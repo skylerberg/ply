@@ -169,9 +169,9 @@ fn an_ended_entry_gives_back_what_it_held() {
     h.alloc_bytes(KIND_BYTES, 200 << 20);
     assert!(h.held() > 200 << 20);
     h.end();
-    assert_eq!(h.held(), 0);
-    let o = h.alloc(KIND_RECORD, 0, 1, 0);
-    assert!(h.is_object(o as Word), "an ended heap allocates afresh");
+    assert_eq!((h.held(), h.live()), (0, 0));
+    h.alloc(KIND_RECORD, 0, 1, 0);
+    assert_eq!(h.live(), 1, "an ended heap allocates afresh");
 }
 
 /// A block is its object's size rounded up by an eighth at most, and a page ends short of one more.
@@ -281,6 +281,19 @@ fn every_value_kind_round_trips() {
         assert_eq!(Heap::to_value(&l, w), v, "{v:?}");
     }
     h.end();
+}
+
+/// Compiled code holds `()` as the word 0, which no object lies at.
+#[test]
+fn the_zero_word_is_unit_as_the_runtime_s_own_is() {
+    let l = layouts();
+    assert_eq!(Heap::to_value(&l, 0), Value::Unit);
+    assert_eq!(cmp_words(&l, 0, unit()), std::cmp::Ordering::Equal);
+    assert_eq!(
+        cmp_words(&l, 0, bool(false)),
+        Value::Unit.cmp(&Value::Bool(false))
+    );
+    assert!(native_key(&l, 0));
 }
 
 /// Below 64 bits a width is the immediate compiled code computes with, which reads back as the
@@ -721,31 +734,6 @@ fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
     );
 }
 
-#[test]
-fn a_word_is_an_object_only_at_a_live_start() {
-    let mut heap = Heap::new();
-    enter(&mut heap);
-    let o = heap.alloc(KIND_RECORD, 0, 2, 0);
-    // Filled before the `dec`, as every caller of `alloc` must: until written, the words hold the last tenant's leftovers.
-    unsafe {
-        set_word(o, 0, imm(1));
-        set_word(o, 1, imm(2));
-    }
-    let w = o as Word;
-    assert!(heap.is_object(w));
-    assert!(
-        !heap.is_object(w + 8),
-        "an interior address is not an object"
-    );
-    assert!(!heap.is_object(imm(7)), "an immediate is not an object");
-    assert!(!heap.is_object(0));
-    dec(w);
-    assert!(!heap.is_object(w), "a released object is not one");
-    leave();
-    heap.end();
-    assert!(!heap.is_object(w), "nothing survives the entry");
-}
-
 /// What another thread may hold is marked once, all of it, and is never unique after.
 #[test]
 fn sharing_marks_everything_under_the_words_and_counts_it_apart() {
@@ -816,7 +804,11 @@ fn an_object_dying_under_another_heap_goes_back_to_its_own() {
     let other = inner.to_word(&l, &Value::ctor("Some", vec![Value::Int(2)]));
     assert_ne!(other, made, "a heap took a block of another's");
     leave();
-    assert!(inner.is_object(other) && !outer.is_object(other));
+    assert_eq!(
+        (inner.live(), outer.live()),
+        (1, 0),
+        "the object made under the inner heap is its own"
+    );
     inner.end();
     outer.end();
 }
@@ -853,8 +845,14 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     let mut branch = Heap::new();
     let made = branch.to_word(&l, &Value::list(vec![Value::Int(7), Value::str("x")]));
     let float = branch.bridge(Value::Float(2.5));
+    let (mine, theirs) = (parent.live(), branch.live());
     parent.adopt_heap(branch);
     let after = parent.to_word(&l, &Value::str("after"));
+    assert_eq!(
+        parent.live(),
+        mine + theirs + 1,
+        "the branch's objects are the parent's"
+    );
     assert_eq!(
         Heap::to_value(&l, made),
         Value::list(vec![Value::Int(7), Value::str("x")])
@@ -862,9 +860,106 @@ fn an_adopted_heap_keeps_its_objects_and_its_bridges() {
     assert_eq!(Heap::to_value(&l, float), Value::Float(2.5));
     assert_eq!(Heap::to_value(&l, before), Value::str("before"));
     assert_eq!(Heap::to_value(&l, after), Value::str("after"));
-    assert!(parent.is_object(made) && parent.is_object(after));
     enter(&mut parent);
     dec(float);
     leave();
     parent.end();
+}
+
+/// A block of two words, as emitted code's C allocates one.
+fn emitted(ctx: &mut ply_compiled::rt::Ctx) -> Word {
+    type Alloc = unsafe extern "C" fn(*mut ply_compiled::rt::Ctx, Word) -> Word;
+    unsafe { crate::bare::helper::<Alloc>("rt_alloc_bytes")(ctx, 16 + 8 * 2) }
+}
+
+#[test]
+fn a_block_emitted_code_laid_out_is_counted_under_a_kind_of_its_own() {
+    let mut ctx = crate::bare::context();
+    let w = emitted(&mut ctx);
+    assert_eq!(kind(w), KIND_REFUSED);
+    assert_eq!(ctx.heap.allocated_by_kind()[KIND_REFUSED as usize], 1);
+    assert_eq!(ctx.heap.live_by_kind(), vec![(KIND_REFUSED, 1, 16)]);
+}
+
+#[test]
+fn a_census_tells_a_record_by_its_fields_and_an_emitted_block_by_its_size_most_bytes_first() {
+    let mut ctx = crate::bare::context();
+    for _ in 0..3 {
+        emitted(&mut ctx);
+    }
+    let shape = ctx
+        .tables
+        .layouts
+        .shape(vec![Symbol::new("a"), Symbol::new("b")]);
+    let r = ctx.heap.alloc(KIND_RECORD, FLAT, 2, shape);
+    ctx.heap.alloc_bytes(KIND_STR, 40);
+    unsafe {
+        set_word(r, 0, imm(1));
+        set_word(r, 1, imm(2));
+    }
+    assert_eq!(
+        ctx.census(),
+        vec![
+            (
+                "emitted blocks of 16 bytes past the header".to_string(),
+                3,
+                48
+            ),
+            ("strings".to_string(), 1, 40),
+            ("{a, b}".to_string(), 1, 16),
+        ]
+    );
+}
+
+#[test]
+fn live_bytes_are_the_blocks_live_objects_take_and_a_dead_objects_block_leaves_them() {
+    let mut h = Heap::new();
+    enter(&mut h);
+    assert_eq!(h.live_bytes(), 0);
+    let small = h.alloc(KIND_RECORD, FLAT, 1, 0);
+    unsafe { set_word(small, 0, imm(1)) };
+    h.alloc_bytes(KIND_BYTES, 1 << 20);
+    let big = (1 << 20) + HEADER;
+    assert_eq!(h.live_bytes(), Heap::object_size(8) + big);
+    dec(small as Word);
+    assert_eq!(h.live_bytes(), big, "the dead object's block still counted");
+    assert!(h.live_bytes() <= h.held());
+    leave();
+    h.end();
+}
+
+/// A walker named, over a word.
+type Walk<'a> = (&'static str, Box<dyn Fn(Word) + 'a>);
+
+#[test]
+fn every_walker_refuses_a_block_emitted_code_laid_out_by_its_own_name() {
+    let mut ctx = crate::bare::context();
+    let l = layouts();
+    let walks: Vec<Walk> = vec![
+        ("dismantle", Box::new(dec)),
+        ("share", Box::new(|w| _ = share(&[w]))),
+        ("Heap::read", Box::new(|w| _ = Heap::to_value(&l, w))),
+        ("Heap::copy", Box::new(|w| _ = Heap::persistent().adopt(w))),
+        ("mark_immortal", Box::new(mark_immortal)),
+        ("world_independent", Box::new(|w| _ = world_independent(w))),
+        ("native_key", Box::new(|w| _ = native_key(&l, w))),
+        ("cmp_words", Box::new(|w| _ = cmp_words(&l, w, imm(1)))),
+        ("Layouts::parts", Box::new(|w| _ = l.parts(obj(w)))),
+        (
+            "stored::text",
+            Box::new(|w| _ = ply_compiled::stored::text(&l, w)),
+        ),
+    ];
+    for (walker, walk) in walks {
+        let w = emitted(&mut ctx);
+        let refused =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| walk(w))).expect_err(walker);
+        let said = refused.downcast_ref::<String>().map_or("", String::as_str);
+        assert!(
+            said.contains(&format!(
+                "`{walker}` was handed a block emitted code laid out"
+            )),
+            "{walker}: {said}"
+        );
+    }
 }

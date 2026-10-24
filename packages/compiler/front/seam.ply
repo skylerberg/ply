@@ -16,8 +16,10 @@ import check.infer (CheckOutput, RootFacts, facts_at, facts_by_owner, filed_fact
                     root_facts_bin, published_pure)
 import check.infer.checker (Location, DefInfo, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo,
                             OpInfo, CtorInfo, Known, no_known, KnownDef, KnownTest, KeptFacts,
-                            WitnessOrder, TypedSite, test_owner, law_root, cases_root, listing_ty,
-                            witness_order_bin, witnessed, InstanceInfo, NumericInfo)
+                            WitnessOrder, TypedSite, listing_ty, witness_order_bin, witnessed,
+                            InstanceInfo, NumericInfo)
+import emit.keys (RootKey, Named, Cases, Clause, Requires, Ensures, LawPart, LawGuard, LawBody,
+                  root_name, root_text, part_word, test_key, test_owner, law_key, law_owner)
 import front.pkg (Pinned)
 import check.resolve.scopes (PackageDeps)
 import std.bin
@@ -272,12 +274,13 @@ fn key_published(def_info: DefInfo) -> Bytes / {abort.raise} = {
   ])
 }
 
-fn key_clause_root(owner: Bytes, kind: Bytes, k: Int) -> Bytes =
-  Bytes::concat_all([owner, b"#", kind, b"#", ascii_of_int(k)])
+/// The `k`th clause of its kind, `requires` or `ensures`, that definition `def` states.
+fn clause_key(def: Bytes, kind: SpecKind, k: Int) -> RootKey =
+  Clause({ def: Named(def), kind: if kind == SRequires { Requires } else { Ensures }, n: k })
 
 /// The root the emitter answers the program's test `i` by.
-pub fn test_root_at(dump: Dump, i: Int) -> Option<Bytes> / {abort.raise} =
-  match dump.tests.at(i) { Some(t) -> Some(test_owner(t.module, t.name)), None -> None }
+pub fn test_root_at(dump: Dump, i: Int) -> Option<RootKey> / {abort.raise} =
+  match dump.tests.at(i) { Some(t) -> Some(test_key(t.module, t.name)), None -> None }
 
 /// A digest of what emitting the root hashed under `key` reads of the rest of the program: the
 /// signature of `owner` (the root, or a clause's definition), the signature of every definition it
@@ -332,7 +335,7 @@ fn key_fn(
             let sentence = match sents.at(i) { Some(s) -> s, None -> owner };
             {
               out: b.out.push({
-                root: key_clause_root(name, text, k),
+                root: root_text(root_name(clause_key(name, kind, k))),
                 key: Bytes::concat_all([
                   hex(sentence),
                   b"#",
@@ -398,10 +401,11 @@ pub fn root_keys(
           let name = qualify(o.name, t.name);
           if !tested(name) { a } else {
             let read = key_reads(published, deps, decls, name, None);
-            let root = test_owner(o.name, t.name);
-            let run = a.push({ root: root, key: b"test+".concat(read) });
-            if !t.cases { run }
-            else { run.push({ root: cases_root(root), key: b"cases+".concat(read) }) }
+            let root = test_key(o.name, t.name);
+            let run = a.push({ root: root_text(root_name(root)), key: b"test+".concat(read) });
+            if !t.cases { run } else {
+              run.push({ root: root_text(root_name(Cases(root))), key: b"cases+".concat(read) })
+            }
           }
         },
         OLaw(l) -> match within {
@@ -414,12 +418,12 @@ pub fn root_keys(
               Some(text) -> {
                 let read = key_reads(published, deps, decls, name, None);
                 List::fold(
-                  if guarded.get(name) == Some(true) { [b"guard", b"body"] } else { [b"body"] },
+                  if guarded.get(name) == Some(true) { [LawGuard, LawBody] } else { [LawBody] },
                   a,
-                  |b: List<KeyRow>, part: Bytes|
+                  |b: List<KeyRow>, part: LawPart|
                     b.push({
-                      root: law_root(o.name, l.name, part),
-                      key: Bytes::concat_all([hex(text), b"#", part, b"+", read]),
+                      root: root_text(root_name(law_key(o.name, l.name, part))),
+                      key: Bytes::concat_all([hex(text), b"#", part_word(part), b"+", read]),
                     }),
                 )
               },
@@ -466,15 +470,18 @@ fn instance_by(checked: CheckOutput, type_name: Bytes, key: Bool) -> Option<Byte
     else { acc })
 
 /// The constructors `checked` read, as a dump rows them, and the names of those whose type states a
-/// `key`.
+/// `key`, and of those whose type states its arithmetic.
 pub fn ctors_read(
   checked: CheckOutput,
-) -> { rows: List<CtorRow>, keyed: List<Bytes> } / {abort.raise} =
+) -> { rows: List<CtorRow>, keyed: List<Bytes>, numeric: List<Bytes> } / {abort.raise} =
   {
     rows: checked.ctors.map(ctor_row),
     keyed: checked.ctors.filter(|c: CtorInfo| instance_by(checked, c.type_name, true) != None).map(
       |c: CtorInfo| c.name,
     ),
+    numeric: checked.ctors.filter(|c: CtorInfo|
+      checked.numeric_types.any(|x: NumericInfo| x.type_name == c.type_name)).map(|c: CtorInfo|
+      c.name),
   }
 
 // --- How a value reads at the compiled seam ------------------------------------
@@ -614,13 +621,13 @@ fn var_number(vars: List<Int>, v: Int) -> Int / {abort.raise} =
 fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
   match ty { TyFn(f) -> { params: f.params, ret: f.ret }, other -> { params: [], ret: other } }
 
-/// Every root is built here, so what the seam reads of it comes from the types it carries. `vars`
-/// numbers the type variables those types share.
+/// Every root is built here, so what the seam reads of it comes from the types it carries, and its
+/// row is named as its key prints. `vars` numbers the type variables those types share.
 fn emit_root(
   cr: Carrier,
   vars: List<Int>,
   witnesses: List<Int>,
-  root: Bytes,
+  root: RootKey,
   params: List<Type>,
   answer: Type,
   labels: Int,
@@ -629,7 +636,7 @@ fn emit_root(
 ) -> EmitterRoot / {abort.raise} = {
   let taken = witnesses.map(|w: Int| int_type()).concat(params);
   {
-    root: root,
+    root: root_text(root_name(root)),
     arity: taken.len() + labels,
     pure: pure,
     at: place,
@@ -643,7 +650,7 @@ fn emit_proposition(
   cr: Carrier,
   vars: List<Int>,
   witnesses: List<Int>,
-  root: Bytes,
+  root: RootKey,
   params: List<Type>,
   place: ModuleSpan,
 ) -> EmitterRoot / {abort.raise} =
@@ -682,7 +689,7 @@ fn emitter_roots(
                 cr,
                 vars,
                 witnesses,
-                name,
+                Named(name),
                 sig.params,
                 sig.ret,
                 def.scheme.label_vars.len(),
@@ -694,13 +701,13 @@ fn emitter_roots(
                 |b: { rows: List<EmitterRoot>, requires: Int, ensures: Int }, kind: SpecKind| {
                   match kind {
                     SRequires -> {
-                      let root = key_clause_root(name, b"requires", b.requires);
+                      let root = clause_key(name, kind, b.requires);
                       let row = emit_proposition(cr, vars, witnesses, root, sig.params, place);
                       { rows: b.rows.push(row), requires: b.requires + 1, ensures: b.ensures }
                     },
                     // `ensures` also takes `result`.
                     SEnsures -> {
-                      let root = key_clause_root(name, b"ensures", b.ensures);
+                      let root = clause_key(name, kind, b.ensures);
                       let row = emit_proposition(
                         cr,
                         vars,
@@ -725,12 +732,12 @@ fn emitter_roots(
             Some(x) -> span_at(x.at.module, x.at.span),
             None -> no_module_span(),
           };
-          let root = test_owner(o.name, t.name);
+          let root = test_key(o.name, t.name);
           // Over cases it is entered with a case's place and identity; a second root lists them.
           let taken = if !t.cases { [] } else { [int_type(), bytes_type()] };
           let row = emit_root(cr, [], [], root, taken, unit_type(), 0, false, place);
           let listed = if !t.cases { a.specs } else {
-            a.specs.push(emit_root(cr, [], [], cases_root(root), [], listing_ty(), 0, false, place))
+            a.specs.push(emit_root(cr, [], [], Cases(root), [], listing_ty(), 0, false, place))
           };
           { ..a, tests: a.tests.push(row), specs: listed }
         },
@@ -747,9 +754,9 @@ fn emitter_roots(
               None -> no_module_span(),
             };
             let rows = List::map(
-              if guarded { [b"guard", b"body"] } else { [b"body"] },
-              |part: Bytes| {
-                emit_proposition(cr, vars, [], law_root(o.name, l.name, part), binders, place)
+              if guarded { [LawGuard, LawBody] } else { [LawBody] },
+              |part: LawPart| {
+                emit_proposition(cr, vars, [], law_key(o.name, l.name, part), binders, place)
               },
             );
             { ..a, specs: a.specs.concat(rows) }
@@ -1023,7 +1030,7 @@ pub fn def_known_row(
     ending: def_info.ending,
     summary: def_info.summary,
     raises: def_info.raises,
-    facts: facts_filed(read, def_info.name, def_info.at.span),
+    facts: facts_filed(read, def_info.name),
     scheme: canonical_scheme(def_info.scheme),
   }
 
@@ -1040,7 +1047,7 @@ fn test_known_row(
     effect_hashes: row_effect_hashes(decls, test_info.footprint),
     footprint: atoms_text(test_info.footprint, b","),
     owner: owner,
-    facts: facts_filed(read, owner, test_info.at.span),
+    facts: facts_filed(read, owner),
   }
 
 /// What the emitter reads of each body: what the rows a body was published from held, and what a
@@ -1055,11 +1062,11 @@ pub fn bodies_read(checked: CheckOutput) -> BodiesRead =
   }
 
 /// One body's facts as its row files them: the bytes its last row held where it was published from
-/// that, else what this walk recorded, counted from where its definition starts.
-fn facts_filed(read: BodiesRead, owner: Bytes, at: Span) -> Bytes / {abort.raise} =
+/// that, else what this walk recorded.
+fn facts_filed(read: BodiesRead, owner: Bytes) -> Bytes / {abort.raise} =
   match read.kept.get(owner) {
     Some(filed) -> filed,
-    None -> filed_facts(match read.walked.get(owner) { Some(f) -> f, None -> no_root_facts() }, at),
+    None -> filed_facts(match read.walked.get(owner) { Some(f) -> f, None -> no_root_facts() }),
   }
 
 /// The types the facts of `defs` and `tests` name, read from `table`.
@@ -1069,7 +1076,7 @@ pub fn types_of_rows(
   tests: List<KnownTestRow>,
 ) -> TypeTable / {abort.raise} = {
   let named = |acc: List<Bytes>, filed: Bytes|
-    match facts_at(filed, 0, 0, b"") {
+    match facts_at(filed, 0, b"") {
       Some(f) -> f.typed.fold(acc, |a: List<Bytes>, s: TypedSite| a.concat(s.args).push(s.ty)),
       None -> acc,
     };
@@ -1083,24 +1090,31 @@ pub fn types_of_rows(
 }
 
 /// What the emitter reads of a checked program beyond each body's own row: the definitions
-/// published pure, each definition's witness order, and the sites of what is walked afresh every
-/// time, a clause or a law. Module indices are into `modules`.
+/// published pure, each definition's witness order, and the sites of each law, which is walked
+/// afresh every time, by its owner. Module indices are into `modules`.
 pub type WalkedFacts = {
   modules: List<Bytes>,
   pure: List<Bytes>,
   orders: List<WitnessOrder>,
-  loose: RootFacts,
+  loose: List<{ owner: Bytes, facts: RootFacts }>,
 }
 
 derive bin for WalkedFacts
 
-pub fn walked_of(modules: List<Bytes>, checked: CheckOutput) -> WalkedFacts =
+pub fn walked_of(modules: List<Bytes>, checked: CheckOutput) -> WalkedFacts / {abort.raise} = {
+  let laws = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
+    acc.insert(law_owner(l.module, l.name), true));
   {
     modules: modules,
     pure: checked.facts.pure,
     orders: checked.facts.elaboration.orders,
-    loose: match facts_by_owner(checked.facts).get(b"") { Some(f) -> f, None -> no_root_facts() },
+    loose: facts_by_owner(checked.facts).fold(
+      [],
+      |acc: List<{ owner: Bytes, facts: RootFacts }>, owner: Bytes, f: RootFacts|
+        if laws.contains(owner) { acc.push({ owner: owner, facts: f }) } else { acc },
+    ),
   }
+}
 
 pub fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.raise} = {
   let keyed = by_name(hashes.defs);

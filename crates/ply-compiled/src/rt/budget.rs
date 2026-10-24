@@ -52,18 +52,19 @@ pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
 }
 
 /// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::fuel`] as this stack left it, whatever ran meanwhile, this stack the
-/// running one again and the floor its own.
+/// switches back, with [`Ctx::fuel`] and [`Ctx::frames`] as this stack left them, whatever ran
+/// meanwhile, this stack the running one again and the floor its own.
 ///
 /// # Safety
 /// As [`switch`], and `ctx` is the context both stacks run under.
 pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let fuel = unsafe { (*ctx).fuel };
+    let (fuel, frames) = unsafe { ((*ctx).fuel, (*ctx).frames) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
         ply_core::limit::set_running(running);
         (*ctx).fuel = fuel;
+        (*ctx).frames = frames;
         (*ctx).stack_floor = stack_floor();
     }
 }
@@ -105,6 +106,7 @@ extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
     let hop = arg as *mut Hop<'_, F>;
     let call = unsafe {
         (*(*hop).ctx).stack_floor = (*hop).stack.enter();
+        (*(*hop).ctx).frames = std::ptr::null_mut();
         (*hop).call.take().expect("a hop runs its call once")
     };
     let answer = call();

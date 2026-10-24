@@ -8,15 +8,18 @@
 //! C's parts in the toolchain's cache, and writes the front end and their manifest.
 
 import cc
-import cc (compilers, toolchain)
-import load (Checked, SourceFile, answers_of, assembled, entry_hash_of, every_root, prepared)
+import cc (compilers, memory, toolchain, Memory, Live)
+import load (Checked, LoadedAnalysis, SourceFile, answers_of, assembled, entry_hash_of, every_root,
+             prepared)
 import front.rows (BakedRow)
 import front.published (linked_of)
-import store.hash.forms (TheFn, reach)
+import store.hash.forms (HashOutput, TheFn, reach)
 import check.resolve.tables (Diag, Label)
-import unit (Baked, Runtime, shipped, baked_key, const_budget, const_room, emitted,
-             emitter_identity, held, keep_value, kept_value, program_key, programs_kept, read_kept,
-             stored_root, write_kept)
+import unit (Baked, Emission, PlaceTally, Runtime, shipped, answers_store, baked_key, const_budget,
+             const_room, emitted, emitter_identity, held, program_key, programs_kept, file_kept,
+             stored_root, keep_file)
+import store.kept (Record, kept_records, with_kept)
+import emit.keys (RootKey, Named, Stored, RootName, root_name)
 import std.bytes (u64_le)
 import std.fs (fs)
 import std.list
@@ -60,6 +63,33 @@ fn texts(files: List<SourceFile>) -> List<Bytes> = files.map(|f: SourceFile| f.t
 
 fn ms(from: Int, to: Int) -> String = Int::to_string(to - from) ++ "ms"
 
+fn mb(bytes: Int) -> String = Int::to_string(bytes / 1000000) ++ "MB"
+
+/// What a build telling its phases says, after each place, of what its heap holds.
+fn memory_said(m: Memory) -> String = mb(m.live) ++ " live, " ++ mb(m.held) ++ " held"
+
+/// What a build telling its phases says of the live objects of `entry`'s build once its unit is
+/// emitted and before its C is held: the twenty sorts that take the most bytes.
+fn census_said(entry: String, live: List<Live>) -> List<String> =
+  live.take(20).map(|l: Live|
+    "phases: " ++ entry ++ " live once emitted: " ++ l.what ++ ": " ++ Int::to_string(l.objects)
+      ++ " objects, "
+      ++ mb(l.bytes))
+
+/// What a build telling its phases says of place `r.place` of `entry`'s unit as it ends.
+pub fn place_said(entry: String, r: PlaceTally) -> String =
+  "phases: " ++ entry ++ " place " ++ Int::to_string(r.place) ++ ": " ++ Int::to_string(r.roots)
+    ++ " roots, "
+    ++ Int::to_string(r.kept)
+    ++ " kept, "
+    ++ Int::to_string(r.asked)
+    ++ " asked, "
+    ++ Int::to_string(r.refused)
+    ++ " refused, "
+    ++ Int::to_string(r.steps)
+    ++ " steps, "
+    ++ ms(r.began, r.ended)
+
 /// What a build made: the front end the runtime reads and the manifest of the unit's C, whose parts
 /// the toolchain's cache keeps.
 type Made = { front: Bytes, sources: Bytes }
@@ -83,7 +113,7 @@ fn unpacked(bytes: Bytes) -> Option<Made> / {toolchain.read, abort.raise} =
 
 /// What a build reaches: the program's sources and the stores below the filesystem's root, the
 /// runtime it runs on, which it emits for, the compilers and their cache, and its own streams.
-pub effect set Builds = {shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.front, shipped.values, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
+pub effect set Builds = {shipped.answer, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.stamps, shipped.runtime, shipped.front, shipped.values, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
 
 /// `made` written where its front end and its manifest go: 0 when both were, 2 when one could not be.
 fn written(
@@ -130,7 +160,7 @@ pub fn built(
       };
       let reading = time.elapsed_ms();
       let had = match key {
-        Some(k) -> match read_kept[abs](programs, k) { Some(b) -> unpacked(b), None -> None },
+        Some(k) -> match file_kept[abs](programs, k) { Some(b) -> unpacked(b), None -> None },
         None -> None,
       };
       match had {
@@ -161,54 +191,80 @@ pub fn built(
             Some(carried) -> {
               let f = checked.front;
               let checking = time.elapsed_ms();
-              let offered = every_root(f);
-              let bodies = below_root(cache ++ "/bodies");
-              let emitter = if kept { emitter_identity(definitions) } else { b"" };
-              let values = constants(checked, offered, kept, emitter, bodies);
-              let valuing = time.elapsed_ms();
-              let emission = emitted(
-                shipped.runtime(),
-                f.dump,
-                texts(f.files),
-                f.inputs,
-                offered,
-                emitter,
-                |k: Bytes| answer_kept(kept, bodies, k),
-                |k: Bytes, bytes: Bytes| keep_answer(kept, bodies, k, bytes),
-                values,
-              );
-              match held(f.dump, offered, emission) {
-                Err(diags) -> {
-                  told(diags, f.files);
-                  1
-                },
-                Ok(unit) -> match cc::kept(cc::split(unit)) {
-                  Err(why) -> {
-                    process.err[proc](why);
-                    2
-                  },
-                  Ok(kept_sources) -> {
-                    let made = {
-                      front: shipped.front(carried),
-                      sources: cc::manifest(kept_sources),
-                    };
-                    let wrote = written(made, front, sources);
-                    match key {
-                      Some(k) -> if wrote == 0 { write_kept[abs](programs, k, packed(made)) },
-                      None -> (),
-                    };
-                    if phases {
-                      process.err[proc](
-                        "phases: " ++ entry ++ " answered " ++ ms(started, reading) ++ ", checked "
-                          ++ ms(reading, checking)
-                          ++ ", constants held "
-                          ++ ms(checking, valuing)
-                          ++ ", emitted and written "
-                          ++ ms(valuing, time.elapsed_ms()),
-                      )
-                    };
-                    wrote
-                  },
+              let offered = built_roots(checked.front, checked.hashes, Bytes::of_string(entry));
+              let places = |unit: String|
+                if phases {
+                  Some({
+                    now: || time.elapsed_ms(),
+                    told: |r: PlaceTally|
+                      process.err[proc](place_said(unit, r) ++ ", " ++ memory_said(memory.heap())),
+                  })
+                } else { None };
+              let made_unit = if kept {
+                with_kept[abs, ans](
+                  answers_store(
+                    below_root(cache ++ "/bodies"),
+                    shipped.runtime(),
+                    emitter_identity(definitions),
+                  ),
+                  ||
+                    unit_made(
+                      checked,
+                      Bytes::of_string(entry),
+                      offered,
+                      places(entry),
+                      places(entry ++ "'s constants"),
+                      |k: Bytes| kept_records.get[ans](k),
+                      |rs: List<Record>| kept_records.put[ans](rs),
+                    ),
+                )
+              } else {
+                unit_made(
+                  checked,
+                  Bytes::of_string(entry),
+                  offered,
+                  places(entry),
+                  places(entry ++ "'s constants"),
+                  |_: Bytes| None,
+                  |_: List<Record>| (),
+                )
+              };
+              match made_unit {
+                Err(s) -> stopped(s, f.files),
+                Ok(m) -> {
+                  if phases {
+                    census_said(entry, memory.census()).fold((), |_: Unit, line: String|
+                      process.err[proc](line))
+                  };
+                  match held(f.dump, offered, m.emission) {
+                    Err(diags) -> stopped(Unheld(diags), f.files),
+                    Ok(unit) -> match cc::kept(cc::split(unit)) {
+                      Err(why) -> stopped(Unbuilt(why), f.files),
+                      Ok(kept_sources) -> {
+                        let made = {
+                          front: shipped.front(carried),
+                          sources: cc::manifest(kept_sources),
+                        };
+                        let wrote = written(made, front, sources);
+                        match key {
+                          Some(k) -> if wrote == 0 { keep_file[abs](programs, k, packed(made)) },
+                          None -> (),
+                        };
+                        if phases {
+                          process.err[proc](
+                            "phases: " ++ entry ++ " answered " ++ ms(started, reading)
+                              ++ ", checked "
+                              ++ ms(reading, checking)
+                              ++ ", constants held "
+                              ++ ms(checking, m.valued)
+                              ++ ", emitted and written "
+                              ++ ms(m.valued, time.elapsed_ms()),
+                          )
+                        };
+                        wrote
+                      },
+                    },
+                  }
                 },
               }
             },
@@ -219,115 +275,228 @@ pub fn built(
   }
 }
 
-/// An emitter's answer kept below `bodies` between builds, when a build keeps them.
-fn answer_kept(
-  kept: Bool,
-  bodies: String,
-  key: Bytes,
-) -> Option<Bytes> / {fs.read[abs], fs.write[abs], time.now_ms, abort.raise} =
-  if kept { read_kept[abs](bodies, key) } else { None }
+/// The roots a build of `entry` offers: each definition the definition it enters reaches, or a `const`
+/// definition does, whose value it holds in place of the body. A built program never runs the
+/// rest: no test, law or clause, and no definition only those reach.
+pub fn built_roots(
+  front: LoadedAnalysis,
+  hashes: HashOutput,
+  entry: Bytes,
+) -> List<RootKey> / {abort.raise} = {
+  let starts = front.dump.baked.map(|b: BakedRow| b.name).push(entry);
+  reached_roots(every_root(front), reach(hashes, starts.map(|n: Bytes| TheFn(n))).fns, starts)
+}
 
-fn keep_answer(
-  kept: Bool,
-  bodies: String,
-  key: Bytes,
-  bytes: Bytes,
-) -> Unit / {fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  if kept { write_kept[abs](bodies, key, bytes) } else { () }
+/// The definitions among `every` that `reached` holds or `starts` names.
+fn reached_roots(
+  every: List<RootKey>,
+  reached: Map<Bytes, Bool>,
+  starts: List<Bytes>,
+) -> List<RootKey> =
+  every.filter(|k: RootKey|
+    match k { Named(n) -> reached.contains(n) || starts.contains(n), _ -> false })
+
+test "a build offers what its entry and its constants reach, never a test, law or clause" {
+  let every = [
+    Named(b"m.main"),
+    Named(b"m.helper"),
+    Named(b"m.unused"),
+    Named(b"m.version"),
+    Stored(Named(b"m.version")),
+  ];
+  assert_eq(
+    reached_roots(every, Map::new().insert(b"m.helper", true), [b"m.version", b"m.main"]),
+    [Named(b"m.main"), Named(b"m.helper"), Named(b"m.version")],
+  )
+}
+
+/// Why a build stopped before its C was written: the unit it held was refused, or its C did not build.
+type Stop = | Unheld(List<Diag>) | Unbuilt(String)
+
+/// What a build stopped by `s` says, and the code it exits with: 1 for a refused unit, 2 for C that
+/// did not build.
+fn stopped(s: Stop, files: List<SourceFile>) -> Int / {process.err[proc], abort.raise} =
+  match s {
+    Unheld(diags) -> {
+      told(diags, files);
+      1
+    },
+    Unbuilt(why) -> {
+      process.err[proc](why);
+      2
+    },
+  }
+
+/// The unit over `offered`, entered at `entry` alone, the emitter's answers and the values of `const`
+/// definitions read through `read` and kept through `keep`, each place it walks told to `places` and
+/// each place the unit the values are entered on walks to `constant_places`; beside when the values
+/// were held. Stops where the unit the values are entered on stops.
+fn unit_made<| e>(
+  checked: Checked,
+  entry: Bytes,
+  offered: List<RootKey>,
+  places: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+  constant_places: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+) -> Result<{ emission: Result<Emission, Bytes>, valued: Int }, Stop> / {shipped.runtime, shipped.values, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, time.elapsed_ms, abort.raise | e} = {
+  let f = checked.front;
+  match constants(checked, offered, read, keep, constant_places) {
+    Err(s) -> Err(s),
+    Ok(values) -> {
+      let valued = time.elapsed_ms();
+      Ok({
+        emission: emitted(
+          shipped.runtime(),
+          f.dump,
+          texts(f.files),
+          f.inputs,
+          offered,
+          read,
+          keep,
+          values,
+          places,
+          None,
+          None,
+          Some([Named(entry)]),
+        ),
+        valued: valued,
+      })
+    },
+  }
+}
 
 /// The value of each `const` definition among `offered`, which the unit holds in place of its body:
-/// read back where a build or a check kept it, under the runtime, the emitter and the hash of all the
-/// definition reaches, and else entered here and kept beside the emitter's answers. One that raises,
-/// runs past `const_budget` or answers past `const_room` is left to its body, which answers the same
-/// in every process that reaches it.
-fn constants(
+/// read back through `read` where a build or a check kept it under the hash of all the definition
+/// reaches, and else entered here and kept through `keep` beside the emitter's answers. One that
+/// raises, runs past `const_budget` or answers past `const_room` is left to its body, which answers
+/// the same in every process that reaches it. Each place the unit they are entered on walks is told
+/// to `places`; stops where that unit is refused or its C does not build.
+fn constants<| e>(
   checked: Checked,
-  offered: List<Bytes>,
-  kept: Bool,
-  emitter: Bytes,
-  bodies: String,
-) -> List<Baked> / {shipped.runtime, shipped.values, fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, abort.raise} = {
+  offered: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  places: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+) -> Result<List<Baked>, Stop> / {shipped.runtime, shipped.values, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e} = {
   let runtime = shipped.runtime();
-  let wanted = offered.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
-  let rows = checked.front.dump.baked.filter(|row: BakedRow| wanted.contains(row.name));
-  let key = |row: BakedRow| baked_key(runtime.identity, emitter, row.hash);
-  let had = rows.map(|row: BakedRow| if kept { kept_value[abs](bodies, key(row)) } else { None });
+  let wanted = offered.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
+    acc.insert(root_name(k), true));
+  let rows = checked.front.dump.baked.filter(|row: BakedRow|
+    wanted.contains(root_name(Named(row.name))));
+  let had = rows.map(|row: BakedRow| read(baked_key(row.hash)));
   let open = range(0, rows.len()).filter(|i: Int| had.get(i) == None);
   let names = open.map(|i: Int| rows.get(i).name);
-  let found = if names.len() == 0 { [] }
-  else { entered(checked, runtime, names, offered, kept, emitter, bodies) };
-  let fresh = range(0, names.len()).fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Int|
-    match found.at(k) {
-      Some(Some(text)) -> if text.len() > const_room() { acc } else {
-        if kept { keep_value[abs](bodies, key(rows.get(open.get(k))), text) };
-        acc.insert(names.get(k), text)
+  match if names.len() == 0 { Ok([]) }
+    else { entered(checked, runtime, names, offered, read, keep, places) } {
+    Err(s) -> Err(s),
+    Ok(found) -> Ok(baked_from(rows, had, open, names, found, keep)),
+  }
+}
+
+/// The values `rows` give their `const` definitions: each `had` read back, else what entering the
+/// definitions `names` at `open` among them `found`, each kept through `keep` where it fits
+/// `const_room`.
+fn baked_from<| e>(
+  rows: List<BakedRow>,
+  had: List<Option<Bytes>>,
+  open: List<Int>,
+  names: List<Bytes>,
+  found: List<Option<Bytes>>,
+  keep: (List<Record>) -> Unit / e,
+) -> List<Baked> / {abort.raise | e} = {
+  let fresh = range(0, names.len()).fold(
+    [],
+    |acc: List<{ row: BakedRow, bytes: Bytes }>, k: Int|
+      match found.at(k) {
+        Some(Some(bytes)) -> if bytes.len() > const_room() { acc }
+        else { acc.push({ row: rows.get(open.get(k)), bytes: bytes }) },
+        _ -> acc,
       },
-      _ -> acc,
-    });
+  );
+  if fresh.len() > 0 {
+    keep(
+      fresh.map(|x: { row: BakedRow, bytes: Bytes }|
+        { key: baked_key(x.row.hash), bytes: x.bytes }),
+    )
+  };
+  let held = fresh.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { row: BakedRow, bytes: Bytes }|
+    acc.insert(x.row.name, x.bytes));
   range(0, rows.len()).fold([], |acc: List<Baked>, i: Int| {
     let name = rows.get(i).name;
-    match match had.get(i) { Some(text) -> Some(text), None -> fresh.get(name) } {
-      Some(text) -> acc.push({ name: name, text: text }),
+    match match had.get(i) { Some(bytes) -> Some(bytes), None -> held.get(name) } {
+      Some(bytes) -> acc.push({ name: name, bytes: bytes }),
       None -> acc,
     }
   })
 }
 
-/// What each of `names`, `const` definitions, answers through its stored root on a unit of all they
-/// reach, compiled here and entered on the runtime the builder runs on: none for one it could not
-/// answer.
-fn entered(
+/// The encoding of the value each of `names`, `const` definitions, answers through its stored root
+/// on a unit of all they reach, compiled here and entered on the runtime the builder runs on: none
+/// for one that raised or ran past `const_budget`, and none for any where no C compiler is found.
+/// Each place the unit walks is told to `places`; stops where the unit is refused, as `held` refuses
+/// one, or its C does not build.
+fn entered<| e>(
   checked: Checked,
   runtime: Runtime,
   names: List<Bytes>,
-  offered: List<Bytes>,
-  kept: Bool,
-  emitter: Bytes,
-  bodies: String,
-) -> List<Option<Bytes>> / {shipped.values, fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, entropy.next, time.now_ms, abort.raise} = {
-  let unanswered = names.map(|_: Bytes| None);
+  offered: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  places: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }>,
+) -> Result<List<Option<Bytes>>, Stop> / {shipped.values, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e} = {
   let reached = reach(checked.hashes, names.map(|n: Bytes| TheFn(n))).fns;
-  let roots = offered.filter(|n: Bytes| reached.contains(n)).concat(names.map(stored_root));
-  match emitted(
-      runtime,
-      checked.front.dump,
-      texts(checked.front.files),
-      checked.front.inputs,
-      roots,
-      emitter,
-      |k: Bytes| answer_kept(kept, bodies, k),
-      |k: Bytes, bytes: Bytes| keep_answer(kept, bodies, k, bytes),
-    ) {
-    Err(_) -> unanswered,
-    Ok(e) -> match ((compilers.found[cc](), toolchain.scratch())) {
+  let roots = offered.filter(|k: RootKey|
+    match k { Named(d) -> reached.contains(d), _ -> false }).concat(
+    names.map(|n: Bytes| Stored(Named(n))),
+  );
+  let emission = emitted(
+    runtime,
+    checked.front.dump,
+    texts(checked.front.files),
+    checked.front.inputs,
+    roots,
+    read,
+    keep,
+    [],
+    places,
+    None,
+    None,
+    Some(names.map(|n: Bytes| Stored(Named(n)))),
+  );
+  match held(checked.front.dump, roots, emission) {
+    Err(diags) -> Err(Unheld(diags)),
+    Ok(unit) -> match ((compilers.found[cc](), toolchain.scratch())) {
       (Some(compiler), Some(work)) -> {
-        let t = cc::toolchain_of(compiler, "-O0");
+        let t = cc::toolchain_of(compiler, "-O0", true);
         let library = match cc::objects[cc](
             t,
-            cc::split(e.produced.text),
+            cc::split(unit),
             ["-fPIC", "-fno-strict-aliasing"],
             work,
           ) {
-          Err(_) -> None,
+          Err(why) -> Err(why),
           Ok(objects) -> match cc::shared[cc](t, objects, work) {
-            Ok(l) -> Some(l),
-            Err(_) -> None,
+            Ok(l) -> Ok(l),
+            Err(u) -> Err(cc::why_unbuilt(u)),
           },
         };
         toolchain.cleared(work);
         match library {
-          None -> unanswered,
-          Some(l) ->
-            shipped.values(
-              checked.front.files,
-              checked.front.dump,
-              l,
-              names.map(|n: Bytes| String::of_bytes(stored_root(n))),
-              const_budget(),
+          Err(why) -> Err(Unbuilt(why)),
+          Ok(l) ->
+            Ok(
+              shipped.values(
+                checked.front.files,
+                checked.front.dump,
+                l,
+                names.map(|n: Bytes| String::of_bytes(stored_root(n))),
+                const_budget(),
+              ),
             ),
         }
       },
-      _ -> unanswered,
+      _ -> Ok(names.map(|_: Bytes| None)),
     },
   }
 }

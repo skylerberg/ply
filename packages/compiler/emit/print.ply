@@ -6,42 +6,55 @@
 //! instruction holding blocks, the framing around them (`emit.print.*`).
 
 import syntax.parsing (Span, span_between)
-import check.types (TyCon)
+import check.types (Type, TyCon)
 import std.bytes (ascii_of_int)
 import emit.c (tick_line)
 import emit.roots (symbol_of, root_id)
-import emit.keys (Named, Root, root_name)
-import emit.pieces (Piece, Text, Hole, TagOf, InGroup, LentBy, merged, spelled)
-import emit.tir (Rep, RInt, RBool, RWord, RFlat, RCases, RSlice, Var, Arg, AVar, AInt, ABool, AZero,
-                 Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
-                 PCapture, Pack, Gathered, Call, Apply, Native, Op, OHandle, OContainer, OCalling,
-                 MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
-                 Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset, Free,
-                 Opened, Block, Fn, Member, Rooted, Given, Lambda, Closure, Uses, NoArm, Spine,
+import emit.keys
+import emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry)
+import emit.reps (Ctors, no_ctors)
+import emit.layout (Boxed, tag_bits, inline_word_at)
+import emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
+import emit.release (drop_of)
+import emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt, ABool,
+                 AZero, Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path, PField, PArg,
+                 PCapture, PCase, Pack, Gathered, Updated, Call, Apply, Native, Op, OHandle,
+                 OContainer, OCalling, OStrings, MClosure, MList, Inst, Let, Do, Decl, Assign, If,
+                 Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail, Handle, Sited,
+                 Lender, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Rooted, Plain, Kept,
+                 Crossing, Given, Owned, Lambda, Closure, Uses, NoArm, Spine, LastOf, Walked,
                  no_links, falls_through, var_said)
 import emit.print.text (Under, Place, Printing, Printed, printing, function_body, line, text,
                         pieces, pad, named, name_of, arg_text, assigned, label, check, zero,
-                        failing_return, site, slot, part_names, part_name, unprinted)
-import emit.print.counts (exit_of, block_opened, block_closed, count_printed)
-import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, packed, gathered,
-                        statics, join_declared, set_parts, returned, head_types, head_params,
-                        entry_opened, entry_outs, entry_answered)
-import emit.print.fuel (fuel_head)
+                        failing_return, site, slot, part_names, part_name, unprinted, fuel_returned)
+import emit.print.counts (exit_of, block_opened, block_closed, count_printed, walked_value, last_of,
+                          updated)
+import emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, gathered, statics,
+                        join_declared, set_parts, returned, head_types, head_params, params_opened)
+import emit.print.worded (worded)
+import emit.print.fuel (fuel_head, crossed_head)
 import emit.print.prims (literal, prim)
 import emit.print.containers (contained, container_op)
+import emit.print.strings (string_op)
 import emit.print.tested (case_opened, case_arm, case_arm_closed, case_rest, case_closed,
                           match_opened, match_arm, match_arm_closed, match_rest, match_closed,
                           missed, failed)
 import emit.print.invoked (call, applied, closure_made, restarted, entered_member, loop_opened,
                            loop_closed, next, done, calling_op, lambda_names, lambda_text,
-                           group_wrapper, capture_got, member_returned)
+                           group_wrapper, capture_got, member_returned, runtime_entry, entered_of,
+                           kept_entry, group_buffers, member_opened)
+import emit.lower.held (passing, ByReference)
 import emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
+import emit.print.frames (site_linked, handle_linked, unlinked, record_declared, eaches_printed)
+import emit.print.counting (inc_fn, rel_fn, call_text)
 
 /// Root `f` as its C function and entry, or a tail group as its group function, the group's entry
-/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order.
-pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
-  let name = symbol_of(root_name(f.key));
-  let own = if f.members.len() == 0 { root_printed(name, f) } else { group_printed(name, f) };
+/// and each member's wrapper; then each of its closures' functions in `f.lambdas` order; the `each`
+/// functions their frame records name before them all. `ctors` is the program's constructor table.
+pub fn printed_fn(f: Fn, ctors: Ctors) -> Printed / {abort.raise} = {
+  let name = symbol_of(root_text(root_name(f.key)));
+  let own = if f.members.len() == 0 { root_printed(name, f, ctors) }
+  else { group_printed(name, f, ctors) };
   let closures = range(0, f.lambdas.len()).fold(
     { pr: own.pr, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, k: Int|
@@ -55,9 +68,8 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
   );
   let tables = closures.pr;
   {
-    pieces: merged(own.out.concat(closures.out)),
+    pieces: merged(eaches_printed(name, tables).concat(own.out).concat(closures.out)),
     calls: tables.calls,
-    consts: tables.consts,
     builtins: tables.builtins,
     fields: tables.fields,
     shapes: tables.shapes,
@@ -70,20 +82,40 @@ pub fn printed_fn(f: Fn) -> Printed / {abort.raise} = {
 
 /// A root of its own as its C function, named `name`, and its entry: the printing after it and its
 /// pieces.
-fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let body = body_printed(name, f, printing(param_names(f)));
-  let entered = entry(name, f, body);
+fn root_printed(
+  name: Bytes,
+  f: Fn,
+  ctors: Ctors,
+) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+  let body = body_printed(name, f, {
+    ..printing(param_names(f)),
+    ctors: ctors,
+    counting: counted_here(f.key),
+  });
+  let entered = if !has_entry(f.key, f.params.len()) { { pr: body, out: [] } } else {
+    match f.kind {
+      Kept(w) -> kept_entry(body, name, w),
+      _ -> runtime_entry(body, name, entered_of(f)),
+    }
+  };
+  // A plain root counts no steps; a drop root nests only so deep, past which its block waits.
+  let opening = match f.kind {
+    Rooted -> fuel_head(f.conv.answer),
+    Crossing -> crossed_head(f.conv.answer),
+    Plain -> if !dropping(f.key) { b"" }
+    else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
+    Kept(_) -> b"",
+  };
   {
     pr: entered.pr,
     out: [
       Text(
         Bytes::concat_all([
-          b"Word ",
-          name,
-          b"_entry(PlyCtx *ctx, const Word *args);\n",
+          if entered.out.len() == 0 { b"" }
+          else { Bytes::concat_all([b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args);\n"]) },
           head(name, f),
           b" {\n",
-          fuel_head(f.conv.answer),
+          opening,
         ]),
       ),
     ].concat(
@@ -98,9 +130,13 @@ fn root_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abo
 
 /// A tail group, its first member named `name`, as its group function, which takes the member's
 /// place `which` and the widest member's parameters as words and switches on `which` to that
-/// member's arm, each arm opening its member's parameters from the words; then the group's entry,
-/// and each member's wrapper.
-fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
+/// member's arm, each arm opening its member's parameters from the words; then each member's
+/// wrapper.
+fn group_printed(
+  name: Bytes,
+  f: Fn,
+  ctors: Ctors,
+) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let g = name.concat(b"_group");
   let width = f.members.fold(0, |w: Int, m: Member|
     if m.params.len() > w { m.params.len() } else { w });
@@ -114,11 +150,12 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
     looping: None,
     landing: None,
     group: None,
+    leaving: fuel_returned(),
   };
-  let start = printing(match f.params.at(0) {
-    Some(which) -> Map::new().insert(which.id, b"which"),
-    None -> Map::new(),
-  });
+  let start = {
+    ..printing(match f.params.at(0) { Some(which) -> Map::new().insert(which.id, b"which"), None -> Map::new() }),
+    ctors: ctors,
+  };
   let switched = match f.body {
     [Case(c)] -> {
       let arms = c.arms.fold(start, |pr: Printing, a: { when: Int, body: Block }|
@@ -149,11 +186,14 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
               |q: Printing, j: Int| {
                 let v = m.params.get(j);
                 let word = b"p".concat(ascii_of_int(j));
-                match v.rep {
-                  RWord -> { ..q, names: q.names.insert(v.id, word) },
-                  RFlat(_) -> parted(q, v, word),
-                  RCases(_) -> parted(q, v, word),
-                  _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
+                if passing(v.rep) == ByReference { member_opened(q, 1, v, word) } else {
+                  match v.rep {
+                    RWord -> { ..q, names: q.names.insert(v.id, word) },
+                    RFlat(_) -> parted(q, v, word),
+                    RSum(_) -> parted(q, v, word),
+                    RUnit -> q,
+                    _ -> assigned(q, 1, v, c_type(v.rep), word_as(word, v.rep)),
+                  }
                 }
               },
             );
@@ -178,7 +218,6 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
         Bytes::concat_all([ascii_of_int(body.len()), b" instructions"]),
       ),
   };
-  let gentry = g.concat(b"_entry");
   let wrappers = range(0, f.members.len()).fold(
     { pr: switched, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, i: Int| {
@@ -192,14 +231,13 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
       Text(
         Bytes::concat_all([
           b"static Word ",
-          gentry,
-          b"(PlyCtx *ctx, const Word *args);\n",
-          b"static Word ",
           g,
           b"(PlyCtx *ctx, int which",
           Bytes::concat_all(words.map(|w: Bytes| b", Word ".concat(w))),
           b") {\n",
           fuel_head(f.conv.answer),
+          Bytes::concat_all(group_buffers(f).map(|d: Bytes| Bytes::concat_all([b"  ", d, b"\n"]))),
+          record_declared(switched),
           b"  ply_loop: ",
           tick_line(failing_return(f.conv.answer)),
           b"\n  switch (which) {\n",
@@ -208,21 +246,7 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
     ].concat(
       switched.out,
     ).push(
-      Text(
-        Bytes::concat_all([
-          b"}\n",
-          b"static Word ",
-          gentry,
-          b"(PlyCtx *ctx, const Word *args) {\n  return ",
-          g,
-          b"(ctx, (int)args[0]",
-          Bytes::concat_all(
-            range(0, width).map(|i: Int|
-              Bytes::concat_all([b", args[", ascii_of_int(i + 1), b"]"])),
-          ),
-          b");\n}\n",
-        ]),
-      ),
+      Text(b"}\n"),
     ).concat(
       wrappers.out,
     ),
@@ -230,13 +254,38 @@ fn group_printed(name: Bytes, f: Fn) -> { pr: Printing, out: List<Piece> } / {ab
 }
 
 /// `v`, held as several values, bound in a group's arm from the word `word`, which it takes.
-fn parted(pr: Printing, v: Var, word: Bytes) -> Printing / {abort.raise} = {
+fn parted(pr: Printing, v: Var, word: Bytes) -> Printing = {
   let n = named(pr, v);
   pieces(
     n.pr,
     [Text(pad(1))].concat(word_parts(word, v.rep, part_names(n.name, v.rep))).push(Text(b"\n")),
   )
 }
+
+/// Whether root `k` is a drop root: of a type, or of the box of one of its sum's cases.
+fn dropping(k: RootKey) -> Bool =
+  match k {
+    Written(w, _) -> match w.op {
+      keys::Drop -> true,
+      keys::Cased(c) -> c.op == keys::Drop,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// The type root `k` counts a value of word by word, where it is a `Held` count root.
+fn counted_here(k: RootKey) -> Option<Type> =
+  match k { Written(w, _) -> match w.op { keys::Held(_) -> Some(w.ty), _ -> None }, _ -> None }
+
+/// The C `f`'s `Return` runs before it returns: a root's unit of fuel given back, a drop root's
+/// depth, nothing for another plain root.
+fn leaving_of(f: Fn) -> Bytes =
+  match f.kind {
+    Rooted -> fuel_returned(),
+    Crossing -> fuel_returned(),
+    Plain -> if dropping(f.key) { b"ply_drop_done(ctx);" } else { b"" },
+    Kept(_) -> b"",
+  }
 
 fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
   range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
@@ -248,8 +297,9 @@ fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
 fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing / {abort.raise} =
   match l { Closure(c) -> body_printed(symbol, c.body, function_body(pr, lambda_names(l, nth))) }
 
-/// `f`'s body, a body of the root named `symbol`, its restart label first where a self call
-/// restarts it, and the tails of what it declares at its end.
+/// `f`'s body, a body of the root named `symbol`: the frame record its sites link, its parameters
+/// opened, its restart label where a self call restarts it, and the tails of what it declares at
+/// its end.
 fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} = {
   let u = {
     symbol: symbol,
@@ -260,15 +310,21 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
     looping: None,
     landing: None,
     group: None,
+    leaving: leaving_of(f),
   };
-  let viewed = views_opened(f, pr);
+  let opened = params_opened(f.params.map(|v: Var| name_of(pr, v)), f.conv.reps).fold(
+    pr,
+    |q: Printing, l: Bytes| line(q, 0, l),
+  );
+  let viewed = views_opened(f, opened);
+  // A plain root's restart counts no tick.
+  let ticked = match f.kind { Rooted -> tick_line(failing_return(f.conv.answer)), _ -> b";" };
   let looped = if restarts(f.body) {
-    text(
-      viewed,
-      Bytes::concat_all([b"  ply_loop: ", tick_line(failing_return(f.conv.answer)), b"\n"]),
-    )
+    text(viewed, Bytes::concat_all([b"  ply_loop: ", ticked, b"\n"]))
   } else { viewed };
-  block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body))
+  let done = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let record = record_declared(done);
+  if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
 }
 
 /// Each parameter `f` holds as a view of the list whose word it takes, viewing the list from its
@@ -317,8 +373,9 @@ fn restarts(b: Block) -> Bool =
 /// out of the function.
 fn root_of(u: Under) -> Bytes = match u.landing { Some(j) -> j, None -> failing_return(u.answer) }
 
-/// `val` printed into `into` at `p`, a failure in it releasing `unwind` on its way out. The tails it
-/// adds are kept only where the C it prints has a failure test, which goes by them.
+/// `val` printed into `into` at `p`, a failure in it releasing `unwind` on its way out, and where it
+/// may stop, a record of `unwind` linked around it. The tails it adds are kept only where the C it
+/// prints has a failure test, which goes by them.
 fn exiting(
   p: Place,
   pr: Printing,
@@ -327,7 +384,8 @@ fn exiting(
   val: Val,
 ) -> Printing / {abort.raise} = {
   let x = exit_of(pr, unwind, root_of(p.u));
-  let after = value_printed({ ..p, leave: x.leave }, x.pr, into, val);
+  let l = site_linked({ ..p, leave: x.leave }, x.pr, unwind, val);
+  let after = unlinked(value_printed({ ..p, leave: l.leave }, l.pr, into, val), p.depth, l);
   if x.pr.tails.all.len() == pr.tails.all.len()
       || range(pr.out.len(), after.out.len()).any(|i: Int|
         match after.out.at(i) { Some(Text(t)) -> t.index_of(x.leave) != None, _ -> false }) {
@@ -483,7 +541,9 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
               Some(_) -> member_returned(p, acc, a),
               None -> {
                 let r = returned(acc, depth, a);
-                text(r.pr, Bytes::concat_all([b"  ctx->fuel += 1;\n  return ", r.value, b";\n"]))
+                let leaving = if u.leaving == b"" { b"" }
+                else { Bytes::concat_all([b"  ", u.leaving, b"\n"]) };
+                text(r.pr, Bytes::concat_all([leaving, b"  return ", r.value, b";\n"]))
               },
             },
             Restart(args) -> match u.group {
@@ -495,22 +555,27 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
             Handle(h) -> {
               let l = label(acc);
               let x = exit_of(l.pr, h.unwind, root_of(u));
-              let hp = { ..p, leave: x.leave };
+              let f = handle_linked({ ..p, leave: x.leave }, x.pr, l.n, h.body, h.site, h.unwind);
+              let hp = { ..p, leave: f.leave };
               let inside = { ..u, landing: Some(landing_jump(l.n)) };
-              let opened = handle_opened(hp, x.pr, l.n, h.args, h.uses, h.site, h.answer);
-              handle_closed(
-                hp,
-                if h.site.detached != None { printed(inside, opened, h.body, inner) } else {
-                  block_closed(
-                    printed(inside, block_opened(opened), h.body, inner),
-                    acc.block,
-                    inner,
-                    falls_through(h.body),
-                  )
-                },
-                l.n,
-                h.site,
-                h.answer,
+              let opened = handle_opened(hp, f.pr, l.n, h.args, h.uses, h.site, h.answer);
+              unlinked(
+                handle_closed(
+                  hp,
+                  if h.site.detached != None { printed(inside, opened, h.body, inner) } else {
+                    block_closed(
+                      printed(inside, block_opened(opened), h.body, inner),
+                      acc.block,
+                      inner,
+                      falls_through(h.body),
+                    )
+                  },
+                  l.n,
+                  h.site,
+                  h.answer,
+                ),
+                depth,
+                f,
               )
             },
             Inc(_) -> count_printed(p, acc, i),
@@ -541,8 +606,9 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
     },
     Take(t) -> taken(p, pr, into, t),
     Tag(name) -> tagged(p, pr, into, name),
-    Pack(k) -> packed(p, pr, into, k),
+    Pack(k) -> worded(p, pr, into, k),
     Gathered(g) -> gathered(p, pr, into, g.parts),
+    Updated(u) -> updated(p, pr, into, u),
     Call(c) -> call(p, pr, into, c),
     Apply(c) -> applied(p, pr, into, c),
     Native(n) -> native(p, pr, into, n),
@@ -550,13 +616,17 @@ fn value_printed(p: Place, pr: Printing, into: Option<Var>, val: Val) -> Printin
       OHandle(h) -> effect_op(p, pr, into, h, o.args, o.uses),
       OContainer(x) -> container_op(p, pr, into, x, o.args, o.uses),
       OCalling(x) -> calling_op(p, pr, into, x, o.args, o.uses),
+      OStrings(x) -> string_op(p, pr, into, x, o.args),
     },
+    LastOf(v) -> last_of(p, pr, into, v),
+    Walked(w) -> walked_value(p, pr, into, w.of, w.op),
   }
 
-/// The field held as one word at `t.path`'s offset in the block `t.of`, read with a count of its own:
-/// moved out of its slot, which is emptied, where the block is held only here, and counted once more
-/// where it is shared. A block held in place in another is held only here where the object counting
-/// for it is: its own header holds no count.
+/// The field held as one word at `t.path`'s offset in the block `t.of`, in the box the case of the
+/// sum `t.of` holds, or among the words of a sum held as them, read with a count of its own: moved
+/// out of its slot, which is emptied, where the block is held only here, and counted once more where
+/// it is shared. A block held in place in another is held only here where the object counting for
+/// it is: its own header holds no count. A sum's words are this body's alone.
 fn taken(
   p: Place,
   pr: Printing,
@@ -565,36 +635,99 @@ fn taken(
 ) -> Printing / {abort.raise} =
   match into {
     None -> unprinted(Spine, b"a field taken that nothing holds", var_said(t.of)),
-    Some(v) -> match if t.of.rep != RWord { None } else { offset_of(t.path) } {
-      None -> unprinted(Spine, b"a field taken other than out of a block's word", var_said(t.of)),
-      Some(at) -> {
-        let block = name_of(pr, t.of);
-        let field = slot(block, at);
+    // A sum held as its words holds each alone: its word moves out, none left for its release.
+    Some(v) -> match match ((t.of.rep, t.path)) {
+        (RSum(s), PCase(c)) -> inline_word_at(s.laid, c.case, c.at),
+        _ -> None,
+      } {
+      Some(w) -> {
+        let name = name_of(pr, t.of);
+        let word = match part_names(name, t.of.rep).at(w) { Some(x) -> x, None -> name };
         let n = named(pr, v);
         line(
-          line(
-            n.pr,
-            p.depth,
-            Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", field, b";"]),
-          ),
+          line(n.pr, p.depth, Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", word, b";"])),
           p.depth,
-          Bytes::concat_all([
-            b"if (ply_counted_by(ply_obj(",
-            block,
-            b"))->rc == 1) ",
-            field,
-            b" = ply_unit; else ply_inc(",
-            n.name,
-            b");",
-          ]),
+          word.concat(b" = 0;"),
         )
       },
+      None -> taken_from_block(p, pr, v, t),
     },
   }
 
-/// The word offset `path` reads at, where it reads at one.
-fn offset_of(path: Path) -> Option<Int> =
-  match path { PField(f) -> Some(f.at), PArg(a) -> Some(a.at), _ -> None }
+/// `v` taken out of the block a word or a case's box holds, which leaves `ply_unit` in its place
+/// where the block is held only here and counts it again otherwise.
+fn taken_from_block(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  t: { of: Var, path: Path },
+) -> Printing / {abort.raise} =
+  match field_of(name_of(pr, t.of), t.of.rep, t.path) {
+    None ->
+      unprinted(
+        Spine,
+        b"a field taken other than out of a block's word or a case's box",
+        var_said(t.of),
+      ),
+    Some(at) -> {
+      let n = named(pr, v);
+      let read = line(
+        n.pr,
+        p.depth,
+        Bytes::concat_all([c_type(v.rep), b" ", n.name, b" = ", at.field, b";"]),
+      );
+      let held = Bytes::concat_all([
+        b"if (ply_counted_by(ply_obj(",
+        at.block,
+        b"))->rc == 1) ",
+        at.field,
+        b" = ply_unit; else",
+      ]);
+      // A word that is a sum is counted through its case, which its class says.
+      if v.rep == RWord {
+        line(read, p.depth, Bytes::concat_all([held, b" ", call_text(inc_fn(), [n.name]), b";"]))
+      } else {
+        line(
+          count_printed(
+            { ..p, depth: p.depth + 1 },
+            line(read, p.depth, held.concat(b" {")),
+            Inc({ var: v, n: 1 }),
+          ),
+          p.depth,
+          b"}",
+        )
+      }
+    },
+  }
+
+/// The block a field `path` reads lies in, out of a value named `name` held as `r`, and the field:
+/// a block's word at its offset, or the box a sum's case holds, after its tag, its word masked where
+/// the case's tag is in its low bits.
+fn field_of(name: Bytes, r: Rep, path: Path) -> Option<{ block: Bytes, field: Bytes }> =
+  match ((r, path)) {
+    (RWord, PField(f)) -> Some({ block: name, field: slot(name, f.at) }),
+    (RWord, PArg(a)) -> Some({ block: name, field: slot(name, a.at) }),
+    (RSum(s), PCase(c)) -> match s.laid.cases.at(c.case) {
+      Some(x) -> match x.payload {
+        Boxed(b) -> {
+          let word = match part_names(name, r).at(b.at) { Some(w) -> w, None -> name };
+          let block = if b.stripped {
+            Bytes::concat_all([
+              b"((",
+              word,
+              b") & ~(Word)",
+              ascii_of_int((1 << tag_bits()) - 1),
+              b")",
+            ])
+          } else { word };
+          Some({ block: block, field: slot(block, b.skip + c.at) })
+        },
+        _ -> None,
+      },
+      None -> None,
+    },
+    _ -> None,
+  }
 
 /// The tag of constructor `name`, which the unit writes in.
 fn tagged(p: Place, pr: Printing, into: Option<Var>, name: Bytes) -> Printing =
@@ -634,54 +767,15 @@ fn native(
 
 /// The C a root's function is declared with: what it returns, each parameter's values, and the
 /// pointers it writes its answer's other values through.
-fn head(name: Bytes, f: Fn) -> Bytes / {abort.raise} =
+fn head(name: Bytes, f: Fn) -> Bytes =
   Bytes::concat_all([
-    head_types(f.conv.reps, f.conv.answer).answer,
+    head_types(f.conv).answer,
     b" ",
     name,
     b"(PlyCtx *ctx",
-    Bytes::concat_all(head_params(f.conv.reps, f.conv.answer).map(|p: Bytes| b", ".concat(p))),
+    Bytes::concat_all(head_params(f.conv).map(|p: Bytes| b", ".concat(p))),
     b")",
   ])
-
-/// The entry the runtime and closures call a root by, words in and out: each word opened as its
-/// parameter is held, and the answer handed back as a word.
-fn entry(name: Bytes, f: Fn, pr: Printing) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let opened = range(0, f.conv.reps.len()).map(|i: Int| entry_opened(i, f.conv.reps.get(i)));
-  let call = Bytes::concat_all([
-    name,
-    b"(ctx",
-    Bytes::concat_all(
-      opened.fold([], |acc: List<Bytes>, o: { text: Bytes, args: List<Bytes> }|
-        acc.concat(o.args)).concat(
-        entry_outs(f.conv.answer),
-      ).map(|a: Bytes| b", ".concat(a)),
-    ),
-    b")",
-  ]);
-  let answered = entry_answered(pr, f.conv.answer, call);
-  {
-    pr: answered.pr,
-    out: [
-      Text(
-        Bytes::concat_all([
-          b"Word ",
-          name,
-          b"_entry(PlyCtx *ctx, const Word *args) {\n",
-          Bytes::concat_all(opened.map(|o: { text: Bytes, args: List<Bytes> }| o.text)),
-        ]),
-      ),
-    ].concat(
-      answered.out,
-    ).push(
-      Text(b"}\n"),
-    ),
-  }
-}
-
-/// Whether `run` stands in `lines` as consecutive lines.
-fn holds_run(lines: List<Bytes>, run: List<Bytes>) -> Bool =
-  range(0, lines.len()).any(|i: Int| lines.drop(i).take(run.len()) == run)
 
 test "a restart takes its arguments into temporaries before it sets the parameters, then loops" {
   let int = TyCon({ name: b"Int", args: [] });
@@ -696,7 +790,8 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     key: Named(b"m.count"),
     kind: Rooted,
     params: [n, acc],
-    conv: { params: [Given, Given], reps: [RInt, RInt], answer: RInt },
+    conv: { params: [Given, Given], reps: [RInt, RInt], answer: RInt, answered: Owned },
+    answer_ty: TyCon({ name: b"Int", args: [] }),
     body: [
       let_of(c, Prim({ op: b"eq", on: RInt, args: [AVar(n), AInt(0)] }), span_between(0, 0)),
       Decl(j),
@@ -714,41 +809,25 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     base: 0,
     members: [],
     links: no_links(),
+    statics: [],
   };
-  let lines = spelled(printed_fn(f).pieces).split(b"\n");
-  assert_eq(
-    holds_run(lines, [
-      b"  ctx->fuel -= 1;",
-      b"  ply_loop: if (++ctx->ticks >= ctx->next_tick) { rt_tick_p(ctx); if (ctx->failed) return 0; }",
-      b"  int64_t t1 = (p0) == (INT64_C(0));",
-      b"  int64_t t2;",
-      b"  if (t1) {",
-      b"    t2 = p1;",
-      b"  } else {",
-      b"    PLY_SITE(ctx, @@r@@, 10, 15);",
-      b"    int64_t t3;",
-      b"    if (ply_sub_ov(p0, INT64_C(1), &t3)) { rt_overflow_p(ctx, 1); return 0; }",
-      b"    int64_t t4 = t3;",
-      b"    int64_t t5 = p1;",
-      b"    p0 = t4;",
-      b"    p1 = t5;",
-      b"    goto ply_loop;",
-      b"  }",
-      b"  ctx->fuel += 1;",
-      b"  return t2;",
-      b"}",
-    ]),
-    true,
-  );
-  assert_eq(
-    lines.at(1),
-    Some(
-      Bytes::concat_all([
-        b"int64_t ",
-        symbol_of(b"m.count"),
-        b"(PlyCtx *ctx, int64_t p0, int64_t p1) {",
-      ]),
-    ),
+  let text = spelled(printed_fn(f, no_ctors()).pieces);
+  let said = Some(String::of_bytes_lossy(text));
+  let arm = match text.index_of(b"} else {") { Some(i) -> text.slice(i, text.len()), None -> b"" };
+  let in_arm = |s: Bytes| match arm.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // Every argument is read, the second parameter's old value among them, before either is set.
+  let read = in_arm(b" = p1;");
+  assert(read >= 0 && read < in_arm(b"p0 = ") && read < in_arm(b"p1 = "), said);
+  // Then the restart jumps back to a label the body stands at before the branch.
+  let jump = in_arm(b"goto ");
+  let label = match arm.slice(jump + 5, arm.len()).index_of(b";") {
+    Some(end) -> arm.slice(jump + 5, jump + 5 + end),
+    None -> b"",
+  };
+  let stands = match text.index_of(label.concat(b":")) { Some(i) -> i, None -> 0 - 1 };
+  assert(
+    jump > in_arm(b"p1 = ") && label.len() > 0 && stands >= 0 && stands < text.len() - arm.len(),
+    said,
   )
 }
 
@@ -768,17 +847,22 @@ fn handle_over(answer: Var, body: Block) -> Inst =
 /// The C of a root answering a word, whose body is `body` and then answers `answer`.
 fn answering(answer: Var, body: Block) -> Bytes / {abort.raise} =
   spelled(
-    printed_fn({
-      key: Named(b"m.guarded"),
-      kind: Rooted,
-      params: [],
-      conv: { params: [], reps: [], answer: RWord },
-      body: body.push(Return(AVar(answer))),
-      lambdas: [],
-      base: 0,
-      members: [],
-      links: no_links(),
-    }).pieces,
+    printed_fn(
+      {
+        key: Named(b"m.guarded"),
+        kind: Rooted,
+        params: [],
+        conv: { params: [], reps: [], answer: RWord, answered: Owned },
+        answer_ty: answer.ty,
+        body: body.push(Return(AVar(answer))),
+        lambdas: [],
+        base: 0,
+        members: [],
+        links: no_links(),
+        statics: [],
+      },
+      no_ctors(),
+    ).pieces,
   )
 
 /// A handle (label 1) inside another's body (label 0), its own body reading a word from a runtime
@@ -838,58 +922,61 @@ test "a tail group is one function switching on its member's place, each arm ope
   let which = { id: 0, ty: int, rep: RInt };
   let n = { id: 1, ty: int, rep: RInt };
   let m = { id: 2, ty: int, rep: RInt };
-  let conv = { params: [Given], reps: [RInt], answer: RInt };
+  let conv = { params: [Given], reps: [RInt], answer: RInt, answered: Owned };
   let text = spelled(
-    printed_fn({
-      key: Named(b"m.even"),
-      kind: Rooted,
-      params: [which],
-      conv: { params: [Given], reps: [RInt], answer: RWord },
-      body: [
-        Case({
-          on: which,
-          test: TInt([0, 1]),
-          arms: [
-            { when: 0, body: [Enter({ member: 1, args: [AVar(n)] })] },
-            { when: 1, body: [Return(AVar(m))] },
-          ],
-          rest: [Return(AZero(RWord))],
-        }),
-      ],
-      lambdas: [],
-      base: 0,
-      members: [
-        { key: Named(b"m.even"), base: 0, params: [n], conv: conv },
-        { key: Named(b"m.odd"), base: 40, params: [m], conv: conv },
-      ],
-      links: no_links(),
-    }).pieces,
+    printed_fn(
+      {
+        key: Named(b"m.even"),
+        kind: Rooted,
+        params: [which],
+        conv: { params: [Given], reps: [RInt], answer: RWord, answered: Owned },
+        answer_ty: m.ty,
+        body: [
+          Case({
+            on: which,
+            test: TInt([0, 1]),
+            arms: [
+              { when: 0, body: [Enter({ member: 1, args: [AVar(n)] })] },
+              { when: 1, body: [Return(AVar(m))] },
+            ],
+            rest: [Return(AZero(RWord))],
+          }),
+        ],
+        lambdas: [],
+        base: 0,
+        members: [
+          { key: Named(b"m.even"), base: 0, params: [n], conv: conv },
+          { key: Named(b"m.odd"), base: 40, params: [m], conv: conv },
+        ],
+        links: no_links(),
+        statics: [],
+      },
+      no_ctors(),
+    ).pieces,
   );
   let g = symbol_of(b"m.even").concat(b"_group");
-  assert(
-    text.index_of(Bytes::concat_all([b"static Word ", g, b"(PlyCtx *ctx, int which, Word p0) {\n"]))
-      != None,
-  );
-  assert(
-    text.index_of(
-        Bytes::concat_all([
-          b"  switch (which) {\n  case 0: {\n    int64_t t1 = ",
-          word_as(b"p0", RInt),
-          b";\n",
-        ]),
-      )
-      != None,
-  );
-  // A member answers at its own convention, made the group's word.
-  let opening = b"  case 1: {\n    int64_t ";
-  let arm = match text.index_of(opening) {
-    Some(i) -> text.slice(i + opening.len(), text.len()),
-    None -> b"",
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // One function, taking the member's place beside the group's words, switching on the place.
+  assert(at(g.concat(b"(PlyCtx *ctx, int which")) >= 0 && at(b"switch (which)") >= 0, said);
+  // Each member's arm opens its words out of the group's, and the answering one makes its answer
+  // the group's word.
+  let opened = Bytes::concat_all([b" = ", word_as(b"p0", RInt), b";"]);
+  let arm = |k: Int| {
+    let from = at(Bytes::concat_all([b"case ", ascii_of_int(k), b":"]));
+    if from < 0 { b"" } else { text.slice(from, text.len()) }
   };
-  let param = match arm.index_of(b" = ") { Some(e) -> arm.slice(0, e), None -> b"" };
-  assert(arm.starts_with(Bytes::concat_all([param, b" = ", word_as(b"p0", RInt), b";\n"])));
-  assert(arm.index_of(Bytes::concat_all([b"  return ", as_word(param, RInt), b";\n"])) != None);
-  assert(text.index_of(Bytes::concat_all([g, b"(ctx, (int)args[0], args[1]);\n}\n"])) != None)
+  assert(arm(0).index_of(opened) != None && arm(1).index_of(opened) != None, said);
+  let param = {
+    let a = arm(1);
+    match a.index_of(opened) {
+      Some(e) -> match a.slice(0, e).split(b" ").last() { Some(p) -> p, None -> b"" },
+      None -> b"",
+    }
+  };
+  assert(arm(1).index_of(b"return ".concat(as_word(param, RInt))) != None, said);
+  // Each member's entry enters the group at its own place.
+  assert(at(g.concat(b"(ctx, ")) >= 0, said)
 }
 
 test "a closure's function follows its root's entry, and its body numbers its temporaries afresh" {
@@ -900,30 +987,84 @@ test "a closure's function follows its root's entry, and its body numbers its te
     key: Named(b"m.outer"),
     kind: Rooted,
     params: [x],
-    conv: { params: [Given], reps: [RInt], answer: RInt },
+    conv: { params: [Given], reps: [RInt], answer: RInt, answered: Owned },
+    answer_ty: int,
     body: [Decl(j), Assign({ var: j, arg: AVar(x) }), Return(AVar(j))],
     lambdas: [],
     base: 0,
     members: [],
     links: no_links(),
+    statics: [],
   };
   let l = Closure({ body: body, captures: 0, at: span_between(20, 30) });
   let f = { ..body, lambdas: [l] };
   let name = symbol_of(b"m.outer");
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
-  assert_eq(spelled(inner.out), b"  int64_t t1;\n  t1 = p0;\n  ctx->fuel += 1;\n  return t1;\n");
-  let printed = printed_fn(f);
+  // Its first temporary is `t1`, whatever the root's printing had numbered before it.
+  let body = spelled(inner.out);
+  assert(body.index_of(b" t1;") != None && body.index_of(b"t8") == None, None);
+  let printed = printed_fn(f, no_ctors());
   assert(
     spelled(printed.pieces).ends_with(
       Bytes::concat_all([
         b"}\n",
-        spelled(entry(name, f, printing(Map::new())).out),
+        spelled(runtime_entry(printing(Map::new()), name, entered_of(f)).out),
         spelled(lambda_text(f, 0, l, inner).out),
       ]),
     ),
   );
-  // The code table holds the entries closures name, never their bodies.
+  // A closure's descriptor names its entries, so it puts none in the code table.
   assert_eq(printed.lambdas, [])
+}
+
+test "a plain root counts no fuel or ticks; a drop root nests through the release depth and leaves by it" {
+  let ty = TyCon({ name: b"m.T", args: [] });
+  let o = { id: 0, ty: ty, rep: RWord };
+  let plain = |op: keys::TypeOp|
+    {
+      key: keys::written(op, ty, b"m"),
+      kind: Plain,
+      params: [o],
+      conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
+      answer_ty: ty,
+      body: [If({ cond: AVar(o), then: [Restart([AVar(o)])], otherwise: [Return(AZero(RWord))] })],
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links(),
+      statics: [],
+    };
+  let text_of = |op: keys::TypeOp| {
+    let f = plain(op);
+    let all = spelled(printed_fn(f, no_ctors()).pieces);
+    // The root's own function, its entry after it aside.
+    let own = Bytes::concat_all([head(symbol_of(root_text(root_name(f.key))), f), b" {"]);
+    match all.index_of(own) {
+      Some(i) -> match all.index_of_from(b"\n}\n", i) { Some(j) -> all.slice(i, j), None -> b"" },
+      None -> b"",
+    }
+  };
+  let dropped = text_of(keys::Drop);
+  let shared = text_of(keys::Share);
+  [dropped, shared].fold((), |_: Unit, t: Bytes| {
+    assert(t.len() > 0, None);
+    assert_eq(t.index_of(b"fuel"), None);
+    assert_eq(t.index_of(b"ticks"), None);
+    assert(t.index_of(b"ply_loop: ;") != None, None)
+  });
+  let at = |s: Bytes| match dropped.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  let deep = at(b"if (ply_drop_deep(ctx, p0, ");
+  assert(deep >= 0 && deep < at(b"ply_loop:"), None);
+  assert_eq(
+    occurrences(dropped, b"ply_drop_done(ctx);\n  return "),
+    occurrences(dropped, b"return 0;") - 1,
+  );
+  assert_eq(shared.index_of(b"ply_drop"), None);
+  // A drop root of a case's box enters and leaves the same way.
+  assert(
+    text_of(keys::Cased({ op: keys::Drop, case: 1 })).index_of(b"ply_drop_deep(") != None,
+    None,
+  )
 }
 
 /// A root of `params` answering an `Int`, its text starting at byte 100, whose body is `body`.
@@ -932,12 +1073,19 @@ fn int_root(params: List<Var>, body: Block) -> Fn =
     key: Named(b"m.sited"),
     kind: Rooted,
     params: params,
-    conv: { params: params.map(|_: Var| Given), reps: params.map(|v: Var| v.rep), answer: RInt },
+    conv: {
+      params: params.map(|_: Var| Given),
+      reps: params.map(|v: Var| v.rep),
+      answer: RInt,
+      answered: Owned,
+    },
+    answer_ty: TyCon({ name: b"Int", args: [] }),
     body: body,
     lambdas: [],
     base: 100,
     members: [],
     links: no_links(),
+    statics: [],
   }
 
 test "a lent run's failure sites name its lender and count from its text, until the run ends" {
@@ -974,6 +1122,7 @@ test "a lent run's failure sites name its lender and count from its text, until 
         add(v(21), span_between(130, 135)),
         Return(AVar(v(22))),
       ]),
+      no_ctors(),
     ).pieces,
   );
   let sites = text.split(b"\n").filter(|l: Bytes| l.index_of(b"PLY_SITE(") != None).map(
@@ -995,15 +1144,14 @@ test "a field taken moves out of a block held only here, in place in another or 
   let field = word_var(1);
   let f = {
     ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
-    conv: { params: [Given], reps: [RWord], answer: RWord },
+    conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
   };
-  let lines = spelled(printed_fn(f).pieces).split(b"\n");
-  assert_eq(
-    holds_run(lines, [
-      b"  Word t1 = ply_words(p0)[1];",
-      b"  if (ply_counted_by(ply_obj(p0))->rc == 1) ply_words(p0)[1] = ply_unit; else ply_inc(t1);",
-    ]),
-    true,
+  let text = spelled(printed_fn(f, no_ctors()).pieces);
+  // Its slot is emptied where the block is held only here, and the field counted once more else.
+  assert(
+    text.index_of(b"ply_words(p0)[1] = ply_unit;") != None
+      && text.index_of(call_text(inc_fn(), [b"t1"])) != None,
+    Some(String::of_bytes_lossy(text)),
   )
 }
 
@@ -1014,9 +1162,9 @@ test "a constructor's tag is a hole the unit writes in" {
       Let({ var: k, val: Tag(b"m.Box"), at: span_between(0, 0), unwind: [] }),
       Return(AVar(k)),
     ]),
+    no_ctors(),
   );
-  assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))));
-  assert(spelled(pr.pieces).index_of(b"  int64_t t1 = @@Tm.Box@@;\n") != None)
+  assert(pr.pieces.contains(Hole(TagOf(b"m.Box"))))
 }
 
 /// A call of `m.g` giving it `args`, answering a word.
@@ -1024,7 +1172,12 @@ fn called(args: List<Arg>) -> Val =
   Call({
     callee: Root(Named(b"m.g")),
     args: args,
-    conv: { params: args.map(|_: Arg| Given), reps: args.map(|_: Arg| RWord), answer: RWord },
+    conv: {
+      params: args.map(|_: Arg| Given),
+      reps: args.map(|_: Arg| RWord),
+      answer: RWord,
+      answered: Owned,
+    },
     stops: false,
   })
 
@@ -1035,10 +1188,28 @@ fn holding(v: Var, val: Val, unwind: List<Var>) -> Inst =
 /// The C of a root taking `params`, each given, whose body is `body`, answering a word.
 fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
   spelled(
-    printed_fn({
-      ..int_root(params, body),
-      conv: { params: params.map(|_: Var| Given), reps: params.map(|v: Var| v.rep), answer: RWord },
-    }).pieces,
+    printed_fn(
+      {
+        ..int_root(params, body),
+        conv: {
+          params: params.map(|_: Var| Given),
+          reps: params.map(|v: Var| v.rep),
+          answer: RWord,
+          answered: Owned,
+        },
+      },
+      no_ctors(),
+    ).pieces,
+  )
+
+/// What letting go of a `String` named `name` prints: a call of its type's drop root, a hole.
+fn released_text(name: Bytes) -> Bytes / {abort.raise} =
+  call_text(rel_fn(), [
+    b"ctx",
+    name,
+    spelled([Hole(Symbol(Root(drop_of(TyCon({ name: b"String", args: [] })))))]),
+  ]).concat(
+    b";",
   )
 
 test "each failure releases what it holds through tails that failures holding alike share" {
@@ -1046,29 +1217,25 @@ test "each failure releases what it holds through tails that failures holding al
   let a = word_var(1);
   let b = word_var(2);
   let c = word_var(3);
-  let lines = word_root([s], [
+  let text = word_root([s], [
     holding(a, called([]), [s]),
     holding(b, called([]), [s, a]),
     holding(c, called([AVar(a)]), [s, b]),
     Return(AVar(c)),
-  ]).split(
-    b"\n",
-  );
-  assert_eq(lines.filter(|l: Bytes| l.starts_with(b"  if (ctx->failed) ")), [
-    b"  if (ctx->failed) goto ply_u0;",
-    b"  if (ctx->failed) goto ply_u1;",
-    b"  if (ctx->failed) goto ply_u2;",
   ]);
-  // The latest declared is let go of first, and the parameter's release is the one every path ends by.
-  assert(
-    holds_run(lines, [
-      b"  return t3;",
-      b"  ply_u2: ply_dec(ctx, t2); goto ply_u0;",
-      b"  ply_u1: ply_dec(ctx, t1);",
-      b"  ply_u0: ply_dec(ctx, p0); return 0;",
-      b"}",
-    ]),
-  )
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // Three failures holding three different sets jump to three tails.
+  let jumps = text.split(b"\n").filter(|l: Bytes| l.index_of(b"if (ctx->failed) goto ") != None);
+  let distinct = jumps.fold([], |acc: List<Bytes>, l: Bytes|
+    if acc.contains(l) { acc } else { acc.push(l) });
+  assert(jumps.len() == 3 && distinct.len() == 3, said);
+  // Each value is let go of once on the failure paths, the latest declared first, and the parameter,
+  // which every failure holds, by the one tail every path ends with.
+  let freed = [b"t2", b"t1", b"p0"].map(|x: Bytes| released_text(x));
+  assert(freed.all(|r: Bytes| occurrences(text, r) == 1), said);
+  assert(at(b"return t3;") < at(freed.get(0)), said);
+  assert(at(freed.get(0)) < at(freed.get(1)) && at(freed.get(1)) < at(freed.get(2)), said)
 }
 
 test "a tail stands in the block its value was declared in, and goes on to the tails of the blocks around it" {
@@ -1077,7 +1244,7 @@ test "a tail stands in the block its value was declared in, and goes on to the t
   let j = word_var(2);
   let a = word_var(3);
   let b = word_var(4);
-  let lines = word_root([s, flag], [
+  let text = word_root([s, flag], [
     Decl(j),
     If({
       cond: AVar(flag),
@@ -1089,20 +1256,14 @@ test "a tail stands in the block its value was declared in, and goes on to the t
       otherwise: [Assign({ var: j, arg: AVar(s) })],
     }),
     Return(AVar(j)),
-  ]).split(
-    b"\n",
-  );
-  // The arm goes on past its end, so its tails stand where only a failure reaches them.
-  assert(
-    holds_run(lines, [
-      b"    t1 = t3;",
-      b"    if (0) {",
-      b"      ply_u1: ply_dec(ctx, t2); goto ply_u0;",
-      b"    }",
-      b"  } else {",
-    ]),
-  );
-  assert(holds_run(lines, [b"  return t1;", b"  ply_u0: ply_dec(ctx, p0); return 0;", b"}"]))
+  ]);
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // The arm's own value is let go of inside the arm, after its last statement, where only a
+  // failure reaches; the parameter's tail stands after the function's answer.
+  let arm_tail = at(released_text(b"t2"));
+  assert(at(b"t1 = t3;") < arm_tail && arm_tail < at(b"} else {"), said);
+  assert(at(b"return t1;") < at(released_text(b"p0")), said)
 }
 
 test "a failure inside a handle's body releases what the body holds and goes to the landing, which releases what the handle holds" {
@@ -1125,16 +1286,18 @@ test "a failure inside a handle's body releases what the body holds and goes to 
     }),
     Return(AVar(answer)),
   ]);
-  let landing = match text.index_of(b"ply_h0: ;") { Some(at) -> at, None -> 0 };
+  // The landing is where the last jump to it is; everything before is the body.
+  let jumps = text.split(landing_jump(0));
+  let landing = text.len() - (match jumps.last() { Some(rest) -> rest.len(), None -> 0 });
   let body = text.slice(0, landing);
   let after = text.slice(landing, text.len());
-  // The body's value is let go of on the way to the landing, and what the handle holds is not.
-  assert(body.index_of(b"if (ctx->failed) goto ply_h0;") != None);
-  assert(body.index_of(b": ply_dec(ctx, t4); goto ply_h0;") != None);
-  assert_eq(occurrences(body, b"ply_dec(ctx, p0);"), 0);
-  // The landing lets go of it where no clause answers the failure.
-  assert(after.index_of(b"if (ctx->failed) goto ply_u") != None);
-  assert(after.index_of(b": ply_dec(ctx, p0); return 0;") != None)
+  let said = Some(String::of_bytes_lossy(text));
+  // A failure in the body lets go of the body's value on its way to the landing, and not of what
+  // the handle holds.
+  assert(jumps.len() >= 3 && occurrences(body, released_text(b"t4")) == 1, said);
+  assert_eq(occurrences(body, released_text(b"p0")), 0);
+  // The landing lets go of what the handle holds where no clause answers the failure.
+  assert_eq(occurrences(after, released_text(b"p0")), 1)
 }
 
 test "a value whose C tests for no failure adds no tail" {

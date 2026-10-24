@@ -1,0 +1,136 @@
+//! Static objects a body's C names: values laid out once, at build, where the program's data lives.
+
+import std.bin
+import std.bytes (hex_digit)
+import emit.keys (RootKey, root_key_bin)
+import emit.layout (str_laid)
+import check.types (Type, string_type, bytes_type)
+
+/// A static object (`Val.Static` names one): its name, `ply_k_` and the start of the digest of what
+/// it holds, so one name is one content and the unit lays each out once; and how it is laid.
+pub type StaticDef = { name: Bytes, laid: StaticLaid }
+
+/// How a static object is laid out. `SBlock`: as emitted code reads a block it made, an immortal
+/// count, the refused kind, each `head` field of the header set by its name (`flags`, `aux`, `len`,
+/// `layout`), then `words`. `SPlain`: words with no header. `SStruct`: one of the machine structs
+/// `emit.layout` declares, by its name, each field in order. `SFile`: the bytes of a file the program
+/// embeds, by their digest, as a byte string the unit lays out from what it was handed.
+pub type StaticLaid =
+  | SBlock({ head: List<{ field: Bytes, value: Int }>, words: List<StaticWord> })
+  | SPlain(List<StaticWord>)
+  | SStruct({ of: Bytes, fields: List<StaticWord> })
+  | SFile(Bytes)
+
+/// A word of a static object, or a field of a machine struct. `WRaw`: the integer itself.
+/// `WAddress`: another static object's address, its low bits `tag`. `WEntry`: a root's C function.
+/// `WBytes`: bytes laid in place, padded with zeros to a whole word. `WField`: the field table's
+/// entry of a name, which the unit writes in. `WHead`: a C function the emitter's head defines, by
+/// its name.
+pub type StaticWord =
+  | WRaw(Int)
+  | WAddress({ name: Bytes, tag: Int })
+  | WEntry(RootKey)
+  | WBytes(Bytes)
+  | WField(Bytes)
+  | WHead(Bytes)
+
+derive bin for StaticWord
+derive bin for StaticLaid
+derive bin for StaticDef
+
+/// The static laid as `laid`, named by its content: `ply_k_` and the first 32 hex digits of the
+/// blake3 of `laid`, which names the statics it addresses by their own content, so two statics share
+/// a name exactly where they hold the same.
+pub fn named(laid: StaticLaid) -> StaticDef / {abort.raise} = {
+  let digest = bin::encode(laid, static_laid_bin()).blake3().slice(0, 16);
+  {
+    name: Bytes::concat_all(
+      [b"ply_k_"].concat(
+        range(0, digest.len()).map(|i: Int|
+          hex_digit(digest.at(i) / 16).concat(hex_digit(digest.at(i) % 16))),
+      ),
+    ),
+    laid: laid,
+  }
+}
+
+/// The words `d` lays out after any header, a machine struct's fields among them; none for a file's
+/// bytes.
+pub fn words_of(d: StaticDef) -> List<StaticWord> =
+  match d.laid { SBlock(b) -> b.words, SPlain(ws) -> ws, SStruct(s) -> s.fields, SFile(_) -> [] }
+
+/// The roots whose C functions `d` holds, in order.
+pub fn entries_of(d: StaticDef) -> List<RootKey> =
+  words_of(d).fold([], |acc: List<RootKey>, w: StaticWord|
+    match w { WEntry(k) -> acc.push(k), _ -> acc })
+
+/// The kind the runtime reads a 64- or 128-bit width's box by, as `heap.rs` numbers it, whose
+/// `layout` is the width's place among the runtime's.
+pub fn wide_kind() -> Int = 18
+
+/// The kind of a block emitted code lays out itself, which no walker of the runtime reads: a static
+/// object's where its head names no other.
+pub fn refused_kind() -> Int = 21
+
+/// The kinds of the runtime's boxes of a value its word form does not hold in a word, as `heap.rs`
+/// numbers them: an `Int` past 62 bits, a `Float`, a `Decimal`.
+pub fn int_kind() -> Int = 2
+
+/// The kind of the runtime's object of a `Bool`, whose header's flags are the value.
+pub fn bool_kind() -> Int = 1
+
+pub fn float_kind() -> Int = 16
+
+pub fn decimal_kind() -> Int = 19
+
+/// The kinds of a list's, a map's, an array's and a `Columns`' own object, as `heap.rs` numbers
+/// them; a list's and a map's nodes are of the kinds `layout.layouts()` names.
+pub fn list_kind() -> Int = 5
+
+pub fn map_kind() -> Int = 8
+
+pub fn array_kind() -> Int = 15
+
+pub fn columns_kind() -> Int = 20
+
+/// The header flag an array's and a `Columns`' object carries, as emitted code allocates them
+/// (`PLY_FLAT`).
+pub fn flat_flag() -> Int = 1
+
+/// The kinds of a string's and a byte string's object, as `heap.rs` numbers them, which the
+/// runtime's functions on text tell them apart by.
+pub fn str_kind() -> Int = 9
+
+pub fn bytes_kind() -> Int = 10
+
+/// The kind of the runtime's text a value of `ty` is held as: a string's for `String`, a byte
+/// string's for `Bytes`; none for any other type, which no text is.
+pub fn text_kind(ty: Type) -> Option<Int> =
+  if ty == string_type() { Some(str_kind()) }
+  else if ty == bytes_type() { Some(bytes_kind()) }
+  else { None }
+
+/// The header fields and words of a string's or a byte string's object holding `b`, of `kind`
+/// (`str_kind` or `bytes_kind`): its length and its room both `b`'s, no view.
+pub fn text_block(
+  b: Bytes,
+  kind: Int,
+) -> { head: List<{ field: Bytes, value: Int }>, words: List<StaticWord> } =
+  {
+    head: [
+      { field: b"kind", value: kind },
+      { field: b"len", value: b.len() },
+      { field: str_laid().room, value: b.len() },
+    ],
+    words: if b.len() == 0 { [] } else { [WBytes(b)] },
+  }
+
+test "a static's name is its content's: equal contents share one, and a child's content moves its parents'" {
+  let s = named(SBlock(text_block(b"ply", str_kind())));
+  assert_eq(named(SBlock(text_block(b"ply", str_kind()))), s);
+  assert(named(SBlock(text_block(b"plz", str_kind()))).name != s.name, None);
+  // A string and a byte string of one content are told apart by the runtime, so they are two.
+  assert(named(SBlock(text_block(b"ply", bytes_kind()))).name != s.name, None);
+  let parent = |child: StaticDef| named(SPlain([WAddress({ name: child.name, tag: 0 })]));
+  assert(parent(s).name != parent(named(SBlock(text_block(b"plz", str_kind())))).name, None)
+}

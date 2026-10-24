@@ -50,9 +50,26 @@ pub effect toolchain {
   write ran(path: String, args: List<String>) -> Ran
 }
 
+/// The asking program's own heap, which no two runs need read alike.
+pub nondet effect memory {
+  /// What the heap holds now, read without a walk of its objects.
+  read heap() -> Memory
+  /// The live objects now, the most bytes first: a walk of every object.
+  read census() -> List<Live>
+}
+
 /// How a program ran: its exit code, `-1` where a signal ended it or it did not start, and what it
 /// wrote to standard output.
 pub type Ran = { code: Int, out: Bytes }
+
+/// What a heap holds, in bytes: `live` is the blocks its live objects take, each its size class's
+/// whole block, and `held` the pages and larger blocks holding them, whatever is live in them.
+pub type Memory = { live: Int, held: Int }
+
+/// A heap's live objects of one sort, how many there are and their bytes past their headers. A
+/// record is told by its fields, a constructor by its name, and a block emitted code laid out, whose
+/// header names no type, by its bytes past the header; any other object by its kind.
+pub type Live = { what: String, objects: Int, bytes: Int }
 
 /// A compiler: its path, what identifies it, which every key it makes holds, and what every
 /// invocation of it needs that others do not, as tcc's `-B` names where its support library is.
@@ -66,6 +83,8 @@ pub type Toolchain = {
   support: List<String>,
   /// The optimisation flag.
   level: String,
+  /// Whether emitted code checks what it assumes (`PLY_CHECKED`), as a development build's does.
+  checked: Bool,
 }
 
 /// A unit's C cut at its marks: the head every part compiles after, then each part by its label.
@@ -116,8 +135,8 @@ pub fn split(text: Bytes) -> Parts / {abort.raise} = {
 fn key_of(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String / {abort.raise} =
   blake3(
     Bytes::concat_all(
-      [t.identity, b"\x00", Bytes::of_string(t.level), b"\x00"].concat(
-        float_flags().concat(flags).map(|f: String| Bytes::of_string(f).concat(b"\x00")).concat(
+      [t.identity, b"\x00"].concat(
+        compile_flags(t).concat(flags).map(|f: String| Bytes::of_string(f).concat(b"\x00")).concat(
           pieces,
         ),
       ),
@@ -127,62 +146,75 @@ fn key_of(t: Toolchain, flags: List<String>, pieces: List<Bytes>) -> String / {a
 
 /// What every compile passes after its level, whatever the level asks for: each `Float` operation
 /// rounded once, as written, so none is fused with another or reordered.
-pub fn float_flags() -> List<String> = ["-ffp-contract=off", "-fno-fast-math"]
+fn float_flags() -> List<String> = ["-ffp-contract=off", "-fno-fast-math"]
 
-/// What `compiler` compiles with at `level`.
-pub fn toolchain_of(compiler: Compiler, level: String) -> Toolchain =
-  { identity: compiler.identity, support: compiler.support, level: level }
+/// What `t` passes every compile before the flags its asker adds: its level, `PLY_CHECKED` defined
+/// where it is checked, and [`float_flags`].
+pub fn compile_flags(t: Toolchain) -> List<String> =
+  [t.level].concat(if t.checked { ["-DPLY_CHECKED"] } else { [] }).concat(float_flags())
+
+/// What `compiler` compiles with at `level`, checked or not.
+pub fn toolchain_of(compiler: Compiler, level: String, checked: Bool) -> Toolchain =
+  { identity: compiler.identity, support: compiler.support, level: level, checked: checked }
 
 /// Each of `runs` run to its end, `toolchain.jobs()` at a time and each waited for in the order it
-/// started: nothing, or what the first refusal said. Every job started is waited for, so none
-/// outlives the refusal it is part of.
+/// started: nothing, or what every refusal said, each after the run it refused, in that order, so
+/// one build reports every part that does not compile. A compiler that cannot be started stops any
+/// more from starting; every job started is waited for, so none outlives the refusal.
 fn ran<[c]>(
   runs: List<List<String>>,
 ) -> Result<Unit, String> / {compilers.write[c], toolchain.read, abort.raise} = {
   let jobs = toolchain.jobs();
-  let waited = |run: { job: Int, args: List<String> }|
+  let refusal = |run: { job: Int, args: List<String> }|
     match compilers.finished[c](run.job) {
-      None -> Ok(()),
+      None -> None,
       Some(err) ->
-        Err(
+        Some(
           "the C compiler refused `" ++ String::join(run.args, " ") ++ "`:\n"
             ++ String::of_bytes_lossy(err),
         ),
     };
-  iterate(
-    { next: 0, running: [], failed: None },
+  let refused = iterate(
+    { next: 0, running: [], refused: [], stopped: false },
     2 * runs.len() + 2,
-    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, failed: Option<String> }|
-      match s.failed {
-        Some(why) -> match s.running {
-          [] -> Stop(Err(why)),
-          [first, ..rest] -> {
-            let _ = waited(first);
-            Continue({ ..s, running: rest })
-          },
-        },
-        None -> if s.next < runs.len() && s.running.len() < jobs {
-          match compilers.started[c](runs.get(s.next)) {
-            Ok(job) ->
-              Continue({
-                ..s,
-                next: s.next + 1,
-                running: s.running.push({ job: job, args: runs.get(s.next) }),
-              }),
-            Err(why) ->
-              Continue({ ..s, failed: Some("the C compiler could not be started: " ++ why) }),
-          }
-        } else {
-          match s.running {
-            [] -> Stop(Ok(())),
-            [first, ..rest] -> match waited(first) {
-              Ok(_) -> Continue({ ..s, running: rest }),
-              Err(why) -> Continue({ ..s, running: rest, failed: Some(why) }),
-            },
-          }
-        },
+    |s: { next: Int, running: List<{ job: Int, args: List<String> }>, refused: List<String>, stopped: Bool }|
+      if !s.stopped && s.next < runs.len() && s.running.len() < jobs {
+        match compilers.started[c](runs.get(s.next)) {
+          Ok(job) ->
+            Continue({
+              ..s,
+              next: s.next + 1,
+              running: s.running.push({ job: job, args: runs.get(s.next) }),
+            }),
+          Err(why) ->
+            Continue({
+              ..s,
+              refused: s.refused.push("the C compiler could not be started: " ++ why),
+              stopped: true,
+            }),
+        }
+      } else {
+        match s.running {
+          [] -> Stop(s.refused),
+          [first, ..rest] ->
+            Continue({
+              ..s,
+              running: rest,
+              refused: match refusal(first) { Some(why) -> s.refused.push(why), None -> s.refused },
+            }),
+        }
       },
-  )
+  );
+  match refused {
+    [] -> Ok(()),
+    [why] -> Err(why),
+    _ ->
+      Err(
+        "the C compiler refused " ++ refused.len().to_string() ++ " of " ++ runs.len().to_string()
+          ++ " runs:\n\n"
+          ++ String::join(refused, "\n\n"),
+      ),
+  }
 }
 
 /// One part of a unit as a compiler is given it: its label, and the digest of its C with the head
@@ -256,7 +288,7 @@ fn compiled<[c]>(
   let cache = toolchain.cache();
   let object = |k: Int| work ++ "/" ++ missing.get(k).to_string() ++ ".o";
   let runs = range(0, missing.len()).map(|k: Int|
-    t.support.concat([t.level].concat(float_flags()).concat(flags)).concat([
+    t.support.concat(compile_flags(t).concat(flags)).concat([
       "-c",
       "-o",
       cache ++ "/" ++ object(k),
@@ -481,10 +513,12 @@ pub fn stack_marked(library: Bytes) -> Bytes / {abort.raise} = {
 /// The flags every object of a library a program loads compiles with.
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
 
-/// `text`, a unit's C, compiled by the compiler labelled `c` at `level` with `flags` and linked into a
-/// library the cache keeps: its path, or why it was not built. `veneers` is [`shared`]'s.
+/// `text`, a unit's C, compiled by the compiler labelled `c` at `level`, checked or not, with `flags`
+/// and linked into a library the cache keeps: its path, or why it was not built. `veneers` is
+/// [`shared`]'s.
 pub fn library<[c]>(
   level: String,
+  checked: Bool,
   flags: List<String>,
   text: Bytes,
   veneers: Bool = true,
@@ -492,7 +526,7 @@ pub fn library<[c]>(
   match compilers.found[c]() {
     None -> Err(BuildFailed("no C compiler is installed to compile the unit with")),
     Some(compiler) -> {
-      let t = toolchain_of(compiler, level);
+      let t = toolchain_of(compiler, level, checked);
       let parts = split(text);
       let cache = toolchain.cache();
       let made = library_of(
@@ -533,7 +567,7 @@ pub fn executable<[c]>(
   if !toolchain.written(work ++ "/main.c", main) {
     Err("the program's `main` could not be written")
   } else {
-    match ran[c]([t.support.concat([t.level].concat(float_flags()).concat(["-c", "-o", o, c]))]) {
+    match ran[c]([t.support.concat(compile_flags(t).concat(["-c", "-o", o, c]))]) {
       Err(why) -> Err(why),
       Ok(_) -> match ran[c]([t.support.concat(["-o", out, o].concat(objects)).concat(libraries)]) {
         Err(why) -> Err(why),
@@ -588,13 +622,81 @@ test "a manifest reads back as the sources it was written from, and nothing else
 }
 
 test "an object's key moves with its compiler, its level, its flags and its C" {
-  let t = { identity: b"cc 1", support: [], level: "-O2" };
+  let t = { identity: b"cc 1", support: [], level: "-O2", checked: false };
   let base = key_of(t, ["-c"], [b"head", b"text"]);
   assert_eq(key_of(t, ["-c"], [b"head", b"text"]), base);
   assert(key_of({ ..t, identity: b"cc 2" }, ["-c"], [b"head", b"text"]) != base);
   assert(key_of({ ..t, level: "-O0" }, ["-c"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c", "-fvisibility=hidden"], [b"head", b"text"]) != base);
   assert(key_of(t, ["-c"], [b"head", b"text2"]) != base)
+}
+
+test "a checked toolchain compiles with `PLY_CHECKED` defined and keys its objects apart, and an unchecked one does not" {
+  let compiler = { path: "cc", identity: b"cc 1", support: [] };
+  let development = toolchain_of(compiler, "-O0", true);
+  let release = toolchain_of(compiler, "-O2", false);
+  assert(compile_flags(development).contains("-DPLY_CHECKED"), None);
+  assert(!compile_flags(release).contains("-DPLY_CHECKED"), None);
+  assert(
+    key_of(development, ["-c"], [b"text"])
+      != key_of({ ..development, checked: false }, ["-c"], [b"text"]),
+    None,
+  )
+}
+
+/// What `ran` answers over `runs` where the compiler says `said` of each run, its argument the
+/// run's last, `None` where it compiles; and how many runs were started.
+fn ran_over(
+  runs: List<List<String>>,
+  said: (String) -> Option<Bytes>,
+) -> { answer: Result<Unit, String>, started: Int } / {abort.raise} =
+  handle {
+    ran[cc](runs)
+  } with {
+    var started = 0,
+    compilers.started[cc](args) -> {
+      started = started + 1;
+      Ok(started - 1)
+    },
+    compilers.finished[cc](job) -> said(match runs.get(job).last() { Some(f) -> f, None -> "" }),
+    toolchain.jobs() -> 1,
+    toolchain.cache() -> panic("a run reads no cache"),
+    toolchain.holds(path) -> panic("a run reads no cache"),
+    toolchain.held(path) -> panic("a run reads no cache"),
+    toolchain.libraries() -> panic("a run links no library"),
+    return answer -> { answer: answer, started: started },
+  }
+
+test "a compile runs every part, and fails once with what the compiler said of each part it refused" {
+  let runs = [["-c", "a.c"], ["-c", "b.c"], ["-c", "c.c"]];
+  let said = |file: String|
+    if file == "b.c" { None } else { Some(Bytes::of_string(file ++ ":1: error: no")) };
+  let r = ran_over(runs, said);
+  // One part refused does not keep the others from compiling.
+  assert_eq(r.started, 3);
+  match r.answer {
+    Ok(_) -> assert(false, Some("a compile two parts refused succeeded")),
+    Err(why) -> {
+      let text = Bytes::of_string(why);
+      let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+      assert(
+        text.starts_with(b"the C compiler refused 2 of 3 runs")
+          && at(b"`-c a.c`:\na.c:1: error: no") >= 0
+          && at(b"`-c c.c`:\nc.c:1: error: no") >= 0
+          && at(b"b.c") < 0,
+        Some(why),
+      );
+      // In the order the parts were started.
+      assert(at(b"a.c:1") < at(b"c.c:1"), Some(why))
+    },
+  };
+  // One refusal is said alone, and none is a success.
+  assert_eq(
+    ran_over(runs, |file: String|
+      if file == "c.c" { Some(Bytes::of_string("bad")) } else { None }).answer,
+    Err("the C compiler refused `-c c.c`:\nbad"),
+  );
+  assert_eq(ran_over(runs, |_: String| None).answer, Ok(()))
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =

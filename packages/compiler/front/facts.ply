@@ -9,7 +9,7 @@ import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMat
                      ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
                      EParallel, EBad, EHole, ETryBlock, Param, SLet, SLetElse, SExpr, SAssign,
                      HandlerVar, RecField, expr_span, ETagged, Tagged, Hole, TaggedPart,
-                     tagged_parts, tagged_part_bin)
+                     tagged_parts, tagged_part_bin, prelude_module)
 import syntax.patterns (Lit, LInt, LStr, LBytes)
 import check.types (unit_type, TypeTable, HeldType, held_type_bin, types_held, types_of)
 import check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify, import_module_name)
@@ -23,11 +23,11 @@ import store.hash.encoding (hex)
 import check.infer (CheckOutput, types_named, types_joined, stated, EmitFacts, emit_facts_bin)
 import check.infer.checker (Location, DefInfo, TestInfo, LawInfo, EffectInfo, OpInfo, CtorInfo,
                             KeptFacts, WalkedBody, WitnessOrder, LabelSite, TypedSite, TrySite,
-                            MemberSite, UpdateShape, WitnessOp, WitnessRef, is_test_owner,
-                            InstanceInfo, NumericInfo, def_info_bin, test_info_bin, law_info_bin,
-                            effect_info_bin, ctor_info_bin, instance_info_bin, numeric_info_bin,
-                            kept_facts_bin)
+                            MemberSite, UpdateShape, WitnessOp, WitnessRef, InstanceInfo,
+                            NumericInfo, def_info_bin, test_info_bin, law_info_bin, effect_info_bin,
+                            ctor_info_bin, instance_info_bin, numeric_info_bin, kept_facts_bin)
 import check.infer.solved (prelude_tables)
+import emit.keys (test_owner, law_owner)
 import front.diagnostics (placed)
 import front.pkg (PackageSources, Closure, Package, Pinned, closure, pins_of)
 import check.resolve.scopes (PackageDeps)
@@ -644,8 +644,8 @@ fn first_index(xs: List<Int>) -> Int = match xs { [x, ..] -> x, [] -> 0 }
 
 /// The functions a program reaches of the shipped modules `shipped` names, as `reach_of` reads it:
 /// what every other definition, declaration, test and law reaches, what a module outside them
-/// imports by a name that is no type or effect, and what a shipped module's statements name.
-/// `hashes` are the program's own, every function of those modules among them.
+/// imports by a name that is no type or effect, and what a shipped module's types, effects and
+/// statements name. `hashes` are the program's own, every function of those modules among them.
 fn reached_of(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
@@ -653,7 +653,17 @@ fn reached_of(
 ) -> Map<Bytes, Bool> / {abort.raise} = {
   let roots = shapes.fold([], |acc: List<Which>, s: ModuleShape| {
     let o = s.outline;
-    if shipped.contains(o.name) { acc.concat(o.stated.map(|t: Bytes| TheDecl(t))) } else {
+    if shipped.contains(o.name) {
+      o.items.fold(
+        acc.concat(o.stated.map(|t: Bytes| TheDecl(t))),
+        |a: List<Which>, item: Outlined|
+          match item {
+            OType(x) -> a.push(TheDecl(qualify(o.name, x.name))),
+            OEffect(x) -> a.push(TheDecl(qualify(o.name, x.name))),
+            _ -> a,
+          },
+      )
+    } else {
       let own = o.items.fold(acc, |a: List<Which>, item: Outlined|
         match item {
           OFn(x) -> a.push(TheFn(qualify(o.name, x.name))),
@@ -716,16 +726,7 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
 /// `t`, the tables of the shipped module `o` outlines as it answered, cut to what a program reaches
 /// of it, `reached`: a function it does not reach, its sites and every test and law are left out.
 fn cut_tables(t: ModuleTables, o: Outline, reached: Map<Bytes, Bool>) -> ModuleTables = {
-  let spans = o.items.fold([], |acc: List<Span>, item: Outlined|
-    match item {
-      OFn(x) -> if kept_in_cut(o, reached, item) { acc.push(x.span) } else { acc },
-      _ -> acc,
-    });
-  // A clause's sites are filed under no owner, inside the definition the clause is of.
-  let owned = |owner: Bytes, span: Span|
-    if owner.len() == 0 {
-      spans.fold(false, |b: Bool, at: Span| b || (span.start >= at.start && span.end <= at.end))
-    } else { reached.contains(owner) };
+  let owned = |owner: Bytes| reached.contains(owner);
   let e = t.facts.elaboration;
   {
     ..t,
@@ -734,33 +735,34 @@ fn cut_tables(t: ModuleTables, o: Outline, reached: Map<Bytes, Bool>) -> ModuleT
     laws: [],
     facts: {
       pure: t.facts.pure.filter(|n: Bytes| reached.contains(n)),
-      label_sites: t.facts.label_sites.filter(|x: LabelSite| owned(x.owner, x.span)),
-      typed: t.facts.typed.filter(|x: TypedSite| owned(x.owner, x.span)),
-      types: types_named(
-        t.facts.types,
-        t.facts.typed.filter(|x: TypedSite| owned(x.owner, x.span)),
-      ),
+      label_sites: t.facts.label_sites.filter(|x: LabelSite| owned(x.owner)),
+      typed: t.facts.typed.filter(|x: TypedSite| owned(x.owner)),
+      types: types_named(t.facts.types, t.facts.typed.filter(|x: TypedSite| owned(x.owner))),
       elaboration: {
-        updates: e.updates.filter(|x: UpdateShape| owned(x.owner, x.span)),
-        ops: e.ops.filter(|x: WitnessOp| owned(x.owner, x.span)),
-        refs: e.refs.filter(|x: WitnessRef| owned(x.owner, x.span)),
+        updates: e.updates.filter(|x: UpdateShape| owned(x.owner)),
+        ops: e.ops.filter(|x: WitnessOp| owned(x.owner)),
+        refs: e.refs.filter(|x: WitnessRef| owned(x.owner)),
         // A witness order names its definition as written.
         orders: e.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
-        tries: e.tries.filter(|x: TrySite| owned(x.owner, x.span)),
-        members: e.members.filter(|x: MemberSite| owned(x.owner, x.span)),
+        tries: e.tries.filter(|x: TrySite| owned(x.owner)),
+        members: e.members.filter(|x: MemberSite| owned(x.owner)),
       },
     },
     kept: t.kept.filter(|k: KeptFacts| reached.contains(k.name)),
   }
 }
 
-/// Whether a site in module `module` is of the walk of its definitions, which takes each module
-/// in the order they are checked in: a body's own, or a clause's, inside its definition. A test's,
-/// a schema's and a law's are walked after every definition, each module in its place.
-fn of_definitions(fn_spans: List<List<Span>>, module: Int, owner: Bytes, span: Span) -> Bool =
-  if owner.len() == 0 {
-    match fn_spans.at(module) { Some(xs) -> within_any(xs, span), None -> false }
-  } else { !is_test_owner(owner) }
+/// The owners the sites of the tests and laws `outlines` outline go by. Those are walked after every
+/// definition, each module in its place; the rest, a body's own or a clause's, are of the walk of
+/// the definitions, which takes each module in the order they are checked in.
+fn walked_apart(outlines: List<Outline>) -> Map<Bytes, Bool> / {abort.raise} =
+  outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
+    o.items.fold(acc, |m: Map<Bytes, Bool>, item: Outlined|
+      match item {
+        OTest(t) -> m.insert(test_owner(o.name, t.name), true),
+        OLaw(l) -> m.insert(law_owner(o.name, l.name), true),
+        _ -> m,
+      }))
 
 /// What `pick` holds of each of `checked`, the modules in the order they are checked in, that
 /// `first` says is of the walk of definitions, then the rest of each of `placed`, the modules in
@@ -800,28 +802,32 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
 }
 
 /// `t`, the tables of the module `o` outlines, read without its tests and laws.
-fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables = {
-  let ours = |owner: Bytes, span: Span| of_definitions([fn_spans_of(o)], 0, owner, span);
+fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} = {
   let e = t.facts.elaboration;
+  let apart = walked_apart([o]);
+  let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ..t,
     tests: [],
     laws: [],
     facts: {
       ..t.facts,
-      label_sites: t.facts.label_sites.filter(|x: LabelSite| ours(x.owner, x.span)),
-      typed: t.facts.typed.filter(|x: TypedSite| ours(x.owner, x.span)),
-      types: types_named(t.facts.types, t.facts.typed.filter(|x: TypedSite| ours(x.owner, x.span))),
+      label_sites: t.facts.label_sites.filter(|x: LabelSite| of_definitions(x.owner)),
+      typed: t.facts.typed.filter(|x: TypedSite| of_definitions(x.owner)),
+      types: types_named(
+        t.facts.types,
+        t.facts.typed.filter(|x: TypedSite| of_definitions(x.owner)),
+      ),
       elaboration: {
         ..e,
-        updates: e.updates.filter(|x: UpdateShape| ours(x.owner, x.span)),
-        ops: e.ops.filter(|x: WitnessOp| ours(x.owner, x.span)),
-        refs: e.refs.filter(|x: WitnessRef| ours(x.owner, x.span)),
-        tries: e.tries.filter(|x: TrySite| ours(x.owner, x.span)),
-        members: e.members.filter(|x: MemberSite| ours(x.owner, x.span)),
+        updates: e.updates.filter(|x: UpdateShape| of_definitions(x.owner)),
+        ops: e.ops.filter(|x: WitnessOp| of_definitions(x.owner)),
+        refs: e.refs.filter(|x: WitnessRef| of_definitions(x.owner)),
+        tries: e.tries.filter(|x: TrySite| of_definitions(x.owner)),
+        members: e.members.filter(|x: MemberSite| of_definitions(x.owner)),
       },
     },
-    kept: t.kept.filter(|k: KeptFacts| !is_test_owner(k.name)),
+    kept: t.kept.filter(|k: KeptFacts| of_definitions(k.name)),
   }
 }
 
@@ -918,6 +924,14 @@ pub fn no_reads() -> TableReads = { reads: [], reach: Map::new() }
 pub fn functions_of(frame: Frame) -> Int =
   frame.outlines.fold(0, |n: Int, o: Outline|
     o.items.fold(n, |k: Int, item: Outlined| match item { OFn(_) -> k + 1, _ -> k }))
+
+/// How many functions `frame` outlines past the prelude's: those the prelude holds are the
+/// language's, reached wherever a body compares or crosses a value, which no program writes.
+pub fn written_functions_of(frame: Frame) -> Int =
+  functions_of({
+    ..frame,
+    outlines: frame.outlines.filter(|o: Outline| o.name != prelude_module()),
+  })
 
 /// How many tests the first `own` modules `frame` outlines hold: its check's tables hold one of
 /// each.
@@ -1153,14 +1167,13 @@ fn merged_tables(
   order: List<Bytes>,
   placed: List<ModuleTables>,
 ) -> CheckOutput / {abort.raise} = {
-  let fn_spans = outlines.map(fn_spans_of);
   let at_name = range(0, outlines.len()).fold(Map::new(), |acc: Map<Bytes, Int>, k: Int|
     acc.insert(outlines.get(k).name, k));
   // The checker takes the modules in the order they are checked in, which its tables hold.
   let checked_order = order.fold([], |acc: List<ModuleTables>, n: Bytes|
     match at_name.get(n) { Some(k) -> acc.push(placed.get(k)), None -> acc });
-  let of_walk = |module: Int, owner: Bytes, span: Span|
-    of_definitions(fn_spans, module, owner, span);
+  let apart = walked_apart(outlines);
+  let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ok: true,
     diags: [],
@@ -1180,10 +1193,10 @@ fn merged_tables(
         checked_order,
         placed,
         |t: ModuleTables| t.facts.label_sites,
-        |x: LabelSite| of_walk(x.module, x.owner, x.span),
+        |x: LabelSite| of_definitions(x.owner),
       ),
       typed: phased(checked_order, placed, |t: ModuleTables| t.facts.typed, |x: TypedSite|
-        of_walk(x.module, x.owner, x.span)),
+        of_definitions(x.owner)),
       types: checked_order.fold(Map::new(), |acc: TypeTable, t: ModuleTables|
         types_joined(acc, t.facts.types)),
       elaboration: {
@@ -1191,19 +1204,19 @@ fn merged_tables(
           checked_order,
           placed,
           |t: ModuleTables| t.facts.elaboration.updates,
-          |x: UpdateShape| of_walk(x.module, x.owner, x.span),
+          |x: UpdateShape| of_definitions(x.owner),
         ),
         ops: phased(
           checked_order,
           placed,
           |t: ModuleTables| t.facts.elaboration.ops,
-          |x: WitnessOp| of_walk(x.module, x.owner, x.span),
+          |x: WitnessOp| of_definitions(x.owner),
         ),
         refs: phased(
           checked_order,
           placed,
           |t: ModuleTables| t.facts.elaboration.refs,
-          |x: WitnessRef| of_walk(x.module, x.owner, x.span),
+          |x: WitnessRef| of_definitions(x.owner),
         ),
         orders: checked_order.fold([], |acc: List<WitnessOrder>, t: ModuleTables|
           acc.concat(t.facts.elaboration.orders)),
@@ -1211,13 +1224,13 @@ fn merged_tables(
           checked_order,
           placed,
           |t: ModuleTables| t.facts.elaboration.tries,
-          |x: TrySite| of_walk(x.module, x.owner, x.span),
+          |x: TrySite| of_definitions(x.owner),
         ),
         members: phased(
           checked_order,
           placed,
           |t: ModuleTables| t.facts.elaboration.members,
-          |x: MemberSite| of_walk(x.module, x.owner, x.span),
+          |x: MemberSite| of_definitions(x.owner),
         ),
       },
     },

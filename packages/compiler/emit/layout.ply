@@ -1,6 +1,397 @@
-//! What the emitter writes in place over the objects the runtime lays out: where a list's and a
-//! map's parts lie, which the runtime's description reports too, and the externs it writes over
-//! them, which no native implements.
+//! Layout facts, with one home: what a word of a value may hold, how a type lays a value out in
+//! words (records and sums, `sum_laid`'s one algorithm for every sum), the constants those rest on,
+//! where the runtime's own objects keep their parts and the externs written in place over them, and
+//! the structs emitted code and the runtime both lay out. It imports nothing from the compiler: `record_laid` and `sum_laid` take layouts, not
+//! types.
+
+/// What a word of a laid value may hold. `P` is a counted pointer or 0: nonzero, 8-aligned and at or
+/// above `pointer_floor()` where nonzero, its low `tag_bits()` spare. `C(m)` is a `Char`'s immediate
+/// `c << 3 | 2`, or one of `m` nullary values `0, 8, ..` below it; uncounted. `R` is a raw scalar of
+/// the valid values `lo..=hi`; uncounted. `S(m)` is a one-word sum's word over pointers: `m` nullary
+/// values `0, 8, ..`, otherwise a pointer whose low bits say the case, counted where at or above the
+/// floor. `U` is a word cases of a sum lay different things in, counted as the case says.
+pub type WordClass = | P | C(Int) | R({ lo: Int, hi: Int }) | S(Int) | U
+
+/// How a type lays a value out wherever it holds one (a local's parts, a field, a sum's payload, a
+/// box, a capture, an array's element), as a function of the type alone. `LWords` are words that make
+/// the value whole: a scalar's (a `Decimal`'s two), a pointer's, none for `Unit`. `LRecord` is a
+/// record's fields in the checker's order (sorted by name), each at its first word, nothing between
+/// them; `LSum` a sum's words and how each case is told apart and laid.
+pub type Laid = | LWords(List<WordClass>) | LRecord(List<FieldLaid>) | LSum(SumLaid)
+
+/// A record's field: the word of the record it starts at, and how it is laid there.
+pub type FieldLaid = { at: Int, laid: Laid }
+
+/// A sum laid out: the class of each of its words, and its cases in declared order.
+pub type SumLaid = { classes: List<WordClass>, cases: List<CaseLaid> }
+
+/// One case of a sum: how a value is known to be this case, and where its payload lies.
+pub type CaseLaid = { test: CaseTest, payload: Payload }
+
+/// How a case is told apart. `Always`: the sum's only case. `WordIs`: word `at` holds `value`.
+/// `WordOutside`: the case whose payload holds a niche, word `at` holding none of the other cases'
+/// `values`, tested by that word's class. `LowBits`: word `at` is a pointer whose low bits are
+/// `bits`, and where `block_tag` says so, past the eighth case, the box's word 0 holds that tag.
+pub type CaseTest =
+  | Always
+  | WordIs({ at: Int, value: Int })
+  | WordOutside({ at: Int, values: List<Int> })
+  | LowBits({ at: Int, bits: Int, block_tag: Option<Int> })
+
+/// Where a case's arguments, laid as a record of them in order, lie. `Nullary`: no words (a case
+/// whose arguments are all of no words is nullary for layout). `Inline`: in the sum's own words from
+/// `offset`, the word `stripped` names, where one does, holding the case's tag in its low bits, read
+/// as `w & ~7`. `Boxed`: word `at` points at a box (masked where `stripped`), the case's payload
+/// after `skip` words of tag.
+pub type Payload =
+  | Nullary
+  | Inline({ offset: Int, laid: Laid, stripped: Option<Int> })
+  | Boxed({ at: Int, stripped: Bool, skip: Int, laid: Laid })
+
+/// Which of `s`'s words word `at` of case `case`'s payload is, where the payload lies in the sum's
+/// own words and that word is nothing the case is told apart by: a word that may be set to none,
+/// the case still read as it was.
+pub fn inline_word_at(s: SumLaid, case: Int, at: Int) -> Option<Int> =
+  match s.cases.at(case) {
+    Some(c) -> match c.payload {
+      Inline(i) -> {
+        let w = i.offset + at;
+        let tested = match c.test {
+          Always -> false,
+          WordIs(t) -> t.at == w,
+          WordOutside(t) -> t.at == w,
+          LowBits(t) -> t.at == w,
+        };
+        if tested || i.stripped == Some(w) { None } else { Some(w) }
+      },
+      _ -> None,
+    },
+    None -> None,
+  }
+
+/// A case as `sum_laid` takes it: its arguments laid as a record of them in order, and whether they
+/// reach the sum's own recursion group inline, which boxes the case.
+pub type CaseArgs = { args: Laid, indirect: Bool }
+
+/// How a value is one word where one word is required: a list's or a map's item, an argument or
+/// answer of a closure's uniform entry, a value the runtime carries. `Itself`: its one word (a
+/// pointer type's, a `Char`'s, a one-word sum's), 0 for a value of no words. `Immediate`:
+/// `v << 1 | 1`, and the runtime's box for an `Int` past 62 bits. `RuntimeBox`: its bits in the
+/// runtime's box (a `Float`'s, a `Decimal`'s, a 64-bit width's). `Singleton`: an immortal object of
+/// the runtime's kind, its header's flags the value, never counted: a `Bool`'s, which the runtime's
+/// natives answer. `Box(words)`: a box of the value laid by its type: a record's, however few its
+/// words, and a sum's of more than one.
+pub type WordForm = | Itself | Immediate | RuntimeBox | Singleton | Box(Int)
+
+/// A record of `fields`, each laid as given, in that order from word 0, nothing between them.
+pub fn record_laid(fields: List<Laid>) -> Laid =
+  LRecord(
+    fields.fold({ at: 0, out: [] }, |acc: { at: Int, out: List<FieldLaid> }, f: Laid|
+      { at: acc.at + words(f), out: acc.out.push({ at: acc.at, laid: f }) }).out,
+  )
+
+/// A sum of `cases`, in declared order, laid by the first encoding that applies: its one case's
+/// payload; an enum's index; pointer tags where two or more cases have data and each is one pointer
+/// (past the eighth, boxed behind tag 7 with the case's place in the box's first word); a niche the
+/// widest case with data (the first of the widest) leaves for the others, whose payloads lie in its
+/// words wholly before or after that word; a tag word and the payloads overlaid after it. Every case
+/// is inline but those `indirect` boxes, a case of no words is nullary, and the words of a case
+/// outside its payload are zero. A word every case laying it lays alike keeps its class, with 0
+/// added where a case leaves it zero; one cases lay differently is `U`.
+pub fn sum_laid(cases: List<CaseArgs>) -> SumLaid = {
+  let ps = cases.fold([], |acc: List<Placed>, c: CaseArgs|
+    acc.push({
+      case: acc.len(),
+      args: c.args,
+      boxed: c.indirect,
+      words: if c.indirect { 1 } else { words(c.args) },
+    }));
+  let data = ps.filter(|p: Placed| p.words > 0);
+  if ps.len() <= 1 { only(ps) } else if data.len() == 0 {
+    {
+      classes: [R({ lo: 0, hi: ps.len() - 1 })],
+      cases: ps.map(|p: Placed| { test: WordIs({ at: 0, value: p.case }), payload: Nullary }),
+    }
+  } else {
+    match tagged(ps, data) {
+      Some(s) -> s,
+      None -> match niched(ps, data) { Some(s) -> s, None -> tag_word(ps) },
+    }
+  }
+}
+
+/// A case as an encoding places it: its place among the sum's cases, its arguments laid as a record,
+/// whether they are boxed, and how many of the sum's words its payload takes (none for a case of no
+/// words, one for a box).
+type Placed = { case: Int, args: Laid, boxed: Bool, words: Int }
+
+/// The classes of the words a case's payload takes in the sum.
+fn laid_by(p: Placed) -> List<WordClass> = if p.boxed { [P] } else { classes(p.args) }
+
+/// A case's payload, from word `at` of the sum.
+fn payload_at(p: Placed, at: Int) -> Payload =
+  if p.boxed { Boxed({ at: at, stripped: false, skip: 0, laid: p.args }) }
+  else if p.words == 0 { Nullary }
+  else { Inline({ offset: at, laid: p.args, stripped: None }) }
+
+fn only(ps: List<Placed>) -> SumLaid =
+  match ps.at(0) {
+    None -> { classes: [], cases: [] },
+    Some(p) -> { classes: laid_by(p), cases: [{ test: Always, payload: payload_at(p, 0) }] },
+  }
+
+/// Pointer tags: each case with data one pointer, told apart by its low bits, the nullary cases the
+/// small values below every pointer.
+fn tagged(ps: List<Placed>, data: List<Placed>) -> Option<SumLaid> = {
+  let nullary = ps.len() - data.len();
+  let tags = 1 << tag_bits();
+  if data.len() < 2 || nullary > small_values() || !data.all(|p: Placed| laid_by(p) == [P]) { None }
+  else {
+    let laid = ps.fold(
+      { cases: [], data: 0, nullary: 0 },
+      |acc: { cases: List<CaseLaid>, data: Int, nullary: Int }, p: Placed|
+        if p.words == 0 {
+          {
+            ..acc,
+            cases: acc.cases.push({
+              test: WordIs({ at: 0, value: nullary_step() * acc.nullary }),
+              payload: Nullary,
+            }),
+            nullary: acc.nullary + 1,
+          }
+        } else {
+          let overflow = data.len() > tags && acc.data >= tags - 1;
+          let c = if overflow {
+            {
+              test: LowBits({ at: 0, bits: tags - 1, block_tag: Some(p.case) }),
+              payload: Boxed({ at: 0, stripped: true, skip: 1, laid: p.args }),
+            }
+          } else {
+            {
+              test: LowBits({ at: 0, bits: acc.data, block_tag: None }),
+              payload: if p.boxed { Boxed({ at: 0, stripped: true, skip: 0, laid: p.args }) }
+              else { Inline({ offset: 0, laid: p.args, stripped: Some(0) }) },
+            }
+          };
+          { ..acc, cases: acc.cases.push(c), data: acc.data + 1 }
+        },
+    );
+    Some({ classes: [S(nullary)], cases: laid.cases })
+  }
+}
+
+/// A niche: the widest case with data keeps its words, and every other case is a value its niche word
+/// never holds, its payload in the widest's words before or after that word.
+fn niched(ps: List<Placed>, data: List<Placed>) -> Option<SumLaid> =
+  match data.at(0) {
+    None -> None,
+    Some(first) ->
+      niched_by(ps, data.fold(first, |w: Placed, p: Placed| if p.words > w.words { p } else { w })),
+  }
+
+/// `niched` with `d` the case keeping its words.
+fn niched_by(ps: List<Placed>, d: Placed) -> Option<SumLaid> = {
+  let own = laid_by(d);
+  let others = ps.filter(|p: Placed| p.case != d.case);
+  let before = |at: Int, p: Placed| p.words <= at;
+  let fits = |at: Int, p: Placed| before(at, p) || p.words <= own.len() - at - 1;
+  let chosen = range(0, own.len()).find(|at: Int|
+    (match own.at(at) { Some(c) -> room(c), None -> 0 }) >= others.len()
+      && others.all(|p: Placed| fits(at, p)));
+  match chosen {
+    None -> None,
+    Some(at) -> {
+      let niche = match own.at(at) { Some(c) -> c, None -> U };
+      let offset = |p: Placed| if p.case == d.case || before(at, p) { 0 } else { at + 1 };
+      let values = range(0, others.len()).map(|j: Int| niche_value(niche, j));
+      let words = overlaid(own.len(), ps.map(|p: Placed| { at: offset(p), classes: laid_by(p) }));
+      Some({
+        classes: range(0, words.len()).map(|w: Int|
+          if w == at { taken(niche, others.len()) }
+          else { match words.at(w) { Some(c) -> c, None -> U } }),
+        cases: ps.fold(
+          { cases: [], other: 0 },
+          |acc: { cases: List<CaseLaid>, other: Int }, p: Placed|
+            if p.case == d.case {
+              {
+                ..acc,
+                cases: acc.cases.push({
+                  test: WordOutside({ at: at, values: values }),
+                  payload: payload_at(p, 0),
+                }),
+              }
+            } else {
+              {
+                cases: acc.cases.push({
+                  test: WordIs({ at: at, value: niche_value(niche, acc.other) }),
+                  payload: payload_at(p, offset(p)),
+                }),
+                other: acc.other + 1,
+              }
+            },
+        ).cases,
+      })
+    },
+  }
+}
+
+/// A tag word, the case's place, and every case's payload after it.
+fn tag_word(ps: List<Placed>) -> SumLaid = {
+  let n = ps.fold(0, |w: Int, p: Placed| if p.words > w { p.words } else { w });
+  {
+    classes: [R({ lo: 0, hi: ps.len() - 1 })].concat(
+      overlaid(n, ps.map(|p: Placed| { at: 0, classes: laid_by(p) })),
+    ),
+    cases: ps.map(|p: Placed|
+      { test: WordIs({ at: 0, value: p.case }), payload: payload_at(p, 1) }),
+  }
+}
+
+/// The class of each of `n` words cases lay as `laying` says, each from its word `at`: what the
+/// cases laying a word agree it holds, 0 among it where some case lays nothing there.
+fn overlaid(n: Int, laying: List<{ at: Int, classes: List<WordClass> }>) -> List<WordClass> =
+  range(0, n).map(|w: Int| {
+    let seen = laying.fold(
+      { class: None, zero: false },
+      |acc: { class: Option<WordClass>, zero: Bool }, l: { at: Int, classes: List<WordClass> }|
+        match l.classes.at(w - l.at) {
+          Some(c) -> { ..acc, class: Some(match acc.class { Some(a) -> joined(a, c), None -> c }) },
+          None -> { ..acc, zero: true },
+        },
+    );
+    match seen.class {
+      Some(c) -> if seen.zero { zeroed(c) } else { c },
+      None -> R({ lo: 0, hi: 0 }),
+    }
+  })
+
+/// The class of a word one case lays as `a` and another as `b`.
+fn joined(a: WordClass, b: WordClass) -> WordClass =
+  match a {
+    P -> match b { P -> P, S(n) -> S(n), _ -> U },
+    S(m) -> match b { P -> S(m), S(n) -> S(larger(m, n)), _ -> U },
+    C(m) -> match b { C(n) -> C(larger(m, n)), _ -> U },
+    R(x) -> match b { R(y) -> R({ lo: smaller(x.lo, y.lo), hi: larger(x.hi, y.hi) }), _ -> U },
+    U -> U,
+  }
+
+/// The class of a word laid as `c`, or 0 where a case lays nothing there.
+fn zeroed(c: WordClass) -> WordClass =
+  match c {
+    P -> S(1),
+    S(m) -> S(larger(m, 1)),
+    C(m) -> C(larger(m, 1)),
+    R(r) -> R({ lo: smaller(r.lo, 0), hi: larger(r.hi, 0) }),
+    U -> U,
+  }
+
+fn larger(a: Int, b: Int) -> Int = if a > b { a } else { b }
+
+fn smaller(a: Int, b: Int) -> Int = if a < b { a } else { b }
+
+/// How many of the small values below every pointer a one-word sum may take for its nullary cases.
+fn small_values() -> Int = pointer_floor() >> tag_bits()
+
+/// How many values a word of class `c` never holds, which a sum may take for its other cases.
+fn room(c: WordClass) -> Int =
+  match c {
+    P -> small_values(),
+    S(m) -> small_values() - m,
+    C(m) -> small_values() - m,
+    R(r) -> largest() - r.hi,
+    U -> 0,
+  }
+
+/// The `j`th value from the first a word of class `c` never holds.
+fn niche_value(c: WordClass, j: Int) -> Int =
+  match c {
+    P -> nullary_step() * j,
+    S(m) -> nullary_step() * (m + j),
+    C(m) -> nullary_step() * (m + j),
+    R(r) -> r.hi + 1 + j,
+    U -> 0,
+  }
+
+/// A word of class `c` that also holds the first `n` values it never held.
+fn taken(c: WordClass, n: Int) -> WordClass =
+  match c {
+    P -> S(n),
+    S(m) -> S(m + n),
+    C(m) -> C(m + n),
+    R(r) -> R({ lo: r.lo, hi: r.hi + n }),
+    U -> U,
+  }
+
+fn largest() -> Int = 9223372036854775807
+
+/// A word that may hold any value: an `Int`'s, a `Float`'s bits, a width's.
+pub fn raw() -> WordClass = R({ lo: 0 - largest() - 1, hi: largest() })
+
+/// Whether a one-word sum laid as `s` is a raw scalar that may reach the pointer floor or fall below
+/// zero, which as a word the runtime holds would read as a pointer: it is a word as an `Int` is.
+pub fn raw_sum(s: SumLaid) -> Bool =
+  match s.classes { [R(r)] -> r.hi >= pointer_floor() || r.lo < 0, _ -> false }
+
+/// How many words a value laid as `l` takes.
+pub fn words(l: Laid) -> Int =
+  match l {
+    LWords(cs) -> cs.len(),
+    // A record's fields lie one after another from word 0.
+    LRecord(fs) -> match fs.at(fs.len() - 1) { Some(f) -> f.at + words(f.laid), None -> 0 },
+    LSum(s) -> s.classes.len(),
+  }
+
+/// The class of each word of a value laid as `l`, in order.
+pub fn classes(l: Laid) -> List<WordClass> =
+  match l {
+    LWords(cs) -> cs,
+    LRecord(fs) -> fs.fold([], |acc: List<WordClass>, f: FieldLaid| acc.concat(classes(f.laid))),
+    LSum(s) -> s.classes,
+  }
+
+/// Whether a value laid as `l` may hold a count: a pointer of its own, or a case whose payload
+/// does.
+pub fn counts(l: Laid) -> Bool =
+  match l {
+    LWords(cs) -> cs.any(|c: WordClass| match c { P -> true, S(_) -> true, U -> true, _ -> false }),
+    LRecord(fs) -> fs.any(|f: FieldLaid| counts(f.laid)),
+    LSum(s) ->
+      s.cases.any(|c: CaseLaid|
+        match c.payload { Nullary -> false, Inline(i) -> counts(i.laid), Boxed(_) -> true }),
+  }
+
+/// How many words a value may cross a call in before it crosses by reference to the caller's copy.
+pub fn register_words() -> Int = 4
+
+/// Whether a record laid as `l` is held as its fields: only while it fits the words a call passes in
+/// registers. A wider one is a box, and everything holding it holds a pointer to that box, so a read
+/// of it or of one of its fields copies no more than a word.
+pub fn flat_record(l: Laid) -> Bool = flat_words(words(l))
+
+/// `flat_record` of a record of `n` words.
+pub fn flat_words(n: Int) -> Bool = n <= register_words()
+
+/// How a value laid as `l` lies inside another, as a record's field, a case's argument or an array's
+/// element: a record wider than `flat_record` as one counted pointer to its box, anything else as it
+/// is laid.
+pub fn inside(l: Laid) -> Laid =
+  match l { LRecord(_) -> if flat_record(l) { l } else { LWords([P]) }, _ -> l }
+
+/// The least address a heap block or static object lies at: every smaller value is free to stand
+/// for a nullary case.
+pub fn pointer_floor() -> Int = 4096
+
+/// The low bits of a pointer no block's address sets, which a one-word sum's tag takes.
+pub fn tag_bits() -> Int = 3
+
+/// How far apart a one-word sum's nullary values are, so none has a tag bit set.
+pub fn nullary_step() -> Int = 8
+
+/// The bytes of a block's header, its count among them, before its payload.
+pub fn header_bytes() -> Int = 16
+
+/// The kind in the header of a block emitted code lays out, which the runtime's own walks refuse.
+pub fn refused_kind() -> Int = 21
 
 /// A list's own object: the root of its trie at word `root`, zero for none, then the tail's items
 /// from word `tail`. Its header's `len` holds how many items the list has, and the fields named
@@ -130,3 +521,419 @@ fn intrinsic_map() -> Map<Bytes, Intrinsic> =
 /// What the emitter writes in place of a call of the extern whose program-wide name is `name`;
 /// `None` for any other.
 pub fn intrinsic_named(name: Bytes) -> Option<Intrinsic> = intrinsic_map().get(name)
+
+/// A string's or a byte string's own object: its header's `len` bytes from its payload's start, with
+/// room for as many as its header's field `room` holds. A view, whose header's field `flags` holds
+/// `view`, is a block of `view_words` words holding the value it views at word `viewed` and where its
+/// bytes begin there at word `from`; a value counts its views in its header's field `views`.
+pub type StrLaid = {
+  room: Bytes,
+  flags: Bytes,
+  view: Int,
+  view_words: Int,
+  viewed: Int,
+  from: Int,
+  views: Bytes,
+}
+
+/// Where the runtime's strings and byte strings keep their parts.
+pub fn str_laid() -> StrLaid =
+  { room: b"layout", flags: b"flags", view: 8, view_words: 2, viewed: 0, from: 1, views: b"aux" }
+
+/// How big the runtime's other blocks are, which a release frees by their size: a list's trie node
+/// has room for as many words as its header's field `node_room` holds, and a map's leaf for as many
+/// pairs as its field `leaf_room` holds; a map's branch is `branch_words` words, a map's own block
+/// `map_words`, and a 128-bit width's box `wide_words`.
+pub type BlockSizes = {
+  node_room: Bytes,
+  leaf_room: Bytes,
+  branch_words: Int,
+  map_words: Int,
+  wide_words: Int,
+}
+
+pub fn block_sizes() -> BlockSizes =
+  {
+    node_room: b"layout",
+    leaf_room: b"layout",
+    branch_words: layouts().tree.sizes + layouts().tree.keys,
+    map_words: 1,
+    wide_words: 2,
+  }
+
+/// A hold's object: the value it holds at word `held`, 0 once it has let go.
+pub type HoldLaid = { held: Int }
+
+/// Where the runtime's holds keep what they hold.
+pub fn hold_laid() -> HoldLaid = { held: 1 }
+
+/// A `Columns`' object: field `k`'s column, an `Array` of that field of every record, at word
+/// `first + k`, the fields in the checker's order.
+pub type ColumnsLaid = { first: Int }
+
+pub fn columns_laid() -> ColumnsLaid = { first: 0 }
+
+/// A struct emitted code lays out and the runtime reads, as the head declares it and the runtime's
+/// description reports it: its name, its size in bytes, and each field in order.
+pub type MachineStruct = { name: Bytes, bytes: Int, fields: List<MachineField> }
+
+/// A field of a machine struct: its name, the C the head declares it by, its byte offset and size.
+pub type MachineField = { name: Bytes, decl: Bytes, at: Int, bytes: Int }
+
+/// `PlyFrame`: a frame that may stop links one into the context's `frames` around the call, its
+/// slots after it, and `each` counts every slot once more (`d > 0`) or once fewer (`d < 0`).
+pub fn frame_struct() -> MachineStruct =
+  {
+    name: b"PlyFrame",
+    bytes: 16,
+    fields: [
+      { name: b"prev", decl: b"struct PlyFrame *prev", at: 0, bytes: 8 },
+      { name: b"each", decl: b"void (*each)(PlyCtx *, Word *, int64_t)", at: 8, bytes: 8 },
+    ],
+  }
+
+/// `PlyType`, a type's descriptor (`type#T`): its identity (the low 64 bits of the digest of its
+/// spelling), its spelling, and the entries the runtime counts and crosses a value of it through,
+/// each taking the value's word form.
+pub fn type_struct() -> MachineStruct =
+  {
+    name: b"PlyType",
+    bytes: 56,
+    fields: [
+      { name: b"identity", decl: b"uint64_t identity", at: 0, bytes: 8 },
+      { name: b"spelled", decl: b"const uint8_t *spelled", at: 8, bytes: 8 },
+      { name: b"spelled_len", decl: b"uint32_t spelled_len", at: 16, bytes: 4 },
+      { name: b"inc", decl: b"Word (*inc)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"dec", decl: b"Word (*dec)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"lower", decl: b"Word (*lower)(PlyCtx *, Word)", at: 40, bytes: 8 },
+      { name: b"lift", decl: b"Word (*lift)(PlyCtx *)", at: 48, bytes: 8 },
+    ],
+  }
+
+/// `PlyOp`, an operation at its perform's type arguments (`op#effect.op@T..`): the effect's and
+/// the operation's field-table entries, the answer's type, which parameters are the operation's own
+/// type parameter (bit `i` for parameter `i`), each parameter's type and the operation's own type
+/// parameters'.
+pub fn op_struct() -> MachineStruct =
+  {
+    name: b"PlyOp",
+    bytes: 64,
+    fields: [
+      { name: b"effect", decl: b"int64_t effect", at: 0, bytes: 8 },
+      { name: b"op", decl: b"int64_t op", at: 8, bytes: 8 },
+      { name: b"answer", decl: b"const PlyType *answer", at: 16, bytes: 8 },
+      { name: b"own", decl: b"uint64_t own", at: 24, bytes: 8 },
+      { name: b"params_len", decl: b"int64_t params_len", at: 32, bytes: 8 },
+      { name: b"params", decl: b"const PlyType *const *params", at: 40, bytes: 8 },
+      { name: b"vars_len", decl: b"int64_t vars_len", at: 48, bytes: 8 },
+      { name: b"vars", decl: b"const PlyType *const *vars", at: 56, bytes: 8 },
+    ],
+  }
+
+/// `PlyFnDesc`, a lambda's descriptor, which word 0 of its closure's block names: the uniform entry
+/// (the block and each argument as its word form, answering one); the entry at the function type's
+/// own convention, cast to it where emitted code calls it; that convention's identity, which a
+/// checked build compares; and the entries that release the block (its captures, then its memory),
+/// share it with another thread (answering 0 where a capture cannot cross) and keep it for good.
+pub fn fn_desc_struct() -> MachineStruct =
+  {
+    name: b"PlyFnDesc",
+    bytes: 48,
+    fields: [
+      { name: b"uniform", decl: b"Word (*uniform)(PlyCtx *, Word, const Word *)", at: 0, bytes: 8 },
+      { name: b"typed", decl: b"void (*typed)(void)", at: 8, bytes: 8 },
+      { name: b"convention", decl: b"Word convention", at: 16, bytes: 8 },
+      { name: b"release", decl: b"Word (*release)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"share", decl: b"Word (*share)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"keep", decl: b"Word (*keep)(PlyCtx *, Word)", at: 40, bytes: 8 },
+    ],
+  }
+
+/// Every machine struct, in the order the runtime's description lists them, each declared before a
+/// struct that points at it.
+pub fn machine_structs() -> List<MachineStruct> =
+  [frame_struct(), type_struct(), op_struct(), fn_desc_struct()]
+
+/// `PlyCtx`, the context every function is handed, as far as emitted code reads and writes it, in
+/// the order the runtime's description lists its fields: the runtime's head declares those up to
+/// `next_tick`, and emitted code reads the rest at their offsets. Its bytes are those fields' extent;
+/// the rest of the context is the runtime's alone.
+pub fn ctx_struct() -> MachineStruct =
+  {
+    name: b"PlyCtx",
+    bytes: 88,
+    fields: [
+      { name: b"failed", decl: b"int64_t failed", at: 0, bytes: 8 },
+      { name: b"fuel", decl: b"int64_t fuel", at: 8, bytes: 8 },
+      { name: b"stack_floor", decl: b"uintptr_t stack_floor", at: 16, bytes: 8 },
+      { name: b"site_root", decl: b"int64_t site_root", at: 24, bytes: 8 },
+      { name: b"site_start", decl: b"int64_t site_start", at: 32, bytes: 8 },
+      { name: b"site_end", decl: b"int64_t site_end", at: 40, bytes: 8 },
+      { name: b"ticks", decl: b"int64_t ticks", at: 48, bytes: 8 },
+      { name: b"next_tick", decl: b"int64_t next_tick", at: 56, bytes: 8 },
+      { name: b"frames", decl: b"PlyFrame *frames", at: 64, bytes: 8 },
+      { name: b"release_depth", decl: b"int64_t release_depth", at: 72, bytes: 8 },
+      { name: b"release_waiting", decl: b"int64_t release_waiting", at: 80, bytes: 8 },
+    ],
+  }
+
+/// The byte offset of the context's field `name`, which `ctx_struct` lists.
+pub fn ctx_at(name: Bytes) -> Int / {abort.raise} =
+  match ctx_struct().fields.find(|f: MachineField| f.name == name) {
+    Some(f) -> f.at,
+    None ->
+      panic(String::of_bytes_lossy(b"a context field the layout does not list: ".concat(name))),
+  }
+
+/// How deeply drop roots nest before one puts its release off until the outermost returns.
+pub fn release_depth() -> Int = 32
+
+test "a record's fields lie one after another from its first word, each as wide as it is laid" {
+  let raw = R({ lo: 0, hi: 1 });
+  let pair = LWords([raw, raw]);
+  let r = record_laid([LWords([P]), pair, LWords([]), LWords([C(0)])]);
+  assert_eq(words(r), 4);
+  assert_eq(match r { LRecord(fs) -> fs.map(|f: FieldLaid| f.at), _ -> [] }, [0, 1, 3, 3]);
+  assert_eq(counts(r), true);
+  assert_eq(counts(record_laid([pair, LWords([C(0)])])), false)
+}
+
+fn of_args(args: List<Laid>) -> CaseArgs = { args: record_laid(args), indirect: false }
+
+fn recursive(args: List<Laid>) -> CaseArgs = { args: record_laid(args), indirect: true }
+
+fn tests_of(s: SumLaid) -> List<CaseTest> = s.cases.map(|c: CaseLaid| c.test)
+
+fn pointer() -> Laid = LWords([P])
+
+fn int() -> Laid = LWords([raw()])
+
+fn flag() -> Laid = LWords([R({ lo: 0, hi: 1 })])
+
+fn maybe(l: Laid) -> SumLaid = sum_laid([of_args([]), of_args([l])])
+
+test "an Option takes a niche of its payload for None where one has room, and a tag word where none has" {
+  assert_eq(maybe(pointer()), {
+    classes: [S(1)],
+    cases: [
+      { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+      {
+        test: WordOutside({ at: 0, values: [0] }),
+        payload: Inline({ offset: 0, laid: record_laid([pointer()]), stripped: None }),
+      },
+    ],
+  });
+  // Each Option around another takes the next value the inner one never holds.
+  let twice = maybe(LSum(maybe(pointer())));
+  assert_eq(twice.classes, [S(2)]);
+  assert_eq(tests_of(twice), [WordIs({ at: 0, value: 8 }), WordOutside({ at: 0, values: [8] })]);
+  let thrice = maybe(LSum(twice));
+  assert_eq(thrice.classes, [S(3)]);
+  assert_eq(tests_of(thrice), [WordIs({ at: 0, value: 16 }), WordOutside({ at: 0, values: [16] })]);
+  assert_eq(tests_of(maybe(flag())), [
+    WordIs({ at: 0, value: 2 }),
+    WordOutside({ at: 0, values: [2] }),
+  ]);
+  assert_eq(maybe(flag()).classes, [R({ lo: 0, hi: 2 })]);
+  // A record's niche is its first word with room: `{ at: Int, why: String }`'s `why`.
+  let dated = maybe(record_laid([int(), pointer()]));
+  assert_eq(dated.classes, [raw(), S(1)]);
+  assert_eq(tests_of(dated), [WordIs({ at: 1, value: 0 }), WordOutside({ at: 1, values: [0] })]);
+  // An `Int` or a `Float` leaves no value free: a tag word, the payload after it.
+  assert_eq(maybe(int()), {
+    classes: [R({ lo: 0, hi: 1 }), raw()],
+    cases: [
+      { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+      {
+        test: WordIs({ at: 0, value: 1 }),
+        payload: Inline({ offset: 1, laid: record_laid([int()]), stripped: None }),
+      },
+    ],
+  });
+  assert_eq([counts(LSum(maybe(pointer()))), counts(LSum(maybe(flag())))], [true, false])
+}
+
+test "a Result of two pointers tags its Err's pointer, and one of a zero-word Ok is a niche" {
+  let both = sum_laid([of_args([pointer()]), of_args([pointer()])]);
+  assert_eq(both.classes, [S(0)]);
+  assert_eq(tests_of(both), [
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+  ]);
+  assert_eq(both.cases.map(|c: CaseLaid| c.payload), [
+    Inline({ offset: 0, laid: record_laid([pointer()]), stripped: Some(0) }),
+    Inline({ offset: 0, laid: record_laid([pointer()]), stripped: Some(0) }),
+  ]);
+  // `Ok(())` is a case of no words: nullary for its layout, so the error's pointer leaves it 0.
+  let unit = sum_laid([of_args([LWords([])]), of_args([pointer()])]);
+  assert_eq(unit.classes, [S(1)]);
+  assert_eq(tests_of(unit), [WordIs({ at: 0, value: 0 }), WordOutside({ at: 0, values: [0] })]);
+  assert_eq(unit.cases.map(|c: CaseLaid| c.payload == Nullary), [true, false]);
+  // An `Int` beside a pointer leaves no niche: a tag word, its one payload word each case's own.
+  let mixed = sum_laid([of_args([int()]), of_args([pointer()])]);
+  assert_eq(mixed.classes, [R({ lo: 0, hi: 1 }), U]);
+  assert_eq(tests_of(mixed), [WordIs({ at: 0, value: 0 }), WordIs({ at: 0, value: 1 })])
+}
+
+test "a sum of nullary cases is its case's place, and a single case is its payload" {
+  let ordering = sum_laid([of_args([]), of_args([]), of_args([])]);
+  assert_eq(ordering, {
+    classes: [R({ lo: 0, hi: 2 })],
+    cases: range(0, 3).map(|i: Int| { test: WordIs({ at: 0, value: i }), payload: Nullary }),
+  });
+  assert_eq(counts(LSum(ordering)), false);
+  // A case whose arguments take no words is nullary.
+  assert_eq(sum_laid([of_args([LWords([]), record_laid([])]), of_args([])]).classes, [
+    R({ lo: 0, hi: 1 }),
+  ]);
+  // One nullary case takes no words at all.
+  assert_eq(sum_laid([of_args([])]), { classes: [], cases: [{ test: Always, payload: Nullary }] });
+  assert_eq(words(LSum(sum_laid([of_args([])]))), 0);
+  assert_eq(sum_laid([of_args([int(), pointer()])]), {
+    classes: [raw(), P],
+    cases: [
+      {
+        test: Always,
+        payload: Inline({ offset: 0, laid: record_laid([int(), pointer()]), stripped: None }),
+      },
+    ],
+  });
+  // A case reaching its own sum in place is boxed, one pointer.
+  assert_eq(sum_laid([recursive([int(), pointer()])]), {
+    classes: [P],
+    cases: [
+      {
+        test: Always,
+        payload: Boxed({ at: 0, stripped: false, skip: 0, laid: record_laid([int(), pointer()]) }),
+      },
+    ],
+  })
+}
+
+test "a tree's boxed cases are tagged pointers, past the eighth behind tag 7 and their place in the box" {
+  let node = recursive([int(), pointer()]);
+  let tree = sum_laid([of_args([]), node, node, of_args([])]);
+  assert_eq(tree.classes, [S(2)]);
+  assert_eq(tests_of(tree), [
+    WordIs({ at: 0, value: 0 }),
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+    WordIs({ at: 0, value: 8 }),
+  ]);
+  assert_eq(
+    match tree.cases.at(2) { Some(c) -> c.payload, None -> Nullary },
+    Boxed({ at: 0, stripped: true, skip: 0, laid: record_laid([int(), pointer()]) }),
+  );
+  // Nine cases with data, a nullary one among them: the eighth and ninth share tag 7, told apart by
+  // their place in the sum, which their box holds before their payload.
+  let nine = sum_laid(range(0, 10).map(|i: Int| if i == 4 { of_args([]) } else { node }));
+  assert_eq(nine.classes, [S(1)]);
+  assert_eq(tests_of(nine), [
+    LowBits({ at: 0, bits: 0, block_tag: None }),
+    LowBits({ at: 0, bits: 1, block_tag: None }),
+    LowBits({ at: 0, bits: 2, block_tag: None }),
+    LowBits({ at: 0, bits: 3, block_tag: None }),
+    WordIs({ at: 0, value: 0 }),
+    LowBits({ at: 0, bits: 4, block_tag: None }),
+    LowBits({ at: 0, bits: 5, block_tag: None }),
+    LowBits({ at: 0, bits: 6, block_tag: None }),
+    LowBits({ at: 0, bits: 7, block_tag: Some(8) }),
+    LowBits({ at: 0, bits: 7, block_tag: Some(9) }),
+  ]);
+  assert_eq(nine.cases.map(|c: CaseLaid| match c.payload { Boxed(b) -> b.skip, _ -> 0 - 1 }), [
+    0,
+    0,
+    0,
+    0,
+    0 - 1,
+    0,
+    0,
+    0,
+    1,
+    1,
+  ]);
+  // An inline pointer past the eighth is boxed behind its place too.
+  let inline = sum_laid(range(0, 9).map(|_: Int| of_args([pointer()])));
+  assert_eq(
+    match inline.cases.at(8) { Some(c) -> c.payload, None -> Nullary },
+    Boxed({ at: 0, stripped: true, skip: 1, laid: record_laid([pointer()]) }),
+  )
+}
+
+test "nullary cases take the 512 small values below every pointer, and a 513th takes a tag word" {
+  let nullary = |n: Int| range(0, n).map(|_: Int| of_args([]));
+  assert_eq(sum_laid(nullary(513)).classes, [R({ lo: 0, hi: 512 })]);
+  assert_eq(sum_laid(nullary(512).push(of_args([pointer()]))).classes, [S(512)]);
+  assert_eq(sum_laid(nullary(513).push(of_args([pointer()]))).classes, [
+    R({ lo: 0, hi: 513 }),
+    S(1),
+  ]);
+  let two = [of_args([pointer()]), of_args([pointer()])];
+  assert_eq(sum_laid(nullary(512).concat(two)).classes, [S(512)]);
+  assert_eq(sum_laid(nullary(513).concat(two)).classes, [R({ lo: 0, hi: 514 }), S(1)])
+}
+
+test "the widest case's niche holds the other cases where their payloads fit beside it" {
+  // Five nullary cases, one of `{ bits: Int, signed: Bool }` and one of a two-case enum; the niche
+  // is `signed`.
+  let spec = LSum(sum_laid([of_args([]), of_args([])]));
+  let kind = sum_laid([
+    of_args([]),
+    of_args([]),
+    of_args([]),
+    of_args([record_laid([int(), flag()])]),
+    of_args([]),
+    of_args([]),
+    of_args([spec]),
+  ]);
+  assert_eq(kind.classes, [raw(), R({ lo: 0, hi: 7 })]);
+  assert_eq(tests_of(kind), [
+    WordIs({ at: 1, value: 2 }),
+    WordIs({ at: 1, value: 3 }),
+    WordIs({ at: 1, value: 4 }),
+    WordOutside({ at: 1, values: [2, 3, 4, 5, 6, 7] }),
+    WordIs({ at: 1, value: 5 }),
+    WordIs({ at: 1, value: 6 }),
+    WordIs({ at: 1, value: 7 }),
+  ]);
+  assert_eq(
+    match kind.cases.at(6) { Some(c) -> c.payload, None -> Nullary },
+    Inline({ offset: 0, laid: record_laid([spec]), stripped: None }),
+  );
+  // A payload that fits only after the niche word lies there, and a word only the widest lays may
+  // be 0 in the other cases.
+  let after = sum_laid([of_args([flag(), pointer(), pointer()]), of_args([pointer()])]);
+  assert_eq(after.classes, [R({ lo: 0, hi: 2 }), P, S(1)]);
+  assert_eq(tests_of(after), [WordOutside({ at: 0, values: [2] }), WordIs({ at: 0, value: 2 })]);
+  assert_eq(
+    match after.cases.at(1) { Some(c) -> c.payload, None -> Nullary },
+    Inline({ offset: 1, laid: record_laid([pointer()]), stripped: None }),
+  );
+  // A payload as wide as the widest fits on neither side of any niche word: a tag word.
+  let wide = sum_laid([of_args([flag(), pointer()]), of_args([pointer(), pointer()])]);
+  assert_eq(wide.classes, [R({ lo: 0, hi: 1 }), U, P]);
+  assert_eq(tests_of(wide), [WordIs({ at: 0, value: 0 }), WordIs({ at: 0, value: 1 })])
+}
+
+test "a word some case leaves zero never offers 0 to an enclosing sum's niche" {
+  // 512 nullary cases fill the niche word; the pointer after it is 0 in each, so an `Option` of
+  // this sum takes the next value there.
+  let full = sum_laid(
+    range(0, 512).map(|_: Int| of_args([])).push(of_args([pointer(), pointer()])),
+  );
+  assert_eq(full.classes, [S(512), S(1)]);
+  assert_eq(tests_of(maybe(LSum(full))), [
+    WordIs({ at: 1, value: 8 }),
+    WordOutside({ at: 1, values: [8] }),
+  ])
+}
+
+test "each machine struct's fields lie in order, each at a multiple of its size, within the struct" {
+  machine_structs().push(ctx_struct()).fold((), |_: Unit, s: MachineStruct| {
+    let end = s.fields.fold(0, |at: Int, f: MachineField| {
+      assert(f.at >= at && f.at % f.bytes == 0 && f.decl.index_of(f.name) != None, None);
+      f.at + f.bytes
+    });
+    assert(end <= s.bytes && s.bytes % 8 == 0, None)
+  })
+}

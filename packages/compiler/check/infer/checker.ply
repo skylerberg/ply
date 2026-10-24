@@ -2,7 +2,6 @@
 
 import syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
 import std.bin
-import std.hash (blake3)
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode,
                            MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
 import syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
@@ -22,14 +21,13 @@ import check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, T
                     resolve_row, free_vars, env_bind_global, at_arguments, TyNominal, atom_bin,
                     type_bin, scheme_bin, TypeTable)
 import check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
-import check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label, qualify,
+import check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
                              error_with_labels, error_at, error_at_and)
 import expand.rewrite (NumericWitness, numeric_witness_bin, MemberCallee)
 import std.prelude_source
 import expand.derive (DeriveRefusal, HoldsFunction, Unconstrained, NullInsideOption, HoldsNative,
                       Leaf, Structural, Refused, Nominal, constructor_shape, null_encoded_name,
                       same_deriver)
-import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
 import std.string
@@ -265,15 +263,16 @@ pub type RepeatedRow = { params: List<Int>, tail: Bool, over: Option<Span>, mayb
 pub type OwnCall = { callee: Bytes, span: Span }
 
 /// A use of a function of a type, or a call on a value, which the rewrite writes as later passes
-/// read it. A call on a value, `base.name(args)`, at `span` calls `qualifier::name` with the value
+/// read it. A call on a value, `base.name(args)`, at `site` calls `qualifier::name` with the value
 /// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
-/// function the value holds in the field written. A name written `T::name` at `span` is
+/// function the value holds in the field written. A name written `T::name` at `site` is
 /// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
 /// `reaches` the modules the defaults the call copies name. `named` is the place among the
 /// callee's parameters, the value's first, of each argument the call names, in the order written.
+/// Each site in this module and below is a node's of the item `owner` names.
 pub type MemberSite = {
   module: Int,
-  span: Span,
+  site: Int,
   qualifier: Bytes,
   name: Bytes,
   callee: Bytes,
@@ -297,13 +296,13 @@ pub type BitOp = { span: Span, what: Bytes, ty: Type, builtin: Bool }
 type Witnessed = { param: Bytes, integer: Bool }
 
 /// An operator over a witnessed parameter, which the elaboration rewrites to read the witness.
-pub type WitnessOp = { module: Int, span: Span, param: Bytes, owner: Bytes }
+pub type WitnessOp = { module: Int, site: Int, param: Bytes, owner: Bytes }
 
 /// `params` are the callee's type parameters the witnesses are for, so one constrained twice is
-/// passed once.
+/// passed once. `site` is the callee's.
 pub type WitnessRef = {
   module: Int,
-  span: Span,
+  site: Int,
   witnesses: List<NumericWitness>,
   params: List<Int>,
   owner: Bytes,
@@ -339,10 +338,10 @@ pub type UpdateSite = {
 }
 
 /// What the lowering needs: the field list of the record an update copies, in the record's own order.
-pub type UpdateShape = { module: Int, span: Span, names: List<Bytes>, owner: Bytes }
+pub type UpdateShape = { module: Int, site: Int, names: List<Bytes>, owner: Bytes }
 
 /// The raise a `try` answers, by its effect's program-wide name, and how many values it carries.
-pub type TrySite = { module: Int, span: Span, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
+pub type TrySite = { module: Int, site: Int, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
 
 /// A `???` or `..` a walk met, reported when the check settles: where it stands, the variable its
 /// type is, the locals in scope at it, the written row of the definition being checked where one
@@ -389,21 +388,28 @@ pub type LabelApplication = {
 }
 
 /// What the emitter needs: the labels a call fills, in declaration order.
-pub type LabelSite = { module: Int, span: Span, labels: List<Bytes>, owner: Bytes }
+pub type LabelSite = { module: Int, site: Int, labels: List<Bytes>, owner: Bytes }
 
 /// The type an operator reads its operands at, from which a witness's operation is read.
 pub type OperandAt = { module: Int, span: Span, ty: Type, owner: Bytes }
 
 /// A type the emitter reads off the checker rather than off what is written: a pattern's binder, a
-/// lambda, an empty list, a law's binder, and a global named at a use with the type arguments it is
-/// used at. Resolved when the check ends.
-pub type TypedAt = { module: Int, span: Span, ty: Type, args: List<Type>, owner: Bytes }
+/// lambda, a list, a law's binder, and a global named at a use with the type arguments it is
+/// used at, `named` the definition (empty for any other node). Resolved when the check ends.
+pub type TypedAt = {
+  module: Int,
+  span: Span,
+  ty: Type,
+  args: List<Type>,
+  owner: Bytes,
+  named: Bytes,
+}
 
 /// A `TypedAt` resolved, with each variable its owner's scheme quantifies numbered as the scheme's
 /// canonical form numbers it and every other variable `-1`, and no function type carrying a row.
 /// `ty` and `args` are keys of a `TypeTable` beside the sites: a body names a few types at many
 /// places, and one record type can be large.
-pub type TypedSite = { module: Int, span: Span, ty: Bytes, args: List<Bytes>, owner: Bytes }
+pub type TypedSite = { module: Int, site: Int, ty: Bytes, args: List<Bytes>, owner: Bytes }
 
 pub type Assumed = { deriver: Deriver, vars: List<Int> }
 
@@ -525,33 +531,6 @@ pub type KnownTest = { footprint: List<Atom>, facts: Bytes }
 pub type KeptFacts = { name: Bytes, facts: Bytes }
 
 derive bin for KeptFacts
-
-/// The name a test's roots and sites go by: its module, `test#` and a digest of its label, which
-/// the module's tests do not share (E0105) and which no definition's name can spell.
-pub fn test_owner(module: Bytes, label: Bytes) -> Bytes / {abort.raise} =
-  by_label(module, b"test", label)
-
-/// Whether `name` is one `test_owner` makes.
-pub fn is_test_owner(name: Bytes) -> Bool =
-  match name.split(b"#") {
-    [named, digest] ->
-      (named == b"test" || named.ends_with(b".test")) && digest.len() == 16
-        && digest.position(0, |c: Int| bytes::hex_value(c) < 0) == None,
-    _ -> false,
-  }
-
-/// The root of `part` (`guard` or `body`) of the law labelled `label`, named as a test's is.
-pub fn law_root(module: Bytes, label: Bytes, part: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all([by_label(module, b"law", label), b".", part])
-
-fn by_label(module: Bytes, kind: Bytes, label: Bytes) -> Bytes / {abort.raise} =
-  qualify(
-    module,
-    Bytes::concat_all([kind, b"#", Bytes::of_string(blake3(label).slice(0, 8).hex_of())]),
-  )
-
-/// The root a test over cases lists its cases by, beside the root that runs one.
-pub fn cases_root(owner: Bytes) -> Bytes = owner.concat(b".cases")
 
 /// What the listing root of a test over cases answers: each case's label and identity, in the
 /// table's order.
@@ -681,9 +660,12 @@ pub type Checker = {
   /// Each hole a body walked so far holds, in the order the walk met them.
   holes: List<HoleSite>,
   member_sites: List<MemberSite>,
+  /// Each call on a value the walks wrote out as a call of a function, where it is written.
+  member_calls: List<OwnCall>,
   /// The defaults calls on values copied, each beside its parameter's type, not yet typed.
   copied_defaults: List<{ expr: Expr, ty: Type }>,
-  /// The builtin each call on a value of a language type calls, by the call's span.
+  /// The builtin each call on a value of a language type calls, by the body walking it and the
+  /// call's site.
   builtins_on: Map<Bytes, Bytes>,
   simulate_depth: Int,
   /// The scopes open around the innermost `simulate` body, and the locals of those it names.
@@ -731,26 +713,31 @@ pub type Checker = {
   /// True while a `pub fn`'s default is walked: a caller in another module is handed a copy of it.
   copied: Bool,
   assignable: Assignable,
-  /// The local bindings made before the innermost lambda around the expression being inferred: a
-  /// read of one is a read of the lambda's capture.
-  lambda_binds: Int,
 }
 
-/// The variables of the handler whose clause is being walked, each by the stamp its name is bound
-/// at, which an assignment may give a new value; `barred` names the place in the clause where none
-/// may, since what runs there may run after the clause has returned.
-pub type Assignable = { vars: List<{ stamp: Int, name: Bytes, ty: Type }>, barred: Option<Bytes> }
+/// What the code being walked may reach of what is bound around it. `vars` are the variables of the
+/// handler whose clause is being walked, each by the stamp its name is bound at, which an assignment
+/// may give a new value; `barred` names the place in the clause where none may, since what runs
+/// there may run after the clause has returned. `frame` is how many scopes were open where the
+/// innermost closure the code runs in began: a local bound in one of them is read as its capture.
+pub type Assignable = {
+  vars: List<{ stamp: Int, name: Bytes, ty: Type }>,
+  barred: Option<Bytes>,
+  frame: Int,
+}
 
-/// `checker` where no assignment may give the variables of the clause around it a value: inside
-/// `place`, whose walk `unbarred` ends.
+/// `checker` inside `place`, which may run after the code around it, as a closure of its own: no
+/// assignment there may give the variables of the clause around it a value, and a read there of
+/// what is bound before it reads a capture. `unbarred` ends the walk.
 pub fn barred(checker: Checker, place: Bytes) -> Checker =
-  if checker.assignable.vars.len() == 0 { checker }
-  else { { ..checker, assignable: { ..checker.assignable, barred: Some(place) } } }
+  {
+    ..checker,
+    assignable: { ..checker.assignable, barred: Some(place), frame: checker.env.scopes.len() },
+  }
 
-/// `o`, walked from `barred(outer, ..)`, with the assignments `outer` allowed allowed again.
+/// `o`, walked from `barred(outer, ..)`, in `outer`'s place again.
 pub fn unbarred(outer: Checker, o: Inferred) -> Inferred =
-  if outer.assignable.vars.len() == 0 { o }
-  else { { ..o, checker: { ..o.checker, assignable: outer.assignable } } }
+  { ..o, checker: { ..o.checker, assignable: outer.assignable } }
 
 pub type Inferred = { checker: Checker, ty: Type, row: Row }
 
@@ -913,8 +900,9 @@ pub type ModuleFns = {
   names: List<Bytes>,
   members: List<GroupDef>,
   bodies: List<Body>,
-  /// What each call on a value in the module calls, by the call's span.
-  written: Map<Bytes, MemberCallee>,
+  /// What each call on a value in each body of the module calls, by the body's owner and the call's
+  /// site.
+  written: Map<Bytes, Map<Int, MemberCallee>>,
 }
 
 /// The sites of a body an operator, a comparison, a `Map` or a constraint is read at.

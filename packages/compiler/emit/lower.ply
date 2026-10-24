@@ -6,34 +6,41 @@
 
 import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch,
                   NPerform, NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown,
-                  CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause)
-import syntax.parsing (Span, read_site)
+                  CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm, CodeClause, is_label_binder)
+import syntax.parsing (Span)
 import syntax.patterns (LUnit)
 import syntax.exprs (detached_at)
+import emit.reps (Def, resumed)
 import emit.typing (unknown_type)
-import emit.tir (Var, Arg, AZero, RWord, RBool, RSlice, Return, Fn, Rooted, Declined, Spine,
-                 Calling, falls_through, rep_of_arg)
+import emit.tir (Var, Arg, AZero, RWord, RBool, RSlice, Return, Fn, Rooted, Crossing, Declined,
+                 Spine, Calling, falls_through, rep_of_arg)
 import emit.lower.setting (Setting, Root)
+import emit.keys (root_name, root_text, crossing)
 import emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef, ToValue,
                         ToInPlace, Armed, ClauseMade, GroupMember, Opened, started, refuse, opened,
-                        continued, joined, short_circuit, handed, read_noted, read_note, type_at,
-                        taken_as, unviewed)
+                        continued, joined, short_circuit, handed, read_noted, read_note, read_taken,
+                        unviewed, type_of)
 import emit.lower.data (constructed, recorded, field, updated)
 import emit.lower.scalars (literal, constant, operand, unary, binary)
-import emit.lower.containers (builtin, listed, columned, column_read)
+import emit.lower.containers (listed, columned, column_read)
 import emit.lower.matching (arm_opened, closed, let_bound, compared_side, compared_args, compared)
-import emit.lower.calling (convention, params_held, target, global, builtin_lambda, known, called,
-                           applied, entered, left, lambda_opened, closure, group_opened, grouped,
-                           known_body, step_captured, context_of)
+import emit.lower.calling (convention, params_held, target, global, known, called, applied, entered,
+                           left, lambda_opened, closure, group_opened, grouped, known_body,
+                           step_captured, context_of, called_builtin, resumption_closed)
 import emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
                             branched, simulated)
+import emit.statics (folded)
 
 /// Root `r` of `setting`, whose body lowers to `code`, lowered as a build lowers it: its body after
 /// `known_body`, so a slot known to hold a lambda reads as that lambda.
-pub fn root_lowered(setting: Setting, r: Root, code: Code) -> Result<Fn, Declined> / {abort.raise} = {
-  let body = known_body(r.full, r.params, code);
-  lowered_fn(context_of(setting, r, body), body)
-}
+pub fn root_lowered(setting: Setting, r: Root, code: Code) -> Result<Fn, Declined> / {abort.raise} =
+  match r.filed {
+    Err(why) -> Err({ by: Spine, why: why }),
+    Ok(_) -> {
+      let body = known_body(root_text(root_name(r.key)), r.params, code);
+      lowered_fn(context_of(setting, r, body), body)
+    },
+  }
 
 /// Root `r` lowered as `root_lowered` lowers it, noting where each slot is read and where each
 /// closure captures one, for `emit.moves` to read its moves off.
@@ -41,10 +48,14 @@ pub fn root_observed(
   setting: Setting,
   r: Root,
   code: Code,
-) -> Result<Fn, Declined> / {abort.raise} = {
-  let body = known_body(r.full, r.params, code);
-  lowered_fn({ ..context_of(setting, r, body), observing: true }, body)
-}
+) -> Result<Fn, Declined> / {abort.raise} =
+  match r.filed {
+    Err(why) -> Err({ by: Spine, why: why }),
+    Ok(_) -> {
+      let body = known_body(root_text(root_name(r.key)), r.params, code);
+      lowered_fn({ ..context_of(setting, r, body), observing: true }, body)
+    },
+  }
 
 /// The roots of one tail group of `setting`, each with the `Code` its body lowers to, lowered as a
 /// build lowers them: as one root, keyed as its first member.
@@ -52,12 +63,45 @@ pub fn group_lowered(
   setting: Setting,
   roots: List<{ root: Root, code: Code }>,
 ) -> Result<Fn, Declined> / {abort.raise} =
-  lowered_group(
-    roots.map(|m: { root: Root, code: Code }| {
-      let body = known_body(m.root.full, m.root.params, m.code);
-      { cx: context_of(setting, m.root, body), body: body }
-    }),
-  )
+  match roots.fold(None, |acc: Option<Bytes>, m: { root: Root, code: Code }|
+      match acc {
+        Some(_) -> acc,
+        None -> match m.root.filed { Err(why) -> Some(why), Ok(_) -> None },
+      }) {
+    Some(why) -> Err({ by: Spine, why: why }),
+    None ->
+      lowered_group(
+        roots.map(|m: { root: Root, code: Code }| {
+          let body = known_body(root_text(root_name(m.root.key)), m.root.params, m.code);
+          { cx: context_of(setting, m.root, body), body: body }
+        }),
+      ),
+  }
+
+/// A call in tail position of a definition of the module: its name as written, and where the
+/// reference to it stands, which the checker files the type arguments it names it at by.
+pub type TailCall = { name: Bytes, at: Span }
+
+/// The calls `code` makes in tail position of definitions of `here`, after `acc`.
+pub fn tail_calls(
+  here: List<Def>,
+  code: Code,
+  acc: List<TailCall>,
+) -> List<TailCall> / {abort.raise} =
+  match code.node {
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> if fv.slot == None
+          && here.any(|h: Def| h.name == fv.name && h.arity == a.args.len()) {
+        acc.push({ name: fv.name, at: a.func.span })
+      } else { acc },
+      _ -> acc,
+    },
+    NBinary(b) -> if b.op == b"and" || b.op == b"or" { tail_calls(here, b.rhs, acc) } else { acc },
+    NIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, acc)),
+    NBlock(b) -> match b.tail { Some(t) -> tail_calls(here, t, acc), None -> acc },
+    NMatch(m) -> m.arms.fold(acc, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
+    _ -> acc,
+  }
 
 /// The root lowered, or why its body is outside what the lowering covers.
 pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
@@ -75,18 +119,22 @@ pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.rais
   match answered.st.refused {
     Some(no) -> Err(no),
     None ->
-      Ok({
-        key: cx.key,
-        kind: Rooted,
-        params: params,
-        conv: conv,
-        body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
-        else { answered.st.insts },
-        lambdas: answered.st.lambdas,
-        base: cx.base,
-        members: [],
-        links: answered.st.links,
-      }),
+      Ok(
+        folded({
+          key: cx.key,
+          kind: if crossing(cx.key) { Crossing } else { Rooted },
+          params: params,
+          conv: conv,
+          answer_ty: cx.answer_ty,
+          body: if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
+          else { answered.st.insts },
+          lambdas: answered.st.lambdas,
+          base: cx.base,
+          members: [],
+          links: answered.st.links,
+          statics: answered.st.statics,
+        }),
+      ),
   }
 }
 
@@ -108,7 +156,10 @@ pub fn lowered_group(members: List<GroupMember>) -> Result<Fn, Declined> / {abor
         },
       },
   );
-  grouped(members, bodies.out)
+  match grouped(members, bodies.out) {
+    Ok(f) -> Ok(folded({ ..f, statics: match bodies.after { Some(a) -> a.statics, None -> [] } })),
+    Err(no) -> Err(no),
+  }
 }
 
 /// An operand that reads a slot where it stands: what the slot holds, noted read only once the
@@ -125,13 +176,13 @@ fn slot_read(
   st: Lowering,
   x: Code,
   views: Bool,
-) -> Option<{ st: Lowering, read: SlotRead }> =
+) -> Option<{ st: Lowering, read: SlotRead }> / {abort.raise} =
   match x.node {
     NVar(v) -> match v.slot {
       Some(k) -> match st.env.get(k) {
         Some(a) -> {
           let o = if views && rep_of_arg(a) == RSlice { { st: st, arg: a } }
-          else { slot_taken(cx, st, a, x.span) };
+          else { slot_taken(cx, st, v.name, k, a, x.span) };
           Some({ st: o.st, read: { slot: k, at: x.span, arg: o.arg } })
         },
         None -> None,
@@ -141,13 +192,38 @@ fn slot_read(
     _ -> None,
   }
 
-/// `a`, read out of a slot at `at`: a view as its list, and taken at the type the checker filed for
-/// that read where it filed one: a lambda's capture, which a body another root lends the lambda to
-/// holds as an untyped word.
-fn slot_taken(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered = {
+/// `a`, read out of slot `slot`, bound as `name`, at `at`: a view as its list, then read as
+/// `read_taken` reads a slot; a label's read is the lowering's own, of the `Int` its binder takes;
+/// a continuation's the function value that resumes it (`resumption_closed`).
+fn slot_taken(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  slot: Int,
+  a: Arg,
+  at: Span,
+) -> Lowered / {abort.raise} = {
   let l = unviewed({ st: st, arg: a }, at);
-  match type_at(cx, read_site(at)) { Some(t) -> taken_as(cx, l, t, at), None -> l }
+  if is_label_binder(name) { l }
+  else if resumed(type_of(a)) != None { resumption_closed(cx, l.st, slot, a, at) }
+  else { read_taken(cx, l, name, slot, at) }
 }
+
+/// The function value a call applies, lowered from `func`: a continuation as the runtime holds it,
+/// which the call resumes through its uniform entry; any other as a value.
+fn callee_lowered(cx: Context, st: Lowering, func: Code) -> Lowered / {abort.raise} =
+  match func.node {
+    NVar(v) -> match v.slot {
+      Some(s) -> match st.env.get(s) {
+        Some(a) -> if resumed(type_of(a)) != None {
+          { st: read_noted(cx, st, read_note(), s, func.span), arg: a }
+        } else { lowered(cx, st, func, false) },
+        None -> lowered(cx, st, func, false),
+      },
+      None -> lowered(cx, st, func, false),
+    },
+    _ -> lowered(cx, st, func, false),
+  }
 
 /// The slot `c` reads and the view of a list it holds, where `c` reads a slot holding one.
 fn viewed_slot(st: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
@@ -174,19 +250,11 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
       NLit(l) -> literal(cx, st, l, c.span),
       NVar(v) -> match v.slot {
         Some(s) -> match st.env.get(s) {
-          Some(a) -> slot_taken(cx, read_noted(cx, st, read_note(), s, c.span), a, c.span),
+          Some(a) ->
+            slot_taken(cx, read_noted(cx, st, read_note(), s, c.span), v.name, s, a, c.span),
           None -> refuse(st, Spine, b"a slot nothing bound: ".concat(v.name)),
         },
-        None -> match builtin_lambda(cx, v.name, c.span) {
-          None -> global(cx, st, v.name, c.span),
-          Some(b) -> {
-            let frame = { params: b.arity, size: b.arity, captures: [], resumes: false };
-            let o = lambda_opened(cx, st, frame, c.span);
-            let params = range(0, b.arity).fold([], |acc: List<Arg>, j: Int|
-              match o.st.env.get(j) { Some(a) -> acc.push(a), None -> acc });
-            closure(cx, st, builtin(o.cx, o.st, b.name, params, c.span, c.span), frame, c.span)
-          },
-        },
+        None -> global(cx, st, v.name, c.span),
       },
       NKnown(k) -> known(cx, st, k, c.span),
       NUnary(u) -> unary(cx, lowered(cx, st, u.operand, false), u.op, c.span),
@@ -326,7 +394,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           left(cx, before, e, body, args.args, which, c.span)
         },
         Some(ToValue) -> {
-          let f = lowered(cx, st, a.func, false);
+          let f = callee_lowered(cx, st, a.func);
           let args = a.args.fold({ st: f.st, args: [], read: [] }, |acc: Operands, x: Code|
             match slot_read(cx, acc.st, x, false) {
               Some(r) -> { st: r.st, args: acc.args.push(r.read.arg), read: acc.read.push(r.read) },
@@ -351,7 +419,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           let args = { st: reads_noted(cx, ops.st, ops.read), args: ops.args };
           match t {
             ToCtor(name) -> constructed(cx, args.st, name, args.args, a.func.span, c.span),
-            ToBuiltin(name) -> builtin(cx, args.st, name, args.args, a.func.span, c.span),
+            ToBuiltin(name) -> called_builtin(cx, args.st, name, args.args, a.func.span, c.span),
             ToDef(full) -> called(cx, args.st, full, a.func, a.args, args.args, tail, c.span),
             _ -> refuse(args.st, Spine, b"a target taken above"),
           }
@@ -476,14 +544,28 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
       },
       NLabel(n) -> label(cx, st, n, c.span),
       NLambda(l) -> {
-        let frame = { params: l.params, size: l.size, captures: l.captures, resumes: false };
+        let frame = {
+          params: l.params,
+          size: l.size,
+          captures: l.captures,
+          resumes: false,
+          body: l.body,
+          ty: None,
+        };
         let o = lambda_opened(cx, st, frame, l.at);
-        closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, l.at)
+        closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
       },
       NSimulate(x) -> {
-        let frame = { params: 0, size: x.size, captures: x.captures, resumes: false };
+        let frame = {
+          params: 0,
+          size: x.size,
+          captures: x.captures,
+          resumes: false,
+          body: x.body,
+          ty: None,
+        };
         let o = lambda_opened(cx, st, frame, x.at);
-        let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, x.at);
+        let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, Rooted, x.at);
         simulated(cx, k.st, k.arg, c.span)
       },
       NParallel(pr) -> {
@@ -509,7 +591,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
             };
             let frame = clause_frame(cx, cl);
             let o = lambda_opened(cx, lb.st, frame, cl.at);
-            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, cl.at);
+            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at);
             { st: k.st, out: acc.out.push({ label: lb.arg, closure: k.arg }) }
           },
         );
@@ -517,7 +599,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           Some(r) -> {
             let frame = ret_frame(cx, r);
             let o = lambda_opened(cx, clauses.st, frame, r.at);
-            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, r.at);
+            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at);
             { st: k.st, arg: Some(k.arg) }
           },
           None -> { st: clauses.st, arg: None },
@@ -526,7 +608,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           Some(frame) -> {
             let at = detached_at(c.span);
             let o = lambda_opened(cx, ret.st, frame, at);
-            closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, at)
+            closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, Rooted, at)
           },
           None -> lowered(cx, opened(ret.st), h.body, false),
         };

@@ -1,13 +1,179 @@
-//! What the checker filed at a site of a lowered body, which a value's type is read off.
+//! What the checker filed of the nodes of a lowered body, which a value's type is read off.
 
-import check.types (Type, TyVar)
+import check.types (Type, TyVar, type_at, type_text)
+import check.infer (RootFacts)
+import check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite, WitnessOp,
+                            WitnessRef)
+import syntax.parsing (minted_too_deep)
+import std.bytes (ascii_of_int)
 
-/// What is known at a span: `ty` is the type the checker filed there, unknown where it filed none,
-/// and `args` the type arguments it filled where the site names a generic definition.
+/// What is known at a node: `ty` is the type the checker filed there, unknown where it settled none,
+/// and `args` the type arguments it filled where the node names a generic definition.
 pub type Typed = { ty: Type, args: List<Type> }
 
-/// No type: what a site holds where nothing is known of it.
+/// No type: what a node holds where nothing is known of it.
 pub fn unknown_type() -> Type = TyVar(0 - 1)
 
-/// What the checker filed at a site.
+/// What the checker filed at a node.
 pub fn filed_as(ty: Type, args: List<Type>) -> Typed = { ty: ty, args: args }
+
+/// What the checker filed for one item's nodes, by site: the types, the labels each call fills, and
+/// what writing the item out reads of its calls on values, updates, `try`s and witnesses.
+pub type Filings = {
+  typed: Map<Int, Typed>,
+  labels: Map<Int, List<Bytes>>,
+  members: Map<Int, MemberSite>,
+  updates: Map<Int, UpdateShape>,
+  tries: Map<Int, TrySite>,
+  ops: Map<Int, WitnessOp>,
+  refs: Map<Int, WitnessRef>,
+}
+
+/// What an item with nothing filed of it reads.
+pub fn no_filings() -> Filings =
+  {
+    typed: Map::new(),
+    labels: Map::new(),
+    members: Map::new(),
+    updates: Map::new(),
+    tries: Map::new(),
+    ops: Map::new(),
+    refs: Map::new(),
+  }
+
+/// `facts`, one item's, by site, or why not: two different filings at one site, or a site minted
+/// deeper than a site holds. Two equal ones, a node both of a test's trees hold, are one.
+pub fn filings(facts: RootFacts) -> Result<Filings, Bytes> / {abort.raise} = {
+  let read = facts.typed.fold(
+    { typed: [], read: Map::new() },
+    |acc: { typed: List<{ site: Int, t: Typed }>, read: Map<Bytes, Type> }, s: TypedSite| {
+      let own = type_at(facts.types, s.ty, acc.read);
+      let args = s.args.fold(
+        { tys: [], read: own.read },
+        |a: { tys: List<Type>, read: Map<Bytes, Type> }, k: Bytes| {
+          let t = type_at(facts.types, k, a.read);
+          { tys: a.tys.push(t.ty), read: t.read }
+        },
+      );
+      { typed: acc.typed.push({ site: s.site, t: filed_as(own.ty, args.tys) }), read: args.read }
+    },
+  );
+  match by_site(
+      read.typed,
+      |x: { site: Int, t: Typed }| x.site,
+      |x: { site: Int, t: Typed }| x.t,
+      typed_text,
+      b"types",
+    ) {
+    Err(why) -> Err(why),
+    Ok(typed) -> match by_site(
+        facts.label_sites,
+        |x: LabelSite| x.site,
+        |x: LabelSite| x.labels,
+        |ls: List<Bytes>| Bytes::join(ls, b", "),
+        b"labels",
+      ) {
+      Err(why) -> Err(why),
+      Ok(labels) -> match by_site(
+          facts.members,
+          |x: MemberSite| x.site,
+          |x: MemberSite| x,
+          |x: MemberSite| Bytes::concat_all([x.qualifier, b".", x.name]),
+          b"callees",
+        ) {
+        Err(why) -> Err(why),
+        Ok(members) -> match by_site(
+            facts.updates,
+            |x: UpdateShape| x.site,
+            |x: UpdateShape| x,
+            |x: UpdateShape| Bytes::join(x.names, b", "),
+            b"updates",
+          ) {
+          Err(why) -> Err(why),
+          Ok(updates) -> match by_site(
+              facts.tries,
+              |x: TrySite| x.site,
+              |x: TrySite| x,
+              |x: TrySite| Bytes::concat_all([x.effect, b".", x.op]),
+              b"raises",
+            ) {
+            Err(why) -> Err(why),
+            Ok(tries) -> match by_site(
+                facts.ops,
+                |x: WitnessOp| x.site,
+                |x: WitnessOp| x,
+                |x: WitnessOp| x.param,
+                b"witnesses",
+              ) {
+              Err(why) -> Err(why),
+              Ok(ops) -> match by_site(
+                  facts.refs,
+                  |x: WitnessRef| x.site,
+                  |x: WitnessRef| x,
+                  |x: WitnessRef| ascii_of_int(x.witnesses.len()).concat(b" witnesses"),
+                  b"witnesses passed",
+                ) {
+                Err(why) -> Err(why),
+                Ok(refs) ->
+                  Ok({
+                    typed: typed,
+                    labels: labels,
+                    members: members,
+                    updates: updates,
+                    tries: tries,
+                    ops: ops,
+                    refs: refs,
+                  }),
+              },
+            },
+          },
+        },
+      },
+    },
+  }
+}
+
+/// `xs`, `what` was filed, each as `of` reads it at its `site`, or why not, two filings at one site
+/// named as `shown` writes each.
+fn by_site<a, b>(
+  xs: List<a>,
+  site: (a) -> Int,
+  of: (a) -> b,
+  shown: (b) -> Bytes / {abort.raise},
+  what: Bytes,
+) -> Result<Map<Int, b>, Bytes> / {abort.raise} =
+  xs.fold(Ok(Map::new()), |acc: Result<Map<Int, b>, Bytes>, x: a|
+    match acc {
+      Err(_) -> acc,
+      Ok(m) -> {
+        let k = site(x);
+        let here = of(x);
+        if minted_too_deep(k) {
+          Err(b"a site minted deeper than a site holds: ".concat(ascii_of_int(k)))
+        } else {
+          match m.get(k) {
+            Some(was) -> if was == here { acc } else {
+              Err(
+                Bytes::concat_all([
+                  b"two different ",
+                  what,
+                  b" filed at site ",
+                  ascii_of_int(k),
+                  b": ",
+                  shown(was),
+                  b" and ",
+                  shown(here),
+                ]),
+              )
+            },
+            None -> Ok(m.insert(k, here)),
+          }
+        }
+      },
+    })
+
+/// What the checker filed at a node, as a reader writes it: its type, then any type arguments.
+fn typed_text(t: Typed) -> Bytes / {abort.raise} =
+  if t.args.len() == 0 { type_text(t.ty) } else {
+    Bytes::concat_all([type_text(t.ty), b" at [", Bytes::join(t.args.map(type_text), b", "), b"]"])
+  }

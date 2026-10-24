@@ -88,6 +88,186 @@ fn a_block_leaves_this_thread_past_every_handler_its_site_says_it_cannot_reach()
     }
 }
 
+/// Blocks laid out as emitted code lays them: a count at offset 0, freed by size.
+mod emitted {
+    use crate::bare::{context, helper};
+    use ply_compiled::emitted::{Handed, PlyFnDesc};
+    use ply_compiled::heap::{HEADER, SHARED, Word};
+    use ply_compiled::rt::Ctx;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
+    type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
+    type Run = unsafe extern "C" fn(*mut Ctx, *mut Word, Word);
+
+    /// A box of one word, the number it holds, and a closure block of its descriptor alone.
+    const BLOCK: Word = HEADER as Word + 8;
+
+    fn block(ctx: *mut Ctx, word: Word) -> Word {
+        let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, BLOCK) };
+        unsafe { *(w as *mut Word).add(2) = word };
+        w
+    }
+
+    fn held(w: Word) -> Word {
+        unsafe { *(w as *const Word).add(2) }
+    }
+
+    fn free(ctx: *mut Ctx, w: Word) {
+        unsafe { helper::<Free>("rt_free")(ctx, w, BLOCK) };
+    }
+
+    unsafe extern "C" fn release(ctx: *mut Ctx, f: Handed) -> Word {
+        free(ctx, unsafe { std::mem::transmute::<Handed, Word>(f) });
+        0
+    }
+
+    /// Captures nothing that cannot cross threads.
+    unsafe extern "C" fn crosses(_ctx: *mut Ctx, _f: Word) -> Word {
+        1
+    }
+
+    /// Captures what may not leave this thread.
+    unsafe extern "C" fn stays(_ctx: *mut Ctx, _f: Word) -> Word {
+        0
+    }
+
+    static WALKED: AtomicBool = AtomicBool::new(false);
+
+    /// Shares as emitted code's roots do: what the block captures is walked only where nothing has
+    /// marked the block yet, and the block marked after it.
+    unsafe extern "C" fn walks_then_marks(_ctx: *mut Ctx, f: Word) -> Word {
+        let count = unsafe { &*(f as *const AtomicU32) };
+        if count.load(Ordering::Relaxed) < SHARED {
+            WALKED.store(true, Ordering::SeqCst);
+            count.fetch_or(SHARED, Ordering::Relaxed);
+        }
+        1
+    }
+
+    static UNRUN_RAN: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "C" fn first(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+        block(ctx, 1)
+    }
+
+    unsafe extern "C" fn second(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+        block(ctx, 2)
+    }
+
+    /// The branch after one that fails in turn, which no other test runs.
+    unsafe extern "C" fn unrun(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+        UNRUN_RAN.store(true, Ordering::SeqCst);
+        block(ctx, 3)
+    }
+
+    unsafe extern "C" fn fails(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+        unsafe { (*ctx).failed = 1 };
+        0
+    }
+
+    const fn desc(
+        uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word,
+        share: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
+    ) -> PlyFnDesc {
+        PlyFnDesc {
+            uniform,
+            typed: None,
+            convention: 0,
+            release,
+            share,
+            keep: stays,
+        }
+    }
+
+    static FIRST: PlyFnDesc = desc(first, crosses);
+    static SECOND: PlyFnDesc = desc(second, crosses);
+    static FAILS: PlyFnDesc = desc(fails, crosses);
+    static FAILS_HERE: PlyFnDesc = desc(fails, stays);
+    static UNRUN: PlyFnDesc = desc(unrun, crosses);
+    static WALKS: PlyFnDesc = desc(first, walks_then_marks);
+
+    fn multicore() -> bool {
+        std::thread::available_parallelism().map_or(1, |n| n.get()) >= 2
+    }
+
+    /// A block of a branch for each of `descs`, run: its slots as `rt_branches` leaves them.
+    fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
+        let c: *mut Ctx = ctx;
+        let mut slots = descs.map(|d| block(c, d as *const PlyFnDesc as Word));
+        unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
+        slots
+    }
+
+    /// Each branch's closure block is taken and let go once it has run, and its answer written
+    /// over it, at once on threads of their own where the closures may cross.
+    #[test]
+    fn branches_emitted_code_made_answer_in_their_slots_and_are_let_go() {
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let [a, b] = branches(&mut ctx, [&FIRST, &SECOND]);
+        assert_eq!(ctx.failed, 0);
+        assert_eq!((held(a), held(b)), (1, 2));
+        free(&mut ctx, a);
+        free(&mut ctx, b);
+        assert_eq!(ctx.heap.live(), 0, "a branch's closure was not let go");
+        ctx.end();
+    }
+
+    /// A branch's closure is marked shared by its descriptor, which walks what it captures on the
+    /// way: one the runtime marked first would cross with its captures counted as this thread's.
+    #[test]
+    fn a_branch_crossing_threads_is_marked_by_its_descriptor() {
+        if !multicore() {
+            return;
+        }
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let [a, b] = branches(&mut ctx, [&WALKS, &SECOND]);
+        assert!(
+            WALKED.load(Ordering::SeqCst),
+            "the closure was marked before its descriptor walked it"
+        );
+        assert_eq!((held(a), held(b)), (1, 2));
+        free(&mut ctx, a);
+        free(&mut ctx, b);
+        assert_eq!(ctx.heap.live(), 0);
+        ctx.end();
+    }
+
+    /// In turn, a branch that fails leaves 0, and those after it are let go unrun.
+    #[test]
+    fn a_failing_branch_in_turn_leaves_0_and_those_after_it_are_let_go_unrun() {
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let slots = branches(&mut ctx, [&FAILS_HERE, &UNRUN]);
+        assert_eq!(ctx.failed, 1);
+        assert_eq!(slots, [0, 0]);
+        assert!(!UNRUN_RAN.load(Ordering::SeqCst));
+        assert_eq!(ctx.heap.live(), 0);
+        ctx.failed = 0;
+        ctx.end();
+    }
+
+    /// At once, a branch that answered after one before it failed leaves its answer in its slot
+    /// for emitted code, which knows its type, to let go.
+    #[test]
+    fn a_branch_that_answered_past_one_that_failed_is_left_for_emitted_code() {
+        if !multicore() {
+            return;
+        }
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let [failed, answered] = branches(&mut ctx, [&FAILS, &SECOND]);
+        assert_eq!((ctx.failed, failed), (1, 0));
+        assert_eq!(held(answered), 2);
+        free(&mut ctx, answered);
+        assert_eq!(ctx.heap.live(), 0);
+        ctx.failed = 0;
+        ctx.end();
+    }
+}
+
 /// The unit `entered_inside` enters, for the length of the one test that sets it.
 static UNIT: AtomicPtr<ply_compiled::c::Native> = AtomicPtr::new(std::ptr::null_mut());
 

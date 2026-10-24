@@ -1,0 +1,241 @@
+//! Values held otherwise: a scalar boxed or read out of its word, a record or a sum made its word
+//! form or opened out of it, a value of no words its word 0, a view of a list its list.
+
+import syntax.parsing (span_between)
+import check.types (TyCon, list_type, int_type)
+import emit.layout (LWords, P, sum_laid, record_laid, raw, raw_sum)
+import emit.tir (Rep, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, Data, rep_of_arg, rep_said,
+                 in_box)
+import emit.pieces (Text, spelled)
+import emit.print.text (Printing, Place, printing, named, pad, pieces, line, arg_text, part_names,
+                        unprinted)
+import emit.print.made (arg_parts, parts_word, word_parts, word_viewed, word_as, declared_as)
+import emit.print.counting (dec_fn, call_text, calls, counts_any, lets_go_of)
+import emit.print.counts (released)
+
+/// `k.arg` held as `k.to`: a scalar boxed, which takes it, or read out of its word, which borrows
+/// it; a record or a sum made its word form, as `made.parts_word` makes it, which takes it, or read
+/// out of it in place, which borrows it; a value of no words no value, or its word 0; a view of a
+/// list its list from the view's offset.
+pub fn worded(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  k: { arg: Arg, to: Rep },
+) -> Printing / {abort.raise} =
+  match into {
+    None ->
+      unprinted(
+        Data,
+        b"a value held otherwise that nothing holds",
+        Bytes::concat_all([rep_said(rep_of_arg(k.arg)), b" held as ", rep_said(k.to)]),
+      ),
+    Some(v) -> {
+      let from = rep_of_arg(k.arg);
+      let xs = arg_parts(pr, k.arg);
+      if from == k.to { declared_as(p, pr, v, xs) } else {
+        match k.to {
+          RWord -> if from == RSlice { list_of_view(p, pr, v, xs) } else {
+            let n = named(pr, v);
+            let w = parts_word(n.pr, n.name, xs, from);
+            if w.word == n.name {
+              pieces(w.pr, [Text(pad(p.depth))].concat(w.prep).push(Text(b"\n")))
+            } else {
+              line(w.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", w.word, b";"]))
+            }
+          },
+          RUnit -> declared_as(p, pr, v, []),
+          RFlat(_) -> opened(p, pr, v, from, k),
+          // A sum whose one word is a raw scalar is read out as that scalar is.
+          RSum(s) -> if !raw_sum(s.laid) { opened(p, pr, v, from, k) }
+          else { scalar_borrowed(p, pr, v, from, k) },
+          _ -> scalar_borrowed(p, pr, v, from, k),
+        }
+      }
+    },
+  }
+
+/// `v`, a scalar read out of the word form `k.arg`, which it borrows: what holds the word lets it go.
+fn scalar_borrowed(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  from: Rep,
+  k: { arg: Arg, to: Rep },
+) -> Printing / {abort.raise} =
+  if from == RWord { declared_as(p, pr, v, [word_as(arg_text(pr, k.arg), k.to)]) }
+  else { mismatched(from, k.to) }
+
+/// `v`, a record or a sum, read out of the word form `k.arg`: a box of its words viewed in place,
+/// which takes nothing (`tir.unpacks`), and a sum of one word the word held again.
+fn opened(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  from: Rep,
+  k: { arg: Arg, to: Rep },
+) -> Printing / {abort.raise} =
+  if from != RWord { mismatched(from, k.to) } else {
+    let n = named(pr, v);
+    let word = arg_text(pr, k.arg);
+    let names = part_names(n.name, k.to);
+    pieces(
+      n.pr,
+      [Text(pad(p.depth))].concat(if in_box(k.to) { word_viewed(word, k.to, names) }
+      else { word_parts(word, k.to, names) }).push(
+        Text(b"\n"),
+      ),
+    )
+  }
+
+/// `v`, a view's list from its offset on, sharing the list's trie: the list itself where the offset
+/// is zero, whose count the view hands over, and otherwise a list of its own, the view's list then
+/// let go of by its type, since the items it alone held are emitted code's to let go of.
+fn list_of_view(p: Place, pr: Printing, v: Var, xs: List<Bytes>) -> Printing / {abort.raise} = {
+  let list = nth(xs, 0);
+  let from_at = nth(xs, 1);
+  let n = named(pr, v);
+  let go = released(n.pr, v.ty, RWord, [list]);
+  pieces(
+    go.pr,
+    [
+      Text(
+        Bytes::concat_all([
+          pad(p.depth),
+          b"Word ",
+          n.name,
+          b" = ",
+          from_at,
+          b" ? rt_list_rest_p(ctx, ",
+          list,
+          b", ",
+          from_at,
+          b") : ",
+          list,
+          b"; if (",
+          from_at,
+          b") { ",
+        ]),
+      ),
+    ].concat(
+      go.out,
+    ).push(
+      Text(b" }\n"),
+    ),
+  )
+}
+
+fn mismatched(from: Rep, to: Rep) -> Printing / {abort.raise} =
+  unprinted(
+    Data,
+    b"a value held as no type holds both, which the form never packs",
+    Bytes::concat_all([rep_said(from), b" held as ", rep_said(to)]),
+  )
+
+fn nth(xs: List<Bytes>, k: Int) -> Bytes = match xs.at(k) { Some(x) -> x, None -> b"0" }
+
+fn place() -> Place =
+  {
+    u: {
+      symbol: b"f",
+      base: 0,
+      answer: RWord,
+      site: None,
+      arm: None,
+      looping: None,
+      landing: None,
+      group: None,
+      leaving: b"ctx->fuel += 1;",
+    },
+    at: span_between(0, 0),
+    leave: b"return 0;",
+    depth: 0,
+  }
+
+fn local(id: Int, rep: Rep) -> Var = { id: id, ty: TyCon({ name: b"T", args: [] }), rep: rep }
+
+fn point() -> Rep = RFlat([{ name: b"x", rep: RWord }, { name: b"y", rep: RWord }])
+
+test "a record's word form is a box made of its words, and a box read back is viewed in place, taken nowhere" {
+  let pr = { ..printing(Map::new().insert(0, b"p0")), temps: 4 };
+  let made_word = worded(place(), pr, Some(local(1, RWord)), {
+    arg: AVar(local(0, point())),
+    to: RWord,
+  });
+  let made = spelled(made_word.out);
+  // A header and the record's two words; each leaf written to its word.
+  assert_eq(
+    [b"rt_alloc_bytes_p(ctx, INT64_C(32))", b"[0] = p0_0;", b"[1] = p0_1;"].filter(|part: Bytes|
+      made.index_of(part) == None),
+    [],
+  );
+  let both = spelled(
+    worded(place(), made_word, Some(local(2, point())), {
+      arg: AVar(local(1, RWord)),
+      to: point(),
+    }).out,
+  );
+  let opened_back = both.slice(made.len(), both.len());
+  assert(
+    opened_back.index_of(b"[0]") != None && opened_back.index_of(b"[1]") != None
+      && !counts_any(opened_back)
+      && opened_back.index_of(b"rt_") == None,
+    Some(String::of_bytes_lossy(opened_back)),
+  )
+}
+
+test "a sum of one word is its word either way, and a value of no words is its word 0" {
+  let one = RSum({
+    laid: sum_laid([
+      { args: record_laid([]), indirect: false },
+      { args: record_laid([LWords([P])]), indirect: false },
+    ]),
+    cases: [b"None", b"Some"],
+  });
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let said = |from: Rep, to: Rep|
+    spelled(worded(place(), pr, Some(local(1, to)), { arg: AVar(local(0, from)), to: to }).out);
+  // The word itself, nothing called.
+  assert_eq([said(one, RWord), said(RWord, one)].map(|c: Bytes| c.ends_with(b" = p0;\n")), [
+    true,
+    true,
+  ]);
+  assert(said(RUnit, RWord).ends_with(b" = 0;\n"), None);
+  // A sum wider than a word read out of its box: its words, viewed in place.
+  let tagged = RSum({
+    laid: sum_laid([
+      { args: record_laid([]), indirect: false },
+      { args: record_laid([LWords([raw()])]), indirect: false },
+    ]),
+    cases: [b"None", b"Some"],
+  });
+  let wide = said(RWord, tagged);
+  assert(
+    wide.index_of(b"ply_words(p0)[0]") != None && wide.index_of(b"ply_words(p0)[1]") != None
+      && !counts_any(wide),
+    Some(String::of_bytes_lossy(wide)),
+  );
+  // A sum of one case holding a raw scalar is read out of its word as the scalar is, borrowing it:
+  // what holds the word lets its box go.
+  let id = RSum({
+    laid: sum_laid([{ args: record_laid([LWords([raw()])]), indirect: false }]),
+    cases: [b"Id"],
+  });
+  let read = said(RWord, id);
+  assert(!counts_any(read), Some(String::of_bytes_lossy(read)))
+}
+
+test "a view of a list from an offset is made the list of its rest where it leaves" {
+  let pr = printing(Map::new().insert(0, b"p0"));
+  let listed = { ..local(1, RWord), ty: list_type(int_type()) };
+  let text = spelled(
+    worded(place(), pr, Some(listed), { arg: AVar(local(0, RSlice)), to: RWord }).out,
+  );
+  // The rest made where the view starts past the list's first item, the list then let go of by its
+  // type: the runtime does not walk the items emitted code lays out.
+  assert(
+    text.index_of(b"rt_list_rest_p(ctx, p0_0, p0_1)") != None && lets_go_of(text, b"p0_0")
+      && !calls(text, dec_fn()),
+    Some(String::of_bytes_lossy(text)),
+  )
+}

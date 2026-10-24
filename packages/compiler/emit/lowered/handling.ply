@@ -2,22 +2,51 @@
 //! hand-built inputs where another family's construct stands in front of them, its framing printed,
 //! and a corpus that lowers, checks and prints.
 
-import emit.code (Code, NHandle, NBlock, NApp, NLambda, Lambda, Capture, CodeClause, CodeReturn)
+import std.list
+import std.bytes (ascii_of_int)
+import emit.reps
+import emit.reps (Ctors, Def, no_ctors, gathered_type)
+import emit.code (Code, NHandle, NBlock, NApp, NLambda, NVar, NLit, NIf, NMatch, NRecord, NField,
+                  NBinary, Lambda, Capture, CodeClause, CodeReturn, CodeArm, CodeStmt, CLet, CDo,
+                  CodeField)
 import syntax.parsing (Span, span_between)
+import syntax.patterns (LBytes)
 import check.resolve.tables (qualify)
-import check.types (Type, TyCon, TyRecord, fn_type, row_empty, fields_sorted)
-import emit.keys (Named)
+import check.types (Type, TyCon, TyVar, TyRecord, fn_type, row_empty, fields_sorted, list_type,
+                    int_type, bytes_type, unit_type, option_type, bool_type)
+import syntax.type_syntax (MWrite)
+import emit.keys
+import emit.keys (RootKey, Named, Written, Lower, Lift, Dup, Worded, Contained, Root, root_name,
+                  root_text, op_name)
 import emit.pieces (spelled)
-import emit.tir (Rep, RInt, RWord, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure, Op, OHandle,
-                 Uses, Inst, Let, Assign, Return, Handle, Fn, Rooted, Given, Handling, RFlat, Leaf,
-                 Get, Path, PLeaf, Closure, Decl, no_links)
-import emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate)
-import emit.lower.setting (Root)
-import emit.lower.base (Context, started, emitted, opened)
+import emit.tir (Rep, RInt, RWord, RUnit, RAddr, Var, Arg, AVar, AInt, Prim, Pack, Make, MClosure,
+                 Op, OHandle, OContainer, Uses, Inst, Let, Do, Assign, Return, Handle, Fn, Rooted,
+                 Given, Owned, Handling, RFlat, Leaf, Get, Path, PLeaf, PNamed, PPayload, Closure,
+                 Decl, Native, Call, Val, Handed, Static, no_links, rep_of_arg)
+import emit.tir
+import emit.tir.containers (Taken, Length)
+import emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, Simulate, Encoded,
+                          Unsettled)
+import emit.typing (Typed)
+import emit.answer (Need, Exact)
+import emit.lower.setting (Root, prelude_ctor)
+import emit.lower.held (held_as)
+import emit.lower.base (Context, Lowering, started, emitted, opened)
 import emit.lower.calling (context_of)
 import emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated)
+import emit.lower.crossing (crossed, crossing_builtin, encoded_externs, type_described, worded,
+                            op_described, counts_type, holds_function)
+import emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, WHead, entries_of)
+import emit.print.counting (never_lifted_fn)
+import emit.written (WrittenRoot, crossing_root, container_code, container_defs, entered_code,
+                     contained_formed, contained_reads, sums_crossed, crosses, crossing_op)
+import emit.marks (marked_type, marks_of, carried_by)
+import check.infer.definitions (Extern, prelude_externs)
+import store.hash.forms (written_code)
 import emit.print (printed_fn)
-import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built)
+import emit.print.handled (landing_jump, scheduled_ops)
+import emit.compare (Program, program_of, formed, checked, printed_by_form, not_built, printed_text,
+                     unbuilt)
 
 fn named(n: Bytes) -> Type = TyCon({ name: n, args: [] })
 
@@ -35,10 +64,10 @@ fn nowhere() -> Span = span_between(0, 0)
 /// The context root `m.<name>` of `p` is lowered in, and its body.
 fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> / {abort.raise} =
   p.roots.fold(None, |acc: Option<{ cx: Context, code: Code }>, r: Root|
-    if r.full != qualify(b"m", name) { acc } else {
+    if r.key != Named(qualify(b"m", name)) { acc } else {
       match r.code {
-        None -> acc,
-        Some(code) -> Some({ cx: context_of(p.setting, r, code), code: code }),
+        Err(_) -> acc,
+        Ok(code) -> Some({ cx: context_of(p.setting, r, code), code: code }),
       }
     })
 
@@ -79,8 +108,23 @@ fn ops_in(body: List<Inst>) -> List<{ var: Var, op: HandleOp, args: List<Arg>, u
       _ -> acc,
     })
 
-/// `i` with its source place cleared, for holding a form to one written by hand.
-fn placeless(i: Inst) -> Inst = match i { Let(l) -> Let({ ..l, at: nowhere() }), other -> other }
+/// The `handle`s of `body`.
+fn handles_in(
+  body: List<Inst>,
+) -> List<{ body: List<Inst>, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> }> =
+  body.fold(
+    [],
+    |acc: List<{ body: List<Inst>, args: List<Arg>, uses: Uses, site: HandleSite, answer: Var, unwind: List<Var> }>, i: Inst|
+      match i { Handle(h) -> acc.push(h), _ -> acc },
+  )
+
+/// Whether `body` reads the word `v` back as the value it is, held as `rep`.
+fn answer_read(body: List<Inst>, v: Var, rep: Rep) -> Bool =
+  body.any(|i: Inst| match i { Let(l) -> l.val == Pack({ arg: AVar(v), to: rep }), _ -> false })
+
+/// `op` with the name of the descriptor a perform reads blank, which the descriptor's content gives.
+fn undescribed(op: HandleOp) -> HandleOp =
+  match op { Perform(x) -> Perform({ ..x, described: b"" }), other -> other }
 
 fn performs() -> Bytes =
   Bytes::concat_all([
@@ -94,43 +138,64 @@ fn performs() -> Bytes =
     b"fn raised(m: String) -> Int / {abort.raise} = abort.raise(m)\n",
   ])
 
+test "a body with a hole is lowered, the hole the raise it runs as, answering what its place takes" {
+  match program_of(b"pub fn pick(n: Int) -> Int = if n > 3 { 9 } else { ??? }\n") {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"pick") { Err(no) -> assert_eq(no.why, b""), Ok(_) -> () },
+  }
+}
+
 test "a perform hands the runtime its arguments as words and holds what the handler answers as its type" {
   match program_of(performs()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
       let int = named(b"Int");
-      let boxed = local(1, int, RWord);
-      let answer = local(2, named(b"Unit"), RWord);
       match formed(p, b"note") {
         Err(no) -> assert_eq(no.why, b""),
-        Ok(f) ->
-          assert_eq(f.body.map(placeless), [
-            Let({
-              var: boxed,
-              val: Pack({ arg: AVar(local(0, int, RInt)), to: RWord }),
-              at: nowhere(),
-              unwind: [],
-            }),
-            Let({
-              var: answer,
-              val: Op({
-                op: OHandle(
-                  Perform({
-                    effect: b"m.log",
-                    op: b"put",
-                    resource: b"",
-                    labelled: false,
-                    mode: 1,
+        Ok(f) -> {
+          match ops_in(f.body) {
+            [o] -> {
+              assert_eq(
+                undescribed(o.op),
+                Perform({
+                  effect: b"m.log",
+                  op: b"put",
+                  resource: b"",
+                  labelled: false,
+                  mode: 1,
+                  described: b"",
+                }),
+              );
+              assert_eq((o.uses.takes, o.uses.stops), ([true], true));
+              // Its argument is the `Int` handed as its word.
+              assert(
+                f.body.any(|i: Inst|
+                  match i {
+                    Let(l) ->
+                      o.args == [AVar(l.var)] && l.var.rep == RWord
+                        && l.val == Pack({ arg: AVar(local(0, int, RInt)), to: RWord }),
+                    _ -> false,
                   }),
-                ),
-                args: [AVar(boxed)],
-                uses: { takes: [true], owned: true, fails: true, stops: true },
-              }),
-              at: nowhere(),
-              unwind: [],
-            }),
-            Return(AVar(answer)),
-          ]),
+                None,
+              );
+              // `Unit` is no value: the handler's word is held as none.
+              assert(answer_read(f.body, o.var, RUnit), None)
+            },
+            other -> assert_eq(other.len(), 1),
+          };
+          // The descriptor it names is among the root's statics, after the types it addresses.
+          let described = ops_in(f.body).map(
+            |o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }|
+              match o.op { Perform(x) -> x.described, _ -> b"" },
+          );
+          assert_eq(
+            f.statics.filter(|d: StaticDef|
+              match d.laid { SStruct(s) -> s.of == b"PlyOp", _ -> false }).map(|d: StaticDef|
+              d.name),
+            described,
+          );
+          assert_eq(f.statics.last().map(|d: StaticDef| d.name), described.at(0))
+        },
       };
       // The handler's word is held as the `Int` the checker filed for the perform before it is read.
       match formed(p, b"asked") {
@@ -147,14 +212,31 @@ test "a perform hands the runtime its arguments as words and holds what the hand
       // is opened to the entry it holds and leads the operands, which the operation only reads.
       let keyed = |name: Bytes| match formed(p, name) { Ok(f) -> ops_in(f.body), Err(_) -> [] };
       assert_eq(
-        keyed(b"sent").map(|o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }| o.op),
-        [Perform({ effect: b"m.net", op: b"send", resource: b"conn", labelled: false, mode: 1 })],
+        keyed(b"sent").map(|o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }|
+          undescribed(o.op)),
+        [
+          Perform({
+            effect: b"m.net",
+            op: b"send",
+            resource: b"conn",
+            labelled: false,
+            mode: 1,
+            described: b"",
+          }),
+        ],
       );
       match keyed(b"relay") {
         [o] -> {
           assert_eq(
-            o.op,
-            Perform({ effect: b"m.net", op: b"send", resource: b"", labelled: true, mode: 1 }),
+            undescribed(o.op),
+            Perform({
+              effect: b"m.net",
+              op: b"send",
+              resource: b"",
+              labelled: true,
+              mode: 1,
+              described: b"",
+            }),
           );
           assert_eq(o.uses.takes, [false, true]);
           assert_eq(o.args.map(|a: Arg| match a { AVar(v) -> v.rep, _ -> RWord }), [RInt, RWord])
@@ -164,10 +246,17 @@ test "a perform hands the runtime its arguments as words and holds what the hand
       // A raise is the prelude's, never comes back, and so never stops to be resumed.
       assert_eq(
         keyed(b"raised").map(|o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }|
-          (o.op, o.uses.stops)),
+          (undescribed(o.op), o.uses.stops)),
         [
           (
-            Perform({ effect: b"abort", op: b"raise", resource: b"", labelled: false, mode: 2 }),
+            Perform({
+              effect: b"abort",
+              op: b"raise",
+              resource: b"",
+              labelled: false,
+              mode: 2,
+              described: b"",
+            }),
             false,
           ),
         ],
@@ -214,7 +303,80 @@ fn handles() -> Bytes =
     b"fn twice(n: Int) -> Int = handle { let m = n + 1; if amb.flip() { m } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
     b"fn tagged() -> Int = handle { asked() } with { db.query[*t](q) resume k -> k(q) + 1 }\n",
     b"fn once() -> Int = handle { asked() } with { db.query[*t](q) resume k -> k(q) }\n",
+    b"fn caught(b: Bytes) -> Int = handle { b.at(3) } with { abort.raise(m) -> m.len() }\n",
+    b"type Saved = | Done(Int) | Parked((Bool) -> Saved)\n",
+    b"fn parked() -> Saved = handle { Done(if amb.flip() { 1 } else { 0 }) } with { amb.flip() resume k -> Parked(k) }\n",
   ])
+
+test "a continuation read as a value is the closure of a lambda that resumes it, at the type it is called at" {
+  match program_of(handles()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"parked") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> {
+        let resumes = |c: { body: Fn, captures: Int, at: Span }|
+          c.body.kind == tir::Plain
+            && c.body.body.any(|i: Inst|
+              match i {
+                Let(x) -> match x.val {
+                  tir::Apply(a) -> match a.f { AVar(v) -> reps::resumed(v.ty) != None, _ -> false },
+                  _ -> false,
+                },
+                _ -> false,
+              });
+        assert(f.lambdas.any(|l: tir::Lambda| match l { Closure(c) -> resumes(c) }), None)
+      },
+    },
+  }
+}
+
+test "a clause binding the call site's label hands the runtime the descriptor of the label's type" {
+  match program_of(handles()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"tagged") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> {
+        let sites = f.body.fold([], |acc: List<{ site: HandleSite, args: List<Arg> }>, i: Inst|
+          match i { Handle(h) -> acc.push({ site: h.site, args: h.args }), _ -> acc });
+        match sites {
+          [h] -> match h.site.clauses.at(0) {
+            Some(c) -> match c.string {
+              Some(i) -> {
+                assert_eq(h.args.at(i).map(rep_of_arg), Some(RInt));
+                assert(
+                  f.statics.any(|d: StaticDef|
+                    match d.laid {
+                      SStruct(s) -> s.of == b"PlyType" && s.fields.at(2) == Some(WRaw(6)),
+                      _ -> false,
+                    }),
+                )
+              },
+              None -> assert(false),
+            },
+            None -> assert(false),
+          },
+          other -> assert_eq(other.len(), 1),
+        }
+      },
+    },
+  }
+}
+
+test "a clause answering `abort.raise` hands the runtime the descriptor of the message's `String`" {
+  match program_of(handles()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"caught") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> {
+        let clauses = f.body.fold([], |acc: List<Clause>, i: Inst|
+          match i { Handle(h) -> acc.concat(h.site.clauses), _ -> acc });
+        assert_eq(clauses.map(|c: Clause| { op: c.op, string: c.string != None }), [
+          { op: b"raise", string: true },
+        ])
+      },
+    },
+  }
+}
 
 test "a clause resuming in its tail joins its arms as the word it hands back, never opening what its continuation answers" {
   // Called in the tail, the continuation answers what the runtime resumes with, no record.
@@ -256,7 +418,6 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
             made: MClosure({ nth: 0, captures: 0, params: 0, stacked: false }),
             args: [],
             reuse: None,
-            kept: [],
           }),
           at: place(),
           unwind: [],
@@ -279,49 +440,25 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
           g.h,
           place(),
         );
-        let boxed = local(3, int, RWord);
-        let answer = local(4, int, RWord);
         assert_eq(o.st.refused, None);
-        assert_eq(o.st.insts, [
-          made,
-          Handle({
-            body: [
-              add,
-              Let({
-                var: boxed,
-                val: Pack({ arg: AVar(sum), to: RWord }),
-                at: place(),
-                unwind: [],
-              }),
-              Assign({ var: answer, arg: AVar(boxed) }),
-            ],
-            args: [AVar(clause)],
-            uses: { takes: [true], owned: true, fails: true, stops: false },
-            site: {
-              clauses: [
-                {
-                  effect: b"m.ask",
-                  op: b"get",
-                  resource: b"",
-                  mode: 0,
-                  binds_label: false,
-                  handler: 0,
-                  label: None,
-                },
-              ],
-              ret: None,
-              detached: None,
-            },
-            answer: answer,
-            unwind: [],
-          }),
-          Let({
-            var: local(5, int, RInt),
-            val: Pack({ arg: AVar(answer), to: RInt }),
-            at: place(),
-            unwind: [],
-          }),
-        ]);
+        match handles_in(o.st.insts) {
+          [h] -> {
+            // The body runs in place, under the clause's frame, and sets the answer as a word.
+            assert(h.body.contains(add), None);
+            assert_eq(h.answer.rep, RWord);
+            assert(
+              h.body.any(|i: Inst| match i { Assign(a) -> a.var == h.answer, _ -> false }),
+              None,
+            );
+            assert_eq((h.args, h.site.detached, h.uses.takes), ([AVar(clause)], None, [true]));
+            assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
+              (b"m.ask", b"get", 0),
+            ]);
+            // What it answers is read as the `Int` it is.
+            assert(answer_read(o.st.insts, h.answer, RInt), None)
+          },
+          other -> assert_eq(other.len(), 1),
+        };
         // A body that would leave the handle's frame installed is refused.
         let left = { st: emitted(body.st, Return(AVar(sum))), arg: AVar(sum) };
         assert_eq(
@@ -386,39 +523,167 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
             g.h,
             place(),
           );
-          let answer = local(2, int, RWord);
-          assert_eq(o.st.insts, [
-            Handle({
-              body: [],
-              args: [AVar(clause), AVar(inner)],
-              uses: { takes: [true, true], owned: true, fails: true, stops: false },
-              site: {
-                clauses: [
-                  {
-                    effect: b"m.amb",
-                    op: b"flip",
-                    resource: b"",
-                    mode: 2,
-                    binds_label: false,
-                    handler: 0,
-                    label: None,
-                  },
-                ],
-                ret: None,
-                detached: Some(1),
-              },
-              answer: answer,
-              unwind: [],
-            }),
-            Let({
-              var: local(3, int, RInt),
-              val: Pack({ arg: AVar(answer), to: RInt }),
-              at: place(),
-              unwind: [],
-            }),
-          ])
+          match handles_in(o.st.insts) {
+            [h] -> {
+              assert_eq((h.body, h.args, h.site.detached), (
+                [],
+                [AVar(clause), AVar(inner)],
+                Some(1),
+              ));
+              assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
+                (b"m.amb", b"flip", 4),
+              ]);
+              assert(answer_read(o.st.insts, h.answer, RInt), None)
+            },
+            other -> assert_eq(other.len(), 1),
+          }
         },
       }
+    },
+  }
+}
+
+test "a body run detached from its handler's frame captures each variable's first value at the variable's type" {
+  let src = Bytes::concat_all([
+    b"effect tally {\n  write add(n: Int) -> Unit\n  read total() -> Int\n}\n",
+    b"fn resumed() -> Int = handle { tally.add(1); tally.total() } with { var n = 0, var m = n + 1, tally.add(k) resume r -> { n = n + k; let first = r(()); n = n + m; first + r(()) }, tally.total() -> n }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match formed(p, b"resumed") {
+      Err(no) -> assert_eq(no.why, b""),
+      // The body is the one closure capturing anything: the two first values its frame starts from.
+      Ok(f) -> {
+        assert_eq(
+          f.lambdas.fold([], |acc: List<List<Type>>, l: tir::Lambda|
+            match l {
+              Closure(c) -> if c.captures == 0 { acc }
+              else { acc.push(c.body.params.take(c.captures).map(|x: Var| x.ty)) },
+            }),
+          [[named(b"Int"), named(b"Int")]],
+        );
+        // The body hands each first value over with its type's descriptor; a clause reads a
+        // variable held once more and sets one by handing its new value over.
+        let natives = f.lambdas.fold([], |acc: List<Bytes>, l: tir::Lambda|
+          match l { Closure(c) -> acc.concat(crossed_parts(c.body.body)) });
+        assert_eq(
+          [
+            b"builtin_elaborated_handler_typed_p",
+            b"builtin_elaborated_handler_get_p",
+            b"builtin_elaborated_handler_put_p",
+          ].map(|n: Bytes| natives.filter(|x: Bytes| x == n).len() > 0),
+          [true, true, true],
+        )
+      },
+    },
+  }
+}
+
+test "a place an operation's own type parameter stands at crosses carried, which a key says by its marks" {
+  let int = int_type();
+  let opt = option_type(int);
+  assert_eq(marks_of(marked_type(opt, [1])), { ty: opt, marks: [1] });
+  // Places number the type, then each part's in order: the payload of `Option<{_0, _1: Option<a>}>`
+  // is its fifth.
+  let pair = TyRecord(fields_sorted([{ name: b"_0", ty: int }, { name: b"_1", ty: opt }]));
+  assert_eq(marks_of(marked_type(option_type(pair), [4])).marks, [4]);
+  // Met by the types of a perform, a declaration binds its own parameters and marks where they
+  // stand.
+  let declared = TyRecord(
+    fields_sorted([{ name: b"_0", ty: int }, { name: b"_1", ty: option_type(TyVar(0)) }]),
+  );
+  let met = carried_by(option_type(declared), option_type(pair), [0]);
+  assert_eq(met.bound, [{ var: 0, ty: int }]);
+  assert_eq(marks_of(met.marked), { ty: option_type(pair), marks: [4] });
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let marked = |op: keys::TypeOp, t: Type, marks: List<Int>|
+        keys::marked(keys::written(op, t, b"m"), marks);
+      let names = |k: RootKey|
+        match written_at(p.setting.ctors, k).code {
+          Ok(code) ->
+            named_calls(code, written_at(p.setting.ctors, k).typed).map(
+              |c: { name: Bytes, filed: Option<Typed> }|
+                { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } },
+            ),
+          Err(why) -> [{ name: why, at: [] }],
+        };
+      // A value carried whole crosses as what the runtime keeps of it.
+      assert_eq(names(marked(Lift, int, [0])), [{ name: b"?in_carried", at: [int] }]);
+      assert_eq(names(marked(Lower, int, [0])), [{ name: b"?out_carried", at: [int] }]);
+      // A part carried is read by the root of its type marked whole.
+      assert(
+        names(marked(Lift, opt, [1])).any(|c: { name: Bytes, at: List<Type> }|
+          c.name == b"?lift" && c.at == [marked_type(int, [0])]),
+      );
+      assert(
+        names(marked(Lower, list_type(int), [1])).any(|c: { name: Bytes, at: List<Type> }|
+          c.name == b"lower_items#List<Int>^1"),
+      )
+    },
+  }
+}
+
+test "an operation's descriptor names its types at the perform, the parameters it keeps carried and what its own type parameters stand for" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let int = int_type();
+        let chan = |t: Type| TyCon({ name: b"Chan", args: [t] });
+        let send = {
+          name: b"send",
+          mode: MWrite,
+          params: [chan(TyVar(0)), TyVar(0)],
+          ret: bool_type(),
+          own: [0],
+        };
+        let d = op_described(r.cx, start.st, b"task", send, [chan(int), int], bool_type());
+        match d.name {
+          None -> assert(false),
+          Some(name) -> {
+            assert_eq(d.st.statics.last().map(|s: StaticDef| s.name), Some(name));
+            match d.st.statics.last() {
+              Some(s) -> match s.laid {
+                SStruct(x) -> {
+                  assert_eq(x.of, b"PlyOp");
+                  // The value sent is the parameter kept carried whole; the channel crosses as
+                  // its handle. Two parameters, and one own type parameter, an `Int`.
+                  assert_eq(
+                    [
+                      x.fields.get(0),
+                      x.fields.get(1),
+                      x.fields.get(3),
+                      x.fields.get(4),
+                      x.fields.get(6),
+                    ],
+                    [WField(b"task"), WField(b"send"), WRaw(2), WRaw(2), WRaw(1)],
+                  )
+                },
+                _ -> assert(false),
+              },
+              None -> assert(false),
+            }
+          },
+        };
+        // An answer an own type parameter stands in is read with that place carried.
+        let recv = { ..send, name: b"recv", params: [chan(TyVar(0))], ret: option_type(TyVar(0)) };
+        let got = op_described(r.cx, start.st, b"task", recv, [chan(int)], option_type(int));
+        assert(
+          got.st.statics.any(|s: StaticDef|
+            entries_of(s).contains(
+              keys::marked(keys::written(Worded(Lift), option_type(int), b"m"), [1]),
+            )),
+        );
+        // At a type left open, the specialisations describe it.
+        assert_eq(
+          op_described(r.cx, start.st, b"task", send, [chan(TyVar(3)), TyVar(3)], bool_type()).name,
+          None,
+        )
+      },
     },
   }
 }
@@ -438,23 +703,31 @@ test "a parallel block hands the runtime its branches and tells it its definitio
     Ok(p) -> {
       let int = named(b"Int");
       let branches = [AVar(closure_of(0, int)), AVar(closure_of(1, int))];
-      let ran = |name: Bytes, own: Bool|
+      let lowered = |name: Bytes, own: Bool|
         match rooted(p, name) {
           None -> [],
-          Some(r) ->
-            ops_in(branched(r.cx, { ..started([]), next: 2 }, branches, own, place()).st.insts),
+          Some(r) -> branched(r.cx, { ..started([]), next: 2 }, branches, own, place()).st.insts,
         };
+      let ran = |name: Bytes, own: Bool| ops_in(lowered(name, own));
+      // What the runtime gathers is read by each answer's name, the tuple made of those reads.
+      assert_eq(
+        lowered(b"reads", true).fold([], |acc: List<Path>, i: Inst|
+          match i { Let(x) -> match x.val { Get(g) -> acc.push(g.path), _ -> acc }, _ -> acc }),
+        [PNamed(b"_0"), PNamed(b"_1")],
+      );
       match ran(b"reads", true) {
         [o] -> {
           assert_eq(o.op, Parallel({ reach: Some([{ effect: b"m.meter", resource: None }]) }));
-          assert_eq((o.var.ty, o.var.rep), (
-            TyRecord(fields_sorted([{ name: b"_0", ty: int }, { name: b"_1", ty: int }])),
-            RWord,
-          ));
-          assert_eq((o.args, o.uses), (
-            branches,
-            { takes: [true, true], owned: true, fails: true, stops: true },
-          ))
+          assert_eq((o.var.ty, o.var.rep), (gathered_type(), RWord));
+          // The closures, taken, then the descriptor of each one's answer, read.
+          assert_eq(o.args.take(2), branches);
+          assert_eq(o.args.drop(2).map(rep_of_arg), [RInt, RInt]);
+          assert_eq(o.uses, {
+            takes: [true, true, false, false],
+            owned: true,
+            fails: true,
+            stops: true,
+          })
         },
         other -> assert_eq(other.len(), 1),
       };
@@ -477,25 +750,28 @@ test "a simulate hands the runtime its body's closure and holds what the body an
       Some(r) -> {
         let int = named(b"Int");
         let body = closure_of(0, int);
-        let answer = local(1, int, RWord);
-        assert_eq(simulated(r.cx, { ..started([]), next: 1 }, AVar(body), place()).st.insts, [
-          Let({
-            var: answer,
-            val: Op({
-              op: OHandle(Simulate),
-              args: [AVar(body)],
-              uses: { takes: [true], owned: true, fails: true, stops: true },
-            }),
-            at: place(),
-            unwind: [],
-          }),
-          Let({
-            var: local(2, int, RInt),
-            val: Pack({ arg: AVar(answer), to: RInt }),
-            at: place(),
-            unwind: [],
-          }),
-        ])
+        let l = simulated(r.cx, { ..started([]), next: 1 }, AVar(body), place());
+        let descriptor = match l.st.statics.last() {
+          Some(d) -> Static(d.name),
+          None -> Static(b""),
+        };
+        match ops_in(l.st.insts) {
+          [o] -> {
+            // The body's closure, taken, then the descriptor of its answer's type, read.
+            assert_eq((o.op, o.uses.takes), (Simulate, [true, false]));
+            assert_eq(o.args.at(0), Some(AVar(body)));
+            assert(
+              l.st.insts.any(|i: Inst|
+                match i {
+                  Let(x) -> Some(AVar(x.var)) == o.args.at(1) && x.val == descriptor,
+                  _ -> false,
+                }),
+              None,
+            );
+            assert(answer_read(l.st.insts, o.var, RInt), None)
+          },
+          other -> assert_eq(other.len(), 1),
+        }
       },
     },
   }
@@ -507,12 +783,19 @@ fn fn_of(name: Bytes, params: List<Var>, body: List<Inst>) -> Fn =
     key: Named(qualify(b"m", name)),
     kind: Rooted,
     params: params,
-    conv: { params: params.map(|_: Var| Given), reps: params.map(|v: Var| v.rep), answer: RWord },
+    conv: {
+      params: params.map(|_: Var| Given),
+      reps: params.map(|v: Var| v.rep),
+      answer: RWord,
+      answered: Owned,
+    },
+    answer_ty: TyCon({ name: b"T", args: [] }),
     body: body,
     lambdas: [],
     base: 0,
     members: [],
     links: no_links(),
+    statics: [],
   }
 
 fn op_let(v: Var, op: HandleOp, args: List<Arg>) -> Inst =
@@ -539,7 +822,7 @@ test "a handle's body runs in a block between the frame's push and its landing, 
     op: b"get",
     resource: b"",
     mode: 0,
-    binds_label: false,
+    string: None,
     handler: 0,
     label: None,
   };
@@ -564,38 +847,30 @@ test "a handle's body runs in a block between the frame's push and its landing, 
       }),
       Return(AVar(answer)),
     ]),
+    no_ctors(),
   );
   let text = spelled(printed.pieces);
-  assert(
-    text.index_of(
-        b"  Word t1 = 0;\n  Word t2[] = {@@f0@@, -1, @@f1@@, p1, 0, 0};\n  int64_t t3 = rt_handle_push_p(ctx, (Word)(intptr_t)t2, 1, 0);\n  {\n",
-      )
-      != None,
-  );
-  assert(text.index_of(b"rt_overflow_p(ctx, 0); goto ply_h0; }") != None);
-  assert(text.index_of(b"\n    t1 = t") != None);
-  // The landing pops the frame and reads what the handle answers, which is what the root returns.
-  let lead = b"  }\n  ply_h0: ;\n  Word ";
-  match text.index_of(lead) {
-    None -> assert(false),
-    Some(from) -> {
-      let rest = text.slice(from + lead.len(), text.len());
-      match rest.index_of(b" = ") {
-        None -> assert(false),
-        Some(eq) ->
-          assert_eq(
-            rest.index_of(
-              Bytes::concat_all([
-                b" = rt_handle_land_p(ctx, t3, t1);\n  if (ctx->failed) return 0;\n  ctx->fuel += 1;\n  return ",
-                rest.slice(0, eq),
-                b";\n",
-              ]),
-            ),
-            Some(eq),
-          ),
-      }
-    },
+  let said = Some(String::of_bytes_lossy(text));
+  let at = |s: Bytes| match text.index_of(s) { Some(i) -> i, None -> 0 - 1 };
+  // The runtime reads each clause as a row of its table: the effect's and the operation's entries
+  // either side of the resource's (none), the clause's closure, its mode, its label (none).
+  assert(text.index_of(b"{@@f0@@, -1, @@f1@@, p1, 0, 0}") != None, said);
+  assert_eq(call_args(text, b"rt_handle_install_p").map(|a: List<Bytes>| a.drop(2)), [
+    [b"1", b"0"],
+  ]);
+  // A failure inside the body goes to the landing, where the frame is popped and what the handle
+  // answers read, which the root returns.
+  let land = at(b"rt_handle_land_p(");
+  assert(at(b"rt_overflow_p(ctx, 0); ".concat(landing_jump(0))) >= 0, said);
+  assert(at(landing_jump(0)) < land, said);
+  let answered = match text.slice(0, land).split(b"Word ").last() {
+    Some(rest) -> match rest.index_of(b" = ") { Some(e) -> rest.slice(0, e), None -> b"" },
+    None -> b"",
   };
+  assert(
+    text.slice(land, text.len()).index_of(Bytes::concat_all([b"return ", answered, b";"])) != None,
+    said,
+  );
   assert_eq((printed.fields, printed.handles), ([b"m.ask", b"get"], [b"m.ask#get"]));
   // Detached, the handle is one call of the runtime's, its body's closure last.
   let alone = spelled(
@@ -611,15 +886,17 @@ test "a handle's body runs in a block between the frame's push and its landing, 
         }),
         Return(AVar(answer)),
       ]),
+      no_ctors(),
     ).pieces,
   );
   assert(
-    alone.index_of(
-        b"  Word t1[] = {@@f0@@, -1, @@f1@@, p0, 2, 0};\n  Word t2 = rt_handle_detached_p(ctx, (Word)(intptr_t)t1, 1, 0, p1);\n  if (ctx->failed) return 0;\n  ctx->fuel += 1;\n  return t2;\n",
-      )
-      != None,
+    alone.index_of(b"{@@f0@@, -1, @@f1@@, p0, 2, 0}") != None,
+    Some(String::of_bytes_lossy(alone)),
   );
-  assert_eq(alone.index_of(b"ply_h0"), None)
+  assert_eq(call_args(alone, b"rt_handle_install_detached_p").map(|a: List<Bytes>| a.drop(2)), [
+    [b"1", b"0", b"p1"],
+  ]);
+  assert_eq(alone.index_of(landing_jump(0)), None)
 }
 
 test "a perform's words go to the runtime in an array, its effect, operation and resource by their entries" {
@@ -630,7 +907,14 @@ test "a perform's words go to the runtime in an array, its effect, operation and
         var: word(2),
         val: Op({
           op: OHandle(
-            Perform({ effect: b"m.net", op: b"send", resource: b"", labelled: true, mode: 1 }),
+            Perform({
+              effect: b"m.net",
+              op: b"send",
+              resource: b"",
+              labelled: true,
+              mode: 1,
+              described: b"ply_k_send",
+            }),
           ),
           args: [AVar(entry), AVar(word(1))],
           uses: { takes: [false, true], owned: true, fails: true, stops: true },
@@ -640,12 +924,26 @@ test "a perform's words go to the runtime in an array, its effect, operation and
       }),
       op_let(
         word(3),
-        Perform({ effect: b"m.net", op: b"send", resource: b"conn", labelled: false, mode: 1 }),
+        Perform({
+          effect: b"m.net",
+          op: b"send",
+          resource: b"conn",
+          labelled: false,
+          mode: 1,
+          described: b"ply_k_send",
+        }),
         [],
       ),
       op_let(
         word(4),
-        Perform({ effect: b"m.net", op: b"close", resource: b"", labelled: false, mode: 1 }),
+        Perform({
+          effect: b"m.net",
+          op: b"close",
+          resource: b"",
+          labelled: false,
+          mode: 1,
+          described: b"ply_k_close",
+        }),
         [],
       ),
       Let({
@@ -660,48 +958,51 @@ test "a perform's words go to the runtime in an array, its effect, operation and
       }),
       Return(AVar(word(4))),
     ]),
+    no_ctors(),
   );
   let text = spelled(printed.pieces);
-  assert(
-    text.index_of(
-        b"  Word t1[] = {p1};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t2 = rt_perform_p(ctx, @@f0@@, @@f1@@, p0, 1, (Word)(intptr_t)t1, 1);\n  if (ctx->failed) return 0;\n",
-      )
-      != None,
+  // Each names its descriptor, its resource (the label's entry where it is labelled, the
+  // resource's own, or none) and how many words its array holds.
+  let named = |x: Bytes| match x.index_of(b"&") { Some(i) -> x.slice(i + 1, x.len()), None -> x };
+  assert_eq(
+    call_args(text, b"rt_dispatch_p").map(|a: List<Bytes>| [named(a.get(1)), a.get(2), a.get(3)]),
+    [[b"ply_k_send", b"p0", b"1"], [b"ply_k_send", b"@@f0@@", b"1"], [b"ply_k_close", b"-1", b"1"]],
   );
-  assert(
-    text.index_of(
-        b"  Word t3[] = {0};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t4 = rt_perform_p(ctx, @@f0@@, @@f1@@, @@f2@@, 1, (Word)(intptr_t)t3, 0);\n",
-      )
-      != None,
-  );
-  assert(
-    text.index_of(b"rt_perform_p(ctx, @@f0@@, @@f3@@, -1, 1, (Word)(intptr_t)t5, 0);") != None,
-  );
-  assert(text.index_of(b"  int64_t t7 = @@f2@@;\n") != None);
-  assert_eq(printed.fields, [b"m.net", b"send", b"conn", b"close"]);
+  // The words: the operation's argument, or a 0 where it takes none.
+  assert(text.index_of(b"[] = {p1};") != None && text.index_of(b"[] = {0};") != None, None);
+  // A label read is its entry.
+  assert(text.index_of(b" = @@f0@@;") != None, None);
+  // The effect and the operation are the descriptor's to name, the resource the call's.
+  assert_eq(printed.fields, [b"conn"]);
   assert_eq(printed.performs, [b"m.net#send", b"m.net#send", b"m.net#close"])
 }
 
-test "a parallel block's answers are made its tuple in the order its fields' names sort" {
+test "a parallel block's answers are made its tuple in the order its fields' names sort, and let go by their types where one failed" {
   let branches = range(0, 11).map(word);
+  let described = range(11, 22).map(|i: Int| local(i, named(b"Int"), RInt));
   let printed = printed_fn(
-    fn_of(b"many", branches, [
-      op_let(word(11), Parallel({ reach: None }), branches.map(|v: Var| AVar(v))),
-      Return(AVar(word(11))),
+    fn_of(b"many", branches.concat(described), [
+      op_let(word(22), Parallel({ reach: None }), branches.concat(described).map(|v: Var| AVar(v))),
+      Return(AVar(word(22))),
     ]),
+    no_ctors(),
   );
   let text = spelled(printed.pieces);
+  let said = Some(String::of_bytes_lossy(text));
+  // The branches go to the runtime as an array of their closures, eleven of them.
+  assert(text.index_of(b"[] = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10};") != None, said);
+  assert_eq(call_args(text, b"rt_branches_p").map(|a: List<Bytes>| a.drop(2)), [[b"11"]]);
+  // Where one failed, each answer is let go of through its own descriptor, the branch's type.
   assert(
-    text.index_of(
-        b"  Word t1[] = {p0, p1, p2, p3, p4, p5, p6, p7, p8, p9, p10};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_parallel_p(ctx, (Word)(intptr_t)t1, 11);\n  if (ctx->failed) return 0;\n",
-      )
-      != None,
+    range(0, 11).all(|i: Int|
+      text.index_of(Bytes::concat_all([b"p", ascii_of_int(11 + i), b")->dec(ctx, "])) != None),
+    said,
   );
+  // The tuple's fields sort by name, `_10` after `_1`.
   assert(
-    text.index_of(
-        b"  Word t2[] = {t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]};\n  Word t3 = rt_record_p(ctx, @@s0@@, (Word)(intptr_t)t2, 11);\n",
-      )
+    text.index_of(b"{t1[0], t1[1], t1[10], t1[2], t1[3], t1[4], t1[5], t1[6], t1[7], t1[8], t1[9]}")
       != None,
+    said,
   );
   assert_eq(printed.shapes.map(|s: List<Bytes>| s.take(3)), [[b"_0", b"_1", b"_10"]]);
   // Told the definition's row, the runtime reads each effect and resource it names by its entry.
@@ -709,44 +1010,39 @@ test "a parallel block's answers are made its tuple in the order its fields' nam
     { effect: b"m.meter", resource: None },
     { effect: b"m.net", resource: Some(b"conn") },
   ];
+  let pair = [word(0), word(1), local(2, named(b"Int"), RInt), local(3, named(b"Int"), RInt)];
   let told = spelled(
     printed_fn(
-      fn_of(b"told", [word(0), word(1)], [
-        op_let(word(2), Parallel({ reach: Some(reach) }), [AVar(word(0)), AVar(word(1))]),
-        op_let(word(3), Parallel({ reach: Some([]) }), [AVar(word(0)), AVar(word(1))]),
-        Return(AVar(word(2))),
+      fn_of(b"told", pair, [
+        op_let(word(4), Parallel({ reach: Some(reach) }), pair.map(|v: Var| AVar(v))),
+        op_let(word(5), Parallel({ reach: Some([]) }), pair.map(|v: Var| AVar(v))),
+        Return(AVar(word(4))),
       ]),
+      no_ctors(),
     ).pieces,
   );
+  // Each effect of the row and its resource (none, or the resource's entry) as a pair of words; an
+  // empty row as none.
   assert(
-    told.index_of(
-        b"  Word t1[] = {p0, p1};\n  Word t2[] = {@@f0@@, -1, @@f1@@, @@f2@@};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_parallel_past_p(ctx, (Word)(intptr_t)t1, 2, (Word)(intptr_t)t2, 2);\n",
-      )
-      != None,
+    told.index_of(b"{@@f0@@, -1, @@f1@@, @@f2@@}") != None,
+    Some(String::of_bytes_lossy(told)),
   );
-  assert(
-    told.index_of(
-        b"  Word t6[] = {0};\n  PLY_SITE(ctx, @@r@@, 3, 9);\n  rt_parallel_past_p(ctx, (Word)(intptr_t)t5, 2, (Word)(intptr_t)t6, 0);\n",
-      )
-      != None,
-  )
+  assert_eq(call_args(told, b"rt_branches_past_p").map(|a: List<Bytes>| [a.get(2), a.get(4)]), [
+    [b"2", b"2"],
+    [b"2", b"0"],
+  ])
 }
 
-test "a simulate hands the runtime its body and answers every operation a region schedules" {
+test "a simulate hands the runtime its body and its answer's descriptor, and answers every operation a region schedules" {
   let printed = printed_fn(
-    fn_of(b"ticked", [word(0)], [
-      op_let(word(1), Simulate, [AVar(word(0))]),
-      Return(AVar(word(1))),
+    fn_of(b"ticked", [word(0), local(1, named(b"Int"), RInt)], [
+      op_let(word(2), Simulate, [AVar(word(0)), AVar(local(1, named(b"Int"), RInt))]),
+      Return(AVar(word(2))),
     ]),
+    no_ctors(),
   );
-  assert(
-    spelled(printed.pieces).index_of(
-        b"  PLY_SITE(ctx, @@r@@, 3, 9);\n  Word t1 = rt_simulate_p(ctx, p0);\n  if (ctx->failed) return 0;\n",
-      )
-      != None,
-  );
-  assert_eq(printed.handles.len(), 8);
-  assert(printed.handles.contains(b"task#spawn") && printed.handles.contains(b"sim#seed"))
+  assert_eq(call_args(spelled(printed.pieces), b"rt_region_p"), [[b"ctx", b"p0", b"p1"]]);
+  assert(scheduled_ops().all(|op: Bytes| printed.handles.contains(op)), None)
 }
 
 fn corpus() -> Bytes =
@@ -781,6 +1077,7 @@ fn corpus() -> Bytes =
     b"fn pair(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
     b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
     b"fn summed(n: Int) -> Int = { let (a, b) = parallel { n + 1, n + 2 }; a + b }\n",
+    b"fn points(n: Int) -> Int = { let (p, k) = parallel { { x: n, y: 1 }, n }; p.x + p.y + k }\n",
     b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
     b"fn clocked() -> Instant / {abort.raise, sim.read} = simulate { clock.now() }\n",
     b"fn drawn() -> Int / {abort.raise, sim.read} = simulate { random.below(6) }\n",
@@ -822,6 +1119,7 @@ fn lowers() -> List<Bytes> =
     b"tagged",
     b"mapped",
     b"summed",
+    b"points",
     b"pair",
     b"reads",
     b"ticked",
@@ -848,6 +1146,24 @@ test "every root of the handling corpus lowers, passes the check and prints" {
   }
 }
 
+// The shapes `ply`'s own handlers and regions take: a store's variables of a map, a list, a flag, an
+// option and a record wider than the registers updated field by field, and a `parallel` of lists,
+// one whose branches perform a labelled operation among them.
+test "a handler's variables of every kind a store keeps, and a parallel block of lists, lower, pass the check and print" {
+  let src = Bytes::concat_all([
+    b"effect keep {\n  read head(key: Bytes) -> Option<Bytes>\n  write put(key: Bytes, v: Bytes) -> Unit\n}\n",
+    b"effect prover {\n  read judged[c](lane: List<Int>) -> List<Int>\n}\n",
+    b"fn lanes(xs: List<Int>, ys: List<Int>) -> List<Int> / {prover.judged[claims]} = { let h = parallel { prover.judged[claims](xs), prover.judged[claims](ys) }; h._1.fold(h._0, |out: List<Int>, x: Int| out.push(x)) }\n",
+    b"type Pulling = { stamp: Bytes, looked: Map<Bytes, Int>, trusted: Bool, packed: Map<Bytes, Bytes>, n: Int }\n",
+    b"fn kept(keys: List<Bytes>) -> List<Option<Bytes>> = handle { keep.put(b\"a\", b\"1\"); keys.map(|k: Bytes| keep.head(k)) } with { var store: Map<Bytes, Bytes> = Map::new(), var running: Pulling = { stamp: b\"\", looked: Map::new(), trusted: false, packed: Map::new(), n: 0 }, var files: List<String> = [], var begun = false, var last: Option<Bytes> = None, keep.head(key) -> { running = { ..running, n: running.n + 1, looked: running.looked.insert(key, running.n) }; last = Some(key); begun = true; store.get(key) }, keep.put(key, v) -> { store = store.insert(key, v); files = files.push(\"put\"); }, return r -> if begun && files.len() > 0 && last != None { r } else { [] } }\n",
+    b"fn halves(xs: List<List<Int>>) -> List<List<Int>> = { let h = parallel { xs.map(|x: List<Int>| x.push(1)), xs.map(|x: List<Int>| x.push(2)) }; h._1.fold(h._0, |out: List<List<Int>>, x: List<Int>| out.push(x)) }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> assert_eq(not_built(p, [b"kept", b"halves", b"lanes"]), []),
+  }
+}
+
 /// How many times `s` stands in `t`.
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
@@ -863,16 +1179,16 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match printed_by_form(p, b"guarded") {
       Err(why) -> assert_eq(why, b""),
-      Ok(t) -> match t.index_of(b"rt_handle_push_p(") {
+      Ok(t) -> match t.index_of(b"rt_handle_install_p(") {
         None -> assert(false),
-        Some(from) -> match t.index_of(b"ply_h0: ;") {
-          None -> assert(false),
-          Some(to) -> {
-            let body = t.slice(from, to);
-            // The perform, the call and each checked operator go to the landing; nothing returns.
-            assert_eq(body.index_of(b"return"), None);
-            assert(occurrences(body, b"goto ply_h0;") >= 6)
-          },
+        Some(from) -> {
+          // The body runs to the last jump to its landing.
+          let to = t.len()
+            - (match t.split(landing_jump(0)).last() { Some(r) -> r.len(), None -> 0 });
+          let body = t.slice(from, to);
+          // The perform, the call and each checked operator go to the landing; nothing returns.
+          assert_eq(body.index_of(b"return"), None);
+          assert(occurrences(body, landing_jump(0)) >= 6, Some(String::of_bytes_lossy(t)))
         },
       },
     },
@@ -899,8 +1215,8 @@ test "a parallel block tells the runtime its definition's row only where that ro
             Err(why) -> Err(why),
           });
       // A block under a `handle`, or in a definition whose row is left open, is told nothing.
-      assert_eq(calls(b"rt_parallel_past_p(ctx, "), [Ok(true), Ok(true), Ok(false), Ok(false)]);
-      assert_eq(calls(b"rt_parallel_p(ctx, "), [Ok(false), Ok(false), Ok(true), Ok(true)])
+      assert_eq(calls(b"rt_branches_past_p(ctx, "), [Ok(true), Ok(true), Ok(false), Ok(false)]);
+      assert_eq(calls(b"rt_branches_p(ctx, "), [Ok(false), Ok(false), Ok(true), Ok(true)])
     },
   }
 }
@@ -1002,6 +1318,802 @@ test "a step iterate runs in place copies into a detached handle's body only slo
             },
           },
         },
+      },
+    },
+  }
+}
+
+// --- Crossings --------------------------------------------------------------------------------
+
+fn crossings() -> Bytes =
+  Bytes::concat_all([
+    b"pub type Shape = | Dot | Line(Int) | Box({ w: Int, h: Float })\n",
+    b"pub type Hook = | Hook((Int) -> Int)\n",
+    b"fn held(s: String, x: Float, n: Int) -> Int = n\n",
+    b"fn same(a: Int, b: Int) -> Unit / {abort.raise} = assert_eq(a, b)\n",
+    b"fn alike<t>(a: t, b: t) -> Unit / {abort.raise} = assert_eq(a, b)\n",
+  ])
+
+/// What each instruction of `body` calls or makes, by the crossing's part in it: a native or a
+/// root by its name, a family's operation by what it does.
+fn crossed_parts(body: List<Inst>) -> List<Bytes> / {abort.raise} =
+  body.fold([], |acc: List<Bytes>, i: Inst|
+    match i { Let(l) -> acc.concat(part_of(l.val)), Do(d) -> acc.concat(part_of(d.val)), _ -> acc })
+
+fn part_of(v: Val) -> List<Bytes> / {abort.raise} =
+  match v {
+    Native(n) -> [n.name],
+    Call(c) -> match c.callee { Root(k) -> [root_text(root_name(k))], _ -> [b"generic"] },
+    Get(g) -> if g.path == PPayload { [b"payload"] } else { [] },
+    Prim(p) -> [p.op],
+    Op(o) -> match o.op {
+      OContainer(Taken) -> [b"taken"],
+      OContainer(Length) -> [b"length"],
+      OHandle(Encoded(name)) -> [b"encoded ".concat(name)],
+      OHandle(Unsettled(name)) -> [b"unsettled ".concat(name)],
+      _ -> [b"op"],
+    },
+    _ -> [],
+  }
+
+/// The variables `cx`'s root takes, held as its types hold them, and the lowering they start.
+fn params_of(cx: Context) -> { vars: List<Var>, st: Lowering } / {abort.raise} = {
+  let vars = range(0, cx.types.len()).map(|i: Int|
+    { id: i, ty: cx.types.get(i), rep: held_as(cx.setting, cx.types.get(i)) });
+  { vars: vars, st: started(vars) }
+}
+
+/// The calls `body` makes, with what each hands its arguments as.
+fn calls_in(
+  body: List<Inst>,
+) -> List<{ callee: Bytes, args: List<Arg>, handed: List<Handed> }> / {abort.raise} =
+  body.fold([], |acc: List<{ callee: Bytes, args: List<Arg>, handed: List<Handed> }>, i: Inst| {
+    let called = |v: Val|
+      match v {
+        Call(c) -> match c.callee {
+          Root(k) ->
+            acc.push({ callee: root_text(root_name(k)), args: c.args, handed: c.conv.params }),
+          _ -> acc,
+        },
+        _ -> acc,
+      };
+    match i { Let(l) -> called(l.val), Do(d) -> called(d.val), _ -> acc }
+  })
+
+test "an encoding opens a lowering, hands the value to its type's root as the root takes it, and copies out the bytes it ends with" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let s = start.vars.get(0);
+        let l = crossed(r.cx, start.st, b"?encode", [AVar(s)], nowhere(), place());
+        assert_eq(crossed_parts(l.st.insts), [
+          b"builtin_elaborated_lower_open_p",
+          b"m.lower#String",
+          b"builtin_elaborated_lower_close_p",
+          b"taken",
+        ]);
+        assert_eq(calls_in(l.st.insts), [
+          { callee: b"m.lower#String", args: [AVar(s)], handed: [Given] },
+        ]);
+        assert_eq(match l.arg { AVar(v) -> v.ty, _ -> int_type() }, bytes_type());
+        // Decoding opens a lifting over the bytes' address and count and asks the type's root.
+        let back = crossed(r.cx, l.st, b"?decode", [l.arg], nowhere(), place());
+        assert_eq(crossed_parts(back.st.insts.drop(l.st.insts.len())), [
+          b"payload",
+          b"length",
+          b"builtin_elaborated_lift_open_p",
+          b"m.lift#Bytes",
+          b"builtin_elaborated_lift_close_p",
+        ])
+      },
+    },
+  }
+}
+
+test "a crossing native is handed machine words: a string as its bytes' address and count, a float as its bits" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let natives = |body: List<Inst>|
+          body.fold([], |acc: List<{ name: Bytes, reps: List<Rep> }>, i: Inst|
+            match i {
+              Do(d) -> match d.val {
+                Native(n) -> acc.push({ name: n.name, reps: n.args.map(rep_of_arg) }),
+                _ -> acc,
+              },
+              Let(x) -> match x.val {
+                Native(n) -> acc.push({ name: n.name, reps: n.args.map(rep_of_arg) }),
+                _ -> acc,
+              },
+              _ -> acc,
+            });
+        let text = crossed(
+          r.cx,
+          start.st,
+          b"?out_str",
+          [AVar(start.vars.get(0))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(crossed_parts(text.st.insts).take(3), [
+          b"payload",
+          b"length",
+          b"builtin_elaborated_out_str_p",
+        ]);
+        assert_eq(natives(text.st.insts), [
+          { name: b"builtin_elaborated_out_str_p", reps: [RAddr, RInt] },
+        ]);
+        let float = crossed(
+          r.cx,
+          start.st,
+          b"?out_float",
+          [AVar(start.vars.get(1))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(crossed_parts(float.st.insts).take(2), [
+          b"bits",
+          b"builtin_elaborated_out_float_p",
+        ]);
+        assert_eq(natives(float.st.insts), [
+          { name: b"builtin_elaborated_out_float_p", reps: [RInt] },
+        ]);
+        let int = crossed(
+          r.cx,
+          start.st,
+          b"?out_int",
+          [AVar(start.vars.get(2))],
+          nowhere(),
+          place(),
+        );
+        assert_eq(natives(int.st.insts), [{ name: b"builtin_elaborated_out_int_p", reps: [RInt] }])
+      },
+    },
+  }
+}
+
+test "an extern called over its encoding writes its arguments as a list, has the runtime answer it, and reads its answer" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"same") {
+      None -> assert(false),
+      Some(r) -> match r.code.node {
+        NApp(a) -> {
+          let start = params_of(r.cx);
+          let args = start.vars.map(AVar);
+          let l = crossed(r.cx, start.st, b"assert_eq", args, a.func.span, place());
+          assert_eq(l.st.refused, None);
+          assert_eq(crossed_parts(l.st.insts), [
+            b"builtin_elaborated_lower_open_p",
+            b"builtin_elaborated_out_count_p",
+            b"m.lower#Int",
+            b"m.lower#Int",
+            b"encoded assert_eq",
+            b"m.lift#Unit",
+            b"builtin_elaborated_lift_close_p",
+          ]);
+          assert_eq(
+            calls_in(l.st.insts).take(2).map(
+              |c: { callee: Bytes, args: List<Arg>, handed: List<Handed> }| c.args,
+            ),
+            [[args.get(0)], [args.get(1)]],
+          )
+        },
+        _ -> assert(false),
+      },
+    },
+  }
+}
+
+test "an extern called over its encoding at a type left open is the specialisations' to settle" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"alike") {
+      None -> assert(false),
+      Some(r) -> match r.code.node {
+        NApp(a) -> {
+          let start = params_of(r.cx);
+          let l = crossed(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func.span, place());
+          assert_eq(l.st.refused, None);
+          assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
+          assert(l.st.links.needs.any(|n: Need| n.reads == Exact));
+          // A form holding it that leaks past its specialisations fails where it is printed.
+          let said = handle {
+            printed_text(p, fn_of(b"alike", start.vars, l.st.insts.push(Return(AInt(0)))));
+            b""
+          } with {
+            abort.raise(m) -> Bytes::of_string(m),
+          };
+          assert(said.index_of(b"settled by its callers only") != None)
+        },
+        _ -> assert(false),
+      },
+    },
+  }
+}
+
+test "the runtime's answer to an extern called over its encoding is asked by the builtin's place in the unit's table" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let text = printed_text(
+        p,
+        fn_of(b"asks", [], [
+          Do({
+            val: Op({
+              op: OHandle(Encoded(b"assert_eq")),
+              args: [],
+              uses: { takes: [], owned: false, fails: true, stops: false },
+            }),
+            at: place(),
+            unwind: [],
+          }),
+          Return(AInt(0)),
+        ]),
+      );
+      assert_eq(call_args(text, b"rt_builtin_encoded_p"), [[b"ctx", b"@@b=assert_eq@@"]])
+    },
+  }
+}
+
+/// The arguments of each call of `f` in `text`, as the call writes them, up to its statement's end.
+fn call_args(text: Bytes, f: Bytes) -> List<List<Bytes>> / {abort.raise} =
+  text.split(f.concat(b"(")).drop(1).map(|rest: Bytes|
+    match rest.index_of(b");") { Some(end) -> rest.slice(0, end).split(b", "), None -> [] })
+
+/// Every call a crossing root's code makes by name, each with what is filed where its name is
+/// written.
+fn named_calls(c: Code, typed: Map<Int, Typed>) -> List<{ name: Bytes, filed: Option<Typed> }> =
+  match c.node {
+    NApp(a) -> {
+      let inner = a.args.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, x: Code|
+        acc.concat(named_calls(x, typed)));
+      match a.func.node {
+        NVar(v) -> if v.slot == None {
+          [{ name: v.name, filed: typed.get(a.func.span.site) }].concat(inner)
+        } else { inner },
+        _ -> inner,
+      }
+    },
+    NBlock(b) ->
+      b.stmts.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, s: CodeStmt|
+        acc.concat(match s {
+          CLet(l) -> named_calls(l.value, typed),
+          CDo(d) -> named_calls(d.code, typed),
+          _ -> [],
+        })).concat(match b.tail { Some(t) -> named_calls(t, typed), None -> [] }),
+    NIf(x) ->
+      named_calls(x.cond, typed).concat(named_calls(x.then_branch, typed)).concat(
+        named_calls(x.else_branch, typed),
+      ),
+    NMatch(m) ->
+      m.arms.fold(
+        named_calls(m.scrutinee, typed),
+        |acc: List<{ name: Bytes, filed: Option<Typed> }>, arm: CodeArm|
+          acc.concat(named_calls(arm.body, typed)),
+      ),
+    NRecord(r) ->
+      r.fields.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, f: CodeField|
+        acc.concat(named_calls(f.value, typed))),
+    NField(f) -> named_calls(f.base, typed),
+    NBinary(b) -> named_calls(b.lhs, typed).concat(named_calls(b.rhs, typed)),
+    _ -> [],
+  }
+
+/// The byte strings `c` writes literally, in order: the names a crossing root writes.
+fn literal_bytes(c: Code) -> List<Bytes> =
+  match c.node {
+    NLit(l) -> match l { LBytes(b) -> [b], _ -> [] },
+    NApp(a) -> a.args.fold([], |acc: List<Bytes>, x: Code| acc.concat(literal_bytes(x))),
+    NBlock(b) ->
+      b.stmts.fold([], |acc: List<Bytes>, s: CodeStmt|
+        acc.concat(match s {
+          CLet(l) -> literal_bytes(l.value),
+          CDo(d) -> literal_bytes(d.code),
+          _ -> [],
+        })).concat(match b.tail { Some(t) -> literal_bytes(t), None -> [] }),
+    NIf(x) ->
+      literal_bytes(x.cond).concat(literal_bytes(x.then_branch)).concat(
+        literal_bytes(x.else_branch),
+      ),
+    NMatch(m) ->
+      m.arms.fold(literal_bytes(m.scrutinee), |acc: List<Bytes>, arm: CodeArm|
+        acc.concat(literal_bytes(arm.body))),
+    NRecord(r) ->
+      r.fields.fold([], |acc: List<Bytes>, f: CodeField| acc.concat(literal_bytes(f.value))),
+    NBinary(b) -> literal_bytes(b.lhs).concat(literal_bytes(b.rhs)),
+    _ -> [],
+  }
+
+/// The root `key` of module `m` is, written for a type under the constructors `ctors`: a crossing's
+/// or a container's.
+fn written_at(ctors: Ctors, key: RootKey) -> WrittenRoot / {abort.raise} =
+  match key {
+    Written(w, _) -> if crossing_op(w.op) { crossing_root(b"m", ctors, key) }
+    else { container_code(b"m", ctors, op_name(w.op), w.ty) },
+    _ -> crossing_root(b"m", ctors, key),
+  }
+
+/// Whether `k` is a root a crossing runs: a lowering, a lifting, or a loop of one.
+fn crossing_key(k: RootKey) -> Bool =
+  match k {
+    Written(w, _) -> match w.op {
+      Lower -> true,
+      Lift -> true,
+      Contained(c) -> c.starts_with(b"lower_") || c.starts_with(b"lift_"),
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+/// Whether `name` is a constructor's: its last part opens with a capital.
+fn ctor_spelled(name: Bytes) -> Bool / {abort.raise} = {
+  // A prelude constructor is written through the prelude's binder, the module's own may shadow it.
+  let through = prelude_ctor(b"");
+  let bare = if name.starts_with(through) { name.slice(through.len(), name.len()) } else { name };
+  bare.index_of(b"::") == None
+    && (match bare.split(b".").last() {
+      Some(last) -> last.len() > 0 && last.at(0) >= 65 && last.at(0) <= 90,
+      None -> false,
+    })
+}
+
+test "an entry reads its arguments from the runtime's lifting, ends it, and writes its root's answer into the runtime's lowering" {
+  let e = entered_code(
+    b"m",
+    Named(b"m.held"),
+    Named(b"m.held"),
+    [],
+    [named(b"String"), named(b"Float"), int_type()],
+    int_type(),
+  );
+  match e.code {
+    Err(why) -> assert_eq(why, b""),
+    Ok(code) -> {
+      assert_eq(
+        named_calls(code, e.typed).map(|c: { name: Bytes, filed: Option<Typed> }|
+          { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } }),
+        [
+          { name: b"?in_count", at: [] },
+          { name: b"?lift", at: [named(b"String")] },
+          { name: b"?lift", at: [named(b"Float")] },
+          { name: b"?lift", at: [int_type()] },
+          { name: b"?lift_close", at: [] },
+          { name: b"?lower", at: [int_type()] },
+          { name: b"held", at: [] },
+        ],
+      );
+      assert_eq(e.params, []);
+      assert(e.here.any(|d: Def| d.name == b"held" && d.root == Named(b"m.held")))
+    },
+  }
+}
+
+test "a generic definition's entry calls it as any caller does, at an Int for each type variable" {
+  let e = entered_code(
+    b"m",
+    Named(b"m.first"),
+    Named(b"m.first"),
+    [int_type()],
+    [list_type(int_type())],
+    option_type(int_type()),
+  );
+  match e.code {
+    Err(why) -> assert_eq(why, b""),
+    Ok(code) -> {
+      assert(
+        named_calls(code, e.typed).any(|c: { name: Bytes, filed: Option<Typed> }|
+          c.name == b"first"
+            && (match c.filed { Some(t) -> t.args == [int_type()], None -> false })),
+        None,
+      );
+      assert(!e.here.any(|d: Def| d.name == b"first"), None)
+    },
+  }
+}
+
+test "a written root calls only crossing builtins, what it files a type for, and the roots it defines; of the prelude, what a load reaches" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let shape = TyCon({ name: b"m.Shape", args: [] });
+      let record = TyRecord(
+        fields_sorted([{ name: b"w", ty: int_type() }, { name: b"h", ty: named(b"Float") }]),
+      );
+      let map = TyCon({ name: b"Map", args: [named(b"String"), list_type(int_type())] });
+      let array = TyCon({ name: b"Array", args: [option_type(shape)] });
+      let types = [
+        int_type(),
+        named(b"Bool"),
+        unit_type(),
+        named(b"Float"),
+        named(b"Decimal"),
+        named(b"U8"),
+        named(b"I128"),
+        named(b"Char"),
+        named(b"String"),
+        bytes_type(),
+        shape,
+        record,
+        list_type(record),
+        map,
+        array,
+        option_type(named(b"String")),
+        TyCon({ name: b"Columns", args: [record] }),
+      ];
+      let asked = types.fold([], |acc: List<RootKey>, t: Type|
+        acc.concat([Lower, Lift].map(|op: keys::TypeOp| keys::written(op, t, b"m")))).concat(
+        [list_type(int_type()), array, map].fold([], |acc: List<RootKey>, t: Type|
+          acc.concat(container_defs(b"m", t).map(|d: Def| d.root))),
+      );
+      // The loops the roots call are roots of their own.
+      let roots = asked.fold([], |acc: List<{ key: RootKey, root: WrittenRoot }>, k: RootKey| {
+        let r = written_at(p.setting.ctors, k);
+        r.here.fold(
+          acc.push({ key: k, root: r }),
+          |a: List<{ key: RootKey, root: WrittenRoot }>, d: Def|
+            if d.root == k || a.any(|x: { key: RootKey, root: WrittenRoot }| x.key == d.root) { a }
+            else { a.push({ key: d.root, root: written_at(p.setting.ctors, d.root) }) },
+        )
+      });
+      let externs = prelude_externs().map(|e: Extern| e.name);
+      let faults = roots.fold([], |acc: List<Bytes>, r: { key: RootKey, root: WrittenRoot }|
+        match r.root.code {
+          Err(why) -> acc.push(Bytes::concat_all([root_text(root_name(r.key)), b": ", why])),
+          Ok(code) ->
+            named_calls(code, r.root.typed).fold(
+              acc,
+              |a: List<Bytes>, call: { name: Bytes, filed: Option<Typed> }| {
+                let local = r.root.here.any(|d: Def| d.name == call.name);
+                // A part lowered or lifted is filed at its type; the emitter's other builtins are
+                // settled by their operands.
+                let generated = call.name.starts_with(b"?")
+                  && (!crossing_key(r.key) || crossing_builtin(call.name))
+                  && ((call.name != b"?lower" && call.name != b"?lift")
+                  || (match call.filed { Some(t) -> t.args.len() == 1, None -> false }));
+                let prelude = call.filed != None
+                  && (ctor_spelled(call.name) || externs.contains(call.name)
+                  || written_code().calls.concat(written_code().lifts).contains(call.name));
+                if local || generated || prelude { a } else {
+                  a.push(Bytes::concat_all([root_text(root_name(r.key)), b" calls ", call.name]))
+                }
+              },
+            ),
+        });
+      assert_eq(faults, []);
+      // Every loop a written root calls is one `container_code` writes; a loop writing a
+      // container's items reads it, one reading them takes the container it adds to.
+      let loops = roots.fold([], |acc: List<Bytes>, r: { key: RootKey, root: WrittenRoot }|
+        match r.key {
+          Written(w, _) -> match w.op { Contained(c) -> acc.push(c), _ -> acc },
+          _ -> acc,
+        });
+      assert_eq(loops.filter(|c: Bytes| !contained_formed(c)), []);
+      assert(loops.contains(b"lower_entries") && loops.contains(b"lift_entries"));
+      assert_eq(
+        [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"].map(|c: Bytes|
+          contained_reads(c, 0)),
+        [true, true, false, false],
+      );
+      // A body calling a builtin whose call writes crossing code references what that code calls.
+      assert_eq(
+        encoded_externs().push(b"observe").filter(|n: Bytes|
+          !written_code().builtins.contains(match n.split(b"::").last() {
+            Some(x) -> x,
+            None -> n,
+          })),
+        [],
+      );
+      // A record's fields are written in name order, each after its name; a sum's constructor is
+      // read back by its program-wide name, the last by elimination.
+      let written_names = |k: RootKey|
+        match written_at(p.setting.ctors, k).code {
+          Ok(code) -> literal_bytes(code),
+          Err(why) -> [why],
+        };
+      assert_eq(written_names(keys::written(Lower, record, b"m")), [b"h", b"w"]);
+      assert_eq(written_names(keys::written(Lift, shape, b"m")), [b"m.Dot", b"m.Line"])
+    },
+  }
+}
+
+/// Whether root `key` and every root its code reaches are written: the loops it defines, and the
+/// root of each type it lowers or lifts a part at.
+fn written_whole(ctors: Ctors, key: RootKey) -> Bool / {abort.raise} =
+  iterate({ todo: [key], seen: [] }, 512, |s: { todo: List<RootKey>, seen: List<RootKey> }|
+    match s.todo.at(0) {
+      None -> Stop(true),
+      Some(k) -> if s.seen.contains(k) { Continue({ todo: s.todo.drop(1), seen: s.seen }) } else {
+        let r = written_at(ctors, k);
+        match r.code {
+          Err(_) -> Stop(false),
+          Ok(code) -> {
+            let parts = named_calls(code, r.typed).fold(
+              [],
+              |acc: List<RootKey>, call: { name: Bytes, filed: Option<Typed> }|
+                match call.filed {
+                  Some(t) -> match t.args.at(0) {
+                    Some(ty) -> if call.name == b"?lower" {
+                      acc.push(keys::written(Lower, ty, b"m"))
+                    } else if call.name == b"?lift" { acc.push(keys::written(Lift, ty, b"m")) }
+                    else { acc },
+                    None -> acc,
+                  },
+                  None -> acc,
+                },
+            );
+            Continue({
+              todo: s.todo.drop(1).concat(parts).concat(r.here.map(|d: Def| d.root)),
+              seen: s.seen.push(k),
+            })
+          },
+        }
+      },
+    })
+
+test "a type crosses where its roots and those of every type it crosses at are written, and back where none of those types is a function" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let ctors = p.setting.ctors;
+      let held = sums_crossed(ctors.sums, |_: Bytes| true);
+      let shape = TyCon({ name: b"m.Shape", args: [] });
+      let hook = TyCon({ name: b"m.Hook", args: [] });
+      let callback = fn_type([int_type()], int_type(), row_empty());
+      let map = TyCon({ name: b"Map", args: [named(b"String"), list_type(shape)] });
+      let types = [
+        int_type(),
+        named(b"Decimal"),
+        named(b"U8"),
+        named(b"String"),
+        shape,
+        option_type(shape),
+        map,
+        TyCon({ name: b"Array", args: [bytes_type()] }),
+        TyRecord([{ name: b"f", ty: callback }]),
+        hook,
+        callback,
+        list_type(hook),
+        TyVar(0),
+        TyCon({ name: b"ListNode", args: [int_type()] }),
+      ];
+      let said = |back: Bool| types.map(|t: Type| crosses(held, t, back));
+      let written = |op: keys::TypeOp|
+        types.map(|t: Type| written_whole(ctors, keys::written(op, t, b"m")));
+      assert_eq(said(false), written(Lower));
+      assert_eq(said(true), written(Lift));
+      assert_eq(said(false), [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+      ]);
+      assert_eq(said(true), [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+        false,
+        false,
+      ]);
+      // A container crosses where the program holds what its loops call, and a map is read back
+      // where it holds what builds one.
+      let inserting = sums_crossed(ctors.sums, |n: Bytes| !written_code().lifts.contains(n));
+      assert_eq(
+        [
+          crosses(inserting, map, false),
+          crosses(inserting, map, true),
+          crosses(inserting, list_type(shape), true),
+        ],
+        [true, false, true],
+      );
+      let bare = sums_crossed(ctors.sums, |_: Bytes| false);
+      assert_eq(
+        [
+          crosses(bare, list_type(int_type()), false),
+          crosses(bare, shape, true),
+          crosses(bare, option_type(list_type(int_type())), false),
+        ],
+        [false, true, false],
+      )
+    },
+  }
+}
+
+test "a type's descriptor is laid once, its identity and spelling before the entries the runtime calls over its word form" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match rooted(p, b"held") {
+      None -> assert(false),
+      Some(r) -> {
+        let start = params_of(r.cx);
+        let shape = TyCon({ name: b"m.Shape", args: [] });
+        let once = type_described(r.cx, start.st, shape, place());
+        let twice = type_described(r.cx, once.st, shape, place());
+        assert_eq(twice.st.statics, once.st.statics);
+        assert_eq(once.st.statics.len(), 2);
+        let key = |op: keys::TypeOp| keys::written(op, shape, b"m");
+        match once.st.statics.at(1) {
+          None -> assert(false),
+          Some(d) -> {
+            assert_eq(entries_of(d), [
+              key(Dup),
+              key(keys::Release),
+              key(Worded(Lower)),
+              key(Worded(Lift)),
+            ]);
+            match d.laid {
+              SStruct(s) -> {
+                assert_eq(s.of, b"PlyType");
+                assert_eq(s.fields.drop(1).take(2), [
+                  WAddress({ name: once.st.statics.get(0).name, tag: 0 }),
+                  WRaw(b"m.Shape".len()),
+                ])
+              },
+              _ -> assert(false),
+            }
+          },
+        };
+        // The address is an uncounted word, the static's.
+        assert_eq(rep_of_arg(once.arg), RInt);
+        // A value that can hold a function crosses out and never back: no lifting is asked for its
+        // type, whose descriptor lifts by the runtime's refusal; through a sum's case and a record too.
+        let hook = TyCon({ name: b"m.Hook", args: [] });
+        [hook, option_type(hook), TyRecord([{ name: b"h", ty: hook }])].fold(
+          (),
+          |_: Unit, t: Type| {
+            let d = type_described(r.cx, start.st, t, place());
+            match d.st.statics.at(1) {
+              None -> assert(false, None),
+              Some(s) -> {
+                assert(!entries_of(s).contains(keys::written(Worded(Lift), t, b"m")), None);
+                match s.laid {
+                  SStruct(x) -> assert_eq(x.fields.at(6), Some(WHead(never_lifted_fn()))),
+                  _ -> assert(false, None),
+                }
+              },
+            }
+          },
+        );
+        assert(!holds_function(r.cx.setting.ctors, shape), None);
+        // A channel crosses as a handle whatever it holds, so one of functions lifts.
+        assert(
+          !holds_function(
+            r.cx.setting.ctors,
+            TyCon({ name: b"Chan", args: [fn_type([int_type()], int_type(), row_empty())] }),
+          ),
+          None,
+        );
+        // At a type left open, the specialisations describe it, and nothing is laid.
+        let open = type_described(r.cx, start.st, list_type(TyVar(0)), place());
+        assert_eq(open.st.statics, []);
+        assert(open.st.links.needs.any(|n: Need| n.reads == Exact));
+        assert_eq(crossed_parts(open.st.insts), [b"unsettled type#List<'0>"])
+      },
+    },
+  }
+}
+
+test "a type's word-form entries open the word for its lowering and box what its lifting answers, and print" {
+  match program_of(crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let ctors = p.setting.ctors;
+      let types = [
+        int_type(),
+        named(b"Float"),
+        named(b"String"),
+        TyCon({ name: b"m.Shape", args: [] }),
+        TyRecord(
+          fields_sorted([{ name: b"w", ty: int_type() }, { name: b"h", ty: named(b"Float") }]),
+        ),
+        list_type(int_type()),
+      ];
+      let entries = types.fold([], |acc: List<Fn>, t: Type|
+        [Worded(Lower), Worded(Lift)].fold(acc, |a: List<Fn>, op: keys::TypeOp|
+          match worded(ctors, keys::written(op, t, b"m")) {
+            Ok(f) -> a.push(f),
+            Err(no) -> panic(String::of_bytes_lossy(no.why)),
+          }));
+      let refused = entries.fold([], |acc: List<Bytes>, f: Fn|
+        match unbuilt(p, f) {
+          Some(why) -> acc.push(Bytes::concat_all([root_text(root_name(f.key)), b": ", why])),
+          None -> acc,
+        });
+      assert(refused == [], Some(String::of_bytes_lossy(Bytes::join(refused, b"\n"))));
+      // Each calls its type's own root, handing the value as the root takes it, and answers a word.
+      assert_eq(
+        entries.map(|f: Fn|
+          calls_in(f.body).map(|c: { callee: Bytes, args: List<Arg>, handed: List<Handed> }|
+            c.callee)),
+        types.fold([], |acc: List<List<Bytes>>, t: Type|
+          acc.push([root_text(root_name(keys::written(Lower, t, b"m")))]).push([
+            root_text(root_name(keys::written(Lift, t, b"m"))),
+          ])),
+      );
+      // A lifting answers its value's word form; a lowering the `()` its root answered.
+      assert_eq(
+        range(0, entries.len()).filter(|i: Int| i % 2 == 1).map(|i: Int|
+          entries.get(i).conv.answer).filter(|r: Rep| r != RWord),
+        [],
+      );
+      // An `Int` is opened from its word form before it is lowered, and boxed into one once lifted.
+      assert_eq(
+        entries.take(2).map(|f: Fn|
+          f.body.fold([], |acc: List<Rep>, i: Inst|
+            match i { Let(l) -> match l.val { Pack(x) -> acc.push(x.to), _ -> acc }, _ -> acc })),
+        [[RInt], [RWord]],
+      )
+    },
+  }
+}
+
+test "a metered call marks the run's cost, calls its function, and lifts what it spent beside the answer" {
+  let src = b"fn spent(xs: List<Int>) -> Int = { let m = metered(|| xs.len()); m.live + m.value + m.performs.len() }\n";
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match checked(p, b"spent") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        let first = |at: (Inst) -> Bool / {abort.raise}|
+          range(0, f.body.len()).fold(0 - 1, |acc: Int, i: Int|
+            if acc < 0 && at(f.body.get(i)) { i } else { acc });
+        let native = |part: Bytes|
+          first(|i: Inst|
+            match i {
+              Let(l) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
+              Do(_) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
+              _ -> false,
+            });
+        let applied = first(|i: Inst|
+          match i { Let(l) -> match l.val { tir::Apply(_) -> true, _ -> false }, _ -> false });
+        let function = match f.body.get(applied) {
+          Let(l) -> match l.val { tir::Apply(a) -> a.f, _ -> AInt(0) },
+          _ -> AInt(0),
+        };
+        let released = first(|i: Inst| match i { tir::Dec(v) -> AVar(v) == function, _ -> false });
+        let order = [
+          native(b"cost_mark"),
+          applied,
+          native(b"cost_spent"),
+          native(b"lift#"),
+          native(b"lift_close"),
+        ];
+        // The mark, the call, the reading and the lifting, in that order.
+        assert(
+          order.all(|i: Int| i >= 0) && order.sort() == order,
+          Some(String::of_bytes_lossy(printed_text(p, f))),
+        );
+        // The function is held until the counts are read, so its release is not among them.
+        assert(released > native(b"cost_spent"), Some(String::of_bytes_lossy(printed_text(p, f))));
+        // Nothing goes through the runtime's callback.
+        assert(printed_text(p, f).index_of(b"metered") == None, None);
+        // The counts cross back by the lifting written for their type.
+        assert(written_whole(p.setting.ctors, keys::written(Lift, counts_type(), b"m")), None)
       },
     },
   }

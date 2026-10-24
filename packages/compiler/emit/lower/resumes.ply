@@ -1,0 +1,233 @@
+//! How often a `handle` clause that resumes off its tail may resume its continuation, which decides
+//! whether the runtime snapshots the stop it resumes: never where the clause resumes it at most once.
+
+import emit.code (Code, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodeArm, CodeField, NLit, NVar,
+                  NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel,
+                  NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown, slots_read,
+                  all_read, lower_fn)
+import syntax.items (Item, IFn, parse)
+import syntax.exprs (Param)
+import expand.rewrite (expand)
+import syntax.sites (numbered)
+
+/// The runtime's code for clause `cl`, which resumes off its tail: `2` where it calls its
+/// continuation at most once however it runs, so the stop it resumes needs no snapshot, and `4`
+/// where it may call it again. At most once is every read of the continuation a direct call whose
+/// argument does not read it, none under a lambda, `handle`, `simulate` or `parallel`, no path
+/// making two, and nothing before the call that may stop: a handler around the clause that resumes
+/// such a stop twice would run the call twice. Read off the code alone, since the type filed for a
+/// clause carries no row of what its body performs.
+pub fn off_tail_code(cl: CodeClause) -> Int = {
+  let r = run(cl.body, continuation_slot(cl));
+  let once = match r.calls { Some(n) -> n <= 1, None -> false };
+  if once && !r.stops_first { 2 } else { 4 }
+}
+
+/// The most calls of continuation `k`, slot `k`, on one path through `code`; none where some read of
+/// it is not a direct call whose argument does not read it, or is under a lambda, `handle`,
+/// `simulate` or `parallel`, which may call it any number of times.
+pub fn max_calls_on_a_path(code: Code, k: Int) -> Option<Int> = run(code, k).calls
+
+/// The slot a clause's continuation takes: after its parameters and the label it binds.
+fn continuation_slot(cl: CodeClause) -> Int = cl.params + (if cl.binds_label { 1 } else { 0 })
+
+/// What running code may do with a continuation: the most calls of it on one path, as
+/// `max_calls_on_a_path` answers; whether it may stop; and whether some path may stop before it
+/// calls the continuation.
+type Run = { calls: Option<Int>, stops: Bool, stops_first: Bool }
+
+fn still() -> Run = { calls: Some(0), stops: false, stops_first: false }
+
+fn stop() -> Run = { calls: Some(0), stops: true, stops_first: false }
+
+/// `a`, then `b`.
+fn followed(a: Run, b: Run) -> Run =
+  {
+    calls: match a.calls {
+      Some(x) -> match b.calls { Some(y) -> Some(x + y), None -> None },
+      None -> None,
+    },
+    stops: a.stops || b.stops,
+    stops_first: a.stops_first || b.stops_first || (a.stops && b.calls != Some(0)),
+  }
+
+/// `a` or `b`, whichever a path takes.
+fn either(a: Run, b: Run) -> Run =
+  {
+    calls: match a.calls {
+      Some(x) -> match b.calls { Some(y) -> Some(if x > y { x } else { y }), None -> None },
+      None -> None,
+    },
+    stops: a.stops || b.stops,
+    stops_first: a.stops_first || b.stops_first,
+  }
+
+fn in_turn(codes: List<Code>, k: Int) -> Run =
+  codes.fold(still(), |acc: Run, c: Code| followed(acc, run(c, k)))
+
+/// Running `code`, a lambda, `handle`, `simulate` or `parallel`, whose reads of `k` may call it any
+/// number of times, and which stops where it `runs` code.
+fn enclosed(code: Code, k: Int, runs: Bool) -> Run =
+  {
+    calls: if slots_read(code).contains(k) { None } else { Some(0) },
+    stops: runs,
+    stops_first: false,
+  }
+
+/// Whether `a` calls continuation `k` directly with one argument that does not read it.
+fn resumes(a: { func: Code, args: List<Code> }, k: Int) -> Bool =
+  match a.func.node {
+    NVar(v) -> v.slot == Some(k) && a.args.len() == 1 && !all_read(a.args).contains(k),
+    _ -> false,
+  }
+
+/// What running `code` may do with continuation `k`. A call of anything but `k`, a perform, a
+/// `handle`, a `simulate` and a `parallel` may stop; a call of `k` is no stop that matters, since
+/// where `k` is called at most once nothing after the call calls it again.
+fn run(code: Code, k: Int) -> Run =
+  match code.node {
+    NLit(_) -> still(),
+    NLabel(_) -> still(),
+    NVar(v) -> if v.slot == Some(k) { { ..still(), calls: None } } else { still() },
+    NKnown(x) -> if x.slot == k { { ..still(), calls: None } } else { still() },
+    NUnary(u) -> run(u.operand, k),
+    NBinary(b) -> followed(run(b.lhs, k), run(b.rhs, k)),
+    NField(f) -> run(f.base, k),
+    NUpdate(u) ->
+      u.sets.fold(run(u.base, k), |acc: Run, f: CodeField| followed(acc, run(f.value, k))),
+    NRecord(r) -> r.fields.fold(still(), |acc: Run, f: CodeField| followed(acc, run(f.value, k))),
+    NList(l) -> in_turn(l.items, k),
+    NApp(a) -> if resumes(a, k) {
+      let e = in_turn(a.args, k);
+      { calls: Some(1), stops: e.stops, stops_first: e.stops }
+    } else { followed(followed(run(a.func, k), in_turn(a.args, k)), stop()) },
+    NIf(i) -> followed(run(i.cond, k), either(run(i.then_branch, k), run(i.else_branch, k))),
+    NBlock(b) -> {
+      let stmts = b.stmts.fold(still(), |acc: Run, s: CodeStmt|
+        followed(acc, match s {
+          CLet(l) -> run(l.value, k),
+          CLetPat(l) -> run(l.value, k),
+          CDo(d) -> run(d.code, k),
+        }));
+      match b.tail { Some(t) -> followed(stmts, run(t, k)), None -> stmts }
+    },
+    // Every guard may run before the arm a path takes.
+    NMatch(m) ->
+      followed(
+        m.arms.fold(run(m.scrutinee, k), |acc: Run, a: CodeArm|
+          match a.guard { Some(g) -> followed(acc, run(g, k)), None -> acc }),
+        m.arms.fold(still(), |acc: Run, a: CodeArm| either(acc, run(a.body, k))),
+      ),
+    NPerform(p) ->
+      followed(
+        followed(match p.label { Some(l) -> run(l, k), None -> still() }, in_turn(p.args, k)),
+        stop(),
+      ),
+    NLambda(_) -> enclosed(code, k, false),
+    NSimulate(_) -> enclosed(code, k, true),
+    NParallel(_) -> enclosed(code, k, true),
+    NHandle(_) -> enclosed(code, k, true),
+  }
+
+/// The clauses of the `handle` the first function of `src` answers, lowered.
+fn clauses_in(src: Bytes) -> List<CodeClause> / {abort.raise} = {
+  let r = parse(src);
+  let x = expand(r.node, r.parser.diags);
+  x.module.items.fold([], |acc: List<CodeClause>, item: Item|
+    match numbered(item) {
+      IFn(d) -> if acc.len() > 0 { acc } else {
+        match lower_fn(d.params.map(|p: Param| p.name.name), [], Map::new(), d.body) {
+          Ok(l) -> match l.code.node {
+            NHandle(h) -> h.clauses,
+            NBlock(b) -> match b.tail {
+              Some(t) -> match t.node { NHandle(h) -> h.clauses, _ -> [] },
+              None -> [],
+            },
+            _ -> [],
+          },
+          Err(_) -> acc,
+        }
+      },
+      _ -> acc,
+    })
+}
+
+/// The code of the one clause of `fn f(c: Bool) -> Int = handle { .. } with { <clause> }`.
+fn code_of(clause: Bytes) -> Option<Int> / {abort.raise} =
+  match clauses_in(
+      Bytes::concat_all([
+        b"fn f(c: Bool, xs: List<Int>) -> Int = handle { if amb.flip() { 1 } else { 2 } } with { ",
+        clause,
+        b" }\n",
+      ]),
+    ) {
+    [cl] -> Some(off_tail_code(cl)),
+    _ -> None,
+  }
+
+test "a clause that may call its continuation twice on one path, or hands it on, may resume again" {
+  assert_eq(
+    [
+      b"amb.flip() resume k -> k(true) + k(false)",
+      b"amb.flip() resume k -> k(true) + k(false) + k(true)",
+      b"amb.flip() resume k -> Parked(k)",
+      b"amb.flip() resume k -> xs.map(|x: Int| if k(x > 0) > 0 { 1 } else { 0 }).len()",
+      b"amb.flip() resume k -> { let f = k; f(true) + 1 }",
+      b"amb.flip() resume k -> handle { k(true) + 1 } with { abort.raise(m) -> 0 }",
+    ].map(
+      code_of,
+    ),
+    [Some(4), Some(4), Some(4), Some(4), Some(4), Some(4)],
+  )
+}
+
+test "a clause that calls its continuation directly at most once on every path resumes at most once" {
+  assert_eq(
+    [
+      b"amb.flip() resume k -> if c { k(true) * 2 } else { k(false) + 1 }",
+      b"amb.flip() resume r -> { let v = r(true); v + 1 }",
+      b"amb.flip() resume k -> match xs { [] -> k(true) + 1, _ -> 0 }",
+    ].map(
+      code_of,
+    ),
+    [Some(2), Some(2), Some(2)],
+  )
+}
+
+test "a clause that may stop before it calls its continuation once may resume again" {
+  assert_eq(
+    [
+      b"amb.flip() resume k -> { let b = coin.toss(); k(b) * 2 }",
+      b"amb.flip() resume k -> k(coin.toss()) * 2",
+      b"amb.flip() resume k -> { let v = k(true); coin.toss(); v }",
+    ].map(
+      code_of,
+    ),
+    [Some(4), Some(4), Some(2)],
+  )
+}
+
+test "the most calls on a path add along it and take the larger of two branches" {
+  let body = |clause: Bytes|
+    match clauses_in(
+        Bytes::concat_all([
+          b"fn f(c: Bool) -> Int = handle { 1 } with { amb.flip() resume k -> ",
+          clause,
+          b" }\n",
+        ]),
+      ) {
+      [cl] -> max_calls_on_a_path(cl.body, continuation_slot(cl)),
+      _ -> Some(0 - 1),
+    };
+  assert_eq(
+    [
+      b"if c { k(true) } else { k(false) + k(true) }",
+      b"{ let a = k(true); if c { a } else { a + k(false) } }",
+      b"k(k(true) > 0)",
+      b"1",
+    ].map(
+      body,
+    ),
+    [Some(2), Some(2), None, Some(0)],
+  )
+}

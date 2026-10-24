@@ -1,8 +1,9 @@
 //! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
 //! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
 
+use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Native, Raising};
+use crate::native::{Addr, F64, I64, Native, Raises, Raising, Signature};
 use crate::rt::Ctx;
 
 /// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
@@ -87,6 +88,10 @@ typedef struct {
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
+/* `byte_of_int`'s answer for each byte: an immortal object the unit's tail lays out once. */
+typedef struct { PlyObj h; unsigned char b[8]; } PlyOneByte;
+extern const PlyOneByte ply_one_bytes[256];
+static inline Word ply_one_byte(PlyCtx *ctx, int64_t b) { (void)ctx; return (Word)(intptr_t)&ply_one_bytes[b]; }
 /* Held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`, its code point
    above them). An object's address is a multiple of eight. */
 static inline int ply_is_imm(Word w) { return (w & 7) != 0; }
@@ -211,11 +216,104 @@ impl Helper {
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
-            args: F::SIGNATURE.words,
-            answers: F::SIGNATURE.answers,
+            args: F::SIGNATURE.words(),
+            answers: F::SIGNATURE.answers(),
             address: f.address(),
         }
     }
+}
+
+/// A native the compiler declares itself over machine data, under the name it declares and with
+/// its function's signature; bound as the helper [`builtin_helper_name`] names for it.
+pub struct MachineNative {
+    pub name: &'static str,
+    pub signature: Signature,
+    pub helper: Helper,
+}
+
+macro_rules! machine {
+    ($($name:literal => $f:ident($($t:ty),*) $(-> $r:ty)?;)*) => {
+        fn machine_table() -> Vec<MachineNative> {
+            vec![$({
+                let f: unsafe extern "C" fn(*mut Ctx $(, $t)*) $(-> $r)? = crate::rt::$f;
+                let helper = Box::leak(builtin_helper_name($name).into_boxed_str());
+                MachineNative {
+                    name: $name,
+                    signature: signature_of(f),
+                    helper: Helper::of(helper, f),
+                }
+            }),*]
+        }
+    };
+}
+
+fn signature_of<F: Native>(_: F) -> Signature {
+    F::SIGNATURE
+}
+
+/// The native the compiler declares as `name`, bound to `f` and taking and answering what `f`'s
+/// type says.
+pub(crate) fn machine_native<F: Native>(name: &'static str, f: F) -> MachineNative {
+    let helper = Box::leak(builtin_helper_name(name).into_boxed_str());
+    MachineNative {
+        name,
+        signature: F::SIGNATURE,
+        helper: Helper::of(helper, f),
+    }
+}
+
+machine! {
+    "?out_tag" => rt_out_tag(I64);
+    "?out_int" => rt_out_int(I64);
+    "?out_float" => rt_out_float(F64);
+    "?out_decimal" => rt_out_decimal(I64, I64);
+    "?out_fixed" => rt_out_fixed(I64, I64, I64);
+    "?out_char" => rt_out_char(I64);
+    "?out_str" => rt_out_str(Addr, I64);
+    "?out_bytes" => rt_out_bytes(Addr, I64);
+    "?out_count" => rt_out_count(I64, I64);
+    "?out_ctor" => rt_out_ctor(Addr, I64, I64);
+    "?out_name" => rt_out_name(Addr, I64);
+    "?out_handle" => rt_out_handle(Handle);
+    "?out_carried" => rt_out_carried(Handed, *const PlyType);
+    "?out_fun" => rt_out_fun(Handed, Addr, I64);
+    "?out_again" => rt_out_again(Handed) -> I64;
+    "?in_tag" => rt_in_tag() -> I64;
+    "?in_int" => rt_in_int() -> I64;
+    "?in_float" => rt_in_float() -> F64;
+    "?in_decimal" => rt_in_decimal() -> I64;
+    "?in_fixed" => rt_in_fixed(I64) -> I64;
+    "?in_high" => rt_in_high() -> I64;
+    "?in_char" => rt_in_char() -> I64;
+    "?in_str" => rt_in_str() -> I64;
+    "?in_bytes" => rt_in_bytes() -> I64;
+    "?in_count" => rt_in_count(I64) -> I64;
+    "?in_field" => rt_in_field(Addr, I64);
+    "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
+    "?in_handle" => rt_in_handle() -> Handle;
+    "?lower_open" => rt_lower_open(I64);
+    "?lower_close" => rt_lower_close() -> I64;
+    "?lift_open" => rt_lift_open(Addr, I64);
+    "?lift_close" => rt_lift_close();
+    "?taken" => rt_taken(Addr, I64);
+    "?handler_typed" => rt_handler_typed(I64, Handed, *const PlyType);
+    "?handler_get" => rt_handler_get(I64) -> Handed;
+    "?handler_put" => rt_handler_put(I64, Handed);
+    "?cost_mark" => rt_cost_mark() -> I64;
+    "?cost_spent" => rt_cost_spent(I64, I64);
+    "?in_carried" => rt_in_carried() -> Handed;
+    "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
+}
+
+/// The natives the compiler declares itself over machine data: the crossings' and the rest of
+/// this table's, then strings' and byte strings' (`crate::machine`).
+pub fn machine_natives() -> &'static [MachineNative] {
+    static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| {
+        let mut all = machine_table();
+        all.extend(crate::machine::natives());
+        all
+    })
 }
 
 /// A helper's parameter as its function takes it: a `Word` unless written otherwise.
@@ -324,6 +422,32 @@ helpers! {
     rt_node_writable(n) -> Word;
     rt_list_writable(xs, room) -> Word;
     rt_map_writable(m) -> Word;
+
+    rt_alloc_bytes(bytes) -> Block;
+    rt_alloc_kept(bytes) -> Block;
+    rt_free(o: Block, bytes);
+    rt_dec_shared_last(o: Block) -> Word;
+    rt_handle_free(h: Block);
+    rt_released_twice(o: Block);
+    rt_release_later(w: Handed, root: DropRoot);
+    rt_release_drain();
+    rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
+    rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
+    rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
+    rt_with_cleanup(
+        acquire: Block,
+        body: Block,
+        cleanup: Block,
+        held: *const PlyType,
+        answer: *const PlyType
+    ) -> Handed;
+    rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
+    rt_builtin_encoded(index: I64);
+    rt_region(body: Block, answer: *const PlyType) -> Handed;
+    rt_branches(slots: *const Handed, n: I64);
+    rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
+    rt_memo(index: I64, keep: KeepRoot) -> Handed;
+    rt_never_lifted();
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since
@@ -336,7 +460,8 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, then one a builtin.
+/// Every helper a unit may bind: the runtime's own, then one a builtin, then one a native over
+/// machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
@@ -344,12 +469,13 @@ pub fn helpers() -> &'static [Helper] {
             let signature = crate::rt::signature(*b);
             Helper {
                 name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
-                args: signature.words,
-                answers: signature.answers,
+                args: signature.words(),
+                answers: signature.answers(),
                 address: crate::rt::builtin_address(*b),
             }
         });
-        own().into_iter().chain(builtins).collect()
+        let machine = machine_natives().iter().map(|n| n.helper);
+        own().into_iter().chain(builtins).chain(machine).collect()
     })
 }
 
@@ -395,14 +521,14 @@ pub fn runtime_header() -> String {
          \x20 return o;\n\
          }\n\
          \nstatic inline void ply_inc(Word w) {\n\
-         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
          \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
          \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
          }\n\
          \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
-         \x20 if ((w & 3) != 0 || w == 0) return;\n\
+         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
          \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc == UINT32_MAX) return;\n\
@@ -476,6 +602,14 @@ pub fn runtime_object() -> String {
     out.push_str(
         "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
     );
+    out.push_str("const PlyOneByte ply_one_bytes[256] = {\n");
+    for b in 0..256 {
+        out.push_str(&format!(
+            "  {{ {{ .rc = UINT32_MAX, .kind = {}, .len = 1, .layout = 1 }}, {{ {b} }} }},\n",
+            crate::heap::KIND_BYTES
+        ));
+    }
+    out.push_str("};\n");
     out.push_str("\nvoid ply_bind(void **fns) {\n");
     for (i, h) in helpers().iter().enumerate() {
         let (ret, params) = signature(h);

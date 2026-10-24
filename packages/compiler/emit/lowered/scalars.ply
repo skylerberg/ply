@@ -1,14 +1,18 @@
 //! The scalar family's lowering read off programs: the decision each operator, literal and per-type
 //! operation takes, and a corpus that lowers, checks and prints.
 
-import check.types (TyVar, TyCon)
+import check.types (Type, TyVar, TyCon)
 import syntax.patterns (LStr, LDec, LWide, LUnit)
 import emit.answer (Exact)
-import emit.keys (Root, root_name)
-import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RMaybe, RCases, Var, Arg, AVar, AInt,
+import emit.keys
+import emit.keys (Root, RootName, root_name, root_text)
+import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWord, RSum, RImm, Var, Arg, AVar, AInt,
                  ANum, AChar, Val, Prim, Literal, Get, Tag, Call, Native, Inst, Let, Do, If, Block,
                  Scalars)
 import emit.compare (Program, program_of, formed, printed_by_form, not_built)
+
+import emit.tir (Static)
+import emit.statics (Datum, SStr, SWide, statics_of)
 
 /// Every value `b` binds or does, through the blocks its branches hold.
 fn values(b: Block) -> List<Val> =
@@ -43,12 +47,12 @@ fn applied(p: Program, name: Bytes) -> Result<List<Applied>, Bytes> / {abort.rai
   }
 
 /// The roots root `name` of `p` calls by name, or why it was not formed.
-fn roots_called(p: Program, name: Bytes) -> Result<List<Bytes>, Bytes> / {abort.raise} =
+fn roots_called(p: Program, name: Bytes) -> Result<List<RootName>, Bytes> / {abort.raise} =
   match formed(p, name) {
     Err(no) -> Err(no.why),
     Ok(f) ->
       Ok(
-        values(f.body).fold([], |acc: List<Bytes>, v: Val|
+        values(f.body).fold([], |acc: List<RootName>, v: Val|
           match v {
             Call(c) -> match c.callee { Root(k) -> acc.push(root_name(k)), _ -> acc },
             _ -> acc,
@@ -69,6 +73,23 @@ fn natives(p: Program, name: Bytes) -> Result<List<Bytes>, Bytes> / {abort.raise
 
 fn analysed(src: Bytes) -> Program / {abort.raise} =
   match program_of(src) { Ok(p) -> p, Err(why) -> panic(String::of_bytes(why)) }
+
+/// The root written in `m` for operation `op` of `ty`, by its name.
+fn written_root(op: keys::TypeOp, ty: Type) -> RootName / {abort.raise} =
+  root_name(keys::written(op, ty, b"m"))
+
+fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
+
+/// The operands of each operator root `name` of `p` applies, in order, or why it was not formed.
+fn operands(p: Program, name: Bytes) -> Result<List<List<Arg>>, Bytes> / {abort.raise} =
+  match formed(p, name) {
+    Err(no) -> Err(no.why),
+    Ok(f) ->
+      Ok(
+        values(f.body).fold([], |acc: List<List<Arg>>, v: Val|
+          match v { Prim(x) -> acc.push(x.args), _ -> acc }),
+      ),
+  }
 
 /// Whether root `name` of `p` reads a field, or why it was not formed.
 fn reads(p: Program, name: Bytes) -> Result<Bool, Bytes> / {abort.raise} =
@@ -93,22 +114,18 @@ test "records of a known type are compared and ordered field by field, not by th
   assert_eq(applied(p, b"same"), Ok([{ op: b"bytes_eq", on: RWord }, { op: b"eq", on: RInt }]));
   assert_eq(reads(p, b"same"), Ok(true));
   assert_eq(natives(p, b"same"), Ok([]));
-  // An `Option` a record holds is compared as its payload's word, then its payload.
+  // An `Option` a record holds is compared by the root written for its type.
+  assert_eq(applied(p, b"optional"), Ok([{ op: b"eq", on: RInt }]));
   assert_eq(
-    applied(p, b"optional"),
-    Ok([
-      { op: b"eq", on: RInt },
-      { op: b"none_in", on: RMaybe },
-      { op: b"eq", on: RMaybe },
-      { op: b"eq", on: RInt },
-    ]),
+    roots_called(p, b"optional"),
+    Ok([written_root(keys::Contained(b"equal"), con(b"Option", [con(b"Int", [])]))]),
   );
   assert_eq(natives(p, b"optional"), Ok([]));
   // A record a record holds is compared field by field again.
   assert_eq(
     applied(p, b"apart"),
     Ok([
-      { op: b"eq", on: RWord },
+      { op: b"eq", on: RImm },
       { op: b"bytes_eq", on: RWord },
       { op: b"eq", on: RInt },
       { op: b"not", on: RBool },
@@ -141,20 +158,12 @@ test "an operator is read at the type its operands hold, a width's literal as it
     ]),
   );
   let byte = { bits: 8, signed: false };
-  match formed(p, b"wadd") {
-    Err(no) -> assert_eq(no.why, b""),
-    Ok(f) ->
-      assert_eq(values(f.body), [
-        Prim({
-          op: b"add",
-          on: RNum(byte),
-          args: [
-            AVar({ id: 0, ty: TyCon({ name: b"U8", args: [] }), rep: RNum(byte) }),
-            ANum({ width: byte, bits: 1 }),
-          ],
-        }),
-      ]),
-  };
+  assert_eq(applied(p, b"wadd"), Ok([{ op: b"add", on: RNum(byte) }]));
+  // The literal is the width's own bits.
+  assert_eq(
+    operands(p, b"wadd").map(|xs: List<List<Arg>>| xs.map(|a: List<Arg>| a.drop(1))),
+    Ok([[ANum({ width: byte, bits: 1 })]]),
+  );
   assert_eq(applied(p, b"half"), Ok([{ op: b"mul", on: RFloat }]));
   assert_eq(applied(p, b"less"), Ok([{ op: b"lt", on: RInt }]));
   assert_eq(applied(p, b"wide"), Ok([{ op: b"mul", on: width(64, false) }]));
@@ -207,66 +216,54 @@ test "an Int quotient or remainder by a literal is C's own operator, and by anyt
             else { acc },
             _ -> acc,
           }),
-        [
-          [AInt(0 - 4)],
-          [AInt(7)],
-          [AVar({ id: 1, ty: TyCon({ name: b"Int", args: [] }), rep: RInt })],
-        ],
+        [[AInt(0 - 4)], [AInt(7)], [AVar(f.params.get(1))]],
       ),
   };
+  // C divides by the literals itself, and asks the runtime where the divisor may be 0 or -1.
   match printed_by_form(p, b"q") {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> {
-      assert(text.index_of(b"(p0) / INT64_C(-4)") != None);
-      assert(text.index_of(b"(p0) % INT64_C(7)") != None);
-      assert(text.index_of(b"rt_arith_p(ctx, 1, p0, p1)") != None)
+      assert(text.index_of(b"/ INT64_C(-4)") != None && text.index_of(b"% INT64_C(7)") != None);
+      assert(text.index_of(b"rt_arith_p(") != None)
     },
   }
 }
 
-test "a Decimal is held in registers as its two words, a literal one read from the pool into them" {
+test "a Decimal is held in registers as its two words, a literal one written as them" {
   let p = analysed(
     b"fn d(a: Decimal, b: Decimal) -> Decimal = a * b - a\nfn dl(a: Decimal) -> Bool = a < 1.5m\n",
   );
   assert_eq(applied(p, b"d"), Ok([{ op: b"mul", on: RDec }, { op: b"sub", on: RDec }]));
-  assert_eq(applied(p, b"dl"), Ok([{ op: b"lt", on: RDec }]));
+  assert_eq(applied(p, b"dl"), Ok([{ op: b"decimal", on: RInt }, { op: b"lt", on: RDec }]));
   match formed(p, b"dl") {
     Err(no) -> assert_eq(no.why, b""),
     Ok(f) -> assert_eq(bound_in(f.body).map(|v: Var| v.rep), [RDec, RBool]),
   };
+  // The runtime is handed the two words of each operand, never a box of them.
   match printed_by_form(p, b"d") {
     Err(why) -> assert_eq(why, b""),
     Ok(text) ->
       assert(
-        text.index_of(
-            b"rt_decimal_binary_p(ctx, 2, p0.lo, p0.hi, p1.lo, p1.hi, (Word)(intptr_t)&t1);",
-          )
-          != None,
+        text.index_of(b"rt_decimal_binary_p(") != None && text.index_of(b"p0.lo") != None
+          && text.index_of(b"p1.hi") != None,
       ),
   };
   match printed_by_form(p, b"dl") {
     Err(why) -> assert_eq(why, b""),
     Ok(text) ->
       assert(
-        text.index_of(b"ply_dec_of(") != None
-          && text.index_of(b"rt_decimal_compare_p(ctx, p0.lo, p0.hi, ") != None,
+        text.index_of(b"(PlyDec){") != None && text.index_of(b"rt_decimal_compare_p(") != None,
       ),
   }
 }
 
 test "a Char is its own word, compared as C compares the words" {
   let p = analysed(b"fn c(a: Char) -> Bool = a < 'z'\n");
-  match formed(p, b"c") {
-    Err(no) -> assert_eq(no.why, b""),
-    Ok(f) ->
-      assert_eq(values(f.body), [
-        Prim({
-          op: b"lt",
-          on: RWord,
-          args: [AVar({ id: 0, ty: TyCon({ name: b"Char", args: [] }), rep: RWord }), AChar(122)],
-        }),
-      ]),
-  }
+  assert_eq(applied(p, b"c"), Ok([{ op: b"lt", on: RImm }]));
+  assert_eq(
+    operands(p, b"c").map(|xs: List<List<Arg>>| xs.map(|a: List<Arg>| a.drop(1))),
+    Ok([[AChar(122)]]),
+  )
 }
 
 test "strings and byte strings are compared by their bytes, constructors of no argument by their index" {
@@ -281,17 +278,19 @@ test "strings and byte strings are compared by their bytes, constructors of no a
   );
   assert_eq(applied(p, b"s"), Ok([{ op: b"bytes_eq", on: RWord }]));
   assert_eq(applied(p, b"bs"), Ok([{ op: b"bytes_ne", on: RWord }]));
-  // Parameters cross as their constructors' objects, compared by the constructor each header names.
-  assert_eq(applied(p, b"suit"), Ok([{ op: b"ctor_ne", on: RWord }]));
-  // Values held in the body are their constructors' indices, compared as two numbers.
-  let suits = RCases({
-    tagged: false,
-    cases: [b"m.Hearts", b"m.Spades"].map(|n: Bytes| { name: n, leaves: [] }),
-  });
-  assert_eq(applied(p, b"picked"), Ok([{ op: b"eq", on: suits }]))
+  // Parameters cross as their one word, which is their case's place, compared as two numbers.
+  let ops = |name: Bytes|
+    match applied(p, name) {
+      Ok(xs) ->
+        xs.map(|x: { op: Bytes, on: Rep }|
+          { op: x.op, sum: match x.on { RSum(_) -> true, _ -> false } }),
+      Err(why) -> [{ op: why, sum: false }],
+    };
+  assert_eq(ops(b"suit"), [{ op: b"ne", sum: true }]);
+  assert_eq(ops(b"picked"), [{ op: b"eq", sum: true }])
 }
 
-test "an Option is compared as its payload's word, then its payload as its type compares" {
+test "an Option and a Result are compared by the roots written for their types" {
   let p = analysed(
     Bytes::concat_all([
       b"fn ints(a: Option<Int>, b: Option<Int>) -> Bool = a == b\n",
@@ -299,15 +298,14 @@ test "an Option is compared as its payload's word, then its payload as its type 
       b"fn results(a: Result<Int, String>, b: Result<Int, String>) -> Bool = a == b\n",
     ]),
   );
-  let none = [{ op: b"none_in", on: RMaybe }, { op: b"eq", on: RMaybe }];
-  assert_eq(applied(p, b"ints"), Ok(none.push({ op: b"eq", on: RInt })));
-  assert_eq(
-    applied(p, b"texts"),
-    Ok(none.push({ op: b"bytes_eq", on: RWord }).push({ op: b"not", on: RBool })),
-  );
+  let equal = |ty: Type| Ok([written_root(keys::Contained(b"equal"), ty)]);
+  assert_eq(roots_called(p, b"ints"), equal(con(b"Option", [con(b"Int", [])])));
+  assert_eq(roots_called(p, b"texts"), equal(con(b"Option", [con(b"String", [])])));
   assert_eq([b"ints", b"texts"].map(|n: Bytes| natives(p, n)), [Ok([]), Ok([])]);
-  // A `Result` is compared by the root written for its type, handed its word.
-  assert_eq(roots_called(p, b"results"), Ok([b"m.equal#Result<Int,String>"]))
+  assert_eq(
+    roots_called(p, b"results"),
+    equal(con(b"Result", [con(b"Int", []), con(b"String", [])])),
+  )
 }
 
 test "two values of a declared sum are compared and ordered through roots written for it" {
@@ -319,10 +317,11 @@ test "two values of a declared sum are compared and ordered through roots writte
       b"fn order(a: Shape, b: Shape) -> Ordering = compare(a, b)\n",
     ]),
   );
-  assert_eq(roots_called(p, b"same"), Ok([b"m.Shape#eq"]));
-  // The root answers a `Bool`'s word, which `!=` reads as not `true`'s own.
-  assert_eq(applied(p, b"apart"), Ok([{ op: b"untrue", on: RWord }]));
-  assert_eq(roots_called(p, b"order"), Ok([b"m.Shape#cmp"]));
+  let shape = con(b"m.Shape", []);
+  assert_eq(roots_called(p, b"same"), Ok([written_root(keys::Equal, shape)]));
+  // The root answers a `Bool`, which `!=` negates.
+  assert_eq(applied(p, b"apart"), Ok([{ op: b"not", on: RBool }]));
+  assert_eq(roots_called(p, b"order"), Ok([written_root(keys::Order, shape)]));
   assert_eq(applied(p, b"order"), Ok([]))
 }
 
@@ -330,7 +329,10 @@ test "a list, an array or a map is compared through the root written for its typ
   let p = analysed(
     b"fn lists(a: List<Int>, b: List<Int>) -> Bool = a == b\nfn maps(a: Map<Int, String>, b: Map<Int, String>) -> Ordering = compare(a, b)\n",
   );
-  assert_eq(roots_called(p, b"lists"), Ok([b"m.equal#List<Int>"]));
+  assert_eq(
+    roots_called(p, b"lists"),
+    Ok([written_root(keys::Contained(b"equal"), con(b"List", [con(b"Int", [])]))]),
+  );
   match formed(p, b"lists") {
     Err(no) -> assert_eq(no.why, b""),
     // The root answers a `Bool` as itself, as today's roots for containers do.
@@ -341,7 +343,12 @@ test "a list, an array or a map is compared through the root written for its typ
         [RBool],
       ),
   };
-  assert_eq(roots_called(p, b"maps"), Ok([b"m.ordered#Map<Int,String>"]))
+  assert_eq(
+    roots_called(p, b"maps"),
+    Ok([
+      written_root(keys::Contained(b"ordered"), con(b"Map", [con(b"Int", []), con(b"String", [])])),
+    ]),
+  )
 }
 
 test "compare at a number, a character or a string orders in C and answers its constructor" {
@@ -356,7 +363,7 @@ test "compare at a number, a character or a string orders in C and answers its c
   );
   let made = { op: b"ordering", on: RInt };
   assert_eq(applied(p, b"ci"), Ok([{ op: b"order", on: RInt }, made]));
-  assert_eq(applied(p, b"cc"), Ok([{ op: b"order", on: RWord }, made]));
+  assert_eq(applied(p, b"cc"), Ok([{ op: b"order", on: RImm }, made]));
   assert_eq(applied(p, b"cs"), Ok([{ op: b"bytes_order", on: RWord }, made]));
   assert_eq(applied(p, b"cw"), Ok([{ op: b"order", on: width(16, false) }, made]));
   assert_eq(applied(p, b"cd"), Ok([{ op: b"order", on: RDec }, made]));
@@ -410,7 +417,7 @@ test "a value of a type variable is compared by the runtime, which notes the typ
   }
 }
 
-test "a constant the pool holds is read into a variable of its type, a register's written as itself" {
+test "a constant is a static object, a decimal its two words, and a register's written as itself" {
   let p = analysed(
     Bytes::concat_all([
       b"fn text() -> String = \"ply\"\n",
@@ -427,10 +434,29 @@ test "a constant the pool holds is read into a variable of its type, a register'
       Ok(f) ->
         Ok(match f.body.at(0) { Some(Let(l)) -> Some({ val: l.val, rep: l.var.rep }), _ -> None }),
     };
-  assert_eq(read(b"text"), Ok(Some({ val: Literal(LStr(b"ply")), rep: RWord })));
-  assert_eq(read(b"dec"), Ok(Some({ val: Literal(LDec(b"2.50m")), rep: RDec })));
-  assert_eq(read(b"huge"), Ok(Some({ val: Literal(LWide(b"U128", 0, 7)), rep: RWord })));
-  assert_eq(read(b"unit"), Ok(Some({ val: Literal(LUnit), rep: RWord })));
+  let named = |s: Datum| Static(statics_of(s).get(0).name);
+  assert_eq(read(b"text"), Ok(Some({ val: named(SStr(b"ply")), rep: RWord })));
+  // 2.50 is 250 at scale 2: the scale in the flags' bits 16 to 23, the mantissa from bit 32.
+  assert_eq(
+    read(b"dec"),
+    Ok(
+      Some({
+        val: Prim({ op: b"decimal", on: RInt, args: [AInt(2 << 16 | 250 << 32), AInt(0)] }),
+        rep: RDec,
+      }),
+    ),
+  );
+  assert_eq(
+    read(b"huge"),
+    Ok(
+      Some({
+        val: named(SWide({ width: { bits: 128, signed: false }, high: 0, low: 7 })),
+        rep: RWord,
+      }),
+    ),
+  );
+  // `()` is no value at all.
+  assert_eq(read(b"unit"), Ok(None));
   match formed(p, b"top") {
     Err(no) -> assert_eq(no.why, b""),
     Ok(f) ->
@@ -438,11 +464,10 @@ test "a constant the pool holds is read into a variable of its type, a register'
   };
   match printed_by_form(p, b"text") {
     Err(why) -> assert_eq(why, b""),
-    Ok(t) ->
-      assert(
-        t.index_of(b"Word t1 = rt_lit_p(ctx, @@c=str:ply@@);\n  if (ctx->failed) return 0;")
-          != None,
-      ),
+    Ok(t) -> {
+      let address = Bytes::concat_all([b"(Word)(intptr_t)&", statics_of(SStr(b"ply")).get(0).name]);
+      assert(t.index_of(address) != None && t.index_of(b"rt_lit_p") == None, None)
+    },
   }
 }
 
@@ -462,10 +487,16 @@ test "what C does not write at a type is the runtime's builtin, an encoding writ
     Ok([b"builtin_bytes_blake3_p"]),
     Ok([b"builtin_saturating_add_p"]),
     Ok([b"builtin_wrap_add_p"]),
-    Ok([b"builtin_checked_neg_p"]),
+    // An `Option` the runtime answers crosses back as its encoding.
+    Ok([
+      b"builtin_elaborated_lower_open_p",
+      b"builtin_elaborated_out_count_p",
+      b"builtin_elaborated_lift_close_p",
+    ]),
   ]);
   assert_eq(
-    roots_called(p, b"hr").map(|rs: List<Bytes>| rs.map(|r: Bytes| r.starts_with(b"m.digest#"))),
+    roots_called(p, b"hr").map(|rs: List<RootName>|
+      rs.map(|r: RootName| root_text(r).starts_with(b"m.digest#"))),
     Ok([true]),
   )
 }
@@ -540,7 +571,7 @@ test "a stated witness is its constructor's tag, past the witnesses the runtime 
   }
 }
 
-test "a declared sum's negation is its witness's, which the runtime runs over the sum's word" {
+test "a declared sum's negation is the function its module states, which no native runs" {
   let p = analysed(
     Bytes::concat_all([
       b"type Length = | Metres(Int) | Millimetres(Int)\n",
@@ -551,7 +582,7 @@ test "a declared sum's negation is its witness's, which the runtime runs over th
       b"fn back(g: Length) -> Length = -g\n",
     ]),
   );
-  assert_eq(natives(p, b"back"), Ok([b"rt_negate_p"]))
+  assert_eq(natives(p, b"back"), Ok([]))
 }
 
 /// The corpus as module `m` of a program.

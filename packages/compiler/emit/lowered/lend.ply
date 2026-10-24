@@ -1,0 +1,292 @@
+//! Programs lowered as a build lowers them and lent: what each definition lends and answers, that
+//! lending never costs the ownership pass a reuse, and that a tail group lent as inferred passes the
+//! ownership check.
+
+import std.prelude_source
+import syntax.exprs (prelude_module)
+import check.resolve.tables (Diag, qualify)
+import check.infer.definitions (Extern)
+import front.diagnostics (parse_all)
+import front.published (analyse)
+import front.facts (Analysis)
+import front.seam (Analysed, Refused)
+import unit (program_natives)
+import emit.code (Code)
+import emit.keys (RootKey, Named, RootName, root_name, root_text, filed_as)
+import emit.lower (root_lowered, group_lowered)
+import emit.special (instance_group)
+import emit.lower.setting (Setting, Root, setting_in)
+import emit.lend (Handing, Lending, lendings_of, declared_lent, handings_of, handing_said,
+                  reset_params, conventions)
+import emit.tir (Inst, Block, Fn, Member, Handed, Reset, If, Case, Match, Loop, Handle, Given, Lent)
+import emit.own (owned, may_reuse)
+import emit.verify (verified)
+
+fn corpus() -> Bytes =
+  Bytes::concat_all([
+    b"type Tree = | Leaf | Node(Tree, String, Tree)\n",
+    b"fn size(t: Tree) -> Int = match t { Leaf -> 0, Node(l, _, r) -> size(l) + 1 + size(r) }\n",
+    b"fn mirror(t: Tree) -> Tree = match t { Leaf -> Leaf, Node(l, x, r) -> Node(mirror(r), x, mirror(l)) }\n",
+    b"fn label(t: Tree) -> Option<String> = match t { Leaf -> None, Node(_, x, _) -> Some(x) }\n",
+    b"fn labels(t: Tree) -> List<String> = match label(t) { Some(x) -> [x], None -> [] }\n",
+    b"fn pick(c: Bool, a: String, b: String) -> String = if c { a } else { b }\n",
+    b"fn picked(a: String, b: String) -> List<String> = [pick(true, a, b)]\n",
+    b"fn stash(s: String) -> List<String> = [s]\n",
+    b"fn spin(s: String, n: Int) -> Int = if n <= 0 { 0 } else { spin(s, n - 1) }\n",
+    b"fn ping(s: String, n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { pong(s, n - 1) }\n",
+    b"fn pong(s: String, n: Int) -> Int / {diverges} = if n <= 0 { 1 } else { ping(s, n - 1) }\n",
+    b"fn pinged(s: String) -> List<String> / {diverges} = if ping(s, 3) > 0 { [s] } else { [] }\n",
+    b"type P = { x: Float, y: Float }\n",
+    b"type Seg = { from: P, label: String, to: P }\n",
+    b"fn relabelled(s: Seg, label: String) -> Seg = { ..s, label: label }\n",
+    b"fn hop(s: String, n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { skip(s, n - 1) }\n",
+    b"fn skip(s: String, n: Int) -> Int / {diverges} = if n <= 0 { 1 } else { hop(Int::to_string(n), n - 1) }\n",
+    b"type Step = (Int) -> Int\n",
+    b"fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))\n",
+    b"fn apply_kept(f: keep (Int) -> Int, x: Int) -> Int = f(x)\n",
+    b"fn apply_step(f: Step, x: Int) -> Int = f(x)\n",
+    b"fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)\n",
+  ])
+
+/// `src` analysed as module `m` of a program.
+fn analysed(src: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", src)
+
+/// `src` analysed as module `name` of a program, every body of it walked.
+fn analysed_as(name: Bytes, src: Bytes) -> Analysis / {abort.raise} =
+  match analyse(parse_all([{ name: name, src: src }])) {
+    Refused(diags) ->
+      panic(String::of_bytes_lossy(Bytes::join(diags.map(|d: Diag| d.message), b"\n"))),
+    Analysed(a) -> a,
+  }
+
+/// Module `module` of `a` as a build hands it to the emitter, with the roots of each definition
+/// `names` names, every one where it names none.
+fn set_out(
+  a: Analysis,
+  module: Bytes,
+  names: List<Bytes>,
+) -> { setting: Setting, roots: List<Root> } / {abort.raise} =
+  match setting_in(a, module) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(read) ->
+      {
+        setting: { ..read.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
+        roots: read.roots.filter(|r: Root| names.len() == 0 || names.contains(filed_as(r.key))),
+      },
+  }
+
+/// The forms of `roots` as a build lowers them: a tail loop once, under its first member, and every
+/// other root alone; one that does not lower is left out.
+fn forms_in(s: Setting, roots: List<Root>) -> List<Fn> / {abort.raise} = {
+  let named = roots.fold(Map::new(), |m: Map<RootName, Root>, r: Root|
+    m.insert(root_name(r.key), r));
+  let order = range(0, roots.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
+    m.insert(filed_as(roots.get(i).key), i));
+  let read_of = |full: Bytes|
+    match named.get(root_name(Named(full))) {
+      Some(r) -> Some({ code: r.code, filed: r.filed }),
+      None -> None,
+    };
+  roots.fold([], |acc: List<Fn>, r: Root|
+    match r.code {
+      Err(_) -> acc,
+      Ok(code) -> match instance_group(s, order, read_of, r.key) {
+        Err(_) -> acc,
+        Ok(keys) -> if keys.len() < 2 {
+          match root_lowered(s, r, code) { Ok(f) -> acc.push(f), Err(_) -> acc }
+        } else if keys.at(0) != Some(r.key) { acc } else {
+          let members = keys.fold([], |ms: List<{ root: Root, code: Code }>, k: RootKey|
+            match named.get(root_name(k)) {
+              Some(m) -> match m.code { Ok(c) -> ms.push({ root: m, code: c }), Err(_) -> ms },
+              None -> ms,
+            });
+          match group_lowered(s, members) { Ok(f) -> acc.push(f), Err(_) -> acc }
+        },
+      },
+    })
+}
+
+/// The definitions `names` names of module `module` of `a`, every one where it names none, as the
+/// inference reads them.
+fn read_in(a: Analysis, module: Bytes, names: List<Bytes>) -> List<Lending> / {abort.raise} = {
+  let s = set_out(a, module, names);
+  lendings_of(declared_of(s.setting), forms_in(s.setting, s.roots))
+}
+
+fn declared_of(s: Setting) -> Map<RootName, List<Int>> = declared_lent(Map::new(), s.module, s.here)
+
+/// The handing of each definition of module `module` of `src` that `names` names, settled with
+/// nothing published beforehand.
+fn handed_in(
+  src: Bytes,
+  module: Bytes,
+  names: List<Bytes>,
+) -> Map<RootName, Handing> / {abort.raise} =
+  handings_of(read_in(analysed(src), module, names), Map::new()).handed
+
+fn said(handed: Map<RootName, Handing>, full: Bytes) -> Bytes =
+  match handed.get(root_name(Named(full))) { Some(h) -> handing_said(h), None -> b"not lowered" }
+
+fn handings_said(
+  handed: Map<RootName, Handing>,
+  names: List<Bytes>,
+) -> List<{ name: Bytes, handing: Bytes }> =
+  names.map(|n: Bytes| { name: n, handing: said(handed, qualify(b"m", n)) })
+
+/// `f` with its parameters handed as `params`.
+fn handed_as(f: Fn, params: List<Handed>) -> Fn = { ..f, conv: { ..f.conv, params: params } }
+
+test "a reader lends, a builder and a keeper give, and a borrowed answer reaches its callers" {
+  let names = [
+    b"size",
+    b"mirror",
+    b"label",
+    b"labels",
+    b"pick",
+    b"picked",
+    b"stash",
+    b"spin",
+    b"ping",
+    b"pong",
+    b"pinged",
+  ];
+  assert_eq(handings_said(handed_in(corpus(), b"m", []), names), [
+    { name: b"size", handing: b"[lent] owned" },
+    { name: b"mirror", handing: b"[given] owned" },
+    { name: b"label", handing: b"[lent] borrowed(0 part)" },
+    { name: b"labels", handing: b"[lent] owned" },
+    { name: b"pick", handing: b"[lent, lent, lent] borrowed(1, 2)" },
+    { name: b"picked", handing: b"[given, given] owned" },
+    { name: b"stash", handing: b"[given] owned" },
+    { name: b"spin", handing: b"[lent, lent] owned" },
+    { name: b"ping", handing: b"[lent, lent] owned" },
+    { name: b"pong", handing: b"[lent, lent] owned" },
+    { name: b"pinged", handing: b"[given] owned" },
+  ])
+}
+
+test "lending costs no reuse: each body handed as inferred resets what it resets with every parameter given" {
+  let lendings = read_in(analysed(corpus()), b"m", []);
+  let handed = handings_of(lendings, Map::new()).handed;
+  let resets = |l: Lending, params: List<Handed>|
+    resets_in(owned(handed_as(l.f, params)).body).len();
+  let lost = lendings.fold([], |acc: List<RootName>, l: Lending|
+    match handed.get(l.def) {
+      Some(h) -> if resets(l, h.params) == resets(l, h.params.map(|_: Handed| Given)) { acc }
+      else { acc.push(l.def) },
+      None -> acc.push(l.def),
+    });
+  assert_eq(lost, []);
+  // The reuse is there to be lost: a tree rebuilt from the node a match found. A record rebuilt
+  // with one field changed is its leaves, which no block holds to reuse.
+  assert(
+    lendings.filter(|l: Lending| reset_params(l).len() > 0).map(|l: Lending| l.def).contains(
+      root_name(Named(b"m.mirror")),
+    ),
+  );
+  // Only a definition settled lending a counted parameter, whose body makes what takes cells, is
+  // counted for its resets; each of the rest gives every counted parameter or resets nothing.
+  assert_eq(
+    lendings.filter(|l: Lending| !may_reuse(l.whole)).filter(|l: Lending|
+      reset_params(l).len() > 0),
+    [],
+  )
+}
+
+test "every body written against the handings inferred for it and its callees is counted and passes the check" {
+  let a = analysed(corpus());
+  let s = set_out(a, b"m", []);
+  let forms = forms_in(s.setting, s.roots);
+  let handed = handings_of(lendings_of(declared_of(s.setting), forms), Map::new()).handed;
+  assert_eq(
+    forms.fold([], |acc: List<{ root: Bytes, why: Bytes }>, f: Fn|
+      match verified(owned(conventions(f, handed))) {
+        Some(why) -> acc.push({ root: root_text(root_name(f.key)), why: why }),
+        None -> acc,
+      }),
+    [],
+  )
+}
+
+test "a tail group lent as inferred passes the ownership check where a member hands another a value it made" {
+  let a = analysed(corpus());
+  let names = [b"m.hop", b"m.skip"];
+  let s = set_out(a, b"m", names);
+  let handed = handings_of(
+    lendings_of(declared_of(s.setting), forms_in(s.setting, s.roots)),
+    Map::new(),
+  ).handed;
+  let members = s.roots.fold([], |acc: List<{ root: Root, code: Code }>, r: Root|
+    match r.code { Ok(c) -> acc.push({ root: r, code: c }), Err(_) -> acc });
+  let group = match group_lowered(s.setting, members) {
+    Ok(f) -> f,
+    Err(no) -> panic(String::of_bytes_lossy(no.why)),
+  };
+  let checked = |params: (RootName) -> List<Handed>|
+    verified(
+      owned({
+        ..group,
+        members: group.members.map(|m: Member|
+          { ..m, conv: { ..m.conv, params: params(root_name(m.key)) } }),
+      }),
+    );
+  assert_eq(checked(|n: RootName| match handed.get(n) { Some(h) -> h.params, None -> [] }), None);
+  assert_eq(handings_said(handed, [b"hop", b"skip"]), [
+    { name: b"hop", handing: b"[given, lent] owned" },
+    { name: b"skip", handing: b"[given, lent] owned" },
+  ]);
+  // Lent where each member's body alone would lend them, the made value is refused at the jump.
+  assert(checked(|_: RootName| [Lent, Lent]) != None)
+}
+
+test "a function parameter its declaration does not lend is inferred as any other: lent where only called, given where held" {
+  assert_eq(
+    handings_said(handed_in(corpus(), b"m", []), [
+      b"twice",
+      b"apply_kept",
+      b"apply_step",
+      b"later",
+    ]),
+    [
+      { name: b"twice", handing: b"[lent, lent] owned" },
+      { name: b"apply_kept", handing: b"[lent, lent] owned" },
+      { name: b"apply_step", handing: b"[lent, lent] owned" },
+      { name: b"later", handing: b"[given] owned" },
+    ],
+  )
+}
+
+test "the prelude's map read and list read lend what they read, and answer an item they wrap afresh" {
+  let handed = handings_of(
+    read_in(analysed_as(prelude_module(), prelude_source::text()), prelude_module(), [
+      b"std.prelude.List::at",
+      b"std.prelude.Map::get",
+      b"std.prelude.found_under",
+    ]),
+    Map::new(),
+  ).handed;
+  // A key is compared over its encoding at a type the specialisations settle, which reads it. The
+  // `Option` each answers is open in its item's type, which some type boxes, so it is owned at every
+  // type.
+  assert_eq(said(handed, b"std.prelude.Map::get"), b"[lent, lent] owned");
+  assert_eq(said(handed, b"std.prelude.List::at"), b"[lent, lent] owned")
+}
+
+/// The variables the ownership pass resets anywhere in `b`, by number.
+fn resets_in(b: Block) -> List<Int> =
+  b.fold([], |acc: List<Int>, i: Inst|
+    match i {
+      Reset(r) -> acc.push(r.of.id),
+      If(x) -> acc.concat(resets_in(x.then)).concat(resets_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(
+          acc.concat(resets_in(c.rest)),
+          |a: List<Int>, arm: { when: Int, body: Block }| a.concat(resets_in(arm.body)),
+        ),
+      Match(m) ->
+        m.arms.fold(acc.concat(resets_in(m.rest)), |a: List<Int>, arm: Block|
+          a.concat(resets_in(arm))),
+      Loop(l) -> acc.concat(resets_in(l.body)),
+      Handle(h) -> acc.concat(resets_in(h.body)),
+      _ -> acc,
+    })

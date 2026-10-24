@@ -1,7 +1,8 @@
 //! Where a heap's objects live. A block is one object's memory. Blocks of one size fill a page,
 //! pages are cut from segments mapped from the operating system, and a block too big for a page is
 //! the system allocator's. A dead block is listed through its own second word; a page left with no
-//! live block serves any size next, and a segment left with no such page goes back.
+//! live block serves any size next, and a segment left with no such page goes back, kept mapped for
+//! the next heap that needs one while few are.
 
 use crate::vm;
 use std::alloc::{Layout, alloc, dealloc};
@@ -9,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::null_mut;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::{Mutex, PoisonError};
 
 /// A mapping's bytes, which it is aligned to, so a block's address names its segment and page.
 const SEGMENT: usize = 4 << 20;
@@ -23,6 +25,38 @@ const SPARES: usize = 32;
 const HEAD: usize = size_of::<Segment>().next_multiple_of(16);
 /// The bytes before a larger block, the first word of them naming its owner.
 const LEAD: usize = 16;
+/// The most segments kept mapped that no heap holds.
+const EMPTIED: usize = 64;
+
+/// Segments no heap holds, their headers zeros: a heap takes one before it maps one, so a heap that
+/// empties a segment and soon needs another, as a parallel branch's does, costs the system nothing.
+static EMPTIED_SEGMENTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+/// A segment whose header is zeros, or null when the system maps no more.
+fn segment_taken() -> *mut Segment {
+    let emptied = EMPTIED_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .pop();
+    match emptied {
+        Some(address) => address as *mut Segment,
+        None => unsafe { vm::map_aligned(SEGMENT) }.cast(),
+    }
+}
+
+/// Gives back a segment none of whose blocks any heap hands out again.
+unsafe fn segment_given(segment: *mut Segment) {
+    unsafe { segment.write_bytes(0, 1) };
+    let mut emptied = EMPTIED_SEGMENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if emptied.len() < EMPTIED {
+        emptied.push(segment.addr());
+        return;
+    }
+    drop(emptied);
+    unsafe { vm::unmap(segment.cast(), SEGMENT) };
+}
 
 /// What other threads hand back to a heap: dead blocks, each naming the next in its second word.
 #[derive(Default)]
@@ -76,6 +110,15 @@ pub fn block_of(class: usize) -> usize {
     }
     let k = class - 17;
     (9 + k % 8) << (k / 8 + 4)
+}
+
+/// The bytes of the block [`Blocks::take`] hands out for `bytes`.
+pub fn taken_bytes(bytes: usize) -> usize {
+    if bytes > SMALL {
+        bytes
+    } else {
+        block_of(class_of(bytes))
+    }
 }
 
 unsafe fn page_of(block: *mut u8) -> *mut Page {
@@ -323,10 +366,10 @@ impl Blocks {
         unsafe {
             let page = if self.spare.is_null() {
                 if self.clean.is_null() {
-                    let segment = vm::map_aligned(SEGMENT);
+                    let segment = segment_taken();
                     assert!(!segment.is_null(), "the heap is out of memory");
                     self.segments.insert(segment.addr());
-                    self.list(segment.cast());
+                    self.list(segment);
                 }
                 let page = self.clean;
                 unlink(&mut self.clean, page);
@@ -390,27 +433,14 @@ impl Blocks {
         }
     }
 
-    /// A page none of whose blocks is live leaves its class: kept as it is while few are, else let
-    /// go. Its segment goes back with it when that leaves the heap a segment's worth of others.
+    /// A page none of whose blocks is live leaves its class. Its segment goes back with it when that
+    /// leaves the heap a segment's worth of others.
     unsafe fn retire(&mut self, page: *mut Page) {
         unsafe {
             if (*page).listed {
                 unlink(&mut self.filling[(*page).class as usize], page);
             }
-            (*page).block = 0;
-            if self.spares < SPARES {
-                (*page).spare = true;
-                self.spares += 1;
-                push(&mut self.spare, page);
-            } else {
-                let (start, len) = room(page);
-                // A first page begins after the header, where the system's own pages need not.
-                if len == PAGE {
-                    vm::let_go(start, len);
-                }
-                push(&mut self.clean, page);
-            }
-            self.empty += 1;
+            self.shelve(page);
             let segment = segment_of(page);
             (*segment).held -= 1;
             if (*segment).held > 0 || self.empty < 2 * PAGES {
@@ -427,63 +457,77 @@ impl Blocks {
             }
             self.empty -= PAGES;
             self.segments.remove(&segment.addr());
-            vm::unmap(segment.cast(), SEGMENT);
+            segment_given(segment);
+        }
+    }
+
+    /// Lists a page none of whose blocks is live among the emptied: kept as it is while few are,
+    /// else let go.
+    unsafe fn shelve(&mut self, page: *mut Page) {
+        unsafe {
+            (*page).block = 0;
+            (*page).spare = self.spares < SPARES;
+            if (*page).spare {
+                self.spares += 1;
+                push(&mut self.spare, page);
+            } else {
+                let (start, len) = room(page);
+                // A first page begins after the header, where the system's own pages need not.
+                if len == PAGE {
+                    vm::let_go(start, len);
+                }
+                push(&mut self.clean, page);
+            }
+            self.empty += 1;
         }
     }
 
     /// Whether `address` is where a block this heap handed out begins.
     pub fn holds(&self, address: usize) -> bool {
+        self.bytes_at(address).is_some()
+    }
+
+    /// The bytes of the block at `address`, where one this heap handed out begins there.
+    pub fn bytes_at(&self, address: usize) -> Option<usize> {
         if !self.segments.contains(&(address & !(SEGMENT - 1))) {
-            return self.large.contains_key(&address);
+            return self.large.get(&address).copied();
         }
         unsafe {
             let page = page_of(address as *mut u8);
-            if (*page).block == 0 {
-                return false;
+            let block = (*page).block as usize;
+            if block == 0 {
+                return None;
             }
             let start = room(page).0.addr();
-            address >= start
+            (address >= start
                 && address < (*page).fresh.addr()
-                && (address - start).is_multiple_of((*page).block as usize)
+                && (address - start).is_multiple_of(block))
+            .then_some(block)
         }
     }
 
-    /// Whether `address` lies inside a block this heap handed out, where it may begin something held
-    /// in place.
-    pub fn within(&self, address: usize) -> bool {
-        if !self.segments.contains(&(address & !(SEGMENT - 1))) {
-            return self
-                .large
-                .range(..=address)
-                .next_back()
-                .is_some_and(|(start, bytes)| address < start + bytes);
-        }
-        unsafe {
-            let page = page_of(address as *mut u8);
-            (*page).block != 0 && address >= room(page).0.addr() && address < (*page).fresh.addr()
-        }
-    }
-
-    /// Every block handed out and not since emptied with its page, dead ones among them.
-    pub fn each(&self, mut f: impl FnMut(*mut u8)) {
+    /// Every block handed out and not since emptied with its page, dead ones among them, with its
+    /// bytes.
+    pub fn each(&self, mut f: impl FnMut(*mut u8, usize)) {
         unsafe {
             for &address in &self.segments {
                 let segment = address as *mut Segment;
                 for i in 0..PAGES {
                     let page = &raw mut (*segment).pages[i];
-                    if (*page).block == 0 {
+                    let bytes = (*page).block as usize;
+                    if bytes == 0 {
                         continue;
                     }
                     let mut block = room(page).0;
                     while block < (*page).fresh {
-                        f(block);
-                        block = block.add((*page).block as usize);
+                        f(block, bytes);
+                        block = block.add(bytes);
                     }
                 }
             }
         }
-        for &address in self.large.keys() {
-            f(address as *mut u8);
+        for (&address, &bytes) in &self.large {
+            f(address as *mut u8, bytes);
         }
     }
 
@@ -497,6 +541,28 @@ impl Blocks {
         pages * PAGE + self.large.values().sum::<usize>()
     }
 
+    /// The bytes of the emptied pages kept as they are, not let go, for the next page needed.
+    pub fn kept(&self) -> usize {
+        self.spares * PAGE
+    }
+
+    /// The bytes of the blocks handed out and not given back, each its size class's whole block: a
+    /// block another thread let go of counts until this heap takes it back.
+    pub fn live(&self) -> usize {
+        let pages: usize = self
+            .segments
+            .iter()
+            .map(|&address| unsafe {
+                (*(address as *mut Segment))
+                    .pages
+                    .iter()
+                    .map(|page| page.live as usize * page.block as usize)
+                    .sum::<usize>()
+            })
+            .sum();
+        pages + self.large.values().sum::<usize>()
+    }
+
     /// The bytes mapped for pages, in use or not.
     pub fn mapped(&self) -> usize {
         self.segments.len() * SEGMENT
@@ -507,29 +573,36 @@ impl Blocks {
         self.reused
     }
 
-    /// Takes over everything `other` holds: its blocks are this heap's from here on.
+    /// Takes over everything `other` holds: its blocks are this heap's from here on, and its pages
+    /// with no live block are kept, let go or given back as this heap's own would be.
     pub fn adopt(&mut self, mut other: Blocks) {
         unsafe {
-            for &address in &other.segments {
+            other.segments.retain(|&address| {
                 let segment = address as *mut Segment;
+                if (*segment).pages.iter().all(|page| page.live == 0) && self.empty >= PAGES {
+                    segment_given(segment);
+                    return false;
+                }
                 for i in 0..PAGES {
                     let page = &raw mut (*segment).pages[i];
-                    if (*page).block == 0 {
-                        if (*page).spare {
-                            self.spares += 1;
-                            push(&mut self.spare, page);
-                        } else {
-                            push(&mut self.clean, page);
+                    if (*page).live > 0 {
+                        (*page).owner.store(self.name(), Release);
+                        if (*page).listed {
+                            push_behind(&mut self.filling[(*page).class as usize], page);
                         }
+                    } else if (*page).block > 0 || (*page).spare {
+                        // A page the branch was filling holds no live block and was never retired.
+                        if (*page).block > 0 {
+                            (*segment).held -= 1;
+                        }
+                        self.shelve(page);
+                    } else {
+                        push(&mut self.clean, page);
                         self.empty += 1;
-                        continue;
-                    }
-                    (*page).owner.store(self.name(), Release);
-                    if (*page).listed {
-                        push_behind(&mut self.filling[(*page).class as usize], page);
                     }
                 }
-            }
+                true
+            });
             for (&address, &bytes) in &other.large {
                 owner(address as *mut u8, bytes).store(self.name(), Release);
             }
@@ -549,7 +622,7 @@ impl Blocks {
             let kept = self.segments.first().copied();
             self.segments.retain(|&address| {
                 if Some(address) != kept {
-                    vm::unmap(address as *mut u8, SEGMENT);
+                    segment_given(address as *mut Segment);
                 }
                 Some(address) == kept
             });
@@ -576,7 +649,7 @@ impl Drop for Blocks {
                 dealloc((address as *mut u8).sub(LEAD), large(bytes));
             }
             for &address in &self.segments {
-                vm::unmap(address as *mut u8, SEGMENT);
+                segment_given(address as *mut Segment);
             }
         }
     }

@@ -1,17 +1,10 @@
-//! What the emitter names a root: specialisations, written roots and the C symbols they print as.
+//! What the emitter calls a root by: the C symbols a root's name prints as, the id its sites name it
+//! by, and the runtime's helpers by name.
 
 import emit.code (hex)
 import syntax.items (member_of)
-import check.resolve.tables (qualify)
 import syntax.lexer (is_ident_continue)
-import check.infer.checker (test_owner, law_root)
-import check.types (Type, TyCon, spelled_type, type_spelled, read_types, digits)
-import front.published (module_of_root)
-import std.bin
-import std.list
 import std.bytes (ascii_of_int)
-import emit.layout (layouts)
-import emit.c (bytes_join)
 
 /// The id a body's failure sites name their root by: a digest of its name, so a body's C does not
 /// depend on which other roots the unit holds. Non-negative, since the C stores it in an `int64_t`.
@@ -40,169 +33,47 @@ pub fn builtin_helper(name: Bytes) -> Bytes / {abort.raise} =
     }
   }
 
-/// The roots written for containers beside those of `reflect`, `shown` and `digest`: `equal` and
-/// `ordered` of two, answering as `==` and `compare` do, and the loops the roots run from an index:
-/// over two containers for those, and over one, gathering what each item writes, for the others.
-pub fn container_ops() -> List<Bytes> =
-  [
-    b"equal",
-    b"equal_from",
-    b"ordered",
-    b"ordered_from",
-    b"reflect_from",
-    b"shown_from",
-    b"digest_from",
-    b"reflect_entries_from",
-    b"shown_entries_from",
-    b"digest_entries_from",
-  ]
+/// Whether `b` is a C identifier: a letter or `_` first, then letters, digits and `_`.
+fn c_identifier(b: Bytes) -> Bool / {abort.raise} =
+  b.len() > 0 && !(b.at(0) >= 48 && b.at(0) <= 57)
+    && range(0, b.len()).all(|i: Int| is_ident_continue(b.at(i)))
 
-/// The root that compares two values of the declared sum `t`.
-pub fn equality_root(t: Bytes) -> Bytes = t.concat(b"#eq")
+/// Whether `b` ends as a name's symbol does: `_` and 16 hex digits.
+fn ends_in_digest(b: Bytes) -> Bool / {abort.raise} =
+  b.len() > 17 && b.at(b.len() - 17) == 95
+    && range(b.len() - 16, b.len()).all(|i: Int|
+      (b.at(i) >= 48 && b.at(i) <= 57) || (b.at(i) >= 97 && b.at(i) <= 102))
 
-/// The root that orders two values of the declared sum `t`.
-pub fn ordering_root(t: Bytes) -> Bytes = t.concat(b"#cmp")
-
-/// The type whose values `root` compares, orders or reflects, where it is a root `equality_root`,
-/// `ordering_root` or `reflection_root` names: a declared sum by its name, a type reflected as it is
-/// spelled.
-pub fn derived_of(root: Bytes) -> Option<Bytes> / {abort.raise} =
-  if root.len() > 3 && root.slice(root.len() - 3, root.len()) == b"#eq" {
-    Some(root.slice(0, root.len() - 3))
-  } else if root.len() > 4 && root.slice(root.len() - 4, root.len()) == b"#cmp" {
-    Some(root.slice(0, root.len() - 4))
-  } else { match written_root_of(root) { Some(r) -> Some(spelled_type(r.ty)), None -> None } }
-
-/// The root that reflects a value of `ty`, as `reflect` or as `shown` does.
-pub fn reflection_root(module: Bytes, shown: Bool, ty: Type) -> Bytes / {abort.raise} =
-  written_root(module, if shown { b"shown" } else { b"reflect" }, ty)
-
-/// The root that writes `op` of a value of `ty`: its reflection as `reflect` or `shown` reads it, or
-/// the encoding `digest` hashes. A declared sum's is in the module declaring it, which says how it
-/// is shown and keyed, and any other type's in `module`.
-pub fn written_root(module: Bytes, op: Bytes, ty: Type) -> Bytes / {abort.raise} = {
-  let home = match ty {
-    TyCon(c) -> {
-      let dot = range(0, c.name.len()).fold(0 - 1, |acc: Int, i: Int|
-        if c.name.at(i) == 46 { i } else { acc });
-      if dot < 0 { module } else { c.name.slice(0, dot) }
-    },
-    _ -> module,
-  };
-  qualify(home, Bytes::concat_all([op, b"#", spelled_type(ty)]))
+test "every name spells a C identifier, and two names spell two symbols" {
+  // `m_a.b` and `m.a_b` share a stem, told apart by the digest.
+  let names = [
+    b"",
+    b"m_a.b",
+    b"m.a_b",
+    b"m.f",
+    b"m.f#requires#0",
+    b"m.f\xc3\xa9",
+    b"m.f@{a:Int}",
+    b"m.g",
+  ];
+  let symbols = names.map(symbol_of);
+  assert_eq(symbols.filter(|x: Bytes| !c_identifier(x) || !ends_in_digest(x)), []);
+  assert_eq(
+    range(0, symbols.len()).filter(|i: Int| symbols.drop(i + 1).contains(symbols.get(i))),
+    [],
+  );
+  // What the unit suffixes a symbol with ends as no name's symbol does.
+  let f = symbol_of(b"m.f");
+  let suffixed = [
+    entry_of(b"m.f"),
+    f.concat(b"_lambda0"),
+    f.concat(b"_group"),
+    f.concat(b"_lambda12_desc"),
+  ];
+  assert_eq(suffixed.filter(ends_in_digest), [])
 }
 
-/// The module a root `written_root` names is written in, what it writes, and the type it is written
-/// for; `None` for any other root.
-pub fn written_root_of(
-  root: Bytes,
-) -> Option<{ module: Bytes, op: Bytes, ty: Type }> / {abort.raise} =
-  match root.index_of(b"#") {
-    None -> None,
-    Some(h) -> {
-      let head = root.slice(0, h);
-      match [b"reflect", b"shown", b"digest"].concat(container_ops()).fold(
-          None,
-          |acc: Option<Bytes>, o: Bytes|
-            if head == o || head.ends_with(b".".concat(o)) { Some(o) } else { acc },
-        ) {
-        None -> None,
-        Some(op) -> match type_spelled(root.slice(h + 1, root.len())) {
-          None -> None,
-          Some(ty) ->
-            Some({ module: head.slice(0, max(0, head.len() - op.len() - 1)), op: op, ty: ty }),
-        },
-      }
-    },
-  }
-
-// --- Specialisation ----------------------------------------------------------------------------
-
-// A generic definition reached with a type argument laid out apart from a word is emitted again for
-// the layouts its arguments have, under a root that spells them: the body holds its values as their
-// own, reads a record's fields where its layout puts them and does its arithmetic with no witness.
-
-/// The root `full` is emitted under for type arguments laid out as `args` are.
-pub fn specialised(full: Bytes, args: List<Type>) -> Bytes =
-  Bytes::concat_all([full, b"@", bytes_join(args.map(spelled_type), b",")])
-
-/// `specialised`, and then each lambda the root runs where it calls parameter `param`, as
-/// `|param=owner:nth`.
-pub fn specialised_with(full: Bytes, args: List<Type>, fns: List<FnArg>) -> Bytes =
-  Bytes::concat_all(
-    [specialised(full, args)].concat(
-      fns.map(|f: FnArg|
-        Bytes::concat_all([b"|", ascii_of_int(f.param), b"=", f.owner, b":", ascii_of_int(f.nth)])),
-    ),
-  )
-
-/// The definition and layouts of the root `specialised` named; `None` for any other root.
-pub fn specialisation_of(
-  root: Bytes,
-) -> Option<{ base: Bytes, args: List<Type>, fns: List<FnArg> }> / {abort.raise} =
-  match root.index_of(b"@") {
-    None -> None,
-    // A lambda's owner may be a test, whose name holds a `#`; a definition's never does.
-    Some(at) -> if root.slice(0, at).index_of(b"#") != None { None } else {
-      let parts = root.slice(at + 1, root.len()).split(b"|");
-      let layouts = match parts.at(0) { Some(x) -> x, None -> b"" };
-      let fns = range(1, parts.len()).fold(Some([]), |acc: Option<List<FnArg>>, k: Int|
-        match acc {
-          None -> None,
-          Some(fs) -> match fn_arg_of(match parts.at(k) { Some(x) -> x, None -> b"" }) {
-            Some(f) -> Some(fs.push(f)),
-            None -> None,
-          },
-        });
-      match fns {
-        None -> None,
-        Some(fs) -> match if layouts.len() == 0 { Some([]) }
-          else { read_types(layouts, 0, [], layouts.len()) } {
-          Some(args) -> Some({ base: root.slice(0, at), args: args, fns: fs }),
-          None -> None,
-        },
-      }
-    },
-  }
-
-/// A lambda `specialised_with` spelled as `param=owner:nth`. The owner is a root's name, whose
-/// type arguments may hold a `:`, so the lambda's place is what follows the last one.
-fn fn_arg_of(spelled: Bytes) -> Option<FnArg> / {abort.raise} =
-  match spelled.index_of(b"=") {
-    None -> None,
-    Some(eq) -> {
-      let colon = range(eq + 1, spelled.len()).fold(0 - 1, |acc: Int, k: Int|
-        if spelled.at(k) == 58 { k } else { acc });
-      if eq == 0 || colon < 0 || colon + 1 >= spelled.len() { None } else {
-        Some({
-          param: digits(spelled.slice(0, eq)),
-          owner: spelled.slice(eq + 1, colon),
-          nth: digits(spelled.slice(colon + 1, spelled.len())),
-        })
-      }
-    },
-  }
-
-/// The definition a root runs: its own, or the one it specialises.
-pub fn own_definition(root: Bytes) -> Bytes / {abort.raise} =
-  match specialisation_of(root) { Some(s) -> s.base, None -> root }
-
-/// A literal lambda handed as argument `param`: the `nth` its owner root lowers. Where the owner
-/// stands in its module is no part of it, so a body kept for a definition names the same lambda
-/// wherever the definition moves.
-pub type FnArg = { param: Int, owner: Bytes, nth: Int }
-
-test "two names an underscore apart spell two symbols" {
-  assert_eq(symbol_of(b"m_a.b") == symbol_of(b"m.a_b"), false);
-  assert_eq(symbol_of(b"m.f"), b"ply_m_1f_1");
-  assert_eq(symbol_of(b"m.f#requires#0"), b"ply_m_1f_1requiresh80h1");
-  // A byte no C identifier holds takes the whole piece into hex.
-  assert_eq(symbol_of(b"m.f\xc3\xa9"), b"ply_m_166c3a9x6")
-}
-
-// --- the emitter's entry ----------------------------------------------------
-
-test "a long part of a name is its digest, so two long names alike at the start stay apart" {
+test "a symbol is short however long its name, and names alike past its stem stay apart" {
   let long = |tail: Bytes|
     Bytes::concat_all([
       b"m.f@{",
@@ -214,40 +85,14 @@ test "a long part of a name is its digest, so two long names alike at the start 
     ]);
   let a = symbol_of(long(b"x:Int"));
   let b = symbol_of(long(b"y:Int"));
-  assert(a != b);
-  assert(a.len() < 80);
-  // A short part is spelled in full.
-  assert(symbol_of(b"m.f@Float").index_of(hex(b"f@Float")) != None)
-}
-
-test "a symbol fits what a C compiler keeps, and two names alike past that stay apart" {
-  let long = |tail: Bytes|
-    Bytes::concat_all([
-      b"m.f",
-      Bytes::concat_all(
-        range(0, 30).map(|i: Int| Bytes::concat_all([b".part", ascii_of_int(i), b":x|y"])),
-      ),
-      tail,
-    ]);
-  let a = symbol_of(long(b".one"));
-  let b = symbol_of(long(b".two"));
-  assert(a != b);
-  assert(entry_of(long(b".one")).len() < 220);
-  assert_eq(a.slice(0, 120), b.slice(0, 120));
-  // One that fits is spelled whole.
-  assert_eq(symbol_of(b"m.f"), b"ply_m_1f_1")
-}
-
-test "a root is in the module its owner is in" {
-  assert_eq(module_of_root(b"app.cli.main"), b"app.cli");
-  assert_eq(module_of_root(b"app.cli.main#requires#0"), b"app.cli");
-  assert_eq(module_of_root(test_owner(b"app", b"a.b c")), b"app");
-  assert_eq(module_of_root(law_root(b"app", b"x.y", b"body")), b"app");
-  assert_eq(
-    module_of_root(specialised_with(b"app.g", [], [{ param: 1, owner: b"lib.h", nth: 0 }])),
-    b"app",
-  );
-  assert_eq(module_of_root(b"main"), b"")
+  assert(a != b, None);
+  assert_eq([a.len(), b.len()], [4 + stem_room() + 17, 4 + stem_room() + 17]);
+  // The stem is the name's start, so a profile or a debugger shows what the symbol is of.
+  assert(a.starts_with(b"ply_m_f_f0_Float_f1_"), None);
+  assert(symbol_of(b"std.prelude.drop#List<Int>").starts_with(b"ply_std_prelude_drop_List_"), None);
+  // One name is one symbol, whatever its bytes were made of.
+  let n = long(b"x:Int");
+  assert_eq(symbol_of(n.slice(0, 300).concat(n.slice(300, n.len()))), a)
 }
 
 /// The builtin a name in code the emitter writes from a type calls: `?` and the builtin's name,
@@ -259,63 +104,28 @@ pub fn generated_builtin(name: Bytes) -> Bytes =
   else if name == b"?concat" { b"Bytes::concat_all" }
   else { name }
 
-derive bin for FnArg
+/// The C symbol a full name becomes: `ply_`, a stem of the name readable in a profile or a
+/// debugger, `_` and the first 16 hex digits of the name's blake3. The stem is the name's first
+/// bytes, each run of bytes no C identifier holds written as one `_`, cut to `stem_room`; the digest
+/// tells apart names alike that far, two of a program's symbols alike failing to link rather than
+/// running wrong. Every symbol ends in `_` and 16 hex digits, which nothing the unit suffixes
+/// (`_entry`, `_lambda0`, `_group`) and nothing the runtime or the head names (`ply_bind`) does, so
+/// no suffixed symbol is a name's own.
+pub fn symbol_of(full: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all([b"ply_", stem_of(full), b"_", hex(full.blake3().slice(0, 8))])
 
-/// The C symbol a full name becomes: the name cut on its dots and its `#`s, each piece written as
-/// its bytes, a mode byte (`_` after a dot, `h` after a `#`, `x` and `y` for the same two with the
-/// bytes in hex, which a piece holding a byte no C identifier carries takes) and their length.
-/// Bytes lead, so symbols collate as their names do and a definition added to a program leaves the
-/// code-table ranks before it alone. Every symbol ends in a length behind its mode byte, which
-/// nothing suffixed (`_entry`, `_lambda0`, `_group`) and nothing the runtime names (`ply_bind`)
-/// does, so no two names spell one symbol and no suffixed symbol is a name's own. A C compiler
-/// may cut a long symbol short, so one past `symbol_room` is its start and the digest of the
-/// whole behind a mode byte of its own (`q`): two names alike that far stay apart.
-pub fn symbol_of(full: Bytes) -> Bytes / {abort.raise} = {
-  let whole = mangled(full, 0, 0, 46, b"");
-  if whole.len() <= symbol_room() { b"ply_".concat(whole) } else {
-    Bytes::concat_all([
-      b"ply_",
-      whole.slice(0, symbol_room() - 40),
-      hex(whole.blake3().slice(0, 16)),
-      b"q",
-      ascii_of_int(whole.len()),
-    ])
-  }
-}
+/// How many bytes of a name a symbol's stem keeps.
+fn stem_room() -> Int = 24
 
-/// The longest a symbol is written whole: what is suffixed to one still fits in the 255 bytes the
-/// shortest-keeping C compiler this is built with reads.
-fn symbol_room() -> Int = 200
+/// The first bytes of `full` a C identifier holds, each run of others one `_`, at most `stem_room`.
+fn stem_of(full: Bytes) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    range(0, min(full.len(), 4 * stem_room())).fold([], |acc: List<Bytes>, i: Int|
+      if acc.len() >= stem_room() { acc }
+      else if is_ident_continue(full.at(i)) { acc.push(full.slice(i, i + 1)) }
+      else if acc.len() > 0 && acc.get(acc.len() - 1) == b"_" { acc }
+      else { acc.push(b"_") }),
+  )
 
 /// The symbol the loader binds a definition by, which is also its memo slot.
 pub fn entry_of(full: Bytes) -> Bytes / {abort.raise} = symbol_of(full).concat(b"_entry")
-
-/// `start` opens the piece being scanned and `delim` is the byte that opened it.
-fn mangled(name: Bytes, start: Int, at: Int, delim: Int, acc: Bytes) -> Bytes / {abort.raise} =
-  if at >= name.len() { acc.concat(mangled_part(name.slice(start, at), delim)) }
-  else if name.at(at) == 46 || name.at(at) == 35 {
-    mangled(
-      name,
-      at + 1,
-      at + 1,
-      name.at(at),
-      acc.concat(mangled_part(name.slice(start, at), delim)),
-    )
-  } else { mangled(name, start, at + 1, delim, acc) }
-
-fn mangled_part(part: Bytes, delim: Int) -> Bytes / {abort.raise} =
-  if c_ident_bytes(part, 0) {
-    Bytes::concat_all([part, if delim == 35 { b"h" } else { b"_" }, ascii_of_int(part.len())])
-  } else if part.len() > 48 {
-    // A C compiler may cut a long symbol short, so a long part is its digest.
-    let digest = hex(part.blake3().slice(0, 16));
-    Bytes::concat_all([digest, if delim == 35 { b"w" } else { b"z" }, ascii_of_int(part.len())])
-  } else {
-    let hexed = hex(part);
-    Bytes::concat_all([hexed, if delim == 35 { b"y" } else { b"x" }, ascii_of_int(hexed.len())])
-  }
-
-fn c_ident_bytes(part: Bytes, i: Int) -> Bool / {abort.raise} =
-  if i >= part.len() { true }
-  else if is_ident_continue(part.at(i)) { c_ident_bytes(part, i + 1) }
-  else { false }

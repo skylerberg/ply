@@ -8,9 +8,10 @@ import emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, N
                   NPerform, NLabel, NLambda, NSimulate, NParallel, NHandle, NField, NUpdate, NKnown,
                   CodeField, CodeArm, CodeClause, CodeStmt, CLet, CLetPat, CDo, CodePattern,
                   CodePatternField, Capture, PxCtor, PxRecord, PxList, lower_fn)
-import check.types (Scheme, TyFn, TyVar, scheme_text, int_type, unit_type, tables_joined, type_at,
-                    HeldType, held_type_bin, types_held, types_of)
-import check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify)
+import check.types (Scheme, TyFn, TyVar, scheme_text, int_type, unit_type, type_at, HeldType,
+                    held_type_bin, types_held, types_of)
+import check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify,
+                             module_of_name)
 import check.resolve (ResolveSucceeded, ResolveFailed)
 import check.resolve.scopes (find)
 import check.resolve.defaults (seeing_all)
@@ -24,8 +25,9 @@ import check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_root_fact
                     Elaboration)
 import check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder, LabelSite,
                             TypedSite, TrySite, MemberSite, UpdateShape, WitnessOp, WitnessRef,
-                            test_owner, is_test_owner, cases_root, witnessed, Builtin, builtins)
+                            witnessed, Builtin, builtins)
 import check.infer.definitions (natives_of)
+import emit.keys (test_owner, test_key)
 import check.termination (Ends)
 import check.semantics (prelude_iterates)
 import check.lent (Passed)
@@ -94,79 +96,56 @@ pub fn rows_of(analysis: Analysis) -> Rows / {abort.raise} =
   rows_from(analysis.checked, analysis.hashes)
 
 /// What an analysis's check read beside each body's own row, as its answer carries it.
-pub fn walked_facts(analysis: Analysis) -> WalkedFacts =
+pub fn walked_facts(analysis: Analysis) -> WalkedFacts / {abort.raise} =
   walked_of(analysis.mods.map(|parsed: ParsedModule| parsed.name), analysis.checked)
 
-/// The modules a wanted root is in, which are the only ones lowered; `None` lowers them all.
-pub fn lowered_modules(
-  wanted: Option<Map<Bytes, Bool>>,
-) -> Option<Map<Bytes, Bool>> / {abort.raise} =
-  match wanted {
-    None -> None,
-    Some(w) ->
-      Some(
-        w.fold(Map::new(), |acc: Map<Bytes, Bool>, root: Bytes, _: Bool|
-          acc.insert(module_of_root(root), true)),
-      ),
-  }
+/// The roots a lowering wants, by name, and the modules it lowers them in, the only ones lowered.
+pub type Wanted = { roots: Map<Bytes, Bool>, modules: Map<Bytes, Bool> }
 
 pub fn lowers(lowered: Option<Map<Bytes, Bool>>, module: Bytes) -> Bool =
   match lowered { None -> true, Some(m) -> m.contains(module) }
 
-/// A clause's, test's or law's root is its owner's name then `#`, a specialisation's its
-/// definition's then `@`, and a generic sum's comparison its type's then `<`; a module is a name
-/// less its last segment.
-pub fn module_of_root(root: Bytes) -> Bytes / {abort.raise} = {
-  let cut = [b"#", b"@", b"<"].fold(root.len(), |at: Int, mark: Bytes|
-    match root.index_of(mark) { Some(i) -> if i < at { i } else { at }, None -> at });
-  let owner = root.slice(0, cut);
-  let dot = range(0, owner.len()).fold(0 - 1, |acc: Int, i: Int|
-    if owner.at(i) == 46 { i } else { acc });
-  if dot < 0 { b"" } else { owner.slice(0, dot) }
-}
-
 type Gathered = { facts: RootFacts, missing: Option<Bytes> }
+
+/// `f`, a body's facts, gathered into `g`'s.
+fn joined_facts(g: RootFacts, f: RootFacts) -> RootFacts =
+  {
+    label_sites: g.label_sites.concat(f.label_sites),
+    updates: g.updates.concat(f.updates),
+    ops: g.ops.concat(f.ops),
+    refs: g.refs.concat(f.refs),
+    tries: g.tries.concat(f.tries),
+    members: g.members.concat(f.members),
+    typed: g.typed.concat(f.typed),
+    types: types_joined(g.types, f.types),
+  }
 
 fn gathered(
   g: Gathered,
   owner: Bytes,
   filed: Option<Bytes>,
   module: Int,
-  start: Int,
 ) -> Gathered / {abort.raise} =
   match g.missing {
     Some(_) -> g,
     None -> match filed {
       None -> { ..g, missing: Some(owner) },
-      Some(bytes) -> match facts_at(bytes, module, start, owner) {
+      Some(bytes) -> match facts_at(bytes, module, owner) {
         None -> { ..g, missing: Some(owner) },
-        Some(f) ->
-          {
-            ..g,
-            facts: {
-              label_sites: g.facts.label_sites.concat(f.label_sites),
-              updates: g.facts.updates.concat(f.updates),
-              ops: g.facts.ops.concat(f.ops),
-              refs: g.facts.refs.concat(f.refs),
-              tries: g.facts.tries.concat(f.tries),
-              members: g.facts.members.concat(f.members),
-              typed: g.facts.typed.concat(f.typed),
-              types: types_joined(g.facts.types, f.types),
-            },
-          },
+        Some(f) -> { ..g, facts: joined_facts(g.facts, f) },
       },
     },
   }
 
 /// What the front end's check read of the bodies lowered here, on the indices their modules have
-/// here: each wanted body's facts from its row, placed where its definition now starts, and what
-/// the answer carries beside the rows. A wanted body the answer holds no facts for is not lowered
-/// from a guess; one that is not wanted needs none, and a module the front end read cut has tests
-/// the answer never held.
+/// here: each wanted body's facts from its row, and each law's the answer carries beside the rows.
+/// A wanted body the answer holds no facts for is not lowered from a guess; one that is not wanted
+/// needs none, and a module the front end read cut has tests the answer never held. `None` wants
+/// every body, in every module.
 pub fn facts_read(
   rows: Rows,
   w: WalkedFacts,
-  wanted: Option<Map<Bytes, Bool>>,
+  wanted: Option<Wanted>,
   mods: List<ParsedModule>,
 ) -> Result<EmitFacts, Bytes> / {abort.raise} = {
   let here = range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
@@ -177,25 +156,32 @@ pub fn facts_read(
     acc.insert(row.name, row.facts));
   let tests = rows.tests.fold(Map::new(), |acc: Map<Bytes, Bytes>, row: KnownTestRow|
     acc.insert(row.owner, row.facts));
-  // A clause's and a law's sites are walked afresh by every check, so they come as they stand.
-  let loose: RootFacts = {
-    label_sites: w.loose.label_sites.fold([], |acc: List<LabelSite>, x: LabelSite|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    updates: w.loose.updates.fold([], |acc: List<UpdateShape>, x: UpdateShape|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    ops: w.loose.ops.fold([], |acc: List<WitnessOp>, x: WitnessOp|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    refs: w.loose.refs.fold([], |acc: List<WitnessRef>, x: WitnessRef|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    tries: w.loose.tries.fold([], |acc: List<TrySite>, x: TrySite|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    members: w.loose.members.fold([], |acc: List<MemberSite>, x: MemberSite|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    typed: w.loose.typed.fold([], |acc: List<TypedSite>, x: TypedSite|
-      match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-    types: tables_joined(rows.types, w.loose.types),
-  };
-  let lowered = lowered_modules(wanted);
+  // A law's sites are walked afresh by every check, so they come as they stand.
+  let loose = w.loose.fold(
+    { ..no_root_facts(), types: rows.types },
+    |acc: RootFacts, l: { owner: Bytes, facts: RootFacts }| {
+      let f = l.facts;
+      joined_facts(acc, {
+        ..f,
+        label_sites: f.label_sites.fold([], |a: List<LabelSite>, x: LabelSite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        updates: f.updates.fold([], |a: List<UpdateShape>, x: UpdateShape|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        ops: f.ops.fold([], |a: List<WitnessOp>, x: WitnessOp|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        refs: f.refs.fold([], |a: List<WitnessRef>, x: WitnessRef|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        tries: f.tries.fold([], |a: List<TrySite>, x: TrySite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        typed: f.typed.fold([], |a: List<TypedSite>, x: TypedSite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+      })
+    },
+  );
+  let roots = match wanted { None -> None, Some(x) -> Some(x.roots) };
+  let lowered = match wanted { None -> None, Some(x) -> Some(x.modules) };
   let read = range(0, mods.len()).fold({ facts: loose, missing: None }, |g: Gathered, i: Int| {
     let m = mods.get(i);
     if !lowers(lowered, m.name) { g } else {
@@ -203,14 +189,11 @@ pub fn facts_read(
         match item {
           IFn(d) -> {
             let owner = qualify(m.name, d.name.name);
-            if !wants(wanted, owner) { acc }
-            else { gathered(acc, owner, defs.get(owner), i, d.span.start) }
+            if !wants(roots, owner) { acc } else { gathered(acc, owner, defs.get(owner), i) }
           },
           ITest(d) -> {
             let owner = test_owner(m.name, d.name);
-            let listed = d.cases != None && wants(wanted, cases_root(owner));
-            if !wants(wanted, owner) && !listed { acc }
-            else { gathered(acc, owner, tests.get(owner), i, d.span.start) }
+            if !wants(roots, owner) { acc } else { gathered(acc, owner, tests.get(owner), i) }
           },
           _ -> acc,
         })
@@ -290,7 +273,7 @@ pub fn interfaces_among(
 
 /// The encoding a body's bytes and their envelope are written in; a body filed under another is
 /// not read back.
-pub fn body_encoding() -> Int = 8
+pub fn body_encoding() -> Int = 9
 
 /// Every body hashing answered, each under the hash it verifies as: a name's one body answers for
 /// each hash the name has, and a `fn` and a declaration sharing a name have a body each.
@@ -352,7 +335,7 @@ fn with_prelude_module(
   pkgs: List<PackageDeps>,
   module_packages: List<Int>,
   shipped: Int,
-) -> { sources: List<Source>, module_packages: List<Int> } / {abort.raise} = {
+) -> { sources: List<Source>, module_packages: List<Int> } = {
   let read = with_prelude_source(sources);
   {
     sources: read,
@@ -533,8 +516,8 @@ pub fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome /
 }
 
 /// The calls on values made by each body `checked` published from its rows rather than walked, as
-/// its row filed them, placed where its definition or test in `mods` now starts; and each of those
-/// whose row filed no calls, whose body's calls no check here found.
+/// its row filed them, in its module's place in `mods`; and each of those whose row filed no calls,
+/// whose body's calls no check here found.
 fn kept_calls(
   mods: List<ParsedModule>,
   checked: CheckOutput,
@@ -549,15 +532,15 @@ fn kept_calls(
         acc,
         |a: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, item: Item| {
           let at = match item {
-            IFn(d) -> Some({ owner: qualify(m.name, d.name.name), start: d.span.start }),
-            ITest(d) -> Some({ owner: test_owner(m.name, d.name), start: d.span.start }),
+            IFn(d) -> Some({ owner: qualify(m.name, d.name.name) }),
+            ITest(d) -> Some({ owner: test_owner(m.name, d.name) }),
             _ -> None,
           };
           match at {
             None -> a,
             Some(x) -> match kept.get(x.owner) {
               None -> a,
-              Some(filed) -> match facts_at(filed, i, x.start, x.owner) {
+              Some(filed) -> match facts_at(filed, i, x.owner) {
                 None -> a,
                 Some(f) ->
                   { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner, true) },
@@ -606,7 +589,7 @@ fn prelude_cut(
   parsed: List<ParsedSource>,
   h: Hashed,
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
-  let own = |name: Bytes| module_of_root(name) == prelude_module();
+  let own = |name: Bytes| module_of_name(name) == prelude_module();
   let roots = h.hashes.defs.fold([], |acc: List<Which>, d: { name: Bytes, hash: Bytes }|
     if own(d.name) { acc } else { acc.push(TheFn(d.name)) }).concat(
     h.index.nodes.fold([], |acc: List<Which>, n: Node|
@@ -991,8 +974,8 @@ pub type ClaimClause = { kind: SpecKind, clause: Lowered }
 
 fn lowered(r: Resolved, m: Int, params: List<Bytes>, expr: Expr) -> Option<Code> / {abort.raise} =
   match lower_fn(params, [], Map::new(), expr) {
-    Some(l) -> Some(named(r, m, l.code)),
-    None -> None,
+    Ok(l) -> Some(named(r, m, l.code)),
+    Err(_) -> None,
   }
 
 fn lowered_at(
@@ -1445,7 +1428,7 @@ test "the types a body binds and uses are filed by key, read from one table the 
       let rows = rows_of(w);
       let sites = |name: Bytes|
         match rows.defs.find(|r: KnownDefRow| r.name == name) {
-          Some(r) -> match facts_at(r.facts, 0, 0, b"") { Some(f) -> f, None -> no_root_facts() },
+          Some(r) -> match facts_at(r.facts, 0, b"") { Some(f) -> f, None -> no_root_facts() },
           None -> no_root_facts(),
         };
       let read = |k: Bytes| type_at(rows.types, k, Map::new()).ty;
@@ -1478,15 +1461,16 @@ test "a test's root is named by its module and its label, in the program's test 
       ]),
     ),
   );
-  assert_eq(d.emitter_roots.map(|r: EmitterRoot| r.root).filter(is_test_owner), [
+  let tested = d.tests.map(|t: TestRow| test_owner(t.module, t.name));
+  assert_eq(d.emitter_roots.map(|r: EmitterRoot| r.root).filter(|r: Bytes| tested.contains(r)), [
     test_owner(b"a", b"first"),
     test_owner(b"a", b"second"),
     test_owner(b"b", b"third"),
   ]);
   assert_eq(range(0, 4).map(|i: Int| test_root_at(d, i)), [
-    Some(test_owner(b"a", b"first")),
-    Some(test_owner(b"a", b"second")),
-    Some(test_owner(b"b", b"third")),
+    Some(test_key(b"a", b"first")),
+    Some(test_key(b"a", b"second")),
+    Some(test_key(b"b", b"third")),
     None,
   ]);
   assert_eq(d.tests.map(|t: TestRow| Bytes::concat_all([t.module, b".", t.name])), [
@@ -1555,6 +1539,7 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
   let src = Bytes::concat_all([
     b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n",
     b"pub fn k(xs: List<Int>) -> Option<Int> / {abort.raise} = xs.set(0, 1).push(2).at(0)\n",
+    b"pub fn l(a: Array<Int>, c: Columns<{ x: Int }>) -> Int = a.to_list().len() + c.to_list().len()\n",
     b"fn e(o: Option<{ key: Int, value: Int }>) -> Int = match o { Some(x) -> x.key, None -> 0 }\n",
     b"fn p(o: Option<{ key: Int, value: Int, rest: Map<Int, Int> }>) -> Int = match o { Some(x) -> x.rest.len(), None -> 0 }\n",
     b"pub fn n(m: Map<Int, Int>) -> Int = m.remove(1).insert(2, 3).update(2, |v: Int| v + 1).fold(0, |s: Int, k: Int, v: Int| s + k + v) + m.keys().len() + m.values().len() + m.entries().len() + Map::of_entries(m.entries()).merge(m).len() + e(m.first()) + e(m.last()) + e(m.floor(1)) + e(m.ceiling(1)) + e(m.below(1)) + e(m.above(1)) + p(m.pop_first()) + p(m.pop_last()) + m.range(None, true, None, true, 3).len() + (if m.contains(1) { 1 } else { 0 }) + m.split(1).below.len() + match m.get(1) { Some(v) -> v, None -> 0 }\n",
@@ -1571,7 +1556,7 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
       // The prelude's loops read `List::at` answering `Some` as any module does, so each ends.
       assert_eq(
         w.checked.defs.filter(|d: DefInfo|
-          module_of_root(d.name) == prelude_module() && d.ending != Ends).map(|d: DefInfo| d.name),
+          module_of_name(d.name) == prelude_module() && d.ending != Ends).map(|d: DefInfo| d.name),
         [],
       )
     },

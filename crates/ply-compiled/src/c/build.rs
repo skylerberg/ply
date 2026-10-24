@@ -19,18 +19,21 @@ use std::sync::atomic::AtomicI64;
 
 /// A loaded C unit, with the surface `crate::backend::Bodies` asks a compiled unit for.
 pub struct Native {
-    /// Kept alive because every [`Entry`] and the descriptor below point into its pages.
-    _lib: Library,
     /// The definitions the unit holds, read where its C lays them out. The library they lie in
     /// is this unit's own, which is all that makes the lifetime true.
     unit: &'static Descriptor,
     constants: HashMap<String, usize>,
+    /// Each root the unit is entered at through its `R#entered`, with that definition's entry.
+    entered: HashMap<String, Entry>,
     tables: Arc<Tables>,
+    /// Kept alive because every [`Entry`], the descriptor and the unit's static data point into its
+    /// pages. Last, so it is unmapped after everything here that may hold a word of it.
+    _lib: Library,
 }
 
-fn entry_of(row: &TakenRow) -> Entry {
+fn entry_of(row: &TakenRow) -> Option<Entry> {
     // SAFETY: a unit defines each entry it names as a function of an entry's type.
-    unsafe { std::mem::transmute::<*mut c_void, Entry>(row.entry()) }
+    (row.entry()).map(|entry| unsafe { std::mem::transmute::<*mut c_void, Entry>(entry) })
 }
 
 impl Native {
@@ -42,11 +45,34 @@ impl Native {
     }
 
     pub fn entry(&self, name: &str) -> Option<Entry> {
-        self.unit.taking(name).map(entry_of)
+        self.unit.taking(name).and_then(entry_of)
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
         self.unit.taking(name).map(TakenRow::arity)
+    }
+
+    /// Whether the unit is entered through its roots' `R#entered`, its arguments and answer
+    /// crossing encoded, rather than with words.
+    pub fn encoded(&self) -> bool {
+        !self.entered.is_empty()
+    }
+
+    /// The entry of `R#entered` for the root `name`, which takes no words.
+    pub fn entered(&self, name: &str) -> Option<Entry> {
+        self.entered.get(name).copied()
+    }
+
+    /// Whether the root `name` can be entered: any root of a unit entered with words, and of one
+    /// entered encoded each that has its `R#entered`.
+    pub fn enterable(&self, name: &str) -> bool {
+        !self.encoded() || self.entered.contains_key(name)
+    }
+
+    /// Each root the unit is entered at through its `R#entered`: a generic one's entry calls a
+    /// specialisation, so the root itself may be no body the unit holds.
+    pub fn entered_names(&self) -> Vec<String> {
+        self.entered.keys().cloned().collect()
     }
 
     /// The memo index of a pure nullary root, if `name` is one.
@@ -131,7 +157,24 @@ fn finish(
         instances,
         numerics,
         layout,
+        entered,
     } = exports;
+    let entered = entered
+        .into_iter()
+        .map(|root| {
+            let through = format!("{root}#entered");
+            let row = unit.taking(&through);
+            match (row.map(TakenRow::arity), row.and_then(entry_of)) {
+                (Some(0), Some(entry)) => Ok((root, entry)),
+                (Some(arity), _) if arity != 0 => bail!(
+                    "`{through}` takes {arity} words, where `{root}` is entered through it with none"
+                ),
+                _ => {
+                    bail!("`{root}` is entered through `{through}`, which the unit does not take")
+                }
+            }
+        })
+        .collect::<Result<HashMap<_, _>>>()?;
     bind(unit, &helpers);
     let Some(held) = UnitTables::from_tables(ctors, consts, fields, builtins, &shapes, layout)
     else {
@@ -153,7 +196,9 @@ fn finish(
     let taking = |function: &str, takes: usize| match (function, unit.taking(function)) {
         ("-", _) => Ok(Stated::No),
         (_, None) => Ok(Stated::Absent),
-        (_, Some(row)) if row.arity() == takes => Ok(Stated::By(entry_of(row) as usize)),
+        (_, Some(row)) if row.arity() == takes => {
+            Ok(entry_of(row).map_or(Stated::Absent, |entry| Stated::By(entry as usize)))
+        }
         (name, Some(row)) => bail!(
             "`{name}` is stated of a type and takes {} words, where it is called with {takes}",
             row.arity()
@@ -191,6 +236,7 @@ fn finish(
         _lib: lib,
         unit,
         constants: constants.into_iter().collect(),
+        entered,
         tables: Arc::new(tables),
     })
 }

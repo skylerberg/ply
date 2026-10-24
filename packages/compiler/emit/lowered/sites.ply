@@ -1,0 +1,267 @@
+//! Types by node: every node a body is lowered from stands at a site of its own in its item, what the
+//! checker filed of it is read there, and the shapes whose nodes once shared a place lower clean.
+
+import syntax.parsing (Span, dummy_span)
+import syntax.patterns (LInt)
+import syntax.items (Item, ITest, test_run, test_listing)
+import syntax.exprs (Expr, ELit, EBinary, expr_span)
+import expand.rewrite.shared (picked_in)
+import std.bytes (ascii_of_int)
+import check.types (Type, int_type, bool_type, list_type, type_text)
+import check.resolve.tables (ParsedModule, Diag)
+import check.infer (expanded_mods, item_owner)
+import check.infer.checker (TypedSite)
+import front (analyse_pulling_std_with)
+import front.seam (Analysed, Refused)
+import front.published (facts_read, rows_of, walked_facts, no_rows)
+import front.facts (Analysis)
+import emit.code (head, lower_fn)
+import emit.compare (program_of, formed, answered_by_form)
+import emit.keys (RootKey, Named, Cases, Clause, ClauseKind, Requires, Ensures, LawPart, LawGuard,
+                  LawBody, test_key, law_key)
+import emit.lower.setting (Root, facts_by_item)
+import emit.typing (Typed, filings, no_filings)
+
+type Shared = { owner: Bytes, site: Int, heads: List<Bytes> }
+
+/// Each site of an item of module `m` of `a`, written out as the emitter lowers it, two nodes of
+/// different heads stand at, a test's run and listing taken together.
+fn shared_sites(a: Analysis) -> List<Shared> / {abort.raise} =
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(facts) -> {
+      let mods = expanded_mods(a.mods, facts.elaboration, a.r.signatures);
+      let m = mods.fold(None, |acc: Option<ParsedModule>, x: ParsedModule|
+        if x.name == b"m" { Some(x) } else { acc });
+      match m {
+        None -> panic("no module m"),
+        Some(written) ->
+          written.module.items.fold([], |acc: List<Shared>, item: Item| {
+            let trees = match item {
+              ITest(t) -> match t.cases {
+                Some(c) ->
+                  [
+                    ITest({ ..t, cases: None, body: test_run(t) }),
+                    ITest({ ..t, cases: None, body: test_listing(c) }),
+                  ],
+                None -> [item],
+              },
+              _ -> [item],
+            };
+            let nodes = trees.flat_map(|x: Item|
+              picked_in({ ..written.module, items: [x] }, |_: Expr| true));
+            let by_site = nodes.fold(Map::new(), |held: Map<Int, List<Bytes>>, e: Expr| {
+              let s = expr_span(e).site;
+              held.insert(s, match held.get(s) {
+                Some(hs) -> hs.push_unique(head(e)),
+                None -> [head(e)],
+              })
+            });
+            by_site.fold(acc, |out: List<Shared>, s: Int, hs: List<Bytes>|
+              if hs.len() < 2 { out }
+              else { out.push({ owner: item_owner(b"m", item), site: s, heads: hs }) })
+          }),
+      }
+    },
+  }
+
+/// `std.cases` as far as a test over cases, once expanded, calls it.
+fn cases_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.cases",
+    src: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} =\n",
+      b"  table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} =\n",
+      b"  match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  }
+
+/// A tag whose literals hold holes: its check reads the texts, and `fill` the texts and the holes.
+fn tag_module() -> { name: Bytes, src: Bytes } =
+  {
+    name: b"std.tg",
+    src: Bytes::concat_all([
+      b"pub fn literal(text: String) -> Result<String, { message: String, offset: Int }> = Ok(text)\n",
+      b"pub fn compile(texts: List<String>) -> Result<List<String>, { message: String, offset: Int, part: Int }> = Ok(texts)\n",
+      b"pub fn fill(texts: List<String>, holes: List<Int>) -> Int = texts.len() + holes.len()\n",
+    ]),
+  }
+
+/// A module that writes every node the rewrites make once its items are numbered: a holed tagged
+/// literal, a call on a value copying a default, an update of a call's record, a `try`, a hold, a
+/// handler's variables read by what a clause hands on, a witness passed and read, and a test over
+/// cases.
+fn every_maker() -> Bytes =
+  Bytes::concat_all([
+    b"import std.tg\n",
+    b"type Box = | Box(Int)\n",
+    b"type P = { x: Int, y: Int }\n",
+    b"effect parse {\n  raise bad(why: String)\n}\n",
+    b"effect e {\n  write op(k: Int) -> Int\n}\n",
+    b"fn Box::size(b: Box, extra: Int = 2) -> Int = match b { Box(v) -> v + extra }\n",
+    b"fn mk() -> P = { x: 1, y: 2 }\n",
+    b"fn digit(b: Int) -> Int / {parse.bad} = if b < 10 { b } else { parse.bad(\"no\") }\n",
+    b"fn twice<a>(x: a) -> a where numeric(a) = x + x\n",
+    b"fn holed(n: Int) -> Int = tg\"a {n} b {n + 1}\"\n",
+    b"fn sized(b: Box) -> Int = b.size()\n",
+    b"fn moved() -> P = { ..mk(), x: 3 }\n",
+    b"fn tried(b: Int) -> Result<Int, String> = try { digit(b) }\n",
+    b"fn held() -> Int = with_hold[r](1, |x: Int| ()) { h -> 7 }\n",
+    b"fn counted() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; let f = |j: Int| j + n; f(1) }, return x -> x + n }\n",
+    b"fn doubled() -> Int = twice(3)\n",
+    b"test \"each case is positive\" for c: Int in [1, 2] { assert(c > 0) }\n",
+  ])
+
+fn analysed(src: Bytes) -> Analysis / {abort.raise} =
+  match analyse_pulling_std_with(
+      [{ name: b"m", src: src }],
+      [tag_module(), cases_module()],
+      no_rows(),
+    ).out {
+    Analysed(a) -> a,
+    Refused(ds) -> panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diag| d.message), b"\n"))),
+  }
+
+test "no two nodes of an item share a site, whatever wrote them out" {
+  assert_eq(shared_sites(analysed(every_maker())), [])
+}
+
+/// Whether a build writes root `root` of module `m` of text `src`, or why not.
+fn built(src: Bytes, root: RootKey) -> Result<Bool, Bytes> / {abort.raise} =
+  match answered_by_form(src, [tag_module(), cases_module()], root) {
+    Err(why) -> Err(why),
+    Ok(_) -> Ok(true),
+  }
+
+test "a test over cases runs and lists, its two generic callees each at a site of its own" {
+  let src = b"type Pair = { a: Int, b: String }\ntest \"each pair holds\" for p: Pair in [{ a: 1, b: \"x\" }] { assert(p.a > 0) }\n";
+  let run = test_key(b"m", b"each pair holds");
+  assert_eq([run, Cases(run)].map(|r: RootKey| built(src, r)), [Ok(true), Ok(true)])
+}
+
+test "a contract's clauses read the types filed for their definition's nodes" {
+  let src = b"fn inc(x: Int) -> Int\n  requires x > 0\n  ensures result > x\n= x + 1\n";
+  assert_eq(
+    [Requires, Ensures].map(|kind: ClauseKind|
+      built(src, Clause({ def: Named(b"m.inc"), kind: kind, n: 0 }))),
+    [Ok(true), Ok(true)],
+  )
+}
+
+test "a law's guard and body read the law's own sites, each binder's type among them" {
+  let src = b"type Few = | One | Two\nlaw \"distinct\" forall (a: Few, b: Few) where a != b { a != b }\n";
+  assert_eq(
+    [LawGuard, LawBody].map(|part: LawPart| built(src, law_key(b"m", b"distinct", part))),
+    [Ok(true), Ok(true)],
+  )
+}
+
+test "a holed tagged literal, an update of a call's record, a try, a hold and a handler's variables lower" {
+  let roots = [b"m.holed", b"m.moved", b"m.tried", b"m.counted", b"m.sized", b"m.held"];
+  assert_eq(
+    roots.map(|r: Bytes| { root: r, built: built(every_maker(), Named(r)) }),
+    roots.map(|r: Bytes| { root: r, built: Ok(true) }),
+  )
+}
+
+/// Whether `why` says each of `said`.
+fn says(why: Bytes, said: List<Bytes>) -> Bool = said.all(|s: Bytes| why.index_of(s) != None)
+
+test "a node the check filed nothing for is refused, naming its owner and its site" {
+  let src = b"fn f() -> List<Int> = [1, 2]\n";
+  match program_of(src) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(p) -> {
+      let at = match p.roots.fold(None, |acc: Option<Root>, r: Root|
+          if r.key == Named(b"m.f") { Some(r) } else { acc }) {
+        Some(r) -> match r.code { Ok(c) -> c.span, Err(_) -> dummy_span() },
+        None -> dummy_span(),
+      };
+      assert(at.site > 0);
+      assert(match formed(p, b"f") { Ok(_) -> true, Err(_) -> false });
+      match formed({ ..p, roots: p.roots.map(|r: Root| { ..r, filed: Ok(no_filings()) }) }, b"f") {
+        Ok(_) -> assert(false),
+        Err(no) ->
+          assert(
+            says(no.why, [
+              b"a list",
+              b"filed nothing for",
+              b"`m.f` site ".concat(ascii_of_int(at.site)),
+            ]),
+          ),
+      }
+    },
+  }
+}
+
+test "two filings at one site refuse the item, naming the site and both types" {
+  let a = analysed(b"fn f() -> Int = { let a = [1]; let b = [true]; a.len() }\n");
+  match facts_read(rows_of(a), walked_facts(a), None, a.mods) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(facts) -> match facts_by_item(facts).get(b"m.f") {
+      None -> assert(false),
+      Some(f) -> match filings(f) {
+        Err(why) -> panic(String::of_bytes_lossy(why)),
+        Ok(clean) -> {
+          let filed_at = |ty: Type|
+            clean.typed.fold(None, |acc: Option<Int>, site: Int, t: Typed|
+              if acc == None && t.ty == ty { Some(site) } else { acc });
+          match ((filed_at(list_type(int_type())), filed_at(list_type(bool_type())))) {
+            (Some(one), Some(other)) -> match filings({
+                ..f,
+                typed: f.typed.map(|s: TypedSite|
+                  if s.site == other { { ..s, site: one } } else { s }),
+              }) {
+              Ok(_) -> assert(false),
+              Err(why) ->
+                assert(
+                  says(why, [
+                    b"site ".concat(ascii_of_int(one)),
+                    type_text(list_type(int_type())),
+                    type_text(list_type(bool_type())),
+                  ]),
+                ),
+            },
+            _ -> assert(false),
+          }
+        },
+      },
+    },
+  }
+}
+
+test "a body two different nodes stand at one site of is refused, naming the site and both" {
+  let at = { ..dummy_span(), site: 7 };
+  let lit = |n: Int| ELit({ span: at, lit: LInt(n) });
+  let summed = |l: Expr, r: Expr|
+    EBinary({ span: { ..dummy_span(), site: 6 }, op: b"add", lhs: l, rhs: r });
+  match lower_fn([], [], Map::new(), summed(lit(1), lit(2))) {
+    Ok(_) -> assert(false),
+    Err(why) -> assert(says(why, [b"site 7", head(lit(1)), head(lit(2))])),
+  };
+  // One node read twice stands there once.
+  assert(match lower_fn([], [], Map::new(), summed(lit(1), lit(1))) {
+    Ok(_) -> true,
+    Err(_) -> false,
+  })
+}
+
+test "a closure reads what it captures at the type the check filed for each read" {
+  let src = Bytes::concat_all([
+    b"fn within(fs: List<Int>, room: Int) -> List<Int> = range(0, fs.len()).map(|i: Int| match fs.at(i) { Some(x) -> x + room, None -> 0 })\n",
+    b"fn nested(xs: List<Int>) -> Int = xs.fold(0, |s: Int, x: Int| { let { a, b } = { a: s, b: x }; range(0, a).fold(b, |acc: Int, k: Int| acc + k + a) })\n",
+    b"fn handed(xs: List<Int>, n: Int) -> List<Int> = xs.map(|x: Int| x + n)\n",
+    b"fn kept(xs: List<{ k: Int, v: Int }>, n: Int) -> List<Int> = xs.map(|e: { k: Int, v: Int }| e.k + n)\n",
+    // A record made of a field of a record it may reuse the cells of: the reuse reads it there.
+    b"type T = { word: Bytes, n: Int }\n",
+    b"fn reused(t: T) -> T = { let to = |n: Int| { word: if n > 0 { t.word } else { b\"\" }, n: n }; to(1) }\n",
+  ]);
+  let roots = [b"m.within", b"m.nested", b"m.handed", b"m.kept", b"m.reused"];
+  assert_eq(
+    roots.map(|r: Bytes| { root: r, built: built(src, Named(r)) }),
+    roots.map(|r: Bytes| { root: r, built: Ok(true) }),
+  )
+}

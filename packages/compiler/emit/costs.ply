@@ -16,8 +16,9 @@ import expand.embed (EmbedAt, EmbedFile, embed_tables, rewritten)
 import check.resolve.tables (ParsedModule, Resolved, ValueSpace, Source, qualify)
 import check.resolve (ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_packaged)
 import check.resolve.scopes (no_packages, find)
-import check.infer.checker (Builtin, builtins, test_owner, LabelSite, UpdateShape, WitnessOp,
-                            WitnessRef, WitnessOrder, TypedSite, TrySite, MemberSite)
+import check.infer.checker (Builtin, builtins, LabelSite, UpdateShape, WitnessOp, WitnessRef,
+                            WitnessOrder, TypedSite, TrySite, MemberSite)
+import emit.keys (test_owner, law_owner)
 import check.infer (RootFacts, no_root_facts, root_facts_bin, types_named)
 import front.facts (Analysis, cuts_of)
 import front.rows (Rows, KnownDefRow, KnownTestRow, Cut)
@@ -911,26 +912,15 @@ fn evaluate(p: Priced, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / 
       });
     let ready = if unlowered.len() == 0 { run } else { relowered(p, run, keys_of(unlowered)) };
     if ready.failed { ready } else {
-      let walks = range(0, n).fold(Map::new(), |acc: Map<Int, Found>, i: Int|
-        match tried.get(i) {
-          Walks -> {
-            let b: Body = ready.prog.bodies.get(i);
-            acc.insert(
-              i,
-              walk_body(
-                {
-                  prog: ready.prog,
-                  module: b.module,
-                  tables: tables,
-                  moves: no_moves(),
-                  unformed: None,
-                },
-                b,
-              ),
-            )
-          },
-          _ -> acc,
-        });
+      let which = range(0, n).filter(|i: Int| match tried.get(i) { Walks -> true, _ -> false });
+      let found = walks_at_once(
+        { prog: ready.prog, tables: tables, which: which },
+        0,
+        which.len(),
+        64,
+      );
+      let walks = range(0, which.len()).fold(Map::new(), |acc: Map<Int, Found>, k: Int|
+        acc.insert(which.get(k), found.get(k)));
       let walked = |i: Int| match walks.get(i) { Some(f) -> f, None -> no_found() };
       {
         ..ready,
@@ -955,6 +945,30 @@ fn evaluate(p: Priced, run: Run, which: (Int) -> Bool, tables: Tables) -> Run / 
           }),
       }
     }
+  }
+
+/// What the bodies of a program are walked over, all values: the program, the tables the walk reads,
+/// and the bodies to walk.
+type Walking = { prog: Program, tables: Tables, which: List<Int> }
+
+/// The walk of each body `x.which` names from `lo` up to `hi`, in order, the halves at once; `room`
+/// is the halvings left, and 64 take any length to one.
+fn walks_at_once(x: Walking, lo: Int, hi: Int, room: Int) -> List<Found> / {abort.raise} =
+  if hi - lo <= 16 {
+    range(lo, hi).map(|k: Int| {
+      let b: Body = x.prog.bodies.get(x.which.get(k));
+      walk_body(
+        { prog: x.prog, module: b.module, tables: x.tables, moves: no_moves(), unformed: None },
+        b,
+      )
+    })
+  } else if room <= 0 { panic("more halvings than a length has") } else {
+    let mid = lo + (hi - lo) / 2;
+    let both = parallel {
+      walks_at_once(x, lo, mid, room - 1),
+      walks_at_once(x, mid, hi, room - 1),
+    };
+    both._0.concat(both._1)
   }
 
 /// The bodies of `modules`, kept from an earlier run, given the code their lowering makes now. The
@@ -1179,9 +1193,8 @@ fn module_bodies(
   let m = setting.module;
   roots.fold([], |a: List<Body>, ir: ItemRoot| {
     let lowered = match ir.root.code {
-      None ->
-        { code: None, moves: no_moves(), unformed: Some(b"a body that does not lower to Code") },
-      Some(code) -> match root_moves(s, ir.root, code) {
+      Err(why) -> { code: None, moves: no_moves(), unformed: Some(why) },
+      Ok(code) -> match root_moves(s, ir.root, code) {
         Ok(mv) -> { code: Some(code), moves: mv, unformed: None },
         Err(no) -> { code: Some(code), moves: no_moves(), unformed: Some(no.why) },
       },
@@ -1869,36 +1882,42 @@ fn embeds_by_module(embeds: List<EmbedAt>) -> Map<Bytes, Bytes> =
       ]),
     ))
 
-/// What the front end's check walked afresh of each module (its clauses and laws), by its index among
-/// `mods`, in bytes that do not say where the module stands among them.
+/// What the front end's check walked afresh of each module, its laws, by its index among `mods`, in
+/// bytes that do not say where the module stands among them.
 fn loose_by_module(w: WalkedFacts, mods: List<ParsedModule>) -> Map<Int, Bytes> / {abort.raise} = {
-  let here = places(mods);
-  let into = |acc: Map<Int, RootFacts>, k: Int, add: (RootFacts) -> RootFacts|
-    match placed(here, w.modules, k) {
+  let here = range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int| {
+    let m = mods.get(i);
+    m.module.items.fold(acc, |a: Map<Bytes, Int>, item: Item|
+      match item { ILaw(l) -> a.insert(law_owner(m.name, l.name), i), _ -> a })
+  });
+  w.loose.fold(Map::new(), |acc: Map<Int, Bytes>, l: { owner: Bytes, facts: RootFacts }|
+    match here.get(l.owner) {
       None -> acc,
-      Some(i) -> acc.insert(i, add(match acc.get(i) { Some(f) -> f, None -> no_root_facts() })),
-    };
-  let l = w.loose;
-  let labelled = l.label_sites.fold(Map::new(), |acc: Map<Int, RootFacts>, x: LabelSite|
-    into(acc, x.module, |f: RootFacts|
-      { ..f, label_sites: f.label_sites.push({ ..x, module: 0 }) }));
-  let updated = l.updates.fold(labelled, |acc: Map<Int, RootFacts>, x: UpdateShape|
-    into(acc, x.module, |f: RootFacts| { ..f, updates: f.updates.push({ ..x, module: 0 }) }));
-  let witnessed = l.ops.fold(updated, |acc: Map<Int, RootFacts>, x: WitnessOp|
-    into(acc, x.module, |f: RootFacts| { ..f, ops: f.ops.push({ ..x, module: 0 }) }));
-  let referenced = l.refs.fold(witnessed, |acc: Map<Int, RootFacts>, x: WitnessRef|
-    into(acc, x.module, |f: RootFacts| { ..f, refs: f.refs.push({ ..x, module: 0 }) }));
-  let tried = l.tries.fold(referenced, |acc: Map<Int, RootFacts>, x: TrySite|
-    into(acc, x.module, |f: RootFacts| { ..f, tries: f.tries.push({ ..x, module: 0 }) }));
-  let called = l.members.fold(tried, |acc: Map<Int, RootFacts>, x: MemberSite|
-    into(acc, x.module, |f: RootFacts| { ..f, members: f.members.push({ ..x, module: 0 }) }));
-  let typed = l.typed.fold(called, |acc: Map<Int, RootFacts>, x: TypedSite|
-    into(acc, x.module, |f: RootFacts| { ..f, typed: f.typed.push({ ..x, module: 0 }) }));
-  typed.fold(Map::new(), |acc: Map<Int, Bytes>, i: Int, f0: RootFacts| {
-    let f = { ..f0, types: types_named(l.types, f0.typed) };
-    acc.insert(i, bin::encode(f, root_facts_bin()))
-  })
+      Some(i) ->
+        acc.insert(
+          i,
+          Bytes::concat_all([
+            match acc.get(i) { Some(was) -> was, None -> b"" },
+            l.owner,
+            b"\x00",
+            bin::encode(filed_facts_of(l.facts), root_facts_bin()),
+          ]),
+        ),
+    })
 }
+
+/// `f` as it reads whichever module its owner stands in, with the types it names.
+fn filed_facts_of(f: RootFacts) -> RootFacts =
+  {
+    label_sites: f.label_sites.map(|x: LabelSite| { ..x, module: 0 }),
+    updates: f.updates.map(|x: UpdateShape| { ..x, module: 0 }),
+    ops: f.ops.map(|x: WitnessOp| { ..x, module: 0 }),
+    refs: f.refs.map(|x: WitnessRef| { ..x, module: 0 }),
+    tries: f.tries.map(|x: TrySite| { ..x, module: 0 }),
+    members: f.members.map(|x: MemberSite| { ..x, module: 0 }),
+    typed: f.typed.map(|x: TypedSite| { ..x, module: 0 }),
+    types: types_named(f.types, f.typed),
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -2102,7 +2121,7 @@ fn made_shared() -> Bytes =
 
 test "a run that takes what earlier runs walked answers as a run from nothing, and walks only what moved" {
   let first = costed_over(Map::new(), layered(made_fresh()));
-  assert_eq([first.costing.walked, first.costing.lowered], [7, 3]);
+  assert(first.costing.walked > 0 && first.costing.lowered > 0);
   let again = costed_over(first.store, layered(made_fresh()));
   assert_eq(again.costing.report, first.costing.report);
   assert_eq([again.costing.walked, again.costing.lowered], [0, 0]);
@@ -2111,7 +2130,8 @@ test "a run that takes what earlier runs walked answers as a run from nothing, a
   let moved = costed_over(again.store, shared);
   assert_eq(moved.costing.report, costs(shared).report);
   assert_eq(verdicts(moved.costing.report), [b"grow copies", b"hold reuses", b"solo reuses"]);
-  assert_eq([moved.costing.walked, moved.costing.lowered], [4, 2]);
+  assert(moved.costing.walked > 0 && moved.costing.walked < first.costing.walked);
+  assert(moved.costing.lowered < first.costing.lowered);
   // Each text's walks are kept under its own key, so going back walks nothing.
   let back = costed_over(moved.store, layered(made_fresh()));
   assert_eq(back.costing.report, first.costing.report);

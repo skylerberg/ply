@@ -1,0 +1,458 @@
+//! Records kept between runs by key: a store of segments (`segments`) whose one table places each
+//! record's frame under the digest of its key. A run reads the manifest once, and a segment's table
+//! the first time it looks there, the newest segment first. What it keeps it appends a batch at a
+//! time, each batch a segment the manifest names as soon as it is written, so a run that dies keeps
+//! every batch it finished. Nothing kept is written again but when a run that kept something ends:
+//! the newest segments are then written again as one while each is at most twice what follows it.
+//! A run marks the store used once, by writing its `.used`, whose time the toolchain's sweep reads.
+
+import std.fs
+import std.fs (fs)
+import std.bytes (u32_le, u64_le)
+import store.segments
+import store.segments (Manifest, Segment, Writing, Named)
+
+/// The records of the store `s` names: `get` reads the record kept under a key, and `put` keeps a
+/// batch of them.
+pub effect kept_records {
+  read get[s](key: Bytes) -> Option<Bytes>
+  write put[s](records: List<Record>) -> Unit
+}
+
+/// A record: what it is kept under, and its bytes.
+pub type Record = { key: Bytes, bytes: Bytes }
+
+/// The file whose time says when a run last used a store.
+pub fn used_file() -> String = ".used"
+
+fn shapes() -> Bytes = b"ply kept records 1".blake3()
+
+fn records_table() -> Int = 1
+
+/// A row: the digest of a key, then where its frame lies and how many bytes its payload takes.
+fn row_width() -> Int = 44
+
+fn digest_of(key: Bytes) -> Bytes = key.blake3()
+
+/// How many bytes of frames a merge reads at once.
+fn carry_bound() -> Int = 16777216
+
+/// What a run holds of a store: the manifest it read or last named, the segments it named when the
+/// run opened, where each key they hold lies once a read needs it, what the run kept by the digests
+/// of their keys, the segments it found damaged, and how many batches it wrote.
+type Open = {
+  manifest: Manifest,
+  opened: List<Segment>,
+  index: Option<Map<Bytes, Placed>>,
+  mine: Map<Bytes, Bytes>,
+  lost: List<Bytes>,
+  batches: Int,
+}
+
+/// Where a key's frame lies: its segment, the frame's offset and its payload's bytes.
+type Placed = { seg: Segment, at: Int, len: Int }
+
+/// `o` with the segment `seg` found damaged: it is read no more, and the next batch's commit
+/// drops it from the manifest.
+fn damaged(o: Open, seg: Segment) -> Open =
+  if o.lost.contains(seg.token) { o } else { { ..o, lost: o.lost.push(seg.token) } }
+
+/// `o` with where each key the segments it opened with hold lies, the newest segment's row of it,
+/// read once a run: a key the run keeps is its own to read, so no segment it writes is read.
+fn indexed<[r]>(dir: String, o: Open) -> Open / {fs.read[r], abort.raise} =
+  match o.index {
+    Some(_) -> o,
+    None ->
+      o.opened.fold({ ..o, index: Some(Map::new()) }, |acc: Open, seg: Segment|
+        match segments::rows[r](dir, seg, records_table()) {
+          None -> damaged(acc, seg),
+          Some(rows) ->
+            {
+              ..acc,
+              index: Some(
+                range(0, rows.len() / row_width()).fold(
+                  match acc.index { Some(ix) -> ix, None -> Map::new() },
+                  |ix: Map<Bytes, Placed>, i: Int| {
+                    let at = i * row_width();
+                    ix.insert(rows.slice(at, at + 32), {
+                      seg: seg,
+                      at: segments::long_at(rows, at + 32),
+                      len: segments::word_at(rows, at + 40),
+                    })
+                  },
+                ),
+              ),
+            },
+        }),
+  }
+
+/// The bytes kept under the key whose digest is `digest`: what the run kept, else the newest
+/// segment's that holds it, where that segment reads whole.
+fn found<[r]>(
+  dir: String,
+  o: Open,
+  digest: Bytes,
+) -> { open: Open, bytes: Option<Bytes> } / {fs.read[r], abort.raise} =
+  match o.mine.get(digest) {
+    Some(b) -> { open: o, bytes: Some(b) },
+    None -> {
+      let x = indexed[r](dir, o);
+      match match x.index { Some(ix) -> ix.get(digest), None -> None } {
+        None -> { open: x, bytes: None },
+        Some(p) -> if x.lost.contains(p.seg.token) { { open: x, bytes: None } } else {
+          match segments::payload[r](dir, p.seg.token, p.at, p.len) {
+            Some(b) -> { open: x, bytes: Some(b) },
+            None -> { open: damaged(x, p.seg), bytes: None },
+          }
+        },
+      }
+    },
+  }
+
+/// `o` with `records` kept: those it does not hold as they are already, a key kept twice as it was
+/// kept last, written as one segment the store's manifest names at once. A run that takes no write, or a write the file system refuses, keeps
+/// them for the run alone.
+fn batch_kept<[r]>(
+  dir: String,
+  run: Option<String>,
+  o: Open,
+  records: List<Record>,
+) -> Open / {fs.read[r], fs.write[r], abort.raise} = {
+  // A key kept again holds what it was kept with last.
+  let fresh = records.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: Record| {
+    let d = digest_of(x.key);
+    if o.mine.get(d) == Some(x.bytes) { acc.remove(d) } else { acc.insert(d, x.bytes) }
+  });
+  let mine = fresh.fold(o.mine, |acc: Map<Bytes, Bytes>, d: Bytes, b: Bytes| acc.insert(d, b));
+  if fresh.len() == 0 || run == None { { ..o, mine: mine } } else {
+    let placed = fresh.fold(
+      { writing: segments::unwritten(), rows: Map::new() },
+      |acc: { writing: Writing, rows: Map<Bytes, Bytes> }, d: Bytes, b: Bytes| {
+        let f = segments::framing(acc.writing, b);
+        { writing: f.writing, rows: acc.rows.insert(d, u64_le(f.at).concat(u32_le(b.len()))) }
+      },
+    );
+    let token = segments::token_of(run, o.manifest.generation, o.batches);
+    let wrote = { ..o, mine: mine, batches: o.batches + 1 };
+    match segments::finished[r](
+        dir,
+        shapes(),
+        token,
+        placed.writing,
+        [segments::table(records_table(), placed.rows, |_: Bytes, at: Bytes| Some(at))],
+        [],
+      ) {
+      None -> wrote,
+      Some(seg) -> match segments::committed[r](
+          dir,
+          shapes(),
+          o.manifest.generation,
+          seg,
+          without: o.lost,
+        ) {
+        Named(m) -> { ..wrote, manifest: m, lost: [] },
+        _ -> wrote,
+      },
+    }
+  }
+}
+
+/// Where the frames of `seg` end: where its first table lies, or its end where it holds none.
+fn frames_end(seg: Segment) -> Int =
+  seg.parts.fold(seg.size, |at: Int, p: segments::Part| if p.offset < at { p.offset } else { at })
+
+/// `w` with the frames of the segment `from` names, up to `end`, carried after what it holds,
+/// appended to the segment `token` names as they pile up: none where they cannot be read whole.
+fn carried<[r]>(
+  dir: String,
+  token: Bytes,
+  w: Writing,
+  from: Bytes,
+  end: Int,
+) -> Option<Writing> / {fs.read[r], fs.write[r], abort.raise} =
+  iterate(
+    { at: segments::header_len(), writing: w },
+    end / carry_bound() + 2,
+    |x: { at: Int, writing: Writing }|
+      if x.at >= end { Stop(Some(x.writing)) } else {
+        let n = min(end - x.at, carry_bound());
+        match segments::range_of[r](segments::segment_path(dir, from), x.at, n) {
+          None -> Stop(None),
+          Some(b) -> {
+            let more = segments::carrying(x.writing, b).writing;
+            Continue({
+              at: x.at + n,
+              writing: segments::appended_when_full[r](dir, shapes(), token, more),
+            })
+          },
+        }
+      },
+  )
+
+/// The segments of `m` from the one at `from` on written again as one, the segment `token` names,
+/// where no run committed meanwhile: each key's newest frame is the one its row names. A segment
+/// that cannot be read whole leaves the store as it was.
+fn merged<[r]>(
+  dir: String,
+  m: Manifest,
+  from: Int,
+  token: Bytes,
+) -> Unit / {fs.read[r], fs.write[r], abort.raise} = {
+  let laid = m.segments.drop(from).fold(
+    Some({ writing: segments::unwritten(), rows: Map::new() }),
+    |acc: Option<{ writing: Writing, rows: Map<Bytes, Bytes> }>, seg: Segment|
+      match acc {
+        None -> None,
+        Some(x) -> match segments::rows[r](dir, seg, records_table()) {
+          None -> None,
+          Some(rows) -> match carried[r](dir, token, x.writing, seg.token, frames_end(seg)) {
+            None -> None,
+            Some(w) -> {
+              let shift = x.writing.end - segments::header_len();
+              Some({
+                writing: w,
+                rows: range(0, rows.len() / row_width()).fold(
+                  x.rows,
+                  |acc2: Map<Bytes, Bytes>, i: Int| {
+                    let at = i * row_width();
+                    acc2.insert(
+                      rows.slice(at, at + 32),
+                      u64_le(segments::long_at(rows, at + 32) + shift).concat(
+                        rows.slice(at + 40, at + 44),
+                      ),
+                    )
+                  },
+                ),
+              })
+            },
+          },
+        },
+      },
+  );
+  let gone = || {
+    fs.remove[r](segments::segment_path(dir, token));
+    ()
+  };
+  match laid {
+    None -> gone(),
+    Some(x) -> match segments::finished[r](
+        dir,
+        shapes(),
+        token,
+        x.writing,
+        [segments::table(records_table(), x.rows, |_: Bytes, at: Bytes| Some(at))],
+        [],
+      ) {
+      None -> gone(),
+      Some(seg) -> match segments::swapped[r](dir, shapes(), m, from, seg) {
+        Named(_) -> (),
+        _ -> gone(),
+      },
+    },
+  }
+}
+
+/// What a run that kept something leaves of the store `o` holds: the newest segments written again
+/// as one where they are due, and what no manifest names swept.
+fn closed<[r]>(dir: String, run: String, o: Open) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
+  if o.batches == 0 { () } else {
+    let m = o.manifest;
+    let from = segments::merging(m);
+    if from < m.segments.len() - 1 {
+      merged[r](dir, m, from, segments::token_of(Some(run), m.generation, o.batches))
+    };
+    segments::swept[r](dir, shapes(), run, [])
+  }
+
+/// `work` run over the store of records in `dir`, which it names `s`: `kept_records.get[s]` reads
+/// what this run or an earlier one kept, and each `kept_records.put[s]` is written and named by the
+/// store before it answers. A store that takes no write keeps a run's records for the run alone.
+pub fn with_kept<a, [r], [s] | e>(
+  dir: String,
+  work: () -> a / {kept_records.get[s], kept_records.put[s] | e},
+) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
+  let run = segments::entered[r](dir);
+  if run != None {
+    fs.write_file[r](dir ++ "/" ++ used_file(), b"");
+    ()
+  };
+  let manifest = segments::manifest[r](dir, shapes());
+  let opened = {
+    manifest: manifest,
+    opened: manifest.segments,
+    index: None,
+    mine: Map::new(),
+    lost: [],
+    batches: 0,
+  };
+  let value = handle {
+    work()
+  } with {
+    var st: Open = opened,
+    kept_records.get[s](key) -> {
+      let f = found[r](dir, st, digest_of(key));
+      st = f.open;
+      f.bytes
+    },
+    kept_records.put[s](records) -> {
+      st = batch_kept[r](dir, run, st, records);
+    },
+    return value -> {
+      match run { Some(path) -> closed[r](dir, path, st), None -> () };
+      value
+    },
+  };
+  segments::left[r](run);
+  value
+}
+
+// --- Tests ------------------------------------------------------------------
+
+fn rec(key: Bytes, bytes: Bytes) -> Record = { key: key, bytes: bytes }
+
+/// The bytes the files of the store in `dir` take.
+fn store_bytes<[r]>(dir: String) -> Int / {fs.read[r], abort.raise} =
+  match fs.list_dir[r](dir) {
+    None -> 0,
+    Some(names) ->
+      names.fold(0, |n: Int, name: String|
+        n + (match fs.file_size[r](dir ++ "/" ++ name) { Some(s) -> s, None -> 0 })),
+  }
+
+fn segments_of(tree: fs::MemFs) -> List<String> / {abort.raise} =
+  match fs::mem_list(tree, "s") {
+    Some(names) -> names.filter(|n: String| n.starts_with("seg-")),
+    None -> [],
+  }
+
+test "what one run keeps the next reads, and a run that keeps nothing writes nothing" {
+  let first = fs::on_mem[abs](fs::mem_of([]), ||
+    with_kept[abs, t]("s", || {
+      kept_records.put[t]([rec(b"a", b"one"), rec(b"b", b"two")]);
+      kept_records.get[t](b"a")
+    }));
+  assert_eq(first.value, Some(b"one"));
+  let before = fs::on_mem[abs](first.tree, || store_bytes[abs]("s")).value;
+  let second = fs::on_mem[abs](first.tree, ||
+    with_kept[abs, t]("s", ||
+      [kept_records.get[t](b"a"), kept_records.get[t](b"b"), kept_records.get[t](b"c")]));
+  assert_eq(second.value, [Some(b"one"), Some(b"two"), None]);
+  assert_eq(segments_of(second.tree), segments_of(first.tree));
+  assert_eq(fs::on_mem[abs](second.tree, || store_bytes[abs]("s")).value, before)
+}
+
+test "a run that dies keeps every batch it finished" {
+  let died = fs::on_mem[abs](fs::mem_of([]), || {
+    handle {
+      with_kept[abs, t]("s", || {
+        kept_records.put[t]([rec(b"a", b"one")]);
+        kept_records.put[t]([rec(b"b", b"two")]);
+        panic("the run dies before its third batch")
+      })
+    } with {
+      abort.raise(_) -> (),
+    }
+  });
+  let read = fs::on_mem[abs](died.tree, ||
+    with_kept[abs, t]("s", || [kept_records.get[t](b"a"), kept_records.get[t](b"b")]));
+  assert_eq(read.value, [Some(b"one"), Some(b"two")])
+}
+
+test "a batch writes what it keeps and not what the store holds, however much that grows" {
+  // Each batch's growth of the store against the bytes of its records: framing, a row each, and a
+  // segment's header, its table's place and its line of the manifest, never what came before.
+  let batch = |n: Int, at: Int|
+    range(0, n).map(|i: Int|
+      rec(u64_le(at + i), Bytes::concat_all(range(0, 40).map(|_: Int| b"x"))));
+  let grown = fs::on_mem[abs](fs::mem_of([]), ||
+    with_kept[abs, t]("s", ||
+      [8, 32, 128, 512].fold(
+        { at: 0, growth: [] },
+        |acc: { at: Int, growth: List<Int> }, n: Int| {
+          let before = store_bytes[abs]("s");
+          kept_records.put[t](batch(n, acc.at));
+          { at: acc.at + n, growth: acc.growth.push(store_bytes[abs]("s") - before - n * 40) }
+        },
+      ).growth));
+  let sizes = [8, 32, 128, 512];
+  assert(
+    range(0, sizes.len()).all(|i: Int| grown.value.get(i) <= sizes.get(i) * (12 + 44) + 200),
+    Some(String::join(grown.value.map(|g: Int| g.to_string()), ", ")),
+  )
+}
+
+test "a segment the manifest names that cannot be read is passed over, and the next batch drops it" {
+  // The first segment far outweighs the second, so no run writes the two again as one.
+  let big = Bytes::concat_all([b"one"].concat(range(0, 400).map(|_: Int| b"x")));
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"a", big)]));
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"b", b"two")]))
+  });
+  // The older segment is lost: what it held reads as none, and the next commit names it no more.
+  let first = segments_of(made.tree).fold(None, |acc: Option<String>, n: String|
+    match acc {
+      Some(_) -> acc,
+      None -> match fs::mem_read(made.tree, "s/" ++ n) {
+        Some(b) -> if b.index_of(b"one") != None { Some(n) } else { None },
+        None -> None,
+      },
+    });
+  let cut = fs::on_mem[abs](made.tree, || {
+    match first { Some(n) -> fs.remove[abs]("s/" ++ n), None -> false };
+    with_kept[abs, t]("s", || {
+      let lost = kept_records.get[t](b"a");
+      kept_records.put[t]([rec(b"c", b"three")]);
+      [lost, kept_records.get[t](b"b"), kept_records.get[t](b"c")]
+    })
+  });
+  assert(first != None, None);
+  assert_eq(cut.value, [None, Some(b"two"), Some(b"three")]);
+  let m = fs::on_mem[abs](cut.tree, || segments::manifest[abs]("s", shapes())).value;
+  assert(
+    m.segments.all(|seg: Segment|
+      match first { Some(n) -> "seg-" ++ seg.token.hex_of() != n, None -> true }),
+    None,
+  )
+}
+
+test "a key two segments hold reads as the newer keeps it, and one the run keeps as the run does" {
+  // The first segment far outweighs the second, so no run writes the two again as one.
+  let big = Bytes::concat_all(range(0, 400).map(|_: Int| b"x"));
+  let made = fs::on_mem[abs](fs::mem_of([]), || {
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"big", big), rec(b"a", b"one")]));
+    with_kept[abs, t]("s", || kept_records.put[t]([rec(b"a", b"two")]))
+  });
+  let read = fs::on_mem[abs](made.tree, ||
+    with_kept[abs, t]("s", || {
+      let a = kept_records.get[t](b"a");
+      let whole = kept_records.get[t](b"big") == Some(big);
+      kept_records.put[t]([rec(b"b", b"three")]);
+      { a: a, whole: whole, b: kept_records.get[t](b"b"), none: kept_records.get[t](b"none") }
+    }));
+  assert(segments_of(made.tree).len() >= 2, None);
+  assert_eq(read.value, { a: Some(b"two"), whole: true, b: Some(b"three"), none: None })
+}
+
+test "a key a run keeps again reads as it was kept last, in the run and in the next" {
+  let made = fs::on_mem[abs](fs::mem_of([]), ||
+    with_kept[abs, t]("s", || {
+      kept_records.put[t]([rec(b"a", b"one"), rec(b"a", b"two")]);
+      let first = kept_records.get[t](b"a");
+      kept_records.put[t]([rec(b"a", b"three")]);
+      [first, kept_records.get[t](b"a")]
+    }));
+  let next = fs::on_mem[abs](made.tree, || with_kept[abs, t]("s", || kept_records.get[t](b"a")));
+  assert_eq(made.value, [Some(b"two"), Some(b"three")]);
+  assert_eq(next.value, Some(b"three"))
+}
+
+test "runs that each keep a little leave a store of a handful of segments, all of it read back" {
+  let runs = fs::on_mem[abs](fs::mem_of([]), ||
+    range(0, 40).fold((), |_: Unit, i: Int|
+      with_kept[abs, t]("s", || kept_records.put[t]([rec(u64_le(i), u64_le(i * 7))]))));
+  let read = fs::on_mem[abs](runs.tree, ||
+    with_kept[abs, t]("s", ||
+      range(0, 40).all(|i: Int| kept_records.get[t](u64_le(i)) == Some(u64_le(i * 7)))));
+  assert(read.value, None);
+  assert(segments_of(read.tree).len() <= 8, Some(String::join(segments_of(read.tree), ", ")))
+}

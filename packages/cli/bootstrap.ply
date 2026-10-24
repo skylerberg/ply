@@ -21,14 +21,15 @@ import compiler.cc
 import compiler.cc (Toolchain, compilers, toolchain)
 import compiler.front.published (linked_of)
 import compiler.front.interface (sized)
-import compiler.load (LoadedAnalysis, every_root)
+import compiler.build (built_roots)
+import compiler.emit.keys (Named)
 import compiler.native
 import compiler.native (Packed)
 import compiler.store.packs
 import compiler.syntax.parsing (no_module, dummy_span)
 import compiler.check.resolve.tables (Diag, error_at)
-import compiler.unit (Runtime, shipped, emitted, emitter_identity, held, identity_of, read_kept,
-                      write_kept)
+import compiler.unit (Runtime, shipped, answers_store, emitted, emitter_identity, held, identity_of)
+import compiler.store.kept (Record, kept_records, with_kept)
 import std.bin
 import std.bytes
 import std.fs
@@ -204,7 +205,7 @@ fn failed<a>(why: String) -> Result<a, List<Diag>> = Err([nowhere(why)])
 fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc]} =
   match compilers.found[cc]() {
     None -> failed("no `cc` is installed to compile C with"),
-    Some(compiler) -> Ok(cc::toolchain_of(compiler, level_of(profile))),
+    Some(compiler) -> Ok(cc::toolchain_of(compiler, level_of(profile), profile != "release")),
   }
 
 /// The runtime the library at `library` is, as a program linked with it and nothing else says.
@@ -225,9 +226,12 @@ fn described(
       let ran = toolchain.ran(relative(exe), []);
       if ran.code != 0 { failed("the runtime's library does not describe itself") } else {
         match native::runtime_of(ran.out) {
-          Some(r) -> Ok(r),
-          None ->
-            failed("the runtime's library describes itself in a form this `ply` does not read"),
+          Ok(r) -> Ok(r),
+          Err(why) ->
+            failed(
+              "the runtime's library describes a runtime this `ply` cannot hold a program's code to: "
+                ++ String::of_bytes_lossy(why),
+            ),
         }
       }
     },
@@ -304,8 +308,9 @@ fn linking_key(t: Toolchain, library: Bytes, libraries: List<String>) -> Bytes =
     Bytes::concat_all([
       b"ply native link 1\0",
       sized(t.identity),
-      sized(Bytes::of_string(t.level)),
-      sized(Bytes::of_string(String::join(cc::float_flags().concat(native::native_flags()), " "))),
+      sized(
+        Bytes::of_string(String::join(cc::compile_flags(t).concat(native::native_flags()), " ")),
+      ),
       sized(native::main_c()),
       sized(library),
       sized(Bytes::of_string(String::join(libraries, " "))),
@@ -464,21 +469,27 @@ fn builder_built(
       None -> Err(t_load.program.diags),
       Some(w) -> {
         let front = front_of(t_load, w);
-        let offered = every_root(front);
-        let bodies = below_root(env.bodies[sys]());
-        let emission = emitted(
+        let entry = Bytes::of_string(builder_entry());
+        let offered = built_roots(front, w.frame.hashes, entry);
+        let store = answers_store(
+          below_root(env.bodies[sys]()),
           runtime,
-          front.dump,
-          front.files.map(|f: { path: String, name: String, text: Bytes }| f.text),
-          front.inputs,
-          offered,
           emitter_identity(shipped.definitions()),
-          |k: Bytes| read_kept[abs](bodies, k),
-          |k: Bytes, bytes: Bytes| write_kept[abs](bodies, k, bytes),
         );
+        let emission = with_kept[abs, ans](store, ||
+          emitted(
+            runtime,
+            front.dump,
+            front.files.map(|f: { path: String, name: String, text: Bytes }| f.text),
+            front.inputs,
+            offered,
+            |k: Bytes| kept_records.get[ans](k),
+            |rs: List<Record>| kept_records.put[ans](rs),
+            entered: Some([Named(entry)]),
+          ));
         match ((
             held(front.dump, offered, emission),
-            linked_of(front.dump, Bytes::of_string(builder_entry()), front.files.len()),
+            linked_of(front.dump, entry, front.files.len()),
           )) {
           (Err(diags), _) -> Err(diags),
           (_, None) -> failed("the builder defines no `" ++ builder_entry() ++ "` to enter"),
@@ -870,7 +881,7 @@ test "the shipped modules' key moves with a module's bytes and its name, and not
 }
 
 test "a link's key moves with the compiler, its level, the library and what is linked after it" {
-  let t = { identity: b"cc 1", support: [], level: "-O2" };
+  let t = { identity: b"cc 1", support: [], level: "-O2", checked: false };
   let key = linking_key(t, b"library", ["-lm"]);
   assert_eq(linking_key(t, b"library", ["-lm"]), key);
   assert(linking_key({ ..t, identity: b"cc 2" }, b"library", ["-lm"]) != key);

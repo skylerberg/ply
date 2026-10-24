@@ -249,3 +249,298 @@ fn a_pure_root_over_memo_words_is_answered_from_the_memo() {
         );
     }
 }
+
+/// The C pointer a unit calls the native the compiler declares as `name` through.
+fn native(name: &str) -> String {
+    ply_compiled::c::pointer_name(&ply_compiled::c::builtin_helper_name(name))
+}
+
+/// The C that opens an `R#entered`: the arguments' list read, `read` reading each, and the
+/// lifting ended, returning where the context failed.
+fn lifting(read: &str) -> String {
+    format!(
+        "  {}(ctx, {});\n{read}\n  {}(ctx);\n  if (ctx->failed) return 0;\n",
+        native("?in_count"),
+        ply_core::codec::tag::LIST,
+        native("?lift_close"),
+    )
+}
+
+/// A string read from the lifting into `buf`, its length `n`.
+fn string_read() -> String {
+    format!(
+        "  char buf[64];\n  Word n = {}(ctx);\n  if (ctx->failed || n > 64) return 0;\n  {}(ctx, (Word)(intptr_t)buf, n);",
+        native("?in_str"),
+        native("?taken"),
+    )
+}
+
+/// An encoded unit's definitions: each root `R` beside the `R#entered` it is entered through, and
+/// `m.helper`, which has none.
+fn encoded_defs() -> Vec<Def> {
+    let double = units::symbol("m.double");
+    vec![
+        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
+        def(
+            "m.double#entered",
+            0,
+            &format!(
+                "{}  Word r = {double}(ctx, ply_imm(n));\n  if (ctx->failed) return 0;\n  {}(ctx, ply_imm_value(r));\n  return 0;",
+                lifting(&format!("  Word n = {}(ctx);", native("?in_int"))),
+                native("?out_int"),
+            ),
+        ),
+        def("m.greet", 1, "  return p0;"),
+        def(
+            "m.greet#entered",
+            0,
+            &format!(
+                "{}  {}(ctx, {}, 2);\n  {}(ctx, (Word)(intptr_t)\"length\", 6);\n  {}(ctx, n);\n  {}(ctx, (Word)(intptr_t)\"text\", 4);\n  {}(ctx, (Word)(intptr_t)buf, n);\n  return 0;",
+                lifting(&string_read()),
+                native("?out_count"),
+                ply_core::codec::tag::RECORD,
+                native("?out_name"),
+                native("?out_int"),
+                native("?out_name"),
+                native("?out_str"),
+            ),
+        ),
+        def("m.closure", 0, "  return 0;"),
+        def(
+            "m.closure#entered",
+            0,
+            &format!(
+                "{}  {}(ctx, 0, (Word)(intptr_t)\"m.f\", 3);\n  return 0;",
+                lifting(""),
+                native("?out_fun"),
+            ),
+        ),
+        def("m.keep", 1, "  return p0;"),
+        def(
+            "m.keep#entered",
+            0,
+            &format!(
+                "{}  {}(ctx, s);\n  return 0;",
+                lifting(&format!("  Word s = {}(ctx);", native("?in_handle"))),
+                native("?out_handle"),
+            ),
+        ),
+        def("m.fail", 1, "  return p0;"),
+        def(
+            "m.fail#entered",
+            0,
+            &format!(
+                "{}  {}(ctx, 0);\n  {}(ctx, {}, 1);\n  {}(ctx, (Word)(intptr_t)buf, n);\n  rt_builtin_encoded_p(ctx, 0);\n  return 0;",
+                lifting(&string_read()),
+                native("?lower_open"),
+                native("?out_count"),
+                ply_core::codec::tag::LIST,
+                native("?out_str"),
+            ),
+        ),
+        def("m.helper", 1, "  return p0;"),
+    ]
+}
+
+/// The roots of [`encoded_defs`] each entered through its `R#entered`.
+fn entering(e: &mut units::Laid) {
+    e.entered = ["m.double", "m.greet", "m.closure", "m.keep", "m.fail"]
+        .map(str::to_string)
+        .to_vec();
+    e.builtins = vec![ply_core::Builtin::Panic];
+}
+
+/// The unit over `defs`, its table as `adjust` leaves it, opened for a program of them.
+fn opened_with(
+    dir: &std::path::Path,
+    defs: &[Def],
+    pure: &[&str],
+    adjust: impl FnOnce(&mut units::Laid),
+) -> Option<(&'static Analysis, Arc<Unit>)> {
+    let mut exports = units::exports_of(defs);
+    adjust(&mut exports);
+    let lib = units::library(dir, &units::text(defs, &exports))?;
+    let front: &'static Analysis = Box::leak(Box::new(units::front(b"p", defs, pure)));
+    Some((front, Unit::opened(front, &lib).expect("the unit opens")))
+}
+
+/// An encoded unit's root is entered through its `R#entered`: the arguments cross in as their list's
+/// encoding and the answer out as its own, whatever its type.
+#[test]
+fn an_encoded_units_roots_are_entered_through_their_entered_roots() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some((_, unit)) = opened_with(dir.path(), &encoded_defs(), &[], entering) else {
+        return;
+    };
+    let b = bodies(&unit);
+    assert_eq!(
+        enter(&b, "m.double", &[Value::Int(21)], 10_000),
+        Some(Value::Int(42))
+    );
+    let greeted = enter(&b, "m.greet", &[Value::str("héllo")], 10_000).expect("it answers");
+    assert_eq!(
+        greeted,
+        Value::Record(Arc::new(ply_core::Fields::from_unsorted(vec![
+            (Symbol::new("length"), Value::Int(6)),
+            (Symbol::new("text"), Value::str("héllo")),
+        ])))
+    );
+    assert_eq!(b.declines().total(), 0, "{:?}", b.declines());
+}
+
+/// Only a root with an `R#entered` is offered, and no `R#entered` is offered as a root of its own.
+#[test]
+fn an_encoded_unit_offers_only_the_roots_it_is_entered_at() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some((_, unit)) = opened_with(dir.path(), &encoded_defs(), &[], entering) else {
+        return;
+    };
+    let b = bodies(&unit);
+    assert!(b.admits("m.double"));
+    assert!(!b.admits("m.helper"));
+    assert!(!b.admits("m.double#entered"));
+    assert_eq!(enter(&b, "m.helper", &[Value::Int(1)], 10_000), None);
+    assert_eq!(b.declines().not_compiled, 1, "{:?}", b.declines());
+}
+
+/// A function the program wrote, or a handle, cannot leave the entry: the entry is declined and
+/// counted as an answer that could not cross, as a unit entered with words is.
+#[test]
+fn an_encoded_answer_holding_a_function_or_a_handle_is_declined() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some((_, unit)) = opened_with(dir.path(), &encoded_defs(), &[], entering) else {
+        return;
+    };
+    let b = bodies(&unit);
+    assert_eq!(enter(&b, "m.closure", &[], 10_000), None);
+    let secret = Value::secret_text("hunter2");
+    assert_eq!(enter(&b, "m.keep", &[secret], 10_000), None);
+    assert_eq!(b.declines().answer, 2, "{:?}", b.declines());
+}
+
+/// A raise inside an encoded entry is the entry's alone, whatever crossings it left open.
+#[test]
+fn a_raise_in_an_encoded_entry_does_not_poison_the_one_after_it() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some((front, unit)) = opened_with(dir.path(), &encoded_defs(), &[], entering) else {
+        return;
+    };
+    let mut machine = Machine::new(front, bodies(&unit)).expect("the unit describes the program");
+    for _ in 0..2 {
+        let raised = machine
+            .call("m.fail", vec![Value::str("no")], Span::DUMMY)
+            .into_parts()
+            .0
+            .expect_err("a panic raises");
+        assert!(raised.message.contains("no"), "{raised}");
+        let doubled = machine
+            .call("m.double", vec![Value::Int(5)], Span::DUMMY)
+            .into_parts()
+            .0;
+        assert_eq!(doubled.ok(), Some(Value::Int(10)));
+    }
+}
+
+/// A unit that says it is entered at a root through an `R#entered` it does not take, or one that
+/// takes words, is refused by that root.
+#[test]
+fn a_unit_entered_through_what_it_does_not_take_is_refused() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some(loaded) = units::opened(dir.path(), &encoded_defs(), |e| {
+        entering(e);
+        e.entered.push("m.helper".to_string());
+    }) else {
+        return;
+    };
+    let refused = loaded
+        .err()
+        .expect("a root with no `R#entered` was entered");
+    assert!(refused.contains("`m.helper#entered`"), "{refused}");
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut defs = encoded_defs();
+    defs.push(def("m.helper#entered", 1, "  return p0;"));
+    let Some(loaded) = units::opened(dir.path(), &defs, |e| {
+        entering(e);
+        e.entered.push("m.helper".to_string());
+    }) else {
+        return;
+    };
+    let refused = loaded
+        .err()
+        .expect("an `R#entered` taking a word was bound");
+    assert!(refused.contains("takes 1 words"), "{refused}");
+}
+
+/// An encoded unit's memo keeps values: a pure constant runs once, a pure root over what the memo
+/// answered runs once for those arguments, and a root that is not pure runs every time.
+#[test]
+fn an_encoded_pure_root_over_what_the_memo_answered_is_answered_from_the_memo() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let counted = format!(
+        "{}  ctx->ticks += 1;\n  {}(ctx, 7);\n  return 0;",
+        lifting(&string_read()),
+        native("?out_int"),
+    );
+    let defs = vec![
+        def("m.table", 0, "  return 0;"),
+        def(
+            "m.table#entered",
+            0,
+            &format!(
+                "{}  ctx->ticks += 1;\n  {}(ctx, (Word)(intptr_t)\"123\", 3);\n  return 0;",
+                lifting(""),
+                native("?out_str"),
+            ),
+        ),
+        def("m.weigh", 1, "  return p0;"),
+        def("m.weigh#entered", 0, &counted),
+        def("m.post", 1, "  return p0;"),
+        def("m.post#entered", 0, &counted),
+    ];
+    let Some((front, unit)) = opened_with(dir.path(), &defs, &["m.table", "m.weigh"], |e| {
+        e.entered = ["m.table", "m.weigh", "m.post"]
+            .map(str::to_string)
+            .to_vec();
+        e.constants = vec!["m.table".to_string()];
+        e.lambdas = vec![format!("{}_entry", units::symbol("m.table"))];
+    }) else {
+        return;
+    };
+    let b = bodies(&unit);
+    let mut machine = Machine::new(front, b.clone()).expect("the unit describes the program");
+    let mut call = |name: &str, args: Vec<Value>| {
+        let answer = machine
+            .call(name, args, Span::DUMMY)
+            .into_parts()
+            .0
+            .unwrap_or_else(|d| panic!("`{name}` raised: {d}"));
+        (answer, b.steps())
+    };
+    let (table, made) = call("m.table", vec![]);
+    assert_eq!(table, Value::str("123"));
+    assert!(made > 0, "the constant's first entry did not run its body");
+    assert_eq!(
+        call("m.table", vec![]),
+        (table.clone(), 0),
+        "the constant ran again"
+    );
+
+    let (first, ran) = call("m.weigh", vec![table.clone()]);
+    assert_eq!(first, Value::Int(7));
+    assert!(ran > 0, "the first entry did not run the body");
+    assert_eq!(
+        call("m.weigh", vec![table.clone()]),
+        (first, 0),
+        "the second entry ran the body again"
+    );
+    assert!(
+        call("m.weigh", vec![Value::str("123")]).1 > 0,
+        "an argument the memo did not answer was answered from it"
+    );
+    for entry in 1..=2 {
+        assert!(
+            call("m.post", vec![table.clone()]).1 > 0,
+            "entry {entry} of a root that is not pure was answered by an earlier one"
+        );
+    }
+}

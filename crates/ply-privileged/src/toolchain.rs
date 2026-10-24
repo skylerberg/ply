@@ -3,7 +3,8 @@
 //! `tcc`, and starts and waits for them; `toolchain` reads and writes files below the toolchain's
 //! cache and nowhere else, and runs the programs linked there. What to compile, with what flags and what to keep is the program's: this
 //! side only runs what it is asked to and confines where it writes. A compiler's output is a
-//! function of what it is given, so the family is deterministic.
+//! function of what it is given, so `compilers` and `toolchain` are deterministic. `memory` reads the
+//! asking program's own heap for a build that tells its phases, which no two runs need answer alike.
 
 use ply_core::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
 use ply_core::{Diagnostic, Resource, Span, Value as PlyValue, codes};
@@ -42,6 +43,11 @@ const OPERATIONS: [(&str, &str, &str); 14] = [
     ("toolchain", "ran", "ply_privileged::toolchain::ran"),
 ];
 
+const READINGS: [(&str, &str, &str); 2] = [
+    ("memory", "heap", "ply_privileged::toolchain::heap"),
+    ("memory", "census", "ply_privileged::toolchain::census"),
+];
+
 /// What the runtime's library needs linked after it on this platform, as `rustc` names its native
 /// libraries.
 fn libraries() -> &'static [&'static str] {
@@ -63,13 +69,31 @@ fn libraries() -> &'static [&'static str] {
 /// The family's operations, over one table of the jobs it started.
 pub fn lent() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     let handler: Arc<dyn HostHandler> = Arc::new(Toolchain::default());
-    OPERATIONS
-        .into_iter()
-        .map(|(effect, op, path)| {
-            let op = crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path);
-            (op, Arc::clone(&handler))
-        })
+    let hermetic = OPERATIONS.into_iter().map(|(effect, op, path)| {
+        crate::hosts::hermetic_op(effect, op, Linearity::Repeatable, path)
+    });
+    let readings = READINGS.into_iter().map(|(effect, op, path)| {
+        crate::hosts::privileged_op(effect, op, Linearity::Repeatable, path)
+    });
+    hermetic
+        .chain(readings)
+        .map(|op| (op, Arc::clone(&handler)))
         .collect()
+}
+
+/// `f` of the context of the entry that performed the operation at `span`, which waits on it on
+/// this thread.
+fn running(
+    span: Span,
+    f: impl FnOnce(&ply_compiled::rt::Ctx) -> PlyValue,
+) -> Result<PlyValue, Diagnostic> {
+    ply_compiled::rt::with_running(f).ok_or_else(|| {
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a heap was read where no entry runs on the thread serving the read",
+        )
+        .primary(span, "performed here")
+    })
 }
 
 #[derive(Default)]
@@ -111,6 +135,32 @@ pub fn support_flags(resolved: &Path) -> Vec<String> {
         .find(|candidate| candidate.join("libtcc1.a").is_file())
         .map(|candidate| vec![format!("-B{}", candidate.display())])
         .unwrap_or_default()
+}
+
+/// The code `program` ended with, and what a person is told where a signal stopped it, which the
+/// program had no chance to say: -1 and the signal then.
+pub fn ended(program: &Path, status: std::process::ExitStatus) -> (i64, Option<String>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let name = match signal {
+                6 => " (SIGABRT)",
+                9 => " (SIGKILL)",
+                11 => " (SIGSEGV)",
+                15 => " (SIGTERM)",
+                _ => "",
+            };
+            return (
+                -1,
+                Some(format!(
+                    "{} was stopped by signal {signal}{name}",
+                    program.display()
+                )),
+            );
+        }
+    }
+    (status.code().map_or(-1, i64::from), None)
 }
 
 fn compiler_value(label: &str) -> PlyValue {
@@ -336,7 +386,13 @@ impl HostHandler for Toolchain {
                     .stderr(Stdio::inherit())
                     .output();
                 let (code, out) = match ran {
-                    Ok(out) => (out.status.code().map_or(-1, i64::from), out.stdout),
+                    Ok(out) => {
+                        let (code, said) = ended(&program, out.status);
+                        if let Some(said) = said {
+                            eprintln!("{said}");
+                        }
+                        (code, out.stdout)
+                    }
                     Err(e) => {
                         eprintln!("{} did not start: {e}", program.display());
                         (-1, Vec::new())
@@ -352,6 +408,26 @@ impl HostHandler for Toolchain {
                 let _ = std::fs::remove_dir_all(at);
                 PlyValue::Unit
             }
+            ("heap", []) => running(span, |c| {
+                crate::payload::record(vec![
+                    ("live", crate::payload::count(c.live_bytes())),
+                    ("held", crate::payload::count(c.held())),
+                ])
+            })?,
+            ("census", []) => running(span, |c| {
+                PlyValue::list(
+                    c.census()
+                        .into_iter()
+                        .map(|(what, objects, bytes)| {
+                            crate::payload::record(vec![
+                                ("what", PlyValue::str(what)),
+                                ("objects", crate::payload::count(objects)),
+                                ("bytes", crate::payload::count(bytes)),
+                            ])
+                        })
+                        .collect(),
+                )
+            })?,
             (op, _) => return Err(crate::hosts::unserved(req.op.effect.as_str(), op, span)),
         };
         Ok(HostAnswer::Value(value))

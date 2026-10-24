@@ -89,7 +89,23 @@ pub(super) fn held_words<'v>(
         .collect()
 }
 
-pub(super) fn identity(v: &Value) -> Option<Identity> {
+/// The identities of `v` and of its direct parts, the first [`PARTS_LIMIT`] of them: what a body
+/// that takes a value apart may hand back in.
+pub(crate) fn identities(v: &Value) -> Vec<Identity> {
+    let parts: Box<dyn Iterator<Item = &Value>> = match v {
+        Value::Record(fields) => Box::new(fields.iter().map(|(_, part)| part)),
+        Value::Ctor { args, .. } => Box::new(args.iter()),
+        Value::List(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
+        Value::Array(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
+        _ => Box::new(std::iter::empty()),
+    };
+    identity(v)
+        .into_iter()
+        .chain(parts.take(PARTS_LIMIT).filter_map(identity))
+        .collect()
+}
+
+pub(crate) fn identity(v: &Value) -> Option<Identity> {
     Some(match v {
         Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
         Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),
@@ -125,6 +141,21 @@ impl Tables {
             bytes.store(cost.bytes, Release);
         }
         self.memoize(index, w)
+    }
+
+    /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
+    /// answer, with what computing it cost, which every later read charges. The first kept stays;
+    /// one another thread keeps after it stays in the unit's persistent heap, unread.
+    pub fn keep(&self, index: usize, kept: Word, cost: Cost) {
+        let (Some((steps, allocations, bytes)), Some(slot)) =
+            (self.memo_costs.get(index), self.memo.get(index))
+        else {
+            return;
+        };
+        steps.store(cost.steps, Release);
+        allocations.store(cost.allocations, Release);
+        bytes.store(cost.bytes, Release);
+        let _ = slot.compare_exchange(0, kept, AcqRel, Acquire);
     }
 
     /// What computing the memoized answer at `index` cost.
@@ -164,7 +195,7 @@ impl Tables {
             words.insert(id, w);
         }
         // A scalar answer is its own word, with no parts to remember.
-        if heap::is_imm(w) || w == 0 {
+        if !heap::is_object(w) {
             return;
         }
         let o = obj(w);

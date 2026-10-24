@@ -86,6 +86,14 @@ pub(super) fn builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
 /// `b` over the values the words denote. Takes the arguments.
 pub(super) fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
+    match called_over_values(ctx, b, values) {
+        Some(v) => ctx.word(&v),
+        None => 0,
+    }
+}
+
+/// `b` over `values`: its answer, or `None` where it raised, as it raises, or failed the context.
+pub(super) fn called_over_values(ctx: &mut Ctx, b: Builtin, values: Vec<Value>) -> Option<Value> {
     let site = ctx.site();
     let panicked = match (b, values.first()) {
         (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
@@ -105,12 +113,16 @@ pub(super) fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> W
         _ => false,
     };
     match ply_core::builtins::call(b, values, site) {
-        Ok(v) => ctx.word(&v),
+        Ok(v) => Some(v),
         Err(d) if signature(b).raises || divides_by_zero => {
             let message = panicked.unwrap_or_else(|| raised_message(&d));
-            ctx.raise(d, message)
+            ctx.raise(d, message);
+            None
         }
-        Err(d) => ctx.fail(d),
+        Err(d) => {
+            ctx.fail(d);
+            None
+        }
     }
 }
 
@@ -221,20 +233,34 @@ pub(super) fn narrow_binary(op: i64, w: i64, a: i64, b: i64) -> Option<Word> {
 /// The entry's next hold, holding `held`.
 pub(super) fn hold_new(c: &mut Ctx, held: Word) -> Word {
     c.holds_made += 1;
-    hold_word(&mut c.heap, held, c.holds_made)
+    hold_word(&mut c.heap, Some(held), c.holds_made)
 }
 
-/// A hold, as a closure no call enters: what it holds in its first capture, the null word once it
-/// has let go, so a second release or a read after is refused; and `id`, its number in the entry,
-/// in its second, which names it to the scheduler. A continuation resumed twice shares it.
-pub(crate) fn hold_word(heap: &mut Heap, held: Word, id: u64) -> Word {
-    let o = heap.alloc(KIND_CLOSURE, 0, (2 + CLOSURE_CAPTURES) as u32, 0);
+/// The payload word a hold keeps what it holds in, which emitted code reads and empties itself.
+pub const HOLD_HELD: usize = CLOSURE_CAPTURES;
+
+/// The word a hold marks itself let go in, apart from what it holds, whose word may be 0 itself (a
+/// `()`, or a `None` held as one pointer).
+const HOLD_LET_GO: usize = CLOSURE_CAPTURES + 2;
+
+/// A hold, as a closure no call enters: what it holds in its first capture, emptied once it has let
+/// go; `id`, its number in the entry, in its second, which names it to the scheduler; and in its
+/// third whether it has let go, as one made with nothing held has, so a second release or a read
+/// after is refused. A continuation resumed twice shares it.
+pub(crate) fn hold_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word {
+    let o = heap.alloc(KIND_CLOSURE, 0, (3 + CLOSURE_CAPTURES) as u32, 0);
     unsafe {
         set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
-        set_word(o, CLOSURE_CAPTURES, held);
+        set_word(o, HOLD_HELD, held.unwrap_or(0));
         set_word(o, CLOSURE_CAPTURES + 1, heap::imm(id as i64));
+        set_word(o, HOLD_LET_GO, heap::imm(i64::from(held.is_none())));
     }
     o as Word
+}
+
+/// Whether the hold `o` has let go of what it held.
+pub(crate) fn hold_let_go(o: *mut heap::Obj) -> bool {
+    heap::imm_value(unsafe { word_at(o, HOLD_LET_GO) }) != 0
 }
 
 /// The object a hold is, where `w` is one.
@@ -293,8 +319,8 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         }
         (Builtin::HoldGet, [h]) => {
             let o = hold_object(*h)?;
-            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
-            let answer = if held == 0 {
+            let held = unsafe { word_at(o, HOLD_HELD) };
+            let answer = if hold_let_go(o) {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "read"))
             } else {
@@ -306,12 +332,15 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
         }
         (Builtin::HoldTake, [h]) => {
             let o = hold_object(*h)?;
-            let held = unsafe { word_at(o, CLOSURE_CAPTURES) };
-            let answer = if held == 0 {
+            let held = unsafe { word_at(o, HOLD_HELD) };
+            let answer = if hold_let_go(o) {
                 let site = ctx.site();
                 ctx.fail(hold_released(site, "let go"))
             } else {
-                unsafe { set_word(o, CLOSURE_CAPTURES, 0) };
+                unsafe {
+                    set_word(o, HOLD_HELD, 0);
+                    set_word(o, HOLD_LET_GO, heap::imm(1));
+                }
                 held
             };
             heap::dec(*h);
@@ -325,14 +354,10 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
                 heap::dec(*w);
                 return Some(ctx.fail(no_handler_vars()));
             };
-            match &f.vars {
-                Some(v) => v.borrow_mut().set(at, *w),
-                None => {
-                    let mut vars = HandlerVars(Vec::new());
-                    vars.set(at, *w);
-                    f.vars = Some(shared(vars));
-                }
-            }
+            f.vars
+                .get_or_insert_with(|| shared(HandlerVars(Vec::new())))
+                .borrow_mut()
+                .set(at, Var::Word(*w));
             Some(heap::unit())
         }
         (Builtin::HandlerVar, [i]) => {
@@ -340,9 +365,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
             let Some((_, v)) = ctx.stacks[ctx.current].held.last() else {
                 return Some(ctx.fail(no_handler_vars()));
             };
-            let w = v.borrow().0.get(at).copied().unwrap_or(heap::unit());
-            heap::inc(w);
-            Some(w)
+            Some(v.borrow().get(at))
         }
         (Builtin::HandlerSet, [i, w]) => {
             let at = heap::imm_value(*i) as usize;
@@ -350,7 +373,7 @@ pub(super) fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Op
                 heap::dec(*w);
                 return Some(ctx.fail(no_handler_vars()));
             };
-            v.borrow_mut().set(at, *w);
+            v.borrow_mut().set(at, Var::Word(*w));
             Some(heap::unit())
         }
         // Only compiled code can enter a closure, so these answer whatever they are given.

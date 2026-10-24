@@ -7,8 +7,8 @@
 use crate::heap::{
     self, FLAT, Heap, KIND_ARRAY, KIND_BOOL, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_COLUMNS,
     KIND_CTOR, KIND_DECIMAL, KIND_FIXED, KIND_FLOAT, KIND_INT, KIND_LIST, KIND_MAP, KIND_RECORD,
-    KIND_STR, KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj, set_word,
-    word_at,
+    KIND_REFUSED, KIND_STR, KIND_UNIT, Layouts, Obj, Slot, Word, bridged, bytes_of, is_imm, obj,
+    refused, set_word, word_at,
 };
 use crate::{array, list, map};
 use ply_core::Symbol;
@@ -298,6 +298,7 @@ impl<'l> Writer<'l> {
                 Vec::new()
             }
             KIND_CLOSURE => return Err("a function".to_string()),
+            KIND_REFUSED => refused("stored::text"),
             other => return Err(format!("an object of kind {other}")),
         };
         pending.push(Pending::Done(w as usize));

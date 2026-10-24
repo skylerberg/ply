@@ -326,10 +326,9 @@ fn a_record_held_in_place_is_counted_by_the_record_holding_it() {
     let shape = unsafe { (*obj(outer)).layout };
     let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
     let held = field_word(&mut h, &l, obj(outer), at, l.slot_at(shape, at));
-    // A read of it is the holder's own words, which the holder counts for, and an object a stack
-    // scan finds.
+    // A read of it is the holder's own words, which the holder counts for.
+    assert_eq!(held, outer + (HEADER + 8 * at) as Word);
     assert_eq!(unsafe { (*obj(outer)).rc }, 2);
-    assert!(h.is_object(held));
     assert_eq!(
         Heap::to_value(&l, held),
         record(vec![("label", Value::str("held"))])
@@ -341,28 +340,6 @@ fn a_record_held_in_place_is_counted_by_the_record_holding_it() {
     // The last holder lets the string go once, through the copy.
     dec(held);
     assert_eq!(unsafe { (*obj(label)).rc } & !SHARED, 1);
-}
-
-#[test]
-fn a_record_held_in_place_inside_a_large_record_is_an_object_a_stack_scan_finds() {
-    let l = layouts();
-    let mut h = Heap::new();
-    let mut fields: Vec<(&str, Value)> = (0..1100)
-        .map(|i| {
-            let name: &'static str = Box::leak(format!("f{i:04}").into_boxed_str());
-            (name, Value::Int(i))
-        })
-        .collect();
-    fields.push(("inner", record(vec![("label", Value::str("deep"))])));
-    let value = record(fields);
-    let w = h.to_word(&l, &value);
-    let shape = unsafe { (*obj(w)).layout };
-    let at = l.offset(shape, &Symbol::new("inner")).expect("the field");
-    let inner = field_word(&mut h, &l, obj(w), at, l.slot_at(shape, at));
-    assert!(h.is_object(inner));
-    assert_eq!(Heap::to_value(&l, w), value);
-    dec(inner);
-    dec(w);
 }
 
 #[test]

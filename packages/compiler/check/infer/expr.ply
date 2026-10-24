@@ -1,7 +1,10 @@
 //! Expressions inferred: what a place expects, patterns and matches, effects and their handlers.
 
-import syntax.parsing (Span, Ident, QName, span_to, dummy_span, span_key, is_bare, qname_text,
-                       prelude_binder, read_site)
+import syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare, qname_text, prelude_binder,
+                       made_at, minted, role_member_on, role_member_callee, role_hold_acquire,
+                       role_hold_acquire_read, role_hold_release, role_hold_release_read,
+                       role_hold_open, role_hold_close, role_hold_body, role_hold_new_callee,
+                       role_hold_take_callee, role_tag_texts, role_tag_holes, role_var_first_read)
 import std.list (prepend)
 import syntax.type_syntax (TypeExpr, mode_text, is_raise)
 import syntax.items (DOrd, member_name, member_of, Opaque)
@@ -78,9 +81,13 @@ fn reader_of(checker: Checker) -> Reader =
     head: |ty: Type| shallow(checker.subst, ty),
     builtin: |f: Expr| prelude_named(checker, f),
     on_value: |span: Span|
-      match checker.builtins_on.get(span_key(span)) { Some(name) -> name, None -> b"" },
+      match checker.builtins_on.get(builtin_key(checker, span)) { Some(name) -> name, None -> b"" },
     contract: |name: Bytes| checker.contracts.get(name),
   }
+
+/// Where `builtins_on` holds the builtin the call at `at` of the body being walked calls.
+fn builtin_key(checker: Checker, at: Span) -> Bytes =
+  Bytes::concat_all([checker.walking, b"#", ascii_of_int(at.site)])
 
 fn assuming(checker: Checker, cond: Expr, truth: Bool) -> Checker / {abort.raise} =
   { ..checker, guards: guards::assume(reader_of(checker), checker.guards, cond, truth) }
@@ -514,6 +521,12 @@ fn note_operand(checker: Checker, span: Span, ty: Type) -> Checker =
 /// Resolved once the whole program is checked, as an operand is. What the program does not write has
 /// no place a site could be found at, so none is noted for it.
 pub fn note_typed(checker: Checker, span: Span, ty: Type, args: List<Type>) -> Checker =
+  note_named(checker, span, ty, args, b"")
+
+/// `note_typed` of a read of the definition `named`, at the type arguments `args` it is used at:
+/// none where the read is inside the recursive group being inferred, whose arguments are filled
+/// once the group is generalised.
+fn note_named(checker: Checker, span: Span, ty: Type, args: List<Type>, named: Bytes) -> Checker =
   if span == dummy_span() { checker } else {
     {
       ..checker,
@@ -523,6 +536,7 @@ pub fn note_typed(checker: Checker, span: Span, ty: Type, args: List<Type>) -> C
         ty: ty,
         args: args,
         owner: checker.walking,
+        named: named,
       }),
     }
   }
@@ -1096,10 +1110,12 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     // and may do is reported where the check settles, and a run that reaches it raises.
     EHole(h) -> {
       let o: WithVar = new_ty_var(checker);
+      // Filed, since a run lowers a hole to the raise it is, answering what its place takes.
+      let filed = note_typed(o.checker, h.span, TyVar(o.var), []);
       {
         checker: {
-          ..o.checker,
-          holes: o.checker.holes.push({
+          ..filed,
+          holes: filed.holes.push({
             module: checker.module,
             span: h.span,
             var: o.var,
@@ -1114,7 +1130,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       }
     },
     EVar(v) -> {
-      let o: Inferred = infer_var(checker, v.name);
+      let o: Inferred = infer_var(checker, v.name, v.span);
       // Called or passed as a value, a wrapping builtin wraps at its first parameter's type.
       if !is_int_builtin(expr) { o } else {
         match o.ty {
@@ -1166,11 +1182,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     ELambda(l) -> {
       let outer = checker;
       let checker = barred(outer, b"a lambda");
-      let pushed: Checker = {
-        ..checker,
-        env: env_push(checker.env),
-        lambda_binds: checker.env.binds,
-      };
+      let pushed: Checker = { ..checker, env: env_push(checker.env) };
       let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
         { checker: pushed, tys: [] },
@@ -1240,10 +1252,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       };
       let made: Inferred = {
         checker: note_typed(
-          leaving(
-            { ..checked, env: env_pop(checked.env), lambda_binds: checker.lambda_binds },
-            checker.guards,
-          ),
+          leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
           l.span,
           fn_type(ps.tys, body.ty, row_empty()),
           [],
@@ -1256,7 +1265,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EApp(a) -> match a.func {
       EField(f) -> {
         let b: Inferred = infer(checker, f.base);
-        let d = dotted_callee(a.span, b, f.base, f.field, a.args, a.named, a.labels);
+        let d = dotted_callee(a.span, f.span, b, f.base, f.field, a.args, a.named, a.labels);
         // A named value is typed as an argument is, expected at its parameter's type.
         let taken: Took = range(0, d.rest.len()).fold(
           { checker: d.checker, rest: [], row: row_empty() },
@@ -1457,8 +1466,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       );
       let closed: Checker = close_tails(items.checker, items.tails);
       {
-        checker: if l.items.len() == 0 { note_typed(closed, l.span, list_type(items.ty), []) }
-        else { closed },
+        checker: note_typed(closed, l.span, list_type(items.ty), []),
         ty: list_type(items.ty),
         row: items.row,
       }
@@ -1477,10 +1485,21 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         },
       }
     } else {
-      let b: Inferred = infer_var(checker, p.eff);
-      let on = EVar({ span: p.eff.span, name: p.eff });
+      // Typed where the rewrite writes the call on the binding.
+      let at = made_at(p.eff.span, p.span, role_member_on());
+      let b: Inferred = infer_var(checker, p.eff, at);
+      let on = EVar({ span: at, name: p.eff });
       let labels = match p.resource { Some(r) -> [r], None -> [] };
-      let d = dotted_callee(p.span, b, on, p.op, p.args, [], labels);
+      let d = dotted_callee(
+        p.span,
+        made_at(p.op.span, p.span, role_member_callee()),
+        b,
+        on,
+        p.op,
+        p.args,
+        [],
+        labels,
+      );
       dotted(p.span, d, defaults_taken(d), b, on, p.op, p.args, labels, hint, true)
     },
     EHandle(h) -> infer_handle(checker, h.span, h.body, h.clauses, h.ret, h.vars, hint),
@@ -1564,8 +1583,8 @@ fn tag_fn(
   takes: List<Type>,
   answers: Type,
 ) -> { checker: Checker, row: Row, name: Bytes } / {abort.raise} = {
-  let f: Inferred = infer_var(checker, callee);
-  let named: Checker = called(f.checker, t.tag.span);
+  let f: Inferred = infer_var(checker, callee, callee.span);
+  let named: Checker = called(f.checker, callee.span);
   match declared_value(named, callee) {
     // A name that names nothing is said by the lookup.
     None -> { checker: named, row: row_empty(), name: b"" },
@@ -1650,7 +1669,14 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
     );
     let recorded: Checker = filled.row.atoms.fold(held.checker, |cc: Checker, atom: Atom|
       record_site(cc, atom, t.span, PerformVia(filled.name)));
-    let j: WithRow = join(recorded, t.span, held.row, filled.row);
+    // The lists of the texts and of the holes the literal is written out as calling its tag with.
+    let listed: Checker = note_typed(
+      note_typed(recorded, minted(t.span, role_tag_texts()), list_type(string_type()), []),
+      minted(t.span, role_tag_holes()),
+      list_type(hole.ty),
+      [],
+    );
+    let j: WithRow = join(listed, t.span, held.row, filled.row);
     { checker: j.checker, ty: answer.ty, row: j.row }
   }
 }
@@ -1884,7 +1910,7 @@ fn update_shaped(checker: Checker, span: Span, fs: List<Field>) -> Checker =
     ..checker,
     update_shapes: checker.update_shapes.push({
       module: checker.module,
-      span: span,
+      site: span.site,
       names: fs.map(|field: Field| field.name),
       owner: checker.walking,
     }),
@@ -1971,24 +1997,28 @@ pub fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
-/// `checker` with the type of a read of `name` at `span` filed where no binding the emitter sees
+/// `checker` with the type of the read of `name` at `span` filed where no binding the emitter sees
 /// types it: a variable of the handler whose clause is walked, which the read is written out as one
-/// of the runtime's, or a capture of the innermost lambda, which a body another function lends that
-/// lambda to reads off its closure.
-fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker =
-  if checker.assignable.vars.len() == 0 && checker.lambda_binds == 0 { checker } else {
+/// of the runtime's, or a capture of the innermost closure, which a body another function lends that
+/// closure to reads off it.
+fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker / {abort.raise} =
+  if checker.assignable.vars.len() == 0 && checker.assignable.frame == 0 { checker } else {
     match env_local(checker.env, name) {
-      Some(l) -> if l.stamp < checker.lambda_binds
+      Some(l) -> if (match env_depth_of(checker.env, name) {
+            Some(d) -> d < checker.assignable.frame,
+            None -> false,
+          })
           || checker.assignable.vars.fold(
             false,
             |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
-          ) { note_typed(checker, read_site(span), ty, []) }
+          ) { note_typed(checker, span, ty, []) }
       else { checker },
       None -> checker,
     }
   }
 
-fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
+/// The name `qname`, read by the node at `at`, where what the check finds of the read is filed.
+fn infer_var(checker: Checker, qname: QName, at: Span) -> Inferred / {abort.raise} = {
   let k: WithKey = value_key(checker, qname);
   match k.key {
     None -> {
@@ -1998,10 +2028,10 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
     Some(key) -> match env_lookup(k.checker.env, key.name) {
       Some(sc) -> {
         let inst = instantiate_with(sc, k.checker.fresh);
-        let c: Checker = crossed({ ..k.checker, fresh: inst.fresh }, key.name, qname.span);
+        let c: Checker = crossed({ ..k.checker, fresh: inst.fresh }, key.name, at);
         let constrained: Checker = note_constraints(
-          note_instance(c, qname.span, inst.ty),
-          qname.span,
+          note_instance(c, at, inst.ty),
+          at,
           key.name,
           inst.args,
           inst.ty,
@@ -2021,11 +2051,11 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
               Found(m) -> if m.qname.module == None { constrained } else {
                 {
                   ..constrained,
-                  member_sites: sited(constrained, {
+                  member_sites: constrained.member_sites.push({
                     reaches: [],
                     named: [],
                     module: constrained.module,
-                    span: qname.span,
+                    site: at.site,
                     qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
                     name: m.qname.name.name,
                     callee: b"",
@@ -2039,11 +2069,11 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
           Some(t) ->
             {
               ..constrained,
-              member_sites: sited(constrained, {
+              member_sites: constrained.member_sites.push({
                 reaches: [],
                 named: [],
                 module: constrained.module,
-                span: qname.span,
+                site: at.site,
                 qualifier: of_binder(constrained.resolved.scopes.get(t.owner).module),
                 name: member_name(t.simple, qname.name.name),
                 callee: b"",
@@ -2058,7 +2088,7 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
             ..referred,
             group_fills: referred.group_fills.push({
               module: referred.module,
-              span: qname.span,
+              span: at,
               callee: key.name,
               args: inst.args,
             }),
@@ -2070,21 +2100,14 @@ fn infer_var(checker: Checker, qname: QName) -> Inferred / {abort.raise} = {
         // Every `Columns` is made by a call that answers one, so its element is judged there.
         let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
         let columned: Checker = if mentions_columns(made) {
-          {
-            ..noted,
-            columns: noted.columns.push({ module: noted.module, span: qname.span, ty: made }),
-          }
+          { ..noted, columns: noted.columns.push({ module: noted.module, span: at, ty: made }) }
         } else { noted };
         let typed: Checker = match env_depth_of(columned.env, key.name) {
-          Some(d) -> if d > 0 { held_read(columned, key.name, qname.span, inst.ty) }
-          else { note_typed(columned, qname.span, inst.ty, inst.args) },
-          None -> note_typed(columned, qname.span, inst.ty, inst.args),
+          Some(d) -> if d > 0 { held_read(columned, key.name, at, inst.ty) }
+          else { note_named(columned, at, inst.ty, inst.args, key.name) },
+          None -> note_named(columned, at, inst.ty, inst.args, key.name),
         };
-        {
-          checker: note_labels(typed, qname.span, key.name, ls, inst.ty),
-          ty: inst.ty,
-          row: row_empty(),
-        }
+        { checker: note_labels(typed, at, key.name, ls, inst.ty), ty: inst.ty, row: row_empty() }
       },
       None -> {
         let o: WithTy = new_ty(unknown_name(k.checker, qname));
@@ -2547,14 +2570,6 @@ fn member_function(
     else { language_function(checker, of, name, true) },
   }
 
-/// The sites of `checker` with `site`, a call the checker writes out, among them. Every node of
-/// a derived definition stands at its statement's span, so a site there that names a function would
-/// be read by each call of the definition: none is ever filed.
-fn sited(checker: Checker, site: MemberSite) -> List<MemberSite> / {abort.raise} =
-  if checker.derived != None && site.name != b"" {
-    panic("a derived definition calls a function the checker writes out, at the one span it has")
-  } else { checker.member_sites.push(site) }
-
 /// What each parameter of `callee` after those a call on a value fills with the value and `args`
 /// takes: one of `named`, or its default, as a call by name is filled; and the modules those
 /// defaults name. Nothing where the call is refused.
@@ -2610,6 +2625,8 @@ type DottedCallee =
 type Dotted = {
   checker: Checker,
   callee: DottedCallee,
+  /// Where the rewrite writes the function a call of one calls.
+  at: Span,
   params: List<Type>,
   /// How many of `params` come before the call's written arguments: the value, for a function
   /// of its type.
@@ -2634,9 +2651,11 @@ fn defaults_taken(d: Dotted) -> Took =
 
 /// A call on a value, `base.name(args)`, as far as its callee: a function a record holds in its
 /// field `name`, or the function `name` of the head of the value's type; `base.m::f(args)` calls
-/// `m::f`. `b` is the value as its caller typed it and `base` as it is written.
+/// `m::f`. `b` is the value as its caller typed it and `base` as it is written; `callee` is where
+/// the rewrite writes the function a call of one calls, which the callee's type is filed at.
 fn dotted_callee(
   span: Span,
+  callee: Span,
   b: Inferred,
   base: Expr,
   name: Ident,
@@ -2645,10 +2664,11 @@ fn dotted_callee(
   labels: List<Ident>,
 ) -> Dotted / {abort.raise} = {
   let ty = resolve(b.checker, b.ty);
-  let none = |c: Checker, callee: DottedCallee|
+  let none = |c: Checker, d: DottedCallee|
     {
       checker: c,
-      callee: callee,
+      callee: d,
+      at: callee,
       params: [],
       before: 0,
       met: NothingMet,
@@ -2658,19 +2678,20 @@ fn dotted_callee(
     };
   let of_type = |m: { qname: QName, callee: Bytes }| {
     let filled = member_args(b.checker, span, m.callee, base, args, named);
-    let func = EVar({ span: name.span, name: m.qname });
-    let f0: Inferred = infer_var(filled.checker, m.qname);
+    let func = EVar({ span: callee, name: m.qname });
+    let f0: Inferred = infer_var(filled.checker, m.qname, callee);
     let params = match shallow(f0.checker.subst, f0.ty) { TyFn(fn_) -> fn_.params, _ -> [] };
     // A named value is typed after the callee's labels are filled, as any argument is, and
     // before another use of a label-generic definition hides the callee's.
     let names = filled.rest.fold(false, |any: Bool, slot: Slot|
       any || (match slot { FromName(_) -> true, _ -> false }));
     let ready: Checker = if !names { f0.checker } else {
-      fill_labels(called(f0.checker, name.span), span, labels, callee_labels(f0.checker, name.span))
+      fill_labels(called(f0.checker, callee), span, labels, callee_labels(f0.checker, callee))
     };
     {
       checker: ready,
       callee: OfType({ qname: m.qname, callee: m.callee, ty: f0.ty, row: f0.row, labelled: names }),
+      at: callee,
       params: params,
       before: 1,
       met: match params.at(0) {
@@ -2768,9 +2789,9 @@ fn dotted(
       answered(o, if !performed { o.checker } else {
         {
           ..o.checker,
-          member_sites: sited(o.checker, {
+          member_sites: o.checker.member_sites.push({
             module: o.checker.module,
-            span: span,
+            site: span.site,
             qualifier: b"",
             name: b"",
             callee: b"",
@@ -2784,7 +2805,7 @@ fn dotted(
     OfType(m) -> {
       let o: Inferred = applied_call(
         span,
-        EVar({ span: name.span, name: m.qname }),
+        EVar({ span: d.at, name: m.qname }),
         { checker: taken.checker, ty: m.ty, row: m.row },
         Some({ written: base, ty: b.ty }),
         args,
@@ -2794,9 +2815,9 @@ fn dotted(
       );
       answered(o, {
         ..o.checker,
-        member_sites: sited(o.checker, {
+        member_sites: o.checker.member_sites.push({
           module: o.checker.module,
-          span: span,
+          site: span.site,
           // A builtin is the prelude's: the call is written out through the prelude's binder,
           // and what reads the call as it stands asks for the builtin by name.
           qualifier: match m.qname.module { Some(q) -> q.name, None -> prelude_binder() },
@@ -2815,8 +2836,10 @@ fn dotted(
             |x: { arg: Int, at: Int }| x.at,
           ),
         }),
+        member_calls: if m.callee.len() == 0 { o.checker.member_calls }
+        else { o.checker.member_calls.push({ callee: m.callee, span: span }) },
         builtins_on: if m.qname.module != None { o.checker.builtins_on }
-        else { o.checker.builtins_on.insert(span_key(span), m.qname.name.name) },
+        else { o.checker.builtins_on.insert(builtin_key(o.checker, span), m.qname.name.name) },
       })
     },
   }
@@ -4478,9 +4501,11 @@ fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.rais
           duplicate(j.checker, v.name, location_of(j.checker, first.name.span), b"variable"),
         [] -> j.checker,
       };
+      // Where a node a clause hands on reads the variable's value, and where the written-out
+      // `handle` reads its first value, which a body run detached captures.
       let noted: Checker = note_typed(
-        note_typed(once, v.name.span, ty, []),
-        read_site(v.name.span),
+        note_typed(once, v.span, ty, []),
+        minted(v.span, role_var_first_read()),
         ty,
         [],
       );
@@ -4495,7 +4520,8 @@ fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.rais
 }
 
 /// `checker` with a handler's variables bound in a new scope, each its own type: what a clause or
-/// the `return` clause starts from. An assignment may give them new values unless `barred`.
+/// the `return` clause starts from, a closure of its own. An assignment may give them new values
+/// unless `barred`.
 fn with_vars(
   checker: Checker,
   vars: List<{ name: Ident, ty: Type }>,
@@ -4510,7 +4536,10 @@ fn with_vars(
         stamps: acc.stamps.push({ stamp: acc.checker.env.binds, name: v.name.name, ty: v.ty }),
       },
   );
-  { ..bound.checker, assignable: { vars: bound.stamps, barred: barred } }
+  {
+    ..bound.checker,
+    assignable: { vars: bound.stamps, barred: barred, frame: checker.env.scopes.len() },
+  }
 }
 
 fn infer_handle(
@@ -5053,7 +5082,7 @@ fn infer_try_block(
         ..typed,
         try_sites: typed.try_sites.push({
           module: typed.module,
-          span: span,
+          site: span.site,
           effect: hit.info.name,
           op: hit.op.name,
           arity: hit.op.params.len(),
@@ -5397,7 +5426,7 @@ fn infer_with_hold(
         hint,
       );
       let j: WithRow = join(
-        { ..b.checker, env: env_pop(b.checker.env) },
+        hold_filed({ ..b.checker, env: env_pop(b.checker.env) }, span, a.ty, hold_ty, b.ty),
         span,
         entering.row,
         b.row,
@@ -5412,7 +5441,9 @@ fn infer_with_hold(
         body,
         hint,
       );
-      let closed: ClosedRegion = close_region({ ..b.checker, env: env_pop(b.checker.env) });
+      let closed: ClosedRegion = close_region(
+        hold_filed({ ..b.checker, env: env_pop(b.checker.env) }, span, a.ty, hold_ty, b.ty),
+      );
       let handled = [hold_atom(RNamed(label))];
       let discharged: Checker = discharge(
         closed.checker,
@@ -5441,6 +5472,28 @@ fn infer_with_hold(
       { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
     },
   }
+}
+
+/// `checker` with the closures the hold at `span` is written out as filed where they are written,
+/// and the reads inside them: the acquire answering `held` and the release taking it; the open
+/// answering the hold, of type `hold`, its builtin making it of what the acquire answered; the close
+/// taking the hold, its builtin taking `held` back out of it; and the body taking the hold and
+/// answering `answer`.
+fn hold_filed(checker: Checker, span: Span, held: Type, hold: Type, answer: Type) -> Checker = {
+  let acquire = fn_type([], held, row_empty());
+  let release = fn_type([held], unit_type(), row_empty());
+  [
+    { role: role_hold_acquire(), ty: acquire },
+    { role: role_hold_acquire_read(), ty: acquire },
+    { role: role_hold_release(), ty: release },
+    { role: role_hold_release_read(), ty: release },
+    { role: role_hold_open(), ty: fn_type([], hold, row_empty()) },
+    { role: role_hold_new_callee(), ty: fn_type([held], hold, row_empty()) },
+    { role: role_hold_close(), ty: fn_type([hold], unit_type(), row_empty()) },
+    { role: role_hold_take_callee(), ty: fn_type([hold], held, row_empty()) },
+    { role: role_hold_body(), ty: fn_type([hold], answer, row_empty()) },
+  ].fold(checker, |c: Checker, x: { role: Int, ty: Type }|
+    note_typed(c, minted(span, x.role), x.ty, []))
 }
 
 /// By the types at the open: a binding whose type mentions a task only inside the region holds none.

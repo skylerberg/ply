@@ -73,7 +73,7 @@ fn a_family_lends_under_the_effect_a_program_declares_and_its_hermetic_half() {
     assert_eq!(policy::effects_of("claims"), Some(&["prover"][..]));
     assert_eq!(
         policy::effects_of("toolchain"),
-        Some(&["compilers", "toolchain"][..])
+        Some(&["compilers", "toolchain", "memory"][..])
     );
     assert_eq!(policy::effects_of("cache"), None);
     assert_eq!(policy::effects_of("everything"), None);

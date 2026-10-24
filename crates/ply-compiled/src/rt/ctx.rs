@@ -26,6 +26,16 @@ pub struct Ctx {
     /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
     /// nor the clock bounds this entry, so nothing calls back at all.
     pub next_tick: i64,
+    /// The innermost frame record on the running stack's chain: [`crate::frames::base`] at the
+    /// bottom of a detached body's own stack, the one kind that records, and null on any other. A
+    /// switch saves it with the stack it leaves and puts back the other's.
+    pub frames: *mut crate::frames::PlyFrame,
+    /// How deeply drop roots run nested: one at [`RELEASE_DEPTH`] puts its release off through
+    /// [`rt_release_later`], and the outermost drains what waits through [`rt_release_drain`].
+    /// Compiled code reads and writes it, so it stays among the fields before the runtime's own.
+    pub release_depth: i64,
+    /// How many releases wait in the context's buffer for the outermost drop root to drain them.
+    pub release_waiting: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -50,6 +60,8 @@ pub struct Ctx {
     pub(crate) current: usize,
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
+    /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
+    pub(crate) cost_marks: Vec<CostMark>,
     /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
     pub sims: Vec<crate::simulate::Simulation>,
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
@@ -73,6 +85,8 @@ pub struct Ctx {
     /// The last at-most-once host operation this entry performed, for `E0426`.
     pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_core::host::MachineId,
+    /// Whether the entry's branches ran on the pool's threads, whose blocks then hold its objects too.
+    pub(crate) pooled: bool,
     /// What the host runtime said when an entry ended, for the machine's teardown warnings.
     pub(crate) teardown: Vec<Diagnostic>,
     /// The seed the driver set, and the step budget, for the regions this entry opens.
@@ -95,6 +109,64 @@ pub struct Ctx {
     pub(super) outer: (*mut Heap, *const i64),
     /// What that entry's unit answered of its types' keys, put back with them.
     pub(super) outer_instances: Option<ply_core::Instances>,
+    /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
+    pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
+    /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
+    /// drop: never inside the release that let it go.
+    pub(crate) continuations_died: Vec<(usize, usize)>,
+    /// The crossings under way, the innermost last.
+    pub(crate) crossings: Vec<Crossing>,
+    /// The bytes a native answered, until compiled code copies them out with [`rt_taken`].
+    pub(crate) taken: Vec<u8>,
+    /// The context running on this thread when this one's entry began, put back when it ends.
+    pub(super) outer_running: *mut Ctx,
+}
+
+thread_local! {
+    /// The context whose entry runs on this thread, for what lets go of a carried value where no
+    /// context is at hand.
+    static RUNNING: std::cell::Cell<*mut Ctx> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The context whose entry runs on this thread.
+pub(crate) fn running() -> *mut Ctx {
+    let c = RUNNING.with(std::cell::Cell::get);
+    debug_assert!(
+        !c.is_null(),
+        "a carried value was let go of outside an entry"
+    );
+    c
+}
+
+/// Makes `c` the context running on this thread, answering the one that was.
+pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
+    RUNNING.with(|r| r.replace(c))
+}
+
+/// `f` of the context whose entry runs on this thread, which a host operation that entry performs
+/// reads while the entry waits on it; `None` outside an entry.
+pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
+    unsafe { RUNNING.with(std::cell::Cell::get).as_ref() }.map(f)
+}
+
+/// A record shape's fields or a constructor's name, as a tally of objects by layout tells them.
+fn layout_named(layouts: &heap::Layouts, kind: u8, key: u32) -> Option<String> {
+    match kind {
+        heap::KIND_CTOR => layouts
+            .ctors
+            .get(key as usize)
+            .map(|(name, _)| format!("`{name}`")),
+        heap::KIND_RECORD if (key as usize) < layouts.shape_count() => Some(format!(
+            "{{{}}}",
+            layouts
+                .shape_names(key)
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        _ => None,
+    }
 }
 
 impl Ctx {
@@ -109,6 +181,9 @@ impl Ctx {
             ticks: 0,
             charged: Cost::default(),
             next_tick: i64::MAX,
+            frames: std::ptr::null_mut(),
+            release_depth: 0,
+            release_waiting: 0,
             step_budget: 0,
             grown: 0,
             deadline: None,
@@ -121,6 +196,7 @@ impl Ctx {
             free_stacks: Vec::new(),
             current: 0,
             performed: Vec::new(),
+            cost_marks: Vec::new(),
             sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
@@ -135,6 +211,7 @@ impl Ctx {
             host_ops: 0,
             last_linear: None,
             id: ply_core::host::MachineId::next(),
+            pooled: false,
             teardown: Vec::new(),
             seed: ply_core::Seed::default(),
             sim_steps: ply_core::sim::DEFAULT_STEPS,
@@ -148,6 +225,11 @@ impl Ctx {
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             outer_instances: None,
+            release_later: Vec::new(),
+            continuations_died: Vec::new(),
+            crossings: Vec::new(),
+            taken: Vec::new(),
+            outer_running: std::ptr::null_mut(),
         }
     }
 
@@ -253,6 +335,7 @@ impl Ctx {
     /// its calls, and what it performed.
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
+        self.pooled |= branch.pooled;
         self.ticks = self.ticks.saturating_add(branch.ticks);
         self.charged = self.charged.plus(branch.charged);
         self.grown += branch.grown;
@@ -325,6 +408,7 @@ impl Ctx {
         });
         self.arm_tick();
         self.stack_floor = stack_floor();
+        self.frames = std::ptr::null_mut();
         self.site_root = -1;
         self.last_linear = None;
         self.diagnostic = None;
@@ -333,6 +417,7 @@ impl Ctx {
         self.free_stacks.clear();
         self.current = 0;
         self.performed.clear();
+        self.cost_marks.clear();
         self.sims.clear();
         self.starting_detached = None;
         self.trail = ply_core::region::Trail::new(self.seed.clone());
@@ -343,17 +428,24 @@ impl Ctx {
         self.unwind = None;
         self.aborting = None;
         self.resumed = None;
+        self.release_depth = 0;
+        self.release_waiting = 0;
+        self.release_later.clear();
+        self.crossings.clear();
+        self.taken.clear();
         // Every path out of an entry calls `end`; this catches one that did not.
         if self.heap.allocated() != 0 {
             self.end();
         }
         self.detached.clear();
+        self.continuations_died.clear();
         self.entry = ENTRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
         // Another unit's entry may be running further up this thread: it gets its own back at `end`.
         self.outer = (
             heap::swap_current(&mut self.heap),
             heap::poison::swap(&raw const self.site_root),
         );
+        self.outer_running = swap_running(self);
         let mine = self.instances();
         self.outer_instances = ply_core::instances::swap(mine);
     }
@@ -403,54 +495,112 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        // A region left open lets go of the values its tasks passed while the entry's heap lives.
+        drop(std::mem::take(&mut self.sims));
+        crate::detached::teardown(self);
+        debug_assert!(
+            self.release_later.is_empty() && self.release_depth == 0,
+            "an entry ended with a release still running or waiting"
+        );
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
+        swap_running(self.outer_running);
         ply_core::instances::swap(self.outer_instances.take());
         self.outer = (std::ptr::null_mut(), std::ptr::null());
+        self.outer_running = std::ptr::null_mut();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
                 "entry: {} objects allocated, {} recycled, {}MB held, {} stacks grown",
                 self.heap.allocated(),
                 self.heap.recycled(),
-                self.heap.held() / 1_000_000,
+                self.held() / 1_000_000,
                 self.grown
             );
             let by_kind = self.heap.allocated_by_kind();
-            let mut kinds: Vec<(usize, usize)> = (0..16).map(|k| (k, by_kind[k])).collect();
+            let mut kinds: Vec<(usize, usize)> = by_kind.into_iter().enumerate().collect();
             kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
                 eprintln!("  allocated: kind {kind}: {n} objects");
             }
             let layouts = &self.tables.layouts;
             for ((kind, key), n) in self.heap.allocated_by_layout().into_iter().take(24) {
-                let what = match kind {
-                    heap::KIND_CTOR => format!("`{}`", layouts.ctors[key as usize].0),
-                    heap::KIND_RECORD => format!(
-                        "{{{}}}",
-                        layouts
-                            .shape_names(key)
-                            .iter()
-                            .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
                     heap::KIND_BYTES => format!("bytes under {key}"),
+                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
                     _ => format!("str under {key}"),
-                };
+                });
                 eprintln!("  allocated: {n} of {what}");
             }
-            let live = self.heap.live_by_kind();
+            let live = self.census();
             if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
-                for (kind, n, bytes) in live {
+                for (what, n, bytes) in live.into_iter().take(24) {
                     eprintln!(
-                        "  live at end: kind {kind}: {n} objects, {}MB",
+                        "  live at end: {what}: {n} objects, {}MB",
                         bytes / 1_000_000
                     );
                 }
             }
         }
         self.heap.end();
+        if std::mem::take(&mut self.pooled) {
+            crate::parallel::workers_ended(self.id.0);
+        }
+    }
+
+    /// What `read` makes of the blocks the pool's threads hold of this entry's branches, summed.
+    fn workers(&self, read: impl Fn(&crate::blocks::Blocks) -> usize + Sync) -> usize {
+        if self.pooled {
+            crate::parallel::worker_blocks(self.id.0, read)
+                .into_iter()
+                .sum()
+        } else {
+            0
+        }
+    }
+
+    /// The bytes of the blocks the entry's live objects take, its branches' on the pool's threads
+    /// among them, read from the pages without a walk.
+    pub fn live_bytes(&self) -> usize {
+        self.heap.live_bytes() + self.workers(|b| b.live())
+    }
+
+    /// The bytes of the memory holding the entry's objects, whatever is live in it.
+    pub fn held(&self) -> usize {
+        self.heap.held() + self.workers(|b| b.held())
+    }
+
+    /// How many of the entry's objects are live, its branches' on the pool's threads among them.
+    pub fn live(&self) -> usize {
+        self.heap.live()
+            + self.workers(|b| {
+                heap::live_in(b, |kind, _, _| kind)
+                    .values()
+                    .map(|e| e.0)
+                    .sum()
+            })
+    }
+
+    /// The entry's live objects by what they are, the most bytes first, with their count and payload
+    /// bytes: a record by its shape's fields, a constructor by its name, a block emitted code laid
+    /// out, whose header names no type, by its payload bytes, and any other object by its kind.
+    pub fn census(&self) -> Vec<(String, usize, usize)> {
+        let layouts = &self.tables.layouts;
+        let mut rows = self.heap.census();
+        if self.pooled {
+            for tally in crate::parallel::worker_blocks(self.id.0, heap::census_in) {
+                rows = heap::census_merged(rows, tally);
+            }
+        }
+        rows.into_iter()
+            .map(|((kind, key), n, bytes)| {
+                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
+                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
+                    _ => heap::kind_name(kind),
+                });
+                (what, n, bytes)
+            })
+            .collect()
     }
 
     /// The singleton a nullary constructor is.
@@ -512,7 +662,7 @@ impl Ctx {
     }
 
     pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
-        self.fail_with(1, d)
+        self.fail_with(FAILED, d)
     }
 
     /// Fails as a raise of `abort.raise`, bound for the innermost `handle` in reach with a clause
@@ -524,8 +674,27 @@ impl Ctx {
         let Some(at) = self.raise_handler("abort", "raise") else {
             return self.fail(d);
         };
-        let message = self.word(&Value::str(message));
-        self.bind_raise(at, vec![message], d)
+        let (stack, depth, clause) = at;
+        let clause = &self.stacks[stack].list[depth].clauses[clause];
+        let message = Value::str(message);
+        // An emitted clause takes the message as emitted code lays a `String`, lifted through the
+        // type its `handle` site handed.
+        let args = match (clause.emitted, clause.string) {
+            (false, _) => Raised::Words(vec![self.word(&message)]),
+            (true, Some(ty)) => {
+                let Some(w) = lifted(self, &message, ty) else {
+                    return 0;
+                };
+                Raised::Carried(vec![unsafe { Carried::new(w, ty) }])
+            }
+            (true, None) => {
+                return self.fail(
+                    error("an `abort.raise` clause emitted code installed has no `String` type")
+                        .note("this is Ply's fault, not the program's"),
+                );
+            }
+        };
+        self.bind_raise(at, args, d)
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
@@ -533,7 +702,7 @@ impl Ctx {
     pub(super) fn bind_raise(
         &mut self,
         at: (usize, usize, usize),
-        args: Vec<Word>,
+        args: Raised,
         d: Diagnostic,
     ) -> i64 {
         let (stack, depth, clause) = at;
@@ -686,7 +855,11 @@ pub(super) fn error(message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, message.into()).primary(Span::DUMMY, "in compiled code")
 }
 
+/// The `n` words at `ptr`, which may be null where `n` is 0.
 pub(super) fn args_of<'a>(ptr: *const i64, n: i64) -> &'a [Word] {
+    if n == 0 {
+        return &[];
+    }
     unsafe { std::slice::from_raw_parts(ptr, n as usize) }
 }
 

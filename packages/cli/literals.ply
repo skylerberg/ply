@@ -4,9 +4,9 @@
 //! each one the run's own modules hold is entered on a machine of its own, under a step budget, and
 //! what its parser answers is the literal's verdict. A verdict is a function of the parser and the
 //! texts, so it is kept under the hash of all the parser reaches and the texts, in the toolchain's
-//! cache. A `const` definition is entered the same way, handed nothing: what it answers is kept
-//! there too, as the text a unit holds a value by, under the hash of all the definition reaches,
-//! and every unit emitted after holds the value in place of the body. A statement a call runs is
+//! cache. A `const` definition is entered the same way, handed nothing: the encoding of what it
+//! answers is kept there too, under the hash of all the definition reaches, and every unit emitted
+//! after holds the value, laid out as static data, in place of the body. A statement a call runs is
 //! computed the same way and judged by `statements`.
 
 import compiler.syntax.exprs (TaggedPart)
@@ -17,11 +17,12 @@ import compiler.store.hash.encoding (hex)
 import compiler.front.interface (sized)
 import compiler.syntax.lexer (utf8_len)
 import compiler.load (every_root, LoadedAnalysis)
+import compiler.emit.keys (RootKey, Named, Stored)
 import compiler.syntax.parsing (Span, no_module, span_between)
 import compiler.check.resolve.tables (Diag, Label, error_at, error_with_labels, label_at)
-import compiler.unit (read_kept, write_kept, shipped, baked_key, compiler_roots, const_budget,
-                      const_room, emitter_identity, identity_of, keep_value, kept_value,
-                      stored_root)
+import compiler.unit (shipped, answers_store, baked_key, compiler_roots, const_budget, const_room,
+                      emitter_identity, identity_of, stored_root)
+import compiler.store.kept (Record, kept_records, with_kept)
 import diagnostic (Place, shown)
 import env (env)
 import machine (machine, Called, default_options, unconfigured)
@@ -48,8 +49,8 @@ pub fn step_budget() -> Int = 10000000
 /// What a parser said of its texts. `Rejected` is its own `Err`: which text, where in it in
 /// characters, and why. `Raised` is a parser that raised instead of answering, and `Spent` one the
 /// budget stopped. A `const` definition is `Accepted` once its value is kept, `RaisedAt` where its
-/// raise has a place in the program, and `Oversize`, with the bytes its value's text takes, where
-/// those are past `const_room`.
+/// raise has a place in the program, and `Oversize`, with the bytes its value's encoding takes,
+/// where those are past `const_room`.
 pub type Verdict =
   | Accepted
   | Rejected({ part: Int, offset: Int, message: String })
@@ -406,8 +407,8 @@ fn verdict_of(called: Called) -> Verdict / {abort.raise} =
     },
   }
 
-/// A `const` definition's answer, as its stored root gave it: the text of its value, kept only where
-/// a build has room for it.
+/// A `const` definition's answer, as its stored root gave it: the encoding of its value, kept only
+/// where a build has room for it.
 fn value_of(called: Called) -> Judged / {abort.raise} =
   match called.answer {
     Err(raised) -> {
@@ -424,9 +425,9 @@ fn value_of(called: Called) -> Judged / {abort.raise} =
         value: None,
       }
     },
-    Ok(VBytes(text)) -> if text.len() > const_room() {
-      { verdict: Oversize(text.len()), value: None }
-    } else { { verdict: Accepted, value: Some(text) } },
+    Ok(VBytes(bytes)) -> if bytes.len() > const_room() {
+      { verdict: Oversize(bytes.len()), value: None }
+    } else { { verdict: Accepted, value: Some(bytes) } },
     Ok(value) -> { verdict: Raised("its stored root answered " ++ render(value)), value: None },
   }
 
@@ -444,12 +445,12 @@ fn callees(asked: List<Asked>) -> List<Bytes> =
     if acc.contains(a.callee) { acc } else { acc.push(a.callee) })
 
 /// What entering one definition said: its verdict, and for a `const` definition a build can keep,
-/// the text of its value.
+/// the encoding of its value.
 type Judged = { verdict: Verdict, value: Option<Bytes> }
 
 /// `asked` entered on a machine loaded for them alone: a unit of the definitions they reach, each
 /// call under `steps`. A parser is handed its texts; a `const` definition is entered through its
-/// stored root, which hands back its value as text.
+/// stored root, which hands back its value's encoding.
 fn entered(
   front: LoadedAnalysis,
   frame: Frame,
@@ -460,8 +461,9 @@ fn entered(
   if asked.len() == 0 { Ok([]) } else {
     let names = callees(asked);
     let reached = reach(frame.hashes, names.map(|n: Bytes| TheFn(n))).fns;
-    let offered = every_root(front).filter(|n: Bytes| reached.contains(n)).concat(
-      asked.filter(is_const).map(|a: Asked| stored_root(a.callee)),
+    let offered = every_root(front).filter(|k: RootKey|
+      match k { Named(d) -> reached.contains(d), _ -> false }).concat(
+      asked.filter(is_const).map(|a: Asked| Stored(Named(a.callee))),
     );
     match units::library_over(emit.unit(front, offered)) {
       Err(diags) -> Err(diags),
@@ -542,65 +544,77 @@ type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 /// the parsers on one machine and the `const` definitions on another, each under its budget.
 pub fn settling<a | e>(
   body: () -> a / {literal.verdicts, literal.statements | e},
-) -> a / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+) -> a / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
-    literal.statements(timed, frame, root, asked) ->
-      judgements(
-        below_root(env.bodies[sys]()),
-        judging(shipped.definitions(), shipped.runtime().identity, env.binary_version[sys]()),
-        root,
-        timed,
-        frame,
-        asked,
-      ),
+    // A command that settles nothing reads neither the toolchain nor its cache.
+    literal.statements(timed, frame, root, asked) -> {
+      let bodies = below_root(env.bodies[sys]());
+      let toolchain = judging(
+        shipped.definitions(),
+        shipped.runtime().identity,
+        env.binary_version[sys](),
+      );
+      with_kept[abs, lit](literals_store(bodies, toolchain), ||
+        judgements(toolchain, root, timed, frame, asked))
+    },
     literal.verdicts(timed, frame, root, asked) -> {
-      let dir = below_root(env.bodies[sys]());
-      let runtime = shipped.runtime().identity;
-      let toolchain = judging(shipped.definitions(), runtime, env.binary_version[sys]());
-      let emitter = emitter_identity(shipped.definitions());
-      let sought = asked.map(|a: Asked| {
-        let key = verdict_key(toolchain, a);
-        let value = if is_const(a) { baked_key(runtime, emitter, a.hash) } else { b"" };
-        let verdict = match read_kept[abs](dir, key) {
-          None -> None,
-          Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
-            Ok(v) -> Some(v),
-            Err(_) -> None,
-          },
-        };
-        {
-          asked: a,
-          key: key,
-          value: value,
-          // An accepted `const` definition stands only while its value is still kept.
-          kept: if is_const(a) && verdict == Some(Accepted) && kept_value[abs](dir, value) == None {
-            None
-          } else { verdict },
-        }
-      });
-      let open = sought.filter(|s: Sought| s.kept == None);
-      if open.len() == 0 { Ok(settled(sought, [])) } else {
-        // What is entered is the only verdict that reads the check's tables.
-        match program_view(timed.program) {
-          None -> Err(timed.program.diags),
-          Some(view) -> verdicts_entered(timed, view, root, dir, sought, open),
-        }
-      }
+      let bodies = below_root(env.bodies[sys]());
+      let runtime = shipped.runtime();
+      let toolchain = judging(shipped.definitions(), runtime.identity, env.binary_version[sys]());
+      // A `const` definition's value is kept beside the emitter's answers, which a unit reads it from.
+      with_kept[abs, ans](
+        answers_store(bodies, runtime, emitter_identity(shipped.definitions())),
+        ||
+          with_kept[abs, lit](literals_store(bodies, toolchain), || {
+            let sought = asked.map(|a: Asked| {
+              let key = verdict_key(toolchain, a);
+              let value = if is_const(a) { baked_key(a.hash) } else { b"" };
+              let verdict = match kept_records.get[lit](key) {
+                None -> None,
+                Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
+                  Ok(v) -> Some(v),
+                  Err(_) -> None,
+                },
+              };
+              {
+                asked: a,
+                key: key,
+                value: value,
+                // An accepted `const` definition stands only while its value is still kept.
+                kept: if is_const(a) && verdict == Some(Accepted)
+                    && kept_records.get[ans](value) == None { None }
+                else { verdict },
+              }
+            });
+            let open = sought.filter(|s: Sought| s.kept == None);
+            if open.len() == 0 { Ok(settled(sought, [])) } else {
+              // What is entered is the only verdict that reads the check's tables.
+              match program_view(timed.program) {
+                None -> Err(timed.program.diags),
+                Some(view) -> verdicts_entered(timed, view, root, sought, open),
+              }
+            }
+          }),
+      )
     },
   }
 
+/// The store of verdicts and judgements a toolchain judging as `toolchain` keeps under `bodies`.
+fn literals_store(bodies: String, toolchain: Bytes) -> String / {abort.raise} =
+  bodies ++ "/literals-" ++ blake3(toolchain).slice(0, 8).hex_of()
+
 /// The verdicts `sought` holds, `open` among them entered on machines loaded over `view`, and what
-/// they answered kept under `dir`.
+/// they answered kept: each verdict in the store of verdicts, each value beside the emitter's
+/// answers.
 fn verdicts_entered(
   timed: Timed,
   view: View,
   root: String,
-  dir: String,
   sought: List<Sought>,
   open: List<Sought>,
-) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], kept_records.put[ans], kept_records.put[lit], abort.raise} = {
   let front = front_of(
     timed,
     view,
@@ -617,19 +631,34 @@ fn verdicts_entered(
       Ok(evaluated) -> {
         let judged = parsed.concat(evaluated);
         let entries = parsers.concat(consts);
-        range(0, entries.len()).fold((), |_: Unit, i: Int|
-          match judged.at(i) {
-            None -> (),
-            Some(j) -> {
-              let s = entries.get(i);
-              match j.value { Some(text) -> keep_value[abs](dir, s.value, text), None -> () };
-              // A place is this load's, which an edit elsewhere moves under the same hash.
-              match j.verdict {
-                RaisedAt(_) -> (),
-                v -> write_kept[abs](dir, s.key, bin::encode(v, verdict_bin())),
-              }
+        let kept = range(0, entries.len()).fold(
+          { values: [], verdicts: [] },
+          |acc: { values: List<Record>, verdicts: List<Record> }, i: Int|
+            match judged.at(i) {
+              None -> acc,
+              Some(j) -> {
+                let s = entries.get(i);
+                let values = match j.value {
+                  Some(bytes) -> acc.values.push({ key: s.value, bytes: bytes }),
+                  None -> acc.values,
+                };
+                // A place is this load's, which an edit elsewhere moves under the same hash.
+                match j.verdict {
+                  RaisedAt(_) -> { values: values, verdicts: acc.verdicts },
+                  v ->
+                    {
+                      values: values,
+                      verdicts: acc.verdicts.push({
+                        key: s.key,
+                        bytes: bin::encode(v, verdict_bin()),
+                      }),
+                    },
+                }
+              },
             },
-          });
+        );
+        kept_records.put[ans](kept.values);
+        kept_records.put[lit](kept.verdicts);
         Ok(
           settled(
             sought,
@@ -651,19 +680,18 @@ type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
 /// Each statement's judgement: the one kept for it, or the one the statements not kept were judged
 /// to, in their order.
 fn judgements(
-  dir: String,
   toolchain: Bytes,
   root: String,
   timed: Timed,
   frame: Frame,
   asked: List<statements::Asked>,
-) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], kept_records.get[lit], kept_records.put[lit], abort.raise} = {
   let keyed = asked.map(|a: statements::Asked| {
     let key = judgement_key(toolchain, step_budget(), a);
     {
       asked: a,
       key: key,
-      kept: match read_kept[abs](dir, key) {
+      kept: match kept_records.get[lit](key) {
         None -> None,
         Some(bytes) -> match bin::decode(bytes, judgement_bin()) {
           Ok(j) -> Some(j),
@@ -688,11 +716,13 @@ fn judgements(
       } {
       Err(diags) -> Err(diags),
       Ok(found) -> {
-        range(0, open.len()).fold((), |_: Unit, i: Int|
-          match found.at(i) {
-            Some(j) -> write_kept[abs](dir, open.get(i).key, bin::encode(j, judgement_bin())),
-            None -> (),
-          });
+        kept_records.put[lit](
+          range(0, open.len()).fold([], |acc: List<Record>, i: Int|
+            match found.at(i) {
+              Some(j) -> acc.push({ key: open.get(i).key, bytes: bin::encode(j, judgement_bin()) }),
+              None -> acc,
+            }),
+        );
         Ok(
           keyed.fold(
             { out: [], next: 0 },
@@ -843,7 +873,7 @@ test "verdicts kept come back in the order they were sought, the rest from what 
   assert_eq(settled(sought, [Spent, Raised("x")]), [Spent, Accepted, Raised("x")])
 }
 
-test "a `const` definition's answer is its value's text, kept only where a build has room" {
+test "a `const` definition's answer is its value's encoding, kept only where a build has room" {
   let answered = |v: Value| value_of({ answer: Ok(v), warnings: [] });
   assert_eq(answered(VBytes(b"78")), { verdict: Accepted, value: Some(b"78") });
   assert_eq(answered(VInt(1)).verdict, Raised("its stored root answered 1"));

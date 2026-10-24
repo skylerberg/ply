@@ -1,0 +1,242 @@
+//! Types with the places a crossing hands over carried marked on them.
+
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, int_type, option_type,
+                    row_empty)
+import std.list
+import emit.keys
+import emit.keys (RootKey, TypeOp)
+
+// Written code holds a type with the places a crossing hands over carried wrapped as `^`: a key
+// says them as marks on the type without, and a part's filed type says them as wrappers, which
+// `marks_of` reads back into its key.
+
+/// `t`, a value crossing carried.
+fn carried_type(t: Type) -> Type = TyCon({ name: b"^", args: [t] })
+
+/// Types being walked place by place: those made so far, the places they marked, and the place
+/// the next one starts at.
+type Placed = { tys: List<Type>, marks: List<Int>, next: Int }
+
+/// `t` with the places `marks` names wrapped as carried. The places number `t` 0, then each part's in
+/// order: a type's arguments, a record's fields as its type holds them, by name, a function's
+/// parameters and then its answer.
+pub fn marked_type(t: Type, marks: List<Int>) -> Type / {abort.raise} =
+  if marks.len() == 0 { t } else { marked_from(t, marks, 0).ty }
+
+fn marked_from(t: Type, marks: List<Int>, at: Int) -> { ty: Type, next: Int } / {abort.raise} = {
+  let step = |acc: Placed, p: Type| {
+    let r = marked_from(p, marks, acc.next);
+    { ..acc, tys: acc.tys.push(r.ty), next: r.next }
+  };
+  let start = { tys: [], marks: [], next: at + 1 };
+  let made = match t {
+    TyCon(c) -> {
+      let r = c.args.fold(start, step);
+      { ty: TyCon({ ..c, args: r.tys }), next: r.next }
+    },
+    TyRecord(fs) -> {
+      let r = fs.fold(start, |acc: Placed, f: Field| step(acc, f.ty));
+      {
+        ty: TyRecord(range(0, fs.len()).map(|i: Int| { ..fs.get(i), ty: r.tys.get(i) })),
+        next: r.next,
+      }
+    },
+    TyNominal(x) -> {
+      let r = x.fields.fold(start, |acc: Placed, f: Field| step(acc, f.ty));
+      {
+        ty: TyNominal({
+          ..x,
+          fields: range(0, x.fields.len()).map(|i: Int| { ..x.fields.get(i), ty: r.tys.get(i) }),
+        }),
+        next: r.next,
+      }
+    },
+    TyFn(f) -> {
+      let r = step(f.params.fold(start, step), f.ret);
+      {
+        ty: TyFn({ ..f, params: r.tys.take(f.params.len()), ret: r.tys.get(f.params.len()) }),
+        next: r.next,
+      }
+    },
+    TyVar(_) -> { ty: t, next: at + 1 },
+  };
+  { ty: if marks.contains(at) { carried_type(made.ty) } else { made.ty }, next: made.next }
+}
+
+/// `t` without its carried wrappers, and the places they marked.
+pub fn marks_of(t: Type) -> { ty: Type, marks: List<Int> } / {abort.raise} = {
+  let r = unmarked_from(t, 0);
+  { ty: r.ty, marks: r.marks }
+}
+
+fn unmarked_from(t: Type, at: Int) -> { ty: Type, marks: List<Int>, next: Int } / {abort.raise} = {
+  let step = |acc: Placed, p: Type| {
+    let r = unmarked_from(p, acc.next);
+    { tys: acc.tys.push(r.ty), marks: acc.marks.concat(r.marks), next: r.next }
+  };
+  let start = { tys: [], marks: [], next: at + 1 };
+  match t {
+    TyCon(c) -> if c.name == b"^" && c.args.len() == 1 {
+      let r = c.args.fold({ tys: [], marks: [at], next: at }, step);
+      { ty: r.tys.get(0), marks: r.marks, next: r.next }
+    } else {
+      let r = c.args.fold(start, step);
+      { ty: TyCon({ ..c, args: r.tys }), marks: r.marks, next: r.next }
+    },
+    TyRecord(fs) -> {
+      let r = fs.fold(start, |acc: Placed, f: Field| step(acc, f.ty));
+      {
+        ty: TyRecord(range(0, fs.len()).map(|i: Int| { ..fs.get(i), ty: r.tys.get(i) })),
+        marks: r.marks,
+        next: r.next,
+      }
+    },
+    TyNominal(x) -> {
+      let r = x.fields.fold(start, |acc: Placed, f: Field| step(acc, f.ty));
+      {
+        ty: TyNominal({
+          ..x,
+          fields: range(0, x.fields.len()).map(|i: Int| { ..x.fields.get(i), ty: r.tys.get(i) }),
+        }),
+        marks: r.marks,
+        next: r.next,
+      }
+    },
+    TyFn(f) -> {
+      let r = step(f.params.fold(start, step), f.ret);
+      {
+        ty: TyFn({ ..f, params: r.tys.take(f.params.len()), ret: r.tys.get(f.params.len()) }),
+        marks: r.marks,
+        next: r.next,
+      }
+    },
+    TyVar(_) -> { ty: t, marks: [], next: at + 1 },
+  }
+}
+
+/// The places of `t` a function stands at, which a crossing hands over carried: a function crosses
+/// as the closure it is, which no encoding holds. A sum's constructors are no places of its type.
+pub fn function_marks(t: Type) -> List<Int> / {abort.raise} = marks_of(functions_wrapped(t)).marks
+
+fn functions_wrapped(t: Type) -> Type / {abort.raise} =
+  match t {
+    TyFn(_) -> carried_type(t),
+    TyCon(c) ->
+      TyCon({
+        ..c,
+        args: c.args.fold([], |acc: List<Type>, a: Type| acc.push(functions_wrapped(a))),
+      }),
+    TyRecord(fs) ->
+      TyRecord(
+        fs.fold([], |acc: List<Field>, f: Field| acc.push({ ..f, ty: functions_wrapped(f.ty) })),
+      ),
+    TyNominal(x) ->
+      TyNominal({
+        ..x,
+        fields: x.fields.fold([], |acc: List<Field>, f: Field|
+          acc.push({ ..f, ty: functions_wrapped(f.ty) })),
+      }),
+    TyVar(_) -> t,
+  }
+
+/// `t` without its carried wrappers: the type of a value written code holds.
+pub fn plain(t: Type) -> Type / {abort.raise} = marks_of(t).ty
+
+/// What an operation's own type parameters `own` are where its declared type `declared` is met by
+/// `actual`: `actual` with each place a parameter of them stands at in `declared` wrapped as carried,
+/// and the type each parameter stands for there, in the order they are met. A part `declared` says
+/// nothing of (`_`) holds none of them.
+pub fn carried_by(
+  declared: Type,
+  actual: Type,
+  own: List<Int>,
+) -> { marked: Type, bound: List<{ var: Int, ty: Type }> } / {abort.raise} =
+  match declared {
+    TyVar(v) -> if own.contains(v) {
+      { marked: carried_type(actual), bound: [{ var: v, ty: actual }] }
+    } else { { marked: actual, bound: [] } },
+    TyCon(d) -> match actual {
+      TyCon(a) -> if d.name != a.name || d.args.len() != a.args.len() {
+        { marked: actual, bound: [] }
+      } else {
+        let r = d.args.fold(
+          { tys: [], bound: [], i: 0 },
+          |acc: { tys: List<Type>, bound: List<{ var: Int, ty: Type }>, i: Int }, dt: Type| {
+            let x = carried_by(dt, a.args.get(acc.i), own);
+            { tys: acc.tys.push(x.marked), bound: acc.bound.concat(x.bound), i: acc.i + 1 }
+          },
+        );
+        { marked: TyCon({ ..a, args: r.tys }), bound: r.bound }
+      },
+      _ -> { marked: actual, bound: [] },
+    },
+    TyRecord(dfs) -> match actual {
+      TyRecord(afs) -> {
+        let r = carried_fields(dfs, afs, own);
+        { marked: TyRecord(r.fields), bound: r.bound }
+      },
+      _ -> { marked: actual, bound: [] },
+    },
+    TyNominal(dx) -> match actual {
+      TyNominal(ax) -> {
+        let r = carried_fields(dx.fields, ax.fields, own);
+        { marked: TyNominal({ ..ax, fields: r.fields }), bound: r.bound }
+      },
+      _ -> { marked: actual, bound: [] },
+    },
+    TyFn(df) -> match actual {
+      TyFn(af) -> if df.params.len() != af.params.len() { { marked: actual, bound: [] } } else {
+        let r = df.params.fold(
+          { tys: [], bound: [], i: 0 },
+          |acc: { tys: List<Type>, bound: List<{ var: Int, ty: Type }>, i: Int }, dt: Type| {
+            let x = carried_by(dt, af.params.get(acc.i), own);
+            { tys: acc.tys.push(x.marked), bound: acc.bound.concat(x.bound), i: acc.i + 1 }
+          },
+        );
+        let ret = carried_by(df.ret, af.ret, own);
+        { marked: TyFn({ ..af, params: r.tys, ret: ret.marked }), bound: r.bound.concat(ret.bound) }
+      },
+      _ -> { marked: actual, bound: [] },
+    },
+  }
+
+fn carried_fields(
+  declared: List<Field>,
+  actual: List<Field>,
+  own: List<Int>,
+) -> { fields: List<Field>, bound: List<{ var: Int, ty: Type }> } / {abort.raise} =
+  declared.fold(
+    { fields: actual, bound: [] },
+    |acc: { fields: List<Field>, bound: List<{ var: Int, ty: Type }> }, df: Field|
+      match actual.find(|f: Field| f.name == df.name) {
+        None -> acc,
+        Some(af) -> {
+          let x = carried_by(df.ty, af.ty, own);
+          {
+            fields: acc.fields.map(|f: Field|
+              if f.name == df.name { { ..f, ty: x.marked } } else { f }),
+            bound: acc.bound.concat(x.bound),
+          }
+        },
+      },
+  )
+
+/// Root `op` of `marked`, as `module` asks for it: keyed by the type without its wrappers and the
+/// places they marked.
+pub fn marked_key(op: TypeOp, marked: Type, module: Bytes) -> RootKey / {abort.raise} = {
+  let m = marks_of(marked);
+  keys::marked(keys::written(op, m.ty, module), m.marks)
+}
+
+test "a function a value holds at a place is carried there, and marked as `marked_type` marks it" {
+  let f = TyFn({ params: [int_type()], ret: int_type(), effects: row_empty() });
+  assert_eq(function_marks(f), [0]);
+  assert_eq(function_marks(option_type(f)), [1]);
+  let r = TyRecord([{ name: b"f", ty: f }, { name: b"n", ty: int_type() }]);
+  assert_eq(function_marks(r), [1]);
+  assert_eq(
+    marked_type(r, function_marks(r)),
+    TyRecord([{ name: b"f", ty: carried_type(f) }, { name: b"n", ty: int_type() }]),
+  );
+  assert_eq(function_marks(int_type()), [])
+}

@@ -37,30 +37,88 @@ fn every_builtin_has_a_helper_of_its_own() {
 /// past the context, whether it answers, and whether what it answers may be a raise.
 #[test]
 fn a_natives_signature_is_its_functions_type() {
+    use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
+    use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
     use ply_compiled::native::{Native, Raising, Signature};
     use ply_compiled::rt::Ctx;
-    let of = |words, answers, raises| Signature {
-        words,
-        answers,
+    let of = |params: &'static [Machine], answer, raises| Signature {
+        params,
+        answer,
         raises,
     };
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx) as Native>::SIGNATURE,
-        of(0, false, false)
+        of(&[], None, false)
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word as Native>::SIGNATURE,
-        of(2, true, false)
+        of(&[Machine::Word, Words], Some(Machine::Word), false)
     );
     assert_eq!(
         <unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word, Word) -> Raising as Native>::SIGNATURE,
-        of(6, true, true)
+        of(&[Machine::Word; 6], Some(Machine::Word), true)
+    );
+    type Typed = unsafe extern "C" fn(
+        *mut Ctx,
+        ply_compiled::native::Addr,
+        ply_compiled::native::I64,
+        Handed,
+        *const PlyType,
+    ) -> ply_compiled::native::I64;
+    assert_eq!(
+        <Typed as Native>::SIGNATURE,
+        of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
     let push = ply_core::Builtin::from_name("List::push").expect("a builtin");
-    assert_eq!(ply_compiled::rt::signature(push), of(2, true, false));
+    let words = of(&[Machine::Word; 2], Some(Machine::Word), false);
+    assert_eq!(ply_compiled::rt::signature(push), words);
     let at = ply_core::Builtin::from_name("Bytes::at").expect("a builtin");
-    assert_eq!(ply_compiled::rt::signature(at), of(2, true, true));
+    assert_eq!(
+        ply_compiled::rt::signature(at),
+        Signature {
+            raises: true,
+            ..words
+        }
+    );
+}
+
+/// A native over machine data is bound as a builtin's helper is, under the name the compiler gives
+/// it, which neither a builtin nor another of them has, at the words and kinds its function takes.
+#[test]
+fn every_native_over_machine_data_has_a_helper_of_its_own() {
+    use ply_compiled::c::machine_natives;
+    use ply_compiled::native::Machine;
+    let machine = machine_natives();
+    assert!(machine.len() > 30, "only {} machine natives", machine.len());
+    for n in machine {
+        assert!(
+            n.name.starts_with('?'),
+            "`{}` is no name the compiler declares",
+            n.name
+        );
+        assert!(
+            ply_core::Builtin::from_name(n.name).is_none(),
+            "`{}`",
+            n.name
+        );
+        let name = builtin_helper_name(n.name);
+        let found: Vec<_> = helpers().iter().filter(|h| h.name == name).collect();
+        assert_eq!(found.len(), 1, "`{name}`");
+        assert_eq!(found[0].args, n.signature.words(), "`{name}`");
+        assert_eq!(found[0].answers, n.signature.answers(), "`{name}`");
+        assert!(
+            !n.signature.params.contains(&Machine::Word),
+            "`{}` takes a uniform word",
+            n.name
+        );
+    }
+    let out_str = machine
+        .iter()
+        .find(|n| n.name == "?out_str")
+        .expect("`?out_str`");
+    assert_eq!(out_str.signature.params, [Machine::Addr, Machine::I64]);
+    assert_eq!(out_str.signature.answer, None);
 }
 
 #[test]
@@ -430,7 +488,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 #[test]
 fn a_unit_says_its_constants_slots_and_what_its_types_state() {
     let with = "helpers 0\nctors 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\n\
-                consts 0\nbuiltins 0\nfields 0\nshapes 0\n";
+                builtins 0\nfields 0\nshapes 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert!(read.instances.is_empty());
@@ -460,6 +518,40 @@ fn a_unit_says_its_constants_slots_and_what_its_types_state() {
     assert!(
         ply_compiled::c::Exports::decode(&format!("{with}instances 1\nm.N - - m.add\n")).is_none()
     );
+}
+
+/// A unit whose constants are its own static data writes no `consts` table, which reads as no
+/// constants; a unit that pools constants writes the table, which reads back as written.
+#[test]
+fn a_units_consts_table_reads_where_it_has_one_and_as_none_where_it_has_not() {
+    let without = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                   builtins 0\nfields 0\nshapes 0\n";
+    let read = ply_compiled::c::Exports::decode(without).expect("a table with no consts reads");
+    assert!(read.consts.is_empty());
+    assert_eq!(read.encode(), without);
+    let with = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                consts 2\ns 6869\nu\nbuiltins 0\nfields 0\nshapes 0\n";
+    let read = ply_compiled::c::Exports::decode(with).expect("a table with consts reads");
+    assert_eq!(read.consts.len(), 2);
+    assert_eq!(read.encode(), with);
+}
+
+/// A unit entered encoded names each root it is entered at on a line of its own after its tables,
+/// among lines a runtime that does not know them reads as nothing.
+#[test]
+fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
+    let tables = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
+                  builtins 0\nfields 0\nshapes 0\n";
+    let said = format!("{tables}ints held raw\nentered m.main\nentered m.run\n");
+    let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");
+    assert_eq!(read.entered, ["m.main", "m.run"]);
+    assert!(read.layout.raw_ints);
+    assert_eq!(read.encode(), said);
+    let unknown = format!("{tables}entered m.main\na line a later unit says\n");
+    let read = ply_compiled::c::Exports::decode(&unknown).expect("the table reads");
+    assert_eq!(read.entered, ["m.main"]);
+    let words = ply_compiled::c::Exports::decode(tables).expect("the table reads");
+    assert!(words.entered.is_empty());
 }
 
 /// `N` states its arithmetic: `add`, `sub` and `mul` take two words and `neg` and `of_int` one.

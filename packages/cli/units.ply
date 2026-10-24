@@ -9,8 +9,10 @@ import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
 import compiler.cc (compilers, toolchain, TooWide)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Baked, Dropped, Emission, Made, shipped, baked_key, emitted, emitter_identity,
-                      held, kept_value, read_kept, write_kept)
+import compiler.unit (Baked, Dropped, Emission, Made, Scoped, scope_key, shipped, answers_store,
+                      baked_key, emitted, emitter_identity, held)
+import compiler.store.kept (Record, kept_records, with_kept)
+import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text)
 import env (env)
 import sources
 import std.fs (fs)
@@ -27,7 +29,7 @@ pub type Emitted = { text: Bytes, made: Made }
 /// is a function of what is asked, and the library of the C and the compiler, so the effect is a
 /// deterministic one, whatever the answering keeps.
 pub effect emit {
-  read unit(front: LoadedAnalysis, offered: List<Bytes>) -> Result<Emitted, List<Diag>>
+  read unit(front: LoadedAnalysis, offered: List<RootKey>) -> Result<Emitted, List<Diag>>
   /// The library `text`, a unit's C, compiles into under `profile`, `development` or `release`:
   /// its path, which the runtime opens.
   read compiled(text: Bytes, profile: String) -> Result<String, List<Diag>>
@@ -35,7 +37,7 @@ pub effect emit {
 
 fn emitted_of(
   front: LoadedAnalysis,
-  offered: List<Bytes>,
+  offered: List<RootKey>,
   emission: Result<Emission, Bytes>,
 ) -> Result<Emitted, List<Diag>> / {abort.raise} =
   match held(front.dump, offered, emission) {
@@ -73,9 +75,9 @@ fn knobs() -> Knobs / {env.var[sys]} =
   }
 
 /// `offered` with only the definitions `PLY_C_ONLY` names, and none under a prefix `PLY_C_SKIP` names.
-fn narrowed(k: Knobs, offered: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  offered.filter(|n: Bytes| {
-    let name = String::of_bytes(n);
+fn narrowed(k: Knobs, offered: List<RootKey>) -> List<RootKey> / {abort.raise} =
+  offered.filter(|r: RootKey| {
+    let name = String::of_bytes(root_text(root_name(r)));
     let wanted = match k.only {
       None -> true,
       Some(names) -> names.filter(|w: String| w == name).len() > 0,
@@ -96,7 +98,7 @@ fn told(
       if k.refusals {
         e.produced.dropped.fold((), |_: Unit, d: Dropped|
           process.err[proc](
-            "C backend refused `" ++ String::of_bytes(d.function) ++ "`: "
+            "C backend refused `" ++ String::of_bytes(root_text(d.function)) ++ "`: "
               ++ String::of_bytes(d.construct),
           ));
         process.err[proc](
@@ -119,52 +121,70 @@ fn told(
 
 // --- What a build kept of a `const` definition -----------------------------------
 
-/// The values kept of the `const` definitions among `wanted`. One with none kept is left to its
-/// body, which answers the same: a build keeps each before anything runs, and a program no build
-/// kept the values of, a mutant among them, runs without.
-fn kept_values(
+/// The values kept of the `const` definitions among `wanted`, read through `read`. One with none
+/// kept is left to its body, which answers the same: a build keeps each before anything runs, and a
+/// program no build kept the values of, a mutant among them, runs without.
+fn kept_values<| e>(
   rows: List<BakedRow>,
-  wanted: List<Bytes>,
-  runtime: Bytes,
-  emitter: Bytes,
-  dir: String,
-) -> List<Baked> / {fs.read[abs], fs.write[abs], time.now_ms, abort.raise} =
+  wanted: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+) -> List<Baked> / e =
   if rows.len() == 0 { [] } else {
-    let offered = wanted.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+    let offered = wanted.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
+      acc.insert(root_name(k), true));
     rows.fold([], |acc: List<Baked>, row: BakedRow|
-      if !offered.contains(row.name) { acc } else {
-        match kept_value[abs](dir, baked_key(runtime, emitter, row.hash)) {
-          Some(text) -> acc.push({ name: row.name, text: text }),
+      if !offered.contains(root_name(Named(row.name))) { acc } else {
+        match read(baked_key(row.hash)) {
+          Some(bytes) -> acc.push({ name: row.name, bytes: bytes }),
           None -> acc,
         }
       })
   }
 
 /// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
-/// the toolchain's cache.
+/// the toolchain's cache: the unit, and the scope it walked under for an ask of another unit of this
+/// program, or `None` where the walk built no scope to keep.
 fn unit_of(
   front: LoadedAnalysis,
-  offered: List<Bytes>,
-) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+  offered: List<RootKey>,
+  scoped: Option<Scoped>,
+) -> { unit: Result<Emitted, List<Diag>>, scoped: Option<Scoped> } / {shipped.runtime, shipped.definitions, env.bodies[sys], env.var[sys], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let k = knobs();
   let wanted = narrowed(k, offered);
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped.runtime();
-  let dir = kept_dir();
   let started = time.elapsed_ms();
-  let emission = emitted(
-    runtime,
-    front.dump,
-    texts(front),
-    front.inputs,
-    wanted,
-    identity,
-    |key: Bytes| read_kept[abs](dir, key),
-    |key: Bytes, bytes: Bytes| write_kept[abs](dir, key, bytes),
-    kept_values(front.dump.baked, wanted, runtime.identity, identity, dir),
-  );
+  // The roots the program offers, not the ones this ask wants: a scope read for this ask holds the
+  // facts of every root another ask of the same program may name, so both walk under one scope.
+  let facts_of = every_root(front);
+  let key = scope_key(front.dump, texts(front), front.inputs, facts_of);
+  let scope = match scoped {
+    Some(s) -> if s.key == key { Some(s.scope) } else { None },
+    None -> None,
+  };
+  let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), || {
+    let read = |key: Bytes| kept_records.get[ans](key);
+    emitted(
+      runtime,
+      front.dump,
+      texts(front),
+      front.inputs,
+      wanted,
+      read,
+      |rs: List<Record>| kept_records.put[ans](rs),
+      kept_values(front.dump.baked, wanted, read),
+      scope_held: scope,
+      facts_of: Some(facts_of),
+    )
+  });
   told(k, wanted.len(), emission, identity, time.elapsed_ms() - started);
-  emitted_of(front, wanted, emission)
+  {
+    unit: emitted_of(front, wanted, emission),
+    scoped: match emission {
+      Ok(e) -> match e.scope { Some(s) -> Some({ key: key, scope: s }), None -> None },
+      Err(_) -> None,
+    },
+  }
 }
 
 /// A unit's C alone, for whoever only enters it.
@@ -172,11 +192,12 @@ pub fn text_of(r: Result<Emitted, List<Diag>>) -> Result<Bytes, List<Diag>> =
   match r { Ok(e) -> Ok(e.text), Err(diags) -> Err(diags) }
 
 /// The whole program's unit, every root it offers, and what it was made of.
-pub fn whole_emitted(front: LoadedAnalysis) -> Result<Emitted, List<Diag>> / {emit.unit} =
-  emit.unit(front, every_root(front))
+pub fn whole_emitted(
+  front: LoadedAnalysis,
+) -> Result<Emitted, List<Diag>> / {emit.unit, abort.raise} = emit.unit(front, every_root(front))
 
 /// The whole program's unit, as the runtime compiles it.
-pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit} =
+pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, abort.raise} =
   text_of(whole_emitted(front))
 
 /// The library the whole program's unit compiles into under `profile`, or none for a run that
@@ -185,7 +206,7 @@ pub fn wanted(
   front: LoadedAnalysis,
   build: Bool,
   profile: String,
-) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled} =
+) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled, abort.raise} =
   if !build { Ok(None) } else {
     match whole(front) {
       Err(diags) -> Err(diags),
@@ -211,7 +232,12 @@ pub fn emitting<a | e>(
   handle {
     body()
   } with {
-    emit.unit(front, offered) -> unit_of(front, offered),
+    var scoped: Option<Scoped> = None,
+    emit.unit(front, offered) -> {
+      let r = unit_of(front, offered, scoped);
+      scoped = r.scoped;
+      r.unit
+    },
     emit.compiled(text, profile) -> compiled_of(text, profile),
   }
 
@@ -230,11 +256,13 @@ pub fn library_over(
 
 // --- Compiling a unit ---------------------------------------------------------------
 
-/// Which compiler a profile compiles with, and at what level.
-/// `PLY_C_PROFILE` wins over the flag. `development` compiles fast for code that runs slowly enough:
-/// tcc where it is installed, else `cc -O0`; `release` is `cc -O2`. `PLY_CC` names `cc`'s program and
-/// is used whatever the profile, and `PLY_CC_OPT` names the level.
-fn chosen(profile: String) -> { tcc: Bool, level: String } / {compilers.found[tcc], env.var[sys]} = {
+/// Which compiler a profile compiles with, at what level, and whether its code checks what it
+/// assumes. `PLY_C_PROFILE` wins over the flag. `development` compiles fast for code that runs slowly
+/// enough, and checked: tcc where it is installed, else `cc -O0`; `release` is `cc -O2`. `PLY_CC`
+/// names `cc`'s program and is used whatever the profile, and `PLY_CC_OPT` names the level.
+fn chosen(
+  profile: String,
+) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], env.var[sys]} = {
   let release = match env.var[sys]("PLY_C_PROFILE") {
     Some(p) -> p == "release",
     None -> profile == "release",
@@ -246,6 +274,7 @@ fn chosen(profile: String) -> { tcc: Bool, level: String } / {compilers.found[tc
   {
     tcc: !release && env.var[sys]("PLY_CC") == None && compilers.found[tcc]() != None,
     level: level,
+    checked: !release,
   }
 }
 
@@ -262,9 +291,11 @@ fn compiled_of(
   profile: String,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.var[sys], abort.raise} = {
   let choice = chosen(profile);
-  let built = if !choice.tcc { cc::library[cc](choice.level, cc::library_flags(), text) } else {
-    match cc::library[tcc](choice.level, cc::library_flags(), text, false) {
-      Err(TooWide) -> cc::library[cc](choice.level, cc::library_flags(), text),
+  let built = if !choice.tcc {
+    cc::library[cc](choice.level, choice.checked, cc::library_flags(), text)
+  } else {
+    match cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text, false) {
+      Err(TooWide) -> cc::library[cc](choice.level, choice.checked, cc::library_flags(), text),
       by_tcc -> by_tcc,
     }
   };

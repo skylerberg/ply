@@ -45,7 +45,48 @@ pub const KIND_FIXED: u8 = 18;
 pub const KIND_DECIMAL: u8 = 19;
 /// A `Columns`: an array per field of its records (`crate::columns`).
 pub const KIND_COLUMNS: u8 = 20;
+/// A block emitted code made and lays out itself (`crate::emitted`): the runtime reads its count at
+/// offset 0 and nothing else of it, and every walker of the runtime's own objects refuses it.
+pub const KIND_REFUSED: u8 = 21;
 pub const KIND_DEAD: u8 = 255;
+/// How many kinds [`Heap::allocated_by_kind`] tells apart: every `KIND_*` an object is made with.
+pub const KINDS: usize = 32;
+
+/// What objects of `kind` are, as a census of them is told.
+pub fn kind_name(kind: u8) -> String {
+    match kind {
+        KIND_UNIT => "units",
+        KIND_BOOL => "Bools",
+        KIND_INT => "boxed Ints",
+        KIND_RECORD => "records",
+        KIND_CTOR => "constructors",
+        KIND_LIST => "lists",
+        KIND_CLOSURE => "closures",
+        KIND_BRIDGE => "bridges",
+        KIND_MAP => "maps",
+        KIND_STR => "strings",
+        KIND_BYTES => "byte strings",
+        KIND_LEAF => "list leaves",
+        KIND_BRANCH => "list branches",
+        KIND_MLEAF => "map leaves",
+        KIND_MBRANCH => "map branches",
+        KIND_ARRAY => "arrays",
+        KIND_FLOAT => "Floats",
+        KIND_FIXED => "fixed-width integers",
+        KIND_DECIMAL => "Decimals",
+        KIND_COLUMNS => "columns",
+        KIND_REFUSED => "emitted blocks",
+        _ => return format!("kind {kind}"),
+    }
+    .to_string()
+}
+
+/// The walker `walker`, handed a block emitted code laid out, which no walker reads.
+#[cold]
+#[inline(never)]
+pub(crate) fn refused(walker: &str) -> ! {
+    panic!("`{walker}` was handed a block emitted code laid out, which the runtime does not walk")
+}
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
 pub const IMMORTAL: u32 = u32::MAX;
@@ -184,6 +225,22 @@ pub fn is_imm(w: Word) -> bool {
     w & 7 != 0
 }
 
+/// No object lies below this address, so a word under it is a value of its own: 0, or a one-word
+/// sum's nullary value `8, 16, ..`, as emitted code lays them (`layout.pointer_floor`).
+pub const POINTER_FLOOR: Word = 4096;
+
+/// Whether `w` is an object's address: a multiple of eight at or above [`POINTER_FLOOR`].
+#[inline]
+pub fn is_object(w: Word) -> bool {
+    !is_imm(w) && w >= POINTER_FLOOR
+}
+
+/// Whether `w` is `()`: the runtime's own object, or the word 0 emitted code holds one as.
+#[inline]
+pub fn is_unit(w: Word) -> bool {
+    w == 0 || w == unit()
+}
+
 /// Whether `w` is an `Int` held in the word.
 #[inline]
 pub fn is_int(w: Word) -> bool {
@@ -307,7 +364,7 @@ pub fn small_bytes(b: &[u8]) -> Option<Word> {
 
 /// The poison diagnostic: the dead-payload word and the check every object read passes.
 pub mod poison {
-    use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_imm};
+    use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_object};
 
     /// Dead by its header and immortal by its count: a read through it is caught, never counted.
     static POISONED: Obj = Obj {
@@ -339,7 +396,7 @@ pub mod poison {
 
     /// Panics, naming the body's site, when `w` is the poison word or points at a dead header.
     pub fn check(w: Word) {
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             return;
         }
         let why = if w == word() {
@@ -1057,6 +1114,7 @@ impl Layouts {
                         .map(|k| (k * stride, slot))
                         .collect()
                 }
+                KIND_REFUSED => refused("Layouts::parts"),
                 _ => Vec::new(),
             }
         }
@@ -1219,7 +1277,7 @@ pub struct Heap {
     /// Objects allocated since the last reset, the bytes they took, and the objects by kind.
     count: usize,
     bytes: usize,
-    by_kind: [usize; 16],
+    by_kind: [usize; KINDS],
     /// Under `PLY_HEAP_CENSUS`, allocations by kind and layout or power-of-two length.
     by_layout: HashMap<(u8, u32), usize>,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
@@ -1232,6 +1290,69 @@ pub struct Heap {
 thread_local! {
     /// The running entry's heap, which dying objects return to; entries never nest on a thread.
     static CURRENT: std::cell::Cell<*mut Heap> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The live objects of `blocks` tallied under what `key` makes of each one's kind, `layout` and
+/// payload bytes, with their count and payload bytes: for a block emitted code laid out, what its
+/// block holds past the header.
+pub(crate) fn live_in<K: Ord>(
+    blocks: &Blocks,
+    key: impl Fn(u8, u32, usize) -> K,
+) -> std::collections::BTreeMap<K, (usize, usize)> {
+    let mut tally: std::collections::BTreeMap<K, (usize, usize)> = Default::default();
+    blocks.each(|block, bytes| {
+        let o: *mut Obj = block.cast();
+        let (kind, rc, layout) = unsafe { ((*o).kind, (*o).rc, (*o).layout) };
+        if kind == KIND_DEAD || rc == 0 {
+            return;
+        }
+        let size = match kind {
+            KIND_REFUSED => bytes - HEADER,
+            // Unsized: the header alone.
+            _ => match unsafe { payload_bytes(o) } {
+                usize::MAX => HEADER,
+                size => size,
+            },
+        };
+        let e = tally.entry(key(kind, layout, size)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += size;
+    });
+    tally
+}
+
+/// The live objects of `blocks` by what their headers say they are, as [`Heap::census`] reads them.
+pub(crate) fn census_in(blocks: &Blocks) -> Vec<((u8, u32), usize, usize)> {
+    let mut rows: Vec<((u8, u32), usize, usize)> =
+        live_in(blocks, |kind, layout, size| match kind {
+            KIND_RECORD | KIND_CTOR => (kind, layout),
+            KIND_REFUSED => (kind, u32::try_from(size).unwrap_or(u32::MAX)),
+            _ => (kind, 0),
+        })
+        .into_iter()
+        .map(|(k, (n, b))| (k, n, b))
+        .collect();
+    rows.sort_by_key(|&(k, _, b)| (std::cmp::Reverse(b), k));
+    rows
+}
+
+/// Two censuses as one, each sort's counts and bytes summed, the most bytes first.
+pub(crate) fn census_merged(
+    a: Vec<((u8, u32), usize, usize)>,
+    b: Vec<((u8, u32), usize, usize)>,
+) -> Vec<((u8, u32), usize, usize)> {
+    let mut sums: std::collections::BTreeMap<(u8, u32), (usize, usize)> = Default::default();
+    for (k, n, bytes) in a.into_iter().chain(b) {
+        let e = sums.entry(k).or_insert((0, 0));
+        e.0 += n;
+        e.1 += bytes;
+    }
+    let mut rows: Vec<((u8, u32), usize, usize)> = sums
+        .into_iter()
+        .map(|(k, (n, bytes))| (k, n, bytes))
+        .collect();
+    rows.sort_by_key(|&(k, _, bytes)| (std::cmp::Reverse(bytes), k));
+    rows
 }
 
 /// The entry beginning on this thread allocates from `heap`; its dead objects go back to it.
@@ -1272,14 +1393,13 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => 16,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
             KIND_BRIDGE => BRIDGE_BYTES,
+            KIND_REFUSED => refused("payload_bytes"),
             _ => usize::MAX,
         }
     }
 }
 
-/// Gives a dead object's block back. Only the heap that owns the block may: its bridge leaves the
-/// table first, so the bridge that takes the block next is not listed twice, and a bridge another
-/// heap owns stays listed there, dead, until that heap's end.
+/// A dead object's block, given back as [`give_back`] says.
 unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     unsafe {
         let size = payload_bytes(o);
@@ -1288,7 +1408,15 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         if size == usize::MAX {
             return;
         }
-        let object = Heap::object_size(size);
+        give_back(o, heap, Heap::object_size(size), bridge);
+    }
+}
+
+/// Gives back a dead block of `object` bytes. Only the heap that owns the block may: its bridge
+/// leaves the table first, so the bridge that takes the block next is not listed twice, and a
+/// bridge another heap owns stays listed there, dead, until that heap's end.
+unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, bridge: bool) {
+    unsafe {
         if heap.is_null() || !(*heap).blocks.owns(o.cast(), object) {
             if !bridge {
                 blocks::hand_back(o.cast(), object);
@@ -1319,6 +1447,100 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     }
 }
 
+/// Gives back a block whose last holder was emitted code, `payload` bytes past its header, without
+/// a walk: emitted code let go of what it held. Freed so: a block of [`KIND_REFUSED`], a scalar's
+/// box, a string or bytes value, and a list's or a map's own object or node, which the runtime and
+/// emitted code both make.
+pub(crate) unsafe fn free_sized(o: *mut Obj, heap: *mut Heap, payload: usize) {
+    unsafe {
+        let (kind, rc) = ((*o).kind, (*o).rc);
+        debug_assert!(kind != KIND_DEAD, "{o:p} was freed after it died");
+        debug_assert!(rc == 1 || rc == SHARED, "{o:p} was freed with holders left");
+        debug_assert!(
+            matches!(
+                kind,
+                KIND_REFUSED
+                    | KIND_INT
+                    | KIND_FLOAT
+                    | KIND_FIXED
+                    | KIND_DECIMAL
+                    | KIND_STR
+                    | KIND_BYTES
+                    | KIND_LIST
+                    | KIND_LEAF
+                    | KIND_BRANCH
+                    | KIND_MAP
+                    | KIND_MLEAF
+                    | KIND_MBRANCH
+            ),
+            "{o:p}, of kind {kind}, was freed by size, which lets go of nothing it holds"
+        );
+        let object = Heap::object_size(payload);
+        #[cfg(debug_assertions)]
+        sized_as(o, heap, object);
+        (*o).rc = 0;
+        (*o).kind = KIND_DEAD;
+        give_back(o, heap, object, false);
+    }
+}
+
+/// Panics where `o` was not allocated as `object` bytes, as far as its header or `heap`'s blocks
+/// say: a block of [`KIND_REFUSED`] tells its size class alone, which is all a free relies on.
+#[cfg(debug_assertions)]
+unsafe fn sized_as(o: *mut Obj, heap: *mut Heap, object: usize) {
+    unsafe {
+        if (*o).kind != KIND_REFUSED {
+            let had = Heap::object_size(payload_bytes(o));
+            assert_eq!(
+                had, object,
+                "{o:p}, an object of {had} bytes, was freed as {object}"
+            );
+        }
+        if let Some(had) = heap.as_ref().and_then(|h| h.blocks.bytes_at(o.addr())) {
+            assert_eq!(
+                had,
+                blocks::taken_bytes(object),
+                "{o:p} was freed as {object} bytes, and its block was taken as {had}"
+            );
+        }
+    }
+}
+
+/// Gives back a runtime handle whose last holder was emitted code, with what the runtime keeps for
+/// it, and without a walk: a bridge's value is dropped, and a hold's or a continuation's words are
+/// left unread, emitted code having let go of what a hold held.
+pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap) {
+    unsafe {
+        debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
+        match (*o).kind {
+            KIND_BRIDGE => std::ptr::drop_in_place(bridge_slot(o)),
+            KIND_CLOSURE
+                if crate::rt::hold_id(o as Word).is_some()
+                    || crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize) => {}
+            kind => {
+                panic!("`rt_handle_free` was handed an object of kind {kind}, which is no handle")
+            }
+        }
+        (*o).rc = 0;
+        recycle(o, heap);
+    }
+}
+
+/// The count of `o`, read as another thread may be changing it.
+pub(crate) unsafe fn count_of(o: *mut Obj) -> u32 {
+    count(o).load(Relaxed)
+}
+
+/// One holder fewer of a shared object whose count is its own: whether that was the last, its
+/// memory then the caller's to release.
+pub(crate) unsafe fn last_of_shared(o: *mut Obj) -> bool {
+    let last = count(o).fetch_sub(1, Release) == SHARED | 1;
+    if last {
+        std::sync::atomic::fence(Acquire);
+    }
+    last
+}
+
 impl Default for Heap {
     fn default() -> Heap {
         Heap::new()
@@ -1333,7 +1555,7 @@ impl Heap {
             persistent: false,
             count: 0,
             bytes: 0,
-            by_kind: [0; 16],
+            by_kind: [0; KINDS],
             by_layout: HashMap::new(),
             delayed: std::collections::VecDeque::new(),
             poison: poisoning(),
@@ -1357,6 +1579,11 @@ impl Heap {
         }
     }
 
+    /// `blocks` in place of the blocks this heap takes from, which it answers.
+    pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
+        std::mem::replace(&mut self.blocks, blocks)
+    }
+
     /// A heap whose entries never end: what outlives every entry lives here.
     pub fn persistent() -> Heap {
         let mut h = Heap::new();
@@ -1364,27 +1591,38 @@ impl Heap {
         h
     }
 
+    fn live_by<K: Ord>(
+        &self,
+        key: impl Fn(u8, u32, usize) -> K,
+    ) -> std::collections::BTreeMap<K, (usize, usize)> {
+        live_in(&self.blocks, key)
+    }
+
     /// Live objects by kind, with their count and payload bytes.
     pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
-        let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
-        self.blocks.each(|block| {
-            let o: *mut Obj = block.cast();
-            let (kind, rc) = unsafe { ((*o).kind, (*o).rc) };
-            if kind == KIND_DEAD || rc == 0 {
-                return;
-            }
-            let size = unsafe { payload_bytes(o) };
-            let e = tally.entry(kind).or_insert((0, 0));
-            e.0 += 1;
-            // `usize::MAX` means unsized: count the header alone.
-            e.1 += if size == usize::MAX { HEADER } else { size };
-        });
-        tally.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
+        self.live_by(|kind, _, _| kind)
+            .into_iter()
+            .map(|(k, (n, b))| (k, n, b))
+            .collect()
+    }
+
+    /// Live objects by what their headers say they are, the most bytes first, with their count and
+    /// payload bytes: a record by its kind and shape, a constructor by its kind and index, a block
+    /// emitted code laid out, whose header names no type, by its kind and payload bytes, and any
+    /// other object by its kind and 0.
+    pub fn census(&self) -> Vec<((u8, u32), usize, usize)> {
+        census_in(&self.blocks)
     }
 
     /// How many objects are live.
     pub fn live(&self) -> usize {
         self.live_by_kind().iter().map(|(_, n, _)| n).sum()
+    }
+
+    /// The bytes of the blocks the entry's live objects take, read from the pages without a walk:
+    /// a dead block waiting under `PLY_HEAP_DELAY` still counts.
+    pub fn live_bytes(&self) -> usize {
+        self.blocks.live()
     }
 
     /// The bytes of the memory holding the entry's objects, whatever is live in it.
@@ -1404,7 +1642,7 @@ impl Heap {
     }
 
     /// Allocations by kind, indexed by the `KIND_*` constants.
-    pub fn allocated_by_kind(&self) -> [usize; 16] {
+    pub fn allocated_by_kind(&self) -> [usize; KINDS] {
         self.by_kind
     }
 
@@ -1478,12 +1716,13 @@ impl Heap {
         }
         self.count += 1;
         self.bytes += size;
-        self.by_kind[kind as usize & 15] += 1;
+        self.by_kind[kind as usize % KINDS] += 1;
         if self.census {
             let key = match kind {
                 KIND_CTOR | KIND_RECORD => Some(layout),
                 // Bytes arrive with `len` zero; the class is the capacity.
                 KIND_BYTES | KIND_STR => Some((payload_bytes as u32).next_power_of_two()),
+                KIND_REFUSED => Some(u32::try_from(payload_bytes).unwrap_or(u32::MAX)),
                 _ => None,
             };
             if let Some(key) = key {
@@ -1491,31 +1730,6 @@ impl Heap {
             }
         }
         p
-    }
-
-    /// Whether `w` is a live object this heap allocated in the running entry, or a record held in
-    /// place inside one.
-    pub fn is_object(&self, w: Word) -> bool {
-        if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
-            return false;
-        }
-        let address = w as usize;
-        if !self.blocks.holds(address) {
-            if !self.blocks.within(address) {
-                return false;
-            }
-            let o = address as *const Obj;
-            let (rc, kind) = unsafe { ((*o).rc, (*o).kind) };
-            let back = 8 * (rc & !EMBEDDED) as usize;
-            return rc & EMBEDDED == EMBEDDED
-                && rc != IMMORTAL
-                && kind == KIND_RECORD
-                && back > 0
-                && back <= address
-                && self.is_object((address - back) as Word);
-        }
-        let o = w as *const Obj;
-        unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 }
     }
 
     /// A fresh object with `len` payload words, left as a recycled block's last tenant wrote them:
@@ -1787,7 +2001,7 @@ impl Heap {
 
     fn copy(&mut self, w: Word, copies: &mut HashMap<usize, Word>) -> Word {
         // Zero is an `Option` held as its payload's word: `None`.
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             return w;
         }
         let o = obj(w);
@@ -1820,6 +2034,7 @@ impl Heap {
                         .collect();
                     self.map_from_sorted(&entries)
                 }
+                KIND_REFUSED => refused("Heap::copy"),
                 kind => {
                     let (len, layout, flags) = ((*o).len, (*o).layout, (*o).flags);
                     let c = self.alloc(kind, flags, len, layout);
@@ -1863,7 +2078,7 @@ impl Heap {
         self.blocks.reset();
         self.count = 0;
         self.bytes = 0;
-        self.by_kind = [0; 16];
+        self.by_kind = [0; KINDS];
         self.by_layout.clear();
         self.delayed.clear();
     }
@@ -1949,7 +2164,7 @@ impl Heap {
                     o as Word
                 }
                 ClosureKind::Hold { held, id } => {
-                    let held = held.as_ref().map_or(0, |x| self.to_word(layouts, x));
+                    let held = held.as_ref().map(|x| self.to_word(layouts, x));
                     crate::rt::hold_word(self, held, *id)
                 }
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) | ClosureKind::Synth { .. } => {
@@ -1985,6 +2200,9 @@ impl Heap {
         }
         if is_imm(w) {
             return read_int(imm_value(w), carry, walked);
+        }
+        if is_unit(w) {
+            return Value::Unit;
         }
         walked.read += 1;
         let o = obj(w);
@@ -2097,7 +2315,7 @@ impl Heap {
                     let kind = if let Some(id) = crate::rt::hold_id(w) {
                         let held = word_at(o, CLOSURE_CAPTURES);
                         ClosureKind::Hold {
-                            held: (held != 0)
+                            held: (!crate::rt::hold_let_go(o))
                                 .then(|| Heap::to_value_counted(layouts, held, walked)),
                             id,
                         }
@@ -2131,6 +2349,7 @@ impl Heap {
                     }
                     v
                 }
+                KIND_REFUSED => refused("Heap::read"),
                 other => panic!("a word of kind {other} was read after its object died"),
             }
         }
@@ -2175,7 +2394,7 @@ impl Drop for Heap {
 /// One more holder of `w`. Zero is no object, as `ply_inc` and `ply_dec` read it.
 #[inline]
 pub fn inc(w: Word) {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return;
     }
     let o = obj(w);
@@ -2194,7 +2413,7 @@ pub fn inc(w: Word) {
 /// One holder fewer; the last one dismantles the object, children and all.
 #[inline]
 pub fn dec(w: Word) {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return;
     }
     let o = obj(w);
@@ -2237,8 +2456,7 @@ pub fn dec_shared(w: Word) {
         dec(h as Word);
         return;
     }
-    if count(o).fetch_sub(1, Release) == SHARED | 1 {
-        std::sync::atomic::fence(Acquire);
+    if unsafe { last_of_shared(o) } {
         let heap = CURRENT.with(|c| c.get());
         unsafe { release(o, heap) }
     }
@@ -2250,7 +2468,7 @@ pub fn share(words: &[Word]) -> bool {
     let mut marked: Vec<*mut Obj> = Vec::new();
     let mut pending: Vec<Word> = words.to_vec();
     while let Some(w) = pending.pop() {
-        if is_imm(w) || w == 0 {
+        if !is_object(w) {
             continue;
         }
         let o = unsafe { counted_by(obj(w)) };
@@ -2265,6 +2483,7 @@ pub fn share(words: &[Word]) -> bool {
                 KIND_CLOSURE => {
                     !crate::detached::is_continuation(word_at(o, CLOSURE_CODE) as usize)
                 }
+                KIND_REFUSED => refused("share"),
                 _ => true,
             }
         };
@@ -2333,7 +2552,7 @@ unsafe fn release(o: *mut Obj, heap: *mut Heap) {
 /// after releasing anything else. It keeps its width and is marked flat, so a token released unused
 /// walks nothing and goes back to the free list of its own size.
 pub fn reset(w: Word) -> Word {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return 0;
     }
     let o = obj(w);
@@ -2408,6 +2627,7 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
             KIND_CLOSURE => [(CLOSURE_CAPTURES, (*o).len as usize), (0, 0)],
             // The value whose bytes it views.
             KIND_STR | KIND_BYTES if (*o).flags & VIEW != 0 => [(0, 1), (0, 0)],
+            KIND_REFUSED => refused("child_ranges"),
             _ => [(0, 0), (0, 0)],
         }
     }
@@ -2416,6 +2636,9 @@ unsafe fn child_ranges(o: *mut Obj) -> [(usize, usize); 2] {
 /// `o`, held once, dies: its children are released and its header marked dead.
 unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
     unsafe {
+        if (*o).kind == KIND_REFUSED {
+            refused("dismantle");
+        }
         // A shared object reaches here with its count's own bits spent.
         debug_assert!(((*o).rc == SHARED || (*o).rc == 1) && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
@@ -2433,7 +2656,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, hea
                 continue;
             }
             let c = word_at(o, i);
-            if is_imm(c) || c == 0 {
+            if !is_object(c) {
                 continue;
             }
             let co = counted_by(obj(c));
@@ -2479,6 +2702,9 @@ pub fn mark_immortal(w: Word) {
             if (*o).rc == IMMORTAL {
                 continue;
             }
+            if (*o).kind == KIND_REFUSED {
+                refused("mark_immortal");
+            }
             (*o).rc = IMMORTAL;
             pending.extend(children(o));
         }
@@ -2511,6 +2737,7 @@ pub fn world_independent(w: Word) -> bool {
                         return false;
                     }
                 }
+                KIND_REFUSED => refused("world_independent"),
                 _ => pending.extend(children(o)),
             }
         }
@@ -2532,7 +2759,7 @@ unsafe fn counted_view(o: *mut Obj, by: i32) {
 /// Whether bytes or a string `w` may grow in place: no holder but one has it, besides the views of
 /// it, which read only bytes it already holds.
 pub fn grows_in_place(w: Word) -> bool {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return false;
     }
     let o = obj(w);
@@ -2586,7 +2813,7 @@ pub fn as_int(w: Word) -> Option<i64> {
 
 #[inline]
 pub fn as_bool(w: Word) -> Option<bool> {
-    if is_imm(w) || w == 0 {
+    if !is_object(w) {
         return None;
     }
     let o = obj(w);
@@ -2606,6 +2833,9 @@ fn rank(w: Word) -> u8 {
     }
     if is_imm(w) {
         return 2;
+    }
+    if is_unit(w) {
+        return 0;
     }
     let o = obj(w);
     unsafe {
@@ -2644,6 +2874,7 @@ fn rank(w: Word) -> u8 {
                 Value::Char(_) => 16,
                 Value::Array(_) => 17,
             },
+            KIND_REFUSED => refused("cmp_words"),
             other => panic!("a word of kind {other} was ordered after its object died"),
         }
     }
@@ -2867,7 +3098,7 @@ unsafe fn cmp_fields(
 
 /// Whether a word can be a native map's key: one [`cmp_words`] orders in place.
 pub fn native_key(layouts: &Layouts, w: Word) -> bool {
-    if is_imm(w) {
+    if is_imm(w) || is_unit(w) {
         return true;
     }
     let o = obj(w);
@@ -2900,6 +3131,7 @@ pub fn native_key(layouts: &Layouts, w: Word) -> bool {
                 });
                 fine
             }
+            KIND_REFUSED => refused("native_key"),
             _ => false,
         }
     }

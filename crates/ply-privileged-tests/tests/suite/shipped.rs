@@ -135,6 +135,176 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
     assert_eq!(names, reported);
 }
 
+/// A field's name, offset and bytes.
+type Field<'a> = (&'a str, u64, u64);
+
+/// Each field a description lists, in its order.
+fn described_fields(fields: &serde_json::Value) -> Vec<Field<'_>> {
+    fields
+        .as_array()
+        .expect("a list of fields")
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().expect("a field's name"),
+                f["at"].as_u64().expect("a field's offset"),
+                f["bytes"].as_u64().expect("a field's bytes"),
+            )
+        })
+        .collect()
+}
+
+/// Past what a released build reads, the description says what emitted code lays out against: each
+/// native's machine kinds, the context's fields compiled code reads, the structs it lays out, and
+/// how deeply drop roots nest.
+#[test]
+fn the_runtime_describes_what_emitted_code_lays_out_against() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    let native = |name: &str| {
+        described["natives"]
+            .as_array()
+            .expect("natives")
+            .iter()
+            .find(|n| n["name"] == name)
+            .unwrap_or_else(|| panic!("no native `{name}`"))
+            .clone()
+    };
+    let push = native("List::push");
+    assert_eq!(push["params"], serde_json::json!(["Word", "Word"]));
+    assert_eq!(push["answer"], "Word");
+    let out = native("?out_str");
+    assert_eq!(
+        (&out["params"], &out["answer"], &out["words"]),
+        (
+            &serde_json::json!(["Addr", "I64"]),
+            &serde_json::Value::Null,
+            &2.into()
+        )
+    );
+    // A native that answers nothing may still raise.
+    let refused = native("?refused");
+    assert_eq!(
+        (&refused["params"], &refused["answer"], &refused["raises"]),
+        (
+            &serde_json::json!(["I64", "I64", "I64", "I64"]),
+            &serde_json::Value::Null,
+            &true.into()
+        )
+    );
+    let text = native("?refused_text");
+    assert_eq!(
+        (&text["params"], &text["raises"]),
+        (
+            &serde_json::json!(["I64", "Addr", "I64", "Addr", "I64"]),
+            &true.into()
+        )
+    );
+    let ctx = described_fields(&described["ctx"]);
+    let names: Vec<&str> = ctx.iter().map(|f| f.0).collect();
+    assert_eq!(
+        names,
+        [
+            "failed",
+            "fuel",
+            "stack_floor",
+            "site_root",
+            "site_start",
+            "site_end",
+            "ticks",
+            "next_tick",
+            "frames",
+            "release_depth",
+            "release_waiting"
+        ],
+        "the release's eight, then those emitted code reads past them"
+    );
+    for (i, (name, at, bytes)) in ctx.iter().enumerate() {
+        assert_eq!((*at, *bytes), (8 * i as u64, 8), "`{name}` is not word {i}");
+    }
+    assert_eq!(described["release_depth"], 32);
+}
+
+/// `drop#Hold<a>` reads what a hold holds where the description says, as
+/// `compiler.emit.layout`'s `HoldLaid` names it; the release's `layouts` stay as they were.
+#[test]
+fn the_runtime_describes_where_a_hold_keeps_what_it_holds() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    assert_eq!(described["hold"], serde_json::json!({ "held": 1 }));
+    assert!(described["layouts"].get("hold").is_none());
+}
+
+/// Each struct emitted code lays out and the runtime reads is described as
+/// `compiler.emit.layout.machine_structs` lists it: in its order, each field at its offset and of
+/// its bytes, which is what the head declares and the runtime's Rust reads.
+#[test]
+fn the_runtime_describes_the_structs_emitted_code_lays_out_as_the_compiler_states_them() {
+    let described: serde_json::Value =
+        serde_json::from_str(&ply_privileged::shipped::runtime_json())
+            .expect("the description reads");
+    let structs: Vec<(&str, u64, Vec<Field>)> = described["descriptors"]
+        .as_array()
+        .expect("a list of structs")
+        .iter()
+        .map(|s| {
+            (
+                s["name"].as_str().expect("a struct's name"),
+                s["bytes"].as_u64().expect("a struct's bytes"),
+                described_fields(&s["fields"]),
+            )
+        })
+        .collect();
+    let word = |name: &'static str, at: u64| (name, at, 8);
+    assert_eq!(
+        structs,
+        [
+            ("PlyFrame", 16, vec![word("prev", 0), word("each", 8)]),
+            (
+                "PlyType",
+                56,
+                vec![
+                    word("identity", 0),
+                    word("spelled", 8),
+                    ("spelled_len", 16, 4),
+                    word("inc", 24),
+                    word("dec", 32),
+                    word("lower", 40),
+                    word("lift", 48),
+                ]
+            ),
+            (
+                "PlyOp",
+                64,
+                vec![
+                    word("effect", 0),
+                    word("op", 8),
+                    word("answer", 16),
+                    word("own", 24),
+                    word("params_len", 32),
+                    word("params", 40),
+                    word("vars_len", 48),
+                    word("vars", 56),
+                ]
+            ),
+            (
+                "PlyFnDesc",
+                48,
+                vec![
+                    word("uniform", 0),
+                    word("typed", 8),
+                    word("convention", 16),
+                    word("release", 24),
+                    word("share", 32),
+                    word("keep", 40),
+                ]
+            ),
+        ]
+    );
+}
+
 /// What a runtime's library describes itself as carries how it lays out a list's and a map's parts,
 /// under the fields `compiler.native.runtime_of` reads: each a number but the header fields, named.
 #[test]

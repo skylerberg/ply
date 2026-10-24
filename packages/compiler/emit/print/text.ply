@@ -4,19 +4,23 @@
 import syntax.parsing (Span)
 import std.bytes (ascii_of_int)
 import emit.c (KNum, ctype, int_lit)
-import emit.answer (Const, Expect)
+import emit.answer (Expect)
 import emit.keys (RootKey)
+import emit.reps (Ctors, no_ctors)
+import check.types (Type)
 import emit.pieces (Piece, Text, Hole, SiteRoot, SiteOf, FieldName)
-import emit.tir (Rep, RDec, RFlat, Var, Arg, AVar, AInt, ABool, AFloat, ANum, AChar, AZero, Member,
-                 Family, family_name, parts_of, parts_count)
+import emit.tir (Rep, RDec, RInt, RFlat, RSum, RUnit, Var, Arg, AVar, AInt, ABool, AFloat, ANum,
+                 AChar, AZero, Member, Family, family_name)
+import emit.layout (P)
+import emit.lower.held (values_of)
 
 /// What every line of one function's body is printed under: the C name of the root it belongs to,
 /// which the functions of the root's closures are named after (`<symbol>_lambda<nth>`), where the
 /// text its failure sites count from starts and the root they name where it is not the body's own
 /// (a group's member, a lender), how it answers, the arm of the `Match` being printed and the `Loop`
 /// around it, each by the label number that names its C labels, inside a `Handle`'s body the C that
-/// goes to its landing, where a failure goes instead of leaving the function, and inside a member's
-/// arm of a tail group's function, that group.
+/// goes to its landing, where a failure goes instead of leaving the function, inside a member's arm
+/// of a tail group's function, that group, and the C a `Return` runs before it returns.
 pub type Under = {
   symbol: Bytes,
   base: Int,
@@ -26,7 +30,11 @@ pub type Under = {
   looping: Option<{ label: Int, state: List<Var>, answer: Var }>,
   landing: Option<Bytes>,
   group: Option<Grouped>,
+  leaving: Bytes,
 }
+
+/// What a root of its own runs before it returns: the unit of fuel it spent given back.
+pub fn fuel_returned() -> Bytes = b"ctx->fuel += 1;"
 
 /// Inside the arm of member `at` of a tail group's function: the group's members, and how many
 /// words, `p0..`, the function takes after `which`, the widest member's parameters.
@@ -44,13 +52,16 @@ pub type Place = { u: Under, at: Span, leave: Bytes, depth: Int }
 /// performs and handles, and the head each root call was written to. Then the function's failure
 /// paths: the C block being printed and how many were opened, where each variable named so far was
 /// declared, and the tails releasing what a failure holds, each labelled by its place among them.
+/// `ctors` is the program's constructor table, which a release reads a sum's cases off. Then its
+/// frame records (`emit.print.frames`): how many slots the widest record its sites link holds, and
+/// the bodies of the root's `each` functions so far. `counting` is the type whose `Held` count root
+/// is printed, which counts a value of it word by word rather than through itself.
 pub type Printing = {
   out: List<Piece>,
   names: Map<Int, Bytes>,
   temps: Int,
   labels: Int,
   calls: List<RootKey>,
-  consts: List<Const>,
   builtins: List<Bytes>,
   fields: List<Bytes>,
   shapes: List<List<Bytes>>,
@@ -62,15 +73,19 @@ pub type Printing = {
   blocks: Int,
   declared: Map<Int, Declared>,
   tails: Tails,
+  ctors: Ctors,
+  widest: Int,
+  eaches: List<List<Piece>>,
+  counting: Option<Type>,
 }
 
 /// Where a variable's C name was declared: the C block, 0 the function's own, and its temporary's
 /// number, so one declared later numbers higher. A parameter is declared at 0, 0.
 pub type Declared = { block: Int, at: Int }
 
-/// One release on a failure path: the value named `name` held as `rep` let go of, then `then`, the C
-/// the path goes on by (the next tail's label, or leaving).
-pub type Tail = { name: Bytes, rep: Rep, then: Bytes }
+/// One release on a failure path: the value named `name`, of type `ty` held as `rep`, let go of, then
+/// `then`, the C the path goes on by (the next tail's label, or leaving).
+pub type Tail = { name: Bytes, ty: Type, rep: Rep, then: Bytes }
 
 /// The tails a function's failure paths share, each labelled by its place in `all`: the label of
 /// each by its value's name and what it goes on by, and the labels printed at the end of each C
@@ -83,7 +98,6 @@ pub fn no_tails() -> Tails = { all: [], keyed: Map::new(), held: Map::new() }
 pub type Printed = {
   pieces: List<Piece>,
   calls: List<RootKey>,
-  consts: List<Const>,
   builtins: List<Bytes>,
   fields: List<Bytes>,
   shapes: List<List<Bytes>>,
@@ -93,7 +107,7 @@ pub type Printed = {
   expects: List<Expect>,
 }
 
-/// Nothing printed yet, its parameters named by `names`.
+/// Nothing printed yet, its parameters named by `names`, for a program of no constructors.
 pub fn printing(names: Map<Int, Bytes>) -> Printing =
   {
     out: [],
@@ -101,7 +115,6 @@ pub fn printing(names: Map<Int, Bytes>) -> Printing =
     temps: 0,
     labels: 0,
     calls: [],
-    consts: [],
     builtins: [],
     fields: [],
     shapes: [],
@@ -113,11 +126,15 @@ pub fn printing(names: Map<Int, Bytes>) -> Printing =
     blocks: 0,
     declared: Map::new(),
     tails: no_tails(),
+    ctors: no_ctors(),
+    widest: 0,
+    eaches: [],
+    counting: None,
   }
 
 /// What a C function's body is printed from after `pr`, its parameters named by `names`: `pr`'s
-/// tables, and nothing of the body `pr` printed, whose temporaries, labels, blocks and tails were
-/// that function's own.
+/// tables and `each` functions, and nothing of the body `pr` printed, whose temporaries, labels,
+/// blocks, tails and frame record were that function's own.
 pub fn function_body(pr: Printing, names: Map<Int, Bytes>) -> Printing =
   {
     ..pr,
@@ -129,6 +146,7 @@ pub fn function_body(pr: Printing, names: Map<Int, Bytes>) -> Printing =
     blocks: 0,
     declared: Map::new(),
     tails: no_tails(),
+    widest: 0,
   }
 
 /// What a printer has no C for, raised naming the family whose printer it is, the case and what it
@@ -226,24 +244,19 @@ pub fn slot(base: Bytes, at: Int) -> Bytes =
 pub fn check(p: Place, pr: Printing) -> Printing =
   line(pr, p.depth, b"if (ctx->failed) ".concat(p.leave))
 
-/// What a variable held as `r` stands at before anything is set into it; for a value held as several
-/// C values, the first's.
+/// What a variable held as `r` stands at before anything is set into it: its first C value's, `0`
+/// for a value of none.
 pub fn zero(r: Rep) -> Bytes =
-  match r {
-    RDec -> b"(PlyDec){0, 0}",
-    RFlat(ls) -> match ls.at(0) { Some(l) -> zero_one(l.rep), None -> b"0" },
-    _ -> b"0",
-  }
-
-fn zero_one(r: Rep) -> Bytes = match r { RDec -> b"(PlyDec){0, 0}", _ -> b"0" }
+  match values_of(r).at(0) { Some(RDec) -> b"(PlyDec){0, 0}", _ -> b"0" }
 
 /// Leaving a function answering as `r` on a failure, holding nothing.
 pub fn failing_return(r: Rep) -> Bytes = Bytes::concat_all([b"return ", zero(r), b";"])
 
-/// The C names of the values a value named `name` held as `r` is held in, in `parts_of`' order: its
-/// own name where it is one, and `<name>_<k>` for its `k`th where it is several.
+/// The C names of the values a value named `name` held as `r` is held in, in `values_of`' order: its
+/// own name where it is one, and `<name>_<k>` for its `k`th where it is several, none where it is
+/// held in none.
 pub fn part_names(name: Bytes, r: Rep) -> List<Bytes> = {
-  let n = parts_of(r).len();
+  let n = values_of(r).len();
   if n == 1 { [name] } else { range(0, n).map(|k: Int| part_name(name, k)) }
 }
 
@@ -252,7 +265,7 @@ pub fn part_name(name: Bytes, k: Int) -> Bytes = Bytes::concat_all([name, b"_", 
 
 /// `part_names(name, r)`'s `k`th, `0` past them, without naming the others.
 pub fn part_named(name: Bytes, r: Rep, k: Int) -> Bytes = {
-  let n = parts_count(r);
+  let n = values_of(r).len();
   if k < 0 || k >= n { b"0" } else if n == 1 { name } else { part_name(name, k) }
 }
 
@@ -286,3 +299,19 @@ pub fn interned(xs: List<Bytes>, x: Bytes) -> { xs: List<Bytes>, at: Int } =
     Some(i) -> { xs: xs, at: i },
     None -> { xs: xs.push(x), at: xs.len() },
   }
+
+test "a value's C values are named as values_of lays them, its own name where it has one" {
+  let narrow = RSum({ laid: { classes: [P], cases: [] }, cases: [b"m.A", b"m.B"] });
+  let wide = RSum({ laid: { classes: [P, P], cases: [] }, cases: [b"m.A", b"m.B"] });
+  let flat = RFlat([{ name: b"d", rep: RDec }, { name: b"s", rep: wide }]);
+  let reps = [narrow, wide, flat, RUnit, RDec, RInt];
+  assert_eq(reps.map(|r: Rep| part_names(b"x", r).len()), reps.map(|r: Rep| values_of(r).len()));
+  assert_eq(part_names(b"x", narrow), [b"x"]);
+  assert_eq(part_names(b"x", wide), [b"x_0", b"x_1"]);
+  assert_eq(part_names(b"x", flat), [b"x_0", b"x_1", b"x_2"]);
+  assert_eq(
+    reps.map(|r: Rep| range(-1, values_of(r).len() + 1).map(|k: Int| part_named(b"x", r, k))),
+    reps.map(|r: Rep| [b"0"].concat(part_names(b"x", r)).push(b"0")),
+  );
+  assert_eq(reps.map(zero), [b"0", b"0", b"(PlyDec){0, 0}", b"0", b"(PlyDec){0, 0}", b"0"])
+}

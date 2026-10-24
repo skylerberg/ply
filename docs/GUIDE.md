@@ -712,8 +712,8 @@ raise nothing. `pub const fn` publishes it; `const` goes with neither
 `ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate each
 `const fn` the program holds before they do anything else with the load (§16),
 under a budget of 100000000 calls. One that raises is `E0157`, saying what it
-raised and where; one that spends the budget, or whose value takes more than
-16777216 bytes kept, is `E0158`. Each is placed at the definition, and nothing
+raised and where; one that spends the budget, or whose value's encoding takes
+more than 16777216 bytes, is `E0158`. Each is placed at the definition, and nothing
 of the program runs. The value is kept in the toolchain's cache (§8.6) under the
 definition's hash, which covers its body, all it reaches and the bytes of every
 file it embeds (§3.4), and under the names of what it reaches, which a value
@@ -721,9 +721,10 @@ names its constructors by: an edit to any of those evaluates it again, and
 nothing else does but another `ply`.
 
 Every unit emitted after that holds the value as data in place of the body, a
-built artifact's among them (§15). A call of the definition reads the value,
-laid out by the run's first read of it, and enters nothing of the body:
-`metered` (§8.1) counts no step and no allocation for it. A program no build
+built artifact's among them (§15), laid out when the unit is built as a run lays
+out a value of its type. A call of the definition reads the value where it lies
+and enters nothing of the body: `metered` (§8.1) counts no step and no
+allocation for it. A program no build
 kept the values of, such as a mutant (§8.5) or the mixture a bisection runs
 (§8.4), evaluates the body in its place, once a run, as it does any definition
 that takes nothing; the value is the same either way, since the body is pure.
@@ -931,7 +932,12 @@ The leading `|` is optional. Constructors are values: `Circle(3)` is a call,
 A sum is nominal, as a `new` record is (§4.2): identical sums in two modules
 differ. A sum takes parameters as an alias does,
 `type Tree<a> = | Leaf | Node(Tree<a>, a, Tree<a>)`, and a use that fills them
-with other arguments is another type (§4.5).
+with other arguments is another type (§4.5). A sum holds itself, directly or
+through other sums, records and lists, only at its own parameters or at fixed
+types: `type Nest<a> = | Leaf(a) | Deeper(Nest<List<a>>)`, which holds itself at
+a type grown from `a`, is refused (`E0477`), since a value of it reaches a new
+type at each level and the code compiled for each would never end. Through a
+function type it may: `| Later((Later<List<a>>) -> Int)` holds no such value.
 
 A value is compared, ordered, digested and shown as its constructor and fields
 say, which is wrong for a type that can hold one thing two ways. The module that
@@ -2513,7 +2519,7 @@ rather than raised.
 | `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
-| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, as it takes them, what answering and packing the shipped modules took, and allocation counts by kind |
+| `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, as it takes them, and each place of the walks of its unit and of the unit its `const` values are entered on as it ends, with the bytes its heap holds live then, its twenty largest sorts of live object once its unit is emitted, what answering and packing the shipped modules took, and allocation counts by kind with the live objects by what they are at an entry's end |
 | `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
@@ -3218,7 +3224,7 @@ checked against that declaration, so it performs none of it.
 | `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers` and `toolchain`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3912,6 +3918,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0474` | obligation nothing proves |
 | `E0475` | a lent function parameter held past the call: answered, stored, performed, or passed where it may be held |
 | `E0476` | a native a unit calls that the runtime it is compiled against implements by none, by two, or otherwise than the compiler declares it |
+| `E0477` | a sum that holds itself, through a chain of sums, at a type grown from its own parameters |
+| `E0478` | a unit whose code calls a definition lending or giving otherwise than the definition takes it |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
