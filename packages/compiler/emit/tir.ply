@@ -80,14 +80,17 @@ pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep, answ
 /// whether it can fail, and whether it can stop for a handler that may resume it later.
 pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 
-/// What a `Make` allocates. `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
-/// `params` arguments; a `stacked` one is lent and laid out on the caller's stack. `MCase` is a
-/// sum's case `case` (its place among the sum's cases) boxed, `skip` words of tag holding `case` and
-/// then `words` of payload.
+/// What a `Make` allocates. `MClosure` is a closure over body `nth` of the root's lambdas, holding
+/// `captures` words and taking `params` arguments. `MCase` is a sum's case `case` (its place among
+/// the sum's cases) boxed, `skip` words of tag holding `case` and then `words` of payload. `MFramed`
+/// is what it wraps laid in the C frame of the function that makes it, which it never outlives, with
+/// a count no code takes: it borrows what it holds (a closure its captures, a list its items), which
+/// live as long as it does, so its death lets go of nothing.
 pub type Made =
   | MList(Int)
-  | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
+  | MClosure({ nth: Int, captures: Int, params: Int })
   | MCase({ case: Int, skip: Int, words: Int })
+  | MFramed(Made)
 
 /// Where a `Get` reads: a field by its word offset, a case's argument, a closure's capture by the word past its
 /// descriptor it starts at, a flat value's leaf, or the word of a record a block holds in place at a
@@ -331,6 +334,19 @@ pub fn made_said(m: Made) -> Bytes =
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
     MCase(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
+    MFramed(x) -> Bytes::concat_all([made_said(x), b" in the frame"]),
+  }
+
+/// What `m` lays out, wherever it lays it.
+pub fn laid_made(m: Made) -> Made = match m { MFramed(x) -> laid_made(x), _ -> m }
+
+/// What a block laid in the frame borrows of `m`'s arguments `args`: a closure's captures, a list's
+/// items.
+pub fn framed_reads(m: Made, args: List<Arg>) -> Option<List<Arg>> =
+  match m {
+    MFramed(MClosure(c)) -> Some(args.take(c.captures)),
+    MFramed(MList(_)) -> Some(args),
+    _ -> None,
   }
 
 /// Whether a value held as `r` holds a count: a word, a view of a list, a reuse token, a flat value
@@ -396,7 +412,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Literal(_) -> [],
     Static(_) -> [],
     Make(m) -> {
-      let lent = match m.made { MClosure(c) -> if c.stacked { c.captures } else { 0 }, _ -> 0 };
+      let lent = match framed_reads(m.made, m.args) { Some(cs) -> cs.len(), None -> 0 };
       range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
         match m.args.at(i) {
           Some(a) -> acc.push({ arg: a, takes: i >= lent }),
@@ -622,9 +638,10 @@ test "each operation consumes or borrows each operand as its signature says" {
   assert_eq(takes(Pack({ arg: AVar(s), to: flat })), [false]);
   assert_eq(answered(Pack({ arg: AVar(s), to: flat })), ReadsOf([s]));
   // A stacked closure reads its captures, which its caller holds while it is lent.
-  let closure = |stacked: Bool|
+  let closure = |framed: Bool|
     Make({
-      made: MClosure({ nth: 0, captures: 2, params: 1, stacked: stacked }),
+      made: if framed { MFramed(MClosure({ nth: 0, captures: 2, params: 1 })) }
+      else { MClosure({ nth: 0, captures: 2, params: 1 }) },
       args: [AVar(s), AVar(s)],
       reuse: None,
     });

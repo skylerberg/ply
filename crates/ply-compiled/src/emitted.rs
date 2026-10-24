@@ -49,7 +49,7 @@ impl Block {
     pub unsafe fn last_of_shared(self) -> bool {
         let o = self.obj();
         debug_assert!(
-            matches!(unsafe { heap::count_of(o) }, rc if rc > SHARED && rc != IMMORTAL),
+            matches!(unsafe { heap::count_of(o) }, rc if rc > SHARED && rc < heap::FRAME),
             "{self:?} was let go of as shared, and its count is not"
         );
         unsafe { heap::last_of_shared(o) }
@@ -64,14 +64,14 @@ impl Block {
         unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap) }
     }
 
-    /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block keeps its
-    /// count, and a shared one is counted atomically.
+    /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block and one in
+    /// a frame keep their count, and a shared one is counted atomically.
     pub fn dup(&self) {
         let o = self.obj();
         let rc = unsafe { heap::count_of(o) };
         if rc < SHARED {
             unsafe { (*o).rc = rc + 1 };
-        } else if rc != IMMORTAL {
+        } else if rc < heap::FRAME {
             heap::inc_shared(self.0);
         }
     }
@@ -84,7 +84,7 @@ impl Block {
     pub unsafe fn last(&self) -> bool {
         let o = self.obj();
         match unsafe { heap::count_of(o) } {
-            IMMORTAL => false,
+            rc if rc >= heap::FRAME => false,
             rc if rc >= SHARED => unsafe { heap::last_of_shared(o) },
             rc if rc > 1 => {
                 unsafe { (*o).rc = rc - 1 };

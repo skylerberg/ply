@@ -141,8 +141,6 @@ builtins! { $
     StringSlice = "String::slice" (s, start, end) -> Raising;
     StringSplit = "String::split" (s, sep) -> Raising;
     StringTrim = "String::trim" (s) -> Word;
-    StringLower = "String::lower" (s) -> Word;
-    StringUpper = "String::upper" (s) -> Word;
     StringStartsWith = "String::starts_with" (s, prefix) -> Word;
     StringEndsWith = "String::ends_with" (s, suffix) -> Word;
     StringContains = "String::contains" (s, t) -> Word;
@@ -1102,16 +1100,7 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::list(s.split(sep).map(Value::str).collect()))
         }
 
-        // These three read `std`'s Unicode tables, so their answers move if those tables do.
         Builtin::StringTrim => Ok(Value::str(args[0].as_str(span, "`String::trim`")?.trim())),
-
-        Builtin::StringLower => Ok(Value::str(
-            args[0].as_str(span, "`String::lower`")?.to_lowercase(),
-        )),
-
-        Builtin::StringUpper => Ok(Value::str(
-            args[0].as_str(span, "`String::upper`")?.to_uppercase(),
-        )),
 
         Builtin::StringStartsWith => {
             let s = args[0].as_str(span, "`String::starts_with`")?;

@@ -15,10 +15,11 @@ import emit.keys
 import emit.keys (Root, Contained, root_name, root_text)
 import emit.reps (Def, EmitParam, SumCtor, kind_of)
 import emit.roots (builtin_helper)
-import emit.tir (Rep, RInt, RBool, RNum, RDec, RWide, RWord, RFloat, RAddr, RSum, RImm, Var, Arg,
-                 AVar, AInt, AZero, Prim, Get, Path, PPayload, PCase, Native, Op, OContainer,
-                 OStrings, Containers, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg)
-import emit.tir.containers (Length, Taken)
+import emit.tir (Rep, RInt, RBool, RNum, RDec, RWord, RAddr, RSum, RImm, Var, Arg, AVar, AInt,
+                 AZero, Prim, Get, Path, PPayload, PCase, Native, Op, OContainer, OStrings,
+                 Containers, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg)
+import emit.tir.containers (Length, Taken, Laid)
+import emit.layout (Recast)
 import emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Compared, Found,
                          CharsIn, CharStart, Scanned)
 import emit.lower.setting (ctor_named, ctor_sum, prelude_ctor)
@@ -55,7 +56,6 @@ fn written() -> List<Bytes> =
     b"Bytes::index_of_byte",
     b"Bytes::scan",
     b"Bytes::scan_until",
-    b"Bytes::is_utf8",
     b"Bytes::blake3",
     b"Bytes::gzip",
     b"Bytes::gunzip",
@@ -69,18 +69,8 @@ fn written() -> List<Bytes> =
     b"String::find",
     b"String::of_bytes",
     b"String::of_bytes_lossy",
-    b"String::lower",
-    b"String::upper",
-    b"String::trim",
-    b"Int::to_string",
-    b"Float::to_string",
     b"Decimal::to_string",
-    b"U128::to_string",
-    b"I128::to_string",
-    b"Float::of_string",
     b"Decimal::of_string",
-    b"U128::of_string",
-    b"I128::of_string",
     b"Secret::of_string",
     b"Secret::of_bytes",
     b"Secret::verify",
@@ -209,9 +199,6 @@ fn one(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
   } else if n == b"String::len" {
     let t = addressed(st, a, at);
     int_op(t.st, CharsIn, [t.address, t.count], at)
-  } else if n == b"Bytes::is_utf8" {
-    let v = native_over(st, b"?utf8_valid", a, [], at);
-    compared(v.st, b"ne", v.arg, AInt(0), at)
   } else if n == b"String::of_bytes" {
     let t = addressed(st, a, at);
     let v = native_int(t.st, b"?utf8_valid", [t.address, t.count], at);
@@ -228,24 +215,6 @@ fn one(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
     let t = recast(opened(ok.st), a, string_type(), at);
     let e = taken_from(opened(continued(ok.st, t.st)), b"?utf8_lossy", a, [], string_type(), at);
     joined(c.cx, ok, t, e, false, at)
-  } else if n == b"String::lower" { taken_from(st, b"?str_lower", a, [], string_type(), at) }
-  else if n == b"String::upper" { taken_from(st, b"?str_upper", a, [], string_type(), at) }
-  else if n == b"String::trim" {
-    let s = native_over(st, b"?trim_start", a, [], at);
-    let e = native_over(s.st, b"?trim_end", a, [], at);
-    let t = addressed(e.st, a, at);
-    let wide = arith(t.st, b"sub", e.arg, s.arg, at);
-    let empty = compared(wide.st, b"le", wide.arg, AInt(0), at);
-    let none = copied_out(opened(empty.st), string_type(), t.address, AInt(0), AInt(0), at);
-    let some = copied_out(
-      opened(continued(empty.st, none.st)),
-      string_type(),
-      t.address,
-      s.arg,
-      wide.arg,
-      at,
-    );
-    joined(c.cx, empty, none, some, false, at)
   } else if n == b"Bytes::blake3" { blake3_of(st, a, at) }
   else if n == b"Bytes::gzip" { taken_from(st, b"?gzip", a, [], bytes_type(), at) }
   else if n == b"Bytes::zstd" { taken_from(st, b"?zstd", a, [], bytes_type(), at) }
@@ -260,49 +229,14 @@ fn one(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
 fn one_converted(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
   let n = c.name;
   let at = c.at;
-  if n == b"Int::to_string" {
-    let i = handed({ st: st, arg: a }, RInt, at);
-    let k = native_int(i.st, b"?int_text", [i.arg], at);
-    taken_out(k.st, k.arg, string_type(), at)
-  } else if n == b"Float::to_string" {
-    let f = handed({ st: st, arg: a }, RFloat, at);
-    let b = bound_as(f.st, int_type(), RInt, Prim({ op: b"bits", on: RFloat, args: [f.arg] }), at);
-    let k = native_int(b.st, b"?float_text", [b.arg], at);
-    taken_out(k.st, k.arg, string_type(), at)
-  } else if n == b"Decimal::to_string" {
+  if n == b"Decimal::to_string" {
     let w = pair_words(st, a, RDec, at);
     let k = native_int(w.st, b"?decimal_text", [w.lo, w.hi], at);
     taken_out(k.st, k.arg, string_type(), at)
-  } else if n == b"U128::to_string" || n == b"I128::to_string" {
-    let signed = n.starts_with(b"I");
-    let w = pair_words(st, a, RWide({ bits: 128, signed: signed }), at);
-    let k = native_int(w.st, b"?wide_text", [AInt(if signed { 1 } else { 0 }), w.lo, w.hi], at);
-    taken_out(k.st, k.arg, string_type(), at)
-  } else if n == b"Float::of_string" {
-    let k = native_over(st, b"?float_parse", a, [], at);
-    let float = named_type(b"Float");
-    maybe(
-      c.cx,
-      k,
-      float,
-      |s: Lowering| {
-        let w = native_int(s, b"?taken_word", [AInt(0)], at);
-        bound_as(w.st, float, RFloat, Prim({ op: b"of_bits", on: RInt, args: [w.arg] }), at)
-      },
-      at,
-    )
   } else if n == b"Decimal::of_string" {
     let k = native_over(st, b"?decimal_parse", a, [], at);
     let d = named_type(b"Decimal");
     maybe(c.cx, k, d, |s: Lowering| taken_pair(s, b"decimal", { ty: d, rep: RDec }, at), at)
-  } else if n == b"U128::of_string" || n == b"I128::of_string" {
-    let signed = AInt(if n.starts_with(b"I") { 1 } else { 0 });
-    let k = native_over_after(st, b"?wide_parse", [signed], a, at);
-    let w = {
-      ty: named_type(n.slice(0, 4)),
-      rep: RWide({ bits: 128, signed: n.starts_with(b"I") }),
-    };
-    maybe(c.cx, k, w.ty, |s: Lowering| taken_pair(s, b"wide", w, at), at)
   } else if n == b"Secret::of_string" || n == b"Secret::of_bytes" {
     let t = addressed(st, a, at);
     let text = AInt(if n == b"Secret::of_string" { 1 } else { 0 });
@@ -803,8 +737,8 @@ fn maybe(
   joined(cx, none, n, s, false, at)
 }
 
-/// The `Decimal` or 128-bit width of type `two.ty`, held as `two.rep`, whose two words a parse left
-/// taken, made in its registers by `op`.
+/// The `Decimal` of type `two.ty`, held as `two.rep`, whose two words a parse left taken, made in
+/// its registers by `op`.
 fn taken_pair(
   st: Lowering,
   op: Bytes,
@@ -816,12 +750,21 @@ fn taken_pair(
   bound_as(hi.st, two.ty, two.rep, Prim({ op: op, on: RInt, args: [lo.arg, hi.arg] }), at)
 }
 
-/// `a`, a string or byte string, as the same block at type `ty`: the two are laid alike.
-/// A fresh block of type `ty` holding the bytes of `a`, a string's or a byte string's: the runtime
-/// tells their blocks apart by kind, so a value changing between the two is copied, not retyped.
+/// `a`, a string or byte string, as the same block at type `ty`, its count taken over: the two are
+/// laid alike.
 fn recast(st: Lowering, a: Arg, ty: Type, at: Span) -> Lowered = {
-  let t = addressed(st, a, at);
-  copied_out(t.st, ty, t.address, AInt(0), t.count, at)
+  let s = handed({ st: st, arg: a }, RWord, at);
+  bound_as(
+    s.st,
+    ty,
+    RWord,
+    Op({
+      op: OContainer(Laid(Recast)),
+      args: [s.arg],
+      uses: { takes: [true], owned: true, fails: false, stops: false },
+    }),
+    at,
+  )
 }
 
 /// A fresh block of type `ty` holding the `n` bytes at `address` from byte `from`.
@@ -840,18 +783,6 @@ fn native_over(
 ) -> Lowered / {abort.raise} = {
   let t = addressed(st, a, at);
   native_int(t.st, name, [t.address, t.count].concat(more), at)
-}
-
-/// Native `name` over `first`, then the bytes of `a`, its answer raw bits.
-fn native_over_after(
-  st: Lowering,
-  name: Bytes,
-  first: List<Arg>,
-  a: Arg,
-  at: Span,
-) -> Lowered / {abort.raise} = {
-  let t = addressed(st, a, at);
-  native_int(t.st, name, first.concat([t.address, t.count]), at)
 }
 
 /// The bytes native `name` over `a`'s bytes leaves taken, copied out into a fresh value of `ty`.

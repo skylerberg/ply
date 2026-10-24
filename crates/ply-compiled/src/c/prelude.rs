@@ -56,6 +56,7 @@ typedef struct {
 } PlyObj;
 
 #define PLY_HEADER 8
+#define PLY_RC_FRAME (UINT32_MAX - 1)
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
    pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
@@ -387,8 +388,7 @@ fn signature(h: &Helper) -> (&'static str, String) {
 }
 
 /// What every translation unit of a unit opens with after [`PRELUDE`]: the helper pointers
-/// declared, and `ply_inc` over them. Declared, not defined, so a unit compiled in parts binds one
-/// table rather than one per part.
+/// declared, not defined, so a unit compiled in parts binds one table rather than one per part.
 pub fn runtime_header() -> String {
     let mut out = String::from("\n/* --- the runtime, declared --- */\n");
     for h in helpers() {
@@ -398,17 +398,6 @@ pub fn runtime_header() -> String {
             pointer_name(h.name)
         ));
     }
-    // A count with its top bit set is shared (`heap::SHARED`): tcc has no atomics, so the runtime
-    // changes it.
-    out.push_str(
-        "\nstatic inline void ply_inc(Word w) {\n\
-         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
-         \x20 PlyObj *o = ply_obj(w & ~(Word)7);\n\
-         \x20 uint32_t rc = o->rc;\n\
-         \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
-         \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
-         }\n",
-    );
     out
 }
 

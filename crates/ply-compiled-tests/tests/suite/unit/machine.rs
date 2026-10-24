@@ -67,7 +67,7 @@ fn utf8_is_told_apart_and_mended_as_the_builtins_do() {
 }
 
 #[test]
-fn case_and_white_space_are_the_builtins() {
+fn white_space_is_the_builtins() {
     let mut ctx = context();
     for s in [
         "",
@@ -76,17 +76,6 @@ fn case_and_white_space_are_the_builtins() {
         "  \t tab\u{a0}\n",
         "\u{3000}x\u{2003}",
     ] {
-        for (name, b) in [
-            ("?str_lower", Builtin::StringLower),
-            ("?str_upper", Builtin::StringUpper),
-        ] {
-            let want = bytes_of(builtin(b, vec![Value::str(s)]));
-            assert_eq!(
-                taken_over(&mut ctx, name, s.as_bytes()),
-                want,
-                "{name} of {s:?}"
-            );
-        }
         let start = over(&mut ctx, "?trim_start", s.as_bytes()) as usize;
         let end = over(&mut ctx, "?trim_end", s.as_bytes()) as usize;
         let trimmed = bytes_of(builtin(Builtin::StringTrim, vec![Value::str(s)]));
