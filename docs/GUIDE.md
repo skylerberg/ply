@@ -1494,6 +1494,16 @@ pub fn digits(n: Int) -> List<Int>
 = range(0, n)
 ```
 
+A list literal of at most 32 elements that its function only reads, or lends
+to a call that keeps nothing of it, lies in that function's frame and
+allocates nothing: `sum([a, b, c])` where `sum` walks the list with `at`.
+One the function answers, stores, carries round a loop, or hands to a call
+that may keep it or an element of it, such as `List::fold`, whose function
+value is handed each element, is allocated. A function's frame holds 128
+words of such lists at most, the elements' words and three for each list;
+the lists made after that are allocated, and so is every list of a function
+that may stop for a handler that can resume it more than once (§6.6).
+
 ### 5.7 Iteration
 
 There is no `for`, `while` or `break`. A call of the enclosing function in tail
@@ -2516,11 +2526,9 @@ rather than raised.
 | `PLY_C_CACHE=DIR` | compiled objects, the emitter's answers, each kept under the hashes of the definitions that emit it, the runtime and what it was asked, the cost checker's report on a program, kept under the checker's hash and the program's text, and each module's walks, kept under its text, its bodies' own forms and what its check read, each tagged literal's verdict, kept under the hash of all its parser reaches and its text, and each `const fn`'s value, kept under the hash of all it reaches and the names that spells (default `ply/cache` under the user's cache directory: `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) |
 | `PLY_C_STAGE=DIR` | the compiler's own stages, kept apart from the cache so a fresh cache reuses them; and the memo store a toolchain's own modules are answered through, which a bootstrap's builder checks `ply` through and `ply std --answers` answers the shipped modules through (default `ply/stage` under the same) |
 | `PLY_C_CACHE_MAX=BYTES` | cap on the cache and on the stages, each swept oldest first, nothing within an hour of its last use; `0` is no cap |
-| `PLY_C_KEEP=1` | keep and print the emitted `.c` and shared object |
 | `PLY_C_REFUSALS=1` | print which definitions the backend refused, and how many it took |
 | `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or drop those with a prefix; the unit is then partial and a caller of what was dropped is declined, not raised |
 | `PLY_C_PHASES=1` | print how many of the emitter's answers were read back and how many it was asked for, what emitting took, what the builder's steps took when it builds a stage, as it takes them, and each place of the walks of its unit and of the unit its `const` values are entered on as it ends, with the bytes its heap holds live then, its twenty largest sorts of live object once its unit is emitted, what answering and packing the shipped modules took, and allocation counts by kind with the live objects by what they are at an entry's end |
-| `PLY_HEAP_CENSUS=1` | count allocations by constructor, record shape and length class as well, which `PLY_C_PHASES` then prints; a map insert per allocation |
 | `PLY_HEAP_POISON=1` | poison released blocks and fail on a read of one |
 | `PLY_HEAP_DELAY=N` | reuse a released block only after `N` more releases |
 

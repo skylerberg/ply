@@ -30,7 +30,7 @@ import emit.tir (Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg, AVar, A
 import emit.tir.handling (Perform)
 import emit.verify (payload_of, allocates, re_held)
 import emit.own (owned, may_reuse)
-import emit.lower.held (passing, ByReference)
+import emit.lower.held (passing, ByReference, value_words)
 
 /// How a definition takes its parameters and hands back its answer, which every caller's code is
 /// written against: inferred from its body and its callees' handings, never written.
@@ -691,13 +691,43 @@ fn framing(f: Fn) -> Map<Int, Bool> =
     vals_bound(f.body, Map::new(), |m: Map<Int, Bool>, v: Var, val: Val|
       match val {
         Make(x) -> match x.made {
-          MList(n) -> if n > 0 && n <= layout::layouts().trie.width { m.insert(v.id, true) }
+          MList(n) -> if n > 0 && n <= layout::layouts().trie.width
+              && laid_words(x.made, x.args) <= layout::frame_block_words() { m.insert(v.id, true) }
           else { m },
           _ -> m,
         },
         _ -> m,
       })
   }
+
+/// `placed` but for the blocks `b` makes once those it made before, the closures the lowering laid
+/// in the frame among them, take `layout.frame_words` words.
+fn capped(b: Block, placed: Map<Int, Bool>) -> Map<Int, Bool> =
+  vals_bound(
+    b,
+    { kept: placed, words: 0 },
+    |acc: { kept: Map<Int, Bool>, words: Int }, v: Var, val: Val|
+      match val {
+        Make(x) -> {
+          let w = laid_words(laid_made(x.made), x.args);
+          if laid_made(x.made) != x.made { { ..acc, words: acc.words + w } }
+          else if !placed.contains(v.id) { acc }
+          else if acc.words + w > layout::frame_words() { { ..acc, kept: acc.kept.remove(v.id) } }
+          else { { ..acc, words: acc.words + w } }
+        },
+        _ -> acc,
+      },
+  ).kept
+
+/// The words a block made as `made` of `args` takes: its count, a list's head or a closure's
+/// function, and its parts, a list's each as wide as the widest.
+fn laid_words(made: Made, args: List<Arg>) -> Int = {
+  let widths = args.map(|a: Arg| max(1, value_words(rep_of_arg(a))));
+  match made {
+    MList(n) -> 1 + layout::head_words(layout::list_head()) + n * widths.fold(1, max),
+    _ -> 2 + widths.fold(0, |s: Int, w: Int| s + w),
+  }
+}
 
 /// Whether anything in `b` may stop for a handler that can resume it more than once.
 fn stops_in(b: Block) -> Bool = vals_folded(b, false, |acc: Bool, v: Val| acc || stops_at(v))
@@ -745,7 +775,7 @@ pub fn framed_form(f: Fn, look: Map<RootName, Handing>) -> Fn = {
   };
   {
     ..f,
-    body: block_framed(f.body, framed_walk(s, f).framed),
+    body: block_framed(f.body, capped(f.body, framed_walk(s, f).framed)),
     lambdas: f.lambdas.map(|l: Lambda|
       match l { Closure(c) -> Closure({ ..c, body: framed_form(c.body, look) }) }),
   }
