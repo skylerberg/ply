@@ -1,8 +1,11 @@
 //! `ply fmt`: the module printed back from its tree, with comments re-attached by position and
-//! literals re-sliced from the source. Layout is decided from the tree and the column alone, so
-//! printing the output again changes nothing.
+//! literals re-sliced from the source. A tree no source holds, as a decoder builds one, prints by
+//! the same rules, each literal spelled from its value and each form only a source would show read
+//! off the tree. Layout is decided from the tree and the column alone, so printing the output again
+//! changes nothing.
 
-import syntax.parsing (Span, Ident, QName, ParseDiag, primary_span_of, qname_text, span_between)
+import syntax.parsing (Span, Ident, QName, ParseDiag, Doc, primary_span_of, qname_text,
+                       span_between, starts_upper, dummy_span)
 import syntax.lexer (Comment, Token, InterpolatedHead, InterpolatedTail, ItemDoc, lex, doc_mark)
 import syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive, IEffectSet,
                      IExtern, ImportDecl, IModule, IAlias, INames, FnDef, ExternDef, TypeDef,
@@ -11,21 +14,23 @@ import syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, ID
                      SEnsures, SCost, ReturnsFresh, ReturnsParam, Vis, VPub, VPriv, item_span,
                      item_doc, parse, dump_module, is_written, constraint_written, is_pub,
                      spec_kind_text, TDNominal, TDExtern, IInstance, instance_text, INumeric,
-                     NumericOp)
+                     NumericOp, TypeDefBody, Opaque, FieldDoc, Cases, OfSchema, Returns)
 import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode,
-                           MRead, MWrite, MBad, ty_span, mode_text, is_raise, angled, generics_text,
-                           ident_names)
+                           MRead, MWrite, MBad, Generics, ty_span, mode_text, is_raise, angled,
+                           generics_text, ident_names)
 import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
                      ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
                      EParallel, EBad, EHole, ETryBlock, RaiseName, RecField, NamedArg, Param, Stmt,
                      SLet, SLetElse, SExpr, SAssign, MatchArm, HandleClause, ReturnClause,
                      HandlerVar, expr_span, is_block_like, ETagged, Tagged, Hole, written_operator,
-                     call_operator, set_binder, map_literal_call)
+                     call_operator, set_binder, map_literal_call, shown_binder)
 import expand.rewrite.shared (map_expr, map_item)
 import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, PBad, Lit,
                         LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat, LDec, LChar,
                         LUnit, LBad, pat_span)
+import syntax.spelling (literal_text, pattern_literal_text, str_lit, template_text)
 import std.list
+import std.option
 import std.bytes (is_digit, ascii_of_int)
 
 // --- The entry point --------------------------------------------------------
@@ -52,11 +57,13 @@ pub fn fmt_source(src: Bytes) -> Result<Bytes, Bytes> / {abort.raise} = {
 }
 
 /// A call the parser wrote for an operator, as that operator over its operands, so it prints as
-/// any binary operator does; its `op` is the builtin's name.
+/// any binary operator does; its `op` is the builtin's name. An operator writes no label and no
+/// named argument, which a call whose spans say nothing may hold.
 fn as_operator(e: Expr) -> Expr =
   match e {
     EApp(a) -> match ((written_operator(a.func, a.args), a.args)) {
-      (Some(o), [lhs, rhs]) -> EBinary({ span: a.span, op: o.name, lhs: lhs, rhs: rhs }),
+      (Some(o), [lhs, rhs]) -> if a.labels.len() > 0 || a.named.len() > 0 { e }
+      else { EBinary({ span: a.span, op: o.name, lhs: lhs, rhs: rhs }) },
       _ -> e,
     },
     _ -> e,
@@ -106,6 +113,11 @@ pub fn erase_spans(dump: Bytes) -> Bytes / {abort.raise} =
 // --- The state --------------------------------------------------------------
 
 type PrintInput = { source: Bytes, comments: List<Comment> }
+
+/// Whether the source holds the text `span` covers. A tree built rather than parsed has dummy
+/// spans, and what its source would say is read off the tree instead.
+fn sourced(input: PrintInput, span: Span) -> Bool =
+  span.start < span.end && span.end <= input.source.len()
 
 /// `ci` is the next comment not yet placed; `pending` holds the ones the current line will end
 /// with; `prev_end` is where the last placed node or comment ended, for the blank-line rule.
@@ -410,7 +422,9 @@ fn members(atoms: List<AtomExpr>, names: List<QName>) -> List<Bytes> / {abort.ra
 
 fn row_text(input: PrintInput, row: RowExpr) -> Bytes / {abort.raise} = {
   let ms = Bytes::join(members(row.atoms, row.aliases), b", ");
-  let braced = row.span.end > row.span.start && input.source.at(row.span.start) == 123;
+  // `{| e}` and `e` are one tree, so only a source says which a row variable alone was.
+  let braced = if sourced(input, row.span) { input.source.at(row.span.start) == 123 }
+  else { ms.len() > 0 };
   match row.tail {
     Some(t) -> {
       let v = if row.tail_bounded { t.name.concat(b" bounded") } else { t.name };
@@ -438,14 +452,16 @@ pub fn is_ty_tuple(fields: List<{ name: Ident, ty: TypeExpr }>) -> Bool / {abort
 fn type_text(input: PrintInput, t: TypeExpr) -> Bytes / {abort.raise} =
   match t {
     TVar(i) -> i.name,
-    TCon(x) ->
-      qname_text(x.name).concat(
-        angled(
-          x.args.map(|a: TypeExpr| type_text(input, a)),
-          ident_names(x.labels),
-          x.rows.map(|r: RowExpr| row_text(input, r)),
-        ),
-      ),
+    TCon(x) -> {
+      let args = angled(
+        x.args.map(|a: TypeExpr| type_text(input, a)),
+        ident_names(x.labels),
+        x.rows.map(|r: RowExpr| row_text(input, r)),
+      );
+      // A bare lowercase name alone reads back as a type variable.
+      let lone = args.len() == 0 && x.name.module == None && !starts_upper(x.name.name.name);
+      qname_text(x.name).concat(if lone { b"<>" } else { args })
+    },
     TFn(x) ->
       Bytes::concat_all([
         b"(",
@@ -509,7 +525,7 @@ fn strip_blanks(t: Bytes) -> Bytes =
 /// A literal written as a line string: the AST holds only its value, so the source says which.
 fn is_lines(input: PrintInput, expr: Expr) -> Bool / {abort.raise} =
   match expr {
-    ELit(v) -> {
+    ELit(v) -> if !sourced(input, v.span) { false } else {
       let t = unparen(input, v.span);
       t.len() >= 2 && t.at(0) == 92 && t.at(1) == 92
     },
@@ -536,43 +552,91 @@ fn hole_text(flat: Bytes) -> Bytes =
   if flat.starts_with(b"{") { Bytes::concat_all([b"{ ", flat, b" }"]) }
   else { Bytes::concat_all([b"{", flat, b"}"]) }
 
+/// A text of a tagged literal as written, or spelled from its value where no source covers it.
+fn tag_text(input: PrintInput, quoted: Span, value: Bytes) -> Bytes / {abort.raise} =
+  if sourced(input, quoted) { input.source.slice(quoted.start + 1, quoted.end - 1) }
+  else { template_text(value) }
+
+/// The hole `h` as written, `from` past the text before it, where it has no flat form.
+fn hole_written(input: PrintInput, h: Hole, from: Int) -> Option<Bytes> / {abort.raise} =
+  if sourced(input, h.quoted) { Some(input.source.slice(from - 1, h.quoted.start + 1)) }
+  else { None }
+
 /// A tagged literal as written: its tag touching its string, each text kept and each hole printed
-/// flat, or kept too where it has no flat form.
-fn tagged_text(input: PrintInput, t: Tagged) -> Bytes / {abort.raise} = {
-  let text = |quoted: Span| input.source.slice(quoted.start + 1, quoted.end - 1);
+/// flat, or kept too where it has no flat form; with no source to keep, such a hole leaves it no
+/// one-line form.
+fn tagged_flat(input: PrintInput, t: Tagged) -> Option<Bytes> / {abort.raise} = {
   let filled = t.holes.fold(
-    { out: text(t.quoted), from: t.quoted.end },
-    |acc: { out: Bytes, from: Int }, h: Hole|
+    { out: Some(tag_text(input, t.quoted, t.text)), from: t.quoted.end },
+    |acc: { out: Option<Bytes>, from: Int }, h: Hole|
       {
-        out: Bytes::concat_all([
+        out: cat([
           acc.out,
           match flat_expr(input, h.value) {
-            Some(flat) -> hole_text(flat),
-            None -> input.source.slice(acc.from - 1, h.quoted.start + 1),
+            Some(flat) -> Some(hole_text(flat)),
+            None -> hole_written(input, h, acc.from),
           },
-          text(h.quoted),
+          Some(tag_text(input, h.quoted, h.text)),
         ]),
         from: h.quoted.end,
       },
   );
-  Bytes::concat_all([t.tag.name, b"\"", filled.out, b"\""])
+  cat([Some(t.tag.name.concat(b"\"")), filled.out, Some(b"\"")])
 }
 
+/// A tagged literal with a hole no line holds, that hole laid out between its braces.
+fn tagged_laid(
+  input: PrintInput,
+  printer: Printer,
+  t: Tagged,
+  indent: Int,
+) -> Printer / {abort.raise} = {
+  let opened = emit(
+    printer,
+    Bytes::concat_all([t.tag.name, b"\"", tag_text(input, t.quoted, t.text)]),
+  );
+  let filled = t.holes.fold(
+    { printer: opened, from: t.quoted.end },
+    |acc: { printer: Printer, from: Int }, h: Hole|
+      {
+        printer: emit(
+          match flat_expr(input, h.value) {
+            Some(flat) -> emit(acc.printer, hole_text(flat)),
+            None -> match hole_written(input, h, acc.from) {
+              Some(written) -> emit(acc.printer, written),
+              None -> hole_laid(input, acc.printer, h.value, indent),
+            },
+          },
+          tag_text(input, h.quoted, h.text),
+        ),
+        from: h.quoted.end,
+      },
+  );
+  emit(filled.printer, b"\"")
+}
+
+/// A hole's value laid out between braces, set off by a space from what it may open with.
+fn hole_laid(
+  input: PrintInput,
+  printer: Printer,
+  value: Expr,
+  indent: Int,
+) -> Printer / {abort.raise} = emit(expr(input, emit(printer, b"{ "), value, indent, 2), b" }")
+
+/// A literal as the source spells it, or spelled from its value where no source covers it.
 fn lit_text(input: PrintInput, span: Span, literal: Lit) -> Bytes / {abort.raise} =
-  match literal {
-    LInt(_) -> strip_blanks(unparen(input, span)),
-    LFixed(_, _) -> strip_blanks(unparen(input, span)),
-    LWide(_, _, _) -> strip_blanks(unparen(input, span)),
-    LBool(b) -> if b { b"true" } else { b"false" },
-    LStr(_) -> unparen(input, span),
-    LBytes(_) -> unparen(input, span),
-    // Written out of an `embed` call after a parse, so never in text being formatted.
-    LEmbedded(_, _) -> unparen(input, span),
-    LFloat(r) -> r,
-    LDec(r) -> r,
-    LChar(_) -> unparen(input, span),
-    LUnit -> b"()",
-    LBad -> b"()",
+  if !sourced(input, span) { literal_text(literal) } else {
+    match literal {
+      LInt(_) -> strip_blanks(unparen(input, span)),
+      LFixed(_, _) -> strip_blanks(unparen(input, span)),
+      LWide(_, _, _) -> strip_blanks(unparen(input, span)),
+      LStr(_) -> unparen(input, span),
+      LBytes(_) -> unparen(input, span),
+      // Written out of an `embed` call after a parse, so never in text being formatted.
+      LEmbedded(_, _) -> unparen(input, span),
+      LChar(_) -> unparen(input, span),
+      _ -> literal_text(literal),
+    }
   }
 
 fn pat_punned(f: { name: Ident, pat: Pattern }) -> Bool =
@@ -590,8 +654,10 @@ fn pattern_text(input: PrintInput, x: Pattern) -> Bytes / {abort.raise} =
   match x {
     PWild(_) -> b"_",
     PVar(v) -> v.name.name,
-    PLit(v) -> lit_text(input, v.span, v.lit),
-    PRange(v) -> strip_blanks(unparen(input, v.span)),
+    PLit(v) -> if sourced(input, v.span) { lit_text(input, v.span, v.lit) }
+    else { pattern_literal_text(v.lit) },
+    PRange(v) -> if sourced(input, v.span) { strip_blanks(unparen(input, v.span)) }
+    else { Bytes::concat_all([pattern_literal_text(v.lo), b"..=", pattern_literal_text(v.hi)]) },
     PCtor(v) -> if v.args.len() == 0 { qname_text(v.name) } else {
       Bytes::concat_all([
         qname_text(v.name),
@@ -929,10 +995,49 @@ fn flat_clauses(
 /// The parser expands an interpolated string into a concatenation spanning it, which the source
 /// still opens with `f"`: its text is kept as written and each hole printed flat.
 fn interpolated(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
+  if !one_string(input, e) { None } else { cat([Some(b"f\""), pieces(input, e), Some(b"\"")]) }
+
+/// Whether `e` is one interpolated string: as its source opens, or where no source covers it, as
+/// the parser builds one.
+fn one_string(input: PrintInput, e: Expr) -> Bool / {abort.raise} =
   match e {
-    ELit(_) -> None,
-    _ -> if !one_interpolation(input, expr_span(e)) { None }
-    else { cat([Some(b"f\""), pieces(input, e), Some(b"\"")]) },
+    ELit(_) -> false,
+    _ -> if sourced(input, expr_span(e)) { one_interpolation(input, expr_span(e)) }
+    else { interpolation_shape(e) },
+  }
+
+/// The parser's concatenation of one interpolated string: texts and `display` calls chained to the
+/// left, a call among them, no text empty and no two texts side by side.
+fn interpolation_shape(e: Expr) -> Bool / {abort.raise} = {
+  let parts = chained(e);
+  let text = |x: Expr|
+    match x { ELit(v) -> match v.lit { LStr(s) -> s.len() > 0, _ -> false }, _ -> false };
+  parts.fold(false, |any: Bool, x: Expr| any || is_display(x))
+    && range(0, parts.len()).fold(true, |ok: Bool, i: Int| {
+      let x = parts.get(i);
+      ok && (is_display(x) || (text(x) && (i == 0 || !text(parts.get(i - 1)))))
+    })
+}
+
+/// A concatenation's operands, its left operands unfolded.
+fn chained(e: Expr) -> List<Expr> =
+  match e {
+    EBinary(v) -> if v.op == b"concat" { chained(v.lhs).push(v.rhs) } else { [e] },
+    _ -> [e],
+  }
+
+/// The call of `std.show`'s `display` an interpolated string's hole is.
+fn is_display(e: Expr) -> Bool =
+  match e {
+    EApp(a) ->
+      a.args.len() == 1 && a.named.len() == 0 && a.labels.len() == 0
+        && (match a.func {
+          EVar(f) ->
+            f.name.name.name == b"display"
+              && (match f.name.module { Some(m) -> m.name == shown_binder(), None -> false }),
+          _ -> false,
+        }),
+    _ -> false,
   }
 
 /// A span without the parentheses a grouping widened it by, a pair a round.
@@ -981,15 +1086,46 @@ fn pieces(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
 /// A text piece's token runs from the `f"` or `}` before it to the `{` or `"` after it.
 fn piece(input: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
   match expr {
-    ELit(v) -> {
+    ELit(v) -> if sourced(input, v.span) {
       let lead = if input.source.slice(v.span.start, v.span.start + 2) == b"f\"" { 2 } else { 1 };
       Some(input.source.slice(v.span.start + lead, v.span.end - 1))
-    },
+    } else { match v.lit { LStr(s) -> Some(template_text(s)), _ -> None } },
     EApp(v) -> match v.args {
       [x] -> match flat_expr(input, x) { Some(flat) -> Some(hole_text(flat)), None -> None },
       _ -> None,
     },
     _ -> None,
+  }
+
+/// An interpolated string a hole of which no line holds, each such hole laid out in its braces.
+fn pieces_laid(
+  input: PrintInput,
+  printer: Printer,
+  expr: Expr,
+  indent: Int,
+) -> Printer / {abort.raise} =
+  match expr {
+    EBinary(v) -> if v.op == b"concat" {
+      pieces_laid(input, pieces_laid(input, printer, v.lhs, indent), v.rhs, indent)
+    } else { piece_laid(input, printer, expr, indent) },
+    _ -> piece_laid(input, printer, expr, indent),
+  }
+
+fn piece_laid(
+  input: PrintInput,
+  printer: Printer,
+  expr: Expr,
+  indent: Int,
+) -> Printer / {abort.raise} =
+  match expr {
+    EApp(v) -> match v.args {
+      [x] -> match flat_expr(input, x) {
+        Some(flat) -> emit(printer, hole_text(flat)),
+        None -> hole_laid(input, printer, x, indent),
+      },
+      _ -> printer,
+    },
+    _ -> match piece(input, expr) { Some(text) -> emit(printer, text), None -> printer },
   }
 
 fn flat_expr(p: PrintInput, expr: Expr) -> Option<Bytes> / {abort.raise} =
@@ -1008,7 +1144,7 @@ fn flat_node(input: PrintInput, e: Expr) -> Option<Bytes> / {abort.raise} =
   match e {
     ELit(v) -> if is_lines(input, e) { None } else { Some(lit_text(input, v.span, v.lit)) },
     EHole(v) -> Some(v.text),
-    ETagged(v) -> Some(tagged_text(input, v)),
+    ETagged(v) -> tagged_flat(input, v),
     EVar(v) -> Some(qname_text(v.name)),
     EBinary(v) ->
       cat([
@@ -1228,7 +1364,9 @@ fn broken(
 ) -> Printer / {abort.raise} =
   match interpolated(input, expr) {
     Some(text) -> emit(printer, text),
-    None -> broken_node(input, printer, expr, indent, cont, after),
+    None -> if one_string(input, expr) {
+      emit(pieces_laid(input, emit(printer, b"f\""), expr, indent), b"\"")
+    } else { broken_node(input, printer, expr, indent, cont, after) },
   }
 
 fn broken_node(
@@ -1245,7 +1383,10 @@ fn broken_node(
       else { emit(printer, lit_text(input, v.span, v.lit)) },
       _ -> emit(printer, lit_text(input, v.span, v.lit)),
     },
-    ETagged(v) -> emit(printer, tagged_text(input, v)),
+    ETagged(v) -> match tagged_flat(input, v) {
+      Some(text) -> emit(printer, text),
+      None -> tagged_laid(input, printer, v, indent),
+    },
     EHole(v) -> emit(printer, v.text),
     EVar(v) -> emit(printer, qname_text(v.name)),
     EBinary(v) -> chain(input, printer, v.lhs, v.op, v.rhs, cont, after),
@@ -1553,7 +1694,7 @@ fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
       (EVar(f), [EList(l)]) -> match f.name.module {
         Some(m) -> if m.name == set_binder() { Some({ set: true, items: l.items, span: a.span }) }
         else if m.name == map_literal_call().binder && f.name.name.name == map_literal_call().name
-            && input.source.slice(a.span.start, a.span.start + 2) == b"#{" {
+            && opens_map(input, a.span, l.items) {
           Some({ set: false, items: l.items, span: a.span })
         } else { None },
         None -> None,
@@ -1561,6 +1702,21 @@ fn literal_of(input: PrintInput, e: Expr) -> Option<Literal> / {abort.raise} =
       _ -> None,
     },
     _ -> None,
+  }
+
+/// Whether a `Map::of_entries` call was a map literal: its source opens with `#{`, or, where no
+/// source covers it, each of its entries is the record of a key and a value one is written as.
+fn opens_map(input: PrintInput, span: Span, items: List<Expr>) -> Bool / {abort.raise} =
+  if sourced(input, span) { input.source.slice(span.start, span.start + 2) == b"#{" } else {
+    items.fold(true, |ok: Bool, x: Expr|
+      ok
+        && (match x {
+          ERecord(r) -> match r.fields {
+            [k, v] -> k.name.name == b"key" && v.name.name == b"value",
+            _ -> false,
+          },
+          _ -> false,
+        }))
   }
 
 /// The parser writes each entry of a literal as a record of its key and value; an item it did not
@@ -1591,7 +1747,8 @@ pub type Spelling =
   /// `#[a, ..]`: its items, in order.
   | SetLiteral(List<Expr>)
 
-/// How `e` is written in `source`, the text it was parsed from.
+/// How `e` is written in `source`, the text it was parsed from; where `source` does not cover `e`'s
+/// span, how a tree of its shape is printed.
 pub fn spelling(source: Bytes, e: Expr) -> Spelling / {abort.raise} = {
   let input: PrintInput = { source: source, comments: [] };
   match literal_of(input, e) {
@@ -1601,11 +1758,7 @@ pub fn spelling(source: Bytes, e: Expr) -> Spelling / {abort.raise} = {
       if m.set { SetLiteral(entries.map(|entry: { key: Expr, value: Expr }| entry.key)) }
       else { MapLiteral(entries) }
     },
-    None -> match e {
-      ELit(_) -> AsParsed,
-      _ -> if one_interpolation(input, expr_span(e)) { Interpolated(holes_of(e)) }
-      else { AsParsed },
-    },
+    None -> if one_string(input, e) { Interpolated(holes_of(e)) } else { AsParsed },
   }
 }
 
@@ -1914,6 +2067,12 @@ pub fn printed_alone(
     items: items.map(with_operators),
   })
 
+/// `m` printed with no source, as a tree built rather than parsed is: its spans may all be dummy
+/// ones, every literal is spelled from its value, and a blank line parts its items. The text parses
+/// back to `m`, spans aside, where `m` is a tree a parse can make and holds no doc, which only a
+/// source's comments print.
+pub fn module_text(m: Module) -> Bytes / {abort.raise} = printed_alone(b"", m.imports, m.items)
+
 fn module(input: PrintInput, m: Module) -> Bytes / {abort.raise} = {
   let st0 = { next_comment: 0, column: 0, previous_end: 0, pending: [], closed: -1, parts: [] };
   let s1 = m.imports.filter(is_written).fold(st0, |printer: Printer, decl: ImportDecl|
@@ -1951,7 +2110,8 @@ fn constraint_text(c: Constraint) -> Bytes = constraint_written(c.deriver, c.par
 
 fn item(input: PrintInput, printer: Printer, it: Item) -> Printer / {abort.raise} = {
   let sp = item_span(it);
-  let s1 = open_line(input, printer, sp.start, 0, true);
+  let s1 = if sourced(input, sp) { open_line(input, printer, sp.start, 0, true) }
+  else { nl(printer, 0, true) };
   let s2 = match it {
     IFn(d) -> fn_def(input, s1, d),
     IType(d) -> type_def(input, s1, d),
@@ -2277,16 +2437,17 @@ fn name_before(input: PrintInput, i: Int) -> Option<Bytes> / {abort.raise} = {
   } else { None }
 }
 
+/// Where no source covers an operation, its resource gets a name of the printer's choosing and its
+/// parameters none, which the tree drops either way.
 fn op_decl_text(input: PrintInput, op: OpDef) -> Bytes / {abort.raise} = {
-  let res = if op.resource_param {
+  let res = if !op.resource_param { b"" } else if sourced(input, op.name.span) {
     Bytes::concat_all([b"[", ident_after_bracket(input, op.name.span.end), b"]"])
-  } else { b"" };
+  } else { b"[r]" };
   let ps = op.params.map(|t: TypeExpr| {
     let ty = type_text(input, t);
-    match name_before(input, ty_span(t).start) {
-      Some(n) -> Bytes::concat_all([n, b": ", ty]),
-      None -> ty,
-    }
+    let named = if sourced(input, ty_span(t)) { name_before(input, ty_span(t).start) }
+    else { None };
+    match named { Some(n) -> Bytes::concat_all([n, b": ", ty]), None -> ty }
   });
   Bytes::concat_all([
     mode_text(op.mode),
@@ -2316,10 +2477,7 @@ fn effect_def(input: PrintInput, printer: Printer, d: EffectDef) -> Printer / {a
 /// A label is kept as written, holes and all: over cases it is the test's name.
 fn test_def(input: PrintInput, printer: Printer, d: TestDef) -> Printer / {abort.raise} = {
   let kw = if d.is_nondet { b"test/nondet " } else { b"test " };
-  let head = emit(
-    printer,
-    Bytes::concat_all([kw, input.source.slice(d.name_span.start, d.name_span.end), b" "]),
-  );
+  let head = emit(printer, Bytes::concat_all([kw, test_label(input, d), b" "]));
   match d.cases {
     None -> def_body(input, head, d.body, 0),
     Some(c) -> {
@@ -2341,6 +2499,19 @@ fn test_def(input: PrintInput, printer: Printer, d: TestDef) -> Printer / {abort
     },
   }
 }
+
+/// Before `for` a label is a template, whose braces open holes: one without a hole is its value
+/// with each brace doubled, and the name of one with holes is its text as written.
+fn test_label(input: PrintInput, d: TestDef) -> Bytes / {abort.raise} =
+  if sourced(input, d.name_span) { input.source.slice(d.name_span.start, d.name_span.end) } else {
+    match d.cases {
+      None -> str_lit(d.name),
+      Some(c) -> match c.label {
+        ELit(_) -> Bytes::concat_all([b"\"", template_text(d.name), b"\""]),
+        _ -> Bytes::concat_all([b"\"", d.name, b"\""]),
+      },
+    }
+  }
 
 fn binder_text(input: PrintInput, binder: Binder) -> Bytes / {abort.raise} =
   Bytes::concat_all([binder.name.name, b": ", type_text(input, binder.ty)])
@@ -2396,7 +2567,9 @@ fn claim_lines(
 }
 
 fn law_def(input: PrintInput, printer: Printer, d: LawDef) -> Printer / {abort.raise} = {
-  let head = b"law ".concat(input.source.slice(d.name_span.start, d.name_span.end));
+  let head = b"law ".concat(if sourced(input, d.name_span) {
+    input.source.slice(d.name_span.start, d.name_span.end)
+  } else { str_lit(d.name) });
   match d.of {
     Some(_) -> def_body(input, emit(printer, head.concat(b" = ")), d.body, 0),
     None -> {
@@ -3089,8 +3262,8 @@ test "a line string that ends a list, a call or a record takes no comma, and one
   )
 }
 
-test "every item kind prints back to the same tree" {
-  let src = Bytes::concat_all([
+fn every_item_kind() -> Bytes =
+  Bytes::concat_all([
     b"import std.json\nimport a.b as c\nimport spine (Span, Ident)\n",
     b"pub type Shape = | Circle(Int) | Rect(Int, Int) | Point\n",
     b"type P = { x: Int, y: Int }\n",
@@ -3108,7 +3281,10 @@ test "every item kind prints back to the same tree" {
     b"test/nondet \"t\" { assert(true) }\n",
     b"law \"l\" forall (n: Int) where n > 0 { n == n }\n",
     b"law \"m\" { true }\n",
-  ]);
+  ])
+
+test "every item kind prints back to the same tree" {
+  let src = every_item_kind();
   assert(stable(src));
   assert(String::of_bytes(formatted(src)).contains("read get[r](key: Int) -> Option<Int>"))
 }
@@ -3257,8 +3433,8 @@ test "a `handle`, a `match` or an `if` may stand as a scrutinee" {
   assert(String::of_bytes(formatted(broken_up)).contains("match handle {"))
 }
 
-test "every expression kind prints back to the same tree" {
-  let src = Bytes::concat_all([
+fn every_expression_kind() -> Bytes =
+  Bytes::concat_all([
     b"fn f(r: {a: Int, b: Int}) -> Int = {\n",
     b"  let {a, b} = r;\n",
     b"  let s = {..r, a: 2};\n",
@@ -3274,8 +3450,10 @@ test "every expression kind prints back to the same tree" {
     b"  let e = parallel { a + 1, b };\n",
     b"  match [a, b] { [x, ..rest] if x > 0 -> x, [..] -> 0 }\n",
     b"}\n",
-  ]);
-  assert(stable(src))
+  ])
+
+test "every expression kind prints back to the same tree" {
+  assert(stable(every_expression_kind()))
 }
 
 test "literal spelling survives, and a grouped literal loses only its parentheses" {
@@ -3562,4 +3740,524 @@ test "a `key` and a `show` print on a line each, as written" {
 test "a hole prints as written, `???` or `..`" {
   lays_out(b"fn f(x: Int) -> Int = ???\n", b"fn f(x: Int) -> Int = ???\n");
   lays_out(b"fn f(x: Int) -> Int = ..\n", b"fn f(x: Int) -> Int = ..\n")
+}
+
+test "a bare lowercase type with no arguments keeps its `<>`, which tells it from a type variable" {
+  lays_out(
+    b"fn f(x: thing< >) -> List<thing<>> = [x]\n",
+    b"fn f(x: thing<>) -> List<thing<>> = [x]\n",
+  )
+}
+
+test "a string's hole with no one-line form is laid out in its braces" {
+  let src = b"fn f() -> String = f\"a { { let y = 1; y } } b\" ++ sh\"{ { let z = 2; z } }\"\n";
+  assert(stable(src));
+  assert_eq(tree_of(formatted(src)), tree_of(src))
+}
+
+fn every_literal_and_form() -> Bytes =
+  Bytes::concat_all([
+    b"pub opaque type Box<a> where derivable(eq, a) = | Box(List<a>)\n",
+    b"pub extern type Node<a, b>\n",
+    b"extern fn len<a>(xs: List<a>) -> Int / {abort.raise} requires true ensures result >= 0\n",
+    b"pub type Date = new { year: Int, month: Int }\n",
+    b"pub type Sink<a, [l], [k] | e, f> = | Sink((a) -> Unit / {net.send[l] | e}) | Quiet\n",
+    b"type T = | T(Int)\n",
+    b"key for T by f\nshow for T by g\nnumeric for T by { of_int: g, add: f }\n",
+    b"effect toml {\n  raise syntax(e: SyntaxError)\n  read peek[r]<a>(Int, at: a) -> a\n}\n",
+    b"law schema s<a | e>(f: (a) -> a / e) forall (x: a) where x == x { f(x) == x }\n",
+    b"law \"of {s} \\\"q\\\"\" = m::s(f, 1)\n",
+    b"test \"each {c} \\\"q\\\" {{}}\" for c: Int in [1, 2] { assert(c > 0) }\n",
+    b"test \"plain {{c}} \\\\\" for c: Int in [1] { assert(c > 0) }\n",
+    b"test/nondet \"braced {c} alone\" { assert(true) }\n",
+    b"fn held(x: thing<>, s: Sink<Int, [conn], [peer] | {}, {log.write | e}>) -> m::Seq<Int | {| e}> = s\n",
+    b"fn relay<[l]>(c: Int) -> Unit / {net.send[l], db.read[*], db.write bounded | e bounded} = relay[l](c)\n",
+    b"fn f<| e>(xs: List<Int>, g: keep (Int) -> Int / e cost k space s) -> Int / e\n",
+    b"  cost xs.len() * k\n  space s\n  decreases xs.len()\n= 0\n",
+    b"fn ints() -> List<Int> = [0, 7, 0x7FFF_FFFF_FFFF_FFFF, 0xFFFF_FFFF_FFFF_FFFF, 0x8000_0000_0000_0000, b'x', -3]\n",
+    b"fn widths() -> List<Int> = [0u8, 255u8, 127i8, 0x80i8, 0xFFFF_FFFF_FFFF_FFFFu64, ",
+    b"0x8000_0000_0000_0000i64, 65535u16, 0x8000i16, 4294967295u32, 0x8000_0000i32, ",
+    b"340282366920938463463374607431768211455u128, 0x8000_0000_0000_0000_0000_0000_0000_0000i128, ",
+    b"170141183460469231731687303715884105727i128, 5u128]\n",
+    b"fn reals() -> List<Float> = [0.1, 1e300, 5e-324, 1_000.5, 1.50m, 0.00m, 79228162514264337593543950335m]\n",
+    b"fn texts() -> List<String> = [\"tab\\there \\\"q\\\" \\\\ \\u{1F600} {x} \\u{7}\", b\"\\x00\\xff\\\"\", ",
+    b"'a', '\\'', '\\n', '\\u{e9}', true, false, (), \\\\a line\n  \\\\and another\n]\n",
+    b"fn strings(a: Int, b: Int, s: String) -> String = {\n",
+    b"  let h = f\"x = {a} and {{braces}} {f\"in {b}\"} {\"s\"} \\n\";\n",
+    b"  let i = f\"{a}\" ++ f\"{b}\" ++ \"tail\";\n",
+    b"  let j = sh\"text {a} {{b}} \\n {sh\"in {b}\"} z\";\n",
+    b"  let k = hex\"de\\u{61}d\";\n",
+    b"  let l = f\"{ { let y = 1; y } }\" ++ sh\"{ { let z = 2; z } }\";\n",
+    b"  let n = s ++ f\"{a}b\" ++ (\"c\" ++ \"d\");\n",
+    b"  h\n",
+    b"}\n",
+    b"fn forms(a: Int, o: Option<Int>) -> Int = {\n",
+    b"  let l = #{\"a\": 1, \"b\": 2};\n",
+    b"  let m = #[3, 1];\n",
+    b"  let n = Map::of_entries([{ key: 1, value: 2, extra: 3 }]);\n",
+    b"  let e = #{};\n",
+    b"  let w = wrap_add(a, 1) +% a *| 2 + wrap_mul[l](a, 3) + wrap_sub(a, 4, by: 5);\n",
+    b"  let Some(v) = o else { 0 };\n",
+    b"  let t = try[m::toml.syntax] { digit(a) };\n",
+    b"  let u = try { digit(a) };\n",
+    b"  let h = handle { g(a) } with { db.get[*](k) -> k, db.put[*t](k, x) -> x };\n",
+    b"  let p = { x: x, y: 1 };\n",
+    b"  match a {\n",
+    b"    0 | 1 -> 0,\n",
+    b"    -5..=-1 -> 1,\n",
+    b"    0x10..=0x20 -> 2,\n",
+    b"    b'a'..=b'z' -> 3,\n",
+    b"    'a' -> 4,\n",
+    b"    -1.5 -> 5,\n",
+    b"    -2i8 -> 6,\n",
+    b"    -0x7FFF_FFFF_FFFF_FFFF -> 7,\n",
+    b"    0x80i8 | 0x8000_0000_0000_0000 | -5i128 | 0x8000_0000_0000_0000_0000_0000_0000_0000i128 -> 7,\n",
+    b"    \"s\" -> 8,\n",
+    b"    b\"b\" -> 9,\n",
+    b"    1.50m -> 10,\n",
+    b"    { key: k, value: x } -> k,\n",
+    b"    _ -> ???,\n",
+    b"  }\n",
+    b"}\n",
+    b"fn todo() -> Int = ..\n",
+  ])
+
+test "every form prints back to the same tree from its source" {
+  assert(stable(every_literal_and_form()))
+}
+
+// --- A tree no source holds -------------------------------------------------
+
+fn bare_id(i: Ident) -> Ident = { name: i.name, span: dummy_span() }
+
+fn bare_ids(xs: List<Ident>) -> List<Ident> = xs.map(bare_id)
+
+fn bare_q(q: QName) -> QName =
+  { module: q.module.map(bare_id), name: bare_id(q.name), span: dummy_span() }
+
+fn bare_at(at: Option<Span>) -> Option<Span> = at.map(|s: Span| dummy_span())
+
+fn bare_doc(d: Doc) -> Doc = { lines: d.lines, span: dummy_span() }
+
+fn bare_ty(t: TypeExpr) -> TypeExpr =
+  match t {
+    TVar(i) -> TVar(bare_id(i)),
+    TCon(x) ->
+      TCon({
+        span: dummy_span(),
+        name: bare_q(x.name),
+        args: x.args.map(bare_ty),
+        labels: bare_ids(x.labels),
+        rows: x.rows.map(bare_row),
+      }),
+    TFn(x) ->
+      TFn({
+        span: dummy_span(),
+        params: x.params.map(bare_ty),
+        ret: bare_ty(x.ret),
+        effects: x.effects.map(bare_row),
+      }),
+    TRecord(x) ->
+      TRecord({
+        span: dummy_span(),
+        fields: x.fields.map(|f: { name: Ident, ty: TypeExpr }|
+          { name: bare_id(f.name), ty: bare_ty(f.ty) }),
+      }),
+    TUnit(_) -> TUnit({ span: dummy_span() }),
+    TBad(_) -> TBad({ span: dummy_span() }),
+  }
+
+fn bare_atom(a: AtomExpr) -> AtomExpr =
+  {
+    eff: bare_q(a.eff),
+    mode: a.mode,
+    op: a.op.map(bare_id),
+    resource: a.resource.map(bare_id),
+    every: a.every,
+    bounded: a.bounded,
+    span: dummy_span(),
+  }
+
+fn bare_row(r: RowExpr) -> RowExpr =
+  {
+    atoms: r.atoms.map(bare_atom),
+    aliases: r.aliases.map(bare_q),
+    tail: r.tail.map(bare_id),
+    tail_bounded: r.tail_bounded,
+    span: dummy_span(),
+  }
+
+fn bare_pat(p: Pattern) -> Pattern =
+  match p {
+    PWild(_) -> PWild({ span: dummy_span() }),
+    PVar(v) -> PVar({ span: dummy_span(), name: bare_id(v.name) }),
+    PLit(v) -> PLit({ span: dummy_span(), lit: v.lit }),
+    PRange(v) -> PRange({ span: dummy_span(), lo: v.lo, hi: v.hi }),
+    PCtor(v) -> PCtor({ span: dummy_span(), name: bare_q(v.name), args: v.args.map(bare_pat) }),
+    PRecord(v) ->
+      PRecord({
+        span: dummy_span(),
+        rest: v.rest,
+        fields: v.fields.map(|f: { name: Ident, pat: Pattern }|
+          { name: bare_id(f.name), pat: bare_pat(f.pat) }),
+      }),
+    PList(v) ->
+      PList({ span: dummy_span(), rest: v.rest.map(bare_pat), items: v.items.map(bare_pat) }),
+    POr(v) -> POr({ span: dummy_span(), alts: v.alts.map(bare_pat) }),
+    PBad(_) -> PBad({ span: dummy_span() }),
+  }
+
+fn bare_param(p: Param) -> Param =
+  {
+    name: bare_id(p.name),
+    keep: p.keep,
+    ty: p.ty.map(bare_ty),
+    cost: p.cost.map(bare_id),
+    space: p.space.map(bare_id),
+    default: p.default.map(bare_expr),
+    span: dummy_span(),
+  }
+
+fn bare_field(f: RecField) -> RecField = { name: bare_id(f.name), value: bare_expr(f.value) }
+
+fn bare_stmt(s: Stmt) -> Stmt =
+  match s {
+    SLet(v) ->
+      SLet({
+        span: dummy_span(),
+        pat: bare_pat(v.pat),
+        ty: v.ty.map(bare_ty),
+        value: bare_expr(v.value),
+      }),
+    SLetElse(v) ->
+      SLetElse({
+        span: dummy_span(),
+        pat: bare_pat(v.pat),
+        ty: v.ty.map(bare_ty),
+        value: bare_expr(v.value),
+        fallback: bare_expr(v.fallback),
+      }),
+    SExpr(x) -> SExpr(bare_expr(x)),
+    SAssign(v) -> SAssign({ span: dummy_span(), name: bare_id(v.name), value: bare_expr(v.value) }),
+  }
+
+fn bare_clause(c: HandleClause) -> HandleClause =
+  {
+    eff: bare_q(c.eff),
+    op: bare_id(c.op),
+    resource: c.resource.map(bare_id),
+    every_label: c.every_label,
+    label_binder: c.label_binder.map(bare_id),
+    resume: c.resume.map(bare_id),
+    body: bare_expr(c.body),
+    span: dummy_span(),
+    params: bare_ids(c.params),
+  }
+
+fn bare_expr(e: Expr) -> Expr =
+  match e {
+    ELit(v) -> ELit({ span: dummy_span(), lit: v.lit }),
+    EVar(v) -> EVar({ span: dummy_span(), name: bare_q(v.name) }),
+    EBinary(v) ->
+      EBinary({ span: dummy_span(), op: v.op, lhs: bare_expr(v.lhs), rhs: bare_expr(v.rhs) }),
+    EUnary(v) -> EUnary({ span: dummy_span(), op: v.op, operand: bare_expr(v.operand) }),
+    ELambda(v) ->
+      ELambda({
+        span: dummy_span(),
+        body: bare_expr(v.body),
+        params: v.params.map(bare_param),
+        ret: v.ret.map(bare_ty),
+      }),
+    EApp(v) ->
+      EApp({
+        span: dummy_span(),
+        func: bare_expr(v.func),
+        named: v.named.map(|a: NamedArg|
+          { name: bare_id(a.name), value: bare_expr(a.value), span: dummy_span() }),
+        args: v.args.map(bare_expr),
+        labels: bare_ids(v.labels),
+      }),
+    EIf(v) ->
+      EIf({
+        span: dummy_span(),
+        cond: bare_expr(v.cond),
+        then_branch: bare_expr(v.then_branch),
+        else_branch: bare_expr(v.else_branch),
+      }),
+    EMatch(v) ->
+      EMatch({
+        span: dummy_span(),
+        scrutinee: bare_expr(v.scrutinee),
+        arms: v.arms.map(|a: MatchArm|
+          {
+            pat: bare_pat(a.pat),
+            guard: a.guard.map(bare_expr),
+            body: bare_expr(a.body),
+            span: dummy_span(),
+          }),
+      }),
+    EBlock(v) ->
+      EBlock({ span: dummy_span(), tail: v.tail.map(bare_expr), stmts: v.stmts.map(bare_stmt) }),
+    ERecord(v) -> ERecord({ span: dummy_span(), fields: v.fields.map(bare_field) }),
+    ERecordUpdate(v) ->
+      ERecordUpdate({
+        span: dummy_span(),
+        base: bare_expr(v.base),
+        fields: v.fields.map(bare_field),
+      }),
+    ETry(v) -> ETry({ span: dummy_span(), operand: bare_expr(v.operand) }),
+    EField(v) -> EField({ span: dummy_span(), base: bare_expr(v.base), field: bare_id(v.field) }),
+    EList(v) -> EList({ span: dummy_span(), items: v.items.map(bare_expr) }),
+    EPerform(v) ->
+      EPerform({
+        span: dummy_span(),
+        eff: bare_q(v.eff),
+        op: bare_id(v.op),
+        resource: v.resource.map(bare_id),
+        args: v.args.map(bare_expr),
+      }),
+    EHandle(v) ->
+      EHandle({
+        span: dummy_span(),
+        body: bare_expr(v.body),
+        ret: v.ret.map(|r: ReturnClause|
+          { binder: bare_id(r.binder), body: bare_expr(r.body), span: dummy_span() }),
+        clauses: v.clauses.map(bare_clause),
+        vars: v.vars.map(|x: HandlerVar|
+          {
+            name: bare_id(x.name),
+            ty: x.ty.map(bare_ty),
+            init: bare_expr(x.init),
+            span: dummy_span(),
+          }),
+      }),
+    EWithHold(v) ->
+      EWithHold({
+        span: dummy_span(),
+        resource: bare_id(v.resource),
+        acquire: bare_expr(v.acquire),
+        release: bare_expr(v.release),
+        binder: bare_id(v.binder),
+        body: bare_expr(v.body),
+      }),
+    ESimulate(v) -> ESimulate({ span: dummy_span(), body: bare_expr(v.body) }),
+    EParallel(v) -> EParallel({ span: dummy_span(), branches: v.branches.map(bare_expr) }),
+    ETagged(v) ->
+      ETagged({
+        span: dummy_span(),
+        tag: bare_id(v.tag),
+        text: v.text,
+        quoted: dummy_span(),
+        holes: v.holes.map(|h: Hole|
+          { value: bare_expr(h.value), text: h.text, quoted: dummy_span() }),
+      }),
+    EHole(v) -> EHole({ span: dummy_span(), text: v.text }),
+    EBad(_) -> EBad({ span: dummy_span() }),
+    ETryBlock(v) ->
+      ETryBlock({
+        span: dummy_span(),
+        raise: v.raise.map(|r: RaiseName| { eff: bare_q(r.eff), op: bare_id(r.op) }),
+        body: bare_expr(v.body),
+      }),
+  }
+
+fn bare_generics(g: Generics) -> Generics =
+  { types: bare_ids(g.types), effects: bare_ids(g.effects), labels: bare_ids(g.labels) }
+
+fn bare_constraint(c: Constraint) -> Constraint =
+  { deriver: c.deriver, deriver_span: dummy_span(), param: bare_id(c.param), span: dummy_span() }
+
+fn bare_spec(c: SpecClause) -> SpecClause =
+  { kind: c.kind, expr: bare_expr(c.expr), span: dummy_span() }
+
+fn bare_binder(b: Binder) -> Binder =
+  { name: bare_id(b.name), ty: bare_ty(b.ty), span: dummy_span() }
+
+fn bare_returns(r: Returns) -> Returns =
+  match r {
+    ReturnsFresh(_) -> ReturnsFresh(dummy_span()),
+    ReturnsParam(i) -> ReturnsParam(bare_id(i)),
+  }
+
+fn bare_body(b: TypeDefBody) -> TypeDefBody =
+  match b {
+    TDAlias(t) -> TDAlias(bare_ty(t)),
+    TDSum(vs) ->
+      TDSum(
+        vs.map(|v: VariantDef|
+          {
+            name: bare_id(v.name),
+            fields: v.fields.map(bare_ty),
+            doc: v.doc.map(bare_doc),
+            span: dummy_span(),
+          }),
+      ),
+    TDNominal(t) -> TDNominal(bare_ty(t)),
+    TDExtern -> TDExtern,
+  }
+
+fn bare_item(it: Item) -> Item =
+  match it {
+    IFn(d) ->
+      IFn({
+        vis: d.vis,
+        name: bare_id(d.name),
+        generics: bare_generics(d.generics),
+        params: d.params.map(bare_param),
+        ret: d.ret.map(bare_ty),
+        effects: d.effects.map(bare_row),
+        constraints: d.constraints.map(bare_constraint),
+        spec: d.spec.map(bare_spec),
+        returns: d.returns.map(bare_returns),
+        reuse: bare_at(d.reuse),
+        transparent: bare_at(d.transparent),
+        baked: bare_at(d.baked),
+        decreases: d.decreases.map(bare_expr),
+        body: bare_expr(d.body),
+        doc: d.doc.map(bare_doc),
+        span: dummy_span(),
+      }),
+    IType(d) ->
+      IType({
+        vis: d.vis,
+        opaque: d.opaque.map(|o: Opaque| { span: dummy_span(), answer: o.answer, take: o.take }),
+        name: bare_id(d.name),
+        generics: bare_generics(d.generics),
+        constraints: d.constraints.map(bare_constraint),
+        body: bare_body(d.body),
+        doc: d.doc.map(bare_doc),
+        field_docs: d.field_docs.map(|f: FieldDoc| { name: f.name, doc: bare_doc(f.doc) }),
+        span: dummy_span(),
+      }),
+    IEffect(d) ->
+      IEffect({
+        vis: d.vis,
+        name: bare_id(d.name),
+        is_nondet: d.is_nondet,
+        ops: d.ops.map(|op: OpDef|
+          {
+            name: bare_id(op.name),
+            mode: op.mode,
+            resource_param: op.resource_param,
+            ty_params: bare_ids(op.ty_params),
+            params: op.params.map(bare_ty),
+            ret: bare_ty(op.ret),
+            doc: op.doc.map(bare_doc),
+            span: dummy_span(),
+          }),
+        doc: d.doc.map(bare_doc),
+        span: dummy_span(),
+      }),
+    ITest(d) ->
+      ITest({
+        name: d.name,
+        name_span: dummy_span(),
+        is_nondet: d.is_nondet,
+        cases: d.cases.map(|c: Cases|
+          {
+            binder: bare_id(c.binder),
+            ty: bare_ty(c.ty),
+            table: bare_expr(c.table),
+            label: bare_expr(c.label),
+            for_span: dummy_span(),
+            in_span: dummy_span(),
+          }),
+        body: bare_expr(d.body),
+        span: dummy_span(),
+      }),
+    ILaw(d) ->
+      ILaw({
+        name: d.name,
+        name_span: dummy_span(),
+        binders: d.binders.map(bare_binder),
+        guard: d.guard.map(bare_expr),
+        of: d.of.map(|o: OfSchema|
+          { schema: bare_q(o.schema), home: o.home, shown: o.shown, span: dummy_span() }),
+        body: bare_expr(d.body),
+        span: dummy_span(),
+      }),
+    ISchema(d) ->
+      ISchema({
+        vis: d.vis,
+        name: bare_id(d.name),
+        generics: bare_generics(d.generics),
+        params: d.params.map(bare_binder),
+        binders: d.binders.map(bare_binder),
+        guard: d.guard.map(bare_expr),
+        body: bare_expr(d.body),
+        doc: d.doc.map(bare_doc),
+        span: dummy_span(),
+      }),
+    IDerive(d) ->
+      IDerive({
+        deriver: d.deriver,
+        deriver_span: dummy_span(),
+        target: bare_id(d.target),
+        span: dummy_span(),
+      }),
+    IEffectSet(d) ->
+      IEffectSet({
+        name: bare_id(d.name),
+        vis: d.vis,
+        atoms: d.atoms.map(bare_atom),
+        includes: d.includes.map(bare_q),
+        expansion: d.expansion.map(bare_atom),
+        doc: d.doc.map(bare_doc),
+        span: dummy_span(),
+      }),
+    IExtern(d) ->
+      IExtern({
+        vis: d.vis,
+        name: bare_id(d.name),
+        generics: bare_generics(d.generics),
+        params: d.params.map(bare_param),
+        ret: bare_ty(d.ret),
+        effects: d.effects.map(bare_row),
+        constraints: d.constraints.map(bare_constraint),
+        spec: d.spec.map(bare_spec),
+        doc: d.doc.map(bare_doc),
+        span: dummy_span(),
+        written: b"",
+      }),
+    IInstance(d) ->
+      IInstance({ kind: d.kind, target: bare_id(d.target), by: bare_id(d.by), span: dummy_span() }),
+    INumeric(d) ->
+      INumeric({
+        target: bare_id(d.target),
+        ops: d.ops.map(|x: NumericOp| { op: bare_id(x.op), by: bare_id(x.by) }),
+        span: dummy_span(),
+      }),
+  }
+
+fn bare_import(decl: ImportDecl) -> ImportDecl =
+  {
+    path: bare_ids(decl.path),
+    kind: match decl.kind {
+      IModule -> IModule,
+      IAlias(a) -> IAlias(bare_id(a)),
+      INames(ns) -> INames(bare_ids(ns)),
+    },
+    span: dummy_span(),
+  }
+
+/// `src`'s tree with every span the dummy one, printed with no source, parses back to that tree.
+fn prints_bare(src: Bytes) -> Unit / {abort.raise} = {
+  let tree = parse(src).node;
+  let bare = {
+    doc: None,
+    imports: tree.imports.map(bare_import),
+    items: tree.items.map(bare_item),
+  };
+  let out = module_text(bare);
+  let again = parse(out);
+  match again.parser.diags.at(0) {
+    Some(d) -> panic(String::of_bytes(Bytes::concat_all([render_diag(out, d), b" in\n", out]))),
+    None -> assert_eq(erase_spans(dump_module(again.node)), erase_spans(dump_module(bare))),
+  }
+}
+
+test "a tree no source holds prints back to itself, every item, expression, literal and form among it" {
+  prints_bare(every_item_kind());
+  prints_bare(every_expression_kind());
+  prints_bare(every_literal_and_form())
 }
