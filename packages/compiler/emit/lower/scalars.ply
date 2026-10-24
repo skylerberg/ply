@@ -24,7 +24,7 @@ import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_
                         pair_words, continued, type_of, handed, noted, set_join, joined,
                         short_circuit, as_words)
 import emit.lower.data (constructed_as, field)
-import emit.lower.crossing (through_runtime, blake3_of)
+import emit.lower.crossing (through_runtime, blake3_of, scalar_encoding)
 import emit.roots (builtin_helper)
 import expand.rewrite (FloatFunction, float_function)
 
@@ -790,8 +790,7 @@ fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowere
       else if c.name == b"Unit" { constructed_as(cx, st, b"std.value.VUnit", [], value_type, at) }
       else {
         match width_named(c.name) {
-          Some(w) -> if w.bits < 64 { width_reflected(cx, st, c.name, w, a, value_type, at) }
-          else { runtime() },
+          Some(w) -> width_reflected(cx, st, c.name, w, a, value_type, at),
           None -> runtime(),
         }
       },
@@ -802,8 +801,8 @@ fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowere
   }
 }
 
-/// A width below 64 bits reflected: its bits with nothing above them, a signed one's `Int` cut to its
-/// width, as a `U128`, and its type's name.
+/// A width reflected: its bits with nothing above them as a `U128`, a signed one's cut to its width,
+/// and its type's name.
 fn width_reflected(
   cx: Context,
   st: Lowering,
@@ -814,24 +813,35 @@ fn width_reflected(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let int = named_type(b"Int");
-  let x = alone(cx, { st: st, arg: a }, b"to_int", RNum(w), int, at);
-  let bits = if !w.signed { x } else {
-    bound(
-      cx,
-      x.st,
-      int,
-      Prim({ op: b"bitand", on: RInt, args: [x.arg, AInt((1 << w.bits) - 1)] }),
-      at,
-    )
+  let u128 = named_type(b"U128");
+  let made = |s: Lowering, lo: Arg, hi: Arg|
+    bound(cx, s, u128, Prim({ op: b"wide", on: RInt, args: [lo, hi] }), at);
+  let wide = if w.bits > 64 {
+    let p = pair_words(st, a, RWide(w), at);
+    made(p.st, p.lo, p.hi)
+  } else if w.bits == 64 {
+    let x = alone(cx, { st: st, arg: a }, b"narrow", RNum(w), int, at);
+    made(x.st, x.arg, AInt(0))
+  } else {
+    let x = alone(cx, { st: st, arg: a }, b"to_int", RNum(w), int, at);
+    let bits = if !w.signed { x } else {
+      bound(
+        cx,
+        x.st,
+        int,
+        Prim({ op: b"bitand", on: RInt, args: [x.arg, AInt((1 << w.bits) - 1)] }),
+        at,
+      )
+    };
+    made(bits.st, bits.arg, AInt(0))
   };
-  let wide = through_runtime(cx, bits.st, b"U128::of_int", [bits.arg], named_type(b"U128"), at);
   let spelled = literal(cx, wide.st, LStr(name), at);
   constructed_as(cx, spelled.st, b"std.value.VFixed", [spelled.arg, wide.arg], value_type, at)
 }
 
 /// `digest(a)`, or `?encoded(a)` where `hashed` is false: the encoding of a declared sum, a container
-/// or a record written by the root for its type, then hashed; any other type's by the runtime's
-/// builtin.
+/// or a record written by the root for its type, a scalar's by the runtime's native over its words,
+/// then hashed; any other type's by the runtime's builtin.
 fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
   let bytes = answer_of(cx, if hashed { b"digest" } else { b"?encoded" }, ty, named_type(b"Bytes"));
@@ -842,14 +852,18 @@ fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered
     _ -> false,
   };
   if !rooted_by {
-    through_runtime(
-      cx,
-      needing(st, ty, true),
-      if hashed { b"digest" } else { b"?encoded" },
-      [a],
-      bytes,
-      at,
-    )
+    match scalar_encoding(cx, st, a, ty, at) {
+      Some(e) -> if hashed { blake3_of(e.st, e.arg, at) } else { e },
+      None ->
+        through_runtime(
+          cx,
+          needing(st, ty, true),
+          if hashed { b"digest" } else { b"?encoded" },
+          [a],
+          bytes,
+          at,
+        ),
+    }
   } else {
     let e = written(cx, st, Digest, ty, a, at);
     if hashed { blake3_of(e.st, e.arg, at) } else { e }
