@@ -487,7 +487,11 @@ fn filled_under(
 
 /// The effect enumeration an item is written under, fixed by what it references with nothing known.
 fn slots_of(over: Over, form: Template) -> Map<Int, Int> / {abort.raise} =
-  slots(effect_order(over.shapes, references(form), over.graph.scc, None, []))
+  slots_under(over, references(form))
+
+/// The effect enumeration of an item that references `referenced`, in first-mention order.
+fn slots_under(over: Over, referenced: List<Int>) -> Map<Int, Int> / {abort.raise} =
+  slots(effect_order(over.shapes, referenced, over.graph.scc, None, []))
 
 /// `form` filled from `hashes` under the enumeration its own references fix.
 fn filled_item(
@@ -549,7 +553,7 @@ fn hash_component(
       max(acc, match settled.classes.get(v) { Some(c) -> c, None -> 0 }))
     + 1;
   let by_class = range(0, component.len()).fold(
-    range(0, width).map(|i: Int| { bytes: b"", references: [], chosen: [] }),
+    range(0, width).map(|i: Int| { bytes: b"", chosen: [] }),
     |acc: List<Finished>, i: Int|
       acc.set(
         match settled.classes.get(component.get(i)) { Some(c) -> c, None -> 0 },
@@ -646,18 +650,22 @@ type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, fresh: Map<Int,
 
 type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
 
-/// Every node with nothing known: what it references, and a sketch that orders a cycle's members
-/// without source position. A node `fixed` holds references what its run fixed, and has a sketch
-/// only where it has a form.
-fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<Finished> / {abort.raise} =
+/// A node with nothing known: its sketch, which orders a cycle's members without source position,
+/// and what it references, in first-mention order.
+pub type First = { sketch: Bytes, references: List<Int> }
+
+/// Every node with nothing known. A node `fixed` holds references what its run fixed, and has a
+/// sketch only where it has a form.
+fn first_of(shapes: Shapes, fixed: Map<Int, List<Int>>) -> List<First> / {abort.raise} =
   range(0, shapes.nodes.len()).map(|v: Int| {
     let edges = fixed.get(v);
     match shapes.nodes.get(v).form {
-      None -> { bytes: b"", references: match edges { Some(es) -> es, None -> [] }, chosen: [] },
-      Some(f) -> {
-        let x: Finished = finished(f.form, blank());
-        match edges { Some(es) -> { ..x, references: es }, None -> x }
-      },
+      None -> { sketch: b"", references: match edges { Some(es) -> es, None -> [] } },
+      Some(f) ->
+        {
+          sketch: finished(f.form, blank()).bytes,
+          references: match edges { Some(es) -> es, None -> references(f.form) },
+        },
     }
   })
 
@@ -710,7 +718,7 @@ fn test_form(
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
   { form: law_template(index, l.module, l.def), listed: [], listing: [] }
 
-type Shaped = { shapes: Shapes, first: List<Finished> }
+type Shaped = { shapes: Shapes, first: List<First> }
 
 /// Each node of `index` as hashing reads it, its modules in `packages`; a node `fixed` holds the
 /// references of, and each test and law `fixing` holds, without forms. A fixed node that shares a
@@ -753,7 +761,7 @@ pub fn shapes_of(
   let first = first_of(plain, fixed);
   // A cycle whose members are all fixed keeps the order it was fixed in, which no sketch decides.
   let cyclic = if fixed.len() == 0 { Map::new() } else {
-    graph::components({ out: first.map(|f: Finished| f.references) }).fold(
+    graph::components({ out: first.map(|f: First| f.references) }).fold(
       Map::new(),
       |acc: Map<Int, Bool>, c: List<Int>|
         if c.len() < 2 || c.fold(true, |all: Bool, v: Int| all && fixed.contains(v)) { acc } else {
@@ -785,12 +793,12 @@ pub fn over_of(index: Index) -> Over / {abort.raise} = {
 /// `carried` gives a fixed node the enumeration its component had where its body was hashed.
 fn graph_with(
   shapes: Shapes,
-  first: List<Finished>,
+  first: List<First>,
   carried: Map<Int, List<Int>>,
 ) -> Graph / {abort.raise} = {
   let n = shapes.nodes.len();
-  let edges = first.map(|f: Finished| f.references);
-  let sketches = first.map(|f: Finished| f.bytes);
+  let edges = first.map(|f: First| f.references);
+  let sketches = first.map(|f: First| f.sketch);
   // A cycle's members last met first: the order the keys below are taken in.
   let components = graph::components({ out: edges }).map(|c: List<Int>| c.reverse());
   let component_of = range(0, components.len()).fold(
@@ -954,7 +962,7 @@ fn shape_keys(shapes: Shapes) -> Map<Bytes, Int> / {abort.raise} =
 /// it.
 pub fn hashed_over(
   shapes: Shapes,
-  first: List<Finished>,
+  first: List<First>,
   held: Map<Int, Fixed>,
   fixing: Fixing,
 ) -> { graph: Graph, hashed: Hashed } / {abort.raise} = {
@@ -1005,7 +1013,8 @@ pub fn hashed_over(
           None -> panic("a test read as fixed is not fixed"),
         },
         Some(form) -> {
-          let effects = slots_of(over, form.form);
+          let referenced = references(form.form);
+          let effects = slots_under(over, referenced);
           let f: Finished = filled_under(over, form.form, hashes, effects, false);
           let text: Finished = filled_under(over, form.form, hashes, effects, true);
           {
@@ -1013,9 +1022,9 @@ pub fn hashed_over(
             bodies: acc.bodies.push(solo_body(f)),
             texts: acc.texts.push(own_hash(text.bytes)),
             refs: acc.refs.push(
-              form.listed.fold(f.references, |rs: List<Int>, r: Int| rs.push_unique(r)),
+              form.listed.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
             ),
-            runs: acc.runs.push(f.references),
+            runs: acc.runs.push(referenced),
             listings: acc.listings.push(form.listing),
           }
         },
@@ -1035,12 +1044,13 @@ pub fn hashed_over(
           None -> panic("a law read as fixed is not fixed"),
         },
         Some(form) -> {
-          let effects = slots_of(over, form.form);
+          let referenced = references(form.form);
+          let effects = slots_under(over, referenced);
           let f: Finished = filled_under(over, form.form, hashes, effects, false);
           let text: Finished = filled_under(over, form.form, hashes, effects, true);
           {
             hashes: acc.hashes.push(blake3(f.bytes)),
-            refs: acc.refs.push(f.references),
+            refs: acc.refs.push(referenced),
             texts: acc.texts.push(spec_text_hash(0, 0, text.bytes)),
           }
         },

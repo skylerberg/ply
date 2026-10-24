@@ -37,26 +37,20 @@ pub type Filling = {
 pub fn blank() -> Filling =
   { hashes: Map::new(), component: Map::new(), effects: Map::new(), by_name: false, names: [] }
 
-/// A filled template: its stored form, what it references in first-mention order, and each call
-/// on a value's pick in the order the form holds them.
-pub type Filled = { form: Stored, references: List<Int>, chosen: List<Pick> }
+/// A filled template as hashing reads it: the bytes of its stored form, which its hash is taken
+/// over, and each call on a value's pick in the order the form holds them.
+pub type Finished = { bytes: Bytes, chosen: List<Pick> }
 
-/// A filled template as hashing reads it: its stored form's bytes, what it references in
-/// first-mention order, and its picks.
-pub type Finished = { bytes: Bytes, references: List<Int>, chosen: List<Pick> }
-
-pub fn filled(template: Template, filling: Filling) -> Filled / {abort.raise} = {
-  let picked = picks_of(form(filling, template));
-  { form: picked.form, references: references(template), chosen: picked.chosen }
-}
-
-/// The bytes a filled form's hash is taken over.
-pub fn bytes_of(stored: Stored) -> Bytes / {abort.raise} = bin::encode(stored, stored_bin())
-
-pub fn finished(template: Template, filling: Filling) -> Finished / {abort.raise} = {
-  let done = filled(template, filling);
-  { bytes: bytes_of(done.form), references: done.references, chosen: done.chosen }
-}
+pub fn finished(template: Template, filling: Filling) -> Finished / {abort.raise} =
+  handle {
+    bin::encode(form(filling, template), stored_bin())
+  } with {
+    var chosen: List<Pick> = [],
+    picking.pick(one) -> {
+      chosen = chosen.push(one);
+    },
+    return bytes -> { bytes: bytes, chosen: chosen },
+  }
 
 // --- References ----------------------------------------------------------------------------------
 
@@ -148,12 +142,9 @@ fn level_of(runs: Runs, spot: Spot) -> Int / {abort.raise} =
     }
   }
 
-/// A form filled, its notes kept so its picks can be read off it.
-type Noted = Form<Reference, Int, Int, Note>
+type StoredExpression = stored::Expression<Reference, Int, Int, Unit>
 
-type NotedExpression = stored::Expression<Reference, Int, Int, Note>
-
-type NotedStatement = stored::Statement<Reference, Int, Int, Note>
+type StoredStatement = stored::Statement<Reference, Int, Int, Unit>
 
 type TemplateType = stored::Type<Int, Slotted>
 
@@ -161,27 +152,21 @@ type TemplateExpression = stored::Expression<Int, Slotted, Spot, Note>
 
 type TemplateStatement = stored::Statement<Int, Slotted, Spot, Note>
 
-/// What a filled form's notes say of its picks, in the order it holds them.
+/// A call on a value's pick, told as the call is filled. The walk fills each node's parts in the
+/// order the stored form holds them, so picks are told in that order.
 effect picking {
   write pick(chosen: Pick) -> Unit
 }
 
-/// `noted`'s picks, and `noted` with its notes dropped.
-fn picks_of(noted: Noted) -> { form: Stored, chosen: List<Pick> } / {abort.raise} =
-  handle {
-    noted.map(
-      reference: |reference: Reference| reference,
-      slot: |slot: Int| slot,
-      level: |level: Int| level,
-      note: |note: Note| match note { Picked(chosen) -> picking.pick(chosen), Ran(_) -> () },
-    )
-  } with {
-    var chosen: List<Pick> = [],
-    picking.pick(one) -> {
-      chosen = chosen.push(one);
-    },
-    return stored -> { form: stored, chosen: chosen },
+fn picked(note: Note) -> Unit / {picking.pick, abort.raise} =
+  match note {
+    Picked(chosen) -> picking.pick(chosen),
+    Ran(_) -> panic("a call on a value noted as a run"),
   }
+
+/// `work` with the picks it tells dropped: a run's member filled only to order the run.
+fn unpicked<a>(work: () -> a / {picking.pick, abort.raise}) -> a / {abort.raise} =
+  handle { work() } with { picking.pick(one) -> () }
 
 // --- Types and rows ------------------------------------------------------------------------------
 
@@ -286,23 +271,26 @@ fn optional_type(
 fn expressions(
   scope: Scope,
   templates: List<TemplateExpression>,
-) -> List<NotedExpression> / {abort.raise} =
+) -> List<StoredExpression> / {picking.pick, abort.raise} =
   templates.map(|each: TemplateExpression| expression(scope, each))
 
 fn optional_expression(
   scope: Scope,
   template: Option<TemplateExpression>,
-) -> Option<NotedExpression> / {abort.raise} =
+) -> Option<StoredExpression> / {picking.pick, abort.raise} =
   template.map(|present: TemplateExpression| expression(scope, present))
 
 fn record_fields(
   scope: Scope,
   fields: List<stored::RecordField<Int, Slotted, Spot, Note>>,
-) -> List<stored::RecordField<Reference, Int, Int, Note>> / {abort.raise} =
+) -> List<stored::RecordField<Reference, Int, Int, Unit>> / {picking.pick, abort.raise} =
   fields.map(|field: stored::RecordField<Int, Slotted, Spot, Note>|
     { name: field.name, value: expression(scope, field.value) })
 
-fn expression(scope: Scope, template: TemplateExpression) -> NotedExpression / {abort.raise} = {
+fn expression(
+  scope: Scope,
+  template: TemplateExpression,
+) -> StoredExpression / {picking.pick, abort.raise} = {
   let references = |nodes: List<Int>| nodes.map(|node: Int| reference_of(scope.filling, node));
   match template {
     Constant(literal) -> Constant(literal),
@@ -329,7 +317,7 @@ fn expression(scope: Scope, template: TemplateExpression) -> NotedExpression / {
           reference: |node: Int| reference_of(scope.filling, node),
           level: |spot: Spot| level_of(scope.runs, spot),
         ),
-        note: call.note,
+        note: picked(call.note),
       }),
     If(condition, then_branch, else_branch) ->
       If(
@@ -402,7 +390,7 @@ fn expression(scope: Scope, template: TemplateExpression) -> NotedExpression / {
     Block(entries, tail) -> {
       let written = entries.fold(
         { runs: scope.runs, entries: [] },
-        |acc: { runs: Runs, entries: List<stored::Entry<Reference, Int, Int, Note>> }, entry: stored::Entry<Int, Slotted, Spot, Note>|
+        |acc: { runs: Runs, entries: List<stored::Entry<Reference, Int, Int, Unit>> }, entry: stored::Entry<Int, Slotted, Spot, Note>|
           match entry {
             One(alone) ->
               {
@@ -427,7 +415,7 @@ fn run(
   scope: Scope,
   at: RunAt,
   members: List<TemplateStatement>,
-) -> { runs: Runs, entry: stored::Entry<Reference, Int, Int, Note> } / {abort.raise} = {
+) -> { runs: Runs, entry: stored::Entry<Reference, Int, Int, Unit> } / {picking.pick, abort.raise} = {
   let base = level_of(scope.runs, at.base);
   let count = members.len();
   let unordered = {
@@ -436,7 +424,7 @@ fn run(
   };
   let codec = statement_bin(reference_bin(), bin::int_bin(), bin::int_bin(), bin::unit_bin());
   let keys = members.map(|member: TemplateStatement|
-    bin::encode(notes_dropped(statement(unordered, member)), codec));
+    bin::encode(unpicked(|| statement(unordered, member)), codec));
   let order = range(0, count).sort_by(|first: Int, second: Int|
     match compare_values(keys.get(first), keys.get(second)) {
       Less -> true,
@@ -452,24 +440,16 @@ fn run(
   {
     runs: runs,
     entry: Commuting(
-      Ran(at),
+      (),
       order.map(|member: Int| statement({ ..scope, runs: runs }, members.get(member))),
     ),
   }
 }
 
-/// `noted` with its notes dropped: what a run's member is ordered by.
-fn notes_dropped(
-  noted: NotedStatement,
-) -> stored::Statement<Reference, Int, Int, Unit> / {abort.raise} =
-  noted.map(
-    reference: |reference: Reference| reference,
-    slot: |slot: Int| slot,
-    level: |level: Int| level,
-    note: |_: Note| (),
-  )
-
-fn statement(scope: Scope, template: TemplateStatement) -> NotedStatement / {abort.raise} =
+fn statement(
+  scope: Scope,
+  template: TemplateStatement,
+) -> StoredStatement / {picking.pick, abort.raise} =
   match template {
     Let(annotation, value, pattern) ->
       Let(optional_type(scope, annotation), expression(scope, value), pattern_of(scope, pattern)),
@@ -486,7 +466,7 @@ fn statement(scope: Scope, template: TemplateStatement) -> NotedStatement / {abo
 
 // --- Items ---------------------------------------------------------------------------------------
 
-fn form(filling: Filling, template: Template) -> Noted / {abort.raise} = {
+fn form(filling: Filling, template: Template) -> Stored / {picking.pick, abort.raise} = {
   let scope = { filling: filling, runs: Map::new() };
   let type_filled = |each: TemplateType| filled_type(filling, each);
   match template {
