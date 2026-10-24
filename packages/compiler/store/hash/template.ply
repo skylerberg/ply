@@ -61,6 +61,7 @@ pub type TStmt = stored::Stmt<Int, Bytes, Spot, Note>
 /// `scope` is the member of a run being written, with `within` where its binders start among
 /// `values`; `run` -1 outside every run. `chose` is what the check found of each call on a value,
 /// by `site_key`; `None` where hashing runs before the check, which leaves each call pending.
+/// `reads` is the place in `values` of each binder a name has been resolved to, in order.
 pub type Encoder = {
   index: Index,
   module: Int,
@@ -72,6 +73,7 @@ pub type Encoder = {
   scope: Spot,
   runs: Int,
   chose: Option<Map<Bytes, Called>>,
+  reads: List<Int>,
 }
 
 /// What a walk built and the encoder it leaves.
@@ -91,6 +93,7 @@ pub fn new_encoder(index: Index, module: Int) -> Encoder =
     scope: no_scope(),
     runs: 0,
     chose: Some(Map::new()),
+    reads: [],
   }
 
 /// The template of `body` in `module`, each call on a value read as calling what `chose` holds at
@@ -156,6 +159,13 @@ fn bind_all(encoder: Encoder, names: List<Bytes>) -> Encoder = names.fold(encode
 fn bound_at(values: List<Bound>, name: Bytes) -> Option<Int> / {abort.raise} =
   range(0, values.len()).fold(None, |acc: Option<Int>, i: Int|
     if values.get(i).name == name { Some(i) } else { acc })
+
+/// `encoder` having read the binder `qname` names, where it names a local.
+fn read(encoder: Encoder, qname: QName) -> Encoder / {abort.raise} =
+  match if is_bare(qname) { bound_at(encoder.values, qname.name.name) } else { None } {
+    Some(i) -> { ..encoder, reads: encoder.reads.push(i) },
+    None -> encoder,
+  }
 
 /// `encoder` with the binders of `inner` dropped: what a scope that closes leaves.
 fn closed(inner: Encoder, outer: Encoder) -> Encoder = { ..inner, values: outer.values }
@@ -634,7 +644,7 @@ fn expr(encoder: Encoder, e: Expr) -> Built<TExpr> / {abort.raise} =
     } else { block(encoder, b.stmts, b.tail) },
     ELit(l) -> { encoder: encoder, form: Constant(literal(l.lit)) },
     EHole(_) -> { encoder: encoder, form: Unwritten },
-    EVar(v) -> { encoder: encoder, form: Var(value_of(encoder, v.name)) },
+    EVar(v) -> { encoder: read(encoder, v.name), form: Var(value_of(encoder, v.name)) },
     EBinary(b) -> {
       let l = expr(encoder, b.lhs);
       let r = expr(l.encoder, b.rhs);
@@ -726,7 +736,7 @@ fn expr(encoder: Encoder, e: Expr) -> Built<TExpr> / {abort.raise} =
       // On a binding it is a call on the value the binding holds.
       Some(i) ->
         on_value(
-          encoder,
+          { ..encoder, reads: encoder.reads.push(i) },
           Var({ named: Local(encoder.values.get(i).spot), written: [] }),
           p.span,
           p.op,
@@ -857,27 +867,45 @@ fn entries_in_order(
   stmts: List<Stmt>,
 ) -> Built<List<Entry<Int, Bytes, Spot, Note>>> / {abort.raise} = {
   let n = stmts.len();
+  let one = |b: Built<List<Entry<Int, Bytes, Spot, Note>>>, st: Stmt| {
+    let x = stmt(b.encoder, st);
+    { encoder: x.encoder, form: b.form.push(One(x.form)) }
+  };
   iterate(
     { built: { encoder: encoder, form: [] }, i: 0 },
     n + 2,
     |s: { built: Built<List<Entry<Int, Bytes, Spot, Note>>>, i: Int }|
       if s.i >= n { Stop(s) } else {
-        let run = commutable_run(stmts, s.i);
-        if run < 2 {
-          let b = stmt(s.built.encoder, stmts.get(s.i));
-          Continue({
-            built: { encoder: b.encoder, form: s.built.form.push(One(b.form)) },
-            i: s.i + 1,
-          })
-        } else {
-          let r = commuting(s.built.encoder, stmts, s.i, s.i + run);
-          Continue({
-            built: { encoder: r.encoder, form: s.built.form.push(r.form) },
-            i: s.i + run,
-          })
+        let run = pure_run(stmts, s.i);
+        if run < 2 { Continue({ built: one(s.built, stmts.get(s.i)), i: s.i + 1 }) } else {
+          let members = range(s.i, s.i + run).map(|k: Int| stmts.get(k));
+          let apart = members.fold({ encoder: s.built.encoder, form: [] }, one);
+          if reads_run(s.built.encoder, members) {
+            Continue({ built: { encoder: apart.encoder, form: s.built.form.concat(apart.form) }, i: s.i + run })
+          } else {
+            let r = commuting(s.built.encoder, stmts, s.i, s.i + run);
+            Continue({ built: { encoder: r.encoder, form: s.built.form.push(r.form) }, i: s.i + run })
+          }
         }
       },
   ).built
+}
+
+/// Whether a member of `members`, written in turn from `encoder`, reads a binder a member before
+/// it binds: only `let`s that read none of each other's binders commute. What a name reads is the
+/// binder it resolves to, so a binder of the value's own shadows a member's of its name.
+fn reads_run(encoder: Encoder, members: List<Stmt>) -> Bool / {abort.raise} = {
+  let from = encoder.values.len();
+  members.fold(
+    { encoder: encoder, read: false },
+    |acc: { encoder: Encoder, read: Bool }, st: Stmt| {
+      let bound = acc.encoder.values.len();
+      let before = acc.encoder.reads.len();
+      let x = stmt(acc.encoder, st);
+      let reads = range(before, x.encoder.reads.len()).map(|k: Int| x.encoder.reads.get(k));
+      { encoder: x.encoder, read: acc.read || reads.any(|r: Int| r >= from && r < bound) }
+    },
+  ).read
 }
 
 /// The members of a run, each written from where the run starts: filling orders them by their
@@ -931,14 +959,14 @@ fn stmt(encoder: Encoder, s: Stmt) -> Built<TStmt> / {abort.raise} =
       { encoder: x.encoder, form: Effectful(x.form) }
     },
     SAssign(a) -> {
-      let v = expr(encoder, a.value);
+      let v = expr(read(encoder, bare(a.name)), a.value);
       { encoder: v.encoder, form: Assign(value_of(encoder, bare(a.name)), v.form) }
     },
   }
 
-/// How many of the `let`s from `from` commute: consecutive pure ones that bind distinct names and
-/// read none of the names the others bind. Fewer than two is no run.
-fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
+/// How many consecutive `let`s from `from` have pure values: what may commute, fewer than two
+/// being no run.
+fn pure_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
   let n = stmts.len();
   let to = iterate(from, n - from + 1, |i: Int|
     if i >= n { Stop(i) } else {
@@ -947,24 +975,7 @@ fn commutable_run(stmts: List<Stmt>, from: Int) -> Int / {abort.raise} = {
         _ -> Stop(i),
       }
     });
-  if to - from < 2 { 0 } else {
-    let run = range(from, to).map(|i: Int| stmts.get(i));
-    let counted = run.fold(
-      { count: 0, bound: [] },
-      |acc: { count: Int, bound: List<Bytes> }, stmt: Stmt|
-        match stmt {
-          SLet(l) -> {
-            let b = pattern_binders(l.pat, acc.bound);
-            { count: acc.count + b.count, bound: b.bound }
-          },
-          _ -> acc,
-        },
-    );
-    if counted.count != counted.bound.len() { 0 }
-    else if run.fold(false, |b: Bool, stmt: Stmt|
-        b || (match stmt { SLet(l) -> mentions(l.value, counted.bound), _ -> false })) { 0 }
-    else { to - from }
-  }
+  if to - from < 2 { 0 } else { to - from }
 }
 
 // --- Items -------------------------------------------------------------------------------------
@@ -1177,52 +1188,6 @@ fn spec_clause(
 
 // --- Which `let`s commute ----------------------------------------------------------------------
 
-fn pattern_binders(p: Pattern, out: List<Bytes>) -> { count: Int, bound: List<Bytes> } =
-  match p {
-    PVar(v) -> { count: 1, bound: out.push_unique(v.name.name) },
-    PWild(_) -> { count: 0, bound: out },
-    PLit(_) -> { count: 0, bound: out },
-    PRange(_) -> { count: 0, bound: out },
-    PBad(_) -> { count: 0, bound: out },
-    PCtor(c) ->
-      c.args.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, a: Pattern| {
-          let b = pattern_binders(a, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      ),
-    PRecord(r) ->
-      r.fields.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, f: { name: Ident, pat: Pattern }| {
-          let b = pattern_binders(f.pat, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      ),
-    PList(l) -> {
-      let items = l.items.fold(
-        { count: 0, bound: out },
-        |acc: { count: Int, bound: List<Bytes> }, i: Pattern| {
-          let b = pattern_binders(i, acc.bound);
-          { count: acc.count + b.count, bound: b.bound }
-        },
-      );
-      match l.rest {
-        Some(rest) -> {
-          let b = pattern_binders(rest, items.bound);
-          { count: items.count + b.count, bound: b.bound }
-        },
-        None -> items,
-      }
-    },
-    // Every alternative binds the same names, which the checker holds them to.
-    POr(o) -> match o.alts.at(0) {
-      Some(a) -> pattern_binders(a, out),
-      None -> { count: 0, bound: out },
-    },
-  }
-
 pub fn is_pure(e: Expr) -> Bool =
   match e {
     EApp(_) -> false,
@@ -1262,88 +1227,6 @@ pub fn is_pure(e: Expr) -> Bool =
     EField(f) -> is_pure(f.base),
     EList(l) -> l.items.fold(true, |acc: Bool, x: Expr| acc && is_pure(x)),
   }
-
-/// Deliberately blind to scope: any occurrence of the name counts.
-fn mentions(e: Expr, names: List<Bytes>) -> Bool =
-  match e {
-    ELit(_) -> false,
-    ETagged(t) -> t.holes.fold(false, |acc: Bool, h: Hole| acc || mentions(h.value, names)),
-    EHole(_) -> false,
-    EBad(_) -> false,
-    EVar(v) -> is_bare(v.name) && names.contains(v.name.name.name),
-    EBinary(b) -> mentions(b.lhs, names) || mentions(b.rhs, names),
-    EUnary(u) -> mentions(u.operand, names),
-    ELambda(l) ->
-      l.params.fold(false, |acc: Bool, p: Param| acc || names.contains(p.name.name))
-        || mentions(l.body, names),
-    EApp(a) ->
-      mentions(a.func, names) || a.args.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EIf(i) ->
-      mentions(i.cond, names) || mentions(i.then_branch, names) || mentions(i.else_branch, names),
-    EMatch(m) ->
-      mentions(m.scrutinee, names)
-        || m.arms.fold(false, |acc: Bool, a: MatchArm|
-          acc || pattern_mentions(a.pat, names)
-            || (match a.guard { Some(g) -> mentions(g, names), None -> false })
-            || mentions(a.body, names)),
-    EBlock(b) ->
-      b.stmts.fold(false, |acc: Bool, s: Stmt|
-          acc
-            || (match s {
-              SLet(l) -> pattern_mentions(l.pat, names) || mentions(l.value, names),
-              SLetElse(l) ->
-                pattern_mentions(l.pat, names) || mentions(l.value, names)
-                  || mentions(l.fallback, names),
-              SExpr(x) -> mentions(x, names),
-              SAssign(x) -> names.contains(x.name.name) || mentions(x.value, names),
-            }))
-        || (match b.tail { Some(t) -> mentions(t, names), None -> false }),
-    ERecord(r) -> r.fields.fold(false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
-    ERecordUpdate(r) ->
-      mentions(r.base, names)
-        || r.fields.fold(false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
-    EField(f) -> mentions(f.base, names),
-    ETry(t) -> mentions(t.operand, names),
-    EList(l) -> l.items.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EPerform(p) -> p.args.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-    EHandle(h) ->
-      h.vars.fold(false, |acc: Bool, v: HandlerVar|
-          acc || names.contains(v.name.name) || mentions(v.init, names))
-        || mentions(h.body, names)
-        || h.clauses.fold(false, |acc: Bool, c: HandleClause|
-          acc || c.params.fold(false, |b: Bool, p: Ident| b || names.contains(p.name))
-            || mentions(c.body, names))
-        || (match h.ret {
-          Some(rc) -> names.contains(rc.binder.name) || mentions(rc.body, names),
-          None -> false,
-        }),
-    EWithHold(c) ->
-      names.contains(c.binder.name) || mentions(c.acquire, names) || mentions(c.release, names)
-        || mentions(c.body, names),
-    ESimulate(s) -> mentions(s.body, names),
-    ETryBlock(t) -> mentions(t.body, names),
-    EParallel(v) -> v.branches.fold(false, |acc: Bool, x: Expr| acc || mentions(x, names)),
-  }
-
-fn pattern_mentions(p: Pattern, names: List<Bytes>) -> Bool =
-  match p {
-    PWild(_) -> false,
-    PLit(_) -> false,
-    PRange(_) -> false,
-    PBad(_) -> false,
-    PVar(v) -> names.contains(v.name.name),
-    PCtor(c) ->
-      (is_bare(c.name) && names.contains(c.name.name.name))
-        || c.args.fold(false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
-    PRecord(r) ->
-      r.fields.fold(false, |acc: Bool, f: { name: Ident, pat: Pattern }|
-        acc || pattern_mentions(f.pat, names)),
-    PList(l) ->
-      l.items.fold(false, |acc: Bool, i: Pattern| acc || pattern_mentions(i, names))
-        || (match l.rest { Some(rest) -> pattern_mentions(rest, names), None -> false }),
-    POr(o) -> o.alts.fold(false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
-  }
-
 
 // --- Another program's numbering ---------------------------------------------------------------
 
