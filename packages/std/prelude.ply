@@ -678,7 +678,215 @@ fn digit(d: Int) -> Char =
   }
 
 /// The shortest text that reads back to `f`; `Infinity`, `-Infinity` and `NaN`.
-extern fn Float::to_string(f: Float) -> String
+pub fn Float::to_string(f: Float) -> String = {
+  let bits = bits_of_float(f);
+  let biased = bits >> 52 & 2047;
+  let frac = bits & 4503599627370495;
+  let sign = if bits < 0 { "-" } else { "" };
+  if biased == 2047 { if frac != 0 { "NaN" } else { sign ++ "Infinity" } }
+  else if biased == 0 && frac == 0 { sign ++ "0.0" } else {
+    // The halfway points to the neighbours lie `minus` and `plus` from `mant`, in units of
+    // 2^`exp`; a power of two's lower neighbour is twice as near.
+    let mant = if biased == 0 { frac << 1 } else { frac | 4503599627370496 };
+    let exp = if biased == 0 { 0 - 1075 } else { biased - 1075 };
+    let even = mant & 1 == 0;
+    let d = if biased == 0 { shortest_digits(mant, 1, 1, exp, even) }
+    else if mant == 4503599627370496 { shortest_digits(mant << 2, 1, 2, exp - 2, even) }
+    else { shortest_digits(mant << 1, 1, 1, exp - 1, even) };
+    let p = sign ++ digits_placed(d.digits, d.k);
+    let e = sign ++ digits_raised(d.digits, d.k);
+    let text = if e.len() < p.len() { e } else { p };
+    if text.contains(".") || text.contains("e") { text } else { text ++ ".0" }
+  }
+}
+
+/// The digits `0.d1d2…` times 10^`k` of the shortest decimal strictly between, or where `inclusive`
+/// at, the halfway points `mant - minus` and `mant + plus`, in units of 2^`exp`, and of those the
+/// nearest to `mant`: the free-format digits of Steele and White, as Rust's `flt2dec` writes them.
+fn shortest_digits(
+  mant: Int,
+  minus: Int,
+  plus: Int,
+  exp: Int,
+  inclusive: Bool,
+) -> { digits: List<Int>, k: Int } = {
+  // An estimate of the scale from the bit length, one too low at most.
+  let k0 = (int_bits(mant + plus - 1) + exp) * 1292913986 >> 32;
+  let base = if exp < 0 {
+    { mant: nat_of(mant), minus: nat_of(minus), plus: nat_of(plus), scale: nat_shl([1], 0 - exp) }
+  } else {
+    {
+      mant: nat_shl(nat_of(mant), exp),
+      minus: nat_shl(nat_of(minus), exp),
+      plus: nat_shl(nat_of(plus), exp),
+      scale: [1],
+    }
+  };
+  let scaled = if k0 >= 0 { { ..base, scale: nat_ten_to(base.scale, k0) } } else {
+    {
+      ..base,
+      mant: nat_ten_to(base.mant, 0 - k0),
+      minus: nat_ten_to(base.minus, 0 - k0),
+      plus: nat_ten_to(base.plus, 0 - k0),
+    }
+  };
+  let fixed = if nat_below(scaled.scale, nat_add(scaled.mant, scaled.plus), inclusive) {
+    { st: scaled, k: k0 + 1 }
+  } else { { st: tenfold(scaled), k: k0 } };
+  let g = digits_generated(fixed.st, inclusive, [], 800);
+  if g.up && (!g.down || nat_cmp(nat_shl(g.rem, 1), fixed.st.scale) >= 0) {
+    let r = digits_rounded_up(g.digits);
+    if r.len() > g.digits.len() {
+      { digits: range(0, g.digits.len()).map(|i: Int| limb_at(r, i)).push(0), k: fixed.k + 1 }
+    } else { { digits: r, k: fixed.k } }
+  } else { { digits: g.digits, k: fixed.k } }
+}
+
+/// What digit generation works over: the value, its halfway points' distances and the scale, all
+/// in one unit.
+type Scaled = { mant: List<Int>, minus: List<Int>, plus: List<Int>, scale: List<Int> }
+
+fn tenfold(st: Scaled) -> Scaled =
+  {
+    ..st,
+    mant: nat_times(st.mant, 10),
+    minus: nat_times(st.minus, 10),
+    plus: nat_times(st.plus, 10),
+  }
+
+/// `acc` and the digits of `st` past them until one stops within a halfway point, `left` digits at
+/// most: with what is left of the value and which halfway point it stopped by.
+fn digits_generated(
+  st: Scaled,
+  inclusive: Bool,
+  acc: List<Int>,
+  left: Int,
+) -> { digits: List<Int>, rem: List<Int>, up: Bool, down: Bool } =
+  if left <= 0 { { digits: acc, rem: st.mant, up: false, down: true } } else {
+    let q = nat_quotient(st.mant, st.scale, 0);
+    let ds = acc.push(q.d);
+    let down = nat_below(q.rem, st.minus, inclusive);
+    let up = nat_below(st.scale, nat_add(q.rem, st.plus), inclusive);
+    if down || up { { digits: ds, rem: q.rem, up: up, down: down } }
+    else { digits_generated(tenfold({ ..st, mant: q.rem }), inclusive, ds, left - 1) }
+  }
+
+/// `ds` plus one in its last place; a digit longer where every digit is a 9.
+fn digits_rounded_up(ds: List<Int>) -> List<Int> = {
+  let at = range(0, ds.len()).fold(0 - 1, |at: Int, i: Int|
+    if limb_at(ds, i) != 9 { i } else { at });
+  if at < 0 { range(0, ds.len() + 1).map(|i: Int| if i == 0 { 1 } else { 0 }) } else {
+    range(0, ds.len()).map(|i: Int|
+      if i < at { limb_at(ds, i) } else if i == at { limb_at(ds, i) + 1 } else { 0 })
+  }
+}
+
+/// The text of `ds`.
+fn digits_text(ds: List<Int>) -> String = String::of_chars(ds.map(digit))
+
+/// `0.d1d2…` times 10^`k` written out with its point and no exponent.
+fn digits_placed(ds: List<Int>, k: Int) -> String =
+  if k <= 0 { "0." ++ digits_text(range(0, 0 - k).map(|_: Int| 0)) ++ digits_text(ds) }
+  else if k < ds.len() {
+    digits_text(range(0, k).map(|i: Int| limb_at(ds, i))) ++ "."
+      ++ digits_text(range(k, ds.len()).map(|i: Int| limb_at(ds, i)))
+  } else { digits_text(ds) ++ digits_text(range(ds.len(), k).map(|_: Int| 0)) }
+
+/// `0.d1d2…` times 10^`k` written as `d1.d2…e` and its exponent.
+fn digits_raised(ds: List<Int>, k: Int) -> String =
+  digits_text(range(0, 1).map(|i: Int| limb_at(ds, i)))
+    ++ (if ds.len() > 1 { "." ++ digits_text(range(1, ds.len()).map(|i: Int| limb_at(ds, i))) }
+    else { "" })
+    ++ (if k < 1 { "e-" ++ Int::to_string(1 - k) } else { "e" ++ Int::to_string(k - 1) })
+
+/// Limb `i` of a natural number held as base-2^32 limbs, least significant first and no zero limb
+/// on top; 0 past its top.
+fn limb_at(a: List<Int>, i: Int) -> Int = match a.at(i) { Some(x) -> x, None -> 0 }
+
+/// `n`, which is not negative, as a natural number.
+fn nat_of(n: Int) -> List<Int> =
+  if n <= 0 { [] } else if n < 4294967296 { [n] } else { [n & 4294967295, n >> 32] }
+
+fn nat_trimmed(a: List<Int>) -> List<Int> = {
+  let top = range(0, a.len()).fold(0, |top: Int, i: Int|
+    if limb_at(a, i) != 0 { i + 1 } else { top });
+  range(0, top).map(|i: Int| limb_at(a, i))
+}
+
+fn nat_add(a: List<Int>, b: List<Int>) -> List<Int> = {
+  let s = range(0, max(a.len(), b.len())).fold(
+    { out: [], carry: 0 },
+    |s: { out: List<Int>, carry: Int }, i: Int| {
+      let t = limb_at(a, i) + limb_at(b, i) + s.carry;
+      { out: s.out.push(t & 4294967295), carry: t >> 32 }
+    },
+  );
+  if s.carry > 0 { s.out.push(s.carry) } else { s.out }
+}
+
+/// `a - b`, where `b` is not more than `a`.
+fn nat_sub(a: List<Int>, b: List<Int>) -> List<Int> =
+  nat_trimmed(
+    range(0, a.len()).fold(
+      { out: [], borrow: 0 },
+      |s: { out: List<Int>, borrow: Int }, i: Int| {
+        let t = limb_at(a, i) - limb_at(b, i) - s.borrow;
+        if t < 0 { { out: s.out.push(t + 4294967296), borrow: 1 } }
+        else { { out: s.out.push(t), borrow: 0 } }
+      },
+    ).out,
+  )
+
+/// `a` times `k`, from 1 to 2^31.
+fn nat_times(a: List<Int>, k: Int) -> List<Int> = {
+  let s = a.fold({ out: [], carry: 0 }, |s: { out: List<Int>, carry: Int }, x: Int| {
+    let t = x * k + s.carry;
+    { out: s.out.push(t & 4294967295), carry: t >> 32 }
+  });
+  if s.carry > 0 { s.out.push(s.carry) } else { s.out }
+}
+
+/// Below zero, zero or above as `a` is below, at or above `b`.
+fn nat_cmp(a: List<Int>, b: List<Int>) -> Int =
+  if a.len() != b.len() { if a.len() < b.len() { 0 - 1 } else { 1 } } else {
+    range(0, a.len()).fold(0, |c: Int, j: Int|
+      if c != 0 { c } else {
+        let x = limb_at(a, a.len() - 1 - j);
+        let y = limb_at(b, a.len() - 1 - j);
+        if x < y { 0 - 1 } else if x > y { 1 } else { 0 }
+      })
+  }
+
+/// Whether `a` is below `b`, or at it where `inclusive`.
+fn nat_below(a: List<Int>, b: List<Int>, inclusive: Bool) -> Bool =
+  if inclusive { nat_cmp(a, b) <= 0 } else { nat_cmp(a, b) < 0 }
+
+/// `a` times 2^`bits`.
+fn nat_shl(a: List<Int>, bits: Int) -> List<Int> =
+  if a.len() == 0 || bits <= 0 { a } else {
+    let w = bits / 32;
+    nat_times(
+      range(0, w + a.len()).map(|i: Int| if i < w { 0 } else { limb_at(a, i - w) }),
+      1 << bits % 32,
+    )
+  }
+
+/// `a` times 10^`k`.
+fn nat_ten_to(a: List<Int>, k: Int) -> List<Int> =
+  if k <= 0 { a }
+  else if k >= 9 { nat_ten_to(nat_times(a, 1000000000), k - 9) }
+  else { nat_times(a, range(0, k).fold(1, |p: Int, _: Int| p * 10)) }
+
+/// How many bits `n`, which is not negative, takes.
+fn int_bits(n: Int) -> Int =
+  range(0, 63).fold(0, |b: Int, i: Int| if n >> i != 0 { i + 1 } else { b })
+
+fn nat_bits(a: List<Int>) -> Int =
+  if a.len() == 0 { 0 } else { (a.len() - 1) * 32 + int_bits(limb_at(a, a.len() - 1)) }
+
+/// `d` plus how many times more than `d` times `s` goes into `m`, up to 9, and what is left.
+fn nat_quotient(m: List<Int>, s: List<Int>, d: Int) -> { d: Int, rem: List<Int> } =
+  if d >= 9 || nat_cmp(m, s) < 0 { { d: d, rem: m } } else { nat_quotient(nat_sub(m, s), s, d + 1) }
 
 /// `a ++ b`.
 extern fn String::concat(a: String, b: String) -> String
@@ -1770,8 +1978,114 @@ extern fn Decimal::of_float(f: Float) -> Option<Decimal>
 /// text or one past what a `Decimal` holds.
 extern fn Decimal::of_string(s: String) -> Option<Decimal>
 
-/// `Float` literal syntax with a sign; `None` for `inf` or `NaN`.
-extern fn Float::of_string(s: String) -> Option<Float>
+/// `Float` literal syntax with a sign; `None` for `inf` or `NaN`. Correctly rounded, to even at a
+/// tie.
+pub fn Float::of_string(s: String) -> Option<Float> = {
+  let b = Bytes::of_string(s);
+  let negative = byte_is(b, 0, 45);
+  let start = if negative || byte_is(b, 0, 43) { 1 } else { 0 };
+  if !digit_at(b, start) { None } else {
+    let whole = digits_read(b, start, { at: start, nat: [], count: 0 });
+    let dotted = byte_is(b, whole.at, 46);
+    if dotted && !digit_at(b, whole.at + 1) { None } else {
+      let all = if dotted {
+        digits_read(b, whole.at + 1, { at: whole.at + 1, nat: whole.nat, count: 0 })
+      } else { { ..whole, count: 0 } };
+      match exponent_read(b, all.at) {
+        None -> None,
+        Some(x) -> {
+          let bits = float_bits_of(all.nat, x - all.count, whole.count + all.count);
+          Some(Float::of_bits(if negative { bits | 0 - 9223372036854775807 - 1 } else { bits }))
+        },
+      }
+    }
+  }
+}
+
+fn byte_is(b: Bytes, i: Int, c: Int) -> Bool = i >= 0 && i < Bytes::len(b) && Bytes::at(b, i) == c
+
+fn digit_at(b: Bytes, i: Int) -> Bool =
+  i >= 0 && i < Bytes::len(b) && Bytes::at(b, i) >= 48 && Bytes::at(b, i) <= 57
+
+/// The decimal digits of `b` from `i` on, `_` between them read past, onto `acc`'s number: with where
+/// they end and how many there were.
+fn digits_read(
+  b: Bytes,
+  i: Int,
+  acc: { at: Int, nat: List<Int>, count: Int },
+) -> { at: Int, nat: List<Int>, count: Int } =
+  if i < 0 || i >= Bytes::len(b) { { ..acc, at: i } } else {
+    let c = Bytes::at(b, i);
+    if c >= 48 && c <= 57 {
+      digits_read(b, i + 1, {
+        at: i,
+        nat: nat_add(nat_times(acc.nat, 10), nat_of(c - 48)),
+        count: acc.count + 1,
+      })
+    } else if c == 95 { digits_read(b, i + 1, acc) }
+    else { { ..acc, at: i } }
+  }
+
+/// The exponent `b` ends with from `i`, 0 where it ends there; `None` where what follows is no
+/// exponent or more follows it. One past a hundred million reads as a hundred million.
+fn exponent_read(b: Bytes, i: Int) -> Option<Int> =
+  if i >= Bytes::len(b) { Some(0) }
+  else if !(byte_is(b, i, 101) || byte_is(b, i, 69)) { None } else {
+    let negative = byte_is(b, i + 1, 45);
+    let from = if byte_is(b, i + 1, 43) || negative { i + 2 } else { i + 1 };
+    if !digit_at(b, from) { None } else {
+      let e = exponent_digits(b, from, 0);
+      if e.at < Bytes::len(b) { None } else { Some(if negative { 0 - e.value } else { e.value }) }
+    }
+  }
+
+fn exponent_digits(b: Bytes, i: Int, acc: Int) -> { at: Int, value: Int } =
+  if i < 0 || i >= Bytes::len(b) { { at: i, value: acc } } else {
+    let c = Bytes::at(b, i);
+    if c >= 48 && c <= 57 { exponent_digits(b, i + 1, min(acc * 10 + (c - 48), 100000000)) }
+    else if c == 95 { exponent_digits(b, i + 1, acc) }
+    else { { at: i, value: acc } }
+  }
+
+/// The bits of the `Float` nearest `d` times 10^`p`, `d` written in `count` digits: to even at a
+/// tie, infinity past the greatest.
+fn float_bits_of(d: List<Int>, p: Int, count: Int) -> Int =
+  if d.len() == 0 || count + p < 0 - 330 { 0 }
+  else if p > 310 { 9218868437227405312 } else {
+    let num = if p >= 0 { nat_ten_to(d, p) } else { d };
+    let den = if p >= 0 { [1] } else { nat_ten_to([1], 0 - p) };
+    // Scaled by 2^s the value has 53 bits before its point, or fewer where it is subnormal.
+    let s0 = 53 - (nat_bits(num) - nat_bits(den));
+    let first = scaled_quotient(num, den, min(s0, 1074));
+    let q = if s0 <= 1074 && first.q >= 9007199254740992 { scaled_quotient(num, den, s0 - 1) }
+    else { first };
+    let c = nat_cmp(nat_shl(q.rem, 1), q.den);
+    let m = if c > 0 || (c == 0 && q.q & 1 == 1) { q.q + 1 } else { q.q };
+    let s = if m == 9007199254740992 { q.s - 1 } else { q.s };
+    let mant = if m == 9007199254740992 { 4503599627370496 } else { m };
+    if mant < 4503599627370496 { mant }
+    else if 1075 - s >= 2047 { 9218868437227405312 }
+    else { 1075 - s << 52 | mant - 4503599627370496 }
+  }
+
+/// `num` times 2^`s` over `den`, below 2^56: the quotient, what is left over and the divisor.
+fn scaled_quotient(
+  num: List<Int>,
+  den: List<Int>,
+  s: Int,
+) -> { q: Int, rem: List<Int>, den: List<Int>, s: Int } = {
+  let n = if s >= 0 { nat_shl(num, s) } else { num };
+  let d = if s >= 0 { den } else { nat_shl(den, 0 - s) };
+  let r = quotient_bits(n, d, 55, 0);
+  { q: r.q, rem: r.rem, den: d, s: s }
+}
+
+fn quotient_bits(n: List<Int>, d: List<Int>, bit: Int, q: Int) -> { q: Int, rem: List<Int> } =
+  if bit < 0 { { q: q, rem: n } } else {
+    let shifted = nat_shl(d, bit);
+    if nat_cmp(shifted, n) <= 0 { quotient_bits(nat_sub(n, shifted), d, bit - 1, q | 1 << bit) }
+    else { quotient_bits(n, d, bit - 1, q) }
+  }
 
 /// Nearest; exact up to `2^53`.
 extern fn Float::of_int(n: Int) -> Float
