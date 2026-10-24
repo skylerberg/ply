@@ -107,8 +107,6 @@ pub struct Ctx {
     pub(super) holds_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
     pub(super) outer: (*mut Heap, *const i64),
-    /// What that entry's unit answered of its types' keys, put back with them.
-    pub(super) outer_instances: Option<ply_core::Instances>,
     /// Releases a drop root at [`RELEASE_DEPTH`] put off: each word with the root that releases it.
     pub(crate) release_later: Vec<(crate::emitted::Handed, crate::emitted::DropRoot)>,
     /// Stops whose continuation's last holder let it go, by body and capture, for the next drain to
@@ -147,26 +145,6 @@ pub(crate) fn swap_running(c: *mut Ctx) -> *mut Ctx {
 /// reads while the entry waits on it; `None` outside an entry.
 pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
     unsafe { RUNNING.with(std::cell::Cell::get).as_ref() }.map(f)
-}
-
-/// A record shape's fields or a constructor's name, as a tally of objects by layout tells them.
-fn layout_named(layouts: &heap::Layouts, kind: u8, key: u32) -> Option<String> {
-    match kind {
-        heap::KIND_CTOR => layouts
-            .ctors
-            .get(key as usize)
-            .map(|(name, _)| format!("`{name}`")),
-        heap::KIND_RECORD if (key as usize) < layouts.shape_count() => Some(format!(
-            "{{{}}}",
-            layouts
-                .shape_names(key)
-                .iter()
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-        _ => None,
-    }
 }
 
 impl Ctx {
@@ -224,7 +202,6 @@ impl Ctx {
             handlers_made: 0,
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
-            outer_instances: None,
             release_later: Vec::new(),
             continuations_died: Vec::new(),
             crossings: Vec::new(),
@@ -286,23 +263,6 @@ impl Ctx {
             .kept
             .pop()
             .expect("a runtime frame finds what it kept when its call returns")
-    }
-
-    /// This context as what reads its unit's values asks it, while it runs on this thread; `None`
-    /// for a unit none of whose types states a `key` or a `show`.
-    pub(crate) fn instances(&mut self) -> Option<ply_core::Instances> {
-        self.tables
-            .layouts
-            .states_any()
-            .then(|| ply_core::Instances {
-                unit: std::ptr::from_mut(self).cast(),
-                keyed: unit_keys,
-                key: key_value,
-                shown: shown_value,
-                numeric: numeric_value,
-                witness: stated_witness,
-                of_int: of_int_value,
-            })
     }
 
     /// A context for one branch of a `parallel` block this entry reached: its unit, host, seed and
@@ -446,8 +406,6 @@ impl Ctx {
             heap::poison::swap(&raw const self.site_root),
         );
         self.outer_running = swap_running(self);
-        let mine = self.instances();
-        self.outer_instances = ply_core::instances::swap(mine);
     }
 
     /// When compiled code must call back next: the call one past the budget, the end of this
@@ -505,7 +463,6 @@ impl Ctx {
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         swap_running(self.outer_running);
-        ply_core::instances::swap(self.outer_instances.take());
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.outer_running = std::ptr::null_mut();
         self.last_entry = self.heap.allocated();
@@ -517,26 +474,11 @@ impl Ctx {
                 self.held() / 1_000_000,
                 self.grown
             );
-            let by_kind = self.heap.allocated_by_kind();
-            let mut kinds: Vec<(usize, usize)> = by_kind.into_iter().enumerate().collect();
-            kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-            for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
-                eprintln!("  allocated: kind {kind}: {n} objects");
-            }
-            let layouts = &self.tables.layouts;
-            for ((kind, key), n) in self.heap.allocated_by_layout().into_iter().take(24) {
-                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
-                    heap::KIND_BYTES => format!("bytes under {key}"),
-                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
-                    _ => format!("str under {key}"),
-                });
-                eprintln!("  allocated: {n} of {what}");
-            }
             let live = self.census();
             if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
-                for (what, n, bytes) in live.into_iter().take(24) {
+                for (size, n, bytes) in live.into_iter().take(24) {
                     eprintln!(
-                        "  live at end: {what}: {n} objects, {}MB",
+                        "  live at end: blocks of {size} bytes past the header: {n}, {}MB",
                         bytes / 1_000_000
                     );
                 }
@@ -570,42 +512,22 @@ impl Ctx {
         self.heap.held() + self.workers(|b| b.held())
     }
 
-    /// How many of the entry's objects are live, its branches' on the pool's threads among them.
+    /// How many of the entry's blocks are live, its branches' on the pool's threads among them.
     pub fn live(&self) -> usize {
-        self.heap.live()
-            + self.workers(|b| {
-                heap::live_in(b, |kind, _, _| kind)
-                    .values()
-                    .map(|e| e.0)
-                    .sum()
-            })
+        self.census().iter().map(|(_, n, _)| n).sum()
     }
 
-    /// The entry's live objects by what they are, the most bytes first, with their count and payload
-    /// bytes: a record by its shape's fields, a constructor by its name, a block emitted code laid
-    /// out, whose header names no type, by its payload bytes, and any other object by its kind.
-    pub fn census(&self) -> Vec<(String, usize, usize)> {
-        let layouts = &self.tables.layouts;
+    /// The entry's live blocks by the payload bytes they hold, the most bytes first, with their count
+    /// and payload bytes, its branches' on the pool's threads among them: a block's header names no
+    /// type.
+    pub fn census(&self) -> Vec<(usize, usize, usize)> {
         let mut rows = self.heap.census();
         if self.pooled {
             for tally in crate::parallel::worker_blocks(self.id.0, heap::census_in) {
                 rows = heap::census_merged(rows, tally);
             }
         }
-        rows.into_iter()
-            .map(|((kind, key), n, bytes)| {
-                let what = layout_named(layouts, kind, key).unwrap_or_else(|| match kind {
-                    heap::KIND_REFUSED => format!("emitted blocks of {key} bytes past the header"),
-                    _ => heap::kind_name(kind),
-                });
-                (what, n, bytes)
-            })
-            .collect()
-    }
-
-    /// The singleton a nullary constructor is.
-    pub fn nullary(&self, index: u32) -> Word {
-        self.tables.nullaries[index as usize]
+        rows
     }
 
     pub fn set_host(
@@ -825,24 +747,6 @@ impl Ctx {
             .take()
             .or_else(|| self.aborting.take().map(|a| a.diagnostic))
     }
-
-    /// The value a word denotes, for a builtin or an error message.
-    pub(crate) fn value(&self, w: Word) -> Value {
-        Heap::to_value(&self.tables.layouts, w)
-    }
-
-    pub(crate) fn word(&mut self, v: &Value) -> Word {
-        let tables = Arc::clone(&self.tables);
-        self.heap.to_word(&tables.layouts, v)
-    }
-
-    /// Safe on any word an error path meets: an immediate or `0` reads no memory.
-    pub(super) fn type_name(&self, w: Word) -> &'static str {
-        if w == 0 {
-            return "no value";
-        }
-        self.value(w).type_name()
-    }
 }
 
 /// A runtime failure inside compiled code.
@@ -856,14 +760,4 @@ pub(super) fn args_of<'a>(ptr: *const i64, n: i64) -> &'a [Word] {
         return &[];
     }
     unsafe { std::slice::from_raw_parts(ptr, n as usize) }
-}
-
-/// The arguments a builtin consumes, as the values it reads: each word released once copied.
-pub(crate) fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
-    let mut out = ply_core::argv::take(args.len());
-    for w in args {
-        out.push(ctx.value(*w));
-        heap::dec(*w);
-    }
-    out
 }

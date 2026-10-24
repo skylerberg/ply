@@ -9,11 +9,11 @@ import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (TyCon)
 import emit.c (KNum, KInt, KBool, KFloat, KDec, KWide, ctype, width_index, int_lit)
-import emit.pieces (Piece, Text, Hole, ShapeOf, spelled)
+import emit.pieces (Piece, Text, spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSlice, RToken, Var,
-                 Arg, AVar, AInt, AZero, Made, MRecord, MCase, Path, PField, PNamed, PArg, PCapture,
-                 PLeaf, PCase, PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned,
-                 rep_of_arg, rep_said, var_said, made_said, in_box)
+                 Arg, AVar, AInt, AZero, Made, MCase, Path, PField, PArg, PCapture, PLeaf, PCase,
+                 PPayload, RUnit, RSum, Data, Convention, Given, Lent, Owned, rep_of_arg, rep_said,
+                 var_said, made_said, in_box)
 import emit.layout (Laid, LWords, LRecord, LSum, SumLaid, P, S, U, Nullary, Inline, Boxed, WordIs,
                     LowBits, words, header_bytes, pointer_floor, tag_bits, CaseArgs, sum_laid,
                     record_laid, raw)
@@ -22,8 +22,7 @@ import emit.lower.held (passing, ByReference, InWords, answer_buffer, values_of,
                         leaf_values)
 import emit.print.tested (case_switched, case_label, unarmed)
 import emit.print.text (Printing, Place, printing, line, pieces, pad, temp, named, name_of,
-                        arg_text, check, zero, field_hole, part_names, part_named, shape_at, slot,
-                        unprinted)
+                        arg_text, check, zero, part_names, part_named, slot, unprinted)
 import emit.print.strings (payload_printed)
 import emit.print.counting (dup_fn, last_fn, free_fn, rel_box_fn, call_text)
 
@@ -371,7 +370,7 @@ pub fn entry_answer_values(r: Rep) -> List<Bytes> =
 // The values this family prints.
 
 /// A value made of `m.args`, in the cells `m.reuse` names where it names some: a box of words, a
-/// boxed case, a constructor's object of each argument's word, or a record by value.
+/// boxed case, or a constructor's object of each argument's word.
 pub fn made(
   p: Place,
   pr: Printing,
@@ -381,7 +380,6 @@ pub fn made(
   match into {
     None -> unprinted(Data, b"a value made that nothing holds", made_said(m.made)),
     Some(v) -> match m.made {
-      MRecord(r) -> by_value(p, pr, v, r.names, m.args),
       MCase(c) ->
         box_made(
           p,
@@ -458,40 +456,9 @@ fn box_made(
   })
 }
 
-/// A record of `names` holding the words `args`, which it takes, laid out by the runtime as the
-/// values they are.
-fn by_value(p: Place, pr: Printing, v: Var, names: List<Bytes>, args: List<Arg>) -> Printing = {
-  let sh = shape_at(pr, names);
-  let arr = temp(sh.pr);
-  let n = named(arr.pr, v);
-  let listed = line(
-    n.pr,
-    p.depth,
-    Bytes::concat_all([b"Word ", arr.name, b"[] = {", words_of(n.pr, args), b"};"]),
-  );
-  pieces(listed, [
-    Text(Bytes::concat_all([pad(p.depth), b"Word ", n.name, b" = rt_record_p(ctx, "])),
-    Hole(ShapeOf(sh.at)),
-    Text(
-      Bytes::concat_all([
-        b", (Word)(intptr_t)",
-        arr.name,
-        b", ",
-        ascii_of_int(args.len()),
-        b");\n",
-      ]),
-    ),
-  ])
-}
-
-fn words_of(pr: Printing, args: List<Arg>) -> Bytes =
-  if args.len() == 0 { b"0" }
-  else { Bytes::join(args.map(|a: Arg| as_word(arg_text(pr, a), rep_of_arg(a))), b", ") }
-
 /// What `g.path` reads out of `g.of`, which the value read borrows: a value's leaf, its values where
 /// the record's values hold them; a field's words at their offset in the box a record's word is; a
-/// case's payload where the sum's layout lays it; a constructor's argument's word in its object. A
-/// field read by name is the runtime's, which answers its word with a count of its own.
+/// case's payload where the sum's layout lays it; a constructor's argument's word in its object.
 pub fn got(
   p: Place,
   pr: Printing,
@@ -516,7 +483,6 @@ pub fn got(
         PArg(a) -> if g.of.rep != RWord {
           unprinted(Data, b"a constructor's argument read out of no object", var_said(g.of))
         } else { declared_as(p, pr, v, [word_as(slot(base, a.at), v.rep)]) },
-        PNamed(name) -> by_name(p, pr, v, g.of, name),
         PCapture(k) ->
           unprinted(
             Data,
@@ -537,41 +503,6 @@ pub fn got(
         _ -> unprinted(Data, b"a read no printer of this family makes", var_said(g.of)),
       }
     },
-  }
-
-/// `v`, field `name` of the word `of` as the runtime reads it by name, with a count of its own, and
-/// read as `v` holds it.
-fn by_name(p: Place, pr: Printing, v: Var, of: Var, name: Bytes) -> Printing / {abort.raise} =
-  if of.rep != RWord { unprinted(Data, b"a field read by name out of no word", var_said(of)) }
-  else {
-    let f = field_hole(pr, name);
-    let into = if v.rep == RWord { named(f.pr, v) } else { temp(f.pr) };
-    let fetched = check(
-      p,
-      pieces(into.pr, [
-        Text(
-          Bytes::concat_all([
-            pad(p.depth),
-            b"Word ",
-            into.name,
-            b" = rt_field_p(ctx, ",
-            name_of(pr, of),
-            b", ",
-          ]),
-        ),
-        f.piece,
-        Text(b", 0);\n"),
-      ]),
-    );
-    if v.rep == RWord { fetched } else {
-      let n = named(fetched, v);
-      pieces(
-        n.pr,
-        [Text(pad(p.depth))].concat(word_parts(into.name, v.rep, part_names(n.name, v.rep))).push(
-          Text(b"\n"),
-        ),
-      )
-    }
   }
 
 /// `v` declared holding `exprs`, one per C value.
@@ -1026,7 +957,7 @@ test "an answer of several values returns its first and writes the rest into one
   // the record in a block of its two words.
   let answered = spelled(entry_answered(pr, point(), b"f(ctx)", []).out);
   assert_eq(
-    [b"Word ro[1];", b"if (ctx->failed)", b"ro[0]", b"rt_alloc_bytes_p(ctx, INT64_C(32))"].filter(
+    [b"Word ro[1];", b"if (ctx->failed)", b"ro[0]", b"rt_alloc_bytes_p(ctx, INT64_C(24))"].filter(
       |part: Bytes| answered.index_of(part) == None,
     ),
     [],
@@ -1109,7 +1040,7 @@ test "a box is allocated by its size and its words written, a boxed case's place
   let fresh = spelled(made(place(), pr, Some(local(2, RWord)), m).out);
   // A header and two words: the case's place in the first, its payload in the second.
   assert_eq(
-    [b"rt_alloc_bytes_p(ctx, INT64_C(32))", b"[0] = INT64_C(8);", b"[1] = p0;"].filter(
+    [b"rt_alloc_bytes_p(ctx, INT64_C(24))", b"[0] = INT64_C(8);", b"[1] = p0;"].filter(
       |part: Bytes| fresh.index_of(part) == None,
     ),
     [],

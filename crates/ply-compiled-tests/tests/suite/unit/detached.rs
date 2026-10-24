@@ -6,7 +6,7 @@ use super::frames::{boxed, count, dup, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
-use ply_compiled::heap::{KIND_REFUSED, Word, imm, imm_value, kind};
+use ply_compiled::heap::{HEADER, Word, imm, imm_value};
 use ply_compiled::native::{Answered, I64};
 use ply_compiled::rt::{Ctx, rt_dispatch, rt_handle_install_detached};
 use std::cell::RefCell;
@@ -30,10 +30,9 @@ thread_local! {
     static SEEN: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
     /// Whether each clause ran on a stack whose chain was null.
     static CLAUSES_UNRECORDED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
-    /// What each continuation a clause was handed says of itself: whether its block is of the
-    /// refused kind, whether its descriptor has no typed entry, and whether sharing and keeping it
-    /// answer 0.
-    static TOKENS: RefCell<Vec<(bool, bool, bool)>> = const { RefCell::new(Vec::new()) };
+    /// What each continuation a clause was handed says of itself: whether its descriptor has no
+    /// typed entry, and whether sharing and keeping it answer 0.
+    static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn seen(n: u32) {
@@ -140,9 +139,9 @@ unsafe fn through_a_runtime_frame(ctx: *mut Ctx) -> Word {
 unsafe fn clause_ran(ctx: *mut Ctx, k: Word) {
     let unrecorded = unsafe { (*ctx).frames.is_null() };
     CLAUSES_UNRECORDED.with(|c| c.borrow_mut().push(unrecorded));
-    let desc = unsafe { &**(k as *const *const PlyFnDesc).byte_add(16) };
+    let desc = unsafe { &**(k as *const *const PlyFnDesc).byte_add(HEADER) };
     let crosses = unsafe { (desc.share)(ctx, k) != 0 || (desc.keep)(ctx, k) != 0 };
-    let seen = (kind(k) == KIND_REFUSED, desc.typed.is_none(), !crosses);
+    let seen = (desc.typed.is_none(), !crosses);
     TOKENS.with(|t| t.borrow_mut().push(seen));
 }
 
@@ -187,11 +186,11 @@ type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 
 /// A closure over no captures: a block of its descriptor alone.
-const CLOSURE: Word = 16 + 8;
+const CLOSURE: Word = (HEADER + 8) as Word;
 
 fn closure(ctx: *mut Ctx, desc: &'static PlyFnDesc) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, CLOSURE) };
-    unsafe { *(w as *mut Word).add(2) = (&raw const *desc) as Word };
+    unsafe { *(w as *mut Word).byte_add(HEADER) = (&raw const *desc) as Word };
     w
 }
 
@@ -241,9 +240,9 @@ fn failure(ctx: *mut Ctx) -> String {
     unsafe { (*ctx).take_failure() }.map_or_else(String::new, |d| d.message)
 }
 
-/// What the continuation a clause is handed says of itself: a block of the refused kind with no
-/// typed entry, crossing nowhere.
-const TOKEN: (bool, bool, bool) = (true, true, true);
+/// What the continuation a clause is handed says of itself: a block with no typed entry, crossing
+/// nowhere.
+const TOKEN: (bool, bool) = (true, true);
 
 /// Each run past the stop finds everything its frames held held once more for the snapshot, so a
 /// release in the first cannot free what the second reads; when the clause lets go of the

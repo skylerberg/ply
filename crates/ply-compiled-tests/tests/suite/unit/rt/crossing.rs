@@ -5,7 +5,7 @@
 use crate::bare::{context, context_calling, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
-use ply_compiled::heap::{Heap, Word, imm};
+use ply_compiled::heap::{HEADER, Word, imm, word_at};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::{Ctx, Lifted};
 use ply_core::codec::{decode, encode, tag};
@@ -298,9 +298,9 @@ fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
     assert!(said.contains("no wide value was read"), "{said}");
 }
 
-/// A 128-bit width read as its two words is made the runtime's object of that width.
+/// A 128-bit width read as its two words is made a box of them.
 #[test]
-fn a_128_bit_widths_two_words_box_as_the_runtimes_object_of_it() {
+fn a_128_bit_widths_two_words_box_as_its_two_words() {
     let boxed: A3 = helper("rt_box_wide");
     let mut ctx = context();
     for (ty, bits) in [
@@ -309,10 +309,8 @@ fn a_128_bit_widths_two_words_box_as_the_runtimes_object_of_it() {
     ] {
         let (lo, hi) = (bits as u64 as Word, (bits >> 64) as u64 as Word);
         let w = unsafe { boxed(&mut ctx, lo, hi, width(ty)) };
-        assert_eq!(
-            Heap::to_value(&ctx.tables.layouts, w),
-            Value::Fixed(Fixed::new(ty, bits))
-        );
+        let o = w as *mut ply_compiled::heap::Obj;
+        assert_eq!(unsafe { (word_at(o, 0), word_at(o, 1)) }, (lo, hi));
     }
     unfailed(&mut ctx);
     unsafe { boxed(&mut ctx, 1, 0, width(IntTy::U64)) };
@@ -592,7 +590,7 @@ fn a_function_the_program_wrote_crosses_by_name_which_only_its_own_run_reads_bac
 }
 
 /// A value of `m.Box`, a block of one word, counted at its offset 0 and freed by size.
-const BOX_BYTES: Word = 16 + 8;
+const BOX_BYTES: Word = (HEADER + 8) as Word;
 
 unsafe extern "C" fn box_inc(_ctx: *mut Ctx, w: Word) -> Word {
     unsafe { *(w as *mut u32) += 1 };

@@ -4,13 +4,9 @@
 
 use crate::bare::{context, helper};
 use ply_compiled::emitted::Block;
-use ply_compiled::heap::{
-    CLOSURE_CAPTURES, IMMORTAL, KIND_DEAD, KIND_LIST, KIND_REFUSED, SHARED, Word, kind, obj,
-    word_at,
-};
-use ply_compiled::native::Answered;
+use ply_compiled::heap::{HEADER, IMMORTAL, SHARED, Word, obj, word_at};
 use ply_compiled::rt::{Ctx, RELEASE_DEPTH};
-use ply_core::{Closure, ClosureKind, Value};
+use ply_core::Value;
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 
@@ -45,6 +41,11 @@ fn count(w: Word) -> u32 {
     unsafe { *(w as *const u32) }
 }
 
+/// The bytes of a block holding `words` payload words, its header among them.
+fn sized(words: usize) -> Word {
+    (HEADER + 8 * words) as Word
+}
+
 fn alloc(ctx: &mut Ctx, bytes: Word) -> Word {
     unsafe { (bound().alloc)(ctx, bytes) }
 }
@@ -63,14 +64,17 @@ fn the_fields_a_drop_root_keeps_follow_those_every_unit_reads() {
 #[test]
 fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
     let mut ctx = context();
-    let w = alloc(&mut ctx, 16 + 8 * 4);
-    assert_eq!((count(w), kind(w)), (1, KIND_REFUSED));
-    assert_eq!((ctx.heap.allocated(), ctx.heap.allocated_bytes()), (1, 48));
-    free(&mut ctx, w, 16 + 8 * 4);
-    assert_eq!(kind(w), KIND_DEAD);
+    let w = alloc(&mut ctx, sized(4));
+    assert_eq!(count(w), 1);
+    assert_eq!(
+        (ctx.heap.allocated(), ctx.heap.allocated_bytes()),
+        (1, sized(4) as usize)
+    );
+    free(&mut ctx, w, sized(4));
+    assert_eq!(count(w), 0);
     assert_eq!(ctx.heap.live(), 0);
     assert_eq!(
-        alloc(&mut ctx, 48),
+        alloc(&mut ctx, sized(4)),
         w,
         "the next block of its size took the freed one's"
     );
@@ -82,61 +86,9 @@ fn a_block_freed_under_another_context_goes_back_to_the_heap_it_came_from() {
     let (mut mine, mut other) = (context(), context());
     let w = alloc(&mut mine, 32);
     free(&mut other, w, 32);
-    assert_eq!(kind(w), KIND_DEAD);
+    assert_eq!(count(w), 0);
     assert_eq!(mine.heap.live(), 0);
     assert_ne!(alloc(&mut other, 32), w, "a heap took a block of another's");
-}
-
-#[test]
-fn a_box_the_runtime_made_of_a_scalars_bits_is_freed_at_its_size() {
-    let mut ctx = context();
-    let b = ctx.heap.boxed_float(1.5);
-    free(&mut ctx, b, 16 + 8);
-    assert_eq!(kind(b), KIND_DEAD);
-    assert_eq!(ctx.heap.live(), 0);
-}
-
-/// A list's or a map's own object and nodes, and a string or bytes value, are made by the runtime and
-/// by emitted code alike, and emitted code frees each at the size the layout facts give it.
-#[test]
-fn a_list_or_map_node_and_a_string_the_runtime_made_are_freed_at_their_sizes() {
-    use ply_compiled::heap::{
-        KIND_BRANCH, KIND_BYTES, KIND_LEAF, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_STR,
-    };
-    use ply_compiled::{list, map};
-    let mut ctx = context();
-    let room = 4;
-    let text = "a string longer than a word";
-    let bytes = b"\x00bytes longer than a word";
-    let made = [
-        (
-            ctx.heap.alloc_list(room as u32) as Word,
-            16 + 8 * (list::TAIL + room),
-        ),
-        (ctx.heap.alloc_node(KIND_LEAF, &[]), 16 + 8 * list::WIDTH),
-        (ctx.heap.alloc_node(KIND_BRANCH, &[]), 16 + 8 * list::WIDTH),
-        (ctx.heap.map_new(), 16 + 8),
-        (ctx.heap.alloc_leaf() as Word, 16 + 16 * map::WIDTH),
-        (ctx.heap.alloc_branch() as Word, 16 + map::BRANCH_BYTES),
-        (ctx.heap.str(text), 16 + text.len()),
-        (ctx.heap.bytes(bytes), 16 + bytes.len()),
-    ];
-    let kinds = [
-        KIND_LIST,
-        KIND_LEAF,
-        KIND_BRANCH,
-        KIND_MAP,
-        KIND_MLEAF,
-        KIND_MBRANCH,
-        KIND_STR,
-        KIND_BYTES,
-    ];
-    for ((w, size), k) in made.into_iter().zip(kinds) {
-        assert_eq!(kind(w), k);
-        free(&mut ctx, w, size as Word);
-        assert_eq!(kind(w), KIND_DEAD, "a node of kind {k}");
-    }
-    assert_eq!(ctx.heap.live(), 0);
 }
 
 /// A debug build knows each block's size class, which is all a free relies on.
@@ -149,12 +101,15 @@ fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
     let w = alloc(&mut ctx, 40);
     let heap = &raw mut ctx.heap;
     let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        Block::of(w).free(heap, 16 + 8 * 20)
+        std::mem::transmute::<Word, Block>(w).free(heap, sized(20))
     }))
-    .expect_err("a block of 40 bytes was freed as 176");
+    .expect_err("a block of 40 bytes was freed as larger");
     let said = refused.downcast_ref::<String>().expect("a message");
     assert!(
-        said.contains("was freed as 176 bytes, and its block was taken as 40"),
+        said.contains(&format!(
+            "was freed as {} bytes, and its block was taken as 40",
+            sized(20)
+        )),
         "{said}"
     );
 }
@@ -165,12 +120,12 @@ fn a_kept_block_is_immortal_and_outlives_the_entry_that_made_it() {
     let kept: Alloc = helper("rt_alloc_kept");
     ctx.begin(1_000);
     let w = unsafe { kept(&mut ctx, 32) };
-    unsafe { *(w as *mut Word).add(2) = 42 };
-    assert_eq!((count(w), kind(w)), (IMMORTAL, KIND_REFUSED));
+    unsafe { *(w as *mut Word).byte_add(HEADER) = 42 };
+    assert_eq!(count(w), IMMORTAL);
     assert_eq!(ctx.heap.allocated(), 0, "the entry's own heap made it");
     ctx.end();
-    let held = unsafe { *(w as *const Word).add(2) };
-    assert_eq!((count(w), kind(w), held), (IMMORTAL, KIND_REFUSED, 42));
+    let held = unsafe { *(w as *const Word).byte_add(HEADER) };
+    assert_eq!((count(w), held), (IMMORTAL, 42));
 }
 
 /// `rt_dec_shared_last` reads no context, so the holders here hand it none.
@@ -203,32 +158,9 @@ fn a_bridge_is_given_back_with_the_value_it_bridged() {
     let b = ctx.heap.bridge(Value::Str(held.clone()));
     let free_handle: Given = helper("rt_handle_free");
     unsafe { free_handle(&mut ctx, b) };
-    assert_eq!(kind(b), KIND_DEAD);
+    assert_eq!(count(b), 0);
     assert_eq!(Arc::strong_count(&held), 1);
     assert_eq!(ctx.heap.bridges(), 0);
-}
-
-#[test]
-fn a_hold_is_given_back_without_a_read_of_what_it_held() {
-    let mut ctx = context();
-    let tables = Arc::clone(&ctx.tables);
-    let hold = Value::Closure(Arc::new(Closure {
-        name: None,
-        kind: ClosureKind::Hold {
-            held: Some(Value::list(vec![Value::Int(1)])),
-            id: 1,
-        },
-    }));
-    let h = ctx.heap.to_word(&tables.layouts, &hold);
-    let held = unsafe { word_at(obj(h), CLOSURE_CAPTURES) };
-    let free_handle: Given = helper("rt_handle_free");
-    unsafe { free_handle(&mut ctx, h) };
-    assert_eq!(kind(h), KIND_DEAD);
-    assert_eq!(
-        (kind(held), count(held)),
-        (KIND_LIST, 1),
-        "the hold's release let go of what it held"
-    );
 }
 
 /// `drop#Hold<a>` reads what a hold holds at the payload word the description reports, and empties
@@ -236,18 +168,18 @@ fn a_hold_is_given_back_without_a_read_of_what_it_held() {
 #[test]
 fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;
-    use ply_compiled::laid::{Fact, hold};
+    use ply_compiled::laid::hold;
     let mut ctx = context();
     ctx.begin(1_000);
-    let held = alloc(&mut ctx, 16 + 8);
+    let held = alloc(&mut ctx, sized(1));
     let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };
-    let [("held", Fact::Number(at))] = hold()[..] else {
+    let [("held", at)] = hold()[..] else {
         panic!("a hold is described by the one word it holds at");
     };
     assert_eq!(unsafe { word_at(obj(h), at) }, held);
-    unsafe { *(h as *mut Word).add(2 + at) = 0 };
-    free(&mut ctx, held, 16 + 8);
+    unsafe { *(h as *mut Word).byte_add(HEADER).add(at) = 0 };
+    free(&mut ctx, held, sized(1));
     let free_handle: Given = helper("rt_handle_free");
     unsafe { free_handle(&mut ctx, h) };
     assert_eq!(ctx.heap.live(), 0);
@@ -262,19 +194,19 @@ fn a_block_given_back_is_counted_zero_until_it_is_taken_again() {
     let sized = alloc(&mut mine, 32);
     let elsewhere = alloc(&mut mine, 32);
     let bridge = mine.heap.bridge(Value::str("bridged"));
-    let dismantled = mine.heap.str("dismantled");
+    let released = mine.heap.bridge(Value::str("released"));
     free(&mut mine, sized, 32);
     free(&mut other, elsewhere, 32);
     let free_handle: Given = helper("rt_handle_free");
     unsafe { free_handle(&mut mine, bridge) };
     ply_compiled::heap::enter(&mut mine.heap);
-    ply_compiled::heap::dec(dismantled);
+    ply_compiled::heap::release_handle(released);
     ply_compiled::heap::leave();
     for (w, given) in [
         (sized, "freed by its size"),
         (elsewhere, "freed under another context"),
         (bridge, "a handle given back"),
-        (dismantled, "a runtime object let go"),
+        (released, "a handle whose last holder let it go"),
     ] {
         assert_eq!(count(w), 0, "a block {given}");
     }
@@ -319,7 +251,7 @@ fn releases_a_block_twice() {
 }
 
 /// A node: two words, each a node or 0, released by [`drop_node`].
-const NODE: Word = 16 + 8 * 2;
+const NODE: Word = (HEADER + 8 * 2) as Word;
 
 thread_local! {
     static NESTED: Cell<i64> = const { Cell::new(0) };
@@ -356,7 +288,7 @@ unsafe extern "C" fn drop_node(ctx: *mut Ctx, o: Word) -> Word {
         });
         DEEPEST.with(|d| d.set(d.get().max(nested)));
         for at in 0..2 {
-            let child = *(o as *const Word).add(2 + at);
+            let child = *(o as *const Word).byte_add(HEADER).add(at);
             if child != 0 && last(child) {
                 drop_node(ctx, child);
             }
@@ -375,8 +307,8 @@ unsafe extern "C" fn drop_node(ctx: *mut Ctx, o: Word) -> Word {
 fn node(ctx: &mut Ctx, first: Word, second: Word) -> Word {
     let n = alloc(ctx, NODE);
     unsafe {
-        *(n as *mut Word).add(2) = first;
-        *(n as *mut Word).add(3) = second;
+        *(n as *mut Word).byte_add(HEADER) = first;
+        *(n as *mut Word).byte_add(HEADER).add(1) = second;
     }
     n
 }
@@ -457,7 +389,7 @@ fn a_node_held_twice_outlives_the_release_of_the_tree_past_the_bound() {
                 unsafe { drop_node(&mut ctx, root) };
             }
             assert_eq!(ctx.heap.live(), DEEP / 2, "the kept half was released");
-            assert_eq!((count(deep), kind(deep)), (1, KIND_REFUSED));
+            assert_eq!(count(deep), 1);
             if last(deep) {
                 unsafe { drop_node(&mut ctx, deep) };
             }

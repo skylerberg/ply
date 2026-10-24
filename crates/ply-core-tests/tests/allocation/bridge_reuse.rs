@@ -8,7 +8,7 @@ fn round(h: &mut Heap, words: &mut Vec<Word>, live: usize) {
         words.push(h.bridge(Value::Float(i as f64)));
     }
     for w in words.drain(..) {
-        heap::dec(w);
+        heap::release_handle(w);
     }
 }
 

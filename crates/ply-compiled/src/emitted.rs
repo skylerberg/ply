@@ -7,7 +7,7 @@
 //! runtime's own objects takes a [`Word`], so a walk of a value emitted code lays out cannot be
 //! written.
 
-use crate::heap::{self, HEADER, Heap, IMMORTAL, KIND_REFUSED, Obj, SHARED, Word};
+use crate::heap::{self, HEADER, Heap, IMMORTAL, Obj, SHARED, Word};
 use crate::native::{Answered, Machine, Taken};
 use crate::rt::Ctx;
 
@@ -20,15 +20,15 @@ impl Block {
         self.0 as *mut Obj
     }
 
-    /// A fresh block of `bytes`, its header among them, from `heap`: counted once, of
-    /// [`KIND_REFUSED`], and holding past its header whatever the block last held.
+    /// A fresh block of `bytes`, its header among them, from `heap`: counted once, and holding
+    /// past its header whatever the block last held.
     pub fn alloc(heap: &mut Heap, bytes: Word) -> Block {
-        Block(heap.raw_alloc(KIND_REFUSED, 0, 0, 0, payload(bytes)) as Word)
+        Block(heap.raw_alloc(payload(bytes)) as Word)
     }
 
     /// [`Block::alloc`] with an immortal count: no holder counts it and nothing frees it.
     pub fn alloc_immortal(heap: &mut Heap, bytes: Word) -> Block {
-        let o = heap.raw_alloc(KIND_REFUSED, 0, 0, 0, payload(bytes));
+        let o = heap.raw_alloc(payload(bytes));
         unsafe { (*o).rc = IMMORTAL };
         Block(o as Word)
     }

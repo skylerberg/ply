@@ -60,70 +60,48 @@ pub struct HandlerFrame {
     pub(super) vars: Option<SharedVars>,
 }
 
-/// A handler's variables, held. A task's copy of the frame shares them, so tasks under one handler
-/// see one set; a continuation's copy holds its own, so a resumption starts from them as they were
-/// where it was captured. Given back by [`release_vars`], never by a drop, which could come after
-/// the entry's heap is gone.
-pub(crate) struct HandlerVars(pub(super) Vec<Var>);
-
-/// One handler variable: a uniform word `?handler_set` set, or a value set with its type.
-pub(crate) enum Var {
-    Word(Word),
-    Carried(Carried),
-}
-
-impl Var {
-    fn copied(&self) -> Var {
-        match self {
-            Var::Word(w) => {
-                heap::inc(*w);
-                Var::Word(*w)
-            }
-            Var::Carried(v) => Var::Carried(v.dup(running())),
-        }
-    }
-
-    fn release(self) {
-        match self {
-            Var::Word(w) => heap::dec(w),
-            Var::Carried(v) => v.release(running()),
-        }
-    }
-}
+/// A handler's variables, held, each with the type its `handle` gave it: none for one not yet set.
+/// A task's copy of the frame shares them, so tasks under one handler see one set; a continuation's
+/// copy holds its own, so a resumption starts from them as they were where it was captured. Given
+/// back by [`release_vars`], never by a drop, which could come after the entry's heap is gone.
+pub(crate) struct HandlerVars(pub(super) Vec<Option<Carried>>);
 
 impl HandlerVars {
     /// The same values, each held once more.
     pub(crate) fn copied(&self) -> HandlerVars {
-        HandlerVars(self.0.iter().map(Var::copied).collect())
+        HandlerVars(
+            self.0
+                .iter()
+                .map(|v| v.as_ref().map(|v| v.dup(running())))
+                .collect(),
+        )
     }
 
     /// Takes `v` as variable `i`, letting go of what it held.
-    pub(super) fn set(&mut self, i: usize, v: Var) {
+    pub(super) fn set(&mut self, i: usize, v: Carried) {
         if self.0.len() <= i {
-            self.0.resize_with(i + 1, || Var::Word(heap::unit()));
+            self.0.resize_with(i + 1, || None);
         }
-        std::mem::replace(&mut self.0[i], v).release();
+        if let Some(old) = self.0[i].replace(v) {
+            old.release(running());
+        }
     }
 
-    /// Variable `i`, held once more for its reader: a uniform word, or a carried value's word.
+    /// Variable `i`'s word, held once more for its reader; 0 for one not yet set.
     pub(super) fn get(&self, i: usize) -> Word {
         match self.0.get(i) {
-            Some(Var::Carried(v)) => v.dup(running()).handed().word(),
-            Some(Var::Word(w)) => {
-                heap::inc(*w);
-                *w
-            }
-            None => heap::unit(),
+            Some(Some(v)) => v.dup(running()).handed().word(),
+            _ => 0,
         }
     }
 
     /// Takes `w` as variable `i`, of the type the variable was given at its `handle`.
     pub(super) fn put(&mut self, i: usize, w: Handed) -> Result<(), &'static str> {
-        let Some(Var::Carried(old)) = self.0.get(i) else {
+        let Some(Some(old)) = self.0.get(i) else {
             return Err("a handler's variable was set before its `handle` gave it a type");
         };
         let ty = old.ty();
-        self.set(i, Var::Carried(unsafe { Carried::new(w, ty) }));
+        self.set(i, unsafe { Carried::new(w, ty) });
         Ok(())
     }
 }
@@ -137,8 +115,8 @@ pub(crate) fn shared(vars: HandlerVars) -> SharedVars {
 /// Lets go of one holder of `v`; the last gives back the values.
 pub(crate) fn release_vars(v: SharedVars) {
     if let Ok(only) = Rc::try_unwrap(v) {
-        for var in only.into_inner().0 {
-            var.release();
+        for var in only.into_inner().0.into_iter().flatten() {
+            var.release(running());
         }
     }
 }
@@ -196,8 +174,8 @@ impl HandlerFrame {
         match &self.vars {
             Some(v) => {
                 let old = std::mem::replace(&mut *v.borrow_mut(), values.copied());
-                for var in old.0 {
-                    var.release();
+                for var in old.0.into_iter().flatten() {
+                    var.release(running());
                 }
             }
             None => self.vars = Some(shared(values.copied())),

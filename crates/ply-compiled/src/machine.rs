@@ -9,7 +9,7 @@
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::Handle;
-use crate::heap::{KIND_BRIDGE, bridged, obj};
+use crate::heap::{bridged, obj};
 use crate::native::{Addr, F64, I64, Raises};
 use crate::rt::{Ctx, lent, refuse, refused_builtin, refused_unknown};
 use ply_core::builtins::{assert_failure, call, not_found, not_utf8};
@@ -94,6 +94,14 @@ pub fn natives() -> Vec<MachineNative> {
         machine_native(
             "?secret_verify",
             rt_secret_verify as unsafe extern "C" fn(_, _, _, _) -> _,
+        ),
+        machine_native(
+            "?functions_compared",
+            rt_functions_compared as unsafe extern "C" fn(_) -> _,
+        ),
+        machine_native(
+            "?secret_equal",
+            rt_secret_equal as unsafe extern "C" fn(_, _, _) -> _,
         ),
         machine_native(
             "?secret_len",
@@ -492,11 +500,40 @@ pub unsafe extern "C" fn rt_secret_verify(ctx: *mut Ctx, stored: Handle, p: Addr
 /// entry as Ply's fault.
 fn secret_held(c: &mut Ctx, s: &Handle) -> Option<Value> {
     let w = s.word();
-    if w == 0 || crate::heap::kind(w) != KIND_BRIDGE {
+    if !crate::heap::is_bridge(w) {
         c.fail(err_machine("a credential that is no runtime object"));
         return None;
     }
     Some(unsafe { bridged(obj(w)) }.clone())
+}
+
+/// Fails the run: two functions were compared for equality, which no function has. Answers 0.
+pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
+    let c = unsafe { &mut *ctx };
+    c.fail(
+        Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            "cannot compare functions for equality",
+        )
+        .primary(Span::DUMMY, "in compiled code"),
+    );
+    I64(0)
+}
+
+/// 1 where the secrets the lent handles `a` and `b` hold are equal, their bytes compared in constant
+/// time; else 0.
+pub unsafe extern "C" fn rt_secret_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
+    let c = unsafe { &mut *ctx };
+    let (Some(x), Some(y)) = (secret_held(c, &a), secret_held(c, &b)) else {
+        return I64(0);
+    };
+    match ply_core::values_equal(&x, &y, Span::DUMMY) {
+        Ok(same) => I64(i64::from(same)),
+        Err(d) => {
+            c.fail(d);
+            I64(0)
+        }
+    }
 }
 
 /// How many bytes the secret the lent handle `s` holds; 0 where it holds none.

@@ -10,8 +10,8 @@ import emit.pieces (spelled)
 import emit.compare (Program, program_of, formed, checked, printed_text, printed_in, not_built,
                      printed_by_form)
 import emit.own (owned)
-import emit.tir (Rep, RFloat, RWord, RInt, RSum, RFlat, Var, AVar, AInt, AZero, Val, Make, MRecord,
-                 Get, Pack, Gathered, Updated, PLeaf, PNamed, PField, Inst, Let, Decl, Assign, If,
+import emit.tir (Rep, RFloat, RWord, RInt, RSum, RFlat, Var, AVar, AInt, AZero, Val, Unsettled,
+                 Make, Get, Pack, Gathered, Updated, PLeaf, PField, Inst, Let, Decl, Assign, If,
                  Case, Match, Block, Fn, Family, Data, Calling, Leaf, counted, rep_of_arg)
 import emit.lower.held (held_as, values_of)
 import emit.lower.base (Context, started, handed)
@@ -504,7 +504,7 @@ test "a record made its word is a box of its words, its floats as their bits" {
   assert_eq(has(b" = ply_f64_bits("), [true, true, false]);
   assert_eq(has(b"_copy_"), [true, false, true]);
   // A `Seg` made holds its points' words in place: five words, no header or bitmap of a point's.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(56));"), [false, true, false]);
+  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(48));"), [false, true, false]);
   assert_eq(has(b"rt_alloc_p("), [false, false, false])
 }
 
@@ -522,18 +522,12 @@ test "a record handed as its word twice in one block is boxed once, the box read
   )
 }
 
-test "a record whose layout a type variable leaves open is made by value" {
+test "a record whose layout a type variable leaves open is what only a specialisation makes" {
   let f = form_of(program(), b"wrapped");
-  assert_eq(vals(f), [
-    Make({
-      made: MRecord({ names: [b"inner"], width: 1 }),
-      args: [AVar(param(f, 0))],
-      reuse: None,
-    }),
-  ])
+  assert_eq(vals(f), [Unsettled([AVar(param(f, 0))])])
 }
 
-test "a field a type variable lays out is read and updated by name, owning what it reads" {
+test "a field a type variable lays out is read and updated only by a specialisation, which its callers settle" {
   let src = Bytes::concat_all([
     b"fn inner_of<a>(r: { inner: a, n: Int }) -> a = r.inner\n",
     b"fn renamed<a>(r: { inner: a, n: Int }, m: Int) -> { inner: a, n: Int } = { ..r, n: m }\n",
@@ -542,22 +536,16 @@ test "a field a type variable lays out is read and updated by name, owning what 
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
       let read = form_of(p, b"inner_of");
-      assert_eq(vals(read), [Get({ of: param(read, 0), path: PNamed(b"inner") })]);
-      // The record is laid out by value, its kept field read by name.
+      assert_eq(vals(read), [Unsettled([AVar(param(read, 0))])]);
       let update = form_of(p, b"renamed");
       assert_eq(
-        vals(update).filter(|v: Val| match v { Get(_) -> true, Make(_) -> true, _ -> false }).map(
-          |v: Val|
-            match v {
-              Get(g) -> g.path == PNamed(b"inner"),
-              Make(m) -> m.made == MRecord({ names: [b"inner", b"n"], width: 2 }),
-              _ -> false,
-            },
-        ),
-        [true, true],
+        vals(update).map(|v: Val| match v { Unsettled(_) -> true, _ -> false }).filter(|u: Bool| u),
+        [true],
       );
-      // A specialisation would lay the record out where the runtime does here.
-      assert_eq(read.links.needs.map(|n: Need| n.reads == Layout), [true]);
+      assert_eq([read, update].map(|f: Fn| f.links.needs.map(|n: Need| n.reads == Layout)), [
+        [true],
+        [true],
+      ]);
       assert_eq(
         [b"inner_of", b"renamed"].map(|n: Bytes|
           match checked(p, n) { Ok(_) -> true, Err(_) -> false }),
@@ -653,7 +641,7 @@ fn nested() -> Program / {abort.raise} =
 
 test "a case's record argument is read out of the sum's words where its case lays it" {
   let dx = built(nested(), b"dx");
-  assert_eq([dx.index_of(b"(ply_words("), dx.index_of(b"rt_field_p")], [None, None])
+  assert_eq(dx.index_of(b"(ply_words("), None)
 }
 
 test "a case holding a record wider than the registers holds its box, made only where the record is" {
@@ -685,10 +673,8 @@ test "a value's layout is read off its node's type where the value carries none"
     ]),
   );
   let roots = [b"larger", b"kept", b"opened", b"chosen"];
-  let none = [false, false, false, false];
-  // What a generic builtin answers is read at its fields' offsets: nothing asks the runtime for a
-  // field by name.
-  assert_eq(where_lowered(p, roots, b"rt_field_p", none), none)
+  // What a generic builtin answers is read at its fields' offsets, so each prints.
+  assert_eq(roots.map(|n: Bytes| built(p, n) != b""), [true, true, true, true])
 }
 
 test "a record rebuilt from a captured record's fields reads them where they lie" {
@@ -699,7 +685,7 @@ test "a record rebuilt from a captured record's fields reads them where they lie
       b"fn rebuilt(c: C, n: Int) -> C = { let at = |k: Int| { own: 0, node: k, span: c.span }; at(n) }\n",
     ]),
   );
-  assert_eq(holds(p, [b"rebuilt"], b"rt_field_p"), [false])
+  assert(built(p, b"rebuilt") != b"", None)
 }
 
 test "an Option is the words its payload lays out, crossing a call and stored with no object made" {
@@ -730,8 +716,7 @@ test "an Option is the words its payload lays out, crossing a call and stored wi
   let none = roots.map(|_: Bytes| false);
   // Built, matched, handed across a call, answered, stored or compared, no object is made: an
   // `Option` of a pointer, nested or not, is one word.
-  [b"rt_equal_p", b"rt_alloc_bytes_p"].fold((), |_: Unit, t: Bytes|
-    assert_eq(holds(p, roots, t), none));
+  assert_eq(holds(p, roots, b"rt_alloc_bytes_p"), none);
   // Each crosses a call as one word: its answer, and each parameter.
   let words = |n: Bytes| {
     let f = form_of(p, n);
@@ -771,8 +756,7 @@ test "a Result whose error is a small record crosses a call as its constructor a
   // Built, answered, handed on by `?` and matched as its constructor and the record's fields: no
   // record or `Result` is made, and the error's field is read where it came back. A call crossing a
   // sum as its cases is the calling family's to lower.
-  assert_eq(where_lowered(p, roots, b"rt_alloc_p", none), none);
-  assert_eq(where_lowered(p, roots, b"rt_field_p", none), none)
+  assert_eq(where_lowered(p, roots, b"rt_alloc_p", none), none)
 }
 
 test "a sum's constructors hold their arguments at the sum's arguments, as their types lay them" {

@@ -242,7 +242,6 @@ pub fn runtime_json() -> String {
             .collect::<Vec<_>>(),
         // The natives' names alone, which a `ply` that reads no `natives` emits a builder against.
         "builtins": natives().map(|(name, _)| name).collect::<Vec<_>>(),
-        "layouts": layouts_json(),
         "ctx": fields_json(ply_compiled::laid::ctx_fields()),
         "descriptors": ply_compiled::laid::descriptors()
             .into_iter()
@@ -266,23 +265,11 @@ fn fields_json(fields: Vec<ply_compiled::laid::Field>) -> serde_json::Value {
         .collect()
 }
 
-fn facts_json(facts: Vec<(&'static str, ply_compiled::laid::Fact)>) -> serde_json::Value {
-    use ply_compiled::laid::Fact;
-    let facts = facts.into_iter().map(|(name, fact)| {
-        let value = match fact {
-            Fact::Number(n) => serde_json::json!(n),
-            Fact::Field(field) => serde_json::json!(field),
-        };
-        (name.to_string(), value)
-    });
-    serde_json::Value::Object(facts.collect())
-}
-
-fn layouts_json() -> serde_json::Value {
+fn facts_json(facts: Vec<(&'static str, usize)>) -> serde_json::Value {
     serde_json::Value::Object(
-        ply_compiled::laid::layouts()
+        facts
             .into_iter()
-            .map(|(object, facts)| (object.to_string(), facts_json(facts)))
+            .map(|(name, n)| (name.to_string(), serde_json::json!(n)))
             .collect(),
     )
 }

@@ -476,8 +476,6 @@ pub type Ctor = { name: Bytes, arity: Int }
 
 /// A constructor whose type's module states what its values are compared and shown through, and the
 /// function of each.
-pub type Stated = { ctor: Bytes, key: Option<Bytes>, show: Option<Bytes>, numeric: List<Bytes> }
-
 /// What the fixpoint dropped and why: the emitter refused it or a root it calls, or it calls
 /// `missing`, which the unit does not take.
 pub type Dropped = { function: RootName, construct: Bytes, missing: Option<RootName> }
@@ -523,22 +521,6 @@ fn ordered(xs: List<Bytes>) -> List<Bytes> =
 /// Ascending, each once.
 fn names_ordered(xs: List<RootName>) -> List<RootName> =
   xs.fold(Map::new(), |acc: Map<RootName, Bool>, x: RootName| acc.insert(x, true)).keys()
-
-/// A shape's names joined by a byte below every name's, so shapes sort as their name lists do.
-fn shape_key(names: List<Bytes>) -> Bytes / {abort.raise} =
-  range(0, names.len()).fold(b"", |acc: Bytes, i: Int|
-    if i == 0 { names.get(i) } else { Bytes::concat_all([acc, b"\x00", names.get(i)]) })
-
-/// Where a shape sorts in the unit's table: after every shape it holds in place, which the runtime
-/// interns before it, so a shape's position is the id interning the table in order gives it. A shape
-/// held in place opens fewer parentheses than one holding it, and a count sorts as its digits' count
-/// and then its digits.
-fn shape_order(names: List<Bytes>) -> Bytes / {abort.raise} = {
-  let opens = names.fold(0, |acc: Int, nm: Bytes|
-    range(0, nm.len()).fold(acc, |n: Int, i: Int| if nm.at(i) == 40 { n + 1 } else { n }));
-  let digits = ascii_of_int(opens);
-  Bytes::concat_all([ascii_of_int(digits.len()), digits, b"\x00", shape_key(names)])
-}
 
 fn positions(keys: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
   range(0, keys.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int| acc.insert(keys.get(i), i))
@@ -765,14 +747,7 @@ fn unkeyed_why(name: Bytes) -> Bytes =
 
 /// What a unit names that is not code, each table sorted by content and each entry once, so a
 /// position is a rank among what the unit holds and a body's C is a function of the unit's content.
-type Pools = {
-  fields: List<Bytes>,
-  builtins: List<Bytes>,
-  shapes: List<List<Bytes>>,
-  lambdas: List<Bytes>,
-}
-
-fn entry_fields() -> List<Bytes> = [b"key", b"value"]
+type Pools = { fields: List<Bytes>, builtins: List<Bytes>, lambdas: List<Bytes> }
 
 /// The tables of `bodies`, whose static objects are `statics`, the field table holding the names
 /// those statics' words name beside the bodies' own.
@@ -784,14 +759,6 @@ fn pools_of(
   let ts = bodies.map(|k: UnitBody| k.tables);
   let all = |pick: (Tables) -> List<Bytes>|
     ts.fold([], |acc: List<Bytes>, tables: Tables| acc.concat(pick(tables)));
-  let shapes = ts.fold(
-    Map::new().insert(shape_order(entry_fields()), entry_fields()),
-    |acc: Map<Bytes, List<Bytes>>, tables: Tables|
-      tables.shapes.fold(acc, |into: Map<Bytes, List<Bytes>>, names: List<Bytes>| {
-        let s = ordered(names);
-        into.insert(shape_order(s), s)
-      }),
-  );
   {
     fields: ordered(
       all(|tables: Tables| tables.fields).concat(
@@ -799,7 +766,6 @@ fn pools_of(
       ),
     ),
     builtins: ordered(all(|tables: Tables| tables.builtins)),
-    shapes: shapes.values(),
     lambdas: ordered(constant_entries.concat(all(|tables: Tables| tables.lambdas))),
   }
 }
@@ -832,20 +798,10 @@ fn static_fields(d: StaticDef) -> List<Bytes> =
   words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
     match w { WField(n) -> acc.push(n), _ -> acc })
 
-type Placed = {
-  fields: Map<Bytes, Int>,
-  builtins: Map<Bytes, Int>,
-  shapes: Map<Bytes, Int>,
-  lambdas: Map<Bytes, Int>,
-}
+type Placed = { fields: Map<Bytes, Int>, builtins: Map<Bytes, Int>, lambdas: Map<Bytes, Int> }
 
 fn placed_of(p: Pools) -> Placed / {abort.raise} =
-  {
-    fields: positions(p.fields),
-    builtins: positions(p.builtins),
-    shapes: positions(p.shapes.map(shape_key)),
-    lambdas: positions(p.lambdas),
-  }
+  { fields: positions(p.fields), builtins: positions(p.builtins), lambdas: positions(p.lambdas) }
 
 fn place(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
   match m.get(key) {
@@ -893,7 +849,6 @@ fn hole_key(h: Hole, tables: Tables) -> Option<Bytes> / {abort.raise} =
     let i = digits(h.digits);
     if h.kind == 98 { Some(b"b".concat(tables.builtins.get(i))) }
     else if h.kind == 102 { Some(b"f".concat(tables.fields.get(i))) }
-    else if h.kind == 115 { Some(b"s".concat(shape_key(ordered(tables.shapes.get(i))))) }
     else if h.kind == 108 { Some(b"l".concat(tables.lambdas.get(i))) }
     else { panic("an emitted placeholder of no kind the unit resolves") }
   }
@@ -905,7 +860,6 @@ fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.rais
   if kind == 84 { place(tags, rest) }
   else if kind == 98 { place(p.builtins, rest) }
   else if kind == 102 { place(p.fields, rest) }
-  else if kind == 115 { place(p.shapes, rest) }
   else { place(p.lambdas, rest) }
 }
 
@@ -956,36 +910,24 @@ fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
 /// A bucket's table: the unit's position for each of the bucket's keys.
 type BucketRow = { id: Int, places: List<Int> }
 
-/// What a unit says about itself for its loader to read: the helpers it binds, its constructors,
-/// each constant with its row of the code table, the pools its positions index, and each root the
-/// runtime enters through its entry, `R#entered`, which it takes. What the loader takes by address,
-/// `laid` lays out instead.
+/// What a unit says about itself for its loader to read: the helpers it binds, each constant with
+/// its row of the code table, the pools its positions index, and each root the runtime enters
+/// through its entry, `R#entered`, which it takes. What the loader takes by address, `laid` lays out
+/// instead.
 fn exports_text(
   helpers: List<Helper>,
-  ctors: List<Ctor>,
-  taken: List<Taken>,
   constants: List<Bytes>,
   modules: Int,
   dropped: List<Dropped>,
   p: Pools,
-  stated: List<Stated>,
   entered: List<RootName>,
-) -> Bytes / {abort.raise} = {
-  let held = taken.fold(Map::new(), |acc: Map<RootName, Bool>, t: Taken| acc.insert(t.name, true));
-  // `-` where the type states none, and `!` for a function the unit does not take, which a value
-  // read through it there is refused by.
-  let written = |f: Option<Bytes>|
-    match f {
-      None -> b"-",
-      Some(name) -> if held.contains(root_name(Named(name))) { name } else { b"!" },
-    };
+) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     lines(
       b"helpers",
       helpers.map(|h: Helper|
         Bytes::concat_all([h.name, b" ", ascii_of_int(h.args), b" ", dump_flag(h.answers)])),
     ),
-    lines(b"ctors", ctors.map(|c: Ctor| Bytes::concat_all([c.name, b" ", ascii_of_int(c.arity)]))),
     lines(b"constants", constants),
     counted(b"modules", modules),
     counted(b"refused", dropped.len()),
@@ -995,37 +937,10 @@ fn exports_text(
     ),
     lines(b"builtins", p.builtins),
     lines(b"fields", p.fields),
-    lines(
-      b"shapes",
-      p.shapes.map(|names: List<Bytes>|
-        range(0, names.len()).fold(b"", |acc: Bytes, i: Int|
-          if i == 0 { names.get(i) } else { Bytes::concat_all([acc, b" ", names.get(i)]) })),
-    ),
-    // Only a unit one of whose types states either says so, so any other reads as it always did.
-    if stated.len() == 0 { b"" } else {
-      lines(
-        b"instances",
-        stated.map(|x: Stated|
-          x.numeric.fold(
-            Bytes::concat_all([x.ctor, b" ", written(x.key), b" ", written(x.show)]),
-            |row: Bytes, f: Bytes| Bytes::concat_all([row, b" ", written(Some(f))]),
-          )),
-      )
-    },
-    // The runtime lays an `Int`, a `Decimal`, a 128-bit width, a bytes slice and an `Option` out as
-    // this unit's C reads them: `RAW_INTS`, `RAW_DECIMALS`, `RAW_WIDES`, `BYTES_VIEWS` and
-    // `OPTION_WORDS` in `exports.rs`.
-    b"ints held raw\n",
-    b"decimals held raw\n",
-    b"128-bit widths held raw\n",
-    b"bytes slices are views\n",
-    b"options held as their payload's word\n",
-    // The release's runtime reads these lines as nothing.
     Bytes::concat_all(
       entered.map(|r: RootName| Bytes::concat_all([b"entered ", root_text(r), b"\n"])),
     ),
   ])
-}
 
 /// `line` and the newline ending it as adjacent C string literals, the newline's last.
 fn literal_lines(line: Bytes) -> Bytes / {abort.raise} =
@@ -1298,7 +1213,6 @@ pub fn produce(
   modules: Int,
   answers: Map<RootName, Answer>,
   inputs: Map<Bytes, Bytes>,
-  stated: List<Stated> = [],
 ) -> Produced / {abort.raise} = {
   let arity = offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
     acc.insert(o.name, o));
@@ -1415,8 +1329,6 @@ pub fn produce(
   let took = s.taken.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
   let exports = exports_text(
     runtime.helpers,
-    ctors,
-    taken,
     constants.map(|n: RootName|
       Bytes::concat_all([
         root_text(n),
@@ -1426,7 +1338,6 @@ pub fn produce(
     modules,
     s.dropped,
     pools,
-    stated,
     // An entry's site is the root it enters, which the unit need not hold: a generic definition's
     // callers settle its body, and its entry calls a specialisation.
     offered.filter(|o: Offered| o.name == entry_name(o.site) && took.contains(o.name)).map(
@@ -2858,9 +2769,6 @@ pub fn emitted<| e>(
       p.modules.len(),
       held,
       inputs,
-      dump.emitter_ctors.fold([], |acc: List<Stated>, c: EmitterCtor|
-        if c.key == None && c.show == None && c.numeric.len() == 0 { acc }
-        else { acc.push({ ctor: c.name, key: c.key, show: c.show, numeric: c.numeric }) }),
     );
     Ok({
       produced: produced,
@@ -5546,47 +5454,6 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
       b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, 0, ply_taken, 1 };\n",
     ]),
   )
-}
-
-test "a unit says which constructors are read through a function, and which function it lacks" {
-  let p = produce(
-    { ..a_runtime(b"r"), head: b"/* head */\n", tail: b"/* tail */\n" },
-    [{ name: b"m.Box", arity: 2 }, { name: b"m.Dot", arity: 0 }],
-    [offer(b"m.area", 1), offer(b"m.make", 0)],
-    1,
-    by_def([
-      { key: b"m.area", value: one_body(b"m.area", [b"m.area"]) },
-      { key: b"m.make", value: one_body(b"m.make", [b"m.area"]) },
-    ]),
-    Map::new(),
-    [{ ctor: b"m.Box", key: Some(b"m.area"), show: Some(b"m.text"), numeric: [] }],
-  );
-  assert_eq(p.taken, [b"m.area", b"m.make"].map(def_root));
-  assert(p.text.index_of(b"\"instances 1\" \"\\n\"\n\"m.Box m.area !\" \"\\n\"") != None, None);
-  // A body that names the constructor is not taken without the key its type states.
-  let alone = produce(
-    a_runtime(b"r"),
-    [{ name: b"m.Box", arity: 2 }],
-    [offer(b"m.make", 0)],
-    1,
-    by_def([{ key: b"m.make", value: one_body(b"m.make", [b"m.area"]) }]),
-    Map::new(),
-    [{ ctor: b"m.Box", key: Some(b"m.area"), show: None, numeric: [] }],
-  );
-  assert_eq(alone.taken, []);
-  assert_eq(alone.dropped.map(|d: Dropped| d.missing), [Some(def_root(b"m.area"))]);
-  // A unit none of whose types states one says nothing of it.
-  let plain = produce(
-    a_runtime(b"r"),
-    [],
-    [offer(b"m.f", 0)],
-    1,
-    by_def([{ key: b"m.f", value: one_body(b"m.f", []) }]),
-    Map::new(),
-  );
-  assert(plain.text.index_of(b"instances") == None, None);
-  // Last, every unit says it holds a `Decimal` as its two words.
-  assert(plain.text.index_of(b"decimals held raw") != None, None)
 }
 
 test "a root's code moves with the key a type it names states" {

@@ -80,20 +80,16 @@ pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep, answ
 /// whether it can fail, and whether it can stop for a handler that may resume it later.
 pub type Uses = { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool }
 
-/// What a `Make` allocates. `MRecord` is a record the runtime lays out by its names, as it does one
-/// whose layout a type variable leaves open.
-/// `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
+/// What a `Make` allocates. `MClosure` is a closure over body `nth` of the root's lambdas, holding `captures` words and taking
 /// `params` arguments; a `stacked` one is lent and laid out on the caller's stack. `MCase` is a
 /// sum's case `case` (its place among the sum's cases) boxed, `skip` words of tag holding `case` and
 /// then `words` of payload.
 pub type Made =
-  | MRecord({ names: List<Bytes>, width: Int })
   | MList(Int)
   | MClosure({ nth: Int, captures: Int, params: Int, stacked: Bool })
   | MCase({ case: Int, skip: Int, words: Int })
 
-/// Where a `Get` reads: a field by its word offset, or by name where the layout is unknown (a
-/// need the specialisation answers), a case's argument, a closure's capture by the word past its
+/// Where a `Get` reads: a field by its word offset, a case's argument, a closure's capture by the word past its
 /// descriptor it starts at, a flat value's leaf, or the word of a record a block holds in place at a
 /// word offset: the address of its header there.
 /// `PCase` is the field of an `RSum`'s case `case` whose first word is word `at` of the case's
@@ -102,7 +98,6 @@ pub type Made =
 /// as an `RAddr`.
 pub type Path =
   | PField({ name: Bytes, at: Int })
-  | PNamed(Bytes)
   | PArg({ ctor: Bytes, at: Int })
   | PCapture(Int)
   | PLeaf(Int)
@@ -138,8 +133,7 @@ pub type Val =
   | Static(Bytes)
   /// Made in the cells of the reuse token `reuse` names where it names one, else allocated.
   | Make({ made: Made, args: List<Arg>, reuse: Option<Var> })
-  /// What `path` reads out of `of`: borrowed from it, but by `PNamed`, which the runtime looks up by
-  /// name and answers with a count of its own, and which can fail.
+  /// What `path` reads out of `of`, borrowed from it.
   | Get({ of: Var, path: Path })
   /// The field held as one word that `path` (a `PField` or a `PArg`) reads out of the block `of`
   /// is held as a word, with a count of its own: where the block is held only here its slot is
@@ -169,6 +163,9 @@ pub type Val =
   | Op({ op: Operation, args: List<Arg>, uses: Uses })
   /// Takes the variable's count: answers it where that count was its last, and 0 otherwise.
   | LastOf(Var)
+  /// What only a specialisation computes of `args`: an operation that reads a type or layout a type
+  /// variable leaves open, whose need settles the body by its callers, so no printer meets one.
+  | Unsettled(List<Arg>)
   /// `of` walked by its blocks as `op` says, `Copy`, `Share` or `Keep`: a copy, which takes `of`; for
   /// `Share`, every block reached marked to cross threads, answering an `RInt` that is nonzero where
   /// each may; for `Keep`, a copy no count releases. `Share` and `Keep` borrow `of`.
@@ -331,7 +328,6 @@ pub fn var_said(v: Var) -> Bytes =
 /// What `m` makes, as a fault names it.
 pub fn made_said(m: Made) -> Bytes =
   match m {
-    MRecord(r) -> Bytes::concat_all([b"a record of ", Bytes::join(r.names, b", ")]),
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
     MCase(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
@@ -422,6 +418,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Op(o) -> used_as(o.args, o.uses),
     LastOf(x) -> [{ arg: AVar(x), takes: true }],
     Walked(w) -> [{ arg: AVar(w.of), takes: w.op == Copy }],
+    Unsettled(args) -> args.map(|a: Arg| { arg: a, takes: false }),
   }
 
 fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
@@ -457,7 +454,7 @@ pub type Answered = | Owns | ReadsOf(List<Var>) | Lasts
 
 pub fn answered(v: Val) -> Answered =
   match v {
-    Get(g) -> match g.path { PNamed(_) -> Owns, _ -> ReadsOf([g.of]) },
+    Get(g) -> ReadsOf([g.of]),
     Static(_) -> Lasts,
     Tag(_) -> Lasts,
     Native(n) -> by_uses(n.args, n.uses),
@@ -484,7 +481,7 @@ fn by_uses(args: List<Arg>, uses: Uses) -> Answered =
   if uses.owned { Owns } else { match args.at(0) { Some(AVar(x)) -> ReadsOf([x]), _ -> Lasts } }
 
 /// Whether `v` can fail, so a test follows it and its `unwind` is released on the way out: a
-/// call, a checked operator, a field read by name, and what its `uses` say of a runtime function or
+/// call, a checked operator, and what its `uses` say of a runtime function or
 /// a family's operation. A value made or packed only allocates, which never fails: the heap aborts
 /// when it is exhausted. A constant is laid out before the program runs.
 pub fn fails(v: Val) -> Bool =
@@ -493,7 +490,7 @@ pub fn fails(v: Val) -> Bool =
     Literal(_) -> false,
     Static(_) -> false,
     Make(_) -> false,
-    Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
+    Get(_) -> false,
     Take(_) -> false,
     Tag(_) -> false,
     Pack(_) -> false,
@@ -505,6 +502,7 @@ pub fn fails(v: Val) -> Bool =
     Op(o) -> o.uses.fails,
     LastOf(_) -> false,
     Walked(_) -> false,
+    Unsettled(_) -> false,
   }
 
 /// Whether `val` may stop for a handler that can resume it more than once.
@@ -643,8 +641,6 @@ test "each operation consumes or borrows each operand as its signature says" {
     true,
   ]);
   assert_eq(answered(Get({ of: s, path: PLeaf(0) })), ReadsOf([s]));
-  // A field the runtime looks up by name is answered with a count of its own.
-  assert_eq(answered(Get({ of: s, path: PNamed(b"x") })), Owns);
   assert_eq(answered(call), Owns);
   // A call answering what it read out of what it was lent holds no count: it reads those arguments.
   let borrowed = match call {
@@ -663,10 +659,7 @@ test "what can fail is what tests the runtime: a checked operator, a call, never
   assert_eq(fails(Prim({ op: b"add", on: RDec, args: [AZero(RDec), AZero(RDec)] })), true);
   assert_eq(fails(Prim({ op: b"of_int", on: RInt, args: [AInt(300)] })), true);
   let w = { id: 2, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
-  assert_eq([PLeaf(0), PNamed(b"x")].map(|at: Path| fails(Get({ of: w, path: at }))), [
-    false,
-    true,
-  ]);
+  assert_eq(fails(Get({ of: w, path: PLeaf(0) })), false);
   let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
   assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), false);
   assert_eq(fails(Pack({ arg: AVar(flat), to: RWord })), false);

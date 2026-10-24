@@ -94,17 +94,11 @@ pub fn exports_of(defs: &[Def]) -> Laid {
     Laid {
         says: Exports {
             helpers: runtime_helpers(),
-            ctors: Vec::new(),
             constants: Vec::new(),
             modules: 1,
             refusals: Vec::new(),
-            consts: Vec::new(),
             fields: Vec::new(),
             builtins: Vec::new(),
-            shapes: Vec::new(),
-            instances: Vec::new(),
-            numerics: Vec::new(),
-            layout: ply_compiled::heap::RecordLayout::CURRENT,
             entered: Vec::new(),
         },
         lambdas: Vec::new(),
@@ -189,7 +183,7 @@ pub fn text(defs: &[Def], exports: &Laid) -> String {
          void *bind_singletons; void *const *code; unsigned long code_count; \
          const struct ply_taken *taken; unsigned long taken_count; }};\n\
          const struct ply_descriptor ply_descriptor = {{ ply_exports, sizeof ply_exports - 1, \
-         (void *)ply_bind, (void *)ply_bind_singletons, ply_code, {}, ply_taken, {} }};\n",
+         (void *)ply_bind, (void *)0, ply_code, {}, ply_taken, {} }};\n",
         exports.lambdas.len(),
         taken.len()
     ));

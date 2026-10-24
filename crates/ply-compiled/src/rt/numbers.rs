@@ -1,12 +1,7 @@
-//! Counts, boxing, arithmetic, decimals and fixed widths, and the operations a type's module states.
+//! Arithmetic over `Float`s' bits, `Decimal`s' and 128-bit widths' words, their boxes, and the
+//! failures compiled arithmetic and matching raise.
 
 use super::*;
-
-/// Perceus's `drop`: one holder fewer.
-pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap.release_last(w);
-}
 
 /// `a % b` over two `Float`s' bits, which C reaches only through `fmod`.
 pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
@@ -14,7 +9,8 @@ pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     ply_core::float::bits(a % b) as i64
 }
 
-/// The operator codes compiled code hands [`rt_binary`]; `emit/c.ply`'s `binary_code` must match.
+/// The operator codes compiled code hands [`rt_wide_binary`] and [`rt_decimal_binary`];
+/// `emit/c.ply`'s `binary_code` must match.
 pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
@@ -36,54 +32,7 @@ pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Ushr,
 ];
 
-/// The machine's own negation of a `Float`, a `Decimal` or a width past 32 bits, which compiled
-/// code holds as the runtime's own words. Takes it.
-pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let vals = values_taken(c, &[a]);
-    let answer = match &vals[0] {
-        v @ Value::Ctor { .. } => {
-            match numeric_value(
-                ctx.cast(),
-                ply_core::instances::NEG,
-                std::slice::from_ref(v),
-            ) {
-                Some(n) => n,
-                None => return unsafe { &mut *ctx }.fail(ply_core::unstated(Span::DUMMY, v)),
-            }
-        }
-        Value::Float(f) => Value::Float(-f),
-        Value::Decimal(d) => Value::Decimal(-*d),
-        Value::Fixed(f) => match f.checked_neg() {
-            Some(n) => Value::Fixed(n),
-            None => return c.fail(error("negation overflowed its width")),
-        },
-        other => match other.as_int(Span::DUMMY, "negation") {
-            Ok(i) => match i.checked_neg() {
-                Some(n) => Value::Int(n),
-                None => return c.fail(error("integer overflow in negation")),
-            },
-            Err(d) => return c.fail(d),
-        },
-    };
-    c.word(&answer)
-}
-
-/// `~` over a word the emitter cannot read as an `Int`: a width past 32 bits. Takes it.
-pub unsafe extern "C" fn rt_bitnot(ctx: *mut Ctx, a: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let vals = values_taken(c, &[a]);
-    let answer = match &vals[0] {
-        Value::Fixed(f) => Value::Fixed(ply_core::Fixed::new(f.ty, !f.bits())),
-        other => match other.as_int(Span::DUMMY, "`~`") {
-            Ok(i) => Value::Int(!i),
-            Err(d) => return c.fail(d),
-        },
-    };
-    c.word(&answer)
-}
-
-/// `rt_binary` over two 64-bit widths' bits, the width at `t` in [`ply_core::INT_TYPES`]: the
+/// An operator over two 64-bit widths' bits, the width at `t` in [`ply_core::INT_TYPES`]: the
 /// answer's bits, or a `Bool`'s 1 or 0, raised as the evaluator raises.
 pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
@@ -241,19 +190,28 @@ pub unsafe extern "C" fn rt_wide_op(
     1
 }
 
-/// The object of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
+/// The box of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
 /// and above it `hi`.
 pub unsafe extern "C" fn rt_box_wide(ctx: *mut Ctx, lo: I64, hi: I64, t: I64) -> Word {
     let ctx = unsafe { &mut *ctx };
-    let ty = usize::try_from(t.0)
+    let wide = usize::try_from(t.0)
         .ok()
-        .and_then(|i| ply_core::INT_TYPES.get(i).copied())
-        .filter(|ty| ty.bits() == 128);
-    let Some(ty) = ty else {
+        .and_then(|i| ply_core::INT_TYPES.get(i))
+        .is_some_and(|ty| ty.bits() == 128);
+    if !wide {
         return ctx.fail(error(format!("width {} is no 128-bit width", t.0)));
-    };
-    let bits = (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64);
-    ctx.heap.boxed_fixed(ply_core::Fixed::new(ty, bits))
+    }
+    two_words(ctx, lo.0, hi.0)
+}
+
+/// A block of two scalar words, `lo` and then `hi`, which compiled code releases by its size.
+fn two_words(ctx: &mut Ctx, lo: i64, hi: i64) -> Word {
+    let o = ctx.heap.raw_alloc(16);
+    unsafe {
+        set_word(o, 0, lo);
+        set_word(o, 1, hi);
+    }
+    o as Word
 }
 
 /// The `Decimal` two words of compiled code's `PlyDec` hold.
@@ -278,9 +236,9 @@ pub(super) unsafe fn write_decimal(out: i64, d: ply_core::Decimal) {
     }
 }
 
-/// The object of the `Decimal` whose two words are `lo` and `hi`.
+/// The box of the `Decimal` whose two words are `lo` and `hi`.
 pub unsafe extern "C" fn rt_box_decimal(ctx: *mut Ctx, lo: i64, hi: i64) -> i64 {
-    unsafe { &mut *ctx }.heap.boxed_decimal(decimal_of(lo, hi))
+    two_words(unsafe { &mut *ctx }, lo, hi)
 }
 
 /// An arithmetic operator, `op` in `BINOPS`, over two `Decimal`s' words: its answer's two words
@@ -405,201 +363,4 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
         t.max()
     ));
     raise_error(ctx, d);
-}
-
-/// A `(ctx, args)` entry the unit states of a type, called with one of its values. Takes `w`;
-/// `None` when the call failed, which the context then holds. A value is compared wherever it is
-/// read, which may be on a segment a Rust recursion grew onto: the call then runs on a stack of its
-/// own.
-pub(super) fn call_stated(ctx: *mut Ctx, entry: usize, w: Word) -> Option<Word> {
-    call_stated_over(ctx, entry, &[w])
-}
-
-/// [`call_stated`] for an entry of any number of words. Takes each.
-pub(super) fn call_stated_over(ctx: *mut Ctx, entry: usize, args: &[Word]) -> Option<Word> {
-    let site = {
-        let c = unsafe { &*ctx };
-        (c.site_root, c.site_start, c.site_end)
-    };
-    // SAFETY: `entry` is a taken root's address, which the unit keeps as long as its tables.
-    let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(entry) };
-    let out = on_known_stack(ctx, || unsafe { f(ctx, args.as_ptr()) });
-    let c = unsafe { &mut *ctx };
-    if c.failed != 0 {
-        return None;
-    }
-    // What reads the value fails where the body that asked stored its site, not inside this call.
-    (c.site_root, c.site_start, c.site_end) = site;
-    Some(out)
-}
-
-/// The context of the unit running on this thread, which a reader holding only its layouts asks.
-pub(super) fn running_ctx() -> Option<*mut Ctx> {
-    ply_core::instances::running().map(|i| i.unit.cast::<Ctx>())
-}
-
-/// A value read through a function its type states, where the unit running does not hold it.
-pub(super) fn absent(ctx: &mut Ctx, what: &str, ctor: &Symbol) -> i64 {
-    let d = Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("a `{ctor}` was read through its type's `{what}`, which this unit does not hold"),
-    )
-    .primary(Span::DUMMY, "in compiled code")
-    .note("this is Ply's fault: a unit that holds a type's values takes what the type states");
-    ctx.fail(d)
-}
-
-/// The keys two constructors' values are compared by, when their type states one: each the
-/// caller's. Reads both.
-pub(crate) fn keys_of(layouts: &Layouts, a: Word, b: Word) -> Option<(Word, Word)> {
-    if !layouts.states_any() {
-        return None;
-    }
-    let ctor = |w: Word| unsafe { (*obj(w)).layout };
-    let (ka, kb) = (layouts.key(ctor(a)), layouts.key(ctor(b)));
-    if ka == Stated::No || kb == Stated::No {
-        return None;
-    }
-    let ctx = running_ctx()?;
-    let (Stated::By(f), Stated::By(g)) = (ka, kb) else {
-        absent(
-            unsafe { &mut *ctx },
-            "key",
-            &layouts.ctors[ctor(a) as usize].0,
-        );
-        return None;
-    };
-    heap::inc(a);
-    let x = call_stated(ctx, f, a)?;
-    heap::inc(b);
-    match call_stated(ctx, g, b) {
-        Some(y) => Some((x, y)),
-        None => {
-            heap::dec(x);
-            None
-        }
-    }
-}
-
-pub(super) fn unit_keys(unit: *mut (), ctor: &Symbol) -> bool {
-    let layouts = &unsafe { &*unit.cast::<Ctx>() }.tables.layouts;
-    layouts
-        .ctor_index(ctor)
-        .is_some_and(|i| layouts.key(i) != Stated::No)
-}
-
-pub(super) fn stated_value(unit: *mut (), v: &Value, key: bool) -> Option<Value> {
-    let ctx = unit.cast::<Ctx>();
-    let c = unsafe { &mut *ctx };
-    let Value::Ctor { name, .. } = v else {
-        return None;
-    };
-    let index = c.tables.layouts.ctor_index(name)?;
-    let (stated, what) = if key {
-        (c.tables.layouts.key(index), "key")
-    } else {
-        (c.tables.layouts.show(index), "show")
-    };
-    match stated {
-        Stated::No => None,
-        Stated::Absent => {
-            absent(c, what, name);
-            None
-        }
-        Stated::By(entry) => {
-            let tables = Arc::clone(&c.tables);
-            let w = c.heap.to_word(&tables.layouts, v);
-            let out = call_stated(ctx, entry, w)?;
-            let answer = Heap::to_value(&tables.layouts, out);
-            heap::dec(out);
-            Some(answer)
-        }
-    }
-}
-
-pub(super) fn key_value(unit: *mut (), v: &Value) -> Option<Value> {
-    stated_value(unit, v, true)
-}
-
-/// One of a `numeric`'s functions, for this constructor, called over `args`.
-pub(super) fn numeric_call(ctx: *mut Ctx, ctor: u32, role: usize, args: &[Value]) -> Option<Value> {
-    let c = unsafe { &mut *ctx };
-    match c.tables.layouts.numeric(ctor, role) {
-        Stated::No => None,
-        Stated::Absent => {
-            let name = c.tables.layouts.ctors[ctor as usize].0.clone();
-            absent(c, "numeric", &name);
-            None
-        }
-        Stated::By(entry) => {
-            let tables = Arc::clone(&c.tables);
-            let words: Vec<Word> = args
-                .iter()
-                .map(|v| c.heap.to_word(&tables.layouts, v))
-                .collect();
-            let out = call_stated_over(ctx, entry, &words)?;
-            let answer = Heap::to_value(&tables.layouts, out);
-            heap::dec(out);
-            Some(answer)
-        }
-    }
-}
-
-pub(super) fn numeric_value(unit: *mut (), role: usize, args: &[Value]) -> Option<Value> {
-    let ctx = unit.cast::<Ctx>();
-    let Some(Value::Ctor { name, .. }) = args.first() else {
-        return None;
-    };
-    let ctor = unsafe { &*ctx }.tables.layouts.ctor_index(name)?;
-    numeric_call(ctx, ctor, role, args)
-}
-
-pub(super) fn stated_witness(unit: *mut (), ctor: &Symbol) -> Option<i64> {
-    let layouts = &unsafe { &*unit.cast::<Ctx>() }.tables.layouts;
-    let index = layouts.ctor_index(ctor)?;
-    (layouts.numeric(index, ply_core::instances::OF_INT) != Stated::No)
-        .then(|| ply_core::instances::STATED_WITNESS + i64::from(index))
-}
-
-pub(super) fn of_int_value(unit: *mut (), witness: i64, n: i64) -> Option<Value> {
-    let ctor = u32::try_from(witness - ply_core::instances::STATED_WITNESS).ok()?;
-    numeric_call(
-        unit.cast::<Ctx>(),
-        ctor,
-        ply_core::instances::OF_INT,
-        &[Value::Int(n)],
-    )
-}
-
-pub(super) fn shown_value(unit: *mut (), v: &Value) -> Option<Value> {
-    stated_value(unit, v, false)
-}
-
-/// `==` beyond two `Int`s or `Bool`s, deferring to the evaluator's comparison. Reads both.
-pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    if heap::is_imm(a) && heap::is_imm(b) {
-        return i64::from(a == b);
-    }
-    if !heap::is_imm(a) && !heap::is_imm(b) {
-        let (ka, kb) = (heap::kind(a), heap::kind(b));
-        if ka == kb && (ka == KIND_STR || ka == KIND_BYTES) {
-            return i64::from(unsafe { bytes_of(obj(a)) == bytes_of(obj(b)) });
-        }
-        // Two values of a keyed type are equal as their keys are.
-        if ka == KIND_CTOR && kb == KIND_CTOR && unsafe { &*ctx }.tables.layouts.states_any() {
-            let tables = Arc::clone(&unsafe { &*ctx }.tables);
-            if let Some((x, y)) = keys_of(&tables.layouts, a, b) {
-                let equal = unsafe { rt_equal(ctx, x, y) };
-                heap::dec(x);
-                heap::dec(y);
-                return equal;
-            }
-        }
-    }
-    let ctx = unsafe { &mut *ctx };
-    let (l, r) = (ctx.value(a), ctx.value(b));
-    match values_equal(&l, &r, Span::DUMMY) {
-        Ok(eq) => i64::from(eq),
-        Err(d) => ctx.fail(d),
-    }
 }

@@ -7,14 +7,14 @@
 
 import emit.tir (FieldSet, Rep, RWord, RInt, RBool, RNum, RFlat, RSlice, RToken, Leaf, Var, Arg,
                  AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Updated, Native, Op,
-                 Get, Take, Static, Prim, Path, PLeaf, PField, PArg, PNamed, Made, MRecord,
-                 MClosure, MList, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
-                 Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset,
-                 Free, Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed, Given, Lent,
-                 Owned, Borrowed, Returned, Convention, Answered, Owns, ReadsOf, Lasts, no_links,
-                 counted, operands, answered, unpacks, fails, used_as, rep_of_arg, var_of, parts_of,
-                 Test, TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MCase, PCase,
-                 PPayload, OContainer, OStrings, stops_at, Uses, string_uses)
+                 Get, Take, Static, Prim, Path, PLeaf, PField, PArg, Made, MClosure, MList,
+                 Unsettled, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next,
+                 Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free,
+                 Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed, Given, Lent, Owned,
+                 Borrowed, Returned, Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted,
+                 operands, answered, unpacks, fails, used_as, rep_of_arg, var_of, parts_of, Test,
+                 TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MCase, PCase, PPayload,
+                 OContainer, OStrings, stops_at, Uses, string_uses)
 import emit.tir.containers (Taken)
 import emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock, Copied, Grown,
                          ByteRead, string_args, string_answer)
@@ -1367,8 +1367,7 @@ fn counted_class(c: WordClass) -> Bool = match c { P -> true, S(_) -> true, U ->
 
 /// The payload words of the block `m` allocates, where it is a record, or a boxed case with the
 /// words of its tag.
-pub fn made_width(m: Made) -> Int =
-  match m { MRecord(r) -> r.width, MCase(c) -> c.skip + c.words, _ -> 0 }
+pub fn made_width(m: Made) -> Int = match m { MCase(c) -> c.skip + c.words, _ -> 0 }
 
 /// Whether each arm's `when` is a constructor `tested` names, where it tests a tag: the arm then knows
 /// its subject holds that constructor, which decides whose cells it may reuse.
@@ -1434,7 +1433,7 @@ pub fn holds_no_count(y: Var, val: Val, immortal: Map<Int, Bool>) -> Bool =
     Gathered(g) ->
       g.parts.all(|a: Arg|
         match a { AVar(v) -> !counted(v.rep) || immortal.contains(v.id), _ -> true }),
-    Get(g) -> match g.path { PNamed(_) -> false, _ -> immortal.contains(g.of.id) },
+    Get(g) -> immortal.contains(g.of.id),
     _ -> match re_held(y, val) { Some(x) -> immortal.contains(x.id), None -> false },
   }
 
@@ -1745,7 +1744,8 @@ fn answers_count(v: Val) -> Bool =
     Apply(c) -> counted(c.conv.answer),
     Make(_) -> true,
     Take(_) -> true,
-    Get(g) -> match g.path { PNamed(_) -> true, _ -> false },
+    Get(_) -> false,
+    Unsettled(_) -> true,
     Pack(p) -> counted(p.to) && !unpacks(p.arg, p.to),
     Gathered(g) -> g.parts.any(|a: Arg| counted(rep_of_arg(a))),
     Native(n) -> n.uses.owned,
@@ -1950,16 +1950,14 @@ test "the values holding no count are a static, what is gathered, held again or 
   // `k` is set from a static on one path and a given parameter on the other: it holds a count.
   assert_eq(immortals(f).contains(k.id), false);
   // What is read in place out of such a value holds none either, as an `Option` gathered of a
-  // constant holds no count in its payload's place; a field looked up by name is answered afresh.
+  // constant holds no count in its payload's place.
   let read = word(7);
-  let named = word(8);
   let g = root_of([c, p], [], RWord, [
     bind(s, Static(b"k"), []),
     bind(read, Get({ of: s, path: PLeaf(0) }), []),
-    bind(named, Get({ of: s, path: PNamed(b"x") }), []),
     Return(AVar(read)),
   ]);
-  assert_eq([read.id, named.id].map(|id: Int| immortals(g).contains(id)), [true, false])
+  assert(immortals(g).contains(read.id))
 }
 
 test "the paths out of a branch hold the same counts and set the same joins" {
@@ -2307,16 +2305,12 @@ test "a reuse token is kept by a reset, taken by a make or freed, and never read
     ),
     Some(b"a value made in cells of another size: v2"),
   );
-  // A record is made by value, which takes no cells.
+  // A list is made by its own printer, which takes no cells.
   assert_eq(
     verified(
       root_of([r, v], [], RWord, [
         reset,
-        bind(
-          n,
-          Make({ made: MRecord({ names: [b"a"], width: 1 }), args: [AVar(v)], reuse: Some(token) }),
-          [],
-        ),
+        bind(n, Make({ made: MList(1), args: [AVar(v)], reuse: Some(token) }), []),
         Return(AVar(n)),
       ]),
     ),
@@ -2605,15 +2599,6 @@ test "a field taken before any miss is taken for the next arm, a read by name is
     );
   assert_eq(next_reads(b"g", 1), None);
   assert_eq(next_reads(b"f", 0), Some(b"a field read after it was taken out of its block: v5"));
-  assert_eq(
-    verified(
-      root_of([p], [], RWord, [
-        Do({ val: Get({ of: p, path: PNamed(b"f") }), at: dummy_span(), unwind: [p] }),
-        Return(AVar(p)),
-      ]),
-    ),
-    Some(b"a value whose count nothing holds"),
-  );
   let k = word(3);
   let a = word(4);
   let laid = bind(

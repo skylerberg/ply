@@ -105,9 +105,8 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
 
 #[test]
 fn the_prelude_agrees_with_the_layouts_it_mirrors() {
-    assert_eq!(ply_compiled::heap::HEADER, 16, "PLY_HEADER");
-    assert_eq!(std::mem::size_of::<ply_compiled::heap::Obj>(), 16, "PlyObj");
-    assert_eq!(ply_compiled::heap::FLAT, 1, "PLY_FLAT");
+    assert_eq!(ply_compiled::heap::HEADER, 8, "PLY_HEADER");
+    assert_eq!(std::mem::size_of::<ply_compiled::heap::Obj>(), 8, "PlyObj");
     assert_eq!(
         std::mem::offset_of!(ply_compiled::rt::Ctx, failed),
         0,
@@ -133,19 +132,9 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
         56,
         "PlyCtx.next_tick"
     );
-    assert!(PRELUDE.contains("#define PLY_HEADER 16"));
-    assert_eq!(ply_compiled::heap::KIND_FLOAT, 16, "PLY_KIND_FLOAT");
-    assert!(PRELUDE.contains("#define PLY_KIND_FLOAT 16"));
-    assert_eq!(ply_compiled::heap::MIXED, 2, "PLY_MIXED");
-    assert!(PRELUDE.contains("#define PLY_MIXED 2"));
-    assert_eq!(ply_compiled::heap::KIND_FIXED, 18, "PLY_KIND_FIXED");
-    assert!(PRELUDE.contains("#define PLY_KIND_FIXED 18"));
-    assert_eq!(ply_compiled::heap::RAW, 4, "PLY_RAW");
-    assert!(PRELUDE.contains("#define PLY_RAW 4"));
-    assert_eq!(ply_compiled::heap::VIEW, 8, "PLY_VIEW");
-    assert!(PRELUDE.contains("#define PLY_VIEW 8"));
-    assert_eq!(ply_compiled::heap::EMBEDDED, 0xC000_0000, "ply_counted_by");
-    assert!(ply_compiled::c::runtime_header().contains("rc >= UINT32_C(0xC0000000)"));
+    assert!(PRELUDE.contains("#define PLY_HEADER 8"));
+    assert_eq!(ply_compiled::heap::SHARED, 0x8000_0000, "ply_inc");
+    assert!(ply_compiled::c::runtime_header().contains("rc < UINT32_C(0x80000000)"));
 }
 
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
@@ -165,33 +154,24 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A unit says how its C lays out records, after whatever else it says, and how each constructor
-/// lays out its arguments.
+/// A table a unit whose values the runtime laid out wrote reads as its helpers, constants, pools and
+/// entered roots: the constructors, shapes, instances and layout lines it says besides read as
+/// nothing.
 #[test]
-fn a_unit_says_how_it_lays_out_records_and_constructors() {
-    let mut exports = units::exports_of(&[]);
-    let spelled = |names: &[&str]| names.iter().copied().map(ply_core::Symbol::new).collect();
-    exports.ctors = vec![
-        (ply_core::Symbol::new("None"), 0, vec![]),
-        (
-            ply_core::Symbol::new("m.Pair"),
-            2,
-            spelled(&["a000!r(x!f,y!f)", "a001"]),
-        ),
-    ];
-    for bits in 0..32 {
-        exports.layout = ply_compiled::heap::RecordLayout {
-            raw_decimals: bits & 1 != 0,
-            bytes_views: bits & 2 != 0,
-            option_words: bits & 4 != 0,
-            raw_ints: bits & 8 != 0,
-            raw_wides: bits & 16 != 0,
-        };
-        let read =
-            ply_compiled::c::Exports::decode(&exports.encode()).expect("the table reads back");
-        assert_eq!(read.layout, exports.layout);
-        assert_eq!(read.ctors, exports.ctors);
-    }
+fn a_units_table_reads_past_what_it_says_of_values_the_runtime_laid_out() {
+    let said = "helpers 0\nctors 2\nNone 0\nm.Pair 2 a000 a001\nconstants 1\nm.table 4\nmodules 3\n\
+                refused 0\nbuiltins 0\nfields 1\nop\nshapes 1\na b\ninstances 1\nm.Box m.area !\n\
+                ints held raw\nentered m.main\n";
+    let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
+    assert_eq!(read.constants, [("m.table".to_string(), 4)]);
+    assert_eq!(read.modules, 3);
+    assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
+    assert_eq!(read.entered, ["m.main"]);
+    assert_eq!(
+        read.encode(),
+        "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nbuiltins 0\nfields 1\nop\n\
+         entered m.main\n"
+    );
 }
 
 /// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
@@ -498,138 +478,33 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     assert!(raised.contains("bound on nested calls"), "{raised}");
 }
 
-/// A unit says each constant with its row of the code table, and what its types' modules state
-/// their values are read through after its pools, where any does.
+/// A unit says each constant with its row of the code table.
 #[test]
-fn a_unit_says_its_constants_slots_and_what_its_types_state() {
-    let with = "helpers 0\nctors 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\n\
-                builtins 0\nfields 0\nshapes 0\n";
+fn a_unit_says_its_constants_slots() {
+    let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\nbuiltins 0\nfields 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
-    assert!(read.instances.is_empty());
     assert_eq!(read.encode(), with);
     assert!(
         ply_compiled::c::Exports::decode(&with.replace("m.table 4", "m.table")).is_none(),
         "a constant with no slot is no row"
     );
-    // `-` for none, `!` for a function the unit does not take.
-    let stating = format!("{with}instances 2\nm.Box m.area !\nm.Date - m.written\n");
-    let read = ply_compiled::c::Exports::decode(&stating).expect("the table reads");
-    assert_eq!(
-        read.instances,
-        vec![
-            ("m.Box".into(), "m.area".to_string(), "!".to_string()),
-            ("m.Date".into(), "-".to_string(), "m.written".to_string()),
-        ]
-    );
-    assert!(read.numerics.is_empty());
-    assert_eq!(read.encode(), stating);
-    // A type that states `numeric` lists its five functions after those two, in the roles' order.
-    let computing = format!("{with}instances 1\nm.N m.held - m.add m.sub m.mul ! m.of\n");
-    let read = ply_compiled::c::Exports::decode(&computing).expect("the table reads");
-    let names = ["m.add", "m.sub", "m.mul", "!", "m.of"].map(str::to_string);
-    assert_eq!(read.numerics, vec![("m.N".into(), names)]);
-    assert_eq!(read.encode(), computing);
-    assert!(
-        ply_compiled::c::Exports::decode(&format!("{with}instances 1\nm.N - - m.add\n")).is_none()
-    );
-}
-
-/// A unit whose constants are its own static data writes no `consts` table, which reads as no
-/// constants; a unit that pools constants writes the table, which reads back as written.
-#[test]
-fn a_units_consts_table_reads_where_it_has_one_and_as_none_where_it_has_not() {
-    let without = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
-                   builtins 0\nfields 0\nshapes 0\n";
-    let read = ply_compiled::c::Exports::decode(without).expect("a table with no consts reads");
-    assert!(read.consts.is_empty());
-    assert_eq!(read.encode(), without);
-    let with = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
-                consts 2\ns 6869\nu\nbuiltins 0\nfields 0\nshapes 0\n";
-    let read = ply_compiled::c::Exports::decode(with).expect("a table with consts reads");
-    assert_eq!(read.consts.len(), 2);
-    assert_eq!(read.encode(), with);
 }
 
 /// A unit entered encoded names each root it is entered at on a line of its own after its tables,
 /// among lines a runtime that does not know them reads as nothing.
 #[test]
 fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
-    let tables = "helpers 0\nctors 0\nconstants 0\nmodules 0\nrefused 0\n\
-                  builtins 0\nfields 0\nshapes 0\n";
-    let said = format!("{tables}ints held raw\nentered m.main\nentered m.run\n");
+    let tables = "helpers 0\nconstants 0\nmodules 0\nrefused 0\nbuiltins 0\nfields 0\n";
+    let said = format!("{tables}entered m.main\nentered m.run\n");
     let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");
     assert_eq!(read.entered, ["m.main", "m.run"]);
-    assert!(read.layout.raw_ints);
     assert_eq!(read.encode(), said);
     let unknown = format!("{tables}entered m.main\na line a later unit says\n");
     let read = ply_compiled::c::Exports::decode(&unknown).expect("the table reads");
     assert_eq!(read.entered, ["m.main"]);
     let words = ply_compiled::c::Exports::decode(tables).expect("the table reads");
     assert!(words.entered.is_empty());
-}
-
-/// `N` states its arithmetic: `add`, `sub` and `mul` take two words and `neg` and `of_int` one.
-fn numbered() -> Vec<units::Def> {
-    vec![
-        def("m.held", 1, "  return p0;"),
-        def("m.add", 2, "  (void)p1; return p0;"),
-        def("m.neg", 1, "  return p0;"),
-        def("m.of", 1, "  return p0;"),
-    ]
-}
-
-fn stating(e: &mut ply_compiled::c::Exports, functions: [&str; 5]) {
-    e.ctors = vec![(ply_core::Symbol::new("m.N"), 1, vec![])];
-    e.instances = vec![(
-        ply_core::Symbol::new("m.N"),
-        "m.held".to_string(),
-        "-".to_string(),
-    )];
-    e.numerics = vec![(ply_core::Symbol::new("m.N"), functions.map(str::to_string))];
-}
-
-/// An operator at a type that states `numeric` calls the function the unit lists for it with as
-/// many words as the operation takes, so a unit that lists one of another arity is not loaded.
-#[test]
-fn a_unit_listing_arithmetic_of_another_arity_is_refused_by_the_function_it_names() {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some(loaded) = units::opened(dir.path(), &numbered(), |e| {
-        stating(e, ["m.add", "m.add", "m.add", "m.neg", "m.of"])
-    }) else {
-        return;
-    };
-    loaded.expect("a unit stating its arithmetic at the words each takes loads");
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some(loaded) = units::opened(dir.path(), &numbered(), |e| {
-        stating(e, ["m.neg", "m.add", "m.add", "m.neg", "m.of"])
-    }) else {
-        return;
-    };
-    let refused = loaded
-        .err()
-        .expect("an `add` that takes one word was bound");
-    assert!(refused.contains("`m.neg`"), "{refused}");
-}
-
-/// A stated `key` or `show` is called with the value alone, so a unit that states one taking more
-/// words is not loaded.
-#[test]
-fn a_unit_stating_a_function_of_more_than_the_value_is_refused() {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let defs = [def("m.scaled", 2, "  (void)p1; return p0;")];
-    let Some(loaded) = units::opened(dir.path(), &defs, |e| {
-        e.ctors = vec![(ply_core::Symbol::new("m.Box"), 1, vec![])];
-        e.instances = vec![(
-            ply_core::Symbol::new("m.Box"),
-            "m.scaled".to_string(),
-            "-".to_string(),
-        )];
-    }) else {
-        return;
-    };
-    let refused = loaded.err().expect("a key that takes two words was bound");
-    assert!(refused.contains("`m.scaled`"), "{refused}");
 }
 
 /// `m.double`, compiled and opened as a program's unit entered through `m.double#entered`.

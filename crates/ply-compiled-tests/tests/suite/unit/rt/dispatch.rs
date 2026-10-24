@@ -25,7 +25,7 @@ const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: &mut Ctx, n: Word) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, BOX) };
-    unsafe { *(w as *mut Word).add(2) = n };
+    unsafe { *(w as *mut Word).byte_add(HEADER) = n };
     w
 }
 
@@ -48,7 +48,7 @@ unsafe extern "C" fn box_dec(ctx: *mut Ctx, w: Word) -> Word {
 
 unsafe extern "C" fn box_lower(ctx: *mut Ctx, w: Word) -> Word {
     let out: unsafe extern "C" fn(*mut Ctx, Word) = helper(&builtin_helper_name("?out_int"));
-    unsafe { out(ctx, *(w as *const Word).add(2)) };
+    unsafe { out(ctx, *(w as *const Word).byte_add(HEADER)) };
     0
 }
 
@@ -226,7 +226,7 @@ unsafe extern "C" fn acquire(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Wor
 /// Takes what was acquired and lets it go; answers 7, or unwinds where it was acquired as 6.
 unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let held = unsafe { *args };
-    let n = unsafe { *(held as *const Word).add(2) };
+    let n = unsafe { *(held as *const Word).byte_add(HEADER) };
     unsafe { box_dec(ctx, held) };
     if n == 6 {
         unsafe { (*ctx).failed = FAILED_UNWIND };
@@ -237,14 +237,14 @@ unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
 
 unsafe extern "C" fn cleanup(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let held = unsafe { *args };
-    CLEANED.with(|c| c.set(unsafe { *(held as *const Word).add(2) }));
+    CLEANED.with(|c| c.set(unsafe { *(held as *const Word).byte_add(HEADER) }));
     unsafe { box_dec(ctx, held) };
     0
 }
 
 fn closure(ctx: &mut Ctx, d: &'static PlyFnDesc) -> Word {
     let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, CLOSURE) };
-    unsafe { *(w as *mut *const PlyFnDesc).add(2) = d };
+    unsafe { *(w as *mut *const PlyFnDesc).byte_add(HEADER) = d };
     w
 }
 

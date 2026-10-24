@@ -6,7 +6,7 @@
 import emit.code (Code, NLit, NUnary)
 import syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes, LEmbedded,
                         LDec, LUnit, LBad)
-import check.types (Type, TyVar, TyCon, TyRecord, TyNominal, Field, named_type, spelled_type)
+import check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type, spelled_type)
 import emit.typing (unknown_type)
 import syntax.parsing (Span)
 import emit.c (Width, width_named, lit_int, is_bitop)
@@ -22,7 +22,7 @@ import emit.lower.setting (declared_at, prelude_ctor)
 import emit.lower.held (held_as, typed_convention, width_held)
 import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
                         pair_words, continued, type_of, handed, noted, set_join, joined,
-                        short_circuit, as_words)
+                        short_circuit, unsettled)
 import emit.lower.data (constructed_as, field)
 import emit.lower.crossing (through_runtime, blake3_of, scalar_encoding, concatenated)
 import emit.roots (builtin_helper)
@@ -65,7 +65,8 @@ pub fn operand(cx: Context, op: Bytes, rhs: Code) -> Option<Arg> =
   match divisor(op, rhs) { Some(d) -> Some(AInt(d)), None -> None }
 
 /// `op` over `o`: `!` over a `Bool`, `-` and `~` at the type `o` holds, C's own over a scalar a
-/// register holds and the runtime's over any other word, a declared sum's negation its witness's.
+/// register holds, a declared sum's negation its witness's; over a type variable's value, what only
+/// a specialisation computes.
 pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
   if op == b"not" {
     let b = handed(o, RBool, at);
@@ -73,7 +74,6 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
   } else if op != b"neg" && op != b"bitnot" { refuse(o.st, Scalars, b"an operator: ".concat(op)) }
   else {
     let ty = type_of(o.arg);
-    let helper = if op == b"neg" { b"rt_negate_p" } else { b"rt_bitnot_p" };
     if ty == unknown_type() {
       refuse(o.st, Scalars, b"an operator over an operand of no known type: ".concat(op))
     } else {
@@ -82,10 +82,10 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
         CWidth(w) -> alone(cx, o, op, width_held(w), ty, at),
         CFloat -> if op == b"neg" { alone(cx, o, op, RFloat, ty, at) } else { lacking(o.st, op) },
         CDec -> if op == b"neg" { alone(cx, o, op, RDec, ty, at) } else { lacking(o.st, op) },
-        CWord(t) -> by_runtime(cx, needing(o.st, t, false), helper, [], [o.arg], ty, at),
-        CSum(t) -> if op != b"neg" { lacking(o.st, op) }
-        else if numeric_sum(cx.setting.ctors, t) { stated(cx, o.st, op, [o.arg], [t], t, at) }
-        else { by_runtime(cx, needing(o.st, t, false), helper, [], [o.arg], ty, at) },
+        CWord(t) -> unsettled(needing(o.st, t, true), ty, held_as(cx.setting, ty), [o.arg], at),
+        CSum(t) -> if op == b"neg" && numeric_sum(cx.setting.ctors, t) {
+          stated(cx, o.st, op, [o.arg], [t], t, at)
+        } else { lacking(o.st, op) },
         _ -> lacking(o.st, op),
       }
     }
@@ -174,10 +174,61 @@ fn classed(
           at,
         )
       } else { ranked(cx, l, r, op, ty, at) },
-      CWord(t) -> ranked(cx, l, r, op, t, at),
+      CWord(t) -> if eq && is_secret(t) { secrets_equal(l, r, op, at) }
+      else { ranked(cx, l, r, op, t, at) },
       CRecord(_) -> lacking(r.st, op),
     }
   }
+}
+
+fn is_secret(ty: Type) -> Bool = match ty { TyCon(c) -> c.name == b"Secret", _ -> false }
+
+fn is_function(ty: Type) -> Bool = match ty { TyFn(_) -> true, _ -> false }
+
+/// `==` or `!=` of two functions: the run fails there, answering no truth.
+fn functions_compared(st: Lowering, at: Span) -> Lowered = {
+  let failed = bound_as(
+    st,
+    named_type(b"Int"),
+    RInt,
+    Native({
+      name: b"builtin_elaborated_functions_compared_p",
+      args: [],
+      uses: { takes: [], owned: true, fails: true, stops: false },
+    }),
+    at,
+  );
+  bound_as(
+    failed.st,
+    named_type(b"Bool"),
+    RBool,
+    Prim({ op: b"ne", on: RInt, args: [failed.arg, AInt(0)] }),
+    at,
+  )
+}
+
+/// `l == r` or `l != r` of two secrets, which the runtime compares in constant time, borrowing both.
+fn secrets_equal(l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
+  let a = handed({ st: r.st, arg: l.arg }, RWord, at);
+  let b = handed({ st: a.st, arg: r.arg }, RWord, at);
+  let same = bound_as(
+    b.st,
+    named_type(b"Int"),
+    RInt,
+    Native({
+      name: b"builtin_elaborated_secret_equal_p",
+      args: [a.arg, b.arg],
+      uses: { takes: [false, false], owned: true, fails: true, stops: false },
+    }),
+    at,
+  );
+  bound_as(
+    same.st,
+    named_type(b"Bool"),
+    RBool,
+    Prim({ op: if op == b"eq" { b"ne" } else { b"eq" }, on: RInt, args: [same.arg, AInt(0)] }),
+    at,
+  )
 }
 
 /// Whether `a` and `b`, records of fields `fs`, are equal: field by field in order, a field of no
@@ -503,60 +554,6 @@ fn over(
   bound(cx, b.st, answer, Prim({ op: op, on: on, args: [a.arg, b.arg] }), at)
 }
 
-/// `l == r` or `l != r` by the runtime over the operands' words, as the evaluator compares two
-/// values; any other operator no such type has. A type variable's operands note what a
-/// specialisation reads.
-fn words(cx: Context, l: Lowered, r: Lowered, op: Bytes, ty: Type, at: Span) -> Lowered = {
-  if op != b"eq" && op != b"ne" { lacking(r.st, op) } else {
-    let st = needing(r.st, ty, true);
-    let a = handed({ st: st, arg: l.arg }, RWord, at);
-    let b = handed({ st: a.st, arg: r.arg }, RWord, at);
-    let e = bound(
-      cx,
-      b.st,
-      named_type(b"Bool"),
-      Native({
-        name: b"rt_equal_p",
-        args: [a.arg, b.arg],
-        uses: { takes: [false, false], owned: false, fails: true, stops: false },
-      }),
-      at,
-    );
-    if op == b"ne" { negation(cx, e, at) } else { e }
-  }
-}
-
-/// Runtime function `name` over `lead`, then `args` each made a word it takes, its answer a word
-/// held as a value of `ty` is.
-fn by_runtime(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  lead: List<Arg>,
-  args: List<Arg>,
-  ty: Type,
-  at: Span,
-) -> Lowered = {
-  let ws = as_words(st, args, at);
-  let w = bound_as(
-    ws.st,
-    ty,
-    RWord,
-    Native({
-      name: name,
-      args: lead.concat(ws.args),
-      uses: {
-        takes: lead.map(|_: Arg| false).concat(ws.args.map(|_: Arg| true)),
-        owned: true,
-        fails: true,
-        stops: false,
-      },
-    }),
-    at,
-  );
-  handed(w, held_as(cx.setting, ty), at)
-}
-
 /// `==`, or `!=`, through the root `key` names, which takes both operands as values of `ty` and
 /// answers their equality.
 fn equal_by(
@@ -585,10 +582,16 @@ pub fn stated(
 ) -> Lowered = rooted(cx, st, keys::written(Stated(op), ty, cx.setting.module), args, types, ty, at)
 
 /// `l op r` over two values of `ty`: an order's comparison read off the sign of the order a root
-/// written for the type answers; any other operator by the runtime over their words.
+/// written for the type answers; where none is, `==` and `!=` of functions fail the run, as no
+/// function has equality, and at any other type are what only a specialisation computes; no other
+/// operator is the type's.
 fn ranked(cx: Context, l: Lowered, r: Lowered, op: Bytes, ty: Type, at: Span) -> Lowered =
   match if comparison(op) { by_root(cx, r.st, ty, l.arg, r.arg, at) } else { None } {
-    None -> words(cx, l, r, op, ty, at),
+    None -> if op != b"eq" && op != b"ne" { lacking(r.st, op) }
+    else if is_function(ty) { functions_compared(r.st, at) } else {
+      let truth = named_type(b"Bool");
+      unsettled(needing(r.st, ty, true), truth, held_as(cx.setting, truth), [l.arg, r.arg], at)
+    },
     Some(o) -> {
       let s = bound(
         cx,

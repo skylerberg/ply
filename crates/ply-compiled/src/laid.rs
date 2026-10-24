@@ -1,13 +1,10 @@
-//! Where a list's and a map's parts lie, for the code the emitter writes over them in place, and
-//! where the fields of the context and of the descriptors emitted code lays out lie: what the
-//! runtime's description reports, each fact read off the constant or the type the runtime's own
-//! code uses.
+//! Where the fields of the context and of the descriptors emitted code lays out lie, and where a
+//! hold keeps what it holds: what the runtime's description reports, each read off the constant or
+//! the type the runtime's own code uses.
 
 use crate::emitted::{PlyFnDesc, PlyOp, PlyType};
 use crate::frames::PlyFrame;
-use crate::heap::{KIND_BRANCH, KIND_LEAF, KIND_MBRANCH, KIND_MLEAF};
 use crate::rt::Ctx;
-use crate::{list, map};
 use std::mem::{offset_of, size_of};
 
 /// A field of a struct emitted code and the runtime both lay out: where it lies in the struct and
@@ -76,59 +73,8 @@ pub fn descriptors() -> [Described; 4] {
     ]
 }
 
-/// A fact of a layout: a number (a word's place, a kind, a width), or the header field a count is
-/// held in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Fact {
-    Number(usize),
-    Field(&'static str),
-}
-
 /// Where a hold keeps what it holds, as `compiler.emit.layout`'s `HoldLaid` names it: the payload
 /// word `held`, 0 once the hold has let go.
-pub fn hold() -> Vec<(&'static str, Fact)> {
-    vec![("held", Fact::Number(crate::rt::HOLD_HELD))]
-}
-
-/// Each object the emitter writes code over in place, with its facts, under the names
-/// `compiler.emit.layout`'s `Layouts` gives them.
-pub fn layouts() -> [(&'static str, Vec<(&'static str, Fact)>); 4] {
-    use Fact::{Field, Number};
-    [
-        (
-            "list",
-            vec![
-                ("root", Number(list::ROOT)),
-                ("tail", Number(list::TAIL)),
-                ("start", Field(list::START.name())),
-                ("tail_len", Field(list::TAIL_LEN.name())),
-                ("room", Field(list::ROOM.name())),
-            ],
-        ),
-        (
-            "trie",
-            vec![
-                ("leaf", Number(KIND_LEAF.into())),
-                ("branch", Number(KIND_BRANCH.into())),
-                ("width", Number(list::WIDTH)),
-            ],
-        ),
-        (
-            "map",
-            vec![
-                ("root", Number(map::ROOT)),
-                ("height", Field(map::HEIGHT.name())),
-            ],
-        ),
-        (
-            "tree",
-            vec![
-                ("leaf", Number(KIND_MLEAF.into())),
-                ("branch", Number(KIND_MBRANCH.into())),
-                ("width", Number(map::WIDTH)),
-                ("keys", Number(map::KEYS)),
-                ("sizes", Number(map::SIZES)),
-            ],
-        ),
-    ]
+pub fn hold() -> Vec<(&'static str, usize)> {
+    vec![("held", crate::rt::HOLD_HELD)]
 }

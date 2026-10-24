@@ -142,12 +142,15 @@ pub const HOLD_HELD: usize = CLOSURE_CAPTURES;
 /// `()`, or a `None` held as one pointer).
 const HOLD_LET_GO: usize = CLOSURE_CAPTURES + 2;
 
+/// The payload bytes of a hold's block.
+pub(crate) const HOLD_BYTES: usize = 8 * (3 + CLOSURE_CAPTURES);
+
 /// A hold, as a closure no call enters: what it holds in its first capture, emptied once it has let
 /// go; `id`, its number in the entry, in its second, which names it to the scheduler; and in its
 /// third whether it has let go, as one made with nothing held has, so a second release or a read
 /// after is refused. A continuation resumed twice shares it.
 pub(crate) fn hold_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word {
-    let o = heap.alloc(KIND_CLOSURE, 0, (3 + CLOSURE_CAPTURES) as u32, 0);
+    let o = heap.raw_alloc(HOLD_BYTES);
     unsafe {
         set_word(o, CLOSURE_CODE, rt_hold_entry as *const () as usize as Word);
         set_word(o, HOLD_HELD, held.unwrap_or(0));
@@ -162,11 +165,10 @@ pub(crate) fn hold_let_go(o: *mut heap::Obj) -> bool {
     heap::imm_value(unsafe { word_at(o, HOLD_LET_GO) }) != 0
 }
 
-/// The object a hold is, where `w` is one.
+/// The block a hold is, where `w` is one: its first word names the entry no call enters.
 pub(super) fn hold_object(w: Word) -> Option<*mut heap::Obj> {
     let entry = rt_hold_entry as *const () as usize as Word;
-    (heap::kind(w) == KIND_CLOSURE && unsafe { word_at(obj(w), CLOSURE_CODE) } == entry)
-        .then(|| obj(w))
+    (heap::is_object(w) && unsafe { word_at(obj(w), CLOSURE_CODE) } == entry).then(|| obj(w))
 }
 
 /// A hold's number in its entry, where `w` is a hold.

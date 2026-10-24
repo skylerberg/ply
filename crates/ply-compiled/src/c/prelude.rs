@@ -49,24 +49,13 @@ static int memcmp(const void *x, const void *y, size_t n) {
 
 typedef int64_t Word;
 
-/* `crates/ply-compiled/src/heap.rs`'s `Obj`, which is `#[repr(C, align(8))]`. */
+/* `crates/ply-compiled/src/heap.rs`'s `Obj`, a block's header: its count, in a word of its own. */
 typedef struct {
   uint32_t rc;
-  uint8_t kind;
-  uint8_t flags;
-  uint16_t aux;
-  uint32_t len;
-  uint32_t layout;
+  uint32_t unused;
 } PlyObj;
 
-#define PLY_HEADER 16
-#define PLY_FLAT 1
-#define PLY_MIXED 2
-#define PLY_RAW 4
-#define PLY_VIEW 8
-#define PLY_KIND_FLOAT 16
-#define PLY_KIND_FIXED 18
-#define PLY_KIND_COLUMNS 20
+#define PLY_HEADER 8
 
 /* `Ctx`, whose first eight fields compiled code reads and writes directly. The rest is opaque: a
    pointer to it is all the runtime's helpers want. The two bounds are separate counters: `fuel` is
@@ -88,10 +77,6 @@ typedef struct {
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
-/* `byte_of_int`'s answer for each byte: an immortal object the unit's tail lays out once. */
-typedef struct { PlyObj h; unsigned char b[8]; } PlyOneByte;
-extern const PlyOneByte ply_one_bytes[256];
-static inline Word ply_one_byte(PlyCtx *ctx, int64_t b) { (void)ctx; return (Word)(intptr_t)&ply_one_bytes[b]; }
 /* Held in the word itself: an `Int` (low bit set) or a `Char` (low bits `010`, its code point
    above them). An object's address is a multiple of eight. */
 static inline int ply_is_imm(Word w) { return (w & 7) != 0; }
@@ -143,10 +128,9 @@ static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) {
 }
 #endif
 
-/* A `Float` is an object of kind `PLY_KIND_FLOAT` whose one payload word is its bits. */
+/* A `Float`'s bits, as a word holds them. */
 static inline double ply_f64(int64_t bits) { union { int64_t i; double d; } u; u.i = bits; return u.d; }
 static inline int64_t ply_f64_bits(double d) { union { int64_t i; double d; } u; u.d = d; return u.i; }
-static inline int ply_is_float(Word w) { return w != 0 && !ply_is_imm(w) && ply_obj(w)->kind == PLY_KIND_FLOAT; }
 
 /* A `Decimal` in registers: the two words of its object, as `rust_decimal` serializes it. */
 typedef struct { Word lo, hi; } PlyDec;
@@ -169,20 +153,6 @@ static inline int64_t ply_wide_order(PlyWide a, PlyWide b, int s) {
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
-
-/* A string's or bytes value's first byte: its own, or for a view the one its value holds where the
-   view begins. */
-static inline unsigned char *ply_bytes(Word w) {
-  return (ply_obj(w)->flags & PLY_VIEW)
-    ? (unsigned char *)ply_words(ply_words(w)[0]) + ply_words(w)[1]
-    : (unsigned char *)ply_words(w);
-}
-
-/* An array's length: its words a stride at a time where it holds its elements in place. */
-static inline int64_t ply_array_len(Word w) {
-  PlyObj *o = ply_obj(w);
-  return o->aux ? (int64_t)(o->len / o->aux) : (int64_t)o->len;
-}
 "#;
 
 /// A runtime helper the emitted C may call: arguments past the context, whether it answers, and
@@ -332,7 +302,6 @@ macro_rules! helpers {
 }
 
 helpers! {
-    rt_dec(w);
     rt_box_decimal(lo, hi) -> Word;
     rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
     rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
@@ -341,27 +310,20 @@ helpers! {
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
     rt_wide_binary(op, t, a, b) -> Word;
-    rt_negate(a) -> Word;
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
     rt_by_zero(what);
     rt_not_an_int(value);
     rt_not_that_width(which, value);
-    rt_equal(a, b) -> Word;
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
-    rt_field(base, index, own) -> Word;
-    rt_record(shape, args: *const Word, n) -> Word;
-    rt_alloc(kind, len, layout, flags) -> Word;
 
     rt_handle_land(depth, value) -> Word;
 
     rt_tick();
     rt_stack_more() -> Word;
-    rt_bitnot(a) -> Word;
     rt_inc_shared(w);
-    rt_dec_shared(w);
     rt_note_update(in_place, copied);
 
     rt_alloc_bytes(bytes) -> Block;
@@ -424,9 +386,9 @@ fn signature(h: &Helper) -> (&'static str, String) {
     (ret, params)
 }
 
-/// What every translation unit of a unit opens with after [`PRELUDE`]: the helper pointers and
-/// singletons declared, and `ply_dec` over them. Declared, not defined, so a unit compiled in
-/// parts binds one table rather than one per part.
+/// What every translation unit of a unit opens with after [`PRELUDE`]: the helper pointers
+/// declared, and `ply_inc` over them. Declared, not defined, so a unit compiled in parts binds one
+/// table rather than one per part.
 pub fn runtime_header() -> String {
     let mut out = String::from("\n/* --- the runtime, declared --- */\n");
     for h in helpers() {
@@ -436,61 +398,28 @@ pub fn runtime_header() -> String {
             pointer_name(h.name)
         ));
     }
-    // Singletons are heap addresses: bound at load, not baked in, or cached objects break.
-    out.push_str("extern Word ply_true, ply_false, ply_unit;\n");
-    // Trap: `rt_dec` frees unconditionally (it is `release_last`); only call it once `rc == 1`.
     // A count with its top bit set is shared (`heap::SHARED`): tcc has no atomics, so the runtime
-    // changes it. One with its top two set is a record's held in place (`heap::EMBEDDED`), which
-    // the record holding it counts for it.
+    // changes it.
     out.push_str(
-        "\nstatic inline PlyObj *ply_counted_by(PlyObj *o) {\n\
-         \x20 uint32_t rc = o->rc;\n\
-         \x20 while (rc >= UINT32_C(0xC0000000) && rc != UINT32_MAX) {\n\
-         \x20   o = (PlyObj *)((Word *)o - (rc & UINT32_C(0x3FFFFFFF)));\n\
-         \x20   rc = o->rc;\n\
-         \x20 }\n\
-         \x20 return o;\n\
-         }\n\
-         \nstatic inline void ply_inc(Word w) {\n\
+        "\nstatic inline void ply_inc(Word w) {\n\
          \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
-         \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
+         \x20 PlyObj *o = ply_obj(w & ~(Word)7);\n\
          \x20 uint32_t rc = o->rc;\n\
          \x20 if (rc < UINT32_C(0x80000000)) o->rc = rc + 1;\n\
          \x20 else if (rc != UINT32_MAX) rt_inc_shared_p(0, (Word)o);\n\
-         }\n\
-         \nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
-         \x20 if ((w & 3) != 0 || (uint64_t)w < 4096) return;\n\
-         \x20 PlyObj *o = ply_counted_by(ply_obj(w & ~(Word)7));\n\
-         \x20 uint32_t rc = o->rc;\n\
-         \x20 if (rc == UINT32_MAX) return;\n\
-         \x20 if (rc >= UINT32_C(0x80000000)) { rt_dec_shared_p(ctx, (Word)o); return; }\n\
-         \x20 if (rc > 1) { o->rc = rc - 1; return; }\n\
-         \x20 rt_dec_p(ctx, (Word)o);\n\
          }\n",
     );
     out
 }
 
-/// The runtime's definitions and the exported binders that fill them, generated from
-/// [`helpers`]; the unit's tail holds them once.
+/// The runtime's definitions and the exported binder that fills them, generated from [`helpers`];
+/// the unit's tail holds them once.
 pub fn runtime_object() -> String {
     let mut out = format!("\n{RUNTIME_MARK}\n");
     for h in helpers() {
         let (ret, params) = signature(h);
         out.push_str(&format!("{ret} (*{})({params});\n", pointer_name(h.name)));
     }
-    out.push_str("Word ply_true, ply_false, ply_unit;\n");
-    out.push_str(
-        "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
-    );
-    out.push_str("const PlyOneByte ply_one_bytes[256] = {\n");
-    for b in 0..256 {
-        out.push_str(&format!(
-            "  {{ {{ .rc = UINT32_MAX, .kind = {}, .len = 1, .layout = 1 }}, {{ {b} }} }},\n",
-            crate::heap::KIND_BYTES
-        ));
-    }
-    out.push_str("};\n");
     out.push_str("\nvoid ply_bind(void **fns) {\n");
     for (i, h) in helpers().iter().enumerate() {
         let (ret, params) = signature(h);
