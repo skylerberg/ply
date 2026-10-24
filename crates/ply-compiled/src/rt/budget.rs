@@ -9,17 +9,10 @@ pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
-/// What a call that would nest past its stack raises: the one bound left is the platform's.
-pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
-    let ctx = unsafe { &mut *ctx };
-    let d = error("this call would nest past what the native stack holds");
-    ctx.fail_with(FAILED_OUT_OF_STACK, d);
-}
-
 /// The prologue's slow path, for a frame below `ctx.stack_floor`: makes room below the floor of the
-/// stack it runs on and lowers the floor to match. Answers 1, or 0 with the context failed as
-/// [`rt_no_stack`] fails it, on a thread's own stack, whose floor is final, on a runtime stack whose
-/// reservation is spent, and on a stack the runtime does not know.
+/// stack it runs on and lowers the floor to match. Answers 1, or 0 with the context failed for a
+/// call nesting past what the native stack holds, on a thread's own stack, whose floor is final, on
+/// a runtime stack whose reservation is spent, and on a stack the runtime does not know.
 pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
@@ -35,20 +28,9 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
         c.stack_floor = stack_floor();
         return 1;
     }
-    unsafe { rt_no_stack(ctx) };
+    let d = error("this call would nest past what the native stack holds");
+    c.fail_with(FAILED_OUT_OF_STACK, d);
     0
-}
-
-/// The slow path of the prologue an earlier emitter writes, which re-enters the call through
-/// `entry` with its arguments at `args`, both still held by the caller's frame: room is made as
-/// [`rt_stack_more`] makes it, and the call made again on the same stack.
-pub unsafe extern "C" fn rt_grow(ctx: *mut Ctx, entry: i64, args: i64) -> i64 {
-    if unsafe { rt_stack_more(ctx) } == 0 {
-        return 0;
-    }
-    // SAFETY: the emitter passes the address of a compiled function's own `(ctx, args)` entry.
-    let entry = unsafe { std::mem::transmute::<usize, Entry>(entry as usize) };
-    unsafe { entry(ctx, args as usize as *const i64) }
 }
 
 /// [`switch`] between two computations, each nesting on a stack of its own: returns when something

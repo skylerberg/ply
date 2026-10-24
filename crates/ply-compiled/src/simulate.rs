@@ -1,15 +1,14 @@
 //! `simulate` and production regions in the C backend: each task runs on its own stack and
 //! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`. What the
-//! tasks pass each other is the release's code's values, read from its words, or emitted code's,
-//! kept with their types; emitted code's arguments cross in through its operation's types, and
+//! tasks pass each other is read as values or kept with their types; emitted code's arguments cross in through its operation's types, and
 //! what it is answered is written as PLV1 and lifted through them.
 
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
 use crate::heap::{self, Word};
 use crate::rt::{
     Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, Lifted,
-    call_value, drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values, lowering_of,
-    no_stack_to_take, raise_error, released, running, switch_keeping, values_taken,
+    drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values, lowering_of,
+    no_stack_to_take, raise_error, released, running, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::codec::{self, Reader, Writer, tag};
@@ -22,16 +21,14 @@ use ply_core::sim::{
     Access, Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness,
     signature,
 };
-use ply_core::{Diagnostic, Fields, Mode, SimId, Span, Symbol, Unbound, Value, codes};
+use ply_core::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 /// A value a region's tasks pass each other, as its scheduler holds it: copied for each task that
 /// hears it, and let go when the region lets it go.
 pub(crate) struct Item(Option<Passed>);
 
-/// What an [`Item`] is: a value the release's code passed, read from its word, or one emitted code
-/// passed, kept with its type.
+/// What an [`Item`] is: a value read from what a task passed, or what it passed kept with its type.
 pub(crate) enum Passed {
     Value(Value),
     Carried(Carried),
@@ -68,8 +65,8 @@ impl Drop for Item {
     }
 }
 
-/// The word compiled code holds `item` as, which takes it: the release's code's made of its value,
-/// emitted code's the word it handed the region.
+/// The word compiled code holds `item` as, which takes it: a value's made of it, a kept one's the
+/// word it was handed the region as.
 pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
     match item.take() {
         Passed::Value(v) => c.word(&v),
@@ -77,42 +74,21 @@ pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
     }
 }
 
-/// A task's body before it starts.
-pub(crate) enum Body {
-    /// A closure the release's code made.
-    Word(Word),
-    /// A closure block emitted code made, beside the type of what it answers.
-    Block(Block, &'static PlyType),
-}
+/// A task's body before it starts: a closure block, beside the type of what it answers.
+pub(crate) struct Body(pub(crate) Block, pub(crate) &'static PlyType);
 
 impl Body {
     pub(crate) fn release(self, ctx: *mut Ctx) {
-        match self {
-            Body::Word(f) => heap::dec(f),
-            Body::Block(f, _) => unsafe { f.let_go_function(ctx) },
-        }
+        unsafe { self.0.let_go_function(ctx) }
     }
 
     /// Calls the body, letting go of it: what it answered, or `None` where its task failed.
     fn run(self, ctx: *mut Ctx) -> Option<Item> {
-        match self {
-            Body::Word(f) => {
-                let r = call_value(ctx, f, &[]);
-                heap::dec(f);
-                let c = unsafe { &mut *ctx };
-                (c.failed == 0).then(|| {
-                    let v = c.value(r);
-                    heap::dec(r);
-                    Item::value(v)
-                })
-            }
-            Body::Block(f, ty) => {
-                let r = unsafe { f.call(ctx, &[]) };
-                unsafe { f.let_go_function(ctx) };
-                (unsafe { (*ctx).failed } == 0)
-                    .then(|| Item::carried(unsafe { Carried::new(Handed::of(r), ty) }))
-            }
-        }
+        let Body(f, ty) = self;
+        let r = unsafe { f.call(ctx, &[]) };
+        unsafe { f.let_go_function(ctx) };
+        (unsafe { (*ctx).failed } == 0)
+            .then(|| Item::carried(unsafe { Carried::new(Handed::of(r), ty) }))
     }
 }
 
@@ -121,7 +97,7 @@ pub struct Simulation {
     handlers: Handlers,
     /// Alongside the scheduler's tasks; a production region drops a task's once it finishes.
     tasks: BTreeMap<TaskId, TaskStack>,
-    /// The stack [`rt_simulate`] was called on, which the loop runs on.
+    /// The stack [`rt_region`](crate::rt::rt_region) was called on, which the loop runs on.
     scheduler_sp: usize,
     running: Option<TaskId>,
     request: Option<(TaskId, Request)>,
@@ -304,8 +280,7 @@ extern "C" fn loop_entry(arg: usize) {
 }
 
 /// Once a production root's entry has returned: the loop drains the other tasks, and the region
-/// answers what the root did. `root` is the word the release's code answered, which the region
-/// reads; none for an entry that wrote its answer's encoding itself, of which the region keeps
+/// answers what the root did. `root` is the word the entry answered, which the region reads; none for an entry that wrote its answer's encoding itself, of which the region keeps
 /// nothing.
 pub unsafe fn finish_root(ctx: *mut Ctx, root: Option<Word>) -> Word {
     let c = unsafe { &mut *ctx };
@@ -765,15 +740,14 @@ extern "C" fn task_entry(arg: usize) {
 }
 
 /// A `perform` the region answers: switch to the loop, and return once the task runs again with
-/// what it was answered. `described` is the operation emitted code performed, whose types its
-/// arguments cross in through and its answer is lifted through; none for the release's code,
-/// whose words the region reads and makes.
+/// what it was answered. `described` is the operation performed, whose types its arguments cross in
+/// through and its answer is lifted through.
 pub unsafe fn perform(
     ctx: *mut Ctx,
     effect: &Symbol,
     op: &Symbol,
     args: &[Word],
-    described: Option<&PlyOp>,
+    described: &PlyOp,
 ) -> Word {
     let Some(request) = (unsafe { request_of(ctx, effect, op, args, described) }) else {
         return 0;
@@ -895,7 +869,7 @@ unsafe fn request_of(
     effect: &Symbol,
     op: &Symbol,
     args: &[Word],
-    described: Option<&PlyOp>,
+    described: &PlyOp,
 ) -> Option<Request> {
     let from = unsafe { &*ctx }.current;
     match (effect.as_str(), op.as_str()) {
@@ -970,15 +944,10 @@ fn request(c: &Ctx, effect: &Symbol, op: &Symbol, args: Vec<Arg>) -> Result<Requ
     })
 }
 
-/// The arguments `args` stand for, which this takes: the release's words read as values, emitted
-/// code's lowered through its operation's parameters but those in the place of the operation's own
-/// type parameter, which are kept with their types. `None` with the context failed where one does
-/// not lower.
-unsafe fn taken(ctx: *mut Ctx, args: &[Word], described: Option<&PlyOp>) -> Option<Vec<Arg>> {
-    let Some(op) = described else {
-        let c = unsafe { &mut *ctx };
-        return Some(values_taken(c, args).into_iter().map(Arg::Read).collect());
-    };
+/// The arguments `args` stand for, which this takes: each lowered through its operation's
+/// parameter but those in the place of the operation's own type parameter, which are kept with
+/// their types. `None` with the context failed where one does not lower.
+unsafe fn taken(ctx: *mut Ctx, args: &[Word], op: &PlyOp) -> Option<Vec<Arg>> {
     let mut kept = Vec::with_capacity(args.len());
     let (mut read, mut types) = (Vec::new(), Vec::new());
     for (i, (w, ty)) in args.iter().zip(op.params()).enumerate() {
@@ -1011,15 +980,12 @@ unsafe fn taken(ctx: *mut Ctx, args: &[Word], described: Option<&PlyOp>) -> Opti
         .collect()
 }
 
-/// The body `task.spawn` was handed, which the region takes: emitted code's answering what the
-/// operation's own type parameter is. `None` with the context failed.
-unsafe fn body_of(ctx: *mut Ctx, w: Word, described: Option<&PlyOp>) -> Option<Body> {
-    let Some(op) = described else {
-        return Some(Body::Word(w));
-    };
+/// The body `task.spawn` was handed, which the region takes, answering what the operation's own
+/// type parameter is. `None` with the context failed.
+unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp) -> Option<Body> {
     let f = Block::of(w);
     match op.vars().first() {
-        Some(ty) => Some(Body::Block(f, ty)),
+        Some(ty) => Some(Body(f, ty)),
         None => {
             unsafe { f.let_go_function(ctx) };
             unsafe { &mut *ctx }.fail(err_crossing(
@@ -1032,37 +998,25 @@ unsafe fn body_of(ctx: *mut Ctx, w: Word, described: Option<&PlyOp>) -> Option<B
 
 /// `task.select`'s request: each arm's channel beside what it sends, and whether to wait. Takes
 /// the arguments; `None` with the context failed.
-unsafe fn select_of(ctx: *mut Ctx, args: &[Word], described: Option<&PlyOp>) -> Option<Request> {
-    let c = unsafe { &mut *ctx };
-    let site = c.site();
+unsafe fn select_of(ctx: *mut Ctx, args: &[Word], op: &PlyOp) -> Option<Request> {
+    let site = unsafe { &*ctx }.site();
     let what = "`task.select`";
-    let read = match described {
-        None => {
-            let arms = c.value(args[0]);
-            heap::dec(args[0]);
-            let wait = c.value(args[1]);
-            heap::dec(args[1]);
-            select_arms(&arms, site).and_then(|arms| Ok((arms, wait.as_bool(site, what)?)))
-        }
-        Some(op) => {
-            let params = op.params();
-            let arms = lowering_of(ctx, args[0], params[0]).and_then(|(bytes, beside)| {
-                let arms = arms_read(ctx, &bytes, &beside, site);
-                released(ctx, beside);
-                arms
-            });
-            let wait = lowered_values(ctx, &args[1..2], &params[1..2]);
-            for (w, ty) in args.iter().zip(params) {
-                unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
-            }
-            match (arms, wait) {
-                (Ok(arms), Ok(wait)) => match wait.as_slice() {
-                    [v] => v.as_bool(site, what).map(|wait| (arms, wait)),
-                    _ => Err(err_crossing("`task.select` performed without its `wait`")),
-                },
-                (Err(why), _) | (_, Err(why)) => Err(err_crossing(&why)),
-            }
-        }
+    let params = op.params();
+    let arms = lowering_of(ctx, args[0], params[0]).and_then(|(bytes, beside)| {
+        let arms = arms_read(ctx, &bytes, &beside, site);
+        released(ctx, beside);
+        arms
+    });
+    let wait = lowered_values(ctx, &args[1..2], &params[1..2]);
+    for (w, ty) in args.iter().zip(params) {
+        unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
+    }
+    let read = match (arms, wait) {
+        (Ok(arms), Ok(wait)) => match wait.as_slice() {
+            [v] => v.as_bool(site, what).map(|wait| (arms, wait)),
+            _ => Err(err_crossing("`task.select` performed without its `wait`")),
+        },
+        (Err(why), _) | (_, Err(why)) => Err(err_crossing(&why)),
     };
     let c = unsafe { &mut *ctx };
     match read {
@@ -1072,33 +1026,6 @@ unsafe fn select_of(ctx: *mut Ctx, args: &[Word], described: Option<&PlyOp>) -> 
             None
         }
     }
-}
-
-/// The arms the release's code handed `task.select`: each a channel beside `None` to receive from
-/// it or `Some` of a value to send to it.
-fn select_arms(arms: &Value, span: Span) -> Result<Vec<(ChanHandle, Option<Item>)>, Diagnostic> {
-    let what = "`task.select`";
-    let arm_error =
-        |got: &Value| ply_core::type_error(span, what, "a channel beside what to send on it", got);
-    arms.as_list(span, what)?
-        .iter()
-        .map(|arm| {
-            let Value::Record(fields) = arm else {
-                return Err(arm_error(arm));
-            };
-            let (Some(chan), Some(Value::Ctor { name, args })) =
-                (fields.named("_0"), fields.named("_1"))
-            else {
-                return Err(arm_error(arm));
-            };
-            let send = match (name.as_str(), args.as_slice()) {
-                ("None", []) => None,
-                ("Some", [value]) => Some(Item::value(value.clone())),
-                _ => return Err(arm_error(arm)),
-            };
-            Ok((chan.as_chan(span, what)?, send))
-        })
-        .collect()
 }
 
 /// `task.select`'s arms as emitted code lowers them: a list of pairs, each a channel at `_0`, a
@@ -1162,55 +1089,14 @@ fn handle_at<'b>(r: &mut Reader<&[u8]>, beside: &'b [Beside]) -> Result<&'b Besi
         .ok_or_else(|| format!("handle {at}, which was not kept"))
 }
 
-/// What a task's operation was answered, as the code that performed it holds it: a word the region
-/// makes of the value for the release's code, the reply lifted through the operation's answer for
-/// emitted code.
-unsafe fn heard(ctx: *mut Ctx, reply: Reply<Item>, described: Option<&PlyOp>) -> Word {
+/// What a task's operation was answered, as the code that performed it holds it: the reply lifted
+/// through the operation's answer.
+unsafe fn heard(ctx: *mut Ctx, reply: Reply<Item>, op: &PlyOp) -> Word {
     let c = unsafe { &mut *ctx };
-    let Some(op) = described else {
-        return match reply_value(ctx, reply) {
-            Ok(v) => c.word(&v),
-            Err(why) => c.fail(err_crossing(&why)),
-        };
-    };
     let mut w = Writer::new();
     let mut beside = Vec::new();
     write_reply(c, &mut w, &mut beside, reply);
     lifted_from(ctx, w.finish(), beside, op.answer()).map_or(0, Handed::word)
-}
-
-/// A reply as the release's code reads it: a value.
-fn reply_value(ctx: *mut Ctx, reply: Reply<Item>) -> Result<Value, String> {
-    let item = |i: Item| match i.take() {
-        Passed::Value(v) => Ok(v),
-        Passed::Carried(v) => {
-            v.release(ctx);
-            Err("a value emitted code passed, heard by the release's code".to_string())
-        }
-    };
-    Ok(match reply {
-        Reply::Value(v) => v,
-        Reply::Item(i) => item(i)?,
-        Reply::Maybe(Some(i)) => some(item(i)?),
-        Reply::Maybe(None) | Reply::Chosen(None) => none(),
-        Reply::Chosen(Some((at, got))) => chosen(at, got.map(item).transpose()?),
-    })
-}
-
-fn some(value: Value) -> Value {
-    Value::ctor("Some", vec![value])
-}
-
-/// What a select hears of the arm that went: its index, and what it received or sent.
-fn chosen(at: usize, got: Option<Value>) -> Value {
-    some(Value::Record(Arc::new(Fields::from_unsorted(vec![
-        (Symbol::new("_0"), Value::Int(at as i64)),
-        (Symbol::new("_1"), got.map_or_else(none, some)),
-    ]))))
-}
-
-fn none() -> Value {
-    Value::ctor("None", vec![])
 }
 
 /// `reply` written as emitted code lifts it, `beside` taking each value the bytes cannot hold: a

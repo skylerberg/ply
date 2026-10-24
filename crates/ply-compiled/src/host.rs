@@ -2,7 +2,7 @@
 //! through the machine's checks, in the machine's order.
 
 use crate::emitted::{Carried, Handed, PlyOp};
-use crate::heap::{self, Heap, Walked, Word};
+use crate::heap::Word;
 use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
@@ -55,66 +55,10 @@ pub(crate) fn err_continuation_resumed(
         .note("the rule is conservative: it refuses when any at-most-once host operation happened after the capture, including in another task")
 }
 
-/// The arguments `effect.op` takes, each read as the operation's declaration types it and taken
-/// as [`crate::rt::values_taken`] takes them; `None` when one does not read.
-fn arguments(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]) -> Option<Vec<Value>> {
-    let program = c.program.clone();
-    let declared = program.as_deref().and_then(|program| {
-        let params = &program.check.effects.get(effect)?.ops.get(op)?.params;
-        Some((params.as_slice(), &program.ctor_carries))
-    });
-    let tables = std::sync::Arc::clone(&c.tables);
-    let mut walked = Walked::default();
-    let mut out = Vec::with_capacity(args.len());
-    for (i, w) in args.iter().enumerate() {
-        out.push(
-            match declared.and_then(|(params, ctors)| Some((params.get(i)?, ctors))) {
-                Some((carry, ctors)) => Heap::read(&tables.layouts, *w, carry, ctors, &mut walked),
-                None => Heap::to_value_counted(&tables.layouts, *w, &mut walked),
-            },
-        );
-        heap::dec(*w);
-    }
-    (!walked.unread).then_some(out)
-}
-
-#[cold]
-#[inline(never)]
-fn err_unread_argument(span: Span, operation: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "an argument of `{operation}` holds a word its declared type does not say how to read"
-        ),
-    )
-    .primary(span, "performed here")
-    .note("this is Ply's fault, not the program's")
-}
-
-pub unsafe fn perform(
-    ctx: *mut Ctx,
-    effect: &Symbol,
-    op: &Symbol,
-    resource: Option<&Symbol>,
-    args: &[Word],
-) -> Word {
-    let c = unsafe { &mut *ctx };
-    let span = c.site();
-    let operation = operation_label(effect, op, resource);
-    let Some(values) = arguments(c, effect, op, args) else {
-        return c.fail(err_unread_argument(span, &operation));
-    };
-    match unsafe { serve(ctx, effect, op, resource, values) } {
-        Served::Value(value) => unsafe { &mut *ctx }.word(&value),
-        Served::Word(w) => w,
-    }
-}
-
 /// What the host answered an operation.
 pub(crate) enum Served {
     Value(Value),
-    /// What the production scheduler answered, a word as the release's code lays it out; 0 with
-    /// the context failed where the operation failed.
+    /// 0, with the context failed where the operation failed.
     Word(Word),
 }
 
@@ -194,11 +138,11 @@ pub(crate) unsafe fn schedule(
         let c = unsafe { &mut *ctx };
         return refused.map_or(0, |d| c.fail(d));
     }
-    unsafe { crate::simulate::perform(ctx, effect, op, args, Some(described)) }
+    unsafe { crate::simulate::perform(ctx, effect, op, args, described) }
 }
 
 /// `effect.op` performed on the host with `values`, through the machine's checks in the machine's
-/// order.
+/// order. [`production_scheduled`] operations are [`schedule`]'s.
 pub(crate) unsafe fn serve(
     ctx: *mut Ctx,
     effect: &Symbol,
@@ -215,15 +159,6 @@ pub(crate) unsafe fn serve(
         Ok(bound) => bound,
         Err(d) => return failed(c, d),
     };
-    if production_scheduled(c, effect, op) {
-        let words: Vec<Word> = values.iter().map(|v| c.word(v)).collect();
-        if effect.as_str() == "task"
-            && !unsafe { crate::simulate::open_production(ctx, effect, op) }
-        {
-            return Served::Word(0);
-        }
-        return Served::Word(unsafe { crate::simulate::perform(ctx, effect, op, &words, None) });
-    }
     let atom = bound.atom.clone();
     let declaration = bound.op.clone();
     let handler = Arc::clone(bound.handler);

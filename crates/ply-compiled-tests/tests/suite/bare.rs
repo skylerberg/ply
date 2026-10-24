@@ -32,7 +32,6 @@ pub fn context_calling(builtins: &[&str]) -> Ctx {
 pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
         consts: Vec::new(),
-        const_words: Vec::new(),
         layouts: Layouts::new(Vec::new()),
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
         builtins: (builtins.iter())
@@ -42,12 +41,10 @@ pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -
         memo_costs: (functions.iter())
             .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
             .collect(),
-        lambdas: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         functions,
         immortals: Mutex::new(Heap::persistent()),
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries: Vec::new(),
-        empty_list: 0,
         empty_map: 0,
         memo_values: Mutex::default(),
         memo_words: Mutex::default(),

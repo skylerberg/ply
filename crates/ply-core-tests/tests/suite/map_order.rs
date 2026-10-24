@@ -242,7 +242,7 @@ fn sample_values() -> Vec<Value> {
         ]),
     ];
     out.push(Value::builtin(ply_core::Builtin::Len));
-    out.push(Value::builtin(ply_core::Builtin::Push));
+    out.push(Value::builtin(ply_core::Builtin::MapNew));
     out.push(Value::Record(std::sync::Arc::new(
         [
             (ply_core::Symbol::new("a"), Value::Int(1)),
@@ -304,15 +304,6 @@ fn an_equal_key_keeps_the_key_the_map_holds_and_takes_the_value() {
         eq(&m, &other),
         "two maps that hold one key and one value are not equal"
     );
-}
-
-#[test]
-fn an_update_takes_the_entry_with_the_key_the_map_holds() {
-    let m = map_of(vec![(dec("1.50"), Value::Int(1))]);
-    let (rest, taken) = ply_core::map::take(m, &dec("1.5"), Span::DUMMY).expect("a map");
-    assert!(keys(&rest).is_empty());
-    let (held, v) = taken.expect("the entry");
-    assert_eq!((shape(&held), v), (shape(&dec("1.50")), Value::Int(1)));
 }
 
 #[test]

@@ -1,5 +1,5 @@
-use ply_compiled::heap::{self, Heap, KIND_DEAD, Word, dec, inc, kind, obj};
-use ply_compiled::list::{get, kids, leaf_of, len, root, to_vec, unique_throughout};
+use ply_compiled::heap::{self, Heap, KIND_DEAD, Word, dec, kind, obj};
+use ply_compiled::list::{get, kids, leaf_of, len, root, to_vec};
 
 fn ints(n: usize) -> Vec<Word> {
     (0..n).map(|i| heap::imm(i as i64)).collect()
@@ -59,32 +59,6 @@ fn a_list_s_leaves_are_read_in_order_from_the_one_its_first_item_lies_in() {
     assert_eq!(leaf_of(o, (1984 - 1472) / 32), 0);
     dec(ys);
     dec(xs);
-    h.end();
-}
-
-#[test]
-fn pushing_onto_a_list_held_once_writes_in_place_and_onto_a_shared_one_copies_a_tail() {
-    let mut h = Heap::new();
-    let mut xs = h.list_from(&[]);
-    for i in 0..2000 {
-        let before = xs;
-        xs = h.list_push(xs, heap::imm(i));
-        // A tail that ran out of room moved the list once; every other push stayed.
-        if i >= 32 {
-            assert_eq!(xs, before, "push {i} moved a list nobody else held");
-        }
-    }
-    assert_eq!(values(xs), (0..2000).collect::<Vec<_>>());
-    inc(xs);
-    let ys = h.list_push(xs, heap::imm(2000));
-    assert_ne!(ys, xs);
-    assert_eq!(len(obj(xs)), 2000);
-    assert_eq!(len(obj(ys)), 2001);
-    assert_eq!(heap::as_int(get(obj(ys), 2000)), Some(2000));
-    assert_eq!(heap::as_int(get(obj(ys), 1999)), Some(1999));
-    assert!(!unique_throughout(ys), "the trie is shared with `xs`");
-    dec(xs);
-    assert!(unique_throughout(ys), "`xs` gone, the trie is `ys`'s alone");
     h.end();
 }
 

@@ -8,11 +8,6 @@ pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
     ctx.heap.release_last(w);
 }
 
-/// Perceus's `reset`, as [`heap::reset`].
-pub unsafe extern "C" fn rt_reset(_ctx: *mut Ctx, w: i64) -> i64 {
-    heap::reset(w)
-}
-
 pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.heap.boxed_int(v)
@@ -24,17 +19,6 @@ pub unsafe extern "C" fn rt_unbox_int(ctx: *mut Ctx, w: i64) -> i64 {
         None => {
             let ctx = unsafe { &mut *ctx };
             let d = error(format!("an `Int` operation on a {}", ctx.type_name(w)));
-            ctx.fail(d)
-        }
-    }
-}
-
-pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
-    match heap::as_bool(w) {
-        Some(b) => i64::from(b),
-        None => {
-            let ctx = unsafe { &mut *ctx };
-            let d = error(format!("a condition of type {}", ctx.type_name(w)));
             ctx.fail(d)
         }
     }
@@ -293,42 +277,6 @@ pub unsafe extern "C" fn rt_decimal_negate(_ctx: *mut Ctx, lo: i64, hi: i64, out
     unsafe { write_decimal(out, -decimal_of(lo, hi)) }
 }
 
-/// Field `k`, in its records' shape's order, of record `i` of `Columns` `xs`, held once more: a
-/// scalar boxed and a record in place the address of its header there. What is not a columnar
-/// value's in-range record is read through `Columns::get`, which raises as it does. Borrows `xs`.
-pub unsafe extern "C" fn rt_columns_field(ctx: *mut Ctx, xs: i64, i: i64, k: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let tables = Arc::clone(&c.tables);
-    let k = k as usize;
-    if heap::kind(xs) == KIND_COLUMNS
-        && let Some(at) = usize::try_from(i)
-            .ok()
-            .filter(|at| *at < columns::len(obj(xs)))
-    {
-        return array::element(
-            &mut c.heap,
-            &tables.layouts,
-            columns::column(obj(xs), k),
-            at,
-        );
-    }
-    heap::inc(xs);
-    let index = c.heap.boxed_int(i);
-    let r = builtin(c, Builtin::ColumnsGet, &[xs, index]);
-    if c.failed != 0 {
-        return 0;
-    }
-    let o = obj(r);
-    let shape = unsafe { (*o).layout };
-    let (at, slot) = (
-        tables.layouts.shape_offsets(shape)[k],
-        tables.layouts.shape_slots(shape)[k],
-    );
-    let w = heap::field_word(&mut c.heap, &tables.layouts, o, at, slot);
-    heap::dec(r);
-    w
-}
-
 /// A divisor `/` and `%` raise on rather than overflow.
 pub(super) fn is_zero(v: &Value) -> bool {
     match v {
@@ -358,12 +306,6 @@ pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64
             }
         }
     }
-}
-
-/// A literal: the unit's immortal word for it, built once at load.
-pub unsafe extern "C" fn rt_lit(ctx: *mut Ctx, index: i64) -> i64 {
-    let ctx = unsafe { &*ctx };
-    ctx.tables.const_words[index as usize]
 }
 
 /// A `match` whose arms did not cover the value.
@@ -600,20 +542,6 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let (l, r) = (ctx.value(a), ctx.value(b));
     match values_equal(&l, &r, Span::DUMMY) {
         Ok(eq) => i64::from(eq),
-        Err(d) => ctx.fail(d),
-    }
-}
-
-/// Whether `lo <= v <= hi` as `<=` orders the three, for a range pattern over a width the words do
-/// not carry. Reads all three.
-pub unsafe extern "C" fn rt_between(ctx: *mut Ctx, v: i64, lo: i64, hi: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let (x, l, h) = (ctx.value(v), ctx.value(lo), ctx.value(hi));
-    let le = |a: &Value, b: &Value| {
-        ply_core::strict_binary(BinOp::Le, a, b, Span::DUMMY, Span::DUMMY, Span::DUMMY)
-    };
-    match le(&l, &x).and_then(|low| Ok((low, le(&x, &h)?))) {
-        Ok(both) => i64::from(matches!(both, (Value::Bool(true), Value::Bool(true)))),
         Err(d) => ctx.fail(d),
     }
 }

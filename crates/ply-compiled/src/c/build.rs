@@ -225,7 +225,6 @@ fn finish(
     }
     tables.layouts.state_numeric(stated);
     tables.memo = functions.iter().map(|_| AtomicI64::new(0)).collect();
-    tables.lambdas = functions.iter().map(|_| AtomicI64::new(0)).collect();
     tables.memo_costs = functions
         .iter()
         .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
@@ -261,10 +260,6 @@ fn bind(unit: &Descriptor, helpers: &[*mut c_void]) {
 fn tables_of(mut unit: UnitTables) -> Tables {
     unit.layouts.index_fields(&unit.fields);
     let mut immortals = Heap::persistent();
-    let mut const_words = Vec::with_capacity(unit.consts.len());
-    for v in &unit.consts {
-        const_words.push(immortals.immortal(&unit.layouts, v));
-    }
     let mut nullaries = Vec::with_capacity(unit.layouts.ctors.len());
     for (index, (_, arity)) in unit.layouts.ctors.iter().enumerate() {
         let w = if *arity == 0 {
@@ -276,24 +271,19 @@ fn tables_of(mut unit: UnitTables) -> Tables {
         };
         nullaries.push(w);
     }
-    let empty_list = immortals.list_from(&[]);
-    mark_immortal(empty_list);
     let empty_map = immortals.map_new();
     mark_immortal(empty_map);
     Tables {
         consts: unit.consts,
-        const_words,
         layouts: unit.layouts,
         fields: unit.fields,
         builtins: unit.builtins,
         functions: Vec::new(),
         memo: Default::default(),
         memo_costs: Default::default(),
-        lambdas: Default::default(),
         immortals: std::sync::Mutex::new(immortals),
         bytes: std::array::from_fn(|_| AtomicI64::new(0)),
         nullaries,
-        empty_list,
         empty_map,
         memo_values: Default::default(),
         memo_words: Default::default(),

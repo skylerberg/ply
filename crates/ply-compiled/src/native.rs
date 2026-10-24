@@ -8,7 +8,7 @@ use crate::rt::Ctx;
 /// in one machine word.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Machine {
-    /// A uniform word, as the release's code holds every value.
+    /// A uniform word, which holds a value of any type.
     Word,
     /// The address of uniform words.
     Words,

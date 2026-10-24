@@ -1,126 +1,51 @@
-//! Closures, handlers, `perform`, `simulate` and `parallel`.
+//! Handlers, `perform`, `simulate` and `parallel`.
 
 use super::*;
-use crate::parallel::Branches;
 use crate::simulate::Body;
 
-/// A closure of compiled function `index` over `env`, its leading arguments. Takes the captures.
-pub unsafe extern "C" fn rt_closure(
-    ctx: *mut Ctx,
-    index: i64,
-    arity: i64,
-    env: *const i64,
-    n: i64,
-) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let code = ctx.tables.functions[index as usize];
-    let env = args_of(env, n);
-    let o = ctx.heap.alloc(
-        KIND_CLOSURE,
-        0,
-        (env.len() + CLOSURE_CAPTURES) as u32,
-        arity as u32,
-    );
-    unsafe {
-        set_word(o, CLOSURE_CODE, code as Word);
-        for (i, w) in env.iter().enumerate() {
-            set_word(o, CLOSURE_CAPTURES + i, *w);
-        }
-    }
-    o as Word
-}
-
-/// The closure over function `index` that captures nothing, taking `arity` arguments: made once
-/// in the unit's immortal heap, so a body that hands it on allocates nothing and counts nothing.
-/// `desc`, where it is not zero, is the immediate word of the function's descriptor, which a call
-/// by type reads.
-pub unsafe extern "C" fn rt_lambda_value(ctx: *mut Ctx, index: i64, arity: i64, desc: i64) -> i64 {
-    let tables = Arc::clone(&unsafe { &*ctx }.tables);
-    let slot = &tables.lambdas[index as usize];
-    let made = slot.load(Acquire);
-    if made != 0 {
-        return made;
-    }
-    let held = usize::from(desc != 0);
-    let o = lock(&tables.immortals).alloc(
-        KIND_CLOSURE,
-        if desc != 0 { CLOSURE_DESCRIBED } else { 0 },
-        (held + CLOSURE_CAPTURES) as u32,
-        arity as u32,
-    );
-    unsafe {
-        set_word(o, CLOSURE_CODE, tables.functions[index as usize] as Word);
-        if desc != 0 {
-            set_word(o, CLOSURE_CAPTURES, desc as Word);
-        }
-    }
-    heap::mark_immortal(o as Word);
-    // Two threads making it at once keep one each, and the unit's heap holds both.
-    match slot.compare_exchange(0, o as i64, AcqRel, Acquire) {
-        Ok(_) => o as i64,
-        Err(first) => first,
-    }
-}
-
-/// Installs a handler and answers its depth; the clause closures and `ret` are taken until it pops.
-pub unsafe extern "C" fn rt_handle_push(
-    ctx: *mut Ctx,
-    clauses: *const i64,
-    n: i64,
-    ret: i64,
-) -> i64 {
-    unsafe { pushed(ctx, clauses, n, ret, false) }
-}
-
-/// [`rt_handle_push`] of a `handle` emitted code wrote, whose clauses and `return` clause, which
-/// is 0 where it has none, are closures it made.
+/// Installs a handler and answers its depth: the clause closures and `ret`, the `return` clause or
+/// 0 where it has none, are taken until it pops.
 pub unsafe extern "C" fn rt_handle_install(
     ctx: *mut Ctx,
     clauses: *const Word,
     n: I64,
     ret: Handed,
 ) -> I64 {
-    I64(unsafe { pushed(ctx, clauses, n.0, ret.word(), true) })
-}
-
-unsafe fn pushed(ctx: *mut Ctx, clauses: *const Word, n: i64, ret: Word, emitted: bool) -> i64 {
     let c = unsafe { &mut *ctx };
-    let clauses = clauses_of(c, clauses, n, emitted);
+    let clauses = clauses_of(c, clauses, n.0);
     let fuel = c.fuel;
     let handler = c.next_handler();
     let frames = c.frames();
     frames.push(HandlerFrame {
         clauses,
-        ret,
-        emitted,
+        ret: ret.word(),
         simulate: false,
         detached: None,
         fuel,
         handler,
         vars: None,
     });
-    (frames.len() - 1) as i64
+    I64((frames.len() - 1) as i64)
 }
 
 /// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
-/// as field-table indices, the closure, its `resumes`, and whether it binds the label. Emitted
-/// code's sixth word is the `String` type where the clause binds its label or answers
-/// `abort.raise`, and 0 otherwise.
-pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64, emitted: bool) -> Vec<FrameClause> {
+/// as field-table indices, the closure, its `resumes`, and the `String` type where the clause
+/// binds its label or answers `abort.raise`, 0 otherwise.
+pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
     let words = args_of(clauses, n * 6);
     let name = |i: i64| c.tables.fields[i as usize].clone();
     words
         .chunks(6)
         .map(|w| {
             let (effect, op) = (name(w[0]), name(w[2]));
-            let raise = emitted && is_abort(effect.as_str(), op.as_str());
+            let raise = is_abort(effect.as_str(), op.as_str());
+            let string = (w[5] != 0).then(|| unsafe { &*(w[5] as *const PlyType) });
             FrameClause {
                 resource: (w[1] >= 0).then(|| name(w[1])),
                 closure: w[3],
                 resumes: w[4] as u8,
-                binds_label: w[5] != 0 && !raise,
-                emitted,
-                string: (emitted && w[5] != 0).then(|| unsafe { &*(w[5] as *const PlyType) }),
+                label: string.filter(|_| !raise),
+                string,
                 effect,
                 op,
             }
@@ -128,33 +53,15 @@ pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64, emitted: bool) ->
         .collect()
 }
 
-/// The label a clause written `[*t]` reads: a `String` the runtime makes for the release's code,
-/// lifted through the `String` type the `handle` site handed for emitted code; 0 with the context
-/// failed where it does not lift.
-fn label_word(ctx: *mut Ctx, string: Option<&'static PlyType>, label: &Symbol) -> Word {
+/// The label a clause written `[*t]` reads, lifted through the `String` type its `handle` site
+/// handed; 0 with the context failed where it does not lift.
+fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
     let label = Value::Str(Arc::from(label.as_str()));
-    match string {
-        Some(ty) => lifted(ctx, &label, ty).map_or(0, Handed::word),
-        None => unsafe { &mut *ctx }.word(&label),
-    }
+    lifted(ctx, &label, string).map_or(0, Handed::word)
 }
 
 /// A `handle` whose clause resumes off the tail: `body`, a nullary closure, runs on its own stack.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_handle_detached(
-    ctx: *mut Ctx,
-    clauses: *const i64,
-    n: i64,
-    ret: i64,
-    body: i64,
-) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let clauses = clauses_of(c, clauses, n, false);
-    unsafe { crate::detached::open(ctx, clauses, ret, body, false) }
-}
-
-/// [`rt_handle_detached`] of a `handle` emitted code wrote, whose clauses, `return` clause (0 for
-/// none) and body are closures it made.
+/// The clauses, `return` clause (0 for none) and body are taken.
 pub unsafe extern "C" fn rt_handle_install_detached(
     ctx: *mut Ctx,
     clauses: *const Word,
@@ -163,13 +70,13 @@ pub unsafe extern "C" fn rt_handle_install_detached(
     body: Block,
 ) -> Handed {
     let c = unsafe { &mut *ctx };
-    let clauses = clauses_of(c, clauses, n.0, true);
+    let clauses = clauses_of(c, clauses, n.0);
     let body = unsafe { std::mem::transmute::<Block, Word>(body) };
-    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, true) })
+    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body) })
 }
 
-/// The `k` a clause emitted code made is handed where it resumes on the tail: one immortal block
-/// holding nothing but its descriptor, since a tail resumption only records its value.
+/// The `k` a clause is handed where it resumes on the tail: one immortal block holding nothing but
+/// its descriptor, since a tail resumption only records its value.
 #[repr(C)]
 struct ResumeBlock {
     header: heap::Obj,
@@ -212,17 +119,9 @@ unsafe extern "C" fn resumes_here_only(_ctx: *mut Ctx, _k: Word) -> Word {
     0
 }
 
-/// The `k` a tail-resuming clause emitted code made is handed.
-fn resume_token_emitted() -> Word {
+/// The `k` a tail-resuming clause is handed.
+fn resume_token() -> Word {
     &raw const RESUME as Word
-}
-
-/// The `k` a `resume`-binding clause gets: a tail call records the value for `rt_perform`.
-pub(crate) unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let v = unsafe { *args.add(1) };
-    c.resumed = Some(v);
-    v
 }
 
 pub(super) fn hide_above(
@@ -248,52 +147,6 @@ pub(super) fn restore_hidden(c: &mut Ctx, hidden: Vec<(usize, Vec<HandlerFrame>)
     }
 }
 
-pub(super) fn resume_token(c: &mut Ctx, stack: usize, depth: usize) -> Word {
-    closure_of(
-        c,
-        rt_resume_entry as *const () as usize,
-        &[((stack << 32) | depth) as i64],
-    )
-}
-
-/// A unary closure over immediate captures whose entry is a runtime function.
-pub(crate) fn closure_of(c: &mut Ctx, entry: usize, captures: &[i64]) -> Word {
-    let o = c.heap.alloc(
-        KIND_CLOSURE,
-        0,
-        (captures.len() + CLOSURE_CAPTURES) as u32,
-        1,
-    );
-    unsafe {
-        set_word(o, CLOSURE_CODE, entry as Word);
-        for (i, capture) in captures.iter().enumerate() {
-            set_word(o, CLOSURE_CAPTURES + i, heap::imm(*capture));
-        }
-    }
-    o as Word
-}
-
-/// Records the atom; then the innermost frame with a clause answers, with frames from its own
-/// up set aside. A `resume`-binding clause that never resumes unwinds to its `handle`.
-pub unsafe extern "C" fn rt_perform(
-    ctx: *mut Ctx,
-    effect: i64,
-    op: i64,
-    resource: i64,
-    mode: i64,
-    args: *const i64,
-    n: i64,
-) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let effect = c.tables.fields[effect as usize].clone();
-    let op = c.tables.fields[op as usize].clone();
-    let args = args_of(args, n);
-    if mode == MODE_RAISE || is_abort(effect.as_str(), op.as_str()) {
-        return raise_from_perform(c, &effect, &op, Raised::Words(args.to_vec()));
-    }
-    unsafe { performed(ctx, effect, op, resource, mode, args, None) }
-}
-
 /// `perform` of the operation `op` describes, at the perform's types, `args` holding a word form
 /// for each of its parameters, which this takes. A clause, a region's scheduler or a detached body
 /// takes the words as they are; the host is handed what they lower to through the parameters'
@@ -317,18 +170,12 @@ pub unsafe extern "C" fn rt_dispatch(
             .zip(described.params())
             .map(|(w, ty)| unsafe { Carried::new(Handed::of(*w), *ty) })
             .collect();
-        return Handed::of(raise_from_perform(
-            c,
-            &effect,
-            &name,
-            Raised::Carried(carried),
-        ));
+        return Handed::of(raise_from_perform(c, &effect, &name, Raised(carried)));
     }
-    Handed::of(unsafe { performed(ctx, effect, name, resource.0, mode.0, args, Some(described)) })
+    Handed::of(unsafe { performed(ctx, effect, name, resource.0, mode.0, args, described) })
 }
 
-/// [`rt_perform`] past a raise, its arguments crossing to the host through `described` where the
-/// perform passed one.
+/// [`rt_dispatch`] past a raise.
 unsafe fn performed(
     ctx: *mut Ctx,
     effect: Symbol,
@@ -336,7 +183,7 @@ unsafe fn performed(
     resource: i64,
     mode: i64,
     args: &[Word],
-    described: Option<&PlyOp>,
+    described: &PlyOp,
 ) -> i64 {
     let c = unsafe { &mut *ctx };
     let n = args.len() as i64;
@@ -382,32 +229,24 @@ unsafe fn performed(
                         inherited_off_tail = true;
                         break 'search;
                     };
-                    let (closure, emitted, again) = (cl.closure, cl.emitted, cl.again());
+                    let (closure, again) = (cl.closure, cl.again());
                     let mut bound: Vec<Word> = args_of(args, n).to_vec();
-                    if cl.binds_label
-                        && let Some(label) = &resource
-                    {
-                        bound.push(label_word(ctx, cl.string, label));
+                    if let (Some(string), Some(label)) = (cl.label, &resource) {
+                        bound.push(label_word(ctx, string, label));
                     }
                     // Moved in: a local owning memory across the switch is freed once per restore.
                     return unsafe {
                         crate::detached::stop(
                             ctx,
                             id,
-                            (closure, emitted),
+                            closure,
                             bound,
                             again,
                             (effect, op, resource),
                         )
                     };
                 }
-                found = Some((
-                    stack,
-                    i,
-                    (cl.closure, cl.emitted),
-                    cl.resumes != 0,
-                    cl.binds_label.then_some(cl.string),
-                ));
+                found = Some((stack, i, cl.closure, cl.resumes != 0, cl.label));
                 break 'search;
             }
         }
@@ -430,7 +269,7 @@ unsafe fn performed(
         );
         return c.fail(d);
     }
-    let Some((stack, depth, (closure, emitted), resumes, label)) = found else {
+    let Some((stack, depth, closure, resumes, label)) = found else {
         // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_core::sim::TASK_OPS.contains(&op.as_str())
@@ -440,12 +279,15 @@ unsafe fn performed(
                 crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
             };
         }
-        let args = args_of(args, n);
-        return match described {
-            None => unsafe { crate::host::perform(ctx, &effect, &op, resource.as_ref(), args) },
-            Some(described) => unsafe {
-                to_host(ctx, described, &effect, &op, resource.as_ref(), args)
-            },
+        return unsafe {
+            to_host(
+                ctx,
+                described,
+                &effect,
+                &op,
+                resource.as_ref(),
+                args_of(args, n),
+            )
         };
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
@@ -458,16 +300,11 @@ unsafe fn performed(
     let held = c.stacks[stack].list[depth].held();
     let hidden = hide_above(c, stack, depth);
     if resumes {
-        let k = if emitted {
-            resume_token_emitted()
-        } else {
-            resume_token(c, stack, depth)
-        };
-        call_args.push(k);
+        call_args.push(resume_token());
         c.resumed = None;
     }
     let here = c.keep(Kept::Hidden(hidden));
-    let r = call_clause(ctx, closure, emitted, call_args, held);
+    let r = call_clause(ctx, closure, call_args, held);
     let c = unsafe { &mut *ctx };
     let Kept::Hidden(hidden) = c.kept_back(here) else {
         unreachable!("a clause's call keeps the frames it hid");
@@ -519,31 +356,22 @@ unsafe fn to_host(
         }
     };
     let served = unsafe { crate::host::serve(ctx, effect, op, resource, values) };
-    answered(ctx, served, Some(described))
+    answered(ctx, served, described)
 }
 
-/// What a perform is answered: a value as the word compiled code holds it, lifted through
-/// `described`'s answer where the perform passed one; a word the scheduler made as it is.
-fn answered(ctx: *mut Ctx, served: Served, described: Option<&PlyOp>) -> i64 {
-    match (served, described) {
-        (Served::Word(w), _) => w,
-        (Served::Value(v), None) => unsafe { &mut *ctx }.word(&v),
-        (Served::Value(v), Some(described)) => {
-            lifted(ctx, &v, described.answer()).map_or(0, Handed::word)
-        }
+/// What a perform is answered: a value lifted through `described`'s answer, or 0 with the context
+/// failed.
+fn answered(ctx: *mut Ctx, served: Served, described: &PlyOp) -> i64 {
+    match served {
+        Served::Word(w) => w,
+        Served::Value(v) => lifted(ctx, &v, described.answer()).map_or(0, Handed::word),
     }
 }
 
-/// What a raise carries, as values a diagnostic shows: the release's words read as their layouts
-/// say, carried values lowered through their types.
+/// What a raise carries, as values a diagnostic shows, lowered through their types.
 fn raised_values(c: &mut Ctx, args: &Raised) -> Vec<Result<Value, String>> {
-    match args {
-        Raised::Words(ws) => ws.iter().map(|w| Ok(c.value(*w))).collect(),
-        Raised::Carried(vs) => {
-            let ctx: *mut Ctx = c;
-            vs.iter().map(|v| v.lower(ctx)).collect()
-        }
-    }
+    let ctx: *mut Ctx = c;
+    args.0.iter().map(|v| v.lower(ctx)).collect()
 }
 
 /// A raise, which no clause answers where it is performed: the frame whose clause does is unwound
@@ -594,17 +422,11 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
     }
 }
 
-/// `simulate { body }`: runs the nullary `body` as a region's root task on this stack.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
-    unsafe { region(ctx, Body::Word(body)) }
-}
-
-/// [`rt_simulate`] of a `simulate` emitted code wrote: `body` is a closure block, which this takes,
+/// A `simulate` region emitted code wrote: `body` is a closure block, which this takes,
 /// and `answer` the type of what it answers, through which the region holds its answer until it
 /// hands it back.
 pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, answer: *const PlyType) -> Handed {
-    Handed::of(unsafe { region(ctx, Body::Block(body, &*answer)) })
+    Handed::of(unsafe { region(ctx, Body(body, &*answer)) })
 }
 
 unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
@@ -669,7 +491,7 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         let held = f.held();
         drop_frame(f);
         // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
-        let r = call_clause(ctx, clause.closure, clause.emitted, a.args.handed(), held);
+        let r = call_clause(ctx, clause.closure, a.args.handed(), held);
         clause.release();
         return r;
     }
@@ -698,9 +520,9 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         drop_frame(f);
         return value;
     }
-    let (ret, emitted, held) = (f.ret, f.emitted, f.held());
+    let (ret, held) = (f.ret, f.held());
     let here = c.keep(Kept::Landing(f));
-    let r = Ctx::holding(ctx, held, || call_fun(ctx, emitted, ret, &[value]));
+    let r = Ctx::holding(ctx, held, || call_fun(ctx, ret, &[value]));
     let c = unsafe { &mut *ctx };
     c.kept_back(here).release();
     r
@@ -746,32 +568,6 @@ pub unsafe extern "C" fn rt_handler_put(ctx: *mut Ctx, i: I64, x: Handed) {
     }
 }
 
-/// A builtin used as a value, which a call through it answers as a named call would.
-pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let b = ctx.tables.builtins[index as usize];
-    ctx.heap.bridge(Value::builtin(b))
-}
-
-/// The singleton a nullary constructor *is*, and `0` for any other constructor.
-pub unsafe extern "C" fn rt_nullary(ctx: *mut Ctx, index: i64) -> i64 {
-    unsafe { &*ctx }.nullary(index as u32)
-}
-
-/// A constructor named as a value: the singleton a nullary one is, and a function otherwise.
-pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let (name, arity) = &ctx.tables.layouts.ctors[index as usize];
-    if *arity == 0 {
-        return ctx.nullary(index as u32);
-    }
-    let (name, arity) = (name.clone(), *arity);
-    ctx.heap.bridge(Value::Closure(Arc::new(Closure {
-        name: Some(name.clone()),
-        kind: ClosureKind::Ctor { name, arity },
-    })))
-}
-
 /// One more holder of a shared object, for compiled code, which has no atomics of its own.
 pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
     heap::inc_shared(w);
@@ -782,38 +578,18 @@ pub unsafe extern "C" fn rt_dec_shared(_ctx: *mut Ctx, w: i64) {
     heap::dec_shared(w);
 }
 
-/// `parallel { .. }`: the `n` nullary closures at `slots`, each answer written over its closure.
-pub unsafe extern "C" fn rt_parallel(ctx: *mut Ctx, slots: i64, n: i64) {
-    let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
-    let slots = slots as usize as *mut Word;
-    unsafe { crate::parallel::run(ctx, slots, n as usize, allowed, Branches::Words) }
-}
-
-/// A `parallel` block whose site knows what its branches may perform: `reach` holds `count` pairs
-/// of field-table indices, an effect and its resource (negative for any).
-pub unsafe extern "C" fn rt_parallel_past(
-    ctx: *mut Ctx,
-    slots: i64,
-    n: i64,
-    reach: *const i64,
-    count: i64,
-) {
-    let allowed = unsafe { reaching(ctx, reach, count) };
-    let slots = slots as usize as *mut Word;
-    unsafe { crate::parallel::run(ctx, slots, n as usize, allowed, Branches::Words) }
-}
-
-/// [`rt_parallel`] of a `parallel` emitted code wrote: the `n` slots at `slots` hold closure blocks,
-/// which this takes, and each branch's answer is written over its closure uncounted. Where the
-/// block fails, a branch that failed or never ran leaves 0, and one that answered its answer, for
-/// emitted code to let go at its type.
+/// `parallel { .. }`: the `n` slots at `slots` hold closure blocks, which this takes, and each
+/// branch's answer is written over its closure uncounted. Where the block fails, a branch that
+/// failed or never ran leaves 0, and one that answered its answer, for emitted code to let go at
+/// its type.
 pub unsafe extern "C" fn rt_branches(ctx: *mut Ctx, slots: *const Handed, n: I64) {
     let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
     let slots = slots.cast::<Word>().cast_mut();
-    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed, Branches::Blocks) }
+    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed) }
 }
 
-/// [`rt_parallel_past`] of a `parallel` emitted code wrote, its slots as [`rt_branches`] takes them.
+/// [`rt_branches`] of a block whose site knows what its branches may perform: `reach` holds `count`
+/// pairs of field-table indices, an effect and its resource (negative for any).
 pub unsafe extern "C" fn rt_branches_past(
     ctx: *mut Ctx,
     slots: *const Handed,
@@ -823,11 +599,11 @@ pub unsafe extern "C" fn rt_branches_past(
 ) {
     let allowed = unsafe { reaching(ctx, reach, count.0) };
     let slots = slots.cast::<Word>().cast_mut();
-    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed, Branches::Blocks) }
+    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed) }
 }
 
-/// Whether a `parallel` block's branches may run at once, `reach` holding `count` pairs of
-/// field-table indices of what they may perform, an effect and its resource (negative for any).
+/// Whether a `parallel` block's branches may run at once, `reach` holding what they may perform as
+/// [`rt_branches_past`] takes it.
 unsafe fn reaching(ctx: *mut Ctx, reach: *const i64, count: i64) -> bool {
     let reach: Vec<Reached> = {
         let c = unsafe { &*ctx };

@@ -55,17 +55,13 @@ impl Block {
         unsafe { heap::last_of_shared(o) }
     }
 
-    /// Gives back a runtime handle whose last holder was the caller. A continuation's stop is dropped
-    /// at the next drain of the entry's dead continuations.
+    /// Gives back a runtime handle whose last holder was the caller.
     ///
     /// # Safety
-    /// The block is a live handle the runtime made: a bridge, a hold or a continuation; `ctx` is
-    /// the running entry's.
+    /// The block is a live handle the runtime made, a bridge or a hold; `ctx` is the running
+    /// entry's.
     pub unsafe fn free_handle(self, ctx: *mut Ctx) {
-        unsafe {
-            crate::detached::died(ctx, self.obj());
-            heap::free_handle(self.obj(), &raw mut (*ctx).heap);
-        }
+        unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap) }
     }
 
     /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block keeps its
@@ -186,14 +182,6 @@ pub struct PlyType {
 
 // SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.
 unsafe impl Sync for PlyType {}
-
-impl PlyType {
-    /// The type's spelling.
-    pub fn spelling(&self) -> &str {
-        let b = unsafe { std::slice::from_raw_parts(self.spelled, self.spelled_len as usize) };
-        std::str::from_utf8(b).unwrap_or("a type")
-    }
-}
 
 /// `op#effect.op@T1..Tk`: an operation at its perform's type arguments, static data emitted code
 /// lays out and hands [`crate::rt::rt_dispatch`], through whose types the runtime crosses what the
