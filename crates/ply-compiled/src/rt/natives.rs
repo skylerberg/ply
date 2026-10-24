@@ -178,6 +178,56 @@ pub(super) fn hold_new(c: &mut Ctx, held: Word) -> Word {
     hold_word(&mut c.heap, Some(held), c.holds_made)
 }
 
+/// A hold of `held`, which it takes.
+pub unsafe extern "C" fn rt_hold_made(ctx: *mut Ctx, held: Handed) -> crate::emitted::Handle {
+    let c = unsafe { &mut *ctx };
+    crate::emitted::Handle::of(hold_new(c, held.word()))
+}
+
+/// What the lent hold `h` holds, lent from it: whoever reads it counts it as its type does. Fails
+/// the entry where the hold has let go.
+pub unsafe extern "C" fn rt_hold_read(ctx: *mut Ctx, h: crate::emitted::Handle) -> Handed {
+    let c = unsafe { &mut *ctx };
+    Handed::of(held_in(c, &h, Mode::Read).map_or(0, |o| unsafe { word_at(o, HOLD_HELD) }))
+}
+
+/// What the lent hold `h` holds, taken out of it, which lets it go. Fails the entry where the hold
+/// has let go already.
+pub unsafe extern "C" fn rt_hold_taken(ctx: *mut Ctx, h: crate::emitted::Handle) -> Handed {
+    let c = unsafe { &mut *ctx };
+    Handed::of(held_in(c, &h, Mode::Write).map_or(0, |o| unsafe {
+        let held = word_at(o, HOLD_HELD);
+        set_word(o, HOLD_HELD, 0);
+        set_word(o, HOLD_LET_GO, heap::imm(1));
+        held
+    }))
+}
+
+/// The object of hold `h`, a read of it (`mode`) noted for a simulation; none where it has let go,
+/// or is no hold, which fails the entry.
+fn held_in(c: &mut Ctx, h: &crate::emitted::Handle, mode: Mode) -> Option<*mut heap::Obj> {
+    let Some(o) = hold_object(h.word()) else {
+        c.fail(
+            error("a hold that is no runtime hold").note("this is Ply's fault, not the program's"),
+        );
+        return None;
+    };
+    if !c.sims.is_empty()
+        && let Some(id) = hold_id(h.word())
+    {
+        c.record_access(Access::Hold { id, mode });
+    }
+    if hold_let_go(o) {
+        let site = c.site();
+        c.fail(hold_released(
+            site,
+            if mode == Mode::Read { "read" } else { "let go" },
+        ));
+        return None;
+    }
+    Some(o)
+}
+
 /// The payload word a hold keeps what it holds in, which emitted code reads and empties itself.
 pub const HOLD_HELD: usize = CLOSURE_CAPTURES;
 
