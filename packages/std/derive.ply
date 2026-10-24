@@ -1,0 +1,172 @@
+//! What a deriver reads and answers: `derive d for T`, where `d` names a module binder, is the call
+//! `d::derive(declaration)` that the check makes of the module `d` binds before it reads the rest.
+//!
+//! A deriver is a `pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`
+//! that performs nothing but a raise. It is handed the declarations of the module deriving, as data,
+//! and answers the source of the functions it derives, which are read into that module as if written
+//! there: its imports name what the text names, and the binder in `declaration.binder` names the
+//! deriver's own module. The check enters a deriver as it enters a `const fn`, on a machine of its own
+//! and under the same budget, and keeps its answer under what the deriver's modules hold and the
+//! declaration it read; one that raises fails the derivation.
+
+import std.bin
+import std.list
+import std.string
+
+/// A type's name as the deriving module writes it: `T`, or `m::T` through the binder `m`.
+pub type TypeName = { module: Option<String>, name: String }
+
+/// A type as it is written in a declaration.
+pub type Type =
+  /// One of the declaration's type parameters.
+  | Param(String)
+  /// A named type applied to its arguments, labels and rows, each label and row as it is written:
+  /// `Int`, `List<a>`, `m::Sink<a, [l] | e>`.
+  | Applied(TypeName, List<Type>, List<String>, List<String>)
+  /// A function's parameters, its result and its row as it is written, empty where it writes none.
+  | Function(List<Type>, Type, String)
+  | Record(List<Field>)
+  | Unit
+
+pub type Field = { name: String, ty: Type }
+
+pub type Variant = { name: String, fields: List<Type> }
+
+/// An alias names a type; a `new` record (`Nominal`) and a sum are types of their own; an `extern
+/// type` has nothing a deriver can read.
+pub type Body = | Alias(Type) | Nominal(Type) | Sum(List<Variant>) | Extern
+
+/// A type the module declares, with its type, row and label parameters in order.
+pub type TypeDeclaration = {
+  name: String,
+  public: Bool,
+  types: List<String>,
+  rows: List<String>,
+  labels: List<String>,
+  body: Body,
+}
+
+/// What a deriver reads: the type to derive for, the module deriving and every type it declares, the
+/// binder that module writes the deriver's module by, and every type it derives with this deriver,
+/// the target among them.
+pub type Declaration = {
+  target: String,
+  module: String,
+  binder: String,
+  types: List<TypeDeclaration>,
+  derived: List<String>,
+}
+
+/// Why a type has no derivation: what blocks it, the field or variant of the target that does where
+/// one does, and notes on what to do instead.
+pub type Refused = { message: String, at: Option<String>, notes: List<String> }
+
+derive bin for TypeName
+
+derive bin for Type
+
+derive bin for Field
+
+derive bin for Variant
+
+derive bin for Body
+
+derive bin for TypeDeclaration
+
+derive bin for Declaration
+
+derive bin for Refused
+
+/// The declaration of the type a derivation is for.
+pub fn target(d: Declaration) -> TypeDeclaration / {abort.raise} =
+  match declared(d, d.target) {
+    Some(t) -> t,
+    None -> panic("a declaration whose target the module does not declare: " ++ d.target),
+  }
+
+/// The type the module declares under `name`.
+pub fn declared(d: Declaration, name: String) -> Option<TypeDeclaration> =
+  d.types.find(|t: TypeDeclaration| t.name == name)
+
+/// A type's name as the module writes it.
+pub fn name_text(n: TypeName) -> String =
+  match n.module { Some(m) -> m ++ "::" ++ n.name, None -> n.name }
+
+/// `t` as Ply source.
+pub fn type_text(t: Type) -> String =
+  match t {
+    Param(p) -> p,
+    Applied(n, args, labels, rows) -> name_text(n) ++ angled(args, labels, rows),
+    Function(params, result, row) -> {
+      let head = "(" ++ String::join(params.map(type_text), ", ") ++ ") -> " ++ type_text(result);
+      if row == "" { head } else { head ++ " / " ++ row }
+    },
+    Record(fields) ->
+      "{ " ++ String::join(fields.map(|f: Field| f.name ++ ": " ++ type_text(f.ty)), ", ") ++ " }",
+    Unit -> "()",
+  }
+
+/// The parameters a type is declared over, as its declaration writes them: `<a, [l] | e>`.
+pub fn parameters_text(t: TypeDeclaration) -> String = angled(t.types.map(Param), t.labels, t.rows)
+
+/// `<..>` over arguments, labels in brackets and rows after a bar; nothing where there are none.
+fn angled(args: List<Type>, labels: List<String>, rows: List<String>) -> String = {
+  let front = args.map(type_text).concat(labels.map(|l: String| "[" ++ l ++ "]"));
+  if front.len() == 0 && rows.len() == 0 { "" }
+  else if rows.len() == 0 { "<" ++ String::join(front, ", ") ++ ">" }
+  else if front.len() == 0 { "<| " ++ String::join(rows, ", ") ++ ">" }
+  else { "<" ++ String::join(front, ", ") ++ " | " ++ String::join(rows, ", ") ++ ">" }
+}
+
+/// A declaration as the check hands it to a deriver.
+pub fn declared_of(encoded: Bytes) -> Declaration / {abort.raise} =
+  match bin::decode(encoded, declaration_bin()) {
+    Ok(d) -> d,
+    Err(e) -> panic("a declaration that does not decode: " ++ bin::error_to_string(e)),
+  }
+
+/// A deriver's answer as the check reads it back.
+pub fn answered(answer: Result<String, Refused>) -> Bytes / {abort.raise} =
+  bin::encode(answer, answer_bin())
+
+/// The codec of a deriver's answer.
+pub fn answer_bin() -> bin::BinCodec<Result<String, Refused>> =
+  bin::result_bin(bin::string_bin(), refused_bin())
+
+test "a type is written as the module writes it" {
+  let list = Applied({ module: None, name: "List" }, [Param("a")], [], []);
+  let sink = Applied({ module: Some("m"), name: "Sink" }, [Param("a")], ["l"], ["e"]);
+  assert_eq(type_text(list), "List<a>");
+  assert_eq(type_text(sink), "m::Sink<a, [l] | e>");
+  assert_eq(type_text(Function([list], Unit, "")), "(List<a>) -> ()");
+  assert_eq(
+    type_text(Function([], sink, "{log.write | e}")),
+    "() -> m::Sink<a, [l] | e> / {log.write | e}",
+  );
+  assert_eq(type_text(Record([{ name: "x", ty: Param("a") }])), "{ x: a }");
+  let declared = { name: "T", public: true, types: ["a"], rows: ["e"], labels: [], body: Extern };
+  assert_eq(parameters_text(declared), "<a | e>");
+  assert_eq(parameters_text({ ..declared, types: [], rows: [] }), "")
+}
+
+test "a declaration and an answer cross as their encodings" {
+  let d = {
+    target: "T",
+    module: "m",
+    binder: "derived",
+    types: [
+      {
+        name: "T",
+        public: false,
+        types: [],
+        rows: [],
+        labels: [],
+        body: Sum([{ name: "A", fields: [] }]),
+      },
+    ],
+    derived: ["T"],
+  };
+  assert_eq(declared_of(bin::encode(d, declaration_bin())), d);
+  let refused = Err({ message: "no", at: Some("A"), notes: [] });
+  assert_eq(bin::decode(answered(refused), answer_bin()), Ok(refused))
+}

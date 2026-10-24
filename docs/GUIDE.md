@@ -2999,7 +2999,7 @@ derive json for Line
 | `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 | `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
 
-There are no other derivers (`E0207`). `snake_case` is `std.text`'s, so a
+Any other name is a library deriver (below). `snake_case` is `std.text`'s, so a
 name collision (`HTTPRequest` and `HttpRequest` both give `http_request`) is
 `E0105`. A `derive` must be in the
 module declaring its type (`E0208`). A parameterized type's function takes one
@@ -3066,6 +3066,36 @@ and written through its type's own `json` codec, which the module must import
 with parameters and an empty record have no row (`E0206`), and `row` is no
 constraint a `where` can name (`E0207`). The codec's `fields` are what a check
 holds a statement's columns to where `std.db`'s `fetch` reads rows by it (§16).
+
+A deriver can be a module. `derive d for T`, where `d` names no built-in deriver,
+is the call `d::derive(declaration)` of the module the file binds as `d`, made
+before the rest of the module is read, and its answer is the source of the
+functions it derives, read into the module as if written there:
+
+```ply
+import std.derive.map
+
+pub type Tree<a> = | Leaf(a) | Node(List<Tree<a>>)
+derive map for Tree
+// Tree::map : <a, a_mapped | e>(Tree<a>, a: (a) -> a_mapped / e) -> Tree<a_mapped> / e
+```
+
+A deriver is `pub fn derive(declaration: derive::Declaration) ->
+Result<String, derive::Refused>`, performing nothing but a raise; `std.derive`
+says what a declaration holds. The check enters it as it enters a `const fn`
+(§3.5), on a machine of its own and under the same budget, and keeps its answer
+in the toolchain's cache under the declaration and the texts of the modules the
+deriver reaches, so it runs again only after an edit to one of them. A deriver
+is a shipped module or one of the program's own, and its modules derive nothing
+through a library deriver. A name that is no built-in deriver and no binder in
+scope is `E0207`; a module whose `derive` is no deriver, `E0160`; a refusal,
+`E0206` at the field or variant it names; and a deriver that raises, spends its
+budget or answers anything but functions, `E0155`.
+
+`std.derive.map` writes `T::map` for a sum or a `new` record: the value rebuilt
+with each type parameter's values replaced by what its function answers, the
+functions run in the order the value holds what they read (`ply doc
+std.derive.map`).
 
 ## 12. Builtins
 
@@ -3813,17 +3843,19 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0152` | a tagged literal whose tag's `literal`, or `compile` or `fill` for one with holes, is not what a tagged literal calls |
 | `E0153` | a tagged literal its parser refuses |
 | `E0154` | a tagged literal whose parser raised or spent its budget |
+| `E0155` | a library deriver that raised, spent its budget, or answered anything but functions; or one no load ran |
 | `E0156` | a `const fn` that takes or binds a parameter, writes a row, performs more than a raise, may not return, or answers a value a build cannot keep |
 | `E0157` | a `const fn` that raised when the build evaluated it |
 | `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
 | `E0159` | an import of a module below `std.internal` from outside the toolchain's own modules |
+| `E0160` | a module a `derive` names whose `derive` is no deriver: not the signature, not a module of the program's own or the toolchain's, or one whose modules derive through a library deriver |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
 | `E0204` | not a function |
 | `E0205` | non-exhaustive match |
 | `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
-| `E0207` | unknown deriver |
+| `E0207` | unknown deriver: no built-in one, and no module bound by the name |
 | `E0208` | orphan `derive`, `key` or `show`, or a function of a type another module declares |
 | `E0209` | `/` or `%` where no number has it: `/` on `Decimal`, either on a `numeric` type parameter |
 | `E0210` | operand type nothing determines |
