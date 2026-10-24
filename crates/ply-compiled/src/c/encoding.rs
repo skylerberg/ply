@@ -22,8 +22,7 @@ pub(super) fn encode_pools(builtins: &[Builtin], fields: &[Symbol]) -> String {
     out
 }
 
-/// Inverse of [`encode_pools`]; leaves the cursor after them, and after the record shapes a unit
-/// whose records the runtime laid out lists after them, which no unit's code reads now.
+/// Inverse of [`encode_pools`]; leaves the cursor after them.
 pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
     let mut t = Pools::default();
     let n = count(line(s, at)?, "builtins")?;
@@ -35,30 +34,7 @@ pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
     for _ in 0..n {
         t.fields.push(Symbol::new(line(s, at)?));
     }
-    skipped(s, at, "shapes")?;
     Some(t)
-}
-
-/// Steps past the table `label` where the text opens one here, a row a line.
-pub(super) fn skipped(s: &str, at: &mut usize, label: &str) -> Option<()> {
-    for _ in 0..section(s, at, label)? {
-        line(s, at)?;
-    }
-    Some(())
-}
-
-/// How many rows a table `label` holds where the text opens one here, its line stepped past, and
-/// none where the text holds no such table here.
-pub(super) fn section(s: &str, at: &mut usize, label: &str) -> Option<usize> {
-    let opens = s
-        .get(*at..)?
-        .strip_prefix(label)
-        .is_some_and(|rest| rest.starts_with(' '));
-    if opens {
-        count(line(s, at)?, label)
-    } else {
-        Some(0)
-    }
 }
 
 /// Read one line and step the cursor past it; the text is found by offset, never by a marker.

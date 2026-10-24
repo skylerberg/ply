@@ -12,6 +12,11 @@ pub type Word = i64;
 /// A count no increment or decrement touches: the static data a unit lays out, the memo.
 pub const IMMORTAL: u32 = u32::MAX;
 
+/// The count of a block laid in a C frame, which it never outlives: no increment or decrement
+/// touches it, as none touches an immortal one, but a keep or a copy copies the block, which is no
+/// static data.
+pub const FRAME: u32 = u32::MAX - 1;
+
 /// Set on the count of a block another thread may hold. The count changes atomically, and the
 /// block is never unique, so nothing reuses it in place.
 pub const SHARED: u32 = 1 << 31;

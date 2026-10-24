@@ -2,7 +2,7 @@
 //! bind by name, so a unit serves while the runtime has every helper its C calls.
 
 use super::descriptor::Descriptor;
-use super::encoding::{count, decode_pools, encode_pools, line, skipped};
+use super::encoding::{count, decode_pools, encode_pools, line};
 use super::prelude::helpers;
 use anyhow::{Result, anyhow};
 use ply_core::Symbol;
@@ -152,9 +152,6 @@ impl Exports {
                 answers,
             });
         }
-        // What a unit whose values the runtime laid out lists of its constructors, which no unit's
-        // code reads now.
-        skipped(s, &mut at, "ctors")?;
         let n = count(line(s, &mut at)?, "constants")?;
         let mut constants = Vec::with_capacity(n);
         for _ in 0..n {
@@ -170,9 +167,7 @@ impl Exports {
             refusals.push((function, construct));
         }
         let t = decode_pools(s, &mut at)?;
-        skipped(s, &mut at, "instances")?;
-        // Each root entered, a line each; any other line, as one that says how a unit laid its
-        // values out for the runtime once did, reads as nothing.
+        // Each root entered, a line each; a line a later unit says reads as nothing.
         let mut entered = Vec::new();
         while at < s.len() {
             if let Some(root) = line(s, &mut at)?.strip_prefix(ENTERED) {

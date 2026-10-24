@@ -133,8 +133,8 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
         "PlyCtx.next_tick"
     );
     assert!(PRELUDE.contains("#define PLY_HEADER 8"));
-    assert_eq!(ply_compiled::heap::SHARED, 0x8000_0000, "ply_inc");
-    assert!(ply_compiled::c::runtime_header().contains("rc < UINT32_C(0x80000000)"));
+    assert_eq!(ply_compiled::heap::FRAME, u32::MAX - 1, "PLY_RC_FRAME");
+    assert!(PRELUDE.contains("#define PLY_RC_FRAME (UINT32_MAX - 1)"));
 }
 
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
@@ -154,24 +154,18 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A table a unit whose values the runtime laid out wrote reads as its helpers, constants, pools and
-/// entered roots: the constructors, shapes, instances and layout lines it says besides read as
-/// nothing.
+/// A table reads as a unit writes one: its helpers, constants, modules, refusals, pools and entered
+/// roots, in that order.
 #[test]
-fn a_units_table_reads_past_what_it_says_of_values_the_runtime_laid_out() {
-    let said = "helpers 0\nctors 2\nNone 0\nm.Pair 2 a000 a001\nconstants 1\nm.table 4\nmodules 3\n\
-                refused 0\nbuiltins 0\nfields 1\nop\nshapes 1\na b\ninstances 1\nm.Box m.area !\n\
-                ints held raw\nentered m.main\n";
+fn a_units_table_reads_as_a_unit_writes_it() {
+    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nbuiltins 0\nfields 1\nop\n\
+                entered m.main\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.modules, 3);
     assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.entered, ["m.main"]);
-    assert_eq!(
-        read.encode(),
-        "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nbuiltins 0\nfields 1\nop\n\
-         entered m.main\n"
-    );
+    assert_eq!(read.encode(), said);
 }
 
 /// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
