@@ -333,22 +333,15 @@ macro_rules! helpers {
 
 helpers! {
     rt_dec(w);
-    rt_box_int(v) -> Word;
-    rt_unbox_int(w) -> Word;
-    rt_box_float(bits) -> Word;
-    rt_box_fixed(bits, t) -> Word;
     rt_box_decimal(lo, hi) -> Word;
     rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
     rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
     rt_decimal_negate(lo, hi, out);
     rt_wide_op(code, a_lo, a_hi, b_lo, b_hi, out) -> Word;
-    rt_unbox_float(w) -> Word;
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
-    rt_binary(op, a, b) -> Word;
     rt_wide_binary(op, t, a, b) -> Word;
     rt_negate(a) -> Word;
-    rt_arith(op, a, b) -> Word;
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
@@ -356,14 +349,10 @@ helpers! {
     rt_not_an_int(value);
     rt_not_that_width(which, value);
     rt_equal(a, b) -> Word;
-    rt_concat(a, b) -> Word;
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
     rt_field(base, index, own) -> Word;
     rt_record(shape, args: *const Word, n) -> Word;
-    rt_list_at(value, i) -> Word;
-    rt_list_room(n) -> Word;
-    rt_list_rest(value, from) -> Word;
     rt_alloc(kind, len, layout, flags) -> Word;
 
     rt_handle_land(depth, value) -> Word;
@@ -374,7 +363,6 @@ helpers! {
     rt_inc_shared(w);
     rt_dec_shared(w);
     rt_note_update(in_place, copied);
-    rt_node(kind) -> Word;
 
     rt_alloc_bytes(bytes) -> Block;
     rt_alloc_kept(bytes) -> Block;
@@ -413,22 +401,12 @@ pub fn builtin_helper_name(builtin: &str) -> String {
     }
 }
 
-/// Every helper a unit may bind: the runtime's own, then one a builtin, then one a native over
-/// machine data.
+/// Every helper a unit may bind: the runtime's own, then a native over machine data.
 pub fn helpers() -> &'static [Helper] {
     static ALL: std::sync::OnceLock<Vec<Helper>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
-        let builtins = ply_core::Builtin::all().iter().map(|b| {
-            let signature = crate::rt::signature(*b);
-            Helper {
-                name: Box::leak(builtin_helper_name(b.name()).into_boxed_str()),
-                args: signature.words(),
-                answers: signature.answers(),
-                address: crate::rt::builtin_address(*b),
-            }
-        });
         let machine = machine_natives().iter().map(|n| n.helper);
-        own().into_iter().chain(builtins).chain(machine).collect()
+        own().into_iter().chain(machine).collect()
     })
 }
 

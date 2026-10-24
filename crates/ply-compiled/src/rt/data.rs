@@ -381,41 +381,6 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     ctx.heap.record(&tables.layouts, &fields)
 }
 
-/// An empty list with room in its tail for `n` elements, at most a leaf's: a loop pushing that
-/// many onto it grows it in place.
-pub unsafe extern "C" fn rt_list_room(ctx: *mut Ctx, n: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    ctx.heap
-        .alloc_list(n.clamp(0, crate::list::WIDTH as i64) as u32) as Word
-}
-
-/// One element of a list whose length admits `i`: held once more. Reads.
-pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(value) != KIND_LIST {
-        let d = error("a list pattern bound a value that is not a list");
-        return ctx.fail(d);
-    }
-    let o = obj(value);
-    if i < 0 || i >= list::len(o) as i64 {
-        let d = error("a list pattern read past the end of the list");
-        return ctx.fail(d);
-    }
-    let w = list::get(o, i as usize);
-    heap::inc(w);
-    w
-}
-
-/// What a `..rest` binds: the list from `from` on, sharing the trie. Reads.
-pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(value) != KIND_LIST {
-        let d = error("a list pattern bound a value that is not a list");
-        return ctx.fail(d);
-    }
-    ctx.heap.list_skip(value, from.max(0) as usize)
-}
-
 /// A fresh object of `kind` with `len` words, whose fields the compiled caller stores itself.
 pub unsafe extern "C" fn rt_alloc(
     ctx: *mut Ctx,
@@ -432,22 +397,4 @@ pub unsafe extern "C" fn rt_alloc(
 /// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
 pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
     ply_core::rc::note_update_of(in_place != 0, copied as usize, Span::DUMMY);
-}
-
-/// An empty node of a list's trie or a map's tree, of `kind`, with room for a full one.
-pub unsafe extern "C" fn rt_node(ctx: *mut Ctx, kind: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    match kind as u8 {
-        KIND_MLEAF => ctx.heap.alloc_leaf() as Word,
-        KIND_MBRANCH => ctx.heap.alloc_branch() as Word,
-        kind => ctx.heap.alloc_node(kind, &[]),
-    }
-}
-
-pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> Raising {
-    let ctx = unsafe { &mut *ctx };
-    Raising(match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
-        Some(b) => ctx.tables.byte(b),
-        None => builtin(ctx, Builtin::ByteOfInt, &[n]),
-    })
 }

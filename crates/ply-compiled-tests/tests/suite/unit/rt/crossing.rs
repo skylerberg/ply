@@ -394,7 +394,7 @@ fn a_hold_written_into_a_lowering_reads_as_a_hold() {
     let c: *mut Ctx = &mut ctx;
     let name = b"std.value.VHold";
     unsafe {
-        let hold = native::<A1>("?hold_new")(c, imm(42));
+        let hold = native::<A1>("?hold_made")(c, imm(42));
         called_encoded(c, 0, |c| {
             native::<N2>("?out_count")(c, tag::LIST as Word, 1);
             native::<N1>("?out_handle")(c, hold);

@@ -66,9 +66,9 @@ impl Descriptor {
         self.bind
     }
 
-    /// The unit's `ply_bind_singletons`.
-    pub fn bind_singletons(&self) -> *mut c_void {
-        self.bind_singletons
+    /// The unit's `ply_bind_singletons`, where it lays one out.
+    pub fn bind_singletons(&self) -> Option<*mut c_void> {
+        (!self.bind_singletons.is_null()).then_some(self.bind_singletons)
     }
 
     /// Each compiled function's address, by its position in the unit's code table.

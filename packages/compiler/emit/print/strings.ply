@@ -1,12 +1,11 @@
-//! The operations over the bytes of strings and byte strings printed, every block laid as
-//! `layout.str_laid` says: its bytes from its payload's start, its header's `len` of them, room for
-//! as many as its field `room` holds. Emitted code makes no view; it reads one as the layout lays it.
+//! The operations over the bytes of strings and byte strings printed, every block laid with its head
+//! (`layout.text_head`) and then its bytes: its head's `len` of them, room for its `room`.
 
 import std.bytes (ascii_of_int)
 import syntax.parsing (span_between)
 import check.types (Type, TyCon, spelled_type)
-import emit.layout (str_laid, header_bytes)
-import emit.tir.statics (text_kind, str_kind, bytes_kind)
+import emit.layout (header_bytes, head_field, head_words, text_head, text_bytes)
+import emit.tir.statics (is_text)
 import emit.roots (builtin_helper)
 import emit.pieces (spelled)
 import emit.tir (Rep, RInt, RBool, RNum, RWord, RAddr, Var, Arg, AVar, AInt, Containers, var_said)
@@ -202,7 +201,6 @@ fn grown(
 ) -> Printing / {abort.raise} = {
   let declared = named(pr, v);
   let o = declared.name;
-  let laid = str_laid();
   let d = p.depth;
   let opened = line(
     declared.pr,
@@ -211,23 +209,19 @@ fn grown(
       b"Word ",
       o,
       b"; { int64_t sl = (int64_t)",
-      field(x, b"len"),
+      text_field(x, b"len"),
       b", sn = ",
       n,
       b"; if (ply_obj(",
       x,
-      b")->rc == 1 && !(",
-      field(x, laid.flags),
-      b" & ",
-      ascii_of_int(laid.view),
-      b") && (int64_t)",
-      field(x, laid.room),
+      b")->rc == 1 && (int64_t)",
+      text_field(x, b"room"),
       b" >= sl + sn) { memcpy(",
       bytes_of(x),
       b" + sl, ",
       at_address(src),
       b", (size_t)sn); ",
-      field(x, b"len"),
+      text_field(x, b"len"),
       b" = (uint32_t)(sl + sn); ",
       o,
       b" = ",
@@ -250,7 +244,7 @@ fn grown(
       b"  memcpy(",
       bytes_of(o),
       b", ",
-      read_bytes(x),
+      bytes_of(x),
       b", (size_t)sl); memcpy(",
       bytes_of(o),
       b" + sl, ",
@@ -258,15 +252,14 @@ fn grown(
       b", (size_t)sn); if (",
       call_text(last_fn(), [b"ctx", x]),
       b") ",
-      call_text(free_fn(), [b"ctx", x, block_bytes(x)]),
+      call_text(free_fn(), [b"ctx", x, text_bytes(text_field(x, b"room"))]),
       b"; } }",
     ]),
   )
 }
 
-/// `o`, declared already, set to a fresh block of `len` bytes with room for `room`, of the kind of
-/// the runtime's text a value of `ty` is, which the runtime's functions on text read; unprinted
-/// where `ty` is no text's type.
+/// `o`, declared already, set to a fresh block of `len` bytes with room for `room`; unprinted where
+/// `ty` is no text's type.
 fn fresh(
   p: Place,
   pr: Printing,
@@ -275,54 +268,28 @@ fn fresh(
   len: Bytes,
   room: Bytes,
 ) -> Printing / {abort.raise} =
-  match text_kind(ty) {
-    None -> unprinted(Containers, b"text made at a type no text has", spelled_type(ty)),
-    Some(kind) -> {
-      let laid = str_laid();
-      line(
-        pr,
-        p.depth,
-        Bytes::concat_all([
-          b"{ int64_t sr = ",
-          room,
-          b"; ",
-          o,
-          b" = (Word)rt_alloc_bytes_p(ctx, ",
-          ascii_of_int(header_bytes()),
-          b" + ((sr + 7) & ~(int64_t)7)); ",
-          field(o, b"kind"),
-          b" = ",
-          ascii_of_int(kind),
-          b"; ",
-          field(o, b"len"),
-          b" = (uint32_t)(",
-          len,
-          b"); ",
-          field(o, laid.room),
-          b" = (uint32_t)sr; }",
-        ]),
-      )
-    },
+  if !is_text(ty) { unprinted(Containers, b"text made at a type no text has", spelled_type(ty)) }
+  else {
+    line(
+      pr,
+      p.depth,
+      Bytes::concat_all([
+        b"{ int64_t sr = ",
+        room,
+        b"; ",
+        o,
+        b" = (Word)rt_alloc_bytes_p(ctx, ",
+        text_bytes(b"sr"),
+        b"); ",
+        text_field(o, b"len"),
+        b" = (uint32_t)(",
+        len,
+        b"); ",
+        text_field(o, b"room"),
+        b" = (uint32_t)sr; }",
+      ]),
+    )
   }
-
-/// The bytes of the block `x` as its free reads their size, a view's or its room's, its header
-/// among them.
-fn block_bytes(x: Bytes) -> Bytes = {
-  let laid = str_laid();
-  Bytes::concat_all([
-    b"(",
-    field(x, laid.flags),
-    b" & ",
-    ascii_of_int(laid.view),
-    b" ? ",
-    ascii_of_int(header_bytes() + 8 * laid.view_words),
-    b" : ",
-    ascii_of_int(header_bytes()),
-    b" + (((int64_t)",
-    field(x, laid.room),
-    b" + 7) & ~(int64_t)7))",
-  ])
-}
 
 /// The bytes `n` taken bytes of the context's crossing are copied into, a fresh block, into `v`.
 pub fn taken_printed(p: Place, pr: Printing, v: Var, n: Arg) -> Printing / {abort.raise} = {
@@ -354,44 +321,25 @@ pub fn taken_printed(p: Place, pr: Printing, v: Var, n: Arg) -> Printing / {abor
   )
 }
 
-/// The address of the bytes the block `of` holds, into `v`: its own, or a view's where it views them.
+/// The address of the bytes the block `of` holds, into `v`.
 pub fn payload_printed(p: Place, pr: Printing, v: Var, of: Var) -> Printing =
-  assigned(pr, p.depth, v, c_type(v.rep), b"(Word)(intptr_t)".concat(read_bytes(name_of(pr, of))))
+  assigned(pr, p.depth, v, c_type(v.rep), b"(Word)(intptr_t)".concat(bytes_of(name_of(pr, of))))
 
-/// The first byte of the block `x`, a view's where it views them, as an `unsigned char *`.
-fn read_bytes(x: Bytes) -> Bytes = Bytes::concat_all([payload_fn(), b"(", x, b")"])
-
-/// The head's C function answering the first byte of a string's or a byte string's block, a view's
-/// where it views them, as an `unsigned char *`.
-pub fn payload_fn() -> Bytes = b"ply_payload"
-
-/// `payload_fn`'s definition, over the block as `layout.str_laid` lays it.
-pub fn payload_helper() -> Bytes = {
-  let laid = str_laid();
+/// The bytes of the block `x`, past its head, as an `unsigned char *`.
+pub fn bytes_of(x: Bytes) -> Bytes =
   Bytes::concat_all([
-    b"static inline unsigned char *",
-    payload_fn(),
-    b"(Word x) { return (",
-    field(b"x", laid.flags),
-    b" & ",
-    ascii_of_int(laid.view),
-    b") ? (unsigned char *)ply_words(ply_words(x)[",
-    ascii_of_int(laid.viewed),
-    b"]) + ply_words(x)[",
-    ascii_of_int(laid.from),
-    b"] : ",
-    bytes_of(b"x"),
-    b"; }\n",
+    b"((unsigned char *)&ply_words(",
+    x,
+    b")[",
+    ascii_of_int(head_words(text_head())),
+    b"])",
   ])
-}
-
-/// The payload of the block `x`, which is no view, as an `unsigned char *`.
-fn bytes_of(x: Bytes) -> Bytes = Bytes::concat_all([b"((unsigned char *)ply_words(", x, b"))"])
 
 /// The address an `RAddr` holds, as an `unsigned char *`.
 fn at_address(a: Bytes) -> Bytes = Bytes::concat_all([b"((unsigned char *)(intptr_t)", a, b")"])
 
-fn field(x: Bytes, f: Bytes) -> Bytes = Bytes::concat_all([b"ply_obj(", x, b")->", f])
+/// Field `f` of the head of the string or byte string `x`.
+pub fn text_field(x: Bytes, f: Bytes) -> Bytes = head_field(text_head(), x, f)
 
 /// The C type of what an operation here answers: an integer's, a width's, else a word, an address
 /// among them. `print.made` imports this module, so its `c_type` is not read here.
@@ -441,21 +389,20 @@ fn has(text: Bytes, part: Bytes) -> Bool = text.index_of(part) != None
 fn place(text: Bytes, part: Bytes) -> Int =
   match text.index_of(part) { Some(i) -> i, None -> 0 - 1 }
 
-test "a fresh block takes its header and its room rounded up to a word, and holds its kind, length and room" {
+test "a fresh block takes its header, its head and its room rounded up to a word, and holds its length and room" {
   let made = |ty: Bytes| printed(Made, Some(local(9, ty, RWord)), [AVar(local(0, b"Int", RInt))]);
   let string = made(b"String");
   assert_eq(
     [
-      Bytes::concat_all([b"rt_alloc_bytes_p(ctx, ", ascii_of_int(header_bytes()), b" + "]),
-      b" + 7)",
-      Bytes::concat_all([b"->kind = ", ascii_of_int(str_kind()), b";"]),
-      b"->len = ",
-      Bytes::concat_all([b"->", str_laid().room, b" = "]),
+      Bytes::concat_all([b"rt_alloc_bytes_p(ctx, ", text_bytes(b"sr")]),
+      Bytes::concat_all([b"((", text_head().name, b" *)ply_words("]),
+      b"))->len = ",
+      b"))->room = ",
     ].filter(|part: Bytes| !has(string, part)),
     [],
   );
-  // The runtime's functions on text tell a byte string from a string by its kind.
-  assert(has(made(b"Bytes"), Bytes::concat_all([b"->kind = ", ascii_of_int(bytes_kind())])), None)
+  // A string's block and a byte string's are laid alike: no header field tells them apart.
+  assert_eq(made(b"Bytes"), string)
 }
 
 test "a block grows in place only through its one count and its room, and is let go of by its size else" {
@@ -465,8 +412,7 @@ test "a block grows in place only through its one count and its room, and is let
     AVar(local(2, b"Int", RInt)),
   ]);
   assert(has(grown, b"ply_obj(p0)->rc == 1"), None);
-  assert(has(grown, Bytes::concat_all([b"& ", ascii_of_int(str_laid().view), b")"])), None);
-  assert(has(grown, Bytes::concat_all([b"ply_obj(p0)->", str_laid().room, b" >= "])), None);
+  assert(has(grown, Bytes::concat_all([text_field(b"p0", b"room"), b" >= "])), None);
   // Out of place, the old bytes are copied before the block is let go of.
   let out = match grown.index_of(b"} else {") {
     Some(i) -> grown.slice(i, grown.len()),

@@ -15,24 +15,6 @@ fn every_declared_helper_has_an_address() {
     }
 }
 
-/// A builtin's helper, whose words are read off its function's type, takes as many as its
-/// parameters count, which a call of it through a value is held to, under the name the emitter
-/// writes.
-#[test]
-fn every_builtin_has_a_helper_of_its_own() {
-    for b in ply_core::Builtin::all() {
-        let name = builtin_helper_name(b.name());
-        assert!(
-            name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'),
-            "`{name}` is no C name"
-        );
-        let found: Vec<_> = helpers().iter().filter(|h| h.name == name).collect();
-        assert_eq!(found.len(), 1, "`{name}`");
-        assert_eq!(found[0].args, b.words(), "`{name}`");
-        assert!(found[0].answers, "`{name}`");
-    }
-}
-
 /// What the runtime reports of a native is read off the type of the function it binds: the words
 /// past the context, whether it answers, and whether what it answers may be a raise.
 #[test]

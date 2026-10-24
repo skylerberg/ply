@@ -3,14 +3,13 @@
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyFnDesc, PlyOp, PlyType};
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_ARRAY, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE,
-    KIND_COLUMNS, KIND_CTOR, KIND_LIST, KIND_MAP, KIND_MBRANCH, KIND_MLEAF, KIND_RECORD, KIND_STR,
-    Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word, str_of, word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
+    KIND_RECORD, KIND_STR, Layouts, Stated, Word, bridged, bytes_of, is_unique, obj, set_word,
+    word_at,
 };
 use crate::host::Served;
-use crate::native::{Answered, I64, Native, Raises, Raising, Signature};
+use crate::native::{I64, Native, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
-use crate::{array, columns, list};
 use ply_core::builtins::hold_released;
 use ply_core::region::StepSite;
 use ply_core::sched::Shield;

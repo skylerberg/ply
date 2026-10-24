@@ -6,27 +6,25 @@
 import std.bytes (ascii_of_int)
 import emit.c (int_lit)
 import emit.keys (RootKey, Named)
-import emit.layout (MachineStruct, MachineField, machine_structs)
+import emit.layout (MachineStruct, MachineField, machine_structs, head_structs)
 import emit.print.head (head_part)
 import emit.print.counting (dup_fn, last_fn, inc_shared_fn, dec_shared_last_fn)
-import emit.tir.statics (StaticDef, SBlock, SPlain, SStruct, SFile, StaticWord, WRaw, WAddress,
-                         WEntry, WBytes, WField, WHead, text_block, refused_kind, named, str_kind,
-                         bytes_kind)
+import emit.tir.statics (StaticDef, StaticHead, SBlock, SPlain, SStruct, SFile, StaticWord, WRaw,
+                         WAddress, WEntry, WBytes, WField, WHead, text_block, named)
 
 /// The declaration of static `name` a bucket whose bodies name it writes, before their C takes its
 /// address.
 pub fn static_extern(name: Bytes) -> Bytes =
   Bytes::concat_all([b"extern const struct ", name, b" ", name, b";\n"])
 
-/// The C definition of `def`: a block's header with the immortal count and the refused kind unless
-/// its head names another kind, then its words, each a member of the C type it holds; a machine
-/// struct's fields, each as the struct declares it; an embedded file's bytes as a byte string's
-/// object. `field` answers the field table's entry of a name, `entry` a root's C symbol, and `file`
-/// the bytes of a file by their digest. A function a machine struct's field holds is declared before
-/// the definition; each static `def` addresses must be declared before it, as `static_extern` does.
-/// Raises on a header field the runtime's header has not, a word its slot cannot hold (a root's
-/// function where no struct field types it, bytes in a struct's field), a struct `emit.layout`
-/// declares not, or a static of no words.
+/// The C definition of `def`: a block's header with the immortal count and its head, then its words,
+/// each a member of the C type it holds; a machine struct's fields, each as the struct declares it;
+/// an embedded file's bytes as a byte string's object. `field` answers the field table's entry of a
+/// name, `entry` a root's C symbol, and `file` the bytes of a file by their digest. A function a
+/// machine struct's field holds is declared before the definition; each static `def` addresses must
+/// be declared before it, as `static_extern` does. Raises on a head `emit.layout` declares not or a
+/// field it has not, a word its slot cannot hold (a root's function where no struct field types it,
+/// bytes in a struct's field), a struct `emit.layout` declares not, or a static of no words.
 pub fn static_c(
   def: StaticDef,
   field: (Bytes) -> Int / {abort.raise},
@@ -34,31 +32,55 @@ pub fn static_c(
   file: (Bytes) -> Bytes / {abort.raise},
 ) -> Bytes / {abort.raise} =
   match def.laid {
-    SBlock(b) -> laid_object(def.name, Some(b.head), b.words, field),
-    SPlain(ws) -> laid_object(def.name, None, ws, field),
+    SBlock(b) -> laid_object(def.name, headed(def.name, b.head), b.words, field),
+    SPlain(ws) -> laid_object(def.name, [], ws, field),
     SStruct(s) -> laid_struct(def.name, s.of, s.fields, field, entry),
     SFile(digest) -> {
-      let t = text_block(file(digest), bytes_kind());
-      laid_object(def.name, Some(t.head), t.words, field)
+      let t = text_block(file(digest));
+      laid_object(def.name, headed(def.name, t.head), t.words, field)
     },
   }
 
 /// A member of a static's C struct: how the struct declares it, and its initializer.
 type Member = { decl: Bytes, init: Bytes }
 
-/// The fields of the runtime's header a static's head may set.
-fn header_fields() -> List<Bytes> = [b"kind", b"flags", b"aux", b"len", b"layout"]
+/// A block's header, the immortal count alone, and its head where it has one, as members.
+fn headed(name: Bytes, head: Option<StaticHead>) -> List<Member> / {abort.raise} =
+  [{ decl: b"PlyObj h", init: b"{ .rc = UINT32_MAX }" }].concat(match head {
+    None -> [],
+    Some(h) -> [head_member(name, h)],
+  })
+
+/// The head `h` as a member: its struct, each field `h` sets by its name.
+fn head_member(name: Bytes, h: StaticHead) -> Member / {abort.raise} =
+  match head_structs().find(|s: MachineStruct| s.name == h.of) {
+    None -> refused(name, b"lays out a head the layout declares not: ".concat(h.of)),
+    Some(s) -> {
+      h.fields.fold((), |_: Unit, f: { field: Bytes, value: Int }|
+        if s.fields.any(|m: MachineField| m.name == f.field) { () } else {
+          refused(name, Bytes::concat_all([b"sets a field ", h.of, b" has not: ", f.field]))
+        });
+      {
+        decl: Bytes::concat_all([h.of, b" head"]),
+        init: Bytes::concat_all([
+          b"{ ",
+          Bytes::join(
+            h.fields.map(|f: { field: Bytes, value: Int }|
+              Bytes::concat_all([b".", f.field, b" = ", ascii_of_int(f.value)])),
+            b", ",
+          ),
+          b" }",
+        ]),
+      }
+    },
+  }
 
 fn laid_object(
   name: Bytes,
-  head: Option<List<{ field: Bytes, value: Int }>>,
+  header: List<Member>,
   words: List<StaticWord>,
   field: (Bytes) -> Int / {abort.raise},
 ) -> Bytes / {abort.raise} = {
-  let header = match head {
-    None -> [],
-    Some(fs) -> [{ decl: b"PlyObj h", init: header_init(fs) }],
-  };
   let members = range(0, words.len()).fold(header, |acc: List<Member>, i: Int|
     match word_member(i, words.get(i), field) { Some(m) -> acc.push(m), None -> acc });
   if members.len() == 0 { refused(name, b"holds no words") } else {
@@ -68,24 +90,6 @@ fn laid_object(
       members.map(|m: Member| m.init),
     )
   }
-}
-
-/// The header's initializer: the immortal count, the kind `fs` names or the refused kind, and each
-/// field `fs` sets.
-fn header_init(fs: List<{ field: Bytes, value: Int }>) -> Bytes / {abort.raise} = {
-  fs.fold((), |_: Unit, f: { field: Bytes, value: Int }|
-    if header_fields().contains(f.field) { () }
-    else { panic(String::of_bytes_lossy(b"a static's header has no field ".concat(f.field))) });
-  let set = if fs.any(|f: { field: Bytes, value: Int }| f.field == b"kind") { fs }
-  else { [{ field: b"kind", value: refused_kind() }].concat(fs) };
-  Bytes::concat_all(
-    [b"{ .rc = UINT32_MAX"].concat(
-      set.map(|f: { field: Bytes, value: Int }|
-        Bytes::concat_all([b", .", f.field, b" = ", ascii_of_int(f.value)])),
-    ).push(
-      b" }",
-    ),
-  )
 }
 
 /// Word `i` of a block or a plain static as the member holding it: an integer as an `int64_t`, an
@@ -306,52 +310,34 @@ fn no_files(_: Bytes) -> Bytes = b""
 
 fn has(c: Bytes, s: Bytes) -> Bool = c.index_of(s) != None
 
-test "a block's header is immortal, of its head's kind or the refused one, and sets each field its head names" {
-  let s = static_c(
-    named(SBlock(text_block(b"say \"hi\"?\n", str_kind()))),
-    no_fields,
-    no_entries,
-    no_files,
-  );
+test "a block's header is its immortal count alone, then its head with each field the head names" {
+  let s = static_c(named(SBlock(text_block(b"say \"hi\"?\n"))), no_fields, no_entries, no_files);
   let said = Some(String::of_bytes_lossy(s));
-  // Text is of the kind the runtime's functions on it read.
-  assert(has(s, b".rc = UINT32_MAX") && has(s, b".kind = ".concat(ascii_of_int(str_kind()))), said);
-  assert(has(s, b".len = 10") && has(s, b".layout = 10"), said);
+  assert(has(s, b"PlyObj h;") && has(s, b"{ .rc = UINT32_MAX }"), said);
+  assert(has(s, b"PlyTextHead head;") && has(s, b"{ .len = 10, .room = 10 }"), said);
   let plain = static_c(named(SPlain([WRaw(7)])), no_fields, no_entries, no_files);
-  assert(!has(plain, b".kind"), Some(String::of_bytes_lossy(plain)));
+  assert(!has(plain, b"PlyObj"), Some(String::of_bytes_lossy(plain)));
   let headless = static_c(
-    named(SBlock({ head: [{ field: b"len", value: 1 }], words: [WRaw(7)] })),
+    named(SBlock({ head: None, words: [WRaw(7)] })),
     no_fields,
     no_entries,
     no_files,
   );
   assert(
-    has(headless, b".kind = ".concat(ascii_of_int(refused_kind()))),
+    has(headless, b"{ .rc = UINT32_MAX }") && !has(headless, b" head;"),
     Some(String::of_bytes_lossy(headless)),
   );
   // Bytes take whole words, and every static is aligned to one.
   assert(has(s, b"w0[16]") && has(s, b"aligned(8)"), said);
-  let wide = static_c(
-    named(
-      SBlock({ head: [{ field: b"kind", value: 18 }, { field: b"len", value: 2 }], words: [] }),
-    ),
-    no_fields,
-    no_entries,
-    no_files,
-  );
-  assert(has(wide, b".kind = 18") && !has(wide, b".kind = 21"), Some(String::of_bytes_lossy(wide)));
-  // An empty string is its header alone.
+  // An empty string is its header and head alone.
   assert(
-    !has(
-      static_c(named(SBlock(text_block(b"", bytes_kind()))), no_fields, no_entries, no_files),
-      b"w0",
-    ),
+    !has(static_c(named(SBlock(text_block(b""))), no_fields, no_entries, no_files), b"w0"),
     None,
   )
 }
 
 test "a static's declaration names it, so a bucket can take its address" {
-  let s = named(SBlock(text_block(b"x", bytes_kind())));
+  let s = named(SBlock(text_block(b"x")));
   let e = static_extern(s.name);
   assert(has(e, b"extern ") && has(e, s.name), Some(String::of_bytes_lossy(e)))
 }
@@ -397,7 +383,7 @@ test "an embedded file is a byte string's object of the bytes its digest names, 
   let big = Bytes::concat_all(range(0, 4100).map(|i: Int| byte_of_int(97 + i % 26)));
   let c = static_c({ name: b"ply_k_f", laid: SFile(b"d1") }, no_fields, no_entries, |d: Bytes|
     if d == b"d1" { big } else { b"" });
-  assert(has(c, b".len = 4100") && has(c, b"w0[4104]"), None);
+  assert(has(c, b".len = 4100, .room = 4100") && has(c, b"w0[4104]"), None);
   // No literal is longer than a C compiler takes: three, each on its own line.
   assert_eq(c.split(b"\"\n  \"").len(), 3)
 }
@@ -438,7 +424,20 @@ test "a word no slot of its static can hold is refused" {
       abort.raise(m) -> Bytes::of_string(m),
     };
   assert(
-    said(named(SBlock({ head: [{ field: b"rc", value: 1 }], words: [WRaw(0)] }))).len() > 0,
+    said(
+        named(
+          SBlock({
+            head: Some({ of: b"PlyTextHead", fields: [{ field: b"rc", value: 1 }] }),
+            words: [WRaw(0)],
+          }),
+        ),
+      ).len(
+      )
+      > 0,
+    None,
+  );
+  assert(
+    said(named(SBlock({ head: Some({ of: b"PlyObj", fields: [] }), words: [WRaw(0)] }))).len() > 0,
     None,
   );
   assert(said(named(SStruct({ of: b"PlyType", fields: [WRaw(0)] }))).len() > 0, None);

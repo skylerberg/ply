@@ -3,8 +3,8 @@
 //! and the runtime reads.
 
 import std.bytes (ascii_of_int)
-import emit.layout (MachineStruct, MachineField, machine_structs, pointer_floor, tag_bits, ctx_at,
-                    release_depth, refused_kind, header_bytes)
+import emit.layout (MachineStruct, MachineField, machine_structs, head_structs, text_head,
+                    pointer_floor, tag_bits, ctx_at, release_depth, header_bytes)
 import emit.print.frames (chain_defined)
 import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_box_fn, free_fn, inc_shared_fn,
                             dec_shared_last_fn, free_block_fn, release_later_fn, release_drain_fn,
@@ -12,7 +12,6 @@ import emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_box_fn, fre
                             call_text, calls)
 import emit.release (immediate_heads, box_heads, scalar_box_words)
 import emit.print.fuel (entered_helper, entered_fn)
-import emit.print.strings (payload_helper, payload_fn)
 import emit.print.lists (list_helpers, item_fn, leaf_fn)
 import emit.print.counts (walk_helpers, kept_block_fn, fresh_block_fn, unshared_fn, mark_fn)
 
@@ -28,25 +27,49 @@ pub fn head_part() -> Bytes / {abort.raise} =
     helpers(),
     b"\n",
     structs(),
-    b"#define PLY_KIND_REFUSED ",
-    ascii_of_int(refused_kind()),
-    b"\ntypedef struct { PlyObj h; const PlyFnDesc *desc; } PlyFnBlock;\n",
+    b"typedef struct { PlyObj h; const PlyFnDesc *desc; } PlyFnBlock;\n",
+    byte_texts_declared(),
     chain_defined(),
     drops(),
     shared_sequences(),
   ])
 
-/// The sequences printers would otherwise write at each use, defined once: a function's entry, a
-/// string's bytes, a list's item and leaf, a block copied or kept or marked shared, and an object
-/// made writable.
-fn shared_sequences() -> Bytes =
+/// The head's C function answering the byte string of the one byte `b`, from 0 to 255: an immortal
+/// block `tail_part` lays out once for the unit.
+pub fn byte_text_fn() -> Bytes = b"ply_byte_text"
+
+/// The type and the table `byte_text_fn` answers from, declared, and `byte_text_fn` defined.
+fn byte_texts_declared() -> Bytes =
   Bytes::concat_all([
-    entered_helper(),
-    payload_helper(),
-    list_helpers(),
-    walk_helpers(),
-    writable_helper(),
+    b"typedef struct { PlyObj h; ",
+    text_head().name,
+    b" head; unsigned char b[8]; } PlyByteText;\n",
+    b"extern const PlyByteText ply_byte_texts[256];\n",
+    b"static inline Word ",
+    byte_text_fn(),
+    b"(PlyCtx *ctx, int64_t b) { (void)ctx; return (Word)(intptr_t)&ply_byte_texts[b]; }\n",
   ])
+
+/// The emitter's part of a unit's tail, which the unit defines once: the byte string of each byte
+/// `byte_text_fn` answers.
+pub fn tail_part() -> Bytes =
+  Bytes::concat_all([
+    b"const PlyByteText ply_byte_texts[256] = {\n",
+    Bytes::concat_all(
+      range(0, 256).map(|b: Int|
+        Bytes::concat_all([
+          b"  { { .rc = UINT32_MAX }, { .len = 1, .room = 1 }, { ",
+          ascii_of_int(b),
+          b" } },\n",
+        ])),
+    ),
+    b"};\n",
+  ])
+
+/// The sequences printers would otherwise write at each use, defined once: a function's entry, a
+/// list's item and leaf, a block copied or kept or marked shared, and an object made writable.
+fn shared_sequences() -> Bytes =
+  Bytes::concat_all([entered_helper(), list_helpers(), walk_helpers(), writable_helper()])
 
 /// The head's C function answering the object `a` held once, copied by `copy` where another holds
 /// it too, the write counted as in place or of a copy of `n` words.
@@ -198,11 +221,12 @@ fn described_heads(tags: Bytes) -> Bytes = {
   ])
 }
 
-/// Each machine struct declared in its order, each field as the head declares it, and its size
-/// checked: a C compiler that lays it out otherwise refuses the unit.
+/// Each machine struct declared in its order, then each head a block keeps its counts in, each field
+/// as the head declares it, and its size checked: a C compiler that lays it out otherwise refuses
+/// the unit.
 fn structs() -> Bytes =
   Bytes::concat_all(
-    machine_structs().map(|s: MachineStruct|
+    machine_structs().concat(head_structs()).map(|s: MachineStruct|
       Bytes::concat_all([
         b"typedef struct ",
         s.name,
@@ -307,7 +331,6 @@ test "each sequence the printers share is defined once in the head, as a functio
   let h = head_part();
   let shared = [
     entered_fn(),
-    payload_fn(),
     item_fn(),
     leaf_fn(),
     kept_block_fn(),
@@ -324,12 +347,7 @@ test "each sequence the printers share is defined once in the head, as a functio
         entered_helper().index_of(part) != None),
     None,
   );
-  // A block copied takes every header field but its count.
+  // A block copied takes its payload alone: its allocation sets its count.
   let kept = defined_in(h, kept_block_fn());
-  assert(
-    [b"->kind", b"->flags", b"->aux", b"->len", b"->layout"].all(|field: Bytes|
-        kept.index_of(field) != None)
-      && kept.index_of(b"->rc") == None,
-    Some(String::of_bytes_lossy(kept)),
-  )
+  assert(kept.index_of(b"->") == None, Some(String::of_bytes_lossy(kept)))
 }
