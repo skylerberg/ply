@@ -24,7 +24,9 @@ import emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_
                         continued, type_of, handed, noted, set_join, joined, short_circuit,
                         as_words)
 import emit.lower.data (constructed_as, field)
-import emit.lower.crossing (through_runtime)
+import emit.lower.crossing (through_runtime, blake3_of)
+import emit.roots (builtin_helper)
+import expand.rewrite (FloatFunction, float_function)
 
 /// A literal as the operand it is, or read from the pool into a variable of its type where no
 /// register holds it: a string, bytes, an embedded file, a `Decimal`, `()` and a width past 64 bits.
@@ -307,7 +309,8 @@ pub fn operated(
       } else if name == b"bits_of_float" {
         let x = handed({ st: st, arg: a }, RFloat, at);
         bound(cx, x.st, named_type(b"Int"), Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at)
-      } else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
+      } else if float_function(name) != None { float_called(st, name, args, at) }
+      else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
         width_arithmetic(cx, st, name, args, at)
       } else if name == b"?stated_witness" { witnessed(cx, st, a, at) } else {
         match of_int_width(name) {
@@ -805,7 +808,7 @@ fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered
     )
   } else {
     let e = written(cx, st, Digest, ty, a, at);
-    if hashed { through_runtime(cx, e.st, b"Bytes::blake3", [e.arg], bytes, at) } else { e }
+    if hashed { blake3_of(e.st, e.arg, at) } else { e }
   }
 }
 
@@ -974,7 +977,52 @@ fn arity(name: Bytes) -> Int =
       || wrapping(name)
       || saturating(name)
       || (name.starts_with(b"checked_") && name != b"checked_neg") { 2 }
-  else { 1 }
+  else { match float_function(name) { Some(f) -> f.operands, None -> 1 } }
+
+/// `Float` function `name` over `args`: each operand handed its native as its bits, and the bits
+/// the native answers the `Float` the call does.
+fn float_called(st: Lowering, name: Bytes, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match float_function(name) {
+    None -> refuse(st, Scalars, b"no Float function: ".concat(name)),
+    Some(f) -> float_native_called(st, f, args, at),
+  }
+
+fn float_native_called(
+  st: Lowering,
+  f: FloatFunction,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let given = args.fold({ st: st, bits: [] }, |acc: { st: Lowering, bits: List<Arg> }, a: Arg| {
+    let x = handed({ st: acc.st, arg: a }, RFloat, at);
+    let b = bound_as(
+      x.st,
+      named_type(b"Int"),
+      RInt,
+      Prim({ op: b"bits", on: RFloat, args: [x.arg] }),
+      at,
+    );
+    { st: b.st, bits: acc.bits.push(b.arg) }
+  });
+  let answered = bound_as(
+    given.st,
+    named_type(b"Int"),
+    RInt,
+    Native({
+      name: builtin_helper(f.native).concat(b"_p"),
+      args: given.bits,
+      uses: { takes: given.bits.map(|_: Arg| false), owned: true, fails: false, stops: false },
+    }),
+    at,
+  );
+  bound_as(
+    answered.st,
+    named_type(b"Float"),
+    RFloat,
+    Prim({ op: b"of_bits", on: RInt, args: [answered.arg] }),
+    at,
+  )
+}
 
 /// The divisor an `Int` division or remainder takes as a literal where it is a negated one:
 /// C's own operator then divides by it.
