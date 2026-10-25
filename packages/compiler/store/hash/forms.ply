@@ -955,6 +955,117 @@ derive bin for FixedLaw
 
 derive bin for Fixing
 
+/// What hashing fixed of one module as a graph by name, which a later run walks to find what a test
+/// reached when it passed: each definition and declaration with its hash and what it references,
+/// and each test with its hash, what it references and what its cases run.
+pub type ModuleRecord = { nodes: List<RecordedNode>, tests: List<RecordedTest> }
+
+pub type RecordedNode = { name: Bytes, decl: Bool, hash: Bytes, edges: List<NodeRef> }
+
+pub type RecordedTest = { key: Bytes, hash: Bytes, refs: List<NodeRef>, runs: List<NodeRef> }
+
+derive bin for RecordedNode
+
+derive bin for RecordedTest
+
+derive bin for ModuleRecord
+
+/// The record of `fixing`, one module's, as `module_record_bin` encodes it.
+pub fn module_record(fixing: Fixing) -> Bytes / {abort.raise} =
+  bin::encode(
+    {
+      nodes: fixing.nodes.map(|f: Fixed|
+        { name: f.name, decl: f.decl, hash: f.hash, edges: f.edges }),
+      tests: fixing.tests.map(|t: FixedTest|
+        { key: t.key, hash: t.hash, refs: t.refs, runs: t.runs }),
+    },
+    module_record_bin(),
+  )
+
+/// What hashing fixed of one module, and the digest of its record.
+pub type ModuleHashed = { record: Bytes, fixing: Fixing }
+
+/// What hashing fixed of each of `modules`, one program's, as one.
+pub fn joined_fixing(modules: List<ModuleHashed>) -> Fixing =
+  modules.fold(no_fixing(), |acc: Fixing, m: ModuleHashed|
+    {
+      nodes: acc.nodes.concat(m.fixing.nodes),
+      tests: acc.tests.concat(m.fixing.tests),
+      laws: acc.laws.concat(m.fixing.laws),
+    })
+
+fn record_domain() -> Bytes = b"ply.record.1"
+
+/// What a module's record is filed under: a digest of its bytes.
+pub fn record_digest(record: Bytes) -> Bytes = blake3(record_domain().concat(record))
+
+/// One program's module records read as one graph: each node by its place, what each references by
+/// place, and each test by its key.
+pub type RecordedGraph = {
+  nodes: List<RecordedNode>,
+  edges: List<List<Int>>,
+  tests: Map<Bytes, RecordedTest>,
+  at: Map<Bytes, Int>,
+}
+
+/// `records`, one program's, as one graph: a reference no record holds leads nowhere.
+pub fn recorded_graph(records: List<ModuleRecord>) -> RecordedGraph / {abort.raise} = {
+  let nodes = records.flat_map(|r: ModuleRecord| r.nodes);
+  let at = range(0, nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int|
+    acc.insert(pin_key(nodes.get(v).name, nodes.get(v).decl), v));
+  {
+    nodes: nodes,
+    edges: nodes.map(|n: RecordedNode| places_of(at, n.edges)),
+    tests: records.fold(Map::new(), |acc: Map<Bytes, RecordedTest>, r: ModuleRecord|
+      r.tests.fold(acc, |m: Map<Bytes, RecordedTest>, t: RecordedTest| m.insert(t.key, t))),
+    at: at,
+  }
+}
+
+fn places_of(at: Map<Bytes, Int>, refs: List<NodeRef>) -> List<Int> =
+  refs.fold([], |acc: List<Int>, r: NodeRef|
+    match at.get(pin_key(r.name, r.decl)) { Some(v) -> acc.push(v), None -> acc })
+
+/// What a test reached, each function and each declaration by name with its hash.
+pub type Reached = { fns: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes> }
+
+/// Where a walk from the test `key` of `g` starts: at what it references, or at what its cases run
+/// where `case` says. `None` where `g` holds no such test.
+fn starts_of(g: RecordedGraph, key: Bytes, case: Bool) -> Option<List<Int>> =
+  match g.tests.get(key) {
+    None -> None,
+    Some(t) -> Some(places_of(g.at, if case { t.runs } else { t.refs })),
+  }
+
+/// What the test `key` of `g` reached: from where `starts_of` says, through what each reached
+/// definition references. `None` where `g` holds no such test.
+pub fn recorded_reach(g: RecordedGraph, key: Bytes, case: Bool) -> Option<Reached> / {abort.raise} =
+  match starts_of(g, key, case) {
+    None -> None,
+    Some(starts) ->
+      Some(
+        walk(g.edges, starts).fold(
+          { fns: Map::new(), decls: Map::new() },
+          |acc: Reached, v: Int| {
+            let n = g.nodes.get(v);
+            if n.decl { { ..acc, decls: acc.decls.insert(n.name, n.hash) } }
+            else { { ..acc, fns: acc.fns.insert(n.name, n.hash) } }
+          },
+        ),
+      ),
+  }
+
+/// The hash of each definition and declaration any of `tests` of `g` reached, read in one walk
+/// from all of them.
+pub fn recorded_hashes(
+  g: RecordedGraph,
+  tests: List<{ key: Bytes, case: Bool }>,
+) -> List<Bytes> / {abort.raise} = {
+  let starts = tests.fold([], |acc: List<Int>, t: { key: Bytes, case: Bool }|
+    match starts_of(g, t.key, t.case) { Some(vs) -> acc.concat(vs), None -> acc });
+  walk(g.edges, starts).map(|v: Int| g.nodes.get(v).hash)
+}
+
 fn shape_keys(shapes: Shapes) -> Map<Bytes, Int> / {abort.raise} =
   range(0, shapes.nodes.len()).fold(Map::new(), |acc: Map<Bytes, Int>, v: Int| {
     let s = shapes.nodes.get(v);

@@ -10,8 +10,10 @@ import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock,
                            NUpdate, NKnown, CodeField, CodeArm, CodeClause, CodeStmt, CLet, CLetPat,
                            CDo, CodePattern, CodePatternField, Capture, PxCtor, PxRecord, PxList,
                            lower_fn)
-import compiler.check.types (Scheme, TyFn, TyVar, scheme_text, int_type, unit_type, type_at,
-                             HeldType, held_type_bin, types_held, types_of)
+import compiler.check.types (Scheme, Type, Field, Atom, Resource, TyFn, TyVar, TyCon, TyRecord,
+                             TyNominal, int_type, unit_type, type_at, HeldType, held_type_bin,
+                             types_held, types_of, canonical_beside, resource_bin)
+import compiler.syntax.type_syntax (Mode, mode_bin)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify,
                                       module_of_name)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
@@ -40,6 +42,7 @@ import compiler.check.resolve.scopes (PackageDeps, no_packages)
 import compiler.check.resolve (resolve_packaged)
 import std.prelude_source
 import std.bin
+import std.hash (blake3)
 import std.list
 import compiler.expand.rewrite (fn_has_update)
 import compiler.expand.embed (EmbedAt, ItemWants, embed_tables, rewritten)
@@ -50,8 +53,7 @@ import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, EmitterCtor, Carr
 import compiler.front.facts (Analysis, pkg_tables, toolchain_tree, tree_named, home_of, Tree,
                              NoTree)
 import compiler.front.seam (test_root_at, view_of, view_dump, Analysed, AnalysisOutcome, Refused,
-                            known_own, def_known_row, bodies_read, WalkedFacts, walked_of,
-                            rows_from)
+                            known_own, WalkedFacts, walked_of, rows_from)
 
 // --- The rows an analysis publishes -----------------------------------------------
 
@@ -234,17 +236,118 @@ pub fn facts_read(
 pub fn wants(wanted: Option<Map<Bytes, Bool>>, name: Bytes) -> Bool =
   match wanted { None -> true, Some(m) -> m.contains(name) }
 
-/// What a definition published: its rows and its scheme, as text.
-pub type DefInterface = { row: KnownDefRow, scheme: Bytes }
+/// A type or an effect as an interface names it: one the program declares by the hashes of every
+/// declaration of its name, since a type and an effect may share one, so another declaration of
+/// the name is another identity while a move to another module is none; and one of the language's
+/// own by its name.
+pub type Identity = | ByHashes(List<Bytes>) | ByName(Bytes)
+
+/// A `Type` as an interface keeps it, each type and effect by its `Identity`.
+pub type InterfaceType =
+  | TypeVariable(Int)
+  | Constructed({ named: Identity, args: List<InterfaceType> })
+  | Function({ params: List<InterfaceType>, ret: InterfaceType, effects: InterfaceRow })
+  | RecordOf(List<InterfaceField>)
+  /// A nominal type is its declaration and its arguments: its fields are the declaration's.
+  | NominalOf({ named: Identity, args: List<InterfaceType> })
+
+pub type InterfaceField = { name: Bytes, ty: InterfaceType }
+
+pub type InterfaceAtom = { effect: Identity, resource: Resource, mode: Mode, op: Option<Bytes> }
+
+pub type InterfaceRow = { atoms: List<InterfaceAtom>, tail: Option<Int> }
+
+/// What a definition published that a mixture swapping it in alone must agree with: its scheme and
+/// its footprint, canonical. It is a function of the definition's hash.
+pub type DefInterface = {
+  ty_vars: List<Int>,
+  row_vars: List<Int>,
+  label_vars: List<Int>,
+  ty: InterfaceType,
+  footprint: List<InterfaceAtom>,
+}
+
+derive bin for Identity
+
+derive bin for InterfaceType
+
+derive bin for InterfaceField
+
+derive bin for InterfaceAtom
+
+derive bin for InterfaceRow
 
 derive bin for DefInterface
+
+/// Each declaration's hash, by name: a type and an effect of one name each have theirs.
+pub fn declared_hashes(hashes: HashOutput) -> Map<Bytes, List<Bytes>> =
+  hashes.decls.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, d: { name: Bytes, hash: Bytes }|
+    acc.insert(d.name, match acc.get(d.name) { Some(hs) -> hs.push(d.hash), None -> [d.hash] }))
+
+/// `def_info`'s interface, each type and effect `decls` holds named by its hashes there.
+pub fn def_interface_of(
+  decls: Map<Bytes, List<Bytes>>,
+  def_info: DefInfo,
+) -> DefInterface / {abort.raise} = {
+  let c = canonical_beside(def_info.scheme, [def_info.footprint]);
+  {
+    ty_vars: c.scheme.ty_vars,
+    row_vars: c.scheme.row_vars,
+    label_vars: c.scheme.label_vars,
+    ty: interface_type(decls, c.scheme.ty),
+    footprint: match c.rows.at(0) {
+      Some(atoms) -> atoms.map(|a: Atom| interface_atom(decls, a)),
+      None -> [],
+    },
+  }
+}
+
+fn identity(decls: Map<Bytes, List<Bytes>>, name: Bytes) -> Identity =
+  match decls.get(name) { Some(hs) -> ByHashes(hs), None -> ByName(name) }
+
+fn interface_atom(decls: Map<Bytes, List<Bytes>>, a: Atom) -> InterfaceAtom =
+  { effect: identity(decls, a.effect), resource: a.resource, mode: a.mode, op: a.op }
+
+fn interface_type(decls: Map<Bytes, List<Bytes>>, ty: Type) -> InterfaceType / {abort.raise} = {
+  let fields = |fs: List<Field>|
+    fs.map(|f: Field| { name: f.name, ty: interface_type(decls, f.ty) });
+  match ty {
+    TyVar(v) -> TypeVariable(v),
+    TyCon(c) ->
+      Constructed({
+        named: identity(decls, c.name),
+        args: c.args.map(|a: Type| interface_type(decls, a)),
+      }),
+    TyFn(f) ->
+      Function({
+        params: f.params.map(|p: Type| interface_type(decls, p)),
+        ret: interface_type(decls, f.ret),
+        effects: {
+          atoms: f.effects.atoms.map(|a: Atom| interface_atom(decls, a)),
+          tail: f.effects.tail,
+        },
+      }),
+    TyRecord(fs) -> RecordOf(fields(fs)),
+    TyNominal(n) ->
+      NominalOf({
+        named: identity(decls, n.name),
+        args: n.args.map(|a: Type| interface_type(decls, a)),
+      }),
+  }
+}
+
+fn interface_domain() -> Bytes = b"ply.interface.1"
+
+/// A digest of `i`, which is all two interfaces are compared by: a scheme over a large record
+/// type spells the record out whole.
+pub fn interface_digest(i: DefInterface) -> Bytes / {abort.raise} =
+  blake3(interface_domain().concat(bin::encode(i, def_interface_bin())))
 
 /// A body under the hash it verifies as.
 pub type FiledBody = { hash: Bytes, body: Bytes }
 
-/// What a definition the analysis checked published, under its hash: what a later run that holds
-/// only the hash reads of it.
-pub type FiledDef = { name: Bytes, hash: Bytes, interface: DefInterface }
+/// What a definition the analysis checked published, under its hash: the digest of its interface.
+pub type FiledDef = { name: Bytes, hash: Bytes, interface: Bytes }
 
 /// Each definition `analysis` checked, as `FiledDef` keeps it.
 pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef> / {abort.raise} =
@@ -257,18 +360,14 @@ pub fn interfaces_among(
   wanted: (Bytes) -> Bool / {abort.raise},
 ) -> List<FiledDef> / {abort.raise} = {
   let hashed = by_name(hashes.defs);
-  let decls = by_name(hashes.decls);
-  let read = bodies_read(checked);
+  let decls = declared_hashes(hashes);
   checked.defs.fold([], |acc: List<FiledDef>, def_info: DefInfo|
     match hashed.get(def_info.name) {
       Some(h) -> if !wanted(h) { acc } else {
         acc.push({
           name: def_info.name,
           hash: h,
-          interface: {
-            row: def_known_row(decls, def_info, h, read),
-            scheme: scheme_text(def_info.scheme),
-          },
+          interface: interface_digest(def_interface_of(decls, def_info)),
         })
       },
       None -> acc,
@@ -1423,6 +1522,72 @@ pub fn untested(p: ParsedSource) -> ParsedSource =
   }
 
 // --- Tests ------------------------------------------------------------------
+
+/// The digest of the interface `m.size` files where `home` declares `declared` and `m` uses it.
+fn size_over(home: Bytes, declared: Bytes) -> Bytes / {abort.raise} = {
+  let src = Bytes::concat_all([
+    b"import ",
+    home,
+    b"\npub fn size(s: ",
+    home,
+    b"::Shape) -> Int / {",
+    home,
+    b"::log.write} = { ",
+    home,
+    b"::log.put(1); 1 }\n",
+  ]);
+  match analyse(parse_all([{ name: b"m", src: src }, { name: home, src: declared }])) {
+    Refused(_) -> panic("the program checks"),
+    Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: FiledDef|
+        d.name == b"m.size") {
+      Some(d) -> d.interface,
+      None -> panic("the definition is filed"),
+    },
+  }
+}
+
+test "an interface names each type and effect by its declaration's hash, not by how it prints" {
+  let declared = |shape: Bytes, operations: Bytes|
+    Bytes::concat_all([b"pub type Shape = ", shape, b"\npub effect log {\n", operations, b"}\n"]);
+  let put = b"  write put(n: Int) -> Unit\n";
+  let first = size_over(b"shapes", declared(b"| Dot | Line(Int)", put));
+  // The same declarations in another module are the same interface, though they print apart.
+  assert_eq(size_over(b"forms", declared(b"| Dot | Line(Int)", put)), first);
+  // Another type, or another effect, of the same name is another, though it prints alike.
+  assert(size_over(b"shapes", declared(b"| Dot | Circle(Float)", put)) != first, None);
+  assert(
+    size_over(
+        b"shapes",
+        declared(b"| Dot | Line(Int)", Bytes::concat_all([put, b"  write flush() -> Unit\n"])),
+      )
+      != first,
+    None,
+  )
+}
+
+test "a type sharing its name with an effect is told apart from it in an interface" {
+  let opened = |boxed: Bytes|
+    match analyse(
+        parse_all([
+          {
+            name: b"m",
+            src: Bytes::concat_all([
+              b"pub type Box = ",
+              boxed,
+              b"\neffect Box { read held() -> Int }\npub fn open(b: Box) -> Int / {Box.read} = Box.held()\n",
+            ]),
+          },
+        ]),
+      ) {
+      Refused(_) -> panic("the program checks"),
+      Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: FiledDef|
+          d.name == b"m.open") {
+        Some(d) -> d.interface,
+        None -> panic("the definition is filed"),
+      },
+    };
+  assert(opened(b"| Box(Int)") != opened(b"| Box(Int, Int)"), None)
+}
 
 test "the types a body binds and uses are filed by key, read from one table the rows carry" {
   let src = b"fn first<a>(xs: List<a>, d: a) -> a = match xs { [x, ..] -> x, _ -> d }\nfn go(ys: List<Int>) -> Int = first(ys, 0)\n";
