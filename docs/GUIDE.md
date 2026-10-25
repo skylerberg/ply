@@ -2823,9 +2823,11 @@ A call the prover does not unfold, a recursive definition's or another
 package's, of a definition whose row names no raise and that the checker reads
 as ending, is read by its contract: each `ensures`, at the call's arguments and
 answer, holds wherever its `requires` do. Another package's contract is that
-package's run to prove; one of this package's is read once a proof showed every
-`ensures` of its definition taking no call in its body to answer, and the clause being proved holds at each call its
-own definition's body makes back into it, on the way to that call. So `fn
+package's run to prove, and the call still owes that it answers. One of this
+package's is read once a proof showed every `ensures` of its definition taking no
+call in its body to answer, and then the call answers wherever the `requires`
+hold; the clause being proved holds at each call its own definition's body makes
+back into it, on the way to that call. So `fn
 quadrupled(n: Int) -> Int ensures result == n * 4 = doubled(doubled(n))`
 stands on `doubled`'s `ensures result == n * 2` without its body. A contract,
 or a law, proved over a type variable shows no call answers that settles the
