@@ -3091,18 +3091,19 @@ whether its implementation, its spec and its claims changed. The baseline is key
 
 ## 11. Derivation
 
+`derive d for T` is the call `d::derive(declaration)` of the module the file binds
+as `d`, made before the rest of the module is read; its answer is the source of
+the functions it derives, read into the module as if written there:
+
 ```ply
 import std.json
 
 pub type Line = { sku: String, qty: Int, unit_price: Decimal }
 derive json for Line
+// line_json : () -> json::JsonCodec<Line>
 ```
 
-| deriver | generates | type |
-| --- | --- | --- |
-| `json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
-| `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
-| `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
+The toolchain ships these derivers, each documented in its module:
 
 Any other name is a library deriver (below). `snake_case` is `std.text`'s, so two types that give
 the same name (`HTTPRequest` and `HttpRequest` both give `http_request`) are `E0105`. A `derive`
@@ -3115,8 +3116,7 @@ pub type Box<a> = { label: String, inner: a }
 derive json for Box
 // box_json : <a>(JsonCodec<a>) -> JsonCodec<Box<a>>
 
-fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
-  where derivable(json, a) =
+fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String =
   json::encode_string(b, box_json(c))
 ```
 
@@ -3159,7 +3159,7 @@ import std.json
 pub type Line = { sku: String, qty: Int }
 pub type Order = { id: Int, customer: String, note: Option<String>, lines: List<Line> }
 derive json for Line
-derive row for Order
+derive sql for Order
 // order_row : () -> sql::RowCodec<Order>
 ```
 

@@ -1,12 +1,11 @@
-//! `derive D for T` becomes an ordinary definition: generated as source, parsed back, and retargeted.
-//! A built-in deriver writes the source here; a library deriver is a module's `derive`, which the load
-//! runs and whose answer the expansion is handed.
+//! `derive d for T` becomes ordinary definitions: the module `d` binds is a library deriver, whose
+//! `derive` the load runs over `T`'s declaration and whose answer, the source of the functions it
+//! derives, the expansion is handed, parsed back and retargeted at the `derive` item.
 
-import compiler.syntax.parsing (Span, Ident, QName, span_to, is_bare, qname_text, span_between)
+import compiler.syntax.parsing (Span, Ident, QName, span_to, span_between)
 import compiler.syntax.sites (numbered)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, Mode, MRead, MWrite, MBad, ty_span, mode_text, angled,
-                                    generics_text, is_generic, ident_names, type_expr_bin)
+                                    AtomExpr, ty_span)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                                  PBad)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -15,1574 +14,18 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               SLetElse, SExpr, SAssign, HandlerVar, Param, NamedArg, MatchArm,
                               HandleClause, ReturnClause, RecField, hidden_binder, ETagged, Hole,
                               expr_span)
-import compiler.syntax.items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TypeDefBody,
-                              TDAlias, TDSum, VariantDef, DeriveDef, Deriver, DJson, DEq, DOrd,
-                              DBin, DShow, DHash, DNumeric, DInteger, DRow, DLibrary, deriver_text,
-                              deriver_tag, derivers, ImportDecl, ImportKind, IModule, IAlias,
-                              INames, Vis, VPub, VPriv, Derived, Derivation, RuntimeBinder,
-                              Constraint, SpecClause, parse, constraint_written, TDNominal,
-                              TDExtern)
+import compiler.syntax.items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef, TDAlias, TDSum,
+                              VariantDef, DeriveDef, ImportDecl, IModule, IAlias, INames, Derived,
+                              Derivation, parse, TDNominal, TDExtern)
 import compiler.expand.rewrite (expand)
 import compiler.expand.rewrite.shared (find_type, picked_in)
 import compiler.expand.declared (declaration_of)
-import compiler.check.resolve.tables (Diag, Source, error_at, error_at_and, path_span)
-import compiler.check.resolve (dump_diags)
+import compiler.check.resolve.tables (Diag, error_at, error_at_and)
 import std.list
-import std.bytes (ascii_of_int)
 import std.string
 import std.bin
-import std.text
 import std.derive
 import std.value
-
-// --- Rules ---------------------------------------------------------------------------------------
-
-pub type DeriveRefusal =
-  | HoldsFunction
-  | HoldsHandle
-  | HoldsFloat
-  | Unconstrained(Int)
-  | NullInsideOption
-  | HoldsSecret
-  | HoldsNative
-pub type ConstructorShape = | Leaf | Structural | Refused(DeriveRefusal) | Nominal
-
-/// The one table the deriver and the checker's `derivable` both read, so the two cannot disagree.
-pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
-  if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit"
-      || name == b"Decimal"
-      || name == b"Char" { Leaf } else if name == b"Float" {
-    match deriver { DOrd -> Refused(HoldsFloat), DHash -> Refused(HoldsFloat), _ -> Leaf }
-  } else if name == b"List" || name == b"Array" || name == b"Columns" || name == b"Option"
-      || name == b"Map"
-      || name == b"Result"
-      || name == b"Ordering"
-      || name == b"Rounding"
-      || name == b"Instant"
-      || name == b"Duration" { Structural }
-  else if same_deriver(deriver, DBin) && is_fixed_width(name) { Leaf }
-  else if same_deriver(deriver, DBin) && name == b"Iter" { Structural }
-  else if name == b"Hold" || name == b"Task" || name == b"Chan" { Refused(HoldsHandle) }
-  else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
-  else { Nominal }
-
-/// Whether a type constructor's JSON encoding can be the document `null`.
-pub fn null_encoded_name(name: Bytes) -> Bool = name == b"Unit" || name == b"Option"
-
-fn is_fixed_width(name: Bytes) -> Bool =
-  name == b"U8" || name == b"U16" || name == b"U32" || name == b"U64" || name == b"U128"
-    || name == b"I8"
-    || name == b"I16"
-    || name == b"I32"
-    || name == b"I64"
-    || name == b"I128"
-
-pub fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_text(a) == deriver_text(b)
-
-/// The module a `derive` by `deriver` calls into, which the module stating it must import: the one
-/// whose definitions a generated body calls, if any.
-pub fn runtime_module(deriver: Deriver) -> Option<Bytes> =
-  match deriver {
-    DJson -> Some(b"std.json"),
-    DBin -> Some(b"std.bin"),
-    DRow -> Some(b"std.sql"),
-    _ -> None,
-  }
-
-fn runtime_path(deriver: Deriver) -> List<Bytes> =
-  match deriver {
-    DJson -> [b"std", b"json"],
-    DBin -> [b"std", b"bin"],
-    DRow -> [b"std", b"sql"],
-    _ -> [],
-  }
-
-/// The name a type's derived functions start with: `std.text`'s, so the two cannot disagree.
-pub fn snake_case(name: Bytes) -> Bytes =
-  Bytes::of_string(text::snake_case(String::of_bytes_lossy(name)))
-
-pub fn generated_name(deriver: Deriver, type_name: Bytes) -> Bytes =
-  Bytes::concat_all([snake_case(type_name), b"_", deriver_text(deriver)])
-
-// --- The syntactic half of `derivable(D, t)` ---------------------------------------------------
-
-/// `reason` completes the label at `span`; `note` is the advice only a `Secret` refusal carries.
-type Blocker = { span: Span, reason: Bytes, note: Option<Bytes>, variant: Option<Bytes> }
-
-fn check_decl(deriver: Deriver, def: TypeDef) -> Option<Blocker> / {abort.raise} =
-  if same_deriver(deriver, DRow) { check_row(def) } else {
-    match def.body {
-      TDAlias(body) -> check_type_expr(deriver, body),
-      TDNominal(body) -> check_type_expr(deriver, body),
-      TDSum(variants) ->
-        variants.fold(None, |acc: Option<Blocker>, variant: VariantDef|
-          match acc {
-            Some(_) -> acc,
-            None -> match first_blocked_type_expr(deriver, variant.fields) {
-              Some(b) ->
-                Some({
-                  span: b.span,
-                  reason: b.reason,
-                  note: b.note,
-                  variant: Some(variant.name.name),
-                }),
-              None -> None,
-            },
-          }),
-      TDExtern ->
-        Some({
-          span: def.name.span,
-          reason: b"laid out by the toolchain, with no field a derivation could read",
-          note: None,
-          variant: None,
-        }),
-    }
-  }
-
-fn row_refusal(def: TypeDef, reason: Bytes) -> Option<Blocker> =
-  Some({ span: def.name.span, reason: reason, note: None, variant: None })
-
-/// A row is a record's fields, a column each, of one type each.
-fn check_row(def: TypeDef) -> Option<Blocker> / {abort.raise} =
-  if is_generic(def.generics) {
-    row_refusal(def, b"a column holds one type, so a type with parameters has no row")
-  } else {
-    match row_fields(def) {
-      None -> row_refusal(def, b"a row is a record's fields, a column each"),
-      Some(fields) -> if fields.len() == 0 { row_refusal(def, b"a row has a column at least") }
-      else { check_type_expr(DRow, TRecord({ span: def.name.span, fields: fields })) },
-    }
-  }
-
-/// The fields of a record type, as written.
-fn row_fields(def: TypeDef) -> Option<List<{ name: Ident, ty: TypeExpr }>> =
-  match def.body {
-    TDAlias(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
-    TDNominal(body) -> match body { TRecord(r) -> Some(r.fields), _ -> None },
-    TDSum(_) -> None,
-    TDExtern -> None,
-  }
-
-// No generated call fills a label, and only a type that holds a function has a use for one.
-fn label_refusal() -> Bytes = b"a type that takes a label has no derivation"
-
-fn function_refusal(deriver: Deriver) -> Bytes =
-  match deriver {
-    DJson -> b"a function has no JSON encoding",
-    DEq -> b"functions cannot be compared for equality",
-    DOrd -> b"functions cannot be ordered",
-    DBin -> b"a function has no binary encoding",
-    DShow -> b"a function has no rendering to derive",
-    DHash -> b"a function has no content to hash",
-    DNumeric -> b"a function is not a number",
-    DInteger -> b"a function is not an integer",
-    DRow -> b"a function has no column to be stored in",
-    DLibrary(_) -> b"a function has no fields to derive from",
-  }
-
-pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Bytes =
-  match w {
-    HoldsFloat -> float_reason(deriver),
-    HoldsHandle -> Bytes::concat_all([b"a `", simple, b"` names a location rather than a value"]),
-    HoldsSecret -> secret_reason(deriver),
-    HoldsNative -> Bytes::concat_all([b"a `", simple, b"` is laid out by the toolchain"]),
-    _ -> b"",
-  }
-
-pub fn float_reason(deriver: Deriver) -> Bytes =
-  match deriver {
-    DHash ->
-      b"`Float` has no hash that agrees with `==`: `NaN != NaN`, and `0.0 == -0.0` in different bits",
-    _ -> b"`Float` is not ordered: `NaN != NaN`",
-  }
-
-pub fn secret_reason(deriver: Deriver) -> Bytes =
-  match deriver {
-    DJson -> b"a derived codec would write the credential into the document",
-    DOrd -> b"a credential has no order",
-    DEq -> b"a credential has no structural equality to derive",
-    DBin -> b"a derived codec would write the credential into the bytes",
-    DShow -> b"a derived rendering would write the credential out",
-    DHash -> b"a hash of a credential is something to test guesses against",
-    DNumeric -> b"a credential is not a number",
-    DInteger -> b"a credential is not an integer",
-    DRow -> b"a derived row would write the credential into the database",
-    DLibrary(_) -> b"a derivation would read the credential",
-  }
-
-pub fn refusal_note(w: DeriveRefusal, deriver: Deriver) -> Option<Bytes> =
-  match w {
-    HoldsSecret -> match deriver {
-      DOrd ->
-        Some(
-          b"an ordering over a credential leaks a bit of position per comparison and recovers the value in calls proportional to its length; `==` compares two, and `Secret::verify` is the check a program actually wants",
-        ),
-      DShow ->
-        Some(
-          b"a credential is never shown, in an interpolated string or anywhere else; show what the `Secret` guards or names instead",
-        ),
-      DHash ->
-        Some(
-          b"hash what the `Secret` guards or names instead; a password wants `std.password`, not a content hash",
-        ),
-      _ ->
-        Some(
-          b"move the `Secret` field out of the type being derived, or write the codec by hand over the fields that are not credentials \xe2\x80\x94 there is no way to encode a `Secret`, which is the guarantee",
-        ),
-    },
-    _ -> None,
-  }
-
-pub fn null_in_option_note() -> Bytes =
-  b"wrap the inner value in a record or a one-field variant \xe2\x80\x94 both are tagged, and a tagged encoding has no `null` to collide with"
-
-pub fn null_in_option(inner: Bytes) -> Bytes =
-  Bytes::concat_all([
-    b"`",
-    inner,
-    b"` encodes as `null`, which is how an `Option` writes `None`, so `Some` and `None` are the same document",
-  ])
-
-fn first_blocked_type_expr(
-  deriver: Deriver,
-  tys: List<TypeExpr>,
-) -> Option<Blocker> / {abort.raise} =
-  tys.fold(None, |acc: Option<Blocker>, ty: TypeExpr|
-    match acc { Some(_) -> acc, None -> check_type_expr(deriver, ty) })
-
-fn null_encoded_type_expr(ty: TypeExpr) -> Bool =
-  match ty { TUnit(_) -> true, TCon(c) -> null_encoded_name(c.name.name.name), _ -> false }
-
-/// A type parameter is derivable by assumption; a record field is blamed as a whole.
-fn check_type_expr(deriver: Deriver, ty: TypeExpr) -> Option<Blocker> / {abort.raise} =
-  match ty {
-    TVar(_) -> None,
-    TUnit(_) -> None,
-    TBad(_) -> None,
-    TFn(f) -> Some({ span: f.span, reason: function_refusal(deriver), note: None, variant: None }),
-    TRecord(r) ->
-      r.fields.fold(None, |acc: Option<Blocker>, f: { name: Ident, ty: TypeExpr }|
-        match acc {
-          Some(_) -> acc,
-          None -> match check_type_expr(deriver, f.ty) {
-            Some(b) ->
-              Some({
-                span: span_to(f.name.span, ty_span(f.ty)),
-                reason: b.reason,
-                note: b.note,
-                variant: b.variant,
-              }),
-            None -> None,
-          },
-        }),
-    TCon(c) -> if c.labels.len() > 0 {
-      Some({ span: c.span, reason: label_refusal(), note: None, variant: None })
-    } else {
-      let simple = c.name.name.name;
-      match constructor_shape(deriver, simple) {
-        Refused(why) ->
-          Some({
-            span: c.span,
-            reason: Bytes::concat_all([
-              refusal_reason(why, deriver, simple),
-              b", so `",
-              simple,
-              b"` has no derivation",
-            ]),
-            note: refusal_note(why, deriver),
-            variant: None,
-          }),
-        _ -> if same_deriver(deriver, DJson) && simple == b"Option" && c.args.len() > 0
-            && null_encoded_type_expr(c.args.get(0)) {
-          let inner = match c.args.get(0) { TCon(k) -> k.name.name.name, _ -> b"Unit" };
-          Some({ span: c.span, reason: null_in_option(inner), note: None, variant: None })
-        } else {
-          // A `Map`'s key type must be ordered whichever deriver is walking.
-          let key = if simple == b"Map" && c.args.len() > 0 {
-            match check_type_expr(DOrd, c.args.get(0)) {
-              Some(b) ->
-                Some({
-                  span: b.span,
-                  reason: b.reason.concat(b", and a `Map` key type must be ordered"),
-                  note: b.note,
-                  variant: b.variant,
-                }),
-              None -> None,
-            }
-          } else { None };
-          match key { Some(b) -> Some(b), None -> first_blocked_type_expr(deriver, c.args) }
-        },
-      }
-    },
-  }
-
-// --- Generated definitions, as Ply source -------------------------------------------------------
-
-type Alias = { name: Bytes, body: TypeExpr }
-
-/// `b` prefixes every generated binder, chosen so none can shadow a dictionary parameter; `path` is the
-/// module's; `cycle` holds the types whose codecs call the target's and are called back by it; `json`
-/// is how a row's fields stored as documents name `std.json`.
-type DeriveEmitter = {
-  d: Deriver,
-  rt: Bytes,
-  b: Bytes,
-  aliases: List<Alias>,
-  path: Bytes,
-  cycle: List<Bytes>,
-  json: Bytes,
-}
-
-fn emitter(
-  deriver: Deriver,
-  rt: Bytes,
-  params: List<Ident>,
-  aliases: List<Alias>,
-  path: Bytes,
-  cycle: List<Bytes>,
-  json: Bytes,
-) -> DeriveEmitter / {abort.raise} = {
-  let b = iterate(b"d", params.len() + 2, |x: Bytes|
-    if params.fold(false, |acc: Bool, ident: Ident| acc || ident.name.starts_with(x)) {
-      Continue(x.concat(b"_"))
-    } else { Stop(x) });
-  { d: deriver, rt: rt, b: b, aliases: aliases, path: path, cycle: cycle, json: json }
-}
-
-fn find_alias(aliases: List<Alias>, name: Bytes) -> Option<TypeExpr> =
-  aliases.fold(None, |acc: Option<TypeExpr>, alias: Alias|
-    match acc { Some(_) -> acc, None -> if alias.name == name { Some(alias.body) } else { None } })
-
-pub fn target_type(def: TypeDef) -> Bytes = def.name.name.concat(generics_text(def.generics))
-
-/// One of a codec's functions as it is generated: what it takes after the dictionaries, what it
-/// answers, and a body that reads its parameters by name.
-type Member = { name: Bytes, params: List<{ name: Bytes, ty: Bytes }>, ret: Bytes, body: Bytes }
-
-fn written_params(m: Member) -> List<Bytes> =
-  m.params.map(|p: { name: Bytes, ty: Bytes }| Bytes::concat_all([p.name, b": ", p.ty]))
-
-fn param_names(m: Member) -> List<Bytes> = m.params.map(|p: { name: Bytes, ty: Bytes }| p.name)
-
-/// A dictionary whose fields are `members`, each a lambda.
-/// The JSON or binary codec of a `Columns` of `elem`, whose records' codec is `item`: the list
-/// codec's, over the records `Columns::to_list` lists and `Columns::of_list` holds again.
-fn columns_codec(emitter: DeriveEmitter, item: Bytes, elem: Bytes) -> Bytes = {
-  let b = emitter.b;
-  let rt = emitter.rt;
-  let held = Bytes::concat_all([b"Columns<", elem, b">"]);
-  if same_deriver(emitter.d, DJson) {
-    let list = Bytes::concat_all([rt, b"list_json(", item, b")"]);
-    Bytes::concat_all([
-      b"{encode: |",
-      b,
-      b"c: ",
-      held,
-      b"| (",
-      list,
-      b".encode)(Columns::to_list(",
-      b,
-      b"c)), ",
-      b"decode: |",
-      b,
-      b"j: ",
-      rt,
-      b"Json| match (",
-      list,
-      b".decode)(",
-      b,
-      b"j) {",
-      b"Ok(",
-      b,
-      b"l) -> Ok(Columns::of_list(",
-      b,
-      b"l)), Err(",
-      b,
-      b"e) -> Err(",
-      b,
-      b"e)}}",
-    ])
-  } else {
-    Bytes::concat_all([
-      b"{put: |",
-      b,
-      b"w: Bytes, ",
-      b,
-      b"c: ",
-      held,
-      b"| ",
-      rt,
-      b"put_list(",
-      b,
-      b"w, ",
-      b"Columns::to_list(",
-      b,
-      b"c), (",
-      item,
-      b").put), ",
-      b"take: |",
-      b,
-      b"d: Bytes, ",
-      b,
-      b"n: Int| match ",
-      rt,
-      b"take_list(",
-      b,
-      b"d, ",
-      b,
-      b"n, (",
-      item,
-      b").take) {Ok(",
-      b,
-      b"t) -> Ok({value: Columns::of_list(",
-      b,
-      b"t.value), at: ",
-      b,
-      b"t.at}), Err(",
-      b,
-      b"e) -> Err(",
-      b,
-      b"e)}, ",
-      b"shape: |",
-      b,
-      b"s: ",
-      rt,
-      b"Shapes| ",
-      rt,
-      b"applied_shape(",
-      b,
-      b"s, \"Columns\", [(",
-      item,
-      b").shape])}",
-    ])
-  }
-}
-
-fn literal(members: List<Member>) -> Bytes =
-  Bytes::concat_all([
-    b"{",
-    Bytes::join(
-      members.map(|m: Member|
-        Bytes::concat_all([m.name, b": |", Bytes::join(written_params(m), b", "), b"| ", m.body])),
-      b", ",
-    ),
-    b"}",
-  ])
-
-/// A codec off every cycle is one definition, its dictionary. One on a cycle takes how much deeper
-/// it may nest and hands its cycle one less, so the recursion is seen to end. A `bin` one is each of
-/// its functions as a definition that calls its cycle's by name, so no level makes a dictionary,
-/// and the named one hands each to its definition at the runtime's `max_depth`. A `json` one is
-/// two definitions, the named one starting `_at` at `max_depth`: `std.json` takes whole codecs
-/// throughout, so its functions apart would make one at every level all the same.
-fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise} = {
-  let name = generated_name(emitter.d, def.name.name);
-  let target = target_type(def);
-  let ps = def.generics.types.map(|p: Ident| p.name);
-  let generics = generics_text(def.generics);
-  let dicts = ps.map(|p: Bytes| Bytes::concat_all([p, b": ", dict_type(emitter, p)]));
-  let constraints = if ps.len() == 0 { b"" } else {
-    b" where ".concat(Bytes::join(ps.map(|p: Bytes| constraint_written(emitter.d, p)), b", "))
-  };
-  let head = |fname: Bytes, params: List<Bytes>, ret: Bytes|
-    Bytes::concat_all([
-      b"fn ",
-      fname,
-      generics,
-      b"(",
-      Bytes::join(params, b", "),
-      b") -> ",
-      ret,
-      constraints,
-      b" = ",
-    ]);
-  let vis = match def.vis { VPub -> b"pub ", VPriv -> b"" };
-  let dict = dict_type(emitter, target);
-  if emitter.cycle.len() == 0 {
-    [Bytes::concat_all([vis, head(name, dicts, dict), dictionary(emitter, def, target)])]
-  } else if !same_deriver(emitter.d, DBin) {
-    let at_name = name.concat(b"_at");
-    [
-      Bytes::concat_all([
-        vis,
-        head(name, dicts, dict),
-        at_name,
-        b"(",
-        Bytes::join(ps.push(emitter.rt.concat(b"max_depth()")), b", "),
-        b")",
-      ]),
-      Bytes::concat_all([
-        head(at_name, dicts.push(emitter.b.concat(b"depth: Int")), dict),
-        b"if ",
-        emitter.b,
-        b"depth <= 0 {",
-        emitter.rt,
-        b"too_deep()} else {",
-        dictionary(emitter, def, target),
-        b"}",
-      ]),
-    ]
-  } else {
-    let depth = emitter.b.concat(b"depth");
-    let deep = dicts.push(depth.concat(b": Int"));
-    let members = cycle_members(emitter, def, target);
-    let function = |m: Member| Bytes::concat_all([name, b"_", m.name]);
-    let deepest = ps.push(emitter.rt.concat(b"max_depth()"));
-    [
-      Bytes::concat_all([
-        vis,
-        head(name, dicts, dict),
-        b"{",
-        Bytes::join(
-          members.map(|m: Member|
-            Bytes::concat_all([
-              m.name,
-              b": |",
-              Bytes::join(written_params(m), b", "),
-              b"| ",
-              function(m),
-              b"(",
-              Bytes::join(deepest.concat(param_names(m)), b", "),
-              b")",
-            ])),
-          b", ",
-        ),
-        b"}",
-      ]),
-    ].concat(
-      members.map(|m: Member|
-        Bytes::concat_all([
-          head(function(m), deep.concat(written_params(m)), m.ret.concat(b" / {abort.raise}")),
-          b"if ",
-          depth,
-          b" <= 0 {(",
-          emitter.rt,
-          b"too_deep().",
-          m.name,
-          b")(",
-          Bytes::join(param_names(m), b", "),
-          b")} else {",
-          m.body,
-          b"}",
-        ])),
-    )
-  }
-}
-
-/// `JsonCodec<a>`, `BinCodec<a>` and `RowCodec<a>` ship with their runtime modules.
-fn dict_type(emitter: DeriveEmitter, arg: Bytes) -> Bytes =
-  match emitter.d {
-    DJson -> Bytes::concat_all([emitter.rt, b"JsonCodec<", arg, b">"]),
-    DBin -> Bytes::concat_all([emitter.rt, b"BinCodec<", arg, b">"]),
-    DRow -> Bytes::concat_all([emitter.rt, b"RowCodec<", arg, b">"]),
-    // A predicate is never derived: the parser has no `derive` that names one.
-    _ -> b"()",
-  }
-
-fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {abort.raise} =
-  match emitter.d {
-    DJson -> match def.body {
-      TDAlias(body) -> codec(emitter, body, target),
-      TDNominal(body) -> codec(emitter, body, target),
-      TDSum(variants) -> literal(json_sum(emitter, variants, target)),
-      TDExtern -> b"()",
-    },
-    DBin -> match def.body {
-      TDAlias(body) -> codec(emitter, body, target),
-      TDNominal(body) -> codec(emitter, body, target),
-      TDSum(variants) -> literal(bin_sum(emitter, def, variants, target)),
-      TDExtern -> b"()",
-    },
-    DRow -> match row_fields(def) {
-      Some(fields) -> row_record(emitter, fields, target),
-      None -> b"()",
-    },
-    _ -> b"()",
-  }
-
-/// The functions of the `bin` codec of `def`, a type on a cycle.
-fn cycle_members(
-  emitter: DeriveEmitter,
-  def: TypeDef,
-  target: Bytes,
-) -> List<Member> / {abort.raise} =
-  match def.body {
-    TDAlias(body) -> aliased_members(emitter, body, target),
-    TDNominal(body) -> aliased_members(emitter, body, target),
-    TDSum(variants) -> bin_sum(emitter, def, variants, target),
-    TDExtern -> [],
-  }
-
-/// The functions of the `bin` codec of a type on a cycle that is written as `body`.
-fn aliased_members(
-  emitter: DeriveEmitter,
-  body: TypeExpr,
-  target: Bytes,
-) -> List<Member> / {abort.raise} =
-  match body {
-    TRecord(r) -> bin_record(emitter, r.fields, target),
-    _ ->
-      bin_members(
-        emitter,
-        target,
-        bin_put(emitter, body, emitter.b.concat(b"w"), emitter.b.concat(b"v")),
-        bin_take(emitter, body, emitter.b.concat(b"n"), b""),
-        match cycle_call(emitter, body, b"shape", [emitter.b.concat(b"s")]) {
-          Some(call) -> call,
-          None ->
-            Bytes::concat_all([b"(", codec(emitter, body, target), b".shape)(", emitter.b, b"s)"]),
-        },
-      ),
-  }
-
-fn record_members(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  annotation: Bytes,
-) -> List<Member> / {abort.raise} =
-  match emitter.d {
-    DBin -> bin_record(emitter, fields, annotation),
-    _ -> json_record(emitter, fields, annotation),
-  }
-
-// --- A record's row --------------------------------------------------------------------------
-// Each field is a column of its own name, read and written by one of `std.sql`'s readers: a scalar
-// by its own, `Option` by `optional_field`, a `List` of scalars as an array, a `Json` as the
-// document it is, and anything else as a document through the type's own JSON codec.
-
-/// A field type as the module writes it, through its own parameterless aliases.
-fn row_resolved(emitter: DeriveEmitter, ty: TypeExpr) -> TypeExpr / {abort.raise} =
-  iterate({ cur: ty, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
-    if s.n >= 64 { Stop(s.cur) } else {
-      match s.cur {
-        TCon(c) -> if !is_bare(c.name) || c.args.len() > 0 { Stop(s.cur) } else {
-          match find_alias(emitter.aliases, c.name.name.name) {
-            Some(body) -> Continue({ cur: body, n: s.n + 1 }),
-            None -> Stop(s.cur),
-          }
-        },
-        _ -> Stop(s.cur),
-      }
-    })
-
-/// The `std.sql` reader of a scalar field type.
-fn row_scalar(ty: TypeExpr) -> Option<Bytes> =
-  match ty {
-    TCon(c) -> if !is_bare(c.name) || c.args.len() > 0 { None } else {
-      let name = c.name.name.name;
-      if name == b"String" { Some(b"text_field") }
-      else if name == b"Int" { Some(b"int_field") }
-      else if name == b"Bool" { Some(b"bool_field") }
-      else if name == b"Float" { Some(b"float_field") }
-      else if name == b"Decimal" { Some(b"numeric_field") }
-      else if name == b"Bytes" { Some(b"bytes_field") }
-      else { None }
-    },
-    _ -> None,
-  }
-
-/// How a field of a row is read: by the reader of `std.sql`'s that it names, as an `Option` of
-/// what it holds, as an array of what the reader it names reads, as the document it holds, or
-/// through the type's own JSON codec.
-pub type RowRead =
-  | RScalar(Bytes)
-  | ROptional(RowRead)
-  | RArray(Bytes)
-  | RDocument
-  | RByJson(TypeExpr)
-
-/// A field of a record's row: its column and how it is read.
-pub type RowField = { name: Bytes, read: RowRead }
-
-derive bin for RowRead
-derive bin for RowField
-
-/// The fields `derive row for target` reads, in order, as the module that declares the type writes
-/// them; `None` for a type the module does not declare as a record.
-pub fn row_shape(module: Module, target: Bytes) -> Option<List<RowField>> / {abort.raise} = {
-  let ex = new_expander(0, b"", module, [], []);
-  match find_type(ex.types, target) {
-    None -> None,
-    Some(def) -> match row_fields(def) {
-      None -> None,
-      Some(fields) -> {
-        let e = emitter(DRow, b"", [], ex.aliases, ex.path, [], b"");
-        Some(
-          fields.map(|f: { name: Ident, ty: TypeExpr }|
-            { name: f.name.name, read: row_read(e, f.ty, 8) }),
-        )
-      },
-    },
-  }
-}
-
-fn row_read(emitter: DeriveEmitter, ty: TypeExpr, left: Int) -> RowRead / {abort.raise} = {
-  let t = row_resolved(emitter, ty);
-  match row_scalar(t) {
-    Some(reader) -> RScalar(reader),
-    None -> match t {
-      TCon(c) -> if left > 0 && c.name.name.name == b"Option" && c.args.len() == 1 {
-        ROptional(row_read(emitter, c.args.get(0), left - 1))
-      } else if c.name.name.name == b"List" && c.args.len() == 1 {
-        match row_scalar(row_resolved(emitter, c.args.get(0))) {
-          Some(reader) -> RArray(reader),
-          None -> RByJson(t),
-        }
-      } else if c.name.name.name == b"Json" && !is_bare(c.name) { RDocument }
-      else { RByJson(t) },
-      _ -> RByJson(t),
-    },
-  }
-}
-
-/// Whether a field of this type is stored as a document through its JSON codec.
-fn row_by_json(read: RowRead) -> Bool =
-  match read { RByJson(_) -> true, ROptional(inner) -> row_by_json(inner), _ -> false }
-
-/// The reader of a field read this way, as an expression the module can write.
-fn row_reader(emitter: DeriveEmitter, read: RowRead) -> Bytes / {abort.raise} =
-  match read {
-    RScalar(reader) -> Bytes::concat_all([emitter.rt, reader, b"()"]),
-    ROptional(inner) ->
-      Bytes::concat_all([emitter.rt, b"optional_field(", row_reader(emitter, inner), b")"]),
-    RArray(reader) -> Bytes::concat_all([emitter.rt, b"array_field(", emitter.rt, reader, b"())"]),
-    RDocument -> emitter.rt.concat(b"document_field()"),
-    RByJson(t) -> row_document(emitter, t),
-  }
-
-/// Whether any field of a record this module derives a row for is stored through its JSON codec.
-fn row_wants_json(emitter: DeriveEmitter, def: TypeDef) -> Bool / {abort.raise} =
-  match row_fields(def) {
-    None -> false,
-    Some(fields) ->
-      fields.fold(false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
-        acc || row_by_json(row_read(emitter, f.ty, 8))),
-  }
-
-fn row_document(emitter: DeriveEmitter, ty: TypeExpr) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    emitter.rt,
-    b"json_field(",
-    codec({ ..emitter, d: DJson, rt: emitter.json, cycle: [] }, ty, render_type(ty)),
-    b")",
-  ])
-
-fn row_record(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  annotation: Bytes,
-) -> Bytes / {abort.raise} = {
-  let readers = fields.map(|f: { name: Ident, ty: TypeExpr }|
-    row_reader(emitter, row_read(emitter, f.ty, 8)));
-  let name = |i: Int| fields.get(i).name.name;
-  let listed = range(0, fields.len()).map(|i: Int|
-    Bytes::concat_all([emitter.rt, b"field(\"", name(i), b"\", ", readers.get(i), b")"]));
-  let built = range(0, fields.len()).map(|i: Int|
-    Bytes::concat_all([name(i), b": ", emitter.b, ascii_of_int(i)]));
-  let decode = range(0, fields.len()).fold(
-    Bytes::concat_all([b"Ok({", Bytes::join(built, b", "), b"})"]),
-    |acc: Bytes, k: Int| {
-      let i = fields.len() - 1 - k;
-      Bytes::concat_all([
-        b"match ",
-        emitter.rt,
-        b"read(",
-        emitter.b,
-        b"r, \"",
-        name(i),
-        b"\", ",
-        readers.get(i),
-        b") {Err(",
-        emitter.b,
-        b"e) -> Err(",
-        emitter.b,
-        b"e), Ok(",
-        emitter.b,
-        ascii_of_int(i),
-        b") -> ",
-        acc,
-        b"}",
-      ])
-    },
-  );
-  let params = range(0, fields.len()).map(|i: Int|
-    Bytes::concat_all([
-      emitter.rt,
-      b"written(",
-      readers.get(i),
-      b", ",
-      emitter.b,
-      b"v.",
-      name(i),
-      b")",
-    ]));
-  Bytes::concat_all([
-    b"{fields: [",
-    Bytes::join(listed, b", "),
-    b"], decode: |",
-    emitter.b,
-    b"r: ",
-    emitter.rt,
-    b"Row| ",
-    decode,
-    b", params: |",
-    emitter.b,
-    b"v: ",
-    annotation,
-    b"| [",
-    Bytes::join(params, b", "),
-    b"]}",
-  ])
-}
-
-/// An expression of the codec type of `te`: `JsonCodec<te>` or `BinCodec<te>`.
-fn codec(emitter: DeriveEmitter, te: TypeExpr, annotation: Bytes) -> Bytes / {abort.raise} =
-  match te {
-    TVar(p) -> p.name,
-    TUnit(_) -> Bytes::concat_all([emitter.rt, b"unit_", deriver_text(emitter.d), b"()"]),
-    TBad(_) -> b"()",
-    TFn(_) -> b"()",
-    TRecord(r) -> literal(record_members(emitter, r.fields, annotation)),
-    TCon(c) -> {
-      let simple = c.name.name.name;
-      let codecs = c.args.map(|a: TypeExpr| codec(emitter, a, render_type(a)));
-      // A `Columns` is written as the list of its records, through its builtins.
-      if simple == b"Columns" && c.args.len() == 1 {
-        columns_codec(emitter, codecs.get(0), render_type(c.args.get(0)))
-      } else if same_deriver(emitter.d, DJson) && simple == b"Map" && c.args.len() == 2
-          && is_string(emitter, c.args.get(0)) {
-        Bytes::concat_all([emitter.rt, b"string_map_json(", codecs.get(1), b")"])
-      } else {
-        let call = Bytes::concat_all([
-          snake_case(simple),
-          b"_",
-          deriver_text(emitter.d),
-          b"(",
-          Bytes::join(codecs, b", "),
-          b")",
-        ]);
-        // A named type is composed through by name, never inlined.
-        match constructor_shape(emitter.d, simple) {
-          Nominal -> match c.name.module {
-            Some(m) -> Bytes::concat_all([m.name, b"::", call]),
-            None -> if !emitter.cycle.contains(simple) { call }
-            else if same_deriver(emitter.d, DBin) { forwarded(emitter, te) } else {
-              Bytes::concat_all([
-                snake_case(simple),
-                b"_",
-                deriver_text(emitter.d),
-                b"_at(",
-                Bytes::join(codecs.push(emitter.b.concat(b"depth - 1")), b", "),
-                b")",
-              ])
-            },
-          },
-          _ -> emitter.rt.concat(call),
-        }
-      }
-    },
-  }
-
-/// Whether a written type *is* `String`, following the module's own parameterless aliases.
-fn is_string(emitter: DeriveEmitter, ty: TypeExpr) -> Bool / {abort.raise} =
-  iterate({ cur: ty, n: 0 }, 66, |s: { cur: TypeExpr, n: Int }|
-    if s.n >= 64 { Stop(false) } else {
-      match s.cur {
-        TCon(c) -> if !is_bare(c.name) || c.args.len() > 0 { Stop(false) }
-        else if c.name.name.name == b"String" { Stop(true) } else {
-          match find_alias(emitter.aliases, c.name.name.name) {
-            Some(body) -> Continue({ cur: body, n: s.n + 1 }),
-            None -> Stop(false),
-          }
-        },
-        _ -> Stop(false),
-      }
-    })
-
-/// The `bin` codec of `te`, a type on the target's cycle, one level deeper: each of its functions
-/// handed to the definition of that name.
-fn forwarded(emitter: DeriveEmitter, te: TypeExpr) -> Bytes / {abort.raise} = {
-  let call = |member: Bytes, args: List<Bytes>|
-    match cycle_call(emitter, te, member, args) { Some(c) -> c, None -> b"()" };
-  let named = |x: Bytes| emitter.b.concat(x);
-  literal(
-    bin_members(
-      emitter,
-      render_type(te),
-      call(b"put", [named(b"w"), named(b"v")]),
-      call(b"take", [named(b"d"), named(b"n")]),
-      call(b"shape", [named(b"s")]),
-    ),
-  )
-}
-
-/// Whether `te` is a type of this module's on the target's cycle whose codec's functions are
-/// definitions: a `bin` codec's.
-fn on_cycle(emitter: DeriveEmitter, te: TypeExpr) -> Bool =
-  match te {
-    TCon(c) ->
-      same_deriver(emitter.d, DBin) && is_bare(c.name) && emitter.cycle.contains(c.name.name.name),
-    _ -> false,
-  }
-
-/// The call of `member` of the codec of `te` on `args`, where `te` is on the target's cycle: its
-/// definition by name, one level deeper, and no dictionary made for it.
-fn cycle_call(
-  emitter: DeriveEmitter,
-  te: TypeExpr,
-  member: Bytes,
-  args: List<Bytes>,
-) -> Option<Bytes> / {abort.raise} =
-  match te {
-    TCon(c) -> if !on_cycle(emitter, te) { None } else {
-      let codecs = c.args.map(|a: TypeExpr| codec(emitter, a, render_type(a)));
-      Some(
-        Bytes::concat_all([
-          snake_case(c.name.name.name),
-          b"_",
-          deriver_text(emitter.d),
-          b"_",
-          member,
-          b"(",
-          Bytes::join(codecs.push(emitter.b.concat(b"depth - 1")).concat(args), b", "),
-          b")",
-        ]),
-      )
-    },
-    _ -> None,
-  }
-
-fn json_members(
-  emitter: DeriveEmitter,
-  annotation: Bytes,
-  encode: Bytes,
-  decode: Bytes,
-) -> List<Member> =
-  [
-    {
-      name: b"encode",
-      params: [{ name: emitter.b.concat(b"v"), ty: annotation }],
-      ret: emitter.rt.concat(b"Json"),
-      body: encode,
-    },
-    {
-      name: b"decode",
-      params: [{ name: emitter.b.concat(b"j"), ty: emitter.rt.concat(b"Json") }],
-      ret: Bytes::concat_all([b"Result<", annotation, b", ", emitter.rt, b"DecodeError>"]),
-      body: decode,
-    },
-  ]
-
-/// The document of `x`, a value of the type `te`: a record's is written in place.
-fn json_encode(emitter: DeriveEmitter, te: TypeExpr, x: Bytes) -> Bytes / {abort.raise} =
-  match te {
-    TRecord(r) -> json_object(emitter, r.fields, x),
-    _ -> Bytes::concat_all([b"(", codec(emitter, te, render_type(te)), b".encode)(", x, b")"]),
-  }
-
-fn json_object(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  x: Bytes,
-) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    emitter.rt,
-    b"object([",
-    Bytes::join(
-      fields.map(|f: { name: Ident, ty: TypeExpr }|
-        Bytes::concat_all([
-          b"{key: \"",
-          f.name.name,
-          b"\", value: ",
-          json_encode(emitter, f.ty, Bytes::concat_all([x, b".", f.name.name])),
-          b"}",
-        ])),
-      b", ",
-    ),
-    b"])",
-  ])
-
-fn json_record(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  annotation: Bytes,
-) -> List<Member> / {abort.raise} = {
-  let built = range(0, fields.len()).map(|i: Int|
-    Bytes::concat_all([fields.get(i).name.name, b": ", emitter.b, ascii_of_int(i)]));
-  let decode = range(0, fields.len()).fold(
-    Bytes::concat_all([b"Ok({", Bytes::join(built, b", "), b"})"]),
-    |acc: Bytes, k: Int| {
-      let i = fields.len() - 1 - k;
-      let f = fields.get(i);
-      Bytes::concat_all([
-        b"match ",
-        emitter.rt,
-        b"field(",
-        emitter.b,
-        b"j, \"",
-        f.name.name,
-        b"\", ",
-        codec(emitter, f.ty, render_type(f.ty)),
-        b") {Err(",
-        emitter.b,
-        b"e) -> Err(",
-        emitter.b,
-        b"e), Ok(",
-        emitter.b,
-        ascii_of_int(i),
-        b") -> ",
-        acc,
-        b"}",
-      ])
-    },
-  );
-  json_members(emitter, annotation, json_object(emitter, fields, emitter.b.concat(b"v")), decode)
-}
-
-/// A variant is encoded by its declared name and its fields in order.
-fn json_sum(
-  emitter: DeriveEmitter,
-  variants: List<VariantDef>,
-  target: Bytes,
-) -> List<Member> / {abort.raise} = {
-  let arms = variants.map(|v: VariantDef| {
-    let binders = range(0, v.fields.len()).map(|i: Int| emitter.b.concat(ascii_of_int(i)));
-    let pat = if binders.len() == 0 { v.name.name }
-    else { Bytes::concat_all([v.name.name, b"(", Bytes::join(binders, b", "), b")"]) };
-    let values = range(0, v.fields.len()).map(|i: Int|
-      json_encode(emitter, v.fields.get(i), binders.get(i)));
-    Bytes::concat_all([
-      pat,
-      b" -> ",
-      emitter.rt,
-      b"variant(\"",
-      v.name.name,
-      b"\", [",
-      Bytes::join(values, b", "),
-      b"])",
-    ])
-  });
-  let encode = Bytes::concat_all([b"match ", emitter.b, b"v {", Bytes::join(arms, b", "), b"}"]);
-  let names = variants.map(|v: VariantDef| Bytes::concat_all([b"\"", v.name.name, b"\""]));
-  let chain = range(0, variants.len()).fold(
-    Bytes::concat_all([
-      emitter.rt,
-      b"unknown_variant(",
-      emitter.b,
-      b"t.tag, [",
-      Bytes::join(names, b", "),
-      b"])",
-    ]),
-    |acc: Bytes, k: Int| {
-      let v = variants.get(variants.len() - 1 - k);
-      let ctor_args = if v.fields.len() == 0 { b"" } else {
-        Bytes::concat_all([
-          b"(",
-          Bytes::join(
-            range(0, v.fields.len()).map(|i: Int| emitter.b.concat(ascii_of_int(i))),
-            b", ",
-          ),
-          b")",
-        ])
-      };
-      let built = range(0, v.fields.len()).fold(
-        Bytes::concat_all([b"Ok(", v.name.name, ctor_args, b")"]),
-        |inner: Bytes, kk: Int| {
-          let i = v.fields.len() - 1 - kk;
-          Bytes::concat_all([
-            b"match ",
-            emitter.rt,
-            b"decode_and_then(",
-            emitter.rt,
-            b"variant_value(",
-            emitter.b,
-            b"t, ",
-            ascii_of_int(i),
-            b"), ",
-            codec(emitter, v.fields.get(i), render_type(v.fields.get(i))),
-            b".decode) {Err(",
-            emitter.b,
-            b"e) -> Err(",
-            emitter.b,
-            b"e), Ok(",
-            emitter.b,
-            ascii_of_int(i),
-            b") -> ",
-            inner,
-            b"}",
-          ])
-        },
-      );
-      // On a cycle the test is a call: the emitter keys an operator's settled type by span, every
-      // operator here is on the `derive` item's one span, and a depth's are `Int`s.
-      let tested = if emitter.cycle.len() == 0 {
-        Bytes::concat_all([emitter.b, b"t.tag == \"", v.name.name, b"\""])
-      } else {
-        Bytes::concat_all([emitter.rt, b"has_tag(", emitter.b, b"t, \"", v.name.name, b"\")"])
-      };
-      Bytes::concat_all([b"if ", tested, b" {", built, b"} else {", acc, b"}"])
-    },
-  );
-  let decode = Bytes::concat_all([
-    b"match ",
-    emitter.rt,
-    b"variant_of(",
-    emitter.b,
-    b"j) {Err(",
-    emitter.b,
-    b"e) -> Err(",
-    emitter.b,
-    b"e), Ok(",
-    emitter.b,
-    b"t) -> ",
-    chain,
-    b"}",
-  ]);
-  json_members(emitter, target, encode, decode)
-}
-
-fn bin_members(
-  emitter: DeriveEmitter,
-  annotation: Bytes,
-  put: Bytes,
-  take: Bytes,
-  shape: Bytes,
-) -> List<Member> =
-  [
-    {
-      name: b"put",
-      params: [
-        { name: emitter.b.concat(b"w"), ty: b"Bytes" },
-        { name: emitter.b.concat(b"v"), ty: annotation },
-      ],
-      ret: b"Bytes",
-      body: put,
-    },
-    {
-      name: b"take",
-      params: [
-        { name: emitter.b.concat(b"d"), ty: b"Bytes" },
-        { name: emitter.b.concat(b"n"), ty: b"Int" },
-      ],
-      ret: Bytes::concat_all([
-        b"Result<",
-        emitter.rt,
-        b"Taken<",
-        annotation,
-        b">, ",
-        emitter.rt,
-        b"BinError>",
-      ]),
-      body: take,
-    },
-    {
-      name: b"shape",
-      params: [{ name: emitter.b.concat(b"s"), ty: emitter.rt.concat(b"Shapes") }],
-      ret: emitter.rt.concat(b"Shaped"),
-      body: shape,
-    },
-  ]
-
-/// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
-fn bin_scalar(ty: TypeExpr) -> Option<Bytes> =
-  match ty {
-    TUnit(_) -> Some(b"unit"),
-    TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
-      Leaf -> Some(snake_case(c.name.name.name)),
-      _ -> None,
-    },
-    _ -> None,
-  }
-
-/// `x`, a value of the type `ty`, appended to `w`: a record's fields in place.
-fn bin_put(emitter: DeriveEmitter, ty: TypeExpr, w: Bytes, x: Bytes) -> Bytes / {abort.raise} =
-  match ty {
-    TRecord(r) ->
-      r.fields.fold(w, |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
-        bin_put(emitter, f.ty, acc, Bytes::concat_all([x, b".", f.name.name]))),
-    _ -> bin_call(emitter, ty, b"put", [w, x]),
-  }
-
-/// The read of a value of the type `ty` at `from`: a record's fields in place. `path` tells the
-/// binders of a record's fields from those of the record it is written inside.
-fn bin_take(
-  emitter: DeriveEmitter,
-  ty: TypeExpr,
-  from: Bytes,
-  path: Bytes,
-) -> Bytes / {abort.raise} =
-  match ty {
-    TRecord(r) -> record_take(emitter, r.fields, from, path),
-    _ -> bin_call(emitter, ty, b"take", [emitter.b.concat(b"d"), from]),
-  }
-
-/// The call of `member`, `put` or `take`, of the codec of `ty`, no record, on `args`: `std.bin`'s
-/// function for a scalar, and for a type the language declares over the functions of its parts; the
-/// definition of a type on the cycle; and a dictionary's field for any other.
-fn bin_call(
-  emitter: DeriveEmitter,
-  ty: TypeExpr,
-  member: Bytes,
-  args: List<Bytes>,
-) -> Bytes / {abort.raise} = {
-  let through = ||
-    Bytes::concat_all([
-      b"(",
-      codec(emitter, ty, render_type(ty)),
-      b".",
-      member,
-      b")(",
-      Bytes::join(args, b", "),
-      b")",
-    ]);
-  match bin_scalar(ty) {
-    Some(s) ->
-      Bytes::concat_all([emitter.rt, member, b"_", s, b"(", Bytes::join(args, b", "), b")"]),
-    None -> match cycle_call(emitter, ty, member, args) {
-      Some(call) -> call,
-      None -> match ty {
-        TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
-          Structural -> if c.name.name.name == b"Columns" { through() } else {
-            Bytes::concat_all([
-              emitter.rt,
-              member,
-              b"_",
-              snake_case(c.name.name.name),
-              b"(",
-              Bytes::join(
-                args.concat(c.args.map(|a: TypeExpr| bin_function(emitter, a, member))),
-                b", ",
-              ),
-              b")",
-            ])
-          },
-          _ -> through(),
-        },
-        _ -> through(),
-      },
-    },
-  }
-}
-
-/// `member`, `put` or `take`, of the codec of `ty` as a function: a name where one is all of it,
-/// else a lambda around the call.
-fn bin_function(emitter: DeriveEmitter, ty: TypeExpr, member: Bytes) -> Bytes / {abort.raise} = {
-  let field = || Bytes::concat_all([codec(emitter, ty, render_type(ty)), b".", member]);
-  let named = match bin_scalar(ty) {
-    Some(s) -> Some(Bytes::concat_all([emitter.rt, member, b"_", s])),
-    None -> match ty {
-      TRecord(_) -> None,
-      TCon(c) -> match constructor_shape(DBin, c.name.name.name) {
-        Structural -> if c.args.len() > 0 { None }
-        else { Some(Bytes::concat_all([emitter.rt, member, b"_", snake_case(c.name.name.name)])) },
-        _ -> if on_cycle(emitter, ty) { None } else { Some(field()) },
-      },
-      _ -> Some(field()),
-    },
-  };
-  match named {
-    Some(f) -> f,
-    None -> if member == b"put" {
-      let w = emitter.b.concat(b"w");
-      let v = emitter.b.concat(b"v");
-      Bytes::concat_all([
-        b"|",
-        w,
-        b": Bytes, ",
-        v,
-        b": ",
-        render_type(ty),
-        b"| ",
-        bin_put(emitter, ty, w, v),
-      ])
-    } else {
-      let n = emitter.b.concat(b"n");
-      Bytes::concat_all([
-        b"|",
-        emitter.b,
-        b"d: Bytes, ",
-        n,
-        b": Int| ",
-        bin_take(emitter, ty, n, b""),
-      ])
-    },
-  }
-}
-
-/// Each of `tys` read where the last ended, the first at `start`, then `built` over their values.
-fn bin_takes(
-  emitter: DeriveEmitter,
-  tys: List<TypeExpr>,
-  start: Bytes,
-  built: Bytes,
-  path: Bytes,
-) -> Bytes / {abort.raise} = {
-  let n = tys.len();
-  let binder = |i: Int| Bytes::concat_all([emitter.b, path, ascii_of_int(i)]);
-  let end_of = |i: Int| if i < 0 { start } else { binder(i).concat(b".at") };
-  range(0, n).fold(
-    Bytes::concat_all([b"Ok({value: ", built, b", at: ", end_of(n - 1), b"})"]),
-    |acc: Bytes, k: Int| {
-      let i = n - 1 - k;
-      Bytes::concat_all([
-        b"match ",
-        bin_take(
-          emitter,
-          tys.get(i),
-          end_of(i - 1),
-          Bytes::concat_all([path, ascii_of_int(i), b"_"]),
-        ),
-        b" {Err(",
-        emitter.b,
-        b"e) -> Err(",
-        emitter.b,
-        b"e), Ok(",
-        binder(i),
-        b") -> ",
-        acc,
-        b"}",
-      ])
-    },
-  )
-}
-
-fn values_of(emitter: DeriveEmitter, n: Int, path: Bytes) -> List<Bytes> =
-  range(0, n).map(|i: Int| Bytes::concat_all([emitter.b, path, ascii_of_int(i), b".value"]))
-
-/// A record's fields read in order from `from`, and the record built of them.
-fn record_take(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  from: Bytes,
-  path: Bytes,
-) -> Bytes / {abort.raise} = {
-  let values = values_of(emitter, fields.len(), path);
-  let built = range(0, fields.len()).map(|i: Int|
-    Bytes::concat_all([fields.get(i).name.name, b": ", values.get(i)]));
-  bin_takes(
-    emitter,
-    fields.map(|f: { name: Ident, ty: TypeExpr }| f.ty),
-    from,
-    Bytes::concat_all([b"{", Bytes::join(built, b", "), b"}"]),
-    path,
-  )
-}
-
-/// The shape of the type `ty` as a function of the shapes walked: a type on the cycle by its
-/// definition, one level deeper.
-fn bin_shape(emitter: DeriveEmitter, ty: TypeExpr) -> Bytes / {abort.raise} = {
-  let s = emitter.b.concat(b"s");
-  match cycle_call(emitter, ty, b"shape", [s]) {
-    Some(call) -> Bytes::concat_all([b"|", s, b": ", emitter.rt, b"Shapes| ", call]),
-    None -> codec(emitter, ty, render_type(ty)).concat(b".shape"),
-  }
-}
-
-fn shapes_of(emitter: DeriveEmitter, tys: List<TypeExpr>) -> Bytes / {abort.raise} =
-  Bytes::join(tys.map(|ty: TypeExpr| bin_shape(emitter, ty)), b", ")
-
-fn bin_record(
-  emitter: DeriveEmitter,
-  fields: List<{ name: Ident, ty: TypeExpr }>,
-  annotation: Bytes,
-) -> List<Member> / {abort.raise} = {
-  let v = emitter.b.concat(b"v");
-  let shapes = fields.map(|f: { name: Ident, ty: TypeExpr }|
-    Bytes::concat_all([b"{name: \"", f.name.name, b"\", shape: ", bin_shape(emitter, f.ty), b"}"]));
-  bin_members(
-    emitter,
-    annotation,
-    fields.fold(emitter.b.concat(b"w"), |acc: Bytes, f: { name: Ident, ty: TypeExpr }|
-      bin_put(emitter, f.ty, acc, Bytes::concat_all([v, b".", f.name.name]))),
-    record_take(emitter, fields, emitter.b.concat(b"n"), b""),
-    Bytes::concat_all([
-      emitter.rt,
-      b"record_shape(",
-      emitter.b,
-      b"s, [",
-      Bytes::join(shapes, b", "),
-      b"])",
-    ]),
-  )
-}
-
-/// A variant is its index among the declared constructors, then its fields in order.
-fn bin_sum(
-  emitter: DeriveEmitter,
-  def: TypeDef,
-  variants: List<VariantDef>,
-  target: Bytes,
-) -> List<Member> / {abort.raise} = {
-  let count = variants.len();
-  let arms = range(0, count).map(|vi: Int| {
-    let v = variants.get(vi);
-    let binders = range(0, v.fields.len()).map(|i: Int| emitter.b.concat(ascii_of_int(i)));
-    let pat = if binders.len() == 0 { v.name.name }
-    else { Bytes::concat_all([v.name.name, b"(", Bytes::join(binders, b", "), b")"]) };
-    let tagged = Bytes::concat_all([
-      emitter.rt,
-      b"put_tag(",
-      emitter.b,
-      b"w, ",
-      ascii_of_int(vi),
-      b")",
-    ]);
-    let body = range(0, v.fields.len()).fold(tagged, |acc: Bytes, i: Int|
-      bin_put(emitter, v.fields.get(i), acc, binders.get(i)));
-    Bytes::concat_all([pat, b" -> ", body])
-  });
-  // An argument written as a record is read field by field and built as a literal, so the
-  // constructor holds it in place with no record made first.
-  let cases = range(0, count).map(|vi: Int| {
-    let v = variants.get(vi);
-    let read = v.fields.fold(
-      { tys: [], args: [] },
-      |acc: { tys: List<TypeExpr>, args: List<Bytes> }, ty: TypeExpr|
-        match ty {
-          TRecord(r) ->
-            {
-              tys: acc.tys.concat(r.fields.map(|f: { name: Ident, ty: TypeExpr }| f.ty)),
-              args: acc.args.push(
-                Bytes::concat_all([
-                  b"{",
-                  Bytes::join(
-                    range(0, r.fields.len()).map(|k: Int|
-                      Bytes::concat_all([
-                        r.fields.get(k).name.name,
-                        b": ",
-                        emitter.b,
-                        ascii_of_int(acc.tys.len() + k),
-                        b".value",
-                      ])),
-                    b", ",
-                  ),
-                  b"}",
-                ]),
-              ),
-            },
-          _ ->
-            {
-              tys: acc.tys.push(ty),
-              args: acc.args.push(
-                Bytes::concat_all([emitter.b, ascii_of_int(acc.tys.len()), b".value"]),
-              ),
-            },
-        },
-    );
-    let args = if v.fields.len() == 0 { b"" }
-    else { Bytes::concat_all([b"(", Bytes::join(read.args, b", "), b")"]) };
-    Bytes::concat_all([
-      if vi == count - 1 { b"_" } else { ascii_of_int(vi) },
-      b" -> ",
-      bin_takes(emitter, read.tys, emitter.b.concat(b"t.at"), v.name.name.concat(args), b""),
-    ])
-  });
-  let shapes = variants.map(|v: VariantDef|
-    Bytes::concat_all([
-      b"{name: \"",
-      v.name.name,
-      b"\", fields: [",
-      shapes_of(emitter, v.fields),
-      b"]}",
-    ]));
-  let params = Bytes::join(
-    def.generics.types.map(|ident: Ident| ident.name.concat(b".shape")),
-    b", ",
-  );
-  bin_members(
-    emitter,
-    target,
-    Bytes::concat_all([b"match ", emitter.b, b"v {", Bytes::join(arms, b", "), b"}"]),
-    Bytes::concat_all([
-      b"match ",
-      emitter.rt,
-      b"take_tag(",
-      emitter.b,
-      b"d, ",
-      emitter.b,
-      b"n, ",
-      ascii_of_int(count),
-      b") {Err(",
-      emitter.b,
-      b"e) -> Err(",
-      emitter.b,
-      b"e), Ok(",
-      emitter.b,
-      b"t) -> match ",
-      emitter.b,
-      b"t.value {",
-      Bytes::join(cases, b", "),
-      b"}}",
-    ]),
-    Bytes::concat_all([
-      emitter.rt,
-      b"sum_shape(",
-      emitter.b,
-      b"s, \"",
-      emitter.path,
-      b".",
-      def.name.name,
-      b"\", \"",
-      def.name.name,
-      b"\", [",
-      params,
-      b"], [",
-      Bytes::join(shapes, b", "),
-      b"])",
-    ]),
-  )
-}
-
-/// A type back as source, for the annotations a generated lambda needs.
-pub fn render_type(ty: TypeExpr) -> Bytes / {abort.raise} =
-  match ty {
-    TVar(i) -> i.name,
-    TUnit(_) -> b"()",
-    TBad(_) -> b"()",
-    TCon(c) ->
-      qname_text(c.name).concat(
-        angled(c.args.map(render_type), ident_names(c.labels), c.rows.map(render_row)),
-      ),
-    TRecord(r) ->
-      Bytes::concat_all([
-        b"{",
-        Bytes::join(
-          r.fields.map(|f: { name: Ident, ty: TypeExpr }|
-            Bytes::concat_all([f.name.name, b": ", render_type(f.ty)])),
-          b", ",
-        ),
-        b"}",
-      ]),
-    TFn(f) -> {
-      let row = match f.effects { Some(r) -> b" / ".concat(render_row(r)), None -> b"" };
-      Bytes::concat_all([
-        b"(",
-        Bytes::join(f.params.map(render_type), b", "),
-        b") -> ",
-        render_type(f.ret),
-        row,
-      ])
-    },
-  }
-
-fn render_row(row: RowExpr) -> Bytes = {
-  let atoms = Bytes::join(row.atoms.map(render_atom), b", ");
-  match row.tail {
-    Some(t) -> Bytes::concat_all([b"{", atoms, b" | ", t.name, b"}"]),
-    None -> Bytes::concat_all([b"{", atoms, b"}"]),
-  }
-}
-
-fn render_atom(atom: AtomExpr) -> Bytes = {
-  let resource = if atom.every { b"[*]" }
-  else { match atom.resource { Some(r) -> Bytes::concat_all([b"[", r.name, b"]"]), None -> b"" } };
-  Bytes::concat_all([
-    qname_text(atom.eff),
-    b".",
-    match atom.op { Some(o) -> o.name, None -> mode_text(atom.mode) },
-    resource,
-  ])
-}
 
 // --- Every node of a generated definition stands at the `derive` item's place -------------------
 // Its numbering tells them apart, as it does the nodes of any item.
@@ -1880,7 +323,6 @@ fn retarget_pat(p: Pattern, span: Span) -> Pattern =
 
 // --- The expander --------------------------------------------------------------------------------
 
-type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
 
@@ -1925,15 +367,12 @@ type Expander = {
   path: Bytes,
   module: Module,
   types: List<TypeDef>,
-  aliases: List<Alias>,
   taken: List<Derivation>,
   answers: List<Answered>,
   claimed: List<Claimed>,
   generated: List<Generated>,
-  runtimes: List<Runtime>,
   diags: List<Diag>,
 }
-type WithPrefix = { ex: Expander, prefix: Option<Bytes> }
 
 pub type Expansion = { module: Module, derived: List<Derived>, diags: List<Diag> }
 
@@ -1947,19 +386,8 @@ fn find_claimed(xs: List<Claimed>, name: Bytes) -> Option<DeriveDef> =
       None -> if claimed.name == name { Some(claimed.def) } else { None },
     })
 
-fn find_runtime(xs: List<Runtime>, wanted: Bytes) -> Option<Runtime> =
-  xs.fold(None, |acc: Option<Runtime>, runtime: Runtime|
-    match acc {
-      Some(_) -> acc,
-      None -> if runtime.wanted == wanted { Some(runtime) } else { None },
-    })
-
 pub fn dotted(decl: ImportDecl) -> Bytes =
   Bytes::join(decl.path.map(|ident: Ident| ident.name), b".")
-
-fn find_import(imports: List<ImportDecl>, wanted: Bytes) -> Option<ImportDecl> =
-  imports.fold(None, |acc: Option<ImportDecl>, decl: ImportDecl|
-    match acc { Some(_) -> acc, None -> if dotted(decl) == wanted { Some(decl) } else { None } })
 
 /// The hidden import an interpolating module gets has no binder generated source can spell.
 fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
@@ -1973,64 +401,38 @@ fn import_binder(decl: ImportDecl) -> Option<Bytes> / {abort.raise} =
 fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   String::of_bytes(a).eq_ignore_ascii_case(String::of_bytes(b))
 
-/// Each table keeps the first of a name on its own, so an alias may follow a same-named sum type.
+/// The first type of each name is the one a `derive` names.
 fn new_expander(
   m: Int,
   path: Bytes,
   module: Module,
   taken: List<Derivation>,
   answers: List<Answered>,
-) -> Expander = {
-  let walked = module.items.fold(
-    { types: [], aliases: [] },
-    |acc: { types: List<TypeDef>, aliases: List<Alias> }, item: Item|
-      match item {
-        IType(d) -> {
-          let types = match find_type(acc.types, d.name.name) {
-            Some(_) -> acc.types,
-            None -> acc.types.push(d),
-          };
-          let aliases = match d.body {
-            TDAlias(body) -> if !is_generic(d.generics)
-                && (match find_alias(acc.aliases, d.name.name) { Some(_) -> false, None -> true }) {
-              acc.aliases.push({ name: d.name.name, body: body })
-            } else { acc.aliases },
-            _ -> acc.aliases,
-          };
-          { types: types, aliases: aliases }
-        },
-        _ -> acc,
-      },
-  );
+) -> Expander =
   {
     m: m,
     path: path,
     module: module,
-    types: walked.types,
-    aliases: walked.aliases,
+    types: module.items.fold([], |acc: List<TypeDef>, item: Item|
+      match item {
+        IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
+        _ -> acc,
+      }),
     taken: taken,
     answers: answers,
     claimed: [],
     generated: [],
-    runtimes: [],
     diags: [],
   }
-}
 
 fn run_expander(expander: Expander) -> Expander / {abort.raise} =
   expander.module.items.fold(expander, |acc: Expander, item: Item|
-    match item {
-      IDerive(def) -> match def.deriver {
-        DLibrary(binder) -> library_one(acc, def, binder),
-        _ -> unlabelled(acc, def),
-      },
-      _ -> acc,
-    })
+    match item { IDerive(def) -> library_one(acc, def), _ -> acc })
 
 // --- Library derivers ----------------------------------------------------------------------------
 
 /// The module `binder` names in `module`'s imports: the deriver a `derive` by that name runs.
-fn deriver_module(module: Module, binder: Bytes) -> Option<Bytes> / {abort.raise} =
+pub fn deriver_module(module: Module, binder: Bytes) -> Option<Bytes> / {abort.raise} =
   module.imports.fold(None, |acc: Option<Bytes>, decl: ImportDecl|
     match acc {
       Some(_) -> acc,
@@ -2046,26 +448,23 @@ fn asked_of(
 ) -> List<{ span: Span, ask: LibraryAsk }> / {abort.raise} =
   module.items.fold([], |acc: List<{ span: Span, ask: LibraryAsk }>, item: Item|
     match item {
-      IDerive(d) -> match d.deriver {
-        DLibrary(binder) -> if taken.any(|t: Derivation|
-            same_deriver(t.deriver, d.deriver) && t.target == d.target.name) { acc } else {
-          let declares = module.items.any(|i: Item|
-            match i { IType(t) -> t.name.name == d.target.name, _ -> false });
-          match if declares { deriver_module(module, binder) } else { None } {
-            None -> acc,
-            Some(deriver) ->
-              acc.push({
-                span: d.span,
-                ask: {
-                  module: deriver,
-                  declaration: declaration_bytes(
-                    declaration_of(path, module, d.target.name, d.deriver, binder),
-                  ),
-                },
-              }),
-          }
-        },
-        _ -> acc,
+      IDerive(d) -> if taken.any(|t: Derivation|
+          t.deriver == d.deriver && t.target == d.target.name) { acc } else {
+        let declares = module.items.any(|i: Item|
+          match i { IType(t) -> t.name.name == d.target.name, _ -> false });
+        match if declares { deriver_module(module, d.deriver) } else { None } {
+          None -> acc,
+          Some(deriver) ->
+            acc.push({
+              span: d.span,
+              ask: {
+                module: deriver,
+                declaration: declaration_bytes(
+                  declaration_of(path, module, d.target.name, d.deriver),
+                ),
+              },
+            }),
+        }
       },
       _ -> acc,
     })
@@ -2080,14 +479,14 @@ fn unrun_alone() -> LibraryAnswer =
     ],
   })
 
-fn library_one(expander: Expander, def: DeriveDef, binder: Bytes) -> Expander / {abort.raise} =
+fn library_one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
   match find_type(expander.types, def.target.name) {
     None -> orphan(expander, def),
     Some(target) -> match expander.taken.find(|d: Derivation|
-        same_deriver(d.deriver, def.deriver) && d.target == def.target.name) {
+        d.deriver == def.deriver && d.target == def.target.name) {
       Some(d) -> library_wrote(expander, def, d.written),
       None -> match expander.answers.find(|a: Answered| a.span == def.span) {
-        None -> unknown_deriver(expander, def, binder),
+        None -> unknown_deriver(expander, def),
         Some(a) -> match a.answer {
           Wrote(text) -> library_wrote(expander, def, [text]),
           Declined(refused) -> declined(expander, def, target, refused),
@@ -2121,7 +520,7 @@ fn library_wrote(
         def.span,
         Bytes::concat_all([
           b"the `",
-          deriver_text(def.deriver),
+          def.deriver,
           b"` deriver answered source that is not functions",
         ]),
         b"this derivation",
@@ -2155,7 +554,6 @@ fn library_wrote(
             target: def.target.name,
             span: def.span,
             written: written,
-            binders: [],
           },
         }),
       }
@@ -2200,13 +598,7 @@ fn declined(
       b"E0206",
       expander.m,
       refused_at(target, refused.at),
-      Bytes::concat_all([
-        b"`",
-        deriver_text(def.deriver),
-        b"` cannot be derived for `",
-        def.target.name,
-        b"`",
-      ]),
+      Bytes::concat_all([b"`", def.deriver, b"` cannot be derived for `", def.target.name, b"`"]),
       refused.message,
       expander.m,
       def.span,
@@ -2215,374 +607,28 @@ fn declined(
     ),
   )
 
-fn unknown_deriver(expander: Expander, def: DeriveDef, binder: Bytes) -> Expander =
+fn unknown_deriver(expander: Expander, def: DeriveDef) -> Expander =
   report(
     expander,
     error_at(
       b"E0207",
       expander.m,
       def.deriver_span,
-      Bytes::concat_all([b"`", binder, b"` is not a deriver"]),
+      Bytes::concat_all([b"`", def.deriver, b"` is not a deriver"]),
       b"unknown deriver",
       [
-        b"the built-in derivers are ".concat(
-          Bytes::join(
-            derivers().map(|d: Deriver| Bytes::concat_all([b"`", deriver_text(d), b"`"])),
-            b", ",
-          ),
-        ),
         Bytes::concat_all([
-          b"any other deriver is a module this file imports as `",
-          binder,
-          b"`, whose `pub fn derive` writes the derivation",
+          b"a deriver is a module this file imports as `",
+          def.deriver,
+          b"`, whose `pub fn derive` writes the derivation: `import std.json` for `derive json`",
         ]),
       ],
     ),
   )
 
-// A target that binds a label is refused before its fields are read.
-fn unlabelled(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
-  match find_type(expander.types, def.target.name) {
-    None -> one(expander, def),
-    Some(target) -> match target.generics.labels.at(0) {
-      None -> one(expander, def),
-      Some(label) ->
-        report(
-          expander,
-          error_at_and(
-            b"E0206",
-            expander.m,
-            label.span,
-            Bytes::concat_all([
-              b"`",
-              deriver_text(def.deriver),
-              b"` cannot be derived for `",
-              def.target.name,
-              b"`",
-            ]),
-            label_refusal(),
-            expander.m,
-            def.span,
-            b"required by this derivation",
-            [
-              Bytes::concat_all([
-                b"a label is what a function's row performs under, and a type that holds a function has no derivation, so `[",
-                label.name,
-                b"]` is used by no field a derivation could read",
-              ]),
-              Bytes::concat_all([
-                b"drop `[",
-                label.name,
-                b"]` from `",
-                def.target.name,
-                b"`, or write the dictionary by hand",
-              ]),
-            ],
-          ),
-        ),
-    },
-  }
-
-fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
-  match find_type(expander.types, def.target.name) {
-    None -> orphan(expander, def),
-    Some(target) -> {
-      let name = generated_name(def.deriver, def.target.name);
-      match find_claimed(expander.claimed, name) {
-        Some(prev) -> collision(expander, def, prev, name),
-        None -> match check_decl(def.deriver, target) {
-          Some(blocker) -> match target.body {
-            TDExtern -> native_not_derivable(expander, def, blocker),
-            _ -> not_derivable(expander, def, blocker),
-          },
-          None -> match expander.taken.find(|d: Derivation|
-              same_deriver(d.deriver, def.deriver) && d.target == def.target.name) {
-            Some(d) ->
-              wrote(
-                d.binders.fold(expander, |ex: Expander, b: RuntimeBinder| bound(ex, def, b)),
-                def,
-                d.written,
-                d.binders,
-              ),
-            None -> {
-              let rt: WithPrefix = runtime_prefix(expander, def);
-              let json: WithPrefix = match rt.prefix {
-                None -> rt,
-                Some(_) -> documents_prefix(rt.ex, def, target),
-              };
-              let ex1: Expander = json.ex;
-              match ((rt.prefix, json.prefix)) {
-                (Some(prefix), Some(documents)) ->
-                  wrote(
-                    ex1,
-                    def,
-                    emit_item(
-                      emitter(
-                        def.deriver,
-                        prefix,
-                        target.generics.types,
-                        ex1.aliases,
-                        ex1.path,
-                        cycle_of(codec_calls(ex1, def.deriver), def.target.name),
-                        documents,
-                      ),
-                      target,
-                    ),
-                    binders_of(def.deriver, prefix, documents),
-                  ),
-                _ -> ex1,
-              }
-            },
-          },
-        },
-      }
-    },
-  }
-
-/// `def` expanded to the functions `written`, whose text names each runtime module as `binders`
-/// says.
-fn wrote(
-  expander: Expander,
-  def: DeriveDef,
-  written: List<Bytes>,
-  binders: List<RuntimeBinder>,
-) -> Expander / {abort.raise} = {
-  let source = Bytes::join(written, b"\n");
-  let name = generated_name(def.deriver, def.target.name);
-  match parse_generated(source, def.span, written.len()) {
-    None -> internal(expander, def, source),
-    Some(defs) ->
-      {
-        ..expander,
-        claimed: expander.claimed.push({ name: name, def: def }),
-        generated: expander.generated.push({
-          source: source,
-          defs: defs,
-          derived: {
-            deriver: def.deriver,
-            target: def.target.name,
-            span: def.span,
-            written: written,
-            binders: binders,
-          },
-        }),
-      },
-  }
-}
-
 /// What `d` wrote, wherever its item stands.
 pub fn derivation_of(d: Derived) -> Derivation =
-  { deriver: d.deriver, target: d.target, written: d.written, binders: d.binders }
-
-/// The runtime modules a text a `deriver` wrote with `prefix`, and a row's `documents`, calls into.
-fn binders_of(
-  deriver: Deriver,
-  prefix: Bytes,
-  documents: Bytes,
-) -> List<RuntimeBinder> / {abort.raise} = {
-  let named = |module: Option<Bytes>, p: Bytes|
-    match module {
-      Some(m) -> if p.len() == 0 { [] } else { [{ module: m, binder: p.slice(0, p.len() - 2) }] },
-      None -> [],
-    };
-  named(runtime_module(deriver), prefix).concat(named(runtime_module(DJson), documents))
-}
-
-/// `expander` with the runtime module `b` names bound to its binder: by an import of the module that
-/// binds it so, else by one `def` adds. A runtime bound already keeps its binder, which every
-/// derivation of one module's expansion names it by.
-fn bound(expander: Expander, def: DeriveDef, b: RuntimeBinder) -> Expander / {abort.raise} =
-  match find_runtime(expander.runtimes, b.module) {
-    Some(_) -> expander,
-    None -> {
-      let imports = expander.module.imports.filter(|decl: ImportDecl| dotted(decl) == b.module);
-      let span = match imports.at(0) { Some(decl) -> path_span(decl), None -> def.span };
-      {
-        ..expander,
-        runtimes: expander.runtimes.push({
-          wanted: b.module,
-          prefix: b.binder.concat(b"::"),
-          added: if imports.any(|decl: ImportDecl| import_binder(decl) == Some(b.binder)) { None }
-          else {
-            Some({
-              path: b.module.split(b".").map(|s: Bytes| { name: s, span: span }),
-              kind: IAlias({ name: b.binder, span: span }),
-              span: span,
-            })
-          },
-        }),
-      }
-    },
-  }
-
-/// How a row's fields stored as documents name `std.json`, which the module must import as a
-/// `derive json` would; nothing to name for any other derivation.
-fn documents_prefix(
-  expander: Expander,
-  def: DeriveDef,
-  target: TypeDef,
-) -> WithPrefix / {abort.raise} =
-  if !same_deriver(def.deriver, DRow)
-      || !row_wants_json(emitter(DRow, b"", [], expander.aliases, expander.path, [], b""), target) {
-    { ex: expander, prefix: Some(b"") }
-  } else { runtime_prefix(expander, { ..def, deriver: DJson }) }
-
-/// Parsing what was just printed is the deriver's own round-trip check.
-fn parse_generated(source: Bytes, span: Span, count: Int) -> Option<List<FnDef>> / {abort.raise} = {
-  let r = parse(source);
-  let x = expand(r.node, r.parser.diags);
-  let defs = x.module.items.fold([], |acc: List<FnDef>, item: Item|
-    match item { IFn(d) -> acc.push(retarget_fn(d, span)), _ -> acc });
-  if x.diags.len() > 0 || x.module.items.len() != count || defs.len() != count { None }
-  else { Some(defs) }
-}
-
-// --- Codecs on a cycle ---------------------------------------------------------------------------
-
-/// A type this module derives with a codec deriver, and the derived types its codec calls by name.
-type Calls = { name: Bytes, calls: List<Bytes> }
-
-fn codec_calls(expander: Expander, deriver: Deriver) -> List<Calls> =
-  match deriver {
-    DJson -> derived_calls(expander, deriver),
-    DBin -> derived_calls(expander, deriver),
-    _ -> [],
-  }
-
-fn derived_calls(expander: Expander, deriver: Deriver) -> List<Calls> = {
-  let targets = expander.module.items.fold([], |acc: List<TypeDef>, item: Item|
-    match item {
-      IDerive(def) -> if !same_deriver(def.deriver, deriver) { acc } else {
-        match find_type(expander.types, def.target.name) { Some(t) -> acc.push(t), None -> acc }
-      },
-      _ -> acc,
-    });
-  let names = targets.map(|t: TypeDef| t.name.name);
-  targets.map(|t: TypeDef|
-    { name: t.name.name, calls: named_in_def(deriver, t).filter(|n: Bytes| names.contains(n)) })
-}
-
-fn named_in_def(deriver: Deriver, type_def: TypeDef) -> List<Bytes> =
-  match type_def.body {
-    TDAlias(body) -> named_in(deriver, body),
-    TDNominal(body) -> named_in(deriver, body),
-    TDSum(variants) ->
-      variants.fold([], |acc: List<Bytes>, variant: VariantDef|
-        variant.fields.fold(acc, |inner: List<Bytes>, ty: TypeExpr|
-          inner.concat(named_in(deriver, ty)))),
-    TDExtern -> [],
-  }
-
-/// The types `codec` composes through by a name of this module's.
-fn named_in(deriver: Deriver, te: TypeExpr) -> List<Bytes> =
-  match te {
-    TCon(c) -> {
-      let inner = c.args.fold([], |acc: List<Bytes>, a: TypeExpr| acc.concat(named_in(deriver, a)));
-      match constructor_shape(deriver, c.name.name.name) {
-        Nominal -> if is_bare(c.name) { inner.push(c.name.name.name) } else { inner },
-        _ -> inner,
-      }
-    },
-    TRecord(r) ->
-      r.fields.fold([], |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
-        acc.concat(named_in(deriver, f.ty))),
-    _ -> [],
-  }
-
-fn callees(calls: List<Calls>, name: Bytes) -> List<Bytes> =
-  calls.fold([], |acc: List<Bytes>, c: Calls|
-    if c.name == name { acc.concat(c.calls) } else { acc })
-
-/// Every type a chain of one or more calls leads to from `from`: no chain is longer than the types.
-fn reached(calls: List<Calls>, from: Bytes) -> List<Bytes> =
-  range(0, calls.len()).fold(callees(calls, from), |seen: List<Bytes>, _: Int|
-    seen.fold(seen, |acc: List<Bytes>, n: Bytes|
-      callees(calls, n).fold(acc, |more: List<Bytes>, m: Bytes|
-        if more.contains(m) { more } else { more.push(m) })))
-
-/// Empty unless `target`'s codec calls itself, through any of the others.
-fn cycle_of(calls: List<Calls>, target: Bytes) -> List<Bytes> =
-  reached(calls, target).filter(|n: Bytes| reached(calls, n).contains(target))
-
-/// How this module writes a name that lives in the deriver's runtime module.
-fn runtime_prefix(expander: Expander, def: DeriveDef) -> WithPrefix / {abort.raise} =
-  match runtime_module(def.deriver) {
-    None -> { ex: expander, prefix: Some(b"") },
-    Some(wanted) -> match find_runtime(expander.runtimes, wanted) {
-      Some(r) -> { ex: expander, prefix: Some(r.prefix) },
-      None -> match find_import(expander.module.imports, wanted) {
-        None ->
-          {
-            ex: report(
-              expander,
-              error_at(
-                b"E0206",
-                expander.m,
-                def.span,
-                Bytes::concat_all([
-                  b"`",
-                  deriver_text(def.deriver),
-                  b"` cannot be derived here: this module does not import `",
-                  wanted,
-                  b"`",
-                ]),
-                Bytes::concat_all([b"needs `", wanted, b"`"]),
-                [
-                  Bytes::concat_all([
-                    b"add `import ",
-                    wanted,
-                    b"` \xe2\x80\x94 the dictionary type and the codecs a derivation composes with ship there",
-                  ]),
-                ],
-              ),
-            ),
-            prefix: None,
-          },
-        Some(decl) -> {
-          let bound: { binder: Bytes, added: Option<ImportDecl> } = match import_binder(decl) {
-            Some(b) -> { binder: b, added: None },
-            None -> {
-              let b = free_binder(expander, def.deriver);
-              let span = path_span(decl);
-              {
-                binder: b,
-                added: Some({
-                  path: runtime_path(def.deriver).map(|s: Bytes| { name: s, span: span }),
-                  kind: IAlias({ name: b, span: span }),
-                  span: span,
-                }),
-              }
-            },
-          };
-          let prefix = bound.binder.concat(b"::");
-          {
-            ex: {
-              ..expander,
-              runtimes: expander.runtimes.push({
-                wanted: wanted,
-                prefix: prefix,
-                added: bound.added,
-              }),
-            },
-            prefix: Some(prefix),
-          }
-        },
-      },
-    },
-  }
-
-/// A module binder nothing in this file already binds.
-fn free_binder(expander: Expander, deriver: Deriver) -> Bytes / {abort.raise} = {
-  let path = runtime_path(deriver);
-  let base = if path.len() == 0 { b"" } else { path.get(path.len() - 1) };
-  iterate(base, expander.module.imports.len() + expander.runtimes.len() + 2, |x: Bytes| {
-    let by_import = expander.module.imports.fold(false, |acc: Bool, decl: ImportDecl|
-      acc || (match import_binder(decl) { Some(b) -> b == x, None -> false }));
-    let by_runtime = expander.runtimes.fold(false, |acc: Bool, runtime: Runtime|
-      acc || runtime.prefix == x.concat(b"::"));
-    if by_import || by_runtime { Continue(x.concat(b"_")) } else { Stop(x) }
-  })
-}
+  { deriver: d.deriver, target: d.target, written: d.written }
 
 fn orphan(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} = {
   let near = expander.types.fold(None, |acc: Option<Bytes>, type_def: TypeDef|
@@ -2614,7 +660,7 @@ fn collision(expander: Expander, def: DeriveDef, prev: DeriveDef, name: Bytes) -
   let note = if prev.target.name == def.target.name {
     Bytes::concat_all([
       b"`derive ",
-      deriver_text(def.deriver),
+      def.deriver,
       b" for ",
       def.target.name,
       b"` is already written above; remove one",
@@ -2646,95 +692,9 @@ fn collision(expander: Expander, def: DeriveDef, prev: DeriveDef, name: Bytes) -
   )
 }
 
-/// An `extern type` has no fields, so what a derivation would read of it is stated by hand.
-fn native_not_derivable(expander: Expander, def: DeriveDef, blocker: Blocker) -> Expander =
-  report(
-    expander,
-    error_at_and(
-      b"E0206",
-      expander.m,
-      blocker.span,
-      Bytes::concat_all([
-        b"`",
-        deriver_text(def.deriver),
-        b"` cannot be derived for `",
-        def.target.name,
-        b"`",
-      ]),
-      blocker.reason,
-      expander.m,
-      def.span,
-      b"required by this derivation",
-      [b"write the dictionary by hand over what its module's functions read of a value"],
-    ),
-  )
-
-fn not_derivable(expander: Expander, def: DeriveDef, blocker: Blocker) -> Expander = {
-  let head = Bytes::concat_all([
-    b"`derive ",
-    deriver_text(def.deriver),
-    b" for ",
-    def.target.name,
-    b"` requires every field to be derivable",
-  ]);
-  let with_note = match blocker.note { Some(n) -> [head, n], None -> [head] };
-  let with_variant = match blocker.variant {
-    Some(v) -> with_note.push(Bytes::concat_all([b"the field is in variant `", v, b"`"])),
-    None -> with_note,
-  };
-  let notes = with_variant.push(
-    Bytes::concat_all([
-      b"remove the field from `",
-      def.target.name,
-      b"`, or write the dictionary by hand",
-    ]),
-  );
-  report(
-    expander,
-    error_at_and(
-      b"E0206",
-      expander.m,
-      blocker.span,
-      Bytes::concat_all([
-        b"`",
-        deriver_text(def.deriver),
-        b"` cannot be derived for `",
-        def.target.name,
-        b"`",
-      ]),
-      blocker.reason,
-      expander.m,
-      def.span,
-      b"required by this derivation",
-      notes,
-    ),
-  )
-}
-
-fn internal(expander: Expander, def: DeriveDef, source: Bytes) -> Expander =
-  report(
-    expander,
-    error_at(
-      b"E0505",
-      expander.m,
-      def.span,
-      Bytes::concat_all([
-        b"the `",
-        deriver_text(def.deriver),
-        b"` deriver generated a definition that does not parse",
-      ]),
-      b"this derivation",
-      [
-        b"this is a compiler bug: derivation is total, so generation cannot fail",
-        b"it generated: ".concat(source),
-      ],
-    ),
-  )
-
-/// Appends the generated definitions and any import a runtime module needed; `path` names the module.
-/// `module` is part of that module where `taken` holds what the module's expansion wrote of each
-/// derivation of the part: each is expanded to that. `library` runs a library derivation; with none,
-/// each is reported unrun.
+/// Appends the generated definitions; `path` names the module. `module` is part of that module where
+/// `taken` holds what the module's expansion wrote of each derivation of the part: each is expanded
+/// to that. `library` runs a library derivation; with none, each is reported unrun.
 pub fn expand_derives<| e>(
   m: Int,
   path: Bytes,
@@ -2742,19 +702,16 @@ pub fn expand_derives<| e>(
   taken: List<Derivation> = [],
   library: Option<(LibraryAsk) -> LibraryAnswer / {abort.raise | e}> = None,
 ) -> Expansion / {abort.raise | e} =
-  if !module.items.fold(false, |b: Bool, item: Item|
-      b || (match item { IDerive(_) -> true, _ -> false })) {
+  if !module.items.any(|item: Item| match item { IDerive(_) -> true, _ -> false }) {
     { module: module, derived: [], diags: [] }
   } else {
     let answers = asked_of(path, module, taken).map(|x: { span: Span, ask: LibraryAsk }|
       { span: x.span, answer: match library { Some(run) -> run(x.ask), None -> unrun_alone() } });
     let ex = run_expander(new_expander(m, path, module, taken, answers));
-    let added = ex.runtimes.fold([], |acc: List<ImportDecl>, runtime: Runtime|
-      match runtime.added { Some(i) -> acc.push(i), None -> acc });
     {
       module: {
         doc: module.doc,
-        imports: module.imports.concat(added),
+        imports: module.imports,
         items: ex.generated.fold(module.items, |acc: List<Item>, generated: Generated|
           acc.concat(generated.defs.map(|def: FnDef| IFn(def)))),
       },
@@ -2763,278 +720,8 @@ pub fn expand_derives<| e>(
     }
   }
 
-/// The source each of this module's derivations generates, in `derive` order.
-pub fn preview(path: Bytes, module: Module) -> List<Bytes> / {abort.raise} =
-  run_expander(new_expander(0, path, module, [], [])).generated.map(|generated: Generated|
-    generated.source)
-
-/// Each module expanded on its own: its generated sources length-prefixed, then its diagnostics.
-pub fn derive_dump(sources: List<Source>) -> String / {abort.raise} = {
-  let out = range(0, sources.len()).fold(b"", |acc: Bytes, i: Int| {
-    let s = sources.get(i);
-    let r = parse(s.src);
-    let x = expand(r.node, r.parser.diags);
-    let generated = preview(s.name, x.module);
-    let d: Expansion = expand_derives(i, s.name, x.module);
-    Bytes::concat_all([
-      acc,
-      b"M;",
-      ascii_of_int(generated.len()),
-      b";",
-      Bytes::concat_all(
-        generated.map(|g: Bytes| Bytes::concat_all([b"S;", ascii_of_int(g.len()), b";", g])),
-      ),
-      dump_diags(d.diags),
-    ])
-  });
-  String::of_bytes(out)
-}
-
 // --- Tests ------------------------------------------------------------------
 
-test "snake_case follows the rule, acronyms included" {
-  assert_eq(snake_case(b"Order"), b"order");
-  assert_eq(snake_case(b"OrderLine"), b"order_line");
-  assert_eq(snake_case(b"HTTPRequest"), b"http_request");
-  assert_eq(snake_case(b"HttpRequest"), b"http_request");
-  assert_eq(snake_case(b"Order2Line"), b"order2_line");
-  assert_eq(snake_case(b"A"), b"a");
-  assert_eq(generated_name(DJson, b"OrderLine"), b"order_line_json")
-}
-
-// What a derived codec does is tested by running it, in `tests/cli/derive.ply`.
-test "each derivation writes the function a program calls, named for its type and its kind" {
-  let src = b"import std.bin\nimport std.json\ntype Order = {id: Int, lines: List<Line>}\ntype Line = {sku: String}\ntype Status = Placed | Shipped(Int)\nderive json for Order\nderive bin for Line\nderive json for Status";
-  let out = preview(b"t", parse(src).node);
-  assert_eq(
-    range(0, out.len()).filter(|i: Int|
-      !out.get(i).starts_with(match i {
-        0 -> b"fn order_json() -> json::JsonCodec<Order> = ",
-        1 -> b"fn line_bin() -> bin::BinCodec<Line> = ",
-        _ -> b"fn status_json() -> json::JsonCodec<Status> = ",
-      })),
-    [],
-  );
-  assert_eq(out.len(), 3)
-}
-
-test "the bin form writes scalars straight, composes the rest, and keys a sum by its module" {
-  let src = b"import std.bin\ntype Line = {sku: String, qty: U32, tags: List<String>}\ntype Tree<a> = Leaf | Node(Tree<a>, a)\nderive bin for Line\nderive bin for Tree";
-  let out = preview(b"shop", parse(src).node);
-  assert_eq(out.len(), 2);
-  let line = out.get(0);
-  let tree = out.get(1);
-  assert(line.starts_with(b"fn line_bin() -> bin::BinCodec<Line> = "), None);
-  // A scalar field is written by its own writer; a list composes its items' writer.
-  assert(line.index_of(b"bin::put_u32(") != None && line.index_of(b"bin::take_u32(") != None, None);
-  assert(line.index_of(b"bin::put_list(") != None, None);
-  // A generic sum takes its parameter's codec, and its shape is keyed by its module's name.
-  assert(
-    tree.starts_with(
-      b"fn tree_bin<a>(a: bin::BinCodec<a>) -> bin::BinCodec<Tree<a>> where derivable(bin, a) = ",
-    ),
-    None,
-  );
-  assert(tree.index_of(b"\"shop.Tree\"") != None, None)
-}
-
-test "a `Columns` is coded as the list of its records, through its builtins" {
-  let src = b"import std.bin\nimport std.json\ntype P = {x: Int}\ntype Batch = {ps: Columns<P>}\nderive bin for P\nderive json for P\nderive bin for Batch\nderive json for Batch";
-  let all = Bytes::concat_all(preview(b"m", parse(src).node));
-  assert(all.index_of(b"Columns::to_list(") != None);
-  assert(all.index_of(b"Columns::of_list(") != None);
-  assert(all.index_of(b"put_columns") == None);
-  assert(all.index_of(b"columns_json(") == None)
-}
-
-test "a row reads a column per field, and a field that is no scalar as a document through its codec" {
-  let src = b"import std.sql\nimport std.json\ntype Money = Decimal\ntype Line = {sku: String}\ntype Part = {sku: String, price: Money, note: Option<String>, tags: List<Int>, lines: List<Line>}\nderive json for Line\nderive row for Part";
-  let out = preview(b"shop", parse(src).node);
-  assert_eq(out.len(), 2);
-  let part = out.get(1);
-  assert(part.starts_with(b"fn part_row() -> sql::RowCodec<Part> = "), None);
-  // An alias is the column of the type it names; a list of records is a document.
-  assert(
-    [
-      b"sql::field(\"sku\", sql::text_field())",
-      b"sql::field(\"price\", sql::numeric_field())",
-      b"sql::field(\"note\", sql::optional_field(sql::text_field()))",
-      b"sql::field(\"tags\", sql::array_field(sql::int_field()))",
-      b"sql::field(\"lines\", sql::json_field(json::list_json(line_json())))",
-    ].all(|column: Bytes| part.index_of(column) != None),
-    None,
-  );
-  match row_shape(parse(src).node, b"Part") {
-    None -> panic("a record declared in the module has a row"),
-    Some(fields) ->
-      assert_eq(fields.map(|f: RowField| f.name), [b"sku", b"price", b"note", b"tags", b"lines"]),
-  };
-  let refused = |text: Bytes| expand_derives(0, b"t", parse(text).node).diags.map(|d: Diag| d.code);
-  // A row is a record's fields; a sum, a type with parameters and a missing `std.json` have none.
-  assert_eq(refused(b"import std.sql\ntype S = | A | B\nderive row for S"), [b"E0206"]);
-  assert_eq(refused(b"import std.sql\ntype P<a> = {x: a}\nderive row for P"), [b"E0206"]);
-  assert_eq(refused(b"import std.sql\ntype L = {x: Int}\ntype P = {l: L}\nderive row for P"), [
-    b"E0206",
-  ]);
-  assert_eq(refused(b"type P = {x: Int}\nderive row for P"), [b"E0206"]);
-  // A row is no constraint a type parameter can be held to.
-  assert(parse(b"fn f<a>(x: a) -> a where derivable(row, a) = x").parser.diags.len() > 0)
-}
-
-test "an `extern type` has no field a derivation reads, so nothing derives one" {
-  let refused = |text: Bytes|
-    expand_derives(0, b"std.t", parse(text).node).diags.map(|d: Diag| d.code);
-  assert_eq(refused(b"import std.json\nextern type Node<a>\nderive json for Node\n"), [b"E0206"])
-}
-
-test "a bin codec on a cycle calls its cycle by name through a list, and reads a variant's record in place" {
-  let src = b"import std.bin\ntype Expr = Num(Int) | Block(List<Stmt>)\ntype Stmt = Let({name: String, value: Expr})\nderive bin for Expr\nderive bin for Stmt";
-  let out = preview(b"t", parse(src).node);
-  assert_eq(out.len(), 2);
-  let expr = out.get(0);
-  let stmt = out.get(1);
-  let has = |text: Bytes, part: Bytes| text.index_of(part) != None;
-  // `Expr` reaches `Stmt` through a list, by name, one depth less.
-  assert(has(expr, b"bin::put_list(") && has(expr, b"bin::take_list("), None);
-  assert(has(expr, b"stmt_bin_put(ddepth - 1, ") && has(expr, b"stmt_bin_take(ddepth - 1, "), None);
-  // `Stmt`'s variant record is read field by field where the variant holds it.
-  assert(has(stmt, b"expr_bin_put(ddepth - 1, ") && has(stmt, b"d0.name"), None);
-  assert(has(stmt, b"Let({name: d0.value, value: d1.value})"), None);
-  assert_eq(expand_derives(0, b"t", parse(src).node).diags.len(), 0)
-}
-
-test "a codec on a cycle hands the cycle one depth less, and calls a codec off it as written" {
-  let src = b"import std.json\ntype Expr = Num(Int) | Block(List<Stmt>) | Lit(Literal)\ntype Stmt = Bare(Expr) | Let({name: String, value: Expr})\ntype Literal = Text(String)\nderive json for Expr\nderive json for Stmt\nderive json for Literal";
-  let out = preview(b"t", parse(src).node);
-  assert_eq(out.len(), 3);
-  let expr = out.get(0);
-  // The codec a program calls starts the cycle at its deepest, past which it refuses.
-  assert(expr.starts_with(b"fn expr_json() -> json::JsonCodec<Expr> = "), None);
-  assert(
-    expr.index_of(b"expr_json_at(json::max_depth())") != None
-      && expr.index_of(b"json::too_deep()") != None,
-    None,
-  );
-  assert(expr.index_of(b"json::list_json(stmt_json_at(ddepth - 1))") != None);
-  assert(expr.index_of(b"(literal_json().encode)") != None);
-  assert(expr.index_of(b"json::has_tag(dt, \"Num\")") != None);
-  assert(out.get(2).index_of(b"dt.tag == \"Text\"") != None);
-  assert(out.get(1).index_of(b"value: (expr_json_at(ddepth - 1).encode)(d0.value)}") != None);
-  // A type off the cycle is one definition.
-  assert(out.get(2).index_of(b"\nfn ") == None);
-  let x = expand_derives(0, b"t", parse(src).node);
-  assert_eq(x.diags.len(), 0);
-  assert_eq(x.derived.len(), 3)
-}
-
-test "a selective import of std.json still writes a module binder, stepping around a taken name" {
-  let src = b"import other.json\nimport std.json (JsonCodec, Json, object, field, int_json)\ntype Order = {id: Int}\nderive json for Order";
-  let x = expand_derives(0, b"t", parse(src).node);
-  assert_eq(x.diags.len(), 0);
-  assert_eq(x.module.imports.len(), 3);
-  assert(
-    preview(b"t", parse(src).node).get(0).starts_with(
-      b"fn order_json() -> json_::JsonCodec<Order>",
-    ),
-  )
-}
-
-test "part of a module expands a derivation as its module's expansion wrote it, cycle and binder alike" {
-  let module = b"import other.json\nimport std.json (Json)\ntype Tree = {groves: List<Grove>}\ntype Grove = {trees: List<Tree>}\nderive json for Tree\nderive json for Grove";
-  let part = b"import std.json (Json)\ntype Tree = {groves: List<Grove>}\nderive json for Tree";
-  let written = |x: Expansion| x.derived.map(|d: Derived| d.written);
-  let whole = expand_derives(0, b"t", parse(module).node);
-  let tree = whole.derived.filter(|d: Derived| d.target == b"Tree").map(|d: Derived| d.written);
-  assert(written(expand_derives(0, b"t", parse(part).node)) != tree);
-  let taken = expand_derives(0, b"t", parse(part).node, taken: whole.derived.map(derivation_of));
-  assert_eq(taken.diags.len(), 0);
-  assert_eq(written(taken), tree);
-  assert_eq(taken.module.imports.map(import_binder), [None, Some(b"json_")])
-}
-
-test "every node of a generated definition stands at the derive item's place, its numbering telling them apart" {
-  let src = b"import std.json\ntype Order = {id: Int, name: String}\nderive json for Order";
-  let x = expand_derives(0, b"t", parse(src).node);
-  assert_eq(x.derived.len(), 1);
-  let d = x.derived.get(0);
-  assert_eq(d.span, span_between(53, 74));
-  match numbered(x.module.items.get(x.module.items.len() - 1)) {
-    IFn(f) -> {
-      assert_eq(f.span, d.span);
-      assert_eq(f.name.span, d.span);
-      let spans = picked_in({ ..x.module, items: [IFn(f)] }, |_: Expr| true).map(expr_span);
-      assert(spans.len() > 4);
-      assert_eq(spans.map(|s: Span| span_between(s.start, s.end)), spans.map(|_: Span| d.span));
-      assert_eq(spans.map(|s: Span| s.site).unique().len(), spans.len());
-      assert_eq(spans.filter(|s: Span| s.site == 0), [])
-    },
-    _ -> assert(false),
-  }
-}
-
-test "a type that takes a row derives over it, and one that takes a label has no derivation" {
-  let out = preview(
-    b"t",
-    parse(
-      b"import std.json\ntype Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive json for Tagged\nderive json for Pair",
-    ).node,
-  );
-  // Its function is generic over the row as the type is.
-  assert(
-    out.get(0).starts_with(
-      b"fn tagged_json<a | e>(a: json::JsonCodec<a>) -> json::JsonCodec<Tagged<a | e>> where derivable(json, a) = ",
-    ),
-    None,
-  );
-  let refused = |src: Bytes|
-    expand_derives(0, b"t", parse(src).node).diags.map(|diag: Diag| {
-      let primary = diag.labels.get(0);
-      [diag.code, src.slice(primary.start, primary.end)]
-    });
-  assert_eq(
-    refused(b"import std.json\ntype Tagged<a, [l]> = | Tagged(a)\nderive json for Tagged"),
-    [[b"E0206", b"l"]],
-  );
-  assert_eq(
-    refused(
-      b"import std.json\ntype Tagged<a, [l]> = | Tagged(a)\ntype Pair = {left: Tagged<Int, [conn]>}\nderive json for Pair",
-    ),
-    [[b"E0206", b"left: Tagged<Int, [conn]>"]],
-  )
-}
-
-test "an orphan, a collision, a missing runtime and a refused field each report as the reference does" {
-  let orphan_ = expand_derives(0, b"t", parse(b"import std.json\nderive json for Order").node);
-  assert_eq(orphan_.diags.map(|diag: Diag| diag.code), [b"E0208"]);
-  let twice = expand_derives(
-    0,
-    b"t",
-    parse(
-      b"import std.json\ntype Order = {id: Int}\nderive json for Order\nderive json for Order",
-    ).node,
-  );
-  assert_eq(twice.diags.map(|diag: Diag| diag.code), [b"E0105"]);
-  assert_eq(twice.diags.get(0).labels.len(), 2);
-  let missing = expand_derives(
-    0,
-    b"t",
-    parse(b"type Order = {id: Int}\nderive json for Order").node,
-  );
-  assert_eq(missing.diags.map(|diag: Diag| diag.code), [b"E0206"]);
-  let refused = expand_derives(
-    0,
-    b"t",
-    parse(
-      b"import std.json\ntype Order = {id: Int, on_complete: (Int) -> Unit}\nderive json for Order",
-    ).node,
-  );
-  assert_eq(refused.diags.map(|diag: Diag| diag.code), [b"E0206"]);
-  let first = refused.diags.get(0).labels.get(0);
-  assert_eq(first.start, 39);
-  assert_eq(first.end, 65)
-}
-
-/// `src` expanded with each library derivation answered `answer`, beside what each one asked.
 fn library_expanded(
   src: Bytes,
   answer: LibraryAnswer,
@@ -3072,7 +759,7 @@ test "a library derivation asks its module's deriver with the module's types, an
   );
   assert_eq(x.expansion.diags, []);
   assert_eq(x.asked.map(|a: LibraryAsk| a.module), [b"lib.mapping"]);
-  let declaration = declaration_of(b"t", parse(src).node, b"Box", DLibrary(b"mapping"), b"mapping");
+  let declaration = declaration_of(b"t", parse(src).node, b"Box", b"mapping");
   assert_eq(x.asked.get(0).declaration, declaration_bytes(declaration));
   assert_eq(declaration.target, "Box");
   assert_eq(declaration.binder, "mapping");
@@ -3116,4 +803,29 @@ test "a library deriver's refusal, failure, or text that is not functions each r
   let unknown = library_expanded(b"type Box<a> = | Box(a)\nderive mapping for Box\n", Wrote(b""));
   assert_eq(unknown.expansion.diags.map(|d: Diag| d.code), [b"E0207"]);
   assert_eq(unknown.asked, [])
+}
+
+test "every node of a generated definition stands at the derive item's place, its numbering telling them apart" {
+  let src = b"import lib.naming as naming\ntype Order = {id: Int, name: String}\nderive naming for Order";
+  let x = library_expanded(
+    src,
+    Wrote(
+      b"fn order_named(o: Order) -> String = if o.id > 0 { o.name } else { \"none\" ++ o.name }",
+    ),
+  ).expansion;
+  assert_eq(x.derived.len(), 1);
+  let d = x.derived.get(0);
+  assert_eq(d.span, span_between(src.index_of(b"derive").at_or(0), src.len()));
+  match numbered(x.module.items.get(x.module.items.len() - 1)) {
+    IFn(f) -> {
+      assert_eq(f.span, d.span);
+      assert_eq(f.name.span, d.span);
+      let spans = picked_in({ ..x.module, items: [IFn(f)] }, |_: Expr| true).map(expr_span);
+      assert(spans.len() > 4);
+      assert_eq(spans.map(|s: Span| span_between(s.start, s.end)), spans.map(|_: Span| d.span));
+      assert_eq(spans.map(|s: Span| s.site).unique().len(), spans.len());
+      assert_eq(spans.filter(|s: Span| s.site == 0), [])
+    },
+    _ -> assert(false),
+  }
 }

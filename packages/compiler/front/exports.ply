@@ -19,9 +19,9 @@ import compiler.front.pkg (PackageSources, Supplied, Judged)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive,
                               IEffectSet, IExtern, is_shipped, IInstance, INumeric, TDSum,
                               ImportDecl, IModule, IAlias, INames, VariantDef, OpDef, Derived,
-                              Derivation, DRow, DLibrary, parse, parse_started, header, header_of,
-                              is_written, item_span, import_decl_bin, owner_of, item_owner,
-                              member_of, member_name, is_builtin, derivation_bin)
+                              Derivation, parse, parse_started, header, header_of, is_written,
+                              item_span, import_decl_bin, owner_of, item_owner, member_of,
+                              member_name, is_builtin, derivation_bin)
 import compiler.syntax.fmt (printed_alone)
 import compiler.syntax.exprs (EBlock, expr_span, freed_by, prelude_module, map_literal_call)
 import compiler.store.hash.forms (Fixed, Fixing, NodeRef, HashOutput, fixed_nodes, fixing_of,
@@ -31,7 +31,7 @@ import compiler.store.hash.template (called_at, written_code, written_for, cross
 import compiler.store.hash.graph (Index)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, Label)
 import compiler.front.diagnostics (ParsedSource, parse_at, parse_from, with_prelude_source)
-import compiler.expand.derive (dotted, runtime_module, same_deriver, derivation_of)
+import compiler.expand.derive (dotted, derivation_of, deriver_module)
 import compiler.expand.embed (EmbedFile)
 import compiler.syntax.lexer (lex, Token, Identifier, Punctuation, Keyword, StringLiteral,
                               InterpolatedHead, LineString, EndOfInput, is_ident_start, bound_names)
@@ -377,17 +377,21 @@ fn hidden_of(raw: Module) -> List<Mention> =
 /// Whether `d` imports a module for names read with no import, which are mentioned where read.
 fn freed(d: ImportDecl) -> Bool = match d.kind { IAlias(a) -> freed_by(a.name) != [], _ -> false }
 
-/// Whether `item` is a `derive` an entry holds as the functions it generates.
-fn signed(item: Item) -> Bool =
-  match item { IDerive(d) -> !same_deriver(d.deriver, DRow), _ -> false }
+/// Whether `item` is a `derive` an entry holds as the functions it generates. A `derive sql` is held
+/// as written beside the types it reads: a check of a statement that reads rows by its codec reads
+/// the codec's columns from them.
+fn signed(raw: Module, item: Item) -> Bool =
+  match item { IDerive(d) -> deriver_module(raw, d.deriver) != Some(b"std.sql"), _ -> false }
 
-/// The runtime modules the `derive`s among `items` call into.
-fn runtimes_of(items: List<Item>) -> List<Bytes> =
+/// The deriver modules of the `derive`s among `items` an entry holds as written.
+fn runtimes_of(raw: Module, items: List<Item>) -> List<Bytes> =
   items.fold([], |acc: List<Bytes>, item: Item|
     match item {
-      IDerive(d) -> match runtime_module(d.deriver) {
-        Some(m) -> if acc.contains(m) { acc } else { acc.push(m) },
-        None -> acc,
+      IDerive(d) -> if signed(raw, item) { acc } else {
+        match deriver_module(raw, d.deriver) {
+          Some(m) -> if acc.contains(m) { acc } else { acc.push(m) },
+          None -> acc,
+        }
       },
       _ -> acc,
     })
@@ -668,15 +672,14 @@ pub fn exports_of(
   let items = grouped(raw.items.filter(|item: Item| owner_of(item) != None), |item: Item|
     match owner_of(item) { Some(o) -> o, None -> b"" });
   let generated = generated_by_owner(raw, parsed, fns);
-  let added = parsed.module.imports.drop(raw.imports.len());
   {
     module: module,
     owners: owners,
     entries: items.fold(Map::new(), |acc: Map<Bytes, Entry>, o: Bytes, its: List<Item>| {
-      let stated = alone(text, its.filter(|item: Item| !signed(item)).map(bare));
+      let stated = alone(text, its.filter(|item: Item| !signed(raw, item)).map(bare));
       let fs = match generated.get(o) { Some(fs) -> fs, None -> [] };
       let derives = its.fold(Map::new(), |spans: Map<Bytes, Bool>, item: Item|
-        if signed(item) { spans.insert(span_key(item_span(item)), true) } else { spans });
+        if signed(raw, item) { spans.insert(span_key(item_span(item)), true) } else { spans });
       let printed = stated.concat(
         alone(text, fs.filter(|f: Item| derives.contains(span_key(item_span(f)))).map(bare)),
       );
@@ -684,17 +687,12 @@ pub fn exports_of(
       let mentions = distinct(
         mentioned(sc.written, stated).concat(expansion).concat(hidden_read(printed)),
       ).filter(|m: Mention| !(m.module == module && m.name == o));
-      let runtimes = runtimes_of(its);
+      let runtimes = runtimes_of(raw, its);
       acc.insert(o, {
         reach: b"",
         owner: o,
         text: printed,
-        imports: imports_for(raw.imports, targets, mentions, runtimes).concat(
-          // The binder an expansion gave a runtime no import of the module's binds.
-          added.filter(|d: ImportDecl| is_written(d) && runtimes.contains(dotted(d))),
-        ).map(
-          unplaced,
-        ),
+        imports: imports_for(raw.imports, targets, mentions, runtimes).map(unplaced),
         mentions: mentions,
         rows: match rows.get(o) { Some(xs) -> xs, None -> [] },
         fixed: match fixed.get(o) { Some(xs) -> xs, None -> [] },
@@ -764,7 +762,7 @@ pub fn wanted_in(
   );
   let selected = sc.written.selected.fold([], |acc: List<Mention>, n: Bytes, ms: List<Bytes>|
     acc.concat(ms.map(|m: Bytes| { module: m, name: n })));
-  let runtimes = runtimes_of(raw.items).map(|m: Bytes| { module: m, name: b"" });
+  let runtimes = runtimes_of(raw, raw.items).map(|m: Bytes| { module: m, name: b"" });
   distinct(
     mentioned_in(sc.written, tokens).concat(expansion).concat(selected).concat(
       runtimes.concat(hidden_of(raw)),
@@ -1125,7 +1123,7 @@ pub fn owner_reads(
       texts: its.map(|item: Item| text.slice(written_start(text, item), item_span(item).end)),
       starts: its.map(|item: Item| written_start(text, item)),
       generated: match generated.get(o) { Some(fs) -> alone(text, fs), None -> b"" },
-      runtimes: runtimes_of(its),
+      runtimes: runtimes_of(raw, its),
       derived: its.fold([], |acc: List<Derivation>, item: Item|
         match item {
           IDerive(d) -> match parsed.derived.find(|x: Derived| x.span == d.span) {
@@ -1732,19 +1730,17 @@ fn kinds_derived() -> List<ModuleDerivations> =
       module: b"kinds",
       derivations: [
         {
-          deriver: DLibrary(b"likeness"),
+          deriver: b"likeness",
           target: b"Shape",
           written: [
             b"pub fn shape_alike(a: Shape, b: Shape) -> Bool = a == b",
             b"pub fn shape_order(a: Shape, b: Shape) -> Ordering = compare(a, b)",
           ],
-          binders: [],
         },
         {
-          deriver: DLibrary(b"likeness"),
+          deriver: b"likeness",
           target: b"Pair",
           written: [b"pub fn pair_alike(a: Pair, b: Pair) -> Bool = a == b"],
-          binders: [],
         },
       ],
     },
