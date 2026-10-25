@@ -18,6 +18,9 @@ import compiler.front (published, staged_pulling_std_with, analyse_pulling_std_w
 import compiler.front.facts (ModuleShape, ModuleTables, answered_program, answered_load,
                              functions_of, tests_of)
 import compiler.syntax.items (derivation_bin)
+import compiler.expand.derive (Wrote, library_ask_bin, library_answer_bin)
+import std.value
+import std.value (VRecord, VStr)
 import compiler.front.diagnostics (parse_all, with_prelude_source)
 import compiler.syntax.exprs (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
@@ -1664,47 +1667,65 @@ test "a walk taken from a check of its whole module is made again when what a si
   assert_eq(said(warm.outcome), said(analyse(parse_all(after))))
 }
 
-/// Two sums whose `json` codecs call one another, so one unit whose owners' derivations each write
-/// a codec on their cycle, and enough functions apart from them that the unit is checked again
-/// alone; `more` is the rest of `Tree`'s variants. `std.json` holds what those codecs call and
-/// nothing else.
-fn coded(more: Bytes) -> { user: List<Source>, shipped: List<Source> } =
-  {
-    user: [
-      {
-        name: b"lib",
-        src: range(0, 40).fold(
+/// Two sums that hold one another, each derived by `sizes`, and enough functions apart from them
+/// that their unit is checked again alone; `more` is the rest of `Tree`'s variants.
+fn coded(more: Bytes) -> List<Source> =
+  [
+    { name: b"sizes", src: b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n" },
+    {
+      name: b"lib",
+      src: range(0, 40).fold(
+        Bytes::concat_all([
+          b"import sizes\n\npub type Tree = | Branch(List<Grove>)",
+          more,
+          b"\n\npub type Grove = | Grove(List<Tree>)\n\nderive sizes for Tree\n\nderive sizes for Grove\n",
+        ]),
+        |src: Bytes, i: Int|
           Bytes::concat_all([
-            b"import std.json\n\npub type Tree = | Branch(List<Grove>)",
-            more,
-            b"\n\npub type Grove = | Grove(List<Tree>)\n\nderive json for Tree\n\nderive json for Grove\n",
+            src,
+            b"\npub fn pad",
+            Bytes::of_string(i.to_string()),
+            b"() -> Int = 0\n",
           ]),
-          |src: Bytes, i: Int|
-            Bytes::concat_all([
-              src,
-              b"\npub fn pad",
-              Bytes::of_string(i.to_string()),
-              b"() -> Int = 0\n",
-            ]),
-        ),
+      ),
+    },
+  ]
+
+/// What `sizes` writes for a derivation asked at `at`, where no deriver runs: `T::size()`, the
+/// length of the declaration it read, so its text moves whenever the declaration does.
+fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
+  match bin::decode(at, library_ask_bin()) {
+    Err(_) -> None,
+    Ok(ask) -> match value::decode(ask.declaration) {
+      Some(VRecord(fields)) -> match value::field_named(fields, "target") {
+        Some(VStr(target)) ->
+          Some(
+            bin::encode(
+              Wrote(
+                Bytes::concat_all([
+                  b"pub fn ",
+                  Bytes::of_string(target),
+                  b"::size() -> Int = ",
+                  Bytes::of_string(ask.declaration.len().to_string()),
+                ]),
+              ),
+              library_answer_bin(),
+            ),
+          ),
+        _ -> None,
       },
-    ],
-    shipped: [
-      {
-        name: b"std.json",
-        src: b"pub type Json = | Null | Array(List<Json>) | Variant(String, List<Json>)\n\npub type JsonCodec<a> = { encode: (a) -> Json / {abort.raise}, decode: (Json) -> Result<a, String> / {abort.raise} }\n\npub type Tagged = { tag: String, values: List<Json> }\n\npub fn max_depth() -> Int = 8\n\npub fn too_deep<a>() -> JsonCodec<a> = { encode: |_: a| Null, decode: |_: Json| Err(\"too deep\") }\n\npub fn list_json<a>(item: JsonCodec<a>) -> JsonCodec<List<a>> = { encode: |xs: List<a>| Array(xs.map(|x: a| (item.encode)(x))), decode: |j: Json| match j { Array(ys) -> ys.fold(Ok([]), |acc: Result<List<a>, String>, y: Json| match acc { Err(e) -> Err(e), Ok(xs) -> match (item.decode)(y) { Err(e) -> Err(e), Ok(x) -> Ok(xs.push(x)) } }), _ -> Err(\"not a list\") } }\n\npub fn variant(tag: String, values: List<Json>) -> Json = Variant(tag, values)\n\npub fn variant_of(j: Json) -> Result<Tagged, String> = match j { Variant(t, vs) -> Ok({ tag: t, values: vs }), _ -> Err(\"not a variant\") }\n\npub fn has_tag(v: Tagged, tag: String) -> Bool = v.tag == tag\n\npub fn variant_value(v: Tagged, index: Int) -> Result<Json, String> = match v.values.at(index) { Some(x) -> Ok(x), None -> Err(v.tag) }\n\npub fn decode_and_then<a, b | e>(r: Result<a, String>, f: (a) -> Result<b, String> / e) -> Result<b, String> / e = match r { Ok(x) -> f(x), Err(e) -> Err(e) }\n\npub fn unknown_variant<a>(tag: String, tags: List<String>) -> Result<a, String> = Err(tag)\n",
-      },
-    ],
+      _ -> None,
+    },
   }
 
-// Alone, `Tree`'s derivation would write a codec off any cycle, which its module never lowers.
-test "an owner of a unit walked alone walks the codec its module's derivation wrote" {
-  let before = coded(b"");
-  let cold = fixed_over(nothing_held(), before.user, before.shipped);
+// A derivation reads its module's every type: an edit to `Tree` moves `Grove`'s too.
+test "owners whose derivations' declaration moved walk what their deriver wrote anew" {
+  let cold = fixed_over(nothing_held(), coded(b""), [], derived: sized);
   let after = coded(b" | Twig(List<Grove>)");
-  let warm = fixed_over(cold.held, after.user, after.shipped);
+  let warm = fixed_over(cold.held, after, [], derived: sized);
   assert(owners_ran(warm.run, typed_query()).contains(b"Tree"));
-  assert_eq(warm.answers, fixed_over(nothing_held(), after.user, after.shipped).answers)
+  assert(owners_ran(warm.run, typed_query()).contains(b"Grove"));
+  assert_eq(warm.answers, fixed_over(nothing_held(), after, [], derived: sized).answers)
 }
 
 /// Two types whose `len` each call `len` on a value: one unit by what their texts mention, and
