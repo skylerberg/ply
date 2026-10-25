@@ -39,7 +39,8 @@ import compiler.front (analyse_pulling_std_with)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.check.infer (dump_flag)
-import compiler.check.infer.definitions (Extern, prelude_externs, externs_in, module_externs)
+import compiler.check.infer.definitions (Extern, externs_in, declared_natives, program_natives,
+                                         natives_beside)
 import compiler.expand.rewrite (Elaborated, elaborated_natives)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.print.head (head_part, tail_part)
@@ -47,7 +48,7 @@ import std.prelude_source
 import compiler.front.interface (read_key, sized)
 import compiler.expand.embed (EmbedAt, embed_file)
 import compiler.check.resolve.scopes (PackageDeps)
-import compiler.check.resolve.tables (Diag, Label, ParsedModule, error_with_labels)
+import compiler.check.resolve.tables (Diag, Label, error_with_labels)
 import std.bin
 import std.list
 import std.graph
@@ -144,14 +145,6 @@ pub fn unbound(natives: List<Native>, declared: List<Extern>) -> List<Unbound> =
   })
 }
 
-/// The natives the compiler declares itself: each `extern fn` of the prelude, then each native the
-/// elaboration writes calls of.
-pub fn declared_natives() -> List<Extern> / {abort.raise} =
-  prelude_externs().concat(
-    elaborated_natives().map(|n: Elaborated|
-      { module: b"", name: n.name, words: n.words, raises: n.raises }),
-  )
-
 /// The C helper of each native a unit's bodies call, by its name without the `_p` its pointer
 /// adds, and of each native a body reads as a value, which the runtime calls as that native.
 fn natives_called(made: Made) -> Map<Bytes, Bool> / {abort.raise} =
@@ -182,33 +175,6 @@ fn helpers_named(text: Bytes, into: Map<Bytes, Bool>) -> Map<Bytes, Bool> / {abo
         })
       },
     })
-
-/// Every native a program over the shipped `modules`, each by its name and text, may call, each once
-/// as it is first declared: the compiler's own (`declared_natives`), then each `extern fn` of the
-/// prelude and of each of `modules`.
-pub fn program_natives(
-  modules: List<{ name: Bytes, text: Bytes }>,
-) -> List<Extern> / {abort.raise} =
-  natives_beside(
-    declared_natives(),
-    modules.map(|m: { name: Bytes, text: Bytes }| externs_in(m.name, m.text)),
-  )
-
-/// `program_natives` of a program whose modules are parsed as `mods`.
-pub fn parsed_natives(mods: List<ParsedModule>) -> List<Extern> / {abort.raise} =
-  natives_beside(declared_natives(), mods.map(|m: ParsedModule| module_externs(m.name, m.module)))
-
-fn natives_beside(own: List<Extern>, modules: List<List<Extern>>) -> List<Extern> / {abort.raise} =
-  [externs_in(prelude_module(), prelude_source::text())].concat(modules).fold(
-    {
-      seen: own.fold(Map::new(), |m: Map<Bytes, Bool>, e: Extern| m.insert(e.name, true)),
-      all: own,
-    },
-    |acc: { seen: Map<Bytes, Bool>, all: List<Extern> }, es: List<Extern>|
-      es.fold(acc, |a: { seen: Map<Bytes, Bool>, all: List<Extern> }, e: Extern|
-        if a.seen.contains(e.name) { a }
-        else { { seen: a.seen.insert(e.name, true), all: a.all.push(e) } }),
-  ).all
 
 /// What the natives whose helpers are `called` are declared to be, as `program_natives` declares
 /// them over the shipped `modules`, each module's text the one `text_of` finds; the modules are read
@@ -1816,7 +1782,6 @@ fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors =
 /// bodies `roots` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
 /// root.
 fn scope_over(
-  runtime: Runtime,
   dump: Dump,
   p: Program,
   ctors: List<Ctor>,
@@ -1829,7 +1794,6 @@ fn scope_over(
       p.modules.map(|m: ModuleRow| match text_at(p, m.index) { Some(t) -> t, None -> b"" }),
     ),
     program_ctors(dump, ctors),
-    runtime.natives.map(|n: Native| n.name),
     true,
     roots,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
@@ -2730,7 +2694,7 @@ pub fn emitted<| e>(
     phases,
     scope_held,
     |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
-      let scope = match held { Some(s) -> s, None -> scope_over(runtime, dump, p, ctors, reading) };
+      let scope = match held { Some(s) -> s, None -> scope_over(dump, p, ctors, reading) };
       let pieces = dealt(p, roots);
       let a = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
       { held: Some(scope), answers: unpacked(a), found: a.found }
@@ -4356,7 +4320,7 @@ test "a walk answers the roots it deals over lists, place by place, as the emitt
   let dump = three_modules_dump();
   let p = program_of(dump, three_modules());
   let missed = offered_roots(dump).keys;
-  let scope = scope_over(a_runtime(b"r"), dump, p, [], missed);
+  let scope = scope_over(dump, p, [], missed);
   let together = answers_of(answers_in(scope, missed, Map::new()));
   assert(
     together.fold(false, |found: Bool, _: RootName, a: Answer|
@@ -5125,9 +5089,8 @@ test "a function of a type a module calls with no import is read from its home, 
     None,
   );
   assert_eq(
-    answers_in(scope_over(a_runtime(b"r"), dump, p, [], [root]), [root], Map::new()).map(
-      |r: RootAnswer| match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why },
-    ),
+    answers_in(scope_over(dump, p, [], [root]), [root], Map::new()).map(|r: RootAnswer|
+      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
     [b"m.first"],
   )
 }
@@ -5143,9 +5106,8 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
   let p = program_of(dump, sources_placed(dump, user));
   let root = law_key(b"m", b"identity is identity", LawBody);
   assert_eq(
-    answers_in(scope_over(a_runtime(b"r"), dump, p, [], [root]), [root], Map::new()).map(
-      |r: RootAnswer| match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why },
-    ),
+    answers_in(scope_over(dump, p, [], [root]), [root], Map::new()).map(|r: RootAnswer|
+      match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
     [printed(root)],
   )
 }
@@ -5594,10 +5556,7 @@ fn walk_in_store(
     None,
     { scope: None, built: 0, asked: [] },
     |held: Counted, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
-      let scope = match held.scope {
-        Some(s) -> s,
-        None -> scope_over(a_runtime(b"r"), dump, p, ctors, offered),
-      };
+      let scope = match held.scope { Some(s) -> s, None -> scope_over(dump, p, ctors, offered) };
       let pieces = dealt(p, roots);
       let answered = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
       {
