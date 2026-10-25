@@ -1,7 +1,7 @@
 use astro_float::{BigFloat, Consts, RoundingMode, Sign};
-use ply_core::builtins::{Builtin, call};
-use ply_core::float::{CANONICAL_NAN_BITS, bits, total_cmp};
-use ply_core::{Span, Value};
+use ply_core::Value;
+use ply_core::builtins::Builtin;
+use ply_core::float::{self, CANONICAL_NAN_BITS, bits, total_cmp};
 use std::cmp::Ordering;
 
 const RM: RoundingMode = RoundingMode::ToEven;
@@ -184,14 +184,24 @@ impl Rng {
     }
 }
 
+/// What the runtime's function for builtin `b` answers over `x`, and `y` where it takes two.
 fn answered(b: Builtin, x: f64, y: f64) -> f64 {
-    let args = match b {
-        Builtin::Pow | Builtin::Atan2 | Builtin::Hypot => vec![Value::Float(x), Value::Float(y)],
-        _ => vec![Value::Float(x)],
-    };
-    match call(b, args, Span::DUMMY) {
-        Ok(Value::Float(f)) => f,
-        other => panic!("`{}` answered {other:?}", b.name()),
+    match b {
+        Builtin::Sqrt => x.sqrt(),
+        Builtin::Exp => float::exp(x),
+        Builtin::Ln => float::ln(x),
+        Builtin::Log2 => float::log2(x),
+        Builtin::Log10 => float::log10(x),
+        Builtin::Sin => float::sin(x),
+        Builtin::Cos => float::cos(x),
+        Builtin::Tan => float::tan(x),
+        Builtin::Asin => float::asin(x),
+        Builtin::Acos => float::acos(x),
+        Builtin::Atan => float::atan(x),
+        Builtin::Pow => float::pow(x, y),
+        Builtin::Atan2 => float::atan2(x, y),
+        Builtin::Hypot => float::hypot(x, y),
+        other => panic!("`{}` is no float function", other.name()),
     }
 }
 
@@ -248,8 +258,6 @@ fn a_nan_reads_as_the_one_nan_whatever_bits_made_it() {
         f64::from_bits(0xFFF8_0000_DEAD_BEEF),
     ] {
         assert_eq!(bits(nan), CANONICAL_NAN_BITS);
-        let read = call(Builtin::BitsOfFloat, vec![Value::Float(nan)], Span::DUMMY);
-        assert_eq!(read.ok(), Some(Value::Int(CANONICAL_NAN_BITS as i64)));
         assert_eq!(total_cmp(nan, f64::NAN), Ordering::Equal);
         assert_eq!(total_cmp(nan, f64::INFINITY), Ordering::Greater);
         assert_eq!(

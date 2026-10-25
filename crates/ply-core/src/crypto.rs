@@ -54,10 +54,6 @@ pub(crate) fn utf8(v: &Value, span: Span) -> Result<Value, Diagnostic> {
     Ok(sealed(opened(v, span, "`Secret::bytes`")?))
 }
 
-pub(crate) fn len(v: &Value, span: Span) -> Result<Value, Diagnostic> {
-    Ok(Value::Int(opened(v, span, "`Secret::len`")?.len() as i64))
-}
-
 pub(crate) fn concat(a: &Value, b: &Value, span: Span) -> Result<Value, Diagnostic> {
     let a = opened(a, span, "`Secret::concat`")?;
     let b = opened(b, span, "`Secret::concat`")?;

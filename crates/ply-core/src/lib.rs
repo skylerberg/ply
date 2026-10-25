@@ -31,7 +31,6 @@ pub use expr::{BinOp, render_float};
 pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
 pub mod evaluator;
-pub mod map;
 pub mod memo;
 mod plain;
 mod program;

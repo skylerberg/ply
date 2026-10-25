@@ -1,14 +1,13 @@
 //! What an operation emitted code writes in place leaves in the context when it hands the runtime
-//! its refusal of its operands: the builtin's own refusal of them, word for word, raised where the
-//! builtin raises, which `abort.raise` answers, and failing the run where it fails.
+//! its refusal of its operands: raised where the operation raises, which `abort.raise` answers, and
+//! failing the run where it fails.
 
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyType};
 use ply_compiled::heap::{IMMORTAL, Obj, Word};
 use ply_compiled::rt::{Ctx, FAILED_ABORT};
-use ply_core::builtins::call;
-use ply_core::{Builtin, Diagnostic, Span, Value, codes};
+use ply_core::{Diagnostic, codes};
 
 type Refused = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
 type RefusedText = unsafe extern "C" fn(*mut Ctx, Word, *const u8, Word, *const u8, Word);
@@ -44,19 +43,6 @@ fn refused_text(what: Word, p: Option<&[u8]>, q: &[u8]) -> Diagnostic {
     })
 }
 
-/// What builtin `b` refuses `args` with, over values.
-fn builtin_refusal(b: Builtin, args: Vec<Value>) -> Diagnostic {
-    match call(b, args, Span::DUMMY) {
-        Err(d) => d,
-        Ok(v) => panic!("`{}` answered {v:?}", b.name()),
-    }
-}
-
-/// What a diagnostic says, apart from where.
-fn said(d: &Diagnostic) -> String {
-    format!("{} {} {:?} {:?}", d.code, d.message, d.notes, d.values)
-}
-
 #[test]
 fn a_length_refused_raises_as_the_operation_of_that_length_does() {
     for (what, name, n) in [
@@ -83,132 +69,6 @@ fn an_index_refused_raises_as_the_operation_of_that_index_does() {
         assert_eq!(
             refused(what, n, 3, 0).message,
             format!("`{name}` index {n} is outside a value of 3 elements")
-        );
-    }
-}
-
-#[test]
-fn a_string_operation_refused_numbers_says_what_its_builtin_says_over_values() {
-    let abc = || Value::bytes(*b"abc");
-    for (what, numbers, b, args) in [
-        (8, [5, 3, 0], Builtin::BytesAt, vec![abc(), Value::Int(5)]),
-        (8, [-1, 3, 0], Builtin::BytesAt, vec![abc(), Value::Int(-1)]),
-        (
-            9,
-            [0, 3, 0],
-            Builtin::BytesU32Le,
-            vec![abc(), Value::Int(0)],
-        ),
-        (
-            10,
-            [2, 1, 3],
-            Builtin::BytesSlice,
-            vec![abc(), Value::Int(2), Value::Int(1)],
-        ),
-        (
-            11,
-            [1, 9, 5],
-            Builtin::StringSlice,
-            vec![Value::str("héllo"), Value::Int(1), Value::Int(9)],
-        ),
-        (12, [256, 0, 0], Builtin::ByteOfInt, vec![Value::Int(256)]),
-        (
-            13,
-            [-1, 0, 0],
-            Builtin::BytesIndexOfByte,
-            vec![abc(), Value::Int(-1)],
-        ),
-        (
-            14,
-            [4, 3, 0],
-            Builtin::BytesIndexOfFrom,
-            vec![abc(), Value::bytes(*b""), Value::Int(4)],
-        ),
-        (
-            15,
-            [9, 3, 1],
-            Builtin::BytesScan,
-            vec![abc(), Value::Int(9), Value::bytes(*b"a"), Value::Int(1)],
-        ),
-        (
-            16,
-            [0, 3, -1],
-            Builtin::BytesScanUntil,
-            vec![abc(), Value::Int(0), Value::bytes(*b"a"), Value::Int(-1)],
-        ),
-        (
-            17,
-            [0, 20_000_000, 0],
-            Builtin::Range,
-            vec![Value::Int(0), Value::Int(20_000_000)],
-        ),
-        (
-            17,
-            [i64::MIN, i64::MAX, 0],
-            Builtin::Range,
-            vec![Value::Int(i64::MIN), Value::Int(i64::MAX)],
-        ),
-        (
-            18,
-            [0, 0, 0],
-            Builtin::BytesSplit,
-            vec![abc(), Value::bytes(*b"")],
-        ),
-        (
-            19,
-            [0, 0, 0],
-            Builtin::StringSplit,
-            vec![Value::str("abc"), Value::str("")],
-        ),
-        (
-            22,
-            [9, 3, 0],
-            Builtin::BytesPosition,
-            vec![abc(), Value::Int(9), Value::Int(0)],
-        ),
-    ] {
-        let [a, b2, c] = numbers;
-        assert_eq!(
-            said(&refused(what, a, b2, c)),
-            said(&builtin_refusal(b, args)),
-            "`{}`",
-            b.name()
-        );
-    }
-}
-
-#[test]
-fn a_string_operation_refused_text_says_what_its_builtin_says_over_values() {
-    let none = || Value::ctor("None", Vec::new());
-    let some = |s: &str| Value::ctor("Some", vec![Value::str(s)]);
-    for (what, p, q, b, args) in [
-        (
-            20,
-            Some(&b"abc"[..]),
-            &b"z"[..],
-            Builtin::StringFind,
-            vec![Value::str("abc"), Value::str("z")],
-        ),
-        (
-            21,
-            None,
-            &b""[..],
-            Builtin::Assert,
-            vec![Value::Bool(false), none()],
-        ),
-        (
-            21,
-            Some(&b"why"[..]),
-            &b""[..],
-            Builtin::Assert,
-            vec![Value::Bool(false), some("why")],
-        ),
-    ] {
-        assert_eq!(
-            said(&refused_text(what, p, q)),
-            said(&builtin_refusal(b, args)),
-            "`{}`",
-            b.name()
         );
     }
 }

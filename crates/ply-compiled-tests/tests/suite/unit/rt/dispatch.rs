@@ -375,7 +375,7 @@ fn an_emitted_clause_reads_its_label_lifted_through_the_string_type_its_site_han
 /// descriptor with it.
 #[test]
 fn a_raise_the_runtime_makes_reaches_an_emitted_clause_lifted_and_the_landing_calls_it() {
-    let mut ctx = crate::bare::context_over(&["abort", "raise"], Vec::new(), &["Bytes::at"]);
+    let mut ctx = crate::bare::context_over(&["abort", "raise"], Vec::new(), &["panic"]);
     ctx.begin(1_000);
     LIFTED.with(|l| l.borrow_mut().clear());
     HEARD.with(|h| h.set(0));
@@ -395,18 +395,16 @@ fn a_raise_the_runtime_makes_reaches_an_emitted_clause_lifted_and_the_landing_ca
         let depth = helper::<Install>("rt_handle_install")(c, clause.as_ptr(), 1, 0);
         let open: unsafe extern "C" fn(*mut Ctx, Word) =
             helper(&builtin_helper_name("?lower_open"));
-        let int: unsafe extern "C" fn(*mut Ctx, Word) = helper(&builtin_helper_name("?out_int"));
         open(c, 0);
-        native("?out_count")(c, ply_core::codec::tag::LIST as Word, 2);
-        native("?out_bytes")(c, b"ab".as_ptr() as Word, 2);
-        int(c, 7);
+        native("?out_count")(c, ply_core::codec::tag::LIST as Word, 1);
+        native("?out_str")(c, b"no such file".as_ptr() as Word, 12);
         helper::<unsafe extern "C" fn(*mut Ctx, Word)>("rt_builtin_encoded")(c, 0);
         assert_ne!(ctx.failed, 0, "the builtin raised");
         assert_eq!(helper::<Land>("rt_handle_land")(c, depth, 0), 9);
     }
     super::crossing::unfailed(&mut ctx);
     let said = LIFTED.with(|l| l.borrow().clone());
-    assert!(said.contains("`Bytes::at` index 7"), "{said}");
+    assert!(said.contains("no such file"), "{said}");
     assert_ne!(HEARD.with(Cell::get), 0, "the clause was not called");
     assert_eq!(
         ctx.heap.live(),

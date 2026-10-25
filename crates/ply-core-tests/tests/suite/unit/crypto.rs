@@ -115,9 +115,8 @@ fn what_is_made_of_a_secret_is_a_secret() {
 }
 
 #[test]
-fn a_length_a_tag_a_public_key_and_a_signature_are_no_secret() {
+fn a_tag_a_public_key_and_a_signature_are_no_secret() {
     let key = secret(&[7; 32]);
-    assert_eq!(done(Builtin::SecretLen, vec![key.clone()]), Value::Int(32));
     // RFC 4231, case 2.
     let tag = done(
         Builtin::SecretHmac,

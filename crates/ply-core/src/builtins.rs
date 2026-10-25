@@ -2,7 +2,7 @@
 
 use crate::semantics::arity_error;
 use crate::value::{Decimal, Fixed, FixedOp, Value, first_difference, type_error, values_equal};
-use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, float, map, slot};
+use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, slot};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -389,25 +389,6 @@ fn numeric_op(op: &Value, span: Span) -> Result<BinOp, Diagnostic> {
         })
 }
 
-/// `Array::set` or `Columns::set`, taking the array out of its arguments so the last holder writes in
-/// place.
-fn array_set(args: &mut Vec<Value>, span: Span, what: &str) -> Result<Value, Diagnostic> {
-    let v = args.pop().expect("arity checked");
-    let index = args.pop().expect("arity checked");
-    let mut xs = args.pop().expect("arity checked");
-    let Value::Array(items) = &mut xs else {
-        return Err(type_error(span, &format!("`{what}`"), "Array", &xs));
-    };
-    let i = index.as_int(span, &format!("`{what}`"))?;
-    let Some(at) = usize::try_from(i).ok().filter(|at| *at < items.len()) else {
-        return Err(out_of_range(span, what, i, items.len(), "elements"));
-    };
-    let in_place = std::sync::Arc::get_mut(items).is_some();
-    crate::rc::note_update_of(in_place, if in_place { 0 } else { items.len() }, span);
-    std::sync::Arc::make_mut(items)[at] = v;
-    Ok(xs)
-}
-
 /// A builtin over values. One that calls back into the program, or reaches a hold or a handler's
 /// variables, is the compiled backend's to answer, since only it holds them.
 pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
@@ -417,7 +398,7 @@ pub fn call(b: Builtin, mut args: Vec<Value>, span: Span) -> Result<Value, Diagn
     out
 }
 
-fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagnostic> {
     if args.len() != b.words() {
         return Err(arity_error(
             span,
@@ -428,13 +409,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
     }
 
     match b {
-        Builtin::Assert => {
-            if args[0].as_bool(span, "`assert`")? {
-                return Ok(Value::Unit);
-            }
-            Err(assert_failure(&args[1], span))
-        }
-
         Builtin::AssertEq => {
             if values_equal(&args[0], &args[1], span)? {
                 Ok(Value::Unit)
@@ -444,59 +418,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         }
 
         Builtin::AssertFailed => Err(assertion_failure(&args[0], &args[1], span)),
-
-        Builtin::Len => match &args[0] {
-            Value::List(xs) => Ok(Value::Int(xs.len() as i64)),
-            Value::Str(s) => Ok(Value::Int(s.chars().count() as i64)),
-            other => Err(type_error(span, "`List::len`", "a List or String", other)),
-        },
-
-        Builtin::WithCapacity => {
-            args[0].as_int(span, "`List::with_capacity`")?;
-            Ok(Value::list(Vec::new()))
-        }
-
-        // Compiled code searches in place and calls this only to raise for a start past the end.
-        Builtin::BytesPosition => {
-            let bytes = args[0].as_bytes(span, "`Bytes::position`")?;
-            start_at(&args[1], bytes.len(), span, "Bytes::position")?;
-            Err(answered_by_the_backend(b, span))
-        }
-
-        Builtin::Iterate
-        | Builtin::Metered
-        | Builtin::Bracket
-        | Builtin::HoldGet
-        | Builtin::HoldTake
-        | Builtin::HoldBracket
-        | Builtin::HandlerInit
-        | Builtin::HandlerVar
-        | Builtin::HandlerSet
-        | Builtin::HoldNew
-        | Builtin::ListLeafOf => Err(answered_by_the_backend(b, span)),
-
-        Builtin::Range => {
-            let lo = args[0].as_int(span, "`range`")?;
-            let hi = args[1].as_int(span, "`range`")?;
-            if hi <= lo {
-                return Ok(Value::list(Vec::new()));
-            }
-            if hi.saturating_sub(lo) > MAX_RANGE_LEN {
-                return Err(range_too_long(span, lo, hi));
-            }
-            Ok(Value::list((lo..hi).map(Value::Int).collect()))
-        }
-
-        // In `compare`'s order, the first of two equal ones.
-        Builtin::Min | Builtin::Max => {
-            crate::value::secret_has_no_order(&args[0], b.name(), span)?;
-            let first = match args[0].cmp(&args[1]) {
-                std::cmp::Ordering::Less => b == Builtin::Min,
-                std::cmp::Ordering::Greater => b == Builtin::Max,
-                std::cmp::Ordering::Equal => true,
-            };
-            Ok(args.swap_remove(if first { 0 } else { 1 }))
-        }
 
         Builtin::Rotr32 => {
             let x = args[0].as_int(span, "`rotr32`")?;
@@ -571,33 +492,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             }))
         }
 
-        // Out of range raises rather than truncating; a program masks first to mean truncation.
-        Builtin::U8OfInt
-        | Builtin::U16OfInt
-        | Builtin::U32OfInt
-        | Builtin::U64OfInt
-        | Builtin::I8OfInt
-        | Builtin::I16OfInt
-        | Builtin::I32OfInt
-        | Builtin::I64OfInt
-        | Builtin::U128OfInt
-        | Builtin::I128OfInt => {
-            let t = b.converts_into().expect("every `_of_int` names its type");
-            let n = args[0].as_int(span, &format!("`{}`", b.name()))?;
-            match Fixed::of(t, i128::from(n)) {
-                Some(v) => Ok(Value::Fixed(v)),
-                None => Err(Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("`{}` was given {n}", b.name()),
-                )
-                .primary(span, format!("`{t}` holds {} to {}", t.min(), t.max()))
-                .note(format!(
-                    "mask the value before the call if that is what you meant: `n & 0x{:X}`",
-                    t.max()
-                ))),
-            }
-        }
-
         Builtin::IntOfU8
         | Builtin::IntOfU16
         | Builtin::IntOfU32
@@ -659,73 +553,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(option(answer))
         }
 
-        // Raises rather than masking: a silent `& 0xFF` would write a byte nobody chose.
-        Builtin::ByteOfInt => {
-            let n = args[0].as_int(span, "`byte_of_int`")?;
-            match u8::try_from(n) {
-                Ok(byte) => Ok(Value::bytes([byte])),
-                Err(_) => Err(byte_of_int_refused(span, n)),
-            }
-        }
-
-        Builtin::StringConcat => {
-            let a = args[0].as_str(span, "`String::concat`")?;
-            let b = args[1].as_str(span, "`String::concat`")?;
-            Ok(Value::str(format!("{a}{b}")))
-        }
-
-        Builtin::BytesLen => {
-            let b = args[0].as_bytes(span, "`Bytes::len`")?;
-            Ok(Value::Int(b.len() as i64))
-        }
-
-        Builtin::BytesAt => {
-            let b = args[0].as_bytes(span, "`Bytes::at`")?;
-            let i = args[1].as_int(span, "`Bytes::at`")?;
-            match usize::try_from(i).ok().and_then(|i| b.get(i)) {
-                Some(byte) => Ok(Value::Int(i64::from(*byte))),
-                None => Err(out_of_range(span, "Bytes::at", i, b.len(), "bytes")),
-            }
-        }
-
-        Builtin::BytesU32Le => {
-            let b = args[0].as_bytes(span, "`Bytes::u32_le`")?;
-            let i = args[1].as_int(span, "`Bytes::u32_le`")?;
-            let four = usize::try_from(i)
-                .ok()
-                .and_then(|i| b.get(i..i + 4))
-                .and_then(|s| <[u8; 4]>::try_from(s).ok());
-            match four {
-                Some(w) => Ok(Value::Fixed(Fixed::new(
-                    IntTy::U32,
-                    u128::from(u32::from_le_bytes(w)),
-                ))),
-                // Reported at the last index it would read: that is the one past the end.
-                None => Err(out_of_range(span, "Bytes::u32_le", i + 3, b.len(), "bytes")),
-            }
-        }
-
-        Builtin::BytesSlice => {
-            let b = args[0].as_bytes(span, "`Bytes::slice`")?;
-            let (start, end) =
-                range_args(&args[1], &args[2], b.len(), span, "Bytes::slice", "bytes")?;
-            Ok(Value::bytes(&b[start..end]))
-        }
-
-        Builtin::BytesConcat => {
-            let a = args[0].as_bytes(span, "`Bytes::concat`")?;
-            let b = args[1].as_bytes(span, "`Bytes::concat`")?;
-            let mut out = Vec::with_capacity(a.len() + b.len());
-            out.extend_from_slice(a);
-            out.extend_from_slice(b);
-            Ok(Value::bytes(out))
-        }
-
-        Builtin::BytesBlake3 => {
-            let b = args[0].as_bytes(span, "`Bytes::blake3`")?;
-            Ok(Value::bytes(blake3::hash(b).as_bytes()))
-        }
-
         // At the best level, so what a writer seals is a function of the bytes alone.
         Builtin::BytesGzip => {
             use std::io::Write;
@@ -753,124 +580,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::bytes(
                 sealed.expect("compressing in memory cannot fail"),
             ))
-        }
-
-        Builtin::BytesConcatAll => {
-            let pieces = args[0].as_list(span, "`Bytes::concat_all`")?.clone();
-            let mut total = 0usize;
-            for piece in pieces.iter() {
-                total += piece.as_bytes(span, "`Bytes::concat_all`")?.len();
-            }
-            let mut out = Vec::with_capacity(total);
-            for piece in pieces.iter() {
-                out.extend_from_slice(piece.as_bytes(span, "`Bytes::concat_all`")?);
-            }
-            Ok(Value::bytes(out))
-        }
-
-        Builtin::BytesOfString => {
-            let s = args[0].as_str(span, "`Bytes::of_string`")?;
-            Ok(Value::bytes(s.as_bytes()))
-        }
-
-        Builtin::BytesIndexOf => {
-            let hay = args[0].as_bytes(span, "`Bytes::index_of`")?;
-            let needle = args[1].as_bytes(span, "`Bytes::index_of`")?;
-            Ok(position(find(hay, needle, 0)))
-        }
-
-        Builtin::BytesIndexOfFrom => {
-            let hay = args[0].as_bytes(span, "`Bytes::index_of_from`")?;
-            let needle = args[1].as_bytes(span, "`Bytes::index_of_from`")?;
-            let from = start_at(&args[2], hay.len(), span, "Bytes::index_of_from")?;
-            Ok(position(find(hay, needle, from)))
-        }
-
-        Builtin::BytesIndexOfByte => {
-            let hay = args[0].as_bytes(span, "`Bytes::index_of_byte`")?;
-            let byte = one_byte(&args[1], span, "Bytes::index_of_byte")?;
-            Ok(position(memchr::memchr(byte, hay)))
-        }
-
-        Builtin::BytesStartsWith => {
-            let b = args[0].as_bytes(span, "`Bytes::starts_with`")?;
-            let prefix = args[1].as_bytes(span, "`Bytes::starts_with`")?;
-            Ok(Value::Bool(b.starts_with(prefix)))
-        }
-
-        Builtin::BytesEndsWith => {
-            let b = args[0].as_bytes(span, "`Bytes::ends_with`")?;
-            let suffix = args[1].as_bytes(span, "`Bytes::ends_with`")?;
-            Ok(Value::Bool(b.ends_with(suffix)))
-        }
-
-        Builtin::BytesSplit => {
-            let b = args[0].as_bytes(span, "`Bytes::split`")?;
-            let sep = args[1].as_bytes(span, "`Bytes::split`")?;
-            if sep.is_empty() {
-                return Err(empty_separator(span, Builtin::BytesSplit));
-            }
-            let mut out = Vec::new();
-            let mut at = 0;
-            for found in memchr::memmem::find_iter(b, sep.as_ref()) {
-                out.push(Value::bytes(&b[at..found]));
-                at = found + sep.len();
-            }
-            out.push(Value::bytes(&b[at..]));
-            Ok(Value::list(out))
-        }
-
-        Builtin::BytesScan => {
-            let b = args[0].as_bytes(span, "`Bytes::scan`")?;
-            Ok(Value::Int(scan(args, b, span, false)?))
-        }
-
-        Builtin::BytesScanUntil => {
-            let b = args[0].as_bytes(span, "`Bytes::scan_until`")?;
-            Ok(Value::Int(scan(args, b, span, true)?))
-        }
-
-        Builtin::CharOfInt => {
-            let n = args[0].as_int(span, "`Char::of_int`")?;
-            Ok(option(
-                u32::try_from(n)
-                    .ok()
-                    .and_then(char::from_u32)
-                    .map(Value::Char),
-            ))
-        }
-
-        Builtin::IntOfChar => Ok(Value::Int(i64::from(u32::from(
-            args[0].as_char(span, "`Int::of_char`")?,
-        )))),
-
-        Builtin::StringChars => Ok(Value::list(
-            args[0]
-                .as_str(span, "`String::chars`")?
-                .chars()
-                .map(Value::Char)
-                .collect(),
-        )),
-
-        Builtin::StringOfChars => {
-            let items = args[0].as_list(span, "`String::of_chars`")?;
-            let mut out = String::with_capacity(items.len());
-            for c in items.iter() {
-                out.push(c.as_char(span, "`String::of_chars`")?);
-            }
-            Ok(Value::str(out))
-        }
-
-        Builtin::StringLen => Ok(Value::Int(
-            args[0].as_str(span, "`String::len`")?.chars().count() as i64,
-        )),
-
-        Builtin::ArrayNew | Builtin::ColumnsNew => {
-            let n = args[0].as_int(span, &format!("`{}`", b.name()))?;
-            if !(0..=MAX_ARRAY_LEN).contains(&n) {
-                return Err(array_length(span, b.name(), n));
-            }
-            Ok(Value::array(vec![args[1].clone(); n as usize]))
         }
 
         Builtin::ArrayOfList | Builtin::ColumnsOfList => Ok(Value::array(
@@ -901,8 +610,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 None => Err(out_of_range(span, b.name(), i, xs.len(), "elements")),
             }
         }
-
-        Builtin::ArraySet | Builtin::ColumnsSet => array_set(args, span, b.name()),
 
         Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
 
@@ -994,7 +701,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 .map(Value::Int),
             other => Some(Value::Int(other.as_int(span, "`to_int`")?)),
         })),
-        Builtin::FloatOfInt => Ok(Value::Float(args[0].as_int(span, "`Float::of_int`")? as f64)),
         Builtin::IntOfFloat => {
             let x = args[0].as_float(span, "`Int::of_float`")?;
             let r = rounded(x, rounding(&args[1], span, "Int::of_float")?);
@@ -1004,75 +710,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             let x = args[0].as_float(span, "`Float::round`")?;
             Ok(Value::Float(rounded(x, rounding(&args[1], span, "round")?)))
         }
-        Builtin::Floor => unary_float(&args[0], span, "`Float::floor`", f64::floor),
-        Builtin::Ceil => unary_float(&args[0], span, "`Float::ceil`", f64::ceil),
-        Builtin::Sqrt => unary_float(&args[0], span, "`Float::sqrt`", f64::sqrt),
-        Builtin::Exp => unary_float(&args[0], span, "`Float::exp`", float::exp),
-        Builtin::Ln => unary_float(&args[0], span, "`Float::ln`", float::ln),
-        Builtin::Log2 => unary_float(&args[0], span, "`Float::log2`", float::log2),
-        Builtin::Log10 => unary_float(&args[0], span, "`Float::log10`", float::log10),
-        Builtin::Sin => unary_float(&args[0], span, "`Float::sin`", float::sin),
-        Builtin::Cos => unary_float(&args[0], span, "`Float::cos`", float::cos),
-        Builtin::Tan => unary_float(&args[0], span, "`Float::tan`", float::tan),
-        Builtin::Asin => unary_float(&args[0], span, "`Float::asin`", float::asin),
-        Builtin::Acos => unary_float(&args[0], span, "`Float::acos`", float::acos),
-        Builtin::Atan => unary_float(&args[0], span, "`Float::atan`", float::atan),
-        Builtin::Pow => binary_float(args, span, "`Float::pow`", float::pow),
-        Builtin::Atan2 => binary_float(args, span, "`Float::atan2`", float::atan2),
-        Builtin::Hypot => binary_float(args, span, "`Float::hypot`", float::hypot),
-
-        Builtin::StringSlice => {
-            let s = args[0].as_str(span, "`String::slice`")?;
-            let chars = s.chars().count();
-            let (start, end) = range_args(
-                &args[1],
-                &args[2],
-                chars,
-                span,
-                "String::slice",
-                "characters",
-            )?;
-            let from = char_offset(s, start);
-            let to = char_offset(s, end);
-            Ok(Value::str(&s[from..to]))
-        }
-
-        Builtin::StringSplit => {
-            let s = args[0].as_str(span, "`String::split`")?;
-            let sep = args[1].as_str(span, "`String::split`")?;
-            if sep.is_empty() {
-                return Err(empty_separator(span, Builtin::StringSplit));
-            }
-            Ok(Value::list(s.split(sep).map(Value::str).collect()))
-        }
-
-        Builtin::StringStartsWith => {
-            let s = args[0].as_str(span, "`String::starts_with`")?;
-            let prefix = args[1].as_str(span, "`String::starts_with`")?;
-            Ok(Value::Bool(s.starts_with(prefix)))
-        }
-
-        Builtin::StringEndsWith => {
-            let s = args[0].as_str(span, "`String::ends_with`")?;
-            let suffix = args[1].as_str(span, "`String::ends_with`")?;
-            Ok(Value::Bool(s.ends_with(suffix)))
-        }
-
-        Builtin::StringContains => {
-            let s = args[0].as_str(span, "`String::contains`")?;
-            let needle = args[1].as_str(span, "`String::contains`")?;
-            Ok(Value::Bool(s.contains(needle)))
-        }
-
-        Builtin::StringFind => {
-            let s = args[0].as_str(span, "`String::find`")?;
-            let needle = args[1].as_str(span, "`String::find`")?;
-            match s.find(needle) {
-                Some(at) => Ok(Value::Int(s[..at].chars().count() as i64)),
-                None => Err(not_found(span, s, needle)),
-            }
-        }
-
         // The order `Map` iterates in, so a derived `OrdDict` and map key order cannot drift.
         Builtin::Compare | Builtin::CompareValues => {
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
@@ -1086,9 +723,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 Vec::new(),
             ))
         }
-
-        Builtin::MapNew => Ok(map::new()),
-        Builtin::MapLen => Ok(map::len(&args[0], span)?),
 
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`Decimal::div`")?;
@@ -1112,21 +746,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 .ok_or_else(|| decimal_overflow(span, "rounding"))
         }
 
-        Builtin::DecimalOfInt => Ok(Value::Decimal(Decimal::from(
-            args[0].as_int(span, "`Decimal::of_int`")?,
-        ))),
-
         Builtin::IntOfDecimal => {
             let d = args[0].as_decimal(span, "`Int::of_decimal`")?;
             let mode = rounding(&args[1], span, "Int::of_decimal")?;
             Ok(option(
                 d.round_dp_with_strategy(0, mode).to_i64().map(Value::Int),
             ))
-        }
-
-        Builtin::FloatOfDecimal => {
-            let d = args[0].as_decimal(span, "`Float::of_decimal`")?;
-            Ok(Value::Float(float_of_decimal(d)))
         }
 
         Builtin::DecimalOfFloat => {
@@ -1143,21 +768,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`Decimal::to_string`")?;
             Ok(Value::str(d.to_string()))
-        }
-
-        Builtin::DecimalScale => {
-            let d = args[0].as_decimal(span, "`Decimal::scale`")?;
-            Ok(Value::Int(i64::from(d.scale())))
-        }
-
-        Builtin::BitsOfFloat => {
-            let f = args[0].as_float(span, "`bits_of_float`")?;
-            Ok(Value::Int(float::bits(f) as i64))
-        }
-
-        Builtin::FloatOfBits => {
-            let n = args[0].as_int(span, "`Float::of_bits`")?;
-            Ok(Value::Float(f64::from_bits(n as u64)))
         }
 
         Builtin::Observe => {
@@ -1194,20 +804,12 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             ))
         }
 
-        Builtin::SecretIsEmpty => {
-            let Value::Secret(held) = &args[0] else {
-                return Err(type_error(span, "`Secret::is_empty`", "Secret", &args[0]));
-            };
-            Ok(Value::Bool(held.bytes().is_empty()))
-        }
-
         Builtin::SecretOfBytes => Ok(Value::secret_bytes(
             args[0].as_bytes(span, "`Secret::of_bytes`")?,
         )),
         Builtin::SecretEncode => crate::crypto::encode(&args[0], &args[1], span),
         Builtin::SecretRsaJwk => crate::crypto::rsa_jwk(args, span),
         Builtin::SecretBytes => crate::crypto::utf8(&args[0], span),
-        Builtin::SecretLen => crate::crypto::len(&args[0], span),
         Builtin::SecretConcat => crate::crypto::concat(&args[0], &args[1], span),
         Builtin::SecretDecode => crate::crypto::decode(&args[0], &args[1], span),
         Builtin::SecretPrivateKey => crate::crypto::private_key(&args[0], span),
@@ -1227,6 +829,9 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
         Builtin::SqliteRun => crate::sqlite::run_image(args, span),
         Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
+
+        // Compiled code answers every other builtin itself.
+        _ => Err(answered_by_the_backend(b, span)),
     }
 }
 
@@ -1235,21 +840,6 @@ fn option(v: Option<Value>) -> Value {
         Some(v) => Value::ctor("Some", vec![v]),
         None => Value::ctor("None", Vec::new()),
     }
-}
-
-fn unary_float(x: &Value, span: Span, what: &str, f: fn(f64) -> f64) -> Result<Value, Diagnostic> {
-    Ok(Value::Float(f(x.as_float(span, what)?)))
-}
-
-fn binary_float(
-    args: &[Value],
-    span: Span,
-    what: &str,
-    f: fn(f64, f64) -> f64,
-) -> Result<Value, Diagnostic> {
-    let x = args[0].as_float(span, what)?;
-    let y = args[1].as_float(span, what)?;
-    Ok(Value::Float(f(x, y)))
 }
 
 /// `x` at a whole number, chosen as `mode` chooses a decimal's last digit.
@@ -1390,37 +980,6 @@ fn parse_decimal(text: &str) -> Option<Decimal> {
     }
 }
 
-fn position(at: Option<usize>) -> Value {
-    match at {
-        Some(i) => Value::ctor("Some", vec![Value::Int(i as i64)]),
-        None => Value::ctor("None", Vec::new()),
-    }
-}
-
-/// An empty needle occurs at `from`, as with `str::find`.
-fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(from);
-    }
-    memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
-}
-
-struct ByteSet([u64; 4]);
-
-impl ByteSet {
-    fn new(members: &[u8]) -> ByteSet {
-        let mut bits = [0u64; 4];
-        for &b in members {
-            bits[usize::from(b >> 6)] |= 1 << (b & 63);
-        }
-        ByteSet(bits)
-    }
-
-    fn contains(&self, b: u8) -> bool {
-        self.0[usize::from(b >> 6)] >> (b & 63) & 1 == 1
-    }
-}
-
 pub fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
     &hay[from..hay.len().min(from.saturating_add(max))]
 }
@@ -1437,59 +996,6 @@ fn int_arg(v: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
     }
 }
 
-fn bytes_arg<'a>(
-    v: &'a Value,
-    span: Span,
-    what: &str,
-) -> Result<&'a std::sync::Arc<[u8]>, Diagnostic> {
-    match v {
-        Value::Bytes(b) => Ok(b),
-        other => Err(crate::value::type_error(
-            span,
-            &format!("`{what}`"),
-            "Bytes",
-            other,
-        )),
-    }
-}
-
-fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagnostic> {
-    let what = if want {
-        "Bytes::scan_until"
-    } else {
-        "Bytes::scan"
-    };
-    let from = start_at(&args[1], hay.len(), span, what)?;
-    let members = bytes_arg(&args[2], span, what)?;
-    let max = budget(&args[3], span, what)?;
-    let window = scan_window(hay, from, max);
-
-    // `memchr` is SIMD and the bitmap loop is not, so small sets take it.
-    let found = match (want, members.as_ref()) {
-        // Empty class: `Bytes::scan_until` runs out the window, `Bytes::scan` stops at once.
-        (true, []) => None,
-        (true, [a]) => memchr::memchr(*a, window),
-        (true, [a, b]) => memchr::memchr2(*a, *b, window),
-        (true, [a, b, c]) => memchr::memchr3(*a, *b, *c, window),
-        _ => {
-            let set = ByteSet::new(members);
-            window.iter().position(|&b| set.contains(b) == want)
-        }
-    };
-    Ok(match found {
-        Some(at) => (from + at) as i64,
-        None => (from + window.len()) as i64,
-    })
-}
-
-fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diagnostic> {
-    let from = int_arg(v, span, what)?;
-    match usize::try_from(from) {
-        Ok(from) if from <= len => Ok(from),
-        _ => Err(start_outside(from, len, span, what)),
-    }
-}
-
 pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
@@ -1501,12 +1007,6 @@ pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnosti
     ))
 }
 
-/// A scan's byte budget, which bounds the work hostile input can cause.
-fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
-    let max = int_arg(v, span, what)?;
-    usize::try_from(max).map_err(|_| negative_budget(span, what, max))
-}
-
 /// `what`, a scan, given a budget `max` below 0.
 #[cold]
 pub fn negative_budget(span: Span, what: &str, max: i64) -> Diagnostic {
@@ -1516,11 +1016,6 @@ pub fn negative_budget(span: Span, what: &str, max: i64) -> Diagnostic {
     )
     .primary(span, "a scan cannot examine a negative number of bytes")
     .note("pass `0` to examine nothing, or `Bytes::len(b)` to leave it unbounded")
-}
-
-fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
-    let byte = int_arg(v, span, what)?;
-    u8::try_from(byte).map_err(|_| not_a_byte(span, what, byte))
 }
 
 /// `what` given `byte` to search for, which is no byte.
@@ -1587,23 +1082,6 @@ pub fn not_found(span: Span, s: &str, needle: &str) -> Diagnostic {
     ])
 }
 
-/// The half-open `[start, end)` of a slicing builtin, refused rather than clamped.
-fn range_args(
-    start: &Value,
-    end: &Value,
-    len: usize,
-    span: Span,
-    what: &str,
-    unit: &str,
-) -> Result<(usize, usize), Diagnostic> {
-    let start = int_arg(start, span, what)?;
-    let end = int_arg(end, span, what)?;
-    if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
-        return Err(range_outside(span, what, start, end, len, unit));
-    }
-    Ok((start as usize, end as usize))
-}
-
 /// `what`, a slicing builtin, given the range `start..end` of a value of `len` `unit`, which does not
 /// satisfy `0 <= start <= end <= len`.
 #[cold]
@@ -1623,15 +1101,6 @@ pub fn range_outside(
     .note(format!(
         "a range must satisfy `0 <= start <= end <= {len}`; it is never clamped"
     ))
-}
-
-/// The byte offset of the `n`-th character boundary.
-fn char_offset(s: &str, n: usize) -> usize {
-    s.char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(s.len()))
-        .nth(n)
-        .unwrap_or(s.len())
 }
 
 #[cold]
