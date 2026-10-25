@@ -2797,9 +2797,9 @@ states `numeric` is the function it names, and one over operands of no type the
 prover knows, a type variable's or a lambda's answer, is a function of them that
 may raise. A `perform`, `handle` or `simulate` is a value the prover does not
 read, and a refutable `let` raises where it does not match; each is owed
-unreached in a law and in any claim's own clause and guards, while the body of
-a definition an `ensures` is about holds of what it answers, which a raise is
-not. A call of a function value answers where the prover reads its
+unreached in a law and in any claim's own clause and guards, while an `ensures`
+holds of what its definition answers: a raise in its body, or a call there the
+prover cannot show answers, is a run that answers nothing it speaks of. A call of a function value answers where the prover reads its
 body, or in a law where a binder's type performs nothing: the law speaks of such
 functions. An `ensures` is handed functions by callers it cannot see, so a call
 of a parameter there answers nothing it can stand on. An `unproved` claim names each place
@@ -2824,7 +2824,7 @@ package's, of a definition whose row names no raise and that the checker reads
 as ending, is read by its contract: each `ensures`, at the call's arguments and
 answer, holds wherever its `requires` do. Another package's contract is that
 package's run to prove; one of this package's is read once a proof showed every
-`ensures` of its definition, and the clause being proved holds at each call its
+`ensures` of its definition taking no call in its body to answer, and the clause being proved holds at each call its
 own definition's body makes back into it, on the way to that call. So `fn
 quadrupled(n: Int) -> Int ensures result == n * 4 = doubled(doubled(n))`
 stands on `doubled`'s `ensures result == n * 2` without its body. A contract,

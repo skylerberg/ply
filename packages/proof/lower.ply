@@ -170,6 +170,9 @@ pub type Blocker =
   /// A value of the type named, which states an invariant, built where the proof did not read it: in a
   /// constructor handed on as a function, or in code the lowering passed over.
   | Unseen(String)
+  /// A clause shown of what its definition answers only by taking its body to answer: it shows
+  /// nothing of whether the body answers.
+  | AnswerAssumed
 
 /// The kind a report prints, and the definition or reason it names, if any.
 pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
@@ -193,6 +196,7 @@ pub fn blocker_parts(b: Blocker) -> { kind: String, detail: Option<String> } =
     Unbounded(why) -> { kind: "unbounded", detail: Some(why) },
     Unclosed -> { kind: "unclosed", detail: None },
     Unseen(t) -> { kind: "unseen_build", detail: Some(t) },
+    AnswerAssumed -> { kind: "answer_assumed", detail: None },
   }
 
 pub type Lowering = {
@@ -248,10 +252,10 @@ pub type Lowering = {
   in_law: Bool,
   /// The claim's binders, as terms.
   binder_terms: List<Int>,
-  /// Whether a raise in what is being read is owed unreached: a region, or a `let` that does not
-  /// match. It is in a law and in any claim's clause and guards; not in the body of a definition an
-  /// `ensures` is about, which holds of what the definition answers, which a raise is not.
-  raises_owed: Bool,
+  /// Whether what may keep what is being read from answering is owed unreached: a raise, or a call
+  /// not known to answer. It is in a law and in any claim's clause and guards; not in the body of a
+  /// definition an `ensures` is about, which holds of what the definition answers.
+  answer_owed: Bool,
   /// How many more definitions this reading may unfold.
   unfold_room: Int,
   /// Whether what was lowered performs anything, which a closure's body is read on fresh
@@ -261,13 +265,7 @@ pub type Lowering = {
 
 /// A lambda as a value: its code, the terms it captured, by slot, and what reading its body on fresh
 /// arguments showed: whether it performs nothing, and whether it always answers.
-pub type Closure = {
-  lambda: Lambda,
-  window: List<Option<Int>>,
-  pure: Bool,
-  total: Bool,
-  raises_owed: Bool,
-}
+pub type Closure = { lambda: Lambda, window: List<Option<Int>>, pure: Bool, total: Bool }
 
 /// A lowering after a step, and the term the step produced.
 pub type L = { lowering: Lowering, id: Int }
@@ -302,7 +300,7 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     tainted: [],
     in_law: false,
     binder_terms: [],
-    raises_owed: true,
+    answer_owed: true,
     unfold_room: unfold_room(),
   }
 
@@ -343,7 +341,11 @@ fn require(lowering: Lowering, cond: Int) -> Lowering / {abort.raise} =
     { ..out.lowering, requirements: out.lowering.requirements.push(out.id) }
   }
 
-fn undefined(lowering: Lowering) -> Lowering / {abort.raise} = require(lowering, false_id())
+/// `lowering` owing that its run goes on past here, where that is owed; elsewhere a proof stands on
+/// it, and says so.
+fn undefined(lowering: Lowering) -> Lowering / {abort.raise} =
+  if lowering.answer_owed { require(lowering, false_id()) }
+  else { blocked(lowering, AnswerAssumed) }
 
 fn require_int_range(lowering: Lowering, t: Int) -> Lowering / {abort.raise} =
   match node(lowering.terms, t) {
@@ -425,7 +427,7 @@ fn lower_opt(
 
 /// What a region answers, of `sort` where that is known, which is not read.
 fn region(lowering: Lowering, sort: Option<Ty>) -> L / {abort.raise} = {
-  let lw = blocked(if lowering.raises_owed { undefined(lowering) } else { lowering }, Region);
+  let lw = blocked(undefined(lowering), Region);
   on({ ..lw, impure: true }, sym(lw.terms, sort))
 }
 
@@ -449,9 +451,7 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
     match acc {
       Some(_) -> acc,
       None -> match lw.closures.at(k) {
-        Some(c) -> if c.lambda == l && c.window == captured.window
-            && c.raises_owed == lw.raises_owed { Some(k) }
-        else { None },
+        Some(c) -> if c.lambda == l && c.window == captured.window { Some(k) } else { None },
         None -> None,
       },
     });
@@ -476,6 +476,7 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
           path: [],
           impure: false,
           inducting: None,
+          answer_owed: true,
         },
         context,
         l.body,
@@ -497,7 +498,6 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
             window: captured.window,
             pure: !read.lowering.impure,
             total: !read.lowering.impure && read.lowering.requirements.len() == 0,
-            raises_owed: lw.raises_owed,
           }),
         },
         made,
@@ -2508,10 +2508,7 @@ fn block(
           let r = lower(acc, context, l.value, unfolds);
           match destructured(r.lowering, pat, r.id) {
             Some(bound) -> bound,
-            None -> {
-              let lw = if r.lowering.raises_owed { undefined(r.lowering) } else { r.lowering };
-              bind_opaque(blocked(lw, DestructuringLet), pat)
-            },
+            None -> { bind_opaque(blocked(undefined(r.lowering), DestructuringLet), pat) },
           }
         },
       },
