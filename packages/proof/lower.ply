@@ -9,7 +9,7 @@ import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, 
                                  LDec, LChar, LUnit, LBad)
 import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, builtin, is_pure,
                 is_recursive, unfoldable, self_recursive, is_identity, is_reflexive, ends,
-                recursive_body, operation_sort, reaches_key)
+                recursive_body, operation_sort, may_call_key)
 import compiler.syntax.parsing (Span)
 import domain (Ty, Var, Fn, Record, Con, Variant)
 import lemma (Lemma)
@@ -553,13 +553,19 @@ fn function_pure(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.
     _ -> match sort_of(lowering.terms, t) { Some(Fn(_, _, pure)) -> pure, _ -> false },
   }
 
-/// Whether a call of a function value always answers: a closure that read so, a total builtin or a
-/// constructor, or in a law a binder whose type says it performs nothing and never raises. Elsewhere
-/// a function's type cannot say so, since an overflow inside it ends the run whatever its row is.
-fn function_total(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.raise} =
+/// Whether a call of a function value over values of `sorts` always answers: a closure that read so,
+/// a builtin that answers there or a constructor, or in a law a binder whose type says it performs
+/// nothing and never raises. Elsewhere a function's type cannot say so, since an overflow inside it
+/// ends the run whatever its row is.
+fn function_total(
+  lowering: Lowering,
+  context: Context,
+  t: Int,
+  sorts: List<Option<Ty>>,
+) -> Bool / {abort.raise} =
   match node(lowering.terms, t) {
     TClosure(k) -> match lowering.closures.at(k) { Some(c) -> c.total, None -> false },
-    TOpaque(name) -> (is_total_builtin(name) && !compares(name)) || ctor(context, name) != None,
+    TOpaque(name) -> builtin_answers(context, name, sorts) || ctor(context, name) != None,
     TSym(_) ->
       lowering.in_law && lowering.binder_terms.contains(t)
         && (match sort_of(lowering.terms, t) { Some(Fn(_, _, total)) -> total, _ -> false }),
@@ -1190,7 +1196,7 @@ fn pointwise(
   }
 }
 
-/// `x == y` at `sort` as the relation alone. Where the values may hold a keyed one, `==` calls a
+/// `x == y` at `sort` as the relation alone. Where either value may hold a keyed one, `==` calls a
 /// key no term here reads, which may end the run.
 fn related(
   lowering: Lowering,
@@ -1199,10 +1205,8 @@ fn related(
   x: Int,
   y: Int,
 ) -> L / {abort.raise} = {
-  let keyed = match sort {
-    Some(t) -> reaches_key(context, t),
-    None -> context.keyed_types.len() > 0,
-  };
+  let keyed = may_call_key(context, sort_of(lowering.terms, x))
+    || may_call_key(context, sort_of(lowering.terms, y));
   let lw = if keyed { undefined(blocked(lowering, OpaqueCall("=="))) } else { lowering };
   let reflexive = match sort {
     Some(t) -> is_reflexive(context, t, lowering.identities),
@@ -1634,23 +1638,26 @@ fn stands_alike(
   !declared.any(|t: Ty| holds_function(context, t))
     && !keyed_at_variable(lowering, context, declared, terms)
 
-/// Whether some term of `terms`, where its `declared` type has a variable, is of a sort that reaches
-/// a key, or of no sort known: generic code was shown at no type whose `==` calls a function.
+/// Whether a variable of `declared`, settled by the sorts of `terms`, may be a type whose `==` calls
+/// a key, or is settled by a term of no sort known: generic code was shown at no such type.
 fn keyed_at_variable(
   lowering: Lowering,
   context: Context,
   declared: List<Ty>,
   terms: List<Int>,
 ) -> Bool =
-  range(0, declared.len()).any(|i: Int|
-    match ((declared.at(i), terms.at(i))) {
-      (Some(d), Some(t)) ->
-        vars(d, []).len() > 0
-          && (match sort_of(lowering.terms, t) {
-            Some(s) -> reaches_key(context, s),
-            None -> true,
-          }),
-      _ -> false,
+  context.compared_by_key.len() > 0
+    && (match range(0, declared.len()).fold(
+        Some(Map::new()),
+        |acc: Option<Map<Int, Ty>>, i: Int|
+          match ((acc, declared.at(i), terms.at(i))) {
+            (Some(m), Some(d), Some(t)) -> if vars(d, []).len() == 0 { acc }
+            else { match sort_of(lowering.terms, t) { Some(s) -> unified(d, s, m), None -> None } },
+            _ -> acc,
+          },
+      ) {
+      None -> true,
+      Some(settled) -> settled.values().any(|s: Ty| may_call_key(context, Some(s))),
     })
 
 /// Whether a value of `ty` is or holds a function, through any declaration.
@@ -2091,7 +2098,9 @@ fn apply_function(
   unfolds: Int,
 ) -> L / {abort.raise} =
   if unfolds <= 0 {
-    let lw = if function_total(lowering, context, f) { lowering } else { undefined(lowering) };
+    let sorts = args.map(|a: Int| sort_of(lowering.terms, a));
+    let lw = if function_total(lowering, context, f, sorts) { lowering }
+    else { undefined(lowering) };
     if function_pure(lowering, context, f) { on(lw, app(lw.terms, f, args, None)) }
     else { on({ ..lw, impure: true }, sym(lw.terms, None)) }
   } else {
@@ -2113,7 +2122,9 @@ fn remainder(
   sort: Option<Ty>,
 ) -> L / {abort.raise} = {
   let f = match args.at(args.len() - 1) { Some(t) -> t, None -> 0 };
-  let lw = if function_total(lowering, context, f) { lowering } else { undefined(lowering) };
+  // `f` is handed the list's elements and what the other arguments start it at.
+  let sorts = args.take(args.len() - 1).map(|a: Int| sort_of(lowering.terms, a));
+  let lw = if function_total(lowering, context, f, sorts) { lowering } else { undefined(lowering) };
   if function_pure(lowering, context, f) { on(lw, app(lw.terms, head, args, sort)) }
   else { on({ ..lw, impure: true }, sym(lw.terms, sort)) }
 }
@@ -2303,7 +2314,7 @@ fn callee_is_total(
   args: List<Int>,
 ) -> Bool / {abort.raise} =
   match who {
-    Local -> function_total(lowering, context, head),
+    Local -> function_total(lowering, context, head, args.map(|a: Int| sort_of(lowering.terms, a))),
     Named(name) -> ctor(context, name) != None || lowering.total.contains(name),
     Unresolved(name) ->
       builtin_answers(context, name, args.map(|a: Int| sort_of(lowering.terms, a))),
@@ -2314,11 +2325,8 @@ fn callee_is_total(
 /// where it compares, over no value whose key's function could end the run.
 fn builtin_answers(context: Context, name: String, sorts: List<Option<Ty>>) -> Bool =
   is_total_builtin(name)
-    && !(compares(name)
-      && sorts.any(|s: Option<Ty>| match s { Some(t) -> reaches_key(context, t), None -> true }))
-
-/// Whether the builtin `name` compares its arguments, which calls a keyed value's key.
-fn compares(name: String) -> Bool = name == "min" || name == "max" || name.starts_with("Map::")
+    && !((name == "min" || name == "max" || name.starts_with("Map::"))
+      && sorts.any(|s: Option<Ty>| may_call_key(context, s)))
 
 fn head_is_pure(terms: Terms, head: Int) -> Bool =
   match sort_of(terms, head) { Some(Fn(_, _, pure)) -> pure, _ -> false }

@@ -16,7 +16,7 @@ import compiler.front.published (Claim, ClaimDef, ClaimSum, ClaimLaw, ClaimClaus
 import compiler.syntax.items (IFn)
 import compiler.syntax.parsing (Span)
 import domain (Ty, Var, Fn, Record, Con, Decl, Variant)
-import sort (canonical, foreign, is_pure_fn, substituted)
+import sort (canonical, foreign, foreign_base, is_pure_fn, substituted)
 import world (BuiltinSignature, Operation, Signature, World)
 import std.graph
 
@@ -76,6 +76,9 @@ pub type Context = {
   // Nominal types that state a `key` or a `numeric`, or whose declaration reaches one that does:
   // what a comparison or an operator calls unseen, which the cost reader reads.
   keyed_types: Map<String, Bool>,
+  /// Nominal types that state a `key`, or whose declaration reaches one that does: those whose `==`
+  /// calls a key.
+  compared_by_key: Map<String, Bool>,
   /// Each type that states a `key`, by name, and the function its `==` reads through.
   keys: Map<String, String>,
   /// Each type that states a `numeric`, and its functions in `numeric_ops` order.
@@ -326,6 +329,12 @@ pub fn context(claims: Claims, world: World) -> Context / {abort.raise} = {
       );
       if stated.len() == 0 { Map::new() } else { reaching_types(decls, set_of(stated)) }
     },
+    compared_by_key: if world.keys.len() == 0 { Map::new() } else {
+      reaching_types(
+        decls,
+        set_of(world.keys.map(|k: { type_name: String, by: String }| k.type_name)),
+      )
+    },
     keys: world.keys.fold(
       Map::new(),
       |m: Map<String, String>, k: { type_name: String, by: String }| m.insert(k.type_name, k.by),
@@ -366,17 +375,22 @@ pub fn operation_sort(cx: Context, named: Bytes, op: Bytes) -> Option<Ty> = {
 /// Whether a value of `ty` holds one of a type that states a `key` or a `numeric`, whose `==` or
 /// whose operators call a function no body shows.
 pub fn reaches_key(cx: Context, ty: Ty) -> Bool =
-  cx.keyed_types.len() > 0 && reaches(ty, cx.keyed_types)
+  cx.keyed_types.len() > 0 && reaches(ty, cx.keyed_types, false)
 
-fn reaches(t: Ty, declared: Map<String, Bool>) -> Bool =
+/// Whether `==` at `sort` may call a key, which may end the run: the sort holds a type that states
+/// one, or a variable the prover never settled, or is not known, where any type states one.
+pub fn may_call_key(cx: Context, sort: Option<Ty>) -> Bool =
+  cx.compared_by_key.len() > 0
+    && (match sort { Some(t) -> reaches(t, cx.compared_by_key, true), None -> true })
+
+/// `open`: a variable numbered past `foreign_base()`, which the prover never settled, may be any type.
+fn reaches(t: Ty, declared: Map<String, Bool>, open: Bool) -> Bool =
   match t {
-    Con(name, args) ->
-      declared.contains(name) || args.fold(false, |f: Bool, a: Ty| f || reaches(a, declared)),
+    Con(name, args) -> declared.contains(name) || args.any(|a: Ty| reaches(a, declared, open)),
     Fn(params, ret, _) ->
-      params.fold(false, |f: Bool, p: Ty| f || reaches(p, declared)) || reaches(ret, declared),
-    Record(fields) ->
-      fields.fold(false, |f: Bool, x: { name: String, ty: Ty }| f || reaches(x.ty, declared)),
-    Var(_) -> false,
+      params.any(|p: Ty| reaches(p, declared, open)) || reaches(ret, declared, open),
+    Record(fields) -> fields.any(|x: { name: String, ty: Ty }| reaches(x.ty, declared, open)),
+    Var(v) -> open && v >= foreign_base(),
   }
 
 /// Whether `==` at `ty` is identity: two values are `==` exactly when they are one value, which is
@@ -506,7 +520,7 @@ fn reaching_types(
     let grown = decls.fold(found, |acc: Map<String, Bool>, decl: Decl|
       if acc.contains(decl.name) { acc }
       else if decl.variants.fold(false, |f: Bool, variant: Variant|
-          f || variant.fields.fold(false, |g: Bool, ty: Ty| g || reaches(ty, found))) {
+          f || variant.fields.fold(false, |g: Bool, ty: Ty| g || reaches(ty, found, false))) {
         acc.insert(decl.name, true)
       } else { acc });
     if grown.len() == found.len() { Stop(found) } else { Continue(grown) }

@@ -2786,9 +2786,10 @@ values, so `1.5m == 1.50m`, though they print apart. At a type that states a
 `key` (§4.4) it is `==` of the keys. At a value holding any of these it is read
 part by part where the shapes are in view, and otherwise as a relation that is
 symmetric, and true of a value and itself only where no `Float`, keyed value or
-type variable can be held; where a keyed value can, that comparison calls a key
-the prover does not read, as `min`, `max` and a `Map`'s operations over one do,
-and is owed as a call that may end the run. At a type variable it is identity only under an
+type variable can be held; where a keyed value can, or a value of a type the
+prover does not know, that comparison calls a key the prover does not read, as
+`min`, `max` and a `Map`'s operations over one do, and is owed as a call that may
+end the run. At a type variable it is identity only under an
 `identity` constraint (below). `<`, `<=`, `>` and `>=` at `Float` are the order,
 false where either side is `NaN`; `Float` arithmetic is read only where both
 operands are literals, as the bits a run answers. An operator at a type that
