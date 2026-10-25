@@ -35,7 +35,8 @@ pub enum ObligationKind {
     Ensures {
         index: usize,
     },
-    /// A `cost` or `space` bound, read off its owner's body and never entered.
+    /// Read off its owner's body and never entered: a `cost` or `space` bound, or the claim that
+    /// what the body builds of a type stating an invariant satisfies it.
     Bound,
     Law,
 }
@@ -47,7 +48,7 @@ pub enum Strategy {
     Interleave,
     /// The static prover first, then the claim's points.
     Static,
-    /// A `cost` bound, which nothing runs.
+    /// A claim nothing runs: a `cost` or `space` bound, or what a body builds.
     Bounded,
 }
 
@@ -73,7 +74,7 @@ fn obligation_of(at: AnswerValue<'_>) -> Result<Obligation, DecodeError> {
             "Ensures" => ObligationKind::Ensures {
                 index: kind.arg(0)?.number()?,
             },
-            "Cost" | "Space" => ObligationKind::Bound,
+            "Cost" | "Space" | "Builds" => ObligationKind::Bound,
             "Law" => ObligationKind::Law,
             _ => return Err(kind.unknown()),
         },

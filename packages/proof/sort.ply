@@ -95,12 +95,145 @@ pub fn substituted(t: Ty, args: List<Ty>) -> Ty =
 
 pub fn is_pure_fn(ty: Ty) -> Bool = match ty { Fn(_, _, pure) -> pure, _ -> false }
 
+/// Where the variables of a declaration or of another definition's signature are numbered once one
+/// is in a claim: past every variable a claim's binders number, so none reads as the claim's own.
+pub fn foreign_base() -> Int = 1000000
+
+/// `t` with each variable numbered past `foreign_base`.
+pub fn foreign(t: Ty) -> Ty =
+  match t {
+    Var(v) -> Var(foreign_base() + v),
+    Con(n, xs) -> Con(n, xs.map(foreign)),
+    Fn(params, ret, pure) -> Fn(params.map(foreign), foreign(ret), pure),
+    Record(fields) ->
+      Record(fields.map(|f: { name: String, ty: Ty }| { name: f.name, ty: foreign(f.ty) })),
+  }
+
+/// What a function of `params` answering `ret` answers, given its arguments' sorts: `ret` with each
+/// variable the parameters settle in place. A variable left is the function's own, which a foreign
+/// signature numbers apart from the claim's.
+pub fn answered(params: List<Ty>, args: List<Option<Ty>>, ret: Ty) -> Option<Ty> = {
+  let settled = range(0, params.len()).fold(Map::new(), |acc: Map<Int, Ty>, i: Int|
+    match ((params.at(i), args.at(i))) {
+      (Some(p), Some(Some(a))) -> matched(p, a, acc),
+      _ -> acc,
+    });
+  Some(placed_vars(ret, settled))
+}
+
+fn placed_vars(t: Ty, settled: Map<Int, Ty>) -> Ty =
+  match t {
+    Var(v) -> match settled.get(v) { Some(a) -> a, None -> Var(v) },
+    Con(n, xs) -> Con(n, xs.map(|x: Ty| placed_vars(x, settled))),
+    Fn(params, ret, pure) ->
+      Fn(params.map(|p: Ty| placed_vars(p, settled)), placed_vars(ret, settled), pure),
+    Record(fields) ->
+      Record(
+        fields.map(|f: { name: String, ty: Ty }| { name: f.name, ty: placed_vars(f.ty, settled) }),
+      ),
+  }
+
+/// One-way matching of `pattern` against `actual` that fails where they disagree: a variable bound
+/// once is bound alike everywhere, and a function that performs fits no pure one.
+pub fn unified(pattern: Ty, actual: Ty, subst: Map<Int, Ty>) -> Option<Map<Int, Ty>> =
+  match pattern {
+    Var(v) -> match subst.get(v) {
+      Some(bound) -> if bound == actual { Some(subst) } else { None },
+      None -> Some(subst.insert(v, actual)),
+    },
+    Con(a, xs) -> match actual {
+      Con(b, ys) -> if a == b && xs.len() == ys.len() { unified_all(xs, ys, subst) } else { None },
+      _ -> None,
+    },
+    Fn(ps, r, pure) -> match actual {
+      Fn(qs, s, also) -> if ps.len() != qs.len() || (pure && !also) { None }
+      else { match unified_all(ps, qs, subst) { Some(m) -> unified(r, s, m), None -> None } },
+      _ -> None,
+    },
+    Record(xs) -> match actual {
+      Record(ys) -> if xs.len() != ys.len() { None } else {
+        xs.fold(Some(subst), |acc: Option<Map<Int, Ty>>, x: { name: String, ty: Ty }|
+          match acc {
+            None -> None,
+            Some(m) -> match field_ty(actual, x.name) {
+              Some(y) -> unified(x.ty, y, m),
+              None -> None,
+            },
+          })
+      },
+      _ -> None,
+    },
+  }
+
+fn unified_all(xs: List<Ty>, ys: List<Ty>, subst: Map<Int, Ty>) -> Option<Map<Int, Ty>> =
+  range(0, xs.len()).fold(Some(subst), |acc: Option<Map<Int, Ty>>, i: Int|
+    match acc {
+      None -> None,
+      Some(m) -> match ((xs.at(i), ys.at(i))) { (Some(x), Some(y)) -> unified(x, y, m), _ -> None },
+    })
+
+/// One-way matching of `pattern` against `actual`; silently declines where they disagree.
+pub fn matched(pattern: Ty, actual: Ty, subst: Map<Int, Ty>) -> Map<Int, Ty> =
+  match pattern {
+    Var(v) -> if subst.contains(v) { subst } else { subst.insert(v, actual) },
+    Con(a, xs) -> match actual {
+      Con(b, ys) -> if a == b && xs.len() == ys.len() {
+        range(0, xs.len()).fold(subst, |acc: Map<Int, Ty>, i: Int|
+          match ((xs.at(i), ys.at(i))) { (Some(x), Some(y)) -> matched(x, y, acc), _ -> acc })
+      } else { subst },
+      _ -> subst,
+    },
+    Fn(ps, r, _) -> match actual {
+      Fn(qs, s, _) -> if ps.len() == qs.len() {
+        matched(
+          r,
+          s,
+          range(0, ps.len()).fold(subst, |acc: Map<Int, Ty>, i: Int|
+            match ((ps.at(i), qs.at(i))) { (Some(p), Some(q)) -> matched(p, q, acc), _ -> acc }),
+        )
+      } else { subst },
+      _ -> subst,
+    },
+    Record(xs) -> match actual {
+      Record(_) ->
+        xs.fold(subst, |acc: Map<Int, Ty>, x: { name: String, ty: Ty }|
+          match field_ty(actual, x.name) { Some(y) -> matched(x.ty, y, acc), None -> acc }),
+      _ -> subst,
+    },
+  }
+
 test "a record type is one sort whichever order its fields were written in" {
   let a = record_of([{ name: "b", ty: int_ty() }, { name: "a", ty: bool_ty() }]);
   let b = record_of([{ name: "a", ty: bool_ty() }, { name: "b", ty: int_ty() }]);
   assert_eq(a, b);
   assert_eq(field_names(a), Some(["a", "b"]));
   assert_eq(field_ty(a, "b"), Some(int_ty()))
+}
+
+test "a call answers its return at what its arguments settle, and its own variable where they leave one" {
+  let at = list_ty(Var(0));
+  assert_eq(
+    answered([at], [Some(list_ty(float_ty()))], option_ty(Var(0))),
+    Some(option_ty(float_ty())),
+  );
+  let unsettled = foreign(Var(1));
+  assert_eq(
+    answered([foreign(at), unsettled], [Some(list_ty(int_ty())), None], unsettled),
+    Some(unsettled),
+  );
+  assert_eq(answered([], [], int_ty()), Some(int_ty()))
+}
+
+test "a type fits a pattern only where each variable is settled alike and nothing disagrees" {
+  let pair = Fn([Var(0), Var(0)], bool_ty(), true);
+  assert(unified(pair, Fn([int_ty(), int_ty()], bool_ty(), true), Map::new()) != None);
+  assert_eq(unified(pair, Fn([int_ty(), float_ty()], bool_ty(), true), Map::new()), None);
+  assert_eq(unified(int_ty(), float_ty(), Map::new()), None);
+  // A law over a pure function says nothing of one that performs.
+  assert_eq(
+    unified(Fn([int_ty()], int_ty(), true), Fn([int_ty()], int_ty(), false), Map::new()),
+    None,
+  )
 }
 
 test "substitution replaces the variables it numbers and keeps the rest" {

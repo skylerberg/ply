@@ -11,9 +11,11 @@ import rules (RuleLog, Rule, note, Propositional, CaseSplit, Congruence, Injecti
               LinearArithmetic)
 import sort (is_con, list_elem, field_names, int_ty)
 import term (Terms, Made, Node, TInt, TBool, TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot,
-             TAnd, TOr, TCmp, TEq, TIf, TMatch, TOpaque, Poly, Mono, CmpOp, Lt, Le, Gt, Ge, Arm,
-             ArmTest, Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id, size,
-             node, sort_of, is_int, mk, sym, nil, cons, int_lit, add, app)
+             TAnd, TOr, TCmp, TEq, TEqualAt, TIf, TMatch, TOpaque, TFloat, TDecimal, Poly, Mono,
+             CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit, TestList, Undecidable,
+             true_id, false_id, size, node, sort_of, is_int, mk, sym, nil, cons, int_lit, add, app,
+             cmp, float_nan, float_rank, decimal_normalized, op_float_nan, op_float_rank,
+             op_decimal_normalized)
 
 pub type Answer = | Closed | Open | Exhausted
 
@@ -33,8 +35,14 @@ type Split =
 /// A solver after a search, and what the search came to.
 pub type Searched = { sv: Solver, answer: Answer }
 
-fn charged(solver: Solver) -> Option<Solver> =
-  if solver.budget >= 1 { Some({ ..solver, budget: solver.budget - 1 }) } else { None }
+fn charged(solver: Solver) -> Option<Solver> = charged_by(solver, 1)
+
+fn charged_by(solver: Solver, steps: Int) -> Option<Solver> =
+  if solver.budget >= steps { Some({ ..solver, budget: solver.budget - steps }) } else { None }
+
+/// A round of saturation walks every term, so it costs a step for each thousand of them: a budget
+/// bounds the work a claim takes, whatever its reading made.
+fn round_cost(solver: Solver) -> Int = 1 + size(solver.terms) / 1000
 
 fn spent(solver: Solver) -> Solver = { ..solver, budget: 0 }
 
@@ -164,7 +172,7 @@ type Saturated = { sv: Solver, b: Branch, answer: Answer }
 /// Each round charges the budget, so it bounds the rounds: `left`.
 fn saturate(solver: Solver, branch: Branch, left: Int) -> Saturated / {abort.raise} =
   if left <= 0 { { sv: spent(solver), b: branch, answer: Exhausted } } else {
-    match charged(solver) {
+    match charged_by(solver, round_cost(solver)) {
       None -> { sv: spent(solver), b: branch, answer: Exhausted },
       Some(sv1) -> {
         let grown = { ..branch, cs: grow(branch.cs, size(sv1.terms)) };
@@ -260,6 +268,17 @@ fn canonical(terms: Terms, cs: Classes, t: Int) -> Option<Node> / {abort.raise} 
       let x = f(e.lhs);
       let y = f(e.rhs);
       Some(TEq({ lhs: if x < y { x } else { y }, rhs: if x < y { y } else { x } }))
+    },
+    TEqualAt(e) -> {
+      let x = f(e.lhs);
+      let y = f(e.rhs);
+      Some(
+        TEqualAt({
+          lhs: if x < y { x } else { y },
+          rhs: if x < y { y } else { x },
+          reflexive: e.reflexive,
+        }),
+      )
     },
     TIf(i) ->
       Some(TIf({ cond: f(i.cond), then_branch: f(i.then_branch), else_branch: f(i.else_branch) })),
@@ -394,6 +413,11 @@ fn propagate_one(solver: Solver, branch: Branch, t: Int) -> Stepped / {abort.rai
     TAnd(x, y) -> junction(solver, branch, t, x, y, true),
     TOr(x, y) -> junction(solver, branch, t, x, y, false),
     TEq(e) -> equality(solver, branch, t, e.lhs, e.rhs),
+    // A value is `==` to itself only where the sort's `==` is reflexive; nothing else follows.
+    TEqualAt(e) -> if e.reflexive && equal(branch.cs, e.lhs, e.rhs) {
+      let s = set(solver.terms, branch, t, true);
+      { sv: if s.changed { noted(solver, Congruence) } else { solver }, b: s.b, changed: s.changed }
+    } else { { sv: solver, b: branch, changed: false } },
     TIf(i) -> match truth(solver.terms, branch, i.cond) {
       Some(true) -> {
         let j = union(branch.cs, t, i.then_branch);
@@ -416,8 +440,41 @@ fn propagate_one(solver: Solver, branch: Branch, t: Int) -> Stepped / {abort.rai
       },
       None -> { sv: solver, b: branch, changed: false },
     },
-    TApp(a) -> over_spine(solver, branch, t, a.head, a.args),
+    TApp(a) -> match literal_answer(solver.terms, branch, a.head, a.args) {
+      Some(m) -> made(solver, branch, t, m),
+      None -> over_spine(solver, branch, t, a.head, a.args),
+    },
     _ -> { sv: solver, b: branch, changed: false },
+  }
+
+/// What a `Float`'s place in the order, its being `NaN`, or a `Decimal`'s normal form is, once the
+/// search knows the value is a literal.
+fn literal_answer(
+  terms: Terms,
+  branch: Branch,
+  head: Int,
+  args: List<Int>,
+) -> Option<Made> / {abort.raise} =
+  match node(terms, head) {
+    TOpaque(name) -> match args {
+      [x] -> if name != op_float_rank() && name != op_float_nan()
+          && name != op_decimal_normalized() { None } else {
+        match first_in_class(
+            branch,
+            x,
+            range(0, size(terms)).filter(|c: Int|
+              match node(terms, c) { TFloat(_) -> true, TDecimal(_) -> true, _ -> false }),
+          ) {
+          None -> None,
+          Some(lit) -> if lit == x { None }
+          else if name == op_float_rank() { Some(float_rank(terms, lit)) }
+          else if name == op_float_nan() { Some(float_nan(terms, lit)) }
+          else { Some(decimal_normalized(terms, lit)) },
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
   }
 
 /// `List::len` and `List::push` over a list whose class holds a spine cell, one cell at a time: what lowering
@@ -446,8 +503,15 @@ fn over_spine(
               Some(below) -> {
                 let rest = app(solver.terms, head, [below], Some(int_ty()));
                 let one = int_lit(rest.terms, 1);
-                match add(one.terms, one.id, rest.id) {
-                  Some(sum) -> made(solver, branch, t, sum),
+                // A length the search makes is a length: not negative, as one the claim made is.
+                let zero = int_lit(one.terms, 0);
+                let counted = cmp(zero.terms, Ge, rest.id, zero.id);
+                match add(counted.terms, one.id, rest.id) {
+                  Some(sum) -> {
+                    let m = made(solver, branch, t, sum);
+                    let j = union(grow(m.b.cs, size(m.sv.terms)), counted.id, true_id());
+                    { ..m, b: { ..m.b, cs: j.cs }, changed: m.changed || j.changed }
+                  },
                   None -> unchanged,
                 }
               },

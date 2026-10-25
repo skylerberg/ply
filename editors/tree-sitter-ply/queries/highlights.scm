@@ -36,6 +36,7 @@
   "derive"
   "key"
   "show"
+  "invariant"
   "numeric"
   "forall"
   "where"
@@ -115,6 +116,9 @@
 (operation_parameter name: (identifier) @parameter)
 (clause_parameters (identifier) @parameter)
 
+; A claim's leading `identity(a)` constrains `a`; it is no call.
+(law_declaration condition: (call_expression function: (identifier) @keyword (#eq? @keyword "identity")))
+(law_schema_declaration condition: (call_expression function: (identifier) @keyword (#eq? @keyword "identity")))
 (call_expression function: (identifier) @function.call)
 (call_expression function: (qualified_name (identifier) @function.call))
 (call_expression function: (field_expression field: (identifier) @function.method))

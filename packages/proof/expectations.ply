@@ -16,12 +16,13 @@ import goal (Goal, Binder, Limits, Proof, BudgetSpent, default_limits, default_p
 import kernel (checked, refusal)
 import statics (Prover, Unshown, prover_of, unshown)
 import statics
-import lower (Blocker, BitOperator, FloatTerm, DecimalArithmetic, KeyedTerm)
+import lower (Blocker, BitOperator, DecimalArithmetic)
 import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, CaseSplit, Unfold,
               Induction, Cited, Descent, Spine)
 import sort (canonical, int_ty)
 import world
 import world (Built, Obligation, Signature, world_of)
+import obligation (Builds)
 import std.list
 import std.string
 
@@ -53,7 +54,19 @@ fn law_goal(f: Fixture, label: String) -> Goal / {abort.raise} =
         lemmas: [],
         total: [],
         partial: false,
+        identities: law_identities(f, label),
+        contracts: [],
+        inducting: None,
+        builds: None,
+        tainted: [],
       },
+  }
+
+fn law_identities(f: Fixture, label: String) -> List<Int> =
+  match f.built.world.obligations.fold(None, |acc: Option<Obligation>, o: Obligation|
+      match acc { Some(_) -> acc, None -> if o.owner == owner(label) { Some(o) } else { None } }) {
+    Some(o) -> o.identities,
+    None -> [],
   }
 
 fn law_binders(f: Fixture, label: String) -> List<Binder> =
@@ -259,7 +272,8 @@ fn congruence() -> String =
     "  { f(x) == f(y) }",
     "law \"any two arguments agree\" forall (f: (Int) -> Int, x: Int, y: Int)",
     "  { f(x) == f(y) }",
-    "law \"congruence is polymorphic\" forall (g: (a) -> b, u: a, v: a) where u == v",
+    "law \"congruence is polymorphic\" forall (g: (a) -> List<b>, u: a) { g(u).len() == g(u).len() }",
+    "law \"equal values at a variable are taken alike\" forall (g: (a) -> b, u: a, v: a) where u == v",
     "  { g(u) == g(v) }",
     "law \"a record is its fields\" forall (n: Int) { { balance: n }.balance == n }",
     "law \"records with equal fields are equal\" forall (n: Int, m: Int) where n == m",
@@ -562,12 +576,19 @@ fn audit_program() -> String =
     "law \"two weights at once\" forall (s: Shade) where weight(s) == 1 && weight(s) == 3",
     "  { s == s }",
     "",
-    "// The numeric types, whose whole content in this audit is that a type arriving",
-    "// is not evidence. Every `Float` entry below is `Refutable` — false at `NaN`,",
-    "// including the reflexivity of `==` — so the audit asserts `Unknown` for each,",
-    "// which is the structural refusal doing its job rather than a rule somebody",
-    "// remembered to apply.",
+    "// `==` at `Float`, at `Decimal` and at a type variable is not identity: false at",
+    "// `NaN`, `1.5m == 1.50m` though they print apart, and a variable may be either.",
     "law \"a float equals itself\" forall (x: Float) { x == x }",
+    "law \"a float from bits equals itself\" forall (n: Int) { Float::of_bits(n) == Float::of_bits(n) }",
+    "law \"any value equals itself\" forall (x: a) { x == x }",
+    "fn same<a>(x: a) -> Bool = x == x",
+    "law \"a float is itself through a generic call\" forall (n: Int) { same(Float::of_bits(n)) }",
+    "law \"equal values are shown alike\" forall (f: (a) -> String, x: a, y: a) { !(x == y) || f(x) == f(y) }",
+    "law \"equal decimals print alike\" forall (x: Decimal, y: Decimal)",
+    "  { !(x == y) || Decimal::to_string(x) == Decimal::to_string(y) }",
+    "law \"a float that equals itself does\" forall (x: Float) where x == x { x == x }",
+    "law \"a float from bits is itself or NaN\" forall (n: Int)",
+    "  { Float::of_bits(n) == Float::of_bits(n) || Float::of_bits(n) != Float::of_bits(n) }",
     "law \"a float sum commutes\" forall (x: Float, y: Float) { x + y == y + x }",
     "law \"a float is at least itself\" forall (x: Float) { x >= x }",
     "law \"a decimal equals itself\" forall (x: Decimal) { x == x }",
@@ -608,6 +629,11 @@ fn returns_zero(f: Fixture, name: String) -> Decision / {abort.raise} = {
       lemmas: [],
       total: [],
       partial: false,
+      identities: [],
+      contracts: [],
+      inducting: None,
+      builds: None,
+      tainted: [],
     },
     default_limits(),
   )
@@ -626,6 +652,11 @@ fn ensures_goal(index: Int) -> Decision / {abort.raise} = {
       lemmas: [],
       total: [],
       partial: false,
+      identities: [],
+      contracts: [],
+      inducting: None,
+      builds: None,
+      tainted: [],
     },
     default_limits(),
   )
@@ -673,6 +704,11 @@ test "congruence over an uninterpreted function decides both directions" {
   assert(uses(proof(f, "a function is a function"), Congruence));
   assert(is_proved(f, "equal arguments agree"));
   assert(not_proved(f, "any two arguments agree"))
+}
+
+// At `Decimal`, `1.5m == 1.50m` and a function may tell them apart; at `Float`, `NaN != NaN`.
+test "== at a variable no constraint is on is no identity" {
+  assert(not_proved(fixture(congruence()), "equal values at a variable are taken alike"))
 }
 
 test "a polymorphic proof records its sorts" {
@@ -924,8 +960,10 @@ test "a measure is shown where every call its group makes back into it descends,
 type Proving = { prover: Prover, built: Built, analysis: Analysis }
 
 /// A fixture with the run's prover over it, its measures decided.
-fn proving(src: String) -> Proving / {abort.raise} = {
-  let sources = [{ name: b"m", src: Bytes::of_string(src) }];
+fn proving(src: String) -> Proving / {abort.raise} =
+  proving_all([{ name: b"m", src: Bytes::of_string(src) }])
+
+fn proving_all(sources: List<{ name: Bytes, src: Bytes }>) -> Proving / {abort.raise} =
   match analyse(parse_all(sources)) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> {
@@ -937,7 +975,6 @@ fn proving(src: String) -> Proving / {abort.raise} = {
       }
     },
   }
-}
 
 fn proof_of(p: Proving, pick: (Obligation) -> Bool) -> Option<Proof> / {abort.raise} =
   match p.built.world.obligations.fold(None, |found: Option<Obligation>, o: Obligation|
@@ -1011,6 +1048,11 @@ test "a postcondition without the definition is unknown" {
       lemmas: [],
       total: [],
       partial: false,
+      identities: [],
+      contracts: [],
+      inducting: None,
+      builds: None,
+      tainted: [],
     },
     default_limits(),
   );
@@ -1116,6 +1158,8 @@ fn audit() -> List<{ label: String, truth: Truth }> = {
     "two decimals are two values",
     // Valid, and still not proved: there is no theory of `Decimal` arithmetic.
     "a decimal zero is additive",
+    "a float that equals itself does",
+    "a float from bits is itself or NaN",
   ];
   let partial = [
     "addition commutes",
@@ -1144,6 +1188,11 @@ fn audit() -> List<{ label: String, truth: Truth }> = {
     "a float equals itself",
     "a float sum commutes",
     "a float is at least itself",
+    "a float from bits equals itself",
+    "any value equals itself",
+    "a float is itself through a generic call",
+    "equal values are shown alike",
+    "equal decimals print alike",
   ];
   let vacuous_ones = [
     "between zero and one",
@@ -1221,11 +1270,29 @@ fn floats() -> String =
     "law \"a float sum commutes\" forall (x: Float, y: Float) { x + y == y + x }",
     "law \"a float is at least itself\" forall (x: Float) { x >= x }",
     "law \"a float zero is additive\" forall (x: Float) { x + 0.0 == x }",
+    "law \"a float in a record\" forall (r: {rate: Float}) { r == r }",
+    "law \"a float below another is not above it\" forall (x: Float, y: Float) where x < y { x > y }",
+    "",
     "law \"one point five is one point five\" forall (n: Int) { 1.5 == 1.5 }",
     "law \"a float in a list\" forall (xs: List<Float>) { xs.len() >= 0 }",
-    "law \"a float in a record\" forall (r: {rate: Float}) { r == r }",
     "fn half() -> Float = 0.5",
     "law \"a float from a call\" forall (n: Int) { half() == half() }",
+    "law \"a float equals itself or is NaN\" forall (x: Float) { x == x || x != x }",
+    "law \"a float that equals itself is at least itself\" forall (x: Float) where x == x { x >= x }",
+    "law \"no float is below itself\" forall (x: Float) { !(x < x) }",
+    "law \"the zeros are equal\" forall (n: Int) { -0.0 == 0.0 }",
+    "law \"a sum of literals is its rounding\" forall (n: Int) { 0.1 + 0.2 == 0.30000000000000004 }",
+    "law \"the order is transitive\" forall (x: Float, y: Float, z: Float) where x < y && y < z { x < z }",
+    "fn clamped(x: Float) -> Float = if x >= 0.0 { if x <= 1.0 { x } else { 1.0 } } else { 0.0 }",
+    "fn clamped_naively(x: Float) -> Float = if x < 0.0 { 0.0 } else if x > 1.0 { 1.0 } else { x }",
+    "law \"a clamp lands in its range\" forall (x: Float) { clamped(x) >= 0.0 && clamped(x) <= 1.0 }",
+    "law \"a naive clamp lands in its range\" forall (x: Float) { clamped_naively(x) >= 0.0 }",
+    "type Node = | Node({ visits: Int, reward: Float })",
+    "fn leaf() -> Node = Node({ visits: 0, reward: 0.0 })",
+    "fn visits(n: Node) -> Int = match n { Node(d) -> d.visits }",
+    "fn credited(n: Node, r: Float) -> Node = match n { Node(d) -> Node({ visits: d.visits + 1, reward: d.reward + r }) }",
+    "law \"a leaf has no visits\" forall (n: Int) { visits(leaf()) == 0 }",
+    "law \"crediting a leaf visits it once\" forall (r: Float) { visits(credited(leaf(), r)) == 1 }",
   ])
 
 fn decimals() -> String =
@@ -1336,7 +1403,8 @@ test "a true law about the bit pattern is property and not proved" {
   )
 }
 
-test "no law mentioning a float is ever proved" {
+// `==` at `Float` is IEEE's, not identity: false at `NaN`, true of `-0.0` and `0.0`.
+test "a claim over floats is proved exactly where it holds at every float, NaN among them" {
   let f = fixture(floats());
   assert(
     [
@@ -1344,22 +1412,37 @@ test "no law mentioning a float is ever proved" {
       "a float sum commutes",
       "a float is at least itself",
       "a float zero is additive",
+      "a float in a record",
+      "a float below another is not above it",
+      "a naive clamp lands in its range",
+    ].fold(true, |ok: Bool, l: String| ok && not_proved(f, l)),
+  );
+  assert_eq(
+    [
       "one point five is one point five",
       "a float in a list",
-      "a float in a record",
       "a float from a call",
-    ].fold(true, |ok: Bool, l: String| ok && not_proved(f, l)),
+      "a float equals itself or is NaN",
+      "a float that equals itself is at least itself",
+      "no float is below itself",
+      "the zeros are equal",
+      "a sum of literals is its rounding",
+      "the order is transitive",
+      "a clamp lands in its range",
+    ].filter(|l: String| !is_proved(f, l)),
+    [],
   )
 }
 
-test "a refused float obligation says that is why" {
+// A `Float` field changes nothing a claim about the fields beside it says.
+test "a value that holds a float is reasoned about as any other" {
   let f = fixture(floats());
-  assert(match diagnosed(f, "a float equals itself").decision { Unknown(_) -> true, _ -> false });
-  assert(blocked_by(f, "a float equals itself", FloatTerm))
+  assert(is_proved(f, "a leaf has no visits"));
+  assert(is_proved(f, "crediting a leaf visits it once"))
 }
 
-test "a float binder alone is enough to refuse" {
-  assert(not_proved(fixture(beside_a_float()), "an int is itself, beside a float"))
+test "a float binder beside a claim takes nothing from it" {
+  assert(is_proved(fixture(beside_a_float()), "an int is itself, beside a float"))
 }
 
 test "the same claim without a float is still proved" {
@@ -1375,11 +1458,29 @@ test "a decimal is provable as an uninterpreted term" {
   assert(is_proved(f, "a decimal literal is itself"))
 }
 
-test "two decimal literals of one value are one term" {
+test "two scales of one decimal value are ==, and two values are not" {
   let f = fixture(decimals());
   assert(is_proved(f, "two scales are one value"));
   // Distinct values must stay distinct: the normalization merged nothing else.
   assert(not_proved(f, "two values are two values"))
+}
+
+// `1.5m == 1.50m`, and they print as `1.5` and `1.50`: `==` is no identity a function respects.
+test "equal decimals are not taken to print alike" {
+  let f = fixture(
+    String::unlines([
+      "law \"equal decimals print alike\" forall (x: Decimal, y: Decimal) {",
+      "  !(x == y) || Decimal::to_string(x) == Decimal::to_string(y)",
+      "}",
+      "law \"literals of one value print alike\" forall (n: Int) {",
+      "  Decimal::to_string(1.5m) == Decimal::to_string(1.50m)",
+      "}",
+      "law \"a decimal prints as itself\" forall (x: Decimal) { Decimal::to_string(x) == Decimal::to_string(x) }",
+    ]),
+  );
+  assert(not_proved(f, "equal decimals print alike"));
+  assert(not_proved(f, "literals of one value print alike"));
+  assert(is_proved(f, "a decimal prints as itself"))
 }
 
 test "decimal arithmetic and ordering are property rather than proved" {
@@ -1389,11 +1490,10 @@ test "decimal arithmetic and ordering are property rather than proved" {
   assert(not_proved(f, "a decimal is at least itself"))
 }
 
-test "a decimal never reports the float blocker" {
+test "decimal arithmetic says it is why a claim is not proved" {
   let f = fixture(decimals());
-  assert(!blocked_by(f, "a decimal zero is additive", FloatTerm));
-  assert(!blocked_by(f, "a decimal equals itself", FloatTerm));
-  assert(blocked_by(f, "a decimal zero is additive", DecimalArithmetic))
+  assert(blocked_by(f, "a decimal zero is additive", DecimalArithmetic));
+  assert(!blocked_by(f, "a decimal equals itself", DecimalArithmetic))
 }
 
 test "the arithmetic fragment did not grow" {
@@ -1408,13 +1508,11 @@ test "a prelude sum type is a case analysis like any other" {
   assert(is_proved(f, "a direction is one of three"))
 }
 
-// The one way a `Float` can enter the graph carrying no sort of its own.
-test "a float pulled out of a destructuring is still refused" {
+test "a destructuring reads the fields it names" {
   let f = fixture(destructured());
-  assert(not_proved(f, "a destructured float sum commutes"));
-  assert(not_proved(f, "a matched float sum commutes"));
-  // The `Int` control: outside the fragment for its own reason, never as a `Float` problem.
-  assert(!blocked_by(f, "a destructured int sum commutes", FloatTerm))
+  assert(is_proved(f, "a destructured float sum commutes"));
+  assert(is_proved(f, "a matched float sum commutes"));
+  assert(is_proved(f, "a destructured int sum commutes"))
 }
 
 /// Two values of a type that states a `key` are equal as their keys are, so what differs in how
@@ -1436,6 +1534,14 @@ fn keyed() -> String =
     "law \"a list of lengths has a length\" forall (xs: List<Length>) { xs.len() >= 0 }",
     "law \"equal plains hold one number\" forall (a: Plain, b: Plain) { !(a == b) || number(a) == number(b) }",
     "",
+    "type Tag = | Tag(Int, String)",
+    "key for Tag by number_of",
+    "fn number_of(t: Tag) -> Int = match t { Tag(n, _) -> n }",
+    "fn label(t: Tag) -> String = match t { Tag(_, s) -> s }",
+    "law \"a tag equals itself\" forall (t: Tag) { t == t }",
+    "law \"tags of one number are equal\" forall (n: Int, a: String, b: String) { Tag(n, a) == Tag(n, b) }",
+    "law \"equal tags are labelled alike\" forall (x: Tag, y: Tag) { !(x == y) || label(x) == label(y) }",
+    "",
     "fn whole(l: Length) -> Length = Millimetres(millimetres(l))",
     "law schema settles<a>(f: (a) -> a) forall (x: a) { f(f(x)) == f(x) }",
     "law \"a whole length is whole, written out\" forall (x: Length) { whole(whole(x)) == whole(x) }",
@@ -1443,20 +1549,24 @@ fn keyed() -> String =
     "law \"a plain is itself, by its schema\" = settles(|p: Plain| p)",
   ])
 
-test "no law that holds a value compared by a key is ever proved, and it says that is why" {
+// Two lengths are `==` as their keys are: `Metres(1) == Millimetres(1000)`, and `Metres(0)` is
+// `Millimetres(0)`. A length's key overflows past `Int`, so `==` of one may end the run.
+test "a value compared by a key is equal as its key is, and no more" {
   let f = fixture(keyed());
-  assert(
+  assert(not_proved(f, "constructors that differ are unequal"));
+  assert(not_proved(f, "equal lengths are built alike"));
+  assert(not_proved(f, "a length equals itself"));
+  assert(not_proved(f, "a held length equals itself"));
+  assert(not_proved(f, "equal tags are labelled alike"));
+  assert_eq(
     [
-      "constructors that differ are unequal",
-      "equal lengths are built alike",
-      "a length equals itself",
-      "a held length equals itself",
+      "a tag equals itself",
+      "tags of one number are equal",
       "a list of lengths has a length",
-    ].fold(true, |ok: Bool, l: String| ok && not_proved(f, l) && blocked_by(f, l, KeyedTerm)),
-  );
-  // A type that states none is read as its constructors say, in the same program.
-  assert(is_proved(f, "equal plains hold one number"));
-  assert(!blocked_by(f, "equal plains hold one number", KeyedTerm))
+      "equal plains hold one number",
+    ].filter(|l: String| !is_proved(f, l)),
+    [],
+  )
 }
 
 test "an operator at a type that states its own arithmetic is no arithmetic of the integers" {
@@ -1472,19 +1582,439 @@ test "an operator at a type that states its own arithmetic is no arithmetic of t
       "law \"the integers' adding commutes\" forall (a: Int, b: Int) where a > 0 && a < 9 && b > 0 && b < 9 { a + b == b + a }",
     ]),
   );
-  // One is false and one true of `first`: neither is read off `+` and `-` as the integers have them.
-  assert(not_proved(f, "adding commutes") && blocked_by(f, "adding commutes", KeyedTerm));
-  assert(not_proved(f, "a difference of itself is itself"));
+  // Each operator is the function it names, never the integers' operator.
+  assert(not_proved(f, "adding commutes"));
+  assert(is_proved(f, "a difference of itself is itself"));
   assert(is_proved(f, "the integers' adding commutes"))
 }
 
-test "a schema instantiated over a keyed type is refused as its body written out is" {
+test "a schema instantiated over a keyed type is decided as its body written out is" {
   let f = fixture(keyed());
   let written = diagnosed(f, "a whole length is whole, written out");
   let made = diagnosed(f, "a whole length is whole, by its schema");
-  assert(not_proved(f, "a whole length is whole, by its schema"));
-  assert(blocked_by(f, "a whole length is whole, by its schema", KeyedTerm));
+  assert_eq(
+    is_proved(f, "a whole length is whole, by its schema"),
+    is_proved(f, "a whole length is whole, written out"),
+  );
   assert_eq(made.blockers, written.blockers);
-  // The schema is no part of the refusal: over a type that states no key it is proved.
   assert(is_proved(f, "a plain is itself, by its schema"))
+}
+
+fn higher() -> String =
+  String::unlines([
+    "fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))",
+    "fn has(xs: List<Int>, k: Int) -> Bool = match xs { [] -> false, [x, ..rest] -> x == k || has(rest, k) }",
+    "",
+    "law \"a lambda applied\" forall (x: Int) where x > -100 && x < 100 { (|y: Int| y + 1)(x) == x + 1 }",
+    "law \"a lambda handed on and applied twice\" forall (x: Int) where x > -100 && x < 100 {",
+    "  twice(|y: Int| y + 1, x) == x + 2",
+    "}",
+    "law \"a captured value is read where the lambda runs\" forall (x: Int, k: Int) where x > -100 && x < 100 && k > -100 && k < 100 {",
+    "  twice(|y: Int| y + k, x) == x + k + k",
+    "}",
+    "law \"a mapped literal keeps its length\" forall (p: Int) where p > -100 && p < 100 {",
+    "  [1, 2, 3].map(|x: Int| x + p).len() == 3",
+    "}",
+    "law \"a map reads each element\" forall (p: Int) where p > -100 && p < 100 {",
+    "  [1, 2].map(|x: Int| x + p) == [1 + p, 2 + p]",
+    "}",
+    "law \"a fold over a literal\" forall (p: Int) where p > -100 && p < 100 {",
+    "  [1, 2, 3].fold(p, |a: Int, x: Int| a + x) == p + 6",
+    "}",
+    "law \"a filter keeps what it is asked to\" forall (p: Int) where p > 0 && p < 100 {",
+    "  [p, 0 - p].filter(|x: Int| x > 0) == [p]",
+    "}",
+    "law \"a map keeps its length\" forall (xs: List<Int>) { xs.map(|x: Int| x).len() == xs.len() }",
+    "law \"a recursion over a literal runs\" forall (k: Int) where k == 2 || k == 3 { has([1, 2, 3], k) }",
+    "",
+    "law \"a map does not read as its function's identity\" forall (p: Int) where p > -100 && p < 100 {",
+    "  [1, 2].map(|x: Int| x + p) == [1, 2]",
+    "}",
+    "law \"a fold that may overflow\" forall (p: Int) { [1, 2, 3].fold(p, |a: Int, x: Int| a + x) == p + 6 }",
+    "law \"a recursion over a literal answers what it does\" forall (k: Int) where k == 4 { has([1, 2, 3], k) }",
+  ])
+
+test "a lambda is a value applied where it is called, and the list functions read over a spine in view" {
+  let f = fixture(higher());
+  assert_eq(
+    [
+      "a lambda applied",
+      "a lambda handed on and applied twice",
+      "a captured value is read where the lambda runs",
+      "a mapped literal keeps its length",
+      "a map reads each element",
+      "a fold over a literal",
+      "a filter keeps what it is asked to",
+      "a map keeps its length",
+      "a recursion over a literal runs",
+    ].filter(|l: String| !is_proved(f, l)),
+    [],
+  );
+  assert(not_proved(f, "a map does not read as its function's identity"));
+  assert(not_proved(f, "a fold that may overflow"));
+  assert(not_proved(f, "a recursion over a literal answers what it does"))
+}
+
+fn first_or_zero() -> String =
+  String::unlines([
+    "fn first_or_zero(xs: List<Int>) -> Int ensures result >= 0 || xs.len() > 0 = match xs { [] -> 0, [x, ..] -> x }",
+    "law \"a cell is no empty list\" forall (xs: List<Int>) { match xs { [] -> true, [_, ..] -> xs.len() > 0 } }",
+  ])
+
+test "a list the search takes apart into a cell has a length of at least one" {
+  let f = fixture(first_or_zero());
+  assert(is_proved(f, "a cell is no empty list"))
+}
+
+fn counted() -> String =
+  String::unlines([
+    "fn steps(n: Int) -> Int requires n >= 0 && n < 1000 ensures result >= 0 && result <= n =",
+    "  if n <= 0 { 0 } else { 1 + steps(n - 1) }",
+    "fn both(n: Int) -> Int requires n >= 0 && n < 1000 ensures result >= 0 = steps(n) + steps(n)",
+    "fn unbounded(n: Int) -> Int requires n >= 0 && n < 1000 ensures result >= 0 = steps(n + 1000)",
+    "fn wrong(n: Int) -> Int requires n >= 0 && n < 1000 ensures result >= 1 =",
+    "  if n <= 0 { 0 } else { 1 + wrong(n - 1) }",
+    "fn uncounted(n: Int) -> Int = if n <= 0 { 0 } else { 1 + uncounted(n - 1) }",
+    "fn leaning(n: Int) -> Int requires n >= 0 && n < 1000 ensures result >= 0 = uncounted(n)",
+  ])
+
+test "a call stands on its callee's proved contract, and on no unproved one" {
+  let p = proving(counted());
+  // Its own clause holds at the call its body makes back into it, which is induction over the run.
+  assert(decided_by(p, "m.steps") != None);
+  assert(decided_by(p, "m.both") != None);
+  // The call is owed its `requires`, which `n + 1000` does not meet.
+  assert(decided_by(p, "m.unbounded") == None);
+  // At zero the clause is false, so its own call back cannot carry it.
+  assert(decided_by(p, "m.wrong") == None);
+  // No contract, no answer: a call that may overflow is not known to answer.
+  assert(decided_by(p, "m.leaning") == None)
+}
+
+fn identities() -> String =
+  String::unlines([
+    "law \"a value is itself, at identity\" forall (x: a) where identity(a) { x == x }",
+    "law \"a value is itself\" forall (x: a) { x == x }",
+    "law \"equal values are taken alike, at identity\" forall (g: (a) -> b, u: a, v: a) where identity(a), identity(b), u == v {",
+    "  g(u) == g(v)",
+    "}",
+  ])
+
+test "an identity constraint makes == at its variable identity, and nothing else does" {
+  let f = fixture(identities());
+  assert(is_proved(f, "a value is itself, at identity"));
+  assert(is_proved(f, "equal values are taken alike, at identity"));
+  assert(not_proved(f, "a value is itself"))
+}
+
+test "a law over an identity variable is no lemma at a Float" {
+  let p = proving(
+    String::unlines([
+      "fn keep<a>(x: a, n: Int) -> a = if n <= 0 { x } else { keep(x, n - 1) }",
+      "law \"keeping is itself\" forall (x: a, n: Int) where identity(a) { keep(x, n) == x }",
+      "law \"at an int\" forall (k: Int, n: Int) { keep(k, n) == k }",
+      "law \"at a float\" forall (r: Float, n: Int) { keep(r, n) == r }",
+    ]),
+  );
+  assert(match decided_by(p, "m.at an int") {
+    Some(pr) -> cites(pr, "keeping is itself"),
+    None -> false,
+  });
+  assert(decided_by(p, "m.at a float") == None)
+}
+
+fn balances() -> String =
+  String::unlines([
+    "pub opaque type Balance = | Balance(Int)",
+    "invariant for Balance by solvent",
+    "fn solvent(b: Balance) -> Bool = match b { Balance(n) -> n >= 0 }",
+    "pub fn opened() -> Balance = Balance(0)",
+    "pub fn deposited(b: Balance, n: Int) -> Balance =",
+    "  match b { Balance(m) -> if n >= 0 && n < 1000 && m < 1000000 { Balance(m + n) } else { b } }",
+    "pub fn overdrawn(b: Balance) -> Balance = match b { Balance(m) -> if m > 0 { Balance(m - 1) } else { Balance(0 - 1) } }",
+    "pub fn amount(b: Balance) -> Int = match b { Balance(n) -> n }",
+    "law \"a balance is never negative\" forall (b: Balance) { amount(b) >= 0 }",
+  ])
+
+test "each value a module builds of a type with an invariant is owed it, and every other value has it" {
+  let p = proving(balances());
+  assert(proof_of(p, builds("m.opened")) != None);
+  assert(proof_of(p, builds("m.deposited")) != None);
+  assert(proof_of(p, builds("m.overdrawn")) == None);
+  // Matching on a value builds none.
+  assert(!p.built.world.obligations.any(builds("m.amount")));
+  assert(decided_by(p, "m.a balance is never negative") != None)
+}
+
+fn builds(owner: String) -> (Obligation) -> Bool =
+  |o: Obligation| o.owner == owner && (match o.kind { Builds(_) -> true, _ -> false })
+
+test "a law of one type is no lemma at another" {
+  let p = proving(
+    String::unlines([
+      "fn same<a>(x: a) -> Bool = x == x",
+      "law \"an int is itself\" forall (n: Int) { same(n) }",
+      "law \"a float is itself\" forall (f: Float) { same(f) }",
+    ]),
+  );
+  assert(decided_by(p, "m.an int is itself") != None);
+  assert(decided_by(p, "m.a float is itself") == None)
+}
+
+fn solvent_balances(rest: List<String>) -> String =
+  String::unlines(
+    [
+      "pub opaque type Balance = | Balance(Int)",
+      "invariant for Balance by solvent",
+      "fn solvent(b: Balance) -> Bool = match b { Balance(n) -> n >= 0 }",
+      "pub fn amount(b: Balance) -> Int = match b { Balance(n) -> n }",
+      "law \"a balance is never negative\" forall (b: Balance) { amount(b) >= 0 }",
+    ].concat(
+      rest,
+    ),
+  )
+
+test "a value is owed its invariant whatever its builder requires, which no call is held to" {
+  let p = proving(solvent_balances(["pub fn of(n: Int) -> Balance requires n >= 0 = Balance(n)"]));
+  assert(proof_of(p, builds("m.of")) == None)
+}
+
+test "a value built is not shown to hold its invariant by what stands on that invariant" {
+  let p = proving(
+    solvent_balances([
+      "pub fn forged(n: Int) -> Balance = { let b = Balance(n); if amount(b) >= 0 { b } else { b } }",
+      "pub fn ensured(n: Int) -> Balance ensures amount(result) >= 0 = Balance(n)",
+      "fn kept(b: Balance, k: Int) -> Balance = if k <= 0 { b } else { kept(b, k - 1) }",
+      "law \"made\" forall (n: Int, k: Int) { solvent(kept(Balance(n), k)) }",
+      "law \"a deposit keeps it\" forall (b: Balance, n: Int) where n >= 0 && n < 1000 {",
+      "  amount(match b { Balance(m) -> if m < 1000000 { Balance(m + n) } else { b } }) >= 0",
+      "}",
+    ]),
+  );
+  assert(proof_of(p, builds("m.forged")) == None);
+  assert(decided_by(p, "m.ensured") == None);
+  assert(decided_by(p, "m.made") == None);
+  // What a binder holds is no value the claim made.
+  assert(decided_by(p, "m.a deposit keeps it") != None)
+}
+
+test "a value built where the proof does not read it is no value shown to hold its invariant" {
+  let p = proving(
+    solvent_balances([
+      "pub fn all_of(xs: List<Int>) -> List<Balance> = xs.map(Balance)",
+      "pub fn maker(b: Balance) -> (Int) -> Balance = |n: Int| Balance(n)",
+      "pub fn opened() -> List<Balance> = [0, 1].map(|n: Int| Balance(n * n))",
+    ]),
+  );
+  assert(proof_of(p, builds("m.all_of")) == None);
+  assert(proof_of(p, builds("m.maker")) == None);
+  // A lambda is read at every argument, so what it builds is owed at each.
+  assert(proof_of(p, builds("m.opened")) == None)
+}
+
+test "what a definition answers holds its invariant only where its builds claims are shown" {
+  let p = proving(
+    solvent_balances([
+      "fn make(n: Int) -> Balance ensures amount(result) >= 0 =",
+      "  if n <= 0 { Balance(n) } else { make(n - 1) }",
+    ]),
+  );
+  assert(decided_by(p, "m.make") == None)
+}
+
+test "the clause being proved holds at its definition's own calls and nowhere a lemma puts it" {
+  let p = proving(
+    String::unlines([
+      "law \"f is zero\" forall (xs: List<Int>) { f(xs) == 0 }",
+      "fn f(xs: List<Int>) -> Int ensures result > 0 = match xs { [] -> 0, [_, ..rest] -> f(rest) }",
+    ]),
+  );
+  assert(decided_by(p, "m.f") == None)
+}
+
+test "a keyed value of no fields compares by its key" {
+  let p = proving(
+    String::unlines([
+      "type Length = | Zero | Metres(Int)",
+      "key for Length by mm",
+      "fn mm(l: Length) -> Int = match l { Zero -> 0, Metres(n) -> n }",
+      "law \"no zero metres\" forall (n: Int) { Metres(n) != Zero }",
+    ]),
+  );
+  assert(decided_by(p, "m.no zero metres") == None)
+}
+
+test "an order or a sum over values of no known type is not Int's" {
+  let p = proving(
+    String::unlines([
+      "law \"mapped floats are ordered\" forall (xs: List<Float>) {",
+      "  match xs.map(|x: Float| x) { [a, b, ..] -> a <= b || b <= a, _ -> true }",
+      "}",
+    ]),
+  );
+  assert(decided_by(p, "m.mapped floats are ordered") == None)
+}
+
+test "a declaration's own type variables are none of the claim's" {
+  let p = proving(
+    "law \"float options are themselves\" forall (x: a, f: Float) where identity(a) { [None, Some(f)] == [None, Some(f)] }\n",
+  );
+  assert(decided_by(p, "m.float options are themselves") == None)
+}
+
+test "two lambdas written alike in two modules are two functions" {
+  let p = proving_all([
+    {
+      name: b"a",
+      src: b"// a.ply\npub fn up(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n",
+    },
+    {
+      name: b"b",
+      src: b"import a\npub fn dn(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x - 1)\nlaw \"down is up\" forall (k: Int) where k > 0 && k < 100 { dn([k]) == a::up([k]) }\n",
+    },
+  ]);
+  assert(decided_by(p, "b.down is up") == None)
+}
+
+test "a law owes every raise it reaches unreached, and stands on no contract of a definition that may raise" {
+  let p = proving(
+    String::unlines([
+      "fn walk(n: Int) -> Int / {abort.raise} ensures result >= 0 || n < 0 =",
+      "  if n < 0 { abort.raise(\"negative\") } else if n == 0 { 0 } else { walk(n - 1) }",
+      "law \"a walk answers\" forall (n: Int) { walk(n) >= 0 || n < 0 }",
+      "fn guard(n: Int) -> Int / {abort.raise} = if n < 0 { abort.raise(\"negative\") } else { n }",
+      "law \"a guard answers\" forall (n: Int) { guard(n) >= 0 || n < 0 }",
+    ]),
+  );
+  // An `ensures` holds of what its definition answers, and a raise answers nothing.
+  assert(decided_by(p, "m.walk") != None);
+  assert(decided_by(p, "m.a walk answers") == None);
+  assert(decided_by(p, "m.a guard answers") == None)
+}
+
+test "a function value is not known to answer by its type, which says only that it performs nothing" {
+  let p = proving(
+    String::unlines([
+      "fn walk(n: Int) -> Int / {abort.raise} = if n < 0 { abort.raise(\"negative\") } else if n == 0 { 0 } else { walk(n - 1) }",
+      "fn app(f: (Int) -> Int / {abort.raise}, n: Int) -> Int / {abort.raise} = f(n)",
+      "law \"applied alike\" forall (n: Int) { app(walk, n) == app(walk, n) }",
+    ]),
+  );
+  assert(decided_by(p, "m.applied alike") == None)
+}
+
+test "a statement whose value no claim reads still owes what it owes" {
+  let p = proving(
+    String::unlines([
+      "fn guard(n: Int) -> Int / {abort.raise} = if n < 0 { abort.raise(\"negative\") } else { n }",
+      "law \"a guard is passed\" forall (n: Int) { let _ = guard(n); true }",
+    ]),
+  );
+  assert(decided_by(p, "m.a guard is passed") == None)
+}
+
+test "a claim that builds a value stands on no law over a type that holds one" {
+  let p = proving(
+    solvent_balances([
+      "type Wrapper = | W(Balance)",
+      "fn inner(w: Wrapper, k: Int) -> Balance = if k <= 0 { match w { W(b) -> b } } else { inner(w, k - 1) }",
+      "law \"held\" forall (w: Wrapper, k: Int) { amount(inner(w, k)) >= 0 }",
+      "law \"forged\" forall (k: Int) { amount(inner(W(Balance(0 - 5)), k)) >= 0 }",
+    ]),
+  );
+  assert(decided_by(p, "m.forged") == None)
+}
+
+test "a keyed value compares by its key against a value of a type the proof does not know" {
+  let p = proving(
+    String::unlines([
+      "type Length = | Zero | Metres(Int)",
+      "key for Length by mm",
+      "fn mm(l: Length) -> Int = match l { Zero -> 0, Metres(n) -> n }",
+      "fn is_zero(l: Length) -> Bool = match l { Zero -> true, Metres(_) -> false }",
+      "law \"mapped lengths\" forall (xs: List<Int>) {",
+      "  match xs.map(|n: Int| Metres(n)) { [x, ..] -> x != Zero || is_zero(x), _ -> true }",
+      "}",
+    ]),
+  );
+  assert(decided_by(p, "m.mapped lengths") == None)
+}
+
+test "an empty list is of no one type" {
+  let p = proving(
+    String::unlines([
+      "law \"ordered floats\" forall (xs: List<Int>, fs: List<Float>, c: Bool) {",
+      "  match xs { [] -> true, _ -> true }",
+      "    && match (if c { [] } else { fs }) { [a, b, ..] -> a <= b || b <= a, _ -> true }",
+      "}",
+    ]),
+  );
+  assert(decided_by(p, "m.ordered floats") == None)
+}
+
+test "a contract stands on no call of a function it is handed, which may end the run" {
+  let p = proving(
+    String::unlines([
+      "fn all_hold(xs: List<Int>, p: (Int) -> Bool) -> Bool ensures result || xs.len() > 0 =",
+      "  match xs { [] -> true, [x, ..rest] -> p(x) && all_hold(rest, p) }",
+      "fn above(x: Int) -> Bool = x + 1 > 0",
+      "law \"passes or has an element\" forall (xs: List<Int>) { all_hold(xs, above) || xs.len() > 0 }",
+    ]),
+  );
+  assert(decided_by(p, "m.passes or has an element") == None)
+}
+
+test "a keyed value of no fields keeps its key at a type with parameters" {
+  let p = proving(
+    String::unlines([
+      "type Level<a> = | Low | High | Exact(a)",
+      "key for Level by rank",
+      "fn rank<a>(l: Level<a>) -> Int = match l { Low -> 0, High -> 0, Exact(_) -> 1 }",
+      "fn low() -> Level<Int> = Low",
+      "fn high() -> Level<Int> = High",
+      "law \"low is not high\" forall (n: Int) { low() != high() }",
+    ]),
+  );
+  assert(decided_by(p, "m.low is not high") == None)
+}
+
+test "a claim that builds a value takes no call's answer to hold an invariant" {
+  let p = proving(
+    solvent_balances([
+      "pub opaque type Report = | Report(Int)",
+      "invariant for Report by nonneg",
+      "fn nonneg(r: Report) -> Bool = match r { Report(n) -> n >= 0 }",
+      "pub fn report(b: Balance) -> Report = Report(amount(b))",
+      "fn through(b: Balance, k: Int) -> Report = if k <= 0 { report(b) } else { through(b, k - 1) }",
+      "law \"forged\" forall (k: Int) { nonneg(through(Balance(0 - 5), k)) }",
+    ]),
+  );
+  assert(decided_by(p, "m.forged") == None)
+}
+
+test "a refutable let raises where it does not match, which a law owes unreached" {
+  let p = proving(
+    "law \"an option is something\" forall (o: Option<Int>) { let Some(_) = o; true }\n",
+  );
+  assert(decided_by(p, "m.an option is something") == None)
+}
+
+test "the clause being proved holds at no call back that a value the claim built is handed" {
+  let p = proving(
+    solvent_balances([
+      "fn drained(b: Balance, k: Int) -> Int ensures result >= 0 =",
+      "  if k <= 0 { amount(b) } else { drained(if k > 5 { Balance(0 - 1) } else { b }, k - 1) }",
+    ]),
+  );
+  assert(decided_by(p, "m.drained") == None)
+}
+
+test "a definition whose row is a variable unfolds where it is called with a lambda" {
+  let p = proving(
+    String::unlines([
+      "fn twice<| e>(f: (Int) -> Int / e, x: Int) -> Int / e = f(f(x))",
+      "law \"twice the identity is the identity\" forall (x: Int) { twice(|y: Int| y, x) == x }",
+    ]),
+  );
+  assert(decided_by(p, "m.twice the identity is the identity") != None)
 }

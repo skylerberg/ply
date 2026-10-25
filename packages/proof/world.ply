@@ -13,28 +13,49 @@ import compiler.front.facts (Analysis, claim_literals, literals_of, schema_defin
                              bounds_of, guard_bounds)
 import compiler.front.seam (Analysed, Refused)
 import compiler.front (analyse_pulling_std_with)
-import compiler.check.infer.checker (CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo, InstanceInfo,
-                                     NumericInfo)
+import compiler.front.rows (module_imports)
+import compiler.check.infer.checker (Builtin, CtorInfo, DefInfo, LawBinder, LawInfo, SpecInfo,
+                                     InstanceInfo, NumericInfo, EffectInfo, OpInfo, builtins)
 import compiler.syntax.items (Item, IFn, IType, ILaw, SCost, SEnsures, SRequires, SSpace,
-                              SpecClause, SpecKind, NKey)
-import compiler.syntax.exprs (Expr, Param, expr_span)
+                              SpecClause, SpecKind, NKey, NInvariant)
+import compiler.syntax.exprs (Expr, EVar, Param, expr_span)
+import compiler.expand.rewrite.shared (nodes_of)
 import compiler.store.hash.forms (HashOutput, NodeRef, TheItem, named_in)
 import compiler.store.hash.encoding (hex)
+import std.hash (blake3)
 import compiler.check.resolve.tables (Diag, ParsedModule, error_at, qualify)
 import compiler.syntax.parsing (Span, no_module)
 import compiler.check.types (Atom, Field, Printer, Type, TyCon, TyFn, TyRecord, TyVar, field_get,
                              print_resource, print_row, print_ty, printer_naming, printer_new,
-                             reserve_atoms, row_is_pure_but_raise, run_needs, tuple_arity,
-                             ty_letter, type_args, without_raises, TyNominal)
+                             reserve_atoms, row_is_pure, row_is_pure_but_raise, run_needs,
+                             tuple_arity, ty_letter, type_args, without_raises, TyNominal,
+                             is_diverges)
 import compiler.syntax.type_syntax (MWrite)
 import domain (Cases, Con, Decl, Domain, Ends, Fn, Record, Scalar, Shape, Ty, Var, Variant,
                finite_within, name_of)
-import obligation (Cost, Def, Ensures, Frame, Kind, Law, Pure, Space, Writes, Written)
+import obligation (Builds, Cost, Def, Ensures, Frame, Kind, Law, Pure, Space, Writes, Written)
 import std.list
 
 /// A definition as a callee: its signature, and whether its published row is empty. The static
 /// prover unfolds a call and shares one term between equal calls only when that row is.
-pub type Signature = { name: String, ty: Ty, pure: Bool }
+/// `pure`: its body performs nothing but may raise. `row_pure`: its type's row is nothing but raises
+/// too, so equal calls answer alike. A function type's own flag says more: that a value of it
+/// performs nothing and never raises.
+pub type Signature = {
+  name: String,
+  ty: Ty,
+  pure: Bool,
+  row_pure: Bool,
+  /// Whether its row names a raise or `diverges`: a call may end with no answer.
+  raises: Bool,
+  /// Where its row is a variable beside nothing but raises, the parameters whose functions are
+  /// handed that row: a call performs what those do and nothing else. Empty otherwise.
+  through: List<Int>,
+}
+
+/// A builtin as a callee: its declared signature, which says what a call of it answers, and whether
+/// it performs nothing but may raise.
+pub type BuiltinSignature = { name: String, ty: Ty, pure: Bool }
 
 /// One binder of one claim: its name, its type, and that type as the compiler prints it. `made` is
 /// whether a run may make a value of it: not where that would make one of a type only another
@@ -46,7 +67,8 @@ pub type Binder = { name: String, ty: Ty, text: String, made: Bool }
 pub type Strategy =
   /// A law over a `simulate` region: its interleavings are searched at each of its points.
   | Interleave(Points)
-  /// The static prover first, and what follows when that does not settle the claim.
+  /// The static prover first, and what follows when that does not settle the claim; a law whose
+  /// every point is walked gets a short search.
   | Static(Unsettled)
   /// A `cost` bound: read off its owner's body, and never run.
   | Bounded
@@ -88,6 +110,8 @@ pub type Obligation = {
   /// What the owner leaves alone: an `ensures` promises everything outside what its row writes.
   frame: Frame,
   strategy: Strategy,
+  /// The variables, by number, an `identity` constraint is on: where `==` is identity.
+  identities: List<Int>,
 }
 
 /// A definition's `decreases`, with the parameters it is stated over, named as its signature writes
@@ -101,11 +125,33 @@ pub type Measure = {
 pub type World = {
   decls: List<Decl>,
   signatures: List<Signature>,
+  /// Each `extern fn` the prelude declares, by the name a call writes.
+  builtins: List<BuiltinSignature>,
   obligations: List<Obligation>,
   measures: List<Measure>,
-  // The declared types that state a `key` or a `numeric`: two of their values are equal, and
-  // meet under an operator, as those functions answer, which no proof here reads.
-  keyed: List<String>,
+  /// Each type that states a `key`, and the function: two of its values are `==` as their keys are.
+  keys: List<{ type_name: String, by: String }>,
+  /// Each type that states a `numeric`, and its functions in `numeric_ops` order: its operators.
+  numerics: List<{ type_name: String, fns: List<String> }>,
+  /// Each type that states an invariant, and its function.
+  invariants: List<{ type_name: String, by: String }>,
+  /// By module, every module it imports, at any remove: whose proved laws its claims may use.
+  imports: List<List<Int>>,
+  /// The laws with no guard of the modules a run does not answer for, which another package's run
+  /// proves: lemmas for the claims of modules that import theirs.
+  trusted_laws: List<TrustedLaw>,
+  /// What each operation of each effect answers, by the effect's own name: what a `perform` is.
+  operations: List<Operation>,
+}
+
+pub type Operation = { effect: String, op: String, answers: Ty }
+
+pub type TrustedLaw = {
+  key: String,
+  label: String,
+  binders: List<Binder>,
+  identities: List<Int>,
+  module: Int,
 }
 
 /// The world; every definition and every hashed law of the modules a run answers for, in the
@@ -136,15 +182,45 @@ pub fn world_of(analysis: Analysis, owned: (Bytes) -> Bool) -> Built / {abort.ra
   let laws = analysis.checked.laws.filter(|l: LawInfo| owned(l.module));
   let clauses = defs.fold({ obligations: [], warnings: [] }, |acc: Owed, d: DefInfo|
     clauses_of(acc, d, written, requires, keys, runs, closing));
-  let owed = laws.fold(clauses, |acc: Owed, l: LawInfo|
+  let stating = invariants_of(analysis.checked.instances);
+  let values = if stating.len() == 0 { Map::new() } else { values_named(analysis.mods) };
+  let built = defs.fold(clauses, |acc: Owed, d: DefInfo|
+    builds_of(acc, d, written, stating, values, analysis.hashes, closing));
+  let owed = laws.fold(built, |acc: Owed, l: LawInfo|
     law_of(acc, l, analysis.hashes.laws, wheres, closing));
+  let imports = imports_of(analysis.mods);
+  let trusted = analysis.checked.laws.filter(|l: LawInfo|
+    !owned(l.module) && !l.has_guard && analysis.hashes.law_texts.contains(l.key));
+  // A claim may stand on each law of another package its module imports, which means what the
+  // definitions it names do: its hash covers them. A bound stands on no law.
+  let standing = |o: Obligation|
+    match o.kind {
+      Cost(_) -> [],
+      Space(_) -> [],
+      _ -> match imports.at(o.at.module) {
+        Some(reach) ->
+          trusted.filter(|l: LawInfo| reach.contains(l.at.module)).fold(
+            [],
+            |acc: List<Bytes>, l: LawInfo|
+              match analysis.hashes.laws.get(l.key) { Some(h) -> acc.push(h), None -> acc },
+          ),
+        None -> [],
+      },
+    };
   {
     world: {
       decls: decls,
       signatures: analysis.checked.defs.map(signature_of),
-      obligations: owed.obligations,
+      builtins: builtin_signatures(),
+      obligations: owed.obligations.map(|o: Obligation| standing_on(o, standing(o))),
       measures: measures_in(analysis, owned),
-      keyed: keyed_of(analysis.checked.instances, analysis.checked.numeric_types),
+      keys: keys_of(analysis.checked.instances),
+      numerics: numerics_of(analysis.checked.numeric_types),
+      invariants: stating.map(|i: { type_name: Bytes, by: Bytes }|
+        { type_name: String::of_bytes_lossy(i.type_name), by: String::of_bytes_lossy(i.by) }),
+      imports: imports,
+      trusted_laws: trusted.map(|l: LawInfo| trusted_of(l, closing)),
+      operations: operations_of(analysis.checked.effects),
     },
     defs: defined(defs.filter(|d: DefInfo| !schemas.contains(d.name)), analysis.hashes),
     laws: sentences_of(laws, analysis.hashes),
@@ -339,11 +415,7 @@ fn ty_of(t: Type, vars: List<Int>) -> Ty / {abort.raise} =
     TyCon(c) ->
       Con(String::of_bytes_lossy(c.name), type_args(c.args).map(|a: Type| ty_of(a, vars))),
     TyFn(f) ->
-      Fn(
-        f.params.map(|p: Type| ty_of(p, vars)),
-        ty_of(f.ret, vars),
-        row_is_pure_but_raise(f.effects),
-      ),
+      Fn(f.params.map(|p: Type| ty_of(p, vars)), ty_of(f.ret, vars), row_is_pure(f.effects)),
     TyRecord(fs) -> record_of(fs, vars),
     // A value of a `new` record is the record it is written as, which is what a run is handed.
     TyNominal(n) -> record_of(n.fields, vars),
@@ -394,6 +466,47 @@ fn signature_of(d: DefInfo) -> Signature / {abort.raise} =
     name: String::of_bytes_lossy(d.name),
     ty: ty_of(d.scheme.ty, met(d.scheme.ty, [])),
     pure: without_raises(d.footprint).len() == 0,
+    row_pure: but_raise(d.scheme.ty),
+    raises: d.footprint.len() > without_raises(d.footprint).len()
+      || d.footprint.any(|atom: Atom| is_diverges(atom)),
+    through: through_of(d.scheme.ty),
+  }
+
+/// The parameters a row variable passes through: each a function whose own row is that variable,
+/// where the definition's row is the variable and raises, and nothing else mentions it.
+fn through_of(t: Type) -> List<Int> =
+  match t {
+    TyFn(f) -> match f.effects.tail {
+      Some(v) -> if without_raises(f.effects.atoms).len() > 0 || mentions_row(f.ret, v) { [] }
+      else {
+        let direct = range(0, f.params.len()).filter(|i: Int|
+          match f.params.at(i) {
+            Some(TyFn(g)) ->
+              g.effects.tail == Some(v) && !g.params.any(|p: Type| mentions_row(p, v))
+                && !mentions_row(g.ret, v),
+            _ -> false,
+          });
+        let elsewhere = range(0, f.params.len()).any(|i: Int|
+          !direct.contains(i)
+            && (match f.params.at(i) { Some(p) -> mentions_row(p, v), None -> false }));
+        if elsewhere || direct.len() == 0 { [] } else { direct }
+      },
+      None -> [],
+    },
+    _ -> [],
+  }
+
+fn mentions_row(t: Type, v: Int) -> Bool =
+  match t {
+    TyVar(_) -> false,
+    TyCon(c) -> type_args(c.args).any(|a: Type| mentions_row(a, v)),
+    TyFn(f) ->
+      f.effects.tail == Some(v) || f.params.any(|p: Type| mentions_row(p, v))
+        || mentions_row(f.ret, v),
+    TyRecord(fs) -> fs.any(|x: Field| mentions_row(x.ty, v)),
+    TyNominal(n) ->
+      n.fields.any(|x: Field| mentions_row(x.ty, v))
+        || type_args(n.args).any(|a: Type| mentions_row(a, v)),
   }
 
 // --- Declared types ------------------------------------------------------------------
@@ -624,6 +737,7 @@ fn clauses_of(
                   footprint: footprint_text(clause.footprint),
                   frame: frame,
                   strategy: if bound { Bounded } else { strategy },
+                  identities: [],
                 }),
               },
             },
@@ -650,6 +764,7 @@ fn law_of(
         closing,
         l.module,
       );
+      let vars = l.binders.fold([], |acc: List<Int>, b: LawBinder| met(b.ty, acc));
       let footprint = footprint_text(l.footprint);
       {
         ..acc,
@@ -675,6 +790,7 @@ fn law_of(
             match wheres.get(l.key) { Some(s) -> s.held, None -> [] },
             closing,
           ),
+          identities: l.identities.map(|v: Int| number_of(vars, v)),
         }),
       }
     },
@@ -686,18 +802,221 @@ pub fn measures_world(analysis: Analysis, measures: List<Measure>) -> World / {a
   {
     decls: decls_of(analysis.checked.ctors),
     signatures: analysis.checked.defs.map(signature_of),
+    builtins: builtin_signatures(),
     obligations: [],
     measures: measures,
-    keyed: keyed_of(analysis.checked.instances, analysis.checked.numeric_types),
+    keys: keys_of(analysis.checked.instances),
+    numerics: numerics_of(analysis.checked.numeric_types),
+    invariants: invariants_of(analysis.checked.instances).map(
+      |i: { type_name: Bytes, by: Bytes }|
+        { type_name: String::of_bytes_lossy(i.type_name), by: String::of_bytes_lossy(i.by) },
+    ),
+    imports: imports_of(analysis.mods),
+    trusted_laws: [],
+    operations: operations_of(analysis.checked.effects),
   }
 
-/// The types that state a `key` or a `numeric`, by name.
-fn keyed_of(instances: List<InstanceInfo>, numeric: List<NumericInfo>) -> List<String> =
-  numeric.fold(
-    instances.fold([], |acc: List<String>, x: InstanceInfo|
-      match x.kind { NKey -> acc.push(String::of_bytes_lossy(x.type_name)), _ -> acc }),
-    |acc: List<String>, x: NumericInfo| acc.push(String::of_bytes_lossy(x.type_name)),
-  )
+/// A proof of `o` may stand on another package's laws its module imports, by their `hashes`: its
+/// key reads them, so a proof filed under it moves with them.
+fn standing_on(o: Obligation, hashes: List<Bytes>) -> Obligation / {abort.raise} =
+  if hashes.len() == 0 { o } else {
+    {
+      ..o,
+      key: String::of_bytes_lossy(
+        hex(blake3(Bytes::concat_all([Bytes::of_string(o.key)].concat(hashes)))),
+      ),
+    }
+  }
+
+/// Another package's law with no guard, as a lemma for the claims of the modules that import its
+/// module.
+fn trusted_of(l: LawInfo, closing: Closing) -> TrustedLaw / {abort.raise} =
+  {
+    key: String::of_bytes_lossy(l.key),
+    label: String::of_bytes_lossy(l.name),
+    binders: binders_of(
+      l.binders.map(|b: LawBinder| { name: b.name, ty: b.ty }),
+      closing,
+      l.module,
+    ).binders,
+    identities: {
+      let vars = l.binders.fold([], |acc: List<Int>, b: LawBinder| met(b.ty, acc));
+      l.identities.map(|v: Int| number_of(vars, v))
+    },
+    module: l.at.module,
+  }
+
+/// A world of nothing: what a run whose claims are spelled out, not read off a program, hands on.
+pub fn no_world() -> World =
+  {
+    decls: [],
+    signatures: [],
+    builtins: [],
+    obligations: [],
+    measures: [],
+    keys: [],
+    numerics: [],
+    invariants: [],
+    imports: [],
+    trusted_laws: [],
+    operations: [],
+  }
+
+fn operations_of(effects: List<EffectInfo>) -> List<Operation> / {abort.raise} =
+  effects.fold([], |acc: List<Operation>, e: EffectInfo|
+    e.ops.fold(acc, |out: List<Operation>, op: OpInfo|
+      out.push({
+        effect: String::of_bytes_lossy(e.simple_name),
+        op: String::of_bytes_lossy(op.name),
+        answers: ty_of(op.ret, met(op.ret, [])),
+      })))
+
+/// By module, the modules it imports at any remove, not itself.
+pub fn imports_of(mods: List<ParsedModule>) -> List<List<Int>> / {abort.raise} = {
+  let index = range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+    match mods.at(i) { Some(m) -> acc.insert(m.name, i), None -> acc });
+  let direct = mods.map(|m: ParsedModule|
+    module_imports(m).fold([], |acc: List<Int>, name: Bytes|
+      match index.get(name) { Some(j) -> acc.push(j), None -> acc }));
+  range(0, mods.len()).map(|i: Int| reached_from(direct, i))
+}
+
+fn reached_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
+  let start = match direct.at(from) { Some(xs) -> xs, None -> [] };
+  let seen = iterate(
+    { seen: start.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true)), stack: start },
+    direct.len() * direct.len() + 2,
+    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
+      match s.stack.at(s.stack.len() - 1) {
+        None -> Stop(s.seen),
+        Some(i) -> {
+          let rest = s.stack.take(s.stack.len() - 1);
+          let next = match direct.at(i) { Some(xs) -> xs, None -> [] };
+          Continue(
+            next.fold(
+              { seen: s.seen, stack: rest },
+              |acc: { seen: Map<Int, Bool>, stack: List<Int> }, j: Int|
+                if acc.seen.contains(j) { acc }
+                else { { seen: acc.seen.insert(j, true), stack: acc.stack.push(j) } },
+            ),
+          )
+        },
+      },
+  );
+  seen.keys().filter(|j: Int| j != from)
+}
+
+fn invariants_of(instances: List<InstanceInfo>) -> List<{ type_name: Bytes, by: Bytes }> =
+  instances.fold([], |acc: List<{ type_name: Bytes, by: Bytes }>, x: InstanceInfo|
+    match x.kind { NInvariant -> acc.push({ type_name: x.type_name, by: x.by }), _ -> acc })
+
+/// By program-wide name, the names each written definition's body and parameter defaults use as
+/// values: a constructor is among them wherever the definition builds with it.
+fn values_named(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
+  mods.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
+    m.module.items.fold(acc, |a: Map<Bytes, List<Bytes>>, it: Item|
+      match it {
+        IFn(d) -> {
+          let held = d.params.fold(nodes_of(d.body), |out: List<Expr>, p: Param|
+            match p.default { Some(e) -> out.concat(nodes_of(e)), None -> out });
+          a.insert(
+            qualify(m.name, d.name.name),
+            held.fold([], |names: List<Bytes>, e: Expr|
+              match e { EVar(v) -> names.push(v.name.name.name), _ -> names }),
+          )
+        },
+        _ -> a,
+      }))
+
+/// The claim, for each type of its own module that states an invariant and that its body builds,
+/// that every value of it the body builds satisfies the invariant: the prover's alone. A definition
+/// with no written body, a derived one, owes it wherever it names the type.
+fn builds_of(
+  acc: Owed,
+  d: DefInfo,
+  written: Map<Bytes, List<Bytes>>,
+  stating: List<{ type_name: Bytes, by: Bytes }>,
+  values: Map<Bytes, List<Bytes>>,
+  h: HashOutput,
+  closing: Closing,
+) -> Owed / {abort.raise} = {
+  let named = h.deps.fold([], |found: List<Bytes>, x: { name: Bytes, names: List<Bytes> }|
+    if x.name == d.name { x.names } else { found });
+  let owed_for = stating.filter(|i: { type_name: Bytes, by: Bytes }| {
+    let made = closing.ctors.filter(|c: CtorInfo|
+      c.type_name == i.type_name && c.module == d.module);
+    made.len() > 0 && i.by != d.name && named.contains(i.type_name)
+      && (match values.get(d.name) {
+        Some(used) -> made.any(|c: CtorInfo| used.contains(c.simple_name)),
+        None -> true,
+      })
+  });
+  if owed_for.len() == 0 { acc } else {
+    let shape = match d.scheme.ty {
+      TyFn(f) -> { params: f.params, ret: f.ret },
+      other -> { params: [], ret: other },
+    };
+    let names = match written.get(d.name) { Some(ns) -> ns, None -> [] };
+    let params = range(0, min(names.len(), shape.params.len())).map(|i: Int|
+      { name: names.get(i), ty: shape.params.get(i) });
+    let printed = binders_of(params.push({ name: b"result", ty: shape.ret }), closing, d.module);
+    let check = h.checks.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
+      if x.name == d.name { x.hash } else { found });
+    owed_for.fold(acc, |a: Owed, i: { type_name: Bytes, by: Bytes }| {
+      let typed = h.decls.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
+        if x.name == i.type_name { x.hash } else { found });
+      let key = String::of_bytes_lossy(
+        hex(blake3(Bytes::concat_all([b"builds\x00", check, typed]))),
+      );
+      {
+        ..a,
+        obligations: a.obligations.push({
+          key: key,
+          run_key: key,
+          owner: String::of_bytes_lossy(d.name),
+          kind: Builds(String::of_bytes_lossy(i.type_name)),
+          at: at_of(d.at.module, d.at.span),
+          binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
+          result: printed.binders.at(params.len()),
+          variables: printed.variables,
+          guards: [],
+          literals: [],
+          footprint: None,
+          frame: Pure,
+          strategy: Bounded,
+          identities: [],
+        }),
+      }
+    })
+  }
+}
+
+fn keys_of(instances: List<InstanceInfo>) -> List<{ type_name: String, by: String }> =
+  instances.fold([], |acc: List<{ type_name: String, by: String }>, x: InstanceInfo|
+    match x.kind {
+      NKey ->
+        acc.push({
+          type_name: String::of_bytes_lossy(x.type_name),
+          by: String::of_bytes_lossy(x.by),
+        }),
+      _ -> acc,
+    })
+
+fn numerics_of(numeric: List<NumericInfo>) -> List<{ type_name: String, fns: List<String> }> =
+  numeric.map(|x: NumericInfo|
+    { type_name: String::of_bytes_lossy(x.type_name), fns: x.fns.map(String::of_bytes_lossy) })
+
+/// What a call of a builtin answers is read off its declared signature, whoever writes its body.
+fn builtin_signatures() -> List<BuiltinSignature> / {abort.raise} =
+  builtins().map(|b: Builtin|
+    {
+      name: String::of_bytes_lossy(b.name),
+      ty: ty_of(b.scheme.ty, met(b.scheme.ty, [])),
+      pure: but_raise(b.scheme.ty),
+    })
+
+/// Whether a function of type `t` performs nothing but may raise.
+fn but_raise(t: Type) -> Bool = match t { TyFn(f) -> row_is_pure_but_raise(f.effects), _ -> true }
 
 /// The measures the definitions of the modules `owned` answers for state, in the checker's order.
 pub fn measures_in(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Measure> / {abort.raise} = {
@@ -796,6 +1115,9 @@ test "a signature numbers its variables by first appearance, and says whether it
     name: "m.apply",
     ty: Fn([Fn([Var(0)], Var(1), true), Var(0)], Var(1), true),
     pure: true,
+    row_pure: true,
+    raises: false,
+    through: [],
   });
   let say = signature_named(w.signatures, "m.say");
   assert_eq(say.pure, false);
@@ -1047,4 +1369,42 @@ test "a value of a type another module keeps opaque is one no run makes" {
       ),
     ),
   ])
+}
+
+/// The key of a law of `app` over `base::f`, where `base` is the package `src` makes.
+fn key_beside(src: Bytes) -> String / {abort.raise} =
+  match analyse(
+      parse_all([
+        { name: b"base", src: b"pub fn f(x: Int) -> Int = x\n".concat(src) },
+        { name: b"app", src: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n" },
+      ]),
+    ) {
+    Refused(_) -> panic("the fixture checks"),
+    Analysed(w) -> match world_of(w, |m: Bytes| m == b"app").world.obligations.fold(
+        None,
+        |found: Option<String>, o: Obligation|
+          if o.owner == "app.uses" { Some(o.key) } else { found },
+      ) {
+      Some(k) -> k,
+      None -> panic("an obligation of the fixture"),
+    },
+  }
+
+test "a claim's key reads the laws of another package its module imports, and moves with them" {
+  let none = key_beside(b"");
+  let one = key_beside(b"law \"f is itself\" forall (x: Int) { f(x) == x }\n");
+  let reworded = key_beside(b"law \"f is itself\" forall (y: Int) { f(y) == y + 0 }\n");
+  assert(none != one);
+  assert(one != reworded);
+  assert_eq(one, key_beside(b"law \"f is itself\" forall (x: Int) { f(x) == x }\n"));
+  // What a law names moves the key where the law's text does not.
+  let named = |g: Bytes|
+    key_beside(
+      Bytes::concat_all([
+        b"fn g(x: Int) -> Int = ",
+        g,
+        b"\nlaw \"f is g\" forall (x: Int) { f(x) == g(x) }\n",
+      ]),
+    );
+  assert(named(b"x") != named(b"x + 0"))
 }

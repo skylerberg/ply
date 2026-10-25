@@ -2466,56 +2466,84 @@ fn binders_text(input: PrintInput, binders: List<Binder>) -> Bytes / {abort.rais
     ])
   }
 
-fn guard_flat(input: PrintInput, guard: Option<Expr>) -> Option<Bytes> / {abort.raise} =
-  match guard { Some(g) -> cat([Some(b" where "), flat_scrutinee(input, g)]), None -> Some(b"") }
+/// What a `where` writes before its guard: `identity(a), identity(b)`, and a comma when a guard follows.
+fn identities_text(identities: List<Ident>, guarded: Bool) -> Bytes =
+  if identities.len() == 0 { b"" } else {
+    Bytes::concat_all([
+      Bytes::join(
+        identities.map(|i: Ident| Bytes::concat_all([b"identity(", i.name, b")"])),
+        b", ",
+      ),
+      if guarded { b", " } else { b"" },
+    ])
+  }
 
-/// A claim on its head's line: the binders, the guard and the body.
+/// A claim's `where`: the type variables it constrains, then its guard.
+type ClaimWhere = { identities: List<Ident>, guard: Option<Expr> }
+
+fn where_flat(input: PrintInput, w: ClaimWhere) -> Option<Bytes> / {abort.raise} =
+  if w.identities.len() == 0 && w.guard == None { Some(b"") } else {
+    cat([
+      Some(b" where ".concat(identities_text(w.identities, w.guard != None))),
+      match w.guard { Some(g) -> flat_scrutinee(input, g), None -> Some(b"") },
+    ])
+  }
+
+/// A claim on its head's line: the binders, the `where` and the body.
 fn claim_flat(
   input: PrintInput,
   binders: List<Binder>,
-  guard: Option<Expr>,
+  w: ClaimWhere,
   body: Expr,
 ) -> Option<Bytes> / {abort.raise} = {
   let quantified = binders_text(input, binders);
   cat([
     Some(if quantified.len() == 0 { b"" } else { b" ".concat(quantified) }),
-    guard_flat(input, guard),
+    where_flat(input, w),
     Some(b" "),
     flat_expr(input, body),
   ])
 }
 
-/// The same where one line does not hold it: the binders under the head, the guard beside them
+/// The same where one line does not hold it: the binders under the head, the `where` beside them
 /// if it fits.
 fn claim_lines(
   input: PrintInput,
   s1: Printer,
   binders: List<Binder>,
-  guard: Option<Expr>,
+  w: ClaimWhere,
   body: Expr,
 ) -> Printer / {abort.raise} = {
   let written = binders_text(input, binders);
-  let quantified = written.len() > 0 || guard != None;
+  let quantified = written.len() > 0 || w.guard != None || w.identities.len() > 0;
   let s2 = if written.len() == 0 { s1 } else { emit(nl(s1, 2, false), written) };
-  let s3 = match guard {
-    Some(g) -> match try_flat(input, s2, guard_flat(input, guard), expr_span(g).end, 2) {
+  let s3 = match w.guard {
+    Some(g) -> match try_flat(input, s2, where_flat(input, w), expr_span(g).end, 2) {
       Some(f) -> emit(s2, f),
-      None -> scrutinee(input, emit(nl(s2, 2, false), b"where "), g, 2, 2),
+      None ->
+        scrutinee(
+          input,
+          emit(nl(s2, 2, false), b"where ".concat(identities_text(w.identities, true))),
+          g,
+          2,
+          2,
+        ),
     },
-    None -> s2,
+    None -> match where_flat(input, w) { Some(f) -> emit(s2, f), None -> s2 },
   };
   block(input, emit(s3, b" "), body, if quantified { 2 } else { 0 })
 }
 
 fn law_def(input: PrintInput, printer: Printer, d: LawDef) -> Printer / {abort.raise} = {
   let head = b"law ".concat(label_text(input, d.name_span, d.name));
+  let w = { identities: d.identities, guard: d.guard };
   match d.of {
     Some(_) -> def_body(input, emit(printer, head.concat(b" = ")), d.body, 0),
     None -> {
-      let flat = cat([Some(head), claim_flat(input, d.binders, d.guard, d.body)]);
+      let flat = cat([Some(head), claim_flat(input, d.binders, w, d.body)]);
       match try_flat(input, printer, flat, d.span.end, 0) {
         Some(f) -> emit(printer, f),
-        None -> claim_lines(input, emit(printer, head), d.binders, d.guard, d.body),
+        None -> claim_lines(input, emit(printer, head), d.binders, w, d.body),
       }
     },
   }
@@ -2543,7 +2571,8 @@ fn schema_def(input: PrintInput, printer: Printer, d: SchemaDef) -> Printer / {a
     Bytes::join(d.params.map(|x: Binder| binder_text(input, x)), b", "),
     b")",
   ]);
-  let flat = cat([Some(head), Some(params), claim_flat(input, d.binders, d.guard, d.body)]);
+  let w = { identities: d.identities, guard: d.guard };
+  let flat = cat([Some(head), Some(params), claim_flat(input, d.binders, w, d.body)]);
   match try_flat(input, printer, flat, d.span.end, 0) {
     Some(f) -> emit(printer, f),
     None -> {
@@ -2562,7 +2591,7 @@ fn schema_def(input: PrintInput, printer: Printer, d: SchemaDef) -> Printer / {a
           close(input, ps, params_end, 0, b")")
         },
       };
-      claim_lines(input, s2, d.binders, d.guard, d.body)
+      claim_lines(input, s2, d.binders, w, d.body)
     },
   }
 }
@@ -3236,6 +3265,27 @@ test "a `new` record prints `new` before its fields, one to a line where they do
   )
 }
 
+test "a `where` prints the type variables it constrains before its guard" {
+  lays_out(
+    b"law \"l\" forall (xs: List<a>)   where identity( a ) {reverse(reverse(xs))==xs}\n",
+    b"law \"l\" forall (xs: List<a>) where identity(a) { reverse(reverse(xs)) == xs }\n",
+  );
+  lays_out(
+    b"law \"l\" forall (xs: List<a>, n: Int) where identity(a),n>0 { xs.len() + n > 0 }\n",
+    b"law \"l\" forall (xs: List<a>, n: Int) where identity(a), n > 0 { xs.len() + n > 0 }\n",
+  );
+  lays_out(
+    b"law schema s<a,b>(f: (a)->b) forall (x: a) where identity(a),identity(b) { f(x)==f(x) }\n",
+    b"law schema s<a, b>(f: (a) -> b) forall (x: a) where identity(a), identity(b) { f(x) == f(x) }\n",
+  );
+  let long = b"pub law schema round_trip<a, b | e>(encode: (a) -> b / e, decode: (b) -> Option<a> / e) forall (x: a) where identity(a), x == x && decode(encode(x)) != None { decode(encode(x)) == Some(x) }\n";
+  assert(stable(long));
+  assert(formatted(long).contains(b"where identity(a), x == x"));
+  let unguarded = b"pub law schema round_trip<a, b | e>(encode: (a) -> b / e, decode: (b) -> Option<a> / e) forall (x: a) where identity(a) { decode(encode(x)) == Some(x) }\n";
+  assert(stable(unguarded));
+  assert(formatted(unguarded).contains(b"forall (x: a) where identity(a) {"))
+}
+
 test "a schema prints as a law does after its parameters, and an instantiation as a definition's body" {
   lays_out(
     b"pub  law schema  s<a>(f: (a)->a)   forall (x: a) where x==x { f(x)==x }\n",
@@ -3664,10 +3714,10 @@ test "a `numeric` prints on one line, its operations in the order written" {
   )
 }
 
-test "a `key` and a `show` print on a line each, as written" {
+test "a `key`, a `show` and an `invariant` print on a line each, as written" {
   lays_out(
-    b"type T = | T(Int)\n// read through\nkey   for T   by f\nshow for T by\n  g\n",
-    b"type T = | T(Int)\n// read through\nkey for T by f\nshow for T by g\n",
+    b"type T = | T(Int)\n// read through\nkey   for T   by f\nshow for T by\n  g\ninvariant  for T by   h\n",
+    b"type T = | T(Int)\n// read through\nkey for T by f\nshow for T by g\ninvariant for T by h\n",
   )
 }
 
