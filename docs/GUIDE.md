@@ -3189,10 +3189,11 @@ derive map for Tree
 
 A deriver is `pub fn derive(declaration: derive::Declaration) ->
 Result<String, derive::Refused>`, performing nothing but a raise; `std.derive`
-says what a declaration holds. The check enters it as it enters a `const fn`
-(§3.5), on a machine of its own and under the same budget, and keeps its answer
-in the toolchain's cache under the declaration and the texts of the modules the
-deriver reaches, so it runs again only after an edit to one of them. A deriver
+says what a declaration holds. The check compiles a deriver once and enters it
+for each declaration on a machine of its own, under a `const fn`'s budget
+(§3.5), and keeps each answer in the toolchain's cache under the declaration and
+the texts of the modules the deriver reaches, so it runs again only after an edit
+to one of them. A deriver
 is a shipped module or one of the program's own, and its modules derive nothing
 through a library deriver. A name that is no built-in deriver and no binder in
 scope is `E0207`; a module whose `derive` is no deriver, `E0160`; a refusal,
