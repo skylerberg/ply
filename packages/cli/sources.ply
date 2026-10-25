@@ -12,7 +12,7 @@ import compiler.front (Embedded, Shipping, ShippedData, ShippedWants, embeds_wan
                        shipped_data_wanted, shipped_pulled, shipped_wants, shipping_pulled)
 import compiler.unit (identity_of, file_kept, keep_file)
 import compiler.front.interface (blanked, imported)
-import compiler.syntax.items (parse, unimported)
+import compiler.syntax.items (parse, unimported, is_std)
 import std.bin
 import std.random (entropy)
 import std.time (time)
@@ -69,10 +69,6 @@ pub type Project = {
 /// again from there.
 pub type Embed = { embedded: Embedded, file: Rooted }
 
-pub fn is_std(name: String) -> Bool = name == "std" || name.starts_with("std.")
-
-pub fn is_compiler(name: String) -> Bool = name == "compiler" || name.starts_with("compiler.")
-
 // --- Reading them ---------------------------------------------------------------
 
 pub fn nowhere(code: Bytes, message: String, label: Bytes, notes: List<Bytes>) -> Diag =
@@ -118,7 +114,15 @@ pub fn no_package(pwd: String) -> Diag =
 fn refused_file(project: Project, file: File, diag: Diag) -> Project =
   { ..project, files: project.files.push(file), diags: project.diags.push(diag) }
 
-fn placed(project: Project, rooted: Rooted, path: String, text: Bytes) -> Project / {abort.raise} = {
+/// The file at `path` below the root as a module, named under `part` where the root is a part of the
+/// toolchain's library.
+fn placed(
+  project: Project,
+  rooted: Rooted,
+  path: String,
+  text: Bytes,
+  part: String,
+) -> Project / {abort.raise} = {
   let here = project.files.len();
   match module_of(path) {
     Err(why) ->
@@ -128,7 +132,8 @@ fn placed(project: Project, rooted: Rooted, path: String, text: Bytes) -> Projec
         unaddressable(here, path, why),
       ),
     // The built-in packages' prefixes collide at the front end, which reports them.
-    Ok(name) -> {
+    Ok(stem) -> {
+      let name = if part == "" { stem } else { part ++ "." ++ stem };
       {
         ..project,
         files: project.files.push({ path: path, module: name, text: text, at: rooted }),
@@ -138,9 +143,11 @@ fn placed(project: Project, rooted: Rooted, path: String, text: Bytes) -> Projec
   }
 }
 
-/// One file the walk found, read through its own root and named by its place below `strip`.
+/// One file the walk found, read through its own root and named by its place below `strip`, under
+/// `part`.
 fn one_file(
   strip: String,
+  part: String,
   project: Project,
   rooted: Rooted,
 ) -> Project / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
@@ -151,20 +158,22 @@ fn one_file(
         Some(rest) -> if rest == "" { rooted.path } else { rest },
         None -> rooted.path,
       };
-      placed(project, rooted, display, text)
+      placed(project, rooted, display, text, part)
     },
   }
 
 fn empty() -> Project =
   { files: [], sources: [], diags: [], manifest: None, packages: [], root_key: "", absent: [] }
 
-/// Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused.
+/// Every `.ply` file the walk found, in path order, with the ones that cannot be modules refused,
+/// each named under `part`.
 fn read(
   found: Found,
   strip: String,
+  part: String = "",
 ) -> Project / {fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
   let filed: Project = found.files.values().fold(empty(), |acc: Project, rooted: Rooted|
-    one_file(strip, acc, rooted));
+    one_file(strip, part, acc, rooted));
   found.errors.fold({ ..filed, absent: found.absent }, |acc: Project, e: Failure|
     { ..acc, diags: acc.diags.push(unreadable(e.path)) })
 }
@@ -179,21 +188,22 @@ fn unnamed(resolved: paths::Resolved) -> List<Diag> / {fs.kind[cwd], fs.kind[abs
   }
 }
 
-/// One path as a load reads it, with its root's manifest: a path a line names in a package must be
-/// there, though the package is read whole.
+/// One path as a load reads it, with its root's manifest: a path a line names in a package or a part
+/// of the toolchain's library must be there, though the root is read whole.
 fn loaded(
   resolved: paths::Resolved,
 ) -> Project / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
-  let own = read(loading(nothing(), resolved), paths::root_prefix(resolved));
+  let own = read(loading(nothing(), resolved), paths::root_prefix(resolved), resolved.part);
   match with_manifest(resolved, empty()).manifest {
-    None -> own,
+    None -> if resolved.part == "" { own }
+    else { { ..own, diags: own.diags.concat(unnamed(resolved)) } },
     Some(manifest) ->
       { ..own, manifest: Some(manifest), diags: own.diags.concat(unnamed(resolved)) },
   }
 }
 
-/// Every path a command was given, each read under the root it resolved to, and merged: a package
-/// two of them are part of is read once.
+/// Every path a command was given, each read under the root it resolved to, and merged: a package,
+/// or a part of the toolchain's library, two of them are part of is read once.
 pub fn load_resolved(
   rs: List<paths::Resolved>,
 ) -> Project / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
@@ -208,7 +218,8 @@ pub fn load_resolved(
         let one = loaded(resolved);
         {
           project: merge(acc.project, one),
-          packages: match one.manifest { Some(_) -> acc.packages.push(root), None -> acc.packages },
+          packages: if one.manifest != None || resolved.part != "" { acc.packages.push(root) }
+          else { acc.packages },
         }
       }
     },
@@ -568,9 +579,8 @@ pub fn stem(name: String) -> String / {abort.raise} = name.slice(0, name.len() -
 pub fn shipped_digest_of(srcs: List<Source>, data: List<ShippedData>) -> String / {abort.raise} = {
   let part = |name: Bytes, bytes: Bytes|
     Bytes::concat_all([u64_le(String::of_bytes_lossy(name).len()), name, blake3(bytes)]);
-  let parts = srcs.filter(|src: Source| is_std(String::of_bytes_lossy(src.name))).map(
-    |src: Source| part(src.name, src.src),
-  ).concat(
+  let parts = srcs.filter(|src: Source| is_std(src.name)).map(|src: Source|
+    part(src.name, src.src)).concat(
     data.map(|d: ShippedData| part(d.name, d.bytes)),
   );
   "b3:" ++ String::of_bytes(hex(blake3(Bytes::concat_all(parts))).slice(0, 12))
@@ -585,12 +595,10 @@ pub fn shipped_names() -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
 
 /// The shipped modules a load of `user` and `pkgs` pulls and the data files those embed, each read
 /// off the directory bound as `shipped` when it is pulled, a module as a module importing it reads
-/// it (`compiler.front.interface.imported`). `every` pulls each module of the standard library there is,
-/// whole, whatever `user` and `pkgs` import.
+/// it (`compiler.front.interface.imported`).
 pub fn shipping_for(
   user: List<Source>,
   pkgs: PackageSources,
-  every: Bool = false,
 ) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let listed = shipped_names();
   shipped_pulled(
@@ -599,27 +607,19 @@ pub fn shipping_for(
     listed,
     |name: Bytes|
       match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
-        Some(text) -> Some(if every { text } else { imported(text) }),
+        Some(text) -> Some(imported(text)),
         None -> None,
       },
     |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
     pulls_of,
-    if every { listed.filter(|name: Bytes| is_std(String::of_bytes_lossy(name))) } else { [] },
   )
 }
 
-/// The shipped modules a load asks after whatever its modules import: each module of the standard
-/// library where `every` says, as a run over its own tests reads them.
-pub fn asked_shipped(every: Bool) -> List<Bytes> / {fs.list_dir[shipped], abort.raise} =
-  if every { shipped_names().filter(|name: Bytes| is_std(String::of_bytes_lossy(name))) }
-  else { [] }
-
 /// The shipping of a load that pulled `pulled`: each pulled module as a module importing it reads it,
-/// through the reading the machine keeps of it ([`imported_reader`]), or whole where `every` says,
+/// through the reading the machine keeps of it ([`imported_reader`]),
 /// and what those embed, as `wants` says each embeds, or as its text says where `wants` is silent.
 pub fn shipping_kept_of(
   pulled: List<Bytes>,
-  every: Bool,
   wants: Map<Bytes, ShippedWants>,
 ) -> Shipping / {env.reused[sys], fs.list_dir[shipped], fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
   let importing = imported_reader();
@@ -628,31 +628,30 @@ pub fn shipping_kept_of(
     shipped_names(),
     |name: Bytes|
       match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
-        Some(text) -> Some(if every { text } else { read_imported(importing, text) }),
+        Some(text) -> Some(read_imported(importing, text)),
         None -> None,
       },
     |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
     |source: Source| match wants.get(source.name) { Some(w) -> w, None -> shipped_wants(source) },
-    asked_shipped(every),
+    [],
   )
 }
 
 /// [`shipping_kept_of`] with nothing kept.
 pub fn shipping_of(
   pulled: List<Bytes>,
-  every: Bool,
 ) -> Shipping / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   shipping_pulled(
     pulled,
     shipped_names(),
     |name: Bytes|
       match fs.read_file[shipped](String::of_bytes_lossy(name) ++ ".ply") {
-        Some(text) -> Some(if every { text } else { imported(text) }),
+        Some(text) -> Some(imported(text)),
         None -> None,
       },
     |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
     shipped_wants,
-    asked_shipped(every),
+    [],
   )
 
 /// How a load reads a shipped module for a module importing it: what that reading is a function of
@@ -670,7 +669,7 @@ pub fn imported_reader() -> ImportedReader / {env.reused[sys], fs.read_file[ship
           b"ply.imported.1\x00",
           hex(bin::shape_digest(blanked_bin())),
           b"\x00",
-          identity_of(definitions, [b"front.interface.imported"]),
+          identity_of(definitions, [b"compiler.front.interface.imported"]),
           b"\x00",
         ]),
       None -> b"",
@@ -783,15 +782,6 @@ test "a path names a module by its place, and a segment that is not an identifie
   assert_eq(module_of("café.ply"), Err("`café` is not an identifier"))
 }
 
-test "the reserved roots are the ones this binary ships under" {
-  assert(is_std("std"));
-  assert(is_std("std.json"));
-  assert(!is_std("standard"));
-  assert(is_compiler("compiler"));
-  assert(is_compiler("compiler.fmt"));
-  assert(!is_compiler("compilers"))
-}
-
 /// The walk's answer for files it found in the working directory.
 fn found_here(names: List<String>) -> Found =
   {
@@ -841,6 +831,19 @@ test "a project file under std walks on to the front end's collision" {
   assert_eq(match p.sources.at(0) { Some(s) -> s.name, None -> b"" }, b"std.json")
 }
 
+test "a part of the toolchain's library names its files under its prefix, as the pack does" {
+  let p = handle {
+    read(found_here(["json.ply", "hash/legacy.ply"]), "", "std")
+  } with {
+    fs.read_file[cwd](path) -> Some(b"pub fn f() -> Int = 1\n"),
+    fs.read_file[abs](path) -> panic("nothing here leaves the working directory"),
+  };
+  assert_eq(p.diags.len(), 0);
+  assert_eq(p.sources.map(|s: Source| s.name).sort(), [b"std.hash.legacy", b"std.json"]);
+  // Each is placed at its file below the part, where a report points.
+  assert_eq(p.files.map(|file: File| file.path).sort(), ["hash/legacy.ply", "json.ply"])
+}
+
 test "a file found outside the working directory is read there, named below its root" {
   let found: Found = {
     files: Map::new().insert("/srv/app/store/orders.ply", {
@@ -874,6 +877,7 @@ test "the manifest is the one in the root's directory, whichever file in it the 
     inside: "main.ply",
     absolute: "/srv/app",
     machine: "/srv/app",
+    part: "",
   };
   let p = handle {
     with_manifest(file, empty())
@@ -914,43 +918,18 @@ test "a load reads the shipped modules it pulls and what they embed, and only th
   assert_eq(got.files, ["std.json.ply", "std.bytes.ply"])
 }
 
-test "a load of every standard library module reads each, imported or not, and no other shipped module" {
-  let got = handle {
-    shipping_for(
-      [{ name: b"main", src: b"import std.json\nfn main() -> Unit = ()\n" }],
-      { root: b"", manifest: None, supplied: [] },
-      true,
-    )
-  } with {
-    var files: List<String> = [],
-    fs.list_dir[shipped](p) ->
-      Some(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"]),
-    fs.read_file[shipped](p) -> {
-      files = files.push(p);
-      if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = 1\n") }
-      else { Some(b"pub fn x() -> Int = 3\n") }
-    },
-    return shipping -> { shipping: shipping, files: files },
-  };
-  assert_eq(got.shipping.asked, [b"std.json", b"std.bytes", b"std.list"]);
-  assert_eq(got.shipping.unread, [b"compiler.fmt"]);
-  assert_eq(got.files, ["std.bytes.ply", "std.json.ply", "std.list.ply"])
-}
-
 fn exercised() -> Bytes =
   b"//! Counting.\n\nimport std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = x * 2\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)), 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n"
 
 /// What a load of a module importing `std.count`, a shipped module with a test and a law, reads of
 /// the shipped modules: the modules, the text of `std.count` and the files asked for.
-fn counted_load(
-  every: Bool,
-) -> { read: List<Bytes>, text: Bytes, files: List<String> } / {abort.raise} =
+fn counted_load() -> { read: List<Bytes>, text: Bytes, files: List<String> } / {abort.raise} =
   handle {
-    shipping_for(
-      [{ name: b"main", src: b"import std.count\nfn main() -> Unit = ()\n" }],
-      { root: b"", manifest: None, supplied: [] },
-      every,
-    )
+    shipping_for([{ name: b"main", src: b"import std.count\nfn main() -> Unit = ()\n" }], {
+      root: b"",
+      manifest: None,
+      supplied: [],
+    })
   } with {
     var files: List<String> = [],
     fs.list_dir[shipped](p) -> Some(["std.count.ply", "std.laws.ply"]),
@@ -974,13 +953,14 @@ fn kept_count(toolchain: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.ra
   let over = on_mem[cwd](mem_empty(), ||
     on_mem[abs](toolchain, ||
       handle {
-        shipping_kept_of([b"std.count"], false, Map::new())
+        shipping_kept_of([b"std.count"], Map::new())
       } with {
         env.reused[sys]() -> "/reused",
         fs.list_dir[shipped](p) -> Some(["std.count.ply"]),
         fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(exercised()) }
-        else if p == "definitions" { Some(b"front.pulls_of aa\nfront.interface.imported bb\n") }
-        else { None },
+        else if p == "definitions" {
+          Some(b"compiler.front.pulls_of aa\ncompiler.front.interface.imported bb\n")
+        } else { None },
         entropy.next() -> 7,
         time.now_ms() -> 0,
       })).value;
@@ -1005,8 +985,8 @@ test "what an importer reads of a shipped module is kept for every project, and 
   assert_eq(kept_count(spoiled).text, viewed)
 }
 
-test "a project's load reads no shipped test or law, nor what only they reach, and `--std`'s reads all" {
-  let load = counted_load(false);
+test "a project's load reads no shipped test or law, nor what only they reach" {
+  let load = counted_load();
   assert_eq(load.read, [b"std.count"]);
   assert_eq(load.files, ["std.count.ply"]);
   assert_eq(load.text.len(), exercised().len());
@@ -1016,10 +996,7 @@ test "a project's load reads no shipped test or law, nor what only they reach, a
   assert(!says(b"std.laws") && !says(b"twice") && !says(b"test") && !says(b"law"));
   let parsed = parse(load.text);
   assert_eq(parsed.parser.diags.len(), 0);
-  assert_eq(parsed.node.items.len(), 2);
-  let whole = counted_load(true);
-  assert_eq(whole.read, [b"std.count", b"std.laws"]);
-  assert_eq(whole.text, exercised())
+  assert_eq(parsed.node.items.len(), 2)
 }
 
 fn embedding_words() -> Bytes = b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n"

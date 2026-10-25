@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # The Ply runs (`ci-shards.sh`'s), each one `ply test` of a package: over the CLI's suite with the
-# grants its harness drives `ply` with, from a scratch directory of the run's own, over the standard
-# library's tests with every shipped module's beside them, or a package's own suite as `ply test`
-# runs it; the proof runs, the standard library's (`proofs`) and each package's (`laws-<id>`), are a
-# `ply prove` each. A run fails when a test fails or a claim does not hold, when the run refuses, and
+# grants its harness drives `ply` with, from a scratch directory of the run's own, or a package's own
+# suite as `ply test` runs it, the standard library's among them; the proof runs, the standard
+# library's (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each. A run fails when a test fails or a claim does not hold, when the run refuses, and
 # when it selects no test or proves no claim, so a renamed test never stops being run quietly; a part
 # of the CLI's suite takes the tests whose keys hash to it, which may be none. It fails too when its
 # load ran a body again because a store had lost the answer its record names, which is a run made
@@ -112,8 +111,7 @@ stopped_run() {
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker,
-# the standard library's tests with every shipped module's beside them, and any other package as
-# `ply test` runs it, each of those granted nothing.
+# and any other package as `ply test` runs it, granted nothing.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -122,8 +120,6 @@ tested() {
     touch "$dir/.ply-scratch"
     (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
     rm -rf "$dir"
-  elif [[ $path == "$(work std-tests)" ]]; then
-    bounded "$ply" test --std "$path" --json "$@" || status=$?
   else
     bounded "$ply" test "$path" --json "$@" || status=$?
   fi
@@ -233,11 +229,7 @@ proofs_of() {
   placed "$id" || return 2
   out=$(mktemp)
   started=$(now_ms)
-  if [[ $id == proofs ]]; then
-    bounded "$ply" prove --std "$path" "$@" --json > "$out" || status=$?
-  else
-    bounded "$ply" prove "$path" --json "$@" > "$out" || status=$?
-  fi
+  bounded "$ply" prove "$path" --json "$@" > "$out" || status=$?
   if ((status == STOPPED)); then
     stopped_run "$started" "$id"
     rm -f "$out"

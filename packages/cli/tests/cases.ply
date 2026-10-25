@@ -17,11 +17,12 @@ import compiler.unit (codes, shipped)
 import compiler.store.hash.forms (TheItem, Which, listing_reach, reached_functions)
 import compiler.check.infer.checker (DefInfo, TestInfo)
 import compiler.emit.keys (RootKey, Named, Cases, Clause, RootName, root_name)
-import compiler.check.resolve.tables (Diag, qualify)
+import compiler.check.resolve.tables (Diag, Source, qualify)
 import diagnostic (Raised, diag_of, shown)
-import program (Timed, is_shipped, keep_command)
+import program (Timed, keep_command)
 import report (Answer, ok_code)
-import sources (Project, is_std)
+import sources (Project)
+import compiler.syntax.items (is_shipped)
 import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, object, to_string, int)
 import std.term (Style, plain)
@@ -91,7 +92,7 @@ fn unwarned(answer: Answer) -> Bool =
 // --- What the loaded tree tells a selector ------------------------------------
 
 /// Which tests a run reports on: the package being loaded — a dependency's tests are its own to run,
-/// and a standard library module's are in scope only under `--std`, the compiler's never — narrowed
+/// and a shipped module's its library's own checkout's — narrowed
 /// by a path the line names in the package to the modules under it, by `--filter` to the keys that
 /// contain one of its substrings, and by `--shard` to its part.
 pub type Scope = { visible: List<Int>, out: List<Int>, filtered_out: Int }
@@ -112,9 +113,7 @@ pub fn scope_of(
   let packaged = analysis.frame.packages.len() > 0;
   let root = root_modules(analysis);
   let in_scope = |t: TestInfo|
-    (if packaged { root.contains(String::of_bytes_lossy(t.module)) }
-      else { !is_shipped(String::of_bytes_lossy(t.module)) })
-      || (options.std && is_std(String::of_bytes_lossy(t.module)));
+    if packaged { root.contains(String::of_bytes_lossy(t.module)) } else { !is_shipped(t.module) };
   let matches = |t: TestInfo|
     kept(options.filters, String::of_bytes_lossy(t.key)) && in_shard(options.shard, t.key)
       && (match named {
@@ -657,40 +656,29 @@ test "the search a seeded test is keyed on is the plan the flags name, and the d
 
 // --- Footprints over real programs --------------------------------------------
 
-test "`--std` adds the standard library's tests and never the compiler's, whose own suite runs them" {
-  let w = match analyse_pulling_std_with(
-      [
-        {
-          name: b"m",
-          src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
-        },
-      ],
-      [
-        {
-          name: b"std.y",
-          src: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
-        },
-        {
-          name: b"compiler.x",
-          src: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
-        },
-      ],
-      no_rows(),
-      reached: false,
-    ).out {
-    Analysed(w) -> view_of(w),
-    Refused(_) -> panic("the fixture checks"),
+test "a run takes in its root's tests, the library's own tree's among them, and no pulled module's" {
+  let library = {
+    name: b"std.y",
+    src: b"pub fn one() -> Int = 1\ntest \"library\" { assert_eq(one(), 1) }\n",
   };
-  let keys = |args: List<String>|
-    scope_of(w, options_from(parsed(["test"].concat(args)), "/p")).visible.map(|i: Int|
-      match test_at(w, i) { Some(t) -> t.key, None -> b"" });
-  // `std.prelude`'s tests are the library's too, read as the load reads it whole.
-  let mine = |key: Bytes| !key.starts_with(b"std.prelude.");
-  assert_eq(w.checked.tests.map(|t: TestInfo| t.key).filter(mine).len(), 3);
-  assert_eq(keys([]), [b"m.own"]);
-  let std = keys(["--std"]);
-  assert(
-    std.filter(mine).len() == 2 && std.contains(b"m.own") && std.contains(b"std.y.library")
-      && std.len() > 2,
-  )
+  let compiler = {
+    name: b"compiler.x",
+    src: b"pub fn one() -> Int = 1\ntest \"compiler\" { assert_eq(one(), 1) }\n",
+  };
+  let keys = |user: List<Source>, shipped: List<Source>| {
+    let w = match analyse_pulling_std_with(user, shipped, no_rows(), reached: false).out {
+      Analysed(w) -> view_of(w),
+      Refused(_) -> panic("the fixture checks"),
+    };
+    scope_of(w, options_from(parsed(["test"]), "/p")).visible.map(|i: Int|
+      match test_at(w, i) { Some(t) -> t.key, None -> b"" })
+  };
+  let program = {
+    name: b"m",
+    src: b"import std.y\nimport compiler.x\ntest \"own\" { assert_eq(y::one(), x::one()) }\n",
+  };
+  assert_eq(keys([program], [library, compiler]), [b"m.own"]);
+  // A root holding the whole of the library the toolchain lists is the library: its tests are the
+  // run's.
+  assert_eq(keys([library], [library, compiler]), [b"std.y.library"])
 }

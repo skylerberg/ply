@@ -63,7 +63,8 @@ NEXTEST_SHARDS=2
 TAB=$'\t'
 
 # The Ply runs, each one `ply test` or `ply prove` of a package, which loads the package once: the
-# library's tests (`stdlib`) and its proofs (`proofs`), the CLI's suite in parts, each package's suite
+# library's tests (`stdlib`), its tests that read fixtures (`std-tests`) and its proofs (`proofs`),
+# the CLI's suite in parts, each package's suite
 # (`package-<id>`) and each package's proofs (`laws-<id>`), each package where `ply.work` places it
 # (`workspace`).
 # The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
@@ -161,8 +162,7 @@ workspace() {
     return 1
   fi
   WORK=$("$ply" work "$root") || { echo "$ply did not read $root/$TOOLCHAIN_WORKSPACE" >&2; return 1; }
-  # The standard library's tests that read fixtures, as a project: `--std` over it tests and proves
-  # every module of the library beside its own.
+  # The standard library, a project of its own in this checkout, and its tests that read fixtures.
   STD_TESTS=$(role std-tests)
   STD_LIBRARY=$(role std)
   CLI_SUITE=$(role cli-tests)
@@ -323,16 +323,18 @@ modules_of() {
 # Every Ply run a pull request takes, one id a line.
 runs() {
   local entry k
-  printf 'stdlib\nproofs\n'
+  printf 'stdlib\nstd-tests\nproofs\n'
   for ((k = 1; k <= CLI_PARTS; k++)); do printf 'cli-part-%d\n' "$k"; done
   for entry in "${PACKAGE_SUITES[@]}"; do printf 'package-%s\n' "${entry%%:*}"; done
   for entry in ${PACKAGE_PROOFS[@]+"${PACKAGE_PROOFS[@]}"}; do printf 'laws-%s\n' "${entry%%:*}"; done
 }
 
 # The job that takes the run $1: `packages` for a package's own tests and a package's proofs, but
-# those RUNS_ALONE names, and a job of its own for every other run.
+# those RUNS_ALONE names, `stdlib` for the library's tests that read fixtures, and a job of its own
+# for every other run.
 job_of() {
   case "$1" in
+    std-tests) printf 'stdlib\n' ;;
     package-* | laws-*)
       if named_in "$1" "${RUNS_ALONE[@]}"; then printf '%s\n' "$1"; else printf 'packages\n'; fi
       ;;
@@ -372,7 +374,8 @@ cli_filters() {
 cmd_run_line() {
   local id=$1 path part
   case "$id" in
-    stdlib | proofs) printf '%s\t\t\n' "$STD_TESTS" ;;
+    stdlib | proofs) printf '%s\t\t\n' "$STD_LIBRARY" ;;
+    std-tests) printf '%s\t\t\n' "$STD_TESTS" ;;
     cli-part-*)
       part=${id#cli-part-}
       if ! [[ $part =~ ^[1-9][0-9]*$ ]] || ((part > CLI_PARTS)); then

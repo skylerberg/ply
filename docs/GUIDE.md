@@ -48,8 +48,9 @@ package prefix can be — lower-case letters, digits and `_`, joined by dots —
 and a directory that is already there is refused rather than written into.
 
 **Projects.** A project's root is found, not assumed: it is the nearest directory
-at or above the path a command names that holds a `ply.pkg` (§3.3), and a
-command that names no path starts from the working directory. So `ply test`
+at or above the path a command names that holds a `ply.pkg` (§3.3) or is a part of
+the toolchain's library a checkout places, and a command that names no path starts
+from the working directory. So `ply test`
 means the same package from its root and from any directory below it, and a
 path inside the package narrows the command and never moves the root:
 `ply test store` runs the tests of the modules under `store/`, and
@@ -69,7 +70,12 @@ named `target`, and, under a root that holds a `ply.pkg`, one that holds a
 `ply.pkg` of its own, which is another package and reached only as a dependency
 (§3.3). Every directory name and file stem must be an identifier (`E0111`).
 `std` and `compiler` are the built-in packages, pre-seeded for every load: a
-module named under either collides with its prefix (`E0133`).
+module named under either collides with its prefix (`E0133`), but in the parts of
+the toolchain's library a checkout places (§3.3), whose modules are named under the
+part's prefix wherever they are read: below the standard library's directory
+`hash/legacy.ply` is `std.hash.legacy`, and below the compiler's `emit/roots.ply`
+is `compiler.emit.roots`, which is how every module, the compiler's own among them,
+imports it.
 
 **The cache.** `.ply-cache/` at the root holds the memo store (`memo/`), which
 keeps what each module of the project answered checked, the store — the tests'
@@ -667,7 +673,15 @@ role and a path a line — `std`, `std-tests`, `compiler`, `cli`, `entry`,
 below `target/<profile>`), then `package`, `suite`, `proved` and `fixtures` —
 or as one document with `--json`; where no directory at or above holds a
 `ply.work`, it is `E0502`. A workspace changes nothing a command does to a
-package: each is still its own root.
+package, each still its own root, but where it names the toolchain: a load of a
+path inside that checkout reads the standard library and the compiler from the
+directories it places them in, in place of the ones the running `ply` ships, so
+the CLI, the compiler and the library are checked against one another as a
+bootstrap builds them. A `ply` older than the checkout checks the library's
+modules that moved since it was built, and refuses where they use a rule it does
+not know. A path inside one of those directories is that part of the library as
+a project: `ply check packages/std` checks every module of the standard library
+as its own, and `ply test packages/compiler` runs every test of the compiler.
 
 ### 3.4 Embedding files
 
@@ -2823,8 +2837,8 @@ clauses unless it is `transparent` too. `std.laws` ships the schemas the
 standard library states its laws with (`ply doc std.laws`).
 
 A definition of another package
-— a dependency's, a compiler module's the library ships, or outside `--std` a
-standard library module's — is claimed by its
+— a dependency's, or a module's the toolchain ships where the load is not of the
+library's own directory — is claimed by its
 `requires` and `ensures` alone: a proof may use what it promises and never
 unfolds its body, which that package's own run proves. A `transparent fn` is
 claimed by its body too: a proof anywhere may unfold it, so its body, and all
@@ -3177,11 +3191,11 @@ The built-in package, shipped inside `ply` and pre-seeded for every load — an
 implicit dependency of every package, no declaration needed: `import
 std.<name>`, a name having more segments where a module sits beneath another
 (`std.hash.legacy` beside `std.hash`). Its tests and obligations are no
-project's: `ply test`, `ply prove` and `ply review` skip them unless you pass
-`--std`, which adds those of every
-module `ply std` lists, whichever of them the project imports. So do `ply check`,
-which then reports each module's errors, warnings and definitions as the project's
-own, and `ply defs`, which then lists their definitions too.
+project's: `ply test`, `ply prove`, `ply review`, `ply check` and `ply defs` of a
+project leave every one of them out. They are the library's own, run in the
+repository that builds `ply`, where the library's directory is a project of its
+own (§3.3): `ply test packages/std` runs every module's tests, and `ply check`
+reports each module's errors, warnings and definitions as its own.
 A module named for a type of the language's is that type's home: it and
 `std.prelude` (§12) alone declare functions of the type (`fn List::name` in
 `std.list`, §3.1). A module
@@ -3214,8 +3228,8 @@ counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
 `show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
-dependent's proof is owed; `--std` reads every module of the library, each one
-whole.
+dependent's proof is owed; a load of the library's own directory reads every
+module of it, each one whole.
 
 ## 14. The host boundary
 
@@ -3507,11 +3521,11 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the path's last segment), `--lib` (no `main`, a `pub` definition instead); refuses a name that is not a package name and a directory that is already there |
-| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases and how many answers of each query the memo store took as kept and how many it ran again, which a check that refuses prints too; and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps`, `--std` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--std`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply check [path]` | `--types`, `--costs`, `--explain` (front-end phases and how many answers of each query the memo store took as kept and how many it ran again, which a check that refuses prints too; and, where the cost pass ran, how many bodies it walked rather than took as an earlier run walked them and how many modules it lowered to; with `--types`, effect sets, provenance, and each place a body can raise with why, §6.8), `--workspace`, `--verify-deps` |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (one interleaving always), `--steps` and `--timeout` (both default to no bound: an entry that serves forever is a program), `--profile`, `--explain` (whether the front end ran or an earlier run's answer was reused, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain; `ARGS` is what `process.args` answers; a `.plyx` path runs the artifact |
-| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--std`, `--workspace`, `--verify-deps`, prove, simulation |
-| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--std`, prove, simulation |
+| `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--workspace`, `--verify-deps`, prove, simulation |
+| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | `--show [NAME]` (a module's source, or a data file one embeds), `--digest`, `--answers DIR` (answer every shipped module into a pack in `DIR/pack`, a file of Zstandard frames and its index holding those answers and nothing else, through the memo store kept under the stage root, which holds what a bootstrap's builder answered of them checking `ply` and what an earlier answering did: what `ply bootstrap` packs into the `ply` it builds, which every load reads below its own store), `--answering` (one line naming how this `ply` answers the shipped modules: two that print the same answer the same modules alike, and `ply bootstrap` keeps the answers under it); no path |
@@ -3529,7 +3543,7 @@ and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 | `ply keygen PATH` | an Ed25519 key pair: the secret key at `PATH`, the public key at `PATH.pub` (§15.2); no path |
 | `ply contracts NAME FROM TO` | the public definitions whose contracts were added, changed or removed between two published versions, the bump that needs, and whether `TO` makes it (`needs`, `kept`); no path |
 | `ply hash [path]` | `--deps` (references and transitive closure) |
-| `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING`, `--std` |
+| `ply defs [path]` | every definition: place, hash, signature, footprint, references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what mentions a definition directly, and every definition, and every test and law of the run's own modules, whose closure reaches it |
 | `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`), its parts where its `ply.work` places them (§3.3): the checkout's compiler built by this `ply` into the builder, linked with the runtime's library cargo built (`--runtime LIBRARY`, default the static library of the `runtime` package below `target/<profile>`), the builder run over the checkout's `ply`, that linked with the library, and its pack written with the shipped modules, what they answer (each one `ply` imports answered once, by the builder, through the store the answering reads) and what its front end answered of the definition it enters; the builder is taken from the toolchain's cache where an earlier bootstrap kept it, and so is what the shipped modules answer, kept under how the `ply` answers them and not under its front end, so a `ply` that differs from an earlier one only outside what answers them answers nothing; the C compiles under `--profile development` (default) or `release`, and the `ply` goes to `--out PATH` (default `target/<profile>/ply`) |
 | `ply work [<path>]` | where the `ply.work` at or above a directory (default `.`) places each package and each part of `ply`: a role and a path a line, or `--json` (§3.3) |
@@ -3544,8 +3558,8 @@ are one Ply program (the `cli` package, entered at `ply.main`). The program itse
 refusals, and resolves the paths it is given against the working directory — a
 relative path reads under it, an absolute one reads where it points — and then
 finds the root each is part of (§1): `[path]` in the table above is a `.ply`
-file or a directory, and left off it is the package the working directory is
-part of. `ply fmt` rewrites the paths it is given as they stand, `ply new`,
+file or a directory, and left off it is the package, or the part of the
+toolchain's library, the working directory is part of. `ply fmt` rewrites the paths it is given as they stand, `ply new`,
 `ply bootstrap` and `ply work` take theirs as written, and `ply doc` answers for a builtin or a
 shipped module where no package holds the working directory. The binary
 answers with the code the program asked to exit with. What a command needs of
@@ -3567,7 +3581,7 @@ starts, so a body is walked once however often it is lowered or moved.
 after them holding the shipped modules, what they answer, and the tables of the CLI's front end
 the runtime binds its code to, so starting runs no compiler and opens no library. `ply bootstrap`
 builds it. The running `ply` builds the builder, a native program that enters the checkout's
-compiler at its `build.main`: it loads the compiler as the shipped modules that definition reaches,
+compiler at `compiler.build.main`: it loads the compiler as the shipped modules that definition reaches,
 so each one that did not move since the running `ply` was built is answered by what its pack
 carries. The builder is kept in the toolchain's cache under the checkout's shipped modules, the
 runtime's library, the C compiler and the definitions of the running `ply` that build it, and a

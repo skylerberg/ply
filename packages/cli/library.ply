@@ -1,0 +1,337 @@
+//! Where a load reads the toolchain's library from: the standard library and the compiler as this
+//! `ply`'s pack carries them, or as a checkout holds them whose `ply.work` names the toolchain's
+//! parts, which a load of a path inside that checkout reads in their place. A file of a part is
+//! named by the part and its place below it, wherever it is read: the `std` part's
+//! `hash/legacy.ply` is `std.hash.legacy`, the `compiler` part's `emit/roots.ply` is
+//! `compiler.emit.roots`.
+
+import diagnostic (Place)
+import compiler.native
+import compiler.unit (shipped)
+import compiler.front.diagnostics (placed)
+import compiler.front.pkg (check_workspace)
+import compiler.syntax.parsing (ParseDiag, no_module, dummy_span)
+import compiler.check.resolve.tables (Diag, error_at)
+import std.fs
+import std.fs (fs, Entry, File, mem_of)
+import std.hash (blake3)
+import std.list
+import std.string
+import std.path (below_root, is_absolute, join, normalize, parent)
+import std.pkg (Workspace, ToolchainParts)
+
+// --- The workspace ------------------------------------------------------------------
+
+/// The file a repository states its workspace in, at its root.
+pub fn file() -> String = "ply.work"
+
+/// Why a workspace was not read: what to report, and the texts its labels point into.
+pub type Unread = { diags: List<Diag>, places: List<Place> }
+
+pub fn unread(message: String, label: Bytes) -> Unread =
+  {
+    diags: [
+      error_at(b"E0502", no_module(), dummy_span(), Bytes::of_string(message), label, [
+        b"a `ply.work` names where each package of a repository lies (`ply doc std.pkg.Workspace`)",
+      ]),
+    ],
+    places: [],
+  }
+
+/// The workspace the `ply.work` of `root`, an absolute directory, states.
+pub fn read(root: String) -> Result<Workspace, Unread> / {fs.read_file[abs], abort.raise} = {
+  let path = join(root, file());
+  match fs.read_file[abs](below_root(path)) {
+    None -> Err(unread("no `" ++ file() ++ "` in `" ++ root ++ "`", b"no workspace to read")),
+    Some(text) -> {
+      let checked = check_workspace(text);
+      match checked.workspace {
+        Some(w) -> Ok(w),
+        None ->
+          Err({
+            diags: checked.diags.map(|d: ParseDiag| placed(0, d)),
+            places: [{ path: path, text: text }],
+          }),
+      }
+    },
+  }
+}
+
+/// The parts of `ply` the `ply.work` of `root` names: refused where it names none.
+pub fn toolchain(
+  root: String,
+) -> Result<ToolchainParts, Unread> / {fs.read_file[abs], abort.raise} =
+  match read(root) {
+    Err(u) -> Err(u),
+    Ok(w) -> match w.toolchain {
+      Some(t) -> Ok(t),
+      None ->
+        Err(unread("`" ++ join(root, file()) ++ "` names no toolchain", b"no toolchain to build")),
+    },
+  }
+
+/// The nearest directory at or above `dir`, an absolute one, that holds a `ply.work`. Each step up
+/// is shorter, so the spelling's length bounds the steps.
+pub fn root_of(dir: String) -> Option<String> / {fs.resolved[abs], abort.raise} =
+  iterate(normalize(dir), dir.len() + 2, |at: String|
+    if !is_absolute(at) { Stop(None) }
+    else if fs.resolved[abs](below_root(join(at, file()))) == File { Stop(Some(at)) }
+    else if at == "/" { Stop(None) }
+    else { Continue(parent(at)) })
+
+// --- The toolchain's checkout -----------------------------------------------------------
+
+/// A checkout whose `ply.work` names the toolchain's parts: its root, absolute, and those parts.
+pub type Checkout = { root: String, parts: ToolchainParts }
+
+/// The checkout `dir`, an absolute directory, is part of: the nearest directory at or above it that
+/// holds a `ply.work`, where that names the toolchain's parts.
+pub fn checkout_holding(
+  dir: String,
+) -> Option<Checkout> / {fs.resolved[abs], fs.read_file[abs], abort.raise} =
+  match root_of(dir) {
+    None -> None,
+    Some(root) -> match toolchain(root) {
+      Ok(parts) -> Some({ root: root, parts: parts }),
+      Err(_) -> None,
+    },
+  }
+
+/// A part of the library a checkout holds: its directory, absolute, and the prefix its modules are
+/// named under, which is the root a pack keeps it below.
+pub type Part = { dir: String, prefix: String }
+
+pub fn parts_of(c: Checkout) -> List<Part> / {abort.raise} =
+  [
+    { dir: normalize(join(c.root, c.parts.std)), prefix: native::std_root() },
+    { dir: normalize(join(c.root, c.parts.compiler)), prefix: native::compiler_root() },
+  ]
+
+/// The part of the library `dir`, an absolute directory, is at or below, in the checkout that holds
+/// it.
+pub fn part_of(dir: String) -> Option<Part> / {fs.resolved[abs], fs.read_file[abs], abort.raise} = {
+  let at = normalize(dir);
+  match checkout_holding(at) {
+    None -> None,
+    Some(c) -> parts_of(c).find(|p: Part| at == p.dir || at.starts_with(p.dir ++ "/")),
+  }
+}
+
+// --- The library's files ----------------------------------------------------------------
+
+/// One file of the library, by the name a load reads it under among the shipped modules, and the
+/// path a pack keeps it under.
+pub type Shipping = { name: String, path: String, bytes: Bytes }
+
+/// Every file below `dir`, an absolute directory, but those in a hidden directory, a cache, by its
+/// path below it.
+fn files_below(dir: String) -> List<{ rel: String, bytes: Bytes }> / {fs.read[abs], abort.raise} =
+  match fs.walk[abs](below_root(dir)) {
+    None -> [],
+    Some(entries) ->
+      entries.fold([], |acc: List<{ rel: String, bytes: Bytes }>, e: Entry|
+        match e.kind {
+          File -> {
+            let rel = e.path.slice(below_root(dir).len() + 1, e.path.len());
+            if rel.starts_with(".") || rel.contains("/.") { acc } else {
+              match fs.read_file[abs](e.path) {
+                Some(bytes) -> acc.push({ rel: rel, bytes: bytes }),
+                None -> acc,
+              }
+            }
+          },
+          _ -> acc,
+        }),
+  }
+
+/// The module a `.ply` file of a part is, by the part's prefix and the file's place `rel` below the
+/// part: `hash/legacy.ply` of the standard library is `std.hash.legacy`.
+pub fn module_at(prefix: String, rel: String) -> String / {abort.raise} =
+  prefix ++ "." ++ rel.slice(0, rel.len() - 4).replace("/", ".")
+
+/// The library `c` holds, each file as the shipped modules name it and a pack keeps it, below the
+/// root the pack keeps its part's files under: `std.hash.legacy.ply` for the standard library's
+/// `hash/legacy.ply`, `std/<path>` for a data file, and `compiler.emit.roots.ply` for the
+/// compiler's `emit/roots.ply`. The compiler holds modules only.
+pub fn shipping(c: Checkout) -> List<Shipping> / {fs.read[abs], abort.raise} =
+  parts_of(c).flat_map(|part: Part|
+    files_below(part.dir).fold([], |acc: List<Shipping>, f: { rel: String, bytes: Bytes }| {
+      let path = part.prefix ++ "/" ++ f.rel;
+      if f.rel.ends_with(".ply") {
+        acc.push({ name: module_at(part.prefix, f.rel) ++ ".ply", path: path, bytes: f.bytes })
+      } else if part.prefix == native::std_root() {
+        acc.push({ name: path, path: path, bytes: f.bytes })
+      } else { acc }
+    }))
+
+fn module_names(files: List<Shipping>) -> List<String> / {abort.raise} =
+  files.fold([], |acc: List<String>, f: Shipping|
+    if f.name.ends_with(".ply") { acc.push(f.name.slice(0, f.name.len() - 4)) } else { acc })
+
+/// What `files` are as a binary lists the shipped files it carries (`digests`): each by its name, a
+/// space and the BLAKE3 digest of its bytes in hex, a line each, ascending.
+pub fn digests_of(files: List<Shipping>) -> Bytes / {abort.raise} = {
+  let lines = files.fold(Map::new(), |acc: Map<String, Bool>, f: Shipping|
+    acc.insert(f.name ++ " " ++ blake3(f.bytes).hex_of() ++ "\n", true));
+  Bytes::concat_all(lines.keys().map(Bytes::of_string))
+}
+
+/// `body` with the shipped modules as `files` hold them in place of this `ply`'s own. The files this
+/// `ply` lists of its own are `files`, so its packed answers stand as they are only where `files`
+/// are the very ones they were answered over, and are held to what they read otherwise.
+pub fn over_shipping<a | e>(
+  files: List<Shipping>,
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise | e} = {
+  let by_name = files.fold(Map::new(), |acc: Map<String, Bytes>, f: Shipping|
+    acc.insert(f.name, f.bytes));
+  let names = module_names(files);
+  let digests = digests_of(files);
+  handle {
+    body()
+  } with {
+    fs.list_dir[shipped](dir) -> if dir == "." {
+      match fs.list_dir[shipped](".") {
+        Some(own) ->
+          Some(own.filter(|n: String| !n.ends_with(".ply") && n != "std").concat(by_name.keys())),
+        None -> Some(by_name.keys()),
+      }
+    } else { fs.list_dir[shipped](dir) },
+    fs.read_file[shipped](name) -> match by_name.get(name) {
+      Some(bytes) -> Some(bytes),
+      // A module or data file the checkout lacks is not this `ply`'s own.
+      None -> if name == "digests" { Some(digests) }
+      else if name.ends_with(".ply") || name.starts_with("std/") { None }
+      else { fs.read_file[shipped](name) },
+    },
+    shipped.names() -> names,
+    shipped.module(name) -> match by_name.get(name ++ ".ply") {
+      Some(bytes) -> Some(bytes),
+      None -> by_name.get(name),
+    },
+  }
+}
+
+/// `body` over the library `checkout` holds, where there is one, in place of this `ply`'s own.
+pub fn reading<a | e>(
+  checkout: Option<Checkout>,
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, fs.read[abs], abort.raise | e} =
+  match checkout { None -> body(), Some(c) -> over_shipping(shipping(c), body) }
+
+// --- Tests ------------------------------------------------------------------
+
+fn stated() -> Bytes =
+  b"import std.pkg (Workspace)\n\nfn workspace() -> Workspace = {\n  packages: [\"lib/store\"],\n  suites: [{ dir: \"examples\", proved: true }, { dir: \"tests/lang\", proved: false }],\n  fixtures: [\"tests/fixtures\"],\n  toolchain: Some({\n    std: \"lib/std\",\n    std_tests: \"tests/std\",\n    compiler: \"lib/compiler\",\n    cli: \"cli\",\n    entry: \"ply.main\",\n    cli_tests: \"tests/cli\",\n    runtime: \"ply-runtime\",\n  }),\n}\n"
+
+/// What `body` answers over a filesystem holding `files` below its root.
+fn over<a>(
+  files: List<{ path: String, body: Bytes }>,
+  body: () -> a / {fs.resolved[abs], fs.read_file[abs], abort.raise},
+) -> a / {abort.raise} = fs::on_mem[abs](mem_of(files), body).value
+
+test "the workspace is found at or above a directory, and none outside every one" {
+  let files = [
+    { path: "repo/ply.work", body: stated() },
+    { path: "repo/lib/std/a.ply", body: b"" },
+  ];
+  assert_eq(over(files, || root_of("/repo/lib/std")), Some("/repo"));
+  assert_eq(over(files, || root_of("/repo")), Some("/repo"));
+  assert_eq(over(files, || root_of("/elsewhere")), None)
+}
+
+test "a workspace that does not check is refused at its place, and one with no toolchain builds none" {
+  match over([{ path: "repo/ply.work", body: b"fn workspace() -> Int = 1" }], || read("/repo")) {
+    Ok(_) -> panic("an `Int` is no workspace"),
+    Err(u) -> {
+      assert_eq(u.diags.map(|d: Diag| d.code), [b"E0129"]);
+      assert_eq(u.places.map(|p: Place| p.path), ["/repo/ply.work"])
+    },
+  };
+  let bare = stated().split(b"  toolchain: Some(").get(0).concat(b"  toolchain: None,\n}\n");
+  match over([{ path: "repo/ply.work", body: bare }], || toolchain("/repo")) {
+    Ok(_) -> panic("a workspace with no toolchain names none"),
+    Err(u) -> assert_eq(u.diags.map(|d: Diag| d.code), [b"E0502"]),
+  };
+  assert_eq(over([{ path: "repo/ply.work", body: bare }], || checkout_holding("/repo/lib")), None)
+}
+
+test "a directory is in the part of the library its checkout places it below, and no other" {
+  let files = [{ path: "repo/ply.work", body: stated() }];
+  let part = |dir: String| over(files, || part_of(dir));
+  assert_eq(part("/repo/lib/std"), Some({ dir: "/repo/lib/std", prefix: "std" }));
+  assert_eq(part("/repo/lib/std/hash/"), Some({ dir: "/repo/lib/std", prefix: "std" }));
+  assert_eq(
+    part("/repo/lib/compiler/emit"),
+    Some({ dir: "/repo/lib/compiler", prefix: "compiler" }),
+  );
+  // A sibling whose name begins as a part's does is none of it.
+  assert_eq(part("/repo/lib/stdlib"), None);
+  assert_eq(part("/repo/cli"), None);
+  assert_eq(part("/elsewhere/lib/std"), None)
+}
+
+// The pack keeps the library's files below `std/` and the compiler's below `compiler/`, whatever
+// directories the checkout keeps them in.
+test "a checkout ships its library and compiler as the workspace places them, below the pack's roots" {
+  let tree = fs::mem_of([
+    { path: "repo/lib/std/a.ply", body: b"a" },
+    { path: "repo/lib/std/a/b.ply", body: b"b" },
+    { path: "repo/lib/std/a/words.txt", body: b"w" },
+    { path: "repo/lib/std/.ply-cache/kept", body: b"k" },
+    { path: "repo/lib/compiler/front.ply", body: b"f" },
+    { path: "repo/lib/compiler/emit/roots.ply", body: b"r" },
+    { path: "repo/lib/compiler/emit/notes.md", body: b"n" },
+  ]);
+  let checkout = {
+    root: "/repo",
+    parts: {
+      std: "lib/std",
+      std_tests: "tests/std",
+      compiler: "lib/compiler",
+      cli: "cli",
+      entry: "ply.main",
+      cli_tests: "tests/cli",
+      runtime: "ply-runtime",
+    },
+  };
+  let files: List<Shipping> = fs::on_mem[abs](tree, || shipping(checkout)).value;
+  assert_eq(
+    files.map(|f: Shipping| f.name ++ " " ++ f.path ++ " " ++ String::of_bytes(f.bytes)).sort(),
+    [
+      "compiler.emit.roots.ply compiler/emit/roots.ply r",
+      "compiler.front.ply compiler/front.ply f",
+      "std.a.b.ply std/a/b.ply b",
+      "std.a.ply std/a.ply a",
+      "std/a/words.txt std/a/words.txt w",
+    ],
+  )
+}
+
+fn two_files() -> List<Shipping> =
+  [
+    { name: "std.a.ply", path: "std/a.ply", bytes: b"pub fn a() -> Int = 1\n" },
+    { name: "std/a/data.txt", path: "std/a/data.txt", bytes: b"data" },
+  ]
+
+test "over a checkout's files, a ply lists theirs as it lists its own, and none of its own beside" {
+  let files = two_files();
+  let read = |name: String|
+    fs::on_mem[shipped](
+      fs::mem_of([{ path: "std.gone.ply", body: b"" }, { path: "stamps", body: b"s" }]),
+      || over_shipping(files, || fs.read_file[shipped](name)),
+    ).value;
+  assert_eq(
+    read("digests"),
+    Some(
+      Bytes::of_string(
+        "std.a.ply " ++ blake3(files.get(0).bytes).hex_of() ++ "\nstd/a/data.txt "
+          ++ blake3(files.get(1).bytes).hex_of()
+          ++ "\n",
+      ),
+    ),
+  );
+  assert_eq(read("std.a.ply"), Some(files.get(0).bytes));
+  assert_eq(read("std.gone.ply"), None);
+  assert_eq(read("stamps"), Some(b"s"))
+}

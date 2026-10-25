@@ -16,8 +16,9 @@ import env (env)
 import program (Timed, front_of, timed_uncached_over, program_view)
 import queried
 import report (Answer, ok_code, compile_error, refused, reported)
-import sources (Project, shipped_names)
-import work
+import sources (Project)
+import library
+import library (Shipping)
 import compiler.cc
 import compiler.cc (Toolchain, compilers, toolchain)
 import compiler.front.published (linked_of)
@@ -34,7 +35,7 @@ import compiler.store.kept (Record, kept_records, with_kept)
 import std.bin
 import std.bytes
 import std.fs
-import std.fs (fs, Entry, File)
+import std.fs (fs)
 import std.hash (blake3)
 import std.json (Json, Str, Bool, object)
 import std.list
@@ -85,114 +86,6 @@ fn nowhere(message: String) -> Diag =
 
 /// What a native program's objects compile at under `profile`.
 fn level_of(profile: String) -> String = if profile == "release" { "-O2" } else { "-O0" }
-
-// --- The checkout's shipped modules ---------------------------------------------------
-
-/// One file a shipped root holds, by the name it is read under there, and the path a pack keeps it
-/// under.
-pub type Shipping = { name: String, path: String, bytes: Bytes }
-
-/// Every file below `dir` but those in a hidden directory, a cache, by its path below it.
-fn files_below(
-  root: String,
-  dir: String,
-) -> List<{ rel: String, bytes: Bytes }> / {fs.read[abs], abort.raise} =
-  match fs.walk[abs](below_root(root ++ "/" ++ dir)) {
-    None -> [],
-    Some(entries) ->
-      entries.fold([], |acc: List<{ rel: String, bytes: Bytes }>, e: Entry|
-        match e.kind {
-          File -> {
-            let rel = e.path.slice(below_root(root ++ "/" ++ dir).len() + 1, e.path.len());
-            if rel.starts_with(".") || rel.contains("/.") { acc } else {
-              match fs.read_file[abs](e.path) {
-                Some(bytes) -> acc.push({ rel: rel, bytes: bytes }),
-                None -> acc,
-              }
-            }
-          },
-          _ -> acc,
-        }),
-  }
-
-/// The module a `.ply` file below a shipped root is, by its place there: `hash/legacy.ply` below
-/// the standard library is `std.hash.legacy`.
-fn module_at(prefix: String, rel: String) -> String / {abort.raise} =
-  prefix ++ "." ++ rel.slice(0, rel.len() - 4).replace("/", ".")
-
-/// The checkout's shipped modules and data, each as a shipped root names it and a pack keeps it,
-/// below the root the pack keeps the library's or the compiler's files under wherever the checkout
-/// keeps them: `std.hash.legacy.ply` for `hash/legacy.ply`, `std/<path>` for a data file, and
-/// `compiler.emit.roots.ply` for the compiler's `emit/roots.ply`. The compiler holds modules only.
-fn shipping(root: String, t: ToolchainParts) -> List<Shipping> / {fs.read[abs], abort.raise} = {
-  let std_files = files_below(root, t.std).map(|f: { rel: String, bytes: Bytes }| {
-    let path = native::std_root() ++ "/" ++ f.rel;
-    if f.rel.ends_with(".ply") {
-      { name: module_at("std", f.rel) ++ ".ply", path: path, bytes: f.bytes }
-    } else { { name: "std/" ++ f.rel, path: path, bytes: f.bytes } }
-  });
-  let compiler_files = files_below(root, t.compiler).fold(
-    [],
-    |acc: List<Shipping>, f: { rel: String, bytes: Bytes }|
-      if f.rel.ends_with(".ply") {
-        acc.push({
-          name: module_at("compiler", f.rel) ++ ".ply",
-          path: native::compiler_root() ++ "/" ++ f.rel,
-          bytes: f.bytes,
-        })
-      } else { acc },
-  );
-  std_files.concat(compiler_files)
-}
-
-fn module_names(files: List<Shipping>) -> List<String> / {abort.raise} =
-  files.fold([], |acc: List<String>, f: Shipping|
-    if f.name.ends_with(".ply") { acc.push(f.name.slice(0, f.name.len() - 4)) } else { acc })
-
-/// What `files` are as a binary lists the shipped files it carries (`digests`): each by its name, a
-/// space and the BLAKE3 digest of its bytes in hex, a line each, ascending.
-pub fn digests_of(files: List<Shipping>) -> Bytes / {abort.raise} = {
-  let lines = files.fold(Map::new(), |acc: Map<String, Bool>, f: Shipping|
-    acc.insert(f.name ++ " " ++ blake3(f.bytes).hex_of() ++ "\n", true));
-  Bytes::concat_all(lines.keys().map(Bytes::of_string))
-}
-
-/// `body` with the shipped modules as `files` hold them in place of this `ply`'s own: what a load of
-/// the checkout's compiler compiles it against. The files this `ply` lists of its own are `files`,
-/// so its packed answers stand as they are only where `files` are the very ones they were answered
-/// over, and are held to what they read otherwise.
-fn over_shipping<a | e>(
-  files: List<Shipping>,
-  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
-) -> a / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise | e} = {
-  let by_name = files.fold(Map::new(), |acc: Map<String, Bytes>, f: Shipping|
-    acc.insert(f.name, f.bytes));
-  let names = module_names(files);
-  let digests = digests_of(files);
-  handle {
-    body()
-  } with {
-    fs.list_dir[shipped](dir) -> if dir == "." {
-      match fs.list_dir[shipped](".") {
-        Some(own) ->
-          Some(own.filter(|n: String| !n.ends_with(".ply") && n != "std").concat(by_name.keys())),
-        None -> Some(by_name.keys()),
-      }
-    } else { fs.list_dir[shipped](dir) },
-    fs.read_file[shipped](name) -> match by_name.get(name) {
-      Some(bytes) -> Some(bytes),
-      // A module or data file the checkout lacks is not this `ply`'s own.
-      None -> if name == "digests" { Some(digests) }
-      else if name.ends_with(".ply") || name.starts_with("std/") { None }
-      else { fs.read_file[shipped](name) },
-    },
-    shipped.names() -> names,
-    shipped.module(name) -> match by_name.get(name ++ ".ply") {
-      Some(bytes) -> Some(bytes),
-      None -> by_name.get(name),
-    },
-  }
-}
 
 // --- Building -------------------------------------------------------------------------
 
@@ -464,7 +357,7 @@ fn builder_built(
   let path = toolchain.cache() ++ "/" ++ kept;
   if toolchain.holds(kept) { Ok({ path: path, taken: true }) } else {
     let started = time.elapsed_ms();
-    let t_load: Timed = over_shipping(files, ||
+    let t_load: Timed = library::over_shipping(files, ||
       timed_uncached_over([], builder_project(), started));
     match program_view(t_load.program) {
       None -> Err(t_load.program.diags),
@@ -778,11 +671,11 @@ pub fn run(
   flags: Flags,
 ) -> Answer / {Bootstraps, compilers.read[cc], env.pwd[sys], env.var[sys], shipped.definitions, env.bodies[sys], env.reused[sys], shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
   let s = style_of(flags);
-  match work::toolchain(checkout_of(flags)) {
+  match library::toolchain(checkout_of(flags)) {
     Err(unread) -> reported(s, "bootstrap", unread.diags, unread.places),
     Ok(parts) -> {
       let options = options_of(flags, parts);
-      let files = shipping(options.root, parts);
+      let files = library::shipping({ root: options.root, parts: parts });
       let phases = env.var[sys]("PLY_C_PHASES") != None;
       let built = match ((toolchain_for(options.profile), toolchain.scratch())) {
         (Err(diags), _) -> Err(diags),
@@ -821,6 +714,7 @@ test "a checkout named outside the working directory is the path it names" {
     inside: ".",
     absolute: "/src/ply",
     machine: "/src/ply",
+    part: "",
   };
   let options = handle {
     options_of({ ..no_flags(), paths: [elsewhere] }, placed_parts())
@@ -830,31 +724,6 @@ test "a checkout named outside the working directory is the path it names" {
   assert_eq(options.root, "/src/ply");
   assert_eq(options.library, "/src/ply/target/debug/libply_runtime.a");
   assert_eq(options.out, "/src/ply/target/debug/ply")
-}
-
-// The compiler's modules below its directory ship as its own do, so the compiler may keep a phase's
-// modules in a directory of their own.
-test "a checkout ships its library and compiler as the workspace places them, below the pack's roots" {
-  let tree = fs::mem_of([
-    { path: "repo/lib/std/a.ply", body: b"a" },
-    { path: "repo/lib/std/a/b.ply", body: b"b" },
-    { path: "repo/lib/std/a/words.txt", body: b"w" },
-    { path: "repo/lib/std/.ply-cache/kept", body: b"k" },
-    { path: "repo/lib/compiler/front.ply", body: b"f" },
-    { path: "repo/lib/compiler/emit/roots.ply", body: b"r" },
-    { path: "repo/lib/compiler/emit/notes.md", body: b"n" },
-  ]);
-  let files: List<Shipping> = fs::on_mem[abs](tree, || shipping("/repo", placed_parts())).value;
-  assert_eq(
-    files.map(|f: Shipping| f.name ++ " " ++ f.path ++ " " ++ String::of_bytes(f.bytes)).sort(),
-    [
-      "compiler.emit.roots.ply compiler/emit/roots.ply r",
-      "compiler.front.ply compiler/front.ply f",
-      "std.a.b.ply std/a/b.ply b",
-      "std.a.ply std/a.ply a",
-      "std/a/words.txt std/a/words.txt w",
-    ],
-  )
 }
 
 // The CI's first bootstrap writes below `target/stage1`, which no build made before it.
@@ -932,26 +801,4 @@ test "what was kept of a ply's answers reads back, and bytes that are not the wh
   assert_eq(unkept(kept.slice(0, kept.len() - 1)), None);
   assert_eq(unkept(kept.concat(b"x")), None);
   assert_eq(unkept(b"short"), None)
-}
-
-test "over a checkout's files, a ply lists theirs as it lists its own, and none of its own beside" {
-  let files = two_shipped();
-  let read = |name: String|
-    fs::on_mem[shipped](
-      fs::mem_of([{ path: "std.gone.ply", body: b"" }, { path: "stamps", body: b"s" }]),
-      || over_shipping(files, || fs.read_file[shipped](name)),
-    ).value;
-  assert_eq(
-    read("digests"),
-    Some(
-      Bytes::of_string(
-        "std.a.ply " ++ blake3(files.get(0).bytes).hex_of() ++ "\nstd/a/data.txt "
-          ++ blake3(files.get(1).bytes).hex_of()
-          ++ "\n",
-      ),
-    ),
-  );
-  assert_eq(read("std.a.ply"), Some(files.get(0).bytes));
-  assert_eq(read("std.gone.ply"), None);
-  assert_eq(read("stamps"), Some(b"s"))
 }
