@@ -101,11 +101,7 @@ fn digests_and_packings_are_the_builtins() {
     let mut ctx = context();
     let data: Vec<u8> = (0..4000u32).map(|i| (i * 7 % 251) as u8).collect();
     for b in [&b""[..], b"x", &data] {
-        for (name, builtin_of) in [
-            ("?blake3", Builtin::BytesBlake3),
-            ("?gzip", Builtin::BytesGzip),
-            ("?zstd", Builtin::BytesZstd),
-        ] {
+        for (name, builtin_of) in [("?gzip", Builtin::BytesGzip), ("?zstd", Builtin::BytesZstd)] {
             let want = bytes_of(builtin(builtin_of, vec![Value::bytes(b)]));
             assert_eq!(taken_over(&mut ctx, name, b), want, "{name}");
         }

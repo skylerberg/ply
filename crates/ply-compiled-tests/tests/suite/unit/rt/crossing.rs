@@ -331,19 +331,19 @@ fn called_encoded(c: *mut Ctx, index: Word, args: impl FnOnce(*mut Ctx)) {
 /// bytes cannot hold crosses beside them both ways.
 #[test]
 fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
-    let mut ctx = context_calling(&["Char::of_int", "Secret::is_empty", "Secret::of_string"]);
+    let mut ctx = context_calling(&["checked_neg", "Secret::verify", "Secret::of_string"]);
     let c: *mut Ctx = &mut ctx;
     unsafe {
         called_encoded(c, 0, |c| {
             native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            native::<N1>("?out_int")(c, 'é' as Word);
+            native::<N1>("?out_int")(c, 5);
         });
         assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 1);
         assert_eq!(
             native::<A2>("?in_name_is")(c, b"Some".as_ptr() as Word, 4),
             1
         );
-        assert_eq!(native::<A0>("?in_char")(c), 'é' as Word);
+        assert_eq!(native::<A0>("?in_int")(c), -5i64 as Word);
         native::<N0>("?lift_close")(c);
         called_encoded(c, 2, |c| {
             native::<N2>("?out_count")(c, tag::LIST as Word, 1);
@@ -352,8 +352,9 @@ fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
         let secret = native::<A0>("?in_handle")(c);
         native::<N0>("?lift_close")(c);
         called_encoded(c, 1, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
             native::<N1>("?out_handle")(c, secret);
+            text(c, "?out_str", b"hunter3");
         });
         assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
         native::<N0>("?lift_close")(c);
@@ -365,7 +366,7 @@ fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
 /// go before the builtin the lowering is read for runs.
 #[test]
 fn a_runtime_object_written_into_a_lowering_outlives_the_count_that_wrote_it() {
-    let mut ctx = context_calling(&["Secret::is_empty", "Secret::of_string"]);
+    let mut ctx = context_calling(&["Secret::verify", "Secret::of_string"]);
     let c: *mut Ctx = &mut ctx;
     unsafe {
         called_encoded(c, 1, |c| {
@@ -375,9 +376,10 @@ fn a_runtime_object_written_into_a_lowering_outlives_the_count_that_wrote_it() {
         let secret = native::<A0>("?in_handle")(c);
         native::<N0>("?lift_close")(c);
         called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
             native::<N1>("?out_handle")(c, secret);
             helper::<N1>("rt_handle_free")(c, secret);
+            text(c, "?out_str", b"hunter3");
         });
         assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
         native::<N0>("?lift_close")(c);
@@ -412,19 +414,18 @@ fn a_hold_written_into_a_lowering_reads_as_a_hold() {
 /// was called inside goes on where it was.
 #[test]
 fn a_builtin_called_encoded_that_raises_opens_nothing() {
-    let mut ctx = context_calling(&["Bytes::at"]);
+    let mut ctx = context_calling(&["panic"]);
     let outer = lowered(&mut ctx, false, |c| unsafe {
         native::<N2>("?out_count")(c, tag::LIST as Word, 2);
         native::<N1>("?out_int")(c, 1);
         called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-            text(c, "?out_bytes", b"ab");
-            native::<N1>("?out_int")(c, 7);
+            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+            text(c, "?out_str", b"no such file");
         });
         native::<N1>("?out_int")(c, 2);
     });
     let said = ctx.take_failure().expect("the builtin raised").message;
-    assert!(said.contains("`Bytes::at` index 7"), "{said}");
+    assert!(said.contains("no such file"), "{said}");
     assert_eq!(
         decode(&outer).unwrap(),
         Value::list(vec![Value::Int(1), Value::Int(2)])
@@ -434,7 +435,7 @@ fn a_builtin_called_encoded_that_raises_opens_nothing() {
 /// A builtin is called over a lowering of its arguments and nothing else.
 #[test]
 fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_context() {
-    let mut ctx = context_calling(&["Char::of_int"]);
+    let mut ctx = context_calling(&["checked_neg"]);
     unsafe { helper::<N1>("rt_builtin_encoded")(&mut ctx, 0) };
     let said = ctx.take_failure().expect("a diagnostic").message;
     assert!(said.contains("no lowering open"), "{said}");
