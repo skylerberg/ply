@@ -11,8 +11,8 @@ import compiler.emit.reps (SumCtor, Ctors, kind_of, laid_known, laid_inside, cto
 import compiler.emit.c (Width, Kind, KInt, KBool, KNum, KFloat, KDec, KWide, carried)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, Leaf, RSum,
                           RUnit, RSlice, RImm, Convention, Given, Owned, parts_of)
-import compiler.emit.layout (Laid, LSum, LRecord, LWords, FieldLaid, P, U, Always, Inline, Boxed,
-                             Nullary, SumLaid, words, register_words, raw, counts)
+import compiler.emit.layout (Laid, LSum, LRecord, LWords, LPlaced, FieldLaid, P, U, Always, Inline,
+                             Boxed, Nullary, SumLaid, words, register_words, raw, counts)
 import compiler.emit.lower.setting (Setting)
 
 /// How a value of `ty` is held in a body, and so how it crosses a call: `held_with` the setting's
@@ -20,14 +20,16 @@ import compiler.emit.lower.setting (Setting)
 pub fn held_as(s: Setting, ty: Type) -> Rep = held_with(s.ctors, ty)
 
 /// How a root whose parameters are of `params` and whose answer is of `answer` takes and answers
-/// them: each held as a body holds a value of its type, given, and the answer owned. A root is
-/// lowered to it and every call of the root is written to it, a root written for a type among them,
-/// so a call's head and its callee's are one.
+/// them: each held as a body holds a value of its type, given, and the answer owned, written where
+/// the caller says when it is a record lying in place. A root is lowered to it and every call of
+/// the root is written to it, a root written for a type among them, so a call's head and its
+/// callee's are one.
 pub fn typed_convention(ctors: Ctors, params: List<Type>, answer: Type) -> Convention =
   {
     params: params.map(|_: Type| Given),
     reps: params.map(|t: Type| held_with(ctors, t)),
     answer: held_with(ctors, answer),
+    destined: match laid_inside(ctors, answer) { Some(LPlaced(_)) -> true, _ -> false },
     answered: Owned,
   }
 
@@ -47,6 +49,8 @@ fn held_laid(ctors: Ctors, ty: Type, l: Laid) -> Rep =
     match l {
       LSum(x) -> RSum({ laid: x, cases: case_names(ctors, ty) }),
       LRecord(fs) -> RFlat(record_leaves(ctors, ty, fs)),
+      // Held as the word its header's address is, or its box's.
+      LPlaced(_) -> RWord,
       LWords(_) -> match slot_rep(kind_of(ty).kind) {
         RWord -> if counts(l) { RWord } else { RImm },
         r -> r,
@@ -69,6 +73,11 @@ pub fn laid_leaves(ctors: Ctors, ty: Type) -> Option<List<Leaf>> =
 /// holds as its leaves; none for a record held as its box, which lies there as a pointer to it.
 pub fn leaves_inside(ctors: Ctors, ty: Type) -> Option<List<Leaf>> =
   match held_with(ctors, ty) { RFlat(ls) -> Some(ls), _ -> None }
+
+/// Whether a value of `ty` lies in place inside another behind a header: a record too wide to be
+/// held as its leaves, which a read of it answers the header's address of.
+pub fn lies_placed(ctors: Ctors, ty: Type) -> Bool =
+  match laid_inside(ctors, ty) { Some(LPlaced(_)) -> true, _ -> false }
 
 /// The constructors of the declared sum `ty`, as the table names them, in their declared order.
 fn case_names(ctors: Ctors, ty: Type) -> List<Bytes> =
@@ -405,14 +414,24 @@ test "a record is held as its leaves in its words' order, a record it holds amon
 
 // A wider record copied whole at each read of it or of a field it holds would make a body's code
 // and frame grow as its fields times its reads.
-test "a record wider than a call's registers is a box, and lies inside whatever holds it as a pointer to it" {
+test "a record wider than a call's registers is a box, lies in place in a record holding it, and in a case as a pointer" {
   let s = setting_of(sums());
   assert_eq(held_as(s, segment()), RWord);
-  let holder = record([{ name: b"n", ty: named(b"Int") }, { name: b"s", ty: segment() }]);
-  assert_eq(held_as(s, holder), RFlat([{ name: b"n", rep: RInt }, { name: b"s", rep: RWord }]));
-  assert_eq(field_offsets(s, holder).get(b"s"), Some(1));
-  assert_eq(record_parts(s.ctors, holder).map(|p: RecordPart| p.rep), [RInt, RWord]);
-  // So does a case's argument: `Some` of one is a word, its payload the pointer.
+  // A holder that fits the registers with it a pointer holds the pointer and is held as its fields;
+  // one wider anyway is a box too, the record's header at the field's word and its words after it.
+  let small = record([{ name: b"n", ty: named(b"Int") }, { name: b"s", ty: segment() }]);
+  assert(held_as(s, small) != RWord, None);
+  let int = named(b"Int");
+  let holder = record([
+    { name: b"a", ty: int },
+    { name: b"b", ty: int },
+    { name: b"c", ty: int },
+    { name: b"n", ty: int },
+    { name: b"s", ty: segment() },
+  ]);
+  assert_eq(held_as(s, holder), RWord);
+  assert(lies_placed(s.ctors, segment()), None);
+  // A case's argument holds it as its box: `Some` of one is a word, its payload the pointer.
   assert_eq(case_parts(s.ctors, option_type(segment()), 1).map(|p: CasePart| p.rep), [RWord]);
   assert_eq(values_of(held_as(s, option_type(segment()))), [RWord])
 }

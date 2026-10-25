@@ -8,12 +8,12 @@
 import compiler.syntax.parsing (Span, span_between)
 import compiler.check.types (Type, TyCon)
 import std.bytes (ascii_of_int)
-import compiler.emit.c (tick_line)
+import compiler.emit.c (tick_line, int_lit)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry)
-import compiler.emit.reps (Ctors, no_ctors)
-import compiler.emit.layout (Boxed, tag_bits, inline_word_at)
+import compiler.emit.reps (Ctors, no_ctors, laid_known)
+import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
 import compiler.emit.release (drop_of)
 import compiler.emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt,
@@ -24,7 +24,7 @@ import compiler.emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, V
                           Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset,
                           Free, Opened, Block, Fn, Member, Rooted, Plain, Kept, Crossing, Given,
                           Owned, Lambda, Closure, Uses, NoArm, Spine, LastOf, Walked, Unsettled,
-                          Data, no_links, falls_through, var_said, laid_made)
+                          Data, no_links, falls_through, var_said, laid_made, PPlace)
 import compiler.emit.print.text (Under, Place, Printing, Printed, printing, function_body, line,
                                  text, pieces, pad, named, name_of, arg_text, assigned, label,
                                  check, zero, failing_return, site, slot, part_names, part_name,
@@ -33,8 +33,9 @@ import compiler.emit.print.counts (exit_of, block_opened, block_closed, count_pr
                                    last_of, updated)
 import compiler.emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, gathered,
                                  statics, join_declared, set_parts, returned, head_types,
-                                 head_params, params_opened)
+                                 head_params, params_opened, laid_dups, placed_write, laid_counted)
 import compiler.emit.print.worded (worded)
+import compiler.emit.print.placing (placing_of)
 import compiler.emit.print.fuel (fuel_head, crossed_head)
 import compiler.emit.print.prims (literal, prim)
 import compiler.emit.print.containers (contained, container_op)
@@ -258,6 +259,25 @@ fn group_printed(
   }
 }
 
+/// The C a destined root answering `a` runs before it returns it: where its caller gave a
+/// destination, the record moved there and the destination answered; nothing where `a` was
+/// written there already.
+fn moved_to_destination(pr: Printing, a: Arg) -> { pr: Printing, text: Bytes } / {abort.raise} =
+  match a {
+    AVar(x) -> if !pr.placing.destined || pr.placing.answers.contains(x.id) {
+      { pr: pr, text: b"" }
+    } else {
+      match laid_known(pr.ctors, x.ty) {
+        Some(l) -> {
+          let moved = placed_write(pr, b"*(Word *)d", b"ply_words(d)", name_of(pr, x), l);
+          { pr: moved.pr, text: Bytes::concat_all([b"  if (d) { ", moved.text, b" return d; }\n"]) }
+        },
+        None -> { pr: pr, text: b"" },
+      }
+    },
+    _ -> { pr: pr, text: b"" },
+  }
+
 /// `v`, held as several values, bound in a group's arm from the word `word`, which it takes.
 fn parted(pr: Printing, v: Var, word: Bytes) -> Printing = {
   let n = named(pr, v);
@@ -305,7 +325,8 @@ fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing
 /// `f`'s body, a body of the root named `symbol`: the frame record its sites link, its parameters
 /// opened, its restart label where a self call restarts it, and the tails of what it declares at
 /// its end.
-fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} = {
+fn body_printed(symbol: Bytes, f: Fn, given: Printing) -> Printing / {abort.raise} = {
+  let pr = { ..given, placing: placing_of(f) };
   let u = {
     symbol: symbol,
     base: f.base,
@@ -327,7 +348,8 @@ fn body_printed(symbol: Bytes, f: Fn, pr: Printing) -> Printing / {abort.raise} 
   let looped = if restarts(f.body) {
     text(viewed, Bytes::concat_all([b"  ply_loop: ", ticked, b"\n"]))
   } else { viewed };
-  let done = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let closed = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let done = { ..closed, placing: given.placing };
   let record = record_declared(done);
   if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
 }
@@ -548,7 +570,11 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
                 let r = returned(acc, depth, a);
                 let leaving = if u.leaving == b"" { b"" }
                 else { Bytes::concat_all([b"  ", u.leaving, b"\n"]) };
-                text(r.pr, Bytes::concat_all([leaving, b"  return ", r.value, b";\n"]))
+                let moved = moved_to_destination(r.pr, a);
+                text(
+                  moved.pr,
+                  Bytes::concat_all([leaving, moved.text, b"  return ", r.value, b";\n"]),
+                )
               },
             },
             Restart(args) -> match u.group {
@@ -657,8 +683,52 @@ fn taken(
           word.concat(b" = 0;"),
         )
       },
-      None -> taken_from_block(p, pr, v, t),
+      None -> match t.path {
+        PPlace(at) -> taken_from_place(p, pr, v, t.of, at),
+        _ -> taken_from_block(p, pr, v, t),
+      },
     },
+  }
+
+/// `v`, the record lying in place at word `at` of the box `of` is, moved out into a box of its
+/// own: where `of` is held only here its words move, zeroes left in their place, which no release
+/// reads; otherwise they are copied, each counted word counted once more.
+fn taken_from_place(p: Place, pr: Printing, v: Var, of: Var, at: Int) -> Printing / {abort.raise} =
+  match laid_known(pr.ctors, v.ty) {
+    Some(l) -> {
+      let m = words(l);
+      let block = name_of(pr, of);
+      let n = named(pr, v);
+      let place = Bytes::concat_all([b"&", slot(block, at + 1)]);
+      let bytes = int_lit(8 * m);
+      let counted = laid_counted(n.pr, l, Bytes::concat_all([b"ply_words(", n.name, b")"]));
+      line(
+        counted.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          n.name,
+          b" = rt_alloc_bytes_p(ctx, ",
+          int_lit(header_bytes() + 8 * m),
+          b"); memcpy(ply_words(",
+          n.name,
+          b"), ",
+          place,
+          b", ",
+          bytes,
+          b"); if (ply_obj(",
+          block,
+          b")->rc == 1) memset(",
+          place,
+          b", 0, ",
+          bytes,
+          b"); else { ",
+          counted.text,
+          b" }",
+        ]),
+      )
+    },
+    None -> unprinted(Spine, b"a record taken out of its place at no layout", var_said(v)),
   }
 
 /// `v` taken out of the block a word or a case's box holds, which leaves 0, which no release reads,
@@ -792,7 +862,13 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     key: Named(b"m.count"),
     kind: Rooted,
     params: [n, acc],
-    conv: { params: [Given, Given], reps: [RInt, RInt], answer: RInt, answered: Owned },
+    conv: {
+      params: [Given, Given],
+      reps: [RInt, RInt],
+      answer: RInt,
+      destined: false,
+      answered: Owned,
+    },
     answer_ty: TyCon({ name: b"Int", args: [] }),
     body: [
       let_of(c, Prim({ op: b"eq", on: RInt, args: [AVar(n), AInt(0)] }), span_between(0, 0)),
@@ -854,7 +930,7 @@ fn answering(answer: Var, body: Block) -> Bytes / {abort.raise} =
         key: Named(b"m.guarded"),
         kind: Rooted,
         params: [],
-        conv: { params: [], reps: [], answer: RWord, answered: Owned },
+        conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
         answer_ty: answer.ty,
         body: body.push(Return(AVar(answer))),
         lambdas: [],
@@ -924,14 +1000,14 @@ test "a tail group is one function switching on its member's place, each arm ope
   let which = { id: 0, ty: int, rep: RInt };
   let n = { id: 1, ty: int, rep: RInt };
   let m = { id: 2, ty: int, rep: RInt };
-  let conv = { params: [Given], reps: [RInt], answer: RInt, answered: Owned };
+  let conv = { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned };
   let text = spelled(
     printed_fn(
       {
         key: Named(b"m.even"),
         kind: Rooted,
         params: [which],
-        conv: { params: [Given], reps: [RInt], answer: RWord, answered: Owned },
+        conv: { params: [Given], reps: [RInt], answer: RWord, destined: false, answered: Owned },
         answer_ty: m.ty,
         body: [
           Case({
@@ -989,7 +1065,7 @@ test "a closure's function follows its root's, and its body numbers its temporar
     key: Named(b"m.outer"),
     kind: Rooted,
     params: [x],
-    conv: { params: [Given], reps: [RInt], answer: RInt, answered: Owned },
+    conv: { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned },
     answer_ty: int,
     body: [Decl(j), Assign({ var: j, arg: AVar(x) }), Return(AVar(j))],
     lambdas: [],
@@ -1021,7 +1097,7 @@ test "a plain root counts no fuel or ticks; a drop root nests through the releas
       key: keys::written(op, ty, b"m"),
       kind: Plain,
       params: [o],
-      conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
+      conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
       answer_ty: ty,
       body: [If({ cond: AVar(o), then: [Restart([AVar(o)])], otherwise: [Return(AZero(RWord))] })],
       lambdas: [],
@@ -1073,6 +1149,7 @@ fn int_root(params: List<Var>, body: Block) -> Fn =
       params: params.map(|_: Var| Given),
       reps: params.map(|v: Var| v.rep),
       answer: RInt,
+      destined: false,
       answered: Owned,
     },
     answer_ty: TyCon({ name: b"Int", args: [] }),
@@ -1140,7 +1217,7 @@ test "a field taken moves out of a block held only here, in place in another or 
   let field = word_var(1);
   let f = {
     ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
-    conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
+    conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
   };
   let text = spelled(printed_fn(f, no_ctors()).pieces);
   // Its slot is emptied where the block is held only here, and the field counted once more else.
@@ -1172,6 +1249,7 @@ fn called(args: List<Arg>) -> Val =
       params: args.map(|_: Arg| Given),
       reps: args.map(|_: Arg| RWord),
       answer: RWord,
+      destined: false,
       answered: Owned,
     },
     stops: false,
@@ -1191,6 +1269,7 @@ fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
           params: params.map(|_: Var| Given),
           reps: params.map(|v: Var| v.rep),
           answer: RWord,
+          destined: false,
           answered: Owned,
         },
       },

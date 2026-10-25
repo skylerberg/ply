@@ -12,7 +12,8 @@ import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Fiel
 import compiler.emit.layout
 import compiler.emit.layout (WordClass, P, C, R, S, U, LWords, LSum, SumLaid, CaseLaid, CaseArgs,
                              Payload, Nullary, Inline, Boxed, WordForm, Itself, Bits, RuntimeBox,
-                             Box, record_laid, sum_laid, words, classes, raw, flat_words)
+                             Box, record_laid, sum_laid, words, classes, raw, inside, by_pointer,
+                             flat_words)
 import compiler.emit.typing (Typed, Filings, unknown_type)
 import compiler.front.rows (CtorRow)
 import std.list
@@ -744,32 +745,54 @@ fn laid_within(ctors: Ctors, ty: Type, cut: List<Bytes>, depth: Int) -> Option<l
     }
   }
 
-/// A record of fields `fs` laid, each as it lies inside a value (`inside_within`).
+/// A record of fields `fs` laid: where it fits a call's registers with each wide record among them
+/// a pointer to its box, so (`pointed_within`), and so held as its fields; else each as it lies
+/// inside a value (`inside_within`), a wide record in place, since the record is a box anyway.
 fn fields_laid(
   ctors: Ctors,
   fs: List<Field>,
   cut: List<Bytes>,
   depth: Int,
 ) -> Option<layout::Laid> =
-  all_laid(fs.map(|f: Field| inside_within(ctors, f.ty, cut, depth - 1))).map(record_laid)
+  match all_laid(fs.map(|f: Field| pointed_within(ctors, f.ty, cut, depth - 1))) {
+    Some(ps) -> if flat_words(words(record_laid(ps))) { Some(record_laid(ps)) } else {
+      all_laid(fs.map(|f: Field| inside_within(ctors, f.ty, cut, depth - 1))).map(record_laid)
+    },
+    None -> None,
+  }
 
 /// How a value of `ty` lies inside another, as an array's element: `laid_known` as it lies there.
 pub fn laid_inside(ctors: Ctors, ty: Type) -> Option<layout::Laid> =
   inside_within(ctors, ty, [], nesting())
 
-/// `laid_within` as the value lies inside another (`layout.inside`). A record's fields are laid
-/// only until they pass a call's registers, past which it lies as a pointer to its box however its
-/// other fields lay, so no type is followed below a record held as its box.
+/// `laid_within` as the value lies inside another (`layout.inside`): a record wider than a call's
+/// registers in place behind a header.
 fn inside_within(ctors: Ctors, ty: Type, cut: List<Bytes>, depth: Int) -> Option<layout::Laid> =
   if depth <= 0 { None } else {
     match ty {
-      TyRecord(fs) -> record_inside(ctors, fs, cut, depth),
-      TyNominal(x) -> record_inside(ctors, x.fields, cut, depth),
+      TyRecord(fs) -> fields_laid(ctors, fs, cut, depth).map(inside),
+      TyNominal(x) -> fields_laid(ctors, x.fields, cut, depth).map(inside),
       _ -> laid_within(ctors, ty, cut, depth),
     }
   }
 
-fn record_inside(
+/// How a value of `ty` lies as a case's argument or a container's element (`layout.by_pointer`): a
+/// record wider than a call's registers as its box.
+pub fn laid_by_pointer(ctors: Ctors, ty: Type) -> Option<layout::Laid> =
+  pointed_within(ctors, ty, [], nesting())
+
+/// `laid_within` as `laid_by_pointer` lays it: a record's fields past the registers leave it one
+/// pointer however a type variable lays the rest.
+fn pointed_within(ctors: Ctors, ty: Type, cut: List<Bytes>, depth: Int) -> Option<layout::Laid> =
+  if depth <= 0 { None } else {
+    match ty {
+      TyRecord(fs) -> record_pointed(ctors, fs, cut, depth),
+      TyNominal(x) -> record_pointed(ctors, x.fields, cut, depth),
+      _ -> laid_within(ctors, ty, cut, depth),
+    }
+  }
+
+fn record_pointed(
   ctors: Ctors,
   fs: List<Field>,
   cut: List<Bytes>,
@@ -779,15 +802,13 @@ fn record_inside(
     { laid: [], words: 0, open: false },
     |acc: { laid: List<layout::Laid>, words: Int, open: Bool }, f: Field|
       if !flat_words(acc.words) { acc } else {
-        match inside_within(ctors, f.ty, cut, depth - 1) {
+        match pointed_within(ctors, f.ty, cut, depth - 1) {
           None -> { ..acc, open: true },
           Some(l) -> { ..acc, laid: acc.laid.push(l), words: acc.words + words(l) },
         }
       },
   );
-  if !flat_words(r.words) { Some(LWords([P])) }
-  else if r.open { None }
-  else { Some(record_laid(r.laid)) }
+  if r.open && flat_words(r.words) { None } else { Some(by_pointer(record_laid(r.laid))) }
 }
 
 /// Each of `ls`, where every one is laid.
@@ -821,7 +842,7 @@ fn sum_within(
         let args = if boxed && !open { Some(LWords([])) } else {
           all_laid(
             ctor_fields_at(k, c.args).map(|t: Type|
-              inside_within(ctors, t, if boxed { group } else { cut }, depth)),
+              pointed_within(ctors, t, if boxed { group } else { cut }, depth)),
           ).map(
             record_laid,
           )
@@ -1242,21 +1263,25 @@ test "a table with its sums laid once lays every type as one that lays them wher
   })
 }
 
-test "a record past the registers lies inside another as a pointer, laid no further, open fields or not" {
+test "a record past the registers lies in place inside another, and in a case as a pointer, open fields or not" {
   let t = sample_ctors();
   let ints = |n: Int|
     range(0, n).map(|i: Int|
       { name: b"f".concat(Bytes::of_string(i.to_string())), ty: int_type() });
   let wide = TyRecord(ints(5).push({ name: b"g", ty: TyVar(0) }));
   let narrow = TyRecord(ints(2).push({ name: b"g", ty: TyVar(0) }));
-  assert_eq(laid_inside(t, wide), Some(LWords([P])));
+  // In place, its holder waits for the variable to be settled: a holder wide anyway lays it so.
+  assert_eq(laid_inside(t, wide), None);
   assert_eq(laid_known(t, wide), None);
   assert_eq(laid_inside(t, narrow), None);
-  // A record holding it lays it as that pointer.
+  assert_eq(laid_known(t, TyRecord([{ name: b"r", ty: wide }].concat(ints(4)))), None);
+  // A holder that fits the registers with it a pointer holds its box, whatever the variable lays.
   assert_eq(
-    laid_known(t, TyRecord([{ name: b"r", ty: wide }, { name: b"x", ty: int_type() }])),
-    Some(record_laid([LWords([P]), LWords([raw()])])),
+    laid_known(t, TyRecord([{ name: b"r", ty: wide }, { name: b"x", ty: int_type() }])) != None,
+    true,
   );
+  // A case holds it as its box, which is one word whatever the variable lays.
+  assert_eq(laid_known(t, option_type(wide)) != None, true);
   // A closed record lies inside another as `layout.inside` lays it.
   let closed = TyRecord(ints(6));
   assert_eq(laid_inside(t, closed), Some(layout::inside(laid(t, closed))));

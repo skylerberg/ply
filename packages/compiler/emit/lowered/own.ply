@@ -3,8 +3,9 @@
 import std.bytes (ascii_of_int)
 import std.pace (Measure, outgrown)
 import compiler.emit.tir (Inst, Block, Let, Do, Make, Inc, Reset, Free, If, Case, Match, Loop,
-                          Handle, Fn, Val, Get, Op, OStrings, OContainer, PPayload, RInt, RAddr)
-import compiler.emit.tir.containers (Taken)
+                          Handle, Fn, Val, Get, Take, Op, OStrings, OContainer, PPayload, PPlace,
+                          RInt, RAddr, MRecord, FieldMade, Built, Updated)
+import compiler.emit.tir.containers (Taken, Retained)
 import compiler.emit.compare (program_of, formed, checked, printed_by_form)
 import compiler.emit.own (owned)
 import compiler.emit.verify (verified)
@@ -246,6 +247,129 @@ test "a field read out of a payload read out of a parameter's field keeps the pa
   }
 }
 
+/// Bodies reading records that lie in place in the record holding them: one only reads them, one
+/// hands them on, one keeps one past the update that consumes its holder.
+fn places() -> Bytes =
+  Bytes::concat_all([
+    b"type Five = { a: Int, b: Int, c: Int, d: Int, name: String }\n",
+    b"type Holder = { id: Int, at: Int, to: Int, five: Five, other: Five }\n",
+    b"type Outer = { h: Holder, k: Int, a: Int, b: Int, c: Int }\n",
+    b"fn nudged(h: Holder, n: Int) -> Holder = { ..h, five: { ..h.five, a: n } }\n",
+    b"fn deeper(o: Outer, n: Int) -> Outer = { ..o, h: { ..o.h, five: { ..o.h.five, a: n } } }\n",
+    b"fn reads(h: Holder) -> Int = h.five.a + h.other.d\n",
+    b"fn hands(h: Holder) -> List<Five> = [h.five, h.other]\n",
+    b"fn outlives(h: Holder, n: Int) -> Five = { let f = h.five; let g = { ..h, id: n }; if g.id > f.a { f } else { g.other } }\n",
+    b"fn constant() -> Holder = { id: 1, at: 0, to: 0, five: { a: 1, b: 2, c: 3, d: 4, name: \"x\" }, other: { a: 5, b: 6, c: 7, d: 8, name: \"y\" } }\n",
+    b"fn constant_case() -> Option<Five> = Some({ a: 1, b: 2, c: 3, d: 4, name: \"x\" })\n",
+    b"fn wrapped(h: Holder) -> Option<Five> = Some(h.five)\n",
+    b"fn erred(h: Holder) -> Result<Int, Five> = Err(h.other)\n",
+    b"fn rewrapped(h: Holder) -> { a: Five, b: Five, n: Int, at: Int, to: Int } = { a: h.five, b: h.other, n: h.id, at: h.at, to: h.to }\n",
+    b"fn moved_on(h: Holder) -> Holder = { ..h, five: h.other }\n",
+    b"fn nested(n: Int) -> Holder = { id: n, at: 0, to: 0, five: { a: n, b: 1, c: 2, d: 3, name: \"x\" }, other: { a: 1, b: n, c: 3, d: 4, name: \"y\" } }\n",
+  ])
+
+test "a record literal holding record literals is one box, each inner record built in its place" {
+  match program_of(places()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match checked(p, b"nested") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(f) -> {
+        let makes = insts(f.body).fold([], |acc: List<List<FieldMade>>, i: Inst|
+          match i {
+            Let(l) -> match l.val {
+              Make(m) -> match m.made { MRecord(shape) -> acc.push(shape), _ -> acc },
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        assert_eq(makes.len(), 1);
+        assert_eq(
+          makes.get(0).filter(|s: FieldMade| match s { Built(_) -> true, _ -> false }).len(),
+          2,
+        )
+      },
+    },
+  }
+}
+
+test "an update of a record in place inside an update of its holder is one update, writing at its word" {
+  match program_of(places()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [b"nudged", b"deeper"].map(|n: Bytes|
+          match checked(p, n) {
+            Ok(f) ->
+              Ok(
+                insts(f.body).fold(
+                  { updates: 0, places: 0 },
+                  |acc: { updates: Int, places: Int }, i: Inst|
+                    match i {
+                      Let(l) -> match l.val {
+                        Updated(_) -> { ..acc, updates: acc.updates + 1 },
+                        Get(g) -> match g.path {
+                          PPlace(_) -> { ..acc, places: acc.places + 1 },
+                          _ -> acc,
+                        },
+                        _ -> acc,
+                      },
+                      _ -> acc,
+                    },
+                ),
+              ),
+            Err(why) -> Err(why),
+          }),
+        [Ok({ updates: 1, places: 0 }), Ok({ updates: 1, places: 0 })],
+      ),
+  }
+}
+
+/// How many records read where they lie a body keeps, and how many it takes out of a box it holds.
+fn keeps(b: Block) -> { kept: Int, taken: Int } =
+  insts(b).fold({ kept: 0, taken: 0 }, |acc: { kept: Int, taken: Int }, i: Inst|
+    match i {
+      Let(l) -> match l.val {
+        Op(o) -> if o.op == OContainer(Retained) { { ..acc, kept: acc.kept + 1 } } else { acc },
+        Take(t) -> match t.path { PPlace(_) -> { ..acc, taken: acc.taken + 1 }, _ -> acc },
+        _ -> acc,
+      },
+      _ -> acc,
+    })
+
+test "a record read where it lies moves out of a box held only here, and is kept only where a count of it is taken" {
+  match program_of(places()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [
+          b"reads",
+          b"hands",
+          b"outlives",
+          b"constant",
+          b"constant_case",
+          b"wrapped",
+          b"erred",
+          b"rewrapped",
+          b"moved_on",
+        ].map(|n: Bytes| match checked(p, n) { Ok(f) -> Ok(keeps(f.body)), Err(why) -> Err(why) }),
+        // Out of a box held only here a record moves; read out of one held elsewhere it is kept. A
+        // case holding a record read where it lies takes it: no sum word points into a place.
+        [
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 2 }),
+          Ok({ kept: 1, taken: 1 }),
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 1 }),
+          Ok({ kept: 0, taken: 1 }),
+          // A record made of records read where they lie copies each in: none kept, none taken.
+          Ok({ kept: 0, taken: 0 }),
+          Ok({ kept: 0, taken: 0 }),
+        ],
+      ),
+  }
+}
+
 /// Buffers appended to through a record or a constructor this body holds alone, as `emit.cases`'
 /// buffer test writes them.
 fn buffers() -> Bytes =
@@ -435,5 +559,46 @@ test "bytes read through an address, operated on and taken from a crossing pass 
         [],
       )
     },
+  }
+}
+
+/// Bodies reading and keeping records in place out of options, records and captures.
+fn placed_shapes() -> Bytes =
+  Bytes::concat_all([
+    b"type Five = { a: Int, b: Int, c: Int, d: Int, name: String }\n",
+    b"type Holder = { id: Int, at: Int, to: Int, five: Five, other: Five }\n",
+    b"type Ran = { ok: Bool, run: Holder }\n",
+    b"fn opt_read(o: Option<Five>) -> Int = match o { Some(f) -> f.a, None -> 0 }\n",
+    b"fn opt_keep(o: Option<Five>) -> List<Five> = match o { Some(f) -> [f], None -> [] }\n",
+    b"fn opt_update(o: Option<Five>) -> Option<Five> = match o { Some(f) -> Some({ ..f, a: 1 }), None -> None }\n",
+    b"fn opt_two(o: Option<Five>, p: Option<Five>, z: Five) -> Five = match o { Some(f) -> match p { Some(g) -> { ..g, a: max(f.a, g.a) }, None -> f }, None -> z }\n",
+    b"fn chain(h: Holder) -> Holder = { let g = { ..h, id: 2 }; { ..g, five: { ..g.five, a: h.five.a } } }\n",
+    b"fn captured(h: Holder) -> List<Int> = [1, 2].map(|x: Int| x + h.five.a)\n",
+    b"fn folded_holder(xs: List<Int>, h: Holder) -> Holder = xs.fold(h, |s: Holder, x: Int| { ..s, id: s.id + x })\n",
+    b"fn nested_update(t: Ran) -> Holder = { ..t.run, id: t.run.id + 1 }\n",
+    b"fn given_on(t: Ran) -> List<Holder> = [t.run, { ..t.run, id: 0 }]\n",
+    b"fn kept_both(o: Option<Holder>, t: Ran) -> Holder = match o { Some(r) -> if t.ok { { ..t.run, five: r.five } } else { r }, None -> t.run }\n",
+  ])
+
+test "records in place read, kept and updated out of options, records and captures pass the check" {
+  match program_of(placed_shapes()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) ->
+      assert_eq(
+        [
+          b"opt_read",
+          b"opt_keep",
+          b"opt_update",
+          b"opt_two",
+          b"chain",
+          b"captured",
+          b"folded_holder",
+          b"nested_update",
+          b"given_on",
+          b"kept_both",
+        ].fold([], |acc: List<Bytes>, n: Bytes|
+          match checked(p, n) { Ok(_) -> acc, Err(why) -> acc.push(n.concat(b": ").concat(why)) }),
+        [],
+      ),
   }
 }

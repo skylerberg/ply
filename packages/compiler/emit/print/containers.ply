@@ -3,7 +3,8 @@
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, TyCon, TyFn, TyRecord, Field, record_fields, spelled_type)
-import compiler.emit.reps (laid, laid_inside, no_ctors)
+import compiler.emit.reps (laid, laid_by_pointer, laid_known, no_ctors)
+import compiler.emit.c (int_lit)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListRoot, TailAt,
                              NodeLen, LeafAt, KidAt, TailPush, TailSet, LeafSet, RootSwap, KidSwap,
@@ -25,12 +26,13 @@ import compiler.emit.layout (BranchLaid, branch_laid, refusal)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew,
                                      ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
                                      ColumnsOfList, ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest,
-                                     LeafOf, Room, Position, Taken, Element)
+                                     LeafOf, Room, Position, Taken, Retained, Element)
 import compiler.emit.print.text (Printing, Place, printing, line, pad, pieces, temp, named, name_of,
-                                 arg_text, assigned, site, check, zero, part_names, unprinted)
+                                 arg_text, assigned, site, check, zero, part_names, unprinted, slot)
 import compiler.emit.lower.held (leaf_span, leaves_within, leaf_values, values_of, held_with)
 import compiler.emit.print.made (c_type, c_types, as_word, word_as, word_parts, head_types,
-                                 arg_parts, words_laid, parts_read, values_read)
+                                 arg_parts, words_laid, parts_read, values_read, laid_dups,
+                                 laid_counted)
 import compiler.emit.print.counts (Said, released, duped, let_go_of, dup_of)
 import compiler.emit.print.lists (item_read, leaf_read, rest_made, list_made, room_made, node_made,
                                   node_words_made, framed_list_made)
@@ -54,7 +56,7 @@ pub fn contained(
         let n = named(pr, v);
         let items = m.args.map(|a: Arg| words_laid(arg_parts(pr, a), values_of(rep_of_arg(a))));
         // An empty list's room is its type's items too; one of no known layout holds none ever.
-        let stride = match laid_inside(pr.ctors, held_type(v.ty)) {
+        let stride = match laid_by_pointer(pr.ctors, held_type(v.ty)) {
           Some(l) -> max(1, words(l)),
           None -> if m.args.len() == 0 { 1 } else { item_element(pr, held_type(v.ty)).stride },
         };
@@ -64,6 +66,48 @@ pub fn contained(
       None -> unprinted(Containers, b"a list made that nothing holds", made_said(m.made)),
     },
     other -> unprinted(Containers, b"a value made other than a list", made_said(other)),
+  }
+
+/// `v`, the record held as the word `object`, with a count of its own: a record in place, whose
+/// header holds the count no code takes, copied into a box of its own, its words copied from past
+/// its header and each counted word counted once more; a box counted once more.
+fn retained_printed(p: Place, pr: Printing, v: Var, object: Bytes) -> Printing / {abort.raise} =
+  match laid_known(pr.ctors, v.ty) {
+    Some(l) -> {
+      let m = words(l);
+      let n = named(pr, v);
+      let counted = laid_counted(n.pr, l, Bytes::concat_all([b"ply_words(", n.name, b")"]));
+      line(
+        counted.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          n.name,
+          b"; if (ply_obj(",
+          object,
+          b")->rc == PLY_RC_FRAME) { ",
+          n.name,
+          b" = rt_alloc_bytes_p(ctx, ",
+          int_lit(header_bytes() + 8 * m),
+          b"); memcpy(ply_words(",
+          n.name,
+          b"), ply_words(",
+          object,
+          b"), ",
+          int_lit(8 * m),
+          b"); ",
+          counted.text,
+          b" } else { ",
+          call_text(dup_fn(), [object]),
+          b"; ",
+          n.name,
+          b" = ",
+          object,
+          b"; }",
+        ]),
+      )
+    },
+    None -> unprinted(Containers, b"a record kept at no layout", var_said(v)),
   }
 
 /// Operation `op` on a container's cells over `args`.
@@ -103,6 +147,7 @@ pub fn container_op(
           Bytes::concat_all([b"(uint64_t)", index, b" < (uint64_t)", array_len(object)]),
         ),
       Laid(i) -> laid_printed(p, pr, v, i, args),
+      Retained -> retained_printed(p, pr, v, object),
       ArrayNew(e) -> array_new(p, pr, v, e, args),
       ArraySet(e) -> array_set(p, pr, v, e, args),
       ArrayOfList(e) -> array_of_list(p, pr, v, e, args),
@@ -166,10 +211,10 @@ pub fn container_op(
   }
 }
 
-/// How an item of type `ty` lies in a list's node: as any holder lays it (`reps.laid_inside`), a
+/// How an item of type `ty` lies in a list's node: as a container lays it (`reps.laid_by_pointer`), a
 /// word apart at least.
 pub fn item_element(pr: Printing, ty: Type) -> Element / {abort.raise} =
-  match laid_inside(pr.ctors, ty) {
+  match laid_by_pointer(pr.ctors, ty) {
     Some(l) -> { laid: l, stride: max(1, words(l)) },
     None ->
       unprinted(Containers, b"an item of a layout a type variable leaves open", spelled_type(ty)),
@@ -927,7 +972,13 @@ fn copy_called(pr: Printing, a: Bytes, ty: Type) -> { pr: Printing, out: List<Pi
         calls: pr.calls.push(k),
         expects: pr.expects.push({
           callee: CallAt(pr.calls.len()),
-          head: head_types({ params: [Given], reps: [RWord], answer: RWord, answered: Owned }),
+          head: head_types({
+            params: [Given],
+            reps: [RWord],
+            answer: RWord,
+            destined: false,
+            answered: Owned,
+          }),
         }),
       }
     },

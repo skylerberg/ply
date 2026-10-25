@@ -16,7 +16,7 @@ import compiler.emit.tir (FieldSet, Rep, RWord, RInt, RBool, RNum, RFlat, RSlice
                           answered, unpacks, fails, used_as, rep_of_arg, var_of, parts_of, Test,
                           TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MCase, PCase,
                           PPayload, OContainer, OStrings, stops_at, Uses, string_uses, framed_reads,
-                          MFramed)
+                          MFramed, PPlace, word_record)
 import compiler.emit.tir.containers (Taken)
 import compiler.emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock,
                                   Copied, Grown, ByteRead, string_args, string_answer)
@@ -803,9 +803,12 @@ fn field_fault(
     // An update writing every field taken out of its record makes one that holds none of the holes.
     Updated(u) -> match h.taken.get(u.of.id) {
       Some(ps) -> if ps.all(|p: Path|
-          match p { PField(f) -> u.sets.any(|s: FieldSet| s.at == f.at), _ -> false }) {
-        whole_fault(h, u.sets.map(|s: FieldSet| s.arg))
-      } else { Some({ why: b"a record updated without a field taken out of it: v", v: u.of }) },
+          match p {
+            PField(f) -> u.sets.any(|s: FieldSet| s.at == f.at),
+            PPlace(at) -> u.sets.any(|s: FieldSet| s.at == at),
+            _ -> false,
+          }) { whole_fault(h, u.sets.map(|s: FieldSet| s.arg)) }
+      else { Some({ why: b"a record updated without a field taken out of it: v", v: u.of }) },
       None -> whole_fault(h, read_args(val)),
     },
     _ -> whole_fault(h, read_args(val)),
@@ -969,8 +972,10 @@ fn taken_at(h: Holding, of: Var, p: Path) -> Bool =
 /// the runtime lays out is made by value, which takes none.
 pub fn reuses_cells(made: Made) -> Bool = match made { MCase(_) -> true, _ -> false }
 
-/// Whether `p` reads a field at its offset in a block: what a `Take` may take.
-pub fn field_path(p: Path) -> Bool = match p { PField(_) -> true, PArg(_) -> true, _ -> false }
+/// Whether `p` reads a field at its offset in a block: what a `Take` may take, a record lying in
+/// place there among them.
+pub fn field_path(p: Path) -> Bool =
+  match p { PField(_) -> true, PArg(_) -> true, PPlace(_) -> true, _ -> false }
 
 /// Whether a `Take` may move the word `path` reads out of a value held as `r`: a field of a block's
 /// word, a word of the box a sum's case holds its payload in, or a word a sum held as its words holds
@@ -998,19 +1003,23 @@ pub fn boxed_read(r: Rep, path: Path) -> Bool =
     _ -> false,
   }
 
-/// Whether the field `path` reads out of `of` into `reader` is a record `of` holds in place: its
-/// header and words are the block's own, with no count of their own to take. A field of a record
-/// type is laid in place, which the reader's type says on any path, and for a field by its name the
-/// block's own record layout says too, whatever the reader is bound as.
+/// Whether the field `path` reads out of `of` into `reader` is a record `of` holds as its leaves:
+/// its words are the block's own, with no count of their own to take. A field of a record type is
+/// laid so, which the reader's type says on any path, and for a field by its name the block's own
+/// record layout says too, whatever the reader is bound as; but a record behind a header (`PPlace`)
+/// moves out whole.
 pub fn held_in_place(of: Var, path: Path, reader: Var) -> Bool =
-  laid_record(reader.ty)
-    || (match path {
-      PField(p) -> match kind_of(of.ty).ty {
-        TyRec(fs) -> fs.any(|f: FieldTy| f.name == p.name && in_place(f) != None),
-        _ -> false,
-      },
-      _ -> false,
-    })
+  match path {
+    // A record lying in place behind a header moves out whole into a box of its own.
+    PPlace(_) -> false,
+    PField(p) ->
+      laid_record(reader.ty)
+        || (match kind_of(of.ty).ty {
+          TyRec(fs) -> fs.any(|f: FieldTy| f.name == p.name && in_place(f) != None),
+          _ -> false,
+        }),
+    _ -> laid_record(reader.ty),
+  }
 
 fn laid_record(ty: Type) -> Bool = match kind_of(ty).ty { TyRec(_) -> true, _ -> false }
 
@@ -1317,18 +1326,20 @@ pub fn answer_held(val: Val) -> Answered =
 /// counted word held as another (a pointer as an `Option`'s word, a sum laid in one word as its word
 /// form), or a sum of one word gathered from its case and one counted word, which holds the value's
 /// count, or reads it where the value is borrowed. A word opened into a wider value is no such: the
-/// opening takes the word.
+/// opening takes the word. Nor is a record held as a word, which may lie in place where no count of
+/// it can be taken: what holds it takes it.
 pub fn re_held(y: Var, val: Val) -> Option<Var> =
   match val {
     Pack(p) -> match var_of(p.arg) {
-      Some(x) -> if word_held(p.to) && word_held(x.rep) { Some(x) } else { None },
+      Some(x) -> if word_held(p.to) && word_held(x.rep) && !word_record(x) { Some(x) }
+      else { None },
       None -> None,
     },
     Gathered(g) -> {
       let held = g.parts.filter(|a: Arg| counted(rep_of_arg(a)));
       if !word_held(y.rep) || held.len() != 1 { None } else {
         match held.at(0) {
-          Some(AVar(x)) -> if word_held(x.rep) { Some(x) } else { None },
+          Some(AVar(x)) -> if word_held(x.rep) && !word_record(x) { Some(x) } else { None },
           _ -> None,
         }
       }
@@ -1779,6 +1790,7 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
       params: range(0, params.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
       reps: params.map(|p: Var| p.rep),
       answer: answer,
+      destined: false,
       answered: Owned,
     },
     answer_ty: TyCon({ name: b"T", args: [] }),
@@ -1799,6 +1811,7 @@ fn call_of(args: List<Arg>, lent: List<Int>) -> Val =
       params: range(0, args.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
       reps: args.map(rep_of_arg),
       answer: RWord,
+      destined: false,
       answered: Owned,
     },
     stops: false,
@@ -2648,7 +2661,7 @@ test "an operand is held as its operation takes it, and a counted answer is held
   let int_call = Call({
     callee: Root(Named(b"m.g")),
     args: [AVar(p)],
-    conv: { params: [Given], reps: [RInt], answer: RWord, answered: Owned },
+    conv: { params: [Given], reps: [RInt], answer: RWord, destined: false, answered: Owned },
     stops: false,
   });
   assert_eq(
@@ -2682,7 +2695,13 @@ test "a root holds a parameter as its convention takes it or as a view of the li
   let walk = |body: Block|
     {
       ..root_of([view, n], [], RInt, body),
-      conv: { params: [Given, Given], reps: [RWord, RInt], answer: RInt, answered: Owned },
+      conv: {
+        params: [Given, Given],
+        reps: [RWord, RInt],
+        answer: RInt,
+        destined: false,
+        answered: Owned,
+      },
     };
   assert_eq(verified(walk([Dec(view), Return(AVar(n))])), None);
   assert_eq(verified(walk([Restart([AVar(view), AVar(n)])])), None);
@@ -2693,7 +2712,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
   assert_eq(
     verified({
       ..root_of([n], [], RInt, [Return(AVar(n))]),
-      conv: { params: [Given], reps: [RWord], answer: RInt, answered: Owned },
+      conv: { params: [Given], reps: [RWord], answer: RInt, destined: false, answered: Owned },
     }),
     Some(b"a parameter held otherwise than its convention takes it"),
   )

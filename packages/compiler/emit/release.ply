@@ -8,10 +8,10 @@ import compiler.check.types (Type, TyCon, TyFn, TyVar, TyRecord, TyNominal, Fiel
                              over_arg)
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (dummy_span)
-import compiler.emit.layout (Laid, LWords, LRecord, LSum, FieldLaid, SumLaid, CaseLaid, Payload,
-                             Nullary, Inline, Boxed, WordClass, P, S, R, U, Always, WordIs,
+import compiler.emit.layout (Laid, LWords, LRecord, LSum, LPlaced, FieldLaid, SumLaid, CaseLaid,
+                             Payload, Nullary, Inline, Boxed, WordClass, P, S, R, U, Always, WordIs,
                              WordOutside, WordForm, Itself, Bits, RuntimeBox, Box, words, counts,
-                             hold_laid, record_laid, sum_laid, raw_sum, inside)
+                             hold_laid, record_laid, sum_laid, raw_sum, inside, by_pointer)
 import compiler.emit.reps
 import compiler.emit.reps (Ctors, SumCtor, ctors_of)
 import compiler.emit.keys
@@ -337,6 +337,8 @@ pub fn laid_parts(ctors: Ctors, ty: Type, l: Laid, at: Int) -> List<Part> / {abo
         }),
     LRecord(fs) -> fields_parts(ctors, field_types(ty), fs, at, ty),
     LSum(s) -> sum_parts(ctors, ty, s, at),
+    // Past the header, whose count is no code's to take.
+    LPlaced(r) -> laid_parts(ctors, ty, r, at + 1),
   }
 
 /// The counted parts of fields `fs` of the types `tys`, in order, the record's words from `at`.
@@ -608,7 +610,7 @@ fn named_opening(
   let arg = |i: Int|
     match args.at(i) { Some(t) -> t, None -> refused(b"a type short of arguments", ty) };
   // A list's item lies in its node as an array's element does.
-  let lies = |t: Type| inside(laid_of(t));
+  let lies = |t: Type| by_pointer(laid_of(t));
   let element = |t: Type| laid_parts(ctors, t, lies(t), 0);
   let stride = |t: Type| max(1, words(lies(t)));
   if name == b"String" || name == b"Bytes" { StrBlock } else if name == b"List" {
@@ -629,7 +631,7 @@ fn named_opening(
       value_words: stride(arg(1)),
     })
   } else if name == b"Array" {
-    let l = inside(laid_of(arg(0)));
+    let l = by_pointer(laid_of(arg(0)));
     ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: max(1, words(l)) })
   } else if name == b"Columns" {
     ColumnsOf(field_types(arg(0)).map(|t: Type| drop_of(TyCon({ name: b"Array", args: [t] }))))
@@ -760,6 +762,7 @@ fn held_in(
   if !counts(l) { [] } else {
     match l {
       LRecord(fs) -> fields_held(ctors, field_types(ty), fs, at, ty, laid_of),
+      LPlaced(r) -> held_in(ctors, ty, r, at + 1, laid_of),
       _ -> match ty {
         TyCon(c) -> if ctors.sums.contains(c.name) {
           match laid_of(ty) {
@@ -896,7 +899,7 @@ fn plain(k: RootKey, param: Var, handed: Handed, body: List<Inst>) -> Fn =
     key: k,
     kind: Plain,
     params: [param],
-    conv: { params: [handed], reps: [param.rep], answer: RWord, answered: Owned },
+    conv: { params: [handed], reps: [param.rep], answer: RWord, destined: false, answered: Owned },
     answer_ty: plain_answer(k),
     body: body,
     lambdas: [],
@@ -1735,7 +1738,13 @@ test "a box's drop root opens it, binding its counted words, and lets go of each
   match generated_here(drop_of(point())) {
     Ok(f) -> {
       assert_eq(f.kind, Plain);
-      assert_eq(f.conv, { params: [Given], reps: [RWord], answer: RWord, answered: Owned });
+      assert_eq(f.conv, {
+        params: [Given],
+        reps: [RWord],
+        answer: RWord,
+        destined: false,
+        answered: Owned,
+      });
       let d = dropping(f.body);
       assert_eq(d.opened.map(|v: Var| v.ty), [named(b"String"), applied(b"List", [int_type()])]);
       assert_eq(d.decs, d.opened)
@@ -1982,7 +1991,13 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
       });
   match generated_here(root_of(Copy, node)) {
     Ok(f) -> {
-      assert_eq(f.conv, { params: [Given], reps: [RWord], answer: RWord, answered: Owned });
+      assert_eq(f.conv, {
+        params: [Given],
+        reps: [RWord],
+        answer: RWord,
+        destined: false,
+        answered: Owned,
+      });
       assert_eq(walk(f), Some({ ty: node, rep: RWord, op: Copy }))
     },
     Err(no) -> assert_eq(no.why, b""),
@@ -2043,7 +2058,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     key: keys::Named(b"m.f"),
     kind: Rooted,
     params: [],
-    conv: { params: [], reps: [], answer: RInt, answered: Owned },
+    conv: { params: [], reps: [], answer: RInt, destined: false, answered: Owned },
     answer_ty: int_type(),
     body: [
       Dec(list),
@@ -2087,6 +2102,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
         params: [Lent, Lent],
         reps: [RWord, RInt],
         answer: RWord,
+        destined: false,
         answered: Borrowed([{ param: 0, whole: true }]),
       },
       answer_ty: TyVar(4),
@@ -2105,7 +2121,7 @@ test "a value held across what may stop is read by its layout too, as the frame'
     Call({
       callee: keys::Root(keys::Named(b"m.g")),
       args: [],
-      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
       stops: stops,
     });
   let root = |body: Block|
@@ -2113,7 +2129,7 @@ test "a value held across what may stop is read by its layout too, as the frame'
       key: keys::Named(b"m.f"),
       kind: Rooted,
       params: [],
-      conv: { params: [], reps: [], answer: RInt, answered: Owned },
+      conv: { params: [], reps: [], answer: RInt, destined: false, answered: Owned },
       answer_ty: int_type(),
       body: body.push(Return(AInt(0))),
       lambdas: [],

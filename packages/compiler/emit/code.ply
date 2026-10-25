@@ -617,7 +617,11 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
         Some({ code: { span: expr_span(e), node: NList({ items: r.codes }) }, stack: r.stack }),
       None -> None,
     },
-    ERecord(x) -> match as_update(x.fields, stack, x.span) {
+    // Copies of one path's fields update the record the path reads, before any other base.
+    ERecord(x) -> match match as_path_update(x.fields, stack, x.span) {
+        Some(u) -> Some(u),
+        None -> as_update(x.fields, stack, x.span),
+      } {
       Some(u) -> Some(u),
       None -> match lower_seq(x.fields.map(|field: RecField| field.value), stack) {
         None -> None,
@@ -923,6 +927,82 @@ fn as_update(
     }
   }
 }
+
+/// Recovers an update from a literal whose copied fields are `p.<own name>` for one path `p` of
+/// field reads off an in-scope variable, `h.five` say: the record `p` reads is the base, read after
+/// every written field, so a record lying in place is updated where it lies.
+fn as_path_update(
+  fields: List<RecField>,
+  stack: Stack,
+  span: Span,
+) -> Option<{ code: Code, stack: Stack }> / {abort.raise} = {
+  let copies = fields.fold(
+    { base: None, spelled: b"", bad: false },
+    |acc: { base: Option<Bytes>, spelled: Bytes, bad: Bool }, f: RecField|
+      match copy_path(f, stack) {
+        None -> acc,
+        Some(c) -> match acc.base {
+          None -> { ..acc, base: Some(c), spelled: c },
+          Some(_) -> if c == acc.spelled { acc } else { { ..acc, bad: true } },
+        },
+      },
+  );
+  match copies.base {
+    None -> None,
+    Some(_) -> if copies.bad { None } else {
+      let sets = fields.filter(|f: RecField| copy_path(f, stack) == None);
+      match lower_seq(sets.map(|f: RecField| f.value), stack) {
+        None -> None,
+        // The base read out of the first copied field's path, after every written field.
+        Some(r) -> match fields.fold(None, |acc: Option<Lowered>, f: RecField|
+            match acc {
+              Some(_) -> acc,
+              None -> if copy_path(f, stack) == None { None }
+              else { match f.value { EField(x) -> lower_in(x.base, r.stack), _ -> None } },
+            }) {
+          None -> None,
+          Some(o) ->
+            Some({
+              code: {
+                span: span,
+                node: NUpdate({
+                  base: o.code,
+                  copies: fields.filter(|f: RecField| copy_path(f, stack) != None).map(
+                    |f: RecField| f.name.name,
+                  ),
+                  sets: range(0, sets.len()).map(|i: Int|
+                    { name: field_name(sets, i), value: nth(r.codes, i) }),
+                }),
+              },
+              stack: o.stack,
+            }),
+        },
+      }
+    },
+  }
+}
+
+/// The spelling of the path of one or more field reads off an in-scope variable that a field copies
+/// from, when the field is `p.<its own name>` for such a path `p`, which tells two paths apart.
+fn copy_path(field: RecField, stack: Stack) -> Option<Bytes> =
+  match field.value {
+    EField(x) -> if x.field.name != field.name.name { None }
+    else { match x.base { EField(_) -> path_spelled(x.base, stack), _ -> None } },
+    _ -> None,
+  }
+
+/// `e` spelled as a path of field reads off an in-scope variable, where it is one.
+fn path_spelled(e: Expr, stack: Stack) -> Option<Bytes> =
+  match e {
+    EVar(v) -> if v.name.module != None { None } else {
+      match st_depth(stack, v.name.name.name) { Some(_) -> Some(v.name.name.name), None -> None }
+    },
+    EField(x) -> match path_spelled(x.base, stack) {
+      Some(s) -> Some(Bytes::concat_all([s, b".", x.field.name])),
+      None -> None,
+    },
+    _ -> None,
+  }
 
 /// The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
 fn copy_base(field: RecField, stack: Stack) -> Option<Bytes> =

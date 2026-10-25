@@ -8,6 +8,7 @@ import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.patterns (Lit, LUnit, LStr)
 import compiler.emit.c (Width)
+import compiler.emit.reps (TyRec, kind_of)
 import compiler.emit.answer (GenericCall, Need, Pass)
 import compiler.emit.keys (RootKey, Callee, Generic, Named, TypeOp, Copy, Share, Keep)
 import compiler.emit.layout (SumLaid, LSum, LWords, P, R, WordIs, WordOutside, Nullary, Inline,
@@ -74,8 +75,17 @@ pub type Handed = | Given | Lent
 /// word read out of it.
 pub type Returned = | Owned | Borrowed(List<{ param: Int, whole: Bool }>)
 
-/// How a root takes its parameters and hands back its answer.
-pub type Convention = { params: List<Handed>, reps: List<Rep>, answer: Rep, answered: Returned }
+/// How a root takes its parameters and hands back its answer. A `destined` root answers a record
+/// lying in place and takes one more C parameter, its destination: given a place's header address,
+/// an owned answer is written there, its counts the place's, and the root answers that address;
+/// given zero, it answers a box of its own. A borrowed answer is never given one.
+pub type Convention = {
+  params: List<Handed>,
+  reps: List<Rep>,
+  answer: Rep,
+  destined: Bool,
+  answered: Returned,
+}
 
 /// What an operation does with each operand (`takes`), whether it answers a count of its own,
 /// whether it can fail, and whether it can stop for a handler that may resume it later.
@@ -92,6 +102,14 @@ pub type Made =
   | MClosure({ nth: Int, captures: Int, params: Int })
   | MCase({ case: Int, skip: Int, words: Int })
   | MFramed(Made)
+  /// The box of a record wider than a call's registers, each field that holds a value made as
+  /// its `FieldMade` says, in field order.
+  | MRecord(List<FieldMade>)
+
+/// How `MRecord` makes one field that holds a value: `Supplied`, from the next argument, a record
+/// lying in place read where that value lies, a place or a box, and copied in; `Built`, a record
+/// lying in place made right there, each of its own fields as these say, so no box of it is made.
+pub type FieldMade = | Supplied | Built(List<FieldMade>)
 
 /// Where a `Get` reads: a field by its word offset, a case's argument, a closure's capture by the word past its
 /// descriptor it starts at, a flat value's leaf, or the word of a record a block holds in place at a
@@ -335,6 +353,7 @@ pub fn made_said(m: Made) -> Bytes =
     MList(n) -> Bytes::concat_all([b"a list of ", ascii_of_int(n)]),
     MClosure(c) -> Bytes::concat_all([b"closure ", ascii_of_int(c.nth)]),
     MCase(c) -> Bytes::concat_all([b"case ", ascii_of_int(c.case), b" boxed"]),
+    MRecord(_) -> b"record",
     MFramed(x) -> Bytes::concat_all([made_said(x), b" in the frame"]),
   }
 
@@ -412,7 +431,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Prim(p) -> p.args.map(|a: Arg| { arg: a, takes: false }),
     Literal(_) -> [],
     Static(_) -> [],
-    Make(m) -> {
+    Make(m) -> if made_record(m.made) { read_records(m.args) } else {
       let lent = match framed_reads(m.made, m.args) { Some(cs) -> cs.len(), None -> 0 };
       range(0, m.args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
         match m.args.at(i) {
@@ -426,9 +445,7 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Pack(p) -> [{ arg: p.arg, takes: counted(p.to) && !unpacks(p.arg, p.to) }],
     Gathered(g) -> g.parts.map(|a: Arg| { arg: a, takes: true }),
     Updated(u) ->
-      [{ arg: AVar(u.of), takes: true }].concat(
-        u.sets.map(|s: FieldSet| { arg: s.arg, takes: true }),
-      ),
+      [{ arg: AVar(u.of), takes: true }].concat(read_records(u.sets.map(|s: FieldSet| s.arg))),
     Call(c) -> handed(c.args, c.conv),
     Apply(c) -> [{ arg: c.f, takes: applied_typed(c.f) }].concat(handed(c.args, c.conv)),
     Native(n) -> used_as(n.args, n.uses),
@@ -437,6 +454,18 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Walked(w) -> [{ arg: AVar(w.of), takes: w.op == Copy }],
     Unsettled(args) -> args.map(|a: Arg| { arg: a, takes: false }),
   }
+
+fn made_record(m: Made) -> Bool = match m { MRecord(_) -> true, _ -> false }
+
+/// `args`, values written into a record's fields: each taken, but a record held as a word, which a
+/// field lays in place and is copied in from where it lies, so it is only read.
+pub fn read_records(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg| { arg: a, takes: match var_of(a) { Some(v) -> !word_record(v), None -> true } })
+
+/// Whether `v` is a record held as a word: a box of its own, or a record lying in place in what it
+/// was read out of, which no count can be taken of.
+pub fn word_record(v: Var) -> Bool =
+  v.rep == RWord && (match kind_of(v.ty).ty { TyRec(_) -> true, _ -> false })
 
 fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
   range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
@@ -613,7 +642,13 @@ test "a word, a view and a flat value with a counted leaf hold a count where a s
 
 test "each operation consumes or borrows each operand as its signature says" {
   let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
-  let conv = { params: [Given, Lent], reps: [RWord, RWord], answer: RInt, answered: Owned };
+  let conv = {
+    params: [Given, Lent],
+    reps: [RWord, RWord],
+    answer: RInt,
+    destined: false,
+    answered: Owned,
+  };
   let call = Call({ callee: Generic(0), args: [AVar(s), AVar(s)], conv: conv, stops: false });
   let takes = |v: Val| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes);
   assert_eq(takes(call), [true, false]);
@@ -702,7 +737,7 @@ test "a call stops where it says, a block where something it holds does, a handl
     Call({
       callee: Generic(0),
       args: [],
-      conv: { params: [], reps: [], answer: RWord, answered: Owned },
+      conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
       stops: stops,
     });
   let calling = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [] })];
