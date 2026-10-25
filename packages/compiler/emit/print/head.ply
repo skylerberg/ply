@@ -1,10 +1,16 @@
-//! The emitter's part of the C every part of a unit compiles after, written after the runtime's
-//! head: the helpers emitted code counts and releases blocks through, and the structs it lays out
-//! and the runtime reads.
+//! The C every part of a unit compiles after, and the C its runtime part opens with: what the C
+//! assumes of words, blocks and the context, the pointers to the functions it calls that the unit
+//! binds at load, the helpers emitted code counts and releases blocks through, and the structs it
+//! lays out and the runtime reads.
 
 import std.bytes (ascii_of_int)
-import compiler.emit.layout (MachineStruct, MachineField, machine_structs, head_structs, text_head,
-                             pointer_floor, tag_bits, ctx_at, release_depth, header_bytes)
+import compiler.emit.layout (MachineStruct, MachineField, head_structs, text_head, pointer_floor,
+                             tag_bits, header_bytes, frame_count)
+import compiler.emit.abi
+import compiler.emit.abi (Native, Machine, natives, machine_structs, obj_struct, ctx_struct,
+                          release_depth)
+import compiler.emit.roots (builtin_helper)
+import compiler.cc (tail_mark)
 import compiler.emit.print.frames (chain_defined)
 import compiler.emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_box_fn, free_fn,
                                      inc_shared_fn, dec_shared_last_fn, free_block_fn,
@@ -17,13 +23,174 @@ import compiler.emit.print.lists (list_helpers, item_fn, leaf_fn)
 import compiler.emit.print.counts (walk_helpers, kept_block_fn, fresh_block_fn, unshared_fn,
                                    mark_fn)
 
+/// What every part of a unit compiles after: the prelude, a pointer to each function the unit
+/// binds, declared and not defined so a unit compiled in parts binds one table, then the helpers and
+/// structs emitted code shares.
+pub fn unit_head() -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    prelude(),
+    b"\n",
+    Bytes::concat_all(bound().map(|n: Native| Bytes::concat_all([b"extern ", pointer(n), b";\n"]))),
+    b"\n",
+    head_part(),
+  ])
+
+/// What the unit's runtime part opens with: each pointer the head declares, defined, and the
+/// `ply_bind` the loader hands the address of each function the unit binds, in `bound`'s order.
+pub fn unit_tail() -> Bytes / {abort.raise} = {
+  let all = bound();
+  Bytes::concat_all([
+    b"\n",
+    tail_mark(),
+    b"\n",
+    Bytes::concat_all(all.map(|n: Native| pointer(n).concat(b";\n"))),
+    b"\nvoid ply_bind(void **fns) {\n",
+    Bytes::concat_all(
+      range(0, all.len()).map(|i: Int| {
+        let n = all.get(i);
+        Bytes::concat_all([
+          b"  ",
+          n.name,
+          b"_p = (",
+          answered_c(n),
+          b" (*)(",
+          params_c(n),
+          b"))fns[",
+          ascii_of_int(i),
+          b"];\n",
+        ])
+      }),
+    ),
+    b"}\n",
+    tail_part(),
+  ])
+}
+
+/// Each function the unit's C calls through a pointer it binds, by the pointer's name less its `_p`:
+/// the runtime's helpers, then the natives the compiler calls directly. The unit lists them so, in
+/// this order, for the loader, which finds each by name.
+pub fn bound() -> List<Native> / {abort.raise} =
+  abi::helpers().concat(natives().map(|n: Native| { ..n, name: builtin_helper(n.name) }))
+
+fn answered_c(n: Native) -> Bytes = if n.answer == None { b"void" } else { b"Word" }
+
+/// Every parameter is a `Word` to C: each kind is passed as one `int64_t` is.
+fn params_c(n: Native) -> Bytes =
+  b"PlyCtx*".concat(Bytes::concat_all(n.params.map(|_: Machine| b", Word")))
+
+fn pointer(n: Native) -> Bytes =
+  Bytes::concat_all([answered_c(n), b" (*", n.name, b"_p)(", params_c(n), b")"])
+
+/// What C the unit's code assumes before anything of its own: the C library's few functions, the
+/// word, a block's header and the context as the runtime lays them out, and the inline helpers over
+/// words, checked arithmetic, `Float` bits, decimals and wide integers.
+fn prelude() -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"#include <stdint.h>\n",
+    // tcc's arm64 calls reach 128 MB, silently: under `PLY_FAR` the C library's are defined here.
+    b"#if defined(__TINYC__) && defined(__aarch64__)\n",
+    b"#  define PLY_FAR 1\n",
+    b"#endif\n",
+    b"#ifdef PLY_FAR\n",
+    b"#include <stddef.h>\n",
+    b"static void *memcpy(void *d, const void *s, size_t n) {\n",
+    b"  unsigned char *a = d;\n",
+    b"  const unsigned char *b = s;\n",
+    b"  while (n--) *a++ = *b++;\n",
+    b"  return d;\n",
+    b"}\n",
+    b"static void *memmove(void *d, const void *s, size_t n) {\n",
+    b"  unsigned char *a = d;\n",
+    b"  const unsigned char *b = s;\n",
+    b"  if ((uintptr_t)a < (uintptr_t)b) while (n--) *a++ = *b++;\n",
+    b"  else while (n--) a[n] = b[n];\n",
+    b"  return d;\n",
+    b"}\n",
+    b"static void *memset(void *d, int c, size_t n) {\n",
+    b"  unsigned char *a = d;\n",
+    b"  while (n--) *a++ = (unsigned char)c;\n",
+    b"  return d;\n",
+    b"}\n",
+    b"static int memcmp(const void *x, const void *y, size_t n) {\n",
+    b"  const unsigned char *a = x;\n",
+    b"  const unsigned char *b = y;\n",
+    b"  for (; n; n--, a++, b++) if (*a != *b) return *a < *b ? -1 : 1;\n",
+    b"  return 0;\n",
+    b"}\n",
+    b"#else\n",
+    b"#include <string.h>\n",
+    b"#endif\n",
+    b"\n",
+    b"typedef int64_t Word;\n",
+    declared(obj_struct()),
+    b"#define PLY_HEADER ",
+    ascii_of_int(header_bytes()),
+    b"\n#define PLY_RC_FRAME UINT32_C(",
+    ascii_of_int(frame_count()),
+    b")\n",
+    declared(ctx_struct()),
+    b"#define PLY_SITE(ctx, r, s, e) ((ctx)->site_root = (r), (ctx)->site_start = (s), (ctx)->site_end = (e))\n",
+    b"static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }\n",
+    b"static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }\n",
+    b"static inline uint32_t ply_le32(uint32_t v) {\n",
+    b"#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__\n",
+    b"  return __builtin_bswap32(v);\n",
+    b"#else\n",
+    b"  return v;\n",
+    b"#endif\n",
+    b"}\n",
+    // tcc has no overflow builtins: it reads the test written out, unsigned, as `PLY_NO_OV_BUILTIN` asks.
+    b"#if defined(__has_builtin) && !defined(PLY_NO_OV_BUILTIN)\n",
+    b"#  if __has_builtin(__builtin_add_overflow)\n",
+    b"#    define PLY_OV_BUILTIN 1\n",
+    b"#  endif\n",
+    b"#endif\n",
+    b"#ifdef PLY_OV_BUILTIN\n",
+    b"static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_add_overflow(a, b, r); }\n",
+    b"static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_sub_overflow(a, b, r); }\n",
+    b"static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_mul_overflow(a, b, r); }\n",
+    b"#else\n",
+    b"static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) {\n",
+    b"  uint64_t s = (uint64_t)a + (uint64_t)b;\n",
+    b"  *r = (int64_t)s;\n",
+    b"  return (int)((((uint64_t)a ^ s) & ((uint64_t)b ^ s)) >> 63);\n",
+    b"}\n",
+    b"static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {\n",
+    b"  uint64_t s = (uint64_t)a - (uint64_t)b;\n",
+    b"  *r = (int64_t)s;\n",
+    b"  return (int)((((uint64_t)a ^ (uint64_t)b) & ((uint64_t)a ^ s)) >> 63);\n",
+    b"}\n",
+    // A product's magnitude must divide back, then fit the sign's range, one more below zero.
+    b"static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) {\n",
+    b"  uint64_t x = a < 0 ? 0 - (uint64_t)a : (uint64_t)a;\n",
+    b"  uint64_t y = b < 0 ? 0 - (uint64_t)b : (uint64_t)b;\n",
+    b"  uint64_t m = x * y;\n",
+    b"  *r = (int64_t)((uint64_t)a * (uint64_t)b);\n",
+    b"  if (x != 0 && m / x != y) return 1;\n",
+    b"  return m > (uint64_t)INT64_MAX + ((a < 0) != (b < 0));\n",
+    b"}\n",
+    b"#endif\n",
+    b"static inline double ply_f64(int64_t bits) { union { int64_t i; double d; } u; u.i = bits; return u.d; }\n",
+    b"static inline int64_t ply_f64_bits(double d) { union { int64_t i; double d; } u; u.d = d; return u.i; }\n",
+    b"typedef struct { Word lo, hi; } PlyDec;\n",
+    b"static inline PlyDec ply_dec_of(Word w) { PlyDec d; d.lo = ply_words(w)[0]; d.hi = ply_words(w)[1]; return d; }\n",
+    b"typedef struct { Word lo, hi; } PlyWide;\n",
+    b"static inline PlyWide ply_wide_of(Word w) { PlyWide x; x.lo = ply_words(w)[0]; x.hi = ply_words(w)[1]; return x; }\n",
+    b"static inline int64_t ply_wide_order(PlyWide a, PlyWide b, int s) {\n",
+    b"  if (a.hi != b.hi) return (s ? (int64_t)a.hi < (int64_t)b.hi : (uint64_t)a.hi < (uint64_t)b.hi) ? -1 : 1;\n",
+    b"  return ((uint64_t)a.lo > (uint64_t)b.lo) - ((uint64_t)a.lo < (uint64_t)b.lo);\n",
+    b"}\n",
+    b"static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }\n",
+    b"static inline int64_t ply_imm_value(Word w) { return w >> 1; }\n",
+  ])
+
 /// The helpers, the machine structs, a function value's block (its header and its descriptor, its
 /// captures after them) and the context's chain of frame records. `ply_last` answers whether the
 /// count it took was a block's last, so the caller drops it; a checked build (`PLY_CHECKED`) traps a
 /// block whose count is already 0, which is how a block given back is counted. A drop root enters by
 /// `ply_drop_deep`, which puts its block off to the runtime where drop roots already nest
 /// `release_depth()` deep, and leaves by `ply_drop_done`, the outermost draining what was put off.
-pub fn head_part() -> Bytes / {abort.raise} =
+fn head_part() -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"\n",
     helpers(),
@@ -54,7 +221,7 @@ fn byte_texts_declared() -> Bytes =
 
 /// The emitter's part of a unit's tail, which the unit defines once: the byte string of each byte
 /// `byte_text_fn` answers.
-pub fn tail_part() -> Bytes =
+fn tail_part() -> Bytes =
   Bytes::concat_all([
     b"const PlyByteText ply_byte_texts[256] = {\n",
     Bytes::concat_all(
@@ -86,12 +253,10 @@ fn writable_helper() -> Bytes =
     b"(PlyCtx *ctx, Word a, PlyDrop copy, int64_t n) { int in_place = ply_obj(a)->rc == 1; if (!in_place) a = copy(ctx, a); rt_note_update_p(ctx, in_place, in_place ? 0 : n); return a; }\n",
   ])
 
-/// The context's counters a drop root reads and writes, at their offsets past what the runtime's
-/// head declares of it, and the drop root's entry and exit.
+/// A drop root's entry and exit, over the context's counters of nested drop roots and of releases
+/// put off.
 fn drops() -> Bytes / {abort.raise} = {
-  let counter = |name: Bytes|
-    Bytes::concat_all([b"(*(int64_t *)((char *)ctx + ", ascii_of_int(ctx_at(name)), b"))"]);
-  let depth = counter(b"release_depth");
+  let depth = b"ctx->release_depth";
   Bytes::concat_all([
     b"static inline int ply_drop_deep(PlyCtx *ctx, Word o, PlyDrop d) {\n",
     Bytes::concat_all([
@@ -110,9 +275,7 @@ fn drops() -> Bytes / {abort.raise} = {
     Bytes::concat_all([
       b"  if (--",
       depth,
-      b" == 0 && ",
-      counter(b"release_waiting"),
-      b" != 0) ",
+      b" == 0 && ctx->release_waiting != 0) ",
       call_text(release_drain_fn(), [b"ctx"]),
       b";\n",
     ]),
@@ -223,31 +386,49 @@ fn described_heads(tags: Bytes) -> Bytes = {
   ])
 }
 
-/// Each machine struct declared in its order, then each head a block keeps its counts in, each field
-/// as the head declares it, and its size checked: a C compiler that lays it out otherwise refuses
-/// the unit.
-fn structs() -> Bytes =
-  Bytes::concat_all(
-    machine_structs().concat(head_structs()).map(|s: MachineStruct|
-      Bytes::concat_all([
-        b"typedef struct ",
-        s.name,
-        b" {\n",
-        Bytes::concat_all(
-          s.fields.map(|f: MachineField| Bytes::concat_all([b"  ", f.decl, b";\n"])),
-        ),
-        b"} ",
-        s.name,
-        b";\n",
-        b"typedef char ply_sized_",
-        s.name,
-        b"[sizeof(",
-        s.name,
-        b") == ",
-        ascii_of_int(s.bytes),
-        b" ? 1 : -1];\n",
-      ])),
-  )
+/// Each machine struct declared in its order, then each head a block keeps its counts in.
+fn structs() -> Bytes = Bytes::concat_all(machine_structs().concat(head_structs()).map(declared))
+
+/// `s` declared, each field as it declares it at its offset, padded where it declares none, and its
+/// size checked: a C compiler that lays it out otherwise refuses the unit.
+fn declared(s: MachineStruct) -> Bytes = {
+  let laid = s.fields.fold(
+    { at: 0, text: b"" },
+    |acc: { at: Int, text: Bytes }, f: MachineField|
+      {
+        at: f.at + f.bytes,
+        text: Bytes::concat_all([acc.text, gap(acc.at, f.at), b"  ", f.decl, b";\n"]),
+      },
+  );
+  Bytes::concat_all([
+    b"typedef struct ",
+    s.name,
+    b" {\n",
+    laid.text,
+    gap(laid.at, s.bytes),
+    b"} ",
+    s.name,
+    b";\n",
+    b"typedef char ply_sized_",
+    s.name,
+    b"[sizeof(",
+    s.name,
+    b") == ",
+    ascii_of_int(s.bytes),
+    b" ? 1 : -1];\n",
+  ])
+}
+
+fn gap(from: Int, to: Int) -> Bytes =
+  if to <= from { b"" } else {
+    Bytes::concat_all([
+      b"  char ply_gap_",
+      ascii_of_int(from),
+      b"[",
+      ascii_of_int(to - from),
+      b"];\n",
+    ])
+  }
 
 /// The body of function `f` the head defines: from where its name is first followed by its
 /// parameters to the end of its body; empty where the head defines none.
@@ -290,17 +471,71 @@ test "a descriptor lifts a type a value of which can hold a function by the runt
 
 test "a drop root nests to the release depth, then puts its block off; the outermost drains what was put off" {
   let h = head_part();
-  let at = |name: Bytes| Bytes::concat_all([b"(char *)ctx + ", ascii_of_int(ctx_at(name)), b")"]);
   let deep = defined_in(h, b"ply_drop_deep");
   let done = defined_in(h, b"ply_drop_done");
-  assert(deep.index_of(at(b"release_depth")) != None, None);
+  assert(deep.index_of(b"ctx->release_depth") != None, None);
   assert(deep.index_of(ascii_of_int(release_depth())) != None, None);
   assert(calls(deep, release_later_fn()), None);
-  assert(done.index_of(at(b"release_depth")) != None, None);
-  assert(done.index_of(at(b"release_waiting")) != None, None);
-  assert(calls(done, release_drain_fn()), None);
-  // Both read the counters past the fields the runtime's head declares.
-  assert(ctx_at(b"release_depth") > ctx_at(b"next_tick"), None)
+  assert(done.index_of(b"ctx->release_depth") != None, None);
+  assert(done.index_of(b"ctx->release_waiting") != None, None);
+  assert(calls(done, release_drain_fn()), None)
+}
+
+test "the head declares the context and a block's header field by field, at their offsets" {
+  let h = unit_head();
+  [obj_struct(), ctx_struct()].fold((), |_: Unit, s: MachineStruct| {
+    let from = match h.index_of(Bytes::concat_all([b"typedef struct ", s.name, b" {"])) {
+      Some(i) -> i,
+      None -> panic(String::of_bytes_lossy(b"the head declares no ".concat(s.name))),
+    };
+    s.fields.fold(from, |last: Int, f: MachineField|
+      match h.index_of_from(f.decl, last) {
+        Some(i) -> i,
+        None ->
+          panic(String::of_bytes_lossy(b"a field the head does not declare: ".concat(f.decl))),
+      });
+    assert(
+      h.index_of(Bytes::concat_all([b"sizeof(", s.name, b") == ", ascii_of_int(s.bytes)])) != None,
+      None,
+    )
+  });
+  // The count takes the low half of the header's word; the rest is padding.
+  assert(h.index_of(b"  uint32_t rc;\n  char ply_gap_4[4];\n} PlyObj;") != None, None)
+}
+
+test "the head declares a pointer to each function the unit binds once, and the tail defines it and binds it in the unit's order" {
+  let h = unit_head();
+  let t = unit_tail();
+  let all = bound();
+  assert(all.len() == abi::helpers().len() + natives().len(), None);
+  range(0, all.len()).fold((), |_: Unit, i: Int| {
+    let n = all.get(i);
+    let p = pointer(n);
+    assert(
+      h.split(Bytes::concat_all([b"extern ", p, b";\n"])).len() == 2,
+      Some(String::of_bytes_lossy(p)),
+    );
+    assert(t.split(p.concat(b";\n")).len() == 2, Some(String::of_bytes_lossy(p)));
+    let bind = Bytes::concat_all([
+      b"  ",
+      n.name,
+      b"_p = (",
+      answered_c(n),
+      b" (*)(",
+      params_c(n),
+      b"))fns[",
+      ascii_of_int(i),
+      b"];\n",
+    ]);
+    assert(t.index_of(bind) != None, Some(String::of_bytes_lossy(bind)))
+  });
+  assert(t.starts_with(b"\n".concat(tail_mark())), None);
+  // A native is bound under its helper's name; one that answers nothing is `void`.
+  assert(
+    h.index_of(b"extern void (*builtin_elaborated_out_str_p)(PlyCtx*, Word, Word);\n") != None,
+    None,
+  );
+  assert(h.index_of(b"extern Word (*rt_alloc_bytes_p)(PlyCtx*, Word);\n") != None, None)
 }
 
 test "each machine struct is declared before one that points at it, its fields in order, its size checked" {

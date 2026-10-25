@@ -1,0 +1,679 @@
+//! What emitted code and the runtime it runs on both rely on, declared once: the structs both lay
+//! out, the constants both read, and each function emitted C calls through a pointer its unit binds
+//! (the runtime's helpers, and the natives the compiler calls directly) with its signature at the
+//! machine. The runtime describes what it implements and lays out as a text (`runtime_of` reads
+//! it), and `unserved` says where that disagrees with what is declared here.
+
+import std.bytes (ascii_of_int)
+import compiler.emit.layout (MachineStruct, MachineField, head_structs, header_bytes, frame_count,
+                             pointer_floor)
+
+// --- Signatures -------------------------------------------------------------------
+
+/// What a parameter or the answer of a function compiled code calls is at the machine, as the
+/// runtime's description names it. Each is passed in one machine word.
+pub type Machine =
+  /// A uniform word, which holds a value of any type.
+  | Word
+  /// The address of uniform words.
+  | Words
+  /// A 64-bit integer, raw.
+  | I64
+  /// A `Float`'s bits.
+  | F64
+  /// The address of bytes, their count passed beside it.
+  | Addr
+  /// The address of words the function writes.
+  | Out
+  /// A runtime object the runtime lays out: a bridge or a hold.
+  | Handle
+  /// A value's word form, which the runtime moves and never reads.
+  | Handed
+  /// A block emitted code lays out, of which the runtime reads the count.
+  | Block
+  /// A type's descriptor, `type#T`.
+  | Type
+  /// An operation's descriptor.
+  | Op
+  /// A drop root's address.
+  | DropRoot
+  /// A keep root's address.
+  | KeepRoot
+
+/// Every kind, in the order the runtime's `Machine` lists them.
+fn kinds() -> List<Machine> =
+  [Word, Words, I64, F64, Addr, Out, Handle, Handed, Block, Type, Op, DropRoot, KeepRoot]
+
+/// The name the runtime's description gives `m`.
+pub fn machine_name(m: Machine) -> Bytes =
+  match m {
+    Word -> b"Word",
+    Words -> b"Words",
+    I64 -> b"I64",
+    F64 -> b"F64",
+    Addr -> b"Addr",
+    Out -> b"Out",
+    Handle -> b"Handle",
+    Handed -> b"Handed",
+    Block -> b"Block",
+    Type -> b"Type",
+    Op -> b"Op",
+    DropRoot -> b"DropRoot",
+    KeepRoot -> b"KeepRoot",
+  }
+
+fn machine_named(name: Bytes) -> Option<Machine> =
+  kinds().find(|m: Machine| machine_name(m) == name)
+
+/// A function compiled code calls with its context and machine words, by the name it is known by:
+/// what it takes past the context, what it answers (`None` for nothing), and whether a failure of
+/// it raises rather than ending the run. A native's signature is what the runtime reads off the
+/// Rust type of the function it binds.
+pub type Native = { name: Bytes, params: List<Machine>, answer: Option<Machine>, raises: Bool }
+
+fn uniform(n: Int) -> List<Machine> = range(0, n).map(|_: Int| Word)
+
+/// The native `name` taking `words` uniform words, answering one where `answers`, as one called
+/// over a value's encoding does.
+pub fn uniform_native(name: Bytes, words: Int, answers: Bool, raises: Bool) -> Native =
+  {
+    name: name,
+    params: uniform(words),
+    answer: if answers { Some(Word) } else { None },
+    raises: raises,
+  }
+
+fn called(name: Bytes, params: List<Machine>, answer: Option<Machine>) -> Native =
+  { name: name, params: params, answer: answer, raises: false }
+
+/// Each of the runtime's own helpers the emitted C calls, by its C name: what the C does to values,
+/// frames and handlers. A helper is added here and in the runtime's table beside its function.
+pub fn helpers() -> List<Native> =
+  [
+    called(b"rt_box_decimal", uniform(2), Some(Word)),
+    called(b"rt_decimal_binary", uniform(6), None),
+    called(b"rt_decimal_compare", uniform(4), Some(Word)),
+    called(b"rt_decimal_negate", uniform(3), None),
+    called(b"rt_wide_op", uniform(6), Some(Word)),
+    called(b"rt_float_rem", uniform(2), Some(Word)),
+    called(b"rt_no_fuel", [], None),
+    called(b"rt_wide_binary", uniform(4), Some(Word)),
+    called(b"rt_no_match", [], None),
+    called(b"rt_let_no_match", [], None),
+    called(b"rt_overflow", uniform(1), None),
+    called(b"rt_by_zero", uniform(1), None),
+    called(b"rt_not_an_int", uniform(1), None),
+    called(b"rt_not_that_width", uniform(2), None),
+    called(b"rt_iterate_bad", uniform(2), None),
+    called(b"rt_shift_count", uniform(2), None),
+    called(b"rt_handle_land", uniform(2), Some(Word)),
+    called(b"rt_tick", [], None),
+    called(b"rt_stack_more", [], Some(Word)),
+    called(b"rt_inc_shared", uniform(1), None),
+    called(b"rt_note_update", uniform(2), None),
+    called(b"rt_alloc_bytes", uniform(1), Some(Block)),
+    called(b"rt_alloc_kept", uniform(1), Some(Block)),
+    called(b"rt_free", [Block, Word], None),
+    called(b"rt_dec_shared_last", [Block], Some(Word)),
+    called(b"rt_handle_free", [Block], None),
+    called(b"rt_released_twice", [Block], None),
+    called(b"rt_release_later", [Handed, DropRoot], None),
+    called(b"rt_release_drain", [], None),
+    called(b"rt_dispatch", [Op, I64, I64, Words], Some(Handed)),
+    called(b"rt_handle_install", [Words, I64, Handed], Some(I64)),
+    called(b"rt_handle_install_detached", [Words, I64, Handed, Block], Some(Handed)),
+    called(b"rt_with_cleanup", [Block, Block, Block, Type, Type], Some(Handed)),
+    called(b"rt_box_wide", [I64, I64, I64], Some(Word)),
+    called(b"rt_builtin_encoded", [I64], None),
+    called(b"rt_region", [Block, Type], Some(Handed)),
+    called(b"rt_branches", [Words, I64], None),
+    called(b"rt_branches_past", [Words, I64, Words, I64], None),
+    called(b"rt_memo", [I64, KeepRoot], Some(Handed)),
+    called(b"rt_never_lifted", [], None),
+  ]
+
+fn raising(n: Native) -> Native = { ..n, raises: true }
+
+/// Each native the emitted C calls directly over machine words, by the name the compiler declares
+/// it under, `?` first. A crossing is written a part at a time into the innermost lowering
+/// (`?out_*`) and read a part at a time from the innermost lifting (`?in_*`); `?in_decimal` and
+/// `?in_fixed` answer a value's low word and keep its high word for `?in_high`; a native that
+/// answers bytes leaves them as the crossing's taken bytes and answers their count, and `?taken`
+/// copies them out. `?handler_*` hold a handler's variables each with its type. `?hold_made` makes
+/// a hold of a value it takes, `?hold_read` answers what a hold holds lent from it, and
+/// `?hold_taken` takes it out, the hold letting go. `?cost_mark` marks what the run has cost so far,
+/// and `?cost_spent` opens a lifting of what it spent since a mark. `?refused` and `?refused_text`
+/// refuse an operation written in place over the numbers or the text it names. The rest read a
+/// string's bytes, lent as an address and a count, or a `Float`'s bits.
+pub fn natives() -> List<Native> =
+  [
+    called(b"?out_tag", [I64], None),
+    called(b"?out_int", [I64], None),
+    called(b"?out_float", [F64], None),
+    called(b"?out_decimal", [I64, I64], None),
+    called(b"?out_fixed", [I64, I64, I64], None),
+    called(b"?out_char", [I64], None),
+    called(b"?out_str", [Addr, I64], None),
+    called(b"?out_bytes", [Addr, I64], None),
+    called(b"?out_count", [I64, I64], None),
+    called(b"?out_ctor", [Addr, I64, I64], None),
+    called(b"?out_name", [Addr, I64], None),
+    called(b"?out_handle", [Handle], None),
+    called(b"?out_carried", [Handed, Type], None),
+    called(b"?out_fun", [Handed, Addr, I64], None),
+    called(b"?out_again", [Handed], Some(I64)),
+    called(b"?in_tag", [], Some(I64)),
+    called(b"?in_int", [], Some(I64)),
+    called(b"?in_float", [], Some(F64)),
+    called(b"?in_decimal", [], Some(I64)),
+    called(b"?in_fixed", [I64], Some(I64)),
+    called(b"?in_high", [], Some(I64)),
+    called(b"?in_char", [], Some(I64)),
+    called(b"?in_str", [], Some(I64)),
+    called(b"?in_bytes", [], Some(I64)),
+    called(b"?in_count", [I64], Some(I64)),
+    called(b"?in_field", [Addr, I64], None),
+    called(b"?in_name_is", [Addr, I64], Some(I64)),
+    called(b"?in_handle", [], Some(Handle)),
+    called(b"?lower_open", [I64], None),
+    called(b"?lower_close", [], Some(I64)),
+    called(b"?lift_open", [Addr, I64], None),
+    called(b"?lift_close", [], None),
+    called(b"?taken", [Addr, I64], None),
+    called(b"?handler_typed", [I64, Handed, Type], None),
+    called(b"?handler_get", [I64], Some(Handed)),
+    called(b"?handler_put", [I64, Handed], None),
+    called(b"?hold_made", [Handed], Some(Handle)),
+    called(b"?hold_read", [Handle], Some(Handed)),
+    called(b"?hold_taken", [Handle], Some(Handed)),
+    called(b"?cost_mark", [], Some(I64)),
+    called(b"?cost_spent", [I64, I64], None),
+    called(b"?in_carried", [], Some(Handed)),
+    raising(called(b"?refused", [I64, I64, I64, I64], None)),
+    called(b"?decimal_text", [I64, I64], Some(I64)),
+    called(b"?decimal_float", [I64, I64], Some(F64)),
+    called(b"?decimal_parse", [Addr, I64], Some(I64)),
+    called(b"?taken_word", [I64], Some(I64)),
+    called(b"?blake3", [Addr, I64], Some(I64)),
+    called(b"?scalar_encoded", [I64, I64, I64, I64], Some(I64)),
+    called(b"?text_encoded", [I64, Addr, I64], Some(I64)),
+    called(b"?gzip", [Addr, I64], Some(I64)),
+    called(b"?gunzip", [Addr, I64], Some(I64)),
+    called(b"?zstd", [Addr, I64], Some(I64)),
+    called(b"?secret_of", [Addr, I64, I64], Some(Handle)),
+    called(b"?secret_verify", [Handle, Addr, I64], Some(I64)),
+    called(b"?functions_compared", [], Some(I64)),
+    called(b"?secret_equal", [Handle, Handle], Some(I64)),
+    called(b"?secret_len", [Handle], Some(I64)),
+    called(b"?secret_bytes", [Handle], Some(Handle)),
+    called(b"?secret_concat", [Handle, Handle], Some(Handle)),
+    raising(called(b"?refused_text", [I64, Addr, I64, Addr, I64], None)),
+  ].concat(
+    [
+      b"?float_floor",
+      b"?float_ceil",
+      b"?float_sqrt",
+      b"?float_exp",
+      b"?float_ln",
+      b"?float_log2",
+      b"?float_log10",
+      b"?float_sin",
+      b"?float_cos",
+      b"?float_tan",
+      b"?float_asin",
+      b"?float_acos",
+      b"?float_atan",
+    ].map(|name: Bytes| called(name, [F64], Some(F64))),
+  ).concat(
+    [b"?float_pow", b"?float_atan2", b"?float_hypot"].map(|name: Bytes|
+      called(name, [F64, F64], Some(F64))),
+  )
+
+/// The native of `natives` named `name`.
+pub fn native_named(name: Bytes) -> Option<Native> = natives().find(|n: Native| n.name == name)
+
+// --- What both lay out ------------------------------------------------------------
+
+/// `PlyObj`, a block's header: its count, in the low half of the word before the block's payload.
+pub fn obj_struct() -> MachineStruct =
+  {
+    name: b"PlyObj",
+    bytes: header_bytes(),
+    fields: [{ name: b"rc", decl: b"uint32_t rc", at: 0, bytes: 4 }],
+  }
+
+/// `PlyCtx`, the context every function is handed, as far as emitted code reads and writes it:
+/// the fields the runtime lays out first. Its bytes are those fields' extent; the rest of the
+/// context is the runtime's alone.
+pub fn ctx_struct() -> MachineStruct =
+  {
+    name: b"PlyCtx",
+    bytes: 88,
+    // A released `ply`'s bootstrap compares these eleven as listed, so a new field goes after them.
+    fields: [
+      { name: b"failed", decl: b"int64_t failed", at: 0, bytes: 8 },
+      { name: b"fuel", decl: b"int64_t fuel", at: 8, bytes: 8 },
+      { name: b"stack_floor", decl: b"uintptr_t stack_floor", at: 16, bytes: 8 },
+      { name: b"site_root", decl: b"int64_t site_root", at: 24, bytes: 8 },
+      { name: b"site_start", decl: b"int64_t site_start", at: 32, bytes: 8 },
+      { name: b"site_end", decl: b"int64_t site_end", at: 40, bytes: 8 },
+      { name: b"ticks", decl: b"int64_t ticks", at: 48, bytes: 8 },
+      { name: b"next_tick", decl: b"int64_t next_tick", at: 56, bytes: 8 },
+      { name: b"frames", decl: b"struct PlyFrame *frames", at: 64, bytes: 8 },
+      { name: b"release_depth", decl: b"int64_t release_depth", at: 72, bytes: 8 },
+      { name: b"release_waiting", decl: b"int64_t release_waiting", at: 80, bytes: 8 },
+    ],
+  }
+
+/// `PlyFrame`: a frame that may stop links one into the context's `frames` around the call, its
+/// slots after it, and `each` counts every slot once more (`d > 0`) or once fewer (`d < 0`).
+pub fn frame_struct() -> MachineStruct =
+  {
+    name: b"PlyFrame",
+    bytes: 16,
+    fields: [
+      { name: b"prev", decl: b"struct PlyFrame *prev", at: 0, bytes: 8 },
+      { name: b"each", decl: b"void (*each)(PlyCtx *, Word *, int64_t)", at: 8, bytes: 8 },
+    ],
+  }
+
+/// `PlyType`, a type's descriptor (`type#T`): its identity (the low 64 bits of the digest of its
+/// spelling), its spelling, and the entries the runtime counts and crosses a value of it through,
+/// each taking the value's word form.
+pub fn type_struct() -> MachineStruct =
+  {
+    name: b"PlyType",
+    bytes: 56,
+    fields: [
+      { name: b"identity", decl: b"uint64_t identity", at: 0, bytes: 8 },
+      { name: b"spelled", decl: b"const uint8_t *spelled", at: 8, bytes: 8 },
+      { name: b"spelled_len", decl: b"uint32_t spelled_len", at: 16, bytes: 4 },
+      { name: b"inc", decl: b"Word (*inc)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"dec", decl: b"Word (*dec)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"lower", decl: b"Word (*lower)(PlyCtx *, Word)", at: 40, bytes: 8 },
+      { name: b"lift", decl: b"Word (*lift)(PlyCtx *)", at: 48, bytes: 8 },
+    ],
+  }
+
+/// `PlyOp`, an operation at its perform's type arguments (`op#effect.op@T..`): the effect's and
+/// the operation's field-table entries, the answer's type, which parameters are the operation's own
+/// type parameter (bit `i` for parameter `i`), each parameter's type and the operation's own type
+/// parameters'.
+pub fn op_struct() -> MachineStruct =
+  {
+    name: b"PlyOp",
+    bytes: 64,
+    fields: [
+      { name: b"effect", decl: b"int64_t effect", at: 0, bytes: 8 },
+      { name: b"op", decl: b"int64_t op", at: 8, bytes: 8 },
+      { name: b"answer", decl: b"const PlyType *answer", at: 16, bytes: 8 },
+      { name: b"own", decl: b"uint64_t own", at: 24, bytes: 8 },
+      { name: b"params_len", decl: b"int64_t params_len", at: 32, bytes: 8 },
+      { name: b"params", decl: b"const PlyType *const *params", at: 40, bytes: 8 },
+      { name: b"vars_len", decl: b"int64_t vars_len", at: 48, bytes: 8 },
+      { name: b"vars", decl: b"const PlyType *const *vars", at: 56, bytes: 8 },
+    ],
+  }
+
+/// `PlyFnDesc`, a lambda's descriptor, which the payload word `closure_descriptor` of its closure's
+/// block names: the uniform entry (the block and each argument as its word form, answering one);
+/// the entry at the function type's own convention, cast to it where emitted code calls it; that
+/// convention's identity, which a checked build compares; and the entries that release the block
+/// (its captures, then its memory), share it with another thread (answering 0 where a capture
+/// cannot cross) and keep it for good.
+pub fn fn_desc_struct() -> MachineStruct =
+  {
+    name: b"PlyFnDesc",
+    bytes: 48,
+    fields: [
+      { name: b"uniform", decl: b"Word (*uniform)(PlyCtx *, Word, const Word *)", at: 0, bytes: 8 },
+      { name: b"typed", decl: b"void (*typed)(void)", at: 8, bytes: 8 },
+      { name: b"convention", decl: b"Word convention", at: 16, bytes: 8 },
+      { name: b"release", decl: b"Word (*release)(PlyCtx *, Word)", at: 24, bytes: 8 },
+      { name: b"share", decl: b"Word (*share)(PlyCtx *, Word)", at: 32, bytes: 8 },
+      { name: b"keep", decl: b"Word (*keep)(PlyCtx *, Word)", at: 40, bytes: 8 },
+    ],
+  }
+
+/// Every struct emitted code lays out and the runtime reads, each declared before a struct that
+/// points at it.
+pub fn machine_structs() -> List<MachineStruct> =
+  [frame_struct(), type_struct(), op_struct(), fn_desc_struct()]
+
+/// The count of a block nothing counts or frees, as a unit's static data and the memo hold, which
+/// the C spells `UINT32_MAX`.
+pub fn immortal_count() -> Int = 4294967295
+
+/// The bit of a block's count set while another thread may hold it, which the C spells
+/// `UINT32_C(0x80000000)`.
+pub fn shared_count() -> Int = 2147483648
+
+/// The payload word of a function value's block that names its `PlyFnDesc`, and of a hold that says
+/// it is one.
+pub fn closure_descriptor() -> Int = 0
+
+/// How deeply drop roots nest before one puts its release off until the outermost returns.
+pub fn release_depth() -> Int = 32
+
+/// A hold's object: the value it holds at word `held`, 0 once it has let go.
+pub type HoldLaid = { held: Int }
+
+/// Where the runtime's holds keep what they hold.
+pub fn hold_laid() -> HoldLaid = { held: 1 }
+
+fn dotted(parts: List<Bytes>) -> Bytes = Bytes::join(parts, b".")
+
+fn fields_stated(into: Map<Bytes, Int>, s: MachineStruct) -> Map<Bytes, Int> =
+  s.fields.fold(into, |acc: Map<Bytes, Int>, f: MachineField|
+    acc.insert(dotted([s.name, f.name, b"at"]), f.at).insert(
+      dotted([s.name, f.name, b"bytes"]),
+      f.bytes,
+    ))
+
+/// What the runtime must lay out and read as this compiler does, each a named integer as the
+/// runtime's description states it: each shared struct's size (`PlyType.bytes`) but the context's,
+/// which is the runtime's own, each field's offset and size (`PlyCtx.fuel.at`, `PlyCtx.fuel.bytes`),
+/// and the constants both read.
+pub fn facts() -> Map<Bytes, Int> =
+  [obj_struct()].concat(machine_structs()).fold(
+    fields_stated(Map::new(), ctx_struct()),
+    |acc: Map<Bytes, Int>, s: MachineStruct|
+      fields_stated(acc, s).insert(dotted([s.name, b"bytes"]), s.bytes),
+  ).insert(
+    b"count.frame",
+    frame_count(),
+  ).insert(
+    b"count.immortal",
+    immortal_count(),
+  ).insert(
+    b"count.shared",
+    shared_count(),
+  ).insert(
+    b"pointer_floor",
+    pointer_floor(),
+  ).insert(
+    b"release_depth",
+    release_depth(),
+  ).insert(
+    b"hold.held",
+    hold_laid().held,
+  ).insert(
+    b"closure.descriptor",
+    closure_descriptor(),
+  )
+
+// --- The runtime's description ------------------------------------------------------
+
+/// The runtime a unit is compiled against, as it describes itself: what all a unit emitted against
+/// it is a function of on its side, each native it implements by the name the compiler declares,
+/// each helper of its own by its C name, and what it lays out, as `facts` names it.
+pub type Runtime = {
+  identity: Bytes,
+  natives: List<Native>,
+  helpers: List<Native>,
+  facts: Map<Bytes, Int>,
+}
+
+/// The line a runtime's description opens with, which names its form.
+fn described_form() -> Bytes = b"ply runtime 1"
+
+fn function_line(kind: Bytes, n: Native) -> Bytes =
+  Bytes::concat_all([
+    Bytes::join(
+      [
+        kind,
+        n.name,
+        if n.raises { b"1" } else { b"0" },
+        match n.answer { Some(m) -> machine_name(m), None -> b"-" },
+      ].concat(
+        n.params.map(machine_name),
+      ),
+      b" ",
+    ),
+    b"\n",
+  ])
+
+/// `r` as its runtime's library describes it: a line naming the form, then a line each for its
+/// identity, each native, each helper and each fact, its words apart by one space.
+pub fn described(r: Runtime) -> Bytes =
+  Bytes::concat_all([
+    described_form(),
+    b"\n",
+    b"identity ",
+    r.identity,
+    b"\n",
+    Bytes::concat_all(r.natives.map(|n: Native| function_line(b"native", n))),
+    Bytes::concat_all(r.helpers.map(|n: Native| function_line(b"helper", n))),
+    Bytes::concat_all(
+      r.facts.fold([], |acc: List<Bytes>, name: Bytes, value: Int|
+        acc.push(Bytes::concat_all([b"fact ", name, b" ", ascii_of_int(value), b"\n"]))),
+    ),
+  ])
+
+/// The kinds `names` spell; `None` where one spells none.
+fn kinds_named(names: List<Bytes>) -> Option<List<Machine>> =
+  names.fold(Some([]), |acc: Option<List<Machine>>, name: Bytes|
+    match ((acc, machine_named(name))) { (Some(ms), Some(m)) -> Some(ms.push(m)), _ -> None })
+
+/// The function a `native` or `helper` line's words describe after its kind.
+fn function_of(words: List<Bytes>) -> Option<Native> =
+  match ((words.at(1), words.at(2), words.at(3), kinds_named(words.drop(4)))) {
+    (Some(name), Some(raises), Some(answer), Some(params)) -> if raises != b"0" && raises != b"1" {
+      None
+    } else if answer == b"-" {
+      Some({ name: name, params: params, answer: None, raises: raises == b"1" })
+    } else {
+      match machine_named(answer) {
+        Some(m) -> Some({ name: name, params: params, answer: Some(m), raises: raises == b"1" }),
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// `r` with what `line` says of it: a line of a kind no compiler of this form reads says nothing.
+fn read_line(r: Runtime, line: Bytes) -> Result<Runtime, Bytes> / {abort.raise} = {
+  let words = line.split(b" ");
+  let kind = match words.at(0) { Some(k) -> k, None -> b"" };
+  let unread = Err(Bytes::concat_all([b"its line `", line, b"` does not read"]));
+  if kind == b"identity" {
+    match words.at(1) {
+      Some(id) -> if words.len() == 2 { Ok({ ..r, identity: id }) } else { unread },
+      None -> unread,
+    }
+  } else if kind == b"native" {
+    match function_of(words) { Some(n) -> Ok({ ..r, natives: r.natives.push(n) }), None -> unread }
+  } else if kind == b"helper" {
+    match function_of(words) { Some(n) -> Ok({ ..r, helpers: r.helpers.push(n) }), None -> unread }
+  } else if kind == b"fact" {
+    match ((words.at(1), match words.at(2) { Some(v) -> v.int_of_ascii(), None -> None })) {
+      (Some(name), Some(value)) -> if words.len() == 3 {
+        Ok({ ..r, facts: r.facts.insert(name, value) })
+      } else { unread },
+      _ -> unread,
+    }
+  } else { Ok(r) }
+}
+
+/// The runtime `text` describes, as `described` writes one; or why it reads as none.
+pub fn runtime_of(text: Bytes) -> Result<Runtime, Bytes> / {abort.raise} = {
+  let lines = text.split(b"\n").filter(|l: Bytes| l.len() > 0);
+  match lines.at(0) {
+    None -> Err(b"it says nothing"),
+    Some(first) -> if first != described_form() {
+      Err(
+        Bytes::concat_all([
+          b"it opens `",
+          first,
+          b"` where this `ply` reads `",
+          described_form(),
+          b"`",
+        ]),
+      )
+    } else {
+      lines.drop(1).fold(
+        Ok({ identity: b"", natives: [], helpers: [], facts: Map::new() }),
+        |acc: Result<Runtime, Bytes>, line: Bytes|
+          match acc { Ok(r) -> read_line(r, line), Err(_) -> acc },
+      )
+    },
+  }
+}
+
+/// A runtime of `identity` implementing `natives` that serves the code this compiler emits: its
+/// helpers and what it lays out as declared here.
+pub fn serving(identity: Bytes, natives: List<Native>) -> Runtime =
+  { identity: identity, natives: natives, helpers: helpers(), facts: facts() }
+
+// --- Where a runtime disagrees ------------------------------------------------------
+
+/// Where a runtime does not serve the code this compiler emits: a helper the emitted C calls that it
+/// has none of, or has under another signature; or a fact it lays out otherwise, or states nothing
+/// of.
+pub type Unserved =
+  | Lacks(Native)
+  | Unlike({ declared: Native, found: Native })
+  | Laid({ name: Bytes, declared: Int, found: Option<Int> })
+
+/// Each place `r` does not serve what is declared here, helpers first, then facts by name. What `r`
+/// says beyond them is not read.
+pub fn unserved(r: Runtime) -> List<Unserved> = {
+  let found = r.helpers.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
+    acc.insert(n.name, n));
+  let helpers = helpers().fold([], |acc: List<Unserved>, d: Native|
+    match found.get(d.name) {
+      None -> acc.push(Lacks(d)),
+      Some(n) -> if n == d { acc } else { acc.push(Unlike({ declared: d, found: n })) },
+    });
+  facts().fold(helpers, |acc: List<Unserved>, name: Bytes, value: Int|
+    match r.facts.get(name) {
+      Some(v) -> if v == value { acc }
+      else { acc.push(Laid({ name: name, declared: value, found: Some(v) })) },
+      None -> acc.push(Laid({ name: name, declared: value, found: None })),
+    })
+}
+
+fn signature_said(n: Native) -> Bytes =
+  Bytes::concat_all([
+    b"takes [",
+    Bytes::join(n.params.map(machine_name), b", "),
+    b"]",
+    match n.answer {
+      Some(m) -> b" and answers ".concat(machine_name(m)),
+      None -> b" and answers nothing",
+    },
+    if n.raises { b", raising" } else { b"" },
+  ])
+
+/// Why `u` does not serve, as a line of the diagnostic that lists it.
+pub fn unserved_line(u: Unserved) -> Bytes / {abort.raise} =
+  match u {
+    Lacks(d) ->
+      Bytes::concat_all([b"the runtime has no helper `", d.name, b"`, which emitted code calls"]),
+    Unlike(x) ->
+      Bytes::concat_all([
+        b"`",
+        x.declared.name,
+        b"` ",
+        signature_said(x.declared),
+        b" as this compiler calls it, and the runtime's ",
+        signature_said(x.found),
+      ]),
+    Laid(l) -> match l.found {
+      Some(v) ->
+        Bytes::concat_all([
+          b"the runtime lays out `",
+          l.name,
+          b"` as ",
+          ascii_of_int(v),
+          b", where this compiler declares ",
+          ascii_of_int(l.declared),
+        ]),
+      None ->
+        Bytes::concat_all([
+          b"the runtime states nothing of `",
+          l.name,
+          b"`, which this compiler declares ",
+          ascii_of_int(l.declared),
+        ]),
+    },
+  }
+
+// --- Tests -------------------------------------------------------------------------
+
+test "each struct emitted code lays out has its fields in order, each at a multiple of its size, within the struct" {
+  [obj_struct(), ctx_struct()].concat(machine_structs()).concat(head_structs()).fold(
+    (),
+    |_: Unit, s: MachineStruct| {
+      let end = s.fields.fold(0, |at: Int, f: MachineField| {
+        assert(f.at >= at && f.at % f.bytes == 0 && f.decl.index_of(f.name) != None, None);
+        f.at + f.bytes
+      });
+      assert(end <= s.bytes && s.bytes % 8 == 0, None)
+    },
+  )
+}
+
+test "no two functions a unit binds share a name, and each kind reads back by its name" {
+  let names = helpers().concat(natives()).map(|n: Native| n.name);
+  assert_eq(range(0, names.len()).filter(|i: Int| names.drop(i + 1).contains(names.get(i))), []);
+  assert_eq(
+    kinds().map(|m: Machine| machine_named(machine_name(m))),
+    kinds().map(|m: Machine| Some(m)),
+  )
+}
+
+test "a description reads back as it was written" {
+  let r = { ..serving(b"abc", natives().take(3)), helpers: helpers().take(4) };
+  assert_eq(runtime_of(described(r)), Ok(r));
+  // A line of a kind this form does not know says nothing; a line of a known kind that does not read
+  // refuses the description.
+  assert_eq(runtime_of(described(r).concat(b"later something\n")), Ok(r));
+  assert(runtime_of(described(r).concat(b"fact count.frame\n")) != Ok(r), None);
+  assert(runtime_of(described(r).concat(b"helper rt_x 0 Ward\n")) != Ok(r), None);
+  assert(runtime_of(b"ply runtime 2\nidentity abc\n") != Ok(r), None)
+}
+
+test "a runtime serves where it lays out and binds what is declared here, whatever more it says" {
+  let r = serving(b"r", []);
+  assert_eq(unserved(r), []);
+  let more = {
+    ..r,
+    helpers: r.helpers.push(called(b"rt_kept_for_another", [I64], None)),
+    facts: r.facts.insert(b"PlyCtx.runtime_own.at", 4096),
+  };
+  assert_eq(unserved(more), [])
+}
+
+test "a runtime that lacks or retypes a helper, or lays out a field, a size or a constant otherwise, is refused, each place named" {
+  let r = serving(b"r", []);
+  let without = |name: Bytes| { ..r, helpers: r.helpers.filter(|n: Native| n.name != name) };
+  let retyped = {
+    ..r,
+    helpers: r.helpers.map(|n: Native|
+      if n.name == b"rt_tick" { { ..n, params: [I64] } } else { n }),
+  };
+  let moved = { ..r, facts: r.facts.insert(b"PlyCtx.release_depth.at", 80) };
+  let said = |x: Runtime| unserved(x).map(unserved_line);
+  assert_eq(said(without(b"rt_memo")), [
+    b"the runtime has no helper `rt_memo`, which emitted code calls",
+  ]);
+  assert_eq(said(retyped), [
+    b"`rt_tick` takes [] and answers nothing as this compiler calls it, and the runtime's takes [I64] and answers nothing",
+  ]);
+  assert_eq(said(moved), [
+    b"the runtime lays out `PlyCtx.release_depth.at` as 80, where this compiler declares 72",
+  ]);
+  assert_eq(said({ ..r, facts: r.facts.insert(b"PlyFnDesc.bytes", 56) }), [
+    b"the runtime lays out `PlyFnDesc.bytes` as 56, where this compiler declares 48",
+  ]);
+  assert_eq(said({ ..r, facts: r.facts.insert(b"release_depth", 64) }), [
+    b"the runtime lays out `release_depth` as 64, where this compiler declares 32",
+  ]);
+  assert_eq(said({ ..r, facts: r.facts.remove(b"hold.held") }), [
+    b"the runtime states nothing of `hold.held`, which this compiler declares 1",
+  ]);
+  // The context's size is the runtime's own; each field's place is not.
+  assert_eq(facts().get(b"PlyCtx.bytes"), None);
+  assert_eq(facts().get(b"PlyCtx.frames.at"), Some(64))
+}

@@ -20,8 +20,8 @@ pub fn runtime_helpers() -> Vec<HelperShape> {
         .iter()
         .map(|h| HelperShape {
             name: h.name.to_string(),
-            args: h.args,
-            answers: h.answers,
+            args: h.args(),
+            answers: h.answers(),
         })
         .collect()
 }
@@ -30,7 +30,7 @@ pub fn runtime_helpers() -> Vec<HelperShape> {
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();
     for helper in helpers() {
-        h.update(format!("{} {} {}\n", helper.name, helper.args, helper.answers).as_bytes());
+        h.update(format!("{} {} {}\n", helper.name, helper.args(), helper.answers()).as_bytes());
     }
     h.finalize().to_hex().to_string()
 }
@@ -90,7 +90,7 @@ impl Exports {
             .iter()
             .map(
                 |mine| match helpers().iter().find(|h| h.name == mine.name) {
-                    Some(h) if h.args == mine.args && h.answers == mine.answers => {
+                    Some(h) if h.args() == mine.args && h.answers() == mine.answers => {
                         Ok(h.address as *mut std::ffi::c_void)
                     }
                     Some(h) => Err(Unserved(format!(
@@ -99,8 +99,8 @@ impl Exports {
                         said(mine),
                         said(&HelperShape {
                             name: h.name.to_string(),
-                            args: h.args,
-                            answers: h.answers,
+                            args: h.args(),
+                            answers: h.answers(),
                         }),
                     ))),
                     None => Err(Unserved(format!(

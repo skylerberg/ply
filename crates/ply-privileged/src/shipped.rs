@@ -136,7 +136,7 @@ impl HostHandler for Shipped {
             ("definitions", []) => {
                 PlyValue::bytes(ENTERED.get().map_or("", String::as_str).as_bytes())
             }
-            ("runtime", []) => runtime(),
+            ("runtime", []) => PlyValue::bytes(ply_compiled::c::described()),
             ("runnable", [entry, files, dump]) => {
                 let entry = entry.as_str(span, "an entry point's name")?;
                 let bytes = crate::runnable::encode(entry, files, dump).map_err(|why| {
@@ -203,26 +203,14 @@ fn values(
     ))
 }
 
-/// Each builtin by its name in the prelude, then each native the compiler declares over machine
-/// data, with what the function compiled code calls it through takes and answers, as that
-/// function's type says.
-fn natives() -> impl Iterator<Item = (&'static str, ply_compiled::native::Signature)> {
-    let builtins = ply_core::Builtin::all()
-        .iter()
-        .map(|b| (b.name(), ply_compiled::rt::signature(*b)));
-    let machine = ply_compiled::c::machine_natives()
-        .iter()
-        .map(|n| (n.name, n.signature));
-    builtins.chain(machine)
-}
-
-/// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
-/// of a program for this runtime by another `ply` reads it from. Past what [`runtime`] answers,
-/// each native's machine kinds, the context's fields compiled code reads and the structs emitted
-/// code lays out (each field in order with its offset and bytes), and how deeply drop roots nest
-/// before a release is put off.
+/// The runtime a unit is compiled against as a released `ply`'s bootstrap reads it, written as
+/// JSON: the C its units open and close with, the helpers they bind, each native with its machine
+/// kinds, the context's fields compiled code reads and the structs emitted code lays out (each field
+/// in order with its offset and bytes), how deeply drop roots nest before a release is put off, and
+/// where a hold keeps what it holds.
 pub fn runtime_json() -> String {
     use ply_compiled::c;
+    let natives = c::described::natives;
     serde_json::json!({
         "head": c::unit_head(),
         "tail": c::runtime_object(),
@@ -272,47 +260,4 @@ fn facts_json(facts: Vec<(&'static str, usize)>) -> serde_json::Value {
             .map(|(name, n)| (name.to_string(), serde_json::json!(n)))
             .collect(),
     )
-}
-
-/// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens
-/// and closes with, the helpers it binds by position, the natives an `extern fn` names, and what all
-/// of that is a function of.
-fn runtime() -> PlyValue {
-    use crate::payload::record;
-    use ply_compiled::c;
-    record(vec![
-        ("head", PlyValue::bytes(c::unit_head())),
-        ("tail", PlyValue::bytes(c::runtime_object())),
-        (
-            "helpers",
-            PlyValue::list(
-                c::exports::runtime_helpers()
-                    .into_iter()
-                    .map(|h| {
-                        record(vec![
-                            ("name", PlyValue::bytes(h.name)),
-                            ("args", PlyValue::Int(h.args as i64)),
-                            ("answers", PlyValue::Bool(h.answers)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "natives",
-            PlyValue::list(
-                natives()
-                    .map(|(name, s)| {
-                        record(vec![
-                            ("name", PlyValue::bytes(name)),
-                            ("words", PlyValue::Int(s.words() as i64)),
-                            ("answers", PlyValue::Bool(s.answers())),
-                            ("raises", PlyValue::Bool(s.raises)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        ("identity", PlyValue::bytes(c::runtime_identity())),
-    ])
 }

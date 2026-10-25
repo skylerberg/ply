@@ -29,6 +29,8 @@ pub struct Obj {
 
 pub const HEADER: usize = 8;
 
+const _: () = assert!(HEADER == std::mem::size_of::<Obj>());
+
 /// A block's count, read and changed as an atomic: another thread may hold a shared block.
 #[inline]
 fn count(o: *mut Obj) -> &'static std::sync::atomic::AtomicU32 {

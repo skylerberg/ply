@@ -13,8 +13,21 @@ static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
 /// The exit code of a run that panicked in the runtime, which no program asks for.
 const PANICKED: c_int = 101;
 
-/// The runtime this library is, as JSON: what a `ply` building a program for it emits the program's
-/// C against. A program linked with nothing but a `main` that prints it is how a build asks.
+/// The runtime this library is, as `compiler.emit.abi.runtime_of` reads it: what a `ply` building a
+/// program for it holds the program's C to. A program linked with nothing but a `main` that prints
+/// it is how a build asks.
+#[unsafe(no_mangle)]
+pub extern "C" fn ply_runtime_described() -> *const c_char {
+    static DESCRIBED: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
+    DESCRIBED
+        .get_or_init(|| {
+            std::ffi::CString::new(ply_compiled::c::described())
+                .expect("a description holds no NUL")
+        })
+        .as_ptr()
+}
+
+/// The runtime this library is, as JSON, which a released `ply`'s bootstrap reads.
 #[unsafe(no_mangle)]
 pub extern "C" fn ply_runtime_describe() -> *const c_char {
     static DESCRIBED: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();

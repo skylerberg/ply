@@ -4,7 +4,6 @@
 //! cannot or answering what its `ensures` rules out. None is an extern the emitter writes in place,
 //! and the runtime lays out the objects those write over as the emitter writes them.
 
-import compiler.emit.roots (builtin_helper)
 import compiler.syntax.exprs (Param, expr_span)
 import compiler.front.published (BuiltinRow, shipped_builtin_rows)
 import compiler.check.infer.checker (Builtin, builtins)
@@ -13,7 +12,8 @@ import compiler.syntax.items (DNumeric, DOrd, ExternDef, IExtern, Item, SEnsures
 import compiler.syntax.type_syntax (TypeExpr, TCon, TFn, TVar)
 import compiler.check.types (Atom, TyFn)
 import compiler.emit.layout (Intrinsic, intrinsics)
-import compiler.unit (Helper, Native, Unbound, shipped, unbound)
+import compiler.unit (Unbound, shipped, shipped_runtime, unbound)
+import compiler.emit.abi (Native, natives, unserved, unserved_line)
 import compiler.check.infer.definitions (Extern, declared_natives)
 import harness (in_memory, one, prelude_file, said, json_of, at, path, items, str, int, std_modules,
                 StdModule)
@@ -37,20 +37,21 @@ fn words(row: BuiltinRow) -> Int / {abort.raise} =
       _ -> panic(named(row.name) ++ "'s scheme is not a function"),
     })
 
-fn natives() -> Map<Bytes, Native> / {shipped.runtime} =
-  shipped.runtime().natives.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
+fn implemented() -> Map<Bytes, Native> / {shipped.runtime, abort.raise} =
+  shipped_runtime().natives.fold(Map::new(), |acc: Map<Bytes, Native>, n: Native|
     acc.insert(n.name, n))
 
 test "every builtin a shipped module declares that the runtime implements passes the words the runtime's takes" {
-  let runtime = natives();
+  let runtime = implemented();
   rows().fold((), |_u: Unit, row: BuiltinRow|
     match runtime.get(row.name) {
       None -> (),
       Some(n) ->
         assert(
-          n.words == words(row) && n.answers,
+          n.params.len() == words(row) && n.answer != None,
           Some(
-            named(row.name) ++ " takes " ++ n.words.to_string() ++ " words in the runtime and "
+            named(row.name) ++ " takes " ++ n.params.len().to_string()
+              ++ " words in the runtime and "
               ++ words(row).to_string()
               ++ " in its declaration's scheme",
           ),
@@ -61,11 +62,11 @@ test "every builtin a shipped module declares that the runtime implements passes
 // Whether the runtime implements each native a unit calls is checked as the unit is linked (E0476):
 // one the emitter writes in place it need not.
 test "every native the runtime implements is one the compiler declares, once and as declared" {
-  let implemented = shipped.runtime().natives.map(|n: Native| n.name);
+  let implemented = shipped_runtime().natives.map(|n: Native| n.name);
   let declared = declared_natives();
   assert_eq(
     unbound(
-      shipped.runtime().natives,
+      shipped_runtime().natives,
       declared.filter(|d: Extern| implemented.contains(d.name)),
     ).map(|u: Unbound| u.declared.name),
     [],
@@ -74,13 +75,18 @@ test "every native the runtime implements is one the compiler declares, once and
   assert_eq(implemented.filter(|n: Bytes| !names.contains(n)), [])
 }
 
-test "no native or helper of the runtime is an extern the emitter writes in place" {
-  let natives = shipped.runtime().natives.map(|n: Native| n.name);
-  let helpers = shipped.runtime().helpers.map(|h: Helper| h.name);
-  let implemented = intrinsics().filter(|i: { name: Bytes, op: Intrinsic }| {
-    let own = i.name.slice(b"std.prelude.".len(), i.name.len());
-    natives.contains(own) || helpers.contains(builtin_helper(own))
-  });
+test "the runtime this ply is linked with serves the code its compiler emits" {
+  let runtime = shipped_runtime();
+  assert_eq(unserved(runtime).map(unserved_line), []);
+  // Each native the emitted C calls directly takes and answers the kinds the compiler declares.
+  let found = implemented();
+  assert_eq(natives().filter(|d: Native| found.get(d.name) != Some(d)).map(|d: Native| d.name), [])
+}
+
+test "no native of the runtime is an extern the emitter writes in place" {
+  let natives = shipped_runtime().natives.map(|n: Native| n.name);
+  let implemented = intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
+    natives.contains(i.name.slice(b"std.prelude.".len(), i.name.len())));
   assert_eq(implemented.map(|i: { name: Bytes, op: Intrinsic }| i.name), [])
 }
 
@@ -91,7 +97,7 @@ test "every builtin the runtime implements is one a program can call" {
     rows().fold(Map::new(), |acc: Map<Bytes, Bool>, row: BuiltinRow| acc.insert(row.name, true)),
     |acc: Map<Bytes, Bool>, b: Builtin| acc.insert(b.name, true),
   );
-  let untyped = shipped.runtime().natives.map(|n: Native| n.name).filter(|n: Bytes|
+  let untyped = shipped_runtime().natives.map(|n: Native| n.name).filter(|n: Bytes|
     !typed.contains(n) && !n.starts_with(b"?"));
   assert(
     untyped.len() == 0,
@@ -107,7 +113,7 @@ fn typed_raises(row: BuiltinRow) -> Bool =
 
 // The runtime answers a builtin's failure with a raise only where the scheme lets a `handle` see one.
 test "every builtin raises exactly when its scheme says it may" {
-  let runtime = natives();
+  let runtime = implemented();
   rows().fold((), |_u: Unit, row: BuiltinRow|
     match runtime.get(row.name) {
       None -> (),

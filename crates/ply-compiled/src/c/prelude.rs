@@ -1,13 +1,15 @@
-//! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
-//! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
+//! The helpers a loaded unit binds, each read off its function's type, and the C a unit a released
+//! `ply` emits opens and closes with, which this runtime's description still hands it.
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::native::{Addr, F64, I64, Native, Raises, Signature};
 use crate::rt::Ctx;
 
-/// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
-/// shared object cannot see symbols the host executable did not export.
+/// What a released `ply`'s units open with, as it reads this runtime's description; this `ply`'s
+/// emitter writes its own (`compiler.emit.print.head`). `rt_*` is declared, not defined:
+/// `ply_bind` supplies the addresses after `dlopen`, since a shared object cannot see symbols the
+/// host executable did not export.
 pub const PRELUDE: &str = r#"
 #include <stdint.h>
 /* tcc's arm64 linker writes every call as one branch, which reaches 128 MB and no further, and says
@@ -156,13 +158,12 @@ static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
 "#;
 
-/// A runtime helper the emitted C may call: arguments past the context, whether it answers, and
-/// the function a loaded unit binds it to.
+/// A runtime helper the emitted C may call: what it takes past the context and answers, as its
+/// function's type says, and the function a loaded unit binds it to.
 #[derive(Clone, Copy)]
 pub struct Helper {
     pub name: &'static str,
-    pub args: usize,
-    pub answers: bool,
+    pub signature: Signature,
     pub address: *const (),
 }
 
@@ -175,10 +176,18 @@ impl Helper {
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
-            args: F::SIGNATURE.words(),
-            answers: F::SIGNATURE.answers(),
+            signature: F::SIGNATURE,
             address: f.address(),
         }
+    }
+
+    /// The words a call passes past the context.
+    pub fn args(&self) -> usize {
+        self.signature.words()
+    }
+
+    pub fn answers(&self) -> bool {
+        self.signature.answers()
     }
 }
 
@@ -373,15 +382,21 @@ pub fn helpers() -> &'static [Helper] {
     })
 }
 
+/// The runtime's own helpers, which are no native's.
+pub fn own_helpers() -> &'static [Helper] {
+    let all = helpers();
+    &all[..all.len() - machine_natives().len()]
+}
+
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the
 /// one translation unit that defines what [`runtime_header`] declares.
 pub const RUNTIME_MARK: &str = "/* --- the runtime, bound at load --- */";
 
 /// A helper's C return type and parameter list.
 fn signature(h: &Helper) -> (&'static str, String) {
-    let ret = if h.answers { "Word" } else { "void" };
+    let ret = if h.answers() { "Word" } else { "void" };
     let mut params = String::from("PlyCtx*");
-    for _ in 0..h.args {
+    for _ in 0..h.args() {
         params.push_str(", Word");
     }
     (ret, params)

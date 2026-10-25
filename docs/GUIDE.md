@@ -3239,7 +3239,11 @@ library shares within itself, and only a shipped module imports one (`E0159`).
 The runtime reports each native it implements, the words a call passes, whether
 it answers and whether it raises, as the Rust type of the function it binds says;
 a unit is compiled only against a runtime that implements each native it calls, an
-`extern fn` or one the compiler writes calls of, once and as declared (`E0476`).
+`extern fn` or one the compiler writes calls of, once and as declared (`E0476`). It
+also reports each helper of its own that emitted code calls, and where it lays out
+what emitted code reads in place (the context's fields, a block's header, the
+descriptors); a unit is compiled only against a runtime that agrees with what the
+compiler declares of them (`E0481`).
 Most are functions of a
 type of the language's, declared under it (`extern fn List::len`) and called on
 a value or through the type as any function of a type is (§5.4): `xs.len()`,
@@ -4066,6 +4070,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0478` | a unit whose code calls a definition lending or giving otherwise than the definition takes it |
 | `E0479` | a law schema's `identity` constraint settled at a type whose `==` is not identity |
 | `E0480` | an `invariant` for a `pub` type that is not `opaque`, which other modules could build; a parameter default naming a constructor of a type that states an `invariant`, which each call omitting the argument would build |
+| `E0481` | a unit whose runtime lacks a helper its code calls or has it otherwise, or lays out a field, a size or a constant its code reads otherwise than the compiler declares |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |
