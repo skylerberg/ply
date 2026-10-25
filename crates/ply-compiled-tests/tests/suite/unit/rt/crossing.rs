@@ -439,7 +439,7 @@ fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_conte
     unsafe { helper::<N1>("rt_builtin_encoded")(&mut ctx, 0) };
     let said = ctx.take_failure().expect("a diagnostic").message;
     assert!(said.contains("no lowering open"), "{said}");
-    let mut ctx = context_calling(&["Char::of_int"]);
+    let mut ctx = context_calling(&["digest"]);
     called_encoded(&mut ctx, 1, |c| unsafe {
         native::<N2>("?out_count")(c, tag::LIST as Word, 0);
     });

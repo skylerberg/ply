@@ -1,6 +1,5 @@
 use astro_float::{BigFloat, Consts, RoundingMode, Sign};
 use ply_core::Value;
-use ply_core::builtins::Builtin;
 use ply_core::float::{self, CANONICAL_NAN_BITS, bits, total_cmp};
 use std::cmp::Ordering;
 
@@ -79,23 +78,49 @@ fn precision(x: f64) -> usize {
     256 + (x.abs().log2().max(0.0) as usize)
 }
 
-fn reference(b: Builtin, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
+/// A `Float` function the runtime answers correctly rounded.
+#[derive(Clone, Copy, Debug)]
+enum Function {
+    Sqrt,
+    Exp,
+    Ln,
+    Log2,
+    Log10,
+    Sin,
+    Cos,
+    Tan,
+    Asin,
+    Acos,
+    Atan,
+    Pow,
+    Atan2,
+    Hypot,
+}
+
+impl Function {
+    /// Its name in the prelude.
+    fn name(self) -> String {
+        format!("Float::{}", format!("{self:?}").to_lowercase())
+    }
+}
+
+fn reference(b: Function, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
     let p = precision(x.max(y));
     let big = |v: f64| BigFloat::from_f64(v, p);
     let r = match b {
-        Builtin::Sqrt => big(x).sqrt(p, RM),
-        Builtin::Exp => big(x).exp(p, RM, cc),
-        Builtin::Ln => big(x).ln(p, RM, cc),
-        Builtin::Log2 => big(x).log2(p, RM, cc),
-        Builtin::Log10 => big(x).log10(p, RM, cc),
-        Builtin::Sin => big(x).sin(p, RM, cc),
-        Builtin::Cos => big(x).cos(p, RM, cc),
-        Builtin::Tan => big(x).tan(p, RM, cc),
-        Builtin::Asin => big(x).asin(p, RM, cc),
-        Builtin::Acos => big(x).acos(p, RM, cc),
-        Builtin::Atan => big(x).atan(p, RM, cc),
+        Function::Sqrt => big(x).sqrt(p, RM),
+        Function::Exp => big(x).exp(p, RM, cc),
+        Function::Ln => big(x).ln(p, RM, cc),
+        Function::Log2 => big(x).log2(p, RM, cc),
+        Function::Log10 => big(x).log10(p, RM, cc),
+        Function::Sin => big(x).sin(p, RM, cc),
+        Function::Cos => big(x).cos(p, RM, cc),
+        Function::Tan => big(x).tan(p, RM, cc),
+        Function::Asin => big(x).asin(p, RM, cc),
+        Function::Acos => big(x).acos(p, RM, cc),
+        Function::Atan => big(x).atan(p, RM, cc),
         // `Float::exp(y * ln |x|)`, odd powers of a negative base negated.
-        Builtin::Pow => {
+        Function::Pow => {
             let wide = p + 128;
             let magnitude = BigFloat::from_f64(y, wide)
                 .mul(
@@ -110,14 +135,14 @@ fn reference(b: Builtin, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
                 magnitude
             }
         }
-        Builtin::Hypot => {
+        Function::Hypot => {
             let (bx, by) = (big(x), big(y));
             bx.mul(&bx, p, RM)
                 .add(&by.mul(&by, p, RM), p, RM)
                 .sqrt(p, RM)
         }
         // `Float::atan(y / x)` turned by `pi` into the half-plane of a negative `x`.
-        Builtin::Atan2 => {
+        Function::Atan2 => {
             let (yy, xx) = (x, y);
             let a = big(yy).div(&big(xx), p, RM).atan(p, RM, cc);
             if xx > 0.0 {
@@ -128,7 +153,6 @@ fn reference(b: Builtin, x: f64, y: f64, cc: &mut Consts) -> Option<f64> {
                 a.sub(&cc.pi(p, RM), p, RM)
             }
         }
-        other => panic!("`{}` has no reference", other.name()),
     };
     decided(&r, p)
 }
@@ -155,73 +179,71 @@ impl Rng {
     }
 
     /// Arguments for `b` across its domain, the ranges an implementation treats apart included.
-    fn arguments(&mut self, b: Builtin, i: usize) -> (f64, f64) {
+    fn arguments(&mut self, b: Function, i: usize) -> (f64, f64) {
         match (b, i % 3) {
-            (Builtin::Sqrt, _) => (self.spread(-1074, 1023).abs(), 0.0),
-            (Builtin::Exp, 0) => (self.between(-745.0, 709.7), 0.0),
-            (Builtin::Exp, _) => (self.spread(-60, 0), 0.0),
-            (Builtin::Ln | Builtin::Log2 | Builtin::Log10, 0) => (self.between(0.5, 2.0), 0.0),
-            (Builtin::Ln | Builtin::Log2 | Builtin::Log10, _) => {
+            (Function::Sqrt, _) => (self.spread(-1074, 1023).abs(), 0.0),
+            (Function::Exp, 0) => (self.between(-745.0, 709.7), 0.0),
+            (Function::Exp, _) => (self.spread(-60, 0), 0.0),
+            (Function::Ln | Function::Log2 | Function::Log10, 0) => (self.between(0.5, 2.0), 0.0),
+            (Function::Ln | Function::Log2 | Function::Log10, _) => {
                 (self.spread(-1022, 1023).abs(), 0.0)
             }
-            (Builtin::Sin | Builtin::Cos | Builtin::Tan, 0) => (self.between(-10.0, 10.0), 0.0),
-            (Builtin::Sin | Builtin::Cos | Builtin::Tan, 1) => (self.spread(-30, 30), 0.0),
-            (Builtin::Sin | Builtin::Cos | Builtin::Tan, _) => (self.spread(30, 1023), 0.0),
-            (Builtin::Asin | Builtin::Acos, 0) => (self.between(-1.0, 1.0), 0.0),
-            (Builtin::Asin | Builtin::Acos, _) => (self.spread(-40, -1), 0.0),
-            (Builtin::Atan, _) => (self.spread(-40, 60), 0.0),
-            (Builtin::Pow, 0) => (self.spread(-20, 20).abs(), self.between(-40.0, 40.0)),
-            (Builtin::Pow, 1) => (self.between(0.9, 1.1), self.spread(0, 12)),
-            (Builtin::Pow, _) => (self.spread(-1, 1), (self.next() % 200) as f64 - 100.0),
-            (Builtin::Atan2, _) => (self.spread(-50, 50), self.spread(-50, 50)),
-            (Builtin::Hypot, _) => {
+            (Function::Sin | Function::Cos | Function::Tan, 0) => (self.between(-10.0, 10.0), 0.0),
+            (Function::Sin | Function::Cos | Function::Tan, 1) => (self.spread(-30, 30), 0.0),
+            (Function::Sin | Function::Cos | Function::Tan, _) => (self.spread(30, 1023), 0.0),
+            (Function::Asin | Function::Acos, 0) => (self.between(-1.0, 1.0), 0.0),
+            (Function::Asin | Function::Acos, _) => (self.spread(-40, -1), 0.0),
+            (Function::Atan, _) => (self.spread(-40, 60), 0.0),
+            (Function::Pow, 0) => (self.spread(-20, 20).abs(), self.between(-40.0, 40.0)),
+            (Function::Pow, 1) => (self.between(0.9, 1.1), self.spread(0, 12)),
+            (Function::Pow, _) => (self.spread(-1, 1), (self.next() % 200) as f64 - 100.0),
+            (Function::Atan2, _) => (self.spread(-50, 50), self.spread(-50, 50)),
+            (Function::Hypot, _) => {
                 let x = self.spread(-1000, 1000);
                 let e = x.abs().log2() as i64;
                 (x, self.spread((e - 30).max(-1022), (e + 30).min(1023)))
             }
-            (other, _) => panic!("`{}` has no sampler", other.name()),
         }
     }
 }
 
 /// What the runtime's function for builtin `b` answers over `x`, and `y` where it takes two.
-fn answered(b: Builtin, x: f64, y: f64) -> f64 {
+fn answered(b: Function, x: f64, y: f64) -> f64 {
     match b {
-        Builtin::Sqrt => x.sqrt(),
-        Builtin::Exp => float::exp(x),
-        Builtin::Ln => float::ln(x),
-        Builtin::Log2 => float::log2(x),
-        Builtin::Log10 => float::log10(x),
-        Builtin::Sin => float::sin(x),
-        Builtin::Cos => float::cos(x),
-        Builtin::Tan => float::tan(x),
-        Builtin::Asin => float::asin(x),
-        Builtin::Acos => float::acos(x),
-        Builtin::Atan => float::atan(x),
-        Builtin::Pow => float::pow(x, y),
-        Builtin::Atan2 => float::atan2(x, y),
-        Builtin::Hypot => float::hypot(x, y),
-        other => panic!("`{}` is no float function", other.name()),
+        Function::Sqrt => x.sqrt(),
+        Function::Exp => float::exp(x),
+        Function::Ln => float::ln(x),
+        Function::Log2 => float::log2(x),
+        Function::Log10 => float::log10(x),
+        Function::Sin => float::sin(x),
+        Function::Cos => float::cos(x),
+        Function::Tan => float::tan(x),
+        Function::Asin => float::asin(x),
+        Function::Acos => float::acos(x),
+        Function::Atan => float::atan(x),
+        Function::Pow => float::pow(x, y),
+        Function::Atan2 => float::atan2(x, y),
+        Function::Hypot => float::hypot(x, y),
     }
 }
 
 #[test]
 fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
     let functions = [
-        Builtin::Sqrt,
-        Builtin::Exp,
-        Builtin::Ln,
-        Builtin::Log2,
-        Builtin::Log10,
-        Builtin::Sin,
-        Builtin::Cos,
-        Builtin::Tan,
-        Builtin::Asin,
-        Builtin::Acos,
-        Builtin::Atan,
-        Builtin::Pow,
-        Builtin::Atan2,
-        Builtin::Hypot,
+        Function::Sqrt,
+        Function::Exp,
+        Function::Ln,
+        Function::Log2,
+        Function::Log10,
+        Function::Sin,
+        Function::Cos,
+        Function::Tan,
+        Function::Asin,
+        Function::Acos,
+        Function::Atan,
+        Function::Pow,
+        Function::Atan2,
+        Function::Hypot,
     ];
     let mut cc = Consts::new().expect("astro-float's constants");
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15);

@@ -11,7 +11,7 @@ use crate::c::{MachineNative, machine_native};
 use crate::emitted::Handle;
 use crate::heap::{bridged, obj};
 use crate::native::{Addr, F64, I64, Raises};
-use crate::rt::{Ctx, lent, refuse, refused_builtin, refused_unknown};
+use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
 use ply_core::builtins::{assert_failure, call, not_found};
 use ply_core::{Builtin, Decimal, Diagnostic, Fixed, Span, Value, codes};
 
@@ -452,12 +452,12 @@ pub unsafe extern "C" fn rt_refused_text(
 ) -> Raises {
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let Some(builtin) = refused_builtin(what) else {
+    let Some(r) = refused_numbered(what) else {
         refused_unknown(c, what);
         return Raises(());
     };
-    let refused = match builtin {
-        Builtin::StringFind => {
+    let refused = match r {
+        Refused::StringFind => {
             let (Some(s), Some(needle)) =
                 (c.text(unsafe { lent(p, n) }), c.text(unsafe { lent(q, m) }))
             else {
@@ -465,7 +465,7 @@ pub unsafe extern "C" fn rt_refused_text(
             };
             not_found(site, s, needle)
         }
-        Builtin::Assert => {
+        Refused::Assert => {
             let message = if n.0 < 0 {
                 Value::ctor("None", Vec::new())
             } else {
@@ -481,7 +481,7 @@ pub unsafe extern "C" fn rt_refused_text(
             return Raises(());
         }
     };
-    refuse(c, builtin, refused);
+    refuse(c, r, refused);
     Raises(())
 }
 
