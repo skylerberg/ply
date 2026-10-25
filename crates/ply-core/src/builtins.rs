@@ -111,8 +111,6 @@ builtins! { $
     Min = "min" (a, b) -> Word;
     Max = "max" (a, b) -> Word;
     ByteOfInt = "byte_of_int" (n) -> Raising;
-    IntToString = "Int::to_string" (n) -> Word;
-    FloatToString = "Float::to_string" (f) -> Word;
     StringConcat = "String::concat" (a, b) -> Word;
     BytesLen = "Bytes::len" (b) -> Word;
     BytesAt = "Bytes::at" (b, i) -> Raising;
@@ -125,7 +123,6 @@ builtins! { $
     BytesGunzip = "Bytes::gunzip" (b) -> Word;
     BytesZstd = "Bytes::zstd" (b) -> Word;
     BytesOfString = "Bytes::of_string" (s) -> Word;
-    BytesIsUtf8 = "Bytes::is_utf8" (b) -> Word;
     BytesIndexOf = "Bytes::index_of" (hay, needle) -> Word;
     BytesIndexOfFrom = "Bytes::index_of_from" (hay, needle, from) -> Raising;
     BytesIndexOfByte = "Bytes::index_of_byte" (hay, byte) -> Raising;
@@ -135,12 +132,9 @@ builtins! { $
     BytesScan = "Bytes::scan" (hay, from, class, budget) -> Raising;
     BytesScanUntil = "Bytes::scan_until" (hay, from, class, budget) -> Raising;
     BytesPosition = "Bytes::position" (b, from, f) -> Raising;
-    StringOfBytes = "String::of_bytes" (b) -> Raising;
-    StringOfBytesLossy = "String::of_bytes_lossy" (b) -> Word;
     StringLen = "String::len" (s) -> Word;
     StringSlice = "String::slice" (s, start, end) -> Raising;
     StringSplit = "String::split" (s, sep) -> Raising;
-    StringTrim = "String::trim" (s) -> Word;
     StringStartsWith = "String::starts_with" (s, prefix) -> Word;
     StringEndsWith = "String::ends_with" (s, suffix) -> Word;
     StringContains = "String::contains" (s, t) -> Word;
@@ -155,7 +149,6 @@ builtins! { $
     DecimalOfFloat = "Decimal::of_float" (f) -> Word;
     DecimalOfString = "Decimal::of_string" (s) -> Word;
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
-    FloatOfString = "Float::of_string" (s) -> Word;
     DecimalToString = "Decimal::to_string" (d) -> Word;
     DecimalScale = "Decimal::scale" (d) -> Word;
     /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
@@ -175,10 +168,6 @@ builtins! { $
     I128OfInt = "I128::of_int" (n) -> Word;
     IntOfU128 = "Int::of_u128" (n) -> Raising;
     IntOfI128 = "Int::of_i128" (n) -> Raising;
-    U128ToString = "U128::to_string" (n) -> Word;
-    I128ToString = "I128::to_string" (n) -> Word;
-    U128OfString = "U128::of_string" (s) -> Word;
-    I128OfString = "I128::of_string" (s) -> Word;
     /// Over any integer type: the exact answer, or `None` where it leaves the type.
     CheckedAdd = "checked_add" (a, b) -> Word;
     CheckedSub = "checked_sub" (a, b) -> Word;
@@ -635,21 +624,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             }
         }
 
-        Builtin::U128ToString | Builtin::I128ToString => {
-            let f = args[0].as_fixed(span, &format!("`{}`", b.name()))?;
-            Ok(Value::str(f.to_decimal()))
-        }
-
-        Builtin::U128OfString | Builtin::I128OfString => {
-            let text = args[0].as_str(span, &format!("`{}`", b.name()))?;
-            let t = if b == Builtin::U128OfString {
-                IntTy::U128
-            } else {
-                IntTy::I128
-            };
-            Ok(option(fixed_of_text(t, text).map(Value::Fixed)))
-        }
-
         Builtin::CheckedAdd | Builtin::CheckedSub | Builtin::CheckedMul => {
             let answer = match (&args[0], &args[1]) {
                 (Value::Fixed(x), Value::Fixed(y)) if x.ty == y.ty => {
@@ -693,16 +667,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
                 Err(_) => Err(byte_of_int_refused(span, n)),
             }
         }
-
-        Builtin::IntToString => Ok(Value::str(
-            args[0].as_int(span, "`Int::to_string`")?.to_string(),
-        )),
-
-        // The language's own float spelling, the one a diagnostic prints: shortest round-trip,
-        // and `Infinity`/`NaN` rather than the `inf`/`NaN` Rust would write.
-        Builtin::FloatToString => Ok(Value::str(crate::render_float(
-            args[0].as_float(span, "`Float::to_string`")?,
-        ))),
 
         Builtin::StringConcat => {
             let a = args[0].as_str(span, "`String::concat`")?;
@@ -809,11 +773,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::bytes(s.as_bytes()))
         }
 
-        Builtin::BytesIsUtf8 => {
-            let b = args[0].as_bytes(span, "`Bytes::is_utf8`")?;
-            Ok(Value::Bool(std::str::from_utf8(b).is_ok()))
-        }
-
         Builtin::BytesIndexOf => {
             let hay = args[0].as_bytes(span, "`Bytes::index_of`")?;
             let needle = args[1].as_bytes(span, "`Bytes::index_of`")?;
@@ -869,19 +828,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::BytesScanUntil => {
             let b = args[0].as_bytes(span, "`Bytes::scan_until`")?;
             Ok(Value::Int(scan(args, b, span, true)?))
-        }
-
-        Builtin::StringOfBytes => {
-            let b = args[0].as_bytes(span, "`String::of_bytes`")?;
-            match std::str::from_utf8(b) {
-                Ok(s) => Ok(Value::str(s)),
-                Err(e) => Err(not_utf8(span, b, &e)),
-            }
-        }
-
-        Builtin::StringOfBytesLossy => {
-            let b = args[0].as_bytes(span, "`String::of_bytes_lossy`")?;
-            Ok(Value::str(String::from_utf8_lossy(b)))
         }
 
         Builtin::CharOfInt => {
@@ -1100,8 +1046,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(Value::list(s.split(sep).map(Value::str).collect()))
         }
 
-        Builtin::StringTrim => Ok(Value::str(args[0].as_str(span, "`String::trim`")?.trim())),
-
         Builtin::StringStartsWith => {
             let s = args[0].as_str(span, "`String::starts_with`")?;
             let prefix = args[1].as_str(span, "`String::starts_with`")?;
@@ -1195,11 +1139,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
             Ok(option(parse_decimal(s).map(Value::Decimal)))
         }
 
-        Builtin::FloatOfString => {
-            let s = args[0].as_str(span, "`Float::of_string`")?;
-            Ok(option(parse_float(s).map(Value::Float)))
-        }
-
         // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `Decimal::of_string`.
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`Decimal::to_string`")?;
@@ -1288,22 +1227,6 @@ fn call_with(b: Builtin, args: &mut Vec<Value>, span: Span) -> Result<Value, Dia
         Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
         Builtin::SqliteRun => crate::sqlite::run_image(args, span),
         Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
-    }
-}
-
-/// Digits, after a `-` only for a signed width, and a value the width holds.
-fn fixed_of_text(t: IntTy, text: &str) -> Option<Fixed> {
-    let digits = match text.strip_prefix('-') {
-        Some(rest) if t.signed() => rest,
-        _ => text,
-    };
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    if t.signed() {
-        Fixed::of(t, text.parse::<i128>().ok()?)
-    } else {
-        Fixed::of_unsigned(t, text.parse::<u128>().ok()?)
     }
 }
 
@@ -1465,30 +1388,6 @@ fn parse_decimal(text: &str) -> Option<Decimal> {
     } else {
         Decimal::from_str_exact(text).ok()
     }
-}
-
-/// The lexer's float grammar plus a leading sign; `inf`, `NaN`, `.5` and the like are `None`.
-fn parse_float(text: &str) -> Option<f64> {
-    let body = text.strip_prefix(['+', '-']).unwrap_or(text);
-    let (mantissa, exponent) = match body.split_once(['e', 'E']) {
-        Some((m, e)) => (m, Some(e)),
-        None => (body, None),
-    };
-    let (whole, fraction) = match mantissa.split_once('.') {
-        Some((w, f)) => (w, Some(f)),
-        None => (mantissa, None),
-    };
-    let digits = |s: &str| {
-        s.starts_with(|c: char| c.is_ascii_digit())
-            && s.bytes().all(|b| b.is_ascii_digit() || b == b'_')
-    };
-    if !digits(whole)
-        || fraction.is_some_and(|f| !digits(f))
-        || exponent.is_some_and(|e| !digits(e.strip_prefix(['+', '-']).unwrap_or(e)))
-    {
-        return None;
-    }
-    text.replace('_', "").parse().ok()
 }
 
 fn position(at: Option<usize>) -> Value {
@@ -1733,25 +1632,6 @@ fn char_offset(s: &str, n: usize) -> usize {
         .chain(std::iter::once(s.len()))
         .nth(n)
         .unwrap_or(s.len())
-}
-
-/// `String::of_bytes` given the bytes `b`, which `e` says are not UTF-8.
-#[cold]
-pub fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
-    let at = e.valid_up_to();
-    let what = match e.error_len() {
-        Some(n) => format!(
-            "{n} byte{} at offset {at} are not a UTF-8 sequence",
-            if n == 1 { "" } else { "s" }
-        ),
-        None => format!("a UTF-8 sequence starting at offset {at} is cut short"),
-    };
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`String::of_bytes` was given bytes that are not UTF-8: {what}"),
-    )
-    .primary(span, format!("byte {at} of {} is where it fails", b.len()))
-    .note("guard with `Bytes::is_utf8`, or use `String::of_bytes_lossy` to accept U+FFFD")
 }
 
 #[cold]

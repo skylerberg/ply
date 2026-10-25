@@ -156,7 +156,7 @@ fn cancel_carried(c: &mut Ctx) {
 /// The builtins emitted code writes in place whose refusal of their operands it hands the runtime,
 /// each numbered by its place here: through [`rt_refused`] where the refusal names numbers, and
 /// through [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
-pub const REFUSED: [Builtin; 24] = [
+pub const REFUSED: [Builtin; 23] = [
     Builtin::ArrayNew,
     Builtin::ColumnsNew,
     Builtin::ArrayOfList,
@@ -178,7 +178,6 @@ pub const REFUSED: [Builtin; 24] = [
     Builtin::BytesSplit,
     Builtin::StringSplit,
     Builtin::StringFind,
-    Builtin::StringOfBytes,
     Builtin::Assert,
     Builtin::BytesPosition,
 ];

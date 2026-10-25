@@ -6,7 +6,7 @@ use ply_compiled::c::builtin_helper_name;
 use ply_compiled::heap::Word;
 use ply_compiled::rt::Ctx;
 use ply_core::builtins::call;
-use ply_core::{Builtin, Decimal, Fixed, IntTy, Span, Value};
+use ply_core::{Builtin, Decimal, Span, Value};
 
 type A1 = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type A2 = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
@@ -48,76 +48,14 @@ fn bytes_of(v: Value) -> Vec<u8> {
 }
 
 #[test]
-fn utf8_is_told_apart_and_mended_as_the_builtins_do() {
+fn a_decimal_is_written_as_its_builtin_writes_it() {
     let mut ctx = context();
-    let cases: [&[u8]; 5] = [
-        b"",
-        b"plain",
-        "caf\u{e9} \u{1f600}".as_bytes(),
-        b"\xff\xfe",
-        b"ab\xc3",
-    ];
-    for b in cases {
-        let valid = builtin(Builtin::BytesIsUtf8, vec![Value::bytes(b)]);
-        assert_eq!(Value::Bool(over(&mut ctx, "?utf8_valid", b) == 1), valid);
-        let lossy = builtin(Builtin::StringOfBytesLossy, vec![Value::bytes(b)]);
-        assert_eq!(taken_over(&mut ctx, "?utf8_lossy", b), bytes_of(lossy));
-    }
-    assert_eq!(ctx.failed, 0);
-}
-
-#[test]
-fn white_space_is_the_builtins() {
-    let mut ctx = context();
-    for s in [
-        "",
-        "MiXeD",
-        "stra\u{df}e \u{130}",
-        "  \t tab\u{a0}\n",
-        "\u{3000}x\u{2003}",
-    ] {
-        let start = over(&mut ctx, "?trim_start", s.as_bytes()) as usize;
-        let end = over(&mut ctx, "?trim_end", s.as_bytes()) as usize;
-        let trimmed = bytes_of(builtin(Builtin::StringTrim, vec![Value::str(s)]));
-        if trimmed.is_empty() {
-            assert!(start >= end, "{s:?} trims to nothing");
-        } else {
-            assert_eq!(&s.as_bytes()[start..end], trimmed.as_slice(), "{s:?}");
-        }
-    }
-    assert_eq!(ctx.failed, 0);
-}
-
-#[test]
-fn numbers_are_written_as_their_builtins_write_them() {
-    let mut ctx = context();
-    for v in [0, -1, 42, i64::MIN, i64::MAX] {
-        let n = unsafe { native::<A1>("?int_text")(&mut ctx, v) };
-        let want = bytes_of(builtin(Builtin::IntToString, vec![Value::Int(v)]));
-        assert_eq!(taken(&mut ctx, n), want);
-    }
-    for f in [0.0, -0.5, 1e300, f64::INFINITY, f64::NAN, 0.1 + 0.2] {
-        let n = unsafe { native::<A1>("?float_text")(&mut ctx, ply_core::float::bits(f) as Word) };
-        let want = bytes_of(builtin(Builtin::FloatToString, vec![Value::Float(f)]));
-        assert_eq!(taken(&mut ctx, n), want);
-    }
     for d in [Decimal::new(-12345, 3), Decimal::new(150, 2), Decimal::ZERO] {
         let b = d.serialize();
         let lo = i64::from_le_bytes(b[..8].try_into().unwrap());
         let hi = i64::from_le_bytes(b[8..].try_into().unwrap());
         let n = unsafe { native::<A2>("?decimal_text")(&mut ctx, lo, hi) };
         let want = bytes_of(builtin(Builtin::DecimalToString, vec![Value::Decimal(d)]));
-        assert_eq!(taken(&mut ctx, n), want);
-    }
-    for (ty, bits, b) in [
-        (IntTy::U128, u128::MAX, Builtin::U128ToString),
-        (IntTy::I128, (-7i128) as u128, Builtin::I128ToString),
-        (IntTy::I128, i128::MIN as u128, Builtin::I128ToString),
-    ] {
-        let signed = Word::from(ty == IntTy::I128);
-        let (lo, hi) = (bits as u64 as Word, (bits >> 64) as u64 as Word);
-        let n = unsafe { native::<A3>("?wide_text")(&mut ctx, signed, lo, hi) };
-        let want = bytes_of(builtin(b, vec![Value::Fixed(Fixed::new(ty, bits))]));
         assert_eq!(taken(&mut ctx, n), want);
     }
     assert_eq!(ctx.failed, 0);
@@ -129,21 +67,8 @@ fn word(ctx: &mut Ctx, k: Word) -> Word {
 }
 
 #[test]
-fn a_parse_answers_its_number_in_words_or_minus_one_for_none() {
+fn a_decimal_parse_answers_its_two_words_or_minus_one_for_none() {
     let mut ctx = context();
-    for s in ["1.5", "-0", "inf", "nope", ""] {
-        let n = over(&mut ctx, "?float_parse", s.as_bytes());
-        match &builtin(Builtin::FloatOfString, vec![Value::str(s)]) {
-            Value::Ctor { args, .. } if !args.is_empty() => {
-                assert_eq!(n, 8, "{s:?}");
-                assert_eq!(
-                    Value::Float(f64::from_bits(word(&mut ctx, 0) as u64)),
-                    args[0]
-                );
-            }
-            _ => assert_eq!(n, -1, "{s:?}"),
-        }
-    }
     for s in ["1.50", "-0.001", "x", ""] {
         let n = over(&mut ctx, "?decimal_parse", s.as_bytes());
         match &builtin(Builtin::DecimalOfString, vec![Value::str(s)]) {
@@ -160,24 +85,14 @@ fn a_parse_answers_its_number_in_words_or_minus_one_for_none() {
             _ => assert_eq!(n, -1, "{s:?}"),
         }
     }
-    let wide = |ctx: &mut Ctx, signed: Word, s: &str| unsafe {
-        native::<A3>("?wide_parse")(ctx, signed, s.as_ptr() as Word, s.len() as Word)
-    };
-    let max = u128::MAX.to_string();
-    assert_eq!(wide(&mut ctx, 0, &max), 16);
-    assert_eq!((word(&mut ctx, 0), word(&mut ctx, 1)), (-1, -1));
-    assert_eq!(wide(&mut ctx, 1, "-2"), 16);
-    assert_eq!((word(&mut ctx, 0), word(&mut ctx, 1)), (-2, -1));
-    assert_eq!(wide(&mut ctx, 1, &max), -1);
-    assert_eq!(wide(&mut ctx, 0, "-1"), -1);
     assert_eq!(ctx.failed, 0);
 }
 
 #[test]
 fn a_word_past_the_taken_bytes_fails_the_run() {
     let mut ctx = context();
-    assert_eq!(over(&mut ctx, "?float_parse", b"2"), 8);
-    word(&mut ctx, 1);
+    assert_eq!(over(&mut ctx, "?decimal_parse", b"2"), 16);
+    word(&mut ctx, 2);
     assert_ne!(ctx.failed, 0);
 }
 

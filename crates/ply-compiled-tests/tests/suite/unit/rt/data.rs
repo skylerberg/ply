@@ -161,7 +161,7 @@ fn a_string_operation_refused_numbers_says_what_its_builtin_says_over_values() {
             vec![Value::str("abc"), Value::str("")],
         ),
         (
-            23,
+            22,
             [9, 3, 0],
             Builtin::BytesPosition,
             vec![abc(), Value::Int(9), Value::Int(0)],
@@ -191,27 +191,13 @@ fn a_string_operation_refused_text_says_what_its_builtin_says_over_values() {
         ),
         (
             21,
-            Some(&b"a\xffb"[..]),
-            &b""[..],
-            Builtin::StringOfBytes,
-            vec![Value::bytes(*b"a\xffb")],
-        ),
-        (
-            21,
-            Some(&b"a\xe2\x82"[..]),
-            &b""[..],
-            Builtin::StringOfBytes,
-            vec![Value::bytes(*b"a\xe2\x82")],
-        ),
-        (
-            22,
             None,
             &b""[..],
             Builtin::Assert,
             vec![Value::Bool(false), none()],
         ),
         (
-            22,
+            21,
             Some(&b"why"[..]),
             &b""[..],
             Builtin::Assert,
@@ -230,7 +216,7 @@ fn a_string_operation_refused_text_says_what_its_builtin_says_over_values() {
 #[test]
 fn an_operation_no_number_names_fails_the_entry_as_plys_fault() {
     for d in [
-        refused(24, 0, 0, 0),
+        refused(23, 0, 0, 0),
         refused(-1, 0, 0, 0),
         refused(20, 0, 0, 0),
         refused_text(8, None, b""),
@@ -343,12 +329,12 @@ fn a_refusal_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fail
     let text = failed_under_a_clause(|c| unsafe {
         helper::<RefusedText>(&builtin_helper_name("?refused_text"))(
             c,
-            21,
-            b"\xff".as_ptr(),
+            20,
+            b"abc".as_ptr(),
+            3,
+            b"z".as_ptr(),
             1,
-            std::ptr::null(),
-            0,
         )
     });
-    assert_eq!(text, FAILED_ABORT, "`String::of_bytes` raises");
+    assert_eq!(text, FAILED_ABORT, "`String::find` raises");
 }
