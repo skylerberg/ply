@@ -168,6 +168,156 @@ pub fn stored_values(
     entered.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
+/// One call of an [`entered`] unit's entry, and where its answer goes.
+struct Entry {
+    argument: Vec<u8>,
+    steps: i64,
+    reply: std::sync::mpsc::Sender<Result<Option<Vec<u8>>, Diagnostic>>,
+}
+
+type Worker = std::sync::mpsc::Sender<Entry>;
+
+/// Each unit [`entered`] opened, by its library and its runnable.
+static OPENED: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), Worker>>,
+> = std::sync::OnceLock::new();
+
+/// What the entry of the runnable at `runnable`, its unit compiled into the library `unit`,
+/// answers for the value the PLV1 bytes `argument` hold under `steps` calls, as PLV1 writes it:
+/// none where it raised or ran past its calls. The unit is opened the first time a process enters it, on a thread of its own that
+/// keeps its machine for every later call.
+pub fn entered(
+    unit: PathBuf,
+    runnable: PathBuf,
+    argument: Vec<u8>,
+    steps: i64,
+) -> Result<Option<Vec<u8>>, Diagnostic> {
+    let worker = worker_of(unit, runnable)?;
+    let (reply, answer) = std::sync::mpsc::channel();
+    worker
+        .send(Entry {
+            argument,
+            steps,
+            reply,
+        })
+        .map_err(|_| worker_gone())?;
+    answer.recv().map_err(|_| worker_gone())?
+}
+
+fn worker_of(unit: PathBuf, runnable: PathBuf) -> Result<Worker, Diagnostic> {
+    let key = (unit.clone(), runnable.clone());
+    let mut opened = OPENED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(worker) = opened.get(&key) {
+        return Ok(worker.clone());
+    }
+    let (worker, hearing) = std::sync::mpsc::channel();
+    let (ready, readied) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("ply entered".to_string())
+        .stack_size(ply_compiled::rt::PROGRAM_STACK)
+        .spawn(move || serve_entries(&unit, &runnable, &ready, &hearing))
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the unit could not be entered on a thread of its own: {e}"),
+            )
+        })?;
+    readied.recv().map_err(|_| worker_gone())??;
+    opened.insert(key, worker.clone());
+    Ok(worker)
+}
+
+fn serve_entries(
+    unit: &std::path::Path,
+    runnable: &std::path::Path,
+    ready: &std::sync::mpsc::Sender<Result<(), Diagnostic>>,
+    hearing: &std::sync::mpsc::Receiver<Entry>,
+) {
+    let read = std::fs::read(runnable)
+        .map_err(|e| format!("`{}` does not read: {e}", runnable.display()))
+        .and_then(|bytes| crate::runnable::decode(&bytes))
+        .map_err(|why| {
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the runnable of an entered unit does not read: {why}"),
+            )
+        });
+    let held = match read {
+        Ok(held) => held,
+        Err(refused) => {
+            let _ = ready.send(Err(refused));
+            return;
+        }
+    };
+    let loaded = match crate::driver::load_over_analysis_taken(PathBuf::from("."), held.front) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            let _ = ready.send(Err(err.diagnostics.into_iter().next().unwrap_or_else(
+                || {
+                    Diagnostic::error(
+                        codes::INTERNAL_ERROR,
+                        "the front end's answer did not read, and nothing said why",
+                    )
+                },
+            )));
+            return;
+        }
+    };
+    let machine = ply_compiled::Unit::opened(&loaded.front, unit)
+        .map_err(|e| {
+            Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the unit could not be loaded: {e:#}"),
+            )
+        })
+        .and_then(|unit| ply_core::Machine::new(&loaded.front, ply_core::Provider::attach(unit)));
+    let mut machine = match machine {
+        Ok(machine) => machine,
+        Err(refused) => {
+            let _ = ready.send(Err(refused));
+            return;
+        }
+    };
+    let _ = ready.send(Ok(()));
+    while let Ok(entry) = hearing.recv() {
+        let argument = match ply_core::codec::decode(&entry.argument) {
+            Ok(argument) => argument,
+            Err(why) => {
+                let _ = entry.reply.send(Err(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("an entered unit's argument does not decode: {why}"),
+                )));
+                continue;
+            }
+        };
+        ply_core::rc::reset();
+        let (answer, _) = ply_compiled::rt::with_step_budget(entry.steps, || {
+            machine.call(&held.entry, vec![argument], Span::DUMMY)
+        })
+        .into_parts();
+        let encoded = match answer {
+            Ok(value) => ply_core::codec::encode(&value).map(Some).map_err(|why| {
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    format!("an entered unit's answer does not encode: {why}"),
+                )
+            }),
+            Err(_) => Ok(None),
+        };
+        let _ = entry.reply.send(encoded);
+    }
+}
+
+fn worker_gone() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "the thread an entered unit runs on is gone",
+    )
+}
+
 fn bind_failed(diagnostics: &[Diagnostic]) -> Diagnostic {
     diagnostics.first().cloned().unwrap_or_else(|| {
         Diagnostic::error(

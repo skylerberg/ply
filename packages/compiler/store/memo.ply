@@ -829,79 +829,93 @@ fn settled_at<| e>(
       None -> {
         let step = { query: name, input: input };
         if run.open.contains(key) {
-          panic(
-            "the query `" ++ String::of_bytes_lossy(name) ++ "` asks for its own answer, through"
-              ++ run.trail.push(step).fold("", |acc: String, s: { query: Bytes, input: Bytes }|
-                acc ++ "\n  " ++ String::of_bytes_lossy(s.query) ++ " "
-                  ++ String::of_bytes_lossy(s.input.slice(0, min(s.input.len(), 120)))),
-          )
-        };
-        let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
-        let done = match memo_keep.head(key) {
-          None -> executed(queries, opened, q, key, input, [], None, left - 1),
-          Some(out) -> {
-            let marks = memo_keep.marks(key);
-            if marks.len() == 0 { took(opened, name, out) } else {
-              match memo_keep.record(key) {
-                None -> executed(queries, opened, q, key, input, marks, None, left - 1),
-                Some(r) -> {
-                  let s = stands(queries, opened, r.reads, left - 1);
-                  if s.ok {
-                    memo_keep.unmark(key, marks);
-                    took(s.run, name, r.output)
-                  } else {
-                    // A record of the pack below noted none of its reads: one answered again notes
-                    // them all.
-                    let prior = if memo_keep.stored(key) { Some(r) } else { None };
-                    // An edit undone answers as before: the record it replaced stands again, its
-                    // reads linked to the key since it was first kept.
-                    match match prior {
-                        Some(_) -> memo_keep.record(earlier_key(key)),
-                        None -> None,
-                      } {
-                      Some(e) -> {
-                        let t = stands(queries, s.run, e.reads, left - 1);
-                        if t.ok && memo_keep.output(e.output) != None {
-                          memo_keep.adopt(earlier_key(key), r);
-                          memo_keep.adopt(key, { ..e, height: max(e.height, r.height) });
-                          memo_keep.unmark(key, marks);
-                          // What asked the answer it replaces asks again where the two differ.
-                          took(
-                            answer_moved(
-                              queries,
-                              {
-                                ..t.run,
-                                restored: t.run.restored.push({ query: name, input: input }),
-                              },
-                              asked_id(name, input),
-                              Some(r.output),
+          // While marks settle, a record taken before what it reads settled may lead a body back to
+          // an answer being made: that is taken as kept too, and what took it runs again if it moves.
+          match if run.settling { memo_keep.head(key) } else { None } {
+            Some(out) -> if memo_keep.output(out) != None { took(run, name, out) }
+            else { circled(run, step) },
+            None -> circled(run, step),
+          }
+        } else {
+          let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
+          let done = match memo_keep.head(key) {
+            None -> executed(queries, opened, q, key, input, [], None, left - 1),
+            Some(out) -> {
+              let marks = memo_keep.marks(key);
+              if marks.len() == 0 { took(opened, name, out) } else {
+                match memo_keep.record(key) {
+                  None -> executed(queries, opened, q, key, input, marks, None, left - 1),
+                  Some(r) -> {
+                    let s = stands(queries, opened, r.reads, left - 1);
+                    if s.ok {
+                      memo_keep.unmark(key, marks);
+                      took(s.run, name, r.output)
+                    } else {
+                      // A record of the pack below noted none of its reads: one answered again notes
+                      // them all.
+                      let prior = if memo_keep.stored(key) { Some(r) } else { None };
+                      // An edit undone answers as before: the record it replaced stands again, its
+                      // reads linked to the key since it was first kept.
+                      match match prior {
+                          Some(_) -> memo_keep.record(earlier_key(key)),
+                          None -> None,
+                        } {
+                        Some(e) -> {
+                          let t = stands(queries, s.run, e.reads, left - 1);
+                          if t.ok && memo_keep.output(e.output) != None {
+                            memo_keep.adopt(earlier_key(key), r);
+                            memo_keep.adopt(key, { ..e, height: max(e.height, r.height) });
+                            memo_keep.unmark(key, marks);
+                            // What asked the answer it replaces asks again where the two differ.
+                            took(
+                              answer_moved(
+                                queries,
+                                {
+                                  ..t.run,
+                                  restored: t.run.restored.push({ query: name, input: input }),
+                                },
+                                asked_id(name, input),
+                                Some(r.output),
+                                e.output,
+                              ),
+                              name,
                               e.output,
-                            ),
-                            name,
-                            e.output,
-                          )
-                        } else { executed(queries, t.run, q, key, input, marks, prior, left - 1) }
-                      },
-                      None -> executed(queries, s.run, q, key, input, marks, prior, left - 1),
+                            )
+                          } else { executed(queries, t.run, q, key, input, marks, prior, left - 1) }
+                        },
+                        None -> executed(queries, s.run, q, key, input, marks, prior, left - 1),
+                      }
                     }
-                  }
-                },
+                  },
+                }
               }
-            }
-          },
-        };
-        {
-          run: {
-            ..done.run,
-            settled: done.run.settled.insert(key, done.head),
-            open: done.run.open.remove(key),
-            trail: run.trail,
-          },
-          head: done.head,
+            },
+          };
+          {
+            run: {
+              ..done.run,
+              settled: done.run.settled.insert(key, done.head),
+              open: done.run.open.remove(key),
+              trail: run.trail,
+            },
+            head: done.head,
+          }
         }
       },
     }
   }
+
+/// Refuses a query asked for its own answer, naming the queries asked on the way to it.
+fn circled(
+  run: Run,
+  step: { query: Bytes, input: Bytes },
+) -> { run: Run, head: Bytes } / {abort.raise} =
+  panic(
+    "the query `" ++ String::of_bytes_lossy(step.query) ++ "` asks for its own answer, through"
+      ++ run.trail.push(step).fold("", |acc: String, s: { query: Bytes, input: Bytes }|
+        acc ++ "\n  " ++ String::of_bytes_lossy(s.query) ++ " "
+          ++ String::of_bytes_lossy(s.input.slice(0, min(s.input.len(), 120)))),
+  )
 
 /// Whether the record under `key` would be taken without its body running, worked out with no body
 /// run: the run settled it, or the store vouches for it, or the store only left it unchecked and
@@ -1640,6 +1654,59 @@ test "an answer that comes out the same stops what an edit moves" {
   let longer_now = asked_over(q, edited(same.world, b"a", b"forty"), b"longer", b"a");
   assert_eq(longer_now.output, b"long 5");
   assert_eq(longer_now.executed, 2)
+}
+
+fn switched(input: Bytes) -> Bytes / {memo.read} =
+  if memo.world(b"file", b"switch") == Some(b"ask") {
+    let relayed = memo.ask(b"relayed", input);
+    if relayed == b"loop" { memo.ask(b"back", input) } else { relayed }
+  } else { b"alone" }
+
+fn leveled(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.ask(b"length", b"pad");
+  match memo.world(b"file", b"f") { Some(text) -> text, None -> b"none" }
+}
+
+fn relayed(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"leveled", input)
+
+fn back(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"switched", input)
+
+fn paired(input: Bytes) -> Bytes / {memo.read} =
+  Bytes::concat_all([memo.ask(b"switched", input), b"|", memo.ask(b"relayed", input)])
+
+fn settle_queries() -> Map<Bytes, Query<| {}>> =
+  test_queries(b"h1").insert(b"switched", {
+    name: b"switched",
+    hash: b"s1",
+    body: switched,
+    kept: true,
+  }).insert(b"leveled", { name: b"leveled", hash: b"v1", body: leveled, kept: true }).insert(
+    b"relayed",
+    { name: b"relayed", hash: b"r1", body: relayed, kept: true },
+  ).insert(b"back", { name: b"back", hash: b"b1", body: back, kept: true }).insert(b"paired", {
+    name: b"paired",
+    hash: b"o1",
+    body: paired,
+    kept: true,
+  })
+
+test "a body led back to an answer being made, by a record taken before its reads settled, answers as cold" {
+  let q = settle_queries();
+  let first = asked_over(
+    q,
+    test_world([
+      { at: b"switch", text: b"no" },
+      { at: b"f", text: b"loop" },
+      { at: b"pad", text: b"x" },
+    ]),
+    b"paired",
+    b"s",
+  );
+  assert_eq(first.output, b"alone|loop");
+  // `switched` settles first, being lowest, and now asks `relayed`, taken as kept though `leveled`
+  // below it is still to settle: it answers `loop`, which leads round to `switched` again.
+  let moved = edited(edited(first.world, b"switch", b"ask"), b"f", b"fine");
+  assert_eq(asked_over(q, moved, b"paired", b"s").output, b"fine|fine")
 }
 
 test "an edit undone answers as before with no body run, from the records it replaced" {

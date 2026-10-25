@@ -14,14 +14,14 @@ import compiler.front.facts (Analysis)
 import compiler.front.seam (Analysed, Refused)
 import compiler.front (Pulled, Staged, Embedded, analyse_pulling_std_with, staged_pulling_std_with,
                        checked_staged)
-import compiler.front.rows (KnownDefRow, Rows, known_def_row_bin, of_module)
+import compiler.front.rows (KnownDefRow, Rows, ModuleDerivations, known_def_row_bin, of_module)
 import compiler.front.pkg (PackageSources, Supplied, Judged)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IDerive,
                               IEffectSet, IExtern, is_shipped, IInstance, INumeric, TDSum,
                               ImportDecl, IModule, IAlias, INames, VariantDef, OpDef, Derived,
-                              Derivation, DRow, parse, parse_started, header, header_of, is_written,
-                              item_span, import_decl_bin, owner_of, item_owner, member_of,
-                              member_name, is_builtin, derivation_bin)
+                              Derivation, DRow, DLibrary, parse, parse_started, header, header_of,
+                              is_written, item_span, import_decl_bin, owner_of, item_owner,
+                              member_of, member_name, is_builtin, derivation_bin)
 import compiler.syntax.fmt (printed_alone)
 import compiler.syntax.exprs (EBlock, expr_span, freed_by, prelude_module, map_literal_call)
 import compiler.store.hash.forms (Fixed, Fixing, NodeRef, HashOutput, fixed_nodes, fixing_of,
@@ -1559,7 +1559,17 @@ fn per_module(
           |_: Bytes| seen_by(whole, i),
         );
         let source = { name: name, src: text_at(i) };
-        let apart = match checked_against(source, InRoot, deps, placing, reading).pulled.out {
+        // A load hands the check its parse, which holds what its library derivers wrote.
+        let parsed = parse_from(
+          0,
+          source,
+          parse(source.src),
+          taken: whole.mods.get(i).derived.map(derivation_of),
+        );
+        let apart = match checked_against(source, InRoot, deps, placing, {
+            ..reading,
+            given: [parsed],
+          }).pulled.out {
           Refused(ds) -> refused_apart(name, "checks", ds),
           Analysed(w) -> w,
         };
@@ -1690,15 +1700,46 @@ fn core_src() -> Bytes =
 fn shop_src() -> Bytes =
   b"import core\nfn total(items: List<core::Item>) -> Int =\n  items.fold(0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.get[cart](k)\ntest \"it adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
 
+// No deriver runs here: `kinds_derived` is what one wrote.
+fn likeness_src() -> Bytes = b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n"
+
 fn kinds_src() -> Bytes =
-  b"pub type Shape =\n  | Dot\n  | Line(Int)\npub type Pair = { left: Shape, right: Shape }\nderive eq for Shape\nderive ord for Shape\nderive eq for Pair\npub fn same(a: Pair, b: Pair) -> Bool = pair_eq().eq(a, b)\n"
+  b"import likeness\npub type Shape =\n  | Dot\n  | Line(Int)\npub type Pair = { left: Shape, right: Shape }\nderive likeness for Shape\nderive likeness for Pair\npub fn same(a: Pair, b: Pair) -> Bool = pair_alike(a, b)\n"
+
+fn kinds_derived() -> List<ModuleDerivations> =
+  [
+    {
+      module: b"kinds",
+      derivations: [
+        {
+          deriver: DLibrary(b"likeness"),
+          target: b"Shape",
+          written: [
+            b"pub fn shape_alike(a: Shape, b: Shape) -> Bool = a == b",
+            b"pub fn shape_order(a: Shape, b: Shape) -> Ordering = compare(a, b)",
+          ],
+          binders: [],
+        },
+        {
+          deriver: DLibrary(b"likeness"),
+          target: b"Pair",
+          written: [b"pub fn pair_alike(a: Pair, b: Pair) -> Bool = a == b"],
+          binders: [],
+        },
+      ],
+    },
+  ]
 
 fn sorter_src() -> Bytes =
-  b"import kinds\nfn alike(a: kinds::Shape, b: kinds::Shape) -> Bool = kinds::shape_eq().eq(a, b)\nfn order(a: kinds::Shape, b: kinds::Shape) -> Ordering = kinds::shape_ord().compare(a, b)\nfn paired(a: kinds::Shape) -> Bool = kinds::same({ left: a, right: a }, { left: a, right: a })\n"
+  b"import kinds\nfn alike(a: kinds::Shape, b: kinds::Shape) -> Bool = kinds::shape_alike(a, b)\nfn order(a: kinds::Shape, b: kinds::Shape) -> Ordering = kinds::shape_order(a, b)\nfn paired(a: kinds::Shape) -> Bool = kinds::same({ left: a, right: a }, { left: a, right: a })\n"
 
 test "an entry holds a derive as the functions it generates, bodies left out, and checks against it agree with the whole program's" {
-  let sources = [{ name: b"kinds", src: kinds_src() }, { name: b"sorter", src: sorter_src() }];
-  let whole = outcome(analyse_pulling_std_with(sources, [], no_rows()));
+  let sources = [
+    { name: b"likeness", src: likeness_src() },
+    { name: b"kinds", src: kinds_src() },
+    { name: b"sorter", src: sorter_src() },
+  ];
+  let whole = outcome(analyse_pulling_std_with(sources, [], no_rows(), derived: kinds_derived()));
   let kinds = range(0, whole.mods.len()).fold(0, |k: Int, i: Int|
     if whole.mods.get(i).name == b"kinds" { i } else { k });
   let shape = match exports_of(whole, kinds, kinds_src()).entries.get(b"Shape") {
@@ -1706,8 +1747,8 @@ test "an entry holds a derive as the functions it generates, bodies left out, an
     None -> b"",
   };
   assert(shape.index_of(b"pub type Shape") != None);
-  assert(shape.index_of(b"fn shape_eq()") != None);
-  assert(shape.index_of(b"fn shape_ord()") != None);
+  assert(shape.index_of(b"fn shape_alike(") != None);
+  assert(shape.index_of(b"fn shape_order(") != None);
   assert_eq(shape.index_of(b"derive"), None);
   assert_eq(shape.index_of(b"=="), None);
   for_all(
@@ -1719,6 +1760,7 @@ test "an entry holds a derive as the functions it generates, bodies left out, an
   );
   let apart = per_owner(whole, sources);
   assert_eq(apart.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
+    b"likeness.derive",
     b"kinds.same",
     b"sorter.alike",
     b"sorter.order",
@@ -1862,7 +1904,7 @@ test "a name a text binds, however it binds it, is one it may call on" {
 }
 
 test "an owner's tokens, whole and signed, are a lex of its texts joined, and read as it reads" {
-  let src = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\nderive eq for Shape\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
+  let src = b"import std.list\npub type Shape =\n  | Dot\n  | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s {\n    Dot -> 0,\n    Line(n) -> abs(n),\n  }\npub transparent fn twice(n: Int) -> Int = n + n\nfn named(s: Shape) -> String = \"shape of {size(s)}\"\nfn listed(xs: List<Int>) -> Int = {\n  let ys = List::rotate(xs, 1);\n  ys.len() + twice(1)\n}\nfn small() -> Set<Int> = #[1, 2]\ntest \"the size of a line of {n}\" for n: Int in [1, 2] {\n  assert_eq(size(Line(n)), n)\n}\n";
   let parsed = parse_at(0, { name: b"m", src: src }).module;
   let raw = parse(src).node;
   let tokens = lex(src).tokens;

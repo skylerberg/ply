@@ -63,9 +63,10 @@ pub type ImportDecl = { path: List<Ident>, kind: ImportKind, span: Span }
 derive bin for ImportKind
 derive bin for ImportDecl
 
-/// `DNumeric` and `DInteger` are the predicates `numeric(a)` and `integer(a)`: a constraint can name
-/// them, and no `derive` can. `DRow` is a record's row, which a `derive` names and no constraint
-/// does. `DLibrary` is a deriver a module declares, named by the binder a `derive` writes.
+/// `DEq`, `DOrd`, `DShow` and `DHash` are what `==`, `compare`, `show` and `digest` read of a
+/// value, which a constraint names and no `derive` does. `DNumeric` and `DInteger` are the
+/// predicates `numeric(a)` and `integer(a)`. `DRow` is a record's row, which a `derive` names and no
+/// constraint does. `DLibrary` is a deriver a module declares, named by the binder a `derive` writes.
 pub type Deriver =
   | DJson
   | DEq
@@ -80,11 +81,11 @@ pub type Deriver =
 
 derive bin for Deriver
 
-pub fn derivers() -> List<Deriver> = [DJson, DEq, DOrd, DBin, DShow, DHash, DRow]
+/// The derivers the compiler writes itself; a `derive` naming any other runs a library's.
+pub fn derivers() -> List<Deriver> = [DJson, DBin, DRow]
 
-/// Everything a `where` clause can name.
-pub fn constraint_kinds() -> List<Deriver> =
-  [DJson, DEq, DOrd, DBin, DShow, DHash, DNumeric, DInteger]
+/// What `derivable(D, a)` can name.
+pub fn derivable_kinds() -> List<Deriver> = [DJson, DEq, DOrd, DBin, DShow, DHash]
 
 pub fn is_predicate(deriver: Deriver) -> Bool =
   match deriver { DNumeric -> true, DInteger -> true, _ -> false }
@@ -756,8 +757,7 @@ pub fn import_out_of_order(input: Input, parser: Parser, first_item: Option<Item
 
 // --- `where` and its constraints -------------------------------------------
 
-/// The built-in deriver `name` names. A constraint names only these, so an unknown one there is
-/// reported with the full list.
+/// The built-in deriver `name` names, if any.
 pub fn deriver_of(name: Bytes) -> Option<Deriver> =
   derivers().fold(None, |acc: Option<Deriver>, deriver: Deriver|
     match acc {
@@ -765,8 +765,9 @@ pub fn deriver_of(name: Bytes) -> Option<Deriver> =
       None -> if deriver_text(deriver) == name { Some(deriver) } else { None },
     })
 
-pub fn deriver(input: Input, parser: Parser, name: Ident) -> Result<Parsed<Deriver>, Parser> =
-  match deriver_of(name.name) {
+/// What `derivable(D, a)` names as `D`.
+fn derivable_kind(parser: Parser, name: Ident) -> Result<Parsed<Deriver>, Parser> =
+  match derivable_kinds().find(|d: Deriver| deriver_text(d) == name.name) {
     Some(d) -> Ok({ parser: parser, node: d }),
     None ->
       Err(
@@ -775,11 +776,11 @@ pub fn deriver(input: Input, parser: Parser, name: Ident) -> Result<Parsed<Deriv
           error_at(
             unknown_deriver(),
             name.span,
-            Bytes::concat_all([b"`", name.name, b"` is not a deriver"]),
-            b"unknown deriver",
+            Bytes::concat_all([b"`", name.name, b"` is nothing `derivable` can name"]),
+            b"not a constraint",
             [
-              b"the derivers are ".concat(
-                derivers().fold(b"", |acc: Bytes, d: Deriver|
+              b"`derivable` names ".concat(
+                derivable_kinds().fold(b"", |acc: Bytes, d: Deriver|
                   Bytes::concat_all([
                     acc,
                     if acc == b"" { b"" } else { b", " },
@@ -813,8 +814,7 @@ pub fn constraint(
     let a = advance(input, parser);
     let { parser, node: o } = expect(input, a.parser, token_lparen(), b"`(` after `derivable`")?;
     let { parser, node: n } = expect_ident(input, parser, b"a deriver name")?;
-    let { parser, node: named } = deriver(input, parser, n)?;
-    let { parser, node: d } = constrainable(parser, n, named)?;
+    let { parser, node: d } = derivable_kind(parser, n)?;
     let { parser, .. } = expect(input, parser, token_comma(), b"`,` and the type parameter")?;
     let { parser, node: pa } = expect_ident(
       input,
@@ -834,25 +834,6 @@ pub fn constraint(
     })
   }
 }
-
-/// A row is a record's own columns, so no type parameter is constrained to have one.
-fn constrainable(parser: Parser, name: Ident, d: Deriver) -> Result<Parsed<Deriver>, Parser> =
-  match d {
-    DRow ->
-      Err(
-        push_diag(
-          parser,
-          error_at(
-            unknown_deriver(),
-            name.span,
-            b"`row` is derived for a record type, and a constraint cannot name it",
-            b"not a constraint",
-            [b"the constraints are `derivable` of `json`, `eq`, `ord`, `bin`, `show` and `hash`"],
-          ),
-        ),
-      ),
-    _ -> Ok({ parser: parser, node: d }),
-  }
 
 /// `numeric(a)` or `integer(a)`: the predicate's name, then the type parameter it is about.
 fn predicate(
@@ -2409,7 +2390,7 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
         }
       },
   );
-  let shown = match first_shown(input, done.items) {
+  let shown = match first_shown(input) {
     None -> done.imports,
     Some(sp) -> done.imports.push(hidden_import(b"show", shown_binder(), sp)),
   };
@@ -2658,9 +2639,9 @@ fn first_cases(items: List<Item>) -> Option<Span> =
       },
     })
 
-/// Where the module first interpolates or derives `show`, either of which calls into `std.show`.
-fn first_shown(input: Input, items: List<Item>) -> Option<Span> / {abort.raise} = {
-  let hole = input.tokens.fold(None, |acc: Option<Span>, token: Token|
+/// Where the module first interpolates, which calls into `std.show`.
+fn first_shown(input: Input) -> Option<Span> / {abort.raise} =
+  input.tokens.fold(None, |acc: Option<Span>, token: Token|
     match acc {
       Some(_) -> acc,
       None -> match token.kind {
@@ -2669,20 +2650,7 @@ fn first_shown(input: Input, items: List<Item>) -> Option<Span> / {abort.raise} 
         else { Some(span_between(token.start, token.end)) },
         _ -> None,
       },
-    });
-  match hole {
-    Some(_) -> hole,
-    None ->
-      items.fold(None, |acc: Option<Span>, item: Item|
-        match acc {
-          Some(_) -> acc,
-          None -> match item {
-            IDerive(d) -> match d.deriver { DShow -> Some(d.span), _ -> None },
-            _ -> None,
-          },
-        }),
-  }
-}
+    })
 
 /// An import no source can write, so it is never printed and never collides with a binder.
 fn hidden_import(module: Bytes, binder: Bytes, span: Span) -> ImportDecl =
