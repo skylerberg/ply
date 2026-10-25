@@ -6,7 +6,7 @@
 import compiler.syntax.patterns (Lit, LStr, LBytes, LEmbedded, LDec, LFixed, LWide, LUnit)
 import compiler.syntax.parsing (dummy_span)
 import compiler.check.types (Type, TyCon, TyVar, TyRecord, TyNominal, Field, spelled_type,
-                             named_type, int_type, string_type)
+                             named_type, int_type, string_type, unit_type)
 import std.value
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VRecord,
                   VCtor, VList, VMap, VArray, VHold)
@@ -17,7 +17,7 @@ import compiler.emit.reps (Ctors, SumCtor, ctors_of, laid, laid_inside, laid_kno
 import compiler.emit.layout (Laid, LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, Nullary,
                              Inline, Boxed, Itself, Bits, RuntimeBox, Box, LWords, words, layouts,
                              columns_laid, branch_laid, head_words, list_head, node_head, map_head,
-                             array_head, LPlaced, LRecord, FieldLaid, frame_count)
+                             array_head, LPlaced, LRecord, FieldLaid, frame_count, register_words)
 import compiler.emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal,
                           Static, Prim, AInt, ABool, AVar, AFloat, AChar, ANum, AZero, Arg, Make,
                           Made, MCase, Gathered, Pack, MRecord, FieldMade, Built, RInt, RBool,
@@ -78,12 +78,10 @@ pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
     },
     KnownRecord(ks) -> {
       let types = record_types(ty);
-      match laid(ctors, ty) {
-        LRecord(fs) -> if types.len() != ks.len() || fs.len() != ks.len() { mislaid(ty) } else {
-          range(0, ks.len()).fold(no_laying(), |out: Laying, i: Int|
-            joined(out, field_at(ctors, fs.get(i).laid, types.get(i), ks.get(i))))
-        },
-        _ -> mislaid(ty),
+      let fields = match laid(ctors, ty) { LRecord(fs) -> fs.map(|f: FieldLaid| f.laid), _ -> [] };
+      if types.len() != ks.len() || fields.len() != ks.len() { mislaid(ty) } else {
+        range(0, ks.len()).fold(no_laying(), |out: Laying, i: Int|
+          joined(out, field_at(ctors, fields.get(i), types.get(i), ks.get(i))))
       }
     },
     KnownCase(c) -> match ty {
@@ -1429,6 +1427,21 @@ test "a record, an Option and a Result are laid in place as their types lay them
   let count = of(b"Option", [int_type()]);
   assert_eq(lay(count, KnownCase({ case: 1, args: [KnownWord(5)] })).words, [WRaw(1), WRaw(5)]);
   assert_eq(lay(count, KnownCase({ case: 0, args: [] })).words, [WRaw(0), WRaw(0)]);
+  assert_eq(lay(unit_type(), KnownRecord([])).words, []);
+  // A record within a call's registers keeps a wide field as its static box's address; a wider one
+  // lays it in place behind its header.
+  let ints = |prefix: Bytes, n: Int|
+    range(0, n).map(|i: Int|
+      { name: prefix.concat(Bytes::of_string(i.to_string())), ty: int_type() });
+  let wide = TyRecord(ints(b"f", register_words() + 1));
+  let known_wide = KnownRecord(range(0, register_words() + 1).map(|i: Int| KnownWord(i)));
+  let holder = |n: Int| TyRecord(ints(b"a", n).push({ name: b"w", ty: wide }));
+  let held = |n: Int| KnownRecord(range(0, n).map(|i: Int| KnownWord(i)).push(known_wide));
+  let pointed = lay(holder(1), held(1)).words;
+  assert_eq(pointed.len(), 2);
+  assert(match pointed.at(1) { Some(WAddress(_)) -> true, _ -> false }, None);
+  let n = register_words();
+  assert_eq(lay(holder(n), held(n)).words.len(), n + 1 + register_words() + 1);
   // A value its type lays in other words is refused.
   assert_eq(
     handle { lay(pair(), KnownWord(5)).words.len() } with { abort.raise(_) -> 0 - 1 },
