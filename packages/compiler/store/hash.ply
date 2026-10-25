@@ -36,7 +36,9 @@ import compiler.store.hash.forms (First, build_index, listed_refs, member_hash, 
                                   fixing_of, is_decl, pin_key, skeleton_of, assemble, walked,
                                   TheDecl, TheFn, TheItem, Reach, reach, closure_of,
                                   reached_functions, listing_reach, named_in, naming, reaching,
-                                  Closed, held_by, by_name)
+                                  Closed, held_by, by_name, of_key, module_record,
+                                  module_record_bin, record_digest, recorded_graph, recorded_reach,
+                                  recorded_hashes, Reached)
 import compiler.store.hash.printed (envelope, picks_of, Printed, Unprintable, print_bodies)
 
 // --- The hash table ----------------------------------------------------------------------
@@ -2180,4 +2182,67 @@ test "a type's hash covers the key and the show it states, and what hold it move
   assert(named(keyed, b"m.make") != named(edited, b"m.make"));
   assert(named(plain, b"m.make") != named(keyed, b"m.make"));
   assert_eq(named(plain, b"m.same"), named(edited, b"m.same"))
+}
+
+test "a walk of a program's module records reaches what each test reached, by name and hash" {
+  let index = indexed([
+    { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"" },
+    {
+      name: b"std.cases",
+      src: b"pub type Table<a> = List<a>\npub fn listed<a>(t: List<a>, l: (a) -> String) -> List<String> = t.map(l)\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a = panic(\"\")",
+    },
+    {
+      name: b"low",
+      src: b"pub fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }\npub fn unused() -> Int = 7\n",
+    },
+    {
+      name: b"app",
+      src: b"import low\ntype Amount = | Cents(Int)\nfn Amount(n: Int) -> Int = n\nfn table() -> List<Int> = [Amount(2)]\nfn held(n: Int) -> Bool = low::even(n)\nfn cents(a: Amount) -> Int = match a { Cents(c) -> c }\ntest \"plain\" { assert_eq(cents(Cents(2)), 2) }\ntest \"case {n}\" for n: Int in table() { assert(held(n)) }\n",
+    },
+  ]);
+  let h = hash_index(index);
+  let records = [b"std.show", b"std.cases", b"low", b"app"].map(|m: Bytes|
+    module_record(fixing_of(index, h, Map::new().insert(m, true))));
+  let g = recorded_graph(
+    records.map(|r: Bytes|
+      match bin::decode(r, module_record_bin()) {
+        Ok(x) -> x,
+        Err(_) -> panic("a record reads back"),
+      }),
+  );
+  let hashed = |r: Reach|
+    {
+      fns: r.fns.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+        match by_name(h.defs).get(n) { Some(x) -> acc.insert(n, x), None -> acc }),
+      decls: r.decls.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+        match by_name(h.decls).get(n) { Some(x) -> acc.insert(n, x), None -> acc }),
+    };
+  let plain = b"app.plain";
+  let ranged = b"app.case {n}";
+  assert_eq(recorded_reach(g, plain, false), Some(hashed(reach(h, [TheItem(plain)]))));
+  // A case runs its test's body, and never what lists its table.
+  let runs = {
+    ..h,
+    refs: { ..h.refs, items: h.refs.items.insert(ranged, of_key(h.refs.cases, ranged)) },
+  };
+  let case = recorded_reach(g, ranged, true);
+  assert_eq(case, Some(hashed(reach(runs, [TheItem(ranged)]))));
+  match case {
+    Some(c) -> assert(c.fns.contains(b"low.odd") && !c.fns.contains(b"app.table")),
+    None -> panic("the case's test is recorded"),
+  };
+  assert_eq(recorded_reach(g, b"app.gone", false), None);
+  // One walk from several tests reaches the hashes each reached alone.
+  let alone = |r: Option<Reached>|
+    match r { Some(x) -> x.fns.values().concat(x.decls.values()), None -> [] };
+  assert_eq(
+    recorded_hashes(g, [{ key: plain, case: false }, { key: ranged, case: true }]).sort(),
+    alone(recorded_reach(g, plain, false)).concat(alone(case)).fold(
+      Map::new(),
+      |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true),
+    ).keys(
+    ),
+  );
+  // Each module's record is filed under a digest of its own bytes.
+  assert(record_digest(records.get(2)) != record_digest(records.get(3)), None)
 }

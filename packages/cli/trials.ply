@@ -5,7 +5,7 @@
 
 import compiler.load (LoadedAnalysis)
 import units (emit)
-import compiler.front.published (no_rows, DefInterface, FiledDef, dump_of, interfaces_of, rehash)
+import compiler.front.published (no_rows, FiledDef, dump_of, interfaces_of, rehash)
 import compiler.front.seam (Analysed, Refused, view_of)
 import compiler.front (Pulled, Shipping)
 import compiler.front.facts (View)
@@ -23,11 +23,10 @@ import std.bytes
 import testing.bisect (DifferentFailure, DoesNotCheck, MissingBody, NoBodies, NoHybrids, OfCases,
                        Skipped, Trial, a_failure, a_pass, from_cache, unresolved_trial)
 import testing.bisect
-import testing.conclude (PassRecord, Named)
 import testing.delta (Decl, DefKey, Facts, Row, Value, decl_key, value_key)
 import testing.facts (Baseline, Now, Node, Rehash, facts)
 import testing.mixture (Era, Mixture, choose, hashes_of, mixture_of, printed_names)
-import tester (tester, ledger, unit_over)
+import tester (tester, ledger, unit_over, LastPass)
 import std.list
 import std.option
 import std.prelude_source
@@ -175,9 +174,6 @@ pub fn tree_of(sources: List<Source>, analysis: View, shipped: Shipped) -> Tree 
     ),
   }
 
-fn named_map(xs: List<Named>) -> Map<String, String> =
-  xs.fold(Map::new(), |acc: Map<String, String>, named: Named| acc.insert(named.name, named.hash))
-
 /// Today's bodies re-hashed with every reference to a baseline name written as its baseline hash.
 fn rehashed(pr: Tree, b: Baseline) -> Rehash / {abort.raise} = {
   let pins = b.closure.fold([], |acc: List<Pin>, name: String, h: String|
@@ -213,20 +209,21 @@ fn rehashed(pr: Tree, b: Baseline) -> Rehash / {abort.raise} = {
 /// Whether a function's published interface, its scheme and its footprint, is the same in both
 /// eras: exactly when a mixture swapping it alone still checks. A declaration never is, and an
 /// interface the store never filed is no answer.
-fn stable_of(pr: Tree, key: DefKey, before: String) -> Option<Bool> / {ledger.interfaces} =
+fn stable_of(
+  pr: Tree,
+  key: DefKey,
+  before: String,
+) -> Option<Bool> / {ledger.interfaces, abort.raise} =
   match key.ns {
     Decl -> Some(false),
     Value -> match pr.interfaces.get(key.name) {
       None -> None,
-      Some(now) -> match ledger.interfaces([{ hash: before, name: key.name }]) {
-        [Some(was)] -> Some(same_interface(was, now.interface)),
+      Some(now) -> match ledger.interfaces([Bytes::of_hex(before)]) {
+        [Some(was)] -> Some(was == now.interface),
         _ -> None,
       },
     },
   }
-
-fn same_interface(a: DefInterface, b: DefInterface) -> Bool =
-  a.scheme == b.scheme && a.row.footprint == b.row.footprint
 
 /// The bodies a mixture could take that this run does not hold, from the store; one that is not the
 /// body its hash names is no body at all.
@@ -236,7 +233,7 @@ fn stored(
 ) -> Map<String, Bytes> / {ledger.bodies, abort.raise} = {
   let missing = wanted.filter(|h: String| !have.contains(h));
   if missing.len() == 0 { have } else {
-    let found = ledger.bodies(missing);
+    let found = ledger.bodies(missing.map(Bytes::of_hex));
     range(0, missing.len()).fold(have, |acc: Map<String, Bytes>, i: Int|
       match ((missing.at(i), found.at(i))) {
         (Some(h), Some(Some(b))) -> if body_key(b) == Some(Bytes::of_hex(h)) { acc.insert(h, b) }
@@ -246,22 +243,27 @@ fn stored(
   }
 }
 
-/// One failure's facts and bench, from the pass its test last had. `seed` is the interleaving it
-/// failed at, when it was searched. A case of a test over cases has facts and no bench: a mixture
-/// is printed from a test's body, which holds no case.
+/// `reached` as diagnosis keys it: each name as text, each hash as hex.
+fn keyed(reached: Map<Bytes, Bytes>) -> Map<String, String> / {abort.raise} =
+  reached.fold(Map::new(), |acc: Map<String, String>, name: Bytes, hash: Bytes|
+    acc.insert(String::of_bytes_lossy(name), hash.hex_of()))
+
+/// One failure's facts and bench, from what its test last passed against. `seed` is the
+/// interleaving it failed at, when it was searched. A case of a test over cases has facts and no
+/// bench: a mixture is printed from a test's body, which holds no case.
 pub fn diagnosed(
   pr: Tree,
   key: String,
   test_hash: Option<String>,
-  record: PassRecord,
+  baseline: LastPass,
   failure: Raised,
   seed: Seed,
   of_cases: Bool,
 ) -> Diagnosed / {ledger.interfaces, ledger.bodies, abort.raise} = {
   let b: Baseline = {
-    test: record.test,
-    closure: named_map(record.closure),
-    decls: named_map(record.decls),
+    test: baseline.test.hex_of(),
+    closure: keyed(baseline.reached.fns),
+    decls: keyed(baseline.reached.decls),
   };
   let names = closed(pr, key);
   let now: Now = { test: test_hash, closure: names, defs: pr.defs, decls: pr.decls, deps: pr.deps };
@@ -301,7 +303,7 @@ pub fn diagnosed(
 }
 
 /// What one mixture came to, and the key its pass is filed under when it passed.
-pub type Tried = { trial: Trial, proved: Option<String> }
+pub type Tried = { trial: Trial, proved: Option<Bytes> }
 
 fn unresolved(why: bisect::Unresolved) -> Tried = { trial: unresolved_trial(why), proved: None }
 
@@ -313,7 +315,7 @@ fn mixture_test() -> Bytes = b"ply_tests.t0"
 pub fn trial(
   b: Bench,
   flipped: List<DefKey>,
-  filed: Option<String>,
+  filed: Option<Bytes>,
 ) -> Tried / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} = {
   let cached = match filed { Some(k) -> ledger.passes([k]) == [Some(b"")], None -> false };
   if cached { { trial: from_cache(a_pass()), proved: None } } else {
@@ -358,7 +360,7 @@ fn checked_over(sources: List<Source>, shipped: Shipped) -> Pulled / {abort.rais
 fn ran(
   b: Bench,
   modules: List<{ module: Bytes, text: Bytes }>,
-  filed: Option<String>,
+  filed: Option<Bytes>,
 ) -> Tried / {tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} = {
   let sources = modules.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text });
   let analysed = checked_over(sources, b.shipped);
@@ -451,16 +453,20 @@ fn hash_of_test(t: Tree, key: String) -> Option<String> / {abort.raise} =
     None -> None,
   }
 
-/// What a pass of `key` in `t` filed: its hash and its closure's.
-fn passed_in(t: Tree, key: String) -> PassRecord / {abort.raise} = {
-  let reached = closed(t, key);
-  let pick = |names: List<String>, m: Map<String, String>|
-    names.fold([], |acc: List<Named>, n: String|
-      match m.get(n) { Some(h) -> acc.push({ name: n, hash: h }), None -> acc });
+/// What a pass of `key` in `t` passed against: its hash, and each definition it reached with its
+/// hash.
+fn passed_in(t: Tree, key: String) -> LastPass / {abort.raise} = {
+  let h = t.whole.frame.hashes;
+  let reached = reach(h, [TheItem(Bytes::of_string(key))]);
+  let hashed = |names: Map<Bytes, Bool>, of: List<{ name: Bytes, hash: Bytes }>| {
+    let by = of.fold(Map::new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+      m.insert(x.name, x.hash));
+    names.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+      match by.get(n) { Some(x) -> acc.insert(n, x), None -> acc })
+  };
   {
-    test: match hash_of_test(t, key) { Some(h) -> h, None -> "" },
-    closure: pick(reached.fns, t.defs),
-    decls: pick(reached.decls, t.decls),
+    test: match h.tests.get(Bytes::of_string(key)) { Some(x) -> x, None -> b"" },
+    reached: { fns: hashed(reached.fns, h.defs), decls: hashed(reached.decls, h.decls) },
   }
 }
 
@@ -493,10 +499,11 @@ fn diagnosed_over(before: Tree, after: Tree, key: String) -> Diagnosed / {abort.
       false,
     )
   } with {
-    ledger.interfaces(asked) ->
-      asked.map(|a: { hash: String, name: String }|
-        match before.interfaces.get(a.name) { Some(f) -> Some(f.interface), None -> None }),
-    ledger.bodies(hashes) -> hashes.map(|h: String| before.bodies.get(h)),
+    ledger.interfaces(hashes) ->
+      hashes.map(|h: Bytes|
+        before.interfaces.fold(None, |found: Option<Bytes>, name: String, f: FiledDef|
+          if f.hash == h { Some(f.interface) } else { found })),
+    ledger.bodies(hashes) -> hashes.map(|h: Bytes| before.bodies.get(h.hex_of())),
   }
 
 fn row_of(d: Diagnosed, name: String) -> Row / {abort.raise} =
@@ -580,8 +587,8 @@ test "a store that cannot produce the baseline's bodies is why no mixture can be
       false,
     )
   } with {
-    ledger.interfaces(asked) -> asked.map(|a: { hash: String, name: String }| None),
-    ledger.bodies(hashes) -> hashes.map(|h: String| None),
+    ledger.interfaces(hashes) -> hashes.map(|h: Bytes| None),
+    ledger.bodies(hashes) -> hashes.map(|h: Bytes| None),
   };
   assert_eq(d.evident.absent, Some(NoBodies));
   assert_eq(d.bench, None)
@@ -590,9 +597,9 @@ test "a store that cannot produce the baseline's bodies is why no mixture can be
 /// A mixture is printed from bodies alone, checked like any program, and run without the binding.
 fn tried(b: Bench, flipped: List<DefKey>, failing: Bool) -> Tried / {abort.raise} =
   handle {
-    trial(b, flipped, Some("k"))
+    trial(b, flipped, Some(b"k"))
   } with {
-    ledger.passes(keys) -> keys.map(|k: String| None),
+    ledger.passes(keys) -> keys.map(|k: Bytes| None),
     emit.unit(front, offered) -> Ok({ text: b"unit", made: { bodies: [], offered: [] } }),
     emit.compiled(text, profile) -> Ok("/unit.so"),
     tester.unit[tests](front, library, hosted) -> if hosted {
@@ -622,7 +629,7 @@ test "a mixture of the two eras prints and checks, and its answer is the trial's
       let green = tried(b, [value_key("leaf")], false);
       assert_eq(green.trial, a_pass());
       // A green mixture is filed under the key it was handed, and never under the failing test's.
-      assert_eq(green.proved, Some("k"));
+      assert_eq(green.proved, Some(b"k"));
       let red = tried(b, [value_key("leaf")], true);
       assert_eq(red.trial, a_failure());
       assert_eq(red.proved, None)
@@ -674,9 +681,9 @@ test "a mixture whose key already holds a pass is answered without being built" 
     None -> panic("a mixture can be built"),
     Some(b) -> {
       let t = handle {
-        trial(b, [value_key("leaf")], Some("k"))
+        trial(b, [value_key("leaf")], Some(b"k"))
       } with {
-        ledger.passes(keys) -> keys.map(|k: String| Some(b"")),
+        ledger.passes(keys) -> keys.map(|k: Bytes| Some(b"")),
         tester.unit[tests](front, unit, hosted) -> panic("a cached mixture was built"),
         tester.interleaved[tests](unit, index, case, seed, steps, again) ->
           panic("a cached mixture was run"),
@@ -772,4 +779,25 @@ test "a name shared by a function and a type still names the one that moved" {
   let d = diagnosed_over(tree_of_source(collide), tree_of_source(swapped), "t");
   assert(edited_row(decl_row_of(d, "Amount")));
   assert(derived_row(value_row_of(d, "use_it")))
+}
+
+test "an edited function's interface is stable while its types stand, and not over a new type of one name" {
+  let program = |shape: Bytes, body: Bytes|
+    tree_of_source(
+      String::of_bytes(
+        Bytes::concat_all([
+          b"type Shape = ",
+          shape,
+          b"\nfn size(s: Shape) -> Int = match s { _ -> ",
+          body,
+          b" }\ntest \"sized\" { assert_eq(size(Dot), 1) }\n",
+        ]),
+      ),
+    );
+  let before = program(b"| Dot | Line(Int)", b"1");
+  let edited = diagnosed_over(before, program(b"| Dot | Line(Int)", b"2"), "sized");
+  assert_eq(row_of(edited, "size").stable, Some(true));
+  // The scheme prints alike in both eras; the type it names is another.
+  let retyped = diagnosed_over(before, program(b"| Dot | Circle(Float)", b"2"), "sized");
+  assert_eq(row_of(retyped, "size").stable, Some(false))
 }

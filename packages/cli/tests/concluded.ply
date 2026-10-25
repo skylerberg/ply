@@ -2,13 +2,24 @@
 
 import args (kept)
 import units (emit)
-import std.fs (fs)
+import std.fs
+import std.fs (fs, mem_empty)
+import std.hash (blake3)
+import std.prelude_source
 import machine
 import compiler.front.facts (View)
 import compiler.front.published (FiledBody, FiledDef, filed_bodies, interfaces_among)
 import compiler.front.rows (ModuleSpan)
 import compiler.unit (shipped)
-import compiler.store.hash.forms (TheItem, reach)
+import compiler.store.hash.forms (ModuleHashed, TheItem, by_name, reach)
+import compiler.store.hash.encoding (hex)
+import compiler.front.checking.world (Answering)
+import compiler.front.checking.groups (queries)
+import compiler.front.seam (Analysed, view_of)
+import compiler.load (analysed, answers_afresh, deriving_nothing, prepared)
+import results
+import store.tables
+import store.twin (on_twin)
 import compiler.check.infer.checker (DefInfo)
 import compiler.check.resolve.tables (Diag, Label)
 import compiler.check.types
@@ -16,9 +27,9 @@ import diagnostic (Raised, diag_of, noted, shown)
 import mutants (Judged, Queue, built, coverage, mutants, queued)
 import program (Timed)
 import std.json (Bool)
-import tester (tester, ledger, Executed, InterleavingFailure, Hosted, Options, Usage, joined_trace,
-               sum_usage, no_usage)
-import trials (Bench, Tried, diagnosed, trial, by_name)
+import tester (tester, ledger, Executed, InterleavingFailure, Hosted, LastPass, Options, Usage,
+               joined_trace, sum_usage, no_usage)
+import trials (Bench, Tried, diagnosed, trial)
 import trials
 import views
 import testing.keys (mixture_key)
@@ -48,14 +59,13 @@ import tests.report (Entry, Decided, cached_count, every_of, Program, Cost, Expl
 
 // --- What the loaded tree tells a selector ------------------------------------
 
+/// The hash of the test at `i`, as the hasher hands it over.
+pub fn test_hash_at(analysis: View, i: Int) -> Option<Bytes> =
+  match test_at(analysis, i) { Some(t) -> analysis.frame.hashes.tests.get(t.key), None -> None }
+
+/// The same as a report prints it.
 pub fn hash_at(analysis: View, i: Int) -> Option<String> / {abort.raise} =
-  match test_at(analysis, i) {
-    Some(t) -> match analysis.frame.hashes.tests.get(t.key) {
-      Some(h) -> Some(h.hex_of()),
-      None -> None,
-    },
-    None -> None,
-  }
+  match test_hash_at(analysis, i) { Some(h) -> Some(h.hex_of()), None -> None }
 
 /// Something in its closure entered a `simulate` region, so it reads a seed and is searched.
 pub fn seeded_of(atoms: List<types::Atom>) -> Bool =
@@ -63,7 +73,7 @@ pub fn seeded_of(atoms: List<types::Atom>) -> Bool =
 
 // --- A test over cases --------------------------------------------------------
 
-pub fn entry_of(index: Int, key: String) -> Entry =
+pub fn entry_of(index: Int, key: Bytes) -> Entry =
   { test: index, of: key, case: None, unlisted: None }
 
 /// What the run's searches are asked: the plan a seeded test searches, whether to measure what the
@@ -95,7 +105,7 @@ pub fn job_of(
   searching: plan::Plan,
 ) -> Job / {abort.raise} =
   match case_of(program, index) {
-    None -> { unit: unit, test: index, entry: entry_of(index, ""), search: None },
+    None -> { unit: unit, test: index, entry: entry_of(index, b""), search: None },
     Some(c) ->
       {
         unit: unit,
@@ -278,40 +288,42 @@ fn stopped(fl: Failure<InterleavingFailure>) -> Raised / {abort.raise} =
 
 // --- What the run establishes ------------------------------------------------
 
-pub fn hashes_of(analysis: View) -> Hashes / {abort.raise} =
+/// The program `analysis` is, as a run concludes over it, in the era `era` names.
+pub fn hashes_of(analysis: View, era: Bytes) -> Hashes / {abort.raise} =
   {
     defs: by_name(analysis.frame.hashes.defs),
     decls: by_name(analysis.frame.hashes.decls),
-    closure: |keys: List<String>| {
-      let reached = reach(
-        analysis.frame.hashes,
-        keys.map(|k: String| TheItem(Bytes::of_string(k))),
-      );
-      {
-        fns: reached.fns.keys().map(String::of_bytes_lossy),
-        decls: reached.decls.keys().map(String::of_bytes_lossy),
-      }
+    era: era,
+    closure: |keys: List<Bytes>| {
+      let reached = reach(analysis.frame.hashes, keys.map(|k: Bytes| TheItem(k)));
+      { fns: reached.fns.keys(), decls: reached.decls.keys() }
     },
   }
 
-pub fn conclude_tests(analysis: View) -> List<conclude::Test> / {abort.raise} =
+/// The run's tests, each with where a later run walks what it reached from: the test it is, or the
+/// test it is a case of, as `program` enters it.
+pub fn conclude_tests(analysis: View, program: Program) -> List<conclude::Test> / {abort.raise} =
   range(0, analysis.checked.tests.len()).fold([], |acc: List<conclude::Test>, i: Int|
     match test_at(analysis, i) {
-      Some(t) ->
+      Some(t) -> {
+        let entry = match case_of(program, i) { Some(c) -> Some(c.entry), None -> None };
         acc.push({
           index: i,
-          key: String::of_bytes_lossy(t.key),
+          key: t.key,
           seeded: seeded_of(t.footprint),
-          hash: hash_at(analysis, i),
-        }),
+          hash: test_hash_at(analysis, i),
+          of: match entry { Some(e) -> e.of, None -> t.key },
+          case: match entry { Some(e) -> e.case != None, None -> false },
+        })
+      },
       None -> acc,
     })
 
 /// Whether the store had seen each definition before this run, which a failure is suspected against.
-pub fn seen_of(h: Hashes) -> Map<String, Bool> / {ledger.seen} = {
+pub fn seen_of(h: Hashes) -> Map<Bytes, Bool> / {ledger.seen} = {
   let hashes = h.defs.values();
   let answers = ledger.seen(hashes);
-  range(0, hashes.len()).fold(Map::new(), |acc: Map<String, Bool>, i: Int|
+  range(0, hashes.len()).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
     match ((hashes.at(i), answers.at(i))) {
       (Some(hash), Some(known)) -> acc.insert(hash, known),
       _ -> acc,
@@ -437,17 +449,21 @@ fn failed_of(
 ) -> Failed / {abort.raise} = {
   let t = test_at(analysis, failed.index);
   let e = exploration_of(done, failed.index);
+  let key = String::of_bytes_lossy(failed.key);
   {
-    key: failed.key,
-    name: match t { Some(x) -> String::of_bytes_lossy(x.name), None -> failed.key },
+    key: key,
+    name: match t { Some(x) -> String::of_bytes_lossy(x.name), None -> key },
     diagnostic: failed.failure,
     defect: failed.defect,
     host: failed.host,
     search: None,
-    suspects: failed.suspects.map(|name: String|
+    suspects: failed.suspects.map(|name: Bytes|
       {
-        name: name,
-        hash: match h.defs.get(name) { Some(x) -> Some(x), None -> h.decls.get(name) },
+        name: String::of_bytes_lossy(name),
+        hash: match h.defs.get(name) {
+          Some(x) -> Some(x.hex_of()),
+          None -> match h.decls.get(name) { Some(x) -> Some(x.hex_of()), None -> None },
+        },
       }),
     unchanged: failed.suspects.len() == 0,
     seed: match e {
@@ -546,7 +562,8 @@ fn notice_of(n: conclude::Notice) -> Diag =
       diag_of(
         "warning",
         "E0505",
-        "`" ++ key ++ "` reads a simulation seed, but the run reported no search",
+        "`" ++ String::of_bytes_lossy(key)
+          ++ "` reads a simulation seed, but the run reported no search",
         [],
         [
           "the test passed and its result was not cached, so it re-runs next time",
@@ -685,7 +702,7 @@ fn judged_mutant(
 /// result is filed under, and — for a seeded test whose plan is answered root by root — each
 /// root's own. A run that bypasses the cache asks nothing and finds nothing.
 /// Each test's case, and the keys whose passes answer it where one does: its own, or each root's.
-type Selection = { cases: List<select::Case>, answering: List<List<String>> }
+type Selection = { cases: List<select::Case>, answering: List<List<Bytes>> }
 
 /// `loaded` is what the run's load read of the shipped modules (`views.held_texts`).
 pub fn cases_of(
@@ -694,12 +711,12 @@ pub fn cases_of(
   bypassed: Bool,
   loaded: Map<Bytes, Bytes>,
 ) -> Selection / {ledger.passes, tester.moved[tests], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let ask = |keys: List<String>|
-    if bypassed { keys.map(|k: String| None) } else { ledger.passes(keys) };
+  let ask = |keys: List<Bytes>|
+    if bypassed { keys.map(|k: Bytes| None) } else { ledger.passes(keys) };
   let digest = digest_of(search);
   let keys = rows.map(|r: Row| key_of(r, digest));
   let filed = ask(
-    keys.fold([], |acc: List<String>, k: Option<String>|
+    keys.fold([], |acc: List<Bytes>, k: Option<Bytes>|
       match k { Some(key) -> acc.push(key), None -> acc }),
   );
   let rooted = rows.map(|r: Row|
@@ -708,7 +725,7 @@ pub fn cases_of(
       else { None },
       None -> None,
     });
-  let seeded = rooted.map(|ks: Option<List<String>>|
+  let seeded = rooted.map(|ks: Option<List<Bytes>>|
     match ks { Some(xs) -> Some(ask(xs)), None -> None });
   let now = views::now_for(
     views::viewed_in(
@@ -723,7 +740,7 @@ pub fn cases_of(
   // A keyed row's answer is the next one, in the order the keys were asked.
   let held = keys.fold(
     { at: 0, out: [] },
-    |st: { at: Int, out: List<Option<Held>> }, k: Option<String>|
+    |st: { at: Int, out: List<Option<Held>> }, k: Option<Bytes>|
       match k {
         None -> { ..st, out: st.out.push(None) },
         Some(_) -> { at: st.at + 1, out: st.out.push(answers.at_or(st.at, None)) },
@@ -795,8 +812,8 @@ pub fn diagnosed_all(
   if options.no_cache || failures.len() == 0 {
     { failures: failures, benches: failures.map(|f: Failed| None) }
   } else {
-    let records = ledger.baselines(failures.map(|f: Failed| f.key));
-    if records.fold(true, |none: Bool, r: Option<conclude::PassRecord>| none && r == None) {
+    let records = ledger.baselines(c.failures.map(|f: conclude::Failed<Raised>| f.key));
+    if records.fold(true, |none: Bool, r: Option<LastPass>| none && r == None) {
       { failures: failures, benches: failures.map(|f: Failed| None) }
     } else {
       let tree = trials::program_of(timed.program, analysis);
@@ -832,14 +849,14 @@ pub fn decided_faults(
   report: RunReport,
   benches: List<Option<Bench>>,
   asked: Diagnosing,
-) -> { faults: List<Fault>, proved: List<String> } / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} =
+) -> { faults: List<Fault>, proved: List<Bytes> } / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} =
   handle {
     range(0, report.failures.len()).flat_map(|i: Int|
       match report.failures.at(i) {
         None -> [],
         Some(f) ->
           [
-            fault_of(f, asked, |keys: List<DefKey>, filed: Option<String>|
+            fault_of(f, asked, |keys: List<DefKey>, filed: Option<Bytes>|
               match benches.at(i) {
                 Some(Some(b)) -> {
                   let tried: Tried = trial(b, keys, filed);
@@ -851,7 +868,7 @@ pub fn decided_faults(
           ],
       })
   } with {
-    var proved: List<String> = [],
+    var proved: List<Bytes> = [],
     proving.proved(key) -> {
       proved = proved.push(key);
     },
@@ -860,7 +877,7 @@ pub fn decided_faults(
 
 /// The key of a mixture a trial found green, which `decided_faults` keeps.
 effect proving {
-  write proved(key: String) -> Unit
+  write proved(key: Bytes) -> Unit
 }
 
 /// What this run's flags ask of a cause: the search mode and the trial budget.
@@ -878,7 +895,7 @@ pub fn diagnosing(options: Options) -> Diagnosing =
 pub fn fault_of<| e>(
   failed: Failed,
   asked: Diagnosing,
-  tried: (List<DefKey>, Option<String>) -> Trial / e,
+  tried: (List<DefKey>, Option<Bytes>) -> Trial / e,
 ) -> Fault / {abort.raise | e} = {
   let diff = match failed.search { Some(e) -> Some(classified(e.facts)), None -> None };
   let evidence: Evidence = {
@@ -927,21 +944,13 @@ pub fn replay_of(seed: String, name: String) -> Option<String> =
 
 /// A mixture's pass is filed under the test as it is now and as it last passed, the definitions
 /// taken, and the interleaving the failure took.
-fn mixture_filed(failed: Failed, keys: List<DefKey>) -> Option<String> / {abort.raise} =
+fn mixture_filed(failed: Failed, keys: List<DefKey>) -> Option<Bytes> / {abort.raise} =
   match failed.search {
     None -> None,
     Some(e) -> match e.facts.own.after {
       None -> None,
       Some(now) ->
-        Some(
-          mixture_key(
-            Bytes::of_hex(now),
-            Bytes::of_hex(e.facts.own.before),
-            keys,
-            failed.seed,
-          ).hex_of(
-          ),
-        ),
+        Some(mixture_key(Bytes::of_hex(now), Bytes::of_hex(e.facts.own.before), keys, failed.seed)),
     },
   }
 
@@ -982,27 +991,26 @@ fn first_at(
 fn at_at(hits: List<{ name: String, at: Option<ModuleSpan> }>, i: Int) -> Option<ModuleSpan> =
   match hits.at(i) { Some(hit) -> hit.at, None -> None }
 
-/// What the run's filed pass records reach of `analysis`, as a later era's bisection reads it: the
-/// interface and the body of each definition in a passed test's closure.
+/// Files what a later era's bisection reads of the passes `filing` holds, ran over `analysis`, whose
+/// modules hashed as `modules`: the era they passed in, and the interface and the body of each
+/// definition they reached that the store does not hold. Nothing is worked out for one it does.
 pub fn history_of(
   analysis: View,
-  records: List<{ key: String, record: conclude::PassRecord }>,
-) -> { defs: List<FiledDef>, bodies: List<FiledBody> } / {abort.raise} =
-  if records.len() == 0 { { defs: [], bodies: [] } } else {
-    let hashes = records.fold(
-      Map::new(),
-      |acc: Map<String, Bool>, e: { key: String, record: conclude::PassRecord }|
-        e.record.closure.concat(e.record.decls).fold(
-          acc,
-          |a: Map<String, Bool>, n: conclude::Named| a.insert(n.hash, true),
-        ),
-    );
-    {
-      defs: interfaces_among(analysis.checked, analysis.frame.hashes, |h: Bytes|
-        hashes.contains(h.hex_of())),
-      bodies: filed_bodies(analysis.frame.hashes).filter(|b: FiledBody|
-        hashes.contains(b.hash.hex_of())),
-    }
+  modules: List<ModuleHashed>,
+  filing: conclude::Filing,
+) -> Unit / {ledger.unfiled, ledger.history, abort.raise} =
+  if filing.records.len() == 0 { () } else {
+    let unfiled = ledger.unfiled(filing.reached);
+    let fns = unfiled.fns.fold(Map::new(), |acc: Map<Bytes, Bool>, h: Bytes| acc.insert(h, true));
+    let missing = unfiled.decls.fold(fns, |acc: Map<Bytes, Bool>, h: Bytes| acc.insert(h, true));
+    ledger.history(
+      if fns.len() == 0 { [] } else {
+        interfaces_among(analysis.checked, analysis.frame.hashes, |h: Bytes| fns.contains(h))
+      },
+      if missing.len() == 0 { [] }
+      else { filed_bodies(analysis.frame.hashes).filter(|b: FiledBody| missing.contains(b.hash)) },
+      modules,
+    )
   }
 
 // --- Tests ------------------------------------------------------------------
@@ -1044,4 +1052,133 @@ test "a bounded count renders as a lower bound, and a reduction needs the naive 
     explored_of({ ..e, failure: Some({ root: 7u64, path: [1, 0] }) }).failing_seed,
     Some("7:1.0"),
   )
+}
+
+// --- What a run files ---------------------------------------------------------
+
+/// The package `p` that `files` hold, loaded as a run loads it: each module's hashing, and the
+/// program whole.
+fn loaded_from(
+  files: List<{ path: String, body: Bytes }>,
+) -> { modules: List<ModuleHashed>, whole: View } / {abort.raise} = {
+  let tree = fs::mem_of(files);
+  let listed = Bytes::concat_all(
+    queries().map(
+      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {Answering, abort.raise} }|
+        Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
+    ),
+  );
+  handle {
+    match prepared[t]("p") {
+      Err(_) -> panic("the program is read"),
+      Ok(p) -> match analysed(p.own.files, Map::new()).out {
+        Analysed(w) ->
+          { modules: deriving_nothing(|| answers_afresh[t](p)).modules, whole: view_of(w) },
+        _ -> panic("the program checks"),
+      },
+    }
+  } with {
+    fs.list_dir[t](path) -> fs::mem_list(tree, path),
+    fs.kind[t](path) -> fs::mem_kind(tree, path),
+    fs.read_file[t](path) -> fs::mem_read(tree, path),
+    shipped.names() -> ["std.prelude"],
+    shipped.module(name) -> if name == "std.prelude" { Some(prelude_source::text()) } else { None },
+    shipped.reached(view, pulled) -> (),
+    shipped.answer(path, offset, len) -> None,
+    shipped.definitions() -> listed,
+    shipped.stamps() -> "",
+    shipped.runtime() -> panic("the program names no library deriver"),
+  }
+}
+
+/// Every test of `program` passing, concluded and filed as a run files it, into the store at `cache`
+/// under `mem`.
+fn filed_passing(
+  program: { modules: List<ModuleHashed>, whole: View },
+) -> Unit / {fs.read[mem], fs.write[mem], abort.raise} = {
+  let view = program.whole;
+  let tests = range(0, view.checked.tests.len()).fold([], |acc: List<conclude::Test>, i: Int|
+    match test_at(view, i) {
+      Some(t) ->
+        acc.push({
+          index: i,
+          key: t.key,
+          seeded: false,
+          hash: test_hash_at(view, i),
+          of: t.key,
+          case: false,
+        }),
+      None -> acc,
+    });
+  let ran: List<conclude::Ran<Raised>> = tests.map(|t: conclude::Test|
+    {
+      index: t.index,
+      status: "passed",
+      failure: None,
+      host: false,
+      trace: Some(b""),
+      searched: None,
+      seeds: 0,
+    });
+  let c = conclude::concluded(
+    tests,
+    hashes_of(view, results::era_digest_of(program.modules)),
+    {
+      groups: [tests.map(|t: conclude::Test| t.index)],
+      filed: tests.fold(Map::new(), |acc: Map<Int, List<Bytes>>, t: conclude::Test|
+        match t.hash { Some(h) -> acc.insert(t.index, [h]), None -> acc }),
+      codes: Map::new(),
+      reasons: Map::new(),
+      out_of_scope: [],
+    },
+    Map::new(),
+    ran,
+  );
+  handle {
+    history_of(view, program.modules, c.filing)
+  } with {
+    var store = tables::open_cache[mem]("cache", { runtime: "runtime", code: "code" }),
+    ledger.unfiled(reached) -> results::unfiled_in(store, reached),
+    ledger.history(defs, bodies, modules) -> {
+      store = results::kept_over[mem](store, defs, bodies, modules);
+    },
+    return u -> {
+      let _flushed = tables::flush_cache[mem](results::noted[mem, mem](store, c.filing));
+      u
+    },
+  }
+}
+
+test "a run after one definition is edited files its module's record and what the edit moved, and nothing else" {
+  let program = |body: Bytes|
+    loaded_from([
+      { path: "p/low.ply", body: b"pub fn twice(n: Int) -> Int = n * 2\n" },
+      {
+        path: "p/app.ply",
+        body: Bytes::concat_all([
+          b"import low\nfn base(n: Int) -> Int = ",
+          body,
+          b"\nfn top(n: Int) -> Int = base(n) + low::twice(n)\ntest \"tops\" { assert(top(1) > 0) }\n",
+        ]),
+      },
+    ]);
+  let before = program(b"n + 1");
+  let after = program(b"n + 2");
+  let counted = on_twin(mem_empty(), || {
+    let held = ||
+      tables::counts(tables::open_cache[mem]("cache", { runtime: "runtime", code: "code" }));
+    filed_passing(before);
+    let first = held();
+    filed_passing(after);
+    { first: first, second: held() }
+  }).value;
+  // The first run files a record of every module, the shipped ones it pulled among them.
+  assert_eq(counted.first.modules, before.modules.len());
+  assert_eq(counted.first.eras, 1);
+  // The second files the one module whose hashes moved, its era, and `base` and `top`, which the
+  // edit moved; the rest is held.
+  assert_eq(counted.second.modules - counted.first.modules, 1);
+  assert_eq(counted.second.eras - counted.first.eras, 1);
+  assert_eq(counted.second.defs - counted.first.defs, 2);
+  assert_eq(counted.second.bodies - counted.first.bodies, 2)
 }

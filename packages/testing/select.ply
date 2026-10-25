@@ -22,7 +22,7 @@ pub type Row = {
   name: String,
   module: String,
   /// `None` when the front end produced no hash.
-  hash: Option<String>,
+  hash: Option<Bytes>,
   /// Whether the key is the search's, rather than the test's own hash.
   seeded: Bool,
   nondet: Bool,
@@ -37,13 +37,10 @@ pub fn digest_of(s: Search) -> Bytes / {abort.raise} =
 /// Whether a seeded test's result is also answered root by root.
 pub fn per_root(s: Search) -> Bool = writes_seed_keys(s.mode, s.budget, s.steps, s.path)
 
-/// The key a test's result is filed under, as the store spells it back: hex. `None` when the front
-/// end produced no hash, because there is then no key to have an answer under.
-pub fn key_of(row: Row, digest: Bytes) -> Option<String> / {abort.raise} =
-  match row.hash {
-    None -> None,
-    Some(h) -> Some(result_key(Bytes::of_hex(h), row.seeded, digest).hex_of()),
-  }
+/// The key a test's result is filed under. `None` when the front end produced no hash, because
+/// there is then no key to have an answer under.
+pub fn key_of(row: Row, digest: Bytes) -> Option<Bytes> / {abort.raise} =
+  match row.hash { None -> None, Some(h) -> Some(result_key(h, row.seeded, digest)) }
 
 /// Whether the store is asked about each of this test's roots on its own.
 pub fn answers_per_root(row: Row, s: Search) -> Bool = row.seeded && row.hash != None && per_root(s)
@@ -59,9 +56,9 @@ pub type Case = {
   label: String,
   name: String,
   module: String,
-  hash: Option<String>,
+  hash: Option<Bytes>,
   /// The key the result is filed under; `None` when the front end produced no hash.
-  cache_key: Option<String>,
+  cache_key: Option<Bytes>,
   seeded: Bool,
   nondet: Bool,
   /// Nothing, when the store holds no result under that key.
@@ -72,7 +69,7 @@ pub type Case = {
 
 pub fn case_of(
   row: Row,
-  cache_key: Option<String>,
+  cache_key: Option<Bytes>,
   cached: Option<Held>,
   owed: Option<List<Int>>,
 ) -> Case =
@@ -92,7 +89,7 @@ pub fn case_of(
 pub type Reason = | New | Changed(String) | PreviousFailure | Cached | SameCode | Unhashed
 
 /// A pass as the store files it: the key, and the trace of what its run read.
-pub type Pass = { key: String, trace: Bytes }
+pub type Pass = { key: Bytes, trace: Bytes }
 
 /// One test's answer: what was decided, and whether it therefore runs.
 pub type Decision = { case: Case, reason: Reason }
@@ -129,13 +126,13 @@ pub fn owed_roots(roots: List<Int>, held: List<Option<Held>>) -> List<Int> / {ab
     match held.at(i) { Some(Some(Stands)) -> false, _ -> true }
   }).map(|i: Int| roots.get(i))
 
-/// The key each root files its own result under, as the store spells it back: hex.
+/// The key each root files its own result under.
 pub fn seed_keys(
-  test_hash: String,
+  test_hash: Bytes,
   roots: List<Int>,
   path: List<Int>,
-) -> List<String> / {abort.raise} =
-  roots.map(|root: Int| seed_key(Bytes::of_hex(test_hash), seed_bytes(root, path)).hex_of())
+) -> List<Bytes> / {abort.raise} =
+  roots.map(|root: Int| seed_key(test_hash, seed_bytes(root, path)))
 
 /// The roots a running test searches: what it still owes when that is some but not all of the
 /// plan's, and the whole plan otherwise.
@@ -162,20 +159,16 @@ pub fn narrowed(
 pub fn filed(
   decisions: List<Decision>,
   s: Search,
-) -> List<{ index: Int, keys: List<String> }> / {abort.raise} = {
+) -> List<{ index: Int, keys: List<Bytes> }> / {abort.raise} = {
   let digest = digest_of(s);
-  decisions.fold([], |acc: List<{ index: Int, keys: List<String> }>, d: Decision|
+  decisions.fold([], |acc: List<{ index: Int, keys: List<Bytes> }>, d: Decision|
     match d.case.hash {
       None -> acc,
       Some(h) -> if !runs(d) { acc } else {
-        let keys = filed_keys(
-          Bytes::of_hex(h),
-          d.case.seeded,
-          digest,
-          per_root(s),
-          searched_roots(d.case, s.roots),
-        );
-        acc.push({ index: d.case.index, keys: keys.map(Bytes::hex_of) })
+        acc.push({
+          index: d.case.index,
+          keys: filed_keys(h, d.case.seeded, digest, per_root(s), searched_roots(d.case, s.roots)),
+        })
       },
     })
 }
@@ -185,16 +178,15 @@ pub fn filed(
 /// hash is filed by neither key.
 pub fn code_keys(
   decisions: List<Decision>,
-  codes: Map<Int, String>,
+  codes: Map<Int, Bytes>,
   s: Search,
-) -> Map<Int, String> / {abort.raise} = {
+) -> Map<Int, Bytes> / {abort.raise} = {
   let digest = digest_of(s);
-  decisions.fold(Map::new(), |acc: Map<Int, String>, d: Decision|
+  decisions.fold(Map::new(), |acc: Map<Int, Bytes>, d: Decision|
     if d.case.hash == None { acc } else {
       match codes.get(d.case.index) {
         None -> acc,
-        Some(code) ->
-          acc.insert(d.case.index, code_key(Bytes::of_hex(code), d.case.seeded, digest).hex_of()),
+        Some(code) -> acc.insert(d.case.index, code_key(code, d.case.seeded, digest)),
       }
     })
 }
@@ -203,9 +195,9 @@ pub fn code_keys(
 /// cached test is answered already.
 pub fn asked_by_code(
   decisions: List<Decision>,
-  keys: Map<Int, String>,
-) -> List<{ index: Int, key: String }> =
-  decisions.fold([], |acc: List<{ index: Int, key: String }>, d: Decision|
+  keys: Map<Int, Bytes>,
+) -> List<{ index: Int, key: Bytes }> =
+  decisions.fold([], |acc: List<{ index: Int, key: Bytes }>, d: Decision|
     if d.reason != New { acc } else {
       match keys.get(d.case.index) {
         Some(k) -> acc.push({ index: d.case.index, key: k }),
@@ -229,9 +221,9 @@ pub fn by_code(
     decisions: decisions.map(|d: Decision| if hit(d) { { ..d, reason: SameCode } } else { d }),
     refiled: filed(decisions.filter(hit), s).fold(
       [],
-      |acc: List<Pass>, e: { index: Int, keys: List<String> }| {
+      |acc: List<Pass>, e: { index: Int, keys: List<Bytes> }| {
         let trace = match passed.get(e.index) { Some(t) -> t, None -> b"" };
-        e.keys.fold(acc, |a: List<Pass>, k: String| a.push({ key: k, trace: trace }))
+        e.keys.fold(acc, |a: List<Pass>, k: Bytes| a.push({ key: k, trace: trace }))
       },
     ),
   }
@@ -262,7 +254,7 @@ pub fn word(r: Reason) -> String =
 
 // --- Tests ------------------------------------------------------------------
 
-fn a_hash() -> String = "0707070707070707070707070707070707070707070707070707070707070707"
+fn a_hash() -> Bytes = b"\x07".repeat(32)
 
 fn a_case(index: Int, cached: Option<Held>) -> Case =
   {
@@ -307,7 +299,7 @@ test "a test with no hash runs, because there is no key to have an answer under"
   assert(!answers_per_root(row, random(4)))
 }
 
-fn sevens() -> String = "7777777777777777777777777777777777777777777777777777777777777777"
+fn sevens() -> Bytes = b"\x77".repeat(32)
 
 test "a new test is answered by its code, and filed again under its own key; nothing else is" {
   let decisions = decide([
@@ -317,18 +309,14 @@ test "a new test is answered by its code, and filed again under its own key; not
     { ..a_case(3, None), nondet: true },
     { ..a_case(4, None), hash: None, cache_key: None },
   ]);
-  let codes = range(0, 5).fold(Map::new(), |m: Map<Int, String>, i: Int| m.insert(i, sevens()));
+  let codes = range(0, 5).fold(Map::new(), |m: Map<Int, Bytes>, i: Int| m.insert(i, sevens()));
   let keys = code_keys(decisions, codes, dpor());
   // An unhashed test is filed by no key, its code's included.
   assert_eq(keys.keys(), [0, 1, 2, 3]);
   // Two tests that ran the same code share its key: what passed as that code passes again.
   assert_eq(keys.get(0), keys.get(2));
   // A stored failure runs again whatever its code did before.
-  assert_eq(asked_by_code(decisions, keys).map(|a: { index: Int, key: String }| a.index), [
-    0,
-    2,
-    3,
-  ]);
+  assert_eq(asked_by_code(decisions, keys).map(|a: { index: Int, key: Bytes }| a.index), [0, 2, 3]);
   let answered = by_code(decisions, Map::new().insert(0, b"read"), dpor());
   assert_eq(answered.decisions.map(|d: Decision| d.reason), [
     SameCode,
@@ -475,10 +463,10 @@ test "a pass is filed under what the test ran and the plan it answers for" {
     ]),
     four,
   );
-  assert_eq(keys.map(|f: { index: Int, keys: List<String> }| f.keys.len()), [3]);
-  assert_eq(keys.map(|f: { index: Int, keys: List<String> }| f.keys).get(0), [
+  assert_eq(keys.map(|f: { index: Int, keys: List<Bytes> }| f.keys.len()), [3]);
+  assert_eq(keys.map(|f: { index: Int, keys: List<Bytes> }| f.keys).get(0), [
     seed_keys(a_hash(), [2], []).get(0),
     seed_keys(a_hash(), [3], []).get(0),
-    result_key(Bytes::of_hex(a_hash()), true, digest_of(four)).hex_of(),
+    result_key(a_hash(), true, digest_of(four)),
   ])
 }
