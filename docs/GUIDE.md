@@ -2786,7 +2786,9 @@ values, so `1.5m == 1.50m`, though they print apart. At a type that states a
 `key` (§4.4) it is `==` of the keys. At a value holding any of these it is read
 part by part where the shapes are in view, and otherwise as a relation that is
 symmetric, and true of a value and itself only where no `Float`, keyed value or
-type variable can be held. At a type variable it is identity only under an
+type variable can be held; where a keyed value can, that comparison calls a key
+the prover does not read, as `min`, `max` and a `Map`'s operations over one do,
+and is owed as a call that may end the run. At a type variable it is identity only under an
 `identity` constraint (below). `<`, `<=`, `>` and `>=` at `Float` are the order,
 false where either side is `NaN`; `Float` arithmetic is read only where both
 operands are literals, as the bits a run answers. An operator at a type that
@@ -2824,7 +2826,9 @@ package's run to prove; one of this package's is read once a proof showed every
 `ensures` of its definition, and the clause being proved holds at each call its
 own definition's body makes back into it, on the way to that call. So `fn
 quadrupled(n: Int) -> Int ensures result == n * 4 = doubled(doubled(n))`
-stands on `doubled`'s `ensures result == n * 2` without its body.
+stands on `doubled`'s `ensures result == n * 2` without its body. A contract,
+or a law, proved over a type variable shows no call answers that settles the
+variable at a type whose `==` may call a key.
 
 A run proves a claim only where it covers all of it. A domain of at most 4096
 points is walked whole, a law's after a short static search, and a law over a `simulate` region is searched at every

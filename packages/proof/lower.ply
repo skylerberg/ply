@@ -261,7 +261,13 @@ pub type Lowering = {
 
 /// A lambda as a value: its code, the terms it captured, by slot, and what reading its body on fresh
 /// arguments showed: whether it performs nothing, and whether it always answers.
-pub type Closure = { lambda: Lambda, window: List<Option<Int>>, pure: Bool, total: Bool }
+pub type Closure = {
+  lambda: Lambda,
+  window: List<Option<Int>>,
+  pure: Bool,
+  total: Bool,
+  raises_owed: Bool,
+}
 
 /// A lowering after a step, and the term the step produced.
 pub type L = { lowering: Lowering, id: Int }
@@ -443,7 +449,9 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
     match acc {
       Some(_) -> acc,
       None -> match lw.closures.at(k) {
-        Some(c) -> if c.lambda == l && c.window == captured.window { Some(k) } else { None },
+        Some(c) -> if c.lambda == l && c.window == captured.window
+            && c.raises_owed == lw.raises_owed { Some(k) }
+        else { None },
         None -> None,
       },
     });
@@ -489,6 +497,7 @@ fn closure(lowering: Lowering, context: Context, l: Lambda, unfolds: Int) -> L /
             window: captured.window,
             pure: !read.lowering.impure,
             total: !read.lowering.impure && read.lowering.requirements.len() == 0,
+            raises_owed: lw.raises_owed,
           }),
         },
         made,
@@ -550,7 +559,7 @@ fn function_pure(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.
 fn function_total(lowering: Lowering, context: Context, t: Int) -> Bool / {abort.raise} =
   match node(lowering.terms, t) {
     TClosure(k) -> match lowering.closures.at(k) { Some(c) -> c.total, None -> false },
-    TOpaque(name) -> is_total_builtin(name) || ctor(context, name) != None,
+    TOpaque(name) -> (is_total_builtin(name) && !compares(name)) || ctor(context, name) != None,
     TSym(_) ->
       lowering.in_law && lowering.binder_terms.contains(t)
         && (match sort_of(lowering.terms, t) { Some(Fn(_, _, total)) -> total, _ -> false }),
@@ -1050,7 +1059,7 @@ fn equal_within(
     match sort_of(lowering.terms, t) { Some(Con(name, _)) -> context.keys.get(name), _ -> None };
   let keyed = match key_of(x) { Some(by) -> Some(by), None -> key_of(y) };
   match keyed {
-    Some(by) -> if room <= 0 { on(lowering, equal_at(lowering.terms, x, y, false)) } else {
+    Some(by) -> if room <= 0 { related(lowering, context, sort, x, y) } else {
       let kx = call_named(lowering, context, by, [x], unfolds);
       let ky = call_named(kx.lowering, context, by, [y], unfolds);
       equal_within(ky.lowering, context, kx.id, ky.id, unfolds, room - 1)
@@ -1063,12 +1072,8 @@ fn equal_within(
         None -> by_shape(lowering, context, x, y, unfolds, room),
         Some(s) -> if is_identity(context, s, lowering.identities) {
           on(lowering, eq(lowering.terms, x, y))
-        } else if room <= 0 {
-          on(
-            lowering,
-            equal_at(lowering.terms, x, y, is_reflexive(context, s, lowering.identities)),
-          )
-        } else if is_con(s, "Float") {
+        } else if room <= 0 { related(lowering, context, Some(s), x, y) }
+        else if is_con(s, "Float") {
           let rx = float_rank(lowering.terms, x);
           let ry = float_rank(rx.terms, y);
           let same = eq(ry.terms, rx.id, ry.id);
@@ -1115,7 +1120,7 @@ fn by_shape(
       _ -> false,
     };
   if plain(x) || plain(y) { on(lowering, eq(lowering.terms, x, y)) }
-  else if room <= 0 { on(lowering, equal_at(lowering.terms, x, y, false)) }
+  else if room <= 0 { related(lowering, context, None, x, y) }
   else { pointwise(lowering, context, None, x, y, unfolds, room - 1) }
 }
 
@@ -1169,7 +1174,7 @@ fn pointwise(
       (TCons(a), TCons(b)) -> all(lowering, [{ a: a.head, b: b.head }, { a: a.tail, b: b.tail }]),
       (TRecord(a), TRecord(b)) -> if a.map(|f: { name: String, value: Int }| f.name)
           != b.map(|f: { name: String, value: Int }| f.name) {
-        on(lowering, equal_at(lowering.terms, x, y, false))
+        related(lowering, context, sort, x, y)
       } else {
         all(
           lowering,
@@ -1180,16 +1185,30 @@ fn pointwise(
             }),
         )
       },
-      _ ->
-        on(
-          lowering,
-          equal_at(lowering.terms, x, y, match sort {
-            Some(t) -> is_reflexive(context, t, lowering.identities),
-            None -> false,
-          }),
-        ),
+      _ -> related(lowering, context, sort, x, y),
     },
   }
+}
+
+/// `x == y` at `sort` as the relation alone. Where the values may hold a keyed one, `==` calls a
+/// key no term here reads, which may end the run.
+fn related(
+  lowering: Lowering,
+  context: Context,
+  sort: Option<Ty>,
+  x: Int,
+  y: Int,
+) -> L / {abort.raise} = {
+  let keyed = match sort {
+    Some(t) -> reaches_key(context, t),
+    None -> context.keyed_types.len() > 0,
+  };
+  let lw = if keyed { undefined(blocked(lowering, OpaqueCall("=="))) } else { lowering };
+  let reflexive = match sort {
+    Some(t) -> is_reflexive(context, t, lowering.identities),
+    None -> false,
+  };
+  on(lw, equal_at(lw.terms, x, y, reflexive))
 }
 
 /// Of two sorts one value may have, the one that knows more: a sort whose type arguments are known
@@ -1590,13 +1609,11 @@ pub fn invariants_held(
               unfolds - 1,
             );
             {
-              ..r.lowering,
-              path: lw.path,
+              ..facts_on_path(lw, { ..r.lowering, facts: r.lowering.facts.push(r.id) }),
               building: lw.building,
               inducting: lw.inducting,
               requirements: lw.requirements,
               blockers: lw.blockers,
-              facts: r.lowering.facts.push(r.id),
             }
           },
           None -> lw,
@@ -1604,6 +1621,37 @@ pub fn invariants_held(
         _ -> lw,
       })
   }
+
+/// Whether a law over `declared` binders, bound at `terms`, says the calls it fits answer: not where
+/// a binder holds a function, whose answering the law stood on and no other function may; nor where
+/// a binder's type variable is settled at a value a key is called on, which the law never met.
+fn stands_alike(
+  lowering: Lowering,
+  context: Context,
+  declared: List<Ty>,
+  terms: List<Int>,
+) -> Bool =
+  !declared.any(|t: Ty| holds_function(context, t))
+    && !keyed_at_variable(lowering, context, declared, terms)
+
+/// Whether some term of `terms`, where its `declared` type has a variable, is of a sort that reaches
+/// a key, or of no sort known: generic code was shown at no type whose `==` calls a function.
+fn keyed_at_variable(
+  lowering: Lowering,
+  context: Context,
+  declared: List<Ty>,
+  terms: List<Int>,
+) -> Bool =
+  range(0, declared.len()).any(|i: Int|
+    match ((declared.at(i), terms.at(i))) {
+      (Some(d), Some(t)) ->
+        vars(d, []).len() > 0
+          && (match sort_of(lowering.terms, t) {
+            Some(s) -> reaches_key(context, s),
+            None -> true,
+          }),
+      _ -> false,
+    })
 
 /// Whether a value of `ty` is or holds a function, through any declaration.
 fn holds_function(context: Context, ty: Ty) -> Bool = function_within(context, ty, [], 64)
@@ -1653,9 +1701,10 @@ fn holds_any(context: Context, ty: Ty, names: List<String>, seen: List<String>, 
 
 /// A call of `name` read by its contract, where one is in hand: a proved `ensures` shows the body
 /// answers wherever the `requires` hold, so the call owes them, and each clause holds of what it
-/// answers there. A proved clause holds of the call wherever it stands; the clause being proved
-/// holds of a call back into its definition only on the way to that call, which the definition's
-/// run makes before it answers. What reading the clauses owes is owed by the run that proves them.
+/// answers there. A proved clause holds of the call where the call is reached; the clause being
+/// proved holds of a call back into its definition only on the way to that call, which the
+/// definition's run makes before it answers. What reading the clauses owes is owed by the run that
+/// proves them. A generic callee was proved at no value whose comparison calls a key.
 fn contracted(
   lowering: Lowering,
   context: Context,
@@ -1676,55 +1725,62 @@ fn contracted(
         if !range(0, ensures.len()).any(usable) { None } else {
           let made = app(lowering.terms, head, args, sort);
           let call = made.id;
-          let scratch = {
-            ..with_terms(lowering, made.terms),
-            path: [],
-            depth: lowering.depth + 1,
-            inducting: None,
+          let params = match signature(context, name) {
+            Some(s) -> match s.ty { Fn(ps, _, _) -> ps, _ -> [] },
+            None -> [],
           };
-          let guard = requires.fold(
-            { lowering: scratch, id: true_id() },
-            |acc: L, c: ClaimClause| {
-              let r = lower_opt(
-                { ..acc.lowering, window: args.map(|t: Int| Some(t)) },
-                context,
-                c.clause.code,
-                unfolds - 1,
-              );
-              on(r.lowering, both(r.lowering.terms, acc.id, r.id))
-            },
-          );
-          let stated = range(0, ensures.len()).fold(guard.lowering, |lw: Lowering, i: Int|
-            if !usable(i) { lw } else {
-              match ensures.at(i) {
-                None -> lw,
-                Some(c) -> {
-                  let e = lower_opt(
-                    { ..lw, window: args.push(call).map(|t: Int| Some(t)) },
-                    context,
-                    c.clause.code,
-                    unfolds - 1,
-                  );
-                  let unmet = not(e.lowering.terms, guard.id);
-                  let stated = or(unmet.terms, unmet.id, e.id);
-                  let fact = where_owed(with_terms(e.lowering, stated.terms), lowering, stated.id);
-                  let held = if proved { fact }
-                  else { under_path({ ..fact.lowering, path: lowering.path }, fact.id) };
-                  { ..held.lowering, facts: held.lowering.facts.push(held.id) }
-                },
-              }
-            });
-          let back = {
-            ..stated,
-            window: lowering.window,
-            path: lowering.path,
-            depth: lowering.depth,
-            inducting: lowering.inducting,
-            requirements: lowering.requirements,
-            blockers: lowering.blockers,
-            rules: note(stated.rules, Contract({ def: name })),
-          };
-          Some({ lowering: require(back, guard.id), id: call })
+          if keyed_at_variable(lowering, context, params, args) { None } else {
+            let scratch = {
+              ..with_terms(lowering, made.terms),
+              path: [],
+              depth: lowering.depth + 1,
+              inducting: None,
+            };
+            let guard = requires.fold(
+              { lowering: scratch, id: true_id() },
+              |acc: L, c: ClaimClause| {
+                let r = lower_opt(
+                  { ..acc.lowering, window: args.map(|t: Int| Some(t)) },
+                  context,
+                  c.clause.code,
+                  unfolds - 1,
+                );
+                on(r.lowering, both(r.lowering.terms, acc.id, r.id))
+              },
+            );
+            let stated = range(0, ensures.len()).fold(guard.lowering, |lw: Lowering, i: Int|
+              if !usable(i) { lw } else {
+                match ensures.at(i) {
+                  None -> lw,
+                  Some(c) -> {
+                    let e = lower_opt(
+                      { ..lw, window: args.push(call).map(|t: Int| Some(t)) },
+                      context,
+                      c.clause.code,
+                      unfolds - 1,
+                    );
+                    let unmet = not(e.lowering.terms, guard.id);
+                    let stated = or(unmet.terms, unmet.id, e.id);
+                    let fact = where_owed(
+                      with_terms(e.lowering, stated.terms),
+                      lowering,
+                      stated.id,
+                    );
+                    { ..fact.lowering, facts: fact.lowering.facts.push(fact.id) }
+                  },
+                }
+              });
+            let back = {
+              ..facts_on_path(lowering, stated),
+              window: lowering.window,
+              depth: lowering.depth,
+              inducting: lowering.inducting,
+              requirements: lowering.requirements,
+              blockers: lowering.blockers,
+              rules: note(stated.rules, Contract({ def: name })),
+            };
+            Some({ lowering: require(back, guard.id), id: call })
+          }
         }
       },
     }
@@ -1775,11 +1831,11 @@ fn instances(
           Some(binds) -> match Option::all(binds) {
             None -> acc,
             Some(terms) -> if !typed_fit(acc.lowering, context, lemma, terms) { acc } else {
+              let answers = stands_alike(acc.lowering, context, lemma.typed, terms);
               {
                 lowering: instance(acc.lowering, context, lemma, terms, unfolds - 1),
-                apart: acc.apart || lemma.apart,
-                // A law over a function stood on that function answering, which no other may.
-                fitted: acc.fitted || !lemma.typed.any(|t: Ty| holds_function(context, t)),
+                apart: acc.apart || (lemma.apart && answers),
+                fitted: acc.fitted || answers,
               }
             },
           },
@@ -1876,8 +1932,10 @@ fn fitted(
   }
 
 /// The law at `terms`, lowered where nothing has been assumed and no lemma fits, so a law's instance
-/// never asks for another. A proved law holds and is defined at every point, so what lowering it owes
-/// is not owed, and the calls it makes are values.
+/// never asks for another. A proved law holds and is defined at every value of its binders' types,
+/// so what lowering it owes is not owed and the calls it makes are values; not where a binder holds
+/// a function, or a keyed value at a type variable, which the law never met: there the fact holds
+/// only where its reading answers.
 fn instance(
   lowering: Lowering,
   context: Context,
@@ -1898,23 +1956,34 @@ fn instance(
     lemma.body,
     unfolds,
   );
-  let fact = where_owed(r.lowering, lowering, r.id);
+  let alike = stands_alike(lowering, context, lemma.typed, terms);
+  let fact = where_owed(r.lowering, if alike { lowering } else { r.lowering }, r.id);
   {
-    ..fact.lowering,
+    ..facts_on_path(lowering, { ..fact.lowering, facts: fact.lowering.facts.push(fact.id) }),
     window: lowering.window,
-    path: lowering.path,
     depth: lowering.depth,
     inducting: lowering.inducting,
     lemmas: lowering.lemmas,
     requirements: lowering.requirements,
     blockers: lowering.blockers,
     calls: lowering.calls,
-    // A law over a function stood on that function answering, so its calls are no other's values.
-    defined: if lemma.typed.any(|t: Ty| holds_function(context, t)) { r.lowering.defined }
-    else { r.lowering.defined.concat(r.lowering.calls.drop(lowering.calls.len())) },
-    facts: fact.lowering.facts.push(fact.id),
+    defined: if alike { r.lowering.defined.concat(r.lowering.calls.drop(lowering.calls.len())) }
+    else { r.lowering.defined },
     rules: note(fact.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
   }
+}
+
+/// `after`, a reading made off to the side of `before`, with each fact it added stated only where
+/// `before`'s path holds: a fact made for a call speaks of nothing where the call is not reached.
+fn facts_on_path(before: Lowering, after: Lowering) -> Lowering / {abort.raise} = {
+  let stated = after.facts.drop(before.facts.len()).fold(
+    { lowering: { ..after, path: before.path }, ids: [] },
+    |acc: { lowering: Lowering, ids: List<Int> }, f: Int| {
+      let u = under_path(acc.lowering, f);
+      { lowering: u.lowering, ids: acc.ids.push(u.id) }
+    },
+  );
+  { ..stated.lowering, facts: before.facts.concat(stated.ids) }
 }
 
 /// `fact`, about values `owing` was read to, stated where what that reading owes holds: a fact
@@ -2245,8 +2314,11 @@ fn callee_is_total(
 /// where it compares, over no value whose key's function could end the run.
 fn builtin_answers(context: Context, name: String, sorts: List<Option<Ty>>) -> Bool =
   is_total_builtin(name)
-    && !((name == "min" || name == "max" || name.starts_with("Map::"))
+    && !(compares(name)
       && sorts.any(|s: Option<Ty>| match s { Some(t) -> reaches_key(context, t), None -> true }))
+
+/// Whether the builtin `name` compares its arguments, which calls a keyed value's key.
+fn compares(name: String) -> Bool = name == "min" || name == "max" || name.starts_with("Map::")
 
 fn head_is_pure(terms: Terms, head: Int) -> Bool =
   match sort_of(terms, head) { Some(Fn(_, _, pure)) -> pure, _ -> false }
