@@ -8,11 +8,11 @@ import std.hash (blake3)
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, TyCon, TyFn, TyVar, row_empty)
 import compiler.emit.c (int_lit, tick_line)
-import compiler.emit.reps (Ctors, word_type, resumption)
+import compiler.emit.reps (Ctors, word_type, resumption, laid_known)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOp, root_name, root_text,
                            has_entry)
-import compiler.emit.layout (header_bytes)
+import compiler.emit.layout (header_bytes, words)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, spelled)
 import compiler.emit.answer (Expect, GenericAt, SharedFn, call_at)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSum, RUnit,
@@ -35,7 +35,7 @@ import compiler.emit.print.made (c_type, c_types, zeros, word_as, arg_parts, hea
                                  head_params, head_names, words_laid, parts_read, answer_parts,
                                  entry_opened, entry_outs, entry_answered, entry_answer_values,
                                  parts_word, word_parts, declared, set_parts, read_from,
-                                 declared_as)
+                                 declared_as, placed_write)
 import compiler.emit.print.fuel (fuel_head)
 import compiler.emit.print.counting (last_fn, free_fn, rel_box_fn, call_text, same_word_fn)
 
@@ -88,11 +88,13 @@ fn invoked(
   let named_as = match into { Some(v) -> named(handed.pr, v), None -> temp(handed.pr) };
   let answered = part_names(named_as.name, answer);
   let buffer = answer_buffered(named_as.pr, p.depth, answer);
-  let noted = noting(site(p, buffer.pr));
+  let dest = destination(buffer.pr, p.depth, into, conv);
+  let noted = noting(site(p, dest.pr));
   let handed_args = Bytes::concat_all([
     b"(ctx",
     Bytes::concat_all(
-      to.first.concat(handed.args).concat(buffer.args).map(|a: Bytes| b", ".concat(a)),
+      to.first.concat(handed.args).concat(buffer.args).concat(dest.args).map(|a: Bytes|
+        b", ".concat(a)),
     ),
     b")",
   ]);
@@ -172,6 +174,34 @@ fn answer_buffered(pr: Printing, depth: Int, r: Rep) -> { pr: Printing, args: Li
     }
   }
 }
+
+/// What a call of a destined root hands as its destination, `into` its answer, and the C laying it:
+/// the body's own `d` where the answer is the body's, a slot of the frame where it is only read
+/// into a place, else zero, so the callee answers a box of its own.
+fn destination(
+  pr: Printing,
+  depth: Int,
+  into: Option<Var>,
+  conv: Convention,
+) -> { pr: Printing, args: List<Bytes> } =
+  if !conv.destined { { pr: pr, args: [] } } else {
+    match into {
+      Some(v) -> if pr.placing.answers.contains(v.id) { { pr: pr, args: [b"d"] } }
+      else if pr.placing.slots.contains(v.id) {
+        let t = temp(pr);
+        let n = match laid_known(pr.ctors, v.ty) { Some(l) -> 1 + words(l), None -> 1 };
+        {
+          pr: line(
+            t.pr,
+            depth,
+            Bytes::concat_all([b"Word ", t.name, b"[", ascii_of_int(n), b"];"]),
+          ),
+          args: [b"(Word)".concat(t.name)],
+        }
+      } else { { pr: pr, args: [b"0"] } },
+      None -> { pr: pr, args: [b"0"] },
+    }
+  }
 
 /// The C values `names` of an answer held as `r` past its first, read out of the buffer `buffer`
 /// hands, each declared where `declare` says and set otherwise.
@@ -850,9 +880,7 @@ fn typed_entry(name: Bytes, taken: Taken, own: Convention) -> List<Piece> =
         b"  return ",
         name,
         b"(ctx",
-        Bytes::concat_all(
-          taken.names.concat(head_names(own.reps, own.answer)).map(|a: Bytes| b", ".concat(a)),
-        ),
+        Bytes::concat_all(taken.names.concat(head_names(own)).map(|a: Bytes| b", ".concat(a))),
         b");\n}\n",
       ]),
     ),
@@ -1113,7 +1141,8 @@ fn entry_text(
     name,
     b"(ctx",
     Bytes::concat_all(
-      first.concat(opened.args).concat(entry_outs(c.answer)).map(|a: Bytes| b", ".concat(a)),
+      first.concat(opened.args).concat(entry_outs(c.answer)).concat(if c.destined { [b"0"] }
+      else { [] }).map(|a: Bytes| b", ".concat(a)),
     ),
     b")",
   ]);
@@ -1196,10 +1225,13 @@ pub fn group_wrapper(
         ),
         b")",
       ]);
+      let answered = if m.conv.destined && m.conv.answered == Owned {
+        destined_answered(words.pr, call, f.answer_ty)
+      } else { { pr: words.pr, out: group_answered(call, answer) } };
       let entered = if !has_entry(m.key, m.params.len(), words.pr.ctors.stated) {
-        { pr: words.pr, out: [] }
+        { pr: answered.pr, out: [] }
       } else {
-        runtime_entry(words.pr, name, {
+        runtime_entry(answered.pr, name, {
           conv: m.conv,
           types: m.params.map(|v: Var| v.ty),
           answer_ty: f.answer_ty,
@@ -1221,7 +1253,7 @@ pub fn group_wrapper(
         ].concat(
           words.prep,
         ).concat(
-          group_answered(call, answer),
+          answered.out,
         ).push(
           Text(b"}\n"),
         ).concat(
@@ -1238,6 +1270,34 @@ fn two_words_released(w: Bytes) -> Bytes =
 /// How a member's wrapper hands back what the group's function `call` answers, a word, as the member
 /// answers `answer`: the word itself; a scalar read out and the word let go; a value held as several opened into them, each past the first written into
 /// the caller's buffer `o`.
+/// The C a destined member's wrapper hands back the group's answer `call`, a box of a record of
+/// `ty`, by: moved into the destination where its caller gave one.
+fn destined_answered(
+  pr: Printing,
+  call: Bytes,
+  ty: Type,
+) -> { pr: Printing, out: List<Piece> } / {abort.raise} =
+  match laid_known(pr.ctors, ty) {
+    Some(l) -> {
+      let moved = placed_write(pr, b"*(Word *)d", b"ply_words(d)", b"r", l);
+      {
+        pr: moved.pr,
+        out: [
+          Text(
+            Bytes::concat_all([
+              b"  Word r = ",
+              call,
+              b";\n  if (d && r) { ",
+              moved.text,
+              b" return d; }\n  return r;\n",
+            ]),
+          ),
+        ],
+      }
+    },
+    None -> { pr: pr, out: [Text(Bytes::concat_all([b"  return ", call, b";\n"]))] },
+  }
+
 fn group_answered(call: Bytes, answer: Rep) -> List<Piece> = {
   let got = Bytes::concat_all([b"  Word r = ", call, b";\n  if (ctx->failed) "]);
   match answer {
@@ -1303,7 +1363,13 @@ pub fn typed_callee(f: Bytes, c: Convention) -> Bytes =
 /// answer owned, each held as a body holds a value of its type over the constructor table `ctors`.
 pub fn convention_of(ctors: Ctors, t: { params: List<Type>, ret: Type }) -> Convention = {
   let reps = t.params.map(|x: Type| held_with(ctors, x));
-  { params: reps.map(|_: Rep| Given), reps: reps, answer: held_with(ctors, t.ret), answered: Owned }
+  {
+    params: reps.map(|_: Rep| Given),
+    reps: reps,
+    answer: held_with(ctors, t.ret),
+    destined: false,
+    answered: Owned,
+  }
 }
 
 /// The C type of the entry a closure of convention `c` is called through by its type: the closure,
@@ -1408,7 +1474,7 @@ fn place() -> Place =
 test "a call lays a record wider than four words in a buffer it hands, and reads a wide answer out of one it hands last" {
   let wide = RFlat(range(0, 5).map(|i: Int| { name: b"f".concat(ascii_of_int(i)), rep: RInt }));
   let local = |id: Int| { id: id, ty: TyCon({ name: b"T", args: [] }), rep: wide };
-  let conv = { params: [Given], reps: [wide], answer: wide, answered: Owned };
+  let conv = { params: [Given], reps: [wide], answer: wide, destined: false, answered: Owned };
   let callee = Root(Named(b"m.g"));
   let pr = call(place(), printing(Map::new().insert(0, b"w")), Some(local(1)), {
     callee: callee,
@@ -1435,7 +1501,7 @@ test "a function value is called through its descriptor's entry at its type's co
   let typed = applied(place(), names, Some({ id: 2, ty: int(), rep: RInt }), {
     f: AVar({ id: 0, ty: fty, rep: RWord }),
     args: [AVar({ id: 1, ty: int(), rep: RInt })],
-    conv: { params: [Given], reps: [RInt], answer: RInt, answered: Owned },
+    conv: { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned },
     stops: false,
   });
   // The typed entry, cast to the function type's convention, takes the closure and the argument.
@@ -1445,7 +1511,7 @@ test "a function value is called through its descriptor's entry at its type's co
   let resumed = applied(place(), names, Some({ id: 2, ty: int(), rep: RWord }), {
     f: AVar({ id: 0, ty: resumption(int()), rep: RWord }),
     args: [AVar({ id: 1, ty: int(), rep: RWord })],
-    conv: { params: [Given], reps: [RWord], answer: RWord, answered: Owned },
+    conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
     stops: true,
   });
   // A continuation is called as the runtime calls a function value: its uniform entry, its arguments
@@ -1501,6 +1567,7 @@ test "a root's entry lets go of what the root only borrows after the call, a bor
     params: [Lent, Given],
     reps: [RWord, RInt],
     answer: RWord,
+    destined: false,
     answered: Borrowed([{ param: 0, whole: true }]),
   };
   let entry = |c: Convention|
@@ -1546,6 +1613,7 @@ test "a closure's entries hand over its captures out of its block, its release l
       params: [Given, Given, Given],
       reps: [RWord, RWord, RInt],
       answer: RInt,
+      destined: false,
       answered: Owned,
     },
     answer_ty: int(),

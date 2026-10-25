@@ -3,14 +3,19 @@
 
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (TyCon, list_type, int_type)
-import compiler.emit.layout (LWords, P, sum_laid, record_laid, raw, raw_sum)
+import compiler.check.types (Type)
+import compiler.emit.c (int_lit)
+import compiler.emit.layout (LWords, LRecord, LPlaced, FieldLaid, P, sum_laid, record_laid, raw,
+                             raw_sum, words, header_bytes)
+import compiler.emit.reps (laid_known)
 import compiler.emit.tir (Rep, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, Data, rep_of_arg,
                           rep_said, in_box)
 import compiler.emit.pieces (Text, spelled)
 import compiler.emit.print.text (Printing, Place, printing, named, pad, pieces, line, arg_text,
-                                 part_names, unprinted)
+                                 part_names, unprinted, slot)
 import compiler.emit.print.made (arg_parts, parts_word, word_parts, word_viewed, word_as,
-                                 declared_as)
+                                 declared_as, words_laid, placed_write)
+import compiler.emit.lower.held (values_of)
 import compiler.emit.print.counting (call_text, calls, counts_any, lets_go_of)
 import compiler.emit.print.counts (released)
 import compiler.emit.print.lists (rest_made)
@@ -38,12 +43,9 @@ pub fn worded(
       if from == k.to { declared_as(p, pr, v, xs) } else {
         match k.to {
           RWord -> if from == RSlice { list_of_view(p, pr, v, xs) } else {
-            let n = named(pr, v);
-            let w = parts_word(n.pr, n.name, xs, from);
-            if w.word == n.name {
-              pieces(w.pr, [Text(pad(p.depth))].concat(w.prep).push(Text(b"\n")))
-            } else {
-              line(w.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", w.word, b";"]))
+            match placed_fields(pr, v.ty) {
+              Some(fs) -> placed_box(p, pr, v, words_laid(xs, values_of(from)), fs),
+              None -> made_word(p, pr, v, xs, from),
             }
           },
           RUnit -> declared_as(p, pr, v, []),
@@ -56,6 +58,72 @@ pub fn worded(
       }
     },
   }
+
+/// `v`, the word form of a value of C values `xs` held as `from`, as `made.parts_word` makes it.
+fn made_word(p: Place, pr: Printing, v: Var, xs: List<Bytes>, from: Rep) -> Printing = {
+  let n = named(pr, v);
+  let w = parts_word(n.pr, n.name, xs, from);
+  if w.word == n.name { pieces(w.pr, [Text(pad(p.depth))].concat(w.prep).push(Text(b"\n"))) }
+  else { line(w.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", w.word, b";"])) }
+}
+
+/// The fields of the record type `ty`, where one of them lies in place behind a header.
+fn placed_fields(pr: Printing, ty: Type) -> Option<List<FieldLaid>> =
+  match laid_known(pr.ctors, ty) {
+    Some(LRecord(fs)) -> if fs.any(|f: FieldLaid| match f.laid { LPlaced(_) -> true, _ -> false }) {
+      Some(fs)
+    } else { None },
+    _ -> None,
+  }
+
+/// `v`, the box of a record laid as `fs`, made of `ws`, its words in order but each field in
+/// place given as its own record's word: that record's words copied behind a header, its box freed
+/// where this took its last count, and each counted word it holds counted once more where not.
+fn placed_box(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  ws: List<Bytes>,
+  fs: List<FieldLaid>,
+) -> Printing / {abort.raise} = {
+  let n = named(pr, v);
+  let made = line(
+    n.pr,
+    p.depth,
+    Bytes::concat_all([
+      b"Word ",
+      n.name,
+      b" = rt_alloc_bytes_p(ctx, ",
+      int_lit(header_bytes() + 8 * words(LRecord(fs))),
+      b");",
+    ]),
+  );
+  fs.fold({ pr: made, at: 0 }, |acc: { pr: Printing, at: Int }, f: FieldLaid|
+    match f.laid {
+      LPlaced(r) -> {
+        let moved = placed_write(
+          acc.pr,
+          slot(n.name, f.at),
+          Bytes::concat_all([b"&", slot(n.name, f.at + 1)]),
+          nth(ws, acc.at),
+          r,
+        );
+        { pr: line(moved.pr, p.depth, moved.text), at: acc.at + 1 }
+      },
+      other -> {
+        let k = words(other);
+        {
+          pr: range(0, k).fold(acc.pr, |q: Printing, j: Int|
+            line(
+              q,
+              p.depth,
+              Bytes::concat_all([slot(n.name, f.at + j), b" = ", nth(ws, acc.at + j), b";"]),
+            )),
+          at: acc.at + k,
+        }
+      },
+    }).pr
+}
 
 /// `v`, a scalar read out of the word form `k.arg`, which it borrows: what holds the word lets it go.
 fn scalar_borrowed(
