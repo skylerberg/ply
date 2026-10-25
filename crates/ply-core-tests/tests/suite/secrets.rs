@@ -41,7 +41,7 @@ fn a_nested_secret_is_copied_out_with_no_payload() {
 fn a_runtime_type_error_over_a_secret_prints_no_payload() {
     let d = values_equal(
         &Value::secret_text("hunter2"),
-        &Value::builtin(ply_core::Builtin::Len),
+        &Value::builtin(ply_core::Builtin::Digest),
         ply_core::Span::DUMMY,
     )
     .expect_err("a function has no equality");

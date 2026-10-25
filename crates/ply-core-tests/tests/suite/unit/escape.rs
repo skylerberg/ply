@@ -186,7 +186,7 @@ fn an_entry_points_answer_refuses_every_handle_and_lets_data_cross() {
 
 #[test]
 fn a_builtin_closure_carries_nothing() {
-    let value = Value::builtin(ply_core::Builtin::Len);
+    let value = Value::builtin(ply_core::Builtin::Digest);
     assert_eq!(carries(&value), None);
 }
 

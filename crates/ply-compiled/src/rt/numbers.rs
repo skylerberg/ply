@@ -357,8 +357,7 @@ pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64
     let ctx = unsafe { &mut *ctx };
     let t = ply_core::INT_TYPES[which as usize];
     let d = error(format!(
-        "`{}` was given {value}: `{t}` holds {} to {}",
-        Builtin::of_int(t).name(),
+        "`{t}::of_int` was given {value}: `{t}` holds {} to {}",
         t.min(),
         t.max()
     ));

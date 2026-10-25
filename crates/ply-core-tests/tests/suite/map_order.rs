@@ -241,8 +241,8 @@ fn sample_values() -> Vec<Value> {
             (Value::Int(2), Value::Int(2)),
         ]),
     ];
-    out.push(Value::builtin(ply_core::Builtin::Len));
-    out.push(Value::builtin(ply_core::Builtin::MapNew));
+    out.push(Value::builtin(ply_core::Builtin::Digest));
+    out.push(Value::builtin(ply_core::Builtin::Reflect));
     out.push(Value::Record(std::sync::Arc::new(
         [
             (ply_core::Symbol::new("a"), Value::Int(1)),

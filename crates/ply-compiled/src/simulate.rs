@@ -18,8 +18,7 @@ use ply_core::sched::{
     Turn,
 };
 use ply_core::sim::{
-    Access, Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness,
-    signature,
+    Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness, signature,
 };
 use ply_core::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
 use std::collections::BTreeMap;
@@ -1136,34 +1135,4 @@ fn write_value(c: &mut Ctx, w: &mut Writer, beside: &mut Vec<Lifted>, v: &Value)
         Ok(beside.len() as u64 - 1)
     })
     .expect("a value is written whole but for what is kept beside it");
-}
-
-/// What builtin `b` over `args` reads or writes that another task may share: a handler's variable
-/// or a hold.
-pub fn shared_access(ctx: &Ctx, b: ply_core::Builtin, args: &[Word]) -> Option<Access> {
-    use ply_core::{Builtin, Mode};
-    let first = *args.first()?;
-    match b {
-        Builtin::HoldGet | Builtin::HoldTake => Some(Access::Hold {
-            id: crate::rt::hold_id(first)?,
-            mode: if b == Builtin::HoldGet {
-                Mode::Read
-            } else {
-                Mode::Write
-            },
-        }),
-        Builtin::HandlerVar | Builtin::HandlerSet => {
-            let (handler, _) = ctx.stacks[ctx.current].held.last()?;
-            Some(Access::Var {
-                handler: *handler,
-                at: u32::try_from(crate::heap::imm_value(first)).ok()?,
-                mode: if b == Builtin::HandlerVar {
-                    Mode::Read
-                } else {
-                    Mode::Write
-                },
-            })
-        }
-        _ => None,
-    }
 }

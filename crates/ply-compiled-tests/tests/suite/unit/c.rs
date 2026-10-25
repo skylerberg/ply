@@ -52,10 +52,10 @@ fn a_natives_signature_is_its_functions_type() {
         <Typed as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
-    let concat = ply_core::Builtin::from_name("Bytes::concat").expect("a builtin");
+    let concat = ply_core::Builtin::from_name("Secret::concat").expect("a builtin");
     let words = of(&[Machine::Word; 2], Some(Machine::Word), false);
     assert_eq!(ply_compiled::rt::signature(concat), words);
-    let at = ply_core::Builtin::from_name("Bytes::at").expect("a builtin");
+    let at = ply_core::Builtin::from_name("Secret::decode").expect("a builtin");
     assert_eq!(
         ply_compiled::rt::signature(at),
         Signature {

@@ -153,46 +153,114 @@ fn cancel_carried(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
-/// The builtins emitted code writes in place whose refusal of their operands it hands the runtime,
-/// each numbered by its place here: through [`rt_refused`] where the refusal names numbers, and
-/// through [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
-pub const REFUSED: [Builtin; 23] = [
-    Builtin::ArrayNew,
-    Builtin::ColumnsNew,
-    Builtin::ArrayOfList,
-    Builtin::ColumnsOfList,
-    Builtin::ArrayGet,
-    Builtin::ArraySet,
-    Builtin::ColumnsGet,
-    Builtin::ColumnsSet,
-    Builtin::BytesAt,
-    Builtin::BytesU32Le,
-    Builtin::BytesSlice,
-    Builtin::StringSlice,
-    Builtin::ByteOfInt,
-    Builtin::BytesIndexOfByte,
-    Builtin::BytesIndexOfFrom,
-    Builtin::BytesScan,
-    Builtin::BytesScanUntil,
-    Builtin::Range,
-    Builtin::BytesSplit,
-    Builtin::StringSplit,
-    Builtin::StringFind,
-    Builtin::Assert,
-    Builtin::BytesPosition,
+/// A builtin emitted code writes in place whose refusal of its operands it hands the runtime:
+/// through [`rt_refused`] where the refusal names numbers, and through
+/// [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Refused {
+    ArrayNew,
+    ColumnsNew,
+    ArrayOfList,
+    ColumnsOfList,
+    ArrayGet,
+    ArraySet,
+    ColumnsGet,
+    ColumnsSet,
+    BytesAt,
+    BytesU32Le,
+    BytesSlice,
+    StringSlice,
+    ByteOfInt,
+    BytesIndexOfByte,
+    BytesIndexOfFrom,
+    BytesScan,
+    BytesScanUntil,
+    Range,
+    BytesSplit,
+    StringSplit,
+    StringFind,
+    Assert,
+    BytesPosition,
+}
+
+/// Every [`Refused`], each numbered by its place here as emitted code numbers it.
+pub const REFUSED: [Refused; 23] = [
+    Refused::ArrayNew,
+    Refused::ColumnsNew,
+    Refused::ArrayOfList,
+    Refused::ColumnsOfList,
+    Refused::ArrayGet,
+    Refused::ArraySet,
+    Refused::ColumnsGet,
+    Refused::ColumnsSet,
+    Refused::BytesAt,
+    Refused::BytesU32Le,
+    Refused::BytesSlice,
+    Refused::StringSlice,
+    Refused::ByteOfInt,
+    Refused::BytesIndexOfByte,
+    Refused::BytesIndexOfFrom,
+    Refused::BytesScan,
+    Refused::BytesScanUntil,
+    Refused::Range,
+    Refused::BytesSplit,
+    Refused::StringSplit,
+    Refused::StringFind,
+    Refused::Assert,
+    Refused::BytesPosition,
 ];
 
-/// The builtin [`REFUSED`] numbers `what`.
-pub(crate) fn refused_builtin(what: I64) -> Option<Builtin> {
+impl Refused {
+    /// Its name in the prelude.
+    pub fn name(self) -> &'static str {
+        match self {
+            Refused::ArrayNew => "Array::new",
+            Refused::ColumnsNew => "Columns::new",
+            Refused::ArrayOfList => "Array::of_list",
+            Refused::ColumnsOfList => "Columns::of_list",
+            Refused::ArrayGet => "Array::get",
+            Refused::ArraySet => "Array::set",
+            Refused::ColumnsGet => "Columns::get",
+            Refused::ColumnsSet => "Columns::set",
+            Refused::BytesAt => "Bytes::at",
+            Refused::BytesU32Le => "Bytes::u32_le",
+            Refused::BytesSlice => "Bytes::slice",
+            Refused::StringSlice => "String::slice",
+            Refused::ByteOfInt => "byte_of_int",
+            Refused::BytesIndexOfByte => "Bytes::index_of_byte",
+            Refused::BytesIndexOfFrom => "Bytes::index_of_from",
+            Refused::BytesScan => "Bytes::scan",
+            Refused::BytesScanUntil => "Bytes::scan_until",
+            Refused::Range => "range",
+            Refused::BytesSplit => "Bytes::split",
+            Refused::StringSplit => "String::split",
+            Refused::StringFind => "String::find",
+            Refused::Assert => "assert",
+            Refused::BytesPosition => "Bytes::position",
+        }
+    }
+
+    /// Whether its refusal raises for `abort.raise` to answer, as the prelude declares it, rather
+    /// than ending the run.
+    pub fn raises(self) -> bool {
+        !matches!(
+            self,
+            Refused::ArrayOfList | Refused::ColumnsOfList | Refused::Range
+        )
+    }
+}
+
+/// The refusal [`REFUSED`] numbers `what`.
+pub(crate) fn refused_numbered(what: I64) -> Option<Refused> {
     usize::try_from(what.0)
         .ok()
         .and_then(|at| REFUSED.get(at).copied())
 }
 
-/// Builtin `b`'s refusal `d`, left in the context as `b` leaves it over values: raised for
-/// `abort.raise` to answer where `b` raises, else failing the run.
-pub(crate) fn refuse(c: &mut Ctx, b: Builtin, d: Diagnostic) {
-    if signature(b).raises {
+/// The refusal `d` of `r`: raised for `abort.raise` to answer where `r` raises, else failing the
+/// run.
+pub(crate) fn refuse(c: &mut Ctx, r: Refused, d: Diagnostic) {
+    if r.raises() {
         raise_error(c, d);
     } else {
         c.fail(d);
@@ -226,43 +294,43 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
     let cx = unsafe { &mut *ctx };
     let site = cx.site();
     let len = |n: I64| usize::try_from(n.0).unwrap_or(0);
-    let Some(builtin) = refused_builtin(what) else {
+    let Some(r) = refused_numbered(what) else {
         refused_unknown(cx, what);
         return Raises(());
     };
-    let name = builtin.name();
-    let refused = match builtin {
-        Builtin::ArrayNew | Builtin::ColumnsNew | Builtin::ArrayOfList | Builtin::ColumnsOfList => {
+    let name = r.name();
+    let refused = match r {
+        Refused::ArrayNew | Refused::ColumnsNew | Refused::ArrayOfList | Refused::ColumnsOfList => {
             said::array_length(site, name, a.0)
         }
-        Builtin::ArrayGet | Builtin::ArraySet | Builtin::ColumnsGet | Builtin::ColumnsSet => {
+        Refused::ArrayGet | Refused::ArraySet | Refused::ColumnsGet | Refused::ColumnsSet => {
             said::out_of_range(site, name, a.0, len(b), "elements")
         }
-        Builtin::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
+        Refused::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         // Told at the last index it would read, as the builtin tells it.
-        Builtin::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
-        Builtin::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
-        Builtin::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
-        Builtin::ByteOfInt => said::byte_of_int_refused(site, a.0),
-        Builtin::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
-        Builtin::BytesIndexOfFrom | Builtin::BytesPosition => {
+        Refused::BytesU32Le => said::out_of_range(site, name, a.0.wrapping_add(3), len(b), "bytes"),
+        Refused::BytesSlice => said::range_outside(site, name, a.0, b.0, len(c), "bytes"),
+        Refused::StringSlice => said::range_outside(site, name, a.0, b.0, len(c), "characters"),
+        Refused::ByteOfInt => said::byte_of_int_refused(site, a.0),
+        Refused::BytesIndexOfByte => said::not_a_byte(site, name, a.0),
+        Refused::BytesIndexOfFrom | Refused::BytesPosition => {
             said::start_outside(a.0, len(b), site, name)
         }
-        Builtin::BytesScan | Builtin::BytesScanUntil => {
+        Refused::BytesScan | Refused::BytesScanUntil => {
             if usize::try_from(a.0).is_ok_and(|from| from <= len(b)) {
                 said::negative_budget(site, name, c.0)
             } else {
                 said::start_outside(a.0, len(b), site, name)
             }
         }
-        Builtin::Range => said::range_too_long(site, a.0, b.0),
-        Builtin::BytesSplit | Builtin::StringSplit => said::empty_separator(site, builtin),
+        Refused::Range => said::range_too_long(site, a.0, b.0),
+        Refused::BytesSplit | Refused::StringSplit => said::empty_separator(site, name),
         _ => {
             refused_unknown(cx, what);
             return Raises(());
         }
     };
-    refuse(cx, builtin, refused);
+    refuse(cx, r, refused);
     Raises(())
 }
 

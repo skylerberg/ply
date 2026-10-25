@@ -66,20 +66,10 @@ macro_rules! builtins {
 }
 
 builtins! { $
-    Assert = "assert" (cond, message) -> Raising;
     AssertEq = "assert_eq" (actual, expected) -> Raising;
     /// `assert_eq` failing where compiled code compared the two and found them unequal: raises with
     /// both shown, comparing nothing. No source can spell it.
     AssertFailed = "?assert_failed" (actual, expected) -> Raising;
-    Len = "List::len" (xs) -> Word;
-    WithCapacity = "List::with_capacity" (n) -> Word;
-    /// The leaf of a list's trie that holds its items `j * 32` on, counting from the leaf a `rest`
-    /// cut starts in, as compiled code holds an `Option`: the leaf's word with a count of the
-    /// caller's, or zero past the last.
-    ListLeafOf = "ListNode::leaf_of" (xs, j) -> Word;
-    Iterate = "iterate" (seed, budget, step) -> Raising;
-    Metered = "metered" (f) -> Word;
-    Range = "range" (lo, hi) -> Word;
     WrapAdd = "wrap_add" (a, b) -> Word;
     WrapSub = "wrap_sub" (a, b) -> Word;
     WrapMul = "wrap_mul" (a, b) -> Word;
@@ -91,15 +81,6 @@ builtins! { $
     SaturatingAdd = "saturating_add" (a, b) -> Word;
     SaturatingSub = "saturating_sub" (a, b) -> Word;
     SaturatingMul = "saturating_mul" (a, b) -> Word;
-    // Field-less rather than carrying an `IntTy`: the enum is cast to a per-builtin cache index.
-    U8OfInt = "U8::of_int" (n) -> Raising;
-    U16OfInt = "U16::of_int" (n) -> Raising;
-    U32OfInt = "U32::of_int" (n) -> Raising;
-    U64OfInt = "U64::of_int" (n) -> Raising;
-    I8OfInt = "I8::of_int" (n) -> Raising;
-    I16OfInt = "I16::of_int" (n) -> Raising;
-    I32OfInt = "I32::of_int" (n) -> Raising;
-    I64OfInt = "I64::of_int" (n) -> Word;
     IntOfU8 = "Int::of_u8" (n) -> Word;
     IntOfU16 = "Int::of_u16" (n) -> Word;
     IntOfU32 = "Int::of_u32" (n) -> Word;
@@ -108,52 +89,16 @@ builtins! { $
     IntOfI16 = "Int::of_i16" (n) -> Word;
     IntOfI32 = "Int::of_i32" (n) -> Word;
     IntOfI64 = "Int::of_i64" (n) -> Word;
-    Min = "min" (a, b) -> Word;
-    Max = "max" (a, b) -> Word;
-    ByteOfInt = "byte_of_int" (n) -> Raising;
-    StringConcat = "String::concat" (a, b) -> Word;
-    BytesLen = "Bytes::len" (b) -> Word;
-    BytesAt = "Bytes::at" (b, i) -> Raising;
-    BytesU32Le = "Bytes::u32_le" (b, i) -> Raising;
-    BytesSlice = "Bytes::slice" (b, start, end) -> Raising;
-    BytesConcat = "Bytes::concat" (a, b) -> Word;
-    BytesConcatAll = "Bytes::concat_all" (bs) -> Word;
-    BytesBlake3 = "Bytes::blake3" (b) -> Word;
     BytesGzip = "Bytes::gzip" (b) -> Word;
     BytesGunzip = "Bytes::gunzip" (b) -> Word;
     BytesZstd = "Bytes::zstd" (b) -> Word;
-    BytesOfString = "Bytes::of_string" (s) -> Word;
-    BytesIndexOf = "Bytes::index_of" (hay, needle) -> Word;
-    BytesIndexOfFrom = "Bytes::index_of_from" (hay, needle, from) -> Raising;
-    BytesIndexOfByte = "Bytes::index_of_byte" (hay, byte) -> Raising;
-    BytesStartsWith = "Bytes::starts_with" (b, prefix) -> Word;
-    BytesEndsWith = "Bytes::ends_with" (b, suffix) -> Word;
-    BytesSplit = "Bytes::split" (b, sep) -> Raising;
-    BytesScan = "Bytes::scan" (hay, from, class, budget) -> Raising;
-    BytesScanUntil = "Bytes::scan_until" (hay, from, class, budget) -> Raising;
-    BytesPosition = "Bytes::position" (b, from, f) -> Raising;
-    StringLen = "String::len" (s) -> Word;
-    StringSlice = "String::slice" (s, start, end) -> Raising;
-    StringSplit = "String::split" (s, sep) -> Raising;
-    StringStartsWith = "String::starts_with" (s, prefix) -> Word;
-    StringEndsWith = "String::ends_with" (s, suffix) -> Word;
-    StringContains = "String::contains" (s, t) -> Word;
-    StringFind = "String::find" (s, needle) -> Raising;
-    MapNew = "Map::new" () -> Word;
-    MapLen = "Map::len" (m) -> Word;
     DecimalDiv = "Decimal::div" (a, b, scale, mode) -> Raising;
     DecimalRound = "Decimal::round" (d, scale, mode) -> Raising;
-    DecimalOfInt = "Decimal::of_int" (n) -> Word;
     IntOfDecimal = "Int::of_decimal" (d, mode) -> Word;
-    FloatOfDecimal = "Float::of_decimal" (d) -> Word;
     DecimalOfFloat = "Decimal::of_float" (f) -> Word;
     DecimalOfString = "Decimal::of_string" (s) -> Word;
     /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
     DecimalToString = "Decimal::to_string" (d) -> Word;
-    DecimalScale = "Decimal::scale" (d) -> Word;
-    /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
-    BitsOfFloat = "bits_of_float" (f) -> Word;
-    FloatOfBits = "Float::of_bits" (n) -> Word;
     Compare = "compare" (x, y) -> Word;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues = "compare_values" (x, y) -> Word;
@@ -162,10 +107,6 @@ builtins! { $
     Observe = "observe" (value) -> Word;
     SecretOfString = "Secret::of_string" (s) -> Word;
     SecretVerify = "Secret::verify" (stored, supplied) -> Word;
-    SecretIsEmpty = "Secret::is_empty" (s) -> Word;
-    // Appended, so every earlier builtin keeps its cache index.
-    U128OfInt = "U128::of_int" (n) -> Raising;
-    I128OfInt = "I128::of_int" (n) -> Word;
     IntOfU128 = "Int::of_u128" (n) -> Raising;
     IntOfI128 = "Int::of_i128" (n) -> Raising;
     /// Over any integer type: the exact answer, or `None` where it leaves the type.
@@ -173,27 +114,15 @@ builtins! { $
     CheckedSub = "checked_sub" (a, b) -> Word;
     CheckedMul = "checked_mul" (a, b) -> Word;
     CheckedNeg = "checked_neg" (a) -> Word;
-    /// `None` for a surrogate or past `U+10FFFF`, which no `Char` is.
-    CharOfInt = "Char::of_int" (n) -> Word;
-    IntOfChar = "Int::of_char" (c) -> Word;
-    StringChars = "String::chars" (s) -> Word;
-    StringOfChars = "String::of_chars" (cs) -> Word;
-    ArrayNew = "Array::new" (n, x) -> Raising;
     ArrayOfList = "Array::of_list" (xs) -> Word;
     ArrayLen = "Array::len" (xs) -> Word;
     ArrayAt = "Array::at" (xs, i) -> Word;
     /// Raises where `Array::at` answers `None`.
     ArrayGet = "Array::get" (xs, i) -> Raising;
-    /// In place while the array has one holder; raises out of range.
-    ArraySet = "Array::set" (xs, i, v) -> Raising;
-    /// An array of records holding each field apart, the compiled runtime's columns; as a value it
-    /// is the array of its records, and each builtin answers as its `array_` namesake does.
-    ColumnsNew = "Columns::new" (n, x) -> Raising;
     ColumnsOfList = "Columns::of_list" (xs) -> Word;
     ColumnsLen = "Columns::len" (xs) -> Word;
     ColumnsAt = "Columns::at" (xs, i) -> Word;
     ColumnsGet = "Columns::get" (xs, i) -> Raising;
-    ColumnsSet = "Columns::set" (xs, i, v) -> Raising;
     /// The value as a `std.value.Value`, whole.
     Reflect = "reflect" (x) -> Word;
     /// As `reflect`, with a value whose type states a `show` as `VShown` of what that function
@@ -204,8 +133,6 @@ builtins! { $
     /// The value's canonical encoding, whose BLAKE3 is its `digest`: what code written from a type
     /// reads of a part it does not lay out itself. No source can spell it.
     Encoded = "?encoded" (x) -> Word;
-    /// `bracket(acquire, release, body)`: `release` runs on every exit from `body` but a failure.
-    Bracket = "bracket" (acquire, release, body) -> Word;
     /// An operator over a `numeric` or `integer` type parameter: `?numeric_binary(op, witness, x,
     /// y)`, its operands read as the type the witness names. No source can spell it; the
     /// elaboration writes it.
@@ -215,37 +142,12 @@ builtins! { $
     NumericOfInt = "numeric_of_int" (witness, n) -> Raising;
     /// `to_int(x)`, called with the witness the elaboration passes first.
     ToInt = "to_int" (witness, x) -> Word;
-    FloatOfInt = "Float::of_int" (n) -> Word;
     /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
     IntOfFloat = "Int::of_float" (x, mode) -> Word;
-    Floor = "Float::floor" (x) -> Word;
-    Ceil = "Float::ceil" (x) -> Word;
     Round = "Float::round" (x, mode) -> Word;
-    Sqrt = "Float::sqrt" (x) -> Word;
-    Pow = "Float::pow" (x, y) -> Word;
-    Exp = "Float::exp" (x) -> Word;
-    Ln = "Float::ln" (x) -> Word;
-    Log2 = "Float::log2" (x) -> Word;
-    Log10 = "Float::log10" (x) -> Word;
-    Sin = "Float::sin" (x) -> Word;
-    Cos = "Float::cos" (x) -> Word;
-    Tan = "Float::tan" (x) -> Word;
-    Asin = "Float::asin" (x) -> Word;
-    Acos = "Float::acos" (x) -> Word;
-    Atan = "Float::atan" (x) -> Word;
-    Atan2 = "Float::atan2" (y, x) -> Word;
-    Hypot = "Float::hypot" (x, y) -> Word;
-    /// What a hold holds, while its region has not let it go.
-    HoldGet = "Hold::get" (h) -> Word;
-    /// A hold's contents moved out for its release, so the next read finds them gone. No source
-    /// can spell it; the lowering of `with_hold` writes it.
-    HoldTake = "?hold_take" (h) -> Word;
-    /// [`Builtin::Bracket`] under a name no module rebinds, for the lowering of `with_hold`.
-    HoldBracket = "?hold_bracket" (acquire, release, body) -> Word;
     /// Bytes as a credential, and what is made of one without opening it.
     SecretOfBytes = "Secret::of_bytes" (b) -> Word;
     SecretBytes = "Secret::bytes" (s) -> Word;
-    SecretLen = "Secret::len" (s) -> Word;
     SecretConcat = "Secret::concat" (a, b) -> Word;
     /// `Secret::decode(encoding, text)`: `None` for a text the encoding does not write.
     SecretDecode = "Secret::decode" (encoding, text) -> Raising;
@@ -272,34 +174,9 @@ builtins! { $
     /// `Secret::rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
     /// numbers make, each private one its base64url text sealed; `None` for numbers that are no key.
     SecretRsaJwk = "Secret::rsa_jwk" (n, e, private) -> Raising;
-    /// Variable `i` of the `handle` whose body starts, given its first value. No source can spell
-    /// these three; the lowering of a handler's `var`s writes them.
-    HandlerInit = "?handler_init" (i, x) -> Word;
-    /// Variable `i` of the handler whose clause runs.
-    HandlerVar = "?handler_var" (i) -> Word;
-    /// Variable `i` of the handler whose clause runs, given a new value.
-    HandlerSet = "?handler_set" (i, x) -> Word;
-    /// A hold of what it is given, which a bracket's release lets go. No source can spell it; the
-    /// lowering of `with_hold` writes it.
-    HoldNew = "?hold_new" (x) -> Word;
 }
 
 impl Builtin {
-    pub fn of_int(t: IntTy) -> Builtin {
-        match t {
-            IntTy::U8 => Builtin::U8OfInt,
-            IntTy::U16 => Builtin::U16OfInt,
-            IntTy::U32 => Builtin::U32OfInt,
-            IntTy::U64 => Builtin::U64OfInt,
-            IntTy::I8 => Builtin::I8OfInt,
-            IntTy::I16 => Builtin::I16OfInt,
-            IntTy::I32 => Builtin::I32OfInt,
-            IntTy::I64 => Builtin::I64OfInt,
-            IntTy::U128 => Builtin::U128OfInt,
-            IntTy::I128 => Builtin::I128OfInt,
-        }
-    }
-
     pub fn int_of(t: IntTy) -> Builtin {
         match t {
             IntTy::U8 => Builtin::IntOfU8,
@@ -313,10 +190,6 @@ impl Builtin {
             IntTy::U128 => Builtin::IntOfU128,
             IntTy::I128 => Builtin::IntOfI128,
         }
-    }
-
-    pub fn converts_into(self) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| Builtin::of_int(*t) == self)
     }
 
     pub fn converts_from(self) -> Option<IntTy> {
@@ -829,9 +702,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
         Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
         Builtin::SqliteRun => crate::sqlite::run_image(args, span),
         Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
-
-        // Compiled code answers every other builtin itself.
-        _ => Err(answered_by_the_backend(b, span)),
     }
 }
 
@@ -1039,18 +909,15 @@ pub fn byte_of_int_refused(span: Span, n: i64) -> Diagnostic {
 
 /// `Bytes::split` or `String::split`, as `split` names it, given an empty separator.
 #[cold]
-pub fn empty_separator(span: Span, split: Builtin) -> Diagnostic {
-    let example = if split == Builtin::StringSplit {
+pub fn empty_separator(span: Span, split: &str) -> Diagnostic {
+    let example = if split == "String::split" {
         "pass the text that actually separates the parts, as in \"\\r\\n\""
     } else {
         "pass the bytes that actually separate the parts, as in `b\"\\r\\n\"`"
     };
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!(
-            "`{}` needs a separator, and this one is empty",
-            split.name()
-        ),
+        format!("`{split}` needs a separator, and this one is empty"),
     )
     .primary(span, "an empty separator matches everywhere and nowhere")
     .note(example)
@@ -1190,22 +1057,4 @@ pub fn hold_released(span: Span, doing: &str) -> Diagnostic {
     .primary(span, "the hold holds nothing now")
     .note("a `with_hold` releases what it holds once, when its body first ends; a continuation captured inside the body and resumed after that runs the rest of the body against a hold already let go")
     .note("resume a continuation captured inside a `with_hold` at most once, or open the `with_hold` after the choice the continuation replays")
-}
-
-/// The C backend answers every builtin that calls back into the program or reaches what only it
-/// holds, a list's trie nodes among them.
-#[cold]
-fn answered_by_the_backend(b: Builtin, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "`{}` reached the value builtins, and only compiled code can answer it",
-            b.name()
-        ),
-    )
-    .primary(
-        span,
-        "it calls back into the program or reaches what only compiled code holds",
-    )
-    .note("this is Ply's fault: the C backend answers this builtin over its own words")
 }
