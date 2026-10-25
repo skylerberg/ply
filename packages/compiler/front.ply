@@ -14,14 +14,16 @@ import check.resolve.tables (Source, ParsedModule, Diag, Label, Fix, Edit, quali
 import check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
 import store.hash.graph (TestNode, LawNode, Node, NodeFn)
 import store.hash.forms (build_index, Fixing, Rehash, by_name, reached_functions, Which, TheFn,
-                         TheDecl, TheItem, fixing_of, written_code)
+                         TheDecl, TheItem, fixing_of)
+import store.hash.template (written_code)
 import store.hash (hash_index, body_key)
 import store.hash.encoding (hex)
 import check.infer.checker (DefInfo, TestInfo, LawInfo, Walks, Every, Builtin, builtins)
 import emit.keys (LawPart, LawGuard, LawBody, root_name, root_text, test_owner, law_key)
 import check.infer (filed_facts, no_root_facts, stated)
 import check.termination (Ending, Ends, unknown_summary)
-import front.diagnostics (ParsedSource, headed_at, parse_all, parse_at, placed, with_prelude_source)
+import front.diagnostics (ParsedSource, headed_at, parse_all, parse_at, parse_from, placed,
+                          with_prelude_source)
 import front.pkg (PackageSources, Supplied, Pinned, Judged, closure, closed, pins_of)
 import std.prelude_source
 import std.bin
@@ -33,10 +35,10 @@ import expand.embed (EmbedAt, EmbedRead, EmbedFile, EmbedBytes, BytesRead, Embed
 import syntax.items (parse, import_decl_bin, homes_called, homes_declaring, homes_for, called_names,
                      is_std, is_compiler, is_shipped, HomeNames)
 import syntax.lexer (is_ident_continue)
-import front.rows (KeyRow, EmitterRoot, EmitterCtor, CFn, CList, CMap, CPlain, CRecord, CSum, CVar,
-                   CWidth, KnownDefRow, KnownTestRow, Rows, ModuleRow, DefRow, TypeRow, TestRow,
-                   LawRow, OpRow, EffectRow, CtorRow, HashRow, ItemHashRow, HDef, HLaw, HTest,
-                   HashFrame, BodyRow, Dump)
+import front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterCtor, CFn, CList, CMap, CPlain,
+                   CRecord, CSum, CVar, CWidth, KnownDefRow, KnownTestRow, Rows, ModuleRow, DefRow,
+                   TypeRow, TestRow, LawRow, OpRow, EffectRow, CtorRow, HashRow, ItemHashRow, HDef,
+                   HLaw, HTest, HashFrame, BodyRow, Dump)
 import front.facts (outlines_of, guard_bounds, Bounded, tables_kept, tables_read, module_facts,
                     functions_of, tests_of, answered_program, cuts_of, Analysis, ACall, ACtor,
                     AList, AOther, AText, StatementSite, sites_in, toolchain_tree, ShippedView)
@@ -564,7 +566,8 @@ fn with_hidden(p: ParsedSource, told: Option<Pulls>) -> ParsedSource =
 /// `shipped` is each shipped module as the analysis reads it, cut where a program reads it so, `whole` the
 /// shipped modules as they stand and `data` the data files they embed. `room` is how many more
 /// rounds may pull: each pulls a shipped module not pulled before. `asked` are pulled whatever the
-/// modules import, and a module `given` holds a parse of is not parsed again.
+/// modules import, a module `given` holds a parse of is not parsed again, and any other is parsed
+/// with its library derivations as `derived` holds them.
 fn pulling(
   users: Int,
   shipped: Map<Bytes, Bytes>,
@@ -578,6 +581,7 @@ fn pulling(
   asked: List<Bytes>,
   declared: List<HomeNames>,
   given: List<ParsedSource>,
+  derived: List<ModuleDerivations>,
 ) -> Pull / {abort.raise} = {
   let early = x.parsed.fold([], |acc: List<Diag>, parsed: ParsedSource| acc.concat(parsed.diags));
   if early.len() > 0 { { ..x, diags: early } } else {
@@ -600,7 +604,7 @@ fn pulling(
             told,
             data,
             at,
-            parsed_at(given, at, { name: name, src: src }),
+            parsed_at(given, derived, at, { name: name, src: src }),
           );
           {
             ..acc,
@@ -618,21 +622,33 @@ fn pulling(
         },
         declared,
         given,
+        derived,
       )
     }
   }
 }
 
-/// `source` parsed at `index` among a load's modules: the parse of it `given` holds, which is the one
-/// whose library derivations ran, its diagnostics moved from the module's place there to `index`.
+/// `source` parsed at `index` among a load's modules: the parse of it `given` holds, its diagnostics
+/// moved from the module's place there to `index`, or else its text parsed with each library
+/// derivation expanded to what the load's deriver wrote, as `derived` holds it.
 fn parsed_at(
   given: List<ParsedSource>,
+  derived: List<ModuleDerivations>,
   index: Int,
   source: Source,
 ) -> ParsedSource / {abort.raise} =
   match given.find(|g: ParsedSource| g.name == source.name && g.src == source.src) {
     Some(g) -> { ..g, diags: g.diags.map(|d: Diag| moved_to(d, index)) },
-    None -> parse_at(index, source),
+    None ->
+      parse_from(
+        index,
+        source,
+        parse(source.src),
+        taken: match derived.find(|m: ModuleDerivations| m.module == source.name) {
+          Some(m) -> m.derivations,
+          None -> [],
+        },
+      ),
   }
 
 /// `d`, a diagnostic of a module parsed alone, with each label and fix into it at `index`.
@@ -855,6 +871,9 @@ pub fn staged_pulling_std_with(
   // A parse of a source made already, taken in place of parsing its text again where it refused
   // nothing, so where it stands among the sources is in no label of it.
   given: List<ParsedSource> = [],
+  // What the load's library derivers wrote for each module, which a source parsed here expands its
+  // derives to: no deriver runs here.
+  derived: List<ModuleDerivations> = [],
   // The packages as a load judged them already, taken in place of judging `pkgs`' manifests.
   judged: Option<Judged> = None,
   // The module a check against entries checks, which the others stand in for what it reads of.
@@ -879,7 +898,7 @@ pub fn staged_pulling_std_with(
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
     |acc: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
-      let p = parsed_at(given, i, sources.get(i));
+      let p = parsed_at(given, derived, i, sources.get(i));
       if tested { { ..acc, parsed: acc.parsed.push(p) } } else {
         {
           parsed: acc.parsed.push(untested(p)),
@@ -922,6 +941,7 @@ pub fn staged_pulling_std_with(
     asking,
     declared,
     given,
+    derived,
   );
   let hashed = |parsed: List<ParsedSource>|
     match hashed_closure(
@@ -1198,6 +1218,7 @@ pub fn analyse_pulling_std_with(
   asked: List<Bytes> = [],
   pulls: List<ModulePulls> = [],
   fixed: Fixing = { nodes: [], tests: [], laws: [] },
+  derived: List<ModuleDerivations> = [],
 ) -> Pulled / {abort.raise} =
   checked_staged(
     staged_pulling_std_with(
@@ -1211,6 +1232,7 @@ pub fn analyse_pulling_std_with(
       data: data_known(data),
       asked: asked,
       pulls: pulls,
+      derived: derived,
     ),
     rows,
   )

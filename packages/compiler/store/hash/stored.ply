@@ -1,0 +1,439 @@
+//! A definition's stored form: what its hash is taken over, and what printing it back reads. One
+//! codec writes and reads it, so what is read is always what was written.
+//!
+//! Each type is generic over the phase. A template, what the encoder makes of a definition before
+//! anything it references is hashed, is `Template`'s instance: references are nodes of the program,
+//! an effect's slot is its node and what orders atoms equal in their bytes, levels are spots a
+//! commutable run's order decides, and notes carry the picks and runs filling reads. A stored form
+//! is `Stored`'s: references are filled, an effect carries its slot, levels are numbers, and notes are
+//! empty. Filling is each sum's derived `map` over those four parameters, beside what reorders.
+
+import std.bin
+import std.derive.map
+import syntax.type_syntax (Mode, mode_bin)
+import syntax.items (Deriver, SpecKind, deriver_bin, spec_kind_bin)
+import store.hash.encoding (Spot, Pick, spot_bin, pick_bin)
+
+/// What a filled reference names: a definition by its hash, a member of the component being
+/// hashed by its class, the definition being hashed while it has no hash, or a definition by its
+/// program-wide name where a form is written by name.
+pub type Reference = | Hashed(Bytes) | Member(Int) | Itself | ByName(Bytes)
+
+/// What a template's note says: the pick of a call on a value, or the run a block's commuting
+/// `let`s are, with where it starts and how many binders each member writes.
+pub type Note = | Picked(Pick) | Ran(RunAt)
+
+/// A commutable run in a template: its number, the spot its first binder stands at, and each
+/// member's binder count.
+pub type RunAt = { id: Int, base: Spot, binders: List<Int> }
+
+/// An effect's slot in a template: the effect's node, which the slot is filled from, and its sketch,
+/// which orders atoms whose encodings are equal.
+pub type Slotted = { node: Int, sketch: Bytes }
+
+/// A name nothing in the program declares, with the module it was qualified by.
+pub type Free = { module: Option<Bytes>, name: Bytes }
+
+pub type Literal =
+  | IntLiteral(Int)
+  /// A width-suffixed integer: the width's place in `lexer::widths`, then the bit pattern.
+  | FixedLiteral(Int, Int)
+  /// A 128-bit integer: the width's place, then its high and low 64 bits.
+  | WideLiteral(Int, Int, Int)
+  | BoolLiteral(Bool)
+  | StringLiteral(Bytes)
+  | BytesLiteral(Bytes)
+  /// An embedded file: its digest and its size.
+  | EmbeddedLiteral(Bytes, Int)
+  /// A float by its bit pattern.
+  | FloatLiteral(Int)
+  /// A decimal by its mantissa's little-endian bytes and its scale.
+  | DecimalLiteral(Bytes, Int)
+  | CharLiteral(Int)
+  | UnitLiteral
+
+/// What a value position names. A local is a binder's level; a constructor is its type and name.
+pub type Named<reference, level> =
+  | Local(level)
+  | Defined(reference)
+  | Constructed(reference, Bytes)
+  | Unbound(Free)
+
+/// A named value and what the code the emitter writes for it calls (`template.written_code`), which
+/// the text does not say.
+pub type Value<reference, level> = { named: Named<reference, level>, written: List<reference> }
+
+pub type Label = | LabelParameter(Int) | LabelName(Bytes)
+
+/// An effect: a declaration and its slot, or a name nothing declares.
+pub type Effect<reference, slot> = | Declared(reference, slot) | EffectUnbound(Free)
+
+pub type TypeName<reference> = | TypeParameter(Int) | TypeDefined(reference) | TypeUnbound(Free)
+
+pub type Type<reference, slot> =
+  /// A type applied to its arguments, with what crossing it calls where it is a container.
+  | Applied(TypeName<reference>, List<reference>, List<Type<reference, slot>>)
+  /// One applied to labels or rows beside its types.
+  | AppliedOver(TypeName<reference>, List<reference>, List<Type<reference, slot>>, List<Label>, List<Row<reference, slot>>)
+  | Function(List<Type<reference, slot>>, Type<reference, slot>, Option<Row<reference, slot>>)
+  /// Fields in the order their names' encodings sort in.
+  | Fields(List<TypeField<reference, slot>>)
+  | UnitType
+
+pub type TypeField<reference, slot> = { name: Bytes, field_type: Type<reference, slot> }
+
+pub type RowTail = | RowParameter(Int) | RowName(Bytes)
+
+/// Atoms sorted by their encodings, then by their effects' sketches, and deduplicated.
+pub type Row<reference, slot> = {
+  atoms: List<Atom<reference, slot>>,
+  tail: Option<RowTail>,
+  bounded: Bool,
+}
+
+pub type Atom<reference, slot> =
+  | Moded(Effect<reference, slot>, Mode, Option<Label>, Bool)
+  | OfOperation(Effect<reference, slot>, Bytes, Option<Label>, Bool)
+
+pub type Pattern<reference, level> =
+  | Wild
+  | Bind
+  /// In a later alternative of an or-pattern: the first alternative's binder this variable is.
+  | Again(level)
+  | LiteralPattern(Literal)
+  | RangePattern(Literal, Literal)
+  | ConstructorPattern(Named<reference, level>, List<Pattern<reference, level>>)
+  | RecordPattern(List<PatternField<reference, level>>, Bool)
+  | ListPattern(List<Pattern<reference, level>>, Option<Pattern<reference, level>>)
+  | OrPattern(List<Pattern<reference, level>>)
+
+pub type PatternField<reference, level> = { name: Bytes, pattern: Pattern<reference, level> }
+
+/// What a call on a value may call: the function it names in full, or every function of its name
+/// a module its own can see, in the order of their program-wide names.
+pub type Callees<reference, level> = | InFull(Value<reference, level>) | Among(List<reference>)
+
+pub type Expression<reference, slot, level, note> =
+  | Constant(Literal)
+  | Unwritten
+  | Variable(Value<reference, level>)
+  /// The operator's builtin name, its operands, and what the code written for it calls.
+  | Binary(Bytes, Expression<reference, slot, level, note>, Expression<reference, slot, level, note>, List<reference>)
+  | Unary(Bytes, Expression<reference, slot, level, note>)
+  /// Each parameter's type, then the body under them.
+  | Lambda(List<Option<Type<reference, slot>>>, Expression<reference, slot, level, note>)
+  | Call(Expression<reference, slot, level, note>, List<Expression<reference, slot, level, note>>, List<Label>)
+  | OnValue(OnValueCall<reference, slot, level, note>)
+  | If(Expression<reference, slot, level, note>, Expression<reference, slot, level, note>, Expression<reference, slot, level, note>)
+  | Match(Expression<reference, slot, level, note>, List<Arm<reference, slot, level, note>>)
+  | Record(List<RecordField<reference, slot, level, note>>)
+  | RecordUpdate(Expression<reference, slot, level, note>, List<RecordField<reference, slot, level, note>>)
+  | Field(Expression<reference, slot, level, note>, Bytes)
+  | ListOf(List<Expression<reference, slot, level, note>>)
+  | Perform(Effect<reference, slot>, Bytes, Option<Label>, List<Expression<reference, slot, level, note>>)
+  | Handle(Handled<reference, slot, level, note>)
+  | WithHold(Bytes, Expression<reference, slot, level, note>, Expression<reference, slot, level, note>, Expression<reference, slot, level, note>)
+  | Simulate(Expression<reference, slot, level, note>)
+  | Parallel(List<Expression<reference, slot, level, note>>)
+  /// A tagged literal with no holes: its parser and its text.
+  | Tagged(Value<reference, level>, Bytes)
+  /// One with holes: its parser, its filler, the text before the first hole, and each hole with
+  /// the text after it.
+  | Filled(Value<reference, level>, Value<reference, level>, Bytes, List<FilledHole<reference, slot, level, note>>)
+  | TryBlock(Option<Raised<reference, slot>>, Expression<reference, slot, level, note>)
+  | Block(List<Entry<reference, slot, level, note>>, Option<Expression<reference, slot, level, note>>)
+
+pub type OnValueCall<reference, slot, level, note> = {
+  base: Expression<reference, slot, level, note>,
+  name: Bytes,
+  labels: List<Label>,
+  arguments: List<Expression<reference, slot, level, note>>,
+  named: List<RecordField<reference, slot, level, note>>,
+  callees: Callees<reference, level>,
+  /// The check's pick, in a template.
+  note: note,
+}
+
+pub type RecordField<reference, slot, level, note> = {
+  name: Bytes,
+  value: Expression<reference, slot, level, note>,
+}
+
+pub type FilledHole<reference, slot, level, note> = {
+  value: Expression<reference, slot, level, note>,
+  text: Bytes,
+}
+
+pub type Raised<reference, slot> = { effect: Effect<reference, slot>, operation: Bytes }
+
+pub type Arm<reference, slot, level, note> = {
+  pattern: Pattern<reference, level>,
+  guard: Option<Expression<reference, slot, level, note>>,
+  body: Expression<reference, slot, level, note>,
+}
+
+/// A `handle`: the variables its clauses assign, each with its type and first value, then its
+/// body, its clauses and its `return`.
+pub type Handled<reference, slot, level, note> = {
+  variables: List<HandlerVariable<reference, slot, level, note>>,
+  body: Expression<reference, slot, level, note>,
+  clauses: List<Clause<reference, slot, level, note>>,
+  returned: Option<Expression<reference, slot, level, note>>,
+}
+
+pub type HandlerVariable<reference, slot, level, note> = {
+  annotation: Option<Type<reference, slot>>,
+  first: Expression<reference, slot, level, note>,
+}
+
+/// A clause: the operation it handles, its label, how many parameters it binds, whether it binds a
+/// continuation, and its body.
+pub type Clause<reference, slot, level, note> = {
+  effect: Effect<reference, slot>,
+  operation: Bytes,
+  label: Option<Label>,
+  parameters: Int,
+  resumes: Bool,
+  body: Expression<reference, slot, level, note>,
+}
+
+/// A statement of a block, or a run of `let`s that commute: its note in a template, its members in
+/// the order their encodings sort in once filled.
+pub type Entry<reference, slot, level, note> =
+  | One(Statement<reference, slot, level, note>)
+  | Commuting(note, List<Statement<reference, slot, level, note>>)
+
+pub type Statement<reference, slot, level, note> =
+  | Let(Option<Type<reference, slot>>, Expression<reference, slot, level, note>, Pattern<reference, level>)
+  | LetElse(Option<Type<reference, slot>>, Expression<reference, slot, level, note>, Pattern<reference, level>, Expression<reference, slot, level, note>)
+  | Effectful(Expression<reference, slot, level, note>)
+  | Assign(Value<reference, level>, Expression<reference, slot, level, note>)
+
+/// How many type, row and label parameters a declaration binds.
+pub type Generics = { types: Int, rows: Int, labels: Int }
+
+pub type Parameter<reference, slot, level, note> = {
+  kept: Bool,
+  spaced: Bool,
+  annotation: Option<Type<reference, slot>>,
+  default: Option<Expression<reference, slot, level, note>>,
+}
+
+/// A constraint by its type parameter's level, sorted and deduplicated.
+pub type Constrained = { level: Int, deriver: Deriver }
+
+pub type Returning = | Unstated | Fresh | ParameterReturned(Int)
+
+pub type FunctionForm<reference, slot, level, note> = {
+  generics: Generics,
+  parameters: List<Parameter<reference, slot, level, note>>,
+  returned: Option<Type<reference, slot>>,
+  row: Option<Row<reference, slot>>,
+  constraints: List<Constrained>,
+  returns: Returning,
+  decreases: Option<Expression<reference, slot, level, note>>,
+  /// A `const`: what the code written for its value calls.
+  baked: Option<List<reference>>,
+  body: Expression<reference, slot, level, note>,
+}
+
+pub type Variant<reference, slot> = { name: Bytes, fields: List<Type<reference, slot>> }
+
+pub type TypeBody<reference, slot> =
+  | Alias(Type<reference, slot>)
+  | Sum(Bytes, List<Variant<reference, slot>>)
+  | Nominal(Bytes, Type<reference, slot>)
+  | Extern(Bytes)
+
+/// The function a type's values are compared through (`key`) or shown through.
+pub type Through<reference, level> = { key: Bool, by: Value<reference, level> }
+
+/// One operation of a type's arithmetic and the function it is.
+pub type Numeric<reference, level> = { operation: Bytes, by: Value<reference, level> }
+
+pub type TypeForm<reference, slot, level> = {
+  generics: Generics,
+  /// Whether the declaration binds a row or a label, which writes their counts.
+  over: Bool,
+  constraints: List<Constrained>,
+  body: TypeBody<reference, slot>,
+  opaque: Bool,
+  through: List<Through<reference, level>>,
+  numerics: List<Numeric<reference, level>>,
+}
+
+pub type Operation<reference, slot> = {
+  name: Bytes,
+  mode: Mode,
+  resource: Bool,
+  types: Int,
+  parameters: List<Type<reference, slot>>,
+  returned: Type<reference, slot>,
+}
+
+/// An effect, its operations in the order their names' encodings sort in.
+pub type EffectForm<reference, slot> = {
+  name: Bytes,
+  nondet: Bool,
+  operations: List<Operation<reference, slot>>,
+}
+
+pub type TestForm<reference, slot, level, note> = {
+  nondet: Bool,
+  cases: Option<Type<reference, slot>>,
+  body: Expression<reference, slot, level, note>,
+}
+
+pub type LawForm<reference, slot, level, note> = {
+  binders: List<Type<reference, slot>>,
+  guard: Option<Expression<reference, slot, level, note>>,
+  body: Expression<reference, slot, level, note>,
+}
+
+/// A specification clause in its owner's scope: the owner's generics and parameter count, and the
+/// parameters whose cost or space names it binds, after them.
+pub type SpecForm<reference, slot, level, note> = {
+  kind: SpecKind,
+  generics: Generics,
+  parameters: Int,
+  names: Option<List<Int>>,
+  body: Expression<reference, slot, level, note>,
+}
+
+pub type Form<reference, slot, level, note> =
+  | FunctionOf(FunctionForm<reference, slot, level, note>)
+  | TypeOf(TypeForm<reference, slot, level>)
+  | EffectOf(EffectForm<reference, slot>)
+  | TestOf(TestForm<reference, slot, level, note>)
+  | LawOf(LawForm<reference, slot, level, note>)
+  | SpecOf(SpecForm<reference, slot, level, note>)
+
+/// A template: what the encoder writes of a definition, before what it references is hashed.
+pub type Template = Form<Int, Slotted, Spot, Note>
+
+/// A stored form: what a definition's hash is taken over.
+pub type Stored = Form<Reference, Int, Int, Unit>
+
+derive map for Named
+
+derive map for Effect
+
+derive map for TypeName
+
+derive map for Type
+
+derive map for Atom
+
+derive map for Pattern
+
+derive map for Callees
+
+derive map for Expression
+
+derive map for Entry
+
+derive map for Statement
+
+derive map for TypeBody
+
+derive map for Form
+
+derive bin for Reference
+
+derive bin for Note
+
+derive bin for RunAt
+
+derive bin for Slotted
+
+derive bin for Free
+
+derive bin for Literal
+
+derive bin for Named
+
+derive bin for Value
+
+derive bin for Label
+
+derive bin for Effect
+
+derive bin for TypeName
+
+derive bin for Type
+
+derive bin for TypeField
+
+derive bin for RowTail
+
+derive bin for Row
+
+derive bin for Atom
+
+derive bin for Pattern
+
+derive bin for PatternField
+
+derive bin for Callees
+
+derive bin for Expression
+
+derive bin for OnValueCall
+
+derive bin for RecordField
+
+derive bin for FilledHole
+
+derive bin for Raised
+
+derive bin for Arm
+
+derive bin for Handled
+
+derive bin for HandlerVariable
+
+derive bin for Clause
+
+derive bin for Entry
+
+derive bin for Statement
+
+derive bin for Generics
+
+derive bin for Parameter
+
+derive bin for Constrained
+
+derive bin for Returning
+
+derive bin for FunctionForm
+
+derive bin for Variant
+
+derive bin for TypeBody
+
+derive bin for Through
+
+derive bin for Numeric
+
+derive bin for TypeForm
+
+derive bin for Operation
+
+derive bin for EffectForm
+
+derive bin for TestForm
+
+derive bin for LawForm
+
+derive bin for SpecForm
+
+derive bin for Form
+
+/// The codec of stored forms: its bytes are what a definition's hash is taken over.
+pub fn stored_bin() -> bin::BinCodec<Stored> =
+  form_bin(reference_bin(), bin::int_bin(), bin::int_bin(), bin::unit_bin())
+
+/// The codec of templates, which the memo store keeps.
+pub fn template_bin() -> bin::BinCodec<Template> =
+  form_bin(bin::int_bin(), slotted_bin(), spot_bin(), note_bin())

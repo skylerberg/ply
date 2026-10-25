@@ -1,42 +1,53 @@
-//! Stored bodies printed back to source: what a mixture and an artifact print.
+//! Stored bodies printed back to source: what a mixture and an artifact print. A body decodes to
+//! its stored form (`stored.stored_bin`), each reference in it is named where the print can name
+//! it, and `fmt` prints the syntax that makes.
 
-import syntax.parsing (bare, starts_upper)
-import syntax.lexer (widths, wide_decimal, utf8_of)
-import syntax.type_syntax (angled)
-import syntax.items (Deriver, constraint_kinds, constraint_written, NKey, NShow, instance_text)
+import syntax.parsing (Ident, QName, Span, dummy_span)
+import syntax.lexer (widths)
+import syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr, Lit, LInt,
+                        LFixed, LWide, LBool, LStr, LBytes, LFloat, LDec, LChar, LUnit)
+import syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+                     ERecordUpdate, EField, EList, EPerform, EHandle, EWithHold, ESimulate,
+                     EParallel, ETagged, EHole, ETryBlock, Stmt, SLet, SLetElse, SExpr, SAssign,
+                     Param, MatchArm, HandleClause, ReturnClause, HandlerVar, RecField, NamedArg,
+                     Hole, RaiseName)
+import syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, RowExpr, AtomExpr, Mode,
+                           MWrite, Generics)
+import syntax.items (Module, Item, IFn, IType, IEffect, ITest, IInstance, INumeric, FnDef, TypeDef,
+                     TDAlias, TDSum, TDNominal, TDExtern, VariantDef, EffectDef, OpDef, TestDef,
+                     Constraint, NKey, NShow, ReturnsFresh, ReturnsParam, VPub)
+import syntax.fmt (module_text)
+import syntax.spelling (float_text, decimal_text)
 import check.resolve.tables (qualify, default_binder, backticked)
+import std.bin
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
 import std.list
 import std.option
 import std.bytes
 import std.string
-import store.hash.encoding (hex_digit, hex, i128_le_of_digits, tag_local, tag_ref_hash,
-                            tag_ref_index, tag_free, tag_ctor, tag_ty_param, tag_row_param,
-                            tag_free_qualified, tag_none, tag_some, tag_param_default, tag_fn,
-                            tag_type_alias, tag_type_sum, tag_effect, tag_test, tag_variant, tag_op,
-                            tag_type, tag_ty_con, tag_ty_fn, tag_ty_record, tag_ty_unit,
-                            tag_lit_int, tag_lit_bool, tag_lit_str, tag_lit_unit, tag_lit_bytes,
-                            tag_lit_float, tag_lit_decimal, tag_lit_char, tag_lit_embedded,
-                            tag_lit_fixed, tag_lit_wide, tag_e_lit, tag_e_var, tag_e_binary,
-                            tag_e_unary, tag_e_lambda, tag_e_app, tag_e_if, tag_e_match,
-                            tag_e_block, tag_e_record, tag_e_field, tag_e_list, tag_e_perform,
-                            tag_e_handle, tag_e_with_hold, tag_e_on_value, tag_written,
-                            tag_e_simulate, tag_e_tagged, tag_e_filled, tag_e_parallel, tag_e_hole,
-                            tag_e_try_block, tag_e_record_update, tag_e_handle_vars, tag_s_let,
-                            tag_s_expr, tag_s_let_else, tag_s_assign, tag_p_wildcard, tag_p_var,
-                            tag_p_lit, tag_p_ctor, tag_p_record, tag_p_list, tag_p_or, tag_p_range,
-                            tag_p_again, tag_row, tag_atom, tag_atom_op, tag_label_param, tag_arm,
-                            tag_clause, tag_return_clause, tag_constraint, tag_returns_fresh,
-                            tag_returns_param, tag_bounded, tag_decreases, tag_const,
-                            tag_type_nominal, tag_type_over, tag_ty_con_over, tag_key, tag_show,
-                            tag_numeric, tag_opaque, deriver_byte, Choice, Slot)
-import store.hash.forms (member_hash, container_named)
+import store.hash.encoding (hex, Choice, Slot)
+import store.hash.forms (member_hash)
+import store.hash.stored
+import store.hash.stored (Reference, Hashed, Member, Itself, ByName, Free, Literal, IntLiteral,
+                          FixedLiteral, WideLiteral, BoolLiteral, StringLiteral, BytesLiteral,
+                          EmbeddedLiteral, FloatLiteral, DecimalLiteral, CharLiteral, UnitLiteral,
+                          Local, Defined, Constructed, Unbound, Value, Label, LabelParameter,
+                          LabelName, Effect, Declared, EffectUnbound, TypeParameter, TypeDefined,
+                          TypeUnbound, Type, Applied, AppliedOver, Function, Fields, UnitType,
+                          RowParameter, RowName, Row, Moded, OfOperation, Wild, Bind, Again,
+                          LiteralPattern, RangePattern, ConstructorPattern, RecordPattern,
+                          ListPattern, OrPattern, InFull, Among, Constant, Unwritten, Variable,
+                          Binary, Unary, Lambda, Call, OnValue, If, Match, Record, RecordUpdate,
+                          Field, ListOf, Perform, Handle, WithHold, Simulate, Parallel, Tagged,
+                          Filled, TryBlock, Block, One, Commuting, Let, LetElse, Effectful, Assign,
+                          Unstated, Fresh, ParameterReturned, Alias, Sum, Nominal, Extern,
+                          FunctionOf, TypeOf, EffectOf, TestOf, LawOf, SpecOf, Stored, stored_bin)
 
 // --- The hash table ----------------------------------------------------------------------
 
 /// Where a stored body's parts stand: its kind, a member's class, the choices each member's calls
-/// on values made (`Chose`) from `picks` to `at`, and the bytes its hash is taken over from `at`.
+/// on values made from `picks` to `at`, and the bytes its hash is taken over from `at`.
 type Envelope = { kind: Int, class: Int, picks: Int, at: Int }
 
 pub fn envelope(body: Bytes) -> Option<Envelope> = {
@@ -78,6 +89,45 @@ pub fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} 
   )
 }
 
+/// The members of a component's packed bytes: a count, then each member's length and bytes.
+fn members_of(packed: Bytes) -> Option<List<Bytes>> / {abort.raise} =
+  match packed.u32_at(0) {
+    None -> None,
+    Some(n) -> {
+      let read = range(0, n).fold(
+        Some({ at: 4, members: [] }),
+        |acc: Option<{ at: Int, members: List<Bytes> }>, _i: Int|
+          match acc {
+            None -> None,
+            Some(s) -> match packed.u32_at(s.at) {
+              None -> None,
+              Some(len) -> if s.at + 4 + len > packed.len() { None } else {
+                Some({
+                  at: s.at + 4 + len,
+                  members: s.members.push(packed.slice(s.at + 4, s.at + 4 + len)),
+                })
+              },
+            },
+          },
+      );
+      match read {
+        Some(s) -> if s.at == packed.len() { Some(s.members) } else { None },
+        None -> None,
+      }
+    },
+  }
+
+/// The stored form of the body `bytes` holds for the definition `name`.
+fn stored_of(bytes: Bytes, name: Bytes) -> Stored / {abort.raise} =
+  match bin::decode(bytes, stored_bin()) {
+    Ok(form) -> form,
+    Err(e) ->
+      panic(
+        String::of_bytes(Bytes::concat_all([b"the stored body of `", name, b"` does not decode: "]))
+          ++ bin::error_to_string(e),
+      ),
+  }
+
 // --- Stored bodies back to source ------------------------------------------------------------
 
 pub type Refusal = { message: Bytes, notes: List<Bytes> }
@@ -106,161 +156,44 @@ type Layout = {
 }
 
 /// The import graph the print has laid down so far travels with the printer: a home is chosen
-/// with it in view, so a reference never closes a cycle the source did not have. `room` is how
-/// much deeper a body may nest: each level reads a byte, so a definition's length is its room.
-/// `meant` is every name the definition being printed names, and empty where nothing said.
+/// with it in view, so a reference never closes a cycle the source did not have. `meant` is every
+/// name the definition being printed names, and empty where nothing said.
 type BodyPrinter = {
   layout: Layout,
   part: Int,
   own: Bytes,
   graph: Map<Bytes, List<Bytes>>,
-  room: Int,
   meant: Map<Bytes, Bool>,
 }
 
 /// A hash is thirty-two bytes, so the name after it needs no separator.
 fn meant_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
 
-/// `picks` is which candidate each call on a value of the body calls, in the order its bytes write
-/// them (`Chose`), and `picked` how many of them are read.
-type Decoder = {
-  bytes: Bytes,
-  pos: Int,
-  picks: List<Choice>,
-  picked: Int,
-  values: Int,
-  types: Int,
-  rows: Int,
-  labels: Int,
+/// What naming has gathered: each module the print imports and the binder it imports it under,
+/// each hash a body refers to that no printed name holds, the slot each effect declaration was
+/// met under, and the picks of the body's calls on values, `picked` of them read.
+type Naming = {
   imports: Map<Bytes, Bytes>,
   missing: Map<Bytes, Bool>,
   slots: Map<Bytes, Int>,
+  picks: List<Choice>,
+  picked: Int,
 }
 
-type Decoded = { decoder: Decoder, text: Bytes }
+/// How many value, type, row and label binders are in scope: each is named by its level.
+type Depth = { values: Int, types: Int, rows: Int, labels: Int }
 
-type DecodedInt = { decoder: Decoder, value: Int }
+/// A node the namer built, and the naming it leaves.
+type Spelled<a> = { naming: Naming, node: a }
 
-type DecodedFlag = { decoder: Decoder, value: Bool }
+/// A pattern named, and the binders it leaves in scope.
+type Bound = { naming: Naming, depth: Depth, node: Pattern }
 
-type DecodedOption = { decoder: Decoder, text: Bytes, some: Bool }
+/// Patterns named in order, and the binders they leave in scope.
+type BoundAll = { naming: Naming, depth: Depth, node: List<Pattern> }
 
-type DecodedList = { decoder: Decoder, texts: List<Bytes> }
-
-type DecodedRef = { decoder: Decoder, hash: Bytes, class: Int }
-
-fn cursor(b: Bytes, missing: Map<Bytes, Bool>) -> Decoder =
-  {
-    bytes: b,
-    pos: 0,
-    picks: [],
-    picked: 0,
-    values: 0,
-    types: 0,
-    rows: 0,
-    labels: 0,
-    imports: Map::new(),
-    missing: missing,
-    slots: Map::new(),
-  }
-
-fn read_bytes(decoder: Decoder, n: Int) -> Decoded / {abort.raise} =
-  if decoder.pos + n > decoder.bytes.len() { panic("a stored body ends inside a value") } else {
-    {
-      decoder: { ..decoder, pos: decoder.pos + n },
-      text: decoder.bytes.slice(decoder.pos, decoder.pos + n),
-    }
-  }
-
-fn le_int(b: Bytes) -> Int = range(0, b.len()).fold(0, |a: Int, i: Int| a | b.at(i) << 8 * i)
-
-fn read_int(decoder: Decoder, n: Int) -> DecodedInt / {abort.raise} = {
-  let g = read_bytes(decoder, n);
-  { decoder: g.decoder, value: le_int(g.text) }
-}
-
-fn read_u8(decoder: Decoder) -> DecodedInt / {abort.raise} = read_int(decoder, 1)
-
-fn read_u32(decoder: Decoder) -> DecodedInt / {abort.raise} = read_int(decoder, 4)
-
-fn read_text(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let n = read_u32(decoder);
-  read_bytes(n.decoder, n.value)
-}
-
-fn read_bool(decoder: Decoder) -> DecodedFlag / {abort.raise} = {
-  let r = read_u8(decoder);
-  if r.value > 1 { panic("a byte that is not a boolean") }
-  else { { decoder: r.decoder, value: r.value == 1 } }
-}
-
-fn peek(decoder: Decoder) -> Int / {abort.raise} =
-  if decoder.pos < decoder.bytes.len() { decoder.bytes.at(decoder.pos) } else { 0 - 1 }
-
-fn skip(decoder: Decoder) -> Decoder = { ..decoder, pos: decoder.pos + 1 }
-
-fn expect(decoder: Decoder, want: Int, what: Bytes) -> Decoder / {abort.raise} = {
-  let r = read_u8(decoder);
-  if r.value == want { r.decoder } else {
-    panic(
-      String::of_bytes(
-        Bytes::concat_all([b"expected ", what, b", found tag ", ascii_of_int(r.value)]),
-      ),
-    )
-  }
-}
-
-fn read_count(decoder: Decoder) -> DecodedInt / {abort.raise} = {
-  let r = read_u32(decoder);
-  if r.value > r.decoder.bytes.len() - r.decoder.pos { panic("a count runs past the stored body") }
-  else { r }
-}
-
-/// Past what `written_block` wrote, which the text of a body does not say: each reference read as
-/// one and nothing looked up, so none is wanted where the body is printed.
-fn past_written(decoder: Decoder) -> Decoder / {abort.raise} = {
-  let n = read_count(expect(decoder, tag_written(), b"what a body references past its text"));
-  range(0, n.value).fold(n.decoder, |d: Decoder, _i: Int| {
-    let t = read_u8(d);
-    if t.value == tag_ref_hash() { read_bytes(t.decoder, 32).decoder }
-    else if t.value == tag_ref_index() { read_u32(t.decoder).decoder }
-    else { panic(String::of_bytes(b"a reference of tag ".concat(ascii_of_int(t.value)))) }
-  })
-}
-
-fn read_binders(decoder: Decoder) -> DecodedInt / {abort.raise} = {
-  let r = read_u32(decoder);
-  if r.value > 65535 { panic("a count of binders no definition declares") } else { r }
-}
-
-fn read_many<| e>(decoder: Decoder, count: Int, f: (Decoder) -> Decoded / e) -> DecodedList / e =
-  range(0, count).fold({ decoder: decoder, texts: [] }, |decoded: DecodedList, i: Int| {
-    let g = f(decoded.decoder);
-    { decoder: g.decoder, texts: decoded.texts.push(g.text) }
-  })
-
-fn read_opt<| e>(
-  decoder: Decoder,
-  f: (Decoder) -> Decoded / e,
-) -> DecodedOption / {abort.raise | e} = {
-  let r = read_u8(decoder);
-  if r.value == tag_none() { { decoder: r.decoder, text: b"", some: false } }
-  else if r.value == tag_some() {
-    let g = f(r.decoder);
-    { decoder: g.decoder, text: g.text, some: true }
-  } else { panic("a byte that is not an optional marker") }
-}
-
-fn joined(xs: List<Bytes>, sep: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    range(0, xs.len()).map(|i: Int| if i == 0 { xs.get(i) } else { sep.concat(xs.get(i)) }),
-  )
-
-fn prefixed(decoded: DecodedOption, before: Bytes) -> Bytes =
-  if decoded.some { before.concat(decoded.text) } else { b"" }
-
-fn bracketed(decoded: DecodedOption) -> Bytes =
-  if decoded.some { Bytes::concat_all([b"[", decoded.text, b"]"]) } else { b"" }
+/// A statement named, and the binders it leaves in scope.
+type Said = { naming: Naming, depth: Depth, node: Stmt }
 
 fn local_name(level: Int) -> Bytes = b"_l".concat(ascii_of_int(level))
 
@@ -270,31 +203,60 @@ fn row_var_name(level: Int) -> Bytes = b"_e".concat(ascii_of_int(level))
 
 fn label_name(level: Int) -> Bytes = b"_r".concat(ascii_of_int(level))
 
-fn line_break(depth: Int) -> Bytes =
-  b"\n".concat(Bytes::concat_all(range(0, depth).map(|i: Int| b"  ")))
-
-fn zeros(k: Int) -> Bytes = Bytes::concat_all(range(0, k).map(|i: Int| b"0"))
+fn space_name(at: Int) -> Bytes = b"_s".concat(ascii_of_int(at))
 
 fn short_hex(h: Bytes) -> Bytes / {abort.raise} = hex(h).slice(0, 12)
 
-fn read_ref(printer: BodyPrinter, decoder: Decoder) -> DecodedRef / {abort.raise} = {
-  let t = read_u8(decoder);
-  if t.value == tag_ref_hash() {
-    let g: Decoded = read_bytes(t.decoder, 32);
-    let h = match printer.layout.relink.get(g.text) { Some(to) -> to, None -> g.text };
-    {
-      decoder: if printer.layout.by_hash.contains(h) { g.decoder }
-      else { { ..g.decoder, missing: g.decoder.missing.insert(h, true) } },
-      hash: h,
-      class: 0 - 1,
-    }
-  } else if t.value == tag_ref_index() {
-    let c = read_u32(t.decoder);
-    let hashes = if printer.part < 0 { [] } else { printer.layout.parts.get(printer.part).hashes };
-    if c.value >= hashes.len() { panic("a reference to a member this component does not have") }
-    else { { decoder: c.decoder, hash: hashes.get(c.value), class: c.value } }
-  } else { panic(String::of_bytes(b"a reference of tag ".concat(ascii_of_int(t.value)))) }
-}
+fn ident(name: Bytes) -> Ident = { name: name, span: dummy_span() }
+
+fn unqualified(name: Bytes) -> QName = { module: None, name: ident(name), span: dummy_span() }
+
+fn free_name(free: Free) -> QName =
+  match free.module {
+    Some(module) -> { module: Some(ident(module)), name: ident(free.name), span: dummy_span() },
+    None -> unqualified(free.name),
+  }
+
+/// A qualified name as one identifier, as a call on a value writes the function it names in full.
+fn qualified_text(name: QName) -> Bytes =
+  match name.module {
+    Some(module) -> Bytes::concat_all([module.name, b"::", name.name.name]),
+    None -> name.name.name,
+  }
+
+/// What a `{ e }` is to the parser: the block a branch, a test or a fallback is written as.
+fn as_block(expression: Expr) -> Expr =
+  match expression {
+    EBlock(_) -> expression,
+    _ -> EBlock({ span: dummy_span(), tail: Some(expression), stmts: [] }),
+  }
+
+/// `items` named in order, each under the naming the ones before it left.
+fn named_in_turn<a, b>(
+  naming: Naming,
+  items: List<a>,
+  name_one: (Naming, a) -> Spelled<b> / {abort.raise},
+) -> Spelled<List<b>> / {abort.raise} =
+  items.fold({ naming: naming, node: [] }, |acc: Spelled<List<b>>, item: a| {
+    let spelled = name_one(acc.naming, item);
+    { naming: spelled.naming, node: acc.node.push(spelled.node) }
+  })
+
+/// `item` named, where there is one.
+fn named_if_any<a, b>(
+  naming: Naming,
+  item: Option<a>,
+  name_one: (Naming, a) -> Spelled<b> / {abort.raise},
+) -> Spelled<Option<b>> / {abort.raise} =
+  match item {
+    None -> { naming: naming, node: None },
+    Some(present) -> {
+      let spelled = name_one(naming, present);
+      { naming: spelled.naming, node: Some(spelled.node) }
+    },
+  }
+
+// --- Naming references -------------------------------------------------------------------------
 
 /// A name the module being printed may write: its own needs no export, a printed module is reprinted
 /// `pub` throughout, and any other is reached as `binder::name`, which is what its own `pub` permits.
@@ -303,9 +265,6 @@ fn nameable(layout: Layout, slot: Slot, own: Bytes) -> Bool / {abort.raise} = {
   p.module == own || p.printed || p.public.get(slot.class)
 }
 
-/// Two definitions alike are one body under two names, and only some of those names are in reach:
-/// an unreachable one is no candidate at all, since printing it names something that will not
-/// resolve rather than something merely further away.
 /// Whether `from` reaches `target` along the import edges laid down. Each round reaches one edge
 /// further, and a module past the first round has edges only if it is a key, so the rounds suffice.
 fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
@@ -327,6 +286,9 @@ fn reaches(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
   walked.seen.contains(target)
 }
 
+/// Two definitions alike are one body under two names, and only some of those names are in reach:
+/// an unreachable one is no candidate at all, since printing it names something that will not
+/// resolve rather than something merely further away.
 fn pick(
   layout: Layout,
   g: Map<Bytes, List<Bytes>>,
@@ -360,72 +322,105 @@ fn pick(
   }
 }
 
-fn qname(
+/// What a filled reference is: a hash and, for a member of the component being printed, its class.
+type Target = { hash: Bytes, class: Int }
+
+fn target_of(
   printer: BodyPrinter,
-  decoded: DecodedRef,
-  ctor: Option<Bytes>,
-) -> Decoded / {abort.raise} = {
+  naming: Naming,
+  reference: Reference,
+) -> Spelled<Target> / {abort.raise} =
+  match reference {
+    Hashed(written) -> {
+      let hash = match printer.layout.relink.get(written) { Some(to) -> to, None -> written };
+      {
+        naming: if printer.layout.by_hash.contains(hash) { naming }
+        else { { ..naming, missing: naming.missing.insert(hash, true) } },
+        node: { hash: hash, class: 0 - 1 },
+      }
+    },
+    Member(class) -> {
+      let hashes = if printer.part < 0 { [] }
+      else { printer.layout.parts.get(printer.part).hashes };
+      if class >= hashes.len() { panic("a reference to a member this component does not have") }
+      else { { naming: naming, node: { hash: hashes.get(class), class: class } } }
+    },
+    Itself -> panic("a stored body refers to its own definition by no hash"),
+    ByName(_) -> panic("a stored body names a definition by its name"),
+  }
+
+/// The name `target` is printed under, its module imported where it is another's; `constructor`
+/// names a constructor of the type `target` is.
+fn named(
+  printer: BodyPrinter,
+  naming: Naming,
+  target: Target,
+  constructor: Option<Bytes>,
+) -> Spelled<QName> / {abort.raise} = {
   // One body under two modules' names: the checker tells them apart where the hash does not.
-  let named = |s: Slot| {
-    let p = printer.layout.parts.get(s.part);
-    printer.meant.contains(qualify(p.module, p.names.get(s.class)))
+  let meant = |slot: Slot| {
+    let part = printer.layout.parts.get(slot.part);
+    printer.meant.contains(qualify(part.module, part.names.get(slot.class)))
   };
-  let told = match printer.layout.by_hash.get(decoded.hash) {
-    Some(slots) -> slots.filter(named).len() > 0,
+  let told = match printer.layout.by_hash.get(target.hash) {
+    Some(slots) -> slots.filter(meant).len() > 0,
     None -> false,
   };
-  let found = if decoded.class >= 0 { Some({ part: printer.part, class: decoded.class }) } else {
-    pick(
-      printer.layout,
-      printer.graph,
-      decoded.decoder.imports,
-      decoded.hash,
-      printer.own,
-      |s: Slot| !told || named(s),
-    )
+  let found = if target.class >= 0 { Some({ part: printer.part, class: target.class }) } else {
+    pick(printer.layout, printer.graph, naming.imports, target.hash, printer.own, |slot: Slot|
+      !told || meant(slot))
   };
   match found {
     // A body with no name this module may write is filed with the ones it has no body for: either
-    // way the reference cannot be printed, and a refusal names it rather than a hex string standing
-    // in for it.
+    // way the reference cannot be printed, and a refusal names it rather than a name standing in.
     None ->
       {
-        decoder: { ..decoded.decoder, missing: decoded.decoder.missing.insert(decoded.hash, true) },
-        text: match ctor { Some(c) -> c, None -> short_hex(decoded.hash) },
+        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        node: unqualified(match constructor {
+          Some(given) -> given,
+          None -> short_hex(target.hash),
+        }),
       },
-    Some(s) -> {
-      let p = printer.layout.parts.get(s.part);
-      let name = match ctor { Some(c) -> c, None -> p.names.get(s.class) };
-      if p.module == printer.own { { decoder: decoded.decoder, text: name } } else {
+    Some(slot) -> {
+      let part = printer.layout.parts.get(slot.part);
+      let name = match constructor { Some(given) -> given, None -> part.names.get(slot.class) };
+      if part.module == printer.own { { naming: naming, node: unqualified(name) } } else {
         {
-          decoder: {
-            ..decoded.decoder,
-            imports: decoded.decoder.imports.insert(p.module, p.binder),
-          },
-          text: Bytes::concat_all([p.binder, b"::", name]),
+          naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
+          node: { module: Some(ident(part.binder)), name: ident(name), span: dummy_span() },
         }
       }
     },
   }
 }
 
-/// What follows `decoded`, a function a call on a value may be, with its module imported where
-/// the module being printed may name it: the call is answered among the modules its own can see.
-fn seen(printer: BodyPrinter, decoded: DecodedRef) -> Decoder / {abort.raise} =
-  if decoded.class >= 0 { decoded.decoder } else {
+fn reference_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  reference: Reference,
+  constructor: Option<Bytes>,
+) -> Spelled<QName> / {abort.raise} = {
+  let target = target_of(printer, naming, reference);
+  named(printer, target.naming, target.node, constructor)
+}
+
+/// `target`, a function a call on a value may be, with its module imported where the module being
+/// printed may name it: the call is answered among the modules its own can see.
+fn seen(printer: BodyPrinter, naming: Naming, target: Target) -> Naming / {abort.raise} =
+  if target.class >= 0 { naming } else {
     match pick(
         printer.layout,
         printer.graph,
-        decoded.decoder.imports,
-        decoded.hash,
+        naming.imports,
+        target.hash,
         printer.own,
         |_: Slot| true,
       ) {
-      None -> decoded.decoder,
-      Some(s) -> {
-        let p = printer.layout.parts.get(s.part);
-        if p.module == printer.own { decoded.decoder }
-        else { { ..decoded.decoder, imports: decoded.decoder.imports.insert(p.module, p.binder) } }
+      None -> naming,
+      Some(slot) -> {
+        let part = printer.layout.parts.get(slot.part);
+        if part.module == printer.own { naming }
+        else { { ..naming, imports: naming.imports.insert(part.module, part.binder) } }
       },
     }
   }
@@ -448,1362 +443,1218 @@ fn names_body(
   }
 
 /// The binder a tagged literal is written with: one of another module that names the literal's
-/// parser `named`, and its filler `fill` where it has one, and that a string can touch without
+/// parser `parser`, and its filler `fill` where it has one, and that a string can touch without
 /// making an interpolated or a byte string.
 fn tag_binder(
   printer: BodyPrinter,
-  decoded: DecodedRef,
-  named: Bytes,
+  naming: Naming,
+  target: Target,
+  parser: Bytes,
   filler: Option<Bytes>,
-) -> Decoded / {abort.raise} = {
+) -> Spelled<Ident> / {abort.raise} = {
   let layout = printer.layout;
-  let found = pick(
-    layout,
-    printer.graph,
-    decoded.decoder.imports,
-    decoded.hash,
-    printer.own,
-    |s: Slot| {
-      let p = layout.parts.get(s.part);
-      p.module != printer.own && p.names.get(s.class) == named && p.binder != b"f"
-        && p.binder != b"b"
-        && (match filler {
-          None -> true,
-          Some(hash) -> names_body(layout, p.module, hash, b"fill", printer.own),
-        })
-    },
-  );
+  let found = pick(layout, printer.graph, naming.imports, target.hash, printer.own, |slot: Slot| {
+    let part = layout.parts.get(slot.part);
+    part.module != printer.own && part.names.get(slot.class) == parser && part.binder != b"f"
+      && part.binder != b"b"
+      && (match filler {
+        None -> true,
+        Some(hash) -> names_body(layout, part.module, hash, b"fill", printer.own),
+      })
+  });
   match found {
     None ->
       {
-        decoder: { ..decoded.decoder, missing: decoded.decoder.missing.insert(decoded.hash, true) },
-        text: short_hex(decoded.hash),
+        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        node: ident(short_hex(target.hash)),
       },
-    Some(s) -> {
-      let p = layout.parts.get(s.part);
+    Some(slot) -> {
+      let part = layout.parts.get(slot.part);
       {
-        decoder: { ..decoded.decoder, imports: decoded.decoder.imports.insert(p.module, p.binder) },
-        text: p.binder,
+        naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
+        node: ident(part.binder),
       }
     },
   }
 }
-
-fn is_free(decoder: Decoder) -> Bool / {abort.raise} =
-  peek(decoder) == tag_free() || peek(decoder) == tag_free_qualified()
-
-fn read_free(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let t = read_u8(decoder);
-  if t.value == tag_free() { read_text(t.decoder) } else if t.value == tag_free_qualified() {
-    let m = read_text(t.decoder);
-    let n = read_text(m.decoder);
-    { decoder: n.decoder, text: Bytes::concat_all([m.text, b"::", n.text]) }
-  } else { panic("a tag that is not a free reference") }
-}
-
-fn read_value(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
-  if peek(decoder) == tag_local() {
-    let l = read_u32(skip(decoder));
-    if l.value >= decoder.values { panic("a local that is not in scope") }
-    else { { decoder: l.decoder, text: local_name(l.value) } }
-  } else if peek(decoder) == tag_ctor() { read_ctor(printer, decoder) } else if is_free(decoder) {
-    let name = read_free(decoder);
-    past_crossed(name.text.split(b"::").get(0), {
-      decoder: past_written(name.decoder),
-      text: name.text,
-    })
-  } else {
-    let q = qname(printer, read_ref(printer, decoder), None);
-    past_crossed(q.text.split(b"::").get(0), q)
-  }
-
-/// `d` past what follows a reference naming the container `named` (`forms.container_named`): what
-/// crossing the container calls, which the text does not say.
-fn past_crossed(named: Bytes, d: Decoded) -> Decoded / {abort.raise} =
-  if container_named(named) { { ..d, decoder: past_written(d.decoder) } } else { d }
-
-fn read_ctor(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
-  if peek(decoder) == tag_ctor() {
-    let owner: DecodedRef = read_ref(printer, skip(decoder));
-    let name = read_text(owner.decoder);
-    qname(printer, { ..owner, decoder: name.decoder }, Some(name.text))
-  } else { read_free(decoder) }
 
 /// Two effects declared alike share a hash, and only the slot tells them apart.
-fn read_effect(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
-  if is_free(decoder) { read_free(decoder) } else {
-    let r: DecodedRef = read_ref(printer, decoder);
-    let s: DecodedInt = read_u32(r.decoder);
-    match s.decoder.slots.get(r.hash) {
-      Some(was) -> if was != s.value {
-        panic(
-          "two distinct effects share one declaration, which a hash-keyed body cannot tell apart",
-        )
-      } else { qname(printer, { ..r, decoder: s.decoder }, None) },
-      None ->
-        qname(
-          printer,
-          { ..r, decoder: { ..s.decoder, slots: s.decoder.slots.insert(r.hash, s.value) } },
-          None,
-        ),
-    }
+fn effect_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  performed: Effect<Reference, Int>,
+) -> Spelled<QName> / {abort.raise} =
+  match performed {
+    EffectUnbound(free) -> { naming: naming, node: free_name(free) },
+    Declared(reference, slot) -> {
+      let target = target_of(printer, naming, reference);
+      match target.naming.slots.get(target.node.hash) {
+        Some(was) -> if was != slot {
+          panic(
+            "two distinct effects share one declaration, which a hash-keyed body cannot tell apart",
+          )
+        } else { named(printer, target.naming, target.node, None) },
+        None ->
+          named(
+            printer,
+            { ..target.naming, slots: target.naming.slots.insert(target.node.hash, slot) },
+            target.node,
+            None,
+          ),
+      }
+    },
   }
 
-fn print_type(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
-  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
-    let printer = { ..outer, room: outer.room - 1 };
-    let t = read_u8(d);
-    if t.value == tag_ty_con() {
-      if peek(t.decoder) == tag_ty_param() {
-        let l = read_u32(skip(t.decoder));
-        let n = read_u32(l.decoder);
-        if l.value >= d.types || n.value != 0 { panic("a type parameter out of scope, or applied") }
-        else { { decoder: n.decoder, text: type_var_name(l.value) } }
-      } else {
-        let name = if is_free(t.decoder) {
-          let f = read_free(t.decoder);
-          past_crossed(f.text, f)
-        } else { qname(printer, read_ref(printer, t.decoder), None) };
-        let n = read_count(name.decoder);
-        let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
-        // A bare lowercase name reads back as a type variable, so it keeps an empty `<>`.
-        let bare = match name.text.index_of(b"::") { Some(_) -> false, None -> true };
-        {
-          decoder: args.decoder,
-          text: if n.value > 0 || (bare && !starts_upper(name.text)) {
-            Bytes::concat_all([name.text, b"<", joined(args.texts, b", "), b">"])
-          } else { name.text },
-        }
-      }
-    } else if t.value == tag_ty_con_over() {
-      let name = if is_free(t.decoder) {
-        let f = read_free(t.decoder);
-        past_crossed(f.text, f)
-      } else { qname(printer, read_ref(printer, t.decoder), None) };
-      let n = read_count(name.decoder);
-      let args = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
-      let lc = read_count(args.decoder);
-      let labels = read_many(lc.decoder, lc.value, read_label);
-      let rc = read_count(labels.decoder);
-      let rows = read_many(rc.decoder, rc.value, |e: Decoder| print_row(printer, e, false));
-      {
-        decoder: rows.decoder,
-        text: name.text.concat(angled(args.texts, labels.texts, rows.texts)),
-      }
-    } else if t.value == tag_ty_fn() {
-      let n = read_count(t.decoder);
-      let ps = read_many(n.decoder, n.value, |e: Decoder| print_type(printer, e));
-      let ret = print_ret(printer, ps.decoder);
-      let row = read_opt(ret.decoder, |e: Decoder| print_row(printer, e, false));
-      {
-        decoder: row.decoder,
-        text: Bytes::concat_all([
-          b"(",
-          joined(ps.texts, b", "),
-          b") -> ",
-          ret.text,
-          prefixed(row, b" / "),
-        ]),
-      }
-    } else if t.value == tag_ty_record() {
-      let n = read_count(t.decoder);
-      let fs = read_many(n.decoder, n.value, |e: Decoder| {
-        let f = read_text(e);
-        let ty = print_type(printer, f.decoder);
-        { decoder: ty.decoder, text: Bytes::concat_all([f.text, b": ", ty.text]) }
-      });
-      { decoder: fs.decoder, text: Bytes::concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
-    } else if t.value == tag_ty_unit() { { decoder: t.decoder, text: b"()" } }
-    else { panic("a tag that does not begin a type") }
+fn value_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  value: Value<Reference, Int>,
+) -> Spelled<QName> / {abort.raise} =
+  match value.named {
+    Local(level) -> if level >= depth.values { panic("a local that is not in scope") }
+    else { { naming: naming, node: unqualified(local_name(level)) } },
+    Defined(reference) -> reference_named(printer, naming, reference, None),
+    Constructed(reference, name) -> reference_named(printer, naming, reference, Some(name)),
+    Unbound(free) -> { naming: naming, node: free_name(free) },
   }
 
-/// After `->` a function type is parenthesized, or a row after it would bind to the inner arrow.
-fn print_ret(printer: BodyPrinter, decoder: Decoder) -> Decoded / {abort.raise} =
-  if peek(decoder) == tag_ty_fn() {
-    let g = print_type(printer, decoder);
-    { decoder: g.decoder, text: Bytes::concat_all([b"(", g.text, b")"]) }
-  } else { print_type(printer, decoder) }
+fn label_of(depth: Depth, label: Label) -> Ident / {abort.raise} =
+  match label {
+    LabelParameter(level) -> if level >= depth.labels {
+      panic("a label parameter that is not in scope")
+    } else { ident(label_name(level)) },
+    LabelName(name) -> ident(name),
+  }
 
-fn read_mode(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let m = read_u8(decoder);
-  if m.value == 0 { { decoder: m.decoder, text: b"read" } }
-  else if m.value == 1 { { decoder: m.decoder, text: b"write" } }
-  else if m.value == 2 { { decoder: m.decoder, text: b"raise" } }
-  else { panic("a byte that is not an access mode") }
-}
+fn optional_label_of(depth: Depth, label: Option<Label>) -> Option<Ident> / {abort.raise} =
+  match label { Some(given) -> Some(label_of(depth, given)), None -> None }
 
-fn read_label(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let k = read_u8(decoder);
-  if k.value == tag_label_param() {
-    let l = read_u32(k.decoder);
-    if l.value >= decoder.labels { panic("a label parameter that is not in scope") }
-    else { { decoder: l.decoder, text: label_name(l.value) } }
-  } else if k.value == tag_free() { read_text(k.decoder) }
-  else { panic("a tag that is not a resource label") }
-}
+// --- Types -------------------------------------------------------------------------------------
 
-/// `own` is a definition's own row, the only one whose row variable may be promised `bounded`: what
-/// follows any other row is not the row's to read.
-fn print_row(printer: BodyPrinter, d: Decoder, own: Bool) -> Decoded / {abort.raise} = {
-  let n = read_count(expect(d, tag_row(), b"an effect row"));
-  let atoms = read_many(n.decoder, n.value, |e: Decoder| {
-    let named: Decoded = if peek(e) == tag_atom_op() {
-      let eff = read_effect(printer, expect(e, tag_atom_op(), b"an operation atom"));
-      let op = read_text(eff.decoder);
-      let r = read_opt(op.decoder, read_label);
-      { decoder: r.decoder, text: Bytes::concat_all([eff.text, b".", op.text, bracketed(r)]) }
-    } else {
-      let eff = read_effect(printer, expect(e, tag_atom(), b"an effect atom"));
-      let m = read_mode(eff.decoder);
-      let r = read_opt(m.decoder, read_label);
-      { decoder: r.decoder, text: Bytes::concat_all([eff.text, b".", m.text, bracketed(r)]) }
-    };
-    if peek(named.decoder) == tag_bounded() {
-      { decoder: skip(named.decoder), text: named.text.concat(b" bounded") }
-    } else { named }
-  });
-  let tail = read_opt(atoms.decoder, |e: Decoder| {
-    let k = read_u8(e);
-    if k.value == tag_row_param() {
-      let l = read_u32(k.decoder);
-      if l.value >= e.rows { panic("a row parameter that is not in scope") }
-      else { { decoder: l.decoder, text: row_var_name(l.value) } }
-    } else if k.value == tag_free() { read_text(k.decoder) }
-    else { panic("a tag that is not a row tail") }
-  });
-  let promised = own && tail.some && peek(tail.decoder) == tag_bounded();
-  let variable = if promised { tail.text.concat(b" bounded") } else { tail.text };
+fn types_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  types: List<Type<Reference, Int>>,
+) -> Spelled<List<TypeExpr>> / {abort.raise} =
+  named_in_turn(naming, types, |so_far: Naming, each: Type<Reference, Int>|
+    type_of(printer, so_far, depth, each))
+
+fn optional_type_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  annotation: Option<Type<Reference, Int>>,
+) -> Spelled<Option<TypeExpr>> / {abort.raise} =
+  named_if_any(naming, annotation, |so_far: Naming, present: Type<Reference, Int>|
+    type_of(printer, so_far, depth, present))
+
+fn type_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  name: stored::TypeName<Reference>,
+) -> Spelled<QName> / {abort.raise} =
+  match name {
+    TypeParameter(level) -> if level >= depth.types { panic("a type parameter out of scope") }
+    else { { naming: naming, node: unqualified(type_var_name(level)) } },
+    TypeDefined(reference) -> reference_named(printer, naming, reference, None),
+    TypeUnbound(free) -> { naming: naming, node: free_name(free) },
+  }
+
+fn type_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: Type<Reference, Int>,
+) -> Spelled<TypeExpr> / {abort.raise} =
+  match original {
+    Applied(TypeParameter(level), _, arguments) -> if level >= depth.types || arguments.len() > 0 {
+      panic("a type parameter out of scope, or applied")
+    } else { { naming: naming, node: TVar(ident(type_var_name(level))) } },
+    Applied(name, _, arguments) -> {
+      let head = type_named(printer, naming, depth, name);
+      let spelled = types_of(printer, head.naming, depth, arguments);
+      {
+        naming: spelled.naming,
+        node: TCon({
+          span: dummy_span(),
+          name: head.node,
+          args: spelled.node,
+          labels: [],
+          rows: [],
+        }),
+      }
+    },
+    AppliedOver(name, _, arguments, labels, rows) -> {
+      let head = type_named(printer, naming, depth, name);
+      let spelled = types_of(printer, head.naming, depth, arguments);
+      let spelled_rows = named_in_turn(
+        spelled.naming,
+        rows,
+        |so_far: Naming, row: Row<Reference, Int>| row_of(printer, so_far, depth, row),
+      );
+      {
+        naming: spelled_rows.naming,
+        node: TCon({
+          span: dummy_span(),
+          name: head.node,
+          args: spelled.node,
+          labels: labels.map(|label: Label| label_of(depth, label)),
+          rows: spelled_rows.node,
+        }),
+      }
+    },
+    Function(parameters, returned, row) -> {
+      let spelled_parameters = types_of(printer, naming, depth, parameters);
+      let spelled_returned = type_of(printer, spelled_parameters.naming, depth, returned);
+      let spelled_row = optional_row_of(printer, spelled_returned.naming, depth, row);
+      {
+        naming: spelled_row.naming,
+        node: TFn({
+          span: dummy_span(),
+          params: spelled_parameters.node,
+          ret: spelled_returned.node,
+          effects: spelled_row.node,
+        }),
+      }
+    },
+    Fields(fields) -> {
+      let spelled = named_in_turn(
+        naming,
+        fields,
+        |so_far: Naming, field: stored::TypeField<Reference, Int>| {
+          let field_type = type_of(printer, so_far, depth, field.field_type);
+          { naming: field_type.naming, node: { name: ident(field.name), ty: field_type.node } }
+        },
+      );
+      { naming: spelled.naming, node: TRecord({ span: dummy_span(), fields: spelled.node }) }
+    },
+    UnitType -> { naming: naming, node: TUnit({ span: dummy_span() }) },
+  }
+
+fn optional_row_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  row: Option<Row<Reference, Int>>,
+) -> Spelled<Option<RowExpr>> / {abort.raise} =
+  named_if_any(naming, row, |so_far: Naming, present: Row<Reference, Int>|
+    row_of(printer, so_far, depth, present))
+
+/// What a label `[*]` and `[*t]` and a plain one are to an atom or a clause.
+type Labelled = { resource: Option<Ident>, every: Bool, binder: Option<Ident> }
+
+fn labelled(depth: Depth, label: Option<Label>) -> Labelled / {abort.raise} =
+  match label {
+    None -> { resource: None, every: false, binder: None },
+    Some(LabelName(name)) -> if name == b"*" { { resource: None, every: true, binder: None } }
+    else if name.starts_with(b"*") {
+      { resource: None, every: true, binder: Some(ident(name.slice(1, name.len()))) }
+    } else { { resource: Some(ident(name)), every: false, binder: None } },
+    Some(parameter) -> { resource: Some(label_of(depth, parameter)), every: false, binder: None },
+  }
+
+fn atom_named(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  performed: Effect<Reference, Int>,
+  mode: Mode,
+  operation: Option<Ident>,
+  label: Option<Label>,
+  bounded: Bool,
+) -> Spelled<AtomExpr> / {abort.raise} = {
+  let effect_name = effect_named(printer, naming, performed);
+  let labelled_by = labelled(depth, label);
   {
-    decoder: if promised { skip(tail.decoder) } else { tail.decoder },
-    text: if n.value == 0 && tail.some { variable } else {
-      Bytes::concat_all([
-        b"{",
-        joined(atoms.texts, b", "),
-        if tail.some { b" | ".concat(variable) } else { b"" },
-        b"}",
-      ])
+    naming: effect_name.naming,
+    node: {
+      eff: effect_name.node,
+      mode: mode,
+      op: operation,
+      resource: labelled_by.resource,
+      every: labelled_by.every,
+      bounded: bounded,
+      span: dummy_span(),
     },
   }
 }
 
-fn escape(c: Int, raw: Bool) -> Bytes / {abort.raise} =
-  if c == 34 { b"\\\"" }
-  else if c == 92 { b"\\\\" }
-  else if c == 10 { b"\\n" }
-  else if c == 9 { b"\\t" }
-  else if c == 13 { b"\\r" }
-  else if c == 0 { b"\\0" }
-  else if raw || (c >= 32 && c <= 126) { byte_of_int(c) }
-  else { Bytes::concat_all([b"\\x", hex_digit(c >>> 4), hex_digit(c & 15)]) }
-
-fn str_lit(s: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"\"",
-    Bytes::concat_all(range(0, s.len()).map(|i: Int| escape(s.at(i), true))),
-    b"\"",
-  ])
-
-/// A text of a tagged literal between its quotes and its holes, where a brace is written twice.
-fn read_tag_text(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let s = read_text(expect(decoder, tag_lit_str(), b"a tagged literal's text"));
-  {
-    decoder: s.decoder,
-    text: Bytes::concat_all(
-      range(0, s.text.len()).map(|i: Int| {
-        let c = s.text.at(i);
-        if c == 123 { b"{{" } else if c == 125 { b"}}" } else { escape(c, true) }
-      }),
-    ),
-  }
-}
-
-/// A character is its literal; past ASCII it is its own UTF-8, as a string's characters are.
-fn char_lit(v: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"'",
-    if v == 39 { b"\\'" }
-    else if v == 34 { b"\"" }
-    else if v < 128 { escape(v, true) }
-    else { utf8_of(v) },
-    b"'",
-  ])
-
-fn bytes_lit(s: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"b\"",
-    Bytes::concat_all(range(0, s.len()).map(|i: Int| escape(s.at(i), false))),
-    b"\"",
-  ])
-
-fn hex_int(v: Int, bits: Int) -> Bytes / {abort.raise} = {
-  let n = bits / 4;
-  let ds = range(0, n).map(|i: Int| v >>> 4 * (n - 1 - i) & 15);
-  let lead = range(0, n).fold(n - 1, |acc: Int, j: Int|
-    if ds.get(j) != 0 && j < acc { j } else { acc });
-  b"0x".concat(Bytes::concat_all(range(lead, n).map(|j: Int| hex_digit(ds.get(j)))))
-}
-
-/// A negative literal is spelled as its bit pattern: `-5` would read back as a negation.
-fn int_text(v: Int) -> Bytes / {abort.raise} = if v >= 0 { ascii_of_int(v) } else { hex_int(v, 64) }
-
-fn fixed_text(which: Int, v: Int) -> Bytes / {abort.raise} =
-  match widths().at(which) {
-    None -> panic("a byte that is not a fixed-width integer type"),
-    Some(w) ->
-      Bytes::concat(
-        if v >= 0 { ascii_of_int(v) }
-        else { hex_int(if w.bits == 64 { v } else { v & (1 << w.bits) - 1 }, w.bits) },
-        w.name,
-      ),
-  }
-
-fn wide_text(which: Int, high: Int, low: Int) -> Bytes / {abort.raise} =
-  match widths().at(which) {
-    None -> panic("a byte that is not a fixed-width integer type"),
-    Some(w) ->
-      Bytes::concat(
-        if w.signed && high < 0 {
-          hex_int(high, 64).concat(
-            Bytes::concat_all(range(0, 16).map(|i: Int| hex_digit(low >>> 4 * (15 - i) & 15))),
-          )
-        } else { wide_decimal(false, high, low) },
-        w.name,
-      ),
-  }
-
-fn big_mul(n: List<Int>, f: Int, add: Int) -> List<Int> / {abort.raise} = {
-  let r = n.fold({ limbs: [], carry: add }, |s: { limbs: List<Int>, carry: Int }, limb: Int| {
-    let v = limb * f + s.carry;
-    { limbs: s.limbs.push(v % 1000000000), carry: v / 1000000000 }
-  });
-  iterate(r, 4, |s: { limbs: List<Int>, carry: Int }|
-    if s.carry == 0 { Stop(s) } else {
-      Continue({ limbs: s.limbs.push(s.carry % 1000000000), carry: s.carry / 1000000000 })
-    }).limbs
-}
-
-fn pow_int(b: Int, k: Int) -> Int = range(0, k).fold(1, |a: Int, i: Int| a * b)
-
-fn big_pow(n: List<Int>, base: Int, e: Int) -> List<Int> / {abort.raise} = {
-  let chunk = if base == 5 { 13 } else { 30 };
-  big_mul(
-    range(0, e / chunk).fold(n, |acc: List<Int>, i: Int| big_mul(acc, pow_int(base, chunk), 0)),
-    pow_int(base, e % chunk),
-    0,
-  )
-}
-
-fn big_digits(n: List<Int>) -> Bytes / {abort.raise} = {
-  let top = range(0, n.len()).fold(0, |t: Int, i: Int| if n.get(i) != 0 { i } else { t });
-  Bytes::concat_all(
-    range(0, top + 1).map(|j: Int| {
-      let d = ascii_of_int(n.get(top - j));
-      if j == 0 { d } else { zeros(9 - d.len()).concat(d) }
-    }),
-  )
-}
-
-fn decimal_text(m: Bytes, scale: Int) -> Bytes / {abort.raise} =
-  if scale > 28 || range(12, 16).fold(false, |b: Bool, i: Int| b || m.at(i) != 0) {
-    panic("a mantissa and scale that are not a `Decimal`")
-  } else {
-    let ds = big_digits(
-      range(0, 12).fold([0], |acc: List<Int>, i: Int| big_mul(acc, 256, m.at(11 - i))),
-    );
-    let padded = if ds.len() <= scale { zeros(scale - ds.len() + 1).concat(ds) } else { ds };
-    let point = padded.len() - scale;
-    Bytes::concat(
-      if scale == 0 { ds }
-      else { Bytes::concat_all([padded.slice(0, point), b".", padded.slice(point, padded.len())]) },
-      b"m",
-    )
-  }
-
-type Rounded = { digits: Bytes, exp: Int, p: Int }
-
-fn trim_zeros(s: Bytes) -> Bytes / {abort.raise} =
-  s.slice(0, range(0, s.len()).fold(1, |acc: Int, i: Int| if s.at(i) != 48 { i + 1 } else { acc }))
-
-fn scientific(s: Bytes, x: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    s.slice(0, 1),
-    if s.len() > 1 { b".".concat(s.slice(1, s.len())) } else { b"" },
-    b"e",
-    ascii_of_int(x),
-  ])
-
-fn round_to(ds: Bytes, x0: Int, p: Int) -> Rounded / {abort.raise} = {
-  let head = ds.slice(0, p);
-  if p >= ds.len() || ds.at(p) < 53 { { digits: trim_zeros(head), exp: x0, p: p } } else {
-    let k = range(0, p).fold(0 - 1, |acc: Int, i: Int| if head.at(i) != 57 { i } else { acc });
-    if k < 0 { { digits: b"1", exp: x0 + 1, p: p } }
-    else { { digits: head.slice(0, k).concat(byte_of_int(head.at(k) + 1)), exp: x0, p: p } }
-  }
-}
-
-fn reads_back(r: Rounded, mag: Int) -> Bool / {abort.raise} =
-  match Float::of_string(String::of_bytes(scientific(r.digits, r.exp))) {
-    Some(f) -> bits_of_float(f) == mag,
-    None -> false,
-  }
-
-fn shortest(ds: Bytes, x0: Int, mag: Int) -> Rounded / {abort.raise} =
-  iterate({ digits: ds, exp: x0, p: 1 }, 19, |s: Rounded|
-    if s.p > 17 || s.p > ds.len() { Stop({ digits: trim_zeros(ds), exp: x0, p: s.p }) } else {
-      let r = round_to(ds, x0, s.p);
-      if reads_back(r, mag) { Stop(r) } else { Continue({ ..s, p: s.p + 1 }) }
-    })
-
-fn float_spelling(r: Rounded) -> Bytes / {abort.raise} = {
-  let s = r.digits;
-  let n = s.len();
-  let positional = if r.exp >= n - 1 { s.concat(zeros(r.exp - n + 1)) }
-  else if r.exp >= 0 { Bytes::concat_all([s.slice(0, r.exp + 1), b".", s.slice(r.exp + 1, n)]) }
-  else { Bytes::concat_all([b"0.", zeros(0 - r.exp - 1), s]) };
-  let exponential = scientific(s, r.exp);
-  let text = if exponential.len() < positional.len() { exponential } else { positional };
-  match text.index_of(b".") {
-    Some(_) -> text,
-    None -> match text.index_of(b"e") { Some(_) -> text, None -> text.concat(b".0") },
-  }
-}
-
-fn float_text(bits: Int) -> Bytes / {abort.raise} = {
-  let mag = bits & 0x7FFFFFFFFFFFFFFF;
-  let sign = if bits < 0 { b"-" } else { b"" };
-  let ex = mag >>> 52;
-  let fr = mag & 0xFFFFFFFFFFFFF;
-  if ex == 2047 && fr != 0 { panic("a NaN, which no literal spells") }
-  else if ex == 2047 { sign.concat(b"1e400") }
-  else if mag == 0 { sign.concat(b"0.0") } else {
-    let m = if ex == 0 { fr } else { fr | 0x10000000000000 };
-    let e2 = if ex == 0 { 0 - 1074 } else { ex - 1075 };
-    let start = [m % 1000000000, m / 1000000000];
-    let ds = big_digits(if e2 >= 0 { big_pow(start, 2, e2) } else { big_pow(start, 5, 0 - e2) });
-    let x0 = ds.len() - 1 + (if e2 >= 0 { 0 } else { e2 });
-    sign.concat(float_spelling(shortest(ds, x0, mag)))
-  }
-}
-
-fn print_lit(decoder: Decoder) -> Decoded / {abort.raise} = {
-  let t = read_u8(decoder);
-  let e = t.decoder;
-  if t.value == tag_lit_int() {
-    let v = read_int(e, 8);
-    { decoder: v.decoder, text: int_text(v.value) }
-  } else if t.value == tag_lit_bool() {
-    let b = read_bool(e);
-    { decoder: b.decoder, text: if b.value { b"true" } else { b"false" } }
-  } else if t.value == tag_lit_str() {
-    let s = read_text(e);
-    { decoder: s.decoder, text: str_lit(s.text) }
-  } else if t.value == tag_lit_bytes() {
-    let s = read_text(e);
-    { decoder: s.decoder, text: bytes_lit(s.text) }
-  } else if t.value == tag_lit_embedded() {
-    // The bytes are not in the form: what prints embeds the file named by the digest's hex, which
-    // a load handed the bytes under that digest reads back as this literal.
-    let size = read_int(e, 8);
-    let digest = read_text(size.decoder);
-    { decoder: digest.decoder, text: Bytes::concat_all([b"embed(\"", hex(digest.text), b"\")"]) }
-  } else if t.value == tag_lit_float() {
-    let v = read_int(e, 8);
-    { decoder: v.decoder, text: float_text(v.value) }
-  } else if t.value == tag_lit_decimal() {
-    let m = read_bytes(e, 16);
-    let s = read_u32(m.decoder);
-    { decoder: s.decoder, text: decimal_text(m.text, s.value) }
-  } else if t.value == tag_lit_fixed() {
-    let w = read_u8(e);
-    let v = read_int(w.decoder, 8);
-    { decoder: v.decoder, text: fixed_text(w.value, v.value) }
-  } else if t.value == tag_lit_wide() {
-    let w = read_u8(e);
-    let high = read_int(w.decoder, 8);
-    let low = read_int(high.decoder, 8);
-    { decoder: low.decoder, text: wide_text(w.value, high.value, low.value) }
-  } else if t.value == tag_lit_char() {
-    let v = read_u32(e);
-    { decoder: v.decoder, text: char_lit(v.value) }
-  } else if t.value == tag_lit_unit() { { decoder: e, text: b"()" } }
-  else { panic("a tag that is not a literal") }
-}
-
-fn print_pat(outer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
-  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
-    let printer = { ..outer, room: outer.room - 1 };
-    let t = read_u8(d);
-    let e: Decoder = t.decoder;
-    if t.value == tag_p_wildcard() { { decoder: e, text: b"_" } } else if t.value == tag_p_var() {
-      { decoder: { ..e, values: e.values + 1 }, text: local_name(e.values) }
-    } else if t.value == tag_p_again() {
-      let l = read_u32(e);
-      if l.value >= e.values { panic("an alternative names a binder that is not in scope") }
-      else { { decoder: l.decoder, text: local_name(l.value) } }
-    } else if t.value == tag_p_or() {
-      // Parenthesized wherever it stands: a choice nests only so, and reads the same at the top.
-      let n = read_count(e);
-      let alts = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-      { decoder: alts.decoder, text: Bytes::concat_all([b"(", joined(alts.texts, b" | "), b")"]) }
-    } else if t.value == tag_p_lit() { print_lit(e) } else if t.value == tag_p_range() {
-      let lo = print_lit(e);
-      let hi = print_lit(lo.decoder);
-      { decoder: hi.decoder, text: Bytes::concat_all([lo.text, b"..=", hi.text]) }
-    } else if t.value == tag_p_ctor() {
-      let name = read_ctor(printer, e);
-      let n = read_count(name.decoder);
-      let args = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-      {
-        decoder: args.decoder,
-        text: if n.value == 0 { name.text }
-        else { Bytes::concat_all([name.text, b"(", joined(args.texts, b", "), b")"]) },
-      }
-    } else if t.value == tag_p_record() {
-      let n = read_count(e);
-      let fs = read_many(n.decoder, n.value, |g: Decoder| {
-        let f = read_text(g);
-        let p = print_pat(printer, f.decoder);
-        { decoder: p.decoder, text: Bytes::concat_all([f.text, b": ", p.text]) }
-      });
-      let rest = read_bool(fs.decoder);
-      {
-        decoder: rest.decoder,
-        text: Bytes::concat_all([
-          b"{",
-          joined(fs.texts, b", "),
-          if !rest.value { b"" } else if n.value > 0 { b", .." } else { b".." },
-          b"}",
-        ]),
-      }
-    } else if t.value == tag_p_list() {
-      let n = read_count(e);
-      let items = read_many(n.decoder, n.value, |g: Decoder| print_pat(printer, g));
-      let held = peek(skip(items.decoder));
-      let named = held == tag_p_var() || held == tag_p_again();
-      let rest = read_opt(items.decoder, |g: Decoder| print_pat(printer, g));
-      {
-        decoder: rest.decoder,
-        text: Bytes::concat_all([
-          b"[",
-          joined(items.texts, b", "),
-          if !rest.some { b"" } else {
-            Bytes::concat_all([
-              if n.value > 0 { b", " } else { b"" },
-              b"..",
-              if named { rest.text } else { b"" },
-            ])
-          },
-          b"]",
-        ]),
-      }
-    } else { panic("a tag that does not begin a pattern") }
-  }
-
-fn parens(decoded: Decoded, bare: Bool) -> Decoded =
-  if bare { decoded }
-  else { { decoder: decoded.decoder, text: Bytes::concat_all([b"(", decoded.text, b")"]) } }
-
-fn is_atomic(decoder: Decoder) -> Bool / {abort.raise} = {
-  let t = peek(decoder);
-  t == tag_e_lit() || t == tag_e_var() || t == tag_e_app() || t == tag_e_field()
-    || t == tag_e_list()
-    || t == tag_e_perform()
-    || t == tag_e_on_value()
-    || t == tag_e_tagged()
-    || t == tag_e_filled()
-    || t == tag_e_hole()
-}
-
-fn is_base(decoder: Decoder) -> Bool / {abort.raise} = {
-  let t = peek(decoder);
-  t == tag_e_var() || t == tag_e_app() || t == tag_e_field() || t == tag_e_perform()
-    || t == tag_e_on_value()
-}
-
-fn print_operand(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded / {abort.raise} =
-  parens(print_expr(printer, decoder, depth), is_atomic(decoder))
-
-fn print_block(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded / {abort.raise} =
-  if peek(decoder) == tag_e_block() { print_expr(printer, decoder, depth) } else {
-    let g = print_expr(printer, decoder, depth + 1);
-    {
-      decoder: g.decoder,
-      text: Bytes::concat_all([b"{", line_break(depth + 1), g.text, line_break(depth), b"}"]),
-    }
-  }
-
-fn binop_text(op: Int) -> Bytes / {abort.raise} =
-  match [
-      b"+",
-      b"-",
-      b"*",
-      b"/",
-      b"%",
-      b"==",
-      b"!=",
-      b"<",
-      b"<=",
-      b">",
-      b">=",
-      b"&&",
-      b"||",
-      b"++",
-      b"&",
-      b"|",
-      b"^",
-      b"<<",
-      b">>",
-      b">>>",
-    ].at(
-      op - 1,
-    ) {
-    Some(t) -> t,
-    None -> panic("a byte that is not a binary operator"),
-  }
-
-fn unop_text(op: Int) -> Bytes / {abort.raise} =
-  if op == 1 { b"-" }
-  else if op == 2 { b"!" }
-  else if op == 3 { b"~" }
-  else { panic("a byte that is not a unary operator") }
-
-/// `if c { t }` is the parser's own spelling of an `else ()`.
-fn print_if(printer: BodyPrinter, decoder: Decoder, depth: Int) -> Decoded / {abort.raise} = {
-  let c = print_operand(printer, decoder, depth);
-  let th = print_block(printer, c.decoder, depth);
-  let el: Decoder = th.decoder;
-  let tail: Decoded = if peek(el) == tag_e_lit() && peek(skip(el)) == tag_lit_unit() {
-    { decoder: { ..el, pos: el.pos + 2 }, text: b"" }
-  } else if peek(el) == tag_e_if() {
-    let g = print_expr(printer, el, depth);
-    { decoder: g.decoder, text: b" else ".concat(g.text) }
-  } else {
-    let g = print_block(printer, el, depth);
-    { decoder: g.decoder, text: b" else ".concat(g.text) }
-  };
-  { decoder: tail.decoder, text: Bytes::concat_all([b"if ", c.text, b" ", th.text, tail.text]) }
-}
-
-/// A call on a value, printed from where its arguments end: every function it may be follows, which
-/// the hash reads and the text does not, and which of them the check found it calls. Under the
-/// program's own names the value's type answers the call as it did; set apart, a function of a type
-/// is a plain function under another name, so the call is printed as a call of the one it calls.
-fn on_value_call(
+fn row_of(
   printer: BodyPrinter,
-  decoder: Decoder,
-  call: { on: Bytes, name: Bytes, labels: List<Bytes>, args: List<Bytes>, keys: List<Bytes>, values: List<Bytes> },
-) -> Decoded / {abort.raise} = {
-  let full = read_count(decoder);
-  let apart = printer.layout.apart;
-  let pick: Choice = match full.decoder.picks.at(full.decoder.picked) {
-    Some(c) -> c,
+  naming: Naming,
+  depth: Depth,
+  row: Row<Reference, Int>,
+) -> Spelled<RowExpr> / {abort.raise} = {
+  let atoms = named_in_turn(
+    naming,
+    row.atoms,
+    |so_far: Naming, atom: stored::Atom<Reference, Int>|
+      match atom {
+        Moded(performed, mode, label, bounded) ->
+          atom_named(printer, so_far, depth, performed, mode, None, label, bounded),
+        OfOperation(performed, operation, label, bounded) ->
+          atom_named(
+            printer,
+            so_far,
+            depth,
+            performed,
+            MWrite,
+            Some(ident(operation)),
+            label,
+            bounded,
+          ),
+      },
+  );
+  {
+    naming: atoms.naming,
+    node: {
+      atoms: atoms.node,
+      aliases: [],
+      tail: match row.tail {
+        None -> None,
+        Some(RowParameter(level)) -> if level >= depth.rows {
+          panic("a row parameter that is not in scope")
+        } else { Some(ident(row_var_name(level))) },
+        Some(RowName(name)) -> Some(ident(name)),
+      },
+      tail_bounded: row.bounded,
+      span: dummy_span(),
+    },
+  }
+}
+
+// --- Literals and patterns ---------------------------------------------------------------------
+
+fn width_name(at: Int) -> Bytes / {abort.raise} =
+  match widths().at(at) {
+    Some(width) -> width.name,
+    None -> panic("a literal of no width the lexer has"),
+  }
+
+fn literal_of(literal: Literal) -> Lit / {abort.raise} =
+  match literal {
+    IntLiteral(value) -> LInt(value),
+    FixedLiteral(width, bits) -> LFixed(width_name(width), bits),
+    WideLiteral(width, high, low) -> LWide(width_name(width), high, low),
+    BoolLiteral(value) -> LBool(value),
+    StringLiteral(text) -> LStr(text),
+    BytesLiteral(content) -> LBytes(content),
+    EmbeddedLiteral(_, _) -> panic("an embedded file where only a literal is written"),
+    FloatLiteral(bits) -> LFloat(float_text(bits)),
+    DecimalLiteral(mantissa, scale) -> LDec(decimal_text(mantissa, scale)),
+    CharLiteral(value) -> LChar(value),
+    UnitLiteral -> LUnit,
+  }
+
+fn patterns_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  originals: List<stored::Pattern<Reference, Int>>,
+) -> BoundAll / {abort.raise} =
+  originals.fold(
+    { naming: naming, depth: depth, node: [] },
+    |acc: BoundAll, original: stored::Pattern<Reference, Int>| {
+      let bound = pattern_of(printer, acc.naming, acc.depth, original);
+      { naming: bound.naming, depth: bound.depth, node: acc.node.push(bound.node) }
+    },
+  )
+
+fn pattern_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: stored::Pattern<Reference, Int>,
+) -> Bound / {abort.raise} = {
+  let span = dummy_span();
+  match original {
+    Wild -> { naming: naming, depth: depth, node: PWild({ span: span }) },
+    Bind ->
+      {
+        naming: naming,
+        depth: { ..depth, values: depth.values + 1 },
+        node: PVar({ span: span, name: ident(local_name(depth.values)) }),
+      },
+    Again(level) -> if level >= depth.values {
+      panic("an alternative names a binder that is not in scope")
+    } else {
+      { naming: naming, depth: depth, node: PVar({ span: span, name: ident(local_name(level)) }) }
+    },
+    LiteralPattern(literal) ->
+      { naming: naming, depth: depth, node: PLit({ span: span, lit: literal_of(literal) }) },
+    RangePattern(low, high) ->
+      {
+        naming: naming,
+        depth: depth,
+        node: PRange({ span: span, lo: literal_of(low), hi: literal_of(high) }),
+      },
+    ConstructorPattern(constructor, arguments) -> {
+      let name = match constructor {
+        Constructed(reference, simple) -> reference_named(printer, naming, reference, Some(simple)),
+        Unbound(free) -> { naming: naming, node: free_name(free) },
+        _ -> panic("a pattern of no constructor"),
+      };
+      let bound = patterns_of(printer, name.naming, depth, arguments);
+      {
+        naming: bound.naming,
+        depth: bound.depth,
+        node: PCtor({ span: span, name: name.node, args: bound.node }),
+      }
+    },
+    RecordPattern(fields, rest) -> {
+      let bound = fields.fold(
+        { naming: naming, depth: depth, node: [] },
+        |acc: { naming: Naming, depth: Depth, node: List<{ name: Ident, pat: Pattern }> }, field: stored::PatternField<Reference, Int>| {
+          let field_bound = pattern_of(printer, acc.naming, acc.depth, field.pattern);
+          {
+            naming: field_bound.naming,
+            depth: field_bound.depth,
+            node: acc.node.push({ name: ident(field.name), pat: field_bound.node }),
+          }
+        },
+      );
+      {
+        naming: bound.naming,
+        depth: bound.depth,
+        node: PRecord({ span: span, rest: rest, fields: bound.node }),
+      }
+    },
+    ListPattern(items, rest) -> {
+      let bound = patterns_of(printer, naming, depth, items);
+      match rest {
+        None ->
+          {
+            naming: bound.naming,
+            depth: bound.depth,
+            node: PList({ span: span, rest: None, items: bound.node }),
+          },
+        Some(tail) -> {
+          let tail_bound = pattern_of(printer, bound.naming, bound.depth, tail);
+          {
+            naming: tail_bound.naming,
+            depth: tail_bound.depth,
+            node: PList({ span: span, rest: Some(tail_bound.node), items: bound.node }),
+          }
+        },
+      }
+    },
+    OrPattern(alternatives) -> {
+      let bound = patterns_of(printer, naming, depth, alternatives);
+      { naming: bound.naming, depth: bound.depth, node: POr({ span: span, alts: bound.node }) }
+    },
+  }
+}
+
+// --- Expressions -------------------------------------------------------------------------------
+
+type StoredExpression = stored::Expression<Reference, Int, Int, Unit>
+
+type StoredStatement = stored::Statement<Reference, Int, Int, Unit>
+
+fn expressions_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  expressions: List<StoredExpression>,
+) -> Spelled<List<Expr>> / {abort.raise} =
+  named_in_turn(naming, expressions, |so_far: Naming, each: StoredExpression|
+    expression_of(printer, so_far, depth, each))
+
+fn optional_expression_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  expression: Option<StoredExpression>,
+) -> Spelled<Option<Expr>> / {abort.raise} =
+  named_if_any(naming, expression, |so_far: Naming, present: StoredExpression|
+    expression_of(printer, so_far, depth, present))
+
+fn fields_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  fields: List<stored::RecordField<Reference, Int, Int, Unit>>,
+) -> Spelled<List<RecField>> / {abort.raise} =
+  named_in_turn(
+    naming,
+    fields,
+    |so_far: Naming, field: stored::RecordField<Reference, Int, Int, Unit>| {
+      let value = expression_of(printer, so_far, depth, field.value);
+      { naming: value.naming, node: { name: ident(field.name), value: value.node } }
+    },
+  )
+
+/// A call on a value. Under the program's own names the value's type answers the call as it did;
+/// set apart, a function of a type is a plain function under another name, so the call is printed
+/// as a call of the one it calls. A printed function's parameters are named by their places, so an
+/// argument the call names is named so too, where the check said which parameter it fills.
+fn on_value_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  call: stored::OnValueCall<Reference, Int, Int, Unit>,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  let base = expression_of(printer, naming, depth, call.base);
+  let arguments = expressions_of(printer, base.naming, depth, call.arguments);
+  let given = fields_of(printer, arguments.naming, depth, call.named);
+  let choice: Choice = match given.naming.picks.at(given.naming.picked) {
+    Some(found) -> found,
     None -> { callee: 0 - 1, named: [] },
   };
-  let after = { ..full.decoder, picked: full.decoder.picked + 1 };
-  // A printed function's parameters are named by their places, so an argument a call names is
-  // named so too, where the check said which parameter it fills.
-  let named = range(0, call.keys.len()).map(|j: Int|
-    Bytes::concat_all([
-      if pick.named.len() == call.keys.len() { local_name(pick.named.get(j)) }
-      else { call.keys.get(j) },
-      b": ",
-      call.values.get(j),
-    ]));
-  let callee: Decoded = if full.value == 1 {
-    read_value(printer, expect(after, tag_e_var(), b"a function named in full"))
-  } else {
-    let c = read_count(after);
-    let chosen = if apart { pick.callee } else { 0 - 1 };
-    range(0, c.value).fold({ decoder: c.decoder, text: b"" }, |acc: Decoded, i: Int| {
-      let r = read_ref(printer, acc.decoder);
-      if i == chosen { qname(printer, r, None) }
-      else if chosen >= 0 { { decoder: r.decoder, text: acc.text } }
-      else { { decoder: seen(printer, r), text: acc.text } }
-    })
+  let after = { ..given.naming, picked: given.naming.picked + 1 };
+  let named_arguments = range(0, given.node.len()).map(|i: Int|
+    {
+      name: if choice.named.len() == given.node.len() { ident(local_name(choice.named.get(i))) }
+      else { given.node.get(i).name },
+      value: given.node.get(i).value,
+      span: span,
+    });
+  let labels = call.labels.map(|label: Label| label_of(depth, label));
+  let apart = printer.layout.apart;
+  let local = match call.base {
+    Variable(value) -> match value.named { Local(_) -> true, _ -> false },
+    _ -> false,
   };
-  let passed = |first: List<Bytes>|
-    Bytes::concat_all([
-      if call.labels == [] { b"" }
-      else { Bytes::concat_all([b"[", joined(call.labels, b", "), b"]"]) },
-      b"(",
-      joined(first.concat(call.args).concat(named), b", "),
-      b")",
-    ]);
-  {
-    decoder: callee.decoder,
-    text: if callee.text.len() == 0 { Bytes::concat_all([call.on, b".", call.name, passed([])]) }
-    else if apart { callee.text.concat(passed([call.on])) }
-    else { Bytes::concat_all([call.on, b".", callee.text, passed([])]) },
+  let on_value = |field: Bytes| {
+    let written = EApp({
+      span: span,
+      func: EField({ span: span, base: base.node, field: ident(field) }),
+      named: named_arguments,
+      args: arguments.node,
+      labels: labels,
+    });
+    // A call on a local is written as a perform on it, which is how the parser reads one.
+    match base.node {
+      EVar(variable) -> if local && named_arguments.len() == 0 && labels.len() <= 1
+          && field.index_of(b"::") == None {
+        EPerform({
+          span: span,
+          eff: variable.name,
+          op: ident(field),
+          resource: labels.at(0),
+          args: arguments.node,
+        })
+      } else { written },
+      _ -> written,
+    }
+  };
+  let plain = |callee: QName|
+    EApp({
+      span: span,
+      func: EVar({ span: span, name: callee }),
+      named: named_arguments,
+      args: List::concat([base.node], arguments.node),
+      labels: labels,
+    });
+  match call.callees {
+    InFull(value) -> {
+      let name = value_named(printer, after, depth, value);
+      {
+        naming: name.naming,
+        node: if apart { plain(name.node) } else { on_value(qualified_text(name.node)) },
+      }
+    },
+    Among(references) -> {
+      let chosen = if apart { choice.callee } else { 0 - 1 };
+      let walked = range(0, references.len()).fold(
+        { naming: after, node: None },
+        |acc: Spelled<Option<QName>>, i: Int| {
+          let target = target_of(printer, acc.naming, references.get(i));
+          if i == chosen {
+            let name = named(printer, target.naming, target.node, None);
+            { naming: name.naming, node: Some(name.node) }
+          } else if chosen >= 0 { { naming: target.naming, node: acc.node } }
+          else { { naming: seen(printer, target.naming, target.node), node: acc.node } }
+        },
+      );
+      {
+        naming: walked.naming,
+        node: match walked.node { Some(name) -> plain(name), None -> on_value(call.name) },
+      }
+    },
   }
 }
 
-fn print_expr(outer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} =
-  if outer.room <= 0 { panic("a body nested deeper than its own length") } else {
-    let printer = { ..outer, room: outer.room - 1 };
-    let t = read_u8(d);
-    let e = t.decoder;
-    let inner = depth + 1;
-    if t.value == tag_e_lit() { print_lit(e) }
-    else if t.value == tag_e_hole() { { decoder: e, text: b"???" } }
-    else if t.value == tag_e_var() { read_value(printer, e) } else if t.value == tag_e_binary() {
-      let op = read_u8(e);
-      let l = print_operand(printer, op.decoder, depth);
-      let r = print_operand(printer, l.decoder, depth);
+fn expression_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: StoredExpression,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  match original {
+    // The bytes are not in the form: what prints embeds the file named by the digest's hex, which a
+    // load handed the bytes under that digest reads back as this literal.
+    Constant(EmbeddedLiteral(digest, _)) ->
       {
-        decoder: past_written(r.decoder),
-        text: Bytes::concat_all([l.text, b" ", binop_text(op.value), b" ", r.text]),
-      }
-    } else if t.value == tag_e_unary() {
-      let op = read_u8(e);
-      let o = print_operand(printer, op.decoder, depth);
-      { decoder: o.decoder, text: unop_text(op.value).concat(o.text) }
-    } else if t.value == tag_e_lambda() {
-      let n = read_count(e);
-      let anns: DecodedList = read_many(n.decoder, n.value, |g: Decoder| {
-        let o = read_opt(g, |h: Decoder| print_type(printer, h));
-        { decoder: o.decoder, text: prefixed(o, b": ") }
-      });
-      let base = anns.decoder.values;
-      let body: Decoded = print_expr(printer, { ..anns.decoder, values: base + n.value }, depth);
-      let ps = range(0, n.value).map(|i: Int| local_name(base + i).concat(anns.texts.get(i)));
+        naming: naming,
+        node: EApp({
+          span: span,
+          func: EVar({ span: span, name: unqualified(b"embed") }),
+          named: [],
+          args: [ELit({ span: span, lit: LStr(hex(digest)) })],
+          labels: [],
+        }),
+      },
+    Constant(literal) -> { naming: naming, node: ELit({ span: span, lit: literal_of(literal) }) },
+    Unwritten -> { naming: naming, node: EHole({ span: span, text: b"???" }) },
+    Variable(value) -> {
+      let name = value_named(printer, naming, depth, value);
+      { naming: name.naming, node: EVar({ span: span, name: name.node }) }
+    },
+    Binary(operator, left, right, _) -> {
+      let spelled_left = expression_of(printer, naming, depth, left);
+      let spelled_right = expression_of(printer, spelled_left.naming, depth, right);
       {
-        decoder: { ..body.decoder, values: base },
-        text: Bytes::concat_all([
-          if n.value == 0 { b"||" } else { Bytes::concat_all([b"|", joined(ps, b", "), b"|"]) },
-          b" ",
-          body.text,
-        ]),
+        naming: spelled_right.naming,
+        node: EBinary({
+          span: span,
+          op: operator,
+          lhs: spelled_left.node,
+          rhs: spelled_right.node,
+        }),
       }
-    } else if t.value == tag_e_app() {
-      // `r.f(x)` performs an effect, so a call through anything but a name is parenthesized.
-      let f = parens(print_expr(printer, e, depth), peek(e) == tag_e_var());
-      let n = read_count(f.decoder);
-      let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-      let ln = read_count(args.decoder);
-      let ls = read_many(ln.decoder, ln.value, read_label);
+    },
+    Unary(operator, operand) -> {
+      let spelled = expression_of(printer, naming, depth, operand);
+      { naming: spelled.naming, node: EUnary({ span: span, op: operator, operand: spelled.node }) }
+    },
+    Lambda(annotations, body) -> {
+      let spelled_annotations = named_in_turn(
+        naming,
+        annotations,
+        |so_far: Naming, annotation: Option<Type<Reference, Int>>|
+          optional_type_of(printer, so_far, depth, annotation),
+      );
+      let spelled_body = expression_of(
+        printer,
+        spelled_annotations.naming,
+        { ..depth, values: depth.values + annotations.len() },
+        body,
+      );
       {
-        decoder: ls.decoder,
-        text: Bytes::concat_all([
-          f.text,
-          if ln.value == 0 { b"" }
-          else { Bytes::concat_all([b"[", joined(ls.texts, b", "), b"]"]) },
-          b"(",
-          joined(args.texts, b", "),
-          b")",
-        ]),
+        naming: spelled_body.naming,
+        node: ELambda({
+          span: span,
+          body: spelled_body.node,
+          params: range(0, annotations.len()).map(|i: Int|
+            {
+              name: ident(local_name(depth.values + i)),
+              keep: false,
+              ty: spelled_annotations.node.get(i),
+              cost: None,
+              space: None,
+              default: None,
+              span: span,
+            }),
+          ret: None,
+        }),
       }
-    } else if t.value == tag_e_if() { print_if(printer, e, depth) }
-    else if t.value == tag_e_match() {
-      let s = print_operand(printer, e, depth);
-      let n = read_count(s.decoder);
-      let arms = read_many(n.decoder, n.value, |g: Decoder| {
-        let p = print_pat(printer, expect(g, tag_arm(), b"a match arm"));
-        let guard = read_opt(p.decoder, |h: Decoder| print_expr(printer, h, inner));
-        let body: Decoded = print_expr(printer, guard.decoder, inner);
-        {
-          decoder: { ..body.decoder, values: g.values },
-          text: Bytes::concat_all([
-            line_break(inner),
-            p.text,
-            prefixed(guard, b" if "),
-            b" -> ",
-            body.text,
-            b",",
-          ]),
-        }
-      });
+    },
+    Call(callee, arguments, labels) -> {
+      let spelled_callee = expression_of(printer, naming, depth, callee);
+      let spelled_arguments = expressions_of(printer, spelled_callee.naming, depth, arguments);
       {
-        decoder: arms.decoder,
-        text: Bytes::concat_all([
-          b"match ",
-          s.text,
-          b" {",
-          Bytes::concat_all(arms.texts),
-          line_break(depth),
-          b"}",
-        ]),
+        naming: spelled_arguments.naming,
+        node: EApp({
+          span: span,
+          func: spelled_callee.node,
+          named: [],
+          args: spelled_arguments.node,
+          labels: labels.map(|label: Label| label_of(depth, label)),
+        }),
       }
-    } else if t.value == tag_e_block() {
-      let n = read_count(e);
-      let stmts = read_many(n.decoder, n.value, |g: Decoder| {
-        let s = print_stmt(printer, g, inner);
-        { decoder: s.decoder, text: line_break(inner).concat(s.text) }
-      });
-      let tail: DecodedOption = read_opt(stmts.decoder, |g: Decoder| print_expr(printer, g, inner));
+    },
+    OnValue(call) -> on_value_of(printer, naming, depth, call),
+    If(condition, then_branch, else_branch) -> {
+      let spelled_condition = expression_of(printer, naming, depth, condition);
+      let spelled_then = expression_of(printer, spelled_condition.naming, depth, then_branch);
+      let spelled_else = expression_of(printer, spelled_then.naming, depth, else_branch);
+      // `if c { t }` is the parser's own spelling of an `else ()`.
+      let otherwise = match spelled_else.node {
+        ELit(literal) -> match literal.lit {
+          LUnit -> spelled_else.node,
+          _ -> as_block(spelled_else.node),
+        },
+        EIf(_) -> spelled_else.node,
+        _ -> as_block(spelled_else.node),
+      };
       {
-        decoder: { ..tail.decoder, values: e.values },
-        text: Bytes::concat_all([
-          b"{",
-          Bytes::concat_all(stmts.texts),
-          prefixed(tail, line_break(inner)),
-          line_break(depth),
-          b"}",
-        ]),
+        naming: spelled_else.naming,
+        node: EIf({
+          span: span,
+          cond: spelled_condition.node,
+          then_branch: as_block(spelled_then.node),
+          else_branch: otherwise,
+        }),
       }
-    } else if t.value == tag_e_record() {
-      let n = read_count(e);
-      let fs = read_many(n.decoder, n.value, |g: Decoder| {
-        let f = read_text(g);
-        let v = print_expr(printer, f.decoder, depth);
-        { decoder: v.decoder, text: Bytes::concat_all([f.text, b": ", v.text]) }
-      });
-      { decoder: fs.decoder, text: Bytes::concat_all([b"{", joined(fs.texts, b", "), b"}"]) }
-    } else if t.value == tag_e_record_update() {
-      let b = print_expr(printer, e, depth);
-      let n = read_count(b.decoder);
-      let fs = read_many(n.decoder, n.value, |g: Decoder| {
-        let f = read_text(g);
-        let v = print_expr(printer, f.decoder, depth);
-        { decoder: v.decoder, text: Bytes::concat_all([f.text, b": ", v.text]) }
-      });
-      {
-        decoder: fs.decoder,
-        text: Bytes::concat_all([
-          b"{..",
-          b.text,
-          if n.value > 0 { b", " } else { b"" },
-          joined(fs.texts, b", "),
-          b"}",
-        ]),
-      }
-    } else if t.value == tag_e_on_value() {
-      let on = parens(print_expr(printer, e, depth), is_base(e));
-      let name = read_text(on.decoder);
-      let ln = read_count(name.decoder);
-      let ls = read_many(ln.decoder, ln.value, read_label);
-      let n = read_count(ls.decoder);
-      let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-      let k = read_count(args.decoder);
-      let named = range(0, k.value).fold(
-        { decoder: k.decoder, keys: [], values: [] },
-        |acc: { decoder: Decoder, keys: List<Bytes>, values: List<Bytes> }, _j: Int| {
-          let key = read_text(acc.decoder);
-          let value: Decoded = print_expr(printer, key.decoder, depth);
+    },
+    Match(scrutinee, arms) -> {
+      let spelled_scrutinee = expression_of(printer, naming, depth, scrutinee);
+      let spelled_arms = named_in_turn(
+        spelled_scrutinee.naming,
+        arms,
+        |so_far: Naming, arm: stored::Arm<Reference, Int, Int, Unit>| {
+          let bound = pattern_of(printer, so_far, depth, arm.pattern);
+          let guard = optional_expression_of(printer, bound.naming, bound.depth, arm.guard);
+          let body = expression_of(printer, guard.naming, bound.depth, arm.body);
           {
-            decoder: value.decoder,
-            keys: acc.keys.push(key.text),
-            values: acc.values.push(value.text),
+            naming: body.naming,
+            node: { pat: bound.node, guard: guard.node, body: body.node, span: span },
           }
         },
       );
-      on_value_call(printer, named.decoder, {
-        on: on.text,
-        name: name.text,
-        labels: ls.texts,
-        args: args.texts,
-        keys: named.keys,
-        values: named.values,
-      })
-    } else if t.value == tag_e_field() {
-      let b = parens(print_expr(printer, e, depth), is_base(e));
-      let f = read_text(b.decoder);
-      { decoder: f.decoder, text: Bytes::concat_all([b.text, b".", f.text]) }
-    } else if t.value == tag_e_list() {
-      let n = read_count(e);
-      let items = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
-      { decoder: items.decoder, text: Bytes::concat_all([b"[", joined(items.texts, b", "), b"]"]) }
-    } else if t.value == tag_e_perform() {
-      let eff = read_effect(printer, e);
-      let op = read_text(eff.decoder);
-      let r = read_opt(op.decoder, read_label);
-      let n = read_count(r.decoder);
-      let args = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
       {
-        decoder: args.decoder,
-        text: Bytes::concat_all([
-          eff.text,
-          b".",
-          op.text,
-          bracketed(r),
-          b"(",
-          joined(args.texts, b", "),
-          b")",
-        ]),
+        naming: spelled_arms.naming,
+        node: EMatch({ span: span, scrutinee: spelled_scrutinee.node, arms: spelled_arms.node }),
       }
-    } else if t.value == tag_e_handle() {
-      let body = print_expr(printer, e, depth);
-      print_handled(
+    },
+    Record(fields) -> {
+      let spelled = fields_of(printer, naming, depth, fields);
+      { naming: spelled.naming, node: ERecord({ span: span, fields: spelled.node }) }
+    },
+    RecordUpdate(base, fields) -> {
+      let spelled_base = expression_of(printer, naming, depth, base);
+      let spelled_fields = fields_of(printer, spelled_base.naming, depth, fields);
+      {
+        naming: spelled_fields.naming,
+        node: ERecordUpdate({ span: span, base: spelled_base.node, fields: spelled_fields.node }),
+      }
+    },
+    Field(base, name) -> {
+      let spelled = expression_of(printer, naming, depth, base);
+      {
+        naming: spelled.naming,
+        node: EField({ span: span, base: spelled.node, field: ident(name) }),
+      }
+    },
+    ListOf(items) -> {
+      let spelled = expressions_of(printer, naming, depth, items);
+      { naming: spelled.naming, node: EList({ span: span, items: spelled.node }) }
+    },
+    Perform(performed, operation, label, arguments) -> {
+      let effect_name = effect_named(printer, naming, performed);
+      let spelled_arguments = expressions_of(printer, effect_name.naming, depth, arguments);
+      {
+        naming: spelled_arguments.naming,
+        node: EPerform({
+          span: span,
+          eff: effect_name.node,
+          op: ident(operation),
+          resource: optional_label_of(depth, label),
+          args: spelled_arguments.node,
+        }),
+      }
+    },
+    Handle(handled) -> handle_of(printer, naming, depth, handled),
+    WithHold(resource, acquire, release, body) -> {
+      let spelled_acquire = expression_of(printer, naming, depth, acquire);
+      let spelled_release = expression_of(printer, spelled_acquire.naming, depth, release);
+      let spelled_body = expression_of(
         printer,
-        body.decoder,
-        depth,
-        Bytes::concat_all([b"handle ", body.text, b" with {"]),
-      )
-    } else if t.value == tag_e_handle_vars() {
-      let n = read_count(e);
-      let level = n.decoder.values;
-      let inits = range(0, n.value).fold(
-        { decoder: n.decoder, texts: [] },
-        |acc: { decoder: Decoder, texts: List<Bytes> }, i: Int| {
-          let ty = read_opt({ ..acc.decoder, values: level + i }, |h: Decoder|
-            print_type(printer, h));
-          let v = print_expr(printer, ty.decoder, inner);
-          {
-            decoder: { ..v.decoder, values: level },
-            texts: acc.texts.push(Bytes::concat_all([prefixed(ty, b": "), b" = ", v.text])),
-          }
-        },
+        spelled_release.naming,
+        { ..depth, values: depth.values + 1 },
+        body,
       );
-      let body = print_expr(printer, inits.decoder, depth);
-      let vars = range(0, n.value).map(|i: Int|
-        Bytes::concat_all([
-          line_break(inner),
-          b"var ",
-          local_name(level + i),
-          inits.texts.get(i),
-          b",",
-        ]));
-      let h = print_handled(
-        printer,
-        { ..body.decoder, values: level + n.value },
-        depth,
-        Bytes::concat_all([b"handle ", body.text, b" with {", Bytes::concat_all(vars)]),
-      );
-      { ..h, decoder: { ..h.decoder, values: level } }
-    } else if t.value == tag_e_with_hold() {
-      let r = read_text(e);
-      let acquire: Decoded = print_expr(printer, r.decoder, depth);
-      let release: Decoded = print_expr(printer, acquire.decoder, depth);
-      let level = release.decoder.values;
-      let body: Decoded = print_expr(printer, { ..release.decoder, values: level + 1 }, inner);
       {
-        decoder: { ..body.decoder, values: level },
-        text: Bytes::concat_all([
-          b"with_hold[",
-          r.text,
-          b"](",
-          acquire.text,
-          b", ",
-          release.text,
-          b") {",
-          line_break(inner),
-          local_name(level),
-          b" -> ",
-          body.text,
-          line_break(depth),
-          b"}",
-        ]),
+        naming: spelled_body.naming,
+        node: EWithHold({
+          span: span,
+          resource: ident(resource),
+          acquire: spelled_acquire.node,
+          release: spelled_release.node,
+          binder: ident(local_name(depth.values)),
+          body: spelled_body.node,
+        }),
       }
-    } else if t.value == tag_e_simulate() {
-      let body = print_block(printer, e, depth);
-      { decoder: body.decoder, text: b"simulate ".concat(body.text) }
-    } else if t.value == tag_e_parallel() {
-      let n = read_count(e);
-      let branches = read_many(n.decoder, n.value, |g: Decoder| print_expr(printer, g, depth));
+    },
+    Simulate(body) -> {
+      let spelled = expression_of(printer, naming, depth, body);
+      { naming: spelled.naming, node: ESimulate({ span: span, body: as_block(spelled.node) }) }
+    },
+    Parallel(branches) -> {
+      let spelled = expressions_of(printer, naming, depth, branches);
+      { naming: spelled.naming, node: EParallel({ span: span, branches: spelled.node }) }
+    },
+    Tagged(parser, text) -> {
+      let parser_target = parsed_by(printer, naming, parser);
+      let tag = tag_binder(printer, parser_target.naming, parser_target.node, b"literal", None);
       {
-        decoder: branches.decoder,
-        text: Bytes::concat_all([b"parallel { ", joined(branches.texts, b", "), b" }"]),
+        naming: tag.naming,
+        node: ETagged({ span: span, tag: tag.node, text: text, quoted: span, holes: [] }),
       }
-    } else if t.value == tag_e_try_block() {
-      let named = read_opt(e, |g: Decoder| {
-        let eff = read_effect(printer, g);
-        let op = read_text(eff.decoder);
-        { decoder: op.decoder, text: Bytes::concat_all([b"[", eff.text, b".", op.text, b"]"]) }
-      });
-      let body = print_block(printer, named.decoder, depth);
-      { decoder: body.decoder, text: Bytes::concat_all([b"try", named.text, b" ", body.text]) }
-    } else if t.value == tag_e_tagged() {
-      let tag = tag_binder(printer, read_ref(printer, e), b"literal", None);
-      let text = read_tag_text(tag.decoder);
-      { decoder: text.decoder, text: Bytes::concat_all([tag.text, b"\"", text.text, b"\""]) }
-    } else if t.value == tag_e_filled() {
-      let parser = read_ref(printer, e);
-      let filler = read_ref(printer, parser.decoder);
+    },
+    Filled(parser, filler, head, holes) -> {
+      let parser_target = parsed_by(printer, naming, parser);
+      let filler_target = parsed_by(printer, parser_target.naming, filler);
       let tag = tag_binder(
         printer,
-        { ..parser, decoder: filler.decoder },
+        filler_target.naming,
+        parser_target.node,
         b"compile",
-        Some(filler.hash),
+        Some(filler_target.node.hash),
       );
-      let n = read_count(tag.decoder);
-      let head = read_tag_text(n.decoder);
-      let rest = read_many(head.decoder, n.value, |g: Decoder| {
-        let hole = print_expr(printer, g, depth);
-        let text = read_tag_text(hole.decoder);
-        // A hole that opens with a brace of its own is set off from it: `{{` is a brace of the text.
-        let open = if hole.text.starts_with(b"{") { b"{ " } else { b"{" };
-        { decoder: text.decoder, text: Bytes::concat_all([open, hole.text, b"}", text.text]) }
-      });
+      let spelled_holes = named_in_turn(
+        tag.naming,
+        holes,
+        |so_far: Naming, hole: stored::FilledHole<Reference, Int, Int, Unit>| {
+          let value = expression_of(printer, so_far, depth, hole.value);
+          { naming: value.naming, node: { value: value.node, text: hole.text, quoted: span } }
+        },
+      );
       {
-        decoder: rest.decoder,
-        text: Bytes::concat_all([tag.text, b"\"", head.text, Bytes::concat_all(rest.texts), b"\""]),
+        naming: spelled_holes.naming,
+        node: ETagged({
+          span: span,
+          tag: tag.node,
+          text: head,
+          quoted: span,
+          holes: spelled_holes.node,
+        }),
       }
-    } else {
-      panic(
-        String::of_bytes(
-          b"a tag that does not begin an expression: ".concat(ascii_of_int(t.value)),
-        ),
-      )
-    }
+    },
+    TryBlock(raised, body) -> {
+      let spelled_raised = match raised {
+        None -> { naming: naming, node: None },
+        Some(given) -> {
+          let effect_name = effect_named(printer, naming, given.effect);
+          {
+            naming: effect_name.naming,
+            node: Some({ eff: effect_name.node, op: ident(given.operation) }),
+          }
+        },
+      };
+      let spelled_body = expression_of(printer, spelled_raised.naming, depth, body);
+      {
+        naming: spelled_body.naming,
+        node: ETryBlock({
+          span: span,
+          raise: spelled_raised.node,
+          body: as_block(spelled_body.node),
+        }),
+      }
+    },
+    Block(entries, tail) -> {
+      let said = |acc: { naming: Naming, depth: Depth, node: List<Stmt> }, statement: StoredStatement| {
+        let spelled = statement_of(printer, acc.naming, acc.depth, statement);
+        { naming: spelled.naming, depth: spelled.depth, node: acc.node.push(spelled.node) }
+      };
+      let statements = entries.fold(
+        { naming: naming, depth: depth, node: [] },
+        |acc: { naming: Naming, depth: Depth, node: List<Stmt> }, entry: stored::Entry<Reference, Int, Int, Unit>|
+          match entry {
+            One(statement) -> said(acc, statement),
+            Commuting(_, members) -> members.fold(acc, said),
+          },
+      );
+      let spelled_tail = optional_expression_of(printer, statements.naming, statements.depth, tail);
+      {
+        naming: spelled_tail.naming,
+        node: EBlock({ span: span, tail: spelled_tail.node, stmts: statements.node }),
+      }
+    },
   }
+}
 
-/// A `handle`'s clauses and `return` after its body, `head` the text through its `with {`.
-fn print_handled(
+/// The value a tagged literal's parser or filler is: a definition, which names the module it is of.
+fn parsed_by(
   printer: BodyPrinter,
-  d: Decoder,
-  depth: Int,
-  head: Bytes,
-) -> Decoded / {abort.raise} = {
-  let inner = depth + 1;
-  let n = read_count(d);
-  let clauses = read_many(n.decoder, n.value, |g: Decoder| {
-    let eff = read_effect(printer, expect(g, tag_clause(), b"a handler clause"));
-    let op = read_text(eff.decoder);
-    let r = read_opt(op.decoder, read_label);
-    let k: DecodedInt = read_binders(r.decoder);
-    let bound = g.values + k.value;
-    let resumed: DecodedOption = read_opt({ ..k.decoder, values: bound }, |h: Decoder|
-      { decoder: h, text: b" resume ".concat(local_name(bound)) });
-    let cb: Decoded = print_expr(
-      printer,
-      { ..resumed.decoder, values: if resumed.some { bound + 1 } else { bound } },
-      inner,
-    );
-    {
-      decoder: { ..cb.decoder, values: g.values },
-      text: Bytes::concat_all([
-        line_break(inner),
-        eff.text,
-        b".",
-        op.text,
-        bracketed(r),
-        b"(",
-        joined(range(0, k.value).map(|i: Int| local_name(g.values + i)), b", "),
-        b")",
-        resumed.text,
-        b" -> ",
-        cb.text,
-        b",",
-      ]),
-    }
-  });
-  let ret = read_opt(clauses.decoder, |g: Decoder| {
-    let h: Decoder = expect(g, tag_return_clause(), b"a return clause");
-    let rb: Decoded = print_expr(printer, { ..h, values: g.values + 1 }, inner);
-    {
-      decoder: { ..rb.decoder, values: g.values },
-      text: Bytes::concat_all([
-        line_break(inner),
-        b"return ",
-        local_name(g.values),
-        b" -> ",
-        rb.text,
-        b",",
-      ]),
-    }
-  });
-  {
-    decoder: ret.decoder,
-    text: Bytes::concat_all([
-      head,
-      Bytes::concat_all(clauses.texts),
-      ret.text,
-      line_break(depth),
-      b"}",
-    ]),
+  naming: Naming,
+  value: Value<Reference, Int>,
+) -> Spelled<Target> / {abort.raise} =
+  match value.named {
+    Defined(reference) -> target_of(printer, naming, reference),
+    _ -> panic("a tagged literal whose parser is no definition"),
   }
-}
 
-fn print_stmt(printer: BodyPrinter, d: Decoder, depth: Int) -> Decoded / {abort.raise} = {
-  let t = read_u8(d);
-  if t.value == tag_s_let() {
-    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
-    let v = print_expr(printer, ty.decoder, depth);
-    let p = print_pat(printer, v.decoder);
-    {
-      decoder: p.decoder,
-      text: Bytes::concat_all([b"let ", p.text, prefixed(ty, b": "), b" = ", v.text, b";"]),
-    }
-  } else if t.value == tag_s_let_else() {
-    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
-    // Parenthesized unless it is atomic: an `if` with no `else` would take the statement's.
-    let v = print_operand(printer, ty.decoder, depth);
-    let p = print_pat(printer, v.decoder);
-    let fallback = print_block(printer, p.decoder, depth);
-    {
-      decoder: fallback.decoder,
-      text: Bytes::concat_all([
-        b"let ",
-        p.text,
-        prefixed(ty, b": "),
-        b" = ",
-        v.text,
-        b" else ",
-        fallback.text,
-        b";",
-      ]),
-    }
-  } else if t.value == tag_s_expr() {
-    let g = print_expr(printer, t.decoder, depth);
-    { decoder: g.decoder, text: g.text.concat(b";") }
-  } else if t.value == tag_s_assign() {
-    let target = read_value(printer, t.decoder);
-    let v = print_expr(printer, target.decoder, depth);
-    { decoder: v.decoder, text: Bytes::concat_all([target.text, b" = ", v.text, b";"]) }
-  } else { panic("a tag that does not begin a statement") }
-}
-
-fn print_param_slot(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} = {
-  let t = read_u8(d);
-  if t.value == tag_none() { { decoder: t.decoder, text: b"" } } else if t.value == tag_some() {
-    let ty = print_type(printer, t.decoder);
-    { decoder: ty.decoder, text: b": ".concat(ty.text) }
-  } else if t.value == tag_param_default() {
-    let ty = read_opt(t.decoder, |g: Decoder| print_type(printer, g));
-    let v = print_expr(printer, ty.decoder, 0);
-    { decoder: v.decoder, text: Bytes::concat_all([prefixed(ty, b": "), b" = ", v.text]) }
-  } else { panic("a tag that does not open a parameter") }
-}
-
-fn print_constraint(d: Decoder) -> Decoded / {abort.raise} = {
-  let l = read_u32(expect(d, tag_constraint(), b"a constraint"));
-  let k = read_u8(l.decoder);
-  match constraint_kinds().fold(None, |acc: Option<Deriver>, deriver: Deriver|
-      if deriver_byte(deriver) == k.value { Some(deriver) } else { acc }) {
-    Some(d) -> { decoder: k.decoder, text: constraint_written(d, type_var_name(l.value)) },
-    None -> panic("a byte that is not a deriver"),
-  }
-}
-
-fn print_fn(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
-  let tc = read_binders(expect(d, tag_fn(), b"a function"));
-  let ec: DecodedInt = read_binders(tc.decoder);
-  let lc: DecodedInt = read_binders(ec.decoder);
-  let generics = generic_list(tc.value, ec.value, lc.value);
-  let n = read_count({ ..lc.decoder, types: tc.value, rows: ec.value, labels: lc.value });
-  let ps = read_many(n.decoder, n.value, |g: Decoder| print_param_slot(printer, g));
-  let ret = read_opt(ps.decoder, |g: Decoder| print_ret(printer, g));
-  let row = read_opt(ret.decoder, |g: Decoder| print_row(printer, g, true));
-  let cs = read_count(row.decoder);
-  let derives: DecodedList = read_many(cs.decoder, cs.value, print_constraint);
-  let bound: Decoder = { ..derives.decoder, values: n.value };
-  let shared: Decoded = if peek(bound) == tag_returns_fresh() {
-    { decoder: skip(bound), text: b"\n  returns fresh" }
-  } else if peek(bound) == tag_returns_param() {
-    let i = read_u32(skip(bound));
-    if i.value >= n.value { panic("a `returns` clause names a parameter out of scope") }
-    else { { decoder: i.decoder, text: b"\n  returns ".concat(local_name(i.value)) } }
-  } else { { decoder: bound, text: b"" } };
-  let scoped: Decoder = shared.decoder;
-  let measure: DecodedOption = if peek(scoped) != tag_decreases() {
-    { decoder: scoped, text: b"", some: false }
-  } else {
-    let m = print_expr(printer, expect(scoped, tag_decreases(), b"a measure"), 0);
-    { decoder: m.decoder, text: m.text, some: true }
-  };
-  let baked = peek(measure.decoder) == tag_const();
-  let body = print_expr(
-    printer,
-    if baked { past_written(skip(measure.decoder)) } else { measure.decoder },
-    0,
-  );
-  {
-    decoder: body.decoder,
-    text: Bytes::concat_all([
-      if baked { b"const fn " } else { b"fn " },
-      name,
-      generics,
-      b"(",
-      joined(range(0, n.value).map(|i: Int| local_name(i).concat(ps.texts.get(i))), b", "),
-      b")",
-      prefixed(ret, b" -> "),
-      prefixed(row, b" / "),
-      if cs.value > 0 { b" where ".concat(joined(derives.texts, b", ")) } else { b"" },
-      shared.text,
-      if measure.some { b"\n  decreases ".concat(measure.text) } else { b"" },
-      b" =\n  ",
-      body.text,
-    ]),
-  }
-}
-
-fn type_binders(count: Int) -> Bytes = generic_list(count, 0, 0)
-
-// A generic list of that many type, row and label binders, each named by its level.
-fn generic_list(types: Int, rows: Int, labels: Int) -> Bytes =
-  angled(
-    range(0, types).map(type_var_name),
-    range(0, labels).map(label_name),
-    range(0, rows).map(row_var_name),
-  )
-
-fn print_type_def(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
-  let over = peek(d) == tag_type_over();
-  let n: DecodedInt = read_binders(
-    expect(d, if over { tag_type_over() } else { tag_type() }, b"a type"),
-  );
-  let ec: DecodedInt = if over { read_binders(n.decoder) }
-  else { { decoder: n.decoder, value: 0 } };
-  let lc: DecodedInt = if over { read_binders(ec.decoder) }
-  else { { decoder: ec.decoder, value: 0 } };
-  let scoped: Decoder = { ..lc.decoder, types: n.value, rows: ec.value, labels: lc.value };
-  let cs = read_count(scoped);
-  let derives: DecodedList = read_many(cs.decoder, cs.value, print_constraint);
-  let k = read_u8(derives.decoder);
-  // Every variant keeps its `|`: a single-variant sum without one reads as an alias.
-  let body: Decoded = if k.value == tag_type_alias() { print_type(printer, k.decoder) }
-  else if k.value == tag_type_sum() {
-    // The encoding carries the name the declaring program wrote; this printing uses the one it
-    // was asked for, which a relink may have changed.
-    let declared = read_text(k.decoder);
-    let vn = read_count(declared.decoder);
-    let vs = read_many(vn.decoder, vn.value, |g: Decoder| {
-      let vname = read_text(expect(g, tag_variant(), b"a variant"));
-      let fc = read_count(vname.decoder);
-      let fs = read_many(fc.decoder, fc.value, |h: Decoder| print_type(printer, h));
+/// A `handle`: its variables first, each seeing those before it, then its body, which sees none of
+/// them, then its clauses and its `return`, which see them all.
+fn handle_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  handled: stored::Handled<Reference, Int, Int, Unit>,
+) -> Spelled<Expr> / {abort.raise} = {
+  let span = dummy_span();
+  let level = depth.values;
+  let variables = range(0, handled.variables.len()).fold(
+    { naming: naming, node: [] },
+    |acc: Spelled<List<HandlerVar>>, i: Int| {
+      let variable = handled.variables.get(i);
+      let seeing = { ..depth, values: level + i };
+      let annotation = optional_type_of(printer, acc.naming, seeing, variable.annotation);
+      let first = expression_of(printer, annotation.naming, seeing, variable.first);
       {
-        decoder: fs.decoder,
-        text: Bytes::concat_all([
-          b"| ",
-          vname.text,
-          if fc.value > 0 { Bytes::concat_all([b"(", joined(fs.texts, b", "), b")"]) } else { b"" },
-          b" ",
-        ]),
+        naming: first.naming,
+        node: acc.node.push({
+          name: ident(local_name(level + i)),
+          ty: annotation.node,
+          init: first.node,
+          span: span,
+        }),
       }
-    });
-    { decoder: vs.decoder, text: Bytes::concat_all(vs.texts) }
-  } else if k.value == tag_type_nominal() {
-    let fields = print_type(printer, read_text(k.decoder).decoder);
-    { decoder: fields.decoder, text: b"new ".concat(fields.text) }
-  } else { panic("a tag that does not begin a type body") };
-  let closed = peek(body.decoder) == tag_opaque();
-  let stated = instances_of(printer, if closed { skip(body.decoder) } else { body.decoder }, name);
-  let numeric = numeric_of(printer, stated.decoder);
+    },
+  );
+  let body = expression_of(printer, variables.naming, depth, handled.body);
+  let held = level + handled.variables.len();
+  let clauses = named_in_turn(
+    body.naming,
+    handled.clauses,
+    |so_far: Naming, clause: stored::Clause<Reference, Int, Int, Unit>| {
+      let effect_name = effect_named(printer, so_far, clause.effect);
+      let labelled_by = labelled(depth, clause.label);
+      let bound = held + clause.parameters;
+      let clause_body = expression_of(
+        printer,
+        effect_name.naming,
+        { ..depth, values: if clause.resumes { bound + 1 } else { bound } },
+        clause.body,
+      );
+      {
+        naming: clause_body.naming,
+        node: {
+          eff: effect_name.node,
+          op: ident(clause.operation),
+          resource: labelled_by.resource,
+          every_label: labelled_by.every,
+          label_binder: labelled_by.binder,
+          resume: if clause.resumes { Some(ident(local_name(bound))) } else { None },
+          body: clause_body.node,
+          span: span,
+          params: range(held, bound).map(|i: Int| ident(local_name(i))),
+        },
+      }
+    },
+  );
+  let returned = match handled.returned {
+    None -> { naming: clauses.naming, node: None },
+    Some(given) -> {
+      let spelled = expression_of(printer, clauses.naming, { ..depth, values: held + 1 }, given);
+      {
+        naming: spelled.naming,
+        node: Some({ binder: ident(local_name(held)), body: spelled.node, span: span }),
+      }
+    },
+  };
   {
-    decoder: numeric.decoder,
-    text: Bytes::concat_all([
-      if closed && !printer.layout.apart { b"opaque type " } else { b"type " },
-      name,
-      generic_list(n.value, ec.value, lc.value),
-      if cs.value > 0 { b" where ".concat(joined(derives.texts, b", ")) } else { b"" },
-      b" = ",
-      body.text,
-      stated.text,
-      if numeric.text.len() == 0 { b"" }
-      else { Bytes::concat_all([b"\nnumeric for ", name, b" by { ", numeric.text, b" }"]) },
-    ]),
+    naming: returned.naming,
+    node: EHandle({
+      span: span,
+      body: body.node,
+      ret: returned.node,
+      clauses: clauses.node,
+      vars: variables.node,
+    }),
   }
 }
 
-/// What follows a type's `key` and `show`: each operation its `numeric` names and the function it
-/// is, as the statement's record lists them. Each one read is at least a byte.
-fn numeric_of(printer: BodyPrinter, d: Decoder) -> Decoded / {abort.raise} =
-  iterate({ decoder: d, text: b"" }, d.bytes.len() - d.pos + 1, |acc: Decoded|
-    if peek(acc.decoder) != tag_numeric() { Stop(acc) } else {
-      let op = read_text(skip(acc.decoder));
-      let by = read_value(printer, op.decoder);
-      Continue({
-        decoder: by.decoder,
-        text: Bytes::concat_all([
-          acc.text,
-          if acc.text.len() == 0 { b"" } else { b", " },
-          op.text,
-          b": ",
-          by.text,
-        ]),
-      })
+fn statement_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  depth: Depth,
+  original: StoredStatement,
+) -> Said / {abort.raise} = {
+  let span = dummy_span();
+  match original {
+    Let(annotation, value, pattern) -> {
+      let spelled_annotation = optional_type_of(printer, naming, depth, annotation);
+      let spelled_value = expression_of(printer, spelled_annotation.naming, depth, value);
+      let bound = pattern_of(printer, spelled_value.naming, depth, pattern);
+      {
+        naming: bound.naming,
+        depth: bound.depth,
+        node: SLet({
+          span: span,
+          pat: bound.node,
+          ty: spelled_annotation.node,
+          value: spelled_value.node,
+        }),
+      }
+    },
+    LetElse(annotation, value, pattern, fallback) -> {
+      let spelled_annotation = optional_type_of(printer, naming, depth, annotation);
+      let spelled_value = expression_of(printer, spelled_annotation.naming, depth, value);
+      let bound = pattern_of(printer, spelled_value.naming, depth, pattern);
+      let spelled_fallback = expression_of(printer, bound.naming, bound.depth, fallback);
+      {
+        naming: spelled_fallback.naming,
+        depth: bound.depth,
+        node: SLetElse({
+          span: span,
+          pat: bound.node,
+          ty: spelled_annotation.node,
+          value: spelled_value.node,
+          fallback: as_block(spelled_fallback.node),
+        }),
+      }
+    },
+    Effectful(expression) -> {
+      let spelled = expression_of(printer, naming, depth, expression);
+      { naming: spelled.naming, depth: depth, node: SExpr(spelled.node) }
+    },
+    Assign(variable, value) -> {
+      let name = match variable.named {
+        Local(level) -> if level >= depth.values {
+          panic("a handler variable that is not in scope")
+        } else { ident(local_name(level)) },
+        _ -> panic("an assignment to no handler variable"),
+      };
+      let spelled = expression_of(printer, naming, depth, value);
+      {
+        naming: spelled.naming,
+        depth: depth,
+        node: SAssign({ span: span, name: name, value: spelled.node }),
+      }
+    },
+  }
+}
+
+// --- Definitions -------------------------------------------------------------------------------
+
+fn generics_of(generics: stored::Generics) -> Generics =
+  {
+    types: range(0, generics.types).map(|i: Int| ident(type_var_name(i))),
+    effects: range(0, generics.rows).map(|i: Int| ident(row_var_name(i))),
+    labels: range(0, generics.labels).map(|i: Int| ident(label_name(i))),
+  }
+
+/// What is in scope at the head of a declaration binding `generics`.
+fn depth_of(generics: stored::Generics) -> Depth =
+  { values: 0, types: generics.types, rows: generics.rows, labels: generics.labels }
+
+fn constraints_of(constraints: List<stored::Constrained>) -> List<Constraint> =
+  constraints.map(|constrained: stored::Constrained|
+    {
+      deriver: constrained.deriver,
+      deriver_span: dummy_span(),
+      param: ident(type_var_name(constrained.level)),
+      span: dummy_span(),
     })
 
-/// What follows a type's body: the `key` and the `show` its module states of it, a line each. Each
-/// one read is at least a byte, which bounds the rounds.
-fn instances_of(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} =
-  iterate({ decoder: d, text: b"" }, d.bytes.len() - d.pos + 1, |acc: Decoded| {
-    let kind = if peek(acc.decoder) == tag_key() { Some(NKey) }
-    else if peek(acc.decoder) == tag_show() { Some(NShow) }
-    else { None };
-    match kind {
-      None -> Stop(acc),
-      Some(k) -> {
-        let by = read_value(printer, skip(acc.decoder));
-        Continue({
-          decoder: by.decoder,
-          text: Bytes::concat_all([
-            acc.text,
-            b"\n",
-            instance_text(k),
-            b" for ",
-            name,
-            b" by ",
-            by.text,
-          ]),
-        })
+/// Everything is `pub`: visibility is metadata the encoding erased. A type's `key`, `show` and
+/// `numeric` follow it.
+fn items_of(
+  printer: BodyPrinter,
+  naming: Naming,
+  form: Stored,
+  name: Bytes,
+) -> Spelled<List<Item>> / {abort.raise} = {
+  let span = dummy_span();
+  match form {
+    FunctionOf(function) -> {
+      let depth = depth_of(function.generics);
+      let parameters = range(0, function.parameters.len()).fold(
+        { naming: naming, node: [] },
+        |acc: Spelled<List<Param>>, i: Int| {
+          let parameter = function.parameters.get(i);
+          let annotation = optional_type_of(printer, acc.naming, depth, parameter.annotation);
+          let default_value = optional_expression_of(
+            printer,
+            annotation.naming,
+            depth,
+            parameter.default,
+          );
+          {
+            naming: default_value.naming,
+            node: acc.node.push({
+              name: ident(local_name(i)),
+              keep: parameter.kept,
+              ty: annotation.node,
+              cost: None,
+              space: if parameter.spaced { Some(ident(space_name(i))) } else { None },
+              default: default_value.node,
+              span: span,
+            }),
+          }
+        },
+      );
+      let returned = optional_type_of(printer, parameters.naming, depth, function.returned);
+      let row = optional_row_of(printer, returned.naming, depth, function.row);
+      let inside = { ..depth, values: function.parameters.len() };
+      let measure = optional_expression_of(printer, row.naming, inside, function.decreases);
+      let body = expression_of(printer, measure.naming, inside, function.body);
+      {
+        naming: body.naming,
+        node: [
+          IFn({
+            vis: VPub,
+            name: ident(name),
+            generics: generics_of(function.generics),
+            params: parameters.node,
+            ret: returned.node,
+            effects: row.node,
+            constraints: constraints_of(function.constraints),
+            spec: [],
+            returns: match function.returns {
+              Unstated -> None,
+              Fresh -> Some(ReturnsFresh(span)),
+              ParameterReturned(i) -> if i >= function.parameters.len() {
+                panic("a `returns` clause names a parameter out of scope")
+              } else { Some(ReturnsParam(ident(local_name(i)))) },
+            },
+            reuse: None,
+            transparent: None,
+            baked: match function.baked { Some(_) -> Some(span), None -> None },
+            decreases: measure.node,
+            body: body.node,
+            doc: None,
+            span: span,
+          }),
+        ],
+      }
+    },
+    TypeOf(declared) -> {
+      let depth = depth_of(declared.generics);
+      let body = match declared.body {
+        Alias(aliased) -> {
+          let spelled = type_of(printer, naming, depth, aliased);
+          { naming: spelled.naming, node: TDAlias(spelled.node) }
+        },
+        Sum(_, variants) -> {
+          let spelled = named_in_turn(
+            naming,
+            variants,
+            |so_far: Naming, variant: stored::Variant<Reference, Int>| {
+              let fields = types_of(printer, so_far, depth, variant.fields);
+              {
+                naming: fields.naming,
+                node: { name: ident(variant.name), fields: fields.node, doc: None, span: span },
+              }
+            },
+          );
+          { naming: spelled.naming, node: TDSum(spelled.node) }
+        },
+        Nominal(_, wrapped) -> {
+          let spelled = type_of(printer, naming, depth, wrapped);
+          { naming: spelled.naming, node: TDNominal(spelled.node) }
+        },
+        Extern(_) -> { naming: naming, node: TDExtern },
+      };
+      let instances = named_in_turn(
+        body.naming,
+        declared.through,
+        |so_far: Naming, through: stored::Through<Reference, Int>| {
+          let function_name = value_named(printer, so_far, depth, through.by);
+          {
+            naming: function_name.naming,
+            node: IInstance({
+              kind: if through.key { NKey } else { NShow },
+              target: ident(name),
+              by: ident(qualified_text(function_name.node)),
+              span: span,
+            }),
+          }
+        },
+      );
+      let arithmetic = named_in_turn(
+        instances.naming,
+        declared.numerics,
+        |so_far: Naming, operation: stored::Numeric<Reference, Int>| {
+          let function_name = value_named(printer, so_far, depth, operation.by);
+          {
+            naming: function_name.naming,
+            node: { op: ident(operation.operation), by: ident(qualified_text(function_name.node)) },
+          }
+        },
+      );
+      let declaration = IType({
+        vis: VPub,
+        // Set apart, what only the type's module may write is written wherever a body landed.
+        opaque: if declared.opaque && !printer.layout.apart {
+          Some({ span: span, answer: [], take: [] })
+        } else { None },
+        name: ident(name),
+        generics: generics_of(declared.generics),
+        constraints: constraints_of(declared.constraints),
+        body: body.node,
+        doc: None,
+        field_docs: [],
+        span: span,
+      });
+      {
+        naming: arithmetic.naming,
+        node: List::concat([declaration], instances.node).concat(if arithmetic.node.len() == 0 {
+          []
+        } else { [INumeric({ target: ident(name), ops: arithmetic.node, span: span })] }),
+      }
+    },
+    EffectOf(declared) -> {
+      let operations = named_in_turn(
+        naming,
+        declared.operations,
+        |so_far: Naming, operation: stored::Operation<Reference, Int>| {
+          let depth = { values: 0, types: operation.types, rows: 0, labels: 0 };
+          let parameters = types_of(printer, so_far, depth, operation.parameters);
+          let returned = type_of(printer, parameters.naming, depth, operation.returned);
+          {
+            naming: returned.naming,
+            node: {
+              name: ident(operation.name),
+              mode: operation.mode,
+              resource_param: operation.resource,
+              ty_params: range(0, operation.types).map(|i: Int| ident(type_var_name(i))),
+              params: parameters.node,
+              ret: returned.node,
+              doc: None,
+              span: span,
+            },
+          }
+        },
+      );
+      {
+        naming: operations.naming,
+        node: [
+          IEffect({
+            vis: VPub,
+            name: ident(name),
+            is_nondet: declared.nondet,
+            ops: operations.node,
+            doc: None,
+            span: span,
+          }),
+        ],
+      }
+    },
+    TestOf(declared) -> match declared.cases {
+      Some(_) -> panic("a test over cases has no body to print without its table"),
+      None -> {
+        let body = expression_of(
+          printer,
+          naming,
+          { values: 0, types: 0, rows: 0, labels: 0 },
+          declared.body,
+        );
+        {
+          naming: body.naming,
+          node: [
+            ITest({
+              name: name,
+              name_span: span,
+              is_nondet: declared.nondet,
+              cases: None,
+              body: as_block(body.node),
+              span: span,
+            }),
+          ],
+        }
       },
-    }
-  })
-
-fn print_effect(printer: BodyPrinter, d: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
-  // The encoding carries the name the declaring program wrote; this printing uses the one it was
-  // asked for, which a relink may have changed.
-  let declared = read_text(expect(d, tag_effect(), b"an effect"));
-  let nd = read_bool(declared.decoder);
-  let n = read_count(nd.decoder);
-  let ops = read_many(n.decoder, n.value, |g: Decoder| {
-    let op = read_text(expect(g, tag_op(), b"an operation"));
-    let m = read_mode(op.decoder);
-    let r = read_bool(m.decoder);
-    let tc = read_binders(r.decoder);
-    let pc = read_count({ ..tc.decoder, types: tc.value });
-    let ps = read_many(pc.decoder, pc.value, |h: Decoder| print_type(printer, h));
-    let ret = print_type(printer, ps.decoder);
-    {
-      decoder: { ..ret.decoder, types: g.types },
-      text: Bytes::concat_all([
-        line_break(1),
-        m.text,
-        b" ",
-        op.text,
-        if r.value { b"[r]" } else { b"" },
-        type_binders(tc.value),
-        b"(",
-        joined(ps.texts, b", "),
-        b")",
-        // A raise writes no result; the `Unit` its encoding holds in that place is read past.
-        if m.text == b"raise" { b"" } else { b" -> ".concat(ret.text) },
-      ]),
-    }
-  });
-  {
-    decoder: ops.decoder,
-    text: Bytes::concat_all([
-      if nd.value { b"nondet " } else { b"" },
-      b"effect ",
-      name,
-      b" {",
-      Bytes::concat_all(ops.texts),
-      b"\n}",
-    ]),
+    },
+    LawOf(_) -> panic("a law is never printed back"),
+    SpecOf(_) -> panic("a specification clause is never printed back"),
   }
 }
 
-/// Everything is `pub`: visibility is metadata the encoding erased.
-fn print_item(unsized: BodyPrinter, decoder: Decoder, name: Bytes) -> Decoded / {abort.raise} = {
-  let printer = { ..unsized, room: decoder.bytes.len() };
-  let t = peek(decoder);
-  let g = if t == tag_fn() { print_fn(printer, decoder, name) }
-  else if t == tag_type() || t == tag_type_over() { print_type_def(printer, decoder, name) }
-  else if t == tag_effect() { print_effect(printer, decoder, name) }
-  else { panic("a tag that does not begin a definition") };
-  if g.decoder.pos != g.decoder.bytes.len() { panic("bytes remain after the definition") }
-  else { { decoder: g.decoder, text: b"pub ".concat(g.text) } }
-}
+/// The text of `items`, as `fmt` prints a module of them alone.
+fn items_text(items: List<Item>) -> Bytes / {abort.raise} =
+  module_text({ doc: None, imports: [], items: items })
 
-fn print_test(unsized: BodyPrinter, decoder: Decoder, label: Bytes) -> Decoded / {abort.raise} = {
-  let printer = { ..unsized, room: decoder.bytes.len() };
-  let nd = read_bool(expect(decoder, tag_test(), b"a test"));
-  let body = print_block(printer, nd.decoder, 0);
-  if body.decoder.pos != body.decoder.bytes.len() { panic("bytes remain after the test") } else {
-    {
-      decoder: body.decoder,
-      text: Bytes::concat_all([
-        if nd.value { b"test/nondet " } else { b"test " },
-        str_lit(label),
-        b" ",
-        body.text,
-      ]),
-    }
-  }
-}
+// --- Laying the print out ----------------------------------------------------------------------
 
-type Named = { module: Bytes, simple: Bytes, public: Bool }
+type Holder = { module: Bytes, simple: Bytes, public: Bool }
 
 type Component = {
   members: List<Bytes>,
@@ -1836,33 +1687,50 @@ fn comp_of(body: Bytes) -> Component / {abort.raise} =
       if e.kind == 0 {
         { members: [payload], picks: picks_of(body, e), hashes: [id], id: id, key: id }
       } else {
-        let c = read_count(cursor(payload, Map::new()));
-        let ms = read_many(c.decoder, c.value, read_text);
-        if ms.decoder.pos != payload.len() || e.class >= c.value {
-          panic("a malformed component body")
-        } else {
-          {
-            members: ms.texts,
-            picks: picks_of(body, e),
-            hashes: range(0, c.value).map(|i: Int| member_hash(id, i)),
-            id: id,
-            key: member_hash(id, e.class),
-          }
+        match members_of(payload) {
+          Some(ms) -> if e.class >= ms.len() { panic("a malformed component body") } else {
+            {
+              members: ms,
+              picks: picks_of(body, e),
+              hashes: range(0, ms.len()).map(|i: Int| member_hash(id, i)),
+              id: id,
+              key: member_hash(id, e.class),
+            }
+          },
+          None -> panic("a malformed component body"),
         }
       }
     },
   }
 
-fn listed(ns: List<Named>) -> Bytes / {abort.raise} =
-  backticked(ns.map(|n: Named| qualify(n.module, n.simple)), b", ")
+/// The stored forms a body holds: its own, or each member's of the component it is part of.
+pub fn stored_forms(body: Bytes) -> List<Stored> / {abort.raise} = {
+  let component = comp_of(body);
+  component.members.map(|member: Bytes| stored_of(member, short_hex(component.key)))
+}
+
+/// What kind of definition a member of a component is: two of one name and one kind are one
+/// definition, and two of one name and two kinds are two.
+fn kind_of(member: Bytes, name: Bytes) -> Int / {abort.raise} =
+  match stored_of(member, name) {
+    FunctionOf(_) -> 0,
+    TypeOf(_) -> 1,
+    EffectOf(_) -> 2,
+    TestOf(_) -> 3,
+    LawOf(_) -> 4,
+    SpecOf(_) -> 5,
+  }
+
+fn listed(ns: List<Holder>) -> Bytes / {abort.raise} =
+  backticked(ns.map(|n: Holder| qualify(n.module, n.simple)), b", ")
 
 fn named_of(
   names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
   keys: Map<Bytes, Bool>,
-) -> { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> } / {abort.raise} =
+) -> { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<Refusal> } / {abort.raise} =
   names.fold(
     { named: Map::new(), bad: None },
-    |acc: { named: Map<Bytes, Map<Bytes, Named>>, bad: Option<Refusal> }, n: { name: Bytes, hash: Bytes, public: Bool }|
+    |acc: { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<Refusal> }, n: { name: Bytes, hash: Bytes, public: Bool }|
       match acc.bad {
         Some(_) -> acc,
         None -> {
@@ -1890,33 +1758,35 @@ fn named_of(
       },
   )
 
-fn copies(classes: List<List<Named>>) -> Option<List<Copied>> / {abort.raise} =
+fn copies(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort.raise} =
   if classes.len() == 1 {
-    Some(classes.get(0).map(|n: Named| { module: n.module, names: [n.simple], public: [n.public] }))
+    Some(
+      classes.get(0).map(|n: Holder| { module: n.module, names: [n.simple], public: [n.public] }),
+    )
   } else {
     let by_module = range(0, classes.len()).fold(
       Map::new(),
-      |acc: Map<Bytes, List<List<Named>>>, c: Int|
-        classes.get(c).fold(acc, |a: Map<Bytes, List<List<Named>>>, n: Named| {
+      |acc: Map<Bytes, List<List<Holder>>>, c: Int|
+        classes.get(c).fold(acc, |a: Map<Bytes, List<List<Holder>>>, n: Holder| {
           let rows = match a.get(n.module) {
             Some(r) -> r,
-            None -> classes.map(|k: List<Named>| []),
+            None -> classes.map(|k: List<Holder>| []),
           };
           a.insert(n.module, rows.set(c, rows.get(c).push(n)))
         }),
     );
-    by_module.fold(Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Named>>|
+    by_module.fold(Some([]), |acc: Option<List<Copied>>, m: Bytes, rows: List<List<Holder>>|
       match acc {
         None -> None,
         Some(out) -> {
           let count = rows.get(0).len();
-          if rows.fold(false, |b: Bool, r: List<Named>| b || r.len() != count) { None } else {
+          if rows.fold(false, |b: Bool, r: List<Holder>| b || r.len() != count) { None } else {
             Some(
               range(0, count).fold(out, |o: List<Copied>, k: Int|
                 o.push({
                   module: m,
-                  names: rows.map(|r: List<Named>| r.get(k).simple),
-                  public: rows.map(|r: List<Named>| r.get(k).public),
+                  names: rows.map(|r: List<Holder>| r.get(k).simple),
+                  public: rows.map(|r: List<Holder>| r.get(k).public),
                 })),
             )
           }
@@ -1927,7 +1797,7 @@ fn copies(classes: List<List<Named>>) -> Option<List<Copied>> / {abort.raise} =
 fn part_in(
   acc: Parting,
   component: Component,
-  named: Map<Bytes, Map<Bytes, Named>>,
+  named: Map<Bytes, Map<Bytes, Holder>>,
   shipped: List<Bytes>,
 ) -> Parting / {abort.raise} = {
   let classes = component.hashes.map(|h: Bytes|
@@ -1938,42 +1808,47 @@ fn part_in(
       None -> {
         let all = classes.get(i);
         let h = component.hashes.get(i);
-        let kind = component.members.get(i).at(0);
         if all.len() == 0 {
           {
             ..a,
             bad: refuse(Bytes::concat_all([b"the body `", short_hex(h), b"` has no name"]), []),
           }
-        }
-        // Two modules declaring one effect alike declare one effect, so a body performing it cannot
-        // be printed back under a name: either module's would be a different claim about what it does.
-        else if kind == tag_effect() && all.len() > 1 {
-          {
-            ..a,
-            bad: refuse(
-              listed(all).concat(
-                b" are one effect declaration, so a body cannot say which it performs",
-              ),
-              [b"make the declarations differ, or keep one of them"],
-            ),
-          }
         } else {
-          all.fold(a, |b: Parting, n: Named| {
-            let q = qualify(n.module, n.simple);
-            let key = byte_of_int(kind).concat(q);
-            match b.declared.get(key) {
-              Some(other) -> if other == h || is_some(b.bad) { b } else {
-                {
-                  ..b,
-                  bad: refuse(
-                    Bytes::concat_all([b"`", q, b"` names two different definitions"]),
-                    [],
-                  ),
-                }
-              },
-              None -> { ..b, declared: b.declared.insert(key, h) },
+          let kind = kind_of(
+            component.members.get(i),
+            qualify(all.get(0).module, all.get(0).simple),
+          );
+          // Two modules declaring one effect alike declare one effect, so a body performing it
+          // cannot be printed back under a name: either module's would be a different claim about
+          // what it does.
+          if kind == 2 && all.len() > 1 {
+            {
+              ..a,
+              bad: refuse(
+                listed(all).concat(
+                  b" are one effect declaration, so a body cannot say which it performs",
+                ),
+                [b"make the declarations differ, or keep one of them"],
+              ),
             }
-          })
+          } else {
+            all.fold(a, |b: Parting, n: Holder| {
+              let q = qualify(n.module, n.simple);
+              let key = byte_of_int(kind).concat(q);
+              match b.declared.get(key) {
+                Some(other) -> if other == h || is_some(b.bad) { b } else {
+                  {
+                    ..b,
+                    bad: refuse(
+                      Bytes::concat_all([b"`", q, b"` names two different definitions"]),
+                      [],
+                    ),
+                  }
+                },
+                None -> { ..b, declared: b.declared.insert(key, h) },
+              }
+            })
+          }
         }
       },
     });
@@ -1984,7 +1859,7 @@ fn part_in(
         {
           ..checked,
           bad: refuse(
-            listed(classes.fold([], |o: List<Named>, ns: List<Named>| o.concat(ns))).concat(
+            listed(classes.fold([], |o: List<Holder>, ns: List<Holder>| o.concat(ns))).concat(
               b" are a mutually recursive group in which two definitions share one body, so a call cannot say which it reaches",
             ),
             [b"make the definitions differ, or keep one of them"],
@@ -2011,6 +1886,7 @@ fn part_in(
 
 fn is_some(o: Option<Refusal>) -> Bool = match o { Some(_) -> true, None -> false }
 
+/// Each module's binder: its last segment, or its whole path joined where two share one.
 fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
   let sharing = modules.fold(Map::new(), |acc: Map<Bytes, Int>, m: Bytes|
     acc.insert(
@@ -2028,7 +1904,7 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
       if match sharing.get(own) { Some(k) -> k == 1, None -> true } {
         { ..s, out: s.out.insert(m, own) }
       } else {
-        let base = joined(m.split(b"."), b"_");
+        let base = Bytes::join(m.split(b"."), b"_");
         let found = iterate(
           { n: 1, binder: base },
           2 * modules.len() + 2,
@@ -2078,6 +1954,12 @@ fn layout_of(
   }
 }
 
+fn fresh_naming(
+  imports: Map<Bytes, Bytes>,
+  missing: Map<Bytes, Bool>,
+  picks: List<Choice>,
+) -> Naming = { imports: imports, missing: missing, slots: Map::new(), picks: picks, picked: 0 }
+
 fn print_parts(
   layout: Layout,
 ) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
@@ -2086,54 +1968,42 @@ fn print_parts(
     |acc: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = layout.parts.get(u);
       if !p.printed { acc } else {
-        let x = {
-          layout: layout,
-          part: u,
-          own: p.module,
-          graph: acc.graph,
-          room: 0,
-          meant: Map::new(),
-        };
+        let x = { layout: layout, part: u, own: p.module, graph: acc.graph, meant: Map::new() };
         let walked = range(0, p.members.len()).fold(
-          { decoder: cursor(b"", acc.missing), texts: [] },
-          |decoded: DecodedList, c: Int| {
-            let g = print_item(
-              {
-                ..x,
-                meant: match layout.meant.get(
-                    meant_key(qualify(p.module, p.names.get(c)), p.hashes.get(c)),
-                  ) {
-                  Some(names) -> names,
-                  None -> Map::new(),
-                },
+          { imports: Map::new(), missing: acc.missing, texts: [] },
+          |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, c: Int| {
+            let name = p.names.get(c);
+            let printer = {
+              ..x,
+              meant: match layout.meant.get(meant_key(qualify(p.module, name), p.hashes.get(c))) {
+                Some(names) -> names,
+                None -> Map::new(),
               },
-              {
-                ..decoded.decoder,
-                bytes: p.members.get(c),
-                pos: 0,
-                picks: match p.picks.at(c) { Some(x) -> x, None -> [] },
-                picked: 0,
-                values: 0,
-                types: 0,
-                rows: 0,
-                labels: 0,
-              },
-              p.names.get(c),
+            };
+            let g = items_of(
+              printer,
+              fresh_naming(w.imports, w.missing, match p.picks.at(c) { Some(x) -> x, None -> [] }),
+              stored_of(p.members.get(c), qualify(p.module, name)),
+              name,
             );
-            { decoder: g.decoder, texts: decoded.texts.push(g.text) }
+            {
+              imports: g.naming.imports,
+              missing: g.naming.missing,
+              texts: w.texts.push(items_text(g.node)),
+            }
           },
         );
         let had = match acc.modules.get(p.module) {
           Some(m) -> m,
           None -> { items: [], imports: Map::new() },
         };
-        let imports = had.imports.merge(walked.decoder.imports.remove(p.module));
+        let imports = had.imports.merge(walked.imports.remove(p.module));
         {
           modules: acc.modules.insert(p.module, {
             items: had.items.concat(walked.texts),
             imports: imports,
           }),
-          missing: walked.decoder.missing,
+          missing: walked.missing,
           graph: acc.graph.insert(p.module, imports.keys()),
         }
       }
@@ -2145,31 +2015,29 @@ fn print_tests(
   g: Map<Bytes, List<Bytes>>,
   tests: List<Bytes>,
   missing: Map<Bytes, Bool>,
-) -> DecodedList / {abort.raise} = {
-  let x = { layout: layout, part: 0 - 1, own: b"", graph: g, room: 0, meant: Map::new() };
+) -> { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> } / {abort.raise} = {
+  let x = { layout: layout, part: 0 - 1, own: b"", graph: g, meant: Map::new() };
   range(0, tests.len()).fold(
-    { decoder: cursor(b"", missing), texts: [] },
-    |decoded: DecodedList, i: Int| {
+    { imports: Map::new(), missing: missing, texts: [] },
+    |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, i: Int| {
       let body = tests.get(i);
+      let label = b"t".concat(ascii_of_int(i));
       match envelope(body) {
         Some(e) -> if e.kind != 0 { panic("a test body that is not a solo body") } else {
-          let g = print_test(
+          let t = items_of(
             x,
-            {
-              ..decoded.decoder,
-              bytes: body.slice(e.at, body.len()),
-              pos: 0,
-              picks: match picks_of(body, e).at(0) { Some(p) -> p, None -> [] },
-              picked: 0,
-              values: 0,
-              types: 0,
-              rows: 0,
-              labels: 0,
-              slots: Map::new(),
-            },
-            b"t".concat(ascii_of_int(i)),
+            fresh_naming(w.imports, w.missing, match picks_of(body, e).at(0) {
+              Some(p) -> p,
+              None -> [],
+            }),
+            stored_of(body.slice(e.at, body.len()), label),
+            label,
           );
-          { decoder: g.decoder, texts: decoded.texts.push(g.text) }
+          {
+            imports: t.naming.imports,
+            missing: t.naming.missing,
+            texts: w.texts.push(items_text(t.node)),
+          }
         },
         None -> panic("a test body that is not a solo body"),
       }
@@ -2188,7 +2056,7 @@ fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
           b"\n",
         ]),
       )).concat(
-      sheet.items.map(|it: Bytes| Bytes::concat_all([b"\n", it, b"\n"])),
+      sheet.items.map(|it: Bytes| Bytes::concat_all([b"\n", it])),
     ),
   )
 
@@ -2255,14 +2123,16 @@ pub fn print_bodies(
       );
       let printed = print_parts(l);
       let t = print_tests(l, printed.graph, tests, printed.missing);
-      let missing = t.decoder.missing.keys();
+      let missing = t.missing.keys();
       if missing.len() > 0 {
         Unprintable({
           message: ascii_of_int(missing.len()).concat(
             b" definitions a body refers to are not among the bodies it can name",
           ),
           notes: [
-            b"missing: ".concat(joined(missing.take(min(8, missing.len())).map(short_hex), b", ")),
+            b"missing: ".concat(
+              Bytes::join(missing.take(min(8, missing.len())).map(short_hex), b", "),
+            ),
           ],
         })
       } else {
@@ -2274,31 +2144,10 @@ pub fn print_bodies(
         Printed(if tests.len() == 0 { texts } else {
           texts.push({
             module: b"ply_tests",
-            text: sheet_text({ items: t.texts, imports: t.decoder.imports }),
+            text: sheet_text({ items: t.texts, imports: t.imports }),
           })
         })
       }
     },
   }
-}
-
-// --- Tests ------------------------------------------------------------------
-
-test "a literal is spelled so it reads back to its bits" {
-  assert_eq(float_text(bits_of_float(0.1)), b"0.1");
-  assert_eq(float_text(bits_of_float(100.0)), b"100.0");
-  assert_eq(float_text(bits_of_float(1e300)), b"1e300");
-  assert_eq(float_text(bits_of_float(1.5e-7)), b"1.5e-7");
-  assert_eq(float_text(1), b"5e-324");
-  assert_eq(float_text(0x8000000000000000), b"-0.0");
-  assert_eq(decimal_text(i128_le_of_digits(b"50"), 3), b"0.050m");
-  assert_eq(
-    decimal_text(i128_le_of_digits(b"79228162514264337593543950335"), 0),
-    b"79228162514264337593543950335m",
-  );
-  assert_eq(int_text(0 - 1), b"0xffffffffffffffff");
-  assert_eq(fixed_text(4, 0 - 1), b"0xffi8");
-  assert_eq(wide_text(8, 1, 0), b"18446744073709551616u128");
-  assert_eq(wide_text(9, 0 - 1, 5), b"0xffffffffffffffff0000000000000005i128");
-  assert_eq(bytes_lit(b"\x00\"q\xff"), b"b\"\\0\\\"q\\xff\"")
 }

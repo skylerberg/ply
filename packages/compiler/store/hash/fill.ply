@@ -1,0 +1,551 @@
+//! A template filled: each reference by what it is to the hashing at hand, each effect by its slot,
+//! each level by where a commutable run's order puts its binder, and each row in the order its atoms'
+//! stored encodings sort in. What fills is the one stored form a hash is taken over (`stored.Stored`).
+//!
+//! Every part that holds no expression is filled by its derived `map`. Expressions and statements
+//! are walked here, since a commutable run's members are ordered by their filled encodings and the
+//! binders after them leveled by that order.
+
+import std.bin
+import std.list
+import std.option
+import std.bytes
+import store.hash.encoding (Spot, Pick)
+import store.hash.stored
+import store.hash.stored (Reference, Hashed, Member, Itself, ByName, Note, Picked, Ran, RunAt,
+                          Slotted, Value, Effect, Applied, AppliedOver, Function, Fields, UnitType,
+                          TypeField, Row, Atom, Constant, Unwritten, Variable, Binary, Unary,
+                          Lambda, Call, OnValue, If, Match, Record, RecordUpdate, Field, ListOf,
+                          Perform, Handle, WithHold, Simulate, Parallel, Tagged, Filled, TryBlock,
+                          Block, Arm, Clause, One, Commuting, Let, LetElse, Effectful, Assign,
+                          Alias, Sum, Nominal, Extern, Form, FunctionOf, TypeOf, EffectOf, TestOf,
+                          LawOf, SpecOf, Template, Stored, reference_bin, atom_bin, statement_bin,
+                          stored_bin)
+
+/// What a template's holes are filled from: each referenced node's hash, its class where it shares
+/// the component being hashed, each effect's slot in the enumeration the form is written under, and
+/// whether a reference is written as the name `names` gives its node instead.
+pub type Filling = {
+  hashes: Map<Int, Bytes>,
+  component: Map<Int, Int>,
+  effects: Map<Int, Int>,
+  by_name: Bool,
+  names: List<Bytes>,
+}
+
+/// Each reference with nothing known: what orders a cycle's members and what a node references.
+pub fn blank() -> Filling =
+  { hashes: Map::new(), component: Map::new(), effects: Map::new(), by_name: false, names: [] }
+
+/// A filled template as hashing reads it: the bytes of its stored form, which its hash is taken
+/// over, and each call on a value's pick in the order the form holds them.
+pub type Finished = { bytes: Bytes, chosen: List<Pick> }
+
+pub fn finished(template: Template, filling: Filling) -> Finished / {abort.raise} =
+  handle {
+    bin::encode(form(filling, template), stored_bin())
+  } with {
+    var chosen: List<Pick> = [],
+    picking.pick(one) -> {
+      chosen = chosen.push(one);
+    },
+    return bytes -> { bytes: bytes, chosen: chosen },
+  }
+
+// --- References ----------------------------------------------------------------------------------
+
+/// A node a template references, told to whatever collects them.
+effect mentioned {
+  write mention(node: Int) -> Unit
+}
+
+/// Each node `walk` mentions, once, in the order it first mentions them.
+fn first_mentions(
+  walk: () -> Unit / {mentioned.mention, abort.raise},
+) -> List<Int> / {abort.raise} =
+  handle {
+    walk()
+  } with {
+    var seen: Map<Int, Bool> = Map::new(),
+    var order: List<Int> = [],
+    mentioned.mention(node) -> {
+      order = if seen.contains(node) { order } else { order.push(node) };
+      seen = seen.insert(node, true);
+    },
+    return finished -> order,
+  }
+
+fn mentioning(node: Int) -> Int / {mentioned.mention} = {
+  mentioned.mention(node);
+  node
+}
+
+/// What `template` references, in first-mention order: the order its parts stand in, a row's atoms
+/// in the order the encoder wrote them.
+pub fn references(template: Template) -> List<Int> / {abort.raise} =
+  first_mentions(|| {
+    let _ = template.map(
+      reference: mentioning,
+      slot: |slot: Slotted| slot,
+      level: |spot: Spot| spot,
+      note: |note: Note| note,
+    );
+    ()
+  })
+
+/// What the types `types` reference, in first-mention order.
+pub fn type_references(types: List<stored::Type<Int, Slotted>>) -> List<Int> / {abort.raise} =
+  first_mentions(|| {
+    let _ = types.map(|each: stored::Type<Int, Slotted>|
+      each.map(reference: mentioning, slot: |slot: Slotted| slot));
+    ()
+  })
+
+/// What the expression template `expression` references, in first-mention order.
+pub fn expression_references(
+  expression: stored::Expression<Int, Slotted, Spot, Note>,
+) -> List<Int> / {abort.raise} =
+  first_mentions(|| {
+    let _ = expression.map(
+      reference: mentioning,
+      slot: |slot: Slotted| slot,
+      level: |spot: Spot| spot,
+      note: |note: Note| note,
+    );
+    ()
+  })
+
+// --- What fills the parameters -------------------------------------------------------------------
+
+fn reference_of(filling: Filling, node: Int) -> Reference / {abort.raise} =
+  if filling.by_name { ByName(filling.names.get(node)) } else {
+    match filling.component.get(node) {
+      Some(class) -> Member(class),
+      None -> match filling.hashes.get(node) { Some(hash) -> Hashed(hash), None -> Itself },
+    }
+  }
+
+fn slot_of(filling: Filling, slot: Slotted) -> Int =
+  match filling.effects.get(slot.node) { Some(enumerated) -> enumerated, None -> 0 }
+
+/// A run's base level and each member's offset from it, by the member's place in the source.
+type Placed = { base: Int, offsets: List<Int> }
+
+/// Where each run written so far puts its members, by the run's number.
+type Runs = Map<Int, Placed>
+
+fn level_of(runs: Runs, spot: Spot) -> Int / {abort.raise} =
+  if spot.run < 0 { spot.within } else {
+    match runs.get(spot.run) {
+      Some(placed) -> placed.base + placed.offsets.get(spot.member) + spot.within,
+      None -> panic("a level names a run not written"),
+    }
+  }
+
+type StoredExpression = stored::Expression<Reference, Int, Int, Unit>
+
+type StoredStatement = stored::Statement<Reference, Int, Int, Unit>
+
+type TemplateType = stored::Type<Int, Slotted>
+
+type TemplateExpression = stored::Expression<Int, Slotted, Spot, Note>
+
+type TemplateStatement = stored::Statement<Int, Slotted, Spot, Note>
+
+/// A call on a value's pick, told as the call is filled. The walk fills each node's parts in the
+/// order the stored form holds them, so picks are told in that order.
+effect picking {
+  write pick(chosen: Pick) -> Unit
+}
+
+fn picked(note: Note) -> Unit / {picking.pick, abort.raise} =
+  match note {
+    Picked(chosen) -> picking.pick(chosen),
+    Ran(_) -> panic("a call on a value noted as a run"),
+  }
+
+/// `work` with the picks it tells dropped: a run's member filled only to order the run.
+fn unpicked<a>(work: () -> a / {picking.pick, abort.raise}) -> a / {abort.raise} =
+  handle { work() } with { picking.pick(one) -> () }
+
+// --- Types and rows ------------------------------------------------------------------------------
+
+fn filled_type(
+  filling: Filling,
+  template: TemplateType,
+) -> stored::Type<Reference, Int> / {abort.raise} =
+  rows_ordered(
+    template.map(
+      reference: |node: Int| reference_of(filling, node),
+      slot: |slot: Slotted| slot_of(filling, slot),
+    ),
+  )
+
+fn filled_row(
+  filling: Filling,
+  template: Row<Int, Slotted>,
+) -> Row<Reference, Int> / {abort.raise} =
+  row_ordered({
+    ..template,
+    atoms: template.atoms.map(|atom: Atom<Int, Slotted>|
+      atom.map(
+        reference: |node: Int| reference_of(filling, node),
+        slot: |slot: Slotted| slot_of(filling, slot),
+      )),
+  })
+
+/// `original` with each row it holds ordered.
+fn rows_ordered(
+  original: stored::Type<Reference, Int>,
+) -> stored::Type<Reference, Int> / {abort.raise} =
+  match original {
+    Applied(name, written, arguments) -> Applied(name, written, arguments.map(rows_ordered)),
+    AppliedOver(name, written, arguments, labels, rows) ->
+      AppliedOver(name, written, arguments.map(rows_ordered), labels, rows.map(row_ordered)),
+    Function(parameters, returned, row) ->
+      Function(parameters.map(rows_ordered), rows_ordered(returned), row.map(row_ordered)),
+    Fields(fields) ->
+      Fields(
+        fields.map(|field: TypeField<Reference, Int>|
+          { name: field.name, field_type: rows_ordered(field.field_type) }),
+      ),
+    UnitType -> UnitType,
+  }
+
+type KeyedAtom = { key: Bytes, atom: Atom<Reference, Int> }
+
+/// A row is a set: its atoms in the order of their encodings, each kept once. Atoms of one encoding
+/// are one atom, so which of them stood first is no part of the row.
+fn row_ordered(row: Row<Reference, Int>) -> Row<Reference, Int> / {abort.raise} = {
+  let codec = atom_bin(reference_bin(), bin::int_bin());
+  let keyed = row.atoms.map(|atom: Atom<Reference, Int>|
+    { key: bin::encode(atom, codec), atom: atom });
+  let sorted = keyed.sort_by(|first: KeyedAtom, second: KeyedAtom|
+    match compare_values(first.key, second.key) { Greater -> false, _ -> true });
+  let kept = sorted.fold([], |acc: List<KeyedAtom>, next: KeyedAtom|
+    match acc.last() {
+      Some(previous) -> if previous.key == next.key { acc } else { acc.push(next) },
+      None -> acc.push(next),
+    });
+  { ..row, atoms: kept.map(|each: KeyedAtom| each.atom) }
+}
+
+// --- Expressions ---------------------------------------------------------------------------------
+
+/// How the parts of a template under `runs` fill.
+type Scope = { filling: Filling, runs: Runs }
+
+fn value_of(scope: Scope, value: Value<Int, Spot>) -> Value<Reference, Int> / {abort.raise} =
+  {
+    named: value.named.map(
+      reference: |node: Int| reference_of(scope.filling, node),
+      level: |spot: Spot| level_of(scope.runs, spot),
+    ),
+    written: value.written.map(|node: Int| reference_of(scope.filling, node)),
+  }
+
+fn effect_of(
+  scope: Scope,
+  performed: Effect<Int, Slotted>,
+) -> Effect<Reference, Int> / {abort.raise} =
+  performed.map(
+    reference: |node: Int| reference_of(scope.filling, node),
+    slot: |slot: Slotted| slot_of(scope.filling, slot),
+  )
+
+fn pattern_of(
+  scope: Scope,
+  pattern: stored::Pattern<Int, Spot>,
+) -> stored::Pattern<Reference, Int> / {abort.raise} =
+  pattern.map(
+    reference: |node: Int| reference_of(scope.filling, node),
+    level: |spot: Spot| level_of(scope.runs, spot),
+  )
+
+fn optional_type(
+  scope: Scope,
+  annotation: Option<TemplateType>,
+) -> Option<stored::Type<Reference, Int>> / {abort.raise} =
+  annotation.map(|present: TemplateType| filled_type(scope.filling, present))
+
+fn expressions(
+  scope: Scope,
+  templates: List<TemplateExpression>,
+) -> List<StoredExpression> / {picking.pick, abort.raise} =
+  templates.map(|each: TemplateExpression| expression(scope, each))
+
+fn optional_expression(
+  scope: Scope,
+  template: Option<TemplateExpression>,
+) -> Option<StoredExpression> / {picking.pick, abort.raise} =
+  template.map(|present: TemplateExpression| expression(scope, present))
+
+fn record_fields(
+  scope: Scope,
+  fields: List<stored::RecordField<Int, Slotted, Spot, Note>>,
+) -> List<stored::RecordField<Reference, Int, Int, Unit>> / {picking.pick, abort.raise} =
+  fields.map(|field: stored::RecordField<Int, Slotted, Spot, Note>|
+    { name: field.name, value: expression(scope, field.value) })
+
+fn expression(
+  scope: Scope,
+  template: TemplateExpression,
+) -> StoredExpression / {picking.pick, abort.raise} = {
+  let references = |nodes: List<Int>| nodes.map(|node: Int| reference_of(scope.filling, node));
+  match template {
+    Constant(literal) -> Constant(literal),
+    Unwritten -> Unwritten,
+    Variable(value) -> Variable(value_of(scope, value)),
+    Binary(operator, left, right, written) ->
+      Binary(operator, expression(scope, left), expression(scope, right), references(written)),
+    Unary(operator, operand) -> Unary(operator, expression(scope, operand)),
+    Lambda(annotations, body) ->
+      Lambda(
+        annotations.map(|annotation: Option<TemplateType>| optional_type(scope, annotation)),
+        expression(scope, body),
+      ),
+    Call(called, arguments, labels) ->
+      Call(expression(scope, called), expressions(scope, arguments), labels),
+    OnValue(call) ->
+      OnValue({
+        base: expression(scope, call.base),
+        name: call.name,
+        labels: call.labels,
+        arguments: expressions(scope, call.arguments),
+        named: record_fields(scope, call.named),
+        callees: call.callees.map(
+          reference: |node: Int| reference_of(scope.filling, node),
+          level: |spot: Spot| level_of(scope.runs, spot),
+        ),
+        note: picked(call.note),
+      }),
+    If(condition, then_branch, else_branch) ->
+      If(
+        expression(scope, condition),
+        expression(scope, then_branch),
+        expression(scope, else_branch),
+      ),
+    Match(scrutinee, arms) ->
+      Match(
+        expression(scope, scrutinee),
+        arms.map(|arm: Arm<Int, Slotted, Spot, Note>|
+          {
+            pattern: pattern_of(scope, arm.pattern),
+            guard: optional_expression(scope, arm.guard),
+            body: expression(scope, arm.body),
+          }),
+      ),
+    Record(fields) -> Record(record_fields(scope, fields)),
+    RecordUpdate(base, fields) ->
+      RecordUpdate(expression(scope, base), record_fields(scope, fields)),
+    Field(base, name) -> Field(expression(scope, base), name),
+    ListOf(items) -> ListOf(expressions(scope, items)),
+    Perform(performed, operation, label, arguments) ->
+      Perform(effect_of(scope, performed), operation, label, expressions(scope, arguments)),
+    Handle(handled) ->
+      Handle({
+        variables: handled.variables.map(
+          |variable: stored::HandlerVariable<Int, Slotted, Spot, Note>|
+            {
+              annotation: optional_type(scope, variable.annotation),
+              first: expression(scope, variable.first),
+            },
+        ),
+        body: expression(scope, handled.body),
+        clauses: handled.clauses.map(|clause: Clause<Int, Slotted, Spot, Note>|
+          {
+            effect: effect_of(scope, clause.effect),
+            operation: clause.operation,
+            label: clause.label,
+            parameters: clause.parameters,
+            resumes: clause.resumes,
+            body: expression(scope, clause.body),
+          }),
+        returned: optional_expression(scope, handled.returned),
+      }),
+    WithHold(resource, acquire, release, body) ->
+      WithHold(
+        resource,
+        expression(scope, acquire),
+        expression(scope, release),
+        expression(scope, body),
+      ),
+    Simulate(body) -> Simulate(expression(scope, body)),
+    Parallel(branches) -> Parallel(expressions(scope, branches)),
+    Tagged(parser, text) -> Tagged(value_of(scope, parser), text),
+    Filled(parser, filler, head, holes) ->
+      Filled(
+        value_of(scope, parser),
+        value_of(scope, filler),
+        head,
+        holes.map(|hole: stored::FilledHole<Int, Slotted, Spot, Note>|
+          { value: expression(scope, hole.value), text: hole.text }),
+      ),
+    TryBlock(raised, body) ->
+      TryBlock(
+        raised.map(|given: stored::Raised<Int, Slotted>|
+          { effect: effect_of(scope, given.effect), operation: given.operation }),
+        expression(scope, body),
+      ),
+    Block(entries, tail) -> {
+      let written = entries.fold(
+        { runs: scope.runs, entries: [] },
+        |acc: { runs: Runs, entries: List<stored::Entry<Reference, Int, Int, Unit>> }, entry: stored::Entry<Int, Slotted, Spot, Note>|
+          match entry {
+            One(alone) ->
+              {
+                runs: acc.runs,
+                entries: acc.entries.push(One(statement({ ..scope, runs: acc.runs }, alone))),
+              },
+            Commuting(Ran(at), members) -> {
+              let placed = run({ ..scope, runs: acc.runs }, at, members);
+              { runs: placed.runs, entries: acc.entries.push(placed.entry) }
+            },
+            Commuting(Picked(_), _) -> panic("a run noted as a pick"),
+          },
+      );
+      Block(written.entries, optional_expression({ ..scope, runs: written.runs }, tail))
+    },
+  }
+}
+
+/// Each member's encoding at the run's base orders the run, ties in source order; each member is
+/// then filled where that order puts it, after the binders of those before it.
+fn run(
+  scope: Scope,
+  at: RunAt,
+  members: List<TemplateStatement>,
+) -> { runs: Runs, entry: stored::Entry<Reference, Int, Int, Unit> } / {picking.pick, abort.raise} = {
+  let base = level_of(scope.runs, at.base);
+  let count = members.len();
+  let unordered = {
+    ..scope,
+    runs: scope.runs.insert(at.id, { base: base, offsets: range(0, count).map(|_: Int| 0) }),
+  };
+  let codec = statement_bin(reference_bin(), bin::int_bin(), bin::int_bin(), bin::unit_bin());
+  let keys = members.map(|member: TemplateStatement|
+    bin::encode(unpicked(|| statement(unordered, member)), codec));
+  let order = range(0, count).sort_by(|first: Int, second: Int|
+    match compare_values(keys.get(first), keys.get(second)) {
+      Less -> true,
+      Greater -> false,
+      Equal -> first <= second,
+    });
+  let offsets = order.fold(
+    { next: 0, offsets: range(0, count).map(|_: Int| 0) },
+    |acc: { next: Int, offsets: List<Int> }, member: Int|
+      { next: acc.next + at.binders.get(member), offsets: acc.offsets.set(member, acc.next) },
+  ).offsets;
+  let runs = scope.runs.insert(at.id, { base: base, offsets: offsets });
+  {
+    runs: runs,
+    entry: Commuting(
+      (),
+      order.map(|member: Int| statement({ ..scope, runs: runs }, members.get(member))),
+    ),
+  }
+}
+
+fn statement(
+  scope: Scope,
+  template: TemplateStatement,
+) -> StoredStatement / {picking.pick, abort.raise} =
+  match template {
+    Let(annotation, value, pattern) ->
+      Let(optional_type(scope, annotation), expression(scope, value), pattern_of(scope, pattern)),
+    LetElse(annotation, value, pattern, fallback) ->
+      LetElse(
+        optional_type(scope, annotation),
+        expression(scope, value),
+        pattern_of(scope, pattern),
+        expression(scope, fallback),
+      ),
+    Effectful(effectful) -> Effectful(expression(scope, effectful)),
+    Assign(assigned, value) -> Assign(value_of(scope, assigned), expression(scope, value)),
+  }
+
+// --- Items ---------------------------------------------------------------------------------------
+
+fn form(filling: Filling, template: Template) -> Stored / {picking.pick, abort.raise} = {
+  let scope = { filling: filling, runs: Map::new() };
+  let type_filled = |each: TemplateType| filled_type(filling, each);
+  match template {
+    FunctionOf(function) ->
+      FunctionOf({
+        generics: function.generics,
+        parameters: function.parameters.map(
+          |parameter: stored::Parameter<Int, Slotted, Spot, Note>|
+            {
+              kept: parameter.kept,
+              spaced: parameter.spaced,
+              annotation: optional_type(scope, parameter.annotation),
+              default: optional_expression(scope, parameter.default),
+            },
+        ),
+        returned: optional_type(scope, function.returned),
+        row: function.row.map(|row: Row<Int, Slotted>| filled_row(filling, row)),
+        constraints: function.constraints,
+        returns: function.returns,
+        decreases: optional_expression(scope, function.decreases),
+        baked: function.baked.map(|nodes: List<Int>|
+          nodes.map(|node: Int| reference_of(filling, node))),
+        body: expression(scope, function.body),
+      }),
+    TypeOf(declared) ->
+      TypeOf({
+        generics: declared.generics,
+        over: declared.over,
+        constraints: declared.constraints,
+        body: match declared.body {
+          Alias(aliased) -> Alias(type_filled(aliased)),
+          Sum(name, variants) ->
+            Sum(
+              name,
+              variants.map(|variant: stored::Variant<Int, Slotted>|
+                { name: variant.name, fields: variant.fields.map(type_filled) }),
+            ),
+          Nominal(name, wrapped) -> Nominal(name, type_filled(wrapped)),
+          Extern(name) -> Extern(name),
+        },
+        opaque: declared.opaque,
+        through: declared.through.map(|through: stored::Through<Int, Spot>|
+          { key: through.key, by: value_of(scope, through.by) }),
+        numerics: declared.numerics.map(|arithmetic: stored::Numeric<Int, Spot>|
+          { operation: arithmetic.operation, by: value_of(scope, arithmetic.by) }),
+      }),
+    EffectOf(declared) ->
+      EffectOf({
+        name: declared.name,
+        nondet: declared.nondet,
+        operations: declared.operations.map(|operation: stored::Operation<Int, Slotted>|
+          {
+            name: operation.name,
+            mode: operation.mode,
+            resource: operation.resource,
+            types: operation.types,
+            parameters: operation.parameters.map(type_filled),
+            returned: type_filled(operation.returned),
+          }),
+      }),
+    TestOf(declared) ->
+      TestOf({
+        nondet: declared.nondet,
+        cases: optional_type(scope, declared.cases),
+        body: expression(scope, declared.body),
+      }),
+    LawOf(declared) ->
+      LawOf({
+        binders: declared.binders.map(type_filled),
+        guard: optional_expression(scope, declared.guard),
+        body: expression(scope, declared.body),
+      }),
+    SpecOf(declared) ->
+      SpecOf({
+        kind: declared.kind,
+        generics: declared.generics,
+        parameters: declared.parameters,
+        names: declared.names,
+        body: expression(scope, declared.body),
+      }),
+  }
+}
