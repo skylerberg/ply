@@ -83,7 +83,12 @@ impl Bound {
             .unwrap_or_else(|| panic!("the registry serves `{effect}.{op}` under {label:?}"));
         let request = HostRequest {
             machine: MachineId(1),
-            atom: served.atom.clone(),
+            atom: ply_core::EffectAtom::operation(
+                effect,
+                ply_core::host::resource_of(label.as_ref()),
+                ply_core::Mode::Write,
+                op,
+            ),
             op: served.op,
             args: &args,
             span: Span::DUMMY,

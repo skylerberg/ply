@@ -469,14 +469,64 @@ pub(crate) struct Reached {
 }
 
 impl HandlerFrame {
-    /// Whether a branch performing what `reach` lists could reach this frame.
+    /// Whether a branch performing what `reach` lists could reach a clause of this frame that
+    /// cannot answer it from another thread.
     pub(super) fn within(&self, reach: &[Reached]) -> bool {
         self.simulate
             || self
                 .clauses
                 .iter()
-                .any(|cl| reach.iter().any(|reached| cl.may_answer(reached)))
+                .any(|cl| !self.crosses(cl) && reach.iter().any(|reached| cl.may_answer(reached)))
     }
+
+    /// Whether every clause of this frame can answer from another thread.
+    pub(super) fn crosses_whole(&self) -> bool {
+        !self.simulate && self.clauses.iter().all(|cl| self.crosses(cl))
+    }
+
+    /// Whether `cl` can answer a perform of a branch running on another thread, in a copy of this
+    /// frame the branch is given: it resumes on its tail, so it neither unwinds to its `handle` nor
+    /// captures, its frame holds no variables, and its closure is immortal, so the threads count
+    /// nothing of it between them.
+    pub(super) fn crosses(&self, cl: &FrameClause) -> bool {
+        self.vars.is_none()
+            && self.detached.is_none()
+            && !self.simulate
+            && cl.resumes == 1
+            && !cl.raises()
+            && immortal(cl.closure)
+    }
+
+    /// A copy of the clauses of this frame that cross, for a branch on another thread; none where
+    /// none does. It is never landed: its `handle` is on the thread that runs the block.
+    pub(super) fn crossing_copy(&self) -> Option<HandlerFrame> {
+        let clauses: Vec<FrameClause> = (self.clauses.iter())
+            .filter(|cl| self.crosses(cl))
+            .map(|cl| FrameClause {
+                effect: cl.effect.clone(),
+                resource: cl.resource.clone(),
+                op: cl.op.clone(),
+                closure: cl.closure,
+                resumes: cl.resumes,
+                label: cl.label,
+                string: cl.string,
+            })
+            .collect();
+        (!clauses.is_empty()).then_some(HandlerFrame {
+            clauses,
+            ret: 0,
+            simulate: false,
+            detached: None,
+            fuel: self.fuel,
+            handler: self.handler,
+            vars: None,
+        })
+    }
+}
+
+/// Whether `w` is a block no count is kept of, as a closure that captures nothing is.
+fn immortal(w: Word) -> bool {
+    heap::is_object(w) && unsafe { heap::count_of(obj(w)) } == heap::IMMORTAL
 }
 
 /// `f` again, each closure held once more, and its handler's variables shared with it where

@@ -2,6 +2,7 @@
 
 use crate::config::Configuration;
 use crate::payload::{count, diags_value, option, places_value, record, strings};
+use ply_compiled::entry::Grants;
 use ply_core::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
     HostRequest, HostResource, HostRow, HostRuntime, Linearity, MachineId,
@@ -196,6 +197,98 @@ impl Hosts {
         )
     }
 
+    /// The binding of the families this runtime serves itself, from what a run is lent alone: no
+    /// program's rows are read. Under `hermetic` every host family is registered withheld, so an
+    /// operation that reaches one is refused naming what would serve it; `lent` are the caller's
+    /// families beside them.
+    pub fn granted(grants: &Grants, lent: Vec<LentOp>) -> Result<Hosts, Vec<Diagnostic>> {
+        let pairs = |name: &'static str| {
+            grants.named(name).filter_map(|fields| match fields {
+                [name, path] => Some((name.clone(), std::path::PathBuf::from(path))),
+                _ => None,
+            })
+        };
+        let config = Configuration::default();
+        if grants.has("hermetic") {
+            let mut registry = registry_for(None).withheld_all("under `--host`");
+            for (op, handler) in lent {
+                registry.register(op, handler);
+            }
+            return Ok(Hosts {
+                host: None,
+                binding: Arc::new(registry.granted()),
+                listing: HostListing::default(),
+                config,
+                observability: None,
+                shutdown: None,
+            });
+        }
+        let credentials: Vec<tls::CredentialSpec> = grants
+            .named("tls")
+            .filter_map(|fields| match fields {
+                [name, certificate, key] => Some(tls::CredentialSpec {
+                    name: name.clone(),
+                    certificate: certificate.into(),
+                    key: key.into(),
+                }),
+                _ => None,
+            })
+            .collect();
+        let first = |name: &'static str| {
+            grants
+                .named(name)
+                .filter_map(|fields| fields.first().cloned())
+                .collect::<Vec<String>>()
+        };
+        let trust: Vec<std::path::PathBuf> = first("trust").into_iter().map(Into::into).collect();
+        let material = tls::Credentials::load(&credentials, &trust, &first("mtls"))?;
+        let roots: Vec<ply_host::fs::RootSpec> = pairs("fs")
+            .map(|(name, path)| ply_host::fs::RootSpec { name, path })
+            .collect();
+        let roots = ply_host::fs::Roots::load(&roots, Span::DUMMY).map_err(|d| vec![d])?;
+        let programs: Vec<ply_host::process::ExecSpec> = pairs("exec")
+            .map(|(name, path)| ply_host::process::ExecSpec { name, path })
+            .collect();
+        let executables =
+            ply_host::process::Executables::load(&programs, Span::DUMMY).map_err(|d| vec![d])?;
+        let process = if grants.has("spawning") {
+            Some(ply_host::process::ProcessHost::spawning(executables))
+        } else {
+            grants.named("argv").next().map(|argv| {
+                let out = if grants.has("stderr") {
+                    ply_host::process::Stream::Err
+                } else {
+                    ply_host::process::Stream::Out
+                };
+                ply_host::process::ProcessHost::new(
+                    argv.to_vec(),
+                    ply_host::process::OutputSink::Real { out },
+                )
+                .executing(executables)
+            })
+        };
+        let mut facilities = ply_host::Host::with_credentials(material)
+            .configured(Arc::clone(&config.snapshot))
+            .rooted(roots)
+            .traced(crate::trace::TraceOptions::default().open());
+        if let Some(process) = process {
+            facilities = facilities.with_process(process);
+        }
+        let facilities = Arc::new(facilities);
+        let mut registry = facilities.registry();
+        for (op, handler) in lent {
+            registry.register(op, handler);
+        }
+        Ok(Hosts {
+            host: Some(facilities),
+            binding: Arc::new(registry.granted()),
+            listing: HostListing::default(),
+            config,
+            observability: None,
+            shutdown: None,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn open_over(
         check: &CheckOutput,
@@ -383,6 +476,16 @@ impl Hosts {
             .as_ref()
             .map(|h| h.handshakes())
             .unwrap_or_default()
+    }
+}
+
+impl ply_compiled::entry::Bound for Hosts {
+    fn binding(&self) -> Arc<HostBinding> {
+        Hosts::binding(self)
+    }
+
+    fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
+        Hosts::runtime_factory(self)
     }
 }
 

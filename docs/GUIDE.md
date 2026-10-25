@@ -1624,7 +1624,9 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
 * The branches spend one step budget between them (`E0503`, §8.4), as they would
   in turn.
 * A block whose branches could reach a `handle` around it or a `simulate` region
-  (§9) runs them in turn, which answers the same. A block written in a
+  (§9) runs them in turn, which answers the same. A clause that resumes on its
+  tail, captures nothing and whose `handle` holds no `var` keeps no block in
+  turn: each branch is answered by a copy of it on its own thread. A block written in a
   definition's own body is held to that definition's row: a `handle` that
   answers no effect in it does not keep the block in turn. One inside a lambda
   or the body of a `handle` is kept in turn by any `handle` around it. So is

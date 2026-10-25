@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 12] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("names", "ply_privileged::shipped::names"),
     ("module", "ply_privileged::shipped::module"),
     ("answer", "ply_privileged::shipped::answer"),
@@ -16,7 +16,6 @@ const OPERATIONS: [(&str, &str); 12] = [
     ("stamps", "ply_privileged::shipped::stamps"),
     ("runtime", "ply_privileged::shipped::runtime"),
     ("runnable", "ply_privileged::shipped::runnable"),
-    ("front", "ply_privileged::shipped::front"),
     ("values", "ply_privileged::shipped::values"),
     ("definitions", "ply_privileged::shipped::definitions"),
 ];
@@ -148,57 +147,55 @@ impl HostHandler for Shipped {
                 })?;
                 PlyValue::bytes(bytes)
             }
-            ("front", [linked]) => {
-                PlyValue::bytes(ply_core::codec::encode(linked).map_err(|why| {
-                    Diagnostic::error(
-                        codes::INTERNAL_ERROR,
-                        format!("the program's front end does not encode: {why}"),
-                    )
-                    .primary(span, "this is Ply's fault")
-                })?)
-            }
-            ("values", [files, dump, unit, roots, steps]) => {
-                values(files, dump, unit, roots, steps, span)?
-            }
+            ("values", [library, roots, steps]) => values(library, roots, steps, span)?,
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
         Ok(HostAnswer::Value(value))
     }
 }
 
-/// What each stored root answers on the unit emitted over `files` and `dump` and compiled into the
-/// library `unit`, as [`crate::enter::stored_values`] enters them.
+/// What each of `roots`, a `const` definition's stored root, answers on the unit compiled into the
+/// library `library`: each entered by name with nothing, binding no host, under `steps` calls. A
+/// stored root answers the bytes a build keeps its definition's value as; one that raised, ran past
+/// its calls, answered anything else or is not in the unit answers none.
 fn values(
-    files: &PlyValue,
-    dump: &PlyValue,
-    unit: &PlyValue,
+    library: &PlyValue,
     roots: &PlyValue,
     steps: &PlyValue,
     span: ply_core::Span,
 ) -> Result<PlyValue, Diagnostic> {
-    let front = crate::driver::loaded_analysis_of(
-        &crate::payload::record(vec![
-            ("dump", dump.clone()),
-            ("files", files.clone()),
-            ("read_ms", PlyValue::Int(0)),
-            ("front_ms", PlyValue::Int(0)),
-            ("file_ms", PlyValue::Int(0)),
-            ("cached", PlyValue::Bool(false)),
-        ]),
-        span,
-    )?;
-    let unit = std::path::PathBuf::from(unit.as_str(span, "the unit's library")?);
+    use ply_compiled::entry::{self, Ended, Opened, Run};
+    let library = std::path::PathBuf::from(library.as_str(span, "the unit's library")?);
     let roots = roots
         .as_list(span, "the stored roots")?
         .iter()
         .map(|root| root.as_str(span, "a stored root").map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    let steps = steps.as_int(span, "the calls each may make")?;
-    let answered = crate::enter::stored_values(front, unit, roots, steps)?;
+    let run = Run {
+        steps: steps.as_int(span, "the calls each may make")?,
+        ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
+    };
+    let opened = Opened::open(&library).map_err(|why| {
+        Diagnostic::error(
+            codes::BACKEND_UNAVAILABLE,
+            format!("the unit could not be loaded: {why}"),
+        )
+        .primary(span, "its constants were to be entered here")
+    })?;
     Ok(PlyValue::list(
-        answered
-            .into_iter()
-            .map(|value| crate::payload::option(value.map(PlyValue::bytes)))
+        roots
+            .iter()
+            .map(|root| {
+                let kept =
+                    match entry::enter(&opened, root, entry::no_arguments(), &run, None).ended {
+                        Ended::Answered(bytes) => match ply_core::codec::decode(&bytes) {
+                            Ok(kept @ PlyValue::Bytes(_)) => Some(kept),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                crate::payload::option(kept)
+            })
             .collect(),
     ))
 }

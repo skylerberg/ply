@@ -66,7 +66,12 @@ fn perform(
         .expect("the registry serves this triple");
     let request = HostRequest {
         machine: ply_core::host::MachineId(1),
-        atom: bound.atom.clone(),
+        atom: ply_core::EffectAtom::operation(
+            EFFECT,
+            ply_core::Resource::Named(Symbol::new(resource)),
+            ply_core::Mode::Write,
+            op.name(),
+        ),
         op: bound.op,
         args: &args,
         span: Span::DUMMY,

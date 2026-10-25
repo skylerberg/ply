@@ -1,7 +1,8 @@
 //! The seam a machine enters a unit through: what it declines, what it counts, and the program it
 //! describes. Each unit here is written by hand (`crate::units`), so no program is compiled.
 
-use crate::units::{self, Def, def, int_entry, lifting, native};
+use super::entry::{encoded_defs, entering, string_read};
+use crate::units::{self, Def, def, lifting, native};
 use ply_compiled::{Bodies, Unit};
 use ply_core::{Analysis, Compiled, DefHash, Machine, Provider, Span, Symbol, Value, codes};
 use std::rc::Rc;
@@ -13,103 +14,6 @@ fn bodies(unit: &Arc<Unit>) -> Rc<Bodies> {
 
 fn enter(bodies: &Bodies, name: &str, args: &[Value], budget: usize) -> Option<Value> {
     Compiled::enter(bodies, &Symbol::new(name), args, budget)
-}
-
-/// A string read from the lifting into `buf`, its length `n`.
-fn string_read() -> String {
-    format!(
-        "  char buf[64];\n  Word n = {}(ctx);\n  if (ctx->failed || n > 64) return 0;\n  {}(ctx, (Word)(intptr_t)buf, n);",
-        native("?in_str"),
-        native("?taken"),
-    )
-}
-
-/// The definitions the tests enter: each root `R` beside the `R#entered` it is entered through, and
-/// `m.helper`, which has none. `m.ladder` nests a call `n` deep.
-fn encoded_defs() -> Vec<Def> {
-    let ladder = units::symbol("m.ladder");
-    vec![
-        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
-        def("m.double#entered", 0, &int_entry("m.double")),
-        def(
-            "m.ladder",
-            1,
-            &format!(
-                "  if (ctx->fuel <= 0) {{ rt_no_fuel_p(ctx); return 0; }}\n\
-                 \x20 ctx->fuel -= 1;\n\
-                 \x20 int64_t n = ply_imm_value(p0);\n\
-                 \x20 Word r = ply_imm(0);\n\
-                 \x20 if (n > 0) {{ r = {ladder}(ctx, ply_imm(n - 1)); if (ctx->failed) return 0; r = ply_imm(ply_imm_value(r) + 1); }}\n\
-                 \x20 ctx->fuel += 1;\n\
-                 \x20 return r;"
-            ),
-        ),
-        def("m.ladder#entered", 0, &int_entry("m.ladder")),
-        def("m.greet", 1, "  return p0;"),
-        def(
-            "m.greet#entered",
-            0,
-            &format!(
-                "{}  {}(ctx, {}, 2);\n  {}(ctx, (Word)(intptr_t)\"length\", 6);\n  {}(ctx, n);\n  {}(ctx, (Word)(intptr_t)\"text\", 4);\n  {}(ctx, (Word)(intptr_t)buf, n);\n  return 0;",
-                lifting(&string_read()),
-                native("?out_count"),
-                ply_core::codec::tag::RECORD,
-                native("?out_name"),
-                native("?out_int"),
-                native("?out_name"),
-                native("?out_str"),
-            ),
-        ),
-        def("m.closure", 0, "  return 0;"),
-        def(
-            "m.closure#entered",
-            0,
-            &format!(
-                "{}  {}(ctx, 0, (Word)(intptr_t)\"m.f\", 3);\n  return 0;",
-                lifting(""),
-                native("?out_fun"),
-            ),
-        ),
-        def("m.keep", 1, "  return p0;"),
-        def(
-            "m.keep#entered",
-            0,
-            &format!(
-                "{}  {}(ctx, s);\n  return 0;",
-                lifting(&format!("  Word s = {}(ctx);", native("?in_handle"))),
-                native("?out_handle"),
-            ),
-        ),
-        def("m.fail", 1, "  return p0;"),
-        def(
-            "m.fail#entered",
-            0,
-            &format!(
-                "{}  {}(ctx, 0);\n  {}(ctx, {}, 1);\n  {}(ctx, (Word)(intptr_t)buf, n);\n  rt_builtin_encoded_p(ctx, 0);\n  return 0;",
-                lifting(&string_read()),
-                native("?lower_open"),
-                native("?out_count"),
-                ply_core::codec::tag::LIST,
-                native("?out_str"),
-            ),
-        ),
-        def("m.helper", 1, "  return p0;"),
-    ]
-}
-
-/// The roots of [`encoded_defs`] each entered through its `R#entered`.
-fn entering(e: &mut units::Laid) {
-    e.entered = [
-        "m.double",
-        "m.ladder",
-        "m.greet",
-        "m.closure",
-        "m.keep",
-        "m.fail",
-    ]
-    .map(str::to_string)
-    .to_vec();
-    e.builtins = vec![ply_core::Builtin::Panic];
 }
 
 /// The unit over `defs`, its table as `adjust` leaves it, opened for a program of them.

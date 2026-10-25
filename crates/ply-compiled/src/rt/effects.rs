@@ -182,12 +182,13 @@ unsafe fn performed(
     let n = args.len() as i64;
     let args = args.as_ptr();
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
+    let mode = if mode != 0 { Mode::Write } else { Mode::Read };
     let atom = EffectAtom::operation(
         effect.clone(),
         resource
             .clone()
             .map_or(Resource::Singleton, Resource::Named),
-        if mode != 0 { Mode::Write } else { Mode::Read },
+        mode,
         op.clone(),
     );
     // A step conflicts on the mode, and a scheduled draw's access is recorded here alone.
@@ -279,6 +280,7 @@ unsafe fn performed(
                 &effect,
                 &op,
                 resource.as_ref(),
+                mode,
                 args_of(args, n),
             )
         };
@@ -328,6 +330,7 @@ unsafe fn to_host(
     effect: &Symbol,
     op: &Symbol,
     resource: Option<&Symbol>,
+    mode: Mode,
     args: &[Word],
 ) -> i64 {
     if crate::host::production_scheduled(unsafe { &*ctx }, effect, op) {
@@ -348,7 +351,7 @@ unsafe fn to_host(
             return unsafe { &mut *ctx }.fail(d);
         }
     };
-    let served = unsafe { crate::host::serve(ctx, effect, op, resource, values) };
+    let served = unsafe { crate::host::serve(ctx, effect, op, resource, mode, values) };
     answered(ctx, served, described)
 }
 

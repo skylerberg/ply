@@ -11,6 +11,7 @@ pub mod blocks;
 pub mod c;
 pub mod detached;
 pub mod emitted;
+pub mod entry;
 pub mod frames;
 pub mod heap;
 pub mod host;

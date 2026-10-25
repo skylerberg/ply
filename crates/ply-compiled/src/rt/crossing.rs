@@ -854,9 +854,45 @@ impl Ctx {
     }
 }
 
-/// Ends the lowering [`Ctx::open_entry`] opened and reads the answer in it; an error where the entry
-/// ended that lowering or left another crossing open.
+/// Ends the lowering [`Ctx::open_entry`] opened and reads the answer in it.
 pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
+    let l = entry_lowering(ctx)?;
+    if l.functions {
+        return Ok(EntryAnswer::Function);
+    }
+    let holding = !l.beside.is_empty() || l.resumes;
+    Ok(EntryAnswer::Read {
+        value: read_back(ctx, l)?,
+        holding,
+    })
+}
+
+/// What an entry's `R#entered` wrote of its root's answer, kept as the bytes it wrote.
+pub(crate) enum EntryBytes {
+    /// The answer's PLV1, untouched.
+    Bytes(Vec<u8>),
+    /// The answer holds what the bytes cannot, read as the value it stands for, so the boundary
+    /// can say why it stays in its run.
+    Holding(Value),
+    /// The answer holds a function the program wrote, which only its own run can hold.
+    Function,
+}
+
+/// [`close_entry`], the answer kept as bytes where they hold all of it.
+pub(crate) fn close_entry_bytes(ctx: *mut Ctx) -> Result<EntryBytes, String> {
+    let l = entry_lowering(ctx)?;
+    if l.functions {
+        return Ok(EntryBytes::Function);
+    }
+    if !l.beside.is_empty() || l.resumes {
+        return Ok(EntryBytes::Holding(read_back(ctx, l)?));
+    }
+    Ok(EntryBytes::Bytes(l.w.finish()))
+}
+
+/// Ends the lowering [`Ctx::open_entry`] opened and answers it; an error where the entry ended that
+/// lowering or left another crossing open.
+fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
     let c = unsafe { &mut *ctx };
     let open = c.crossings.len();
     if open != 1 {
@@ -869,15 +905,8 @@ pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
             ),
         });
     }
-    let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
-        return Err("the entry ended the lowering its answer was to be written into".into());
-    };
-    if l.functions {
-        return Ok(EntryAnswer::Function);
+    match c.crossings.pop() {
+        Some(Crossing::Lowering(l)) => Ok(l),
+        _ => Err("the entry ended the lowering its answer was to be written into".into()),
     }
-    let holding = !l.beside.is_empty() || l.resumes;
-    Ok(EntryAnswer::Read {
-        value: read_back(ctx, l)?,
-        holding,
-    })
 }

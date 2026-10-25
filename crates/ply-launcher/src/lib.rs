@@ -2,23 +2,24 @@
 //! shipped modules beside it, and its environment lent.
 //!
 //! This is the whole of what stands between the operating system and the program `ply` is: the
-//! big-stack thread, the program's front end read from the pack, the `cwd` and `shipped` roots, the
-//! process and environment bindings, and the exit code.
+//! big-stack thread, the definition the pack says the program enters, the `cwd` and `shipped`
+//! roots, the process and environment bindings, and the exit code.
 
-use ply_core::{Analysis, Diagnostic, Ended, codes};
-use ply_privileged::enter::{self, Binds};
+use ply_compiled::entry::{self, Ended, Grants, Opened};
+use ply_core::{Diagnostic, codes};
 use std::path::{Path, PathBuf};
 
-/// Where the pack carries what the linked program's front end answered of the definition it
-/// enters: a `front.Linked` in the value codec.
+/// Where the pack carries what a launcher reads of the linked program: the definition it enters
+/// and each `fn` that one reaches with its hash.
 pub const FRONT: &str = "program/front";
 
-/// What a launched program is: the definition it enters, what its front end answered of that
-/// definition, the stage its shipped modules are laid out under, and the binary's version for the
-/// environment it may ask about.
+/// The line a front of this launcher's own format opens with, which the program's builder writes.
+const FRONT_FORMAT: &[u8] = b"ply entry 1\n";
+
+/// What a launched program is: the definition it enters, the stage its shipped modules are laid
+/// out under, and the binary's version for the environment it may ask about.
 pub struct Program {
     pub entry: String,
-    pub front: Analysis,
     /// Each `fn` the entry reaches and its hash, a `name hash` line each in name order.
     pub definitions: String,
     /// The stage's identity: the shipped modules land under it, beside the C cache.
@@ -26,23 +27,58 @@ pub struct Program {
     pub version: String,
 }
 
-/// The program this executable was linked with, as its pack carries its front end's answer.
+/// The program this executable was linked with, as its pack names it.
 pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
     let pack = ply_pack::installed();
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
         return Err(unlinked(format!("its pack carries no `{FRONT}`")));
     };
-    let value = ply_core::codec::decode(bytes)
-        .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    let linked = ply_compiled::c::dump::linked(&value).map_err(|why| unlinked(why.to_string()))?;
+    let (entry, definitions) = match bytes.strip_prefix(FRONT_FORMAT) {
+        Some(rest) => {
+            let text = std::str::from_utf8(rest)
+                .map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
+            let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
+            (entry.to_string(), definitions.to_string())
+        }
+        None => released_front(bytes)?,
+    };
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
-        entry: linked.entry.to_string(),
-        front: linked.front,
-        definitions: linked.definitions,
+        entry,
+        definitions,
         stage: format!("native-{stage}"),
         version: version.to_string(),
     })
+}
+
+/// The entry and definitions of the front a release's `ply bootstrap` packs a builder with: a
+/// `front.Linked` in the value codec, of which nothing else is read.
+fn released_front(bytes: &[u8]) -> Result<(String, String), Diagnostic> {
+    use ply_core::Value;
+    let value = ply_core::codec::decode(bytes)
+        .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
+    fn field<'v>(v: &'v Value, name: &str) -> Option<&'v Value> {
+        match v {
+            Value::Record(fields) => fields
+                .iter()
+                .find(|(k, _)| k.as_str() == name)
+                .map(|(_, v)| v),
+            _ => None,
+        }
+    }
+    let text = |v: Option<&Value>| match v {
+        Some(Value::Str(s)) => Some(s.to_string()),
+        Some(Value::Bytes(b)) => String::from_utf8(b.to_vec()).ok(),
+        _ => None,
+    };
+    let entry = text(field(&value, "entry").and_then(|e| field(e, "name")));
+    let definitions = text(field(&value, "definitions"));
+    match (entry, definitions) {
+        (Some(entry), Some(definitions)) => Ok((entry, definitions)),
+        _ => Err(unlinked(format!(
+            "`{FRONT}` names no entry and definitions"
+        ))),
+    }
 }
 
 #[cold]
@@ -77,32 +113,43 @@ pub fn install_own_pack() -> Result<(), String> {
     }
 }
 
-/// The PEM files `PLY_TRUST` names, separated as `PATH` separates directories: roots the program's
-/// own `net.connect_tls` accepts beside the built-in ones, as `--trust` gives a program a command
-/// runs. One that does not load is `E0430` before the program runs.
-pub fn trust() -> Vec<PathBuf> {
-    match std::env::var_os("PLY_TRUST") {
-        None => Vec::new(),
-        Some(value) => std::env::split_paths(&value)
-            .filter(|path| !path.as_os_str().is_empty())
-            .collect(),
+/// What the `ply` program is lent: every family; its roots, `cwd` at `root`, `shipped` at the
+/// shipped modules and `abs` at the filesystem's root (the program is the tool, so a path that
+/// leaves the working directory is addressed under `abs`); its command line; the `git` on `PATH`
+/// for its `process.spawn[git]`, which fetches a git dependency, and is unbound where none can be
+/// started (the program reads that with `process.bound[git]`); and the PEM files `PLY_TRUST` names,
+/// separated as `PATH` separates directories, which its own `net.connect_tls` accepts beside the
+/// built-in roots, as `--trust` gives a program a command runs (one that does not load is `E0430`
+/// before the program runs).
+pub fn grants(root: &Path, shipped: &Path, argv: &[String]) -> Grants {
+    let path = |p: &Path| p.display().to_string();
+    let mut grants = Grants::default()
+        .with("fs", &["cwd", &path(root)])
+        .with("fs", &["shipped", &path(shipped)])
+        .with("fs", &["abs", "/"]);
+    for family in ply_privileged::policy::names() {
+        grants = grants.with("allow", &[family]);
     }
-}
-
-/// The programs the `ply` program's own `process.spawn` labels start: the `git` on `PATH`, which
-/// fetches a git dependency. Where none is installed the label stays unbound, which the program
-/// reads with `process.bound[git]`.
-pub fn executables() -> ply_host::process::Executables {
-    let mut executables = ply_host::process::Executables::new();
     let git = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
             .map(|dir| dir.join("git"))
-            .find(|program| program.is_file())
+            .find(|program| {
+                program.is_file()
+                    && ply_host::process::Executables::new()
+                        .bind("git", program, ply_core::Span::DUMMY)
+                        .is_ok()
+            })
     });
     if let Some(git) = git {
-        let _ = executables.bind("git", &git, ply_core::Span::DUMMY);
+        grants = grants.with("exec", &["git", &path(&git)]);
     }
-    executables
+    if let Some(value) = std::env::var_os("PLY_TRUST") {
+        for trusted in std::env::split_paths(&value).filter(|p| !p.as_os_str().is_empty()) {
+            grants = grants.with("trust", &[&path(&trusted)]);
+        }
+    }
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    grants.with("argv", &argv)
 }
 
 /// Not `.ply` files, so the program's own listing passes over them.
@@ -218,47 +265,44 @@ fn reporting() -> Option<std::sync::Arc<dyn Fn() + Send + Sync>> {
     Some(write)
 }
 
-/// Enter the program on the command's own big-stack thread; the answer is the exit code it asked
-/// for, with what the entry ended with. `binds` lends whatever the caller's command configured on
-/// top of the launcher's own.
+/// How a launched program ended: the exit code it asked for, or what stopped it, as it is printed;
+/// and what its host runtime warned of as it ended.
+pub struct Launched {
+    pub code: Result<i32, String>,
+    pub warnings: Vec<Diagnostic>,
+}
+
+impl Launched {
+    fn refused(d: Diagnostic) -> Launched {
+        Launched {
+            code: Err(d.to_string()),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+/// Enter the program on the command's own big-stack thread, lent `lent` beside the families the
+/// runtime serves itself and the launcher's own environment.
 pub fn run(
     program: Program,
     root: &Path,
     argv: Vec<String>,
-    mut binds: Binds,
+    mut lent: Vec<ply_privileged::hosts::LentOp>,
     count: Option<crate::count::Asked>,
-) -> Ended<i32> {
+) -> Launched {
     ply_compiled::c::sweep::once();
     let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
-        Err(refused) => return Ended::refused(refused),
+        Err(refused) => return Launched::refused(refused),
     };
     ply_host::observe::laid_out(&shipped, ply_compiled::c::kept_dirs());
     let reporting = reporting();
     ply_privileged::shipped::stamp(stamps());
     ply_privileged::shipped::entered(&program.entry, definitions);
-    let version = program.version.clone();
-    let opened = enter::opened_linked(program.front, &program.entry);
-    let mut roots = vec![
-        ply_host::fs::RootSpec {
-            name: "cwd".to_string(),
-            path: root.to_path_buf(),
-        },
-        ply_host::fs::RootSpec {
-            name: "shipped".to_string(),
-            path: shipped,
-        },
-        // The program is the tool: a path that leaves the working directory is addressed under
-        // `abs`, the filesystem's root.
-        ply_host::fs::RootSpec {
-            name: "abs".to_string(),
-            path: PathBuf::from("/"),
-        },
-    ];
-    roots.append(&mut binds.roots);
-    binds.roots = roots;
-    binds.lent.extend(crate::env::registrations(&version));
+    let grants = grants(root, &shipped, &argv);
+    lent.extend(crate::env::registrations(&program.version));
+    let entry = program.entry;
     // The program is the tool's own work rather than a program under test, so the budgets a run
     // gives a program are not its. The entry runs on a thread of its own, with the stack a front
     // end's recursion wants.
@@ -266,12 +310,11 @@ pub fn run(
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
         .spawn(move || {
+            let launch = || ply_compiled::rt::unbounded(|| entered(&entry, &grants, lent));
             match count {
                 Some(asked) => {
-                    let (answer, counted, sites) = crate::count::window_sampled(
-                        || ply_compiled::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
-                        asked.every(),
-                    );
+                    let (launched, counted, sites) =
+                        crate::count::window_sampled(launch, asked.every());
                     // The entry's answer stands: the run happened, and a count that could not
                     // be written is reported rather than replacing what the program did.
                     if let Err(e) = crate::count::write(&asked.path, counted, &sites, asked.every())
@@ -281,28 +324,87 @@ pub fn run(
                             asked.path.display()
                         );
                     }
-                    answer
+                    launched
                 }
-                None => ply_compiled::rt::unbounded(|| enter::enter_linked(opened, argv, binds)),
+                None => launch(),
             }
         });
     match work {
         Ok(thread) => match thread.join() {
-            Ok(answer) => {
+            Ok(launched) => {
                 if let Some(write) = reporting {
                     write();
                 }
-                answer
+                launched
             }
             Err(panic) => std::panic::resume_unwind(panic),
         },
-        Err(e) => Ended::refused(
+        Err(e) => Launched::refused(
             Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("the program could not be started on a thread of its own: {e}"),
             )
             .primary(ply_core::Span::DUMMY, "this is Ply's fault"),
         ),
+    }
+}
+
+/// The linked program's `entry` entered with nothing, under the binding `grants` and `lent` make.
+fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp>) -> Launched {
+    let opened = match Opened::linked() {
+        Ok(opened) => opened,
+        Err(why) => {
+            return Launched::refused(Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the program linked into this executable could not be bound: {why}"),
+            ));
+        }
+    };
+    let hosts = match ply_privileged::hosts::Hosts::granted(grants, lent) {
+        Ok(hosts) => hosts,
+        Err(diagnostics) => {
+            return Launched::refused(diagnostics.into_iter().next().unwrap_or_else(|| {
+                Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "the program's hosts could not be bound, and nothing said why",
+                )
+            }));
+        }
+    };
+    let run = entry::Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64);
+    let outcome = entry::enter(&opened, entry, entry::no_arguments(), &run, Some(&hosts));
+    // Ends the children still running and flushes the sink.
+    let _ = hosts.runtime().map(|rt| rt.shutdown());
+    let code = match (hosts.requested_exit(), outcome.ended) {
+        (Some(code), _) => Ok(code),
+        (None, Ended::Answered(_)) => Ok(0),
+        (None, Ended::Failed(d)) => Err(placed(&d, &opened)),
+        (None, Ended::Panicked(message)) => Err(format!(
+            "Error[{}]: the program panicked: {message}\n  = this is Ply's fault, not the program's",
+            codes::INTERNAL_ERROR
+        )),
+        (None, Ended::NoRoot) => Err(format!(
+            "Error[{}]: this executable's program is entered at no `{entry}`",
+            codes::INTERNAL_ERROR
+        )),
+        (None, Ended::Unanswerable(why)) => Err(format!(
+            "Error[{}]: `{entry}` answered, and {why}",
+            codes::INTERNAL_ERROR
+        )),
+    };
+    Launched {
+        code,
+        warnings: outcome.warnings,
+    }
+}
+
+/// `d` as it is printed, with the definition its primary label's site lies in: the launcher holds
+/// no source to place it in.
+fn placed(d: &Diagnostic, opened: &Opened) -> String {
+    let site = d.primary_span().and_then(|span| opened.root_named(span));
+    match site {
+        Some(root) => format!("{d}\n  = in `{root}`"),
+        None => d.to_string(),
     }
 }
 

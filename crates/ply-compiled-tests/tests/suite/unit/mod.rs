@@ -8,6 +8,7 @@ mod blocks;
 mod c;
 mod detached;
 mod emitted;
+mod entry;
 mod frames;
 mod heap;
 mod linked;

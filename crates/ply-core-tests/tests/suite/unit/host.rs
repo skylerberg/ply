@@ -462,7 +462,7 @@ fn the_footprint_is_exactly_what_resolve_answers() {
         let bound = binding
             .resolve(&row.effect, &row.op, resource.as_ref())
             .unwrap_or_else(|| panic!("{row} resolves"));
-        assert_eq!(bound.atom, row.atom);
+        assert_eq!(bound.op.op, row.op);
     }
 
     let absent = EffectAtom::new(

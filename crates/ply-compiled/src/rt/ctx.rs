@@ -288,7 +288,29 @@ impl Ctx {
         b.id = self.id;
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
+        b.stacks[0].list = self.crossing_frames();
         b
+    }
+
+    /// Copies of what the frames in reach of the running stack answer from another thread,
+    /// outermost first, as a branch's own stack holds them.
+    fn crossing_frames(&self) -> Vec<HandlerFrame> {
+        let mut chain = Vec::new();
+        let mut stack = Some(self.current);
+        while let Some(s) = stack {
+            chain.push(s);
+            stack = self.stacks[s].parent;
+        }
+        chain
+            .into_iter()
+            .rev()
+            .flat_map(|s| {
+                self.stacks[s]
+                    .list
+                    .iter()
+                    .filter_map(HandlerFrame::crossing_copy)
+            })
+            .collect()
     }
 
     /// Takes back what a finished branch did, in the order the branches are written: its memory,
@@ -323,7 +345,7 @@ impl Ctx {
             let frames = &self.stacks[s].list;
             let held = match reach {
                 Some(reach) => frames.iter().any(|f| f.within(reach)),
-                None => !frames.is_empty(),
+                None => !frames.iter().all(HandlerFrame::crosses_whole),
             };
             if held {
                 return false;
@@ -354,15 +376,21 @@ impl Ctx {
         self.tick();
     }
 
-    /// Between calls, and only between calls.
+    /// Between calls, and only between calls, bounded as this thread's entries are.
     pub fn begin(&mut self, fuel: i64) {
+        self.begin_bounded(fuel, step_budget(), time_budget_ms());
+    }
+
+    /// [`Ctx::begin`], the entry bounded by `steps` calls and `time_budget_ms` of wall clock, 0
+    /// for no bound.
+    pub fn begin_bounded(&mut self, fuel: i64, steps: i64, time_budget_ms: u64) {
         self.failed = 0;
         self.fuel = fuel;
         self.ticks = 0;
         self.charged = Cost::default();
-        self.step_budget = step_budget();
+        self.step_budget = steps.max(0);
         self.grown = 0;
-        self.time_budget_ms = time_budget_ms();
+        self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
         });
@@ -451,6 +479,16 @@ impl Ctx {
         self.arm_tick();
     }
 
+    /// The thread's heap, poison site and running context put back as they were when this entry
+    /// began: what [`Ctx::end`] does first, and all a Rust unwind out of the entry can do.
+    pub(crate) fn give_thread_back(&mut self) {
+        heap::poison::swap(self.outer.1);
+        heap::swap_current(self.outer.0);
+        swap_running(self.outer_running);
+        self.outer = (std::ptr::null_mut(), std::ptr::null());
+        self.outer_running = std::ptr::null_mut();
+    }
+
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
         // A region left open lets go of the values its tasks passed while the entry's heap lives.
@@ -460,11 +498,7 @@ impl Ctx {
             self.release_later.is_empty() && self.release_depth == 0,
             "an entry ended with a release still running or waiting"
         );
-        heap::poison::swap(self.outer.1);
-        heap::swap_current(self.outer.0);
-        swap_running(self.outer_running);
-        self.outer = (std::ptr::null_mut(), std::ptr::null());
-        self.outer_running = std::ptr::null_mut();
+        self.give_thread_back();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(

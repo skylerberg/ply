@@ -7,7 +7,7 @@ use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
     Bound, HostAnswer, HostBinding, HostRequest, attribute, err_blocking_answered_inline,
-    err_hermetic, err_host_in_search, err_withheld, operation_label,
+    err_hermetic, err_host_in_search, err_withheld, operation_label, resource_of,
 };
 use ply_core::sim::TASK_OPS;
 use ply_core::{
@@ -15,6 +15,7 @@ use ply_core::{
     err_footprint_escape, err_host_in_simulation, err_no_runtime, err_secret_to_host,
     err_unenumerated_atom,
 };
+use ply_core::{EffectAtom, Mode};
 use std::sync::Arc;
 
 /// An at-most-once host operation an entry performed, which a second resumption would replay.
@@ -142,12 +143,14 @@ pub(crate) unsafe fn schedule(
 }
 
 /// `effect.op` performed on the host with `values`, through the machine's checks in the machine's
-/// order. [`production_scheduled`] operations are [`schedule`]'s.
+/// order, `mode` as its declaration states it. [`production_scheduled`] operations are
+/// [`schedule`]'s.
 pub(crate) unsafe fn serve(
     ctx: *mut Ctx,
     effect: &Symbol,
     op: &Symbol,
     resource: Option<&Symbol>,
+    mode: Mode,
     values: Vec<Value>,
 ) -> Served {
     let c = unsafe { &mut *ctx };
@@ -159,7 +162,7 @@ pub(crate) unsafe fn serve(
         Ok(bound) => bound,
         Err(d) => return failed(c, d),
     };
-    let atom = bound.atom.clone();
+    let atom = EffectAtom::operation(effect.clone(), resource_of(resource), mode, op.clone());
     let declaration = bound.op.clone();
     let handler = Arc::clone(bound.handler);
     if let Some(declared) = &c.declared

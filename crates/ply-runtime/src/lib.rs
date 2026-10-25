@@ -86,20 +86,14 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     // Every command family's ops are lent unconfigured to the program, which is this binary's own;
     // the program configures what it drives.
-    let binds = ply_privileged::enter::Binds {
-        lent: ply_privileged::policy::all(),
-        executables: ply_launcher::executables(),
-        trust: ply_launcher::trust(),
-        ..ply_privileged::enter::Binds::default()
-    };
-    let (answer, warnings) = ply_launcher::run(program, &root, argv, binds, count).into_parts();
-    for warning in warnings {
+    let launched = ply_launcher::run(program, &root, argv, ply_privileged::policy::all(), count);
+    for warning in launched.warnings {
         eprintln!("{warning}");
     }
-    let code = match answer {
+    let code = match launched.code {
         Ok(code) => code,
-        Err(diagnostic) => {
-            eprintln!("{diagnostic}");
+        Err(said) => {
+            eprintln!("{said}");
             1
         }
     };

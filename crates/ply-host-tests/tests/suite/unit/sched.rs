@@ -522,7 +522,12 @@ fn dispatching_a_task_perform_to_the_handler_is_refused() {
         .expect("the triple is bound");
     let request = HostRequest {
         machine: ply_core::host::MachineId(1),
-        atom: bound_op.atom.clone(),
+        atom: ply_core::EffectAtom::operation(
+            "task",
+            ply_core::Resource::Singleton,
+            ply_core::Mode::Write,
+            "spawn",
+        ),
         op: bound_op.op,
         args: &[],
         span: Span::DUMMY,

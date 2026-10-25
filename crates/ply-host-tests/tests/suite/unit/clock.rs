@@ -40,7 +40,12 @@ fn answer(host: &Host, binding: &HostBinding, op: Op, args: &[Value]) -> Value {
         .expect("the language's clock is bound");
     let request = HostRequest {
         machine: MachineId(1),
-        atom: bound.atom.clone(),
+        atom: ply_core::EffectAtom::operation(
+            EFFECT,
+            ply_core::Resource::Singleton,
+            Mode::Read,
+            op.name(),
+        ),
         op: bound.op,
         args,
         span: Span::DUMMY,

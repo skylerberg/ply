@@ -169,6 +169,11 @@ fn finish(
     if roots.windows(2).any(|w| w[0].id == w[1].id) {
         bail!("two roots of this unit share a site id");
     }
+    if source.is_none() {
+        for (at, root) in roots.iter_mut().enumerate() {
+            root.span = crate::entry::site_span(at);
+        }
+    }
     let tables = Tables {
         fields,
         builtins,

@@ -241,6 +241,12 @@ impl HostRegistry {
         self.entries.push((op, handler));
     }
 
+    /// Every registration withheld, each refused where an operation reaches it as served `served`.
+    pub fn withheld_all(mut self, served: &'static str) -> HostRegistry {
+        self.withheld = (0..self.entries.len()).map(|at| (at, served)).collect();
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -303,7 +309,19 @@ impl HostRegistry {
             nondeterministic,
             index,
             bound: true,
+            granted: false,
         })
+    }
+
+    /// A binding of every registration, which answers a perform its effect's name, operation and
+    /// label find a registration for: what a run is lent decides the registrations, and no row of
+    /// the program's is read.
+    pub fn granted(self) -> HostBinding {
+        HostBinding {
+            granted: true,
+            bound: true,
+            ..HostBinding::hermetic_with(self)
+        }
     }
 
     /// What would bind, without binding.
@@ -541,7 +559,6 @@ impl HostListing {
 }
 
 pub struct Bound<'a> {
-    pub atom: EffectAtom,
     pub op: &'a HostOp,
     pub handler: &'a Arc<dyn HostHandler>,
 }
@@ -556,6 +573,8 @@ pub struct HostBinding {
     /// Triple -> index into `listing.rows`.
     index: BTreeMap<RowKey, usize>,
     bound: bool,
+    /// Resolves by name against `entries`, with no rows.
+    granted: bool,
 }
 
 impl Default for HostBinding {
@@ -590,6 +609,7 @@ impl HostBinding {
             nondeterministic: BTreeSet::new(),
             index: BTreeMap::new(),
             bound: false,
+            granted: false,
         }
     }
 
@@ -630,11 +650,25 @@ impl HostBinding {
         op: &Symbol,
         resource: Option<&Symbol>,
     ) -> Option<Bound<'_>> {
+        if self.granted {
+            let wanted = resource_of(resource);
+            let declared = Symbol::new(simple_name(effect.as_str()));
+            return (self.entries.iter().enumerate())
+                .find(|(index, (candidate, _))| {
+                    candidate.op == *op
+                        && !self.withheld.contains_key(index)
+                        && registration_names(&candidate.effect, effect, &declared)
+                        && candidate.serves_label(&wanted)
+                })
+                .map(|(_, (registered, handler))| Bound {
+                    op: registered,
+                    handler,
+                });
+        }
         let key = (effect.clone(), op.clone(), resource_of(resource));
         let row = &self.listing.rows[*self.index.get(&key)?];
         let (registered, handler) = &self.entries[row.row];
         Some(Bound {
-            atom: row.atom.clone(),
             op: registered,
             handler,
         })
