@@ -110,7 +110,7 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
             .find(|n| n["name"] == name)
             .unwrap_or_else(|| panic!("no native `{name}`"))
     };
-    let concat = named("Bytes::concat");
+    let concat = named("Secret::concat");
     assert_eq!(
         (&concat["words"], &concat["answers"], &concat["raises"]),
         (&2.into(), &true.into(), &false.into())
@@ -168,7 +168,7 @@ fn the_runtime_describes_what_emitted_code_lays_out_against() {
             .unwrap_or_else(|| panic!("no native `{name}`"))
             .clone()
     };
-    let concat = native("Bytes::concat");
+    let concat = native("Secret::concat");
     assert_eq!(concat["params"], serde_json::json!(["Word", "Word"]));
     assert_eq!(concat["answer"], "Word");
     let out = native("?out_str");
