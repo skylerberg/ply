@@ -41,13 +41,15 @@ import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.check.infer (dump_flag)
 import compiler.check.infer.definitions (Extern, externs_in, declared_natives, program_natives,
-                                         natives_beside)
+                                         natives_beside, MachineCall, MachineValue, MachineInt,
+                                         MachineFloat, MachineText, MachineUnit)
 import compiler.expand.rewrite (Elaborated, elaborated_natives)
 import compiler.emit.layout (Intrinsic, intrinsics)
-import compiler.emit.print.head (unit_head, unit_tail, bound)
+import compiler.emit.print.head (unit_head, unit_tail, bound, pointer_declared)
 import compiler.cc (tail_mark)
+import compiler.emit.abi
 import compiler.emit.abi (Native, Runtime, Unserved, unserved, unserved_line, runtime_of,
-                          uniform_native, serving)
+                          uniform_native, serving, Machine, machine_name)
 import std.prelude_source
 import compiler.front.interface (read_key, sized)
 import compiler.expand.embed (EmbedAt, embed_file)
@@ -131,20 +133,61 @@ pub fn shipped_runtime() -> Runtime / {shipped.runtime, abort.raise} =
 pub type Unbound = { declared: Extern, found: List<Native> }
 
 /// Each of `declared` that `natives` does not implement, in `declared`'s order: every native answers
-/// but a crossing native the compiler declares answering nothing.
+/// but a crossing native the compiler declares answering nothing. A native called over machine words
+/// binds one that takes and answers the kinds its call passes; any other, one that takes as many
+/// words.
 pub fn unbound(natives: List<Native>, declared: List<Extern>) -> List<Unbound> = {
   let by_name = natives.fold(Map::new(), |acc: Map<Bytes, List<Native>>, n: Native|
     acc.insert(n.name, List::push(match acc.get(n.name) { Some(ns) -> ns, None -> [] }, n)));
   declared.fold([], |acc: List<Unbound>, d: Extern| {
     let found = match by_name.get(d.name) { Some(ns) -> ns, None -> [] };
     match found {
-      [n] -> if n.params.len() == d.words && n.answer != None == declared_answers(d)
-          && n.raises == d.raises { acc }
-      else { acc.push({ declared: d, found: found }) },
+      [n] -> if binds(n, d) { acc } else { acc.push({ declared: d, found: found }) },
       _ -> acc.push({ declared: d, found: found }),
     }
   })
 }
+
+fn binds(n: Native, d: Extern) -> Bool =
+  n.raises == d.raises
+    && (match d.call {
+      Some(c) -> n.params == call_params(c) && n.answer == call_answer(c),
+      None -> n.params.len() == d.words && n.answer != None == declared_answers(d),
+    })
+
+/// The kinds a call of `c` passes past the context, as the runtime describes a native's.
+pub fn call_params(c: MachineCall) -> List<Machine> =
+  c.params.fold([], |acc: List<Machine>, v: MachineValue|
+    match v {
+      MachineInt(_) -> acc.push(abi::I64),
+      MachineFloat -> acc.push(abi::F64),
+      MachineText(_) -> acc.push(abi::Addr).push(abi::I64),
+      MachineUnit -> acc,
+    })
+
+/// The kind a call of `c` is answered, as the runtime describes a native's; `None` for nothing.
+pub fn call_answer(c: MachineCall) -> Option<Machine> =
+  match c.answer {
+    MachineInt(_) -> Some(abi::I64),
+    MachineFloat -> Some(abi::F64),
+    MachineText(_) -> Some(abi::Taken),
+    MachineUnit -> None,
+  }
+
+/// Each of `declared` called over machine words, as the unit's C binds it: by its helper's name, at
+/// the kinds its call passes and is answered.
+fn machine_bound(declared: List<Extern>) -> List<Native> / {abort.raise} =
+  declared.fold([], |acc: List<Native>, e: Extern|
+    match e.call {
+      Some(c) ->
+        acc.push({
+          name: builtin_helper(e.name),
+          params: call_params(c),
+          answer: call_answer(c),
+          raises: e.raises,
+        }),
+      None -> acc,
+    })
 
 /// The C helper of each native a unit's bodies call, by its name without the `_p` its pointer
 /// adds, and of each native a body reads as a value, which the runtime calls as that native.
@@ -209,7 +252,11 @@ fn called_externs(
 /// Whether the native `d` declares answers a word: all but a crossing native the compiler declares
 /// answering nothing.
 pub fn declared_answers(d: Extern) -> Bool =
-  d.module != b"" || !elaborated_natives().any(|n: Elaborated| n.name == d.name && !n.answers)
+  match d.call {
+    Some(c) -> c.answer != MachineUnit,
+    None ->
+      d.module != b"" || !elaborated_natives().any(|n: Elaborated| n.name == d.name && !n.answers),
+  }
 
 fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
   Bytes::concat_all([
@@ -220,6 +267,15 @@ fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
     if raises { b" and raises" } else { b" and cannot raise" },
   ])
 
+fn kinds_said(params: List<Machine>, answer: Option<Machine>, raises: Bool) -> Bytes =
+  Bytes::concat_all([
+    b"takes [",
+    Bytes::join(params.map(machine_name), b", "),
+    b"]",
+    match answer { Some(m) -> b", answers ".concat(machine_name(m)), None -> b", answers nothing" },
+    if raises { b" and raises" } else { b" and cannot raise" },
+  ])
+
 /// Why `u` does not bind, as a line of the diagnostic that lists it.
 fn unbound_line(u: Unbound) -> Bytes = {
   let d = u.declared;
@@ -227,14 +283,24 @@ fn unbound_line(u: Unbound) -> Bytes = {
   else { Bytes::concat_all([b"`extern fn ", d.name, b"` of `", d.module, b"`"]) };
   match u.found {
     [] -> named.concat(b": no native of the runtime implements it"),
-    [n] ->
-      Bytes::concat_all([
-        named,
-        b" ",
-        native_said(d.words, declared_answers(d), d.raises),
-        b", and the runtime's native ",
-        native_said(n.params.len(), n.answer != None, n.raises),
-      ]),
+    [n] -> match d.call {
+      Some(c) ->
+        Bytes::concat_all([
+          named,
+          b" ",
+          kinds_said(call_params(c), call_answer(c), d.raises),
+          b", and the runtime's native ",
+          kinds_said(n.params, n.answer, n.raises),
+        ]),
+      None ->
+        Bytes::concat_all([
+          named,
+          b" ",
+          native_said(d.words, declared_answers(d), d.raises),
+          b", and the runtime's native ",
+          native_said(n.params.len(), n.answer != None, n.raises),
+        ]),
+    },
     ns ->
       Bytes::concat_all([
         named,
@@ -1114,7 +1180,8 @@ fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
 /// `tables`, what it lays out for its loader: one translation unit that the loader also compiles in
 /// parts, cut on the marks. A bucket declares its table and its statics and never defines them, so
 /// its C reads the same whatever the unit holds beside it, and calls what another defines as
-/// [`far_calls`] says.
+/// [`far_calls`] says. A bucket declares the pointer to each of `machine`, the natives of shipped
+/// modules the unit calls over machine words, that its bodies call, and the tail binds them all.
 fn assembled(
   bodies: List<Placing>,
   sizes: Map<Int, Int>,
@@ -1122,6 +1189,7 @@ fn assembled(
   statics: Bytes,
   exports: Bytes,
   tables: Bytes,
+  machine: List<Native>,
 ) -> Bytes / {abort.raise} = {
   let by_bucket = bodies.fold(Map::new(), |acc: Map<Bytes, Placing>, p: Placing|
     acc.insert(bucket_key(p), p));
@@ -1169,6 +1237,13 @@ fn assembled(
             ).map(|name: RootName|
               match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" }),
           ),
+          {
+            let called = group.fold(Map::new(), |acc: Map<Bytes, Bool>, p: Placing|
+              pointers_named(p.text, b"builtin_", acc));
+            Bytes::concat_all(
+              machine.filter(|n: Native| called.contains(n.name)).map(pointer_declared),
+            )
+          },
           far_calls(far_table(group.get(0).bucket), reached),
           b"\n",
           shared_written(group),
@@ -1177,11 +1252,27 @@ fn assembled(
         ])
       }),
     ),
-    unit_tail(),
+    unit_tail(machine),
     statics,
     embedded(exports),
     tables,
   ])
+}
+
+/// The natives of shipped modules `bodies` call over machine words, which the head declares no
+/// pointer to: each one `machine_of` declares among the helpers their C names beyond `bound`'s.
+fn machine_called(
+  bodies: List<UnitBody>,
+  machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
+) -> List<Native> / {abort.raise} = {
+  let own = bound().fold(Map::new(), |acc: Map<Bytes, Bool>, n: Native| acc.insert(n.name, true));
+  let beyond = bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, k: UnitBody|
+    pointers_named(k.text, b"builtin_", acc)).fold(
+    Map::new(),
+    |acc: Map<Bytes, Bool>, name: Bytes, _: Bool|
+      if own.contains(name) { acc } else { acc.insert(name, true) },
+  );
+  if beyond.len() == 0 { [] } else { machine_of(beyond) }
 }
 
 /// Each function closures alike share that the bodies of `group` name, once, in the order they first
@@ -1205,10 +1296,12 @@ pub fn produce(
   modules: Int,
   answers: Map<RootName, Answer>,
   inputs: Map<Bytes, Bytes>,
+  machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
 ) -> Produced / {abort.raise} = {
   let arity = offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
     acc.insert(o.name, o));
   let s = settle(answers, names_ordered(offered.map(|o: Offered| o.name)), []);
+  let machine = machine_called(s.bodies, machine_of);
   let published = |n: RootName|
     match s.symbols.get(n) {
       Some(d) -> d,
@@ -1320,7 +1413,7 @@ pub fn produce(
     else { acc.push({ id: b, places: ks.keys().map(|k: Bytes| unit_place(k, placed, tags)) }) });
   let took = s.taken.fold(Map::new(), |acc: Map<RootName, Bool>, n: RootName| acc.insert(n, true));
   let exports = exports_text(
-    bound(),
+    bound().concat(machine),
     constants.map(|n: RootName|
       Bytes::concat_all([
         root_text(n),
@@ -1346,6 +1439,7 @@ pub fn produce(
       laid_statics,
       exports,
       laid(by_name.values(), pools.lambdas, rows),
+      machine,
     ),
     taken: s.taken,
     dropped: s.dropped,
@@ -2758,6 +2852,8 @@ pub fn emitted<| e>(
       p.modules.len(),
       held,
       inputs,
+      |called: Map<Bytes, Bool>|
+        machine_bound(called_externs(called, p.modules, |m: ModuleRow| text_at(p, m.index))),
     );
     Ok({
       produced: produced,
@@ -3264,6 +3360,10 @@ fn def_root(n: Bytes) -> RootName = root_name(Named(n))
 /// The name root `k` prints as.
 fn printed(k: RootKey) -> Bytes = root_text(root_name(k))
 
+/// What a program declares of the natives of shipped modules a unit calls over machine words, for one
+/// that declares none.
+fn no_machine(called: Map<Bytes, Bool>) -> List<Native> = []
+
 /// Each of `entries` by the name of the root of the definition its key names.
 fn by_def<v>(entries: List<{ key: Bytes, value: v }>) -> Map<RootName, v> =
   entries.fold(Map::new(), |m: Map<RootName, v>, x: { key: Bytes, value: v }|
@@ -3676,6 +3776,7 @@ fn codes_over(
       1,
       by_def(answers),
       Map::new(),
+      no_machine,
     ).made,
   ).fold(Map::new(), |m: Map<Bytes, Bytes>, n: RootName, code: Bytes| m.insert(root_text(n), code))
 
@@ -3749,6 +3850,7 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
       1,
       by_def([{ key: b"m.f", value: answer }]),
       Map::new(),
+      no_machine,
     ).text;
   let alone = unit([
     { name: b"None", arity: 0 },
@@ -3797,6 +3899,7 @@ test "a bucket's C reads the same whatever another bucket adds to the unit's tab
       1,
       by_def(names.map(|n: Bytes| { key: n, value: one_body(n, []) })),
       Map::new(),
+      no_machine,
     ).text;
   let alone = unit([b"m.f"]);
   let beside = unit([b"m.f", other]);
@@ -3823,6 +3926,7 @@ test "a root whose entry the unit takes is listed as entered, though the unit ho
       { key: entry(b"m.h"), value: one_body(root_text(entry(b"m.h")), []) },
     ]),
     Map::new(),
+    no_machine,
   );
   assert(p.taken.contains(entry(b"m.f")), None);
   assert(p.text.index_of(b"entered m.f") != None, None);
@@ -3841,13 +3945,14 @@ test "every part of a unit compiles after the head, and the runtime's part opens
     1,
     by_def([{ key: b"m.f", value: one_body(b"m.f", []) }]),
     Map::new(),
+    no_machine,
   );
   let head = match p.text.index_of(b"/* --- bucket ") {
     Some(at) -> p.text.slice(0, at),
     None -> b"",
   };
   assert(head == unit_head(), None);
-  assert(p.text.index_of(unit_tail()) != None, None);
+  assert(p.text.index_of(unit_tail([])) != None, None);
   // The unit lists what it binds in the order its `ply_bind` reads their addresses.
   assert(
     p.text.index_of(
@@ -3886,6 +3991,7 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
       { key: apart, value: one_body(apart, []) },
     ]),
     Map::new(),
+    no_machine,
   );
   let declares = |part: Bytes, name: Bytes, arity: Int|
     part.index_of(prototype(b"f_".concat(name), word_head(arity))) != None;
@@ -3924,6 +4030,7 @@ test "where the head defines `PLY_FAR` a bucket calls what another defines throu
       { key: callee, value: headed(one_body(callee, []), word_head(2)) },
     ]),
     Map::new(),
+    no_machine,
   );
   let calling = bucket_part(p.text, def_bucket(caller));
   let shown = Some(String::of_bytes_lossy(calling));
@@ -4016,6 +4123,7 @@ test "a call written to another head than the callee defines fails the unit" {
           },
         ]),
         Map::new(),
+        no_machine,
       ).taken
     };
   assert_eq(made({ answer: b"double", params: [b"double"] }), Ok([callee, caller].map(def_root)));
@@ -4041,6 +4149,7 @@ fn unit_of(
     1,
     by_def(answers),
     inputs,
+    no_machine,
   )
 
 /// `a` naming `defs` beside its own statics.
@@ -4640,11 +4749,15 @@ test "no root is asked to give back a scalar's box, which its last count gives b
   )
 }
 
-fn native_of(e: Extern) -> Native = uniform_native(e.name, e.words, declared_answers(e), e.raises)
+fn native_of(e: Extern) -> Native =
+  match e.call {
+    Some(c) -> { name: e.name, params: call_params(c), answer: call_answer(c), raises: e.raises },
+    None -> uniform_native(e.name, e.words, declared_answers(e), e.raises),
+  }
 
 test "an `extern fn` no native implements, two do, or one does otherwise, is unbound" {
   let declared = |name: Bytes, words: Int, raises: Bool|
-    { module: b"std.prelude", name: name, words: words, raises: raises };
+    { module: b"std.prelude", name: name, words: words, raises: raises, call: None };
   let native = |name: Bytes, words: Int, answers: Bool, raises: Bool|
     uniform_native(name, words, answers, raises);
   let found = unbound(
@@ -4683,11 +4796,13 @@ test "an `extern fn` no native implements, two do, or one does otherwise, is unb
     b"`extern fn calm` of `std.prelude` takes 1 word and raises, and the runtime's native takes 1 word and cannot raise",
   ]);
   assert_eq(
-    unbound([], [{ module: b"", name: b"?hold_take", words: 1, raises: false }]).map(unbound_line),
+    unbound([], [{ module: b"", name: b"?hold_take", words: 1, raises: false, call: None }]).map(
+      unbound_line,
+    ),
     [b"the compiler's `?hold_take`: no native of the runtime implements it"],
   );
   // A crossing native the compiler declares answering nothing is bound by one that answers nothing.
-  let crossing = { module: b"", name: b"?out_int", words: 1, raises: false };
+  let crossing = { module: b"", name: b"?out_int", words: 1, raises: false, call: None };
   assert_eq(unbound([native(b"?out_int", 1, false, false)], [crossing]), []);
   assert_eq(unbound([native(b"?out_int", 1, true, false)], [crossing]).map(unbound_line), [
     b"the compiler's `?out_int` takes 1 word, answers nothing and cannot raise, and the runtime's native takes 1 word and cannot raise",
@@ -5177,16 +5292,99 @@ test "every function a unit's C calls through a pointer is one the unit binds" {
 }
 
 test "a unit is refused where the runtime implements a shipped module's `extern fn` it calls otherwise" {
-  let native = [{ name: b"std.native", src: b"pub extern fn doubled(x: Int) -> Int\n" }];
-  let program = [{ name: b"m", src: b"import std.native (doubled)\nfn f() -> Int = doubled(2)\n" }];
-  let doubled = |words: Int| uniform_native(b"doubled", words, true, false);
-  let implemented = declared_natives().map(native_of);
-  assert_eq(refusal(held_over(program, native, implemented.push(doubled(1)))), []);
-  assert_eq(refusal(held_over(program, native, implemented.push(doubled(2)))), [
+  let native = [
+    {
+      name: b"std.native",
+      src: b"pub extern fn counted(x: Option<Int>) -> Int\npub extern fn named(id: Int) -> String\n",
+    },
+  ];
+  let program = [
+    {
+      name: b"m",
+      src: b"import std.native (counted, named)\nfn f() -> Int = counted(Some(1))\nfn g() -> String = named(7)\n",
+    },
+  ];
+  let counted = |words: Int| uniform_native(b"counted", words, true, false);
+  let named = |answer: Machine|
+    { name: b"named", params: [abi::I64], answer: Some(answer), raises: false };
+  let implemented = |a: Native, b: Native| declared_natives().map(native_of).push(a).push(b);
+  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::Taken)))), []);
+  assert_eq(refusal(held_over(program, native, implemented(counted(2), named(abi::Taken)))), [
     b"E0476",
-    b"`extern fn doubled` of `std.native` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
+    b"`extern fn counted` of `std.native` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
+    natives_refused([]).notes_text.get(0),
+  ]);
+  // One called over machine words binds a native of the kinds its call passes: bytes are told from
+  // an integer by theirs.
+  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::I64)))), [
+    b"E0476",
+    b"`extern fn named` of `std.native` takes [I64], answers Taken and cannot raise, and the runtime's native takes [I64], answers I64 and cannot raise",
     natives_refused([]).notes_text.get(0),
   ])
+}
+
+test "a unit declares a shipped module's native over machine words where a bucket calls it, and binds it after the rest" {
+  let native = [
+    {
+      name: b"std.native",
+      src: b"pub extern fn named(id: Int, sep: String) -> String\npub extern fn told(on: Bool, x: Float, c: Char, w: U8) -> Char\npub extern fn noted(b: Bytes) -> Unit\n",
+    },
+  ];
+  let program = [
+    {
+      name: b"m",
+      src: b"import std.native (named, told, noted)\nfn g() -> String = named(7, \"-\")\nfn h() -> Char = told(true, 1.5, 'a', 3u8)\nfn k() -> Unit = noted(b\"x\")\n",
+    },
+  ];
+  let named = {
+    name: b"named",
+    params: [abi::I64, abi::Addr, abi::I64],
+    answer: Some(abi::Taken),
+    raises: false,
+  };
+  let told = {
+    name: b"told",
+    params: [abi::I64, abi::F64, abi::I64, abi::I64],
+    answer: Some(abi::I64),
+    raises: false,
+  };
+  let noted = { name: b"noted", params: [abi::Addr, abi::I64], answer: None, raises: false };
+  match held_over(
+      program,
+      native,
+      declared_natives().map(native_of).push(named).push(told).push(noted),
+    ) {
+    Err(diags) -> assert_eq(diags.map(|d: Diag| d.code), []),
+    Ok(text) -> {
+      let pointer = b"Word (*builtin_named_p)(PlyCtx*, Word, Word, Word)";
+      // Called with the string's address and count, its answer the count of the bytes it left.
+      assert(text.index_of(b"builtin_named_p(ctx, ") != None, None);
+      assert_eq(text.split(b"extern ".concat(pointer)).len(), 2);
+      assert(text.index_of(pointer.concat(b";\n")) != None, None);
+      assert(
+        text.index_of(
+            Bytes::concat_all([
+              b"builtin_named_p = (Word (*)(PlyCtx*, Word, Word, Word))fns[",
+              ascii_of_int(bound().len()),
+              b"]",
+            ]),
+          )
+          != None,
+        None,
+      );
+      assert(text.index_of(b"builtin_named 3 1") != None, None);
+      // Each scalar is one raw word, and a native answering `()` is `void`.
+      assert(
+        text.index_of(b"extern Word (*builtin_told_p)(PlyCtx*, Word, Word, Word, Word);\n") != None,
+        None,
+      );
+      assert(
+        text.index_of(b"extern void (*builtin_noted_p)(PlyCtx*, Word, Word);\n") != None,
+        None,
+      );
+      assert(text.index_of(b"builtin_noted 2 0") != None, None)
+    },
+  }
 }
 
 test "a function of a type a module calls with no import is read from its home, which the emitter is handed" {
@@ -5456,6 +5654,7 @@ test "a unit takes what its callees let it, resolves its bodies and says what it
     1,
     answers,
     Map::new(),
+    no_machine,
   );
   assert_eq(p.taken, [def_root(b"m.f")]);
   assert_eq(p.dropped.map(|d: Dropped| d.function), [def_root(b"m.g")]);
@@ -5508,6 +5707,7 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
     roots.fold(Map::new(), |acc: Map<RootName, Answer>, k: RootKey|
       acc.insert(root_name(k), one_body(printed(k), []))),
     Map::new(),
+    no_machine,
   );
   assert(
     p.text.index_of(

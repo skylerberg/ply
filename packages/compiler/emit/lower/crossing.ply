@@ -36,6 +36,8 @@ import compiler.emit.print.counting (never_lifted_fn)
 import compiler.emit.marks (marks_of, marked_key, carried_by, marked_type, function_marks)
 import compiler.emit.answer (Exact)
 import compiler.emit.lower.data (field, recorded_as)
+import compiler.check.infer.definitions (MachineCall, MachineInt, MachineFloat, MachineText,
+                                         MachineUnit)
 
 /// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
 /// runtime decodes, answers as it always has, and encodes the answer of.
@@ -735,6 +737,99 @@ pub fn concatenated(cx: Context, st: Lowering, a: Arg, b: Arg, ty: Type, at: Spa
   );
   handed(g, held_as(cx.setting, ty), at)
 }
+
+/// Native `name` of a shipped module, which `call` says crosses over machine words, called on
+/// `args`: each argument handed as its raw bits, a `Float`'s bits, or a string's or byte string's
+/// address and count, borrowed for the call; and the answer read back from the word the native
+/// answers, or copied out of the bytes it left taken. A native that asks the machine refuses where
+/// a run may not, so the run is checked after every call.
+pub fn over_machine_words(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  call: MachineCall,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if args.len() != call.params.len() {
+    refuse(st, Handling, b"a native over machine words called with other arguments: ".concat(name))
+  } else {
+    let given = range(0, args.len()).fold(
+      { st: st, args: [] },
+      |acc: { st: Lowering, args: List<Arg> }, i: Int|
+        match call.params.get(i) {
+          MachineInt(t) -> match match t {
+              TyCon(c) -> scalar_words(cx, acc.st, args.get(i), c.name, at),
+              _ -> None,
+            } {
+            Some(w) -> { st: w.st, args: acc.args.push(w.lo) },
+            None ->
+              {
+                st: refuse(
+                  acc.st,
+                  Handling,
+                  b"an integer over machine words of no integer's type",
+                ).st,
+                args: acc.args,
+              },
+          },
+          MachineFloat -> {
+            let f = handed({ st: acc.st, arg: args.get(i) }, RFloat, at);
+            let b = bound_as(
+              f.st,
+              int_type(),
+              RInt,
+              Prim({ op: b"bits", on: RFloat, args: [f.arg] }),
+              at,
+            );
+            { st: b.st, args: acc.args.push(b.arg) }
+          },
+          MachineText(_) -> {
+            let a = addressed(acc.st, args.get(i), at);
+            { st: a.st, args: acc.args.push(a.address).push(a.count) }
+          },
+          MachineUnit -> acc,
+        },
+    );
+    match call.answer {
+      MachineUnit -> unit_after(native_done(given.st, name, given.args, true, at)),
+      MachineText(t) -> {
+        let n = native_int(given.st, name, given.args, true, at);
+        taken_out(n.st, n.arg, t, at)
+      },
+      MachineFloat -> {
+        let b = native_int(given.st, name, given.args, true, at);
+        bound_as(
+          b.st,
+          named_type(b"Float"),
+          RFloat,
+          Prim({ op: b"of_bits", on: RInt, args: [b.arg] }),
+          at,
+        )
+      },
+      MachineInt(t) -> {
+        let w = native_int(given.st, name, given.args, true, at);
+        integer_answered(w, t, at)
+      },
+    }
+  }
+
+/// The word `w` a native answered read as a value of the integer type `t`: an `Int` as it is, a
+/// `Bool` as whether it is other than 0, a `Char` as the scalar value it is, and a width narrowed.
+fn integer_answered(w: Lowered, t: Type, at: Span) -> Lowered =
+  match t {
+    TyCon(c) -> if c.name == b"Bool" {
+      bound_as(w.st, t, RBool, Prim({ op: b"ne", on: RInt, args: [w.arg, AInt(0)] }), at)
+    } else if c.name == b"Char" {
+      bound_as(w.st, t, RImm, Prim({ op: b"char_of", on: RInt, args: [w.arg] }), at)
+    } else {
+      match width_named(c.name) {
+        Some(n) -> bound_as(w.st, t, RNum(n), Prim({ op: b"narrow", on: RInt, args: [w.arg] }), at),
+        None -> w,
+      }
+    },
+    _ -> w,
+  }
 
 /// The BLAKE3 hash of byte string `a`, read in place by the `?blake3` native, whose answer's bytes
 /// are copied out.

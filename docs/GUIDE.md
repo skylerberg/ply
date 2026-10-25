@@ -3270,10 +3270,19 @@ that holds one is `E0201`, as on a function, and no deriver reads one, so
 `compare`, `digest`, `show`, a `Map` key and a `derive` over it are `E0206`; its
 module states no `key`, `show` or `numeric` for it. A module below `std.internal` holds what the standard
 library shares within itself, and only a shipped module imports one (`E0159`).
+An `extern fn` of a shipped module other than `std.prelude` that is not generic,
+states no `where`, cannot raise, and takes and answers only machine types is
+called over machine words, never over its arguments' encoding: an `Int`, a
+`Bool` (0 or 1), a `Char` (its scalar value) and a width of at most 64 bits pass
+as their raw 64 bits, a `Float` as its bits, and a `String` or `Bytes` is lent
+as its bytes' address and count; such a native answers one of those, or bytes it
+leaves for the caller to copy out, or nothing for `()`. Its row is not read, and
+nothing in it crosses.
 The runtime reports each native it implements, the words a call passes, whether
 it answers and whether it raises, as the Rust type of the function it binds says;
 a unit is compiled only against a runtime that implements each native it calls, an
-`extern fn` or one the compiler writes calls of, once and as declared (`E0476`). It
+`extern fn` or one the compiler writes calls of, once and as declared, a native
+over machine words with the machine kind of each word and of its answer (`E0476`). It
 also reports each helper of its own that emitted code calls, and where it lays out
 what emitted code reads in place (the context's fields, a block's header, the
 descriptors); a unit is compiled only against a runtime that agrees with what the

@@ -36,6 +36,8 @@ pub enum Machine {
     DropRoot,
     /// A keep root's address.
     KeepRoot,
+    /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
+    Taken,
 }
 
 impl Machine {
@@ -55,6 +57,7 @@ impl Machine {
             Machine::Op => "Op",
             Machine::DropRoot => "DropRoot",
             Machine::KeepRoot => "KeepRoot",
+            Machine::Taken => "Taken",
         }
     }
 }
@@ -108,6 +111,12 @@ pub struct F64(pub u64);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Addr(pub *mut u8);
+
+/// How many bytes a native left as the context's taken bytes ([`Ctx::give`]), which compiled code
+/// copies out into a string or a byte string of its own.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Taken(pub i64);
 
 /// The address of words a native writes for compiled code, as many as the native says.
 #[repr(transparent)]
@@ -203,6 +212,14 @@ unsafe impl Answered for F64 {
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         F64(w as u64)
+    }
+}
+
+unsafe impl Answered for Taken {
+    const MACHINE: Option<Machine> = Some(Machine::Taken);
+    const RAISES: bool = false;
+    fn of(w: Word) -> Self {
+        Taken(w)
     }
 }
 
