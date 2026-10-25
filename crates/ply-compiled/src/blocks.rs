@@ -8,8 +8,8 @@ use crate::vm;
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ptr::null_mut;
-use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+use std::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
+use std::sync::atomic::{AtomicPtr, AtomicU32};
 use std::sync::{Mutex, PoisonError};
 
 /// A mapping's bytes, which it is aligned to, so a block's address names its segment and page.
@@ -23,7 +23,8 @@ const CLASSES: usize = 65;
 const SPARES: usize = 32;
 /// A segment's header, which its first page's blocks begin after.
 const HEAD: usize = size_of::<Segment>().next_multiple_of(16);
-/// The bytes before a larger block, the first word of them naming its owner.
+/// The bytes before a larger block: the first word names its owner, and the second counts the
+/// threads handing the block back to that owner right now, as a page's `handing` does its blocks.
 const LEAD: usize = 16;
 /// The most segments kept mapped that no heap holds.
 const EMPTIED: usize = 64;
@@ -73,6 +74,8 @@ struct Page {
     end: *mut u8,
     /// The heap whose thread alone touches the rest of this.
     owner: AtomicPtr<Returned>,
+    /// Blocks of this page other threads are handing back to `owner` right now (see [`Handing`]).
+    handing: AtomicU32,
     next: *mut Page,
     prev: *mut Page,
     /// A block's bytes; zero while the page holds none and waits for any class.
@@ -155,6 +158,26 @@ unsafe fn owner(block: *mut u8, bytes: usize) -> &'static AtomicPtr<Returned> {
     }
 }
 
+/// The count of threads handing a block, of `bytes` when it was taken, back right now: its page's,
+/// or its lead's second word.
+unsafe fn handing(block: *mut u8, bytes: usize) -> &'static AtomicU32 {
+    unsafe {
+        if bytes > SMALL {
+            &*block.sub(LEAD - 8).cast()
+        } else {
+            &(*page_of(block)).handing
+        }
+    }
+}
+
+/// Waits until no thread is handing back a block whose owner was `handing`'s before it changed: a
+/// thread that marks it after this sees it at zero reads the new owner.
+fn waited(handing: &AtomicU32) {
+    while handing.load(SeqCst) != 0 {
+        std::hint::spin_loop();
+    }
+}
+
 fn large(bytes: usize) -> Layout {
     Layout::from_size_align(bytes + LEAD, 16).expect("a block's layout")
 }
@@ -229,24 +252,59 @@ unsafe fn pop(page: *mut Page, reused: &mut usize) -> *mut u8 {
 /// Hands a dead block, of `bytes` when it was taken, back to the heap that owns it, from any
 /// thread: the heap takes it up when it next needs a page.
 pub unsafe fn hand_back(block: *mut u8, bytes: usize) {
-    unsafe {
-        // A page of an ended heap has no owner, and its blocks are already given back.
-        let Some(heap) = owner(block, bytes).load(Acquire).as_ref() else {
-            return;
-        };
-        let list = if bytes > SMALL {
-            &heap.large
-        } else {
-            &heap.small
-        };
-        let mut head = list.load(Relaxed);
-        loop {
-            *link(block) = head;
-            match list.compare_exchange_weak(head, block, Release, Relaxed) {
-                Ok(_) => return,
-                Err(now) => head = now,
+    unsafe { Handing::begin(block, bytes).finish() }
+}
+
+/// A dead block on its way back to the heap that owns it, from another thread. While one is, its
+/// page (or a larger block's lead) is marked, and [`Blocks::adopt`] waits for the mark to clear
+/// before it lets the heap the block was read to belong to go, so the push never lands in a freed
+/// heap's list.
+pub struct Handing {
+    block: *mut u8,
+    bytes: usize,
+    heap: *const Returned,
+}
+
+impl Handing {
+    /// Marks the block's page as being handed back to, then reads the heap that owns it.
+    pub unsafe fn begin(block: *mut u8, bytes: usize) -> Handing {
+        unsafe {
+            handing(block, bytes).fetch_add(1, SeqCst);
+            Handing {
+                block,
+                bytes,
+                heap: owner(block, bytes).load(SeqCst),
             }
         }
+    }
+
+    /// Pushes the block onto its heap's list of blocks handed back. A page of an ended heap has no
+    /// owner, and its blocks are already given back.
+    pub unsafe fn finish(self) {
+        unsafe {
+            let Some(heap) = self.heap.as_ref() else {
+                return;
+            };
+            let list = if self.bytes > SMALL {
+                &heap.large
+            } else {
+                &heap.small
+            };
+            let mut head = list.load(Relaxed);
+            loop {
+                *link(self.block) = head;
+                match list.compare_exchange_weak(head, self.block, Release, Relaxed) {
+                    Ok(_) => return,
+                    Err(now) => head = now,
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Handing {
+    fn drop(&mut self) {
+        unsafe { handing(self.block, self.bytes).fetch_sub(1, Release) };
     }
 }
 
@@ -302,6 +360,7 @@ impl Blocks {
                 assert!(!base.is_null(), "the heap is out of memory");
                 base.cast::<AtomicPtr<Returned>>()
                     .write(AtomicPtr::new(self.name()));
+                base.add(8).cast::<AtomicU32>().write(AtomicU32::new(0));
                 let block = base.add(LEAD);
                 self.large.insert(block.addr(), bytes);
                 return block;
@@ -586,7 +645,7 @@ impl Blocks {
                 for i in 0..PAGES {
                     let page = &raw mut (*segment).pages[i];
                     if (*page).live > 0 {
-                        (*page).owner.store(self.name(), Release);
+                        (*page).owner.store(self.name(), SeqCst);
                         if (*page).listed {
                             push_behind(&mut self.filling[(*page).class as usize], page);
                         }
@@ -604,8 +663,12 @@ impl Blocks {
                 true
             });
             for (&address, &bytes) in &other.large {
-                owner(address as *mut u8, bytes).store(self.name(), Release);
+                owner(address as *mut u8, bytes).store(self.name(), SeqCst);
             }
+            // A thread that read `other` as a block's owner before it changed pushes to `other`'s
+            // list: draining that list below misses none, and `other` goes with no thread holding
+            // its name.
+            other.quiet();
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
             self.reused += other.reused;
@@ -613,8 +676,25 @@ impl Blocks {
         }
     }
 
+    /// Waits until no thread is handing back a block of this heap's, so its list of blocks handed
+    /// back holds every one there will be and nothing still holds its name.
+    fn quiet(&self) {
+        unsafe {
+            for &address in &self.segments {
+                let segment = address as *mut Segment;
+                for i in 0..PAGES {
+                    waited(&(*segment).pages[i].handing);
+                }
+            }
+            for (&address, &bytes) in &self.large {
+                waited(handing(address as *mut u8, bytes));
+            }
+        }
+    }
+
     /// Gives back everything but one segment, which the next blocks come from.
     pub fn reset(&mut self) {
+        self.quiet();
         unsafe {
             for (address, bytes) in std::mem::take(&mut self.large) {
                 dealloc((address as *mut u8).sub(LEAD), large(bytes));
@@ -644,6 +724,7 @@ impl Blocks {
 
 impl Drop for Blocks {
     fn drop(&mut self) {
+        self.quiet();
         unsafe {
             for (&address, &bytes) in &self.large {
                 dealloc((address as *mut u8).sub(LEAD), large(bytes));

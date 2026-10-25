@@ -139,6 +139,41 @@ fn a_large_block_another_thread_hands_back_is_given_up_before_the_next() {
     assert_eq!(b.held(), MIB);
 }
 
+/// A block another thread is handing back keeps the heap it read as its owner until it is pushed:
+/// an adopter of that heap goes on only once the block is on the list it drains, so neither the
+/// heap the push lands in nor the block is lost.
+#[test]
+fn an_adopter_waits_for_a_block_being_handed_back_to_the_heap_it_adopts() {
+    struct Moved(Blocks);
+    unsafe impl Send for Moved {}
+    let mut branch = Blocks::default();
+    let handed = branch.take(48);
+    let rest: Vec<*mut u8> = (0..100).map(|_| branch.take(48)).collect();
+    let pending = unsafe { Handing::begin(handed, 48) };
+    let branch = Moved(branch);
+    let (adopted, done) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        let adopter = s.spawn(move || {
+            let moved = branch;
+            let mut parent = Blocks::default();
+            parent.adopt(moved.0);
+            adopted.send(()).expect("the test waits for the adopter");
+            Moved(parent)
+        });
+        assert!(
+            done.recv_timeout(std::time::Duration::from_millis(200))
+                .is_err(),
+            "the adopter went on while a block was being handed back to the heap it adopted"
+        );
+        unsafe { pending.finish() };
+        done.recv().expect("the adopter goes on");
+        let mut parent = adopter.join().expect("the adopter").0;
+        let again: Vec<*mut u8> = (0..1_000).map(|_| parent.take(48)).collect();
+        assert!(again.contains(&handed));
+    });
+    drop(rest);
+}
+
 #[test]
 fn an_adopted_heaps_blocks_are_the_adopters() {
     let mut parent = Blocks::default();
