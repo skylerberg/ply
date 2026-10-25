@@ -6,10 +6,11 @@ to C and linked with the runtime, a static library cargo builds (`crates/ply-run
 builds `ply`: `ply bootstrap` links a checkout's runtime library with what the checkout's builder
 makes of its CLI. `scripts/bootstrap.sh` is the rebuild when an edit changes what `ply` does:
 cargo, then `ply bootstrap` run by the `ply` in `target/`, or by the last release in a checkout
-with none, which drives the first bootstrap only. An edit to the compiler's own code tests
-without a new binary: `scripts/iterate.sh <package> [filters...]` runs `ply check` and `ply test`
-of the package with the newest `ply` the checkout has. `PLY_C_PHASES=1` prints what a bootstrap's
-steps took.
+with none, which drives the first bootstrap only. An edit to the compiler's or the standard
+library's own code tests without a new binary: a load inside the checkout reads both from the
+checkout, as `std.*` and `compiler.*`, and `scripts/iterate.sh <package> [filters...]` runs `ply
+check` and `ply test` of the package with the newest `ply` the checkout has. `PLY_C_PHASES=1`
+prints what a bootstrap's steps took.
 
 Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 

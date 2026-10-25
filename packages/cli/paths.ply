@@ -3,10 +3,12 @@
 //! under `cwd`, and one that leaves it is addressed under `abs`, root-relative, after a lexical
 //! normalize. `resolve` is where that is decided; everything after it carries the answer as a
 //! `Rooted` path. A command that loads a project finds its root: the nearest directory at or above
-//! what its line names, or the working directory where it names nothing, that holds a `ply.pkg`.
+//! what its line names, or the working directory where it names nothing, that holds a `ply.pkg` or
+//! is a part of the toolchain's library a checkout holds (`library`).
 
 import std.cli
 import env (env)
+import library
 import std.fs (fs, Kind, File, Dir, Symlink, Missing, MemFs, Written, mem_create_dir, mem_empty,
                mem_kind, mem_list, mem_of, mem_read, mem_resolved, mem_symlink, mem_write)
 import std.path (below_root, file_name, is_absolute, join, normalize, parent, strip_dot)
@@ -29,6 +31,9 @@ pub type Resolved = {
   /// The project root as the machine spells it: the working-directory spelling while it stays
   /// under it (so the spans a run reports read as given), the absolute form once it leaves.
   machine: String,
+  /// The prefix the root's modules are named under: the part's (`std`, `compiler`) where the root
+  /// is a part of the toolchain's library a checkout holds, else empty.
+  part: String,
 }
 
 /// The path with `prefix` dropped when it starts with it.
@@ -67,8 +72,14 @@ fn addressed(pwd: String, full: String) -> (String, String) / {abort.raise} =
     None -> ("abs", below_root(full)),
   }
 
-/// The absolute directory `dir` as a project root, with `inside` named in it.
-fn root_at(pwd: String, dir: String, inside: String) -> Resolved / {abort.raise} = {
+/// The absolute directory `dir` as a project root, with `inside` named in it, its modules named
+/// under `part`.
+fn root_at(
+  pwd: String,
+  dir: String,
+  inside: String,
+  part: String = "",
+) -> Resolved / {abort.raise} = {
   let (label, spelling) = addressed(pwd, dir);
   {
     label: label,
@@ -77,6 +88,7 @@ fn root_at(pwd: String, dir: String, inside: String) -> Resolved / {abort.raise}
     inside: inside,
     absolute: dir,
     machine: if label == "cwd" { spelling } else { dir },
+    part: part,
   }
 }
 
@@ -112,19 +124,43 @@ pub fn package_of(dir: String) -> Option<String> / {fs.resolved[abs], abort.rais
     else if at == "/" { Stop(None) }
     else { Continue(parent(at)) })
 
-/// `resolved` in the package that holds it: rooted at the nearest directory at or above its root
-/// that holds a `ply.pkg`, with what it named as the path inside. Itself where no package holds it,
-/// and where it names a file that is no module, which is read as it stands.
-pub fn in_package(resolved: Resolved) -> Resolved / {fs.resolved[abs], env.pwd[sys], abort.raise} =
+/// The root that holds `dir`, an absolute directory: the nearer of the nearest directory at or above
+/// it that holds a `ply.pkg` and the part of the toolchain's library a checkout holds it in, with the
+/// prefix the root's modules are named under.
+fn enclosing(
+  dir: String,
+) -> Option<{ dir: String, part: String }> / {fs.resolved[abs], fs.read_file[abs], abort.raise} = {
+  let package = match package_of(dir) { Some(root) -> Some({ dir: root, part: "" }), None -> None };
+  match library::part_of(dir) {
+    None -> package,
+    Some(p) -> match package {
+      Some(k) -> if k.dir.len() >= p.dir.len() { package }
+      else { Some({ dir: p.dir, part: p.prefix }) },
+      None -> Some({ dir: p.dir, part: p.prefix }),
+    },
+  }
+}
+
+/// `resolved` in the package or the part of the toolchain's library that holds it ([`enclosing`]),
+/// with what it named as the path inside. Itself where neither holds it, and where it names a file
+/// that is no module, which is read as it stands.
+pub fn in_package(
+  resolved: Resolved,
+) -> Resolved / {fs.resolved[abs], fs.read_file[abs], env.pwd[sys], abort.raise} =
   if resolved.inside != "." && !resolved.inside.ends_with(".ply") { resolved } else {
-    match package_of(resolved.absolute) {
+    match enclosing(resolved.absolute) {
       None -> resolved,
-      Some(root) -> match strip_prefix(resolved.absolute, if root == "/" { "" } else { root }) {
+      Some(e) -> match strip_prefix(resolved.absolute, if e.dir == "/" { "" } else { e.dir }) {
         None -> resolved,
         Some(below) ->
-          root_at(env.pwd[sys](), root, if below == "" { resolved.inside }
-          else if resolved.inside == "." { below }
-          else { join(below, resolved.inside) }),
+          root_at(
+            env.pwd[sys](),
+            e.dir,
+            if below == "" { resolved.inside }
+            else if resolved.inside == "." { below }
+            else { join(below, resolved.inside) },
+            e.part,
+          ),
       },
     }
   }
@@ -232,28 +268,34 @@ fn named_by(command: String, parsed: cli::Parsed) -> List<String> =
   } else if loads_nothing(command) { [] }
   else { parsed.positionals }
 
+/// Whether `command` loads a project: one that does reads the toolchain's library a checkout holds
+/// where its project is in one.
+pub fn loads(command: String) -> Bool =
+  !loads_nothing(command) && command != "new" && command != "bootstrap" && command != "work"
+    && command != "fmt"
+
 /// The commands that load no project: what they act on is not found from where they run.
 fn loads_nothing(command: String) -> Bool =
   command == "explain" || command == "std" || command == "yank" || command == "contracts"
     || command == "keygen"
     || command == "attest"
 
-/// The command's paths, resolved. One that loads a project acts on the package each path is part
-/// of, and on the package the working directory is part of where its line names no path: `Err`
-/// holds the working directory when no package holds it. `ply new`, `ply bootstrap` and `ply work`
+/// The command's paths, resolved. One that loads a project acts on the package or the part of the
+/// toolchain's library each path is part of, and on the one the working directory is part of where
+/// its line names no path: `Err` holds the working directory when none holds it. `ply new`, `ply bootstrap` and `ply work`
 /// take their path as it stands, as `ply fmt` takes the ones it is given, and a command that loads
 /// no project is given the working directory.
 pub fn resolve_all(
   command: String,
   parsed: cli::Parsed,
-) -> Result<List<Resolved>, String> / {fs.resolved[cwd], fs.resolved[abs], env.pwd[sys], abort.raise} = {
+) -> Result<List<Resolved>, String> / {fs.resolved[cwd], fs.resolved[abs], fs.read_file[abs], env.pwd[sys], abort.raise} = {
   let named = named_by(command, parsed);
   if loads_nothing(command) { Ok([resolve(".")]) }
   else if command == "new" || command == "bootstrap" || command == "work"
       || (command == "fmt" && named.len() > 0) { Ok(named.map(|path: String| resolve(path))) }
   else if named.len() > 0 { Ok(named.map(|path: String| in_package(resolve(path)))) } else {
     let pwd = env.pwd[sys]();
-    match package_of(pwd) { Some(root) -> Ok([root_at(pwd, root, ".")]), None -> Err(pwd) }
+    match enclosing(pwd) { Some(e) -> Ok([root_at(pwd, e.dir, ".", e.part)]), None -> Err(pwd) }
   }
 }
 
@@ -261,7 +303,7 @@ fn drop_first(xs: List<String>) -> List<String> = match xs { [] -> [], [_, ..res
 
 /// The working directory, unresolved: what an empty path list means.
 pub fn here() -> Resolved =
-  { label: "cwd", spelling: ".", display: ".", inside: ".", absolute: ".", machine: "." }
+  { label: "cwd", spelling: ".", display: ".", inside: ".", absolute: ".", machine: ".", part: "" }
 
 /// A path in the working directory, for tests that build one by hand.
 pub fn at_cwd(spelling: String) -> Resolved =
@@ -272,6 +314,7 @@ pub fn at_cwd(spelling: String) -> Resolved =
     inside: ".",
     absolute: spelling,
     machine: spelling,
+    part: "",
   }
 
 /// A root outside the working directory, as `resolve` answers one.
@@ -283,6 +326,7 @@ pub fn at_abs(spelling: String) -> Resolved =
     inside: ".",
     absolute: "/" ++ spelling,
     machine: "/" ++ spelling,
+    part: "",
   }
 
 // --- Checkouts -----------------------------------------------------------------
@@ -508,7 +552,15 @@ fn packages() -> MemFs / {abort.raise} =
     { path: "repo/app/tools/ply.pkg", body: b"" },
     { path: "repo/app/tools/gen.ply", body: b"fn main() -> Int = 2" },
     { path: "loose/a.ply", body: b"fn a() -> Int = 1" },
+    { path: "repo/ply.work", body: workspace() },
+    { path: "repo/lib/std/json.ply", body: b"pub fn parse() -> Int = 1" },
+    { path: "repo/lib/std/hash/legacy.ply", body: b"pub fn md5() -> Int = 1" },
+    { path: "repo/lib/compiler/emit/roots.ply", body: b"pub fn r() -> Int = 1" },
   ])
+
+/// A `ply.work` that places the toolchain's library below `lib/`.
+fn workspace() -> Bytes =
+  b"import std.pkg (Workspace)\n\nfn workspace() -> Workspace = {\n  packages: [],\n  suites: [],\n  fixtures: [],\n  toolchain: Some({\n    std: \"lib/std\",\n    std_tests: \"tests/std\",\n    compiler: \"lib/compiler\",\n    cli: \"app\",\n    entry: \"main.main\",\n    cli_tests: \"tests/cli\",\n    runtime: \"ply-runtime\",\n  }),\n}\n"
 
 /// Each root a command's line resolves to over `packages` from `pwd`, with what it names inside.
 fn asked_at(
@@ -523,10 +575,13 @@ fn asked_at(
     env.pwd[sys]() -> pwd,
     fs.resolved[cwd](p) -> mem_resolved(disk, normalize(join(below_root(pwd), p))),
     fs.resolved[abs](p) -> mem_resolved(disk, p),
+    fs.read_file[abs](p) -> mem_read(disk, p),
   };
   match asked {
     Err(nowhere) -> ["no package holds " ++ nowhere],
-    Ok(rs) -> rs.map(|r: Resolved| r.machine ++ " " ++ r.inside),
+    Ok(rs) ->
+      rs.map(|r: Resolved|
+        r.machine ++ " " ++ r.inside ++ (if r.part == "" { "" } else { " " ++ r.part })),
   }
 }
 
@@ -550,4 +605,17 @@ test "a line that names no path is the package the working directory is part of,
   // `ply fmt` rewrites the files it is given, whatever package holds them.
   assert_eq(asked_at("/repo/app", "fmt", ["store"]), ["store ."]);
   assert_eq(asked_at("/loose", "explain", ["E0302"]), [". ."])
+}
+
+test "a path in a part of the toolchain's library is in the part, its modules named under it" {
+  assert_eq(asked_at("/repo", "check", ["lib/std"]), ["lib/std . std"]);
+  assert_eq(asked_at("/repo", "test", ["lib/std/hash/legacy.ply"]), [
+    "lib/std hash/legacy.ply std",
+  ]);
+  assert_eq(asked_at("/repo/lib/compiler/emit", "check", []), ["/repo/lib/compiler . compiler"]);
+  assert_eq(asked_at("/repo/lib/std/hash", "check", ["."]), ["/repo/lib/std hash std"]);
+  // A directory of the checkout in no part is no root of one.
+  assert_eq(asked_at("/repo/lib", "check", []), ["no package holds /repo/lib"]);
+  // A command that reads files as they stand takes a part's path as it is.
+  assert_eq(asked_at("/repo", "fmt", ["lib/std"]), ["lib/std ."])
 }

@@ -1,79 +1,16 @@
 //! `ply work` — what the `ply.work` at or above a directory states: the directory of each package
-//! the repository maintains and, in the repository that builds `ply`, where its parts are. `ply
-//! bootstrap` reads a checkout's parts here, and a script reads what `ply work` prints.
+//! the repository maintains and, in the repository that builds `ply`, where its parts are. A script
+//! reads what `ply work` prints; `library` reads the workspace itself.
 
 import args (Flags, style_of)
-import diagnostic (Place)
 import env (env)
+import library (file, read, root_of, unread)
 import report (Answer, ok_code, reported)
-import sources (nowhere)
-import compiler.front.diagnostics (placed)
-import compiler.syntax.parsing (ParseDiag)
-import compiler.front.pkg (check_workspace)
-import compiler.check.resolve.tables (Diag)
 import std.fs
-import std.fs (fs, File, mem_of)
+import std.fs (fs, mem_of)
 import std.json (Null, Str, Bool, Number, object)
-import std.path (below_root, is_absolute, join, normalize, parent)
-import std.pkg (Workspace, ToolchainParts, Suite, workspace_json, library_of)
+import std.pkg (Workspace, Suite, workspace_json, library_of)
 import std.list
-
-/// The file a repository states its workspace in, at its root.
-pub fn file() -> String = "ply.work"
-
-/// Why a workspace was not read: what to report, and the texts its labels point into.
-pub type Unread = { diags: List<Diag>, places: List<Place> }
-
-fn unread(message: String, label: Bytes) -> Unread =
-  {
-    diags: [
-      nowhere(b"E0502", message, label, [
-        b"a `ply.work` names where each package of a repository lies (`ply doc std.pkg.Workspace`)",
-      ]),
-    ],
-    places: [],
-  }
-
-/// The workspace the `ply.work` of `root`, an absolute directory, states.
-pub fn read(root: String) -> Result<Workspace, Unread> / {fs.read_file[abs], abort.raise} = {
-  let path = join(root, file());
-  match fs.read_file[abs](below_root(path)) {
-    None -> Err(unread("no `" ++ file() ++ "` in `" ++ root ++ "`", b"no workspace to read")),
-    Some(text) -> {
-      let checked = check_workspace(text);
-      match checked.workspace {
-        Some(w) -> Ok(w),
-        None ->
-          Err({
-            diags: checked.diags.map(|d: ParseDiag| placed(0, d)),
-            places: [{ path: path, text: text }],
-          }),
-      }
-    },
-  }
-}
-
-/// The parts of `ply` the `ply.work` of `root` names: refused where it names none.
-pub fn toolchain(
-  root: String,
-) -> Result<ToolchainParts, Unread> / {fs.read_file[abs], abort.raise} =
-  match read(root) {
-    Err(u) -> Err(u),
-    Ok(w) -> match w.toolchain {
-      Some(t) -> Ok(t),
-      None ->
-        Err(unread("`" ++ join(root, file()) ++ "` names no toolchain", b"no toolchain to build")),
-    },
-  }
-
-/// The nearest directory at or above `dir`, an absolute one, that holds a `ply.work`. Each step up
-/// is shorter, so the spelling's length bounds the steps.
-pub fn root_of(dir: String) -> Option<String> / {fs.kind[abs], abort.raise} =
-  iterate(normalize(dir), dir.len() + 2, |at: String|
-    if !is_absolute(at) { Stop(None) }
-    else if fs.kind[abs](below_root(join(at, file()))) == File { Stop(Some(at)) }
-    else if at == "/" { Stop(None) }
-    else { Continue(parent(at)) })
 
 /// The workspace as a script reads it: a role and a path a line. `library` is the file the
 /// `runtime` package's static library is, below `target/<profile>`; a proved suite is a `suite` line
@@ -116,7 +53,9 @@ fn answered(root: String, w: Workspace) -> Answer / {abort.raise} =
     code: ok_code(),
   }
 
-pub fn run(flags: Flags) -> Answer / {fs.kind[abs], fs.read_file[abs], env.pwd[sys], abort.raise} = {
+pub fn run(
+  flags: Flags,
+) -> Answer / {fs.resolved[abs], fs.read_file[abs], env.pwd[sys], abort.raise} = {
   let dir = match flags.paths.at(0) { Some(r) -> r.absolute, None -> env.pwd[sys]() };
   match root_of(dir) {
     None ->
@@ -141,24 +80,9 @@ pub fn run(flags: Flags) -> Answer / {fs.kind[abs], fs.read_file[abs], env.pwd[s
 fn stated() -> Bytes =
   b"import std.pkg (Workspace)\n\nfn workspace() -> Workspace = {\n  packages: [\"lib/store\"],\n  suites: [{ dir: \"examples\", proved: true }, { dir: \"tests/lang\", proved: false }],\n  fixtures: [\"tests/fixtures\"],\n  toolchain: Some({\n    std: \"lib/std\",\n    std_tests: \"tests/std\",\n    compiler: \"lib/compiler\",\n    cli: \"cli\",\n    entry: \"ply.main\",\n    cli_tests: \"tests/cli\",\n    runtime: \"ply-runtime\",\n  }),\n}\n"
 
-/// What `body` answers over a filesystem holding `files` below its root.
-fn over<a>(
-  files: List<{ path: String, body: Bytes }>,
-  body: () -> a / {fs.kind[abs], fs.read_file[abs], abort.raise},
-) -> a / {abort.raise} = fs::on_mem[abs](mem_of(files), body).value
-
-test "the workspace is found at or above a directory, and none outside every one" {
-  let files = [
-    { path: "repo/ply.work", body: stated() },
-    { path: "repo/lib/std/a.ply", body: b"" },
-  ];
-  assert_eq(over(files, || root_of("/repo/lib/std")), Some("/repo"));
-  assert_eq(over(files, || root_of("/repo")), Some("/repo"));
-  assert_eq(over(files, || root_of("/elsewhere")), None)
-}
-
 test "a script reads each role and path a line, the runtime's library among them" {
-  match over([{ path: "repo/ply.work", body: stated() }], || read("/repo")) {
+  match fs::on_mem[abs](mem_of([{ path: "repo/ply.work", body: stated() }]), ||
+      read("/repo")).value {
     Err(_) -> panic("the workspace reads"),
     Ok(w) ->
       assert_eq(lines_of(w), [
@@ -176,20 +100,5 @@ test "a script reads each role and path a line, the runtime's library among them
         "suite tests/lang",
         "fixtures tests/fixtures",
       ]),
-  }
-}
-
-test "a workspace that does not check is refused at its place, and one with no toolchain builds none" {
-  match over([{ path: "repo/ply.work", body: b"fn workspace() -> Int = 1" }], || read("/repo")) {
-    Ok(_) -> panic("an `Int` is no workspace"),
-    Err(u) -> {
-      assert_eq(u.diags.map(|d: Diag| d.code), [b"E0129"]);
-      assert_eq(u.places.map(|p: Place| p.path), ["/repo/ply.work"])
-    },
-  };
-  let bare = stated().split(b"  toolchain: Some(").get(0).concat(b"  toolchain: None,\n}\n");
-  match over([{ path: "repo/ply.work", body: bare }], || toolchain("/repo")) {
-    Ok(_) -> panic("a workspace with no toolchain names none"),
-    Err(u) -> assert_eq(u.diags.map(|d: Diag| d.code), [b"E0502"]),
   }
 }
