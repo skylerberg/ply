@@ -720,8 +720,9 @@ pub fn load<[r]>(
 /// cache.
 pub effect set Derives = {shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.entered, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
-/// A module of the load's own a deriver reaches, by its name in the program, and its text.
-type Reached = { name: Bytes, text: Bytes }
+/// A module a deriver reaches, by its name in the program, its text, and whether it is one of the
+/// load's own rather than a shipped one.
+type Reached = { name: Bytes, text: Bytes, own: Bool }
 
 /// What the library derivation `ask` answers. It is kept in the toolchain's cache under its deriver,
 /// as `deriver_key` names it among `own`, the load's own modules' texts by name, and the declaration
@@ -730,7 +731,15 @@ pub fn derived_answer(
   ask: LibraryAsk,
   own: Map<Bytes, Bytes>,
 ) -> LibraryAnswer / {Derives, abort.raise} = {
-  let reached = deriver_reach(ask.module, own);
+  let reached = deriver_reach(
+    ask.module,
+    |name: Bytes| match own.get(name) {
+      Some(text) -> Some({ name: name, text: text, own: true }),
+      None -> shipped.module(String::of_bytes(name)).map(|text: Bytes|
+        { name: name, text: text, own: false }),
+    },
+    own.len() + shipped.names().len() + 1,
+  );
   let deriver = deriver_key(ask.module, reached);
   let path = "derived/" ++ String::of_bytes(hex(blake3(deriver.concat(ask.declaration))));
   match match toolchain.held(path) {
@@ -750,7 +759,8 @@ pub fn derived_answer(
 }
 
 /// What the deriver `module`'s compiled program is a function of: the toolchain, the runtime, the
-/// module, and the texts of the modules of the load's own it reaches.
+/// module, and the texts of the modules it reaches, shipped ones among them, since a bootstrap reads
+/// its checkout's in place of the binary's own.
 fn deriver_key(module: Bytes, reached: List<Reached>) -> Bytes / {Derives, abort.raise} =
   blake3(
     Bytes::concat_all([
@@ -764,20 +774,21 @@ fn deriver_key(module: Bytes, reached: List<Reached>) -> Bytes / {Derives, abort
     ]),
   )
 
-/// The modules of `own` that `module` is and its imports reach.
-fn deriver_reach(module: Bytes, own: Map<Bytes, Bytes>) -> List<Reached> / {abort.raise} =
+/// The modules `module` is and its imports reach, each as `read` finds it, of at most `most`.
+fn deriver_reach<| e>(
+  module: Bytes,
+  read: (Bytes) -> Option<Reached> / e,
+  most: Int,
+) -> List<Reached> / {abort.raise | e} =
 
-  // Each round that goes on reaches a module of `own` no earlier round did.
+  // Each round that goes on reaches a module no earlier round did.
   iterate(
     { seen: [], frontier: [module] },
-    own.len() + 1,
+    most,
     |walk: { seen: List<Reached>, frontier: List<Bytes> }| {
       let fresh = walk.frontier.fold([], |acc: List<Reached>, name: Bytes|
-        match own.get(name) {
-          Some(text) -> if walk.seen.concat(acc).any(|reached: Reached| reached.name == name) {
-            acc
-          } else { acc.push({ name: name, text: text }) },
-          None -> acc,
+        if walk.seen.concat(acc).any(|reached: Reached| reached.name == name) { acc } else {
+          match read(name) { Some(reached) -> acc.push(reached), None -> acc }
         });
       if fresh.len() == 0 { Stop(walk) } else {
         Continue({
@@ -866,7 +877,7 @@ fn deriver_compiled(
 ) -> Result<Compiled, Ran> / {Derives, abort.raise} = {
   let name = iterate(b"derivation", reached.len() + 1, |n: Bytes|
     if reached.any(|r: Reached| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) });
-  let files = reached.map(|r: Reached|
+  let files = reached.filter(|r: Reached| r.own).map(|r: Reached|
     {
       path: String::of_bytes(r.name) ++ ".ply",
       name: String::of_bytes(r.name),
@@ -1047,8 +1058,14 @@ fn loaded_from(
   }
 }
 
-test "a deriver's reach is every module of the load's own it imports, whatever else they import" {
-  assert_eq(deriver_reach(b"std.derive.map", Map::new()), []);
+test "a deriver's reach is every module it imports, whatever else they import" {
+  let reach = |own: Map<Bytes, Bytes>, module: Bytes|
+    deriver_reach(
+      module,
+      |name: Bytes| own.get(name).map(|text: Bytes| { name: name, text: text, own: true }),
+      own.len() + 1,
+    ).map(|reached: Reached| reached.name);
+  assert_eq(reach(Map::new(), b"std.derive.map"), []);
   let own = Map::new().insert(
     b"app.deriver",
     b"import std.derive\nimport std.list\nimport std.option\nimport app.helper\n",
@@ -1056,7 +1073,7 @@ test "a deriver's reach is every module of the load's own it imports, whatever e
     b"app.helper",
     b"import std.bytes\nimport app.deriver\n",
   );
-  assert_eq(deriver_reach(b"app.deriver", own).map(|reached: Reached| reached.name), [
+  assert_eq(reach(own, b"app.deriver"), [
     b"app.deriver",
     b"app.helper",
   ])
