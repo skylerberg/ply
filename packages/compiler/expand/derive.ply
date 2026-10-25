@@ -33,7 +33,7 @@ import std.string
 import std.bin
 import std.text
 import std.derive
-import std.derive (Refused, refused_bin)
+import std.value
 
 // --- Rules ---------------------------------------------------------------------------------------
 
@@ -1952,22 +1952,35 @@ type Runtime = { wanted: Bytes, prefix: Bytes, added: Option<ImportDecl> }
 type Claimed = { name: Bytes, def: DeriveDef }
 type Generated = { source: Bytes, defs: List<FnDef>, derived: Derived }
 
-/// A library derivation to run: the deriver's module and the `std.derive` declaration it reads,
-/// encoded.
+/// A library derivation to run: the deriver's module and the `std.derive` declaration it reads, as
+/// PLV1 writes it.
 pub type LibraryAsk = { module: Bytes, declaration: Bytes }
 
 /// Why no library deriver answered: the diagnostic the derivation reports.
 pub type Unrun = { code: Bytes, message: Bytes, notes: List<Bytes> }
 
+/// A deriver's `derive::Refused`: why the type has no derivation, the field or variant that blocks
+/// it, and notes on what to do instead.
+pub type Refusal = { message: Bytes, at: Option<Bytes>, notes: List<Bytes> }
+
 /// What a library derivation answered: the source its deriver wrote, its refusal, or why it did not
 /// run.
-pub type LibraryAnswer = | Wrote(Bytes) | Declined(Refused) | Unran(Unrun)
+pub type LibraryAnswer = | Wrote(Bytes) | Declined(Refusal) | Unran(Unrun)
 
 derive bin for LibraryAsk
 
 derive bin for Unrun
 
+derive bin for Refusal
+
 derive bin for LibraryAnswer
+
+/// A declaration as an ask carries it.
+pub fn declaration_bytes(declaration: derive::Declaration) -> Bytes / {abort.raise} =
+  match value::encode(value::reflect(declaration)) {
+    Some(b) -> b,
+    None -> panic("a declaration holds what PLV1 does not write"),
+  }
 
 /// The answer to the library derivation of the `derive` item at `span`.
 type Answered = { span: Span, answer: LibraryAnswer }
@@ -2112,9 +2125,8 @@ fn asked_of(
                 span: d.span,
                 ask: {
                   module: deriver,
-                  declaration: bin::encode(
+                  declaration: declaration_bytes(
                     declaration_of(path, module, d.target.name, d.deriver, binder),
-                    derive::declaration_bin(),
                   ),
                 },
               }),
@@ -2220,11 +2232,10 @@ fn library_wrote(
 
 /// Where a refusal that names `at`, a field or a variant of `target`, points: there, else at the
 /// type's name.
-fn refused_at(target: TypeDef, at: Option<String>) -> Span / {abort.raise} =
+fn refused_at(target: TypeDef, at: Option<Bytes>) -> Span / {abort.raise} =
   match at {
     None -> target.name.span,
-    Some(s) -> {
-      let name = Bytes::of_string(s);
+    Some(name) -> {
       let fields = |t: TypeExpr|
         match t {
           TRecord(r) ->
@@ -2248,7 +2259,7 @@ fn declined(
   expander: Expander,
   def: DeriveDef,
   target: TypeDef,
-  refused: Refused,
+  refused: Refusal,
 ) -> Expander / {abort.raise} =
   report(
     expander,
@@ -2263,11 +2274,11 @@ fn declined(
         def.target.name,
         b"`",
       ]),
-      Bytes::of_string(refused.message),
+      refused.message,
       expander.m,
       def.span,
       b"required by this derivation",
-      refused.notes.map(Bytes::of_string),
+      refused.notes,
     ),
   )
 
@@ -3129,7 +3140,8 @@ test "a library derivation asks its module's deriver with the module's types, an
   );
   assert_eq(x.expansion.diags, []);
   assert_eq(x.asked.map(|a: LibraryAsk| a.module), [b"lib.mapping"]);
-  let declaration = derive::declared_of(x.asked.get(0).declaration);
+  let declaration = declaration_of(b"t", parse(src).node, b"Box", DLibrary(b"mapping"), b"mapping");
+  assert_eq(x.asked.get(0).declaration, declaration_bytes(declaration));
   assert_eq(declaration.target, "Box");
   assert_eq(declaration.binder, "mapping");
   assert_eq(declaration.derived, ["Box"]);
@@ -3157,7 +3169,7 @@ test "a library deriver's refusal, failure, or text that is not functions each r
     library_expanded(src, answer).expansion.diags.map(|d: Diag| d.code);
   let declined = library_expanded(
     src,
-    Declined({ message: "no", at: Some("Empty"), notes: ["why"] }),
+    Declined({ message: b"no", at: Some(b"Empty"), notes: [b"why"] }),
   );
   assert_eq(declined.expansion.diags.map(|d: Diag| d.code), [b"E0206"]);
   // The refusal points at the variant it names.

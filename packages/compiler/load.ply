@@ -23,21 +23,20 @@ import compiler.front.checking (Answered, OwnPackage, World, asked_all, entry_ha
                                 hashed_all, looked, packages_refused, refused_first, registry,
                                 root_warnings, view_answered, world_of, world_placing)
 import compiler.front.checking.world (Answering, CheckQuery, Driving, ModuleAnswer, decoding_once)
-import compiler.expand.derive (LibraryAsk, LibraryAnswer, Wrote, Declined, Unran, dotted,
+import compiler.expand.derive (LibraryAsk, LibraryAnswer, Refusal, Wrote, Declined, Unran, dotted,
                                library_ask_bin, library_answer_bin)
 import compiler.syntax.items (header, parse)
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import std.bin
-import std.derive
 import std.value
-import std.value (VBytes)
+import std.value (Value, VCtor, VStr, VRecord, VList)
 import compiler.front.checking.groups (queries)
 import compiler.front.pkg (PackageSources, Supplied, closure, git_spec, wants)
 import compiler.check.resolve.tables (Source, Diag, Label, error_at)
 import compiler.unit
 import compiler.unit (Runtime, shipped, emitted, pack_frame, declared_answers, offered_roots)
-import compiler.emit.keys (RootKey, Named, Stored)
+import compiler.emit.keys (RootKey, Named)
 import compiler.store.kept (Record)
 import compiler.check.infer.definitions (Extern, program_natives)
 import std.hash (blake3)
@@ -717,38 +716,30 @@ pub fn load<[r]>(
 // --- Library derivations ---------------------------------------------------------------------
 
 /// What running a library deriver performs: its program is checked against the shipped modules,
-/// emitted, compiled, and its `const` entered on the runtime, the answer kept in the toolchain's cache.
-pub effect set Derives = {shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.values, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
+/// emitted and compiled once, and entered for each declaration, each answer kept in the toolchain's
+/// cache.
+pub effect set Derives = {shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, shipped.entered, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
 /// A module of the load's own a deriver reaches, by its name in the program, and its text.
 type Reached = { name: Bytes, text: Bytes }
 
-/// What the library derivation `ask` answers. It is kept in the toolchain's cache under the toolchain,
-/// the texts of the modules its deriver reaches among `own`, the load's own modules' texts by name,
-/// and the declaration it reads, and run where the cache holds none.
+/// What the library derivation `ask` answers. It is kept in the toolchain's cache under its deriver,
+/// as `deriver_key` names it among `own`, the load's own modules' texts by name, and the declaration
+/// it reads, and run where the cache holds none.
 pub fn derived_answer(
   ask: LibraryAsk,
   own: Map<Bytes, Bytes>,
 ) -> LibraryAnswer / {Derives, abort.raise} = {
   let reached = deriver_reach(ask.module, own);
-  let key = blake3(
-    Bytes::concat_all([
-      blake3(shipped.definitions()),
-      shipped.runtime().identity,
-      bin::encode(ask, library_ask_bin()),
-      Bytes::concat_all(
-        reached.map(|r: Reached| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
-      ),
-    ]),
-  );
-  let path = "derived/" ++ String::of_bytes(hex(key));
+  let deriver = deriver_key(ask.module, reached);
+  let path = "derived/" ++ String::of_bytes(hex(blake3(deriver.concat(ask.declaration))));
   match match toolchain.held(path) {
       Some(b) -> match bin::decode(b, library_answer_bin()) { Ok(a) -> Some(a), Err(_) -> None },
       None -> None,
     } {
     Some(a) -> a,
     None -> {
-      let ran = derivation_ran(ask, reached);
+      let ran = derivation_ran(ask, deriver, reached);
       if ran.keep {
         let _ = toolchain.written(path, bin::encode(ran.answer, library_answer_bin()));
         ()
@@ -757,6 +748,21 @@ pub fn derived_answer(
     },
   }
 }
+
+/// What the deriver `module`'s compiled program is a function of: the toolchain, the runtime, the
+/// module, and the texts of the modules of the load's own it reaches.
+fn deriver_key(module: Bytes, reached: List<Reached>) -> Bytes / {Derives, abort.raise} =
+  blake3(
+    Bytes::concat_all([
+      blake3(shipped.definitions()),
+      shipped.runtime().identity,
+      module,
+      b"\x00",
+      Bytes::concat_all(
+        reached.map(|r: Reached| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
+      ),
+    ]),
+  )
 
 /// The modules of `own` that `module` is and its imports reach.
 fn deriver_reach(module: Bytes, own: Map<Bytes, Bytes>) -> List<Reached> / {abort.raise} =
@@ -788,28 +794,13 @@ fn deriver_reach(module: Bytes, own: Map<Bytes, Bytes>) -> List<Reached> / {abor
     },
   ).seen
 
-/// The program that runs a derivation: a module beside those the deriver reaches, whose `const` is
-/// the deriver's answer to the declaration, encoded.
-fn derivation_text(module: Bytes, ask: LibraryAsk) -> Bytes / {abort.raise} =
+/// The program that runs a derivation: a module beside those the deriver reaches, whose `derived`
+/// is the deriver's answer to the declaration it is handed.
+fn derivation_text(deriver: Bytes) -> Bytes =
   Bytes::concat_all([
     b"import std.derive\nimport ",
-    ask.module,
-    b" as deriver\n\nconst fn derived() -> Bytes =\n  derive::answered(deriver::derive(derive::declared_of(",
-    escaped_bytes(ask.declaration),
-    b")))\n",
-  ])
-
-/// `b` as a bytes literal.
-fn escaped_bytes(b: Bytes) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"b\"",
-    Bytes::concat_all(
-      range(0, b.len()).map(|i: Int| {
-        let h = hex(b.slice(i, i + 1));
-        Bytes::concat_all([b"\\x", h])
-      }),
-    ),
-    b"\"",
+    deriver,
+    b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
   ])
 
 /// What a run of a derivation answered, and whether the cache keeps it: an answer that says no C
@@ -821,8 +812,58 @@ fn unran(code: Bytes, message: Bytes, notes: List<Bytes>) -> LibraryAnswer =
 
 fn diag_line(d: Diag) -> Bytes = Bytes::concat_all([d.code, b": ", d.message])
 
-/// `ask` run: its deriver's program checked, emitted, compiled and its `const` entered.
-fn derivation_ran(ask: LibraryAsk, reached: List<Reached>) -> Ran / {Derives, abort.raise} = {
+/// A deriver's program compiled: the library its unit is in and the runnable that enters it, each
+/// by its path in the toolchain's cache.
+type Compiled = { library: String, runnable: String }
+
+/// `ask` run: its deriver's program, compiled once for every declaration, entered with this one.
+fn derivation_ran(
+  ask: LibraryAsk,
+  deriver: Bytes,
+  reached: List<Reached>,
+) -> Ran / {Derives, abort.raise} =
+  match compiled_deriver(ask.module, deriver, reached) {
+    Err(ran) -> ran,
+    Ok(compiled) -> {
+      let cache = toolchain.cache();
+      answered_of(
+        ask,
+        shipped.entered(
+          cache ++ "/" ++ compiled.library,
+          cache ++ "/" ++ compiled.runnable,
+          ask.declaration,
+          unit::const_budget(),
+        ),
+      )
+    },
+  }
+
+/// The deriver `module`'s program compiled, as the cache keeps it under `deriver` while it still
+/// holds the library, else checked, emitted and compiled now: or what the derivation answers where it
+/// does not compile.
+fn compiled_deriver(
+  module: Bytes,
+  deriver: Bytes,
+  reached: List<Reached>,
+) -> Result<Compiled, Ran> / {Derives, abort.raise} = {
+  let kept = "derivers/" ++ String::of_bytes(hex(deriver));
+  let runnable = kept ++ ".runnable";
+  match toolchain.held(kept) {
+    Some(library) -> {
+      let path = String::of_bytes(library);
+      if toolchain.holds(path) && toolchain.holds(runnable) {
+        Ok({ library: path, runnable: runnable })
+      } else { deriver_compiled(module, kept, reached) }
+    },
+    None -> deriver_compiled(module, kept, reached),
+  }
+}
+
+fn deriver_compiled(
+  module: Bytes,
+  kept: String,
+  reached: List<Reached>,
+) -> Result<Compiled, Ran> / {Derives, abort.raise} = {
   let name = iterate(b"derivation", reached.len() + 1, |n: Bytes|
     if reached.any(|r: Reached| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) });
   let files = reached.map(|r: Reached|
@@ -833,13 +874,13 @@ fn derivation_ran(ask: LibraryAsk, reached: List<Reached>) -> Ran / {Derives, ab
     }).push({
     path: String::of_bytes(name) ++ ".ply",
     name: String::of_bytes(name),
-    text: derivation_text(name, ask),
+    text: derivation_text(module),
   });
   let refused = |diags: List<Diag>|
-    {
+    Err({
       answer: unran(
         b"E0160",
-        Bytes::concat_all([b"`", ask.module, b"` is no deriver a `derive` can run"]),
+        Bytes::concat_all([b"`", module, b"` is no deriver a `derive` can run"]),
         [
           b"a deriver's module declares `pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`, performing nothing but a raise, and reaches no library deriver itself",
         ].concat(
@@ -847,13 +888,14 @@ fn derivation_ran(ask: LibraryAsk, reached: List<Reached>) -> Ran / {Derives, ab
         ),
       ),
       keep: true,
-    };
+    });
+  let unkept = |why: Bytes, notes: List<Bytes>|
+    Err({ answer: unran(b"E0155", why, notes), keep: false });
   match held(files, Map::new()) {
     Err(u) -> refused(u.diags),
     Ok(front) -> {
-      let derived = Named(Bytes::concat_all([name, b".derived"]));
-      let stored = Stored(derived);
-      let roots = every_root(front).push(stored);
+      let entry = Bytes::concat_all([name, b".derived"]);
+      let roots = every_root(front);
       let emission = emitted(
         shipped.runtime(),
         front.dump,
@@ -862,7 +904,7 @@ fn derivation_ran(ask: LibraryAsk, reached: List<Reached>) -> Ran / {Derives, ab
         roots,
         |_: Bytes| None,
         |_: List<Record>| (),
-        entered: Some([stored]),
+        entered: Some([Named(entry)]),
       );
       match unit::held(front.dump, roots, emission) {
         Err(diags) -> refused(diags),
@@ -883,40 +925,38 @@ fn derivation_ran(ask: LibraryAsk, reached: List<Reached>) -> Ran / {Derives, ab
             };
             toolchain.cleared(work);
             match library {
-              Err(why) ->
-                {
-                  answer: unran(b"E0155", b"the deriver's program did not compile", [
-                    Bytes::of_string(why),
-                  ]),
-                  keep: false,
-                },
-              Ok(l) ->
-                answered_of(
-                  ask,
-                  shipped.values(
-                    front.files,
-                    front.dump,
-                    l,
-                    [String::of_bytes(unit::stored_root(Bytes::concat_all([name, b".derived"])))],
-                    unit::const_budget(),
-                  ),
-                ),
+              Err(why) -> unkept(b"the deriver's program did not compile", [Bytes::of_string(why)]),
+              Ok(l) -> {
+                let library = in_cache(l);
+                let runnable = kept ++ ".runnable";
+                if toolchain.written(
+                      runnable,
+                      shipped.runnable(String::of_bytes(entry), front.files, front.dump),
+                    )
+                    && toolchain.written(kept, Bytes::of_string(library)) {
+                  Ok({ library: library, runnable: runnable })
+                } else {
+                  unkept(b"the deriver's program could not be kept in the toolchain's cache", [])
+                }
+              },
             }
           },
-          _ ->
-            {
-              answer: unran(b"E0155", b"no C compiler is found to run the deriver", []),
-              keep: false,
-            },
+          _ -> unkept(b"no C compiler is found to run the deriver", []),
         },
       }
     },
   }
 }
 
-/// What the runtime answered for a derivation's `const`: the deriver's answer, or that it raised or
-/// spent its budget.
-fn answered_of(ask: LibraryAsk, values: List<Option<Bytes>>) -> Ran / {abort.raise} = {
+/// `path`, an absolute one below the toolchain's cache, as the cache names it.
+fn in_cache(path: String) -> String / {toolchain.read, abort.raise} = {
+  let cache = toolchain.cache();
+  if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
+}
+
+/// What the runtime answered for a derivation, as PLV1 writes it: the deriver's answer, or that it
+/// raised or spent its budget.
+fn answered_of(ask: LibraryAsk, answered: Option<Bytes>) -> Ran / {abort.raise} = {
   let failed = {
     answer: unran(
       b"E0155",
@@ -925,18 +965,41 @@ fn answered_of(ask: LibraryAsk, values: List<Option<Bytes>>) -> Ran / {abort.rai
     ),
     keep: true,
   };
-  match values.at(0) {
-    Some(Some(bytes)) -> match value::decode(bytes) {
-      Some(VBytes(b)) -> match bin::decode(b, derive::answer_bin()) {
-        Ok(Ok(text)) -> { answer: Wrote(Bytes::of_string(text)), keep: true },
-        Ok(Err(r)) -> { answer: Declined(r), keep: true },
-        Err(_) -> failed,
-      },
-      _ -> failed,
+  match answered.and_then(value::decode) {
+    Some(VCtor(c, [VStr(text)])) -> if value::ctor_name(c) == "Ok" {
+      { answer: Wrote(Bytes::of_string(text)), keep: true }
+    } else { failed },
+    Some(VCtor(c, [VRecord(fields)])) -> if value::ctor_name(c) != "Err" { failed } else {
+      match refused_of(fields) { Some(r) -> { answer: Declined(r), keep: true }, None -> failed }
     },
     _ -> failed,
   }
 }
+
+/// The refusal a deriver answered, from its fields as a value.
+fn refused_of(fields: List<value::Field>) -> Option<Refusal> =
+  match ((
+      value::field_named(fields, "message"),
+      value::field_named(fields, "at"),
+      value::field_named(fields, "notes"),
+    )) {
+    (Some(VStr(message)), Some(VCtor(at, held)), Some(VList(notes))) -> {
+      let texts = notes.fold(Some([]), |acc: Option<List<Bytes>>, n: Value|
+        match ((acc, n)) { (Some(xs), VStr(t)) -> Some(xs.push(Bytes::of_string(t))), _ -> None });
+      let place = match held {
+        [VStr(p)] -> Some(Some(Bytes::of_string(p))),
+        [] -> Some(None),
+        _ -> None,
+      };
+      match ((texts, place)) {
+        (Some(ns), Some(p)) -> if value::ctor_name(at) == "Some" || value::ctor_name(at) == "None" {
+          Some({ message: Bytes::of_string(message), at: p, notes: ns })
+        } else { None },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
 
 // --- Tests ------------------------------------------------------------------
 
@@ -1002,12 +1065,13 @@ test "a deriver's reach is every module of the load's own it imports, whatever e
 /// `work`, a load that names no library deriver, so nothing it runs is compiled or entered: what a
 /// test over a program held in memory runs its load under.
 pub fn deriving_nothing<a | e>(
-  work: () -> a / {shipped.values, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
+  work: () -> a / {shipped.runnable, shipped.entered, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
 ) -> a / {abort.raise | e} =
   handle {
     work()
   } with {
-    shipped.values(files, dump, library, roots, steps) -> panic("a test's load runs no deriver"),
+    shipped.runnable(entry, files, dump) -> panic("a test's load runs no deriver"),
+    shipped.entered(library, runnable, argument, steps) -> panic("a test's load runs no deriver"),
     compilers.found[cc]() -> panic("a test's load runs no deriver"),
     compilers.started[cc](args) -> panic("a test's load runs no deriver"),
     compilers.finished[cc](job) -> panic("a test's load runs no deriver"),

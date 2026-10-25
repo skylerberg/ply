@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 12] = [
+const OPERATIONS: [(&str, &str); 13] = [
     ("names", "ply_privileged::shipped::names"),
     ("module", "ply_privileged::shipped::module"),
     ("answer", "ply_privileged::shipped::answer"),
@@ -18,6 +18,7 @@ const OPERATIONS: [(&str, &str); 12] = [
     ("runnable", "ply_privileged::shipped::runnable"),
     ("front", "ply_privileged::shipped::front"),
     ("values", "ply_privileged::shipped::values"),
+    ("entered", "ply_privileged::shipped::entered"),
     ("definitions", "ply_privileged::shipped::definitions"),
 ];
 
@@ -159,6 +160,15 @@ impl HostHandler for Shipped {
             }
             ("values", [files, dump, unit, roots, steps]) => {
                 values(files, dump, unit, roots, steps, span)?
+            }
+            ("entered", [unit, runnable, argument, steps]) => {
+                let unit = std::path::PathBuf::from(unit.as_str(span, "the unit's library")?);
+                let runnable =
+                    std::path::PathBuf::from(runnable.as_str(span, "the unit's runnable")?);
+                let argument = argument.as_bytes(span, "an argument")?.to_vec();
+                let steps = steps.as_int(span, "the calls the entry may make")?;
+                let answered = crate::enter::entered(unit, runnable, argument, steps)?;
+                crate::payload::option(answered.map(PlyValue::bytes))
             }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
