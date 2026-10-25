@@ -6,9 +6,8 @@ use ply_compiled::c::builtin_helper_name;
 use ply_compiled::heap::Word;
 use ply_compiled::rt::Ctx;
 use ply_core::builtins::call;
-use ply_core::{Builtin, Decimal, Span, Value};
+use ply_core::{Builtin, Span, Value};
 
-type A1 = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type A2 = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 type A3 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word) -> Word;
 type N2 = unsafe extern "C" fn(*mut Ctx, Word, Word);
@@ -45,55 +44,6 @@ fn bytes_of(v: Value) -> Vec<u8> {
         Value::Bytes(b) => b.to_vec(),
         other => panic!("{} where bytes were", other.type_name()),
     }
-}
-
-#[test]
-fn a_decimal_is_written_as_its_builtin_writes_it() {
-    let mut ctx = context();
-    for d in [Decimal::new(-12345, 3), Decimal::new(150, 2), Decimal::ZERO] {
-        let b = d.serialize();
-        let lo = i64::from_le_bytes(b[..8].try_into().unwrap());
-        let hi = i64::from_le_bytes(b[8..].try_into().unwrap());
-        let n = unsafe { native::<A2>("?decimal_text")(&mut ctx, lo, hi) };
-        let want = bytes_of(builtin(Builtin::DecimalToString, vec![Value::Decimal(d)]));
-        assert_eq!(taken(&mut ctx, n), want);
-    }
-    assert_eq!(ctx.failed, 0);
-}
-
-/// Word `k` of what a parse left taken.
-fn word(ctx: &mut Ctx, k: Word) -> Word {
-    unsafe { native::<A1>("?taken_word")(ctx, k) }
-}
-
-#[test]
-fn a_decimal_parse_answers_its_two_words_or_minus_one_for_none() {
-    let mut ctx = context();
-    for s in ["1.50", "-0.001", "x", ""] {
-        let n = over(&mut ctx, "?decimal_parse", s.as_bytes());
-        match &builtin(Builtin::DecimalOfString, vec![Value::str(s)]) {
-            Value::Ctor { args, .. } if !args.is_empty() => {
-                assert_eq!(n, 16, "{s:?}");
-                let mut b = [0u8; 16];
-                b[..8].copy_from_slice(&word(&mut ctx, 0).to_le_bytes());
-                b[8..].copy_from_slice(&word(&mut ctx, 1).to_le_bytes());
-                let d = Decimal::deserialize(b);
-                assert_eq!(Value::Decimal(d), args[0]);
-                // The scale survives, which `to_string` shows.
-                assert_eq!(d.to_string(), s);
-            }
-            _ => assert_eq!(n, -1, "{s:?}"),
-        }
-    }
-    assert_eq!(ctx.failed, 0);
-}
-
-#[test]
-fn a_word_past_the_taken_bytes_fails_the_run() {
-    let mut ctx = context();
-    assert_eq!(over(&mut ctx, "?decimal_parse", b"2"), 16);
-    word(&mut ctx, 2);
-    assert_ne!(ctx.failed, 0);
 }
 
 #[test]

@@ -1984,12 +1984,15 @@ pub fn Map::split<a, b>(
 /// `a / b` with exactly `scale` digits after the point: the exact quotient, rounded once, there,
 /// by `mode`. Raises on a zero divisor, on a `scale` outside `0..=28`, and on a quotient that
 /// with that many digits is past the 96 bits a `Decimal` holds.
-extern fn Decimal::div(
-  a: Decimal,
-  b: Decimal,
-  scale: Int,
-  mode: Rounding,
-) -> Decimal / {abort.raise}
+pub fn Decimal::div(a: Decimal, b: Decimal, scale: Int, mode: Rounding) -> Decimal / {abort.raise} = {
+  let places = decimal_scale_asked(scale, "Decimal::div");
+  if decimal_mantissa(b) == 0u128 { panic("`Decimal::div` by zero") } else {
+    match decimal_quotient(a, b, places, mode) {
+      Some(q) -> q,
+      None -> panic("`Decimal` overflow in division"),
+    }
+  }
+}
 
 /// The digits `d` has after its point: `2` for `1.50m`.
 extern fn Decimal::scale(d: Decimal) -> Int
@@ -1999,8 +2002,113 @@ extern fn Decimal::scale(d: Decimal) -> Int
 /// and filled with zeros where it has fewer. Raises on a `scale` outside `0..=28`, and on a `d`
 /// that with that many digits is past the 96 bits a `Decimal` holds, which filling alone can do:
 /// to no more digits than `d` has, it cannot raise.
-extern fn Decimal::round(d: Decimal, scale: Int, mode: Rounding) -> Decimal / {abort.raise}
+pub fn Decimal::round(d: Decimal, scale: Int, mode: Rounding) -> Decimal / {abort.raise}
   requires 0 <= scale && scale <= Decimal::scale(d)
+=
+  match decimal_quotient(
+      d,
+      Decimal::of_int(1),
+      decimal_scale_asked(scale, "Decimal::round"),
+      mode,
+    ) {
+    Some(r) -> r,
+    None -> panic("`Decimal` overflow in rounding"),
+  }
+
+/// `scale`, where a `Decimal` can hold that many digits after its point; raises, naming `what`,
+/// otherwise.
+fn decimal_scale_asked(scale: Int, what: String) -> Int / {abort.raise} =
+  if scale < 0 || scale > 28 {
+    panic("`" ++ what ++ "` needs a scale in 0..=28, not " ++ Int::to_string(scale))
+  } else { scale }
+
+/// Whether `d`'s sign bit is set.
+fn decimal_negative(d: Decimal) -> Bool = Decimal::bits(d)._0 >>> 31 & 1 == 1
+
+/// The magnitude of `d`'s mantissa: the 96 bits above its flags.
+fn decimal_mantissa(d: Decimal) -> U128 / {abort.raise} = {
+  let w = Decimal::bits(d);
+  U128::of_int(w._1 >>> 32) << 64 | U128::of_int(w._1 & 4294967295) << 32
+    | U128::of_int(w._0 >>> 32)
+}
+
+/// The `Decimal` of mantissa `m` at `scale`, below zero where `negative` and `m` is not zero; `None`
+/// where `m` is past 96 bits.
+fn decimal_of_mantissa(m: U128, scale: Int, negative: Bool) -> Option<Decimal> / {abort.raise} =
+  if m >= 79228162514264337593543950336u128 { None } else {
+    let sign = if negative && m != 0u128 { 2147483648 } else { 0 };
+    Decimal::of_bits(
+      sign | scale << 16 | Int::of_u128(m & 4294967295u128) << 32,
+      Int::of_u128(m >> 32 & 4294967295u128) | Int::of_u128(m >> 64) << 32,
+    )
+  }
+
+/// `-1`, `0` or `1` as twice `rest` is below, at or above `unit`.
+fn halved_against(rest: U128, unit: U128) -> Int / {abort.raise} =
+  if rest * 2u128 > unit { 1 } else if rest * 2u128 == unit { 0 } else { 0 - 1 }
+
+/// `a / b`, for a `b` that is not zero, with exactly `scale` digits after the point: the exact
+/// quotient rounded once, there, by `mode`; `None` where that mantissa is past 96 bits. The
+/// mantissas are divided as whole numbers, a digit at a time, so no digit past the last one kept is
+/// rounded before `mode` reads what is left over.
+fn decimal_quotient(
+  a: Decimal,
+  b: Decimal,
+  scale: Int,
+  mode: Rounding,
+) -> Option<Decimal> / {abort.raise} = {
+  let negative = decimal_negative(a) != decimal_negative(b);
+  let dividend = decimal_mantissa(a);
+  let divisor = decimal_mantissa(b);
+  // The answer's mantissa is `dividend * 10^shift / divisor`.
+  let shift = scale + Decimal::scale(b) - Decimal::scale(a);
+  let found = if shift >= 0 {
+    let shifted = range(0, shift).fold(
+      Some({ q: dividend / divisor, r: dividend % divisor }),
+      |s: Option<{ q: U128, r: U128 }>, _: Int|
+        match s {
+          None -> None,
+          Some(t) -> {
+            // `t.r` is below `divisor`, which is below 2^96, so neither product wraps.
+            let r = t.r * 10u128;
+            let q = t.q * 10u128 + r / divisor;
+            if q >= 79228162514264337593543950336u128 { None }
+            else { Some({ q: q, r: r % divisor }) }
+          },
+        },
+    );
+    match shifted {
+      None -> None,
+      Some(t) -> Some({ q: t.q, exact: t.r == 0u128, half: halved_against(t.r, divisor) }),
+    }
+  } else {
+    let unit = range(0, 0 - shift).fold(1u128, |u: U128, _: Int| u * 10u128);
+    let whole = dividend / divisor;
+    let rest = dividend % divisor;
+    let dropped = whole % unit;
+    let half = halved_against(dropped, unit);
+    Some({
+      q: whole / unit,
+      exact: dropped == 0u128 && rest == 0u128,
+      half: if half == 0 && rest > 0u128 { 1 } else { half },
+    })
+  };
+  match found {
+    None -> None,
+    Some(f) -> {
+      let away = !f.exact
+        && (match mode {
+          Down -> false,
+          Up -> true,
+          Ceiling -> !negative,
+          Floor -> negative,
+          HalfUp -> f.half >= 0,
+          HalfEven -> f.half > 0 || (f.half == 0 && f.q % 2u128 == 1u128),
+        });
+      decimal_of_mantissa(if away { f.q + 1u128 } else { f.q }, scale, negative)
+    },
+  }
+}
 
 /// `n` as a `Decimal` at scale zero.
 extern fn Decimal::of_int(n: Int) -> Decimal
@@ -2015,17 +2123,223 @@ extern fn Decimal::bits(d: Decimal) -> (Int, Int)
 extern fn Decimal::of_bits(low: Int, high: Int) -> Option<Decimal>
 
 /// `None` if the rounded value does not fit an `Int`.
-extern fn Int::of_decimal(d: Decimal, mode: Rounding) -> Option<Int>
+pub fn Int::of_decimal(d: Decimal, mode: Rounding) -> Option<Int> =
+  handle {
+    match decimal_quotient(d, Decimal::of_int(1), 0, mode) {
+      None -> None,
+      Some(whole) -> {
+        let m = decimal_mantissa(whole);
+        if !decimal_negative(whole) {
+          if m > 9223372036854775807u128 { None } else { Some(Int::of_u128(m)) }
+        } else if m > 9223372036854775808u128 { None }
+        else if m == 9223372036854775808u128 { Some(0 - 9223372036854775807 - 1) }
+        else { Some(0 - Int::of_u128(m)) }
+      },
+    }
+  } with {
+    abort.raise(_) -> None,
+  }
 
-/// Nearest.
-extern fn Float::of_decimal(d: Decimal) -> Float
+/// Nearest, to even at a tie; a `Decimal` below zero that is zero is `-0.0`.
+pub fn Float::of_decimal(d: Decimal) -> Float = {
+  let w = Decimal::bits(d);
+  let mantissa = trimmed_limbs([w._0 >>> 32, w._1 & 4294967295, w._1 >>> 32]);
+  // No mantissa has more than 29 digits.
+  let bits = float_bits_of(mantissa, 0 - Decimal::scale(d), 29);
+  Float::of_bits(if decimal_negative(d) { bits | 0 - 9223372036854775807 - 1 } else { bits })
+}
 
-/// `None` for `inf` or `NaN`.
-extern fn Decimal::of_float(f: Float) -> Option<Decimal>
+/// The decimal the float's shortest text reads as, exactly; `None` for `inf` or `NaN`, and for a
+/// float that needs more than 28 places or 96 bits.
+pub fn Decimal::of_float(f: Float) -> Option<Decimal> = {
+  let bits = bits_of_float(f);
+  let biased = bits >> 52 & 2047;
+  let frac = bits & 4503599627370495;
+  if biased == 2047 { None }
+  else if biased == 0 && frac == 0 { Some(Decimal::of_int(0)) } else {
+    let mant = if biased == 0 { frac << 1 } else { frac | 4503599627370496 };
+    let exp = if biased == 0 { 0 - 1075 } else { biased - 1075 };
+    let even = mant & 1 == 0;
+    let d = if biased == 0 { shortest_digits(mant, 1, 1, exp, even) }
+    else if mant == 4503599627370496 { shortest_digits(mant << 2, 1, 2, exp - 2, even) }
+    else { shortest_digits(mant << 1, 1, 1, exp - 1, even) };
+    let n = d.digits.len();
+    let scale = max(0, n - d.k);
+    if scale > 28 { None } else {
+      handle {
+        let m = range(0, max(n, d.k)).fold(Some(0u128), |acc: Option<U128>, i: Int|
+          match acc {
+            None -> None,
+            Some(v) -> {
+              let next = v * 10u128 + U128::of_int(limb_at(d.digits, i));
+              if next >= 79228162514264337593543950336u128 { None } else { Some(next) }
+            },
+          });
+        match m { None -> None, Some(v) -> decimal_of_mantissa(v, scale, bits < 0) }
+      } with {
+        abort.raise(_) -> None,
+      }
+    }
+  }
+}
 
 /// A decimal number, optionally signed or in scientific notation, read exactly; `None` for any other
 /// text or one past what a `Decimal` holds.
-extern fn Decimal::of_string(s: String) -> Option<Decimal>
+pub fn Decimal::of_string(s: String) -> Option<Decimal> =
+  handle {
+    let b = Bytes::of_string(s);
+    let e = range(0, b.len()).fold(0 - 1, |found: Int, i: Int|
+      if found >= 0 { found } else if b.at(i) == 101 || b.at(i) == 69 { i } else { found });
+    if e >= 0 { decimal_scientific(b, e) } else { decimal_read(b, false) }
+  } with {
+    abort.raise(_) -> None,
+  }
+
+/// A read of a decimal's text under way: where it is, what it has read, and how it ended where it
+/// has. `wide` is whether the mantissa has passed what rust_decimal's 64-bit path holds in a text
+/// long enough to take its 96-bit path, which rounds at the 28th place otherwise.
+type DecimalReading = {
+  at: Int,
+  negative: Bool,
+  point: Bool,
+  has: Bool,
+  m: U128,
+  scale: Int,
+  wide: Bool,
+  ended: Option<Option<Decimal>>,
+}
+
+/// The digit the byte `c` is, or -1.
+fn digit_byte(c: Int) -> Int = if c >= 48 && c <= 57 { c - 48 } else { 0 - 1 }
+
+/// rust_decimal's `maybe_round`: the mantissa `m` rounded up at the byte `next` where that is a 5
+/// or more, a mantissa then past 96 bits cut a place.
+fn decimal_rounded_at(
+  m: U128,
+  next: Int,
+  scale: Int,
+  point: Bool,
+  negative: Bool,
+) -> Option<Decimal> / {abort.raise} = {
+  let d = if digit_byte(next) >= 0 { digit_byte(next) }
+  else if next == 95 { 0 }
+  else if next == 46 && !point { 0 }
+  else { 0 - 1 };
+  if d < 0 { None }
+  else if d < 5 { decimal_of_mantissa(m, scale, negative) } else {
+    let up = m + 1u128;
+    if up < 79228162514264337593543950336u128 { decimal_of_mantissa(up, scale, negative) }
+    else if scale == 0 { None }
+    else { decimal_of_mantissa((up + 4u128) / 10u128, scale - 1, negative) }
+  }
+}
+
+/// The text `b` as rust_decimal's base-10 parser reads it: an optional sign, digits with `_`
+/// between them and at most one point. `round` reads as `from_str` does, rounding at the first
+/// digit past 96 bits or 28 places, where `from_str_exact` refuses it.
+fn decimal_read(b: Bytes, round: Bool) -> Option<Decimal> / {abort.raise} = {
+  let n = b.len();
+  let big = n >= 18;
+  let start = {
+    at: 0,
+    negative: false,
+    point: false,
+    has: false,
+    m: 0u128,
+    scale: 0,
+    wide: false,
+    ended: None,
+  };
+  let r = range(0, n).fold(start, |s: DecimalReading, _: Int|
+    if s.ended != None || s.at >= n { s } else {
+      let c = b.at(s.at);
+      let more = s.at + 1 < n;
+      let next = if more { b.at(s.at + 1) } else { 0 };
+      if digit_byte(c) >= 0 {
+        let grown = s.m * 10u128 + U128::of_int(digit_byte(c));
+        if grown >= 79228162514264337593543950336u128 {
+          if s.point && round {
+            { ..s, ended: Some(decimal_rounded_at(s.m, c, s.scale, s.point, s.negative)) }
+          } else { { ..s, ended: Some(None) } }
+        } else {
+          let scale = if s.point { s.scale + 1 } else { 0 };
+          let wide = s.wide || (big && grown >= 1844674407370954906u128);
+          let t = { ..s, at: s.at + 1, has: true, m: grown, scale: scale, wide: wide };
+          if more && s.point && scale >= 28 && big {
+            if !round { { ..t, ended: Some(None) } } else if s.wide && next == 95 {
+              // The 96-bit path looks past underscores at the place it rounds at.
+              let after = range(s.at + 1, n).fold(0 - 1, |found: Int, i: Int|
+                if found >= 0 { found } else if b.at(i) != 95 { b.at(i) } else { found });
+              {
+                ..t,
+                ended: Some(if after < 0 { decimal_of_mantissa(grown, scale, s.negative) }
+                else { decimal_rounded_at(grown, after, scale, s.point, s.negative) }),
+              }
+            } else {
+              { ..t, ended: Some(decimal_rounded_at(grown, next, scale, s.point, s.negative)) }
+            }
+          } else { t }
+        }
+      } else if c == 46 && !s.point { { ..s, at: s.at + 1, point: true } }
+      else if s.at == 0 && c == 45 { { ..s, at: 1, negative: true } }
+      else if s.at == 0 && c == 43 { { ..s, at: 1 } }
+      else if c == 95 && (s.has || s.wide) { { ..s, at: s.at + 1 } }
+      else { { ..s, ended: Some(None) } }
+    });
+  match r.ended {
+    Some(d) -> d,
+    None -> if !r.has { None } else { decimal_of_mantissa(r.m, r.scale, r.negative) },
+  }
+}
+
+/// An exponent as Rust's `u32` parse reads it: an optional `+` and digits, at most `u32::MAX`.
+fn decimal_exponent(b: Bytes) -> Option<Int> / {abort.raise} = {
+  let from = if b.len() > 0 && b.at(0) == 43 { 1 } else { 0 };
+  if b.len() <= from { None } else {
+    range(from, b.len()).fold(Some(0), |acc: Option<Int>, i: Int|
+      match acc {
+        None -> None,
+        Some(v) -> if digit_byte(b.at(i)) < 0 { None } else {
+          let w = v * 10 + digit_byte(b.at(i));
+          if w > 4294967295 { None } else { Some(w) }
+        },
+      })
+  }
+}
+
+/// rust_decimal's `from_scientific` of `b`, its exponent after byte `at`: the base read as
+/// `from_str` reads it, then its scale moved by the exponent, or its mantissa grown by it.
+fn decimal_scientific(b: Bytes, at: Int) -> Option<Decimal> / {abort.raise} =
+  match decimal_read(b.slice(0, at), true) {
+    None -> None,
+    Some(base) -> {
+      let negative = decimal_negative(base);
+      let scale = Decimal::scale(base);
+      let m = decimal_mantissa(base);
+      let rest = b.slice(at + 1, b.len());
+      if rest.len() > 0 && rest.at(0) == 45 {
+        match decimal_exponent(rest.slice(1, rest.len())) {
+          None -> None,
+          Some(e) -> if e > 28 || scale + e > 28 { None }
+          else { decimal_of_mantissa(m, scale + e, negative) },
+        }
+      } else {
+        match decimal_exponent(rest) {
+          None -> None,
+          Some(e) -> if e <= scale { decimal_of_mantissa(m, scale - e, negative) }
+          else if e > 28 { None } else {
+            let grown = range(0, e - scale).fold(Some(m), |acc: Option<U128>, _: Int|
+              match acc {
+                None -> None,
+                Some(v) -> if v * 10u128 >= 79228162514264337593543950336u128 { None }
+                else { Some(v * 10u128) },
+              });
+            match grown { None -> None, Some(g) -> decimal_of_mantissa(g, 0, negative) }
+          },
+        }
+      }
+    },
+  }
 
 /// `Float` literal syntax with a sign; `None` for `inf` or `NaN`. Correctly rounded, to even at a
 /// tie.
@@ -2140,10 +2454,38 @@ fn quotient_bits(n: List<Int>, d: List<Int>, bit: Int, q: Int) -> { q: Int, rem:
 extern fn Float::of_int(n: Int) -> Float
 
 /// `x` rounded to a whole number by `mode`; `None` for `NaN`, an infinity, or one past `Int`.
-extern fn Int::of_float(x: Float, mode: Rounding) -> Option<Int>
+pub fn Int::of_float(x: Float, mode: Rounding) -> Option<Int> = {
+  let bits = bits_of_float(Float::round(x, mode));
+  let biased = bits >> 52 & 2047;
+  if biased >= 1086 {
+    // Of the floats this far out only `-2^63` is an `Int`.
+    if bits == bits_of_float(0.0 - 9223372036854775808.0) { Some(0 - 9223372036854775807 - 1) }
+    else { None }
+  } else if biased < 1023 { Some(0) } else {
+    let whole = (bits & 4503599627370495 | 4503599627370496) >> 1075 - min(biased, 1075)
+      << max(biased, 1075) - 1075;
+    Some(if bits < 0 { 0 - whole } else { whole })
+  }
+}
 
-/// `x` at a whole number, chosen as `mode` chooses.
-extern fn Float::round(x: Float, mode: Rounding) -> Float
+/// `x` at a whole number, chosen as `mode` chooses; `NaN` and the infinities as they are.
+pub fn Float::round(x: Float, mode: Rounding) -> Float =
+  if bits_of_float(x) >> 52 & 2047 == 2047 { x } else {
+    let toward_zero = if x < 0.0 { Float::ceil(x) } else { Float::floor(x) };
+    // Exact: below 2^52 a float's fraction is a float, and above it there is none.
+    let fraction = if x < 0.0 { toward_zero - x } else { x - toward_zero };
+    let away = toward_zero + (if x < 0.0 { 0.0 - 1.0 } else { 1.0 });
+    match mode {
+      Down -> toward_zero,
+      Up -> if fraction == 0.0 { x } else { away },
+      Ceiling -> Float::ceil(x),
+      Floor -> Float::floor(x),
+      HalfUp -> if fraction < 0.5 { toward_zero } else { away },
+      HalfEven -> if fraction < 0.5 { toward_zero }
+      else if fraction > 0.5 || Float::floor(toward_zero / 2.0) * 2.0 != toward_zero { away }
+      else { toward_zero },
+    }
+  }
 
 /// The greatest whole number at or below `x`.
 extern fn Float::floor(x: Float) -> Float
@@ -2194,7 +2536,56 @@ extern fn Float::atan2(y: Float, x: Float) -> Float
 extern fn Float::hypot(x: Float, y: Float) -> Float
 
 /// `d` in decimal at its scale, so `1.50m` prints `1.50`.
-extern fn Decimal::to_string(d: Decimal) -> String
+pub fn Decimal::to_string(d: Decimal) -> String = {
+  let w = Decimal::bits(d);
+  let digits = decimal_digits(trimmed_limbs([w._0 >>> 32, w._1 & 4294967295, w._1 >>> 32]));
+  let scale = Decimal::scale(d);
+  // At least one digit before the point: zeros where the digits are fewer than the scale.
+  let width = max(digits.len(), scale + 1);
+  let lead = width - digits.len();
+  String::of_chars(
+    range(0, width).fold(if decimal_negative(d) { ['-'] } else { [] }, |out: List<Char>, i: Int| {
+      let c = if i < lead { '0' } else { match digits.at(i - lead) { Some(x) -> x, None -> '0' } };
+      (if scale > 0 && i == width - scale { out.push('.') } else { out }).push(c)
+    }),
+  )
+}
+
+/// `a`, base-2^32 limbs least significant first, without the zero limbs on top.
+fn trimmed_limbs(a: List<Int>) -> List<Int> = {
+  let top = range(0, a.len()).fold(0, |top: Int, i: Int|
+    if limb_at(a, i) != 0 { i + 1 } else { top });
+  range(0, top).map(|i: Int| limb_at(a, i))
+}
+
+/// The decimal digits of the natural number `a`, most significant first, `0` for zero: a mantissa
+/// of 96 bits has at most 29.
+fn decimal_digits(a: List<Int>) -> List<Char> =
+  if a.len() == 0 { ['0'] } else {
+    let low_first = range(0, 30).fold(
+      { a: a, out: [] },
+      |s: { a: List<Int>, out: List<Char> }, _: Int|
+        if s.a.len() == 0 { s } else {
+          let d = limbs_tenth(s.a);
+          { a: d.q, out: s.out.push(digit(d.r)) }
+        },
+    ).out;
+    let n = low_first.len();
+    range(0, n).map(|i: Int| match low_first.at(n - 1 - i) { Some(c) -> c, None -> '0' })
+  }
+
+/// `a` divided by ten, and the remainder.
+fn limbs_tenth(a: List<Int>) -> { q: List<Int>, r: Int } = {
+  let s = range(0, a.len()).fold(
+    { top_first: [], r: 0 },
+    |s: { top_first: List<Int>, r: Int }, j: Int| {
+      let t = s.r * 4294967296 + limb_at(a, a.len() - 1 - j);
+      { top_first: s.top_first.push(t / 10), r: t % 10 }
+    },
+  );
+  let n = s.top_first.len();
+  { q: trimmed_limbs(range(0, n).map(|i: Int| limb_at(s.top_first, n - 1 - i))), r: s.r }
+}
 
 /// The IEEE-754 bit pattern; total. Every `NaN` reads as `0x7FF8_0000_0000_0000`.
 extern fn bits_of_float(f: Float) -> Int
