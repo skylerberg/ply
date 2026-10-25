@@ -9,7 +9,7 @@ import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, 
                                  LDec, LChar, LUnit, LBad)
 import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, builtin, is_pure,
                 is_recursive, unfoldable, self_recursive, is_identity, is_reflexive, ends,
-                recursive_body, operation_sort)
+                recursive_body, operation_sort, reaches_key)
 import compiler.syntax.parsing (Span)
 import domain (Ty, Var, Fn, Record, Con, Variant)
 import lemma (Lemma)
@@ -17,7 +17,8 @@ import rules (RuleLog, Cited, Contract, note, unfolded)
 import compiler.front.published (ClaimClause)
 import compiler.syntax.items (SEnsures, SRequires)
 import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
-             option_ty, record_of, substituted, field_ty, answered, matched, unified, foreign, vars)
+             option_ty, record_of, substituted, field_ty, answered, matched, unified, foreign,
+             foreign_base, vars)
 import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFloat, TFixed, TUnit, TSym, TOpaque,
              TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TEqualAt,
              TIf, TMatch, TClosure, CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit,
@@ -242,11 +243,15 @@ pub type Lowering = {
   /// The types stating an invariant that nothing in this claim may stand on but its binders' values:
   /// what an earlier reading of the claim found it constructs.
   tainted: List<String>,
-  /// Whether the claim is a law. A region it reads is owed unreached, since a law's run fails where
-  /// one raises or never resumes, and a function its binders hold answers at every argument, since
-  /// the law is a claim about such functions. An `ensures` holds of what its definition answers,
-  /// which a raise is not, and is handed functions by callers it cannot see.
+  /// Whether the claim is a law, whose binders' functions answer at every argument: the law is a
+  /// claim about such functions. An `ensures` is handed functions by callers it cannot see.
   in_law: Bool,
+  /// The claim's binders, as terms.
+  binder_terms: List<Int>,
+  /// Whether a raise in what is being read is owed unreached: a region, or a `let` that does not
+  /// match. It is in a law and in any claim's clause and guards; not in the body of a definition an
+  /// `ensures` is about, which holds of what the definition answers, which a raise is not.
+  raises_owed: Bool,
   /// How many more definitions this reading may unfold.
   unfold_room: Int,
   /// Whether what was lowered performs anything, which a closure's body is read on fresh
@@ -290,6 +295,8 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering / {abort.raise} =
     constructed: [],
     tainted: [],
     in_law: false,
+    binder_terms: [],
+    raises_owed: true,
     unfold_room: unfold_room(),
   }
 
@@ -412,7 +419,7 @@ fn lower_opt(
 
 /// What a region answers, of `sort` where that is known, which is not read.
 fn region(lowering: Lowering, sort: Option<Ty>) -> L / {abort.raise} = {
-  let lw = blocked(if lowering.in_law { undefined(lowering) } else { lowering }, Region);
+  let lw = blocked(if lowering.raises_owed { undefined(lowering) } else { lowering }, Region);
   on({ ..lw, impure: true }, sym(lw.terms, sort))
 }
 
@@ -545,7 +552,7 @@ fn function_total(lowering: Lowering, context: Context, t: Int) -> Bool / {abort
     TClosure(k) -> match lowering.closures.at(k) { Some(c) -> c.total, None -> false },
     TOpaque(name) -> is_total_builtin(name) || ctor(context, name) != None,
     TSym(_) ->
-      lowering.in_law
+      lowering.in_law && lowering.binder_terms.contains(t)
         && (match sort_of(lowering.terms, t) { Some(Fn(_, _, total)) -> total, _ -> false }),
     _ -> false,
   }
@@ -598,10 +605,7 @@ pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L /
         unfolds,
       );
       let lw2 = popped(else_branch.lowering);
-      let sort = match sort_of(lw2.terms, then_branch.id) {
-        Some(s) -> Some(s),
-        None -> sort_of(lw2.terms, else_branch.id),
-      };
+      let sort = surer(sort_of(lw2.terms, then_branch.id), sort_of(lw2.terms, else_branch.id));
       on(
         lw2,
         mk(
@@ -1188,6 +1192,14 @@ fn pointwise(
   }
 }
 
+/// Of two sorts one value may have, the one that knows more: a sort whose type arguments are known
+/// over one whose are not.
+fn surer(a: Option<Ty>, b: Option<Ty>) -> Option<Ty> =
+  match a {
+    Some(s) -> if vars(s, []).any(|v: Int| v >= foreign_base()) && b != None { b } else { a },
+    None -> b,
+  }
+
 /// Whether `Int`'s operators are the ones applied: either operand is of a sort no variable leaves
 /// open. Of no sort or of a variable, both may be `Float`s or of a type stating its own.
 fn int_operands(terms: Terms, lhs: Int, rhs: Int) -> Bool / {abort.raise} =
@@ -1399,7 +1411,10 @@ fn call_head(
     _ -> None,
   };
   // A total builtin is a function of its arguments, so two calls over one argument are one term.
-  let total_builtin = match who { Unresolved(name) -> is_total_builtin(name), _ -> false };
+  let total_builtin = match who {
+    Unresolved(name) -> builtin_answers(context, name, arg_sorts),
+    _ -> false,
+  };
   let sort = match who {
     Unresolved(name) -> match builtin(context, name) {
       Some(b) -> match b.ty { Fn(params, ret, _) -> answered(params, arg_sorts, ret), _ -> None },
@@ -1590,14 +1605,26 @@ pub fn invariants_held(
       })
   }
 
-/// Whether a value of `ty` is or holds a function.
-fn holds_function(ty: Ty) -> Bool =
-  match ty {
-    Var(_) -> false,
-    Con(_, args) -> args.any(holds_function),
-    Fn(_, _, _) -> true,
-    Record(fields) -> fields.any(|f: { name: String, ty: Ty }| holds_function(f.ty)),
-  }
+/// Whether a value of `ty` is or holds a function, through any declaration.
+fn holds_function(context: Context, ty: Ty) -> Bool = function_within(context, ty, [], 64)
+
+fn function_within(context: Context, ty: Ty, seen: List<String>, room: Int) -> Bool =
+  room <= 0
+    || (match ty {
+      Var(_) -> false,
+      Fn(_, _, _) -> true,
+      Record(fields) ->
+        fields.any(|f: { name: String, ty: Ty }| function_within(context, f.ty, seen, room - 1)),
+      Con(n, args) ->
+        args.any(|a: Ty| function_within(context, a, seen, room - 1))
+          || (!seen.contains(n)
+          && (match context.decls.get(n) {
+            Some(decl) ->
+              decl.variants.any(|v: Variant|
+                v.fields.any(|f: Ty| function_within(context, f, seen.push(n), room - 1))),
+            None -> false,
+          })),
+    })
 
 /// Whether a value of `ty` can hold one of the types `names`, at any depth and through any
 /// declaration. A type variable holds none: what stands on it was shown at every type.
@@ -1679,15 +1706,10 @@ fn contracted(
                     unfolds - 1,
                   );
                   let unmet = not(e.lowering.terms, guard.id);
-                  let fact = or(unmet.terms, unmet.id, e.id);
-                  let held = if proved {
-                    { lowering: with_terms(e.lowering, fact.terms), id: fact.id }
-                  } else {
-                    under_path(
-                      { ..with_terms(e.lowering, fact.terms), path: lowering.path },
-                      fact.id,
-                    )
-                  };
+                  let stated = or(unmet.terms, unmet.id, e.id);
+                  let fact = where_owed(with_terms(e.lowering, stated.terms), lowering, stated.id);
+                  let held = if proved { fact }
+                  else { under_path({ ..fact.lowering, path: lowering.path }, fact.id) };
                   { ..held.lowering, facts: held.lowering.facts.push(held.id) }
                 },
               }
@@ -1757,7 +1779,7 @@ fn instances(
                 lowering: instance(acc.lowering, context, lemma, terms, unfolds - 1),
                 apart: acc.apart || lemma.apart,
                 // A law over a function stood on that function answering, which no other may.
-                fitted: acc.fitted || !lemma.typed.any(holds_function),
+                fitted: acc.fitted || !lemma.typed.any(|t: Ty| holds_function(context, t)),
               }
             },
           },
@@ -1876,8 +1898,9 @@ fn instance(
     lemma.body,
     unfolds,
   );
+  let fact = where_owed(r.lowering, lowering, r.id);
   {
-    ..r.lowering,
+    ..fact.lowering,
     window: lowering.window,
     path: lowering.path,
     depth: lowering.depth,
@@ -1886,10 +1909,23 @@ fn instance(
     requirements: lowering.requirements,
     blockers: lowering.blockers,
     calls: lowering.calls,
-    defined: r.lowering.defined.concat(r.lowering.calls.drop(lowering.calls.len())),
-    facts: r.lowering.facts.push(r.id),
-    rules: note(r.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
+    // A law over a function stood on that function answering, so its calls are no other's values.
+    defined: if lemma.typed.any(|t: Ty| holds_function(context, t)) { r.lowering.defined }
+    else { r.lowering.defined.concat(r.lowering.calls.drop(lowering.calls.len())) },
+    facts: fact.lowering.facts.push(fact.id),
+    rules: note(fact.lowering.rules, Cited({ law: lemma.law, label: lemma.label })),
   }
+}
+
+/// `fact`, about values `owing` was read to, stated where what that reading owes holds: a fact
+/// about a call is no ground to take its arguments for values.
+fn where_owed(lowering: Lowering, owing: Lowering, fact: Int) -> L / {abort.raise} = {
+  let owed = owing.requirements.fold(
+    on(lowering, boolean(lowering.terms, true)),
+    |acc: L, r: Int| on(acc.lowering, both(acc.lowering.terms, acc.id, r)),
+  );
+  let unmet = not(owed.lowering.terms, owed.id);
+  on(owed.lowering, or(unmet.terms, unmet.id, fact))
 }
 
 /// A `Float` builtin over literals: the bits a run answers, which every machine agrees on.
@@ -2200,9 +2236,17 @@ fn callee_is_total(
   match who {
     Local -> function_total(lowering, context, head),
     Named(name) -> ctor(context, name) != None || lowering.total.contains(name),
-    Unresolved(name) -> is_total_builtin(name),
+    Unresolved(name) ->
+      builtin_answers(context, name, args.map(|a: Int| sort_of(lowering.terms, a))),
     Other -> false,
   }
+
+/// Whether a call of the builtin `name` over arguments of `sorts` answers: one of the total ones, and
+/// where it compares, over no value whose key's function could end the run.
+fn builtin_answers(context: Context, name: String, sorts: List<Option<Ty>>) -> Bool =
+  is_total_builtin(name)
+    && !((name == "min" || name == "max" || name.starts_with("Map::"))
+      && sorts.any(|s: Option<Ty>| match s { Some(t) -> reaches_key(context, t), None -> true }))
 
 fn head_is_pure(terms: Terms, head: Int) -> Bool =
   match sort_of(terms, head) { Some(Fn(_, _, pure)) -> pure, _ -> false }
@@ -2316,7 +2360,11 @@ fn try_unfold(
 /// Whether a value of `sort` is one no recursion takes apart: a builtin type of no parameters. A
 /// recursion over a list or a sum not in view is not unrolled by an argument beside it that is.
 fn scalar(context: Context, sort: Option<Ty>) -> Bool =
-  match sort { Some(Con(name, [])) -> !context.decls.contains(name), _ -> false }
+  match sort {
+    Some(Con(name, [])) -> !context.decls.contains(name),
+    Some(Fn(_, _, _)) -> true,
+    _ -> false,
+  }
 
 /// A value the lowering sees all of that a recursion could take apart: a literal, a constructor of
 /// them, or a list's whole spine, whatever its elements.
@@ -2365,7 +2413,7 @@ fn block(
           match destructured(r.lowering, pat, r.id) {
             Some(bound) -> bound,
             None -> {
-              let lw = if r.lowering.in_law { undefined(r.lowering) } else { r.lowering };
+              let lw = if r.lowering.raises_owed { undefined(r.lowering) } else { r.lowering };
               bind_opaque(blocked(lw, DestructuringLet), pat)
             },
           }
@@ -2593,7 +2641,7 @@ fn arms_of(
       let entered = match taken { Some(c) -> assume(c.lowering, c.id), None -> guarded };
       let body = lower(entered, context, a.body, unfolds);
       let left = match taken { Some(_) -> popped(body.lowering), None -> body.lowering };
-      let sort = match acc.sort { Some(x) -> Some(x), None -> sort_of(left.terms, body.id) };
+      let sort = surer(acc.sort, sort_of(left.terms, body.id));
       {
         lowering: left,
         arms: acc.arms.push({ test: tested.test, binds: tested.binds, body: body.id }),

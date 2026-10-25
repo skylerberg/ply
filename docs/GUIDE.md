@@ -2763,8 +2763,8 @@ points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, a `match` taking its arm over
 a value whose shape is in view, a lambda applied, `List::map`, `List::filter`
 and `List::fold` read over the part of a list in view, a recursive definition
-the checker reads as ending (§5.10) run over arguments in view (each one in view
-or a value of a builtin type no recursion takes apart), the contracts of
+the checker reads as ending (§5.10) run over arguments in view (each one in view,
+a function, or a value of a builtin type), the contracts of
 the definitions a claim calls (below), exhaustive interleaving, and induction: a
 definition that calls only itself, and that the checker reads as ending
 (§5.10), is unrolled, and over values in view as deep as the unfolding goes. On
@@ -2793,9 +2793,10 @@ operands are literals, as the bits a run answers. An operator at a type that
 states `numeric` is the function it names, and one over operands of no type the
 prover knows, a type variable's or a lambda's answer, is a function of them that
 may raise. A `perform`, `handle` or `simulate` is a value the prover does not
-read, and a refutable `let` raises where it does not match; in a law each is
-owed unreached, while an `ensures` holds of what its definition answers, which a
-raise is not. A call of a function value answers where the prover reads its
+read, and a refutable `let` raises where it does not match; each is owed
+unreached in a law and in any claim's own clause and guards, while the body of
+a definition an `ensures` is about holds of what it answers, which a raise is
+not. A call of a function value answers where the prover reads its
 body, or in a law where a binder's type performs nothing: the law speaks of such
 functions. An `ensures` is handed functions by callers it cannot see, so a call
 of a parameter there answers nothing it can stand on. An `unproved` claim names each place
