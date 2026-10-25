@@ -21,7 +21,7 @@ import compiler.syntax.items (Module, Item, IFn, IType, IDerive, FnDef, TypeDef,
                               deriver_tag, derivers, ImportDecl, ImportKind, IModule, IAlias,
                               INames, Vis, VPub, VPriv, Derived, Derivation, RuntimeBinder,
                               Constraint, SpecClause, parse, constraint_written, TDNominal,
-                              TDExtern, IInstance, InstanceDef, NKey, NShow, NInvariant)
+                              TDExtern)
 import compiler.expand.rewrite (expand)
 import compiler.expand.rewrite.shared (find_type, picked_in)
 import compiler.expand.declared (declaration_of)
@@ -85,7 +85,6 @@ pub fn runtime_module(deriver: Deriver) -> Option<Bytes> =
   match deriver {
     DJson -> Some(b"std.json"),
     DBin -> Some(b"std.bin"),
-    DShow -> Some(b"std.show"),
     DRow -> Some(b"std.sql"),
     _ -> None,
   }
@@ -94,7 +93,6 @@ fn runtime_path(deriver: Deriver) -> List<Bytes> =
   match deriver {
     DJson -> [b"std", b"json"],
     DBin -> [b"std", b"bin"],
-    DShow -> [b"std", b"show"],
     DRow -> [b"std", b"sql"],
     _ -> [],
   }
@@ -164,25 +162,6 @@ fn row_fields(def: TypeDef) -> Option<List<{ name: Ident, ty: TypeExpr }>> =
     TDSum(_) -> None,
     TDExtern -> None,
   }
-
-/// Whether the module states what `deriver` reads of `target`: its `key` for `eq`, `ord` and `hash`,
-/// its `show` for `show`. The fields are then not what is derived from, and the checker judges what
-/// the stated function answers.
-fn has_instance(module: Module, deriver: Deriver, target: Bytes) -> Bool =
-  module.items.fold(false, |found: Bool, item: Item|
-    found
-      || (match item {
-        IInstance(d) ->
-          d.target.name == target
-            && (match d.kind {
-              NKey ->
-                same_deriver(deriver, DEq) || same_deriver(deriver, DOrd)
-                  || same_deriver(deriver, DHash),
-              NShow -> same_deriver(deriver, DShow),
-              NInvariant -> false,
-            }),
-        _ -> false,
-      }))
 
 // No generated call fills a label, and only a type that holds a function has a use for one.
 fn label_refusal() -> Bytes = b"a type that takes a label has no derivation"
@@ -590,68 +569,18 @@ fn emit_item(emitter: DeriveEmitter, def: TypeDef) -> List<Bytes> / {abort.raise
   }
 }
 
-/// `JsonCodec<a>` and `BinCodec<a>` ship with their runtime modules; `EqDict` and `OrdDict` are structural.
+/// `JsonCodec<a>`, `BinCodec<a>` and `RowCodec<a>` ship with their runtime modules.
 fn dict_type(emitter: DeriveEmitter, arg: Bytes) -> Bytes =
   match emitter.d {
     DJson -> Bytes::concat_all([emitter.rt, b"JsonCodec<", arg, b">"]),
     DBin -> Bytes::concat_all([emitter.rt, b"BinCodec<", arg, b">"]),
     DRow -> Bytes::concat_all([emitter.rt, b"RowCodec<", arg, b">"]),
-    DShow -> Bytes::concat_all([b"{show: (", arg, b") -> String}"]),
-    DHash -> Bytes::concat_all([b"{hash: (", arg, b") -> Bytes}"]),
-    DEq -> Bytes::concat_all([b"{eq: (", arg, b", ", arg, b") -> Bool}"]),
-    DOrd -> Bytes::concat_all([b"{compare: (", arg, b", ", arg, b") -> Ordering}"]),
     // A predicate is never derived: the parser has no `derive` that names one.
     _ -> b"()",
   }
 
 fn dictionary(emitter: DeriveEmitter, def: TypeDef, target: Bytes) -> Bytes / {abort.raise} =
   match emitter.d {
-    DEq ->
-      Bytes::concat_all([
-        b"{eq: |",
-        emitter.b,
-        b"a: ",
-        target,
-        b", ",
-        emitter.b,
-        b"b: ",
-        target,
-        b"| ",
-        emitter.b,
-        b"a == ",
-        emitter.b,
-        b"b}",
-      ]),
-    DOrd ->
-      Bytes::concat_all([
-        b"{compare: |",
-        emitter.b,
-        b"a: ",
-        target,
-        b", ",
-        emitter.b,
-        b"b: ",
-        target,
-        b"| compare_values(",
-        emitter.b,
-        b"a, ",
-        emitter.b,
-        b"b)}",
-      ]),
-    DShow ->
-      Bytes::concat_all([
-        b"{show: |",
-        emitter.b,
-        b"a: ",
-        target,
-        b"| ",
-        emitter.rt,
-        b"show(",
-        emitter.b,
-        b"a)}",
-      ]),
-    DHash ->
-      Bytes::concat_all([b"{hash: |", emitter.b, b"a: ", target, b"| digest(", emitter.b, b"a)}"]),
     DJson -> match def.body {
       TDAlias(body) -> codec(emitter, body, target),
       TDNominal(body) -> codec(emitter, body, target),
@@ -2357,8 +2286,7 @@ fn one(expander: Expander, def: DeriveDef) -> Expander / {abort.raise} =
       let name = generated_name(def.deriver, def.target.name);
       match find_claimed(expander.claimed, name) {
         Some(prev) -> collision(expander, def, prev, name),
-        None -> match if has_instance(expander.module, def.deriver, def.target.name) { None }
-          else { check_decl(def.deriver, target) } {
+        None -> match check_decl(def.deriver, target) {
           Some(blocker) -> match target.body {
             TDExtern -> native_not_derivable(expander, def, blocker),
             _ -> not_derivable(expander, def, blocker),
@@ -2953,7 +2881,6 @@ test "a row reads a column per field, and a field that is no scalar as a documen
 test "an `extern type` has no field a derivation reads, so nothing derives one" {
   let refused = |text: Bytes|
     expand_derives(0, b"std.t", parse(text).node).diags.map(|d: Diag| d.code);
-  assert_eq(refused(b"extern type Node\nderive eq for Node\n"), [b"E0206"]);
   assert_eq(refused(b"import std.json\nextern type Node<a>\nderive json for Node\n"), [b"E0206"])
 }
 
@@ -3047,13 +2974,13 @@ test "a type that takes a row derives over it, and one that takes a label has no
   let out = preview(
     b"t",
     parse(
-      b"type Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive eq for Tagged\nderive eq for Pair",
+      b"import std.json\ntype Tagged<a | e> = | Tagged(a)\ntype Pair = {left: Tagged<Int | {}>}\nderive json for Tagged\nderive json for Pair",
     ).node,
   );
   // Its function is generic over the row as the type is.
   assert(
     out.get(0).starts_with(
-      b"fn tagged_eq<a | e>(a: {eq: (a, a) -> Bool}) -> {eq: (Tagged<a | e>, Tagged<a | e>) -> Bool} where derivable(eq, a) = ",
+      b"fn tagged_json<a | e>(a: json::JsonCodec<a>) -> json::JsonCodec<Tagged<a | e>> where derivable(json, a) = ",
     ),
     None,
   );
@@ -3062,12 +2989,13 @@ test "a type that takes a row derives over it, and one that takes a label has no
       let primary = diag.labels.get(0);
       [diag.code, src.slice(primary.start, primary.end)]
     });
-  assert_eq(refused(b"type Tagged<a, [l]> = | Tagged(a)\nderive eq for Tagged"), [
-    [b"E0206", b"l"],
-  ]);
+  assert_eq(
+    refused(b"import std.json\ntype Tagged<a, [l]> = | Tagged(a)\nderive json for Tagged"),
+    [[b"E0206", b"l"]],
+  );
   assert_eq(
     refused(
-      b"type Tagged<a, [l]> = | Tagged(a)\ntype Pair = {left: Tagged<Int, [conn]>}\nderive eq for Pair",
+      b"import std.json\ntype Tagged<a, [l]> = | Tagged(a)\ntype Pair = {left: Tagged<Int, [conn]>}\nderive json for Pair",
     ),
     [[b"E0206", b"left: Tagged<Int, [conn]>"]],
   )
@@ -3079,7 +3007,9 @@ test "an orphan, a collision, a missing runtime and a refused field each report 
   let twice = expand_derives(
     0,
     b"t",
-    parse(b"type Order = {id: Int}\nderive eq for Order\nderive eq for Order").node,
+    parse(
+      b"import std.json\ntype Order = {id: Int}\nderive json for Order\nderive json for Order",
+    ).node,
   );
   assert_eq(twice.diags.map(|diag: Diag| diag.code), [b"E0105"]);
   assert_eq(twice.diags.get(0).labels.len(), 2);
@@ -3145,6 +3075,7 @@ test "a library derivation asks its module's deriver with the module's types, an
   assert_eq(declaration.target, "Box");
   assert_eq(declaration.binder, "mapping");
   assert_eq(declaration.derived, ["Box"]);
+  assert_eq(declaration.imports, [{ module: "lib.mapping", binder: "mapping" }]);
   assert_eq(declaration.types.map(|t: derive::TypeDeclaration| t.name), ["Box", "Pair"]);
   assert_eq(
     derive::type_text(match derive::target(declaration).body {
