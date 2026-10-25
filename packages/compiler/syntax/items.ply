@@ -23,10 +23,11 @@ import std.list
 import compiler.syntax.lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead,
                               InterpolatedTail, Keyword, Punctuation, EndOfInput, Comment, DocMark,
                               ItemDoc, ModuleDoc, doc_mark, follows_name, is_ident_continue)
-import compiler.syntax.type_syntax (TypeExpr, TRecord, TUnit, TCon, TFn, RowExpr, AtomExpr, Mode,
-                                    Generics, RowMember, MWrite, MRaise, RMAtom, RMSet, ty, ty_span,
-                                    mode, generics, row, row_member, no_generics, dump_ty, dump_row,
-                                    dump_atom, dump_generics, dump_mode)
+import compiler.syntax.type_syntax (TypeExpr, TVar, TRecord, TUnit, TCon, TFn, TBad, RowExpr,
+                                    AtomExpr, Mode, Generics, RowMember, MWrite, MRaise, RMAtom,
+                                    RMSet, ty, ty_span, mode, generics, row, row_member,
+                                    no_generics, dump_ty, dump_row, dump_atom, dump_generics,
+                                    dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span,
                               no_expr, fn_param, param, declared_param, dump_expr, dump_param,
@@ -161,21 +162,35 @@ pub type FnDef = {
 
 pub type Binder = { name: Ident, ty: TypeExpr, span: Span }
 
+/// `identities` are the type variables a `where identity(a)` names: the law claims only the types
+/// at which `==` is identity there, two values being `==` exactly when they are the same value.
 pub type LawDef = {
   name: Bytes,
   name_span: Span,
   binders: List<Binder>,
+  identities: List<Ident>,
   guard: Option<Expr>,
   of: Option<OfSchema>,
   body: Expr,
   span: Span,
 }
 
-/// `law "l" = round_trip(f, g)`. The resolver fills `home`, the schema's module, and `shown`, the
-/// names the schema gives its binders.
-pub type OfSchema = { schema: QName, home: Option<Bytes>, shown: List<Bytes>, span: Span }
+/// `law "l" = round_trip(f, g)`. The resolver fills `home`, the schema's module, `shown`, the
+/// names the schema gives its binders, and `identities`, the type parameters its `where` constrains.
+pub type OfSchema = {
+  schema: QName,
+  home: Option<Bytes>,
+  shown: List<Bytes>,
+  identities: List<SchemaIdentity>,
+  span: Span,
+}
+
+/// A schema's type parameter constrained `identity`, by its place among the type arguments the
+/// schema's definitions are called at: the type parameters its parameters' and binders' types write.
+pub type SchemaIdentity = { name: Bytes, position: Int }
 
 /// `law schema round_trip<a>(f: (a) -> String) forall (x: a) { .. }`: a law over what it is given.
+/// `identities` are the type parameters its `where identity(a)` names, as a law's are.
 pub type SchemaDef = {
   vis: Vis,
   name: Ident,
@@ -183,6 +198,7 @@ pub type SchemaDef = {
   generics: Generics,
   params: List<Binder>,
   binders: List<Binder>,
+  identities: List<Ident>,
   guard: Option<Expr>,
   body: Expr,
   doc: Option<Doc>,
@@ -294,14 +310,17 @@ derive bin for RuntimeBinder
 derive bin for Derivation
 
 /// What a nominal type's own module says its values go through: `key for Deque by to_list` for
-/// `==`, `compare`, `digest` and a `Map`'s order, and `show for Date by render` for `show`.
-pub type InstanceKind = | NKey | NShow
+/// `==`, `compare`, `digest` and a `Map`'s order, and `show for Date by render` for `show`; and
+/// `invariant for Balance by valid`, what every value of an opaque sum satisfies, which each
+/// constructor application in its module is an obligation to show and every other value assumes.
+pub type InstanceKind = | NKey | NShow | NInvariant
 
 derive bin for InstanceKind
 
 pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Span }
 
-pub fn instance_text(kind: InstanceKind) -> Bytes = match kind { NKey -> b"key", NShow -> b"show" }
+pub fn instance_text(kind: InstanceKind) -> Bytes =
+  match kind { NKey -> b"key", NShow -> b"show", NInvariant -> b"invariant" }
 
 /// One function a `numeric` names, and the operation it names it for.
 pub type NumericOp = { op: Ident, by: Ident }
@@ -513,11 +532,17 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_numeric_start(input, parser)
 }
 
-/// `key` and `show` are contextual: one opens an item only before `for`, so `fn key(..)` and a field
-/// named `show` keep their meaning.
+/// `key`, `show` and `invariant` are contextual: one opens an item only before `for`, so
+/// `fn key(..)` and a field named `show` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
-  (at_ident_text(input, parser, b"key") || at_ident_text(input, parser, b"show"))
+  instance_kind_at(input, parser) != None
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
+
+fn instance_kind_at(input: Input, parser: Parser) -> Option<InstanceKind> =
+  if at_ident_text(input, parser, b"key") { Some(NKey) }
+  else if at_ident_text(input, parser, b"show") { Some(NShow) }
+  else if at_ident_text(input, parser, b"invariant") { Some(NInvariant) }
+  else { None }
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
 /// keep their meaning.
@@ -1237,11 +1262,76 @@ pub fn quoted(
     _ -> Err(error_here(input, parser, what)),
   }
 
-fn law_guard(input: Input, parser: Parser) -> Result<Parsed<Option<Expr>>, Parser> / {abort.raise} =
-  if !at_ident_text(input, parser, b"where") { Ok({ parser: parser, node: None }) } else {
+/// What a law's or a law schema's `where` writes: the type variables it constrains, then its guard.
+type LawWhere = { identities: List<Ident>, guard: Option<Expr> }
+
+/// `open` while a constraint or the guard must still follow.
+type WhereSoFar = { parser: Parser, identities: List<Ident>, open: Bool }
+
+/// The type variables `binders`' types write, each once, in the order they are first written: what
+/// a law's `identity(a)` may name.
+pub fn law_type_variables(binders: List<Binder>) -> List<Bytes> =
+  binders.fold([], |acc: List<Bytes>, b: Binder| written_variables(b.ty, acc))
+
+fn written_variables(ty: TypeExpr, found: List<Bytes>) -> List<Bytes> =
+  match ty {
+    TVar(i) -> if found.contains(i.name) { found } else { found.push(i.name) },
+    TCon(c) -> c.args.fold(found, |acc: List<Bytes>, a: TypeExpr| written_variables(a, acc)),
+    TFn(f) ->
+      written_variables(
+        f.ret,
+        f.params.fold(found, |acc: List<Bytes>, p: TypeExpr| written_variables(p, acc)),
+      ),
+    TRecord(r) ->
+      r.fields.fold(found, |acc: List<Bytes>, f: { name: Ident, ty: TypeExpr }|
+        written_variables(f.ty, acc)),
+    TUnit(_) -> found,
+    TBad(_) -> found,
+  }
+
+/// `identity(a)` at the parser's position, where `a` is one of `variables`.
+fn identity_at(input: Input, parser: Parser, variables: List<Bytes>) -> Option<Ident> =
+  if !at_ident_text(input, parser, b"identity") || token_kind_at(input, parser, 1) != token_lparen()
+      || token_kind_at(input, parser, 3) != token_rparen() { None } else {
+    match token_kind_at(input, parser, 2) {
+      Identifier(n) -> if variables.contains(n) {
+        Some({ name: n, span: span_at(input, parser, 2) })
+      } else { None },
+      _ -> None,
+    }
+  }
+
+/// `where identity(a), .., guard`: a leading `identity(<name>)` constrains `<name>` exactly when it is
+/// one of `variables`, so anything else, a call of a function named `identity` among them, is the guard.
+fn law_where(
+  input: Input,
+  parser: Parser,
+  variables: List<Bytes>,
+) -> Result<Parsed<LawWhere>, Parser> / {abort.raise} =
+  if !at_ident_text(input, parser, b"where") {
+    Ok({ parser: parser, node: { identities: [], guard: None } })
+  } else {
     let a = advance(input, parser);
-    let { parser, node: e } = scrutinee(input, a.parser)?;
-    Ok({ parser: parser, node: Some(e) })
+    let named = iterate(
+      { parser: a.parser, identities: [], open: true },
+      input.token_count - a.parser.pos + 1,
+      |s: WhereSoFar|
+        match identity_at(input, s.parser, variables) {
+          None -> Stop(s),
+          Some(name) -> {
+            let past = range(0, 4).fold(s.parser, |p: Parser, _: Int| bump(input, p));
+            let cm = eat(input, past, token_comma());
+            let next = { parser: cm.parser, identities: s.identities.push(name), open: cm.ok };
+            if cm.ok { Continue(next) } else { Stop(next) }
+          },
+        },
+    );
+    if !named.open {
+      Ok({ parser: named.parser, node: { identities: named.identities, guard: None } })
+    } else {
+      let { parser, node: e } = scrutinee(input, named.parser)?;
+      Ok({ parser: parser, node: { identities: named.identities, guard: Some(e) } })
+    }
   }
 
 pub fn law_def(input: Input, parser: Parser) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
@@ -1257,7 +1347,7 @@ fn written_law(
   nm: ParsedName,
 ) -> Result<Parsed<LawDef>, Parser> / {abort.raise} = {
   let { parser, node: bs } = law_binders(input, nm.parser)?;
-  let { parser, node: g } = law_guard(input, parser)?;
+  let { parser, node: w } = law_where(input, parser, law_type_variables(bs))?;
   let { parser, node: body } = block_expr(input, parser)?;
   Ok({
     parser: parser,
@@ -1265,7 +1355,8 @@ fn written_law(
       name: nm.name,
       name_span: nm.span,
       binders: bs,
-      guard: g,
+      identities: w.identities,
+      guard: w.guard,
       of: None,
       body: body,
       span: span_to(start, expr_span(body)),
@@ -1302,8 +1393,9 @@ fn instantiation(
       name: nm.name,
       name_span: nm.span,
       binders: [],
+      identities: [],
       guard: None,
-      of: Some({ schema: q, home: None, shown: [], span: span }),
+      of: Some({ schema: q, home: None, shown: [], identities: [], span: span }),
       body: EApp({
         span: span,
         func: EVar({ span: q.span, name: q }),
@@ -1382,7 +1474,7 @@ pub fn schema_def(
     b"`)` to close the parameters",
   )?;
   let { parser, node: bs } = law_binders(input, parser)?;
-  let { parser, node: guard } = law_guard(input, parser)?;
+  let { parser, node: w } = law_where(input, parser, g.types.map(|ident: Ident| ident.name))?;
   let { parser, node: body } = block_expr(input, parser)?;
   Ok({
     parser: parser,
@@ -1392,7 +1484,8 @@ pub fn schema_def(
       generics: g,
       params: ps,
       binders: bs,
-      guard: guard,
+      identities: w.identities,
+      guard: w.guard,
       body: body,
       doc: None,
       span: span_to(st.node, expr_span(body)),
@@ -1951,19 +2044,27 @@ pub fn derive_def(
   }
 }
 
-// --- `key` and `show` -------------------------------------------------------
+// --- `key`, `show` and `invariant` -------------------------------------------
 
-/// One `key for T by f` or `show for T by f`.
+/// One `key for T by f`, `show for T by f` or `invariant for T by f`.
 pub fn instance_def(
   input: Input,
   parser: Parser,
 ) -> Result<Parsed<InstanceDef>, Parser> / {abort.raise} = {
-  let kind = if at_ident_text(input, parser, b"key") { NKey } else { NShow };
+  let kind = match instance_kind_at(input, parser) {
+    Some(k) -> k,
+    None -> panic("an instance is read where its kind opens it"),
+  };
   let st = advance(input, parser);
   let f = advance(input, st.parser);
   let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
   if !at_ident_text(input, parser, b"by") {
-    Err(error_here(input, parser, b"`by` and the function the type's values go through"))
+    Err(
+      error_here(input, parser, match kind {
+        NInvariant -> b"`by` and the function every value of the type satisfies",
+        _ -> b"`by` and the function the type's values go through",
+      }),
+    )
   } else {
     let b = advance(input, parser);
     let { parser, node: by } = fn_name(input, b.parser, b"a function of this module, after `by`")?;
@@ -2222,9 +2323,13 @@ pub fn item_at(
   } else if at_instance_start(input, parser) {
     let d = instance_def(
       input,
-      no_pub(parser, unexpected(), pub_span, b"a `key`, a `show` or a `gen` cannot be `pub`", [
-        b"it is part of what its type is, and reaches wherever the type does",
-      ]),
+      no_pub(
+        parser,
+        unexpected(),
+        pub_span,
+        b"a `key`, a `show` or an `invariant` cannot be `pub`",
+        [b"it is part of what its type is, and reaches wherever the type does"],
+      ),
     )?;
     Ok({ parser: d.parser, node: IInstance(d.node) })
   } else if at_numeric_start(input, parser) {
@@ -2240,7 +2345,7 @@ pub fn item_at(
       error_here(
         input,
         parser,
-        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `derive`, `key`, `show`, or `gen`",
+        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`, `show`, `invariant`, or `numeric`",
       ),
     )
   }
@@ -2255,8 +2360,8 @@ pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abo
   Ok({ parser: parser, node: documented(found, doc) })
 }
 
-/// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key`, a `show`
-/// or a `numeric` is its functions'; none takes a doc.
+/// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key`, a `show`,
+/// an `invariant` or a `numeric` is its functions'; none takes a doc.
 fn documented(item: Item, doc: Option<Doc>) -> Item =
   match item {
     IFn(d) -> IFn({ ..d, doc: doc }),
@@ -2843,6 +2948,7 @@ fn may_start(k: TokenKind) -> Bool =
         || n == b"extern"
         || n == b"key"
         || n == b"show"
+        || n == b"invariant"
         || n == b"numeric",
     _ -> false,
   }
@@ -3144,12 +3250,18 @@ pub fn dump_fn(def: FnDef) -> Bytes / {abort.raise} =
 pub fn dump_binder(binder: Binder) -> Bytes / {abort.raise} =
   Bytes::concat_all([dump_node(binder.span, b"bnd"), dump_ident(binder.name), dump_ty(binder.ty)])
 
+/// Dumped only where a `where` writes them, so a claim without them dumps as it always has.
+fn dump_identities(identities: List<Ident>) -> Bytes / {abort.raise} =
+  if identities.len() == 0 { b"" }
+  else { dump_word(b"idn").concat(dump_list(identities, dump_ident)) }
+
 pub fn dump_law(law_def: LawDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(law_def.span, b"law"),
     dump_node(law_def.name_span, b"lnm"),
     dump_payload(law_def.name),
     dump_list(law_def.binders, dump_binder),
+    dump_identities(law_def.identities),
     dump_opt(law_def.guard, dump_expr),
     dump_expr(law_def.body),
     match law_def.of {
@@ -3166,6 +3278,7 @@ pub fn dump_schema(d: SchemaDef) -> Bytes / {abort.raise} =
     dump_generics(d.generics),
     dump_list(d.params, dump_binder),
     dump_list(d.binders, dump_binder),
+    dump_identities(d.identities),
     dump_opt(d.guard, dump_expr),
     dump_expr(d.body),
     dump_doc_if(d.doc),
@@ -3771,6 +3884,65 @@ test "a schema takes types and one row, binds no label, states no bound and writ
   assert_eq(dump(b"law schema s(f) { true }\n"), "#0;#0;#1;!E0001:14:15:1:0;=14:15:1;")
 }
 
+/// What the first item of `src`, a law or a schema, writes in its `where`, and how many errors the
+/// parse found.
+fn written_where(
+  src: Bytes,
+) -> { identities: List<Bytes>, guarded: Bool, errors: Int } / {abort.raise} = {
+  let r = parse(src);
+  let named = |w: LawWhere|
+    {
+      identities: w.identities.map(|i: Ident| i.name),
+      guarded: w.guard != None,
+      errors: r.parser.diags.len(),
+    };
+  match r.node.items.at(0) {
+    Some(ILaw(d)) -> named({ identities: d.identities, guard: d.guard }),
+    Some(ISchema(d)) -> named({ identities: d.identities, guard: d.guard }),
+    _ -> { identities: [], guarded: false, errors: r.parser.diags.len() },
+  }
+}
+
+test "a `where` constrains each type variable a leading `identity` names, then holds the guard" {
+  assert_eq(written_where(b"law \"l\" forall (xs: List<a>) where identity(a) { true }\n"), {
+    identities: [b"a"],
+    guarded: false,
+    errors: 0,
+  });
+  assert_eq(
+    written_where(
+      b"law \"l\" forall (x: a, f: (b) -> a) where identity(a), identity(b), f == f { true }\n",
+    ),
+    { identities: [b"a", b"b"], guarded: true, errors: 0 },
+  );
+  assert_eq(
+    written_where(
+      b"pub law schema s<a, b>(f: (a) -> b) forall (x: a) where identity(b), x == x { true }\n",
+    ),
+    { identities: [b"b"], guarded: true, errors: 0 },
+  )
+}
+
+test "an `identity` of what is no type variable there is a guard calling a function of that name" {
+  assert_eq(written_where(b"law \"l\" forall (n: Int) where identity(n) { true }\n"), {
+    identities: [],
+    guarded: true,
+    errors: 0,
+  });
+  assert_eq(
+    written_where(b"law schema s(f: (Int) -> Int) forall (a: Int) where identity(a) { true }\n"),
+    { identities: [], guarded: true, errors: 0 },
+  )
+}
+
+test "after a constraint comes a comma and the guard, or the body" {
+  assert(
+    written_where(b"law \"l\" forall (x: a) where identity(b), identity(a) { true }\n").errors > 0,
+  );
+  assert(written_where(b"law \"l\" forall (x: a) where identity(a), { true }\n").errors > 0);
+  assert(written_where(b"law \"l\" forall (x: a) where identity(a) && true { true }\n").errors > 0)
+}
+
 test "an instantiation is never `pub`, and `schema` stays a name" {
   assert(dump(b"pub law \"l\" = s(f)\n").ends_with("#1;!E0001:0:3:1:1;=0:3:1;"));
   assert_eq(
@@ -3948,6 +4120,35 @@ test "`key for T by f` and `show for T by f` are items, and neither word is rese
   )
 }
 
+test "`invariant for T by f` is an item, and `invariant` is not reserved" {
+  let r = parse(b"pub opaque type T = | T(Int)\ninvariant for T by valid\n");
+  assert_eq(r.parser.diags.len(), 0);
+  match r.node.items {
+    [IType(_), IInstance(i)] -> {
+      assert_eq(i.kind, NInvariant);
+      assert_eq(instance_text(i.kind), b"invariant");
+      assert_eq((i.target.name, i.by.name), (b"T", b"valid"))
+    },
+    _ -> panic("a type and an invariant"),
+  };
+  assert_eq(
+    parse(
+      b"fn invariant(invariant: Int) -> { invariant: Int } = { invariant: invariant }\n",
+    ).parser.diags.len(
+    ),
+    0,
+  );
+  assert(parse(b"invariant for T valid\n").parser.diags.len() > 0);
+  assert_eq(parse(b"pub invariant for T by valid\n").parser.diags.map(|d: ParseDiag| d.message), [
+    b"a `key`, a `show` or an `invariant` cannot be `pub`",
+  ]);
+  // Without `for` the word opens nothing, and what would is named.
+  assert(
+    parse(b"pub invariant T\n").parser.diags.any(|d: ParseDiag|
+      d.message.contains(b"`key`, `show`, `invariant`, or `numeric`")),
+  )
+}
+
 test "a header holds the imports a whole parse finds, the hidden ones among them" {
   let same = |src: Bytes|
     match header(src) { None -> false, Some(m) -> m.imports == parse(src).node.imports };
@@ -4015,5 +4216,9 @@ test "an importer reads no test or law, nor a private item or an import only the
   assert_eq(unimported(tested).len(), 2);
   // Whatever a `pub` item or a `derive` spells stays, and so does what that spells in turn.
   let held = b"import std.bin\n\ntype Kept = { a: Int }\n\nderive bin for Kept\n\nfn helper() -> Int = 1\n\npub fn shown() -> Int = helper()\n";
-  assert_eq(unimported(held), [])
+  assert_eq(unimported(held), []);
+  let stated = b"pub opaque type Balance = | Balance(Int)\n\nfn valid(b: Balance) -> Bool = true\n\ntest \"valid\" { assert(valid(Balance(1))) }\n\ninvariant for Balance by valid\n";
+  assert_eq(unimported(stated).map(|s: Span| stated.slice(s.start, s.end)), [
+    b"\n\ntest \"valid\" { assert(valid(Balance(1))) }",
+  ])
 }

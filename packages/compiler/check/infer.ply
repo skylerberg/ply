@@ -5,15 +5,16 @@ import compiler.syntax.parsing (Span, span_between, site_digit, minted, role_wit
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, IExtern, DOrd, DNumeric, deriver_text,
-                              Derived, parse)
+                              Derived, NInvariant, parse)
 import compiler.syntax.exprs (Expr, prelude_module, try_places, detached_at, simulated_at,
                               branch_at, expr_span)
 import compiler.expand.rewrite.shared (picked_in)
 import compiler.check.types (Atom, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord, Field,
                              row_empty, row_open, row_singleton, without_raises, int_type,
-                             bytes_type, list_type, iter_type, fn_type, shallow, written_label,
-                             label_of, atoms_text, scheme_text, type_text, TyNominal, TypeTable,
-                             held_type, table_of, tables_joined, type_table_bin, vars_in, unit_type)
+                             bool_type, bytes_type, list_type, iter_type, fn_type, shallow,
+                             written_label, label_of, atoms_text, scheme_text, type_text, TyNominal,
+                             TypeTable, held_type, table_of, tables_joined, type_table_bin, vars_in,
+                             unit_type)
 import compiler.check.termination (Ends, Stated, Diverges, Site)
 import compiler.check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix,
                                       with_fix, insertion, qualify, error_at, Parameters)
@@ -2447,6 +2448,77 @@ test "an instantiation's binder settles to the `new` record what it is given tak
   );
   // A record of the same fields is not the `new` one.
   assert_eq(check_codes(src.concat(b"law \"l\" = reads_back(shown, plain)")), [b"E0201"])
+}
+
+/// The variables of `ty` in the order they first appear.
+fn variables_of(ty: Type) -> List<Int> =
+  match ty {
+    TyVar(v) -> [v],
+    TyCon(c) ->
+      c.args.fold([], |acc: List<Int>, a: Type|
+        acc.concat(variables_of(a).filter(|v: Int| !acc.contains(v)))),
+    _ -> [],
+  }
+
+test "a law carries the variables its `where identity(a)` names, as its binders' types hold them" {
+  let c = checked_cx(
+    b"law \"l\" forall (xs: List<a>, y: b) where identity(a), xs.len() > 0 { xs == xs }\n",
+  );
+  assert_eq(c.diags, []);
+  let law = c.laws.get(0);
+  assert_eq(law.identities, variables_of(law.binders.get(0).ty));
+  assert(
+    law.identities.len() == 1
+      && !law.identities.contains(variables_of(law.binders.get(1).ty).get(0)),
+  );
+  assert_eq(
+    checked_cx(b"law \"l\" forall (x: a) { x == x }\n").laws.map(|l: LawInfo| l.identities),
+    [[]],
+  )
+}
+
+test "an instantiation settles a type parameter its schema constrains `identity` only at a type whose `==` is" {
+  let over = |law: Bytes|
+    b"law schema twice<a>(f: (a) -> a) forall (x: a) where identity(a) { f(f(x)) == x }\ntype N = | N(Int)\nfn k(n: N) -> Int = 0\nkey for N by k\nfn neg(n: Int) -> Int = 0 - n\nfn swap(p: (Int, String)) -> (Int, String) = p\nfn maybe(o: Option<List<Char>>) -> Option<List<Char>> = o\nfn same<t>(x: t) -> t = x\nfn halve(x: Float) -> Float = x * 2.0\nfn scale(d: Decimal) -> Decimal = d\nfn halves(xs: List<Float>) -> List<Float> = xs\nfn keyed(n: N) -> N = n\n".concat(
+      law,
+    );
+  assert_eq(check_codes(over(b"law \"l\" = twice(neg)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = twice(swap)")), []);
+  assert_eq(check_codes(over(b"law \"l\" = twice(maybe)")), []);
+  assert_eq(refused_at(over(b"law \"l\" = twice(halve)"), b"twice(halve)"), [
+    {
+      code: b"E0479",
+      message: b"the schema `twice` claims `==` is identity at `a`, and `==` at `Float` is not",
+      on_name: true,
+    },
+  ]);
+  assert_eq(check_codes(over(b"law \"l\" = twice(scale)")), [b"E0479"]);
+  assert_eq(check_codes(over(b"law \"l\" = twice(halves)")), [b"E0479"]);
+  assert_eq(check_codes(over(b"law \"l\" = twice(keyed)")), [b"E0479"]);
+  let noted = |law: Bytes, said: Bytes|
+    check_diags(over(law)).any(|d: Diag| d.notes_text.any(|n: Bytes| n.contains(said)));
+  assert(noted(b"law \"l\" = twice(halve)", b"`NaN != NaN`"));
+  assert(noted(b"law \"l\" = twice(halves)", b"`List<Float>` holds `Float`"));
+  assert(noted(b"law \"l\" = twice(keyed)", b"`N` states a `key`"));
+  // What the arguments leave unsettled is the law's own, constrained as the schema's was.
+  let generic = checked_cx(over(b"law \"l\" = twice(same)"));
+  assert_eq(generic.diags, []);
+  let law = generic.laws.get(0);
+  assert_eq(law.identities, variables_of(law.binders.get(0).ty));
+  assert_eq(law.identities.len(), 1);
+  // A type parameter no parameter or binder writes is no type argument, and constrains nothing.
+  let halve = b"fn halve(x: Float) -> Float = x * 2.0\nlaw \"l\" = s(halve)\n";
+  let unwritten = |constrained: Bytes|
+    check_codes(
+      Bytes::concat_all([
+        b"law schema s<t, a>(f: (a) -> a) forall (x: a) where identity(",
+        constrained,
+        b") { f(f(x)) == x }\n",
+        halve,
+      ]),
+    );
+  assert_eq(unwritten(b"a"), [b"E0479"]);
+  assert_eq(unwritten(b"t"), [])
 }
 
 test "a handle must have a clause for every operation its body performs on an atom it handles" {
@@ -5344,6 +5416,75 @@ test "the function a key or a show names takes the value alone and only answers"
   );
   assert_eq(over(b"fn s<a>(b: Box<a>) -> String = \"box\"", b"show for Box by s"), []);
   assert_eq(over(b"fn s<a>(b: Box<a>) -> Int = 0", b"show for Box by s"), [b"E0218"])
+}
+
+test "an invariant is stated once, by the module that alone builds its sum, of a function answering `Bool`" {
+  let balance = b"pub opaque type Balance = | Balance(Int)\npub fn open() -> Balance = Balance(0)\n";
+  let stated = |f: Bytes, more: Bytes|
+    check_codes(Bytes::concat_all([balance, f, b"\ninvariant for Balance by valid\n", more]));
+  let valid = b"fn valid(b: Balance) -> Bool = match b { Balance(n) -> n >= 0 }";
+  assert_eq(stated(valid, b""), []);
+  let c = checked_cx(Bytes::concat_all([balance, valid, b"\ninvariant for Balance by valid\n"]));
+  assert_eq(
+    c.instances.map(|x: InstanceInfo| (x.type_name, x.kind == NInvariant, x.by, x.answers)),
+    [(b"m.Balance", true, b"m.valid", bool_type())],
+  );
+  assert_eq(stated(valid, b"invariant for Balance by valid\n"), [b"E0105"]);
+  assert_eq(stated(valid, b"fn ok(b: Balance) -> Int = 0\nkey for Balance by ok\n"), []);
+  // It is no key: the type is compared as what it holds.
+  assert_eq(c.keyed_names, []);
+  assert_eq(stated(valid, b"fn same(a: Balance, b: Balance) -> Bool = a == b\n"), []);
+  assert_eq(stated(b"fn valid(b: Balance) -> Int = 0", b""), [b"E0218"]);
+  assert_eq(stated(b"fn valid(b: Balance, n: Int) -> Bool = n > 0", b""), [b"E0218"]);
+  assert_eq(stated(b"fn valid(b: Balance) -> Bool / {abort.raise} = panic(\"no\")", b""), [
+    b"E0218",
+  ]);
+  assert_eq(stated(b"fn valid(b: Balance) -> Bool / {diverges} = valid(b)", b""), [b"E0218"]);
+  assert_eq(
+    check_codes(b"fn valid(o: Option<Int>) -> Bool = true\ninvariant for Option by valid\n"),
+    [b"E0208"],
+  );
+  let record = check_diags(
+    b"type P = new { x: Int }\nfn valid(p: P) -> Bool = p.x > 0\ninvariant for P by valid\n",
+  );
+  assert_eq(record.map(|d: Diag| (d.code, d.message)), [
+    (b"E0217", b"`P` is a `new` record, which cannot state an `invariant` yet"),
+  ]);
+  assert(
+    record.any(|d: Diag|
+      d.notes_text.any(|n: Bytes| n.contains(b"where a constructor of the type is applied"))),
+  );
+  // A sum other modules build is refused at the item, whatever its function.
+  let shown = b"pub type Balance = | Balance(Int)\nfn valid(b: Balance) -> Bool = true\ninvariant for Balance by valid\n";
+  assert_eq(refused_at(shown, b"invariant for Balance by valid"), [
+    {
+      code: b"E0480",
+      message: b"an invariant for `Balance`, a type other modules build",
+      on_name: true,
+    },
+  ]);
+  // No other module names a private sum's constructors, so only its own builds one.
+  let unexported = b"type Balance = | Balance(Int)\nfn valid(b: Balance) -> Bool = true\ninvariant for Balance by valid\n";
+  assert_eq(check_codes(unexported), [])
+}
+
+test "a default names no constructor of a type that states an invariant: each call that omits it builds the value" {
+  let defaulted = |param: Bytes|
+    Bytes::concat_all([
+      b"opaque type Balance = | Balance(Int)\nfn valid(b: Balance) -> Bool = true\ninvariant for Balance by valid\nfn pay(",
+      param,
+      b") -> Int = 0\n",
+    ]);
+  assert_eq(refused_at(defaulted(b"b: Balance = Balance(5)"), b"Balance(5)"), [
+    {
+      code: b"E0480",
+      message: b"a parameter default cannot build `Balance`, which states an invariant",
+      on_name: true,
+    },
+  ]);
+  assert_eq(check_codes(defaulted(b"o: Option<Balance> = Some(Balance(1))")), [b"E0480"]);
+  assert_eq(check_codes(defaulted(b"f: (Int) -> Balance = Balance")), [b"E0480"]);
+  assert_eq(check_codes(defaulted(b"bs: List<Balance> = []")), [])
 }
 
 test "a key's function is at the type's own rows, and a type that binds a label states none" {

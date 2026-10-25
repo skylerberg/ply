@@ -1,7 +1,7 @@
 //! `term` — the prover's term language: one hash-consed DAG per obligation.
 
-import domain (Ty, Con, Record)
-import sort (bool_ty, decimal_ty, field_ty, int_ty, is_con, string_ty, unit_ty)
+import domain (Ty, Con, Record, Var)
+import sort (bool_ty, decimal_ty, field_ty, float_ty, int_ty, is_con, string_ty, unit_ty, foreign)
 
 /// The names the prover gives operators it does not interpret. One each for the shifts: `-1 >> 1`
 /// and `-1 >>> 1` differ, and a shared name would equate them.
@@ -22,6 +22,18 @@ pub fn op_lt() -> String = "(<)"
 pub fn op_le() -> String = "(<=)"
 pub fn op_gt() -> String = "(>)"
 pub fn op_ge() -> String = "(>=)"
+
+/// Where a `Float` that is no `NaN` falls in the order `<` reads: an `Int`, with `-0.0` and `0.0`
+/// at one place.
+pub fn op_float_rank() -> String = "Float rank"
+
+pub fn op_float_nan() -> String = "Float NaN"
+
+/// A `Decimal` with no trailing zero after its point: two values are `==` exactly when these are one.
+pub fn op_decimal_normalized() -> String = "Decimal normalized"
+
+/// `Float` arithmetic, uninterpreted but where both sides are literals.
+pub fn op_float(op: String) -> String = "Float " ++ op
 
 pub type CmpOp = | Lt | Le | Gt | Ge
 
@@ -46,8 +58,10 @@ pub type Node =
   | TInt(Int)
   | TBool(Bool)
   | TStr(String)
-  /// Compared by value, so `1.5m` and `1.50m` are one node.
-  | TDecimal(Decimal)
+  /// By how it is written, so `1.5m` and `1.50m` are two values, which print apart.
+  | TDecimal(String)
+  /// A `Float` by its bits, which a program sees one `NaN` of.
+  | TFloat(Int)
   /// Distinct from `TInt`: `5` and `5u32` must not be congruent. The width, then its bits as the
   /// literal carries them; arithmetic over it stays opaque.
   | TFixed(String, Int, Int)
@@ -56,6 +70,9 @@ pub type Node =
   | TSym(Int)
   /// A top-level definition named as a value, or an uninterpreted operator.
   | TOpaque(String)
+  /// A lambda over what it captured: the lowering's closure at this index, applied by reading its
+  /// body.
+  | TClosure(Int)
   | TLin(Poly)
   | TApp({ head: Int, args: List<Int> })
   | TCtor({ name: String, args: List<Int> })
@@ -69,7 +86,11 @@ pub type Node =
   | TOr(Int, Int)
   /// Over `Int` only.
   | TCmp({ op: CmpOp, lhs: Int, rhs: Int })
+  /// Identity: the two are one value, which is what congruence reasons with.
   | TEq({ lhs: Int, rhs: Int })
+  /// The program's `==` at a sort where it is not identity and the shapes are not in view: only
+  /// symmetric, and true of a value and itself where `reflexive`.
+  | TEqualAt({ lhs: Int, rhs: Int, reflexive: Bool })
   | TIf({ cond: Int, then_branch: Int, else_branch: Int })
   | TMatch({ scrutinee: Int, arms: List<Arm> })
 
@@ -122,7 +143,8 @@ pub fn is_int(terms: Terms, t: Int) -> Bool = match terms.ints.at(t) { Some(b) -
 pub fn force_int(terms: Terms, t: Int) -> Terms / {abort.raise} =
   { ..terms, ints: terms.ints.set(t, true) }
 
-pub fn mk(terms: Terms, n: Node, sort: Option<Ty>) -> Made / {abort.raise} =
+pub fn mk(terms: Terms, n: Node, given: Option<Ty>) -> Made / {abort.raise} = {
+  let sort = if one_at_every_type(n, given) { unknown_arguments(given) } else { given };
   match terms.index.get(n) {
     Some(existing) -> {
       let ts2 = match sort_of(terms, existing) {
@@ -154,6 +176,28 @@ pub fn mk(terms: Terms, n: Node, sort: Option<Ty>) -> Made / {abort.raise} =
       }
     },
   }
+}
+
+/// Whether `n` is one term at every type a use of it has, so the sort one use gives it is no sort of
+/// the term: `[]`, and a constructor or call of no arguments at a type with parameters.
+fn one_at_every_type(n: Node, sort: Option<Ty>) -> Bool =
+  match n {
+    TNil -> true,
+    TCtor(c) -> c.args.len() == 0 && has_parameters(sort),
+    TApp(a) -> a.args.len() == 0 && has_parameters(sort),
+    _ -> false,
+  }
+
+fn has_parameters(sort: Option<Ty>) -> Bool =
+  match sort { Some(Con(_, args)) -> args.len() > 0, Some(_) -> true, None -> false }
+
+/// The type a sort-free node is of, whatever use it is put to: its constructor, its arguments none
+/// the claim knows.
+fn unknown_arguments(sort: Option<Ty>) -> Option<Ty> =
+  match sort {
+    Some(Con(name, args)) -> Some(Con(name, range(0, args.len()).map(|i: Int| foreign(Var(i))))),
+    _ -> None,
+  }
 
 pub fn int_lit(terms: Terms, k: Int) -> Made / {abort.raise} = mk(terms, TInt(k), Some(int_ty()))
 
@@ -163,7 +207,67 @@ pub fn string(terms: Terms, s: String) -> Made / {abort.raise} =
   mk(terms, TStr(s), Some(string_ty()))
 
 pub fn decimal(terms: Terms, d: Decimal) -> Made / {abort.raise} =
-  mk(terms, TDecimal(d), Some(decimal_ty()))
+  mk(terms, TDecimal(d.to_string()), Some(decimal_ty()))
+
+pub fn float_lit(terms: Terms, bits: Int) -> Made / {abort.raise} =
+  mk(terms, TFloat(bits), Some(float_ty()))
+
+pub fn is_nan_bits(bits: Int) -> Bool = bits & 0x7FFF_FFFF_FFFF_FFFF > 0x7FF0_0000_0000_0000
+
+/// Ascending as the values are, for every `Float` but `NaN`.
+pub fn rank_of_bits(bits: Int) -> Int =
+  if bits >= 0 { bits } else { 0 - (bits & 0x7FFF_FFFF_FFFF_FFFF) }
+
+/// Whether `x` is `NaN`, a literal's answered.
+pub fn float_nan(terms: Terms, x: Int) -> Made / {abort.raise} =
+  match node(terms, x) {
+    TFloat(bits) -> boolean(terms, is_nan_bits(bits)),
+    _ -> {
+      let head = opaque(terms, op_float_nan(), None);
+      app(head.terms, head.id, [x], Some(bool_ty()))
+    },
+  }
+
+/// Where `x` falls in the order, a literal's answered.
+pub fn float_rank(terms: Terms, x: Int) -> Made / {abort.raise} =
+  match node(terms, x) {
+    TFloat(bits) -> int_lit(terms, rank_of_bits(bits)),
+    _ -> {
+      let head = opaque(terms, op_float_rank(), None);
+      let made = app(head.terms, head.id, [x], Some(int_ty()));
+      { terms: force_int(made.terms, made.id), id: made.id }
+    },
+  }
+
+/// `x` with no trailing zero after its point, a literal's answered.
+pub fn decimal_normalized(terms: Terms, x: Int) -> Made / {abort.raise} =
+  match node(terms, x) {
+    TDecimal(written) -> mk(terms, TDecimal(normalized_text(written)), Some(decimal_ty())),
+    TApp(a) -> match node(terms, a.head) {
+      TOpaque(name) -> if name == op_decimal_normalized() { { terms: terms, id: x } }
+      else { normalizing(terms, x) },
+      _ -> normalizing(terms, x),
+    },
+    _ -> normalizing(terms, x),
+  }
+
+fn normalizing(terms: Terms, x: Int) -> Made / {abort.raise} = {
+  let head = opaque(terms, op_decimal_normalized(), None);
+  app(head.terms, head.id, [x], Some(decimal_ty()))
+}
+
+/// A decimal's text without the zeros its scale keeps past its value, and zero unsigned.
+pub fn normalized_text(written: String) -> String / {abort.raise} = {
+  let b = Bytes::of_string(written);
+  let trimmed = if b.index_of(b".") == None { b } else {
+    let kept = iterate(b.len(), b.len() + 1, |n: Int|
+      if n > 0 && b.at(n - 1) == 48 { Continue(n - 1) } else { Stop(n) });
+    let cut = b.slice(0, kept);
+    if cut.ends_with(b".") { cut.slice(0, cut.len() - 1) } else { cut }
+  };
+  let text = String::of_bytes_lossy(trimmed);
+  if text == "-0" { "0" } else { text }
+}
 
 pub fn fixed(terms: Terms, width: String, high: Int, low: Int) -> Made / {abort.raise} =
   mk(terms, TFixed(width, high, low), Some(Con(width, [])))
@@ -335,6 +439,14 @@ pub fn eq(terms: Terms, lhs: Int, rhs: Int) -> Made / {abort.raise} = {
   let high = if lhs <= rhs { rhs } else { lhs };
   mk(project_fields(terms, low, high), TEq({ lhs: low, rhs: high }), Some(bool_ty()))
 }
+
+/// The program's `==` where it is not identity: one term whichever side is written first.
+pub fn equal_at(terms: Terms, lhs: Int, rhs: Int, reflexive: Bool) -> Made / {abort.raise} =
+  if lhs == rhs && reflexive { boolean(terms, true) } else {
+    let low = if lhs <= rhs { lhs } else { rhs };
+    let high = if lhs <= rhs { rhs } else { lhs };
+    mk(terms, TEqualAt({ lhs: low, rhs: high, reflexive: reflexive }), Some(bool_ty()))
+  }
 
 /// Both sides' fields, interned, so the solver's extensionality rule has projections to compare.
 fn project_fields(terms: Terms, a: Int, b: Int) -> Terms / {abort.raise} =

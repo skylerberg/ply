@@ -3,15 +3,18 @@
 import compiler.syntax.parsing (Span, Ident)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Item, IDerive, Deriver, DEq, DOrd, DHash, deriver_text, Derived,
-                              DeriveDef, IInstance, InstanceDef, NKey, NShow, instance_text,
-                              INumeric, NumericDef, NumericOp, numeric_ops, numeric_by)
+                              DeriveDef, IInstance, InstanceDef, NKey, NShow, NInvariant,
+                              instance_text, INumeric, NumericDef, NumericOp, numeric_ops,
+                              numeric_by, IType, IFn, is_pub, InstanceKind)
+import compiler.syntax.exprs (Expr, Param, expr_span)
 import compiler.check.types (Resource, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
                              Field, Free, atoms_covered, row_empty, row_is_pure, atom_conflicts,
-                             named_type, int_type, string_type, fresh_new, subst_new, occurs_ty,
-                             free_vars, env_new, label_of, atom_text, type_text, row_text,
-                             at_arguments, over_arg, TyNominal)
+                             named_type, int_type, string_type, bool_type, fresh_new, subst_new,
+                             occurs_ty, free_vars, env_new, label_of, atom_text, type_text,
+                             row_text, at_arguments, over_arg, TyNominal)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Diag, Label, qualify,
                                       error_with_labels, error_at, label_at)
+import compiler.check.resolve.sets (mentions)
 import compiler.expand.derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
                                NullInsideOption, HoldsSecret, HoldsNative, float_reason,
                                null_in_option_note, same_deriver)
@@ -216,14 +219,22 @@ fn unfit(checker: Checker, def: InstanceDef, f: DefInfo, why: Bytes, note: Bytes
             def.target.name,
             b"` and answers the `String` that `show` and an interpolated string write",
           ]),
+        NInvariant ->
+          Bytes::concat_all([
+            b"an `invariant` takes one `",
+            def.target.name,
+            b"` and answers the `Bool` every value of it satisfies",
+          ]),
       },
     ],
   )
 
-/// One `key for T by f` or `show for T by f`: the type is a sum of this module's own, it states
-/// each once, and `f` is a function of this module that takes the value alone and only answers.
+/// One `key for T by f`, `show for T by f` or `invariant for T by f`: the type is a sum of this
+/// module's own, for an invariant one no other module builds, it states each once, and `f` is a
+/// function of this module that takes the value alone and only answers.
 fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
   let what = instance_text(def.kind);
+  let one = one_of(def.kind);
   let type_name = qualify(m.name, def.target.name);
   match checker.types.get(type_name) {
     None ->
@@ -235,9 +246,13 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
         b"declared in another module, or not at all",
         [
           Bytes::concat_all([
-            b"a `",
-            what,
-            b"` may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown",
+            one,
+            match def.kind {
+              NInvariant ->
+                b" may only name a type its own module declares, the module that builds every value of it",
+              _ ->
+                b" may only name a type its own module declares, so that a type means one thing wherever its values are compared or shown",
+            },
           ]),
         ],
       ),
@@ -251,11 +266,15 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
             Bytes::concat_all([
               b"`",
               def.target.name,
-              b"` is not a sum, and a `",
-              what,
-              b"` is for one",
+              b"` is not a sum, and ",
+              one,
+              b" is for one",
             ]),
-            b"an alias is the type it names, so a `key` or a `show` for one would be for every value of that type",
+            Bytes::concat_all([
+              b"an alias is the type it names, so ",
+              one,
+              b" for one would be for every value of that type",
+            ]),
           ),
         DeclaredRecord(_) ->
           not_a_sum(
@@ -265,11 +284,16 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
             Bytes::concat_all([
               b"`",
               def.target.name,
-              b"` is a `new` record, which cannot state a `",
-              what,
-              b"` yet",
+              b"` is a `new` record, which cannot state ",
+              one,
+              b" yet",
             ]),
-            b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+            match def.kind {
+              NInvariant ->
+                b"the prover reads an invariant where a constructor of the type is applied, and a `new` record has none: a record literal builds it",
+              _ ->
+                b"a `new` record runs as the record it is written as, so nothing in a value says which type it is of where it is compared or shown",
+            },
           ),
         DeclaredExtern ->
           not_a_sum(
@@ -283,9 +307,13 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
               what,
               b"`",
             ]),
-            b"the toolchain lays out its values, and nothing compares or shows one",
+            match def.kind {
+              NInvariant ->
+                b"the toolchain makes its values, and no constructor of the program builds one",
+              _ -> b"the toolchain lays out its values, and nothing compares or shows one",
+            },
           ),
-        DeclaredSum -> match instance_of(checker.instances, type_name, is_key(def.kind)) {
+        DeclaredSum -> match instance_of(checker.instances, type_name, def.kind) {
           Some(first) ->
             report_error_at_and(
               checker,
@@ -297,22 +325,121 @@ fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checke
               b"first stated here",
               [b"a type has one, so that nothing has to choose between two; remove one"],
             ),
-          None -> match def_of(checker, qualify(m.name, def.by.name)) {
-            None ->
-              report_error_at(
-                checker,
-                b"E0101",
-                def.by.span,
-                Bytes::concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
-                Bytes::concat_all([b"a `", what, b"` names a function of its type's own module"]),
-                [],
-              ),
-            Some(f) -> fitted(checker, def, type_name, f),
+          None -> if def.kind == NInvariant && decl.opaque == None
+              && declared_pub(m, def.target.name) { built_elsewhere(checker, def, decl) } else {
+            match def_of(checker, qualify(m.name, def.by.name)) {
+              None ->
+                report_error_at(
+                  checker,
+                  b"E0101",
+                  def.by.span,
+                  Bytes::concat_all([
+                    b"`",
+                    def.by.name,
+                    b"` is not a function this module declares",
+                  ]),
+                  Bytes::concat_all([one, b" names a function of its type's own module"]),
+                  [],
+                ),
+              Some(f) -> fitted(checker, def, type_name, f),
+            }
           },
         },
       }
     },
   }
+}
+
+/// `kind` as a sentence names one item of it: "a `key`", "an `invariant`".
+fn one_of(kind: InstanceKind) -> Bytes =
+  match kind {
+    NInvariant -> b"an `invariant`",
+    _ -> Bytes::concat_all([b"a `", instance_text(kind), b"`"]),
+  }
+
+/// Whether `m` declares the type `name` `pub`.
+fn declared_pub(m: ParsedModule, name: Bytes) -> Bool =
+  m.module.items.any(|item: Item|
+    match item { IType(t) -> t.name.name == name && is_pub(t.vis), _ -> false })
+
+/// An invariant of a sum other modules build: each value the type's own module makes is an
+/// obligation, and a value another module made would be assumed to hold it unshown.
+fn built_elsewhere(checker: Checker, def: InstanceDef, decl: TypeDecl) -> Checker =
+  report_error_at_and(
+    checker,
+    b"E0480",
+    def.span,
+    Bytes::concat_all([b"an invariant for `", def.target.name, b"`, a type other modules build"]),
+    Bytes::concat_all([b"`", def.target.name, b"` is `pub` and not `opaque`"]),
+    { module: decl.owner, span: decl.span },
+    b"declared here",
+    [
+      b"a value another module makes would not be held to it: only a constructor applied in the type's own module is an obligation, and every value of the type assumes the invariant",
+      Bytes::concat_all([
+        b"declare it `opaque`, as `pub opaque type ",
+        def.target.name,
+        b" = | ..`, or drop its `pub`, so that its own module builds every value of it",
+      ]),
+    ],
+  )
+
+/// Each parameter default of the invariant `x`'s module that names a constructor of its type. Only
+/// that module names one: the type is `opaque` or not `pub`.
+fn invariant_defaults(checker: Checker, x: InstanceInfo) -> Checker / {abort.raise} = {
+  let ctors = checker.ctors.filter(|k: CtorInfo| k.type_name == x.type_name).map(|k: CtorInfo|
+    k.simple_name);
+  checker.modules.get(x.at.module).module.items.fold(
+    { ..checker, module: x.at.module },
+    |c: Checker, item: Item|
+      match item {
+        IFn(def) ->
+          def.params.fold(c, |cc: Checker, p: Param|
+            match p.default {
+              None -> cc,
+              Some(d) -> match mentions(d, ctors, [], []).at(0) {
+                None -> cc,
+                Some(ctor) -> built_by_default(cc, x, ctor, d),
+              },
+            }),
+        _ -> c,
+      },
+  )
+}
+
+/// A default is filled into each call that omits its argument, so the value it builds is built
+/// there, in a definition no obligation holds to the invariant.
+fn built_by_default(
+  checker: Checker,
+  x: InstanceInfo,
+  ctor: Bytes,
+  default: Expr,
+) -> Checker / {abort.raise} = {
+  let simple = simple_name_of(x.type_name);
+  report_error_at_and(
+    checker,
+    b"E0480",
+    expr_span(default),
+    Bytes::concat_all([
+      b"a parameter default cannot build `",
+      simple,
+      b"`, which states an invariant",
+    ]),
+    Bytes::concat_all([b"this names `", ctor, b"`"]),
+    x.at,
+    b"the invariant is stated here",
+    [
+      Bytes::concat_all([
+        b"every call that omits the argument fills the default in, so the caller would build a `",
+        simple,
+        b"` outside the definitions held to its invariant",
+      ]),
+      Bytes::concat_all([
+        b"drop the default, and pass each call a `",
+        simple,
+        b"` that a function of its module answers",
+      ]),
+    ],
+  )
 }
 
 fn not_a_sum(
@@ -367,7 +494,7 @@ fn fitted(
         def,
         f,
         b"this function binds a resource label",
-        b"it is called with the value alone, and a value does not carry the label its type was given, so a type that binds a label states no `key` and no `show`",
+        b"it is called with the value alone, and a value does not carry the label its type was given, so a type that binds a label states no `key`, `show` or `invariant`",
       )
     } else {
       match own_params(sig.params.get(0), type_name) {
@@ -395,7 +522,12 @@ fn fitted(
               def.target.name,
               b"` carries",
             ]),
-            b"it is called with the value alone, wherever two are compared or one is shown, so no call meets a constraint: its signature may need only what the type itself carries, the order a `Map` key asks of what it holds or a constraint the type's `where` states",
+            match def.kind {
+              NInvariant ->
+                b"it is read of each value alone, so no call meets a constraint: its signature may need only what the type itself carries, the order a `Map` key asks of what it holds or a constraint the type's `where` states",
+              _ ->
+                b"it is called with the value alone, wherever two are compared or one is shown, so no call meets a constraint: its signature may need only what the type itself carries, the order a `Map` key asks of what it holds or a constraint the type's `where` states",
+            },
           )
         } else if !row_is_pure(sig.effects) {
           unfit(
@@ -403,7 +535,12 @@ fn fitted(
             def,
             f,
             Bytes::concat_all([b"this function's row is `", row_text(sig.effects), b"`"]),
-            b"`==`, `compare` and `show` perform nothing, cannot raise and always return, so the function they read through does the same",
+            match def.kind {
+              NInvariant ->
+                b"an invariant is a fact of every value, so it performs nothing, cannot raise and always returns",
+              _ ->
+                b"`==`, `compare` and `show` perform nothing, cannot raise and always return, so the function they read through does the same",
+            },
           )
         } else if !answers_over(free_vars(checker.subst, sig.ret, { tys: [], rows: [] }), own) {
           unfit(
@@ -413,13 +550,21 @@ fn fitted(
             Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
             b"what it answers is over the type's own parameters and no others",
           )
-        } else if !is_key(def.kind) && sig.ret != string_type() {
+        } else if def.kind == NShow && sig.ret != string_type() {
           unfit(
             checker,
             def,
             f,
             Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
             b"what is shown is text",
+          )
+        } else if def.kind == NInvariant && sig.ret != bool_type() {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"an invariant answers `Bool`: whether a value is one the type may hold",
           )
         } else {
           {
@@ -473,6 +618,7 @@ pub fn collect_stated(checker: Checker, parsed: ParsedModule) -> Checker =
       IInstance(def) -> match def.kind {
         NKey -> { ..c, keyed_names: c.keyed_names.push(qualify(parsed.name, def.target.name)) },
         NShow -> c,
+        NInvariant -> c,
       },
       INumeric(def) -> {
         let type_name = qualify(parsed.name, def.target.name);
@@ -728,7 +874,7 @@ fn key_loop(
     TyFn(_) -> None,
     TyRecord(fs) -> first_key_loop(fs.map(|f: Field| f.ty), instances, adts, path, room),
     TyNominal(n) -> first_key_loop(n.fields.map(|f: Field| f.ty), instances, adts, path, room),
-    TyCon(c) -> match instance_of(instances, c.name, true) {
+    TyCon(c) -> match instance_of(instances, c.name, NKey) {
       Some(x) -> if path.contains(c.name) { Some(path.push(c.name)) } else {
         if room <= 0 { None } else {
           key_loop(
@@ -757,10 +903,11 @@ fn key_loop(
     },
   }
 
-/// Every `key` and `show` the program states. A key's type is ordered and hashed, so one function
-/// decides `==`, `compare` and `digest` alike, and is not read through its own type again.
+/// Every `key`, `show`, `invariant` and `numeric` the program states. A key's type is ordered and
+/// hashed, so one function decides `==`, `compare` and `digest` alike, and is not read through its
+/// own type again.
 pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
-  let stated: Checker = range(0, checker.modules.len()).fold(checker, |c: Checker, i: Int| {
+  let collected: Checker = range(0, checker.modules.len()).fold(checker, |c: Checker, i: Int| {
     let m = c.modules.get(i);
     m.module.items.fold(c, |cc: Checker, item: Item|
       match item {
@@ -769,6 +916,8 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
         _ -> cc,
       })
   });
+  let stated: Checker = collected.instances.fold(collected, |c: Checker, x: InstanceInfo|
+    if x.kind == NInvariant { invariant_defaults(c, x) } else { c });
   if stated.instances.len() == 0 { { ..stated, module: checker.module } } else {
     let adts = algebraic_shapes(stated);
     let shapes = deriver_shapes(stated.instances, adts);

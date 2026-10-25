@@ -188,7 +188,7 @@ its examples, and `ply callers` lists them, as `ply doc` lists the laws (§16). 
 blank line between a doc and its
 declaration does not part them, and `ply fmt` removes it. A doc comment that
 documents nothing — one inside a body, above an import, a `test`, a `law`, a
-`derive`, a `key`, a `show`, a `gen` or a `numeric`, or at the end of a file, or a `//!` line below
+`derive`, a `key`, a `show`, an `invariant` or a `numeric`, or at the end of a file, or a `//!` line below
 the head of its file — is `E0003`. A doc is trivia like any comment: it moves no hash, key or cached
 answer.
 
@@ -220,8 +220,8 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `bounded` | after an atom or the row variable of a definition's row (§6.2) |
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
-| `key`, `show`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
-| `where`, `derivable` | after a signature's row, after a type's generic list, or after a law's binders |
+| `key`, `show`, `invariant`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `invariant for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `where`, `derivable`, `identity` | after a signature's row, after a type's generic list, or after a law's binders; `identity(a)` opens a law's or schema's `where` |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
 | `resume`, `return` | in a handler clause (§6.5, §6.6) |
@@ -417,7 +417,7 @@ Loosest to tightest; all binary operators are left-associative:
 
 A file is its imports followed by its items: `fn`, `type`, `effect`,
 `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`,
-`show`, `gen` and `numeric`, in any order.
+`show`, `invariant` and `numeric`, in any order.
 Definitions may refer to each other and recurse across the whole program.
 
 ### 3.1 Functions
@@ -441,8 +441,9 @@ pattern; it binds nothing and may repeat.
 
 A parameter default lets a call omit the argument. It must be a value — a
 literal, a constructor over literals, a record or a list — and may not name
-another parameter (`E0121`) or, on a `pub fn`, anything its module does not
-export (`E0122`). Only a `fn` takes defaults (`E0120` elsewhere).
+another parameter (`E0121`), on a `pub fn`, anything its module does not
+export (`E0122`), or a constructor of a type that states an `invariant` (`E0480`,
+§4.4). Only a `fn` takes defaults (`E0120` elsewhere).
 
 A function may be declared in a type's namespace: `fn Stack::size(s: Stack) -> Int = ..`
 is the function `size` of `Stack`. It is named `Stack::size` wherever `Stack` is
@@ -986,7 +987,25 @@ write what `g` answers wherever a `T` is shown, and `derivable(show, T)` holds
 whatever `T` holds. It decides nothing about comparison, `std.value.reflect` still
 answers the value as it was built, and a diagnostic prints that.
 
-Both are found by the type alone, with no search, so only the module declaring
+`invariant for T by v` names `v: (T<a, ..>) -> Bool` for a sum that is `opaque` or
+not `pub` (`E0480` otherwise): every value of `T` satisfies it. Only `T`'s module builds one, so each
+place it applies one of `T`'s constructors is a claim `ply prove` must prove (§10),
+and a value of `T` from anywhere else is taken to satisfy `v`:
+
+```ply
+pub opaque type Balance = | Balance(Int)
+invariant for Balance by solvent
+fn solvent(b: Balance) -> Bool = match b { Balance(n) -> n >= 0 }
+
+pub fn amount(b: Balance) -> Int = match b { Balance(n) -> n }
+law "a balance is never negative" forall (b: Balance) { amount(b) >= 0 }
+```
+
+It changes nothing a run does: `v` is never called by the program. A parameter
+default that names one of `T`'s constructors is `E0480` too: each call that omits
+the argument would build that value itself.
+
+All three are found by the type alone, with no search, so only the module declaring
 `T` may write them (`E0208`), and it states each at most once (`E0105`). `T` is
 a sum: an alias is the type it names, and a `new` record (§4.2) runs as its
 plain record, with no constructor in a value to find them by, so it cannot
@@ -2700,10 +2719,23 @@ law "a credit and a matching debit leave an account exactly as it was"
 
 * `requires`/`ensures` go between the signature and body, in any number, as
   do `cost` and `space` (below); `result` is bound in `ensures`. `requires` restricts the domain of its
-  `ensures`; it is not checked at call sites and laws do not inherit it.
+  `ensures`; it is not checked at call sites and laws do not inherit it. A call
+  that stands on a contract (below) owes it.
 * A law has a label, optional `forall` binders (typed; `E0418` if a type cannot
   be quantified, as a sum whose function performs the type's row parameter
   cannot, whatever row it is given), an optional `where` guard and a block body.
+* A law's or a schema's `where` may open with `identity(a)` constraints on its
+  type variables, then a comma and the guard: `forall (xs: List<a>, n: Int)
+  where identity(a), n > 0`. A leading `identity(x)` is a constraint where `x`
+  is a type variable the binders write, or a schema's type parameter, and the
+  guard otherwise; on a schema parameter no parameter or binder type writes, it
+  constrains nothing. Under one, `==` at `a` is identity, so the law claims only
+  the types whose `==` is: not `Float`, `Decimal`, a type that states a `key`, an
+  `extern type`, `Hold`, `Task`, `Chan`, `Secret`, a function, or one holding
+  them. Without one, `==` at a type variable is only
+  what holds at every type (below). An instantiation that settles a constrained
+  schema variable at another type is `E0479`, and a law over one is no lemma at
+  another type.
 * Specs, guards and law bodies must be pure (`E0417`), except that they may
   raise (§6.8) or may not return (§5.10), and a law body may be a `simulate`
   region.
@@ -2729,7 +2761,11 @@ says what a test says: that it held where it was run.
 `proved` covers ground evaluation, enumeration of finite domains up to 4096
 points, linear `Int` arithmetic, case splits, congruence, constructor
 injectivity, unfolding non-recursive definitions, a `match` taking its arm over
-a value whose shape is in view, exhaustive interleaving, and induction: a
+a value whose shape is in view, a lambda applied, `List::map`, `List::filter`
+and `List::fold` read over the part of a list in view, a recursive definition
+the checker reads as ending (§5.10) run over arguments in view (each one in view,
+a function, or a value of a builtin type), the contracts of
+the definitions a claim calls (below), exhaustive interleaving, and induction: a
 definition that calls only itself, and that the checker reads as ending
 (§5.10), is unrolled, and over values in view as deep as the unfolding goes. On
 an `Int` binder the claim is proved at `n <= 0` and then at `n > 0` from itself
@@ -2740,15 +2776,65 @@ A kernel checks each induction from the claim alone before refuting its cases,
 whatever proposed it: the binder it names, a hypothesis strictly below the case
 it proves, and only definitions the checker reads as ending unrolled.
 
-Congruence and injectivity read `==` as what a value's constructors and fields
-say, which a `Float` (`NaN != NaN`) and a type that states a `key` (§4.4) are
-not, and arithmetic as the integers', which an operator at a type that states
-`numeric` is not. A claim that holds a value of any of them, at any depth, is
-proved only by a walk of every point of a finite domain. An `unproved` claim
-names each place the prover stopped, such as `float term` or `keyed term`.
+Congruence and injectivity reason with identity: two terms are one value. The
+program's `==` is read by its operands' type. Where two values are `==` exactly
+when they are one value it is identity: at `Int`, `Bool`, `Char`, `String`,
+`Bytes`, `Unit`, the fixed widths, and the lists, maps, records and sums of
+them that state no `key`. At `Float` it is IEEE's: neither is `NaN`, and they
+fall at one place in the order, `-0.0` with `0.0`. At `Decimal` it is of the
+values, so `1.5m == 1.50m`, though they print apart. At a type that states a
+`key` (§4.4) it is `==` of the keys. At a value holding any of these it is read
+part by part where the shapes are in view, and otherwise as a relation that is
+symmetric, and true of a value and itself only where no `Float`, keyed value or
+type variable can be held; where a keyed value can, or a value of a type the
+prover does not know, that comparison calls a key the prover does not read, as
+`min`, `max` and a `Map`'s operations over one do, and is owed as a call that may
+end the run. At a type variable it is identity only under an
+`identity` constraint (below). `<`, `<=`, `>` and `>=` at `Float` are the order,
+false where either side is `NaN`; `Float` arithmetic is read only where both
+operands are literals, as the bits a run answers. An operator at a type that
+states `numeric` is the function it names, and one over operands of no type the
+prover knows, a type variable's or a lambda's answer, is a function of them that
+may raise. A `perform`, `handle` or `simulate` is a value the prover does not
+read, and a refutable `let` raises where it does not match; each is owed
+unreached in a law and in any claim's own clause and guards, while an `ensures`
+holds of what its definition answers: a raise in its body, or a call there the
+prover cannot show answers, is a run that answers nothing it speaks of. A call of a function value answers where the prover reads its
+body, or in a law where a binder's type performs nothing: the law speaks of such
+functions. An `ensures` is handed functions by callers it cannot see, so a call
+of a parameter there answers nothing it can stand on. An `unproved` claim names each place
+the prover stopped, and `unclosed` where it read the whole claim and found a
+case it could not close: the claim may be false there, or need a lemma or a
+guard.
+
+A definition in the module of a type that states an `invariant` (§4.4) owes a
+claim for each value of the type its body builds, `<owner> builds <type>`: that
+the invariant holds of it, under the conditions on the way to it. Its `requires`
+are not assumed, since no call is held to them, and a body that raises or never
+answers builds nothing. What a lambda builds is owed at every argument; a
+constructor handed on as a function, or applied where the prover does not read,
+leaves the claim unproved as `unseen_build`. A value of the type a claim is
+handed, a binder of a law or what a call answers, is taken to satisfy the
+invariant; a claim that builds one stands on the invariant only at its binders,
+since a value it makes need not. A run makes no value of the type to try a claim
+at. These claims are the prover's alone.
+
+A call the prover does not unfold, a recursive definition's or another
+package's, of a definition whose row names no raise and that the checker reads
+as ending, is read by its contract: each `ensures`, at the call's arguments and
+answer, holds wherever its `requires` do. Another package's contract is that
+package's run to prove, and the call still owes that it answers. One of this
+package's is read once a proof showed every `ensures` of its definition taking no
+call in its body to answer, and then the call answers wherever the `requires`
+hold; the clause being proved holds at each call its own definition's body makes
+back into it, on the way to that call. So `fn
+quadrupled(n: Int) -> Int ensures result == n * 4 = doubled(doubled(n))`
+stands on `doubled`'s `ensures result == n * 2` without its body. A contract,
+or a law, proved over a type variable shows no call answers that settles the
+variable at a type whose `==` may call a key.
 
 A run proves a claim only where it covers all of it. A domain of at most 4096
-points is walked whole, and a law over a `simulate` region is searched at every
+points is walked whole, a law's after a short static search, and a law over a `simulate` region is searched at every
 interleaving of each point its guard admits (§9); a search that stops short of
 all of them, or binders whose domain is not finite, leave such a law
 `unproved`. An `Int` binder is finite where the claim's guards hold it between
@@ -2768,9 +2854,13 @@ run makes a function, so a claim over either is proved by the prover or not at
 all.
 
 A law with no guard, once proved, is a lemma for every claim written below it
-in its module. Its trigger is the first call its body always makes whose
-arguments name every binder; where a claim makes a call that fits it, the law
-at that call is a fact, and a trigger that takes an argument apart, as
+in its module and every claim of a module that imports its module, at any
+remove; a law with no guard of another package, which that package's run
+proves, is one for the claims of the modules that import its module. Its
+trigger is the first call its body always makes whose
+arguments name every binder; where a claim makes a call that fits it, with each
+argument of its binder's type, the law at that call is a fact, and a trigger
+that takes an argument apart, as
 `reverse(ys.push(x))` does, stands for the call in place of its body:
 
 ```ply
@@ -3226,7 +3316,7 @@ a change to any other leaves it alone.
 Of those it checks,
 counts and hashes only the functions the program reaches and the names its
 modules import, beside every type and effect and the functions a type's `key`,
-`show`, `numeric` or `gen` names (§4.4), and none of their tests or laws; a
+`show`, `invariant` or `numeric` names (§4.4), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
 dependent's proof is owed; a load of the library's own directory reads every
 module of it, each one whole.
@@ -3878,7 +3968,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0205` | non-exhaustive match |
 | `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver: no built-in one, and no module bound by the name |
-| `E0208` | orphan `derive`, `key` or `show`, or a function of a type another module declares |
+| `E0208` | orphan `derive`, `key`, `show` or `invariant`, or a function of a type another module declares |
 | `E0209` | `/` or `%` where no number has it: `/` on `Decimal`, either on a `numeric` type parameter |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
@@ -3887,8 +3977,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0214` | a `new` record whose fields reach the record itself |
 | `E0215` | a `numeric` that does not name each of `add`, `sub`, `mul`, `neg` and `of_int` once |
 | `E0216` | a `numeric` for a type that takes parameters |
-| `E0217` | a `key`, a `show` or a `numeric` for a type that is not a sum, or a function of an alias |
-| `E0218` | a `key`, a `show` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, needs a constraint the type does not carry, binds a resource label, or does not only answer; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
+| `E0217` | a `key`, a `show`, an `invariant` or a `numeric` for a type that is not a sum, or a function of an alias |
+| `E0218` | a `key`, a `show`, an `invariant` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, needs a constraint the type does not carry, binds a resource label, or does not only answer; a `show`'s does not answer `String`, an `invariant`'s `Bool`; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0220` | a record literal or an update that would build an `opaque` record outside its module |
 | `E0221` | `opaque` on an alias, which has no values of its own |
@@ -3974,6 +4064,8 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0476` | a native a unit calls that the runtime it is compiled against implements by none, by two, or otherwise than the compiler declares it |
 | `E0477` | a sum that holds itself, through a chain of sums, at a type grown from its own parameters |
 | `E0478` | a unit whose code calls a definition lending or giving otherwise than the definition takes it |
+| `E0479` | a law schema's `identity` constraint settled at a type whose `==` is not identity |
+| `E0480` | an `invariant` for a `pub` type that is not `opaque`, which other modules could build; a parameter default naming a constructor of a type that states an `invariant`, which each call omitting the argument would build |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

@@ -11,9 +11,10 @@
 import compiler.emit.code (Code)
 import context (Context, self_recursive, ends)
 import goal (Goal, Binder, Limits, Proof, Assertion, Ran, run, conjunction, domain_inhabited,
-             uninterpreted_sorts, int_ranges, ranges_of, set_of, with_true)
+             uninterpreted_sorts, int_ranges, ranges_of, set_of, with_true, names_set)
 import lower (Lowering, L, Blocker, Induction, lowering, bind_symbolic, lower_root, assume,
-              drop_assumptions, smaller_than, requirements_since, requirements_between)
+              invariants_held, unroll_budget, drop_assumptions, smaller_than, requirements_since,
+              requirements_between)
 import rules (RuleLog, Rule, Scheme, Descent, Spine, no_rules, rules_of, induction_rule)
 import solve (Closed)
 import sort (bool_ty, is_con, list_elem)
@@ -120,18 +121,36 @@ fn settle(
 
 fn ran_out(budget: Int) -> String = if budget == 0 { ", the budget spent" } else { "" }
 
+/// The goal's binders as symbols, each that is no `result` holding its type's invariant: what a
+/// definition answers holds it only once its own `builds` claims are shown.
 fn bound_all(
   lowering: Lowering,
   context: Context,
-  binders: List<Binder>,
-) -> { lowering: Lowering, ids: List<Int> } / {abort.raise} =
-  binders.fold(
+  g: Goal,
+) -> { lowering: Lowering, ids: List<Int> } / {abort.raise} = {
+  let bound = g.binders.fold(
     { lowering: lowering, ids: [] },
     |acc: { lowering: Lowering, ids: List<Int> }, binder: Binder| {
-      let r = bind_symbolic(acc.lowering, binder.ty, context);
+      let r = bind_symbolic(acc.lowering, binder.ty);
       { lowering: r.lowering, ids: acc.ids.push(r.id) }
     },
-  )
+  );
+  let given = match g.result { Some(_) -> bound.ids.take(bound.ids.len() - 1), None -> bound.ids };
+  {
+    ..bound,
+    lowering: invariants_held(
+      { ..bound.lowering, binder_terms: bound.ids },
+      context,
+      given,
+      unroll_budget(),
+    ),
+  }
+}
+
+/// A type stating an invariant that `lowering` built a value of and `g` stood on: a step that
+/// unrolls a definition can make what the claim's own reading did not.
+fn built_apart(lowering: Lowering, g: Goal) -> Option<String> =
+  lowering.constructed.find(|t: String| !g.tainted.contains(t))
 
 /// `And(body, needs)` when anything is owed.
 fn owing(terms: Terms, body: Int, needs: List<Int>) -> { terms: Terms, id: Int } / {abort.raise} = {
@@ -205,8 +224,12 @@ fn induct_on(
     total: g.total.fold(recursive_set, |m: Map<String, Bool>, n: String| m.insert(n, true)),
     unrolled: recursive_set,
     lemmas: g.lemmas,
+    identities: set_of(g.identities),
+    contracts: names_set(g.contracts),
+    tainted: g.tainted,
+    in_law: g.result == None,
   };
-  let bound = bound_all(start, context, g.binders);
+  let bound = bound_all(start, context, g);
   let guarded_lw = g.guards.fold(
     { lowering: bound.lowering, ids: [] },
     |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
@@ -219,13 +242,13 @@ fn induct_on(
     Some(result_body) -> if bound.ids.len() == 0 { { lowering: guarded_lw.lowering, def: None } }
     else {
       let r = lower_root(
-        guarded_lw.lowering,
+        { ..guarded_lw.lowering, answer_owed: false },
         context,
         result_body,
         bound.ids.take(bound.ids.len() - 1),
       );
       {
-        lowering: r.lowering,
+        lowering: { ..r.lowering, answer_owed: true },
         def: Some({
           symbol: match bound.ids.at(bound.ids.len() - 1) { Some(t) -> t, None -> 0 },
           value: r.id,
@@ -257,26 +280,32 @@ fn induct_on(
           { lowering: prior_guards.lowering, prior: prior0 }
         } else {
           let r = lower_root(
-            prior_guards.lowering,
+            { ..prior_guards.lowering, answer_owed: false },
             context,
             result_body,
             prior0.take(prior0.len() - 1),
           );
-          { lowering: r.lowering, prior: prior0.set(prior0.len() - 1, r.id) }
+          {
+            lowering: { ..r.lowering, answer_owed: true },
+            prior: prior0.set(prior0.len() - 1, r.id),
+          }
         },
         None -> { lowering: prior_guards.lowering, prior: prior0 },
       };
       let prior_body = lower_root(with_result.lowering, context, g.body, with_result.prior);
       let lw1 = prior_body.lowering;
       let hypothesis_needs = requirements_since(lw1, body_mark);
+      let unstood = built_apart(lw1, g);
       // The hypothesis makes values of the calls it reaches; a call it does not reach, and that no
       // equation defines, is one this induction cannot speak for.
       let covered = set_of(lw1.calls.drop(claim_calls.len())).keys();
       let defined = lw1.defined;
-      if claim_calls.fold(false, |f: Bool, c: Int|
+      if unstood != None {
+        no("it builds a `" ++ unstood.unwrap_or("") ++ "`, whose invariant it stood on", 0)
+      } else if claim_calls.fold(false, |f: Bool, c: Int|
           f || (!covered.contains(c) && !defined.contains(c))) {
         no("a remaining call is not one the hypothesis reaches", 0)
-      } else if lw1.float { no("a Float or a keyed value", 0) } else {
+      } else {
         let requirements = lw1.requirements;
         let equations = lw1.equations;
         let definition = match defined_result.def {
@@ -364,7 +393,7 @@ fn induct_on(
                   guard_satisfiable: sat.ok,
                 }),
                 used: sat.spent,
-                blockers: blockers,
+                blockers: blockers.concat(lw1.blockers),
               }
             }
           }
@@ -437,8 +466,12 @@ fn induct_list(
         total: g.total.fold(recursive_set, |m: Map<String, Bool>, n: String| m.insert(n, true)),
         unrolled: recursive_set,
         lemmas: g.lemmas,
+        identities: set_of(g.identities),
+        contracts: names_set(g.contracts),
+        tainted: g.tainted,
+        in_law: true,
       };
-      let bound = bound_all(start, context, g.binders);
+      let bound = bound_all(start, context, g);
       let sort = binder.ty;
       let elem = list_elem(sort);
       let empty = nil(bound.lowering.terms, Some(sort));
@@ -469,10 +502,13 @@ fn induct_list(
       let lw1 = hyp.lowering;
       let covered = set_of(lw1.calls.drop(claim_calls.len())).keys();
       let defined = lw1.defined;
-      if claim_calls.fold(false, |f: Bool, c: Int|
+      let unstood = built_apart(lw1, g);
+      if unstood != None {
+        no("it builds a `" ++ unstood.unwrap_or("") ++ "`, whose invariant it stood on", 0)
+      } else if claim_calls.fold(false, |f: Bool, c: Int|
           f || (!covered.contains(c) && !defined.contains(c) && !structural.contains(c))) {
         no("a remaining call is not one the hypothesis reaches", 0)
-      } else if lw1.float { no("a Float or a keyed value", 0) } else {
+      } else {
         let equations = lw1.equations;
         let in_question = set_of(covered.concat(defined).concat(structural));
         let ranges = int_ranges(lw1.terms, None, in_question);
@@ -558,7 +594,7 @@ fn induct_list(
                   guard_satisfiable: sat.ok,
                 }),
                 used: sat.spent,
-                blockers: blockers,
+                blockers: blockers.concat(lw1.blockers),
               }
             }
           }

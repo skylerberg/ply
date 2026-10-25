@@ -83,6 +83,7 @@ module.exports = grammar({
       $.derive_declaration,
       $.key_declaration,
       $.show_declaration,
+      $.invariant_declaration,
       $.numeric_declaration,
     ),
 
@@ -331,7 +332,7 @@ module.exports = grammar({
         seq('=', field('instantiation', $._expression)),
         seq(
           optional(seq('forall', '(', commaSep1($.binder), ')')),
-          optional(seq('where', field('guard', $._expression))),
+          optional($._law_where),
           field('body', $.block),
         ),
       )),
@@ -344,8 +345,16 @@ module.exports = grammar({
       optional($.generic_parameters),
       $.parameter_list,
       optional(seq('forall', '(', commaSep1($.binder), ')')),
-      optional(seq('where', field('guard', $._expression))),
+      optional($._law_where),
       field('body', $.block),
+    ),
+
+    // The compiler reads a leading `identity(a)` as a constraint where `a` is a type variable of the
+    // claim and as the guard elsewhere; a grammar that cannot see types reads each as an expression.
+    _law_where: $ => seq(
+      'where',
+      field('condition', $._expression),
+      repeat(seq(',', field('condition', $._expression))),
     ),
 
     binder: $ => seq(field('name', $.identifier), ':', field('type', $._type)),
@@ -360,6 +369,7 @@ module.exports = grammar({
 
     key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
+    invariant_declaration: $ => seq(optional('pub'), 'invariant', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     numeric_declaration: $ => seq(
       optional('pub'),
       'numeric',

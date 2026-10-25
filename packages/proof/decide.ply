@@ -2,14 +2,16 @@
 //! certificate a proof becomes.
 
 import compiler.emit.code (Code)
-import context (Context)
+import compiler.syntax.parsing (Span)
+import context (Context, Global, ctor, globals_of)
 import goal (Goal, Binder, Limits, Reason, Open, BudgetSpent, Proof, Assertion, run, conjunction,
-             domain_inhabited, uninterpreted_sorts, float_in, key_in, int_ranges, with_true)
+             domain_inhabited, uninterpreted_sorts, int_ranges, with_true, set_of, names_set)
 import induct (attempt)
-import lower (Lowering, Blocker, FloatTerm, KeyedTerm, lowering, bind_symbolic, lower_root, assume)
+import lower (Lowering, Blocker, Unclosed, Unseen, AnswerAssumed, lowering, bind_symbolic,
+              lower_root, assume, with_terms, invariants_held, unroll_budget)
 import rules (Rule, RuleLog, Unfold, Induction, no_rules, rules_of)
 import solve (Answer, Closed, Exhausted)
-import term (Terms, and, eq)
+import term (Terms, and, eq, true_id, false_id)
 import std.list
 
 pub type Decision =
@@ -37,18 +39,58 @@ fn inconclusive(a: Answer) -> Option<Reason> =
   match a { Closed -> None, Exhausted -> Some(BudgetSpent), _ -> Some(Open) }
 
 pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnosed / {abort.raise} = {
+  let first = read(
+    context,
+    { ..g, tainted: match g.builds { Some(b) -> g.tainted.push(b.type_name), None -> g.tainted } },
+    limits,
+  );
+  // A value made here of a type stating an invariant may break it, so the claim is read again,
+  // standing on no such type's invariant but at its binders, until a reading makes none it stood on.
+  let reading = iterate(first, context.invariants.keys().len() + 1, |r: Reading|
+    match r.lowering.constructed.filter(|t: String| !r.goal.tainted.contains(t)) {
+      [] -> Stop(r),
+      more -> Continue(read(context, { ..r.goal, tainted: r.goal.tainted.concat(more) }, limits)),
+    });
+  decided(context, reading, limits)
+}
+
+/// A goal read once into terms: its binders, its guards, what its definition answers, and its claim,
+/// standing on no invariant of the goal's `tainted` types but at its binders.
+type Reading = {
+  goal: Goal,
+  lowering: Lowering,
+  guards: List<Int>,
+  guard_mark: Int,
+  def: Option<{ symbol: Int, value: Int }>,
+  body: Int,
+}
+
+fn read(context: Context, g: Goal, limits: Limits) -> Reading / {abort.raise} = {
   let start = {
     ..lowering(no_rules(), limits.unfold_depth),
     total: g.total.fold(Map::new(), |m: Map<String, Bool>, n: String| m.insert(n, true)),
     lemmas: g.lemmas,
+    identities: set_of(g.identities),
+    contracts: names_set(g.contracts),
+    tainted: g.tainted,
+    in_law: g.result == None,
   };
-  let bound = g.binders.fold(
+  let symbols = g.binders.fold(
     { lowering: start, ids: [] },
     |acc: { lowering: Lowering, ids: List<Int> }, b: Binder| {
-      let r = bind_symbolic(acc.lowering, b.ty, context);
+      let r = bind_symbolic(acc.lowering, b.ty);
       { lowering: r.lowering, ids: acc.ids.push(r.id) }
     },
   );
+  let bound = {
+    ..symbols,
+    lowering: invariants_held(
+      { ..symbols.lowering, binder_terms: symbols.ids },
+      context,
+      match g.result { Some(_) -> symbols.ids.take(symbols.ids.len() - 1), None -> symbols.ids },
+      unroll_budget(),
+    ),
+  };
   // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
   let guarded = g.guards.fold(
     { lowering: bound.lowering, ids: [] },
@@ -62,14 +104,15 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
   let defined = match g.result {
     Some(result_body) -> if bound.ids.len() == 0 { { lowering: guarded.lowering, def: None } }
     else {
+      // The clause holds at the calls the body makes back into its definition, and no others.
       let r = lower_root(
-        guarded.lowering,
+        { ..guarded.lowering, inducting: g.inducting, building: g.builds, answer_owed: false },
         context,
         result_body,
         bound.ids.take(bound.ids.len() - 1),
       );
       {
-        lowering: r.lowering,
+        lowering: { ..r.lowering, inducting: None, building: None, answer_owed: true },
         def: Some({
           symbol: match bound.ids.at(bound.ids.len() - 1) { Some(t) -> t, None -> 0 },
           value: r.id,
@@ -78,31 +121,70 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
     },
     None -> { lowering: guarded.lowering, def: None },
   };
-  let body = lower_root(defined.lowering, context, g.body, bound.ids);
-  let lowering = body.lowering;
+  // The values a body builds of a type with an invariant satisfy it, or what it answers satisfies
+  // the clause. A constructor the reading did not count a value of leaves what it builds unshown.
+  let body = match g.builds {
+    Some(b) -> if builds_unseen(context, b.type_name, g.result, defined.lowering.seen) {
+      {
+        lowering: {
+          ..defined.lowering,
+          blockers: defined.lowering.blockers.push(Unseen(b.type_name)),
+        },
+        id: false_id(),
+      }
+    } else {
+      let all = conjunction(defined.lowering.terms, defined.lowering.built);
+      {
+        lowering: with_terms(defined.lowering, all.terms),
+        id: match all.id { Some(t) -> t, None -> true_id() },
+      }
+    },
+    None -> lower_root(defined.lowering, context, g.body, bound.ids),
+  };
+  {
+    goal: g,
+    lowering: body.lowering,
+    guards: guarded.ids,
+    guard_mark: guard_mark,
+    def: defined.def,
+    body: body.id,
+  }
+}
+
+/// Whether the body of a definition owed `builds` for `type_name` applies one of its constructors
+/// where the reading counted no value: a constructor handed on as a function, or code it passed over.
+fn builds_unseen(
+  context: Context,
+  type_name: String,
+  result: Option<Option<Code>>,
+  seen: List<Span>,
+) -> Bool =
+  match result {
+    Some(Some(code)) ->
+      globals_of(code, []).any(|x: Global|
+        match ctor(context, x.name) {
+          Some(k) -> k.decl.name == type_name && !seen.contains(x.at),
+          None -> false,
+        }),
+    _ -> true,
+  }
+
+fn decided(context: Context, reading: Reading, limits: Limits) -> Diagnosed / {abort.raise} = {
+  let g = reading.goal;
+  let lowering = reading.lowering;
   let blockers = lowering.blockers;
-  // `Float`, and a value compared by its type's `key`, are refused before any solver runs, so no
-  // proof or certificate can be built: neither is equal as its constructors and fields say.
-  if lowering.float || float_in(context, lowering.terms) || key_in(context, lowering.terms) {
-    let named = if key_in(context, lowering.terms) { KeyedTerm } else { FloatTerm };
-    {
-      decision: Unknown({ reason: Open, steps: 0 }),
-      blockers: if blockers.fold(false, |f: Bool, b: Blocker|
-          f || b == FloatTerm || b == KeyedTerm) { blockers }
-      else { blockers.push(named) },
-    }
-  } else {
-    let definition = match defined.def {
+  {
+    let definition = match reading.def {
       Some(d) -> {
         let m = eq(lowering.terms, d.symbol, d.value);
         { terms: m.terms, eq: Some(m.id), symbol: Some(d.symbol) }
       },
       None -> { terms: lowering.terms, eq: None, symbol: None },
     };
-    let guards = guarded.ids.map(|t: Int| { term: t, polarity: true });
+    let guards = reading.guards.map(|t: Int| { term: t, polarity: true });
     let ranges = int_ranges(definition.terms, definition.symbol, Map::new());
-    let guard_needs = lowering.requirements.take(guard_mark);
-    let body_needs = if g.partial { [] } else { lowering.requirements.drop(guard_mark) };
+    let guard_needs = lowering.requirements.take(reading.guard_mark);
+    let body_needs = if g.partial { [] } else { lowering.requirements.drop(reading.guard_mark) };
     // A guard that can raise has no domain, so the obligation is not decided at any tier.
     let needed = conjunction(ranges.terms, guard_needs);
     let checked = match needed.id {
@@ -146,10 +228,10 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
           let needs = conjunction(vacuity.terms, body_needs);
           let claim = match needs.id {
             Some(n) -> {
-              let m = and(needs.terms, body.id, n);
+              let m = and(needs.terms, reading.body, n);
               { terms: m.terms, id: m.id }
             },
-            None -> { terms: needs.terms, id: body.id },
+            None -> { terms: needs.terms, id: reading.body },
           };
           let assertions = ranges.out.concat(guards).concat(with_true(lowering.facts)).concat(
             match definition.eq { Some(d) -> [{ term: d, polarity: true }], None -> [] },
@@ -163,13 +245,20 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
               match tried.proof {
                 Some(p) -> { decision: certified(p, limits), blockers: tried.blockers },
                 None ->
-                  { decision: Unknown({ reason: reason, steps: spent }), blockers: tried.blockers },
+                  {
+                    decision: Unknown({ reason: reason, steps: spent }),
+                    blockers: {
+                      // A call taken to answer is no place the proof stopped.
+                      let stopped = tried.blockers.filter(|b: Blocker| b != AnswerAssumed);
+                      if reason == Open && stopped.len() == 0 { [Unclosed] } else { stopped }
+                    },
+                  },
               }
             },
             None -> {
               let sat = if !domain_inhabited(context, g.binders) { { ok: false, spent: spent } }
               else {
-                let all = conjunction(r.terms, guarded.ids);
+                let all = conjunction(r.terms, reading.guards);
                 match all.id {
                   None -> { ok: true, spent: spent },
                   // A valid guard over a non-empty domain admits a value.
