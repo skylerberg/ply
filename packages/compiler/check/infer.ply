@@ -9,12 +9,12 @@ import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, IExtern, DOrd, DNu
 import compiler.syntax.exprs (Expr, prelude_module, try_places, detached_at, simulated_at,
                               branch_at, expr_span)
 import compiler.expand.rewrite.shared (picked_in)
-import compiler.check.types (Atom, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord, Field,
-                             row_empty, row_open, row_singleton, without_raises, int_type,
-                             bool_type, bytes_type, list_type, iter_type, fn_type, shallow,
-                             written_label, label_of, atoms_text, scheme_text, type_text, TyNominal,
-                             TypeTable, held_type, table_of, tables_joined, type_table_bin, vars_in,
-                             unit_type)
+import compiler.check.types (Atom, Row, RVar, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord,
+                             Field, atoms_sorted, resolve_atom, row_empty, row_open, row_singleton,
+                             without_raises, int_type, bool_type, bytes_type, list_type, iter_type,
+                             fn_type, shallow, written_label, label_of, atoms_text, scheme_text,
+                             type_text, TyNominal, TypeTable, held_type, table_of, tables_joined,
+                             type_table_bin, vars_in, unit_type)
 import compiler.check.termination (Ends, Stated, Diverges, Site)
 import compiler.check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix,
                                       with_fix, insertion, qualify, error_at, Parameters)
@@ -40,11 +40,13 @@ import compiler.check.infer.checker (Location, OpInfo, EffectInfo, CtorInfo, Def
                                      Unguarded, Unshown, ZeroDivisor, Raise, TestInfo, LawBinder,
                                      LawInfo, MemberSite, WitnessOp, WitnessRef, WitnessOrder,
                                      UpdateShape, TrySite, LabelApplication, LabelSite, OperandAt,
-                                     TypedAt, TypedSite, KnownDef, KnownTest, KeptFacts, Known,
-                                     no_known, Checker, WalkedBody, report, report_error_at,
-                                     resolve, abort_atom, def_of, Builtin, declared, builtins,
-                                     builtin_named, update_shape_bin, try_site_bin, member_site_bin,
-                                     label_site_bin, typed_site_bin, witness_op_bin,
+                                     TypedAt, TypedSite, RowAt, ReadOf, RowOf, AtomOf, RowSite,
+                                     RowArguments, Performs, PerformsAtom, filed_rows_text,
+                                     KnownDef, KnownTest, KeptFacts, Known, no_known, Checker,
+                                     WalkedBody, report, report_error_at, resolve, resolve_row_in,
+                                     abort_atom, def_of, Builtin, declared, builtins, builtin_named,
+                                     update_shape_bin, try_site_bin, member_site_bin,
+                                     label_site_bin, typed_site_bin, row_site_bin, witness_op_bin,
                                      witness_ref_bin, witness_order_bin)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
@@ -152,13 +154,15 @@ pub fn published_pure(def_info: DefInfo) -> Bool =
   without_raises(def_info.footprint).len() == 0 && def_info.constraints.len() == 0
 
 /// What the emitter needs from the checker: the definitions published pure, for its constant table,
-/// the labels every call fills, the shape of every record update, and the type of each typed site.
+/// the labels every call fills, the shape of every record update, the type of each typed site and
+/// the rows of each site that hands on or takes evidence.
 pub type EmitFacts = {
   pure: List<Bytes>,
   label_sites: List<LabelSite>,
   elaboration: Elaboration,
   typed: List<TypedSite>,
   types: TypeTable,
+  rows: List<RowSite>,
 }
 
 /// What lowering reads that only the checker knows: the shape of every record update, the raise
@@ -210,6 +214,7 @@ pub type RootFacts = {
   members: List<MemberSite>,
   typed: List<TypedSite>,
   types: TypeTable,
+  rows: List<RowSite>,
 }
 
 derive bin for RootFacts
@@ -224,6 +229,7 @@ pub fn no_root_facts() -> RootFacts =
     members: [],
     typed: [],
     types: Map::new(),
+    rows: [],
   }
 
 /// The nodes of `all` the types `sites` name are made of, which is all a table of them needs.
@@ -273,7 +279,11 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     m.insert(x.owner, { ..f, typed: f.typed.push(x) })
   });
-  typed.fold(Map::new(), |m: Map<Bytes, RootFacts>, owner: Bytes, f: RootFacts|
+  let rowed = facts.rows.fold(typed, |m: Map<Bytes, RootFacts>, x: RowSite| {
+    let f = owned(m, x.owner);
+    m.insert(x.owner, { ..f, rows: f.rows.push(x) })
+  });
+  rowed.fold(Map::new(), |m: Map<Bytes, RootFacts>, owner: Bytes, f: RootFacts|
     m.insert(owner, { ..f, types: types_named(facts.types, f.typed) }))
 }
 
@@ -288,10 +298,11 @@ fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
     members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
     typed: facts.typed.map(|x: TypedSite| { ..x, module: module, owner: owner }),
     types: facts.types,
+    rows: facts.rows.map(|x: RowSite| { ..x, module: module, owner: owner }),
   }
 
 /// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
-fn facts_encoding() -> Int = 2
+fn facts_encoding() -> Int = 3
 
 /// One body's sites as its row files them: each by its node's site in the body's item, which no
 /// edit elsewhere, cut of its module or check of part of it moves.
@@ -325,6 +336,7 @@ fn lowered_only(checker: Checker) -> Checker / {abort.raise} = {
     operands: checker.operands.filter(|x: OperandAt| kept(x.owner)),
     witness_refs: checker.witness_refs.filter(|x: WitnessRef| kept(x.owner)),
     typed: checker.typed.filter(|x: TypedAt| kept(x.owner)),
+    rows_at: checker.rows_at.filter(|x: RowAt| kept(x.owner)),
   }
 }
 
@@ -348,6 +360,7 @@ fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
     },
     typed: grouped(settled.sites, |x: TypedSite| x.owner),
     types: settled.types,
+    rows: grouped(settled_rows(checker), |x: RowSite| x.owner),
   }
 }
 
@@ -434,6 +447,76 @@ fn settled_sites(checker: Checker) -> { sites: List<TypedSite>, types: TypeTable
   );
   { sites: settled.sites, types: settled.types }
 }
+
+/// Each row a walk found, resolved under the check's final substitution and read in its owner's
+/// numbering, as `settled_sites` reads types. A read of a definition generic over no row files none.
+fn settled_rows(checker: Checker) -> List<RowSite> / {abort.raise} = {
+  let numbering_of = |owner: Bytes|
+    match def_of(checker, owner) {
+      Some(d) -> { rows: by_place(d.scheme.row_vars), labels: by_place(d.scheme.label_vars) },
+      None -> { rows: Map::new(), labels: Map::new() },
+    };
+  checker.rows_at.fold(
+    { sites: [], owner: b"", numbering: numbering_of(b"") },
+    |acc: RowSettling, r: RowAt| {
+      let numbering = if r.owner == acc.owner { acc.numbering } else { numbering_of(r.owner) };
+      let read = |row: Row| row_numbered(resolve_row_in(checker, row), numbering);
+      let filed = match r.found {
+        ReadOf(x) -> {
+          // A read inside the recursive group being inferred shares the variables its scheme did
+          // not quantify, so the definition is used at its own there.
+          let filled = |v: Int|
+            range(0, x.quantified.len()).fold(v, |w: Int, i: Int|
+              if x.quantified.get(i) == v { x.filled.get(i) } else { w });
+          let vars = match def_of(checker, x.named) {
+            Some(d) -> d.scheme.row_vars.map(filled),
+            None -> x.filled,
+          };
+          if vars.len() == 0 { None }
+          else { Some(RowArguments(vars.map(|v: Int| read(row_open(v))))) }
+        },
+        RowOf(row) -> Some(Performs(read(row))),
+        AtomOf(atom) ->
+          Some(PerformsAtom(atom_numbered(resolve_atom(checker.subst, atom), numbering.labels))),
+      };
+      {
+        sites: match filed {
+          Some(f) ->
+            acc.sites.push({ module: r.module, site: r.span.site, filed: f, owner: r.owner }),
+          None -> acc.sites,
+        },
+        owner: r.owner,
+        numbering: numbering,
+      }
+    },
+  ).sites
+}
+
+/// An owner's row and label variables, each by its place in the owner's scheme.
+type RowNumbering = { rows: Map<Int, Int>, labels: Map<Int, Int> }
+
+/// Rows settled so far, and the owner of the last with its numbering.
+type RowSettling = { sites: List<RowSite>, owner: Bytes, numbering: RowNumbering }
+
+/// `row`, resolved, read in `numbering`: what it ends in by its place among the row variables, and
+/// each label its atoms name by its place among the label variables. A row variable the owner does
+/// not quantify is one nothing in the program settles, such as a callee's that only an omitted
+/// default's type names, so nothing is performed through it and the row ends there.
+fn row_numbered(row: Row, numbering: RowNumbering) -> Row / {abort.raise} =
+  {
+    atoms: if !row.atoms.fold(false, |found: Bool, a: Atom|
+        found || (match a.resource { RVar(_) -> true, _ -> false })) { row.atoms }
+    else { atoms_sorted(row.atoms.map(|a: Atom| atom_numbered(a, numbering.labels))) },
+    tail: match row.tail { None -> None, Some(v) -> numbering.rows.get(v) },
+  }
+
+/// `atom` with its label variable read in `labels`.
+fn atom_numbered(atom: Atom, labels: Map<Int, Int>) -> Atom =
+  match atom.resource { RVar(v) -> { ..atom, resource: RVar(place_among(labels, v)) }, _ -> atom }
+
+/// `v`'s place in `numbering`, `-1` for a variable it does not number.
+fn place_among(numbering: Map<Int, Int>, v: Int) -> Int =
+  match numbering.get(v) { Some(i) -> i, None -> 0 - 1 }
 
 /// Variables `vs` numbered by their places.
 fn by_place(vs: List<Int>) -> Map<Int, Int> / {abort.raise} =
@@ -1148,6 +1231,188 @@ test "each closure a handle, a simulate and a parallel make is filed at a place 
   assert_eq(filed_at(checker, simulated_at(node(b"simulate", b"\n"))), [b"() -> Int"]);
   assert_eq(branch(b"n + 1"), [b"() -> Int"]);
   assert_eq(branch(b"n > 2"), [b"() -> Bool"])
+}
+
+/// The rows the check behind `checker` filed at the places of module 0 `picked` picks, as a reader
+/// writes them.
+fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} = {
+  let noted = checker.rows_at.filter(|r: RowAt| r.module == 0 && picked(r.span));
+  settled_rows(checker).filter(|s: RowSite|
+    s.module == 0
+      && noted.fold(false, |found: Bool, r: RowAt|
+        found || (r.owner == s.owner && r.span.site == s.site))).map(|s: RowSite|
+    filed_rows_text(s.filed))
+}
+
+/// The rows filed at `at`, its site and place.
+fn rows_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  rows_where(checker, |s: Span| s == at)
+
+/// The rows filed for a node written from `at.start` to `at.end`, none made for another.
+fn rows_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  rows_where(checker, |s: Span|
+    s.start == at.start && s.end == at.end && s.site > 0 && s.site < site_digit())
+
+/// The checker of a check of `m` holding `src`, which checks. No row it files names a label its
+/// owner's scheme does not quantify.
+fn rowed_m(src: Bytes) -> Checker / {abort.raise} = {
+  let checker = checker_m(src);
+  assert_eq(
+    settled_rows(checker).map(|s: RowSite| filed_rows_text(s.filed)).filter(|t: Bytes|
+      t.index_of(b"?") != None),
+    [],
+  );
+  checker
+}
+
+fn log_and_link() -> Bytes =
+  Bytes::concat_all([
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
+    b"fn apply<|e>(f: () -> Int / e) -> Int / e = f()\n",
+    b"fn into<|e>(g: () -> Int / {log.note | e}) -> Int / {log.note | e} = g()\n",
+  ])
+
+test "a read of a definition generic over rows files what it fills each of them with, a label as the reader's own" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"fn logged() -> Int / {log.write} = apply(|| { log.note(1); 2 })\n",
+      b"fn sent<[l]>(x: Int) -> Int / {link.send[l]} = apply(|| link.send[l](x))\n",
+      b"fn passed<|e>(f: () -> Int / e) -> Int / e = apply(f)\n",
+      b"fn mapped(xs: List<Int>) -> List<Int> / {log.write} = xs.map(|x: Int| { log.note(x); x })\n",
+      b"fn twice() -> Int / {log.write} = logged() + logged()\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  assert_eq(at(b"apply(|| {", b"(|| {"), [b"[{m.log.note}]"]);
+  assert_eq(at(b"apply(|| link", b"(|| link"), [b"[{m.link.send[l0]}]"]);
+  assert_eq(at(b"apply(f)", b"(f)"), [b"[{| e0}]"]);
+  // A call on a value reads its function where the rewrite writes it, at a place of its own.
+  let member = placed_in(src, b"map(|x", b"(|x");
+  assert_eq(rows_where(checker, |s: Span| s.start == member.start && s.end == member.end), [
+    b"[{m.log.note}]",
+  ]);
+  // A definition generic over no row is read at none.
+  assert_eq(at(b"logged() +", b"() +"), [])
+}
+
+test "a row variable nothing settles ends the row it is read in" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"fn run<|e>(n: Int, hook: Option<() -> Int / e> = None) -> Int / e = match hook { Some(h) -> h() + n, None -> n }\n",
+      b"test \"runs\" { assert(run(1) == 1) }\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  // Only the type of the default the call leaves off names the row variable `run` is read at.
+  assert_eq(rows_written_at(checker, placed_in(src, b"run(1)", b"(1)")), [b"[{}]"])
+}
+
+test "a lambda is filed with its own row, however wide the place it is passed to" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"fn quiet() -> Int / {log.write} = into(|| 3)\n",
+      b"fn noisy() -> Int / {log.write} = into(|| { log.note(4); 5 })\n",
+      b"fn opened<|e>(f: () -> Int / e) -> Int / e = apply(|| f())\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  assert_eq(at(b"|| 3", b")\n"), [b"{}"]);
+  assert_eq(at(b"into(|| 3", b"(|| 3"), [b"[{}]"]);
+  assert_eq(at(b"|| { log.note(4)", b")\n"), [b"{m.log.note}"]);
+  assert_eq(at(b"|| f()", b")\n"), [b"{| e0}"])
+}
+
+test "a call through a function value is filed with the row of the type it calls through" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"effect amb {\n  read flip() -> Bool\n}\n",
+      b"type Job = { run: () -> Int / {log.write} }\n",
+      b"fn ran(j: Job) -> Int / {log.write} = j.run()\n",
+      b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
+      b"fn called() -> Int = apply(|| 1)\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  assert_eq(at(b"f()", b"\n"), [b"{| e0}"]);
+  assert_eq(at(b"g()", b"\n"), [b"{m.log.note | e0}"]);
+  assert_eq(at(b"j.run()", b"\n"), [b"{m.log.write}"]);
+  // A continuation performs what the rest of the body does, which the clause answers.
+  assert_eq(at(b"k(true)", b" + k"), [b"{}"]);
+  // A call of a definition files its rows where the definition is read.
+  assert_eq(at(b"apply(|| 1)", b"\n"), [])
+}
+
+test "a handle files its body's row as its clauses open it, and each clause's and its return clause's own" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"fn caught() -> Int / {link.send[conn]} = handle { log.note(1); link.send[conn](2) } with { log.note(n) -> { let _ = link.send[conn](n); () }, return v -> v + 1 }\n",
+      b"fn guarded<|e>(k: () -> Int / {log.note | e}) -> Int / e = handle { k() } with { log.note(n) -> () }\n",
+      b"fn local() -> Int = { let run = |k| handle { k() } with { log.note(n) -> () }; run(|| { log.note(1); 5 }) }\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  assert_eq(at(b"handle { log.note(1)", b"\nfn guarded"), [b"{m.link.send[conn], m.log.note}"]);
+  assert_eq(at(b"log.note(n) -> {", b", return"), [b"{m.link.send[conn]}"]);
+  assert_eq(at(b"return v", b" }\n"), [b"{}"]);
+  assert_eq(at(b"handle { k() } with { log.note(n) -> () }\n", b"\n"), [b"{m.log.note | e0}"]);
+  // Over a lambda's parameter, what it is handed comes to hold the operations the clauses answer.
+  let local = b"handle { k() } with { log.note(n) -> () };";
+  assert_eq(at(local, b";"), [b"{m.log.note}"]);
+  assert_eq(at(b"k() } with { log.note(n) -> () };", b" }"), [b"{m.log.note}"]);
+  assert_eq(at(b"log.note(n) -> () };", b" };"), [b"{}"]);
+  assert_eq(at(b"|k| handle", b"; run"), [b"{}"])
+}
+
+test "a try files its body's row, and the clauses it is written out with perform nothing" {
+  let src = Bytes::concat_all([
+    b"effect parse {\n  raise bad(why: String)\n}\n",
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"fn digit(b: Int) -> Int / {parse.bad, log.write} = if b < 10 { b } else { parse.bad(\"no\") }\n",
+    b"fn checked(b: Int) -> Result<Int, String> / {log.write} = try { digit(b) }\n",
+  ]);
+  let checker = rowed_m(src);
+  let one = expr_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
+  let at = try_places(one);
+  assert_eq(rows_at(checker, one), [b"{m.log.write, m.parse.bad}"]);
+  assert_eq(rows_at(checker, at.ret), [b"{}"]);
+  assert_eq(rows_at(checker, at.clause), [b"{}"])
+}
+
+test "each branch of a `parallel` is filed with what it performs" {
+  let src = Bytes::concat_all([
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"fn summed(n: Int) -> Int / {log.write} = { let (a, b) = parallel { n + 1, { log.note(n); n } }; a + b }\n",
+  ]);
+  let checker = rowed_m(src);
+  let branch = |text: Bytes| {
+    let s = placed_in(src, text, text).start;
+    rows_at(checker, branch_at(written_node(checker, span_between(s, s + text.len()))))
+  };
+  assert_eq(branch(b"n + 1"), [b"{}"]);
+  assert_eq(branch(b"{ log.note(n); n }"), [b"{m.log.note}"])
+}
+
+test "a perform files its atom, on a label parameter as its definition's own" {
+  let src = log_and_link().concat(
+    Bytes::concat_all([
+      b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
+      b"fn direct(x: Int) -> Int / {link.send[conn]} = link.send[conn](x)\n",
+      b"fn relayed<[l], [n]>(x: Int) -> Int / {link.send[l], link.send[n]} = link.send[l](link.send[n](x))\n",
+      b"fn noted() -> Unit / {log.write} = log.note(3)\n",
+    ]),
+  );
+  let checker = rowed_m(src);
+  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
+  assert_eq(at(b"link.send[l](x)", b"\n"), [b"m.link.send[l0]"]);
+  assert_eq(at(b"link.send[conn](x)", b"\n"), [b"m.link.send[conn]"]);
+  assert_eq(at(b"link.send[l](link", b"\n"), [b"m.link.send[l0]"]);
+  assert_eq(at(b"link.send[n](x)", b")\n"), [b"m.link.send[l1]"]);
+  assert_eq(at(b"log.note(3)", b"\n"), [b"m.log.note"])
 }
 
 test "the constructor a `?` hands its failure on by is filed at the `?`, as a written one is" {

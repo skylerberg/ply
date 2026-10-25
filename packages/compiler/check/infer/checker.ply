@@ -3,7 +3,8 @@
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
 import std.bin
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
+                                    AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin,
+                                    mode_text)
 import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
                               ImportDecl, INames, Constraint, Deriver, DJson, DEq, DOrd, DBin,
                               DShow, DHash, DNumeric, DInteger, DRow, DLibrary, is_predicate,
@@ -13,15 +14,15 @@ import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin,
 import compiler.syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_module)
 import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
                                  LDec, LChar)
-import compiler.check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn,
-                             TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, atoms_insert,
-                             row_empty, row_open, row_singleton, named_type, applied_type, int_type,
-                             bool_type, string_type, bytes_type, float_type, decimal_type,
-                             unit_type, list_type, option_type, fn_type, fields_sorted, ints_insert,
-                             ints_union, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
-                             fresh_row, subst_new, with_bindings, resolve_row, free_vars,
-                             env_bind_global, at_arguments, TyNominal, atom_bin, type_bin,
-                             scheme_bin, TypeTable)
+import compiler.check.types (Resource, RSingleton, RVar, RNamed, RAny, Atom, Row, Type, TyVar,
+                             TyCon, TyFn, TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified,
+                             atoms_insert, row_empty, row_open, row_singleton, named_type,
+                             applied_type, int_type, bool_type, string_type, bytes_type, float_type,
+                             decimal_type, unit_type, list_type, option_type, fn_type,
+                             fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
+                             fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
+                             resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
+                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable)
 import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
                                       error_with_labels, error_at, error_at_and)
@@ -417,6 +418,76 @@ pub type TypedAt = {
 /// places, and one record type can be large.
 pub type TypedSite = { module: Int, site: Int, ty: Bytes, args: List<Bytes>, owner: Bytes }
 
+/// A row the emitter reads at a site, as the walk found it: resolved when the check ends, as a
+/// `TypedAt` is.
+pub type RowAt = { module: Int, span: Span, found: RowFound, owner: Bytes }
+
+/// What a walk found of the rows at one site.
+pub type RowFound =
+  /// A read of the definition `named`: `quantified` are the row variables of its scheme as the
+  /// read found it, and `filled` the variable each became.
+  | ReadOf({ named: Bytes, quantified: List<Int>, filled: List<Int> })
+  /// What a lambda, a call through a value, a `handle`'s body, a clause or a branch performs.
+  | RowOf(Row)
+  /// What a perform performs.
+  | AtomOf(Atom)
+
+/// A `RowAt` resolved, each variable read in its owner's numbering: a row variable as its place
+/// among the owner's scheme's `row_vars`, a row ending in any other closed there, since nothing
+/// settles that variable, and a label variable as its place among its `label_vars`, any other `-1`.
+/// What the emitter hands evidence by.
+pub type RowSite = { module: Int, site: Int, filed: FiledRows, owner: Bytes }
+
+/// The rows filed at one site, in its owner's numbering.
+pub type FiledRows =
+  /// At a read of a definition its scheme makes generic over rows: what the read fills each of the
+  /// scheme's row variables with, in the scheme's order.
+  | RowArguments(List<Row>)
+  /// At a lambda, a call through a function value, a `handle` or `try`, a clause, a `return`
+  /// clause or a `parallel` branch: what it performs. A `handle`'s is its body's, opened to what
+  /// its clauses answer; a call's is what the function type it calls through says.
+  | Performs(Row)
+  /// At a perform: the atom it performs, its label the owner's variable or a named one.
+  | PerformsAtom(Atom)
+
+/// `filed` as a reader writes it: a row variable as `e` and a label variable as `l` with its place,
+/// `?` for a label the owner does not quantify.
+pub fn filed_rows_text(filed: FiledRows) -> Bytes / {abort.raise} =
+  match filed {
+    RowArguments(rows) ->
+      Bytes::concat_all([b"[", Bytes::join(rows.map(filed_row_text), b", "), b"]"]),
+    Performs(row) -> filed_row_text(row),
+    PerformsAtom(atom) -> filed_atom_text(atom),
+  }
+
+fn filed_row_text(row: Row) -> Bytes / {abort.raise} = {
+  let atoms = Bytes::join(row.atoms.map(filed_atom_text), b", ");
+  let tail = match row.tail {
+    None -> b"",
+    Some(v) ->
+      Bytes::concat_all([if atoms.len() == 0 { b"" } else { b" " }, b"| ", filed_place(b"e", v)]),
+  };
+  Bytes::concat_all([b"{", atoms, tail, b"}"])
+}
+
+fn filed_atom_text(atom: Atom) -> Bytes / {abort.raise} = {
+  let resource = match atom.resource {
+    RSingleton -> b"",
+    RAny -> b"[*]",
+    RNamed(n) -> Bytes::concat_all([b"[", n, b"]"]),
+    RVar(v) -> Bytes::concat_all([b"[", filed_place(b"l", v), b"]"]),
+  };
+  Bytes::concat_all([
+    atom.effect,
+    b".",
+    match atom.op { Some(op) -> op, None -> mode_text(atom.mode) },
+    resource,
+  ])
+}
+
+fn filed_place(letter: Bytes, place: Int) -> Bytes / {abort.raise} =
+  if place < 0 { b"?" } else { letter.concat(ascii_of_int(place)) }
+
 pub type Assumed = { deriver: Deriver, vars: List<Int> }
 
 /// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
@@ -652,6 +723,7 @@ pub type Checker = {
   bit_ops: List<BitOp>,
   operands: List<OperandAt>,
   typed: List<TypedAt>,
+  rows_at: List<RowAt>,
   witnessed: Map<Int, Witnessed>,
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
@@ -2001,6 +2073,10 @@ derive bin for MemberSite
 derive bin for LabelSite
 
 derive bin for TypedSite
+
+derive bin for FiledRows
+
+derive bin for RowSite
 
 derive bin for WitnessOp
 
