@@ -85,6 +85,7 @@ module.exports = grammar({
       $.show_declaration,
       $.invariant_declaration,
       $.numeric_declaration,
+      $.host_declaration,
     ),
 
     function_definition: $ => seq(
@@ -370,6 +371,7 @@ module.exports = grammar({
     key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     invariant_declaration: $ => seq(optional('pub'), 'invariant', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
+    host_declaration: $ => seq(optional('pub'), 'host', 'for', field('effect', $.identifier), 'by', field('function', choice($.identifier, $.qualified_name))),
     numeric_declaration: $ => seq(
       optional('pub'),
       'numeric',

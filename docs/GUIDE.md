@@ -221,6 +221,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `invariant`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `invariant for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `host`, `by` | `host for <effect> by <function>` at item position (§6.10) |
 | `where`, `derivable`, `identity` | after a signature's row, after a type's generic list, or after a law's binders; `identity(a)` opens a law's or schema's `where` |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -2233,6 +2234,41 @@ it decides on the same side of every wait. `simulate` searches the orders in
 which tasks reach a handler's variables, so a test of such a handler meets the
 lost update.
 
+### 6.10 Real handlers
+
+An effect's own module may name the handler that answers it where nothing in
+the program does, its **real handler**:
+
+```ply
+pub nondet effect os {
+  read pid() -> Int
+}
+
+host for os by served
+
+fn served<a | e>(go: () -> a / {os.read | e}) -> a / e =
+  handle { go() } with { os.pid() -> machine_pid() }
+```
+
+Every root the runtime enters (`main`, an entry `ply run` names, a test) runs
+under the real handler of each effect its row names, once the root has handled
+what it handles: the entry calls the handler with a closure over the root, so
+an `os.pid()` that no `handle` of the program answers reaches `served`, and one
+inside `os::on` (`std.os`) never does. A root whose row names no such effect
+runs as it is. The wrapping is the entry's, after checking: a test's row, and
+so `E0412`, is what the test performs, never what a real handler does with it.
+
+Only a module the toolchain ships declares one (`E0161`), of an effect it
+declares itself (`E0162`), once (`E0163`), and its function is a handler of
+the whole effect on every label by its signature alone (`E0164`): it takes one
+nullary function whose row names every `read` and `write` operation of the
+effect, on `[*]` where the operation takes a label, beside a row variable, and
+answers what that function answers, its row the same variable and what the
+handler adds of its own: raises, and effects no real handler serves. So its
+body, checked as any function's, discharges every operation (§6.5); a raise of
+the effect stays the program's to answer. It binds no label, states no `where`
+and is no `const fn`.
+
 ## 7. Holds and regions
 
 ```ply
@@ -3319,8 +3355,9 @@ modules import, what the parts it reads import in turn, and what they embed, so
 a change to any other leaves it alone.
 Of those it checks,
 counts and hashes only the functions the program reaches and the names its
-modules import, beside every type and effect and the functions a type's `key`,
-`show`, `invariant` or `numeric` names (§4.4), and none of their tests or laws; a
+modules import, beside every type and effect, the functions a type's `key`,
+`show`, `invariant` or `numeric` names (§4.4) and an effect's real handler
+(§6.10), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
 dependent's proof is owed; a load of the library's own directory reads every
 module of it, each one whole.
@@ -3965,6 +4002,10 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
 | `E0159` | an import of a module below `std.internal` from outside the toolchain's own modules |
 | `E0160` | a module a `derive` names whose `derive` is no deriver: not the signature, not a module of the program's own or the toolchain's, or one whose modules derive through a library deriver |
+| `E0161` | a `host for` outside a module the toolchain ships |
+| `E0162` | a `host for` an effect its module does not declare |
+| `E0163` | an effect's real handler stated twice |
+| `E0164` | a `host for` naming a function that is not a handler of the whole effect on every label |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |

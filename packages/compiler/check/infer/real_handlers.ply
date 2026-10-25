@@ -1,0 +1,217 @@
+//! `host for e by f`: the real handler an effect's own module declares, which every root whose row
+//! names the effect runs under. The declaration is the toolchain's, of an effect of its module, at
+//! most once, and `f` is a handler of the whole effect on every label by its signature alone:
+//!
+//! `fn f<a | r>(go: () -> a / {..every read and write operation of e, on every label | r}) -> a / r`
+//!
+//! answering `go()` with the effect discharged, its row adding only raises and effects no real
+//! handler serves. A body that does not handle every operation then fails its own row (`E0302`),
+//! as any `handle` that leaves an operation unanswered does.
+
+import compiler.syntax.parsing (Span)
+import compiler.syntax.type_syntax (MRaise)
+import compiler.syntax.items (Item, IFn, IInstance, InstanceDef, NHost, is_shipped)
+import compiler.check.types (Atom, Row, TyVar, TyFn, RAny, RSingleton, atoms_covered, atom_text,
+                             row_text, type_text)
+import compiler.check.resolve.tables (ParsedModule, qualify, label_at)
+import compiler.check.infer.checker (Checker, DefInfo, EffectInfo, OpInfo, report_error_at,
+                                     report_error_at_and, err_labels, resolve, def_of, effect_of)
+import std.bytes
+
+/// Each effect of the program whose module declares its real handler, by program-wide name.
+pub fn hosted_effects(checker: Checker) -> List<Bytes> =
+  checker.modules.fold([], |acc: List<Bytes>, m: ParsedModule|
+    m.module.items.fold(acc, |a: List<Bytes>, item: Item|
+      match item {
+        IInstance(d) -> if d.kind == NHost { a.push(qualify(m.name, d.target.name)) } else { a },
+        _ -> a,
+      }))
+
+/// The `host for` `def` module `m` writes, judged; `hosted` is every effect a real handler serves.
+pub fn checked_real_handler(
+  checker: Checker,
+  m: ParsedModule,
+  def: InstanceDef,
+  hosted: List<Bytes>,
+) -> Checker / {abort.raise} = {
+  if !is_shipped(m.name) {
+    report_error_at(
+      checker,
+      b"E0161",
+      def.span,
+      Bytes::concat_all([b"`host for ", def.target.name, b"` declares a real handler"]),
+      b"only a module the toolchain ships declares one",
+      [
+        b"a real handler answers what no handler of the program does, from the machine the program runs on, so only the toolchain's own modules declare one",
+        b"answer the effect with a `handle` where the program performs it",
+      ],
+    )
+  } else {
+    match effect_of(checker, qualify(m.name, def.target.name)) {
+      None ->
+        report_error_at(
+          checker,
+          b"E0162",
+          def.target.span,
+          Bytes::concat_all([b"`", def.target.name, b"` is not an effect this module declares"]),
+          b"declared in another module, or not at all",
+          [
+            b"a `host` names an effect of its own module, which every program that performs the effect reads it with",
+          ],
+        ),
+      Some(info) -> match earlier_host(m, def) {
+        Some(first) ->
+          report_error_at_and(
+            checker,
+            b"E0163",
+            def.span,
+            Bytes::concat_all([b"`", def.target.name, b"` states its real handler twice"]),
+            b"stated again here",
+            { module: checker.module, span: first },
+            b"first stated here",
+            [b"an effect has one, so that a root runs under one handler of it; remove one"],
+          ),
+        None -> match def_of(checker, qualify(m.name, def.by.name)) {
+          None ->
+            report_error_at(
+              checker,
+              b"E0164",
+              def.by.span,
+              Bytes::concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
+              b"a `host` names a function of its effect's own module",
+              [],
+            ),
+          Some(f) -> match unfit_why(checker, m, info, f, hosted) {
+            None -> checker,
+            Some(why) ->
+              err_labels(
+                checker,
+                b"E0164",
+                Bytes::concat_all([
+                  b"`",
+                  def.by.name,
+                  b"` cannot be the real handler of `",
+                  def.target.name,
+                  b"`",
+                ]),
+                [
+                  label_at(checker.module, def.by.span, true, why),
+                  label_at(f.at.module, f.at.span, false, b"the function it names"),
+                ],
+                [
+                  Bytes::concat_all([
+                    b"a real handler of `",
+                    def.target.name,
+                    b"` is `fn f<a | r>(go: () -> a / {",
+                    Bytes::join(
+                      info.ops.filter(served_op).map(|o: OpInfo| written_atom(info, o)),
+                      b", ",
+                    ),
+                    b" | r}) -> a / r`: it answers what `go()` answers, every operation of the effect discharged, and its row adds only raises and effects no real handler serves",
+                  ]),
+                ],
+              ),
+          },
+        },
+      },
+    }
+  }
+}
+
+/// Where module `m` states the real handler of `def`'s effect before `def` does.
+fn earlier_host(m: ParsedModule, def: InstanceDef) -> Option<Span> =
+  m.module.items.fold(None, |found: Option<Span>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IInstance(d) -> if d.kind == NHost && d.target.name == def.target.name
+            && d.span.start < def.span.start { Some(d.span) }
+        else { None },
+        _ -> None,
+      },
+    })
+
+/// Whether operation `o` is one a real handler answers: a `read` or a `write`, not a raise, which it
+/// leaves to the program.
+fn served_op(o: OpInfo) -> Bool = o.mode != MRaise
+
+/// The atom a real handler's parameter row names for operation `o` of `info`: on every label where
+/// it takes one.
+fn served_atom(info: EffectInfo, o: OpInfo) -> Atom =
+  {
+    effect: info.name,
+    resource: if o.resource_param { RAny } else { RSingleton },
+    mode: o.mode,
+    op: Some(o.name),
+  }
+
+fn written_atom(info: EffectInfo, o: OpInfo) -> Bytes =
+  Bytes::concat_all([info.simple_name, b".", o.name, if o.resource_param { b"[*]" } else { b"" }])
+
+/// Why `f` is no real handler of `info`, as the label on its name says it; `None` where it is one.
+fn unfit_why(
+  checker: Checker,
+  m: ParsedModule,
+  info: EffectInfo,
+  f: DefInfo,
+  hosted: List<Bytes>,
+) -> Option<Bytes> / {abort.raise} =
+  if written_const(m, f.simple_name) {
+    Some(b"this function is a `const fn`, whose value a build keeps")
+  } else if f.scheme.label_vars.len() > 0 { Some(b"this function binds a resource label") }
+  else if f.constraints.len() > 0 { Some(b"this function is constrained") } else {
+    let shape = Bytes::concat_all([
+      b"this function's type is `",
+      type_text(resolve(checker, f.scheme.ty)),
+      b"`",
+    ]);
+    match ((f.scheme.ty_vars, f.scheme.row_vars, resolve(checker, f.scheme.ty))) {
+      ([a], [r], TyFn(sig)) -> match sig.params {
+        [TyFn(go)] -> if go.params.len() > 0 || go.ret != TyVar(a) || sig.ret != TyVar(a)
+            || go.effects.tail != Some(r)
+            || sig.effects.tail != Some(r) { Some(shape) } else {
+          match info.ops.filter(served_op).find(|o: OpInfo|
+              !atoms_covered(go.effects.atoms, served_atom(info, o))) {
+            Some(o) ->
+              Some(
+                Bytes::concat_all([
+                  b"the function it is handed may not perform `",
+                  atom_text(served_atom(info, o)),
+                  b"`",
+                ]),
+              ),
+            None -> answered_row_why(sig.effects, info, hosted),
+          }
+        },
+        _ -> Some(shape),
+      },
+      _ -> Some(shape),
+    }
+  }
+
+/// Why the row a real handler of `info` answers with is not one: it still names a `read` or a
+/// `write` of the effect, or one of an effect another real handler serves.
+fn answered_row_why(
+  row: Row,
+  info: EffectInfo,
+  hosted: List<Bytes>,
+) -> Option<Bytes> / {abort.raise} =
+  match row.atoms.find(|x: Atom|
+      x.mode != MRaise && (x.effect == info.name || hosted.contains(x.effect))) {
+    None -> None,
+    Some(x) ->
+      Some(
+        Bytes::concat_all([
+          b"this function's row is `",
+          row_text(row),
+          b"`, which ",
+          if x.effect == info.name { b"still names the effect it serves" }
+          else { b"names an effect a real handler serves" },
+        ]),
+      ),
+  }
+
+/// Whether module `m` writes its function `name` as a `const fn`.
+fn written_const(m: ParsedModule, name: Bytes) -> Bool =
+  m.module.items.any(|item: Item|
+    match item { IFn(d) -> d.name.name == name && d.baked != None, _ -> false })

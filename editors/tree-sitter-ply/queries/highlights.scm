@@ -38,6 +38,7 @@
   "show"
   "invariant"
   "numeric"
+  "host"
   "forall"
   "where"
   "returns"

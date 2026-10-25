@@ -5615,6 +5615,106 @@ test "a `key` or a `show` names no function constrained beyond the order its typ
   )
 }
 
+/// A shipped module declaring the effect `fact` and writing `rest`, and a module performing it.
+fn real_handled(rest: Bytes) -> List<Source> =
+  [
+    {
+      name: b"std.fact",
+      src: Bytes::concat_all([
+        b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n  raise lost(why: String)\n}\n",
+        rest,
+      ]),
+    },
+    { name: b"m", src: b"import std.fact (fact)\nfn main() -> Int / {fact.get} = fact.get()\n" },
+  ]
+
+/// A real handler of `fact` with parameter row `go`, answer `answer` and body `body`.
+fn handler_written(go: Bytes, answer: Bytes, body: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"host for fact by served\nfn served<a | e>(go: () -> a / ",
+    go,
+    b") -> ",
+    answer,
+    b" = ",
+    body,
+    b"\n",
+  ])
+
+fn handled_body() -> Bytes = b"handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }"
+
+test "an effect's real handler handles every read and write of it on every label, and only its module's toolchain declares one" {
+  let whole = b"{fact.get, fact.put[*] | e}";
+  assert_eq(codes_of(real_handled(handler_written(whole, b"a / e", handled_body()))), []);
+  // A raise of the effect is the program's to answer, so it may stay in the row it answers with.
+  assert_eq(
+    codes_of(real_handled(handler_written(whole, b"a / {fact.lost | e}", handled_body()))),
+    [],
+  );
+  // Only a module the toolchain ships declares one.
+  assert_eq(
+    codes_of([
+      {
+        name: b"tools.fact",
+        src: Bytes::concat_all([
+          b"pub effect fact {\n  read get() -> Int\n}\n",
+          b"host for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
+        ]),
+      },
+    ]),
+    [b"E0161"],
+  );
+  // Of an effect its module declares, once.
+  assert_eq(codes_of(real_handled(b"host for other by served\nfn served() -> Int = 1\n")), [
+    b"E0162",
+  ]);
+  assert_eq(
+    codes_of(
+      real_handled(
+        handler_written(whole, b"a / e", handled_body()).concat(b"host for fact by served\n"),
+      ),
+    ),
+    [b"E0163"],
+  );
+  // By a function of its module whose signature is a handler of the whole effect.
+  assert_eq(codes_of(real_handled(b"host for fact by absent\n")), [b"E0164"]);
+  let unfit = |go: Bytes, answer: Bytes, body: Bytes|
+    codes_of(real_handled(handler_written(go, answer, body)));
+  assert_eq(unfit(b"{fact.get | e}", b"a / e", b"handle { go() } with { fact.get() -> 7 }"), [
+    b"E0164",
+  ]);
+  assert_eq(unfit(b"{fact.get, fact.put[here] | e}", b"a / e", handled_body()), [b"E0164"]);
+  assert_eq(unfit(whole, b"Option<a> / e", b"Some(".concat(handled_body()).concat(b")")), [
+    b"E0164",
+  ]);
+  assert_eq(unfit(whole, b"a / {fact.get, fact.put[*] | e}", b"go()"), [b"E0164"]);
+  assert_eq(
+    codes_of(
+      real_handled(
+        b"host for fact by served\nfn served<a | e>(n: Int, go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> n, fact.put[*](x) -> () }\n",
+      ),
+    ),
+    [b"E0164"],
+  );
+  assert_eq(
+    codes_of(
+      real_handled(
+        b"host for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e where derivable(eq, a) = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
+      ),
+    ),
+    [b"E0164"],
+  );
+  // What it answers with performs nothing another real handler serves, so no order of them matters.
+  let other = {
+    name: b"std.clock",
+    src: b"pub effect tick {\n  read now() -> Int\n}\nhost for tick by ticked\nfn ticked<a | e>(go: () -> a / {tick.now | e}) -> a / e = handle { go() } with { tick.now() -> 0 }\n",
+  };
+  let ticking = {
+    name: b"std.fact",
+    src: b"import std.clock (tick)\npub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / {tick.now | e} = handle { go() } with { fact.get() -> tick.now() }\n",
+  };
+  assert_eq(codes_of([other, ticking]), [b"E0164"])
+}
+
 test "a type that keys a `Map` by its parameter is ordered wherever it is written or built" {
   let opt = b"type Opt<a> = | Plain(a) | Keyed(Map<a, Int>)\n";
   // A `key` that keys a `Map` by what a variant holds is reached only through a value, and no
