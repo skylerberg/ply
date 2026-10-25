@@ -2072,7 +2072,11 @@ the tuple for one of several. It answers the one `raise` operation the body's
 row names, `abort.raise` aside, and takes that atom out of the row; a body that
 names none is `E0311`, and one that names several is `E0312`, where
 `try[toml.syntax] { body }` says which and lets the others pass. Naming an
-operation that is not a `raise` is `E0313`. A `try` is the `handle` with that
+operation that is not a `raise` is `E0313`. A named `try` whose raise could
+reach the body only through a row variable of the enclosing definition is
+`E0311` too: what that variable carries is the caller's to answer, so a
+function that answers a raise of its callback names it in the callback's row,
+`f: () -> a / {toml.syntax | e}`. A `try` is the `handle` with that
 one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
 recursive group with one in a member's body nests (§5.7), a `?` inside one is
 `E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
@@ -4060,7 +4064,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group fills a type parameter with a type that grows each time round |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, or a parameter its signature never mentions |
-| `E0311` | `try` whose body's row names no `raise` operation to answer |
+| `E0311` | `try` whose body's row names no `raise` operation to answer, or names the one it is given only through a row variable |
 | `E0312` | `try` whose body's row names several `raise` operations, and it names none |
 | `E0313` | `try` naming an operation that is not a `raise` |
 | `E0314` | assignment to a name that is not a variable of the handler whose clause it is in |

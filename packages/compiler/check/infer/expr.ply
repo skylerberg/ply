@@ -209,6 +209,28 @@ fn discharge(
   }
 }
 
+/// `checker` with a `handle` body's row made to name each operation in `answered`, where the row's
+/// tail is a variable still to solve: what that variable comes to hold, a lambda parameter's row or
+/// a continuation's, is then the `handle`'s to answer rather than passed by. A rigid row variable of
+/// the enclosing definition is never opened, so what reaches the body through it is the caller's.
+fn opened_to_clauses(checker: Checker, row: Row, answered: List<Atom>) -> Checker / {abort.raise} =
+  answered.fold(checker, |c: Checker, a: Atom| {
+    let r = resolve_row_in(c, row);
+    match r.tail {
+      None -> c,
+      Some(v) -> if is_rigid_row(c.subst, v) || atoms_covered(r.atoms, a) { c } else {
+        let o = new_row_var(c);
+        with_unified(
+          o.checker,
+          unify_row(o.checker.subst, o.checker.fresh, row_open(v), {
+            atoms: [a],
+            tail: Some(o.var),
+          }),
+        )
+      },
+    }
+  })
+
 /// The clause's resource covers the performed one: `[*]` is a clause for every label.
 fn key_named(keys: List<OpKey>, atom: Atom) -> Bool =
   keys.fold(false, |acc: Bool, k: OpKey|
@@ -4851,18 +4873,19 @@ fn infer_handle(
       ).checker,
     None -> returned.checker,
   };
-  let body_row = resolve_row_in(agreed, b.row);
+  let opened = opened_to_clauses(agreed, b.row, walked.around.map(|c: ClauseSite| c.op));
+  let body_row = resolve_row_in(opened, b.row);
   let remaining = body_row.atoms.filter(|a: Atom|
-    !clause_discharges(agreed, walked.handled, walked.selected, a));
+    !clause_discharges(opened, walked.handled, walked.selected, a));
   // An atom the clauses leave under a handled mode atom runs past this `handle`: refused unless the
   // enclosing definition's written row forwards it to the caller's handler.
   let missing = remaining.filter(|a: Atom|
-    atoms_covered(walked.handled, a) && !atoms_covered(agreed.declared_atoms, a));
-  let sites = resolved_sites(agreed.subst, agreed.performs.drop(mark).take(body_mark - mark));
+    atoms_covered(walked.handled, a) && !atoms_covered(opened.declared_atoms, a));
+  let sites = resolved_sites(opened.subst, opened.performs.drop(mark).take(body_mark - mark));
   let after = clauses.fold(span.start, |acc: Int, cl: HandleClause|
     max(acc, expr_span(cl.body).end));
-  let judged: Checker = if missing.len() == 0 { agreed }
-  else { incomplete(agreed, span, after, sites, walked.handled, walked.selected, missing) };
+  let judged: Checker = if missing.len() == 0 { opened }
+  else { incomplete(opened, span, after, sites, walked.handled, walked.selected, missing) };
   // A refused atom leaves the row with its report, so the signature is not told about it twice.
   let kept = atoms_difference(remaining, missing);
   let discharged: Checker = discharge(
@@ -4953,7 +4976,7 @@ fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} 
         match row.tail {
           Some(_) ->
             [
-              b"what a row variable carries is named by the caller, not here, so it passes through: name the operation, `try[effect.op] { .. }`",
+              b"what a row variable carries is the caller's to answer, so it passes through: to answer a raise here, name it in the row the body is given",
             ],
           None -> [],
         },
@@ -5008,6 +5031,31 @@ fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} 
     },
   }
 }
+
+/// `checker` with a named `try`'s refusal where its raise could reach the body only through a rigid
+/// row variable of the enclosing definition: what that variable carries is the caller's to answer.
+fn passing_raise(checker: Checker, span: Span, row: Row, atom: Atom) -> Checker / {abort.raise} =
+  match row.tail {
+    Some(v) -> if atoms_covered(row.atoms, atom) || !is_rigid_row(checker.subst, v) { checker }
+    else {
+      let written = atom_written(checker, atom);
+      report_error_at(
+        checker,
+        b"E0311",
+        span,
+        Bytes::concat_all([b"this `try` answers `", written, b"`, which its body does not raise"]),
+        b"what its body's row variable carries is the caller's to answer",
+        [
+          Bytes::concat_all([
+            b"to answer it here, name it in the row the body is given: `/ {",
+            written,
+            b" | e}`",
+          ]),
+        ],
+      )
+    },
+    None -> checker,
+  }
 
 fn carried_type(params: List<Type>) -> Type / {abort.raise} =
   match params {
@@ -5069,7 +5117,9 @@ fn infer_try_block(
         mode: hit.op.mode,
         op: Some(hit.op.name),
       };
-      let c: Checker = chosen.checker;
+      let opened = opened_to_clauses(chosen.checker, b.row, [atom]);
+      let answered_row = resolve_row_in(opened, b.row);
+      let c: Checker = passing_raise(opened, span, answered_row, atom);
       let carried = carried_type(hit.op.params);
       let result = TyCon({ name: b"Result", args: [b.ty, carried] });
       // The `handle` the `try` is written out as, typed where its parts will stand.
@@ -5101,7 +5151,7 @@ fn infer_try_block(
       {
         checker: discharge(filed, mark, body_mark, [atom]),
         ty: result,
-        row: { atoms: body_row.atoms.filter(|a: Atom| a != atom), tail: body_row.tail },
+        row: { atoms: answered_row.atoms.filter(|a: Atom| a != atom), tail: answered_row.tail },
       }
     },
   }
