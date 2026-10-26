@@ -143,9 +143,11 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
     // Where the root lies with its links resolved, as a binding lends it.
     let lent = [("app".to_string(), dir.path().canonicalize().unwrap())];
     let shipped = |_: &str| None;
+    let config = std::collections::BTreeMap::new();
     let world = World {
         roots: &lent,
         binding: "b".to_string(),
+        config: &config,
         binary: Binary {
             shipped: &shipped,
             program: "p".to_string(),

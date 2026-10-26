@@ -1,6 +1,8 @@
 //! What a test read of the world while it ran: the files and directories the real handlers that
-//! answered it read, what they wrote, the shipped modules it asked for, and what any `ply` it started
-//! read in turn. A test's pass is filed with what this comes to, and stands only while every read
+//! answered it read, what they wrote, the configuration keys it read, the shipped modules it asked
+//! for, and what any `ply` it started read in turn, but for that `ply`'s configuration, which is what
+//! the test handed it. No trace holds anything of a secret, so a run that read a secret
+//! configuration value files no pass. A test's pass is filed with what this comes to, and stands only while every read
 //! still answers as it did. A load that read a shipped module for only what its program reaches says
 //! so in a view: the module's form and each function reached, with its hash, stand in for that read
 //! of the whole module.
@@ -88,6 +90,12 @@ struct Observed {
     digested: BTreeMap<String, String>,
     /// Report files handed to the programs this record started.
     children: Vec<PathBuf>,
+    /// Each configuration key read, with the digest of what it answered. A run made on the record's
+    /// behalf, a nested one's or a child's, is configured by what this one handed it, so what it
+    /// read of its own configuration is none of this.
+    config: BTreeMap<String, String>,
+    /// The secret configuration keys read, of which a trace holds nothing.
+    secrets: BTreeSet<String>,
     /// Why no record can stand in for the run, when something made it so.
     opaque: Vec<String>,
 }
@@ -233,6 +241,21 @@ impl Recorder {
             return;
         }
         self.observed().reads.insert((how, path.to_path_buf()));
+    }
+
+    /// The configuration key `key` was read, and answered `value`.
+    pub fn configured(&self, key: &str, value: Option<&str>) {
+        settle(
+            &mut self.observed().config,
+            key.to_string(),
+            configured_digest(value),
+        );
+    }
+
+    /// A secret configuration value was read: no trace holds anything of a secret, so none stands
+    /// in for the run.
+    pub fn read_secret(&self, key: &str) {
+        self.observed().secrets.insert(key.to_string());
     }
 
     pub fn wrote(&self, path: &Path) {
@@ -551,29 +574,48 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
 }
 
 /// What a trace is read against: the run's roots, the digest of what the run is configured to bind,
-/// and the binary running it.
+/// the plain value of each configuration key the run is given, and the binary running it.
 pub struct World<'a> {
     pub roots: &'a [(String, PathBuf)],
     pub binding: String,
+    pub config: &'a BTreeMap<String, String>,
     pub binary: Binary<'a>,
 }
 
 /// A trace: one line a read, sorted — `<how>\t<root>\t<path>\t<own>\t<digest>`, the root empty for
 /// a path no root of the run holds and `own` the paths below it the read leaves out;
-/// `shipped\t<module>\t<digest>`; a view's `shipform` and `shipdef` lines ([`reached`]);
-/// `program\t<digest>`; and `binding\t<digest>` for a run that reached a host handler, whose verdict
-/// is the binding's.
+/// `config\t<key>\t<digest>` of what a configuration key answered; `shipped\t<module>\t<digest>`; a
+/// view's `shipform` and `shipdef` lines ([`reached`]); `program\t<digest>`; and `binding\t<digest>`
+/// for a run that reached a host handler, whose verdict is the binding's.
 pub type Trace = String;
+
+/// What a configuration key answering `value` is held at in a trace.
+fn configured_digest(value: Option<&str>) -> String {
+    let mut hasher = blake3::Hasher::new();
+    match value {
+        Some(value) => {
+            hasher.update(b"value\0");
+            hasher.update(value.as_bytes());
+        }
+        None => {
+            hasher.update(b"none");
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}
 
 /// What `recorder` came to, read against `world`; `None` when something it did no trace can stand
 /// in for. `hosted` is whether the run reached a host handler.
 pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<Trace> {
     let mut observed = recorder.observed();
     fold_children(&mut observed);
-    if !observed.opaque.is_empty() {
+    if !observed.opaque.is_empty() || !observed.secrets.is_empty() {
         return None;
     }
     let mut lines = digested(&observed, &world.binary);
+    for (key, digest) in &observed.config {
+        lines.insert(format!("config\t{key}"), digest.clone());
+    }
     if hosted {
         lines.insert("binding".to_string(), world.binding.clone());
     }
@@ -650,6 +692,11 @@ pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<
                 world.binary.program == *digest
             }
             ["binding", digest] => world.binding == *digest,
+            ["config", key, digest] => {
+                let now = world.config.get(*key).map(String::as_str);
+                noted(&|r| r.configured(key, now));
+                configured_digest(now) == *digest
+            }
             [how, root, rest, own, digest] => match Read::of_word(how) {
                 Some(how) => match located(root, rest, world.roots) {
                     Some(path) => {
@@ -679,6 +726,7 @@ fn said(fields: &[&str]) -> String {
         ["shipdef", _, name, _] => format!("the shipped definition `{name}`"),
         ["program", _] => "the `ply` program".to_string(),
         ["binding", _] => "the binding".to_string(),
+        ["config", key, _] => format!("the configuration key `{key}`"),
         [how, "", rest, ..] => format!("the {how} `{rest}`"),
         [how, root, rest, ..] => format!("the {how} `{rest}` under `{root}`"),
         _ => format!("an unreadable trace line `{}`", fields.join(" ")),

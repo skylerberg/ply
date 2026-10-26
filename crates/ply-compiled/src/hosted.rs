@@ -400,16 +400,27 @@ pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
 }
 
 /// The run's value of `key`: a plain one, or, where `secret`, the one only `config.secret` reads.
-/// `None` where the run was granted no such key.
+/// `None` where the run was granted no such key. The read is entered into the record of the run
+/// asking, where it is observed: a plain value as what it answered, a secret as one read.
 fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
     let runtime = c.host_runtime();
-    let config = ply_host::registry::facilities_of(&*runtime)?.configuration();
-    if secret {
-        config.plaintext(key)
-    } else {
-        config.get(key)
+    let value = ply_host::registry::facilities_of(&*runtime).and_then(|facilities| {
+        let config = facilities.configuration();
+        if secret {
+            config.plaintext(key)
+        } else {
+            config.get(key)
+        }
+        .map(str::to_string)
+    });
+    if let Some(recorder) = ply_host::observe::of(&*runtime) {
+        if secret {
+            recorder.read_secret(key);
+        } else {
+            recorder.configured(key, value.as_deref());
+        }
     }
-    .map(str::to_string)
+    value
 }
 
 /// The run's plain value of the key at `p`, found.

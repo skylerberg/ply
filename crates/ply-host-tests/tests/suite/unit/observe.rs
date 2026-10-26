@@ -1,6 +1,10 @@
 use ply_host::observe::{self, Binary, Read, Recorder, World};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// A run given no configuration.
+static UNCONFIGURED: BTreeMap<String, String> = BTreeMap::new();
 
 fn module(name: &str) -> Option<String> {
     match name {
@@ -11,9 +15,18 @@ fn module(name: &str) -> Option<String> {
 }
 
 fn world<'a>(roots: &'a [(String, PathBuf)], binding: &str) -> World<'a> {
+    configured(roots, binding, &UNCONFIGURED)
+}
+
+fn configured<'a>(
+    roots: &'a [(String, PathBuf)],
+    binding: &str,
+    config: &'a BTreeMap<String, String>,
+) -> World<'a> {
     World {
         roots,
         binding: binding.to_string(),
+        config,
         binary: Binary {
             shipped: &module,
             program: "program digest".to_string(),
@@ -119,6 +132,60 @@ fn a_run_that_reached_the_host_stands_for_its_binding_alone() {
     assert_eq!(lines(&trace), ["binding"]);
     assert!(stands(&trace, &world(&[], "lent")));
     assert!(moved(&trace, &world(&[], "lent another root")));
+}
+
+fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+#[test]
+fn a_configuration_read_stands_while_its_key_answers_as_it_did() {
+    let recorder = Recorder::default();
+    recorder.configured("SERVICE_REGION", Some("eu"));
+    recorder.configured("SERVICE_ABSENT", None);
+    let eu = values(&[("SERVICE_REGION", "eu"), ("UNREAD", "one")]);
+    let trace = observe::finished(&recorder, &configured(&[], "b", &eu), false).unwrap();
+    assert_eq!(
+        lines(&trace),
+        ["config\tSERVICE_ABSENT", "config\tSERVICE_REGION"]
+    );
+    // A key the run never read moves nothing.
+    let other_unread = values(&[("SERVICE_REGION", "eu"), ("UNREAD", "two")]);
+    assert!(stands(&trace, &configured(&[], "b", &other_unread)));
+    let us = values(&[("SERVICE_REGION", "us")]);
+    assert_eq!(
+        observe::moved(&trace, &configured(&[], "b", &us), None),
+        Some("the configuration key `SERVICE_REGION`".to_string())
+    );
+    let supplied = values(&[("SERVICE_REGION", "eu"), ("SERVICE_ABSENT", "now")]);
+    assert_eq!(
+        observe::moved(&trace, &configured(&[], "b", &supplied), None),
+        Some("the configuration key `SERVICE_ABSENT`".to_string())
+    );
+}
+
+#[test]
+fn a_run_that_read_a_secret_files_no_trace() {
+    let recorder = Recorder::default();
+    recorder.configured("SERVICE_REGION", Some("eu"));
+    recorder.read_secret("SERVICE_API_KEY");
+    assert_eq!(observe::finished(&recorder, &world(&[], "b"), false), None);
+}
+
+#[test]
+fn a_nested_run_s_configuration_is_its_caller_s_handing_and_no_read_of_the_caller_s() {
+    let inner = Recorder::default();
+    inner.configured("SERVICE_REGION", Some("handed"));
+    inner.read_secret("SERVICE_API_KEY");
+    let outer = Recorder::default();
+    outer.absorb(&inner);
+    assert_eq!(
+        observe::finished(&outer, &world(&[], "b"), false),
+        Some(String::new())
+    );
 }
 
 #[test]

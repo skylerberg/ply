@@ -9,6 +9,7 @@ use ply_core::Diagnostic;
 use ply_core::host::{HostBinding, HostResource};
 use ply_host::observe::Recorder;
 use ply_host::tls;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -184,12 +185,13 @@ impl Bound for Lent {
     }
 }
 
-/// What a trace is read against: the roots a run is lent, and what the run binds apart from the
-/// program.
+/// What a trace is read against: the roots a run is lent, what the run binds apart from the
+/// program, and the plain value of each configuration key it is given.
 #[derive(Clone)]
 struct Worldly {
     roots: Vec<(String, PathBuf)>,
     binding: String,
+    config: BTreeMap<String, String>,
 }
 
 impl Worldly {
@@ -202,9 +204,16 @@ impl Worldly {
                     .collect()
             })
             .unwrap_or_default();
+        let config = (grants.named("config"))
+            .filter_map(|fields| match fields {
+                [key, value, kind] if kind == "plain" => Some((key.clone(), value.clone())),
+                _ => None,
+            })
+            .collect();
         Worldly {
             roots,
             binding: binding_digest(grants),
+            config,
         }
     }
 
@@ -212,6 +221,7 @@ impl Worldly {
         ply_host::observe::World {
             roots: &self.roots,
             binding: self.binding.clone(),
+            config: &self.config,
             binary: ply_host::observe::Binary {
                 shipped: &crate::shipped::module_digest,
                 program: crate::shipped::program_digest(),
