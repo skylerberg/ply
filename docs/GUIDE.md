@@ -3405,9 +3405,9 @@ any other; one that read the machine is cached with the binding it ran under
 (§8.2), and what a real handler read under a root is what its pass stands on.
 
 The environment is open: `config.get` and `config.secret` answer from `--set`,
-`--config`, the environment and the schema's defaults under `ply run`, and from
-`--set`, `--config` and the defaults alone under `ply test`, whose pass would
-otherwise be the machine's. The network is open: a run looks names up, connects
+`--config`, the environment and the schema's defaults, under `ply run` and
+`ply test` alike; `config` is `nondet`, so a test that reads it is one too
+(§8.2). The network is open: a run looks names up, connects
 and listens, each socket in a table of the run's own, under the label its
 operation names. The credentials a TLS listener or upgrade names are the ones
 `--tls` gives the run, so one given none holds none (`E0429`). The console is
@@ -3473,7 +3473,7 @@ performs none of it.
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine` (`std.machine`'s `machine`: open a compiled unit, bind the host families the runtime serves itself from what a run is lent, and enter one of the unit's roots), `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise, and where an operation of `machine` that lends the host, measures or clocks an entry is performed by a run not lent it. `machine`'s deterministic half, `hermetic_machine`, answers from what it is handed alone: it binds no host, clocks nothing, and needs no grant, so a test that drives a program through it stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
-| `--config PATH` | `KEY=VALUE` file; repeatable, above the environment, which only `ply run` reads |
+| `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
 | `--trace json\|text\|off` | trace sink: JSON lines on stderr (default), text, or discard |
 | `--trace-level debug\|info\|warn\|error` | lowest level written (default `info`) |
