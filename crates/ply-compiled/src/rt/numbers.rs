@@ -9,8 +9,8 @@ pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     ply_core::float::bits(a % b) as i64
 }
 
-/// The operator codes compiled code hands [`rt_wide_binary`] and [`rt_decimal_binary`];
-/// `emit/c.ply`'s `binary_code` must match.
+/// The operator codes compiled code hands [`rt_decimal_binary`]; `emit/c.ply`'s `binary_code`
+/// must match.
 pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
@@ -31,34 +31,6 @@ pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Shr,
     BinOp::Ushr,
 ];
-
-/// An operator over two 64-bit widths' bits, the width at `t` in [`ply_core::INT_TYPES`]: the
-/// answer's bits, or a `Bool`'s 1 or 0, raised as the evaluator raises.
-pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, b: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let (Some(op), Some(ty)) = (
-        usize::try_from(op)
-            .ok()
-            .and_then(|i| BINOPS.get(i).copied()),
-        usize::try_from(t)
-            .ok()
-            .and_then(|i| ply_core::INT_TYPES.get(i).copied()),
-    ) else {
-        return ctx.fail(error("an operator this runtime has no code for"));
-    };
-    let of = |w: i64| Value::Fixed(ply_core::Fixed::new(ty, w as u64 as u128));
-    let (x, y) = (of(a), of(b));
-    match ply_core::strict_binary(op, &x, &y, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
-        Ok(Value::Fixed(f)) => f.bits() as u64 as i64,
-        Ok(Value::Bool(b)) => i64::from(b),
-        Ok(other) => ctx.fail(error(format!(
-            "a width's operator answered {}",
-            other.type_name()
-        ))),
-        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&y) => raise_error(ctx, d),
-        Err(d) => ctx.fail(d),
-    }
-}
 
 /// The box of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
 /// and above it `hi`.
