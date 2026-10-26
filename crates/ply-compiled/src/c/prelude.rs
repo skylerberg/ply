@@ -312,6 +312,7 @@ helpers! {
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
+    rt_decimal_overflow(what);
     rt_by_zero(what);
     rt_not_an_int(value);
     rt_not_an_int_wide(lo, hi, signed);
