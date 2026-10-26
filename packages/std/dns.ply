@@ -26,6 +26,8 @@
 //! Records the system's resolver does not offer (MX, TXT, SRV, CNAME) are `std.resolver`'s, which
 //! asks a server itself.
 
+import std.bytes (i64_be, u32_be)
+import std.internal.native (native, job_wait, found, parts, int_of)
 import std.ip
 import std.ip (Ip, SocketAddress, ip)
 import std.list
@@ -150,15 +152,23 @@ pub fn with_reverse(t: Table, address: Ip, names: List<String>) -> Table =
 /// The table saying it asks `servers`.
 pub fn with_servers(t: Table, servers: List<SocketAddress>) -> Table = { ..t, servers: servers }
 
+/// What `dns.lookup` answers of `name` where `ask` answers a name that is no address and is
+/// ASCII: an address written as text is itself, and a name that is not ASCII is refused unasked.
+fn looked_up<| e>(
+  name: String,
+  ask: (String) -> Result<List<Found>, Failure> / e,
+) -> Result<List<Found>, Failure> / {abort.raise | e} =
+  match ip::parse(name) {
+    Ok(address) -> Ok([{ address: address, ttl: None }]),
+    Err(_) -> if !name.is_ascii() { Err(not_ascii()) } else { ask(name) },
+  }
+
 /// What `dns.lookup` answers over the table: an address written as text is itself, a name that
 /// is not ASCII is refused as the host refuses it, a name the table holds is what it was given,
 /// and any other is `NoSuchName`.
 pub fn table_lookup(t: Table, name: String) -> Result<List<Found>, Failure> / {abort.raise} =
-  match ip::parse(name) {
-    Ok(address) -> Ok([{ address: address, ttl: None }]),
-    Err(_) -> if !name.is_ascii() { Err(not_ascii()) }
-    else { match t.names.get(held(name)) { Some(answer) -> answer, None -> Err(NoSuchName) } },
-  }
+  looked_up(name, |asked: String|
+    match t.names.get(held(asked)) { Some(answer) -> answer, None -> Err(NoSuchName) })
 
 /// What `dns.reverse` answers over the table.
 pub fn table_reverse(t: Table, address: Ip) -> Result<List<String>, Failure> =
@@ -180,7 +190,113 @@ pub fn on_table<a | e>(
     dns.servers() -> t.servers,
   }
 
+// --- The real handler -------------------------------------------------------
+
+host for dns by served
+
+/// `go` with every question asked of the system's resolver, the asking task waiting for its own
+/// answer.
+fn served<a | e>(go: () -> a / {dns.read | e}) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    dns.lookup(name) ->
+      looked_up(name, |asked: String| addresses_said(job_wait(dns_lookup(asked)))),
+    dns.reverse(address) -> names_said(job_wait(dns_reverse(ip::to_bytes(address)))),
+    dns.servers() -> match found(dns_configuration()) {
+      Some(text) -> servers_named(String::of_bytes_lossy(text)),
+      None -> [],
+    },
+  }
+
+/// The ticket of the addresses the system's resolver gives `name`.
+extern fn dns_lookup(name: String) -> Int / {native.read}
+
+/// The ticket of the names the system's resolver says the address of these bytes answers to.
+extern fn dns_reverse(address: Bytes) -> Int / {native.read}
+
+/// The system's resolver configuration, found where the host has one to read.
+extern fn dns_configuration() -> Bytes / {native.read}
+
+/// What the resolver answered a lookup: byte 1 and each address's bytes as parts, or the failure.
+fn addresses_said(said: Bytes) -> Result<List<Found>, Failure> / {abort.raise} =
+  if said.at(0) == 1 {
+    Ok(
+      parts(said.slice(1, said.len())).fold([], |acc: List<Found>, b: Bytes|
+        match ip::of_bytes(b) { Some(a) -> acc.push({ address: a, ttl: None }), None -> acc }),
+    )
+  } else { Err(failure_said(said)) }
+
+/// What the resolver answered a reverse lookup: byte 1 and each name as parts, or the failure.
+fn names_said(said: Bytes) -> Result<List<String>, Failure> / {abort.raise} =
+  if said.at(0) == 1 {
+    Ok(parts(said.slice(1, said.len())).map(|name: Bytes| String::of_bytes_lossy(name)))
+  } else { Err(failure_said(said)) }
+
+/// A failure as the resolver's natives write it: byte 0, its kind (`NoSuchName` 1, `NoData` 2,
+/// `ServerFailure` 3, `Other` 4), and for `Other` its code and words as parts.
+fn failure_said(said: Bytes) -> Failure / {abort.raise} =
+  match said.at(1) {
+    1 -> NoSuchName,
+    2 -> NoData,
+    3 -> ServerFailure,
+    _ -> match parts(said.slice(2, said.len())) {
+      [code, words] -> Other(int_of(code), String::of_bytes_lossy(words)),
+      _ -> Other(0, String::of_bytes_lossy(said.slice(2, said.len()))),
+    },
+  }
+
+/// The servers a resolver configuration names, in its order, each at the port a server answers
+/// on; a `nameserver` line naming no address this reads is passed over.
+pub fn servers_named(configuration: String) -> List<SocketAddress> / {abort.raise} =
+  configuration.lines().fold([], |acc: List<SocketAddress>, line: String|
+    match line.words() {
+      [word, server, ..] -> if word != "nameserver" { acc }
+      else { match server_at(server) { Some(at) -> acc.push(at), None -> acc } },
+      _ -> acc,
+    })
+
+/// A `nameserver` line's server: an address, and after a `%` the zone it is reached through.
+fn server_at(server: String) -> Option<SocketAddress> / {abort.raise} =
+  match server.split_once("%") {
+    None -> match ip::parse(server) { Ok(a) -> Some(ip::socket_at(a, 53)), Err(_) -> None },
+    Some(split) -> match ip::parse(split.head) {
+      Ok(a) -> ip::in_zone(ip::socket_at(a, 53), split.tail),
+      Err(_) -> None,
+    },
+  }
+
 // --- Tests ------------------------------------------------------------------
+
+test "a resolver configuration names its servers in order, a zone kept and a stray line passed over" {
+  let named = servers_named(
+    "# the network's\nsearch example.org\nnameserver 192.0.2.53\nnameserver fe80::1%en0\nnameserver   2001:db8::53 # trailing\nnameserver not-an-address\noptions ndots:2\n",
+  );
+  assert_eq(named.map(ip::render_socket), [
+    "192.0.2.53:53",
+    "[fe80::1%en0]:53",
+    "[2001:db8::53]:53",
+  ])
+}
+
+test "the resolver's answers read back as the failures and addresses they are" {
+  let address = ip::read("192.0.2.7");
+  assert_eq(
+    addresses_said(Bytes::concat_all([b"\x01", u32_be(4), ip::to_bytes(address)])),
+    Ok([{ address: address, ttl: None }]),
+  );
+  assert_eq(addresses_said(b"\x00\x01"), Err(NoSuchName));
+  assert_eq(names_said(b"\x00\x02"), Err(NoData));
+  assert_eq(names_said(b"\x00\x03"), Err(ServerFailure));
+  assert_eq(
+    names_said(Bytes::concat_all([b"\x00\x04", u32_be(8), i64_be(-2), u32_be(4), b"gone"])),
+    Err(Other(-2, "gone")),
+  );
+  assert_eq(
+    names_said(Bytes::concat_all([b"\x01", u32_be(11), b"example.org"])),
+    Ok(["example.org"]),
+  )
+}
 
 fn interleaved(written: List<String>) -> List<String> / {ip.refused, abort.raise} =
   interleave(written.map(ip::read)).map(ip::render)

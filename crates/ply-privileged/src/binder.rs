@@ -111,18 +111,9 @@ impl ply_compiled::entry::Binder for Binder {
     }
 }
 
-/// Which disclosure a registration's handler is one of: `tls`, `fs`, or none.
+/// Which disclosure a registration's handler is one of: `fs`, or none.
 fn facility_of(path: &str) -> &'static str {
-    if [
-        tls::HANDLER,
-        tls::CONNECT_HANDLER,
-        tls::START_HANDLER,
-        tls::SERVE_HANDLER,
-    ]
-    .contains(&path)
-    {
-        "tls"
-    } else if path.starts_with("ply_host::fs::") || path.starts_with("ply_host::sqlite::") {
+    if path.starts_with("ply_host::fs::") || path.starts_with("ply_host::sqlite::") {
         "fs"
     } else {
         ""

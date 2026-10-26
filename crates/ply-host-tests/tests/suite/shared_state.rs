@@ -6,9 +6,8 @@ use ply_core::host::{
 };
 use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
 use ply_host::config::{Entry, Snapshot};
-use ply_host::pool::Pooled;
 use ply_host::signal::{Accepting, Bounds, Shutdown, ShutdownSignal};
-use ply_host::tcp::{Net, TcpHost};
+use ply_host::tcp::TcpHost;
 use ply_host::trace::sink::Recording;
 use ply_host::trace::{Clock, Level, Op, Outcome, OwnedRecord, RecordKind, Sink, Trace};
 use std::sync::Arc;
@@ -482,31 +481,19 @@ fn two_snapshots_in_one_process_do_not_see_each_other() {
     assert_eq!(Snapshot::unopened().get("SERVICE_REGION"), None);
 }
 
-fn listener_label() -> Resource {
-    Resource::Named(Symbol::new("listener"))
+const LISTENER: &str = "listener";
+
+fn listen(net: &TcpHost) -> i64 {
+    net.listen(LISTENER, 0, Span::DUMMY)
+        .expect("a loopback port")
 }
 
-fn settle(host: &TcpHost, answered: Result<HostAnswer, Diagnostic>) -> Value {
-    match answered.expect("the operation was accepted") {
-        HostAnswer::Value(value) => value,
-        HostAnswer::Pending(pending) => {
-            let until = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
-                    return value;
-                }
-                assert!(Instant::now() < until, "`{pending}` never resolved");
-                let _ = host.pool().park_until(Duration::from_millis(20));
-            }
-        }
-    }
-}
-
-fn int(value: &Value) -> i64 {
-    match value {
-        Value::Int(i) => *i,
-        other => panic!("not an Int: {}", other.type_name()),
-    }
+/// What a listener's next `accept` answers, its job run here.
+fn accepted(net: &TcpHost, listener: i64) -> i64 {
+    let job = net
+        .accept(LISTENER, listener, Span::DUMMY)
+        .expect("the accept is taken");
+    ply_host::native::int_of(&job().expect("the accept ran")).expect("a handle")
 }
 
 fn until_phase_two(shutdown: &Arc<Shutdown>) {
@@ -605,7 +592,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     // Wired to the coordinator exactly as `Hosts::open_stopping` wires them.
     let net = Arc::new(TcpHost::new());
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
-    let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
+    let listener = listen(&net);
 
     assert!(shutdown.stopping(), "the run is stopping");
     assert!(
@@ -614,10 +601,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     );
 
     assert_eq!(
-        int(&settle(
-            &net,
-            net.accept(&listener_label(), listener, Span::DUMMY)
-        )),
+        accepted(&net, listener),
         0,
         "a run that was already stopping when the socket table arrived answers 0, which is what \
          ends a sequential accept loop"
@@ -634,20 +618,11 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
         drain: Duration::from_secs(5),
     });
     let late = Arc::new(TcpHost::new());
-    let listener = int(&settle(
-        &late,
-        late.listen(&listener_label(), 0, Span::DUMMY),
-    ));
+    let listener = listen(&late);
     assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
     shutdown.attach_net(Arc::clone(&late) as Arc<dyn Accepting>);
-    assert_eq!(
-        int(&settle(
-            &late,
-            late.accept(&listener_label(), listener, Span::DUMMY)
-        )),
-        0
-    );
+    assert_eq!(accepted(&late, listener), 0);
     assert_eq!(
         shutdown.at_stop().0,
         1,
@@ -663,16 +638,13 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     });
     let net = Arc::new(TcpHost::new());
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
-    let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
+    let listener = listen(&net);
 
     assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
 
     assert_eq!(
-        int(&settle(
-            &net,
-            net.accept(&listener_label(), listener, Span::DUMMY)
-        )),
+        accepted(&net, listener),
         0,
         "a listener the drain closed answers 0, which is what ends a sequential accept loop"
     );

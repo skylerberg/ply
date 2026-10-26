@@ -73,13 +73,14 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
     use ply_compiled::native::Machine;
     let machine = machine_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
-    let shipped: Vec<&str> = (ply_compiled::hosted::natives().iter())
+    let declared: Vec<&str> = ply_compiled::hosted::natives()
+        .iter()
         .chain(ply_compiled::entry::natives().iter())
         .map(|n| n.name)
         .collect();
     for n in machine {
         assert!(
-            n.name.starts_with('?') || shipped.contains(&n.name),
+            n.name.starts_with('?') || declared.contains(&n.name),
             "`{}` is no name the compiler or a shipped module declares",
             n.name
         );

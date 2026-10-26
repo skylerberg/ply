@@ -6,7 +6,7 @@
 
 use crate::fs::{FsHost, confine};
 use crate::observe::{self, Read};
-use crate::pool::{JobOutput, Pooled};
+use crate::pool::JobOutput;
 use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity, MachineId,
@@ -182,12 +182,13 @@ struct Operation {
 }
 
 impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let what = self.op.what();
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
+        let run = crate::registry::run_of(rt)?;
         let at = &req.atom.resource;
         let root = match self.fs.roots().get(at) {
             Some(root) => root.to_path_buf(),
@@ -279,7 +280,7 @@ impl HostHandler for Operation {
         let pending = self
             .fs
             .pool()
-            .submit(span, self.op.label(), self.op.what(), job)?;
+            .submit(run, span, self.op.label(), self.op.what(), job)?;
         Ok(HostAnswer::Pending(pending))
     }
 }

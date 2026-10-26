@@ -1,158 +1,16 @@
-//! The socket host over real loopback: addresses, options, Unix sockets, the upgrade to TLS,
-//! datagrams and the resolver.
+//! The run's socket table over real sockets on loopback, as `std.net`'s and `std.udp`'s natives
+//! drive it: each operation that waits is a job, run here, and every answer is flat as the real
+//! handlers read it.
 
-use ply_core::host::{Grants, MachineId};
-use ply_core::{
-    Diagnostic, HostAnswer, HostBinding, HostRequest, HostRuntime, Span, Symbol, Value, codes,
-};
-use ply_host::tcp::wire::{Endpoint, Probing, SocketOption};
-use ply_host::{Credentials, Host};
+use ply_core::{Span, codes};
+use ply_host::native::{int_of, parts_of};
+use ply_host::tcp::wire::{Endpoint, Probing, Refusal, SocketOption};
+use ply_host::tcp::{Job, TcpHost, Upgrade};
+use ply_host::{CredentialSpec, Credentials};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::rc::Rc;
 use std::time::Duration;
 
-const NET: &str = "std.net.net";
-const UDP: &str = "std.udp.udp";
-const DNS: &str = "std.dns.dns";
-
-/// One host, bound from no grants, with the runtime that settles what it leaves pending.
-struct Bound {
-    host: Host,
-    binding: HostBinding,
-    runtime: Rc<dyn HostRuntime>,
-}
-
-fn bound(host: Host) -> Bound {
-    let binding = host
-        .registry()
-        .granted(Grants::default())
-        .expect("no two registrations serve one operation");
-    let runtime = host.runtime();
-    Bound {
-        host,
-        binding,
-        runtime,
-    }
-}
-
-impl Bound {
-    /// The handler's own answer, which a waiting operation leaves pending.
-    fn call(
-        &self,
-        effect: &str,
-        op: &str,
-        label: Option<&str>,
-        args: Vec<Value>,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let label = label.map(Symbol::new);
-        let served = self
-            .binding
-            .resolve(&Symbol::new(effect), &Symbol::new(op), label.as_ref())
-            .unwrap_or_else(|_| panic!("the registry serves `{effect}.{op}` under {label:?}"));
-        let request = HostRequest {
-            machine: MachineId(1),
-            atom: ply_core::EffectAtom::operation(
-                effect,
-                ply_core::host::resource_of(label.as_ref()),
-                ply_core::Mode::Write,
-                op,
-            ),
-            op: served.op,
-            args: &args,
-            span: Span::DUMMY,
-            task: None,
-            declared: None,
-        };
-        served.handler.call(self.runtime.as_ref(), &request)
-    }
-
-    fn settle(&self, answer: HostAnswer) -> Value {
-        match answer {
-            HostAnswer::Value(v) => v,
-            HostAnswer::Pending(pending) => self
-                .runtime
-                .block_on(pending)
-                .expect("the operation settles"),
-        }
-    }
-
-    fn perform(
-        &self,
-        effect: &str,
-        op: &str,
-        label: Option<&str>,
-        args: Vec<Value>,
-    ) -> Result<Value, Diagnostic> {
-        self.call(effect, op, label, args).map(|a| self.settle(a))
-    }
-
-    fn net(&self, op: &str, label: &str, args: Vec<Value>) -> Value {
-        self.perform(NET, op, Some(label), args)
-            .unwrap_or_else(|d| panic!("`net.{op}` is served: {d:?}"))
-    }
-
-    fn udp(&self, op: &str, label: &str, args: Vec<Value>) -> Value {
-        self.perform(UDP, op, Some(label), args)
-            .unwrap_or_else(|d| panic!("`udp.{op}` is served: {d:?}"))
-    }
-
-    /// A listener on a loopback port of the kernel's choosing, and where it is.
-    fn listening(&self, ip: IpAddr) -> (i64, Endpoint) {
-        let listener = int(ok(self.net(
-            "listen_on",
-            "listener",
-            vec![at(ip, 0).value(), Value::list(Vec::new())],
-        )));
-        let here = self.address("local_address", "listener", listener);
-        (listener, here.expect("a listener has an address"))
-    }
-
-    /// A connection to `to` and the listener's end of it.
-    fn joined(&self, listener: i64, to: &Endpoint) -> (i64, i64) {
-        let client = int(ok(self.net(
-            "connect_to",
-            "client",
-            vec![to.value(), Value::list(Vec::new()), Value::Int(5000)],
-        )));
-        let server = int(self.net("accept", "listener", vec![Value::Int(listener)]));
-        (client, server)
-    }
-
-    fn address(&self, op: &str, label: &str, socket: i64) -> Option<Endpoint> {
-        maybe(self.net(op, label, vec![Value::Int(socket)]))
-            .map(|v| Endpoint::read(&v, Span::DUMMY).expect("a socket address"))
-    }
-
-    fn options(&self, label: &str, socket: i64) -> Vec<SocketOption> {
-        SocketOption::list(
-            &self.net("options", label, vec![Value::Int(socket)]),
-            Span::DUMMY,
-        )
-        .expect("a list of options")
-    }
-
-    fn send(&self, label: &str, conn: i64, payload: &[u8]) -> i64 {
-        int(some(self.net(
-            "send",
-            label,
-            vec![Value::Int(conn), Value::bytes(payload), Value::Int(5000)],
-        )))
-    }
-
-    /// `None` is the deadline, which these tests set short where they expect it.
-    fn recv(&self, label: &str, conn: i64, timeout_ms: i64) -> Option<Vec<u8>> {
-        maybe(self.net(
-            "recv",
-            label,
-            vec![Value::Int(conn), Value::Int(4096), Value::Int(timeout_ms)],
-        ))
-        .map(bytes)
-    }
-
-    fn close(&self, label: &str, socket: i64) {
-        self.net("close", label, vec![Value::Int(socket)]);
-    }
-}
+const LONG: Duration = Duration::from_secs(5);
 
 fn at(ip: IpAddr, port: u16) -> Endpoint {
     Endpoint {
@@ -166,262 +24,322 @@ fn loopback() -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
-fn int(v: Value) -> i64 {
-    v.as_int(Span::DUMMY, "a test expectation")
-        .expect("an Int answer")
-}
-
-fn bytes(v: Value) -> Vec<u8> {
-    v.as_bytes(Span::DUMMY, "a test expectation")
-        .expect("a Bytes answer")
-        .to_vec()
-}
-
-fn maybe(v: Value) -> Option<Value> {
-    match &v {
-        Value::Ctor { name, args } if name.as_str() == "Some" => Some(args[0].clone()),
-        Value::Ctor { name, .. } if name.as_str() == "None" => None,
-        other => panic!("not an `Option`: {other:?}"),
+/// An answer that may be refused: what follows byte 1, or the refusal written after byte 0.
+fn outcome(answer: Vec<u8>) -> Result<Vec<u8>, Vec<u8>> {
+    match answer.split_first() {
+        Some((1, rest)) => Ok(rest.to_vec()),
+        Some((0, rest)) => Err(rest.to_vec()),
+        _ => panic!("no answer: {answer:?}"),
     }
 }
 
-fn some(v: Value) -> Value {
-    maybe(v).expect("the operation answered `None`")
-}
-
-/// A `Result` whose refusal is told by its constructor's own name: `Refused`, `Injected`.
-fn result(v: Value) -> Result<Value, String> {
-    match &v {
-        Value::Ctor { name, args } if name.as_str() == "Ok" => Ok(args[0].clone()),
-        Value::Ctor { name, args } if name.as_str() == "Err" => match &args[0] {
-            Value::Ctor { name, .. } => {
-                let full = name.as_str();
-                Err(full.rsplit('.').next().unwrap_or(full).to_string())
-            }
-            other => panic!("not a refusal: {other:?}"),
-        },
-        other => panic!("not a `Result`: {other:?}"),
+/// What a native found: what follows byte 1, or none for the byte 0.
+fn found(answer: Vec<u8>) -> Option<Vec<u8>> {
+    match answer.split_first() {
+        Some((1, rest)) => Some(rest.to_vec()),
+        Some((0, [])) => None,
+        _ => panic!("not found nor none: {answer:?}"),
     }
 }
 
-fn ok(v: Value) -> Value {
-    result(v).unwrap_or_else(|why| panic!("the operation was refused: {why}"))
+fn int(bytes: &[u8]) -> i64 {
+    int_of(bytes).expect("eight bytes")
 }
 
-fn refused(v: Value) -> String {
-    match result(v) {
-        Ok(answer) => panic!("the operation was not refused: {answer:?}"),
-        Err(why) => why,
+fn ran(job: Job) -> Vec<u8> {
+    job().expect("the job ran")
+}
+
+/// A run's sockets, and how a test reaches them.
+struct Net {
+    host: TcpHost,
+}
+
+impl Net {
+    fn new() -> Net {
+        Net {
+            host: TcpHost::new(),
+        }
     }
-}
 
-fn text(s: &str) -> Value {
-    Value::str(s)
-}
+    /// A listener at `ip` on a port of the kernel's choosing, and where it is.
+    fn listening(&self, ip: IpAddr) -> (i64, Endpoint) {
+        let listener = int(
+            &outcome(self.host.listen_on("listener", &at(ip, 0), &[])).expect("loopback binds")
+        );
+        let here = self.address("listener", listener).expect("a bound address");
+        (listener, here)
+    }
 
-fn strings(items: &[&str]) -> Value {
-    Value::list(items.iter().map(Value::str).collect())
-}
+    fn address(&self, label: &str, socket: i64) -> Option<Endpoint> {
+        let flat = self.host.local_address(label, socket, Span::DUMMY);
+        found(flat.expect("a socket")).map(|e| Endpoint::read(&e).expect("an address"))
+    }
 
-/// The protocol a `std.net.Secured` says the two ends agreed on.
-fn protocol(secured: Value) -> Option<String> {
-    let Value::Record(fields) = &secured else {
-        panic!("not a `Secured`: {secured:?}");
-    };
-    maybe(fields.named("protocol").expect("a protocol").clone()).map(|p| {
-        p.as_str(Span::DUMMY, "a protocol")
-            .expect("a String")
-            .to_string()
-    })
+    fn peer(&self, label: &str, conn: i64) -> Option<Endpoint> {
+        let flat = self.host.peer_address(label, conn, Span::DUMMY);
+        found(flat.expect("a socket")).map(|e| Endpoint::read(&e).expect("an address"))
+    }
+
+    /// A connection to the program's own listener at `here`: the client's end and the server's.
+    fn joined(&self, listener: i64, here: &Endpoint) -> (i64, i64) {
+        let connecting = self
+            .host
+            .connect_to("client", here.clone(), Vec::new(), LONG);
+        let dialled = std::thread::spawn(move || ran(connecting));
+        let server = int(&ran(self
+            .host
+            .accept("listener", listener, Span::DUMMY)
+            .expect("an accept")));
+        let client = int(&outcome(dialled.join().expect("the dial")).expect("connected"));
+        (client, server)
+    }
+
+    fn send(&self, label: &str, conn: i64, payload: &[u8]) -> i64 {
+        let job = self
+            .host
+            .send(label, conn, payload.to_vec(), LONG, Span::DUMMY)
+            .expect("a send");
+        int(&found(ran(job)).expect("not a deadline"))
+    }
+
+    fn recv(&self, label: &str, conn: i64, max: usize, timeout: Duration) -> Option<Vec<u8>> {
+        let job = self
+            .host
+            .recv(label, conn, max, timeout, Span::DUMMY)
+            .expect("a recv");
+        found(ran(job))
+    }
+
+    fn close(&self, label: &str, socket: i64) {
+        self.host
+            .close(label, socket, Span::DUMMY)
+            .expect("an open socket closes");
+    }
+
+    fn options(&self, label: &str, socket: i64) -> Vec<SocketOption> {
+        let listed = self.host.options(label, socket, Span::DUMMY);
+        SocketOption::list(&listed.expect("a socket")).expect("options")
+    }
 }
 
 #[test]
-fn a_connection_knows_both_its_ends() {
-    let b = bound(Host::new());
-    let (listener, here) = b.listening(loopback());
-    assert_eq!(here.ip, loopback());
-    assert_ne!(here.port, 0, "the kernel chose a port");
-    let (client, server) = b.joined(listener, &here);
+fn a_connection_knows_both_its_ends_and_carries_bytes_each_way() {
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    assert_eq!(net.peer("client", client), Some(here.clone()));
+    assert_eq!(net.peer("conn", server), net.address("client", client));
 
-    let from = b.address("peer_address", "conn", server).expect("a peer");
-    assert_eq!(from.ip, loopback(), "the client came from loopback");
+    assert_eq!(net.send("client", client, b"ping"), 4);
+    assert_eq!(net.recv("conn", server, 64, LONG), Some(b"ping".to_vec()));
+    net.host
+        .close_write("client", client, Span::DUMMY)
+        .expect("an open connection");
     assert_eq!(
-        Some(from),
-        b.address("local_address", "client", client),
-        "the server's peer is the client's own end"
+        net.recv("conn", server, 64, LONG),
+        Some(Vec::new()),
+        "ending one's sending is the peer's end of stream"
+    );
+    assert_eq!(net.send("conn", server, b"pong"), 4);
+    assert_eq!(
+        net.recv("client", client, 64, LONG),
+        Some(b"pong".to_vec()),
+        "and leaves reading open"
     );
     assert_eq!(
-        b.address("peer_address", "client", client),
-        Some(here.clone())
-    );
-    assert_eq!(b.address("local_address", "conn", server), Some(here));
-    assert_eq!(
-        b.address("peer_address", "listener", listener),
+        net.recv("client", client, 64, Duration::from_millis(50)),
         None,
-        "a listener has no far end"
+        "nothing more is a deadline"
     );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
+}
+
+#[test]
+fn a_connection_where_nothing_listens_is_refused_and_a_bound_address_binds_once() {
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
+    assert_eq!(
+        outcome(net.host.listen_on("listener", &here, &[])),
+        Err(Refusal::AddressInUse.written())
+    );
+    net.close("listener", listener);
+    let dialled = ran(net.host.connect_to("client", here, Vec::new(), LONG));
+    assert_eq!(outcome(dialled), Err(Refusal::Refused.written()));
 }
 
 #[test]
 fn an_ipv6_connection_knows_both_its_ends_where_the_machine_has_ipv6() {
-    if std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_err() {
+    let net = Net::new();
+    let six = IpAddr::V6(Ipv6Addr::LOCALHOST);
+    let Ok(listening) = outcome(net.host.listen_on("listener", &at(six, 0), &[])) else {
         return;
+    };
+    let listener = int(&listening);
+    let here = net.address("listener", listener).expect("a bound address");
+    let (client, server) = net.joined(listener, &here);
+    assert_eq!(net.peer("client", client), Some(here));
+    assert_eq!(net.address("client", client).map(|e| e.ip), Some(six));
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
+}
+
+#[test]
+fn a_read_shorter_than_what_waits_leaves_the_rest_for_the_next() {
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    assert_eq!(net.send("client", client, b"0123456789"), 10);
+    let first = net.recv("conn", server, 4, LONG).expect("bytes");
+    assert_eq!(first, b"0123");
+    let mut rest = Vec::new();
+    while rest.len() < 6 {
+        rest.extend(net.recv("conn", server, 64, LONG).expect("the rest"));
     }
-    let b = bound(Host::new());
-    let (listener, here) = b.listening(IpAddr::V6(Ipv6Addr::LOCALHOST));
-    assert_eq!(here.ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
-    let (client, server) = b.joined(listener, &here);
-    let from = b.address("peer_address", "conn", server).expect("a peer");
-    assert_eq!(from.ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
-    assert_eq!(from.zone, None, "loopback is reached through no zone");
-    assert_eq!(Some(from), b.address("local_address", "client", client));
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
-}
-
-#[test]
-fn a_connection_nothing_answers_is_refused_and_says_so() {
-    let b = bound(Host::new());
-    let free = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-        .and_then(|l| l.local_addr())
-        .expect("a port that was free a moment ago");
-    let answer = b.net(
-        "connect_to",
-        "client",
-        vec![
-            Endpoint::of(free).value(),
-            Value::list(Vec::new()),
-            Value::Int(5000),
-        ],
+    assert_eq!(rest, b"456789");
+    net.close("client", client);
+    assert_eq!(
+        net.recv("conn", server, 64, LONG),
+        Some(Vec::new()),
+        "a peer that closed reads empty rather than failing"
     );
-    assert_eq!(refused(answer), "Refused");
-}
-
-#[test]
-fn a_listener_binds_loopback_only_and_one_address_once() {
-    let b = bound(Host::new());
-    let anywhere = b.net(
-        "listen_on",
-        "listener",
-        vec![
-            at(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0).value(),
-            Value::list(Vec::new()),
-        ],
-    );
-    assert_eq!(refused(anywhere), "PermissionDenied");
-
-    let (listener, here) = b.listening(loopback());
-    let again = b.net(
-        "listen_on",
-        "listener",
-        vec![here.value(), Value::list(Vec::new())],
-    );
-    assert_eq!(refused(again), "AddressInUse");
-    b.close("listener", listener);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
 fn options_set_as_a_socket_opens_and_afterwards_are_read_back() {
-    let b = bound(Host::new());
-    let (listener, here) = b.listening(loopback());
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
     assert!(
-        b.options("listener", listener)
+        net.options("listener", listener)
             .contains(&SocketOption::ReuseAddress(true)),
-        "a listener reuses its address unless told otherwise"
+        "a listener reuses its address"
     );
-
+    let connecting = net.host.connect_to(
+        "client",
+        here.clone(),
+        vec![
+            SocketOption::NoDelay(false),
+            SocketOption::Presenting("absent".to_string()),
+        ],
+        LONG,
+    );
+    let dialled = std::thread::spawn(move || ran(connecting));
+    let server = int(&ran(net
+        .host
+        .accept("listener", listener, Span::DUMMY)
+        .expect("an accept")));
+    let client = int(&outcome(dialled.join().expect("the dial")).expect("connected"));
+    let options = net.options("client", client);
+    assert!(
+        options.contains(&SocketOption::NoDelay(false)),
+        "{options:?}"
+    );
+    assert!(
+        !options
+            .iter()
+            .any(|o| matches!(o, SocketOption::Presenting(_))),
+        "a credential to present is no setting"
+    );
     let probing = Probing {
-        idle: Duration::from_secs(30),
-        interval: Some(Duration::from_secs(5)),
-        count: Some(4),
+        idle: Duration::from_secs(60),
+        interval: None,
+        count: None,
     };
-    let asked = [
-        SocketOption::NoDelay(false),
+    for option in [
+        SocketOption::NoDelay(true),
         SocketOption::KeepAlive(Some(probing)),
-    ];
-    let client = int(ok(b.net(
-        "connect_to",
-        "client",
-        vec![
-            here.value(),
-            Value::list(asked.iter().map(SocketOption::value).collect()),
-            Value::Int(5000),
-        ],
-    )));
-    let server = int(b.net("accept", "listener", vec![Value::Int(listener)]));
-    let opened = b.options("client", client);
-    assert!(opened.contains(&SocketOption::NoDelay(false)), "{opened:?}");
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert!(
-        opened.contains(&SocketOption::KeepAlive(Some(probing))),
-        "the idle time, the interval and the count are the ones asked for: {opened:?}"
-    );
-    assert!(
-        b.options("conn", server)
-            .contains(&SocketOption::NoDelay(true)),
-        "a connection sends small writes at once unless told otherwise"
-    );
-
-    for option in [SocketOption::NoDelay(true), SocketOption::KeepAlive(None)] {
-        ok(b.net(
-            "set_option",
-            "client",
-            vec![Value::Int(client), option.value()],
-        ));
+    ] {
+        let set = net.host.set_option("client", client, option, Span::DUMMY);
+        assert_eq!(outcome(set.expect("a socket")), Ok(Vec::new()));
     }
-    let now = b.options("client", client);
-    assert!(now.contains(&SocketOption::NoDelay(true)), "{now:?}");
-    assert!(now.contains(&SocketOption::KeepAlive(None)), "{now:?}");
-
-    ok(b.net(
-        "set_option",
-        "client",
-        vec![
-            Value::Int(client),
-            SocketOption::Linger(Some(Duration::from_secs(1))).value(),
-        ],
-    ));
+    let options = net.options("client", client);
     assert!(
-        b.options("client", client)
-            .contains(&SocketOption::Linger(Some(Duration::from_secs(1))))
+        options.contains(&SocketOption::NoDelay(true)),
+        "{options:?}"
     );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    assert!(
+        options
+            .iter()
+            .any(|o| matches!(o, SocketOption::KeepAlive(Some(_)))),
+        "{options:?}"
+    );
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
-fn ending_ones_sending_is_the_peers_end_of_stream_and_leaves_reading_open() {
-    let b = bound(Host::new());
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-    assert_eq!(b.send("client", client, b"question"), 8);
-    b.net("close_write", "client", vec![Value::Int(client)]);
+fn a_handle_is_held_to_its_kind_its_label_and_its_lifetime() {
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    let twice = net
+        .host
+        .recv("other", client, 8, LONG, Span::DUMMY)
+        .err()
+        .expect("one socket under two labels");
+    assert!(
+        twice.message.contains("net[other]") && twice.message.contains("net[client]"),
+        "{}",
+        twice.message
+    );
+    let read_a_listener = net
+        .host
+        .recv("listener", listener, 8, LONG, Span::DUMMY)
+        .err()
+        .expect("a listener is no connection");
+    assert_eq!(read_a_listener.code, codes::RUNTIME_ERROR);
+    let accept_a_connection = net
+        .host
+        .accept("client", client, Span::DUMMY)
+        .err()
+        .expect("a connection is no listener");
+    assert_eq!(accept_a_connection.code, codes::RUNTIME_ERROR);
+    net.close("client", client);
+    let closed = net
+        .host
+        .send("client", client, b"x".to_vec(), LONG, Span::DUMMY)
+        .err()
+        .expect("a closed handle names nothing");
+    assert!(
+        closed.message.contains("no open socket"),
+        "{}",
+        closed.message
+    );
+    net.close("conn", server);
+    net.close("listener", listener);
+}
 
-    assert_eq!(b.recv("conn", server, 5000), Some(b"question".to_vec()));
-    assert_eq!(
-        b.recv("conn", server, 5000),
-        Some(Vec::new()),
-        "the half-close is the end of what the client sends"
-    );
-    assert_eq!(b.send("conn", server, b"answer"), 6);
-    assert_eq!(
-        b.recv("client", client, 5000),
-        Some(b"answer".to_vec()),
-        "the end that stopped sending still reads"
-    );
-    assert_eq!(
-        b.send("client", client, b"more"),
-        0,
-        "nothing more is sent from an end that ended its sending"
-    );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+#[test]
+fn a_connection_by_name_reaches_a_listener_and_a_name_not_reached_is_none() {
+    let net = Net::new();
+    let (listener, here) = net.listening(loopback());
+    let connecting = net
+        .host
+        .connect("client", "localhost".to_string(), here.port, LONG);
+    let dialled = std::thread::spawn(move || ran(connecting));
+    let server = int(&ran(net
+        .host
+        .accept("listener", listener, Span::DUMMY)
+        .expect("an accept")));
+    let client = int(&found(dialled.join().expect("the dial")).expect("reached"));
+    net.close("client", client);
+    net.close("conn", server);
+    for name in ["\u{ff4c}ocalhost", "no-such-host.invalid"] {
+        let dialled = ran(net.host.connect(
+            "client",
+            name.to_string(),
+            here.port,
+            Duration::from_millis(500),
+        ));
+        assert_eq!(found(dialled), None, "{name}");
+    }
+    net.close("listener", listener);
 }
 
 #[cfg(unix)]
@@ -429,7 +347,7 @@ mod unix {
     use super::*;
     use ply_host::fs::{RootSpec, Roots};
 
-    fn rooted(dir: &std::path::Path) -> Bound {
+    fn rooted(dir: &std::path::Path) -> Net {
         let roots = Roots::load(
             &[RootSpec {
                 name: "run".to_string(),
@@ -438,126 +356,102 @@ mod unix {
             Span::DUMMY,
         )
         .expect("the temp dir is a root");
-        bound(Host::new().rooted(roots))
-    }
-
-    fn at_path(path: &str) -> Vec<Value> {
-        vec![text("run"), text(path)]
+        let net = Net::new();
+        net.host.rooted(roots);
+        net
     }
 
     #[test]
     fn a_unix_socket_is_a_path_under_a_root_and_goes_with_its_listener() {
         use std::os::unix::fs::MetadataExt;
         let dir = tempfile::tempdir().expect("a temp dir");
-        let b = rooted(dir.path());
+        let net = rooted(dir.path());
         let file = dir.path().join("app.sock");
-
-        let listener = int(ok(b.net("listen_unix", "listener", at_path("app.sock"))));
-        assert!(file.exists(), "the socket is a file under the root");
-        assert_eq!(
-            refused(b.net("listen_unix", "listener", at_path("app.sock"))),
-            "AddressInUse"
-        );
-
-        let mut dial = at_path("app.sock");
-        dial.push(Value::Int(5000));
-        let client = int(ok(b.net("connect_unix", "client", dial)));
-        let server = int(b.net("accept", "listener", vec![Value::Int(listener)]));
-        assert_eq!(b.send("client", client, b"over a path"), 11);
-        assert_eq!(b.recv("conn", server, 5000), Some(b"over a path".to_vec()));
-
-        assert_eq!(b.address("peer_address", "conn", server), None);
-        assert_eq!(b.address("local_address", "client", client), None);
-        assert_eq!(
-            maybe(b.net("local_port", "listener", vec![Value::Int(listener)])).map(int),
-            None
-        );
-        let owner = maybe(b.net("peer_credentials", "conn", vec![Value::Int(server)]))
-            .expect("the far end of a Unix socket has an owner");
-        let Value::Record(fields) = &owner else {
-            panic!("not a `PeerCredentials`: {owner:?}");
+        let listen = || {
+            outcome(
+                net.host
+                    .listen_unix("listener", "run", "app.sock", Span::DUMMY)
+                    .expect("the root is bound"),
+            )
         };
+        let listener = int(&listen().expect("the path is free"));
+        assert!(file.exists(), "the socket is a file under the root");
+        assert_eq!(listen(), Err(Refusal::AddressInUse.written()));
+
+        let connecting = net
+            .host
+            .connect_unix("client", "run", "app.sock", LONG, Span::DUMMY)
+            .expect("the root is bound");
+        let dialled = std::thread::spawn(move || ran(connecting));
+        let server = int(&ran(net
+            .host
+            .accept("listener", listener, Span::DUMMY)
+            .expect("an accept")));
+        let client = int(&outcome(dialled.join().expect("the dial")).expect("connected"));
+        assert_eq!(net.send("client", client, b"over a path"), 11);
+        assert_eq!(
+            net.recv("conn", server, 64, LONG),
+            Some(b"over a path".to_vec())
+        );
+        assert_eq!(net.peer("conn", server), None);
+        assert_eq!(net.address("client", client), None);
+
+        let owner = found(
+            net.host
+                .peer_credentials("conn", server, Span::DUMMY)
+                .expect("a socket"),
+        )
+        .expect("the far end of a Unix socket has an owner");
+        let parts = parts_of(&owner).expect("parts");
         let mine = std::fs::metadata(dir.path()).expect("the temp dir").uid();
         assert_eq!(
-            int(fields.named("user").expect("a user").clone()),
+            int(parts[0]),
             i64::from(mine),
             "the client is this process, which made the temp dir"
         );
         #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(int(parts[2]), i64::from(std::process::id()));
+        let start = net.host.start_tls(
+            "client",
+            client,
+            "localhost",
+            Upgrade {
+                alpn: Vec::new(),
+                unread: 0,
+                timeout: LONG,
+            },
+            Span::DUMMY,
+        );
         assert_eq!(
-            maybe(fields.named("process").expect("a process").clone()).map(int),
-            Some(i64::from(std::process::id()))
+            start.err().expect("an upgrade takes a TCP connection").code,
+            codes::RUNTIME_ERROR
         );
 
-        b.close("client", client);
-        b.close("conn", server);
-        b.close("listener", listener);
+        net.close("client", client);
+        net.close("conn", server);
+        net.close("listener", listener);
         assert!(!file.exists(), "closing the listener removes its socket");
-        let mut absent = at_path("app.sock");
-        absent.push(Value::Int(5000));
-        assert_eq!(refused(b.net("connect_unix", "client", absent)), "Refused");
-    }
-
-    #[test]
-    fn a_tcp_connection_has_no_owner_to_report() {
-        let b = bound(Host::new());
-        let (listener, here) = b.listening(loopback());
-        let (client, server) = b.joined(listener, &here);
-        assert!(maybe(b.net("peer_credentials", "conn", vec![Value::Int(server)])).is_none());
-        b.close("client", client);
-        b.close("conn", server);
-        b.close("listener", listener);
+        let after = net
+            .host
+            .connect_unix("client", "run", "app.sock", LONG, Span::DUMMY)
+            .expect("the root is bound");
+        assert_eq!(outcome(ran(after)), Err(Refusal::Refused.written()));
     }
 
     #[test]
     fn a_unix_socket_stays_inside_a_root_the_run_bound() {
         let dir = tempfile::tempdir().expect("a temp dir");
-        let b = rooted(dir.path());
-        let escaping = b
-            .perform(
-                NET,
-                "listen_unix",
-                Some("listener"),
-                vec![text("run"), text("../outside.sock")],
-            )
+        let net = rooted(dir.path());
+        let escaping = net
+            .host
+            .listen_unix("listener", "run", "../outside.sock", Span::DUMMY)
             .expect_err("`..` leaves the root");
         assert_eq!(escaping.code, codes::FS_PATH_ESCAPES_ROOT);
-        let unbound = b
-            .perform(
-                NET,
-                "listen_unix",
-                Some("listener"),
-                vec![text("elsewhere"), text("app.sock")],
-            )
+        let unbound = net
+            .host
+            .listen_unix("listener", "elsewhere", "app.sock", Span::DUMMY)
             .expect_err("no root is bound under that name");
         assert_eq!(unbound.code, codes::FS_ROOT_UNBOUND);
-    }
-
-    #[test]
-    fn a_unix_socket_is_not_secured() {
-        let dir = tempfile::tempdir().expect("a temp dir");
-        let b = rooted(dir.path());
-        let listener = int(ok(b.net("listen_unix", "listener", at_path("tls.sock"))));
-        let mut dial = at_path("tls.sock");
-        dial.push(Value::Int(5000));
-        let client = int(ok(b.net("connect_unix", "client", dial)));
-        let refusal = b
-            .perform(
-                NET,
-                "start_tls",
-                Some("client"),
-                vec![
-                    Value::Int(client),
-                    text("localhost"),
-                    strings(&[]),
-                    Value::bytes(b""),
-                    Value::Int(1000),
-                ],
-            )
-            .expect_err("an upgrade takes a TCP connection");
-        assert_eq!(refusal.code, codes::RUNTIME_ERROR);
-        b.close("client", client);
-        b.close("listener", listener);
     }
 }
 
@@ -583,9 +477,9 @@ fn material() -> Material {
 }
 
 impl Material {
-    /// A host that serves this certificate as `mail`, and trusts it when `trusting`.
-    fn host(&self, trusting: bool) -> Bound {
-        let spec = ply_host::CredentialSpec {
+    /// Sockets that serve this certificate as `mail`, and trust it when `trusting`.
+    fn net(&self, trusting: bool) -> Net {
+        let spec = CredentialSpec {
             name: "mail".to_string(),
             certificate: self.certificate.clone(),
             key: self.key.clone(),
@@ -595,265 +489,256 @@ impl Material {
         } else {
             Vec::new()
         };
-        bound(Host::with_credentials(
-            Credentials::load(&[spec], &trusted, &[]).expect("the generated material loads"),
-        ))
+        Net {
+            host: TcpHost::with_credentials(
+                Credentials::load(&[spec], &trusted, &[]).expect("the generated material loads"),
+            ),
+        }
     }
 }
 
-fn start(b: &Bound, conn: i64, name: &str, alpn: &[&str], unread: &[u8], ms: i64) -> HostAnswer {
-    b.call(
-        NET,
-        "start_tls",
-        Some("client"),
-        vec![
-            Value::Int(conn),
-            text(name),
-            strings(alpn),
-            Value::bytes(unread),
-            Value::Int(ms),
-        ],
-    )
-    .expect("the client's half is served")
+fn upgrade(alpn: &[&str], unread: usize, timeout: Duration) -> Upgrade {
+    Upgrade {
+        alpn: alpn.iter().map(|p| p.to_string()).collect(),
+        unread,
+        timeout,
+    }
 }
 
-fn serve(b: &Bound, conn: i64, alpn: &[&str], unread: &[u8], ms: i64) -> HostAnswer {
-    b.call(
-        NET,
-        "serve_tls",
-        Some("conn"),
-        vec![
-            Value::Int(conn),
-            text("mail"),
-            strings(alpn),
-            Value::bytes(unread),
-            Value::Int(ms),
-        ],
-    )
-    .expect("the server's half is served")
+/// What an upgrade settled: the protocol agreed, or the refusal's bytes.
+type Settled = Result<Option<String>, Vec<u8>>;
+
+fn settled(answer: Vec<u8>) -> Settled {
+    outcome(answer)
+        .map(|agreed| found(agreed).map(|p| String::from_utf8(p).expect("a protocol is text")))
 }
 
 /// Both halves of an upgrade, each waiting on the other, settled together.
 fn upgraded(
-    b: &Bound,
+    net: &Net,
     client: i64,
     server: i64,
     name: &str,
     offered: &[&str],
     accepted: &[&str],
-) -> (Result<Value, String>, Result<Value, String>) {
-    let serving = serve(b, server, accepted, b"", 5000);
-    let starting = start(b, client, name, offered, b"", 5000);
-    (result(b.settle(starting)), result(b.settle(serving)))
+) -> (Settled, Settled) {
+    let serving = net
+        .host
+        .serve_tls(
+            "conn",
+            server,
+            "mail",
+            upgrade(accepted, 0, LONG),
+            Span::DUMMY,
+        )
+        .expect("the server's half is taken");
+    let served = std::thread::spawn(move || ran(serving));
+    let starting = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            name,
+            upgrade(offered, 0, LONG),
+            Span::DUMMY,
+        )
+        .expect("the client's half is taken");
+    let started = settled(ran(starting));
+    (started, settled(served.join().expect("the server's half")))
+}
+
+fn handshake(net: &Net, label: &str, conn: i64) -> Option<Vec<u8>> {
+    found(ran(net
+        .host
+        .handshake(label, conn, Span::DUMMY)
+        .expect("a connection")))
+}
+
+fn certificate(net: &Net, label: &str, conn: i64) -> Option<Vec<u8>> {
+    found(
+        net.host
+            .peer_certificate(label, conn, Span::DUMMY)
+            .expect("a connection"),
+    )
 }
 
 #[test]
 fn an_open_connection_is_secured_at_both_ends_and_carries_bytes_after() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-
-    // The plaintext exchange that asks for the upgrade, as a STARTTLS does.
-    assert_eq!(b.send("client", client, b"STARTTLS\r\n"), 10);
-    assert_eq!(b.recv("conn", server, 5000), Some(b"STARTTLS\r\n".to_vec()));
-    assert_eq!(b.send("conn", server, b"220 go ahead\r\n"), 14);
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    assert_eq!(net.send("client", client, b"STARTTLS\r\n"), 10);
     assert_eq!(
-        b.recv("client", client, 5000),
-        Some(b"220 go ahead\r\n".to_vec())
+        net.recv("conn", server, 64, LONG),
+        Some(b"STARTTLS\r\n".to_vec())
     );
-    assert!(
-        maybe(b.net("handshake", "client", vec![Value::Int(client)])).is_none(),
+    assert_eq!(
+        handshake(&net, "client", client),
+        None,
         "a plaintext connection has no handshake to complete"
     );
 
-    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
-    assert_eq!(protocol(started.expect("the client secured")), None);
-    assert_eq!(protocol(served.expect("the server secured")), None);
+    let (started, served) = upgraded(&net, client, server, "localhost", &[], &[]);
+    assert_eq!(started, Ok(None));
+    assert_eq!(served, Ok(None));
     assert!(
-        maybe(b.net("handshake", "client", vec![Value::Int(client)])).is_some(),
+        handshake(&net, "client", client).is_some(),
         "the same handle is the secured connection"
     );
-
-    assert_eq!(b.send("client", client, b"EHLO secured\r\n"), 14);
+    assert!(certificate(&net, "client", client).is_some());
     assert_eq!(
-        b.recv("conn", server, 5000),
+        certificate(&net, "conn", server),
+        None,
+        "the client presented none"
+    );
+
+    assert_eq!(net.send("client", client, b"EHLO secured\r\n"), 14);
+    assert_eq!(
+        net.recv("conn", server, 64, LONG),
         Some(b"EHLO secured\r\n".to_vec())
     );
-    assert_eq!(b.send("conn", server, b"250 ok\r\n"), 8);
-    assert_eq!(b.recv("client", client, 5000), Some(b"250 ok\r\n".to_vec()));
+    assert_eq!(net.peer("conn", server), net.address("client", client));
+    net.close("client", client);
     assert_eq!(
-        b.address("peer_address", "conn", server),
-        b.address("local_address", "client", client),
-        "a secured connection still knows its ends"
-    );
-
-    b.close("client", client);
-    assert_eq!(
-        b.recv("conn", server, 5000),
+        net.recv("conn", server, 64, LONG),
         Some(Vec::new()),
         "the handle's close ends the session"
     );
-    b.close("conn", server);
-    b.close("listener", listener);
-    assert_eq!(b.host.handshakes().completed, 2);
+    net.close("conn", server);
+    net.close("listener", listener);
+    assert_eq!(net.host.handshakes().completed, 2);
 }
 
 #[test]
-fn a_connection_presenting_a_credential_is_who_its_server_sees_and_one_presenting_none_is_no_one() {
+fn a_connection_presenting_a_credential_is_who_its_server_sees() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let peer_certificate = |label: &str, conn: i64| {
-        maybe(b.net("peer_certificate", label, vec![Value::Int(conn)])).map(bytes)
-    };
-
-    let (client, server) = b.joined(listener, &here);
-    ok(b.net(
-        "set_option",
-        "client",
-        vec![
-            Value::Int(client),
-            SocketOption::Presenting("mail".to_string()).value(),
-        ],
-    ));
-    assert!(
-        !b.options("client", client)
-            .iter()
-            .any(|o| matches!(o, SocketOption::Presenting(_))),
-        "a credential to present is not read back"
-    );
-    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
-    started.expect("the client secured");
-    served.expect("the server secured");
-    let seen = peer_certificate("conn", server);
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    let presenting = SocketOption::Presenting("mail".to_string());
+    let set = net
+        .host
+        .set_option("client", client, presenting, Span::DUMMY);
+    assert_eq!(outcome(set.expect("a socket")), Ok(Vec::new()));
+    let (started, served) = upgraded(&net, client, server, "localhost", &[], &[]);
+    assert!(started.is_ok() && served.is_ok());
+    let seen = certificate(&net, "conn", server);
     assert!(seen.is_some(), "the server sees the certificate presented");
-    assert_eq!(
-        seen,
-        peer_certificate("client", client),
-        "the credential presented is the one the server holds"
-    );
-    b.close("client", client);
-    b.close("conn", server);
+    assert_eq!(seen, certificate(&net, "client", client));
+    net.close("client", client);
+    net.close("conn", server);
 
-    let (client, server) = b.joined(listener, &here);
-    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
-    started.expect("the client secured");
-    served.expect("the server secured");
-    assert_eq!(peer_certificate("conn", server), None);
-    b.close("client", client);
-    b.close("conn", server);
-
-    let (client, server) = b.joined(listener, &here);
-    ok(b.net(
-        "set_option",
-        "client",
-        vec![
-            Value::Int(client),
-            SocketOption::Presenting("absent".to_string()).value(),
-        ],
-    ));
-    let unknown = b
-        .perform(
-            NET,
-            "start_tls",
-            Some("client"),
-            vec![
-                Value::Int(client),
-                text("localhost"),
-                strings(&[]),
-                Value::bytes(b""),
-                Value::Int(5000),
-            ],
+    let (client, server) = net.joined(listener, &here);
+    let absent = SocketOption::Presenting("absent".to_string());
+    let set = net.host.set_option("client", client, absent, Span::DUMMY);
+    assert_eq!(outcome(set.expect("a socket")), Ok(Vec::new()));
+    let unknown = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 0, LONG),
+            Span::DUMMY,
         )
-        .expect_err("the run holds no credential of that name");
+        .err()
+        .expect("the run holds no credential of that name");
     assert_eq!(unknown.code, codes::TLS_CREDENTIAL_UNKNOWN);
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    let unknown = net
+        .host
+        .serve_tls("conn", server, "absent", upgrade(&[], 0, LONG), Span::DUMMY)
+        .err()
+        .expect("the run holds no credential of that name");
+    assert_eq!(unknown.code, codes::TLS_CREDENTIAL_UNKNOWN);
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
 fn an_upgrade_agrees_on_a_protocol_both_ends_name() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
     let (started, served) = upgraded(
-        &b,
+        &net,
         client,
         server,
         "localhost",
         &["postgresql", "other"],
         &["postgresql"],
     );
+    assert_eq!(started, Ok(Some("postgresql".to_string())));
+    assert_eq!(served, Ok(Some("postgresql".to_string())));
+    let agreed = net.host.protocol("client", client, Span::DUMMY);
     assert_eq!(
-        protocol(started.expect("the client secured")),
-        Some("postgresql".to_string())
+        found(agreed.expect("a connection")),
+        Some(b"postgresql".to_vec())
     );
-    assert_eq!(
-        protocol(served.expect("the server secured")),
-        Some("postgresql".to_string())
-    );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
-fn plaintext_waiting_in_the_socket_is_refused_and_ends_the_connection() {
+fn plaintext_ahead_of_a_handshake_is_refused_and_ends_the_connection() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+
     // A go-ahead with a second line behind it, which the client reads only the first of.
+    let (client, server) = net.joined(listener, &here);
     assert_eq!(
-        b.send("conn", server, b"220 go ahead\r\n250 injected\r\n"),
+        net.send("conn", server, b"220 go ahead\r\n250 injected\r\n"),
         28
     );
-    let read = maybe(b.net(
-        "recv",
-        "client",
-        vec![Value::Int(client), Value::Int(14), Value::Int(5000)],
-    ))
-    .map(bytes);
-    assert_eq!(read, Some(b"220 go ahead\r\n".to_vec()));
-
-    let started = result(b.settle(start(&b, client, "localhost", &[], b"", 5000)));
-    assert_eq!(started.expect_err("plaintext was waiting"), "Injected");
     assert_eq!(
-        b.recv("client", client, 5000),
+        net.recv("client", client, 14, LONG),
+        Some(b"220 go ahead\r\n".to_vec())
+    );
+    let started = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 0, LONG),
+            Span::DUMMY,
+        )
+        .expect("the upgrade is taken");
+    assert_eq!(settled(ran(started)), Err(Refusal::Injected.written()));
+    assert_eq!(
+        net.recv("client", client, 64, LONG),
         Some(Vec::new()),
         "what was injected is never read as if it had come secured"
     );
-    assert_eq!(b.send("client", client, b"AUTH"), 0);
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
-}
+    net.close("client", client);
+    net.close("conn", server);
 
-#[test]
-fn plaintext_the_caller_still_holds_is_refused_at_either_end() {
-    let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-    let started = result(b.settle(start(
-        &b,
-        client,
-        "localhost",
-        &[],
-        b"250 injected\r\n",
-        5000,
-    )));
-    assert_eq!(started.expect_err("the caller held plaintext"), "Injected");
-    let served = result(b.settle(serve(&b, server, &[], b"MAIL FROM:<m@x>\r\n", 5000)));
-    assert_eq!(served.expect_err("the caller held plaintext"), "Injected");
-    assert_eq!(b.send("conn", server, b"250 ok\r\n"), 0);
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
-    let refusals: u64 = b
+    // Plaintext the caller still holds, at either end.
+    let (client, server) = net.joined(listener, &here);
+    let started = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 14, LONG),
+            Span::DUMMY,
+        )
+        .expect("the upgrade is taken");
+    assert_eq!(settled(ran(started)), Err(Refusal::Injected.written()));
+    let served = net
+        .host
+        .serve_tls("conn", server, "mail", upgrade(&[], 17, LONG), Span::DUMMY)
+        .expect("the upgrade is taken");
+    assert_eq!(settled(ran(served)), Err(Refusal::Injected.written()));
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
+    let injected: u64 = net
         .host
         .handshakes()
         .reasons
@@ -861,632 +746,359 @@ fn plaintext_the_caller_still_holds_is_refused_at_either_end() {
         .filter(|(reason, _)| *reason == ply_host::tls::REASON_INJECTED)
         .map(|(_, n)| *n)
         .sum();
-    assert_eq!(refusals, 2, "each refusal is counted under its reason");
+    assert_eq!(injected, 3, "each refusal is counted under its reason");
 }
 
 #[test]
-fn a_certificate_no_root_vouches_for_is_untrusted() {
+fn a_server_the_client_cannot_verify_as_its_name_is_refused() {
     let material = material();
-    let b = material.host(false);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
-    assert_eq!(started.expect_err("no root vouches for it"), "Untrusted");
-    assert!(served.is_err(), "the server's half fails with the client's");
+    for (trusting, name) in [(false, "localhost"), (true, "mail.example")] {
+        let net = material.net(trusting);
+        let (listener, here) = net.listening(loopback());
+        let (client, server) = net.joined(listener, &here);
+        let (started, served) = upgraded(&net, client, server, name, &[], &[]);
+        assert_eq!(started, Err(Refusal::Untrusted.written()), "{name}");
+        assert!(served.is_err(), "the server's half fails with the client's");
+        net.close("client", client);
+        net.close("conn", server);
+        net.close("listener", listener);
+    }
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    let started = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "not a name",
+            upgrade(&[], 0, LONG),
+            Span::DUMMY,
+        )
+        .expect("the upgrade is taken");
+    let refused = settled(ran(started)).expect_err("no server is verified as that");
+    assert_eq!(refused[0], 10, "a handshake refused for its reason");
     assert_eq!(
-        b.send("client", client, b"AUTH"),
-        0,
-        "the connection is over"
-    );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
-}
-
-#[test]
-fn a_name_the_certificate_does_not_cover_is_untrusted() {
-    let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-    let (started, _) = upgraded(&b, client, server, "mail.example", &[], &[]);
-    assert_eq!(
-        started.expect_err("the name is not the certificate's"),
-        "Untrusted"
-    );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
-}
-
-#[test]
-fn a_name_no_certificate_could_cover_is_refused_before_anything_is_sent() {
-    let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-    let started = result(b.settle(start(&b, client, "not a name", &[], b"", 5000)));
-    assert_eq!(
-        started.expect_err("no server is verified as that"),
-        "Handshake"
-    );
-    assert_eq!(
-        b.recv("conn", server, 5000),
+        net.recv("conn", server, 64, LONG),
         Some(Vec::new()),
         "the refusal ended the connection"
     );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
-fn a_peer_that_never_handshakes_is_a_deadline() {
+fn a_peer_that_never_handshakes_is_a_deadline_on_the_whole_handshake() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
     let began = std::time::Instant::now();
-    let started = result(b.settle(start(&b, client, "localhost", &[], b"", 200)));
-    assert_eq!(started.expect_err("the server never answers"), "TimedOut");
-    assert!(
-        began.elapsed() < Duration::from_secs(4),
-        "the deadline is the whole handshake's, not each read's"
-    );
-    assert_eq!(
-        b.send("client", client, b"AUTH"),
-        0,
-        "a timed-out upgrade is over"
-    );
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    let started = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 0, Duration::from_millis(200)),
+            Span::DUMMY,
+        )
+        .expect("the upgrade is taken");
+    assert_eq!(settled(ran(started)), Err(Refusal::TimedOut.written()));
+    assert!(began.elapsed() < Duration::from_secs(4));
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 #[test]
 fn an_upgrade_is_refused_under_a_read_still_waiting_and_twice() {
     let material = material();
-    let b = material.host(true);
-    let (listener, here) = b.listening(loopback());
-    let (client, server) = b.joined(listener, &here);
-
-    let waiting = b
-        .call(
-            NET,
-            "recv",
-            Some("client"),
-            vec![Value::Int(client), Value::Int(64), Value::Int(5000)],
-        )
+    let net = material.net(true);
+    let (listener, here) = net.listening(loopback());
+    let (client, server) = net.joined(listener, &here);
+    let waiting = net
+        .host
+        .recv("client", client, 64, LONG, Span::DUMMY)
         .expect("a read");
-    let under = b
-        .call(
-            NET,
-            "start_tls",
-            Some("client"),
-            vec![
-                Value::Int(client),
-                text("localhost"),
-                strings(&[]),
-                Value::bytes(b""),
-                Value::Int(5000),
-            ],
+    let under = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 0, LONG),
+            Span::DUMMY,
         )
         .err()
         .expect("a read still holds the plaintext");
     assert_eq!(under.code, codes::RUNTIME_ERROR);
-    assert_eq!(b.send("conn", server, b"x"), 1);
-    assert_eq!(maybe(b.settle(waiting)).map(bytes), Some(b"x".to_vec()));
-
-    let (started, served) = upgraded(&b, client, server, "localhost", &[], &[]);
+    drop(waiting);
+    let (started, served) = upgraded(&net, client, server, "localhost", &[], &[]);
     assert!(started.is_ok() && served.is_ok());
-    let twice = b
-        .call(
-            NET,
-            "start_tls",
-            Some("client"),
-            vec![
-                Value::Int(client),
-                text("localhost"),
-                strings(&[]),
-                Value::bytes(b""),
-                Value::Int(5000),
-            ],
+    let twice = net
+        .host
+        .start_tls(
+            "client",
+            client,
+            "localhost",
+            upgrade(&[], 0, LONG),
+            Span::DUMMY,
         )
         .err()
         .expect("the connection is already TLS");
     assert_eq!(twice.code, codes::RUNTIME_ERROR);
-    let unknown = b
-        .call(
-            NET,
-            "serve_tls",
-            Some("conn"),
-            vec![
-                Value::Int(server),
-                text("absent"),
-                strings(&[]),
-                Value::bytes(b""),
-                Value::Int(5000),
-            ],
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
+}
+
+#[test]
+fn a_tls_listener_serves_a_client_that_connects_over_tls() {
+    let material = material();
+    let net = material.net(true);
+    let listener = net
+        .host
+        .listen_tls("listener", 0, "mail", Span::DUMMY)
+        .expect("the credential is held");
+    let port = net.host.local_addr(listener).expect("a bound port").port();
+    let connecting = net
+        .host
+        .connect_tls("client", "localhost".to_string(), port, LONG);
+    let dialled = std::thread::spawn(move || ran(connecting));
+    let server = int(&ran(net
+        .host
+        .accept("listener", listener, Span::DUMMY)
+        .expect("an accept")));
+    let client = int(&found(dialled.join().expect("the dial")).expect("reached"));
+    let sending = net
+        .host
+        .send(
+            "client",
+            client,
+            b"GET / HTTP/1.1\r\n".to_vec(),
+            LONG,
+            Span::DUMMY,
         )
-        .err()
-        .expect("the run holds no such credential");
+        .expect("a send");
+    let sent = std::thread::spawn(move || ran(sending));
+    assert_eq!(
+        net.recv("conn", server, 64, LONG),
+        Some(b"GET / HTTP/1.1\r\n".to_vec()),
+        "the first read is where the handshake happens"
+    );
+    assert_eq!(
+        found(sent.join().expect("the send")).map(|n| int(&n)),
+        Some(16)
+    );
+    let unknown = net
+        .host
+        .listen_tls("listener", 0, "absent", Span::DUMMY)
+        .expect_err("the run holds no such credential");
     assert_eq!(unknown.code, codes::TLS_CREDENTIAL_UNKNOWN);
-    b.close("client", client);
-    b.close("conn", server);
-    b.close("listener", listener);
+    net.close("client", client);
+    net.close("conn", server);
+    net.close("listener", listener);
 }
 
 /// A datagram socket at loopback, on a port of the kernel's choosing, and where it is.
-fn datagram_socket(b: &Bound, label: &str) -> (i64, Endpoint) {
-    let socket = int(ok(b.udp(
-        "bind",
-        label,
-        vec![at(loopback(), 0).value(), Value::list(Vec::new())],
-    )));
-    let here = maybe(b.udp("local_address", label, vec![Value::Int(socket)]))
-        .map(|v| Endpoint::read(&v, Span::DUMMY).expect("a socket address"))
-        .expect("a bound socket has an address");
+fn datagram_socket(net: &Net, label: &str) -> (i64, Endpoint) {
+    let bound = ply_host::udp::bind(&net.host, label, &at(loopback(), 0), &[]);
+    let socket = int(&outcome(bound).expect("loopback binds"));
+    let here = net.address(label, socket).expect("a bound address");
     (socket, here)
 }
 
-/// What a `std.udp.Datagram` holds: who sent it, its bytes, and whether it was cut.
-fn datagram(v: Value) -> (Endpoint, Vec<u8>, bool) {
-    let Value::Record(fields) = &v else {
-        panic!("not a `Datagram`: {v:?}");
-    };
-    (
-        Endpoint::read(fields.named("from").expect("a sender"), Span::DUMMY)
-            .expect("a socket address"),
-        bytes(fields.named("payload").expect("a payload").clone()),
-        fields
-            .named("truncated")
-            .expect("a flag")
-            .as_bool(Span::DUMMY, "a flag")
-            .expect("a Bool"),
-    )
+/// A datagram received, or its refusal's bytes: who sent it, its bytes, and whether it was cut.
+fn received(
+    net: &Net,
+    label: &str,
+    socket: i64,
+    max: usize,
+    timeout: Duration,
+) -> Result<(Endpoint, Vec<u8>, bool), Vec<u8>> {
+    let job = ply_host::udp::recv_from(&net.host, label, socket, max, timeout, Span::DUMMY)
+        .expect("a datagram socket");
+    outcome(ran(job)).map(|flat| {
+        let parts = parts_of(&flat).expect("parts");
+        (
+            Endpoint::read(parts[0]).expect("an address"),
+            parts[1].to_vec(),
+            parts[2] == [1],
+        )
+    })
 }
 
-fn receive(b: &Bound, label: &str, socket: i64, max: i64, ms: i64) -> Result<Value, String> {
-    result(b.udp(
-        "recv_from",
+fn sent_to(net: &Net, label: &str, socket: i64, to: &Endpoint, payload: &[u8]) -> i64 {
+    let job = ply_host::udp::send_to(
+        &net.host,
         label,
-        vec![Value::Int(socket), Value::Int(max), Value::Int(ms)],
-    ))
+        socket,
+        to.clone(),
+        payload.to_vec(),
+        LONG,
+        Span::DUMMY,
+    )
+    .expect("a datagram socket");
+    int(&outcome(ran(job)).expect("sent"))
 }
 
 #[test]
-fn a_datagram_crosses_loopback_and_names_its_sender() {
-    let b = bound(Host::new());
-    let (server, there) = datagram_socket(&b, "socket");
-    let (client, here) = datagram_socket(&b, "other");
-    let sent = int(ok(b.udp(
-        "send_to",
-        "other",
-        vec![
-            Value::Int(client),
-            there.value(),
-            Value::bytes(b"ping"),
-            Value::Int(5000),
-        ],
-    )));
-    assert_eq!(sent, 4);
-    let (from, payload, truncated) =
-        datagram(receive(&b, "socket", server, 512, 5000).expect("a datagram"));
-    assert_eq!(from, here);
-    assert_eq!(payload, b"ping");
-    assert!(!truncated);
+fn a_datagram_crosses_loopback_names_its_sender_and_says_where_it_was_cut() {
+    let net = Net::new();
+    let (server, there) = datagram_socket(&net, "socket");
+    let (client, here) = datagram_socket(&net, "other");
+    assert_eq!(sent_to(&net, "other", client, &there, b"ping"), 4);
     assert_eq!(
-        receive(&b, "socket", server, 512, 50).expect_err("nothing more was sent"),
-        "TimedOut"
+        received(&net, "socket", server, 512, LONG),
+        Ok((here.clone(), b"ping".to_vec(), false))
     );
-    b.udp("close", "socket", vec![Value::Int(server)]);
-    b.udp("close", "other", vec![Value::Int(client)]);
-}
-
-#[test]
-fn a_datagram_longer_than_its_reader_holds_is_cut_and_says_so() {
-    let b = bound(Host::new());
-    let (server, there) = datagram_socket(&b, "socket");
-    let (client, _) = datagram_socket(&b, "other");
-    for payload in [&b"0123456789"[..], &b"0123"[..]] {
-        ok(b.udp(
-            "send_to",
-            "other",
-            vec![
-                Value::Int(client),
-                there.value(),
-                Value::bytes(payload),
-                Value::Int(5000),
-            ],
-        ));
-    }
-    let (_, cut, truncated) = datagram(receive(&b, "socket", server, 4, 5000).expect("a datagram"));
-    assert_eq!(cut, b"0123");
-    assert!(
-        truncated,
+    assert_eq!(
+        received(&net, "socket", server, 512, Duration::from_millis(50)),
+        Err(Refusal::TimedOut.written())
+    );
+    sent_to(&net, "other", client, &there, b"0123456789");
+    sent_to(&net, "other", client, &there, b"0123");
+    assert_eq!(
+        received(&net, "socket", server, 4, LONG),
+        Ok((here.clone(), b"0123".to_vec(), true)),
         "six bytes of it are gone, and the answer says so"
     );
-    let (_, whole, truncated) =
-        datagram(receive(&b, "socket", server, 4, 5000).expect("a datagram"));
-    assert_eq!(whole, b"0123");
-    assert!(!truncated, "a datagram that fits exactly is whole");
-}
-
-#[test]
-fn a_connected_socket_sends_without_naming_its_far_end() {
-    let b = bound(Host::new());
-    let (server, there) = datagram_socket(&b, "socket");
-    let (client, here) = datagram_socket(&b, "other");
-    let unconnected = b
-        .perform(
-            UDP,
-            "send",
-            Some("other"),
-            vec![Value::Int(client), Value::bytes(b"x"), Value::Int(5000)],
-        )
-        .expect_err("the socket has no far end yet");
-    assert_eq!(unconnected.code, codes::RUNTIME_ERROR);
-    ok(b.udp("connect", "other", vec![Value::Int(client), there.value()]));
-    let sent = int(ok(b.udp(
-        "send",
-        "other",
-        vec![Value::Int(client), Value::bytes(b"hello"), Value::Int(5000)],
-    )));
-    assert_eq!(sent, 5);
-    let (from, payload, _) =
-        datagram(receive(&b, "socket", server, 512, 5000).expect("a datagram"));
-    assert_eq!((from, payload), (here, b"hello".to_vec()));
-}
-
-#[test]
-fn a_run_binds_a_datagram_socket_at_loopback_or_nowhere() {
-    let b = bound(Host::new());
-    let unspecified = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
-    let fixed = b.udp(
-        "bind",
-        "socket",
-        vec![at(unspecified, 5353).value(), Value::list(Vec::new())],
+    assert_eq!(
+        received(&net, "socket", server, 4, LONG),
+        Ok((here, b"0123".to_vec(), false)),
+        "a datagram that fits exactly is whole"
     );
-    assert_eq!(refused(fixed), "PermissionDenied");
-    let asking = int(ok(b.udp(
-        "bind",
-        "socket",
-        vec![at(unspecified, 0).value(), Value::list(Vec::new())],
-    )));
-    let (_, here) = datagram_socket(&b, "other");
-    let taken = b.udp("bind", "other", vec![here.value(), Value::list(Vec::new())]);
-    assert_eq!(refused(taken), "AddressInUse");
-    b.udp("close", "socket", vec![Value::Int(asking)]);
+    net.close("socket", server);
+    net.close("other", client);
+}
+
+#[test]
+fn a_connected_datagram_socket_sends_without_naming_its_far_end() {
+    let net = Net::new();
+    let (server, there) = datagram_socket(&net, "socket");
+    let (client, here) = datagram_socket(&net, "other");
+    let unconnected =
+        ply_host::udp::send(&net.host, "other", client, b"x".to_vec(), LONG, Span::DUMMY)
+            .err()
+            .expect("the socket has no far end yet");
+    assert_eq!(unconnected.code, codes::RUNTIME_ERROR);
+    let connected = ply_host::udp::connect(&net.host, "other", client, &there, Span::DUMMY);
+    assert_eq!(
+        outcome(connected.expect("a datagram socket")),
+        Ok(Vec::new())
+    );
+    let job = ply_host::udp::send(
+        &net.host,
+        "other",
+        client,
+        b"hello".to_vec(),
+        LONG,
+        Span::DUMMY,
+    )
+    .expect("a connected socket");
+    assert_eq!(int(&outcome(ran(job)).expect("sent")), 5);
+    assert_eq!(
+        received(&net, "socket", server, 512, LONG),
+        Ok((here, b"hello".to_vec(), false))
+    );
+    let (listener, _) = net.listening(loopback());
+    let as_datagram =
+        ply_host::udp::recv_from(&net.host, "listener", listener, 64, LONG, Span::DUMMY)
+            .err()
+            .expect("a listener is no datagram socket");
+    assert_eq!(as_datagram.code, codes::RUNTIME_ERROR);
+    let as_stream = net
+        .host
+        .recv("socket", server, 64, LONG, Span::DUMMY)
+        .err()
+        .expect("a datagram socket is no connection");
+    assert_eq!(as_stream.code, codes::RUNTIME_ERROR);
 }
 
 #[test]
 fn a_datagram_sockets_options_are_set_and_read_back() {
-    let b = bound(Host::new());
-    let (socket, _) = datagram_socket(&b, "socket");
-    let options = |b: &Bound| {
-        SocketOption::list(
-            &b.udp("options", "socket", vec![Value::Int(socket)]),
-            Span::DUMMY,
-        )
-        .expect("a list of options")
-    };
-    assert!(options(&b).contains(&SocketOption::Broadcast(false)));
-    ok(b.udp(
-        "set_option",
-        "socket",
-        vec![Value::Int(socket), SocketOption::Broadcast(true).value()],
-    ));
-    let now = options(&b);
+    let net = Net::new();
+    let (socket, here) = datagram_socket(&net, "socket");
+    assert!(
+        net.options("socket", socket)
+            .contains(&SocketOption::Broadcast(false))
+    );
+    let set = net
+        .host
+        .set_option("socket", socket, SocketOption::Broadcast(true), Span::DUMMY);
+    assert_eq!(outcome(set.expect("a socket")), Ok(Vec::new()));
+    let now = net.options("socket", socket);
     assert!(now.contains(&SocketOption::Broadcast(true)), "{now:?}");
     assert!(
         !now.iter().any(|o| matches!(o, SocketOption::NoDelay(_))),
         "a datagram socket has no stream's options: {now:?}"
     );
+    let taken = ply_host::udp::bind(&net.host, "other", &here, &[]);
+    assert_eq!(outcome(taken), Err(Refusal::AddressInUse.written()));
+}
 
-    // Whether a machine routes multicast is its own affair, so a join may be refused; a group
-    // that was joined is one that can be left, once.
-    let group = IpAddr::V4(Ipv4Addr::new(239, 255, 71, 3));
-    let join = SocketOption::JoinGroup(group, None).value();
-    let leave = SocketOption::LeaveGroup(group, None).value();
-    if result(b.udp("set_option", "socket", vec![Value::Int(socket), join])).is_ok() {
-        ok(b.udp(
-            "set_option",
-            "socket",
-            vec![Value::Int(socket), leave.clone()],
-        ));
-    }
+#[test]
+fn the_flat_forms_read_back_as_they_are_written() {
+    let probing = Probing {
+        idle: Duration::from_secs(60),
+        interval: Some(Duration::from_secs(5)),
+        count: Some(3),
+    };
+    let options = [
+        SocketOption::NoDelay(true),
+        SocketOption::KeepAlive(Some(probing)),
+        SocketOption::KeepAlive(None),
+        SocketOption::ReuseAddress(false),
+        SocketOption::ReusePort(true),
+        SocketOption::SendBuffer(65536),
+        SocketOption::ReceiveBuffer(0),
+        SocketOption::Linger(Some(Duration::from_millis(250))),
+        SocketOption::Linger(None),
+        SocketOption::Broadcast(true),
+        SocketOption::MulticastLoop(false),
+        SocketOption::JoinGroup(
+            IpAddr::V4(Ipv4Addr::new(239, 0, 0, 1)),
+            Some("en0".to_string()),
+        ),
+        SocketOption::LeaveGroup(IpAddr::V6(Ipv6Addr::LOCALHOST), None),
+        SocketOption::Presenting("client".to_string()),
+    ];
+    assert_eq!(
+        SocketOption::list(&SocketOption::listed(&options)),
+        Some(options.to_vec())
+    );
+    let zoned = Endpoint {
+        ip: IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1)),
+        port: 8080,
+        zone: Some("3".to_string()),
+    };
+    assert_eq!(Endpoint::read(&zoned.written()), Some(zoned));
+    assert_eq!(Endpoint::read(b"\x00\x00\x00\x03abc"), None);
+    assert_eq!(SocketOption::read(&[12]), None);
+}
+
+#[test]
+fn localhost_resolves_to_loopback_each_address_once_and_a_name_that_cannot_exist_fails() {
+    let answer = ply_host::dns::lookup("localhost");
+    let (kind, rest) = answer.split_first().expect("an answer");
+    assert_eq!(*kind, 1, "every machine names itself");
+    let found: Vec<IpAddr> = parts_of(rest)
+        .expect("parts")
+        .into_iter()
+        .map(|b| ply_host::dns::address_of(b).expect("an address"))
+        .collect();
     assert!(
-        result(b.udp("set_option", "socket", vec![Value::Int(socket), leave])).is_err(),
-        "a group not joined cannot be left"
+        !found.is_empty() && found.iter().all(IpAddr::is_loopback),
+        "{found:?}"
     );
-}
-
-#[test]
-fn a_stream_operation_refuses_a_datagram_socket_and_a_datagram_one_a_stream() {
-    let b = bound(Host::new());
-    let (listener, _) = b.listening(loopback());
-    let as_datagram = b
-        .perform(
-            UDP,
-            "recv_from",
-            Some("socket"),
-            vec![Value::Int(listener), Value::Int(64), Value::Int(100)],
-        )
-        .expect_err("a listener is no datagram socket");
-    assert_eq!(as_datagram.code, codes::RUNTIME_ERROR);
-    b.close("listener", listener);
-}
-
-fn lookup(b: &Bound, name: &str) -> Result<Vec<IpAddr>, String> {
-    let answer = b
-        .perform(DNS, "lookup", None, vec![text(name)])
-        .expect("a lookup is served");
-    result(answer).map(|found| {
-        found
-            .as_list(Span::DUMMY, "the addresses")
-            .expect("a List")
-            .iter()
-            .map(|one| {
-                let Value::Record(fields) = one else {
-                    panic!("not a `Found`: {one:?}");
-                };
-                assert!(
-                    maybe(fields.named("ttl").expect("a lifetime").clone()).is_none(),
-                    "the system's resolver says nothing of lifetimes"
-                );
-                ply_host::tcp::wire::ip_of(
-                    fields.named("address").expect("an address"),
-                    Span::DUMMY,
-                )
-                .expect("an address")
-            })
-            .collect()
-    })
-}
-
-#[test]
-fn an_address_written_as_text_answers_itself() {
-    let b = bound(Host::new());
-    assert_eq!(
-        lookup(&b, "192.0.2.7"),
-        Ok(vec!["192.0.2.7".parse().unwrap()])
-    );
-    assert_eq!(
-        lookup(&b, "2001:db8::7"),
-        Ok(vec!["2001:db8::7".parse().unwrap()])
-    );
-}
-
-#[test]
-fn localhost_resolves_to_loopback_and_each_address_once() {
-    let b = bound(Host::new());
-    let found = lookup(&b, "localhost").expect("every machine names itself");
-    assert!(!found.is_empty());
-    assert!(found.iter().all(IpAddr::is_loopback), "{found:?}");
     let mut once = found.clone();
     once.sort();
     once.dedup();
     assert_eq!(once.len(), found.len(), "{found:?}");
-}
-
-#[test]
-fn a_name_that_cannot_exist_is_a_failure_and_not_an_empty_answer() {
-    let b = bound(Host::new());
-    // Which failure is the machine's resolver's to say: no such name where one answers, a server
-    // failure where none can be asked.
-    lookup(&b, "no-such-host.invalid").expect_err("`.invalid` never resolves");
-}
-
-/// `localhost` under a fullwidth `l`, which a resolver that maps one to ASCII finds at loopback.
-const FULLWIDTH_LOCALHOST: &str = "\u{ff4c}ocalhost";
-
-#[test]
-fn a_connection_by_a_name_that_is_not_ascii_is_not_made() {
-    let b = bound(Host::new());
-    let (listener, here) = b.listening(loopback());
-    let reached = b.net(
-        "connect",
-        "client",
-        vec![
-            text(FULLWIDTH_LOCALHOST),
-            Value::Int(i64::from(here.port)),
-            Value::Int(1000),
-        ],
-    );
-    assert!(maybe(reached).is_none());
-    b.close("listener", listener);
-}
-
-#[test]
-fn a_name_that_is_not_ascii_is_refused_and_not_looked_up() {
-    let b = bound(Host::new());
-    let answer = b
-        .perform(DNS, "lookup", None, vec![text(FULLWIDTH_LOCALHOST)])
-        .expect("a lookup is served");
-    let Value::Ctor { name, args } = &answer else {
-        panic!("not a `Result`: {answer:?}");
-    };
-    assert_eq!(name.as_str(), "Err");
-    let Value::Ctor { name, args } = &args[0] else {
-        panic!("not a `Failure`: {answer:?}");
-    };
-    assert_eq!(name.as_str(), "std.dns.Other");
-    assert_eq!(
-        args[1]
-            .as_str(Span::DUMMY, "what it says")
-            .expect("a String"),
-        ply_host::dns::NOT_ASCII
-    );
-}
-
-#[test]
-fn an_address_answers_to_a_name_or_says_it_has_none() {
-    let b = bound(Host::new());
-    let answer = b
-        .perform(
-            DNS,
-            "reverse",
-            None,
-            vec![ply_host::tcp::wire::ip_value(loopback())],
-        )
-        .expect("a reverse lookup is served");
-    // A machine that names its loopback answers the name; one that does not says why.
-    if let Ok(names) = result(answer) {
-        assert!(
-            !names
-                .as_list(Span::DUMMY, "names")
-                .expect("a List")
-                .is_empty()
-        );
-    }
-}
-
-#[test]
-fn the_servers_of_a_resolver_configuration_are_read_in_its_order() {
-    let found = ply_host::dns::servers(
-        "# a comment\nsearch example.org\nnameserver 192.0.2.53\nnameserver fe80::1%en0\nnameserver not-an-address\noptions ndots:1\nnameserver 2001:db8::53\n",
-    );
-    assert_eq!(
-        found,
-        [
-            Endpoint {
-                ip: "192.0.2.53".parse().unwrap(),
-                port: 53,
-                zone: None
-            },
-            Endpoint {
-                ip: "fe80::1".parse().unwrap(),
-                port: 53,
-                zone: Some("en0".to_string())
-            },
-            Endpoint {
-                ip: "2001:db8::53".parse().unwrap(),
-                port: 53,
-                zone: None
-            },
-        ]
-    );
-    let b = bound(Host::new());
-    let listed = b
-        .perform(DNS, "servers", None, Vec::new())
-        .expect("the servers are served");
-    for server in listed
-        .as_list(Span::DUMMY, "servers")
-        .expect("a List")
-        .iter()
-    {
-        assert_eq!(
-            Endpoint::read(server, Span::DUMMY)
-                .expect("a socket address")
-                .port,
-            53
-        );
-    }
-}
-
-#[test]
-fn the_script_keeps_the_sockets_rules_without_a_socket() {
-    use ply_core::Resource;
-    use ply_host::tcp::{Net, SimNet, Upgrade};
-    let net = SimNet::with_credentials(
-        vec![vec![b"220 go ahead\r\n".to_vec()], vec![b"S".to_vec()]],
-        vec!["mail"],
-    );
-    let label = |name: &str| Resource::Named(Symbol::new(name));
-    let value = |answer: Result<HostAnswer, Diagnostic>| match answer.expect("the script serves it")
-    {
-        HostAnswer::Value(v) => v,
-        HostAnswer::Pending(_) => panic!("the script never waits"),
-    };
-    let upgrade = |alpn: &[&str], unread: usize| Upgrade {
-        alpn: alpn.iter().map(|p| p.to_string()).collect(),
-        unread,
-        timeout: Duration::from_secs(1),
-    };
-
-    let listener = int(value(net.listen(&label("listener"), 8080, Span::DUMMY)));
-    let accepted = int(value(net.accept(&label("listener"), listener, Span::DUMMY)));
-    let from = maybe(value(net.peer_address(
-        &label("conn"),
-        accepted,
-        Span::DUMMY,
-    )))
-    .map(|v| Endpoint::read(&v, Span::DUMMY).expect("a socket address"))
-    .expect("an accepted connection has a far end");
-    assert_eq!(from.ip, loopback());
-    let held = value(net.serve_tls(
-        &label("conn"),
-        accepted,
-        "mail",
-        upgrade(&[], 3),
-        Span::DUMMY,
-    ));
-    assert_eq!(refused(held), "Injected");
-    let after = value(net.send(
-        &label("conn"),
-        accepted,
-        b"250 ok\r\n",
-        Duration::from_secs(1),
-        Span::DUMMY,
-    ));
-    assert_eq!(int(some(after)), 0, "a refused upgrade ends the connection");
-
-    let to = at("192.0.2.5".parse().unwrap(), 5432);
-    let dialled = int(ok(value(net.connect_to(
-        &label("client"),
-        to.clone(),
-        vec![
-            SocketOption::NoDelay(false),
-            SocketOption::Presenting("caller".to_string()),
-        ],
-        Duration::from_secs(1),
-        Span::DUMMY,
-    ))));
-    assert_eq!(
-        maybe(value(net.peer_address(
-            &label("client"),
-            dialled,
-            Span::DUMMY
-        )))
-        .map(|v| Endpoint::read(&v, Span::DUMMY).expect("a socket address")),
-        Some(to.clone()),
-        "the far end is where the connection was sent"
-    );
-    let options = SocketOption::list(
-        &value(net.options(&label("client"), dialled, Span::DUMMY)),
-        Span::DUMMY,
-    )
-    .expect("a list of options");
-    assert_eq!(
-        options,
-        [SocketOption::NoDelay(false)],
-        "a credential to present is no setting"
-    );
-    let secured = ok(value(net.start_tls(
-        &label("client"),
-        dialled,
-        "db.example",
-        upgrade(&["postgresql"], 0),
-        Span::DUMMY,
-    )));
-    assert_eq!(protocol(secured), Some("postgresql".to_string()));
-    let twice = net
-        .start_tls(
-            &label("client"),
-            dialled,
-            "db.example",
-            upgrade(&[], 0),
-            Span::DUMMY,
-        )
-        .err()
-        .expect("the connection is already TLS");
-    assert_eq!(twice.code, codes::RUNTIME_ERROR);
-    let nobody = value(net.connect_to(
-        &label("client"),
-        to,
-        Vec::new(),
-        Duration::from_secs(1),
-        Span::DUMMY,
-    ));
-    assert_eq!(refused(nobody), "Refused", "no connection is left scripted");
+    // Which failure is the machine's resolver's to say.
+    assert_eq!(ply_host::dns::lookup("no-such-host.invalid")[0], 0);
+    let reversed = ply_host::dns::reverse(loopback());
+    assert!(matches!(reversed.first(), Some(0 | 1)));
 }

@@ -6,7 +6,7 @@ mod children;
 pub(crate) use children::{Children, Io, Output, Signal};
 pub use children::{Ended, Finished, Heard};
 
-use crate::pool::{JobOutput, Pool, Pooled, option};
+use crate::pool::{JobOutput, Pool, option};
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
 use ply_core::host::{HostRegistry, MachineId};
@@ -334,10 +334,9 @@ impl ProcessHost {
     pub fn end_children(&self) {
         self.children.end_all();
     }
-}
 
-impl Pooled for ProcessHost {
-    fn pool(&self) -> &Pool {
+    /// The pool its operations wait on, which the terminal's wait on too.
+    pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 }
@@ -491,11 +490,13 @@ struct Operation {
 }
 
 impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
+        // Only an operation that waits is submitted for the run.
+        let run = || crate::registry::run_of(rt);
         // A withheld registration is never resolved, so this is a dispatch bug.
         let Some(host) = &self.host else {
             return Err(Diagnostic::error(
@@ -532,9 +533,13 @@ impl HostHandler for Operation {
             }
             Op::Flush => taken(self.op, host.sink.flush(), span),
             Op::Line => {
-                let pending =
-                    host.pool
-                        .submit(span, "process-line", Op::Line.what(), Box::new(read_line))?;
+                let pending = host.pool.submit(
+                    run()?,
+                    span,
+                    "process-line",
+                    Op::Line.what(),
+                    Box::new(read_line),
+                )?;
                 Ok(HostAnswer::Pending(pending))
             }
             Op::InBytes => {
@@ -543,6 +548,7 @@ impl HostHandler for Operation {
                     return Err(negative_read(max, span));
                 };
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-in-bytes",
                     Op::InBytes.what(),
@@ -576,6 +582,7 @@ impl HostHandler for Operation {
                 let dir = req.args[1].as_str(span, "a working directory")?.to_string();
                 let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-spawn",
                     Op::Spawn.what(),
@@ -620,6 +627,7 @@ impl HostHandler for Operation {
                 let (handle, child) = child_of(host, self.op, req)?;
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-wait",
                     Op::Wait.what(),
@@ -642,6 +650,7 @@ impl HostHandler for Operation {
                 let (_, child) = child_of(host, self.op, req)?;
                 let bytes = Arc::clone(req.args[1].as_bytes(span, "the bytes to write")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-input",
                     Op::Input.what(),
@@ -658,6 +667,7 @@ impl HostHandler for Operation {
                 let (handle, child) = child_of(host, self.op, req)?;
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-output-line",
                     Op::OutputLine.what(),

@@ -1,10 +1,15 @@
-//! The values `std.net`, `std.udp` and `std.dns` exchange with their handlers, each built and read
-//! by the name its Ply declaration gives it.
+//! What `std.net`'s and `std.udp`'s real handlers hand their natives and read back, in flat forms
+//! the handlers' own readers and writers in `std.net` share. A socket address is parts: its
+//! address's bytes, its port in two bytes and its zone, empty for none. An option is its setting's
+//! byte, as `std.net` numbers settings, and then what it sets. A refusal is its kind's byte,
+//! `Refused` 1 to `Other` 11 in declaration order, then `Handshake`'s reason, or `Other`'s code and
+//! words as parts. An answer that may be refused is byte 1 and what it answers, or byte 0 and the
+//! refusal.
 
-use ply_core::{Diagnostic, Fixed, IntTy, Span, Symbol, Value, codes};
+use crate::dns::{address_bytes, address_of};
+use crate::native::{int, int_of, parts, parts_of};
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::time::Duration;
 
 /// A `std.net.Refusal`.
@@ -44,59 +49,31 @@ impl Refusal {
         }
     }
 
-    pub fn value(&self) -> Value {
-        let named = |name: &str, args: Vec<Value>| Value::ctor(format!("std.net.{name}"), args);
+    pub fn written(&self) -> Vec<u8> {
         match self {
-            Refusal::Refused => named("Refused", Vec::new()),
-            Refusal::Unreachable => named("Unreachable", Vec::new()),
-            Refusal::TimedOut => named("TimedOut", Vec::new()),
-            Refusal::Reset => named("Reset", Vec::new()),
-            Refusal::NameNotFound => named("NameNotFound", Vec::new()),
-            Refusal::AddressInUse => named("AddressInUse", Vec::new()),
-            Refusal::PermissionDenied => named("PermissionDenied", Vec::new()),
-            Refusal::Injected => named("Injected", Vec::new()),
-            Refusal::Untrusted => named("Untrusted", Vec::new()),
-            Refusal::Handshake(why) => named("Handshake", vec![Value::str(why)]),
-            Refusal::Other(code, text) => named("Other", vec![Value::Int(*code), Value::str(text)]),
+            Refusal::Refused => vec![1],
+            Refusal::Unreachable => vec![2],
+            Refusal::TimedOut => vec![3],
+            Refusal::Reset => vec![4],
+            Refusal::NameNotFound => vec![5],
+            Refusal::AddressInUse => vec![6],
+            Refusal::PermissionDenied => vec![7],
+            Refusal::Injected => vec![8],
+            Refusal::Untrusted => vec![9],
+            Refusal::Handshake(why) => [&[10u8][..], why.as_bytes()].concat(),
+            Refusal::Other(code, text) => {
+                [&[11u8][..], &parts(&[&int(*code), text.as_bytes()])].concat()
+            }
         }
     }
 }
 
-pub fn ok(value: Value) -> Value {
-    Value::ctor("Ok", vec![value])
-}
-
-pub fn err(refusal: &Refusal) -> Value {
-    Value::ctor("Err", vec![refusal.value()])
-}
-
-pub fn some(value: Value) -> Value {
-    Value::ctor("Some", vec![value])
-}
-
-pub fn none() -> Value {
-    Value::ctor("None", Vec::new())
-}
-
-pub fn option(value: Option<Value>) -> Value {
-    value.map_or_else(none, some)
-}
-
-pub fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    Value::Record(Arc::new(
-        fields
-            .into_iter()
-            .map(|(name, value)| (Symbol::new(name), value))
-            .collect(),
-    ))
-}
-
-/// The prelude's `Duration`, which counts nanoseconds.
-pub fn duration(d: Duration) -> Value {
-    Value::ctor(
-        "Duration",
-        vec![Value::Int(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))],
-    )
+/// `outcome` as an answer that may be refused.
+pub fn answer(outcome: Result<Vec<u8>, Refusal>) -> Vec<u8> {
+    match outcome {
+        Ok(answered) => [&[1u8][..], &answered].concat(),
+        Err(refusal) => [&[0u8][..], &refusal.written()].concat(),
+    }
 }
 
 /// A `std.ip.SocketAddress`: an address, a port, and the zone of a link-local IPv6 address.
@@ -139,116 +116,26 @@ impl Endpoint {
         }
     }
 
-    pub fn value(&self) -> Value {
-        Value::ctor(
-            "std.ip.SocketAddress",
-            vec![
-                ip_value(self.ip),
-                Value::Int(i64::from(self.port)),
-                option(self.zone.as_deref().map(Value::str)),
-            ],
-        )
+    pub fn written(&self) -> Vec<u8> {
+        parts(&[
+            &address_bytes(&self.ip),
+            &self.port.to_be_bytes(),
+            self.zone.as_deref().unwrap_or_default().as_bytes(),
+        ])
     }
 
-    pub fn read(value: &Value, span: Span) -> Result<Endpoint, Diagnostic> {
-        let args = fields_of(value, "std.ip.SocketAddress", 3)
-            .ok_or_else(|| misshapen("a `std.ip.SocketAddress`", span))?;
-        let port = u16::try_from(args[1].as_int(span, "a port")?)
-            .map_err(|_| misshapen("a port", span))?;
-        let zone = match maybe(&args[2]).ok_or_else(|| misshapen("a zone", span))? {
-            Some(zone) => Some(zone.as_str(span, "a zone")?.to_string()),
-            None => None,
+    /// The socket address `flat` writes; `None` for bytes that write none.
+    pub fn read(flat: &[u8]) -> Option<Endpoint> {
+        let [ip, port, zone] = parts_of(flat)?[..] else {
+            return None;
         };
-        Ok(Endpoint {
-            ip: ip_of(&args[0], span)?,
-            port,
-            zone,
+        let zone = std::str::from_utf8(zone).ok()?;
+        Some(Endpoint {
+            ip: address_of(ip)?,
+            port: u16::from_be_bytes(port.try_into().ok()?),
+            zone: (!zone.is_empty()).then(|| zone.to_string()),
         })
     }
-}
-
-/// A `std.ip.Ip`.
-pub fn ip_value(ip: IpAddr) -> Value {
-    match ip {
-        IpAddr::V4(four) => Value::ctor(
-            "std.ip.V4",
-            vec![Value::ctor(
-                "std.ip.Ipv4",
-                vec![Value::Int(i64::from(u32::from(four)))],
-            )],
-        ),
-        IpAddr::V6(six) => Value::ctor(
-            "std.ip.V6",
-            vec![Value::ctor(
-                "std.ip.Ipv6",
-                vec![Value::Fixed(Fixed::new(IntTy::U128, u128::from(six)))],
-            )],
-        ),
-    }
-}
-
-pub fn ip_of(value: &Value, span: Span) -> Result<IpAddr, Diagnostic> {
-    let wrong = || misshapen("a `std.ip.Ip`", span);
-    if let Some(four) = fields_of(value, "std.ip.V4", 1) {
-        let bits = fields_of(&four[0], "std.ip.Ipv4", 1).ok_or_else(wrong)?[0]
-            .as_int(span, "an IPv4 address")?;
-        let bits = u32::try_from(bits).map_err(|_| wrong())?;
-        return Ok(IpAddr::V4(Ipv4Addr::from(bits)));
-    }
-    let six = fields_of(value, "std.ip.V6", 1).ok_or_else(wrong)?;
-    let bits = fields_of(&six[0], "std.ip.Ipv6", 1).ok_or_else(wrong)?[0]
-        .as_fixed(span, "an IPv6 address")?;
-    Ok(IpAddr::V6(Ipv6Addr::from(bits.bits())))
-}
-
-/// The arguments of a constructor named `name` that holds `arity` of them.
-pub fn fields_of<'a>(value: &'a Value, name: &str, arity: usize) -> Option<&'a [Value]> {
-    match value {
-        Value::Ctor { name: found, args } if found.as_str() == name && args.len() == arity => {
-            Some(args.as_slice())
-        }
-        _ => None,
-    }
-}
-
-/// An `Option`'s content; `None` for a value that is no `Option`.
-pub fn maybe(value: &Value) -> Option<Option<&Value>> {
-    if let Some(inside) = fields_of(value, "Some", 1) {
-        return Some(Some(&inside[0]));
-    }
-    fields_of(value, "None", 0).map(|_| None)
-}
-
-/// A `Duration` that is not negative.
-pub fn duration_of(value: &Value, span: Span) -> Result<Duration, Diagnostic> {
-    let nanos = fields_of(value, "Duration", 1).ok_or_else(|| misshapen("a `Duration`", span))?[0]
-        .as_int(span, "a duration")?;
-    u64::try_from(nanos).map(Duration::from_nanos).map_err(|_| {
-        Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("a socket was given a duration of {nanos} nanoseconds"),
-        )
-        .primary(span, "a duration here is zero or more")
-    })
-}
-
-pub fn strings_of(value: &Value, span: Span, what: &str) -> Result<Vec<String>, Diagnostic> {
-    value
-        .as_list(span, what)?
-        .iter()
-        .map(|item| item.as_str(span, what).map(str::to_string))
-        .collect()
-}
-
-/// Inference checks an argument's type, so one of another shape was never checked.
-#[cold]
-pub fn misshapen(what: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("a host operation was handed something that is not {what}"),
-    )
-    .primary(span, "this perform reached the host handler")
-    .note("the declaration and the handler disagree about a type's shape; this is Ply's fault")
 }
 
 /// The interface a scope id names, as a zone is written; the number where it names none.
@@ -321,66 +208,100 @@ pub struct Probing {
 }
 
 impl SocketOption {
-    pub fn read(value: &Value, span: Span) -> Result<SocketOption, Diagnostic> {
-        let wrong = || misshapen("a `std.net.SocketOption`", span);
-        let Value::Ctor { name, args } = value else {
-            return Err(wrong());
+    /// The option `flat` writes; `None` for bytes that write none.
+    pub fn read(flat: &[u8]) -> Option<SocketOption> {
+        let (setting, rest) = flat.split_first()?;
+        let flag = || match rest {
+            [0] => Some(false),
+            [1] => Some(true),
+            _ => None,
         };
-        let group = |args: &[Value]| -> Result<(IpAddr, Option<String>), Diagnostic> {
-            let [group, interface] = args else {
-                return Err(wrong());
+        let size = || usize::try_from(int_of(rest)?).ok();
+        let group = || -> Option<(IpAddr, Option<String>)> {
+            let [group, interface] = parts_of(rest)?[..] else {
+                return None;
             };
-            let interface = match maybe(interface).ok_or_else(wrong)? {
-                Some(name) => Some(name.as_str(span, "an interface")?.to_string()),
-                None => None,
-            };
-            Ok((ip_of(group, span)?, interface))
+            let interface = std::str::from_utf8(interface).ok()?;
+            Some((
+                address_of(group)?,
+                (!interface.is_empty()).then(|| interface.to_string()),
+            ))
         };
-        match name.as_str() {
-            "std.net.JoinGroup" => {
-                let (address, interface) = group(args)?;
-                return Ok(SocketOption::JoinGroup(address, interface));
-            }
-            "std.net.LeaveGroup" => {
-                let (address, interface) = group(args)?;
-                return Ok(SocketOption::LeaveGroup(address, interface));
-            }
-            _ => {}
-        }
-        let [arg] = args.as_slice() else {
-            return Err(wrong());
-        };
-        let size = |arg: &Value| -> Result<usize, Diagnostic> {
-            let bytes = arg.as_int(span, "a buffer size")?;
-            usize::try_from(bytes).map_err(|_| {
-                Diagnostic::error(
-                    codes::RUNTIME_ERROR,
-                    format!("a socket buffer was sized at {bytes} bytes"),
-                )
-                .primary(span, "a buffer holds zero or more bytes")
-            })
-        };
-        Ok(match name.as_str() {
-            "std.net.NoDelay" => SocketOption::NoDelay(arg.as_bool(span, "a flag")?),
-            "std.net.KeepAlive" => SocketOption::KeepAlive(match maybe(arg).ok_or_else(wrong)? {
-                Some(probing) => Some(Probing::read(probing, span)?),
-                None => None,
+        Some(match setting {
+            0 => SocketOption::NoDelay(flag()?),
+            1 => SocketOption::KeepAlive(match rest.split_first()? {
+                (0, []) => None,
+                (1, probing) => Some(Probing::read(probing)?),
+                _ => return None,
             }),
-            "std.net.ReuseAddress" => SocketOption::ReuseAddress(arg.as_bool(span, "a flag")?),
-            "std.net.ReusePort" => SocketOption::ReusePort(arg.as_bool(span, "a flag")?),
-            "std.net.SendBuffer" => SocketOption::SendBuffer(size(arg)?),
-            "std.net.ReceiveBuffer" => SocketOption::ReceiveBuffer(size(arg)?),
-            "std.net.Linger" => SocketOption::Linger(match maybe(arg).ok_or_else(wrong)? {
-                Some(d) => Some(duration_of(d, span)?),
-                None => None,
+            2 => SocketOption::ReuseAddress(flag()?),
+            3 => SocketOption::ReusePort(flag()?),
+            4 => SocketOption::SendBuffer(size()?),
+            5 => SocketOption::ReceiveBuffer(size()?),
+            6 => SocketOption::Linger(match rest.split_first()? {
+                (0, []) => None,
+                (1, nanos) => Some(duration_of(nanos)?),
+                _ => return None,
             }),
-            "std.net.Broadcast" => SocketOption::Broadcast(arg.as_bool(span, "a flag")?),
-            "std.net.MulticastLoop" => SocketOption::MulticastLoop(arg.as_bool(span, "a flag")?),
-            "std.net.Presenting" => {
-                SocketOption::Presenting(arg.as_str(span, "a credential")?.to_string())
+            7 => SocketOption::Broadcast(flag()?),
+            8 => SocketOption::MulticastLoop(flag()?),
+            9 => {
+                let (address, interface) = group()?;
+                SocketOption::JoinGroup(address, interface)
             }
-            _ => return Err(wrong()),
+            10 => {
+                let (address, interface) = group()?;
+                SocketOption::LeaveGroup(address, interface)
+            }
+            11 => SocketOption::Presenting(std::str::from_utf8(rest).ok()?.to_string()),
+            _ => return None,
         })
+    }
+
+    /// The options `flat` writes as parts, one each.
+    pub fn list(flat: &[u8]) -> Option<Vec<SocketOption>> {
+        parts_of(flat)?
+            .into_iter()
+            .map(SocketOption::read)
+            .collect()
+    }
+
+    pub fn written(&self) -> Vec<u8> {
+        let flag = |setting: u8, on: bool| vec![setting, u8::from(on)];
+        let size = |setting: u8, n: usize| {
+            [&[setting][..], &int(i64::try_from(n).unwrap_or(i64::MAX))].concat()
+        };
+        let group = |setting: u8, address: &IpAddr, interface: &Option<String>| {
+            let named = interface.as_deref().unwrap_or_default();
+            [
+                &[setting][..],
+                &parts(&[&address_bytes(address), named.as_bytes()]),
+            ]
+            .concat()
+        };
+        match self {
+            SocketOption::NoDelay(on) => flag(0, *on),
+            SocketOption::KeepAlive(None) => vec![1, 0],
+            SocketOption::KeepAlive(Some(probing)) => [&[1u8, 1][..], &probing.written()].concat(),
+            SocketOption::ReuseAddress(on) => flag(2, *on),
+            SocketOption::ReusePort(on) => flag(3, *on),
+            SocketOption::SendBuffer(n) => size(4, *n),
+            SocketOption::ReceiveBuffer(n) => size(5, *n),
+            SocketOption::Linger(None) => vec![6, 0],
+            SocketOption::Linger(Some(d)) => [&[6u8, 1][..], &nanos(*d)].concat(),
+            SocketOption::Broadcast(on) => flag(7, *on),
+            SocketOption::MulticastLoop(on) => flag(8, *on),
+            SocketOption::JoinGroup(address, interface) => group(9, address, interface),
+            SocketOption::LeaveGroup(address, interface) => group(10, address, interface),
+            SocketOption::Presenting(name) => [&[11u8][..], name.as_bytes()].concat(),
+        }
+    }
+
+    /// `options` as parts, one each.
+    pub fn listed(options: &[SocketOption]) -> Vec<u8> {
+        let written: Vec<Vec<u8>> = options.iter().map(SocketOption::written).collect();
+        let each: Vec<&[u8]> = written.iter().map(Vec::as_slice).collect();
+        parts(&each)
     }
 
     /// Whether `options` reads the option back: a group joined or left, and a credential to
@@ -393,84 +314,48 @@ impl SocketOption {
                 | SocketOption::Presenting(_)
         )
     }
-
-    pub fn list(value: &Value, span: Span) -> Result<Vec<SocketOption>, Diagnostic> {
-        value
-            .as_list(span, "socket options")?
-            .iter()
-            .map(|option| SocketOption::read(option, span))
-            .collect()
-    }
-
-    pub fn value(&self) -> Value {
-        let named = |name: &str, arg: Value| Value::ctor(format!("std.net.{name}"), vec![arg]);
-        let size = |n: &usize| Value::Int(i64::try_from(*n).unwrap_or(i64::MAX));
-        match self {
-            SocketOption::NoDelay(on) => named("NoDelay", Value::Bool(*on)),
-            SocketOption::KeepAlive(probing) => {
-                named("KeepAlive", option(probing.map(|p| p.value())))
-            }
-            SocketOption::ReuseAddress(on) => named("ReuseAddress", Value::Bool(*on)),
-            SocketOption::ReusePort(on) => named("ReusePort", Value::Bool(*on)),
-            SocketOption::SendBuffer(n) => named("SendBuffer", size(n)),
-            SocketOption::ReceiveBuffer(n) => named("ReceiveBuffer", size(n)),
-            SocketOption::Linger(d) => named("Linger", option(d.map(duration))),
-            SocketOption::Broadcast(on) => named("Broadcast", Value::Bool(*on)),
-            SocketOption::MulticastLoop(on) => named("MulticastLoop", Value::Bool(*on)),
-            SocketOption::JoinGroup(group, interface) => membership("JoinGroup", group, interface),
-            SocketOption::LeaveGroup(group, interface) => {
-                membership("LeaveGroup", group, interface)
-            }
-            SocketOption::Presenting(name) => named("Presenting", Value::str(name)),
-        }
-    }
-}
-
-fn membership(name: &str, group: &IpAddr, interface: &Option<String>) -> Value {
-    Value::ctor(
-        format!("std.net.{name}"),
-        vec![
-            ip_value(*group),
-            option(interface.as_deref().map(Value::str)),
-        ],
-    )
 }
 
 impl Probing {
-    fn read(value: &Value, span: Span) -> Result<Probing, Diagnostic> {
-        let wrong = || misshapen("a `std.net.Probing`", span);
-        let Value::Record(fields) = value else {
-            return Err(wrong());
+    /// Parts: the idle wait, then the interval and the count, each empty for none.
+    fn read(flat: &[u8]) -> Option<Probing> {
+        let [idle, interval, count] = parts_of(flat)?[..] else {
+            return None;
         };
-        let field = |name: &str| fields.named(name).ok_or_else(wrong);
-        let interval = match maybe(field("interval")?).ok_or_else(wrong)? {
-            Some(d) => Some(duration_of(d, span)?),
-            None => None,
-        };
-        let count = match maybe(field("count")?).ok_or_else(wrong)? {
-            Some(n) => Some(
-                u32::try_from(n.as_int(span, "a probe count")?)
-                    .map_err(|_| misshapen("a probe count", span))?,
-            ),
-            None => None,
-        };
-        Ok(Probing {
-            idle: duration_of(field("idle")?, span)?,
-            interval,
-            count,
+        Some(Probing {
+            idle: duration_of(idle)?,
+            interval: if interval.is_empty() {
+                None
+            } else {
+                Some(duration_of(interval)?)
+            },
+            count: if count.is_empty() {
+                None
+            } else {
+                Some(u32::try_from(int_of(count)?).ok()?)
+            },
         })
     }
 
-    pub fn value(&self) -> Value {
-        record([
-            (
-                "count",
-                option(self.count.map(|n| Value::Int(i64::from(n)))),
-            ),
-            ("idle", duration(self.idle)),
-            ("interval", option(self.interval.map(duration))),
+    fn written(&self) -> Vec<u8> {
+        let interval = self.interval.map(nanos);
+        let count = self.count.map(|n| int(i64::from(n)));
+        parts(&[
+            &nanos(self.idle),
+            interval.as_ref().map_or(&[][..], |n| &n[..]),
+            count.as_ref().map_or(&[][..], |n| &n[..]),
         ])
     }
+}
+
+/// A duration as its nanoseconds' eight bytes.
+fn nanos(d: Duration) -> [u8; 8] {
+    int(i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))
+}
+
+/// The duration of nanoseconds eight bytes count, which is not negative.
+fn duration_of(bytes: &[u8]) -> Option<Duration> {
+    u64::try_from(int_of(bytes)?).ok().map(Duration::from_nanos)
 }
 
 /// A `std.net.PeerCredentials`: who holds the other end of a Unix socket.
@@ -482,16 +367,13 @@ pub struct Credentials {
 }
 
 impl Credentials {
-    pub fn value(&self) -> Value {
-        record([
-            ("group", Value::Int(self.group)),
-            ("process", option(self.process.map(Value::Int))),
-            ("user", Value::Int(self.user)),
+    /// Parts: the user, the group, and the process, empty where the platform does not say.
+    pub fn written(&self) -> Vec<u8> {
+        let process = self.process.map(int);
+        parts(&[
+            &int(self.user),
+            &int(self.group),
+            process.as_ref().map_or(&[][..], |n| &n[..]),
         ])
     }
-}
-
-/// A `std.net.Secured`.
-pub fn secured(protocol: Option<String>) -> Value {
-    record([("protocol", option(protocol.map(Value::str)))])
 }

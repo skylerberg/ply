@@ -1,10 +1,8 @@
 use ply_core::host::MachineId;
 use ply_core::{
-    Diagnostic, EffectAtom, HostAnswer, HostRequest, HostRuntime, Mode, Resource, Span, Symbol,
-    Value, codes,
+    Diagnostic, EffectAtom, HostAnswer, HostRequest, Mode, Resource, Span, Symbol, Value, codes,
 };
 use ply_host::fs::*;
-use ply_host::pool::Pooled;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -213,23 +211,6 @@ fn the_lock_operations_are_declared_and_confined_like_every_other() {
 
 // --- Appending, ranged reads and syncing ------------------------------------
 
-struct Nothing;
-
-impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        Vec::new()
-    }
-    fn park(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
-        Ok(Value::Unit)
-    }
-}
-
 fn rooted(at: &std::path::Path) -> Arc<FsHost> {
     let mut roots = Roots::new();
     roots.bind("cache", at, span()).expect("the root binds");
@@ -243,8 +224,9 @@ fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Valu
         .iter()
         .find(|(d, _)| d.op.as_str() == op.name())
         .expect("every operation is registered");
+    let runtime = ply_host::Host::new().runtime();
     let answer = handler.call(
-        &Nothing,
+        &*runtime,
         &HostRequest {
             atom: EffectAtom::new(
                 Symbol::new(EFFECT),
@@ -260,7 +242,7 @@ fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Valu
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => fs.pool().block_on(pending),
+        HostAnswer::Pending(pending) => runtime.block_on(pending),
         HostAnswer::Value(v) => Ok(v),
     }
 }

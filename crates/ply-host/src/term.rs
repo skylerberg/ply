@@ -2,7 +2,7 @@
 //! mode, and what is typed at it. The terminal is the run's own process's, so the operations are
 //! served where `process`'s own are, and wait on that host's pool.
 
-use crate::pool::{JobOutput, Pooled};
+use crate::pool::JobOutput;
 use crate::process::ProcessHost;
 use crate::stdio::{self, Mode, Standard};
 use ply_core::host::HostRegistry;
@@ -87,11 +87,13 @@ struct Operation {
 }
 
 impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
+        // Only an operation that waits is submitted for the run.
+        let run = || crate::registry::run_of(rt);
         // A withheld registration is never resolved, so this is a dispatch bug.
         let Some(host) = &self.host else {
             return Err(Diagnostic::error(
@@ -130,6 +132,7 @@ impl HostHandler for Operation {
                 };
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
                 let pending = host.pool().submit(
+                    run()?,
                     span,
                     "term-input",
                     Op::Input.what(),
@@ -142,6 +145,7 @@ impl HostHandler for Operation {
             }
             Op::SecretLine => {
                 let pending = host.pool().submit(
+                    run()?,
                     span,
                     "term-secret-line",
                     Op::SecretLine.what(),

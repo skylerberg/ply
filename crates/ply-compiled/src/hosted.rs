@@ -7,9 +7,10 @@
 //! ticket, which `job_wait` reads the job's bytes by: the running task waits in a production
 //! region while the region's other tasks run, and the thread waits outside one.
 //!
-//! A native answering structured text writes one of three flat forms. Told: byte 1 and then the
-//! text, or byte 0 and then why the system said nothing. Found: byte 1 and then the text, or the
-//! one byte 0. Parts: each part behind its count, four bytes, most significant first.
+//! A native answering structured data writes it in the flat forms of `ply_host::native`.
+
+mod dns;
+mod sockets;
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
@@ -19,6 +20,7 @@ use crate::rt::{Ctx, lent};
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Value, codes};
 use ply_host::jobs::{self, Work};
+use ply_host::native::{found, parts, told};
 use ply_host::password;
 
 /// The effect every native here performs, under its program-wide name (`std.internal.native`).
@@ -38,6 +40,12 @@ const READS: Asking = Asking {
     linearity: Linearity::Repeatable,
 };
 
+/// Changing what is outside the program, which asking again would change again.
+const WRITES: Asking = Asking {
+    determinism: Determinism::Nondeterministic,
+    linearity: Linearity::AtMostOnce,
+};
+
 /// Computing a function of what the native is handed, off the program's thread.
 const COMPUTES: Asking = Asking {
     determinism: Determinism::Deterministic,
@@ -46,7 +54,7 @@ const COMPUTES: Asking = Asking {
 
 /// Every native here, under the name its module declares it by.
 pub fn natives() -> Vec<MachineNative> {
-    vec![
+    let mut natives = vec![
         machine_native("job_wait", rt_job_wait as unsafe extern "C" fn(_, _) -> _),
         machine_native(
             "certgen_issue",
@@ -106,7 +114,10 @@ pub fn natives() -> Vec<MachineNative> {
             "os_pointer_bits",
             rt_os_pointer_bits as unsafe extern "C" fn(_) -> _,
         ),
-    ]
+    ];
+    natives.extend(dns::natives());
+    natives.extend(sockets::natives());
+    natives
 }
 
 impl Ctx {
@@ -141,8 +152,9 @@ impl Ctx {
         true
     }
 
-    /// The ticket of `job` on `work`'s pool, which `native` asked for as `what`, a diagnostic names
-    /// it by; 0, with the run failed, where no thread could be had for it.
+    /// The ticket of `job` on `work`'s pool, the job this context's run's, which `native` asked for
+    /// as `what`, a diagnostic names it by; 0, with the run failed, where no thread could be had
+    /// for it.
     fn submitted(
         &mut self,
         native: &'static str,
@@ -151,7 +163,10 @@ impl Ctx {
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
         let span = self.site();
-        match jobs::submit(work, span, native, what, job) {
+        let runtime = self.host_runtime();
+        let submitted = ply_host::registry::run_of(&*runtime)
+            .and_then(|run| jobs::submit(work, run, span, native, what, job));
+        match submitted {
             Ok(pending) => I64(pending.token as i64),
             Err(d) => {
                 self.fail(d);
@@ -177,32 +192,6 @@ impl Ctx {
             }
         }
     }
-}
-
-/// `text` told: byte 1 and its bytes, or byte 0 and the system's error.
-fn told(text: std::io::Result<String>) -> Vec<u8> {
-    match text {
-        Ok(text) => [&[1u8][..], text.as_bytes()].concat(),
-        Err(e) => [&[0u8][..], e.to_string().as_bytes()].concat(),
-    }
-}
-
-/// `text` found: byte 1 and its bytes, or byte 0 alone.
-fn found(text: Option<String>) -> Vec<u8> {
-    match text {
-        Some(text) => [&[1u8][..], text.as_bytes()].concat(),
-        None => vec![0],
-    }
-}
-
-/// `parts` one after another, each behind its count.
-fn parts(parts: &[&[u8]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for part in parts {
-        out.extend((part.len() as u32).to_be_bytes());
-        out.extend(*part);
-    }
-    out
 }
 
 /// What `answer` answers, where the native `native` may ask the host as `asking` says; `refused`
@@ -292,13 +281,26 @@ pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
     })
 }
 
+/// The run's value of `key`: a plain one, or, where `secret`, the one only `config.secret` reads.
+/// `None` where the run was granted no such key.
+fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
+    let runtime = c.host_runtime();
+    let config = ply_host::registry::facilities_of(&*runtime)?.configuration();
+    if secret {
+        config.plaintext(key)
+    } else {
+        config.get(key)
+    }
+    .map(str::to_string)
+}
+
 /// The run's plain value of the key at `p`, found.
 pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     asked(ctx, "config_get", READS, TakenBytes(0), |c| {
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return TakenBytes(0);
         };
-        let value = c.host_runtime().configured(key, false);
+        let value = configured(c, key, false);
         c.given(found(value))
     })
 }
@@ -309,7 +311,7 @@ pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return I64(0);
         };
-        I64(i64::from(c.host_runtime().configured(key, true).is_some()))
+        I64(i64::from(configured(c, key, true).is_some()))
     })
 }
 
@@ -319,7 +321,7 @@ pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> Sec
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return SecretHandle::of(0);
         };
-        let plain = c.host_runtime().configured(key, true).unwrap_or_default();
+        let plain = configured(c, key, true).unwrap_or_default();
         SecretHandle::of(c.heap.bridge(Value::secret_text(&plain)))
     })
 }

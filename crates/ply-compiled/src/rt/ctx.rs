@@ -86,8 +86,9 @@ pub struct Ctx {
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_core::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
-    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
-    pub(crate) runtime_factory: Option<ply_core::RuntimeFactory>,
+    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of:
+    /// the bound run's, or one over a host of this context's own.
+    pub(crate) runtime_factory: ply_core::RuntimeFactory,
     pub(crate) declared: Option<ply_core::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
@@ -207,7 +208,7 @@ impl Ctx {
             entry: 0,
             binding: Arc::new(ply_core::HostBinding::hermetic()),
             runtime: None,
-            runtime_factory: None,
+            runtime_factory: ply_host::registry::unbound(),
             declared: None,
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
@@ -308,7 +309,7 @@ impl Ctx {
         b.arm_tick();
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
-        b.runtime_factory = self.runtime_factory.clone();
+        b.runtime_factory = Arc::clone(&self.runtime_factory);
         b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
         b.id = self.id;
@@ -387,8 +388,7 @@ impl Ctx {
     /// not answer themselves, where the block's site knows it; a block that does not is kept from any
     /// handler at all.
     pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
-        // A reactor this thread holds and no factory could make again belongs to this thread alone.
-        if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
+        if !self.sims.is_empty() {
             return false;
         }
         self.frames_in_reach()
@@ -622,21 +622,17 @@ impl Ctx {
     ) {
         self.binding = binding;
         self.runtime = runtime;
-        self.runtime_factory = factory;
+        if let Some(factory) = factory {
+            self.runtime_factory = factory;
+        }
     }
 
-    /// The reactor this context waits on, made on first need on a `parallel` branch's thread: the
-    /// run's, or, for a run no host facility serves, one over the natives' jobs alone.
+    /// The reactor this context waits on, made on first need on a `parallel` branch's thread.
     pub(crate) fn host_runtime(&mut self) -> Rc<dyn ply_core::HostRuntime> {
         if let Some(runtime) = &self.runtime {
             return Rc::clone(runtime);
         }
-        // Kept as the factory too, so a `parallel` branch makes its own as a bound run's does.
-        let factory = Arc::clone(
-            self.runtime_factory
-                .get_or_insert_with(|| Arc::new(ply_host::jobs::runtime)),
-        );
-        let runtime = factory();
+        let runtime = (self.runtime_factory)();
         self.runtime = Some(Rc::clone(&runtime));
         runtime
     }

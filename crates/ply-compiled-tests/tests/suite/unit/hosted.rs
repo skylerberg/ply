@@ -5,6 +5,7 @@ use ply_compiled::native::{Addr, I64};
 use ply_compiled::rt::{Ctx, rt_taken};
 use ply_core::Span;
 use ply_host::jobs::{self, Work};
+use std::sync::Arc;
 
 /// The bytes a native left taken, `n` of them, copied out as emitted code copies them.
 fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
@@ -32,15 +33,32 @@ fn a_native_that_asks_the_machine_leaves_the_run_having_read_it() {
     assert_eq!(at_most_once, 0);
 }
 
+/// The ticket of `job`, submitted for `ctx`'s run as a native submits one.
+fn submitted(
+    ctx: &mut Ctx,
+    work: Work,
+    what: &'static str,
+    job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
+) -> I64 {
+    let runtime = ply_host::Host::new().runtime();
+    let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
+    ctx.set_host(
+        Arc::new(ply_core::HostBinding::hermetic()),
+        Some(runtime),
+        None,
+    );
+    let ticket = jobs::submit(work, &run, Span::DUMMY, "test", what, job).expect("a thread is had");
+    I64(ticket.token as i64)
+}
+
 /// Outside a production region the thread waits for a job, and is handed its bytes.
 #[test]
 fn a_jobs_bytes_come_back_through_job_wait() {
     let mut ctx = context();
-    let ticket = jobs::submit(Work::Computing, Span::DUMMY, "test", "a test job", || {
+    let ticket = submitted(&mut ctx, Work::Computing, "a test job", || {
         Ok(b"computed".to_vec())
-    })
-    .expect("a thread is had");
-    let n = unsafe { rt_job_wait(&mut ctx, I64(ticket.token as i64)) };
+    });
+    let n = unsafe { rt_job_wait(&mut ctx, ticket) };
     assert!(ctx.take_failure().is_none());
     assert_eq!(taken(&mut ctx, n.0), b"computed");
 }
@@ -49,11 +67,10 @@ fn a_jobs_bytes_come_back_through_job_wait() {
 #[test]
 fn a_failed_job_fails_the_run_that_waits_on_it() {
     let mut ctx = context();
-    let ticket = jobs::submit(Work::Waiting, Span::DUMMY, "test", "`kdf.scrypt`", || {
+    let ticket = submitted(&mut ctx, Work::Waiting, "`kdf.scrypt`", || {
         Err("no memory to be had".to_string())
-    })
-    .expect("a thread is had");
-    unsafe { rt_job_wait(&mut ctx, I64(ticket.token as i64)) };
+    });
+    unsafe { rt_job_wait(&mut ctx, ticket) };
     let failed = ctx.take_failure().expect("the run failed");
     assert!(
         failed.message.contains("`kdf.scrypt`"),

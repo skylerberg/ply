@@ -157,11 +157,10 @@ pub trait HostRuntime {
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
-    /// The run's configuration value of `key`, which a real handler's native reads: a plain one,
-    /// or, where `secret`, the one only `config.secret` reads. `None` where the run was granted no
-    /// such key, as a runtime holding no configuration grants none.
-    fn configured(&self, key: &str, secret: bool) -> Option<String> {
-        let _ = (key, secret);
+    /// What the natives of the real handlers reach the machine through: the run's sockets, its
+    /// configuration and the rest the host made, which only the crate that made them names. `None`
+    /// for a runtime that holds none.
+    fn facilities(&self) -> Option<&dyn std::any::Any> {
         None
     }
 

@@ -1,56 +1,17 @@
-//! The `dns` effect: the system's resolver, asked off the machine's thread. The resolver has its
-//! own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s `resolve`
-//! cancels the task that asked) leaves the question on its thread until the system answers it.
+//! The system's resolver, which `std.dns`'s real handler asks off the program's thread. The resolver
+//! has its own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s
+//! `resolve` cancels the task that asked) leaves the question on its thread until the system
+//! answers it.
+//!
+//! An answer is flat: byte 1 and then each address's bytes or each name as parts, or byte 0, the
+//! failure's kind (`NoSuchName` 1, `NoData` 2, `ServerFailure` 3, `Other` 4), and for `Other` its
+//! code and the resolver's words as parts.
 
-use crate::pool::JobOutput;
-use crate::tcp::TcpHost;
-use crate::tcp::wire::{self, Endpoint};
-use ply_core::host::HostRegistry;
-use ply_core::{
-    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, Span, Symbol, Value, codes,
-};
+use crate::native::{int, parts};
 use std::net::IpAddr;
-use std::sync::Arc;
-
-pub const MODULE: &str = "std.dns";
-
-pub const EFFECT: &str = "std.dns.dns";
 
 /// Where the system's resolver keeps the servers it asks.
-const RESOLVER_CONFIGURATION: &str = "/etc/resolv.conf";
-
-/// The port a server named without one answers on.
-const PORT: u16 = 53;
-
-operations! {
-    what "dns";
-    path "dns";
-    Lookup = "lookup" / 1,
-    Reverse = "reverse" / 1,
-    Servers = "servers" / 0,
-}
-
-/// What a name that is not ASCII is refused with: an internationalized name is looked up by its
-/// A-labels, and which those are is not the resolver's to decide.
-pub const NOT_ASCII: &str =
-    "a name is ASCII: an internationalized name is looked up by its A-labels";
-
-impl Op {
-    pub fn declaration(self) -> HostOp {
-        HostOp {
-            effect: Symbol::new(EFFECT),
-            op: Symbol::new(self.name()),
-            resource: HostResource::Any,
-            determinism: Determinism::Nondeterministic,
-            // A question changes nothing it asks about.
-            linearity: Linearity::Repeatable,
-            blocking: matches!(self, Op::Lookup | Op::Reverse),
-            secrets: false,
-            path: self.path(),
-        }
-    }
-}
+pub const RESOLVER_CONFIGURATION: &str = "/etc/resolv.conf";
 
 /// A `std.dns.Failure` the system's resolver can answer with: a deadline is its caller's.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -62,140 +23,56 @@ pub enum Failure {
 }
 
 impl Failure {
-    fn value(&self) -> Value {
-        let named = |name: &str, args: Vec<Value>| Value::ctor(format!("std.dns.{name}"), args);
+    fn written(&self) -> Vec<u8> {
         match self {
-            Failure::NoSuchName => named("NoSuchName", Vec::new()),
-            Failure::NoData => named("NoData", Vec::new()),
-            Failure::ServerFailure => named("ServerFailure", Vec::new()),
-            Failure::Other(code, text) => named("Other", vec![Value::Int(*code), Value::str(text)]),
-        }
-    }
-}
-
-/// One value of each `std.dns` type the handlers build, under that type's name.
-pub fn shapes() -> Vec<(&'static str, Value)> {
-    let mut shapes: Vec<(&'static str, Value)> = [
-        Failure::NoSuchName,
-        Failure::NoData,
-        Failure::ServerFailure,
-        Failure::Other(2, "the resolver's own words".to_string()),
-    ]
-    .iter()
-    .map(|failure| ("std.dns.Failure", failure.value()))
-    .collect();
-    shapes.push(("std.dns.Found", found(IpAddr::from([192, 0, 2, 1]))));
-    shapes
-}
-
-fn failed(failure: &Failure) -> Value {
-    Value::ctor("Err", vec![failure.value()])
-}
-
-/// A `std.dns.Found` of an address the system's resolver gave, which says nothing of how long it
-/// holds.
-fn found(address: IpAddr) -> Value {
-    wire::record([("address", wire::ip_value(address)), ("ttl", wire::none())])
-}
-
-pub fn register(registry: &mut HostRegistry, net: Arc<TcpHost>) {
-    for op in Op::ALL {
-        registry.register(
-            op.declaration(),
-            Arc::new(Operation {
-                op,
-                net: Arc::clone(&net),
-            }),
-        );
-    }
-}
-
-/// On the socket host's pool, so one runtime waits on a lookup as it waits on a connect.
-struct Operation {
-    op: Op,
-    net: Arc<TcpHost>,
-}
-
-impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        let span = req.span;
-        if req.args.len() != self.op.arity() {
-            return Err(arity(self.op, req.args.len(), span));
-        }
-        match self.op {
-            Op::Lookup => {
-                let name = req.args[0].as_str(span, "a name")?.to_string();
-                self.net.waiting(span, "lookup", self.op.what(), move || {
-                    let answer = match name.parse::<IpAddr>() {
-                        Ok(address) => Ok(vec![address]),
-                        Err(_) if !name.is_ascii() => Err(Failure::Other(0, NOT_ASCII.to_string())),
-                        Err(_) => system::addresses(&name),
-                    };
-                    JobOutput::built(move || match answer {
-                        Ok(addresses) => {
-                            wire::ok(Value::list(addresses.into_iter().map(found).collect()))
-                        }
-                        Err(failure) => failed(&failure),
-                    })
-                })
+            Failure::NoSuchName => vec![0, 1],
+            Failure::NoData => vec![0, 2],
+            Failure::ServerFailure => vec![0, 3],
+            Failure::Other(code, text) => {
+                [&[0u8, 4][..], &parts(&[&int(*code), text.as_bytes()])].concat()
             }
-            Op::Reverse => {
-                let address = wire::ip_of(&req.args[0], span)?;
-                self.net.waiting(span, "reverse", self.op.what(), move || {
-                    let answer = system::names(address);
-                    JobOutput::built(move || match answer {
-                        Ok(names) => {
-                            wire::ok(Value::list(names.into_iter().map(Value::str).collect()))
-                        }
-                        Err(failure) => failed(&failure),
-                    })
-                })
-            }
-            Op::Servers => Ok(HostAnswer::Value(Value::list(
-                std::fs::read_to_string(RESOLVER_CONFIGURATION)
-                    .map(|text| servers(&text))
-                    .unwrap_or_default()
-                    .iter()
-                    .map(Endpoint::value)
-                    .collect(),
-            ))),
         }
     }
 }
 
-/// The servers a `resolv.conf` names, in its order, each at the port a server answers on.
-pub fn servers(configuration: &str) -> Vec<Endpoint> {
-    configuration
-        .lines()
-        .filter_map(|line| {
-            let mut words = line.split_whitespace();
-            (words.next() == Some("nameserver")).then(|| words.next())?
-        })
-        .filter_map(|server| {
-            let (address, zone) = match server.split_once('%') {
-                Some((address, zone)) => (address, Some(zone.to_string())),
-                None => (server, None),
-            };
-            Some(Endpoint {
-                ip: address.parse().ok()?,
-                port: PORT,
-                zone,
-            })
-        })
-        .collect()
+/// The addresses the system's resolver gives `name`, each once and in its order.
+pub fn lookup(name: &str) -> Vec<u8> {
+    match system::addresses(name) {
+        Ok(found) => {
+            let bytes: Vec<Vec<u8>> = found.iter().map(address_bytes).collect();
+            let each: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
+            [&[1u8][..], &parts(&each)].concat()
+        }
+        Err(failure) => failure.written(),
+    }
 }
 
-#[cold]
-fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "{} was performed with {got} arguments and takes {}",
-            op.what(),
-            op.arity()
-        ),
-    )
-    .primary(span, "this perform reached the host handler")
+/// The names the system's resolver says `address` answers to.
+pub fn reverse(address: IpAddr) -> Vec<u8> {
+    match system::names(address) {
+        Ok(names) => {
+            let each: Vec<&[u8]> = names.iter().map(|n| n.as_bytes()).collect();
+            [&[1u8][..], &parts(&each)].concat()
+        }
+        Err(failure) => failure.written(),
+    }
+}
+
+/// The address four or sixteen bytes are, in network order.
+pub fn address_of(bytes: &[u8]) -> Option<IpAddr> {
+    match bytes.len() {
+        4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),
+        16 => Some(IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)),
+        _ => None,
+    }
+}
+
+/// `address` in network order.
+pub fn address_bytes(address: &IpAddr) -> Vec<u8> {
+    match address {
+        IpAddr::V4(four) => four.octets().to_vec(),
+        IpAddr::V6(six) => six.octets().to_vec(),
+    }
 }
 
 /// The system's resolver, through the C library, which is where its failures have codes.

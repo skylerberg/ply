@@ -1,6 +1,6 @@
 //! The filesystem, as operations confined to roots the run names.
 
-use crate::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Pooled, option, record};
+use crate::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, option, record};
 use ply_core::crypto::Framing;
 use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
@@ -318,10 +318,9 @@ impl FsHost {
     pub fn roots(&self) -> &Roots {
         &self.roots
     }
-}
 
-impl Pooled for FsHost {
-    fn pool(&self) -> &Pool {
+    /// The pool its operations wait on, which a database under its roots waits on too.
+    pub(crate) fn pool(&self) -> &Pool {
         &self.pool
     }
 }
@@ -351,11 +350,12 @@ struct Operation {
 }
 
 impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
+        let asking = crate::registry::run_of(rt)?;
         // The resolved atom's resource, never one the handler re-derives.
         let at = &req.atom.resource;
         let root = match self.fs.roots.get(at) {
@@ -366,6 +366,7 @@ impl HostHandler for Operation {
             let descriptors = Arc::clone(&self.fs.descriptors);
             let descriptor = req.args[0].as_int(span, "a file descriptor")?;
             let pending = self.fs.pool.submit(
+                asking,
                 span,
                 self.op.label(),
                 self.op.what(),
@@ -436,6 +437,7 @@ impl HostHandler for Operation {
         let machine = req.machine;
         let to_write = matches!(second, Second::Opening(how) if how != Opening::Read);
         let pending = self.fs.pool.submit(
+            asking,
             span,
             op.label(),
             op.what(),

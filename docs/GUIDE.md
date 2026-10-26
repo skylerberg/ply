@@ -3387,7 +3387,8 @@ module of it, each one whole.
 An effect whose module declares its real handler (§6.10) never reaches the
 boundary: every root whose row names it runs under that handler, with or
 without `--host` and whatever else the flags say, as the operations of
-`std.os`, `std.certgen`, `std.config` and `std.password`'s `kdf` do. A native
+`std.os`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`,
+`std.net` and `std.udp` do. A native
 such a handler calls refuses inside a `simulate` region and in a test the search
 re-runs, as a host operation does (`E0425`). One that would hold the program's
 thread, as a hash does, hands its work to the runtime's threads: as many hashes
@@ -3399,7 +3400,11 @@ binding it ran under (§8.2). The environment is open to a program by default,
 and its configuration is what the run's flags resolve: `config.get` and
 `config.secret` answer from the sources `--host` reads (`--set`, `--config`,
 the environment and the schema's defaults), and a run granted none, as one
-without `--host` is, answers `None` for every key.
+without `--host` is, answers `None` for every key. The network is open to a
+program by default too: a run with or without `--host` looks names up, connects
+and listens alike, each socket in a table of the run's own, under the label its
+operation names. The credentials a TLS listener or upgrade names are the ones
+`--tls` gives the run, so one given none holds none (`E0429`).
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound

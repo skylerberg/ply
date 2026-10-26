@@ -55,22 +55,6 @@ const DETERMINISTIC: &Rows = &[];
 const REPEATABLE: &Rows = &[
     // A wait changes nothing outside the program: crossed twice, it waits twice.
     ("clock", &["now", "sleep"]),
-    // A question to a resolver changes nothing it asks about.
-    ("std.dns.dns", &["lookup", "reverse", "servers"]),
-    // A socket's port and its two addresses are fixed while it is open, and so is who holds its
-    // far end; its options are read as they stand, and reading them sets none.
-    (
-        "std.net.net",
-        &[
-            "local_address",
-            "local_port",
-            "options",
-            "peer_address",
-            "peer_certificate",
-            "peer_credentials",
-            "protocol",
-        ],
-    ),
     // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
     ("std.process.process", &["args", "bound"]),
     // Every draw is independent of every other, so a run may take as many as it likes.
@@ -79,7 +63,6 @@ const REPEATABLE: &Rows = &[
     // Asking what a stream is, or how large the terminal is, changes neither.
     ("std.term.term", &["is_terminal", "size"]),
     ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
-    ("std.udp.udp", &["local_address", "options"]),
     (
         "task",
         &[
@@ -105,32 +88,6 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
     assert_eq!(
         operations(|op| op.linearity == Linearity::Repeatable),
         written(REPEATABLE)
-    );
-}
-
-/// A credential crosses the boundary to these and to nothing else: the password hashes, each
-/// answering a hash that is one-way in it, and the two writes that put one where it is meant to
-/// go, a file a key is written down in and a connection a login is sent on, each answering only
-/// whether it wrote.
-#[test]
-fn only_the_password_hashes_and_the_two_secret_writes_declare_that_they_may_receive_a_credential() {
-    let mut claiming: Vec<&str> = registry()
-        .ops()
-        .filter(|op| op.secrets)
-        .map(|op| op.path)
-        .collect();
-    // Ascending, so a family's handlers are its own lines wherever it is registered.
-    claiming.sort_unstable();
-    assert_eq!(
-        claiming,
-        [
-            "ply_host::fs::write_secret",
-            "ply_host::password::argon2",
-            "ply_host::password::bcrypt",
-            "ply_host::password::pbkdf2",
-            "ply_host::password::scrypt",
-            "ply_host::tcp::send_secret",
-        ]
     );
 }
 

@@ -67,7 +67,7 @@ fn an_unsupplied_secret_answers_none_from_both() {
 
 /// The natives read the run's snapshot through its runtime, and a run granted none reads nothing.
 #[test]
-fn a_hosts_runtime_answers_from_its_snapshot_and_a_bare_one_answers_nothing() {
+fn a_hosts_runtime_lends_its_snapshot_and_an_unbound_one_lends_none() {
     let granted = snapshot(
         &[
             ("SERVICE_API_KEY", "s3cret", true),
@@ -78,17 +78,15 @@ fn a_hosts_runtime_answers_from_its_snapshot_and_a_bare_one_answers_nothing() {
     let runtime = ply_host::Host::new()
         .configured(Arc::new(granted))
         .runtime();
-    assert_eq!(
-        runtime.configured("SERVICE_REGION", false).as_deref(),
-        Some("eu")
-    );
-    assert_eq!(runtime.configured("SERVICE_REGION", true), None);
-    assert_eq!(
-        runtime.configured("SERVICE_API_KEY", true).as_deref(),
-        Some("s3cret")
-    );
-    assert_eq!(runtime.configured("SERVICE_API_KEY", false), None);
-    let bare = ply_host::jobs::runtime();
-    assert_eq!(bare.configured("SERVICE_REGION", false), None);
-    assert_eq!(bare.configured("SERVICE_API_KEY", true), None);
+    let lent = ply_host::registry::facilities_of(&*runtime)
+        .expect("a host made it")
+        .configuration();
+    assert_eq!(lent.get("SERVICE_REGION"), Some("eu"));
+    assert_eq!(lent.plaintext("SERVICE_API_KEY"), Some("s3cret"));
+    let unbound = ply_host::registry::unbound()();
+    let lent = ply_host::registry::facilities_of(&*unbound)
+        .expect("a host made it")
+        .configuration();
+    assert_eq!(lent.get("PATH"), None);
+    assert_eq!(lent.plaintext("SERVICE_API_KEY"), None);
 }

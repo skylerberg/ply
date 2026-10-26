@@ -21,6 +21,7 @@
 //! under `simulate` is `sim.seed()`, so a run over many seeds is a run over many networks.
 //! Nothing waits in it: a receive with nothing to answer is a deadline.
 
+import std.internal.native (native, job_wait, found, parts, in_parts, int_of)
 import std.ip
 import std.ip (Ip, SocketAddress, V4, V6, ip)
 import std.list
@@ -150,6 +151,20 @@ fn deadline(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
     )
   } else { () }
 
+/// `max`, refused where a receive asks for no bytes: a datagram longer than the bytes asked for is
+/// cut to them and answered `truncated`, so asking for none would lose every one.
+fn asked_for(max: Int) -> Int / {abort.raise} =
+  if max <= 0 { panic("`udp.recv_from` was asked for " ++ max.to_string() ++ " bytes") }
+  else { max }
+
+/// Whether a run may bind at `at`: loopback, or no address and no port for a socket that asks and
+/// hears answers. One that anything on a network could send to at a known port is not a run's to
+/// open.
+fn bindable(at: SocketAddress) -> Bool = {
+  let address = ip::socket_ip(at);
+  ip::is_loopback(address) || (ip::is_unspecified(address) && ip::socket_port(at) == 0)
+}
+
 fn socket_of(u: MemUdp, label: String, id: Int) -> MemSocket / {abort.raise} =
   match u.sockets.get(id) {
     Some(s) -> if s.label == label { s } else {
@@ -174,9 +189,7 @@ pub fn mem_bind(
 ) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
   let address = ip::socket_ip(at);
   let asked = ip::socket_port(at);
-  if !(ip::is_loopback(address) || (ip::is_unspecified(address) && asked == 0)) {
-    { udp: u, answer: Err(PermissionDenied) }
-  } else {
+  if !bindable(at) { { udp: u, answer: Err(PermissionDenied) } } else {
     let here = ip::socket_at(address, if asked == 0 { u.port } else { asked });
     let taken = u.sockets.fold(false, |found: Bool, _handle: Int, s: MemSocket|
       found || s.at == here);
@@ -356,26 +369,25 @@ pub fn mem_recv_from(
   timeout_ms: Int,
 ) -> Stepped<Result<Datagram, Refusal>> / {abort.raise} = {
   deadline("recv_from", timeout_ms);
-  if max <= 0 { panic("`udp.recv_from` was asked for " ++ max.to_string() ++ " bytes") } else {
-    let s = socket_of(u, label, socket);
-    let wanted = s.waiting.filter(|d: Datagram|
-      match s.peer { Some(peer) -> d.from == peer, None -> true });
-    if s.refused { { udp: with_socket(u, socket, { ..s, refused: false }), answer: Err(Refused) } }
-    else {
-      match wanted {
-        [] -> { udp: with_socket(u, socket, { ..s, waiting: [] }), answer: Err(TimedOut) },
-        [next, ..rest] -> {
-          let cut = next.payload.len() > max;
-          {
-            udp: with_socket(u, socket, { ..s, waiting: rest }),
-            answer: Ok({
-              from: next.from,
-              payload: if cut { next.payload.slice(0, max) } else { next.payload },
-              truncated: cut,
-            }),
-          }
-        },
-      }
+  let most = asked_for(max);
+  let s = socket_of(u, label, socket);
+  let wanted = s.waiting.filter(|d: Datagram|
+    match s.peer { Some(peer) -> d.from == peer, None -> true });
+  if s.refused { { udp: with_socket(u, socket, { ..s, refused: false }), answer: Err(Refused) } }
+  else {
+    match wanted {
+      [] -> { udp: with_socket(u, socket, { ..s, waiting: [] }), answer: Err(TimedOut) },
+      [next, ..rest] -> {
+        let cut = next.payload.len() > most;
+        {
+          udp: with_socket(u, socket, { ..s, waiting: rest }),
+          answer: Ok({
+            from: next.from,
+            payload: if cut { next.payload.slice(0, most) } else { next.payload },
+            truncated: cut,
+          }),
+        }
+      },
     }
   }
 }
@@ -466,6 +478,104 @@ pub fn on_mem<a | e>(
     udp.local_address[*label](socket) -> Some(socket_of(t, label, socket).at),
     udp.options[*label](socket) -> socket_of(t, label, socket).options,
     return value -> { value: value, udp: t },
+  }
+
+// --- The real handler -------------------------------------------------------
+
+host for udp by served
+
+/// `go` with every datagram socket opened on the machine, in the run's one table of sockets under
+/// the label its clause binds, and every operation that waits waiting in the asking task.
+fn served<a | e>(
+  go: () -> a / {udp.read[*], udp.write[*] | e},
+) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    udp.bind[*label](at, options) -> if !bindable(at) { Err(PermissionDenied) } else {
+      net::refused_or(
+        udp_bind(label, net::address_written(at), net::options_written(options)),
+        int_of,
+      )
+    },
+    udp.connect[*label](socket, to) ->
+      net::refused_or(udp_connect(label, socket, net::address_written(to)), |_: Bytes| ()),
+    udp.send_to[*label](socket, to, payload, timeout_ms) -> {
+      deadline("send_to", timeout_ms);
+      let asked = udp_send_to(label, socket, net::address_written(to), payload, timeout_ms);
+      net::refused_or(job_wait(asked), int_of)
+    },
+    udp.send[*label](socket, payload, timeout_ms) -> {
+      deadline("send", timeout_ms);
+      net::refused_or(job_wait(udp_send(label, socket, payload, timeout_ms)), int_of)
+    },
+    udp.recv_from[*label](socket, max, timeout_ms) -> {
+      deadline("recv_from", timeout_ms);
+      net::refused_or(
+        job_wait(udp_recv_from(label, socket, asked_for(max), timeout_ms)),
+        datagram_read,
+      )
+    },
+    udp.set_option[*label](socket, option) ->
+      net::refused_or(udp_set_option(label, socket, net::option_written(option)), |_: Bytes| ()),
+    udp.close[*label](socket) -> udp_close(label, socket),
+    udp.local_address[*label](socket) -> match found(udp_local_address(label, socket)) {
+      Some(flat) -> Some(net::address_read(flat)),
+      None -> None,
+    },
+    udp.options[*label](socket) -> net::options_read(udp_options(label, socket)),
+  }
+
+/// A datagram socket bound at the address written, with the options written set before it binds.
+extern fn udp_bind(label: String, at: Bytes, options: Bytes) -> Bytes / {native.read}
+
+/// A datagram socket's far end fixed at the address written.
+extern fn udp_connect(label: String, socket: Int, to: Bytes) -> Bytes / {native.read}
+
+/// The ticket of `payload` sent as one datagram to the address written.
+extern fn udp_send_to(
+  label: String,
+  socket: Int,
+  to: Bytes,
+  payload: Bytes,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of `payload` sent as one datagram to the far end `connect` fixed.
+extern fn udp_send(
+  label: String,
+  socket: Int,
+  payload: Bytes,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of the next datagram, at most `max` bytes of it.
+extern fn udp_recv_from(
+  label: String,
+  socket: Int,
+  max: Int,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// Sets the option written on a datagram socket.
+extern fn udp_set_option(label: String, socket: Int, option: Bytes) -> Bytes / {native.read}
+
+/// Closes a datagram socket.
+extern fn udp_close(label: String, socket: Int) -> Unit / {native.read}
+
+/// The address a datagram socket is bound to, found.
+extern fn udp_local_address(label: String, socket: Int) -> Bytes / {native.read}
+
+/// Each option a datagram socket has, as parts.
+extern fn udp_options(label: String, socket: Int) -> Bytes / {native.read}
+
+/// A datagram as the host's natives write one: parts of the address it came from, its payload,
+/// and byte 1 where it was cut short.
+fn datagram_read(flat: Bytes) -> Datagram / {abort.raise} =
+  match parts(flat) {
+    [from, payload, truncated] ->
+      { from: net::address_read(from), payload: payload, truncated: truncated == b"\x01" },
+    _ -> panic("a datagram native wrote no datagram"),
   }
 
 // --- Tests ------------------------------------------------------------------
@@ -711,4 +821,19 @@ test "the twin refuses what the host refuses, in its words" {
     }).value
   };
   assert_eq(closed, Err("there is no open socket with handle 1"))
+}
+
+test "a datagram reads back as the host's natives write it, and only loopback or an asking socket binds" {
+  let from = ip::read_socket("127.0.0.1:5353");
+  assert_eq(datagram_read(in_parts([net::address_written(from), b"pong", b"\x01"])), {
+    from: from,
+    payload: b"pong",
+    truncated: true,
+  });
+  assert_eq(datagram_read(in_parts([net::address_written(from), b"", b"\x00"])).truncated, false);
+  assert_eq(
+    ["127.0.0.1:53", "[::1]:0", "0.0.0.0:0", "0.0.0.0:53", "192.0.2.1:0"].map(|at: String|
+      bindable(ip::read_socket(at))),
+    [true, true, true, false, false],
+  )
 }
