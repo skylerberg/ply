@@ -350,7 +350,7 @@ helpers! {
     rt_release_drain();
     rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
-    rt_pending_raised(string: *const PlyType) -> Handed;
+    rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
     rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
     rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
     rt_with_cleanup(

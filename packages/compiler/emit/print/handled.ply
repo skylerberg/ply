@@ -35,8 +35,9 @@ pub fn handle_opened(
   }
 
 /// What opens a `handle` that answers through evidence objects over instance `i`: its answer
-/// declared, the fuel it stands at and each clause's record set in the instance, and the block its
-/// body runs in.
+/// declared, the fuel it stands at, the descriptor of what it answers where a clause may stop it,
+/// and each clause's record set in the instance, and the block its body runs in. A record's place
+/// is the clause's, counted from 1, as word 1 of the instance names a raise clause.
 fn instance_opened(
   p: Place,
   pr: Printing,
@@ -62,7 +63,11 @@ fn instance_opened(
     inst(0),
     b"ctx->fuel",
   );
-  let recorded = range(0, site.clauses.len()).fold(fueled, |q: Printing, k: Int|
+  let described = match i.answer {
+    Some(d) -> set(fueled, inst(3), operand(pr, args, d)),
+    None -> fueled,
+  };
+  let recorded = range(0, site.clauses.len()).fold(described, |q: Printing, k: Int|
     match ((site.clauses.at(k), i.records.at(k))) {
       (Some(c), Some(at)) ->
         set(
@@ -72,7 +77,7 @@ fn instance_opened(
             operand(pr, args, i.operand),
           ),
           inst(at + 2),
-          ascii_of_int(k),
+          ascii_of_int(k + 1),
         ),
       _ -> q,
     });
@@ -189,7 +194,8 @@ pub fn handle_closed(
 /// block, then its landing. An unwind to this instance answers what its clause left, or runs the
 /// raise clause it names on the arguments it left; a raise pending where an `abort.raise` clause
 /// is runs that clause on its message; a body that answered goes through the return clause. Then
-/// the variables are let go by their types, and any other failure leaves by `p.leave`.
+/// what the instance holds of an unwind another failure replaced is let go, then the variables by
+/// their types, and any other failure leaves by `p.leave`.
 fn instance_landed(
   p: Place,
   pr: Printing,
@@ -212,10 +218,8 @@ fn instance_landed(
       Some(c) -> if c.mode != 3 { acc } else {
         acc.push(
           Bytes::concat_all([
-            b"  else if (",
-            inst(1),
-            b" == ",
-            ascii_of_int(k),
+            b"  else if (ply_held == ",
+            ascii_of_int(k + 1),
             b") ",
             ans,
             b" = ply_uniform(ctx, ",
@@ -228,18 +232,21 @@ fn instance_landed(
       },
       None -> acc,
     });
+  // What the unwind carries is the clause's now, so the instance holds nothing past it.
   let unwound = Bytes::concat_all([
     b"if (ctx->failed == PLY_FAILED_TARGET && ctx->target == ",
     operand(pr, args, i.operand),
     b") {\n",
     pad(d + 1),
-    b"ctx->failed = 0; ctx->fuel = ",
+    b"Word ply_held = ",
+    inst(1),
+    b"; ",
+    inst(1),
+    b" = 0; ctx->failed = 0; ctx->fuel = ",
     inst(0),
     b";\n",
     pad(d + 1),
-    b"if (",
-    inst(1),
-    b" == -1) ",
+    b"if (ply_held == -1) ",
     ans,
     b" = ",
     inst(2),
@@ -248,6 +255,7 @@ fn instance_landed(
     pad(d),
     b"}",
   ]);
+  // A pending raise gives back the calls it unwound as a raise to the instance does.
   let pending = match i.pending {
     None -> b"",
     Some(k) -> match site.clauses.at(k) {
@@ -255,9 +263,13 @@ fn instance_landed(
         Bytes::concat_all([
           b" else if (ctx->failed == PLY_FAILED_PENDING) {\n",
           pad(d + 1),
+          b"ctx->fuel = ",
+          inst(0),
+          b";\n",
+          pad(d + 1),
           b"Word m[2] = { rt_pending_raised_p(ctx, ",
           match c.string { Some(s) -> operand(pr, args, s), None -> b"0" },
-          b"), 0 };\n",
+          b", 0), 0 };\n",
           pad(d + 1),
           b"if (!ctx->failed) ",
           ans,
@@ -283,8 +295,20 @@ fn instance_landed(
         b");",
       ]),
   };
+  // What an unwind left here that another replaced, or that leaves past it, is let go.
+  let answered = line(
+    line(landed, d, Bytes::concat_all([unwound, pending, returned])),
+    d,
+    Bytes::concat_all([
+      b"if (",
+      inst(1),
+      b") ply_held_let_go(ctx, (Word *)(intptr_t)",
+      operand(pr, args, i.operand),
+      b");",
+    ]),
+  );
   let released = range(0, i.count).fold(
-    vars_unlinked(p, line(landed, d, Bytes::concat_all([unwound, pending, returned])), inst(0), i),
+    vars_unlinked(p, answered, inst(0), i),
     |q: Printing, j: Int| {
       let at = i.vars + 2 * j;
       line(
@@ -440,15 +464,14 @@ pub fn effect_op(
                   ]),
                 ),
               Forwarding(f) -> {
-                let from = |k: Int|
-                  Bytes::concat_all([
-                    b"((const Word *)(intptr_t)",
-                    operand(pr, args, f.operand),
-                    b")[",
-                    ascii_of_int(k),
-                    b"]",
-                  ]);
-                acc.push(from(1 + 2 * f.op)).push(from(2 + 2 * f.op))
+                let slot = Bytes::concat_all([
+                  b"ply_slot(",
+                  operand(pr, args, f.operand),
+                  b", ",
+                  ascii_of_int(f.op),
+                  b")",
+                ]);
+                acc.push(slot.concat(b"[0]")).push(slot.concat(b"[1]"))
               },
             }),
         ),

@@ -173,17 +173,14 @@ pub unsafe extern "C" fn rt_dispatch(
 pub type OpEntry =
     unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
 
-/// The most operations one effect may declare: the frame bridge has a slot for each.
-pub const BRIDGE_OPS: usize = 256;
-
-/// The evidence object whose every slot hands the perform to [`rt_dispatch`], which searches the
-/// frames: what code that holds no word for an effect performs it through. Laid out as every
-/// evidence object is: its flags, then an entry and its environment per operation, in the order
-/// the effect declares them.
+/// The evidence object that hands every perform to [`rt_dispatch`], which searches the frames: what
+/// code that holds no word for an effect performs it through. Laid out as an evidence object is:
+/// its flags, then an entry and its environment per operation, or, with the flags set as here, one
+/// slot that answers every operation, which reads the operation from its descriptor.
 #[repr(C)]
 pub struct Bridge {
     pub flags: i64,
-    pub slots: [Slot; BRIDGE_OPS],
+    pub slot: Slot,
 }
 
 /// An operation's slot in an evidence object.
@@ -196,11 +193,11 @@ pub struct Slot {
 
 /// The one [`Bridge`].
 pub static BRIDGE: Bridge = Bridge {
-    flags: 0,
-    slots: [Slot {
+    flags: 1,
+    slot: Slot {
         entry: bridged,
         env: 0,
-    }; BRIDGE_OPS],
+    },
 };
 
 /// [`BRIDGE`]'s word.
@@ -496,8 +493,14 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
 
 /// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays
 /// it out, the entry no longer failed: for compiled code to raise it through the word that answers
-/// it. 0 with the entry failed as it was where nothing is pending.
-pub unsafe extern "C" fn rt_pending_raised(ctx: *mut Ctx, string: *const PlyType) -> Handed {
+/// it. Where that word's slot is the frame bridge's (`bridged` not 0), the raise goes on from here
+/// as the one it is, its diagnostic kept: to a frame that answers it, or pending again, and this
+/// answers 0 with the entry failed. 0 with the entry failed as it was where nothing is pending.
+pub unsafe extern "C" fn rt_pending_raised(
+    ctx: *mut Ctx,
+    string: *const PlyType,
+    bridged: I64,
+) -> Handed {
     let c = unsafe { &mut *ctx };
     if c.failed != FAILED_PENDING {
         return Handed::of(0);
@@ -506,7 +509,14 @@ pub unsafe extern "C" fn rt_pending_raised(ctx: *mut Ctx, string: *const PlyType
         return Handed::of(0);
     };
     c.failed = 0;
-    c.diagnostic = None;
+    let diagnostic = c.diagnostic.take();
+    if bridged.0 != 0 {
+        let d = diagnostic.unwrap_or_else(|| {
+            Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
+        });
+        c.raise(d, message);
+        return Handed::of(0);
+    }
     let message = Value::str(message);
     lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
 }

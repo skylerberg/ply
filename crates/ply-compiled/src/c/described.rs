@@ -62,7 +62,6 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("closure.descriptor", heap::CLOSURE_CODE),
         ("failed.target", crate::rt::FAILED_TARGET as usize),
         ("failed.pending", crate::rt::FAILED_PENDING as usize),
-        ("bridge.ops", crate::rt::BRIDGE_OPS),
     ]);
     out
 }

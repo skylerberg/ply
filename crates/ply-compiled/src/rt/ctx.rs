@@ -44,7 +44,7 @@ pub struct Ctx {
     pub entering_desc: Word,
     pub entering_words: Word,
     /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
-    /// test reads what its entries performed, a cost mark is open or a region runs.
+    /// test reads what its entries performed, a cost mark is open or a seeded region runs.
     pub recording: i64,
     /// The evidence object of every effect that hands each operation to the frame protocol
     /// ([`BRIDGE`]), for code that holds no word answering one.
@@ -322,10 +322,11 @@ impl Ctx {
         b
     }
 
-    /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now.
+    /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
+    /// its entries, a cost mark, or a seeded region's steps. A production region reads none.
     pub(crate) fn rearm_recording(&mut self) {
-        self.recording =
-            i64::from(self.traced || !self.cost_marks.is_empty() || !self.sims.is_empty());
+        let seeded = self.sims.iter().any(|sim| !sim.is_production());
+        self.recording = i64::from(self.traced || !self.cost_marks.is_empty() || seeded);
     }
 
     /// Whoever runs this context's entries reads what they perform, or stops reading it.

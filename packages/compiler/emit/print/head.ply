@@ -212,17 +212,21 @@ fn head_part() -> Bytes / {abort.raise} =
   ])
 
 /// What performs and `handle`s enter evidence objects through. An object is a flags word, then an
-/// entry and its environment per operation of its effect; `ply_perform` calls operation `k`'s with
-/// the operation's `op#`, its mode, the resource and the array of the arguments' words, which has
-/// a word to spare past them. A clause's slot has the clause's record in its `handle`'s instance as
-/// its environment: the clause's closure, the instance and the clause's place. `ply_answers` answers
-/// the perform with what the clause answers; `ply_resumes` hands the clause a continuation in the
-/// spare word, which records what it is resumed with, and a clause that did not resume unwinds to
-/// its instance with what it answered; `ply_raises` leaves the raise's arguments in the instance and
-/// unwinds to it, whose landing runs the clause. A perform a clause answers is recorded where the
-/// context arms recording; the runtime records no raise. `ply_instance_each` is the `each` of the
-/// frame record an instance holds its variables in: the place of its first and their count, then
-/// the instance. `ply_pending_raised` raises a raise left pending through word `w`.
+/// entry and its environment per operation of its effect, or, where the flags are set, one that
+/// answers every operation, as the frame bridge does: `ply_slot` is operation `k`'s. `ply_perform`
+/// calls its entry with the operation's `op#`, its mode, the resource and the array of the
+/// arguments' words, which has a word to spare past them. A clause's slot has the clause's record in
+/// its `handle`'s instance as its environment: the clause's closure, the instance and the clause's
+/// place, counted from 1. `ply_answers` answers the perform with what the clause answers;
+/// `ply_resumes` hands the clause a continuation in the spare word, which records what it is
+/// resumed with, and a clause that did not resume unwinds to its instance with what it answered;
+/// `ply_raises` leaves the raise's arguments in the instance and unwinds to it, whose landing runs
+/// the clause. Either first lets go, by `ply_held_let_go`, of what an unwind it replaces left in the
+/// instance. A perform a clause answers is recorded where the context arms recording; the runtime
+/// records no raise. `ply_instance_each` is the `each` of the frame record an instance holds its
+/// variables in: the place of its first and their count, then the instance. `ply_pending_raised`
+/// raises a raise left pending through word `w`, which through the frame bridge is the runtime's
+/// to raise again as the raise it is.
 fn entries_defined() -> Bytes =
   Bytes::concat_all([
     b"#define PLY_FAILED_TARGET ",
@@ -231,9 +235,24 @@ fn entries_defined() -> Bytes =
     ascii_of_int(failed_pending()),
     b"\n",
     b"typedef Word (*PlyEntry)(PlyCtx *, Word, Word, Word, Word, Word);\n",
-    b"static inline Word ply_perform(PlyCtx *ctx, Word w, int64_t k, Word op, Word mode, Word res, Word args) {\n",
+    b"static inline const Word *ply_slot(Word w, int64_t k) {\n",
     b"  const Word *o = (const Word *)(intptr_t)w;\n",
-    b"  return ((PlyEntry)(intptr_t)o[1 + 2 * k])(ctx, o[2 + 2 * k], op, mode, res, args);\n",
+    b"  return o + 1 + 2 * (o[0] ? 0 : k);\n",
+    b"}\n",
+    b"static inline Word ply_perform(PlyCtx *ctx, Word w, int64_t k, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *s = ply_slot(w, k);\n",
+    b"  return ((PlyEntry)(intptr_t)s[0])(ctx, s[1], op, mode, res, args);\n",
+    b"}\n",
+    b"static void ply_held_let_go(PlyCtx *ctx, Word *in) {\n",
+    b"  Word held = in[1];\n",
+    b"  in[1] = 0;\n",
+    b"  if (held == -1) ((const PlyType *)(intptr_t)in[3])->dec(ctx, in[2]);\n",
+    b"  else if (held > 0) {\n",
+    b"    const PlyOp *o = (const PlyOp *)(intptr_t)in[2];\n",
+    b"    for (int64_t i = 0; i < o->params_len; i++) o->params[i]->dec(ctx, in[",
+    ascii_of_int(raised_at()),
+    b" + i]);\n",
+    b"  }\n",
     b"}\n",
     b"static inline Word ply_uniform(PlyCtx *ctx, Word f, const Word *args) {\n",
     b"  return ((const PlyFnDesc *)(intptr_t)ply_words(f)[0])->uniform(ctx, f, args);\n",
@@ -260,6 +279,7 @@ fn entries_defined() -> Bytes =
     b"  Word r = ply_uniform(ctx, e[0], a);\n",
     b"  if (ctx->failed || k[3]) return ctx->failed ? 0 : r;\n",
     b"  Word *in = (Word *)(intptr_t)e[1];\n",
+    b"  if (in[1]) ply_held_let_go(ctx, in);\n",
     b"  in[1] = -1; in[2] = r;\n",
     b"  ctx->target = e[1]; ctx->failed = PLY_FAILED_TARGET;\n",
     b"  return 0;\n",
@@ -269,7 +289,8 @@ fn entries_defined() -> Bytes =
     b"  const Word *a = (const Word *)(intptr_t)args;\n",
     b"  Word *in = (Word *)(intptr_t)e[1];\n",
     b"  (void)mode; (void)res;\n",
-    b"  in[1] = e[2];\n",
+    b"  if (in[1]) ply_held_let_go(ctx, in);\n",
+    b"  in[1] = e[2]; in[2] = op;\n",
     b"  for (int64_t i = 0; i < ((const PlyOp *)(intptr_t)op)->params_len; i++) in[",
     ascii_of_int(raised_at()),
     b" + i] = a[i];\n",
@@ -285,7 +306,8 @@ fn entries_defined() -> Bytes =
     b"}\n",
     b"static inline void ply_pending_raised(PlyCtx *ctx, Word w, int64_t k, Word op, Word string) {\n",
     b"  if (ctx->failed != PLY_FAILED_PENDING) return;\n",
-    b"  Word m[2] = { rt_pending_raised_p(ctx, string), 0 };\n",
+    b"  Word bridged = ply_slot(w, k)[0] == ply_slot(ctx->bridge, 0)[0];\n",
+    b"  Word m[2] = { rt_pending_raised_p(ctx, string, bridged), 0 };\n",
     b"  if (!ctx->failed) ply_perform(ctx, w, k, op, 2, -1, (Word)(intptr_t)m);\n",
     b"}\n",
   ])
@@ -594,6 +616,26 @@ test "a release takes the count, the last one dropping the block, and a checked 
   );
   assert_eq(named.filter(|n: Bytes| defined_in(h, n).len() == 0), []);
   assert(calls(defined_in(h, box_released_fn(2)), rel_box_fn()), None)
+}
+
+test "a raise or a stop at an instance lets go of what an unwind it replaces left there, then writes" {
+  let h = head_part();
+  [b"ply_raises", b"ply_resumes"].fold((), |_: Unit, f: Bytes| {
+    let body = defined_in(h, f);
+    let first = match ((body.index_of(b"ply_held_let_go(ctx, in)"), body.index_of(b"in[1] = "))) {
+      (Some(freed), Some(written)) -> freed < written,
+      _ -> false,
+    };
+    assert(first, Some(String::of_bytes_lossy(body)))
+  });
+  // A stop's answer goes by the descriptor of what the handle answers, a raise's arguments by its
+  // operation's, and the instance holds nothing after.
+  let let_go = defined_in(h, b"ply_held_let_go");
+  assert(
+    [b"in[3])->dec(ctx, in[2])", b"o->params[i]->dec(ctx, in[", b"in[1] = 0;"].all(|part: Bytes|
+      let_go.index_of(part) != None),
+    Some(String::of_bytes_lossy(let_go)),
+  )
 }
 
 test "a descriptor lifts a type a value of which can hold a function by the runtime's refusal" {
