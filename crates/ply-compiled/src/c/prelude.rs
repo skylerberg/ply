@@ -309,7 +309,6 @@ helpers! {
     rt_decimal_negate(lo, hi, out);
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
-    rt_wide_binary(op, t, a, b) -> Word;
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
