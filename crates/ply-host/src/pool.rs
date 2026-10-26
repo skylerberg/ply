@@ -4,7 +4,7 @@
 use ply_core::{Diagnostic, Pending, Span, Symbol, Value, codes};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 /// How many operations of a pool that gives each a thread may be outstanding at once.
@@ -122,7 +122,9 @@ struct Shared {
     state: Mutex<State>,
     /// Signalled by a job finishing, so neither `park` nor `block_on` spins.
     finished: Condvar,
-    bell: OnceLock<Arc<Bell>>,
+    /// The bells of every runtime that routes this pool's tokens, held weakly so a runtime that is
+    /// gone is no longer rung.
+    bells: Mutex<Vec<Weak<Bell>>>,
     /// Where jobs wait for a thread; `None` for a pool that starts one for each.
     queue: Option<Queue>,
 }
@@ -187,15 +189,20 @@ impl Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 finished: Condvar::new(),
-                bell: OnceLock::new(),
+                bells: Mutex::new(Vec::new()),
                 queue,
             }),
         }
     }
 
-    /// Rings `bell` too whenever an operation finishes; a pool rings one bell at most.
+    /// Rings `bell` too whenever an operation finishes, beside every other bell it was handed that
+    /// is still held somewhere.
     pub fn ring(&self, bell: &Arc<Bell>) {
-        let _ = self.shared.bell.set(Arc::clone(bell));
+        let mut bells = lock(&self.shared.bells);
+        bells.retain(|held| held.strong_count() > 0);
+        if !bells.iter().any(|held| held.as_ptr() == Arc::as_ptr(bell)) {
+            bells.push(Arc::downgrade(bell));
+        }
     }
 
     /// Whether an operation has finished and is waiting to be polled.
@@ -384,6 +391,131 @@ impl Pool {
     }
 }
 
+/// A facility, and the tokens of its pool one runtime watches, as they resolve.
+struct Watched {
+    facility: Arc<dyn Pooled>,
+    inbox: Arc<Inbox>,
+}
+
+impl Watched {
+    fn pool(&self) -> &Pool {
+        self.facility.pool()
+    }
+}
+
+/// One runtime's routing of tokens to the facilities that minted them, each of which rings its
+/// bell, so one wait covers them all.
+pub struct Routing {
+    pools: Vec<Watched>,
+    bell: Arc<Bell>,
+}
+
+impl Routing {
+    pub fn over(facilities: Vec<Arc<dyn Pooled>>, bell: Arc<Bell>) -> Routing {
+        Routing {
+            pools: facilities
+                .into_iter()
+                .map(|facility| {
+                    facility.pool().ring(&bell);
+                    Watched {
+                        facility,
+                        inbox: Arc::default(),
+                    }
+                })
+                .collect(),
+            bell,
+        }
+    }
+
+    pub fn bell(&self) -> &Arc<Bell> {
+        &self.bell
+    }
+
+    /// Whether some pool holds an operation that has finished and not been collected.
+    pub fn ready(&self) -> bool {
+        self.pools.iter().any(|watched| watched.pool().ready())
+    }
+
+    /// The pool that minted `pending`.
+    pub fn owner(&self, pending: &Pending) -> Result<&Pool, Diagnostic> {
+        self.pools
+            .iter()
+            .find(|watched| watched.pool().owns(pending))
+            .map(Watched::pool)
+            .ok_or_else(|| err_unowned(pending))
+    }
+
+    pub fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
+        let owner = self
+            .pools
+            .iter()
+            .find(|watched| watched.pool().owns(pending))
+            .ok_or_else(|| err_unowned(pending))?;
+        owner.pool().watch(pending, &owner.inbox)
+    }
+
+    pub fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
+        self.pools
+            .iter()
+            .flat_map(|watched| watched.pool().collect(&watched.inbox))
+            .collect()
+    }
+
+    /// Waits until an outstanding operation of some pool finishes, for at most `bound` where one
+    /// is given; `false` where no pool has one outstanding, and nothing was waited for.
+    pub fn park(&self, bound: Option<Duration>) -> bool {
+        let mut busy = self
+            .pools
+            .iter()
+            .filter(|watched| watched.pool().outstanding() > 0);
+        match (busy.next(), busy.next(), bound) {
+            (None, _, _) => false,
+            // The pool's own wait, which only its operations end: the bell rings at a stop too.
+            (Some(only), None, None) => only.pool().park().is_ok(),
+            (Some(only), None, Some(bound)) => only.pool().park_until(bound).is_ok(),
+            // Several pools' condition variables cannot be waited on together, so the bell each
+            // of them rings is waited on instead.
+            (Some(_), Some(_), bound) => {
+                let seen = self.bell.rung();
+                if !self.ready() {
+                    match bound {
+                        Some(bound) => self.bell.wait_past_for(seen, bound),
+                        None => self.bell.wait_past(seen),
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn err_unowned(pending: &Pending) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("no host facility minted the pending token `{pending}`"),
+    )
+    .primary(Span::DUMMY, "this token belongs to no facility in this run")
+    .note("a handler answered `Pending` with a token from a runtime other than the one this run is driving")
+    .note("this is Ply's fault: report it with the program that produced it")
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn err_nothing_outstanding() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "the run asked the host runtime to wait with nothing outstanding to wait for",
+    )
+    .primary(
+        Span::DUMMY,
+        "no task is enabled and no host operation is pending",
+    )
+    .note("waiting here would never return, so it is refused instead")
+    .note("this is Ply's fault: report it with the program that produced it")
+}
+
 /// Files what a job answered and wakes whoever waits on it.
 fn complete(shared: &Shared, token: u64, outcome: JobOutput) {
     let mut state = lock(&shared.state);
@@ -398,7 +530,11 @@ fn complete(shared: &Shared, token: u64, outcome: JobOutput) {
         inbox.deliver(token);
     }
     shared.finished.notify_all();
-    if let Some(bell) = shared.bell.get() {
+    let bells: Vec<Arc<Bell>> = lock(&shared.bells)
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    for bell in bells {
         bell.ring();
     }
 }

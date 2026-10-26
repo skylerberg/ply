@@ -1223,9 +1223,10 @@ secret: each is one-way in the key.
 
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
-allows it (`E0439`). The operations `ply` ships that take one are
-`std.password`'s, which hash a password and answer the hash, one-way in it, and
-the two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
+allows it (`E0439`), and a native only as a parameter its declaration types
+`Secret` (§12). The natives `ply` ships that take one are `std.password`'s,
+which hash a password and answer the hash, one-way in it; the operations, the
+two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
 alone may read, and `std.net`'s `send_secret`, to a connection. Both write the
 same frame, all of it or nothing: plain bytes before the secret, the secret
 `raw` or in `hex`, `base64`, `base64url` or `base32`, and plain bytes after it,
@@ -3276,17 +3277,18 @@ that holds one is `E0201`, as on a function, and no deriver reads one, so
 module states no `key`, `show` or `numeric` for it. A module below `std.internal` holds what the standard
 library shares within itself, and only a shipped module imports one (`E0159`).
 A shipped module's `extern fn` reads an alias of its module's as the type it
-names, and its row names a mode only of an effect it imports that declares no
-operation (`native.read`), so no handler of an effect seems to answer a native
-that asks the machine.
+names, and its row names a mode only of an effect it declares or imports that
+declares no operation (`native.read`), so no handler of an effect seems to
+answer a native that asks the machine.
 An `extern fn` of a shipped module other than `std.prelude` that is not generic,
 states no `where`, cannot raise, and takes and answers only machine types is
 called over machine words, never over its arguments' encoding: an `Int`, a
 `Bool` (0 or 1), a `Char` (its scalar value) and a width of at most 64 bits pass
-as their raw 64 bits, a `Float` as its bits, and a `String` or `Bytes` is lent
-as its bytes' address and count; such a native answers one of those, or bytes it
-leaves for the caller to copy out, or nothing for `()`. Its row is not read, and
-nothing in it crosses.
+as their raw 64 bits, a `Float` as its bits, a `String` or `Bytes` is lent as
+its bytes' address and count, and a `Secret` as its handle, so no byte of it
+crosses but to the native; such a native answers one of those, bytes it leaves
+for the caller to copy out, a secret's handle the caller then holds, or nothing
+for `()`. Its row is not read, and nothing in it crosses.
 The runtime reports each native it implements, the machine kind of each word a
 call passes and of its answer, and whether it raises, as the Rust type of the
 function it binds says; a unit is compiled only against a runtime that
@@ -3384,16 +3386,27 @@ module of it, each one whole.
 
 An effect whose module declares its real handler (§6.10) never reaches the
 boundary: every root whose row names it runs under that handler, with or
-without `--host` and whatever else the flags say, as `std.os`'s operations do.
-A native such a handler calls refuses inside a `simulate` region and in a test
-the search re-runs, as a host operation does (`E0425`).
+without `--host` and whatever else the flags say, as the operations of
+`std.os`, `std.certgen`, `std.config` and `std.password`'s `kdf` do. A native
+such a handler calls refuses inside a `simulate` region and in a test the search
+re-runs, as a host operation does (`E0425`). One that would hold the program's
+thread, as a hash does, hands its work to the runtime's threads: as many hashes
+at once as the machine has cores, and the rest in line, while a task of a
+production region that asked waits and the region's other tasks run. A test
+that has the machine compute what is a function of what it is handed, as a
+hash is, is cached like any other; one that read the machine is cached with the
+binding it ran under (§8.2). The environment is open to a program by default,
+and its configuration is what the run's flags resolve: `config.get` and
+`config.secret` answer from the sources `--host` reads (`--set`, `--config`,
+the environment and the schema's defaults), and a run granted none, as one
+without `--host` is, answers `None` for every key.
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
 nondeterministic handler is cached with what it read and the binding it ran
 under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, as
-`std.password`'s hashes are, is cached like any other. An operation performed
+deterministic handlers, whose answers are a function of what they are handed, is
+cached like any other. An operation performed
 inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
 once per interleaving. `std.signal`, `std.process` (and `std.console` on top of

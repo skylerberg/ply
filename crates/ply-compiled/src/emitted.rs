@@ -160,6 +160,21 @@ impl Handle {
     }
 }
 
+/// A `Secret`'s handle: a bridge to the credential, lent to a native that takes it and owned by
+/// the code a native answers it to.
+#[repr(transparent)]
+pub struct SecretHandle(Word);
+
+impl SecretHandle {
+    pub(crate) fn of(w: Word) -> SecretHandle {
+        SecretHandle(w)
+    }
+
+    pub(crate) fn word(&self) -> Word {
+        self.0
+    }
+}
+
 /// `type#T`: a type's descriptor, static data emitted code lays out, through which the runtime
 /// counts and crosses a value of the type it holds as a [`Carried`]. Each entry takes the value's
 /// word form; what `inc`, `dec` and `lower` answer is unread.
@@ -391,6 +406,9 @@ unsafe impl Taken for Handed {
 unsafe impl Taken for Handle {
     const MACHINE: Machine = Machine::Handle;
 }
+unsafe impl Taken for SecretHandle {
+    const MACHINE: Machine = Machine::Secret;
+}
 unsafe impl Taken for DropRoot {
     const MACHINE: Machine = Machine::DropRoot;
 }
@@ -429,5 +447,13 @@ unsafe impl Answered for Handle {
     const RAISES: bool = false;
     fn of(w: Word) -> Handle {
         Handle(w)
+    }
+}
+
+unsafe impl Answered for SecretHandle {
+    const MACHINE: Option<Machine> = Some(Machine::Secret);
+    const RAISES: bool = false;
+    fn of(w: Word) -> SecretHandle {
+        SecretHandle(w)
     }
 }

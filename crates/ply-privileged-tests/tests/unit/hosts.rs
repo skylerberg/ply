@@ -196,12 +196,12 @@ fn the_digest_moves_when_a_flag_alone_moves() {
     assert!(secrets.rows[0].secrets);
 }
 
-/// A credential crosses the boundary to these and to nothing else: the password hashes, each
-/// answering a hash that is one-way in it, and the two writes that put one where it is meant to
-/// go, a file a key is written down in and a connection a login is sent on, each answering only
-/// whether it wrote.
+/// A credential crosses the boundary to these handlers and to nothing else: the two writes that
+/// put one where it is meant to go, a file a key is written down in and a connection a login is
+/// sent on, each answering only whether it wrote. A native takes one only as its declaration types
+/// it.
 #[test]
-fn only_the_password_hashes_and_the_two_secret_writes_declare_that_they_may_receive_a_credential() {
+fn only_the_two_secret_writes_declare_that_they_may_receive_a_credential() {
     let mut claiming: Vec<&str> = ply_privileged::hosts::registry()
         .ops()
         .filter(|op| op.secrets)
@@ -211,14 +211,7 @@ fn only_the_password_hashes_and_the_two_secret_writes_declare_that_they_may_rece
     claiming.sort_unstable();
     assert_eq!(
         claiming,
-        [
-            "ply_host::fs::write_secret",
-            "ply_host::password::argon2",
-            "ply_host::password::bcrypt",
-            "ply_host::password::pbkdf2",
-            "ply_host::password::scrypt",
-            "ply_host::tcp::send_secret",
-        ]
+        ["ply_host::fs::write_secret", "ply_host::tcp::send_secret"]
     );
 }
 

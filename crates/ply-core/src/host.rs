@@ -164,6 +164,14 @@ pub trait HostRuntime {
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
+    /// The run's configuration value of `key`, which a real handler's native reads: a plain one,
+    /// or, where `secret`, the one only `config.secret` reads. `None` where the run was granted no
+    /// such key, as a runtime holding no configuration grants none.
+    fn configured(&self, key: &str, secret: bool) -> Option<String> {
+        let _ = (key, secret);
+        None
+    }
+
     /// Nanoseconds the host's monotonic clock reads, which a production region's sleeps are
     /// deadlines on; only the difference of two readings means anything.
     fn now(&self) -> Result<i64, Diagnostic> {

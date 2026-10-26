@@ -5,6 +5,7 @@ mod certgen;
 mod clock;
 mod config;
 mod fs;
+mod jobs;
 mod observe;
 mod os;
 mod password;

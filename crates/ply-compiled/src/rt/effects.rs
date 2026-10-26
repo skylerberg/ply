@@ -387,9 +387,7 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
     } else if at.is_some() {
         Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
     } else {
-        if let Some(runtime) = c.host_runtime() {
-            runtime.unanswered(effect, op);
-        }
+        c.host_runtime().unanswered(effect, op);
         // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
         let carried: Vec<Plain> = raised_values(c, &args)
             .iter()

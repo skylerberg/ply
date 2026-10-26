@@ -384,23 +384,6 @@ pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     .note("hoist the inner region out, or handle its effects with an ordinary `handle`")
 }
 
-#[cold]
-#[inline(never)]
-pub fn err_no_runtime(
-    span: Span,
-    operation: &str,
-    pending: Pending,
-    path: &'static str,
-) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("`{operation}` did not complete and this run has no host runtime to wait on it"),
-    )
-    .primary(span, "performed here")
-    .note(format!("`{path}` answered a pending `{pending}`"))
-    .note("`Machine::set_host_runtime` was never called; a handler that can answer `Pending` needs one")
-}
-
 /// `E0427`: the binding enumerated no atom for an operation a registration claims.
 #[cold]
 #[inline(never)]

@@ -20,7 +20,7 @@ use ply_core::sched::{
 use ply_core::sim::{
     Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness, signature,
 };
-use ply_core::{Diagnostic, Mode, SimId, Span, Symbol, Unbound, Value, codes};
+use ply_core::{Diagnostic, Mode, SimId, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 
 /// A value a region's tasks pass each other, as its scheduler holds it: copied for each task that
@@ -383,14 +383,11 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
             }
         }
         let c = unsafe { &mut *ctx };
-        let runtime = c.runtime.clone();
+        let runtime = c.host_runtime();
         let sim = c.sims.last_mut().expect("a region is running");
         let turn = match sim.policy {
             Policy::Seeded => sim.sched.next(sim.handlers.clock_mut(), &mut c.trail),
-            Policy::Host => match &runtime {
-                Some(rt) => sim.sched.next_host(rt.as_ref()),
-                None => sim.sched.next_host(&Unbound),
-            },
+            Policy::Host => sim.sched.next_host(runtime.as_ref()),
         };
         let (task, resumption) = match turn {
             Err(d) => {
@@ -451,7 +448,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
 unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Option<Diagnostic>> {
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let runtime = c.runtime.clone();
+    let runtime = c.host_runtime();
     let sim = c.sims.last_mut().expect("a region is running");
     let k = sim.slot(task).sp;
     let applied = match request {
@@ -546,14 +543,8 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             applied
         }
         Request::Yield => sim.sched.suspend(k, Value::Unit),
-        Request::Park(pending) => match &runtime {
-            Some(rt) => sim.sched.park_on_host(k, pending, site, rt.as_ref()),
-            None => sim.sched.park_on_host(k, pending, site, &Unbound),
-        },
-        Request::Sleep(nanos) => match &runtime {
-            Some(rt) => sim.sched.sleep_on_host(k, nanos, site, rt.as_ref()),
-            None => sim.sched.sleep_on_host(k, nanos, site, &Unbound),
-        },
+        Request::Park(pending) => sim.sched.park_on_host(k, pending, site, runtime.as_ref()),
+        Request::Sleep(nanos) => sim.sched.sleep_on_host(k, nanos, site, runtime.as_ref()),
         Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
             Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
             Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),

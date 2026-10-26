@@ -578,14 +578,20 @@ impl Ctx {
         self.runtime_factory = factory;
     }
 
-    /// The reactor this context waits on, made on first need on a `parallel` branch's thread.
-    pub(crate) fn host_runtime(&mut self) -> Option<Rc<dyn ply_core::HostRuntime>> {
-        if self.runtime.is_none()
-            && let Some(factory) = &self.runtime_factory
-        {
-            self.runtime = Some(factory());
+    /// The reactor this context waits on, made on first need on a `parallel` branch's thread: the
+    /// run's, or, for a run no host facility serves, one over the natives' jobs alone.
+    pub(crate) fn host_runtime(&mut self) -> Rc<dyn ply_core::HostRuntime> {
+        if let Some(runtime) = &self.runtime {
+            return Rc::clone(runtime);
         }
-        self.runtime.clone()
+        // Kept as the factory too, so a `parallel` branch makes its own as a bound run's does.
+        let factory = Arc::clone(
+            self.runtime_factory
+                .get_or_insert_with(|| Arc::new(ply_host::jobs::runtime)),
+        );
+        let runtime = factory();
+        self.runtime = Some(Rc::clone(&runtime));
+        runtime
     }
 
     pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {

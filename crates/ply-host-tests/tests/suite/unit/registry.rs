@@ -50,19 +50,11 @@ fn written(rows: &Rows) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-const DETERMINISTIC: &Rows = &[
-    // A hash is a function of the password, the salt and the parameters.
-    (
-        "std.password.kdf",
-        &["argon2", "bcrypt", "pbkdf2", "scrypt"],
-    ),
-];
+const DETERMINISTIC: &Rows = &[];
 
 const REPEATABLE: &Rows = &[
-    ("certgen", &["issue"]),
     // A wait changes nothing outside the program: crossed twice, it waits twice.
     ("clock", &["now", "sleep"]),
-    ("std.config.config", &["get", "secret"]),
     // A question to a resolver changes nothing it asks about.
     ("std.dns.dns", &["lookup", "reverse", "servers"]),
     // A socket's port and its two addresses are fixed while it is open, and so is who holds its
@@ -78,11 +70,6 @@ const REPEATABLE: &Rows = &[
             "peer_credentials",
             "protocol",
         ],
-    ),
-    // Hashing again computes the same bytes and changes nothing outside the program.
-    (
-        "std.password.kdf",
-        &["argon2", "bcrypt", "pbkdf2", "scrypt"],
     ),
     // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
     ("std.process.process", &["args", "bound"]),

@@ -1,5 +1,3 @@
-use ply_core::Symbol;
-use ply_core::host::{Determinism, Linearity};
 use ply_host::config::*;
 use std::sync::Arc;
 
@@ -67,45 +65,30 @@ fn an_unsupplied_secret_answers_none_from_both() {
     assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), None);
 }
 
+/// The natives read the run's snapshot through its runtime, and a run granted none reads nothing.
 #[test]
-fn two_configuration_readers_never_conflict() {
-    use ply_core::{EffectAtom, Footprint, Mode, Resource};
-
-    let effect = Symbol::new(EFFECT);
-    let atom = |namespace: &str| {
-        Footprint::from_atoms([EffectAtom::new(
-            effect.clone(),
-            Resource::Named(Symbol::new(namespace)),
-            Mode::Read,
-        )])
-    };
-    assert!(!atom("database").conflicts_with(&atom("credentials")));
-    assert!(
-        !atom("credentials").conflicts_with(&atom("credentials")),
-        "two readers of one namespace do not conflict either, which is the whole point of a read"
+fn a_hosts_runtime_answers_from_its_snapshot_and_a_bare_one_answers_nothing() {
+    let granted = snapshot(
+        &[
+            ("SERVICE_API_KEY", "s3cret", true),
+            ("SERVICE_REGION", "eu", false),
+        ],
+        true,
     );
-
-    // The conflicting shape too, so `conflicts_with` is shown not to answer `false` to everything.
-    let writer = Footprint::from_atoms([EffectAtom::new(
-        effect.clone(),
-        Resource::Named(Symbol::new("credentials")),
-        Mode::Write,
-    )]);
-    assert!(atom("credentials").conflicts_with(&writer));
-}
-
-#[test]
-fn the_registration_declares_what_the_snapshot_makes_true() {
-    let registry = registry(Arc::new(Snapshot::unopened()));
-    let ops: Vec<String> = registry.ops().map(|op| op.to_string()).collect();
+    let runtime = ply_host::Host::new()
+        .configured(Arc::new(granted))
+        .runtime();
     assert_eq!(
-        ops,
-        ["std.config.config.get[..]", "std.config.config.secret[..]"]
+        runtime.configured("SERVICE_REGION", false).as_deref(),
+        Some("eu")
     );
-    for op in registry.ops() {
-        assert_eq!(op.determinism, Determinism::Nondeterministic);
-        assert_eq!(op.linearity, Linearity::Repeatable);
-        assert!(!op.blocking, "no source is opened at a call site");
-        assert!(op.path.starts_with("ply_host::config::"));
-    }
+    assert_eq!(runtime.configured("SERVICE_REGION", true), None);
+    assert_eq!(
+        runtime.configured("SERVICE_API_KEY", true).as_deref(),
+        Some("s3cret")
+    );
+    assert_eq!(runtime.configured("SERVICE_API_KEY", false), None);
+    let bare = ply_host::jobs::runtime();
+    assert_eq!(bare.configured("SERVICE_REGION", false), None);
+    assert_eq!(bare.configured("SERVICE_API_KEY", true), None);
 }

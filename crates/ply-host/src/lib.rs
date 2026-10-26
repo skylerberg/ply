@@ -72,6 +72,7 @@ pub mod clock;
 pub mod config;
 pub mod dns;
 pub mod fs;
+pub mod jobs;
 pub mod observe;
 pub mod os;
 pub mod password;

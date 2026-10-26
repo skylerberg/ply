@@ -1,5 +1,5 @@
 use ply_core::{Diagnostic, Pending, Span, Value, codes};
-use ply_host::pool::{Inbox, JobOutput, MAX_BLOCKING_OPERATIONS, Pool};
+use ply_host::pool::{Bell, Inbox, JobOutput, MAX_BLOCKING_OPERATIONS, Pool};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -180,4 +180,22 @@ fn no_two_pools_mint_the_same_token_and_none_mints_zero() {
             pool.block_on(pending).expect("answered");
         }
     }
+}
+
+/// One pool serves the runtimes of every machine, so each finished job rings each of their
+/// bells once, and a bell handed twice is still rung once.
+#[test]
+fn a_finished_job_rings_every_bell_its_pool_was_handed_once() {
+    let pool = Pool::new();
+    let first = Arc::new(Bell::default());
+    let second = Arc::new(Bell::default());
+    pool.ring(&first);
+    pool.ring(&second);
+    pool.ring(&first);
+    let (seen_first, seen_second) = (first.rung(), second.rung());
+    pool.block_on(submitted(&pool, 7)).expect("answered");
+    first.wait_past(seen_first);
+    second.wait_past(seen_second);
+    assert_eq!(first.rung(), seen_first + 1);
+    assert_eq!(second.rung(), seen_second + 1);
 }

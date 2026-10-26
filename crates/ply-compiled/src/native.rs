@@ -38,6 +38,9 @@ pub enum Machine {
     KeepRoot,
     /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
     Taken,
+    /// A `Secret`'s handle: lent to a native that takes one, owned by the code a native answers
+    /// one to.
+    Secret,
 }
 
 impl Machine {
@@ -58,6 +61,7 @@ impl Machine {
             Machine::DropRoot => "DropRoot",
             Machine::KeepRoot => "KeepRoot",
             Machine::Taken => "Taken",
+            Machine::Secret => "Secret",
         }
     }
 }
@@ -252,3 +256,8 @@ natives_taking!(A B C D);
 natives_taking!(A B C D E);
 natives_taking!(A B C D E F);
 natives_taking!(A B C D E F G);
+natives_taking!(A B C D E F G H);
+natives_taking!(A B C D E F G H I);
+natives_taking!(A B C D E F G H I J);
+natives_taking!(A B C D E F G H I J K);
+natives_taking!(A B C D E F G H I J K L);

@@ -2,11 +2,8 @@
 //! the operation and the handler, and says what would or would not help. Which calls reach these is
 //! the CLI suite's `host_boundary` module, over real host operations.
 
-use ply_core::host::{Pending, err_blocking_answered_inline, err_hermetic};
-use ply_core::{
-    EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes, err_footprint_escape,
-    err_no_runtime,
-};
+use ply_core::host::{err_blocking_answered_inline, err_hermetic};
+use ply_core::{EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes, err_footprint_escape};
 
 /// E0424 means "pass `--host`", which a handler is named for.
 #[test]
@@ -45,23 +42,6 @@ fn an_answer_outside_the_declared_footprint_names_what_was_declared() {
     assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
     let said = format!("{} {}", d.message, d.notes.join(" "));
     assert!(said.contains("t.net.write[other]"), "{said}");
-}
-
-/// A binding with no reactor is a legitimate configuration, so a token it cannot wait on is a
-/// diagnostic and not a panic.
-#[test]
-fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
-    let d = err_no_runtime(
-        Span::DUMMY,
-        "t.net.send[socket]",
-        Pending {
-            token: 7,
-            label: "send",
-        },
-        "test::send",
-    );
-    assert_eq!(d.code, codes::INTERNAL_ERROR);
-    assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
 }
 
 /// A handler declared blocking answers on the host's pool, never inline on the run's thread.

@@ -11,18 +11,17 @@ use ply_core::host::{
 };
 use ply_core::sim::TASK_OPS;
 use ply_core::{
-    Diagnostic, Span, Symbol, Unbound, Value, carries_secret, check_host_answer, codes,
-    err_footprint_escape, err_host_in_simulation, err_no_runtime, err_secret_to_host,
-    err_unenumerated_atom,
+    Diagnostic, Span, Symbol, Value, carries_secret, check_host_answer, codes,
+    err_footprint_escape, err_host_in_simulation, err_secret_to_host, err_unenumerated_atom,
 };
 use ply_core::{EffectAtom, Mode};
 use std::sync::Arc;
 
 /// An at-most-once host operation an entry performed, which a second resumption would replay.
 pub(crate) struct HostMark {
-    operation: String,
-    path: &'static str,
-    span: Span,
+    pub(crate) operation: String,
+    pub(crate) path: &'static str,
+    pub(crate) span: Span,
 }
 
 /// A second resumption across an at-most-once host operation.
@@ -198,10 +197,7 @@ pub(crate) unsafe fn serve(
             task: crate::simulate::running_task_of_production(c),
             declared: c.declared.as_ref(),
         };
-        match &runtime {
-            Some(rt) => handler.call(rt.as_ref(), &request),
-            None => handler.call(&Unbound, &request),
-        }
+        handler.call(runtime.as_ref(), &request)
     };
     c.host_use.record(&atom, declaration.determinism);
     if declaration.linearity.is_linear() {
@@ -233,13 +229,7 @@ pub(crate) unsafe fn serve(
                     None => return Served::Word(0),
                 }
             } else {
-                let Some(rt) = runtime else {
-                    return failed(
-                        c,
-                        err_no_runtime(span, &operation, pending, declaration.path),
-                    );
-                };
-                match rt.block_on(pending) {
+                match runtime.block_on(pending) {
                     Ok(value) => value,
                     Err(d) => return failed(c, d),
                 }
