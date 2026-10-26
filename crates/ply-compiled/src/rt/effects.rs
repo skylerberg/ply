@@ -221,22 +221,11 @@ unsafe fn dispatched(
 ) -> Handed {
     let c = unsafe { &mut *ctx };
     let described = unsafe { &*op };
-    let effect = c.tables.fields[described.effect as usize].clone();
-    let name = c.tables.fields[described.op as usize].clone();
+    let (effect, name) = named_op(c, described);
     let args = args_of(args.cast(), described.params_len);
     if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
-        let carried = args
-            .iter()
-            .zip(described.params())
-            .map(|(w, ty)| unsafe { Carried::new(Handed::of(*w), *ty) })
-            .collect();
-        return Handed::of(raise_from_perform(
-            c,
-            &effect,
-            &name,
-            Raised(carried),
-            target,
-        ));
+        let raised = raised_of(args, described);
+        return Handed::of(raise_from_perform(c, &effect, &name, raised, target));
     }
     let performing = Performing {
         effect,
@@ -263,12 +252,11 @@ struct Performing {
 pub type OpEntry =
     unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
 
-/// The evidence object that hands every perform to [`rt_dispatch`], which searches the frames: what
-/// code that holds no word for an effect performs it through. Laid out as an evidence object is:
-/// its flags, then an entry and its environment per operation, or, with the flags set as here, one
-/// slot that answers every operation, which reads the operation from its descriptor.
+/// An evidence object of the runtime's own, laid out as an evidence object is: its flags, then an
+/// entry and its environment per operation, or, with the flags set as here, one slot that answers
+/// every operation, which reads the operation from its descriptor.
 #[repr(C)]
-pub struct Bridge {
+pub struct RuntimeObject {
     pub flags: i64,
     pub slot: Slot,
 }
@@ -281,8 +269,9 @@ pub struct Slot {
     pub env: Word,
 }
 
-/// The one [`Bridge`].
-pub static BRIDGE: Bridge = Bridge {
+/// The frame bridge, which hands every perform to [`rt_dispatch`], which searches the frames: what
+/// code that holds no word for an effect performs it through.
+pub static BRIDGE: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
         entry: bridged,
@@ -290,9 +279,29 @@ pub static BRIDGE: Bridge = Bridge {
     },
 };
 
-/// [`BRIDGE`]'s word.
-pub(crate) fn bridge_word() -> Word {
-    &raw const BRIDGE as Word
+/// What an entry hands its root for an effect the Rust binding serves: an operation goes to the
+/// binding, no frame searched, and a raise is left unanswered.
+pub static HOSTED: RuntimeObject = RuntimeObject {
+    flags: 1,
+    slot: Slot {
+        entry: hosted,
+        env: 0,
+    },
+};
+
+/// What an entry hands its root for an effect nothing answers: an operation is refused (`E0424`),
+/// and a raise is left unanswered.
+pub static UNSERVED: RuntimeObject = RuntimeObject {
+    flags: 1,
+    slot: Slot {
+        entry: unserved,
+        env: 0,
+    },
+};
+
+/// The word compiled code holds `object` by.
+pub(crate) fn object_word(object: &'static RuntimeObject) -> Word {
+    std::ptr::from_ref(object) as Word
 }
 
 unsafe extern "C" fn bridged(
@@ -304,6 +313,93 @@ unsafe extern "C" fn bridged(
     args: *const Handed,
 ) -> Handed {
     unsafe { rt_dispatch(ctx, op, resource, mode, args) }
+}
+
+unsafe extern "C" fn hosted(
+    ctx: *mut Ctx,
+    _env: Word,
+    op: *const PlyOp,
+    mode: I64,
+    resource: I64,
+    args: *const Handed,
+) -> Handed {
+    unsafe { at_entry(ctx, op, mode, resource, args, true) }
+}
+
+unsafe extern "C" fn unserved(
+    ctx: *mut Ctx,
+    _env: Word,
+    op: *const PlyOp,
+    mode: I64,
+    resource: I64,
+    args: *const Handed,
+) -> Handed {
+    unsafe { at_entry(ctx, op, mode, resource, args, false) }
+}
+
+/// A perform the object its entry hands answers, since nothing between answers it: a raise left
+/// unanswered, and any other operation handed to the Rust binding where `hosted`, else refused.
+unsafe fn at_entry(
+    ctx: *mut Ctx,
+    op: *const PlyOp,
+    mode: I64,
+    resource: I64,
+    args: *const Handed,
+    hosted: bool,
+) -> Handed {
+    let c = unsafe { &mut *ctx };
+    let described = unsafe { &*op };
+    let (effect, name) = named_op(c, described);
+    let args = args_of(args.cast(), described.params_len);
+    if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
+        return Handed::of(unanswered(c, &effect, &name, raised_of(args, described)));
+    }
+    let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
+    let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
+    if !hosted {
+        let_go(ctx, args, described);
+        let c = unsafe { &mut *ctx };
+        let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
+        let d = ply_core::host::err_unserved(c.site(), &operation);
+        return Handed::of(c.fail(d));
+    }
+    recorded(c, &effect, &name, resource.as_ref(), mode);
+    Handed::of(unsafe {
+        to_host(
+            ctx,
+            described,
+            &effect,
+            &name,
+            resource.as_ref(),
+            mode,
+            args,
+        )
+    })
+}
+
+/// The effect and the operation `described` describes, by their program-wide names.
+fn named_op(c: &Ctx, described: &PlyOp) -> (Symbol, Symbol) {
+    let name = |i: i64| c.tables.fields[i as usize].clone();
+    (name(described.effect), name(described.op))
+}
+
+/// Lets go of `args`, what a perform handed the operation `described` describes, through the
+/// operation's parameters' types.
+fn let_go(ctx: *mut Ctx, args: &[Word], described: &PlyOp) {
+    for (w, ty) in args.iter().zip(described.params()) {
+        unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
+    }
+}
+
+/// What a raise hands the operation `described` describes, `args` its words, held through the
+/// operation's parameters' types.
+fn raised_of(args: &[Word], described: &PlyOp) -> Raised {
+    Raised(
+        args.iter()
+            .zip(described.params())
+            .map(|(w, ty)| unsafe { Carried::new(Handed::of(*w), *ty) })
+            .collect(),
+    )
 }
 
 /// A perform of `effect.op` on `resource` in `mode` noted where this entry's performs are read: in
@@ -329,9 +425,7 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
 /// is handed. Compiled code calls it only while [`Ctx::recording`] is armed.
 pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource: I64, mode: I64) {
     let c = unsafe { &mut *ctx };
-    let described = unsafe { &*op };
-    let effect = c.tables.fields[described.effect as usize].clone();
-    let name = c.tables.fields[described.op as usize].clone();
+    let (effect, name) = named_op(c, unsafe { &*op });
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
     let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
     recorded(c, &effect, &name, resource.as_ref(), mode);
@@ -530,9 +624,7 @@ unsafe fn to_host(
         return unsafe { crate::host::schedule(ctx, described, effect, op, resource, args) };
     }
     let values = lowered_values(ctx, args, described.params());
-    for (w, ty) in args.iter().zip(described.params()) {
-        unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
-    }
+    let_go(ctx, args, described);
     let values = match values {
         Ok(values) => values,
         Err(why) => {
@@ -576,58 +668,75 @@ pub(super) fn raise_from_perform(
         args.release();
         return 0;
     }
-    let at = c.raise_handler(effect.as_str(), op.as_str(), target);
-    if at.is_none() && target.is_some() {
-        args.release();
-        return c.fail(err_handle_gone(effect, op));
-    }
+    let Some(at) = c.raise_handler(effect.as_str(), op.as_str(), target) else {
+        if target.is_some() {
+            args.release();
+            return c.fail(err_handle_gone(effect, op));
+        }
+        return unanswered(c, effect, op, args);
+    };
     let d = if is_abort(effect.as_str(), op.as_str()) {
-        let message = match raised_values(c, &args).first() {
-            Some(Ok(Value::Str(s))) => s.to_string(),
-            _ => String::new(),
-        };
-        Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-    } else if at.is_some() {
-        Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
-    } else {
-        // Only a raise no frame answers is shown what it carried: one a clause takes is not read.
-        let carried: Vec<Plain> = raised_values(c, &args)
-            .iter()
-            .map(|v| v.as_ref().map_or(Plain::Elided(0), Plain::shown))
-            .collect();
-        let slots: Vec<String> = (0..carried.len()).map(ply_core::slot).collect();
-        let with = if slots.is_empty() {
-            String::new()
-        } else {
-            format!(" with {}", slots.join(", "))
-        };
         Diagnostic::error(
             codes::RUNTIME_ERROR,
-            format!("`{effect}.{op}` was raised{with}, and nothing answers it"),
+            format!("panic: {}", raised_message(c, &args)),
         )
-        .note("a `try` around the call answers it as an `Err`, and a `handle` clause as it likes")
-        .showing(carried)
+    } else {
+        Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
     };
     let d = d.primary(c.site(), "raised here");
-    match at {
-        Some(at) => c.bind_raise(at, args, d),
-        None if is_abort(effect.as_str(), op.as_str()) => {
-            let message = match raised_values(c, &args).first() {
-                Some(Ok(Value::Str(s))) => s.to_string(),
-                _ => String::new(),
-            };
-            args.release();
-            c.pend(d, message)
-        }
-        None => c.pend_raised(d, effect.clone(), op.clone(), args),
+    c.bind_raise(at, args, d)
+}
+
+/// A raise no `handle` answers, left pending for the code around it, as [`Ctx::pend`] says, with
+/// what the entry fails with should nothing take it: `abort.raise` a panic of its message, any other
+/// raise naming the operation and what it carried. Takes the arguments.
+pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised) -> i64 {
+    if c.failed != 0 {
+        args.release();
+        return 0;
+    }
+    if is_abort(effect.as_str(), op.as_str()) {
+        let message = raised_message(c, &args);
+        args.release();
+        let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
+            .primary(c.site(), "raised here");
+        return c.pend(d, message);
+    }
+    // Only a raise no frame answers is shown what it carried: one a clause takes is not read.
+    let carried: Vec<Plain> = raised_values(c, &args)
+        .iter()
+        .map(|v| v.as_ref().map_or(Plain::Elided(0), Plain::shown))
+        .collect();
+    let slots: Vec<String> = (0..carried.len()).map(ply_core::slot).collect();
+    let with = if slots.is_empty() {
+        String::new()
+    } else {
+        format!(" with {}", slots.join(", "))
+    };
+    let d = Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{effect}.{op}` was raised{with}, and nothing answers it"),
+    )
+    .note("a `try` around the call answers it as an `Err`, and a `handle` clause as it likes")
+    .showing(carried)
+    .primary(c.site(), "raised here");
+    c.pend_raised(d, effect.clone(), op.clone(), args)
+}
+
+/// The message an `abort.raise` carries, empty where it does not lower to a string.
+fn raised_message(c: &mut Ctx, args: &Raised) -> String {
+    match raised_values(c, args).first() {
+        Some(Ok(Value::Str(s))) => s.to_string(),
+        _ => String::new(),
     }
 }
 
 /// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays
 /// it out, the entry no longer failed: for compiled code to raise it through the word that answers
-/// it. Where that word's slot is the frame bridge's (`bridged` not 0), the raise goes on from here
-/// as the one it is, its diagnostic kept: to a frame that answers it, or pending again, and this
-/// answers 0 with the entry failed. 0 with the entry failed as it was where nothing is pending.
+/// it. Where that word's slot is the frame bridge's or [`UNSERVED`]'s (`bridged` not 0), the raise
+/// goes on from here as the one it is, its diagnostic kept: to a frame that answers it, or pending
+/// again, and this answers 0 with the entry failed. 0 with the entry failed as it was where nothing
+/// is pending.
 pub unsafe extern "C" fn rt_pending_raised(
     ctx: *mut Ctx,
     string: *const PlyType,

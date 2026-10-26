@@ -12,9 +12,10 @@ import compiler.emit.code (Code, NHandle, NBlock, NApp, NLambda, NVar, NLit, NIf
 import compiler.syntax.parsing (Span, span_between)
 import compiler.syntax.patterns (LBytes)
 import compiler.check.resolve.tables (qualify)
-import compiler.check.types (Type, TyCon, TyVar, TyRecord, fn_type, row_empty, fields_sorted,
-                             list_type, int_type, bytes_type, unit_type, option_type, bool_type)
-import compiler.syntax.type_syntax (MWrite)
+import compiler.check.types (Type, TyCon, TyVar, TyRecord, Atom, RSingleton, fn_type, row_empty,
+                             fields_sorted, list_type, int_type, bytes_type, unit_type, option_type,
+                             bool_type)
+import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Written, Lower, Lift, Dup, Worded, Contained, Root,
                            root_name, root_text, op_name)
@@ -31,7 +32,7 @@ import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label,
                                    Encoded, Unsettled, Entering, Framing, FramingSet, ObjectAt,
                                    Framed, Forwarded, raised_at)
 import compiler.emit.typing (Typed)
-import compiler.check.infer.checker (FiledRows, RowArguments)
+import compiler.check.infer.checker (FiledRows, RowArguments, Performs)
 import compiler.emit.answer (Need, Exact)
 import compiler.emit.lower.setting (Root, prelude_ctor)
 import compiler.emit.lower.held (held_as)
@@ -2040,8 +2041,10 @@ test "an entry of a definition generic over a row calls it as any caller does, a
           c.name == b"none"),
         None,
       );
+      // The call fills the row with nothing, so the entry's body performs nothing.
       assert_eq(e.rows.fold([], |acc: List<FiledRows>, _: Int, r: FiledRows| acc.push(r)), [
         RowArguments([row_empty()]),
+        Performs(row_empty()),
       ]);
       assert(!e.here.any(|d: Def| d.name == b"none"), None)
     },
@@ -2059,8 +2062,8 @@ test "an entry under real handlers hands each a closure over the call inside it,
     int_type(),
     row_empty(),
     [
-      { call: b"std.a.a::served", effect: b"std.a.a" },
-      { call: b"std.b.b::served", effect: b"std.b.b" },
+      { call: b"std.a.a::served", effect: b"std.a.a", adds: [] },
+      { call: b"std.b.b::served", effect: b"std.b.b", adds: [] },
     ],
   );
   match e.code {
@@ -2084,6 +2087,52 @@ test "an entry under real handlers hands each a closure over the call inside it,
         e.typed.fold(0, |n: Int, _: Int, t: Typed|
           if t.ty == fn_type([], int_type(), row_empty()) { n + 1 } else { n }),
         2,
+      )
+    },
+  }
+}
+
+test "an entry holds words for what its real handlers leave and add, and each closure performs what its handlers' calls add" {
+  let atom = |name: Bytes, mode: Mode| { effect: name, resource: RSingleton, mode: mode, op: None };
+  let e = entered_code(
+    b"m",
+    Named(b"m.main"),
+    Named(b"m.main"),
+    [],
+    [],
+    [],
+    int_type(),
+    {
+      atoms: [atom(b"std.a.a", MRead), atom(b"std.b.b", MRead), atom(b"m.log", MWrite)],
+      tail: None,
+    },
+    [
+      { call: b"std.a.a::served", effect: b"std.a.a", adds: [atom(b"std.fs.fs", MRead)] },
+      { call: b"std.b.b::served", effect: b"std.b.b", adds: [atom(b"abort", MRaise)] },
+    ],
+  );
+  match e.code {
+    Err(why) -> assert_eq(why, b""),
+    Ok(code) -> {
+      assert_eq(
+        e.rows.get(code.span.site),
+        Some(
+          Performs({
+            atoms: [atom(b"m.log", MWrite), atom(b"abort", MRaise), atom(b"std.fs.fs", MRead)],
+            tail: None,
+          }),
+        ),
+      );
+      // The closure `std.a.a`'s handler runs performs what `std.b.b`'s adds.
+      assert(
+        e.rows.fold(false, |found: Bool, _: Int, r: FiledRows|
+          found
+            || r
+            == Performs({
+              atoms: [atom(b"std.a.a", MRead), atom(b"m.log", MWrite), atom(b"abort", MRaise)],
+              tail: None,
+            })),
+        None,
       )
     },
   }

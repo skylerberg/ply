@@ -9,20 +9,20 @@
 import compiler.syntax.parsing (Span)
 import compiler.check.types (Type, TyCon, Row, Atom, Resource, RNamed, RSingleton, RVar, RAny,
                              Scheme, int_type, row_empty)
-import compiler.check.infer.checker (RowArguments, Performs, PerformsAtom)
+import compiler.check.infer.checker (RowArguments, Performs, PerformsAtom, simulated_names)
 import compiler.emit.typing (Filings, rows_filed_at)
 import compiler.emit.code (Code, NLabel, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
                            NMatch, NPerform, NLambda, NSimulate, NParallel, NHandle, NField,
                            NUpdate, NKnown, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
                            CodeClause, Capture, is_label_binder)
-import compiler.emit.keys (RootKey, Evidence, key_rows, unspecialised)
+import compiler.emit.keys (RootKey, Entered, Evidence, key_rows, unspecialised)
 import compiler.emit.evidence (Own, Keyed, row_words, written_row, opened, labels_handed, keyed,
                                key_rows_of, covers, answered, ordered, evidence_type, words_apart,
                                words_carried, words_laid_type, words_laid_of, row_described_type)
 import compiler.emit.reps (Def)
 import compiler.emit.tir (Rep, RInt, RImm, Var, Arg, AVar, AInt, AZero, Op, OHandle, Static,
                           Convention, Lent, Uses)
-import compiler.emit.tir.handling (WordsLaid, WordAt, Bridge)
+import compiler.emit.tir.handling (HandleOp, WordsLaid, WordAt, Bridge, Hosted, Unserved)
 import compiler.emit.tir.statics (StaticLaid, StaticWord, SPlain, WRaw, WField)
 import compiler.emit.lower.setting (Setting)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Worded, bound_as, static_added)
@@ -88,6 +88,75 @@ pub fn root_opened(
     st: read.st,
   }
 }
+
+/// The state an entry's body starts in, opened as `o` says: holding, for each effect of the row
+/// filed at `at`, what the root and the real handlers it runs under perform, the object the runtime
+/// answers that effect by where nothing of the program does. Any other root as `o` says.
+pub fn entry_opened(o: { cx: Context, st: Lowering }, at: Span) -> { cx: Context, st: Lowering } =
+  match o.cx.key {
+    Entered(_) -> {
+      let effects = filed_row(o.cx, at).atoms.fold([], |acc: List<Bytes>, a: Atom|
+        if !answered(a.effect) || acc.contains(a.effect) { acc } else { acc.push(a.effect) });
+      let held = effects.fold(
+        { st: o.st, made: [], words: [] },
+        |acc: { st: Lowering, made: List<Made>, words: List<Worded> }, e: Bytes| {
+          let op = entry_object(e);
+          let w = match acc.made.find(|m: Made| m.op == op) {
+            Some(m) -> { st: acc.st, made: acc.made, arg: m.arg },
+            None -> {
+              let b = bound_as(
+                acc.st,
+                evidence_type(),
+                RImm,
+                Op({ op: OHandle(op), args: [], uses: reads(0) }),
+                at,
+              );
+              { st: b.st, made: acc.made.push({ op: op, arg: b.arg }), arg: b.arg }
+            },
+          };
+          {
+            st: w.st,
+            made: w.made,
+            words: acc.words.push({
+              evidence: { effect: e, resource: RAny },
+              word: w.arg,
+              through: false,
+              handled: false,
+            }),
+          }
+        },
+      );
+      { cx: { ..o.cx, words: held.words.concat(o.cx.words) }, st: held.st }
+    },
+    _ -> o,
+  }
+
+/// An object an entry holds, made once whatever number of its effects it answers.
+type Made = { op: HandleOp, arg: Arg }
+
+/// The object an entry hands its root for effect `name`, which no `handle` of the program answers there:
+/// the frame bridge for the scheduler's effects, whose regions the frames hold; for a family the
+/// Rust binding serves, the object that hands its operations to the binding; and for any other,
+/// `abort` among them, the one that refuses its operations. Each leaves a raise unanswered.
+fn entry_object(name: Bytes) -> HandleOp =
+  if name == b"sim" || simulated_names().contains(name) { Bridge }
+  else if rust_families().contains(name) { Hosted }
+  else { Unserved }
+
+/// The effects the Rust binding serves, by program-wide name: those of the modules the builder
+/// imports and the compiler's own, which declare no real handler, and the CLI's `env`.
+fn rust_families() -> List<Bytes> =
+  [
+    b"compiler.cc.compilers",
+    b"compiler.cc.memory",
+    b"compiler.cc.toolchain",
+    b"compiler.unit.shipped",
+    b"env.env",
+    b"std.fs.fs",
+    b"std.process.process",
+    b"std.random.entropy",
+    b"std.time.time",
+  ]
 
 /// The words a function handed `own` holds, from `carried`, its parameters that carry them: each
 /// one's own, or each read out of the one array where there are more than `words_apart`.

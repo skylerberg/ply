@@ -49,6 +49,10 @@ pub struct Ctx {
     /// The evidence object of every effect that hands each operation to the frame protocol
     /// ([`BRIDGE`]), for code that holds no word answering one.
     pub bridge: Word,
+    /// What an entry hands its root for an effect the Rust binding serves ([`HOSTED`]) and for one
+    /// nothing answers ([`UNSERVED`]).
+    pub hosted: Word,
+    pub unserved: Word,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -231,7 +235,9 @@ impl Ctx {
             entering_desc: 0,
             entering_words: 0,
             recording: 0,
-            bridge: bridge_word(),
+            bridge: object_word(&BRIDGE),
+            hosted: object_word(&HOSTED),
+            unserved: object_word(&UNSERVED),
             step_budget: 0,
             grown: 0,
             deadline: None,

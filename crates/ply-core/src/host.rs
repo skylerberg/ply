@@ -717,6 +717,19 @@ pub fn err_unbound(span: Span, operation: &str) -> Diagnostic {
     .note(format!("handle `{operation}` in the program"))
 }
 
+/// An operation of an effect that no handler of the program, no real handler and no host family
+/// answers, refused at the entry that performed it.
+#[cold]
+#[inline(never)]
+pub fn err_unserved(span: Span, operation: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_UNBOUND,
+        format!("`{operation}` reached the host boundary, and nothing serves it"),
+    )
+    .primary(span, "no handler here, and no host serves this effect")
+    .note(format!("handle `{operation}` in the program"))
+}
+
 #[cold]
 #[inline(never)]
 pub fn err_withheld(
