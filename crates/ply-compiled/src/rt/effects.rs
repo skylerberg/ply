@@ -586,6 +586,18 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     if let Some(f) = &mine {
         f.land(c);
     }
+    // A raise the runtime left pending that nothing inside the frame took is the frame's where a
+    // clause of it answers `abort.raise`.
+    if c.failed == FAILED_PENDING
+        && let Some(f) = &mine
+        && let Some(clause) = f
+            .clauses
+            .iter()
+            .position(|cl| cl.answers_raise("abort", "raise"))
+    {
+        let string = f.clauses[clause].string;
+        c.bind_pending((stack, depth, clause), string);
+    }
     if c.failed == FAILED_ABORT
         && let Some(a) = c.aborting.take_if(|a| a.stack == stack && a.depth == depth)
     {

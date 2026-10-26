@@ -433,7 +433,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
                 let message = failure.message.clone();
                 // Bound from the task's own stack: its handles answer before the region's.
                 c.current = sim.slot(task).frames;
-                c.raise(failure, message);
+                c.pend(failure, message);
                 Some(k)
             }
         };

@@ -674,8 +674,9 @@ impl Ctx {
         self.fail_with(FAILED, d)
     }
 
-    /// Fails as a raise of `abort.raise`, bound for the innermost `handle` in reach with a clause
-    /// for it; with none, the entry fails with `d` as [`Ctx::fail`] would.
+    /// Fails as a raise of `abort.raise` made where the code's word for `abort` is the frame bridge,
+    /// bound for the innermost frame in reach with a clause for it, which is the innermost `handle`
+    /// answering it there; with none, left pending as [`Ctx::pend`] leaves it.
     pub(crate) fn raise(&mut self, d: Diagnostic, message: String) -> i64 {
         if self.failed != 0 {
             return 0;
@@ -684,31 +685,60 @@ impl Ctx {
             return self.pend(d, message);
         };
         let (stack, depth, clause) = at;
-        let clause = &self.stacks[stack].list[depth].clauses[clause];
-        let message = Value::str(message);
-        // The clause takes the message as emitted code lays a `String`, lifted through the type its
-        // `handle` site handed.
-        let Some(ty) = clause.string else {
-            return self.fail(
-                error("an `abort.raise` clause emitted code installed has no `String` type")
-                    .note("this is Ply's fault, not the program's"),
-            );
-        };
-        let Some(w) = lifted(self, &message, ty) else {
-            return 0;
-        };
-        let args = Raised(vec![unsafe { Carried::new(w, ty) }]);
-        self.bind_raise(at, args, d)
+        let string = self.stacks[stack].list[depth].clauses[clause].string;
+        self.pending = Some(message);
+        self.fail_with(FAILED_PENDING, d);
+        self.bind_pending(at, string);
+        0
     }
 
-    /// Leaves `abort.raise` of `message`, which no frame answers, pending for the compiled code
-    /// holding the word that does; `d` is what the entry fails with should none take it.
+    /// Fails as a raise of `abort.raise` of `message` the runtime makes, left pending for the code
+    /// around the failure, whose innermost `handle` answering it takes it: an instance's landing, a
+    /// frame's landing where a clause of it answers `abort.raise`, or a function holding a word for
+    /// `abort`, which raises it through that word as it leaves. `d` is what the entry fails with
+    /// should none take it.
     pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
         if self.failed != 0 {
             return 0;
         }
         self.pending = Some(message);
         self.fail_with(FAILED_PENDING, d)
+    }
+
+    /// Binds the raise left pending to the clause at `at` of a frame, which takes the message as
+    /// emitted code lays a `String`, lifted through `string`, the type its `handle` site handed.
+    pub(super) fn bind_pending(
+        &mut self,
+        at: (usize, usize, usize),
+        string: Option<&'static PlyType>,
+    ) {
+        let Some(message) = self.pending.take() else {
+            return;
+        };
+        let diagnostic = self
+            .diagnostic
+            .take()
+            .unwrap_or_else(|| self.placed(error("a raise was left pending without a failure")));
+        self.failed = 0;
+        let Some(ty) = string else {
+            self.fail(
+                error("an `abort.raise` clause emitted code installed has no `String` type")
+                    .note("this is Ply's fault, not the program's"),
+            );
+            return;
+        };
+        let Some(w) = lifted(self, &Value::str(message), ty) else {
+            return;
+        };
+        let (stack, depth, clause) = at;
+        self.aborting = Some(Aborting {
+            stack,
+            depth,
+            clause,
+            args: Raised(vec![unsafe { Carried::new(w, ty) }]),
+            diagnostic,
+        });
+        self.failed = FAILED_ABORT;
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
