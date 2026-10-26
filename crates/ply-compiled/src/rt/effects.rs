@@ -42,6 +42,7 @@ fn installed(c: &mut Ctx, clauses: *const Word, n: I64, ret: Handed) -> (i64, u6
         fuel,
         handler,
         vars: None,
+        inherited: false,
     });
     ((frames.len() - 1) as i64, handler)
 }
@@ -398,7 +399,7 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
                         )
                     };
                 }
-                found = Some((stack, i, cl.closure, cl.resumes != 0, cl.label));
+                found = Some((stack, i, cl.closure, cl.resumes != 0, cl.label, f.inherited));
                 break 'search;
             }
         }
@@ -421,7 +422,7 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
         );
         return c.fail(d);
     }
-    let Some((stack, depth, closure, resumes, label)) = found else {
+    let Some((stack, depth, closure, resumes, label, inherited)) = found else {
         if target.is_some() {
             return c.fail(err_handle_gone(&effect, &op));
         }
@@ -451,6 +452,8 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
     if let (Some(string), Some(label)) = (label, &resource) {
         call_args.push(label_word(ctx, string, label));
     }
+    // Where nothing on the task's stack lands for the frame, a clause that does not resume is refused.
+    let abandoning = (inherited && resumes).then(|| (effect.clone(), op.clone(), c.site()));
     drop((effect, op, resource));
     // The clause runs outside its handler: that frame and all above it are hidden until it returns.
     let held = c.stacks[stack].list[depth].held();
@@ -472,14 +475,32 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
     if !resumes {
         return r;
     }
-    match c.resumed.take() {
-        Some(v) => v,
-        None => {
+    match (c.resumed.take(), abandoning) {
+        (Some(v), _) => v,
+        // What the clause answered is emitted code's, abandoned uncounted as an unwind's is.
+        (None, Some((effect, op, site))) => c.fail(err_task_abandoned(&effect, &op, site)),
+        (None, None) => {
             c.unwind = Some((stack, depth, r));
             c.failed = FAILED_UNWIND;
             0
         }
     }
+}
+
+/// A task's perform answered by a clause, of a `handle` around its spawn, that stopped the body
+/// rather than resume it: what it would abandon is the spawner's, not the task's.
+#[cold]
+#[inline(never)]
+fn err_task_abandoned(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{effect}.{op}` was performed in a task, and its handler did not resume it"),
+    )
+    .primary(site, "performed here")
+    .note(
+        "the clause would abandon the body the task was spawned in, which is not the task's own: \
+         handle the operation inside the task, or resume on every path",
+    )
 }
 
 /// A perform or raise sent to a `handle` whose frame is no longer installed where it was made: an

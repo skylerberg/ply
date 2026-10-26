@@ -9,7 +9,7 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_bracket_callee, role_tag_texts, role_tag_holes,
                                 role_var_first_read)
 import std.list (prepend)
-import compiler.syntax.type_syntax (TypeExpr, mode_text, is_raise)
+import compiler.syntax.type_syntax (TypeExpr, MRaise, mode_text, is_raise)
 import compiler.syntax.items (DOrd, member_name, member_of, Opaque)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
@@ -17,8 +17,9 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               Stmt, SLet, SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm,
                               HandleClause, ReturnClause, HandlerVar, RecField, expr_span,
                               is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
-                              tagged_filler, call_operator, written_operator, Slot, FromName,
-                              FromDefault, simulated_at, detached_at, branch_at, try_places)
+                              tagged_filler, call_operator, written_operator, is_exit_effect,
+                              exit_op, Slot, FromName, FromDefault, simulated_at, detached_at,
+                              branch_at, try_places)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                                  PBad, Lit, LInt, LFixed, LWide, pat_span, has_or)
 import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -4089,6 +4090,58 @@ fn resolve_op(
   checker: Checker,
   eff: QName,
   ident: Ident,
+) -> { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> } / {abort.raise} =
+  if is_exit_effect(eff.name.name) { exit_resolved(checker, eff) }
+  else { declared_op(checker, eff, ident) }
+
+/// The one raise of an exit effect (`exit_effect`), which carries one type wherever it is
+/// raised and answered: the failure its `?`s leave a `handle` with, which the `?` written around
+/// the `handle` answering it holds to what its function answers.
+fn exit_resolved(checker: Checker, eff: QName) -> WithHit / {abort.raise} = {
+  let key = Bytes::concat_all([ascii_of_int(checker.module), b" ", eff.name.name]);
+  let carried: WithTy = match checker.exit_types.get(key) {
+    Some(t) -> { checker: checker, ty: t },
+    None -> {
+      let o: WithTy = new_ty(checker);
+      { checker: { ..o.checker, exit_types: o.checker.exit_types.insert(key, o.ty) }, ty: o.ty }
+    },
+  };
+  let answer: WithVar = new_ty_var(carried.checker);
+  let at = { module: checker.module, span: eff.span };
+  let op = {
+    name: exit_op(),
+    mode: MRaise,
+    resource_param: false,
+    params: [carried.ty],
+    ret: TyVar(answer.var),
+    at: at,
+    scheme: Some({
+      ty_vars: [answer.var],
+      row_vars: [],
+      label_vars: [],
+      ty: fn_type([carried.ty], TyVar(answer.var), row_empty()),
+    }),
+  };
+  {
+    checker: answer.checker,
+    hit: Some({
+      info: {
+        name: eff.name.name,
+        module: b"",
+        simple_name: eff.name.name,
+        nondet: false,
+        ops: [op],
+        at: at,
+      },
+      op: op,
+    }),
+  }
+}
+
+fn declared_op(
+  checker: Checker,
+  eff: QName,
+  ident: Ident,
 ) -> { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> } / {abort.raise} = {
   let e: WithName = effect_name(checker, eff);
   match e.name {
@@ -4404,7 +4457,9 @@ fn infer_perform(
   args: List<Expr>,
 ) -> Inferred / {abort.raise} = {
   // Read ahead for what the arguments are expected to be; an unknown operation is reported below.
-  let wanted = match resolve_op(checker, eff, ident).hit { Some(hit) -> hit.op.params, None -> [] };
+  // An exit effect's carried type is made where it is first read, so it is read once, below.
+  let wanted = if is_exit_effect(eff.name.name) { [] }
+  else { match resolve_op(checker, eff, ident).hit { Some(hit) -> hit.op.params, None -> [] } };
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     checker,
     args,
@@ -5024,9 +5079,9 @@ fn named_raise(checker: Checker, name: RaiseName) -> WithHit / {abort.raise} = {
 }
 
 /// The one raise a body's row names, `abort.raise` aside: what can fail on a value raises that, so a
-/// `try` answers it only by name.
+/// `try` answers it only by name. A `?` leaving a `handle` raises no raise a `try` answers.
 fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} = {
-  let raises = row.atoms.filter(|a: Atom| is_raise(a.mode) && a != abort_atom());
+  let raises = row.atoms.filter(tried);
   let found = |a: Atom|
     match effect_of(checker, a.effect) {
       None -> None,
@@ -5132,6 +5187,9 @@ fn passing_raise(checker: Checker, span: Span, row: Row, atom: Atom) -> Checker 
     None -> checker,
   }
 
+/// Whether a `try` that names no raise may answer `a`.
+fn tried(a: Atom) -> Bool = is_raise(a.mode) && a != abort_atom() && !is_exit_effect(a.effect)
+
 fn carried_type(params: List<Type>) -> Type / {abort.raise} =
   match params {
     [] -> unit_type(),
@@ -5175,10 +5233,7 @@ fn infer_try_block(
     // is the one report.
     None -> {
       let o: WithTy = new_ty(chosen.checker);
-      let might = match raise {
-        Some(_) -> [],
-        None -> body_row.atoms.filter(|a: Atom| is_raise(a.mode) && a != abort_atom()),
-      };
+      let might = match raise { Some(_) -> [], None -> body_row.atoms.filter(tried) };
       {
         checker: discharge(o.checker, mark, body_mark, might),
         ty: TyCon({ name: b"Result", args: [b.ty, o.ty] }),

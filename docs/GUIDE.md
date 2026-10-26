@@ -1553,7 +1553,10 @@ fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc 
 A tail call of another function in the same module is a loop too when the two
 are in one recursive group, a set of definitions whose tail calls lead back to
 each other, so `even`/`odd` mutual recursion does not nest either. A group with
-a `handle` in a member's body is compiled definition by definition and nests.
+a `handle` in a member's body whose clause resumes off its tail (§6.6), running
+the body on a stack of its own, is compiled definition by definition and nests;
+one whose `handle`s answer, resume on their tail or answer a raise, as a `try`
+does, keeps its loop.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_hold` or a lambda, and a call of another function.
@@ -1597,7 +1600,19 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `try`, `with_hold` or `simulate`; inside a
+* Inside a `handle` or a `try`, in its body, a clause or its `return` clause,
+  it exits the function through it, as a raise would: every `handle` between is
+  left, none of their `return` clauses runs, and no clause answers it, a `try`'s
+  included. It stands there as it would in a body of its own, and the
+  outermost `handle` holding one stands where a `?` could (`E0119`):
+
+  ```ply
+  fn priced(sku: String) -> Result<Int, String> = {
+    let base = handle { catalog::price(sku)? + rate.get() } with { rate.get() -> 3 };
+    Ok(base * 2)
+  }
+  ```
+* `E0118`: inside a `with_hold`, a `simulate` or a `parallel` branch; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -2000,12 +2015,39 @@ value reaches it, and offers a clause per operation not yet named. A `handle`
 is judged by rows alone, so a lambda or a function-typed parameter is judged
 by its type.
 
+A `handle` answers what its body's row names and nothing else: the operations
+its body performs, and those of the definitions and function values it calls
+whose types name them. An operation that reaches the body only through a row
+variable or a label parameter of the enclosing definition is the caller's,
+whatever it turns out to be when the program runs: it goes where the
+definition's signature sends it, to the handlers around the call. So a
+definition generic over a row or a label never observes or answers what the
+row or label stands for:
+
+```ply
+fn quiet<| e>(f: () -> Int / e) -> Int / e =
+  handle { f() } with { log.note(s) -> () }
+```
+
+`quiet(|| { log.note("x"); 1 })` performs its `log.note` against the handlers
+around the call of `quiet`, never against `quiet`'s clause, which answers only a
+`log.note` that `quiet`'s own body names. A library that answers its callback's
+operations names them in the parameter's type, as `sink` names `log.note[*]`
+above and `std.db`'s `transaction` takes `body: () -> a / {db.rollback | e}` to
+answer the body's rollback itself. A clause on a label parameter answers that
+parameter, and one on a named label never answers a perform on the parameter,
+whatever label fills it. A function value takes its handlers from where it is
+called, by its row there, a continuation included (§6.6).
+
 ### 6.6 `resume`
 
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
 continuation; the clause then has the `handle`'s type and may call `k` any
 number of times. Without `resume`, a clause's value returns to the perform site,
-except a clause for a `raise` operation (§6.8).
+except a clause for a `raise` operation (§6.8). `k` is a function value, and may
+be kept past the `handle` and called after it has ended: what the resumed body
+performs that its own `handle`s do not answer then goes to the handlers around
+that call, not to those that were around the capture.
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -2079,9 +2121,9 @@ reach the body only through a row variable of the enclosing definition is
 function that answers a raise of its callback names it in the callback's row,
 `f: () -> a / {toml.syntax | e}`. A `try` is the `handle` with that
 one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
-recursive group with one in a member's body nests (§5.7), a `?` inside one is
-`E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
-own. An `Err` goes back to its raise through a function:
+recursive group with one in a member's body keeps its loop (§5.7), a `?` inside
+one exits the function through it (§5.8), and a `try` in a module that binds an
+`Ok` or an `Err` of its own is `E0118`. An `Err` goes back to its raise through a function:
 `r.unwrap_or_else(|e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
 
 The prelude declares `effect abort { raise raise(message: String) }`.
@@ -2648,9 +2690,11 @@ effect sim           { read  seed() -> Int }
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
   wall clock. Outside a region `task` and `clock` are the host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
-  reaches reads only the holds the task itself may (§7); a clause that binds
-  `resume` is unreachable from a task (`E0502`), and a clause for a raise is
-  not among them (§6.8).
+  reaches reads only the holds the task itself may (§7). A clause that answers,
+  or resumes on its tail, answers the task as it would the spawner; one that
+  resumes off its tail, or stops the body without resuming it, would capture or
+  abandon the spawner's body rather than the task's, and is refused when the
+  task reaches it (`E0502`). A clause for a raise is not among them (§6.8).
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its

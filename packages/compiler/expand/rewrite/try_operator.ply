@@ -9,7 +9,8 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, ETryBlock, Stmt, SLet,
                               SLetElse, SExpr, SAssign, HandlerVar, NamedArg, MatchArm,
-                              HandleClause, RecField, expr_span, ETagged, Hole, with_hole_values)
+                              HandleClause, ReturnClause, RecField, expr_span, ETagged, Hole,
+                              with_hole_values, exit_effect, is_exit_effect, exit_op)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PCtor, LUnit)
 import std.bytes (ascii_of_int)
 import compiler.expand.rewrite.shared (max_alias_depth, collect_types, find_type, is_pure,
@@ -28,12 +29,17 @@ fn too_deep() -> Bytes =
 type TryMode = | TryResult | TryOption
 
 /// `shadowed` is the note for a module whose own `Ok`/`Err`/`Some`/`None` would capture the expansion.
+/// `exit` is the effect a `?` raises to leave the `handle` it stands in, while one is expanded;
+/// `exits` numbers the item's functions and typed lambdas, written at `item_at`, that `?` exits.
 type TryState = {
   types: List<TypeDef>,
   shadowed: Option<Bytes>,
   diags: List<ParseDiag>,
   mode: Option<TryMode>,
   fresh: Int,
+  exit: Option<Bytes>,
+  exits: Int,
+  item_at: Int,
 }
 
 type Lift = { operand: Expr, binder: Ident, at: Span }
@@ -132,7 +138,21 @@ pub fn ctor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
 /// place of its own, which the checker files the constructor's type at as it does a written one's.
 fn failed_at(at: Span) -> Span = if at.end > at.start { { ..at, start: at.end - 1 } } else { at }
 
-/// `match operand { <failure>, <success>(pat) -> body }`, failure arm first.
+/// The raise of `exit` a `?` written at `span` leaves its `handle` by, carrying `value`.
+fn exited(exit: Bytes, span: Span, value: Expr) -> Expr = {
+  let at = failed_at(span);
+  EPerform({
+    span: at,
+    eff: bare({ name: exit, span: at }),
+    op: { name: exit_op(), span: at },
+    resource: None,
+    args: [value],
+  })
+}
+
+/// `match operand { <failure>, <success>(pat) -> body }`, failure arm first. Inside a `handle`
+/// the failure leaves it by `state.exit`, carrying what the function or lambda would answer
+/// beside the constructor.
 fn wrap(
   state: TryState,
   operand: Expr,
@@ -148,13 +168,17 @@ fn wrap(
     TryResult -> {
       let fresh = fresh_binder(state, span);
       let fail_pat = ctor_pattern(b"Err", [var_pattern(fresh.binder)], span);
-      let fail_body = EApp({
-        span: span,
-        func: var_of({ name: b"Err", span: failed_at(span) }),
-        args: [var_of(fresh.binder)],
-        named: [],
-        labels: [],
-      });
+      let fail_body = match state.exit {
+        Some(exit) -> exited(exit, span, var_of(fresh.binder)),
+        None ->
+          EApp({
+            span: span,
+            func: var_of({ name: b"Err", span: failed_at(span) }),
+            args: [var_of(fresh.binder)],
+            named: [],
+            labels: [],
+          }),
+      };
       {
         state: fresh.state,
         expr: EMatch({
@@ -169,7 +193,10 @@ fn wrap(
     },
     TryOption -> {
       let fail_pat = ctor_pattern(b"None", [], span);
-      let fail_body = var_of({ name: b"None", span: failed_at(span) });
+      let fail_body = match state.exit {
+        Some(exit) -> exited(exit, span, ELit({ span: failed_at(span), lit: LUnit })),
+        None -> var_of({ name: b"None", span: failed_at(span) }),
+      };
       {
         state: state,
         expr: EMatch({
@@ -737,6 +764,268 @@ fn take_try(state: TryState, operand: Expr, span: Span, pat: Pattern) -> TryTake
   }
 }
 
+// --- A `?` inside a `handle` -------------------------------------------------------------------
+
+// Inside a `handle` or a `try`, in a return position of its body, a clause or its `return`, a `?`
+// leaves by a raise of the effect its function or typed lambda exits by (`exit_effect`), carrying
+// the failure. The outermost `handle` holding such a `?` is written as the operand of a `?` of its
+// own, inside a `handle` whose one clause answers the raise with that failure, so the function
+// leaves where the `handle` stands, as it would by a `?` written there.
+
+/// `body`, a function's or a typed lambda's, which `?` exits by `state.mode`, with each outermost
+/// `handle` or `try` holding a `?` written out to leave through it.
+fn exits_lifted(state: TryState, body: Expr) -> TryOut / {abort.raise} =
+  exits_in({ ..state, exits: state.exits + 1 }, exit_effect(state.item_at, state.exits), true, body)
+
+/// `expr` with each `handle` or `try` in it holding a `?` written out to leave by `exit`, wrapped
+/// where `outermost`. A lambda's body, a `with_hold`'s, a `simulate`'s and a `parallel` branch are
+/// not entered: a `?` there exits no `handle` around them.
+fn exits_in(state: TryState, exit: Bytes, outermost: Bool, expr: Expr) -> TryOut / {abort.raise} =
+  match expr {
+    EHandle(_) -> handle_exits(state, exit, outermost, expr),
+    ETryBlock(_) -> handle_exits(state, exit, outermost, expr),
+    EBinary(b) -> {
+      let l = exits_in(state, exit, outermost, b.lhs);
+      let r = exits_in(l.state, exit, outermost, b.rhs);
+      { state: r.state, expr: EBinary({ ..b, lhs: l.expr, rhs: r.expr }) }
+    },
+    EUnary(u) -> {
+      let o = exits_in(state, exit, outermost, u.operand);
+      { state: o.state, expr: EUnary({ ..u, operand: o.expr }) }
+    },
+    EApp(a) -> {
+      let f = exits_in(state, exit, outermost, a.func);
+      let args = exits_all(f.state, exit, outermost, a.args);
+      let named = a.named.fold(
+        { state: args.state, args: [] },
+        |acc: { state: TryState, args: List<NamedArg> }, arg: NamedArg| {
+          let o = exits_in(acc.state, exit, outermost, arg.value);
+          { state: o.state, args: acc.args.push({ ..arg, value: o.expr }) }
+        },
+      );
+      { state: named.state, expr: EApp({ ..a, func: f.expr, args: args.exprs, named: named.args }) }
+    },
+    EIf(i) -> {
+      let c = exits_in(state, exit, outermost, i.cond);
+      let t = exits_in(c.state, exit, outermost, i.then_branch);
+      let el = exits_in(t.state, exit, outermost, i.else_branch);
+      {
+        state: el.state,
+        expr: EIf({ ..i, cond: c.expr, then_branch: t.expr, else_branch: el.expr }),
+      }
+    },
+    EMatch(m) -> {
+      let sc = exits_in(state, exit, outermost, m.scrutinee);
+      let arms = m.arms.fold(
+        { state: sc.state, arms: [] },
+        |acc: { state: TryState, arms: List<MatchArm> }, arm: MatchArm| {
+          let g = match arm.guard {
+            None -> { state: acc.state, expr: None },
+            Some(x) -> {
+              let o = exits_in(acc.state, exit, outermost, x);
+              { state: o.state, expr: Some(o.expr) }
+            },
+          };
+          let b = exits_in(g.state, exit, outermost, arm.body);
+          { state: b.state, arms: acc.arms.push({ ..arm, guard: g.expr, body: b.expr }) }
+        },
+      );
+      { state: arms.state, expr: EMatch({ ..m, scrutinee: sc.expr, arms: arms.arms }) }
+    },
+    EBlock(b) -> {
+      let stmts = b.stmts.fold(
+        { state: state, stmts: [] },
+        |acc: { state: TryState, stmts: List<Stmt> }, stmt: Stmt|
+          match stmt {
+            SLet(l) -> {
+              let o = exits_in(acc.state, exit, outermost, l.value);
+              { state: o.state, stmts: acc.stmts.push(SLet({ ..l, value: o.expr })) }
+            },
+            SLetElse(l) -> {
+              let v = exits_in(acc.state, exit, outermost, l.value);
+              let f = exits_in(v.state, exit, outermost, l.fallback);
+              {
+                state: f.state,
+                stmts: acc.stmts.push(SLetElse({ ..l, value: v.expr, fallback: f.expr })),
+              }
+            },
+            SExpr(x) -> {
+              let o = exits_in(acc.state, exit, outermost, x);
+              { state: o.state, stmts: acc.stmts.push(SExpr(o.expr)) }
+            },
+            SAssign(x) -> {
+              let o = exits_in(acc.state, exit, outermost, x.value);
+              { state: o.state, stmts: acc.stmts.push(SAssign({ ..x, value: o.expr })) }
+            },
+          },
+      );
+      let tl = match b.tail {
+        None -> { state: stmts.state, expr: None },
+        Some(t) -> {
+          let o = exits_in(stmts.state, exit, outermost, t);
+          { state: o.state, expr: Some(o.expr) }
+        },
+      };
+      { state: tl.state, expr: EBlock({ ..b, tail: tl.expr, stmts: stmts.stmts }) }
+    },
+    ERecord(r) -> {
+      let o = exits_fields(state, exit, outermost, r.fields);
+      { state: o.state, expr: ERecord({ ..r, fields: o.fields }) }
+    },
+    ERecordUpdate(r) -> {
+      let b = exits_in(state, exit, outermost, r.base);
+      let o = exits_fields(b.state, exit, outermost, r.fields);
+      { state: o.state, expr: ERecordUpdate({ ..r, base: b.expr, fields: o.fields }) }
+    },
+    ETry(t) -> {
+      let o = exits_in(state, exit, outermost, t.operand);
+      { state: o.state, expr: ETry({ ..t, operand: o.expr }) }
+    },
+    EField(f) -> {
+      let o = exits_in(state, exit, outermost, f.base);
+      { state: o.state, expr: EField({ ..f, base: o.expr }) }
+    },
+    EList(l) -> {
+      let o = exits_all(state, exit, outermost, l.items);
+      { state: o.state, expr: EList({ ..l, items: o.exprs }) }
+    },
+    EPerform(p) -> {
+      let o = exits_all(state, exit, outermost, p.args);
+      { state: o.state, expr: EPerform({ ..p, args: o.exprs }) }
+    },
+    ETagged(t) -> {
+      let o = exits_all(state, exit, outermost, t.holes.map(|h: Hole| h.value));
+      { state: o.state, expr: ETagged(with_hole_values(t, o.exprs)) }
+    },
+    _ -> { state: state, expr: expr },
+  }
+
+fn exits_all(
+  state: TryState,
+  exit: Bytes,
+  outermost: Bool,
+  exprs: List<Expr>,
+) -> { state: TryState, exprs: List<Expr> } / {abort.raise} =
+  exprs.fold(
+    { state: state, exprs: [] },
+    |acc: { state: TryState, exprs: List<Expr> }, expr: Expr| {
+      let o = exits_in(acc.state, exit, outermost, expr);
+      { state: o.state, exprs: acc.exprs.push(o.expr) }
+    },
+  )
+
+fn exits_fields(
+  state: TryState,
+  exit: Bytes,
+  outermost: Bool,
+  fields: List<RecField>,
+) -> { state: TryState, fields: List<RecField> } / {abort.raise} =
+  fields.fold(
+    { state: state, fields: [] },
+    |acc: { state: TryState, fields: List<RecField> }, field: RecField| {
+      let o = exits_in(acc.state, exit, outermost, field.value);
+      { state: o.state, fields: acc.fields.push({ ..field, value: o.expr }) }
+    },
+  )
+
+/// `part` of a `handle` or a `try`, its body, a clause's or its `return`'s, with each `?` in it
+/// that a return position of it, or of a `handle` inside it, holds leaving by `exit`.
+fn exits_through(state: TryState, exit: Bytes, part: Expr) -> TryOut / {abort.raise} = {
+  let nested = exits_in(state, exit, false, part);
+  ret({ ..nested.state, exit: Some(exit) }, nested.expr, tries_in(nested.expr))
+}
+
+/// `expr`, a `handle` or a `try`, with each `?` its parts hold leaving by `exit`; the `outermost`
+/// one holding any, written as the operand of a `?` around the `handle` that answers the raise.
+fn handle_exits(
+  state: TryState,
+  exit: Bytes,
+  outermost: Bool,
+  expr: Expr,
+) -> TryOut / {abort.raise} = {
+  let parts: TryOut = match expr {
+    EHandle(h) -> {
+      let b = exits_through(state, exit, h.body);
+      let cs = h.clauses.fold(
+        { state: b.state, clauses: [] },
+        |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
+          let o = exits_through(acc.state, exit, c.body);
+          { state: o.state, clauses: acc.clauses.push({ ..c, body: o.expr }) }
+        },
+      );
+      let r: { state: TryState, ret: Option<ReturnClause> } = match h.ret {
+        None -> { state: cs.state, ret: None },
+        Some(rc) -> {
+          let o = exits_through(cs.state, exit, rc.body);
+          { state: o.state, ret: Some({ ..rc, body: o.expr }) }
+        },
+      };
+      { state: r.state, expr: EHandle({ ..h, body: b.expr, clauses: cs.clauses, ret: r.ret }) }
+    },
+    ETryBlock(t) -> {
+      let b = exits_through(state, exit, t.body);
+      { state: b.state, expr: ETryBlock({ ..t, body: b.expr }) }
+    },
+    _ -> { state: state, expr: expr },
+  };
+  let left = { ..parts.state, exit: state.exit };
+  // Each `?` lifted takes a fresh binder, so one that took none holds no `?` that exits through it.
+  if parts.state.fresh == state.fresh { { state: left, expr: expr } }
+  else if !outermost { { state: left, expr: parts.expr } }
+  else { exit_answered(left, exit, parts.expr) }
+}
+
+/// The `?` of the `handle` around `h` answering `exit`: its one clause answers the failure the
+/// raise carried, and its body `h`'s answer as the success.
+fn exit_answered(state: TryState, exit: Bytes, h: Expr) -> TryOut / {abort.raise} = {
+  let span = expr_span(h);
+  let fresh = fresh_binder(state, span);
+  let named = |n: Bytes| var_of({ name: n, span: span });
+  let called = |n: Bytes, x: Expr|
+    EApp({ span: span, func: named(n), args: [x], named: [], labels: [] });
+  let answered = match state.mode {
+    Some(TryOption) -> { ok: called(b"Some", h), failed: named(b"None") },
+    _ -> { ok: called(b"Ok", h), failed: called(b"Err", var_of(fresh.binder)) },
+  };
+  {
+    state: fresh.state,
+    expr: ETry({
+      span: span,
+      operand: EHandle({
+        span: span,
+        body: answered.ok,
+        ret: None,
+        clauses: [
+          {
+            eff: bare({ name: exit, span: span }),
+            op: { name: exit_op(), span: span },
+            resource: None,
+            every_label: false,
+            label_binder: None,
+            resume: None,
+            body: answered.failed,
+            span: span,
+            params: [fresh.binder],
+          },
+        ],
+        vars: [],
+      }),
+    }),
+  }
+}
+
+/// Whether `operand` is the `handle` `exit_answered` writes around one holding a `?`.
+fn exit_answering(operand: Expr) -> Bool =
+  match operand {
+    EHandle(h) -> h.clauses.any(|c: HandleClause| is_exit_effect(c.eff.name.name)),
+    _ -> false,
+  }
+
+/// What a `handle`'s or a `try`'s parts stand behind as `sweep` reads them: no more than `barrier`
+/// where a `?` there exits the function or typed lambda through it, else the `handle` too.
+fn behind(state: TryState, barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
+  if state.mode == None { under(barrier, what) } else { barrier }
+
 /// Refuses and unwraps every `?` left in `expr`: `E0118` when `scope` or `barrier` says why, else `E0119`.
 fn sweep(
   state: TryState,
@@ -770,7 +1059,7 @@ fn sweep_within(
               Bytes::concat_all([
                 b"this `?` is inside ",
                 what,
-                b", which has no written return type of its own. `?` exits the expression it is written in and never a lambda, a handler or a region: name a function with a written `->` and call it",
+                b", which has no written return type of its own. `?` exits the expression it is written in and never a lambda or a region: name a function with a written `->` and call it",
               ]),
             ],
           ),
@@ -783,7 +1072,17 @@ fn sweep_within(
               b"no `Result` or `Option` to expand this into",
               [why],
             ),
-          None ->
+          None -> if exit_answering(t.operand) {
+            error_at(
+              b"E0119",
+              t.span,
+              b"this `handle` holds a `?`, and stands where one could not be expanded from",
+              b"a `?` inside it leaves the function from here",
+              [
+                b"a `?` inside a `handle` leaves the function where the `handle` stands, so the `handle` stands where a `?` could: at the head of a statement or of the return position, with nothing conditional between, and everything evaluated before it pure. Bind it first: `let a = handle { .. } with { .. };`",
+              ],
+            )
+          } else {
             error_at(
               b"E0119",
               t.span,
@@ -792,10 +1091,16 @@ fn sweep_within(
               [
                 b"`?` lifts what it unwraps to the head of the statement, or of the return position, it is written in \xe2\x80\x94 so nothing conditional may sit between the two, and everything evaluated before it must be pure. Bind it first: `let a = e?;`",
               ],
-            ),
+            )
+          },
         },
       };
-      sweep_inner({ ..state, diags: state.diags.push(d) }, t.operand, scope, barrier, room)
+      // The `handle` written around one holding a `?` answers what the `?` would unwrap.
+      if exit_answering(t.operand) {
+        { state: { ..state, diags: state.diags.push(d) }, expr: EBad({ span: t.span }) }
+      } else {
+        sweep_inner({ ..state, diags: state.diags.push(d) }, t.operand, scope, barrier, room)
+      }
     },
     _ -> sweep_inner(state, expr, scope, barrier, room),
   }
@@ -839,7 +1144,8 @@ fn sweep_inner(
         },
         Ok(m) -> {
           let saved = state.mode;
-          let r = ret({ ..state, mode: Some(m) }, l.body, tries_in(l.body));
+          let ex = exits_lifted({ ..state, mode: Some(m) }, l.body);
+          let r = ret(ex.state, ex.expr, tries_in(ex.expr));
           let s: TryOut = if room <= 0 { panic("a lambda swept past the ones written") }
           else { sweep_within(r.state, r.expr, None, None, room - 1) };
           {
@@ -971,7 +1277,13 @@ fn sweep_inner(
           { state: o.state, vars: acc.vars.push({ ..v, init: o.expr }) }
         },
       );
-      let b = sweep_within(vs.state, h.body, scope, under(barrier, b"a `handle` body"), room);
+      let b = sweep_within(
+        vs.state,
+        h.body,
+        scope,
+        behind(state, barrier, b"a `handle` body"),
+        room,
+      );
       let cs = h.clauses.fold(
         { state: b.state, clauses: [] },
         |acc: { state: TryState, clauses: List<HandleClause> }, c: HandleClause| {
@@ -979,7 +1291,7 @@ fn sweep_inner(
             acc.state,
             c.body,
             scope,
-            under(barrier, b"a `handle` clause"),
+            behind(state, barrier, b"a `handle` clause"),
             room,
           );
           {
@@ -1005,7 +1317,7 @@ fn sweep_inner(
             cs.state,
             rc.body,
             scope,
-            under(barrier, b"a `handle` return clause"),
+            behind(state, barrier, b"a `handle` return clause"),
             room,
           );
           { state: o.state, ret: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
@@ -1043,7 +1355,7 @@ fn sweep_inner(
       { state: o.state, expr: EParallel({ span: x.span, branches: o.exprs }) }
     },
     ETryBlock(x) -> {
-      let o = sweep_within(state, x.body, scope, under(barrier, b"a `try` body"), room);
+      let o = sweep_within(state, x.body, scope, behind(state, barrier, b"a `try` body"), room);
       { state: o.state, expr: ETryBlock({ ..x, body: o.expr }) }
     },
     ETagged(t) -> {
@@ -1089,8 +1401,18 @@ fn sweep_fields(
     },
   )
 
+/// Where `item` is written, which names apart the exit effects of the functions in it.
+fn item_at(item: Item) -> Int =
+  match item {
+    IFn(d) -> d.span.start,
+    ITest(d) -> d.span.start,
+    ILaw(d) -> d.span.start,
+    ISchema(d) -> d.name.span.start,
+    _ -> 0,
+  }
+
 fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {abort.raise} = {
-  let state = { ..outer, fresh: 0, mode: None };
+  let state = { ..outer, fresh: 0, mode: None, exit: None, exits: 0, item_at: item_at(item) };
   match item {
     IFn(d) -> {
       let spec: { state: TryState, clauses: List<SpecClause> } = d.spec.fold(
@@ -1119,7 +1441,8 @@ fn try_item(outer: TryState, item: Item) -> { state: TryState, item: Item } / {a
       let body = match mode_for(state, d.ret) {
         Err(why) -> sweep(measured.state, d.body, Some(why), None),
         Ok(m) -> {
-          let r = ret({ ..measured.state, mode: Some(m) }, d.body, tries_in(d.body));
+          let ex = exits_lifted({ ..measured.state, mode: Some(m) }, d.body);
+          let r = ret(ex.state, ex.expr, tries_in(ex.expr));
           let s: TryOut = sweep(r.state, r.expr, None, None);
           { state: { ..s.state, mode: None }, expr: s.expr }
         },
@@ -1197,6 +1520,9 @@ pub fn expand_try(
     diags: diags,
     mode: None,
     fresh: 0,
+    exit: None,
+    exits: 0,
+    item_at: 0,
   };
   let walked = module.items.fold(
     { state: start, items: [] },

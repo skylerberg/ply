@@ -67,6 +67,9 @@ pub struct HandlerFrame {
     pub(crate) handler: u64,
     /// The handler's variables, from when its body starts.
     pub(super) vars: Option<SharedVars>,
+    /// A task's copy of a frame around its spawn, which no landing of the task's stands for: a
+    /// clause answering through it must return to the perform.
+    pub(super) inherited: bool,
 }
 
 /// A handler's variables, held, each with the type its `handle` gave it: none for one not yet set.
@@ -145,6 +148,7 @@ impl HandlerFrame {
             fuel,
             handler: 0,
             vars: None,
+            inherited: false,
         }
     }
 
@@ -163,6 +167,7 @@ impl HandlerFrame {
             fuel,
             handler,
             vars: None,
+            inherited: false,
         }
     }
 
@@ -536,6 +541,7 @@ impl HandlerFrame {
             fuel: self.fuel,
             handler: self.handler,
             vars: None,
+            inherited: false,
         })
     }
 }
@@ -580,6 +586,7 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
                 shared(v.borrow().copied())
             }
         }),
+        inherited: f.inherited,
     }
 }
 
@@ -602,6 +609,7 @@ pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
             HandlerFrame {
                 clauses,
                 detached: None,
+                inherited: true,
                 ..f
             }
         })

@@ -19,7 +19,8 @@ import compiler.syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, S
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, EMatch, MatchArm,
                               ERecord, ERecordUpdate, ETry, EField, EPerform, EHandle, ETryBlock,
                               SLet, Param, NamedArg, RecField, expr_span, ETagged, Tagged,
-                              tagged_call, tagged_fill, slotted, slot_args, try_places)
+                              tagged_call, tagged_fill, slotted, slot_args, try_places,
+                              HandleClause, is_exit_effect, exit_op)
 import compiler.syntax.patterns (LUnit, LInt, LStr, Pattern, PCtor, PVar)
 import std.bytes (ascii_of_int)
 import compiler.emit.abi
@@ -807,9 +808,98 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
   assert_eq(called(x.body), b"g")
 }
 
-test "a `?` inside a `try` is refused, as one inside a `handle` is" {
-  let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
-  assert(out.contains("!E0118"))
+/// What a raise of an exit effect carries, where `e` is one.
+fn exit_carried(e: Expr) -> Option<Expr> =
+  match e {
+    EPerform(p) -> if is_exit_effect(p.eff.name.name) && p.op.name == exit_op() { p.args.at(0) }
+    else { None },
+    _ -> None,
+  }
+
+test "a `?` inside a `handle` raises its function's exit, which a `handle` around it answers" {
+  let x = expanded_fn(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let r = handle { g(n)? } with { a.b() -> 1 }; Ok(r) }",
+  );
+  assert_eq(x.codes, []);
+  // The `handle` stands where a `?` of its own would: the scrutinee of the block's `match`.
+  let lifted = match x.body { EBlock(b) -> b.tail, _ -> None };
+  let around = match lifted { Some(EMatch(m)) -> Some(m.scrutinee), _ -> None };
+  match around {
+    Some(EHandle(w)) -> {
+      // Its one clause answers the exit with the failure it carried, and its body is the `Ok`.
+      assert_eq(w.clauses.map(|c: HandleClause| is_exit_effect(c.eff.name.name)), [true]);
+      assert_eq(called(w.clauses.get(0).body), b"Err");
+      assert_eq(called(w.body), b"Ok");
+      // Inside, the `?`'s failure arm raises the exit with what `Err` held.
+      let inner = match w.body {
+        EApp(a) -> match a.args.at(0) {
+          Some(EHandle(h)) -> match h.body { EBlock(b) -> b.tail, other -> Some(other) },
+          _ -> None,
+        },
+        _ -> None,
+      };
+      match inner {
+        Some(m) -> {
+          let arms = arms_of(m);
+          assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+            b"Err",
+            b"Ok",
+          ]);
+          assert(exit_carried(arms.get(0).body) != None, None)
+        },
+        None -> assert(false, Some("the written `handle` stands inside the `Ok`")),
+      }
+    },
+    _ -> assert(false, Some("the block ends in the `match` of the written `handle`")),
+  }
+}
+
+test "a `?` inside a `try`, a clause, a `return` or a nested `handle` leaves by one exit" {
+  let exits = |src: Bytes| {
+    let out = dump_expanded(src);
+    assert(
+      !out.contains("!E0118") && !out.contains("!E0119") && out.contains("@657869743f"),
+      Some(out),
+    )
+  };
+  exits(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
+  exits(b"fn f(n: Int) -> Option<Int> = handle { a.b() } with { a.b() -> g(n)? }");
+  exits(b"fn f(n: Int) -> Result<Int, Bytes> = handle { a.b() } with { return v -> g(v)? }");
+  exits(
+    b"fn f(n: Int) -> Result<Int, Bytes> = handle { Ok(handle { g(n)? } with { c.d() -> 1 }) } with { a.b() -> 1 }",
+  );
+  // One exit for the function, and one of its own for a typed lambda, which its `?` exits.
+  let named = dump_expanded(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let k = |m: Int| -> Option<Int> { handle { Some(h(m)?) } with { a.b() -> 1 } }; handle { g(n)? } with { a.b() -> 1 } }",
+  );
+  // `exit?0?0` and `exit?0?1`: the item written at 0's first and second.
+  assert(
+    !named.contains("!E0118") && !named.contains("!E0119") && named.contains("@657869743f303f30;")
+      && named.contains("@657869743f303f31;"),
+    Some(named),
+  )
+}
+
+test "a `?` inside a lambda or a region inside a `handle` exits nothing, and a `handle` holding one stands where a `?` could" {
+  let said = |src: Bytes| dump_expanded(src);
+  assert(
+    said(
+      b"fn f(n: Int) -> Result<Int, Bytes> = handle { let k = || g(n)?; Ok(1) } with { a.b() -> 1 }",
+    ).contains(
+      "!E0118",
+    ),
+  );
+  assert(
+    said(
+      b"fn f(n: Int) -> Result<Int, Bytes> = handle { simulate { g(n)? } } with { a.b() -> 1 }",
+    ).contains(
+      "!E0118",
+    ),
+  );
+  let placed = said(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let r = if n > 0 { handle { g(n)? } with { a.b() -> 1 } } else { 0 }; Ok(r) }",
+  );
+  assert(placed.contains("!E0119") && !placed.contains("!E0118"))
 }
 
 test "a `try` and a tagged literal are refused where the module binds what they are written out with" {
