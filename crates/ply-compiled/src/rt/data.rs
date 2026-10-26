@@ -141,6 +141,83 @@ pub unsafe extern "C" fn rt_with_cleanup(
     answered.map_or(Handed::of(0), Carried::handed)
 }
 
+/// What a failure that lets go of a resource on its way out set aside while the resource's release
+/// runs, written into the words emitted code sets aside for it in its frame.
+#[repr(C)]
+pub(crate) struct Unwinding {
+    ending: i64,
+    unwind: Option<(usize, usize, Word)>,
+    raise: Option<usize>,
+    entered: Option<crate::simulate::Shielded>,
+}
+
+/// The words emitted code sets aside in its frame for an [`Unwinding`].
+pub const UNWINDING_WORDS: usize = 16;
+const _: () = assert!(std::mem::size_of::<Unwinding>() <= 8 * UNWINDING_WORDS);
+
+/// Sets aside the failure going on, where it is one a release runs during (a raise, a clause that
+/// did not resume, a cancel), so emitted code can let go of a resource on the failure's way out:
+/// answers 1, the failure written into the words at `held`, or 0 where the failure is the run's,
+/// which releases nothing. The release runs where the failure stands, with the handlers around it,
+/// as a `bracket`'s does.
+pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
+    let c = unsafe { &mut *ctx };
+    let ending = c.failed;
+    if ending != FAILED_UNWIND && ending != FAILED_CANCELLED && ending != FAILED_ABORT {
+        return 0;
+    }
+    let unwind = c.unwind.take();
+    let raising = c.aborting.take();
+    c.failed = 0;
+    let entered = crate::simulate::shield(c, Shield::Release);
+    let raise = raising.map(|a| c.keep(Kept::Raising(a)));
+    let at = held as usize as *mut Unwinding;
+    // SAFETY: emitted code hands the address of `UNWINDING_WORDS` words of its frame, which hold
+    // nothing until `rt_unwind_resume` reads them back.
+    unsafe {
+        at.write(Unwinding {
+            ending,
+            unwind,
+            raise,
+            entered,
+        })
+    };
+    1
+}
+
+/// The failure [`rt_unwind_hold`] set aside at `held` going on again once the release ran, or
+/// replaced where the release failed or was cancelled.
+pub unsafe extern "C" fn rt_unwind_resume(ctx: *mut Ctx, held: Word) {
+    let at = held as usize as *mut Unwinding;
+    // SAFETY: `rt_unwind_hold` wrote these words, and nothing read them since.
+    let Unwinding {
+        ending,
+        unwind,
+        raise,
+        entered,
+    } = unsafe { at.read() };
+    let c = unsafe { &mut *ctx };
+    let raising = raise.map(|here| match c.kept_back(here) {
+        Kept::Raising(a) => a,
+        _ => unreachable!("a release keeps the raise it runs during"),
+    });
+    let cancelled = crate::simulate::unshield(c, entered);
+    if c.failed != 0 || cancelled {
+        if let Some(raise) = raising {
+            raise.into_failure();
+        }
+        if c.failed == 0 {
+            c.failed = FAILED_CANCELLED;
+        } else if cancelled {
+            cancel_carried(c);
+        }
+        return;
+    }
+    c.failed = ending;
+    c.unwind = unwind;
+    c.aborting = raising;
+}
+
 /// [`cancel_here`] where what a clause unwinds with is emitted code's, which is abandoned uncounted.
 fn cancel_carried(c: &mut Ctx) {
     if c.failed != FAILED_UNWIND && c.failed != FAILED_ABORT {

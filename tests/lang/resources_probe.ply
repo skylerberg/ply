@@ -1,0 +1,156 @@
+//! Each resource opened is let go once, in the order the guide gives, on the path a program takes.
+
+effect log {
+  write note(s: String) -> Unit
+}
+
+opaque type Conn = | Conn(String)
+
+release for Conn by close
+
+fn close(c: keep Conn) -> Unit / {log.write} = match c { Conn(name) -> log.note("close " ++ name) }
+
+fn open(name: String) -> Conn / {log.write} = {
+  log.note("open " ++ name);
+  Conn(name)
+}
+
+fn send(c: Conn, m: String) -> Int / {log.write} =
+  match c {
+    Conn(name) -> {
+      log.note(name ++ " " ++ m);
+      m.len()
+    },
+  }
+
+fn took_with(c: keep Conn, n: Int) -> Int / {log.write} =
+  match c {
+    Conn(name) -> {
+      log.note("took " ++ name);
+      n
+    },
+  }
+
+/// What `body` noted, in order.
+fn noted<a | e>(body: () -> a / {log.write | e}) -> List<String> / e =
+  handle {
+    body()
+  } with {
+    var seen = [],
+    log.note(s) -> {
+      seen = seen.push(s);
+    },
+    return u -> seen,
+  }
+
+opaque type Fragile = | Fragile(String)
+
+release for Fragile by shut
+
+fn shut(x: keep Fragile) -> Unit / {log.write, abort.raise} =
+  match x {
+    Fragile(name) -> {
+      log.note("shut " ++ name);
+      if name == "b" { abort.raise("shut failed") }
+    },
+  }
+
+fn fragile(name: String) -> Fragile / {log.write} = {
+  log.note("open " ++ name);
+  Fragile(name)
+}
+
+type Either = | L(Conn) | R(Conn)
+
+fn either(left: Bool) -> Either / {log.write} = if left { L(open("l")) } else { R(open("r")) }
+
+test "a raise lets go of what its block owns, the last bound first" {
+  let seen = noted(|| {
+    let answered = handle {
+      let a = open("a");
+      let b = open("b");
+      abort.raise("gone");
+      send(a, "x") + send(b, "y")
+    } with {
+      abort.raise(m) -> 0,
+    };
+    log.note("answered")
+  });
+  assert_eq(seen, ["open a", "open b", "close b", "close a", "answered"])
+}
+
+test "a release that fails lets go of the rest, the last bound first" {
+  let seen = noted(|| {
+    handle {
+      let a = fragile("a");
+      let c = fragile("c");
+      let b = fragile("b");
+      log.note("last")
+    } with {
+      abort.raise(m) -> log.note("caught " ++ m),
+    }
+  });
+  assert_eq(seen, [
+    "open a",
+    "open c",
+    "open b",
+    "shut b",
+    "shut c",
+    "shut a",
+    "caught shut failed",
+  ])
+}
+
+test "a `let ... else` whose pattern misses lets go of the value it missed" {
+  let run = |left: Bool|
+    noted(|| {
+      let n = {
+        let L(c) = either(left) else { 0 };
+        send(c, "x")
+      };
+      log.note("end")
+    });
+  assert_eq(run(true), ["open l", "l x", "close l", "end"]);
+  assert_eq(run(false), ["open r", "close r", "end"])
+}
+
+fn updated(fail: Bool) -> Int / {log.write, abort.raise} = {
+  let h = { conn: open("a"), n: 1 };
+  let r = { ..h, n: if fail { abort.raise("no") } else { 2 } };
+  send(r.conn, "hi") + r.n
+}
+
+test "an update whose written field fails lets go of the record it updates" {
+  let caught = |body: () -> Int / {log.write, abort.raise}|
+    noted(|| {
+      let n = handle { body() } with { abort.raise(m) -> 0 };
+      log.note("answered")
+    });
+  assert_eq(caught(|| updated(true)), ["open a", "close a", "answered"]);
+  assert_eq(caught(|| updated(false)), ["open a", "a hi", "close a", "answered"])
+}
+
+test "a raise a `handle` in an argument answers keeps what the call already holds" {
+  let seen = noted(|| {
+    let n = took_with(open("x"), handle {
+      abort.raise("no");
+      1
+    } with {
+      abort.raise(m) -> 2,
+    });
+    assert_eq(n, 2)
+  });
+  assert_eq(seen, ["open x", "took x"])
+}
+
+test "a binding a later one hides is let go before a last expression naming only the later" {
+  let seen = noted(|| {
+    let n = {
+      let c = open("a");
+      let c = open("b");
+      send(c, "x")
+    };
+    log.note("end")
+  });
+  assert_eq(seen, ["open a", "open b", "close a", "b x", "close b", "end"])
+}

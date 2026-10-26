@@ -8,7 +8,7 @@
 
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
-import compiler.check.types (Type, TyCon, TyFn, TyRecord, int_type, row_empty)
+import compiler.check.types (Type, TyCon, TyFn, TyRecord, int_type, row_empty, unit_type)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Root, Written, TypeOp, Drop, Dup, Share, Keep, Copy, root_name,
                            root_text, op_name)
@@ -24,7 +24,7 @@ import compiler.emit.lower.held (values_of, leaf_values, passing, InWords, ByRef
 import std.pace (Measure, outgrown)
 import compiler.emit.tir (Rep, RInt, RWord, RFlat, RToken, RSum, Leaf, Var, Inst, Inc, Dec, Reset,
                           Free, Opened, AInt, AVar, Spine, RUnit, Given, Lent, Owned, Convention,
-                          FieldSet, counted, parts_of, var_said, rep_of_arg)
+                          FieldSet, counted, parts_of, var_said, rep_of_arg, Arg, Unwound)
 import compiler.emit.c (int_lit)
 import compiler.emit.print.tested (case_switched, case_label, unarmed)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, spelled)
@@ -37,7 +37,7 @@ import compiler.emit.release (Part, WordAt, ByCase, Counted, Object, CaseBox, Su
                               list_node_name, never_kept, counted_through, generated, laid_parts)
 import compiler.emit.print.text (Printing, Place, line, name_of, named, printing, part_names,
                                  declared_at, pad, slot, assigned, arg_text, unprinted, zero,
-                                 moves_slot, slots_moved)
+                                 moves_slot, slots_moved, Tail)
 import compiler.emit.print.made (head_types, words_laid, parts_read, arg_parts, placed_copy,
                                  placed_moved, placed_write)
 import compiler.emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_box_fn, free_fn,
@@ -75,7 +75,14 @@ fn tailed(pr: Printing, v: Var, then: Bytes) -> { pr: Printing, leave: Bytes } =
         pr: {
           ..pr,
           tails: {
-            all: ts.all.push({ name: name, id: v.id, ty: v.ty, rep: v.rep, then: then }),
+            all: ts.all.push({
+              name: name,
+              id: v.id,
+              ty: v.ty,
+              rep: v.rep,
+              then: then,
+              letting: None,
+            }),
             keyed: ts.keyed.insert(key, k),
             held: ts.held.insert(block, match ts.held.get(block) {
               Some(ks) -> ks.push(k),
@@ -90,6 +97,118 @@ fn tailed(pr: Printing, v: Var, then: Bytes) -> { pr: Printing, leave: Bytes } =
 }
 
 fn tail_jump(k: Int) -> Bytes = Bytes::concat_all([b"goto ply_u", ascii_of_int(k), b";"])
+
+/// The C a failure runs that first lets go of each resource of `unwinds`, in order, and then holds
+/// `unwind` as `exit_of` releases it before it goes by `root`.
+pub fn exit_through(
+  pr: Printing,
+  unwinds: List<Unwound>,
+  unwind: List<Var>,
+  root: Bytes,
+) -> { pr: Printing, leave: Bytes } =
+  unwinds.reverse().fold(
+    exit_of(pr, unwind, root),
+    |acc: { pr: Printing, leave: Bytes }, u: Unwound| letting_tailed(acc.pr, u, acc.leave),
+  )
+
+/// The jump to the tail letting go of the resource `u` and going on by `then`, added at the end of the
+/// C block being printed where it has none.
+fn letting_tailed(pr: Printing, u: Unwound, then: Bytes) -> { pr: Printing, leave: Bytes } = {
+  let name = Bytes::join(arg_parts(pr, u.arg), b", ");
+  let key = Bytes::concat_all([b"let go ", ascii_of_int(pr.block), b" ", name, b" ", then]);
+  let ts = pr.tails;
+  match ts.keyed.get(key) {
+    Some(k) -> { pr: pr, leave: tail_jump(k) },
+    None -> {
+      let k = ts.all.len();
+      let held = match u.arg {
+        AVar(v) -> { id: v.id, ty: v.ty },
+        _ -> { id: -1, ty: unit_type() },
+      };
+      {
+        pr: {
+          ..pr,
+          tails: {
+            all: ts.all.push({
+              name: name,
+              id: held.id,
+              ty: held.ty,
+              rep: rep_of_arg(u.arg),
+              then: then,
+              letting: Some(u),
+            }),
+            keyed: ts.keyed.insert(key, k),
+            held: ts.held.insert(pr.block, match ts.held.get(pr.block) {
+              Some(ks) -> ks.push(k),
+              None -> [k],
+            }),
+          },
+        },
+        leave: tail_jump(k),
+      }
+    },
+  }
+}
+
+/// What a C function whose failure paths let go of a resource keeps at its start: the fuel it stood
+/// at, which a release on a failure path runs at, as the frames the failure left gave back none.
+pub fn fuel_kept(pr: Printing) -> Bytes =
+  if pr.tails.all.any(|t: Tail| match t.letting { Some(_) -> true, None -> false }) {
+    b"  int64_t ply_fuel = ctx->fuel;\n"
+  } else { b"" }
+
+/// `u`'s resource let go on a failure path, as its type's `LetGo` root lets it go, where the failure
+/// is one a release runs during: the runtime sets the failure aside while the root runs, and a
+/// failure of the root's own replaces it. The root is noted among the body's calls.
+fn let_go_on_failure(pr: Printing, u: Unwound) -> Said / {abort.raise} = {
+  let k = u.callee;
+  let noted = if pr.calls.contains(k) { pr } else {
+    {
+      ..pr,
+      calls: pr.calls.push(k),
+      expects: pr.expects.push({ callee: CallAt(pr.calls.len()), head: head_types(u.conv) }),
+    }
+  };
+  let parts = arg_parts(noted, u.arg);
+  let r = match u.conv.reps.at(0) { Some(x) -> x, None -> rep_of_arg(u.arg) };
+  let ty = match u.arg { AVar(v) -> v.ty, _ -> unit_type() };
+  let given = u.conv.params.at(0) == Some(Given);
+  let dup = if given { duped(noted, ty, rep_of_arg(u.arg), parts) } else { { pr: noted, out: [] } };
+  let handed = match passing(r) {
+    InWords -> { first: b"", args: parts },
+    ByReference ->
+      {
+        first: Bytes::concat_all([
+          b"Word ply_b[] = {",
+          Bytes::join(words_laid(parts, values_of(r)), b", "),
+          b"}; ",
+        ]),
+        args: [b"ply_b"],
+      },
+  };
+  {
+    pr: dup.pr,
+    out: [
+      Text(
+        b"{ Word ply_h[PLY_UNWINDING_WORDS]; ctx->fuel = ply_fuel; if (rt_unwind_hold_p(ctx, (Word)(intptr_t)ply_h)) { ",
+      ),
+    ].concat(
+      dup.out,
+    ).push(
+      Text(handed.first),
+    ).push(
+      Hole(Symbol(Root(k))),
+    ).push(
+      Text(
+        Bytes::concat_all([
+          b"(ctx",
+          Bytes::concat_all(handed.args.map(|a: Bytes| b", ".concat(a))),
+          b"); rt_unwind_resume_p(ctx, (Word)(intptr_t)ply_h); } }",
+        ]),
+      ),
+    ),
+  }
+}
 
 /// `pr` inside a C block of its own, which what it names is declared in.
 pub fn block_opened(pr: Printing) -> Printing =
@@ -113,9 +232,11 @@ pub fn block_closed(pr: Printing, outer: Int, depth: Int, falls: Bool) -> Printi
               Some(next) -> tail_jump(next) == t.then,
               None -> false,
             };
-            let let_go = if acc.pr.placing.slots.contains(t.id) {
-              slot_released(acc.pr, t.name, t.ty)
-            } else { released(acc.pr, t.ty, t.rep, part_names(t.name, t.rep)) };
+            let let_go = match t.letting {
+              Some(u) -> let_go_on_failure(acc.pr, u),
+              None -> if acc.pr.placing.slots.contains(t.id) { slot_released(acc.pr, t.name, t.ty) }
+              else { released(acc.pr, t.ty, t.rep, part_names(t.name, t.rep)) },
+            };
             {
               pr: let_go.pr,
               out: acc.out.push(
@@ -1791,6 +1912,7 @@ fn place() -> Place =
       looping: None,
       landing: None,
       group: None,
+      unwinds: [],
       leaving: b"ctx->fuel += 1;",
     },
     at: span_between(0, 0),
@@ -2610,7 +2732,7 @@ test "a box shared marks it and shares each block it holds; kept, it is copied f
   ].fold((), |_: Unit, part: Bytes| assert(kept.text.contains(part), None));
   // A function value is shared through its descriptor, held or captured, a handle not at all.
   assert(walked_said(Share, FnBlock, dropping_of(b"m.R")).text.contains(b"->share(ctx, p0)"), None);
-  let fun = TyFn({ params: [string], ret: string, effects: row_empty() });
+  let fun = TyFn({ kept: [], once: false, params: [string], ret: string, effects: row_empty() });
   let capturing = InBox({ parts: [{ at: 1, ty: fun, rep: RWord }], words: 2 });
   assert(
     walked_said(Share, capturing, dropping_of(b"m.R")).text.contains(

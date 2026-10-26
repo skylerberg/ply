@@ -1,9 +1,10 @@
 //! The lowered form the code generator reads: slots resolved.
 
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, qname_text, prelude_binder)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded,
-                                 LFloat, LDec, LChar, LUnit, LBad, has_or, alternatives_of)
+import compiler.syntax.patterns (pat_span, Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord,
+                                 PList, POr, PBad, Lit, LInt, LFixed, LWide, LBool, LStr, LBytes,
+                                 LEmbedded, LFloat, LDec, LChar, LUnit, LBad, has_or,
+                                 alternatives_of)
 import compiler.syntax.exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary,
                               EApp, EIf, EBlock, EList, ERecord, EField, ELambda, EMatch, EPerform,
                               EHandle, ESimulate, EParallel, EBad, EHole, ERecordUpdate, ETry,
@@ -13,6 +14,8 @@ import compiler.syntax.items (Module, Item, IFn, parse)
 import compiler.expand.rewrite (expand)
 import compiler.expand.rewrite.shared (nodes_of)
 import compiler.syntax.sites (numbered)
+import compiler.check.infer.checker (ReleaseSite, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
+                                     ReleaseFailing, binder_key)
 import std.list
 import std.bytes (hex_digit, ascii_of_int)
 import std.string
@@ -394,7 +397,36 @@ type Stack = {
   /// The binder a function of a type of the module being lowered is written out through, where
   /// its caller reads such a call as one of the module's own; empty where it does not.
   own: Bytes,
+  releases: Releases,
+  /// Where each binder a release names put its name, by the binder's key.
+  binders: Map<Int, Binder>,
+  /// The keys an or-pattern's first alternative gives its names, which the check names every
+  /// alternative's binders by.
+  rekey: Map<Bytes, Int>,
 }
+
+/// Where a body lets go of the resources it owns, as the check filed it, and the binder site of each
+/// of the body's parameters, by place.
+pub type Releasing = { sites: List<ReleaseSite>, params: List<Int> }
+
+/// `Releasing` read by site: the releases at each node, and the sites a release names as what it
+/// lets go, a binder's or that of a node whose value no binder holds.
+type Releases = { at: Map<Int, List<ReleaseSite>>, held: Map<Int, Bool> }
+
+/// The barrier, by depth, and the slot a binder put its name in.
+type Binder = { name: Bytes, depth: Int, slot: Int }
+
+fn releases_of(r: Releasing) -> Releases =
+  r.sites.fold({ at: Map::new(), held: Map::new() }, |acc: Releases, x: ReleaseSite|
+    {
+      at: acc.at.insert(x.at, match acc.at.get(x.at) { Some(xs) -> xs.push(x), None -> [x] }),
+      // A node's own value a failing release after it names is held by the node itself.
+      held: match x.place {
+        ReleaseFailing(_) -> if x.binding == x.at { acc.held }
+        else { acc.held.insert(x.binding, true) },
+        _ -> acc.held.insert(x.binding, true),
+      },
+    })
 
 fn st_top(stack: Stack) -> Frame =
   match stack.frames.at(stack.frames.len() - 1) { Some(f) -> f, None -> empty_frame() }
@@ -490,6 +522,17 @@ fn label_args(stack: Stack, span: Span) -> Labels =
 /// A block's binders leave scope at its end, but the slots they took are never reused.
 fn bind_st(stack: Stack, name: Bytes) -> Stack = st_top_set(stack, bind(st_top(stack), name))
 
+/// `name` bound by the binder at `site`, which a release may name it by.
+fn bind_at(stack: Stack, name: Bytes, site: Int) -> Stack =
+  binder_noted(bind_st(stack, name), name, site, stack.frames.len() - 1, st_top(stack).names.len())
+
+/// `stack` noting that the binder at `site` put `name` in slot `slot` of barrier `depth`, where a
+/// release names it.
+fn binder_noted(stack: Stack, name: Bytes, site: Int, depth: Int, slot: Int) -> Stack =
+  if !stack.releases.held.contains(site) { stack } else {
+    { ..stack, binders: stack.binders.insert(site, { name: name, depth: depth, slot: slot }) }
+  }
+
 fn unscope(frame: Frame, to: Int) -> Frame =
   {
     names: frame.names,
@@ -525,6 +568,13 @@ fn take(xs: List<Bind>, n: Int) -> List<Bind> =
 type Lowered = { code: Code, stack: Stack }
 
 fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
+  match lower_node(e, stack) {
+    None -> None,
+    Some(o) ->
+      Some(if stack.releases.held.len() == 0 { o } else { released_around(expr_span(e), o) }),
+  }
+
+fn lower_node(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
   match e {
     ELit(x) -> Some({ code: { span: expr_span(e), node: NLit(x.lit) }, stack: stack }),
     // A hole runs as the raise the checker said it is: `abort.raise("unfilled hole")`.
@@ -689,7 +739,13 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
     // The binder is in scope for the body only; the init is evaluated before it exists.
     // A lambda opens its own barrier; a name it reads from outside becomes a capture.
     ELambda(x) ->
-      lower_lambda(x.params.map(|param: Param| param.name.name), x.body, stack, expr_span(e)),
+      lower_lambda(
+        x.params.map(|param: Param| param.name.name),
+        x.params.map(|param: Param| binder_key(param.name.span)),
+        x.body,
+        stack,
+        expr_span(e),
+      ),
     // `simulate` opens a barrier, as a lambda does, and takes no parameters.
     ESimulate(x) -> match lower_in(x.body, st_push(stack, empty_frame())) {
       None -> None,
@@ -715,7 +771,7 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
         |acc: Option<Seq>, b: Expr|
           match acc {
             None -> None,
-            Some(sq) -> match lower_lambda([], b, sq.stack, branch_at(b)) {
+            Some(sq) -> match lower_lambda([], [], b, sq.stack, branch_at(b)) {
               Some(o) -> Some({ codes: sq.codes.push(o.code), stack: o.stack }),
               None -> None,
             },
@@ -761,7 +817,24 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
               else { match c.resource { Some(id) -> id.name, None -> b"" } };
               let lb = label_code(acc.stack, res);
               let outer = match lb { Some(o) -> o.stack, None -> acc.stack };
-              match lower_in(c.body, st_push(outer, inner)) {
+              let depth = outer.frames.len();
+              let pushed = range(0, c.params.len()).fold(
+                st_push(outer, inner),
+                |st: Stack, k: Int|
+                  binder_noted(
+                    st,
+                    c.params.get(k).name,
+                    binder_key(c.params.get(k).span),
+                    depth,
+                    k,
+                  ),
+              );
+              let entered = match c.resume {
+                Some(rid) ->
+                  binder_noted(pushed, rid.name, binder_key(rid.span), depth, names.len() - 1),
+                None -> pushed,
+              };
+              match lower_in(c.body, entered) {
                 None -> { clauses: acc.clauses, stack: acc.stack, ok: false },
                 Some(cb) -> {
                   let f = st_top(cb.stack);
@@ -798,7 +871,14 @@ fn lower_in(e: Expr, stack: Stack) -> Option<Lowered> / {abort.raise} =
               }),
             Some(r) -> {
               let inner = bind(empty_frame(), r.binder.name);
-              match lower_in(r.body, st_push(cls.stack, inner)) {
+              let entered = binder_noted(
+                st_push(cls.stack, inner),
+                r.binder.name,
+                binder_key(r.binder.span),
+                cls.stack.frames.len(),
+                0,
+              );
+              match lower_in(r.body, entered) {
                 None -> None,
                 Some(rb) -> {
                   let f = st_top(rb.stack);
@@ -986,7 +1066,7 @@ fn as_path_update(
 /// from, when the field is `p.<its own name>` for such a path `p`, which tells two paths apart.
 fn copy_path(field: RecField, stack: Stack) -> Option<Bytes> =
   match field.value {
-    EField(x) -> if x.field.name != field.name.name { None }
+    EField(x) -> if x.field.name != field.name.name || in_flight(field.value, stack) { None }
     else { match x.base { EField(_) -> path_spelled(x.base, stack), _ -> None } },
     _ -> None,
   }
@@ -1004,10 +1084,15 @@ fn path_spelled(e: Expr, stack: Stack) -> Option<Bytes> =
     _ -> None,
   }
 
+/// Whether a failure may let go of `value` before what it is handed to holds it, which only a node
+/// lowered where it stands can be.
+fn in_flight(value: Expr, stack: Stack) -> Bool =
+  stack.releases.held.contains(expr_span(value).site)
+
 /// The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
 fn copy_base(field: RecField, stack: Stack) -> Option<Bytes> =
   match field.value {
-    EField(x) -> if x.field.name != field.name.name { None } else {
+    EField(x) -> if x.field.name != field.name.name || in_flight(field.value, stack) { None } else {
       match x.base {
         EVar(v) -> if v.name.module != None { None } else {
           match st_depth(stack, v.name.name.name) {
@@ -1121,9 +1206,11 @@ fn lower_seq(exprs: List<Expr>, stack: Stack) -> Option<Seq> / {abort.raise} =
       },
     })
 
-/// A lambda over `params`: its body lowered behind a barrier, which the captures cross.
+/// A lambda over `params`, bound at `sites`: its body lowered behind a barrier, which the captures
+/// cross.
 fn lower_lambda(
   params: List<Bytes>,
+  sites: List<Int>,
   body: Expr,
   stack: Stack,
   at: Span,
@@ -1132,10 +1219,10 @@ fn lower_lambda(
     { names: [], scope: [], captures: [], capture_names: [] },
     |g: Frame, n: Bytes| bind(g, n),
   );
-  match lower_in(body, st_push(stack, inner)) {
-    None -> None,
-    Some(b) -> Some(lam_of(params, b, at)),
-  }
+  let depth = stack.frames.len();
+  let entered = range(0, sites.len()).fold(st_push(stack, inner), |st: Stack, k: Int|
+    binder_noted(st, params.at_or(k, b""), sites.get(k), depth, k));
+  match lower_in(body, entered) { None -> None, Some(b) -> Some(lam_of(params, b, at)) }
 }
 
 /// Pops the lambda's barrier; the stack below keeps the captures threaded into it.
@@ -1197,11 +1284,15 @@ fn arms_into(
   guard: Option<Expr>,
   body: (Stack) -> Option<Lowered> / {abort.raise},
 ) -> ArmAcc / {abort.raise} =
-  List::fold(
-    if has_or(pat) { alternatives_of(pat) } else { [pat] },
-    acc,
-    |a: ArmAcc, alt: Pattern| arm_into(a, alt, guard, body),
-  )
+  if !has_or(pat) { arm_into(acc, pat, guard, body) } else {
+    let alts = alternatives_of(pat);
+    let first = match alts.at(0) { Some(p) -> binder_idents(p), None -> [] };
+    let keys = first.fold(Map::new(), |m: Map<Bytes, Int>, i: Ident|
+      m.insert(i.name, binder_key(i.span)));
+    // Each alternative binds under the first one's keys, which its guard and body then read.
+    alts.fold(acc, |a: ArmAcc, alt: Pattern|
+      arm_into({ ..a, stack: { ..a.stack, rekey: keys } }, alt, guard, body))
+  }
 
 /// Arm binders leave scope at the arm's end; their slots are not reused.
 fn arm_into(
@@ -1212,7 +1303,9 @@ fn arm_into(
 ) -> ArmAcc / {abort.raise} =
   if !acc.ok { acc } else {
     let pd = depth_of(acc.stack);
-    let pat = lower_pat(alt, acc.stack);
+    let lowered = lower_pat(alt, acc.stack);
+    // What the pattern binds is renamed; a name the guard or body binds again is its own.
+    let pat = { ..lowered, stack: { ..lowered.stack, rekey: Map::new() } };
     match lower_guard(guard, pat.stack) {
       None -> { arms: acc.arms, stack: acc.stack, ok: false },
       Some(g) -> match body(g.stack) {
@@ -1315,9 +1408,24 @@ fn straight(acc: BlockAcc, stmt: Stmt) -> BlockAcc / {abort.raise} =
         None -> match lower_in(l.value, acc.stack) {
           None -> { stmts: acc.stmts, stack: acc.stack, ok: false },
           Some(o) -> {
-            let p = lower_pat(l.pat, o.stack);
+            // What a miss lets go of is read where the value stands, before the pattern binds.
+            let missed = match o.stack.releases.at.get(pat_span(l.pat).site) {
+              Some(xs) -> xs.filter(|x: ReleaseSite| x.place == ReleaseUnwinding),
+              None -> [],
+            };
+            let unwound = held_codes(o.stack, missed);
+            let p = lower_pat(l.pat, unwound.stack);
+            let value = if unwound.codes.len() == 0 { o.code } else {
+              {
+                span: dummy_span(),
+                node: NApp({
+                  func: { span: dummy_span(), node: NVar({ name: b"?let_missing", slot: None }) },
+                  args: unwound.codes.push(o.code),
+                }),
+              }
+            };
             {
-              stmts: acc.stmts.push(CLetPat({ span: l.span, pat: p.pat, value: o.code })),
+              stmts: acc.stmts.push(CLetPat({ span: l.span, pat: p.pat, value: value })),
               stack: p.stack,
               ok: true,
             }
@@ -1330,7 +1438,10 @@ fn straight(acc: BlockAcc, stmt: Stmt) -> BlockAcc / {abort.raise} =
               stmts: acc.stmts.push(
                 CLet({ name: name, slot: st_top(o.stack).names.len(), value: o.code }),
               ),
-              stack: bind_st(o.stack, name),
+              stack: match l.pat {
+                PVar(v) -> bind_at(o.stack, name, binder_key(v.name.span)),
+                _ -> o.stack,
+              },
               ok: true,
             },
         },
@@ -1357,7 +1468,8 @@ fn lower_pat(pattern: Pattern, stack: Stack) -> PatOut / {abort.raise} =
     PWild(_) -> { pat: PxWild, stack: stack },
     PVar(v) -> {
       let name = v.name.name;
-      let g = bind_st(stack, name);
+      let key = match stack.rekey.get(name) { Some(k) -> k, None -> binder_key(v.name.span) };
+      let g = bind_at(stack, name, key);
       { pat: PxVar({ name: name, slot: slot_in(st_top(g), name), span: v.span }), stack: g }
     },
     PLit(v) -> { pat: PxLit(v.lit), stack: stack },
@@ -1431,8 +1543,185 @@ fn slots_union(a: List<Int>, b: List<Int>) -> List<Int> =
   b.fold(a, |acc: List<Int>, s: Int| if acc.contains(s) { acc } else { acc.push(s) })
 
 /// Only a single-name binder; any other pattern lowers as `CLetPat`.
+/// The names `pattern` binds, as written, an or-pattern's by its first alternative.
+fn binder_idents(pattern: Pattern) -> List<Ident> =
+  match pattern {
+    PVar(v) -> [v.name],
+    PCtor(c) -> c.args.fold([], |acc: List<Ident>, a: Pattern| acc.concat(binder_idents(a))),
+    PRecord(r) ->
+      r.fields.fold([], |acc: List<Ident>, x: { name: Ident, pat: Pattern }|
+        acc.concat(binder_idents(x.pat))),
+    PList(l) -> {
+      let items = l.items.fold([], |acc: List<Ident>, a: Pattern| acc.concat(binder_idents(a)));
+      match l.rest { Some(r) -> items.concat(binder_idents(r)), None -> items }
+    },
+    POr(o) -> match o.alts.at(0) { Some(a) -> binder_idents(a), None -> [] },
+    _ -> [],
+  }
+
 fn binder_of(pattern: Pattern) -> Option<Bytes> =
   match pattern { PVar(id) -> Some(id.name.name), _ -> None }
+
+// --- releases ---------------------------------------------------------------
+
+/// `o`, the node at `span` lowered, with what the check lets go there: its value held by a slot of
+/// its own where a release names it; the resources a failure in it lets go named around it; and
+/// those let go before it runs or after it.
+fn released_around(span: Span, o: Lowered) -> Lowered = {
+  // The check files them the latest bound first.
+  let here = match o.stack.releases.at.get(span.site) { Some(xs) -> xs, None -> [] };
+  let unwinding = here.filter(|x: ReleaseSite| x.place == ReleaseUnwinding);
+  let after = here.filter(|x: ReleaseSite| x.place == ReleaseAfter);
+  let before = here.filter(|x: ReleaseSite| x.place == ReleaseBefore);
+  let unwound = held_codes(o.stack, unwinding);
+  let guarded = if unwinding.len() == 0 { { code: o.code, stack: unwound.stack } } else {
+    {
+      code: {
+        span: dummy_span(),
+        node: NApp({
+          func: { span: dummy_span(), node: NVar({ name: b"?unwinds", slot: None }) },
+          args: unwound.codes.push(o.code),
+        }),
+      },
+      stack: unwound.stack,
+    }
+  };
+  let ended = if after.len() == 0 { guarded } else {
+    // The node's value is held while what runs after it is let go, which a failing release lets go.
+    let at = guarded.stack;
+    let slot = st_top(at).names.len();
+    let depth = depth_of(at);
+    // Noted whether or not a later node reads it: a failing release after this one names it.
+    let named = bind_st(at, b"?released");
+    let bound = {
+      ..named,
+      binders: named.binders.insert(span.site, {
+        name: b"?released",
+        depth: at.frames.len() - 1,
+        slot: slot,
+      }),
+    };
+    let lets = let_goes(bound, after, here);
+    {
+      code: {
+        span: dummy_span(),
+        node: NBlock({
+          stmts: [CLet({ name: b"?released", slot: slot, value: guarded.code })].concat(
+            lets.codes.map(|c: Code| CDo({ code: c })),
+          ),
+          tail: Some({ span: dummy_span(), node: NVar({ name: b"?released", slot: Some(slot) }) }),
+        }),
+      },
+      stack: unscope_st(lets.stack, depth),
+    }
+  };
+  let first = let_goes(ended.stack, before, here);
+  let made = preceded(first.codes, ended.code);
+  let s = first.stack;
+  if !s.releases.held.contains(span.site) { { code: made, stack: s } } else {
+    let slot = st_top(s).names.len();
+    let bound = held_by(s, b"?held", made, |v: Code| v);
+    { ..bound, stack: binder_noted(bound.stack, b"?held", span.site, s.frames.len() - 1, slot) }
+  }
+}
+
+/// `code` after each of `calls`.
+fn preceded(calls: List<Code>, code: Code) -> Code =
+  match calls {
+    [] -> code,
+    calls ->
+      {
+        span: dummy_span(),
+        node: NBlock({ stmts: calls.map(|x: Code| CDo({ code: x })), tail: Some(code) }),
+      },
+  }
+
+/// A call letting go of each of `rs` in turn, between markers naming what `here`, the releases at the
+/// node, files for its release failing.
+fn let_goes(
+  s: Stack,
+  rs: List<ReleaseSite>,
+  here: List<ReleaseSite>,
+) -> { codes: List<Code>, stack: Stack } =
+  rs.fold({ codes: [], stack: s }, |acc: { codes: List<Code>, stack: Stack }, r: ReleaseSite| {
+    let own = held_codes(acc.stack, [r]);
+    match own.codes.at(0) {
+      None -> { ..acc, stack: own.stack },
+      Some(x) -> {
+        let failing = held_codes(
+          own.stack,
+          here.filter(|y: ReleaseSite| y.place == ReleaseFailing(r.binding)),
+        );
+        let call = {
+          span: dummy_span(),
+          node: NApp({
+            func: { span: dummy_span(), node: NVar({ name: b"?let_go", slot: None }) },
+            args: [x],
+          }),
+        };
+        {
+          codes: acc.codes.push(if failing.codes.len() == 0 { call } else {
+            {
+              span: dummy_span(),
+              node: NApp({
+                func: { span: dummy_span(), node: NVar({ name: b"?unwinds", slot: None }) },
+                args: failing.codes.push(call),
+              }),
+            }
+          }),
+          stack: failing.stack,
+        }
+      },
+    }
+  })
+
+/// A read of the slot each of `rs` lets go of: its binder's in this barrier, or one captured from
+/// the barrier it is bound in, where no barrier between binds its name again.
+fn held_codes(s: Stack, rs: List<ReleaseSite>) -> { codes: List<Code>, stack: Stack } =
+  rs.fold({ codes: [], stack: s }, |acc: { codes: List<Code>, stack: Stack }, r: ReleaseSite|
+    match acc.stack.binders.get(r.binding) {
+      Some(b) -> {
+        let top = acc.stack.frames.len() - 1;
+        if b.depth == top {
+          {
+            ..acc,
+            codes: acc.codes.push({
+              span: dummy_span(),
+              node: NVar({ name: b.name, slot: Some(b.slot) }),
+            }),
+          }
+        } else if b.depth < top
+            && range(b.depth + 1, top + 1).all(|i: Int| find(st_at(acc.stack, i), b.name) == None) {
+          let l = resolve(acc.stack, b.name);
+          {
+            codes: acc.codes.push({
+              span: dummy_span(),
+              node: NVar({ name: b.name, slot: l.slot }),
+            }),
+            stack: l.stack,
+          }
+        } else { acc }
+      },
+      None -> acc,
+    })
+
+/// `value` held by a slot of its own, named `name`, which no written name can be, and then `then`
+/// of a read of it: a block whose binder leaves scope at its end.
+fn held_by(s: Stack, name: Bytes, value: Code, then: (Code) -> Code) -> Lowered = {
+  let slot = st_top(s).names.len();
+  let depth = depth_of(s);
+  let read = { span: dummy_span(), node: NVar({ name: name, slot: Some(slot) }) };
+  {
+    code: {
+      span: dummy_span(),
+      node: NBlock({
+        stmts: [CLet({ name: name, slot: slot, value: value })],
+        tail: Some(then(read)),
+      }),
+    },
+    stack: unscope_st(bind_st(s, name), depth),
+  }
+}
 
 // --- reads ------------------------------------------------------------------
 
@@ -1512,6 +1801,7 @@ pub fn lower_fn(
   sites: Map<Int, List<Bytes>>,
   body: Expr,
   own: Bytes = b"",
+  releasing: Releasing = { sites: [], params: [] },
 ) -> Result<{ code: Code, size: Int }, Bytes> / {abort.raise} =
   match shared_site(body) {
     Some(why) -> Err(why),
@@ -1523,13 +1813,21 @@ pub fn lower_fn(
         ),
         |frame: Frame, l: Bytes| bind(frame, label_binder(l)),
       );
-      match lower_in(body, {
+      let releases = releases_of(releasing);
+      let stack = range(0, releasing.params.len()).fold(
+        {
           frames: [start],
           labels: labels,
           sites: sites,
           handled: false,
           own: own,
-        }) {
+          releases: releases,
+          binders: Map::new(),
+          rekey: Map::new(),
+        },
+        |st: Stack, k: Int| binder_noted(st, params.at_or(k, b""), releasing.params.get(k), 0, k),
+      );
+      match lower_in(body, stack) {
         None -> Err(b"a body that does not lower to Code"),
         Some(o) -> Ok({ code: o.code, size: st_top(o.stack).names.len() }),
       }

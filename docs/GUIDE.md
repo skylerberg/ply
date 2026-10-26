@@ -221,6 +221,10 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `invariant`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `invariant for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `release` | `release for <Type> by <function>` at item position (§7.1) |
+| `keep` | before a parameter's type, a function type's parameter, an operation's parameter, or a type parameter in a generic list (§4.7, §7.1) |
+| `once` | before the `(` of a function type (§7.1) |
+| `multi` | before `read` or `write` opening an operation declaration, and before a row parameter in a generic list (§6.1, §6.6) |
 | `where`, `derivable`, `identity` | after a signature's row, after a type's generic list, or after a law's binders; `identity(a)` opens a law's or schema's `where` |
 | `returns`, `fresh` | between a `fn` header and its specifications |
 | `requires`, `ensures` | between a `fn` header and its body |
@@ -810,7 +814,8 @@ as `0x7FF8_0000_0000_0000`, so it has no sign or payload to tell apart.
 ### 4.2 Records and tuples
 
 Records are structural; `type` names an alias, not a new type, unless its body
-opens with `new` (below). Field order does not matter.
+opens with `new` (below). Field order does not matter, and a record, its type
+or a pattern over it names each field once (`E0004`).
 
 ```ply
 fn f(a: Account) -> Int = a.balance
@@ -1064,13 +1069,17 @@ lowercase names in `<...>`, and row parameters follow `|` (`<| e>` if there are
 no type parameters); a row variable among the type parameters is `E0301`.
 Aliases may be parameterized, `pub type Route<a> = { ... endpoint: a }`, and so
 may `new` records, `type Pair<a> = new { first: a, second: a }`.
+A type parameter written `keep`, `<keep a>`, may be filled by a resource (§7.1);
+any other is `E0317` filled by one. A row parameter written `multi`,
+`<| multi e>`, may hold `multi` operations, so a call of what performs it is
+where a clause may resume the body more than once (§6.6).
 
 A bracketed name binds a resource label:
 `fn relay<[l]>(b: Bytes) -> Unit / {net.send[l]} = net.send[l](b)`. Binders sit
 among the type parameters and before the `|` — `fn serve<a, [l], [k] | e>(..)` —
 and one bracket may hold several, so `<[l, k]>` is `<[l], [k]>`. A call fills
 them left to right, either written, `relay[conn](b)`, or from an argument whose
-row or type names one (§6.2). A binder that names a region (§7), in a `Hold`'s
+row or type names one (§6.2). A binder that names a region (§7.2), in a `Hold`'s
 type or in a `hold` atom, is filled by the argument that carries the
 region and is never written: the labels a call writes fill the others, so
 `fn log_first<[l], [r]>(h: Hold<Bytes, [r]>) -> Unit / {log.write[l], hold.read[r]}`
@@ -1235,7 +1244,7 @@ given the frame, it answers the secret a file holds inside it, never a plain
 value. So `ply keygen` draws its seed with `entropy.secret` and writes it, and
 `ply build --sign` reads it, without the key ever being a plain value.
 
-**`Hold<a, [r]>`** (§7), **`Task<a>`** and **`Chan<a>`** (§9) belong to a
+**`Hold<a, [r]>`** (§7.2), **`Task<a>`** and **`Chan<a>`** (§9) belong to a
 region and cannot outlive it. A hold's type names its region, and it is written
 only where a hold is passed: as the type of a parameter of a definition, a
 lambda or a function type. As a result, a `let` annotation or a type argument
@@ -1254,7 +1263,7 @@ An operation's parameter or result is held to the same rule, since a handler
 may keep what it is handed past the region: take the row as the operation's,
 `write put<| e>(f: () -> Int / e) -> Unit`.
 A `new` record's fields are read wherever it goes, so one may write such a row;
-a row a declaration writes names no region (§7), though, so a closure over a
+a row a declaration writes names no region (§7.2), though, so a closure over a
 hold is held through a row parameter there too, and the row the type
 is given is seen leaving the region as a plain record's is.
 
@@ -1265,6 +1274,9 @@ is given is seen leaving the region as a plain record's is.
 is empty, in a signature as in a declared type. A function value may perform less
 than the type it meets says (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys.
+`once (A) -> B` is a function called at most once and never copied, a resource
+(§7.1). Within a function type, `keep` before a
+parameter's type takes what is passed there, as on a `fn` (§7.1).
 
 * **Written:** every parameter and return type of a top-level `fn` (`E0126`),
   every `forall` binder type, and every top-level `fn`'s effect row, so a
@@ -1284,8 +1296,9 @@ Functions cannot be compared, encoded, ordered or used as map keys.
   parameter among them, or to a function value would hold it past the call
   (`E0475`). Written `keep`
   (`f: keep (Int) -> Int`), the function may hold it. `keep` is part of the
-  signature and of the function's hash, and stands only before a function type (a
-  parse error elsewhere). A call is checked against it, never against the body, so
+  signature and of the function's hash. It also stands before a parameter whose
+  type is a resource, which the call then takes (§7.1); before any other type it
+  is `E0323`. A call is checked against it, never against the body, so
   a function a caller lends a parameter not written `keep` never outlives the call.
   A parameter whose type is written as an alias or a type parameter is not lent,
   even where that is a function type: it may hold what it is passed, so nothing
@@ -1785,7 +1798,10 @@ Each operation is `read`, `write` or `raise`. A `read` or a `write` answers
 where it was performed; a `raise` does not come back, so it writes a name and
 its parameters and no result (§6.8). `[r]` makes a `read` or a `write`
 resource-parameterized: a perform must supply a label (`E0304`). `nondet` marks
-results that are not a function of program state (§8.3). Effects are nominal.
+results that are not a function of program state (§8.3). `multi` before an
+operation's mode, `multi read flip[r]() -> Bool`, lets a clause resume the body
+more than once (§6.6). A parameter written `keep` takes a resource the perform
+hands it rather than lending it (§7.1). Effects are nominal.
 `task`, `clock`, `random`, `sim`, `abort`, `diverges` and `hold` are taken
 (`E0105`).
 
@@ -1830,7 +1846,7 @@ A function value may perform less than the type it meets says, though not more
 written return type or a `let` annotation, and as one of the elements of a list
 or the branches of an `if`, a `match` or a `let ... else`, which meet each
 other; so does any function such a value holds in a record, a tuple, a `List`,
-an `Array`, an `Option`, a `Result`, a `Map`, an `Iter` or a `Hold` (§7), and
+an `Array`, an `Option`, a `Result`, a `Map`, an `Iter` or a `Hold` (§7.2), and
 the function a function returns. So `run(|| a.x())` checks against `fn run(k: () -> Unit / {a.x, a.z})`,
 a callback whose row names `net.send[conn]` is one a row written
 `/ {net.write[conn]}` admits, and two callbacks fill one row variable with both
@@ -1998,8 +2014,10 @@ by its type.
 ### 6.6 `resume`
 
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
-continuation; the clause then has the `handle`'s type and may call `k` any
-number of times. Without `resume`, a clause's value returns to the perform site,
+continuation; the clause then has the `handle`'s type. It calls `k` at most once
+(`E0316`), unless the operation is declared `multi` (§6.1), as `flip` is, when it
+may call it any number of times and the body is held to what running twice
+allows (§7.1). Without `resume`, a clause's value returns to the perform site,
 except a clause for a `raise` operation (§6.8).
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
@@ -2013,7 +2031,7 @@ takes no answer from an `acquire` and no wait from a `release`: it lands when
 that one returns (§9), so what was acquired is released, and wholly. The body
 is handed what `acquire` answered as it is, a value that may be kept past the
 release, and a continuation captured inside the body and resumed twice releases
-twice; `with_hold` (§7) is the bracket whose body cannot keep what it holds and
+twice; `with_hold` (§7.2) is the bracket whose body cannot keep what it holds and
 which releases once.
 
 ### 6.7 Unhandled effects
@@ -2233,7 +2251,102 @@ it decides on the same side of every wait. `simulate` searches the orders in
 which tasks reach a handler's variables, so a test of such a handler meets the
 lost update.
 
-## 7. Holds and regions
+## 7. Resources, holds and regions
+
+### 7.1 Resources
+
+```ply
+pub opaque type Conn = | Conn(Int)
+
+release for Conn by close
+
+pub fn open(host: String) -> Conn / {net.write} = ..
+pub fn send(c: Conn, data: Bytes) -> Int / {net.write} = ..
+pub fn close(c: keep Conn) -> Unit / {net.write} = match c { Conn(fd) -> .. }
+
+fn greet(host: String) -> Int / {net.write} = {
+  let c = open(host);
+  send(c, b"hello")
+}
+```
+
+`release for T by f` makes `T` a **resource**: each value of it has one owner,
+is never copied, and is let go once, by `f`. `T` is an opaque sum type of the
+module (`E0225`, `E0217`, `E0208`), and `f` a function taking one parameter written `keep T`
+and answering `Unit` (`E0218`). A type whose constructors hold a resource is one
+too, as is a record or tuple that holds one, and so is a `once` function (below);
+letting one go lets go of each resource it holds. Every other value is copied
+freely.
+
+A `let`, a pattern's binding, and a parameter written `keep` own their resource.
+Handing it to a parameter written `keep`, answering it, putting it in a record,
+a list or a constructor, or consuming it inside a lambda **takes** it, and any
+use of the binding after that is `E0316`. Handing it to a parameter not written
+`keep` **lends** it: the call may use it and lend it on, but not take it
+(`E0318`), and the owner keeps it. A resource is not data otherwise: comparing,
+showing or filling a type parameter with one is `E0317`, unless the parameter is
+written `keep` (`fn hold<keep a>(x: keep a) -> ..`). An operation's parameter
+lends or takes the same way, and a clause's binding of it borrows or owns.
+
+What an owner still holds when its block ends is let go there, last bound first,
+with `f`'s row joining the row of the body that owns it, a definition's, a test's or a lambda's,
+but for what a `handle` around the owner answers (`E0302`): in `greet`,
+`close(c)` runs after `send` answers. Where the block's last expression does not
+name it, it is let go before that expression, so a loop's tail call stays one. A
+branch that takes it lets it go at the start of each branch that does not. It
+is let go too when a raise, a clause that does not resume, a `?` or a `let`
+whose pattern misses leaves its block, and when a release that runs before it
+fails. A resource made where nothing owns it, as a statement, a lent argument, a
+`_` binding, what a `..` leaves out or a handler's variable, is `E0322`, and so is
+a statement that names an owner and does nothing with it, or a block lent whole
+whose value is what it binds.
+
+A `match` on a value of a resource type takes it apart: its parts go to the
+arm's bindings and its own release does not run. Only the module sees an opaque
+type's constructors, so only the module takes its resource apart, which is how
+`close` lets go of a `Conn` without letting go of it again. A guard only borrows
+(`E0316`): a guard that fails hands the value to the next arm. So does the right
+of `&&` or `||`, which may not run. A field that holds
+a resource is moved out of a record once (`E0316`), one field at a time, never
+through a path `r.a.b`, and one is not moved out while another resource stays
+behind (`E0316`): take the record apart, `let { conn, .. } = r;`. The record is
+not used whole after, but by an update that writes each moved field again; an
+update that writes over a resource the record still holds is `E0322`. A field
+read through a lent record is lent.
+
+A lambda that consumes a resource it captures takes it: it is bound by a `let`
+and only called, at most once (`E0316`), and where its block ends uncalled, what
+it took is let go with it. A `once` function is called at most once and never
+copied; calling one consumes it, so only its owner, a parameter written
+`keep once`, calls it (`E0318`). A lambda that only borrows what it captures, or
+calls a lambda that does, is called or lent while the owner holds it: it may not
+be answered, kept or held in a value (`E0318`). A clause, a `return` clause, a `simulate` region's body and a
+`parallel` branch run any number of times or none, so each may borrow a resource
+bound outside it but not consume it (`E0316`).
+
+An operation's continuation (§6.6) is a resource too: unless the operation is
+declared `multi`, `resume k` binds a `k` the clause calls at most once
+(`E0316`). A clause for a `multi` operation may run the rest of the body again,
+so no resource is live across where the body performs one or calls what may
+(`E0319`), and no `nondet` operation runs after it, under the clause that may
+resume it twice (`E0321`): answer the `multi` operation with a `handle` inside
+the block first.
+
+* `E0225`: `release for` names a type that is not opaque.
+* `E0316`: a resource is used after it was consumed, or consumed by a function
+  that may run more than once; a function that consumed one is handed on; a
+  continuation is resumed twice.
+* `E0317`: a resource would be copied: compared, shown, or filling a type
+  parameter not written `keep`.
+* `E0318`: a borrowed resource is consumed, or a function borrowing one may
+  outlive it.
+* `E0319`: a resource is live across a `multi` operation.
+* `E0321`: a `nondet` operation runs where a `multi` clause may resume it twice.
+* `E0322`: a resource is made or named where nothing owns it.
+* `E0323`: `keep` is written before a type that is neither a resource nor a
+  function type.
+
+### 7.2 Holds and regions
 
 ```ply
 fn first_byte(path: String) -> Bytes / {fs.open[repo], fs.read_chunk[repo], fs.close[repo], io.refused, io.closed} =
@@ -2603,7 +2716,7 @@ effect sim           { read  seed() -> Int }
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
   wall clock. Outside a region `task` and `clock` are the host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
-  reaches reads only the holds the task itself may (§7); a clause that binds
+  reaches reads only the holds the task itself may (§7.2); a clause that binds
   `resume` is unreachable from a task (`E0502`), and a clause for a raise is
   not among them (§6.8).
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
@@ -3899,6 +4012,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0001` | unexpected token |
 | `E0002` | unterminated string or byte-string literal |
 | `E0003` | a doc comment documents nothing: no declaration follows a `///` line, or a `//!` line is not at the head of its file |
+| `E0004` | a record, a record type or a record pattern that names one field twice |
 | `E0101` | unknown name (including no `main` to run) |
 | `E0102` | unknown type |
 | `E0103` | unknown effect |
@@ -3964,7 +4078,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0205` | non-exhaustive match |
 | `E0206` | not derivable, including an unordered `Map` key, a `key` that is not ordered and hashed, and a test's case of a type hashed only through a `key` |
 | `E0207` | unknown deriver: no built-in one, and no module bound by the name |
-| `E0208` | orphan `derive`, `key`, `show` or `invariant`, or a function of a type another module declares |
+| `E0208` | orphan `derive`, `key`, `show`, `invariant` or `release`, or a function of a type another module declares |
 | `E0209` | `/` or `%` where no number has it: `/` on `Decimal`, either on a `numeric` type parameter |
 | `E0210` | operand type nothing determines |
 | `E0211` | integer literal out of range for its fixed width |
@@ -3973,14 +4087,15 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0214` | a `new` record whose fields reach the record itself |
 | `E0215` | a `numeric` that does not name each of `add`, `sub`, `mul`, `neg` and `of_int` once |
 | `E0216` | a `numeric` for a type that takes parameters |
-| `E0217` | a `key`, a `show`, an `invariant` or a `numeric` for a type that is not a sum, or a function of an alias |
-| `E0218` | a `key`, a `show`, an `invariant` or a `numeric` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, needs a constraint the type does not carry, binds a resource label, or does not only answer; a `show`'s does not answer `String`, an `invariant`'s `Bool`; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
+| `E0217` | a `key`, a `show`, an `invariant` or a `numeric` for a type that is not a sum, or a function of an alias; a `release` for an alias, an `extern type` or a record |
+| `E0218` | a `key`, a `show`, an `invariant`, a `numeric` or a `release` naming a function that does not fit: it takes more than the value, is not over the type's own parameters, needs a constraint the type does not carry, binds a resource label, or does not only answer; a `show`'s does not answer `String`, an `invariant`'s `Bool`; a `release`'s does not take one `keep` parameter of the type and answer `Unit`; a `numeric`'s is not `(T, T) -> T`, `(T) -> T` for `neg` or `(Int) -> T` for `of_int` |
 | `E0219` | a `key` whose answer is compared through the type it is the key of |
 | `E0220` | a record literal or an update that would build an `opaque` record outside its module |
 | `E0221` | `opaque` on an alias, which has no values of its own |
 | `E0222` | a range pattern whose bounds are not two integer literals of one type, the first no greater than the second |
 | `E0223` | a wrapping, saturating or checked builtin, an operator written in one, or a rotation at a type that states its own arithmetic |
 | `E0224` | a `Columns` of a type that is not a record of at least one field |
+| `E0225` | a `release for` a type that is not `opaque` |
 | `E0301` | unbound row variable |
 | `E0302` | effect not permitted by the written row |
 | `E0303` | unhandled effect (compiler defect) |
@@ -3995,6 +4110,13 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0313` | `try` naming an operation that is not a `raise` |
 | `E0314` | assignment to a name that is not a variable of the handler whose clause it is in |
 | `E0315` | handler variable assigned in a lambda, a nested body or `return` |
+| `E0316` | a resource used after it was consumed, consumed by a function that may run more than once, by a guard or by the right of `&&` or `||`, or moved out of a record twice or through a path of fields; a function that consumed one handed on; a continuation resumed twice |
+| `E0317` | a resource copied: compared, shown, read as data, or filling a type parameter not written `keep` |
+| `E0318` | a borrowed resource consumed, or a function that borrows one where it may outlive it |
+| `E0319` | a resource live, or handed to a call, across a perform or a call a clause may resume more than once, or consumed past one |
+| `E0321` | a `nondet` operation where a clause may resume the body more than once |
+| `E0322` | a resource made or named where nothing owns it: a statement, a lent argument, `_`, what `..` leaves out, a handler's variable, or a record field an update writes over |
+| `E0323` | `keep` before a type that is neither a resource nor a function type |
 | `E0330` | `with_hold` naming a region already open |
 | `E0331` | hold read or let go after its region released what it held |
 | `E0412` | nondeterministic effect in a deterministic test |

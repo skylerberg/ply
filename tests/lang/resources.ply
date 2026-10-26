@@ -1,0 +1,289 @@
+//! A resource is let go once, by the function its type's `release` names: where its block ends,
+//! before a last expression that does not name it and after one that does, at the start of a branch
+//! that does not take it, and where a raise, a clause that does not resume or a `?` leaves its block.
+//! A call that takes it lets it go instead.
+
+effect log {
+  write note(s: String) -> Unit
+}
+
+effect stop {
+  write now() -> Unit
+}
+
+opaque type Conn = | Conn(String)
+
+release for Conn by close
+
+fn close(c: keep Conn) -> Unit / {log.write} = match c { Conn(name) -> log.note("close " ++ name) }
+
+fn open(name: String) -> Conn / {log.write} = {
+  log.note("open " ++ name);
+  Conn(name)
+}
+
+fn send(c: Conn, m: String) -> Int / {log.write} =
+  match c {
+    Conn(name) -> {
+      log.note(name ++ " " ++ m);
+      m.len()
+    },
+  }
+
+fn take(c: keep Conn) -> Unit / {log.write} = match c { Conn(name) -> log.note("took " ++ name) }
+
+/// What `body` noted, in order.
+fn noted<a | e>(body: () -> a / {log.write | e}) -> List<String> / e =
+  handle {
+    body()
+  } with {
+    var seen = [],
+    log.note(s) -> {
+      seen = seen.push(s);
+    },
+    return u -> seen,
+  }
+
+fn attempt(fail: Bool) -> Result<Int, String> / {log.write} = {
+  let c = open("a");
+  let n = (if fail { Err("no") } else { Ok(1) })?;
+  Ok(send(c, "hi") + n)
+}
+
+test "a resource is let go where its block ends, once the last expression naming it ran" {
+  let seen = noted(|| {
+    let n = {
+      let c = open("a");
+      send(c, "hi")
+    };
+    assert_eq(n, 2)
+  });
+  assert_eq(seen, ["open a", "a hi", "close a"])
+}
+
+test "a resource the last expression does not name is let go before it, the last bound first" {
+  let seen = noted(|| {
+    let a = open("a");
+    let b = open("b");
+    log.note("last")
+  });
+  assert_eq(seen, ["open a", "open b", "close b", "close a", "last"])
+}
+
+test "a resource a call takes is let go by that call alone" {
+  let seen = noted(|| {
+    let c = open("a");
+    take(c)
+  });
+  assert_eq(seen, ["open a", "took a"])
+}
+
+test "a branch that does not take a resource lets it go as it starts" {
+  let run = |b: Bool|
+    noted(|| {
+      let c = open("a");
+      if b { take(c) } else { log.note("kept") }
+    });
+  assert_eq(run(true), ["open a", "took a"]);
+  assert_eq(run(false), ["open a", "close a", "kept"])
+}
+
+test "a raise unwinding through a resource's block lets it go before its clause runs" {
+  let seen = noted(|| {
+    let answered = handle {
+      let c = open("a");
+      abort.raise("gone");
+      send(c, "never")
+    } with {
+      abort.raise(m) -> {
+        log.note("caught");
+        m.len()
+      },
+    };
+    assert_eq(answered, 4)
+  });
+  assert_eq(seen, ["open a", "close a", "caught"])
+}
+
+test "a clause that does not resume lets go of what the body held" {
+  let seen = noted(|| {
+    let answered = handle {
+      let c = open("a");
+      stop.now();
+      send(c, "never")
+    } with {
+      stop.now() resume k -> 0,
+    };
+    assert_eq(answered, 0)
+  });
+  assert_eq(seen, ["open a", "close a"])
+}
+
+test "a `?` leaving a resource's block lets it go on the way out" {
+  assert_eq(noted(|| attempt(true)), ["open a", "close a"]);
+  assert_eq(noted(|| attempt(false)), ["open a", "a hi", "close a"])
+}
+
+test "a value holding resources lets go of each it holds" {
+  let seen = noted(|| {
+    let pair = (open("a"), open("b"));
+    let maybe = Some(open("c"));
+    let many = [open("d"), open("e")];
+    log.note("end")
+  });
+  assert_eq(seen, [
+    "open a",
+    "open b",
+    "open c",
+    "open d",
+    "open e",
+    "close d",
+    "close e",
+    "close c",
+    "close a",
+    "close b",
+    "end",
+  ])
+}
+
+test "a function that took a resource lets it go where its block ends uncalled" {
+  let seen = noted(|| {
+    let c = open("a");
+    let later = || take(c);
+    log.note("end")
+  });
+  assert_eq(seen, ["open a", "close a", "end"]);
+  let called = noted(|| {
+    let c = open("a");
+    let later = || take(c);
+    later()
+  });
+  assert_eq(called, ["open a", "took a"])
+}
+
+test "a function that took one that took a resource lets the resource go uncalled" {
+  let seen = noted(|| {
+    let c = open("a");
+    let g = || take(c);
+    let h = || g();
+    log.note("end")
+  });
+  assert_eq(seen, ["open a", "close a", "end"])
+}
+
+fn moved(fail: Bool) -> Int / {log.write, abort.raise} = {
+  let h = { conn: open("a"), n: 1 };
+  let r = { conn: h.conn, n: if fail { abort.raise("no") } else { 2 } };
+  send(r.conn, "hi") + r.n
+}
+
+test "a field moved into a record a later field fails to finish is let go" {
+  let caught = |body: () -> Int / {log.write, abort.raise}|
+    noted(|| {
+      let n = handle { body() } with { abort.raise(m) -> 0 };
+      log.note("answered")
+    });
+  assert_eq(caught(|| moved(true)), ["open a", "close a", "answered"]);
+  assert_eq(caught(|| moved(false)), ["open a", "a hi", "close a", "answered"])
+}
+
+type Inner = { conn: Conn, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int }
+
+type Outer = { inner: Inner, z: Int }
+
+fn built(fail: Bool) -> Outer / {log.write, abort.raise} =
+  {
+    inner: { conn: open("a"), a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8 },
+    z: if fail { abort.raise("no") } else { 0 },
+  }
+
+test "a wide record built inside another is let go when a later field fails" {
+  let run = |fail: Bool|
+    noted(|| {
+      let n = handle {
+        let o = built(fail);
+        o.z
+      } with {
+        abort.raise(m) -> 9,
+      };
+      log.note("answered")
+    });
+  assert_eq(run(true), ["open a", "close a", "answered"]);
+  assert_eq(run(false), ["open a", "close a", "answered"])
+}
+
+fn stepped(fail: Bool) -> Int / {log.write, abort.raise} = {
+  let c = open("c");
+  let t = iterate(0, 10, |i: Int| {
+    let d = open("d");
+    let k = send(d, "x");
+    if fail && i == 1 { abort.raise("no") };
+    if i > 2 { Stop(i) } else { Continue(i + 1) }
+  });
+  send(c, "after") + t
+}
+
+test "a failure in a loop's step lets go of what the step and its caller hold" {
+  let run = |fail: Bool|
+    noted(|| {
+      let n = handle { stepped(fail) } with { abort.raise(m) -> 0 };
+      log.note("answered")
+    });
+  assert_eq(run(true), [
+    "open c",
+    "open d",
+    "d x",
+    "close d",
+    "open d",
+    "d x",
+    "close d",
+    "close c",
+    "answered",
+  ])
+}
+
+opaque type Fragile = | Fragile(String)
+
+release for Fragile by shut
+
+fn shut(x: keep Fragile) -> Unit / {log.write, abort.raise} =
+  match x {
+    Fragile(name) -> {
+      log.note("shut " ++ name);
+      if name == "b" { abort.raise("shut failed") }
+    },
+  }
+
+fn fragile(name: String) -> Fragile / {log.write} = {
+  log.note("open " ++ name);
+  Fragile(name)
+}
+
+test "a release that fails lets go of what is still owned before its failure goes on" {
+  let seen = noted(|| {
+    handle {
+      let a = fragile("a");
+      let b = fragile("b");
+      log.note("last")
+    } with {
+      abort.raise(m) -> log.note("caught " ++ m),
+    }
+  });
+  assert_eq(seen, ["open a", "open b", "shut b", "shut a", "caught shut failed"])
+}
+
+fn none_int() -> Option<Int> = None
+
+test "a `let` whose pattern misses lets go of what its block owns" {
+  let seen = noted(|| {
+    let n = handle {
+      let c = open("a");
+      let Some(m) = none_int();
+      send(c, "x") + m
+    } with {
+      abort.raise(why) -> 0,
+    };
+    log.note("answered")
+  });
+  assert_eq(seen, ["open a", "close a", "answered"])
+}
