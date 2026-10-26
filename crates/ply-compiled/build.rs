@@ -1,8 +1,8 @@
 //! A digest of the runtime. `PLY_SEMANTICS_DIGEST` is every file under `src/` of this crate and of
 //! the workspace crates it links, less the files that only keep, sweep and load C: what an answer
-//! the program's own emitter gives, running inside a loaded unit, is a function of. The Ply packages are left out: what they hold is Ply sources and the
-//! builder, which a body's key already names through its definition's key and the emitter's
-//! identity.
+//! the program's own emitter gives, running inside a loaded unit, is a function of. The Ply
+//! packages are left out: what they hold is Ply sources and the builder, which a body's key already
+//! names through its definition's key and the emitter's identity.
 
 use std::path::{Path, PathBuf};
 

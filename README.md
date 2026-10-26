@@ -32,14 +32,13 @@ of it next.
 | `tests/cli` | the CLI's suite |
 | `tests/std` | the standard library's tests that read fixture files, beside the files |
 | `examples/`, `tests/lang/`, `tests/fixtures/` | Ply programs the suite runs |
-| `crates/ply-core` | what every crate speaks: values and the builtins' Rust, the scheduler and the simulator; spans, diagnostics and their codes; the program record the compiler answers with |
+| `crates/ply-core` | what every crate speaks: values and the builtins' Rust, the scheduler and the simulator; spans, diagnostics and their codes; effects, their footprints and the host boundary |
 | `crates/ply-compiled` | the runtime compiled code runs on: loads a compiled unit, or the one an executable was linked with, and runs it |
 | `crates/ply-host` | the Rust handlers effects resolve to (db, fs, tcp, tls, ...) |
-| `crates/ply-privileged` | the privileged families `--allow` lends: a program loading and entering another program, and the runtime `ply test` and `ply prove` drive |
+| `crates/ply-privileged` | the families the runtime serves itself, the shipped modules and what they answer and the toolchain, and the binding a program `std.machine` enters runs under |
 | `crates/ply-launcher` | what enters a native program: its pack read, its roots and hosts lent, its entry called |
 | `crates/ply-pack` | the pack a native program carries after its code |
 | `crates/ply-runtime` | the runtime's static library a native program, `ply` among them, is linked with |
-| `crates/ply-test-support` | a program's checked declarations written by hand, for Rust tests that compile no Ply |
 | `crates/<crate>-tests` | that crate's tests |
 | `editors/` | the tree-sitter grammar editors read |
 | `probes/` | standalone C probes, each run by a CI job |
