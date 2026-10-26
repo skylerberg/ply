@@ -1,20 +1,17 @@
-//! The deterministic scheduler. It holds what its tasks pass each other, the payloads `P` a task
-//! answers and a channel carries, without reading them, and answers each operation with a
-//! [`Reply`] the region writes as the operation's answer.
+//! The production scheduler: a region a `task` operation outside `simulate` opens, scheduling its
+//! tasks round-robin against the host runtime. It holds what its tasks pass each other, the
+//! payloads `P` a task answers and a channel carries, without reading them, and answers each
+//! operation with a [`Reply`] the region writes as the operation's answer.
 
 use crate::host::{HostBinding, HostRuntime, MachineId, Pending};
-use crate::region::SimId;
-use crate::region::{StepSite, Trail};
-use crate::sim::{
-    Access, ChanId, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId, ended, liveness,
-};
+use crate::sim::{ChanId, SimId, TaskId};
 use crate::value::Value;
-use crate::{Diagnostic, Mode, Span, codes};
+use crate::{Diagnostic, Span, codes};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::rc::{Rc, Weak};
 
-/// The task a `simulate` region's own body runs as.
+/// The task a region's root runs as.
 pub const ROOT: TaskId = TaskId(0);
 
 /// What an operation a task performed is answered.
@@ -75,22 +72,7 @@ pub enum Turn<K, B, P> {
     Complete(P),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Policy {
-    Seeded,
-    Host,
-}
-
-impl Policy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Policy::Seeded => "seeded",
-            Policy::Host => "host",
-        }
-    }
-}
-
-/// Permission to build a [`Policy::Host`] scheduler; unobtainable in a run bound to no host.
+/// Permission to build a production scheduler; unobtainable in a run bound to no host.
 pub struct HostPolicy(());
 
 impl HostPolicy {
@@ -108,7 +90,7 @@ struct HeldTask {
     /// Every region numbers its own tasks, so an id alone names a task only in its own region.
     region: SimId,
     id: TaskId,
-    /// A production region's [`Released`]; dangling for every other handle, which nothing counts.
+    /// Its region's [`Released`]; dangling for an [`TaskHandle::unowned`] one, which nothing counts.
     released: Weak<Released>,
 }
 
@@ -152,8 +134,8 @@ pub struct ChanHandle {
 /// A bounded queue between tasks. A blocked sender's value waits in its [`Wait::Send`].
 struct Channel<P> {
     capacity: usize,
-    /// Sent and not yet received, each with its sender's vector clock as of the send.
-    queue: VecDeque<(P, Stamp)>,
+    /// Sent and not yet received.
+    queue: VecDeque<P>,
     senders: VecDeque<TaskId>,
     receivers: VecDeque<TaskId>,
     closed: bool,
@@ -177,27 +159,13 @@ struct Arm<P> {
     send: Option<P>,
 }
 
-/// What a cancel let go of. Which of the cancel and another task's step on it comes first decides
-/// whether the cancelled task had its answer, so a seeded region records it against the cancel.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LetGo {
-    Nothing,
-    /// A join or an await of this task.
-    Task(TaskId),
-    /// A send, a receive or a select on these channels.
-    Chans(Vec<ChanId>),
-}
-
 /// What `task.cancel` did beside answering.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Stopped<B> {
     /// Whether it stopped the task, which is what it answered.
     pub stopped: bool,
-    /// The task had ended before the cancel came, so the cancel read only that.
-    pub ended: bool,
     /// The body of a task that never started, for the caller to release.
     pub unstarted: Option<B>,
-    pub let_go: LetGo,
 }
 
 /// A `bracket`'s `acquire` or its `release`: where a cancel does not take a task's answer from it.
@@ -220,8 +188,7 @@ enum Wait<P> {
         task: TaskId,
         span: Span,
     },
-    /// A seeded region's timer is the [`Clock`]'s, and `until` virtual time; a production region's
-    /// is the scheduler's, and `until` a reading of the host's clock.
+    /// Until a reading of the host's clock.
     Timer {
         until: i64,
         span: Span,
@@ -258,18 +225,13 @@ enum TaskState<K, B, P> {
     Failed,
     /// Stopped by `task.cancel` before it finished: it answers nothing.
     Cancelled,
-    /// Cancelled before it started, in a seeded region: enabled for one turn that runs nothing, so
-    /// the search has a step of the task to order against the cancel.
-    Dropped,
 }
 
 struct Task<K, B, P> {
     state: TaskState<K, B, P>,
     origin: Span,
-    /// The vector clock, indexed by [`TaskId`]; a production region keeps none.
-    stamp: Stamp,
     joiners: Vec<TaskId>,
-    /// No handle to it is left, so a production region retires it once it is done.
+    /// No handle to it is left, so the region retires it once it is done.
     unheld: bool,
     /// A cancel reached it: a later one changes nothing, and every step it still takes reads it.
     cancelled: bool,
@@ -281,11 +243,10 @@ struct Task<K, B, P> {
 }
 
 impl<K, B, P> Task<K, B, P> {
-    fn new(state: TaskState<K, B, P>, origin: Span, stamp: Stamp) -> Task<K, B, P> {
+    fn new(state: TaskState<K, B, P>, origin: Span) -> Task<K, B, P> {
         Task {
             state,
             origin,
-            stamp,
             joiners: Vec::new(),
             unheld: false,
             cancelled: false,
@@ -296,55 +257,18 @@ impl<K, B, P> Task<K, B, P> {
     }
 }
 
-pub struct StepRecord {
-    pub region: SimId,
-    pub task: TaskId,
-    /// Ascending by id.
-    pub enabled: Vec<TaskId>,
-    pub choice: u16,
-    /// Virtual time when the step began.
-    pub at: i64,
-    /// What the step touched, excluding the scheduler's own bookkeeping.
-    pub accesses: StepFootprint,
-    /// Where it first touched something in `accesses`, else where it gave control back.
-    pub site: Option<StepSite>,
-    pub stamp: Stamp,
-}
-
-/// A task's vector clock, indexed by [`TaskId`], as of one step.
-pub type Stamp = Vec<u32>;
-
-/// `later`'s task had observed `earlier`'s step, transitively through spawns and joins.
-pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> bool {
-    if earlier.is_empty() || later.is_empty() {
-        return false;
-    }
-    let at = earlier_task.0 as usize;
-    let mine = earlier.get(at).copied().unwrap_or(0);
-    let theirs = later.get(at).copied().unwrap_or(0);
-    mine > 0 && theirs >= mine
-}
-
-pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
-    match access {
-        Access::Atom(atom) => matches!(atom.effect.as_str(), "task" | "clock"),
-        Access::Var { .. } | Access::Hold { .. } => false,
-    }
-}
-
 /// The scheduler of one region: `K` how a suspended task is resumed, `B` a task's body before it
 /// starts, and `P` what a task answers and a channel carries, which it clones for each task that
 /// hears it and drops when the region lets it go.
 pub struct Scheduler<K, B, P> {
     region: SimId,
-    /// Only the tasks still kept: a production region retires a finished one nobody can join.
+    /// Only the tasks still kept: a finished one nobody can join is retired.
     tasks: BTreeMap<TaskId, Task<K, B, P>>,
-    /// Ascending, the order a seed's choice indexes and the round-robin walks.
+    /// Ascending, the order the round-robin walks.
     ready: BTreeSet<TaskId>,
     /// Each host token a task waits on, and the task.
     parked: BTreeMap<u64, TaskId>,
-    /// A production region's sleepers, each beside the reading of the host's clock that wakes it;
-    /// a seeded region's are the [`Clock`]'s.
+    /// The sleepers, each beside the reading of the host's clock that wakes it.
     timers: BTreeSet<(i64, TaskId)>,
     channels: BTreeMap<ChanId, Channel<P>>,
     unfinished: usize,
@@ -353,13 +277,12 @@ pub struct Scheduler<K, B, P> {
     /// The next channel's id. One past a channel not in `channels` is spent: closed and empty.
     next_chan: u64,
     released: Rc<Released>,
-    /// The machine whose host state a retired task ends; `None` for a seeded region.
-    machine: Option<MachineId>,
+    /// The machine whose host state a retired task ends.
+    machine: MachineId,
+    /// No budget where `u32::MAX`, the default.
     max_steps: u32,
-    /// Counted only under [`Policy::Host`]; a seeded region spends the [`Trail`]'s points instead.
     steps: u32,
-    policy: Policy,
-    /// Where a production region's round-robin looks first: one past the task it ran last.
+    /// Where the round-robin looks first: one past the task it ran last.
     resume_from: TaskId,
     current: Option<TaskId>,
     span: Span,
@@ -367,32 +290,15 @@ pub struct Scheduler<K, B, P> {
 }
 
 impl<K, B, P: Clone> Scheduler<K, B, P> {
-    pub fn new(region: SimId, span: Span) -> Scheduler<K, B, P> {
-        Scheduler::rooted(region, span, Policy::Seeded, DEFAULT_STEPS, None)
-    }
-
     pub fn production(
         region: SimId,
         span: Span,
         _permit: HostPolicy,
         machine: MachineId,
     ) -> Scheduler<K, B, P> {
-        Scheduler::rooted(region, span, Policy::Host, u32::MAX, Some(machine))
-    }
-
-    fn rooted(
-        region: SimId,
-        span: Span,
-        policy: Policy,
-        max_steps: u32,
-        machine: Option<MachineId>,
-    ) -> Scheduler<K, B, P> {
         Scheduler {
             region,
-            tasks: BTreeMap::from([(
-                ROOT,
-                Task::new(TaskState::Ready(Resumption::Enter), span, vec![0]),
-            )]),
+            tasks: BTreeMap::from([(ROOT, Task::new(TaskState::Ready(Resumption::Enter), span))]),
             ready: BTreeSet::from([ROOT]),
             parked: BTreeMap::new(),
             timers: BTreeSet::new(),
@@ -402,9 +308,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             next_chan: 0,
             released: Rc::new(Cell::new(Vec::new())),
             machine,
-            max_steps,
+            max_steps: u32::MAX,
             steps: 0,
-            policy,
             resume_from: ROOT,
             current: None,
             span,
@@ -428,111 +333,17 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         self
     }
 
-    pub fn policy(&self) -> Policy {
-        self.policy
-    }
-
-    pub fn records_steps(&self) -> bool {
-        self.policy == Policy::Seeded
-    }
-
-    /// A production region answers no reading: the host's clock and its entropy are handlers'. Of
-    /// the clock it answers the sleep alone, which is a wait of one task.
-    pub fn answers(&self, effect: &str, op: &str) -> bool {
-        match self.policy {
-            Policy::Seeded => crate::sim::is_scheduled(effect, op),
-            Policy::Host => match effect {
-                "task" => crate::sim::TASK_OPS.contains(&op),
-                "clock" => op == "sleep",
-                _ => false,
-            },
-        }
-    }
-
     pub fn current(&self) -> Option<TaskId> {
         self.current
     }
 
-    /// Every task a seeded region spawned; under the host, only those that can still run or be joined.
+    /// The tasks that can still run or be joined.
     pub fn tasks(&self) -> usize {
         self.tasks.len()
     }
 
-    pub fn next(
-        &mut self,
-        clock: &mut Clock,
-        trail: &mut Trail,
-    ) -> Result<Turn<K, B, P>, Diagnostic> {
-        self.require(Policy::Seeded)?;
-        if let Some(failure) = &self.failure {
-            return Err(failure.clone());
-        }
-        if let Some(task) = self.current {
-            return Err(self.internal(format!(
-                "{task} was still running when the scheduler was asked for the next task"
-            )));
-        }
-
-        loop {
-            let enabled = loop {
-                let enabled: Vec<TaskId> = self.ready.iter().copied().collect();
-                if !enabled.is_empty() {
-                    break enabled;
-                }
-                if let Some(wake) = clock.advance() {
-                    self.wake(&wake.woken)?;
-                    continue;
-                }
-                return if self.unfinished == 0 {
-                    self.complete()
-                } else {
-                    Err(self.err_deadlock(clock.now(), trail.seed()))
-                };
-            };
-
-            if trail.point() as u32 >= self.max_steps {
-                return Err(self.err_step_budget(trail.seed()));
-            }
-
-            let choice = self.choose(trail, &enabled)?;
-            let task = enabled[choice];
-            self.tick(task);
-            let t = self.task_mut(task)?;
-            let dropped = matches!(t.state, TaskState::Dropped);
-            // Each step a cancelled task takes could have come before its cancel instead.
-            let mut accesses = StepFootprint::new();
-            if t.cancelled {
-                accesses.insert(liveness(task, Mode::Read));
-            }
-            if dropped {
-                accesses.insert(ended(task));
-            }
-            let stamp = t.stamp.clone();
-            trail.push_step(StepRecord {
-                region: self.region,
-                task,
-                enabled,
-                choice: choice as u16,
-                at: clock.now(),
-                accesses,
-                site: None,
-                stamp,
-            });
-            if dropped {
-                self.ready.remove(&task);
-                self.task_mut(task)?.state = TaskState::Cancelled;
-                self.settle_cancelled(task)?;
-                continue;
-            }
-            let resumption = self.take_ready(task)?;
-            self.current = Some(task);
-            return Ok(Turn::Run { task, resumption });
-        }
-    }
-
     /// Costs what is ready and what resolved, never what the region has ever run.
     pub fn next_host(&mut self, rt: &dyn HostRuntime) -> Result<Turn<K, B, P>, Diagnostic> {
-        self.require(Policy::Host)?;
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
         }
@@ -600,8 +411,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         Ok(Turn::Run { task, resumption })
     }
 
-    /// Only a production region parks: the boundary refuses a host operation performed under a
-    /// seed before a handler can answer one, so a seeded park is a defect in dispatch.
+    /// Parks the running task until the host resolves `pending`, the region's other tasks running
+    /// meanwhile.
     pub fn park_on_host(
         &mut self,
         k: K,
@@ -609,9 +420,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         span: Span,
         rt: &dyn HostRuntime,
     ) -> Result<(), Diagnostic> {
-        if let Err(d) = self.require(Policy::Host) {
-            return Err(d.secondary(span, format!("`{pending}` would have parked this task")));
-        }
         let task = self.running()?;
         rt.watch(&pending)?;
         if let Some(other) = self.parked.insert(pending.token, task) {
@@ -628,7 +436,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     }
 
     /// Parks the running task until the host's clock has run `nanos` on, the region's other tasks
-    /// running meanwhile. No span or less is a yield, as it is on virtual time.
+    /// running meanwhile. No span or less is a yield.
     pub fn sleep_on_host(
         &mut self,
         k: K,
@@ -636,9 +444,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         span: Span,
         rt: &dyn HostRuntime,
     ) -> Result<(), Diagnostic> {
-        if let Err(d) = self.require(Policy::Host) {
-            return Err(d.secondary(span, "this sleep would have waited on the host's clock"));
-        }
         if nanos <= 0 {
             return self.suspend(k, Value::Unit);
         }
@@ -740,9 +545,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                 }
                 // Its answer may hold another task's last handle, which the next pass picks up.
                 self.tasks.remove(&id);
-                if let Some(machine) = self.machine {
-                    rt.end_task(machine, id);
-                }
+                rt.end_task(self.machine, id);
             }
         }
     }
@@ -760,32 +563,16 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     pub fn spawn(&mut self, body: B, span: Span) -> TaskHandle {
         let id = TaskId(self.next_id);
         self.next_id += 1;
-        let stamp = match (self.policy, self.current) {
-            (Policy::Seeded, Some(parent)) => self
-                .tasks
-                .get(&parent)
-                .map(|t| t.stamp.clone())
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
         self.tasks.insert(
             id,
-            Task::new(
-                TaskState::Ready(Resumption::Start { body, span }),
-                span,
-                stamp,
-            ),
+            Task::new(TaskState::Ready(Resumption::Start { body, span }), span),
         );
         self.ready.insert(id);
         self.unfinished += 1;
-        let released = match self.policy {
-            Policy::Host => Rc::downgrade(&self.released),
-            Policy::Seeded => Weak::new(),
-        };
         TaskHandle(Rc::new(HeldTask {
             region: self.region,
             id,
-            released,
+            released: Rc::downgrade(&self.released),
         }))
     }
 
@@ -802,34 +589,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             }
         }
         bodies
-    }
-
-    fn tick(&mut self, task: TaskId) {
-        let width = self.next_id as usize;
-        for t in self.tasks.values_mut() {
-            t.stamp.resize(width, 0);
-        }
-        if let Some(t) = self.tasks.get_mut(&task) {
-            t.stamp[task.0 as usize] += 1;
-        }
-    }
-
-    fn absorb(&mut self, into: TaskId, from: TaskId) {
-        if self.policy != Policy::Seeded {
-            return;
-        }
-        let Some(source) = self.tasks.get(&from).map(|t| t.stamp.clone()) else {
-            return;
-        };
-        let Some(target) = self.tasks.get_mut(&into) else {
-            return;
-        };
-        if target.stamp.len() < source.len() {
-            target.stamp.resize(source.len(), 0);
-        }
-        for (slot, seen) in target.stamp.iter_mut().zip(source) {
-            *slot = (*slot).max(seen);
-        }
     }
 
     /// Readies the running task with `value`, which the region answered it itself, and gives
@@ -853,7 +612,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         };
         match settled {
             Some(answer) => {
-                self.absorb(task, target);
                 let resumption = match answer {
                     Ok(value) => Resumption::Resume {
                         k,
@@ -890,10 +648,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             Some(_) => None,
         };
         match settled {
-            Some(value) => {
-                self.absorb(task, target);
-                self.make_ready(task, Resumption::Resume { k, value });
-            }
+            Some(value) => self.make_ready(task, Resumption::Resume { k, value }),
             None => {
                 self.task_mut(target)?.joiners.push(task);
                 self.task_mut(task)?.state = TaskState::Blocked {
@@ -916,7 +671,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         k: K,
         target: &TaskHandle,
         span: Span,
-        clock: Option<&mut Clock>,
     ) -> Result<Stopped<B>, Diagnostic> {
         let task = self.running()?;
         if target.region() != self.region {
@@ -931,20 +685,17 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             .primary(span, "cancelled here")
             .note("a task cancels another one: the region's own body, and a task itself, are not cancelled"));
         }
-        let seeded = self.policy == Policy::Seeded;
         let Some(t) = self.tasks.get_mut(&target) else {
             return Err(err_unknown_task(span, target));
         };
         let ended = matches!(
             t.state,
-            TaskState::Done(_) | TaskState::Failed | TaskState::Cancelled | TaskState::Dropped
+            TaskState::Done(_) | TaskState::Failed | TaskState::Cancelled
         );
         let stops = !ended && !t.cancelled;
         let mut stopped = Stopped {
             stopped: stops,
-            ended,
             unstarted: None,
-            let_go: LetGo::Nothing,
         };
         if stops {
             t.cancelled = true;
@@ -952,12 +703,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             match std::mem::replace(&mut t.state, TaskState::Cancelled) {
                 TaskState::Ready(Resumption::Start { body, .. }) => {
                     stopped.unstarted = Some(body);
-                    if seeded {
-                        t.state = TaskState::Dropped;
-                    } else {
-                        self.ready.remove(&target);
-                        self.settle_cancelled(target)?;
-                    }
+                    self.ready.remove(&target);
+                    self.settle_cancelled(target)?;
                 }
                 answered @ TaskState::Ready(
                     Resumption::Resume { .. } | Resumption::Raise { .. },
@@ -973,10 +720,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                     t.stopping = true;
                 }
                 TaskState::Blocked { wait, k } => {
-                    stopped.let_go = self.let_go(target, wait, clock);
+                    self.let_go(target, wait);
                     self.make_ready(target, Resumption::Cancel { k });
-                    // The cancel is what woke it, where a task that could run was only overtaken.
-                    self.absorb(target, task);
                 }
                 other => {
                     t.state = other;
@@ -996,38 +741,21 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     }
 
     /// Takes `target` off whatever `wait` had it waiting on.
-    fn let_go(&mut self, target: TaskId, wait: Wait<P>, clock: Option<&mut Clock>) -> LetGo {
+    fn let_go(&mut self, target: TaskId, wait: Wait<P>) {
         match wait {
             Wait::Timer { until, .. } => {
-                match clock {
-                    Some(clock) => clock.cancel(target),
-                    None => {
-                        self.timers.remove(&(until, target));
-                    }
-                }
-                LetGo::Nothing
+                self.timers.remove(&(until, target));
             }
             Wait::Join { task: on, .. } | Wait::Await { task: on, .. } => {
                 if let Some(t) = self.tasks.get_mut(&on) {
                     t.joiners.retain(|j| *j != target);
                 }
-                LetGo::Task(on)
             }
             Wait::Host { pending, .. } => {
                 self.parked.remove(&pending.token);
-                LetGo::Nothing
             }
-            Wait::Send { chan, .. } | Wait::Recv { chan, .. } => {
-                self.unwait(target, [chan]);
-                LetGo::Chans(vec![chan])
-            }
-            Wait::Select { arms, .. } => {
-                let mut chans: Vec<ChanId> = arms.iter().map(|arm| arm.chan).collect();
-                chans.sort();
-                chans.dedup();
-                self.unwait(target, chans.iter().copied());
-                LetGo::Chans(chans)
-            }
+            Wait::Send { chan, .. } | Wait::Recv { chan, .. } => self.unwait(target, [chan]),
+            Wait::Select { arms, .. } => self.unwait(target, arms.iter().map(|arm| arm.chan)),
         }
     }
 
@@ -1071,24 +799,20 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
 
     /// Lets go of a wait `task` just began with a cancel held back for the `acquire` it stands
     /// in: there an operation that answers keeps its answer, and a wait does not start.
-    pub fn refuse_wait(&mut self, task: TaskId, clock: Option<&mut Clock>) -> LetGo {
+    pub fn refuse_wait(&mut self, task: TaskId) {
         let Some(t) = self.tasks.get_mut(&task) else {
-            return LetGo::Nothing;
+            return;
         };
         if !t.stopping || t.releasing > 0 || !matches!(t.state, TaskState::Blocked { .. }) {
-            return LetGo::Nothing;
+            return;
         }
         t.stopping = false;
         match std::mem::replace(&mut t.state, TaskState::Cancelled) {
             TaskState::Blocked { wait, k } => {
-                let let_go = self.let_go(task, wait, clock);
+                self.let_go(task, wait);
                 self.make_ready(task, Resumption::Cancel { k });
-                let_go
             }
-            other => {
-                t.state = other;
-                LetGo::Nothing
-            }
+            other => t.state = other,
         }
     }
 
@@ -1123,7 +847,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                 }
                 _ => return Err(self.internal(format!("{joiner} waited on {task} without a join"))),
             };
-            self.absorb(joiner, task);
             self.make_ready(joiner, resumption);
         }
         if unheld {
@@ -1165,7 +888,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     ) -> Result<(), Diagnostic> {
         let task = self.running()?;
         let id = self.channel_of(chan, span)?;
-        let value = match self.send_now(task, id, value)? {
+        let value = match self.send_now(id, value)? {
             Sent::Went(sent) => return self.answer(task, k, Reply::Value(Value::Bool(sent))),
             Sent::Waits(value) => value,
         };
@@ -1186,8 +909,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
 
     /// A send that does not wait: handed to the longest-waiting receiver, queued while there is
     /// room, or refused by a closed channel.
-    fn send_now(&mut self, task: TaskId, id: ChanId, value: P) -> Result<Sent<P>, Diagnostic> {
-        let stamp = self.stamp_of(task);
+    fn send_now(&mut self, id: ChanId, value: P) -> Result<Sent<P>, Diagnostic> {
         let Some(ch) = self.channels.get_mut(&id) else {
             return Ok(Sent::Went(false));
         };
@@ -1195,11 +917,11 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             return Ok(Sent::Went(false));
         }
         if let Some(receiver) = ch.receivers.pop_front() {
-            self.deliver(receiver, id, Some(value), task)?;
+            self.deliver(receiver, id, Some(value))?;
             return Ok(Sent::Went(true));
         }
         if ch.queue.len() < ch.capacity {
-            ch.queue.push_back((value, stamp));
+            ch.queue.push_back(value);
             return Ok(Sent::Went(true));
         }
         Ok(Sent::Waits(value))
@@ -1211,7 +933,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         receiver: TaskId,
         chan: ChanId,
         value: Option<P>,
-        by: TaskId,
     ) -> Result<(), Diagnostic> {
         let t = self.task_mut(receiver)?;
         let (k, answer) = match std::mem::replace(&mut t.state, TaskState::Running) {
@@ -1243,20 +964,13 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                 )));
             }
         };
-        self.absorb(receiver, by);
         self.make_ready(receiver, Resumption::Resume { k, value: answer });
         Ok(())
     }
 
     /// Readies `sender`, which waited to send on `chan`, with whether its value went, and
     /// answers the value.
-    fn take_sent(
-        &mut self,
-        sender: TaskId,
-        chan: ChanId,
-        sent: bool,
-        by: TaskId,
-    ) -> Result<P, Diagnostic> {
+    fn take_sent(&mut self, sender: TaskId, chan: ChanId, sent: bool) -> Result<P, Diagnostic> {
         let t = self.task_mut(sender)?;
         let (k, value, answer) = match std::mem::replace(&mut t.state, TaskState::Running) {
             TaskState::Blocked {
@@ -1290,7 +1004,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                 )));
             }
         };
-        self.absorb(sender, by);
         self.make_ready(sender, Resumption::Resume { k, value: answer });
         Ok(value)
     }
@@ -1300,7 +1013,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     pub fn recv(&mut self, k: K, chan: &ChanHandle, span: Span) -> Result<(), Diagnostic> {
         let task = self.running()?;
         let id = self.channel_of(chan, span)?;
-        if let Some(taken) = self.receive_now(task, id)? {
+        if let Some(taken) = self.receive_now(id)? {
             return self.answer(task, k, Reply::Maybe(taken));
         }
         if let Some(ch) = self.channels.get_mut(&id) {
@@ -1316,9 +1029,9 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
 
     /// A receive that does not wait: `Some` of the oldest value sent, `Some(None)` from a channel
     /// closed and empty, and `None` where it would wait.
-    fn receive_now(&mut self, task: TaskId, id: ChanId) -> Result<Option<Option<P>>, Diagnostic> {
+    fn receive_now(&mut self, id: ChanId) -> Result<Option<Option<P>>, Diagnostic> {
         enum Taken<P> {
-            Queued(P, Stamp),
+            Queued(P),
             From(TaskId),
             Closed,
             Waits,
@@ -1326,8 +1039,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         let taken = match self.channels.get_mut(&id) {
             None => Taken::Closed,
             Some(ch) => {
-                if let Some((value, stamp)) = ch.queue.pop_front() {
-                    Taken::Queued(value, stamp)
+                if let Some(value) = ch.queue.pop_front() {
+                    Taken::Queued(value)
                 } else if let Some(sender) = ch.senders.pop_front() {
                     Taken::From(sender)
                 } else if ch.closed {
@@ -1338,26 +1051,23 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             }
         };
         match taken {
-            Taken::Queued(value, stamp) => {
-                self.absorb_stamp(task, &stamp);
+            Taken::Queued(value) => {
                 // The room this made takes the longest-waiting sender's value.
                 let waiting = self
                     .channels
                     .get_mut(&id)
                     .and_then(|ch| ch.senders.pop_front());
                 if let Some(sender) = waiting {
-                    let sent_at = self.stamp_of(sender);
-                    let sent = self.take_sent(sender, id, true, task)?;
+                    let sent = self.take_sent(sender, id, true)?;
                     if let Some(ch) = self.channels.get_mut(&id) {
-                        ch.queue.push_back((sent, sent_at));
+                        ch.queue.push_back(sent);
                     }
                 }
                 self.retire_if_spent(id);
                 Ok(Some(Some(value)))
             }
             Taken::From(sender) => {
-                self.absorb(task, sender);
-                let sent = self.take_sent(sender, id, true, task)?;
+                let sent = self.take_sent(sender, id, true)?;
                 Ok(Some(Some(sent)))
             }
             Taken::Closed => Ok(Some(None)),
@@ -1379,14 +1089,14 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             .get_mut(&id)
             .and_then(|ch| ch.receivers.pop_front())
         {
-            self.deliver(receiver, id, None, task)?;
+            self.deliver(receiver, id, None)?;
         }
         while let Some(sender) = self
             .channels
             .get_mut(&id)
             .and_then(|ch| ch.senders.pop_front())
         {
-            self.take_sent(sender, id, false, task)?;
+            self.take_sent(sender, id, false)?;
         }
         self.retire_if_spent(id);
         self.answer(task, k, Reply::Value(Value::Unit))
@@ -1413,8 +1123,8 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         }
         for (at, arm) in waiting.iter_mut().enumerate() {
             let got = match arm.send.take() {
-                None => self.receive_now(task, arm.chan)?,
-                Some(value) => match self.send_now(task, arm.chan, value.clone())? {
+                None => self.receive_now(arm.chan)?,
+                Some(value) => match self.send_now(arm.chan, value.clone())? {
                     Sent::Went(sent) => Some(sent.then_some(value)),
                     Sent::Waits(value) => {
                         arm.send = Some(value);
@@ -1479,57 +1189,11 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         Ok(())
     }
 
-    fn stamp_of(&self, task: TaskId) -> Stamp {
-        self.tasks
-            .get(&task)
-            .map(|t| t.stamp.clone())
-            .unwrap_or_default()
-    }
-
-    /// `into` has observed the step whose clock `stamp` is.
-    fn absorb_stamp(&mut self, into: TaskId, stamp: &Stamp) {
-        if self.policy != Policy::Seeded {
-            return;
-        }
-        let Some(target) = self.tasks.get_mut(&into) else {
-            return;
-        };
-        if target.stamp.len() < stamp.len() {
-            target.stamp.resize(stamp.len(), 0);
-        }
-        for (slot, seen) in target.stamp.iter_mut().zip(stamp) {
-            *slot = (*slot).max(*seen);
-        }
-    }
-
     fn waiting_on(&self, task: TaskId) -> Option<&Wait<P>> {
         match self.tasks.get(&task).map(|t| &t.state) {
             Some(TaskState::Blocked { wait, .. }) => Some(wait),
             _ => None,
         }
-    }
-
-    /// Blocks until virtual time reaches `deadline`; the [`Clock`] already holds the timer.
-    pub fn sleep_until(&mut self, k: K, deadline: i64, span: Span) -> Result<(), Diagnostic> {
-        if self.policy != Policy::Seeded {
-            return Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                "`clock.sleep` was answered on virtual time by a production region, which has none",
-            )
-            .primary(span, "performed here")
-            .secondary(self.span, "this region schedules against the host runtime")
-            .note("in a production region a sleep is a deadline on the host's clock, which `sleep_on_host` takes"));
-        }
-        let task = self.running()?;
-        self.task_mut(task)?.state = TaskState::Blocked {
-            wait: Wait::Timer {
-                until: deadline,
-                span,
-            },
-            k,
-        };
-        self.current = None;
-        Ok(())
     }
 
     /// The running task answered `value`: each task waiting on it hears a copy, and it keeps
@@ -1546,7 +1210,6 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
                 _ => Reply::Item(value.clone()),
             };
             let k = self.unblock(joiner)?;
-            self.absorb(joiner, done);
             self.make_ready(joiner, Resumption::Resume { k, value: answer });
         }
         self.task_mut(done)?.state = TaskState::Done(value);
@@ -1557,28 +1220,23 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         Ok(())
     }
 
-    /// `failure` noted with the task it ends in where the region spawned any: which task, how many
-    /// others it leaves unfinished, and how to replay the run.
-    pub fn noted(&self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
+    /// `failure` noted with the task it ends in where the region spawned any: which task, and how
+    /// many others it leaves unfinished.
+    pub fn noted(&self, failure: Diagnostic) -> Diagnostic {
         match self.current {
             Some(task) if self.next_id > ROOT.0 + 1 => {
                 // The failing task is itself unfinished.
                 let live = self.unfinished.saturating_sub(1);
-                failure.note(match self.policy {
-                    Policy::Seeded => format!(
-                        "failed in task {task} of a simulated region, with {live} other task(s) unfinished; replay with seed {seed}"
-                    ),
-                    Policy::Host => format!(
-                        "failed in task {task} of a host-scheduled region, with {live} other task(s) unfinished; a host-backed run is not replayable from a seed"
-                    ),
-                })
+                failure.note(format!(
+                    "failed in task {task} of a host-scheduled region, with {live} other task(s) unfinished; a host-backed run is not replayable from a seed"
+                ))
             }
             _ => failure,
         }
     }
 
-    pub fn fail(&mut self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
-        let failure = self.noted(failure, seed);
+    pub fn fail(&mut self, failure: Diagnostic) -> Diagnostic {
+        let failure = self.noted(failure);
         if let Some(t) = self.current.and_then(|task| self.tasks.get_mut(&task)) {
             t.state = TaskState::Failed;
         }
@@ -1627,13 +1285,13 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
     }
 
     fn task_mut(&mut self, task: TaskId) -> Result<&mut Task<K, B, P>, Diagnostic> {
-        let (span, policy) = (self.span, self.policy);
-        self.tasks.get_mut(&task).ok_or_else(|| {
-            out_of_order(span, policy, format!("{task} is not a task of this region"))
-        })
+        let span = self.span;
+        self.tasks
+            .get_mut(&task)
+            .ok_or_else(|| out_of_order(span, format!("{task} is not a task of this region")))
     }
 
-    /// Readies timer-fired tasks in ascending order, so the seed, not the host, orders ties.
+    /// Readies timer-fired tasks in ascending order.
     fn wake(&mut self, woken: &[TaskId]) -> Result<(), Diagnostic> {
         for id in woken {
             match self.tasks.get(id).map(|t| &t.state) {
@@ -1664,51 +1322,12 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         Ok(())
     }
 
-    /// The seed's path decides while it lasts, then the `sched` stream; both count per entry point.
-    fn choose(&self, trail: &mut Trail, enabled: &[TaskId]) -> Result<usize, Diagnostic> {
-        let point = trail.point();
-        match trail.pinned() {
-            Some(choice) => {
-                let choice = usize::from(choice);
-                if choice >= enabled.len() {
-                    return Err(self.err_divergence(point, choice, enabled.len(), trail.seed()));
-                }
-                Ok(choice)
-            }
-            None => match trail.draw(enabled.len()) {
-                Some(drawn) => Ok(drawn),
-                None => Err(self.internal("a scheduling point had no enabled task to choose")),
-            },
-        }
-    }
-
     fn running(&self) -> Result<TaskId, Diagnostic> {
         match self.current {
             Some(task) => Ok(task),
             None => Err(self
                 .internal("the scheduler was asked to suspend a task while no task was running")),
         }
-    }
-
-    fn err_deadlock(&self, now: i64, seed: &Seed) -> Diagnostic {
-        let blocked: Vec<(TaskId, &Wait<P>, Span)> = self.blocked().collect();
-        let mut diagnostic = Diagnostic::error(
-            codes::DEADLOCK,
-            format!(
-                "this simulated region deadlocked: {} blocked and none runnable",
-                plural(blocked.len(), "task is", "tasks are")
-            ),
-        )
-        .primary(self.span, "no task in this region can make progress");
-        for (id, wait, origin) in &blocked {
-            let (span, message) = waiting(*id, wait, Some(now));
-            diagnostic =
-                diagnostic.secondary(if span.is_dummy() { *origin } else { span }, message);
-        }
-        diagnostic
-            .note("a `simulate` region ends when its last task ends, so a task that never finishes stops the region rather than being abandoned")
-            .note("break the wait cycle, or make the task being waited on finish")
-            .note(format!("replay with seed {seed}"))
     }
 
     fn err_host_deadlock(&self) -> Diagnostic {
@@ -1721,7 +1340,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         )
         .primary(self.span, "no task in this region can make progress");
         for (id, wait, origin) in self.blocked() {
-            let (span, message) = waiting(id, wait, None);
+            let (span, message) = waiting(id, wait);
             diagnostic = diagnostic.secondary(if span.is_dummy() { origin } else { span }, message);
         }
         diagnostic
@@ -1761,78 +1380,18 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         })
     }
 
-    fn require(&self, wanted: Policy) -> Result<(), Diagnostic> {
-        if self.policy == wanted {
-            return Ok(());
-        }
-        Err(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!(
-                "a {} region was driven by the {} scheduler's entry point",
-                self.policy.as_str(),
-                wanted.as_str()
-            ),
-        )
-        .primary(self.span, "this region was opened with the other policy")
-        .note("`Scheduler::next` drives a seeded region and the host entry points drive a production one; the two are never interchangeable")
-        .note("a seeded region that took real readiness for an answer would stop being a function of its seed"))
-    }
-
-    fn err_step_budget(&self, seed: &Seed) -> Diagnostic {
-        Diagnostic::error(
-            codes::DEADLOCK,
-            format!(
-                "this simulated region took {} scheduling steps without finishing",
-                self.max_steps
-            ),
-        )
-        .primary(self.span, "no task in this region ever stopped running")
-        .note("this is the per-interleaving step budget; a region that legitimately needs more steps raises the simulation plan's `steps`")
-        .note("more often it is a task that loops without ever finishing, which a real scheduler would spin on forever")
-        .note(format!("replay with seed {seed}"))
-    }
-
-    fn err_divergence(
-        &self,
-        point: usize,
-        choice: usize,
-        enabled: usize,
-        seed: &Seed,
-    ) -> Diagnostic {
-        Diagnostic::error(
-            codes::SIMULATION_DIVERGENCE,
-            "replaying this seed did not reproduce the schedule it recorded",
-        )
-        .primary(self.span, "this region scheduled differently on replay")
-        .note(format!(
-            "at scheduling point {point} the seed names enabled task {choice}, and {} enabled",
-            plural(enabled, "task was", "tasks were")
-        ))
-        .note("this is a defect in Ply's simulation rather than in the program under test: a run must be a function of its definitions and its seed")
-        .note(format!("the seed replayed was {seed}"))
-    }
-
     fn internal(&self, message: impl Into<String>) -> Diagnostic {
-        out_of_order(self.span, self.policy, message)
+        out_of_order(self.span, message)
     }
 }
 
-/// Where a blocked task waits and on what, for a deadlock's report; `now` is a seeded region's
-/// virtual time.
-fn waiting<P>(id: TaskId, wait: &Wait<P>, now: Option<i64>) -> (Span, String) {
+/// Where a blocked task waits and on what, for a deadlock's report.
+fn waiting<P>(id: TaskId, wait: &Wait<P>) -> (Span, String) {
     match wait {
         Wait::Join { task, span } | Wait::Await { task, span } => {
             (*span, format!("{id} waits here for {task} to finish"))
         }
-        // Unreachable in a seeded region while the clock has a timer: time would have advanced.
-        Wait::Timer { until, span } => (
-            *span,
-            match now {
-                Some(now) => format!("{id} sleeps here until {until}ns, and it is {now}ns"),
-                None => format!("{id} sleeps here until {until}ns"),
-            },
-        ),
-        // A seeded region never parks on one: `park_on_host` refuses.
+        Wait::Timer { until, span } => (*span, format!("{id} sleeps here until {until}ns")),
         Wait::Host { pending, span } => (
             *span,
             format!("{id} waits here on host operation {pending}"),
@@ -1868,14 +1427,9 @@ fn waiting<P>(id: TaskId, wait: &Wait<P>, now: Option<i64>) -> (Span, String) {
     }
 }
 
-fn out_of_order(span: Span, policy: Policy, message: impl Into<String>) -> Diagnostic {
-    Diagnostic::error(codes::INTERNAL_ERROR, message).primary(
-        span,
-        match policy {
-            Policy::Seeded => "the simulated scheduler was driven out of order",
-            Policy::Host => "the production scheduler was driven out of order",
-        },
-    )
+fn out_of_order(span: Span, message: impl Into<String>) -> Diagnostic {
+    Diagnostic::error(codes::INTERNAL_ERROR, message)
+        .primary(span, "the production scheduler was driven out of order")
 }
 
 fn plural(n: usize, one: &str, many: &str) -> String {
@@ -1920,11 +1474,11 @@ fn err_foreign_task(span: Span, task: TaskId) -> Diagnostic {
 fn err_unknown_task(span: Span, task: TaskId) -> Diagnostic {
     Diagnostic::error(
         codes::TASK_ESCAPES_SCOPE,
-        format!("`{task}` names no task in this simulated region"),
+        format!("`{task}` names no task in this region"),
     )
     .primary(span, "this handle outlived the region that created it")
     .note("a `Task` is a key into its region's scheduler, and the scheduler ends with the region")
-    .note("join the task inside the `simulate` region that spawned it")
+    .note("join the task inside the region that spawned it")
 }
 
 #[cold]

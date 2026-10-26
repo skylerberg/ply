@@ -1,6 +1,7 @@
-//! `simulate` and production regions in the C backend: each task runs on its own stack and
-//! switches back to the machine's scheduler loop to perform `task`, `clock` or `random`. What the
-//! tasks pass each other is read as values or kept with their types; emitted code's arguments cross in through its operation's types, and
+//! Production regions in the C backend: a `task` operation outside `simulate` opens one, the
+//! performer as its root, and each other task runs on its own stack and switches back to the
+//! region's loop to perform `task` or sleep. What the tasks pass each other is read as values or
+//! kept with their types; emitted code's arguments cross in through its operation's types, and
 //! what it is answered is written as PLV1 and lifted through them.
 
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
@@ -14,13 +15,10 @@ use crate::stack::{Stack, switch};
 use ply_core::codec::{self, Reader, Writer, tag};
 use ply_core::host::Pending;
 use ply_core::sched::{
-    ChanHandle, HostPolicy, LetGo, Policy, ROOT, Reply, Resumption, Scheduler, Shield, TaskHandle,
-    Turn,
+    ChanHandle, HostPolicy, ROOT, Reply, Resumption, Scheduler, Shield, TaskHandle, Turn,
 };
-use ply_core::sim::{
-    Answer, Handlers, OpSignature, TaskId, channel_access, channel_made, ended, liveness, signature,
-};
-use ply_core::{Diagnostic, Mode, SimId, Span, Symbol, Value, codes};
+use ply_core::sim::TaskId;
+use ply_core::{Diagnostic, SimId, Span, Symbol, Value, codes};
 use std::collections::BTreeMap;
 
 /// A value a region's tasks pass each other, as its scheduler holds it: copied for each task that
@@ -64,25 +62,9 @@ impl Drop for Item {
     }
 }
 
-/// The word compiled code holds `item` as, which takes it: a kept one's the word it was handed the
-/// region as, `()` the word 0. A value read without its type has no word to be held as.
-pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
-    match item.take() {
-        Passed::Value(Value::Unit) => 0,
-        Passed::Value(_) => c.fail(err_crossing(
-            "a region answered a value read without the type that lays it out",
-        )),
-        Passed::Carried(v) => v.handed().word(),
-    }
-}
-
-/// A task's body before it starts: a closure block, beside the type of what it answers and the row
-/// descriptor and words it is handed (0 for none, the frame bridge's).
-pub(crate) struct Body(
-    pub(crate) Block,
-    pub(crate) &'static PlyType,
-    pub(crate) (Word, Word),
-);
+/// A task's body before it starts: a closure block, which holds its row's words, beside the type
+/// of what it answers.
+pub(crate) struct Body(pub(crate) Block, pub(crate) &'static PlyType);
 
 impl Body {
     pub(crate) fn release(self, ctx: *mut Ctx) {
@@ -91,9 +73,9 @@ impl Body {
 
     /// Calls the body, letting go of it: what it answered, or `None` where its task failed.
     fn run(self, ctx: *mut Ctx) -> Option<Item> {
-        let Body(f, ty, words) = self;
+        let Body(f, ty) = self;
         let c = unsafe { &mut *ctx };
-        (c.entering_desc, c.entering_words) = words;
+        (c.entering_desc, c.entering_words) = (0, 0);
         let r = unsafe { f.call(ctx, &[]) };
         unsafe { f.let_go_function(ctx) };
         (unsafe { (*ctx).failed } == 0)
@@ -103,10 +85,9 @@ impl Body {
 
 pub struct Simulation {
     sched: Scheduler<usize, Body, Item>,
-    handlers: Handlers,
-    /// Alongside the scheduler's tasks; a production region drops a task's once it finishes.
+    /// Alongside the scheduler's tasks, each dropped once it finishes.
     tasks: BTreeMap<TaskId, TaskStack>,
-    /// The stack [`rt_region`](crate::rt::rt_region) was called on, which the loop runs on.
+    /// Where the loop's stack stands while a task runs.
     scheduler_sp: usize,
     running: Option<TaskId>,
     request: Option<(TaskId, Request)>,
@@ -117,27 +98,24 @@ pub struct Simulation {
     /// The stack the region was entered on, which every task's frames chain to.
     stack: usize,
     starting: Option<Body>,
-    /// The region's own body, until it starts; a production region's root is its entry.
-    root: Option<Body>,
-    /// The descriptor and words the region was entered with, which each task it spawns is handed,
-    /// so what a task performs past the region reaches the handles around it.
-    entered: (Word, Word),
-    policy: Policy,
-    /// A production region's loop stack; the opening stack is the root task.
+    /// The loop's own stack; the opening stack is the root task's.
     loop_stack: Option<Stack>,
     /// The loop returned; nothing may switch into its stack again.
     loop_done: bool,
-    pub(crate) site: Span,
+    /// Where the operation that opened it was performed: its root's id, its start and its end.
+    pub(crate) site: [i64; 3],
 }
 
 #[derive(Default)]
 struct TaskStack {
-    /// Owned by a spawned task; a production region's root runs on the stack that opened it.
+    /// Owned by a spawned task; the root runs on the stack that opened the region.
     stack: Option<Stack>,
     frames: usize,
     sp: usize,
     /// Copies of the handlers around its spawn as they stood then, held until the task starts.
     inherited: Vec<HandlerFrame>,
+    /// What `Ctx.task` says while it runs: the root's opener's, a spawned task's its own.
+    runs_as: i64,
 }
 
 enum Request {
@@ -153,7 +131,6 @@ enum Request {
     /// Each arm's channel beside what it sends, and whether to wait when none can go.
     Select(Vec<(ChanHandle, Option<Item>)>, bool),
     Yield,
-    Seeded(&'static OpSignature, Vec<Value>),
     Park(Pending),
     /// The nanoseconds a production task waits on the host's clock.
     Sleep(i64),
@@ -164,38 +141,6 @@ enum Request {
 }
 
 impl Simulation {
-    pub(crate) fn new(
-        sched: Scheduler<usize, Body, Item>,
-        site: Span,
-        root_seed: u64,
-        drawn: u64,
-        stack: usize,
-        root: Body,
-    ) -> Simulation {
-        Simulation {
-            sched,
-            site,
-            entered: root.2,
-            handlers: Handlers::at(root_seed, drawn),
-            tasks: BTreeMap::from([(ROOT, TaskStack::default())]),
-            scheduler_sp: 0,
-            running: None,
-            request: None,
-            heard: None,
-            answer: None,
-            stack,
-            starting: None,
-            root: Some(root),
-            policy: Policy::Seeded,
-            loop_stack: None,
-            loop_done: false,
-        }
-    }
-
-    pub fn is_production(&self) -> bool {
-        self.policy == Policy::Host
-    }
-
     /// The tasks whose stacks this region still holds.
     pub fn task_slots(&self) -> usize {
         self.tasks.len()
@@ -242,11 +187,10 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         frames: c.current,
         sp: 0,
         inherited: Vec::new(),
+        runs_as: c.task,
     };
-    let site = c.site();
     c.sims.push(Simulation {
         sched,
-        handlers: Handlers::at(0, 0),
         tasks: BTreeMap::from([(ROOT, root)]),
         scheduler_sp,
         running: Some(ROOT),
@@ -255,13 +199,9 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         answer: None,
         stack: loop_frames,
         starting: None,
-        root: None,
-        // The operation that opens it hands it no words: its tasks reach what frames hold.
-        entered: (0, 0),
-        policy: Policy::Host,
         loop_stack: Some(loop_stack),
         loop_done: false,
-        site,
+        site: [c.site_root, c.site_start, c.site_end],
     });
     c.rearm_recording();
     true
@@ -322,8 +262,8 @@ fn ended_under_root(c: &mut Ctx) -> Option<Item> {
     sim.answer.take()
 }
 
-/// Drops a task's stack and frames, or the frames it holds unstarted; the production root runs on
-/// the opening stack and keeps both.
+/// Drops a task's stack and frames, or the frames it holds unstarted; the root runs on the opening
+/// stack and keeps both.
 fn release(c: &mut Ctx, task: TaskId) {
     let sim = c.sims.last_mut().expect("a region is running");
     let slot = sim.slot(task);
@@ -339,10 +279,10 @@ fn release(c: &mut Ctx, task: TaskId) {
     }
 }
 
-/// A finished production task's slot and stack index go back, since nothing names a dead stack.
+/// A finished task's slot and stack index go back, since nothing names a dead stack.
 fn recycle(c: &mut Ctx, task: TaskId) {
     let sim = c.sims.last_mut().expect("a region is running");
-    if sim.policy != Policy::Host || task == ROOT {
+    if task == ROOT {
         return;
     }
     if let Some(slot) = sim.tasks.remove(&task) {
@@ -397,26 +337,21 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
         let c = unsafe { &mut *ctx };
         let runtime = c.host_runtime();
         let sim = c.sims.last_mut().expect("a region is running");
-        let turn = match sim.policy {
-            Policy::Seeded => sim.sched.next(sim.handlers.clock_mut(), &mut c.trail),
-            Policy::Host => sim.sched.next_host(runtime.as_ref()),
-        };
-        let (task, resumption) = match turn {
+        let (task, resumption) = match sim.sched.next_host(runtime.as_ref()) {
             Err(d) => {
                 c.fail(d);
                 return None;
             }
-            Ok(Turn::Complete(value)) => {
-                c.trail
-                    .leave(sim.handlers.clock().now(), sim.handlers.rand().drawn());
-                return Some(value);
-            }
+            Ok(Turn::Complete(value)) => return Some(value),
             Ok(Turn::Run { task, resumption }) => (task, resumption),
         };
         let sp = match resumption {
             Resumption::Enter => {
-                let root = sim.root.take().expect("a seeded region's body starts once");
-                unsafe { start(ctx, task, root) }
+                c.fail(Diagnostic::error(
+                    codes::INTERNAL_ERROR,
+                    "a production region entered a body of its own",
+                ));
+                return None;
             }
             Resumption::Start { body, .. } => unsafe { start(ctx, task, body) },
             Resumption::Resume { k, value } => {
@@ -442,19 +377,16 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
         let sim = c.sims.last_mut().expect("a region is running");
         c.current = sim.slot(task).frames;
         sim.running = Some(task);
-        c.task = task.0 as i64;
+        let before = c.task;
+        c.task = sim.slot(task).runs_as;
         let from = &mut sim.scheduler_sp as *mut usize;
         unsafe { switch_keeping(ctx, from, sp) };
 
         let c = unsafe { &mut *ctx };
-        let yielded = c.step_site();
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
-        c.task = 0;
+        c.task = before;
         c.current = sim.stack;
-        if sim.sched.records_steps() {
-            c.trail.end_step(yielded);
-        }
     }
 }
 
@@ -473,6 +405,7 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
                 handle.id(),
                 TaskStack {
                     inherited,
+                    runs_as: crate::tasks::task_number(),
                     ..TaskStack::default()
                 },
             );
@@ -480,107 +413,35 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
         }
         Request::Join(target) => sim.sched.join(k, &target, site),
         Request::Await(target) => sim.sched.await_task(k, &target, site),
-        Request::Cancel(target) => {
-            let clock = match sim.policy {
-                Policy::Seeded => Some(sim.handlers.clock_mut()),
-                Policy::Host => None,
-            };
-            match sim.sched.cancel(k, &target, site, clock) {
-                Err(d) => Err(d),
-                Ok(stopped) => {
-                    let region = target.region();
+        Request::Cancel(target) => match sim.sched.cancel(k, &target, site) {
+            Err(d) => Err(d),
+            Ok(stopped) => {
+                if let Some(body) = stopped.unstarted {
                     let id = target.id();
-                    let records = sim.sched.records_steps();
-                    if let Some(body) = stopped.unstarted {
-                        body.release(ctx);
-                        release(c, id);
-                        recycle(c, id);
-                    }
-                    // A cancel of a task that had ended read only that, which the task's last
-                    // step wrote. Any other writes the task's liveness, which the step it took
-                    // last and each it takes from here read, so the search tries cancelling a
-                    // step earlier and a step later.
-                    if records && stopped.ended {
-                        c.record_access(ended(id));
-                    } else if records {
-                        c.record_access(liveness(id, Mode::Write));
-                        c.trail
-                            .mark_last_step_of(region, id, liveness(id, Mode::Read));
-                        record_let_go(c, stopped.let_go);
-                    }
-                    Ok(())
+                    body.release(ctx);
+                    release(c, id);
+                    recycle(c, id);
                 }
+                Ok(())
             }
-        }
-        Request::Channel(capacity) => {
-            let records = sim.sched.records_steps();
-            let applied = sim.sched.channel(k, capacity);
-            if records {
-                c.record_access(channel_made());
-            }
-            applied
-        }
-        Request::Send(chan, value) => {
-            let records = sim.sched.records_steps();
-            let applied = sim.sched.send(k, &chan, value, site);
-            if records {
-                c.record_access(channel_access(chan.id));
-            }
-            applied
-        }
-        Request::Recv(chan) => {
-            let records = sim.sched.records_steps();
-            let applied = sim.sched.recv(k, &chan, site);
-            if records {
-                c.record_access(channel_access(chan.id));
-            }
-            applied
-        }
-        Request::Close(chan) => {
-            let records = sim.sched.records_steps();
-            let applied = sim.sched.close(k, &chan, site);
-            if records {
-                c.record_access(channel_access(chan.id));
-            }
-            applied
-        }
-        Request::Select(arms, wait) => {
-            let records = sim.sched.records_steps();
-            let chans: Vec<_> = arms.iter().map(|(chan, _)| chan.id).collect();
-            let applied = sim.sched.select(k, arms, wait, site);
-            // It reads every arm's channel, whichever it goes on.
-            if records {
-                for chan in chans {
-                    c.record_access(channel_access(chan));
-                }
-            }
-            applied
-        }
+        },
+        Request::Channel(capacity) => sim.sched.channel(k, capacity),
+        Request::Send(chan, value) => sim.sched.send(k, &chan, value, site),
+        Request::Recv(chan) => sim.sched.recv(k, &chan, site),
+        Request::Close(chan) => sim.sched.close(k, &chan, site),
+        Request::Select(arms, wait) => sim.sched.select(k, arms, wait, site),
         Request::Yield => sim.sched.suspend(k, Value::Unit),
         Request::Park(pending) => sim.sched.park_on_host(k, pending, site, runtime.as_ref()),
         Request::Sleep(nanos) => sim.sched.sleep_on_host(k, nanos, site, runtime.as_ref()),
-        Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
-            Ok(Answer::Value(value)) => sim.sched.suspend(k, value),
-            Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),
-            Err(d) => Err(d),
-        },
         Request::Finished(value) => {
-            let records = sim.sched.records_steps();
             release(c, task);
             recycle(c, task);
-            if records {
-                c.record_access(ended(task));
-            }
             let sim = c.sims.last_mut().expect("a region is running");
             sim.sched.finish(value)
         }
         Request::Cancelled => {
-            let records = sim.sched.records_steps();
             release(c, task);
             recycle(c, task);
-            if records {
-                c.record_access(ended(task));
-            }
             c.failed = 0;
             let sim = c.sims.last_mut().expect("a region is running");
             sim.sched.finish_cancelled()
@@ -594,10 +455,9 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             // A raise no frame answered stays pending for the code around the region, whose
             // handles may answer it, noted with where in the region it was raised.
             if c.failed == FAILED_PENDING {
-                let seed = c.trail.seed().clone();
                 let failure = c.diagnostic.take();
                 let sim = c.sims.last().expect("a region is running");
-                let noted = failure.map(|d| sim.sched.noted(d, &seed));
+                let noted = failure.map(|d| sim.sched.noted(d));
                 c.diagnostic = noted;
                 return Err(None);
             }
@@ -608,9 +468,8 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             let failure = c.diagnostic.take().unwrap_or_else(|| {
                 Diagnostic::error(codes::INTERNAL_ERROR, "a task failed without a diagnostic")
             });
-            let seed = c.trail.seed().clone();
             let sim = c.sims.last_mut().expect("a region is running");
-            let failure = sim.sched.fail(failure, &seed);
+            let failure = sim.sched.fail(failure);
             c.failed = 0;
             return Err(Some(failure));
         }
@@ -618,28 +477,8 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
     applied.map_err(Some)?;
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
-    let clock = match sim.policy {
-        Policy::Seeded => Some(sim.handlers.clock_mut()),
-        Policy::Host => None,
-    };
-    let let_go = sim.sched.refuse_wait(task, clock);
-    if sim.sched.records_steps() {
-        record_let_go(c, let_go);
-    }
+    sim.sched.refuse_wait(task);
     Ok(())
-}
-
-/// What a cancel took a task off, which a step on it by another task is ordered against.
-fn record_let_go(c: &mut Ctx, let_go: LetGo) {
-    match let_go {
-        LetGo::Nothing => {}
-        LetGo::Task(on) => c.record_access(ended(on)),
-        LetGo::Chans(chans) => {
-            for chan in chans {
-                c.record_access(channel_access(chan));
-            }
-        }
-    }
 }
 
 /// A `bracket`'s `acquire` or `release` the running task of the innermost region stands in.
@@ -702,21 +541,16 @@ unsafe fn start(ctx: *mut Ctx, task: TaskId, body: Body) -> Option<usize> {
     let sim = c.sims.last_mut().expect("a region is running");
     let sp = stack.prepare(task_entry, ctx as usize);
     let parent = sim.stack;
-    let entered_from = match sim.policy {
-        Policy::Host => sim.slot(ROOT).frames,
-        Policy::Seeded => sim.stack,
-    };
+    let entered_from = sim.slot(ROOT).frames;
     let inherited = std::mem::take(&mut sim.slot(task).inherited);
     let frames = c.open_stack(Some(parent));
     c.stacks[frames].list = inherited;
     c.stacks[frames].entered_from = Some(entered_from);
     let sim = c.sims.last_mut().expect("a region is running");
-    *sim.slot(task) = TaskStack {
-        stack: Some(stack),
-        frames,
-        sp,
-        inherited: Vec::new(),
-    };
+    let slot = sim.slot(task);
+    slot.stack = Some(stack);
+    slot.frames = frames;
+    slot.sp = sp;
     sim.starting = Some(body);
     Some(sp)
 }
@@ -822,17 +656,7 @@ pub unsafe fn park(ctx: *mut Ctx, pending: Pending) -> Option<Value> {
 
 /// The running task of an innermost production region, so a host answer parks rather than blocks.
 pub fn running_task_of_production(c: &Ctx) -> Option<TaskId> {
-    let sim = c.sims.last()?;
-    if sim.policy != Policy::Host {
-        return None;
-    }
-    sim.running
-}
-
-/// The innermost region's site when that region is seeded, so a refusal can name it.
-pub fn seeded_region(c: &Ctx) -> Option<Span> {
-    let sim = c.sims.last()?;
-    (sim.policy == Policy::Seeded).then_some(sim.site)
+    c.sims.last()?.running
 }
 
 /// An argument of a scheduled operation, as the region takes it: read as a value, or, in the
@@ -884,11 +708,7 @@ unsafe fn request_of(
     let from = unsafe { &*ctx }.current;
     match (effect.as_str(), op.as_str()) {
         ("task", "spawn") => {
-            let entered = unsafe { &*ctx }
-                .sims
-                .last()
-                .map_or((0, 0), |sim| sim.entered);
-            let body = unsafe { body_of(ctx, args[0], described, entered) }?;
+            let body = unsafe { body_of(ctx, args[0], described) }?;
             return Some(Request::Spawn(body, from));
         }
         ("task", "select") => return unsafe { select_of(ctx, args, described) },
@@ -933,27 +753,17 @@ fn request(c: &Ctx, effect: &Symbol, op: &Symbol, args: Vec<Arg>) -> Result<Requ
         ("task", "recv") => Request::Recv(next()?.read()?.as_chan(site, &what)?),
         ("task", "close") => Request::Close(next()?.read()?.as_chan(site, &what)?),
         ("task", "yield") => Request::Yield,
-        // A seeded region's sleep is its virtual clock's, below.
-        ("clock", "sleep") if c.sims.last().is_some_and(|sim| sim.is_production()) => {
+        ("clock", "sleep") => {
             Request::Sleep(ply_core::sim::nanos_of(&next()?.read()?, site, &what)?)
         }
         _ => {
-            let Some(sig) = signature(effect.as_str(), op.as_str()) else {
-                return Err(Refused::Fail(
-                    Diagnostic::error(
-                        codes::UNKNOWN_OPERATION,
-                        format!("`{effect}` has no operation `{op}`"),
-                    )
-                    .note("a `simulate` region answers `task`, `clock` and `random`"),
-                ));
-            };
-            let values = args.map(Arg::read).collect::<Result<Vec<_>, _>>()?;
-            if let (("random", "below"), [Value::Int(bound)]) =
-                ((effect.as_str(), op.as_str()), values.as_slice())
-            {
-                ply_core::sim::bound_of(*bound, site).map_err(Refused::Raise)?;
-            }
-            Request::Seeded(sig, values)
+            return Err(Refused::Fail(
+                Diagnostic::error(
+                    codes::UNKNOWN_OPERATION,
+                    format!("`{effect}` has no operation `{op}`"),
+                )
+                .note("a production region answers `task` and a task's sleep"),
+            ));
         }
     })
 }
@@ -995,11 +805,11 @@ unsafe fn taken(ctx: *mut Ctx, args: &[Word], op: &PlyOp) -> Option<Vec<Arg>> {
 }
 
 /// The body `task.spawn` was handed, which the region takes, answering what the operation's own
-/// type parameter is, handed the region's `words`. `None` with the context failed.
-unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp, words: (Word, Word)) -> Option<Body> {
+/// type parameter is. `None` with the context failed.
+unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp) -> Option<Body> {
     let f = Block::of(w);
     match op.vars().first() {
-        Some(ty) => Some(Body(f, ty, words)),
+        Some(ty) => Some(Body(f, ty)),
         None => {
             unsafe { f.let_go_function(ctx) };
             unsafe { &mut *ctx }.fail(err_crossing(

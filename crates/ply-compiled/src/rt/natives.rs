@@ -119,10 +119,11 @@ fn held_in(c: &mut Ctx, h: &crate::emitted::Handle, mode: Mode) -> Option<*mut h
         );
         return None;
     };
-    if !c.sims.is_empty()
-        && let Some(id) = hold_id(h.word())
-    {
-        c.record_access(Access::Hold { id, mode });
+    if let Some(id) = hold_id(h.word()) {
+        c.touched(crate::tasks::Touched::Hold {
+            id,
+            write: mode == Mode::Write,
+        });
     }
     if hold_let_go(o) {
         let site = c.site();

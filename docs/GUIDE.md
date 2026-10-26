@@ -2701,6 +2701,12 @@ effect sim           { read  seed() -> Int }
   resumes off its tail, or stops the body without resuming it, would capture or
   abandon the spawner's body rather than the task's, and is refused when the
   task reaches it (`E0502`). A clause for a raise is not among them (§6.8).
+* A raise a spawned task makes that no clause the task installed answers leaves
+  the task, as does one nothing answers in the region's body: the region first
+  cancels every other task, so each releases the brackets it stands in (§6.6),
+  and once they have ended the raise lands where the `simulate` is written, as
+  one the region's body made. A second raise that leaves a task meanwhile goes
+  nowhere.
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its

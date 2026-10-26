@@ -13,7 +13,6 @@ mod list;
 mod memo;
 mod numerics;
 mod rc;
-mod region;
 mod sched;
 mod sim;
 mod span;

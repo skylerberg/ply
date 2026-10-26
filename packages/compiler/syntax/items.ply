@@ -33,7 +33,7 @@ import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, bl
                               no_expr, fn_param, param, declared_param, dump_expr, dump_param,
                               shown_binder, cases_binder, set_binder, hidden_binder, free_names,
                               free_binder, case_at, case_identity, case_body, listing, home_modules,
-                              sees_homes, prelude_module)
+                              sees_homes, prelude_module, scheduler_module, crossing_operations)
 import compiler.syntax.patterns (LStr)
 import std.prelude_source
 
@@ -2544,18 +2544,39 @@ fn ident_length(b: Bytes, from: Int) -> Int / {abort.raise} =
 /// A home module and the names it declares a function of a type under.
 pub type HomeNames = { home: Bytes, names: Map<Bytes, Bool> }
 
-/// The home modules the module `name` reads with no import: each that `declared` says declares a
-/// function of a type under a name its text, lexed as `input`, calls ([`called_names`]), where the
-/// module sees them.
-pub fn homes_called<| e>(
+/// The shipped modules the module `name` reads with no import, where it sees the home modules: each
+/// home that `declared` says declares a function of a type under a name its text, lexed as `input`,
+/// calls ([`called_names`]), and the scheduler as [`scheduler_read`] says.
+pub fn read_without_import<| e>(
   name: Bytes,
   input: Input,
   declared: () -> List<HomeNames> / e,
 ) -> List<Bytes> / e =
   if !sees_homes(name) { [] } else {
     let called = called_names(input);
-    if called.len() == 0 { [] } else { homes_for(called, declared()) }
+    (if called.len() == 0 { [] } else { homes_for(called, declared()) }).concat(
+      scheduler_read(name, input),
+    )
   }
+
+/// The scheduler, where the module `name`, lexed as `input`, is another and writes `simulate { .. }`
+/// or `task.op(..)` of one of [`crossing_operations`], each a call of the scheduler's: a name after
+/// `.` or `::` is another's.
+pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> = {
+  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+  let crossing = crossing_operations();
+  let calls = range(0, input.token_count).any(|i: Int|
+    match kind(i) {
+      Identifier(n) -> if n == b"simulate" { kind(i + 1) == token_lbrace() } else {
+        n == b"task" && kind(i + 1) == token_dot() && kind(i + 3) == token_lparen()
+          && kind(i - 1) != token_dot()
+          && kind(i - 1) != token_coloncolon()
+          && (match kind(i + 2) { Identifier(op) -> crossing.contains(op), _ -> false })
+      },
+      _ -> false,
+    });
+  if calls && name != scheduler_module() { [scheduler_module()] } else { [] }
+}
 
 /// Each home of `declared` that declares one of the names `called`.
 pub fn homes_for(called: Map<Bytes, Bool>, declared: List<HomeNames>) -> List<Bytes> =
@@ -2563,7 +2584,7 @@ pub fn homes_for(called: Map<Bytes, Bool>, declared: List<HomeNames>) -> List<By
     |d: HomeNames| d.home,
   )
 
-/// What each home module `text_of` holds declares, as [`homes_called`] reads it.
+/// What each home module `text_of` holds declares, as [`read_without_import`] reads it.
 pub fn homes_declaring<| e>(
   text_of: (Bytes) -> Option<Bytes> / e,
 ) -> List<HomeNames> / {abort.raise | e} =
@@ -4203,11 +4224,29 @@ test "a module reads the home modules that declare a name it calls, unless it is
   ];
   assert_eq(declared.map(|d: HomeNames| d.names.keys()), [[b"reverse"], [b"or_else"]]);
   let src = b"fn f(xs: List<Int>) -> Int = xs.reverse().len()\n";
-  let homes = |name: Bytes, src: Bytes| homes_called(name, start(src).input, || declared);
+  let homes = |name: Bytes, src: Bytes| read_without_import(name, start(src).input, || declared);
   assert_eq(homes(b"app", src), [b"std.list"]);
   assert_eq(homes(b"std.oid", src), [b"std.list"]);
   assert_eq(homes(b"std.gen", src), []);
   assert_eq(homes(b"app", b"fn f(xs: List<Int>) -> Int = xs.len()\n"), [])
+}
+
+test "a module reads the scheduler where it writes `simulate` or a `task` operation that crosses" {
+  let read = |name: Bytes, src: Bytes| read_without_import(name, start(src).input, || []);
+  let region = b"fn f() -> Int / {sim.read} = simulate { 1 }\n";
+  let joined = b"fn f(t: Task<Int>) -> Int / {task.join, abort.raise} = task.join(t)\n";
+  assert_eq(read(b"app", region), [b"std.internal.schedule"]);
+  assert_eq(read(b"app", joined), [b"std.internal.schedule"]);
+  assert_eq(read(b"std.internal.schedule", region), []);
+  assert_eq(read(b"std.gen", region), []);
+  // An operation that crosses nothing, a string, a comment, or a name on a value is none.
+  assert_eq(read(b"app", b"fn f() -> Unit / {task.yield} = task.yield()\n"), []);
+  assert_eq(
+    read(b"app", b"// simulate { task.join(t) }\nfn f() -> String = \"simulate { 1 }\"\n"),
+    [],
+  );
+  assert_eq(read(b"app", b"fn f(task: Int) -> String = task.to_string()\n"), []);
+  assert_eq(read(b"app", b"fn f(r: { task: Task<Int> }) -> Int = r.task.join()\n"), [])
 }
 
 test "an importer reads no test or law, nor a private item or an import only they reach" {

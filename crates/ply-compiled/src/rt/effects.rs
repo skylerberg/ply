@@ -1,7 +1,6 @@
-//! Handlers, `perform`, `simulate` and `parallel`.
+//! Handlers, `perform` and `parallel`.
 
 use super::*;
-use crate::simulate::Body;
 
 /// Installs a handler and answers its depth: the clause closures and `ret`, the `return` clause or
 /// 0 where it has none, are taken until it pops.
@@ -37,7 +36,6 @@ fn installed(c: &mut Ctx, clauses: *const Word, n: I64, ret: Handed) -> (i64, u6
     frames.push(HandlerFrame {
         clauses,
         ret: ret.word(),
-        simulate: false,
         detached: None,
         fuel,
         handler,
@@ -466,10 +464,11 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
         mode,
         op.clone(),
     );
-    // A step conflicts on the mode, and a scheduled draw's access is recorded here alone.
-    if !c.sims.is_empty() {
-        c.record_access(Access::Atom(atom.mode_atom()));
-    }
+    c.touched(crate::tasks::Touched::Atom {
+        effect: effect.clone(),
+        resource: resource.cloned(),
+        write: mode == Mode::Write,
+    });
     c.performed.push(atom);
 }
 
@@ -505,18 +504,6 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
     'search: loop {
         for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
             if target.is_some_and(|t| t != f.handler) {
-                continue;
-            }
-            if f.simulate {
-                if effect.as_str() == "sim" && op.as_str() == "seed" {
-                    let root = Value::Int(c.seed.root as i64);
-                    return answered(ctx, Served::Value(root), described);
-                }
-                if ply_core::sim::is_scheduled(effect.as_str(), op.as_str()) {
-                    return unsafe {
-                        crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
-                    };
-                }
                 continue;
             }
             if let Some(cl) = f
@@ -576,7 +563,7 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
         // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_core::sim::TASK_OPS.contains(&op.as_str())
-            && c.sims.last().is_some_and(|sim| sim.is_production())
+            && !c.sims.is_empty()
         {
             return unsafe {
                 crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
@@ -641,6 +628,22 @@ pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Wo
     let (effect, name) = named_op(c, unsafe { &*op });
     let site = c.site();
     c.fail(err_task_abandoned(&effect, &name, site))
+}
+
+/// Leaves unanswered a raise, the operation `op` describes with the `args` it takes, that a task
+/// made and a clause of an instance another task opened would answer: no clause for a raise
+/// answers a task from around its spawn, so the raise leaves the task, and its region raises it
+/// again where the region was opened. 0 with the context failed.
+pub unsafe extern "C" fn rt_task_raises(
+    ctx: *mut Ctx,
+    op: *const PlyOp,
+    args: *const Handed,
+) -> Word {
+    let c = unsafe { &mut *ctx };
+    let described = unsafe { &*op };
+    let (effect, name) = named_op(c, described);
+    let args = args_of(args.cast(), described.params_len);
+    unanswered(c, &effect, &name, raised_of(args, described))
 }
 
 /// A task's perform answered by a clause, of a `handle` around its spawn, that stopped the body
@@ -858,52 +861,15 @@ pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I6
     Handed::of(c.pending_words.as_ptr() as Word)
 }
 
-/// A `simulate` region emitted code wrote: `body` is a closure block, which this takes,
-/// and `answer` the type of what it answers, through which the region holds its answer until it
-/// hands it back. The body is handed the words the context's `entering_*` name.
-pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, answer: *const PlyType) -> Handed {
+/// Refuses a `simulate` an older emitter wrote as a call of the runtime, letting go of its body: a
+/// region is `std.internal.schedule`'s. A released `ply` refuses a runtime that lacks this helper.
+pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, _answer: *const PlyType) -> Handed {
+    unsafe { body.let_go_function(ctx) };
     let c = unsafe { &mut *ctx };
-    let words = (c.entering_desc, c.entering_words);
-    c.entering_desc = 0;
-    c.entering_words = 0;
-    Handed::of(unsafe { region(ctx, Body(body, &*answer, words)) })
-}
-
-unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
-    let c = unsafe { &mut *ctx };
-    if !c.sims.is_empty() {
-        body.release(ctx);
-        let outer = c.sims.last().map_or(Span::DUMMY, |sim| sim.site);
-        let d = ply_core::sim::err_nested_simulation(c.site(), outer);
-        return c.fail(d);
-    }
-    let id = ply_core::SimId(c.entered_sims);
-    c.entered_sims += 1;
-    let site = c.site();
-    c.trail.enter(site);
-    let stack = c.current;
-    let depth = c.frames().len();
-    let fuel = c.fuel;
-    c.frames().push(HandlerFrame::simulate(fuel));
-    let sim = crate::simulate::Simulation::new(
-        ply_core::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
-        site,
-        c.seed.root,
-        c.trail.drawn(),
-        stack,
-        body,
-    );
-    c.sims.push(sim);
-    c.rearm_recording();
-    let r = unsafe { crate::simulate::run(ctx) };
-    let c = unsafe { &mut *ctx };
-    c.current = stack;
-    for f in c.stacks[stack].list.split_off(depth) {
-        drop_frame(f);
-    }
-    crate::simulate::end(c);
-    c.record = Some(c.trail.record());
-    r.map_or(0, |answer| crate::simulate::word_of(c, answer))
+    Handed::of(c.fail(Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a `simulate` was emitted as a call of the runtime, which runs no region",
+    )))
 }
 
 /// The `handle` at `depth` is over: pops its frames, catches an unwind to it, applies `return`.

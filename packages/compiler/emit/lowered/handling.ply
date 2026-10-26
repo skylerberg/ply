@@ -28,18 +28,21 @@ import compiler.emit.tir (Rep, RInt, RWord, RUnit, RImm, RAddr, Var, Arg, AVar, 
                           Handed, Static, no_links, rep_of_arg)
 import compiler.emit.tir
 import compiler.emit.tir.containers (Taken, Length)
-import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, Simulate,
+import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, SiteHere,
                                    Encoded, Unsettled, Entering, ForwardsLaid, ForwardsSet,
                                    ObjectAt, ObjectLaid, Bridge, Answering, Keyed, Answers, Resumes,
                                    Stops, Forwarded, VarInit, VarRead, VarWrite, raised_at)
 import compiler.emit.typing (Typed)
-import compiler.check.infer.checker (FiledRows, RowArguments, Performs)
-import compiler.emit.answer (Need, Exact)
+import compiler.check.infer.checker (FiledRows, RowArguments, Performs, prelude_effects, EffectInfo,
+                                     OpInfo)
+import compiler.check.infer.expr (crossing_vars)
+import compiler.syntax.exprs (crossing_operations)
+import compiler.emit.answer (Need, Exact, GenericCall)
 import compiler.emit.lower.setting (Root, prelude_ctor)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, none_held)
 import compiler.emit.lower.calling (context_of)
-import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated,
+import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched,
                                      handle_planned, detaches)
 import compiler.emit.lower.crossing (crossed, crossing_builtin, encoded_externs, type_described,
                                      worded, op_described, counts_type, holds_function)
@@ -52,9 +55,9 @@ import compiler.emit.marks (marked_type, marks_of, carried_by)
 import compiler.check.infer.definitions (Extern, prelude_externs)
 import compiler.store.hash.template (written_code)
 import compiler.emit.print (printed_fn)
-import compiler.emit.print.handled (landing_jump, scheduled_ops)
-import compiler.emit.compare (entered_words, Program, program_of, formed, checked, printed_by_form,
-                              not_built, printed_text, unbuilt)
+import compiler.emit.print.handled (landing_jump)
+import compiler.emit.compare (entered_words, Program, program_of, scheduled_program_of, formed,
+                              checked, printed_by_form, not_built, printed_text, unbuilt)
 
 fn named(n: Bytes) -> Type = TyCon({ name: n, args: [] })
 
@@ -732,7 +735,6 @@ fn blocks() -> Bytes =
     b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
     b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
     b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
-    b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
   ])
 
 test "a parallel block hands the runtime its branches and tells it its definition's row where that row is closed" {
@@ -784,49 +786,6 @@ test "a parallel block hands the runtime its branches and tells it its definitio
       assert_eq(told(b"pure", true), [Parallel({ reach: Some([]) })]);
       // A block outside its definition's own body is told nothing.
       assert_eq(told(b"reads", false), [Parallel({ reach: None })])
-    },
-  }
-}
-
-test "a simulate hands the runtime its body's closure and holds what the body answers as its type" {
-  match program_of(blocks()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match rooted(p, b"ticked") {
-      None -> assert(false),
-      Some(r) -> {
-        let int = named(b"Int");
-        let body = closure_of(0, int);
-        let l = simulated(r.cx, { ..started([]), next: 1 }, AVar(body), row_empty(), place());
-        let described = l.st.statics.map(|d: StaticDef| Static(d.name));
-        match ops_in(l.st.insts).filter(
-            |o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }| o.op == Simulate,
-          ) {
-          [o] -> {
-            // The body's closure, taken, then the descriptor of its answer's type, read.
-            assert_eq(o.uses.takes, [true, false]);
-            assert_eq(o.args.at(0), Some(AVar(body)));
-            assert(
-              l.st.insts.any(|i: Inst|
-                match i {
-                  Let(x) -> Some(AVar(x.var)) == o.args.at(1) && described.contains(x.val),
-                  _ -> false,
-                }),
-              None,
-            );
-            // The runtime is told the words of the body's row, which it hands the body.
-            assert(
-              l.st.insts.any(|i: Inst|
-                match i {
-                  Do(d) -> match d.val { Op(x) -> x.op == OHandle(Entering), _ -> false },
-                  _ -> false,
-                }),
-              None,
-            );
-            assert(answer_read(l.st.insts, o.var, RInt), None)
-          },
-          other -> assert_eq(other.len(), 1),
-        }
-      },
     },
   }
 }
@@ -1010,16 +969,23 @@ test "a parallel block's answers are moved into a box in the branches' order, an
   ])
 }
 
-test "a simulate hands the runtime its body and its answer's descriptor, and answers every operation a region schedules" {
-  let printed = printed_fn(
-    fn_of(b"ticked", [word(0), local(1, named(b"Int"), RInt)], [
-      op_let(word(2), Simulate, [AVar(word(0)), AVar(local(1, named(b"Int"), RInt))]),
-      Return(AVar(word(2))),
-    ]),
-    no_ctors(),
+test "where an instruction is written is its root, then its offsets from the root's definition" {
+  let int = named(b"Int");
+  let printed = spelled(
+    printed_fn(
+      fn_of(b"sited", [], [
+        op_let(local(0, int, RInt), SiteHere(0), []),
+        op_let(local(1, int, RInt), SiteHere(1), []),
+        op_let(local(2, int, RInt), SiteHere(2), []),
+        Return(AVar(local(2, int, RInt))),
+      ]),
+      no_ctors(),
+    ).pieces,
   );
-  assert_eq(call_args(spelled(printed.pieces), b"rt_region_p"), [[b"ctx", b"p0", b"p1"]]);
-  assert(scheduled_ops().all(|op: Bytes| printed.handles.contains(op)), None)
+  // `op_let` writes each at `place()`, and the root's definition starts at 0.
+  let said = Some(String::of_bytes_lossy(printed));
+  assert(printed.index_of(b"t1 = @@r@@;") != None, said);
+  assert(printed.index_of(b"t2 = 3;") != None && printed.index_of(b"t3 = 9;") != None, said)
 }
 
 fn corpus() -> Bytes =
@@ -1055,16 +1021,6 @@ fn corpus() -> Bytes =
     b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
     b"fn summed(n: Int) -> Int = { let (a, b) = parallel { n + 1, n + 2 }; a + b }\n",
     b"fn points(n: Int) -> Int = { let (p, k) = parallel { { x: n, y: 1 }, n }; p.x + p.y + k }\n",
-    b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
-    b"fn clocked() -> Instant / {abort.raise, sim.read} = simulate { clock.now() }\n",
-    b"fn drawn() -> Int / {abort.raise, sim.read} = simulate { random.below(6) }\n",
-    b"fn spawned() -> Int / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1 + 2); task.join(t) }\n",
-    b"fn yielded() -> Int / {abort.raise, sim.read} = simulate { task.yield(); 1 }\n",
-    b"fn chan() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 5); match task.recv(c) { Some(v) -> v, None -> 0 } }\n",
-    b"fn shut() -> Bool / {abort.raise, sim.read} = simulate { let c: Chan<Int> = task.channel(1); task.close(c); task.send(c, 1) }\n",
-    b"fn cancelled() -> Bool / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.cancel(t) }\n",
-    b"fn awaited() -> Option<Int> / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.await(t) }\n",
-    b"fn selected() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 3); match task.select([(c, None)], false) { Some((i, _)) -> i, None -> 0 - 1 } }\n",
     b"fn release(_: Int) -> Unit = ()\n",
     b"fn held(n: Int) -> Int = with_hold[t](n, release) { c -> c.get() }\n",
     b"fn bracketed(n: Int) -> Int = bracket(|| n, release, |x: Int| x + 1)\n",
@@ -1073,8 +1029,8 @@ fn corpus() -> Bytes =
     b"fn tried_far(n: Int) -> Int = match try { if n > 0 { n } else { fail.far(n, \"low\") } } { Ok(v) -> v, Err(e) -> e._0 }\n",
   ])
 
-/// The corpus's roots the form lowers and checks: every construct of the family, under the
-/// effects, `parallel`, region, task, channel, cancellation and select tests' shapes.
+/// The corpus's roots the form lowers and checks: every construct of the family that calls nothing
+/// of the scheduler's, under the effects and `parallel` tests' shapes.
 fn lowers() -> List<Bytes> =
   [
     b"note",
@@ -1099,16 +1055,6 @@ fn lowers() -> List<Bytes> =
     b"points",
     b"pair",
     b"reads",
-    b"ticked",
-    b"clocked",
-    b"drawn",
-    b"spawned",
-    b"yielded",
-    b"chan",
-    b"shut",
-    b"cancelled",
-    b"awaited",
-    b"selected",
     b"bracketed",
     b"counted",
     b"held",
@@ -1120,6 +1066,64 @@ test "every root of the handling corpus lowers, passes the check and prints" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> assert_eq(not_built(p, lowers()), []),
+  }
+}
+
+test "the task operations a load reads the scheduler for are the prelude's that cross" {
+  let declared = match prelude_effects().find(|e: EffectInfo| e.name == b"task") {
+    Some(e) -> e.ops.filter(|o: OpInfo| crossing_vars(o).len() > 0).map(|o: OpInfo| o.name),
+    None -> [],
+  };
+  assert_eq(declared, crossing_operations())
+}
+
+fn scheduled() -> Bytes =
+  Bytes::concat_all([
+    b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
+    b"fn clocked() -> Instant / {abort.raise, sim.read} = simulate { clock.now() }\n",
+    b"fn drawn() -> Int / {abort.raise, sim.read} = simulate { random.below(6) }\n",
+    b"fn spawned() -> Int / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1 + 2); task.join(t) }\n",
+    b"fn yielded() -> Int / {abort.raise, sim.read} = simulate { task.yield(); 1 }\n",
+    b"fn chan() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 5); match task.recv(c) { Some(v) -> v, None -> 0 } }\n",
+    b"fn shut() -> Bool / {abort.raise, sim.read} = simulate { let c: Chan<Int> = task.channel(1); task.close(c); task.send(c, 1) }\n",
+    b"fn cancelled() -> Bool / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.cancel(t) }\n",
+    b"fn awaited() -> Option<Int> / {abort.raise, sim.read} = simulate { let t = task.spawn(|| 1); task.await(t) }\n",
+    b"fn selected() -> Int / {abort.raise, sim.read} = simulate { let c = task.channel(1); task.send(c, 3); match task.select([(c, None)], false) { Some((i, _)) -> i, None -> 0 - 1 } }\n",
+    b"effect log {\n  write put(n: Int) -> Unit\n}\n",
+    b"fn logged() -> Int / {abort.raise, sim.read} = handle { simulate { log.put(1); 2 } } with { log.put(n) -> () }\n",
+    b"fn hosted() -> Int / {task.write, abort.raise} = task.join(task.spawn(|| 1 + 2))\n",
+  ])
+
+test "a region and a task operation at a type of its own are calls of the scheduler's, which lower, pass the check and print" {
+  match scheduled_program_of(scheduled()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let roots = [
+        b"ticked",
+        b"clocked",
+        b"drawn",
+        b"spawned",
+        b"yielded",
+        b"chan",
+        b"shut",
+        b"cancelled",
+        b"awaited",
+        b"selected",
+        b"logged",
+        b"hosted",
+      ];
+      assert_eq(not_built(p, roots), []);
+      let called = |name: Bytes|
+        match formed(p, name) {
+          Ok(f) -> f.links.generics.map(|g: GenericCall| g.callee),
+          Err(_) -> [],
+        };
+      assert_eq(called(b"ticked"), [Named(b"std.internal.schedule.simulated")]);
+      assert_eq(called(b"hosted"), [
+        Named(b"std.internal.schedule.crossing_spawn"),
+        Named(b"std.internal.schedule.crossing_join"),
+      ])
+    },
   }
 }
 
@@ -1466,22 +1470,16 @@ fn rows() -> Bytes =
     b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
   ])
 
-test "a parallel block, and a simulate's body, are handed the words of what they perform, which the handle around them answers" {
-  let src = Bytes::concat_all([
-    rows(),
-    b"fn ticked() -> Int / {abort.raise, sim.read} = handle { simulate { meter.level() } } with { meter.level() -> 3 }\n",
-  ]);
-  match program_of(src) {
+test "a parallel block is handed the words of what it performs, which the handle around it answers" {
+  match program_of(rows()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) ->
-      [b"under", b"ticked"].fold((), |_: Unit, n: Bytes|
-        match printed_by_form(p, n) {
-          Err(why) -> assert_eq(why, b""),
-          Ok(t) -> {
-            let set = entered_words(t);
-            assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(t)))
-          },
-        }),
+    Ok(p) -> match printed_by_form(p, b"under") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(t) -> {
+        let set = entered_words(t);
+        assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(t)))
+      },
+    },
   }
 }
 

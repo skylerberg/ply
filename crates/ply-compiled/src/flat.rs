@@ -68,6 +68,12 @@ impl Writer {
         self.bytes(s.as_bytes())
     }
 
+    /// What another writer of this format wrote, as part of what this one writes.
+    pub fn written(&mut self, b: &[u8]) -> &mut Writer {
+        self.bytes.extend_from_slice(b);
+        self
+    }
+
     /// An option: none, or `write` of its value.
     pub fn option<T>(&mut self, v: Option<T>, write: impl FnOnce(&mut Writer, T)) -> &mut Writer {
         match v {

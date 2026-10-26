@@ -347,6 +347,34 @@ fn let_go(ctx: &mut Ctx, w: Word) {
     heap::release_object(ctx, w);
 }
 
+/// What `std.internal.trail`'s `touches_of` reads, pinned there too.
+#[test]
+fn a_steps_footprint_is_written_as_the_trail_reads_it_and_taken_once() {
+    let mut ctx = context();
+    ctx.footprint.push((
+        tasks::Touched::Atom {
+            effect: ply_core::Symbol::new("log"),
+            resource: Some(ply_core::Symbol::new("x")),
+            write: true,
+        },
+        [3, 1, 2],
+    ));
+    ctx.footprint.push((
+        tasks::Touched::Hold {
+            id: 9,
+            write: false,
+        },
+        [0, 0, 0],
+    ));
+    let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
+    assert_eq!(
+        taken(&mut ctx, n.0),
+        b"\x02\x00\x03log\x00\x01x\x01\x00\x06\x02\x04\x02\x12\x00\x00\x00\x00"
+    );
+    let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
+    assert_eq!(taken(&mut ctx, n.0), b"\x00");
+}
+
 #[test]
 fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() {
     let mut ctx = context();
@@ -434,7 +462,7 @@ fn block(f: &'static Immortal) -> Block {
 /// row's descriptor and its words `row` and `words`.
 fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]) -> (Word, Word) {
     let c: *mut Ctx = ctx;
-    let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1)) });
+    let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1), I64(-1), I64(0), I64(0)) });
     let region = unsafe { tasks::rt_stacks_region(c, handle(s)) };
     let t = word_of(unsafe { tasks::rt_task_made(c, region) });
     let b = word_of(unsafe {

@@ -58,8 +58,8 @@ pub struct Ctx {
     pub performed_root: i64,
     pub performed_start: i64,
     pub performed_end: i64,
-    /// The task running, 0 for a region's root and outside any region: what an instance records as
-    /// it opens, which only that task may leave.
+    /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
+    /// which only that task may leave.
     pub task: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
@@ -115,10 +115,16 @@ pub struct Ctx {
     /// The seed the driver set, and the step budget, for the regions this entry opens.
     pub(crate) seed: ply_core::Seed,
     pub(crate) sim_steps: u32,
-    pub(crate) trail: ply_core::region::Trail,
-    /// What the entry's regions did, for the search, once the last one has completed.
-    pub record: Option<ply_core::region::Record>,
     pub(crate) entered_sims: u32,
+    /// The regions `std.internal.schedule` opened on this context, innermost last, which a bracket
+    /// shields its running task in and a seeded step records what it touched for.
+    pub(crate) regions: Vec<(*mut crate::tasks::Region, [i64; 3])>,
+    /// What the running seeded step touched, each beside where it was made.
+    pub footprint: Vec<(crate::tasks::Touched, [i64; 3])>,
+    /// The trail the entry's last seeded region left, and the interleaving its regions took, each as
+    /// the scheduler wrote it.
+    pub(crate) trail_kept: Option<Vec<u8>>,
+    pub interleaving: Option<Vec<u8>>,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
     pub(crate) aborting: Option<Aborting>,
@@ -280,9 +286,11 @@ impl Ctx {
             teardown: Vec::new(),
             seed: ply_core::Seed::default(),
             sim_steps: ply_core::sim::DEFAULT_STEPS,
-            trail: ply_core::region::Trail::new(ply_core::Seed::default()),
-            record: None,
             entered_sims: 0,
+            regions: Vec::new(),
+            footprint: Vec::new(),
+            trail_kept: None,
+            interleaving: None,
             unwind: None,
             aborting: None,
             pending: None,
@@ -389,7 +397,7 @@ impl Ctx {
     /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
     /// its entries, a cost mark, or a seeded region's steps. A production region reads none.
     pub(crate) fn rearm_recording(&mut self) {
-        let seeded = self.sims.iter().any(|sim| !sim.is_production());
+        let seeded = (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
         self.recording = i64::from(self.traced || !self.cost_marks.is_empty() || seeded);
     }
 
@@ -453,7 +461,7 @@ impl Ctx {
     /// not answer themselves, where the block's site knows it; a block that does not is kept from any
     /// handler at all.
     pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
-        if !self.sims.is_empty() {
+        if !self.sims.is_empty() || !self.regions.is_empty() {
             return false;
         }
         self.frames_in_reach()
@@ -520,9 +528,11 @@ impl Ctx {
         self.cost_marks.clear();
         self.sims.clear();
         self.starting_detached = None;
-        self.trail = ply_core::region::Trail::new(self.seed.clone());
-        self.record = None;
         self.entered_sims = 0;
+        self.regions.clear();
+        self.footprint.clear();
+        self.trail_kept = None;
+        self.interleaving = None;
         self.handlers_made = 0;
         self.holds_made = 0;
         self.unwind = None;
@@ -931,18 +941,19 @@ impl Ctx {
         self.span_at(self.site_root, self.site_start, self.site_end)
     }
 
-    /// [`Ctx::site`] and the definition the body that stored it belongs to.
-    pub(crate) fn step_site(&self) -> StepSite {
-        StepSite {
-            definition: self.root_of(self.site_root).map(|r| r.name.clone()),
-            span: self.site(),
+    /// Puts `touched` into the running seeded step of the innermost region `std.internal.schedule`
+    /// opened, made where the body last stored a site; nothing where no such step runs.
+    pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
+        let stepping = (self.regions.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
+        if stepping {
+            self.footprint
+                .push((touched, [self.site_root, self.site_start, self.site_end]));
         }
     }
 
-    /// Puts `access` into the running step, made where the body last stored a site.
-    pub(crate) fn record_access(&mut self, access: Access) {
-        let at = self.step_site();
-        self.trail.record_access(access, at);
+    /// The name of the definition whose root's id is `root`; none for an id no root has.
+    pub(crate) fn root_name(&self, root: i64) -> Option<&Symbol> {
+        self.root_of(root).map(|r| &r.name)
     }
 
     /// The root whose id is `root`; none for an id below 0 or that no root has.

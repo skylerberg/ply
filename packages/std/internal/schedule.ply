@@ -1685,14 +1685,47 @@ pub extern type Stacks
 /// A task's body and the words its row takes as its maker held them, until a region starts it.
 pub extern type TaskBody
 
-/// Stacks for a region opened here, `seeded` for `simulate`.
-extern fn stacks_opened(seeded: Bool) -> Stacks
+/// Stacks for a region opened here, `seeded` for `simulate`, the region written at the site `root`,
+/// `start` and `end` name.
+extern fn stacks_opened(seeded: Bool, root: Int, start: Int, end: Int) -> Stacks
 
 /// The id of `s`'s region among the entry's regions.
 extern fn stacks_region(s: Stacks) -> Int
 
+/// Where a region open on the context before `s`'s was written, a seeded one's or else a production
+/// one's: the site's root, start or end by `which`, a root of -1 where none is.
+extern fn stacks_outer(s: Stacks, which: Int) -> Int
+
+/// A task's handle at the type its perform names it at, or its clause does: the same handle.
+extern fn task_as<a, b>(t: Task<a>) -> Task<b>
+
+/// A channel's handle at the type its perform names it at, or its clause does: the same handle.
+extern fn chan_as<a, b>(c: Chan<a>) -> Chan<b>
+
+/// What the entry's last seeded region left of its trail (`trail::left_bytes`), empty before its
+/// first.
+extern fn trail_entered() -> Bytes
+
+/// The root of the seed the driver set: its high 32 bits for `which` 0, its low ones for 1.
+extern fn seed_root(which: Int) -> Int
+
+/// The seed's path, each choice in two bytes, the least significant first.
+extern fn seed_path() -> Bytes
+
+/// The scheduling points the entry's seeded regions may take.
+extern fn seeded_steps() -> Int
+
+/// Keeps `left` for the entry's next region and `interleaving` as its outcome's.
+extern fn trail_left(left: Bytes, interleaving: Bytes) -> Unit
+
+/// The site `root`, `start` and `end` name as an outcome places it (`trail::placed_of`).
+extern fn site_placed(root: Int, start: Int, end: Int) -> Bytes
+
+/// What the running seeded step touched since this was last asked (`trail::touches_of`).
+extern fn footprint_taken() -> Bytes
+
 /// `body`, to answer into `t`, beside the words its row takes as the caller holds them.
-extern fn task_body<| e>(t: Task<Kept>, body: () -> Kept / e) -> TaskBody
+extern fn task_body<| e>(t: Task<Kept>, body: keep () -> Kept / e) -> TaskBody
 
 /// Task `id`, to run `b`'s body the first time the loop resumes it, its handle numbered so.
 extern fn task_started(s: Stacks, id: Int, b: TaskBody) -> Unit
@@ -1766,6 +1799,334 @@ extern fn chan_said(c: Chan<Kept>, which: Int) -> Int
 /// Fails the run with the region's failure `failure_bytes` wrote.
 extern fn region_failed(failure: Bytes) -> Unit
 
+// --- How a perform crosses ------------------------------------------------------------------
+
+// A perform of a `task` operation at a type other than `Kept` is a call of its crossing here: each
+// value of the operation's type parameter crosses kept, a function answering one is wrapped to
+// keep what it answers, and an answer holding one is opened.
+
+pub fn crossing_spawn<a | e>(body: keep () -> a / e) -> Task<a> / {task.spawn | e} =
+  task_as(task.spawn(|| keep(body())))
+
+pub fn crossing_join<a>(t: Task<a>) -> a / {task.join, abort.raise} = open(task.join(task_as(t)))
+
+pub fn crossing_cancel<a>(t: Task<a>) -> Bool / {task.cancel} = task.cancel(task_as(t))
+
+pub fn crossing_await<a>(t: Task<a>) -> Option<a> / {task.await} =
+  match task.await(task_as(t)) { Some(k) -> Some(open(k)), None -> None }
+
+pub fn crossing_channel<a>(capacity: Int) -> Chan<a> / {task.channel, abort.raise} =
+  chan_as(task.channel(capacity))
+
+pub fn crossing_send<a>(c: Chan<a>, x: a) -> Bool / {task.send} = task.send(chan_as(c), keep(x))
+
+pub fn crossing_recv<a>(c: Chan<a>) -> Option<a> / {task.recv} =
+  match task.recv(chan_as(c)) { Some(k) -> Some(open(k)), None -> None }
+
+pub fn crossing_close<a>(c: Chan<a>) -> Unit / {task.close} = task.close(chan_as(c))
+
+pub fn crossing_select<a>(
+  arms: List<(Chan<a>, Option<a>)>,
+  wait: Bool,
+) -> Option<(Int, Option<a>)> / {task.select} =
+  match task.select(
+      arms.map(|arm: (Chan<a>, Option<a>)|
+        (chan_as(arm._0), match arm._1 { Some(x) -> Some(keep(x)), None -> None })),
+      wait,
+    ) {
+    Some(went) -> Some((went._0, match went._1 { Some(k) -> Some(open(k)), None -> None })),
+    None -> None,
+  }
+
+// --- What a task asks its loop, and hears ---------------------------------------------------
+
+// The code of each request a clause asks its loop with, never below 0.
+fn ask_spawn() -> Int = 0
+fn ask_join() -> Int = 1
+fn ask_await() -> Int = 2
+fn ask_cancel() -> Int = 3
+fn ask_channel() -> Int = 4
+fn ask_send() -> Int = 5
+fn ask_recv() -> Int = 6
+fn ask_close() -> Int = 7
+fn ask_select() -> Int = 8
+fn ask_yield() -> Int = 9
+fn ask_now() -> Int = 10
+fn ask_sleep() -> Int = 11
+fn ask_next() -> Int = 12
+fn ask_below() -> Int = 13
+fn ask_seed() -> Int = 14
+
+// How a task's body ended, as `task_resumed` answers it.
+fn body_answered() -> Int = 0 - 1
+fn body_unwound() -> Int = 0 - 2
+fn body_raised() -> Int = 0 - 3
+
+// How the loop resumes a task: to start or unwind, or with what it heard, by code and number.
+fn resume_start() -> Int = 0
+fn resume_unwind() -> Int = 0 - 1
+fn heard_went() -> Int = 1
+fn heard_flag() -> Int = 2
+fn heard_count() -> Int = 3
+fn heard_received() -> Int = 4
+fn heard_closed() -> Int = 5
+fn heard_chose() -> Int = 6
+
+/// The running task asks its loop `code` about the task `t`: its id, then its region and how its
+/// handle says it ended as one number.
+fn asked_about(s: Stacks, code: Int, t: Task<Kept>) -> Int =
+  task_yielded(s, code, task_said(t, 1), task_said(t, 0) * 4 + task_said(t, 2))
+
+/// The brackets task `id` stands in.
+fn shields_of(s: Stacks, id: Int) -> Shields =
+  {
+    acquiring: task_shields(s, id, 0),
+    releasing: task_shields(s, id, 1),
+    stopping: task_shields(s, id, 2) != 0,
+  }
+
+/// The request the loop just heard from task `id`, `code` its code.
+fn request_of(s: Stacks, r: Region<Kept>, id: Int, code: Int) -> Request<Kept> / {abort.raise} = {
+  let a = asked_number(s, 0);
+  let b = asked_number(s, 1);
+  let task = {
+    region: b / 4,
+    id: a,
+    ended: match b % 4 { 1 -> Answered, 2 -> Cancelled, _ -> Live },
+  };
+  let chan = { region: b, id: a };
+  if code == ask_spawn() { Spawn }
+  else if code == ask_join() { Join(task) }
+  else if code == ask_await() { Await(task) }
+  else if code == ask_cancel() { Cancel(task, shields_of(s, a)) }
+  else if code == ask_channel() { Channel(a) }
+  else if code == ask_send() { Send(chan, asked_kept(s)) }
+  else if code == ask_recv() { Recv(chan) }
+  else if code == ask_close() { Close(chan) }
+  else if code == ask_select() { Select(open(asked_kept(s)), a != 0) }
+  else if code == ask_yield() { Yield }
+  else if code == ask_now() { Now }
+  else if code == ask_sleep() { Sleep(a) }
+  else if code == ask_next() { Next }
+  else if code == ask_below() { Below(a) }
+  else if code == ask_seed() { Seed }
+  else if code == body_answered() { Finished }
+  else if code == body_unwound() { Unwound } else if code == body_raised() {
+    Raised(
+      r.tasks.keys().fold(Map::new(), |m: Map<Int, Shields>, other: Int|
+        if other == id { m } else { m.insert(other, shields_of(s, other)) }),
+    )
+  } else { Failed }
+}
+
+/// Resumes task `id` as `res`: the code of what it asks next, or of how its body ended.
+fn resumed_as(s: Stacks, id: Int, res: Resumption<Kept>) -> Int / {abort.raise} =
+  match res {
+    Start -> task_resumed(s, id, resume_start(), 0),
+    Unwind -> task_resumed(s, id, resume_unwind(), 0),
+    Raise(f) -> task_resumed_raising(s, id, failure_bytes(f)),
+    Resume(heard) -> match heard {
+      Went -> task_resumed(s, id, heard_went(), 0),
+      Flag(b) -> task_resumed(s, id, heard_flag(), if b { 1 } else { 0 }),
+      Number(n) -> task_resumed(s, id, heard_count(), n),
+      Spawned(n) -> task_resumed(s, id, heard_count(), n),
+      Made(n) -> task_resumed(s, id, heard_count(), n),
+      Joined -> task_resumed(s, id, heard_went(), 0),
+      Awaited(b) -> task_resumed(s, id, heard_flag(), if b { 1 } else { 0 }),
+      Received(Some(k)) -> task_resumed_kept(s, id, heard_received(), 0, k),
+      Received(None) -> task_resumed(s, id, heard_closed(), 0),
+      Chose(went) -> task_resumed_kept(s, id, heard_chose(), 0, keep(went)),
+    },
+  }
+
+// --- `simulate`'s region ---------------------------------------------------------------------
+
+/// `simulate`'s region, written at the site `root`, `start` and `end` name: `body` runs as its
+/// task 0, and every task's `task`, `clock`, `random` and `sim` operations are answered here, in
+/// the order the entry's seed takes. A raise that leaves a task lands where the region is written
+/// once every other task has ended; a region that ends otherwise fails the run.
+pub fn simulated<a | e>(
+  root: Int,
+  start: Int,
+  end: Int,
+  body: keep () -> a / {task.write, clock.read, clock.write, random.write, sim.read | e},
+) -> a / {abort.raise | e} = {
+  let stacks = stacks_opened(true, root, start, end);
+  let id = stacks_region(stacks);
+  let site = { root: root, start: start, end: end };
+  let root_task = task_made(id);
+  handle {
+    if stacks_outer(stacks, 0) >= 0 {
+      let outer = {
+        root: stacks_outer(stacks, 0),
+        start: stacks_outer(stacks, 1),
+        end: stacks_outer(stacks, 2),
+      };
+      region_failed(failure_bytes(nested(site, outer)))
+    } else {
+      task_started(stacks, 0, task_body(root_task, || keep(body())));
+      ran(stacks, id, site)
+    };
+    open(task_answer(root_task))
+  } with {
+    task.spawn(f) -> {
+      let t = task_made(id);
+      task_yielded_kept(stacks, ask_spawn(), 0, 0, keep(task_body(t, f)));
+      t
+    },
+    task.join(t) -> {
+      asked_about(stacks, ask_join(), t);
+      task_answer(t)
+    },
+    task.await(t) -> if asked_about(stacks, ask_await(), t) == heard_flag()
+        && heard_number(stacks) == 1 { Some(task_answer(t)) }
+    else { None },
+    task.cancel(t) -> {
+      asked_about(stacks, ask_cancel(), t);
+      heard_number(stacks) == 1
+    },
+    task.yield() -> {
+      task_yielded(stacks, ask_yield(), 0, 0);
+      ()
+    },
+    task.channel(n) -> {
+      task_yielded(stacks, ask_channel(), n, 0);
+      chan_made(id, heard_number(stacks))
+    },
+    task.send(c, x) -> {
+      task_yielded_kept(stacks, ask_send(), chan_said(c, 1), chan_said(c, 0), x);
+      heard_number(stacks) == 1
+    },
+    task.recv(c) -> if task_yielded(stacks, ask_recv(), chan_said(c, 1), chan_said(c, 0))
+        == heard_received() { Some(heard_kept(stacks)) }
+    else { None },
+    task.close(c) -> {
+      task_yielded(stacks, ask_close(), chan_said(c, 1), chan_said(c, 0));
+      ()
+    },
+    task.select(arms, wait) -> {
+      let asked = arms.map(|arm: (Chan<Kept>, Option<Kept>)|
+        { chan: { region: chan_said(arm._0, 0), id: chan_said(arm._0, 1) }, send: arm._1 });
+      task_yielded_kept(stacks, ask_select(), if wait { 1 } else { 0 }, 0, keep(asked));
+      let went: Option<{ at: Int, got: Option<Kept> }> = open(heard_kept(stacks));
+      match went { Some(w) -> Some((w.at, w.got)), None -> None }
+    },
+    clock.now() -> {
+      task_yielded(stacks, ask_now(), 0, 0);
+      Instant(heard_number(stacks))
+    },
+    clock.sleep(d) -> {
+      task_yielded(stacks, ask_sleep(), match d { Duration(n) -> n }, 0);
+      ()
+    },
+    random.next() -> {
+      task_yielded(stacks, ask_next(), 0, 0);
+      heard_number(stacks)
+    },
+    random.below(n) -> {
+      task_yielded(stacks, ask_below(), n, 0);
+      heard_number(stacks)
+    },
+    sim.seed() -> {
+      task_yielded(stacks, ask_seed(), 0, 0);
+      heard_number(stacks)
+    },
+  }
+}
+
+/// The trail the entry's regions left, or the seed's own before the first.
+fn entered_trail() -> trail::Left / {abort.raise} =
+  match trail::left_of(trail_entered()) {
+    Some(l) -> l,
+    None -> {
+      let path = seed_path();
+      let root = U64::of_int(seed_root(0)) << 32 | U64::of_int(seed_root(1));
+      {
+        trail: trail::trail(
+          {
+            root: root,
+            path: range(0, path.len() / 2).map(|i: Int| path.at(2 * i) + 256 * path.at(2 * i + 1)),
+          },
+          seeded_steps(),
+        ),
+        steps: [],
+      }
+    },
+  }
+
+/// What the loop holds: the region, and the task it ran last.
+type Looping = { region: Region<Kept>, last: Int }
+
+/// `simulate`'s loop over the stacks `s` of region `id` written at `site`: runs the task each turn
+/// names and applies what it asks, until the region ends; then leaves the trail and answers, fails
+/// the run, or lands the raise that left a task, as the region ended.
+fn ran(s: Stacks, id: Int, site: Site) -> Unit / {abort.raise} = {
+  let entered = entered_trail();
+  let start = { region: seeded(id, site, entered.trail), last: 0 };
+  let ended = iterate(start, entered.trail.budget + 2, |l: Looping| {
+    let t = turned(l.region, { now: 0, stopping: false });
+    match t.turn {
+      Run(task, res) -> {
+        let code = resumed_as(s, task, res);
+        let child = t.region.next_id;
+        let at = {
+          site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },
+          shields: shields_of(s, task),
+          now: 0,
+        };
+        let touched = performed(t.region, trail::touches_of(footprint_taken()));
+        let next = asked(touched, task, request_of(s, touched, task, code), at);
+        if code == ask_spawn() && next.next_id > child {
+          task_started(s, child, open(asked_kept(s)))
+        };
+        if code == body_answered() || code == body_unwound() { task_freed(s, task) };
+        let given = orders_taken(next);
+        given.orders.fold((), |_u: Unit, o: Order| obeyed(s, o));
+        Continue({ region: given.region, last: task })
+      },
+      other -> Stop({ looping: { ..l, region: t.region }, turn: other }),
+    }
+  });
+  let r = ended.looping.region;
+  let all = entered.steps.concat(r.steps);
+  trail_left(
+    trail::left_bytes({ trail: left(r), steps: all }),
+    trail::interleaving_bytes(all, r.now, |at: Site|
+      trail::placed_of(site_placed(at.root, at.start, at.end))),
+  );
+  match ended.turn {
+    Complete -> (),
+    Reraise(task) -> {
+      task_restored(s, task, raised_note(r, task));
+      ()
+    },
+    Ends(Refused(f)) -> region_failed(failure_bytes(f)),
+    Ends(TaskFailed(note)) -> {
+      task_restored(s, ended.looping.last, match note { Some(n) -> n, None -> "" });
+      ()
+    },
+    _ -> region_failed(failure_bytes(internal(r, "a seeded region waited on the host"))),
+  }
+}
+
+/// What a raise that left task `task` notes as the region raises it again, where the region spawned
+/// any task: the task, and the seed that replays the run.
+fn raised_note(r: Region<Kept>, task: Int) -> String / {abort.raise} =
+  if r.next_id <= 1 { "" } else {
+    "raised in task " ++ task_name(task) ++ " of a simulated region; replay with seed "
+      ++ trail::seed_text(r.trail.seed)
+  }
+
+/// What the loop does for an order the scheduler gave.
+fn obeyed(s: Stacks, o: Order) -> Unit =
+  match o {
+    HoldBack(id) -> task_held_back(s, id, true),
+    LetThrough(id) -> task_held_back(s, id, false),
+    Discard(id) -> task_freed(s, id),
+    Settled(id) -> task_settled(s, id),
+    DropRaise(id) -> task_freed(s, id),
+  }
+
 // --- Tests --------------------------------------------------------------------------
 
 fn here() -> Asked = { site: nowhere(), shields: unshielded(), now: 0 }
@@ -1773,14 +2134,14 @@ fn here() -> Asked = { site: nowhere(), shields: unshielded(), now: 0 }
 fn region_site() -> Site = { root: 1, start: 0, end: 10 }
 
 /// A `simulate` region whose seed takes `path`, then the lowest enabled task.
-fn simulated(path: List<Int>, budget: Int) -> Region<Int> =
+fn seeded_by(path: List<Int>, budget: Int) -> Region<Int> =
   seeded(
     0,
     region_site(),
     trail::trail({ root: 0u64, path: path.concat(range(0, 200).map(|_i: Int| 0)) }, budget),
   )
 
-fn lowest() -> Region<Int> = simulated([], 1000)
+fn lowest() -> Region<Int> = seeded_by([], 1000)
 
 fn next(r: Region<Int>) -> Turned<Int> / {abort.raise} = turned(r, { now: 0, stopping: false })
 
@@ -1900,7 +2261,7 @@ test "a raise that leaves a task cancels the region's other tasks, and lands onc
 
 test "a sibling in a bracket's acquire keeps its answer, and the raise waits for it to unwind" {
   // The body spawns task 1, and the seed runs task 1 before the body hears its answer.
-  let spawned = then(next(simulated([0, 1], 1000)), 0, Spawn);
+  let spawned = then(next(seeded_by([0, 1], 1000)), 0, Spawn);
   assert_eq(spawned.turn, Run(1, Start));
   let acquiring = Map::new().insert(0, { acquiring: 1, releasing: 0, stopping: false });
   let left = then(spawned, 1, Raised(acquiring));
@@ -1980,9 +2341,9 @@ test "a handle another region made is refused" {
 }
 
 test "the step budget ends a region that never finishes, and a replay off its schedule diverges" {
-  let spun = then(then(next(simulated([], 3)), 0, Yield), 0, Yield);
+  let spun = then(then(next(seeded_by([], 3)), 0, Yield), 0, Yield);
   assert_eq(code_of(then(spun, 0, Yield)), "E0414");
-  assert_eq(code_of(then(next(simulated([0, 5], 10)), 0, Spawn)), "E0415")
+  assert_eq(code_of(then(next(seeded_by([0, 5], 10)), 0, Spawn)), "E0415")
 }
 
 fn produced() -> Turned<Int> / {abort.raise} = next(production(0, region_site()))

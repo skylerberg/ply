@@ -29,7 +29,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     c.entering_desc = 0;
     c.entering_words = 0;
-    let entered = crate::simulate::shield(c, Shield::Acquire);
+    let entered = crate::tasks::shielded(c, crate::tasks::Shield::Acquire);
     let f = acquire.word();
     entering();
     let holding = [
@@ -48,7 +48,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     unsafe { acquire.let_go_function(ctx) };
     let c = unsafe { &mut *ctx };
-    let cancelled = crate::simulate::unshield(c, entered);
+    let cancelled = crate::tasks::unshielded(c, entered);
     if c.failed != 0 {
         if cancelled {
             cancel_carried(c);
@@ -110,7 +110,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         c.keep(Kept::Pending(raise, failure))
     });
     c.failed = 0;
-    let entered = crate::simulate::shield(c, Shield::Release);
+    let entered = crate::tasks::shielded(c, crate::tasks::Shield::Release);
     let raise = raising.map(|a| c.keep(Kept::Raising(a)));
     let (f, given) = (cleanup.word(), held.handed().word());
     let call = || {
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
         Kept::Pending(raise, failure) => (raise, failure),
         _ => unreachable!("a cleanup keeps the pending raise it runs during"),
     });
-    let cancelled = crate::simulate::unshield(c, entered);
+    let cancelled = crate::tasks::unshielded(c, entered);
     if c.failed != 0 || cancelled {
         if let Some(raise) = raising {
             raise.into_failure();

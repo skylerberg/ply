@@ -218,13 +218,14 @@ pub struct Held {
     pub frame_tables: u64,
 }
 
-/// How an entry ended, what it used, what its host runtime warned of as it ended, what its
-/// `simulate` regions did, and the trace of what it read where it was recorded.
+/// How an entry ended, what it used, what its host runtime warned of as it ended, the interleaving
+/// its `simulate` regions took as `std.internal.schedule` wrote it, and the trace of what it read
+/// where it was recorded.
 pub struct Outcome {
     pub ended: Ended,
     pub usage: Usage,
     pub warnings: Vec<Diagnostic>,
-    pub record: Option<ply_core::region::Record>,
+    pub interleaving: Option<Vec<u8>>,
     pub trace: Option<String>,
 }
 
@@ -234,7 +235,7 @@ impl Outcome {
             ended,
             usage: Usage::default(),
             warnings: Vec::new(),
-            record: None,
+            interleaving: None,
             trace: None,
         }
     }
@@ -326,7 +327,7 @@ pub fn enter(
                         .saturating_sub(counted.updates_in_place),
                 },
                 warnings: std::mem::take(&mut ctx.teardown),
-                record: last.record,
+                interleaving: last.interleaving,
                 trace: None,
             }
         }
@@ -363,7 +364,7 @@ struct Last {
     steps: u64,
     performs: u64,
     held: Held,
-    record: Option<ply_core::region::Record>,
+    interleaving: Option<Vec<u8>>,
 }
 
 /// An entry a Rust unwind left: its host runtime and the pool are told it is over, and its context
@@ -417,14 +418,14 @@ fn entered(
 /// What an entry leaves once its root returned: its production region's other tasks run to their
 /// ends first, and its host runtime told the entry is over.
 fn returned(ctx: &mut Ctx) -> Last {
-    let production = ctx.sims.last().filter(|sim| sim.is_production());
+    let production = ctx.sims.last();
     let held = Held {
         bridges: ctx.heap.bridges() as u64,
         scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
         task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
         frame_tables: ctx.stack_slots() as u64,
     };
-    if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
+    if !ctx.sims.is_empty() {
         unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx)) };
     }
     if let Some(rt) = ctx.runtime.clone() {
@@ -435,7 +436,7 @@ fn returned(ctx: &mut Ctx) -> Last {
         steps: u64::try_from(ctx.ticks).unwrap_or(0),
         performs: ctx.performed.len() as u64,
         held,
-        record: ctx.record.take(),
+        interleaving: ctx.interleaving.take(),
     }
 }
 
@@ -914,8 +915,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
     w.list(outcome.warnings.iter(), |w, d| {
         write_failure(w, d, Some(opened))
     });
-    w.option(outcome.record.as_ref(), |w, record| {
-        write_interleaving(w, opened, record)
+    w.option(outcome.interleaving.as_deref(), |w, interleaving| {
+        w.written(interleaving);
     });
     w.option(outcome.trace.as_deref(), |w, t| {
         w.bytes(t.as_bytes());
@@ -957,60 +958,6 @@ fn write_site(w: &mut Writer, opened: Option<&Opened>, span: Span) {
             .count(u64::from(span.start))
             .count(u64::from(span.end));
     });
-}
-
-/// `interleaving := list(step), int virtual_time`; `step := int region, int task, list(int)
-/// enabled, int choice, list(access), option(string) definition, option(site), list(int) stamp`;
-/// `access := tag 0 string effect, option(string) resource, bool write, option(string) op | 1 int
-/// handler, int index, bool write | 2 int id, bool write`.
-fn write_interleaving(w: &mut Writer, opened: &Opened, record: &ply_core::region::Record) {
-    use ply_core::sim::Access;
-    w.list(record.steps.iter(), |w, step| {
-        w.count(u64::from(step.region.0))
-            .count(step.task.0)
-            .list(step.enabled.iter(), |w, t| {
-                w.count(t.0);
-            })
-            .count(u64::from(step.choice));
-        let accesses: Vec<&Access> = step.accesses.accesses().collect();
-        w.list(accesses.into_iter(), |w, access| match access {
-            Access::Atom(atom) => {
-                w.tag(0).str(atom.effect.as_str());
-                w.option(
-                    match &atom.resource {
-                        Resource::Named(name) => Some(name.as_str().to_string()),
-                        Resource::Var(n) => Some(format!("${n}")),
-                        Resource::Every => Some("*".to_string()),
-                        Resource::Singleton => None,
-                    },
-                    |w, r| {
-                        w.str(&r);
-                    },
-                );
-                w.bool(atom.mode == Mode::Write);
-                w.option(atom.op.as_ref(), |w, op| {
-                    w.str(op.as_str());
-                });
-            }
-            Access::Var { handler, at, mode } => {
-                w.tag(1)
-                    .count(*handler)
-                    .count(u64::from(*at))
-                    .bool(*mode == Mode::Write);
-            }
-            Access::Hold { id, mode } => {
-                w.tag(2).count(*id).bool(*mode == Mode::Write);
-            }
-        });
-        w.option(step.definition.as_ref(), |w, d| {
-            w.str(d.as_str());
-        });
-        write_site(w, Some(opened), step.span);
-        w.list(step.stamp.iter(), |w, n| {
-            w.count(u64::from(*n));
-        });
-    });
-    w.int(record.virtual_time);
 }
 
 #[cold]

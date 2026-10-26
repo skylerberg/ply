@@ -1,5 +1,5 @@
 //! The runtime's vocabulary: values, spans, diagnostics and their codes, effects and their
-//! footprints, the host boundary, and the deterministic simulation compiled code runs under.
+//! footprints, the host boundary, and the production scheduler.
 
 // `Value` mixes `Arc` payloads with a task handle's `Rc`, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
@@ -29,7 +29,6 @@ pub mod memo;
 mod plain;
 pub mod rc;
 pub mod reflect;
-pub mod region;
 pub mod sched;
 pub mod semantics;
 pub mod sim;
@@ -49,13 +48,9 @@ pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use rc::RcStats;
-pub use region::{Interleaving, SimId, Verdict};
 pub use sched::TaskHandle;
 pub use semantics::{strict_binary, unstated};
-pub use sim::{
-    Access, Answer, Clock, Domain, Handlers, OpSignature, Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed,
-    SimType, Sleep, StepFootprint, Stream, TaskId, Wakeup,
-};
+pub use sim::{Seed, SimId, TaskId};
 pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
     intern_code, slot,

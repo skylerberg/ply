@@ -33,8 +33,9 @@ import compiler.emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, RImm, Va
                           FnKind, Rooted, Plain, Member, Closure, Declined, Calling, no_links,
                           falls_through, rep_of_arg, counted, MFramed, OHandle)
 import compiler.emit.tir.calling (ConstantRead, Ticked)
-import compiler.emit.tir.handling (Entering)
+import compiler.emit.tir.handling (Entering, SiteHere)
 import compiler.emit.lower.setting (Setting, Root, imported_target, ctor_named)
+import compiler.syntax.exprs (scheduler_module)
 import compiler.emit.lower.held (held_as, case_index, arg_word, typed_convention, value_words,
                                  passing, InWords)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef,
@@ -47,10 +48,11 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToB
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin)
 import compiler.emit.lower.crossing (metered, pending_raised)
-import compiler.emit.lower.evidence (Handed, Handing, handed_to, evidenced, handing, value_handing,
-                                     filed_words, labels_held, left_labels, label_value, words_read,
-                                     described, words_handed, label_codes, rows_static, root_opened,
-                                     handed_param_types, routed, builtin_row)
+import compiler.emit.lower.evidence (Handed, Handing, handed_to, evidenced, handing, handing_filled,
+                                     value_handing, filed_words, labels_held, left_labels,
+                                     label_value, words_read, described, words_handed, label_codes,
+                                     rows_static, root_opened, handed_param_types, routed,
+                                     builtin_row)
 import compiler.emit.evidence (Own, evidence_type, instance_block_type, words_carried, words_apart,
                                words_laid_type, row_words)
 
@@ -1945,12 +1947,116 @@ fn call(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let given = handing(cx, st, d.def, ref, label_codes(d.def, codes));
-  let n = named_ref(cx, st, d, ref, fn_args(cx, d.def, codes), given.rows);
+  called_as(
+    cx,
+    d,
+    given,
+    named_ref(cx, st, d, ref, fn_args(cx, d.def, codes), given.rows),
+    codes,
+    args,
+    at,
+  )
+}
+
+/// A call of the toolchain's function `name` at `types`, filling its row variables with `rows`, on
+/// `args` lowered from `codes`: what a perform crossing to the scheduler and a `simulate` are
+/// written as, which no reference in the module names.
+pub fn called_at_types(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  types: List<Type>,
+  rows: List<Row>,
+  codes: List<Code>,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match def_named(cx, name) {
+    None ->
+      refuse(st, Calling, b"a call of a function no load of the program reached: ".concat(name)),
+    Some(d) -> {
+      let given = handing_filled(cx, d.def, rows, []);
+      called_as(
+        cx,
+        d,
+        given,
+        referred(cx.setting, st, d, types, fn_args(cx, d.def, codes), given.rows),
+        codes,
+        args,
+        at,
+      )
+    },
+  }
+
+/// A `simulate` written at `at` whose body is the closure `body`, performing `row`: a call of the
+/// scheduler's `simulated`, handed where the region is written and the body, at the body's answer
+/// type and filling its row variable with what `row` performs beyond what `simulated` answers.
+pub fn simulate_called(
+  cx: Context,
+  st: Lowering,
+  body: Arg,
+  row: Row,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let name = scheduler_module().concat(b"::simulated");
+  let answered = match def_named(cx, name) {
+    Some(d) -> match d.def.scheme {
+      Some(sc) -> match sc.ty {
+        TyFn(f) -> match f.params.last() {
+          Some(TyFn(b)) -> b.effects.atoms.map(|a: Atom| a.effect),
+          _ -> [],
+        },
+        _ -> [],
+      },
+      None -> [],
+    },
+    None -> [],
+  };
+  let sites = range(0, 3).fold(
+    { st: st, args: [] },
+    |acc: { st: Lowering, args: List<Arg> }, part: Int| {
+      let s = bound_as(
+        acc.st,
+        int_type(),
+        RInt,
+        Op({
+          op: OHandle(SiteHere(part)),
+          args: [],
+          uses: { takes: [], owned: false, fails: false, stops: false },
+        }),
+        at,
+      );
+      { st: s.st, args: acc.args.push(s.arg) }
+    },
+  );
+  called_at_types(
+    cx,
+    sites.st,
+    name,
+    [match type_of(body) { TyFn(f) -> f.ret, _ -> unknown_type() }],
+    [{ ..row, atoms: row.atoms.filter(|a: Atom| !answered.contains(a.effect)) }],
+    [],
+    sites.args.push(body),
+    at,
+  )
+}
+
+/// A call of `d` handing `given`, named as `n` says.
+fn called_as(
+  cx: Context,
+  d: Defined,
+  given: Handing,
+  n: Reference,
+  codes: List<Code>,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let st = n.st;
   match ((crossing_at(cx.setting, d.def, n.args), answer_type(d.def, n.given))) {
     (None, _) ->
       refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
     (_, None) ->
-      unfiled(cx, st, b"a call's type arguments of a generic definition: ".concat(d.full), ref),
+      unfiled(cx, st, b"a call's type arguments of a generic definition: ".concat(d.full), at),
     (Some(c), Some(ret)) -> {
       let conv = evidenced(conventional(cx.setting, c), given.labels.len(), given.words.len());
       let e = words_handed(

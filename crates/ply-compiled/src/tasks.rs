@@ -16,12 +16,12 @@ use crate::rt::{
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
-use ply_core::region::SimId;
 use ply_core::sched::{ChanHandle, TaskHandle};
-use ply_core::sim::{ChanId, TaskId};
-use ply_core::{Diagnostic, Value, codes};
+use ply_core::sim::{ChanId, SimId, TaskId};
+use ply_core::{Diagnostic, Span, Value, codes};
 use ply_host::pool::Run;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 /// What [`resume`] answers where the task's body ended rather than asked: it answered; it unwound
 /// after a cancel; a raise nothing in it answered left it; it failed at run time. A request's own
@@ -91,6 +91,9 @@ struct Slot {
     frames: Option<usize>,
     shields: Shields,
     stashed: Option<Stashed>,
+    /// What `Ctx.task` says while it runs ([`task_number`]); none for the region's body, which runs
+    /// as the task that opened the region.
+    runs_as: Option<i64>,
 }
 
 /// One open region's tasks. Boxed, so a task's stack can name it while it runs.
@@ -131,6 +134,11 @@ impl Region {
         self.seeded
     }
 
+    /// Whether a seeded step runs: one of the region's tasks, which what it touches is recorded for.
+    pub fn is_stepping(&self) -> bool {
+        self.seeded && self.running.is_some()
+    }
+
     /// The task the loop resumed, while it runs.
     pub fn running(&self) -> Option<u64> {
         self.running
@@ -146,10 +154,11 @@ impl Region {
         self.live + self.spare.len()
     }
 
-    /// Task `id`, to run `body` the first time the loop resumes it.
+    /// Task `id`, to run `body` the first time the loop resumes it; task 0 is the region's body.
     pub fn start(&mut self, id: u64, body: Body) {
         let slot = Slot {
             body: Some(body),
+            runs_as: (id != 0).then(task_number),
             ..Slot::default()
         };
         if let Some(old) = self.slots.insert(id, Box::new(slot)) {
@@ -300,14 +309,26 @@ pub unsafe fn resume(region: *mut Region, id: u64, answer: Message) -> Message {
         r.peak = r.peak.max(r.live);
     }
     let to = slot.sp;
+    let opener = c.task;
+    c.task = slot.runs_as.unwrap_or(opener);
     c.current = slot.frames.unwrap_or(r.frames);
     r.message = answer;
     r.running = Some(id);
     unsafe { switch_keeping(ctx, &raw mut r.loop_sp, to) };
     let r = unsafe { &mut *region };
     r.running = None;
-    unsafe { (*ctx).current = r.frames };
+    unsafe {
+        (*ctx).current = r.frames;
+        (*ctx).task = opener;
+    }
     r.message
+}
+
+/// A number for `Ctx.task` no other task of any region in the process is given: below 0, so
+/// apart from 0, which no region's task runs as.
+pub(crate) fn task_number() -> i64 {
+    static NEXT: AtomicI64 = AtomicI64::new(-1);
+    NEXT.fetch_sub(1, Ordering::Relaxed)
 }
 
 /// The running task of `region` hands its loop `request` and waits to run again: answers what the
@@ -404,11 +425,39 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
         n("open", rt_open as unsafe extern "C" fn(_, _, _) -> _),
         n(
             "stacks_opened",
-            rt_stacks_opened as unsafe extern "C" fn(_, _) -> _,
+            rt_stacks_opened as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
         n(
             "stacks_region",
             rt_stacks_region as unsafe extern "C" fn(_, _) -> _,
+        ),
+        n(
+            "stacks_outer",
+            rt_stacks_outer as unsafe extern "C" fn(_, _, _) -> _,
+        ),
+        n("task_as", rt_handle_as as unsafe extern "C" fn(_, _) -> _),
+        n("chan_as", rt_handle_as as unsafe extern "C" fn(_, _) -> _),
+        n(
+            "trail_entered",
+            rt_trail_entered as unsafe extern "C" fn(_) -> _,
+        ),
+        n("seed_root", rt_seed_root as unsafe extern "C" fn(_, _) -> _),
+        n("seed_path", rt_seed_path as unsafe extern "C" fn(_) -> _),
+        n(
+            "seeded_steps",
+            rt_seeded_steps as unsafe extern "C" fn(_) -> _,
+        ),
+        n(
+            "trail_left",
+            rt_trail_left as unsafe extern "C" fn(_, _, _, _, _),
+        ),
+        n(
+            "site_placed",
+            rt_site_placed as unsafe extern "C" fn(_, _, _, _) -> _,
+        ),
+        n(
+            "footprint_taken",
+            rt_footprint_taken as unsafe extern "C" fn(_) -> _,
         ),
         n(
             "task_body",
@@ -551,6 +600,10 @@ impl Stacks {
 
 impl Native for Stacks {
     fn release(&mut self, ctx: *mut Ctx) {
+        let region = self.region();
+        let c = unsafe { &mut *ctx };
+        c.regions.retain(|(r, _)| *r != region);
+        c.rearm_recording();
         drop(self.region.take());
         for w in [self.asked.word, self.heard.word] {
             if w != 0 {
@@ -710,13 +763,23 @@ pub unsafe extern "C" fn rt_open(ctx: *mut Ctx, k: Handle, ty: *const PlyType) -
     }
 }
 
-/// A region's stacks, opened on the running stack, `seeded` (1) for `simulate`.
-pub unsafe extern "C" fn rt_stacks_opened(ctx: *mut Ctx, seeded: I64) -> Handle {
+/// A region's stacks, opened on the running stack, `seeded` (1) for `simulate`, the region written
+/// at the site `root`, `start` and `end` name.
+pub unsafe extern "C" fn rt_stacks_opened(
+    ctx: *mut Ctx,
+    seeded: I64,
+    root: I64,
+    start: I64,
+    end: I64,
+) -> Handle {
     let c = unsafe { &mut *ctx };
     let id = i64::from(c.entered_sims);
     c.entered_sims += 1;
+    let mut region = Region::open(ctx, seeded.0 != 0);
+    c.regions.push((&mut *region, [root.0, start.0, end.0]));
+    c.rearm_recording();
     let stacks = Stacks {
-        region: Some(Region::open(ctx, seeded.0 != 0)),
+        region: Some(region),
         id,
         asked: Message::default(),
         heard: Message::default(),
@@ -724,6 +787,188 @@ pub unsafe extern "C" fn rt_stacks_opened(ctx: *mut Ctx, seeded: I64) -> Handle 
         tasks: HashMap::new(),
     };
     object_made(ctx, Box::new(stacks))
+}
+
+/// Where a region open on this context before `s`'s was written, a seeded one's or else a
+/// production one's: its root, start or end by `which`; a root of -1 where there is none.
+pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -> I64 {
+    let c = unsafe { &*ctx };
+    let region = object::<Stacks>(ctx, &s, "a region's stacks").map(|s| s.region());
+    let outer = (c.regions.iter())
+        .take_while(|(r, _)| Some(*r) != region)
+        .filter(|(r, _)| unsafe { (**r).is_seeded() })
+        .last()
+        .map(|(_, site)| *site)
+        .or_else(|| c.sims.last().map(|sim| sim.site));
+    I64(match (outer, usize::try_from(which.0)) {
+        (Some(site), Ok(i)) if i < 3 => site[i],
+        _ => -1,
+    })
+}
+
+/// Where the innermost region `std.internal.schedule` opened on `c` was written, where it is
+/// seeded, so a refusal of what one of its tasks performs can name it.
+pub fn seeded_region(c: &Ctx) -> Option<Span> {
+    let (region, [root, start, end]) = c.regions.last()?;
+    unsafe { (**region).is_seeded() }.then(|| c.span_at(*root, *start, *end))
+}
+
+/// A task's or a channel's handle as the same handle at another type, held once more.
+pub unsafe extern "C" fn rt_handle_as(_ctx: *mut Ctx, h: Handle) -> Handle {
+    Handle::of(held(h.word()))
+}
+
+/// A `bracket`'s `acquire` or `release` the running task of a region stands in: the innermost
+/// region `std.internal.schedule` opened, or a production region the runtime runs.
+pub(crate) enum Bracketed {
+    Region {
+        region: *mut Region,
+        task: u64,
+        shield: Shield,
+    },
+    Production(crate::simulate::Shielded),
+}
+
+/// Enters `shield` for the running task of the innermost region running one.
+pub(crate) fn shielded(c: &mut Ctx, shield: Shield) -> Option<Bracketed> {
+    if let Some((region, _)) = c.regions.last().copied()
+        && let Some(task) = unsafe { (*region).shield(shield) }
+    {
+        return Some(Bracketed::Region {
+            region,
+            task,
+            shield,
+        });
+    }
+    let shield = match shield {
+        Shield::Acquire => ply_core::sched::Shield::Acquire,
+        Shield::Release => ply_core::sched::Shield::Release,
+    };
+    crate::simulate::shield(c, shield).map(Bracketed::Production)
+}
+
+/// Leaves what [`shielded`] entered: whether a cancel held back for it lands now.
+pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
+    match entered {
+        None => false,
+        Some(Bracketed::Region {
+            region,
+            task,
+            shield,
+        }) => {
+            c.regions.iter().any(|(r, _)| *r == region)
+                && unsafe { (*region).unshield(task, shield) }
+        }
+        Some(Bracketed::Production(s)) => crate::simulate::unshield(c, Some(s)),
+    }
+}
+
+// --- The entry's trail -----------------------------------------------------------------------
+
+/// What a seeded step touched, as `std.internal.trail`'s `Access` holds it: an effect's mode atom,
+/// its resource where it names one, or a hold.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Touched {
+    Atom {
+        effect: ply_core::Symbol,
+        resource: Option<ply_core::Symbol>,
+        write: bool,
+    },
+    Hold {
+        id: u64,
+        write: bool,
+    },
+}
+
+/// The trail the entry's last seeded region left, as the scheduler wrote it; none before its first.
+pub unsafe extern "C" fn rt_trail_entered(ctx: *mut Ctx) -> TakenBytes {
+    let c = unsafe { &mut *ctx };
+    let kept = c.trail_kept.clone().unwrap_or_default();
+    c.given(kept)
+}
+
+/// The root of the seed the driver set: its high 32 bits for `which` 0, its low ones for 1.
+pub unsafe extern "C" fn rt_seed_root(ctx: *mut Ctx, which: I64) -> I64 {
+    let root = unsafe { &*ctx }.seed.root;
+    I64(if which.0 == 0 {
+        (root >> 32) as i64
+    } else {
+        (root & 0xFFFF_FFFF) as i64
+    })
+}
+
+/// The seed's path, each choice in two bytes, the least significant first.
+pub unsafe extern "C" fn rt_seed_path(ctx: *mut Ctx) -> TakenBytes {
+    let c = unsafe { &mut *ctx };
+    let path: Vec<u8> = c.seed.path.iter().flat_map(|p| p.to_le_bytes()).collect();
+    c.given(path)
+}
+
+/// The scheduling points a seeded region of the entry may take, as the driver set them.
+pub unsafe extern "C" fn rt_seeded_steps(ctx: *mut Ctx) -> I64 {
+    I64(i64::from(unsafe { &*ctx }.sim_steps))
+}
+
+/// Keeps the trail the `n` bytes at `p` hold for the entry's next region and the interleaving the
+/// `m` bytes at `q` hold as its outcome's, each as the scheduler wrote it, which this never reads.
+pub unsafe extern "C" fn rt_trail_left(ctx: *mut Ctx, p: Addr, n: I64, q: Addr, m: I64) {
+    let c = unsafe { &mut *ctx };
+    c.trail_kept = Some(unsafe { lent(p, n) }.to_vec());
+    c.interleaving = Some(unsafe { lent(q, m) }.to_vec());
+}
+
+/// The site `root`, `start` and `end` name as an outcome places it, as `std.internal.trail`'s
+/// `Placed` holds it: the definition it lies in, and its root's name and its span there.
+pub unsafe extern "C" fn rt_site_placed(
+    ctx: *mut Ctx,
+    root: I64,
+    start: I64,
+    end: I64,
+) -> TakenBytes {
+    let c = unsafe { &mut *ctx };
+    let name = c.root_name(root.0).map(|n| n.as_str().to_string());
+    let span = c.span_at(root.0, start.0, end.0);
+    let mut w = crate::flat::Writer::new();
+    w.option(name.as_deref(), |w, n| {
+        w.str(n);
+    });
+    w.option(name.as_deref().filter(|_| !span.is_dummy()), |w, n| {
+        w.str(n)
+            .count(u64::from(span.start))
+            .count(u64::from(span.end));
+    });
+    let bytes = w.finish();
+    c.given(bytes)
+}
+
+/// What the running seeded step touched since this was last asked, each access beside where it was
+/// made, as `std.internal.trail` reads a `List<Touch>`; what it held is let go.
+pub unsafe extern "C" fn rt_footprint_taken(ctx: *mut Ctx) -> TakenBytes {
+    let c = unsafe { &mut *ctx };
+    let touched = std::mem::take(&mut c.footprint);
+    let mut w = crate::flat::Writer::new();
+    w.list(touched.iter(), |w, (t, site)| {
+        match t {
+            Touched::Atom {
+                effect,
+                resource,
+                write,
+            } => {
+                w.tag(0).str(effect.as_str());
+                match resource {
+                    Some(r) => w.tag(0).str(r.as_str()),
+                    None => w.tag(2),
+                };
+                w.tag(u64::from(*write)).tag(0);
+            }
+            Touched::Hold { id, write } => {
+                w.tag(2).count(*id).tag(u64::from(*write));
+            }
+        }
+        w.int(site[0]).int(site[1]).int(site[2]);
+    });
+    let bytes = w.finish();
+    c.given(bytes)
 }
 
 /// The id of the region `s` holds the stacks of, among its entry's regions.

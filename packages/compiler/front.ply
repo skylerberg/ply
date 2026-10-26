@@ -5,7 +5,7 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               SRequires, ImportDecl, INames, dump_item, stated_type, item_span,
                               IAlias, IModule, IDerive, IInstance, INumeric)
 import compiler.syntax.type_syntax (MWrite)
-import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module)
+import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module, scheduler_module)
 import compiler.emit.code (Code, dump)
 import compiler.check.types (Atom, RSingleton, Scheme, TyFn, atoms_text, scheme_text,
                              canonical_scheme, named_type)
@@ -33,8 +33,9 @@ import std.list
 import compiler.expand.embed (EmbedAt, EmbedRead, EmbedFile, EmbedBytes, BytesRead, EmbedWant,
                               ItemWants, embed_want_bin, embed_read_bin, item_wants_bin, embed_key,
                               embedded, wants_of, wants_by_item, wants_in, want_of_key, embed_file)
-import compiler.syntax.items (parse, import_decl_bin, homes_called, homes_declaring, homes_for,
-                              called_names, is_std, is_shipped, HomeNames)
+import compiler.syntax.items (parse, import_decl_bin, read_without_import, scheduler_read,
+                              homes_declaring, homes_for, called_names, is_std, is_shipped,
+                              HomeNames)
 import compiler.syntax.lexer (is_ident_continue)
 import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterCtor, CFn, CList, CMap,
                             CPlain, CRecord, CSum, CVar, CWidth, KnownDefRow, KnownTestRow, Rows,
@@ -309,8 +310,8 @@ type Needed = {
   declared: Option<List<HomeNames>>,
 }
 
-/// `pulls` of `source` with the home modules it calls ([`homes_called`]), what the homes declare
-/// read through `read` where no module before it read it.
+/// `pulls` of `source` with the modules it reads with no import ([`read_without_import`]), what the
+/// homes declare read through `read` where no module before it read it.
 fn homes_added<| e>(
   source: Source,
   pulls: Pulls,
@@ -318,15 +319,26 @@ fn homes_added<| e>(
   read: (Bytes) -> Option<Bytes> / e,
 ) -> { pulls: Pulls, declared: Option<List<HomeNames>> } / {abort.raise | e} =
   if !sees_homes(source.name) { { pulls: pulls, declared: declared } } else {
-    let called = called_names(start(source.src).input);
-    if called.len() == 0 { { pulls: pulls, declared: declared } } else {
-      let d = match declared { Some(d) -> d, None -> homes_declaring(read) };
-      {
-        pulls: { ..pulls, imports: pulls.imports.concat(home_imports(homes_for(called, d))) },
-        declared: Some(d),
-      }
+    let input = start(source.src).input;
+    let called = called_names(input);
+    let d = if called.len() == 0 { declared }
+    else { Some(match declared { Some(d) -> d, None -> homes_declaring(read) }) };
+    let homes = match d { Some(x) -> homes_for(called, x), None -> [] };
+    {
+      pulls: {
+        ..pulls,
+        imports: pulls.imports.concat(
+          home_imports(homes.concat(scheduler_read(source.name, input))),
+        ),
+      },
+      declared: d,
     }
   }
+
+/// Whether a walk for what modules read with no import finds nothing `asked` does not hold: every
+/// home is asked, so `declared` holds none, and the scheduler is asked.
+fn nothing_unasked(declared: List<HomeNames>, asked: List<Bytes>) -> Bool =
+  declared.len() == 0 && asked.contains(scheduler_module())
 
 /// A round of reads at a time, each of what the last round's modules import and nothing read before;
 /// `room` bounds the rounds, as each reads at least one module no earlier round did.
@@ -612,9 +624,9 @@ fn pulling(
           }
         }),
         room - 1,
-        if declared.len() == 0 { asked } else {
+        if nothing_unasked(declared, asked) { asked } else {
           r.wanted.fold(asked, |acc: List<Bytes>, name: Bytes, src: Bytes|
-            acc.concat(homes_called(name, start(src).input, || declared)))
+            acc.concat(read_without_import(name, start(src).input, || declared)))
         },
         declared,
         given,
@@ -864,9 +876,9 @@ pub fn staged_pulling_std_with(
   let sources = user.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src));
   // A home asked already is pulled whatever calls it, so no source is read for a call to it.
   let declared = homes_declaring(|h: Bytes| if asked.contains(h) { None } else { texts.get(h) });
-  let asking = if declared.len() == 0 { asked } else {
+  let asking = if nothing_unasked(declared, asked) { asked } else {
     sources.fold(asked, |acc: List<Bytes>, s: Source|
-      acc.concat(homes_called(s.name, start(s.src).input, || declared)))
+      acc.concat(read_without_import(s.name, start(s.src).input, || declared)))
   };
   let read = range(0, sources.len()).fold(
     { parsed: [], cuts: [] },
@@ -960,8 +972,9 @@ fn shipped_functions(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} =
 
 /// The functions a program reaches of the shipped modules it pulls: those every other definition
 /// and declaration reaches, those the tests and laws outside them do, and the one behind each name
-/// a module outside them imports that names nothing else, since such an import has to resolve. A
-/// reached definition's specifications are read with it, so what they name is reached too. A
+/// a module outside them imports that names nothing else, since such an import has to resolve, and
+/// the scheduler's. A reached definition's specifications are read with it, so what they name is
+/// reached too. A
 /// function is reached as itself: an effect or a type of its name reached or imported without it
 /// leaves it, and what it calls, unread.
 fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
@@ -981,17 +994,25 @@ fn reach_of(h: Hashed) -> Map<Bytes, Bool> / {abort.raise} = {
       }));
   // Every type and effect a shipped module declares is read, reached or not, and so is what its node
   // holds: the functions the module states of a type, and what crossing a container it names calls.
+  // The scheduler's functions are reached wherever it is pulled: what a module writes calls them,
+  // and no reference names them.
   let stated = range(first, h.mods.len()).fold([], |acc: List<Which>, i: Int| {
     let m = h.mods.get(i);
-    m.module.items.fold(acc, |a: List<Which>, item: Item|
-      match item {
+    m.module.items.fold(acc, |a: List<Which>, item: Item| {
+      let read = match item {
         IType(t) -> a.push(TheDecl(qualify(m.name, t.name.name))),
         IEffect(e) -> a.push(TheDecl(qualify(m.name, e.name.name))),
         _ -> match stated_type(item) {
           Some(target) -> a.push(TheDecl(qualify(m.name, target.name))),
           None -> a,
         },
-      })
+      };
+      match item {
+        IFn(d) -> if m.name != scheduler_module() { read }
+        else { read.push(TheFn(qualify(m.name, d.name.name))) },
+        _ -> read,
+      }
+    })
   });
   reached_functions(
     h.hashes,

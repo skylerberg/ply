@@ -74,7 +74,7 @@ fn bound<'b>(
     let resolved = binding.resolve(effect, op, resource);
     // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
     // any handler could give, bound or withheld, would differ between interleavings.
-    if let Some(region) = crate::simulate::seeded_region(c)
+    if let Some(region) = crate::tasks::seeded_region(c)
         && !matches!(resolved, Err(Unserved::Unregistered))
     {
         return Err(err_host_in_simulation(span, &operation, region));

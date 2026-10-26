@@ -140,7 +140,7 @@ impl Ctx {
     fn reaches_host(&mut self, native: &'static str, asking: Asking) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
-        if let Some(region) = crate::simulate::seeded_region(self) {
+        if let Some(region) = crate::tasks::seeded_region(self) {
             self.fail(err_host_in_simulation(span, &operation, region));
             return false;
         }

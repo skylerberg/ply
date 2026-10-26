@@ -1,7 +1,6 @@
 use ply_core::host::MachineId;
 use ply_core::sched::{HostPolicy, Scheduler};
-use ply_core::sched::{Policy, Resumption, Turn};
-use ply_core::sim::TASK_OPS;
+use ply_core::sched::{Resumption, Turn};
 use ply_core::{
     Diagnostic, HostBinding, HostRegistry, HostRequest, HostRuntime, Pending, SimId, Span, Symbol,
     TaskHandle, TaskId, Value, codes,
@@ -265,7 +264,6 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                             return Err(sched.fail(
                                 Diagnostic::error(codes::RUNTIME_ERROR, "the task failed")
                                     .primary(Span::DUMMY, "here"),
-                                &ply_core::Seed::at(0, Vec::new()),
                             ));
                         }
                     }
@@ -338,29 +336,6 @@ fn an_unbound_binding_mints_no_permit() {
         "an unbound binding minted a permit for the production scheduler"
     );
     assert!(HostPolicy::of(&HostBinding::default()).is_none());
-}
-
-#[test]
-fn a_bound_binding_opens_a_production_region() {
-    let sched = production();
-    assert_eq!(sched.policy(), Policy::Host);
-    assert!(!sched.records_steps());
-}
-
-/// A sleep is a wait of one task, so it is the scheduler's; a reading is a handler's.
-#[test]
-fn a_production_region_answers_task_and_the_sleep_and_no_reading() {
-    let sched = production();
-    for op in TASK_OPS {
-        assert!(sched.answers("task", op), "task.{op}");
-    }
-    assert!(sched.answers("clock", "sleep"));
-    for (effect, op) in [("clock", "now"), ("random", "next"), ("random", "below")] {
-        assert!(
-            !sched.answers(effect, op),
-            "a production region claimed to answer {effect}.{op}"
-        );
-    }
 }
 
 /// Through the runtime the host itself builds, on the host's own clock.
@@ -615,10 +590,7 @@ fn a_failed_production_region_answers_with_its_failure_forever() {
     let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
         panic!("expected the root's step");
     };
-    sched.fail(
-        Diagnostic::error(codes::RUNTIME_ERROR, "boom"),
-        &ply_core::Seed::at(0, Vec::new()),
-    );
+    sched.fail(Diagnostic::error(codes::RUNTIME_ERROR, "boom"));
     for _ in 0..4 {
         let err = refused(sched.next_host(&*rt), "the region is over");
         assert_eq!(err.code, codes::RUNTIME_ERROR);

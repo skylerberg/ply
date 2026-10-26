@@ -9,9 +9,6 @@ use crate::host::Served;
 use crate::native::{I64, Native, Out, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use ply_core::builtins::hold_released;
-use ply_core::region::StepSite;
-use ply_core::sched::Shield;
-use ply_core::sim::Access;
 use ply_core::{
     BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span,
     Symbol, Value, codes,

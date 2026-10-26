@@ -1,20 +1,20 @@
-//! `perform`, labels, `handle`, `parallel` and `simulate`. A perform calls the entry of its
-//! operation in the evidence object the body holds for its effect; a `handle` is a block its body
-//! runs in, inline over an instance its evidence objects' clause slots point into or under the
-//! runtime's frame its clauses lay out, or detached on a stack of its own where a clause resumes off
-//! its tail. Effects are named program-wide.
+//! `perform`, labels, `handle` and `parallel`. A perform calls the entry of its operation in the
+//! evidence object the body holds for its effect; a `handle` is a block its body runs in over an
+//! instance its evidence objects' clause slots point into, inline or detached on a stack of its own
+//! where a clause resumes off its tail. Effects are named program-wide.
 
 import compiler.emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo, CodeArm,
                            CodeField, NApp, NVar, NIf, NBlock, NMatch, NUnary, NBinary, NField,
-                           NUpdate, NRecord, NList, NPerform, NParallel, NHandle, slots_read,
-                           all_read, pat_slots)
+                           NUpdate, NRecord, NList, NPerform, NParallel, NHandle, NLambda,
+                           slots_read, all_read, pat_slots)
 import compiler.emit.keys (Evidence)
 import compiler.emit.evidence (evidence_type, instance_block_type, row_described_type)
 import compiler.syntax.parsing (Span)
-import compiler.syntax.exprs (is_exit_effect)
+import compiler.syntax.exprs (is_exit_effect, scheduler_module)
 import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, Row, Resource, RNamed, RSingleton,
                              RAny, RVar, is_diverges, int_type, string_type, fields_sorted, fn_type,
                              row_empty)
+import compiler.check.infer.expr (kept_type, crossing_vars)
 import compiler.emit.typing (unknown_type)
 import compiler.check.resolve.tables (qualify)
 import compiler.expand.rewrite (named_program_wide)
@@ -26,17 +26,18 @@ import compiler.emit.keys (Named, unspecialised)
 import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
                           Enter, Handle, Handling, Uses, AInt, Static, falls_through)
-import compiler.emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached,
-                                   Bridge, Instance, InstanceHeap, InstanceIn, ObjectLaid, Entering,
+import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Reached, Bridge,
+                                   Instance, InstanceHeap, InstanceIn, ObjectLaid, Entering,
                                    ForwardsLaid, ForwardsSet, ObjectAt, Mapped, Slot, Answering,
                                    Forwarding, Forwarded, Keyed, KeyedRow, Entry, Answers, Stops,
                                    Resumes, Raises, HandleInstance, raised_at)
-import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named)
+import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
+                                     own_types)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, refuse, fresh,
                                  bound_as, done, emitted, continued, filed, unfiled, type_of,
                                  handed, static_added)
 import compiler.emit.lower.evidence (words_at, routed, bridged, held_routed, label_resource,
-                                     value_handing, described, label_value)
+                                     value_handing, described, label_value, filed_row)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.lower.data (recorded_as)
 import compiler.emit.lower.resumes (off_tail_code)
@@ -120,6 +121,58 @@ pub fn performed(
         },
       }
     },
+  }
+
+/// The call a perform of `p` with `args`, lowered from `codes`, is written as where a value of the
+/// operation's own type parameters crosses and the toolchain declares its effect (GUIDE §6.1): its
+/// crossing in the toolchain's scheduler, at the types the perform stands its type parameters at
+/// and filling its row variables with what the perform fills the operation's own rows with. None
+/// for any other perform, and for one whose types are already `Kept`.
+pub fn crossing_of(
+  cx: Context,
+  p: { effect: Bytes, op: Bytes, resource: Bytes },
+  codes: List<Code>,
+  args: List<Arg>,
+  at: Span,
+) -> Option<{ name: Bytes, types: List<Type>, rows: List<Row> }> / {abort.raise} =
+  match ((effect_named(cx, p.effect), filed(cx, at))) {
+    (Some(named), Some(t)) -> {
+      let crossing = match prelude_effects().find(|e: EffectInfo| e.name == named.global) {
+        Some(e) -> match e.ops.find(|o: OpInfo| o.name == p.op) {
+          Some(o) -> crossing_vars(o),
+          None -> [],
+        },
+        None -> [],
+      };
+      let en = match effect_of(cx, named.global) { Some(e) -> e, None -> named };
+      let declared = op_declared(en, p.op);
+      let types = own_types(declared, args.map(type_of), t.ty);
+      if crossing.len() == 0 || types.any(|x: Option<Type>| x == None)
+          || crossing.all(|i: Int| types.at(i) == Some(Some(kept_type()))) { None } else {
+        Some({
+          name: Bytes::concat_all([scheduler_module(), b"::crossing_", p.op]),
+          types: types.fold([], |acc: List<Type>, x: Option<Type>|
+            match x { Some(y) -> acc.push(y), None -> acc }),
+          rows: range(0, declared.params.len()).fold([], |acc: List<Row>, i: Int|
+            match declared.params.at(i) {
+              Some(TyFn(f)) -> if f.effects.tail == None { acc } else {
+                acc.push(match codes.at(i) {
+                  Some(c) -> match c.node {
+                    NLambda(l) -> filed_row(cx, l.at),
+                    _ -> match args.at(i) {
+                      Some(a) -> match type_of(a) { TyFn(g) -> g.effects, _ -> row_empty() },
+                      None -> row_empty(),
+                    },
+                  },
+                  None -> row_empty(),
+                })
+              },
+              _ -> acc,
+            }),
+        })
+      }
+    },
+    _ -> None,
   }
 
 /// The field-table entry of resource `name`, as a call's label argument.
@@ -973,34 +1026,6 @@ pub fn branched(
     },
     _ -> refuse(gathered.st, Handling, b"a parallel block's answers bound to no variable"),
   }
-}
-
-/// A `simulate` of the nullary closure `body`, which performs `performs` and answers what the body
-/// answers: the runtime takes the body and the descriptor of its answer's type, which it keeps the
-/// answer by, and hands the body the words of that row, the frame bridge's for what the region
-/// answers.
-pub fn simulated(
-  cx: Context,
-  st: Lowering,
-  body: Arg,
-  performs: Row,
-  at: Span,
-) -> Lowered / {abort.raise} = {
-  let w = handed({ st: st, arg: body }, RWord, at);
-  let ty = answer_of(type_of(body));
-  let described = type_described(cx, w.st, ty, at);
-  let handing = value_handing(cx, described.st, performs, at);
-  let entered = done(
-    handing.st,
-    Op({ op: OHandle(Entering), args: handing.args, uses: reading(2) }),
-    at,
-  );
-  let op = Op({
-    op: OHandle(Simulate),
-    args: [w.arg, described.arg],
-    uses: { takes: [true, false], owned: true, fails: true, stops: true },
-  });
-  handed(bound_as(entered, ty, RWord, op, at), held_as(cx.setting, ty), at)
 }
 
 /// A `handle`'s clauses laid out so far: the state, the handle's operands and whether it takes each,

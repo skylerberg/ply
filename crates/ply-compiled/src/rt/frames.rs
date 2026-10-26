@@ -55,8 +55,6 @@ pub struct HandlerFrame {
     pub(super) clauses: Vec<FrameClause>,
     /// The `return` clause's closure, or zero.
     pub(super) ret: Word,
-    /// A `simulate` region's clause-less frame, answering `task`, `clock`, `random` and `sim`.
-    pub(super) simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     pub(super) detached: Option<usize>,
     /// The calls its stack had left when this frame went on, which its `handle` lands with: a
@@ -139,19 +137,6 @@ impl HandlerFrame {
         self.clauses.swap_remove(at)
     }
 
-    pub(super) fn simulate(fuel: i64) -> HandlerFrame {
-        HandlerFrame {
-            clauses: Vec::new(),
-            ret: 0,
-            simulate: true,
-            detached: None,
-            fuel,
-            handler: 0,
-            vars: None,
-            inherited: false,
-        }
-    }
-
     /// The bottom of a detached body's own stack, which starts with the calls its opener had left.
     pub(crate) fn detached(
         clauses: Vec<FrameClause>,
@@ -162,7 +147,6 @@ impl HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
-            simulate: false,
             detached: Some(id),
             fuel,
             handler,
@@ -492,16 +476,14 @@ impl HandlerFrame {
     /// cannot answer it from another thread. Where `crossing` is false nothing of the frame can:
     /// a frame below it does not cross.
     pub(super) fn within(&self, reach: &[Reached], crossing: bool) -> bool {
-        self.simulate
-            || self.clauses.iter().any(|cl| {
-                !(crossing && self.crosses(cl))
-                    && reach.iter().any(|reached| cl.may_answer(reached))
-            })
+        self.clauses.iter().any(|cl| {
+            !(crossing && self.crosses(cl)) && reach.iter().any(|reached| cl.may_answer(reached))
+        })
     }
 
     /// Whether every clause of this frame can answer from another thread.
     pub(super) fn crosses_whole(&self) -> bool {
-        !self.simulate && self.clauses.iter().all(|cl| self.crosses(cl))
+        self.clauses.iter().all(|cl| self.crosses(cl))
     }
 
     /// Whether `cl` can answer a perform of a branch running on another thread, in a copy of this
@@ -512,7 +494,6 @@ impl HandlerFrame {
     pub(super) fn crosses(&self, cl: &FrameClause) -> bool {
         self.vars.is_none()
             && self.detached.is_none()
-            && !self.simulate
             && cl.resumes == 0
             && !cl.raises()
             && immortal(cl.closure)
@@ -536,7 +517,6 @@ impl HandlerFrame {
         (!clauses.is_empty()).then_some(HandlerFrame {
             clauses,
             ret: 0,
-            simulate: false,
             detached: None,
             fuel: self.fuel,
             handler: self.handler,
@@ -575,7 +555,6 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
             })
             .collect(),
         ret: f.ret,
-        simulate: f.simulate,
         detached: f.detached,
         fuel: f.fuel,
         handler: f.handler,
