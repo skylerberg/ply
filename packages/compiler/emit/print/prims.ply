@@ -8,12 +8,12 @@ import compiler.syntax.patterns (Lit, LUnit, LStr)
 import compiler.check.types (TyCon)
 import compiler.syntax.parsing (span_between)
 import compiler.emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
-                        width_min, width_max, binary_code, overflow_code)
+                        width_min, width_max, overflow_code)
 import compiler.emit.pieces (spelled)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RImm, Var, Arg,
                           AVar, AInt, ANum, Scalars, rep_of_arg, arithmetic, comparison, shift)
 import compiler.emit.print.text (Printing, Place, printing, line, temp, named, arg_text, assigned,
-                                 site, check, unprinted)
+                                 site, unprinted)
 import compiler.emit.print.made (c_type)
 import compiler.emit.layout (sum_laid, record_laid)
 import compiler.emit.print.strings (bytes_of, text_field)
@@ -370,8 +370,9 @@ fn float_printed(
     )
   } else { unwritten(p, pr, op) }
 
-/// A `Decimal`'s operator by the runtime over each operand's two words, which allocates nothing:
-/// arithmetic writes its answer into the local it names, and an order is the sign of a comparison.
+/// A `Decimal`'s operator over each operand's two words, in place by the head's `print.decimal`
+/// helpers, which allocate nothing: an answer past what a `Decimal` holds exactly fails the run, and
+/// a remainder by zero raises.
 fn dec_printed(
   p: Place,
   pr: Printing,
@@ -379,8 +380,7 @@ fn dec_printed(
   op: Bytes,
   a: Bytes,
   b: Bytes,
-) -> Printing / {abort.raise} = {
-  let words = Bytes::concat_all([a, b".lo, ", a, b".hi, ", b, b".lo, ", b, b".hi"]);
+) -> Printing / {abort.raise} =
   if op == b"lo" || op == b"hi" {
     bound(p, pr, v, Bytes::concat_all([b"(int64_t)(", a, b").", op]))
   } else if op == b"scale" {
@@ -390,49 +390,47 @@ fn dec_printed(
       p,
       pr,
       v,
-      Bytes::concat_all([b"(rt_decimal_compare_p(ctx, ", words, b") ", compare_c(op), b" 0)"]),
+      Bytes::concat_all([b"(ply_dec_order(", a, b", ", b, b") ", compare_c(op), b" 0)"]),
     )
   } else if op == b"order" {
-    bound(p, pr, v, Bytes::concat_all([b"rt_decimal_compare_p(ctx, ", words, b")"]))
-  } else if arithmetic(op) {
+    bound(p, pr, v, Bytes::concat_all([b"ply_dec_order(", a, b", ", b, b")"]))
+  } else if op == b"add" || op == b"sub" || op == b"mul" {
     let n = named(site(p, pr), v);
-    check(
-      p,
-      line(
-        n.pr,
-        p.depth,
-        Bytes::concat_all([
-          b"PlyDec ",
-          n.name,
-          b"; rt_decimal_binary_p(ctx, ",
-          ascii_of_int(binary_code(op)),
-          b", ",
-          words,
-          b", (Word)(intptr_t)&",
-          n.name,
-          b");",
-        ]),
-      ),
-    )
-  } else if op == b"neg" {
-    let n = named(pr, v);
+    let call = if op == b"mul" { Bytes::concat_all([b"ply_dec_mul(", a, b", ", b]) } else {
+      Bytes::concat_all([b"ply_dec_add(", a, b", ", b, if op == b"sub" { b", 1" } else { b", 0" }])
+    };
     line(
-      n.pr,
+      line(n.pr, p.depth, Bytes::concat_all([b"PlyDec ", n.name, b";"])),
       p.depth,
       Bytes::concat_all([
-        b"PlyDec ",
+        b"if (",
+        call,
+        b", &",
         n.name,
-        b"; rt_decimal_negate_p(ctx, ",
-        a,
-        b".lo, ",
-        a,
-        b".hi, (Word)(intptr_t)&",
-        n.name,
-        b");",
+        b")) { rt_decimal_overflow_p(ctx, ",
+        ascii_of_int(overflow_code(op)),
+        b"); ",
+        p.leave,
+        b" }",
       ]),
     )
-  } else { unwritten(p, pr, op) }
-}
+  } else if op == b"rem" {
+    let zero = line(
+      site(p, pr),
+      p.depth,
+      Bytes::concat_all([
+        b"if (((uint64_t)(",
+        b,
+        b").lo >> 32) == 0 && (",
+        b,
+        b").hi == 0) { rt_by_zero_p(ctx, 1); ",
+        p.leave,
+        b" }",
+      ]),
+    );
+    bound(p, zero, v, Bytes::concat_all([b"ply_dec_rem(", a, b", ", b, b")"]))
+  } else if op == b"neg" { bound(p, pr, v, Bytes::concat_all([b"ply_dec_negated(", a, b")"])) }
+  else { unwritten(p, pr, op) }
 
 /// An operator over a 128-bit width held as its two words: compared, ordered, masked and read
 /// here, and the rest by the head's helpers (`wide_called`).

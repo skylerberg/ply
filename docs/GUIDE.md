@@ -390,9 +390,10 @@ Loosest to tightest; all binary operators are left-associative:
 * Arithmetic is checked. A `/` or `%` whose divisor is zero raises (§6.8), so
   either puts `abort.raise` in the row unless its operands are `Float`s, its
   divisor is a literal other than zero, or the conditions on the way to it show
-  an `Int` divisor is not zero. Overflow and a shift count that is
-  negative or not less than the type's width are the machine's limit, as the
-  call ceiling is: they end the run (`E0502`) and are in no row. `<<` discards
+  an `Int` divisor is not zero. Overflow, a `Decimal` answer no `Decimal` holds
+  exactly, and a shift count that is negative or not less than the type's
+  width are the machine's limit, as the call ceiling is: they end the run
+  (`E0502`) and are in no row. `<<` discards
   shifted-out bits and `checked_*` answer `None` (§12).
 * `+%`, `-%` and `*%` wrap at the operand type's width, and `+|`, `-|` and `*|`
   saturate at it: `255u8 +% 1u8` is `0u8`, `250u8 +| 10u8` is `255u8` and
@@ -774,7 +775,7 @@ signatures are checked, not inferred (§4.7).
 | `Int` | 64-bit signed; the type to count and index with |
 | `U8` `U16` `U32` `U64` `U128` `I8` `I16` `I32` `I64` `I128` | fixed widths, for data defined in a width and for exact answers past `Int` |
 | `Float` | IEEE-754 binary64 |
-| `Decimal` | exact base 10; `+ - * %` are exact or raise |
+| `Decimal` | exact base 10; `+ - * %` are exact, or end the run as overflow does |
 | `Bool`, `Unit` | `true`/`false`, `()` |
 | `Char` | one Unicode scalar value: `U+0000` to `U+10FFFF` without the surrogates |
 | `String` | UTF-8, indexed and sliced by character |

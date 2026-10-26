@@ -198,7 +198,8 @@ fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diag
     }))
 }
 
-/// Exact, or a diagnostic; never a silent wrap or rounding. Inference already refuses `/`.
+/// rust_decimal's checked operations, which round a sum past 96 bits and a product past scale 28
+/// where compiled code's (`emit/print/decimal.ply`) fail. Inference already refuses `/`.
 fn decimal_arithmetic(
     op: BinOp,
     a: Decimal,

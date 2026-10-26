@@ -199,6 +199,21 @@ pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, sig
     }
 }
 
+/// A `Decimal` operator's answer past what a `Decimal` holds exactly; `what` is `emit/c.ply`'s
+/// `overflow_code`.
+pub unsafe extern "C" fn rt_decimal_overflow(ctx: *mut Ctx, what: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let name = match what {
+        0 => "addition",
+        1 => "subtraction",
+        3 => "multiplication",
+        _ => "remainder",
+    };
+    let d = error(format!("`Decimal` overflow in {name}"))
+        .note("`Decimal` is exact and bounded; it will not round to make room");
+    ctx.fail(d);
+}
+
 /// `what` is `emit/c.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
