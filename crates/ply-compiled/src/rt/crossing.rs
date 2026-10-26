@@ -98,7 +98,7 @@ pub enum Lifted {
 impl Lifted {
     fn release(self, ctx: *mut Ctx) {
         match self {
-            Lifted::Runtime(w) => heap::release_handle(w),
+            Lifted::Runtime(w) => heap::release_object(ctx, w),
             Lifted::Carried(v) => v.release(ctx),
         }
     }
@@ -338,7 +338,7 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
 /// A runtime object, its value read as it is written.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
-    match runtime_value(h.word()) {
+    match runtime_value(ctx, h.word()) {
         Ok(v) => c.write(|l| l.beside(Beside::Runtime(v))),
         Err(why) => {
             c.fail(err_crossing(&why));
@@ -662,13 +662,16 @@ impl Ctx {
     }
 }
 
-/// What a value of a runtime object reads as: a bridge's value, or a hold, whose held value is laid
-/// out by a type the crossing does not carry, so it reads as holding none. Nothing else the runtime
-/// lays out is read here.
-pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
+/// What a value of a runtime object reads as: a bridge's value, a native object's, or a hold,
+/// whose held value is laid out by a type the crossing does not carry, so it reads as holding none.
+/// Nothing else the runtime lays out is read here.
+pub(crate) fn runtime_value(ctx: *mut Ctx, w: Word) -> Result<Value, String> {
     if let Some(id) = hold_id(w) {
         let kind = ClosureKind::Hold { held: None, id };
         return Ok(Value::Closure(Arc::new(Closure { name: None, kind })));
+    }
+    if heap::is_native(w) {
+        return unsafe { heap::native_value(ctx, w) };
     }
     if !heap::is_bridge(w) {
         return Err("a block that is no runtime handle crossed as one".to_string());

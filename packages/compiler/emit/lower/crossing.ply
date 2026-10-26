@@ -14,8 +14,8 @@ import compiler.syntax.type_syntax (MRaise)
 import compiler.syntax.exprs (is_exit_effect, exit_op)
 import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type,
                              int_type, unit_type, bytes_type, list_type, string_type, spelled_type)
-import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
-import compiler.emit.typing (unknown_type)
+import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, RowArguments)
+import compiler.emit.typing (unknown_type, rows_filed_at)
 import compiler.emit.c (Width, width_named, width_index)
 import compiler.emit.roots (builtin_helper)
 import compiler.emit.keys
@@ -41,7 +41,9 @@ import compiler.emit.marks (marks_of, marked_key, carried_by, marked_type, funct
 import compiler.emit.answer (Exact)
 import compiler.emit.lower.data (field, recorded_as)
 import compiler.check.infer.definitions (MachineCall, MachineInt, MachineFloat, MachineText,
-                                         MachineSecret, MachineUnit)
+                                         MachineSecret, MachineObject, MachineHanded,
+                                         MachineFunction, MachineUnit)
+import compiler.emit.lower.evidence (value_handing)
 
 /// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
 /// runtime decodes, answers as it always has, and encodes the answer of.
@@ -801,39 +803,47 @@ pub fn concatenated(cx: Context, st: Lowering, a: Arg, b: Arg, ty: Type, at: Spa
 }
 
 /// Native `name` of a shipped module, which `call` says crosses over machine words, called on
-/// `args`: each argument handed as its raw bits, a `Float`'s bits, a string's or byte string's
-/// address and count, or a secret's handle, borrowed for the call; and the answer read back from
-/// the word the native answers, copied out of the bytes it left taken, or held as the secret whose
-/// handle it answered. A native that asks the machine refuses where a run may not, so the run is
-/// checked after every call.
+/// `args`, answering `answer` where the checker filed what the call answers, its name written at
+/// `callee`: each argument handed as its raw bits, a `Float`'s bits, a string's or byte string's
+/// address and count, a secret's or a runtime object's handle, or a function value's block beside
+/// its row's descriptor and words, borrowed for the call, or a value of a type variable handed over
+/// beside its type's descriptor; and the answer read back from the word the native answers, copied
+/// out of the bytes it left taken, or held as the handle or the value it answered. A native that
+/// asks the machine refuses where a run may not, so the run is checked after every call.
 pub fn over_machine_words(
   cx: Context,
   st: Lowering,
   name: Bytes,
   call: MachineCall,
   args: List<Arg>,
+  answer: Option<Type>,
+  callee: Span,
   at: Span,
 ) -> Lowered / {abort.raise} =
   if args.len() != call.params.len() {
     refuse(st, Handling, b"a native over machine words called with other arguments: ".concat(name))
   } else {
+    let lent = |acc: { st: Lowering, args: List<Arg>, takes: List<Bool> }, a: Arg| {
+      let h = handed({ st: acc.st, arg: a }, RWord, at);
+      { st: h.st, args: acc.args.push(h.arg), takes: acc.takes.push(false) }
+    };
     let given = range(0, args.len()).fold(
-      { st: st, args: [] },
-      |acc: { st: Lowering, args: List<Arg> }, i: Int|
+      { st: st, args: [], takes: [] },
+      |acc: { st: Lowering, args: List<Arg>, takes: List<Bool> }, i: Int|
         match call.params.get(i) {
           MachineInt(t) -> match match t {
               TyCon(c) -> scalar_words(cx, acc.st, args.get(i), c.name, at),
               _ -> None,
             } {
-            Some(w) -> { st: w.st, args: acc.args.push(w.lo) },
+            Some(w) -> { st: w.st, args: acc.args.push(w.lo), takes: acc.takes.push(false) },
             None ->
               {
+                ..acc,
                 st: refuse(
                   acc.st,
                   Handling,
                   b"an integer over machine words of no integer's type",
                 ).st,
-                args: acc.args,
               },
           },
           MachineFloat -> {
@@ -845,37 +855,76 @@ pub fn over_machine_words(
               Prim({ op: b"bits", on: RFloat, args: [f.arg] }),
               at,
             );
-            { st: b.st, args: acc.args.push(b.arg) }
+            { st: b.st, args: acc.args.push(b.arg), takes: acc.takes.push(false) }
           },
           MachineText(_) -> {
             let a = addressed(acc.st, args.get(i), at);
-            { st: a.st, args: acc.args.push(a.address).push(a.count) }
+            {
+              st: a.st,
+              args: acc.args.push(a.address).push(a.count),
+              takes: acc.takes.push(false).push(false),
+            }
           },
-          MachineSecret(_) -> {
+          MachineSecret(_) -> lent(acc, args.get(i)),
+          MachineObject(_) -> lent(acc, args.get(i)),
+          MachineHanded(_) -> {
             let h = handed({ st: acc.st, arg: args.get(i) }, RWord, at);
-            { st: h.st, args: acc.args.push(h.arg) }
+            let d = type_described(cx, h.st, type_of(args.get(i)), at);
+            {
+              st: d.st,
+              args: acc.args.push(h.arg).push(d.arg),
+              takes: acc.takes.push(true).push(false),
+            }
+          },
+          MachineFunction(k) -> {
+            let f = lent(acc, args.get(i));
+            match match rows_filed_at(cx.filed, callee.site) {
+                Some(RowArguments(rows)) -> rows.at(k),
+                _ -> None,
+              } {
+              None ->
+                {
+                  ..f,
+                  st: refuse(f.st, Handling, b"a function value a native takes at no row").st,
+                },
+              Some(r) -> {
+                let e = value_handing(cx, f.st, r, at);
+                { st: e.st, args: f.args.concat(e.args), takes: f.takes.push(false).push(false) }
+              },
+            }
           },
           MachineUnit -> acc,
         },
     );
+    let made = { name: name, args: given.args, takes: given.takes };
+    let answered_as = |declared: Type| match answer { Some(t) -> t, None -> declared };
     match call.answer {
-      MachineUnit -> unit_after(native_done(given.st, name, given.args, true, at)),
+      MachineUnit -> {
+        let n = native_made(made);
+        unit_after(done(given.st, Native({ ..n, uses: { ..n.uses, owned: false } }), at))
+      },
       MachineText(t) -> {
-        let n = native_int(given.st, name, given.args, true, at);
+        let n = native_word(given.st, made, at);
         taken_out(n.st, n.arg, t, at)
       },
-      MachineSecret(t) -> {
-        let made = bound_as(
-          given.st,
-          t,
-          RWord,
-          Native({ name: native_of(name), args: given.args, uses: answering(given.args, true) }),
-          at,
-        );
-        handed(made, held_as(cx.setting, t), at)
+      MachineSecret(t) -> object_answered(cx, given.st, made, answered_as(t), at),
+      MachineObject(t) -> object_answered(cx, given.st, made, answered_as(t), at),
+      MachineHanded(_) -> match answer {
+        None -> refuse(given.st, Handling, b"a native's value of a type variable at no type filed"),
+        Some(t) -> {
+          let d = type_described(cx, given.st, t, at);
+          object_answered(
+            cx,
+            d.st,
+            { ..made, args: made.args.push(d.arg), takes: made.takes.push(false) },
+            t,
+            at,
+          )
+        },
       },
+      MachineFunction(_) -> refuse(given.st, Handling, b"a native answering a function value"),
       MachineFloat -> {
-        let b = native_int(given.st, name, given.args, true, at);
+        let b = native_word(given.st, made, at);
         bound_as(
           b.st,
           named_type(b"Float"),
@@ -884,12 +933,33 @@ pub fn over_machine_words(
           at,
         )
       },
-      MachineInt(t) -> {
-        let w = native_int(given.st, name, given.args, true, at);
-        integer_answered(w, t, at)
-      },
+      MachineInt(t) -> integer_answered(native_word(given.st, made, at), t, at),
     }
   }
+
+/// A call of a native over machine words: its name, the words it passes, and which of them it takes.
+type NativeMade = { name: Bytes, args: List<Arg>, takes: List<Bool> }
+
+fn native_made(m: NativeMade) -> { name: Bytes, args: List<Arg>, uses: Uses } / {abort.raise} =
+  {
+    name: native_of(m.name),
+    args: m.args,
+    uses: { takes: m.takes, owned: true, fails: true, stops: false },
+  }
+
+/// What the call `m` answers, a raw word.
+fn native_word(st: Lowering, m: NativeMade, at: Span) -> Lowered / {abort.raise} =
+  bound_as(st, int_type(), RInt, Native(native_made(m)), at)
+
+/// What the call `m` answers, a word the caller holds as a value of `t`.
+fn object_answered(
+  cx: Context,
+  st: Lowering,
+  m: NativeMade,
+  t: Type,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  handed(bound_as(st, t, RWord, Native(native_made(m)), at), held_as(cx.setting, t), at)
 
 /// The word `w` a native answered read as a value of the integer type `t`: an `Int` as it is, a
 /// `Bool` as whether it is other than 0, a `Char` as the scalar value it is, and a width narrowed.

@@ -58,10 +58,10 @@ impl Block {
     /// Gives back a runtime handle whose last holder was the caller.
     ///
     /// # Safety
-    /// The block is a live handle the runtime made, a bridge or a hold; `ctx` is the running
-    /// entry's.
+    /// The block is a live handle the runtime made, a bridge, a native object or a hold; `ctx` is
+    /// the running entry's.
     pub unsafe fn free_handle(self, ctx: *mut Ctx) {
-        unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap) }
+        unsafe { heap::free_handle(self.obj(), &raw mut (*ctx).heap, ctx) }
     }
 
     /// One holder more, counted as emitted code's `ply_dup` counts one: an immortal block and one in
@@ -146,7 +146,7 @@ impl Handed {
 }
 
 /// A runtime object compiled code holds, which the runtime lays out and so may read: a bridge (a
-/// task, a channel or a credential) or a hold.
+/// task, a channel or a credential), what a native made, or a hold.
 #[repr(transparent)]
 pub struct Handle(Word);
 

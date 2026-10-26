@@ -12,7 +12,7 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               schema_of, SRequires, SEnsures, SCost, SSpace, SpecClause, Derived,
                               parse, test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
                               NInvariant, NHost, INumeric, member_name, member_of, numeric_ops,
-                              numeric_by, is_pub, TDAlias)
+                              numeric_by, is_pub, TDAlias, TDExtern)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -363,17 +363,37 @@ pub type MachineValue =
   /// A `Secret` of the type it is, as its handle: lent where a native takes one, so no byte of it
   /// crosses but to the native, and owned by the caller where a native answers one.
   | MachineSecret(Type)
+  /// A runtime object of the type it is, a `Task`, a `Chan` or an extern type of the native's own
+  /// module, as its handle: lent where a native takes one, owned by the caller where a native
+  /// answers one.
+  | MachineObject(Type)
+  /// A value of the native's type variable, by its place among them, as its word and its type's
+  /// descriptor: handed over where a native takes one, and handed back where a native answers one,
+  /// the descriptor of the type the call answers then passed after the parameters.
+  | MachineHanded(Int)
+  /// A function value whose row is the native's row variable at this place among them: its block,
+  /// lent, then the descriptor of the row the call fills the variable with and the words the
+  /// caller holds for it, which the native copies where it keeps the value.
+  | MachineFunction(Int)
   /// No word: what a native that answers `()` answers.
   | MachineUnit
 
 /// How a call of a native over machine words crosses: each parameter, then the answer.
 pub type MachineCall = { params: List<MachineValue>, answer: MachineValue }
 
-/// How a value of `t` crosses to a native over machine words; `None` for a type that crosses only
-/// over its encoding.
-pub fn machine_value(t: Type) -> Option<MachineValue> =
+/// How a value of `t` crosses to a native over machine words, `scheme` the native's and `objects`
+/// the extern types its module declares; `None` for a type that crosses only over its encoding.
+pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<MachineValue> =
   match t {
+    TyVar(v) -> place_of(scheme.ty_vars, v).map(MachineHanded),
+    TyFn(f) -> match f.effects.tail {
+      Some(r) -> if f.effects.atoms.len() > 0 { None }
+      else { place_of(scheme.row_vars, r).map(MachineFunction) },
+      None -> None,
+    },
     TyCon(c) -> if c.name == b"Secret" && c.args.len() == 1 { Some(MachineSecret(t)) }
+    else if ((c.name == b"Task" || c.name == b"Chan") && c.args.len() == 1)
+        || objects.contains(c.name) { Some(MachineObject(t)) }
     else if c.args.len() > 0 { None }
     else if c.name == b"Int" || c.name == b"Bool" || c.name == b"Char" { Some(MachineInt(t)) }
     else if c.name == b"Float" { Some(MachineFloat) }
@@ -387,20 +407,23 @@ pub fn machine_value(t: Type) -> Option<MachineValue> =
     _ -> None,
   }
 
-/// How a call of the native the shipped module `module` declares as `b` crosses over machine words:
-/// one of a module other than `std.prelude`, not generic, constrained by nothing, that cannot raise,
-/// each of whose parameters is a machine type other than `()` and whose answer is one. Its row is
-/// not read: a native that asks the machine names what it reads there, and nothing of it crosses.
-/// `None` for any other native, which a call reaches over its arguments' encoding.
-pub fn machine_call(module: Bytes, b: Builtin) -> Option<MachineCall> =
-  if module == prelude_module() || b.scheme.ty_vars.len() > 0 || b.scheme.label_vars.len() > 0
-      || b.constraints.len() > 0
+/// How a call of the native the shipped module `module` declares as `b` crosses over machine words,
+/// `objects` the extern types the module declares: one of a module other than `std.prelude`,
+/// generic over no label, constrained by nothing, that cannot raise, each of whose parameters is a
+/// machine type other than `()` and whose answer is one, a type variable among them only whole, or
+/// as what a task or a channel carries. Its row is not read: a native that asks the machine names
+/// what it reads there, and nothing of it crosses. `None` for any other native, which a call
+/// reaches over its arguments' encoding.
+pub fn machine_call(module: Bytes, b: Builtin, objects: List<Bytes>) -> Option<MachineCall> =
+  if module == prelude_module() || b.scheme.label_vars.len() > 0 || b.constraints.len() > 0
       || b.contract.raises { None } else {
     match b.scheme.ty {
       TyFn(f) -> {
-        let params = f.params.map(machine_value);
-        match machine_value(f.ret) {
+        let crossing = |t: Type| machine_value(t, b.scheme, objects);
+        let params = f.params.map(crossing);
+        match if f.params.push(f.ret).any(laid_over_var) { None } else { crossing(f.ret) } {
           None -> None,
+          Some(MachineFunction(_)) -> None,
           Some(answer) -> if params.any(|p: Option<MachineValue>|
               p == None || p == Some(MachineUnit)) { None } else {
             Some({
@@ -416,12 +439,51 @@ pub fn machine_call(module: Bytes, b: Builtin) -> Option<MachineCall> =
   }
 
 /// The words a call of `c` passes: one for each parameter, but two for bytes, their address and
-/// their count.
+/// their count, two for a value of a type variable, its word and its type's descriptor, and three
+/// for a function value; then the descriptor of a type variable's value the native answers.
 pub fn machine_words(c: MachineCall) -> Int =
-  c.params.fold(0, |n: Int, v: MachineValue| match v { MachineText(_) -> n + 2, _ -> n + 1 })
+  c.params.fold(match c.answer { MachineHanded(_) -> 1, _ -> 0 }, |n: Int, v: MachineValue|
+    match v {
+      MachineText(_) -> n + 2,
+      MachineHanded(_) -> n + 2,
+      MachineFunction(_) -> n + 3,
+      _ -> n + 1,
+    })
 
-fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern = {
-  let call = machine_call(module, b);
+/// Whether a native's parameter or answer of type `t` holds a type variable where the type the
+/// variable stands for lays it out: anywhere but whole, in a function's type, or as what a task or
+/// a channel carries.
+fn laid_over_var(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> false,
+    TyFn(_) -> false,
+    TyCon(c) -> !(c.name == b"Task" || c.name == b"Chan") && c.args.any(names_var),
+    _ -> names_var(t),
+  }
+
+fn place_of(xs: List<Int>, x: Int) -> Option<Int> =
+  range(0, xs.len()).find(|i: Int| xs.at(i) == Some(x))
+
+/// Whether a type variable stands anywhere in `t`.
+fn names_var(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> true,
+    TyCon(c) -> c.args.any(names_var),
+    TyFn(f) -> f.params.any(names_var) || names_var(f.ret),
+    TyRecord(fs) -> fs.any(|f: Field| names_var(f.ty)),
+    TyNominal(x) -> x.fields.any(|f: Field| names_var(f.ty)),
+  }
+
+/// The extern types `module` declares, by their program-wide names.
+fn extern_types(name: Bytes, module: Module) -> List<Bytes> =
+  module.items.fold([], |acc: List<Bytes>, item: Item|
+    match item {
+      IType(t) -> match t.body { TDExtern -> acc.push(qualify(name, t.name.name)), _ -> acc },
+      _ -> acc,
+    })
+
+fn extern_of(module: Bytes, name: Bytes, b: Builtin, objects: List<Bytes>) -> Extern = {
+  let call = machine_call(module, b, objects);
   {
     module: module,
     name: name,
@@ -436,7 +498,8 @@ fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern = {
 
 /// Each `extern fn` the prelude declares, in its order: a function it writes in Ply is none.
 pub fn prelude_externs() -> List<Extern> / {abort.raise} =
-  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| extern_of(prelude_module(), b.name, b))
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin|
+    extern_of(prelude_module(), b.name, b, []))
 
 /// Each `extern fn` a native implements that the module `name` declares in `text`, as the checker
 /// binds it, which only a module the toolchain ships does; a text without the word declares none
@@ -445,9 +508,11 @@ pub fn externs_in(name: Bytes, text: Bytes) -> List<Extern> / {abort.raise} =
   if text.index_of(b"extern") == None { [] } else { module_externs(name, parse(text).node) }
 
 /// `externs_in` of module `name` parsed as `module`.
-pub fn module_externs(name: Bytes, module: Module) -> List<Extern> / {abort.raise} =
+pub fn module_externs(name: Bytes, module: Module) -> List<Extern> / {abort.raise} = {
+  let objects = extern_types(name, module);
   natives_of(name, module).map(|e: { own: Bytes, builtin: Builtin }|
-    extern_of(name, e.own, e.builtin))
+    extern_of(name, e.own, e.builtin, objects))
+}
 
 /// The natives the compiler declares itself: each `extern fn` of the prelude, then each native the
 /// elaboration writes calls of.
@@ -4410,11 +4475,30 @@ test "a shipped module's extern over machine types is called over machine words,
       }),
     },
   ]);
-  // A width past 64 bits, a list, a generic, a raise or a `()` taken is crossed over its encoding.
+  // A value of a type variable crosses as its word and its type's descriptor, the descriptor of
+  // what a native answers passed last; a runtime object as its handle; a function value as its
+  // block, its row's descriptor and its words.
+  let kept = TyCon({ name: b"std.native.Kept", args: [] });
+  assert_eq(
+    call(b"extern type Kept\nextern fn keep<a>(x: a) -> Kept\nextern fn open<a>(k: Kept) -> a\n"),
+    [
+      { words: 2, call: Some({ params: [MachineHanded(0)], answer: MachineObject(kept) }) },
+      { words: 2, call: Some({ params: [MachineObject(kept)], answer: MachineHanded(0) }) },
+    ],
+  );
+  let task = TyCon({ name: b"Task", args: [TyVar(0)] });
+  assert_eq(call(b"extern fn started<a | e>(t: Task<a>, body: () -> Unit / e) -> Int\n"), [
+    {
+      words: 4,
+      call: Some({ params: [MachineObject(task), MachineFunction(0)], answer: MachineInt(int) }),
+    },
+  ]);
+  // A width past 64 bits, a list, a variable a list lays out, a raise or a `()` taken is crossed
+  // over its encoding.
   [
     b"extern fn wide(x: U128) -> Int\n",
     b"extern fn listed(xs: List<Int>) -> Int\n",
-    b"extern fn any<a>(x: a) -> Int\n",
+    b"extern fn any<a>(xs: List<a>) -> Int\n",
     b"extern fn raised(x: Int) -> Int / {abort.raise}\n",
     b"extern fn nothing(u: Unit) -> Int\n",
   ].fold((), |_: Unit, src: Bytes|

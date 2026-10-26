@@ -53,6 +53,11 @@ pub struct Ctx {
     /// nothing answers ([`UNSERVED`]).
     pub hosted: Word,
     pub unserved: Word,
+    /// Where the perform a clause answers stood, as the site fields hold one, which compiled code
+    /// stores as it enters the clause: what a region's request is placed at.
+    pub performed_root: i64,
+    pub performed_start: i64,
+    pub performed_end: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -238,6 +243,9 @@ impl Ctx {
             bridge: object_word(&BRIDGE),
             hosted: object_word(&HOSTED),
             unserved: object_word(&UNSERVED),
+            performed_root: -1,
+            performed_start: 0,
+            performed_end: 0,
             step_budget: 0,
             grown: 0,
             deadline: None,

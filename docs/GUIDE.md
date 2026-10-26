@@ -1813,7 +1813,13 @@ An operation's type parameters sit just before its parameters,
 signature resolves names as a `fn` signature does, so a lowercase name its list
 does not declare, or a type name not in scope, is `E0102`. Each perform picks
 its own `a`, so a clause for the operation has to answer every type (`E0201`).
-An operation writes no `where`. Where its types name a `Map`, or a type that
+An operation of an effect the toolchain declares (`task`'s, §9) crosses
+erased instead, where a value of its type parameters crosses: its clause sees
+`Kept`, the value kept beside its type, which only the toolchain's own modules
+read; a function the perform hands that answers one is wrapped where it is
+performed, and an answer that holds one is opened there. So only a module the
+toolchain ships writes a clause for one (`E0165`). An operation writes no
+`where`. Where its types name a `Map`, or a type that
 carries an order (§4.2), whose ordering reads one of its type parameters, each
 perform is held to the order of what it picks for that parameter (`E0206`), and
 each clause for the operation assumes it; the rest of such a key is judged where
@@ -3325,15 +3331,20 @@ A shipped module's `extern fn` reads an alias of its module's as the type it
 names, and its row names a mode only of an effect it declares or imports that
 declares no operation (`native.read`), so no handler of an effect seems to
 answer a native that asks the machine.
-An `extern fn` of a shipped module other than `std.prelude` that is not generic,
-states no `where`, cannot raise, and takes and answers only machine types is
-called over machine words, never over its arguments' encoding: an `Int`, a
-`Bool` (0 or 1), a `Char` (its scalar value) and a width of at most 64 bits pass
-as their raw 64 bits, a `Float` as its bits, a `String` or `Bytes` is lent as
-its bytes' address and count, and a `Secret` as its handle, so no byte of it
-crosses but to the native; such a native answers one of those, bytes it leaves
-for the caller to copy out, a secret's handle the caller then holds, or nothing
-for `()`. Its row is not read, and nothing in it crosses.
+An `extern fn` of a shipped module other than `std.prelude` that is generic over
+no label, states no `where`, cannot raise, and takes and answers only machine
+types is called over machine words, never over its arguments' encoding: an
+`Int`, a `Bool` (0 or 1), a `Char` (its scalar value) and a width of at most 64
+bits pass as their raw 64 bits, a `Float` as its bits, a `String` or `Bytes` is
+lent as its bytes' address and count, a `Secret`, a `Task`, a `Chan` or an
+`extern type` of its module as its handle, so no byte of a secret crosses but to
+the native, a value of one of its type variables as its word, handed over, and
+its type's descriptor, and a function whose row is one of its row variables as
+its block, lent, and the descriptor and words of the row the call fills the
+variable with. A type variable stands only whole, or as what a task or a channel
+carries. Such a native answers one of those, bytes it leaves for the caller to
+copy out, a handle or a value the caller then holds, or nothing for `()`. Its
+row is not read, and nothing in it crosses.
 The runtime reports each native it implements, the machine kind of each word a
 call passes and of its answer, and whether it raises, as the Rust type of the
 function it binds says; a unit is compiled only against a runtime that
@@ -4116,6 +4127,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0162` | a `host for` an effect its module does not declare |
 | `E0163` | an effect's real handler stated twice |
 | `E0164` | a `host for` naming a function that is not a handler of the whole effect on every label |
+| `E0165` | a clause, outside a module the toolchain ships, for an operation of an effect the toolchain declares that a value of its own type parameters crosses |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |

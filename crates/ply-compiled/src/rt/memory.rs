@@ -38,8 +38,8 @@ pub unsafe extern "C" fn rt_dec_shared_last(_ctx: *mut Ctx, o: Block) -> Word {
     Word::from(unsafe { o.last_of_shared() })
 }
 
-/// Gives back a runtime handle, a bridge, a hold or a continuation, whose last holder was emitted
-/// code, after letting go of what the runtime keeps for it. Emitted code lets go of what a hold
+/// Gives back a runtime handle, a bridge, what a native made, a hold or a continuation, whose last
+/// holder was emitted code, after letting go of what the runtime keeps for it. Emitted code lets go of what a hold
 /// holds first: this reads none of a hold's words.
 pub unsafe extern "C" fn rt_handle_free(ctx: *mut Ctx, h: Block) {
     unsafe { h.free_handle(ctx) }

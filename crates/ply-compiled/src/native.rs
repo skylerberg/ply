@@ -21,7 +21,7 @@ pub enum Machine {
     Addr,
     /// The address of words the native writes.
     Out,
-    /// A runtime object the runtime lays out: a bridge or a hold.
+    /// A runtime object the runtime lays out: a bridge, a hold or what a native made.
     Handle,
     /// A value's word form, which the runtime moves and never reads.
     Handed,

@@ -279,7 +279,8 @@ machine! {
 
 /// The natives over machine data: the crossings' and the rest of this table's, then strings' and
 /// byte strings' (`crate::machine`), then those the standard library's real handlers call
-/// (`crate::hosted`), then what `std.machine` declares (`crate::entry`).
+/// (`crate::hosted`), then what `std.machine` declares (`crate::entry`) and what
+/// `std.internal.schedule` does (`crate::tasks`).
 pub fn machine_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
@@ -287,6 +288,7 @@ pub fn machine_natives() -> &'static [MachineNative] {
         all.extend(crate::machine::natives());
         all.extend(crate::hosted::natives());
         all.extend(crate::entry::natives());
+        all.extend(crate::tasks::natives());
         all
     })
 }

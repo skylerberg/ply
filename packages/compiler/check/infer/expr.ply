@@ -10,7 +10,7 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_var_first_read)
 import std.list (prepend)
 import compiler.syntax.type_syntax (TypeExpr, MRaise, mode_text, is_raise)
-import compiler.syntax.items (DOrd, member_name, member_of, Opaque)
+import compiler.syntax.items (DOrd, member_name, member_of, Opaque, is_shipped)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, RaiseName,
@@ -33,9 +33,9 @@ import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, Ty
                              shallow, resolved_tail, solve_continuation_row, free_vars, unify,
                              unify_row, covariant_con, env_push, env_pop, env_bind, env_lookup,
                              env_local, env_depth_of, env_locals, instantiate_with, instantiate,
-                             rename_scheme, region_mark, written_label, leaving_type, label_type,
-                             resolve_atom, atom_text, resource_text, type_text, row_text,
-                             printer_new, print_ty, print_row, TyNominal, record_fields)
+                             rename_scheme, at_arguments, region_mark, written_label, leaving_type,
+                             label_type, resolve_atom, atom_text, resource_text, type_text,
+                             row_text, printer_new, print_ty, print_row, TyNominal, record_fields)
 import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_fix, insertion,
                                       ValueSpace, EffectSpace, lookup, lookup_declared,
                                       error_with_labels, error_at, label_at, backticked,
@@ -4399,7 +4399,32 @@ fn clause_ordered(op_info: OpInfo, shape: OpShape) -> List<Int> / {abort.raise} 
 
 fn op_type(shape: OpShape) -> Type = fn_type(shape.params, shape.ret, row_empty())
 
-fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {abort.raise} = {
+/// The type a value of an operation's own type parameter crosses between its perform and its
+/// clause as, where a shipped module declares the effect: a perform keeps it, and the clause sees
+/// no type variable.
+pub fn kept_type() -> Type = TyCon({ name: b"std.internal.schedule.Kept", args: [] })
+
+/// Whether the toolchain declares effect `info`: the prelude, or a module it ships.
+pub fn shipped_effect(info: EffectInfo) -> Bool = info.module == b"" || is_shipped(info.module)
+
+/// The places, among `op_info`'s own type parameters, of those a value crosses at between a perform
+/// and its clause: each a parameter's type names, or the answer's where the operation answers.
+pub fn crossing_vars(op_info: OpInfo) -> List<Int> / {abort.raise} = {
+  let sc = op_scheme(op_info);
+  let fv = op_info.params.fold({ tys: [], rows: [] }, |acc: Free, ty: Type|
+    free_vars(subst_new(), ty, acc));
+  let named = if is_raise(op_info.mode) { fv } else { free_vars(subst_new(), op_info.ret, fv) };
+  range(0, sc.ty_vars.len()).filter(|i: Int| named.tys.contains(sc.ty_vars.get(i)))
+}
+
+/// A clause for `op_info`, which `info` declares, as it sees the operation: where a shipped module
+/// declares the effect, its own type parameters a value crosses at erased to `kept_type`; every
+/// other own type parameter and row rigid.
+fn instantiate_op_for_clause(
+  checker: Checker,
+  info: EffectInfo,
+  op_info: OpInfo,
+) -> OpShape / {abort.raise} = {
   let sc = op_scheme(op_info);
   let tys: { checker: Checker, vs: List<Int> } = sc.ty_vars.fold(
     { checker: checker, vs: [] },
@@ -4421,11 +4446,46 @@ fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {ab
       }
     },
   );
-  match rename_scheme(sc, tys.vs, rows.vs, []) {
+  let erased = if shipped_effect(info) { crossing_vars(op_info) } else { [] };
+  match at_arguments(
+      rename_scheme(sc, tys.vs, rows.vs, []),
+      erased.map(|i: Int| tys.vs.get(i)),
+      [],
+      erased.map(|_: Int| kept_type()),
+    ) {
     TyFn(f) -> { checker: rows.checker, params: f.params, ret: f.ret, row: f.effects },
     _ -> panic("operation schemes are function types"),
   }
 }
+
+/// A clause for `op_info`, which `info` declares, written at `span` in a module the toolchain does
+/// not ship, refused where the toolchain declares the effect and a value crosses at one of the
+/// operation's own type parameters, which the clause would see kept.
+fn crossing_refused(
+  checker: Checker,
+  info: EffectInfo,
+  op_info: OpInfo,
+  span: Span,
+) -> Checker / {abort.raise} =
+  if !shipped_effect(info) || is_shipped(module_name(checker, checker.module))
+      || crossing_vars(op_info).len() == 0 { checker } else {
+    report_error_at(
+      checker,
+      b"E0165",
+      span,
+      Bytes::concat_all([
+        b"`",
+        as_written(checker, info.name),
+        b".",
+        op_info.name,
+        b"` is the toolchain's and generic in its own type parameters, so only a module the toolchain ships answers it",
+      ]),
+      b"a clause for it",
+      [
+        b"a value of such a parameter crosses to the clause kept with its type, which only the toolchain's own modules read",
+      ],
+    )
+  }
 
 /// Whether `x` in `x.name(..)` is a local binding, so the call is one on its value and no perform.
 fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} =
@@ -4746,7 +4806,11 @@ fn infer_handle(
           match res.resource {
             None -> { ..acc, checker: res.checker },
             Some(resource_) -> {
-              let shape: OpShape = instantiate_op_for_clause(res.checker, hit.op);
+              let shape: OpShape = instantiate_op_for_clause(
+                crossing_refused(res.checker, hit.info, hit.op, clause.span),
+                hit.info,
+                hit.op,
+              );
               if shape.params.len() != clause.params.len() {
                 let bound = clause.params.len();
                 {
@@ -4929,7 +4993,7 @@ fn infer_handle(
                       body_.ty,
                       b"a handler clause returns the operation's result",
                     );
-                    if !x.ok && op_free_vars(hit.op).len() > 0 {
+                    if !x.ok && !shipped_effect(hit.info) && op_free_vars(hit.op).len() > 0 {
                       note_universal_clause(x.checker, hit.info, hit.op)
                     } else { x.checker }
                   },

@@ -1,9 +1,12 @@
 use crate::bare::context;
-use ply_compiled::native::{Addr, I64};
-use ply_compiled::rt::{Ctx, FAILED_ABORT, FAILED_CANCELLED, rt_taken};
+use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
+use ply_compiled::heap::{self, IMMORTAL, Word};
+use ply_compiled::native::{Addr, Answered, I64};
+use ply_compiled::rt::{Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, rt_taken};
 use ply_compiled::tasks::{
-    self, Body, FAILED, FINISHED, Message, RAISED, Region, Shield, Shields, UNWOUND, failure_of,
-    rt_host_now, rt_ticket_taken, rt_ticket_watch, rt_tickets_answered, rt_tickets_park,
+    self, ANSWERED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Region, Shield,
+    Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_taken, rt_ticket_watch,
+    rt_tickets_answered, rt_tickets_park,
 };
 use ply_core::{Span, codes};
 use ply_host::jobs::{self, Work};
@@ -50,7 +53,7 @@ fn body(run: unsafe fn(*mut Ctx, usize), region: *mut Region) -> Body {
 #[test]
 fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true, Span::DUMMY);
+    let mut region = Region::open(&mut ctx, true);
     let r: *mut Region = &mut *region;
     region.start(1, body(asks_twice, r));
     let first = unsafe { tasks::resume(r, 1, Message::default()) };
@@ -72,7 +75,7 @@ fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
 #[test]
 fn tasks_interleave_through_their_loop_each_where_it_stopped() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, false, Span::DUMMY);
+    let mut region = Region::open(&mut ctx, false);
     let r: *mut Region = &mut *region;
     region.start(1, body(asks_twice, r));
     region.start(2, body(asks_twice, r));
@@ -106,7 +109,7 @@ unsafe fn breaks(ctx: *mut Ctx, _: usize) {
 fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
-    let mut region = Region::open(c, true, Span::DUMMY);
+    let mut region = Region::open(c, true);
     let r: *mut Region = &mut *region;
     region.start(1, body(unwinds, r));
     region.start(2, body(raises, r));
@@ -136,7 +139,7 @@ unsafe fn asks_once(_ctx: *mut Ctx, region: usize) {
 #[test]
 fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, false, Span::DUMMY);
+    let mut region = Region::open(&mut ctx, false);
     let r: *mut Region = &mut *region;
     for id in 1..=3 {
         region.start(id, body(asks_once, r));
@@ -174,7 +177,7 @@ fn a_region_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
 #[test]
 fn a_task_the_region_never_ran_lets_go_of_its_body() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true, Span::DUMMY);
+    let mut region = Region::open(&mut ctx, true);
     let r: *mut Region = &mut *region;
     let before = RELEASED.with(Cell::get);
     region.start(1, body(asks_once, r));
@@ -197,7 +200,7 @@ unsafe fn acquires(_ctx: *mut Ctx, region: usize) {
 #[test]
 fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
     let mut ctx = context();
-    let mut region = Region::open(&mut ctx, true, Span::DUMMY);
+    let mut region = Region::open(&mut ctx, true);
     let r: *mut Region = &mut *region;
     region.start(1, body(acquires, r));
     unsafe { tasks::resume(r, 1, Message::default()) };
@@ -297,4 +300,229 @@ fn a_ticket_another_run_handed_out_is_refused() {
         0
     );
     assert!(ctx.take_failure().is_some());
+}
+
+// --- The scheduler's objects ---------------------------------------------------------------
+
+unsafe extern "C" fn untouched(_ctx: *mut Ctx, _w: Word) -> Word {
+    0
+}
+
+unsafe extern "C" fn lifted(_ctx: *mut Ctx) -> Word {
+    0
+}
+
+const fn scalar(identity: u64, spelled: &'static [u8]) -> PlyType {
+    PlyType {
+        identity,
+        spelled: spelled.as_ptr(),
+        spelled_len: spelled.len() as u32,
+        inc: untouched,
+        dec: untouched,
+        lower: untouched,
+        lift: lifted,
+    }
+}
+
+static INTS: PlyType = scalar(7, b"Int");
+static TEXTS: PlyType = scalar(8, b"String");
+
+/// The word a native's answer is, each of one word.
+fn word_of<T>(x: T) -> Word {
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<Word>());
+    let w = unsafe { std::mem::transmute_copy(&x) };
+    std::mem::forget(x);
+    w
+}
+
+fn handle(w: Word) -> Handle {
+    <Handle as Answered>::of(w)
+}
+
+fn handed(w: Word) -> Handed {
+    <Handed as Answered>::of(w)
+}
+
+fn let_go(ctx: &mut Ctx, w: Word) {
+    heap::release_object(ctx, w);
+}
+
+#[test]
+fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() {
+    let mut ctx = context();
+    let c: *mut Ctx = &mut ctx;
+    let k = word_of(unsafe { tasks::rt_keep(c, handed(42), &INTS) });
+    assert_eq!(word_of(unsafe { tasks::rt_open(c, handle(k), &INTS) }), 42);
+    assert!(ctx.take_failure().is_none());
+    unsafe { tasks::rt_open(c, handle(k), &TEXTS) };
+    let d = ctx
+        .take_failure()
+        .expect("a kept `Int` opened as a `String`");
+    assert!(
+        d.message.contains("`Int` was opened as `String`"),
+        "{}",
+        d.message
+    );
+    let_go(&mut ctx, k);
+    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+}
+
+thread_local! {
+    static STACKS: Cell<Word> = const { Cell::new(0) };
+    static ENTERED: RefCell<Vec<Word>> = const { RefCell::new(Vec::new()) };
+}
+
+/// A closure block no count is kept of, as emitted code lays out one that captures nothing.
+#[repr(C, align(8))]
+struct Immortal {
+    rc: u32,
+    desc: &'static PlyFnDesc,
+}
+
+unsafe extern "C" fn kept_alone(_ctx: *mut Ctx, _f: Handed) -> Word {
+    0
+}
+
+const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word) -> PlyFnDesc {
+    PlyFnDesc {
+        uniform,
+        typed: None,
+        convention: 0,
+        release: kept_alone,
+        share: untouched,
+        keep: untouched,
+    }
+}
+
+/// Keeps the descriptor and the first word it was entered with, and answers 5 kept.
+unsafe extern "C" fn answers_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+    let c = unsafe { &mut *ctx };
+    let first = if c.entering_words == 0 {
+        0
+    } else {
+        unsafe { *(c.entering_words as *const Word) }
+    };
+    ENTERED.with(|e| e.borrow_mut().extend([c.entering_desc, first]));
+    c.entering_desc = 0;
+    c.entering_words = 0;
+    word_of(unsafe { tasks::rt_keep(ctx, handed(5), &INTS) })
+}
+
+/// Asks its loop code 3 with 4 and 5, and answers nothing once it hears back.
+unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
+    let s = STACKS.with(Cell::get);
+    unsafe { tasks::rt_task_yielded(ctx, handle(s), I64(3), I64(4), I64(5)) };
+    0
+}
+
+static FIVE: PlyFnDesc = function(answers_five);
+static THREE: PlyFnDesc = function(asks_three);
+static ANSWERS_FIVE: Immortal = Immortal {
+    rc: IMMORTAL,
+    desc: &FIVE,
+};
+static ASKS_THREE: Immortal = Immortal {
+    rc: IMMORTAL,
+    desc: &THREE,
+};
+
+fn block(f: &'static Immortal) -> Block {
+    <Block as Answered>::of(f as *const Immortal as Word)
+}
+
+/// Stacks for a region, a task handle in it, and `f` made a body of task 1 answering into it, the
+/// row's descriptor and its words `row` and `words`.
+fn started(ctx: &mut Ctx, f: &'static Immortal, row: &[Word], words: &mut [Word]) -> (Word, Word) {
+    let c: *mut Ctx = ctx;
+    let s = word_of(unsafe { tasks::rt_stacks_opened(c, I64(1)) });
+    let region = unsafe { tasks::rt_stacks_region(c, handle(s)) };
+    let t = word_of(unsafe { tasks::rt_task_made(c, region) });
+    let b = word_of(unsafe {
+        tasks::rt_task_body(c, handle(t), block(f), row.as_ptr(), words.as_ptr())
+    });
+    // The body copied the words it was handed.
+    words.iter_mut().for_each(|w| *w = 0);
+    unsafe { tasks::rt_task_started(c, handle(s), I64(1), handle(b)) };
+    let_go(ctx, b);
+    STACKS.with(|x| x.set(s));
+    (s, t)
+}
+
+#[test]
+fn a_task_runs_its_body_with_the_words_its_maker_held_and_answers_into_its_handle() {
+    let mut ctx = context();
+    let c: *mut Ctx = &mut ctx;
+    let row = [1, 0, -1];
+    let (s, t) = started(&mut ctx, &ANSWERS_FIVE, &row, &mut [77]);
+    assert_eq!(unsafe { tasks::rt_task_said(c, handle(t), I64(1)) }.0, 1);
+    let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
+    assert_eq!(ended.0, FINISHED);
+    assert_eq!(ENTERED.with(|e| e.take()), [row.as_ptr() as Word, 77]);
+    assert_eq!(
+        unsafe { tasks::rt_task_said(c, handle(t), I64(2)) }.0,
+        ANSWERED
+    );
+    let answer = word_of(unsafe { tasks::rt_task_answer(c, handle(t)) });
+    assert_eq!(
+        word_of(unsafe { tasks::rt_open(c, handle(answer), &INTS) }),
+        5
+    );
+    let_go(&mut ctx, answer);
+    unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
+    let_go(&mut ctx, t);
+    let_go(&mut ctx, s);
+    assert!(ctx.take_failure().is_none());
+    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+}
+
+#[test]
+fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes_it() {
+    let mut ctx = context();
+    let c: *mut Ctx = &mut ctx;
+    (ctx.performed_root, ctx.performed_start, ctx.performed_end) = (9, 10, 11);
+    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    let asked = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
+    assert_eq!(asked.0, 3);
+    let said = |f: unsafe extern "C" fn(*mut Ctx, Handle, I64) -> I64, i| unsafe { f(c, handle(s), I64(i)) }.0;
+    assert_eq!(
+        (
+            said(tasks::rt_asked_number, 0),
+            said(tasks::rt_asked_number, 1)
+        ),
+        (4, 5)
+    );
+    let site = [0, 1, 2].map(|i| said(tasks::rt_asked_site, i));
+    assert_eq!(site, [9, 10, 11]);
+    let ended = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(RESUME_UNWIND), I64(0)) };
+    assert_eq!(ended.0, UNWOUND);
+    assert_eq!(ctx.failed, 0);
+    unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
+    let_go(&mut ctx, t);
+    let_go(&mut ctx, s);
+
+    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
+    let failure = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
+    let ended = unsafe {
+        tasks::rt_task_resumed_raising(
+            c,
+            handle(s),
+            I64(1),
+            Addr(failure.as_ptr() as *mut u8),
+            I64(failure.len() as i64),
+        )
+    };
+    assert_eq!(ended.0, RAISED);
+    let none = Addr(std::ptr::null_mut());
+    assert_eq!(
+        unsafe { tasks::rt_task_restored(c, handle(s), I64(1), none, I64(0)) }.0,
+        1
+    );
+    assert_eq!(ctx.failed, FAILED_PENDING);
+    let d = ctx.take_failure().expect("the raise is put back");
+    assert_eq!(d.message, "m");
+    unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
+    let_go(&mut ctx, t);
+    let_go(&mut ctx, s);
+    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
 }
