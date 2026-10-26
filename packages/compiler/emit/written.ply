@@ -8,7 +8,8 @@ import compiler.syntax.items (Item, IInstance, NKey, NShow, INumeric, numeric_by
 import compiler.check.resolve.tables (qualify)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
                              Atom, int_type, bytes_type, bool_type, unit_type, named_type,
-                             list_type, fn_type, monomorphic, row_empty, fields_sorted)
+                             list_type, fn_type, monomorphic, row_empty, row_open, arg_row,
+                             fields_sorted)
 import compiler.check.infer.checker (FiledRows, Performs, RowArguments)
 import compiler.emit.typing (Typed, unknown_type, filed_as)
 import std.list
@@ -629,8 +630,13 @@ pub fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
 /// A function the module of a declared sum states for it: `f`'s name in the sum's module, the type
-/// arguments a call of it files, its type at them, and what it answers there.
-pub type StatedFn = { f: Bytes, args: List<Type>, fn_type: Type, ret: Type }
+/// arguments a call of it files, its type at them, what it answers there, and the row a call fills
+/// each of its row variables with.
+pub type StatedFn = { f: Bytes, args: List<Type>, fn_type: Type, ret: Type, rows: List<Row> }
+
+/// The code written for a root, and what it files: the types at its sites and the rows its calls of
+/// definitions generic over rows fill them with.
+pub type WrittenCode = { code: Code, typed: Map<Int, Typed>, rows: Map<Int, FiledRows> }
 
 /// The key the module states for the declared sum `ty` (`key for T by f`), at `ty`'s arguments; none
 /// where it states none.
@@ -662,7 +668,8 @@ pub fn numeric_stated(
       }))
 
 /// The function `named` finds stated for the sum `ty` names, at `ty`'s arguments: each of its
-/// variables the argument of `ty` its signature names it at.
+/// variables, type or row, the argument of `ty` its signature names it at, a row it names at none
+/// the empty row.
 fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Option<StatedFn> =
   match ty {
     TyCon(c) -> match named(c.name) {
@@ -688,11 +695,20 @@ fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Opt
                 if written.at(i) == Some(TyVar(v)) {
                   match c.args.at(i) { Some(t) -> t, None -> found }
                 } else { found }));
+            let rows = sc.row_vars.map(|v: Int|
+              range(0, written.len()).fold(row_empty(), |found: Row, i: Int|
+                match ((written.at(i), c.args.at(i))) {
+                  (Some(w), Some(given)) -> if arg_row(w) == Some(row_open(v)) {
+                    match arg_row(given) { Some(r) -> r, None -> found }
+                  } else { found },
+                  _ -> found,
+                }));
             Some({
               f: f,
               args: args,
               fn_type: at_args(sc.ty, sc.ty_vars, args),
               ret: at_args(fn_ty.ret, sc.ty_vars, args),
+              rows: rows,
             })
           },
           _ -> None,
@@ -703,9 +719,16 @@ fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Opt
     _ -> None,
   }
 
-/// The body of a root doing what `s` does over its `arity` parameters, `a` and `b`, and the types it
+/// What calls of `s` whose names are written at `sites` file of the rows they fill: none where `s` is
+/// generic over no row.
+fn stated_rows(s: StatedFn, sites: List<Int>) -> Map<Int, FiledRows> =
+  if s.rows.len() == 0 { Map::new() } else {
+    sites.fold(Map::new(), |m: Map<Int, FiledRows>, site: Int| m.insert(site, RowArguments(s.rows)))
+  }
+
+/// The body of a root doing what `s` does over its `arity` parameters, `a` and `b`, and what it
 /// files: a call of `s`.
-pub fn stated_code(s: StatedFn, arity: Int) -> { code: Code, typed: Map<Int, Typed> } = {
+pub fn stated_code(s: StatedFn, arity: Int) -> WrittenCode = {
   let placed = { start: 0, end: 0, site: 1 };
   let var = |name: Bytes, slot: Int|
     { node: NVar({ name: name, slot: Some(slot) }), span: dummy_span() };
@@ -718,13 +741,14 @@ pub fn stated_code(s: StatedFn, arity: Int) -> { code: Code, typed: Map<Int, Typ
       span: dummy_span(),
     },
     typed: said_typed(Map::new().insert(placed.site, filed_as(s.fn_type, s.args)), []),
+    rows: stated_rows(s, [placed.site]),
   }
 }
 
 /// The body of `T#cmp`, or of `T#eq` where `eq`, for a sum whose module states its key `k`, over its
-/// two parameters and the types it files: the parameters' keys ordered, and equal where they order
-/// so, as values whose keys are equal are.
-pub fn keyed_code(k: StatedFn, eq: Bool) -> { code: Code, typed: Map<Int, Typed> } = {
+/// two parameters and what it files: the parameters' keys ordered, and equal where they order so, as
+/// values whose keys are equal are.
+pub fn keyed_code(k: StatedFn, eq: Bool) -> WrittenCode = {
   let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |n: Int| { start: 0, end: n, site: n + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
@@ -745,13 +769,14 @@ pub fn keyed_code(k: StatedFn, eq: Bool) -> { code: Code, typed: Map<Int, Typed>
       called(called(Map::new().insert(placed(0).site, filed_as(unknown_type(), [k.ret])), 1), 2),
       [],
     ),
+    rows: stated_rows(k, [placed(1).site, placed(2).site]),
   }
 }
 
 /// The body of `T#eq` for a sum of constructors `cs`, as lowered code over its two parameters, and the
 /// binder types it files: each constructor's arguments compared in turn where both are that
 /// constructor.
-pub fn equality_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Int, Typed> } = {
+pub fn equality_code(cs: List<SumCtor>) -> WrittenCode = {
   let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |k: Int| { start: 0, end: k, site: k + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
@@ -824,13 +849,14 @@ pub fn equality_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Int, Typed> 
   {
     code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span()),
     typed: walked.typed,
+    rows: Map::new(),
   }
 }
 
 /// The body of `T#cmp` for a sum of constructors `cs`, as lowered code over its two parameters, and
 /// the binder and call types it files: as the evaluator orders two constructors' values, by the
 /// constructors' names and then by each argument in turn as its type orders.
-pub fn ordering_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Int, Typed> } = {
+pub fn ordering_code(cs: List<SumCtor>) -> WrittenCode = {
   let at = |node: Node, span: Span| { node: node, span: span };
   let placed = |k: Int| { start: 0, end: k, site: k + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
@@ -967,6 +993,7 @@ pub fn ordering_code(cs: List<SumCtor>) -> { code: Code, typed: Map<Int, Typed> 
       ),
     ),
     typed: said_typed(walked.typed, []),
+    rows: Map::new(),
   }
 }
 
@@ -994,16 +1021,16 @@ fn le64(n: Int) -> Bytes =
   Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
 
 /// The body of the root `Digest` is written as for `ty`, over its parameter `a`, a value of `ty`,
-/// and the types it files: the encoding `digest.rs` writes, a record's and a constructor's own
-/// bytes written here and each part's encoding at its type. A type whose module states `key` is its
-/// key's encoding.
+/// and what it files: the encoding `digest.rs` writes, a record's and a constructor's own bytes
+/// written here and each part's encoding at its type. A type whose module states `key` is its key's
+/// encoding.
 pub fn digest_code(
   module: Bytes,
   ctors: Ctors,
   here: List<Def>,
   items: List<Item>,
   ty: Type,
-) -> { code: Code, typed: Map<Int, Typed> } / {abort.raise} = {
+) -> WrittenCode / {abort.raise} = {
   let at = |node: Node| { node: node, span: dummy_span() };
   let placed = |k: Int| { start: 0, end: k, site: k + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
@@ -1021,7 +1048,7 @@ pub fn digest_code(
     m.insert(placed(k).site, filed_as(unknown_type(), [t]));
   let joined = |parts: List<Code>| call(named(b"?concat"), [said_list(parts, 0)]);
   // The runtime's encoding, of a type this root cannot write.
-  let read = { code: part(var(b"a", 0), 1), typed: Map::new() };
+  let read = { code: part(var(b"a", 0), 1), typed: Map::new(), rows: Map::new() };
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
   let out = match fields_of {
     Some(fs) -> {
@@ -1040,7 +1067,7 @@ pub fn digest_code(
               },
           },
       );
-      { code: joined(walked.parts), typed: walked.typed }
+      { code: joined(walked.parts), typed: walked.typed, rows: Map::new() }
     },
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
@@ -1063,6 +1090,7 @@ pub fn digest_code(
                   placed(2).site,
                   filed_as(k.fn_type, k.args),
                 ),
+                rows: stated_rows(k, [placed(2).site]),
               },
             None -> {
               let walked = cs.fold(
@@ -1114,6 +1142,7 @@ pub fn digest_code(
               {
                 code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
                 typed: walked.typed,
+                rows: Map::new(),
               }
             },
           }
@@ -1125,8 +1154,8 @@ pub fn digest_code(
   { ..out, typed: said_typed(out.typed, [TyCon({ name: b"List", args: [bytes_type()] })]) }
 }
 
-/// The body of the root `Reflect` or `Shown` is written as for `ty`, over its parameter `a`, and the
-/// types it files: a record's fields in their names' order, and a declared sum's constructor's name
+/// The body of the root `Reflect` or `Shown` is written as for `ty`, over its parameter `a`, and
+/// what it files: a record's fields in their names' order, and a declared sum's constructor's name
 /// and arguments, each part reflected at its own type. Under `shown`, a sum whose module states a
 /// `show` is what that function writes; one stated generic is read by the runtime.
 pub fn reflection_code(
@@ -1136,7 +1165,7 @@ pub fn reflection_code(
   items: List<Item>,
   shown: Bool,
   ty: Type,
-) -> { code: Code, typed: Map<Int, Typed> } = {
+) -> WrittenCode = {
   let at = |node: Node| { node: node, span: dummy_span() };
   let placed = |k: Int| { start: 0, end: k, site: k + 1 };
   let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
@@ -1181,11 +1210,15 @@ pub fn reflection_code(
               },
           },
       );
-      { code: call(said(b"std.value.VRecord"), [said_list(walked.items, 0)]), typed: walked.typed }
+      {
+        code: call(said(b"std.value.VRecord"), [said_list(walked.items, 0)]),
+        typed: walked.typed,
+        rows: Map::new(),
+      }
     },
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
-        None -> { code: part(var(b"a", 0), 1), typed: Map::new() },
+        None -> { code: part(var(b"a", 0), 1), typed: Map::new(), rows: Map::new() },
         Some(cs) -> {
           let stated = if !shown { None } else {
             stated_for(here, ty, |n: Bytes|
@@ -1205,6 +1238,7 @@ pub fn reflection_code(
                   call({ node: NVar({ name: f.f, slot: None }), span: placed(1) }, [var(b"a", 0)]),
                 ]),
                 typed: Map::new().insert(placed(1).site, filed_as(f.fn_type, f.args)),
+                rows: stated_rows(f, [placed(1).site]),
               },
             None -> {
               let walked = cs.fold(
@@ -1256,12 +1290,13 @@ pub fn reflection_code(
               {
                 code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
                 typed: walked.typed,
+                rows: Map::new(),
               }
             },
           }
         },
       },
-      _ -> { code: part(var(b"a", 0), 1), typed: Map::new() },
+      _ -> { code: part(var(b"a", 0), 1), typed: Map::new(), rows: Map::new() },
     },
   };
   {
@@ -1340,19 +1375,21 @@ fn crossing_loop(
 }
 
 /// The root `R#entered` the runtime enters root `root` of `module` through, calling `callee` at type
-/// arguments `at`, taking `params` and answering `answer`: from the lifting the runtime opened over
-/// the list of its arguments' encodings, each argument read and the lifting ended; then `callee`
-/// called on them, and its answer written into the lowering the runtime opened beneath, which it
-/// ends. A generic definition is called as any caller calls it at `at`, through its own scheme;
-/// any other root is declared at `params` and `answer`, performing `row`, its own atoms. `hosts` are
-/// the real handlers the call runs under, each by the name the entry calls it by and the effect it
-/// answers, the first outermost: each is handed a closure over the call inside it, which performs
-/// what that call does, and answers it, leaving its caller the rest, as the checker would file it.
+/// arguments `at` and its row variables at `rows`, taking `params` and answering `answer`: from the
+/// lifting the runtime opened over the list of its arguments' encodings, each argument read and the
+/// lifting ended; then `callee` called on them, and its answer written into the lowering the runtime
+/// opened beneath, which it ends. A generic definition is called as any caller calls it at `at` and
+/// `rows`, through its own scheme; any other root is declared at `params` and `answer`, performing
+/// `row`, its own atoms. `hosts` are the real handlers the call runs under, each by the name the
+/// entry calls it by and the effect it answers, the first outermost: each is handed a closure over
+/// the call inside it, which performs what that call does, and answers it, leaving its caller the
+/// rest, as the checker would file it.
 pub fn entered_code(
   module: Bytes,
   root: RootKey,
   callee: RootKey,
   at: List<Type>,
+  rows: List<Row>,
   params: List<Type>,
   answer: Type,
   row: Row,
@@ -1379,8 +1416,11 @@ pub fn entered_code(
     },
   );
   let direct = call_at(reads.w, local_root(module, root_text(root_name(callee))), reads.codes, at);
+  let generic = at.len() > 0 || rows.len() > 0;
+  let direct_rows = if rows.len() == 0 { direct.w }
+  else { rows_at(direct.w, function_span(direct.code), RowArguments(rows)) };
   let called = hosts.reverse().fold(
-    { code: direct.code, w: direct.w, atoms: row.atoms },
+    { code: direct.code, w: direct_rows, atoms: row.atoms },
     |inner: { code: Code, w: Writing, atoms: List<Atom> }, host: { call: Bytes, effect: Bytes }| {
       let lambda = filing(inner.w, filed_as(fn_type([], answer, row_empty()), []));
       let left = inner.atoms.filter(|a: Atom| a.effect != host.effect);
@@ -1400,10 +1440,9 @@ pub fn entered_code(
         ],
         [answer],
       );
-      let reference = match c.code.node { NApp(a) -> a.func.span, _ -> c.code.span };
       {
         code: c.code,
-        w: rows_at(c.w, reference, RowArguments([{ atoms: left, tail: None }])),
+        w: rows_at(c.w, function_span(c.code), RowArguments([{ atoms: left, tail: None }])),
         atoms: left,
       }
     },
@@ -1419,10 +1458,13 @@ pub fn entered_code(
       ),
     ),
     w: written.w,
-    here: if at.len() > 0 { [] }
+    here: if generic { [] }
     else { [called_def(module, callee, params, answer, { atoms: row.atoms, tail: None })] },
   })
 }
+
+/// Where the function a call names is written: what the checker files a read of a definition at.
+fn function_span(call: Code) -> Span = match call.node { NApp(a) -> a.func.span, _ -> call.span }
 
 /// The stored root of the `const` definition `root` of `module`, answering `answer`, which a build
 /// enters to keep its value: the bytes of that value's encoding, a value met again written as
