@@ -116,7 +116,7 @@ pub struct Addr(pub *mut u8);
 /// copies out into a string or a byte string of its own.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Taken(pub i64);
+pub struct TakenBytes(pub i64);
 
 /// The address of words a native writes for compiled code, as many as the native says.
 #[repr(transparent)]
@@ -215,11 +215,11 @@ unsafe impl Answered for F64 {
     }
 }
 
-unsafe impl Answered for Taken {
+unsafe impl Answered for TakenBytes {
     const MACHINE: Option<Machine> = Some(Machine::Taken);
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
-        Taken(w)
+        TakenBytes(w)
     }
 }
 
