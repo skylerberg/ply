@@ -16,8 +16,8 @@ use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_OUT_OF_FUEL, FAILED_UNWIND, lent
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, MachineId, RuntimeFactory};
 use ply_core::{
-    Diagnostic, EffectAtom, Footprint, Held, Mode, Resource, Seed, Severity, SourceId, Span,
-    Symbol, codes,
+    Diagnostic, EffectAtom, Footprint, Mode, Resource, Seed, Severity, SourceId, Span, Symbol,
+    codes,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -41,7 +41,7 @@ impl Opened {
     /// emitted against another runtime.
     pub fn open(library: &std::path::Path) -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let (native, _) = crate::c::load_opened(library, None).map_err(|e| format!("{e:#}"))?;
+        let (native, _) = crate::c::load_opened(library).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -51,7 +51,7 @@ impl Opened {
     /// The program this executable was linked with.
     pub fn linked() -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let (native, _) = crate::c::load_linked(None).map_err(|e| format!("{e:#}"))?;
+        let (native, _) = crate::c::load_linked().map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -206,6 +206,20 @@ pub struct Usage {
     pub held: Held,
     pub updates: u64,
     pub updates_in_place: u64,
+}
+
+/// What a run still held when an entry's root body returned, before its production region drained:
+/// what grows with the work a long-running program does if anything is never given back.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Held {
+    /// Heap objects standing for a runtime value, such as a task's handle.
+    pub bridges: u64,
+    /// Tasks the production region's scheduler still tracks.
+    pub scheduled: u64,
+    /// Task stacks the production region still keeps.
+    pub task_stacks: u64,
+    /// Frame tables kept for stacks that are or were running.
+    pub frame_tables: u64,
 }
 
 /// How an entry ended, what it used, what its host runtime warned of as it ended, what its
@@ -366,7 +380,7 @@ fn entered(
 ) -> (Ended, Last) {
     ctx.begin_bounded(run.depth, run.steps, run.timeout_ms);
     let giving_back = GivingBack(std::ptr::from_mut(ctx));
-    ctx.open_entry(arguments, Vec::new());
+    ctx.open_entry(arguments);
     let entering = std::ptr::from_mut(ctx);
     let none: [i64; 0] = [];
     // SAFETY: the unit owns the entry's pages and outlives the call, `ctx` is this entry's alone,
@@ -410,7 +424,7 @@ fn returned(ctx: &mut Ctx) -> Last {
 
 /// How an entry whose root returned ended: its answer's bytes, or why the boundary keeps it.
 fn answered(ctx: &mut Ctx, root: &str) -> Ended {
-    match crate::rt::close_entry_bytes(ctx) {
+    match crate::rt::close_entry(ctx) {
         Ok(EntryBytes::Bytes(bytes)) => Ended::Answered(bytes),
         Ok(EntryBytes::Function) => {
             Ended::Unanswerable("its answer holds a function the program wrote")

@@ -428,7 +428,7 @@ unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
     if !c.sims.is_empty() {
         body.release(ctx);
         let outer = c.sims.last().map_or(Span::DUMMY, |sim| sim.site);
-        let d = ply_core::err_nested_simulation(c.site(), outer);
+        let d = ply_core::sim::err_nested_simulation(c.site(), outer);
         return c.fail(d);
     }
     let id = ply_core::SimId(c.entered_sims);

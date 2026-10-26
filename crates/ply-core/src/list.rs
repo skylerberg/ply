@@ -73,11 +73,6 @@ impl List {
             out.append(items);
         }
     }
-
-    /// Equal identities mean equal elements, while one of the lists keeps the allocation alive.
-    pub fn identity(&self) -> usize {
-        Arc::as_ptr(&self.0) as usize
-    }
 }
 
 impl From<Vec<Value>> for List {

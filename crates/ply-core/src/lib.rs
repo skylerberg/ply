@@ -1,18 +1,14 @@
-//! The evaluator, and the runtime's vocabulary: spans, diagnostics and their codes, and the
-//! program record the compiler answers with.
+//! The runtime's vocabulary: values, spans, diagnostics and their codes, effects and their
+//! footprints, the host boundary, and the deterministic simulation compiled code runs under.
 
 // `Value` mixes `Arc` payloads with a task handle's `Rc`, so it is never `Send` by design.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod argv;
-pub mod backend;
 pub mod builtins;
-mod carry;
 pub mod codec;
 pub mod codes;
-pub mod compiled;
 pub mod crypto;
-pub mod decode;
 pub mod digest;
 pub mod escape;
 pub mod expr;
@@ -20,7 +16,6 @@ pub mod files;
 pub mod float;
 mod footprint;
 pub mod handler;
-mod hash;
 pub mod host;
 pub mod instances;
 pub mod intty;
@@ -30,10 +25,8 @@ pub use expr::{BinOp, render_float};
 
 pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
-pub mod evaluator;
 pub mod memo;
 mod plain;
-mod program;
 pub mod rc;
 pub mod reflect;
 pub mod region;
@@ -42,34 +35,19 @@ pub mod semantics;
 pub mod sim;
 mod span;
 pub mod sqlite;
-pub mod trace;
 mod value;
 
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
-pub use backend::{Compilation, Counters, Offers, Provider};
 pub use builtins::{Builtin, assert_failure, assertion_failure};
-pub use carry::{Carry, CtorCarries};
-pub use compiled::{Compiled, Entered, Held};
 pub use escape::{Boundary, Escapee, Handle};
-pub use evaluator::{
-    Case, Ended, Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape,
-    err_host_in_simulation, err_nested_simulation, err_not_compiled, err_secret_to_host,
-    err_unenumerated_atom,
-};
 pub use footprint::{EffectAtom, Footprint, Mode, Resource, atom_texts, label_var_name};
-pub use hash::{DefHash, HashOutput};
 pub use host::{
-    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,
-    HostRequest, HostResource, HostRow, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
-    ShutdownReport,
+    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
+    HostResource, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory, ShutdownReport,
 };
 pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
-pub use program::{
-    Analysis, CheckOutput, DefInfo, EffectInfo, EmitterRoot, LawInfo, ModuleInfo, ModuleName,
-    OpInfo, Ordinal, SpecKind, TestInfo, TypeDecl, Visibility,
-};
 pub use rc::RcStats;
 pub use region::{Interleaving, SimId, Verdict};
 pub use sched::TaskHandle;
@@ -82,7 +60,6 @@ pub use span::{
     Diagnostic, Edit, Fix, Label, Severity, SourceFile, SourceId, SourceMap, Span, Sparse, Symbol,
     intern_code, slot,
 };
-pub use trace::Trace;
 pub use value::{
     Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Sealed,
     Synth, Value, constant_time_eq, first_difference, type_error, values_equal,

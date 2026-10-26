@@ -1,4 +1,3 @@
-mod dump;
 mod stage;
 mod sweep;
 
@@ -74,13 +73,13 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
     use ply_compiled::native::Machine;
     let machine = machine_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
-    let hosted: Vec<&str> = ply_compiled::hosted::natives()
-        .iter()
+    let shipped: Vec<&str> = (ply_compiled::hosted::natives().iter())
+        .chain(ply_compiled::entry::natives().iter())
         .map(|n| n.name)
         .collect();
     for n in machine {
         assert!(
-            n.name.starts_with('?') || hosted.contains(&n.name),
+            n.name.starts_with('?') || shipped.contains(&n.name),
             "`{}` is no name the compiler or a shipped module declares",
             n.name
         );
@@ -350,7 +349,7 @@ fn the_preludes_checked_arithmetic_agrees_with_and_without_the_overflow_builtins
         let Some(lib) = units::library(dir.path(), &text) else {
             return;
         };
-        let (native, _) = ply_compiled::c::load_opened(&lib, None).expect("the unit loads");
+        let (native, _) = ply_compiled::c::load_opened(&lib).expect("the unit loads");
         let wrong = units::entered(&native, "m.checked", 10, &[]).expect("it answers");
         assert_eq!(imm_value(wrong), 0, "with {head:?}");
     }
@@ -398,7 +397,7 @@ fn deep_calls() -> [units::Def; 2] {
 const DEEP: i64 = 20_000;
 
 /// An entry begun where a Rust recursion grew onto a stacker segment, or anywhere else the runtime
-/// does not know, as `Bodies::run` begins one.
+/// does not know.
 struct Unknown {
     ctx: *mut ply_compiled::rt::Ctx,
     entry: ply_compiled::rt::Entry,
@@ -550,55 +549,4 @@ fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
     assert_eq!(read.entered, ["m.main"]);
     let words = ply_compiled::c::Exports::decode(tables).expect("the table reads");
     assert!(words.entered.is_empty());
-}
-
-/// `m.double`, compiled and opened as a program's unit entered through `m.double#entered`.
-fn doubling(dir: &std::path::Path) -> Option<(ply_core::Analysis, std::path::PathBuf)> {
-    let defs = [
-        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
-        def("m.double#entered", 0, &units::int_entry("m.double")),
-    ];
-    let mut exports = units::exports_of(&defs);
-    exports.entered = vec!["m.double".to_string()];
-    let lib = units::library(dir, &units::text(&defs, &exports))?;
-    Some((units::front(b"doubling", &defs[..1], &[]), lib))
-}
-
-/// The unit is loaded once to read what it holds, and every backend over it answers alike.
-#[test]
-fn every_backend_over_a_unit_answers_what_it_holds() {
-    use ply_core::{Provider, Symbol, Value};
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some((front, lib)) = doubling(dir.path()) else {
-        return;
-    };
-    let unit = ply_compiled::Unit::opened(&front, &lib).expect("the unit opens");
-    assert_eq!(unit.compiled(), ["m.double", "m.double#entered"]);
-    let first = std::sync::Arc::clone(&unit).attach();
-    let second = std::sync::Arc::clone(&unit).attach();
-    assert_eq!(unit.compilation().units, 2);
-    for backend in [&first, &second] {
-        assert!(backend.describes(front.hashes_digest));
-        assert_eq!(
-            backend.enter(&Symbol::new("m.double"), &[Value::Int(21)], 10_000),
-            Some(Value::Int(42))
-        );
-    }
-}
-
-/// A program loaded and let go leaves nothing behind: its unit, the front end's answer it holds and
-/// its loaded image go with the last backend over it.
-#[test]
-fn a_unit_nothing_holds_is_freed() {
-    use ply_core::Provider;
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some((front, lib)) = doubling(dir.path()) else {
-        return;
-    };
-    let unit = ply_compiled::Unit::opened(&front, &lib).expect("the unit opens");
-    let held = std::sync::Arc::downgrade(&unit);
-    let backend = unit.attach();
-    assert!(held.upgrade().is_some(), "a backend holds its unit");
-    drop(backend);
-    assert!(held.upgrade().is_none(), "a unit nothing holds was kept");
 }

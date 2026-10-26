@@ -1,14 +1,11 @@
-//! The host effect boundary: the types the machine speaks and the registry of host handlers.
+//! The host effect boundary: the types the machine speaks, the registry of host handlers, and the
+//! binding a run's grants make of one.
 
 use crate::value::Value;
-use crate::{
-    CheckOutput, Diagnostic, EffectAtom, EffectInfo, Footprint, Resource, Span, Symbol, codes,
-};
-use std::collections::{BTreeMap, BTreeSet};
+use crate::{Diagnostic, EffectAtom, Footprint, Resource, Span, Symbol, codes};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
-
-const DIGEST_DOMAIN: &[u8] = b"ply.hosts.1";
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HostResource {
@@ -75,10 +72,6 @@ pub struct HostOp {
 }
 
 impl HostOp {
-    fn atom(&self, effect: &Symbol, resource: Resource, mode: crate::Mode) -> EffectAtom {
-        EffectAtom::operation(effect.clone(), resource, mode, self.op.clone())
-    }
-
     fn serves_label(&self, resource: &Resource) -> bool {
         match &self.resource {
             HostResource::Only(r) => r == resource,
@@ -267,38 +260,6 @@ impl HostRegistry {
         self.entries.iter().map(|(op, _)| op)
     }
 
-    pub fn bind(self, check: &CheckOutput) -> Result<HostBinding, Vec<Diagnostic>> {
-        let rows = resolve(&self.entries, &self.withheld, check)?;
-        let footprint = Footprint::from_atoms(rows.iter().map(|r| r.atom.clone()));
-        let atoms = rows.iter().map(|r| r.atom.clone()).collect();
-        let nondeterministic = rows
-            .iter()
-            .filter(|r| !r.deterministic)
-            .map(|r| r.atom.clone())
-            .collect();
-        let index = rows
-            .iter()
-            .enumerate()
-            .map(|(row, r)| (r.key(), row))
-            .collect();
-        let listing = HostListing {
-            handlers: self.entries.len(),
-            rows,
-        };
-        Ok(HostBinding {
-            entries: self.entries,
-            withheld: self.withheld,
-            listing,
-            footprint,
-            atoms,
-            nondeterministic,
-            index,
-            bound: true,
-            granted: false,
-            grants: Grants::default(),
-        })
-    }
-
     /// A binding of every registration, which answers a perform its effect's name, operation and
     /// label find a registration for: what a run is lent, `grants`, decides the registrations, and
     /// no row of the program's is read. Two registrations a binding serves of one effect, operation
@@ -309,10 +270,10 @@ impl HostRegistry {
             return Err(refused);
         }
         Ok(HostBinding {
+            entries: self.entries,
+            withheld: self.withheld,
             granted: true,
-            bound: true,
             grants,
-            ..HostBinding::hermetic_with(self)
         })
     }
 
@@ -346,132 +307,6 @@ impl HostRegistry {
         }
         refused
     }
-
-    /// What would bind, without binding.
-    pub fn preview(&self, check: &CheckOutput) -> Result<HostListing, Vec<Diagnostic>> {
-        Ok(HostListing {
-            handlers: self.entries.len(),
-            rows: resolve(&self.entries, &self.withheld, check)?,
-        })
-    }
-}
-
-/// Rows ascending by `(effect, op, resource)`, with every registration-time check applied.
-fn resolve(
-    entries: &[(HostOp, Arc<dyn HostHandler>)],
-    withheld: &BTreeMap<usize, &'static str>,
-    check: &CheckOutput,
-) -> Result<Vec<HostRow>, Vec<Diagnostic>> {
-    let mut diagnostics = Vec::new();
-    let mut rows: BTreeMap<RowKey, HostRow> = BTreeMap::new();
-    let mut claimed: BTreeMap<RowKey, &'static str> = BTreeMap::new();
-    let performed = performed_atoms(check);
-
-    for (index, (op, _)) in entries.iter().enumerate() {
-        // A withheld registration must not appear in the listing, footprint or index.
-        if withheld.contains_key(&index) {
-            continue;
-        }
-        // A handler `ply hosts` cannot name is one no reviewer can find.
-        if op.path.trim().is_empty() {
-            diagnostics.push(err_anonymous(op));
-            continue;
-        }
-        // A name declared twice is refused rather than served by a coin flip.
-        let declarations: Vec<&EffectInfo> = check
-            .effects
-            .values()
-            .filter(|e| registration_names(&op.effect, &e.name, &e.simple_name))
-            .collect();
-        let effect = match declarations.as_slice() {
-            [] => {
-                if matches!(op.resource, HostResource::Only(_)) {
-                    diagnostics.push(err_unknown_effect(op, check));
-                }
-                continue;
-            }
-            [only] => *only,
-            several => {
-                diagnostics.push(err_ambiguous_effect(op, several));
-                continue;
-            }
-        };
-        let name = &effect.name;
-        // The program was checked against its own declaration of the effect, so an operation that
-        // declaration lacks is one it cannot perform, and the registration binds nothing.
-        let Some(decl) = effect.ops.get(&op.op) else {
-            continue;
-        };
-        if op.determinism == Determinism::Nondeterministic && !effect.nondet {
-            diagnostics.push(err_determinism(op, effect));
-            continue;
-        }
-
-        // A footprint names the operation, or the mode when its row was written that way; a program
-        // holding both names one label once. A label a caller fills is no resource to serve: the
-        // call that fills it names one, and that atom is what reaches here.
-        let candidates: BTreeSet<Resource> = match &op.resource {
-            HostResource::Only(r) => BTreeSet::from([r.clone()]),
-            HostResource::Any => performed
-                .iter()
-                .filter(|a| {
-                    a.effect == *name
-                        && !matches!(a.resource, Resource::Var(_))
-                        && match &a.op {
-                            Some(named) => *named == op.op,
-                            None => a.mode == decl.mode,
-                        }
-                })
-                .map(|a| a.resource.clone())
-                .collect(),
-        };
-        if !decl.resource_param && candidates.iter().any(|r| *r != Resource::Singleton) {
-            diagnostics.push(err_resource_unexpected(op, effect));
-            continue;
-        }
-
-        for resource in candidates {
-            if !op.serves_label(&resource) {
-                continue;
-            }
-            let atom = op.atom(name, resource.clone(), decl.mode);
-            // `Only` naming a resource the program never performs is usually an unfollowed rename.
-            if matches!(op.resource, HostResource::Only(_))
-                && !performed.iter().any(|p| p.covers(&atom))
-            {
-                diagnostics.push(err_unused_resource(op, &atom, effect));
-                continue;
-            }
-            let key = (name.clone(), op.op.clone(), resource.clone());
-            if let Some(other) = claimed.get(&key) {
-                diagnostics.push(err_conflict(op, other, op.path));
-                continue;
-            }
-            claimed.insert(key.clone(), op.path);
-            rows.insert(
-                key,
-                HostRow {
-                    effect: name.clone(),
-                    op: op.op.clone(),
-                    resource,
-                    atom,
-                    row: index,
-                    path: op.path,
-                    deterministic: op.determinism.is_deterministic(),
-                    linearity: op.linearity,
-                    blocking: op.blocking,
-                    secrets: op.secrets,
-                    declared_nondet: effect.nondet,
-                },
-            );
-        }
-    }
-
-    if diagnostics.is_empty() {
-        Ok(rows.into_values().collect())
-    } else {
-        Err(diagnostics)
-    }
 }
 
 /// The standard library's reserved root itself, or a module under it.
@@ -494,93 +329,6 @@ pub fn registration_names(registered: &Symbol, program_wide: &Symbol, declared: 
     }
 }
 
-fn performed_atoms(check: &CheckOutput) -> BTreeSet<EffectAtom> {
-    let mut out = BTreeSet::new();
-    for def in check.defs.values() {
-        out.extend(def.footprint.atoms().cloned());
-    }
-    for test in &check.tests {
-        out.extend(test.footprint.atoms().cloned());
-    }
-    for law in &check.laws {
-        out.extend(law.footprint.atoms().cloned());
-    }
-    out
-}
-
-/// `(effect, op, resource)`.
-pub type RowKey = (Symbol, Symbol, Resource);
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct HostRow {
-    pub effect: Symbol,
-    pub op: Symbol,
-    pub resource: Resource,
-    /// The operation atom: what the row prints, with the declared mode.
-    pub atom: EffectAtom,
-    /// Index of the registration that produced this row.
-    pub row: usize,
-    pub path: &'static str,
-    pub deterministic: bool,
-    pub linearity: Linearity,
-    pub blocking: bool,
-    pub secrets: bool,
-    /// Whether the declaration, not the handler, carries `nondet`.
-    pub declared_nondet: bool,
-}
-
-impl HostRow {
-    pub fn key(&self) -> RowKey {
-        (self.effect.clone(), self.op.clone(), self.resource.clone())
-    }
-}
-
-impl fmt::Display for HostRow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}{}", self.effect, self.op, self.resource)
-    }
-}
-
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct HostListing {
-    /// Ascending by `(effect, op, resource)`, [`EffectAtom`]'s own order.
-    pub rows: Vec<HostRow>,
-    /// Registrations, which is at most `rows.len()`.
-    pub handlers: usize,
-}
-
-impl HostListing {
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    /// BLAKE3 over the canonical rows, domain-tagged and length-prefixed.
-    pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(DIGEST_DOMAIN);
-        hasher.update(&(self.rows.len() as u64).to_le_bytes());
-        for row in &self.rows {
-            let text = row.to_string();
-            hasher.update(&(text.len() as u64).to_le_bytes());
-            hasher.update(text.as_bytes());
-            hasher.update(&(row.path.len() as u64).to_le_bytes());
-            hasher.update(row.path.as_bytes());
-            hasher.update(&[
-                u8::from(row.deterministic),
-                u8::from(row.linearity.is_linear()),
-                u8::from(row.blocking),
-                u8::from(row.secrets),
-                u8::from(row.declared_nondet),
-            ]);
-        }
-        *hasher.finalize().as_bytes()
-    }
-
-    pub fn digest_short(&self) -> String {
-        crate::digest::short(&self.digest())
-    }
-}
-
 pub struct Bound<'a> {
     pub op: &'a HostOp,
     pub handler: &'a Arc<dyn HostHandler>,
@@ -589,14 +337,7 @@ pub struct Bound<'a> {
 pub struct HostBinding {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
     withheld: BTreeMap<usize, &'static str>,
-    listing: HostListing,
-    footprint: Footprint,
-    atoms: BTreeSet<EffectAtom>,
-    nondeterministic: BTreeSet<EffectAtom>,
-    /// Triple -> index into `listing.rows`.
-    index: BTreeMap<RowKey, usize>,
-    bound: bool,
-    /// Resolves by name against `entries`, with no rows.
+    /// Resolves by name against `entries`; a hermetic binding resolves nothing.
     granted: bool,
     grants: Grants,
 }
@@ -644,13 +385,12 @@ impl Default for HostBinding {
     }
 }
 
-/// Hand-written: `dyn HostHandler` has no `Debug`, and the listing already carries each path.
+/// Hand-written: `dyn HostHandler` has no `Debug`.
 impl fmt::Debug for HostBinding {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HostBinding")
-            .field("bound", &self.bound)
+            .field("granted", &self.granted)
             .field("registrations", &self.entries.len())
-            .field("listing", &self.listing)
             .finish()
     }
 }
@@ -660,48 +400,23 @@ impl HostBinding {
         HostBinding::hermetic_with(HostRegistry::new())
     }
 
+    /// A binding that serves none of `registry`, and names each registration a perform reaches.
     pub fn hermetic_with(registry: HostRegistry) -> HostBinding {
         HostBinding {
             entries: registry.entries,
             withheld: registry.withheld,
-            listing: HostListing::default(),
-            footprint: Footprint::empty(),
-            atoms: BTreeSet::new(),
-            nondeterministic: BTreeSet::new(),
-            index: BTreeMap::new(),
-            bound: false,
             granted: false,
             grants: Grants::default(),
         }
     }
 
     pub fn is_hermetic(&self) -> bool {
-        !self.bound
+        !self.granted
     }
 
     /// What the run this binding serves is lent.
     pub fn grants(&self) -> &Grants {
         &self.grants
-    }
-
-    pub fn footprint(&self) -> &Footprint {
-        &self.footprint
-    }
-
-    /// Whether a bound row is within `atom`: the row itself, or an operation a mode atom covers.
-    pub fn serves(&self, atom: &EffectAtom) -> bool {
-        self.atoms.iter().any(|row| atom.covers(row))
-    }
-
-    /// Only a nondeterministic handler makes a run unrepeatable.
-    pub fn reaches(&self, footprint: &Footprint) -> bool {
-        footprint
-            .atoms()
-            .any(|a| self.nondeterministic.iter().any(|row| a.covers(row)))
-    }
-
-    pub fn listing(&self) -> &HostListing {
-        &self.listing
     }
 
     /// Tells every handler that `machine` has ended.
@@ -711,36 +426,38 @@ impl HostBinding {
         }
     }
 
+    /// The registration that serves `effect.op[resource]`, the first not withheld of those for it,
+    /// or why there is none.
     pub fn resolve(
         &self,
         effect: &Symbol,
         op: &Symbol,
         resource: Option<&Symbol>,
-    ) -> Option<Bound<'_>> {
-        if self.granted {
-            let wanted = resource_of(resource);
-            let declared = Symbol::new(simple_name(effect.as_str()));
-            return (self.entries.iter().enumerate())
-                .find(|(index, (candidate, _))| {
-                    candidate.op == *op
-                        && !self.withheld.contains_key(index)
-                        && registration_names(&candidate.effect, effect, &declared)
-                        && candidate.serves_label(&wanted)
-                })
-                .map(|(_, (registered, handler))| Bound {
-                    op: registered,
-                    handler,
-                });
+    ) -> Result<Bound<'_>, Unserved> {
+        let mut matching = self.matching(effect, op, resource);
+        let Some((first, (registered, _))) = matching.next() else {
+            return Err(Unserved::Unregistered);
+        };
+        if !self.granted {
+            return Err(Unserved::Hermetic(registered.path));
         }
-        let key = (effect.clone(), op.clone(), resource_of(resource));
-        let row = &self.listing.rows[*self.index.get(&key)?];
-        let (registered, handler) = &self.entries[row.row];
-        Some(Bound {
-            op: registered,
-            handler,
-        })
+        let withheld = |index: &usize| self.withheld.get(index).copied();
+        match withheld(&first) {
+            None => Ok(Bound {
+                op: registered,
+                handler: &self.entries[first].1,
+            }),
+            Some(served) => matching
+                .find(|(index, _)| withheld(index).is_none())
+                .map(|(_, (op, handler))| Bound { op, handler })
+                .ok_or(Unserved::Withheld {
+                    path: registered.path,
+                    served,
+                }),
+        }
     }
 
+    /// The path of the first registration for `effect.op[resource]`, withheld or not.
     pub fn would_serve(
         &self,
         effect: &Symbol,
@@ -748,41 +465,46 @@ impl HostBinding {
         resource: Option<&Symbol>,
     ) -> Option<&'static str> {
         self.matching(effect, op, resource)
-            .map(|(_, candidate)| candidate.path)
+            .next()
+            .map(|(_, (candidate, _))| candidate.path)
     }
 
-    /// Where a run does bind the handler this run could serve the operation with but declined to.
-    pub fn withholds(
-        &self,
-        effect: &Symbol,
-        op: &Symbol,
+    /// Each registration for `effect.op[resource]`, by its place among the registrations.
+    fn matching<'s, 'n>(
+        &'s self,
+        effect: &'n Symbol,
+        op: &'n Symbol,
         resource: Option<&Symbol>,
-    ) -> Option<&'static str> {
-        self.matching(effect, op, resource)
-            .and_then(|(index, _)| self.withheld.get(&index).copied())
-    }
-
-    fn matching(
-        &self,
-        effect: &Symbol,
-        op: &Symbol,
-        resource: Option<&Symbol>,
-    ) -> Option<(usize, &HostOp)> {
+    ) -> impl Iterator<Item = (usize, &'s (HostOp, Arc<dyn HostHandler>))> + use<'s, 'n> {
         let wanted = resource_of(resource);
         let declared = Symbol::new(simple_name(effect.as_str()));
         self.entries
             .iter()
             .enumerate()
-            .find(|(_, (candidate, _))| {
+            .filter(move |(_, (candidate, _))| {
                 registration_names(&candidate.effect, effect, &declared)
                     && candidate.op == *op
                     && candidate.serves_label(&wanted)
             })
-            .map(|(index, (candidate, _))| (index, candidate))
     }
 }
 
-/// The test runner shares one binding across workers, so it must stay `Send + Sync`.
+/// Why a binding serves no registration of an operation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Unserved {
+    /// No registration is for it.
+    Unregistered,
+    /// The binding is hermetic, and `path` would serve it under `--host`.
+    Hermetic(&'static str),
+    /// Each registration for it is withheld from this run; `served` says where a run does bind
+    /// the first, `path`.
+    Withheld {
+        path: &'static str,
+        served: &'static str,
+    },
+}
+
+/// A `parallel` block's branches share one binding, so it must stay `Send + Sync`.
 const _: fn() = || {
     fn shareable<T: Send + Sync>() {}
     shareable::<HostRegistry>();
@@ -890,6 +612,35 @@ pub fn attribute(
     diagnostic
 }
 
+/// Whether a value handed across the boundary holds a credential anywhere.
+pub fn check_host_answer(
+    operation: &str,
+    path: &'static str,
+    value: &Value,
+    span: Span,
+) -> Result<(), Diagnostic> {
+    crate::escape::check(
+        &crate::escape::Boundary::HostAnswer { operation, path },
+        value,
+        span,
+    )
+}
+
+pub fn carries_secret(v: &Value) -> bool {
+    match v {
+        Value::Secret(_) => true,
+        Value::List(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
+        Value::Array(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
+        Value::Map(m) => crate::limit::grow(|| {
+            m.iter()
+                .any(|(k, v)| carries_secret(k) || carries_secret(v))
+        }),
+        Value::Record(fields) => crate::limit::grow(|| fields.values().any(carries_secret)),
+        Value::Ctor { args, .. } => crate::limit::grow(|| args.iter().any(carries_secret)),
+        _ => false,
+    }
+}
+
 #[cold]
 #[inline(never)]
 pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Diagnostic {
@@ -908,6 +659,20 @@ pub fn err_host_in_search(span: Span, operation: &str, path: &'static str) -> Di
 
 #[cold]
 #[inline(never)]
+pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_IN_SIMULATION,
+        format!("`{operation}` reached the host boundary from inside a `simulate` region"),
+    )
+    .primary(span, "performed here, against a real resource")
+    .secondary(region, "this region re-runs its body once per interleaving")
+    .note("the search runs the region whole for every schedule it explores, so this operation would be performed once per interleaving")
+    .note("and the result would then be reported as a proof over every interleaving")
+    .note("handle the operation with a test double inside the region, or hoist it out of the region entirely")
+}
+
+#[cold]
+#[inline(never)]
 pub fn err_blocking_answered_inline(span: Span, operation: &str, path: &'static str) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_BLOCKING_ANSWER,
@@ -917,6 +682,44 @@ pub fn err_blocking_answered_inline(span: Span, operation: &str, path: &'static 
     .note("`blocking: true` means the work leaves the machine's thread: the handler dispatches it and answers `HostAnswer::Pending` immediately")
     .note("a value returned from `call` is this thread having done the work, so every task sharing it was stalled for the duration")
     .note("dispatch the work to the host's pool and answer `Pending`, or register the operation `blocking: false`")
+}
+
+#[cold]
+#[inline(never)]
+pub fn err_footprint_escape(
+    span: Span,
+    operation: &str,
+    atom: &EffectAtom,
+    declared: &Footprint,
+    path: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(
+        codes::HOST_FOOTPRINT_ESCAPE,
+        format!("`{path}` answered `{atom}`, which is outside this entry point's declared footprint"),
+    )
+    .primary(span, format!("`{operation}` performed here"))
+    .note(format!("the entry point's declared footprint is {declared}"))
+    .note("scheduling and world isolation are decided from that footprint, so an operation outside it may have run beside work it conflicts with")
+    .note("this is Ply's fault: the run knows two of its own answers disagree and nothing in the definition graph decides which was meant")
+}
+
+#[cold]
+#[inline(never)]
+pub fn err_secret_to_host(
+    span: Span,
+    operation: &str,
+    position: usize,
+    path: &'static str,
+) -> Diagnostic {
+    Diagnostic::error(
+        codes::SECRET_TO_HOST,
+        format!("`{operation}` was handed a `Secret` in argument {}", position + 1),
+    )
+    .primary(span, "performed here")
+    .note(format!("`{path}` is registered `secrets: no`, so nothing above the boundary knows a credential can reach it"))
+    .note("below the boundary nothing is checkable: what a handler does with a credential is invisible to every guarantee this language makes")
+    .note("`ply hosts` prints the column; a handler that must receive one declares `secrets: true` there and becomes a reviewed member of the trusted computing base")
+    .note("this is Ply's fault: the registration and what crossed it disagree, and no definition in the program decides which was meant")
 }
 
 #[cold]
@@ -969,164 +772,6 @@ pub fn err_withheld(
     ))
 }
 
-#[cold]
-#[inline(never)]
-fn err_anonymous(op: &HostOp) -> Diagnostic {
-    Diagnostic::error(
-        codes::HOST_OPERATION_UNKNOWN,
-        format!("a host handler for `{op}` declares no Rust path"),
-    )
-    .note("`ply hosts` prints the path, and it is the reviewable identity of a member of the trusted computing base")
-    .note("give the registration a `path` naming the function that serves it, such as `ply_host::tcp::send`")
-}
-
-#[cold]
-#[inline(never)]
-fn err_unknown_effect(op: &HostOp, check: &CheckOutput) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_OPERATION_UNKNOWN,
-        format!(
-            "`{}` registers for `{op}`, which this program does not declare",
-            op.path
-        ),
-    )
-    .note(format!(
-        "no effect named `{}` is declared anywhere in the program",
-        op.effect
-    ));
-    if let Some(near) = nearest_effect(&op.effect, check) {
-        diagnostic = diagnostic
-            .note(format!("the closest declared effect is `{near}`"))
-            .note(format!(
-                "declare `effect {}` with the operations this handler serves, or register against `{}`",
-                op.effect,
-                simple_name(near.as_str()),
-            ));
-    }
-    diagnostic.note("a host handler's triple is its footprint claim; a claim about an effect nothing declares is a claim about nothing")
-}
-
-#[cold]
-#[inline(never)]
-fn err_ambiguous_effect(op: &HostOp, declarations: &[&EffectInfo]) -> Diagnostic {
-    let names: Vec<String> = declarations
-        .iter()
-        .map(|e| format!("`{}`", e.name))
-        .collect();
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_HANDLER_CONFLICT,
-        format!(
-            "`{}` registers for `{op}`, and this program declares `{}` {} times",
-            op.path,
-            op.effect,
-            declarations.len()
-        ),
-    )
-    .note(format!("declared as {}", names.join(" and ")));
-    for declaration in declarations {
-        if !declaration.span.is_dummy() {
-            diagnostic = diagnostic.secondary(declaration.span, "declared here");
-        }
-    }
-    diagnostic
-        .note("effects are nominal, so these are different effects that share a spelling, and one host handler cannot be both")
-        .note("rename one declaration, or keep a single one and import it where it is used")
-}
-
-#[cold]
-#[inline(never)]
-fn err_resource_unexpected(op: &HostOp, effect: &EffectInfo) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_OPERATION_UNKNOWN,
-        format!(
-            "`{}` registers for `{op}`, but `{}.{}` is not resource-parameterized",
-            op.path, op.effect, op.op
-        ),
-    );
-    if let Some(decl) = effect.ops.get(&op.op)
-        && !decl.span.is_dummy()
-    {
-        diagnostic = diagnostic.secondary(decl.span, "declared without `[r]`");
-    }
-    diagnostic
-        .note("an operation declared without `[r]` has one singleton resource")
-        .note("register `HostResource::Only(Resource::Singleton)`, or add `[r]` to the declaration")
-}
-
-#[cold]
-#[inline(never)]
-fn err_unused_resource(op: &HostOp, atom: &EffectAtom, effect: &EffectInfo) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_OPERATION_UNKNOWN,
-        format!(
-            "`{}` registers for `{atom}`, which this program never performs",
-            op.path
-        ),
-    );
-    if !effect.span.is_dummy() {
-        diagnostic = diagnostic.secondary(effect.span, "the effect is declared here");
-    }
-    diagnostic
-        .note("no definition, test or law in the program has that atom in its footprint")
-        .note("check the resource label, or register `HostResource::Any` to serve whichever labels the program uses")
-}
-
-#[cold]
-#[inline(never)]
-fn err_determinism(op: &HostOp, effect: &EffectInfo) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(
-        codes::HOST_DETERMINISM_MISMATCH,
-        format!(
-            "`{}` is nondeterministic, but `effect {}` is not declared `nondet`",
-            op.path, effect.simple_name
-        ),
-    );
-    if !effect.span.is_dummy() {
-        diagnostic = diagnostic.secondary(effect.span, "declared here, without `nondet`");
-    }
-    diagnostic
-        .note(format!("write `nondet effect {}` so that a `det` test reaching it is E0412", effect.simple_name))
-        .note("or declare the handler `Determinism::Deterministic` if its answers really are a function of the program state")
-        .note("the declaration is the authority: a binding may not change what inference computed, or `ply check` would answer differently under `--host`")
-}
-
-#[cold]
-#[inline(never)]
-fn err_conflict(op: &HostOp, first: &str, second: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::HOST_HANDLER_CONFLICT,
-        format!("two host handlers claim `{op}`"),
-    )
-    .note(format!("`{first}` and `{second}` both serve it"))
-    .note("which one answers would decide which real resource is touched; narrow one registration's resource, or remove it")
-}
-
-fn nearest_effect(wanted: &Symbol, check: &CheckOutput) -> Option<Symbol> {
-    let simple = simple_name(wanted.as_str());
-    if let Some(name) = check
-        .effects
-        .values()
-        .find(|effect| effect.simple_name.as_str() == simple)
-    {
-        return Some(name.name.clone());
-    }
-    // A declared effect is program-wide, `<module>.<name>`, so it is near by its own name.
-    check
-        .effects
-        .keys()
-        .map(|name| (shared_prefix(simple_name(name.as_str()), simple), name))
-        .filter(|(shared, name)| {
-            let shortest = simple_name(name.as_str()).len().min(simple.len());
-            *shared >= 2 && *shared * 2 >= shortest
-        })
-        .max_by_key(|(shared, name)| (*shared, std::cmp::Reverse((*name).clone())))
-        .map(|(_, name)| name.clone())
-}
-
 fn simple_name(name: &str) -> &str {
     name.rsplit('.').next().unwrap_or(name)
-}
-
-fn shared_prefix(a: &str, b: &str) -> usize {
-    a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }

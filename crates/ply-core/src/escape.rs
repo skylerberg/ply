@@ -88,9 +88,6 @@ pub enum Boundary<'a> {
         label: &'static str,
         token: u64,
     },
-    EntryPoint {
-        name: &'a str,
-    },
     EntryAnswer {
         name: &'a str,
     },
@@ -114,9 +111,6 @@ impl Boundary<'_> {
             Boundary::HostToken { label, token } => {
                 format!("the host runtime resolved `{label}` (#{token}) to {what}{reached}")
             }
-            Boundary::EntryPoint { name } => {
-                format!("`{name}` was called with {what}{reached}")
-            }
             Boundary::EntryAnswer { name } => format!("`{name}` answered {what}{reached}"),
         }
     }
@@ -125,7 +119,6 @@ impl Boundary<'_> {
         match self {
             Boundary::HostArgument { .. } => "performed here",
             Boundary::HostAnswer { .. } | Boundary::HostToken { .. } => "the answer to this",
-            Boundary::EntryPoint { .. } => "entered here",
             Boundary::EntryAnswer { .. } => "answered here",
         }
     }
@@ -143,10 +136,6 @@ impl Boundary<'_> {
             Boundary::HostToken { .. } => Cow::Borrowed(
                 "a host runtime is outside the program, so a handle it produced names no region \
                  this run allocated",
-            ),
-            Boundary::EntryPoint { .. } => Cow::Borrowed(
-                "an entry point starts a run of its own, so a handle carried in from another run \
-                 names nothing this one made",
             ),
             Boundary::EntryAnswer { .. } => Cow::Borrowed(
                 "an entry point's answer goes to its caller, which keeps it after the entry has \
@@ -168,10 +157,6 @@ impl Boundary<'_> {
             (Boundary::HostAnswer { .. } | Boundary::HostToken { .. }, _) => {
                 "a handler answers with data; a handle into the program's memory is not data it \
                  is in a position to have"
-            }
-            (Boundary::EntryPoint { .. }, _) => {
-                "call the entry point with data, and let the program make its own tasks, channels \
-                 and continuations"
             }
             (Boundary::EntryAnswer { .. }, Handle::Task | Handle::Chan) => {
                 "read the value inside the region and answer with something that does not reach \

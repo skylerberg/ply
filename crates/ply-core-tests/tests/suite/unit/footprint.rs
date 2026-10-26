@@ -34,23 +34,6 @@ fn a_mode_atom_covers_its_operations_and_an_operation_atom_only_itself() {
 }
 
 #[test]
-fn an_operation_atom_takes_its_mode_from_the_declaration() {
-    let peek = EffectAtom::operation("net", Resource::Singleton, Mode::Write, "peek");
-    let declared = |effect: &Symbol, op: &Symbol| {
-        (effect.as_str() == "net" && op.as_str() == "peek").then_some(Mode::Read)
-    };
-    assert_eq!(peek.clone().with_declared_mode(&declared).mode, Mode::Read);
-    let mut footprint = Footprint::from_atoms([peek, atom("net", None, Mode::Write)]);
-    footprint.resolve_modes(&declared);
-    assert_eq!(footprint.to_string(), "{net.peek, net.write}");
-    assert!(
-        footprint
-            .atoms()
-            .any(|a| a.op.is_some() && a.mode == Mode::Read)
-    );
-}
-
-#[test]
 fn reads_of_the_same_resource_do_not_conflict() {
     let a = Footprint::from_atoms([atom("db", Some("users"), Mode::Read)]);
     let b = Footprint::from_atoms([atom("db", Some("users"), Mode::Read)]);

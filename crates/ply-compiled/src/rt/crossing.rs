@@ -839,37 +839,14 @@ pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
     }
 }
 
-/// What an entry's `R#entered` wrote of its root's answer.
-pub(crate) enum EntryAnswer {
-    /// The answer, and whether it holds a value the bytes could not, each read as the value it
-    /// stands for.
-    Read { value: Value, holding: bool },
-    /// The answer holds a function the program wrote, which only its own run can hold.
-    Function,
-}
-
 impl Ctx {
     /// Opens what an entry through `R#entered` runs between: a lowering for its answer, and over it
-    /// a lifting of `bytes`, the arguments' list, each of `held` made a runtime object for the
-    /// handle it is.
-    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
+    /// a lifting of `bytes`, the arguments' list.
+    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>) {
         self.crossings
             .push(Crossing::Lowering(Lowering::new(false)));
-        self.lift_holding(bytes, held);
+        self.lift_holding(bytes, Vec::new());
     }
-}
-
-/// Ends the lowering [`Ctx::open_entry`] opened and reads the answer in it.
-pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
-    let l = entry_lowering(ctx)?;
-    if l.functions {
-        return Ok(EntryAnswer::Function);
-    }
-    let holding = !l.beside.is_empty() || l.resumes;
-    Ok(EntryAnswer::Read {
-        value: read_back(ctx, l)?,
-        holding,
-    })
 }
 
 /// What an entry's `R#entered` wrote of its root's answer, kept as the bytes it wrote.
@@ -883,8 +860,9 @@ pub(crate) enum EntryBytes {
     Function,
 }
 
-/// [`close_entry`], the answer kept as bytes where they hold all of it.
-pub(crate) fn close_entry_bytes(ctx: *mut Ctx) -> Result<EntryBytes, String> {
+/// Ends the lowering [`Ctx::open_entry`] opened: the answer kept as the bytes the entry wrote
+/// where they hold all of it.
+pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
     let l = entry_lowering(ctx)?;
     if l.functions {
         return Ok(EntryBytes::Function);

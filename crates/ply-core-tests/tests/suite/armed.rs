@@ -13,7 +13,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[(
     "Severity::Note",
     "Two consumers and no producer: `Diagnostic`'s Display in \
          crates/ply-core/src/span.rs heads a diagnostic \"Note\", and \
-         crates/ply-privileged/src/payload.rs hands the program a \"note\". \
+         crates/ply-compiled/src/entry.rs writes a failure's severity for the program. \
          Nothing builds one. Severity also derives Deserialize, so a Note could \
          in principle arrive from a stored diagnostic rather than from a \
          constructor — nothing in the workspace writes one, and the gate cannot \
@@ -33,14 +33,8 @@ struct Indirection {
     reason: &'static str,
 }
 
-/// The enums the variant half covers, as `(file, name)`: the prove package's runtime among them.
-const COVERED_ENUMS: &[(&str, &str)] = &[
-    ("crates/ply-core/src/span.rs", "Severity"),
-    ("crates/ply-privileged/src/engine.rs", "ObligationKind"),
-    ("crates/ply-privileged/src/engine.rs", "Strategy"),
-    ("crates/ply-privileged/src/engine.rs", "Judgement"),
-    ("crates/ply-privileged/src/engine.rs", "Mode"),
-];
+/// The enums the variant half covers, as `(file, name)`.
+const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-core/src/span.rs", "Severity")];
 
 /// Blanks comments and string, raw-string and char literals, preserving offsets and newlines.
 fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
@@ -809,27 +803,52 @@ fn ply_item_bodies_masked(text: &[u8]) -> Vec<bool> {
     masked
 }
 
-/// A code a `.ply` source raises. Ply passes the code as a byte literal — `diag1(b"E0128", ..)`,
-/// `err1(cx, b"E0201", ..)` — so the number itself is the arming, and a plain `"E0128"` in a
-/// rendered-text assertion or in `explain`'s table is not one.
+/// A code a `.ply` source raises. The compiler passes the code as a byte literal —
+/// `diag1(b"E0128", ..)`, `err1(cx, b"E0201", ..)` — and the CLI as the text `diag_of` is handed
+/// after the severity, `diag_of("error", "E0421", ..)`; a plain `"E0128"` anywhere else, in a
+/// rendered-text assertion or in `explain`'s table, is not one.
 fn ply_armed_numbers(sources: &[Source]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for source in sources {
-        for at in find_all(&source.text, b"b\"") {
-            let body = at + 2;
-            if body + 5 > source.text.len() || source.masked[at] {
+        let text = &source.text;
+        for at in find_all(text, b"b\"") {
+            if !source.masked[at]
+                && let Some(number) = quoted_code(text, at + 1)
+            {
+                out.insert(number);
+            }
+        }
+        for at in find_all(text, b"diag_of(") {
+            if source.masked[at] {
                 continue;
             }
-            let number = &source.text[body..body + 5];
-            let shaped = matches!(number[0], b'E' | b'W')
-                && number[1..].iter().all(|b| b.is_ascii_digit())
-                && source.text.get(body + 5) == Some(&b'"');
-            if shaped {
-                out.insert(String::from_utf8_lossy(number).to_string());
+            let severity = skip_ws(text, at + b"diag_of(".len(), text.len());
+            if text.get(severity) != Some(&b'"') {
+                continue;
+            }
+            let Some(close) = text[severity + 1..].iter().position(|b| *b == b'"') else {
+                continue;
+            };
+            let comma = skip_ws(text, severity + close + 2, text.len());
+            if text.get(comma) != Some(&b',') {
+                continue;
+            }
+            if let Some(number) = quoted_code(text, skip_ws(text, comma + 1, text.len())) {
+                out.insert(number);
             }
         }
     }
     out
+}
+
+/// The code a literal opening at `quote` spells whole, `"E0128"`.
+fn quoted_code(text: &[u8], quote: usize) -> Option<String> {
+    let number = text.get(quote + 1..quote + 6)?;
+    let shaped = text.get(quote) == Some(&b'"')
+        && matches!(number[0], b'E' | b'W')
+        && number[1..].iter().all(|b| b.is_ascii_digit())
+        && text.get(quote + 6) == Some(&b'"');
+    shaped.then(|| String::from_utf8_lossy(number).to_string())
 }
 
 fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -1279,10 +1298,11 @@ fn every_registered_code_is_constructed_in_production() {
             "\nA code is ARMED iff a production Rust source calls Diagnostic::error(codes::NAME, ..) \
              or Diagnostic::warning(codes::NAME, ..), or passes codes::NAME to a wrapper listed \
              in CODE_INDIRECTION, or a `.ply` source a member ships raises its number as a byte \
-             literal, as `diag1(b\"E0128\", ..)` does. A row in the registry table, an entry in \
-             crates/ply-core/src/host.rs's RESERVED_CODES, a `\"E0128\"` string rather than a byte \
-             literal, and any mention under #[cfg(test)], inside a Ply `test` or `law` body, or \
-             under crates/*/tests/ are NOT armings.",
+             literal, as `diag1(b\"E0128\", ..)` does, or as the code `diag_of` is handed, as \
+             `diag_of(\"error\", \"E0421\", ..)` does. A row in the registry table, an entry in \
+             crates/ply-core/src/host.rs's RESERVED_CODES, any other `\"E0128\"` string, and any \
+             mention under #[cfg(test)], inside a Ply `test` or `law` body, or under \
+             crates/*/tests/ are NOT armings.",
         );
         message.push_str(&how_to_fix(
             "raise it where the condition it names is detected",

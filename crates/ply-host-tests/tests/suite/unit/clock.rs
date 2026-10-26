@@ -1,36 +1,12 @@
 use ply_core::Mode;
-use ply_core::host::MachineId;
+use ply_core::host::{Grants, MachineId, Unserved};
 use ply_core::{HostAnswer, HostBinding, HostRequest, Span, Symbol, Value};
 use ply_host::Host;
 use ply_host::clock::*;
-use ply_test_support::{Sketch, atom};
 
-/// Reads the language's clock and sleeps on it, so both rows bind.
-fn timed() -> ply_core::CheckOutput {
-    Sketch::program()
-        .def(
-            "m",
-            "waited",
-            vec![
-                atom("clock", "", Mode::Read),
-                atom("clock", "", Mode::Write),
-            ],
-        )
-        .check()
-}
-
-/// Declares a `clock` of its own, `nondet effect clock { read now() -> Int }`, which hides the
-/// language's in this module.
-fn own() -> ply_core::CheckOutput {
-    Sketch::program()
-        .effect("m", "clock", true, &[("now", Mode::Read, false)])
-        .def("m", "stamp", vec![atom("m.clock", "", Mode::Read)])
-        .check()
-}
-
-fn bound(host: &Host, check: ply_core::CheckOutput) -> HostBinding {
+fn bound(host: &Host) -> HostBinding {
     host.registry()
-        .bind(&check)
+        .granted(Grants::default())
         .unwrap_or_else(|d| panic!("the host binds: {d:?}"))
 }
 
@@ -63,37 +39,30 @@ fn nanos(value: &Value) -> i64 {
     ply_core::sim::nanos_of(value, Span::DUMMY, "a reading").expect("an `Instant`")
 }
 
+/// A registration by the language's name is for the language's effect: a module's own `clock`,
+/// which hides the language's there, is answered by nothing the host registers, where read by its
+/// declared name it would be answered an `Instant` where it reads an `Int`.
 #[test]
-fn the_host_serves_the_languages_clock_to_a_program_that_performs_it() {
-    let rows: Vec<String> = bound(&Host::new(), timed())
-        .listing()
-        .rows
-        .iter()
-        .map(|row| row.to_string())
-        .collect();
-    assert_eq!(rows, ["clock.now", "clock.sleep"]);
-}
-
-/// A registration by the language's name is for the language's effect: bound by declared name it
-/// would find two declarations here, and answer one of them an `Instant` where it reads an `Int`.
-#[test]
-fn a_modules_own_clock_is_not_the_one_the_host_serves() {
-    let binding = bound(&Host::new(), own());
-    assert!(
-        binding.listing().is_empty(),
-        "the host bound a handler to an effect a module declared: {:?}",
-        binding.listing().rows
-    );
-    assert_eq!(
-        binding.would_serve(&Symbol::new("m.clock"), &Symbol::new("now"), None),
-        None
-    );
+fn the_host_serves_the_languages_clock_and_not_a_modules_own() {
+    let binding = bound(&Host::new());
+    for op in ["now", "sleep"] {
+        assert!(
+            binding
+                .resolve(&Symbol::new(EFFECT), &Symbol::new(op), None)
+                .is_ok(),
+            "`clock.{op}` is not served"
+        );
+    }
+    assert!(matches!(
+        binding.resolve(&Symbol::new("m.clock"), &Symbol::new("now"), None),
+        Err(Unserved::Unregistered)
+    ));
 }
 
 #[test]
 fn a_reading_is_an_instant_on_the_clock_the_runtime_keeps() {
     let host = Host::new();
-    let binding = bound(&host, timed());
+    let binding = bound(&host);
     let rt = host.runtime();
     let before = rt.now().expect("the host keeps time");
     let read = answer(&host, &binding, Op::Now, &[]);
@@ -115,7 +84,7 @@ fn a_reading_is_an_instant_on_the_clock_the_runtime_keeps() {
 #[test]
 fn the_handlers_sleep_is_the_threads_wait() {
     let host = Host::new();
-    let binding = bound(&host, timed());
+    let binding = bound(&host);
     let before = nanos(&answer(&host, &binding, Op::Now, &[]));
     let span = Value::ctor("Duration", vec![Value::Int(20_000_000)]);
     let answered = answer(&host, &binding, Op::Sleep, &[span]);

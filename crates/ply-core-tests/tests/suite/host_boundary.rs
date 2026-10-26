@@ -2,8 +2,8 @@
 //! the operation and the handler, and says what would or would not help. Which calls reach these is
 //! the CLI suite's `host_boundary` module, over real host operations.
 
-use ply_core::host::{err_blocking_answered_inline, err_hermetic};
-use ply_core::{EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes, err_footprint_escape};
+use ply_core::host::{err_blocking_answered_inline, err_footprint_escape, err_hermetic};
+use ply_core::{EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes};
 
 /// E0424 means "pass `--host`", which a handler is named for.
 #[test]

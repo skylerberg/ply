@@ -592,6 +592,21 @@ impl Handlers {
     }
 }
 
+#[cold]
+#[inline(never)]
+pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::NESTED_SIMULATION,
+        "a `simulate` region may not run inside another one",
+    )
+    .primary(span, "this region is entered while one is already running")
+    .secondary(outer, "the region already running")
+    .note(
+        "two schedulers mean two notions of `runnable` and a state space that is a product of both",
+    )
+    .note("hoist the inner region out, or handle its effects with an ordinary `handle`")
+}
+
 /// What `random.below(bound)` draws below, or the raise a bound below one is.
 pub fn bound_of(bound: i64, span: Span) -> Result<u64, Diagnostic> {
     u64::try_from(bound)

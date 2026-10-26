@@ -1,188 +1,37 @@
-//! What a host may lend a program, by name. The launcher lends its own program every family; any
-//! other host names the ones it means, so what may drive a machine is a decision with a name and
-//! a summary a reviewer can read.
+//! What a host may lend a program, by name. The launcher lends its own program every family; a run
+//! that program makes is lent the ones its `allow` entries name, so what may drive a machine is a
+//! decision with a name.
 
 use crate::hosts::LentOp;
-use ply_core::{CheckOutput, Diagnostic, Span, codes};
 
-/// One family of capabilities, and what lending it lets a program do.
-pub struct Family {
-    pub name: &'static str,
-    /// The effects whose operations the family lends, one of which a program must declare to reach
-    /// any of them.
-    pub effects: &'static [&'static str],
-    /// The same operations answered from what they are handed alone, by deterministic handlers.
-    pub hermetic: Option<&'static str>,
-    pub summary: &'static str,
-}
-
-/// Every family a host can lend. `machine` is the one that drives another machine: a program lent
-/// it can load, bind, enter and call a nested program, so a host lends it only on purpose.
-pub const FAMILIES: &[Family] = &[
-    Family {
-        name: "machine",
-        effects: &["machine"],
-        hermetic: Some("hermetic_machine"),
-        summary: "load, bind, enter and call a nested program",
-    },
-    Family {
-        name: "tester",
-        effects: &["tester"],
-        hermetic: Some("hermetic_tester"),
-        summary: "run a project's tests, and report what ran; `hermetic_tester` runs them binding nothing",
-    },
-    Family {
-        name: "claims",
-        effects: &["prover"],
-        hermetic: Some("hermetic_prover"),
-        summary: "discharge a project's obligations",
-    },
-    Family {
-        name: "hosts",
-        effects: &["hosts"],
-        hermetic: Some("hermetic_hosts"),
-        summary: "preview what a run would bind",
-    },
-    Family {
-        name: "shipped",
-        effects: &["shipped"],
-        hermetic: None,
-        summary: "read the modules and the version this binary ships",
-    },
-    Family {
-        name: "toolchain",
-        effects: &["compilers", "toolchain", "memory"],
-        hermetic: None,
-        summary: "compile and link C with the host's compiler, below the toolchain's cache, and read the program's own heap",
-    },
-];
+/// Every family a host can lend. `machine` registers nothing: it is what lets `std.machine`'s
+/// natives lend the host to a run they make, so a host lends it only on purpose.
+pub const FAMILIES: [&str; 3] = ["machine", "shipped", "toolchain"];
 
 /// Every family's name, in the order [`FAMILIES`] lists them.
 pub fn names() -> Vec<&'static str> {
-    FAMILIES.iter().map(|f| f.name).collect()
+    FAMILIES.to_vec()
 }
 
-pub fn known(name: &str) -> bool {
-    FAMILIES.iter().any(|f| f.name == name)
-}
-
-/// Where the program being lent declares each family's effect, by the effect's simple name: the
-/// values a family hands back are named as that program names them.
-pub type Declared<'a> = &'a dyn Fn(&str) -> String;
-
-/// Every effect where the `ply` binary's own program declares it.
-fn own(effect: &str) -> String {
-    match effect {
-        "prover" => "claims",
-        "shipped" => "compiler.unit",
-        "compilers" | "toolchain" | "memory" => "compiler.cc",
-        other => other,
-    }
-    .to_string()
-}
-
-/// The operations one family lends.
-pub fn lent(family: &str, declared: Declared<'_>) -> Option<Vec<LentOp>> {
-    Some(match family {
-        "machine" => {
-            let mut ops = crate::registrations_with(crate::drive::RunOptions::default());
-            ops.extend(crate::hermetic_registrations());
-            ops
-        }
-        "tester" => crate::tester::lent(),
-        "claims" => crate::claims::lent(&declared("prover")),
-        "hosts" => crate::hosts::lent(&declared("hosts")),
+/// The operations one family registers; none for a name that is no family.
+pub fn lent(family: &str) -> Vec<LentOp> {
+    match family {
         "shipped" => crate::shipped::lent(),
         "toolchain" => crate::toolchain::lent(),
-        _ => return None,
-    })
-}
-
-/// The effects a family's operations are performed under, one of which a program must declare to
-/// be lent it: `claims` lends `prover`, so the family's name is not it.
-pub fn effects_of(family: &str) -> Option<&'static [&'static str]> {
-    FAMILIES
-        .iter()
-        .find(|f| f.name == family)
-        .map(|f| f.effects)
-}
-
-pub fn hermetic_of(family: &str) -> Option<&'static str> {
-    FAMILIES.iter().find(|f| f.name == family)?.hermetic
-}
-
-/// The operations of the named families, or why one of them is not a family.
-pub fn lent_for(families: &[&str], declared: Declared<'_>) -> Result<Vec<LentOp>, String> {
-    let mut out = Vec::new();
-    for family in families {
-        match lent(family, declared) {
-            Some(ops) => out.extend(ops),
-            None => {
-                return Err(format!(
-                    "`{family}` is not a family a host lends; it lends {}",
-                    names().join(", ")
-                ));
-            }
-        }
+        _ => Vec::new(),
     }
-    Ok(out)
 }
 
-/// What `--allow` grants a program: the operations of every family it names, each of whose effect
-/// the program must declare. A family whose effect it does not declare reaches nothing, so granting
-/// one is refused rather than ignored.
-pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<LentOp>, Diagnostic> {
-    let declared = |effect: &str| {
-        check
-            .effects
-            .values()
-            .find(|e| e.simple_name.as_str() == effect)
-    };
-    let families: Vec<&str> = allow.iter().map(String::as_str).collect();
-    for name in &families {
-        // A name that is no family is refused by `lent_for`, which says what the families are.
-        let Some(effects) = effects_of(name) else {
-            continue;
-        };
-        if effects.iter().all(|effect| declared(effect).is_none()) {
-            let named = effects
-                .iter()
-                .map(|e| format!("`{e}`"))
-                .collect::<Vec<_>>()
-                .join(" or ");
-            return Err(Diagnostic::error(
-                codes::CAPABILITY_UNDECLARED,
-                format!("`--allow {name}` was granted and the program declares no {named} effect"),
-            )
-            .primary(
-                Span::DUMMY,
-                "a family the program does not declare reaches nothing",
-            )
-            .note(format!(
-                "`{name}` lends the operations of {named}, and a run lends only what the program \
-                 it runs can reach"
-            )));
-        }
-    }
-    let module =
-        |effect: &str| declared(effect).map_or_else(|| own(effect), |e| e.module.to_string());
-    lent_for(&families, &module).map_err(|why| Diagnostic::error(codes::CAPABILITY_UNDECLARED, why))
-}
-
-/// The families a run's `allow` entries name, served as the `ply` binary's own program declares
-/// their effects.
+/// The families a run's `allow` entries name.
 pub fn lent_to(grants: &ply_core::host::Grants) -> Vec<LentOp> {
     FAMILIES
         .iter()
-        .filter(|f| grants.allows(f.name))
-        .flat_map(|f| lent(f.name, &own).unwrap_or_default())
+        .filter(|family| grants.allows(family))
+        .flat_map(|family| lent(family))
         .collect()
 }
 
 /// Every family, for a host that lends them all: the `ply` binary's own program.
 pub fn all() -> Vec<LentOp> {
-    FAMILIES
-        .iter()
-        .flat_map(|f| lent(f.name, &own).unwrap_or_default())
-        .collect()
+    FAMILIES.iter().flat_map(|family| lent(family)).collect()
 }

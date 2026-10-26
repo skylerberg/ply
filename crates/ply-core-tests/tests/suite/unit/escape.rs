@@ -128,9 +128,6 @@ fn every_boundary_refuses_a_continuation_and_names_it() {
             label: "keep",
             token: 7,
         },
-        Boundary::EntryPoint {
-            name: "m.resume_it",
-        },
         Boundary::EntryAnswer { name: "m.parked" },
     ];
     for boundary in boundaries {
@@ -248,7 +245,7 @@ fn check_arguments_names_the_first_position_that_carries_one() {
 }
 
 #[test]
-fn an_answer_and_an_entry_point_each_say_what_outlives_the_region() {
+fn a_host_answer_says_what_outlives_the_region() {
     let answer = check(
         &Boundary::HostAnswer {
             operation: "net.recv[s]",
@@ -265,22 +262,5 @@ fn an_answer_and_an_entry_point_each_say_what_outlives_the_region() {
             .any(|n| n.contains("outside the program")),
         "{:#?}",
         answer.notes
-    );
-
-    let entry = check(
-        &Boundary::EntryPoint {
-            name: "m.resume_it",
-        },
-        &task(),
-        Span::DUMMY,
-    )
-    .expect_err("a smuggled handle is refused");
-    assert!(
-        entry
-            .notes
-            .iter()
-            .any(|n| n.contains("starts a run of its own")),
-        "{:#?}",
-        entry.notes
     );
 }

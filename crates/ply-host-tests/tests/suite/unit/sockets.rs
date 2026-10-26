@@ -1,14 +1,12 @@
 //! The socket host over real loopback: addresses, options, Unix sockets, the upgrade to TLS,
 //! datagrams and the resolver.
 
-use crate::support::declared::{labelled, shipped};
-use ply_core::host::MachineId;
+use ply_core::host::{Grants, MachineId};
 use ply_core::{
     Diagnostic, HostAnswer, HostBinding, HostRequest, HostRuntime, Span, Symbol, Value, codes,
 };
 use ply_host::tcp::wire::{Endpoint, Probing, SocketOption};
 use ply_host::{Credentials, Host};
-use ply_test_support::Sketch;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::rc::Rc;
 use std::time::Duration;
@@ -17,36 +15,7 @@ const NET: &str = "std.net.net";
 const UDP: &str = "std.udp.udp";
 const DNS: &str = "std.dns.dns";
 
-/// Names every operation the tests perform, under the labels they perform it under.
-fn driver() -> ply_core::CheckOutput {
-    let both = |effect: &str, label: &str| {
-        [
-            labelled(effect, label, ply_core::Mode::Read),
-            labelled(effect, label, ply_core::Mode::Write),
-        ]
-    };
-    let row: Vec<ply_core::EffectAtom> = [
-        both(NET, "listener"),
-        both(NET, "conn"),
-        both(NET, "client"),
-        both(UDP, "socket"),
-        both(UDP, "other"),
-    ]
-    .into_iter()
-    .flatten()
-    .chain(["lookup", "reverse", "servers"].map(|op| {
-        ply_core::EffectAtom::operation(
-            DNS,
-            ply_core::Resource::Singleton,
-            ply_core::Mode::Read,
-            op,
-        )
-    }))
-    .collect();
-    shipped(Sketch::program()).def("app", "driven", row).check()
-}
-
-/// One host, bound to the driver, with the runtime that settles what it leaves pending.
+/// One host, bound from no grants, with the runtime that settles what it leaves pending.
 struct Bound {
     host: Host,
     binding: HostBinding,
@@ -54,11 +23,10 @@ struct Bound {
 }
 
 fn bound(host: Host) -> Bound {
-    let check = driver();
     let binding = host
         .registry()
-        .bind(&check)
-        .expect("the declarations and the registrations agree");
+        .granted(Grants::default())
+        .expect("no two registrations serve one operation");
     let runtime = host.runtime();
     Bound {
         host,
@@ -80,7 +48,7 @@ impl Bound {
         let served = self
             .binding
             .resolve(&Symbol::new(effect), &Symbol::new(op), label.as_ref())
-            .unwrap_or_else(|| panic!("the registry serves `{effect}.{op}` under {label:?}"));
+            .unwrap_or_else(|_| panic!("the registry serves `{effect}.{op}` under {label:?}"));
         let request = HostRequest {
             machine: MachineId(1),
             atom: ply_core::EffectAtom::operation(

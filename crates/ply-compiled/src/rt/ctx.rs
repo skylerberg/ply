@@ -72,9 +72,6 @@ pub struct Ctx {
     pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_core::HostBinding>,
-    /// The program this context's entries run, whose declarations say how a host operation's
-    /// arguments read; `None` for one entered without its program's answer.
-    pub(crate) program: Option<Arc<ply_core::Analysis>>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
     /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
     pub(crate) runtime_factory: Option<ply_core::RuntimeFactory>,
@@ -180,7 +177,6 @@ impl Ctx {
             starting_detached: None,
             entry: 0,
             binding: Arc::new(ply_core::HostBinding::hermetic()),
-            program: None,
             runtime: None,
             runtime_factory: None,
             declared: None,
@@ -282,7 +278,6 @@ impl Ctx {
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
         b.runtime_factory = self.runtime_factory.clone();
-        b.program = self.program.clone();
         b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
         b.id = self.id;

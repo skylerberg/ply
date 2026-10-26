@@ -1515,22 +1515,13 @@ fn this_module_names_nothing_a_seeded_run_may_not_depend_on() {
 }
 
 use ply_core::host::{
-    Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
+    Determinism, Grants, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, Linearity,
 };
-use ply_test_support::Sketch;
 use std::sync::Arc;
 
-/// Enough of a program to bind against; these tests need only that it is bound.
+/// A binding that serves something; these tests need only that it is bound.
 fn binding() -> HostBinding {
-    let check = Sketch::program()
-        .effect("m", "db", true, &[("get", Mode::Read, true)])
-        .def(
-            "m",
-            "lookup",
-            vec![ply_test_support::atom("m.db", "users", Mode::Read)],
-        )
-        .check();
     let mut registry = HostRegistry::new();
     registry.register(
         HostOp {
@@ -1545,7 +1536,9 @@ fn binding() -> HostBinding {
         },
         Arc::new(Never),
     );
-    registry.bind(&check).expect("the fixture binds")
+    registry
+        .granted(Grants::default())
+        .expect("the fixture binds")
 }
 
 struct Never;

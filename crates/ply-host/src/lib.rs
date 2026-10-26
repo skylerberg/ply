@@ -92,5 +92,5 @@ pub mod tls;
 pub mod trace;
 pub mod udp;
 
-pub use registry::{Host, registry, registry_over};
+pub use registry::{Host, registry};
 pub use tls::{CredentialSpec, Credentials, HandshakeCounts};

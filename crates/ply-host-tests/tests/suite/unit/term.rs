@@ -1,4 +1,4 @@
-use ply_core::host::{HostBinding, MachineId};
+use ply_core::host::{Grants, HostBinding, MachineId, Unserved};
 use ply_core::{
     Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime,
     Linearity, Mode, Resource, Span, Symbol, Value, codes,
@@ -147,24 +147,28 @@ fn a_withheld_registration_refuses_dispatch() {
 /// A test is no process of its own: it has no terminal, as it has no streams.
 #[test]
 fn a_host_that_only_starts_programs_withholds_the_terminal() {
-    let spawning = ply_host::Host::new().with_process(ProcessHost::spawning(Executables::new()));
-    let binding = HostBinding::hermetic_with(spawning.registry());
-    let whole =
-        ply_host::Host::new().with_process(ProcessHost::new(Vec::new(), OutputSink::captured()));
-    let bound = HostBinding::hermetic_with(whole.registry());
+    let granted = |host: ply_host::Host| -> HostBinding {
+        host.registry()
+            .granted(Grants::default())
+            .expect("no two registrations serve one operation")
+    };
+    let binding =
+        granted(ply_host::Host::new().with_process(ProcessHost::spawning(Executables::new())));
+    let bound = granted(
+        ply_host::Host::new().with_process(ProcessHost::new(Vec::new(), OutputSink::captured())),
+    );
     for op in Op::ALL {
         let named = Symbol::new(op.name());
         assert!(
-            binding
-                .withholds(&Symbol::new(EFFECT), &named, None)
-                .is_some(),
+            matches!(
+                binding.resolve(&Symbol::new(EFFECT), &named, None),
+                Err(Unserved::Withheld { .. })
+            ),
             "`{}` is withheld from a run that is no process",
             op.name()
         );
         assert!(
-            bound
-                .withholds(&Symbol::new(EFFECT), &named, None)
-                .is_none(),
+            bound.resolve(&Symbol::new(EFFECT), &named, None).is_ok(),
             "`{}` is served to a run that is one",
             op.name()
         );

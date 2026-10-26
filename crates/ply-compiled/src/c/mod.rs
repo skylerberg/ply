@@ -4,7 +4,6 @@
 mod build;
 pub mod described;
 pub mod descriptor;
-pub mod dump;
 mod encoding;
 pub mod exports;
 pub mod linked;

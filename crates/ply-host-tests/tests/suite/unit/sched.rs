@@ -309,18 +309,6 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
     }
 }
 
-/// `fn spin() -> Unit / {task.write}`: its footprint contains `task.write`, so the `Any`
-/// registrations have an atom to resolve against.
-fn spawns() -> ply_core::CheckOutput {
-    ply_test_support::Sketch::program()
-        .def(
-            "m",
-            "spin",
-            vec![ply_test_support::atom("task", "", ply_core::Mode::Write)],
-        )
-        .check()
-}
-
 fn registry() -> HostRegistry {
     let mut registry = HostRegistry::new();
     for (op, handler) in registrations() {
@@ -331,8 +319,8 @@ fn registry() -> HostRegistry {
 
 fn bound() -> HostBinding {
     registry()
-        .bind(&spawns())
-        .expect("the task registrations resolve against a program that spawns")
+        .granted(ply_core::host::Grants::default())
+        .expect("no two task registrations serve one operation")
 }
 
 fn permit() -> HostPolicy {
@@ -473,12 +461,20 @@ fn a_stop_wakes_a_thread_that_waits_on_a_deadline() {
 }
 
 #[test]
-fn the_task_registrations_are_what_ply_hosts_prints() {
-    let listing = bound().listing().clone();
-    let rows: Vec<String> = listing.rows.iter().map(|r| r.to_string()).collect();
+fn the_task_registrations_are_every_task_operation_answered_on_the_scheduler() {
+    let mut ops: Vec<String> = registry()
+        .ops()
+        .map(|op| {
+            assert!(!op.determinism.is_deterministic(), "`{op}`");
+            assert!(!op.linearity.is_linear(), "`{op}`");
+            assert!(!op.blocking, "`{op}`");
+            format!("{}.{}", op.effect, op.op)
+        })
+        .collect();
+    ops.sort();
     assert_eq!(
-        rows,
-        vec![
+        ops,
+        [
             "task.await",
             "task.cancel",
             "task.channel",
@@ -491,27 +487,6 @@ fn the_task_registrations_are_what_ply_hosts_prints() {
             "task.yield"
         ]
     );
-    for row in &listing.rows {
-        assert_eq!(row.atom.to_string(), row.to_string());
-        assert_eq!(row.atom.mode, ply_core::Mode::Write);
-        assert!(!row.deterministic);
-        assert!(!row.linearity.is_linear());
-        assert!(!row.blocking);
-        assert!(row.declared_nondet);
-    }
-}
-
-#[test]
-fn a_program_that_never_spawns_binds_cleanly_and_lists_nothing() {
-    let binding = registry()
-        .bind(
-            &ply_test_support::Sketch::program()
-                .def("m", "f", Vec::new())
-                .check(),
-        )
-        .expect("an idle scheduler is not an error");
-    assert!(binding.listing().is_empty());
-    assert!(binding.footprint().is_empty());
 }
 
 #[test]

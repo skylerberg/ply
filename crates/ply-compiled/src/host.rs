@@ -6,14 +6,13 @@ use crate::heap::Word;
 use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
-    Bound, HostAnswer, HostBinding, HostRequest, attribute, err_blocking_answered_inline,
-    err_hermetic, err_host_in_search, err_withheld, operation_label, resource_of,
+    Bound, HostAnswer, HostBinding, HostRequest, Unserved, attribute, carries_secret,
+    check_host_answer, err_blocking_answered_inline, err_footprint_escape, err_hermetic,
+    err_host_in_search, err_host_in_simulation, err_secret_to_host, err_withheld, operation_label,
+    resource_of,
 };
 use ply_core::sim::TASK_OPS;
-use ply_core::{
-    Diagnostic, Span, Symbol, Value, carries_secret, check_host_answer, codes,
-    err_footprint_escape, err_host_in_simulation, err_secret_to_host, err_unenumerated_atom,
-};
+use ply_core::{Diagnostic, Span, Symbol, Value, codes};
 use ply_core::{EffectAtom, Mode};
 use std::sync::Arc;
 
@@ -73,18 +72,17 @@ fn bound<'b>(
 ) -> Result<Bound<'b>, Diagnostic> {
     let span = c.site();
     let operation = operation_label(effect, op, resource);
-    let would = binding.would_serve(effect, op, resource);
     let resolved = binding.resolve(effect, op, resource);
     // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
     // any handler could give -- bound, withheld or hermetic -- would differ between interleavings.
     if let Some(region) = crate::simulate::seeded_region(c)
-        && (would.is_some() || resolved.is_some())
+        && !matches!(resolved, Err(Unserved::Unregistered))
     {
         return Err(err_host_in_simulation(span, &operation, region));
     }
-    resolved.ok_or_else(|| match would {
-        None => err_unhandled(span, effect, op, resource),
-        Some(path) if binding.is_hermetic() => {
+    resolved.map_err(|unserved| match unserved {
+        Unserved::Unregistered => err_unhandled(span, effect, op, resource),
+        Unserved::Hermetic(path) => {
             let hermetic = err_hermetic(span, &operation, path);
             if c.re_executed {
                 hermetic.note(
@@ -94,10 +92,9 @@ fn bound<'b>(
                 hermetic
             }
         }
-        Some(path) => match binding.withholds(effect, op, resource) {
-            Some(served) => err_withheld(span, &operation, effect, path, served),
-            None => err_unenumerated_atom(span, &operation, path),
-        },
+        Unserved::Withheld { path, served } => {
+            err_withheld(span, &operation, effect, path, served)
+        }
     })
 }
 

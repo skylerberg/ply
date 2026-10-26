@@ -1,7 +1,6 @@
 //! A digest of the runtime. `PLY_SEMANTICS_DIGEST` is every file under `src/` of this crate and of
-//! the workspace crates it links, less the files that only compile, keep, sweep and load C and read
-//! the compiler's answers: what an answer the program's own emitter gives, running inside a loaded
-//! unit, is a function of. The Ply packages are left out: what they hold is Ply sources and the
+//! the workspace crates it links, less the files that only keep, sweep and load C: what an answer
+//! the program's own emitter gives, running inside a loaded unit, is a function of. The Ply packages are left out: what they hold is Ply sources and the
 //! builder, which a body's key already names through its definition's key and the emitter's
 //! identity.
 
@@ -9,15 +8,12 @@ use std::path::{Path, PathBuf};
 
 const CRATES: &[&str] = &["ply-compiled", "ply-core"];
 
-/// Under `crates/`: how C is compiled, kept and swept, and how the compiler's answer is read. None
-/// of it runs while a loaded unit computes.
+/// Under `crates/`: how C is kept, swept and loaded. None of it runs while a loaded unit computes.
 const OUTSIDE_SEMANTICS: &[&str] = &[
-    "ply-compiled/src/c/dump.rs",
     "ply-compiled/src/c/linked.rs",
     "ply-compiled/src/c/load.rs",
     "ply-compiled/src/c/stage.rs",
     "ply-compiled/src/c/sweep.rs",
-    "ply-compiled/src/source.rs",
 ];
 
 fn main() {

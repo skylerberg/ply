@@ -16,8 +16,8 @@ use crate::emitted::SecretHandle;
 use crate::host::HostMark;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
-use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search};
-use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Value, codes, err_host_in_simulation};
+use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
+use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Value, codes};
 use ply_host::jobs::{self, Work};
 use ply_host::password;
 

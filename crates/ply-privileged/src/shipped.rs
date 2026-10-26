@@ -111,9 +111,7 @@ impl HostHandler for Shipped {
             ),
             ("module", [name]) => {
                 let name = name.as_str(span, "a module's name")?;
-                let module =
-                    crate::shipped_modules::source(&ply_core::ModuleName::from_dotted(name))
-                        .map(str::as_bytes);
+                let module = crate::shipped_modules::source(name).map(str::as_bytes);
                 crate::payload::option(
                     module
                         .or_else(|| crate::shipped_modules::data(name))

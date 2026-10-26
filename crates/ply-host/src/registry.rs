@@ -196,14 +196,11 @@ impl Host {
     }
 }
 
-/// The listing a hermetic run retains.
+/// Every registration this binary serves, of a host that holds nothing: what a hermetic run
+/// withholds and names.
 pub fn registry() -> HostRegistry {
-    registry_over(Arc::new(trace::Trace::default()))
-}
-
-pub fn registry_over(trace: Arc<trace::Trace>) -> HostRegistry {
     Host::new()
-        .traced(trace)
+        .traced(Arc::new(trace::Trace::default()))
         .stopping_on(Shutdown::new(signal::Bounds::default()))
         .with_process(process::ProcessHost::new(
             Vec::new(),

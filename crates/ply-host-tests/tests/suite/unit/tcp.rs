@@ -1,5 +1,5 @@
 use ply_core::{
-    Bound, CheckOutput, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostRequest, HostRuntime,
+    Bound, Diagnostic, EffectAtom, HostAnswer, HostBinding, HostOp, HostRequest, HostRuntime,
     Linearity, Mode, Pending, Resource, Span, Symbol, Value, codes,
 };
 use ply_host::pool::Pooled;
@@ -8,42 +8,13 @@ use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;
 
-use crate::support::declared::{labelled, performed, shipped};
-use ply_test_support::Sketch;
-
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
-/// Registrations resolve against the atoms the program performs; the declaration names no label.
-/// A driver over the shipped `std.net`, whose `every_op` listens, accepts, reads its ports, receives,
-/// sends and closes, and whose `client` connects.
-fn fixture() -> CheckOutput {
-    shipped(Sketch::program())
-        .def(
-            "app",
-            "every_op",
-            vec![
-                labelled(EFFECT, "listener", Mode::Write),
-                labelled(EFFECT, "conn", Mode::Write),
-                performed(EFFECT, "listener", Mode::Read, "local_port"),
-                performed(EFFECT, "conn", Mode::Read, "local_port"),
-            ],
-        )
-        .def("app", "client", vec![labelled(EFFECT, "conn", Mode::Write)])
-        .check()
-}
-
-/// The shipped declaration as the binder reads it, which a test may change as no source can.
-fn declared(check: &mut CheckOutput) -> &mut ply_core::EffectInfo {
-    check
-        .effects
-        .get_mut(&Symbol::new(EFFECT))
-        .expect("the program declares `std.net.net`")
-}
 fn bind(net: Arc<dyn Net>) -> HostBinding {
     registry(net)
-        .bind(&fixture())
-        .expect("the declaration and the registration agree")
+        .granted(ply_core::host::Grants::default())
+        .expect("no two registrations serve one operation")
 }
 
 fn atom(resource: &str) -> EffectAtom {
@@ -109,98 +80,6 @@ fn inside(v: Value) -> Value {
 }
 
 #[test]
-fn the_declaration_binds_and_names_exactly_the_operations_the_program_performs() {
-    let binding = bind(Arc::new(TcpHost::new()));
-    let mut atoms: Vec<String> = binding
-        .footprint()
-        .atoms()
-        .map(EffectAtom::to_string)
-        .collect();
-    let mut rows: Vec<String> = binding
-        .listing()
-        .rows
-        .iter()
-        .map(|r| r.to_string())
-        .collect();
-    atoms.sort();
-    rows.sort();
-    assert_eq!(atoms, rows);
-    for label in ["conn", "listener"] {
-        assert!(
-            binding.serves(&atom(label)),
-            "the written mode atom reaches every row under `[{label}]`"
-        );
-    }
-    assert!(binding.serves(&EffectAtom::operation(
-        EFFECT,
-        Resource::Named(Symbol::new("conn")),
-        Mode::Write,
-        "send"
-    )));
-}
-
-#[test]
-fn the_listing_is_one_row_per_triple_and_never_a_star() {
-    let binding = bind(Arc::new(TcpHost::new()));
-    let rows: Vec<String> = binding
-        .listing()
-        .rows
-        .iter()
-        .map(|r| {
-            assert_eq!(
-                r.atom.to_string(),
-                r.to_string(),
-                "a row's atom is its operation"
-            );
-            format!("{r} {}", r.path)
-        })
-        .collect();
-    assert_eq!(
-        rows,
-        [
-            "std.net.net.accept[conn] ply_host::tcp::accept",
-            "std.net.net.accept[listener] ply_host::tcp::accept",
-            "std.net.net.close[conn] ply_host::tcp::close",
-            "std.net.net.close[listener] ply_host::tcp::close",
-            "std.net.net.close_write[conn] ply_host::tcp::close_write",
-            "std.net.net.close_write[listener] ply_host::tcp::close_write",
-            "std.net.net.connect[conn] ply_host::tcp::connect",
-            "std.net.net.connect[listener] ply_host::tcp::connect",
-            "std.net.net.connect_tls[conn] ply_host::tls::connect",
-            "std.net.net.connect_tls[listener] ply_host::tls::connect",
-            "std.net.net.connect_to[conn] ply_host::tcp::connect_to",
-            "std.net.net.connect_to[listener] ply_host::tcp::connect_to",
-            "std.net.net.connect_unix[conn] ply_host::tcp::connect_unix",
-            "std.net.net.connect_unix[listener] ply_host::tcp::connect_unix",
-            "std.net.net.handshake[conn] ply_host::tls::handshake",
-            "std.net.net.handshake[listener] ply_host::tls::handshake",
-            "std.net.net.listen[conn] ply_host::tcp::listen",
-            "std.net.net.listen[listener] ply_host::tcp::listen",
-            "std.net.net.listen_on[conn] ply_host::tcp::listen_on",
-            "std.net.net.listen_on[listener] ply_host::tcp::listen_on",
-            "std.net.net.listen_tls[conn] ply_host::tls::listen",
-            "std.net.net.listen_tls[listener] ply_host::tls::listen",
-            "std.net.net.listen_unix[conn] ply_host::tcp::listen_unix",
-            "std.net.net.listen_unix[listener] ply_host::tcp::listen_unix",
-            "std.net.net.local_port[conn] ply_host::tcp::local_port",
-            "std.net.net.local_port[listener] ply_host::tcp::local_port",
-            "std.net.net.recv[conn] ply_host::tcp::recv",
-            "std.net.net.recv[listener] ply_host::tcp::recv",
-            "std.net.net.send[conn] ply_host::tcp::send",
-            "std.net.net.send[listener] ply_host::tcp::send",
-            "std.net.net.send_secret[conn] ply_host::tcp::send_secret",
-            "std.net.net.send_secret[listener] ply_host::tcp::send_secret",
-            "std.net.net.serve_tls[conn] ply_host::tls::serve",
-            "std.net.net.serve_tls[listener] ply_host::tls::serve",
-            "std.net.net.set_option[conn] ply_host::tcp::set_option",
-            "std.net.net.set_option[listener] ply_host::tcp::set_option",
-            "std.net.net.start_tls[conn] ply_host::tls::start",
-            "std.net.net.start_tls[listener] ply_host::tls::start",
-        ]
-    );
-}
-
-#[test]
 fn two_labelled_sockets_do_not_conflict_and_one_label_does() {
     assert!(!atom("conn").conflicts_with(&atom("listener")));
     assert!(atom("conn").conflicts_with(&atom("conn")));
@@ -208,22 +87,25 @@ fn two_labelled_sockets_do_not_conflict_and_one_label_does() {
 
 #[test]
 fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
-    let socket = bind(Arc::new(TcpHost::new()));
-    let script = bind(Arc::new(SimNet::new(Vec::new())));
-    let rows = socket.listing().rows.iter().zip(&script.listing().rows);
-    for (a, b) in rows {
+    let registered = |net: Arc<dyn Net>| {
+        let mut ops: Vec<HostOp> = registry(net).ops().cloned().collect();
+        ops.sort_by_key(HostOp::to_string);
+        ops
+    };
+    let socket = registered(Arc::new(TcpHost::new()));
+    let script = registered(Arc::new(SimNet::new(Vec::new())));
+    assert_eq!(socket.len(), script.len());
+    for (a, b) in socket.iter().zip(&script) {
         assert_eq!(
             (&a.effect, &a.op, &a.resource),
             (&b.effect, &b.op, &b.resource)
         );
-        assert_eq!(a.atom, b.atom);
-        assert_eq!(a.deterministic, b.deterministic);
+        assert_eq!(a.determinism, b.determinism);
         assert_eq!(a.linearity, b.linearity);
-        assert_eq!(a.declared_nondet, b.declared_nondet);
-        assert_ne!(a.path, b.path, "the listing must say which one is bound");
+        assert_ne!(a.path, b.path, "a listing must say which one is bound");
     }
-    assert!(socket.listing().rows.iter().any(|r| r.blocking));
-    assert!(script.listing().rows.iter().all(|r| !r.blocking));
+    assert!(socket.iter().any(|op| op.blocking));
+    assert!(script.iter().all(|op| !op.blocking));
 }
 
 /// Reading what a socket is changes nothing; every other operation opens, moves, tunes or closes.
@@ -251,47 +133,6 @@ fn only_reading_what_a_socket_is_is_repeatable() {
             assert_eq!(op.declaration(net.as_ref()).linearity, expected, "{op:?}");
         }
     }
-}
-
-#[test]
-fn a_declaration_without_nondet_refuses_the_handler() {
-    let mut weakened = fixture();
-    declared(&mut weakened).nondet = false;
-    let diagnostics = registry(Arc::new(TcpHost::new()))
-        .bind(&weakened)
-        .expect_err("a socket cannot sit behind an effect that is not `nondet`");
-    assert!(
-        diagnostics
-            .iter()
-            .all(|d| d.code == codes::HOST_DETERMINISM_MISMATCH),
-        "{:?}",
-        diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
-    );
-}
-
-/// A declaration that lacks an operation the host registers is a program checked before the
-/// operation was added, or after it was renamed: either way it performs none of it, and the rest
-/// binds. That the registry names only what this tree declares is `unit::registry`'s to hold.
-#[test]
-fn an_operation_the_declaration_lacks_binds_nothing_and_the_rest_binds() {
-    let mut renamed = fixture();
-    let net = declared(&mut renamed);
-    let recv = net
-        .ops
-        .shift_remove(&Symbol::new("recv"))
-        .expect("`net.recv` is declared");
-    net.ops.insert(Symbol::new("read_bytes"), recv);
-    let binding = registry(Arc::new(TcpHost::new()))
-        .bind(&renamed)
-        .expect("what the declaration still holds binds");
-    let served: Vec<&str> = binding
-        .listing()
-        .rows
-        .iter()
-        .map(|r| r.op.as_str())
-        .collect();
-    assert!(served.contains(&"send"), "{served:?}");
-    assert!(!served.contains(&"recv"), "{served:?}");
 }
 
 #[test]
@@ -1070,34 +911,14 @@ fn open(binding: &HostBinding, rt: &dyn HostRuntime) -> (i64, i64) {
     (listener, accept(binding, rt, listener))
 }
 
-/// A driver whose listener is created over TLS, serving one connection.
-fn tls_fixture() -> CheckOutput {
-    shipped(Sketch::program())
-        .def(
-            "app",
-            "serve_tls",
-            vec![
-                labelled(EFFECT, "listener", Mode::Write),
-                labelled(EFFECT, "conn", Mode::Write),
-            ],
-        )
-        .check()
-}
-
-fn bind_tls(net: Arc<dyn Net>) -> HostBinding {
-    registry(net)
-        .bind(&tls_fixture())
-        .expect("the declaration and the registration agree")
-}
-
 /// Lists what the run was configured with, because the fix is a `--tls` argument.
 #[test]
 fn a_credential_the_run_does_not_hold_is_refused_by_both_implementations() {
     let socket = Arc::new(TcpHost::new());
     let script = Arc::new(SimNet::new(Vec::new()));
     let refusals = [
-        unconfigured(&bind_tls(socket.clone()), socket.as_ref()),
-        unconfigured(&bind_tls(script.clone()), script.as_ref()),
+        unconfigured(&bind(socket.clone()), socket.as_ref()),
+        unconfigured(&bind(script.clone()), script.as_ref()),
     ];
     for refused in refusals {
         assert_eq!(refused.code, codes::TLS_CREDENTIAL_UNKNOWN);
@@ -1131,7 +952,7 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
         vec![vec![REQUEST.to_vec()]],
         vec!["api"],
     ));
-    let binding = bind_tls(net.clone());
+    let binding = bind(net.clone());
     let listener = int(perform(
         &binding,
         net.as_ref(),
@@ -1148,7 +969,7 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
 
     // A plaintext listener answers the same program: TLS is not a separate effect.
     let plain = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
-    let binding = bind_tls(plain.clone());
+    let binding = bind(plain.clone());
     let listener = listen(&binding, plain.as_ref());
     let other = accept(&binding, plain.as_ref(), listener);
     assert_eq!(drain_tls(&binding, plain.as_ref(), other), request);
@@ -1238,7 +1059,7 @@ fn an_outbound_tls_connection_is_verified_and_served_end_to_end() {
         ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[certificate], &[])
             .expect("the material loads");
     let net = Arc::new(TcpHost::with_credentials(credentials));
-    let binding = bind_tls(net.clone());
+    let binding = bind(net.clone());
     let listener = int(perform(
         &binding,
         net.as_ref(),
@@ -1250,7 +1071,7 @@ fn an_outbound_tls_connection_is_verified_and_served_end_to_end() {
     let port = net.local_addr(listener).expect("a bound port").port();
 
     let server_net = net.clone();
-    let server_binding = bind_tls(server_net.clone());
+    let server_binding = bind(server_net.clone());
     let server = std::thread::spawn(move || {
         let conn = int(perform(
             &server_binding,
@@ -1325,7 +1146,7 @@ fn an_untrusted_server_ends_the_connection_at_the_handshake() {
     let credentials = ply_host::tls::Credentials::load(std::slice::from_ref(&spec), &[], &[])
         .expect("the material loads");
     let net = Arc::new(TcpHost::with_credentials(credentials));
-    let binding = bind_tls(net.clone());
+    let binding = bind(net.clone());
     let listener = int(perform(
         &binding,
         net.as_ref(),
@@ -1337,7 +1158,7 @@ fn an_untrusted_server_ends_the_connection_at_the_handshake() {
     let port = net.local_addr(listener).expect("a bound port").port();
 
     let server_net = net.clone();
-    let server_binding = bind_tls(server_net.clone());
+    let server_binding = bind(server_net.clone());
     let server = std::thread::spawn(move || {
         let conn = int(perform(
             &server_binding,

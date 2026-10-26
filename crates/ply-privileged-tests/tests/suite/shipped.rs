@@ -1,8 +1,7 @@
 //! The shipped modules as a binary's pack holds them: each `.ply` file below the library a module
 //! named by its place, and every other file data a module embeds, held by name.
 
-use crate::front::SHIPPED;
-use ply_core::ModuleName;
+use crate::pack::SHIPPED;
 use ply_privileged::shipped_modules;
 
 fn held(path: &str) -> &'static [u8] {
@@ -19,14 +18,9 @@ fn a_shipped_module_below_the_library_is_named_by_its_place() {
     let names = shipped_modules::names();
     assert!(names.iter().any(|n| n == "std.hash"), "{names:?}");
     assert!(names.iter().any(|n| n == "std.hash.legacy"), "{names:?}");
-    let module = ModuleName::from_dotted("std.hash.legacy");
     assert_eq!(
-        shipped_modules::source(&module).map(str::as_bytes),
+        shipped_modules::source("std.hash.legacy").map(str::as_bytes),
         Some(held("std/hash/legacy.ply"))
-    );
-    assert_eq!(
-        shipped_modules::pseudo_path(&module),
-        std::path::PathBuf::from("<std>/hash/legacy.ply")
     );
     assert!(
         !shipped_modules::data_names()
@@ -45,14 +39,9 @@ fn a_compiler_module_below_the_compiler_is_named_by_its_place() {
         names.iter().any(|n| n == "compiler.emit.roots"),
         "{names:?}"
     );
-    let module = ModuleName::from_dotted("compiler.emit.roots");
     assert_eq!(
-        shipped_modules::source(&module).map(str::as_bytes),
+        shipped_modules::source("compiler.emit.roots").map(str::as_bytes),
         Some(held("compiler/emit/roots.ply"))
-    );
-    assert_eq!(
-        shipped_modules::pseudo_path(&module),
-        std::path::PathBuf::from("<compiler>/emit/roots.ply")
     );
     assert_eq!(
         ply_privileged::shipped::module_digest("compiler.emit.roots"),
@@ -87,10 +76,9 @@ fn a_data_file_a_shipped_module_embeds_is_held_by_name_and_is_no_module() {
     ] {
         assert_eq!(shipped_modules::data(other), None, "`{other}`");
     }
-    let module = ModuleName::from_dotted("std.oid");
     assert_eq!(
         ply_privileged::shipped::module_digest("std.oid"),
-        shipped_modules::source(&module)
+        shipped_modules::source("std.oid")
             .map(|text| blake3::hash(text.as_bytes()).to_hex().to_string())
     );
 }
