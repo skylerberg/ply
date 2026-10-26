@@ -17,8 +17,9 @@ import compiler.check.infer (CheckOutput, RootFacts, facts_at, facts_by_owner, f
                              no_root_facts, root_facts_bin, published_pure)
 import compiler.check.infer.checker (Location, DefInfo, SpecInfo, TestInfo, LawInfo, LawBinder,
                                      EffectInfo, OpInfo, CtorInfo, Known, no_known, KnownDef,
-                                     KnownTest, KeptFacts, WitnessOrder, TypedSite, listing_ty,
-                                     witness_order_bin, witnessed, InstanceInfo, NumericInfo)
+                                     KnownTest, KeptFacts, WitnessOrder, TypedSite, RowSite,
+                                     Performs, listing_ty, witness_order_bin, witnessed,
+                                     InstanceInfo, NumericInfo)
 import compiler.emit.keys (RootKey, Named, Cases, Clause, Requires, Ensures, LawPart, LawGuard,
                            LawBody, root_name, root_text, part_word, test_key, test_owner, law_key,
                            law_owner)
@@ -36,11 +37,10 @@ import compiler.front.rows (span_at, loc_at, Written, fn_written, written_of, Pl
                             KnownDefRow, KnownTestRow, Rows, ModuleSpan, DefRow, TestRow, LawRow,
                             OpRow, EffectRow, CtorRow, HashRow, HDef, HLaw, HTest, HashFrame,
                             OrdinalRow, Dump, answered_diag)
-import compiler.front.facts (outlines_of, effect_written, effect_hosts, RealHandler,
-                             effect_public_of, type_rows, test_name_spans, law_literals, Frame,
-                             View, Analysis, TaggedSite, tagged_of, root_tagged, TypedConst,
-                             typed_consts_of, root_consts, StatementSite, statements_of,
-                             root_statements)
+import compiler.front.facts (outlines_of, effect_written, effect_hosts, effect_public_of, type_rows,
+                             test_name_spans, law_literals, Frame, View, Analysis, TaggedSite,
+                             tagged_of, root_tagged, TypedConst, typed_consts_of, root_consts,
+                             StatementSite, statements_of, root_statements)
 
 // --- Cuts -------------------------------------------------------------------
 
@@ -125,7 +125,8 @@ fn op_row(module: Int, op_info: OpInfo, cr: Carrier) -> OpRow / {abort.raise} =
 fn effect_row(
   effect_info: EffectInfo,
   public: Bool,
-  hosts: Map<Bytes, RealHandler>,
+  hosts: Map<Bytes, Bytes>,
+  read: BodiesRead,
   cr: Carrier,
 ) -> EffectRow / {abort.raise} = {
   let host = hosts.get(effect_info.name);
@@ -137,8 +138,26 @@ fn effect_row(
     nondet: effect_info.nondet,
     ops: effect_info.ops.map(|op_info: OpInfo| op_row(effect_info.at.module, op_info, cr)),
     at: loc_at(effect_info.at),
-    host: match host { Some(h) -> Some(h.handler), None -> None },
-    waits: match host { Some(h) -> h.waits, None -> [] },
+    host: host,
+    waits: match host { Some(handler) -> waited(read, handler, effect_info.name), None -> [] },
+  }
+}
+
+/// The operations of `served` its real handler `handler` answers by a ticket's wait: each whose
+/// clause, as the check inferred it, performs what `std.internal.native.job_wait` alone performs.
+fn waited(read: BodiesRead, handler: Bytes, served: Bytes) -> List<Bytes> / {abort.raise} = {
+  let of_effect = served.concat(b".");
+  match facts_at(facts_filed(read, handler), 0, handler) {
+    None -> [],
+    Some(f) ->
+      f.rows.fold([], |acc: List<Bytes>, s: RowSite|
+        match s.filed {
+          Performs(row) -> if s.answers.starts_with(of_effect)
+              && row.atoms.any(|a: Atom| a.effect == b"std.internal.native.wait") {
+            acc.push(s.answers.slice(of_effect.len(), s.answers.len()))
+          } else { acc },
+          _ -> acc,
+        }),
   }
 }
 
@@ -827,6 +846,7 @@ fn tables(
   let fns = fn_written(outlines);
   let effs = effect_written(outlines);
   let hosts = effect_hosts(outlines);
+  let read = bodies_read(checked);
   let names = test_name_spans(outlines);
   let lits = law_literals(outlines);
   let cr = carrier_of(checked.ctors);
@@ -844,7 +864,7 @@ fn tables(
     tests: range(0, checked.tests.len()).map(|i: Int| test_row(checked.tests.get(i), names.get(i))),
     laws: range(0, checked.laws.len()).map(|i: Int| law_row(checked.laws.get(i), lits.get(i))),
     effects: checked.effects.map(|effect_info: EffectInfo|
-      effect_row(effect_info, effect_public_of(effs, effect_info), hosts, cr)),
+      effect_row(effect_info, effect_public_of(effs, effect_info), hosts, read, cr)),
     ctors: checked.ctors.map(ctor_row),
     hashes: hash_rows(outlines, hashes),
     hashes_digest: digest(hashes),

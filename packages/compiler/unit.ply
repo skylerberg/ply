@@ -5123,35 +5123,34 @@ test "an entry runs under the real handler of each effect its root's row names, 
   }
 }
 
-test "an entry runs under a real handler that answers every label of its effect and performs natives" {
+test "a real handler waits on a ticket for each operation whose clause performs the wait, a helper's too" {
   let user = [
     {
       name: b"m",
-      src: b"import std.fact (fact)\npub fn asked() -> Int / {fact.get[server]} = fact.get[server](1)\npub fn both() -> Int / {fact.get[server], fact.get[client]} = fact.get[server](1) + fact.get[client](2)\n",
+      src: b"import std.fact (fact)\npub fn asked() -> Int / {fact.slow, fact.fast, fact.behind} = fact.slow() + fact.fast() + fact.behind()\n",
     },
   ];
-  let native = { name: b"std.internal.native", src: b"pub nondet effect native {}\n" };
   let fact = {
     name: b"std.fact",
-    src: b"import std.internal.native (native)\npub effect fact {\n  read get[r](x: Int) -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.read[*] | e}) -> a / {native.read | e} = handle { go() } with { fact.get[*](x) -> x + 1 }\n",
+    src: Bytes::concat_all([
+      b"import std.internal.native (native, wait, job_wait)\n",
+      b"pub effect fact {\n  read slow() -> Int\n  read fast() -> Int\n  read behind() -> Int\n}\n",
+      b"host for fact by served\n",
+      b"fn waited() -> Int / {native.read, wait.read} = job_wait(1).len()\n",
+      b"fn served<a | e>(go: () -> a / {fact.slow, fact.fast, fact.behind | e}) -> a / {native.read, wait.read | e} =\n",
+      b"  handle { go() } with { fact.slow() -> job_wait(0).len(), fact.fast() -> 1, fact.behind() -> waited() }\n",
+    ]),
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [native, fact], no_rows()).out);
-  match emitted(
-      a_runtime(b"r"),
-      dump,
-      sources_placed(dump, user.concat([native, fact])),
-      Map::new(),
-      offered_roots(dump).keys,
-      |_: Bytes| None,
-      |_: List<Record>| (),
-    ) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(e) -> {
-      let entries = [b"m.asked", b"m.both"].map(|n: Bytes| root_name(Entered(Named(n))));
-      assert_eq(e.produced.dropped.filter(|d: Dropped| entries.contains(d.function)), []);
-      assert(entries.all(|n: RootName| e.produced.taken.contains(n)), None)
-    },
-  }
+  let native = {
+    name: b"std.internal.native",
+    src: b"pub nondet effect native {}\npub nondet effect wait {}\npub extern fn job_wait(ticket: Int) -> Bytes / {native.read, wait.read}\n",
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [fact, native], no_rows()).out);
+  assert_eq(dump.diags.filter(|d: Diag| d.severity == b"error").map(|d: Diag| d.message), []);
+  assert_eq(
+    dump.effects.filter(|r: EffectRow| r.name == b"std.fact.fact").map(|r: EffectRow| r.waits),
+    [[b"slow", b"behind"]],
+  )
 }
 
 test "a test's entry runs under the real handler of each effect it performs, a labelled one included" {
