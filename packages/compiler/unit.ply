@@ -43,7 +43,6 @@ import compiler.check.infer (dump_flag)
 import compiler.check.infer.definitions (Extern, externs_in, declared_natives, program_natives,
                                          natives_beside, MachineCall, MachineValue, MachineInt,
                                          MachineFloat, MachineText, MachineUnit)
-import compiler.expand.rewrite (Elaborated, elaborated_natives)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.print.head (unit_head, unit_tail, bound, pointer_declared)
 import compiler.cc (tail_mark)
@@ -132,31 +131,35 @@ pub fn shipped_runtime() -> Runtime / {shipped.runtime, abort.raise} =
 /// or raises otherwise.
 pub type Unbound = { declared: Extern, found: List<Native> }
 
-/// Each of `declared` that `natives` does not implement, in `declared`'s order: every native answers
-/// but a crossing native the compiler declares answering nothing. A native called over machine words
-/// binds one that takes and answers the kinds its call passes; any other, one that takes as many
-/// words.
+/// Each of `declared` that `natives` does not implement, in `declared`'s order: one binds a native of
+/// the signature the compiler declares (`declared_signature`).
 pub fn unbound(natives: List<Native>, declared: List<Extern>) -> List<Unbound> = {
   let by_name = natives.fold(Map::new(), |acc: Map<Bytes, List<Native>>, n: Native|
     acc.insert(n.name, List::push(match acc.get(n.name) { Some(ns) -> ns, None -> [] }, n)));
   declared.fold([], |acc: List<Unbound>, d: Extern| {
     let found = match by_name.get(d.name) { Some(ns) -> ns, None -> [] };
     match found {
-      [n] -> if binds(n, d) { acc } else { acc.push({ declared: d, found: found }) },
+      [n] -> if n == declared_signature(d) { acc } else { acc.push({ declared: d, found: found }) },
       _ -> acc.push({ declared: d, found: found }),
     }
   })
 }
 
-fn binds(n: Native, d: Extern) -> Bool =
-  n.raises == d.raises
-    && (match d.call {
-      Some(c) -> n.params == call_params(c) && n.answer == call_answer(c),
-      None -> n.params.len() == d.words && n.answer != None == declared_answers(d),
-    })
+/// What the compiler declares of the native `d` at the machine, as the runtime describes one: the
+/// kinds a call over machine words passes and is answered; for a native the emitted C calls
+/// directly, the kinds `compiler.emit.abi` declares; for any other, a uniform word for each word a
+/// call passes, and one answered.
+pub fn declared_signature(d: Extern) -> Native =
+  match d.call {
+    Some(c) -> { name: d.name, params: call_params(c), answer: call_answer(c), raises: d.raises },
+    None -> match abi::native_named(d.name) {
+      Some(n) -> n,
+      None -> uniform_native(d.name, d.words, true, d.raises),
+    },
+  }
 
 /// The kinds a call of `c` passes past the context, as the runtime describes a native's.
-pub fn call_params(c: MachineCall) -> List<Machine> =
+fn call_params(c: MachineCall) -> List<Machine> =
   c.params.fold([], |acc: List<Machine>, v: MachineValue|
     match v {
       MachineInt(_) -> acc.push(abi::I64),
@@ -166,7 +169,7 @@ pub fn call_params(c: MachineCall) -> List<Machine> =
     })
 
 /// The kind a call of `c` is answered, as the runtime describes a native's; `None` for nothing.
-pub fn call_answer(c: MachineCall) -> Option<Machine> =
+fn call_answer(c: MachineCall) -> Option<Machine> =
   match c.answer {
     MachineInt(_) -> Some(abi::I64),
     MachineFloat -> Some(abi::F64),
@@ -178,16 +181,8 @@ pub fn call_answer(c: MachineCall) -> Option<Machine> =
 /// the kinds its call passes and is answered.
 fn machine_bound(declared: List<Extern>) -> List<Native> / {abort.raise} =
   declared.fold([], |acc: List<Native>, e: Extern|
-    match e.call {
-      Some(c) ->
-        acc.push({
-          name: builtin_helper(e.name),
-          params: call_params(c),
-          answer: call_answer(c),
-          raises: e.raises,
-        }),
-      None -> acc,
-    })
+    if e.call == None { acc }
+    else { acc.push({ ..declared_signature(e), name: builtin_helper(e.name) }) })
 
 /// The C helper of each native a unit's bodies call, by its name without the `_p` its pointer
 /// adds, and of each native a body reads as a value, which the runtime calls as that native.
@@ -248,32 +243,16 @@ fn called_externs(
     )
   }
 }
-
-/// Whether the native `d` declares answers a word: all but a crossing native the compiler declares
-/// answering nothing.
-pub fn declared_answers(d: Extern) -> Bool =
-  match d.call {
-    Some(c) -> c.answer != MachineUnit,
-    None ->
-      d.module != b"" || !elaborated_natives().any(|n: Elaborated| n.name == d.name && !n.answers),
-  }
-
-fn native_said(words: Int, answers: Bool, raises: Bool) -> Bytes =
-  Bytes::concat_all([
-    b"takes ",
-    ascii_of_int(words),
-    if words == 1 { b" word" } else { b" words" },
-    if !answers { b", answers nothing" } else { b"" },
-    if raises { b" and raises" } else { b" and cannot raise" },
-  ])
-
-fn kinds_said(params: List<Machine>, answer: Option<Machine>, raises: Bool) -> Bytes =
+fn kinds_said(n: Native) -> Bytes =
   Bytes::concat_all([
     b"takes [",
-    Bytes::join(params.map(machine_name), b", "),
+    Bytes::join(n.params.map(machine_name), b", "),
     b"]",
-    match answer { Some(m) -> b", answers ".concat(machine_name(m)), None -> b", answers nothing" },
-    if raises { b" and raises" } else { b" and cannot raise" },
+    match n.answer {
+      Some(m) -> b", answers ".concat(machine_name(m)),
+      None -> b", answers nothing",
+    },
+    if n.raises { b" and raises" } else { b" and cannot raise" },
   ])
 
 /// Why `u` does not bind, as a line of the diagnostic that lists it.
@@ -283,24 +262,14 @@ fn unbound_line(u: Unbound) -> Bytes = {
   else { Bytes::concat_all([b"`extern fn ", d.name, b"` of `", d.module, b"`"]) };
   match u.found {
     [] -> named.concat(b": no native of the runtime implements it"),
-    [n] -> match d.call {
-      Some(c) ->
-        Bytes::concat_all([
-          named,
-          b" ",
-          kinds_said(call_params(c), call_answer(c), d.raises),
-          b", and the runtime's native ",
-          kinds_said(n.params, n.answer, n.raises),
-        ]),
-      None ->
-        Bytes::concat_all([
-          named,
-          b" ",
-          native_said(d.words, declared_answers(d), d.raises),
-          b", and the runtime's native ",
-          native_said(n.params.len(), n.answer != None, n.raises),
-        ]),
-    },
+    [n] ->
+      Bytes::concat_all([
+        named,
+        b" ",
+        kinds_said(declared_signature(d)),
+        b", and the runtime's native ",
+        kinds_said(n),
+      ]),
     ns ->
       Bytes::concat_all([
         named,
@@ -3680,7 +3649,7 @@ test "an identity moves with the hash of a root it names, and with no other defi
 /// A runtime named `identity` implementing every native the prelude declares and serving this
 /// compiler's code, as the shipped one does.
 fn a_runtime(identity: Bytes) -> Runtime / {abort.raise} =
-  serving(identity, program_natives([]).map(native_of))
+  serving(identity, program_natives([]).map(declared_signature))
 
 fn a_builder(main: Bytes) -> Bytes =
   Bytes::concat_all([b"compiler.build.main ", main, b"\ncompiler.build.told e5\n"])
@@ -4683,7 +4652,7 @@ fn kept_unit(
   let shipped = [{ name: b"std.prelude", src: prelude_source::text() }];
   let modules = user.concat(shipped);
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(native_of) };
+  let runtime = { ..a_runtime(b"r"), natives: program_natives([]).map(declared_signature) };
   {
     unit: |every: List<RootKey>, baked: List<Baked>|
       match emitted(
@@ -4749,12 +4718,6 @@ test "no root is asked to give back a scalar's box, which its last count gives b
   )
 }
 
-fn native_of(e: Extern) -> Native =
-  match e.call {
-    Some(c) -> { name: e.name, params: call_params(c), answer: call_answer(c), raises: e.raises },
-    None -> uniform_native(e.name, e.words, declared_answers(e), e.raises),
-  }
-
 test "an `extern fn` no native implements, two do, or one does otherwise, is unbound" {
   let declared = |name: Bytes, words: Int, raises: Bool|
     { module: b"std.prelude", name: name, words: words, raises: raises, call: None };
@@ -4791,9 +4754,9 @@ test "an `extern fn` no native implements, two do, or one does otherwise, is unb
   assert_eq(found.map(unbound_line), [
     b"`extern fn gone` of `std.prelude`: no native of the runtime implements it",
     b"`extern fn twice` of `std.prelude`: 2 natives of the runtime implement it",
-    b"`extern fn wider` of `std.prelude` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
-    b"`extern fn silent` of `std.prelude` takes 1 word and cannot raise, and the runtime's native takes 1 word, answers nothing and cannot raise",
-    b"`extern fn calm` of `std.prelude` takes 1 word and raises, and the runtime's native takes 1 word and cannot raise",
+    b"`extern fn wider` of `std.prelude` takes [Word], answers Word and cannot raise, and the runtime's native takes [Word, Word], answers Word and cannot raise",
+    b"`extern fn silent` of `std.prelude` takes [Word], answers Word and cannot raise, and the runtime's native takes [Word], answers nothing and cannot raise",
+    b"`extern fn calm` of `std.prelude` takes [Word], answers Word and raises, and the runtime's native takes [Word], answers Word and cannot raise",
   ]);
   assert_eq(
     unbound([], [{ module: b"", name: b"?hold_take", words: 1, raises: false, call: None }]).map(
@@ -4801,12 +4764,21 @@ test "an `extern fn` no native implements, two do, or one does otherwise, is unb
     ),
     [b"the compiler's `?hold_take`: no native of the runtime implements it"],
   );
-  // A crossing native the compiler declares answering nothing is bound by one that answers nothing.
-  let crossing = { module: b"", name: b"?out_int", words: 1, raises: false, call: None };
-  assert_eq(unbound([native(b"?out_int", 1, false, false)], [crossing]), []);
-  assert_eq(unbound([native(b"?out_int", 1, true, false)], [crossing]).map(unbound_line), [
-    b"the compiler's `?out_int` takes 1 word, answers nothing and cannot raise, and the runtime's native takes 1 word and cannot raise",
-  ])
+  // A native the emitted C calls directly binds one of the kinds `compiler.emit.abi` declares, in
+  // their order, not one taking as many words of other kinds.
+  let crossing = |name: Bytes| { module: b"", name: name, words: 3, raises: false, call: None };
+  let declared_fun = {
+    name: b"?out_fun",
+    params: [abi::Handed, abi::Addr, abi::I64],
+    answer: None,
+    raises: false,
+  };
+  let swapped = { ..declared_fun, params: [abi::Addr, abi::I64, abi::Handed] };
+  assert_eq(unbound([declared_fun], [crossing(b"?out_fun")]), []);
+  assert_eq(unbound([swapped], [crossing(b"?out_fun")]).map(unbound_line), [
+    b"the compiler's `?out_fun` takes [Handed, Addr, I64], answers nothing and cannot raise, and the runtime's native takes [Addr, I64, Handed], answers nothing and cannot raise",
+  ]);
+  assert_eq(unbound([native(b"?out_fun", 3, false, false)], [crossing(b"?out_fun")]).len(), 1)
 }
 
 /// The unit of a program of `user` modules and the `shipped` ones they import, held against a
@@ -4855,7 +4827,7 @@ test "a root the emitter answers nothing for is refused and listed, and the rest
   let user = [{ name: b"m", src: b"fn one() -> Int = 1\nfn two() -> Int = one() + 1\n" }];
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
   let every = [b"m.one", b"m.absent", b"m.two"].map(Named);
-  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
+  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(declared_signature) };
   kept_bodies(|| {
     let run = ||
       match emitted(
@@ -5069,6 +5041,37 @@ test "an entry runs under the real handler of each effect its root's row names, 
   }
 }
 
+test "a test's entry runs under the real handler of each effect it performs, a labelled one included" {
+  let user = [
+    {
+      name: b"m",
+      src: b"import std.fact (fact)\ntest \"asks\" {\n  fact.put[cell](1);\n  assert(fact.get() == 7)\n}\n",
+    },
+  ];
+  let fact = {
+    name: b"std.fact",
+    src: b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [fact], no_rows()).out);
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user.concat([fact])),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    // Nothing but the test's entry performs `fact`, so only it takes the handler.
+    Ok(e) ->
+      assert(
+        e.produced.taken.any(|n: RootName| root_text(n).starts_with(b"std.fact.served")),
+        Some(String::of_bytes_lossy(Bytes::join(e.produced.taken.map(root_text), b", "))),
+      ),
+  }
+}
+
 test "a clause over a function its definition answers has no entry, as a function crosses only out" {
   let user = [
     {
@@ -5088,7 +5091,7 @@ test "a root the front end offers with no typed row to key it by fails the build
   let dump = { ..whole, defs: whole.defs.filter(|d: DefRow| d.name != b"m.one") };
   let offers = offered_roots(dump);
   assert_eq(offers.unkeyed, [b"m.one"]);
-  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(native_of) };
+  let runtime = { ..a_runtime(b"r"), natives: declared_natives().map(declared_signature) };
   match emitted(
       runtime,
       dump,
@@ -5171,7 +5174,7 @@ test "a unit is refused where the runtime does not implement a native it calls a
       src: b"fn at(b: Bytes, i: Int) -> Int / {abort.raise} = b.at(i)\nfn plus<a>(x: a, y: a) -> a where numeric(a) = x + y\n",
     },
   ];
-  let implemented = declared_natives().map(native_of);
+  let implemented = declared_natives().map(declared_signature);
   let taking = |name: Bytes, words: Int|
     implemented.map(|n: Native|
       if n.name == name { uniform_native(name, words, n.answer != None, n.raises) } else { n });
@@ -5202,7 +5205,7 @@ test "a unit is refused where the runtime does not implement a native it calls a
   assert_eq(
     refused.at(1),
     Some(
-      b"the compiler's `?refused` takes 4 words, answers nothing and raises, and the runtime's native takes 3 words, answers nothing and raises",
+      b"the compiler's `?refused` takes [I64, I64, I64, I64], answers nothing and raises, and the runtime's native takes [Word, Word, Word], answers nothing and raises",
     ),
   );
   let twice = implemented.concat(implemented.filter(|n: Native| n.name == b"?refused"));
@@ -5214,7 +5217,7 @@ test "a unit is refused where the runtime does not implement a native it calls a
 
 test "a unit whose bodies write externs in place asks the runtime for no native of them" {
   // What the prelude declares that a native implements: its builtins, and `ListNode::leaf_of`.
-  let implemented = program_natives([]).map(native_of);
+  let implemented = program_natives([]).map(declared_signature);
   let names = implemented.map(|n: Native| n.name);
   assert_eq(
     intrinsics().filter(|i: { name: Bytes, op: Intrinsic }|
@@ -5307,11 +5310,12 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
   let counted = |words: Int| uniform_native(b"counted", words, true, false);
   let named = |answer: Machine|
     { name: b"named", params: [abi::I64], answer: Some(answer), raises: false };
-  let implemented = |a: Native, b: Native| declared_natives().map(native_of).push(a).push(b);
+  let implemented = |a: Native, b: Native|
+    declared_natives().map(declared_signature).push(a).push(b);
   assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::Taken)))), []);
   assert_eq(refusal(held_over(program, native, implemented(counted(2), named(abi::Taken)))), [
     b"E0476",
-    b"`extern fn counted` of `std.native` takes 1 word and cannot raise, and the runtime's native takes 2 words and cannot raise",
+    b"`extern fn counted` of `std.native` takes [Word], answers Word and cannot raise, and the runtime's native takes [Word, Word], answers Word and cannot raise",
     natives_refused([]).notes_text.get(0),
   ]);
   // One called over machine words binds a native of the kinds its call passes: bytes are told from
@@ -5352,7 +5356,7 @@ test "a unit declares a shipped module's native over machine words where a bucke
   match held_over(
       program,
       native,
-      declared_natives().map(native_of).push(named).push(told).push(noted),
+      declared_natives().map(declared_signature).push(named).push(told).push(noted),
     ) {
     Err(diags) -> assert_eq(diags.map(|d: Diag| d.code), []),
     Ok(text) -> {

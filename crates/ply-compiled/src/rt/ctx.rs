@@ -781,6 +781,15 @@ impl Ctx {
             .take()
             .or_else(|| self.aborting.take().map(|a| a.diagnostic))
     }
+
+    /// What the run asked of the host since the last take, and how many of those asks were
+    /// at-most-once operations.
+    pub fn take_host_use(&mut self) -> (ply_core::host::HostUse, u64) {
+        (
+            std::mem::take(&mut self.host_use),
+            std::mem::take(&mut self.host_ops),
+        )
+    }
 }
 
 /// A runtime failure inside compiled code.

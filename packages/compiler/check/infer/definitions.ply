@@ -12,7 +12,7 @@ import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, IE
                               SRequires, SEnsures, SCost, SSpace, SpecClause, Derived, parse,
                               test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
                               NInvariant, NHost, INumeric, member_name, member_of, numeric_ops,
-                              numeric_by, is_pub)
+                              numeric_by, is_pub, TDAlias)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -69,7 +69,7 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      seed_atom, builtin_type_arity, effect_of, def_of, set_def,
                                      Builtin, prelude_imports, declared, builtins, refuse_externs,
                                      mode_eq, is_direct, builtin_bound, insert_constraint,
-                                     dedup_constraints, Shapes, derivable, vars_of_type)
+                                     dedup_constraints, Shapes, derivable, vars_of_type, hold)
 import compiler.check.infer.names (Found, of_language_type, declared_value, written_binder,
                                    simple_name_of, home_module)
 import compiler.check.infer.declarations (conv_type, conv_atom, op_named, duplicate,
@@ -271,22 +271,52 @@ pub fn signed_fns(
 /// A shipped module's own externs bound as builtins under its name; the prelude's that every module
 /// calls are bound before any module is checked.
 fn externs_bound(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
-  if !is_shipped(parsed.name) { checker }
-  else { externs_of(parsed.name, parsed.module).fold(checker, builtin_bound) }
+  if !is_shipped(parsed.name) { checker } else {
+    externs_of(parsed.name, parsed.module).fold(checker, |c: Checker, b: Builtin|
+      builtin_bound(c, asking_only(c, b)))
+  }
+
+/// `b`, whose row names a mode only of an effect that declares no operation: a native naming a mode
+/// of one with operations would look answered by a handler of that effect while it asks the machine.
+fn asking_only(c: Checker, b: Builtin) -> Builtin / {abort.raise} = {
+  let modes = match b.scheme.ty {
+    TyFn(f) -> f.effects.atoms.filter(|a: Atom| a.op == None && a.effect != hold()),
+    _ -> [],
+  };
+  match modes.find(|a: Atom|
+      match effect_of(c, a.effect) { Some(info) -> info.ops.len() > 0, None -> true }) {
+    None -> b,
+    Some(a) ->
+      panic(
+        "the shipped `extern fn " ++ String::of_bytes_lossy(b.name) ++ "` names a mode of `"
+          ++ String::of_bytes_lossy(a.effect)
+          ++ "`, which is no effect that declares no operation",
+      ),
+  }
+}
 
 /// The externs the module `name` declares as its own, each under its program-wide name, at the
-/// types the module declares or imports by name: of the prelude's, only the functions of its own
-/// types.
+/// types the module declares or imports by name, an alias of its own as the type it names: of the
+/// prelude's, only the functions of its own types.
 pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} = {
   let own = module.items.fold(
     prelude_imports(module.imports),
     |acc: Map<Bytes, Bytes>, item: Item|
       match item { IType(t) -> acc.insert(t.name.name, qualify(name, t.name.name)), _ -> acc },
   );
+  let aliases = module.items.fold(Map::new(), |acc: Map<Bytes, TypeExpr>, item: Item|
+    match item {
+      IType(t) -> match t.body {
+        TDAlias(body) -> if (t.generics != { types: [], effects: [], labels: [] }) { acc }
+        else { acc.insert(t.name.name, body) },
+        _ -> acc,
+      },
+      _ -> acc,
+    });
   module.items.fold([], |acc: List<Builtin>, item: Item|
     match item {
       IExtern(def) -> if is_builtin(name, module, def) { acc }
-      else { acc.push(declared(qualify(name, def.name.name), own, def)) },
+      else { acc.push(declared(qualify(name, def.name.name), own, def, aliases)) },
       _ -> acc,
     })
 }
@@ -433,6 +463,11 @@ pub fn program_natives(
 /// `program_natives` of a program whose modules are parsed as `mods`.
 pub fn parsed_natives(mods: List<ParsedModule>) -> List<Extern> / {abort.raise} =
   natives_beside(declared_natives(), mods.map(|m: ParsedModule| module_externs(m.name, m.module)))
+
+/// How a call of each of `natives` called over machine words crosses, by its name.
+pub fn machine_calls(natives: List<Extern>) -> Map<Bytes, MachineCall> =
+  natives.fold(Map::new(), |acc: Map<Bytes, MachineCall>, e: Extern|
+    match e.call { Some(c) -> acc.insert(e.name, c), None -> acc })
 
 /// `own`, then each of `modules`' natives and the prelude's whose name is not yet among them.
 pub fn natives_beside(
@@ -4352,6 +4387,10 @@ test "a shipped module's extern over machine types is called over machine words,
     ),
     [4],
   );
+  // An alias of the module's own is the type it names.
+  assert_eq(call(b"type Pid = Int\nextern fn pid() -> Pid\n"), [
+    { words: 0, call: Some({ params: [], answer: MachineInt(int) }) },
+  ]);
   // A width past 64 bits, a list, a generic, a raise or a `()` taken is crossed over its encoding.
   [
     b"extern fn wide(x: U128) -> Int\n",

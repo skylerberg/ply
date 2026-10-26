@@ -11,6 +11,7 @@ mod emitted;
 mod entry;
 mod frames;
 mod heap;
+mod hosted;
 mod linked;
 mod machine;
 mod parallel;

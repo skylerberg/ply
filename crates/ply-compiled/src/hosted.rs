@@ -10,8 +10,11 @@
 use crate::c::{MachineNative, machine_native};
 use crate::native::{I64, TakenBytes};
 use crate::rt::Ctx;
-use ply_core::err_host_in_simulation;
-use ply_core::host::err_host_in_search;
+use ply_core::host::{Determinism, err_host_in_search};
+use ply_core::{EffectAtom, Mode, Resource, err_host_in_simulation};
+
+/// The effect every native here performs, under its program-wide name (`std.internal.native`).
+const NATIVE: &str = "std.internal.native.native";
 
 /// Every native here, under the name its module declares it by.
 pub fn natives() -> Vec<MachineNative> {
@@ -46,8 +49,10 @@ pub fn natives() -> Vec<MachineNative> {
 }
 
 impl Ctx {
-    /// Whether the native `native` may ask the host now; where it may not, the run fails as a host
-    /// operation's would, and the native answers nothing it reads.
+    /// Whether the native `native` may ask the host now. Where it may, the run has read the machine,
+    /// as a nondeterministic host operation's answer reads it: its pass answers only for the binding
+    /// it ran under. Where it may not, the run fails as a host operation's would, and the native
+    /// answers nothing it reads.
     fn reaches_host(&mut self, native: &'static str) -> bool {
         let operation = format!("the native `{native}`");
         if let Some(region) = crate::simulate::seeded_region(self) {
@@ -60,6 +65,10 @@ impl Ctx {
             self.fail(err_host_in_search(span, &operation, native));
             return false;
         }
+        self.host_use.record(
+            &EffectAtom::new(NATIVE, Resource::Singleton, Mode::Read),
+            Determinism::Nondeterministic,
+        );
         true
     }
 

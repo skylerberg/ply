@@ -1378,14 +1378,16 @@ pub type Builtin = {
   body: Bool,
 }
 
-/// What a declaration's types are read against: the variables its generic list binds, and the types
-/// the prelude imports, each under the name its module declares it by.
+/// What a declaration's types are read against: the variables its generic list binds, the types
+/// the prelude imports, each under the name its module declares it by, and the body of each alias
+/// of no parameter its module declares.
 type Declaring = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
   labels: Map<Bytes, Type>,
   rows: Map<Bytes, Int>,
   imported: Map<Bytes, Bytes>,
+  aliases: Map<Bytes, TypeExpr>,
 }
 
 fn misdeclared(what: Bytes, name: Bytes) -> String =
@@ -1394,15 +1396,21 @@ fn misdeclared(what: Bytes, name: Bytes) -> String =
 fn declared_types(
   d: Declaring,
   tys: List<TypeExpr>,
+  room: Int,
 ) -> { d: Declaring, tys: List<Type> } / {abort.raise} =
   tys.fold({ d: d, tys: [] }, |acc: { d: Declaring, tys: List<Type> }, ty: TypeExpr| {
-    let o = declared_type(acc.d, ty);
+    let o = declared_type(acc.d, ty, room);
     { d: o.d, tys: acc.tys.push(o.ty) }
   })
 
 /// A type as a declaration writes it: the language's own, or one its module declares or imports by
-/// name, at the arguments written.
-fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
+/// name, at the arguments written; an alias of its module's is the type it names, read with `room`
+/// more aliases to expand inside one another.
+fn declared_type(
+  d: Declaring,
+  ty: TypeExpr,
+  room: Int,
+) -> { d: Declaring, ty: Type } / {abort.raise} =
   match ty {
     TVar(id) -> match d.tys.get(id.name) {
       Some(t) -> { d: d, ty: t },
@@ -1414,40 +1422,50 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
       let fs = r.fields.fold(
         { d: d, fs: [] },
         |acc: { d: Declaring, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
-          let o = declared_type(acc.d, f.ty);
+          let o = declared_type(acc.d, f.ty, room);
           { d: o.d, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
         },
       );
       { d: fs.d, ty: TyRecord(fields_sorted(fs.fs)) }
     },
     TFn(f) -> {
-      let ps = declared_types(d, f.params);
-      let r = declared_type(ps.d, f.ret);
+      let ps = declared_types(d, f.params, room);
+      let r = declared_type(ps.d, f.ret, room);
       { d: r.d, ty: fn_type(ps.tys, r.ty, declared_row(r.d, f.effects)) }
     },
     TCon(c) -> {
       let name = c.name.name.name;
       match d.tys.get(name) {
         Some(t) -> { d: d, ty: t },
-        None -> match d.imported.get(name) {
-          Some(full) -> {
-            let args = declared_types(d, c.args);
-            { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+        None -> match if c.args.len() == 0 { d.aliases.get(name) } else { None } {
+          // Read without itself, so an alias that names itself is no type at all.
+          Some(body) -> if room <= 0 { panic("an alias expanded past the aliases there are") }
+          else {
+            let o = declared_type({ ..d, aliases: d.aliases.remove(name) }, body, room - 1);
+            { d: { ..o.d, aliases: d.aliases }, ty: o.ty }
           },
-          None -> {
-            let args = declared_types(d, c.args);
-            if builtin_type_arity(name) != Some(args.tys.len()) {
-              panic(misdeclared(b"names a type that is not the language's own at that arity", name))
-            } else if name == b"Hold" {
-              match c.labels {
-                [l] -> match args.d.labels.get(l.name) {
-                  Some(label) ->
-                    { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
-                  None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
-                },
-                _ -> panic(misdeclared(b"names a hold without its region's label", name)),
-              }
-            } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+          None -> match d.imported.get(name) {
+            Some(full) -> {
+              let args = declared_types(d, c.args, room);
+              { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+            },
+            None -> {
+              let args = declared_types(d, c.args, room);
+              if builtin_type_arity(name) != Some(args.tys.len()) {
+                panic(
+                  misdeclared(b"names a type that is not the language's own at that arity", name),
+                )
+              } else if name == b"Hold" {
+                match c.labels {
+                  [l] -> match args.d.labels.get(l.name) {
+                    Some(label) ->
+                      { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
+                    None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
+                  },
+                  _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+                }
+              } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+            },
           },
         },
       }
@@ -1455,7 +1473,8 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
   }
 
 /// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a mode atom of an effect
-/// its module imports by name (`native.read`), a row variable, or none of them.
+/// its module imports by name (`native.read`), which a check holds to one that declares no
+/// operation, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1567,10 +1586,13 @@ fn contract_of(
     },
   }
 
+/// `def` as the builtin `name`, its types read against `imported` and the bodies of the aliases of
+/// no parameter its module declares, `aliases`.
 pub fn declared(
   name: Bytes,
   imported: Map<Bytes, Bytes>,
   def: ExternDef,
+  aliases: Map<Bytes, TypeExpr>,
 ) -> Builtin / {abort.raise} = {
   let tys = def.generics.types.fold(
     { fresh: fresh_new(), tys: Map::new() },
@@ -1595,14 +1617,22 @@ pub fn declared(
     },
   );
   let params = declared_types(
-    { fresh: rows.fresh, tys: tys.tys, labels: labels.tys, rows: rows.rows, imported: imported },
+    {
+      fresh: rows.fresh,
+      tys: tys.tys,
+      labels: labels.tys,
+      rows: rows.rows,
+      imported: imported,
+      aliases: aliases,
+    },
     def.params.map(|p: Param|
       match p.ty {
         Some(t) -> t,
         None -> panic(misdeclared(b"leaves a parameter untyped", p.name.name)),
       }),
+    aliases.len(),
   );
-  let ret = declared_type(params.d, def.ret);
+  let ret = declared_type(params.d, def.ret, aliases.len());
   let row = declared_row(ret.d, def.effects);
   let written = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint| {
     let param = range(0, def.generics.types.len()).fold(0 - 1, |p: Int, i: Int|
@@ -1672,7 +1702,7 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
       match item {
         IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
-          acc.push(declared(def.name.name, imported, def))
+          acc.push(declared(def.name.name, imported, def, Map::new()))
         } else { acc },
         IFn(d) -> if !is_pub(d.vis) { acc } else {
           let whole = signed_extern(source, d);
@@ -1682,7 +1712,7 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
             spec: whole.spec.filter(|c: SpecClause| c.kind == SRequires || c.kind == SEnsures),
           };
           acc.push({
-            ..declared(d.name.name, imported, called),
+            ..declared(d.name.name, imported, called, Map::new()),
             clauses: whole.spec.map(|c: SpecClause| written_at(whole, c.span)),
             body: true,
           })

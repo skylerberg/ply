@@ -672,13 +672,10 @@ impl ply_core::Compiled for Bodies {
     }
 
     fn take_host_use(&self) -> (ply_core::host::HostUse, u64) {
-        let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
-            return Default::default();
-        };
-        (
-            std::mem::take(&mut ctx.host_use),
-            std::mem::take(&mut ctx.host_ops),
-        )
+        self.ctx
+            .try_borrow_mut()
+            .map(|mut ctx| ctx.take_host_use())
+            .unwrap_or_default()
     }
 
     fn take_teardown(&self) -> Vec<ply_core::Diagnostic> {
