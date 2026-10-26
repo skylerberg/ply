@@ -117,6 +117,8 @@ struct State {
 
 pub struct Shutdown {
     bounds: Bounds,
+    /// Whether a first signal drains; one that does not ends the children and exits at once.
+    drains: bool,
     /// The whole of what a signal handler touches.
     requested: AtomicBool,
     /// Set at the stop, so a later `net.accept` answers `0` even if the table is rebuilt.
@@ -155,9 +157,21 @@ impl Shutdown {
         Ok(watch.arrived.swap(false, Ordering::AcqRel))
     }
 
+    /// A stop that drains within `bounds`, and exits at a second signal.
     pub fn new(bounds: Bounds) -> Arc<Shutdown> {
+        Shutdown::made(bounds, true)
+    }
+
+    /// A stop that ends the run's children and exits with the signal's code at the first signal,
+    /// for a run with children and nothing to drain.
+    pub fn at_once() -> Arc<Shutdown> {
+        Shutdown::made(Bounds::default(), false)
+    }
+
+    fn made(bounds: Bounds, drains: bool) -> Arc<Shutdown> {
         Arc::new(Shutdown {
             bounds,
+            drains,
             requested: AtomicBool::new(false),
             stopped_accepting: AtomicBool::new(false),
             second: AtomicBool::new(false),
@@ -395,7 +409,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
                 if stream.recv().await.is_none() {
                     return;
                 }
-                if !shutdown.request(which) {
+                if !shutdown.drains || !shutdown.request(which) {
                     exit_now(&shutdown, which);
                 }
             }
@@ -406,7 +420,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
                 if tokio::signal::ctrl_c().await.is_err() {
                     return;
                 }
-                if !shutdown.request(which) {
+                if !shutdown.drains || !shutdown.request(which) {
                     exit_now(&shutdown, which);
                 }
             }
@@ -469,13 +483,15 @@ fn watch_for(which: Asked, _: Arc<AtomicBool>) -> std::io::Result<()> {
 }
 
 fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
-    let connections = lock(&shutdown.net)
-        .as_ref()
-        .map_or(0, |net| net.connections_in_flight());
-    eprintln!(
-        "   abandoned   {connections} connection{} in flight",
-        if connections == 1 { "" } else { "s" },
-    );
+    if shutdown.drains {
+        let connections = lock(&shutdown.net)
+            .as_ref()
+            .map_or(0, |net| net.connections_in_flight());
+        eprintln!(
+            "   abandoned   {connections} connection{} in flight",
+            if connections == 1 { "" } else { "s" },
+        );
+    }
     shutdown.end_children();
     crate::stdio::settle();
     crate::observe::exiting();

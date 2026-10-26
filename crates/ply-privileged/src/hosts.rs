@@ -59,8 +59,8 @@ pub struct Hosts {
 impl Hosts {
     /// The binding of every family this runtime serves itself, from what a run is lent alone: no
     /// program's rows are read. Its roots, its programs and its command line narrow what they
-    /// serve; `lent` are the caller's families beside them. A run lent `listen LEAD_MS DRAIN_MS`
-    /// stops on a signal.
+    /// serve; `lent` are the caller's families beside them. A run lent `drain LEAD_MS DRAIN_MS`
+    /// drains on `INT` or `TERM`; one lent `end` ends its children and exits at once.
     pub fn granted(grants: &Grants, lent: Vec<LentOp>) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
             grants.named(name).filter_map(|fields| match fields {
@@ -68,7 +68,7 @@ impl Hosts {
                 _ => None,
             })
         };
-        let stop = grants.named("listen").next().map(|fields| {
+        let draining = grants.named("drain").next().map(|fields| {
             let ms = |at: usize, default: u64| {
                 let ms = fields.get(at).and_then(|f| f.parse::<u64>().ok());
                 std::time::Duration::from_millis(ms.unwrap_or(default))
@@ -78,6 +78,7 @@ impl Hosts {
                 drain: ms(1, ply_host::signal::DEFAULT_DRAIN_MS),
             })
         });
+        let stop = draining.or_else(|| grants.has("end").then(ply_host::signal::Shutdown::at_once));
         if let Some(stop) = &stop {
             ply_host::signal::listen(stop).map_err(|d| vec![d])?;
         }

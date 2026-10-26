@@ -3414,9 +3414,12 @@ operation names. The credentials a TLS listener or upgrade names are the ones
 open: `std.term` answers from the terminal the process's streams are, and the
 run leaves it in the mode it found it in. `ply run` listens for `SIGINT` and
 `SIGTERM` where its root performs `std.signal` or accepts connections
-(`net.accept`), and drains as the flags below say; ctrl-C ends any other
-program at once. A run that listens for no stop, as a test's does, is never
-asked to stop and hears no signal, installing no handler of its own.
+(`net.accept`), and drains as the flags below say. Where its root starts a child
+(`process.start` or `process.spawn`) and drains nothing, a stop ends the run's
+children and exits at once, with the code the signal would have given (130 or
+143), so no child outlives it. Ctrl-C ends any other program at once. A run
+that listens for no stop, as a test's does, is never asked to stop and hears no
+signal, installing no handler of its own.
 `std.trace` writes to the sink `--trace` names, and holds each span to being
 closed (`E0445`). A database is opened under a root `--fs` lends, so a run
 lent none opens none (`E0451`).
@@ -3474,7 +3477,7 @@ performs none of it.
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
 | `--trace json\|text\|off` | trace sink: JSON lines on stderr (default), text, or discard |
 | `--trace-level debug\|info\|warn\|error` | lowest level written (default `info`) |
-| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0), in a run that listens for them |
+| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0), in a run that drains on them |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
 At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
@@ -3703,6 +3706,7 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
 | *n* | `process.exit[p](n)` under `ply run`: the program's own, `0` to `125` |
+| 130, 143 | `SIGINT` or `SIGTERM` ended a `ply run`: the first where the run ends its children at once, a second where it drains (§14) |
 | 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
 Flag groups: *simulation* (§9), *host* (§14's flags except trace and drain),

@@ -10,7 +10,7 @@ import compiler.check.types (Atom, Resource, RNamed, RSingleton, RVar, RAny, Typ
 import compiler.check.resolve.tables (Diag, Label)
 import compiler.syntax.type_syntax (mode_text, MRead, MWrite)
 import diagnostic (diag_of)
-import machine (Configured, Named)
+import machine (Configured, Named, Stop, Unheard, Ends, Drains, Drain)
 import std.bin
 import std.bytes
 import std.bytes (u64_le)
@@ -62,7 +62,8 @@ pub type Observability = {
   channels: List<String>,
 }
 
-pub type Stopping = { signals: List<String>, lead_ms: Int, drain_ms: Int }
+/// The signals a run stops on, and its drain where it drains rather than ending at once.
+pub type Stopping = { signals: List<String>, drain: Option<Drain> }
 
 /// The blocks a listing prints under its table: facts no row can carry.
 pub type Disclosures = {
@@ -394,12 +395,12 @@ fn label_matches(r: Resource, row: Option<String>) -> Bool =
 /// program resolved: the TLS stack where a row can listen or the run holds a credential, the roots
 /// where a row reads a file or opens a database or the run binds one, the configuration where a
 /// source was read, the sink where a row traces on a channel, and the signals the run stops on where
-/// it `listens`.
+/// it meets a stop itself (`stop_of`).
 pub fn disclosures_of(
   listing: Listing,
   hosting: entering::Hosting,
   configured: Configured,
-  stop: Option<{ lead_ms: Int, drain_ms: Int }>,
+  stop: Option<Drain>,
 ) -> Disclosures = {
   let facility = |name: String|
     hosting.registrations.any(|r: entering::Registration|
@@ -441,19 +442,26 @@ pub fn disclosures_of(
       })
     },
     shutdown: match stop {
-      Some(s) -> if listens(listing.rows) {
-        Some({ signals: hosting.signals, lead_ms: s.lead_ms, drain_ms: s.drain_ms })
-      } else { None },
+      Some(bounds) -> match stop_of(listing.rows) {
+        Unheard -> None,
+        Ends -> Some({ signals: hosting.signals, drain: None }),
+        Drains -> Some({ signals: hosting.signals, drain: Some(bounds) }),
+      },
       None -> None,
     },
   }
 }
 
-/// Whether a run that binds `rows` listens for a stop: where it asks for one, or accepts
-/// connections, which a stop's drain closes. Any other ends at once on `INT` or `TERM`.
-pub fn listens(rows: List<Row>) -> Bool =
-  rows.any(|row: Row|
-    row.effect == "std.signal.signal" || (row.effect == "std.net.net" && row.op == "accept"))
+/// How a run that binds `rows` meets a stop: it drains where it asks for one or accepts
+/// connections, which a drain closes; it ends its children and exits where it starts a child,
+/// which would otherwise outlive it; and any other is left to the platform, which ends it.
+pub fn stop_of(rows: List<Row>) -> Stop =
+  if rows.any(|row: Row|
+      row.effect == "std.signal.signal" || (row.effect == "std.net.net" && row.op == "accept")) {
+    Drains
+  } else if rows.any(|row: Row|
+      row.effect == "std.process.process" && (row.op == "start" || row.op == "spawn")) { Ends }
+  else { Unheard }
 
 /// No block: a run that discloses nothing past its rows, whose digest is theirs alone.
 pub fn no_disclosures() -> Disclosures =
@@ -552,13 +560,18 @@ pub fn digest_of(listing: Listing, d: Disclosures) -> String / {abort.raise} =
             None -> b"",
           },
           match d.shutdown {
-            Some(s) ->
-              Bytes::concat_all([
-                s.signals.fold(b"ply.hosts.shutdown.v1\x00", |acc: Bytes, n: String|
+            Some(s) -> match s.drain {
+              Some(drain) ->
+                Bytes::concat_all([
+                  s.signals.fold(b"ply.hosts.shutdown.v1\x00", |acc: Bytes, n: String|
+                    acc.concat(sized(n))),
+                  u64_le(drain.lead_ms),
+                  u64_le(drain.drain_ms),
+                ]),
+              None ->
+                s.signals.fold(b"ply.hosts.shutdown.ends.v1\x00", |acc: Bytes, n: String|
                   acc.concat(sized(n))),
-                u64_le(s.lead_ms),
-                u64_le(s.drain_ms),
-              ]),
+            },
             None -> b"",
           },
         ]),
@@ -813,6 +826,35 @@ test "a real handler serves each operation of its effect on each label the progr
       assert(!reaches(l, hashed()), Some("a deterministic handler reaches no host"))
     },
   }
+}
+
+/// A row of `named.op` on no label, as a run binds it.
+fn bound_row(named: String, op: String) -> Row =
+  {
+    effect: named,
+    op: op,
+    resource: None,
+    triple: named ++ "." ++ op,
+    handler: "",
+    deterministic: false,
+    linear: false,
+    blocking: false,
+    secrets: false,
+    declared_nondet: true,
+  }
+
+test "a run drains where it asks for a stop or accepts, ends at once where it starts a child, and is otherwise left to the platform" {
+  let start = bound_row("std.process.process", "start");
+  let spawn = bound_row("std.process.process", "spawn");
+  let accept = bound_row("std.net.net", "accept");
+  let asks = bound_row("std.signal.signal", "stopping");
+  let prints = bound_row("std.process.process", "out");
+  assert_eq(stop_of([]), Unheard);
+  assert_eq(stop_of([prints, bound_row("std.net.net", "connect")]), Unheard);
+  assert_eq(stop_of([prints, start]), Ends);
+  assert_eq(stop_of([spawn]), Ends);
+  assert_eq(stop_of([start, accept]), Drains);
+  assert_eq(stop_of([asks, spawn]), Drains)
 }
 
 test "a registration of an operation a real handler serves is a second handler of it" {

@@ -248,7 +248,7 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
     ctx.set_host(
-        Arc::new(ply_core::HostBinding::hermetic()),
+        Arc::new(ply_core::HostBinding::unbound()),
         Some(runtime),
         None,
     );
@@ -288,7 +288,7 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
 fn a_ticket_another_run_handed_out_is_refused() {
     let mut ctx = context();
     ctx.set_host(
-        Arc::new(ply_core::HostBinding::hermetic()),
+        Arc::new(ply_core::HostBinding::unbound()),
         Some(ply_host::Host::new().runtime()),
         None,
     );

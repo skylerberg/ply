@@ -154,15 +154,12 @@ test/nondet "bound answers from the exec table the run was given" {
   )
 }
 
-/// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says. It asks
-/// whether it is stopping, so its run listens for a stop.
+/// Starts a child that says its pid and sleeps, says that pid, then ends as `ENDING` says.
 fn leaves_a_child() -> String =
   \\import std.process
   \\import std.process (process)
-  \\import std.signal (signal)
   \\
-  \\fn main() -> Unit / {process.start[sh], process.output_line[sh], process.wait[sh], process.out[proc], process.exit[proc], signal.stopping, abort.raise} = {
-  \\  if signal.stopping() { process.exit[proc](0) } else { () };
+  \\fn main() -> Unit / {process.start[sh], process.output_line[sh], process.wait[sh], process.out[proc], process.exit[proc], abort.raise} = {
   \\  let started = process.start[sh](
   \\    ["-c", "echo $$; exec sleep 600"],
   \\    "",
@@ -181,6 +178,16 @@ fn leaves_a_child() -> String =
   \\  }
   \\}
   \\
+
+/// The same program asking whether it is stopping first, so its run drains on a stop.
+fn drains_beside_a_child() -> String =
+  leaves_a_child().replace(
+    "import std.process (process)\n",
+    "import std.process (process)\nimport std.signal (signal)\n",
+  ).replace(
+    "abort.raise} = {\n",
+    "signal.stopping, abort.raise} = {\n  if signal.stopping() { process.exit[proc](0) } else { () };\n",
+  )
 
 fn waits_on_it() -> String = "let _ = process.wait[sh](child, -1);\n      ()"
 
@@ -225,14 +232,16 @@ fn pid_said(server: Server) -> String / {Spawned, abort.raise, diverges} =
     None -> panic("the run never said the child's pid"),
   }
 
-/// A run waiting on its child, stopped from outside: how the run ended, and the child's pid.
+/// A run of `source` waiting on its child, stopped from outside: how the run ended, and the
+/// child's pid.
 type Stopped = { code: Int, pid: String }
 
 fn stopped(
+  source: String,
   flags: List<String>,
   signals: Int,
 ) -> Stopped / {Spawned, Here, process.spawn[sh], time.sleep_ms, abort.raise, diverges} = {
-  leaving(waits_on_it());
+  program(source.replace("ENDING", waits_on_it()));
   let run = speaking(flags.fold(["run", "m.ply", "--exec", "sh=/bin/sh"], List::push), []);
   let pid = pid_said(run);
   assert(alive(pid), Some("the child " ++ pid ++ " is running"));
@@ -244,14 +253,21 @@ fn stopped(
   { code: match f.ended { Exited(c) -> c, Signalled(_) -> -1 }, pid: pid }
 }
 
+// Nothing of it drains, so the stop is the end: its children go, and the code is the signal's.
+test/nondet "a run that starts a child and drains nothing ends the child and exits at the first stop" {
+  let s = stopped(leaves_a_child(), [], 1);
+  assert(s.code == 143, Some("a `SIGTERM` ending the run at once exits 143"));
+  assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the run"))
+}
+
 test/nondet "a second signal ends the children before the run exits" {
-  let s = stopped([], 2);
+  let s = stopped(drains_beside_a_child(), [], 2);
   assert(s.code == 143, Some("a second `SIGTERM` exits 143"));
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the second signal"))
 }
 
 test/nondet "a drain that runs out of time ends the children with the run" {
-  let s = stopped(["--drain-ms", "200"], 1);
+  let s = stopped(drains_beside_a_child(), ["--drain-ms", "200"], 1);
   assert(s.code == 3, Some("an expired drain exits 3"));
   assert(!alive(s.pid), Some("the child " ++ s.pid ++ " outlived the drain"))
 }

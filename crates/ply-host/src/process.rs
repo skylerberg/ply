@@ -17,7 +17,7 @@ use ply_core::{
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -567,20 +567,51 @@ impl HostHandler for Operation {
                 Err(exit_requested(code, span))
             }
             // The resolved atom's resource, never one the handler re-derives.
+            // Held with the started children, so a stop or a teardown ends it as it ends them.
             Op::Spawn => {
                 let Some(program) = host.executables.get(&req.atom.resource) else {
                     return Err(unbound(self.op, &req.atom.resource, span));
                 };
-                let program = program.to_path_buf();
                 let args = argument_vector(&req.args[0], span)?;
-                let dir = req.args[1].as_str(span, "a working directory")?.to_string();
+                let dir = req.args[1].as_str(span, "a working directory")?;
                 let env = traced(rt, environment(self.op, &req.args[2], span)?);
+                let io = Io {
+                    input: false,
+                    out: Output::Keep,
+                    err: Output::Keep,
+                };
+                let launch = Launch {
+                    label: &req.atom.resource,
+                    program,
+                    args: &args,
+                    dir,
+                    env: &env,
+                    io: &io,
+                };
+                let started = host.children.started(&launch, &host.sink);
+                let program = program.to_path_buf();
                 let pending = host.pool.submit(
                     run()?,
                     span,
                     "process-spawn",
                     Op::Spawn.what(),
-                    Box::new(move || run_to_end(&program, &args, &dir, &env, span)),
+                    Box::new(move || match started {
+                        Err(why) => JobOutput::Failed(why),
+                        Ok((_, child)) => match child.wait(None) {
+                            Ok(Some(exit)) => JobOutput::built(move || exit.value()),
+                            Err(Refusal::TooMuch { out, err }) => {
+                                JobOutput::Refused(too_much(Op::Spawn, &program, out, err, span))
+                            }
+                            Err(Refusal::Unreaped(why)) => JobOutput::Failed(format!(
+                                "`{}`'s ending could not be read: {why}",
+                                program.display()
+                            )),
+                            Ok(None) | Err(Refusal::Spent) => JobOutput::Failed(format!(
+                                "`{}` was waited on by something other than its spawn",
+                                program.display()
+                            )),
+                        },
+                    }),
                 )?;
                 Ok(HostAnswer::Pending(pending))
             }
@@ -858,39 +889,6 @@ fn command(program: &Path, args: &[String], dir: &str, env: &[(String, String)])
         command.current_dir(dir);
     }
     command
-}
-
-/// Each stream arrives whole or not at all; `process.start` is what streams.
-fn run_to_end(
-    program: &Path,
-    args: &[String],
-    dir: &str,
-    env: &[(String, String)],
-    span: Span,
-) -> JobOutput {
-    match command(program, args, dir, env)
-        .stdin(Stdio::null())
-        .output()
-    {
-        Err(e) => JobOutput::Failed(format!("`{}` could not be started: {e}", program.display())),
-        Ok(done) => {
-            if done.stdout.len() > MAX_CAPTURE_BYTES || done.stderr.len() > MAX_CAPTURE_BYTES {
-                return JobOutput::Refused(too_much(
-                    Op::Spawn,
-                    program,
-                    done.stdout.len(),
-                    done.stderr.len(),
-                    span,
-                ));
-            }
-            let exit = Finished {
-                ended: children::ending(&done.status),
-                out: done.stdout,
-                err: done.stderr,
-            };
-            JobOutput::built(move || exit.value())
-        }
-    }
 }
 
 #[cold]
