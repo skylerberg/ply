@@ -778,7 +778,7 @@ type Pools = { fields: List<Bytes>, builtins: List<Bytes>, lambdas: List<Bytes> 
 fn pools_of(
   bodies: List<UnitBody>,
   statics: List<StaticDef>,
-  constant_entries: List<Bytes>,
+  constant_entries: List<{ name: RootName, entry: Bytes }>,
 ) -> Pools / {abort.raise} = {
   let ts = bodies.map(|k: UnitBody| k.tables);
   let all = |pick: (Tables) -> List<Bytes>|
@@ -790,9 +790,30 @@ fn pools_of(
       ),
     ),
     builtins: ordered(all(|tables: Tables| tables.builtins)),
-    lambdas: ordered(constant_entries.concat(all(|tables: Tables| tables.lambdas))),
+    lambdas: ordered(
+      constant_entries.map(|c: { name: RootName, entry: Bytes }|
+        entry_named(c.name, c.entry)).concat(
+        bodies.fold([], |acc: List<Bytes>, k: UnitBody|
+          acc.concat(k.tables.lambdas.map(|l: Bytes| entry_named(k.name, l)))),
+      ),
+    ),
   }
 }
+
+/// `entry`, which the code table names for root `name`, the loader taking it by address: one of no
+/// name stops the build at the root that named it, before any C is written.
+fn entry_named(name: RootName, entry: Bytes) -> Bytes / {abort.raise} =
+  if entry.len() > 0 { entry } else {
+    panic(
+      String::of_bytes_lossy(
+        Bytes::concat_all([
+          b"`",
+          root_text(name),
+          b"` names an entry of no name in the code table",
+        ]),
+      ),
+    )
+  }
 
 /// Every static the unit's bodies name, each once and after those it addresses: in the order the
 /// bodies list them, each body listing a static's children before it. Two statics of one name holding
@@ -1278,7 +1299,11 @@ pub fn produce(
   let constants = s.taken.filter(|n: RootName|
     match arity.get(n) { Some(o) -> o.constant, None -> false });
   let statics = statics_placed(s.bodies);
-  let pools = pools_of(s.bodies, statics, constants.map(|n: RootName| published(n).entry));
+  let pools = pools_of(
+    s.bodies,
+    statics,
+    constants.map(|n: RootName| { name: n, entry: published(n).entry }),
+  );
   let placed = placed_of(pools);
   let laid_statics = Bytes::concat_all(
     statics.map(|d: StaticDef|
@@ -4930,6 +4955,39 @@ test "each root a program offers is keyed by the row that says what it is, and p
     mine.filter(|k: RootKey| entered_root(p, k)),
     mine.filter(|k: RootKey| k != law_key(b"m", b"s", LawBody)),
   )
+}
+
+test "a constant that may raise keeps its entry, which the unit's code table names, past the word it is handed for the raise" {
+  let user = [
+    {
+      name: b"m",
+      src: Bytes::concat_all([
+        b"pub fn limit() -> Int / {abort.raise} = if 2 > 3 { abort.raise(\"never\") } else { 7 }\n",
+        b"pub fn twice() -> Int / {abort.raise} = limit() + limit()\n",
+      ]),
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  match emitted(
+      a_runtime(b"r"),
+      dump,
+      sources_placed(dump, user),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(e) -> {
+      let text = e.produced.text;
+      let said = Some(String::of_bytes_lossy(text));
+      assert(
+        text.index_of(Bytes::concat_all([b"(void *)&", entry_of(b"m.limit"), b",\n"])) != None,
+        said,
+      );
+      assert(text.index_of(b"(void *)&,") == None && text.index_of(b"extern char ;") == None, said)
+    },
+  }
 }
 
 test "a generic definition's clause is entered at the specialisation it is judged at, which the unit asks for" {
