@@ -18,7 +18,8 @@ import compiler.emit.lower.setting (Setting, Root, setting_in)
 import compiler.emit.lend (Handing, Lending, lendings_of, declared_lent, handings_of, handing_said,
                            reset_params, conventions)
 import compiler.emit.tir (Inst, Block, Fn, Member, Handed, Reset, If, Case, Match, Loop, Handle,
-                          Given, Lent)
+                          Given, Lent, Let, Do, Call, Lambda, Closure, Arg, Convention)
+import compiler.emit.keys (Callee, Generic)
 import compiler.emit.own (owned, may_reuse)
 import compiler.emit.verify (verified)
 
@@ -276,6 +277,72 @@ test "the prelude's map read and list read lend what they read, and answer an it
   // type.
   assert_eq(said(handed, b"std.prelude.Map::get"), b"[lent, lent] owned");
   assert_eq(said(handed, b"std.prelude.List::at"), b"[lent, lent] owned")
+}
+
+/// A callee generic over a label and a row its closure parameters share, with defaulted arguments,
+/// and a caller generic over a label calling it inside a closure at a row of more words than go
+/// apart.
+fn worded_corpus() -> Bytes =
+  Bytes::concat_all([
+    b"effect store {\n  read get[s]() -> Int\n  write put[s](x: Int) -> Unit\n}\n",
+    b"effect p {\n  write x() -> Unit\n}\n",
+    b"effect q {\n  write x() -> Unit\n}\n",
+    b"effect u {\n  write x() -> Unit\n}\n",
+    b"effect v {\n  write x() -> Unit\n}\n",
+    b"effect w {\n  write x() -> Unit\n}\n",
+    b"fn kept<t, [r] | e>(dir: String, read: (Int) -> Int / {abort.raise | e}, look: (Int) -> Int / {abort.raise | e}, work: () -> t / {abort.raise}, covers: (Int) -> Bool = |_: Int| true, commands: List<Int> = []) -> t / {store.get[r], store.put[r], abort.raise | e} = {\n",
+    b"  store.put[r](read(store.get[r]()) + look(commands.len()));\n",
+    b"  if covers(1) { work() } else { abort.raise(dir) }\n",
+    b"}\n",
+    b"fn seeing<t | e>(go: () -> t / e) -> t / e = go()\n",
+    b"fn answered<[r]>(dir: String) -> Int / {store.get[r], store.put[r], p.x, q.x, u.x, v.x, w.x, abort.raise} =\n",
+    b"  seeing(|| kept[r](dir, |n: Int| { p.x(); q.x(); n }, |n: Int| { u.x(); v.x(); w.x(); n }, || 1, covers: |n: Int| n > 0, commands: [1]))\n",
+  ])
+
+type Called = { callee: Callee, args: List<Arg>, conv: Convention, stops: Bool }
+
+/// The calls `b` makes, at any depth.
+fn calls_in(b: Block) -> List<Called> =
+  b.fold([], |acc: List<Called>, i: Inst|
+    match i {
+      Let(l) -> match l.val { Call(c) -> acc.push(c), _ -> acc },
+      Do(d) -> match d.val { Call(c) -> acc.push(c), _ -> acc },
+      If(x) -> acc.concat(calls_in(x.then)).concat(calls_in(x.otherwise)),
+      Handle(h) -> acc.concat(calls_in(h.body)),
+      _ -> acc,
+    })
+
+test "a call of a specialisation whose words go as one array is written against its definition's handing" {
+  let a = analysed(worded_corpus());
+  let s = set_out(a, b"m", []);
+  let forms = forms_in(s.setting, s.roots);
+  let handed = handings_of(
+    lendings_of(declared_of(s.setting), forms),
+    Map::new(),
+    declared_of(s.setting),
+  ).handed;
+  let form = |name: Bytes|
+    match forms.find(|f: Fn| root_name(f.key) == root_name(Named(name))) {
+      Some(f) -> f,
+      None -> panic(String::of_bytes_lossy(name.concat(b" did not lower"))),
+    };
+  // The specialisation `answered`'s closure calls takes fewer parameters than `kept` as it stands,
+  // whose two words go apart: its seven go as one array.
+  let called = form(b"m.answered").lambdas.fold([], |acc: List<Called>, l: Lambda|
+    match l { Closure(c) -> acc.concat(calls_in(c.body.body)) });
+  let generic = called.filter(|c: Called| match c.callee { Generic(_) -> true, _ -> false });
+  assert_eq(
+    generic.map(|c: Called| c.conv.params.len() < form(b"m.kept").params.len()),
+    [true],
+  );
+  assert_eq(
+    forms.fold([], |acc: List<{ root: Bytes, why: Bytes }>, f: Fn|
+      match verified(owned(conventions(f, handed))) {
+        Some(why) -> acc.push({ root: root_text(root_name(f.key)), why: why }),
+        None -> acc,
+      }),
+    [],
+  )
 }
 
 /// The variables the ownership pass resets anywhere in `b`, by number.
