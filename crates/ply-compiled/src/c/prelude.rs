@@ -191,8 +191,9 @@ impl Helper {
     }
 }
 
-/// A native the compiler declares itself over machine data, under the name it declares and with
-/// its function's signature; bound as the helper [`builtin_helper_name`] names for it.
+/// A native over machine data, under the name the compiler or a shipped module's `extern fn`
+/// declares and with its function's signature; bound as the helper [`builtin_helper_name`] names
+/// for it.
 pub struct MachineNative {
     pub name: &'static str,
     pub signature: Signature,
@@ -276,13 +277,15 @@ machine! {
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
 }
 
-/// The natives the compiler declares itself over machine data: the crossings' and the rest of
-/// this table's, then strings' and byte strings' (`crate::machine`).
+/// The natives over machine data: the crossings' and the rest of this table's, then strings' and
+/// byte strings' (`crate::machine`), then those the standard library's real handlers call
+/// (`crate::hosted`).
 pub fn machine_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let mut all = machine_table();
         all.extend(crate::machine::natives());
+        all.extend(crate::hosted::natives());
         all
     })
 }

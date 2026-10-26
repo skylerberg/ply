@@ -7,7 +7,6 @@ use crate::clock;
 use crate::config;
 use crate::dns;
 use crate::fs;
-use crate::os;
 use crate::password;
 use crate::pool::{Bell, Inbox, Pool, Pooled};
 use crate::process;
@@ -146,7 +145,6 @@ impl Host {
         dns::register(&mut registry, Arc::clone(&self.net));
         // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
         fs::register(&mut registry, Arc::clone(&self.fs));
-        os::register(&mut registry);
         password::register(&mut registry, Arc::clone(&self.password));
         process::register(&mut registry, self.process.as_ref());
         random::register(&mut registry);

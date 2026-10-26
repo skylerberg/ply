@@ -65,18 +65,23 @@ fn a_natives_signature_is_its_functions_type() {
     );
 }
 
-/// A native over machine data is bound as a builtin's helper is, under the name the compiler gives
-/// it, which neither a builtin nor another of them has, at the words and kinds its function takes.
+/// A native over machine data is bound as a builtin's helper is, under the name the compiler or a
+/// shipped module's `extern fn` gives it, which neither a builtin nor another of them has, at the
+/// words and kinds its function takes.
 #[test]
 fn every_native_over_machine_data_has_a_helper_of_its_own() {
     use ply_compiled::c::machine_natives;
     use ply_compiled::native::Machine;
     let machine = machine_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
+    let hosted: Vec<&str> = ply_compiled::hosted::natives()
+        .iter()
+        .map(|n| n.name)
+        .collect();
     for n in machine {
         assert!(
-            n.name.starts_with('?'),
-            "`{}` is no name the compiler declares",
+            n.name.starts_with('?') || hosted.contains(&n.name),
+            "`{}` is no name the compiler or a shipped module declares",
             n.name
         );
         assert!(

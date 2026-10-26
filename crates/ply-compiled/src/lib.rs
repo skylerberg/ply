@@ -15,6 +15,7 @@ pub mod entry;
 pub mod frames;
 pub mod heap;
 pub mod host;
+pub mod hosted;
 pub mod laid;
 pub mod machine;
 pub mod native;

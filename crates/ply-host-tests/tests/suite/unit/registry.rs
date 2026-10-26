@@ -79,22 +79,6 @@ const REPEATABLE: &Rows = &[
             "protocol",
         ],
     ),
-    // What the machine says of itself is read, never taken.
-    (
-        "std.os.os",
-        &[
-            "arch",
-            "cpus",
-            "endian",
-            "executable",
-            "family",
-            "hostname",
-            "name",
-            "pid",
-            "pointer_bits",
-            "user",
-        ],
-    ),
     // Hashing again computes the same bytes and changes nothing outside the program.
     (
         "std.password.kdf",

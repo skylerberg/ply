@@ -9,7 +9,11 @@
 //!
 //! They describe the machine a program runs on, never the one that built it. A `const fn`
 //! performs nothing, so no build keeps an answer, and a built artifact asks again where it runs:
-//! `endian` and `pointer_bits` are operations for that reason.
+//! `endian` and `pointer_bits` are operations for that reason. Where nothing of the program
+//! answers them, the machine does: `served` is the effect's real handler, which every root whose
+//! row names `os` runs under, with or without `--host`.
+
+import std.internal.native (native)
 
 /// The facts. `family`, `arch`, `endian`, `pointer_bits`, `pid`, `user` and `executable` hold
 /// for a whole run; `name`, `hostname` and `cpus` are what the system says when it is asked.
@@ -129,6 +133,100 @@ pub fn on<a | e>(m: Machine, go: () -> a / {os.read | e}) -> a / e =
     os.pointer_bits() -> m.pointer_bits,
   }
 
+// --- The real handler -------------------------------------------------------
+
+host for os by served
+
+/// `go` with every operation answered by the machine the program runs on.
+fn served<a | e>(go: () -> a / {os.read | e}) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    os.family() -> family_of(os_system()),
+    os.name() -> told("name", os_uname()),
+    os.arch() -> arch_of(os_machine()),
+    os.cpus() -> os_cpus(),
+    os.hostname() -> told("hostname", os_hostname()),
+    os.user() -> user_of(os_uid()),
+    os.pid() -> os_pid(),
+    os.executable() -> present(os_executable()),
+    os.endian() -> if os_big_endian() { Big } else { Little },
+    os.pointer_bits() -> os_pointer_bits(),
+  }
+
+/// The system `name` is, as the toolchain names one (`family_name`).
+fn family_of(name: String) -> Family =
+  match name {
+    "linux" -> Linux,
+    "macos" -> MacOs,
+    "windows" -> Windows,
+    "freebsd" -> FreeBsd,
+    "openbsd" -> OpenBsd,
+    "netbsd" -> NetBsd,
+    _ -> OtherFamily(name),
+  }
+
+/// The architecture `name` is, as the toolchain names one (`arch_name`).
+fn arch_of(name: String) -> Arch =
+  match name {
+    "x86_64" -> X86_64,
+    "aarch64" -> Aarch64,
+    "x86" -> X86,
+    "arm" -> Arm,
+    "riscv64" -> Riscv64,
+    _ -> OtherArch(name),
+  }
+
+/// The user of id `id`, and the name the system's records give it.
+fn user_of(id: Int) -> User / {native.read} = { id: id, name: present(os_user_name(id)) }
+
+/// The text a native told: byte 1 and then it, or byte 0 and then why the system said nothing,
+/// which ends the run, since a system that cannot name `what` is no machine a program runs on.
+fn told(what: String, said: Bytes) -> String / {abort.raise} = {
+  let text = String::of_bytes_lossy(said.slice(1, said.len()));
+  if said.at(0) == 1 { text } else { panic("the system did not say its " ++ what ++ ": " ++ text) }
+}
+
+/// The text a native found: byte 1 and then it, or byte 0 alone where there is none.
+fn present(said: Bytes) -> Option<String> =
+  if said.len() > 0 && said.at(0) == 1 { Some(String::of_bytes_lossy(said.slice(1, said.len()))) }
+  else { None }
+
+// Each native asks the machine this program runs on.
+
+/// The name the toolchain gives the system this binary was built for: `linux`, `macos`, ...
+extern fn os_system() -> String / {native.read}
+
+/// The name the toolchain gives the architecture this binary was built for: `x86_64`, ...
+extern fn os_machine() -> String / {native.read}
+
+/// The system's name for itself and its release, as `uname -sr` prints them, told.
+extern fn os_uname() -> Bytes / {native.read}
+
+/// The name the kernel holds for the machine, told; no resolver is asked.
+extern fn os_hostname() -> Bytes / {native.read}
+
+/// The processors the process may run on at once, at least one.
+extern fn os_cpus() -> Int / {native.read}
+
+/// The id of the user the process runs as.
+extern fn os_uid() -> Int / {native.read}
+
+/// The name the system's records give the user of id `id`, found.
+extern fn os_user_name(id: Int) -> Bytes / {native.read}
+
+/// The process's id.
+extern fn os_pid() -> Int / {native.read}
+
+/// The absolute path of the executable the process runs, its links followed, found.
+extern fn os_executable() -> Bytes / {native.read}
+
+/// Whether the machine's words are big-endian.
+extern fn os_big_endian() -> Bool / {native.read}
+
+/// The width of an address on the machine, in bits.
+extern fn os_pointer_bits() -> Int / {native.read}
+
 // --- Tests ------------------------------------------------------------------
 
 /// A log line's prefix, as a service names where it runs.
@@ -208,4 +306,28 @@ test "a family and an architecture have the names tools give them, and an unlist
   assert(is_unix(MacOs));
   assert(!is_unix(Windows));
   assert(!is_unix(OtherFamily("wasi")))
+}
+
+test "the toolchain's name of a system or an architecture reads back as the one it names" {
+  [Linux, MacOs, Windows, FreeBsd, OpenBsd, NetBsd, OtherFamily("plan9")].fold(
+    (),
+    |_: Unit, f: Family| assert_eq(family_of(family_name(f)), f),
+  );
+  [X86_64, Aarch64, X86, Arm, Riscv64, OtherArch("s390x")].fold((), |_: Unit, a: Arch|
+    assert_eq(arch_of(arch_name(a)), a));
+  assert_eq(present(b"\x01ada"), Some("ada"));
+  assert_eq(present(b"\x00"), None);
+  assert_eq(told("name", b"\x01Linux 6.8.0"), "Linux 6.8.0")
+}
+
+test/nondet "a run asks the machine it is on, which no handler of its own answers" {
+  assert(os.cpus() >= 1);
+  assert(os.pointer_bits() == 64 || os.pointer_bits() == 32);
+  assert(os.pid() > 0 && os.pid() == os.pid());
+  assert(os.user().id >= 0);
+  assert(os.executable() != None);
+  assert(os.hostname().len() > 0);
+  assert(os.name().len() > 0);
+  assert_eq(family_of(family_name(os.family())), os.family());
+  assert_eq(arch_of(arch_name(os.arch())), os.arch())
 }

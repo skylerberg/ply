@@ -1814,7 +1814,8 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `E0104`. No mode atom stands for a `raise`: a row names each one, `toml.syntax`,
 so a row is the set of ways a call can fail (§6.8). `diverges`, written bare,
 is the atom of a call that may not return (§5.10); it names no operation, and
-nothing handles it.
+nothing handles it. An effect that declares no operation is named by a mode
+atom, `native.read`, which likewise names no operation and nothing handles.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
 a call adds the callee's row as written (a mode atom stays a mode atom), and a
@@ -3370,6 +3371,12 @@ dependent's proof is owed; a load of the library's own directory reads every
 module of it, each one whole.
 
 ## 14. The host boundary
+
+An effect whose module declares its real handler (§6.10) never reaches the
+boundary: every root whose row names it runs under that handler, with or
+without `--host` and whatever else the flags say, as `std.os`'s operations do.
+A native such a handler calls refuses inside a `simulate` region and in a test
+the search re-runs, as a host operation does (`E0425`).
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
