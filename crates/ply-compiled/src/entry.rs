@@ -11,7 +11,7 @@
 
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
-use crate::native::{Addr, I64};
+use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_OUT_OF_FUEL, FAILED_UNWIND, lent};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, MachineId, RuntimeFactory};
@@ -313,6 +313,20 @@ pub fn enter(
     outcome
 }
 
+/// What `enter` answers, run on a thread of its own with a program's stack, so how deeply an entry
+/// may nest does not hang on what its caller left of its own stack: `None` where no thread could be
+/// made or the work unwound.
+pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(crate::rt::PROGRAM_STACK)
+            .spawn_scoped(scope, enter)
+            .ok()?
+            .join()
+            .ok()
+    })
+}
+
 /// What an entry leaves for its outcome once its root returned.
 struct Last {
     steps: u64,
@@ -535,7 +549,7 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// `open`: `result(opened, string)`, `opened := int unit, int roots, int nanos, int threads`.
-unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let library = unsafe { lent(p, n) };
     let mut w = Writer::new();
     match std::str::from_utf8(library)
@@ -556,7 +570,7 @@ unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
             w.tag(1).str(&why);
         }
     }
-    unsafe { &mut *ctx }.give(w.finish())
+    unsafe { &mut *ctx }.given(w.finish())
 }
 
 /// `close`: the unit let go; an entry still running holds it until it ends.
@@ -566,13 +580,13 @@ unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
 
 /// `bind`: `result(int, list(failure))`. A binding that lends the host is refused unless the
 /// caller is lent `machine`.
-unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
-        return I64(0);
+        return TakenBytes(0);
     };
     if !grants.has("hermetic") && !allowed(c, "machine.bind") {
-        return I64(0);
+        return TakenBytes(0);
     }
     let made = match BINDER.get() {
         Some(binder) => binder.bind(grants),
@@ -589,45 +603,51 @@ unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
                 .list(refused.iter(), |w, d| write_failure(w, d, None));
         }
     }
-    c.give(w.finish())
+    c.given(w.finish())
 }
 
 /// `unbind`: `list(report)`, `report := string name, bytes body`.
-unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> I64 {
+unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
     let bound = bindings().by.remove(&binding.0);
     let reports = bound.map(|b| b.unbind()).unwrap_or_default();
     let mut w = Writer::new();
     w.list(reports.iter(), |w, (name, body)| {
         w.str(name).bytes(body);
     });
-    unsafe { &mut *ctx }.give(w.finish())
+    unsafe { &mut *ctx }.given(w.finish())
 }
 
 /// `hosting`: what the families register under the grants, and the disclosures' facts.
-unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
+unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
-        return I64(0);
+        return TakenBytes(0);
     };
     let Some(binder) = BINDER.get() else {
-        return I64(c.fail(err_no_binder()));
+        return TakenBytes(c.fail(err_no_binder()));
     };
     let mut w = Writer::new();
     binder.hosting(&grants, &mut w);
-    c.give(w.finish())
+    c.given(w.finish())
 }
 
 /// `moved`: `option(string)`, under the roots and the binding the grants name.
-unsafe extern "C" fn rt_unit_moved(ctx: *mut Ctx, gp: Addr, gn: I64, tp: Addr, tn: I64) -> I64 {
+unsafe extern "C" fn rt_unit_moved(
+    ctx: *mut Ctx,
+    gp: Addr,
+    gn: I64,
+    tp: Addr,
+    tn: I64,
+) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(gp, gn) }, read_grants) else {
-        return I64(0);
+        return TakenBytes(0);
     };
     if !allowed(c, "machine.moved") {
-        return I64(0);
+        return TakenBytes(0);
     }
     let Some(binder) = BINDER.get() else {
-        return I64(c.fail(err_no_binder()));
+        return TakenBytes(c.fail(err_no_binder()));
     };
     let trace = String::from_utf8_lossy(unsafe { lent(tp, tn) }).into_owned();
     let moved = binder.moved(&grants, &trace, c.id);
@@ -635,10 +655,10 @@ unsafe extern "C" fn rt_unit_moved(ctx: *mut Ctx, gp: Addr, gn: I64, tp: Addr, t
     w.option(moved.as_deref(), |w, m| {
         w.str(m);
     });
-    c.give(w.finish())
+    c.given(w.finish())
 }
 
-/// `enter`: `outcome`, `root` of the unit entered on a context of its own on this thread.
+/// `enter`: `outcome`, `root` of the unit entered on a context and a program thread of its own.
 #[allow(clippy::too_many_arguments)]
 unsafe extern "C" fn rt_unit_enter(
     ctx: *mut Ctx,
@@ -649,43 +669,43 @@ unsafe extern "C" fn rt_unit_enter(
     arguments_n: I64,
     run_p: Addr,
     run_n: I64,
-) -> I64 {
+) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(asked) = read_or_fail(c, unsafe { lent(run_p, run_n) }, read_run) else {
-        return I64(0);
+        return TakenBytes(0);
     };
     if (asked.run.timeout_ms > 0 || asked.run.measure) && !allowed(c, "machine.enter") {
-        return I64(0);
+        return TakenBytes(0);
     }
     let root = String::from_utf8_lossy(unsafe { lent(root_p, root_n) }).into_owned();
     let arguments = unsafe { lent(arguments_p, arguments_n) }.to_vec();
     let Some(opened) = units().get(unit.0) else {
-        return I64(c.fail(err_unheld("unit", unit.0)));
+        return TakenBytes(c.fail(err_unheld("unit", unit.0)));
     };
     let bound = match asked.binding {
         0 => None,
         handle => match bindings().get(handle) {
             Some(bound) => Some(bound),
-            None => return I64(c.fail(err_unheld("binding", handle))),
+            None => return TakenBytes(c.fail(err_unheld("binding", handle))),
         },
     };
-    let watch = bound.as_deref().map(|by| Watch {
-        by,
-        caller: c.id,
-        recorded: asked.observe,
+    let caller = c.id;
+    let entered = on_program_thread(|| {
+        let watch = bound.as_deref().map(|by| Watch {
+            by,
+            caller,
+            recorded: asked.observe,
+        });
+        let hosted = bound.as_deref().filter(|_| asked.hosted);
+        enter(&opened, &root, arguments, &asked.run, hosted, watch)
     });
-    let outcome = enter(
-        &opened,
-        &root,
-        arguments,
-        &asked.run,
-        bound.as_deref().filter(|_| asked.hosted),
-        watch,
-    );
+    let Some(outcome) = entered else {
+        return TakenBytes(c.fail(err_no_thread()));
+    };
     let exit = bound.as_ref().and_then(|b| b.requested_exit());
     let mut w = Writer::new();
     write_outcome(&mut w, &opened, &outcome, exit);
-    c.give(w.finish())
+    c.given(w.finish())
 }
 
 /// Whether the caller is lent `machine`, the context failed where it is not.
@@ -984,4 +1004,12 @@ fn err_no_binder() -> Diagnostic {
         "this process serves no host families: no binder was installed",
     )
     .note("a `ply` installs its binder before it enters its program; this is Ply's fault")
+}
+
+#[cold]
+fn err_no_thread() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "the thread an entry runs on could not be made, or its work unwound",
+    )
 }

@@ -23,7 +23,6 @@ pub mod payload;
 pub mod policy;
 pub mod recording;
 pub mod reused;
-pub mod runnable;
 pub mod shipped;
 pub mod shipped_modules;
 pub mod support;
@@ -47,10 +46,9 @@ pub const EFFECT: &str = "machine";
 
 pub const HERMETIC: &str = "hermetic_machine";
 
-const OPERATIONS: [(&str, &str); 12] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("configure", "ply_privileged::configure"),
     ("load", "ply_privileged::load"),
-    ("opened", "ply_privileged::opened"),
     ("reuse", "ply_privileged::reuse"),
     ("filed", "ply_privileged::filed"),
     ("reload", "ply_privileged::reload"),
@@ -62,10 +60,9 @@ const OPERATIONS: [(&str, &str); 12] = [
     ("drop", "ply_privileged::drop"),
 ];
 
-const HERMETIC_OPERATIONS: [(&str, &str); 12] = [
+const HERMETIC_OPERATIONS: [(&str, &str); 11] = [
     ("configure", "ply_privileged::hermetic::configure"),
     ("load", "ply_privileged::hermetic::load"),
-    ("opened", "ply_privileged::hermetic::opened"),
     ("reuse", "ply_privileged::hermetic::reuse"),
     ("filed", "ply_privileged::hermetic::filed"),
     ("reload", "ply_privileged::hermetic::reload"),
@@ -218,18 +215,6 @@ impl HostHandler for MachineHandler {
         let value = match (req.op.op.as_str(), req.args) {
             ("configure", [options]) => self.configure(&label, options, span)?,
             ("load", [root, front, unit]) => self.load(&label, root, front, unit, span)?,
-            ("opened", [path, runnable, entry, closure, names, library]) => self.opened(
-                &label,
-                &[
-                    path.clone(),
-                    runnable.clone(),
-                    entry.clone(),
-                    closure.clone(),
-                    names.clone(),
-                    library.clone(),
-                ],
-                span,
-            )?,
             ("reuse", [root, walked, entry]) => self.reuse(&label, root, walked, entry, span)?,
             ("filed", [front, unit]) => filed(front, unit, span)?,
             ("reload", [front, unit]) => {
@@ -450,63 +435,6 @@ impl MachineHandler {
             }
             Err(_) => Ok(payload::option(None)),
         }
-    }
-
-    /// The program the artifact at `path` holds, from the parts of it the caller read out of the
-    /// container and checked: its runnable, the entry its namespace names, the closure it prints
-    /// and the hash it files each name under, and the library its caller compiled its unit into.
-    fn opened(&self, label: &str, args: &[Value; 6], span: Span) -> Result<Value, Diagnostic> {
-        let [path, runnable, entry, closure, names, library] = args;
-        let library = PathBuf::from(library.as_str(span, "the artifact's library")?);
-        let path = PathBuf::from(path.as_str(span, "the artifact's path")?);
-        let runnable = runnable.as_bytes(span, "the artifact's runnable")?.to_vec();
-        let entry = entry.as_str(span, "the artifact's entry")?.to_string();
-        let closure = closure
-            .as_list(span, "the artifact's closure")?
-            .iter()
-            .map(|file| {
-                Ok(drive::Closed {
-                    path: crate::payload::field_of(file, "path", span)?
-                        .as_str(span, "a module's path")?
-                        .to_string(),
-                    text: String::from_utf8_lossy(
-                        crate::payload::field_of(file, "text", span)?
-                            .as_bytes(span, "a module's text")?,
-                    )
-                    .into_owned(),
-                })
-            })
-            .collect::<Result<Vec<_>, Diagnostic>>()?;
-        let names = names
-            .as_list(span, "the artifact's names")?
-            .iter()
-            .map(|named| {
-                let hash = crate::payload::field_of(named, "hash", span)?
-                    .as_bytes(span, "a name's hash")?;
-                Ok(drive::Hashed {
-                    name: crate::payload::field_of(named, "name", span)?
-                        .as_str(span, "a name")?
-                        .to_string(),
-                    hash: ply_core::DefHash(hash[..].try_into().map_err(|_| {
-                        Diagnostic::error(
-                            ply_core::codes::RUNTIME_ERROR,
-                            "a name's hash is not 32 bytes",
-                        )
-                        .primary(span, "handed here")
-                    })?),
-                })
-            })
-            .collect::<Result<Vec<_>, Diagnostic>>()?;
-        let options = self.taken(label);
-        let found = self.open(label, options, span, move |options| {
-            drive::Drive::open_deployed(
-                options, &path, &runnable, &entry, &closure, &names, &library,
-            )
-        })?;
-        Ok(match found {
-            Ok(_) => ok(Value::Unit),
-            Err(refused) => refused_value(&refused),
-        })
     }
 
     /// What the label was configured with, taken for the load that uses it.

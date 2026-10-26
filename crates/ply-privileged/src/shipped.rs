@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 12] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("names", "ply_privileged::shipped::names"),
     ("module", "ply_privileged::shipped::module"),
     ("answer", "ply_privileged::shipped::answer"),
@@ -16,7 +16,6 @@ const OPERATIONS: [(&str, &str); 12] = [
     ("version", "ply_privileged::shipped::version"),
     ("stamps", "ply_privileged::shipped::stamps"),
     ("runtime", "ply_privileged::shipped::runtime"),
-    ("runnable", "ply_privileged::shipped::runnable"),
     ("values", "ply_privileged::shipped::values"),
     ("entered", "ply_privileged::shipped::entered"),
     ("definitions", "ply_privileged::shipped::definitions"),
@@ -138,26 +137,14 @@ impl HostHandler for Shipped {
                 PlyValue::bytes(ENTERED.get().map_or("", String::as_str).as_bytes())
             }
             ("runtime", []) => PlyValue::bytes(ply_compiled::c::described()),
-            ("runnable", [entry, files, dump]) => {
-                let entry = entry.as_str(span, "an entry point's name")?;
-                let bytes = crate::runnable::encode(entry, files, dump).map_err(|why| {
-                    Diagnostic::error(
-                        codes::INTERNAL_ERROR,
-                        format!("the program does not encode as a runnable: {why}"),
-                    )
-                    .primary(span, "this is Ply's fault")
-                })?;
-                PlyValue::bytes(bytes)
-            }
             ("values", [library, roots, steps]) => values(library, roots, steps, span)?,
-            ("entered", [library, runnable, argument, steps]) => {
-                let library = std::path::PathBuf::from(library.as_str(span, "the unit's library")?);
-                let runnable =
-                    std::path::PathBuf::from(runnable.as_str(span, "the unit's runnable")?);
+            ("entered", [library, root, argument, steps]) => {
+                let library = PathBuf::from(library.as_str(span, "the unit's library")?);
+                let root = root.as_str(span, "the root to enter")?;
                 let argument = argument.as_bytes(span, "an argument")?;
                 let steps = steps.as_int(span, "the calls the entry may make")?;
                 crate::payload::option(
-                    entry_answered(library, runnable, argument, steps, span)?.map(PlyValue::bytes),
+                    entry_answered(&library, root, argument, steps, span)?.map(PlyValue::bytes),
                 )
             }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
@@ -177,7 +164,7 @@ fn values(
     span: ply_core::Span,
 ) -> Result<PlyValue, Diagnostic> {
     use ply_compiled::entry::{self, Ended, Run};
-    let library = std::path::PathBuf::from(library.as_str(span, "the unit's library")?);
+    let library = PathBuf::from(library.as_str(span, "the unit's library")?);
     let roots = roots
         .as_list(span, "the stored roots")?
         .iter()
@@ -194,7 +181,7 @@ fn values(
         )
         .primary(span, "its constants were to be entered here")
     })?;
-    let answered = on_program_thread(|| {
+    let answered = entry::on_program_thread(|| {
         roots
             .iter()
             .map(|root| {
@@ -220,49 +207,22 @@ fn values(
     ))
 }
 
-/// A deriver's unit as [`entry_answered`] keeps it: opened once a process, with the root its
-/// runnable names.
-type Kept = (Arc<ply_compiled::entry::Opened>, String);
-
-/// Each unit [`entry_answered`] opened, by its library and its runnable.
-static OPENED: OnceLock<std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), Kept>>> =
-    OnceLock::new();
-
-/// What the entry the runnable at `runnable` names, its unit compiled into `library`, answers for
-/// the value the PLV1 bytes `argument` hold under `steps` calls, as the root writes it: none where it
+/// What `root` of the unit compiled into `library`, a function of one parameter, answers for the
+/// value the PLV1 bytes `argument` hold under `steps` calls, as the root writes it: none where it
 /// raised, ran past its calls or answered nothing a run can hold.
 fn entry_answered(
-    library: PathBuf,
-    runnable: PathBuf,
+    library: &std::path::Path,
+    root: &str,
     argument: &[u8],
     steps: i64,
     span: ply_core::Span,
 ) -> Result<Option<Vec<u8>>, Diagnostic> {
-    use ply_compiled::entry::{self, Ended, Opened, Run};
+    use ply_compiled::entry::{self, Ended, Run};
     let refused = |why: String| {
         Diagnostic::error(codes::INTERNAL_ERROR, why).primary(span, "this is Ply's fault")
     };
-    let key = (library, runnable);
-    let kept = {
-        let mut opened = OPENED
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match opened.get(&key) {
-            Some(kept) => kept.clone(),
-            None => {
-                let held = std::fs::read(&key.1)
-                    .map_err(|e| format!("`{}` does not read: {e}", key.1.display()))
-                    .and_then(|bytes| crate::runnable::decode(&bytes))
-                    .map_err(|why| refused(format!("an entered unit's runnable: {why}")))?;
-                let unit = Opened::open(&key.0)
-                    .map_err(|why| refused(format!("an entered unit does not load: {why}")))?;
-                let kept = (unit, held.entry);
-                opened.insert(key, kept.clone());
-                kept
-            }
-        }
-    };
+    let opened = opened_unit(library)
+        .map_err(|why| refused(format!("an entered unit does not load: {why}")))?;
     let value = ply_core::codec::decode(argument)
         .map_err(|why| refused(format!("an entered unit's argument does not decode: {why}")))?;
     let arguments = ply_core::codec::encode(&PlyValue::list(vec![value]))
@@ -271,12 +231,13 @@ fn entry_answered(
         steps,
         ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
     };
-    Ok(
-        match entry::enter(&kept.0, &kept.1, arguments, &run, None).ended {
+    Ok(entry::on_program_thread(|| {
+        match entry::enter(&opened, root, arguments, &run, None, None).ended {
             Ended::Answered(bytes) => Some(bytes),
             _ => None,
-        },
-    )
+        }
+    })
+    .flatten())
 }
 
 /// The unit compiled into `library`, opened the first time this process asks and kept after.
@@ -294,20 +255,6 @@ fn opened_unit(library: &std::path::Path) -> Result<Arc<ply_compiled::entry::Ope
     Ok(Arc::clone(
         held.entry(library.to_path_buf()).or_insert(opened),
     ))
-}
-
-/// What `enter` answers, run on a thread of its own with a program's stack: how deeply the caller
-/// had nested bounds nothing a nested entry nests. `None` where no thread could be started or the
-/// thread did not finish.
-fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
-    std::thread::scope(|s| {
-        std::thread::Builder::new()
-            .stack_size(ply_compiled::rt::PROGRAM_STACK)
-            .spawn_scoped(s, enter)
-            .ok()?
-            .join()
-            .ok()
-    })
 }
 
 /// The runtime a unit is compiled against as a released `ply`'s bootstrap reads it, written as

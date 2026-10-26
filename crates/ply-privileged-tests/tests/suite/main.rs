@@ -1,5 +1,4 @@
-//! The machine's Rust over programs written out by hand: the front `ply run` files and reads back,
-//! and the runnable a deployed program carries.
+//! The machine's Rust over programs written out by hand: the front `ply run` files and reads back.
 
 /// The pack this binary reads: a few shipped modules written out by hand, one below another and one
 /// with a data file beside it.
@@ -17,5 +16,4 @@ fn pack() {
 mod front;
 mod hosts;
 mod reused;
-mod runnable;
 mod shipped;

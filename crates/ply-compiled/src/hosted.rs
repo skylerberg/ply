@@ -71,10 +71,6 @@ impl Ctx {
         );
         true
     }
-
-    fn given(&mut self, bytes: Vec<u8>) -> TakenBytes {
-        TakenBytes(self.give(bytes).0)
-    }
 }
 
 /// `text` told: byte 1 and its bytes, or byte 0 and the system's error.

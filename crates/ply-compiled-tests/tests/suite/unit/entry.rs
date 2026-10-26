@@ -246,3 +246,32 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
         Ok(Value::Int(18))
     );
 }
+
+/// An entry on a program thread nests as deeply as its run allows, however little stack the thread
+/// that asks for it has: 100,000 nested calls from a thread of 256 KiB.
+#[test]
+fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some(opened) = opened(dir.path()) else {
+        return;
+    };
+    let deep = Run::unbounded(200_000);
+    let asked = std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            entry::on_program_thread(|| {
+                let arguments = arguments(vec![Value::Int(100_000)]);
+                match entry::enter(&opened, "m.ladder", arguments, &deep, None, None).ended {
+                    Ended::Answered(bytes) => Some(bytes),
+                    _ => None,
+                }
+            })
+        })
+        .expect("a thread of little stack")
+        .join()
+        .expect("the asking thread ends");
+    let answer = asked
+        .flatten()
+        .map(|bytes| codec::decode(&bytes).expect("the answer reads"));
+    assert_eq!(answer, Some(Value::Int(100_000)));
+}

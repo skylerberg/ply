@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
-use crate::native::{Addr, F64, I64};
+use crate::native::{Addr, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 
 /// One crossing under way.
@@ -210,6 +210,11 @@ impl Ctx {
     pub(crate) fn give(&mut self, bytes: Vec<u8>) -> I64 {
         self.taken = bytes;
         I64(self.taken.len() as i64)
+    }
+
+    /// The bytes a machine-word native answers, held until compiled code copies them out.
+    pub(crate) fn given(&mut self, bytes: Vec<u8>) -> TakenBytes {
+        TakenBytes(self.give(bytes).0)
     }
 }
 
