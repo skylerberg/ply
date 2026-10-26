@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Raises, Signature};
+use crate::native::{Addr, F64, I64, Native, Out, Raises, Signature};
 use crate::rt::Ctx;
 
 /// What a released `ply`'s units open with, as it reads this runtime's description; this `ply`'s
@@ -349,10 +349,25 @@ helpers! {
     rt_release_later(w: Handed, root: DropRoot);
     rt_release_drain();
     rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
+    rt_dispatch_at(
+        handler: I64,
+        op: *const PlyOp,
+        resource: I64,
+        mode: I64,
+        args: *const Handed
+    ) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
     rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
     rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
+    rt_handle_install_at(clauses: *const Word, n: I64, ret: Handed, cell: Out) -> I64;
     rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
+    rt_handle_forwarded(
+        clauses: *const Word,
+        n: I64,
+        ret: Handed,
+        body: Block,
+        forwards: Block
+    ) -> Handed;
     rt_with_cleanup(
         acquire: Block,
         body: Block,

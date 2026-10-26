@@ -6,7 +6,7 @@ use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, bridged, obj, set_word, word_at,
 };
 use crate::host::Served;
-use crate::native::{I64, Native, Raises, Raising, Signature};
+use crate::native::{I64, Native, Out, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use ply_core::builtins::hold_released;
 use ply_core::region::StepSite;

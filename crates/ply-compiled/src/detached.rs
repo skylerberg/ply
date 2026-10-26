@@ -30,10 +30,80 @@ pub struct Detached {
     /// Owned here, not by the entry frame, which every restored snapshot would release again.
     body: Word,
     ret: Word,
+    /// The block whose objects the body, clauses and `return` clause hold for what their rows take
+    /// around the `handle`, kept as the closures are.
+    forwards: Option<Word>,
     starting: Option<Word>,
     state: State,
     captures: Vec<Capture>,
     live: Option<usize>,
+}
+
+/// A detached `handle`'s forwarding block, as emitted code lays it out past its header, in words:
+/// the handler (which [`open`] writes), the unit's word mapping, the static descriptor of the words
+/// it forwards, how many those are (`m`), how many words the block holds, then the `m` words each
+/// forwards to, the labels the descriptor leaves to them, and the evidence objects. An object that
+/// forwards has its slot's environment point at a pair: the address of the word it forwards to and
+/// the operation's place. Every call of a continuation sets those `m` words to what its caller hands
+/// for the same.
+const FORWARDS_HANDLER: usize = 0;
+const FORWARDS_MAPPED: usize = 1;
+const FORWARDS_OWN: usize = 2;
+const FORWARDS_COUNT: usize = 3;
+const FORWARDS_WORDS: usize = 4;
+const FORWARDS_TARGETS: usize = 5;
+
+/// `void ply_words_mapped(PlyCtx *, const Word *own, const Word *labels, const Word *site, const
+/// Word *words, Word *out)`, the head's.
+type Mapped =
+    unsafe extern "C" fn(*mut Ctx, *const Word, *const Word, *const Word, *const Word, *mut Word);
+
+fn forwards_words(block: Word) -> *mut Word {
+    unsafe { (block as *mut Word).byte_add(HEADER) }
+}
+
+fn forwards_bytes(block: Word) -> Word {
+    let words = unsafe { *forwards_words(block).add(FORWARDS_WORDS) };
+    HEADER as Word + 8 * words
+}
+
+/// Points body `id`'s forwarding words at the words the call resuming it handed for the same, as
+/// `ctx`'s `entering_*` name them, the frame bridge where it handed none; a word that is one of the
+/// block's own objects, which the body's own clause hands back, leaves its word as it was.
+fn retargeted(ctx: *mut Ctx, id: usize) {
+    let c = unsafe { &mut *ctx };
+    let site = std::mem::take(&mut c.entering_desc);
+    let words = std::mem::take(&mut c.entering_words);
+    let Some(block) = c.detached[id].forwards else {
+        return;
+    };
+    let b = forwards_words(block);
+    let (m, size) = unsafe {
+        (
+            *b.add(FORWARDS_COUNT) as usize,
+            *b.add(FORWARDS_WORDS) as usize,
+        )
+    };
+    let targets = unsafe { b.add(FORWARDS_TARGETS) };
+    let old: Vec<Word> = (0..m).map(|i| unsafe { *targets.add(i) }).collect();
+    let mapped: Mapped = unsafe { std::mem::transmute(*b.add(FORWARDS_MAPPED)) };
+    unsafe {
+        mapped(
+            ctx,
+            *b.add(FORWARDS_OWN) as *const Word,
+            targets.add(m),
+            site as *const Word,
+            words as *const Word,
+            targets,
+        );
+    }
+    let own = (b as Word)..(unsafe { b.add(size) } as Word);
+    for (i, was) in old.into_iter().enumerate() {
+        let now = unsafe { targets.add(i) };
+        if own.contains(unsafe { &*now }) {
+            unsafe { now.write(was) };
+        }
+    }
 }
 
 /// What a stop leaves behind.
@@ -68,9 +138,16 @@ enum Stopped {
 
 const ONE_SHOT: &str = "the `handle` this continuation was captured in has already ended";
 
-/// `rt_handle_install_detached`: runs the body on a fresh stack until it stops; answers the
-/// handle's value.
-pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, body: Word) -> Word {
+/// `rt_handle_install_detached` and `rt_handle_forwarded`: runs the body on a fresh stack until it
+/// stops; answers the handle's value. Takes `forwards`, the body's forwarding block where it has one,
+/// whose handler word this sets.
+pub(crate) unsafe fn open(
+    ctx: *mut Ctx,
+    clauses: Vec<FrameClause>,
+    ret: Word,
+    body: Word,
+    forwards: Option<Word>,
+) -> Word {
     drain(ctx);
     let c = unsafe { &mut *ctx };
     let Some(stack) = Stack::take() else {
@@ -79,6 +156,9 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
             release_fun(ret);
         }
         release_fun(body);
+        if let Some(block) = forwards {
+            unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
+        }
         return no_stack_to_take(c);
     };
     let id = c.detached.len();
@@ -87,6 +167,13 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
     let frames = c.open_stack(Some(opener));
     c.stacks[frames].body = Some(id);
     let handler = c.next_handler();
+    if let Some(block) = forwards {
+        unsafe {
+            forwards_words(block)
+                .add(FORWARDS_HANDLER)
+                .write(handler as Word)
+        };
+    }
     c.stacks[frames]
         .list
         .push(HandlerFrame::detached(clauses, id, fuel, handler));
@@ -103,6 +190,7 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
         answer: 0,
         body,
         ret,
+        forwards,
         starting: Some(body),
         state: State::Fresh,
         captures: Vec::new(),
@@ -248,6 +336,9 @@ fn give_back(c: &mut Ctx, id: usize) {
         if f != 0 {
             release_fun(f);
         }
+    }
+    if let Some(block) = c.detached[id].forwards.take() {
+        unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
     }
 }
 
@@ -480,6 +571,7 @@ unsafe extern "C" fn token_resumed(ctx: *mut Ctx, k: Word, args: *const Word) ->
     if !captured_here(c, entry, id, capture) {
         return c.fail(err_stale_continuation());
     }
+    retargeted(ctx, id);
     unsafe { resume(ctx, id, Some(capture), Some(v)) }
 }
 

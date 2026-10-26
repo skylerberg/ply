@@ -681,7 +681,7 @@ impl Ctx {
         if self.failed != 0 {
             return 0;
         }
-        let Some(at) = self.raise_handler("abort", "raise") else {
+        let Some(at) = self.raise_handler("abort", "raise", None) else {
             return self.pend(d, message);
         };
         let (stack, depth, clause) = at;
@@ -762,9 +762,15 @@ impl Ctx {
         0
     }
 
-    /// The stack, depth and clause that answer a raise of `effect.op`. Searched as a `perform`
-    /// searches, so frames hidden while a clause runs are passed over.
-    pub(super) fn raise_handler(&self, effect: &str, op: &str) -> Option<(usize, usize, usize)> {
+    /// The stack, depth and clause that answer a raise of `effect.op`, in the frame of handler
+    /// `target` alone where there is one. Searched as a `perform` searches, so frames hidden while a
+    /// clause runs are passed over.
+    pub(super) fn raise_handler(
+        &self,
+        effect: &str,
+        op: &str,
+        target: Option<u64>,
+    ) -> Option<(usize, usize, usize)> {
         let mut stack = self.current;
         loop {
             let found = self.stacks[stack]
@@ -772,6 +778,7 @@ impl Ctx {
                 .iter()
                 .enumerate()
                 .rev()
+                .filter(|(_, f)| target.is_none_or(|t| t == f.handler))
                 .find_map(|(depth, f)| {
                     let clause = f
                         .clauses

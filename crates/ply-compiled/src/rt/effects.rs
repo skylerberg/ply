@@ -11,7 +11,25 @@ pub unsafe extern "C" fn rt_handle_install(
     n: I64,
     ret: Handed,
 ) -> I64 {
-    let c = unsafe { &mut *ctx };
+    I64(installed(unsafe { &mut *ctx }, clauses, n, ret).0)
+}
+
+/// [`rt_handle_install`] for a `handle` whose evidence objects reach its frame by its handler,
+/// which this writes to `cell`.
+pub unsafe extern "C" fn rt_handle_install_at(
+    ctx: *mut Ctx,
+    clauses: *const Word,
+    n: I64,
+    ret: Handed,
+    cell: Out,
+) -> I64 {
+    let (depth, handler) = installed(unsafe { &mut *ctx }, clauses, n, ret);
+    unsafe { cell.0.write(handler as i64) };
+    I64(depth)
+}
+
+/// A handler installed on the running stack: its depth there and its handler.
+fn installed(c: &mut Ctx, clauses: *const Word, n: I64, ret: Handed) -> (i64, u64) {
     let clauses = clauses_of(c, clauses, n.0);
     let fuel = c.fuel;
     let handler = c.next_handler();
@@ -25,7 +43,7 @@ pub unsafe extern "C" fn rt_handle_install(
         handler,
         vars: None,
     });
-    I64((frames.len() - 1) as i64)
+    ((frames.len() - 1) as i64, handler)
 }
 
 /// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
@@ -72,7 +90,25 @@ pub unsafe extern "C" fn rt_handle_install_detached(
     let c = unsafe { &mut *ctx };
     let clauses = clauses_of(c, clauses, n.0);
     let body = unsafe { std::mem::transmute::<Block, Word>(body) };
-    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body) })
+    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, None) })
+}
+
+/// [`rt_handle_install_detached`] for a body, clauses and `return` clause that hold the words of
+/// `forwards`, a block laid out as [`crate::detached::Forwards`] says, which this takes: the body
+/// keeps it as long as anything can resume it.
+pub unsafe extern "C" fn rt_handle_forwarded(
+    ctx: *mut Ctx,
+    clauses: *const Word,
+    n: I64,
+    ret: Handed,
+    body: Block,
+    forwards: Block,
+) -> Handed {
+    let c = unsafe { &mut *ctx };
+    let clauses = clauses_of(c, clauses, n.0);
+    let body = unsafe { std::mem::transmute::<Block, Word>(body) };
+    let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
+    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, Some(forwards)) })
 }
 
 /// The `k` a clause is handed where it resumes on the tail: one immortal block holding nothing but
@@ -99,7 +135,11 @@ static RESUME: ResumeBlock = ResumeBlock {
 
 unsafe extern "C" fn resume_uniform(ctx: *mut Ctx, _k: Word, args: *const Word) -> Word {
     let v = unsafe { *args };
-    unsafe { (*ctx).resumed = Some(v) };
+    let c = unsafe { &mut *ctx };
+    // A tail resumption reads no words; those its caller set are no other closure's.
+    c.entering_desc = 0;
+    c.entering_words = 0;
+    c.resumed = Some(v);
     v
 }
 
@@ -152,6 +192,32 @@ pub unsafe extern "C" fn rt_dispatch(
     mode: I64,
     args: *const Handed,
 ) -> Handed {
+    unsafe { dispatched(ctx, None, op, resource, mode, args) }
+}
+
+/// [`rt_dispatch`] reaching the frame of handler `handler` alone: what the evidence object of a
+/// `handle` the runtime's frames hold hands it, so the perform reaches that `handle` whatever frames
+/// stand nearer it.
+pub unsafe extern "C" fn rt_dispatch_at(
+    ctx: *mut Ctx,
+    handler: I64,
+    op: *const PlyOp,
+    resource: I64,
+    mode: I64,
+    args: *const Handed,
+) -> Handed {
+    unsafe { dispatched(ctx, Some(handler.0 as u64), op, resource, mode, args) }
+}
+
+/// A perform the frames answer, by the nearest that answers it or by the one of handler `target`.
+unsafe fn dispatched(
+    ctx: *mut Ctx,
+    target: Option<u64>,
+    op: *const PlyOp,
+    resource: I64,
+    mode: I64,
+    args: *const Handed,
+) -> Handed {
     let c = unsafe { &mut *ctx };
     let described = unsafe { &*op };
     let effect = c.tables.fields[described.effect as usize].clone();
@@ -163,9 +229,32 @@ pub unsafe extern "C" fn rt_dispatch(
             .zip(described.params())
             .map(|(w, ty)| unsafe { Carried::new(Handed::of(*w), *ty) })
             .collect();
-        return Handed::of(raise_from_perform(c, &effect, &name, Raised(carried)));
+        return Handed::of(raise_from_perform(
+            c,
+            &effect,
+            &name,
+            Raised(carried),
+            target,
+        ));
     }
-    Handed::of(unsafe { performed(ctx, effect, name, resource.0, mode.0, args, described) })
+    let performing = Performing {
+        effect,
+        op: name,
+        resource: resource.0,
+        mode: mode.0,
+        target,
+    };
+    Handed::of(unsafe { performed(ctx, performing, args, described) })
+}
+
+/// What [`performed`] searches the frames for: an operation on a resource (negative for none) in a
+/// mode, answered by the nearest frame or, with a `target`, by that handler's frame alone.
+struct Performing {
+    effect: Symbol,
+    op: Symbol,
+    resource: i64,
+    mode: i64,
+    target: Option<u64>,
 }
 
 /// An operation's entry in an evidence object, as compiled code calls it: the slot's environment,
@@ -248,15 +337,14 @@ pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource:
 }
 
 /// [`rt_dispatch`] past a raise.
-unsafe fn performed(
-    ctx: *mut Ctx,
-    effect: Symbol,
-    op: Symbol,
-    resource: i64,
-    mode: i64,
-    args: &[Word],
-    described: &PlyOp,
-) -> i64 {
+unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &PlyOp) -> i64 {
+    let Performing {
+        effect,
+        op,
+        resource,
+        mode,
+        target,
+    } = p;
     let c = unsafe { &mut *ctx };
     let n = args.len() as i64;
     let args = args.as_ptr();
@@ -268,6 +356,9 @@ unsafe fn performed(
     let mut stack = c.current;
     'search: loop {
         for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
+            if target.is_some_and(|t| t != f.handler) {
+                continue;
+            }
             if f.simulate {
                 if effect.as_str() == "sim" && op.as_str() == "seed" {
                     let root = Value::Int(c.seed.root as i64);
@@ -331,6 +422,9 @@ unsafe fn performed(
         return c.fail(d);
     }
     let Some((stack, depth, closure, resumes, label)) = found else {
+        if target.is_some() {
+            return c.fail(err_handle_gone(&effect, &op));
+        }
         // Inside an open production region a `task` op is the scheduler's; outside, the host's.
         if effect.as_str() == "task"
             && ply_core::sim::TASK_OPS.contains(&op.as_str())
@@ -388,6 +482,17 @@ unsafe fn performed(
     }
 }
 
+/// A perform or raise sent to a `handle` whose frame is no longer installed where it was made: an
+/// evidence object outlived the `handle` it was laid out for.
+#[cold]
+#[inline(never)]
+fn err_handle_gone(effect: &Symbol, op: &Symbol) -> Diagnostic {
+    error(format!(
+        "`{effect}.{op}` reached for a `handle` that is no longer installed"
+    ))
+    .note("this is Ply's fault, not the program's")
+}
+
 /// The host's answer to an operation `described` describes, `args` its word forms, which this
 /// takes: each lowered through its parameter's type and let go through it, and the answer lifted
 /// through the operation's. One the production scheduler answers is handed it as it was performed.
@@ -439,12 +544,22 @@ fn raised_values(c: &mut Ctx, args: &Raised) -> Vec<Result<Value, String>> {
 
 /// A raise, which no clause answers where it is performed: the frame whose clause does is unwound
 /// to first, and with none in reach the entry fails. Takes the arguments.
-pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised) -> i64 {
+pub(super) fn raise_from_perform(
+    c: &mut Ctx,
+    effect: &Symbol,
+    op: &Symbol,
+    args: Raised,
+    target: Option<u64>,
+) -> i64 {
     if c.failed != 0 {
         args.release();
         return 0;
     }
-    let at = c.raise_handler(effect.as_str(), op.as_str());
+    let at = c.raise_handler(effect.as_str(), op.as_str(), target);
+    if at.is_none() && target.is_some() {
+        args.release();
+        return c.fail(err_handle_gone(effect, op));
+    }
     let d = if is_abort(effect.as_str(), op.as_str()) {
         let message = match raised_values(c, &args).first() {
             Some(Ok(Value::Str(s))) => s.to_string(),

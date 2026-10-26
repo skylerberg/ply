@@ -9,7 +9,8 @@ import compiler.emit.pieces (Piece, Text, Hole, BuiltinAt)
 import compiler.emit.tir (Var, Arg, Uses, Handling)
 import compiler.emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate, Encoded, Unsettled,
                                    WordsLaid, WordAt, Bridge, Instance, ObjectLaid, VarInit,
-                                   VarRead, VarWrite, Entering, Slot, Answering, Forwarding, Entry,
+                                   VarRead, VarWrite, Entering, Framing, FramingSet, ObjectAt,
+                                   Mapped, Slot, Answering, Forwarding, Framed, Forwarded, Entry,
                                    Answers, Resumes, Raises, Clause, HandleSite, HandleInstance,
                                    Reached, raised_at)
 import compiler.emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text,
@@ -96,13 +97,22 @@ fn framed_opened(
   match site.detached {
     Some(body) -> {
       let t = table(p, pr, args, site);
-      check(
-        p,
-        assigned(
-          t.pr,
-          p.depth,
-          answer,
-          c_type(answer.rep),
+      let installed = match site.framing {
+        Some(f) ->
+          Bytes::concat_all([
+            b"rt_handle_forwarded_p(ctx, (Word)(intptr_t)",
+            t.name,
+            b", ",
+            ascii_of_int(site.clauses.len()),
+            b", ",
+            returned(site, args, t.pr),
+            b", ",
+            operand(t.pr, args, body),
+            b", (Word)(intptr_t)((char *)(intptr_t)",
+            operand(t.pr, args, f),
+            b" - PLY_HEADER))",
+          ]),
+        None ->
           Bytes::concat_all([
             b"rt_handle_install_detached_p(ctx, (Word)(intptr_t)",
             t.name,
@@ -114,8 +124,8 @@ fn framed_opened(
             operand(t.pr, args, body),
             b")",
           ]),
-        ),
-      )
+      };
+      check(p, assigned(t.pr, p.depth, answer, c_type(answer.rep), installed))
     },
     None -> {
       let a = named(pr, answer);
@@ -126,21 +136,31 @@ fn framed_opened(
         site,
       );
       let d = temp(t.pr);
-      let pushed = line(
-        d.pr,
-        p.depth,
-        Bytes::concat_all([
-          b"int64_t ",
-          d.name,
-          b" = rt_handle_install_p(ctx, (Word)(intptr_t)",
-          t.name,
-          b", ",
-          ascii_of_int(site.clauses.len()),
-          b", ",
-          returned(site, args, d.pr),
-          b");",
-        ]),
-      );
+      let installed = match site.framing {
+        Some(f) ->
+          Bytes::concat_all([
+            b" = rt_handle_install_at_p(ctx, (Word)(intptr_t)",
+            t.name,
+            b", ",
+            ascii_of_int(site.clauses.len()),
+            b", ",
+            returned(site, args, d.pr),
+            b", ",
+            operand(d.pr, args, f),
+            b");",
+          ]),
+        None ->
+          Bytes::concat_all([
+            b" = rt_handle_install_p(ctx, (Word)(intptr_t)",
+            t.name,
+            b", ",
+            ascii_of_int(site.clauses.len()),
+            b", ",
+            returned(site, args, d.pr),
+            b");",
+          ]),
+      };
+      let pushed = line(d.pr, p.depth, Bytes::concat_all([b"int64_t ", d.name, installed]));
       line({ ..pushed, names: pushed.names.insert(depth_key(label), d.name) }, p.depth, b"{")
     },
   }
@@ -451,31 +471,18 @@ pub fn effect_op(
         into,
         ascii_of_int(1 + 2 * slots.len()),
         [b"0"].concat(
-          slots.fold([], |acc: List<Bytes>, s: Slot|
-            match s {
-              Answering(a) ->
-                acc.push(Bytes::concat_all([b"(Word)(intptr_t)&", entry_fn(a.entry)])).push(
-                  Bytes::concat_all([
-                    b"(Word)(intptr_t)((Word *)(intptr_t)",
-                    operand(pr, args, 0),
-                    b" + ",
-                    ascii_of_int(a.record),
-                    b")",
-                  ]),
-                ),
-              Forwarding(f) -> {
-                let slot = Bytes::concat_all([
-                  b"ply_slot(",
-                  operand(pr, args, f.operand),
-                  b", ",
-                  ascii_of_int(f.op),
-                  b")",
-                ]);
-                acc.push(slot.concat(b"[0]")).push(slot.concat(b"[1]"))
-              },
-            }),
+          slots.fold([], |acc: List<Bytes>, s: Slot| acc.concat(slot_words(pr, args, s))),
         ),
       ),
+    Framing(f) -> framing_laid(p, pr, into, f.words, f.heap),
+    FramingSet(at) ->
+      line(
+        pr,
+        p.depth,
+        Bytes::concat_all([instance_word(pr, args, 0, at), b" = ", operand(pr, args, 1), b";"]),
+      ),
+    ObjectAt(o) -> object_at(p, pr, into, args, o.at, o.slots),
+    Mapped -> word_set(p, pr, into, b"(Word)(intptr_t)&ply_words_mapped"),
     VarInit(at) ->
       line(
         line(
@@ -596,6 +603,130 @@ fn vars_unlinked(p: Place, pr: Printing, first: Bytes, i: HandleInstance) -> Pri
       Bytes::concat_all([b"if (PLY_FRAMES(ctx) == ", r, b") PLY_FRAMES(ctx) = ", r, b"->prev;"]),
     )
   }
+
+/// The entry and environment of slot `s` of an object over `args`, whose first is the instance or
+/// block the object is laid over, as C.
+fn slot_words(pr: Printing, args: List<Arg>, s: Slot) -> List<Bytes> = {
+  let within = |at: Int|
+    Bytes::concat_all([
+      b"(Word)(intptr_t)((Word *)(intptr_t)",
+      operand(pr, args, 0),
+      b" + ",
+      ascii_of_int(at),
+      b")",
+    ]);
+  match s {
+    Answering(a) ->
+      [Bytes::concat_all([b"(Word)(intptr_t)&", entry_fn(a.entry)]), within(a.record)],
+    Forwarding(f) -> {
+      let slot = Bytes::concat_all([
+        b"ply_slot(",
+        operand(pr, args, f.operand),
+        b", ",
+        ascii_of_int(f.op),
+        b")",
+      ]);
+      [slot.concat(b"[0]"), slot.concat(b"[1]")]
+    },
+    Framed -> [b"(Word)(intptr_t)&ply_framed", operand(pr, args, 0)],
+    Forwarded(f) -> [b"(Word)(intptr_t)&ply_forwarded", within(f.record)],
+  }
+}
+
+/// `into` declared the address of the first of `words` zeroed words a framed `handle`'s block
+/// holds: on the heap where `heap`, past a block's header, else in the frame.
+fn framing_laid(p: Place, pr: Printing, into: Option<Var>, words: Int, heap: Bool) -> Printing =
+  if !heap { laid_set(p, pr, into, ascii_of_int(words), [b"0"]) } else {
+    match into {
+      None -> pr,
+      Some(_) -> {
+        let b = temp(pr);
+        let size = ascii_of_int(8 * words);
+        let laid = line(
+          b.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            b.name,
+            b" = rt_alloc_bytes_p(ctx, PLY_HEADER + ",
+            size,
+            b"); memset(ply_words(",
+            b.name,
+            b"), 0, ",
+            size,
+            b");",
+          ]),
+        );
+        word_set(p, laid, into, Bytes::concat_all([b"(Word)(intptr_t)ply_words(", b.name, b")"]))
+      },
+    }
+  }
+
+/// `into` declared the address of an evidence object laid out at word `at` of the block `args`
+/// hands first, with `slots`: its flags, set where its one slot is `Framed`, which answers every
+/// operation; then each slot's entry and environment, and for a slot that forwards, its pair of the
+/// address of the word it forwards to and the operation's place.
+fn object_at(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  args: List<Arg>,
+  at: Int,
+  slots: List<Slot>,
+) -> Printing / {abort.raise} = {
+  let word = |k: Int| instance_word(pr, args, 0, k);
+  let set = |lhs: Bytes, rhs: Bytes| Bytes::concat_all([lhs, b" = ", rhs, b";"]);
+  let laid = range(0, slots.len()).fold(
+    line(pr, p.depth, set(word(at), if slots == [Framed] { b"1" } else { b"0" })),
+    |q: Printing, j: Int| {
+      let s = slots.get(j);
+      let ws = slot_words(pr, args, s);
+      let entered = line(
+        q,
+        p.depth,
+        Bytes::concat_all([
+          set(word(at + 1 + 2 * j), ws.get(0)),
+          b" ",
+          set(word(at + 2 + 2 * j), ws.get(1)),
+        ]),
+      );
+      match s {
+        Forwarded(f) ->
+          line(
+            entered,
+            p.depth,
+            Bytes::concat_all([
+              set(
+                word(f.record),
+                Bytes::concat_all([
+                  b"(Word)(intptr_t)((Word *)(intptr_t)",
+                  operand(pr, args, 0),
+                  b" + ",
+                  ascii_of_int(f.target),
+                  b")",
+                ]),
+              ),
+              b" ",
+              set(word(f.record + 1), ascii_of_int(j)),
+            ]),
+          ),
+        _ -> entered,
+      }
+    },
+  );
+  word_set(
+    p,
+    laid,
+    into,
+    Bytes::concat_all([
+      b"(Word)(intptr_t)((Word *)(intptr_t)",
+      operand(pr, args, 0),
+      b" + ",
+      ascii_of_int(at),
+      b")",
+    ]),
+  )
+}
 
 /// The head's function a clause's slot enters it through.
 pub fn entry_fn(e: Entry) -> Bytes =
