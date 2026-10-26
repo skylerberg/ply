@@ -365,8 +365,9 @@ impl HostRuntime for Facilities {
     }
 
     /// Closes the spans this entry point left open, and warns of them, and the database
-    /// connections it left open.
+    /// connections it left open, and drops the secrets it read and did not take.
     fn end_entry_point(&self, machine: MachineId) -> Vec<Diagnostic> {
+        self.run.drop_secrets();
         self.sqlite.end_machine(machine);
         self.trace.end_entry_point(machine).into_iter().collect()
     }

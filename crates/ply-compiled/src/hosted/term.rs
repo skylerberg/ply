@@ -1,11 +1,11 @@
 //! `std.term`'s natives: whether the process's streams are a terminal, the terminal's size and
 //! input mode, and what is typed at it, read from the buffer `process.line` reads.
 //!
-//! A line read for a `Secret` crosses as one alone: the job that reads it keeps it under a number
-//! of its own and answers the number found, and `term_secret_taken` makes the secret of what it
-//! keeps.
+//! A line read for a `Secret` crosses as one alone: the job that reads it keeps it with the run
+//! that asked, under a number, and answers the number found, and `term_secret_taken` makes the
+//! secret of what the run keeps.
 
-use super::{READS, WRITES, asked, handed, waited};
+use super::{READS, WRITES, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{I64, TakenBytes};
@@ -13,10 +13,8 @@ use crate::rt::Ctx;
 use ply_core::{Diagnostic, Span, Value, codes};
 use ply_host::jobs::Job;
 use ply_host::native::{found, int};
-use ply_host::stdio::{self, Mode, SecretLine, Standard};
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use ply_host::stdio::{self, Mode, Standard};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub(super) fn natives() -> Vec<MachineNative> {
@@ -40,16 +38,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
             rt_term_secret_taken as unsafe extern "C" fn(_, _) -> _,
         ),
     ]
-}
-
-/// The lines read for a `Secret` and not yet taken, each under the number its job answered.
-static HELD: LazyLock<Mutex<HashMap<i64, SecretLine>>> = LazyLock::new(Default::default);
-
-/// The number the next line read for a `Secret` is kept under.
-static NEXT_HELD: AtomicI64 = AtomicI64::new(1);
-
-fn held() -> MutexGuard<'static, HashMap<i64, SecretLine>> {
-    HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The modes as the real handler numbers them: `Cooked` 0, `Silent` 1 and `Raw` 2.
@@ -131,16 +119,16 @@ pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64)
     })
 }
 
-/// The ticket of one line of standard input kept for a `Secret`: the number it is kept under,
-/// found, or none at the end of input.
+/// The ticket of one line of standard input kept for a `Secret` by the run that asked: the number
+/// it is kept under, found, or none at the end of input. A line read after its run ended is wiped
+/// as it is dropped.
 pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
     asked(ctx, "term_secret_line", WRITES, I64(0), |c: &mut Ctx| {
-        let job: Job = Box::new(|| match stdio::read_secret_line() {
-            Ok(Some(line)) => {
-                let number = NEXT_HELD.fetch_add(1, Ordering::Relaxed);
-                held().insert(number, line);
-                Ok(found(Some(int(number))))
-            }
+        let Some(run) = from_host(c, |facilities| Arc::downgrade(facilities.run())) else {
+            return I64(0);
+        };
+        let job: Job = Box::new(move || match stdio::read_secret_line() {
+            Ok(Some(line)) => Ok(found(run.upgrade().map(|run| int(run.keep_secret(line))))),
             Ok(None) => Ok(found(None::<[u8; 8]>)),
             Err(e) => Err(format!("standard input could not be read: {e}")),
         });
@@ -148,7 +136,7 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
     })
 }
 
-/// The line kept under `number`, as a secret that only a `Secret`'s own readers read.
+/// The line the run keeps under `number`, as a secret that only a `Secret`'s own readers read.
 pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
     asked(
         ctx,
@@ -156,7 +144,7 @@ pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> Sec
         WRITES,
         SecretHandle::of(0),
         |c: &mut Ctx| {
-            let line = held().remove(&number.0);
+            let line = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
             match handed(c, "term_secret_taken", "a line's number", line) {
                 Some(line) => SecretHandle::of(c.heap.bridge(Value::secret_text(&line))),
                 None => SecretHandle::of(0),

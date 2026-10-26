@@ -3,6 +3,7 @@
 //! run's answers, kept or abandoned, never wake another's wait. Every pool mints from one count of
 //! tokens.
 
+use crate::stdio::SecretLine;
 use ply_core::{Diagnostic, Pending, Span, Symbol, Value, codes};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -88,10 +89,20 @@ impl Bell {
 /// One run's operations, of whichever pool runs each: an operation is the run's from its
 /// submission until the run takes its answer. The run holds this, and each operation's job holds it
 /// weakly, so the answer of a job that finishes after its run has ended is dropped, and what an
-/// ended run left goes with it.
+/// ended run left goes with it. The lines its jobs read for a `Secret` are kept here too, until the
+/// run takes them or its entry point ends.
 pub struct Run {
     held: Mutex<HashMap<u64, Held>>,
+    secrets: Mutex<Secrets>,
     bell: Arc<Bell>,
+}
+
+/// The lines read for a `Secret` and not yet taken, each under the number its job answered, wiped
+/// as each is dropped.
+#[derive(Default)]
+struct Secrets {
+    last: i64,
+    kept: HashMap<i64, SecretLine>,
 }
 
 /// An operation a run holds, until its answer is taken.
@@ -108,12 +119,33 @@ impl Run {
     pub fn new(bell: Arc<Bell>) -> Arc<Run> {
         Arc::new(Run {
             held: Mutex::new(HashMap::new()),
+            secrets: Mutex::new(Secrets::default()),
             bell,
         })
     }
 
     pub fn bell(&self) -> &Arc<Bell> {
         &self.bell
+    }
+
+    /// Keeps `line` for this run under a number no other line of it is kept under, answered.
+    pub fn keep_secret(&self, line: SecretLine) -> i64 {
+        let mut secrets = lock(&self.secrets);
+        secrets.last += 1;
+        let number = secrets.last;
+        secrets.kept.insert(number, line);
+        number
+    }
+
+    /// The line kept under `number`, which the run then keeps no longer.
+    pub fn take_secret(&self, number: i64) -> Option<SecretLine> {
+        lock(&self.secrets).kept.remove(&number)
+    }
+
+    /// Drops every line kept and not taken, each wiped: what an entry point that ended did not
+    /// take, nothing after it may.
+    pub fn drop_secrets(&self) {
+        lock(&self.secrets).kept.clear();
     }
 
     fn enter(&self, token: u64, span: Span, what: &'static str) {

@@ -1,5 +1,7 @@
+use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Pending, Span, Value, codes};
 use ply_host::pool::{Bell, JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Run};
+use ply_host::stdio::SecretLine;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -249,5 +251,39 @@ fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
     assert!(
         !run().park(None, &|| false),
         "nothing watched, nothing to wait for"
+    );
+}
+
+fn secret(text: &str) -> SecretLine {
+    SecretLine::new(text.to_string())
+}
+
+/// A line read for a `Secret` is its run's, taken once, by that run alone.
+#[test]
+fn a_secret_is_taken_once_and_by_the_run_that_kept_it() {
+    let (mine, theirs) = (run(), run());
+    let kept = mine.keep_secret(secret("hunter2"));
+    assert_ne!(kept, mine.keep_secret(secret("other")));
+    assert!(
+        theirs.take_secret(kept).is_none(),
+        "another run's number names nothing of this one's"
+    );
+    assert_eq!(
+        mine.take_secret(kept).as_deref().map(String::as_str),
+        Some("hunter2")
+    );
+    assert!(mine.take_secret(kept).is_none(), "a line is taken once");
+}
+
+/// A run whose entry point ends between reading a secret and taking it leaves nothing held.
+#[test]
+fn a_secret_an_entry_point_did_not_take_is_dropped_when_it_ends() {
+    let runtime = ply_host::Host::new().runtime();
+    let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
+    let left = run.keep_secret(secret("hunter2"));
+    let _ = runtime.end_entry_point(MachineId::next());
+    assert!(
+        run.take_secret(left).is_none(),
+        "the line outlived its entry point"
     );
 }

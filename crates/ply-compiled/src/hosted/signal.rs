@@ -5,7 +5,7 @@ use super::{READS, WRITES, asked, from_host, handed};
 use crate::c::{MachineNative, machine_native};
 use crate::native::I64;
 use crate::rt::Ctx;
-use ply_host::signal::{Asked, arrived, err_unheard};
+use ply_host::signal::{Asked, err_unheard};
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
@@ -45,7 +45,8 @@ pub unsafe extern "C" fn rt_signal_deadline_ms(ctx: *mut Ctx) -> I64 {
 }
 
 /// 1 where the signal numbered `which` (`SIGHUP` 0, `SIGUSR1` 1, `SIGUSR2` 2, `SIGWINCH` 3) has
-/// arrived since it was last asked about. An ask takes the arrival it answers.
+/// arrived since it was last asked about. An ask takes the arrival it answers. A run that listens
+/// for no stop hears no signal, and its ask installs nothing.
 pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
     asked(ctx, "signal_arrived", WRITES, I64(0), |c: &mut Ctx| {
         let (asked, what) = match which.0 {
@@ -58,9 +59,13 @@ pub unsafe extern "C" fn rt_signal_arrived(ctx: *mut Ctx, which: I64) -> I64 {
         let Some(asked) = handed(c, "signal_arrived", "a signal", asked) else {
             return I64(0);
         };
-        match arrived(asked) {
-            Ok(came) => I64(i64::from(came)),
-            Err(e) => {
+        let heard = from_host(c, |facilities| {
+            facilities.stop().map(|stop| stop.arrived(asked))
+        });
+        match heard.flatten() {
+            None | Some(Ok(false)) => I64(0),
+            Some(Ok(true)) => I64(1),
+            Some(Err(e)) => {
                 let span = c.site();
                 c.fail(err_unheard(what, asked, &e, span));
                 I64(0)

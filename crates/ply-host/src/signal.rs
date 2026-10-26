@@ -137,22 +137,24 @@ pub struct Shutdown {
 /// so one installed handler serves every run in it.
 static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Default::default);
 
-/// Whether `which` has arrived since it was last asked about, however many times it did: arrivals
-/// are not counted. The first ask installs the handler and answers `false`.
-///
-/// # Errors
-/// The handler could not be installed.
-pub fn arrived(which: Asked) -> std::io::Result<bool> {
-    let watch = &WATCHES[which as usize];
-    let mut installed = lock(&watch.installed);
-    if !*installed {
-        watch_for(which, Arc::clone(&watch.arrived))?;
-        *installed = true;
-    }
-    Ok(watch.arrived.swap(false, Ordering::AcqRel))
-}
-
 impl Shutdown {
+    /// Whether `which` has arrived since it was last asked about, however many times it did:
+    /// arrivals are not counted. The first ask installs the handler, for the whole process, and
+    /// answers `false`. Only a run that listens for a stop holds a `Shutdown` to ask through, so a
+    /// run that does not, as a test's, leaves every signal as the platform has it.
+    ///
+    /// # Errors
+    /// The handler could not be installed.
+    pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
+        let watch = &WATCHES[which as usize];
+        let mut installed = lock(&watch.installed);
+        if !*installed {
+            watch_for(which, Arc::clone(&watch.arrived))?;
+            *installed = true;
+        }
+        Ok(watch.arrived.swap(false, Ordering::AcqRel))
+    }
+
     pub fn new(bounds: Bounds) -> Arc<Shutdown> {
         Arc::new(Shutdown {
             bounds,

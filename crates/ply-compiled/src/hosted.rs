@@ -10,10 +10,10 @@
 //! A native answering structured data writes it in the flat forms of `ply_host::native`.
 
 mod dns;
-mod signal;
+pub mod signal;
 mod sockets;
 mod sqlite;
-mod term;
+pub mod term;
 mod trace;
 
 use crate::c::{MachineNative, machine_native};

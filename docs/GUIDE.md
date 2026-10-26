@@ -3408,8 +3408,8 @@ operation names. The credentials a TLS listener or upgrade names are the ones
 `--tls` gives the run, so one given none holds none (`E0429`). The console is
 open as well: `std.term` answers from the terminal the process's streams are,
 and the run leaves it in the mode it found it in; `std.signal` answers the
-signals the process is sent, and a run that listens for no stop is never asked
-to stop. `std.trace` writes to the sink `--trace` names; a run without
+signals the process is sent, and a run that listens for no stop, as a test's,
+is never asked to stop and hears no signal, installing no handler of its own. `std.trace` writes to the sink `--trace` names; a run without
 `--host` discards every record and still holds each span to being closed
 (`E0445`). A
 database is opened under a root `--fs` lends, so a run lent none opens none
