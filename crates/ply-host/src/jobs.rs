@@ -1,14 +1,26 @@
-//! Where a native's job runs when it would block the program's thread: two pools for the whole
-//! process, so a test run's machines and a `parallel`'s branches share one bound of cores between
+//! Where a native's job runs when it would block the program's thread: pools for the whole
+//! process, so a test run's machines and a `parallel`'s branches share one bound of threads between
 //! them, while each job stays the run's that submitted it.
 
-use crate::pool::{JobOutput, Pool, Run};
+use crate::pool::{MAX_BLOCKING_OPERATIONS, Pool, Run};
 use ply_core::host::Pending;
 use ply_core::{Diagnostic, Span};
 use std::sync::{Arc, OnceLock};
 
 /// What a native's operation does on a thread of its own: its answer flat, or why it failed.
 pub type Job = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
+
+/// Why a native's job answered nothing.
+#[derive(Debug)]
+pub enum Failure {
+    /// What the system said, which the run's failure names the job by.
+    Said(String),
+    /// A refusal of the job's own, which fails the run as it stands.
+    Refused(Diagnostic),
+}
+
+/// A job whose failure may be a refusal of its own.
+pub type Refusing = Box<dyn FnOnce() -> Result<Vec<u8>, Failure> + Send>;
 
 /// Which of the process's pools a job waits for a thread in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -18,11 +30,15 @@ pub enum Work {
     Computing,
     /// It waits on something outside the process: a thread of its own, a bounded number at once.
     Waiting,
+    /// It reads or writes the file system: in line for one of a bounded number of threads, so a
+    /// burst of small operations is a line rather than a refusal.
+    Filing,
 }
 
 struct Jobs {
     computing: Pool,
     waiting: Pool,
+    filing: Pool,
 }
 
 fn jobs() -> &'static Jobs {
@@ -30,6 +46,7 @@ fn jobs() -> &'static Jobs {
     JOBS.get_or_init(|| Jobs {
         computing: Pool::queued(std::thread::available_parallelism().map_or(1, |n| n.get())),
         waiting: Pool::new(),
+        filing: Pool::queued(MAX_BLOCKING_OPERATIONS),
     })
 }
 
@@ -47,18 +64,27 @@ pub fn submit(
     what: &'static str,
     job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
 ) -> Result<Pending, Diagnostic> {
+    refusing(work, run, span, label, what, move || {
+        job().map_err(Failure::Said)
+    })
+}
+
+/// `job` as [`submit`] runs it, where the job may refuse with a diagnostic of its own.
+///
+/// # Errors
+/// As [`submit`].
+pub fn refusing(
+    work: Work,
+    run: &Arc<Run>,
+    span: Span,
+    label: &'static str,
+    what: &'static str,
+    job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+) -> Result<Pending, Diagnostic> {
     let pool = match work {
         Work::Computing => &jobs().computing,
         Work::Waiting => &jobs().waiting,
+        Work::Filing => &jobs().filing,
     };
-    pool.submit(
-        run,
-        span,
-        label,
-        what,
-        Box::new(move || match job() {
-            Ok(bytes) => JobOutput::Bytes(bytes),
-            Err(why) => JobOutput::Failed(why),
-        }),
-    )
+    pool.submit(run, span, label, what, Box::new(job))
 }

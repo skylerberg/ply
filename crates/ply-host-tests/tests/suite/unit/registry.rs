@@ -55,11 +55,6 @@ const DETERMINISTIC: &Rows = &[];
 const REPEATABLE: &Rows = &[
     // A wait changes nothing outside the program: crossed twice, it waits twice.
     ("clock", &["now", "sleep"]),
-    // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
-    ("std.process.process", &["args", "bound"]),
-    // Every draw is independent of every other, so a run may take as many as it likes.
-    ("std.random.entropy", &["below", "next", "secret"]),
-    ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
 ];
 
 /// A deterministic handler's test is cached with no binding to answer for it, so each one is a

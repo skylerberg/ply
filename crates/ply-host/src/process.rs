@@ -1,36 +1,33 @@
-//! The `process` effect: the arguments, the two output streams, standard input, the exit code, and
-//! the programs a run may start, to completion or beside it.
+//! What `std.process`'s real handler asks the host through its natives: the arguments, the two
+//! output streams, standard input, the exit code, and the programs a run may start, to completion
+//! or beside it. Each answer that is structured is flat: a child's ending as [`Finished::flat`]
+//! writes it, a line heard as [`Heard::flat`] does.
 
 mod children;
 
-pub(crate) use children::{Children, Io, Output, Signal};
-pub use children::{Ended, Finished, Heard};
+pub(crate) use children::Children;
+pub use children::{Ended, Finished, Heard, Io, Output, Signal};
 
-use crate::pool::{JobOutput, Pool, option};
+use crate::jobs::{Failure, Job, Refusing};
+use crate::native::found;
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
-use ply_core::host::HostRegistry;
-use ply_core::{
-    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, Plain, Resource, Span, Symbol, Value, codes, slot,
-};
+use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use std::collections::BTreeMap;
-use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-pub const MODULE: &str = "std.process";
+/// The effect, by the program-wide name a refusal names its module by.
+const EFFECT: &str = "std.process.process";
 
-pub const EFFECT: &str = "std.process.process";
+/// What serves the effect, for a refusal to name.
+const SERVED_BY: &str = "std.process::served";
 
 /// The effect whose raise says a standard stream's reader went away, and that raise.
 pub const PIPE_EFFECT: &str = "std.process.pipe";
 pub const PIPE_BROKEN: &str = "broken";
-
-/// What `process.exit` accepts; above it the shell reports a signal or its own failure.
-pub const EXIT_RANGE: RangeInclusive<i64> = 0..=125;
 
 /// What one captured stream holds: a spawn's whole stream, or what a child's `Keep` stream took
 /// and its `Lines` stream holds unread.
@@ -191,12 +188,9 @@ impl Executables {
         Ok(())
     }
 
-    pub fn get(&self, at: &Resource) -> Option<&Path> {
-        match at {
-            Resource::Named(name) => self.bound.get(name.as_str()).map(PathBuf::as_path),
-            // Unreachable when well-typed; `None` keeps a malformed registration a diagnostic.
-            Resource::Var(_) | Resource::Singleton | Resource::Every => None,
-        }
+    /// The program bound to `label`.
+    pub fn named(&self, label: &str) -> Option<&Path> {
+        self.bound.get(label).map(PathBuf::as_path)
     }
 
     pub fn listing(&self) -> impl Iterator<Item = (&str, &Path)> {
@@ -221,15 +215,20 @@ fn is_executable(_: &Path) -> bool {
     true
 }
 
+/// What an operation of `process` reaches: the run's own process, or a program `--exec` binds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    Own,
+    Executable,
+}
+
 pub struct ProcessHost {
     argv: Vec<String>,
     /// Shared with the drains that forward an inheriting child's lines to a captured sink.
     sink: Arc<OutputSink>,
     exit: Mutex<Option<i32>>,
-    /// The programs `--exec NAME=PATH` bound, which `bound` reads; a label outside them is `E0456`.
+    /// The programs `--exec NAME=PATH` bound; a label outside them is `E0456`.
     executables: Executables,
-    /// Where a spawn waits, so a driver that starts a compiler does not stop the machine.
-    pool: Pool,
     /// Held nowhere else, so the children go when the host does.
     children: Arc<Children>,
     /// Whether the run is a process of its own; one that is not only starts other programs.
@@ -243,7 +242,6 @@ impl ProcessHost {
             sink: Arc::new(sink),
             exit: Mutex::new(None),
             executables: Executables::new(),
-            pool: Pool::new(),
             children: Arc::new(Children::new()),
             whole: true,
         }
@@ -260,25 +258,11 @@ impl ProcessHost {
         .executing(executables)
     }
 
-    /// Whether the run is a process of its own, with arguments, streams and a terminal.
-    pub fn is_whole(&self) -> bool {
-        self.whole
-    }
-
-    /// Whether this host serves `op`, rather than leaving it withheld.
-    pub fn serves(&self, op: Op) -> bool {
-        self.whole || op.names_an_executable()
-    }
-
     pub fn executing(self, executables: Executables) -> ProcessHost {
         ProcessHost {
             executables,
             ..self
         }
-    }
-
-    pub fn argv(&self) -> &[String] {
-        &self.argv
     }
 
     /// The code the first `process.exit` asked for.
@@ -330,515 +314,313 @@ impl ProcessHost {
         &self.children
     }
 
-    /// Kills and reaps every child `process.start` launched that is still running.
+    /// Kills and reaps every child `start` or `spawn` launched that is still running.
     pub fn end_children(&self) {
         self.children.end_all();
     }
-}
 
-pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    Op::ALL
-        .iter()
-        .map(|op| {
-            let handler: Arc<dyn HostHandler> = Arc::new(Operation {
-                op: *op,
-                host: host.cloned(),
-            });
-            (op.declaration(), handler)
-        })
-        .collect()
+    /// The run's own process, which a host that is not one withholds.
+    fn own(&self, op: &'static str, span: Span) -> Result<(), Diagnostic> {
+        if self.whole {
+            Ok(())
+        } else {
+            Err(withheld(op, Reach::Own, span))
+        }
+    }
+
+    /// The arguments the run was given.
+    ///
+    /// # Errors
+    /// The host is not the run's own process.
+    pub fn args(&self, span: Span) -> Result<&[String], Diagnostic> {
+        self.own("args", span)?;
+        Ok(&self.argv)
+    }
+
+    /// Whether the run bound a program to `label`.
+    pub fn bound(&self, label: &str) -> bool {
+        self.executables.named(label).is_some()
+    }
+
+    /// `text` and a line ending written to `stream`. A stream whose reader has gone ends the
+    /// process, since a line answers nothing its writer could be told by.
+    ///
+    /// # Errors
+    /// The host is not the run's own process, or the stream refused the write.
+    pub fn line(&self, stream: Stream, text: &str, span: Span) -> Result<(), Diagnostic> {
+        let op = match stream {
+            Stream::Out => "out",
+            Stream::Err => "err",
+        };
+        self.own(op, span)?;
+        match self.sink.line(stream, text) {
+            Ok(()) => Ok(()),
+            Err(e) if stdio::reader_gone(&e) => self.end_of_broken_pipe(),
+            Err(e) => Err(err_write(op, &e, span)),
+        }
+    }
+
+    /// Whether `bytes` reached `stream`: `false` once its reader has gone away.
+    ///
+    /// # Errors
+    /// The host is not the run's own process, or the stream refused the write.
+    pub fn write(&self, stream: Stream, bytes: &[u8], span: Span) -> Result<bool, Diagnostic> {
+        let op = match stream {
+            Stream::Out => "out_bytes",
+            Stream::Err => "err_bytes",
+        };
+        self.own(op, span)?;
+        taken(op, self.sink.write(stream, bytes), span)
+    }
+
+    /// Whether what standard output's buffer held reached it: `false` once its reader has gone.
+    ///
+    /// # Errors
+    /// The host is not the run's own process, or the stream refused the write.
+    pub fn flush(&self, span: Span) -> Result<bool, Diagnostic> {
+        self.own("flush", span)?;
+        taken("flush", self.sink.flush(), span)
+    }
+
+    /// The job of one line of standard input without its ending, found: none at the end of input.
+    ///
+    /// # Errors
+    /// The host is not the run's own process.
+    pub fn read_line(&self, span: Span) -> Result<Job, Diagnostic> {
+        self.own("line", span)?;
+        Ok(Box::new(|| match stdio::read_line() {
+            Ok(line) => Ok(found(line)),
+            Err(e) => Err(format!("standard input could not be read: {e}")),
+        }))
+    }
+
+    /// The job of what comes next on standard input, at most `max` bytes.
+    ///
+    /// # Errors
+    /// The host is not the run's own process.
+    pub fn read(&self, max: usize, span: Span) -> Result<Job, Diagnostic> {
+        self.own("in_bytes", span)?;
+        Ok(Box::new(move || {
+            stdio::read(max).map_err(|e| format!("standard input could not be read: {e}"))
+        }))
+    }
+
+    /// What ends the run with `code`, the first code asked for being the one kept.
+    pub fn exit(&self, code: i32, span: Span) -> Diagnostic {
+        if let Err(withheld) = self.own("exit", span) {
+            return withheld;
+        }
+        let mut requested = lock(&self.exit);
+        if requested.is_none() {
+            *requested = Some(code);
+        }
+        exit_requested(code, span)
+    }
+
+    fn program(&self, op: &'static str, label: &str, span: Span) -> Result<&Path, Diagnostic> {
+        self.executables
+            .named(label)
+            .ok_or_else(|| unbound(op, label, span))
+    }
+
+    /// The job of the program `label` names run to its end with empty input, in `dir` (the run's
+    /// own where empty) under the whole environment `env`: how it ended and both its streams, as
+    /// [`Finished::flat`] writes them. It is started now and held with the started children, so a
+    /// stop or a teardown ends it as it ends them.
+    ///
+    /// # Errors
+    /// No program is bound to `label`.
+    pub fn spawn(
+        &self,
+        label: &str,
+        args: &[String],
+        dir: &str,
+        env: &[(String, String)],
+        span: Span,
+    ) -> Result<Refusing, Diagnostic> {
+        let program = self.program("spawn", label, span)?;
+        let io = Io {
+            input: false,
+            out: Output::Keep,
+            err: Output::Keep,
+        };
+        let at = Resource::Named(Symbol::new(label));
+        let launch = Launch {
+            label: &at,
+            program,
+            args,
+            dir,
+            env,
+            io: &io,
+        };
+        let started = self.children.started(&launch, &self.sink);
+        let program = program.to_path_buf();
+        Ok(Box::new(move || {
+            let (_, child) = started.map_err(Failure::Said)?;
+            match child.wait(None) {
+                Ok(Some(exit)) => Ok(exit.flat()),
+                Err(Refusal::TooMuch { out, err }) => Err(Failure::Refused(too_much(
+                    "spawn", &program, out, err, span,
+                ))),
+                Err(Refusal::Unreaped(why)) => Err(Failure::Said(format!(
+                    "`{}`'s ending could not be read: {why}",
+                    program.display()
+                ))),
+                Ok(None) | Err(Refusal::Spent) => Err(Failure::Said(format!(
+                    "`{}` was waited on by something other than its spawn",
+                    program.display()
+                ))),
+            }
+        }))
+    }
+
+    /// A child of the program `label` names, started beside the program and wired as `io` says:
+    /// its handle, or why it could not start.
+    ///
+    /// # Errors
+    /// No program is bound to `label`.
+    pub fn start(
+        &self,
+        label: &str,
+        args: &[String],
+        dir: &str,
+        env: &[(String, String)],
+        io: &Io,
+        span: Span,
+    ) -> Result<Result<i64, String>, Diagnostic> {
+        let program = self.program("start", label, span)?;
+        // What the program wrote before the child comes before what the child writes.
+        if io.out == Output::Inherit || io.err == Output::Inherit {
+            self.sink.make_way();
+        }
+        let label = Resource::Named(Symbol::new(label));
+        let launch = Launch {
+            label: &label,
+            program,
+            args,
+            dir,
+            env,
+            io,
+        };
+        Ok(self.children.start(&launch, &self.sink))
+    }
+
+    /// The child `handle` names, where `op` under `label` may reach it.
+    fn child(
+        &self,
+        op: &'static str,
+        label: &str,
+        handle: i64,
+        span: Span,
+    ) -> Result<Arc<Child>, Diagnostic> {
+        let at = Resource::Named(Symbol::new(label));
+        self.children
+            .get(handle, &at)
+            .map_err(|why| unusable(op, handle, &at, why, span))
+    }
+
+    /// The job of how the child ended and what its streams hold, found once it has: none while it
+    /// runs past `timeout_ms`, which waits for as long as it takes where negative.
+    ///
+    /// # Errors
+    /// The handle names no child `label` may reach.
+    pub fn wait(
+        &self,
+        label: &str,
+        handle: i64,
+        timeout_ms: i64,
+        span: Span,
+    ) -> Result<Refusing, Diagnostic> {
+        let child = self.child("wait", label, handle, span)?;
+        let deadline = deadline(timeout_ms);
+        Ok(Box::new(move || match child.wait(deadline) {
+            Ok(exit) => Ok(found(exit.map(Finished::flat))),
+            Err(refusal) => Err(refused("wait", handle, &child, refusal, span)),
+        }))
+    }
+
+    /// Whether `signal` reached the child: `false` where it had already ended.
+    ///
+    /// # Errors
+    /// The handle names no child `label` may reach, or the signal could not be delivered.
+    pub fn signal(
+        &self,
+        label: &str,
+        handle: i64,
+        signal: Signal,
+        span: Span,
+    ) -> Result<bool, Diagnostic> {
+        self.child("signal", label, handle, span)?
+            .signal(signal)
+            .map_err(|e| undelivered(handle, signal, &e, span))
+    }
+
+    /// The job of `bytes` written to the child's input: byte 1 where every byte was, 0 once its
+    /// input is closed or it has ended.
+    ///
+    /// # Errors
+    /// The handle names no child `label` may reach.
+    pub fn input(
+        &self,
+        label: &str,
+        handle: i64,
+        bytes: Vec<u8>,
+        span: Span,
+    ) -> Result<Job, Diagnostic> {
+        let child = self.child("input", label, handle, span)?;
+        Ok(Box::new(move || Ok(vec![u8::from(child.input(&bytes))])))
+    }
+
+    /// The child's input closed.
+    ///
+    /// # Errors
+    /// The handle names no child `label` may reach.
+    pub fn end_input(&self, label: &str, handle: i64, span: Span) -> Result<(), Diagnostic> {
+        self.child("end_input", label, handle, span)?.end_input();
+        Ok(())
+    }
+
+    /// The job of the next line any of the child's `Lines` streams wrote, as [`Heard::flat`]
+    /// writes it, waiting at most `timeout_ms` as [`ProcessHost::wait`] does.
+    ///
+    /// # Errors
+    /// The handle names no child `label` may reach.
+    pub fn output_line(
+        &self,
+        label: &str,
+        handle: i64,
+        timeout_ms: i64,
+        span: Span,
+    ) -> Result<Refusing, Diagnostic> {
+        let child = self.child("output_line", label, handle, span)?;
+        let deadline = deadline(timeout_ms);
+        Ok(Box::new(move || match child.next_line(deadline) {
+            Ok(heard) => Ok(heard.flat()),
+            Err(refusal) => Err(refused("output_line", handle, &child, refusal, span)),
+        }))
+    }
 }
 
 /// Where an operation about the run's own process is served, for a refusal to say.
-pub const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
+const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
 /// Where an operation on a program `--exec` binds is served.
 const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
 
-/// Withheld without a host, so a run that was given no arguments never binds a process it is not;
-/// a host that only starts programs withholds what is about the run's own process.
-pub fn register(registry: &mut HostRegistry, host: Option<&Arc<ProcessHost>>) {
-    for (op, (declared, handler)) in Op::ALL.into_iter().zip(registrations(host)) {
-        match host {
-            Some(host) if host.serves(op) => registry.register(declared, handler),
-            _ => {
-                let served = if op.names_an_executable() {
-                    AN_EXECUTABLE
-                } else {
-                    ONLY_A_RUN
-                };
-                registry.register_withheld(declared, handler, served)
-            }
-        }
-    }
-}
-
-operations! {
-    what "process";
-    path "process";
-    Args = "args" / 0,
-    Bound = "bound" / 0,
-    Out = "out" / 1,
-    Err = "err" / 1,
-    OutBytes = "out_bytes" / 1,
-    ErrBytes = "err_bytes" / 1,
-    Flush = "flush" / 0,
-    Line = "line" / 0,
-    InBytes = "in_bytes" / 1,
-    Exit = "exit" / 1,
-    Spawn = "spawn" / 3,
-    Start = "start" / 4,
-    Wait = "wait" / 2,
-    Signal = "signal" / 2,
-    Input = "input" / 2,
-    EndInput = "end_input" / 1,
-    OutputLine = "output_line" / 2,
-}
-
-impl Op {
-    /// The stream an operation that writes one writes to.
-    fn stream(self) -> Stream {
-        match self {
-            Op::Err | Op::ErrBytes => Stream::Err,
-            _ => Stream::Out,
-        }
-    }
-
-    /// Labelled by the program `--exec` bound rather than by the run's own process.
-    pub fn names_an_executable(self) -> bool {
-        match self {
-            Op::Bound
-            | Op::Spawn
-            | Op::Start
-            | Op::Wait
-            | Op::Signal
-            | Op::Input
-            | Op::EndInput
-            | Op::OutputLine => true,
-            Op::Args
-            | Op::Out
-            | Op::Err
-            | Op::OutBytes
-            | Op::ErrBytes
-            | Op::Flush
-            | Op::Line
-            | Op::InBytes
-            | Op::Exit => false,
-        }
-    }
-
-    /// Waits for another process, for a person, or on a pipe a child drains at its own pace.
-    pub fn waits(self) -> bool {
-        match self {
-            Op::Spawn | Op::Line | Op::InBytes | Op::Wait | Op::Input | Op::OutputLine => true,
-            Op::Args
-            | Op::Bound
-            | Op::Out
-            | Op::Err
-            | Op::OutBytes
-            | Op::ErrBytes
-            | Op::Flush
-            | Op::Exit
-            | Op::Start
-            | Op::Signal
-            | Op::EndInput => false,
-        }
-    }
-
-    pub fn declaration(self) -> HostOp {
-        HostOp {
-            effect: Symbol::new(EFFECT),
-            op: Symbol::new(self.name()),
-            resource: HostResource::Any,
-            determinism: Determinism::Nondeterministic,
-            // The arguments and the executables never change; everything else writes, starts,
-            // signals, reaps or consumes.
-            linearity: match self {
-                Op::Args | Op::Bound => Linearity::Repeatable,
-                Op::Out
-                | Op::Err
-                | Op::OutBytes
-                | Op::ErrBytes
-                | Op::Flush
-                | Op::Line
-                | Op::InBytes
-                | Op::Exit
-                | Op::Spawn
-                | Op::Start
-                | Op::Wait
-                | Op::Signal
-                | Op::Input
-                | Op::EndInput
-                | Op::OutputLine => Linearity::AtMostOnce,
-            },
-            blocking: self.waits(),
-            secrets: false,
-            path: self.path(),
-        }
-    }
-}
-
-struct Operation {
-    op: Op,
-    host: Option<Arc<ProcessHost>>,
-}
-
-impl HostHandler for Operation {
-    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        let span = req.span;
-        if req.args.len() != self.op.arity() {
-            return Err(arity(self.op, req.args.len(), span));
-        }
-        // Only an operation that waits is submitted for the run.
-        let run = || crate::registry::run_of(rt);
-        // A withheld registration is never resolved, so this is a dispatch bug.
-        let Some(host) = &self.host else {
-            return Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!(
-                    "{} was dispatched to a handler this run withheld",
-                    self.op.what()
-                ),
-            )
-            .primary(span, "performed here")
-            .note("only `ply run` binds `process`, and a withheld registration is in no binding index")
-            .note("this is a defect in Ply's host dispatch rather than in the program"));
-        };
-        match self.op {
-            Op::Args => {
-                let args = host.argv.iter().map(|arg| Value::Str(arg.as_str().into()));
-                Ok(HostAnswer::Value(Value::list(args.collect())))
-            }
-            Op::Bound => Ok(HostAnswer::Value(Value::Bool(
-                host.executables.get(&req.atom.resource).is_some(),
-            ))),
-            Op::Out | Op::Err => {
-                let text = req.args[0].as_str(span, "the text to write")?;
-                match host.sink.line(self.op.stream(), text) {
-                    Ok(()) => Ok(HostAnswer::Value(Value::Unit)),
-                    // A line answers nothing, so its writer cannot be told: the pipe ends it.
-                    Err(e) if stdio::reader_gone(&e) => host.end_of_broken_pipe(),
-                    Err(e) => Err(err_write(self.op, &e, span)),
-                }
-            }
-            Op::OutBytes | Op::ErrBytes => {
-                let bytes = req.args[0].as_bytes(span, "the bytes to write")?;
-                taken(self.op, host.sink.write(self.op.stream(), bytes), span)
-            }
-            Op::Flush => taken(self.op, host.sink.flush(), span),
-            Op::Line => {
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-line",
-                    Op::Line.what(),
-                    Box::new(read_line),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-            Op::InBytes => {
-                let max = req.args[0].as_int(span, "a length")?;
-                let Ok(max) = usize::try_from(max) else {
-                    return Err(negative_read(max, span));
-                };
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-in-bytes",
-                    Op::InBytes.what(),
-                    Box::new(move || match stdio::read(max) {
-                        Ok(bytes) => JobOutput::Bytes(bytes),
-                        Err(e) => {
-                            JobOutput::Failed(format!("standard input could not be read: {e}"))
-                        }
-                    }),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-            Op::Exit => {
-                let code = req.args[0].as_int(span, "an exit code")?;
-                if !EXIT_RANGE.contains(&code) {
-                    return Err(err_exit_range(code, span));
-                }
-                let mut requested = lock(&host.exit);
-                if requested.is_none() {
-                    *requested = Some(code as i32);
-                }
-                Err(exit_requested(code, span))
-            }
-            // The resolved atom's resource, never one the handler re-derives.
-            // Held with the started children, so a stop or a teardown ends it as it ends them.
-            Op::Spawn => {
-                let Some(program) = host.executables.get(&req.atom.resource) else {
-                    return Err(unbound(self.op, &req.atom.resource, span));
-                };
-                let args = argument_vector(&req.args[0], span)?;
-                let dir = req.args[1].as_str(span, "a working directory")?;
-                let env = traced(rt, environment(self.op, &req.args[2], span)?);
-                let io = Io {
-                    input: false,
-                    out: Output::Keep,
-                    err: Output::Keep,
-                };
-                let launch = Launch {
-                    label: &req.atom.resource,
-                    program,
-                    args: &args,
-                    dir,
-                    env: &env,
-                    io: &io,
-                };
-                let started = host.children.started(&launch, &host.sink);
-                let program = program.to_path_buf();
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-spawn",
-                    Op::Spawn.what(),
-                    Box::new(move || match started {
-                        Err(why) => JobOutput::Failed(why),
-                        Ok((_, child)) => match child.wait(None) {
-                            Ok(Some(exit)) => JobOutput::built(move || exit.value()),
-                            Err(Refusal::TooMuch { out, err }) => {
-                                JobOutput::Refused(too_much(Op::Spawn, &program, out, err, span))
-                            }
-                            Err(Refusal::Unreaped(why)) => JobOutput::Failed(format!(
-                                "`{}`'s ending could not be read: {why}",
-                                program.display()
-                            )),
-                            Ok(None) | Err(Refusal::Spent) => JobOutput::Failed(format!(
-                                "`{}` was waited on by something other than its spawn",
-                                program.display()
-                            )),
-                        },
-                    }),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-            Op::Start => {
-                let Some(program) = host.executables.get(&req.atom.resource) else {
-                    return Err(unbound(self.op, &req.atom.resource, span));
-                };
-                let args = argument_vector(&req.args[0], span)?;
-                let env = traced(rt, environment(self.op, &req.args[2], span)?);
-                let io = io_of(&req.args[3], span)?;
-                let dir = req.args[1].as_str(span, "a working directory")?;
-                // What the program wrote before the child comes before what the child writes.
-                if io.out == Output::Inherit || io.err == Output::Inherit {
-                    host.sink.make_way();
-                }
-                let launch = Launch {
-                    label: &req.atom.resource,
-                    program,
-                    args: &args,
-                    dir,
-                    env: &env,
-                    io: &io,
-                };
-                let started = host.children.start(&launch, &host.sink);
-                if let Some(recorder) = crate::observe::of(rt) {
-                    for output in [&io.out, &io.err] {
-                        if let Output::File(path) = output
-                            && let Ok(at) = Path::new(dir).join(path).canonicalize()
-                        {
-                            recorder.wrote(&at);
-                        }
-                    }
-                }
-                Ok(HostAnswer::Value(match started {
-                    Ok(handle) => Value::ctor("Ok", vec![Value::Int(handle)]),
-                    Err(why) => Value::ctor("Err", vec![Value::str(why)]),
-                }))
-            }
-            Op::Wait => {
-                let (handle, child) = child_of(host, self.op, req)?;
-                let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-wait",
-                    Op::Wait.what(),
-                    Box::new(move || match child.wait(deadline) {
-                        Ok(exit) => JobOutput::built(move || option(exit.map(Finished::value))),
-                        Err(refusal) => refused(Op::Wait, handle, &child, refusal, span),
-                    }),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-            Op::Signal => {
-                let (handle, child) = child_of(host, self.op, req)?;
-                let signal = signal_of(&req.args[1], span)?;
-                let delivered = child
-                    .signal(signal)
-                    .map_err(|e| undelivered(handle, signal, &e, span))?;
-                Ok(HostAnswer::Value(Value::Bool(delivered)))
-            }
-            Op::Input => {
-                let (_, child) = child_of(host, self.op, req)?;
-                let bytes = Arc::clone(req.args[1].as_bytes(span, "the bytes to write")?);
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-input",
-                    Op::Input.what(),
-                    Box::new(move || JobOutput::Bool(child.input(&bytes))),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-            Op::EndInput => {
-                let (_, child) = child_of(host, self.op, req)?;
-                child.end_input();
-                Ok(HostAnswer::Value(Value::Unit))
-            }
-            Op::OutputLine => {
-                let (handle, child) = child_of(host, self.op, req)?;
-                let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
-                let pending = host.pool.submit(
-                    run()?,
-                    span,
-                    "process-output-line",
-                    Op::OutputLine.what(),
-                    Box::new(move || match child.next_line(deadline) {
-                        Ok(heard) => JobOutput::built(move || heard.value()),
-                        Err(refusal) => refused(Op::OutputLine, handle, &child, refusal, span),
-                    }),
-                )?;
-                Ok(HostAnswer::Pending(pending))
-            }
-        }
-    }
-}
-
-fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic> {
-    value
-        .as_list(span, "an argument vector")?
-        .iter()
-        .map(|arg| arg.as_str(span, "an argument").map(str::to_string))
-        .collect()
-}
-
-/// The whole environment a child runs under; a later entry for one name wins, as `Map::insert`
-/// does.
-/// `env` and, where the run asking is observed, where a `ply` the child is reports what it read.
-fn traced(runtime: &dyn HostRuntime, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    if let Some(recorder) = crate::observe::of(runtime) {
-        env.push((
-            crate::observe::TRACE_VAR.to_string(),
-            recorder.child_trace().to_string_lossy().into_owned(),
-        ));
-    }
-    env
-}
-
-fn environment(op: Op, value: &Value, span: Span) -> Result<Vec<(String, String)>, Diagnostic> {
-    let mut out = Vec::new();
-    for entry in value.as_list(span, "an environment")?.iter() {
-        let Value::Record(fields) = entry else {
-            return Err(malformed_argument(
-                op,
-                &format!("an environment entry that is {}", entry.type_name()),
-                span,
-            ));
-        };
-        let (Some(name), Some(setting)) = (
-            fields.get(&Symbol::new("name")),
-            fields.get(&Symbol::new("value")),
-        ) else {
-            return Err(malformed_argument(
-                op,
-                "an environment entry without `name` and `value`",
-                span,
-            ));
-        };
-        out.push((
-            name.as_str(span, "a variable's name")?.to_string(),
-            setting.as_str(span, "a variable's value")?.to_string(),
-        ));
-    }
-    Ok(out)
-}
-
-/// A constructor of `std.process` by its simple name, with what it carries.
-fn constructor(value: &Value) -> Option<(&str, &[Value])> {
-    match value {
-        Value::Ctor { name, args } => name
-            .as_str()
-            .strip_prefix(MODULE)
-            .and_then(|rest| rest.strip_prefix('.'))
-            .map(|simple| (simple, args.as_slice())),
-        _ => None,
-    }
-}
-
-fn io_of(value: &Value, span: Span) -> Result<Io, Diagnostic> {
-    let Value::Record(fields) = value else {
-        return Err(malformed_argument(
-            Op::Start,
-            &format!("an `Io` that is {}", value.type_name()),
-            span,
-        ));
+/// `process.<op>` refused in a run whose host serves none of what `reach` names.
+#[cold]
+pub fn withheld(op: &'static str, reach: Reach, span: Span) -> Diagnostic {
+    let served = match reach {
+        Reach::Own => ONLY_A_RUN,
+        Reach::Executable => AN_EXECUTABLE,
     };
-    let field = |name: &str| {
-        fields.get(&Symbol::new(name)).ok_or_else(|| {
-            malformed_argument(Op::Start, &format!("an `Io` without `{name}`"), span)
-        })
-    };
-    Ok(Io {
-        input: field("input")?.as_bool(span, "whether the child reads input")?,
-        out: output_of(field("out")?, span)?,
-        err: output_of(field("err")?, span)?,
-    })
-}
-
-fn output_of(value: &Value, span: Span) -> Result<Output, Diagnostic> {
-    Ok(match constructor(value) {
-        Some(("Keep", [])) => Output::Keep,
-        Some(("Discard", [])) => Output::Discard,
-        Some(("Inherit", [])) => Output::Inherit,
-        Some(("Lines", [])) => Output::Lines,
-        Some(("File", [path])) => Output::File(path.as_str(span, "a file's path")?.to_string()),
-        _ => {
-            return Err(malformed_argument(
-                Op::Start,
-                &format!("an `Output` that is {}", slot(0)),
-                span,
-            )
-            .showing(vec![Plain::shown(value)]));
-        }
-    })
-}
-
-fn signal_of(value: &Value, span: Span) -> Result<Signal, Diagnostic> {
-    Ok(match constructor(value) {
-        Some(("Hangup", [])) => Signal::Hangup,
-        Some(("Interrupt", [])) => Signal::Interrupt,
-        Some(("Terminate", [])) => Signal::Terminate,
-        Some(("Kill", [])) => Signal::Kill,
-        Some(("User1", [])) => Signal::User1,
-        Some(("User2", [])) => Signal::User2,
-        Some(("WindowChange", [])) => Signal::WindowChange,
-        _ => {
-            return Err(malformed_argument(
-                Op::Signal,
-                &format!("a `Signal` that is {}", slot(0)),
-                span,
-            )
-            .showing(vec![Plain::shown(value)]));
-        }
-    })
-}
-
-/// The child the first argument names, if this operation's label may reach it.
-fn child_of(
-    host: &ProcessHost,
-    op: Op,
-    req: &HostRequest<'_>,
-) -> Result<(i64, Arc<Child>), Diagnostic> {
-    let handle = req.args[0].as_int(req.span, "a child's handle")?;
-    host.children
-        .get(handle, &req.atom.resource)
-        .map(|child| (handle, child))
-        .map_err(|why| unusable(op, handle, &req.atom.resource, why, req.span))
+    ply_core::host::err_withheld(
+        span,
+        &format!("process.{op}"),
+        &Symbol::new(EFFECT),
+        SERVED_BY,
+        served,
+    )
 }
 
 /// A negative timeout waits for as long as it takes, and so does one no clock can reach.
@@ -847,33 +629,24 @@ fn deadline(ms: i64) -> Option<Instant> {
     Instant::now().checked_add(Duration::from_millis(ms))
 }
 
-fn refused(op: Op, handle: i64, child: &Child, refusal: Refusal, span: Span) -> JobOutput {
+fn refused(op: &'static str, handle: i64, child: &Child, refusal: Refusal, span: Span) -> Failure {
     match refusal {
-        Refusal::Spent => JobOutput::Refused(raced(op, handle, span)),
+        Refusal::Spent => Failure::Refused(raced(op, handle, span)),
         Refusal::TooMuch { out, err } => {
-            JobOutput::Refused(too_much(op, child.program(), out, err, span))
+            Failure::Refused(too_much(op, child.program(), out, err, span))
         }
         Refusal::Unreaped(why) => {
-            JobOutput::Failed(format!("child {handle}'s ending could not be read: {why}"))
+            Failure::Said(format!("child {handle}'s ending could not be read: {why}"))
         }
-    }
-}
-
-/// One line of this process's standard input, without its ending; `None` at end of input. Read in
-/// the pool, because a console waits for a person.
-fn read_line() -> JobOutput {
-    match stdio::read_line() {
-        Ok(line) => JobOutput::MaybeString(line),
-        Err(e) => JobOutput::Failed(format!("standard input could not be read: {e}")),
     }
 }
 
 /// Whether a write of bytes reached its stream: `false` once the stream's reader has gone away,
 /// which the program is told rather than ended by.
-fn taken(op: Op, wrote: std::io::Result<()>, span: Span) -> Result<HostAnswer, Diagnostic> {
+fn taken(op: &'static str, wrote: std::io::Result<()>, span: Span) -> Result<bool, Diagnostic> {
     match wrote {
-        Ok(()) => Ok(HostAnswer::Value(Value::Bool(true))),
-        Err(e) if stdio::reader_gone(&e) => Ok(HostAnswer::Value(Value::Bool(false))),
+        Ok(()) => Ok(true),
+        Err(e) if stdio::reader_gone(&e) => Ok(false),
         Err(e) => Err(err_write(op, &e, span)),
     }
 }
@@ -892,19 +665,10 @@ fn command(program: &Path, args: &[String], dir: &str, env: &[(String, String)])
 }
 
 #[cold]
-pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
-    let label = match at {
-        Resource::Named(name) => name.as_str().to_string(),
-        Resource::Var(v) => ply_core::label_var_name(*v),
-        Resource::Singleton => "the singleton resource".to_string(),
-        Resource::Every => "every label".to_string(),
-    };
+pub fn unbound(op: &str, label: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_EXEC_UNBOUND,
-        format!(
-            "{} names `{label}`, and no executable is bound to it",
-            op.what()
-        ),
+        format!("`process.{op}` names `{label}`, and no executable is bound to it"),
     )
     .primary(span, format!("`{label}` names no program"))
     .note(format!("bind one beside the run: `--exec {label}=<program>`"))
@@ -915,7 +679,7 @@ pub fn unbound(op: Op, at: &Resource, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn too_much(op: Op, program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
+fn too_much(op: &str, program: &Path, out: usize, err: usize, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_OUTPUT_TOO_LARGE,
         format!(
@@ -928,17 +692,17 @@ fn too_much(op: Op, program: &Path, out: usize, err: usize, span: Span) -> Diagn
         "what the host holds of one stream, whole or as lines not yet read, is at most {MAX_CAPTURE_BYTES} bytes"
     ))
     .note(match op {
-        Op::Spawn => "`process.start` can send a stream to a `File`, or hand it over a line at a time as `Lines`",
+        "spawn" => "`process.start` can send a stream to a `File`, or hand it over a line at a time as `Lines`",
         _ => "read `Lines` as they arrive with `process.output_line`, or send the stream to a `File`",
     })
 }
 
 #[cold]
-fn unusable(op: Op, handle: i64, at: &Resource, why: Unusable, span: Span) -> Diagnostic {
+fn unusable(op: &str, handle: i64, at: &Resource, why: Unusable, span: Span) -> Diagnostic {
     match why {
         Unusable::Unknown => Diagnostic::error(
             codes::RUNTIME_ERROR,
-            format!("{} was given {handle}, and no child has that handle", op.what()),
+            format!("`process.{op}` was given {handle}, and no child has that handle"),
         )
         .primary(span, "`process.start` never answered this handle")
         .note("handles ascend and are never reused, so a stale one names nothing rather than whatever started next"),
@@ -951,8 +715,7 @@ fn unusable(op: Op, handle: i64, at: &Resource, why: Unusable, span: Span) -> Di
         Unusable::Elsewhere(started) => Diagnostic::error(
             codes::RUNTIME_ERROR,
             format!(
-                "child {handle} was started as `process.start{started}` and is used as `process.{}{at}`",
-                op.name()
+                "child {handle} was started as `process.start{started}` and is used as `process.{op}{at}`"
             ),
         )
         .primary(span, format!("this operation names `{at}`"))
@@ -962,13 +725,10 @@ fn unusable(op: Op, handle: i64, at: &Resource, why: Unusable, span: Span) -> Di
 
 /// Another `process.wait` on the same child answered while this one was waiting.
 #[cold]
-fn raced(op: Op, handle: i64, span: Span) -> Diagnostic {
+fn raced(op: &str, handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!(
-            "child {handle} was waited on while {} was waiting",
-            op.what()
-        ),
+        format!("child {handle} was waited on while `process.{op}` was waiting"),
     )
     .primary(span, "another `process.wait` handed this child back first")
     .note("one child is handed back once; a program that waits on it from two tasks races them")
@@ -983,19 +743,9 @@ fn undelivered(handle: i64, signal: Signal, e: &std::io::Error, span: Span) -> D
     .primary(span, "the host could not signal this child")
 }
 
-#[cold]
-fn malformed_argument(op: Op, found: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("{} was given {found}", op.what()),
-    )
-    .primary(span, "this perform reached the host handler")
-    .note("inference checks a perform's argument types, so reaching this means the evaluator was handed a module that was never checked")
-}
-
 /// The unwinding the machine does on any diagnostic is what makes `exit` end the program.
 #[cold]
-fn exit_requested(code: i64, span: Span) -> Diagnostic {
+fn exit_requested(code: i32, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::PROCESS_EXIT,
         format!("the program asked to exit with code {code}"),
@@ -1005,50 +755,13 @@ fn exit_requested(code: i64, span: Span) -> Diagnostic {
 }
 
 #[cold]
-fn err_exit_range(code: i64, span: Span) -> Diagnostic {
+fn err_write(op: &str, e: &std::io::Error, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!(
-            "`process.exit` was given {code}, and an exit code is {} to {}",
-            EXIT_RANGE.start(),
-            EXIT_RANGE.end()
-        ),
-    )
-    .primary(span, "this code cannot reach the shell as written")
-    .note("codes above 125 are how a shell reports a command it could not run or a signal that ended it")
-}
-
-#[cold]
-fn err_write(op: Op, e: &std::io::Error, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("{} could not write: {e}", op.what()),
+        format!("`process.{op}` could not write: {e}"),
     )
     .primary(span, "the stream refused what was written")
     .note("the descriptor is closed, or what it is open on took nothing")
-}
-
-#[cold]
-fn negative_read(max: i64, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`process.in_bytes` was asked for {max} bytes"),
-    )
-    .primary(span, "a read's length cannot be negative")
-}
-
-#[cold]
-fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "{} was performed with {got} argument(s) and takes {}",
-            op.what(),
-            op.arity()
-        ),
-    )
-    .primary(span, "this perform reached the host handler")
-    .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
 }
 
 /// The guarded state has no invariant a panicking caller can break, so recovering is correct.

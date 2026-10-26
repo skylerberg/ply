@@ -10,10 +10,17 @@
 //! A native answering structured data writes it in the flat forms of `ply_host::native`.
 
 mod dns;
+mod env;
+mod fs;
+mod process;
+pub mod random;
+pub mod shipped;
 pub mod signal;
 mod sockets;
 mod sqlite;
 pub mod term;
+pub mod time;
+pub mod toolchain;
 mod trace;
 
 use crate::c::{MachineNative, machine_native};
@@ -23,8 +30,8 @@ use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, Resource, Value, codes};
-use ply_host::jobs::{self, Job, Work};
-use ply_host::native::{found, parts, told};
+use ply_host::jobs::{self, Failure, Job, Work};
+use ply_host::native::{found, parts, parts_of, told};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
@@ -123,10 +130,17 @@ pub fn natives() -> Vec<MachineNative> {
         ),
     ];
     natives.extend(dns::natives());
+    natives.extend(env::natives());
+    natives.extend(fs::natives());
+    natives.extend(process::natives());
+    natives.extend(random::natives());
+    natives.extend(shipped::natives());
     natives.extend(signal::natives());
     natives.extend(sockets::natives());
     natives.extend(sqlite::natives());
     natives.extend(term::natives());
+    natives.extend(time::natives());
+    natives.extend(toolchain::natives());
     natives.extend(trace::natives());
     natives
 }
@@ -170,10 +184,22 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
+        self.refusing(native, what, work, move || job().map_err(Failure::Said))
+    }
+
+    /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may refuse with a
+    /// diagnostic of its own.
+    fn refusing(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+    ) -> I64 {
         let span = self.site();
         let runtime = self.host_runtime();
         let submitted = ply_host::registry::run_of(&*runtime)
-            .and_then(|run| jobs::submit(work, run, span, native, what, job));
+            .and_then(|run| jobs::refusing(work, run, span, native, what, job));
         match submitted {
             Ok(pending) => I64(pending.token as i64),
             Err(d) => {
@@ -217,6 +243,32 @@ fn asked<R>(
     } else {
         refused
     }
+}
+
+/// What `answer` answers where the run is lent `family` and the native `native` may ask the host
+/// as `asking` says; `refused`, with the run failed, where it is not lent the family.
+fn granted<R>(
+    ctx: *mut Ctx,
+    family: &'static str,
+    native: &'static str,
+    asking: Asking,
+    refused: R,
+    answer: impl FnOnce(&mut Ctx) -> R,
+) -> R {
+    let c = unsafe { &mut *ctx };
+    if !c.binding.grants().allows(family) {
+        c.fail(
+            Diagnostic::error(
+                codes::CAPABILITY_UNDECLARED,
+                format!(
+                    "the native `{native}` is the family `{family}`'s, which this run is not lent"
+                ),
+            )
+            .note(format!("`--allow {family}` lends it")),
+        );
+        return refused;
+    }
+    asked(ctx, native, asking, refused, answer)
 }
 
 /// The secret the lent handle `s` holds.
@@ -288,6 +340,28 @@ fn waited(
     }
 }
 
+/// The text a native was lent at `p`; `None`, with the run failed, where it is not UTF-8.
+fn text_at(c: &mut Ctx, p: Addr, n: I64) -> Option<String> {
+    c.text(unsafe { lent(p, n) }).map(str::to_string)
+}
+
+/// The texts lent as parts at `p`; `None`, with the run failed, where they are not.
+fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
+    let read = parts_of(unsafe { lent(p, n) }).and_then(|texts| {
+        texts
+            .into_iter()
+            .map(|t| String::from_utf8(t.to_vec()).ok())
+            .collect::<Option<Vec<String>>>()
+    });
+    if read.is_none() {
+        c.fail(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a native was handed a list of texts as parts that are not",
+        ));
+    }
+    read
+}
+
 /// The run failed where `done` is a diagnostic.
 fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
     if let Err(d) = done {
@@ -320,10 +394,13 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     }
 }
 
-/// What a real handler read of the root the label at `label_at` names, at the path at `path_at`
-/// below it, or wrote there, entered into the record of the run asking where it is observed: `kind`
-/// 0 a file's bytes, 1 a directory's names, 2 what is there, 3 every path below, and 4 a write. A
-/// label no root is bound to holds nothing to record. It asks nothing of the host itself.
+/// What a real handler read or wrote, entered into the record of the run asking where it is
+/// observed. Under the root the label at `label_at` names, at the path at `path_at` below it,
+/// `kind` 0 is a file's bytes read, 1 a directory's names, 2 what is there, 3 every path below,
+/// and 4 a write; a label no root is bound to holds nothing to record. Of what the binary ships,
+/// the label empty, 5 is the shipped module the path names read (every module's name for the empty
+/// path), 6 the program the launcher entered, and 7 and 8 a load's view at the path of the shipped
+/// modules it reached, which it pulled itself for 7. It asks nothing of the host itself.
 pub unsafe extern "C" fn rt_observed(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -343,6 +420,20 @@ pub unsafe extern "C" fn rt_observed(
     ) else {
         return;
     };
+    let how = match kind.0 {
+        0 => Some(Read::File),
+        1 => Some(Read::Dir),
+        2 => Some(Read::Kind),
+        3 => Some(Read::Tree),
+        4 => None,
+        5 => return recorder.shipped(path),
+        6 => return recorder.ran_program(),
+        7 | 8 => return recorder.reached(path, kind.0 == 7),
+        _ => {
+            handed(c, "observed", "a kind of read", None::<()>);
+            return;
+        }
+    };
     let resource = Resource::Named(ply_core::Symbol::new(label));
     let Some(Some(root)) = from_host(c, |facilities| {
         facilities.roots().get(&resource).map(Path::to_path_buf)
@@ -351,17 +442,6 @@ pub unsafe extern "C" fn rt_observed(
     };
     // The path as the program named it: where a link in it leads is read again when the record is.
     let target = root.join(path);
-    let how = match kind.0 {
-        0 => Some(Read::File),
-        1 => Some(Read::Dir),
-        2 => Some(Read::Kind),
-        3 => Some(Read::Tree),
-        4 => None,
-        _ => {
-            handed(c, "observed", "a kind of read", None::<()>);
-            return;
-        }
-    };
     match how {
         Some(how) => recorder.read(how, &target),
         None => recorder.wrote(&target),

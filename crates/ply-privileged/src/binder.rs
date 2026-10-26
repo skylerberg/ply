@@ -13,16 +13,17 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Installs the binder, once, before a program enters another.
+/// Installs the binder and what the binary ships, once, before a program enters another.
 pub fn install() {
     ply_compiled::entry::install(Box::new(Binder));
+    crate::shipped::install();
 }
 
 struct Binder;
 
 impl ply_compiled::entry::Binder for Binder {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>> {
-        let hosts = Hosts::granted(&grants, crate::policy::lent_to(&grants))?;
+        let hosts = Hosts::granted(&grants)?;
         Ok(Arc::new(Lent {
             world: Worldly::of(&grants),
             hosts,
@@ -32,16 +33,13 @@ impl ply_compiled::entry::Binder for Binder {
     /// `hosting := list(registration), list(failure) refusals, option(transport), list(named)
     /// roots, sink, list(string) signals`; `registration := string effect, string op,
     /// option(resource) (none for every label), bool deterministic, bool repeatable, bool blocking,
-    /// bool secrets, string handler, string facility`; `transport := string library, string
+    /// bool secrets, string handler`; `transport := string library, string
     /// version, string provider, list(string) versions, list(string) alpn, string roots, string
     /// roots_version, int trusted, list(credential)`; `credential := string name, string
     /// fingerprint, int certificates`; `named := string name, string path`; `sink := string sink,
     /// string destination, option(string) level`.
     fn hosting(&self, grants: &Grants, w: &mut Writer) {
-        let mut registry = ply_host::registry();
-        for (op, handler) in crate::policy::lent_to(grants) {
-            registry.register(op, handler);
-        }
+        let registry = ply_host::registry();
         w.list(registry.ops().collect::<Vec<_>>().into_iter(), |w, op| {
             w.str(op.effect.as_str()).str(op.op.as_str());
             w.option(
@@ -55,8 +53,7 @@ impl ply_compiled::entry::Binder for Binder {
                 .bool(!op.linearity.is_linear())
                 .bool(op.blocking)
                 .bool(op.secrets)
-                .str(op.path)
-                .str(facility_of(op.path));
+                .str(op.path);
         });
         let mut refusals = Vec::new();
         let credentials = credentials_of(grants).map_err(|d| refusals.extend(d)).ok();
@@ -110,15 +107,6 @@ impl ply_compiled::entry::Binder for Binder {
 
     fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String> {
         ply_host::observe::moved(trace, &Worldly::of(grants).world(), caller)
-    }
-}
-
-/// Which disclosure a registration's handler is one of: `fs`, or none.
-fn facility_of(path: &str) -> &'static str {
-    if path.starts_with("ply_host::fs::") {
-        "fs"
-    } else {
-        ""
     }
 }
 

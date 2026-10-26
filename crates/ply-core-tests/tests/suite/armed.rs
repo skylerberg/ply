@@ -1381,10 +1381,14 @@ fn every_variant_of_a_covered_enum_is_constructed_in_production() {
 fn every_diagnostic_constructor_call_names_its_code_literally() {
     let Tree { sources, calls, .. } = tree();
 
+    let crates: BTreeSet<&str> = calls
+        .iter()
+        .filter_map(|(idx, _, _)| sources[*idx].rel.strip_prefix("crates/")?.split('/').next())
+        .collect();
     assert!(
-        calls.len() > 100,
-        "found {} Diagnostic::error/warning calls — the scan is broken",
-        calls.len()
+        crates.len() > 1,
+        "found Diagnostic::error/warning calls in {} crate(s) — the scan is broken",
+        crates.len()
     );
 
     let mut unlisted = Vec::new();

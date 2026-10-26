@@ -67,7 +67,7 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
         eprintln!("ply: {why}");
         return 2;
     }
-    let program = match ply_launcher::linked_program(env!("CARGO_PKG_VERSION")) {
+    let program = match ply_launcher::linked_program() {
         Ok(program) => program,
         Err(diagnostic) => {
             eprintln!("{diagnostic}");
@@ -84,9 +84,7 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
         }
     };
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // Every command family's ops are lent unconfigured to the program, which is this binary's own;
-    // the program configures what it drives.
-    let launched = ply_launcher::run(program, &root, argv, ply_privileged::policy::all(), count);
+    let launched = ply_launcher::run(program, &root, argv, count);
     for warning in launched.warnings {
         eprintln!("{warning}");
     }

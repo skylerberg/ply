@@ -128,7 +128,10 @@ pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
             return I64(0);
         };
         let job: Job = Box::new(move || match stdio::read_secret_line() {
-            Ok(Some(line)) => Ok(found(run.upgrade().map(|run| int(run.keep_secret(line))))),
+            Ok(Some(mut line)) => {
+                let kept = ply_host::pool::Kept::new(std::mem::take(&mut *line).into_bytes());
+                Ok(found(run.upgrade().map(|run| int(run.keep_secret(kept)))))
+            }
             Ok(None) => Ok(found(None::<[u8; 8]>)),
             Err(e) => Err(format!("standard input could not be read: {e}")),
         });
@@ -146,7 +149,10 @@ pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> Sec
         |c: &mut Ctx| {
             let line = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
             match handed(c, "term_secret_taken", "a line's number", line) {
-                Some(line) => SecretHandle::of(c.heap.bridge(Value::secret_text(&line))),
+                Some(line) => SecretHandle::of(
+                    c.heap
+                        .bridge(Value::secret_text(std::str::from_utf8(&line).unwrap_or(""))),
+                ),
                 None => SecretHandle::of(0),
             }
         },

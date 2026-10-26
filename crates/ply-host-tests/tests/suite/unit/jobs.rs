@@ -103,6 +103,30 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
     assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
 }
 
+/// A job's refusal of its own fails the run as it stands, its code kept.
+#[test]
+fn a_jobs_own_refusal_fails_the_run_with_its_code() {
+    let runtime = ply_host::Host::new().runtime();
+    let run = run_of(&*runtime).expect("a host made the runtime");
+    let ticket = jobs::refusing(
+        Work::Waiting,
+        run,
+        Span::DUMMY,
+        "test",
+        "a test job",
+        || {
+            Err(jobs::Failure::Refused(ply_core::Diagnostic::error(
+                codes::PROCESS_OUTPUT_TOO_LARGE,
+                "too much",
+            )))
+        },
+    )
+    .expect("a thread is had");
+    let refused = runtime.block_on(ticket).expect_err("the job refused");
+    assert_eq!(refused.code, codes::PROCESS_OUTPUT_TOO_LARGE);
+    assert_eq!(refused.message, "too much");
+}
+
 /// Every runtime one unbound factory makes, as each `parallel` branch makes its own, is over the
 /// one host: a socket a branch opens is in the table the run reads.
 #[test]

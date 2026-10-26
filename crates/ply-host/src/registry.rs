@@ -7,7 +7,6 @@ use crate::config;
 use crate::fs;
 use crate::pool::{Bell, Run, err_nothing_outstanding};
 use crate::process;
-use crate::random;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
 use crate::tcp;
@@ -119,11 +118,6 @@ impl Host {
     pub fn registry(&self) -> HostRegistry {
         let mut registry = HostRegistry::new();
         clock::register(&mut registry, Arc::clone(&self.time));
-        // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
-        fs::register(&mut registry, Arc::clone(&self.fs));
-        process::register(&mut registry, self.process.as_ref());
-        random::register(&mut registry);
-        time::register(&mut registry, Arc::clone(&self.time));
         registry
     }
 
@@ -268,9 +262,19 @@ impl Facilities {
         self.fs.roots()
     }
 
+    /// The files under the roots, and the locks and descriptors the run holds of them.
+    pub fn files(&self) -> &Arc<fs::FsHost> {
+        &self.fs
+    }
+
     /// The database connections the run holds open.
     pub fn databases(&self) -> &Arc<sqlite::SqliteHost> {
         &self.sqlite
+    }
+
+    /// The run's own process and the programs it may start, where it was lent either.
+    pub fn process(&self) -> Option<&Arc<process::ProcessHost>> {
+        self.process.as_ref()
     }
 
     /// The stop the run listens for, where it listens for one.
