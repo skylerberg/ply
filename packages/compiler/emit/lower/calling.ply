@@ -7,7 +7,7 @@ import compiler.emit.code (Code, Node, NVar, NKnown, NLambda, NApp, NUnary, NBin
                            NBlock, NList, NRecord, NUpdate, NMatch, NPerform, NSimulate, NParallel,
                            NHandle, Lambda, Capture, CodeStmt, CLet, CLetPat, CDo, CodeField,
                            CodeArm, CodeClause, PxList, PxVar, is_label_binder)
-import compiler.check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, RVar, int_type, bool_type,
+import compiler.check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, Atom, RVar, int_type, bool_type,
                              run_needs, row_empty)
 import compiler.emit.typing (Filings, no_filings, unknown_type, rows_filed_at)
 import compiler.check.infer.checker (Performs)
@@ -1829,8 +1829,9 @@ fn jumped(
     jumped_handing(cx, st, d, ref, codes, args, given, at)
   }
 
-/// A call in tail position as `jumped` makes it, handing `given` past its arguments. A restart
-/// hands no word: the root goes on holding its own, which are the callee's.
+/// A call in tail position as `jumped` makes it, handing `given` past its arguments, a restart as
+/// much as an entry of a tail group's member: a call passing its labels otherwise than it was given
+/// them hands the words of the labels it passes.
 fn jumped_handing(
   cx: Context,
   st: Lowering,
@@ -1843,10 +1844,11 @@ fn jumped_handing(
 ) -> Option<Lowered> / {abort.raise} =
   if unspecialised(cx.key) == d.def.root && args.len() == cx.params.len()
       && (match reference_args(cx, d.def.scheme, ref) {
-        Some(types) -> owns(cx, types, fn_args(cx, codes), given.rows),
+        Some(types) -> owns(cx, types, fn_args(cx, d.def, codes), given.rows),
         None -> false,
       }) {
-    let h = handed_all(st, args.concat(cx.handed), params_held(cx), at);
+    let e = words_handed(st, given, at);
+    let h = handed_all(e.st, args.concat(e.args), params_held(cx), at);
     Some({ st: emitted(h.st, Restart(h.args)), arg: AZero(held_as(cx.setting, cx.answer_ty)) })
   } else {
     match cx.tails {
@@ -1902,7 +1904,7 @@ fn call(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let given = handing(cx, st, d.def, ref, label_codes(d.def, codes));
-  let n = named_ref(cx, st, d, ref, fn_args(cx, codes), given.rows);
+  let n = named_ref(cx, st, d, ref, fn_args(cx, d.def, codes), given.rows);
   match ((crossing_at(cx.setting, d.def, n.args), answer_type(d.def, n.given))) {
     (None, _) ->
       refuse(st, Calling, b"a call of a definition no scheme speaks for: ".concat(d.full)),
@@ -2165,7 +2167,7 @@ fn may_be_called(cx: Context, j: Int) -> Bool =
 /// specialisation reads and runs: a literal one where the root lends its lambdas, one known to a
 /// slot, another root's wherever it is handed on, and a definition named as a value as the lambda
 /// around a call of it.
-fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
+fn fn_args(cx: Context, callee: Def, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
   let owner = root_text(root_name(cx.key));
   let lends = cx.lends;
   // Code of a lambda another root lent is that root's, which lends each lambda within it.
@@ -2174,7 +2176,7 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
     None -> if lends { Some({ owner: cx.key, written: cx.written }) } else { None },
   };
   let handed_as = |j: Int, l: Lambda, acc: List<FnArg>|
-    match if !lendable(cx, l) { None } else { by } {
+    match if !lendable(cx, l) || labelled_param(callee, j) { None } else { by } {
       None -> acc,
       Some(b) -> match position_in(b.written, l) {
         Some(nth) -> acc.push({ param: j, owner: b.owner, nth: nth }),
@@ -2185,7 +2187,8 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
     match codes.at(j) {
       Some(c) -> match c.node {
         NLambda(l) -> handed_as(j, l, acc),
-        NKnown(k) -> if k.owner != owner || (lends && lendable(cx, k.lambda)) {
+        NKnown(k) -> if labelled_param(callee, j) { acc }
+        else if k.owner != owner || (lends && lendable(cx, k.lambda)) {
           acc.push({ param: j, owner: owner_named(cx, k.owner), nth: k.nth })
         } else { acc },
         NVar(_) -> match named_arity(cx.setting.module, cx.setting.here, cx.setting.imports, c) {
@@ -2197,6 +2200,22 @@ fn fn_args(cx: Context, codes: List<Code>) -> List<FnArg> / {abort.raise} = {
       None -> acc,
     })
 }
+
+/// Whether parameter `j` of definition `d` is a function whose row names a label variable of
+/// `d`'s: a lambda handed there runs as a closure, its words read off its caller's at the label the
+/// call fills, which no root running it in place knows.
+fn labelled_param(d: Def, j: Int) -> Bool =
+  match d.scheme {
+    Some(sc) -> match sc.ty {
+      TyFn(f) -> match f.params.at(j) {
+        Some(TyFn(p)) ->
+          p.effects.atoms.any(|a: Atom| match a.resource { RVar(_) -> true, _ -> false }),
+        _ -> false,
+      },
+      _ -> false,
+    },
+    None -> false,
+  }
 
 /// Whether lambda `l`, written in this root's code, may run in place in another root: it holds no
 /// `handle`, and every row filed for it and in it names only what it writes, which the root running
