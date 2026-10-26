@@ -246,6 +246,8 @@ pub(crate) enum Kept {
     Landing(HandlerFrame),
     /// The raise a `bracket`'s release runs during.
     Raising(Aborting),
+    /// The pending raise a `bracket`'s release runs during, and the failure it carries.
+    Pending(String, Option<Diagnostic>),
     /// The arguments a clause emitted code made is called with, which it takes as it is entered.
     Args(Vec<Word>),
 }
@@ -261,7 +263,7 @@ impl Kept {
             Kept::Raising(a) => {
                 a.into_failure();
             }
-            Kept::Args(_) => {}
+            Kept::Pending(..) | Kept::Args(_) => {}
         }
     }
 }
@@ -323,6 +325,7 @@ impl StackCopy {
                 ),
                 Kept::Landing(f) => Kept::Landing(frame(f)),
                 Kept::Raising(a) => Kept::Raising(a.copied()),
+                Kept::Pending(message, failure) => Kept::Pending(message.clone(), failure.clone()),
                 Kept::Args(words) => Kept::Args(words.clone()),
             })
             .collect();

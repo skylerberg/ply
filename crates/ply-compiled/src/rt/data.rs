@@ -105,10 +105,10 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let unwinding = c.unwind.take();
     let raising = c.aborting.take();
     let target = c.target;
-    let pending = c
-        .pending
-        .take()
-        .map(|message| (message, c.diagnostic.take()));
+    let pending = c.pending.take().map(|message| {
+        let failure = c.diagnostic.take();
+        c.keep(Kept::Pending(message, failure))
+    });
     c.failed = 0;
     let entered = crate::simulate::shield(c, Shield::Release);
     let raise = raising.map(|a| c.keep(Kept::Raising(a)));
@@ -139,6 +139,10 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let raising = raise.map(|here| match c.kept_back(here) {
         Kept::Raising(a) => a,
         _ => unreachable!("a cleanup keeps the raise it runs during"),
+    });
+    let pending = pending.map(|here| match c.kept_back(here) {
+        Kept::Pending(message, failure) => (message, failure),
+        _ => unreachable!("a cleanup keeps the pending raise it runs during"),
     });
     let cancelled = crate::simulate::unshield(c, entered);
     if c.failed != 0 || cancelled {
