@@ -1,0 +1,372 @@
+//! What a seeded schedule is drawn from and what it records: an entry's seed, the two streams its
+//! root expands into, each scheduling point a region takes with what the step after it touched,
+//! and the interleaving an entry's outcome carries, in the bytes `std.machine` reads.
+//!
+//! A stream is counter-mode BLAKE3: block `n` of a root's stream is the digest of the stream's
+//! name, the root, the stream's tag and `n`, each eight bytes little-endian but the one-byte tag,
+//! and a draw is a block's first eight bytes. The scheduler's choices are tag 0 and `random`'s draws
+//! tag 1, the stream `std.random`'s `rand` reads too. Every seed a failure has printed replays
+//! because these never change.
+
+import std.bin
+import std.bytes (u64_le)
+import std.list
+
+// --- Streams ------------------------------------------------------------------
+
+/// The two streams a seed's root expands into.
+pub type Domain = | Choices | Draws
+
+fn tag_of(d: Domain) -> Int = match d { Choices -> 0, Draws -> 1 }
+
+/// Block `counter` of `root`'s stream in `domain`.
+pub fn block(root: U64, domain: Domain, counter: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"ply.sim.stream.1",
+    u64_bytes(root),
+    byte_of_int(tag_of(domain)),
+    u64_le(counter),
+  ]).blake3(
+  )
+
+fn u64_bytes(n: U64) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(low_int(n >> 8 * i & 255u64))))
+
+/// `n` below 2^63 as an `Int`; any other is 0, which no caller hands.
+fn low_int(n: U64) -> Int = match to_int(n) { Some(i) -> i, None -> 0 }
+
+/// Draw `counter` of `domain`'s stream: the block's first eight bytes, least significant first.
+pub fn drawn(root: U64, domain: Domain, counter: Int) -> U64 / {abort.raise} = {
+  let b = block(root, domain, counter);
+  U64::of_int(Int::of_u32(b.u32_le(0))) | U64::of_int(Int::of_u32(b.u32_le(4))) << 32
+}
+
+/// The draw's sixty-four bits as an `Int`, the top one its sign.
+pub fn bits_of(n: U64) -> Int =
+  if n < 9223372036854775808u64 { low_int(n) }
+  else { low_int(n - 9223372036854775808u64) +% (-9223372036854775807 - 1) }
+
+/// A draw uniform over `0..n`, `n` at least 1, and the counter after it: a draw at or past the last
+/// whole multiple of `n` below 2^64 is thrown away and the next taken.
+pub fn below(
+  root: U64,
+  domain: Domain,
+  counter: Int,
+  n: Int,
+) -> { value: Int, counter: Int } / {abort.raise} = {
+  let bound = U64::of_int(max(n, 1));
+  let limit = 18446744073709551615u64 / bound * bound;
+  // A draw is kept with probability over one half, so a 64th rejection in a row never comes.
+  iterate(counter, 64, |at: Int| {
+    let x = drawn(root, domain, at);
+    if x < limit { Stop({ value: low_int(x % bound), counter: at + 1 }) } else { Continue(at + 1) }
+  })
+}
+
+// --- Seeds --------------------------------------------------------------------
+
+/// A root, and the choices that fix the first scheduling points before the root's stream decides.
+pub type Seed = { root: U64, path: List<Int> }
+
+/// The seed as a failure prints it for its replay: `7`, or `7:3.0.2`.
+pub fn seed_text(s: Seed) -> String / {abort.raise} =
+  range(0, s.path.len()).fold(u64_text(s.root), |acc: String, i: Int|
+    match s.path.at(i) {
+      Some(c) -> acc ++ (if i == 0 { ":" } else { "." }) ++ c.to_string(),
+      None -> acc,
+    })
+
+fn u64_text(n: U64) -> String / {abort.raise} = {
+  let high = low_int(n >> 32);
+  let low = low_int(n & 4294967295u64);
+  if high == 0 { low.to_string() }
+  else { U128::to_string(U128::of_int(high) * 4294967296u128 + U128::of_int(low)) }
+}
+
+/// Where an entry's regions stand in their seed: the scheduling points they have taken, how far
+/// each stream has drawn, and the virtual time the last region that finished spent. `budget` is the
+/// points the entry may take.
+pub type Trail = {
+  seed: Seed,
+  budget: Int,
+  points: Int,
+  choices: Int,
+  draws: Int,
+  virtual_time: Int,
+}
+
+/// Default scheduling points per interleaving.
+pub fn default_budget() -> Int = 100000
+
+/// An entry's trail before its first region opens.
+pub fn trail(seed: Seed, budget: Int) -> Trail =
+  { seed: seed, budget: max(budget, 1), points: 0, choices: 0, draws: 0, virtual_time: 0 }
+
+/// What the next scheduling point takes among `enabled` tasks: the seed's choice while its path
+/// lasts, then a draw.
+pub type Choice =
+  | Took({ choice: Int, trail: Trail })
+  /// The seed names a choice past the enabled tasks, so a replay did not reach the schedule it
+  /// recorded.
+  | Beyond(Int)
+
+/// The choice at the trail's next point among `enabled` tasks, at least one; the trail it answers
+/// has drawn what the choice drew, and has not yet counted the point.
+pub fn chosen(t: Trail, enabled: Int) -> Choice / {abort.raise} =
+  match t.seed.path.at(t.points) {
+    Some(c) -> if c >= enabled { Beyond(c) } else { Took({ choice: c, trail: t }) },
+    None -> {
+      let d = below(t.seed.root, Choices, t.choices, enabled);
+      Took({ choice: d.value, trail: { ..t, choices: d.counter } })
+    },
+  }
+
+/// The next draw of `random`, and the trail after it.
+pub fn next_draw(t: Trail) -> { value: Int, trail: Trail } / {abort.raise} =
+  { value: bits_of(drawn(t.seed.root, Draws, t.draws)), trail: { ..t, draws: t.draws + 1 } }
+
+/// A draw of `random` below `n`, at least 1, and the trail after it.
+pub fn draw_below(t: Trail, n: Int) -> { value: Int, trail: Trail } / {abort.raise} = {
+  let d = below(t.seed.root, Draws, t.draws, n);
+  { value: d.value, trail: { ..t, draws: d.counter } }
+}
+
+// --- Steps --------------------------------------------------------------------
+
+/// A place a task stood, as the runtime stores a site: the root's id and offsets from its start;
+/// root -1 for none.
+pub type Site = { root: Int, start: Int, end: Int }
+
+/// No place.
+pub fn nowhere() -> Site = { root: -1, start: 0, end: 0 }
+
+derive bin for Site
+
+/// What an atom names: one label, a label the definition is generic over (by its place), the
+/// singleton, or every label.
+pub type Resource = | Named(String) | Variable(Int) | Singleton | Every
+
+pub type Mode = | Read | Write | Raise
+
+/// What a step touched: an effect's atom (effect, resource, mode, and the operation where it names
+/// one), a handler's variable (its `handle`, its place there, the mode), or a hold (its number
+/// among the entry's, the mode). Ordered as the runtime ordered them, so a step lists what it
+/// touched in one order.
+pub type Access =
+  | Atom(String, Resource, Mode, Option<String>)
+  | Var(Int, Int, Mode)
+  | Hold(Int, Mode)
+
+/// Whether two accesses of one place conflict, where either writes it.
+pub fn conflicts(a: Access, b: Access) -> Bool =
+  match ((a, b)) {
+    (Atom(e, r, m, _), Atom(f, s, n, _)) -> e == f && r == s && (m == Write || n == Write),
+    (Var(h, i, m), Var(g, j, n)) -> h == g && i == j && (m == Write || n == Write),
+    (Hold(i, m), Hold(j, n)) -> i == j && (m == Write || n == Write),
+    _ -> false,
+  }
+
+/// What the operation that ends a step performed, which the scheduler orders itself: `task` and
+/// `clock` atoms are no footprint.
+pub fn is_bookkeeping(a: Access) -> Bool =
+  match a { Atom(e, _, _, _) -> e == "task" || e == "clock", _ -> false }
+
+/// What a cancel writes and every step of the cancelled task reads.
+pub fn liveness(task: Int, mode: Mode) -> Access =
+  Atom("task.alive", Named("@" ++ task.to_string()), mode, None)
+
+/// What a task's last step writes, and a cancel that lets go of a join on it.
+pub fn ended(task: Int) -> Access = Atom("task.end", Named("@" ++ task.to_string()), Write, None)
+
+/// What every operation on a channel writes.
+pub fn channel_access(chan: Int) -> Access =
+  Atom("task.chan", Named("#" ++ chan.to_string()), Write, None)
+
+/// What making a channel writes: the order two run in decides each id.
+pub fn channel_made() -> Access = Atom("task.chan", Named("new"), Write, None)
+
+/// `xs`, each access once and in order, with `a` among them.
+pub fn with_access(xs: List<Access>, a: Access) -> List<Access> =
+  match xs.index_of(a) {
+    Some(_) -> xs,
+    None -> {
+      let before = xs.filter(|x: Access| compare(x, a) == Less);
+      before.push(a).concat(xs.filter(|x: Access| compare(x, a) == Greater))
+    },
+  }
+
+/// One scheduling point: the region and task it resumed, every task it could have resumed in the
+/// order a choice indexes, which it took, what the step after it touched, where it first touched
+/// something or else gave control back, and the task's vector clock: which earlier steps of each
+/// task, by task, it had observed.
+pub type Step = {
+  region: Int,
+  task: Int,
+  enabled: List<Int>,
+  choice: Int,
+  accesses: List<Access>,
+  site: Option<Site>,
+  stamp: List<Int>,
+}
+
+/// `later`'s task had observed `earlier`'s step, through the spawns, joins and channels between.
+pub fn happens_before(earlier: Step, later: Step) -> Bool =
+  if earlier.stamp.len() == 0 || later.stamp.len() == 0 { false } else {
+    let mine = match earlier.stamp.at(earlier.task) { Some(n) -> n, None -> 0 };
+    let theirs = match later.stamp.at(earlier.task) { Some(n) -> n, None -> 0 };
+    mine > 0 && theirs >= mine
+  }
+
+// --- What an outcome carries ----------------------------------------------------
+
+/// A site as an outcome names it: the definition it lies in, and the root and the offsets of its
+/// span there; none where the runtime knows no root.
+pub type Placed = { definition: Option<String>, site: Option<At> }
+
+pub type At = { root: String, start: Int, end: Int }
+
+/// The interleaving an entry's regions took, as the outcome carries it: `std.machine`'s
+/// `Interleaving`, field for field, which its reader decodes these bytes as.
+type Written = { steps: List<WrittenStep>, virtual_time: Int }
+
+type WrittenStep = {
+  region: Int,
+  task: Int,
+  enabled: List<Int>,
+  choice: Int,
+  accesses: List<WrittenAccess>,
+  definition: Option<String>,
+  site: Option<At>,
+  stamp: List<Int>,
+}
+
+type WrittenAccess =
+  | AAtom({ effect: String, resource: Option<String>, write: Bool, op: Option<String> })
+  | AVar({ handler: Int, index: Int, write: Bool })
+  | AHold({ id: Int, write: Bool })
+
+derive bin for At
+derive bin for WrittenAccess
+derive bin for WrittenStep
+derive bin for Written
+
+/// `steps` and the virtual time the last region spent, as an outcome carries them, each site placed
+/// by `placed`.
+pub fn interleaving_bytes<| e>(
+  steps: List<Step>,
+  virtual_time: Int,
+  placed: (Site) -> Placed / e,
+) -> Bytes / {abort.raise | e} =
+  bin::encode(
+    {
+      steps: steps.map(|s: Step| {
+        let at = match s.site {
+          Some(site) -> placed(site),
+          None -> { definition: None, site: None },
+        };
+        {
+          region: s.region,
+          task: s.task,
+          enabled: s.enabled,
+          choice: s.choice,
+          accesses: s.accesses.map(written_access),
+          definition: at.definition,
+          site: at.site,
+          stamp: s.stamp,
+        }
+      }),
+      virtual_time: virtual_time,
+    },
+    written_bin(),
+  )
+
+fn written_access(a: Access) -> WrittenAccess =
+  match a {
+    Atom(named, resource, mode, op) ->
+      AAtom({ effect: named, resource: resource_text(resource), write: mode == Write, op: op }),
+    Var(handler, index, mode) -> AVar({ handler: handler, index: index, write: mode == Write }),
+    Hold(id, mode) -> AHold({ id: id, write: mode == Write }),
+  }
+
+fn resource_text(r: Resource) -> Option<String> =
+  match r {
+    Named(name) -> Some(name),
+    Variable(n) -> Some("$" ++ n.to_string()),
+    Every -> Some("*"),
+    Singleton -> None,
+  }
+
+// --- Tests --------------------------------------------------------------------
+
+// The draws `ply-core`'s `sim::Stream` made, computed outside Ply from the BLAKE3 the runtime
+// links: what every seed a failure printed was drawn from.
+test "the streams draw what the scheduler always drew" {
+  assert_eq(
+    block(0u64, Choices, 0).hex_of(),
+    "af20691b9235245163e7d20bba6587247af792186aaf989615a8af0881d4a224",
+  );
+  let draws = |root: U64, d: Domain| range(0, 3).map(|c: Int| bits_of(drawn(root, d, c)));
+  assert_eq(draws(0u64, Choices), [5846857117875118255, -2947224211526844141, 9112728371523608152]);
+  assert_eq(draws(0u64, Draws), [5498647798697370148, 5735462360499685530, 3965747315628040037]);
+  assert_eq(draws(7u64, Choices), [
+    -1069179646710630085,
+    -7563825629958135995,
+    -8670714654812400006,
+  ]);
+  assert_eq(draws(18446744073709551615u64, Draws), [
+    -5271396540973521449,
+    -4044368934125371154,
+    -4994871317154407241,
+  ])
+}
+
+test "a draw below a bound throws away what lies past the bound's last multiple, as it always has" {
+  let bounds = [2, 3, 1, 5, 2, 7, 1, 4];
+  let drew = |root: U64|
+    bounds.fold({ out: [], counter: 0 }, |acc: { out: List<Int>, counter: Int }, n: Int| {
+      let d = below(root, Choices, acc.counter, n);
+      { out: acc.out.push(d.value), counter: d.counter }
+    });
+  assert_eq(drew(0u64), { out: [1, 1, 0, 4, 1, 0, 0, 2], counter: 8 });
+  assert_eq(drew(7u64), { out: [1, 2, 0, 0, 1, 4, 0, 0], counter: 8 })
+}
+
+test "a seed prints its root and then its path" {
+  assert_eq(seed_text({ root: 7u64, path: [] }), "7");
+  assert_eq(seed_text({ root: 0u64, path: [1, 0, 2] }), "0:1.0.2");
+  assert_eq(seed_text({ root: 18446744073709551615u64, path: [3] }), "18446744073709551615:3")
+}
+
+test "the seed's path chooses while it lasts, and the stream after it" {
+  let t = trail({ root: 0u64, path: [1, 0] }, 10);
+  assert_eq(chosen(t, 3), Took({ choice: 1, trail: t }));
+  assert_eq(chosen({ ..t, points: 1 }, 3), Took({ choice: 0, trail: { ..t, points: 1 } }));
+  // Past the path the stream decides: root 0's first draw below 2 is 1.
+  assert_eq(
+    chosen({ ..t, points: 2 }, 2),
+    Took({ choice: 1, trail: { ..t, points: 2, choices: 1 } }),
+  );
+  assert_eq(chosen(trail({ root: 0u64, path: [5] }, 10), 3), Beyond(5))
+}
+
+test "a step lists each access once, in the order the runtime ordered them" {
+  let a = liveness(2, Write);
+  let b = channel_access(1);
+  let held = Hold(4, Read);
+  let both = with_access(with_access(with_access([], held), a), b);
+  assert_eq(both, [a, b, held]);
+  assert_eq(with_access(both, a), both);
+  assert(conflicts(a, liveness(2, Read)));
+  assert(!conflicts(liveness(2, Read), liveness(2, Read)));
+  assert(!conflicts(a, b));
+  assert(is_bookkeeping(Atom("task", Singleton, Write, None)));
+  assert(!is_bookkeeping(b))
+}
+
+test "a step happened before another when the other's clock has seen it" {
+  let step = |task: Int, stamp: List<Int>|
+    { region: 0, task: task, enabled: [task], choice: 0, accesses: [], site: None, stamp: stamp };
+  assert(happens_before(step(0, [1, 0]), step(1, [1, 1])));
+  assert(!happens_before(step(0, [2, 0]), step(1, [1, 1])));
+  assert(!happens_before(step(0, []), step(1, [1, 1])))
+}

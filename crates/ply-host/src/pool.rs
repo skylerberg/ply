@@ -192,6 +192,16 @@ impl Run {
             .any(|held| held.watched && held.answer.is_some())
     }
 
+    /// The watched operations answered and not yet taken, ascending, their answers left for `poll`.
+    pub fn answered(&self) -> Vec<u64> {
+        let mut tokens: Vec<u64> = (lock(&self.held).iter())
+            .filter(|(_, h)| h.watched && h.answer.is_some())
+            .map(|(token, _)| *token)
+            .collect();
+        tokens.sort_unstable();
+        tokens
+    }
+
     /// The watched operations answered since the last call, each with its answer.
     pub fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
         let answered: Vec<(u64, Span, &'static str, JobOutput)> = {

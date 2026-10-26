@@ -787,15 +787,14 @@ impl Ctx {
 
     /// The span the body last stored, or `Span::DUMMY` before any has.
     pub fn site(&self) -> Span {
-        self.stored_in(self.stored_root())
+        self.span_at(self.site_root, self.site_start, self.site_end)
     }
 
     /// [`Ctx::site`] and the definition the body that stored it belongs to.
     pub(crate) fn step_site(&self) -> StepSite {
-        let root = self.stored_root();
         StepSite {
-            definition: root.map(|r| r.name.clone()),
-            span: self.stored_in(root),
+            definition: self.root_of(self.site_root).map(|r| r.name.clone()),
+            span: self.site(),
         }
     }
 
@@ -805,16 +804,18 @@ impl Ctx {
         self.trail.record_access(access, at);
     }
 
-    pub(super) fn stored_root(&self) -> Option<&Root> {
-        let id = u64::try_from(self.site_root).ok()?;
+    /// The root whose id is `root`; none for an id below 0 or that no root has.
+    fn root_of(&self, root: i64) -> Option<&Root> {
+        let id = u64::try_from(root).ok()?;
         let roots = &self.tables.roots;
         let at = roots.binary_search_by_key(&id, |r| r.id).ok()?;
         Some(&roots[at])
     }
 
-    /// The stored offsets as a span in `root`'s definition.
-    pub(super) fn stored_in(&self, root: Option<&Root>) -> Span {
-        let Some(defined) = root.map(|r| r.span).filter(|s| !s.is_dummy()) else {
+    /// The span a site names: offsets `start..end` from the start of root `root`'s definition, as
+    /// the body stores one; `Span::DUMMY` where no root has that id or its offsets leave the source.
+    pub(crate) fn span_at(&self, root: i64, start: i64, end: i64) -> Span {
+        let Some(defined) = self.root_of(root).map(|r| r.span).filter(|s| !s.is_dummy()) else {
             return Span::DUMMY;
         };
         let at = |offset: i64| {
@@ -822,7 +823,7 @@ impl Ctx {
                 .checked_add(offset)
                 .and_then(|o| u32::try_from(o).ok())
         };
-        match (at(self.site_start), at(self.site_end)) {
+        match (at(start), at(end)) {
             (Some(start), Some(end)) => Span::new(defined.source, start, end),
             _ => Span::DUMMY,
         }

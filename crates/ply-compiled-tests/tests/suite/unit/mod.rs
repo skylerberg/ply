@@ -16,3 +16,4 @@ mod machine;
 mod parallel;
 mod rt;
 mod stack;
+mod tasks;

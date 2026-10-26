@@ -23,6 +23,7 @@ mod parallel;
 pub mod rt;
 pub mod simulate;
 pub mod stack;
+pub mod tasks;
 mod vm;
 
 pub use c::Refused;
