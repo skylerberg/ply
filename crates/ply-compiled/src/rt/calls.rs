@@ -60,6 +60,7 @@ pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx) -> I64 {
         performed: c.performed.len(),
     };
     c.cost_marks.push(mark);
+    c.rearm_recording();
     I64(c.cost_marks.len() as i64 - 1)
 }
 
@@ -84,6 +85,7 @@ pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
     };
     let (at, m) = m;
     c.cost_marks.truncate(at);
+    c.rearm_recording();
     let spent = c.cost().minus(m.cost);
     let live = c.live() as i64 - m.live;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();

@@ -40,14 +40,16 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToB
                                  Calls, Worded, refuse, fresh, bound_as, done, emitted, opened,
                                  static_added, nested, unnested, with_lambda, started, filed,
                                  unfiled, read_taken, type_of, handed, read_noted, read_note,
-                                 capture_note, frame_entered, taken_as, noted)
+                                 capture_note, frame_entered, taken_as, noted, none_held,
+                                 held_count, held_args, held_words, held_instance)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin)
-import compiler.emit.lower.crossing (metered)
+import compiler.emit.lower.crossing (metered, pending_raised)
 import compiler.emit.lower.evidence (Handed, Handing, handed_to, evidenced, handing, value_handing,
                                      filed_words, labels_held, left_labels, label_value, words_read,
-                                     described, words_handed, label_codes, rows_static, root_opened)
-import compiler.emit.evidence (Own, evidence_type, words_carried)
+                                     described, words_handed, label_codes, rows_static, root_opened,
+                                     handed_param_types)
+import compiler.emit.evidence (Own, evidence_type, words_carried, words_apart, words_laid_type)
 
 /// The context root `r` of `setting`, a definition of its own, lowers `body` under: holding no word
 /// until its parameters are made (`root_opened`), each label parameter in its slot.
@@ -86,6 +88,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     label_names: r.params.drop(r.params.len() - h.labels).map(|p: EmitParam| p.name),
     label_values: [],
     handed: [],
+    instance: None,
   });
   { ..cx, tails: Restarts(walked_as(cx)) }
 }
@@ -313,6 +316,7 @@ pub fn global(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered / {ab
             Some(d) -> handing(cx, st, d.def, at, []).wanted,
             None -> [],
           },
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, at);
         let params = range(0, frame.params).fold([], |acc: List<Arg>, j: Int|
@@ -364,6 +368,7 @@ pub fn resumption_closed(
           body: { node: NVar({ name: b"resume", slot: Some(n) }), span: at },
           ty: Some(t),
           words: [],
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, at);
         let resumed_by = match o.st.env.get(n) {
@@ -1217,6 +1222,8 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
           match s.params.at(s.captures + j) { Some(p) -> m.insert(j, AVar(p)), None -> m }),
       };
       let read = words_read(given, s.params.drop(s.captures + s.own), frame.words, at);
+      let left = left_labels(frame.words);
+      let holding = s.params.drop(frame.captures.len() + left.len()).take(held_count(frame.held));
       {
         cx: {
           ..cx,
@@ -1228,12 +1235,13 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
           param_at: Map::new(),
           frame: at,
           captured: frame.captures.map(|c: Capture| c.dst),
-          words: read.words,
+          words: held_words(frame.held, holding).concat(read.words),
           label_values: labels_held(
             cx,
-            left_labels(frame.words),
-            s.params.drop(frame.captures.len()).take(s.captures - frame.captures.len()).map(AVar),
+            left,
+            s.params.drop(frame.captures.len()).take(left.len()).map(AVar),
           ),
+          instance: held_instance(frame.held, holding),
         },
         st: read.st,
       }
@@ -1292,8 +1300,21 @@ pub fn closure(
         links: no_links(),
         statics: [],
       };
-      let after = unnested(outer, answered.st);
+      let unraised = unnested(outer, answered.st);
       let left = left_labels(frame.words);
+      // A function holding the word for `abort` raises through it what the runtime left pending.
+      let raising = match range(0, frame.held.words.len()).find(|j: Int|
+          match frame.held.words.at(j) {
+            Some(w) -> w.evidence.effect == b"abort" && !w.through,
+            None -> false,
+          }) {
+        None -> { st: unraised, pending: None },
+        Some(j) -> match s.params.at(frame.captures.len() + left.len() + j) {
+          Some(v) -> pending_raised(cx, unraised, v),
+          None -> { st: unraised, pending: None },
+        },
+      };
+      let after = raising.st;
       let own = if frame.words.len() == 0 { { st: after, name: b"" } }
       else { static_added(after, described(frame.words.map(|o: Own| o.evidence))) };
       // `lambda_opened` reserved place `nth` for this closure.
@@ -1302,7 +1323,7 @@ pub fn closure(
         lambdas: own.st.lambdas.set(
           nth,
           Closure({
-            body: body,
+            body: { ..body, links: { ..body.links, pending: raising.pending } },
             captures: s.captures,
             at: at,
             words: {
@@ -1346,7 +1367,9 @@ pub fn closure(
         RWord,
         Make({
           made: MClosure({ nth: nth, captures: s.captures, params: s.own }),
-          args: caps.args.concat(left.map(|p: Int| label_value(cx, p))),
+          args: caps.args.concat(left.map(|p: Int| label_value(cx, p))).concat(
+            held_args(frame.held),
+          ),
           reuse: None,
         }),
         at,
@@ -1484,14 +1507,17 @@ fn member_params(members: List<GroupMember>) -> List<List<Var>> / {abort.raise} 
     { next: 1, out: [] },
     |acc: { next: Int, out: List<List<Var>> }, m: GroupMember| {
       let reps = convention(m.cx).reps;
+      let declared = m.cx.params.len();
+      let handed_types = handed_param_types(handed_to(m.cx.setting, m.cx.key));
       {
         next: acc.next + reps.len(),
         out: acc.out.push(
           range(0, reps.len()).map(|j: Int|
             {
               id: acc.next + j,
-              ty: if j >= m.cx.params.len() { evidence_type() }
-              else { match m.cx.types.at(j) { Some(t) -> t, None -> unknown_type() } },
+              ty: if j >= declared {
+                match handed_types.at(j - declared) { Some(t) -> t, None -> evidence_type() }
+              } else { match m.cx.types.at(j) { Some(t) -> t, None -> unknown_type() } },
               rep: match reps.at(j) { Some(r) -> r, None -> RWord },
             }),
         ),
@@ -1557,15 +1583,20 @@ fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Option<Sha
       });
       let labelled = range(0, left_labels(frame.words).len()).map(|i: Int|
         { id: n + i, ty: int_type(), rep: RInt });
-      let first = n + labelled.len();
+      let kept = held_count(frame.held);
+      let holding = range(0, kept).map(|i: Int|
+        { id: n + labelled.len() + i, ty: evidence_type(), rep: RImm });
+      let first = n + labelled.len() + kept;
       let own = f.params.fold([], |acc: List<Var>, t: Type| {
         let j = acc.len();
         acc.push(if continued(j) { { id: first + j, ty: resumption(t), rep: RWord } }
         else { { id: first + j, ty: t, rep: held_as(cx.setting, t) } })
       });
+      let laid = if frame.words.len() > words_apart() { words_laid_type() }
+      else { evidence_type() };
       let words = range(0, words_carried(frame.words.len())).map(|i: Int|
-        { id: first + own.len() + i, ty: evidence_type(), rep: RImm });
-      let params = caps.concat(labelled).concat(own).concat(words);
+        { id: first + own.len() + i, ty: laid, rep: RImm });
+      let params = caps.concat(labelled).concat(holding).concat(own).concat(words);
       Some({
         params: params,
         conv: {

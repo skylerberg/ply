@@ -26,6 +26,15 @@ pub const FAILED_CANCELLED: i64 = 7;
 /// A raise: `Ctx::aborting` names the `handle` whose clause answers it.
 pub const FAILED_ABORT: i64 = 8;
 
+/// A clause unwinds to the `handle` instance `Ctx::target` names, whose landing reads what the clause
+/// left in it.
+pub const FAILED_TARGET: i64 = 9;
+
+/// An `abort.raise` no frame answers, which `Ctx::pending` keeps for the emitted code that holds the
+/// word answering it: [`rt_pending_raised`] hands it over. One never handed over fails the entry with
+/// the diagnostic it keeps.
+pub const FAILED_PENDING: i64 = 10;
+
 /// The mode a compiled `perform` of a `raise` operation passes, beside 0 for a read and 1 for a
 /// write.
 pub(super) const MODE_RAISE: i64 = 2;

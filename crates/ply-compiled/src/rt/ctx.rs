@@ -36,6 +36,19 @@ pub struct Ctx {
     pub release_depth: i64,
     /// How many releases wait in the context's buffer for the outermost drop root to drain them.
     pub release_waiting: i64,
+    /// The `handle` instance a [`FAILED_TARGET`] failure unwinds to, which its landing compares
+    /// with its own. Compiled code reads and writes it, as it does the three below.
+    pub target: Word,
+    /// The row descriptor and words the next closure the runtime calls is handed by its uniform
+    /// entry, which takes them and sets both to 0; 0 for none, which hands it the frame bridge.
+    pub entering_desc: Word,
+    pub entering_words: Word,
+    /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
+    /// test reads what its entries performed, a cost mark is open or a region runs.
+    pub recording: i64,
+    /// The evidence object of every effect that hands each operation to the frame protocol
+    /// ([`BRIDGE`]), for code that holds no word answering one.
+    pub bridge: Word,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -96,6 +109,10 @@ pub struct Ctx {
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
     pub(crate) aborting: Option<Aborting>,
+    /// The message of the raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
+    pub(crate) pending: Option<String>,
+    /// Whether whoever runs this context's entries reads what they performed.
+    pub(crate) traced: bool,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     pub(super) resumed: Option<Word>,
     /// How many `handle`s this context has installed, which names the next one's frame.
@@ -115,6 +132,13 @@ pub struct Ctx {
     pub(crate) taken: Vec<u8>,
     /// The context running on this thread when this one's entry began, put back when it ends.
     pub(super) outer_running: *mut Ctx,
+}
+
+/// How a `parallel` branch failed, as its parent fails in turn.
+pub(crate) struct BranchFailure {
+    code: i64,
+    diagnostic: Option<Diagnostic>,
+    pending: Option<String>,
 }
 
 thread_local! {
@@ -159,6 +183,11 @@ impl Ctx {
             frames: std::ptr::null_mut(),
             release_depth: 0,
             release_waiting: 0,
+            target: 0,
+            entering_desc: 0,
+            entering_words: 0,
+            recording: 0,
+            bridge: bridge_word(),
             step_budget: 0,
             grown: 0,
             deadline: None,
@@ -194,6 +223,8 @@ impl Ctx {
             entered_sims: 0,
             unwind: None,
             aborting: None,
+            pending: None,
+            traced: false,
             resumed: None,
             handlers_made: 0,
             holds_made: 0,
@@ -284,7 +315,22 @@ impl Ctx {
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
         b.stacks[0].list = self.crossing_frames();
+        // What a branch performed is this entry's, read wherever this entry's is.
+        b.traced = self.recording != 0;
+        b.rearm_recording();
         b
+    }
+
+    /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now.
+    pub(crate) fn rearm_recording(&mut self) {
+        self.recording =
+            i64::from(self.traced || !self.cost_marks.is_empty() || !self.sims.is_empty());
+    }
+
+    /// Whoever runs this context's entries reads what they perform, or stops reading it.
+    pub fn trace_performs(&mut self, traced: bool) {
+        self.traced = traced;
+        self.rearm_recording();
     }
 
     /// The frames in reach of the running stack, outermost first, each with whether its clauses
@@ -359,12 +405,13 @@ impl Ctx {
     }
 
     /// Fails this entry as one of its `parallel` branches failed.
-    pub(crate) fn fail_from_branch(&mut self, code: i64, diagnostic: Option<Diagnostic>) {
+    pub(crate) fn fail_from_branch(&mut self, f: BranchFailure) {
         if self.failed == 0 {
-            self.failed = code;
+            self.failed = f.code;
+            self.pending = f.pending;
         }
         if self.diagnostic.is_none() {
-            self.diagnostic = diagnostic;
+            self.diagnostic = f.diagnostic;
         }
     }
 
@@ -413,9 +460,14 @@ impl Ctx {
         self.holds_made = 0;
         self.unwind = None;
         self.aborting = None;
+        self.pending = None;
         self.resumed = None;
         self.release_depth = 0;
         self.release_waiting = 0;
+        self.target = 0;
+        self.entering_desc = 0;
+        self.entering_words = 0;
+        self.rearm_recording();
         self.release_later.clear();
         self.crossings.clear();
         self.taken.clear();
@@ -632,7 +684,7 @@ impl Ctx {
             return 0;
         }
         let Some(at) = self.raise_handler("abort", "raise") else {
-            return self.fail(d);
+            return self.pend(d, message);
         };
         let (stack, depth, clause) = at;
         let clause = &self.stacks[stack].list[depth].clauses[clause];
@@ -650,6 +702,16 @@ impl Ctx {
         };
         let args = Raised(vec![unsafe { Carried::new(w, ty) }]);
         self.bind_raise(at, args, d)
+    }
+
+    /// Leaves `abort.raise` of `message`, which no frame answers, pending for the compiled code
+    /// holding the word that does; `d` is what the entry fails with should none take it.
+    pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
+        if self.failed != 0 {
+            return 0;
+        }
+        self.pending = Some(message);
+        self.fail_with(FAILED_PENDING, d)
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
@@ -697,14 +759,23 @@ impl Ctx {
         }
     }
 
-    /// How a finished branch failed, a raise bound past it as the failure it carries.
-    pub(crate) fn take_branch_failure(&mut self) -> Option<(i64, Option<Diagnostic>)> {
+    /// How a finished branch failed, a raise bound past it as the failure it carries; one pending
+    /// is carried on pending.
+    pub(crate) fn take_branch_failure(&mut self) -> Option<BranchFailure> {
         if self.failed == 0 {
             return None;
         }
         Some(match self.aborting.take() {
-            Some(a) if self.failed == FAILED_ABORT => (1, Some(a.into_failure())),
-            _ => (self.failed, self.diagnostic.take()),
+            Some(a) if self.failed == FAILED_ABORT => BranchFailure {
+                code: FAILED,
+                diagnostic: Some(a.into_failure()),
+                pending: None,
+            },
+            _ => BranchFailure {
+                code: self.failed,
+                diagnostic: self.diagnostic.take(),
+                pending: self.pending.take(),
+            },
         })
     }
 

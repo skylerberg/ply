@@ -8,21 +8,83 @@ import std.bytes (ascii_of_int)
 import compiler.emit.pieces (Piece, Text, Hole, BuiltinAt)
 import compiler.emit.tir (Var, Arg, Uses, Handling)
 import compiler.emit.tir.handling (HandleOp, Perform, Label, Parallel, Simulate, Encoded, Unsettled,
-                                   WordsLaid, WordAt, Clause, HandleSite, Reached)
+                                   WordsLaid, WordAt, Bridge, Instance, ObjectLaid, VarInit,
+                                   VarRead, VarWrite, Entering, Slot, Answering, Forwarding, Entry,
+                                   Answers, Resumes, Raises, Clause, HandleSite, HandleInstance,
+                                   Reached, raised_at)
 import compiler.emit.print.text (Printing, Place, line, pad, temp, named, name_of, arg_text,
                                  assigned, site, check, field_hole, interned, unprinted)
 import compiler.emit.print.made (c_type)
 import compiler.emit.layout (header_bytes)
 
 /// What opens `Handle` `label` laying out `site` over `args`. In place: its answer declared, its
-/// clauses' table, the frame pushed, and the block its body runs in. Detached: the whole handle,
-/// its answer into `answer`.
+/// clauses' table, the frame pushed, and the block its body runs in; over an instance, the instance
+/// set up instead of a frame. Detached: the whole handle, its answer into `answer`.
 pub fn handle_opened(
   p: Place,
   pr: Printing,
   label: Int,
   args: List<Arg>,
   uses: Uses,
+  site: HandleSite,
+  answer: Var,
+) -> Printing =
+  match site.instance {
+    Some(i) -> instance_opened(p, pr, args, site, i, answer),
+    None -> framed_opened(p, pr, label, args, site, answer),
+  }
+
+/// What opens a `handle` that answers through evidence objects over instance `i`: its answer
+/// declared, the fuel it stands at and each clause's record set in the instance, and the block its
+/// body runs in.
+fn instance_opened(
+  p: Place,
+  pr: Printing,
+  args: List<Arg>,
+  site: HandleSite,
+  i: HandleInstance,
+  answer: Var,
+) -> Printing = {
+  let a = named(
+    {
+      ..pr,
+      handles: pr.handles.concat(
+        site.clauses.map(|c: Clause| Bytes::concat_all([c.effect, b"#", c.op])),
+      ),
+    },
+    answer,
+  );
+  let inst = |at: Int| instance_word(pr, args, at);
+  let set = |q: Printing, lhs: Bytes, rhs: Bytes|
+    line(q, p.depth, Bytes::concat_all([lhs, b" = ", rhs, b";"]));
+  let fueled = set(
+    line(a.pr, p.depth, Bytes::concat_all([c_type(answer.rep), b" ", a.name, b" = 0;"])),
+    inst(0),
+    b"ctx->fuel",
+  );
+  let recorded = range(0, site.clauses.len()).fold(fueled, |q: Printing, k: Int|
+    match ((site.clauses.at(k), i.records.at(k))) {
+      (Some(c), Some(at)) ->
+        set(
+          set(
+            set(q, inst(at), operand(pr, args, c.handler)),
+            inst(at + 1),
+            operand(pr, args, i.operand),
+          ),
+          inst(at + 2),
+          ascii_of_int(k),
+        ),
+      _ -> q,
+    });
+  line(recorded, p.depth, b"{")
+}
+
+/// What opens a `handle` the runtime's frames hold, as `handle_opened` says.
+fn framed_opened(
+  p: Place,
+  pr: Printing,
+  label: Int,
+  args: List<Arg>,
   site: HandleSite,
   answer: Var,
 ) -> Printing =
@@ -91,12 +153,14 @@ pub fn handle_closed(
   p: Place,
   pr: Printing,
   label: Int,
+  args: List<Arg>,
   site: HandleSite,
   answer: Var,
 ) -> Printing =
-  match site.detached {
-    Some(_) -> pr,
-    None -> {
+  match ((site.instance, site.detached)) {
+    (Some(i), _) -> instance_landed(p, pr, label, args, site, i, answer),
+    (None, Some(_)) -> pr,
+    (None, None) -> {
       let landed = line(
         line(pr, p.depth, b"}"),
         p.depth,
@@ -120,6 +184,126 @@ pub fn handle_closed(
       )
     },
   }
+
+/// What closes `Handle` `label` answering through evidence objects over instance `i`: the body's
+/// block, then its landing. An unwind to this instance answers what its clause left, or runs the
+/// raise clause it names on the arguments it left; a raise pending where an `abort.raise` clause
+/// is runs that clause on its message; a body that answered goes through the return clause. Then
+/// the variables are let go by their types, and any other failure leaves by `p.leave`.
+fn instance_landed(
+  p: Place,
+  pr: Printing,
+  label: Int,
+  args: List<Arg>,
+  site: HandleSite,
+  i: HandleInstance,
+  answer: Var,
+) -> Printing = {
+  let d = p.depth;
+  let inst = |at: Int| instance_word(pr, args, at);
+  let ans = name_of(pr, answer);
+  let landed = line(
+    line(pr, d, b"}"),
+    d,
+    Bytes::concat_all([b"ply_h", ascii_of_int(label), b": ;"]),
+  );
+  let raises = range(0, site.clauses.len()).fold([], |acc: List<Bytes>, k: Int|
+    match site.clauses.at(k) {
+      Some(c) -> if c.mode != 3 { acc } else {
+        acc.push(
+          Bytes::concat_all([
+            b"  else if (",
+            inst(1),
+            b" == ",
+            ascii_of_int(k),
+            b") ",
+            ans,
+            b" = ply_uniform(ctx, ",
+            operand(pr, args, c.handler),
+            b", &",
+            inst(raised_at()),
+            b");",
+          ]),
+        )
+      },
+      None -> acc,
+    });
+  let unwound = Bytes::concat_all([
+    b"if (ctx->failed == PLY_FAILED_TARGET && ctx->target == ",
+    operand(pr, args, i.operand),
+    b") {\n",
+    pad(d + 1),
+    b"ctx->failed = 0; ctx->fuel = ",
+    inst(0),
+    b";\n",
+    pad(d + 1),
+    b"if (",
+    inst(1),
+    b" == -1) ",
+    ans,
+    b" = ",
+    inst(2),
+    b";\n",
+    Bytes::concat_all(raises.map(|r: Bytes| Bytes::concat_all([pad(d), r, b"\n"]))),
+    pad(d),
+    b"}",
+  ]);
+  let pending = match i.pending {
+    None -> b"",
+    Some(k) -> match site.clauses.at(k) {
+      Some(c) ->
+        Bytes::concat_all([
+          b" else if (ctx->failed == PLY_FAILED_PENDING) {\n",
+          pad(d + 1),
+          b"Word m[2] = { rt_pending_raised_p(ctx, ",
+          match c.string { Some(s) -> operand(pr, args, s), None -> b"0" },
+          b"), 0 };\n",
+          pad(d + 1),
+          b"if (!ctx->failed) ",
+          ans,
+          b" = ply_uniform(ctx, ",
+          operand(pr, args, c.handler),
+          b", m);\n",
+          pad(d),
+          b"}",
+        ]),
+      None -> b"",
+    },
+  };
+  let returned = match site.ret {
+    None -> b"",
+    Some(r) ->
+      Bytes::concat_all([
+        b" else if (!ctx->failed) ",
+        ans,
+        b" = ply_uniform(ctx, ",
+        operand(pr, args, r),
+        b", &",
+        ans,
+        b");",
+      ]),
+  };
+  let released = range(0, i.count).fold(
+    line(landed, d, Bytes::concat_all([unwound, pending, returned])),
+    |q: Printing, j: Int| {
+      let at = i.vars + 2 * j;
+      line(
+        q,
+        d,
+        Bytes::concat_all([
+          b"if (",
+          inst(at + 1),
+          b") ((const PlyType *)(intptr_t)",
+          inst(at + 1),
+          b")->dec(ctx, ",
+          inst(at),
+          b");",
+        ]),
+      )
+    },
+  );
+  check(p, released)
+}
 
 /// Operation `op` on effects over `args`, its answer into `into`.
 pub fn effect_op(
@@ -222,6 +406,148 @@ pub fn effect_op(
         )
       },
     },
+    Bridge -> word_set(p, pr, into, b"ctx->bridge"),
+    Entering ->
+      line(
+        pr,
+        p.depth,
+        Bytes::concat_all([
+          b"ctx->entering_desc = ",
+          operand(pr, args, 0),
+          b"; ctx->entering_words = ",
+          operand(pr, args, 1),
+          b";",
+        ]),
+      ),
+    Instance(n) -> laid_set(p, pr, into, ascii_of_int(n), [b"0"]),
+    ObjectLaid(slots) ->
+      laid_set(
+        p,
+        pr,
+        into,
+        ascii_of_int(1 + 2 * slots.len()),
+        [b"0"].concat(
+          slots.fold([], |acc: List<Bytes>, s: Slot|
+            match s {
+              Answering(a) ->
+                acc.push(Bytes::concat_all([b"(Word)(intptr_t)&", entry_fn(a.entry)])).push(
+                  Bytes::concat_all([
+                    b"(Word)(intptr_t)((Word *)(intptr_t)",
+                    operand(pr, args, 0),
+                    b" + ",
+                    ascii_of_int(a.record),
+                    b")",
+                  ]),
+                ),
+              Forwarding(f) -> {
+                let from = |k: Int|
+                  Bytes::concat_all([
+                    b"((const Word *)(intptr_t)",
+                    operand(pr, args, f.operand),
+                    b")[",
+                    ascii_of_int(k),
+                    b"]",
+                  ]);
+                acc.push(from(1 + 2 * f.op)).push(from(2 + 2 * f.op))
+              },
+            }),
+        ),
+      ),
+    VarInit(at) ->
+      line(
+        line(
+          pr,
+          p.depth,
+          Bytes::concat_all([instance_word(pr, args, at), b" = ", operand(pr, args, 1), b";"]),
+        ),
+        p.depth,
+        Bytes::concat_all([instance_word(pr, args, at + 1), b" = ", operand(pr, args, 2), b";"]),
+      ),
+    VarRead(at) -> match into {
+      None -> pr,
+      Some(v) -> {
+        let n = named(pr, v);
+        line(
+          n.pr,
+          p.depth,
+          Bytes::concat_all([
+            b"Word ",
+            n.name,
+            b" = ",
+            instance_word(pr, args, at),
+            b"; ((const PlyType *)(intptr_t)",
+            instance_word(pr, args, at + 1),
+            b")->inc(ctx, ",
+            n.name,
+            b");",
+          ]),
+        )
+      },
+    },
+    VarWrite(at) ->
+      line(
+        pr,
+        p.depth,
+        Bytes::concat_all([
+          b"((const PlyType *)(intptr_t)",
+          instance_word(pr, args, at + 1),
+          b")->dec(ctx, ",
+          instance_word(pr, args, at),
+          b"); ",
+          instance_word(pr, args, at),
+          b" = ",
+          operand(pr, args, 1),
+          b";",
+        ]),
+      ),
+  }
+
+/// Word `at` of the instance `args` hands first, as C that reads or sets it.
+fn instance_word(pr: Printing, args: List<Arg>, at: Int) -> Bytes =
+  Bytes::concat_all([b"((Word *)(intptr_t)", operand(pr, args, 0), b")[", ascii_of_int(at), b"]"])
+
+/// The head's function a clause's slot enters it through.
+pub fn entry_fn(e: Entry) -> Bytes =
+  match e { Answers -> b"ply_answers", Resumes -> b"ply_resumes", Raises -> b"ply_raises" }
+
+/// `into` declared a word set to the C `value`.
+fn word_set(p: Place, pr: Printing, into: Option<Var>, value: Bytes) -> Printing =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let n = named(pr, v);
+      line(n.pr, p.depth, Bytes::concat_all([b"Word ", n.name, b" = ", value, b";"]))
+    },
+  }
+
+/// An array of `count` words laid in the frame, `words` its first, the rest zero, and `into` its
+/// address.
+fn laid_set(
+  p: Place,
+  pr: Printing,
+  into: Option<Var>,
+  count: Bytes,
+  words: List<Bytes>,
+) -> Printing =
+  match into {
+    None -> pr,
+    Some(v) -> {
+      let arr = temp(pr);
+      let laid = line(
+        arr.pr,
+        p.depth,
+        Bytes::concat_all([
+          b"Word ",
+          arr.name,
+          b"[",
+          count,
+          b"] = {",
+          Bytes::join(words, b", "),
+          b"};",
+        ]),
+      );
+      word_set(p, laid, into, b"(Word)(intptr_t)".concat(arr.name))
+    },
   }
 
 /// The key a handle's depth is named under among the printing's names, apart from every variable's.
@@ -284,16 +610,17 @@ fn table(
 fn returned(site: HandleSite, args: List<Arg>, pr: Printing) -> Bytes =
   match site.ret { Some(i) -> operand(pr, args, i), None -> b"0" }
 
-/// A perform: its words in an array, then the runtime's dispatch to the handler of the operation its
-/// `op#` describes, which reads the operation's types from it.
+/// A perform: its words in an array with a word to spare past them, which an entry resuming in its
+/// tail hands its continuation in, then the entry of the operation in the evidence object, which
+/// reads the operation's types from its `op#`.
 fn performed(
   p: Place,
   pr: Printing,
   into: Option<Var>,
-  x: { effect: Bytes, op: Bytes, resource: Bytes, labelled: Bool, mode: Int, described: Bytes },
+  x: { effect: Bytes, op: Bytes, index: Int, resource: Bytes, labelled: Bool, mode: Int, described: Bytes },
   args: List<Arg>,
 ) -> Printing = {
-  let words = if x.labelled { args.drop(1) } else { args };
+  let words = if x.labelled { args.drop(2) } else { args.drop(1) };
   let arr = temp(pr);
   let held = line(
     arr.pr,
@@ -302,7 +629,7 @@ fn performed(
       b"Word ",
       arr.name,
       b"[] = {",
-      if words.len() == 0 { b"0" } else { Bytes::join(words.map(|a: Arg| arg_text(pr, a)), b", ") },
+      Bytes::join(words.map(|a: Arg| arg_text(pr, a)).push(b"0"), b", "),
       b"};",
     ]),
   );
@@ -310,15 +637,27 @@ fn performed(
     ..held,
     performs: held.performs.push(Bytes::concat_all([x.effect, b"#", x.op])),
   });
-  let res = if x.labelled { { pr: sited, piece: Text(operand(pr, args, 0)) } }
+  let res = if x.labelled { { pr: sited, piece: Text(operand(pr, args, 1)) } }
   else if x.resource == b"" { { pr: sited, piece: Text(b"-1") } }
   else { field_hole(sited, x.resource) };
   check(
     p,
     answered(res.pr, p.depth, into, [
-      Text(Bytes::concat_all([b"rt_dispatch_p(ctx, (Word)(intptr_t)&", x.described, b", "])),
+      Text(
+        Bytes::concat_all([
+          b"ply_perform(ctx, ",
+          operand(pr, args, 0),
+          b", ",
+          ascii_of_int(x.index),
+          b", (Word)(intptr_t)&",
+          x.described,
+          b", ",
+          ascii_of_int(x.mode),
+          b", ",
+        ]),
+      ),
       res.piece,
-      Text(Bytes::concat_all([b", ", ascii_of_int(x.mode), b", (Word)(intptr_t)", arr.name, b")"])),
+      Text(Bytes::concat_all([b", (Word)(intptr_t)", arr.name, b")"])),
     ]),
   )
 }

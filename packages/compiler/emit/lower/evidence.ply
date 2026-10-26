@@ -8,7 +8,7 @@
 
 import compiler.syntax.parsing (Span)
 import compiler.check.types (Type, TyCon, Row, Atom, Resource, RNamed, RSingleton, RVar, RAny,
-                             Scheme)
+                             Scheme, int_type)
 import compiler.check.infer.checker (RowArguments, Performs, PerformsAtom)
 import compiler.emit.typing (Filings, rows_filed_at)
 import compiler.emit.code (Code, NLabel, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
@@ -18,11 +18,11 @@ import compiler.emit.code (Code, NLabel, NVar, NUnary, NBinary, NApp, NIf, NBloc
 import compiler.emit.keys (RootKey, Evidence, key_rows, unspecialised)
 import compiler.emit.evidence (Own, Keyed, row_words, written_row, opened, labels_handed, keyed,
                                key_rows_of, covers, answered, ordered, evidence_type, words_apart,
-                               words_carried)
+                               words_carried, words_laid_type, words_laid_of, row_described_type)
 import compiler.emit.reps (Def)
 import compiler.emit.tir (Rep, RInt, RImm, Var, Arg, AVar, AInt, AZero, Op, OHandle, Static,
                           Convention, Lent, Uses)
-import compiler.emit.tir.handling (WordsLaid, WordAt)
+import compiler.emit.tir.handling (WordsLaid, WordAt, Bridge)
 import compiler.emit.tir.statics (StaticLaid, StaticWord, SPlain, WRaw, WField)
 import compiler.emit.lower.setting (Setting)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Worded, bound_as, static_added)
@@ -58,6 +58,13 @@ pub fn evidenced(c: Convention, hidden: Int, words: Int) -> Convention = {
   );
   { ..c, params: c.params.concat(more.map(|_: Rep| Lent)), reps: c.reps.concat(more) }
 }
+
+/// The types of what a root handed `h` takes past its parameters: each label an `Int`, then each
+/// word, or the one array of them.
+pub fn handed_param_types(h: Handed) -> List<Type> =
+  range(0, h.hidden).map(|_: Int| int_type()).concat(if h.own.len() <= words_apart() {
+    h.own.map(|_: Own| evidence_type())
+  } else { [words_laid_of(h.own.len())] })
 
 /// The state a root's body starts in, handed `h` past its `declared` parameters, which `params`
 /// hold in order beside those `h` adds: each word the root holds and each label's value, its label
@@ -297,16 +304,33 @@ pub fn handing(
 
 /// The arguments a call handing `h` passes past its callee's parameters, made after `st`: the
 /// labels, then the words, or an array of them where there are more than `words_apart`.
-pub fn words_handed(st: Lowering, h: Handing, at: Span) -> { st: Lowering, args: List<Arg> } =
-  if h.words.len() <= words_apart() { { st: st, args: h.labels.concat(h.words) } } else {
+pub fn words_handed(st: Lowering, h: Handing, at: Span) -> { st: Lowering, args: List<Arg> } = {
+  let words = bridged(st, h.words, at);
+  if words.args.len() <= words_apart() { { st: words.st, args: h.labels.concat(words.args) } }
+  else {
     let laid = bound_as(
-      st,
-      evidence_type(),
+      words.st,
+      words_laid_type(),
       RImm,
-      Op({ op: OHandle(WordsLaid), args: h.words, uses: reads(h.words.len()) }),
+      Op({ op: OHandle(WordsLaid), args: words.args, uses: reads(words.args.len()) }),
       at,
     );
     { st: laid.st, args: h.labels.push(laid.arg) }
+  }
+}
+
+/// `words` with each that no word the body holds answers, `routed`'s zero, made the frame bridge,
+/// which hands what it is performed to the runtime's frames.
+pub fn bridged(st: Lowering, words: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
+  if !words.contains(AZero(RImm)) { { st: st, args: words } } else {
+    let b = bound_as(
+      st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(Bridge), args: [], uses: reads(0) }),
+      at,
+    );
+    { st: b.st, args: words.map(|w: Arg| if w == AZero(RImm) { b.arg } else { w }) }
   }
 
 /// The label arguments a call of `d` writing `codes` fills its label parameters with: its last.
@@ -318,21 +342,23 @@ pub fn label_codes(d: Def, codes: List<Code>) -> List<Code> =
 /// caller's; any other resource as it is. A label filled by something else answers to no word.
 fn filled_label(cx: Context, labels: List<Code>, r: Resource) -> Resource / {abort.raise} =
   match r {
-    RVar(q) -> match labels.at(q) {
-      Some(c) -> match c.node {
-        NLabel(n) -> RNamed(n),
-        NVar(v) -> if !is_label_binder(v.name) { unfilled() } else {
-          let name = v.name.slice(1, v.name.len() - 1);
-          match range(0, cx.label_names.len()).find(|i: Int| cx.label_names.at(i) == Some(name)) {
-            Some(p) -> RVar(p),
-            None -> unfilled(),
-          }
-        },
-        _ -> unfilled(),
-      },
-      None -> unfilled(),
-    },
+    RVar(q) -> match labels.at(q) { Some(c) -> label_resource(cx, c), None -> unfilled() },
     _ -> r,
+  }
+
+/// The resource a label written as `c` names: one named where it is written, or a label parameter
+/// of the root's numbering; a label made otherwise answers to no word.
+pub fn label_resource(cx: Context, c: Code) -> Resource / {abort.raise} =
+  match c.node {
+    NLabel(n) -> RNamed(n),
+    NVar(v) -> if !is_label_binder(v.name) { unfilled() } else {
+      let name = v.name.slice(1, v.name.len() - 1);
+      match range(0, cx.label_names.len()).find(|i: Int| cx.label_names.at(i) == Some(name)) {
+        Some(p) -> RVar(p),
+        None -> unfilled(),
+      }
+    },
+    _ -> unfilled(),
   }
 
 fn unfilled() -> Resource = RNamed(b"?")
@@ -347,16 +373,16 @@ pub fn value_handing(
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } / {abort.raise} = {
   let wanted = row_words(row, cx.rows, cx.labels);
-  let words = routed(cx, wanted);
+  let words = bridged(st, routed(cx, wanted), at);
   let left = wanted.fold([], |acc: List<Arg>, o: Own|
     match o.evidence.resource { RVar(p) -> acc.push(label_value(cx, p)), _ -> acc });
-  let d = static_added(st, described(wanted.map(|o: Own| o.evidence)));
-  let desc = bound_as(d.st, evidence_type(), RImm, Static(d.name), at);
-  let all = words.concat(left);
+  let d = static_added(words.st, described(wanted.map(|o: Own| o.evidence)));
+  let desc = bound_as(d.st, row_described_type(), RImm, Static(d.name), at);
+  let all = words.args.concat(left);
   if all.len() == 0 { { st: desc.st, args: [desc.arg, AZero(RImm)] } } else {
     let laid = bound_as(
       desc.st,
-      evidence_type(),
+      words_laid_type(),
       RImm,
       Op({ op: OHandle(WordsLaid), args: all, uses: reads(all.len()) }),
       at,

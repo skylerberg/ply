@@ -20,7 +20,8 @@ import compiler.emit.keys (root_name, root_text, crossing)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef,
                                  ToValue, ToInPlace, Armed, ClauseMade, GroupMember, Opened,
                                  started, refuse, opened, continued, joined, short_circuit, handed,
-                                 read_noted, read_note, read_taken, unviewed, type_of, noted)
+                                 read_noted, read_note, read_taken, unviewed, type_of, noted,
+                                 none_held)
 import compiler.emit.lower.data (constructed, recorded, field, updated)
 import compiler.emit.lower.scalars (literal, constant, operand, unary, binary)
 import compiler.emit.lower.containers (listed, columned, column_read)
@@ -31,8 +32,9 @@ import compiler.emit.lower.calling (convention, params_held, target, global, kno
                                     known_body, step_captured, context_of, called_builtin,
                                     resumption_closed)
 import compiler.emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
-                                     branched, simulated, handle_entered)
-import compiler.emit.lower.evidence (handed_to, root_opened, words_at)
+                                     branched, simulated, handle_entered, handle_planned,
+                                     clause_held)
+import compiler.emit.lower.evidence (handed_to, root_opened, words_at, handed_param_types)
 import compiler.emit.evidence (evidence_type)
 import compiler.emit.answer (Rowed)
 import compiler.emit.statics (folded)
@@ -115,14 +117,16 @@ pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.rais
   let conv = convention(cx);
   let held = params_held(cx);
   let declared = cx.params.len();
+  let h = handed_to(cx.setting, cx.key);
+  let handed_types = handed_param_types(h);
   let params = range(0, conv.reps.len()).map(|i: Int|
     {
       id: i,
-      ty: if i >= declared { evidence_type() }
-      else { match cx.types.at(i) { Some(t) -> t, None -> unknown_type() } },
+      ty: if i >= declared {
+        match handed_types.at(i - declared) { Some(t) -> t, None -> evidence_type() }
+      } else { match cx.types.at(i) { Some(t) -> t, None -> unknown_type() } },
       rep: match held.at(i) { Some(r) -> r, None -> conv.reps.get(i) },
     });
-  let h = handed_to(cx.setting, cx.key);
   let begun = root_opened(cx, started(params), params, declared, h);
   let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: Rowed }) } else { begun.st };
   let out = lowered(begun.cx, start, body, true);
@@ -556,6 +560,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           args.st,
           { effect: p.effect, op: p.op, resource: p.resource },
           lb.arg,
+          p.label,
           args.args,
           c.span,
         )
@@ -570,6 +575,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           body: l.body,
           ty: None,
           words: words_at(cx, l.at),
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, l.at);
         closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
@@ -582,8 +588,9 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           resumes: false,
           body: x.body,
           ty: None,
-          // The runtime runs it, handing it no word.
-          words: [],
+          // The runtime runs it, handing it the words its row takes as the region stands.
+          words: words_at(cx, x.at),
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, x.at);
         let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, Rooted, x.at);
@@ -600,8 +607,9 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
         branched(cx, bs.st, bs.args, pr.rooted, c.span)
       },
       NHandle(h) -> {
+        let plan = handle_planned(cx, st, h, c.span);
         let clauses = h.clauses.fold(
-          { st: st, out: [] },
+          { st: plan.st, out: [] },
           |acc: { st: Lowering, out: List<ClauseMade> }, cl: CodeClause| {
             let lb = match cl.label {
               Some(lc) -> {
@@ -610,30 +618,35 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
               },
               None -> { st: acc.st, arg: None },
             };
-            let frame = clause_frame(cx, cl);
-            let o = lambda_opened(cx, lb.st, frame, cl.at);
-            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at);
+            let held = clause_held(cx, lb.st, plan, cl.at);
+            let frame = clause_frame(cl, held.held);
+            let o = lambda_opened(cx, held.st, frame, cl.at);
+            let k = closure(cx, held.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at);
             { st: k.st, out: acc.out.push({ label: lb.arg, closure: k.arg }) }
           },
         );
         let ret = match h.ret {
           Some(r) -> {
-            let frame = ret_frame(cx, r);
-            let o = lambda_opened(cx, clauses.st, frame, r.at);
-            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at);
+            let held = clause_held(cx, clauses.st, plan, r.at);
+            let frame = ret_frame(r, held.held);
+            let o = lambda_opened(cx, held.st, frame, r.at);
+            let k = closure(cx, held.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at);
             { st: k.st, arg: Some(k.arg) }
           },
           None -> { st: clauses.st, arg: None },
         };
-        let body = match body_frame(cx, h) {
+        let body = match body_frame(cx, h, plan) {
           Some(frame) -> {
             let at = detached_at(c.span);
             let o = lambda_opened(cx, ret.st, frame, at);
             closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, Rooted, at)
           },
-          None -> lowered(handle_entered(cx, h), opened(ret.st), h.body, false),
+          None -> {
+            let e = handle_entered(cx, opened(ret.st), h, plan, c.span);
+            lowered(e.cx, e.st, h.body, false)
+          },
         };
-        handled(cx, ret.st, body, clauses.out, ret.arg, h, c.span)
+        handled(cx, ret.st, body, clauses.out, ret.arg, h, plan, c.span)
       },
     }
   }

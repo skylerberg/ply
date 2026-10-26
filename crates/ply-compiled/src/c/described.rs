@@ -45,7 +45,8 @@ macro_rules! laid {
 fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
     laid!(out, Ctx as "PlyCtx": failed, fuel, stack_floor, site_root, site_start, site_end, ticks,
-        next_tick, frames, release_depth, release_waiting);
+        next_tick, frames, release_depth, release_waiting, target, entering_desc, entering_words,
+        recording, bridge);
     laid!(out, Obj as "PlyObj": rc);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
@@ -59,6 +60,9 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("release_depth", crate::rt::RELEASE_DEPTH as usize),
         ("hold.held", crate::rt::HOLD_HELD),
         ("closure.descriptor", heap::CLOSURE_CODE),
+        ("failed.target", crate::rt::FAILED_TARGET as usize),
+        ("failed.pending", crate::rt::FAILED_PENDING as usize),
+        ("bridge.ops", crate::rt::BRIDGE_OPS),
     ]);
     out
 }

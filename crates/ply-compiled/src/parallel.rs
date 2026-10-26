@@ -98,24 +98,39 @@ fn pool() -> Option<&'static rayon::ThreadPool> {
 /// one that answered after one before it failed its answer, for the code that knows its type.
 pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: bool) {
     let branches = unsafe { std::slice::from_raw_parts_mut(slots, n) };
-    let c = unsafe { &*ctx };
+    let c = unsafe { &mut *ctx };
+    let words = (c.entering_desc, c.entering_words);
+    c.entering_desc = 0;
+    c.entering_words = 0;
     // A thread that waits on a block takes up the pool's other branches meanwhile. A machine
     // entered inside another's branch, as a test a run's lane enters is, would then carry a whole
     // other test on its stack and its clock, so its own blocks run in turn.
     let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
-    let at_once = !nested && allowed;
+    // An object other than the bridge lives on this thread's stack.
+    let at_once = !nested && allowed && bridged_only(c, words);
     match pool() {
         Some(pool) if n >= 2 && at_once && share(ctx, branches) => unsafe {
-            in_parallel(ctx, pool, branches)
+            in_parallel(ctx, pool, branches, words)
         },
-        _ => unsafe { in_order(ctx, branches) },
+        _ => unsafe { in_order(ctx, branches, words) },
     }
 }
 
-/// What the block means: each branch in turn, until one fails.
-unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word]) {
+/// Whether every word of the row whose descriptor and words are `words` is the frame bridge.
+fn bridged_only(c: &Ctx, (desc, words): (Word, Word)) -> bool {
+    if desc == 0 {
+        return true;
+    }
+    let n = unsafe { *(desc as *const Word) };
+    (0..n).all(|i| unsafe { *(words as *const Word).add(i as usize) } == c.bridge)
+}
+
+/// What the block means: each branch in turn, until one fails, each handed the block's `words`.
+unsafe fn in_order(ctx: *mut Ctx, branches: &mut [Word], words: (Word, Word)) {
     for i in 0..branches.len() {
         let closure = branches[i];
+        let c = unsafe { &mut *ctx };
+        (c.entering_desc, c.entering_words) = words;
         let answer = call(ctx, closure);
         let_go(ctx, closure);
         if unsafe { (*ctx).failed } != 0 {
@@ -170,15 +185,24 @@ impl Handed {
     }
 }
 
-unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [Word]) {
+unsafe fn in_parallel(
+    ctx: *mut Ctx,
+    pool: &rayon::ThreadPool,
+    branches: &mut [Word],
+    words: (Word, Word),
+) {
     let parent = unsafe { &mut *ctx };
     parent.pooled = true;
     let mut runs: Vec<Branch> = branches
         .iter()
-        .map(|&closure| Branch {
-            ctx: Box::new(parent.branch()),
-            closure,
-            answer: 0,
+        .map(|&closure| {
+            let mut ctx = Box::new(parent.branch());
+            (ctx.entering_desc, ctx.entering_words) = words;
+            Branch {
+                ctx,
+                closure,
+                answer: 0,
+            }
         })
         .collect();
     pool.in_place_scope(|scope| {
@@ -209,8 +233,8 @@ unsafe fn in_parallel(ctx: *mut Ctx, pool: &rayon::ThreadPool, branches: &mut [W
         if out_of_steps {
             parent.fail_out_of_steps();
             ended = true;
-        } else if let Some((code, diagnostic)) = failure {
-            parent.fail_from_branch(code, diagnostic);
+        } else if let Some(f) = failure {
+            parent.fail_from_branch(f);
             ended = true;
         }
     }

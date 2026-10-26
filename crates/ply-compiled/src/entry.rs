@@ -161,6 +161,8 @@ pub struct Run {
     pub declared: Option<Footprint>,
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
+    /// Whether its usage counts every perform, those its own handlers answer included.
+    pub counted: bool,
 }
 
 impl Run {
@@ -174,6 +176,7 @@ impl Run {
             re_executed: false,
             declared: None,
             measure: false,
+            counted: false,
         }
     }
 }
@@ -201,7 +204,8 @@ pub struct Usage {
     pub host: bool,
     /// Calls the entry made.
     pub steps: u64,
-    /// The operations it performed, handled ones included.
+    /// The operations it performed: every one where the run counted them, else those a handler
+    /// the runtime keeps answered.
     pub performs: u64,
     pub held: Held,
     pub updates: u64,
@@ -273,6 +277,7 @@ pub fn enter(
     };
     ctx.declared = run.declared.clone();
     ctx.re_executed = run.re_executed;
+    ctx.trace_performs(run.counted);
     let (seed, steps) = run
         .seed
         .clone()
@@ -770,7 +775,7 @@ struct Asked {
 }
 
 /// `run := int binding, bool hosted, int steps, int timeout_ms, int depth, option(seed),
-/// bool re_executed, option(list(atom)) declared, bool observe, bool measure`.
+/// bool re_executed, option(list(atom)) declared, bool observe, bool measure, bool counted`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
@@ -782,6 +787,7 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let declared = r.option(|r| r.list(read_atom))?;
     let observe = r.bool()?;
     let measure = r.bool()?;
+    let counted = r.bool()?;
     Ok(Asked {
         binding,
         hosted,
@@ -794,6 +800,7 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
             re_executed,
             declared: declared.map(Footprint::from_atoms),
             measure,
+            counted,
         },
     })
 }

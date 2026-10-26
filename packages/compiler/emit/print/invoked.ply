@@ -21,7 +21,7 @@ import compiler.emit.tir (no_closure_words, Rep, RInt, RBool, RNum, RFloat, RDec
                           ClosureWords, Uses, Calling, Return, Rooted, rep_of_arg, made_said,
                           no_links, in_box, applied_typed, laid_made, MFramed)
 import compiler.emit.evidence (evidence_type, is_evidence, declared_arity, words_carried,
-                               words_apart)
+                               words_apart, words_laid_type, words_laid_count, row_described_type)
 import compiler.emit.tir.calling (CallingOp, ConstantRead, Ticked)
 import compiler.emit.tir.statics (StaticWord)
 import compiler.emit.print.statics (word_c)
@@ -759,8 +759,8 @@ pub fn lambda_text(
       let uniform = uniform_entry(taken.pr, name, {
         conv: typed,
         types: c.body.params.drop(c.captures).take(plain.reps.len()).map(|v: Var| v.ty).concat([
-          evidence_type(),
-          evidence_type(),
+          row_described_type(),
+          words_laid_type(),
         ]),
         answer_ty: c.body.answer_ty,
       });
@@ -921,7 +921,7 @@ fn typed_entry(
       array,
       b")[i]; }\n  else { Word l[] = { ",
       if labels.len() == 0 { b"0" } else { Bytes::join(labels, b", ") },
-      b" }; ply_words_mapped(",
+      b" }; ply_words_mapped(ctx, ",
       own,
       b", l, (const Word *)(intptr_t)",
       desc,
@@ -1204,12 +1204,40 @@ fn entry_text(
   e: Entered,
 ) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
   let c = e.conv;
-  // The runtime hands no evidence: each word, and each label beside them, is zero.
+  // What the runtime hands for a row: the words its caller set for a closure, else the bridge,
+  // for a root taking its words as one array an array of it.
+  let row_arg = |t: Type|
+    if t == row_described_type() { { text: [], arg: b"ed" } }
+    else if t == words_laid_type() { { text: [], arg: b"ew" } } else {
+      match words_laid_count(t) {
+        Some(n) ->
+          {
+            text: [
+              Text(
+                Bytes::concat_all([
+                  b"  Word bw[",
+                  ascii_of_int(n),
+                  b"];\n  for (int64_t i = 0; i < ",
+                  ascii_of_int(n),
+                  b"; i++) bw[i] = ctx->bridge;\n",
+                ]),
+              ),
+            ],
+            arg: b"(Word)(intptr_t)bw",
+          },
+        None -> { text: [], arg: b"ctx->bridge" },
+      }
+    };
   let opened = range(0, c.reps.len()).fold(
     { text: [], args: [], values: [] },
     |acc: { text: List<Piece>, args: List<Bytes>, values: List<List<Bytes>> }, j: Int|
-      if e.types.at(j) == Some(evidence_type()) {
-        { ..acc, args: acc.args.push(b"0"), values: acc.values.push([b"0"]) }
+      if match e.types.at(j) { Some(t) -> is_evidence(t), None -> false } {
+        let a = row_arg(e.types.get(j));
+        {
+          text: acc.text.concat(a.text),
+          args: acc.args.push(a.arg),
+          values: acc.values.push([a.arg]),
+        }
       } else {
         let o = entry_opened(j, c.reps.get(j));
         {
@@ -1240,7 +1268,8 @@ fn entry_text(
   let let_go = range(0, c.reps.len()).fold(
     { pr: promoted.pr, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, j: Int|
-      if c.params.at(j) != Some(Lent) || e.types.at(j) == Some(evidence_type()) { acc } else {
+      if c.params.at(j) != Some(Lent)
+          || (match e.types.at(j) { Some(t) -> is_evidence(t), None -> false }) { acc } else {
         let s = released(acc.pr, e.types.get(j), c.reps.get(j), opened.values.get(j));
         {
           pr: s.pr,
@@ -1250,9 +1279,18 @@ fn entry_text(
       },
   );
   let answered = entry_answered(let_go.pr, c.answer, call, promoted.out.concat(let_go.out));
+  let entering = if e.types.contains(row_described_type()) {
+    [
+      Text(
+        b"  Word ed = ctx->entering_desc;\n  Word ew = ctx->entering_words;\n  ctx->entering_desc = 0; ctx->entering_words = 0;\n",
+      ),
+    ]
+  } else { [] };
   {
     pr: answered.pr,
-    out: [Text(head.concat(b" {\n"))].concat(prep).concat(opened.text).concat(answered.out).push(
+    out: [Text(head.concat(b" {\n"))].concat(entering).concat(prep).concat(opened.text).concat(
+      answered.out,
+    ).push(
       Text(b"}\n"),
     ),
   }

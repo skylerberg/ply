@@ -19,22 +19,24 @@ import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Written, Lower, Lift, Dup, Worded, Contained, Root,
                            root_name, root_text, op_name)
 import compiler.emit.pieces (spelled)
-import compiler.emit.tir (Rep, RInt, RWord, RUnit, RAddr, Var, Arg, AVar, AInt, Prim, Pack, Make,
-                          MClosure, Op, OHandle, OContainer, Uses, Inst, Let, Do, Assign, Return,
-                          Handle, Fn, Rooted, Given, Owned, Handling, RFlat, Leaf, Get, Path, PLeaf,
-                          PField, PPayload, Closure, Decl, Native, Call, Val, Handed, Static,
-                          no_links, rep_of_arg)
+import compiler.emit.evidence (evidence_type)
+import compiler.emit.tir (Rep, RInt, RWord, RUnit, RImm, RAddr, Var, Arg, AVar, AInt, Prim, Pack,
+                          Make, MClosure, Op, OHandle, OContainer, Uses, Inst, Let, Do, Assign,
+                          Return, Handle, Fn, Rooted, Given, Owned, Handling, RFlat, Leaf, Get,
+                          Path, PLeaf, PField, PPayload, Closure, Decl, Native, Call, Val, Handed,
+                          Static, no_links, rep_of_arg)
 import compiler.emit.tir
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, Simulate,
-                                   Encoded, Unsettled)
+                                   Encoded, Unsettled, Entering, raised_at)
 import compiler.emit.typing (Typed)
 import compiler.emit.answer (Need, Exact)
 import compiler.emit.lower.setting (Root, prelude_ctor)
 import compiler.emit.lower.held (held_as)
-import compiler.emit.lower.base (Context, Lowering, started, emitted, opened)
+import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, none_held)
 import compiler.emit.lower.calling (context_of)
-import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated)
+import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched, simulated,
+                                     handle_planned)
 import compiler.emit.lower.crossing (crossed, crossing_builtin, encoded_externs, type_described,
                                      worded, op_described, counts_type, holds_function)
 import compiler.emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, WHead, entries_of)
@@ -147,7 +149,7 @@ test "a body with a hole is lowered, the hole the raise it runs as, answering wh
   }
 }
 
-test "a perform hands the runtime its arguments as words and holds what the handler answers as its type" {
+test "a perform hands its operation's entry in the object it holds its arguments as words and holds what it answers as its type" {
   match program_of(performs()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -162,19 +164,22 @@ test "a perform hands the runtime its arguments as words and holds what the hand
                 Perform({
                   effect: b"m.log",
                   op: b"put",
+                  index: 0,
                   resource: b"",
                   labelled: false,
                   mode: 1,
                   described: b"",
                 }),
               );
-              assert_eq((o.uses.takes, o.uses.stops), ([true], true));
+              // The object is the word `note` is handed for `log`, which it only reads.
+              assert_eq((o.uses.takes, o.uses.stops), ([false, true], true));
+              assert_eq(o.args.at(0), f.params.at(1).map(AVar));
               // Its argument is the `Int` handed as its word.
               assert(
                 f.body.any(|i: Inst|
                   match i {
                     Let(l) ->
-                      o.args == [AVar(l.var)] && l.var.rep == RWord
+                      o.args.drop(1) == [AVar(l.var)] && l.var.rep == RWord
                         && l.val == Pack({ arg: AVar(local(0, int, RInt)), to: RWord }),
                     _ -> false,
                   }),
@@ -220,6 +225,7 @@ test "a perform hands the runtime its arguments as words and holds what the hand
           Perform({
             effect: b"m.net",
             op: b"send",
+            index: 0,
             resource: b"conn",
             labelled: false,
             mode: 1,
@@ -234,14 +240,19 @@ test "a perform hands the runtime its arguments as words and holds what the hand
             Perform({
               effect: b"m.net",
               op: b"send",
+              index: 0,
               resource: b"",
               labelled: true,
               mode: 1,
               described: b"",
             }),
           );
-          assert_eq(o.uses.takes, [false, true]);
-          assert_eq(o.args.map(|a: Arg| match a { AVar(v) -> v.rep, _ -> RWord }), [RInt, RWord])
+          assert_eq(o.uses.takes, [false, false, true]);
+          assert_eq(o.args.map(|a: Arg| match a { AVar(v) -> v.rep, _ -> RWord }), [
+            RImm,
+            RInt,
+            RWord,
+          ])
         },
         other -> assert_eq(other.len(), 1),
       };
@@ -254,6 +265,7 @@ test "a perform hands the runtime its arguments as words and holds what the hand
             Perform({
               effect: b"abort",
               op: b"raise",
+              index: 0,
               resource: b"",
               labelled: false,
               mode: 2,
@@ -405,7 +417,7 @@ test "a clause resuming in its tail joins its arms as the word it hands back, ne
   }
 }
 
-test "a handle runs its body in place under its clauses' frame and sets its answer as a word" {
+test "a handle runs its body in place over its instance, which holds its clauses' records, and sets its answer as a word" {
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match handle_at(p, b"guarded") {
@@ -420,15 +432,17 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
           at: place(),
           unwind: [],
         });
-        let outer = emitted({ ..started([n]), next: 2 }, made);
-        let sum = local(2, int, RInt);
+        let plan = handle_planned(g.cx, emitted({ ..started([n]), next: 2 }, made), g.h, place());
+        let outer = { ..plan.st, next: 3 };
+        let instance = match plan.instance { Some(i) -> i.word, None -> AInt(0) };
+        let sum = local(3, int, RInt);
         let add = Let({
           var: sum,
           val: Prim({ op: b"add", on: RInt, args: [AVar(n), AInt(1)] }),
           at: place(),
           unwind: [],
         });
-        let body = { st: { ..emitted(opened(outer), add), next: 3 }, arg: AVar(sum) };
+        let body = { st: { ..emitted(opened(outer), add), next: 4 }, arg: AVar(sum) };
         let o = handled(
           g.cx,
           outer,
@@ -436,19 +450,35 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
           [{ label: None, closure: AVar(clause) }],
           None,
           g.h,
+          plan,
           place(),
         );
         assert_eq(o.st.refused, None);
         match handles_in(o.st.insts) {
           [h] -> {
-            // The body runs in place, under the clause's frame, and sets the answer as a word.
+            // The body runs in place, over the instance, and sets the answer as a word.
             assert(h.body.contains(add), None);
             assert_eq(h.answer.rep, RWord);
             assert(
               h.body.any(|i: Inst| match i { Assign(a) -> a.var == h.answer, _ -> false }),
               None,
             );
-            assert_eq((h.args, h.site.detached, h.uses.takes), ([AVar(clause)], None, [true]));
+            // The handle only reads its clause, whose record lies past the raise's words.
+            assert_eq((h.args, h.site.detached, h.uses.takes), (
+              [AVar(clause), instance],
+              None,
+              [false, false],
+            ));
+            assert_eq(
+              h.site.instance,
+              Some({
+                operand: 1,
+                records: [raised_at()],
+                vars: raised_at() + 3,
+                count: 0,
+                pending: None,
+              }),
+            );
             assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
               (b"m.ask", b"get", 0),
             ]);
@@ -467,6 +497,7 @@ test "a handle runs its body in place under its clauses' frame and sets its answ
             [{ label: None, closure: AVar(clause) }],
             None,
             g.h,
+            plan,
             place(),
           ).st.refused,
           Some({ by: Handling, why: b"a handle body that leaves other than by its end" }),
@@ -480,8 +511,9 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
+      let framed = { st: started([]), instance: None, bridge: None };
       let frame_of = |name: Bytes|
-        match handle_at(p, name) { Some(g) -> body_frame(g.cx, g.h), None -> None };
+        match handle_at(p, name) { Some(g) -> body_frame(g.cx, g.h, framed), None -> None };
       assert_eq(frame_of(b"tail_only"), None);
       assert_eq(frame_of(b"once"), None);
       // The parameter is copied in at its own slot; the body's own `let` is not.
@@ -497,9 +529,9 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
       match handle_at(p, b"tagged") {
         None -> assert(false),
         Some(g) -> {
-          assert_eq(g.h.clauses.map(|cl: CodeClause| clause_frame(g.cx, cl).params), [3]);
+          assert_eq(g.h.clauses.map(|cl: CodeClause| clause_frame(cl, none_held()).params), [3]);
           assert_eq(
-            match body_frame(g.cx, g.h) { Some(f) -> Some(f.captures.len()), None -> None },
+            match body_frame(g.cx, g.h, framed) { Some(f) -> Some(f.captures.len()), None -> None },
             Some(0),
           )
         },
@@ -519,6 +551,7 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
             [{ label: None, closure: AVar(clause) }],
             None,
             g.h,
+            framed,
             place(),
           );
           match handles_in(o.st.insts) {
@@ -550,7 +583,8 @@ test "a body run detached from its handler's frame captures each variable's firs
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match formed(p, b"resumed") {
       Err(no) -> assert_eq(no.why, b""),
-      // The body is the one closure capturing anything: the two first values its frame starts from.
+      // The body is the one closure capturing anything: the two first values its frame starts from,
+      // then the frame bridge it performs what the handle answers through.
       Ok(f) -> {
         assert_eq(
           f.lambdas.fold([], |acc: List<List<Type>>, l: tir::Lambda|
@@ -558,7 +592,7 @@ test "a body run detached from its handler's frame captures each variable's firs
               Closure(c) -> if c.captures == 0 { acc }
               else { acc.push(c.body.params.take(c.captures).map(|x: Var| x.ty)) },
             }),
-          [[named(b"Int"), named(b"Int")]],
+          [[named(b"Int"), named(b"Int"), evidence_type()]],
         );
         // The body hands each first value over with its type's descriptor; a clause reads a
         // variable held once more and sets one by handing its new value over.
@@ -749,19 +783,27 @@ test "a simulate hands the runtime its body's closure and holds what the body an
         let int = named(b"Int");
         let body = closure_of(0, int);
         let l = simulated(r.cx, { ..started([]), next: 1 }, AVar(body), place());
-        let descriptor = match l.st.statics.last() {
-          Some(d) -> Static(d.name),
-          None -> Static(b""),
-        };
-        match ops_in(l.st.insts) {
+        let described = l.st.statics.map(|d: StaticDef| Static(d.name));
+        match ops_in(l.st.insts).filter(
+            |o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }| o.op == Simulate,
+          ) {
           [o] -> {
             // The body's closure, taken, then the descriptor of its answer's type, read.
-            assert_eq((o.op, o.uses.takes), (Simulate, [true, false]));
+            assert_eq(o.uses.takes, [true, false]);
             assert_eq(o.args.at(0), Some(AVar(body)));
             assert(
               l.st.insts.any(|i: Inst|
                 match i {
-                  Let(x) -> Some(AVar(x.var)) == o.args.at(1) && x.val == descriptor,
+                  Let(x) -> Some(AVar(x.var)) == o.args.at(1) && described.contains(x.val),
+                  _ -> false,
+                }),
+              None,
+            );
+            // The runtime is told the words of the body's row, which it hands the body.
+            assert(
+              l.st.insts.any(|i: Inst|
+                match i {
+                  Do(d) -> match d.val { Op(x) -> x.op == OHandle(Entering), _ -> false },
                   _ -> false,
                 }),
               None,
@@ -840,7 +882,7 @@ test "a handle's body runs in a block between the frame's push and its landing, 
         ],
         args: [AVar(clause)],
         uses: { takes: [true], owned: true, fails: true, stops: false },
-        site: { clauses: [asked], ret: None, detached: None },
+        site: { clauses: [asked], ret: None, detached: None, instance: None },
         answer: answer,
         unwind: [],
       }),
@@ -879,7 +921,7 @@ test "a handle's body runs in a block between the frame's push and its landing, 
           body: [],
           args: [AVar(clause), AVar(word(5))],
           uses: { takes: [true, true], owned: true, fails: true, stops: false },
-          site: { clauses: [{ ..asked, mode: 2 }], ret: None, detached: Some(1) },
+          site: { clauses: [{ ..asked, mode: 2 }], ret: None, detached: Some(1), instance: None },
           answer: answer,
           unwind: [],
         }),
@@ -898,10 +940,11 @@ test "a handle's body runs in a block between the frame's push and its landing, 
   assert_eq(alone.index_of(landing_jump(0)), None)
 }
 
-test "a perform's words go to the runtime in an array, its effect, operation and resource by their entries" {
+test "a perform calls its operation's entry in the object it is handed, its words in an array with one to spare, its resource by its entry" {
   let entry = local(0, named(b"Int"), RInt);
+  let object = local(6, evidence_type(), RImm);
   let printed = printed_fn(
-    fn_of(b"sends", [entry, word(1)], [
+    fn_of(b"sends", [entry, word(1), object], [
       Let({
         var: word(2),
         val: Op({
@@ -909,14 +952,15 @@ test "a perform's words go to the runtime in an array, its effect, operation and
             Perform({
               effect: b"m.net",
               op: b"send",
+              index: 0,
               resource: b"",
               labelled: true,
               mode: 1,
               described: b"ply_k_send",
             }),
           ),
-          args: [AVar(entry), AVar(word(1))],
-          uses: { takes: [false, true], owned: true, fails: true, stops: true },
+          args: [AVar(object), AVar(entry), AVar(word(1))],
+          uses: { takes: [false, false, true], owned: true, fails: true, stops: true },
         }),
         at: place(),
         unwind: [],
@@ -926,24 +970,26 @@ test "a perform's words go to the runtime in an array, its effect, operation and
         Perform({
           effect: b"m.net",
           op: b"send",
+          index: 0,
           resource: b"conn",
           labelled: false,
           mode: 1,
           described: b"ply_k_send",
         }),
-        [],
+        [AVar(object)],
       ),
       op_let(
         word(4),
         Perform({
           effect: b"m.net",
           op: b"close",
+          index: 1,
           resource: b"",
           labelled: false,
           mode: 1,
           described: b"ply_k_close",
         }),
-        [],
+        [AVar(object)],
       ),
       Let({
         var: local(5, named(b"Int"), RInt),
@@ -960,15 +1006,20 @@ test "a perform's words go to the runtime in an array, its effect, operation and
     no_ctors(),
   );
   let text = spelled(printed.pieces);
-  // Each names its descriptor, its resource (the label's entry where it is labelled, the
-  // resource's own, or none) and how many words its array holds.
+  // Each calls the entry of its operation's place in the object, naming its descriptor, its mode
+  // and its resource: the label's entry where it is labelled, the resource's own, or none.
   let named = |x: Bytes| match x.index_of(b"&") { Some(i) -> x.slice(i + 1, x.len()), None -> x };
   assert_eq(
-    call_args(text, b"rt_dispatch_p").map(|a: List<Bytes>| [named(a.get(1)), a.get(2), a.get(3)]),
-    [[b"ply_k_send", b"p0", b"1"], [b"ply_k_send", b"@@f0@@", b"1"], [b"ply_k_close", b"-1", b"1"]],
+    call_args(text, b"ply_perform").map(|a: List<Bytes>|
+      [a.get(1), a.get(2), named(a.get(3)), a.get(4), a.get(5)]),
+    [
+      [b"p2", b"0", b"ply_k_send", b"1", b"p0"],
+      [b"p2", b"0", b"ply_k_send", b"1", b"@@f0@@"],
+      [b"p2", b"1", b"ply_k_close", b"1", b"-1"],
+    ],
   );
-  // The words: the operation's argument, or a 0 where it takes none.
-  assert(text.index_of(b"[] = {p1};") != None && text.index_of(b"[] = {0};") != None, None);
+  // The words: the operation's argument, then a word to spare.
+  assert(text.index_of(b"[] = {p1, 0};") != None && text.index_of(b"[] = {0};") != None, None);
   // A label read is its entry.
   assert(text.index_of(b" = @@f0@@;") != None, None);
   // The effect and the operation are the descriptor's to name, the resource the call's.
@@ -1177,7 +1228,8 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match printed_by_form(p, b"guarded") {
       Err(why) -> assert_eq(why, b""),
-      Ok(t) -> match t.index_of(b"rt_handle_install_p(") {
+      // The handle opens where its instance takes the fuel it stands at.
+      Ok(t) -> match t.index_of(b"[0] = ctx->fuel;") {
         None -> assert(false),
         Some(from) -> {
           // The body runs to the last jump to its landing.
@@ -1303,7 +1355,7 @@ test "a step iterate runs in place copies into a detached handle's body only slo
         None -> assert(false),
         Some(l) -> match handle_of(l.body) {
           None -> assert(false),
-          Some(h) -> match body_frame(r.cx, h) {
+          Some(h) -> match body_frame(r.cx, h, { st: started([]), instance: None, bridge: None }) {
             None -> assert(false),
             Some(f) -> {
               let own = range(0, l.params).concat(l.captures.map(|c: Capture| c.dst));

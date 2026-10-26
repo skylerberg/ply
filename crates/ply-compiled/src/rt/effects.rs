@@ -168,6 +168,88 @@ pub unsafe extern "C" fn rt_dispatch(
     Handed::of(unsafe { performed(ctx, effect, name, resource.0, mode.0, args, described) })
 }
 
+/// An operation's entry in an evidence object, as compiled code calls it: the slot's environment,
+/// the operation's descriptor, its mode, the resource (negative for none) and its arguments' words.
+pub type OpEntry =
+    unsafe extern "C" fn(*mut Ctx, Word, *const PlyOp, I64, I64, *const Handed) -> Handed;
+
+/// The most operations one effect may declare: the frame bridge has a slot for each.
+pub const BRIDGE_OPS: usize = 256;
+
+/// The evidence object whose every slot hands the perform to [`rt_dispatch`], which searches the
+/// frames: what code that holds no word for an effect performs it through. Laid out as every
+/// evidence object is: its flags, then an entry and its environment per operation, in the order
+/// the effect declares them.
+#[repr(C)]
+pub struct Bridge {
+    pub flags: i64,
+    pub slots: [Slot; BRIDGE_OPS],
+}
+
+/// An operation's slot in an evidence object.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Slot {
+    pub entry: OpEntry,
+    pub env: Word,
+}
+
+/// The one [`Bridge`].
+pub static BRIDGE: Bridge = Bridge {
+    flags: 0,
+    slots: [Slot {
+        entry: bridged,
+        env: 0,
+    }; BRIDGE_OPS],
+};
+
+/// [`BRIDGE`]'s word.
+pub(crate) fn bridge_word() -> Word {
+    &raw const BRIDGE as Word
+}
+
+unsafe extern "C" fn bridged(
+    ctx: *mut Ctx,
+    _env: Word,
+    op: *const PlyOp,
+    mode: I64,
+    resource: I64,
+    args: *const Handed,
+) -> Handed {
+    unsafe { rt_dispatch(ctx, op, resource, mode, args) }
+}
+
+/// A perform of `effect.op` on `resource` in `mode` noted where this entry's performs are read: in
+/// its trace, and as a region's step access.
+fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>, mode: Mode) {
+    let atom = EffectAtom::operation(
+        effect.clone(),
+        resource
+            .cloned()
+            .map_or(Resource::Singleton, Resource::Named),
+        mode,
+        op.clone(),
+    );
+    // A step conflicts on the mode, and a scheduled draw's access is recorded here alone.
+    if !c.sims.is_empty() {
+        c.record_access(Access::Atom(atom.mode_atom()));
+    }
+    c.performed.push(atom);
+}
+
+/// Notes a perform of the operation `op` describes, on the field-table entry `resource` (negative
+/// for none) in `mode`, that a clause answered in place, as [`rt_dispatch`] notes every perform it
+/// is handed. Compiled code calls it only while [`Ctx::recording`] is armed.
+pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource: I64, mode: I64) {
+    let c = unsafe { &mut *ctx };
+    let described = unsafe { &*op };
+    let effect = c.tables.fields[described.effect as usize].clone();
+    let name = c.tables.fields[described.op as usize].clone();
+    let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
+    let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
+    recorded(c, &effect, &name, resource.as_ref(), mode);
+}
+
 /// [`rt_dispatch`] past a raise.
 unsafe fn performed(
     ctx: *mut Ctx,
@@ -183,19 +265,7 @@ unsafe fn performed(
     let args = args.as_ptr();
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
     let mode = if mode != 0 { Mode::Write } else { Mode::Read };
-    let atom = EffectAtom::operation(
-        effect.clone(),
-        resource
-            .clone()
-            .map_or(Resource::Singleton, Resource::Named),
-        mode,
-        op.clone(),
-    );
-    // A step conflicts on the mode, and a scheduled draw's access is recorded here alone.
-    if !c.sims.is_empty() {
-        c.record_access(Access::Atom(atom.mode_atom()));
-    }
-    c.performed.push(atom);
+    recorded(c, &effect, &op, resource.as_ref(), mode);
     let mut found = None;
     let mut inherited_off_tail = false;
     let mut stack = c.current;
@@ -409,6 +479,14 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
     let d = d.primary(c.site(), "raised here");
     match at {
         Some(at) => c.bind_raise(at, args, d),
+        None if is_abort(effect.as_str(), op.as_str()) => {
+            let message = match raised_values(c, &args).first() {
+                Some(Ok(Value::Str(s))) => s.to_string(),
+                _ => String::new(),
+            };
+            args.release();
+            c.pend(d, message)
+        }
         None => {
             args.release();
             c.fail(d)
@@ -416,11 +494,32 @@ pub(super) fn raise_from_perform(c: &mut Ctx, effect: &Symbol, op: &Symbol, args
     }
 }
 
+/// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays
+/// it out, the entry no longer failed: for compiled code to raise it through the word that answers
+/// it. 0 with the entry failed as it was where nothing is pending.
+pub unsafe extern "C" fn rt_pending_raised(ctx: *mut Ctx, string: *const PlyType) -> Handed {
+    let c = unsafe { &mut *ctx };
+    if c.failed != FAILED_PENDING {
+        return Handed::of(0);
+    }
+    let Some(message) = c.pending.take() else {
+        return Handed::of(0);
+    };
+    c.failed = 0;
+    c.diagnostic = None;
+    let message = Value::str(message);
+    lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+}
+
 /// A `simulate` region emitted code wrote: `body` is a closure block, which this takes,
 /// and `answer` the type of what it answers, through which the region holds its answer until it
-/// hands it back.
+/// hands it back. The body is handed the words the context's `entering_*` name.
 pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, answer: *const PlyType) -> Handed {
-    Handed::of(unsafe { region(ctx, Body(body, &*answer)) })
+    let c = unsafe { &mut *ctx };
+    let words = (c.entering_desc, c.entering_words);
+    c.entering_desc = 0;
+    c.entering_words = 0;
+    Handed::of(unsafe { region(ctx, Body(body, &*answer, words)) })
 }
 
 unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
@@ -448,6 +547,7 @@ unsafe fn region(ctx: *mut Ctx, body: Body) -> Word {
         body,
     );
     c.sims.push(sim);
+    c.rearm_recording();
     let r = unsafe { crate::simulate::run(ctx) };
     let c = unsafe { &mut *ctx };
     c.current = stack;

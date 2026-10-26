@@ -1,14 +1,18 @@
-//! `perform`, labels, `handle`, `parallel` and `simulate`. Each is an operation of the runtime's over
-//! words, naming effects program-wide; a `handle` is a block its body runs in, inline under the
-//! frame its clauses lay out, or detached on a stack of its own where a clause resumes off its tail.
+//! `perform`, labels, `handle`, `parallel` and `simulate`. A perform calls the entry of its
+//! operation in the evidence object the body holds for its effect; a `handle` is a block its body
+//! runs in, inline over an instance its evidence objects' clause slots point into or under the
+//! runtime's frame its clauses lay out, or detached on a stack of its own where a clause resumes off
+//! its tail. Effects are named program-wide.
 
 import compiler.emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo, CodeArm,
                            CodeField, NApp, NVar, NIf, NBlock, NMatch, NUnary, NBinary, NField,
                            NUpdate, NRecord, NList, NPerform, NParallel, NHandle, slots_read,
                            all_read, pat_slots)
+import compiler.emit.keys (Evidence)
+import compiler.emit.evidence (evidence_type)
 import compiler.syntax.parsing (Span)
-import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, Resource, RNamed, RSingleton, RAny,
-                             RVar, is_diverges, int_type, string_type, fields_sorted)
+import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, Row, Resource, RNamed, RSingleton,
+                             RAny, RVar, is_diverges, int_type, string_type, fields_sorted)
 import compiler.emit.typing (unknown_type)
 import compiler.check.resolve.tables (qualify)
 import compiler.expand.rewrite (named_program_wide)
@@ -19,38 +23,54 @@ import compiler.emit.reps (Def, EffectName, OpMode, gathered_of)
 import compiler.emit.keys (Named, unspecialised)
 import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
-                          Enter, Handle, Handling, falls_through)
-import compiler.emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached)
-import compiler.emit.lower.crossing (op_described, type_described)
-import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, Worded, refuse,
-                                 fresh, bound_as, emitted, continued, filed, unfiled, type_of,
-                                 handed)
-import compiler.emit.lower.evidence (words_at)
+                          Enter, Handle, Handling, Uses, falls_through)
+import compiler.emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached,
+                                   Bridge, Instance, ObjectLaid, Entering, Answering, Forwarding,
+                                   Entry, Answers, Resumes, Raises, HandleInstance, raised_at)
+import compiler.emit.lower.crossing (op_described, type_described, effect_of)
+import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, Worded, Held,
+                                 refuse, fresh, bound_as, done, emitted, continued, filed, unfiled,
+                                 type_of, handed)
+import compiler.emit.lower.evidence (words_at, routed, bridged, label_resource, value_handing)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.lower.data (recorded_as)
 import compiler.emit.lower.resumes (off_tail_code)
 
-/// Operation `op` of `effect` performed on `resource` with `args`, at `label` where one is read:
-/// the label opened as the field-table entry it is, each argument handed over as a word, and what
-/// the handler answers, a word, held as the type the checker filed for the perform.
+/// Operation `op` of `effect` performed on `resource` with `args`, at `label` where one is read,
+/// written `written`: the label opened as the field-table entry it is, each argument handed over as
+/// a word to the entry of the object the body holds for the effect there, and what the entry
+/// answers, a word, held as the type the checker filed for the perform.
 pub fn performed(
   cx: Context,
   st: Lowering,
   p: { effect: Bytes, op: Bytes, resource: Bytes },
   label: Option<Arg>,
+  written: Option<Code>,
   args: List<Arg>,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match effect_named(cx, p.effect) {
     None -> refuse(st, Handling, b"an effect the lowering does not resolve: ".concat(p.effect)),
-    Some(en) -> {
+    Some(named) -> {
+      let en = match effect_of(cx, named.global) { Some(e) -> e, None -> named };
+      let index = range(0, en.ops.len()).find(|k: Int|
+        match en.ops.at(k) { Some(o) -> o.name == p.op, None -> false });
+      let resource = match written {
+        Some(c) -> label_resource(cx, c),
+        None -> if p.resource == b"" { RSingleton } else { RNamed(p.resource) },
+      };
+      let word = bridged(
+        st,
+        routed(cx, [{ evidence: { effect: en.global, resource: resource }, through: false }]),
+        at,
+      );
       // The label is opened first, so an argument boxed after it fails holding no count of it.
       let keyed = match label {
         Some(l) -> {
-          let k = handed({ st: st, arg: l }, RInt, at);
+          let k = handed({ st: word.st, arg: l }, RInt, at);
           { st: k.st, args: [k.arg] }
         },
-        None -> { st: st, args: [] },
+        None -> { st: word.st, args: [] },
       };
       let words = args.fold(
         { st: keyed.st, args: [] },
@@ -71,24 +91,25 @@ pub fn performed(
             fails: true,
             stops: !is_raise(mode),
           };
-          let op = match d.name {
-            None ->
-              Op({ op: OHandle(Unsettled(p.op)), args: keyed.args.concat(words.args), uses: uses }),
-            Some(described) ->
+          let op = match ((d.name, index)) {
+            (Some(described), Some(k)) ->
               Op({
                 op: OHandle(
                   Perform({
                     effect: en.global,
                     op: p.op,
+                    index: k,
                     resource: if label == None { p.resource } else { b"" },
                     labelled: label != None,
                     mode: mode_code(mode),
                     described: described,
                   }),
                 ),
-                args: keyed.args.concat(words.args),
-                uses: uses,
+                args: word.args.concat(keyed.args).concat(words.args),
+                uses: { ..uses, takes: [false].concat(uses.takes) },
               }),
+            _ ->
+              Op({ op: OHandle(Unsettled(p.op)), args: keyed.args.concat(words.args), uses: uses }),
           };
           handed(bound_as(d.st, t.ty, RWord, op, at), held_as(cx.setting, t.ty), at)
         },
@@ -111,9 +132,9 @@ pub fn label(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered =
   )
 
 /// How clause `clause`'s body is laid out as a function of its own: its parameters, then the call
-/// site's label where it binds one, then its continuation where it resumes; handed the words its
-/// own row takes.
-pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame / {abort.raise} =
+/// site's label where it binds one, then its continuation where it resumes; holding `held`, the
+/// words its row takes as they stand where the `handle` is, since what calls it hands none.
+pub fn clause_frame(clause: CodeClause, held: Held) -> Frame =
   {
     params: clause.params + (if clause.binds_label { 1 } else { 0 })
       + (if clause.resume { 1 } else { 0 }),
@@ -122,12 +143,13 @@ pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame / {abort.raise} =
     resumes: clause.resume,
     body: clause.body,
     ty: None,
-    words: words_at(cx, clause.at),
+    words: [],
+    held: held,
   }
 
 /// How a `handle`'s return clause is laid out as a function of its own: the value the body answered,
-/// then what it copies in; handed the words its own row takes.
-pub fn ret_frame(cx: Context, r: CodeReturn) -> Frame / {abort.raise} =
+/// then what it copies in; holding `held`, as a clause does.
+pub fn ret_frame(r: CodeReturn, held: Held) -> Frame =
   {
     params: 1,
     size: r.size,
@@ -135,30 +157,240 @@ pub fn ret_frame(cx: Context, r: CodeReturn) -> Frame / {abort.raise} =
     resumes: false,
     body: r.body,
     ty: None,
-    words: words_at(cx, r.at),
+    words: [],
+    held: held,
   }
 
-/// `cx` inside the body of a `handle` laying out `clauses`, run in place: holding, before any word
-/// it held, a word for each effect and resource a clause answers there.
+/// How a `handle` answers what its clauses do: through evidence objects laid over an instance in
+/// the frame of the function it is written in, the instance's word and layout here; or through the
+/// runtime's frames, the frame bridge's word what its body performs those through.
+pub type Planned = {
+  st: Lowering,
+  instance: Option<{ word: Arg, layout: HandleInstance }>,
+  bridge: Option<Arg>,
+}
+
+/// The `handle` `h` written at `at` planned after `st`. It answers through evidence objects unless a
+/// clause resumes off its tail, which runs the body detached, binds the label it answers at or
+/// answers on every label, or the function it is in may spawn a task, which may outlive the frame;
+/// those the runtime's frames hold.
+pub fn handle_planned(
+  cx: Context,
+  st: Lowering,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  at: Span,
+) -> Planned / {abort.raise} =
+  if !in_place(cx, h.clauses) {
+    let b = bound_as(
+      st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(Bridge), args: [], uses: reading(0) }),
+      at,
+    );
+    { st: b.st, instance: None, bridge: Some(b.arg) }
+  } else {
+    let raised = h.clauses.fold(0, |m: Int, cl: CodeClause|
+      if clause_mode(cx, cl) == 3 && cl.params > m { cl.params } else { m });
+    let records = raised_at() + raised;
+    let vars = records + 3 * h.clauses.len();
+    let count = handler_vars(h.body);
+    let layout = {
+      operand: 0,
+      records: range(0, h.clauses.len()).map(|k: Int| records + 3 * k),
+      vars: vars,
+      count: count,
+      pending: range(0, h.clauses.len()).find(|k: Int|
+        match h.clauses.at(k) { Some(cl) -> answers_abort(cx, cl), None -> false }),
+    };
+    let i = bound_as(
+      st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(Instance(vars + 2 * count)), args: [], uses: reading(0) }),
+      at,
+    );
+    { st: i.st, instance: Some({ word: i.arg, layout: layout }), bridge: None }
+  }
+
+/// Whether a `handle` of `clauses` written in `cx` answers through evidence objects, as
+/// `handle_planned` says.
+fn in_place(cx: Context, clauses: List<CodeClause>) -> Bool / {abort.raise} =
+  !detaches(clauses) && !cx.words.any(|w: Worded| w.evidence.effect == b"task")
+    && clauses.all(|cl: CodeClause|
+      !cl.binds_label && cl.resource != b"*"
+        && (match effect_named(cx, cl.effect) {
+          Some(en) -> match effect_of(cx, en.global) {
+            Some(e) -> e.ops.any(|o: OpMode| o.name == cl.op),
+            None -> false,
+          },
+          None -> false,
+        }))
+
+/// Whether clause `cl` answers `abort.raise`, which a raise the runtime left pending reaches.
+fn answers_abort(cx: Context, cl: CodeClause) -> Bool / {abort.raise} =
+  cl.op == b"raise"
+    && (match effect_named(cx, cl.effect) { Some(en) -> en.global == b"abort", None -> false })
+
+/// How many variables the `handle` whose body is `body` holds: what its body's first statements
+/// install.
+fn handler_vars(body: Code) -> Int =
+  match body.node {
+    NBlock(b) ->
+      b.stmts.fold(0, |n: Int, s: CodeStmt|
+        match s {
+          CDo(d) -> match d.code.node {
+            NApp(a) -> match a.func.node {
+              NVar(v) -> if v.name == b"?handler_init" { n + 1 } else { n },
+              _ -> n,
+            },
+            _ -> n,
+          },
+          _ -> n,
+        }),
+    _ -> 0,
+  }
+
+/// What a clause or the return clause of a `handle` planned as `plan`, written at `at`, holds: the
+/// words its row takes as they stand around the `handle`, each the frame bridge where none answers,
+/// and the instance where there is one.
+pub fn clause_held(
+  cx: Context,
+  st: Lowering,
+  plan: Planned,
+  at: Span,
+) -> { st: Lowering, held: Held } / {abort.raise} = {
+  let own = words_at(cx, at);
+  let words = bridged(st, routed(cx, own), at);
+  {
+    st: words.st,
+    held: {
+      words: range(0, own.len()).fold([], |acc: List<Worded>, k: Int|
+        match ((own.at(k), words.args.at(k))) {
+          (Some(o), Some(w)) ->
+            acc.push({ evidence: o.evidence, word: w, through: o.through, handled: false }),
+          _ -> acc,
+        }),
+      instance: match plan.instance {
+        Some(i) -> Some({ word: i.word, vars: i.layout.vars }),
+        None -> None,
+      },
+    },
+  }
+}
+
+/// The keys a `handle` of `clauses` answers: each effect and resource a clause answers there,
+/// once, with the effect's operations.
+fn handle_keys(
+  cx: Context,
+  clauses: List<CodeClause>,
+) -> List<{ evidence: Evidence, effect: EffectName }> / {abort.raise} =
+  clauses.fold([], |acc: List<{ evidence: Evidence, effect: EffectName }>, cl: CodeClause|
+    match effect_named(cx, cl.effect) {
+      None -> acc,
+      Some(named) -> {
+        let en = match effect_of(cx, named.global) { Some(e) -> e, None -> named };
+        let answered = { effect: en.global, resource: clause_resource(cx, cl) };
+        if acc.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == answered) { acc }
+        else { acc.push({ evidence: answered, effect: en }) }
+      },
+    })
+
+/// `cx` inside the body of a `handle` planned as `plan`, run in place, and the state after `st`
+/// holding what it needs: before any word it held, a word for each effect and resource a clause
+/// answers there. Over an instance, each word is an evidence object whose slots enter the clauses
+/// answering its operations and copy the rest from the word around the `handle`; held by the
+/// runtime's frames, each is the frame bridge.
 pub fn handle_entered(
   cx: Context,
+  st: Lowering,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
-) -> Context / {abort.raise} =
-  {
-    ..cx,
-    words: h.clauses.fold([], |acc: List<Worded>, cl: CodeClause|
-      match effect_named(cx, cl.effect) {
-        None -> acc,
-        Some(en) -> {
-          let answered = { effect: en.global, resource: clause_resource(cx, cl) };
-          if acc.any(|w: Worded| w.evidence == answered) { acc } else {
-            acc.push({ evidence: answered, word: AZero(RImm), through: false, handled: true })
+  plan: Planned,
+  at: Span,
+) -> { cx: Context, st: Lowering } / {abort.raise} = {
+  let keys = handle_keys(cx, h.clauses);
+  match plan.instance {
+    None -> {
+      let bridge = match plan.bridge { Some(b) -> b, None -> AZero(RImm) };
+      {
+        cx: {
+          ..cx,
+          words: keys.map(|k: { evidence: Evidence, effect: EffectName }|
+            { evidence: k.evidence, word: bridge, through: false, handled: true }).concat(
+            cx.words,
+          ),
+          instance: None,
+        },
+        st: st,
+      }
+    },
+    Some(i) -> {
+      let made = keys.fold(
+        { st: st, words: [] },
+        |acc: { st: Lowering, words: List<Worded> }, k: { evidence: Evidence, effect: EffectName }| {
+          let outer = bridged(acc.st, routed(cx, [{ evidence: k.evidence, through: false }]), at);
+          let slots = range(0, k.effect.ops.len()).map(|j: Int| {
+            let op = k.effect.ops.get(j);
+            match range(0, h.clauses.len()).find(|c: Int|
+                match h.clauses.at(c) {
+                  Some(cl) ->
+                    cl.op == op.name
+                      && (match effect_named(cx, cl.effect) {
+                        Some(en) -> en.global == k.evidence.effect,
+                        None -> false,
+                      })
+                      && clause_resource(cx, cl) == k.evidence.resource,
+                  None -> false,
+                }) {
+              Some(c) ->
+                Answering({
+                  entry: entry_of(clause_mode(cx, h.clauses.get(c))),
+                  record: i.layout.records.get(c),
+                }),
+              None -> Forwarding({ operand: 1, op: j }),
+            }
+          });
+          let o = bound_as(
+            outer.st,
+            evidence_type(),
+            RImm,
+            Op({
+              op: OHandle(ObjectLaid(slots)),
+              args: [i.word].concat(outer.args),
+              uses: reading(2),
+            }),
+            at,
+          );
+          {
+            st: o.st,
+            words: acc.words.push({
+              evidence: k.evidence,
+              word: o.arg,
+              through: false,
+              handled: true,
+            }),
           }
         },
-      }).concat(
-      cx.words,
-    ),
+      );
+      {
+        cx: {
+          ..cx,
+          words: made.words.concat(cx.words),
+          instance: Some({ word: i.word, vars: i.layout.vars }),
+        },
+        st: made.st,
+      }
+    },
   }
+}
+
+/// How a clause of the runtime's mode `mode` is entered from its slot.
+fn entry_of(mode: Int) -> Entry =
+  if mode == 3 { Raises } else if mode == 1 { Resumes } else { Answers }
+
+/// What an operation over `n` words does with them: reads them, answering what holds no count.
+fn reading(n: Int) -> Uses =
+  { takes: range(0, n).map(|_: Int| false), owned: false, fails: false, stops: false }
 
 /// The resource clause `cl` answers on, in the root's numbering: a label parameter's, every label,
 /// one named, or none.
@@ -174,15 +406,18 @@ fn clause_resource(cx: Context, cl: CodeClause) -> Resource =
 
 /// How a `handle`'s body is laid out as a function of its own where it runs detached, on a stack of
 /// its own: no parameters, each slot it reads that is bound around it copied in at its own number;
-/// nothing where it runs in place.
+/// holding, since the runtime hands it none, the words the function around it holds, before them
+/// the frame bridge for what the `handle` answers. Nothing where it runs in place.
 pub fn body_frame(
   cx: Context,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
-) -> Option<Frame> =
+  plan: Planned,
+) -> Option<Frame> / {abort.raise} =
   if !detaches(h.clauses) { None } else {
     let inside = bound_in(h.body);
     let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
       if acc.contains(r) || inside.contains(r) { acc } else { acc.push(r) });
+    let bridge = match plan.bridge { Some(b) -> b, None -> AZero(RImm) };
     Some({
       params: 0,
       size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
@@ -190,15 +425,23 @@ pub fn body_frame(
       resumes: false,
       body: h.body,
       ty: None,
-      // The runtime runs it, handing it no word.
       words: [],
+      held: {
+        words: handle_keys(cx, h.clauses).map(
+          |k: { evidence: Evidence, effect: EffectName }|
+            { evidence: k.evidence, word: bridge, through: false, handled: true },
+        ).concat(
+          cx.words,
+        ),
+        instance: None,
+      },
     })
   }
 
-/// The `handle` `h`, its body lowered to `body` (in a block of its own, or as a closure where
-/// `body_frame` says it runs detached), its clauses and return clause made: the frame its clauses lay
-/// out over their closures and the labels they key on, its body run under it, and what it answers,
-/// a word, held as the type it answers.
+/// The `handle` `h`, planned as `plan`, its body lowered to `body` (in a block of its own, or as a
+/// closure where `body_frame` says it runs detached), its clauses and return clause made: the
+/// clauses laid out over their closures and the labels they key on, for the runtime's frame or the
+/// instance, its body run under them, and what it answers, a word, held as the type it answers.
 pub fn handled(
   cx: Context,
   st: Lowering,
@@ -206,6 +449,7 @@ pub fn handled(
   clauses: List<ClauseMade>,
   ret: Option<Arg>,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  plan: Planned,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let detached = detaches(h.clauses);
@@ -234,6 +478,16 @@ pub fn handled(
   let all = if detached {
     { args: tail.args.push(body.arg), takes: tail.takes.push(true), at: Some(tail.args.len()) }
   } else { { args: tail.args, takes: tail.takes, at: None } };
+  // Over an instance the `handle` only reads its closures, whose counts are the body's to let go.
+  let site = match plan.instance {
+    None -> { args: all.args, takes: all.takes, instance: None },
+    Some(i) ->
+      {
+        args: all.args.push(i.word),
+        takes: all.args.push(i.word).map(|_: Arg| false),
+        instance: Some({ ..i.layout, operand: all.args.len() }),
+      },
+  };
   let ty = match ret {
     Some(r) -> answer_of(type_of(r)),
     None -> if detached { answer_of(type_of(body.arg)) } else { type_of(body.arg) },
@@ -251,9 +505,9 @@ pub fn handled(
             Some(w) -> inner.block.push(Assign({ var: a.var, arg: w })),
             None -> inner.block,
           },
-          args: all.args,
-          uses: { takes: all.takes, owned: true, fails: true, stops: false },
-          site: { clauses: laid.clauses, ret: tail.at, detached: all.at },
+          args: site.args,
+          uses: { takes: site.takes, owned: true, fails: true, stops: false },
+          site: { clauses: laid.clauses, ret: tail.at, detached: all.at, instance: site.instance },
           answer: a.var,
           unwind: [],
         }),
@@ -288,7 +542,24 @@ pub fn branched(
       { st: d.st, args: acc.args.push(d.arg) }
     },
   );
-  let words = { st: described.st, args: closures.args.concat(described.args) };
+  // The branches are handed the words of the rows they perform, which the runtime hands on.
+  let rows = branches.fold({ atoms: [], tail: None }, |acc: Row, b: Arg|
+    match type_of(b) {
+      TyFn(f) ->
+        {
+          atoms: f.effects.atoms.fold(acc.atoms, |xs: List<Atom>, a: Atom|
+            if xs.contains(a) { xs } else { xs.push(a) }),
+          tail: match acc.tail { Some(t) -> Some(t), None -> f.effects.tail },
+        },
+      _ -> acc,
+    });
+  let handing = value_handing(cx, described.st, rows, at);
+  let entering = done(
+    handing.st,
+    Op({ op: OHandle(Entering), args: handing.args, uses: reading(2) }),
+    at,
+  );
+  let words = { st: entering, args: closures.args.concat(described.args) };
   let ty = TyRecord(
     fields_sorted(
       range(0, branches.len()).map(|i: Int|
@@ -341,7 +612,22 @@ pub fn branched(
 pub fn simulated(cx: Context, st: Lowering, body: Arg, at: Span) -> Lowered / {abort.raise} = {
   let w = handed({ st: st, arg: body }, RWord, at);
   let ty = answer_of(type_of(body));
-  let d = type_described(cx, w.st, ty, at);
+  let described = type_described(cx, w.st, ty, at);
+  // The body is handed the words of its row, the frame bridge for what the region answers.
+  let d = match type_of(body) {
+    TyFn(f) -> {
+      let handing = value_handing(cx, described.st, f.effects, at);
+      {
+        st: done(
+          handing.st,
+          Op({ op: OHandle(Entering), args: handing.args, uses: reading(2) }),
+          at,
+        ),
+        arg: described.arg,
+      }
+    },
+    _ -> described,
+  };
   let op = Op({
     op: OHandle(Simulate),
     args: [w.arg, d.arg],

@@ -11,7 +11,8 @@ import std.list
 import std.bytes
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type,
-                             int_type, unit_type, bytes_type, list_type, spelled_type)
+                             int_type, unit_type, bytes_type, list_type, string_type, spelled_type)
+import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.c (Width, width_named, width_index)
 import compiler.emit.roots (builtin_helper)
@@ -21,17 +22,18 @@ import compiler.emit.tir (Rep, RInt, RBool, RImm, RWord, RFloat, RNum, RDec, RWi
                           Arg, AVar, OStrings, string_uses, AInt, AZero, Var, Val, Uses, Prim, Get,
                           PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent,
                           Owned, Handling, Static, Fn, Inst, Let, Do, Return, Crossing, Declined,
-                          no_links)
+                          Pending, no_links)
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.strings (Grown)
-import compiler.emit.tir.handling (Encoded, Unsettled)
+import compiler.emit.tir.handling (HandleOp, Encoded, Unsettled, VarInit, VarRead, VarWrite)
 import compiler.emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField, WHead)
 import compiler.emit.release (word_form_heads)
 import compiler.emit.lower.setting (CallTypes, builtin_at)
 import compiler.emit.lower.held (held_as, held_with, typed_convention)
-import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, bound, bound_as, done, handed,
-                                 type_of, pair_words, filed, unfiled, noted, static_added)
-import compiler.emit.reps (Ctors, SumCtor, OpMode, type_vars, runtime_object)
+import compiler.emit.lower.base (Context, Lowering, Lowered, Instanced, refuse, bound, bound_as,
+                                 done, handed, type_of, pair_words, filed, unfiled, noted,
+                                 static_added)
+import compiler.emit.reps (Ctors, SumCtor, OpMode, EffectName, type_vars, runtime_object)
 import compiler.emit.print.counting (never_lifted_fn)
 import compiler.emit.marks (marks_of, marked_key, carried_by, marked_type, function_marks)
 import compiler.emit.answer (Exact)
@@ -187,6 +189,65 @@ fn handler_builtin(name: Bytes) -> Bool =
 /// runtime with its type's descriptor; a read, held once more, as the type the check filed where it
 /// is written; a new value given, the one it held let go.
 fn handler_var(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match cx.instance {
+    Some(i) -> instance_var(cx, st, i, name, args, at),
+    None -> framed_var(cx, st, name, args, at),
+  }
+
+/// Handler builtin `name` on `args` where the handle's instance `i` holds its variables: each at
+/// its place's two words, its value and its type's descriptor.
+fn instance_var(
+  cx: Context,
+  st: Lowering,
+  i: Instanced,
+  name: Bytes,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  let place = |a: Arg| match a { AInt(n) -> Some(i.vars + 2 * n), _ -> None };
+  let op = |o: HandleOp, operands: List<Arg>, takes: List<Bool>|
+    Op({
+      op: OHandle(o),
+      args: [i.word].concat(operands),
+      uses: { takes: [false].concat(takes), owned: takes.len() == 0, fails: false, stops: false },
+    });
+  match args {
+    [p] -> if name != b"?handler_var" { refuse(st, Handling, b"a handler variable set to nothing") }
+    else {
+      match ((place(p), filed(cx, at))) {
+        (Some(word_at), Some(t)) ->
+          handed(
+            bound_as(st, t.ty, RWord, op(VarRead(word_at), [], []), at),
+            held_as(cx.setting, t.ty),
+            at,
+          ),
+        _ -> refuse(st, Handling, b"a handler variable read at no place or type"),
+      }
+    },
+    [p, x] -> match place(p) {
+      None -> refuse(st, Handling, b"a handler variable named by other than its place"),
+      Some(word_at) -> {
+        let word = handed({ st: st, arg: x }, RWord, at);
+        if name == b"?handler_init" {
+          let d = type_described(cx, word.st, type_of(x), at);
+          unit_after(done(d.st, op(VarInit(word_at), [word.arg, d.arg], [true, false]), at))
+        } else if name == b"?handler_set" {
+          unit_after(done(word.st, op(VarWrite(word_at), [word.arg], [true]), at))
+        } else { refuse(word.st, Handling, b"a handler variable's read handed a value") }
+      },
+    },
+    _ -> refuse(st, Handling, b"a handler variable named by other than its place"),
+  }
+}
+
+/// Handler builtin `name` on `args` where the runtime's frames hold the variables.
+fn framed_var(
   cx: Context,
   st: Lowering,
   name: Bytes,
@@ -1051,6 +1112,58 @@ pub fn op_described(
       );
       { st: d.st, name: Some(d.name) }
     }
+  }
+
+/// The effect named `global` program-wide, with its operations in the order it declares them: one
+/// the module's scope binds, or one of the prelude's.
+pub fn effect_of(cx: Context, global: Bytes) -> Option<EffectName> / {abort.raise} =
+  match cx.setting.effects.find(|e: EffectName| e.global == global && e.ops.len() > 0) {
+    Some(e) -> Some(e),
+    None ->
+      prelude_effects().find(|e: EffectInfo| e.name == global).map(|e: EffectInfo|
+        {
+          written: e.name,
+          global: e.name,
+          ops: e.ops.map(|o: OpInfo|
+            {
+              name: o.name,
+              mode: o.mode,
+              params: o.params,
+              ret: o.ret,
+              own: match o.scheme { Some(s) -> s.ty_vars, None -> [] },
+            }),
+        }),
+  }
+
+/// How a function holding `word`, its evidence object for `abort`, raises a raise the runtime left
+/// pending as it leaves on a failure: `abort.raise` by its place, its `op#` and the descriptor of
+/// `String` static objects of `st`.
+pub fn pending_raised(
+  cx: Context,
+  st: Lowering,
+  word: Var,
+) -> { st: Lowering, pending: Option<Pending> } / {abort.raise} =
+  match effect_of(cx, b"abort") {
+    None -> { st: st, pending: None },
+    Some(e) -> match range(0, e.ops.len()).find(|k: Int| e.ops.get(k).name == b"raise") {
+      None -> { st: st, pending: None },
+      Some(k) -> {
+        let d = op_described(cx, st, e.global, e.ops.get(k), [string_type()], unit_type());
+        match d.name {
+          None -> { st: d.st, pending: None },
+          Some(op) -> {
+            let s = type_static(
+              cx.setting.ctors,
+              cx.setting.module,
+              d.st,
+              string_type(),
+              function_marks(string_type()),
+            );
+            { st: s.st, pending: Some({ word: word, index: k, op: op, string: s.name }) }
+          },
+        }
+      },
+    },
   }
 
 /// `st` holding `type#T` for `t` as module `module` asks for it over the program's constructors

@@ -6,9 +6,9 @@
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::rt::{
-    Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_UNWIND, Frames, HandlerFrame, Lifted,
-    drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values, lowering_of,
-    no_stack_to_take, raise_error, released, running, switch_keeping,
+    Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_TARGET, FAILED_UNWIND, Frames,
+    HandlerFrame, Lifted, drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values,
+    lowering_of, no_stack_to_take, raise_error, released, running, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::codec::{self, Reader, Writer, tag};
@@ -76,8 +76,13 @@ pub(crate) fn word_of(c: &mut Ctx, item: Item) -> Word {
     }
 }
 
-/// A task's body before it starts: a closure block, beside the type of what it answers.
-pub(crate) struct Body(pub(crate) Block, pub(crate) &'static PlyType);
+/// A task's body before it starts: a closure block, beside the type of what it answers and the row
+/// descriptor and words it is handed (0 for none, the frame bridge's).
+pub(crate) struct Body(
+    pub(crate) Block,
+    pub(crate) &'static PlyType,
+    pub(crate) (Word, Word),
+);
 
 impl Body {
     pub(crate) fn release(self, ctx: *mut Ctx) {
@@ -86,7 +91,9 @@ impl Body {
 
     /// Calls the body, letting go of it: what it answered, or `None` where its task failed.
     fn run(self, ctx: *mut Ctx) -> Option<Item> {
-        let Body(f, ty) = self;
+        let Body(f, ty, words) = self;
+        let c = unsafe { &mut *ctx };
+        (c.entering_desc, c.entering_words) = words;
         let r = unsafe { f.call(ctx, &[]) };
         unsafe { f.let_go_function(ctx) };
         (unsafe { (*ctx).failed } == 0)
@@ -254,6 +261,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         loop_done: false,
         site,
     });
+    c.rearm_recording();
     true
 }
 
@@ -364,7 +372,9 @@ pub(crate) fn end(c: &mut Ctx) -> Simulation {
     for task in tasks {
         release(c, task);
     }
-    c.sims.pop().expect("a region is running")
+    let sim = c.sims.pop().expect("a region is running");
+    c.rearm_recording();
+    sim
 }
 
 /// The region's loop. Answers what the body answered, or `None` with the context failed.
@@ -574,9 +584,11 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
         Request::Failed => {
             release(c, task);
             // Bound for a frame around the region, which carries it on once the region is over.
-            if c.failed == FAILED_UNWIND || c.failed == FAILED_ABORT {
+            if c.failed == FAILED_UNWIND || c.failed == FAILED_ABORT || c.failed == FAILED_TARGET {
                 return Err(None);
             }
+            // A raise nothing in the task answers fails the task, as one no frame answered did.
+            c.pending = None;
             let failure = c.diagnostic.take().unwrap_or_else(|| {
                 Diagnostic::error(codes::INTERNAL_ERROR, "a task failed without a diagnostic")
             });
@@ -967,7 +979,7 @@ unsafe fn taken(ctx: *mut Ctx, args: &[Word], op: &PlyOp) -> Option<Vec<Arg>> {
 unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp) -> Option<Body> {
     let f = Block::of(w);
     match op.vars().first() {
-        Some(ty) => Some(Body(f, ty)),
+        Some(ty) => Some(Body(f, ty, (0, 0))),
         None => {
             unsafe { f.let_go_function(ctx) };
             unsafe { &mut *ctx }.fail(err_crossing(

@@ -20,8 +20,18 @@ pub unsafe extern "C" fn rt_with_cleanup(
     answer: *const PlyType,
 ) -> Handed {
     use crate::frames::{Held, held_across};
-    let entered = crate::simulate::shield(unsafe { &mut *ctx }, Shield::Acquire);
+    let c = unsafe { &mut *ctx };
+    // The three share the bracket's row: each is handed the words its caller set for it.
+    let words = (c.entering_desc, c.entering_words);
+    let entering = move || {
+        let c = unsafe { &mut *ctx };
+        (c.entering_desc, c.entering_words) = words;
+    };
+    c.entering_desc = 0;
+    c.entering_words = 0;
+    let entered = crate::simulate::shield(c, Shield::Acquire);
     let f = acquire.word();
+    entering();
     let holding = [
         Held::Closure(acquire),
         Held::Closure(body),
@@ -62,6 +72,7 @@ pub unsafe extern "C" fn rt_with_cleanup(
             Held::Closure(cleanup),
             Held::Carried(held),
         ];
+        entering();
         let (r, back) = unsafe { held_across(ctx, holding, || Block::of(f).call(ctx, &[given])) };
         let [
             Held::Closure(body),
@@ -83,6 +94,8 @@ pub unsafe extern "C" fn rt_with_cleanup(
         && ending != FAILED_UNWIND
         && ending != FAILED_CANCELLED
         && ending != FAILED_ABORT
+        && ending != FAILED_TARGET
+        && ending != FAILED_PENDING
     {
         held.release(ctx);
         unsafe { cleanup.let_go_function(ctx) };
@@ -91,11 +104,19 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let answered = answered.filter(|_| ending == 0);
     let unwinding = c.unwind.take();
     let raising = c.aborting.take();
+    let target = c.target;
+    let pending = c
+        .pending
+        .take()
+        .map(|message| (message, c.diagnostic.take()));
     c.failed = 0;
     let entered = crate::simulate::shield(c, Shield::Release);
     let raise = raising.map(|a| c.keep(Kept::Raising(a)));
     let (f, given) = (cleanup.word(), held.handed().word());
-    let call = || unsafe { Block::of(f).call(ctx, &[given]) };
+    let call = || {
+        entering();
+        unsafe { Block::of(f).call(ctx, &[given]) }
+    };
     let (cleanup, answered) = match answered {
         Some(a) => {
             let (_, back) =
@@ -138,17 +159,25 @@ pub unsafe extern "C" fn rt_with_cleanup(
     c.failed = ending;
     c.unwind = unwinding;
     c.aborting = raising;
+    c.target = target;
+    if let Some((message, diagnostic)) = pending {
+        c.pending = Some(message);
+        c.diagnostic = diagnostic;
+    }
     answered.map_or(Handed::of(0), Carried::handed)
 }
 
 /// [`cancel_here`] where what a clause unwinds with is emitted code's, which is abandoned uncounted.
 fn cancel_carried(c: &mut Ctx) {
-    if c.failed != FAILED_UNWIND && c.failed != FAILED_ABORT {
+    if ![FAILED_UNWIND, FAILED_ABORT, FAILED_TARGET, FAILED_PENDING].contains(&c.failed) {
         return;
     }
     c.unwind = None;
     if let Some(raise) = c.aborting.take() {
         raise.into_failure();
+    }
+    if c.pending.take().is_some() {
+        c.diagnostic = None;
     }
     c.failed = FAILED_CANCELLED;
 }

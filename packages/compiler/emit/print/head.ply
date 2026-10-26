@@ -8,7 +8,8 @@ import compiler.emit.layout (MachineStruct, MachineField, head_structs, text_hea
                              tag_bits, header_bytes, frame_count)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Machine, natives, machine_structs, obj_struct, ctx_struct,
-                          release_depth)
+                          release_depth, failed_target, failed_pending)
+import compiler.emit.tir.handling (raised_at)
 import compiler.emit.roots (builtin_helper)
 import compiler.cc (tail_mark)
 import compiler.emit.print.frames (chain_defined)
@@ -203,17 +204,89 @@ fn head_part() -> Bytes / {abort.raise} =
     structs(),
     b"typedef struct { PlyObj h; const PlyFnDesc *desc; } PlyFnBlock;\n",
     words_mapped(),
+    entries_defined(),
     byte_texts_declared(),
     chain_defined(),
     drops(),
     shared_sequences(),
   ])
 
+/// What performs and `handle`s enter evidence objects through. An object is a flags word, then an
+/// entry and its environment per operation of its effect; `ply_perform` calls operation `k`'s with
+/// the operation's `op#`, its mode, the resource and the array of the arguments' words, which has
+/// a word to spare past them. A clause's slot has the clause's record in its `handle`'s instance as
+/// its environment: the clause's closure, the instance and the clause's place. `ply_answers` answers
+/// the perform with what the clause answers; `ply_resumes` hands the clause a continuation in the
+/// spare word, which records what it is resumed with, and a clause that did not resume unwinds to
+/// its instance with what it answered; `ply_raises` leaves the raise's arguments in the instance and
+/// unwinds to it, whose landing runs the clause. A perform a clause answers is recorded where the
+/// context arms recording; the runtime records no raise. `ply_pending_raised` raises a raise left
+/// pending through word `w`.
+fn entries_defined() -> Bytes =
+  Bytes::concat_all([
+    b"#define PLY_FAILED_TARGET ",
+    ascii_of_int(failed_target()),
+    b"\n#define PLY_FAILED_PENDING ",
+    ascii_of_int(failed_pending()),
+    b"\n",
+    b"typedef Word (*PlyEntry)(PlyCtx *, Word, Word, Word, Word, Word);\n",
+    b"static inline Word ply_perform(PlyCtx *ctx, Word w, int64_t k, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *o = (const Word *)(intptr_t)w;\n",
+    b"  return ((PlyEntry)(intptr_t)o[1 + 2 * k])(ctx, o[2 + 2 * k], op, mode, res, args);\n",
+    b"}\n",
+    b"static inline Word ply_uniform(PlyCtx *ctx, Word f, const Word *args) {\n",
+    b"  return ((const PlyFnDesc *)(intptr_t)ply_words(f)[0])->uniform(ctx, f, args);\n",
+    b"}\n",
+    b"static Word ply_answers(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  return ply_uniform(ctx, e[0], (const Word *)(intptr_t)args);\n",
+    b"}\n",
+    b"static Word ply_resumed(PlyCtx *ctx, Word self, const Word *args) {\n",
+    b"  Word *k = ply_words(self);\n",
+    b"  (void)ctx;\n",
+    b"  k[1] = args[0]; k[2] = 1;\n",
+    b"  return args[0];\n",
+    b"}\n",
+    b"static Word ply_resumed_kept(PlyCtx *ctx, Word self) { (void)ctx; (void)self; return 0; }\n",
+    b"static const PlyFnDesc ply_resumed_desc = { ply_resumed, 0, 0, ply_resumed_kept, ply_resumed_kept, ply_resumed_kept };\n",
+    b"static Word ply_resumes(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  Word *a = (Word *)(intptr_t)args;\n",
+    b"  Word k[4] = { (Word)PLY_RC_FRAME, (Word)(intptr_t)&ply_resumed_desc, 0, 0 };\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  a[((const PlyOp *)(intptr_t)op)->params_len] = (Word)(intptr_t)k;\n",
+    b"  Word r = ply_uniform(ctx, e[0], a);\n",
+    b"  if (ctx->failed || k[3]) return ctx->failed ? 0 : r;\n",
+    b"  Word *in = (Word *)(intptr_t)e[1];\n",
+    b"  in[1] = -1; in[2] = r;\n",
+    b"  ctx->target = e[1]; ctx->failed = PLY_FAILED_TARGET;\n",
+    b"  return 0;\n",
+    b"}\n",
+    b"static Word ply_raises(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  const Word *a = (const Word *)(intptr_t)args;\n",
+    b"  Word *in = (Word *)(intptr_t)e[1];\n",
+    b"  (void)mode; (void)res;\n",
+    b"  in[1] = e[2];\n",
+    b"  for (int64_t i = 0; i < ((const PlyOp *)(intptr_t)op)->params_len; i++) in[",
+    ascii_of_int(raised_at()),
+    b" + i] = a[i];\n",
+    b"  ctx->target = e[1]; ctx->failed = PLY_FAILED_TARGET;\n",
+    b"  return 0;\n",
+    b"}\n",
+    b"static inline void ply_pending_raised(PlyCtx *ctx, Word w, int64_t k, Word op, Word string) {\n",
+    b"  if (ctx->failed != PLY_FAILED_PENDING) return;\n",
+    b"  Word m[2] = { rt_pending_raised_p(ctx, string), 0 };\n",
+    b"  if (!ctx->failed) ply_perform(ctx, w, k, op, 2, -1, (Word)(intptr_t)m);\n",
+    b"}\n",
+  ])
+
 /// How a closure's entry reads its own words off what its caller hands, where the caller names
 /// another row: a row's descriptor holds its count, then each word's effect and resource, `-3` for a
 /// label handed past the words, in order. Each of the closure's words is the caller's that answers
-/// the same effect on a resource covering its own, the `n`th alike for the `n`th, and zero where the
-/// caller names none, as the runtime, which hands nothing, does.
+/// the same effect on a resource covering its own, the `n`th alike for the `n`th, and the frame
+/// bridge where the caller names none, as where the runtime calls it handing nothing.
 fn words_mapped() -> Bytes =
   Bytes::concat_all([
     b"static inline Word ply_row_label(const Word *row, const Word *labels, int64_t i) {\n",
@@ -221,13 +294,13 @@ fn words_mapped() -> Bytes =
     b"  for (int64_t j = 0; j < i; j++) if (row[2 + 2 * j] == -3) left++;\n",
     b"  return row[2 + 2 * i] == -3 ? labels[left] : row[2 + 2 * i];\n",
     b"}\n",
-    b"static inline void ply_words_mapped(const Word *own, const Word *labels, const Word *site, const Word *words, Word *out) {\n",
+    b"static inline void ply_words_mapped(PlyCtx *ctx, const Word *own, const Word *labels, const Word *site, const Word *words, Word *out) {\n",
     b"  int64_t n = own[0], m = site ? site[0] : 0;\n",
     b"  for (int64_t i = 0; i < n; i++) {\n",
     b"    Word effect = own[1 + 2 * i], label = ply_row_label(own, labels, i);\n",
     b"    int64_t alike = 0;\n",
     b"    for (int64_t j = 0; j < i; j++) if (own[1 + 2 * j] == effect && ply_row_label(own, labels, j) == label) alike++;\n",
-    b"    out[i] = 0;\n",
+    b"    out[i] = ctx->bridge;\n",
     b"    for (int64_t j = 0; j < m; j++) {\n",
     b"      if (site[1 + 2 * j] != effect) continue;\n",
     b"      if (site[2 + 2 * j] != -2 && ply_row_label(site, words + m, j) != label) continue;\n",
