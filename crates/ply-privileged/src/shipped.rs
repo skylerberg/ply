@@ -2,11 +2,12 @@
 
 use ply_core::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
 use ply_core::{Diagnostic, Value as PlyValue, codes};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 11] = [
+const OPERATIONS: [(&str, &str); 12] = [
     ("names", "ply_privileged::shipped::names"),
     ("module", "ply_privileged::shipped::module"),
     ("answer", "ply_privileged::shipped::answer"),
@@ -17,6 +18,7 @@ const OPERATIONS: [(&str, &str); 11] = [
     ("runtime", "ply_privileged::shipped::runtime"),
     ("runnable", "ply_privileged::shipped::runnable"),
     ("values", "ply_privileged::shipped::values"),
+    ("entered", "ply_privileged::shipped::entered"),
     ("definitions", "ply_privileged::shipped::definitions"),
 ];
 
@@ -148,6 +150,16 @@ impl HostHandler for Shipped {
                 PlyValue::bytes(bytes)
             }
             ("values", [library, roots, steps]) => values(library, roots, steps, span)?,
+            ("entered", [library, runnable, argument, steps]) => {
+                let library = std::path::PathBuf::from(library.as_str(span, "the unit's library")?);
+                let runnable =
+                    std::path::PathBuf::from(runnable.as_str(span, "the unit's runnable")?);
+                let argument = argument.as_bytes(span, "an argument")?;
+                let steps = steps.as_int(span, "the calls the entry may make")?;
+                crate::payload::option(
+                    entry_answered(library, runnable, argument, steps, span)?.map(PlyValue::bytes),
+                )
+            }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
         Ok(HostAnswer::Value(value))
@@ -198,6 +210,65 @@ fn values(
             })
             .collect(),
     ))
+}
+
+/// A deriver's unit as [`entry_answered`] keeps it: opened once a process, with the root its
+/// runnable names.
+type Kept = (Arc<ply_compiled::entry::Opened>, String);
+
+/// Each unit [`entry_answered`] opened, by its library and its runnable.
+static OPENED: OnceLock<std::sync::Mutex<std::collections::HashMap<(PathBuf, PathBuf), Kept>>> =
+    OnceLock::new();
+
+/// What the entry the runnable at `runnable` names, its unit compiled into `library`, answers for
+/// the value the PLV1 bytes `argument` hold under `steps` calls, as the root writes it: none where it
+/// raised, ran past its calls or answered nothing a run can hold.
+fn entry_answered(
+    library: PathBuf,
+    runnable: PathBuf,
+    argument: &[u8],
+    steps: i64,
+    span: ply_core::Span,
+) -> Result<Option<Vec<u8>>, Diagnostic> {
+    use ply_compiled::entry::{self, Ended, Opened, Run};
+    let refused = |why: String| {
+        Diagnostic::error(codes::INTERNAL_ERROR, why).primary(span, "this is Ply's fault")
+    };
+    let key = (library, runnable);
+    let kept = {
+        let mut opened = OPENED
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match opened.get(&key) {
+            Some(kept) => kept.clone(),
+            None => {
+                let held = std::fs::read(&key.1)
+                    .map_err(|e| format!("`{}` does not read: {e}", key.1.display()))
+                    .and_then(|bytes| crate::runnable::decode(&bytes))
+                    .map_err(|why| refused(format!("an entered unit's runnable: {why}")))?;
+                let unit = Opened::open(&key.0)
+                    .map_err(|why| refused(format!("an entered unit does not load: {why}")))?;
+                let kept = (unit, held.entry);
+                opened.insert(key, kept.clone());
+                kept
+            }
+        }
+    };
+    let value = ply_core::codec::decode(argument)
+        .map_err(|why| refused(format!("an entered unit's argument does not decode: {why}")))?;
+    let arguments = ply_core::codec::encode(&PlyValue::list(vec![value]))
+        .map_err(|why| refused(format!("an entered unit's argument does not encode: {why}")))?;
+    let run = Run {
+        steps,
+        ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
+    };
+    Ok(
+        match entry::enter(&kept.0, &kept.1, arguments, &run, None).ended {
+            Ended::Answered(bytes) => Some(bytes),
+            _ => None,
+        },
+    )
 }
 
 /// The runtime a unit is compiled against as a released `ply`'s bootstrap reads it, written as

@@ -3142,11 +3142,7 @@ derive json for Line
 | deriver | generates | type |
 | --- | --- | --- |
 | `json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
-| `eq` | `<snake_case(T)>_eq` | `{eq: (T, T) -> Bool}` |
-| `ord` | `<snake_case(T)>_ord` | `{compare: (T, T) -> Ordering}` |
 | `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
-| `show` | `<snake_case(T)>_show` | `{show: (T) -> String}`, writing what `std.show.show` does |
-| `hash` | `<snake_case(T)>_hash` | `{hash: (T) -> Bytes}`, the value's `digest` |
 | `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
 
 Any other name is a library deriver (below). `snake_case` is `std.text`'s, so a
@@ -3180,19 +3176,18 @@ level makes a codec; `tree_bin()` hands each to its definition at
 `json`'s bound is 128 levels, as deep as `parse` reads, and `bin`'s is 10,000, as
 deep as calls nest (§5.7).
 
-`E0206` names the field that blocks a derivation: function types, `Task` and
-`Chan` (all derivers); `Float` (`ord`, `hash`); `Secret` (`json`, `ord`,
-`bin`, `show`, `hash`); `Option<Unit>` and `Option<Option<a>>` (`json`). `json`
-and `bin` need their module imported (`import std.json`, `import std.bin`), or
-the `derive` is `E0206`; `show` imports `std.show` itself. A type that binds a
-label (§4.5), or a field whose type is given one, is `E0206` too: only a function's
-row has a use for a label. A row parameter the fields leave unused is carried
-through, `tagged_eq : <a | e>({eq: ..}) -> {eq: (Tagged<a | e>, ..) -> Bool}`.
+`E0206` names the field that blocks a derivation: function types, `Task`, `Chan`
+and `Secret`; `Option<Unit>` and `Option<Option<a>>` (`json`). `json` and `bin`
+need their module imported (`import std.json`, `import std.bin`), or the
+`derive` is `E0206`. A type that binds a label (§4.5), or a field whose type is
+given one, is `E0206` too: only a function's row has a use for a label. A row
+parameter the fields leave unused is carried through,
+`tagged_json : <a | e>(JsonCodec<a>) -> JsonCodec<Tagged<a | e>>`. A type that
+states a `key` or a `show` (§4.4) is encoded by its fields as they are.
 
-A type that states a `key` (§4.4) derives `eq`, `ord` and `hash` from what the
-key answers, and one that states a `show` derives `show` from that function: the
-dictionaries call `==`, `compare`, `digest` and `show`, which read them. `json`
-and `bin` encode the fields as they are.
+`==`, `compare`, `digest` and `show` need no derivation: they read any value its
+type admits, and `where derivable(eq, a)`, `derivable(ord, a)`,
+`derivable(hash, a)` and `derivable(show, a)` hold a type parameter to them.
 
 `row` is a record's row in a SQL table, a column per field under the field's
 name, read and written in the order the fields are declared:
@@ -3232,10 +3227,11 @@ derive map for Tree
 
 A deriver is `pub fn derive(declaration: derive::Declaration) ->
 Result<String, derive::Refused>`, performing nothing but a raise; `std.derive`
-says what a declaration holds. The check enters it as it enters a `const fn`
-(§3.5), on a machine of its own and under the same budget, and keeps its answer
-in the toolchain's cache under the declaration and the texts of the modules the
-deriver reaches, so it runs again only after an edit to one of them. A deriver
+says what a declaration holds. The check compiles a deriver once and enters it
+for each declaration on a machine of its own, under a `const fn`'s budget
+(§3.5), and keeps each answer in the toolchain's cache under the declaration and
+the texts of the modules the deriver reaches, so it runs again only after an edit
+to one of them. A deriver
 is a shipped module or one of the program's own, and its modules derive nothing
 through a library deriver. A name that is no built-in deriver and no binder in
 scope is `E0207`; a module whose `derive` is no deriver, `E0160`; a refusal,
