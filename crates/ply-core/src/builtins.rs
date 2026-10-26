@@ -83,9 +83,6 @@ builtins! { $
     IntOfI16 = "Int::of_i16" (n) -> Word;
     IntOfI32 = "Int::of_i32" (n) -> Word;
     IntOfI64 = "Int::of_i64" (n) -> Word;
-    BytesGzip = "Bytes::gzip" (b) -> Word;
-    BytesGunzip = "Bytes::gunzip" (b) -> Word;
-    BytesZstd = "Bytes::zstd" (b) -> Word;
     Compare = "compare" (x, y) -> Word;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues = "compare_values" (x, y) -> Word;
@@ -400,35 +397,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
                     .map(Value::Int),
             };
             Ok(option(answer))
-        }
-
-        // At the best level, so what a writer seals is a function of the bytes alone.
-        Builtin::BytesGzip => {
-            use std::io::Write;
-            let b = args[0].as_bytes(span, "`Bytes::gzip`")?;
-            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-            let sealed = gz.write_all(b).and_then(|()| gz.finish());
-            Ok(Value::bytes(sealed.expect("writing to memory cannot fail")))
-        }
-
-        Builtin::BytesGunzip => {
-            use std::io::Read;
-            let b = args[0].as_bytes(span, "`Bytes::gunzip`")?;
-            let mut out = Vec::new();
-            let read = flate2::read::GzDecoder::new(&b[..]).read_to_end(&mut out);
-            Ok(option(read.ok().map(|_| Value::bytes(out))))
-        }
-
-        // One pass, so the frame says how long it is and a reader's window is no larger.
-        Builtin::BytesZstd => {
-            let b = args[0].as_bytes(span, "`Bytes::zstd`")?;
-            let sealed = zstd::bulk::Compressor::new(3).and_then(|mut z| {
-                z.set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))?;
-                z.compress(b)
-            });
-            Ok(Value::bytes(
-                sealed.expect("compressing in memory cannot fail"),
-            ))
         }
 
         Builtin::ArrayOfList | Builtin::ColumnsOfList => Ok(Value::array(

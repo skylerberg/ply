@@ -27,9 +27,6 @@ pub fn natives() -> Vec<MachineNative> {
             "?text_encoded",
             rt_text_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native("?gzip", rt_gzip as unsafe extern "C" fn(_, _, _) -> _),
-        machine_native("?gunzip", rt_gunzip as unsafe extern "C" fn(_, _, _) -> _),
-        machine_native("?zstd", rt_zstd as unsafe extern "C" fn(_, _, _) -> _),
         machine_native(
             "?secret_of",
             rt_secret_of as unsafe extern "C" fn(_, _, _, _) -> _,
@@ -136,22 +133,6 @@ impl Ctx {
             }
         }
     }
-
-    /// The bytes of the string or byte string builtin `b` answers over `args`, as taken bytes.
-    fn taken_of(&mut self, b: Builtin, args: Vec<Value>) -> I64 {
-        match &self.builtin(b, args) {
-            Some(Value::Str(s)) => self.give(s.as_bytes().to_vec()),
-            Some(Value::Bytes(b)) => self.give(b.to_vec()),
-            Some(other) => {
-                self.fail(err_machine(&format!(
-                    "{} answered where bytes were",
-                    other.type_name()
-                )));
-                I64(0)
-            }
-            None => I64(0),
-        }
-    }
 }
 
 /// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
@@ -218,34 +199,6 @@ fn encoded_given(c: &mut Ctx, v: &Value) -> I64 {
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { lent(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
-}
-
-/// `Bytes::gzip` of the `n` bytes at `p`, as taken bytes.
-pub unsafe extern "C" fn rt_gzip(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let b = Value::bytes(unsafe { lent(p, n) });
-    unsafe { &mut *ctx }.taken_of(Builtin::BytesGzip, vec![b])
-}
-
-/// `Bytes::zstd` of the `n` bytes at `p`, as taken bytes.
-pub unsafe extern "C" fn rt_zstd(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let b = Value::bytes(unsafe { lent(p, n) });
-    unsafe { &mut *ctx }.taken_of(Builtin::BytesZstd, vec![b])
-}
-
-/// `Bytes::gunzip` of the `n` bytes at `p`: how many bytes it unpacked, left as taken bytes, or -1
-/// for `None`.
-pub unsafe extern "C" fn rt_gunzip(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match &c.builtin(
-        Builtin::BytesGunzip,
-        vec![Value::bytes(unsafe { lent(p, n) })],
-    ) {
-        Some(Value::Ctor { name, args }) if name.as_str() == "Some" => match args.first() {
-            Some(Value::Bytes(b)) => c.give(b.to_vec()),
-            _ => I64(-1),
-        },
-        _ => I64(-1),
-    }
 }
 
 /// A credential holding the `n` bytes at `p`, a `Secret<String>` where `text` is not 0 and a
