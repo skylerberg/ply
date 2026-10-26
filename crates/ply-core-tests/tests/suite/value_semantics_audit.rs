@@ -102,7 +102,7 @@ fn probe_values() -> Vec<(&'static str, Value)> {
         ("list [1]", Value::list(vec![Value::Int(1)])),
         ("list [1.5m]", Value::list(vec![dec(15, 1)])),
         ("list [1.50m]", Value::list(vec![dec(150, 2)])),
-        ("map empty", Value::empty_map()),
+        ("map empty", Value::map([])),
         ("map {1: 1}", Value::map([(Value::Int(1), Value::Int(1))])),
         (
             "record {a: 1.5m}",

@@ -14,10 +14,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[(
     "Two consumers and no producer: `Diagnostic`'s Display in \
          crates/ply-core/src/span.rs heads a diagnostic \"Note\", and \
          crates/ply-compiled/src/entry.rs writes a failure's severity for the program. \
-         Nothing builds one. Severity also derives Deserialize, so a Note could \
-         in principle arrive from a stored diagnostic rather than from a \
-         constructor — nothing in the workspace writes one, and the gate cannot \
-         see serde either way. Disposition not decided here.",
+         Nothing builds one. Disposition not decided here.",
 )];
 
 /// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.

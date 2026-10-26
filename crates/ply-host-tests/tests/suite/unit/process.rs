@@ -900,14 +900,12 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         parked.elapsed()
     );
     assert!(
-        run.answered().contains(&waiting.token) && run.poll(&waiting).is_ok(),
+        run.answered().contains(&waiting.token) && run.taken(&waiting).is_ok(),
         "the child's end is what woke the park"
     );
 
     let peer = std::net::TcpStream::connect(net.local_addr(listener).expect("a bound port"))
         .expect("a peer connects");
-    runtime
-        .block_on(accepting)
-        .expect("the accept takes the peer");
+    ply_host::registry::job_bytes(&*runtime, &accepting).expect("the accept takes the peer");
     drop(peer);
 }

@@ -371,7 +371,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
     let outcome = entry::enter(
         &opened,
         entry,
-        entry::no_arguments(),
+        entry::NO_ARGUMENTS.to_vec(),
         &run,
         Some(&hosts),
         None,

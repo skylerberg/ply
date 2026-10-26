@@ -7,7 +7,6 @@ use crate::c::{MachineNative, machine_native};
 use crate::entry::{self, Ended, Opened, Run};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
-use ply_core::Value;
 use ply_host::native::{found, int, parts};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -200,7 +199,7 @@ pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
 /// What each stored root lent as parts at `rp` answers on the unit compiled into the library at
 /// `lp`, entered by name with nothing, binding no host, under `steps` calls, as parts each found:
 /// the bytes a build keeps its definition's value as, or none for a root that raised, ran past its
-/// calls, answered anything else or is not in the unit.
+/// calls or is not in the unit.
 pub unsafe extern "C" fn rt_shipped_values(
     ctx: *mut Ctx,
     lp: Addr,
@@ -231,8 +230,8 @@ pub unsafe extern "C" fn rt_shipped_values(
             roots
                 .iter()
                 .map(|root| {
-                    match entry::enter(&opened, root, entry::no_arguments(), &run, None, None).ended
-                    {
+                    let arguments = entry::NO_ARGUMENTS.to_vec();
+                    match entry::enter(&opened, root, arguments, &run, None, None).ended {
                         Ended::Answered(bytes) => Some(bytes),
                         _ => None,
                     }
@@ -240,20 +239,15 @@ pub unsafe extern "C" fn rt_shipped_values(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_else(|| roots.iter().map(|_| None).collect());
-        let kept: Vec<Vec<u8>> = answered
-            .into_iter()
-            .map(|bytes| {
-                found(bytes.filter(|b| matches!(ply_core::codec::decode(b), Ok(Value::Bytes(_)))))
-            })
-            .collect();
+        let kept: Vec<Vec<u8>> = answered.into_iter().map(found).collect();
         let kept: Vec<&[u8]> = kept.iter().map(Vec::as_slice).collect();
         c.given(parts(&kept))
     })
 }
 
-/// What the root at `rp`, a function of one parameter of the unit compiled into the library at
-/// `lp`, answers for the value the PLV1 at `ap` holds under `steps` calls, found: none where it
-/// raised, ran past its calls or answered nothing a run can hold.
+/// What the root at `rp` of the unit compiled into the library at `lp` answers for the arguments,
+/// the PLV1 list at `ap`, under `steps` calls, found: none where it raised, ran past its calls or
+/// answered nothing a run can hold.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_shipped_entered(
     ctx: *mut Ctx,
@@ -269,27 +263,17 @@ pub unsafe extern "C" fn rt_shipped_entered(
         let (Some(library), Some(root)) = (text_at(c, lp, ln), text_at(c, rp, rn)) else {
             return TakenBytes(0);
         };
-        let refused =
-            |why: String| ply_core::Diagnostic::error(ply_core::codes::INTERNAL_ERROR, why);
-        let arguments = opened_unit(Path::new(&library))
-            .map_err(|why| refused(format!("an entered unit does not load: {why}")))
-            .and_then(|opened| {
-                let value = ply_core::codec::decode(unsafe { lent(ap, an) }).map_err(|why| {
-                    refused(format!("an entered unit's argument does not decode: {why}"))
-                })?;
-                let arguments =
-                    ply_core::codec::encode(&Value::list(vec![value])).map_err(|why| {
-                        refused(format!("an entered unit's argument does not encode: {why}"))
-                    })?;
-                Ok((opened, arguments))
-            });
-        let (opened, arguments) = match arguments {
-            Ok(both) => both,
-            Err(d) => {
-                c.fail(d);
+        let opened = match opened_unit(Path::new(&library)) {
+            Ok(opened) => opened,
+            Err(why) => {
+                c.fail(ply_core::Diagnostic::error(
+                    ply_core::codes::INTERNAL_ERROR,
+                    format!("an entered unit does not load: {why}"),
+                ));
                 return TakenBytes(0);
             }
         };
+        let arguments = unsafe { lent(ap, an) }.to_vec();
         let run = Run {
             steps: steps.0,
             ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)

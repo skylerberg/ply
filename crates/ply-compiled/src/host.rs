@@ -6,9 +6,8 @@ use crate::heap::Word;
 use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
-    Bound, HostAnswer, HostBinding, HostRequest, Unserved, attribute, carries_secret,
-    check_host_answer, err_blocking_answered_inline, err_footprint_escape, err_host_in_search,
-    err_host_in_simulation, err_secret_to_host, err_withheld, operation_label, resource_of,
+    HostBinding, HostOp, err_footprint_escape, err_host_in_search, err_host_in_simulation,
+    operation_label, resource_of,
 };
 use ply_core::{Diagnostic, Span, Symbol, Value, codes};
 use ply_core::{EffectAtom, Mode};
@@ -60,28 +59,25 @@ pub(crate) enum Served {
 }
 
 /// What the binding makes of `effect.op` before any argument is read: refused where a seeded region
-/// is in reach of what would serve it, or where nothing it binds does; otherwise what serves it.
+/// is in reach of what would serve it, or where nothing it binds does; otherwise its declaration.
 fn bound<'b>(
     c: &Ctx,
     binding: &'b HostBinding,
     effect: &Symbol,
     op: &Symbol,
     resource: Option<&Symbol>,
-) -> Result<Bound<'b>, Diagnostic> {
+) -> Result<&'b HostOp, Diagnostic> {
     let span = c.site();
-    let operation = operation_label(effect, op, resource);
     let resolved = binding.resolve(effect, op, resource);
-    // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
-    // any handler could give, bound or withheld, would differ between interleavings.
+    // Ahead of every other refusal: under a seed the region is re-run per schedule, so what the
+    // host answered would differ between interleavings.
     if let Some(region) = crate::tasks::seeded_region(c)
-        && !matches!(resolved, Err(Unserved::Unregistered))
+        && resolved.is_some()
     {
+        let operation = operation_label(effect, op, resource);
         return Err(err_host_in_simulation(span, &operation, region));
     }
-    resolved.map_err(|unserved| match unserved {
-        Unserved::Unregistered => err_unhandled(span, effect, op, resource),
-        Unserved::Withheld { path, served } => err_withheld(span, &operation, effect, path, served),
-    })
+    resolved.ok_or_else(|| err_unhandled(span, effect, op, resource))
 }
 
 /// Whether `effect.op`, which nothing on the stack answers, is a sleep by a task of the run's
@@ -151,86 +147,29 @@ pub(crate) unsafe fn serve(
     let c = unsafe { &mut *ctx };
     let failed = |c: &mut Ctx, d: Diagnostic| Served::Word(c.fail(d));
     let span = c.site();
-    let operation = operation_label(effect, op, resource);
     let binding = Arc::clone(&c.binding);
-    let bound = match bound(c, &binding, effect, op, resource) {
-        Ok(bound) => bound,
+    let declaration = match bound(c, &binding, effect, op, resource) {
+        Ok(declaration) => declaration,
         Err(d) => return failed(c, d),
     };
     let atom = EffectAtom::operation(effect.clone(), resource_of(resource), mode, op.clone());
-    let declaration = bound.op.clone();
-    let handler = Arc::clone(bound.handler);
     if let Some(declared) = &c.declared
         && !declared.covers(&atom)
     {
+        let operation = operation_label(effect, op, resource);
         return failed(
             c,
             err_footprint_escape(span, &operation, &atom, declared, declaration.path),
         );
     }
     if c.re_executed {
+        let operation = operation_label(effect, op, resource);
         return failed(c, err_host_in_search(span, &operation, declaration.path));
     }
-    if !declaration.secrets
-        && let Some(position) = values.iter().position(carries_secret)
-    {
-        return failed(
-            c,
-            err_secret_to_host(span, &operation, position, declaration.path),
-        );
-    }
-    if let Err(d) = ply_core::escape::check_arguments(&operation, declaration.path, &values, span) {
-        return failed(c, d);
-    }
-    let runtime = c.host_runtime();
-    let answered = {
-        let request = HostRequest {
-            atom: atom.clone(),
-            op: &declaration,
-            args: &values,
-            span,
-            machine: c.id,
-            task: crate::tasks::production_task(c),
-            declared: c.declared.as_ref(),
-        };
-        handler.call(runtime.as_ref(), &request)
-    };
+    let answered = ply_host::registry::answer(declaration, &*c.host_runtime(), &values, span);
     c.host_use.record(declaration.determinism);
-    if declaration.linearity.is_linear() {
-        c.host_ops = c.host_ops.saturating_add(1);
-        c.last_linear = Some(HostMark {
-            operation: operation.clone(),
-            path: declaration.path,
-            span,
-        });
+    match answered {
+        Ok(value) => Served::Value(value),
+        Err(d) => failed(c, d),
     }
-    let answer = match answered {
-        Ok(answer) => answer,
-        Err(d) => return failed(c, attribute(d, declaration.path, &operation, span)),
-    };
-    let value = match answer {
-        HostAnswer::Value(value) => {
-            if declaration.blocking {
-                return failed(
-                    c,
-                    err_blocking_answered_inline(span, &operation, declaration.path),
-                );
-            }
-            value
-        }
-        // A task of the run's region waits there for the answer, which is then at hand.
-        HostAnswer::Pending(pending) => {
-            match crate::tasks::waited(c, crate::tasks::ASK_TICKET, pending.token as i64) {
-                Some(false) => return Served::Word(0),
-                Some(true) | None => match runtime.block_on(pending) {
-                    Ok(value) => value,
-                    Err(d) => return failed(c, d),
-                },
-            }
-        }
-    };
-    if let Err(d) = check_host_answer(&operation, declaration.path, &value, span) {
-        return failed(c, d);
-    }
-    Served::Value(value)
 }

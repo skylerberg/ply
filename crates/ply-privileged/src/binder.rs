@@ -32,8 +32,8 @@ impl ply_compiled::entry::Binder for Binder {
 
     /// `hosting := list(registration), list(failure) refusals, option(transport), list(named)
     /// roots, sink, list(string) signals`; `registration := string effect, string op,
-    /// option(resource) (none for every label), bool deterministic, bool repeatable, bool blocking,
-    /// bool secrets, string handler`; `transport := string library, string
+    /// option(resource) (none for every label), bool deterministic, bool repeatable, string
+    /// handler`; `transport := string library, string
     /// version, string provider, list(string) versions, list(string) alpn, string roots, string
     /// roots_version, int trusted, list(credential)`; `credential := string name, string
     /// fingerprint, int certificates`; `named := string name, string path`; `sink := string sink,
@@ -51,8 +51,6 @@ impl ply_compiled::entry::Binder for Binder {
             );
             w.bool(op.determinism.is_deterministic())
                 .bool(!op.linearity.is_linear())
-                .bool(op.blocking)
-                .bool(op.secrets)
                 .str(op.path);
         });
         let mut refusals = Vec::new();

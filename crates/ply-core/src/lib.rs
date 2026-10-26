@@ -40,12 +40,12 @@ pub use builtins::{Builtin, assert_failure, assertion_failure};
 pub use escape::{Boundary, Escapee, Handle};
 pub use footprint::{EffectAtom, Footprint, Mode, Resource, atom_texts, label_var_name};
 pub use host::{
-    Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
-    HostResource, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory, ShutdownReport,
+    Determinism, HostBinding, HostOp, HostRegistry, HostResource, HostRuntime, HostUse, Linearity,
+    Pending, RuntimeFactory, ShutdownReport,
 };
 pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
-pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
+pub use plain::{Fun, Plain};
 pub use rc::RcStats;
 pub use semantics::{strict_binary, unstated};
 pub use sim::{Seed, SimId, TaskId};

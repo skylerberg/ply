@@ -1,5 +1,5 @@
-use ply_core::codes;
 use ply_core::host::{Determinism, HostOp, Linearity, Pending};
+use ply_core::{Span, codes};
 use ply_host::{Host, registry};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,11 +76,22 @@ fn every_repeatable_operation_is_one_that_was_argued_for() {
     );
 }
 
+/// The host answers the clock a host made, and nothing else reaches it.
 #[test]
-fn a_registry_and_a_runtime_come_from_one_host() {
-    let host = Host::new();
-    assert!(!host.registry().is_empty());
-    let runtime = host.runtime();
+fn the_host_answers_the_clock_it_registers() {
+    let runtime = Host::new().runtime();
+    for op in registry().ops() {
+        assert_eq!(op.effect.as_str(), "clock", "`{op}`");
+        if op.op.as_str() == "now" {
+            ply_host::registry::answer(op, &*runtime, &[], Span::DUMMY)
+                .unwrap_or_else(|d| panic!("`{op}` was refused: {}", d.message));
+        }
+    }
+}
+
+#[test]
+fn a_runtime_refuses_a_token_it_did_not_mint() {
+    let runtime = Host::new().runtime();
     let stray = Pending {
         token: 0,
         label: "stray",

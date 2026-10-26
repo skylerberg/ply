@@ -29,8 +29,6 @@ pub fn world_independent(value: &Value) -> bool {
             Value::Record(fields) => pending.extend(fields.values()),
             Value::Ctor { args, .. } => pending.extend(args.iter()),
             Value::Closure(closure) => match &closure.kind {
-                ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
-                ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),
                 ClosureKind::Continuation { .. } | ClosureKind::Hold { .. } => return false,
                 ClosureKind::Synth { rule, .. } => pending.extend(rule.values()),
             },

@@ -1,5 +1,5 @@
 use ply_core::codec::{Writer, decode, decode_with, encode, encode_with, fun, tag};
-use ply_core::{Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Symbol, Synth, Value};
+use ply_core::{Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Plain, Symbol, Synth, Value};
 use std::sync::Arc;
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -114,18 +114,6 @@ fn generated(arity: u8, rule: Synth) -> Value {
     }))
 }
 
-/// What a function the prover generated answers for `args`, which tells two apart where `Value`
-/// does not compare closures.
-fn applied(f: &Value, args: &[Value]) -> Value {
-    let Value::Closure(c) = f else {
-        panic!("{f:?} is no function")
-    };
-    let ClosureKind::Synth { rule, .. } = &c.kind else {
-        panic!("{f:?} is no generated function")
-    };
-    rule.apply(args).expect("it applies")
-}
-
 #[test]
 fn a_generated_function_comes_back_answering_as_it_did_nested_or_alone() {
     let constant = generated(2, Synth::Const(Value::str("three")));
@@ -156,11 +144,10 @@ fn a_generated_function_comes_back_answering_as_it_did_nested_or_alone() {
     let Value::Ctor { args, .. } = field("t") else {
         panic!()
     };
-    let (u, a, b) = (Value::Unit, Value::Int(1), Value::Int(2));
-    assert_eq!(applied(fs[0], &[u.clone(), u.clone()]), Value::str("three"));
-    assert_eq!(applied(fs[1], &[a.clone(), b.clone(), u]), b);
-    assert_eq!(applied(&args[0], &[a]), record(vec![("x", Value::Int(8))]));
-    assert_eq!(applied(&args[0], &[Value::Int(5)]), Value::Unit);
+    // `Value` does not compare closures; their plain forms say what each answers.
+    assert_eq!(Plain::of(fs[0]), Plain::of(&constant));
+    assert_eq!(Plain::of(fs[1]), Plain::of(&project));
+    assert_eq!(Plain::of(&args[0]), Plain::of(&table));
     for f in [constant, project, table] {
         assert_eq!(encode(&round_trip(&f)).unwrap(), encode(&f).unwrap());
     }

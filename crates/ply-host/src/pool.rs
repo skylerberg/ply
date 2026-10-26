@@ -5,7 +5,7 @@
 
 use crate::jobs::Failure;
 use crate::observe::Recorder;
-use ply_core::{Diagnostic, Pending, Span, Value, codes};
+use ply_core::{Diagnostic, Pending, Span, codes};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -181,7 +181,7 @@ impl Run {
             .any(|held| held.watched && held.answer.is_some())
     }
 
-    /// The watched operations answered and not yet taken, ascending, their answers left for `poll`.
+    /// The watched operations answered and not yet taken, ascending, their answers left for `taken`.
     pub fn answered(&self) -> Vec<u64> {
         let mut tokens: Vec<u64> = (lock(&self.held).iter())
             .filter(|(_, h)| h.watched && h.answer.is_some())
@@ -191,21 +191,8 @@ impl Run {
         tokens
     }
 
-    /// `pending`'s answer where it has one, which is then taken.
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.took(pending, value_of)
-    }
-
     /// The bytes a native's job answered `pending` where it has answered, which are then taken.
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
-        self.took(pending, bytes_of)
-    }
-
-    fn took<T>(
-        &self,
-        pending: &Pending,
-        read: fn(Span, &str, JobOutput) -> Result<T, Diagnostic>,
-    ) -> Result<Option<T>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
             None => return Err(err_unowned(pending)),
@@ -220,40 +207,22 @@ impl Run {
                 what,
                 answer: Some(answer),
                 ..
-            }) => read(span, what, answer).map(Some),
+            }) => bytes_of(span, what, answer).map(Some),
             _ => Ok(None),
         }
     }
 
-    /// `pending`'s answer once it has one, waiting for at most `bound` where one is given:
-    /// `None` where the bound passed first.
+    /// The bytes a native's job answered `pending` once it has answered, waiting for at most
+    /// `bound` where one is given: `None` where the bound passed first.
     pub fn block_on(
         &self,
         pending: &Pending,
         bound: Option<Duration>,
-    ) -> Result<Option<Value>, Diagnostic> {
-        self.waited(pending, bound, Run::poll)
-    }
-
-    /// The bytes a native's job answered `pending`, waited for as [`Run::block_on`] waits.
-    pub fn block_on_bytes(
-        &self,
-        pending: &Pending,
-        bound: Option<Duration>,
     ) -> Result<Option<Vec<u8>>, Diagnostic> {
-        self.waited(pending, bound, Run::taken)
-    }
-
-    fn waited<T>(
-        &self,
-        pending: &Pending,
-        bound: Option<Duration>,
-        take: fn(&Run, &Pending) -> Result<Option<T>, Diagnostic>,
-    ) -> Result<Option<T>, Diagnostic> {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
             let seen = self.bell.rung();
-            if let Some(answer) = take(self, pending)? {
+            if let Some(answer) = self.taken(pending)? {
                 return Ok(Some(answer));
             }
             match until {
@@ -296,12 +265,6 @@ impl Run {
             }
         }
     }
-}
-
-/// What the operation `what` asked at `span` answered, as the run reads it, a failure naming what
-/// asked for it.
-fn value_of(span: Span, what: &str, answer: JobOutput) -> Result<Value, Diagnostic> {
-    bytes_of(span, what, answer).map(Value::bytes)
 }
 
 /// The bytes a native's job answered, which is all one answers.

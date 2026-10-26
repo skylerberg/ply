@@ -1,25 +1,22 @@
-//! A value as plain data: what crosses a thread, the store and the machine boundary, and what
-//! `std.value.Value` holds on the Ply side. Nothing in Rust renders one; the CLI does.
+//! A value as plain data: what a diagnostic carries to show, as `std.value.Value` holds it on the
+//! Ply side. Nothing in Rust renders one; the CLI does.
 
 use crate::limit::grow;
-use crate::value::{Closure, ClosureKind, Fields, Synth};
-use crate::{IntTy, Symbol, Value};
+use crate::value::{ClosureKind, Synth};
+use crate::{IntTy, Value};
 use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 /// What `std.value.render` shows before eliding the rest of a collection.
-pub const SHOWN_ITEMS: usize = 32;
+const SHOWN_ITEMS: usize = 32;
 /// The nesting `std.value.render` shows before eliding what is inside.
-pub const SHOWN_DEPTH: usize = 16;
+const SHOWN_DEPTH: usize = 16;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Plain {
     Unit,
     Bool(bool),
     Int(i64),
     Float(f64),
-    #[serde(with = "decimal_bytes")]
     Decimal(Decimal),
     /// The pattern the width reads, with nothing above it: `-1i8` is `0xFF`.
     Fixed {
@@ -46,7 +43,7 @@ pub enum Plain {
     Array(Vec<Plain>),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Fun {
     Named(String),
     Anonymous,
@@ -77,57 +74,6 @@ impl Plain {
         snapshot(v, Some((SHOWN_ITEMS, SHOWN_DEPTH)), 0)
     }
 
-    /// The runtime value this names; `Err` says what cannot be one.
-    pub fn into_value(self) -> Result<Value, &'static str> {
-        Ok(match self {
-            Plain::Unit => Value::Unit,
-            Plain::Bool(b) => Value::Bool(b),
-            Plain::Int(i) => Value::Int(i),
-            Plain::Float(f) => Value::Float(f),
-            Plain::Decimal(d) => Value::Decimal(d),
-            Plain::Fixed { ty, bits } => Value::Fixed(crate::Fixed::new(ty, bits)),
-            Plain::Char(c) => Value::Char(c),
-            Plain::Str(s) => Value::str(s),
-            Plain::Bytes(b) => Value::bytes(b),
-            Plain::List(items) => Value::list(grow(|| values(items))?),
-            Plain::Array(items) => Value::array(grow(|| values(items))?),
-            Plain::Record(fields) => Value::Record(Arc::new(Fields::from_unsorted(
-                fields
-                    .into_iter()
-                    .map(|(name, v)| Ok((Symbol::new(name), grow(|| v.into_value())?)))
-                    .collect::<Result<_, &'static str>>()?,
-            ))),
-            Plain::Ctor(name, args) => Value::ctor(name, grow(|| values(args))?),
-            Plain::Map(entries) => Value::map(grow(|| pairs(entries))?),
-            Plain::Fn(Fun::Const { arity, value }) => {
-                synth(arity, Synth::Const((*value).into_value()?))
-            }
-            Plain::Fn(Fun::Project { arity, index }) if index < arity => {
-                synth(arity, Synth::Project(index))
-            }
-            Plain::Fn(Fun::Table {
-                arity,
-                entries,
-                default,
-            }) if arity > 0 => synth(
-                arity,
-                Synth::Table {
-                    entries: pairs(entries)?,
-                    default: (*default).into_value()?,
-                },
-            ),
-            Plain::Fn(Fun::Project { .. } | Fun::Table { .. }) => {
-                return Err("a generated function whose argument is not one of its own");
-            }
-            Plain::Fn(Fun::Named(_) | Fun::Anonymous) => {
-                return Err("a function the program wrote, which only its own run can hold");
-            }
-            Plain::Hold => return Err("a hold, which only its own `with_hold` can hold"),
-            Plain::Secret => return Err("a credential, whose payload never leaves the runtime"),
-            Plain::Elided(_) => return Err("a value a diagnostic cut short"),
-        })
-    }
-
     /// What a reader with no renderer is told in place of the value.
     pub fn describe(&self) -> &'static str {
         match self {
@@ -151,24 +97,6 @@ impl Plain {
             Plain::Elided(_) => "a value",
         }
     }
-}
-
-fn values(items: Vec<Plain>) -> Result<Vec<Value>, &'static str> {
-    items.into_iter().map(Plain::into_value).collect()
-}
-
-fn pairs(entries: Vec<(Plain, Plain)>) -> Result<Vec<(Value, Value)>, &'static str> {
-    entries
-        .into_iter()
-        .map(|(k, v)| Ok((k.into_value()?, v.into_value()?)))
-        .collect()
-}
-
-fn synth(arity: u8, rule: Synth) -> Value {
-    Value::Closure(Arc::new(Closure {
-        name: None,
-        kind: ClosureKind::Synth { arity, rule },
-    }))
 }
 
 /// `bound` is the items and the depth kept; `None` keeps everything.
@@ -249,19 +177,5 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
             },
         }),
         Value::Secret(_) => Plain::Secret,
-    }
-}
-
-/// `Decimal`'s own sixteen bytes, since the workspace builds it without serde.
-mod decimal_bytes {
-    use rust_decimal::Decimal;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
-
-    pub fn serialize<S: Serializer>(d: &Decimal, s: S) -> Result<S::Ok, S::Error> {
-        d.serialize().serialize(s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Decimal, D::Error> {
-        Ok(Decimal::deserialize(<[u8; 16]>::deserialize(d)?))
     }
 }

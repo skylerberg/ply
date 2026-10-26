@@ -1,17 +1,5 @@
 use ply_core::host::*;
-use ply_core::{Diagnostic, Resource, Symbol, codes};
-use std::sync::Arc;
-
-struct Never;
-
-impl HostHandler for Never {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        Err(
-            Diagnostic::error(codes::INTERNAL_ERROR, "the test handler was called")
-                .primary(req.span, "here"),
-        )
-    }
-}
+use ply_core::{Resource, Symbol};
 
 fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
     HostOp {
@@ -20,8 +8,6 @@ fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
         resource,
         determinism: Determinism::Nondeterministic,
         linearity: Linearity::AtMostOnce,
-        blocking: false,
-        secrets: false,
         path: "test::handler",
     }
 }
@@ -30,93 +16,57 @@ fn named(r: &str) -> HostResource {
     HostResource::Only(Resource::Named(Symbol::new(r)))
 }
 
-fn registry(ops: Vec<HostOp>) -> HostRegistry {
-    let mut registry = HostRegistry::new();
-    for op in ops {
-        registry.register(op, Arc::new(Never));
-    }
-    registry
-}
-
-fn codes_of(diagnostics: &[Diagnostic]) -> Vec<&'static str> {
-    diagnostics.iter().map(|d| d.code).collect()
-}
-
-/// What `binding` makes of `effect.op[label]`: the path of what serves it, or why nothing does.
+/// The path of what `binding` serves `effect.op[label]` by, where anything does.
 fn resolved(
     binding: &HostBinding,
     effect: &str,
     op: &str,
     label: Option<&str>,
-) -> Result<&'static str, Unserved> {
+) -> Option<&'static str> {
     let label = label.map(Symbol::new);
-    (binding.resolve(&Symbol::new(effect), &Symbol::new(op), label.as_ref())).map(|b| b.op.path)
+    (binding.resolve(&Symbol::new(effect), &Symbol::new(op), label.as_ref())).map(|op| op.path)
 }
 
 /// A granted binding serves a perform by its effect's declared name, a reserved or a language
-/// effect's by its program-wide one, and the first registration not withheld; where none serves
-/// it, it says whether none is for it or each that is is withheld.
+/// effect's by its program-wide one.
 #[test]
-fn a_granted_binding_resolves_by_name_and_says_why_it_serves_nothing() {
+fn a_granted_binding_resolves_by_name() {
     let mut lent = HostRegistry::new();
-    lent.register_withheld(
-        op("db", "get", named("users")),
-        Arc::new(Never),
-        "under `ply run`",
-    );
     for registered in [
         op("db", "get", HostResource::Any),
         op("std.net.net", "send", named("socket")),
         op("clock", "now", HostResource::Any),
     ] {
-        lent.register(registered, Arc::new(Never));
+        lent.register(registered);
     }
-    lent.register_withheld(
-        op("db", "put", HostResource::Any),
-        Arc::new(Never),
-        "under `ply run`",
-    );
-    let binding = lent.granted(Grants::default()).expect("nothing conflicts");
+    let binding = lent.granted(Grants::default());
+    assert!(binding.is_granted());
     assert_eq!(
         resolved(&binding, "store.db", "get", Some("users")),
-        Ok("test::handler")
+        Some("test::handler")
     );
     assert_eq!(
         resolved(&binding, "std.net.net", "send", Some("socket")),
-        Ok("test::handler")
+        Some("test::handler")
     );
     assert_eq!(
         resolved(&binding, "clock", "now", None),
-        Ok("test::handler")
+        Some("test::handler")
     );
     for (effect, op, label) in [
         ("app.net", "send", Some("socket")),
         ("std.net.net", "send", Some("other")),
         ("m.clock", "now", None),
     ] {
-        assert_eq!(
-            resolved(&binding, effect, op, label),
-            Err(Unserved::Unregistered),
-            "{effect}.{op}"
-        );
+        assert_eq!(resolved(&binding, effect, op, label), None, "{effect}.{op}");
     }
-    assert_eq!(
-        resolved(&binding, "store.db", "put", Some("users")),
-        Err(Unserved::Withheld {
-            path: "test::handler",
-            served: "under `ply run`"
-        })
-    );
 }
 
 #[test]
 fn an_unbound_binding_serves_nothing() {
     let binding = HostBinding::unbound();
     assert!(!binding.is_granted());
-    assert_eq!(
-        resolved(&binding, "db", "get", Some("users")),
-        Err(Unserved::Unregistered)
-    );
+    assert_eq!(resolved(&binding, "db", "get", Some("users")), None);
 }
 
 /// A registration by one of these names is matched by program-wide name, so the list must be the
@@ -142,33 +92,4 @@ fn host_use_records_what_actually_happened() {
     assert_eq!(use_.operations, 2);
     assert!(!use_.is_empty());
     assert!(use_.acted());
-}
-
-#[test]
-fn a_binding_of_grants_refuses_two_handlers_of_one_operation_and_label() {
-    let twice = registry(vec![
-        op("db", "get", named("users")),
-        op("db", "get", named("users")),
-    ]);
-    match twice.granted(Grants::default()) {
-        Ok(_) => panic!("two handlers of `db.get[users]` were bound"),
-        Err(diagnostics) => assert_eq!(codes_of(&diagnostics), [codes::HOST_HANDLER_CONFLICT]),
-    }
-    let apart = registry(vec![
-        op("db", "get", named("users")),
-        op("db", "get", named("orders")),
-        op("db", "get", HostResource::Any),
-    ]);
-    assert!(apart.granted(Grants::default()).is_ok());
-    let mut withheld = HostRegistry::new();
-    withheld.register_withheld(
-        op("db", "get", named("users")),
-        Arc::new(Never),
-        "elsewhere",
-    );
-    withheld.register(op("db", "get", named("users")), Arc::new(Never));
-    assert!(
-        withheld.granted(Grants::default()).is_ok(),
-        "a withheld registration serves nothing, so it conflicts with nothing"
-    );
 }

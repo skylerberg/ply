@@ -135,6 +135,11 @@ fn run() -> Run {
     Run::unbounded(10_000)
 }
 
+#[test]
+fn a_root_that_takes_nothing_is_handed_the_empty_list() {
+    assert_eq!(entry::NO_ARGUMENTS, arguments(Vec::new()));
+}
+
 /// What `root` answered over `values`, read back.
 fn answered(opened: &Opened, root: &str, values: Vec<Value>, run: &Run) -> Result<Value, String> {
     match entry::enter(opened, root, arguments(values), run, None, None).ended {

@@ -55,16 +55,12 @@ pub const HOST_IN_SIMULATION: &str = "E0425";
 pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
 /// A host handler answered an atom outside its entry point's declared footprint.
 pub const HOST_FOOTPRINT_ESCAPE: &str = "E0427";
-/// A handler declared `blocking: true` answered a value inline instead of a pending token.
-pub const HOST_BLOCKING_ANSWER: &str = "E0428";
 /// A listener, a connection presenting one, or `--mtls` named a credential the binding does not
 /// hold.
 pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
 /// A `--tls` credential that does not load, or whose key does not match its certificate; a
 /// certificate to trust that does not load; or `--mtls` with nothing to verify a client against.
 pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
-/// A `Secret` passed to a host operation whose registration does not accept one.
-pub const SECRET_TO_HOST: &str = "E0439";
 /// A configuration source, or the `--config-schema` definition, that the run cannot read.
 pub const CONFIG_UNAVAILABLE: &str = "E0440";
 /// A deployable artifact whose contents do not verify against its own digests.

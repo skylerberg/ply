@@ -1,16 +1,13 @@
 //! The process's pools a native's job runs on, each job its run's.
 
-use ply_core::{HostRuntime, Span, Value, codes};
+use ply_core::{HostRuntime, Pending, Span, codes};
 use ply_host::jobs::{self, Work};
 use ply_host::registry::{facilities_of, job_bytes, run_of, unbound};
 use ply_host::signal::{Bounds, Shutdown, ShutdownSignal};
 use std::time::{Duration, Instant};
 
-fn bytes_of(answer: Result<Value, ply_core::Diagnostic>) -> Vec<u8> {
-    match &answer {
-        Ok(Value::Bytes(bytes)) => bytes.to_vec(),
-        other => panic!("not bytes: {other:?}"),
-    }
+fn answered(runtime: &dyn HostRuntime, ticket: &Pending) -> Vec<u8> {
+    job_bytes(runtime, ticket).unwrap_or_else(|d| panic!("the job was not answered: {}", d.message))
 }
 
 fn submitted(
@@ -30,11 +27,11 @@ fn a_jobs_ticket_is_answered_through_an_unbound_runtime_and_a_hosts() {
     let unbound = unbound()();
     for work in [Work::Computing, Work::Waiting] {
         let ticket = submitted(&*unbound, work, "a test job", || Ok(b"answered".to_vec()));
-        assert_eq!(bytes_of(unbound.block_on(ticket)), b"answered");
+        assert_eq!(answered(&*unbound, &ticket), b"answered");
     }
     let host = ply_host::Host::new().runtime();
     let ticket = submitted(&*host, Work::Computing, "a test job", || Ok(vec![1, 2, 3]));
-    assert_eq!(bytes_of(host.block_on(ticket)), [1, 2, 3]);
+    assert_eq!(answered(&*host, &ticket), [1, 2, 3]);
 }
 
 /// The run's region waits on a ticket it watches and takes its answer once it is answered.
@@ -63,7 +60,7 @@ fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
     let ticket = submitted(&*runtime, Work::Computing, "`kdf.argon2`", || {
         Err("no memory to be had".to_string())
     });
-    let failed = runtime.block_on(ticket).expect_err("the job failed");
+    let failed = job_bytes(&*runtime, &ticket).expect_err("the job failed");
     assert!(
         failed.message.contains("`kdf.argon2`") && failed.message.contains("no memory to be had"),
         "{}",
@@ -84,7 +81,7 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
         .runtime();
     let quick = || Ok(b"read".to_vec());
     let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
-    assert_eq!(bytes_of(runtime.block_on(ticket)), b"read");
+    assert_eq!(answered(&*runtime, &ticket), b"read");
 
     assert!(shutdown.request(ShutdownSignal::Terminate));
     let until = Instant::now() + Duration::from_secs(5);
@@ -95,11 +92,6 @@ fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
 
     let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
     let ended = job_bytes(&*runtime, &ticket).expect_err("the drain is out of time");
-    assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
-    let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
-    let ended = runtime
-        .block_on(ticket)
-        .expect_err("the drain is out of time");
     assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
 }
 
@@ -122,7 +114,7 @@ fn a_jobs_own_refusal_fails_the_run_with_its_code() {
         },
     )
     .expect("a thread is had");
-    let refused = runtime.block_on(ticket).expect_err("the job refused");
+    let refused = job_bytes(&*runtime, &ticket).expect_err("the job refused");
     assert_eq!(refused.code, codes::PROCESS_OUTPUT_TOO_LARGE);
     assert_eq!(refused.message, "too much");
 }

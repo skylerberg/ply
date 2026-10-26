@@ -233,7 +233,7 @@ fn sample_values() -> Vec<Value> {
         Value::ctor("None", vec![]),
         Value::ctor("Some", vec![Value::Int(1)]),
         Value::ctor("Some", vec![Value::Int(2)]),
-        Value::empty_map(),
+        Value::map([]),
         map_of(vec![(Value::Int(1), Value::Int(1))]),
         map_of(vec![(Value::Int(1), Value::Int(2))]),
         map_of(vec![
@@ -241,8 +241,16 @@ fn sample_values() -> Vec<Value> {
             (Value::Int(2), Value::Int(2)),
         ]),
     ];
-    out.push(Value::builtin(ply_core::Builtin::Digest));
-    out.push(Value::builtin(ply_core::Builtin::Reflect));
+    for code in [0, 1] {
+        out.push(Value::Closure(std::sync::Arc::new(ply_core::Closure {
+            name: None,
+            kind: ply_core::ClosureKind::Continuation {
+                code,
+                arity: 1,
+                captured: Vec::new(),
+            },
+        })));
+    }
     out.push(Value::Record(std::sync::Arc::new(
         [
             (ply_core::Symbol::new("a"), Value::Int(1)),
@@ -383,7 +391,7 @@ fn a_map_is_itself_an_ordered_key() {
 
 #[test]
 fn a_deep_chain_of_maps_drops_without_aborting() {
-    let mut v = Value::empty_map();
+    let mut v = Value::map([]);
     for i in 0..20_000i64 {
         let mut m = Map::new();
         m.insert(Value::Int(i), v);

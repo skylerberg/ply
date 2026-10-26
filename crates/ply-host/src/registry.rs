@@ -13,7 +13,7 @@ use crate::tcp;
 use crate::time;
 use crate::trace;
 use ply_core::host::{
-    HostRegistry, HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport,
+    HostOp, HostRegistry, HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport,
 };
 use ply_core::{Diagnostic, Span, Symbol, TaskId, Value, codes};
 use std::rc::Rc;
@@ -115,12 +115,6 @@ impl Host {
         self.net.credentials()
     }
 
-    pub fn registry(&self) -> HostRegistry {
-        let mut registry = HostRegistry::new();
-        clock::register(&mut registry, Arc::clone(&self.time));
-        registry
-    }
-
     /// One per machine, each a run of its own: the pools are shared, but every operation is the
     /// run's that submitted it.
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
@@ -158,19 +152,40 @@ impl Host {
     }
 }
 
-/// Every registration this binary serves, of a host that holds nothing: what a listing of the
-/// families the runtime serves itself names.
+/// Every operation the runtime serves itself: the language's `clock`.
 pub fn registry() -> HostRegistry {
-    Host::new()
-        .traced(Arc::new(trace::Trace::default()))
-        .stopping_on(Shutdown::new(signal::Bounds::default()))
-        .with_process(process::ProcessHost::new(
-            Vec::new(),
-            process::OutputSink::Real {
-                out: process::Stream::Out,
-            },
-        ))
-        .registry()
+    let mut registry = HostRegistry::new();
+    clock::register(&mut registry);
+    registry
+}
+
+/// What the runtime answers `op`, one of [`registry`]'s, performed with `args` under `runtime`.
+///
+/// # Errors
+/// The clock refused, or `op` is none of [`registry`]'s.
+pub fn answer(
+    op: &HostOp,
+    runtime: &dyn HostRuntime,
+    args: &[Value],
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    match clock::Op::of(op) {
+        Some(clock) => clock::answer(clock, runtime, args, span),
+        None => Err(err_unserved(op, span)),
+    }
+}
+
+#[cold]
+fn err_unserved(op: &HostOp, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!(
+            "`{}.{}` reached the host boundary, which answers only the language's `clock`",
+            op.effect, op.op
+        ),
+    )
+    .primary(span, "performed here")
+    .note("this is a defect in Ply's host dispatch rather than in the program")
 }
 
 /// A runtime factory for a run no host was bound for: every runtime it makes, a `parallel`
@@ -198,7 +213,7 @@ pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>
         if let Some(expired) = facilities.drain_expired() {
             return Err(expired);
         }
-        if let Some(bytes) = facilities.run.block_on_bytes(pending, step)? {
+        if let Some(bytes) = facilities.run.block_on(pending, step)? {
             return Ok(bytes);
         }
     }
@@ -360,20 +375,6 @@ impl HostRuntime for Facilities {
         }
         ShutdownReport {
             spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),
-        }
-    }
-
-    /// Drive until this token resolves, or until the drain deadline says the run is out of time,
-    /// which a wait begun past it says at once.
-    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        let step = self.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
-        loop {
-            if let Some(expired) = self.drain_expired() {
-                return Err(expired);
-            }
-            if let Some(value) = self.run.block_on(&pending, step)? {
-                return Ok(value);
-            }
         }
     }
 

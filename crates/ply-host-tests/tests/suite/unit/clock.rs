@@ -1,38 +1,15 @@
-use ply_core::Mode;
-use ply_core::host::{Grants, MachineId, Unserved};
-use ply_core::{HostAnswer, HostBinding, HostRequest, Span, Symbol, Value};
+use ply_core::host::Grants;
+use ply_core::{HostBinding, Span, Symbol, Value};
 use ply_host::Host;
 use ply_host::clock::*;
 
-fn bound(host: &Host) -> HostBinding {
-    host.registry()
-        .granted(Grants::default())
-        .unwrap_or_else(|d| panic!("the host binds: {d:?}"))
+fn bound() -> HostBinding {
+    ply_host::registry().granted(Grants::default())
 }
 
-fn answer(host: &Host, binding: &HostBinding, op: Op, args: &[Value]) -> Value {
-    let bound = binding
-        .resolve(&Symbol::new(EFFECT), &Symbol::new(op.name()), None)
-        .expect("the language's clock is bound");
-    let request = HostRequest {
-        machine: MachineId(1),
-        atom: ply_core::EffectAtom::operation(
-            EFFECT,
-            ply_core::Resource::Singleton,
-            Mode::Read,
-            op.name(),
-        ),
-        op: bound.op,
-        args,
-        span: Span::DUMMY,
-        task: None,
-        declared: None,
-    };
-    match bound.handler.call(&*host.runtime(), &request) {
-        Ok(HostAnswer::Value(value)) => value,
-        Ok(HostAnswer::Pending(pending)) => panic!("{} waited on `{pending}`", op.what()),
-        Err(d) => panic!("{} was refused: {}", op.what(), d.message),
-    }
+fn answered(host: &Host, op: Op, args: &[Value]) -> Value {
+    answer(op, &*host.runtime(), args, Span::DUMMY)
+        .unwrap_or_else(|d| panic!("`clock.{}` was refused: {}", op.name(), d.message))
 }
 
 fn nanos(value: &Value) -> i64 {
@@ -44,28 +21,26 @@ fn nanos(value: &Value) -> i64 {
 /// declared name it would be answered an `Instant` where it reads an `Int`.
 #[test]
 fn the_host_serves_the_languages_clock_and_not_a_modules_own() {
-    let binding = bound(&Host::new());
-    for op in ["now", "sleep"] {
-        assert!(
-            binding
-                .resolve(&Symbol::new(EFFECT), &Symbol::new(op), None)
-                .is_ok(),
-            "`clock.{op}` is not served"
-        );
+    let binding = bound();
+    for op in Op::ALL {
+        let declared = binding
+            .resolve(&Symbol::new(EFFECT), &Symbol::new(op.name()), None)
+            .unwrap_or_else(|| panic!("`clock.{}` is not served", op.name()));
+        assert_eq!(Op::of(declared), Some(op));
     }
-    assert!(matches!(
-        binding.resolve(&Symbol::new("m.clock"), &Symbol::new("now"), None),
-        Err(Unserved::Unregistered)
-    ));
+    assert!(
+        binding
+            .resolve(&Symbol::new("m.clock"), &Symbol::new("now"), None)
+            .is_none()
+    );
 }
 
 #[test]
 fn a_reading_is_an_instant_on_the_clock_the_runtime_keeps() {
     let host = Host::new();
-    let binding = bound(&host);
     let rt = host.runtime();
     let before = rt.now().expect("the host keeps time");
-    let read = answer(&host, &binding, Op::Now, &[]);
+    let read = answered(&host, Op::Now, &[]);
     let after = rt.now().expect("the host keeps time");
     assert!(
         matches!(&read, Value::Ctor { name, .. } if name.as_str() == "Instant"),
@@ -80,23 +55,32 @@ fn a_reading_is_an_instant_on_the_clock_the_runtime_keeps() {
 }
 
 /// What a sleep is where no task could run meanwhile; a task of a production region never reaches
-/// the handler.
+/// the host.
 #[test]
-fn the_handlers_sleep_is_the_threads_wait() {
+fn a_sleep_is_the_threads_wait() {
     let host = Host::new();
-    let binding = bound(&host);
-    let before = nanos(&answer(&host, &binding, Op::Now, &[]));
+    let before = nanos(&answered(&host, Op::Now, &[]));
     let span = Value::ctor("Duration", vec![Value::Int(20_000_000)]);
-    let answered = answer(&host, &binding, Op::Sleep, &[span]);
-    assert!(
-        matches!(answered, Value::Unit),
-        "a sleep reads nothing back"
-    );
-    let after = nanos(&answer(&host, &binding, Op::Now, &[]));
+    let slept = answered(&host, Op::Sleep, &[span]);
+    assert!(matches!(slept, Value::Unit), "a sleep reads nothing back");
+    let after = nanos(&answered(&host, Op::Now, &[]));
     assert!(
         after - before >= 20_000_000,
         "{before} to {after} is not a 20ms wait"
     );
+    let again = nanos(&answered(&host, Op::Now, &[]));
     let none = Value::ctor("Duration", vec![Value::Int(-1)]);
-    answer(&host, &binding, Op::Sleep, &[none]);
+    answered(&host, Op::Sleep, &[none]);
+    assert!(
+        nanos(&answered(&host, Op::Now, &[])) - again < 20_000_000,
+        "a negative span waited"
+    );
+}
+
+#[test]
+fn a_perform_of_the_wrong_arity_is_refused_as_ply_s_own_fault() {
+    let host = Host::new();
+    let refused = answer(Op::Now, &*host.runtime(), &[Value::Int(1)], Span::DUMMY)
+        .expect_err("`clock.now` takes nothing");
+    assert_eq!(refused.code, ply_core::codes::INTERNAL_ERROR);
 }

@@ -1,7 +1,6 @@
 //! Spans, sources and diagnostics; `packages/cli/diagnostic.ply` renders them.
 
 use crate::Plain;
-use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
@@ -47,22 +46,12 @@ impl std::ops::Deref for Symbol {
         &self.0
     }
 }
-impl Serialize for Symbol {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-impl<'de> Deserialize<'de> for Symbol {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        Ok(Symbol::new(String::deserialize(d)?))
-    }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SourceId(pub u32);
 
 /// A half-open byte range within a [`SourceId`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
     pub source: SourceId,
     pub start: u32,
@@ -166,15 +155,14 @@ impl SourceMap {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     Error,
     Warning,
     Note,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Label {
     pub span: Span,
     pub message: String,
@@ -183,20 +171,20 @@ pub struct Label {
 }
 
 /// One replacement a fix makes: `text` in place of `span`; an empty span inserts, empty text deletes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
     pub span: Span,
     pub text: String,
 }
 
 /// A change that applies as it is and leaves a program the diagnostic no longer holds for.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fix {
     pub title: String,
     pub edits: Vec<Edit>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: &'static str,
@@ -205,14 +193,12 @@ pub struct Diagnostic {
     pub notes: Vec<String>,
     pub fixes: Sparse<Fix>,
     /// What the text names by [`slot`], rendered only by the CLI.
-    #[serde(default, skip_serializing_if = "Sparse::is_empty")]
     pub values: Sparse<Plain>,
 }
 
 /// A list most diagnostics leave empty, held as one pointer: every runtime `Result` carries a
 /// `Diagnostic`, so its size is paid on every call.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::box_collection)]
 pub struct Sparse<T>(Option<Box<Vec<T>>>);
 

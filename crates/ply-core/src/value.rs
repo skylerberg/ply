@@ -1,8 +1,6 @@
-use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::{Diagnostic, IntTy, Span, Symbol, codes};
 pub use rust_decimal::Decimal;
-use std::cell::RefCell;
 
 thread_local! {
     static NO_ARGS: Arc<Vec<Value>> = Arc::new(Vec::new());
@@ -44,47 +42,6 @@ impl Map {
         Arc::make_mut(&mut self.0).insert(k, v);
     }
 
-    pub fn remove(&mut self, k: &Value) -> Option<Value> {
-        self.remove_entry(k).map(|(_, v)| v)
-    }
-
-    /// Removes the entry of the key equal to `k`, answering the key the map held and its value.
-    pub fn remove_entry(&mut self, k: &Value) -> Option<(Value, Value)> {
-        if !self.0.contains_key(k) {
-            return None;
-        }
-        Arc::make_mut(&mut self.0).remove_entry(k)
-    }
-
-    /// The entries whose keys `bounds` admits, ascending; panics on bounds that cross, as
-    /// `BTreeMap::range` does.
-    pub fn range<R: std::ops::RangeBounds<Value>>(
-        &self,
-        bounds: R,
-    ) -> std::collections::btree_map::Range<'_, Value, Value> {
-        self.0.range(bounds)
-    }
-
-    /// Removes and answers the least entry, or the greatest.
-    pub fn pop(&mut self, greatest: bool) -> Option<(Value, Value)> {
-        if self.0.is_empty() {
-            return None;
-        }
-        let entries = Arc::make_mut(&mut self.0);
-        if greatest {
-            entries.pop_last()
-        } else {
-            entries.pop_first()
-        }
-    }
-
-    /// Keeps the entries below `k`, and answers the value at `k` with the map of those above it.
-    pub fn split(&mut self, k: &Value) -> (Option<Value>, Map) {
-        let mut above = Arc::make_mut(&mut self.0).split_off(k);
-        let at = above.remove(k);
-        (at, Map(Arc::new(above)))
-    }
-
     pub fn keys(&self) -> std::collections::btree_map::Keys<'_, Value, Value> {
         self.0.keys()
     }
@@ -96,11 +53,6 @@ impl Map {
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, Value, Value> {
         self.0.iter()
     }
-}
-
-thread_local! {
-    /// Indexed by [`Builtin`]'s discriminant.
-    static BUILTIN_VALUES: RefCell<Vec<Option<Value>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A record's fields, sorted by name.
@@ -115,20 +67,8 @@ impl Fields {
             .map(|i| &self.0[i].1)
     }
 
-    /// [`Fields::get`] by the name's text, for a reader holding no symbol.
-    pub fn named(&self, name: &str) -> Option<&Value> {
-        self.0
-            .binary_search_by(|(k, _)| k.as_str().cmp(name))
-            .ok()
-            .map(|i| &self.0[i].1)
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&Symbol, &Value)> {
         self.0.iter().map(|(k, v)| (k, v))
-    }
-
-    pub fn contains_key(&self, name: &Symbol) -> bool {
-        self.get(name).is_some()
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &Symbol> {
@@ -157,14 +97,8 @@ impl Fields {
         }
     }
 
-    pub fn into_values(self) -> impl Iterator<Item = Value> {
+    fn into_values(self) -> impl Iterator<Item = Value> {
         self.0.into_iter().map(|(_, v)| v)
-    }
-
-    /// Replaces an existing field's value; `None` when the name is absent.
-    pub fn set(&mut self, name: &Symbol, value: Value) -> Option<Value> {
-        let i = self.0.binary_search_by(|(k, _)| k.cmp(name)).ok()?;
-        Some(std::mem::replace(&mut self.0[i].1, value))
     }
 }
 
@@ -277,17 +211,6 @@ pub struct Closure {
 }
 
 pub enum ClosureKind {
-    Ctor {
-        name: Symbol,
-        arity: usize,
-    },
-    Builtin(Builtin),
-    /// A compiled function taking `captured` as leading arguments; the machine never enters one.
-    Native {
-        code: usize,
-        arity: usize,
-        captured: Vec<Value>,
-    },
     /// A clause's `k`: native code whose captures name a body only the capturing entry holds.
     Continuation {
         code: usize,
@@ -295,16 +218,10 @@ pub enum ClosureKind {
         captured: Vec<Value>,
     },
     /// A function the prover generated: data rather than a body, so the C backend applies it.
-    Synth {
-        arity: u8,
-        rule: Synth,
-    },
+    Synth { arity: u8, rule: Synth },
     /// What a `with_hold` binds, which no call enters: what it holds, `None` once it has let go,
     /// and its number among its entry's holds.
-    Hold {
-        held: Option<Value>,
-        id: u64,
-    },
+    Hold { held: Option<Value>, id: u64 },
 }
 
 pub enum Synth {
@@ -319,22 +236,6 @@ pub enum Synth {
 }
 
 impl Synth {
-    /// `args` is as long as the closure's arity, which the caller checks.
-    pub fn apply(&self, args: &[Value]) -> Result<Value, Diagnostic> {
-        match self {
-            Synth::Const(value) => Ok(value.clone()),
-            Synth::Project(index) => Ok(args[usize::from(*index)].clone()),
-            Synth::Table { entries, default } => {
-                for (key, value) in entries {
-                    if values_equal(&args[0], key, Span::DUMMY)? {
-                        return Ok(value.clone());
-                    }
-                }
-                Ok(default.clone())
-            }
-        }
-    }
-
     pub fn values(&self) -> Vec<&Value> {
         match self {
             Synth::Const(value) => vec![value],
@@ -370,10 +271,6 @@ impl Value {
         Value::Array(Arc::new(items))
     }
 
-    pub fn empty_map() -> Value {
-        Value::Map(Map::new())
-    }
-
     /// As a fold of `Map::insert`: a later entry's value wins, under an earlier entry's key.
     pub fn map(entries: impl IntoIterator<Item = (Value, Value)>) -> Value {
         let mut m = Map::new();
@@ -394,26 +291,6 @@ impl Value {
             name: name.into(),
             args,
         }
-    }
-
-    pub fn builtin(b: Builtin) -> Value {
-        let fresh = || {
-            Value::Closure(Arc::new(Closure {
-                name: Some(Symbol::new(b.name())),
-                kind: ClosureKind::Builtin(b),
-            }))
-        };
-        // `try_with`: thread-local teardown can drop a value after the cache is gone.
-        BUILTIN_VALUES
-            .try_with(|cache| {
-                let mut cache = cache.borrow_mut();
-                let slot = b as usize;
-                if slot >= cache.len() {
-                    cache.resize(slot + 1, None);
-                }
-                cache[slot].get_or_insert_with(fresh).clone()
-            })
-            .unwrap_or_else(|_| fresh())
     }
 
     pub fn type_name(&self) -> &'static str {
@@ -467,13 +344,6 @@ impl Value {
         }
     }
 
-    pub fn as_char(&self, span: Span, what: &str) -> Result<char, Diagnostic> {
-        match self {
-            Value::Char(c) => Ok(*c),
-            other => Err(type_error(span, what, "Char", other)),
-        }
-    }
-
     pub fn as_bool(&self, span: Span, what: &str) -> Result<bool, Diagnostic> {
         match self {
             Value::Bool(b) => Ok(*b),
@@ -520,13 +390,6 @@ impl Value {
         match self {
             Value::Array(xs) => Ok(xs),
             other => Err(type_error(span, what, "Array", other)),
-        }
-    }
-
-    pub fn as_map(&self, span: Span, what: &str) -> Result<&Map, Diagnostic> {
-        match self {
-            Value::Map(m) => Ok(m),
-            other => Err(type_error(span, what, "Map", other)),
         }
     }
 }
@@ -630,15 +493,6 @@ impl Fixed {
         match i128::try_from(v) {
             Ok(v) => Fixed::of(ty, v),
             Err(_) => (!ty.signed() && v <= ty.max()).then(|| Fixed::new(ty, v)),
-        }
-    }
-
-    /// `Int::to_string`'s spelling, for `U128::to_string` and `I128::to_string`.
-    pub fn to_decimal(self) -> String {
-        if self.ty.signed() {
-            (self.bits() as i128).to_string()
-        } else {
-            self.bits().to_string()
         }
     }
 

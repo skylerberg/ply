@@ -21,14 +21,3 @@ fn the_monotonic_clock_counts_from_the_run_and_never_goes_back() {
         "{second} is not 5ms after {first}"
     );
 }
-
-#[test]
-fn a_wait_parks_for_its_span_and_a_negative_one_not_at_all() {
-    let time = TimeHost::new();
-    let before = time.elapsed_ns();
-    time.sleep_ns(20_000_000);
-    assert!(time.elapsed_ns() >= before + 20_000_000);
-    let again = time.elapsed_ns();
-    time.sleep_ns(-1);
-    assert!(time.elapsed_ns() - again < 20_000_000);
-}

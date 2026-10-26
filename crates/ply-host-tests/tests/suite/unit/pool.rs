@@ -1,5 +1,5 @@
 use ply_core::host::MachineId;
-use ply_core::{Diagnostic, Pending, Span, Value, codes};
+use ply_core::{Diagnostic, Pending, Span, codes};
 use ply_host::pool::{Bell, JobOutput, Kept, MAX_BLOCKING_OPERATIONS, Pool, Run};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -11,14 +11,14 @@ fn run() -> Arc<Run> {
     Run::new(Arc::new(Bell::default()))
 }
 
-/// What a job that answers `n` answers.
-fn said(n: i64) -> JobOutput {
-    Ok(n.to_be_bytes().to_vec())
+/// The bytes a job that answers `n` writes.
+fn written(n: i64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
 }
 
-/// What a run reads of a job that answered `n`.
-fn heard(n: i64) -> Value {
-    Value::bytes(n.to_be_bytes())
+/// What a job that answers `n` answers.
+fn said(n: i64) -> JobOutput {
+    Ok(written(n))
 }
 
 fn submitted(pool: &Pool, run: &Arc<Run>, answer: i64) -> Pending {
@@ -32,7 +32,7 @@ fn submitted(pool: &Pool, run: &Arc<Run>, answer: i64) -> Pending {
     .expect("the pool takes the job")
 }
 
-fn answered(run: &Run, pending: Pending) -> Value {
+fn answered(run: &Run, pending: Pending) -> Vec<u8> {
     run.block_on(&pending, None)
         .unwrap_or_else(|d| panic!("{d:?}"))
         .expect("an unbounded wait ends answered")
@@ -40,7 +40,7 @@ fn answered(run: &Run, pending: Pending) -> Value {
 
 /// What `run` takes once a watched operation has been answered: each answered token beside its
 /// answer.
-fn collected(run: &Run) -> Vec<(u64, Result<Value, Diagnostic>)> {
+fn collected(run: &Run) -> Vec<(u64, Result<Vec<u8>, Diagnostic>)> {
     assert!(
         run.park(Some(Duration::from_secs(10)), &|| false),
         "the run watches something"
@@ -51,7 +51,7 @@ fn collected(run: &Run) -> Vec<(u64, Result<Value, Diagnostic>)> {
                 token,
                 label: "a test job",
             };
-            let answer = run.poll(&pending).map(|v| v.expect("answered"));
+            let answer = run.taken(&pending).map(|v| v.expect("answered"));
             (token, answer)
         })
         .collect()
@@ -78,7 +78,7 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
             .into_iter()
             .map(|(token, answer)| (token, answer.expect("answered")))
             .collect::<Vec<_>>(),
-        [(b.token, heard(2))]
+        [(b.token, written(2))]
     );
     assert!(mine.answered().is_empty(), "an answer is handed back once");
 }
@@ -138,7 +138,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             }
         }
     };
-    assert_eq!(answered(&after, pending), heard(9));
+    assert_eq!(answered(&after, pending), written(9));
 }
 
 /// A pool that gives each operation a thread refuses the one past its bound; a queued one has no
@@ -151,7 +151,7 @@ fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
         .map(|i| (i, submitted(&pool, &asking, i)))
         .collect();
     for (i, token) in asked {
-        assert_eq!(answered(&asking, token), heard(i));
+        assert_eq!(answered(&asking, token), written(i));
     }
 }
 
@@ -209,7 +209,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
             .block_on(&broken, None)
             .expect_err("a panic is the operation's failure");
         assert_eq!(failed.code, codes::RUNTIME_ERROR);
-        assert_eq!(answered(&asking, after), heard(7));
+        assert_eq!(answered(&asking, after), written(7));
     }
 }
 

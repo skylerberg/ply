@@ -79,11 +79,9 @@ impl Opened {
     }
 }
 
-/// The arguments of a root that takes none: the PLV1 of the empty list.
-pub fn no_arguments() -> Vec<u8> {
-    ply_core::codec::encode(&ply_core::Value::list(Vec::new()))
-        .expect("the empty list is written whole")
-}
+/// The arguments of a root that takes none: the PLV1 of the empty list, its format and then the
+/// list's tag and its count.
+pub const NO_ARGUMENTS: &[u8] = b"PLV1\x09\x00";
 
 /// The span a unit with no source gives the root at `at` among its roots: a site of that root.
 pub(crate) fn site_span(at: usize) -> Span {
@@ -266,27 +264,23 @@ pub fn enter(
     let recorder = own
         .clone()
         .or_else(|| watch.as_ref().and_then(|w| w.caller.clone()));
-    let binding = match bound {
-        Some(bound) => {
-            let made = bound.runtime_factory();
-            // Each runtime the entry makes, a `parallel` branch's among them, records into one record.
-            let factory: RuntimeFactory = match &recorder {
-                Some(recorder) => {
-                    let recorder = Arc::clone(recorder);
-                    Arc::new(move || {
-                        let runtime = made();
-                        ply_host::observe::records_into(&*runtime, &recorder);
-                        runtime
-                    })
-                }
-                None => made,
-            };
-            let runtime: Rc<dyn HostRuntime> = factory();
-            ctx.set_host(bound.binding(), Some(runtime), Some(factory));
-            Some(bound.binding())
-        }
-        None => None,
-    };
+    if let Some(bound) = bound {
+        let made = bound.runtime_factory();
+        // Each runtime the entry makes, a `parallel` branch's among them, records into one record.
+        let factory: RuntimeFactory = match &recorder {
+            Some(recorder) => {
+                let recorder = Arc::clone(recorder);
+                Arc::new(move || {
+                    let runtime = made();
+                    ply_host::observe::records_into(&*runtime, &recorder);
+                    runtime
+                })
+            }
+            None => made,
+        };
+        let runtime: Rc<dyn HostRuntime> = factory();
+        ctx.set_host(bound.binding(), Some(runtime), Some(factory));
+    }
     ctx.declared = run.declared.clone();
     ctx.re_executed = run.re_executed;
     ctx.trace_performs(run.counted);
@@ -296,7 +290,6 @@ pub fn enter(
         .unwrap_or_else(|| (Seed::default(), ply_core::sim::DEFAULT_STEPS));
     ctx.seed = seed;
     ctx.sim_steps = steps.max(1);
-    let id = ctx.id;
     // The counters are this thread's, an outer entry's among them, so the entry's are a difference.
     let counted = ply_core::rc::stats();
     let started = Instant::now();
@@ -308,9 +301,6 @@ pub fn enter(
     } else {
         0
     };
-    if let Some(binding) = &binding {
-        binding.machine_ended(id);
-    }
     let mut outcome = match entered {
         Ok((ended, last)) => {
             let counters = ply_core::rc::stats();

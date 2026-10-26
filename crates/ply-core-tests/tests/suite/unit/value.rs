@@ -34,7 +34,6 @@ fn a_hold_shows_as_its_kind_alone() {
         ply_core::reflect::value_of(&Plain::Hold),
         Value::ctor("std.value.VHold", Vec::new())
     );
-    assert!(Plain::Hold.into_value().is_err());
 }
 
 #[test]

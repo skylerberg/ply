@@ -97,11 +97,9 @@ impl Hosts {
         if let Some(stop) = &stop {
             facilities = facilities.stopping_on(Arc::clone(stop));
         }
-        let facilities = Arc::new(facilities);
-        let registry = facilities.registry();
         Ok(Hosts {
-            host: facilities,
-            binding: Arc::new(registry.granted(grants.clone())?),
+            host: Arc::new(facilities),
+            binding: Arc::new(ply_host::registry().granted(grants.clone())),
             stop,
         })
     }

@@ -1,7 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{Plain, Symbol, Value, codes, constant_time_eq, values_equal};
+use ply_core::{Closure, ClosureKind, Plain, Value, codes, constant_time_eq, values_equal};
 use std::sync::Arc;
 
 #[test]
@@ -39,9 +39,17 @@ fn a_nested_secret_is_copied_out_with_no_payload() {
 /// `type_error` interpolates the offending value, so this is a route the redaction has to cover.
 #[test]
 fn a_runtime_type_error_over_a_secret_prints_no_payload() {
+    let function = Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Continuation {
+            code: 0,
+            arity: 1,
+            captured: Vec::new(),
+        },
+    }));
     let d = values_equal(
         &Value::secret_text("hunter2"),
-        &Value::builtin(ply_core::Builtin::Digest),
+        &function,
         ply_core::Span::DUMMY,
     )
     .expect_err("a function has no equality");
@@ -86,34 +94,4 @@ fn compare_values_refuses_a_secret_at_run_time() {
         "{d:#?}"
     );
     assert!(!format!("{d:#?}").contains("\"a\""), "{d:#?}");
-}
-
-/// A credential reaching a handler that does not declare it may receive one is refused before the
-/// handler is entered, wherever in the argument it sits, and the refusal names the operation, the
-/// argument and the handler, and never the payload.
-#[test]
-fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
-    let secret = Value::secret_text("hunter2");
-    let nested = Value::Record(Arc::new(ply_core::Fields::from_unsorted(vec![
-        (Symbol::new("user"), Value::str("ada")),
-        (Symbol::new("password"), secret.clone()),
-    ])));
-    assert!(ply_core::host::carries_secret(&secret));
-    assert!(ply_core::host::carries_secret(&nested));
-    assert!(!ply_core::host::carries_secret(&Value::Int(1)));
-    let d = ply_core::host::err_secret_to_host(
-        ply_core::Span::DUMMY,
-        "net.send[socket]",
-        0,
-        "test::send",
-    );
-    assert_eq!(d.code, codes::SECRET_TO_HOST);
-    assert!(d.message.contains("net.send[socket]"), "{}", d.message);
-    assert!(d.message.contains("argument 1"), "{}", d.message);
-    assert!(
-        d.notes.iter().any(|n| n.contains("test::send")),
-        "{:#?}",
-        d.notes
-    );
-    assert!(!format!("{d:#?}").contains("hunter2"), "{d:#?}");
 }

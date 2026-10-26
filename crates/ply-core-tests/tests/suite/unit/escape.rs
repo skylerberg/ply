@@ -77,52 +77,6 @@ fn a_continuation_is_a_handle() {
     assert_eq!(found.reached(), "");
 }
 
-/// Only the kind tells the two apart: a native closure over the very numbers a continuation
-/// captures is data, and one that captures a continuation carries it.
-#[test]
-fn a_native_closure_carries_a_continuation_only_by_capturing_one() {
-    let native = |captured: Vec<Value>| {
-        closure(ClosureKind::Native {
-            code: 0,
-            arity: 1,
-            captured,
-        })
-    };
-    assert_eq!(carries(&native(vec![Value::Int(3), Value::Int(1)])), None);
-
-    let wrapped = native(vec![Value::Int(2), continuation()]);
-    let found = carries(&wrapped).expect("the capture is a continuation");
-    assert_eq!(found.handle, Handle::Continuation);
-}
-
-/// Each boundary refuses a continuation and names it as what it is rather than as a type it does
-/// not have.
-#[test]
-fn every_boundary_refuses_a_continuation_and_names_it() {
-    let value = Value::ctor("m.Just", vec![continuation()]);
-    let boundaries = [
-        Boundary::HostArgument {
-            operation: "ext.keep[s]",
-            path: "test::keep",
-            position: 0,
-        },
-        Boundary::HostAnswer {
-            operation: "ext.keep[s]",
-            path: "test::keep",
-        },
-        Boundary::EntryAnswer { name: "m.parked" },
-    ];
-    for boundary in boundaries {
-        let d = check(&boundary, &value, Span::DUMMY).expect_err("a continuation is refused");
-        assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY, "{boundary:?}");
-        assert!(
-            d.message.contains(" a continuation") && d.message.contains("`m.Just`'s argument 1"),
-            "{boundary:?}: {}",
-            d.message
-        );
-    }
-}
-
 /// The boundary a handle leaves by rather than enters by: it names the definition that answered,
 /// and its remedy is what to answer instead.
 #[test]
@@ -155,12 +109,6 @@ fn an_entry_points_answer_refuses_a_continuation_and_lets_data_cross() {
     assert!(check(&boundary, &data, Span::DUMMY).is_ok());
 }
 
-#[test]
-fn a_builtin_closure_carries_nothing() {
-    let value = Value::builtin(ply_core::Builtin::Digest);
-    assert_eq!(carries(&value), None);
-}
-
 /// The generator never draws a handle, so this value is assembled directly.
 #[test]
 fn a_generated_function_holding_a_handle_is_found() {
@@ -179,57 +127,4 @@ fn a_generated_function_holding_a_handle_is_found() {
 
     let found = carries(&closure).expect("the table reaches the continuation");
     assert_eq!(found.handle, Handle::Continuation);
-}
-
-#[test]
-fn the_diagnostic_names_the_boundary_the_handle_and_the_route() {
-    let value = Value::Ctor {
-        name: Symbol::new("m.Just"),
-        args: Arc::new(vec![continuation()]),
-    };
-    let boundary = Boundary::HostArgument {
-        operation: "net.recv[conn]",
-        path: "ply_host::tcp",
-        position: 1,
-    };
-    let d = check(&boundary, &value, Span::DUMMY).expect_err("it is refused");
-
-    assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
-    assert!(d.message.contains("argument 2"), "{}", d.message);
-    assert!(d.message.contains("a continuation"), "{}", d.message);
-    assert!(d.message.contains("`m.Just`'s argument 1"), "{}", d.message);
-    assert!(
-        d.notes.iter().any(|n| n.contains("ply_host::tcp")),
-        "the handler is named: {:#?}",
-        d.notes
-    );
-}
-
-#[test]
-fn check_arguments_names_the_first_position_that_carries_one() {
-    let args = vec![Value::Int(1), Value::Int(2), continuation(), continuation()];
-    let d = check_arguments("net.send[s]", "ply_host::tcp", &args, Span::DUMMY)
-        .expect_err("argument 3 carries a continuation");
-    assert!(d.message.contains("argument 3"), "{}", d.message);
-}
-
-#[test]
-fn a_host_answer_says_what_outlives_the_region() {
-    let answer = check(
-        &Boundary::HostAnswer {
-            operation: "net.recv[s]",
-            path: "ply_host::tcp",
-        },
-        &continuation(),
-        Span::DUMMY,
-    )
-    .expect_err("a forged handle is refused");
-    assert!(
-        answer
-            .notes
-            .iter()
-            .any(|n| n.contains("outside the program")),
-        "{:#?}",
-        answer.notes
-    );
 }
