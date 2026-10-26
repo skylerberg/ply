@@ -29,7 +29,8 @@ import compiler.check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_
                              check_front_with, EmitFacts, Elaboration)
 import compiler.check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder,
                                      LabelSite, TypedSite, TrySite, MemberSite, UpdateShape,
-                                     WitnessOp, WitnessRef, witnessed, Builtin, builtins)
+                                     WitnessOp, WitnessRef, witnessed, Builtin, builtins,
+                                     ReleaseSite)
 import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key)
 import compiler.check.termination (Ends, Stated)
@@ -121,6 +122,7 @@ fn joined_facts(g: RootFacts, f: RootFacts) -> RootFacts =
     ops: g.ops.concat(f.ops),
     refs: g.refs.concat(f.refs),
     tries: g.tries.concat(f.tries),
+    releases: g.releases.concat(f.releases),
     members: g.members.concat(f.members),
     typed: g.typed.concat(f.typed),
     types: types_joined(g.types, f.types),
@@ -179,6 +181,8 @@ pub fn facts_read(
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         tries: f.tries.fold([], |a: List<TrySite>, x: TrySite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        releases: f.releases.fold([], |a: List<ReleaseSite>, x: ReleaseSite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         typed: f.typed.fold([], |a: List<TypedSite>, x: TypedSite|
@@ -225,6 +229,7 @@ pub fn facts_read(
           orders: w.orders.fold([], |acc: List<WitnessOrder>, x: WitnessOrder|
             match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
           tries: read.facts.tries,
+          releases: read.facts.releases,
           members: read.facts.members,
         },
         typed: read.facts.typed,
@@ -246,7 +251,7 @@ pub type Identity = | ByHashes(List<Bytes>) | ByName(Bytes)
 pub type InterfaceType =
   | TypeVariable(Int)
   | Constructed({ named: Identity, args: List<InterfaceType> })
-  | Function({ params: List<InterfaceType>, ret: InterfaceType, effects: InterfaceRow })
+  | Function({ params: List<InterfaceType>, kept: List<Int>, once: Bool, ret: InterfaceType, effects: InterfaceRow })
   | RecordOf(List<InterfaceField>)
   /// A nominal type is its declaration and its arguments: its fields are the declaration's.
   | NominalOf({ named: Identity, args: List<InterfaceType> })
@@ -262,6 +267,8 @@ pub type InterfaceRow = { atoms: List<InterfaceAtom>, tail: Option<Int> }
 pub type DefInterface = {
   ty_vars: List<Int>,
   row_vars: List<Int>,
+  kept_vars: List<Int>,
+  multi_vars: List<Int>,
   label_vars: List<Int>,
   ty: InterfaceType,
   footprint: List<InterfaceAtom>,
@@ -293,6 +300,8 @@ pub fn def_interface_of(
   {
     ty_vars: c.scheme.ty_vars,
     row_vars: c.scheme.row_vars,
+    kept_vars: c.scheme.kept_vars,
+    multi_vars: c.scheme.multi_vars,
     label_vars: c.scheme.label_vars,
     ty: interface_type(decls, c.scheme.ty),
     footprint: match c.rows.at(0) {
@@ -321,6 +330,8 @@ fn interface_type(decls: Map<Bytes, List<Bytes>>, ty: Type) -> InterfaceType / {
     TyFn(f) ->
       Function({
         params: f.params.map(|p: Type| interface_type(decls, p)),
+        kept: f.kept,
+        once: f.once,
         ret: interface_type(decls, f.ret),
         effects: {
           atoms: f.effects.atoms.map(|a: Atom| interface_atom(decls, a)),
@@ -1587,6 +1598,31 @@ test "a type sharing its name with an effect is told apart from it in an interfa
       },
     };
   assert(opened(b"| Box(Int)") != opened(b"| Box(Int, Int)"), None)
+}
+
+test "an interface tells a taken parameter from a lent one, and a `keep` or `multi` variable from a plain one" {
+  let filed = |src: Bytes|
+    match analyse(parse_all([{ name: b"m", src: src }])) {
+      Refused(_) -> panic("the program checks"),
+      Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: FiledDef| d.name == b"m.f") {
+        Some(d) -> d.interface,
+        None -> panic("the definition is filed"),
+      },
+    };
+  assert(
+    filed(b"pub fn f(g: keep (Int) -> Int) -> Int = g(1)\n")
+      != filed(b"pub fn f(g: (Int) -> Int) -> Int = g(1)\n"),
+    None,
+  );
+  assert(
+    filed(b"pub fn f<keep a>(x: keep a) -> a = x\n") != filed(b"pub fn f<a>(x: a) -> a = x\n"),
+    None,
+  );
+  assert(
+    filed(b"pub fn f<| multi e>(g: () -> Int / e) -> Int / e = g()\n")
+      != filed(b"pub fn f<| e>(g: () -> Int / e) -> Int / e = g()\n"),
+    None,
+  )
 }
 
 test "the types a body binds and uses are filed by key, read from one table the rows carry" {

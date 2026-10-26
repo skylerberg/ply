@@ -7,7 +7,7 @@ import compiler.emit.code (Code, NLit, NUnary)
 import compiler.syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes,
                                  LEmbedded, LDec, LUnit, LBad)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type,
-                             spelled_type)
+                             spelled_type, unit_type)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, lit_int, is_bitop)
@@ -15,11 +15,12 @@ import compiler.emit.reps (Ctors, has_vars, type_vars, compared_by_root, keyed_s
                            nullary_sum, generic_sum, written_sum)
 import compiler.emit.answer (Scalar, Exact, literal_bits)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown, Digest, Contained)
+import compiler.emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown, Digest, Contained,
+                           LetGo)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RUnit, RImm,
                           Arg, AVar, AInt, AZero, ABool, AFloat, ANum, AChar, Val, Prim, Literal,
                           Get, Tag, Call, Native, Let, Decl, Assign, If, Scalars, rep_of_arg,
-                          comparison, arithmetic, shift)
+                          comparison, arithmetic, shift, Unwound)
 import compiler.emit.lower.setting (declared_at, prelude_ctor)
 import compiler.emit.lower.held (held_as, typed_convention, width_held)
 import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
@@ -594,6 +595,18 @@ fn rooted(
   types: List<Type>,
   answer: Type,
   at: Span,
+) -> Lowered = root_called(cx, st, key, args, types, answer, at, false)
+
+/// `rooted`, where the root may stop for a handler that resumes it later where `stops`.
+fn root_called(
+  cx: Context,
+  st: Lowering,
+  key: RootKey,
+  args: List<Arg>,
+  types: List<Type>,
+  answer: Type,
+  at: Span,
+  stops: Bool,
 ) -> Lowered = {
   let conv = typed_convention(cx.setting.ctors, types, answer);
   let given = range(0, args.len()).fold(
@@ -611,7 +624,7 @@ fn rooted(
     given.st,
     answer,
     conv.answer,
-    Call({ callee: Root(key), args: given.args, conv: conv, stops: false }),
+    Call({ callee: Root(key), args: given.args, conv: conv, stops: stops }),
     at,
   )
 }
@@ -879,6 +892,33 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
     match op { Digest -> named_type(b"Bytes"), _ -> named_type(b"std.value.Value") },
     at,
   )
+
+/// `a`, a resource, let go: its type's `LetGo` root called on it, which only a specialisation
+/// settles where a type variable leaves the type open.
+pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered = {
+  let ty = type_of(a);
+  if has_vars(ty) {
+    unsettled(needing(st, ty, true), unit_type(), held_as(cx.setting, unit_type()), [a], at)
+  } else {
+    // A release may perform what a clause answers by stopping.
+    root_called(cx, st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true)
+  }
+}
+
+/// What a failure lets go of `a`, a resource: its type's `LetGo` root, called as `let_go` calls it.
+pub fn unwound(cx: Context, st: Lowering, a: Arg) -> { st: Lowering, unwound: Unwound } = {
+  let ty = type_of(a);
+  {
+    st: needing(st, ty, true),
+    unwound: {
+      arg: a,
+      callee: let_go_root(cx, ty),
+      conv: typed_convention(cx.setting.ctors, [ty], unit_type()),
+    },
+  }
+}
+
+fn let_go_root(cx: Context, ty: Type) -> RootKey = keys::written(LetGo, ty, cx.setting.module)
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
 /// where a register holds the value, checked below 64 bits exactly in a word, at 64 bits by C's

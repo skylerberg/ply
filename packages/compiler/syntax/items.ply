@@ -27,7 +27,7 @@ import compiler.syntax.type_syntax (TypeExpr, TVar, TRecord, TUnit, TCon, TFn, T
                                     AtomExpr, Mode, Generics, RowMember, MWrite, MRaise, RMAtom,
                                     RMSet, ty, ty_span, mode, generics, row, row_member,
                                     no_generics, dump_ty, dump_row, dump_atom, dump_generics,
-                                    dump_mode)
+                                    dump_mode, starts_type)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
 import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span,
                               no_expr, fn_param, param, declared_param, dump_expr, dump_param,
@@ -243,9 +243,13 @@ pub type TypeDef = {
 pub type OpDef = {
   name: Ident,
   mode: Mode,
+  /// Written `multi`: a clause for it may call its continuation more than once.
+  multi: Bool,
   resource_param: Bool,
   ty_params: List<Ident>,
   params: List<TypeExpr>,
+  /// The places of the parameters written `keep`, which the handler takes.
+  kept: List<Int>,
   ret: TypeExpr,
   doc: Option<Doc>,
   span: Span,
@@ -311,17 +315,23 @@ derive bin for RuntimeBinder
 derive bin for Derivation
 
 /// What a nominal type's own module says its values go through: `key for Deque by to_list` for
-/// `==`, `compare`, `digest` and a `Map`'s order, and `show for Date by render` for `show`; and
+/// `==`, `compare`, `digest` and a `Map`'s order, and `show for Date by render` for `show`;
 /// `invariant for Balance by valid`, what every value of an opaque sum satisfies, which each
-/// constructor application in its module is an obligation to show and every other value assumes.
-pub type InstanceKind = | NKey | NShow | NInvariant
+/// constructor application in its module is an obligation to show and every other value assumes;
+/// and `release for Conn by close` for letting a value go, which makes the type a resource.
+pub type InstanceKind = | NKey | NShow | NInvariant | NRelease
 
 derive bin for InstanceKind
 
 pub type InstanceDef = { kind: InstanceKind, target: Ident, by: Ident, span: Span }
 
 pub fn instance_text(kind: InstanceKind) -> Bytes =
-  match kind { NKey -> b"key", NShow -> b"show", NInvariant -> b"invariant" }
+  match kind {
+    NKey -> b"key",
+    NShow -> b"show",
+    NInvariant -> b"invariant",
+    NRelease -> b"release",
+  }
 
 /// One function a `numeric` names, and the operation it names it for.
 pub type NumericOp = { op: Ident, by: Ident }
@@ -533,7 +543,7 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_numeric_start(input, parser)
 }
 
-/// `key`, `show` and `invariant` are contextual: one opens an item only before `for`, so
+/// `key`, `show`, `invariant` and `release` are contextual: one opens an item only before `for`, so
 /// `fn key(..)` and a field named `show` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
   instance_kind_at(input, parser) != None
@@ -543,6 +553,7 @@ fn instance_kind_at(input: Input, parser: Parser) -> Option<InstanceKind> =
   if at_ident_text(input, parser, b"key") { Some(NKey) }
   else if at_ident_text(input, parser, b"show") { Some(NShow) }
   else if at_ident_text(input, parser, b"invariant") { Some(NInvariant) }
+  else if at_ident_text(input, parser, b"release") { Some(NRelease) }
   else { None }
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
@@ -1425,7 +1436,7 @@ fn schema_generics(
         ),
       None -> labelled,
     };
-    Ok({ parser: rowed, node: { types: g.types, effects: take_one(g.effects), labels: [] } })
+    Ok({ parser: rowed, node: { ..g, effects: take_one(g.effects), labels: [] } })
   }
 
 fn take_one(idents: List<Ident>) -> List<Ident> =
@@ -1709,11 +1720,28 @@ fn record_docs(input: Input, t: TypeExpr) -> List<FieldDoc> / {abort.raise} =
 
 /// `name: Type` is allowed for documentation; only the type is part of the signature.
 pub fn op_param(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
+  let { parser, node: p } = kept_op_param(input, parser)?;
+  Ok({ parser: parser, node: p.ty })
+}
+
+/// An operation's parameter, its documentation name dropped, and whether it is written `keep`: the
+/// handler takes what it is handed.
+fn kept_op_param(
+  input: Input,
+  parser: Parser,
+) -> Result<Parsed<{ keep: Bool, ty: TypeExpr }>, Parser> / {abort.raise} = {
   let named = (is_ident(input, parser) || at_token(input, parser, token_underscore()))
     && token_kind_at(input, parser, 1) == token_colon();
   let p2 = if named { bump(input, bump(input, parser)) } else { parser };
-  ty(input, p2)
+  let keep = at_ident_text(input, p2, b"keep") && starts_type(input, p2, 1);
+  let p3 = if keep { advance(input, p2).parser } else { p2 };
+  let { parser, node: t } = ty(input, p3)?;
+  Ok({ parser: parser, node: { keep: keep, ty: t } })
 }
+
+/// The places among `params` of those written `keep`.
+fn kept_places(params: List<{ keep: Bool, ty: TypeExpr }>) -> List<Int> =
+  range(0, params.len()).filter(|i: Int| match params.at(i) { Some(p) -> p.keep, None -> false })
 
 fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: false }) } else {
@@ -1787,9 +1815,11 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
         node: {
           name: name,
           mode: MRaise,
+          multi: false,
           resource_param: false,
           ty_params: [],
           params: ps,
+          kept: [],
           ret: TUnit({ span: cl }),
           doc: doc_at(input, st.node.start),
           span: span_to(st.node, cl),
@@ -1799,13 +1829,16 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
   }
 }
 
-/// One operation of an effect. `raise` is contextual, as `read` and `write` are.
+/// One operation of an effect. `raise` is contextual, as `read` and `write` are, and so is a `multi`
+/// before either of those.
 pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} =
   if at_ident_text(input, parser, b"raise") { raise_op(input, parser) }
   else { moded_op(input, parser) }
 
 fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
+  let multi = at_ident_text(input, parser, b"multi");
+  let parser = if multi { advance(input, parser).parser } else { parser };
   let { parser, node: m } = mode(input, parser)?;
   let { parser, node: name } = expect_ident(input, parser, b"an operation name")?;
   let { parser, node: rp } = op_resource_param(input, parser)?;
@@ -1816,7 +1849,8 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     token_lparen(),
     b"`(` to start the operation parameters",
   )?;
-  let { parser, node: ps } = comma_list(input, parser, token_rparen(), op_param)?;
+  let { parser, node: written } = comma_list(input, parser, token_rparen(), kept_op_param)?;
+  let ps = written.map(|p: { keep: Bool, ty: TypeExpr }| p.ty);
   let { parser, .. } = expect_close(
     input,
     parser,
@@ -1831,9 +1865,11 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     node: {
       name: name,
       mode: m,
+      multi: multi,
       resource_param: rp,
       ty_params: tps,
       params: ps,
+      kept: kept_places(written),
       ret: ret,
       doc: doc_at(input, start.start),
       span: span_to(start, ty_span(ret)),
@@ -2025,9 +2061,9 @@ pub fn derive_def(
   }
 }
 
-// --- `key`, `show` and `invariant` -------------------------------------------
+// --- `key`, `show`, `invariant` and `release` ----------------------------------
 
-/// One `key for T by f`, `show for T by f` or `invariant for T by f`.
+/// One `key for T by f`, `show for T by f`, `invariant for T by f` or `release for T by f`.
 pub fn instance_def(
   input: Input,
   parser: Parser,
@@ -2308,7 +2344,7 @@ pub fn item_at(
         parser,
         unexpected(),
         pub_span,
-        b"a `key`, a `show` or an `invariant` cannot be `pub`",
+        b"a `key`, a `show`, an `invariant` or a `release` cannot be `pub`",
         [b"it is part of what its type is, and reaches wherever the type does"],
       ),
     )?;
@@ -2326,7 +2362,7 @@ pub fn item_at(
       error_here(
         input,
         parser,
-        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`, `show`, `invariant`, or `numeric`",
+        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`, `show`, `invariant`, `release`, or `numeric`",
       ),
     )
   }
@@ -2342,7 +2378,7 @@ pub fn item(input: Input, parser: Parser) -> Result<Parsed<Item>, Parser> / {abo
 }
 
 /// A test or a law says what it is in its name, a `derive` is its deriver's, and a `key`, a `show`,
-/// an `invariant` or a `numeric` is its functions'; none takes a doc.
+/// an `invariant`, a `release` or a `numeric` is its functions'; none takes a doc.
 fn documented(item: Item, doc: Option<Doc>) -> Item =
   match item {
     IFn(d) -> IFn({ ..d, doc: doc }),
@@ -2917,6 +2953,7 @@ fn may_start(k: TokenKind) -> Bool =
         || n == b"key"
         || n == b"show"
         || n == b"invariant"
+        || n == b"release"
         || n == b"numeric",
     _ -> false,
   }
@@ -3292,10 +3329,13 @@ pub fn dump_op(op: OpDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(op.span, b"op"),
     dump_ident(op.name),
+    if op.multi { dump_word(b"multi") } else { b"" },
     dump_mode(op.mode),
     dump_bool(op.resource_param),
     dump_list(op.ty_params, dump_ident),
     dump_list(op.params, dump_ty),
+    if op.kept.len() == 0 { b"" }
+    else { dump_word(b"keep").concat(dump_list(op.kept, dump_count)) },
     dump_ty(op.ret),
     dump_doc_if(op.doc),
   ])
@@ -3795,14 +3835,15 @@ test "an `extern fn` states where a call cannot raise and what it answers" {
   }
 }
 
-test "an `extern fn`'s parameter of a function type may be written `keep`" {
+test "an `extern fn`'s parameter may be written `keep`" {
   let r = parse(b"extern fn hold<a>(f: keep (a) -> a, g: (a) -> a) -> Unit\n");
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
     [IExtern(d)] -> assert_eq(d.params.map(|p: Param| p.keep), [true, false]),
     _ -> panic("one `extern fn`"),
   };
-  assert(parse(b"extern fn hold(n: keep Int) -> Unit\n").parser.diags.len() > 0)
+  // The checker judges what `keep` stands before.
+  assert_eq(parse(b"extern fn hold(n: keep Int) -> Unit\n").parser.diags.len(), 0)
 }
 
 test "`extern` stays a name where no `fn` follows it" {
@@ -3997,6 +4038,23 @@ test "a doc comment no declaration takes is E0003, reported once for a run of li
   assert_eq(at, span_between(19, 28))
 }
 
+test "a record, its type or a pattern over it that names a field twice is E0004 at the second" {
+  let codes = |src: Bytes| parse(src).parser.diags.map(|d: ParseDiag| d.code);
+  assert_eq(codes(b"fn f(k: Int) -> { a: Int } = { a: 0, a: k }\n"), [b"E0004"]);
+  assert_eq(codes(b"fn f(p: { a: Int }) -> { a: Int } = { ..p, a: 1, a: 2 }\n"), [b"E0004"]);
+  assert_eq(codes(b"fn f(p: { a: Int }) -> Int = match p { { a, a: y } -> y }\n"), [b"E0004"]);
+  assert_eq(codes(b"type T = { a: Int, a: Bool }\n"), [b"E0004"]);
+  assert_eq(codes(b"type T = new { a: Int, b: Int, a: Int }\n"), [b"E0004"]);
+  assert_eq(codes(b"type V = | One({ a: Int, a: Int })\n"), [b"E0004"]);
+  assert_eq(codes(b"fn f(k: Int) -> { a: Int } = { a: 0, a: k, a: 1 }\n"), [b"E0004", b"E0004"]);
+  assert_eq(codes(b"fn f(a: Int) -> { a: Int, b: Int } = { a, b: a }\n"), []);
+  let at = match parse(b"type T = { a: Int, a: Bool }\n").parser.diags.at(0) {
+    Some(d) -> primary_span_of(d),
+    None -> panic("the second `a` is refused"),
+  };
+  assert_eq(at, span_between(19, 20))
+}
+
 test "a test over cases takes no doc either, above it or between its label and its table" {
   let codes = |src: Bytes| parse(src).parser.diags.map(|d: ParseDiag| d.code);
   assert_eq(codes(b"/// over cases\ntest \"t {n}\" for n: Int in [1] { () }\n"), [b"E0003"]);
@@ -4108,13 +4166,22 @@ test "`invariant for T by f` is an item, and `invariant` is not reserved" {
   );
   assert(parse(b"invariant for T valid\n").parser.diags.len() > 0);
   assert_eq(parse(b"pub invariant for T by valid\n").parser.diags.map(|d: ParseDiag| d.message), [
-    b"a `key`, a `show` or an `invariant` cannot be `pub`",
+    b"a `key`, a `show`, an `invariant` or a `release` cannot be `pub`",
   ]);
   // Without `for` the word opens nothing, and what would is named.
   assert(
     parse(b"pub invariant T\n").parser.diags.any(|d: ParseDiag|
-      d.message.contains(b"`key`, `show`, `invariant`, or `numeric`")),
+      d.message.contains(b"`key`, `show`, `invariant`, `release`, or `numeric`")),
   )
+}
+
+test "`release for T by f` is an item, and `release` is not reserved" {
+  match parse(b"pub opaque type T = | T(Int)\nrelease for T by close\n").node.items {
+    [IType(_), IInstance(i)] ->
+      assert_eq((i.kind, i.target.name, i.by.name), (NRelease, b"T", b"close")),
+    _ -> panic("a type and a release"),
+  };
+  assert_eq(parse(b"fn release(release: Int) -> Int = release\n").parser.diags.len(), 0)
 }
 
 test "a header holds the imports a whole parse finds, the hidden ones among them" {

@@ -220,8 +220,10 @@ pub type Inst =
   /// A tail call of member `member` of the root's group, its arguments held as that member's
   /// convention says.
   | Enter({ member: Int, args: List<Arg> })
-  /// The run fails as `why` says, its site the text at `at`.
-  | Fail({ why: Failure, at: Span })
+  /// The run fails as `why` says, its site the text at `at`: on its way out it lets go of the
+  /// resources `letting` names, and then of the counts `unwind` holds, which the ownership pass
+  /// alone writes.
+  | Fail({ why: Failure, at: Span, letting: List<Unwound>, unwind: List<Var> })
   /// `body` run under the handlers `site` lays out over `args`, its answer or a clause's in `answer`.
   /// `unwind` are the owned values held across the body, which its landing releases where a failure
   /// inside it is answered by no clause; a failing instruction inside releases only what the body
@@ -231,6 +233,13 @@ pub type Inst =
   /// `Some` lender's: a lambda another root lent runs in place there. `None` ends the innermost such
   /// run this block began. Writes no C, holds and reads nothing.
   | Sited(Option<Lender>)
+  /// Where a raise, a clause that did not resume, or a cancel fails an instruction after it in its
+  /// block, or in a block they hold, the failure path first lets go of each of `Some` list's
+  /// resources, in order, before it releases what the instruction holds; `None` ends the innermost
+  /// such run this block began. A resource is let go by its type's `LetGo` root, and one whose
+  /// release fails replaces the failure going on. Writes no C where it stands, and holds nothing:
+  /// each value it names is live past the run, which the body lets go of on its own path.
+  | Unwinds(Option<List<Unwound>>)
   // Written by the ownership pass alone.
   | Inc({ var: Var, n: Int })
   | Dec(Var)
@@ -240,6 +249,9 @@ pub type Inst =
   | Free({ of: Var, bytes: Arg })
   /// A block known to be held only here consumed, and its counted words bound as owned.
   | Opened({ of: Var, words: List<Var> })
+
+/// A resource a failure lets go of: the value, and the call of its type's `LetGo` root on it.
+pub type Unwound = { arg: Arg, callee: RootKey, conv: Convention }
 
 /// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
 /// did not hold its value, which raises.
@@ -616,9 +628,10 @@ pub fn ends(i: Inst) -> Bool =
     _ -> false,
   }
 
-/// Whether control can leave `b` at its end: its last instruction but a `Sited` does not end.
+/// Whether control can leave `b` at its end: its last instruction but a marker does not end.
 pub fn falls_through(b: Block) -> Bool =
-  b.fold(true, |falls: Bool, i: Inst| match i { Sited(_) -> falls, _ -> !ends(i) })
+  b.fold(true, |falls: Bool, i: Inst|
+    match i { Sited(_) -> falls, Unwinds(_) -> falls, _ -> !ends(i) })
 
 test "a word, a view and a flat value with a counted leaf hold a count where a scalar holds none" {
   assert_eq([RInt, RBool, RFloat, RDec, RNum({ bits: 8, signed: false })].map(counted), [
@@ -655,7 +668,13 @@ test "each operation consumes or borrows each operand as its signature says" {
   // A call takes a function value it enters typed, and borrows a continuation.
   let f = {
     id: 2,
-    ty: TyFn({ params: [s.ty, s.ty], ret: int_type(), effects: row_empty() }),
+    ty: TyFn({
+      kept: [],
+      once: false,
+      params: [s.ty, s.ty],
+      ret: int_type(),
+      effects: row_empty(),
+    }),
     rep: RWord,
   };
   assert_eq(takes(Apply({ f: AVar(f), args: [AVar(s), AVar(s)], conv: conv, stops: false })), [
@@ -769,7 +788,7 @@ test "a call stops where it says, a block where something it holds does, a handl
 
 test "a block ends where its last instruction but a site's change ends" {
   let lent = Sited(Some({ root: Named(b"m.g"), base: 40 }));
-  let fail = Fail({ why: NoArm, at: dummy_span() });
+  let fail = Fail({ why: NoArm, at: dummy_span(), letting: [], unwind: [] });
   assert_eq(falls_through([lent, fail, Sited(None)]), false);
   assert_eq(falls_through([fail, Sited(None), Return(AInt(0)), lent]), false);
   assert_eq(falls_through([lent, Sited(None)]), true);

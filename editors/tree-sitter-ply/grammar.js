@@ -84,6 +84,7 @@ module.exports = grammar({
       $.key_declaration,
       $.show_declaration,
       $.invariant_declaration,
+      $.release_declaration,
       $.numeric_declaration,
     ),
 
@@ -163,9 +164,9 @@ module.exports = grammar({
       seq('<', '|', commaSep1($.row_parameter), $.type_gt),
     ),
     _generic_parameter: $ => choice($.type_parameter, $.label_parameter),
-    type_parameter: $ => $.identifier,
+    type_parameter: $ => seq(optional($.keep_marker), $.identifier),
     label_parameter: $ => seq('[', commaSep1($.identifier), ']'),
-    row_parameter: $ => $.identifier,
+    row_parameter: $ => seq(optional('multi'), $.identifier),
 
     // --- Types --------------------------------------------------------------
 
@@ -230,8 +231,9 @@ module.exports = grammar({
 
     function_type: $ => prec.right(1, seq(
       optional($.generic_parameters),
+      optional('once'),
       '(',
-      optional(commaSep1(field('parameter', $._type))),
+      optional(commaSep1(seq(optional($.keep_marker), field('parameter', $._type)))),
       ')',
       '->',
       field('return_type', $._type),
@@ -260,6 +262,7 @@ module.exports = grammar({
     ),
 
     operation: $ => seq(
+      optional('multi'),
       field('mode', choice('read', 'write', 'raise')),
       field('name', $.identifier),
       optional($.resource_label),
@@ -269,8 +272,8 @@ module.exports = grammar({
     ),
     operation_parameters: $ => seq('(', optional(commaSep1($.operation_parameter)), ')'),
     operation_parameter: $ => choice(
-      seq(field('name', $.identifier), ':', field('type', $._type)),
-      field('type', $._type),
+      seq(field('name', $.identifier), ':', optional($.keep_marker), field('type', $._type)),
+      seq(optional($.keep_marker), field('type', $._type)),
     ),
 
     type_parameters: $ => seq('<', commaSep1($.identifier), '>'),
@@ -370,6 +373,7 @@ module.exports = grammar({
     key_declaration: $ => seq(optional('pub'), 'key', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     show_declaration: $ => seq(optional('pub'), 'show', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     invariant_declaration: $ => seq(optional('pub'), 'invariant', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
+    release_declaration: $ => seq(optional('pub'), 'release', 'for', field('type', $._type), 'by', field('function', choice($.identifier, $.qualified_name))),
     numeric_declaration: $ => seq(
       optional('pub'),
       'numeric',
