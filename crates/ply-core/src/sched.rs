@@ -1557,24 +1557,30 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
         Ok(())
     }
 
-    pub fn fail(&mut self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
-        let mut failure = failure;
-        if let Some(task) = self.current {
-            // The failing task is itself unfinished.
-            let live = self.unfinished.saturating_sub(1);
-            if self.next_id > ROOT.0 + 1 {
-                failure = failure.note(match self.policy {
+    /// `failure` noted with the task it ends in where the region spawned any: which task, how many
+    /// others it leaves unfinished, and how to replay the run.
+    pub fn noted(&self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
+        match self.current {
+            Some(task) if self.next_id > ROOT.0 + 1 => {
+                // The failing task is itself unfinished.
+                let live = self.unfinished.saturating_sub(1);
+                failure.note(match self.policy {
                     Policy::Seeded => format!(
                         "failed in task {task} of a simulated region, with {live} other task(s) unfinished; replay with seed {seed}"
                     ),
                     Policy::Host => format!(
                         "failed in task {task} of a host-scheduled region, with {live} other task(s) unfinished; a host-backed run is not replayable from a seed"
                     ),
-                });
+                })
             }
-            if let Some(t) = self.tasks.get_mut(&task) {
-                t.state = TaskState::Failed;
-            }
+            _ => failure,
+        }
+    }
+
+    pub fn fail(&mut self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
+        let failure = self.noted(failure, seed);
+        if let Some(t) = self.current.and_then(|task| self.tasks.get_mut(&task)) {
+            t.state = TaskState::Failed;
         }
         self.current = None;
         self.failure = Some(failure.clone());

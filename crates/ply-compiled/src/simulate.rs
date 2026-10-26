@@ -6,9 +6,9 @@
 use crate::emitted::{Block, Carried, Handed, PlyOp, PlyType};
 use crate::heap::Word;
 use crate::rt::{
-    Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_TARGET, FAILED_UNWIND, Frames,
-    HandlerFrame, Lifted, drop_frame, err_crossing, inherit_frames, lifted_from, lowered_values,
-    lowering_of, no_stack_to_take, raise_error, released, running, switch_keeping,
+    Beside, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, FAILED_UNWIND,
+    Frames, HandlerFrame, Lifted, drop_frame, err_crossing, inherit_frames, lifted_from,
+    lowered_values, lowering_of, no_stack_to_take, raise_error, released, running, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::codec::{self, Reader, Writer, tag};
@@ -119,6 +119,9 @@ pub struct Simulation {
     starting: Option<Body>,
     /// The region's own body, until it starts; a production region's root is its entry.
     root: Option<Body>,
+    /// The descriptor and words the region was entered with, which each task it spawns is handed,
+    /// so what a task performs past the region reaches the handles around it.
+    entered: (Word, Word),
     policy: Policy,
     /// A production region's loop stack; the opening stack is the root task.
     loop_stack: Option<Stack>,
@@ -172,6 +175,7 @@ impl Simulation {
         Simulation {
             sched,
             site,
+            entered: root.2,
             handlers: Handlers::at(root_seed, drawn),
             tasks: BTreeMap::from([(ROOT, TaskStack::default())]),
             scheduler_sp: 0,
@@ -252,6 +256,8 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         stack: loop_frames,
         starting: None,
         root: None,
+        // The operation that opens it hands it no words: its tasks reach what frames hold.
+        entered: (0, 0),
         policy: Policy::Host,
         loop_stack: Some(loop_stack),
         loop_done: false,
@@ -583,6 +589,16 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
             if c.failed == FAILED_UNWIND || c.failed == FAILED_ABORT || c.failed == FAILED_TARGET {
                 return Err(None);
             }
+            // A raise no frame answered stays pending for the code around the region, whose
+            // handles may answer it, noted with where in the region it was raised.
+            if c.failed == FAILED_PENDING {
+                let seed = c.trail.seed().clone();
+                let failure = c.diagnostic.take();
+                let sim = c.sims.last().expect("a region is running");
+                let noted = failure.map(|d| sim.sched.noted(d, &seed));
+                c.diagnostic = noted;
+                return Err(None);
+            }
             // A raise nothing in the task answers fails the task, as one no frame answered did.
             c.pending = None;
             let failure = c.diagnostic.take().unwrap_or_else(|| {
@@ -864,7 +880,11 @@ unsafe fn request_of(
     let from = unsafe { &*ctx }.current;
     match (effect.as_str(), op.as_str()) {
         ("task", "spawn") => {
-            let body = unsafe { body_of(ctx, args[0], described) }?;
+            let entered = unsafe { &*ctx }
+                .sims
+                .last()
+                .map_or((0, 0), |sim| sim.entered);
+            let body = unsafe { body_of(ctx, args[0], described, entered) }?;
             return Some(Request::Spawn(body, from));
         }
         ("task", "select") => return unsafe { select_of(ctx, args, described) },
@@ -971,11 +991,11 @@ unsafe fn taken(ctx: *mut Ctx, args: &[Word], op: &PlyOp) -> Option<Vec<Arg>> {
 }
 
 /// The body `task.spawn` was handed, which the region takes, answering what the operation's own
-/// type parameter is. `None` with the context failed.
-unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp) -> Option<Body> {
+/// type parameter is, handed the region's `words`. `None` with the context failed.
+unsafe fn body_of(ctx: *mut Ctx, w: Word, op: &PlyOp, words: (Word, Word)) -> Option<Body> {
     let f = Block::of(w);
     match op.vars().first() {
-        Some(ty) => Some(Body(f, ty, (0, 0))),
+        Some(ty) => Some(Body(f, ty, words)),
         None => {
             unsafe { f.let_go_function(ctx) };
             unsafe { &mut *ctx }.fail(err_crossing(

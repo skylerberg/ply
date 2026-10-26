@@ -5,7 +5,9 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_acquire, role_hold_acquire_read, role_hold_release,
                                 role_hold_release_read, role_hold_open, role_hold_close,
                                 role_hold_body, role_hold_new_callee, role_hold_take_callee,
-                                role_tag_texts, role_tag_holes, role_var_first_read)
+                                role_hold_acquired, role_hold_release_call, role_hold_close_call,
+                                role_hold_bracket_callee, role_tag_texts, role_tag_holes,
+                                role_var_first_read)
 import std.list (prepend)
 import compiler.syntax.type_syntax (TypeExpr, mode_text, is_raise)
 import compiler.syntax.items (DOrd, member_name, member_of, Opaque)
@@ -57,8 +59,8 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, DefConstraint, NumericI
                                      RigidParam, ConstraintSite, GroupDef, Checker, Assignable,
                                      barred, unbarred, Inferred, WithTy, WithVar, HoleSite, WithRow,
                                      WithName, Expected, WithKey, WithHit, WithResource,
-                                     WithBodyRow, Fill, RowFound, ReadOf, RowOf, AtomOf, hold,
-                                     hold_atom, is_region_effect, location_of, module_name,
+                                     WithBodyRow, Fill, RowFound, ReadOf, RowOf, AtomOf, FilledOf,
+                                     hold, hold_atom, is_region_effect, location_of, module_name,
                                      scope_of, report, report_error_at, report_error_at_and,
                                      err_labels, backticked_text, plural, supplied, new_ty,
                                      new_ty_var, new_row, new_row_var, resolve, resolve_row_in,
@@ -4654,18 +4656,10 @@ fn infer_handle(
     let o: WithVar = new_row_var(b.checker);
     { checker: o.checker, v: Some(o.var) }
   } else { { checker: b.checker, v: None } };
-  // With no `return` clause the result is the body's type, known before the clauses read it off `k`.
-  let result_var: { checker: Checker, t: Option<Type> } = if !escapes {
-    { checker: cont.checker, t: None }
-  } else {
-    match ret {
-      None -> { checker: cont.checker, t: Some(b.ty) },
-      Some(_) -> {
-        let o: WithTy = new_ty(cont.checker);
-        { checker: o.checker, t: Some(o.ty) }
-      },
-    }
-  };
+  let result_var: { checker: Checker, t: Option<Type> } = if escapes {
+    let o: WithTy = new_ty(cont.checker);
+    { checker: o.checker, t: Some(o.ty) }
+  } else { { checker: cont.checker, t: None } };
   let walked: HandleAcc = clauses.fold(
     {
       checker: result_var.checker,
@@ -5568,7 +5562,11 @@ fn infer_with_hold(
         entering.row,
         b.row,
       );
-      { checker: j.checker, ty: b.ty, row: j.row }
+      {
+        checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
+        ty: b.ty,
+        row: j.row,
+      }
     },
     None -> {
       let opened: Checker = open_region(entering.checker, resource.name, label, resource.span);
@@ -5606,10 +5604,40 @@ fn infer_with_hold(
         entering.row,
         row_without_covered(resolve_row_in(recorded, b.row), handled),
       );
-      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
+      {
+        checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
+        ty: leaving_type(resolve(j.checker, b.ty), label),
+        row: j.row,
+      }
     },
   }
 }
+
+/// `checker` with what the closures the hold at `span` is written out as perform filed where they
+/// are written, and the calls through them: the acquire and the open performing `acquired`, the
+/// release and the close `released`, and the body `body`; and its bracket filled with `all`, the row
+/// the three share.
+fn hold_rowed(
+  checker: Checker,
+  span: Span,
+  acquired: Row,
+  released: Row,
+  body: Row,
+  all: Row,
+) -> Checker =
+  [
+    { role: role_hold_acquire(), row: acquired },
+    { role: role_hold_open(), row: acquired },
+    { role: role_hold_acquired(), row: acquired },
+    { role: role_hold_release(), row: released },
+    { role: role_hold_release_call(), row: released },
+    { role: role_hold_close(), row: released },
+    { role: role_hold_close_call(), row: released },
+    { role: role_hold_body(), row: body },
+  ].fold(
+    note_row(checker, minted(span, role_hold_bracket_callee()), FilledOf([all])),
+    |c: Checker, x: { role: Int, row: Row }| note_row(c, minted(span, x.role), RowOf(x.row)),
+  )
 
 /// `checker` with the closures the hold at `span` is written out as filed where they are written,
 /// and the reads inside them: the acquire answering `held` and the release taking it; the open
@@ -5704,8 +5732,13 @@ fn infer_simulate(
     }),
   };
   let seed = seed_atom();
+  // The body is filed with what it performs, which the region hands it the words of.
   let recorded: Checker = record_site(
-    note_typed(noted, simulated_at(span), fn_type([], b.ty, row_empty()), []),
+    note_row(
+      note_typed(noted, simulated_at(span), fn_type([], b.ty, row_empty()), []),
+      simulated_at(span),
+      RowOf(b.row),
+    ),
     seed,
     span,
     DirectPerform,
