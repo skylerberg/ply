@@ -1,7 +1,4 @@
-use ply_core::{
-    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity,
-    Resource, Span, Symbol, Value, codes,
-};
+use ply_core::Span;
 use ply_host::signal::*;
 use ply_host::tcp::TcpHost;
 use std::io::Read;
@@ -53,13 +50,6 @@ fn until_stopped_accepting(shutdown: &Arc<Shutdown>) {
         shutdown.stopped_accepting(),
         "the shutdown never reached its stop"
     );
-}
-
-fn int(value: &Value) -> i64 {
-    match value {
-        Value::Int(i) => *i,
-        other => panic!("not an Int: {}", other.type_name()),
-    }
 }
 
 /// `-1` rather than `None` because every call site compares it against a duration.
@@ -287,27 +277,6 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     );
 }
 
-/// The stop's two are flag reads: replaying changes nothing outside the program. An ask takes the
-/// arrival it answers, so a second one answers otherwise. None waits on a peer.
-#[test]
-fn the_registrations_declare_what_a_reviewer_relies_on() {
-    let shutdown = Shutdown::new(Bounds::default());
-    for (op, _) in registrations(Some(&shutdown)) {
-        assert_eq!(op.effect.as_str(), EFFECT);
-        assert_eq!(op.determinism, Determinism::Nondeterministic);
-        let reads = matches!(op.op.as_str(), "stopping" | "deadline_ms");
-        let expected = if reads {
-            Linearity::Repeatable
-        } else {
-            Linearity::AtMostOnce
-        };
-        assert_eq!(op.linearity, expected, "{op}");
-        assert!(!op.blocking);
-        assert!(!op.secrets, "a stop flag is handed no value at all");
-        assert!(op.path.starts_with("ply_host::signal::"));
-    }
-}
-
 /// `SIGUSR2` sent to this process, which is safe once an ask has installed its handler. The
 /// shell's own `kill` sends it, which every system has.
 fn send_user2() {
@@ -318,10 +287,10 @@ fn send_user2() {
     assert!(sent.success());
 }
 
-fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
+fn arrives(which: Asked) -> bool {
     let until = Instant::now() + Duration::from_secs(10);
     while Instant::now() < until {
-        if shutdown.arrived(which).expect("the handler is installed") {
+        if arrived(which).expect("the handler is installed") {
             return true;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -331,138 +300,20 @@ fn arrives(shutdown: &Shutdown, which: Asked) -> bool {
 
 #[test]
 fn a_signal_asked_about_is_seen_once_however_often_it_arrived() {
-    let shutdown = Shutdown::new(Bounds::default());
     assert!(
-        !shutdown
-            .arrived(Asked::User2)
-            .expect("the first ask installs the handler"),
+        !arrived(Asked::User2).expect("the first ask installs the handler"),
         "nothing arrived before anybody asked"
     );
     send_user2();
-    assert!(arrives(&shutdown, Asked::User2), "one arrival is seen");
+    assert!(arrives(Asked::User2), "one arrival is seen");
     send_user2();
     send_user2();
-    assert!(arrives(&shutdown, Asked::User2), "two arrivals are seen");
+    assert!(arrives(Asked::User2), "two arrivals are seen");
     std::thread::sleep(Duration::from_millis(200));
     // The second of the two may have landed after the ask that saw the first.
-    let _ = shutdown.arrived(Asked::User2);
+    let _ = arrived(Asked::User2);
     assert!(
-        !shutdown.arrived(Asked::User2).expect("installed"),
+        !arrived(Asked::User2).expect("installed"),
         "arrivals are not counted: nothing is owed once they were answered"
     );
-    assert!(
-        !shutdown.stopping(),
-        "a signal asked about is no request to stop"
-    );
-}
-
-#[test]
-fn an_ask_is_answered_through_its_handler() {
-    let shutdown = Shutdown::new(Bounds::default());
-    let handlers = registrations(Some(&shutdown));
-    let (declaration, handler) = handlers
-        .iter()
-        .find(|(op, _)| op.op.as_str() == "resized")
-        .expect("`resized` is registered");
-    let atom = ply_core::EffectAtom::new(
-        Symbol::new(EFFECT),
-        Resource::Singleton,
-        ply_core::Mode::Write,
-    );
-    struct Nothing;
-    impl HostRuntime for Nothing {
-        fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-            Ok(())
-        }
-        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-            Vec::new()
-        }
-        fn park(&self) -> Result<(), Diagnostic> {
-            Ok(())
-        }
-        fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
-            Ok(Value::Unit)
-        }
-    }
-    let answered = handler
-        .call(
-            &Nothing,
-            &HostRequest {
-                atom,
-                op: declaration,
-                args: &[],
-                span: Span::DUMMY,
-                machine: ply_core::host::MachineId(0),
-                task: None,
-                declared: None,
-            },
-        )
-        .expect("an ask is answered");
-    assert!(matches!(answered, HostAnswer::Value(Value::Bool(false))));
-}
-
-#[test]
-fn the_handler_answers_the_flag_and_the_clock() {
-    let shutdown = Shutdown::new(bounds(0, 5_000));
-    let handlers = registrations(Some(&shutdown));
-    let stopping = &handlers[0].1;
-    let deadline = &handlers[1].1;
-    let atom = ply_core::EffectAtom::new(
-        Symbol::new(EFFECT),
-        Resource::Singleton,
-        ply_core::Mode::Read,
-    );
-    let declaration = Op::Stopping.declaration();
-    fn request<'a>(
-        atom: &ply_core::EffectAtom,
-        declaration: &'a HostOp,
-        args: &'a [Value],
-    ) -> HostRequest<'a> {
-        HostRequest {
-            atom: atom.clone(),
-            op: declaration,
-            args,
-            span: Span::DUMMY,
-            machine: ply_core::host::MachineId(0),
-            task: None,
-            declared: None,
-        }
-    }
-
-    struct Nothing;
-    impl HostRuntime for Nothing {
-        fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-            Ok(())
-        }
-        fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-            Vec::new()
-        }
-        fn park(&self) -> Result<(), Diagnostic> {
-            Ok(())
-        }
-        fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
-            Ok(Value::Unit)
-        }
-    }
-
-    let answer = |h: &Arc<dyn HostHandler>| match h
-        .call(&Nothing, &request(&atom, &declaration, &[]))
-    {
-        Ok(HostAnswer::Value(v)) => v,
-        Ok(HostAnswer::Pending(_)) => panic!("a flag read waits on nothing, so it answers inline"),
-        Err(d) => panic!("a flag read was refused: {} {}", d.code, d.message),
-    };
-    assert_eq!(answer(stopping), Value::Bool(false));
-    assert_eq!(answer(deadline), Value::Int(-1));
-
-    shutdown.request(ShutdownSignal::Interrupt);
-    assert_eq!(answer(stopping), Value::Bool(true));
-    assert!(int(&answer(deadline)) > 0);
-
-    // Arity is inference's, so the wrong count means the module was never checked.
-    let extra = [Value::Unit];
-    match stopping.call(&Nothing, &request(&atom, &declaration, &extra)) {
-        Err(d) => assert_eq!(d.code, codes::INTERNAL_ERROR),
-        Ok(_) => panic!("an argument to a nullary operation was accepted"),
-    }
 }

@@ -334,11 +334,6 @@ impl ProcessHost {
     pub fn end_children(&self) {
         self.children.end_all();
     }
-
-    /// The pool its operations wait on, which the terminal's wait on too.
-    pub(crate) fn pool(&self) -> &Pool {
-        &self.pool
-    }
 }
 
 pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {

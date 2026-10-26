@@ -318,11 +318,6 @@ impl FsHost {
     pub fn roots(&self) -> &Roots {
         &self.roots
     }
-
-    /// The pool its operations wait on, which a database under its roots waits on too.
-    pub(crate) fn pool(&self) -> &Pool {
-        &self.pool
-    }
 }
 
 pub fn registrations(fs: &Arc<FsHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {

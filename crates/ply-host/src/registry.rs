@@ -12,7 +12,6 @@ use crate::sched;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
 use crate::tcp;
-use crate::term;
 use crate::time;
 use crate::trace;
 use ply_core::host::{
@@ -126,16 +125,7 @@ impl Host {
         process::register(&mut registry, self.process.as_ref());
         random::register(&mut registry);
         sched::register(&mut registry);
-        signal::register(&mut registry, self.shutdown.as_ref());
-        // Its operations wait on the pool of the roots it is handed.
-        sqlite::register(
-            &mut registry,
-            Arc::clone(&self.fs),
-            Arc::clone(&self.sqlite),
-        );
-        term::register(&mut registry, self.process.as_ref());
         time::register(&mut registry, Arc::clone(&self.time));
-        trace::register(&mut registry, Arc::clone(&self.trace));
         registry
     }
 
@@ -145,6 +135,7 @@ impl Host {
         Rc::new(Facilities {
             run: Run::new(Arc::clone(&self.bell)),
             config: Arc::clone(&self.config),
+            fs: Arc::clone(&self.fs),
             net: Arc::clone(&self.net),
             process: self.process.clone(),
             trace: Arc::clone(&self.trace),
@@ -221,6 +212,8 @@ pub struct Facilities {
     run: Arc<Run>,
     /// The run's configuration, which `config`'s natives read.
     config: Arc<config::Snapshot>,
+    /// The roots `--fs` bound, which a database lies under.
+    fs: Arc<fs::FsHost>,
     /// The sockets, for the connections a drain that ran out of time abandoned.
     net: Arc<tcp::TcpHost>,
     /// The run's own process, for its children and its streams at the end.
@@ -246,6 +239,26 @@ impl Facilities {
     /// The run's operations, which every operation it asks for is submitted for.
     pub fn run(&self) -> &Arc<Run> {
         &self.run
+    }
+
+    /// The roots `--fs` bound, each by its label.
+    pub fn roots(&self) -> &fs::Roots {
+        self.fs.roots()
+    }
+
+    /// The database connections the run holds open.
+    pub fn databases(&self) -> &Arc<sqlite::SqliteHost> {
+        &self.sqlite
+    }
+
+    /// The stop the run listens for, where it listens for one.
+    pub fn stop(&self) -> Option<&Arc<Shutdown>> {
+        self.shutdown.as_ref()
+    }
+
+    /// The run's trace and the sink it writes to.
+    pub fn tracing(&self) -> &Arc<trace::Trace> {
+        &self.trace
     }
 }
 
@@ -321,6 +334,8 @@ impl HostRuntime for Facilities {
         }
         // The sink flushes before the run's own state is gone.
         self.trace.flush();
+        // `term.mode` serves every run, whatever process it was lent.
+        crate::stdio::restore_terminal();
         // Last, since a buffer whose reader has gone ends the process here.
         if let Some(process) = &self.process {
             process.settle();

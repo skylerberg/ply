@@ -2,15 +2,14 @@
 //! the label the clause that asks binds. What they are handed and answer is flat as
 //! `ply_host::tcp::wire` reads and writes it; an operation that waits answers a ticket.
 
-use super::{READS, WRITES, asked, opened, secret_of};
+use super::{READS, WRITES, asked, done, from_host, given, handed, opened, secret_of, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
-use ply_core::{Diagnostic, codes};
-use ply_host::jobs::Work;
+use ply_core::Diagnostic;
 use ply_host::native::parts_of;
-use ply_host::tcp::{Endpoint, Job, MAX_RECV, SocketOption, TcpHost, Upgrade};
+use ply_host::tcp::{Endpoint, MAX_RECV, SocketOption, TcpHost, Upgrade};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,27 +158,8 @@ pub(super) fn natives() -> Vec<MachineNative> {
 /// for a runtime no host made or a label that is not UTF-8.
 fn labelled<'a>(c: &mut Ctx, label: &'a [u8]) -> Option<(Arc<TcpHost>, &'a str)> {
     let label = c.text(label)?;
-    let runtime = c.host_runtime();
-    let Some(facilities) = ply_host::registry::facilities_of(&*runtime) else {
-        c.fail(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            "a socket was asked for of a runtime no host made",
-        ));
-        return None;
-    };
-    Some((Arc::clone(facilities.sockets()), label))
-}
-
-/// What a native was handed, read; `None`, with the run failed, where it is not what the real
-/// handler hands on, which checks what it hands.
-fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
-    if read.is_none() {
-        c.fail(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("the native `{native}` was handed {what} it cannot be"),
-        ));
-    }
-    read
+    let net = from_host(c, |facilities| Arc::clone(facilities.sockets()))?;
+    Some((net, label))
 }
 
 fn port(port: I64) -> Option<u16> {
@@ -202,41 +182,6 @@ fn texts(flat: &[u8]) -> Option<Vec<String>> {
         .into_iter()
         .map(|part| std::str::from_utf8(part).ok().map(str::to_string))
         .collect()
-}
-
-/// `answer`'s bytes as taken bytes; none, with the run failed, where it is a diagnostic.
-fn given(c: &mut Ctx, answer: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
-    match answer {
-        Ok(bytes) => c.given(bytes),
-        Err(d) => {
-            c.fail(d);
-            TakenBytes(0)
-        }
-    }
-}
-
-/// The ticket of `job`, which `native` asked for as `what`; 0, with the run failed, where it is a
-/// diagnostic.
-fn waited(
-    c: &mut Ctx,
-    native: &'static str,
-    what: &'static str,
-    job: Result<Job, Diagnostic>,
-) -> I64 {
-    match job {
-        Ok(job) => c.submitted(native, what, Work::Waiting, job),
-        Err(d) => {
-            c.fail(d);
-            I64(0)
-        }
-    }
-}
-
-/// Runs `done`; the run failed where it is a diagnostic.
-fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
-    if let Err(d) = done {
-        c.fail(d);
-    }
 }
 
 /// A listener on `port` of the loopback address, as its handle.

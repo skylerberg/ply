@@ -1,6 +1,6 @@
 //! The sockets `std.net` and `std.udp` open, in one table: TCP, TLS and Unix streams, listeners and
 //! datagram sockets, each under the handle and the resource label the program uses it by. The real
-//! handlers' natives call in here, and an operation that waits answers a [`Job`] for the process's
+//! handlers' natives call in here, and an operation that waits answers a job for the process's
 //! waiting pool.
 
 mod socket;
@@ -18,9 +18,6 @@ use std::time::Duration;
 
 /// The most bytes one `recv` allocates for, whatever `max` asks.
 pub const MAX_RECV: usize = 1 << 20;
-
-/// What an operation that waits does on a thread of its own: its answer flat, or why it failed.
-pub type Job = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
 
 /// What an upgrade to TLS is asked with: the protocols to offer or accept, how many bytes of
 /// plaintext the caller read and has not consumed, and the deadline of the whole handshake.

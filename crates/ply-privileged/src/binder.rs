@@ -113,7 +113,7 @@ impl ply_compiled::entry::Binder for Binder {
 
 /// Which disclosure a registration's handler is one of: `fs`, or none.
 fn facility_of(path: &str) -> &'static str {
-    if path.starts_with("ply_host::fs::") || path.starts_with("ply_host::sqlite::") {
+    if path.starts_with("ply_host::fs::") {
         "fs"
     } else {
         ""

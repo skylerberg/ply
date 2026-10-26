@@ -3,9 +3,10 @@
 //! handlers read it.
 
 use ply_core::{Span, codes};
+use ply_host::jobs::Job;
 use ply_host::native::{int_of, parts_of};
 use ply_host::tcp::wire::{Endpoint, Probing, Refusal, SocketOption};
-use ply_host::tcp::{Job, TcpHost, Upgrade};
+use ply_host::tcp::{TcpHost, Upgrade};
 use ply_host::{CredentialSpec, Credentials};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;

@@ -7,6 +7,9 @@ use ply_core::host::Pending;
 use ply_core::{Diagnostic, Span};
 use std::sync::{Arc, OnceLock};
 
+/// What a native's operation does on a thread of its own: its answer flat, or why it failed.
+pub type Job = Box<dyn FnOnce() -> Result<Vec<u8>, String> + Send>;
+
 /// Which of the process's pools a job waits for a thread in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Work {

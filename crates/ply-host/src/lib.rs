@@ -86,7 +86,6 @@ pub mod signal;
 pub mod sqlite;
 pub mod stdio;
 pub mod tcp;
-pub mod term;
 pub mod time;
 pub mod tls;
 pub mod trace;

@@ -3,13 +3,13 @@ use ply_core::sched::{HostPolicy, Scheduler};
 use ply_core::sched::{Policy, Resumption, Turn};
 use ply_core::sim::TASK_OPS;
 use ply_core::{
-    Diagnostic, EffectAtom, HostBinding, HostRegistry, HostRequest, HostRuntime, Mode, Pending,
-    Resource, SimId, Span, Symbol, TaskHandle, TaskId, Value, codes,
+    Diagnostic, HostBinding, HostRegistry, HostRequest, HostRuntime, Pending, SimId, Span, Symbol,
+    TaskHandle, TaskId, Value, codes,
 };
 use ply_host::sched::*;
 use ply_host::signal::{Bounds, Shutdown, ShutdownSignal};
 use ply_host::trace::sink::Recording;
-use ply_host::trace::{self, Level, Outcome, RecordKind, Sink, Trace};
+use ply_host::trace::{Level, Outcome, RecordKind, Sink, Trace};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
@@ -700,28 +700,6 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
     );
 }
 
-/// `trace.enter[http](name, {})`, performed by `task` of `machine` against the run's own runtime.
-fn enter_span(trace: &Arc<Trace>, rt: &dyn HostRuntime, machine: MachineId, task: TaskId) {
-    let declaration = trace::Op::Enter.declaration("ply_host::trace::tests");
-    let args = [Value::str("request"), Value::empty_map()];
-    let request = HostRequest {
-        atom: EffectAtom::new(
-            Symbol::new(trace::EFFECT),
-            Resource::Named(Symbol::new("http")),
-            Mode::Write,
-        ),
-        op: &declaration,
-        args: &args,
-        span: Span::DUMMY,
-        machine,
-        task: Some(task),
-        declared: None,
-    };
-    trace::handler(trace::Op::Enter, Arc::clone(trace))
-        .call(rt, &request)
-        .unwrap_or_else(|d| panic!("the span opens: {d:?}"));
-}
-
 /// Through the runtime the host itself builds, which is what a `--host` run retires against.
 #[test]
 fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
@@ -741,7 +719,7 @@ fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
         panic!("expected the child's step");
     };
     assert_eq!(task, child);
-    enter_span(&trace, &*rt, machine, child);
+    trace.enter((machine, Some(child)), "http", "request", &[]);
     sched.finish(Value::Unit).expect("the child is running");
     assert_eq!(trace.open_spans(), 1, "open until the task retires");
 

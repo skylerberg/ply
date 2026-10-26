@@ -59,9 +59,6 @@ const REPEATABLE: &Rows = &[
     ("std.process.process", &["args", "bound"]),
     // Every draw is independent of every other, so a run may take as many as it likes.
     ("std.random.entropy", &["below", "next", "secret"]),
-    ("std.signal.signal", &["deadline_ms", "stopping"]),
-    // Asking what a stream is, or how large the terminal is, changes neither.
-    ("std.term.term", &["is_terminal", "size"]),
     ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
     (
         "task",

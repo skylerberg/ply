@@ -174,10 +174,12 @@ impl Hosts {
             write(&mut w);
             reports.push((name.to_string(), w.finish()));
         };
-        if let Some(torn) = self.runtime().map(|rt| rt.shutdown()) {
-            report("teardown", &|w| {
+        match self.runtime().map(|rt| rt.shutdown()) {
+            Some(torn) => report("teardown", &|w| {
                 w.count(torn.spans_left_open as u64);
-            });
+            }),
+            // A hermetic run has no host to tear down, yet `term.mode` served it.
+            None => ply_host::stdio::restore_terminal(),
         }
         let handshakes = (self.host.as_ref()).map_or_else(Default::default, |h| h.handshakes());
         if !handshakes.is_empty() {

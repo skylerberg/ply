@@ -10,7 +10,11 @@
 //! A native answering structured data writes it in the flat forms of `ply_host::native`.
 
 mod dns;
+mod signal;
 mod sockets;
+mod sqlite;
+mod term;
+mod trace;
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
@@ -19,9 +23,10 @@ use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Value, codes};
-use ply_host::jobs::{self, Work};
+use ply_host::jobs::{self, Job, Work};
 use ply_host::native::{found, parts, told};
 use ply_host::password;
+use ply_host::registry::Facilities;
 
 /// The effect every native here performs, under its program-wide name (`std.internal.native`).
 const NATIVE: &str = "std.internal.native.native";
@@ -116,7 +121,11 @@ pub fn natives() -> Vec<MachineNative> {
         ),
     ];
     natives.extend(dns::natives());
+    natives.extend(signal::natives());
     natives.extend(sockets::natives());
+    natives.extend(sqlite::natives());
+    natives.extend(term::natives());
+    natives.extend(trace::natives());
     natives
 }
 
@@ -221,6 +230,69 @@ fn opened(v: &Value) -> &[u8] {
     match v {
         Value::Secret(held) => held.bytes(),
         _ => &[],
+    }
+}
+
+/// What `read` takes of the facilities the run's host lends; `None`, with the run failed, for a
+/// runtime no host made.
+fn from_host<R>(c: &mut Ctx, read: impl FnOnce(&Facilities) -> R) -> Option<R> {
+    let runtime = c.host_runtime();
+    match ply_host::registry::facilities_of(&*runtime) {
+        Some(facilities) => Some(read(facilities)),
+        None => {
+            c.fail(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "a native asked the host through a runtime no host made",
+            ));
+            None
+        }
+    }
+}
+
+/// What a native was handed, read; `None`, with the run failed, where it is not what the real
+/// handler hands on, which checks what it hands.
+fn handed<T>(c: &mut Ctx, native: &str, what: &str, read: Option<T>) -> Option<T> {
+    if read.is_none() {
+        c.fail(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("the native `{native}` was handed {what} it cannot be"),
+        ));
+    }
+    read
+}
+
+/// `answer`'s bytes as taken bytes; none, with the run failed, where it is a diagnostic.
+fn given(c: &mut Ctx, answer: Result<Vec<u8>, Diagnostic>) -> TakenBytes {
+    match answer {
+        Ok(bytes) => c.given(bytes),
+        Err(d) => {
+            c.fail(d);
+            TakenBytes(0)
+        }
+    }
+}
+
+/// The ticket of `job` on the waiting pool, which `native` asked for as `what`; 0, with the run
+/// failed, where it is a diagnostic.
+fn waited(
+    c: &mut Ctx,
+    native: &'static str,
+    what: &'static str,
+    job: Result<Job, Diagnostic>,
+) -> I64 {
+    match job {
+        Ok(job) => c.submitted(native, what, Work::Waiting, job),
+        Err(d) => {
+            c.fail(d);
+            I64(0)
+        }
+    }
+}
+
+/// The run failed where `done` is a diagnostic.
+fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
+    if let Err(d) = done {
+        c.fail(d);
     }
 }
 

@@ -381,8 +381,8 @@ fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp
         Some(&hosts),
         None,
     );
-    // Ends the children still running and flushes the sink.
-    let _ = hosts.runtime().map(|rt| rt.shutdown());
+    // Ends the children still running, flushes the sink and puts the terminal back.
+    let _ = hosts.torn_down();
     let code = match (hosts.requested_exit(), outcome.ended) {
         (Some(code), _) => Ok(code),
         (None, Ended::Answered(_)) => Ok(0),

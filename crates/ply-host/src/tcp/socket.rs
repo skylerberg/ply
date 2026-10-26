@@ -2,10 +2,11 @@
 
 use super::wire::{self, Credentials, Endpoint, Probing, Refusal, SocketOption};
 use super::{
-    Handles, Job, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener,
-    not_a_stream, not_upgradable, unknown_handle,
+    Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
+    not_upgradable, unknown_handle,
 };
 use crate::fs;
+use crate::jobs::Job;
 use crate::native::{found, int};
 use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};

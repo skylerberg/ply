@@ -63,7 +63,9 @@
 import std.sql (Stmt, stmt, Param, PNull, PInt, PBool, PText, PBytes, PFloat, PNumeric, PJson,
                 PArray, Datum, CNull, CInt, CFloat, CText, CBytes, Row, Answer, Rows, Count, Failed,
                 Sqlite, scan_statement, refusal_byte)
+import std.bytes (i64_be)
 import std.fs
+import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
 import std.laws (agrees)
 import std.list
 import std.math (rem_euclid)
@@ -587,6 +589,166 @@ pub fn optional<a | e>(
   read: (Row, String) -> a / e,
 ) -> Option<a> / {sql.refused | e} =
   match held(row, column) { CNull -> None, _ -> Some(read(row, column)) }
+
+// --- The real handler --------------------------------------------------------------------
+
+host for sqlite by served
+
+/// `go` with every database opened under the root its label names on the machine, each operation
+/// waited for in the asking task.
+fn served<a | e>(
+  go: () -> a / {sqlite.read[*], sqlite.write[*] | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    sqlite.open[*label](path, mode, options) -> {
+      let asked = sqlite_open(
+        label,
+        path,
+        mode_number(mode),
+        options.strict,
+        options.busy_ms,
+        options.statements,
+      );
+      opened_read(job_wait(asked))
+    },
+    sqlite.close[*label](conn) -> job_wait(sqlite_close(label, conn)) == b"\x01",
+    sqlite.query[*label](conn, sql, params, limits) ->
+      reply_read(
+        job_wait(sqlite_query(label, conn, sql, scalars_written(params), limits_written(limits))),
+      ),
+    sqlite.execute[*label](conn, sql, params, limits) ->
+      reply_read(
+        job_wait(sqlite_execute(label, conn, sql, scalars_written(params), limits_written(limits))),
+      ),
+    sqlite.control[*label](conn, step) ->
+      reply_read(job_wait(sqlite_control(label, conn, step_number(step)))),
+    sqlite.backup[*label](conn, path) -> reply_read(job_wait(sqlite_backup(label, conn, path))),
+    sqlite.cursor[*label](conn, sql, params, limits) ->
+      reply_read(
+        job_wait(sqlite_cursor(label, conn, sql, scalars_written(params), limits_written(limits))),
+      ),
+    sqlite.fetch[*label](conn, rows) -> reply_read(job_wait(sqlite_fetch(label, conn, rows))),
+    sqlite.finish[*label](conn) -> job_wait(sqlite_finish(label, conn)) == b"\x01",
+  }
+
+/// The ticket of the database at `path` under the root `label` names, opened as `mode` numbers it.
+extern fn sqlite_open(
+  label: String,
+  path: String,
+  mode: Int,
+  strict: Bool,
+  busy_ms: Int,
+  statements: Int,
+) -> Int / {native.read}
+
+/// The ticket of a connection closed.
+extern fn sqlite_close(label: String, conn: Int) -> Int / {native.read}
+
+/// The ticket of a statement that only reads, its values and limits written.
+extern fn sqlite_query(
+  label: String,
+  conn: Int,
+  sql: String,
+  params: Bytes,
+  limits: Bytes,
+) -> Int / {native.read}
+
+/// The ticket of a statement that may write, its values and limits written.
+extern fn sqlite_execute(
+  label: String,
+  conn: Int,
+  sql: String,
+  params: Bytes,
+  limits: Bytes,
+) -> Int / {native.read}
+
+/// The ticket of a statement opened to be fetched a page at a time.
+extern fn sqlite_cursor(
+  label: String,
+  conn: Int,
+  sql: String,
+  params: Bytes,
+  limits: Bytes,
+) -> Int / {native.read}
+
+/// The ticket of a step of a connection's transaction, as `step_number` numbers it.
+extern fn sqlite_control(label: String, conn: Int, step: Int) -> Int / {native.read}
+
+/// The ticket of a compacted copy of a connection's database written to `path`.
+extern fn sqlite_backup(label: String, conn: Int, path: String) -> Int / {native.read}
+
+/// The ticket of the next `rows` rows of a connection's open statement.
+extern fn sqlite_fetch(label: String, conn: Int, rows: Int) -> Int / {native.read}
+
+/// The ticket of a connection's open statement ended.
+extern fn sqlite_finish(label: String, conn: Int) -> Int / {native.read}
+
+fn mode_number(mode: Mode) -> Int = match mode { ReadOnly -> 0, ReadWrite -> 1, Create -> 2 }
+
+fn step_number(step: Control) -> Int =
+  match step { Begin -> 0, BeginRead -> 1, Commit -> 2, Rollback -> 3 }
+
+/// A value as the natives read one: its kind's byte, then a number's eight bytes or what text or
+/// bytes hold.
+fn scalar_written(s: Scalar) -> Bytes =
+  match s.kind {
+    1 -> b"\x01".concat(i64_be(s.int)),
+    2 -> b"\x02".concat(i64_be(bits_of_float(s.real))),
+    3 -> b"\x03".concat(s.bytes),
+    4 -> b"\x04".concat(s.bytes),
+    _ -> b"\x00",
+  }
+
+fn scalars_written(params: List<Scalar>) -> Bytes = in_parts(params.map(scalar_written))
+
+fn limits_written(l: Limits) -> Bytes =
+  Bytes::concat_all([l.sql_bytes, l.params, l.rows, l.bytes, l.steps].map(i64_be))
+
+fn scalar_read(flat: Bytes) -> Scalar / {abort.raise} = {
+  let rest = flat.slice(1, flat.len());
+  match flat.at(0) {
+    1 -> { kind: 1, int: int_of(rest), real: 0.0, bytes: b"" },
+    2 -> { kind: 2, int: 0, real: Float::of_bits(int_of(rest)), bytes: b"" },
+    3 -> { kind: 3, int: 0, real: 0.0, bytes: rest },
+    4 -> { kind: 4, int: 0, real: 0.0, bytes: rest },
+    _ -> null_scalar(),
+  }
+}
+
+fn failure_read(flat: Bytes) -> Failure / {abort.raise} =
+  match parts(flat) {
+    [kind, name, detail] ->
+      {
+        kind: String::of_bytes_lossy(kind),
+        name: String::of_bytes_lossy(name),
+        detail: String::of_bytes_lossy(detail),
+      },
+    _ -> panic("a database native wrote no failure"),
+  }
+
+/// What opening a database answered: byte 1 and the connection's number, or byte 0 and why not.
+fn opened_read(said: Bytes) -> Result<Int, Failure> / {abort.raise} = {
+  let rest = said.slice(1, said.len());
+  if said.at(0) == 1 { Ok(int_of(rest)) } else { Err(failure_read(rest)) }
+}
+
+/// A reply as the natives write one: parts of the columns, the rows, whether it could have
+/// written, the rows it changed, the row id it last inserted and its failure found.
+fn reply_read(said: Bytes) -> Reply / {abort.raise} =
+  match parts(said) {
+    [columns, rows, wrote, changed, last_row_id, failure] ->
+      {
+        columns: parts(columns).map(|c: Bytes| String::of_bytes_lossy(c)),
+        rows: parts(rows).map(|row: Bytes| parts(row).map(scalar_read)),
+        wrote: wrote == b"\x01",
+        changed: int_of(changed),
+        last_row_id: int_of(last_row_id),
+        failure: match found(failure) { Some(f) -> Some(failure_read(f)), None -> None },
+      },
+    _ -> panic("a database native wrote no reply"),
+  }
 
 // --- The twin ----------------------------------------------------------------------------
 

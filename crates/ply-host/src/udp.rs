@@ -2,9 +2,10 @@
 //! closed and tuned as a stream socket is. A datagram received is parts: the address it came from
 //! as `wire` writes one, its payload, and byte 1 where it was cut short.
 
+use crate::jobs::Job;
 use crate::native::{int, parts};
+use crate::tcp::TcpHost;
 use crate::tcp::wire::{self, Endpoint, Refusal, SocketOption};
-use crate::tcp::{Job, TcpHost};
 use ply_core::{Diagnostic, Span, codes};
 use socket2::{Domain, MaybeUninitSlice, Protocol, SockAddr, SockRef, Socket, Type};
 use std::mem::MaybeUninit;

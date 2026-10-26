@@ -3388,7 +3388,8 @@ An effect whose module declares its real handler (§6.10) never reaches the
 boundary: every root whose row names it runs under that handler, with or
 without `--host` and whatever else the flags say, as the operations of
 `std.os`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`,
-`std.net` and `std.udp` do. A native
+`std.net`, `std.udp`, `std.sqlite`, `std.term`, `std.signal` and `std.trace`
+do. A native
 such a handler calls refuses inside a `simulate` region and in a test the search
 re-runs, as a host operation does (`E0425`). One that would hold the program's
 thread, as a hash does, hands its work to the runtime's threads: as many hashes
@@ -3404,7 +3405,15 @@ without `--host` is, answers `None` for every key. The network is open to a
 program by default too: a run with or without `--host` looks names up, connects
 and listens alike, each socket in a table of the run's own, under the label its
 operation names. The credentials a TLS listener or upgrade names are the ones
-`--tls` gives the run, so one given none holds none (`E0429`).
+`--tls` gives the run, so one given none holds none (`E0429`). The console is
+open as well: `std.term` answers from the terminal the process's streams are,
+and the run leaves it in the mode it found it in; `std.signal` answers the
+signals the process is sent, and a run that listens for no stop is never asked
+to stop. `std.trace` writes to the sink `--trace` names; a run without
+`--host` discards every record and still holds each span to being closed
+(`E0445`). A
+database is opened under a root `--fs` lends, so a run lent none opens none
+(`E0451`).
 
 Without `--host`, an operation that reaches the boundary is `E0424`, naming the
 handler that would serve it. With `--host`, a test that can reach a bound
@@ -3414,9 +3423,8 @@ deterministic handlers, whose answers are a function of what they are handed, is
 cached like any other. An operation performed
 inside a `simulate`
 region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.signal`, `std.process` (and `std.console` on top of
-it) and `std.term` are bound only by `ply run --host`; `ply test --host`
-withholds them (`E0424`), except that a
+once per interleaving. `std.process` (and `std.console` on top of it) is bound
+only by `ply run --host`; `ply test --host` withholds it (`E0424`), except that a
 test run binds `process.bound`, `process.spawn`, `process.start` and the
 operations on a started child, which reach only the programs `--exec` names. All
 flags below require `--host`.

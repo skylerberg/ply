@@ -5,6 +5,8 @@
 //! changes no exit code. A test collects records in a `Sink` with the `_step` functions and reads them
 //! with `drain`, `named`, `on_channel` and `counter_total`.
 
+import std.bytes (i64_be)
+import std.internal.native (native, in_parts)
 import std.json
 
 /// An event's severity.
@@ -44,6 +46,88 @@ pub nondet effect trace {
   /// Records a duration in microseconds.
   write time[c](name: String, micros: Int, fields: Fields) -> Unit
 }
+
+// --- The real handler ------------------------------------------------------------
+
+host for trace by served
+
+/// `go` with every record written to the run's sink, a record the sink does not want costing no
+/// more than the asking, and each span kept open for the task that opened it until it is closed.
+fn served<a | e>(go: () -> a / {trace.write[*] | e}) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    trace.event[*channel](level, name, fields) -> {
+      let at = level_number(level);
+      if trace_wants(at) { trace_record(0, channel, at, name, 0, "", fields_written(fields)) }
+    },
+    trace.enter[*channel](name, fields) ->
+      { id: trace_enter(channel, name, fields_written(fields)), channel: channel },
+    trace.exit[*channel](span, outcome) -> match outcome {
+      Ok -> trace_exit(channel, span.id, 0, ""),
+      Failed(reason) -> trace_exit(channel, span.id, 1, reason),
+      Abandoned -> trace_exit(channel, span.id, 2, ""),
+    },
+    trace.count[*channel](name, delta, fields) -> metric(1, channel, name, delta, "", fields),
+    trace.gauge[*channel](name, value, fields) ->
+      metric(2, channel, name, 0, value.to_string(), fields),
+    trace.time[*channel](name, micros, fields) -> metric(3, channel, name, micros, "", fields),
+  }
+
+/// Whether the run's sink writes a record at the level `level_number` numbers.
+extern fn trace_wants(level: Int) -> Bool / {native.read}
+
+/// One record on `channel` of the kind numbered `kind`, `event` 0, `count` 1, `gauge` 2 and `time`
+/// 3: a count's delta or a time's microseconds in `amount`, and a gauge's value as decimal text.
+extern fn trace_record(
+  kind: Int,
+  channel: String,
+  level: Int,
+  name: String,
+  amount: Int,
+  value: String,
+  fields: Bytes,
+) -> Unit / {native.read}
+
+/// Opens a span on `channel` inside the innermost one the asking task has open, answering its id.
+extern fn trace_enter(channel: String, name: String, fields: Bytes) -> Int / {native.read}
+
+/// Closes span `id` on `channel` with the outcome numbered `outcome`, `Ok` 0, `Failed` 1 for
+/// `reason` and `Abandoned` 2, and every span opened inside it. One that is not open ends the run.
+extern fn trace_exit(channel: String, id: Int, outcome: Int, reason: String) -> Unit / {native.read}
+
+/// A metric, written at `Info` where the sink wants that.
+fn metric(
+  kind: Int,
+  channel: String,
+  name: String,
+  amount: Int,
+  value: String,
+  fields: Fields,
+) -> Unit / {native.read, abort.raise} =
+  if trace_wants(1) { trace_record(kind, channel, 1, name, amount, value, fields_written(fields)) }
+
+fn level_number(level: Level) -> Int = match level { Debug -> 0, Info -> 1, Warn -> 2, Error -> 3 }
+
+/// Fields as the natives read them: parts, each name and then its field.
+fn fields_written(fields: Fields) -> Bytes / {abort.raise} =
+  in_parts(
+    fields.fold([], |acc: List<Bytes>, name: String, field: Field|
+      acc.push(Bytes::of_string(name)).push(field_written(field))),
+  )
+
+/// A field as its kind's byte and what it holds: a number in eight bytes, a flag in one, and a
+/// decimal or JSON as its text.
+fn field_written(field: Field) -> Bytes / {abort.raise} =
+  match field {
+    FInt(n) -> b"\x00".concat(i64_be(n)),
+    FBool(on) -> if on { b"\x01\x01" } else { b"\x01\x00" },
+    FText(text) -> b"\x02".concat(Bytes::of_string(text)),
+    FFloat(x) -> b"\x03".concat(i64_be(bits_of_float(x))),
+    FDecimal(d) -> b"\x04".concat(Bytes::of_string(d.to_string())),
+    FBytes(b) -> b"\x05".concat(b),
+    FJson(j) -> b"\x06".concat(json::to_bytes(j)),
+  }
 
 // --- The collecting twin ---------------------------------------------------------
 
