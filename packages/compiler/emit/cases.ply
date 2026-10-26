@@ -6,7 +6,8 @@ import compiler.emit.print.fuel (entered_fn, entered_helper)
 import compiler.syntax.parsing (span_key, span_between)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.check.infer (facts_at)
-import compiler.check.types (Type, TyCon, TyRecord, int_type, bytes_type, string_type, type_spelled)
+import compiler.check.types (Type, TyCon, TyRecord, RSingleton, int_type, bytes_type, string_type,
+                             type_spelled)
 import compiler.emit.typing (unknown_type)
 import compiler.front
 import compiler.front.rows (Rows, KnownDefRow, Dump, CtorRow, EmitterCtor)
@@ -58,6 +59,37 @@ fn emitted_name(e: Emitted) -> Bytes = root_text(e.name)
 fn answer_name(a: RootAnswer) -> Bytes = root_text(a.name)
 
 // --- Specialisation ----------------------------------------------------------------------------
+
+test "a definition generic over rows is settled by its callers, and printed at each row they hand words for" {
+  let src = Bytes::concat_all([
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"fn apply<|e>(f: () -> Int / e) -> Int / e = f()\n",
+    b"fn logged(f: () -> Int / {log.note}) -> Int / {log.note} = apply(f)\n",
+    b"fn plain(f: () -> Int) -> Int = apply(f)\n",
+    b"fn twice<|e>(f: () -> Int / e) -> Int / e = apply(f) + apply(f)\n",
+  ]);
+  let log = [{ effect: b"m.log", resource: RSingleton }];
+  let at_log = keys::at_rowed(b"m.apply", [], [], [log]);
+  let at_none = keys::at_rowed(b"m.apply", [], [], [[]]);
+  let twice_log = keys::at_rowed(b"m.twice", [], [], [log]);
+  let answers = answers_at([b"m"], [src], [], [
+    Named(b"m.apply"),
+    Named(b"m.logged"),
+    Named(b"m.plain"),
+    at_log,
+    at_none,
+    twice_log,
+  ]);
+  let body = |k: RootKey| answered_body(answers, printed(k));
+  // As it stands, `apply` is no C of its own: its callers settle it at their rows.
+  assert_eq(body(Named(b"m.apply")).text, b"");
+  assert_eq(printed(at_log), b"m.apply@/{m.log}");
+  assert_eq(body(Named(b"m.logged")).tables.generics.calls.map(|g: GenericCall| g.rows), [[log]]);
+  assert_eq(body(Named(b"m.plain")).tables.generics.calls.map(|g: GenericCall| g.rows), [[[]]]);
+  // `twice` hands on what it was handed, its own row's words through its row variable.
+  assert_eq(body(twice_log).tables.generics.calls.map(|g: GenericCall| g.rows), [[log], [log]]);
+  assert([at_log, at_none, twice_log].all(|k: RootKey| body(k).text.len() > 0), None)
+}
 
 test "a body that would overrun this thread's stack makes room on the stack it runs on" {
   let out = emit_all_program([{ name: b"m", src: b"fn g(b: Bytes) -> Bytes = b\n" }], [], true);
@@ -220,7 +252,8 @@ test "a `parallel` block tells the runtime its definition's row only where that 
     Named(b"m.reads"),
     Named(b"m.handled"),
     prelude_loop(b"mapped_from", b"m.nested", 5, [b"Int", b"{_0:Int,_1:Int}"]),
-    Named(b"m.open"),
+    // Generic over its row, `open` is printed only at a row a caller fills it with.
+    keys::at_rowed(b"m.open", [], [], [[]]),
   ];
   let names = keys.map(printed);
   let answers = answers_at([b"m"], [src], [], keys);
@@ -1386,7 +1419,7 @@ test "a generic definition comparing its type argument is emitted again at each 
   assert_eq(tables(b"m.same").tables.generics.needs, [{ var: 0, reads: Exact }]);
   assert_eq(tables(b"m.order").tables.generics.needs, [{ var: 0, reads: Exact }]);
   assert_eq(tables(b"m.tokens").tables.generics.calls, [
-    { callee: Named(b"m.same"), args: types_spelled([b"m.TK"]), carried: [0], fns: [] },
+    { callee: Named(b"m.same"), args: types_spelled([b"m.TK"]), carried: [0], fns: [], rows: [] },
   ]);
   // The generic body is settled by its callers, no C of its own; each specialisation compares as
   // its type does.
@@ -2072,7 +2105,12 @@ test "a body over a sum of label and row parameters as well as types, specialise
     b"  match p { Pipe(turn, sink) -> sink(turn(x)) }\n",
     b"fn go(p: Pipe<Int, String, [app], [db] | {}, {}>) -> Unit / {log.note[app], log.note[db]} = through(p, 41)\n",
   ]);
-  let spec = at_spelled(b"m.through", [b"Int", b"String"]);
+  let spec = keys::at_rowed(
+    b"m.through",
+    types_spelled([b"Int", b"String"]).map(keys::KeyType),
+    [],
+    [[]],
+  );
   let answers = answers_at([b"m"], [src], [b"m.Pipe"], [Named(b"m.through"), Named(b"m.go"), spec]);
   let needs = |name: Bytes|
     match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
@@ -2326,9 +2364,13 @@ fn prelude_loop(
   param: Int,
   args: List<Bytes>,
 ) -> RootKey / {abort.raise} =
-  at_key(qualify(prelude_module(), callee), types_spelled(args), [
-    { param: param, owner: Named(owner), nth: 0 },
-  ])
+  keys::at_rowed(
+    qualify(prelude_module(), callee),
+    types_spelled(args).map(keys::KeyType),
+    [{ param: param, owner: Named(owner), nth: 0 }],
+    // The loop's one row variable, which the lambda it runs fills with nothing.
+    [[]],
+  )
 
 test "a list's map, filter and fold are the prelude's functions, whose loops run the lambda in place" {
   let src = Bytes::concat_all([
@@ -2344,11 +2386,12 @@ test "a list's map, filter and fold are the prelude's functions, whose loops run
     prelude_loop(b"kept_from", b"m.kept", 5, [b"Int"]),
     prelude_loop(b"folded_from", b"m.summed", 5, [b"Int", b"Int"]),
   ];
-  // The same loops at those types where no lambda is run in place, as a call handing none settles.
+  // The same loops at those types where no lambda is run in place, as a call handing none settles,
+  // each at a row that holds nothing.
   let generic = [
-    at_spelled(b"std.prelude.mapped_from", [b"Int", b"Int"]),
-    at_spelled(b"std.prelude.kept_from", [b"Int"]),
-    at_spelled(b"std.prelude.folded_from", [b"Int", b"Int"]),
+    rowed_at(b"std.prelude.mapped_from", [b"Int", b"Int"]),
+    rowed_at(b"std.prelude.kept_from", [b"Int"]),
+    rowed_at(b"std.prelude.folded_from", [b"Int", b"Int"]),
   ];
   let answers = answers_at(
     [b"m"],
@@ -3422,6 +3465,11 @@ fn in_m(op: TypeOp, ty: Type) -> RootKey = keys::written(op, ty, b"m")
 fn at_spelled(def: Bytes, args: List<Bytes>) -> RootKey / {abort.raise} =
   at_key(def, types_spelled(args), [])
 
+/// Definition `def`, generic over one row, at the types `args` spell and at a row that holds
+/// nothing.
+fn rowed_at(def: Bytes, args: List<Bytes>) -> RootKey / {abort.raise} =
+  keys::at_rowed(def, types_spelled(args).map(keys::KeyType), [], [[]])
+
 /// The types `ss` spell.
 fn types_spelled(ss: List<Bytes>) -> List<Type> / {abort.raise} =
   ss.map(|s: Bytes|
@@ -3498,10 +3546,10 @@ test "a generic definition reached at a type held apart from a word is emitted a
   // which the unit reads as far as the callee needs.
   assert(has(b"m.go", b"@@g0@@"));
   assert_eq(body(b"m.go").tables.generics.calls, [
-    { callee: Named(b"m.twice"), args: types_spelled([b"Float"]), carried: [0], fns: [] },
+    { callee: Named(b"m.twice"), args: types_spelled([b"Float"]), carried: [0], fns: [], rows: [] },
   ]);
   assert_eq(body(b"m.same").tables.generics.calls, [
-    { callee: Named(b"m.id"), args: types_spelled([b"String"]), carried: [], fns: [] },
+    { callee: Named(b"m.id"), args: types_spelled([b"String"]), carried: [], fns: [], rows: [] },
   ]);
   // `twice` reads its witness, which a scalar argument does in C; `id`, answering a value of its
   // variable owned, takes its argument, needs nothing of it and is printed as it stands.
@@ -3536,11 +3584,11 @@ test "a call carries a variable that changes how a parameter or the answer holdi
     };
   // An `Option<Float>` holds its float apart from a word, which an `Option` of a variable cannot.
   assert_eq(calls(b"m.floats"), [
-    { callee: Named(b"m.first"), args: types_spelled([b"Float"]), carried: [0], fns: [] },
+    { callee: Named(b"m.first"), args: types_spelled([b"Float"]), carried: [0], fns: [], rows: [] },
   ]);
   // A list is one pointer whatever it holds, so a generic body holds it alike.
   assert_eq(calls(b"m.tails"), [
-    { callee: Named(b"m.rest"), args: types_spelled([b"Float"]), carried: [], fns: [] },
+    { callee: Named(b"m.rest"), args: types_spelled([b"Float"]), carried: [], fns: [], rows: [] },
   ])
 }
 
@@ -3627,8 +3675,14 @@ test "a tail loop runs at the types it is called at, each member at the argument
   let body = |name: Bytes| answered_body(answers, name);
   let loops = |name: Bytes| loops_in(answers, name);
   assert_eq(body(b"m.go").tables.generics.calls, [
-    { callee: Named(b"m.spin"), args: types_spelled([b"Float", b"Int"]), carried: [0, 1], fns: [] },
-    { callee: Named(b"m.ping"), args: types_spelled([b"Float"]), carried: [0], fns: [] },
+    {
+      callee: Named(b"m.spin"),
+      args: types_spelled([b"Float", b"Int"]),
+      carried: [0, 1],
+      fns: [],
+      rows: [],
+    },
+    { callee: Named(b"m.ping"), args: types_spelled([b"Float"]), carried: [0], fns: [], rows: [] },
   ]);
   // `spin` lends values of both its variables, which its entry lets go of, so its callers settle it.
   // Its call hands `y` on as `x`: at `Float, Int` it loops through itself at `Int, Float`, under the
@@ -3745,6 +3799,7 @@ test "a generic definition reached at a record type reads the record where its l
       args: types_spelled([b"{x:Float,y:Float}", b"Int"]),
       carried: [0, 1],
       fns: [],
+      rows: [],
     },
   ]);
   // Unspecialised, `p`'s fields may be anything: both its variables' layouts are read, so its

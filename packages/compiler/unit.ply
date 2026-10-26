@@ -9,8 +9,8 @@ import compiler.check.types (Type, TyVar, TyFn, TyCon, Scheme, type_text, type_s
 import compiler.emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect,
                              CallAt, SharedFn, GenericAt, expected_callee, word_head, no_generics,
                              answer_bin, tables_bin, root_answer_bin, no_tables, GenericCall,
-                             Generics, Need, Pass, Reads, Scalar, Layout, Exact, settled_by_callers,
-                             Published)
+                             Generics, Need, Pass, Reads, Scalar, Layout, Exact, Rowed,
+                             settled_by_callers, Published)
 import compiler.emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
 import compiler.emit.print.statics (static_c, static_extern, escaped, c_string)
 import compiler.emit.statics (known_of_value, kept_root)
@@ -3003,6 +3003,8 @@ fn widened(
           Exact -> type_vars(arg),
           Layout -> laid_vars(arg),
           Scalar -> match arg { TyVar(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
+          // A caller hands the rows it settles a callee generic over rows at as its own.
+          Rowed -> [],
         };
         vars.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
           let had = match m.get(n) { Some(ns) -> ns, None -> [] };
@@ -3020,6 +3022,7 @@ fn widened(
 /// at the call's own argument; every other
 /// argument left as the callee's generic body has it. Calls settling on one layout share a root's
 /// name. A tail loop's member reads each variable exactly, so its loop runs at its callers' types.
+/// A callee generic over rows is settled at the rows the call hands it words for.
 fn settled_root(
   call: GenericCall,
   needs: Map<RootName, List<Need>>,
@@ -3043,8 +3046,9 @@ fn settled_root(
   let calls = match called.get(callee) { Some(cs) -> cs, None -> [] };
   let fns = call.fns.filter(|f: FnArg| calls.contains(f.param));
   match definition_of(call.callee) {
-    Some(def) -> if fns.len() == 0 && args.all(|a: KeyArg| a == open) { call.callee }
-    else { keys::at_keyed(def, args, fns) },
+    Some(def) -> if fns.len() == 0 && args.all(|a: KeyArg| a == open) && call.rows.len() == 0 {
+      call.callee
+    } else { keys::at_rowed(def, args, fns, call.rows) },
     None -> call.callee,
   }
 }
@@ -3350,7 +3354,7 @@ test "a generic call settles on each argument its callee's code needs, and leave
   ]);
   let root = |callee: Bytes, arg: Bytes|
     settled_root(
-      { callee: Named(callee), args: [spelled(arg)], carried: [], fns: [] },
+      { callee: Named(callee), args: [spelled(arg)], carried: [], fns: [], rows: [] },
       needs,
       Map::new(),
       no_ctors(),
@@ -3397,6 +3401,7 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
           args: [],
           carried: [],
           fns: [{ param: param, owner: Named(b"m.main"), nth: 0 }],
+          rows: [],
         },
         Map::new(),
         called,
@@ -3412,7 +3417,8 @@ test "a lambda is run in place only by a callee that calls the parameter it is h
 test "a refused specialisation leaves its call to the generic body, whichever root lent the lambda" {
   let lent = |owner: Bytes| [{ param: 1, owner: Named(owner), nth: 0 }];
   let calling = |callee: Bytes, owner: Bytes|
-    generic_body([{ callee: Named(callee), args: [], carried: [], fns: lent(owner) }], []);
+    generic_body([{ callee: Named(callee), args: [], carried: [], fns: lent(owner), rows: [] }], [
+    ]);
   let calls_one = Body({
     text: b"",
     tables: { ..no_tables(), generics: { ..no_generics(), called: [1] } },
@@ -3452,7 +3458,7 @@ test "a refused specialisation leaves its call to the generic body, whichever ro
 }
 
 test "a caller of a refused specialisation of a body its callers settle is dropped for the specialisation's refusal" {
-  let lay = { callee: Named(b"m.lay"), args: [spelled(b"Float")], carried: [], fns: [] };
+  let lay = { callee: Named(b"m.lay"), args: [spelled(b"Float")], carried: [], fns: [], rows: [] };
   let spec = settled_root(
     lay,
     by_def([{ key: b"m.lay", value: [{ var: 0, reads: Layout }] }]),
@@ -3486,8 +3492,8 @@ test "a generic body needs what its callees need of what it hands them, through 
       key: b"m.wrap",
       value: generic_body(
         [
-          { callee: Named(b"m.add"), args: [spelled(b"'0")], carried: [], fns: [] },
-          { callee: Named(b"m.lay"), args: [spelled(b"{v:'1}")], carried: [], fns: [] },
+          { callee: Named(b"m.add"), args: [spelled(b"'0")], carried: [], fns: [], rows: [] },
+          { callee: Named(b"m.lay"), args: [spelled(b"{v:'1}")], carried: [], fns: [], rows: [] },
         ],
         [],
       ),
@@ -3502,6 +3508,7 @@ test "a generic body needs what its callees need of what it hands them, through 
             args: [spelled(b"List<_>"), spelled(b"'0")],
             carried: [],
             fns: [],
+            rows: [],
           },
         ],
         [],
@@ -3512,7 +3519,15 @@ test "a generic body needs what its callees need of what it hands them, through 
     {
       key: b"m.each",
       value: generic_body(
-        [{ callee: Named(b"m.same"), args: [spelled(b"List<'0>")], carried: [], fns: [] }],
+        [
+          {
+            callee: Named(b"m.same"),
+            args: [spelled(b"List<'0>")],
+            carried: [],
+            fns: [],
+            rows: [],
+          },
+        ],
         [],
       ),
     },
@@ -3535,7 +3550,15 @@ test "a generic body whose needs or its callees' read a variable's layout or typ
     {
       key: b"m.each",
       value: generic_body(
-        [{ callee: Named(b"m.same"), args: [spelled(b"List<'0>")], carried: [], fns: [] }],
+        [
+          {
+            callee: Named(b"m.same"),
+            args: [spelled(b"List<'0>")],
+            carried: [],
+            fns: [],
+            rows: [],
+          },
+        ],
         [],
       ),
     },

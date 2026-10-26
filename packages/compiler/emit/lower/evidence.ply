@@ -1,0 +1,400 @@
+//! The evidence words a body is handed and hands on. A definition takes, past its parameters, the
+//! labels its key's caller names and then one word for each effect and resource its row names, more
+//! than `words_apart` of them as one array. A call hands its callee those, each word read off the
+//! words the body holds by what it answers. A call of a function value hands the value a static
+//! descriptor of the row the call reads the value's type at and an array of the words for it, each
+//! of the row's labels the descriptor leaves to the call after them; the value's entry reads its own
+//! words off those.
+
+import compiler.syntax.parsing (Span)
+import compiler.check.types (Type, TyCon, Row, Atom, Resource, RNamed, RSingleton, RVar, RAny,
+                             Scheme)
+import compiler.check.infer.checker (RowArguments, Performs, PerformsAtom)
+import compiler.emit.typing (Filings, rows_filed_at)
+import compiler.emit.code (Code, NLabel, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
+                           NMatch, NPerform, NLambda, NSimulate, NParallel, NHandle, NField,
+                           NUpdate, NKnown, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
+                           CodeClause, Capture, is_label_binder)
+import compiler.emit.keys (RootKey, Evidence, key_rows, unspecialised)
+import compiler.emit.evidence (Own, Keyed, row_words, written_row, opened, labels_handed, keyed,
+                               key_rows_of, covers, answered, ordered, evidence_type, words_apart,
+                               words_carried)
+import compiler.emit.reps (Def)
+import compiler.emit.tir (Rep, RInt, RImm, Var, Arg, AVar, AInt, AZero, Op, OHandle, Static,
+                          Convention, Lent, Uses)
+import compiler.emit.tir.handling (WordsLaid, WordAt)
+import compiler.emit.tir.statics (StaticLaid, StaticWord, SPlain, WRaw, WField)
+import compiler.emit.lower.setting (Setting)
+import compiler.emit.lower.base (Context, Lowering, Lowered, Worded, bound_as, static_added)
+
+/// What a root of a definition is handed past its parameters: the words its row takes at the key's
+/// rows, in order; how many label parameters the definition has; how many labels the key's caller
+/// hands; and whether the key leaves one of the scheme's row variables unfilled, so only callers
+/// settle the root.
+pub type Handed = { own: List<Own>, labels: Int, hidden: Int, unfilled: Bool }
+
+/// What root `key` of module `s` is handed, as its definition's scheme says at the key's rows;
+/// nothing for a root of no definition, which no caller hands words.
+pub fn handed_to(s: Setting, key: RootKey) -> Handed / {abort.raise} =
+  match s.here.fold(None, |acc: Option<Scheme>, d: Def|
+      if d.root == unspecialised(key) { d.scheme } else { acc }) {
+    None -> { own: [], labels: 0, hidden: 0, unfilled: false },
+    Some(sc) -> {
+      let rows = key_rows(key);
+      {
+        own: row_words(written_row(sc), rows, sc.label_vars.len()),
+        labels: sc.label_vars.len(),
+        hidden: labels_handed(rows),
+        unfilled: sc.row_vars.len() > rows.len(),
+      }
+    },
+  }
+
+/// Convention `c` and then what a root handed `hidden` labels and `words` words takes past it: each
+/// label an `Int`, then the words, each one or all as one array, all only read.
+pub fn evidenced(c: Convention, hidden: Int, words: Int) -> Convention = {
+  let more = range(0, hidden).map(|_: Int| RInt).concat(
+    range(0, words_carried(words)).map(|_: Int| RImm),
+  );
+  { ..c, params: c.params.concat(more.map(|_: Rep| Lent)), reps: c.reps.concat(more) }
+}
+
+/// The state a root's body starts in, handed `h` past its `declared` parameters, which `params`
+/// hold in order beside those `h` adds: each word the root holds and each label's value, its label
+/// parameters' and those its key's caller hands.
+pub fn root_opened(
+  cx: Context,
+  st: Lowering,
+  params: List<Var>,
+  declared: Int,
+  h: Handed,
+) -> { cx: Context, st: Lowering } = {
+  let read = words_read(st, params.drop(declared + h.hidden), h.own, cx.body.span);
+  {
+    cx: {
+      ..cx,
+      words: read.words,
+      label_values: params.drop(declared - h.labels).take(h.labels + h.hidden).map(|v: Var|
+        Some(AVar(v))),
+      handed: params.drop(declared).map(AVar),
+    },
+    st: read.st,
+  }
+}
+
+/// The words a function handed `own` holds, from `carried`, its parameters that carry them: each
+/// one's own, or each read out of the one array where there are more than `words_apart`.
+pub fn words_read(
+  st: Lowering,
+  carried: List<Var>,
+  own: List<Own>,
+  at: Span,
+) -> { st: Lowering, words: List<Worded> } = {
+  let read = if own.len() <= words_apart() { { st: st, words: carried.map(AVar) } } else {
+    match carried.at(0) {
+      None -> { st: st, words: [] },
+      Some(array) ->
+        range(0, own.len()).fold(
+          { st: st, words: [] },
+          |acc: { st: Lowering, words: List<Arg> }, i: Int| {
+            let w = bound_as(
+              acc.st,
+              evidence_type(),
+              RImm,
+              Op({ op: OHandle(WordAt(i)), args: [AVar(array)], uses: reads(1) }),
+              at,
+            );
+            { st: w.st, words: acc.words.push(w.arg) }
+          },
+        ),
+    }
+  };
+  {
+    st: read.st,
+    words: range(0, own.len()).fold([], |acc: List<Worded>, i: Int|
+      match own.at(i) {
+        Some(o) ->
+          acc.push({
+            evidence: o.evidence,
+            word: match read.words.at(i) { Some(a) -> a, None -> AZero(RImm) },
+            through: o.through,
+            handled: false,
+          }),
+        None -> acc,
+      }),
+  }
+}
+
+/// What an operation over `n` words does with them: reads them, answering what holds no count.
+fn reads(n: Int) -> Uses =
+  { takes: range(0, n).map(|_: Int| false), owned: false, fails: false, stops: false }
+
+/// The words a row the checker filed at `at` takes, in the root's numbering: what a lambda, a clause
+/// or a call through a function value performs there; none where it filed none.
+pub fn filed_words(cx: Context, at: Span) -> Option<List<Own>> / {abort.raise} =
+  match rows_filed_at(cx.filed, at.site) {
+    Some(Performs(row)) -> Some(row_words(row, cx.rows, cx.labels)),
+    _ -> None,
+  }
+
+/// Whether every row the checker filed for a node of `c` names only the effects and resources it
+/// writes, no row variable and no label variable: the rows of a lambda another root may run in
+/// place, which read alike in any root's numbering.
+pub fn rows_static(filed: Filings, c: Code) -> Bool / {abort.raise} =
+  (match filed.rows.get(c.span.site) {
+      Some(Performs(r)) -> static_row(r),
+      Some(RowArguments(rs)) -> rs.all(static_row),
+      Some(PerformsAtom(a)) -> match a.resource { RVar(_) -> false, _ -> true },
+      None -> true,
+    })
+    && code_parts(c).all(|x: Code| rows_static(filed, x))
+
+fn static_row(r: Row) -> Bool =
+  r.tail == None && r.atoms.all(|a: Atom| match a.resource { RVar(_) -> false, _ -> true })
+
+/// The code `c` holds, each part once.
+fn code_parts(c: Code) -> List<Code> =
+  match c.node {
+    NUnary(u) -> [u.operand],
+    NBinary(b) -> [b.lhs, b.rhs],
+    NApp(a) -> a.args.push(a.func),
+    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
+    NBlock(b) ->
+      b.stmts.fold(match b.tail { Some(t) -> [t], None -> [] }, |acc: List<Code>, s: CodeStmt|
+        acc.push(match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code })),
+    NList(l) -> l.items,
+    NRecord(r) -> r.fields.map(|f: CodeField| f.value),
+    NMatch(m) ->
+      m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
+        List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
+    NPerform(p) -> match p.label { Some(l) -> p.args.push(l), None -> p.args },
+    NLambda(l) -> [l.body],
+    NSimulate(s) -> [s.body],
+    NParallel(p) -> p.branches,
+    NHandle(h) ->
+      h.clauses.fold(
+        match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
+        |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
+      ),
+    NField(f) -> [f.base],
+    NUpdate(u) -> u.sets.map(|f: CodeField| f.value).push(u.base),
+    NKnown(k) -> [k.lambda.body],
+    _ -> [],
+  }
+
+/// The words a lambda, a clause or a `return` clause written at `at` is handed, as the checker filed
+/// its row there; none where it filed none, which only the runtime calls.
+pub fn words_at(cx: Context, at: Span) -> List<Own> / {abort.raise} =
+  match filed_words(cx, at) { Some(ws) -> ws, None -> [] }
+
+/// The word the body holds for each of `wanted`, in order. One through a row variable is the word
+/// the frame was handed through it for the same, the `n`th of those alike for the `n`th wanted; any
+/// other the innermost word answering it, a `handle`'s or one the frame was handed beside its row
+/// variable. In a lambda another root lent, run in place, every word comes through the row variable
+/// the lambda was handed in by. Where none answers one, the word is one no perform reads.
+pub fn routed(cx: Context, wanted: List<Own>) -> List<Arg> =
+  wanted.fold({ out: [], seen: [] }, |acc: { out: List<Arg>, seen: List<Evidence> }, w: Own|
+    if w.through || cx.lender != None {
+      let n = acc.seen.filter(|e: Evidence| e == w.evidence).len();
+      let alike = cx.words.filter(|x: Worded|
+        x.through && !x.handled
+          && (if cx.lender != None { covers(x.evidence, w.evidence) }
+          else { x.evidence == w.evidence }));
+      {
+        out: acc.out.push(match alike.at(n) { Some(x) -> x.word, None -> AZero(RImm) }),
+        seen: acc.seen.push(w.evidence),
+      }
+    } else {
+      {
+        ..acc,
+        out: acc.out.push(
+          match cx.words.find(|x: Worded| !x.through && covers(x.evidence, w.evidence)) {
+            Some(x) -> x.word,
+            None -> AZero(RImm),
+          },
+        ),
+      }
+    }).out
+
+/// The value of label `p` of the root's numbering in the function being lowered, a label's entry;
+/// zero where the function holds none of it.
+pub fn label_value(cx: Context, p: Int) -> Arg =
+  match cx.label_values.at(p) { Some(Some(a)) -> a, _ -> AInt(0) }
+
+/// What a call of definition `d`, its name written at `ref` and its labels filled by `labels`, hands
+/// its callee past its arguments: the rows its key holds, the labels it hands for them, the words,
+/// and what each word answers in the caller's numbering.
+pub type Handing = {
+  rows: List<List<Evidence>>,
+  labels: List<Arg>,
+  words: List<Arg>,
+  wanted: List<Own>,
+}
+
+/// A word a callee takes, as its own numbering and as its caller's say what it answers.
+type Paired = { callee: Evidence, wanted: Own }
+
+/// What a call of `d` at `ref`, filling its labels with `labels`, hands it, as `Handing` says.
+pub fn handing(
+  cx: Context,
+  st: Lowering,
+  d: Def,
+  ref: Span,
+  labels: List<Code>,
+) -> Handing / {abort.raise} =
+  match d.scheme {
+    None -> { rows: [], labels: [], words: [], wanted: [] },
+    Some(sc) -> {
+      let filled = match rows_filed_at(cx.filed, ref.site) {
+        Some(RowArguments(rs)) -> rs,
+        _ -> [],
+      };
+      // Each row the call fills a row variable with, as the caller's words.
+      let given = filled.map(|r: Row| row_words(r, cx.rows, cx.labels));
+      let k = keyed(given.map(|ws: List<Own>| ws.map(|o: Own| o.evidence)));
+      let row = written_row(sc);
+      let own_labels = sc.label_vars.len();
+      // The callee's row's own atoms, each label parameter the label the call fills there.
+      let written = row.atoms.fold([], |acc: List<Paired>, a: Atom|
+        if !answered(a.effect) { acc } else {
+          let callee = { effect: a.effect, resource: a.resource };
+          if acc.any(|p: Paired| p.callee == callee) { acc } else {
+            acc.push({
+              callee: callee,
+              wanted: {
+                evidence: { effect: a.effect, resource: filled_label(cx, labels, a.resource) },
+                through: false,
+              },
+            })
+          }
+        });
+      let through = match row.tail {
+        None -> [],
+        Some(t) -> match ((k.rows.at(t), given.at(t))) {
+          (Some(keys), Some(ws)) ->
+            keys.fold([], |acc: List<Paired>, x: Keyed|
+              match ws.at(x.from) {
+                Some(o) ->
+                  acc.push({
+                    callee: match opened([x.key], own_labels).at(0) { Some(e) -> e, None -> x.key },
+                    wanted: o,
+                  }),
+                None -> acc,
+              }),
+          _ -> [],
+        },
+      };
+      let pairs = ordered(written.concat(through), |p: Paired| p.callee);
+      let wanted = pairs.map(|p: Paired| p.wanted);
+      {
+        rows: key_rows_of(k.rows),
+        labels: k.sources.map(|p: Int| label_value(cx, p)),
+        words: routed(cx, wanted),
+        wanted: wanted,
+      }
+    },
+  }
+
+/// The arguments a call handing `h` passes past its callee's parameters, made after `st`: the
+/// labels, then the words, or an array of them where there are more than `words_apart`.
+pub fn words_handed(st: Lowering, h: Handing, at: Span) -> { st: Lowering, args: List<Arg> } =
+  if h.words.len() <= words_apart() { { st: st, args: h.labels.concat(h.words) } } else {
+    let laid = bound_as(
+      st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(WordsLaid), args: h.words, uses: reads(h.words.len()) }),
+      at,
+    );
+    { st: laid.st, args: h.labels.push(laid.arg) }
+  }
+
+/// The label arguments a call of `d` writing `codes` fills its label parameters with: its last.
+pub fn label_codes(d: Def, codes: List<Code>) -> List<Code> =
+  match d.scheme { Some(sc) -> codes.drop(codes.len() - sc.label_vars.len()), None -> [] }
+
+/// The resource a callee's atom names at a call filling its label parameters with `labels`: a label
+/// parameter's, the label filled there, a label named where the call is written or one of the
+/// caller's; any other resource as it is. A label filled by something else answers to no word.
+fn filled_label(cx: Context, labels: List<Code>, r: Resource) -> Resource / {abort.raise} =
+  match r {
+    RVar(q) -> match labels.at(q) {
+      Some(c) -> match c.node {
+        NLabel(n) -> RNamed(n),
+        NVar(v) -> if !is_label_binder(v.name) { unfilled() } else {
+          let name = v.name.slice(1, v.name.len() - 1);
+          match range(0, cx.label_names.len()).find(|i: Int| cx.label_names.at(i) == Some(name)) {
+            Some(p) -> RVar(p),
+            None -> unfilled(),
+          }
+        },
+        _ -> unfilled(),
+      },
+      None -> unfilled(),
+    },
+    _ -> r,
+  }
+
+fn unfilled() -> Resource = RNamed(b"?")
+
+/// What a call of a function value through a type whose row is `row` in the root's numbering hands
+/// the value past its arguments, at `at`: the static descriptor of the row's words and the array of
+/// the words, each label the descriptor leaves to the call after them.
+pub fn value_handing(
+  cx: Context,
+  st: Lowering,
+  row: Row,
+  at: Span,
+) -> { st: Lowering, args: List<Arg> } / {abort.raise} = {
+  let wanted = row_words(row, cx.rows, cx.labels);
+  let words = routed(cx, wanted);
+  let left = wanted.fold([], |acc: List<Arg>, o: Own|
+    match o.evidence.resource { RVar(p) -> acc.push(label_value(cx, p)), _ -> acc });
+  let d = static_added(st, described(wanted.map(|o: Own| o.evidence)));
+  let desc = bound_as(d.st, evidence_type(), RImm, Static(d.name), at);
+  let all = words.concat(left);
+  if all.len() == 0 { { st: desc.st, args: [desc.arg, AZero(RImm)] } } else {
+    let laid = bound_as(
+      desc.st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(WordsLaid), args: all, uses: reads(all.len()) }),
+      at,
+    );
+    { st: laid.st, args: [desc.arg, laid.arg] }
+  }
+}
+
+/// The static descriptor of a row whose words answer `ws`: how many, then for each its effect's and
+/// its resource's field-table entries, a resource of none `-1`, of every label `-2`, and one the
+/// call hands in the array past the words `-3`.
+pub fn described(ws: List<Evidence>) -> StaticLaid =
+  SPlain(
+    [WRaw(ws.len())].concat(
+      ws.fold([], |acc: List<StaticWord>, w: Evidence|
+        acc.push(WField(w.effect)).push(match w.resource {
+          RSingleton -> WRaw(0 - 1),
+          RAny -> WRaw(0 - 2),
+          RVar(_) -> WRaw(0 - 3),
+          RNamed(n) -> WField(n),
+        })),
+    ),
+  )
+
+/// The value each label of the root's numbering has in a function of its own entered from `cx`'s,
+/// which holds `values` for the labels at `places` and no other.
+pub fn labels_held(cx: Context, places: List<Int>, values: List<Arg>) -> List<Option<Arg>> =
+  range(0, cx.labels + labels_handed(cx.rows)).map(|p: Int|
+    match range(0, places.len()).find(|i: Int| places.at(i) == Some(p)) {
+      Some(i) -> values.at(i),
+      None -> None,
+    })
+
+/// The labels the words `own` leave to the call, by their places, each once, in order: what a
+/// closure of a row taking `own` captures, which its entry reads its own words by.
+pub fn left_labels(own: List<Own>) -> List<Int> =
+  own.fold([], |acc: List<Int>, o: Own|
+    match o.evidence.resource {
+      RVar(p) -> if acc.contains(p) { acc } else { acc.push(p) },
+      _ -> acc,
+    })

@@ -6,9 +6,10 @@ import compiler.emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, 
                            CodeStmt, CodeArm, CodeField)
 import compiler.syntax.items (Item, IInstance, NKey, NShow, INumeric, numeric_by)
 import compiler.check.resolve.tables (qualify)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
-                             bytes_type, bool_type, unit_type, named_type, list_type, fn_type,
-                             monomorphic, row_empty, fields_sorted)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
+                             Atom, int_type, bytes_type, bool_type, unit_type, named_type,
+                             list_type, fn_type, monomorphic, row_empty, fields_sorted)
+import compiler.check.infer.checker (FiledRows, Performs, RowArguments)
 import compiler.emit.typing (Typed, unknown_type, filed_as)
 import std.list
 import compiler.syntax.patterns (Lit, LInt, LBool, LStr, LBytes, LChar, LUnit)
@@ -184,6 +185,7 @@ pub type WrittenRoot = {
   params: List<EmitParam>,
   code: Result<Code, Bytes>,
   typed: Map<Int, Typed>,
+  rows: Map<Int, FiledRows>,
   here: List<Def>,
 }
 
@@ -198,7 +200,10 @@ pub fn container_code(
   op: Bytes,
   t: Type,
 ) -> WrittenRoot / {abort.raise} =
-  if strings_root(op) { strings_code(module, op, t) } else {
+  if strings_root(op) {
+    let s = strings_code(module, op, t);
+    { params: s.params, code: s.code, typed: s.typed, rows: Map::new(), here: s.here }
+  } else {
     let e = walked_code(module, op, t);
     let word = |n: Bytes| { name: n, kind: KBoxed, ty: kind_of(t).ty, of: Some(t), lambda: None };
     let index = { name: b"i", kind: KInt, ty: TyOpen([]), of: Some(int_type()), lambda: None };
@@ -208,6 +213,7 @@ pub fn container_code(
       else { [word(b"a")] },
       code: Ok(e.code),
       typed: e.typed,
+      rows: Map::new(),
       here: e.here,
     }
   }
@@ -1338,9 +1344,10 @@ fn crossing_loop(
 /// the list of its arguments' encodings, each argument read and the lifting ended; then `callee`
 /// called on them, and its answer written into the lowering the runtime opened beneath, which it
 /// ends. A generic definition is called as any caller calls it at `at`, through its own scheme;
-/// any other root is declared at `params` and `answer`. `hosts` are the real handlers the call runs
-/// under, each by the name the entry calls it by, the first outermost: each is handed a closure
-/// over the call inside it.
+/// any other root is declared at `params` and `answer`, performing `row`, its own atoms. `hosts` are
+/// the real handlers the call runs under, each by the name the entry calls it by and the effect it
+/// answers, the first outermost: each is handed a closure over the call inside it, which performs
+/// what that call does, and answers it, leaving its caller the rest, as the checker would file it.
 pub fn entered_code(
   module: Bytes,
   root: RootKey,
@@ -1348,7 +1355,8 @@ pub fn entered_code(
   at: List<Type>,
   params: List<Type>,
   answer: Type,
-  hosts: List<Bytes>,
+  row: Row,
+  hosts: List<{ call: Bytes, effect: Bytes }>,
 ) -> WrittenRoot / {abort.raise} = {
   let key = keys::Entered(root);
   let read = range(0, params.len()).fold(
@@ -1367,25 +1375,35 @@ pub fn entered_code(
     range(0, params.len()).map(|i: Int| slot_code(b"p".concat(ascii_of_int(i)), i)),
     at,
   );
-  let called = hosts.reverse().fold(direct, |inner: { code: Code, w: Writing }, host: Bytes| {
-    let lambda = filing(inner.w, filed_as(fn_type([], answer, row_empty()), []));
-    call_at(
-      lambda.w,
-      host,
-      [
-        bare(
-          NLambda({
-            params: 0,
-            size: params.len(),
-            captures: range(0, params.len()).map(|i: Int| { src: i, dst: i }),
-            body: inner.code,
-            at: lambda.span,
-          }),
-        ),
-      ],
-      [answer],
-    )
-  });
+  let called = hosts.reverse().fold(
+    { code: direct.code, w: direct.w, atoms: row.atoms },
+    |inner: { code: Code, w: Writing, atoms: List<Atom> }, host: { call: Bytes, effect: Bytes }| {
+      let lambda = filing(inner.w, filed_as(fn_type([], answer, row_empty()), []));
+      let left = inner.atoms.filter(|a: Atom| a.effect != host.effect);
+      let c = call_at(
+        rows_at(lambda.w, lambda.span, Performs({ atoms: inner.atoms, tail: None })),
+        host.call,
+        [
+          bare(
+            NLambda({
+              params: 0,
+              size: params.len(),
+              captures: range(0, params.len()).map(|i: Int| { src: i, dst: i }),
+              body: inner.code,
+              at: lambda.span,
+            }),
+          ),
+        ],
+        [answer],
+      );
+      let reference = match c.code.node { NApp(a) -> a.func.span, _ -> c.code.span };
+      {
+        code: c.code,
+        w: rows_at(c.w, reference, RowArguments([{ atoms: left, tail: None }])),
+        atoms: left,
+      }
+    },
+  );
   let written = call_at(called.w, b"?lower", [called.code], [answer]);
   rooted_at(module, key, [], unit_type(), {
     code: Ok(
@@ -1397,14 +1415,21 @@ pub fn entered_code(
       ),
     ),
     w: written.w,
-    here: if at.len() > 0 { [] } else { [called_def(module, callee, params, answer)] },
+    here: if at.len() > 0 { [] }
+    else { [called_def(module, callee, params, answer, { atoms: row.atoms, tail: None })] },
   })
 }
 
 /// The stored root of the `const` definition `root` of `module`, answering `answer`, which a build
 /// enters to keep its value: the bytes of that value's encoding, a value met again written as
-/// `AGAIN`, which the build lays out as static data. It calls the definition's own body.
-pub fn stored_code(module: Bytes, root: RootKey, answer: Type) -> WrittenRoot / {abort.raise} = {
+/// `AGAIN`, which the build lays out as static data. It calls the definition's own body, which
+/// performs `row`'s atoms.
+pub fn stored_code(
+  module: Bytes,
+  root: RootKey,
+  answer: Type,
+  row: Row,
+) -> WrittenRoot / {abort.raise} = {
   let called = bare(
     NApp({
       func: bare(NVar({ name: local_root(module, root_text(root_name(root))), slot: None })),
@@ -1415,7 +1440,7 @@ pub fn stored_code(module: Bytes, root: RootKey, answer: Type) -> WrittenRoot / 
   rooted_at(module, keys::Stored(root), [], bytes_type(), {
     code: Ok(written.code),
     w: written.w,
-    here: [called_def(module, root, [], answer)],
+    here: [called_def(module, root, [], answer, { atoms: row.atoms, tail: None })],
   })
 }
 
@@ -1427,6 +1452,7 @@ fn called_def(
   root: RootKey,
   params: List<Type>,
   answer: Type,
+  row: Row,
 ) -> Def / {abort.raise} =
   {
     name: local_root(module, root_text(root_name(root))),
@@ -1434,7 +1460,7 @@ fn called_def(
     ret_ty: TyOpen([]),
     pure: false,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, answer, row_empty()))),
+    scheme: Some(monomorphic(fn_type(params, answer, row))),
     witnesses: 0,
     lent: [],
     root: root,
@@ -2062,6 +2088,7 @@ fn rooted_at(
     }),
     code: body.code,
     typed: body.w.typed,
+    rows: body.w.rows,
     here: [def_of(module, key, params, answer)].concat(body.here),
   }
 
@@ -2121,15 +2148,20 @@ fn tag_ctor() -> Int = 12
 fn tag_array() -> Int = 14
 
 /// Code being written: the site the next node it files a type for is placed at, and what is filed.
-type Writing = { next: Int, typed: Map<Int, Typed> }
+type Writing = { next: Int, typed: Map<Int, Typed>, rows: Map<Int, FiledRows> }
 
-fn writing() -> Writing = { next: 0, typed: Map::new() }
+fn writing() -> Writing = { next: 0, typed: Map::new(), rows: Map::new() }
 
 /// A place for a node, `t` filed there.
 fn filing(w: Writing, t: Typed) -> { span: Span, w: Writing } = {
   let span = { start: 0, end: w.next, site: w.next + 1 };
-  { span: span, w: { next: w.next + 1, typed: w.typed.insert(span.site, t) } }
+  { span: span, w: { ..w, next: w.next + 1, typed: w.typed.insert(span.site, t) } }
 }
+
+/// `w` with `rows` filed at the node at `at`, as the checker files the rows a call or a lambda takes
+/// words for.
+fn rows_at(w: Writing, at: Span, rows: FiledRows) -> Writing =
+  { ..w, rows: w.rows.insert(at.site, rows) }
 
 /// A call of `name` on `args`, filed as called at type arguments `args_at` where its name is
 /// written.

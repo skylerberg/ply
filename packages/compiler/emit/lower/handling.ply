@@ -7,8 +7,8 @@ import compiler.emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat
                            NUpdate, NRecord, NList, NPerform, NParallel, NHandle, slots_read,
                            all_read, pat_slots)
 import compiler.syntax.parsing (Span)
-import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, RNamed, is_diverges, int_type,
-                             string_type, fields_sorted)
+import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, Resource, RNamed, RSingleton, RAny,
+                             RVar, is_diverges, int_type, string_type, fields_sorted)
 import compiler.emit.typing (unknown_type)
 import compiler.check.resolve.tables (qualify)
 import compiler.expand.rewrite (named_program_wide)
@@ -17,13 +17,15 @@ import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
 import std.bytes (ascii_of_int)
 import compiler.emit.reps (Def, EffectName, OpMode, gathered_of)
 import compiler.emit.keys (Named, unspecialised)
-import compiler.emit.tir (RInt, RWord, Arg, AVar, Inst, Block, Op, OHandle, Get, PField, Assign, If,
-                          Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Handle,
-                          Handling, falls_through)
+import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
+                          PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
+                          Enter, Handle, Handling, falls_through)
 import compiler.emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached)
 import compiler.emit.lower.crossing (op_described, type_described)
-import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, refuse, fresh,
-                                 bound_as, emitted, continued, filed, unfiled, type_of, handed)
+import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, Worded, refuse,
+                                 fresh, bound_as, emitted, continued, filed, unfiled, type_of,
+                                 handed)
+import compiler.emit.lower.evidence (words_at)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.lower.data (recorded_as)
 import compiler.emit.lower.resumes (off_tail_code)
@@ -109,8 +111,9 @@ pub fn label(cx: Context, st: Lowering, name: Bytes, at: Span) -> Lowered =
   )
 
 /// How clause `clause`'s body is laid out as a function of its own: its parameters, then the call
-/// site's label where it binds one, then its continuation where it resumes.
-pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame =
+/// site's label where it binds one, then its continuation where it resumes; handed the words its
+/// own row takes.
+pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame / {abort.raise} =
   {
     params: clause.params + (if clause.binds_label { 1 } else { 0 })
       + (if clause.resume { 1 } else { 0 }),
@@ -119,12 +122,55 @@ pub fn clause_frame(cx: Context, clause: CodeClause) -> Frame =
     resumes: clause.resume,
     body: clause.body,
     ty: None,
+    words: words_at(cx, clause.at),
   }
 
 /// How a `handle`'s return clause is laid out as a function of its own: the value the body answered,
-/// then what it copies in.
-pub fn ret_frame(cx: Context, r: CodeReturn) -> Frame =
-  { params: 1, size: r.size, captures: r.captures, resumes: false, body: r.body, ty: None }
+/// then what it copies in; handed the words its own row takes.
+pub fn ret_frame(cx: Context, r: CodeReturn) -> Frame / {abort.raise} =
+  {
+    params: 1,
+    size: r.size,
+    captures: r.captures,
+    resumes: false,
+    body: r.body,
+    ty: None,
+    words: words_at(cx, r.at),
+  }
+
+/// `cx` inside the body of a `handle` laying out `clauses`, run in place: holding, before any word
+/// it held, a word for each effect and resource a clause answers there.
+pub fn handle_entered(
+  cx: Context,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+) -> Context / {abort.raise} =
+  {
+    ..cx,
+    words: h.clauses.fold([], |acc: List<Worded>, cl: CodeClause|
+      match effect_named(cx, cl.effect) {
+        None -> acc,
+        Some(en) -> {
+          let answered = { effect: en.global, resource: clause_resource(cx, cl) };
+          if acc.any(|w: Worded| w.evidence == answered) { acc } else {
+            acc.push({ evidence: answered, word: AZero(RImm), through: false, handled: true })
+          }
+        },
+      }).concat(
+      cx.words,
+    ),
+  }
+
+/// The resource clause `cl` answers on, in the root's numbering: a label parameter's, every label,
+/// one named, or none.
+fn clause_resource(cx: Context, cl: CodeClause) -> Resource =
+  if cl.label != None {
+    match range(0, cx.label_names.len()).find(|i: Int| cx.label_names.at(i) == Some(cl.resource)) {
+      Some(p) -> RVar(p),
+      None -> RNamed(cl.resource),
+    }
+  } else if cl.resource == b"" { RSingleton }
+  else if cl.resource == b"*" { RAny }
+  else { RNamed(cl.resource) }
 
 /// How a `handle`'s body is laid out as a function of its own where it runs detached, on a stack of
 /// its own: no parameters, each slot it reads that is bound around it copied in at its own number;
@@ -144,6 +190,8 @@ pub fn body_frame(
       resumes: false,
       body: h.body,
       ty: None,
+      // The runtime runs it, handing it no word.
+      words: [],
     })
   }
 

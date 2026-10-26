@@ -2,7 +2,8 @@
 //! written for a type, a test, a law, a clause, a stored value or an entry. Its name is printed from
 //! the key, never read back into one.
 
-import compiler.check.types (Type, TyCon, TyRecord, TyNominal, Field, spelled_type, type_bin)
+import compiler.check.types (Type, TyCon, TyRecord, TyNominal, Field, Resource, RNamed, RSingleton,
+                             RVar, RAny, spelled_type, type_bin, resource_bin)
 import compiler.check.resolve.tables (qualify, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
@@ -11,7 +12,9 @@ import std.math (ilog2)
 import std.pace (paced)
 
 /// A root. `Named` is a definition, by its qualified name. `At` is a definition at type arguments,
-/// running in place the lambdas `lent` names where it calls the parameters they are handed as.
+/// running in place the lambdas `lent` names where it calls the parameters they are handed as, and
+/// at `rows`, what each of its scheme's row variables holds, in the scheme's order, where it has
+/// any: the words it is handed for each, a label in them its caller's (`Evidence`).
 /// `Written` is an operation written for a type, in the module that declares the type where its name
 /// is qualified, and otherwise in `home`, the module asking; its `marks` are the places in `ty` (0
 /// `ty` itself, then each argument's subtree in order) that stand for an operation's own type
@@ -24,7 +27,7 @@ import std.pace (paced)
 /// as, which only this module's constructors make, so it is spelled once and never outlives a change.
 pub type RootKey =
   | Named(Bytes)
-  | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg> }, RootName)
+  | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> }, RootName)
   | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }, RootName)
   | Test({ module: Bytes, digest: Bytes })
   | Cases(RootKey)
@@ -50,6 +53,12 @@ pub type KeyArg = | KeyType(Type) | KeyLayout({ key: Bytes, at: Type })
 /// stands in its module is no part of it, so a body kept for a definition names the same lambda
 /// wherever the definition moves.
 pub type FnArg = { param: Int, owner: RootKey, nth: Int }
+
+/// What one evidence word answers: an effect's operations on one resource, which one object serves
+/// whatever atoms of the effect a row names there. A label variable is a place: in a definition's
+/// own row, its label parameter's; in a key's rows, `RVar(k)` the `k`th label the caller hands the
+/// specialisation beside its words.
+pub type Evidence = { effect: Bytes, resource: Resource }
 
 /// An operation written per type. `Equal` and `Order` compare two values of a declared sum;
 /// `Contained` is one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release`
@@ -90,6 +99,7 @@ pub opaque type RootName = | RootName(Bytes)
 derive bin for KeyArg
 derive bin for TypeOp
 derive bin for FnArg
+derive bin for Evidence
 derive bin for LawPart
 derive bin for ClauseKind
 derive bin for RootKey
@@ -114,8 +124,10 @@ pub fn root_name(k: RootKey) -> RootName =
 /// never for deciding what a root is, which its key says.
 pub fn root_text(n: RootName) -> Bytes = match n { RootName(b) -> b }
 
-/// What a specialisation of `def` at `args`, running `lent` in place, is called.
-fn at_spelled(a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg> }) -> RootName =
+/// What a specialisation of `def` at `args`, running `lent` in place, at `rows`, is called.
+fn at_spelled(
+  a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> },
+) -> RootName =
   RootName(
     Bytes::concat_all(
       [
@@ -135,9 +147,29 @@ fn at_spelled(a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg> }) -> RootN
             b":",
             ascii_of_int(f.nth),
           ])),
+      ).concat(
+        a.rows.map(|r: List<Evidence>| b"/".concat(evidence_spelled(r))),
       ),
     ),
   )
+
+/// Words `ws` as a name spells them: each effect, and its resource between brackets where it names
+/// one, a key's label `k` as `#k`.
+pub fn evidence_spelled(ws: List<Evidence>) -> Bytes =
+  Bytes::concat_all([
+    b"{",
+    Bytes::join(
+      ws.map(|w: Evidence|
+        match w.resource {
+          RSingleton -> w.effect,
+          RNamed(n) -> Bytes::concat_all([w.effect, b"[", n, b"]"]),
+          RAny -> w.effect.concat(b"[*]"),
+          RVar(k) -> Bytes::concat_all([w.effect, b"[#", ascii_of_int(k), b"]"]),
+        }),
+      b",",
+    ),
+    b"}",
+  ])
 
 /// What operation `w.op`, written for `w.ty` with its marks, is called.
 fn written_spelled(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootName = {
@@ -383,6 +415,10 @@ pub fn key_types(k: RootKey) -> List<Type> =
 /// The lambdas a root runs in place of calls of the parameters they are handed as.
 pub fn key_lent(k: RootKey) -> List<FnArg> = match k { At(a, _) -> a.lent, _ -> [] }
 
+/// What a root's key fills its definition's row variables with, in its scheme's order: none but for
+/// a specialisation at rows.
+pub fn key_rows(k: RootKey) -> List<List<Evidence>> = match k { At(a, _) -> a.rows, _ -> [] }
+
 /// Definition `def` at the types `args`, running `lent` in place.
 pub fn at_key(def: Bytes, args: List<Type>, lent: List<FnArg>) -> RootKey =
   at_keyed(def, args.map(KeyType), lent)
@@ -393,8 +429,17 @@ pub fn judged_at(def: Bytes, vars: Int) -> RootKey =
   at_key(def, range(0, vars).map(|_: Int| TyCon({ name: b"Int", args: [] })), [])
 
 /// Definition `def` at `args`, each a type or a layout, running `lent` in place.
-pub fn at_keyed(def: Bytes, args: List<KeyArg>, lent: List<FnArg>) -> RootKey = {
-  let a = { def: def, args: args, lent: lent };
+pub fn at_keyed(def: Bytes, args: List<KeyArg>, lent: List<FnArg>) -> RootKey =
+  at_rowed(def, args, lent, [])
+
+/// Definition `def` at `args`, running `lent` in place, its row variables at `rows`.
+pub fn at_rowed(
+  def: Bytes,
+  args: List<KeyArg>,
+  lent: List<FnArg>,
+  rows: List<List<Evidence>>,
+) -> RootKey = {
+  let a = { def: def, args: args, lent: lent, rows: rows };
   At(a, at_spelled(a))
 }
 
