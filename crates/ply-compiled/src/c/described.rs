@@ -47,7 +47,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Ctx as "PlyCtx": failed, fuel, stack_floor, site_root, site_start, site_end, ticks,
         next_tick, frames, release_depth, release_waiting, target, entering_desc, entering_words,
         recording, bridge, hosted, unserved, performed_root,
-        performed_start, performed_end);
+        performed_start, performed_end, task);
     laid!(out, Obj as "PlyObj": rc);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
@@ -63,6 +63,12 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("closure.descriptor", heap::CLOSURE_CODE),
         ("failed.target", crate::rt::FAILED_TARGET as usize),
         ("failed.pending", crate::rt::FAILED_PENDING as usize),
+        ("instance.head", crate::detached::INSTANCE_HEAD),
+        ("instance.detached", crate::detached::INSTANCE_DETACHED),
+        ("instance.vars", crate::detached::INSTANCE_VARS),
+        ("record.closure", crate::detached::RECORD_CLOSURE),
+        ("record.instance", crate::detached::RECORD_INSTANCE),
+        ("record.string", crate::detached::RECORD_STRING),
     ]);
     out
 }

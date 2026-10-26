@@ -3,7 +3,7 @@
 //! resumed again (multi-shot); one a clause resumes at most once is not. When a continuation's last
 //! holder lets it go, its snapshot is dropped, and the body with it where it waits at that stop.
 
-use crate::emitted::{Block, Handed, PlyFnDesc};
+use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
 use crate::frames::{self, PlyFrame, Snapshot};
 use crate::heap::{HEADER, Word};
 use crate::rt::{
@@ -37,7 +37,25 @@ pub struct Detached {
     state: State,
     captures: Vec<Capture>,
     live: Option<usize>,
+    /// The counted block of the `handle`'s instance where its objects enter its clauses, which hold
+    /// no frame: what the body holds of it once more, and where its variables are.
+    instance: Option<Word>,
+    /// How many calls of the `handle`'s clauses at the body's stops are running.
+    clauses_running: u32,
 }
+
+/// A heap instance's block as emitted code lays it out, past its header, in words: how many its
+/// head holds before the instance, where in the head the body it is the `handle` of is (which
+/// [`open_over`] writes), and where the place of its first variable is, their count after it.
+pub(crate) const INSTANCE_HEAD: usize = 9;
+pub(crate) const INSTANCE_DETACHED: usize = 4;
+pub(crate) const INSTANCE_VARS: usize = 7;
+
+/// A clause's record in an instance: its closure, the instance, its place, and the descriptor of
+/// `String` where it is handed one.
+pub(crate) const RECORD_CLOSURE: usize = 0;
+pub(crate) const RECORD_INSTANCE: usize = 1;
+pub(crate) const RECORD_STRING: usize = 3;
 
 /// A detached `handle`'s forwarding block, as emitted code lays it out past its header, in words:
 /// the handler (which [`open`] writes), the unit's word mapping, the static descriptor of the words
@@ -112,6 +130,10 @@ struct Capture {
     /// what its runtime frames kept and the variables its running clauses hold. `None` for a stop
     /// resumed at most once, and for one from a stack other than the body's own.
     kept: Option<(Snapshot, StackCopy)>,
+    /// The values of an instance's variables as the body stood at this stop, each held once more
+    /// beside its type's descriptor: what a resumption from outside a clause of the `handle`
+    /// continues with.
+    vars: Vec<(Word, Word)>,
     /// The entry's count of at-most-once host operations when this stop was captured.
     born: u64,
     resumes: u32,
@@ -195,8 +217,184 @@ pub(crate) unsafe fn open(
         state: State::Fresh,
         captures: Vec::new(),
         live: None,
+        instance: None,
+        clauses_running: 0,
     });
     unsafe { resume(ctx, id, None, None) }
+}
+
+/// `rt_detached_open`: runs the body of a `handle` whose objects enter its clauses on a fresh stack
+/// until it stops or ends; answers the `handle`'s value, its landing the body's own. Takes `body`
+/// and `forwards`, the body's forwarding block where it has one; holds `instance`, the counted
+/// block of the `handle`'s instance, once more, writing the body's place into its head.
+pub(crate) unsafe fn open_over(
+    ctx: *mut Ctx,
+    body: Word,
+    forwards: Option<Word>,
+    instance: Word,
+) -> Word {
+    drain(ctx);
+    let c = unsafe { &mut *ctx };
+    let Some(stack) = Stack::take() else {
+        release_fun(body);
+        if let Some(block) = forwards {
+            unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
+        }
+        return no_stack_to_take(c);
+    };
+    let id = c.detached.len();
+    let frames = c.open_stack(Some(c.current));
+    c.stacks[frames].body = Some(id);
+    Block::of(instance).dup();
+    unsafe {
+        instance_head(instance)
+            .add(INSTANCE_DETACHED)
+            .write(id as Word)
+    };
+    let sp = stack.prepare(entry, ctx as usize);
+    c.detached.push(Detached {
+        stack: Some(stack),
+        frames,
+        sp,
+        saved_current: frames,
+        head: std::ptr::null_mut(),
+        resumer_sp: 0,
+        resumer_current: 0,
+        request: None,
+        answer: 0,
+        body,
+        ret: 0,
+        forwards,
+        starting: Some(body),
+        state: State::Fresh,
+        captures: Vec::new(),
+        live: None,
+        instance: Some(instance),
+        clauses_running: 0,
+    });
+    unsafe { resume(ctx, id, None, None) }
+}
+
+/// The words of a heap instance's block past its header: its head, then the instance.
+fn instance_head(block: Word) -> *mut Word {
+    unsafe { (block as *mut Word).byte_add(HEADER) }
+}
+
+/// Where a heap instance's variables are, as its head names them: each a value and its type's
+/// descriptor.
+fn instance_vars(block: Word) -> (*mut Word, usize) {
+    let head = instance_head(block);
+    let (place, count) = unsafe {
+        (
+            *head.add(INSTANCE_VARS) as usize,
+            *head.add(INSTANCE_VARS + 1) as usize,
+        )
+    };
+    (unsafe { head.add(INSTANCE_HEAD + place) }, count)
+}
+
+/// The values of the variables of the instance in `block`, each held once more.
+fn vars_kept(ctx: *mut Ctx, block: Word) -> Vec<Word> {
+    let (vars, count) = instance_vars(block);
+    (0..count)
+        .map(|j| unsafe {
+            let (v, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            if ty != 0 {
+                ((*(ty as *const PlyType)).inc)(ctx, v);
+            }
+            v
+        })
+        .collect()
+}
+
+/// The variables of the instance in `block` given `values`, which this takes; what they held let
+/// go.
+fn vars_put(ctx: *mut Ctx, block: Word, values: Vec<Word>) {
+    let (vars, _) = instance_vars(block);
+    for (j, v) in values.into_iter().enumerate() {
+        unsafe {
+            let (old, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            if ty != 0 {
+                ((*(ty as *const PlyType)).dec)(ctx, old);
+            }
+            vars.add(2 * j).write(v);
+        }
+    }
+}
+
+/// The values of the variables of the instance in `block`, each held once more, beside its type's
+/// descriptor, so they can be let go of whatever becomes of the instance.
+fn vars_typed(ctx: *mut Ctx, block: Word) -> Vec<(Word, Word)> {
+    let (vars, count) = instance_vars(block);
+    (0..count)
+        .map(|j| unsafe {
+            let (v, ty) = (*vars.add(2 * j), *vars.add(2 * j + 1));
+            if ty != 0 {
+                ((*(ty as *const PlyType)).inc)(ctx, v);
+            }
+            (v, ty)
+        })
+        .collect()
+}
+
+/// `values`, each held once more.
+fn vars_held(ctx: *mut Ctx, values: &[(Word, Word)]) -> Vec<Word> {
+    values
+        .iter()
+        .map(|&(v, ty)| {
+            if ty != 0 {
+                unsafe { ((*(ty as *const PlyType)).inc)(ctx, v) };
+            }
+            v
+        })
+        .collect()
+}
+
+/// Lets go of `values`, each through its type's descriptor.
+fn vars_let_go(ctx: *mut Ctx, values: Vec<(Word, Word)>) {
+    for (v, ty) in values {
+        if ty != 0 {
+            unsafe { ((*(ty as *const PlyType)).dec)(ctx, v) };
+        }
+    }
+}
+
+/// `rt_detached_stop`: the body of the `handle` the instance of clause record `record` belongs to
+/// stops at a perform the clause answers off its tail, `args` its words and `resource` its label's
+/// field-table entry; the clause runs where the body was entered or resumed from, which may resume
+/// it `again`. Answers what `k` is resumed with.
+pub(crate) unsafe fn stop_over(
+    ctx: *mut Ctx,
+    record: *const Word,
+    args: Vec<Word>,
+    resource: i64,
+    again: bool,
+) -> Word {
+    let (closure, instance, string) = unsafe {
+        (
+            *record.add(RECORD_CLOSURE),
+            *record.add(RECORD_INSTANCE) as *const Word,
+            *record.add(RECORD_STRING),
+        )
+    };
+    let id = unsafe { *instance.sub(INSTANCE_HEAD).add(INSTANCE_DETACHED) } as usize;
+    let mut bound = args;
+    // A clause written `[*t]` reads the label its call site named, before the continuation does.
+    if string != 0 {
+        let c = unsafe { &*ctx };
+        let label = usize::try_from(resource)
+            .ok()
+            .and_then(|i| c.tables.fields.get(i))
+            .cloned();
+        if let Some(label) = label {
+            bound.push(crate::rt::label_word(
+                ctx,
+                unsafe { &*(string as *const PlyType) },
+                &label,
+            ));
+        }
+    }
+    unsafe { stopped(ctx, id, closure, bound, again) }
 }
 
 /// Runs the body from where it stopped, `answer` returned from its `perform`, until it stops again.
@@ -248,9 +446,21 @@ pub(crate) unsafe fn resume(
         }
     }
     let c = unsafe { &mut *ctx };
-    // A resumption continues with the variables of the clause of its handler that resumes it, and
-    // with those the body had where it stopped when nothing of its handler's runs.
-    if capture.is_some() {
+    // Over an instance, a resumption from a clause of the `handle` continues with that clause's
+    // variables, which it gets back as they were once the body stops again; one from anywhere else
+    // continues with those the body had at its stop.
+    let instance = c.detached[id].instance;
+    let mut clause_vars = None;
+    if let (Some(block), Some(k)) = (instance, capture) {
+        if c.detached[id].clauses_running > 0 {
+            clause_vars = Some(vars_kept(ctx, block));
+        } else {
+            let at_stop = vars_held(ctx, &unsafe { &*ctx }.detached[id].captures[k].vars);
+            vars_put(ctx, block, at_stop);
+        }
+    }
+    let c = unsafe { &mut *ctx };
+    if capture.is_some() && instance.is_none() {
         let frames = c.detached[id].frames;
         let values = c.stacks[frames]
             .list
@@ -281,7 +491,7 @@ pub(crate) unsafe fn resume(
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
     c.current = d.resumer_current;
-    match d.request.take() {
+    let r = match d.request.take() {
         Some(Stopped::Performed {
             closure,
             mut args,
@@ -289,13 +499,21 @@ pub(crate) unsafe fn resume(
         }) => {
             d.state = State::Suspended;
             let k = capture_stop(ctx, id, again);
+            if let Some(block) = instance {
+                let kept = vars_typed(ctx, block);
+                unsafe { &mut *ctx }.detached[id].captures[k].vars = kept;
+            }
             let c = unsafe { &mut *ctx };
             args.push(token(c, id, k));
             // The clause works on its own copy of the variables, so each resumption it makes starts
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
             let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
+            c.detached[id].clauses_running += 1;
             let r = call_clause(ctx, closure, args, held);
+            let c = unsafe { &mut *ctx };
+            c.detached[id].clauses_running -= 1;
+            settle(c, id);
             drain(ctx);
             r
         }
@@ -315,6 +533,23 @@ pub(crate) unsafe fn resume(
             );
             c.fail(dg)
         }
+    };
+    if let (Some(block), Some(values)) = (instance, clause_vars) {
+        vars_put(ctx, block, values);
+    }
+    r
+}
+
+/// A finished body over an instance lets go of it once no clause of its `handle` runs, since a
+/// running clause reads its variables through it.
+fn settle(c: &mut Ctx, id: usize) {
+    let d = &mut c.detached[id];
+    if d.state == State::Done
+        && d.clauses_running == 0
+        && d.stack.is_none()
+        && let Some(block) = d.instance.take()
+    {
+        release_fun(block);
     }
 }
 
@@ -340,6 +575,7 @@ fn give_back(c: &mut Ctx, id: usize) {
     if let Some(block) = c.detached[id].forwards.take() {
         unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
     }
+    settle(c, id);
 }
 
 /// Records the stop the body just made, snapshotted where the clause may resume it `again`, and
@@ -365,6 +601,7 @@ fn capture_stop(ctx: *mut Ctx, id: usize, again: bool) -> usize {
     let d = &mut c.detached[id];
     d.captures.push(Capture {
         kept,
+        vars: Vec::new(),
         born,
         resumes: 0,
     });
@@ -432,6 +669,11 @@ pub(crate) unsafe fn stop(
     owned: (Symbol, Symbol, Option<Symbol>),
 ) -> Word {
     drop(owned);
+    unsafe { stopped(ctx, id, closure, args, again) }
+}
+
+/// [`stop`] with nothing uncounted owned across the switch.
+unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>, again: bool) -> Word {
     let c = unsafe { &mut *ctx };
     let head = c.frames;
     let d = &mut c.detached[id];
@@ -619,6 +861,8 @@ pub(crate) fn drain(ctx: *mut Ctx) {
 fn drop_stop(ctx: *mut Ctx, id: usize, k: usize) {
     let d = &mut unsafe { &mut *ctx }.detached[id];
     let kept = d.captures[k].kept.take();
+    let vars = std::mem::take(&mut d.captures[k].vars);
+    vars_let_go(ctx, vars);
     let waiting = d.state == State::Suspended && d.live == Some(k);
     if let Some((snapshot, stack)) = kept {
         unsafe { snapshot.release(ctx) };
@@ -684,11 +928,14 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
                 unsafe { snapshot.release(ctx) };
                 stack.release();
             }
+            let vars = std::mem::take(&mut unsafe { &mut *ctx }.detached[id].captures[k].vars);
+            vars_let_go(ctx, vars);
         }
         let c = unsafe { &mut *ctx };
         let d = &mut c.detached[id];
         d.state = State::Done;
         d.live = None;
+        d.clauses_running = 0;
         give_back(c, id);
     }
     let c = unsafe { &mut *ctx };

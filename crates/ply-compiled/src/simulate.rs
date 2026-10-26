@@ -442,6 +442,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
         let sim = c.sims.last_mut().expect("a region is running");
         c.current = sim.slot(task).frames;
         sim.running = Some(task);
+        c.task = task.0 as i64;
         let from = &mut sim.scheduler_sp as *mut usize;
         unsafe { switch_keeping(ctx, from, sp) };
 
@@ -449,6 +450,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
         let yielded = c.step_site();
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
+        c.task = 0;
         c.current = sim.stack;
         if sim.sched.records_steps() {
             c.trail.end_step(yielded);

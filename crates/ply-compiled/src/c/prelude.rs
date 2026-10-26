@@ -360,6 +360,16 @@ helpers! {
     ) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
     rt_pending_raised_at(effect: I64, op: I64) -> Handed;
+    rt_label_string(resource: I64, string: *const PlyType) -> Handed;
+    rt_task_abandons(op: *const PlyOp) -> Word;
+    rt_detached_open(body: Block, forwards: Block, instance: Block) -> Handed;
+    rt_detached_stop(
+        record: *const Word,
+        op: *const PlyOp,
+        resource: I64,
+        args: *const Handed,
+        again: I64
+    ) -> Handed;
     rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
     rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
     rt_handle_install_at(clauses: *const Word, n: I64, ret: Handed, cell: Out) -> I64;

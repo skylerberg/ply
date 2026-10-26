@@ -9,11 +9,12 @@ import compiler.emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat
                            NUpdate, NRecord, NList, NPerform, NParallel, NHandle, slots_read,
                            all_read, pat_slots)
 import compiler.emit.keys (Evidence)
-import compiler.emit.evidence (evidence_type, row_described_type)
+import compiler.emit.evidence (evidence_type, instance_block_type, row_described_type)
 import compiler.syntax.parsing (Span)
 import compiler.syntax.exprs (is_exit_effect)
 import compiler.check.types (Type, TyFn, TyRecord, Scheme, Atom, Row, Resource, RNamed, RSingleton,
-                             RAny, RVar, is_diverges, int_type, string_type, fields_sorted)
+                             RAny, RVar, is_diverges, int_type, string_type, fields_sorted, fn_type,
+                             row_empty)
 import compiler.emit.typing (unknown_type)
 import compiler.check.resolve.tables (qualify)
 import compiler.expand.rewrite (named_program_wide)
@@ -26,15 +27,16 @@ import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, 
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
                           Enter, Handle, Handling, Uses, AInt, Static, falls_through)
 import compiler.emit.tir.handling (Perform, Label, Parallel, Simulate, Unsettled, Clause, Reached,
-                                   Bridge, Instance, ObjectLaid, Entering, Framing, FramingSet,
-                                   ObjectAt, Mapped, Slot, Answering, Forwarding, Framed, Forwarded,
-                                   Entry, Answers, Resumes, Raises, HandleInstance, raised_at)
+                                   Bridge, Instance, InstanceHeap, InstanceIn, ObjectLaid, Entering,
+                                   ForwardsLaid, ForwardsSet, ObjectAt, Mapped, Slot, Answering,
+                                   Forwarding, Forwarded, Keyed, KeyedRow, Entry, Answers, Stops,
+                                   Resumes, Raises, HandleInstance, raised_at)
 import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named)
-import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, ClauseMade, Worded, Held,
-                                 refuse, fresh, bound_as, done, emitted, continued, filed, unfiled,
-                                 type_of, handed, static_added)
-import compiler.emit.lower.evidence (words_at, routed, bridged, label_resource, value_handing,
-                                     described, label_value)
+import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, refuse, fresh,
+                                 bound_as, done, emitted, continued, filed, unfiled, type_of,
+                                 handed, static_added)
+import compiler.emit.lower.evidence (words_at, routed, bridged, held_routed, label_resource,
+                                     value_handing, described, label_value)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.lower.data (recorded_as)
 import compiler.emit.lower.resumes (off_tail_code)
@@ -165,141 +167,145 @@ pub fn ret_frame(r: CodeReturn, held: Held) -> Frame =
   }
 
 /// How a `handle` answers what its clauses do: through evidence objects laid over an instance in
-/// the frame of the function it is written in, the instance's word and layout here; or through the
-/// runtime's frames, the frame bridge's word what its body performs those through.
+/// the frame of the function it is written in, or on the heap in a counted block where its body
+/// runs detached or that function may spawn a task, either of which may outlive the frame, the
+/// instance's word, layout and block here; and where the body runs detached, its forwarding block.
 pub type Planned = {
   st: Lowering,
-  instance: Option<{ word: Arg, layout: HandleInstance }>,
-  bridge: Option<Arg>,
-  framing: Option<Framed>,
+  instance: { word: Arg, layout: HandleInstance, block: Option<Arg> },
+  forwarding: Option<Forwards>,
 }
 
-/// A `handle` the runtime's frames hold, reached through a block: its address, a word for each
-/// effect and resource its clauses answer, which reaches its frame by its handler, and the words
-/// its clauses, return clause and body hold for what is around it. Where the body runs detached
-/// those forward to the words the call resuming it hands, so a body resumed after the function
-/// around it returned reaches no word that function held.
-pub type Framed = { word: Arg, keys: List<Worded>, outer: List<Worded> }
+/// A detached body's forwarding block: its address, and the words the body, its clauses and its
+/// return clause hold for what is around the `handle`, which forward to the words the call resuming
+/// it hands, so a body resumed after the function around it returned reaches no word that function
+/// held.
+pub type Forwards = { word: Arg, outer: List<Worded> }
 
-/// The `handle` `h` written at `at` planned after `st`. It answers through evidence objects unless a
-/// clause resumes off its tail, which runs the body detached, binds the label it answers at or
-/// answers on every label, or the function it is in may spawn a task, which may outlive the frame;
-/// those the runtime's frames hold.
+/// The `handle` `h` written at `at` planned after `st`, its instance laid out: the fuel and unwind
+/// words, each clause's record, then the return clause's, its variables and its keyed tables.
 pub fn handle_planned(
   cx: Context,
   st: Lowering,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
   at: Span,
-) -> Planned / {abort.raise} =
-  if !in_place(cx, h.clauses) {
+) -> Planned / {abort.raise} = {
+  let detached = detaches(h.clauses);
+  let f = if !detached { { st: st, forwarding: None } } else {
+    let made = forwarding(cx, st, at);
+    { st: made.st, forwarding: Some(made.forwarding) }
+  };
+  let around = match f.forwarding { Some(w) -> { ..cx, words: w.outer }, None -> cx };
+  let raised = h.clauses.fold(0, |m: Int, cl: CodeClause|
+    if clause_mode(cx, cl) == 3 && cl.params > m { cl.params } else { m });
+  let records = raised_at() + raised;
+  let returned = h.clauses.len();
+  let vars = records + 4 * (returned + (if h.ret == None { 0 } else { 1 }));
+  let count = handler_vars(h.body);
+  let tables = instance_keys(cx, h.clauses).fold(0, |n: Int, k: Key|
+    n + tables_of(key_planned(around, h.clauses, k)));
+  let layout = {
+    operand: 0,
+    records: range(0, h.clauses.len()).map(|k: Int| records + 4 * k),
+    vars: vars,
+    count: count,
+    pending: range(0, h.clauses.len()).find(|k: Int|
+      match h.clauses.at(k) { Some(cl) -> answers_abort(cx, cl), None -> false }),
+    answer: None,
+    raised: range(0, h.clauses.len()).filter(|k: Int|
+      match h.clauses.at(k) {
+        Some(cl) -> clause_mode(cx, cl) == 3 && !answers_abort(cx, cl),
+        None -> false,
+      }),
+    heap: None,
+    ret: if h.ret == None { None } else { Some(records + 4 * returned) },
+    preset: false,
+  };
+  let words = vars + 2 * count + tables;
+  if detached || spawning(cx) {
     let b = bound_as(
-      st,
-      evidence_type(),
-      RImm,
-      Op({ op: OHandle(Bridge), args: [], uses: reading(0) }),
+      f.st,
+      instance_block_type(),
+      RWord,
+      Op({
+        op: OHandle(InstanceHeap(words)),
+        args: [],
+        uses: { takes: [], owned: true, fails: false, stops: false },
+      }),
       at,
     );
-    if spawning(cx) { { st: b.st, instance: None, bridge: Some(b.arg), framing: None } } else {
-      let f = framed(cx, b.st, h, b.arg, at);
-      { st: f.st, instance: None, bridge: Some(b.arg), framing: Some(f.framed) }
+    let i = bound_as(
+      b.st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(InstanceIn), args: [b.arg], uses: reading(1) }),
+      at,
+    );
+    {
+      st: i.st,
+      instance: { word: i.arg, layout: layout, block: Some(b.arg) },
+      forwarding: f.forwarding,
     }
   } else {
-    let raised = h.clauses.fold(0, |m: Int, cl: CodeClause|
-      if clause_mode(cx, cl) == 3 && cl.params > m { cl.params } else { m });
-    let records = raised_at() + raised;
-    let vars = records + 3 * h.clauses.len();
-    let count = handler_vars(h.body);
-    let layout = {
-      operand: 0,
-      records: range(0, h.clauses.len()).map(|k: Int| records + 3 * k),
-      vars: vars,
-      count: count,
-      pending: range(0, h.clauses.len()).find(|k: Int|
-        match h.clauses.at(k) { Some(cl) -> answers_abort(cx, cl), None -> false }),
-      answer: None,
-      raised: range(0, h.clauses.len()).filter(|k: Int|
-        match h.clauses.at(k) {
-          Some(cl) -> clause_mode(cx, cl) == 3 && !answers_abort(cx, cl),
-          None -> false,
-        }),
-    };
     let i = bound_as(
-      st,
+      f.st,
       evidence_type(),
       RImm,
-      Op({ op: OHandle(Instance(vars + 2 * count)), args: [], uses: reading(0) }),
+      Op({ op: OHandle(Instance(words)), args: [], uses: reading(0) }),
       at,
     );
-    { st: i.st, instance: Some({ word: i.arg, layout: layout }), bridge: None, framing: None }
+    { st: i.st, instance: { word: i.arg, layout: layout, block: None }, forwarding: None }
   }
+}
 
 /// Whether the function `cx` lowers may spawn a task, which holds none of its words.
 fn spawning(cx: Context) -> Bool = cx.words.any(|w: Worded| w.evidence.effect == b"task")
 
-/// Where the parts of a framed `handle`'s block start: its header, the words it forwards to, the
-/// labels its descriptor leaves to them, each forwarding object and its pairs, then each of the
-/// `handle`'s own objects; and how many words it holds.
-type Placed = { targets: Int, labels: Int, forwards: List<Int>, keys: List<Int>, words: Int }
+/// Where a detached body's forwarding block holds what: its header, the words around the `handle`
+/// it forwards to, the labels their descriptor leaves to them and each forwarding object with its
+/// pairs; and how many words it holds.
+type Placed = { targets: Int, labels: Int, forwards: List<Int>, words: Int }
 
-/// A word around a framed `handle` its detached body forwards to, and how many operations the
-/// effect it answers has; none for an effect whose operations the lowering does not know, which the
-/// body reaches through the frame bridge.
+/// A word around a detached `handle` its body forwards to, and how many operations the effect it
+/// answers has; none for an effect whose operations the lowering does not know, which the body
+/// reaches through the frame bridge.
 type Outer = { word: Worded, ops: Int }
 
-/// The block of the framed `handle` `h` laid out after `st`, `bridge` its word for what nothing
-/// answers: a detached body's on the heap, its header, the words around the `handle` it forwards to
-/// and an object forwarding to each; then, on the heap or in the frame, an object for each effect
-/// and resource the `handle` answers whose operations the lowering knows, reaching its frame where
-/// a clause answers the operation and the word around the `handle` where none does.
-fn framed(
+/// A detached body's forwarding block laid out on the heap after `st`: its header, the words around
+/// the `handle` it forwards to, and an object forwarding to each, which each call resuming the body
+/// points at the words that call hands.
+fn forwarding(
   cx: Context,
   st: Lowering,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
-  bridge: Arg,
   at: Span,
-) -> { st: Lowering, framed: Framed } / {abort.raise} = {
-  let detached = detaches(h.clauses);
-  let keys = handle_keys(cx, h.clauses).filter(|k: { evidence: Evidence, effect: EffectName }|
-    k.effect.ops.len() > 0);
-  let around = if detached { cx.words } else { [] };
-  let known = around.fold([], |acc: List<Outer>, w: Worded|
+) -> { st: Lowering, forwarding: Forwards } / {abort.raise} = {
+  let known = cx.words.fold([], |acc: List<Outer>, w: Worded|
     match effect_of(cx, w.evidence.effect) {
       Some(e) -> if e.ops.len() > 0 { acc.push({ word: w, ops: e.ops.len() }) } else { acc },
       None -> acc,
     });
   let outer = known.map(|f: Outer| f.word);
   let labels = outer.filter(|w: Worded| match w.evidence.resource { RVar(_) -> true, _ -> false });
-  let header = if detached { 5 } else { 1 };
+  let header = 5;
   let forwards = known.fold(
     { at: header + outer.len() + labels.len(), starts: [] },
     |acc: { at: Int, starts: List<Int> }, f: Outer|
       { at: acc.at + 1 + 4 * f.ops, starts: acc.starts.push(acc.at) },
   );
-  let owned = keys.fold(
-    { at: forwards.at, starts: [] },
-    |acc: { at: Int, starts: List<Int> }, k: { evidence: Evidence, effect: EffectName }|
-      { at: acc.at + 1 + 2 * k.effect.ops.len(), starts: acc.starts.push(acc.at) },
-  );
   let placed = {
     targets: header,
     labels: header + outer.len(),
     forwards: forwards.starts,
-    keys: owned.starts,
-    words: owned.at,
+    words: forwards.at,
   };
   let block = bound_as(
     st,
     evidence_type(),
     RImm,
-    Op({
-      op: OHandle(Framing({ words: placed.words, heap: detached })),
-      args: [],
-      uses: reading(0),
-    }),
+    Op({ op: OHandle(ForwardsLaid(placed.words)), args: [], uses: reading(0) }),
     at,
   );
-  let headed = if !detached { block.st }
-  else { forwarding_header(cx, block.st, block.arg, outer, placed, at) };
+  let headed = forwarding_header(cx, block.st, block.arg, outer, placed, at);
   let forwarded = range(0, known.len()).fold(
     { st: headed, words: [] },
     |acc: { st: Lowering, words: List<Worded> }, i: Int| {
@@ -326,45 +332,21 @@ fn framed(
     },
   );
   // A word whose effect's operations the lowering does not know reaches the frames.
-  let unforwarded = around.filter(|w: Worded| !outer.contains(w)).map(|w: Worded|
-    { ..w, word: bridge });
-  let outside = if detached { { ..cx, words: forwarded.words.concat(unforwarded) } } else { cx };
-  let own = range(0, keys.len()).fold(
-    { st: forwarded.st, words: [] },
-    |acc: { st: Lowering, words: List<Worded> }, k: Int| {
-      let key = keys.get(k);
-      let past = bridged(acc.st, routed(outside, [{ evidence: key.evidence, through: false }]), at);
-      let slots = range(0, key.effect.ops.len()).map(|j: Int|
-        if answered_here(cx, h.clauses, key.evidence, key.effect.ops.get(j).name) { Framed }
-        else { Forwarding({ operand: 1, op: j }) });
-      let o = bound_as(
-        past.st,
-        evidence_type(),
-        RImm,
-        Op({
-          op: OHandle(ObjectAt({ at: placed.keys.get(k), slots: slots })),
-          args: [block.arg].concat(past.args),
-          uses: reading(2),
-        }),
-        at,
-      );
-      {
-        st: o.st,
-        words: acc.words.push({
-          evidence: key.evidence,
-          word: o.arg,
-          through: false,
-          handled: true,
-        }),
-      }
-    },
-  );
-  // An effect whose operations the lowering does not know reaches the frames through the bridge.
-  let unknown = handle_keys(cx, h.clauses).filter(
-    |k: { evidence: Evidence, effect: EffectName }| k.effect.ops.len() == 0,
-  ).map(|k: { evidence: Evidence, effect: EffectName }|
-    { evidence: k.evidence, word: bridge, through: false, handled: true });
-  { st: own.st, framed: { word: block.arg, keys: own.words.concat(unknown), outer: outside.words } }
+  let unknown = cx.words.filter(|w: Worded| !outer.contains(w));
+  let bridged_unknown = if unknown.len() == 0 { { st: forwarded.st, words: [] } } else {
+    let b = bound_as(
+      forwarded.st,
+      evidence_type(),
+      RImm,
+      Op({ op: OHandle(Bridge), args: [], uses: reading(0) }),
+      at,
+    );
+    { st: b.st, words: unknown.map(|w: Worded| { ..w, word: b.arg }) }
+  };
+  {
+    st: bridged_unknown.st,
+    forwarding: { word: block.arg, outer: forwarded.words.concat(bridged_unknown.words) },
+  }
 }
 
 /// The header of a detached body's forwarding block at `block`, and the words and labels around the
@@ -379,7 +361,7 @@ fn forwarding_header(
   at: Span,
 ) -> Lowering / {abort.raise} = {
   let set = |s: Lowering, k: Int, a: Arg|
-    done(s, Op({ op: OHandle(FramingSet(k)), args: [block, a], uses: reading(2) }), at);
+    done(s, Op({ op: OHandle(ForwardsSet(k)), args: [block, a], uses: reading(2) }), at);
   let mapped = bound_as(
     st,
     evidence_type(),
@@ -402,32 +384,6 @@ fn forwarding_header(
   range(0, labels.len()).fold(targeted, |s: Lowering, l: Int|
     set(s, placed.labels + l, labels.get(l)))
 }
-
-/// Whether a clause of `clauses` answers operation `op` of the effect and resource `key` names.
-fn answered_here(
-  cx: Context,
-  clauses: List<CodeClause>,
-  key: Evidence,
-  op: Bytes,
-) -> Bool / {abort.raise} =
-  clauses.any(|cl: CodeClause|
-    cl.op == op
-      && (match effect_named(cx, cl.effect) { Some(en) -> en.global == key.effect, None -> false })
-      && clause_resource(cx, cl) == key.resource)
-
-/// Whether a `handle` of `clauses` written in `cx` answers through evidence objects, as
-/// `handle_planned` says.
-fn in_place(cx: Context, clauses: List<CodeClause>) -> Bool / {abort.raise} =
-  !detaches(clauses) && !cx.words.any(|w: Worded| w.evidence.effect == b"task")
-    && clauses.all(|cl: CodeClause|
-      !cl.binds_label && cl.resource != b"*"
-        && (match effect_named(cx, cl.effect) {
-          Some(en) -> match effect_of(cx, en.global) {
-            Some(e) -> e.ops.any(|o: OpMode| o.name == cl.op),
-            None -> false,
-          },
-          None -> false,
-        }))
 
 /// Whether clause `cl` answers `abort.raise`, which a raise the runtime left pending reaches.
 fn answers_abort(cx: Context, cl: CodeClause) -> Bool / {abort.raise} =
@@ -455,29 +411,21 @@ fn handler_vars(body: Code) -> Int =
 
 /// What a clause or the return clause of a `handle` planned as `plan`, written at `at`, holds: the
 /// words its row takes as they stand around the `handle`, each the frame bridge where none answers,
-/// and the instance where there is one.
+/// and the instance.
 pub fn clause_held(
   cx: Context,
   st: Lowering,
   plan: Planned,
   at: Span,
 ) -> { st: Lowering, held: Held } / {abort.raise} = {
-  let own = words_at(cx, at);
-  let around = match plan.framing { Some(f) -> { ..cx, words: f.outer }, None -> cx };
-  let words = bridged(st, routed(around, own), at);
+  let around = match plan.forwarding { Some(f) -> { ..cx, words: f.outer }, None -> cx };
+  let words = held_routed(around, st, words_at(cx, at), at);
   {
     st: words.st,
     held: {
-      words: range(0, own.len()).fold([], |acc: List<Worded>, k: Int|
-        match ((own.at(k), words.args.at(k))) {
-          (Some(o), Some(w)) ->
-            acc.push({ evidence: o.evidence, word: w, through: o.through, handled: false }),
-          _ -> acc,
-        }),
-      instance: match plan.instance {
-        Some(i) -> Some({ word: i.word, vars: i.layout.vars }),
-        None -> None,
-      },
+      words: words.words,
+      instance: Some({ word: plan.instance.word, vars: plan.instance.layout.vars }),
+      kept: cx.kept,
     },
   }
 }
@@ -501,9 +449,8 @@ fn handle_keys(
 
 /// `cx` inside the body of a `handle` planned as `plan`, run in place, and the state after `st`
 /// holding what it needs: before any word it held, a word for each effect and resource a clause
-/// answers there. Over an instance, each word is an evidence object whose slots enter the clauses
-/// answering its operations and copy the rest from the word around the `handle`; held by the
-/// runtime's frames, each is the frame bridge.
+/// answers there, an evidence object whose slots enter the clauses answering its operations and
+/// copy the rest from the word around the `handle`.
 pub fn handle_entered(
   cx: Context,
   st: Lowering,
@@ -511,81 +458,223 @@ pub fn handle_entered(
   plan: Planned,
   at: Span,
 ) -> { cx: Context, st: Lowering } / {abort.raise} = {
-  let keys = handle_keys(cx, h.clauses);
-  match plan.instance {
-    None -> {
-      let bridge = match plan.bridge { Some(b) -> b, None -> AZero(RImm) };
-      let own = match plan.framing {
-        Some(f) -> f.keys,
-        None ->
-          keys.map(|k: { evidence: Evidence, effect: EffectName }|
-            { evidence: k.evidence, word: bridge, through: false, handled: true }),
-      };
-      { cx: { ..cx, words: own.concat(cx.words), instance: None }, st: st }
+  let i = plan.instance;
+  let made = instance_objects(cx, st, h, plan, at);
+  {
+    cx: {
+      ..cx,
+      words: made.words.concat(cx.words),
+      instance: Some({ word: i.word, vars: i.layout.vars }),
+      kept: match i.block { Some(b) -> cx.kept.push(b), None -> cx.kept },
     },
-    Some(i) -> {
-      let made = keys.fold(
-        { st: st, words: [] },
-        |acc: { st: Lowering, words: List<Worded> }, k: { evidence: Evidence, effect: EffectName }| {
-          let outer = bridged(acc.st, routed(cx, [{ evidence: k.evidence, through: false }]), at);
-          let slots = range(0, k.effect.ops.len()).map(|j: Int| {
-            let op = k.effect.ops.get(j);
-            match range(0, h.clauses.len()).find(|c: Int|
-                match h.clauses.at(c) {
-                  Some(cl) ->
-                    cl.op == op.name
-                      && (match effect_named(cx, cl.effect) {
-                        Some(en) -> en.global == k.evidence.effect,
-                        None -> false,
-                      })
-                      && clause_resource(cx, cl) == k.evidence.resource,
-                  None -> false,
-                }) {
-              Some(c) ->
-                Answering({
-                  entry: entry_of(clause_mode(cx, h.clauses.get(c))),
-                  record: i.layout.records.get(c),
-                }),
-              None -> Forwarding({ operand: 1, op: j }),
-            }
-          });
-          let o = bound_as(
-            outer.st,
-            evidence_type(),
-            RImm,
-            Op({
-              op: OHandle(ObjectLaid(slots)),
-              args: [i.word].concat(outer.args),
-              uses: reading(2),
-            }),
-            at,
-          );
-          {
-            st: o.st,
-            words: acc.words.push({
-              evidence: k.evidence,
-              word: o.arg,
-              through: false,
-              handled: true,
-            }),
-          }
-        },
-      );
+    st: made.st,
+  }
+}
+
+/// The objects of the `handle` `h` planned as `plan`, over its instance, laid after `st`: one for
+/// each key its clauses answer, each slot entering a clause, the word around the `handle` (the
+/// forwarding block's, where the body runs detached) or a table of them.
+pub fn instance_objects(
+  cx: Context,
+  st: Lowering,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  plan: Planned,
+  at: Span,
+) -> { st: Lowering, words: List<Worded> } / {abort.raise} = {
+  let i = plan.instance;
+  let around = match plan.forwarding { Some(f) -> { ..cx, words: f.outer }, None -> cx };
+  let made = instance_keys(cx, h.clauses).fold(
+    { st: st, words: [], table: i.layout.vars + 2 * i.layout.count },
+    |acc: { st: Lowering, words: List<Worded>, table: Int }, k: Key| {
+      let kp = key_planned(around, h.clauses, k);
+      let o = object_laid(around, acc.st, h.clauses, i, kp, acc.table, at);
       {
-        cx: {
-          ..cx,
-          words: made.words.concat(cx.words),
-          instance: Some({ word: i.word, vars: i.layout.vars }),
-        },
-        st: made.st,
+        st: o.st,
+        words: acc.words.push({
+          evidence: kp.key.evidence,
+          word: o.arg,
+          through: false,
+          handled: true,
+        }),
+        table: acc.table + tables_of(kp),
       }
     },
+  );
+  { st: made.st, words: made.words }
+}
+
+/// An effect and resource a `handle` answers, with the effect's operations.
+type Key = { evidence: Evidence, effect: EffectName }
+
+/// The keys an instance's objects answer: each effect and resource a clause answers, once; an
+/// effect a clause answers on every label has the one key on every label, which takes all its
+/// clauses, so their order holds across labels.
+fn instance_keys(cx: Context, clauses: List<CodeClause>) -> List<Key> / {abort.raise} = {
+  let keys = handle_keys(cx, clauses);
+  keys.filter(|k: Key|
+    k.evidence.resource == RAny
+      || !keys.any(|o: Key| o.evidence.effect == k.evidence.effect && o.evidence.resource == RAny))
+}
+
+/// What an operation's slot of an instance's object enters: the clause at its place, the word its
+/// key is routed to around the `handle`, or a table of clauses (by place) then of words around the
+/// `handle` (by place among its key's), the first whose label is the perform's.
+type SlotPlan = | ByClause(Int) | ByWord | ByTable({ clauses: List<Int>, words: List<Int> })
+
+/// A key of an instance, the words around the `handle` its tables forward to by label, innermost
+/// first up to the first on every label, and what each of its operations' slots enters.
+type KeyPlan = { key: Key, outer: List<Worded>, slots: List<SlotPlan> }
+
+/// Key `k` of a `handle` of `clauses` planned: a key on one resource enters the clause answering
+/// an operation there, or else the word around; one on every label, the first clause answering the
+/// operation in clause order where it answers every label, and otherwise a table of the clauses up
+/// to that one, then of the words around where no clause answers every label and those differ by
+/// label. A perform through a clause on every label so reads no table.
+fn key_planned(cx: Context, clauses: List<CodeClause>, k: Key) -> KeyPlan / {abort.raise} = {
+  let every = k.evidence.resource == RAny;
+  let outer = if !every { [] } else {
+    cx.words.fold(
+      { out: [], closed: false },
+      |acc: { out: List<Worded>, closed: Bool }, w: Worded|
+        if acc.closed || w.evidence.effect != k.evidence.effect { acc }
+        else { { out: acc.out.push(w), closed: w.evidence.resource == RAny } },
+    ).out
+  };
+  let plain = outer.len() == 0 || (outer.len() == 1 && outer.get(0).evidence.resource == RAny);
+  let answering = |op: Bytes|
+    range(0, clauses.len()).filter(|c: Int|
+      match clauses.at(c) {
+        Some(cl) ->
+          cl.op == op
+            && (match effect_named(cx, cl.effect) {
+              Some(en) -> en.global == k.evidence.effect,
+              None -> false,
+            })
+            && (every || clause_resource(cx, cl) == k.evidence.resource),
+        None -> false,
+      });
+  let on_every = |c: Int|
+    match clauses.at(c) { Some(cl) -> clause_resource(cx, cl) == RAny, None -> false };
+  let words = range(0, outer.len());
+  {
+    key: k,
+    outer: outer,
+    slots: k.effect.ops.map(|op: OpMode| {
+      let all = answering(op.name);
+      if !every { match all.at(0) { Some(c) -> ByClause(c), None -> ByWord } } else {
+        let reach = all.fold(
+          { out: [], closed: false },
+          |acc: { out: List<Int>, closed: Bool }, c: Int|
+            if acc.closed { acc } else { { out: acc.out.push(c), closed: on_every(c) } },
+        );
+        match reach.out.at(0) {
+          None -> if plain { ByWord } else { ByTable({ clauses: [], words: words }) },
+          Some(c) -> if on_every(c) { ByClause(c) }
+          else { ByTable({ clauses: reach.out, words: if reach.closed { [] } else { words } }) },
+        }
+      }
+    }),
   }
+}
+
+/// How many words the tables of the slots `kp` plans take in the instance: for each, its count,
+/// then a label, an entry and its environment per row.
+fn tables_of(kp: KeyPlan) -> Int =
+  kp.slots.fold(0, |n: Int, s: SlotPlan|
+    match s { ByTable(t) -> n + 1 + 3 * (t.clauses.len() + t.words.len()), _ -> n })
+
+/// The object for key `kp` laid over instance `i` after `st`, its tables from word `table` of the
+/// instance on: its operands the instance, the word its key is routed to around the `handle` (zero
+/// where no slot forwards to it), the words its tables forward to, then the labels the tables' rows
+/// answer.
+fn object_laid(
+  cx: Context,
+  st: Lowering,
+  clauses: List<CodeClause>,
+  i: { word: Arg, layout: HandleInstance, block: Option<Arg> },
+  kp: KeyPlan,
+  table: Int,
+  at: Span,
+) -> Lowered / {abort.raise} = {
+  // The word the key is routed to around the `handle`, where a slot forwards to it.
+  let routed_to = if kp.slots.any(|x: SlotPlan| x == ByWord) {
+    bridged(st, routed(cx, [{ evidence: kp.key.evidence, through: false }]), at)
+  } else { { st: st, args: [AZero(RImm)] } };
+  let first_label = 2 + kp.outer.len();
+  let clause_slot = |c: Int| {
+    let cl = clauses.get(c);
+    let mode = clause_mode(cx, cl);
+    Answering({ entry: entry_of(mode), record: i.layout.records.get(c), labelled: cl.binds_label })
+  };
+  // Each row's label as an operand, made where the label is named.
+  let labelled = |s: Lowering, labels: List<Arg>, r: Resource|
+    match r {
+      RAny -> { st: s, labels: labels, at: None },
+      RSingleton ->
+        { st: s, labels: labels.push(AInt(0 - 1)), at: Some(first_label + labels.len()) },
+      RVar(p) ->
+        { st: s, labels: labels.push(label_value(cx, p)), at: Some(first_label + labels.len()) },
+      RNamed(n) -> {
+        let l = label(cx, s, n, at);
+        { st: l.st, labels: labels.push(l.arg), at: Some(first_label + labels.len()) }
+      },
+    };
+  let laid = range(0, kp.slots.len()).fold(
+    { st: routed_to.st, labels: [], slots: [], table: table },
+    |acc: { st: Lowering, labels: List<Arg>, slots: List<Slot>, table: Int }, j: Int|
+      match kp.slots.get(j) {
+        ByClause(c) -> { ..acc, slots: acc.slots.push(clause_slot(c)) },
+        ByWord -> { ..acc, slots: acc.slots.push(Forwarding({ operand: 1, op: j })) },
+        ByTable(t) -> {
+          let by_clause = t.clauses.fold(
+            { st: acc.st, labels: acc.labels, rows: [] },
+            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedRow> }, c: Int| {
+              let l = labelled(r.st, r.labels, clause_resource(cx, clauses.get(c)));
+              {
+                st: l.st,
+                labels: l.labels,
+                rows: r.rows.push({ label: l.at, enters: clause_slot(c) }),
+              }
+            },
+          );
+          let by_word = t.words.fold(
+            by_clause,
+            |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedRow> }, w: Int| {
+              let l = labelled(r.st, r.labels, kp.outer.get(w).evidence.resource);
+              {
+                st: l.st,
+                labels: l.labels,
+                rows: r.rows.push({ label: l.at, enters: Forwarding({ operand: 2 + w, op: j }) }),
+              }
+            },
+          );
+          {
+            st: by_word.st,
+            labels: by_word.labels,
+            slots: acc.slots.push(Keyed({ table: acc.table, rows: by_word.rows })),
+            table: acc.table + 1 + 3 * by_word.rows.len(),
+          }
+        },
+      },
+  );
+  let outer = bridged(laid.st, kp.outer.map(|w: Worded| w.word), at);
+  let operands = [i.word].concat(routed_to.args).concat(outer.args).concat(laid.labels);
+  bound_as(
+    outer.st,
+    evidence_type(),
+    RImm,
+    Op({ op: OHandle(ObjectLaid(laid.slots)), args: operands, uses: reading(operands.len()) }),
+    at,
+  )
 }
 
 /// How a clause of the runtime's mode `mode` is entered from its slot.
 fn entry_of(mode: Int) -> Entry =
-  if mode == 3 { Raises } else if mode == 1 { Resumes } else { Answers }
+  if mode == 3 { Raises }
+  else if mode == 1 { Resumes }
+  else if mode == 2 { Stops(false) }
+  else if mode == 4 { Stops(true) }
+  else { Answers }
 
 /// Whether clause `c` may stop its `handle` with what it answers, which its instance then holds.
 fn may_stop(c: Clause) -> Bool = match entry_of(c.mode) { Resumes -> true, _ -> false }
@@ -606,53 +695,46 @@ fn clause_resource(cx: Context, cl: CodeClause) -> Resource =
   else if cl.resource == b"*" { RAny }
   else { RNamed(cl.resource) }
 
-/// How a `handle`'s body is laid out as a function of its own where it runs detached, on a stack of
-/// its own: no parameters, each slot it reads that is bound around it copied in at its own number;
-/// holding, since the runtime hands it none, the words the function around it holds, before them
-/// the frame bridge for what the `handle` answers. Nothing where it runs in place.
+/// How a detached `handle`'s body is laid out as a function of its own, run on a stack of its own:
+/// no parameters, each slot it reads that is bound around it copied in at its own number;
+/// answering what the `handle` answers, `answer`, since its landing ends it; holding, since the
+/// runtime hands it none, `own`, the `handle`'s objects, the words its forwarding block forwards
+/// to what is around it, and the instance its landing reads.
 pub fn body_frame(
   cx: Context,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
   plan: Planned,
-) -> Option<Frame> / {abort.raise} =
-  if !detaches(h.clauses) { None } else {
-    let inside = bound_in(h.body);
-    let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
-      if acc.contains(r) || inside.contains(r) { acc } else { acc.push(r) });
-    let bridge = match plan.bridge { Some(b) -> b, None -> AZero(RImm) };
-    Some({
-      params: 0,
-      size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
-      captures: reads.map(|r: Int| { src: r, dst: r }),
-      resumes: false,
-      body: h.body,
-      ty: None,
-      words: [],
-      held: {
-        words: match plan.framing {
-          Some(f) -> f.keys.concat(f.outer),
-          None ->
-            handle_keys(cx, h.clauses).map(
-              |k: { evidence: Evidence, effect: EffectName }|
-                { evidence: k.evidence, word: bridge, through: false, handled: true },
-            ).concat(
-              cx.words,
-            ),
-        },
-        instance: None,
-      },
-    })
+  own: List<Worded>,
+  answer: Type,
+) -> Frame = {
+  let inside = bound_in(h.body);
+  let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
+    if acc.contains(r) || inside.contains(r) { acc } else { acc.push(r) });
+  {
+    params: 0,
+    size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
+    captures: reads.map(|r: Int| { src: r, dst: r }),
+    resumes: false,
+    body: h.body,
+    ty: Some(fn_type([], answer, row_empty())),
+    words: [],
+    held: {
+      words: own.concat(match plan.forwarding { Some(f) -> f.outer, None -> [] }),
+      instance: Some({ word: plan.instance.word, vars: plan.instance.layout.vars }),
+      kept: cx.kept,
+    },
   }
+}
 
 /// The `handle` `h`, planned as `plan`, its body lowered to `body` (in a block of its own, or as a
-/// closure where `body_frame` says it runs detached), its clauses and return clause made: the
-/// clauses laid out over their closures and the labels they key on, for the runtime's frame or the
-/// instance, its body run under them, and what it answers, a word, held as the type it answers.
+/// closure where `body_frame` says it runs detached), its clauses' and return clause's closures
+/// made: the clauses laid out over their closures, its instance holding their records, its body
+/// run under them, and what it answers, a word, held as the type it answers.
 pub fn handled(
   cx: Context,
   st: Lowering,
   body: Lowered,
-  clauses: List<ClauseMade>,
+  clauses: List<Arg>,
   ret: Option<Arg>,
   h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
   plan: Planned,
@@ -673,7 +755,7 @@ pub fn handled(
         None -> acc,
         Some(cl) -> match clauses.at(i) {
           None -> acc,
-          Some(made) -> clause_laid(cx, acc, cl, made, at),
+          Some(closure) -> clause_laid(cx, acc, cl, closure, at),
         },
       },
   );
@@ -688,37 +770,32 @@ pub fn handled(
     Some(r) -> answer_of(type_of(r)),
     None -> if detached { answer_of(type_of(body.arg)) } else { type_of(body.arg) },
   };
-  // Over an instance the `handle` only reads its closures, whose counts are the body's to let go,
-  // and, where a clause may stop it, the descriptor of what it answers.
-  let site = match plan.instance {
-    None -> match plan.framing {
-      Some(f) ->
-        {
-          st: laid.st,
-          args: all.args.push(f.word),
-          takes: all.takes.push(false),
-          instance: None,
-          framing: Some(all.args.len()),
-        },
-      None -> { st: laid.st, args: all.args, takes: all.takes, instance: None, framing: None },
+  // The `handle` only reads its closures, whose counts are the body's to let go, and, where a
+  // clause may stop it, the descriptor of what it answers. A heap instance's block is read across
+  // the body, so it lives until the landing; a detached body's forwarding block is the runtime's
+  // once the body opens.
+  let i = plan.instance;
+  let held = all.args.push(i.word).concat(match i.block { Some(b) -> [b], None -> [] });
+  let forwarded = held.concat(match plan.forwarding { Some(f) -> [f.word], None -> [] });
+  let answer = if laid.clauses.any(may_stop) {
+    let d = type_described(cx, laid.st, ty, at);
+    { st: d.st, args: [d.arg] }
+  } else { { st: laid.st, args: [] } };
+  // The runtime takes a detached body's closure, and nothing else the `handle` holds.
+  let taken = forwarded.concat(answer.args);
+  let site = {
+    st: answer.st,
+    args: taken,
+    takes: range(0, taken.len()).map(|k: Int| all.at == Some(k)),
+    instance: {
+      ..i.layout,
+      operand: all.args.len(),
+      answer: if answer.args.len() == 0 { None } else { Some(forwarded.len()) },
+      heap: match i.block { Some(_) -> Some(all.args.len() + 1), None -> None },
     },
-    Some(i) -> {
-      let held = all.args.push(i.word);
-      let answer = if laid.clauses.any(may_stop) {
-        let d = type_described(cx, laid.st, ty, at);
-        { st: d.st, args: [d.arg] }
-      } else { { st: laid.st, args: [] } };
-      {
-        st: answer.st,
-        args: held.concat(answer.args),
-        takes: held.concat(answer.args).map(|_: Arg| false),
-        instance: Some({
-          ..i.layout,
-          operand: all.args.len(),
-          answer: if answer.args.len() == 0 { None } else { Some(held.len()) },
-        }),
-        framing: None,
-      }
+    detached: match ((all.at, plan.forwarding)) {
+      (Some(body), Some(_)) -> Some({ body: body, forwards: held.len() }),
+      _ -> None,
     },
   };
   let a = fresh(site.st, ty, RWord);
@@ -739,9 +816,8 @@ pub fn handled(
           site: {
             clauses: laid.clauses,
             ret: tail.at,
-            detached: all.at,
+            detached: site.detached,
             instance: site.instance,
-            framing: site.framing,
           },
           answer: a.var,
           unwind: [],
@@ -751,6 +827,69 @@ pub fn handled(
     },
   }
 }
+
+/// The landing ending the closure a detached `handle` `h`, planned as `plan`, runs its body in: the
+/// body lowered to `body` after `before`, inside the closure `cx` lowers, which holds the instance
+/// whose records the opener set; and what it answers, a word, held as `answer`, the type the
+/// `handle` answers.
+pub fn detached_landed(
+  cx: Context,
+  before: Lowering,
+  body: Lowered,
+  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  plan: Planned,
+  answer: Type,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match cx.instance {
+    Some(held) -> {
+      let i = plan.instance;
+      let inner = if !falls_through(body.st.insts) {
+        { outer: continued(before, body.st), block: body.st.insts, word: None }
+      } else {
+        let w = handed(body, RWord, at);
+        { outer: continued(before, w.st), block: w.st.insts, word: Some(w.arg) }
+      };
+      let a = fresh(inner.outer, answer, RWord);
+      if escapes(inner.block, false, false) {
+        refuse(a.st, Handling, b"a handle body that leaves other than by its end")
+      } else {
+        let out = emitted(
+          a.st,
+          Handle({
+            body: match inner.word {
+              Some(w) -> inner.block.push(Assign({ var: a.var, arg: w })),
+              None -> inner.block,
+            },
+            args: [held.word],
+            uses: { takes: [false], owned: true, fails: true, stops: false },
+            site: {
+              clauses: preset_clauses(cx, h.clauses),
+              ret: None,
+              detached: None,
+              instance: { ..i.layout, operand: 0, answer: None, heap: Some(0), preset: true },
+            },
+            answer: a.var,
+            unwind: [],
+          }),
+        );
+        handed({ st: out, arg: AVar(a.var) }, held_as(cx.setting, answer), at)
+      }
+    },
+    None -> refuse(before, Handling, b"a detached body holding no instance"),
+  }
+
+/// The clauses of `clauses` as a landing over an instance whose records are set reads them: each
+/// one's effect, operation and mode; it enters each through its record.
+fn preset_clauses(cx: Context, clauses: List<CodeClause>) -> List<Clause> / {abort.raise} =
+  clauses.map(|cl: CodeClause|
+    {
+      effect: match effect_named(cx, cl.effect) { Some(en) -> en.global, None -> cl.effect },
+      op: cl.op,
+      mode: clause_mode(cx, cl),
+      string: None,
+      handler: 0,
+    })
 
 /// A `parallel` block of the closures `branches`, which perform `performs`: the runtime runs them,
 /// at once where it may, handing each the words of that row, and the block answers the tuple of
@@ -874,45 +1013,34 @@ type Laid = {
   unknown: Option<Bytes>,
 }
 
-/// Clause `cl`, made as `made`, laid out after `acc`: its closure, then the label it keys on, then
-/// the descriptor of `String` where it binds the call site's label or answers `abort.raise`, each of
-/// which the runtime hands it as a `String`.
+/// Clause `cl`, its closure `closure`, laid out after `acc`: the closure, then the descriptor of
+/// `String` where it binds the call site's label or answers `abort.raise`, each of which its entry
+/// hands it as a `String`.
 fn clause_laid(
   cx: Context,
   acc: Laid,
   cl: CodeClause,
-  made: ClauseMade,
+  closure: Arg,
   at: Span,
 ) -> Laid / {abort.raise} =
   match effect_named(cx, cl.effect) {
     None -> { ..acc, unknown: match acc.unknown { Some(u) -> Some(u), None -> Some(cl.effect) } },
     Some(en) -> {
-      let keyed = match made.label {
-        Some(l) -> {
-          let k = handed({ st: acc.st, arg: l }, RInt, at);
-          { st: k.st, args: [k.arg] }
-        },
-        None -> { st: acc.st, args: [] },
-      };
-      // The runtime hands a clause a `String` as the label it binds or the message a raise carries.
       let stringed = cl.binds_label || (en.global == b"abort" && cl.op == b"raise");
       let bound = if stringed {
-        let d = type_described(cx, keyed.st, string_type(), at);
+        let d = type_described(cx, acc.st, string_type(), at);
         { st: d.st, args: [d.arg] }
-      } else { { st: keyed.st, args: [] } };
-      let at_label = acc.args.len() + 1 + keyed.args.len();
+      } else { { st: acc.st, args: [] } };
       {
         st: bound.st,
-        args: acc.args.push(made.closure).concat(keyed.args).concat(bound.args),
-        takes: acc.takes.push(true).concat(keyed.args.concat(bound.args).map(|_: Arg| false)),
+        args: acc.args.push(closure).concat(bound.args),
+        takes: acc.takes.push(true).concat(bound.args.map(|_: Arg| false)),
         clauses: acc.clauses.push({
           effect: en.global,
           op: cl.op,
-          resource: if made.label == None { cl.resource } else { b"" },
           mode: clause_mode(cx, cl),
-          string: if stringed { Some(at_label) } else { None },
+          string: if stringed { Some(acc.args.len() + 1) } else { None },
           handler: acc.args.len(),
-          label: if made.label == None { None } else { Some(acc.args.len() + 1) },
         }),
         unknown: acc.unknown,
       }

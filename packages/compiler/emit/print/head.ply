@@ -8,8 +8,8 @@ import compiler.emit.layout (MachineStruct, MachineField, head_structs, text_hea
                              tag_bits, header_bytes, frame_count)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Machine, natives, machine_structs, obj_struct, ctx_struct,
-                          release_depth, failed_target, failed_pending)
-import compiler.emit.tir.handling (raised_at)
+                          release_depth, failed_target, failed_pending, instance_head)
+import compiler.emit.tir.handling (raised_at, task_at)
 import compiler.emit.roots (builtin_helper)
 import compiler.cc (tail_mark)
 import compiler.emit.print.frames (chain_defined)
@@ -215,20 +215,27 @@ fn head_part() -> Bytes / {abort.raise} =
 /// entry and its environment per operation of its effect, or, where the flags are set, one that
 /// answers every operation, as the frame bridge does: `ply_slot` is operation `k`'s. `ply_perform`
 /// calls its entry with the operation's `op#`, its mode, the resource and the array of the
-/// arguments' words, which has a word to spare past them. A clause's slot has the clause's record in
-/// its `handle`'s instance as its environment: the clause's closure, the instance and the clause's
-/// place, counted from 1. `ply_answers` answers the perform with what the clause answers;
-/// `ply_resumes` hands the clause a continuation in the spare word, which records what it is
-/// resumed with, and a clause that did not resume unwinds to its instance with what it answered;
+/// arguments' words, which has two words to spare past them. A clause's slot has the clause's
+/// record in its `handle`'s instance as its environment: the clause's closure, the instance, the
+/// clause's place, counted from 1, and the descriptor of `String`. `ply_answers` answers the perform
+/// with what the clause answers; `ply_resumes` hands the clause a continuation in the first spare
+/// word, which records what it is resumed with, and a clause that did not resume unwinds to its
+/// instance with what it answered; their `_labelled` twins first hand a clause binding its label
+/// the perform's, as a `String`, in the first spare word, the continuation in the next;
 /// `ply_raises` leaves the raise's arguments in the instance and unwinds to it, whose landing runs
-/// the clause. Either first lets go, by `ply_held_let_go`, of what an unwind it replaces left in the
-/// instance. Both store where the perform stood in the context first (`ply_performed_here`), which
-/// is where a region's clause places what it asks. A perform a clause answers is recorded where the
-/// context arms recording; the runtime records no raise. `ply_instance_each` is the `each` of the frame record an instance holds its
-/// variables in: the place of its first and their count, then the instance. A framed `handle`'s own
-/// objects enter `ply_framed`, which hands the perform to the frame whose handler their environment
-/// holds, and a detached body's objects for what is around its `handle` enter `ply_forwarded`,
-/// which calls the same slot of the object the word their pair addresses holds now.
+/// the clause; `ply_stops` and `ply_stops_again` stop the detached body the instance is the `handle`
+/// of (`rt_detached_stop`), whose clause runs where the body was entered or resumed from. Either first lets go, by `ply_held_let_go`, of what an unwind it replaces left in the
+/// instance. A clause leaving an instance another task opened refuses instead
+/// (`rt_task_abandons`), letting go of what it answered or what the raise carried. The answering
+/// and resuming entries store where the perform stood in the context first (`ply_performed_here`),
+/// which is where a region's clause places what it asks. A perform a clause answers is recorded
+/// where the context arms recording; the runtime records no raise. A heap instance's block is held
+/// as a closure is, through `ply_instance_desc`, whose release lets go of its variables, what an
+/// unwind left in it and the clauses its records hold. `ply_instance_each` is the `each` of the
+/// frame record an instance holds its variables in: the place of its first and their count, then
+/// the instance. A detached body's objects for what is around its `handle` enter `ply_forwarded`,
+/// which calls the same slot of the object the word their pair addresses holds now. `ply_keyed` enters the first row of its table whose label is the
+/// perform's, and where none is, the entry's refusal.
 /// `ply_pending_raised` raises a raise left pending through word `w`, which through the frame bridge
 /// or an entry's refusal is the runtime's to raise again as the raise it is.
 fn entries_defined() -> Bytes =
@@ -271,6 +278,15 @@ fn entries_defined() -> Bytes =
     b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
     b"  return ply_uniform(ctx, e[0], (const Word *)(intptr_t)args);\n",
     b"}\n",
+    b"static Word ply_answers_labelled(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  Word *a = (Word *)(intptr_t)args;\n",
+    b"  ply_performed_here(ctx);\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  a[((const PlyOp *)(intptr_t)op)->params_len] = rt_label_string_p(ctx, res, e[3]);\n",
+    b"  if (ctx->failed) return 0;\n",
+    b"  return ply_uniform(ctx, e[0], a);\n",
+    b"}\n",
     b"static Word ply_resumed(PlyCtx *ctx, Word self, const Word *args) {\n",
     b"  Word *k = ply_words(self);\n",
     b"  ctx->entering_desc = 0; ctx->entering_words = 0;\n",
@@ -279,26 +295,52 @@ fn entries_defined() -> Bytes =
     b"}\n",
     b"static Word ply_resumed_kept(PlyCtx *ctx, Word self) { (void)ctx; (void)self; return 0; }\n",
     b"static const PlyFnDesc ply_resumed_desc = { ply_resumed, 0, 0, ply_resumed_kept, ply_resumed_kept, ply_resumed_kept };\n",
-    b"static Word ply_resumes(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
-    b"  const Word *e = (const Word *)(intptr_t)env;\n",
-    b"  Word *a = (Word *)(intptr_t)args;\n",
+    b"static Word ply_answer_abandoned(PlyCtx *ctx, Word op, const Word *in, Word r) {\n",
+    b"  ((const PlyType *)(intptr_t)in[3])->dec(ctx, r);\n",
+    b"  return rt_task_abandons_p(ctx, op);\n",
+    b"}\n",
+    b"static Word ply_raise_abandoned(PlyCtx *ctx, Word op, const Word *a) {\n",
+    b"  const PlyOp *o = (const PlyOp *)(intptr_t)op;\n",
+    b"  for (int64_t i = 0; i < o->params_len; i++) o->params[i]->dec(ctx, a[i]);\n",
+    b"  return rt_task_abandons_p(ctx, op);\n",
+    b"}\n",
+    b"static inline Word ply_resuming(PlyCtx *ctx, Word op, const Word *e, Word *a, int64_t at) {\n",
     b"  Word k[4] = { (Word)PLY_RC_FRAME, (Word)(intptr_t)&ply_resumed_desc, 0, 0 };\n",
-    b"  ply_performed_here(ctx);\n",
-    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
-    b"  a[((const PlyOp *)(intptr_t)op)->params_len] = (Word)(intptr_t)k;\n",
+    b"  a[at] = (Word)(intptr_t)k;\n",
     b"  Word r = ply_uniform(ctx, e[0], a);\n",
     b"  if (ctx->failed || k[3]) return ctx->failed ? 0 : r;\n",
     b"  Word *in = (Word *)(intptr_t)e[1];\n",
+    b"  if (in[",
+    ascii_of_int(task_at()),
+    b"] != ctx->task) return ply_answer_abandoned(ctx, op, in, r);\n",
     b"  if (in[1]) ply_held_let_go(ctx, in);\n",
     b"  in[1] = -1; in[2] = r;\n",
     b"  ctx->target = e[1]; ctx->failed = PLY_FAILED_TARGET;\n",
     b"  return 0;\n",
+    b"}\n",
+    b"static Word ply_resumes(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  ply_performed_here(ctx);\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  return ply_resuming(ctx, op, (const Word *)(intptr_t)env, (Word *)(intptr_t)args, ((const PlyOp *)(intptr_t)op)->params_len);\n",
+    b"}\n",
+    b"static Word ply_resumes_labelled(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  Word *a = (Word *)(intptr_t)args;\n",
+    b"  int64_t n = ((const PlyOp *)(intptr_t)op)->params_len;\n",
+    b"  ply_performed_here(ctx);\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  a[n] = rt_label_string_p(ctx, res, e[3]);\n",
+    b"  if (ctx->failed) return 0;\n",
+    b"  return ply_resuming(ctx, op, e, a, n + 1);\n",
     b"}\n",
     b"static Word ply_raises(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
     b"  const Word *e = (const Word *)(intptr_t)env;\n",
     b"  const Word *a = (const Word *)(intptr_t)args;\n",
     b"  Word *in = (Word *)(intptr_t)e[1];\n",
     b"  (void)mode; (void)res;\n",
+    b"  if (in[",
+    ascii_of_int(task_at()),
+    b"] != ctx->task) return ply_raise_abandoned(ctx, op, a);\n",
     b"  if (in[1]) ply_held_let_go(ctx, in);\n",
     b"  in[1] = e[2]; in[2] = op;\n",
     b"  for (int64_t i = 0; i < ((const PlyOp *)(intptr_t)op)->params_len; i++) in[",
@@ -307,14 +349,57 @@ fn entries_defined() -> Bytes =
     b"  ctx->target = e[1]; ctx->failed = PLY_FAILED_TARGET;\n",
     b"  return 0;\n",
     b"}\n",
-    b"static Word ply_framed(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
-    b"  return rt_dispatch_at_p(ctx, *(const Word *)(intptr_t)env, op, res, mode, args);\n",
+    b"static Word ply_stopping(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args, Word again) {\n",
+    b"  const Word *e = (const Word *)(intptr_t)env;\n",
+    b"  const Word *in = (const Word *)(intptr_t)e[1];\n",
+    b"  if (in[",
+    ascii_of_int(task_at()),
+    b"] != ctx->task) return ply_raise_abandoned(ctx, op, (const Word *)(intptr_t)args);\n",
+    b"  ply_performed_here(ctx);\n",
+    b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
+    b"  return rt_detached_stop_p(ctx, env, op, res, args, again);\n",
+    b"}\n",
+    b"static Word ply_stops(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  return ply_stopping(ctx, env, op, mode, res, args, 0);\n",
+    b"}\n",
+    b"static Word ply_stops_again(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  return ply_stopping(ctx, env, op, mode, res, args, 1);\n",
     b"}\n",
     b"static Word ply_forwarded(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
     b"  const Word *r = (const Word *)(intptr_t)env;\n",
     b"  const Word *s = ply_slot(*(const Word *)(intptr_t)r[0], r[1]);\n",
     b"  return ((PlyEntry)(intptr_t)s[0])(ctx, s[1], op, mode, res, args);\n",
     b"}\n",
+    b"static Word ply_keyed(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  const Word *t = (const Word *)(intptr_t)env;\n",
+    b"  for (int64_t i = 0; i < t[0]; i++) {\n",
+    b"    const Word *r = t + 1 + 3 * i;\n",
+    b"    if (r[0] == res || r[0] == -2) return ((PlyEntry)(intptr_t)r[1])(ctx, r[2], op, mode, res, args);\n",
+    b"  }\n",
+    b"  return ply_perform(ctx, ctx->unserved, 0, op, mode, res, args);\n",
+    b"}\n",
+    b"static Word ply_instance_called(PlyCtx *ctx, Word self, const Word *args) { (void)ctx; (void)self; (void)args; return 0; }\n",
+    b"static Word ply_instance_kept(PlyCtx *ctx, Word self) { (void)ctx; (void)self; return 0; }\n",
+    b"static Word ply_instance_released(PlyCtx *ctx, Word self) {\n",
+    b"  Word *w = ply_words(self);\n",
+    b"  Word *in = w + ",
+    ascii_of_int(instance_head().words),
+    b";\n",
+    b"  if (in[1]) ply_held_let_go(ctx, in);\n",
+    b"  for (int64_t j = 0; j < w[",
+    ascii_of_int(instance_head().vars + 1),
+    b"]; j++) { const PlyType *t = (const PlyType *)(intptr_t)in[w[",
+    ascii_of_int(instance_head().vars),
+    b"] + 2 * j + 1]; if (t) t->dec(ctx, in[w[",
+    ascii_of_int(instance_head().vars),
+    b"] + 2 * j]); }\n",
+    b"  for (int64_t j = 0; j < w[3]; j++) { Word f = in[w[2] + 4 * j]; if (f && ply_last(ctx, f)) ((const PlyFnDesc *)(intptr_t)ply_words(f)[0])->release(ctx, f); }\n",
+    b"  ply_free(ctx, self, PLY_HEADER + 8 * (",
+    ascii_of_int(instance_head().words),
+    b" + w[1]));\n",
+    b"  return 0;\n",
+    b"}\n",
+    b"static const PlyFnDesc ply_instance_desc = { ply_instance_called, 0, 0, ply_instance_released, ply_instance_kept, ply_instance_kept };\n",
     b"static void ply_instance_each(PlyCtx *ctx, Word *s, int64_t d) {\n",
     b"  const Word *in = s + 2;\n",
     b"  for (int64_t i = 0; i < s[1]; i++) {\n",
@@ -639,7 +724,7 @@ test "a release takes the count, the last one dropping the block, and a checked 
 
 test "a raise or a stop at an instance lets go of what an unwind it replaces left there, then writes" {
   let h = head_part();
-  [b"ply_raises", b"ply_resumes"].fold((), |_: Unit, f: Bytes| {
+  [b"ply_raises", b"ply_resuming"].fold((), |_: Unit, f: Bytes| {
     let body = defined_in(h, f);
     let first = match ((body.index_of(b"ply_held_let_go(ctx, in)"), body.index_of(b"in[1] = "))) {
       (Some(freed), Some(written)) -> freed < written,

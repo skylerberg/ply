@@ -8,7 +8,7 @@ import compiler.emit.keys (RootKey, FnArg, Named, Root, Generic, LawPart, LawGua
                            KeyType, Evidence)
 import compiler.check.types (RSingleton)
 import compiler.emit.tir (OHandle)
-import compiler.emit.tir.handling (Bridge, Perform)
+import compiler.emit.tir.handling (Bridge, Perform, InstanceHeap)
 import compiler.emit.reps (filings_at, BoundLambda, has_vars)
 import compiler.emit.typing (no_filings, unknown_type)
 import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MCase, Var, Arg, AVar,
@@ -17,7 +17,7 @@ import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MC
                           Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
                           Closure, Declined, Family, Spine, Data, Calling, Matching, Handling,
                           Scalars, Containers, RNum, TInt, TRange, Convention, Lambda, Lent, Given,
-                          Plain, rep_of_arg, MFramed)
+                          Plain, Handle, rep_of_arg, MFramed)
 import compiler.emit.tir.calling (ConstantRead, Ticked)
 import compiler.emit.tir.containers (Rest)
 import compiler.emit.lower (lowered_fn, lowered_group)
@@ -301,6 +301,51 @@ fn closure_of(f: Fn, nth: Int) -> Option<{ body: Fn, captures: Int }> =
     Some(Closure(c)) -> Some({ body: c.body, captures: c.captures }),
     None -> None,
   }
+
+/// Every `let` of `b`, and of each `handle`'s body inside it.
+fn lets_handled(b: Block) -> List<{ var: Var, val: Val }> =
+  b.fold([], |acc: List<{ var: Var, val: Val }>, i: Inst|
+    match i {
+      Let(l) -> acc.push({ var: l.var, val: l.val }),
+      Handle(h) -> acc.concat(lets_handled(h.body)),
+      _ -> acc,
+    })
+
+test "a handle where a task may be spawned lays its instance on the heap, which the closure the spawn is handed holds" {
+  let src = Bytes::concat_all([
+    b"effect note {\n  write say(n: Int) -> Unit\n}\n",
+    b"fn sayer() -> Int / {abort.raise, sim.read} = simulate { handle { let t = task.spawn(|| { note.say(1); 2 }); task.join(t) } with { note.say(n) -> () } }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lowered_as_built(p, b"sayer") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> {
+        let lets = f.lambdas.fold(
+          lets_handled(f.body),
+          |acc: List<{ var: Var, val: Val }>, l: Lambda|
+            match l { Closure(c) -> acc.concat(lets_handled(c.body.body)) },
+        );
+        let blocks = lets.filter(|x: { var: Var, val: Val }|
+          match x.val {
+            Op(o) -> match o.op { OHandle(InstanceHeap(_)) -> true, _ -> false },
+            _ -> false,
+          });
+        assert_eq(blocks.len(), 1);
+        // A closure is made holding the block: the one the spawn is handed.
+        assert(
+          lets.any(|x: { var: Var, val: Val }|
+            match x.val {
+              Make(m) ->
+                m.args.any(|a: Arg| blocks.any(|b: { var: Var, val: Val }| a == AVar(b.var))),
+              _ -> false,
+            }),
+          None,
+        )
+      },
+    },
+  }
+}
 
 test "a call of a definition hands its arguments as the callee carries them" {
   match form(b"twice") {

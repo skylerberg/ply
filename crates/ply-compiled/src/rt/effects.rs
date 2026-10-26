@@ -74,9 +74,28 @@ pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClaus
 
 /// The label a clause written `[*t]` reads, lifted through the `String` type its `handle` site
 /// handed; 0 with the context failed where it does not lift.
-fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
+pub(crate) fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
     let label = Value::Str(Arc::from(label.as_str()));
     lifted(ctx, &label, string).map_or(0, Handed::word)
+}
+
+/// The label the field-table entry `resource` names, lifted through `string`, the type of `String`:
+/// what a clause written `[*t]` is handed beside its arguments. 0 with the context failed where it
+/// names no label or does not lift.
+pub unsafe extern "C" fn rt_label_string(
+    ctx: *mut Ctx,
+    resource: I64,
+    string: *const PlyType,
+) -> Handed {
+    let c = unsafe { &mut *ctx };
+    let Some(label) = usize::try_from(resource.0)
+        .ok()
+        .and_then(|i| c.tables.fields.get(i))
+        .cloned()
+    else {
+        return Handed::of(c.fail(error("a clause on every label was performed at no label")));
+    };
+    Handed::of(label_word(ctx, unsafe { &*string }, &label))
 }
 
 /// A `handle` whose clause resumes off the tail: `body`, a nullary closure, runs on its own stack.
@@ -110,6 +129,40 @@ pub unsafe extern "C" fn rt_handle_forwarded(
     let body = unsafe { std::mem::transmute::<Block, Word>(body) };
     let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
     Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, Some(forwards)) })
+}
+
+/// The body of a `handle` whose objects enter its clauses, `body` a nullary closure, run on a stack
+/// of its own until it stops or ends, its landing its own; answers the `handle`'s value. Takes the
+/// body and `forwards`, the block forwarding what is around the `handle`, and holds `instance`, the
+/// instance's counted block, once more.
+pub unsafe extern "C" fn rt_detached_open(
+    ctx: *mut Ctx,
+    body: Block,
+    forwards: Block,
+    instance: Block,
+) -> Handed {
+    let body = unsafe { std::mem::transmute::<Block, Word>(body) };
+    let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
+    let instance = unsafe { std::mem::transmute::<Block, Word>(instance) };
+    let forwards = (forwards != 0).then_some(forwards);
+    Handed::of(unsafe { crate::detached::open_over(ctx, body, forwards, instance) })
+}
+
+/// The perform of the operation `op` describes, on the field-table entry `resource` and with the
+/// words at `args`, which this takes, answered off its tail by the clause whose record is at
+/// `record`: the `handle`'s body stops there, and the clause runs where it was entered or resumed
+/// from, which may resume it more than once where `again`. Answers what the body is resumed with.
+pub unsafe extern "C" fn rt_detached_stop(
+    ctx: *mut Ctx,
+    record: *const Word,
+    op: *const PlyOp,
+    resource: I64,
+    args: *const Handed,
+    again: I64,
+) -> Handed {
+    let described = unsafe { &*op };
+    let args = args_of(args.cast(), described.params_len).to_vec();
+    Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0, again.0 != 0) })
 }
 
 /// The `k` a clause is handed where it resumes on the tail: one immortal block holding nothing but
@@ -579,6 +632,15 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
             0
         }
     }
+}
+
+/// Refuses a clause leaving an instance another task opened, the operation `op` describes performed
+/// in a task: what it would leave is the spawner's, not the task's. 0 with the context failed.
+pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Word {
+    let c = unsafe { &mut *ctx };
+    let (effect, name) = named_op(c, unsafe { &*op });
+    let site = c.site();
+    c.fail(err_task_abandoned(&effect, &name, site))
 }
 
 /// A task's perform answered by a clause, of a `handle` around its spawn, that stopped the body

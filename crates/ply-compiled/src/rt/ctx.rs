@@ -58,6 +58,9 @@ pub struct Ctx {
     pub performed_root: i64,
     pub performed_start: i64,
     pub performed_end: i64,
+    /// The task running, 0 for a region's root and outside any region: what an instance records as
+    /// it opens, which only that task may leave.
+    pub task: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
@@ -246,6 +249,7 @@ impl Ctx {
             performed_root: -1,
             performed_start: 0,
             performed_end: 0,
+            task: 0,
             step_budget: 0,
             grown: 0,
             deadline: None,
@@ -373,6 +377,8 @@ impl Ctx {
         b.id = self.id;
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
+        // A branch runs in the task its block is in.
+        b.task = self.task;
         b.stacks[0].list = self.crossing_frames();
         // What a branch performed is this entry's, read wherever this entry's is.
         b.traced = self.recording != 0;
