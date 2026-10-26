@@ -569,8 +569,7 @@ pub(super) fn raise_from_perform(
     } else if at.is_some() {
         Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
     } else {
-        c.host_runtime().unanswered(effect, op);
-        // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
+        // Only a raise no frame answers is shown what it carried: one a clause takes is not read.
         let carried: Vec<Plain> = raised_values(c, &args)
             .iter()
             .map(|v| v.as_ref().map_or(Plain::Elided(0), Plain::shown))
@@ -599,10 +598,7 @@ pub(super) fn raise_from_perform(
             args.release();
             c.pend(d, message)
         }
-        None => {
-            args.release();
-            c.fail(d)
-        }
+        None => c.pend_raised(d, effect.clone(), op.clone(), args),
     }
 }
 
@@ -620,8 +616,12 @@ pub unsafe extern "C" fn rt_pending_raised(
     if c.failed != FAILED_PENDING {
         return Handed::of(0);
     }
-    let Some(message) = c.pending.take() else {
-        return Handed::of(0);
+    let message = match c.pending.take() {
+        Some(Unanswered::Abort(message)) => message,
+        other => {
+            c.pending = other;
+            return Handed::of(0);
+        }
     };
     c.failed = 0;
     let diagnostic = c.diagnostic.take();
@@ -634,6 +634,36 @@ pub unsafe extern "C" fn rt_pending_raised(
     }
     let message = Value::str(message);
     lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+}
+
+/// The words of the raise [`FAILED_PENDING`] stands for, where it is a raise of the effect and
+/// operation the field-table entries `effect` and `op` name and not `abort.raise`, the entry no
+/// longer failed: for compiled code to hand the clause that answers it, which takes them. The array
+/// has a word to spare past them and lasts until the next such raise. 0 with the entry failed as it
+/// was otherwise.
+pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I64) -> Handed {
+    let c = unsafe { &mut *ctx };
+    if c.failed != FAILED_PENDING {
+        return Handed::of(0);
+    }
+    let named = |s: &Symbol, i: I64| c.tables.fields.get(i.0 as usize) == Some(s);
+    let ours = match &c.pending {
+        Some(Unanswered::Raised {
+            effect: e, op: o, ..
+        }) => named(e, effect) && named(o, op),
+        _ => false,
+    };
+    if !ours {
+        return Handed::of(0);
+    }
+    let Some(Unanswered::Raised { args, .. }) = c.pending.take() else {
+        unreachable!("the pending raise was just read");
+    };
+    c.failed = 0;
+    c.diagnostic = None;
+    c.pending_words = args.handed();
+    c.pending_words.push(0);
+    Handed::of(c.pending_words.as_ptr() as Word)
 }
 
 /// A `simulate` region emitted code wrote: `body` is a closure block, which this takes,
@@ -701,14 +731,12 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
     if let Some(f) = &mine {
         f.land(c);
     }
-    // A raise the runtime left pending that nothing inside the frame took is the frame's where a
-    // clause of it answers `abort.raise`.
+    // A raise left pending that nothing inside the frame took is the frame's where a clause of it
+    // answers it.
     if c.failed == FAILED_PENDING
         && let Some(f) = &mine
-        && let Some(clause) = f
-            .clauses
-            .iter()
-            .position(|cl| cl.answers_raise("abort", "raise"))
+        && let Some(clause) =
+            (c.pending.as_ref()).and_then(|p| f.clauses.iter().position(|cl| p.answered_by(cl)))
     {
         let string = f.clauses[clause].string;
         c.bind_pending((stack, depth, clause), string);

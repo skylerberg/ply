@@ -105,9 +105,9 @@ pub unsafe extern "C" fn rt_with_cleanup(
     let unwinding = c.unwind.take();
     let raising = c.aborting.take();
     let target = c.target;
-    let pending = c.pending.take().map(|message| {
+    let pending = c.pending.take().map(|raise| {
         let failure = c.diagnostic.take();
-        c.keep(Kept::Pending(message, failure))
+        c.keep(Kept::Pending(raise, failure))
     });
     c.failed = 0;
     let entered = crate::simulate::shield(c, Shield::Release);
@@ -141,13 +141,16 @@ pub unsafe extern "C" fn rt_with_cleanup(
         _ => unreachable!("a cleanup keeps the raise it runs during"),
     });
     let pending = pending.map(|here| match c.kept_back(here) {
-        Kept::Pending(message, failure) => (message, failure),
+        Kept::Pending(raise, failure) => (raise, failure),
         _ => unreachable!("a cleanup keeps the pending raise it runs during"),
     });
     let cancelled = crate::simulate::unshield(c, entered);
     if c.failed != 0 || cancelled {
         if let Some(raise) = raising {
             raise.into_failure();
+        }
+        if let Some((raise, _)) = pending {
+            raise.release();
         }
         if let Some(a) = answered {
             a.release(ctx);
@@ -164,8 +167,8 @@ pub unsafe extern "C" fn rt_with_cleanup(
     c.unwind = unwinding;
     c.aborting = raising;
     c.target = target;
-    if let Some((message, diagnostic)) = pending {
-        c.pending = Some(message);
+    if let Some((raise, diagnostic)) = pending {
+        c.pending = Some(raise);
         c.diagnostic = diagnostic;
     }
     answered.map_or(Handed::of(0), Carried::handed)
@@ -180,7 +183,8 @@ fn cancel_carried(c: &mut Ctx) {
     if let Some(raise) = c.aborting.take() {
         raise.into_failure();
     }
-    if c.pending.take().is_some() {
+    if let Some(raise) = c.pending.take() {
+        raise.release();
         c.diagnostic = None;
     }
     c.failed = FAILED_CANCELLED;

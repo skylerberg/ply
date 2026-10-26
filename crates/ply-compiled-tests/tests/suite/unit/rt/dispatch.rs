@@ -129,6 +129,29 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
     ctx.end();
 }
 
+type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
+
+#[test]
+fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation() {
+    let mut ctx = naming(&["m", "boom", "other"]);
+    ctx.begin(1_000);
+    let payload = boxed(&mut ctx, 42);
+    dispatch(&mut ctx, &op(&BOXES), 2, &[payload]);
+    assert_ne!(ctx.failed, 0, "the raise left the entry failed");
+    let at = helper::<PendingAt>("rt_pending_raised_at");
+    // A clause of another operation does not take it.
+    assert_eq!(unsafe { at(&mut ctx, 0, 2) }, 0);
+    assert_ne!(ctx.failed, 0);
+    // The clause of its own takes what it carries, the entry no longer failed.
+    let words = unsafe { at(&mut ctx, 0, 1) } as *const Word;
+    assert!(!words.is_null());
+    assert_eq!(ctx.failed, 0);
+    assert_eq!(unsafe { *words }, payload);
+    unsafe { box_dec(&mut ctx, payload) };
+    assert_eq!(ctx.heap.live(), 0);
+    ctx.end();
+}
+
 #[test]
 fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
     let mut ctx = naming(&["abort", "raise"]);

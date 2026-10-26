@@ -110,8 +110,11 @@ pub struct Ctx {
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
     pub(crate) aborting: Option<Aborting>,
-    /// The message of the raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
-    pub(crate) pending: Option<String>,
+    /// The raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
+    pub(crate) pending: Option<Unanswered>,
+    /// The words of the raise `rt_pending_raised_at` last handed compiled code, with a word to
+    /// spare past them, as a perform's arguments have.
+    pub(crate) pending_words: Vec<Word>,
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
@@ -139,7 +142,47 @@ pub struct Ctx {
 pub(crate) struct BranchFailure {
     code: i64,
     diagnostic: Option<Diagnostic>,
-    pending: Option<String>,
+    pending: Option<Unanswered>,
+}
+
+/// A raise no frame answers, left for the code around the failure, whose innermost `handle`
+/// answering it takes it: `abort.raise` of a message, or another raise with what it carries.
+pub(crate) enum Unanswered {
+    Abort(String),
+    Raised {
+        effect: Symbol,
+        op: Symbol,
+        args: Raised,
+    },
+}
+
+impl Unanswered {
+    /// Lets go of what the raise carries.
+    pub(crate) fn release(self) {
+        if let Unanswered::Raised { args, .. } = self {
+            args.release();
+        }
+    }
+
+    /// The same raise, what it carries held once more.
+    pub(crate) fn copied(&self) -> Unanswered {
+        match self {
+            Unanswered::Abort(message) => Unanswered::Abort(message.clone()),
+            Unanswered::Raised { effect, op, args } => Unanswered::Raised {
+                effect: effect.clone(),
+                op: op.clone(),
+                args: args.copied(),
+            },
+        }
+    }
+
+    /// Whether `clause` answers this raise.
+    pub(super) fn answered_by(&self, clause: &FrameClause) -> bool {
+        match self {
+            Unanswered::Abort(_) => clause.answers_raise("abort", "raise"),
+            Unanswered::Raised { effect, op, .. } => clause.answers_raise(effect, op),
+        }
+    }
 }
 
 thread_local! {
@@ -225,6 +268,7 @@ impl Ctx {
             unwind: None,
             aborting: None,
             pending: None,
+            pending_words: Vec::new(),
             traced: false,
             resumed: None,
             handlers_made: 0,
@@ -410,6 +454,8 @@ impl Ctx {
         if self.failed == 0 {
             self.failed = f.code;
             self.pending = f.pending;
+        } else if let Some(p) = f.pending {
+            p.release();
         }
         if self.diagnostic.is_none() {
             self.diagnostic = f.diagnostic;
@@ -461,7 +507,9 @@ impl Ctx {
         self.holds_made = 0;
         self.unwind = None;
         self.aborting = None;
-        self.pending = None;
+        if let Some(p) = self.pending.take() {
+            p.release();
+        }
         self.resumed = None;
         self.release_depth = 0;
         self.release_waiting = 0;
@@ -544,6 +592,9 @@ impl Ctx {
     pub fn end(&mut self) {
         // A region left open lets go of the values its tasks passed while the entry's heap lives.
         drop(std::mem::take(&mut self.sims));
+        if let Some(p) = self.pending.take() {
+            p.release();
+        }
         crate::detached::teardown(self);
         debug_assert!(
             self.release_later.is_empty() && self.release_depth == 0,
@@ -686,7 +737,7 @@ impl Ctx {
         };
         let (stack, depth, clause) = at;
         let string = self.stacks[stack].list[depth].clauses[clause].string;
-        self.pending = Some(message);
+        self.pending = Some(Unanswered::Abort(message));
         self.fail_with(FAILED_PENDING, d);
         self.bind_pending(at, string);
         0
@@ -701,18 +752,36 @@ impl Ctx {
         if self.failed != 0 {
             return 0;
         }
-        self.pending = Some(message);
+        self.pending = Some(Unanswered::Abort(message));
         self.fail_with(FAILED_PENDING, d)
     }
 
-    /// Binds the raise left pending to the clause at `at` of a frame, which takes the message as
-    /// emitted code lays a `String`, lifted through `string`, the type its `handle` site handed.
+    /// Fails as the raise of `effect.op` carrying `args`, which no frame answers, left pending as
+    /// [`Ctx::pend`] leaves `abort.raise`. Takes `args`.
+    pub(crate) fn pend_raised(
+        &mut self,
+        d: Diagnostic,
+        effect: Symbol,
+        op: Symbol,
+        args: Raised,
+    ) -> i64 {
+        if self.failed != 0 {
+            args.release();
+            return 0;
+        }
+        self.pending = Some(Unanswered::Raised { effect, op, args });
+        self.fail_with(FAILED_PENDING, d)
+    }
+
+    /// Binds the raise left pending to the clause at `at` of a frame, which answers it: one of
+    /// `abort.raise` takes the message as emitted code lays a `String`, lifted through `string`,
+    /// the type its `handle` site handed; any other what the raise carries.
     pub(super) fn bind_pending(
         &mut self,
         at: (usize, usize, usize),
         string: Option<&'static PlyType>,
     ) {
-        let Some(message) = self.pending.take() else {
+        let Some(raise) = self.pending.take() else {
             return;
         };
         let diagnostic = self
@@ -720,6 +789,21 @@ impl Ctx {
             .take()
             .unwrap_or_else(|| self.placed(error("a raise was left pending without a failure")));
         self.failed = 0;
+        let (stack, depth, clause) = at;
+        let message = match raise {
+            Unanswered::Abort(message) => message,
+            Unanswered::Raised { args, .. } => {
+                self.aborting = Some(Aborting {
+                    stack,
+                    depth,
+                    clause,
+                    args,
+                    diagnostic,
+                });
+                self.failed = FAILED_ABORT;
+                return;
+            }
+        };
         let Some(ty) = string else {
             self.fail(
                 error("an `abort.raise` clause emitted code installed has no `String` type")
@@ -730,7 +814,6 @@ impl Ctx {
         let Some(w) = lifted(self, &Value::str(message), ty) else {
             return;
         };
-        let (stack, depth, clause) = at;
         self.aborting = Some(Aborting {
             stack,
             depth,
@@ -887,6 +970,15 @@ impl Ctx {
     }
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
+        // A raise left pending is over once its failure is taken: what it carries goes back, and
+        // the host hears of one nothing answered, which may end the run its way.
+        match self.pending.take() {
+            Some(Unanswered::Raised { effect, op, args }) => {
+                self.host_runtime().unanswered(&effect, &op);
+                args.release();
+            }
+            Some(Unanswered::Abort(_)) | None => {}
+        }
         self.diagnostic
             .take()
             .or_else(|| self.aborting.take().map(|a| a.diagnostic))

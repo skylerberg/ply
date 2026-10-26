@@ -600,7 +600,9 @@ unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Opt
                 return Err(None);
             }
             // A raise nothing in the task answers fails the task, as one no frame answered did.
-            c.pending = None;
+            if let Some(raise) = c.pending.take() {
+                raise.release();
+            }
             let failure = c.diagnostic.take().unwrap_or_else(|| {
                 Diagnostic::error(codes::INTERNAL_ERROR, "a task failed without a diagnostic")
             });

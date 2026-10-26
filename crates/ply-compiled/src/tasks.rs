@@ -9,7 +9,7 @@ use crate::heap::Word;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{
     Aborting, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, FAILED_UNWIND,
-    drop_frame, lent, no_stack_to_take, switch_keeping,
+    Unanswered, drop_frame, lent, no_stack_to_take, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
@@ -62,7 +62,7 @@ pub enum Shield {
 struct Stashed {
     failed: i64,
     diagnostic: Option<Diagnostic>,
-    pending: Option<String>,
+    pending: Option<Unanswered>,
     unwind: Option<(usize, usize, Word)>,
     aborting: Option<Aborting>,
     target: Word,

@@ -247,7 +247,7 @@ pub(crate) enum Kept {
     /// The raise a `bracket`'s release runs during.
     Raising(Aborting),
     /// The pending raise a `bracket`'s release runs during, and the failure it carries.
-    Pending(String, Option<Diagnostic>),
+    Pending(Unanswered, Option<Diagnostic>),
     /// The arguments a clause emitted code made is called with, which it takes as it is entered.
     Args(Vec<Word>),
 }
@@ -263,7 +263,8 @@ impl Kept {
             Kept::Raising(a) => {
                 a.into_failure();
             }
-            Kept::Pending(..) | Kept::Args(_) => {}
+            Kept::Pending(raise, _) => raise.release(),
+            Kept::Args(_) => {}
         }
     }
 }
@@ -325,7 +326,7 @@ impl StackCopy {
                 ),
                 Kept::Landing(f) => Kept::Landing(frame(f)),
                 Kept::Raising(a) => Kept::Raising(a.copied()),
-                Kept::Pending(message, failure) => Kept::Pending(message.clone(), failure.clone()),
+                Kept::Pending(raise, failure) => Kept::Pending(raise.copied(), failure.clone()),
                 Kept::Args(words) => Kept::Args(words.clone()),
             })
             .collect();
@@ -366,7 +367,7 @@ pub(crate) struct Aborting {
 pub(crate) struct Raised(pub(crate) Vec<Carried>);
 
 impl Raised {
-    fn copied(&self) -> Raised {
+    pub(super) fn copied(&self) -> Raised {
         let ctx = running();
         Raised(self.0.iter().map(|v| v.dup(ctx)).collect())
     }

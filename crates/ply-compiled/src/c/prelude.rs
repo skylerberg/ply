@@ -357,6 +357,7 @@ helpers! {
         args: *const Handed
     ) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
+    rt_pending_raised_at(effect: I64, op: I64) -> Handed;
     rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
     rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
     rt_handle_install_at(clauses: *const Word, n: I64, ret: Handed, cell: Out) -> I64;
