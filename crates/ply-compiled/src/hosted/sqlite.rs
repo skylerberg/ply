@@ -313,7 +313,7 @@ pub unsafe extern "C" fn rt_sqlite_backup(
         let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
             return I64(0);
         };
-        let job = databases.backup(root, conn.0, path.to_string(), c.id, c.site());
+        let job = databases.backup(root, conn.0, path.to_string(), c.site());
         waited(c, "sqlite_backup", what, job)
     })
 }

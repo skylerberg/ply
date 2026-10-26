@@ -332,22 +332,11 @@ fn production() -> Sched {
 }
 
 #[test]
-fn a_hermetic_binding_mints_no_permit() {
-    let hermetic = HostBinding::hermetic_with(registry());
-    assert!(hermetic.is_hermetic());
+fn an_unbound_binding_mints_no_permit() {
     assert!(
-        HostPolicy::of(&hermetic).is_none(),
-        "a hermetic binding minted a permit for the production scheduler"
+        HostPolicy::of(&HostBinding::unbound()).is_none(),
+        "an unbound binding minted a permit for the production scheduler"
     );
-    assert_eq!(
-        hermetic.would_serve(&Symbol::new("task"), &Symbol::new("spawn"), None),
-        Some("ply_host::sched::spawn"),
-        "the refusal has no handler path to name"
-    );
-}
-
-#[test]
-fn the_default_binding_is_the_one_that_refuses() {
     assert!(HostPolicy::of(&HostBinding::default()).is_none());
 }
 
@@ -700,7 +689,7 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
     );
 }
 
-/// Through the runtime the host itself builds, which is what a `--host` run retires against.
+/// Through the runtime the host itself builds, which is what a bound run retires against.
 #[test]
 fn a_retired_tasks_open_span_is_closed_abandoned_at_retirement() {
     let sink = Arc::new(Recording::new(Level::Debug));

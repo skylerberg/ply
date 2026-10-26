@@ -62,7 +62,7 @@ fn a_granted_binding_resolves_by_name_and_says_why_it_serves_nothing() {
     lent.register_withheld(
         op("db", "get", named("users")),
         Arc::new(Never),
-        "under `--host`",
+        "under `ply run`",
     );
     for registered in [
         op("db", "get", HostResource::Any),
@@ -74,7 +74,7 @@ fn a_granted_binding_resolves_by_name_and_says_why_it_serves_nothing() {
     lent.register_withheld(
         op("db", "put", HostResource::Any),
         Arc::new(Never),
-        "under `--host`",
+        "under `ply run`",
     );
     let binding = lent.granted(Grants::default()).expect("nothing conflicts");
     assert_eq!(
@@ -104,29 +104,17 @@ fn a_granted_binding_resolves_by_name_and_says_why_it_serves_nothing() {
         resolved(&binding, "store.db", "put", Some("users")),
         Err(Unserved::Withheld {
             path: "test::handler",
-            served: "under `--host`"
+            served: "under `ply run`"
         })
     );
 }
 
 #[test]
-fn a_hermetic_binding_serves_nothing_and_names_what_would() {
-    let binding = HostBinding::hermetic_with(registry(vec![op("db", "get", HostResource::Any)]));
-    assert!(binding.is_hermetic());
+fn an_unbound_binding_serves_nothing() {
+    let binding = HostBinding::unbound();
+    assert!(!binding.is_granted());
     assert_eq!(
         resolved(&binding, "db", "get", Some("users")),
-        Err(Unserved::Hermetic("test::handler"))
-    );
-    assert_eq!(
-        binding.would_serve(
-            &Symbol::new("db"),
-            &Symbol::new("get"),
-            Some(&Symbol::new("users"))
-        ),
-        Some("test::handler")
-    );
-    assert_eq!(
-        resolved(&binding, "net", "send", None),
         Err(Unserved::Unregistered)
     );
 }

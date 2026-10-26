@@ -241,12 +241,6 @@ impl HostRegistry {
         self.entries.push((op, handler));
     }
 
-    /// Every registration withheld, each refused where an operation reaches it as served `served`.
-    pub fn withheld_all(mut self, served: &'static str) -> HostRegistry {
-        self.withheld = (0..self.entries.len()).map(|at| (at, served)).collect();
-        self
-    }
-
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -336,7 +330,7 @@ pub struct Bound<'a> {
 pub struct HostBinding {
     entries: Vec<(HostOp, Arc<dyn HostHandler>)>,
     withheld: BTreeMap<usize, &'static str>,
-    /// Resolves by name against `entries`; a hermetic binding resolves nothing.
+    /// Whether a run's grants made it; an unbound one serves nothing.
     granted: bool,
     grants: Grants,
 }
@@ -380,7 +374,7 @@ impl Grants {
 
 impl Default for HostBinding {
     fn default() -> HostBinding {
-        HostBinding::hermetic()
+        HostBinding::unbound()
     }
 }
 
@@ -395,22 +389,20 @@ impl fmt::Debug for HostBinding {
 }
 
 impl HostBinding {
-    pub fn hermetic() -> HostBinding {
-        HostBinding::hermetic_with(HostRegistry::new())
-    }
-
-    /// A binding that serves none of `registry`, and names each registration a perform reaches.
-    pub fn hermetic_with(registry: HostRegistry) -> HostBinding {
+    /// What a context entered with no binding has: it serves nothing past the program's own
+    /// handlers, and opens no production region.
+    pub fn unbound() -> HostBinding {
         HostBinding {
-            entries: registry.entries,
-            withheld: registry.withheld,
+            entries: Vec::new(),
+            withheld: BTreeMap::new(),
             granted: false,
             grants: Grants::default(),
         }
     }
 
-    pub fn is_hermetic(&self) -> bool {
-        !self.granted
+    /// Whether a run's grants made this binding.
+    pub fn is_granted(&self) -> bool {
+        self.granted
     }
 
     /// What the run this binding serves is lent.
@@ -437,9 +429,6 @@ impl HostBinding {
         let Some((first, (registered, _))) = matching.next() else {
             return Err(Unserved::Unregistered);
         };
-        if !self.granted {
-            return Err(Unserved::Hermetic(registered.path));
-        }
         let withheld = |index: &usize| self.withheld.get(index).copied();
         match withheld(&first) {
             None => Ok(Bound {
@@ -454,18 +443,6 @@ impl HostBinding {
                     served,
                 }),
         }
-    }
-
-    /// The path of the first registration for `effect.op[resource]`, withheld or not.
-    pub fn would_serve(
-        &self,
-        effect: &Symbol,
-        op: &Symbol,
-        resource: Option<&Symbol>,
-    ) -> Option<&'static str> {
-        self.matching(effect, op, resource)
-            .next()
-            .map(|(_, (candidate, _))| candidate.path)
     }
 
     /// Each registration for `effect.op[resource]`, by its place among the registrations.
@@ -493,8 +470,6 @@ impl HostBinding {
 pub enum Unserved {
     /// No registration is for it.
     Unregistered,
-    /// The binding is hermetic, and `path` would serve it under `--host`.
-    Hermetic(&'static str),
     /// Each registration for it is withheld from this run; `served` says where a run does bind
     /// the first, `path`.
     Withheld {
@@ -566,7 +541,7 @@ pub const RESERVED_CODES: [&str; 17] = [
     codes::HOST_OPERATION_UNKNOWN,
     codes::HOST_HANDLER_CONFLICT,
     codes::HOST_DETERMINISM_MISMATCH,
-    codes::HERMETIC_BOUNDARY,
+    codes::HOST_UNBOUND,
     codes::HOST_IN_SIMULATION,
     codes::HOST_CONTINUATION_RESUMED,
     codes::HOST_FOOTPRINT_ESCAPE,
@@ -733,17 +708,14 @@ fn err_no_clock(what: &str) -> Diagnostic {
 
 #[cold]
 #[inline(never)]
-pub fn err_hermetic(span: Span, operation: &str, path: &'static str) -> Diagnostic {
+pub fn err_unbound(span: Span, operation: &str) -> Diagnostic {
     Diagnostic::error(
-        codes::HERMETIC_BOUNDARY,
-        format!("`{operation}` reached the host boundary in a hermetic run"),
+        codes::HOST_UNBOUND,
+        format!("`{operation}` reached the host boundary in a run bound to no host"),
     )
-    .primary(span, "no handler here, and no host handler is bound")
-    .note("a hermetic run binds simulated handlers and refuses the real ones")
-    .note(format!(
-        "handle `{operation}` in the program, or run with `--host`"
-    ))
-    .note(format!("`{path}` would serve this under `--host`"))
+    .primary(span, "no handler here, and no host is bound")
+    .note("an entry made with no binding, as `hermetic_machine` makes one, serves only what the program handles")
+    .note(format!("handle `{operation}` in the program"))
 }
 
 #[cold]
@@ -761,7 +733,7 @@ pub fn err_withheld(
         .map(|(module, _)| module.to_string())
         .unwrap_or_else(|| effect.to_string());
     Diagnostic::error(
-        codes::HERMETIC_BOUNDARY,
+        codes::HOST_UNBOUND,
         format!("`{operation}` reached the host boundary in a run that binds no handler for it"),
     )
     .primary(span, "no handler here, and this run bound none")

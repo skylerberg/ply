@@ -2,7 +2,7 @@
 --
 --     $ createdb service
 --     $ psql -d service -f examples/service.sql
---     $ ply run examples/service.ply --host --config-schema service.config \
+--     $ ply run examples/service.ply --config-schema service.config \
 --         --set SERVICE_API_KEY=… --set SERVICE_DATABASE=postgres://localhost/service
 --
 -- **This file is not the authority and must not become one.** `schema()` in

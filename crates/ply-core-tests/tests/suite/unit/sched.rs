@@ -1596,8 +1596,8 @@ fn a_simulated_region_is_seeded_by_construction() {
 }
 
 #[test]
-fn a_hermetic_binding_mints_no_permit() {
-    assert!(HostPolicy::of(&HostBinding::hermetic()).is_none());
+fn an_unbound_binding_mints_no_permit() {
+    assert!(HostPolicy::of(&HostBinding::unbound()).is_none());
     assert!(HostPolicy::of(&HostBinding::default()).is_none());
     assert!(HostPolicy::of(&binding()).is_some());
 }

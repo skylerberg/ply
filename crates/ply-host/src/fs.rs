@@ -1,10 +1,11 @@
 //! The filesystem, as operations confined to roots the run names.
 
+use crate::observe::Recorder;
 use crate::pool::{JobOutput, MAX_BLOCKING_OPERATIONS, Pool, option, record};
 use ply_core::crypto::Framing;
 use ply_core::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
-    HostRuntime, Linearity, MachineId,
+    HostRuntime, Linearity,
 };
 use ply_core::{Diagnostic, Resource, Span, Symbol, Value, codes};
 use std::collections::{BTreeMap, BTreeSet};
@@ -429,7 +430,7 @@ impl HostHandler for Operation {
         let op = self.op;
         let held = Arc::clone(&self.fs.held);
         let descriptors = Arc::clone(&self.fs.descriptors);
-        let machine = req.machine;
+        let recorder = crate::observe::of(rt);
         let to_write = matches!(second, Second::Opening(how) if how != Opening::Read);
         let pending = self.fs.pool.submit(
             asking,
@@ -438,7 +439,9 @@ impl HostHandler for Operation {
             op.what(),
             Box::new(move || {
                 let done = run(op, &root, &first, second, &held, &descriptors, span);
-                observed(op, &root, &first, &done, to_write, machine);
+                if let Some(recorder) = &recorder {
+                    observed(op, &root, &first, &done, to_write, recorder);
+                }
                 done
             }),
         )?;
@@ -936,33 +939,35 @@ fn mode_value(bits: u32) -> Value {
     ])
 }
 
-/// What `op` read of the world or wrote to it, for the record of the test whose machine asked. Taken
-/// after the operation, so a directory `temp_dir` made is known by the name it got. `to_write` is
-/// whether an open asked to write.
-fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, to_write: bool, machine: MachineId) {
-    use crate::observe::{Read, read, wrote};
+/// What `op` read of the world or wrote to it, entered into the record of the test whose run asked.
+/// Taken after the operation, so a directory `temp_dir` made is known by the name it got.
+/// `to_write` is whether an open asked to write.
+fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, to_write: bool, into: &Recorder) {
+    use crate::observe::Read;
     if matches!(done, JobOutput::Refused(_)) {
         return;
     }
     // The path as the program named it: where a link in it leads is read again when the record is.
     let target = root.join(path);
+    let read = |how: Read| into.read(how, &target);
+    let wrote = |at: &Path| into.wrote(at);
     match op {
         Op::ReadFile | Op::ReadSecret | Op::ReadAt | Op::FileSize | Op::Mode | Op::ReadLink => {
-            read(machine, Read::File, &target)
+            read(Read::File)
         }
-        Op::ListDir => read(machine, Read::Dir, &target),
-        Op::Walk | Op::Scan => read(machine, Read::Tree, &target),
+        Op::ListDir => read(Read::Dir),
+        Op::Walk | Op::Scan => read(Read::Tree),
         Op::Stat => {
-            read(machine, Read::Kind, &target);
-            read(machine, Read::File, &target)
+            read(Read::Kind);
+            read(Read::File)
         }
-        Op::Kind | Op::Resolved | Op::Exists | Op::Canonical => read(machine, Read::Kind, &target),
+        Op::Kind | Op::Resolved | Op::Exists | Op::Canonical => read(Read::Kind),
         // A stamp is when, not what; a sync and a lock change nothing a read answers; and the room a
         // file system has is the machine's, as the clock is.
         Op::ModifiedMs | Op::Sync | Op::Lock | Op::Unlock | Op::Space => {}
         // What an open file is read or written through is recorded when it opens.
-        Op::Open if to_write => wrote(machine, &target),
-        Op::Open => read(machine, Read::File, &target),
+        Op::Open if to_write => wrote(&target),
+        Op::Open => read(Read::File),
         Op::ReadChunk | Op::WriteChunk | Op::Close => {}
         Op::WriteFile
         | Op::WriteSecret
@@ -975,10 +980,10 @@ fn observed(op: Op, root: &Path, path: &str, done: &JobOutput, to_write: bool, m
         | Op::Symlink
         | Op::Link
         | Op::Rename
-        | Op::Copy => wrote(machine, &target),
+        | Op::Copy => wrote(&target),
         Op::TempDir => {
             if let JobOutput::MaybeString(Some(made)) = done {
-                wrote(machine, &root.join(made))
+                wrote(&root.join(made))
             }
         }
     }

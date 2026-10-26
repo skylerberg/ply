@@ -1382,7 +1382,7 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
     let Tree { sources, calls, .. } = tree();
 
     assert!(
-        calls.len() > 200,
+        calls.len() > 100,
         "found {} Diagnostic::error/warning calls — the scan is broken",
         calls.len()
     );

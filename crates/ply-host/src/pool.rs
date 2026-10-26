@@ -3,6 +3,7 @@
 //! run's answers, kept or abandoned, never wake another's wait. Every pool mints from one count of
 //! tokens.
 
+use crate::observe::Recorder;
 use crate::stdio::SecretLine;
 use ply_core::{Diagnostic, Pending, Span, Symbol, Value, codes};
 use std::collections::{HashMap, VecDeque};
@@ -90,10 +91,11 @@ impl Bell {
 /// submission until the run takes its answer. The run holds this, and each operation's job holds it
 /// weakly, so the answer of a job that finishes after its run has ended is dropped, and what an
 /// ended run left goes with it. The lines its jobs read for a `Secret` are kept here too, until the
-/// run takes them or its entry point ends.
+/// run takes them or its entry point ends, and so is the record a test's reads are entered into.
 pub struct Run {
     held: Mutex<HashMap<u64, Held>>,
     secrets: Mutex<Secrets>,
+    recorder: Mutex<Option<Arc<Recorder>>>,
     bell: Arc<Bell>,
 }
 
@@ -120,12 +122,23 @@ impl Run {
         Arc::new(Run {
             held: Mutex::new(HashMap::new()),
             secrets: Mutex::new(Secrets::default()),
+            recorder: Mutex::new(None),
             bell,
         })
     }
 
     pub fn bell(&self) -> &Arc<Bell> {
         &self.bell
+    }
+
+    /// What the run read is entered into `recorder` from now on.
+    pub fn records_into(&self, recorder: Arc<Recorder>) {
+        *lock(&self.recorder) = Some(recorder);
+    }
+
+    /// The record what the run reads is entered into, where it is observed.
+    pub fn recorder(&self) -> Option<Arc<Recorder>> {
+        lock(&self.recorder).clone()
     }
 
     /// Keeps `line` for this run under a number no other line of it is kept under, answered.

@@ -209,10 +209,38 @@ test/nondet "a kept answer is not taken once a pass it took no longer stands" {
     "import std.fs (fs)\n\ntest/nondet \"reads its data\" {\n  assert(fs.read_file[cwd](\"data.txt\") != None)\n}\n",
   );
   write("data.txt", "one");
-  let flags = ["--host", "--fs", "cwd=."];
+  let flags = ["--fs", "cwd=."];
   let _ = tested(flags);
   let _ = tested(flags);
   assert(reused(tested(flags)), None);
+  write("data.txt", "two");
+  let moved = tested(flags);
+  assert(!reused(moved), Some(shown(moved)));
+  assert(int(path(moved, ["selection", "selected"])) == 1, Some(shown(moved)))
+}
+
+// A read is recorded by the handler that answers it, so one a test answers itself is no part of
+// its pass.
+test/nondet "a read a test handles itself is not recorded, and a pass stands until a file it read moves" {
+  program(
+    \\import std.fs (fs)
+    \\
+    \\test/nondet "reads one file and answers the other itself" {
+    \\  let canned = handle { fs.read_file[cwd]("handled.txt") } with {
+    \\    fs.read_file[cwd](p) -> Some(b"canned"),
+    \\  };
+    \\  assert_eq(canned, Some(b"canned"));
+    \\  assert(fs.read_file[cwd]("data.txt") != None)
+    \\}
+    \\
+  );
+  write("data.txt", "one");
+  write("handled.txt", "one");
+  let flags = ["--fs", "cwd=."];
+  let _ = tested(flags);
+  let _ = tested(flags);
+  write("handled.txt", "two");
+  assert(reused(tested(flags)), Some("a file only the test's own handler named moved its pass"));
   write("data.txt", "two");
   let moved = tested(flags);
   assert(!reused(moved), Some(shown(moved)));
@@ -736,13 +764,13 @@ test "the environment decides colour as its conventions say, and a flag outranks
   })
 }
 
-test "test --json carries schema version six and a ranked suspect object" {
+test "test --json carries schema version seven and a ranked suspect object" {
   scratch(|| {
     program(red());
     let r = on_disk(["test", "--json"]);
     assert(r.code == 1, Some(said(r)));
     let v = json_of(r);
-    assert(int(at(v, "schema_version")) == 6, Some(shown(v)));
+    assert(int(at(v, "schema_version")) == 7, Some(shown(v)));
     let f = nth(at(v, "failures"), 0);
     assert(str(at(f, "key")) == "m.balance never goes negative", Some(shown(f)));
     assert(str(at(f, "name")) == "balance never goes negative", Some(shown(f)));
@@ -941,72 +969,59 @@ test "a run reports how many tests cannot disturb another" {
 
 // --- The binding --------------------------------------------------------------
 
-test "test is hermetic without the flag and says which binding it used" {
+/// Whether the isolated, shared and host buckets of a run's selection partition its tests.
+fn partitioned(v: Json) -> Bool / {abort.raise} = {
+  let s = at(v, "selection");
+  int(at(s, "isolated")) + int(at(s, "shared")) + int(at(s, "host")) == int(at(s, "total"))
+}
+
+test "a suite no test of which reaches the host prints no binding and reports one it reached nothing of" {
   scratch(|| {
     program(green());
     let v = tested([]);
-    assert(str(at(v, "binding")) == "hermetic", Some(shown(v)));
     assert(int(path(v, ["hosts", "operations"])) == 0, Some(shown(v)));
     assert(str(path(v, ["hosts", "digest"])).starts_with("b3:"), Some(shown(v)));
-    // Nothing is bound, so no test can reach a host handler.
     assert(int(path(v, ["selection", "host"])) == 0, Some(shown(v)));
+    assert(partitioned(v), Some(shown(v)));
     items(path(v, ["selection", "tests"])).fold((), |u: Unit, t: Json| {
       assert(at(t, "host") == json::Bool(false), Some(shown(t)));
       assert(str(at(t, "isolation")) != "host", Some(shown(t)))
-    })
+    });
+    let text = stdout(on_disk(["test", "--no-cache"]));
+    assert(!text.contains("binding host"), Some(text))
   })
 }
 
-test/nondet "--host changes the binding a run reports" {
-  program(green());
-  let v = tested(["--host"]);
+test/nondet "a suite whose tests reach the host says so in the summary a person reads" {
+  program(
+    \\import std.fs (fs)
+    \\
+    \\test/nondet "reads its data" { assert(fs.read_file[cwd]("data.txt") != None) }
+    \\
+    \\test "adds" { assert_eq(1 + 1, 2) }
+    \\
+  );
+  write("data.txt", "one");
+  let v = tested(["--no-cache", "--fs", "cwd=."]);
   assert(truth(at(v, "ok")), Some(shown(v)));
-  assert(str(at(v, "binding")) == "host", Some(shown(v)));
-  let s = at(v, "selection");
-  assert(
-    int(at(s, "isolated")) + int(at(s, "shared")) + int(at(s, "host")) == int(at(s, "total")),
-    Some("the three buckets have to partition the tests: " ++ shown(s)),
-  )
-}
-
-test/nondet "a host run says so in the summary a person reads" {
-  program(green());
-  let bound = on_disk(["test", "--host"]);
+  assert(int(path(v, ["selection", "host"])) == 1, Some(shown(v)));
+  assert(partitioned(v), Some(shown(v)));
+  let bound = on_disk(["test", "--no-cache", "--fs", "cwd=."]);
   assert(bound.code == 0, Some(said(bound)));
+  assert(stdout(bound).contains("host 1 of 2"), Some(stdout(bound)));
   assert(stdout(bound).contains("cached by what each read"), Some(stdout(bound)));
-  assert(stdout(bound).contains("binding host"), Some(stdout(bound)));
-  // And silent when nothing was asked for.
-  let hermetic = stdout(on_disk(["test"]));
-  assert(!hermetic.contains("binding host"), Some(hermetic))
-}
-
-test/nondet "explain never reports more isolation under --host than without it" {
-  program(green());
-  let counts = |extra: List<String>| {
-    let v = tested(["--explain", "--no-cache"].concat(extra));
-    { isolated: int(path(v, ["selection", "isolated"])), host: int(path(v, ["selection", "host"])) }
-  };
-  let hermetic = counts([]);
-  let bound = counts(["--host"]);
-  assert(
-    bound.isolated + bound.host <= hermetic.isolated + bound.host
-      && bound.isolated <= hermetic.isolated,
-    Some(
-      "isolated grew under --host: " ++ hermetic.isolated.to_string() ++ " -> "
-        ++ bound.isolated.to_string(),
-    ),
-  )
+  assert(stdout(bound).contains("binding host"), Some(stdout(bound)))
 }
 
 // If a binding moved a hash, a row or an E0412 verdict, every cache would split on a flag.
 test/nondet "a binding changes nothing the front end computes" {
   program(green());
   assert(stdout(on_disk(["hash", "--json"])) == stdout(on_disk(["hash", "--json"])), None);
-  let hermetic = tested(["--no-cache"]);
-  let bound = tested(["--no-cache", "--host"]);
+  let bare = tested(["--no-cache"]);
+  let bound = tested(["--no-cache", "--exec", "echo=/bin/echo", "--fs", "cwd=."]);
   let hashes = |v: Json| items(path(v, ["selection", "tests"])).map(|t: Json| at(t, "hash"));
-  assert(hashes(hermetic) == hashes(bound), None);
-  assert(path(hermetic, ["selection", "total"]) == path(bound, ["selection", "total"]), None)
+  assert(hashes(bare) == hashes(bound), None);
+  assert(path(bare, ["selection", "total"]) == path(bound, ["selection", "total"]), None)
 }
 
 // A test is no process: it may start and drive the programs `--exec` names, and nothing else of
@@ -1032,13 +1047,13 @@ test/nondet "a test run binds what --exec names and withholds the rest of proces
     \\test/nondet "writes a line" { said() }
     \\
   );
-  let v = tested(["--host", "--exec", "echo=/bin/echo"]);
+  let v = tested(["--exec", "echo=/bin/echo"]);
   assert(status_of(v, "spawns echo") == "passed", Some(shown(v)));
   assert(status_of(v, "starts echo and waits for it") == "passed", Some(shown(v)));
   assert(status_of(v, "writes a line") == "failed", Some(shown(v)));
   assert(str(path(nth(at(v, "failures"), 0), ["diagnostic", "code"])) == "E0424", Some(shown(v)));
   // Without `--exec`, the label is unbound, and the refusal says how to bind it.
-  let bare = stdout(on_disk(["test", "--host", "--filter", "spawns"]));
+  let bare = stdout(on_disk(["test", "--filter", "spawns"]));
   assert(bare.contains("no executable is bound to it"), Some(bare));
   assert(bare.contains("--exec echo="), Some(bare))
 }
@@ -1057,10 +1072,10 @@ test/nondet "a test asks which labels its run bound" {
     \\test/nondet "cc is not bound" { assert(!cc_bound()) }
     \\
   );
-  let granted = tested(["--host", "--exec", "echo=/bin/echo"]);
+  let granted = tested(["--exec", "echo=/bin/echo"]);
   assert(status_of(granted, "echo is bound") == "passed", Some(shown(granted)));
   assert(status_of(granted, "cc is not bound") == "passed", Some(shown(granted)));
-  let bare = tested(["--host", "--no-cache"]);
+  let bare = tested(["--no-cache"]);
   assert(status_of(bare, "echo is bound") == "failed", Some(shown(bare)));
   assert(status_of(bare, "cc is not bound") == "passed", Some(shown(bare)));
   assert(
@@ -1071,7 +1086,7 @@ test/nondet "a test asks which labels its run bound" {
 
 test/nondet "a family the program does not declare is refused to a test run" {
   program(green());
-  let r = on_disk(["test", "--json", "--host", "--allow", "machine"]);
+  let r = on_disk(["test", "--json", "--allow", "machine"]);
   assert(r.code == 2, Some(said(r)));
   assert(code_of(json_of(r)) == "E0459", Some(said(r)))
 }

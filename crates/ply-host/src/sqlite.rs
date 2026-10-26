@@ -15,7 +15,6 @@
 use crate::fs::{Roots, confine};
 use crate::jobs::Job;
 use crate::native::{found, int, int_of, parts, parts_of};
-use crate::observe::{self, Read};
 use ply_core::host::MachineId;
 use ply_core::sqlite::{Control, Engine, Failure, Limits, Mode, Options, Reply, Scalar, unopened};
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
@@ -232,7 +231,6 @@ impl SqliteHost {
         root: PathBuf,
         id: i64,
         path: String,
-        machine: MachineId,
         span: Span,
     ) -> Result<Job, Diagnostic> {
         let to = placed(&root, &path, span)?;
@@ -240,11 +238,7 @@ impl SqliteHost {
         Ok(Box::new(move || {
             let reply = match to {
                 Some(to) if std::fs::symlink_metadata(&to).is_err() => {
-                    let reply = reply_of(&connections, &root, id, Ask::Backup(to.clone()));
-                    if reply.failure.is_none() {
-                        observe::wrote(machine, &to);
-                    }
-                    reply
+                    reply_of(&connections, &root, id, Ask::Backup(to))
                 }
                 _ => Reply::failed(Failure::new(
                     "exists",
@@ -483,15 +477,6 @@ fn opened(
                 "",
                 "the connection's thread ended as it opened",
             ));
-        }
-    }
-    if mode == Mode::ReadOnly {
-        observe::read(machine, Read::File, target);
-        observe::read(machine, Read::File, &beside("-wal"));
-    } else {
-        observe::wrote(machine, target);
-        for suffix in SIDE_FILES {
-            observe::wrote(machine, &beside(suffix));
         }
     }
     let mut held = lock(connections);

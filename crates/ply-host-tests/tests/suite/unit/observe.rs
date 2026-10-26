@@ -1,6 +1,6 @@
-use ply_core::host::MachineId;
-use ply_host::observe::{self, Binary, Read, World};
+use ply_host::observe::{self, Binary, Read, Recorder, World};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 fn module(name: &str) -> Option<String> {
     match name {
@@ -12,7 +12,7 @@ fn module(name: &str) -> Option<String> {
 
 fn world<'a>(roots: &'a [(String, PathBuf)], binding: &str) -> World<'a> {
     World {
-        roots: Some(roots),
+        roots,
         binding: binding.to_string(),
         binary: Binary {
             shipped: &module,
@@ -25,12 +25,12 @@ fn rooted(dir: &Path) -> Vec<(String, PathBuf)> {
     vec![("cwd".to_string(), dir.to_path_buf())]
 }
 
-fn stands(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
-    observe::moved(trace, world, machine).is_none()
+fn stands(trace: &str, world: &World<'_>) -> bool {
+    observe::moved(trace, world, None).is_none()
 }
 
-fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> bool {
-    observe::moved(trace, world, machine).is_some()
+fn moved(trace: &str, world: &World<'_>) -> bool {
+    observe::moved(trace, world, None).is_some()
 }
 
 fn lines(trace: &str) -> Vec<&str> {
@@ -46,24 +46,21 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
     std::fs::create_dir(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join("src/a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &dir.path().join("src/a.ply"));
-    observe::read(m, Read::Dir, &dir.path().join("src"));
-    observe::wrote(m, &dir.path().join("out"));
-    observe::read(m, Read::File, &dir.path().join("out/b.ply"));
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &dir.path().join("src/a.ply"));
+    recorder.read(Read::Dir, &dir.path().join("src"));
+    recorder.wrote(&dir.path().join("out"));
+    recorder.read(Read::File, &dir.path().join("out/b.ply"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
     // What it wrote is its own: reading it back is no input.
     assert_eq!(lines(&trace), ["dir\tcwd\tsrc\t", "file\tcwd\tsrc/a.ply\t"]);
-    let probe = MachineId::next();
-    assert!(stands(&trace, &world(&roots, "b"), probe));
+    assert!(stands(&trace, &world(&roots, "b")));
     std::fs::write(dir.path().join("src/b.ply"), b"new").unwrap();
-    assert!(moved(&trace, &world(&roots, "b"), probe));
+    assert!(moved(&trace, &world(&roots, "b")));
     std::fs::remove_file(dir.path().join("src/b.ply")).unwrap();
     std::fs::write(dir.path().join("src/a.ply"), b"two").unwrap();
     assert_eq!(
-        observe::moved(&trace, &world(&roots, "b"), probe),
+        observe::moved(&trace, &world(&roots, "b"), None),
         Some("the file `src/a.ply` under `cwd`".to_string())
     );
 }
@@ -76,18 +73,16 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
     std::fs::write(pkg.join("a.ply"), b"a").unwrap();
     std::fs::write(pkg.join("left over"), b"by another test").unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
+    let recorder = Recorder::default();
     // Listed, emptied of what was left there, and written into.
-    observe::read(m, Read::Dir, &pkg);
-    observe::read(m, Read::Tree, &pkg);
+    recorder.read(Read::Dir, &pkg);
+    recorder.read(Read::Tree, &pkg);
     std::fs::remove_file(pkg.join("left over")).unwrap();
-    observe::wrote(m, &pkg.join("left over"));
+    recorder.wrote(&pkg.join("left over"));
     std::fs::create_dir(pkg.join(".cache")).unwrap();
     std::fs::write(pkg.join(".cache/entry"), b"kept").unwrap();
-    observe::wrote(m, &pkg.join(".cache/entry"));
+    recorder.wrote(&pkg.join(".cache/entry"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(
         lines(&trace),
         [
@@ -95,14 +90,13 @@ fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
             "tree\tcwd\tpkg\t.cache/entry\u{1f}left over"
         ]
     );
-    let probe = MachineId::next();
     // Another run leaves something else there, which this one would have removed.
     std::fs::write(pkg.join("left over"), b"by yet another").unwrap();
     std::fs::write(pkg.join(".cache/entry"), b"moved").unwrap();
-    assert!(stands(&trace, &world(&roots, "b"), probe));
+    assert!(stands(&trace, &world(&roots, "b")));
     // A module added beside the ones it read is not its own.
     std::fs::write(pkg.join("b.ply"), b"b").unwrap();
-    assert!(moved(&trace, &world(&roots, "b"), probe));
+    assert!(moved(&trace, &world(&roots, "b")));
 }
 
 #[test]
@@ -112,43 +106,33 @@ fn a_trace_reads_the_same_from_another_directory_under_the_same_root() {
     for dir in [one.path(), other.path()] {
         std::fs::write(dir.join("a.ply"), b"same").unwrap();
     }
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &one.path().join("a.ply"));
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &one.path().join("a.ply"));
     let trace = observe::finished(&recorder, &world(&rooted(one.path()), "b"), false).unwrap();
-    observe::end(&recorder);
-    assert!(stands(
-        &trace,
-        &world(&rooted(other.path()), "b"),
-        MachineId::next()
-    ));
+    assert!(stands(&trace, &world(&rooted(other.path()), "b")));
 }
 
 #[test]
 fn a_run_that_reached_the_host_stands_for_its_binding_alone() {
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    let trace = observe::finished(&recorder, &world(&[], "hosted"), true).unwrap();
-    observe::end(&recorder);
+    let recorder = Recorder::default();
+    let trace = observe::finished(&recorder, &world(&[], "lent"), true).unwrap();
     assert_eq!(lines(&trace), ["binding"]);
-    assert!(stands(&trace, &world(&[], "hosted"), m));
-    assert!(moved(&trace, &world(&[], "hermetic"), m));
+    assert!(stands(&trace, &world(&[], "lent")));
+    assert!(moved(&trace, &world(&[], "lent another root")));
 }
 
 #[test]
 fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::shipped(m, "std.list");
-    observe::shipped(m, "std.gone");
-    observe::program(m);
+    let recorder = Recorder::default();
+    recorder.shipped("std.list");
+    recorder.shipped("std.gone");
+    recorder.ran_program();
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(
         trace,
         "program\tprogram digest\nshipped\tstd.gone\tnone\nshipped\tstd.list\tlist digest\n"
     );
-    assert!(stands(&trace, &world(&[], "b"), m));
+    assert!(stands(&trace, &world(&[], "b")));
     let another = World {
         binary: Binary {
             shipped: &module,
@@ -157,7 +141,7 @@ fn shipped_modules_and_the_program_are_held_at_the_binary_s_digests() {
         ..world(&[], "b")
     };
     assert_eq!(
-        observe::moved(&trace, &another, m),
+        observe::moved(&trace, &another, None),
         Some("the `ply` program".to_string())
     );
 }
@@ -171,23 +155,21 @@ fn a_read_through_a_resolved_root_is_of_the_shipped_modules_laid_out_behind_a_li
     std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
     observe::laid_out(&dir.path().join("link/shipped"), Vec::new());
     let real = real.canonicalize().unwrap();
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &real.join("shipped/std.list.ply"));
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &real.join("shipped/std.list.ply"));
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
     // A data file a module embeds lies below them under its name, and no view stands for it.
-    observe::read(m, Read::File, &real.join("shipped/std/words/list.txt"));
-    observe::reached(m, VIEW, true);
+    recorder.read(Read::File, &real.join("shipped/std/words/list.txt"));
+    recorder.reached(VIEW, true);
     let embedding = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert_eq!(
         embedding,
         "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd/words/list.txt\twords digest\n"
     );
     // What lies beside them is the program's.
-    observe::read(m, Read::File, &real.join("shipped/stamps"));
+    recorder.read(Read::File, &real.join("shipped/stamps"));
     let stamped = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert!(
         stamped.starts_with("program\tprogram digest\n"),
         "{stamped}"
@@ -199,38 +181,33 @@ const VIEW: &str =
 
 #[test]
 fn a_view_stands_for_one_whole_read_of_the_modules_it_names() {
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::shipped(m, "std.list");
-    observe::shipped(m, "std.list");
-    observe::reached(m, VIEW, true);
+    let recorder = Recorder::default();
+    recorder.shipped("std.list");
+    recorder.shipped("std.list");
+    recorder.reached(VIEW, true);
     // Never read of the binary: a caller handed the load its own text.
-    observe::reached(m, "shipform\tstd.handed\tt\tf\n", true);
+    recorder.reached("shipform\tstd.handed\tt\tf\n", true);
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     // The second read had no view of its own, so it holds the whole module.
     assert_eq!(
         trace,
         "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd.list\tlist digest\n"
     );
-    observe::reached(m, VIEW, true);
+    recorder.reached(VIEW, true);
     let viewed = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert!(!viewed.contains("shipped\t"));
 }
 
 #[test]
 fn a_view_of_a_load_already_read_adds_to_what_its_view_holds() {
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::shipped(m, "std.list");
-    observe::reached(m, VIEW, true);
-    observe::reached(
-        m,
+    let recorder = Recorder::default();
+    recorder.shipped("std.list");
+    recorder.reached(VIEW, true);
+    recorder.reached(
         "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.drop\thash\n",
         false,
     );
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(
         lines(&trace),
         [
@@ -243,23 +220,20 @@ fn a_view_of_a_load_already_read_adds_to_what_its_view_holds() {
 
 #[test]
 fn a_view_stands_here_while_its_module_s_text_does() {
-    let m = MachineId::next();
-    assert!(stands(VIEW, &world(&[], "b"), m));
+    assert!(stands(VIEW, &world(&[], "b")));
     let moved_list = VIEW.replace("list digest", "another digest");
     assert_eq!(
-        observe::moved(&moved_list, &world(&[], "b"), m),
+        observe::moved(&moved_list, &world(&[], "b"), None),
         Some("the shipped module `std.list`".to_string())
     );
 }
 
 #[test]
 fn a_ply_it_started_reports_its_views() {
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    let file = observe::child_trace(m).unwrap();
+    let recorder = Recorder::default();
+    let file = recorder.child_trace();
     std::fs::write(&file, format!("{VIEW}end\n")).unwrap();
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(
         trace,
         VIEW.lines()
@@ -269,28 +243,50 @@ fn a_ply_it_started_reports_its_views() {
     );
 }
 
+/// The record is the run's: what a real handler of it reads goes there, a run made on the test's
+/// behalf shares it, and a run with none of its own records nothing.
 #[test]
-fn an_adopted_machine_is_observed_into_its_parent_until_the_record_ends() {
+fn a_run_records_into_the_record_it_was_handed_and_one_handed_none_records_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let roots = rooted(dir.path());
-    let parent = MachineId::next();
-    let child = MachineId::next();
-    let recorder = observe::begin(parent);
-    observe::adopt(child, parent);
-    observe::read(child, Read::Kind, &dir.path().join("x"));
-    observe::end(&recorder);
-    observe::read(child, Read::Kind, &dir.path().join("y"));
+    let host = ply_host::Host::new();
+    let (test, nested, other) = (host.runtime(), host.runtime(), host.runtime());
+    assert!(
+        observe::of(&*test).is_none(),
+        "a run observes nothing until told to"
+    );
+    let recorder = Arc::new(Recorder::default());
+    observe::records_into(&*test, &recorder);
+    observe::records_into(&*nested, &observe::of(&*test).expect("the test's record"));
+    for (runtime, path) in [(&test, "x"), (&nested, "y")] {
+        observe::of(&**runtime)
+            .expect("observed")
+            .read(Read::Kind, &dir.path().join(path));
+    }
+    assert!(observe::of(&*other).is_none(), "another run kept no record");
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    assert_eq!(lines(&trace), ["kind\tcwd\tx\t"]);
+    assert_eq!(lines(&trace), ["kind\tcwd\tx\t", "kind\tcwd\ty\t"]);
+}
+
+#[test]
+fn a_test_a_test_ran_is_read_by_the_outer_one_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let roots = rooted(dir.path());
+    let (outer, inner) = (Recorder::default(), Recorder::default());
+    inner.read(Read::Kind, &dir.path().join("inner"));
+    outer.read(Read::Kind, &dir.path().join("outer"));
+    outer.absorb(&inner);
+    outer.absorb(&outer);
+    let trace = observe::finished(&outer, &world(&roots, "b"), false).unwrap();
+    assert_eq!(lines(&trace), ["kind\tcwd\tinner\t", "kind\tcwd\touter\t"]);
 }
 
 #[test]
 fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_it() {
     let dir = tempfile::tempdir().unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    let file = observe::child_trace(m).unwrap();
+    let recorder = Recorder::default();
+    let file = recorder.child_trace();
     std::fs::write(
         &file,
         format!(
@@ -300,18 +296,17 @@ fn a_ply_it_started_reports_into_the_record_and_one_that_never_finished_spoils_i
     )
     .unwrap();
     // A program that is not `ply` never begins its report.
-    let _other = observe::child_trace(m).unwrap();
+    let _other = recorder.child_trace();
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
     assert_eq!(lines(&trace), ["file\tcwd\ta.ply\t", "shipped\tstd.list"]);
     // The child's binary answered, not ours.
     assert!(trace.contains("shipped\tstd.list\tits own digest\n"));
-    let unfinished = observe::child_trace(m).unwrap();
+    let unfinished = recorder.child_trace();
     std::fs::write(&unfinished, "read\tfile\t/x\n").unwrap();
     assert_eq!(
         observe::finished(&recorder, &world(&roots, "b"), false),
         None
     );
-    observe::end(&recorder);
 }
 
 #[test]
@@ -319,34 +314,24 @@ fn checking_a_trace_enters_what_it_read_into_the_asker_s_record() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &dir.path().join("a.ply"));
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &dir.path().join("a.ply"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
-    let asker = MachineId::next();
-    let asking = observe::begin(asker);
-    assert!(stands(&trace, &world(&roots, "b"), asker));
+    let asking = Recorder::default();
+    assert!(observe::moved(&trace, &world(&roots, "b"), Some(&asking)).is_none());
     let asked = observe::finished(&asking, &world(&roots, "b"), false).unwrap();
-    observe::end(&asking);
     assert_eq!(asked, trace);
 }
 
 #[test]
-fn a_trace_naming_a_file_is_never_answered_where_no_file_may_be_read() {
+fn a_trace_naming_a_root_the_run_is_not_lent_is_never_answered() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.ply"), b"one").unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &dir.path().join("a.ply"));
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &dir.path().join("a.ply"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
-    let hermetic = World {
-        roots: None,
-        ..world(&roots, "b")
-    };
-    assert!(moved(&trace, &hermetic, m));
+    assert!(moved(&trace, &world(&[], "b")));
 }
 
 #[test]
@@ -356,29 +341,24 @@ fn a_front_end_s_store_is_neither_read_nor_listed() {
     std::fs::create_dir(&pkg).unwrap();
     std::fs::write(pkg.join("a.ply"), b"a").unwrap();
     let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::Dir, &pkg);
-    observe::read(m, Read::Tree, &pkg);
-    observe::read(m, Read::File, &pkg.join(".ply-cache/index"));
+    let recorder = Recorder::default();
+    recorder.read(Read::Dir, &pkg);
+    recorder.read(Read::Tree, &pkg);
+    recorder.read(Read::File, &pkg.join(".ply-cache/index"));
     let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
     assert_eq!(lines(&trace), ["dir\tcwd\tpkg\t", "tree\tcwd\tpkg\t"]);
     // Another test's store appearing beside the sources moves nothing.
     std::fs::create_dir(pkg.join(".ply-cache")).unwrap();
     std::fs::write(pkg.join(".ply-cache/index"), b"filed").unwrap();
-    assert!(stands(&trace, &world(&roots, "b"), MachineId::next()));
+    assert!(stands(&trace, &world(&roots, "b")));
 }
 
 #[test]
 fn a_checkout_s_version_control_is_no_input() {
     let dir = tempfile::tempdir().unwrap();
-    let roots = rooted(dir.path());
-    let m = MachineId::next();
-    let recorder = observe::begin(m);
-    observe::read(m, Read::File, &dir.path().join(".git/HEAD"));
-    observe::read(m, Read::Kind, &dir.path().join("pkg/.git"));
-    let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
-    observe::end(&recorder);
+    let recorder = Recorder::default();
+    recorder.read(Read::File, &dir.path().join(".git/HEAD"));
+    recorder.read(Read::Kind, &dir.path().join("pkg/.git"));
+    let trace = observe::finished(&recorder, &world(&rooted(dir.path()), "b"), false).unwrap();
     assert_eq!(trace, "");
 }

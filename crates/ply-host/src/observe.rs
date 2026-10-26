@@ -1,25 +1,26 @@
-//! What a test read of the world while it ran: the files and directories its handlers read, what
-//! they wrote, the shipped modules it asked for, and what any `ply` it started read in turn, keyed
-//! by the machine that asked. A test's pass is filed with what this comes to, and stands only while
-//! every read still answers as it did. A load that read a shipped module for only what its program
-//! reaches says so in a view: the module's form and each function reached, with its hash, stand in
-//! for that read of the whole module.
+//! What a test read of the world while it ran: the files and directories the real handlers that
+//! answered it read, what they wrote, the shipped modules it asked for, and what any `ply` it started
+//! read in turn. A test's pass is filed with what this comes to, and stands only while every read
+//! still answers as it did. A load that read a shipped module for only what its program reaches says
+//! so in a view: the module's form and each function reached, with its hash, stand in for that read
+//! of the whole module.
 //!
-//! A machine is observed when the tester begins it; one run on its behalf (a nested machine a
-//! command drives) is adopted into the same record. What the test writes is its own: a read under a
-//! path it wrote is not an input, and a directory it wrote into is read without what it wrote there.
-//! Nor is a read under a directory a run keeps for the next one an input, a front end's store
+//! A test's record is its run's, which the handler that answers a read enters it into; a handler of
+//! the test's own touches no host and records nothing. A run made on a test's behalf (a nested
+//! machine a command drives) shares its caller's record. What the test writes is its own: a read
+//! under a path it wrote is not an input, and a directory it wrote into is read without what it wrote
+//! there. Nor is a read under a directory a run keeps for the next one an input, a front end's store
 //! included wherever it sits, since what is there is a product of its key; nor one of a checkout's
-//! version control, whose commit moves with every change, as the clock does. A `ply` a test starts is handed a file in [`TRACE_VAR`] and reports there what its whole
-//! process read; a program that is not `ply` reports nothing and is the environment, as the clock
-//! and the network are. A `ply` that ended without finishing its report leaves the record
-//! incomplete, which files no pass.
+//! version control, whose commit moves with every change, as the clock does. A `ply` a test starts
+//! is handed a file in [`TRACE_VAR`] and reports there what its whole process read; a program that is
+//! not `ply` reports nothing and is the environment, as the clock and the network are. A `ply` that
+//! ended without finishing its report leaves the record incomplete, which files no pass.
 
-use ply_core::host::MachineId;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use ply_core::HostRuntime;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 /// Where a parent asks a `ply` it starts to report what it read.
 pub const TRACE_VAR: &str = "PLY_TRACE";
@@ -91,19 +92,29 @@ struct Observed {
     opaque: Vec<String>,
 }
 
-/// One test's record, shared by every machine run on its behalf.
+/// One test's record, shared by every run made on its behalf.
 #[derive(Default)]
 pub struct Recorder {
     observed: Mutex<Observed>,
 }
 
-fn recorders() -> &'static Mutex<HashMap<MachineId, Arc<Recorder>>> {
-    static RECORDERS: OnceLock<Mutex<HashMap<MachineId, Arc<Recorder>>>> = OnceLock::new();
-    RECORDERS.get_or_init(|| Mutex::new(HashMap::new()))
+/// A `ply` started with [`TRACE_VAR`] records every run that has no record of its own.
+static PROCESS: OnceLock<Arc<Recorder>> = OnceLock::new();
+
+/// The record `runtime`'s run is entered into: its own, else the process's where a `ply` that
+/// started this one asked for it, else none.
+pub fn of(runtime: &dyn HostRuntime) -> Option<Arc<Recorder>> {
+    crate::registry::facilities_of(runtime)
+        .and_then(|facilities| facilities.run().recorder())
+        .or_else(|| PROCESS.get().cloned())
 }
 
-/// A `ply` started with [`TRACE_VAR`] records every machine it runs.
-static PROCESS: OnceLock<Arc<Recorder>> = OnceLock::new();
+/// `runtime`'s run is entered into `recorder` from now on.
+pub fn records_into(runtime: &dyn HostRuntime, recorder: &Arc<Recorder>) {
+    if let Some(facilities) = crate::registry::facilities_of(runtime) {
+        facilities.run().records_into(Arc::clone(recorder));
+    }
+}
 
 /// Where the running `ply` lays its shipped modules out as files: a read there is of a module, of
 /// a data file one embeds, or of the program beside them.
@@ -167,41 +178,6 @@ fn is_kept(path: &Path) -> bool {
             .is_some_and(|dirs| dirs.iter().any(|dir| path.starts_with(dir)))
 }
 
-fn recorder_of(machine: MachineId) -> Option<Arc<Recorder>> {
-    let held = recorders().lock().unwrap_or_else(|e| e.into_inner());
-    held.get(&machine)
-        .cloned()
-        .or_else(|| PROCESS.get().cloned())
-}
-
-fn with(machine: MachineId, f: impl FnOnce(&mut Observed)) {
-    if let Some(recorder) = recorder_of(machine) {
-        f(&mut recorder.observed.lock().unwrap_or_else(|e| e.into_inner()));
-    }
-}
-
-/// Observes `machine` until [`end`].
-pub fn begin(machine: MachineId) -> Arc<Recorder> {
-    let recorder = Arc::new(Recorder::default());
-    let mut held = recorders().lock().unwrap_or_else(|e| e.into_inner());
-    held.insert(machine, Arc::clone(&recorder));
-    recorder
-}
-
-/// `child`, run on `parent`'s behalf, is observed into `parent`'s record, if it has one.
-pub fn adopt(child: MachineId, parent: MachineId) {
-    let mut held = recorders().lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(recorder) = held.get(&parent).cloned() {
-        held.insert(child, recorder);
-    }
-}
-
-/// Stops observing `recorder` under every machine it was observing.
-pub fn end(recorder: &Arc<Recorder>) {
-    let mut held = recorders().lock().unwrap_or_else(|e| e.into_inner());
-    held.retain(|_, r| !Arc::ptr_eq(r, recorder));
-}
-
 /// The whole process is observed: what a `ply` started with [`TRACE_VAR`] does first.
 pub fn begin_process() -> Arc<Recorder> {
     Arc::clone(PROCESS.get_or_init(|| Arc::new(Recorder::default())))
@@ -223,67 +199,73 @@ pub fn exiting() {
     }
 }
 
-pub fn read(machine: MachineId, how: Read, path: &Path) {
-    if let Some(rest) = SHIPPED_DIR
-        .get()
-        .and_then(|dir| path.strip_prefix(dir).ok())
-    {
-        // A module lies there as `<name>.ply`, and a data file one embeds below it, under its name.
-        let shipped_name = rest.to_str().and_then(|file| {
-            file.strip_suffix(".ply")
-                .or_else(|| file.contains('/').then_some(file))
-        });
-        return match shipped_name {
-            Some(name) if how == Read::File => shipped(machine, name),
-            _ => program(machine),
-        };
-    }
-    if is_kept(path) {
-        return;
-    }
-    with(machine, |o| {
-        o.reads.insert((how, path.to_path_buf()));
-    });
-}
-
-pub fn wrote(machine: MachineId, path: &Path) {
-    with(machine, |o| {
-        o.writes.insert(path.to_path_buf());
-    });
-}
-
 /// What this `ply` wrote outside any handler, when a `ply` that started it is observing it.
 pub fn process_wrote(path: &Path) {
     if let Some(recorder) = PROCESS.get() {
-        let mut o = recorder.observed.lock().unwrap_or_else(|e| e.into_inner());
-        o.writes.insert(path.to_path_buf());
+        recorder.wrote(path);
     }
 }
 
-pub fn shipped(machine: MachineId, name: &str) {
-    with(machine, |o| {
-        o.shipped.entry(name.to_string()).or_default().read += 1;
-    });
-}
+impl Recorder {
+    fn observed(&self) -> MutexGuard<'_, Observed> {
+        self.observed.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
-/// What a load said it read of the shipped modules it pulled: per module, a
-/// `shipform\t<module>\t<text digest>\t<form>` line and a `shipdef\t<module>\t<name>\t<hash>` line
-/// for each function its program reached. A view `pulled` its modules stands for one whole read of
-/// each that the record has not yet had a view for; one made again of a load already read, as a
-/// splice re-analyses it, adds to what such a view holds. A module the record never read of the
-/// binary, one a caller handed the load in its place, is left out.
-pub fn reached(machine: MachineId, view: &str, pulled: bool) {
-    let mut modules: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
-    for line in view.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
-        if let [kind @ ("shipform" | "shipdef"), module, at, digest] = fields.as_slice() {
-            modules
-                .entry(module)
-                .or_default()
-                .push((format!("{kind}\t{module}\t{at}"), digest.to_string()));
+    /// `path` was read as `how` says; a read of the shipped modules' files is one of a module or
+    /// of the program, and one under a kept directory is no input.
+    pub fn read(&self, how: Read, path: &Path) {
+        if let Some(rest) = SHIPPED_DIR
+            .get()
+            .and_then(|dir| path.strip_prefix(dir).ok())
+        {
+            // A module lies there as `<name>.ply`, and a data file one embeds below it, under its
+            // name.
+            let shipped_name = rest.to_str().and_then(|file| {
+                file.strip_suffix(".ply")
+                    .or_else(|| file.contains('/').then_some(file))
+            });
+            return match shipped_name {
+                Some(name) if how == Read::File => self.shipped(name),
+                _ => self.ran_program(),
+            };
         }
+        if is_kept(path) {
+            return;
+        }
+        self.observed().reads.insert((how, path.to_path_buf()));
     }
-    with(machine, |o| {
+
+    pub fn wrote(&self, path: &Path) {
+        self.observed().writes.insert(path.to_path_buf());
+    }
+
+    /// The shipped module `name` was read whole; the empty name is their list.
+    pub fn shipped(&self, name: &str) {
+        self.observed()
+            .shipped
+            .entry(name.to_string())
+            .or_default()
+            .read += 1;
+    }
+
+    /// What a load said it read of the shipped modules it pulled: per module, a
+    /// `shipform\t<module>\t<text digest>\t<form>` line and a `shipdef\t<module>\t<name>\t<hash>`
+    /// line for each function its program reached. A view `pulled` its modules stands for one whole
+    /// read of each that the record has not yet had a view for; one made again of a load already
+    /// read, as a splice re-analyses it, adds to what such a view holds. A module the record never
+    /// read of the binary, one a caller handed the load in its place, is left out.
+    pub fn reached(&self, view: &str, pulled: bool) {
+        let mut modules: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+        for line in view.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if let [kind @ ("shipform" | "shipdef"), module, at, digest] = fields.as_slice() {
+                modules
+                    .entry(module)
+                    .or_default()
+                    .push((format!("{kind}\t{module}\t{at}"), digest.to_string()));
+            }
+        }
+        let mut o = self.observed();
         for (module, lines) in modules {
             let Some(reads) = o.shipped.get_mut(module) else {
                 continue;
@@ -303,47 +285,34 @@ pub fn reached(machine: MachineId, view: &str, pulled: bool) {
                 settle(&mut o.viewed, line, digest);
             }
         }
-    });
-}
-
-/// What the running `ply` program is entered into the record.
-pub fn program(machine: MachineId) {
-    with(machine, |o| o.program = true);
-}
-
-impl Recorder {
-    /// The `ply` program that ran is part of what a run of this process came to.
-    pub fn ran_program(&self) {
-        self.observed
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .program = true;
     }
-}
 
-/// A fresh file a program started for `machine` reports into, when a test is observing it.
-pub fn child_trace(machine: MachineId) -> Option<PathBuf> {
-    let recorder = recorder_of(machine)?;
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let file = std::env::temp_dir().join(format!(
-        "ply-trace-{}-{}",
-        std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = std::fs::remove_file(&file);
-    recorder
-        .observed
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .children
-        .push(file.clone());
-    Some(file)
-}
+    /// The `ply` program that ran is part of what the record came to.
+    pub fn ran_program(&self) {
+        self.observed().program = true;
+    }
 
-/// What `inner`, a test a test ran, read: the outer test read it too.
-pub fn absorb(machine: MachineId, inner: &Recorder) {
-    let taken = inner.observed.lock().unwrap_or_else(|e| e.into_inner());
-    with(machine, |o| merge(o, &taken));
+    /// A fresh file a program the run starts reports into.
+    pub fn child_trace(&self) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let file = std::env::temp_dir().join(format!(
+            "ply-trace-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&file);
+        self.observed().children.push(file.clone());
+        file
+    }
+
+    /// What `inner`, a test this record's test ran, read: this one read it too.
+    pub fn absorb(&self, inner: &Recorder) {
+        if std::ptr::eq(self, inner) {
+            return;
+        }
+        let taken = inner.observed();
+        merge(&mut self.observed(), &taken);
+    }
 }
 
 fn merge(into: &mut Observed, from: &Observed) {
@@ -405,7 +374,7 @@ fn digested(o: &Observed, binary: &Binary<'_>) -> BTreeMap<String, String> {
 /// What a `ply` reports to the parent that started it: every read and write, raw, what it asked of
 /// its own binary digested, each child's report folded in, then [`END`].
 pub fn report(recorder: &Recorder, binary: &Binary<'_>) -> String {
-    let mut o = recorder.observed.lock().unwrap_or_else(|e| e.into_inner());
+    let mut o = recorder.observed();
     fold_children(&mut o);
     let mut out = String::new();
     for (how, path) in &o.reads {
@@ -581,10 +550,10 @@ fn tree_into(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
     }
 }
 
-/// What a trace is read against: the run's roots, `None` where no file may be read; the digest of
-/// what the run is configured to bind; and the binary running it.
+/// What a trace is read against: the run's roots, the digest of what the run is configured to bind,
+/// and the binary running it.
 pub struct World<'a> {
-    pub roots: Option<&'a [(String, PathBuf)]>,
+    pub roots: &'a [(String, PathBuf)],
     pub binding: String,
     pub binary: Binary<'a>,
 }
@@ -599,7 +568,7 @@ pub type Trace = String;
 /// What `recorder` came to, read against `world`; `None` when something it did no trace can stand
 /// in for. `hosted` is whether the run reached a host handler.
 pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<Trace> {
-    let mut observed = recorder.observed.lock().unwrap_or_else(|e| e.into_inner());
+    let mut observed = recorder.observed();
     fold_children(&mut observed);
     if !observed.opaque.is_empty() {
         return None;
@@ -608,7 +577,7 @@ pub fn finished(recorder: &Recorder, world: &World<'_>, hosted: bool) -> Option<
     if hosted {
         lines.insert("binding".to_string(), world.binding.clone());
     }
-    let roots = world.roots.unwrap_or_default();
+    let roots = world.roots;
     for (how, path) in &observed.reads {
         if observed.writes.iter().any(|w| path.starts_with(w)) {
             continue;
@@ -655,41 +624,46 @@ fn own_below(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Vec<PathBuf>
 }
 
 /// The first read `trace` holds that no longer answers as it did, read against `world` now, as a
-/// person reads it; `None` when every one still does. Each read checked is entered into whatever
-/// observes `machine`, since what it decides rests on them. A view stands here while its module's
+/// person reads it; `None` when every one still does. Each read checked is entered into `into`, the
+/// asking run's record, since what it decides rests on them. A view stands here while its module's
 /// text does; what can hash the module again holds its form and functions instead.
-pub fn moved(trace: &str, world: &World<'_>, machine: MachineId) -> Option<String> {
+pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<String> {
+    let noted = |note: &dyn Fn(&Recorder)| {
+        if let Some(recorder) = into {
+            note(recorder);
+        }
+    };
     trace.lines().find_map(|line| {
         let fields: Vec<&str> = line.split('\t').collect();
         let stands = match fields.as_slice() {
             ["shipped", name, digest] => {
-                shipped(machine, name);
+                noted(&|r| r.shipped(name));
                 (world.binary.shipped)(name).unwrap_or_else(|| "none".to_string()) == *digest
             }
             ["shipform", name, text, _] => {
-                shipped(machine, name);
+                noted(&|r| r.shipped(name));
                 (world.binary.shipped)(name).as_deref() == Some(*text)
             }
             ["shipdef", ..] => true,
             ["program", digest] => {
-                program(machine);
+                noted(&|r| r.ran_program());
                 world.binary.program == *digest
             }
             ["binding", digest] => world.binding == *digest,
-            [how, root, rest, own, digest] => match (Read::of_word(how), world.roots) {
-                (Some(how), Some(roots)) => match located(root, rest, roots) {
+            [how, root, rest, own, digest] => match Read::of_word(how) {
+                Some(how) => match located(root, rest, world.roots) {
                     Some(path) => {
                         let own: Vec<PathBuf> = own
                             .split(OWN)
                             .filter(|o| !o.is_empty())
                             .map(PathBuf::from)
                             .collect();
-                        read(machine, how, &path);
+                        noted(&|r| r.read(how, &path));
                         answered(how, &path, &own) == *digest
                     }
                     None => false,
                 },
-                _ => false,
+                None => false,
             },
             _ => false,
         };

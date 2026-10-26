@@ -47,8 +47,8 @@ pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
 pub const HOST_HANDLER_CONFLICT: &str = "E0422";
 /// A host handler declared nondeterministic for an effect not declared `nondet`.
 pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
-/// An operation reached the host boundary with nothing bound.
-pub const HERMETIC_BOUNDARY: &str = "E0424";
+/// An operation reached the host boundary with nothing bound to serve it.
+pub const HOST_UNBOUND: &str = "E0424";
 /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
 pub const HOST_IN_SIMULATION: &str = "E0425";
 /// A continuation was resumed a second time across an at-most-once host operation.

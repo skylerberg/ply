@@ -83,21 +83,27 @@ pub fn lent() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
 struct Shipped;
 
 impl HostHandler for Shipped {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
+        let recorder = ply_host::observe::of(rt);
+        let noted = |note: &dyn Fn(&ply_host::observe::Recorder)| {
+            if let Some(recorder) = &recorder {
+                note(recorder);
+            }
+        };
         // The rest answer for the runtime, which a pass's store is stamped with.
         match (req.op.op.as_str(), req.args) {
-            ("names", []) => ply_host::observe::shipped(req.machine, ""),
+            ("names", []) => noted(&|r| r.shipped("")),
             ("module", [name]) => {
                 if let Ok(name) = name.as_str(span, "a module's name") {
-                    ply_host::observe::shipped(req.machine, name);
+                    noted(&|r| r.shipped(name));
                 }
             }
-            ("definitions", []) => ply_host::observe::program(req.machine),
+            ("definitions", []) => noted(&|r| r.ran_program()),
             ("reached", [view, pulled]) => {
                 let view = view.as_bytes(span, "a load's view of the shipped modules")?;
                 let pulled = pulled.as_bool(span, "whether the load pulled its modules")?;
-                ply_host::observe::reached(req.machine, &String::from_utf8_lossy(view), pulled);
+                noted(&|r| r.reached(&String::from_utf8_lossy(view), pulled));
                 return Ok(HostAnswer::Value(PlyValue::Unit));
             }
             _ => {}

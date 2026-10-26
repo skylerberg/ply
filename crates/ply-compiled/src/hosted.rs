@@ -27,6 +27,7 @@ use ply_host::jobs::{self, Job, Work};
 use ply_host::native::{found, parts, told};
 use ply_host::password;
 use ply_host::registry::Facilities;
+use std::path::Path;
 
 /// The effect every native here performs, under its program-wide name (`std.internal.native`).
 const NATIVE: &str = "std.internal.native.native";
@@ -61,6 +62,10 @@ const COMPUTES: Asking = Asking {
 pub fn natives() -> Vec<MachineNative> {
     let mut natives = vec![
         machine_native("job_wait", rt_job_wait as unsafe extern "C" fn(_, _) -> _),
+        machine_native(
+            "observed",
+            rt_observed as unsafe extern "C" fn(_, _, _, _, _, _),
+        ),
         machine_native(
             "certgen_issue",
             rt_certgen_issue as unsafe extern "C" fn(_) -> _,
@@ -329,6 +334,54 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
             ));
             TakenBytes(0)
         }
+    }
+}
+
+/// What a real handler read of the root the label at `label_at` names, at the path at `path_at`
+/// below it, or wrote there, entered into the record of the run asking where it is observed: `kind`
+/// 0 a file's bytes, 1 a directory's names, 2 what is there, 3 every path below, and 4 a write. A
+/// label no root is bound to holds nothing to record. It asks nothing of the host itself.
+pub unsafe extern "C" fn rt_observed(
+    ctx: *mut Ctx,
+    label_at: Addr,
+    label_n: I64,
+    path_at: Addr,
+    path_n: I64,
+    kind: I64,
+) {
+    use ply_host::observe::Read;
+    let c = unsafe { &mut *ctx };
+    let Some(recorder) = ply_host::observe::of(&*c.host_runtime()) else {
+        return;
+    };
+    let (Some(label), Some(path)) = (
+        c.text(unsafe { lent(label_at, label_n) }),
+        c.text(unsafe { lent(path_at, path_n) }),
+    ) else {
+        return;
+    };
+    let resource = Resource::Named(ply_core::Symbol::new(label));
+    let Some(Some(root)) = from_host(c, |facilities| {
+        facilities.roots().get(&resource).map(Path::to_path_buf)
+    }) else {
+        return;
+    };
+    // The path as the program named it: where a link in it leads is read again when the record is.
+    let target = root.join(path);
+    let how = match kind.0 {
+        0 => Some(Read::File),
+        1 => Some(Read::Dir),
+        2 => Some(Read::Kind),
+        3 => Some(Read::Tree),
+        4 => None,
+        _ => {
+            handed(c, "observed", "a kind of read", None::<()>);
+            return;
+        }
+    };
+    match how {
+        Some(how) => recorder.read(how, &target),
+        None => recorder.wrote(&target),
     }
 }
 

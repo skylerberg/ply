@@ -14,11 +14,12 @@ use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_OUT_OF_FUEL, FAILED_UNWIND, lent};
 pub use ply_core::host::Grants;
-use ply_core::host::{HostBinding, HostRuntime, MachineId, RuntimeFactory};
+use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{
     Diagnostic, EffectAtom, Footprint, Mode, Resource, Seed, Severity, SourceId, Span, Symbol,
     codes,
 };
+use ply_host::observe::Recorder;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -100,8 +101,8 @@ pub trait Binder: Send + Sync {
     fn hosting(&self, grants: &Grants, w: &mut Writer);
 
     /// The first read `trace` holds that no longer answers as it did under `grants`, as a person
-    /// reads it, the reads it made to say so recorded as `caller`'s.
-    fn moved(&self, grants: &Grants, trace: &str, caller: MachineId) -> Option<String>;
+    /// reads it, the reads it made to say so entered into `caller`, the asking run's record.
+    fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String>;
 }
 
 /// The host binding an entry runs under: what serves the operations its program performs that no
@@ -110,36 +111,27 @@ pub trait Bound: Send + Sync {
     fn binding(&self) -> Arc<HostBinding>;
 
     /// What makes the reactor a pending host answer is waited on with, on the thread that enters.
-    fn runtime_factory(&self) -> Option<RuntimeFactory>;
+    fn runtime_factory(&self) -> RuntimeFactory;
 
     /// The code `process.exit` asked for, once asked.
     fn requested_exit(&self) -> Option<i32>;
 
-    /// What the entry `entry`'s reads are recorded into: its own record where `recorded`, which its
-    /// outcome's trace is made of, and else `caller`'s.
-    fn observing(
-        &self,
-        entry: MachineId,
-        caller: MachineId,
-        recorded: bool,
-    ) -> Option<Box<dyn Observation>>;
+    /// The trace a pass of an entry is filed with, of what `recorder` came to, read against the
+    /// world this binding lends: none where nothing could stand in for the run. `host` is whether
+    /// the entry reached a host handler.
+    fn traced(&self, recorder: &Recorder, host: bool) -> Option<String>;
 
     /// The binding torn down, its children ended and its sink flushed: what its facilities report,
     /// by name.
     fn unbind(&self) -> Vec<(String, Vec<u8>)>;
 }
 
-/// What an entry's reads are recorded into, from its start to its end.
-pub trait Observation {
-    /// The trace a pass of the entry is filed with, its reads recorded as `caller`'s too: none
-    /// where nothing could stand in for the run.
-    fn finished(self: Box<Self>, caller: MachineId, host: bool) -> Option<String>;
-}
-
-/// Who observes an entry, and for whom.
+/// What an entry's reads are entered into: a record of its own where `recorded`, which its outcome's
+/// trace is made of and its caller's record takes in, and else `caller`'s, as a run made on the
+/// caller's behalf.
 pub struct Watch<'a> {
     pub by: &'a dyn Bound,
-    pub caller: MachineId,
+    pub caller: Option<Arc<Recorder>>,
     pub recorded: bool,
 }
 
@@ -266,11 +258,29 @@ pub fn enter(
         return Outcome::of(Ended::NoRoot);
     };
     let mut ctx = Box::new(opened.native.context());
+    let own = (watch.as_ref())
+        .filter(|w| w.recorded)
+        .map(|_| Arc::new(Recorder::default()));
+    let recorder = own
+        .clone()
+        .or_else(|| watch.as_ref().and_then(|w| w.caller.clone()));
     let binding = match bound {
         Some(bound) => {
-            let factory = bound.runtime_factory();
-            let runtime: Option<Rc<dyn HostRuntime>> = factory.as_ref().map(|make| make());
-            ctx.set_host(bound.binding(), runtime, factory);
+            let made = bound.runtime_factory();
+            // Each runtime the entry makes, a `parallel` branch's among them, records into one record.
+            let factory: RuntimeFactory = match &recorder {
+                Some(recorder) => {
+                    let recorder = Arc::clone(recorder);
+                    Arc::new(move || {
+                        let runtime = made();
+                        ply_host::observe::records_into(&*runtime, &recorder);
+                        runtime
+                    })
+                }
+                None => made,
+            };
+            let runtime: Rc<dyn HostRuntime> = factory();
+            ctx.set_host(bound.binding(), Some(runtime), Some(factory));
             Some(bound.binding())
         }
         None => None,
@@ -285,7 +295,6 @@ pub fn enter(
     ctx.seed = seed;
     ctx.sim_steps = steps.max(1);
     let id = ctx.id;
-    let observation = (watch.as_ref()).and_then(|w| w.by.observing(id, w.caller, w.recorded));
     // The counters are this thread's, an outer entry's among them, so the entry's are a difference.
     let counted = ply_core::rc::stats();
     let started = Instant::now();
@@ -326,8 +335,11 @@ pub fn enter(
             Outcome::of(Ended::Panicked(panic_message(payload.as_ref())))
         }
     };
-    if let (Some(observation), Some(w)) = (observation, &watch) {
-        outcome.trace = observation.finished(w.caller, outcome.usage.host);
+    if let (Some(own), Some(w)) = (own, &watch) {
+        if let Some(caller) = &w.caller {
+            caller.absorb(&own);
+        }
+        outcome.trace = w.by.traced(&own, outcome.usage.host);
     }
     outcome
 }
@@ -597,14 +609,14 @@ unsafe extern "C" fn rt_unit_close(_ctx: *mut Ctx, unit: I64) {
     units().by.remove(&unit.0);
 }
 
-/// `bind`: `result(int, list(failure))`. A binding that lends the host is refused unless the
+/// `bind`: `result(int, list(failure))`. A binding lends the host, so it is refused unless the
 /// caller is lent `machine`.
 unsafe extern "C" fn rt_unit_bind(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
         return TakenBytes(0);
     };
-    if !grants.has("hermetic") && !allowed(c, "machine.bind") {
+    if !allowed(c, "machine.bind") {
         return TakenBytes(0);
     }
     let made = match BINDER.get() {
@@ -669,7 +681,8 @@ unsafe extern "C" fn rt_unit_moved(
         return TakenBytes(c.fail(err_no_binder()));
     };
     let trace = String::from_utf8_lossy(unsafe { lent(tp, tn) }).into_owned();
-    let moved = binder.moved(&grants, &trace, c.id);
+    let caller = ply_host::observe::of(&*c.host_runtime());
+    let moved = binder.moved(&grants, &trace, caller.as_deref());
     let mut w = Writer::new();
     w.option(moved.as_deref(), |w, m| {
         w.str(m);
@@ -708,7 +721,7 @@ unsafe extern "C" fn rt_unit_enter(
             None => return TakenBytes(c.fail(err_unheld("binding", handle))),
         },
     };
-    let caller = c.id;
+    let caller = ply_host::observe::of(&*c.host_runtime());
     let entered = on_program_thread(|| {
         let watch = bound.as_deref().map(|by| Watch {
             by,

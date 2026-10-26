@@ -2,13 +2,10 @@
 //! runtime serves itself.
 
 use ply_compiled::entry::Grants;
-use ply_core::host::{
-    Determinism, HostBinding, HostHandler, HostOp, HostResource, HostRuntime, Linearity, MachineId,
-};
+use ply_core::host::{Determinism, HostBinding, HostHandler, HostOp, HostResource, Linearity};
 use ply_core::{Diagnostic, Span, Symbol};
 use ply_host::config::{Entry, Snapshot};
 use ply_host::tls;
-use std::rc::Rc;
 use std::sync::Arc;
 
 /// One host operation and the handler that serves it, as a caller lends it to an entry.
@@ -53,17 +50,17 @@ pub fn unserved(effect: &str, op: &str, span: Span) -> Diagnostic {
 /// What a run has bound: the facilities its handlers act on, the binding, and what stops it where
 /// it listens for a signal.
 pub struct Hosts {
-    /// The source of every [`HostRuntime`]; none for a hermetic run.
-    host: Option<Arc<ply_host::Host>>,
+    /// The source of every [`HostRuntime`].
+    host: Arc<ply_host::Host>,
     binding: Arc<HostBinding>,
     stop: Option<Arc<ply_host::signal::Shutdown>>,
 }
 
 impl Hosts {
-    /// The binding of the families this runtime serves itself, from what a run is lent alone: no
-    /// program's rows are read. Under `hermetic` every host family is registered withheld, so an
-    /// operation that reaches one is refused naming what would serve it; `lent` are the caller's
-    /// families beside them. A run lent `listen LEAD_MS DRAIN_MS` stops on a signal.
+    /// The binding of every family this runtime serves itself, from what a run is lent alone: no
+    /// program's rows are read. Its roots, its programs and its command line narrow what they
+    /// serve; `lent` are the caller's families beside them. A run lent `listen LEAD_MS DRAIN_MS`
+    /// stops on a signal.
     pub fn granted(grants: &Grants, lent: Vec<LentOp>) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
             grants.named(name).filter_map(|fields| match fields {
@@ -71,17 +68,6 @@ impl Hosts {
                 _ => None,
             })
         };
-        if grants.has("hermetic") {
-            let mut registry = ply_host::registry().withheld_all("under `--host`");
-            for (op, handler) in lent {
-                registry.register(op, handler);
-            }
-            return Ok(Hosts {
-                host: None,
-                binding: Arc::new(registry.granted(grants.clone())?),
-                stop: None,
-            });
-        }
         let stop = grants.named("listen").next().map(|fields| {
             let ms = |at: usize, default: u64| {
                 let ms = fields.get(at).and_then(|f| f.parse::<u64>().ok());
@@ -155,7 +141,7 @@ impl Hosts {
             registry.register(op, handler);
         }
         Ok(Hosts {
-            host: Some(facilities),
+            host: facilities,
             binding: Arc::new(registry.granted(grants.clone())?),
             stop,
         })
@@ -174,14 +160,11 @@ impl Hosts {
             write(&mut w);
             reports.push((name.to_string(), w.finish()));
         };
-        match self.runtime().map(|rt| rt.shutdown()) {
-            Some(torn) => report("teardown", &|w| {
-                w.count(torn.spans_left_open as u64);
-            }),
-            // A hermetic run has no host to tear down, yet `term.mode` served it.
-            None => ply_host::stdio::restore_terminal(),
-        }
-        let handshakes = (self.host.as_ref()).map_or_else(Default::default, |h| h.handshakes());
+        let torn = self.host.runtime().shutdown();
+        report("teardown", &|w| {
+            w.count(torn.spans_left_open as u64);
+        });
+        let handshakes = self.host.handshakes();
         if !handshakes.is_empty() {
             report("handshakes", &|w| {
                 w.count(handshakes.completed)
@@ -202,28 +185,20 @@ impl Hosts {
                 .count(stop.elapsed().unwrap_or_default().as_millis() as u64);
             });
         }
-        if let Some(counts) = self.host.as_ref().map(|host| host.tracing().counts()) {
-            report("trace", &|w| {
-                w.count(counts.events)
-                    .count(counts.spans)
-                    .count(counts.abandoned)
-                    .bool(counts.flushed);
-            });
-        }
+        let counts = self.host.tracing().counts();
+        report("trace", &|w| {
+            w.count(counts.events)
+                .count(counts.spans)
+                .count(counts.abandoned)
+                .bool(counts.flushed);
+        });
         reports
     }
 
-    /// A reactor for one machine, on the thread that will drive it.
-    pub fn runtime(&self) -> Option<Rc<dyn HostRuntime>> {
-        self.host.as_ref().map(|host| host.runtime())
-    }
-
-    /// The same thing, as something a worker thread can call for itself.
-    pub fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
-        self.host.as_ref().map(Arc::clone).map(|host| {
-            let factory: ply_core::RuntimeFactory = Arc::new(move || host.runtime());
-            factory
-        })
+    /// A reactor for each machine, which a worker thread can call for itself.
+    pub fn runtime_factory(&self) -> ply_core::RuntimeFactory {
+        let host = Arc::clone(&self.host);
+        Arc::new(move || host.runtime())
     }
 
     pub fn binding(&self) -> Arc<HostBinding> {
@@ -232,7 +207,7 @@ impl Hosts {
 
     /// The code `process.exit` asked for, once the run is over.
     pub fn requested_exit(&self) -> Option<i32> {
-        self.host.as_ref()?.process()?.requested_exit()
+        self.host.process()?.requested_exit()
     }
 }
 
@@ -242,7 +217,7 @@ impl ply_compiled::entry::Bound for Hosts {
         Hosts::binding(self)
     }
 
-    fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
+    fn runtime_factory(&self) -> ply_core::RuntimeFactory {
         Hosts::runtime_factory(self)
     }
 
@@ -250,12 +225,7 @@ impl ply_compiled::entry::Bound for Hosts {
         Hosts::requested_exit(self)
     }
 
-    fn observing(
-        &self,
-        _entry: MachineId,
-        _caller: MachineId,
-        _recorded: bool,
-    ) -> Option<Box<dyn ply_compiled::entry::Observation>> {
+    fn traced(&self, _: &ply_host::observe::Recorder, _: bool) -> Option<String> {
         None
     }
 

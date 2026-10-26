@@ -1,13 +1,14 @@
 use crate::bare::context;
 use ply_compiled::hosted::signal::rt_signal_arrived;
 use ply_compiled::hosted::term::rt_term_secret_taken;
-use ply_compiled::hosted::{rt_job_wait, rt_kdf_bcrypt, rt_os_cpus};
+use ply_compiled::hosted::{rt_job_wait, rt_kdf_bcrypt, rt_observed, rt_os_cpus};
 use ply_compiled::machine::{rt_secret_len, rt_secret_of};
 use ply_compiled::native::{Addr, I64};
 use ply_compiled::rt::{Ctx, rt_taken};
 use ply_core::host::MachineId;
 use ply_core::{HostBinding, HostRuntime, Span};
 use ply_host::jobs::{self, Work};
+use ply_host::observe::{Binary, Recorder, World};
 use ply_host::stdio::SecretLine;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -45,13 +46,8 @@ fn submitted(
     what: &'static str,
     job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
 ) -> I64 {
-    let runtime = ply_host::Host::new().runtime();
+    let runtime = hosted(ctx);
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    ctx.set_host(
-        Arc::new(ply_core::HostBinding::hermetic()),
-        Some(runtime),
-        None,
-    );
     let ticket = jobs::submit(work, &run, Span::DUMMY, "test", what, job).expect("a thread is had");
     I64(ticket.token as i64)
 }
@@ -60,7 +56,7 @@ fn submitted(
 fn hosted(ctx: &mut Ctx) -> Rc<dyn HostRuntime> {
     let runtime = ply_host::Host::new().runtime();
     ctx.set_host(
-        Arc::new(HostBinding::hermetic()),
+        Arc::new(HostBinding::unbound()),
         Some(Rc::clone(&runtime)),
         None,
     );
@@ -111,6 +107,56 @@ fn a_run_that_listens_for_no_stop_installs_no_signal_handler() {
         libc::SIG_DFL,
         "`SIGUSR1` was given a handler"
     );
+}
+
+/// What a real handler read goes into its run's record under the root its label names, once the run
+/// is observed; a label no root is bound to, and a run nobody observes, record nothing.
+#[test]
+fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.db"), b"data").unwrap();
+    let spec = ply_host::fs::RootSpec {
+        name: "app".to_string(),
+        path: dir.path().to_path_buf(),
+    };
+    let roots = ply_host::fs::Roots::load(&[spec], Span::DUMMY).expect("a directory");
+    let runtime = ply_host::Host::new().rooted(roots).runtime();
+    let mut ctx = context();
+    ctx.set_host(
+        Arc::new(HostBinding::unbound()),
+        Some(Rc::clone(&runtime)),
+        None,
+    );
+    let note = |ctx: &mut Ctx, label: &[u8], path: &[u8], kind: i64| {
+        let (label_at, label_n) = addr(label);
+        let (path_at, path_n) = addr(path);
+        unsafe { rt_observed(ctx, label_at, label_n, path_at, path_n, I64(kind)) };
+    };
+    note(&mut ctx, b"app", b"before.db", 0);
+    let recorder = Arc::new(Recorder::default());
+    ply_host::observe::records_into(&*runtime, &recorder);
+    note(&mut ctx, b"app", b"a.db", 0);
+    note(&mut ctx, b"elsewhere", b"a.db", 0);
+    note(&mut ctx, b"app", b"made.db", 4);
+    note(&mut ctx, b"app", b"made.db", 0);
+    assert!(ctx.take_failure().is_none());
+    // Where the root lies with its links resolved, as a binding lends it.
+    let lent = [("app".to_string(), dir.path().canonicalize().unwrap())];
+    let shipped = |_: &str| None;
+    let world = World {
+        roots: &lent,
+        binding: "b".to_string(),
+        binary: Binary {
+            shipped: &shipped,
+            program: "p".to_string(),
+        },
+    };
+    let trace = ply_host::observe::finished(&recorder, &world, false).expect("a trace");
+    let read: Vec<&str> = trace
+        .lines()
+        .map(|line| line.rsplit_once('\t').map_or(line, |(at, _)| at))
+        .collect();
+    assert_eq!(read, ["file\tapp\ta.db\t"], "{trace}");
 }
 
 /// Outside a production region the thread waits for a job, and is handed its bytes.

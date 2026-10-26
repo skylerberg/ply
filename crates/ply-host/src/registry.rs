@@ -30,7 +30,7 @@ pub struct Host {
     /// The roots `--fs NAME=PATH` bound, and the pool their operations wait on; empty if none.
     fs: Arc<fs::FsHost>,
     net: Arc<tcp::TcpHost>,
-    /// The arguments and streams `ply run --host` was given; `None` withholds `process`.
+    /// The arguments and streams `ply run` was given; `None` withholds `process`.
     process: Option<Arc<process::ProcessHost>>,
     /// The stop flag and the phase machine, when this run listens for a signal.
     shutdown: Option<Arc<Shutdown>>,
@@ -166,8 +166,8 @@ impl Host {
     }
 }
 
-/// Every registration this binary serves, of a host that holds nothing: what a hermetic run
-/// withholds and names.
+/// Every registration this binary serves, of a host that holds nothing: what a listing of the
+/// families the runtime serves itself names.
 pub fn registry() -> HostRegistry {
     Host::new()
         .traced(Arc::new(trace::Trace::default()))

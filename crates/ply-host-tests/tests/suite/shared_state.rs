@@ -466,7 +466,7 @@ fn a_host_with_no_coordinator_is_never_stopping() {
     );
 }
 
-/// `ply run --host` calls `signal::listen` well before `Host::stopping_on` wires the socket table.
+/// A run that listens calls `signal::listen` well before `Host::stopping_on` wires the socket table.
 #[test]
 fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     let shutdown = Shutdown::new(Bounds {

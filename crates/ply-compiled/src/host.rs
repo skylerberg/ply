@@ -7,9 +7,8 @@ use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
     Bound, HostAnswer, HostBinding, HostRequest, Unserved, attribute, carries_secret,
-    check_host_answer, err_blocking_answered_inline, err_footprint_escape, err_hermetic,
-    err_host_in_search, err_host_in_simulation, err_secret_to_host, err_withheld, operation_label,
-    resource_of,
+    check_host_answer, err_blocking_answered_inline, err_footprint_escape, err_host_in_search,
+    err_host_in_simulation, err_secret_to_host, err_withheld, operation_label, resource_of,
 };
 use ply_core::sim::TASK_OPS;
 use ply_core::{Diagnostic, Span, Symbol, Value, codes};
@@ -74,7 +73,7 @@ fn bound<'b>(
     let operation = operation_label(effect, op, resource);
     let resolved = binding.resolve(effect, op, resource);
     // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
-    // any handler could give -- bound, withheld or hermetic -- would differ between interleavings.
+    // any handler could give, bound or withheld, would differ between interleavings.
     if let Some(region) = crate::simulate::seeded_region(c)
         && !matches!(resolved, Err(Unserved::Unregistered))
     {
@@ -82,19 +81,7 @@ fn bound<'b>(
     }
     resolved.map_err(|unserved| match unserved {
         Unserved::Unregistered => err_unhandled(span, effect, op, resource),
-        Unserved::Hermetic(path) => {
-            let hermetic = err_hermetic(span, &operation, path);
-            if c.re_executed {
-                hermetic.note(
-                    "`--host` would then refuse this: the search runs a seeded test whole once per interleaving, so a handler would answer it once per schedule",
-                )
-            } else {
-                hermetic
-            }
-        }
-        Unserved::Withheld { path, served } => {
-            err_withheld(span, &operation, effect, path, served)
-        }
+        Unserved::Withheld { path, served } => err_withheld(span, &operation, effect, path, served),
     })
 }
 

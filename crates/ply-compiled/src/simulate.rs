@@ -215,11 +215,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
     let c = unsafe { &mut *ctx };
     let Some(permit) = HostPolicy::of(&c.binding) else {
         let operation = ply_core::host::operation_label(effect, op, None);
-        let path = c
-            .binding
-            .would_serve(effect, op, None)
-            .unwrap_or("ply_host::sched::spawn");
-        c.fail(ply_core::host::err_hermetic(c.site(), &operation, path));
+        c.fail(ply_core::host::err_unbound(c.site(), &operation));
         return false;
     };
     let id = SimId(c.entered_sims);

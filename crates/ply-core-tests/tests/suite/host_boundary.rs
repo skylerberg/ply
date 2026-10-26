@@ -2,18 +2,28 @@
 //! the operation and the handler, and says what would or would not help. Which calls reach these is
 //! the CLI suite's `host_boundary` module, over real host operations.
 
-use ply_core::host::{err_blocking_answered_inline, err_footprint_escape, err_hermetic};
+use ply_core::host::{err_blocking_answered_inline, err_footprint_escape, err_withheld};
 use ply_core::{EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes};
 
-/// E0424 means "pass `--host`", which a handler is named for.
+/// A run that withholds an operation names the handler that serves it, where it serves it, and the
+/// twin a test answers it over.
 #[test]
-fn a_hermetic_refusal_names_the_handler_that_would_have_answered() {
-    let d = err_hermetic(Span::DUMMY, "t.net.send[socket]", "test::send");
-    assert_eq!(d.code, codes::HERMETIC_BOUNDARY);
-    assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
+fn a_withheld_refusal_names_the_handler_and_where_it_serves() {
+    let d = err_withheld(
+        Span::DUMMY,
+        "std.process.process.out[proc]",
+        &Symbol::new("std.process.process"),
+        "test::out",
+        "under `ply run`",
+    );
+    assert_eq!(d.code, codes::HOST_UNBOUND);
+    assert!(d.message.contains("process.out[proc]"), "{}", d.message);
     let notes = d.notes.join(" ");
-    assert!(notes.contains("test::send"), "{notes}");
-    assert!(notes.contains("--host"), "{notes}");
+    assert!(
+        notes.contains("`test::out` serves this under `ply run`"),
+        "{notes}"
+    );
+    assert!(notes.contains("`std.process`'s twin"), "{notes}");
 }
 
 /// The declared footprint is checked before the handler runs, or the packet is already out.

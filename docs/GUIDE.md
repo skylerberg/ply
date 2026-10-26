@@ -21,15 +21,15 @@ fn greeting() -> String = "hello from ply"
 fn main() -> Unit / {Console} = print(greeting())
 ```
 
-`ply run hello --host` evaluates `main`: `print` writes `hello from ply` to
+`ply run hello` evaluates `main`: `print` writes `hello from ply` to
 standard output, the run reports the value `main` returned (`()`) and exits `0`.
 Output is an effect, not a builtin: `print` takes a `String` and is
 `std.console`'s wrapper over `std.process`'s `out`, a value that is not one goes
 through interpolation (`print(f"n = {n}")`), `Console` is the three console
 streams as an effect set (`read_line` reads one line of input), all named with
-no import (§13), and `--host` binds them to the run's own console
-(`ply doc std.console`, §14); a run
-without it is hermetic and refuses them (`E0424`). The everyday commands are
+no import (§13), and `ply run` binds them to the run's own console
+(`ply doc std.console`, §14); a test is no process and is refused them
+(`E0424`). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a directory and acts on the project that holds it;
 with no path it acts on the package the working directory is part of.
@@ -39,7 +39,7 @@ whose row says `diverges`, why its calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` that prints and one test — and
-`cd demo && ply run . --host` prints `hello from demo` while `ply test` runs the
+`cd demo && ply run .` prints `hello from demo` while `ply test` runs the
 test. The directory's last segment names the package, so
 `ply new store/orders` makes `orders`; `--name` overrides it when the
 directory is not a name (`ply new lib-src --name core`), and `--lib` writes a
@@ -1633,7 +1633,7 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
   or the body of a `handle` is kept in turn by any `handle` around it. So is
   one whose branches hold a task or a continuation, and so is every
   block of a program entered on another's branch, as each test of a `ply test`
-  run is. Under `--host` each branch waits on a reactor of its own.
+  run is. Each branch waits on the host through a reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
   of them a `write`; or a branch's row is open (it calls a function value whose
   row is a variable) while another performs anything; or a branch opens a
@@ -2027,8 +2027,8 @@ which releases once.
 cover. `E0303`: an effect
 escaped inference (a compiler defect). `E0305`: a `handle` lacks a clause for
 an operation its body performs on an atom it handles. `E0424`: an operation
-reached the host boundary with nothing bound — pass `--host` or handle it
-(§14).
+reached the host boundary with nothing bound to serve it, as a test's own
+process streams are — handle it (§14).
 
 ### 6.8 Raising
 
@@ -2063,7 +2063,7 @@ raise in another clause goes to a `handle` further out than the one whose
 clause raised. A clause answers the raise it names and leaves the effect's
 others to pass. A raise no clause answers ends the run with `E0502`, naming the
 operation and what it carried; a test's is its failure, which is why a raise is
-in no footprint (§8.4). One raise is the host's own under `ply run --host`:
+in no footprint (§8.4). One raise is the host's own under `ply run`:
 `std.process`'s `pipe.broken`, unanswered, ends the run as the closed pipe it
 reports would have, with nothing written and status 141 (§16).
 
@@ -2235,8 +2235,8 @@ resumption would add to what the first left.
 
 The tasks spawned under a handler share its variables (§9). A clause runs with
 no other task's clause running in between until it performs something that may
-wait, such as a `task` or `clock` operation or a host operation under
-`--host`: one that reads a variable, waits, and then assigns it may write over
+wait, such as a `task` or `clock` operation or a host operation: one that
+reads a variable, waits, and then assigns it may write over
 what another task's clause assigned meanwhile. Keep a read and the assignment
 it decides on the same side of every wait. `simulate` searches the orders in
 which tasks reach a handler's variables, so a test of such a handler meets the
@@ -2333,7 +2333,7 @@ The scheduler that runs a spawned task must be younger than the region whose
 hold the task can reach: open it inside the region,
 `with_hold[r](..) { h -> simulate { .. } }`, and not around it,
 `simulate { with_hold[r](..) { h -> .. } }`. An older scheduler — an enclosing
-`simulate` region (§9), or the production one under `--host` — drains the tasks
+`simulate` region (§9), or the production one a run opens outside it — drains the tasks
 nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join. A task reaches a hold through
 the closure it is handed, and through the handlers around its `task.spawn`: a
@@ -2468,7 +2468,7 @@ test "an order renders as stored" {
 with the diff that creates a file nothing stores yet, and never writes one.
 Storing is `snapshot::accept`, which writes through `std.fs`: an entry calls
 it, and a person runs that entry with the directory lent, as
-`ply run . --host --fs snapshots=snapshots` lends it (§14). `ply doc
+`ply run . --fs snapshots=snapshots` lends it (§14). `ply doc
 std.snapshot` has the rest.
 
 ### 8.2 Selection
@@ -2484,11 +2484,12 @@ or a new `ply` that compiles a test to the same code; the selection line counts 
 (`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json`
 gives each definition's and test's as `hash`.
 
-A pass is filed with what its run read of the world: each file and directory a handler read under a
-root (by the root's name, so a pass reads the same from another checkout), each shipped module it
-asked for, and what every `ply` it started read in turn, that `ply`'s own program and shipped
-modules included; and for a run that reached a host handler, the binding it ran under (whether
-`--host`, and the names `--fs`, `--exec` and `--allow` lend). A load that read a shipped module for
+A pass is filed with what its run read of the world: each file and directory the handler that
+answered it from the host read under a root (by the root's name, so a pass reads the same from
+another checkout), each shipped module it asked for, and what every `ply` it started read in turn,
+that `ply`'s own program and shipped modules included; and for a run that reached a host handler,
+the binding it ran under (the names `--fs`, `--exec` and `--allow` lend). A read a handler of the
+test's own answers touches no host and is no input. A load that read a shipped module for
 what its program reaches (§13) files the module's types, effects and imports and each function the
 program reached, by hash, in place of the module, so an edit to a function no program of the test
 reached runs nothing. It stands while each of those still answers as it did, and otherwise the test
@@ -2554,7 +2555,7 @@ A failing deterministic test that has passed before is bisected over the
 definitions that changed to name a culprit. `--bisect auto|always|never`
 (default `auto`) and `--bisect-budget N` (evaluations, default 64) control
 this. `--json` prints one object with each failure's diagnostic, declared
-footprint, suspects, culprit and replay command (`schema_version` 6); the
+footprint, suspects, culprit and replay command (`schema_version` 7); the
 suspects are ranked culprits first, then an edited definition before one whose
 hash only moved. Each result counts the operations its test performed,
 handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
@@ -3384,52 +3385,55 @@ module of it, each one whole.
 
 ## 14. The host boundary
 
+Every run binds the host: `ply run`, `ply test` and `ply hosts` alike. What a
+run is lent by flag is only what names a place or a power: the roots `--fs`
+binds, the programs `--exec` binds and the families `--allow` lends. Everything
+else is open by default.
+
 An effect whose module declares its real handler (§6.10) never reaches the
-boundary: every root whose row names it runs under that handler, with or
-without `--host` and whatever else the flags say, as the operations of
-`std.os`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`,
-`std.net`, `std.udp`, `std.sqlite`, `std.term`, `std.signal` and `std.trace`
-do. A native
-such a handler calls refuses inside a `simulate` region and in a test the search
-re-runs, as a host operation does (`E0425`). One that would hold the program's
-thread, as a hash does, hands its work to the runtime's threads: as many hashes
-at once as the machine has cores, and the rest in line, while a task of a
-production region that asked waits and the region's other tasks run. A test
-that has the machine compute what is a function of what it is handed, as a
-hash is, is cached like any other; one that read the machine is cached with the
-binding it ran under (§8.2). The environment is open to a program by default,
-and its configuration is what the run's flags resolve: `config.get` and
-`config.secret` answer from the sources `--host` reads (`--set`, `--config`,
-the environment and the schema's defaults), and a run granted none, as one
-without `--host` is, answers `None` for every key. The network is open to a
-program by default too: a run with or without `--host` looks names up, connects
-and listens alike, each socket in a table of the run's own, under the label its
+boundary: every root whose row names it runs under that handler, whatever the
+flags say, as the operations of `std.os`, `std.certgen`, `std.config`,
+`std.password`'s `kdf`, `std.dns`, `std.net`, `std.udp`, `std.sqlite`,
+`std.term`, `std.signal` and `std.trace` do. A native such a handler calls
+refuses inside a `simulate` region and in a test the search re-runs, as a host
+operation does (`E0425`). One that would hold the program's thread, as a hash
+does, hands its work to the runtime's threads: as many hashes at once as the
+machine has cores, and the rest in line, while a task of a production region
+that asked waits and the region's other tasks run. A test that has the machine
+compute what is a function of what it is handed, as a hash is, is cached like
+any other; one that read the machine is cached with the binding it ran under
+(§8.2), and what a real handler read under a root is what its pass stands on.
+
+The environment is open: `config.get` and `config.secret` answer from `--set`,
+`--config`, the environment and the schema's defaults under `ply run`, and from
+`--set`, `--config` and the defaults alone under `ply test`, whose pass would
+otherwise be the machine's. The network is open: a run looks names up, connects
+and listens, each socket in a table of the run's own, under the label its
 operation names. The credentials a TLS listener or upgrade names are the ones
 `--tls` gives the run, so one given none holds none (`E0429`). The console is
-open as well: `std.term` answers from the terminal the process's streams are,
-and the run leaves it in the mode it found it in; `std.signal` answers the
-signals the process is sent, and a run that listens for no stop, as a test's,
-is never asked to stop and hears no signal, installing no handler of its own. `std.trace` writes to the sink `--trace` names; a run without
-`--host` discards every record and still holds each span to being closed
-(`E0445`). A
-database is opened under a root `--fs` lends, so a run lent none opens none
-(`E0451`).
+open: `std.term` answers from the terminal the process's streams are, and the
+run leaves it in the mode it found it in. `ply run` listens for `SIGINT` and
+`SIGTERM` where its root performs `std.signal` or accepts connections
+(`net.accept`), and drains as the flags below say; ctrl-C ends any other
+program at once. A run that listens for no stop, as a test's does, is never
+asked to stop and hears no signal, installing no handler of its own.
+`std.trace` writes to the sink `--trace` names, and holds each span to being
+closed (`E0445`). A database is opened under a root `--fs` lends, so a run
+lent none opens none (`E0451`).
 
-Without `--host`, an operation that reaches the boundary is `E0424`, naming the
-handler that would serve it. With `--host`, a test that can reach a bound
-nondeterministic handler is cached with what it read and the binding it ran
-under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, is
-cached like any other. An operation performed
-inside a `simulate`
-region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.process` (and `std.console` on top of it) is bound
-only by `ply run --host`; `ply test --host` withholds it (`E0424`), except that a
-test run binds `process.bound`, `process.spawn`, `process.start` and the
-operations on a started child, which reach only the programs `--exec` names. All
-flags below require `--host`.
+A test that can reach a nondeterministic handler is cached with what it read
+and the binding it ran under (§8.2), so its pass never answers for a run lent
+other roots, programs or families; one that reaches only deterministic
+handlers, whose answers are a function of what they are handed, is cached like
+any other. An operation performed inside a `simulate` region reaches no handler
+at all: it is `E0425` (§9), since the region is run once per interleaving.
+`std.process` (and `std.console` on top of it) is the run's own process under
+`ply run`; `ply test` withholds it (`E0424`, naming the handler that serves it
+under `ply run`), since a test is no process, except that a test binds
+`process.bound`, `process.spawn`, `process.start` and the operations on a
+started child, which reach only the programs `--exec` names.
 
-Outside a `simulate` region, `--host` answers the language's `task` and `clock`
+Outside a `simulate` region, a run answers the language's `task` and `clock`
 as well. Tasks run in turn on the thread that spawned them, and one that waits,
 on a join, a channel, a host operation or a sleep, is parked alone while the
 others run. `clock.now` reads the run's monotonic clock, in nanoseconds since
@@ -3466,11 +3470,11 @@ performs none of it.
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
 | `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine` (`std.machine`'s `machine`: open a compiled unit, bind the host families the runtime serves itself from what a run is lent, and enter one of the unit's roots), `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise, and where an operation of `machine` that lends the host, measures or clocks an entry is performed by a run not lent it. `machine`'s deterministic half, `hermetic_machine`, answers from what it is handed alone: it binds no host, clocks nothing, and needs no grant, so a test that drives a program through it stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
-| `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
+| `--config PATH` | `KEY=VALUE` file; repeatable, above the environment, which only `ply run` reads |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
 | `--trace json\|text\|off` | trace sink: JSON lines on stderr (default), text, or discard |
 | `--trace-level debug\|info\|warn\|error` | lowest level written (default `info`) |
-| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0) |
+| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0), in a run that listens for them |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
 At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
@@ -3493,7 +3497,7 @@ from `std.db`, which reads and runs its own statements.
 $ ply build . --entry app.serve -o app.plyx
 $ ply build . --digest              # print `b3:...`; writes no file
 $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
-$ ply run app.plyx --host
+$ ply run app.plyx
 ```
 
 A **library** — a package whose manifest names no entry and whose own modules
@@ -3625,7 +3629,7 @@ says so. `http://` is accepted only for a registry on this machine
 The registry is a Ply program, `packages/registry`:
 
 ```
-$ ply run packages/registry --host --fs store=/srv/ply \
+$ ply run packages/registry --fs store=/srv/ply \
     --tls registry=cert.pem,key.pem --set tls=registry --set port=8443 \
     --config tokens.conf
 ```
@@ -3698,11 +3702,11 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
-| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
+| *n* | `process.exit[p](n)` under `ply run`: the program's own, `0` to `125` |
+| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
-Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
-and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
+Flag groups: *simulation* (§9), *host* (§14's flags except trace and drain),
+*prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 `--trace-level`),
 *drain* (`--drain-ms`, `--drain-lead-ms`).
 

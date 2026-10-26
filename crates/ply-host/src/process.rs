@@ -9,7 +9,7 @@ pub use children::{Ended, Finished, Heard};
 use crate::pool::{JobOutput, Pool, option};
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
-use ply_core::host::{HostRegistry, MachineId};
+use ply_core::host::HostRegistry;
 use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Plain, Resource, Span, Symbol, Value, codes, slot,
@@ -350,11 +350,10 @@ pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn Ho
 }
 
 /// Where an operation about the run's own process is served, for a refusal to say.
-pub const ONLY_A_RUN: &str =
-    "under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed";
+pub const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
 /// Where an operation on a program `--exec` binds is served.
-const AN_EXECUTABLE: &str = "under `--host` for a label `--exec` binds to a program";
+const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
 
 /// Withheld without a host, so a run that was given no arguments never binds a process it is not;
 /// a host that only starts programs withholds what is about the run's own process.
@@ -502,7 +501,7 @@ impl HostHandler for Operation {
                 ),
             )
             .primary(span, "performed here")
-            .note("only `ply run --host` binds `process`, and a withheld registration is in no binding index")
+            .note("only `ply run` binds `process`, and a withheld registration is in no binding index")
             .note("this is a defect in Ply's host dispatch rather than in the program"));
         };
         match self.op {
@@ -575,7 +574,7 @@ impl HostHandler for Operation {
                 let program = program.to_path_buf();
                 let args = argument_vector(&req.args[0], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?.to_string();
-                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
+                let env = traced(rt, environment(self.op, &req.args[2], span)?);
                 let pending = host.pool.submit(
                     run()?,
                     span,
@@ -590,7 +589,7 @@ impl HostHandler for Operation {
                     return Err(unbound(self.op, &req.atom.resource, span));
                 };
                 let args = argument_vector(&req.args[0], span)?;
-                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
+                let env = traced(rt, environment(self.op, &req.args[2], span)?);
                 let io = io_of(&req.args[3], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?;
                 // What the program wrote before the child comes before what the child writes.
@@ -606,11 +605,13 @@ impl HostHandler for Operation {
                     io: &io,
                 };
                 let started = host.children.start(&launch, &host.sink);
-                for output in [&io.out, &io.err] {
-                    if let Output::File(path) = output
-                        && let Ok(at) = Path::new(dir).join(path).canonicalize()
-                    {
-                        crate::observe::wrote(req.machine, &at);
+                if let Some(recorder) = crate::observe::of(rt) {
+                    for output in [&io.out, &io.err] {
+                        if let Output::File(path) = output
+                            && let Ok(at) = Path::new(dir).join(path).canonicalize()
+                        {
+                            recorder.wrote(&at);
+                        }
                     }
                 }
                 Ok(HostAnswer::Value(match started {
@@ -687,12 +688,12 @@ fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic>
 
 /// The whole environment a child runs under; a later entry for one name wins, as `Map::insert`
 /// does.
-/// `env` and, when a test is observing `machine`, where a `ply` the child is reports what it read.
-fn traced(machine: MachineId, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    if let Some(file) = crate::observe::child_trace(machine) {
+/// `env` and, where the run asking is observed, where a `ply` the child is reports what it read.
+fn traced(runtime: &dyn HostRuntime, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    if let Some(recorder) = crate::observe::of(runtime) {
         env.push((
             crate::observe::TRACE_VAR.to_string(),
-            file.to_string_lossy().into_owned(),
+            recorder.child_trace().to_string_lossy().into_owned(),
         ));
     }
     env

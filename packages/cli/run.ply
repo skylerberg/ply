@@ -98,7 +98,7 @@ fn entry_of(target: Target) -> Result<String, Diag> / {abort.raise} =
 
 /// The one line that says what this run may reach, and each facility's own under it.
 fn binding_lines(style: Style, bound: Bound, c: Configuration) -> List<String> / {abort.raise} =
-  if bound.hermetic { [] } else {
+  if bound.operations == 0 { [] } else {
     let head = [
       indent()
         ++ dim(
@@ -321,7 +321,6 @@ fn shutdown_json(e: Ended) -> Json =
 fn document(
   target: Target,
   en: String,
-  bound: Bound,
   resolution: Resolution,
   e: Ended,
   ok: Bool,
@@ -338,7 +337,6 @@ fn document(
     ).concat([
       { key: "entry", value: Str(en) },
       { key: "module", value: Str(module_of(en)) },
-      { key: "binding", value: Str(if bound.hermetic { "hermetic" } else { "host" }) },
       { key: "counters", value: counters_json(e.counters) },
       { key: "hosts", value: e.hosts },
       { key: "value", value: match e.value { Some(v) -> Str(render(v)), None -> Null } },
@@ -361,13 +359,12 @@ fn exited(
   style: Style,
   target: Target,
   en: String,
-  bound: Bound,
   resolution: Resolution,
   e: Ended,
   code: Int,
 ) -> Answer / {abort.raise} =
   {
-    json: document(target, en, bound, resolution, e, code == ok_code(), code, noted(resolution, e)),
+    json: document(target, en, resolution, e, code == ok_code(), code, noted(resolution, e)),
     lines: handshake_lines(style, e),
     errs: stop_lines(style, e).concat(warned_lines(style, e.warnings)),
     code: code,
@@ -377,12 +374,11 @@ fn answered(
   style: Style,
   target: Target,
   en: String,
-  bound: Bound,
   resolution: Resolution,
   e: Ended,
 ) -> Answer / {abort.raise} =
   {
-    json: document(target, en, bound, resolution, e, true, ok_code(), noted(resolution, e)),
+    json: document(target, en, resolution, e, true, ok_code(), noted(resolution, e)),
     lines: handshake_lines(style, e).concat([
       indent() ++ (match e.value { Some(v) -> render(v), None -> "" }),
     ]),
@@ -394,14 +390,13 @@ fn raised(
   style: Style,
   target: Target,
   en: String,
-  bound: Bound,
   resolution: Resolution,
   e: Ended,
   diag: Diag,
 ) -> Answer / {abort.raise} = {
   let code = if drained(diag) { drain_incomplete() } else { failed() };
   {
-    json: document(target, en, bound, resolution, e, false, code, noted(resolution, e).push(diag)),
+    json: document(target, en, resolution, e, false, code, noted(resolution, e).push(diag)),
     lines: [],
     errs: stop_lines(style, e).concat(all_to_text(style, [diag], places_of(target))).concat(
       raised_at(style, target, diag),
@@ -416,15 +411,14 @@ fn ended(
   style: Style,
   target: Target,
   en: String,
-  bound: Bound,
   resolution: Resolution,
   e: Ended,
 ) -> Answer / {abort.raise} =
   match e.exit {
-    Some(code) -> exited(style, target, en, bound, resolution, e, code),
+    Some(code) -> exited(style, target, en, resolution, e, code),
     None -> match e.raised {
-      None -> answered(style, target, en, bound, resolution, e),
-      Some(r) -> raised(style, target, en, bound, resolution, e, shown(r)),
+      None -> answered(style, target, en, resolution, e),
+      Some(r) -> raised(style, target, en, resolution, e, shown(r)),
     },
   }
 
@@ -476,7 +470,6 @@ fn unbound(style: Style, why: Refusal) -> Answer / {abort.raise} = {
       { key: "command", value: Str("run") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
-      { key: "binding", value: Str("host") },
       { key: "diagnostics", value: all_to_json(why.diags, why.places) },
     ]),
     lines: [],
@@ -504,7 +497,7 @@ fn started<| e>(
       Err(why) -> unbound(style, why),
       Ok(b) -> {
         disclosed(style, flags, target, b.bound, r);
-        ended(style, target, en, b.bound, r, (b.enter)())
+        ended(style, target, en, r, (b.enter)())
       },
     },
   }
@@ -529,7 +522,7 @@ fn configured_over(
   loaded: Loaded,
   options: Options,
 ) -> Result<Resolution, List<Diag>> / {entering::machine.enter, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  configuration::opened_by(options.host, options.config, |name: String|
+  configuration::opened_by(true, options.config, |name: String|
     configuration::schema_in(loaded.unit.unit, entries::roots_of(loaded.runnable), name))
 
 /// The binding `options` make for the entry `en` of `loaded`, answering `config`, and the entry
@@ -541,48 +534,41 @@ fn bound_over(
   en: String,
   config: Configured,
 ) -> Result<Entered<| {entering::machine.enter, entering::machine.unbind, abort.raise}>, Refusal> / {entering::machine.hosting, entering::machine.bind, abort.raise} = {
-  let grants = machine::run_grants(options, config);
+  let unlistening = machine::run_grants(options, config, false);
   let declared = loaded.runnable.declared;
   let refused = |diags: List<Diag>|
     Err({ diags: diags, places: places_of(loaded.target), artifact: None });
-  match listing::unlendable(grants.allow, declared) {
+  match listing::unlendable(unlistening.allow, declared) {
     Some(d) -> refused([d]),
     None -> {
-      let hosting = if grants.hermetic { None } else { Some(entering::machine.hosting(grants)) };
-      let listed = match hosting {
-        None -> Ok({ rows: [], handlers: 0 }),
-        Some(h) -> if h.refusals.len() > 0 { Err(h.refusals.map(machine::unplaced)) }
-        else { listing::resolved(h.registrations, declared, loaded.runnable.performed) },
-      };
+      let hosting = entering::machine.hosting(unlistening);
+      let listed = if hosting.refusals.len() > 0 { Err(hosting.refusals.map(machine::unplaced)) }
+      else { listing::resolved(hosting.registrations, declared, loaded.runnable.performed) };
       match listed {
         Err(diags) -> refused(diags),
-        Ok(l) -> match entering::machine.bind(grants) {
-          Err(failures) -> refused(failures.map(machine::unplaced)),
-          Ok(binding) -> {
-            let stop = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
-            let disclosures = match hosting {
-              Some(h) -> listing::disclosures_of(l, h, config, Some(stop)),
-              None -> listing::no_disclosures(),
-            };
-            Ok({
-              bound: {
-                hermetic: grants.hermetic,
-                operations: l.rows.len(),
-                digest: listing::digest_of(l, disclosures),
-                trace: match disclosures.observability {
-                  Some(o) -> Some(listing::banner(o)),
-                  None -> None,
-                },
-                signals: match hosting {
-                  Some(h) -> if options.host {
-                    Some({ names: h.signals, lead_ms: stop.lead_ms, drain_ms: stop.drain_ms })
+        Ok(l) -> {
+          let listens = listing::listens(l.rows);
+          match entering::machine.bind(machine::run_grants(options, config, listens)) {
+            Err(failures) -> refused(failures.map(machine::unplaced)),
+            Ok(binding) -> {
+              let stop = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
+              let disclosures = listing::disclosures_of(l, hosting, config, Some(stop));
+              Ok({
+                bound: {
+                  operations: l.rows.len(),
+                  digest: listing::digest_of(l, disclosures),
+                  trace: match disclosures.observability {
+                    Some(o) -> Some(listing::banner(o)),
+                    None -> None,
+                  },
+                  signals: if listens {
+                    Some({ names: hosting.signals, lead_ms: stop.lead_ms, drain_ms: stop.drain_ms })
                   } else { None },
-                  None -> None,
                 },
-              },
-              enter: || entered(loaded, options, en, binding, l, disclosures),
-            })
-          },
+                enter: || entered(loaded, options, en, binding, l, disclosures),
+              })
+            },
+          }
         },
       }
     },
@@ -1146,11 +1132,10 @@ fn a_program() -> Target =
 fn an_artifact() -> Target =
   Deployed({ path: "m.plyx", digest: "b3:1f2e3d4c5b6a", entry: "m.main", definitions: 3 })
 
-fn hermetic() -> Bound = { hermetic: true, operations: 0, digest: "", trace: None, signals: None }
+fn reaching_nothing() -> Bound = { operations: 0, digest: "", trace: None, signals: None }
 
 fn a_binding() -> Bound =
   {
-    hermetic: false,
     operations: 7,
     digest: "b3:aabbccddeeff",
     trace: Some("json on stderr · info"),
@@ -1261,7 +1246,7 @@ fn bare() -> Flags / {abort.raise} = from_argv("run", [])
 fn as_json() -> Flags / {abort.raise} = from_argv("run", ["--json"])
 
 test "a value the entry answered with is one indented line and exit 0" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42)));
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), answered_with(VInt(42)));
   assert_eq(ran.answer.code, 0);
   assert_eq(ran.answer.lines, ["   42"]);
   assert_eq(ran.answer.errs, []);
@@ -1271,13 +1256,17 @@ test "a value the entry answered with is one indented line and exit 0" {
 
 test "the object keys off `command` and `exit_code`, and names the entry and its module" {
   let text = to_string(
-    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
+    ran_over(
+      as_json(),
+      Ok(a_program()),
+      Ok(reaching_nothing()),
+      answered_with(VInt(42)),
+    ).answer.json,
   );
   assert(text.contains("\"command\":\"run\""));
   assert(text.contains("\"exit_code\":0"));
   assert(text.contains("\"entry\":\"m.main\""));
   assert(text.contains("\"module\":\"m\""));
-  assert(text.contains("\"binding\":\"hermetic\""));
   assert(text.contains("\"value\":\"42\""));
   assert(text.contains("\"root\":\"/p\""));
   assert(text.contains("\"files\":[\"m.ply\"]"))
@@ -1309,11 +1298,11 @@ test "`--json` promises stdout to the one object, so nothing else is written at 
   let ran = ran_over(as_json(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
   assert_eq(ran.out, []);
   assert_eq(ran.err, []);
-  assert(to_string(ran.answer.json).contains("\"binding\":\"host\""))
+  assert(to_string(ran.answer.json).contains("\"value\":\"42\""))
 }
 
-test "a hermetic run discloses nothing, because there is nothing it could reach" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), answered_with(VUnit));
+test "a run that performs nothing of the host discloses nothing, because there is nothing it could reach" {
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), answered_with(VUnit));
   assert_eq(ran.out, []);
   assert_eq(ran.err, [])
 }
@@ -1330,7 +1319,7 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
       ),
     ),
   };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
   assert_eq(ran.answer.code, 1);
   assert_eq(ran.answer.lines, []);
   assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: nope");
@@ -1343,7 +1332,7 @@ test "a raise shows the values it carries, rendered where its text names them" {
     value: None,
     raised: Some({ diag: a_diag(b"E0501", b"expected \x010\x02", []), values: [VInt(3)] }),
   };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), raise);
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
   assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: expected 3")
 }
 
@@ -1360,10 +1349,12 @@ test "an expired drain is exit 3, and is not attributed to a line of the program
 
 test "a program that chose its own exit code is answered with that code and no value" {
   let chose = { ..answered_with(VUnit), exit: Some(7), value: None };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), chose);
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), chose);
   assert_eq(ran.answer.code, 7);
   assert_eq(ran.answer.lines, []);
-  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), chose).answer.json);
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), chose).answer.json,
+  );
   assert(text.contains("\"exit_code\":7"));
   assert(text.contains("\"ok\":false"));
   assert(text.contains("\"value\":null"))
@@ -1391,7 +1382,9 @@ test "the shutdown block counts the spans left open, as the warning that named t
     warnings: [left_open()],
     teardown: { ..no_teardown(), spans_left_open: 2 },
   };
-  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), finished).answer.json);
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), finished).answer.json,
+  );
   assert(text.contains("\"spans_left_open\":2"))
 }
 
@@ -1413,11 +1406,13 @@ fn warned_of_spans() -> List<String> =
 
 test "spans an entry left open are warned of on stderr under its answer, and its exit 0 stands" {
   let finished = { ..answered_with(VInt(3)), warnings: [left_open()] };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), finished);
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), finished);
   assert_eq(ran.answer.code, 0);
   assert_eq(ran.answer.lines, ["   3"]);
   assert_eq(ran.answer.errs, warned_of_spans());
-  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), finished).answer.json);
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), finished).answer.json,
+  );
   assert(text.contains("\"code\":\"W0609\""));
   assert(text.contains("\"exit_code\":0"))
 }
@@ -1435,7 +1430,7 @@ test "a raise that left spans open is said first, and the spans after where it w
     ),
     warnings: [left_open()],
   };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(hermetic()), finished);
+  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), finished);
   assert_eq(ran.answer.code, 1);
   let errs = ran.answer.errs;
   assert_eq(errs.at_or(0, ""), "Error[E0502]: boom");
@@ -1444,10 +1439,15 @@ test "a raise that left spans open is said first, and the spans after where it w
 }
 
 test "an artifact says which file it ran, its digest, and what it carries" {
-  let ran = ran_over(bare(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42)));
+  let ran = ran_over(bare(), Ok(an_artifact()), Ok(reaching_nothing()), answered_with(VInt(42)));
   assert_eq(ran.out, ["   program b3:1f2e3d4c5b6a · 3 definitions"]);
   let text = to_string(
-    ran_over(as_json(), Ok(an_artifact()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
+    ran_over(
+      as_json(),
+      Ok(an_artifact()),
+      Ok(reaching_nothing()),
+      answered_with(VInt(42)),
+    ).answer.json,
   );
   assert(text.contains("\"artifact\":\"m.plyx\""));
   assert(text.contains("\"digest\":\"b3:1f2e3d4c5b6a\""));
@@ -1517,7 +1517,7 @@ test "a binding that does not match the program is a start-up failure naming no 
     to_string(
       ran_over(as_json(), Ok(a_program()), Err(why), answered_with(VUnit)).answer.json,
     ).contains(
-      "\"binding\":\"host\"",
+      "\"exit_code\":2",
     ),
   )
 }
@@ -1527,12 +1527,19 @@ test "what the machine reused is a count and a ratio, and no ratio at all over n
     ..answered_with(VInt(42)),
     counters: { updates: 4, updates_in_place: 3, in_place: Decimal::of_string("0.75") },
   };
-  let text = to_string(ran_over(as_json(), Ok(a_program()), Ok(hermetic()), reused).answer.json);
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), reused).answer.json,
+  );
   assert(text.contains("\"updates\":4"));
   assert(text.contains("\"updates_in_place\":3"));
   assert(text.contains("\"in_place\":0.75"));
   let over_nothing = to_string(
-    ran_over(as_json(), Ok(a_program()), Ok(hermetic()), answered_with(VInt(42))).answer.json,
+    ran_over(
+      as_json(),
+      Ok(a_program()),
+      Ok(reaching_nothing()),
+      answered_with(VInt(42)),
+    ).answer.json,
   );
   assert(over_nothing.contains("\"in_place\":null"))
 }

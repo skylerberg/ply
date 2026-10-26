@@ -51,11 +51,11 @@
 //! and the values bound, and the same engine runs over an image in memory as the twin:
 //! `in_memory[app](|| ..)` answers every operation from `sqlite_run`, a builtin that performs
 //! nothing, so a test over it is deterministic and cached, a law may quantify over it, and
-//! neither needs `--host`. The twin keeps a database for each path, gives a transaction its own
+//! neither needs a root. The twin keeps a database for each path, gives a transaction its own
 //! copy, and answers `Busy` at once to a second writer. It differs from a file in three ways: a
 //! deferred foreign key is checked at its statement, not at the commit; `backup` copies the image
 //! without compacting it; and each statement costs a copy of the database, so a test that fills a
-//! large one belongs on a file under `--host`.
+//! large one belongs on a file under a root `--fs` lends.
 //!
 //! A schema's version is `pragma user_version`: a migration is a `transaction` that reads it,
 //! runs the statements past it and sets it.
@@ -65,7 +65,7 @@ import std.sql (Stmt, stmt, Param, PNull, PInt, PBool, PText, PBytes, PFloat, PN
                 Sqlite, scan_statement, refusal_byte)
 import std.bytes (i64_be)
 import std.fs
-import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
+import std.internal.native (native, wait, job_wait, observed, found, parts, in_parts, int_of)
 import std.laws (agrees)
 import std.list
 import std.math (rem_euclid)
@@ -611,7 +611,9 @@ fn served<a | e>(
         options.busy_ms,
         options.statements,
       );
-      opened_read(job_wait(asked))
+      let opened = opened_read(job_wait(asked));
+      match opened { Ok(_) -> recorded(label, path, mode), Err(_) -> () };
+      opened
     },
     sqlite.close[*label](conn) -> job_wait(sqlite_close(label, conn)) == b"\x01",
     sqlite.query[*label](conn, sql, params, limits) ->
@@ -624,7 +626,11 @@ fn served<a | e>(
       ),
     sqlite.control[*label](conn, step) ->
       reply_read(job_wait(sqlite_control(label, conn, step_number(step)))),
-    sqlite.backup[*label](conn, path) -> reply_read(job_wait(sqlite_backup(label, conn, path))),
+    sqlite.backup[*label](conn, path) -> {
+      let reply = reply_read(job_wait(sqlite_backup(label, conn, path)));
+      match reply.failure { None -> observed(label, path, 4), Some(_) -> () };
+      reply
+    },
     sqlite.cursor[*label](conn, sql, params, limits) ->
       reply_read(
         job_wait(sqlite_cursor(label, conn, sql, scalars_written(params), limits_written(limits))),
@@ -686,6 +692,20 @@ extern fn sqlite_fetch(label: String, conn: Int, rows: Int) -> Int / {native.rea
 extern fn sqlite_finish(label: String, conn: Int) -> Int / {native.read}
 
 fn mode_number(mode: Mode) -> Int = match mode { ReadOnly -> 0, ReadWrite -> 1, Create -> 2 }
+
+/// What opening the database at `path` read for an observed test's record: the file and the log
+/// beside it, where it only reads, and else what it may write, the files the engine keeps beside
+/// it among them.
+fn recorded(label: String, path: String, mode: Mode) -> Unit / {native.read} =
+  match mode {
+    ReadOnly -> {
+      observed(label, path, 0);
+      observed(label, path ++ "-wal", 0)
+    },
+    _ ->
+      ["", "-journal", "-wal", "-shm"].fold((), |u: Unit, suffix: String|
+        observed(label, path ++ suffix, 4)),
+  }
 
 fn step_number(step: Control) -> Int =
   match step { Begin -> 0, BeginRead -> 1, Commit -> 2, Rollback -> 3 }
@@ -793,7 +813,7 @@ pub fn storing(m: Memory, path: String, image: Bytes) -> Memory =
 pub type Over<a> = { value: a, memory: Memory }
 
 /// `go` run over `m` as the root its row names, every operation answered by the engine over an
-/// image in memory. It performs nothing, so a test or a law over it needs no `--host` and is
+/// image in memory. It performs nothing, so a test or a law over it needs no root and is
 /// cached. A path that leaves the root raises with `E0452`'s words.
 pub fn on_memory<a, [d] | e>(
   m: Memory,

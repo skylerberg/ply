@@ -90,13 +90,13 @@ impl Policy {
     }
 }
 
-/// Permission to build a [`Policy::Host`] scheduler; unobtainable in a hermetic run.
+/// Permission to build a [`Policy::Host`] scheduler; unobtainable in a run bound to no host.
 pub struct HostPolicy(());
 
 impl HostPolicy {
     /// `None` when nothing is bound.
     pub fn of(binding: &HostBinding) -> Option<HostPolicy> {
-        (!binding.is_hermetic()).then_some(HostPolicy(()))
+        binding.is_granted().then_some(HostPolicy(()))
     }
 }
 
@@ -1518,7 +1518,7 @@ impl<K, B, P: Clone> Scheduler<K, B, P> {
             )
             .primary(span, "performed here")
             .secondary(self.span, "this region schedules against the host runtime")
-            .note("under `--host` a sleep is a deadline on the host's clock, which `sleep_on_host` takes"));
+            .note("in a production region a sleep is a deadline on the host's clock, which `sleep_on_host` takes"));
         }
         let task = self.running()?;
         self.task_mut(task)?.state = TaskState::Blocked {

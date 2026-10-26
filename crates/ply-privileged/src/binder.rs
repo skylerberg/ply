@@ -3,10 +3,11 @@
 //! world a trace of the run's reads is read against.
 
 use crate::hosts::Hosts;
-use ply_compiled::entry::{Bound, Grants, Observation};
+use ply_compiled::entry::{Bound, Grants};
 use ply_compiled::flat::Writer;
 use ply_core::Diagnostic;
-use ply_core::host::{HostBinding, HostResource, MachineId};
+use ply_core::host::{HostBinding, HostResource};
+use ply_host::observe::Recorder;
 use ply_host::tls;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -106,7 +107,7 @@ impl ply_compiled::entry::Binder for Binder {
         });
     }
 
-    fn moved(&self, grants: &Grants, trace: &str, caller: MachineId) -> Option<String> {
+    fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String> {
         ply_host::observe::moved(trace, &Worldly::of(grants).world(), caller)
     }
 }
@@ -166,7 +167,7 @@ impl Bound for Lent {
         self.hosts.binding()
     }
 
-    fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
+    fn runtime_factory(&self) -> ply_core::RuntimeFactory {
         self.hosts.runtime_factory()
     }
 
@@ -174,20 +175,8 @@ impl Bound for Lent {
         self.hosts.requested_exit()
     }
 
-    fn observing(
-        &self,
-        entry: MachineId,
-        caller: MachineId,
-        recorded: bool,
-    ) -> Option<Box<dyn Observation>> {
-        if !recorded {
-            ply_host::observe::adopt(entry, caller);
-            return None;
-        }
-        Some(Box::new(Observed {
-            recorder: ply_host::observe::begin(entry),
-            world: self.world.clone(),
-        }))
+    fn traced(&self, recorder: &Recorder, host: bool) -> Option<String> {
+        ply_host::observe::finished(recorder, &self.world.world(), host)
     }
 
     fn unbind(&self) -> Vec<(String, Vec<u8>)> {
@@ -195,39 +184,24 @@ impl Bound for Lent {
     }
 }
 
-struct Observed {
-    recorder: Arc<ply_host::observe::Recorder>,
-    world: Worldly,
-}
-
-impl Observation for Observed {
-    fn finished(self: Box<Self>, caller: MachineId, host: bool) -> Option<String> {
-        ply_host::observe::end(&self.recorder);
-        ply_host::observe::absorb(caller, &self.recorder);
-        ply_host::observe::finished(&self.recorder, &self.world.world(), host)
-    }
-}
-
-/// What a trace is read against: the roots a run is lent, unless it is hermetic and so reads no
-/// file, and what the run binds apart from the program.
+/// What a trace is read against: the roots a run is lent, and what the run binds apart from the
+/// program.
 #[derive(Clone)]
 struct Worldly {
-    roots: Option<Vec<(String, PathBuf)>>,
+    roots: Vec<(String, PathBuf)>,
     binding: String,
 }
 
 impl Worldly {
     fn of(grants: &Grants) -> Worldly {
-        let roots = (!grants.has("hermetic")).then(|| {
-            roots_of(grants)
-                .map(|roots| {
-                    roots
-                        .listing()
-                        .map(|(name, dir)| (name.to_string(), dir.to_path_buf()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        });
+        let roots = roots_of(grants)
+            .map(|roots| {
+                roots
+                    .listing()
+                    .map(|(name, dir)| (name.to_string(), dir.to_path_buf()))
+                    .collect()
+            })
+            .unwrap_or_default();
         Worldly {
             roots,
             binding: binding_digest(grants),
@@ -236,7 +210,7 @@ impl Worldly {
 
     fn world(&self) -> ply_host::observe::World<'_> {
         ply_host::observe::World {
-            roots: self.roots.as_deref(),
+            roots: &self.roots,
             binding: self.binding.clone(),
             binary: ply_host::observe::Binary {
                 shipped: &crate::shipped::module_digest,
@@ -246,15 +220,10 @@ impl Worldly {
     }
 }
 
-/// What a run binds apart from the program, which a pass's key covers: whether it binds the host,
-/// and the roots, programs and families it is lent, by name.
+/// What a run binds apart from the program, which a pass's key covers: the roots, programs and
+/// families it is lent, by name.
 fn binding_digest(grants: &Grants) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(if grants.has("hermetic") {
-        b"hermetic\0"
-    } else {
-        b"host\0"
-    });
     for part in ["fs", "exec", "allow"] {
         let mut names: Vec<&str> = (grants.named(part))
             .filter_map(|fields| fields.first().map(String::as_str))

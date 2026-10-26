@@ -206,7 +206,7 @@ impl Ctx {
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
-            binding: Arc::new(ply_core::HostBinding::hermetic()),
+            binding: Arc::new(ply_core::HostBinding::unbound()),
             runtime: None,
             runtime_factory: ply_host::registry::unbound(),
             declared: None,
