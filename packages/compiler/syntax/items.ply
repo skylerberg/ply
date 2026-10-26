@@ -29,11 +29,12 @@ import compiler.syntax.type_syntax (TypeExpr, TVar, TRecord, TUnit, TCon, TFn, T
                                     no_generics, dump_ty, dump_row, dump_atom, dump_generics,
                                     dump_mode)
 // `fn_param` allows a default argument; the lambda's `param` refuses one.
-import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, block_expr, expr_span,
-                              no_expr, fn_param, param, declared_param, dump_expr, dump_param,
-                              shown_binder, cases_binder, set_binder, hidden_binder, free_names,
-                              free_binder, case_at, case_identity, case_body, listing, home_modules,
-                              sees_homes, prelude_module)
+import compiler.syntax.exprs (Expr, ELit, EApp, EVar, EBlock, EHandle, HandleClause, Param, expr,
+                              scrutinee, block_expr, expr_span, no_expr, fn_param, param,
+                              declared_param, dump_expr, dump_param, shown_binder, cases_binder,
+                              set_binder, hidden_binder, free_names, free_binder, case_at,
+                              case_identity, case_body, listing, home_modules, sees_homes,
+                              prelude_module)
 import compiler.syntax.patterns (LStr)
 import std.prelude_source
 
@@ -454,6 +455,35 @@ pub fn real_handler_of(module: Module, name: Bytes) -> Option<Bytes> =
         _ -> None,
       },
     })
+
+/// The operations the function `handler` of `module`, a real handler, answers by a ticket's wait:
+/// each whose clause in the `handle` the body is answers what a call of `job_wait`
+/// (`std.internal.native`) answers, work the machine does off the program's thread.
+pub fn real_handler_waits(module: Module, handler: Bytes) -> List<Bytes> =
+  module.items.fold([], |acc: List<Bytes>, item: Item|
+    match item {
+      IFn(d) -> if d.name.name == handler {
+        handled_clauses(d.body).fold(acc, |found: List<Bytes>, c: HandleClause|
+          if waits_on_a_ticket(c.body) { found.push(c.op.name) } else { found })
+      } else { acc },
+      _ -> acc,
+    })
+
+/// The clauses of the `handle` `body` is, through the tail of a block.
+fn handled_clauses(body: Expr) -> List<HandleClause> =
+  match body {
+    EHandle(h) -> h.clauses,
+    EBlock(b) -> match b.tail { Some(tail) -> handled_clauses(tail), None -> [] },
+    _ -> [],
+  }
+
+/// Whether `body` answers, through the tail of a block, what a call of `job_wait` answers.
+fn waits_on_a_ticket(body: Expr) -> Bool =
+  match body {
+    EApp(call) -> match call.func { EVar(v) -> v.name.name.name == b"job_wait", _ -> false },
+    EBlock(b) -> match b.tail { Some(tail) -> waits_on_a_ticket(tail), None -> false },
+    _ -> false,
+  }
 
 pub fn item_span(item: Item) -> Span =
   match item {
@@ -4163,6 +4193,14 @@ test "`host for e by f` is an item naming an effect, and `host` is not reserved"
   assert_eq(parse(b"pub host for e by served\n").parser.diags.map(|d: ParseDiag| d.message), [
     b"a `key`, a `show`, an `invariant` or a `host` cannot be `pub`",
   ])
+}
+
+test "a real handler waits on a ticket for each operation whose clause answers `job_wait`" {
+  let module = parse(
+    b"effect e {\n  read hash(x: Bytes) -> Bytes\n  read now() -> Int\n  read peek() -> Bytes\n}\nhost for e by served\nfn served<a | r>(go: () -> a / {e.read | r}) -> a / r = {\n  handle { go() } with {\n    e.hash(x) -> job_wait(hash_ticket(x)),\n    e.now() -> clock_now(),\n    e.peek() -> { let t = peek_ticket(); job_wait(t) },\n  }\n}\n",
+  ).node;
+  assert_eq(real_handler_waits(module, b"served"), [b"hash", b"peek"]);
+  assert_eq(real_handler_waits(module, b"absent"), [])
 }
 
 test "a header holds the imports a whole parse finds, the hidden ones among them" {

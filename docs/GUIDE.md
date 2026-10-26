@@ -3431,11 +3431,16 @@ operation and label some row of the program names, where a written mode atom
 names every operation of its mode) with its handler, determinism,
 `at-most-once`/`repeatable`, blocking and `Secret` permission, plus the run's
 TLS, filesystem, database, configuration, tracing and shutdown settings;
-`--digest` prints one `b3:` line. A handler for an effect the program does not
-declare, or for a resource it never performs, is `E0421`, two for one atom
-`E0422`, and a determinism mismatch `E0423`. A handler for an operation the
-program's own declaration of the effect lacks binds nothing: the program was
-checked against that declaration, so it performs none of it.
+`--digest` prints one `b3:` line. An effect with a real handler (§6.10) is
+listed under that function's name, its rows read off the declaration: it is
+deterministic unless the effect is `nondet`, an operation is `at-most-once`
+where it is a `write`, it blocks where the handler's clause answers a ticket's
+wait, and it is handed a `Secret` where an argument's type holds one. A handler
+for an effect the program does not declare, or for a resource it never
+performs, is `E0421`, two for one atom `E0422`, and a determinism mismatch
+`E0423`. A handler for an operation the program's own declaration of the effect
+lacks binds nothing: the program was checked against that declaration, so it
+performs none of it.
 
 | flag | meaning |
 | --- | --- |

@@ -1,13 +1,14 @@
-//! The trusted computing base a run binds, resolved in this program from what the runtime's own
-//! families register (`machine.hosting`) and what the program declares and performs: each
-//! operation a run would serve, the refusals a registration that does not fit the program meets,
-//! the facts no row carries, and the digest a CI check pins.
+//! The trusted computing base a run binds, resolved in this program from the real handlers the
+//! program's effects name, what the runtime's own families register (`machine.hosting`), and what
+//! the program declares and performs: each operation a run would serve, the refusals a
+//! registration that does not fit the program meets, the facts no row carries, and the digest a CI
+//! check pins.
 
 import compiler.front.rows (Dump, EffectRow, OpRow, DefRow, TestRow, LawRow, ModuleSpan,
                             module_span_bin)
-import compiler.check.types (Atom, Resource, RNamed, RSingleton, RVar, RAny)
+import compiler.check.types (Atom, Resource, RNamed, RSingleton, RVar, RAny, Type, mentions_secret)
 import compiler.check.resolve.tables (Diag, Label)
-import compiler.syntax.type_syntax (mode_text)
+import compiler.syntax.type_syntax (mode_text, MRead, MWrite)
 import diagnostic (diag_of)
 import machine (Configured, Named)
 import std.bin
@@ -72,17 +73,27 @@ pub type Disclosures = {
   shutdown: Option<Stopping>,
 }
 
-/// An effect the program declares, as a binding is resolved against it.
+/// An effect the program declares, as a binding is resolved against it: `host` its real handler,
+/// by program-wide name, where its module declares one.
 pub type Declared = {
   name: Bytes,
   simple_name: Bytes,
   nondet: Bool,
   at: ModuleSpan,
   ops: List<DeclaredOp>,
+  host: Option<Bytes>,
 }
 
-/// `mode` is `read` or `write`.
-pub type DeclaredOp = { name: Bytes, mode: Bytes, resource_param: Bool, at: ModuleSpan }
+/// `mode` is `read` or `write`; `secrets` is whether an argument may hold a `Secret`, and `waits`
+/// whether the effect's real handler answers it by a ticket's wait.
+pub type DeclaredOp = {
+  name: Bytes,
+  mode: Bytes,
+  resource_param: Bool,
+  at: ModuleSpan,
+  secrets: Bool,
+  waits: Bool,
+}
 
 derive bin for DeclaredOp
 derive bin for Declared
@@ -96,7 +107,15 @@ pub fn declared_of(d: Dump) -> List<Declared> =
       nondet: e.nondet,
       at: e.at,
       ops: e.ops.map(|o: OpRow|
-        { name: o.name, mode: o.mode, resource_param: o.resource_param, at: o.at }),
+        {
+          name: o.name,
+          mode: o.mode,
+          resource_param: o.resource_param,
+          at: o.at,
+          secrets: o.params.any(|t: Type| mentions_secret(t)),
+          waits: e.waits.contains(o.name),
+        }),
+      host: e.host,
     })
 
 /// A family `--allow` names, and the effects it lends.
@@ -156,20 +175,56 @@ pub fn performed(d: Dump) -> List<Atom> =
     d.laws.fold([], |acc: List<Atom>, row: LawRow| acc.concat(row.footprint)),
   )
 
-/// The rows the registrations resolve to against the program, or every registration-time refusal:
-/// an effect nobody declares (`E0421`), two declarations of one name or two handlers of one triple
-/// (`E0422`), a nondeterministic handler of an effect not declared `nondet` (`E0423`).
+/// The rows the real handlers the program's effects name and the registrations resolve to against
+/// the program, or every registration-time refusal: an effect nobody declares (`E0421`), two
+/// declarations of one name or two handlers of one triple (`E0422`), a nondeterministic handler of
+/// an effect not declared `nondet` (`E0423`).
 pub fn resolved(
   registrations: List<entering::Registration>,
   effects: List<Declared>,
   performed: List<Atom>,
 ) -> Result<Listing, List<Diag>> / {abort.raise} = {
   let start: Resolving = { rows: Map::new(), claimed: Map::new(), diags: [] };
-  let done = registrations.fold(start, |acc: Resolving, r: entering::Registration|
+  let served = effects.fold(start, |acc: Resolving, e: Declared| really_served(acc, e, performed));
+  let done = registrations.fold(served, |acc: Resolving, r: entering::Registration|
     resolve_one(acc, r, effects, performed));
-  if done.diags.len() == 0 { Ok({ rows: done.rows.values(), handlers: registrations.len() }) }
+  let handlers = registrations.len() + effects.filter(|e: Declared| e.host != None).len();
+  if done.diags.len() == 0 { Ok({ rows: done.rows.values(), handlers: handlers }) }
   else { Err(done.diags) }
 }
+
+/// The rows the real handler of `e`, where its module declares one, serves: each operation on each
+/// label the program performs it on. What the declaration says is what the handler is: it is
+/// deterministic unless the effect is `nondet`, an operation is at most once where it writes, it
+/// blocks where its clause answers a ticket's wait, and it may be handed a `Secret` where an
+/// argument's type holds one.
+fn really_served(acc: Resolving, e: Declared, performed: List<Atom>) -> Resolving / {abort.raise} =
+  match e.host {
+    None -> acc,
+    Some(by) -> {
+      let handler = String::of_bytes_lossy(by);
+      e.ops.fold(acc, |a: Resolving, op: DeclaredOp|
+        performed_labels(e, op, performed).fold(a, |b: Resolving, label: Resource| {
+          let key = row_key(e, op, label);
+          {
+            ..b,
+            claimed: b.claimed.insert(key, handler),
+            rows: b.rows.insert(key, {
+              effect: String::of_bytes_lossy(e.name),
+              op: String::of_bytes_lossy(op.name),
+              resource: label_name(label),
+              triple: triple_of(e, op, label),
+              handler: handler,
+              deterministic: !e.nondet,
+              linear: op.mode == b"write",
+              blocking: op.waits,
+              secrets: op.secrets,
+              declared_nondet: e.nondet,
+            }),
+          }
+        }))
+    },
+  }
 
 type Resolving = { rows: Map<Bytes, Row>, claimed: Map<Bytes, String>, diags: List<Diag> }
 
@@ -212,8 +267,7 @@ fn names_registration(registered: String, e: Declared) -> Bool =
 fn language_effects() -> List<String> = ["task", "clock", "random", "sim", "abort", "diverges"]
 
 /// The labels a registration serves: the one it names, or each the program performs the operation
-/// on, by the operation or by its mode, where it serves every label. A label a caller fills is no
-/// resource to serve: the call that fills it names one.
+/// on, where it serves every label.
 fn candidates(
   r: entering::Registration,
   declaration: Declared,
@@ -222,13 +276,21 @@ fn candidates(
 ) -> List<Resource> =
   match r.resource {
     Some(named) -> [resource_of(named)],
-    None ->
-      performed.fold([], |acc: List<Resource>, a: Atom|
-        if a.effect == declaration.name && !is_variable(a.resource)
-            && (match a.op { Some(o) -> o == op.name, None -> mode_text(a.mode) == op.mode })
-            && !acc.contains(a.resource) { acc.push(a.resource) }
-        else { acc }),
+    None -> performed_labels(declaration, op, performed),
   }
+
+/// Each label the program performs `op` of `declaration` on, by the operation or by its mode. A
+/// label a caller fills is no resource to serve: the call that fills it names one.
+fn performed_labels(
+  declaration: Declared,
+  op: DeclaredOp,
+  performed: List<Atom>,
+) -> List<Resource> =
+  performed.fold([], |acc: List<Resource>, a: Atom|
+    if a.effect == declaration.name && !is_variable(a.resource)
+        && (match a.op { Some(o) -> o == op.name, None -> mode_text(a.mode) == op.mode })
+        && !acc.contains(a.resource) { acc.push(a.resource) }
+    else { acc })
 
 fn is_variable(r: Resource) -> Bool = match r { RVar(_) -> true, _ -> false }
 
@@ -248,13 +310,13 @@ fn rowed(
   label: Resource,
   performed: List<Atom>,
 ) -> Resolving / {abort.raise} = {
-  let triple = String::of_bytes_lossy(declaration.name) ++ "." ++ r.op ++ label_text(label);
+  let triple = triple_of(declaration, op, label);
   let unused = r.resource != None
     && !performed.any(|p: Atom|
       p.effect == declaration.name && p.resource == label
         && (p.op == Some(op.name) || (p.op == None && mode_text(p.mode) == op.mode)));
   if unused { { ..acc, diags: acc.diags.push(unused_resource(r, triple, declaration)) } } else {
-    let key = Bytes::concat_all([declaration.name, b"\x00", op.name, b"\x00", label_key(label)]);
+    let key = row_key(declaration, op, label);
     match acc.claimed.get(key) {
       Some(first) -> { ..acc, diags: acc.diags.push(conflict(r, first)) },
       None ->
@@ -264,7 +326,7 @@ fn rowed(
           rows: acc.rows.insert(key, {
             effect: String::of_bytes_lossy(declaration.name),
             op: r.op,
-            resource: match label { RNamed(n) -> Some(String::of_bytes_lossy(n)), _ -> None },
+            resource: label_name(label),
             triple: triple,
             handler: r.handler,
             deterministic: r.deterministic,
@@ -277,6 +339,19 @@ fn rowed(
     }
   }
 }
+
+/// `op` of `declaration` on `label`, as a row prints it.
+fn triple_of(declaration: Declared, op: DeclaredOp, label: Resource) -> String =
+  String::of_bytes_lossy(declaration.name) ++ "." ++ String::of_bytes_lossy(op.name)
+    ++ label_text(label)
+
+/// What the rows are claimed and ordered by: the effect, the operation and the label.
+fn row_key(declaration: Declared, op: DeclaredOp, label: Resource) -> Bytes =
+  Bytes::concat_all([declaration.name, b"\x00", op.name, b"\x00", label_key(label)])
+
+/// The label a row names, `None` where the operation is on no label.
+fn label_name(r: Resource) -> Option<String> =
+  match r { RNamed(n) -> Some(String::of_bytes_lossy(n)), _ -> None }
 
 /// A label as a triple prints it.
 fn label_text(r: Resource) -> String =
@@ -679,4 +754,74 @@ fn shared_prefix(a: String, b: String) -> Int = {
       if acc.going && x.at(i) == y.at(i) { { n: acc.n + 1, going: true } }
       else { { ..acc, going: false } },
   ).n
+}
+
+/// `kdf`, served by its real handler: `hash` hands it a secret and waits on a ticket, `stamp`
+/// writes on a label, and `idle` is performed by nothing.
+fn hashing() -> Declared = {
+  let at: ModuleSpan = { module: 0, start: 0, end: 0 };
+  let op = |name: Bytes, mode: Bytes, labelled: Bool, secrets: Bool, waits: Bool|
+    { name: name, mode: mode, resource_param: labelled, at: at, secrets: secrets, waits: waits };
+  {
+    name: b"std.password.kdf",
+    simple_name: b"kdf",
+    nondet: false,
+    at: at,
+    ops: [
+      op(b"hash", b"read", false, true, true),
+      op(b"stamp", b"write", true, false, false),
+      op(b"idle", b"read", false, false, false),
+    ],
+    host: Some(b"std.password.served"),
+  }
+}
+
+fn hashed() -> List<Atom> =
+  [
+    { effect: b"std.password.kdf", resource: RSingleton, mode: MRead, op: Some(b"hash") },
+    { effect: b"std.password.kdf", resource: RNamed(b"log"), mode: MWrite, op: None },
+  ]
+
+test "a real handler serves each operation of its effect on each label the program performs it on" {
+  match resolved([], [hashing()], hashed()) {
+    Err(diags) -> panic("refused with " ++ diags.len().to_string() ++ " diagnostics"),
+    Ok(l) -> {
+      assert_eq(l.handlers, 1);
+      assert_eq(
+        l.rows.map(|r: Row|
+          (
+            r.triple,
+            r.handler,
+            r.deterministic,
+            r.linear,
+            r.blocking,
+            r.secrets,
+            r.declared_nondet,
+          )),
+        [
+          ("std.password.kdf.hash", "std.password.served", true, false, true, true, false),
+          ("std.password.kdf.stamp[log]", "std.password.served", true, true, false, false, false),
+        ],
+      );
+      assert(!reaches(l, hashed()), Some("a deterministic handler reaches no host"))
+    },
+  }
+}
+
+test "a registration of an operation a real handler serves is a second handler of it" {
+  let registered: entering::Registration = {
+    effect: "std.password.kdf",
+    op: "hash",
+    resource: None,
+    deterministic: true,
+    repeatable: true,
+    blocking: false,
+    secrets: true,
+    handler: "ply_host::kdf::hash",
+    facility: "",
+  };
+  match resolved([registered], [hashing()], hashed()) {
+    Ok(_) -> panic("two handlers of `kdf.hash` were listed"),
+    Err(diags) -> assert_eq(diags.map(|d: Diag| d.code), [b"E0422"]),
+  }
 }
