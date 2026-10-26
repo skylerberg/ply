@@ -15,14 +15,14 @@ import compiler.check.infer.checker (MemberSite, WitnessOp, listing_ty)
 import compiler.check.infer (RootFacts, expanded_mods)
 import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, machine_calls)
 import compiler.check.types (Type, TyCon, TyVar, TyFn, Scheme, Atom, int_type, bool_type,
-                             bytes_type, unit_type, fn_type, monomorphic, row_empty)
+                             bytes_type, unit_type, fn_type, monomorphic, row_empty, read_atoms)
 import compiler.emit.lower.setting (Setting, declared_schemes, walked_read, defs_in,
                                     resolved_imports, effects_in, params_carried, law_params,
                                     facts_by_item, filings_of, labels_of, param_type)
 import compiler.emit.lower.calling (known_body, lambdas_of, named_in, def_in)
 import compiler.emit.lower.scalars (walked_container)
 import compiler.emit.typing (Typed, Filings, no_filings)
-import compiler.front.rows (Rows, KnownDefRow, KnownTestRow, EffectHash, ModuleDerivations)
+import compiler.front.rows (Rows, KnownDefRow, KnownTestRow, ModuleDerivations)
 import compiler.front.published (facts_read)
 import std.list
 import compiler.front.diagnostics (with_prelude_source)
@@ -48,7 +48,8 @@ import compiler.emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, E
 import compiler.emit.written (WrittenRoot, WrittenCode, CrossedSums, container_code,
                               contained_formed, crossing_root, crossing_op, entered_code,
                               stored_code, crosses, equality_code, ordering_code, keyed_by,
-                              keyed_code, numeric_stated, stated_code, digest_code, reflection_code)
+                              keyed_code, numeric_stated, stated_code, digest_code, reflection_code,
+                              called_def)
 import compiler.emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_from,
                             emitted_of)
 import compiler.emit.release (generated)
@@ -248,8 +249,8 @@ pub type Scope = {
   lent: Map<RootName, List<Int>>,
   /// Each effect whose module declares its real handler, by program-wide name.
   hosts: Map<Bytes, Hosting>,
-  /// The declared effects each test performs once it has handled what it handles, by its key.
-  test_effects: Map<Bytes, List<Bytes>>,
+  /// The atoms each test performs once it has handled what it handles, by its key.
+  test_rows: Map<Bytes, List<Atom>>,
 }
 
 /// An effect's real handler as an entry calls it: by `call`, a name `import` binds and no source
@@ -441,10 +442,13 @@ pub fn scope_of(
                             declared_lent(m, module, defs),
                         ),
                         hosts: hosts,
-                        test_effects: rows.tests.fold(
+                        test_rows: rows.tests.fold(
                           Map::new(),
-                          |m: Map<Bytes, List<Bytes>>, r: KnownTestRow|
-                            m.insert(r.key, r.effect_hashes.map(|h: EffectHash| h.name)),
+                          |m: Map<Bytes, List<Atom>>, r: KnownTestRow|
+                            match read_atoms(r.footprint) {
+                              Some(xs) -> m.insert(r.key, xs),
+                              None -> m,
+                            },
                         ),
                       }),
                   }
@@ -505,13 +509,6 @@ fn hosted_by(
     |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
   ).fold([], |acc: List<{ effect: Bytes, hosting: Hosting }>, e: Bytes|
     match hosts.get(e) { Some(h) -> acc.push({ effect: e, hosting: h }), None -> acc })
-
-/// The effects a root typed by `scheme` performs, by program-wide name.
-fn performed_by(scheme: Option<Scheme>) -> List<Bytes> =
-  match scheme {
-    Some(sc) -> match sc.ty { TyFn(f) -> f.effects.atoms.map(|a: Atom| a.effect), _ -> [] },
-    None -> [],
-  }
 
 /// The roots `roots` keys lowered in `s`, in its modules' order, each written against `handed` where
 /// it calls a definition lowered apart.
@@ -1166,7 +1163,7 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
               let entered = entering(
                 s,
                 wanted,
-                hosted_by(f.scope.hosts, performed_by(schemes.get(p.full))),
+                f.scope.hosts,
                 Named(p.full),
                 schemes.get(p.full),
                 out,
@@ -1176,7 +1173,7 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
                 entering(
                   s,
                   wanted,
-                  [],
+                  f.scope.hosts,
                   Stored(Named(p.full)),
                   Some(monomorphic(fn_type([], bytes_type(), row_empty()))),
                   storing(s, wanted, p.full, schemes.get(p.full), entered),
@@ -1212,9 +1209,9 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           },
         ]
       };
-      let rooted = |key: RootKey, taken: List<EmitParam>, body: Expr|
+      let rooted = |within: Setting, key: RootKey, taken: List<EmitParam>, body: Expr|
         root_formed(
-          s,
+          within,
           t.span.start,
           key,
           taken.map(|p: EmitParam| p.name),
@@ -1223,18 +1220,24 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           filed(),
           body,
         );
-      // A test runs under the real handlers of what it performs once it has handled what it handles.
+      // A test's entry is typed by what it performs once it has handled what it handles, and its
+      // run takes the words of that row its entry hands it.
+      let performs = {
+        atoms: match f.scope.test_rows.get(qualify(module, t.name)) { Some(xs) -> xs, None -> [] },
+        tail: None,
+      };
+      let ran = {
+        ..s,
+        here: s.here.push(called_def(module, tested, ps.map(param_type), unit_type(), performs)),
+      };
       let run = entering(
         s,
         wanted,
-        hosted_by(f.scope.hosts, match f.scope.test_effects.get(qualify(module, t.name)) {
-          Some(es) -> es,
-          None -> [],
-        }),
+        f.scope.hosts,
         tested,
-        Some(monomorphic(fn_type(ps.map(param_type), unit_type(), row_empty()))),
+        Some(monomorphic(fn_type(ps.map(param_type), unit_type(), performs))),
         if !wants_root(wanted, tested) { acc.out }
-        else { acc.out.push(rooted(tested, ps, test_run(t))) },
+        else { acc.out.push(rooted(ran, tested, ps, test_run(t))) },
       );
       let listing = Cases(tested);
       let out = match t.cases {
@@ -1243,11 +1246,11 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           entering(
             s,
             wanted,
-            [],
+            f.scope.hosts,
             listing,
             Some(monomorphic(fn_type([], listing_ty(), row_empty()))),
             if !wants_root(wanted, listing) { run }
-            else { run.push(rooted(listing, [], test_listing(c))) },
+            else { run.push(rooted(s, listing, [], test_listing(c))) },
           )
         },
       };
@@ -1401,11 +1404,12 @@ fn judged_args(vars: List<Int>) -> List<Type> =
 /// `out` and, where `wanted` holds it, the entry the runtime enters root `root` through, `root`
 /// typed by `scheme`, each type variable an `Int` and each row variable the empty row: a definition
 /// called by name at those, as any caller calls it, and a claim root as it is judged; refused for a
-/// root of no function. The call runs under `hosted`, outermost first.
+/// root of no function. The call runs under the real handler of each effect `scheme`'s row names
+/// that `hosts` holds.
 fn entering(
   s: Setting,
   wanted: Map<RootName, Bool>,
-  hosted: List<{ effect: Bytes, hosting: Hosting }>,
+  hosts: Map<Bytes, Hosting>,
   root: RootKey,
   scheme: Option<Scheme>,
   out: List<RootForm>,
@@ -1425,6 +1429,7 @@ fn entering(
               },
             _ -> { callee: judged_callee(root, sc.ty_vars.len()), at: [], rows: [] },
           };
+          let hosted = hosted_by(hosts, f.effects.atoms.map(|a: Atom| a.effect));
           let e = entered_code(
             s.module,
             root,
@@ -1489,7 +1494,7 @@ fn judged(
   entering(
     s,
     wanted,
-    [],
+    Map::new(),
     root,
     Some({
       ..monomorphic(fn_type(params.map(param_type), bool_type(), row_empty())),
