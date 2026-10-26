@@ -8,11 +8,10 @@ import compiler.syntax.patterns (Lit, LUnit, LStr)
 import compiler.check.types (TyCon)
 import compiler.syntax.parsing (span_between)
 import compiler.emit.c (Width, KNum, ctype, int_lit, is_bitop, bitop_c, unsigned_ctype, width_index,
-                        width_min, width_max, binary_code, overflow_code, wide_code)
+                        width_min, width_max, binary_code, overflow_code)
 import compiler.emit.pieces (spelled)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RImm, Var, Arg,
-                          AVar, AInt, ANum, Scalars, rep_of_arg, arithmetic, comparison, shift,
-                          checked)
+                          AVar, AInt, ANum, Scalars, rep_of_arg, arithmetic, comparison, shift)
 import compiler.emit.print.text (Printing, Place, printing, line, temp, named, arg_text, assigned,
                                  site, check, unprinted)
 import compiler.emit.print.made (c_type)
@@ -497,43 +496,137 @@ fn wide_printed(
       v,
       Bytes::concat_all([b"((PlyWide){ ~", part(a, b"lo"), b", ~", part(a, b"hi"), b" })"]),
     )
-  } else {
-    let second = if shift(op) || op == b"rotl" || op == b"rotr" {
-      Bytes::concat_all([count, b", 0"])
-    } else if op == b"neg" || op == b"checked_neg" || op == b"to_int" { b"0, 0" }
-    else { Bytes::concat_all([part(b, b"lo"), b", ", part(b, b"hi")]) };
-    let call = |out: Bytes|
+  } else { wide_called(p, pr, v, op, w, a, b, count) }
+}
+
+/// An operation over a 128-bit width the head's `print.wide` helpers do in place, each failure
+/// reported as a 64-bit operation's is, a checked one answering whether the exact answer fits.
+fn wide_called(
+  p: Place,
+  pr: Printing,
+  v: Var,
+  op: Bytes,
+  w: Width,
+  a: Bytes,
+  b: Bytes,
+  count: Bytes,
+) -> Printing / {abort.raise} = {
+  let s = if w.signed { b"1" } else { b"0" };
+  let part = |x: Bytes, half: Bytes| Bytes::concat_all([b"(", x, b").", half]);
+  let failing = |at: Printing, condition: Bytes, report: Bytes|
+    line(
+      at,
+      p.depth,
+      Bytes::concat_all([b"if (", condition, b") { ", report, b"; ", p.leave, b" }"]),
+    );
+  let overflow = Bytes::concat_all([b"rt_overflow_p(ctx, ", ascii_of_int(overflow_code(op)), b")"]);
+  let operands = if op == b"neg" || op == b"checked_neg" { Bytes::concat_all([a, b", ", s]) }
+  else { Bytes::concat_all([a, b", ", b, b", ", s]) };
+  let declared = |at: Printing, names: Bytes|
+    line(at, p.depth, Bytes::concat_all([b"PlyWide ", names, b";"]));
+  if op == b"add" || op == b"sub" || op == b"mul" || op == b"neg" {
+    let n = named(site(p, pr), v);
+    failing(
+      declared(n.pr, n.name),
+      Bytes::concat_all([b"ply_wide_", op, b"(", operands, b", &", n.name, b")"]),
+      overflow,
+    )
+  } else if op == b"div" || op == b"rem" {
+    let n = named(site(p, pr), v);
+    let t = temp(n.pr);
+    let zero = failing(
+      declared(t.pr, Bytes::concat_all([n.name, b", ", t.name])),
+      Bytes::concat_all([part(b, b"lo"), b" == 0 && ", part(b, b"hi"), b" == 0"]),
+      if op == b"div" { b"rt_by_zero_p(ctx, 0)" } else { b"rt_by_zero_p(ctx, 1)" },
+    );
+    let quotient = if op == b"div" { n.name } else { t.name };
+    let remainder = if op == b"div" { t.name } else { n.name };
+    failing(
+      zero,
+      Bytes::concat_all([b"ply_wide_divrem(", operands, b", &", quotient, b", &", remainder, b")"]),
+      overflow,
+    )
+  } else if shift(op) {
+    let c = temp(site(p, pr));
+    let held = line(c.pr, p.depth, Bytes::concat_all([b"int64_t ", c.name, b" = ", count, b";"]));
+    let guarded = failing(
+      held,
+      Bytes::concat_all([b"(uint64_t)", c.name, b" >= 128"]),
       Bytes::concat_all([
-        b"rt_wide_op_p(ctx, ",
-        ascii_of_int(wide_code(op, w)),
+        b"rt_shift_count_p(ctx, ",
+        c.name,
         b", ",
+        ascii_of_int(width_index(w)),
+        b")",
+      ]),
+    );
+    bound(p, guarded, v, if op == b"shl" {
+      Bytes::concat_all([b"ply_wide_shl(", a, b", ", c.name, b")"])
+    } else {
+      Bytes::concat_all([
+        b"ply_wide_shr(",
+        a,
+        b", ",
+        c.name,
+        if op == b"shr" { Bytes::concat_all([b", ", s, b")"]) } else { b", 0)" },
+      ])
+    })
+  } else if op == b"wrap_add" || op == b"wrap_sub" || op == b"wrap_mul" {
+    let n = named(pr, v);
+    line(
+      declared(n.pr, n.name),
+      p.depth,
+      Bytes::concat_all([
+        b"(void)ply_wide_",
+        op.slice(5, op.len()),
+        b"(",
+        operands,
+        b", &",
+        n.name,
+        b");",
+      ]),
+    )
+  } else if op == b"saturating_add" || op == b"saturating_sub" || op == b"saturating_mul" {
+    bound(
+      p,
+      pr,
+      v,
+      Bytes::concat_all([b"ply_wide_sat_", op.slice(11, op.len()), b"(", operands, b")"]),
+    )
+  } else if op.starts_with(b"checked_") {
+    let t = temp(pr);
+    bound(
+      p,
+      declared(t.pr, t.name),
+      v,
+      Bytes::concat_all([
+        b"!ply_wide_",
+        op.slice(8, op.len()),
+        b"(",
+        operands,
+        b", &",
+        t.name,
+        b")",
+      ]),
+    )
+  } else if op == b"rotl" || op == b"rotr" {
+    bound(p, pr, v, Bytes::concat_all([b"ply_wide_", op, b"(", a, b", ", count, b")"]))
+  } else if op == b"to_int" {
+    let held = failing(
+      site(p, pr),
+      Bytes::concat_all([b"!ply_wide_fits_int(", a, b", ", s, b")"]),
+      Bytes::concat_all([
+        b"rt_not_an_int_wide_p(ctx, (int64_t)",
         part(a, b"lo"),
-        b", ",
+        b", (int64_t)",
         part(a, b"hi"),
         b", ",
-        second,
-        b", (Word)(intptr_t)&",
-        out,
+        s,
         b")",
-      ]);
-    if op.starts_with(b"checked_") {
-      let t = temp(pr);
-      bound(
-        p,
-        line(t.pr, p.depth, Bytes::concat_all([b"PlyWide ", t.name, b";"])),
-        v,
-        Bytes::concat_all([b"(", call(t.name), b" != 0)"]),
-      )
-    } else {
-      let n = named(site(p, pr), v);
-      let made = line(
-        n.pr,
-        p.depth,
-        Bytes::concat_all([c_type(v.rep), b" ", n.name, b"; ", call(n.name), b";"]),
-      );
-      if checked(op, RWide(w)) { check(p, made) } else { made }
-    }
-  }
+      ]),
+    );
+    bound(p, held, v, Bytes::concat_all([b"(int64_t)", part(a, b"lo")]))
+  } else { unwritten(p, pr, op) }
 }
 
 /// Whether checked operation `op` over 64-bit operands `a` and `b` (`a` alone for a negation) of

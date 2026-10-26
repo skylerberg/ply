@@ -337,6 +337,26 @@ pub unsafe extern "C" fn rt_not_an_int(ctx: *mut Ctx, value: i64) {
     raise_error(ctx, d);
 }
 
+/// `Int::of_i128`, where `signed` is not 0, or else `Int::of_u128`, of the 128-bit width whose
+/// words are `lo` and `hi`, past what an `Int` holds, raised.
+pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, signed: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let (ty, b) = if signed != 0 {
+        (ply_core::IntTy::I128, Builtin::IntOfI128)
+    } else {
+        (ply_core::IntTy::U128, Builtin::IntOfU128)
+    };
+    let x = ply_core::Fixed::new(ty, (u128::from(hi as u64) << 64) | u128::from(lo as u64));
+    match ply_core::builtins::call(b, vec![Value::Fixed(x)], Span::DUMMY) {
+        Err(d) => {
+            raise_error(ctx, d);
+        }
+        Ok(_) => {
+            ctx.fail(error("a 128-bit width an `Int` holds was refused as one"));
+        }
+    }
+}
+
 /// `what` is `emit/c.ply`'s `overflow_code`.
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };

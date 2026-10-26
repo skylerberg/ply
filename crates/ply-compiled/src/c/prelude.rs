@@ -316,6 +316,7 @@ helpers! {
     rt_overflow(what);
     rt_by_zero(what);
     rt_not_an_int(value);
+    rt_not_an_int_wide(lo, hi, signed);
     rt_not_that_width(which, value);
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
