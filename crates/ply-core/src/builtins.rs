@@ -69,8 +69,6 @@ builtins! { $
     WrapAdd = "wrap_add" (a, b) -> Word;
     WrapSub = "wrap_sub" (a, b) -> Word;
     WrapMul = "wrap_mul" (a, b) -> Word;
-    /// The low thirty-two bits of an `Int`, rotated right.
-    Rotr32 = "rotr32" (x, n) -> Word;
     Rotr = "rotr" (x, n) -> Word;
     Rotl = "rotl" (x, n) -> Word;
     /// Over any integer type: the exact answer, or the type's nearest value where it leaves it.
@@ -277,14 +275,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
         }
 
         Builtin::AssertFailed => Err(assertion_failure(&args[0], &args[1], span)),
-
-        Builtin::Rotr32 => {
-            let x = args[0].as_int(span, "`rotr32`")?;
-            let n = args[1].as_int(span, "`rotr32`")?;
-            Ok(Value::Int(i64::from(
-                (x as u32).rotate_right((n & 31) as u32),
-            )))
-        }
 
         // A rotation left is one right by the rest of the width.
         Builtin::Rotr | Builtin::Rotl => {

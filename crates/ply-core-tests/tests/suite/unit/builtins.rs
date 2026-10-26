@@ -86,27 +86,6 @@ fn decimal_of(s: &str) -> Value {
     Value::Decimal(s.parse().unwrap())
 }
 
-#[test]
-fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
-    let cases: &[(i64, i64, i64)] = &[
-        (1, 1, 0x8000_0000),
-        (0x8000_0000, 31, 1),
-        (0x1234_5678, 0, 0x1234_5678),
-        (0x1234_5678, 32, 0x1234_5678),
-        (0x1234_5678, 4, 0x8123_4567),
-        (0x1_0000_0001, 1, 0x8000_0000),
-        (-1, 7, 0xFFFF_FFFF),
-        (2, -1, 4),
-    ];
-    for &(x, n, want) in cases {
-        assert_eq!(
-            done(Builtin::Rotr32, vec![Value::Int(x), Value::Int(n)]).unwrap(),
-            Value::Int(want),
-            "rotr32({x}, {n})"
-        );
-    }
-}
-
 /// Every case is at or across the 64-bit edge, the only place these differ from `+`, `-`, `*`.
 #[test]
 fn the_wrapping_builtins_are_modulo_two_to_the_sixty_fourth() {
