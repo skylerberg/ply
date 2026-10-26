@@ -1245,6 +1245,69 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
   }
 }
 
+/// The C name `text` declares last before `end`, as `Word name` declares it.
+fn declared_before(text: Bytes, end: Bytes) -> Bytes / {abort.raise} =
+  match text.split(end).at(0) {
+    Some(before) -> match before.split(b"Word ").last() {
+      Some(tail) -> tail.slice(0, tail.scan(0, identifier_bytes(), tail.len())),
+      None -> b"",
+    },
+    None -> b"",
+  }
+
+fn identifier_bytes() -> Bytes = b"_0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+/// Each name `text` indexes as an array of words, `((Word *)(intptr_t)name)[k]`, once.
+fn indexed(text: Bytes) -> List<Bytes> / {abort.raise} =
+  text.split(b"((Word *)(intptr_t)").drop(1).fold([], |acc: List<Bytes>, part: Bytes| {
+    let name = part.slice(0, part.scan(0, identifier_bytes(), part.len()));
+    if part.slice(name.len(), part.len()).starts_with(b")[") && !acc.contains(name) {
+      acc.push(name)
+    } else { acc }
+  })
+
+test "a handle over an instance sets and reads each of its words through the instance, never through a closure it lays out" {
+  let src = Bytes::concat_all([
+    b"effect picking {\n  write pick(chosen: Int) -> Unit\n}\n",
+    b"fn form(n: Int) -> Int / {picking.pick, abort.raise} = { picking.pick(n); n }\n",
+    b"fn finished(n: Int) -> { bytes: Int, chosen: List<Int> } / {abort.raise} = handle { form(n) } with { var chosen: List<Int> = [], picking.pick(one) -> { chosen = chosen.push(one); }, return bytes -> { bytes: bytes, chosen: chosen } }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match printed_by_form(p, b"finished") {
+      Err(why) -> assert_eq(why, b""),
+      Ok(t) -> {
+        let said = Some(String::of_bytes_lossy(t));
+        // The instance is the word of the array laid out for it, past the record its variables are
+        // held in across a stop.
+        let array = declared_before(t, b"] = {0};");
+        let instance = declared_before(
+          t,
+          Bytes::concat_all([b" = (Word)(intptr_t)(", array, b" + 4);"]),
+        );
+        assert(array != b"" && instance != b"", said);
+        // Its fuel is set and its landing taken through it, and the clauses' closures read it as
+        // their capture: no closure the handle lays out is indexed as its words.
+        let target = t.split(b"ctx->target == ").get(1);
+        assert(target.starts_with(instance.concat(b")")), said);
+        assert(
+          t.index_of(Bytes::concat_all([b"((Word *)(intptr_t)", instance, b")[0] = ctx->fuel;"]))
+            != None,
+          said,
+        );
+        assert_eq(indexed(t).filter(|name: Bytes| name != instance && name != b"q0"), []);
+        // Its variable is held in a record linked over it while the body runs, which a snapshot
+        // reads, and unlinked before the landing lets it go.
+        let at = |s: Bytes| match t.index_of(s) { Some(k) -> k, None -> 0 - 1 };
+        let linked = at(b"->each = ply_instance_each;");
+        let unlinked = at(b"if (PLY_FRAMES(ctx) == ((PlyFrame *)");
+        let released = at(Bytes::concat_all([b")->dec(ctx, ((Word *)(intptr_t)", instance, b")["]));
+        assert(0 <= linked && linked < unlinked && unlinked < released, said)
+      },
+    },
+  }
+}
+
 fn rows() -> Bytes =
   Bytes::concat_all([
     b"effect meter {\n  read level() -> Int\n}\n",

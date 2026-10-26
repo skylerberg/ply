@@ -54,7 +54,7 @@ fn instance_opened(
     },
     answer,
   );
-  let inst = |at: Int| instance_word(pr, args, at);
+  let inst = |at: Int| instance_word(pr, args, i.operand, at);
   let set = |q: Printing, lhs: Bytes, rhs: Bytes|
     line(q, p.depth, Bytes::concat_all([lhs, b" = ", rhs, b";"]));
   let fueled = set(
@@ -76,7 +76,7 @@ fn instance_opened(
         ),
       _ -> q,
     });
-  line(recorded, p.depth, b"{")
+  line(vars_linked(p, recorded, inst(0), i), p.depth, b"{")
 }
 
 /// What opens a `handle` the runtime's frames hold, as `handle_opened` says.
@@ -200,7 +200,7 @@ fn instance_landed(
   answer: Var,
 ) -> Printing = {
   let d = p.depth;
-  let inst = |at: Int| instance_word(pr, args, at);
+  let inst = |at: Int| instance_word(pr, args, i.operand, at);
   let ans = name_of(pr, answer);
   let landed = line(
     line(pr, d, b"}"),
@@ -284,7 +284,7 @@ fn instance_landed(
       ]),
   };
   let released = range(0, i.count).fold(
-    line(landed, d, Bytes::concat_all([unwound, pending, returned])),
+    vars_unlinked(p, line(landed, d, Bytes::concat_all([unwound, pending, returned])), inst(0), i),
     |q: Printing, j: Int| {
       let at = i.vars + 2 * j;
       line(
@@ -419,7 +419,7 @@ pub fn effect_op(
           b";",
         ]),
       ),
-    Instance(n) -> laid_set(p, pr, into, ascii_of_int(n), [b"0"]),
+    Instance(n) -> instance_laid(p, pr, into, n),
     ObjectLaid(slots) ->
       laid_set(
         p,
@@ -458,10 +458,10 @@ pub fn effect_op(
         line(
           pr,
           p.depth,
-          Bytes::concat_all([instance_word(pr, args, at), b" = ", operand(pr, args, 1), b";"]),
+          Bytes::concat_all([instance_word(pr, args, 0, at), b" = ", operand(pr, args, 1), b";"]),
         ),
         p.depth,
-        Bytes::concat_all([instance_word(pr, args, at + 1), b" = ", operand(pr, args, 2), b";"]),
+        Bytes::concat_all([instance_word(pr, args, 0, at + 1), b" = ", operand(pr, args, 2), b";"]),
       ),
     VarRead(at) -> match into {
       None -> pr,
@@ -474,9 +474,9 @@ pub fn effect_op(
             b"Word ",
             n.name,
             b" = ",
-            instance_word(pr, args, at),
+            instance_word(pr, args, 0, at),
             b"; ((const PlyType *)(intptr_t)",
-            instance_word(pr, args, at + 1),
+            instance_word(pr, args, 0, at + 1),
             b")->inc(ctx, ",
             n.name,
             b");",
@@ -490,11 +490,11 @@ pub fn effect_op(
         p.depth,
         Bytes::concat_all([
           b"((const PlyType *)(intptr_t)",
-          instance_word(pr, args, at + 1),
+          instance_word(pr, args, 0, at + 1),
           b")->dec(ctx, ",
-          instance_word(pr, args, at),
+          instance_word(pr, args, 0, at),
           b"); ",
-          instance_word(pr, args, at),
+          instance_word(pr, args, 0, at),
           b" = ",
           operand(pr, args, 1),
           b";",
@@ -502,9 +502,77 @@ pub fn effect_op(
       ),
   }
 
-/// Word `at` of the instance `args` hands first, as C that reads or sets it.
-fn instance_word(pr: Printing, args: List<Arg>, at: Int) -> Bytes =
-  Bytes::concat_all([b"((Word *)(intptr_t)", operand(pr, args, 0), b")[", ascii_of_int(at), b"]"])
+/// Word `at` of the instance operand `instance` of `args` is, as C that reads or sets it: a
+/// `handle`'s instance follows its closures, an operation on the instance's words takes it first.
+fn instance_word(pr: Printing, args: List<Arg>, instance: Int, at: Int) -> Bytes =
+  Bytes::concat_all([
+    b"((Word *)(intptr_t)",
+    operand(pr, args, instance),
+    b")[",
+    ascii_of_int(at),
+    b"]",
+  ])
+
+/// `into` declared the address of an instance of `n` words laid out zeroed in the frame, behind the
+/// four words of the frame record that holds its variables: the record's two, then the place of
+/// the first variable and how many there are.
+fn instance_laid(p: Place, pr: Printing, into: Option<Var>, n: Int) -> Printing =
+  match into {
+    None -> pr,
+    Some(_) -> {
+      let arr = temp(pr);
+      let laid = line(
+        arr.pr,
+        p.depth,
+        Bytes::concat_all([b"Word ", arr.name, b"[", ascii_of_int(4 + n), b"] = {0};"]),
+      );
+      word_set(p, laid, into, Bytes::concat_all([b"(Word)(intptr_t)(", arr.name, b" + 4)"]))
+    },
+  }
+
+/// The frame record instance `i`, whose word 0 is `first`, holds its variables in, as C.
+fn vars_record(first: Bytes) -> Bytes =
+  Bytes::concat_all([b"((PlyFrame *)(intptr_t)(&", first, b" - 4))"])
+
+/// Where instance `i` holds variables and the chain records, its record linked over them, so a
+/// snapshot of a stop under its `handle` holds them once more and a body never resumed lets them
+/// go.
+fn vars_linked(p: Place, pr: Printing, first: Bytes, i: HandleInstance) -> Printing =
+  if i.count == 0 { pr } else {
+    let r = vars_record(first);
+    line(
+      pr,
+      p.depth,
+      Bytes::concat_all([
+        b"if (PLY_FRAMES(ctx)) { ((Word *)",
+        r,
+        b")[2] = ",
+        ascii_of_int(i.vars),
+        b"; ((Word *)",
+        r,
+        b")[3] = ",
+        ascii_of_int(i.count),
+        b"; ",
+        r,
+        b"->each = ply_instance_each; ",
+        r,
+        b"->prev = PLY_FRAMES(ctx); PLY_FRAMES(ctx) = ",
+        r,
+        b"; }",
+      ]),
+    )
+  }
+
+/// Instance `i`'s record unlinked where it is the chain's head, before its variables go.
+fn vars_unlinked(p: Place, pr: Printing, first: Bytes, i: HandleInstance) -> Printing =
+  if i.count == 0 { pr } else {
+    let r = vars_record(first);
+    line(
+      pr,
+      p.depth,
+      Bytes::concat_all([b"if (PLY_FRAMES(ctx) == ", r, b") PLY_FRAMES(ctx) = ", r, b"->prev;"]),
+    )
+  }
 
 /// The head's function a clause's slot enters it through.
 pub fn entry_fn(e: Entry) -> Bytes =

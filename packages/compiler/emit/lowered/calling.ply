@@ -4,7 +4,11 @@
 import compiler.check.resolve.tables (qualify)
 import compiler.check.types (Type, TyCon, int_type, bool_type)
 import compiler.emit.keys (RootKey, FnArg, Named, Root, Generic, LawPart, LawGuard, LawBody, at_key,
-                           RootName, root_name, root_text, filed_as, test_key, law_key)
+                           RootName, root_name, root_text, filed_as, test_key, law_key, at_rowed,
+                           KeyType, Evidence)
+import compiler.check.types (RSingleton)
+import compiler.emit.tir (OHandle)
+import compiler.emit.tir.handling (Bridge, Perform)
 import compiler.emit.reps (filings_at, BoundLambda, has_vars)
 import compiler.emit.typing (no_filings, unknown_type)
 import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MCase, Var, Arg, AVar,
@@ -72,6 +76,12 @@ fn corpus() -> Bytes =
     b"fn seek(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { probe(o, n - 1) }\n",
     b"fn probe(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { seek(o, n - 2) }\n",
     b"fn lends_on(x: Int) -> Int = apply_to(|y: Int| { let g = |z: Int| z + x; g(y) + applied(|w: Int| w + y, y) }, x)\n",
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"fn apply_in<T | e>(f: (T) -> T / e, x: T) -> T / e = f(x)\n",
+    b"fn noted_by(f: (Int) -> Int / {log.note}, x: Int) -> Int / {log.note} = f(x)\n",
+    b"fn lends_noting(x: Int) -> Int / {log.note} = apply_in(|y: Int| noted_by(|w: Int| { log.note(w); w + y }, y), x)\n",
+    b"fn noting<T>(f: (T) -> T / {log.note}, x: T) -> T / {log.note} = f(x)\n",
+    b"fn lends_closed(x: Int) -> Int / {log.note} = noting(|y: Int| { log.note(y); y }, x)\n",
     b"fn raised_step(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| { let next = if i >= 10 { Stop(i) } else { Continue(i + 1) }; if i == 5 { abort.raise(\"five\") } else { () }; next })\n",
     b"fn paired_step(n: Int) -> Int / {abort.raise} = iterate(pair(0, 1), n, |q: { x: Int, y: Int }| if q.x >= 10 { Stop(q.x + q.y) } else { Continue(pair(q.y, q.x + q.y)) })\n",
     b"fn walk1(p: { x: Int, y: Int }, n: Int) -> { x: Int, y: Int } = if n <= 0 { p } else { walk1(pair(p.y, p.x), n - 1) }\n",
@@ -825,13 +835,23 @@ fn specialised_form(
   args: List<Type>,
   fns: List<FnArg>,
   lent: List<Option<BoundLambda>>,
+) -> Result<Fn, Bytes> / {abort.raise} = specialised_rowed(p, name, args, fns, lent, [])
+
+/// `specialised_form` with the root's row variables at `rows`.
+fn specialised_rowed(
+  p: Program,
+  name: Bytes,
+  args: List<Type>,
+  fns: List<FnArg>,
+  lent: List<Option<BoundLambda>>,
+  rows: List<List<Evidence>>,
 ) -> Result<Fn, Bytes> / {abort.raise} =
   match match root_at(p, name) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such root"),
     Some(r) -> match r.code {
       Err(why) -> Err(why),
       Ok(code) -> {
-        let key = at_key(filed_as(r.key), args, fns);
+        let key = at_rowed(filed_as(r.key), args.map(KeyType), fns, rows);
         let params = range(0, r.params.len()).map(|i: Int|
           match lent.at(i) {
             Some(Some(bl)) -> { ..r.params.get(i), lambda: Some(bl) },
@@ -860,6 +880,17 @@ fn lent_run(
   args: List<Type>,
   param: Int,
 ) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
+  lent_rowed(p, lender, generic, args, param, [])
+
+/// `lent_run` with the generic's row variables at `rows`.
+fn lent_rowed(
+  p: Program,
+  lender: Bytes,
+  generic: Bytes,
+  args: List<Type>,
+  param: Int,
+  rows: List<List<Evidence>>,
+) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
   match match root_at(p, lender) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such lender"),
     Some(l) -> match l.code {
@@ -882,12 +913,13 @@ fn lent_run(
               base: l.base,
               written: written,
             };
-            match specialised_form(
+            match specialised_rowed(
                 p,
                 generic,
                 args,
                 [{ param: param, owner: l.key, nth: 0 }],
                 range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
+                rows,
               ) {
               Ok(f) -> Ok({ f: f, base: l.base }),
               Err(why) -> Err(why),
@@ -925,6 +957,55 @@ test "another root's lambda a specialisation runs in place takes its lender's si
           ),
           1,
         )
+      },
+    },
+  }
+}
+
+test "a closure a lent lambda makes performs through its own words, never the frame bridge" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_rowed(p, b"lends_noting", b"apply_in", [int_type()], 0, [
+        [{ effect: b"m.log", resource: RSingleton }],
+      ]) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) -> {
+        let bridged = |f: Fn|
+          vals_in(f.body).filter(|v: Val| match v { Op(o) -> o.op == OHandle(Bridge), _ -> false });
+        let performs = |f: Fn|
+          vals_in(f.body).filter(|v: Val|
+            match v {
+              Op(o) -> match o.op { OHandle(Perform(_)) -> true, _ -> false },
+              _ -> false,
+            });
+        let closures = range(0, run.f.lambdas.len()).fold([], |acc: List<Fn>, k: Int|
+          match closure_of(run.f, k) { Some(c) -> acc.push(c.body), None -> acc });
+        // The closure the lent lambda hands `noted_by` performs `log.note`, through the word it is
+        // handed, as the specialisation's body hands `noted_by` the word it was handed.
+        assert_eq(closures.map(|f: Fn| performs(f).len()), [1]);
+        assert_eq(closures.map(|f: Fn| bridged(f).len()).concat([bridged(run.f).len()]), [0, 0])
+      },
+    },
+  }
+}
+
+test "a lambda lent to a parameter of a closed row performs through the word its callee holds for it" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_run(p, b"lends_closed", b"noting", [int_type()], 0) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) -> {
+        let ops = vals_in(run.f.body).fold([], |acc: List<Bytes>, v: Val|
+          match v {
+            Op(o) -> match o.op {
+              OHandle(Perform(_)) -> acc.push(b"perform"),
+              OHandle(Bridge) -> acc.push(b"bridge"),
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        // `noting`'s own word for `log`, which a call of `f` there would hand it, answers the perform.
+        assert_eq(ops, [b"perform"])
       },
     },
   }
