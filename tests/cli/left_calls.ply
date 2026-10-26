@@ -1,13 +1,15 @@
 //! Every way a body is left without returning gives back the nested calls it spent: a failure
 //! returning through frames, an unwind to a clause, a body parked or resumed elsewhere, a task
-//! cancelled or failed, and a raise from a builtin. Measured through the machine family's
-//! accounting, as the calls an entry can still nest once its rounds are over.
+//! cancelled or failed, and a raise from a builtin. Measured by the steps each entry spent, as the
+//! calls an entry can still nest once its rounds are over.
 
-import harness (Here, Shipped, bound_main, loaded, project)
-import cli.machine (machine, Called, default_options)
+import harness (Here, Shipped, Loaded, entered, loaded, project, unloaded)
+import cli.machine
+import cli.machine (default_options)
+import std.machine as entering
 import std.value (Value, VInt)
 
-effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.accounting[run], machine.drop[run]}
+effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
 fn left() -> String =
   \\effect parse {
@@ -382,25 +384,30 @@ fn ways() -> List<{ name: String, sum: Int }> = {
   ]
 }
 
-fn spent() -> Int / {machine.accounting[run]} = machine.accounting[run]().steps
-
-/// What `name(rounds, spin)` answered, or what it raised.
-fn called(name: String, rounds: Int, spin: Int) -> Result<Value, String> / {Driving} =
-  match machine.call[run]("inner." ++ name, [VInt(rounds), VInt(spin)]).answer {
-    Ok(v) -> Ok(v),
-    Err(r) -> Err(String::of_bytes_lossy(r.diag.message)),
+/// What `name(rounds, spin)` answered, or what it raised, and the steps the entry spent.
+fn called(
+  l: Loaded,
+  name: String,
+  rounds: Int,
+  spin: Int,
+) -> { answer: Result<Value, String>, steps: Int } / {Driving, abort.raise} = {
+  let o = entered(l, name, [VInt(rounds), VInt(spin)]);
+  {
+    answer: match machine::answer_of(o.ended, l.roots, "inner." ++ name) {
+      Ok(v) -> Ok(v),
+      Err(r) -> Err(String::of_bytes_lossy(r.diag.message)),
+    },
+    steps: o.usage.steps,
   }
+}
 
 /// The calls `name` can still nest once `rounds` are over: spun until none are left, less what the
 /// same rounds cost unspun.
-fn room(name: String, rounds: Int) -> Result<Int, String> / {Driving} = {
-  let _ = spent();
-  let spun = called(name, rounds, 1);
-  let spun_calls = spent();
-  let _ = called(name, rounds, 0);
-  let calls = spent();
-  match spun {
-    Err(why) -> if why.contains("nested calls") { Ok(spun_calls - calls) }
+fn room(l: Loaded, name: String, rounds: Int) -> Result<Int, String> / {Driving, abort.raise} = {
+  let spun = called(l, name, rounds, 1);
+  let unspun = called(l, name, rounds, 0);
+  match spun.answer {
+    Err(why) -> if why.contains("nested calls") { Ok(spun.steps - unspun.steps) }
     else { Err("spinning raised " ++ why) },
     Ok(_) -> Err("spinning answered"),
   }
@@ -408,11 +415,14 @@ fn room(name: String, rounds: Int) -> Result<Int, String> / {Driving} = {
 
 /// What is wrong with how `name` gives back its calls, if anything: it answers `sum`, and has as
 /// many calls left once its rounds are over as it had after none.
-fn miscounted(way: { name: String, sum: Int }) -> Option<String> / {Driving} =
-  match called(way.name, rounds(), 0) {
+fn miscounted(
+  l: Loaded,
+  way: { name: String, sum: Int },
+) -> Option<String> / {Driving, abort.raise} =
+  match called(l, way.name, rounds(), 0).answer {
     Err(why) -> Some(way.name ++ " raised " ++ why),
     Ok(v) -> if v != VInt(way.sum) { Some(way.name ++ " answered another sum") } else {
-      match ((room(way.name, 0), room(way.name, rounds()))) {
+      match ((room(l, way.name, 0), room(l, way.name, rounds()))) {
         (Ok(fresh), Ok(used)) -> if fresh <= 0 { Some(way.name ++ " counted no calls left") }
         else if used != fresh {
           Some(
@@ -429,10 +439,9 @@ fn miscounted(way: { name: String, sum: Int }) -> Option<String> / {Driving} =
 
 test/nondet "a body left without returning keeps none of the calls it nested" {
   project([{ path: "inner.ply", text: left() }]);
-  loaded({ ..default_options(), host: true });
-  bound_main();
+  let l = loaded({ ..default_options(), host: true });
   let wrong = ways().fold([], |acc: List<String>, w: { name: String, sum: Int }|
-    match miscounted(w) { Some(why) -> acc.push(why), None -> acc });
-  machine.drop[run]();
+    match miscounted(l, w) { Some(why) -> acc.push(why), None -> acc });
+  let _ = unloaded(l);
   assert_eq(wrong, [])
 }

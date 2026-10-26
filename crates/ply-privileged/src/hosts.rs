@@ -118,6 +118,8 @@ pub struct Hosts {
     /// Where this run's records go and on which channels, when the program records at all.
     observability: Option<Observability>,
     shutdown: Option<Shutdown>,
+    /// What stops the run, where it listens for a signal.
+    stop: Option<Arc<ply_host::signal::Shutdown>>,
 }
 
 impl Hosts {
@@ -200,7 +202,7 @@ impl Hosts {
     /// The binding of the families this runtime serves itself, from what a run is lent alone: no
     /// program's rows are read. Under `hermetic` every host family is registered withheld, so an
     /// operation that reaches one is refused naming what would serve it; `lent` are the caller's
-    /// families beside them.
+    /// families beside them. A run lent `listen LEAD_MS DRAIN_MS` stops on a signal.
     pub fn granted(grants: &Grants, lent: Vec<LentOp>) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
             grants.named(name).filter_map(|fields| match fields {
@@ -208,7 +210,6 @@ impl Hosts {
                 _ => None,
             })
         };
-        let config = Configuration::default();
         if grants.has("hermetic") {
             let mut registry = registry_for(None).withheld_all("under `--host`");
             for (op, handler) in lent {
@@ -216,12 +217,28 @@ impl Hosts {
             }
             return Ok(Hosts {
                 host: None,
-                binding: Arc::new(registry.granted()),
+                binding: Arc::new(registry.granted(grants.clone())?),
                 listing: HostListing::default(),
-                config,
+                config: Configuration::default(),
                 observability: None,
                 shutdown: None,
+                stop: None,
             });
+        }
+        let config = Configuration::of_grants(grants);
+        let stop = grants.named("listen").next().map(|fields| {
+            let ms = |at: usize| fields.get(at).and_then(|f| f.parse::<u64>().ok());
+            let defaults = crate::options::ShutdownOptions::default();
+            ply_host::signal::Shutdown::new(
+                crate::options::ShutdownOptions {
+                    drain_lead_ms: ms(0).unwrap_or(defaults.drain_lead_ms),
+                    drain_ms: ms(1).unwrap_or(defaults.drain_ms),
+                }
+                .bounds(),
+            )
+        });
+        if let Some(stop) = &stop {
+            ply_host::signal::listen(stop).map_err(|d| vec![d])?;
         }
         let credentials: Vec<tls::CredentialSpec> = grants
             .named("tls")
@@ -270,9 +287,12 @@ impl Hosts {
         let mut facilities = ply_host::Host::with_credentials(material)
             .configured(Arc::clone(&config.snapshot))
             .rooted(roots)
-            .traced(crate::trace::TraceOptions::default().open());
+            .traced(crate::trace::TraceOptions::of_grants(grants).open());
         if let Some(process) = process {
             facilities = facilities.with_process(process);
+        }
+        if let Some(stop) = &stop {
+            facilities = facilities.stopping_on(Arc::clone(stop));
         }
         let facilities = Arc::new(facilities);
         let mut registry = facilities.registry();
@@ -281,12 +301,63 @@ impl Hosts {
         }
         Ok(Hosts {
             host: Some(facilities),
-            binding: Arc::new(registry.granted()),
+            binding: Arc::new(registry.granted(grants.clone())?),
             listing: HostListing::default(),
             config,
             observability: None,
             shutdown: None,
+            stop,
         })
+    }
+
+    /// The binding torn down, its children ended and its sink flushed: what it reports, each a
+    /// flat body by name. `teardown := int spans_left_open`; `handshakes := int completed,
+    /// int refused, list(string reason, int count)`; `stopping := option(string) signal,
+    /// int listeners, int connections, int elapsed_ms`; `trace := int events, int spans,
+    /// int abandoned, bool flushed`.
+    pub fn torn_down(&self) -> Vec<(String, Vec<u8>)> {
+        use ply_compiled::flat::Writer;
+        let mut reports = Vec::new();
+        let mut report = |name: &str, write: &dyn Fn(&mut Writer)| {
+            let mut w = Writer::new();
+            write(&mut w);
+            reports.push((name.to_string(), w.finish()));
+        };
+        if let Some(torn) = self.runtime().map(|rt| rt.shutdown()) {
+            report("teardown", &|w| {
+                w.count(torn.spans_left_open as u64);
+            });
+        }
+        let handshakes = self.handshakes();
+        if !handshakes.is_empty() {
+            report("handshakes", &|w| {
+                w.count(handshakes.completed)
+                    .count(handshakes.refused)
+                    .list(handshakes.reasons.iter(), |w, (reason, n)| {
+                        w.str(reason).count(*n);
+                    });
+            });
+        }
+        if let Some(stop) = self.stop.as_ref().filter(|s| s.stopping()) {
+            let (listeners, connections) = stop.at_stop();
+            report("stopping", &|w| {
+                w.option(stop.signal(), |w, s| {
+                    w.str(s.name());
+                })
+                .count(listeners as u64)
+                .count(connections as u64)
+                .count(stop.elapsed().unwrap_or_default().as_millis() as u64);
+            });
+        }
+        if let Some(counts) = self.trace_counts() {
+            report("trace", &|w| {
+                w.count(counts.events)
+                    .count(counts.spans)
+                    .count(counts.abandoned)
+                    .bool(counts.flushed);
+            });
+        }
+        reports
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -314,6 +385,7 @@ impl Hosts {
                 config: Configuration::default(),
                 observability: None,
                 shutdown: None,
+                stop: None,
             });
         }
         let material =
@@ -353,6 +425,7 @@ impl Hosts {
             config,
             observability,
             shutdown: stopping,
+            stop: None,
         })
     }
 
@@ -396,6 +469,7 @@ impl Hosts {
                 config: Configuration::default(),
                 observability: None,
                 shutdown: None,
+                stop: None,
             });
         }
         let binding = registry.bind(check)?;
@@ -407,6 +481,7 @@ impl Hosts {
             config: Configuration::default(),
             observability: None,
             shutdown: None,
+            stop: None,
         })
     }
 
@@ -479,6 +554,7 @@ impl Hosts {
     }
 }
 
+/// A binding no one observes: the launcher's own program's.
 impl ply_compiled::entry::Bound for Hosts {
     fn binding(&self) -> Arc<HostBinding> {
         Hosts::binding(self)
@@ -486,6 +562,23 @@ impl ply_compiled::entry::Bound for Hosts {
 
     fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
         Hosts::runtime_factory(self)
+    }
+
+    fn requested_exit(&self) -> Option<i32> {
+        Hosts::requested_exit(self)
+    }
+
+    fn observing(
+        &self,
+        _entry: MachineId,
+        _caller: MachineId,
+        _recorded: bool,
+    ) -> Option<Box<dyn ply_compiled::entry::Observation>> {
+        None
+    }
+
+    fn unbind(&self) -> Vec<(String, Vec<u8>)> {
+        self.torn_down()
     }
 }
 

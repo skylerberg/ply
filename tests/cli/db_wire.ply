@@ -1,15 +1,17 @@
 //! `std.db`'s TLS, notifications and copies, against a real server.
 
-import harness (Here, Shipped, Spawned, Wire, bound_main, ended, loaded, serving, working, write)
+import harness (Here, Shipped, Spawned, Wire, Loaded, ended, loaded, serving, unloaded, working,
+                write)
 import postgres
 import postgres (Cluster, Postgres, done, over)
-import cli.machine (machine, default_options)
+import cli.machine (default_options)
 import std.certgen (certgen)
+import std.machine as entering
 import std.process (process)
 import std.string
 import std.time (time)
 
-effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.drop[run]}
+effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
 fn wired() -> String =
   \\import std.net (net)
@@ -161,11 +163,10 @@ fn wired() -> String =
   \\fn main() -> Int = 0
   \\
 
-/// The program loaded under a host that trusts the certificates at `trusted`, as `--trust` would.
-fn hosted(trusted: List<String>) -> Unit / {Here, Shipped, Driving, abort.raise} = {
+/// The program bound to a host that trusts the certificates at `trusted`, as `--trust` would.
+fn hosted(trusted: List<String>) -> Loaded / {Here, Shipped, Driving, abort.raise} = {
   write("inner.ply", wired());
-  loaded({ ..default_options(), host: true, trust: trusted });
-  bound_main()
+  loaded({ ..default_options(), host: true, trust: trusted })
 }
 
 /// A cluster speaking TLS under a certificate for `localhost`, and where that certificate is.
@@ -184,12 +185,16 @@ fn refused_08001(r: Result<String, String>, what: String) -> Bool =
 test/nondet "a secured connection is encrypted and verified for its host" {
   if postgres::available() {
     let s = secured();
-    hosted([s.pem]);
+    let l = hosted([s.pem]);
     let modes = ["sslmode=verify-full", "sslmode=require", "sslmode=verify-ca"].map(
-      |mode: String| over("encrypted", postgres::url(s.cluster, "localhost", "ply", mode)),
+      |mode: String| over(l, "encrypted", postgres::url(s.cluster, "localhost", "ply", mode)),
     );
-    let plain = over("encrypted", postgres::url(s.cluster, "localhost", "ply", "sslmode=disable"));
-    done(s.cluster);
+    let plain = over(
+      l,
+      "encrypted",
+      postgres::url(s.cluster, "localhost", "ply", "sslmode=disable"),
+    );
+    done(l, s.cluster);
     assert_eq(modes, [Ok("1"), Ok("1"), Ok("1")]);
     // A plaintext connection to a server that offers TLS stays plaintext.
     assert_eq(plain, Ok("0"))
@@ -199,17 +204,20 @@ test/nondet "a secured connection is encrypted and verified for its host" {
 test/nondet "a certificate not trusted, or not for the host, is refused" {
   if postgres::available() {
     let s = secured();
-    hosted([]);
+    let trusting_none = hosted([]);
     let untrusted = over(
+      trusting_none,
       "encrypted",
       postgres::url(s.cluster, "localhost", "ply", "sslmode=require"),
     );
-    hosted([s.pem]);
+    let _ = unloaded(trusting_none);
+    let l = hosted([s.pem]);
     let elsewhere = over(
+      l,
       "encrypted",
       postgres::url(s.cluster, "127.0.0.1", "ply", "sslmode=verify-full"),
     );
-    done(s.cluster);
+    done(l, s.cluster);
     assert(refused_08001(untrusted, "not trusted"), None);
     assert(refused_08001(elsewhere, "not trusted"), None)
   }
@@ -218,9 +226,9 @@ test/nondet "a certificate not trusted, or not for the host, is refused" {
 test/nondet "a server that will not speak TLS is not spoken to in plaintext" {
   if postgres::available() {
     let c = postgres::scram("ply", "pencil");
-    hosted([]);
-    let r = over("encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"));
-    done(c);
+    let l = hosted([]);
+    let r = over(l, "encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"));
+    done(l, c);
     assert(refused_08001(r, "does not speak TLS"), None)
   }
 }
@@ -242,12 +250,13 @@ fn major() -> Int / {Postgres, abort.raise} = {
 test/nondet "direct negotiation secures the connection without asking first" {
   if postgres::available() {
     let s = secured();
-    hosted([s.pem]);
+    let l = hosted([s.pem]);
     let r = over(
+      l,
       "encrypted",
       postgres::url(s.cluster, "localhost", "ply", "sslmode=verify-full&sslnegotiation=direct"),
     );
-    done(s.cluster);
+    done(l, s.cluster);
     if major() >= 17 { assert_eq(r, Ok("1")) } else { assert(refused_08001(r, ""), None) }
   }
 }
@@ -255,9 +264,9 @@ test/nondet "direct negotiation secures the connection without asking first" {
 test/nondet "a notification is heard when its transaction commits and never when it rolls back" {
   if postgres::available() {
     let c = postgres::scram("ply", "pencil");
-    hosted([]);
-    let heard = over("notices", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
-    done(c);
+    let l = hosted([]);
+    let heard = over(l, "notices", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
+    done(l, c);
     assert_eq(heard, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
   }
 }
@@ -473,14 +482,14 @@ test/nondet "rows are copied in and out whole or not at all" {
       "ply",
       "create table items (id int4 primary key, name text, data bytea, tags text[], price numeric(10, 2))",
     );
-    hosted([]);
-    let copied = over("copies", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
+    let l = hosted([]);
+    let copied = over(l, "copies", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
     let left = postgres::psql(
       c,
       "ply",
       "select string_agg(id::text || '=' || coalesce(name, 'null'), ';' order by id) from items",
     );
-    done(c);
+    done(l, c);
     assert_eq(copied, Ok("3 same 23505 3 spent 3 3 rolled back after 1 3 22012"));
     assert_eq(left, "1=plain;2=tab\there\nnew line\\back;3=\\N")
   }

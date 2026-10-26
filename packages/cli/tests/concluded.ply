@@ -27,8 +27,10 @@ import diagnostic (Raised, diag_of, noted, shown)
 import mutants (Judged, Queue, built, coverage, mutants, queued)
 import program (Timed)
 import std.json (Bool)
-import tester (tester, ledger, Executed, InterleavingFailure, Hosted, LastPass, Options, Usage,
-               joined_trace, sum_usage, no_usage)
+import tester
+import tester (ledger, Executed, InterleavingFailure, Hosted, LastPass, Options, Testing, TestUnit,
+               Usage, joined_trace, sum_usage, no_usage)
+import std.machine as entering
 import trials (Bench, Tried, diagnosed, trial)
 import trials
 import views
@@ -82,7 +84,7 @@ type Asked = { plan: plan::Plan, measuring: Bool, lanes: Option<Int> }
 
 /// One test to run in one unit, how that unit is asked for it, and the plan it searches when it is
 /// seeded.
-type Job = { unit: Int, test: Int, entry: Entry, search: Option<plan::Plan> }
+type Job = { unit: TestUnit, test: Int, entry: Entry, search: Option<plan::Plan> }
 
 /// How one test ended, what running it cost, and what its search explored, when it searched and every
 /// interleaving of it entered a region.
@@ -99,7 +101,7 @@ pub type Done = {
 /// A seeded test searches the roots it still owes; any other runs once.
 pub fn job_of(
   program: Program,
-  unit: Int,
+  unit: TestUnit,
   index: Int,
   narrowing: List<{ index: Int, roots: List<Int> }>,
   searching: plan::Plan,
@@ -125,7 +127,7 @@ pub fn job_of(
 pub fn ran_class(
   jobs: List<Job>,
   asked: Asked,
-) -> List<Done> / {tester.executed[tests], tester.interleaved[tests], abort.raise} = {
+) -> List<Done> / {entering::machine.enter, abort.raise} = {
   let lanes = machine::dealt(jobs, asked.lanes);
   machine::undealt(ran_lanes(lanes, asked.measuring, 0, lanes.len(), 64))
 }
@@ -138,7 +140,7 @@ fn ran_lanes(
   lo: Int,
   hi: Int,
   room: Int,
-) -> List<List<Done>> / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+) -> List<List<Done>> / {entering::machine.enter, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || room <= 0 {
     range(lo, hi).fold([], |lanes_done: List<List<Done>>, i: Int|
       match lanes.at(i) {
@@ -161,10 +163,7 @@ type Swept = { usage: Usage, trace: Option<Bytes>, unobserved: Bool }
 
 /// A test once, or a seeded one searched an interleaving at a time. One whose cases could not be
 /// listed ends as the listing did.
-pub fn ran_job(
-  j: Job,
-  measuring: Bool,
-) -> Done / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+pub fn ran_job(j: Job, measuring: Bool) -> Done / {entering::machine.enter, abort.raise} =
   match j.entry.unlisted {
     Some(why) ->
       {
@@ -178,13 +177,10 @@ pub fn ran_job(
     None -> ran_listed(j, measuring),
   }
 
-fn ran_listed(
-  j: Job,
-  measuring: Bool,
-) -> Done / {tester.executed[tests], tester.interleaved[tests], abort.raise} =
+fn ran_listed(j: Job, measuring: Bool) -> Done / {entering::machine.enter, abort.raise} =
   match j.search {
     None -> {
-      let e: Executed = tester.executed[tests](j.unit, j.entry.test, j.entry.case);
+      let e: Executed = tester::executed(j.unit, j.entry.test, j.entry.case);
       {
         test: j.test,
         status: e.status,
@@ -198,14 +194,7 @@ fn ran_listed(
       // A search re-runs the whole test, so any host operation runs once per interleaving.
       let again = plan::re_executes(p) || measuring;
       let run = |st: Swept, seed: Seed| {
-        let one = tester.interleaved[tests](
-          j.unit,
-          j.entry.test,
-          j.entry.case,
-          seed,
-          p.steps,
-          again,
-        );
+        let one = tester::interleaved(j.unit, j.entry.test, j.entry.case, seed, p.steps, again);
         {
           run: one.run,
           state: {
@@ -504,7 +493,7 @@ fn escapes_of(
           }),
       None -> false,
     };
-  let filed_host = if hosted.hermetic { [] } else {
+  if hosted.hermetic { [] } else {
     c.outcomes.fold([], |acc: List<Diag>, outcome: conclude::Outcome<Raised>| {
       let wrote = match outcome.recorded { Some(rec) -> written(rec), None -> false };
       if !wrote || !unbound(outcome.index) { acc } else {
@@ -528,22 +517,6 @@ fn escapes_of(
         )
       }
     })
-  };
-  let b = hosted.backend;
-  if b.unbuilt == 0 { filed_host } else {
-    filed_host.push(
-      diag_of(
-        "error",
-        "E0505",
-        b.unbuilt.to_string() ++ " thread(s) could not build the `" ++ b.name
-          ++ "` backend, and every call they were offered was declined",
-        [],
-        [
-          "the backend was built once before the run started, so this cannot be a host that has no code generator",
-          "this is Ply's fault — a run that installs a backend and silently does not have one is green over a seam nothing reached",
-        ],
-      ),
-    )
   }
 }
 
@@ -593,7 +566,7 @@ pub fn ran_of(
     label: hosted.label,
     operations: hosted.operations,
     digest: hosted.digest,
-    handshakes: hosted.handshakes,
+    handshakes: [],
     hosts: hosted.hosts,
     reaches: hosted.reaches.filter(|i: Int| case_of(program, i) != None),
     workers: match options.jobs {
@@ -603,11 +576,8 @@ pub fn ran_of(
     backend: Some({
       name: b.name,
       fragment: b.fragment,
-      offered: b.offered,
       entered: done.fold(0, |n: Int, i: Int, d: Done| n + d.usage.entries),
       declined: done.fold(0, |n: Int, i: Int, d: Done| n + d.usage.declines),
-      converted_in: b.converted_in,
-      converted_out: b.converted_out,
       units: b.units,
       load_nanos: b.load_nanos,
     }),
@@ -640,7 +610,7 @@ pub fn mutated(
   options: Options,
   asked: Asked,
   targeted: Option<List<DefInfo>>,
-) -> RunReport / {tester.unit[tests], tester.executed[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise, shipped.reached} =
+) -> RunReport / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.reached} =
   match targeted {
     None -> report,
     Some(defs) -> if !green_run(report) { report } else {
@@ -673,10 +643,10 @@ fn judged_mutant(
   id: Int,
   every: List<List<Int>>,
   asked: Asked,
-) -> Judged / {tester.unit[tests], tester.executed[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise, shipped.reached} =
+) -> Judged / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise, shipped.reached} =
   match queue.mutants.at(id) {
     None -> { id: id, verdict: "unresolved", why: "no mutant " ++ id.to_string() ++ " was queued" },
-    Some(m) -> match built(timed.program, analysis, m.mutation) {
+    Some(m) -> match built(program.unit.testing, timed.program, analysis, m.mutation) {
       Err(j) -> { ..j, id: id },
       Ok(unit) -> {
         let classes = every.map(|class: List<Int>|
@@ -686,6 +656,7 @@ fn judged_mutant(
             ..asked,
             measuring: false,
           }).map(|done: Done| done.status));
+        tester::closed(unit);
         let expected = classes.fold(0, |n: Int, class: List<Int>| n + class.len());
         let judged = |verdict: String, why: String| { id: id, verdict: verdict, why: why };
         if statuses.contains("failed") { judged("killed", "") }
@@ -704,13 +675,15 @@ fn judged_mutant(
 /// Each test's case, and the keys whose passes answer it where one does: its own, or each root's.
 type Selection = { cases: List<select::Case>, answering: List<List<Bytes>> }
 
-/// `loaded` is what the run's load read of the shipped modules (`views.held_texts`).
+/// `loaded` is what the run's load read of the shipped modules (`views.held_texts`); `options` the
+/// run's, whose roots a pass's reads are read against.
 pub fn cases_of(
   rows: List<Row>,
   search: Search,
-  bypassed: Bool,
+  options: Options,
   loaded: Map<Bytes, Bytes>,
-) -> Selection / {ledger.passes, tester.moved[tests], fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> Selection / {ledger.passes, entering::machine.moved, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+  let bypassed = options.no_cache;
   let ask = |keys: List<Bytes>|
     if bypassed { keys.map(|k: Bytes| None) } else { ledger.passes(keys) };
   let digest = digest_of(search);
@@ -736,7 +709,7 @@ pub fn cases_of(
     ),
     |m: Bytes| views::read_held(loaded, m),
   );
-  let answers = filed.map(|held: Option<Bytes>| standing(now, held));
+  let answers = filed.map(|held: Option<Bytes>| standing(now, held, options));
   // A keyed row's answer is the next one, in the order the keys were asked.
   let held = keys.fold(
     { at: 0, out: [] },
@@ -748,7 +721,8 @@ pub fn cases_of(
   ).out;
   let owed = seeded.map(|o: Option<List<Option<Bytes>>>|
     match o {
-      Some(xs) -> Some(owed_roots(search.roots, xs.map(|held: Option<Bytes>| standing(now, held)))),
+      Some(xs) ->
+        Some(owed_roots(search.roots, xs.map(|held: Option<Bytes>| standing(now, held, options)))),
       None -> None,
     });
   {
@@ -775,14 +749,18 @@ pub fn traces_of(held: List<Option<Bytes>>) -> List<Bytes> =
   held.fold([], |acc: List<Bytes>, h: Option<Bytes>|
     match h { Some(trace) -> acc.push(trace), None -> acc })
 
-/// What a filed pass says now: it stands while every read its trace holds answers as it did, and
-/// every view of a shipped module it holds stands against `now`.
-pub fn standing(now: views::Now, held: Option<Bytes>) -> Option<Held> / {tester.moved[tests]} =
+/// What a filed pass says now: it stands while every read its trace holds answers as it did under
+/// what `options` lend, and every view of a shipped module it holds stands against `now`.
+pub fn standing(
+  now: views::Now,
+  held: Option<Bytes>,
+  options: Options,
+) -> Option<Held> / {entering::machine.moved, abort.raise} =
   match held {
     None -> None,
     Some(trace) -> if trace == b"" { Some(Stands) } else {
       let split = views::split(trace);
-      match tester.moved[tests](split.rest) {
+      match tester::moved(options, split.rest) {
         Some(what) -> Some(Moved(what)),
         None -> match views::moved(now, split.viewed) {
           None -> Some(Stands),
@@ -844,12 +822,13 @@ pub fn diagnosed_all(
   }
 
 /// Every failure's cause, decided before anything renders one, and the keys of the mixtures that
-/// went green, which the store keeps.
+/// went green, which the store keeps. A mixture runs under `testing`, which binds nothing.
 pub fn decided_faults(
   report: RunReport,
   benches: List<Option<Bench>>,
   asked: Diagnosing,
-) -> { faults: List<Fault>, proved: List<Bytes> } / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} =
+  testing: Testing,
+) -> { faults: List<Fault>, proved: List<Bytes> } / {ledger.passes, entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
   handle {
     range(0, report.failures.len()).flat_map(|i: Int|
       match report.failures.at(i) {
@@ -859,7 +838,7 @@ pub fn decided_faults(
             fault_of(f, asked, |keys: List<DefKey>, filed: Option<Bytes>|
               match benches.at(i) {
                 Some(Some(b)) -> {
-                  let tried: Tried = trial(b, keys, filed);
+                  let tried: Tried = trial(testing, b, keys, filed);
                   match tried.proved { Some(k) -> proving.proved(k), None -> () };
                   tried.trial
                 },

@@ -291,6 +291,7 @@ pub fn run(
     count: Option<crate::count::Asked>,
 ) -> Launched {
     ply_compiled::c::sweep::once();
+    ply_privileged::binder::install();
     let definitions = program.definitions;
     let shipped = match shipped_modules(&program.stage, &definitions) {
         Ok(shipped) => shipped,
@@ -372,7 +373,14 @@ fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp
         }
     };
     let run = entry::Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64);
-    let outcome = entry::enter(&opened, entry, entry::no_arguments(), &run, Some(&hosts));
+    let outcome = entry::enter(
+        &opened,
+        entry,
+        entry::no_arguments(),
+        &run,
+        Some(&hosts),
+        None,
+    );
     // Ends the children still running and flushes the sink.
     let _ = hosts.runtime().map(|rt| rt.shutdown());
     let code = match (hosts.requested_exit(), outcome.ended) {

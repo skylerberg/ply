@@ -15,6 +15,7 @@ fn pack() {
 }
 
 mod front;
+mod hosts;
 mod reused;
 mod runnable;
 mod shipped;

@@ -75,13 +75,12 @@ pg=$(postgres_bin)
 
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
 # it, a postgres where there is one, its scratch directory and the filesystem, the repository, and
-# every family a command drives a machine with, since its tests run the commands in this process.
+# every family a command enters a program with, since its tests run the commands in this process.
 cli_grants=(--host --timeout 900000 --steps 0 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   ${pg:+--exec "initdb=$pg/initdb" --exec "postgres=$pg/postgres" --exec "psql=$pg/psql"}
   --fs cwd=. --fs abs=/ --fs "repo=$root"
-  --allow machine --allow tester --allow claims --allow hosts
-  --allow shipped --allow toolchain)
+  --allow machine --allow shipped --allow toolchain)
 
 # The epoch second every `ply` this job starts must end by; empty for no end.
 deadline=${PLY_CI_DEADLINE:-}

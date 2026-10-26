@@ -1,0 +1,280 @@
+//! The families this binary serves itself, as the runtime's natives bind them: a binding from what
+//! a run is lent alone, what the families register and the facts a run's disclosures print, and the
+//! world a trace of the run's reads is read against.
+
+use crate::hosts::Hosts;
+use ply_compiled::entry::{Bound, Grants, Observation};
+use ply_compiled::flat::Writer;
+use ply_core::Diagnostic;
+use ply_core::host::{HostBinding, HostResource, MachineId};
+use ply_host::tls;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Installs the binder, once, before a program enters another.
+pub fn install() {
+    ply_compiled::entry::install(Box::new(Binder));
+}
+
+struct Binder;
+
+impl ply_compiled::entry::Binder for Binder {
+    fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>> {
+        let hosts = Hosts::granted(&grants, crate::policy::lent_to(&grants))?;
+        Ok(Arc::new(Lent {
+            world: Worldly::of(&grants),
+            hosts,
+        }))
+    }
+
+    /// `hosting := list(registration), list(failure) refusals, option(transport), list(named)
+    /// roots, sink, list(string) signals`; `registration := string effect, string op,
+    /// option(resource) (none for every label), bool deterministic, bool repeatable, bool blocking,
+    /// bool secrets, string handler, string facility`; `transport := string library, string
+    /// version, string provider, list(string) versions, list(string) alpn, string roots, string
+    /// roots_version, int trusted, list(credential)`; `credential := string name, string
+    /// fingerprint, int certificates`; `named := string name, string path`; `sink := string sink,
+    /// string destination, option(string) level`.
+    fn hosting(&self, grants: &Grants, w: &mut Writer) {
+        let mut registry = ply_host::registry();
+        for (op, handler) in crate::policy::lent_to(grants) {
+            registry.register(op, handler);
+        }
+        w.list(registry.ops().collect::<Vec<_>>().into_iter(), |w, op| {
+            w.str(op.effect.as_str()).str(op.op.as_str());
+            w.option(
+                match &op.resource {
+                    HostResource::Only(r) => Some(r),
+                    HostResource::Any => None,
+                },
+                ply_compiled::entry::write_resource,
+            );
+            w.bool(op.determinism.is_deterministic())
+                .bool(!op.linearity.is_linear())
+                .bool(op.blocking)
+                .bool(op.secrets)
+                .str(op.path)
+                .str(facility_of(op.path));
+        });
+        let mut refusals = Vec::new();
+        let credentials = credentials_of(grants).map_err(|d| refusals.extend(d)).ok();
+        let roots = roots_of(grants).map_err(|d| refusals.push(d)).ok();
+        w.list(refusals.iter(), |w, d| {
+            ply_compiled::entry::write_failure(w, d, None)
+        });
+        w.option(credentials.as_ref(), |w, c| {
+            w.str(tls::LIBRARY)
+                .str(tls::VERSION)
+                .str(tls::PROVIDER)
+                .list(tls::VERSIONS.iter(), |w, v| {
+                    w.str(v);
+                })
+                .list(tls::ALPN.iter(), |w, a| {
+                    w.str(a);
+                })
+                .str(tls::ROOTS)
+                .str(tls::ROOTS_VERSION)
+                .count(c.trusted() as u64)
+                .list(
+                    c.iter().collect::<Vec<_>>().into_iter(),
+                    |w, (name, credential)| {
+                        w.str(name)
+                            .str(credential.fingerprint())
+                            .count(credential.certificates() as u64);
+                    },
+                );
+        });
+        let listed: Vec<(String, String)> = (roots.iter())
+            .flat_map(|r| r.listing())
+            .map(|(name, path)| (name.to_string(), path.display().to_string()))
+            .collect();
+        w.list(listed.iter(), |w, (name, path)| {
+            w.str(name).str(path);
+        });
+        let trace = crate::trace::TraceOptions::of_grants(grants);
+        let opened = trace.open();
+        let sink = opened.sink_path();
+        w.str(sink).str(opened.sink_destination()).option(
+            (sink != ply_host::trace::DISCARD_PATH).then_some(trace.level_name()),
+            |w, level| {
+                w.str(level);
+            },
+        );
+        let listening = ply_host::signal::Shutdown::new(ply_host::signal::Bounds::default());
+        w.list(listening.signals().iter(), |w, s| {
+            w.str(s.name());
+        });
+    }
+
+    fn moved(&self, grants: &Grants, trace: &str, caller: MachineId) -> Option<String> {
+        ply_host::observe::moved(trace, &Worldly::of(grants).world(), caller)
+    }
+}
+
+/// Which disclosure a registration's handler is one of: `tls`, `fs`, or none.
+fn facility_of(path: &str) -> &'static str {
+    if [
+        tls::HANDLER,
+        tls::CONNECT_HANDLER,
+        tls::START_HANDLER,
+        tls::SERVE_HANDLER,
+    ]
+    .contains(&path)
+    {
+        "tls"
+    } else if path.starts_with("ply_host::fs::") || path.starts_with("ply_host::sqlite::") {
+        "fs"
+    } else {
+        ""
+    }
+}
+
+fn credentials_of(grants: &Grants) -> Result<tls::Credentials, Vec<Diagnostic>> {
+    let named: Vec<tls::CredentialSpec> = grants
+        .named("tls")
+        .filter_map(|fields| match fields {
+            [name, certificate, key] => Some(tls::CredentialSpec {
+                name: name.clone(),
+                certificate: certificate.into(),
+                key: key.into(),
+            }),
+            _ => None,
+        })
+        .collect();
+    let first = |name: &'static str| {
+        (grants.named(name))
+            .filter_map(|fields| fields.first().cloned())
+            .collect::<Vec<String>>()
+    };
+    let trust: Vec<PathBuf> = first("trust").into_iter().map(Into::into).collect();
+    tls::Credentials::load(&named, &trust, &first("mtls"))
+}
+
+fn roots_of(grants: &Grants) -> Result<ply_host::fs::Roots, Diagnostic> {
+    let specs: Vec<ply_host::fs::RootSpec> = grants
+        .named("fs")
+        .filter_map(|fields| match fields {
+            [name, path] => Some(ply_host::fs::RootSpec {
+                name: name.clone(),
+                path: path.into(),
+            }),
+            _ => None,
+        })
+        .collect();
+    ply_host::fs::Roots::load(&specs, ply_core::Span::DUMMY)
+}
+
+/// A binding and the world its runs' traces are read against.
+struct Lent {
+    hosts: Hosts,
+    world: Worldly,
+}
+
+impl Bound for Lent {
+    fn binding(&self) -> Arc<HostBinding> {
+        self.hosts.binding()
+    }
+
+    fn runtime_factory(&self) -> Option<ply_core::RuntimeFactory> {
+        self.hosts.runtime_factory()
+    }
+
+    fn requested_exit(&self) -> Option<i32> {
+        self.hosts.requested_exit()
+    }
+
+    fn observing(
+        &self,
+        entry: MachineId,
+        caller: MachineId,
+        recorded: bool,
+    ) -> Option<Box<dyn Observation>> {
+        if !recorded {
+            ply_host::observe::adopt(entry, caller);
+            return None;
+        }
+        Some(Box::new(Observed {
+            recorder: ply_host::observe::begin(entry),
+            world: self.world.clone(),
+        }))
+    }
+
+    fn unbind(&self) -> Vec<(String, Vec<u8>)> {
+        self.hosts.torn_down()
+    }
+}
+
+struct Observed {
+    recorder: Arc<ply_host::observe::Recorder>,
+    world: Worldly,
+}
+
+impl Observation for Observed {
+    fn finished(self: Box<Self>, caller: MachineId, host: bool) -> Option<String> {
+        ply_host::observe::end(&self.recorder);
+        ply_host::observe::absorb(caller, &self.recorder);
+        ply_host::observe::finished(&self.recorder, &self.world.world(), host)
+    }
+}
+
+/// What a trace is read against: the roots a run is lent, unless it is hermetic and so reads no
+/// file, and what the run binds apart from the program.
+#[derive(Clone)]
+struct Worldly {
+    roots: Option<Vec<(String, PathBuf)>>,
+    binding: String,
+}
+
+impl Worldly {
+    fn of(grants: &Grants) -> Worldly {
+        let roots = (!grants.has("hermetic")).then(|| {
+            roots_of(grants)
+                .map(|roots| {
+                    roots
+                        .listing()
+                        .map(|(name, dir)| (name.to_string(), dir.to_path_buf()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+        Worldly {
+            roots,
+            binding: binding_digest(grants),
+        }
+    }
+
+    fn world(&self) -> ply_host::observe::World<'_> {
+        ply_host::observe::World {
+            roots: self.roots.as_deref(),
+            binding: self.binding.clone(),
+            binary: ply_host::observe::Binary {
+                shipped: &crate::shipped::module_digest,
+                program: crate::shipped::program_digest(),
+            },
+        }
+    }
+}
+
+/// What a run binds apart from the program, which a pass's key covers: whether it binds the host,
+/// and the roots, programs and families it is lent, by name.
+fn binding_digest(grants: &Grants) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(if grants.has("hermetic") {
+        b"hermetic\0"
+    } else {
+        b"host\0"
+    });
+    for part in ["fs", "exec", "allow"] {
+        let mut names: Vec<&str> = (grants.named(part))
+            .filter_map(|fields| fields.first().map(String::as_str))
+            .collect();
+        names.sort();
+        hasher.update(part.as_bytes());
+        hasher.update(&[0]);
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(&[0]);
+        }
+    }
+    hasher.finalize().to_hex().to_string()
+}

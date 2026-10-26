@@ -395,9 +395,10 @@ pub(crate) struct FrameClause {
     pub(super) resource: Option<Symbol>,
     pub(super) op: Symbol,
     pub(crate) closure: Word,
-    /// 0: never resumes; 1: resumes in tail position; 3: answers a raise, once its `handle`'s body
-    /// is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may resume
-    /// again.
+    /// 0: takes no continuation, its value the operation's answer; 1: resumes in tail position,
+    /// unwinding to its `handle` on a path that does not; 3: answers a raise, once its `handle`'s
+    /// body is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may
+    /// resume again.
     pub(super) resumes: u8,
     /// `[*t]`: the clause's first slot after the parameters is the label the call site named, lifted
     /// through this `String` type.
@@ -470,13 +471,14 @@ pub(crate) struct Reached {
 
 impl HandlerFrame {
     /// Whether a branch performing what `reach` lists could reach a clause of this frame that
-    /// cannot answer it from another thread.
-    pub(super) fn within(&self, reach: &[Reached]) -> bool {
+    /// cannot answer it from another thread. Where `crossing` is false nothing of the frame can:
+    /// a frame below it does not cross.
+    pub(super) fn within(&self, reach: &[Reached], crossing: bool) -> bool {
         self.simulate
-            || self
-                .clauses
-                .iter()
-                .any(|cl| !self.crosses(cl) && reach.iter().any(|reached| cl.may_answer(reached)))
+            || self.clauses.iter().any(|cl| {
+                !(crossing && self.crosses(cl))
+                    && reach.iter().any(|reached| cl.may_answer(reached))
+            })
     }
 
     /// Whether every clause of this frame can answer from another thread.
@@ -485,14 +487,15 @@ impl HandlerFrame {
     }
 
     /// Whether `cl` can answer a perform of a branch running on another thread, in a copy of this
-    /// frame the branch is given: it resumes on its tail, so it neither unwinds to its `handle` nor
-    /// captures, its frame holds no variables, and its closure is immortal, so the threads count
-    /// nothing of it between them.
+    /// frame the branch is given: it answers by returning, so it neither unwinds to its `handle`
+    /// nor captures, its frame holds no variables, and its closure is immortal, so the threads count
+    /// nothing of it between them. A clause that resumes `k` may not on every path, and its
+    /// unwind would find no `handle` on the branch's thread.
     pub(super) fn crosses(&self, cl: &FrameClause) -> bool {
         self.vars.is_none()
             && self.detached.is_none()
             && !self.simulate
-            && cl.resumes == 1
+            && cl.resumes == 0
             && !cl.raises()
             && immortal(cl.closure)
     }

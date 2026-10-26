@@ -779,6 +779,35 @@ fn host_use_records_what_actually_happened() {
 }
 
 #[test]
+fn a_binding_of_grants_refuses_two_handlers_of_one_operation_and_label() {
+    let twice = registry(vec![
+        op("db", "get", named("users")),
+        op("db", "get", named("users")),
+    ]);
+    match twice.granted(Grants::default()) {
+        Ok(_) => panic!("two handlers of `db.get[users]` were bound"),
+        Err(diagnostics) => assert_eq!(codes_of(&diagnostics), [codes::HOST_HANDLER_CONFLICT]),
+    }
+    let apart = registry(vec![
+        op("db", "get", named("users")),
+        op("db", "get", named("orders")),
+        op("db", "get", HostResource::Any),
+    ]);
+    assert!(apart.granted(Grants::default()).is_ok());
+    let mut withheld = HostRegistry::new();
+    withheld.register_withheld(
+        op("db", "get", named("users")),
+        Arc::new(Never),
+        "elsewhere",
+    );
+    withheld.register(op("db", "get", named("users")), Arc::new(Never));
+    assert!(
+        withheld.granted(Grants::default()).is_ok(),
+        "a withheld registration serves nothing, so it conflicts with nothing"
+    );
+}
+
+#[test]
 fn preview_answers_what_would_bind_without_binding() {
     let registry = registry(vec![op("db", "get", HostResource::Any)]);
     let listing = registry.preview(&db()).expect("previews");

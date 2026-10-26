@@ -169,6 +169,16 @@ pub fn granted(check: &CheckOutput, allow: &[String]) -> Result<Vec<LentOp>, Dia
     lent_for(&families, &module).map_err(|why| Diagnostic::error(codes::CAPABILITY_UNDECLARED, why))
 }
 
+/// The families a run's `allow` entries name, served as the `ply` binary's own program declares
+/// their effects.
+pub fn lent_to(grants: &ply_core::host::Grants) -> Vec<LentOp> {
+    FAMILIES
+        .iter()
+        .filter(|f| grants.allows(f.name))
+        .flat_map(|f| lent(f.name, &own).unwrap_or_default())
+        .collect()
+}
+
 /// Every family, for a host that lends them all: the `ply` binary's own program.
 pub fn all() -> Vec<LentOp> {
     FAMILIES

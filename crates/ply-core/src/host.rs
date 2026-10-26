@@ -310,18 +310,56 @@ impl HostRegistry {
             index,
             bound: true,
             granted: false,
+            grants: Grants::default(),
         })
     }
 
     /// A binding of every registration, which answers a perform its effect's name, operation and
-    /// label find a registration for: what a run is lent decides the registrations, and no row of
-    /// the program's is read.
-    pub fn granted(self) -> HostBinding {
-        HostBinding {
+    /// label find a registration for: what a run is lent, `grants`, decides the registrations, and
+    /// no row of the program's is read. Two registrations a binding serves of one effect, operation
+    /// and label are refused (`E0422`): neither would silently win.
+    pub fn granted(self, grants: Grants) -> Result<HostBinding, Vec<Diagnostic>> {
+        let refused = self.conflicts();
+        if !refused.is_empty() {
+            return Err(refused);
+        }
+        Ok(HostBinding {
             granted: true,
             bound: true,
+            grants,
             ..HostBinding::hermetic_with(self)
+        })
+    }
+
+    /// Each registration served beside an earlier one of the same effect, operation and label.
+    fn conflicts(&self) -> Vec<Diagnostic> {
+        let mut first: BTreeMap<(&str, &str, String), &'static str> = BTreeMap::new();
+        let mut refused = Vec::new();
+        for (at, (op, _)) in self.entries.iter().enumerate() {
+            if self.withheld.contains_key(&at) {
+                continue;
+            }
+            let label = match &op.resource {
+                HostResource::Only(r) => format!("{r:?}"),
+                HostResource::Any => "*".to_string(),
+            };
+            match first.get(&(op.effect.as_str(), op.op.as_str(), label.clone())) {
+                Some(earlier) => refused.push(
+                    Diagnostic::error(
+                        codes::HOST_HANDLER_CONFLICT,
+                        format!(
+                            "`{}.{}` is registered twice: by `{earlier}` and by `{}`",
+                            op.effect, op.op, op.path
+                        ),
+                    )
+                    .note("a binding serves each operation of each label by one handler"),
+                ),
+                None => {
+                    first.insert((op.effect.as_str(), op.op.as_str(), label), op.path);
+                }
+            }
         }
+        refused
     }
 
     /// What would bind, without binding.
@@ -575,6 +613,44 @@ pub struct HostBinding {
     bound: bool,
     /// Resolves by name against `entries`, with no rows.
     granted: bool,
+    grants: Grants,
+}
+
+/// What a run is lent, as named entries, each a list of fields: the runtime's own handlers read the
+/// ones they serve (`fs NAME PATH`, `exec NAME PATH`, `allow FAMILY`, `argv ARG..`, ...), and every
+/// entry is kept for the real handlers a program declares.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Grants {
+    pub entries: Vec<(String, Vec<String>)>,
+}
+
+impl Grants {
+    /// The fields of each entry named `name`, in order.
+    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a [String]> + 'a {
+        (self.entries.iter())
+            .filter(move |(n, _)| n == name)
+            .map(|(_, fields)| fields.as_slice())
+    }
+
+    /// Whether an entry is named `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.named(name).next().is_some()
+    }
+
+    /// The grants with one entry more.
+    pub fn with(mut self, name: &str, fields: &[&str]) -> Grants {
+        self.entries.push((
+            name.to_string(),
+            fields.iter().map(|f| f.to_string()).collect(),
+        ));
+        self
+    }
+
+    /// Whether `allow` names the family `family`.
+    pub fn allows(&self, family: &str) -> bool {
+        self.named("allow")
+            .any(|fields| fields.first().is_some_and(|f| f == family))
+    }
 }
 
 impl Default for HostBinding {
@@ -610,11 +686,17 @@ impl HostBinding {
             index: BTreeMap::new(),
             bound: false,
             granted: false,
+            grants: Grants::default(),
         }
     }
 
     pub fn is_hermetic(&self) -> bool {
         !self.bound
+    }
+
+    /// What the run this binding serves is lent.
+    pub fn grants(&self) -> &Grants {
+        &self.grants
     }
 
     pub fn footprint(&self) -> &Footprint {

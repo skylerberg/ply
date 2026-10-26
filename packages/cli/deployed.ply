@@ -1,13 +1,15 @@
 //! A program's artifact: the closure of one entry point, held three ways — its definitions by hash,
-//! printed back to source, and the runnable a machine loads with the unit's C, made from that source
-//! checked again — and opened by holding each against the others. `compiler.store.plyx` lays the container
-//! out; the runnable is `shipped.runnable`'s.
+//! printed back to source, and the unit's C with what running it reads of its front end, made from
+//! that source checked again — and opened by holding each against the others.
+//! `compiler.store.plyx` lays the container out.
 
 import builder (Refusal)
+import entries
+import entries (Runnable, runnable_bin)
+import std.bin
 import units
 import units (emit)
 import compiler.front.rows (Dump, HashFrame, HDef, HashRow, BodyRow, DefRow, TypeRow, EffectRow)
-import compiler.front.published (shipped_dump)
 import compiler.store.hash.forms (Closed, HashOutput, by_name, held_by, walk)
 import compiler.store.hash.printed (Printed, Unprintable, print_bodies)
 import compiler.store.hash (body_key)
@@ -46,19 +48,22 @@ pub type Made = {
 /// A library's unit: the head every container records, and its one section's payload.
 pub type Compiled = { head: Header, count: Int, payload: Bytes }
 
-/// What an artifact holds once every part of it agrees with every other: the runnable a machine
-/// loads, its unit's C (carried deflated), and what that machine holds it to, and what a report says
-/// of it.
+/// What an artifact holds once every part of it agrees with every other: its unit's C (carried
+/// deflated), what running it reads of its front end, and what a report says of it.
 pub type Opened = {
   entry: String,
   entry_hash: Bytes,
   digest: String,
   definitions: Int,
   names: List<{ name: String, hash: Bytes }>,
-  closure: List<{ path: String, text: Bytes }>,
-  runnable: Bytes,
+  runnable: Runnable,
   unit: Bytes,
 }
+
+/// The runnable section: the entry point the artifact runs, and what running it reads.
+type Carried = { entry: String, runnable: Runnable }
+
+derive bin for Carried
 
 /// What a build asks of its artifacts: one made from the program, an earlier one read back, and a
 /// library's unit. `deploying` answers it with this module; a test answers it with what it reports.
@@ -74,7 +79,7 @@ pub type Previous = { digest: String, names: List<Named> }
 
 pub fn deploying<a | e>(
   body: () -> a / {artifacts.made, artifacts.previous, artifacts.unit | e},
-) -> a / {abort.raise, emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable | e} =
+) -> a / {abort.raise, emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime | e} =
   handle {
     body()
   } with {
@@ -443,7 +448,7 @@ pub fn made(
   entry: String,
   startup: List<String>,
   reaches: Bool,
-) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, shipped.runnable, abort.raise} = {
+) -> Result<Made, Refusal> / {emit.unit, shipped.names, shipped.module, shipped.reached, shipped.definitions, shipped.runtime, abort.raise} = {
   let defs = by_name(hashes.defs);
   let roots = startup.push(entry).map(Bytes::of_string);
   match roots.filter(|r: Bytes| !defs.contains(r)) {
@@ -504,7 +509,10 @@ pub fn made(
                         Some(h) -> h,
                         None -> b"",
                       };
-                      let runnable = shipped.runnable(entry, again.files, shipped_dump(again.dump));
+                      let runnable = bin::encode(
+                        { entry: entry, runnable: entries::runnable_of(again, roots) },
+                        carried_bin(),
+                      );
                       Ok({
                         entry: entry,
                         entry_hash: entry_hash.hex_of(),
@@ -744,7 +752,7 @@ pub fn opened(
             Err(d) -> Err(d),
             Ok(names) -> match read_closure(path, b, placed_named(o.sections, b"closure")) {
               Err(d) -> Err(d),
-              Ok(closure) -> match ((
+              Ok(_) -> match ((
                   placed_named(o.sections, b"runnable"),
                   placed_named(o.sections, b"unit"),
                 )) {
@@ -793,17 +801,21 @@ pub fn opened(
                               [],
                             ),
                           ),
-                        [e, ..] -> match payload(b, u).gunzip() {
-                          None -> Err(invalid(path, "the artifact's unit does not inflate", [])),
-                          Some(unit) ->
+                        [e, ..] -> match ((
+                            payload(b, u).gunzip(),
+                            carried(path, payload(b, r), e.name),
+                          )) {
+                          (None, _) ->
+                            Err(invalid(path, "the artifact's unit does not inflate", [])),
+                          (_, Err(d)) -> Err(d),
+                          (Some(unit), Ok(runnable)) ->
                             Ok({
                               entry: e.name,
                               entry_hash: o.entry,
                               digest: sealed_short(computed),
                               definitions: bodies.keys().len(),
                               names: names,
-                              closure: closure,
-                              runnable: payload(b, r),
+                              runnable: runnable,
                               unit: unit,
                             }),
                         },
@@ -817,6 +829,22 @@ pub fn opened(
         },
       }
     },
+  }
+
+/// The runnable section `bytes`, held to the entry point `entry` the namespace names.
+fn carried(path: String, bytes: Bytes, entry: String) -> Result<Runnable, Diag> / {abort.raise} =
+  match bin::decode(bytes, carried_bin()) {
+    Err(why) -> Err(invalid(path, "the artifact's runnable does not read: " ++ why.message, [])),
+    Ok(c) -> if c.entry != entry {
+      Err(
+        invalid(
+          path,
+          "the artifact's runnable enters `" ++ c.entry ++ "`, and its namespace names `" ++ entry
+            ++ "`",
+          [],
+        ),
+      )
+    } else { Ok(c.runnable) },
   }
 
 pub fn unreadable(path: String) -> Diag =

@@ -72,6 +72,39 @@ impl Configuration {
         })
     }
 
+    /// The configuration a run is lent: each `config KEY VALUE secret|plain` entry, the `schema
+    /// FUNCTION NAME SHAPE..` entry that pins it, and `configured` where a source was read.
+    pub fn of_grants(grants: &ply_core::host::Grants) -> Configuration {
+        let values: BTreeMap<String, Entry> = grants
+            .named("config")
+            .filter_map(|fields| match fields {
+                [key, value, secret] => Some((
+                    key.clone(),
+                    Entry {
+                        value: value.clone(),
+                        secret: secret == "secret",
+                    },
+                )),
+                _ => None,
+            })
+            .collect();
+        let schema = grants.named("schema").next().and_then(|fields| {
+            let (name, keys) = fields.split_first()?;
+            Some(SchemaView {
+                name: name.clone(),
+                keys: keys
+                    .chunks_exact(2)
+                    .map(|pair| (pair[0].clone(), pair[1].clone()))
+                    .collect(),
+            })
+        });
+        Configuration {
+            snapshot: Arc::new(Snapshot::new(values, schema.is_some())),
+            schema,
+            opened: grants.has("configured"),
+        }
+    }
+
     pub fn is_opened(&self) -> bool {
         self.opened
     }

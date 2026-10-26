@@ -292,24 +292,34 @@ impl Ctx {
         b
     }
 
-    /// Copies of what the frames in reach of the running stack answer from another thread,
-    /// outermost first, as a branch's own stack holds them.
-    fn crossing_frames(&self) -> Vec<HandlerFrame> {
+    /// The frames in reach of the running stack, outermost first, each with whether its clauses
+    /// may answer from another thread at all: only where every frame below it crosses whole, since
+    /// what a clause performs and raises is answered below it.
+    fn frames_in_reach(&self) -> Vec<(&HandlerFrame, bool)> {
         let mut chain = Vec::new();
         let mut stack = Some(self.current);
         while let Some(s) = stack {
             chain.push(s);
             stack = self.stacks[s].parent;
         }
-        chain
+        let mut below_crosses = true;
+        let mut frames = Vec::new();
+        for s in chain.into_iter().rev() {
+            for f in &self.stacks[s].list {
+                frames.push((f, below_crosses));
+                below_crosses &= f.crosses_whole();
+            }
+        }
+        frames
+    }
+
+    /// Copies of what the frames in reach of the running stack answer from another thread,
+    /// outermost first, as a branch's own stack holds them.
+    fn crossing_frames(&self) -> Vec<HandlerFrame> {
+        self.frames_in_reach()
             .into_iter()
-            .rev()
-            .flat_map(|s| {
-                self.stacks[s]
-                    .list
-                    .iter()
-                    .filter_map(HandlerFrame::crossing_copy)
-            })
+            .filter(|(_, crossing)| *crossing)
+            .filter_map(|(f, _)| f.crossing_copy())
             .collect()
     }
 
@@ -340,19 +350,12 @@ impl Ctx {
         if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
             return false;
         }
-        let mut stack = Some(self.current);
-        while let Some(s) = stack {
-            let frames = &self.stacks[s].list;
-            let held = match reach {
-                Some(reach) => frames.iter().any(|f| f.within(reach)),
-                None => !frames.iter().all(HandlerFrame::crosses_whole),
-            };
-            if held {
-                return false;
-            }
-            stack = self.stacks[s].parent;
-        }
-        true
+        self.frames_in_reach()
+            .into_iter()
+            .all(|(f, crossing)| match reach {
+                Some(reach) => !f.within(reach, crossing),
+                None => f.crosses_whole(),
+            })
     }
 
     /// The calls left before this entry's budget is spent, or `None` when nothing bounds it.

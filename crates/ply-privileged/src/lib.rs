@@ -10,6 +10,7 @@
 //! forgets what the label was configured with. The run flow itself — targets, bindings, teardown —
 //! is `crate::drive`.
 
+pub mod binder;
 pub mod claims;
 pub mod config;
 pub mod drive;

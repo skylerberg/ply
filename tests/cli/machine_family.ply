@@ -1,25 +1,50 @@
-//! The machine family a program drives another program with, end to end in this process: the
-//! program `compiler.load` reads and `compiler.cc` compiles is loaded under `run`, an entry bound,
-//! entered or called, and the label dropped, with what each step answers.
+//! The capability a program enters another program with, end to end in this process: the program
+//! `compiler.load` reads and `compiler.cc` compiles is opened, bound as the options lend it, and its
+//! definitions entered, with how each entry ended and what it used.
 
-import harness (Here, Shipped, answered, bound_main, compiled_here, first_message, loaded, project,
-                scratch, working, write)
-import cli.machine (machine, Called, Ended, Held, Options, default_options, unconfigured)
+import harness (Here, Shipped, Loaded, compiled_here, entered, loaded, project, scratch, unloaded,
+                write)
+import cli.machine
+import cli.machine (Options, default_options)
 import compiler.check.resolve.tables (Diag)
+import cli.diagnostic (Raised)
 import std.fs
 import std.fs (fs)
+import std.machine as entering
 import std.value (Value, VInt)
 
-/// The family's operations a test performs, under the label the suite's run lends.
-effect set Driving = {machine.configure[run], machine.load[run], machine.reload[run], machine.bound[run], machine.enter[run], machine.call[run], machine.accounting[run], machine.drop[run]}
+/// The capability's operations a test performs.
+effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
+
+/// How one entry ended: the code it chose, its answer or what it raised, what it ended with, and
+/// what it used.
+type Ended = {
+  exit: Option<Int>,
+  answer: Result<Value, Raised>,
+  warnings: List<Diag>,
+  usage: entering::Usage,
+}
+
+fn ended_of(
+  l: Loaded,
+  name: String,
+  args: List<Value>,
+) -> Ended / {entering::machine.enter, abort.raise} = {
+  let o = entered(l, name, args);
+  {
+    exit: o.exit,
+    answer: machine::answer_of(o.ended, l.roots, "inner." ++ name),
+    warnings: machine::warnings_of(o, l.roots),
+    usage: o.usage,
+  }
+}
 
 /// How `inner.main` of the module `inner` ended, entered under `options`.
-fn entered(inner: String, options: Options) -> Ended / {Here, Shipped, Driving, abort.raise} = {
+fn main_of(inner: String, options: Options) -> Ended / {Here, Shipped, Driving, abort.raise} = {
   project([{ path: "inner.ply", text: inner }]);
-  loaded(options);
-  bound_main();
-  let ended = machine.enter[run]();
-  machine.drop[run]();
+  let l = loaded(options);
+  let ended = ended_of(l, "main", []);
+  let _ = unloaded(l);
   ended
 }
 
@@ -50,37 +75,43 @@ fn warns_of_the_open_span(warnings: List<Diag>) -> Unit / {abort.raise} =
     _ -> panic("one warning, not " ++ warnings.len().to_string()),
   }
 
-test "a program loads, binds and enters a program, which answers its value" {
+fn code_of(answer: Result<Value, Raised>) -> Bytes =
+  match answer { Ok(_) -> b"", Err(r) -> r.diag.code }
+
+test "a program opens, binds and enters a program, which answers its value" {
   scratch(|| {
-    let ended = entered("fn main() -> Int = 40 + 2\n", default_options());
-    assert_eq(ended.value, Some(VInt(42)));
-    assert_eq(ended.exit, None);
-    assert(ended.raised == None, Some("the entry raised"))
+    let ended = main_of("fn main() -> Int = 40 + 2\n", default_options());
+    assert_eq(ended.answer, Ok(VInt(42)));
+    assert_eq(ended.exit, None)
   })
 }
 
-test/nondet "a nested program may choose the exit code" {
-  let ended = entered(
-    "import std.process (process)\n\nfn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)\n",
-    { ..default_options(), host: true },
-  );
+fn exits() -> String =
+  "import std.process (process)\n\nfn main() -> Unit / {process.exit[proc]} = process.exit[proc](7)\n"
+
+test/nondet "a nested program may choose the exit code, where the binding lends the host" {
+  let ended = main_of(exits(), { ..default_options(), host: true });
   assert_eq(ended.exit, Some(7));
-  assert_eq(ended.value, None);
-  assert(ended.raised == None, Some("the exit was a raise"))
+  assert_eq(code_of(ended.answer), b"")
+}
+
+test/nondet "a hermetic binding refuses what reaches the host" {
+  let ended = main_of(exits(), default_options());
+  assert_eq(ended.exit, None);
+  assert_eq(code_of(ended.answer), b"E0424")
 }
 
 // A raise is a diagnostic value; the outer program does not unwind through it.
 test "a nested raise is a value, not an unwind" {
   scratch(|| {
-    let ended = entered(
+    let ended = main_of(
       "fn main() -> Int / {abort.raise} = panic(\"the inner program's own bug\")\n",
       default_options(),
     );
     assert_eq(ended.exit, None);
-    assert_eq(ended.value, None);
-    match ended.raised {
-      None -> panic("the raise is reported"),
-      Some(r) -> {
+    match ended.answer {
+      Ok(_) -> panic("the raise is reported"),
+      Err(r) -> {
         assert_eq(r.diag.code, b"E0502");
         assert(
           r.diag.message.index_of(b"the inner program's own bug") != None,
@@ -91,79 +122,36 @@ test "a nested raise is a value, not an unwind" {
   })
 }
 
-// What `ply run` reads once the entry is over, and what a driver reads of a call.
-test/nondet "an entry or a call that left a span open answers W0609 beside its value" {
+test/nondet "an entry that left a span open answers W0609 beside its value" {
   project([{ path: "inner.ply", text: leaves_a_span() }]);
-  loaded(hosted_quietly());
-  bound_main();
-  let ended = machine.enter[run]();
-  assert_eq(ended.value, Some(VInt(3)));
-  warns_of_the_open_span(ended.warnings);
-  bound_main();
-  let called = machine.call[run]("inner.main", []);
-  machine.drop[run]();
-  match called.answer {
-    Ok(v) -> assert_eq(v, VInt(3)),
-    Err(r) -> panic("the call raised: " ++ String::of_bytes_lossy(r.diag.message)),
-  };
-  warns_of_the_open_span(called.warnings)
+  let l = loaded(hosted_quietly());
+  let ended = ended_of(l, "main", []);
+  let _ = unloaded(l);
+  assert_eq(ended.answer, Ok(VInt(3)));
+  warns_of_the_open_span(ended.warnings)
 }
 
-test "a reload after an edit enters the new program, and a load files nothing" {
+test "an edited program's unit enters the new program, and opening one files nothing" {
   scratch(|| {
     project([{ path: "inner.ply", text: "fn main() -> Int = 1\n" }]);
-    loaded(default_options());
-    bound_main();
-    assert_eq(machine.enter[run]().value, Some(VInt(1)));
+    let first = loaded(default_options());
+    assert_eq(ended_of(first, "main", []).answer, Ok(VInt(1)));
     assert(
       fs.kind[cwd](".ply-cache") == fs::Missing,
-      Some("a machine's load reads the program it was handed and files nothing"),
+      Some("opening a unit reads the library it was handed and files nothing"),
     );
     write("inner.ply", "fn main() -> Int = 2\n");
-    let c = compiled_here();
-    match machine.reload[run](c.front, c.library) {
-      Ok(_) -> (),
-      Err(r) -> panic("the edited program reloads: " ++ first_message(r.diags)),
-    };
-    bound_main();
-    let again = machine.enter[run]();
-    machine.drop[run]();
-    assert_eq(again.value, Some(VInt(2)))
+    let again = loaded(default_options());
+    assert_eq(ended_of(again, "main", []).answer, Ok(VInt(2)));
+    // The first unit stays as it was opened until it is closed.
+    assert_eq(ended_of(first, "main", []).answer, Ok(VInt(1)));
+    let _ = unloaded(first);
+    let _ = unloaded(again);
+    ()
   })
 }
 
-// `configure` before `load`: a configured `--host` binds the nested program's host, and a `drop`
-// forgets the configuration with the program.
-test/nondet "a configured machine binds what its options say, and a drop forgets them" {
-  project([{ path: "inner.ply", text: "fn main() -> Int = 77\n" }]);
-  loaded({ ..default_options(), host: true });
-  match machine.bound[run]("inner.main", unconfigured()) {
-    Err(r) -> panic("binds: " ++ first_message(r.diags)),
-    Ok(b) -> {
-      assert(!b.hermetic, Some("the configured host was not bound"));
-      assert_eq(machine.enter[run]().value, Some(VInt(77)))
-    },
-  };
-  machine.configure[run]({ ..default_options(), host: true });
-  machine.drop[run]();
-  let c = compiled_here();
-  match machine.load[run](working(), c.front, c.library) {
-    Err(r) -> panic("loads: " ++ first_message(r.diags)),
-    Ok(_) -> (),
-  };
-  let bound = machine.bound[run]("inner.main", unconfigured());
-  machine.drop[run]();
-  match bound {
-    Err(r) -> panic("binds: " ++ first_message(r.diags)),
-    Ok(b) ->
-      assert(b.hermetic, Some("a load after a drop bound as the dropped configuration said")),
-  }
-}
-
-fn int_of(called: Called) -> Int =
-  match called.answer { Ok(v) -> match v { VInt(i) -> i, _ -> 0 - 2 }, Err(_) -> 0 - 1 }
-
-test "a call enters a definition with its arguments, and what it spent is read once" {
+test "a call enters a definition with its arguments, and says what it spent" {
   scratch(|| {
     project([
       {
@@ -171,16 +159,12 @@ test "a call enters a definition with its arguments, and what it spent is read o
         text: "fn main() -> Int = 0\n\npub fn double(x: Int) -> Int = x * 2\n\npub fn boom() -> Int / {abort.raise} = panic(\"oh no\")\n",
       },
     ]);
-    loaded(default_options());
-    bound_main();
-    assert_eq(int_of(machine.call[run]("inner.double", [VInt(21)])), 42);
-    let first = machine.accounting[run]();
-    let again = machine.accounting[run]();
-    let raised = machine.call[run]("inner.boom", []);
-    let after_raised = machine.accounting[run]();
-    machine.drop[run]();
-    assert(first.steps > 0, Some("the call's steps were not counted"));
-    assert_eq(again.steps, 0);
+    let l = loaded(default_options());
+    let doubled = ended_of(l, "double", [VInt(21)]);
+    let raised = ended_of(l, "boom", []);
+    let _ = unloaded(l);
+    assert_eq(doubled.answer, Ok(VInt(42)));
+    assert(doubled.usage.steps > 0, Some("the call's steps were not counted"));
     match raised.answer {
       Ok(_) -> panic("`boom` answered"),
       Err(r) ->
@@ -189,13 +173,13 @@ test "a call enters a definition with its arguments, and what it spent is read o
           Some(String::of_bytes_lossy(r.diag.message)),
         ),
     };
-    assert(after_raised.steps > 0, Some("the raising call's steps were not counted"))
+    assert(raised.usage.steps > 0, Some("the raising call's steps were not counted"))
   })
 }
 
-// A driver totals each entry's own steps: a memo's answer and a declined call add none, so a
-// constant run and then answered from the memo costs one run of its body, not two.
-test "a memo's answer and a declined call add no steps to the accounting" {
+// A memo's answer and a declined call cost their entry nothing, so a constant run and then
+// answered from the memo costs one run of its body, not two.
+test "a memo's answer and a declined call spend no steps" {
   scratch(|| {
     project([
       {
@@ -203,24 +187,24 @@ test "a memo's answer and a declined call add no steps to the accounting" {
         text: "fn main() -> Int = 0\n\nfn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }\n\npub fn constant() -> Int = deep(50)\n\npub fn twin() -> Int = deep(50)\n",
       },
     ]);
-    loaded(default_options());
-    bound_main();
-    let spent = || machine.accounting[run]().steps;
-    assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
-    let ran = spent();
-    assert_eq(int_of(machine.call[run]("inner.constant", [])), 50);
-    let remembered = spent();
-    assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
-    assert_eq(int_of(machine.call[run]("inner.twin", [])), 50);
-    let both = spent();
-    // A name the program never defined is declined, which the machine answers as a raise.
-    assert_eq(int_of(machine.call[run]("inner.absent", [])), 0 - 1);
-    let declined = spent();
-    machine.drop[run]();
-    assert(ran > 0, Some("the first call's steps were not counted"));
-    assert_eq(remembered, 0);
-    assert_eq(both, ran);
-    assert_eq(declined, 0)
+    let l = loaded(default_options());
+    let steps = |name: String| {
+      let e = ended_of(l, name, []);
+      { answer: e.answer, steps: e.usage.steps }
+    };
+    let ran = steps("constant");
+    let remembered = steps("constant");
+    let twin = steps("twin");
+    let twin_again = steps("twin");
+    // A name the program never defined is declined.
+    let declined = steps("absent");
+    let _ = unloaded(l);
+    assert_eq(ran.answer, Ok(VInt(50)));
+    assert(ran.steps > 0, Some("the first call's steps were not counted"));
+    assert_eq(remembered.steps, 0);
+    assert_eq(twin.steps + twin_again.steps, ran.steps);
+    assert(declined.answer != Ok(VInt(0)), Some("an absent name answered"));
+    assert_eq(declined.steps, 0)
   })
 }
 
@@ -235,10 +219,9 @@ test/nondet "the branches of a parallel block spend one step budget between them
   let both = alone + fib_calls(21);
   let under = |steps: Int| {
     project([{ path: "inner.ply", text: program }]);
-    loaded({ ..default_options(), steps: steps });
-    bound_main();
-    let answer = machine.call[run]("inner.pair", [VInt(20)]).answer;
-    machine.drop[run]();
+    let l = loaded({ ..default_options(), steps: steps });
+    let answer = ended_of(l, "pair", [VInt(20)]).answer;
+    let _ = unloaded(l);
     match answer { Ok(v) -> Ok(v), Err(r) -> Err(r.diag.code) }
   };
   assert_eq(under(both - alone / 2), Err(b"E0503"));
@@ -269,45 +252,39 @@ fn churning() -> String =
   \\
   \\
 
-/// What `name(n)` answered and what the run held when its root returned.
-fn held_by(
-  name: String,
-  n: Int,
-) -> { answer: Value, held: Held } / {Here, Shipped, Driving, abort.raise} = {
+/// How `name(n)` ended, and what the run held when its root returned.
+fn held_by(name: String, n: Int) -> Ended / {Here, Shipped, Driving, abort.raise} = {
   project([{ path: "inner.ply", text: churning() }]);
-  loaded({ ..default_options(), host: true });
-  bound_main();
-  let _ = machine.accounting[run]();
-  let answer = answered(name, [VInt(n)]);
-  let held = machine.accounting[run]().held;
-  machine.drop[run]();
-  { answer: answer, held: held }
+  let l = loaded({ ..default_options(), host: true });
+  let ended = ended_of(l, name, [VInt(n)]);
+  let _ = unloaded(l);
+  ended
 }
 
 // A server spawns per connection for as long as it runs, so its tables must follow the live tasks.
 test/nondet "a production region keeps its tables to the tasks still live" {
   let h = held_by("churn", 200);
-  assert_eq(h.answer, VInt(200 * 201 / 2));
+  assert_eq(h.answer, Ok(VInt(200 * 201 / 2)));
   assert(
-    h.held.scheduled <= 3,
-    Some("the scheduler keeps " ++ h.held.scheduled.to_string() ++ " tasks after 400 spawns"),
+    h.usage.scheduled <= 3,
+    Some("the scheduler keeps " ++ h.usage.scheduled.to_string() ++ " tasks after 400 spawns"),
   );
   assert(
-    h.held.task_stacks <= 2,
-    Some(h.held.task_stacks.to_string() ++ " task stacks after 400 spawns"),
+    h.usage.task_stacks <= 2,
+    Some(h.usage.task_stacks.to_string() ++ " task stacks after 400 spawns"),
   );
   assert(
-    h.held.frame_tables <= 8,
-    Some(h.held.frame_tables.to_string() ++ " frame tables after 400 spawns"),
+    h.usage.frame_tables <= 8,
+    Some(h.usage.frame_tables.to_string() ++ " frame tables after 400 spawns"),
   )
 }
 
 // A spawn's handle is a bridge, which a server makes per request.
 test/nondet "a production region that drops its task handles gives their bridges back" {
   let h = held_by("fired", 10000);
-  assert_eq(h.answer, VInt(10000 * 9999 / 2));
+  assert_eq(h.answer, Ok(VInt(10000 * 9999 / 2)));
   assert(
-    h.held.bridges <= 4,
-    Some(h.held.bridges.to_string() ++ " bridges after 10000 dropped handles"),
+    h.usage.bridges <= 4,
+    Some(h.usage.bridges.to_string() ++ " bridges after 10000 dropped handles"),
   )
 }

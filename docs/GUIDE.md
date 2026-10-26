@@ -3427,7 +3427,7 @@ checked against that declaration, so it performs none of it.
 | `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine` (`std.machine`'s `machine`: open a compiled unit, bind the host families the runtime serves itself from what a run is lent, and enter one of the unit's roots), `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise, and where an operation of `machine` that lends the host, measures or clocks an entry is performed by a run not lent it. `machine`'s deterministic half, `hermetic_machine`, answers from what it is handed alone: it binds no host, clocks nothing, and needs no grant, so a test that drives a program through it stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
@@ -3714,16 +3714,16 @@ toolchain's library, the working directory is part of. `ply fmt` rewrites the pa
 `ply bootstrap` and `ply work` take theirs as written, and `ply doc` answers for a builtin or a
 shipped module where no package holds the working directory. The binary
 answers with the code the program asked to exit with. What a command needs of
-the machine is lent to the program as an effect: `ply run`, `ply test` and
-`ply prove` drive a nested program on a machine of their own, `ply hosts` and
-`ply cache` are answered what a run would bind and what the store holds, and
+the machine is lent to the program as an effect: `ply run`, `ply test`,
+`ply prove` and `ply hosts` open the unit of the program they run and enter its
+roots through `std.machine`, `ply cache` is answered what the store holds, and
 `ply replace` is lent the text it puts in a definition's place, from
 `--with FILE` or stdin. The program emits the C of every unit a command runs,
 and of what `ply bootstrap` links, itself, and compiles it there too: the
 emitter's answer for a definition, and each object a part of a unit compiles
 to, are kept under the toolchain's cache and read back while the definition,
 the emitter, the runtime and the C compiler are the ones they were made by,
-and the machine loads the library the program hands it. What the emitter needs of a
+and `machine.open` loads the library the program hands it. What the emitter needs of a
 body beyond its text — the type each operator reads its operands at, the shape
 of each record update, the labels and witnesses each call passes — the front
 end's check files with the body's row, placed from where the definition
@@ -3765,18 +3765,19 @@ the totals' units and their sum is near the total rather than equal to it.
 that is exact and slower.
 An allocation with no `ply_*` frame on its stack is counted under the site
 `<no ply frame>`.
-What a host may lend is a policy with names, one family each:
-`machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`hosts`, `shipped` and `toolchain` (compile and link C below the toolchain's cache), each with a
-summary a reviewer can read. `ply` is lent every family; another host names the ones it means, so
-`machine` — which drives another machine — is granted on purpose and not by accident. A program
-lent `machine` hands it a program as a front end's answer and the library its unit compiles to:
-`compiler.load`'s `load[r](root)` reads the `.ply` files under `root` through the `fs` root `r`,
-the path dependencies its `ply.pkg` names and what its modules embed, checks them against the
-shipped modules and emits their unit afresh, and `compiler.cc`'s `library` compiles that C, so a
-run of it is granted `--fs r=PATH`, `--allow shipped` and `--allow toolchain`, and `machine.load`
-loads the library it is handed and runs no front end of its own. A git dependency is `ply`'s to
-fetch, and `compiler.load` refuses one.
+What a host may lend is a policy with names, one family each: `machine` (open, bind and enter a
+compiled unit), `shipped` and `toolchain` (compile and link C below the toolchain's cache), each
+with a summary a reviewer can read. `ply` is lent every family; another host names the ones it
+means, so `machine` — which drives another program — is granted on purpose and not by accident.
+A program lent `machine` hands it the library a unit compiles to and the name of the root to
+enter: `compiler.load`'s `load[r](root)` reads the `.ply` files under `root` through the `fs` root
+`r`, the path dependencies its `ply.pkg` names and what its modules embed, checks them against the
+shipped modules and emits their unit afresh, `compiler.cc`'s `library` compiles that C, and
+`machine.open` loads the library it is handed, so a run of it is granted `--fs r=PATH`,
+`--allow shipped`, `--allow toolchain` and `--allow machine`. An entry's arguments are the PLV1
+list `std.value.encode` writes and its answer the PLV1 its root wrote; a failure's places are
+sites, the root they lie in and offsets from where it is written, which the program holding the
+front end places. A git dependency is `ply`'s to fetch, and `compiler.load` refuses one.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command

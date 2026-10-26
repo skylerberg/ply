@@ -1,20 +1,17 @@
 //! `ply run` — one entry point evaluated, what is disclosed about the run before it starts, and
-//! what is reported once it is over. The load, the host binding and the entry itself are the Rust
-//! side's: a front end is not a value a program can hold, an entry does not nest on the thread
-//! this program is itself running on, and a binding holding a connection pool does not cross one.
-//! Everything below decides which entry runs, what is disclosed and when, what both forms say,
-//! and the code the run exits with.
+//! what is reported once it is over. The unit is opened, bound and entered through `std.machine`:
+//! which entry runs, what the binding is resolved against and discloses, what both forms say and
+//! the code the run exits with are decided here.
 //!
-//! A deployed artifact runs the program its runnable holds once every part of it agrees, rather
-//! than a source tree, so it is a second shape of the same report: the same keys wherever the two
-//! agree, the file and its digest where they do not.
+//! A deployed artifact runs the unit it carries once every part of it agrees, rather than a source
+//! tree, so it is a second shape of the same report: the same keys wherever the two agree, the file
+//! and its digest where they do not.
 //!
-//! A run of sources keeps its front end's answer in the memo store, as a function of what its load
-//! asked: while nothing that load read moved, the machine takes it back, and this run runs no front
-//! end at all. Either way the machine is handed the same answer over this run's own files, so the
-//! run reports the same whichever it was.
+//! A run of sources keeps what running it reads of its front end in the memo store, with the library
+//! its unit was compiled into, as a function of what its load asked: while nothing that load read
+//! moved, a run takes it back and runs no front end at all, and reports the same either way.
 
-import compiler.load (Derives)
+import compiler.load (Derives, SourceFile)
 import std.random (entropy)
 import appends (broken_promises, priced)
 import literals (literal, unsettled)
@@ -56,12 +53,16 @@ import compiler.store.plyx (digest_of, digest_text, domain, library_domain)
 import compiler.check.resolve.tables (error_at)
 import compiler.unit (shipped)
 import deployed
-
-// The machine the run drives is the runtime's; the effect is `machine`'s. The `root` it loads is
-// the path the line named, or `.`.
-
-import machine (Artifact, Deployed, Bound, Counters, Ended, Options, Program, Project, Refusal,
-                Signals, Stopping, Target, Teardown, Trace, WalkKey, machine, program_of)
+import hosts (filesystem_json, transport_json)
+import listing
+import listing (Disclosures, Listing, Refused)
+import entries (Runnable, Taken)
+import machine
+import machine (Artifact, Configured, Deployed, Bound, Counters, Ended, Entering, Options, Program,
+                Project, Read, Refusal, Signals, Stopping, Target, Teardown, Trace, program_of)
+import std.bin
+import std.machine as entering
+import sim.plan
 import std.string
 import compiler.syntax.parsing (no_module, dummy_span)
 
@@ -484,53 +485,208 @@ fn unbound(style: Style, why: Refusal) -> Answer / {abort.raise} = {
   }
 }
 
+/// A run that loaded, bound: what the binding discloses, and its entry run under it.
+type Entered<| e> = { bound: Bound, enter: () -> Ended / e }
+
 /// A configuration that did not resolve refuses the run before anything is bound; one that did is
-/// what the binding answers from.
-fn started(
+/// what the binding answers from. `bind` makes the binding the entry `en` runs under.
+fn started<| e>(
   style: Style,
   flags: Flags,
   target: Target,
   en: String,
   cfg: Result<Resolution, List<Diag>>,
-) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], abort.raise} =
+  bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
+) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
   match cfg {
     Err(diags) -> unbound(style, { diags: diags, places: places_of(target), artifact: None }),
-    Ok(r) -> match machine.bound[run](en, configuration::configured(r.configuration)) {
+    Ok(r) -> match bind(en, configuration::configured(r.configuration)) {
       Err(why) -> unbound(style, why),
       Ok(b) -> {
-        disclosed(style, flags, target, b, r);
-        ended(style, target, en, b, r, machine.enter[run]())
+        disclosed(style, flags, target, b.bound, r);
+        ended(style, target, en, b.bound, r, (b.enter)())
       },
     },
   }
 
-fn chosen(
+fn chosen<| e>(
   style: Style,
   flags: Flags,
   target: Target,
   cfg: Result<Resolution, List<Diag>>,
-) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], abort.raise} =
+  bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
+) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
   match entry_of(target) {
     Err(d) -> unentered(style, target, d),
-    Ok(en) -> started(style, flags, target, en, cfg),
+    Ok(en) -> started(style, flags, target, en, cfg, bind),
   }
+
+/// What a run enters: its target, the unit it opened, and what running it reads of its front end.
+type Loaded = { target: Target, unit: entering::Opened, runnable: Runnable }
 
 /// The configuration a run binds, read once its target loaded, whose own unit enters the schema.
 fn configured_over(
-  target: Result<Target, Refusal>,
+  loaded: Loaded,
   options: Options,
-) -> Result<Resolution, List<Diag>> / {machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
-  match target {
-    Err(_) -> Ok({ configuration: configuration::unopened(), warnings: [] }),
-    Ok(_) ->
-      configuration::opened_by(options.host, options.config, |name: String|
-        machine.schema[run](name)),
+) -> Result<Resolution, List<Diag>> / {entering::machine.enter, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  configuration::opened_by(options.host, options.config, |name: String|
+    configuration::schema_in(loaded.unit.unit, entries::roots_of(loaded.runnable), name))
+
+/// The binding `options` make for the entry `en` of `loaded`, answering `config`, and the entry
+/// run under it; or why it cannot be made: a family the program does not declare (`E0459`), a
+/// registration that does not fit the program, or a facility that does not load.
+fn bound_over(
+  loaded: Loaded,
+  options: Options,
+  en: String,
+  config: Configured,
+) -> Result<Entered<| {entering::machine.enter, entering::machine.unbind, abort.raise}>, Refusal> / {entering::machine.hosting, entering::machine.bind, abort.raise} = {
+  let grants = machine::run_grants(options, config);
+  let declared = loaded.runnable.declared;
+  let refused = |diags: List<Diag>|
+    Err({ diags: diags, places: places_of(loaded.target), artifact: None });
+  match listing::unlendable(grants.allow, declared) {
+    Some(d) -> refused([d]),
+    None -> {
+      let hosting = if grants.hermetic { None } else { Some(entering::machine.hosting(grants)) };
+      let listed = match hosting {
+        None -> Ok({ rows: [], handlers: 0 }),
+        Some(h) -> if h.refusals.len() > 0 { Err(h.refusals.map(machine::unplaced)) }
+        else { listing::resolved(h.registrations, declared, loaded.runnable.performed) },
+      };
+      match listed {
+        Err(diags) -> refused(diags),
+        Ok(l) -> match entering::machine.bind(grants) {
+          Err(failures) -> refused(failures.map(machine::unplaced)),
+          Ok(binding) -> {
+            let stop = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
+            let disclosures = match hosting {
+              Some(h) -> listing::disclosures_of(l, h, config, Some(stop)),
+              None -> listing::no_disclosures(),
+            };
+            Ok({
+              bound: {
+                hermetic: grants.hermetic,
+                operations: l.rows.len(),
+                digest: listing::digest_of(l, disclosures),
+                trace: match disclosures.observability {
+                  Some(o) -> Some(listing::banner(o)),
+                  None -> None,
+                },
+                signals: match hosting {
+                  Some(h) -> if options.host {
+                    Some({ names: h.signals, lead_ms: stop.lead_ms, drain_ms: stop.drain_ms })
+                  } else { None },
+                  None -> None,
+                },
+              },
+              enter: || entered(loaded, options, en, binding, l, disclosures),
+            })
+          },
+        },
+      }
+    },
   }
+}
+
+/// The entry `en` of `loaded` run under `binding`, and the binding torn down once it ends: what the
+/// entry answered or raised, what it reused, and what the binding's facilities report.
+fn entered(
+  loaded: Loaded,
+  options: Options,
+  en: String,
+  binding: Int,
+  l: Listing,
+  disclosures: Disclosures,
+) -> Ended / {entering::machine.enter, entering::machine.unbind, abort.raise} = {
+  let o = entering::machine.enter(loaded.unit.unit, en, machine::arguments_of([]), {
+    ..entering::unbounded(machine::max_calls()),
+    binding: binding,
+    hosted: true,
+    steps: options.steps,
+    timeout_ms: options.timeout,
+    seed: match options.seed {
+      Some(s) -> Some({ root: s.root, path: s.path, steps: plan::default_steps() }),
+      None -> None,
+    },
+    declared: entries::footprint_of(loaded.runnable, en),
+  });
+  let reports = entering::machine.unbind(binding);
+  let roots = entries::roots_of(loaded.runnable);
+  let answer = machine::answer_of(o.ended, roots, en);
+  // The program chose its code and returned no value, so none is carried.
+  let chose = o.exit != None;
+  {
+    exit: o.exit,
+    value: if chose { None } else { match answer { Ok(v) -> Some(v), Err(_) -> None } },
+    raised: if chose { None } else { match answer { Ok(_) -> None, Err(r) -> Some(r) } },
+    counters: counters_of(o.usage),
+    warnings: machine::warnings_of(o, roots),
+    stopping: listing::report_of(reports, "stopping", machine::stopping_bin()),
+    teardown: {
+      lead_ms: options.drain_lead_ms,
+      drain_ms: options.drain_ms,
+      spans_left_open: listing::report_of(reports, "teardown", bin::int_bin()).unwrap_or(0),
+    },
+    trace: listing::report_of(reports, "trace", machine::trace_bin()),
+    handshakes: listing::handshake_lines(reports),
+    hosts: hosts_json(l, disclosures, reports),
+  }
+}
+
+/// `in_place` is the share of updates made in place, none where nothing was updated.
+fn counters_of(u: entering::Usage) -> Counters =
+  {
+    updates: u.updates,
+    updates_in_place: u.updates_in_place,
+    in_place: if u.updates == 0 { None }
+    else { Decimal::of_float(Float::of_int(u.updates_in_place) / Float::of_int(u.updates)) },
+  }
+
+/// The binding's own document: its rows' count and digest, and the transport and the roots where it
+/// discloses them, the handshakes beside the transport.
+fn hosts_json(l: Listing, d: Disclosures, reports: List<entering::Report>) -> Json / {abort.raise} =
+  object(
+    [
+      { key: "handlers", value: int(l.handlers) },
+      { key: "operations", value: int(l.rows.len()) },
+      { key: "digest", value: Str(listing::digest_of(l, d)) },
+    ].concat(match d.transport {
+      Some(t) ->
+        [
+          { key: "transport", value: transport_json(t) },
+          { key: "handshakes", value: handshakes_json(reports) },
+        ],
+      None -> [],
+    }).concat(match d.filesystem {
+      Some(f) -> [{ key: "filesystem", value: filesystem_json(f) }],
+      None -> [],
+    }),
+  )
+
+fn handshakes_json(reports: List<entering::Report>) -> Json / {abort.raise} = {
+  let h = listing::report_of(reports, "handshakes", listing::handshakes_bin()).unwrap_or({
+    completed: 0,
+    refused: 0,
+    reasons: [],
+  });
+  object([
+    { key: "completed", value: int(h.completed) },
+    { key: "refused", value: int(h.refused) },
+    {
+      key: "reasons",
+      value: Array(
+        h.reasons.map(|r: Refused|
+          object([{ key: "reason", value: Str(r.reason) }, { key: "count", value: int(r.count) }])),
+      ),
+    },
+  ])
+}
 
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], machine.filed[run], shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -541,49 +697,48 @@ pub fn run(
       Some(d) -> unbound(s, { diags: [d], places: [], artifact: None }),
       None -> match signer_refusal(flags) {
         Some(d) -> unread(s, named, { diags: [d], places: [], artifact: Some(named) }),
-        None -> {
-          machine.configure[run](options);
-          let target = deployed_target(named, artifact_bytes(flags), options.profile);
-          over(s, flags, target, configured_over(target, options))
-        },
+        None ->
+          over(
+            s,
+            flags,
+            options,
+            deployed_target(named, artifact_bytes(flags), options.profile),
+            None,
+          ),
       },
     }
   } else { sourced(s, flags, options) }
 }
 
-/// An artifact read back and held to itself here, its unit compiled under `profile`, and the program
-/// its runnable holds loaded by the machine. A library is a package to depend on, and nothing to run.
+/// An artifact read back and held to itself here, its unit compiled under `profile` and opened. A
+/// library is a package to depend on, and nothing to run.
 fn deployed_target(
   path: String,
   bytes: Option<Bytes>,
   profile: String,
-) -> Result<Target, Refusal> / {machine.opened[run], emit.compiled, shipped.definitions, shipped.runtime, abort.raise} =
+) -> Result<Loaded, Refusal> / {entering::machine.open, emit.compiled, shipped.definitions, shipped.runtime, abort.raise} =
   if path.ends_with(".plyz") { Err({ diags: [a_library(path)], places: [], artifact: None }) }
   else {
+    let refused = |d: List<Diag>| Err({ diags: d, places: [], artifact: Some(path) });
     match bytes {
-      None -> Err({ diags: [deployed::unreadable(path)], places: [], artifact: Some(path) }),
+      None -> refused([deployed::unreadable(path)]),
       Some(b) -> match deployed::opened(path, b) {
-        Err(d) -> Err({ diags: [d], places: [], artifact: Some(path) }),
+        Err(d) -> refused([d]),
         Ok(o) -> match units::library(o.unit, profile) {
-          Err(diags) -> Err({ diags: diags, places: [], artifact: Some(path) }),
-          Ok(library) -> match machine.opened[run](
-              path,
-              o.runnable,
-              o.entry,
-              o.closure,
-              o.names,
-              library,
-            ) {
-            Err(why) -> Err(why),
-            Ok(_) ->
-              Ok(
-                Deployed({
+          Err(diags) -> refused(diags),
+          Ok(library) -> match entering::machine.open(library) {
+            Err(why) -> refused([machine::unloaded(why)]),
+            Ok(unit) ->
+              Ok({
+                target: Deployed({
                   path: path,
                   digest: o.digest,
                   entry: o.entry,
                   definitions: o.definitions,
                 }),
-              ),
+                unit: unit,
+                runnable: o.runnable,
+              }),
           },
         },
       },
@@ -697,44 +852,68 @@ fn signer_refusal(
 /// container they hold is `compiler.store.plyx`'s, so the spelling lives beside the writer.
 fn is_artifact(path: String) -> Bool = path.ends_with(".plyx") || path.ends_with(".plyz")
 
-/// A run of sources: the walk, then the machine over the answer an earlier run of the same closure
-/// filed under what the walk hashes to, or over this run's own front end when none is filed or the
-/// one filed does not read.
+/// A run of sources: the walk, then the load an earlier run of the same closure kept under what the
+/// walk hashes to, or this run's own front end when none is kept or the one kept does not fit.
 fn sourced(
   style: Style,
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, machine.configure[run], machine.load[run], machine.reuse[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project: sources::Project = load_resolved(flags.paths);
   let key = command_key(queried::program(), asked_of(flags, options));
-  let walk: WalkKey = walked(key.hex_of(), project);
-  machine.configure[run](options);
   let asked = time.elapsed_ms();
   let filed = command_kept(flags.paths, project, key);
-  let kept: Option<Target> = match filed.output {
+  let kept = match filed.output {
     None -> None,
     Some(bytes) -> match entries::taken(bytes) {
       None -> None,
-      Some(k) -> match machine.reuse[run](root_of(flags).machine, walk, k.front) {
-        Some(read) -> Some(program_of(read, k.entries.mains, k.entries.modules)),
-        None -> None,
-      },
+      Some(k) -> reused(root_of(flags).machine, project, k),
     },
   };
   match kept {
     Some(t) -> {
       let l = {
         reused: true,
-        key: walk.key,
+        key: key.hex_of(),
         read_ms: asked - started,
         front_ms: 0,
         file_ms: 0,
         load_ms: time.elapsed_ms() - asked,
       };
-      loaded_over(style, flags, Ok(t), configured_over(Ok(t), options), l)
+      over(style, flags, options, Ok(t), Some(l))
     },
     None -> built(style, flags, options, project, key, filed.marks, started),
+  }
+}
+
+/// The load `taken` kept, over this run's own files, its unit opened from the library it was
+/// compiled into; none where the walk does not fit it or the library is gone.
+fn reused(
+  root: String,
+  project: sources::Project,
+  taken: Taken,
+) -> Option<Loaded> / {entering::machine.open, abort.raise} = {
+  let walked: Placed = placed_of(project);
+  match entries::placed_over(taken.files, walked.modules, walked.manifests) {
+    None -> None,
+    Some(places) -> match entering::machine.open(taken.library) {
+      Err(_) -> None,
+      Ok(unit) ->
+        Some({
+          target: program_of(
+            {
+              root: machine::project_root(root),
+              files: places.map(|p: Place| p.path),
+              places: places,
+            },
+            taken.entries.mains,
+            taken.entries.modules,
+          ),
+          unit: unit,
+          runnable: taken.runnable,
+        }),
+    },
   }
 }
 
@@ -750,8 +929,8 @@ fn asked_of(flags: Flags, options: Options) -> Bytes =
     },
   ])
 
-/// This run's own front end, and the machine over its answer, kept under `key` once the load holds,
-/// with `marks`, the marks found on what was kept there, removed.
+/// This run's own front end and its unit, kept under `key` once the load holds, with `marks`, the
+/// marks found on what was kept there, removed.
 fn built(
   style: Style,
   flags: Flags,
@@ -760,7 +939,7 @@ fn built(
   key: Bytes,
   marks: List<Bytes>,
   started: Int,
-) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, machine.load[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, machine.schema[run], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], machine.filed[run], priced.report, literal.verdicts, literal.statements, Derives, abort.raise, shipped.reached} = {
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, env.reused[sys], priced.report, literal.verdicts, literal.statements, Derives, abort.raise, shipped.reached} = {
   let t: Timed = timed_over(flags.paths, project, started);
   match program_view(t.program) {
     // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
@@ -769,7 +948,7 @@ fn built(
     Some(w) -> match config_schema::refusal(w, options.config.schema) {
       Some(d) -> unbound(style, { diags: [d], places: t.program.places, artifact: None }),
       None -> match broken_promises(t.program, w.frame) {
-        [] -> match unsettled(t, w.frame, root_of(flags).machine) {
+        [] -> match unsettled(t, w.frame) {
           [] -> loaded_built(style, flags, options, project, t, w, key, marks),
           refused -> unloaded(style, { diags: refused, places: t.program.places, artifact: None }),
         },
@@ -779,7 +958,8 @@ fn built(
   }
 }
 
-/// The machine over a front end this run checked, filed under the walk's key once the load holds.
+/// A front end this run checked, its unit compiled and opened, kept under the walk's key once the
+/// load holds.
 fn loaded_built(
   style: Style,
   flags: Flags,
@@ -789,7 +969,7 @@ fn loaded_built(
   view: View,
   key: Bytes,
   marks: List<Bytes>,
-) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, machine.load[run], machine.schema[run], machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, machine.filed[run], fs.write[abs], Derives, abort.raise} = {
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, Entering, process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
   let asked = time.elapsed_ms();
   let front = front_of(timed, view);
   let emitted = match units::whole(front) {
@@ -797,11 +977,27 @@ fn loaded_built(
     Ok(text) -> units::library(text, options.profile),
   };
   let offered = entries::named(entries::of_front(front), flags.paths);
-  let target = match emitted {
-    Err(diags) -> Err({ diags: diags, places: timed.program.places, artifact: None }),
-    Ok(unit) -> match machine.load[run](root_of(flags).machine, front, unit) {
-      Ok(read) -> Ok(program_of(read, offered.mains, offered.modules)),
-      Err(why) -> Err(why),
+  let runnable = entries::runnable_of(front, offered.mains.map(|m: Main| Bytes::of_string(m.name)));
+  let refused = |diags: List<Diag>|
+    Err({ diags: diags, places: timed.program.places, artifact: None });
+  let loaded = match emitted {
+    Err(diags) -> refused(diags),
+    Ok(library) -> match entering::machine.open(library) {
+      Err(why) -> refused([machine::unloaded(why)]),
+      Ok(unit) ->
+        Ok({
+          target: program_of(
+            {
+              root: machine::project_root(root_of(flags).machine),
+              files: front.files.map(|f: SourceFile| f.path),
+              places: front.files.map(|f: SourceFile| { path: f.path, text: f.text }),
+            },
+            offered.mains,
+            offered.modules,
+          ),
+          unit: unit,
+          runnable: runnable,
+        }),
     },
   };
   let l = {
@@ -812,49 +1008,66 @@ fn loaded_built(
     file_ms: timed.file_ms,
     load_ms: time.elapsed_ms() - asked,
   };
-  match ((target, emitted)) {
-    (Ok(_), Ok(unit)) -> match machine.filed[run](front, unit) {
-      Some(entry) -> {
-        let _ = keep_command(
-          flags.paths,
-          project,
-          key,
-          timed.program,
-          entries::kept(offered, entry),
-          marks,
-        );
-        ()
-      },
-      None -> (),
+  match ((loaded, emitted)) {
+    (Ok(_), Ok(library)) -> {
+      let _ = keep_command(
+        flags.paths,
+        project,
+        key,
+        timed.program,
+        entries::kept(offered, library, front.files, runnable),
+        marks,
+      );
+      ()
     },
     _ -> (),
   };
-  loaded_over(style, flags, target, configured_over(target, options), l)
+  over(style, flags, options, loaded, Some(l))
 }
 
-/// The run over the target the machine loaded, or the machine's refusal of it.
+/// The run over what loaded, or the refusal of the load; the unit is closed once the run is over.
 fn over(
-  s: Style,
+  style: Style,
   flags: Flags,
-  target: Result<Target, Refusal>,
-  cfg: Result<Resolution, List<Diag>>,
-) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], abort.raise} =
-  match target { Err(why) -> unloaded(s, why), Ok(t) -> chosen(s, flags, t, cfg) }
+  options: Options,
+  loaded: Result<Loaded, Refusal>,
+  l: Option<Loading>,
+) -> Answer / {Entering, process.out[proc], process.err[proc], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match loaded {
+    Err(why) -> unloaded(style, why),
+    Ok(t) -> {
+      let answer = reported(
+        style,
+        flags,
+        Ok(t.target),
+        configured_over(t, options),
+        |en: String, config: Configured| bound_over(t, options, en, config),
+        l,
+      );
+      entering::machine.close(t.unit.unit);
+      answer
+    },
+  }
 
-/// The same over sources, saying where the load's time went when `--explain` asks: aloud before
-/// the entry runs, or in the one document under `--json`.
-fn loaded_over(
+/// The run over `target`, bound and entered as `bind` says; over sources, saying where the load's
+/// time went when `--explain` asks: aloud before the entry runs, or in the one document under
+/// `--json`.
+fn reported<| e>(
   style: Style,
   flags: Flags,
   target: Result<Target, Refusal>,
   cfg: Result<Resolution, List<Diag>>,
-  l: Loading,
-) -> Answer / {machine.bound[run], machine.enter[run], process.out[proc], process.err[proc], abort.raise} =
+  bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
+  l: Option<Loading>,
+) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
   match target {
     Err(why) -> unloaded(style, why),
-    Ok(t) -> {
-      if flags.explain && !flags.json { process.err[proc](loading_line(style, l)) };
-      explained(flags, l, chosen(style, flags, t, cfg))
+    Ok(t) -> match l {
+      None -> chosen(style, flags, t, cfg, bind),
+      Some(loading) -> {
+        if flags.explain && !flags.json { process.err[proc](loading_line(style, loading)) };
+        explained(flags, loading, chosen(style, flags, t, cfg, bind))
+      },
     },
   }
 
@@ -912,14 +1125,6 @@ fn explained(flags: Flags, l: Loading, answer: Answer) -> Answer =
       _ -> answer,
     }
   }
-
-// --- The walk as the machine takes it ------------------------------------------------------
-
-/// The walk as `machine.reuse` takes it: what names it, and its places as a front end places them.
-fn walked(key: String, project: sources::Project) -> WalkKey = {
-  let placed: Placed = placed_of(project);
-  { key: key, modules: placed.modules, manifests: placed.manifests }
-}
 
 /// `b3:` and the key's first twelve hex characters, as a report prints a digest.
 fn short(key: String) -> String / {abort.raise} = "b3:" ++ key.slice(0, 12)
@@ -986,8 +1191,8 @@ fn a_diag(code: Bytes, message: Bytes, labels: List<Label>) -> Diag =
 
 fn nothing() -> Refusal = { diags: [], places: [], artifact: None }
 
-/// The run's own answer over a load, a binding and an entry the test hands it in place of the Rust
-/// side, with whatever it wrote on either stream captured beside it.
+/// The run's own answer over a load, a binding and an entry the test hands it in place of the
+/// runtime, with whatever it wrote on either stream captured beside it.
 type RunCapture = { answer: Answer, out: List<String>, err: List<String> }
 
 fn ran_over(
@@ -1031,14 +1236,17 @@ fn ran_loaded(
   l: Option<Loading>,
 ) -> RunCapture / {abort.raise} =
   handle {
-    match l {
-      None -> over(plain(), flags, t, cfg),
-      Some(l) -> loaded_over(plain(), flags, t, cfg, l),
-    }
+    reported(
+      plain(),
+      flags,
+      t,
+      cfg,
+      |en: String, config: Configured|
+        match b { Ok(bound) -> Ok({ bound: bound, enter: || e }), Err(why) -> Err(why) },
+      l,
+    )
   } with {
     var io = captured([]),
-    machine.bound[run](named, config) -> b,
-    machine.enter[run]() -> e,
     process.out[proc](text) -> {
       io = out_step(io, text);
     },
@@ -1329,6 +1537,23 @@ test "what the machine reused is a count and a ratio, and no ratio at all over n
   assert(over_nothing.contains("\"in_place\":null"))
 }
 
+test "an entry's updates in place are a share of its updates, and no share of none" {
+  let usage: entering::Usage = {
+    nanos: 0,
+    host: false,
+    steps: 0,
+    performs: 0,
+    bridges: 0,
+    scheduled: 0,
+    task_stacks: 0,
+    frame_tables: 0,
+    updates: 4,
+    updates_in_place: 3,
+  };
+  assert_eq(counters_of(usage).in_place, Decimal::of_string("0.75"));
+  assert_eq(counters_of({ ..usage, updates: 0, updates_in_place: 0 }).in_place, None)
+}
+
 test "a definition's module is its name without its own last segment" {
   assert_eq(module_of("m.main"), "m");
   assert_eq(module_of("store.orders.main"), "store.orders")
@@ -1408,7 +1633,7 @@ test "a load the machine refused says nothing about where its time went" {
   assert_eq(ran.answer.code, 2)
 }
 
-test "a walk hands the machine its modules, the root's first, and its manifests apart" {
+test "a walk places its modules, the root's first, and its manifests apart" {
   let project = {
     files: [
       {
@@ -1450,8 +1675,7 @@ test "a walk hands the machine its modules, the root's first, and its manifests 
     root_key: "/w/app",
     absent: [],
   };
-  let w = walked("k", project);
-  assert_eq(w.key, "k");
+  let w: Placed = placed_of(project);
   assert_eq(w.modules.map(|p: Place| p.path), ["main.ply", "util.ply", "/w/lib/deep.ply"]);
   assert_eq(w.manifests.map(|p: Place| p.path), ["ply.pkg", "/w/lib/ply.pkg"])
 }

@@ -176,7 +176,7 @@ fn values(
     steps: &PlyValue,
     span: ply_core::Span,
 ) -> Result<PlyValue, Diagnostic> {
-    use ply_compiled::entry::{self, Ended, Opened, Run};
+    use ply_compiled::entry::{self, Ended, Run};
     let library = std::path::PathBuf::from(library.as_str(span, "the unit's library")?);
     let roots = roots
         .as_list(span, "the stored roots")?
@@ -187,25 +187,33 @@ fn values(
         steps: steps.as_int(span, "the calls each may make")?,
         ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
     };
-    let opened = Opened::open(&library).map_err(|why| {
+    let opened = opened_unit(&library).map_err(|why| {
         Diagnostic::error(
             codes::BACKEND_UNAVAILABLE,
             format!("the unit could not be loaded: {why}"),
         )
         .primary(span, "its constants were to be entered here")
     })?;
-    Ok(PlyValue::list(
+    let answered = on_program_thread(|| {
         roots
             .iter()
             .map(|root| {
-                let kept =
-                    match entry::enter(&opened, root, entry::no_arguments(), &run, None).ended {
-                        Ended::Answered(bytes) => match ply_core::codec::decode(&bytes) {
-                            Ok(kept @ PlyValue::Bytes(_)) => Some(kept),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
+                match entry::enter(&opened, root, entry::no_arguments(), &run, None, None).ended {
+                    Ended::Answered(bytes) => Some(bytes),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_else(|| roots.iter().map(|_| None).collect());
+    Ok(PlyValue::list(
+        answered
+            .into_iter()
+            .map(|bytes| {
+                let kept = bytes.and_then(|b| match ply_core::codec::decode(&b) {
+                    Ok(kept @ PlyValue::Bytes(_)) => Some(kept),
+                    _ => None,
+                });
                 crate::payload::option(kept)
             })
             .collect(),
@@ -269,6 +277,37 @@ fn entry_answered(
             _ => None,
         },
     )
+}
+
+/// The unit compiled into `library`, opened the first time this process asks and kept after.
+fn opened_unit(library: &std::path::Path) -> Result<Arc<ply_compiled::entry::Opened>, String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Units = Mutex<HashMap<std::path::PathBuf, Arc<ply_compiled::entry::Opened>>>;
+    static UNITS: OnceLock<Units> = OnceLock::new();
+    let units = UNITS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(opened) = units.lock().unwrap_or_else(|e| e.into_inner()).get(library) {
+        return Ok(Arc::clone(opened));
+    }
+    let opened = ply_compiled::entry::Opened::open(library)?;
+    let mut held = units.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Arc::clone(
+        held.entry(library.to_path_buf()).or_insert(opened),
+    ))
+}
+
+/// What `enter` answers, run on a thread of its own with a program's stack: how deeply the caller
+/// had nested bounds nothing a nested entry nests. `None` where no thread could be started or the
+/// thread did not finish.
+fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T> {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(ply_compiled::rt::PROGRAM_STACK)
+            .spawn_scoped(s, enter)
+            .ok()?
+            .join()
+            .ok()
+    })
 }
 
 /// The runtime a unit is compiled against as a released `ply`'s bootstrap reads it, written as

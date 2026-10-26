@@ -251,3 +251,4 @@ natives_taking!(A B C);
 natives_taking!(A B C D);
 natives_taking!(A B C D E);
 natives_taking!(A B C D E F);
+natives_taking!(A B C D E F G);

@@ -1,27 +1,37 @@
-//! What `ply test` asks of the runtime: a unit per program its tests run in, the host binding over
-//! the first, the cases a test ranges over, and one test or one interleaving of one on whichever
-//! thread asks. A compiled unit, a
-//! binding and a Rust unwind are not values a program can hold; everything a run decides, and what
-//! the cache keeps, is the program's.
+//! What `ply test` asks of the runtime, over the capability `std.machine` lends: a unit per program
+//! its tests run in, the binding over the run, the cases a test ranges over, and one test or one
+//! interleaving of one, on whichever thread asks. Which root a test is, what it is handed, what its
+//! answer or its failure means and how a report classes it are this module's; the runtime enters a
+//! root and says how the entry ended. The run's state is values a run holds, so its lanes share
+//! nothing and run at once.
 
 import compiler.load (LoadedAnalysis)
 import compiler.front.published (FiledBody, FiledDef)
+import compiler.front.rows (Dump, EmitterRoot, ModuleSpan, TestRow)
 import compiler.store.hash.forms (ModuleHashed, Reached)
-import compiler.check.resolve.tables (Diag)
-import diagnostic (Raised)
+import compiler.emit.keys (Cases, root_name, root_text, test_key)
+import compiler.check.resolve.tables (Diag, Label)
+import diagnostic (Raised, diag_of)
+import listing
+import listing (Listing, no_disclosures)
 import machine
 import sim.plan (Seed)
-import sim.recording (Interleaving)
+import sim.recording (Interleaving, Passed, Failed)
 import std.bin
-import std.json (Json)
-import std.value (Value)
+import std.json (Json, Bool, Number, Object, Str, object, int)
+import std.list
+import std.machine as entering
+import std.value (Value, VUnit, VInt, VBytes, VRecord, VStr, VList, field_named)
+import std.value
 import testing.conclude (Filing, ReachedHashes)
-import surface (Shard)
+import std.cli (Parsed, has, parse_nat, value, values_of)
+import surface
+import surface (Shard, parsed)
 import units
 import units (emit)
 
 /// What a run is configured with: the report flags, the machine's budgets and bounds, and the host
-/// it may bind. The runtime reads the budgets, the profile and the binding's flags from it.
+/// it may bind.
 pub type Options = {
   path: String,
   json: Bool,
@@ -52,57 +62,404 @@ pub type Options = {
   sim: machine::SimulationOptions,
 }
 
-pub nondet effect tester {
-  write configure[r](options: Options) -> Unit
-  /// A program tests run in, from a front end the program ran and the library it compiled the unit
-  /// it emitted into: the loaded program first, then each mutant and mixture. A run that executes
-  /// nothing hands no library, and one that is not `hosted` reaches no binding.
-  write unit[r](front: LoadedAnalysis, library: Option<String>, hosted: Bool) -> Result<Int, List<Diag>>
-  /// The value of the nullary definition `--config-schema` names, entered on the first unit.
-  read schema[r](name: String) -> Result<Value, List<Diag>>
-  /// The host binding over the first unit, answering `config` as the program resolved it.
-  write bound[r](config: machine::Configured) -> Result<Unit, List<Diag>>
-  /// What the binding and the first unit's backend came to, once the run is over.
-  read hosted[r]() -> Hosted
-  /// The run is over: the binding stops and the units go, and the compiled program stays for the
-  /// next run over the same definitions.
-  write ended[r]() -> Unit
-  /// The cases a test of the unit ranges over, in its table's order, or why they could not be
-  /// listed.
-  read cases[r](unit: Int, index: Int) -> Result<List<Listed>, Unlisted>
-  /// A test run once: over cases, the one `case` names.
-  read executed[r](unit: Int, index: Int, case: Option<Chosen>) -> Executed
-  /// One interleaving of a seeded test, the one `seed` names: over cases, of the one `case` names.
-  read interleaved[r](unit: Int, index: Int, case: Option<Chosen>, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
-  /// The first read a pass's trace holds that no longer answers as it did, as a person reads it.
-  read moved[r](trace: Bytes) -> Option<String>
+/// The options record, built from the parsed line.
+pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} = {
+  let machine_options = machine::options_from(p);
+  let count = |long: String, default: Int|
+    match value(p, long) {
+      Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
+      None -> default,
+    };
+  {
+    path: root,
+    json: has(p, "json"),
+    explain: has(p, "explain"),
+    no_cache: has(p, "no-cache"),
+    filters: values_of(p, "filter"),
+    shard: match value(p, "shard") { Some(v) -> surface::shard_of(v), None -> None },
+    jobs: match value(p, "jobs") { Some(v) -> parse_nat(v), None -> None },
+    steps: count("steps", 1000000000),
+    timeout: count("timeout", 60000),
+    bisect: match value(p, "bisect") { Some(v) -> v, None -> "auto" },
+    bisect_budget: count("bisect-budget", 64),
+    coverage: has(p, "coverage"),
+    mutate: value(p, "mutate"),
+    mutate_budget: count("mutate-budget", 64),
+    profile: machine_options.profile,
+    watch: has(p, "watch"),
+    host: machine_options.host,
+    tls: machine_options.tls,
+    trust: machine_options.trust,
+    mtls: machine_options.mtls,
+    fs: machine_options.fs,
+    exec: machine_options.exec,
+    allow: machine_options.allow,
+    config: machine_options.config,
+    sim: machine::sim_options_from(p),
+  }
 }
 
+/// A run of tests: its options, the binding its hosted units run under (0 until it is bound), and
+/// the operations the binding serves against the program.
+pub type Testing = { options: Options, binding: Int, listing: Listing }
+
+/// A program tests run in: its unit, none for a run that executes nothing; the run it belongs to;
+/// whether its tests reach the binding; its tests; and where each root it is entered at is written,
+/// which a failure's sites are offsets from.
+pub type TestUnit = {
+  opened: Option<entering::Opened>,
+  testing: Testing,
+  hosted: Bool,
+  tests: List<TestRow>,
+  roots: Map<Bytes, ModuleSpan>,
+}
+
+/// A run begun over `options`, bound to nothing yet.
+pub fn begun(options: Options) -> Testing =
+  { options: options, binding: 0, listing: { rows: [], handlers: 0 } }
+
+/// A unit that opens nothing, for a run that runs no test.
+pub fn no_unit(testing: Testing) -> TestUnit =
+  { opened: None, testing: testing, hosted: false, tests: [], roots: Map::new() }
+
 /// A unit tests run in, from a front end the program ran: its C emitted and compiled here under
-/// `profile` and the unit made of it, or one that compiles nothing for a run that executes nothing.
+/// `profile` and opened, or one that opens nothing for a run that executes nothing.
 pub fn unit_over(
+  testing: Testing,
   front: LoadedAnalysis,
   build: Bool,
   hosted: Bool,
   profile: String = "development",
-) -> Result<Int, List<Diag>> / {tester.unit[tests], emit.unit, emit.compiled, abort.raise} =
+) -> Result<TestUnit, List<Diag>> / {entering::machine.open, emit.unit, emit.compiled, abort.raise} =
   match units::wanted(front, build, profile) {
     Err(diags) -> Err(diags),
-    Ok(library) -> tester.unit[tests](front, library, hosted),
+    Ok(library) -> unit_of(testing, front, library, hosted),
   }
 
-/// `tester` answered from what it is handed alone: no host, clock, kept unit or measurement.
-pub effect hermetic_tester {
-  write configure[r](options: Options) -> Unit
-  write unit[r](front: LoadedAnalysis, library: Option<String>, hosted: Bool) -> Result<Int, List<Diag>>
-  read schema[r](name: String) -> Result<Value, List<Diag>>
-  write bound[r](config: machine::Configured) -> Result<Unit, List<Diag>>
-  read hosted[r]() -> Hosted
-  write ended[r]() -> Unit
-  read cases[r](unit: Int, index: Int) -> Result<List<Listed>, Unlisted>
-  read executed[r](unit: Int, index: Int, case: Option<Chosen>) -> Executed
-  read interleaved[r](unit: Int, index: Int, case: Option<Chosen>, seed: Seed, steps: Int, re_executed: Bool) -> Interleaved
-  read moved[r](trace: Bytes) -> Option<String>
+/// A unit tests run in, from a front end and the library its unit was compiled into, if any.
+pub fn unit_of(
+  testing: Testing,
+  front: LoadedAnalysis,
+  library: Option<String>,
+  hosted: Bool,
+) -> Result<TestUnit, List<Diag>> / {entering::machine.open, abort.raise} = {
+  let made = |opened: Option<entering::Opened>|
+    {
+      opened: opened,
+      testing: testing,
+      hosted: hosted,
+      tests: front.dump.tests,
+      roots: machine::roots_of(front.dump),
+    };
+  match library {
+    None -> Ok(made(None)),
+    Some(path) -> match entering::machine.open(path) {
+      Ok(opened) -> Ok(made(Some(opened))),
+      Err(why) -> Err([machine::unloaded(why)]),
+    },
+  }
+}
+
+/// The binding over the run's tests, answering `config` as the program resolved it. Under
+/// `--host`, a registration that does not fit the program refuses the run, as it would refuse any.
+pub fn bound(
+  testing: Testing,
+  d: Dump,
+  config: machine::Configured,
+) -> Result<Testing, List<Diag>> / {entering::machine.bind, entering::machine.hosting, abort.raise} = {
+  let grants = grants_of(testing.options, config);
+  let declared = listing::declared_of(d);
+  let listed = match listing::unlendable(grants.allow, declared) {
+    Some(refused) -> Err([refused]),
+    None -> if grants.hermetic { Ok({ rows: [], handlers: 0 }) } else {
+      let hosting = entering::machine.hosting(grants);
+      if hosting.refusals.len() > 0 { Err(hosting.refusals.map(machine::unplaced)) }
+      else { listing::resolved(hosting.registrations, declared, listing::performed(d)) }
+    },
+  };
+  match listed {
+    Err(diags) -> Err(diags),
+    Ok(l) -> match entering::machine.bind(grants) {
+      Ok(binding) -> Ok({ ..testing, binding: binding, listing: l }),
+      Err(refused) -> Err(refused.map(machine::unplaced)),
+    },
+  }
+}
+
+/// `unit` goes; no test runs in it again.
+pub fn closed(unit: TestUnit) -> Unit / {entering::machine.close} =
+  match unit.opened { Some(o) -> entering::machine.close(o.unit), None -> () }
+
+/// The first read a pass's trace holds that no longer answers as it did, as a person reads it.
+pub fn moved(
+  options: Options,
+  trace: Bytes,
+) -> Option<String> / {entering::machine.moved, abort.raise} =
+  entering::machine.moved(grants_of(options, machine::unconfigured()), trace)
+
+/// What a test is lent: under `--host` the roots, the programs it may start and the
+/// configuration, never the command line, and of `process` only what starts a program `--exec`
+/// names; the families `--allow` names either way.
+pub fn grants_of(o: Options, config: machine::Configured) -> entering::Grants =
+  {
+    ..entering::no_grants(),
+    hermetic: !o.host,
+    fs: if o.host { o.fs.map(machine::lent) } else { [] },
+    exec: if o.host { o.exec.map(machine::lent) } else { [] },
+    allow: o.allow,
+    spawning: o.host,
+    given: if !o.host { [] } else {
+      machine::given_of(o.tls, o.trust, o.mtls, config).push({
+        name: "trace",
+        fields: ["off", "info"],
+      })
+    },
+  }
+
+/// How a test of `unit` is entered: under the run's budgets, its host answers held to
+/// `footprint`, its reads recorded for its pass. A unit no test of reaches the binding, a mutant's
+/// or a mixture's, files no pass, so nothing records what it read.
+fn run_of(
+  unit: TestUnit,
+  footprint: List<entering::Atom>,
+  seed: Option<entering::Seed>,
+  re_executed: Bool,
+) -> entering::Run =
+  {
+    ..entering::unbounded(machine::max_calls()),
+    binding: if unit.hosted { unit.testing.binding } else { 0 },
+    hosted: unit.hosted,
+    steps: unit.testing.options.steps,
+    timeout_ms: unit.testing.options.timeout,
+    seed: seed,
+    re_executed: re_executed,
+    declared: Some(footprint),
+    observe: unit.hosted,
+    measure: true,
+  }
+
+/// The cases a test of the unit ranges over, in its table's order, or why they could not be listed.
+/// A listing performs nothing, so it reaches no binding and reads nothing a pass stands on.
+pub fn cases(
+  unit: TestUnit,
+  index: Int,
+) -> Result<List<Listed>, Unlisted> / {entering::machine.enter, abort.raise} =
+  match ((unit.opened, unit.tests.at(index))) {
+    (None, _) -> Err({ status: "panicked", failure: nothing_built() }),
+    (_, None) -> Err({ status: "panicked", failure: no_test(index, unit.tests.len()) }),
+    (Some(o), Some(t)) -> {
+      let listing = String::of_bytes_lossy(root_text(root_name(Cases(test_key(t.module, t.name)))));
+      let outcome = entering::machine.enter(o.unit, listing, machine::arguments_of([]), {
+        ..entering::unbounded(machine::max_calls()),
+        steps: unit.testing.options.steps,
+        timeout_ms: unit.testing.options.timeout,
+      });
+      match outcome.ended {
+        entering::Answered(bytes) -> match listed_of(bytes) {
+          Some(listed) -> Ok(listed),
+          None -> Err({ status: "panicked", failure: answered_otherwise(listing, bytes) }),
+        },
+        other -> {
+          let fell = fell_of(unit, other, listing, index);
+          Err({ status: fell.status, failure: fell.failure })
+        },
+      }
+    },
+  }
+
+/// A test run once: over cases, the one `case` names.
+pub fn executed(
+  unit: TestUnit,
+  index: Int,
+  case: Option<Chosen>,
+) -> Executed / {entering::machine.enter, abort.raise} =
+  match entered(unit, index, case, None, false) {
+    Err(refused) -> { status: "panicked", failure: Some(refused), usage: no_usage(), trace: None },
+    Ok(e) -> {
+      let fell = judged(unit, e.outcome.ended, e.root, index);
+      {
+        status: match fell { Some(f) -> f.status, None -> "passed" },
+        failure: match fell { Some(f) -> Some(f.failure), None -> None },
+        usage: usage_of(unit, e.outcome),
+        trace: e.outcome.trace,
+      }
+    },
+  }
+
+/// One interleaving of a seeded test, the one `seed` names: over cases, of the one `case` names.
+pub fn interleaved(
+  unit: TestUnit,
+  index: Int,
+  case: Option<Chosen>,
+  seed: Seed,
+  steps: Int,
+  re_executed: Bool,
+) -> Interleaved / {entering::machine.enter, abort.raise} = {
+  let seeded = { root: seed.root, path: seed.path, steps: max(steps, 1) };
+  match entered(unit, index, case, Some(seeded), re_executed) {
+    Err(refused) ->
+      {
+        run: {
+          steps: [],
+          verdict: Failed({ status: "panicked", failure: refused }),
+          virtual_time: 0,
+        },
+        observed: false,
+        usage: no_usage(),
+        trace: None,
+      },
+    Ok(e) -> {
+      let verdict = match judged(unit, e.outcome.ended, e.root, index) {
+        Some(f) -> Failed(f),
+        None -> Passed,
+      };
+      {
+        run: match e.outcome.interleaving {
+          Some(i) ->
+            {
+              steps: i.steps.map(|s: entering::Step| machine::step_of(s, unit.roots)),
+              verdict: verdict,
+              virtual_time: i.virtual_time,
+            },
+          None -> { steps: [], verdict: verdict, virtual_time: 0 },
+        },
+        observed: e.outcome.interleaving != None,
+        usage: usage_of(unit, e.outcome),
+        trace: e.outcome.trace,
+      }
+    },
+  }
+}
+
+/// A test's entry: its root and what the entry came to, or why nothing could be entered.
+fn entered(
+  unit: TestUnit,
+  index: Int,
+  case: Option<Chosen>,
+  seed: Option<entering::Seed>,
+  re_executed: Bool,
+) -> Result<{ root: String, outcome: entering::Outcome }, Raised> / {entering::machine.enter, abort.raise} =
+  match ((unit.opened, unit.tests.at(index))) {
+    (None, _) -> Err(nothing_built()),
+    (_, None) -> Err(no_test(index, unit.tests.len())),
+    (Some(o), Some(t)) -> {
+      let root = String::of_bytes_lossy(root_text(root_name(test_key(t.module, t.name))));
+      let arguments = match case {
+        None -> machine::arguments_of([]),
+        Some(c) -> machine::arguments_of([VInt(c.at), VBytes(c.identity)]),
+      };
+      let run = run_of(unit, t.footprint.map(machine::atom_of), seed, re_executed);
+      Ok({ root: root, outcome: entering::machine.enter(o.unit, root, arguments, run) })
+    },
+  }
+
+/// How a run of a test fell, where it did not pass: a test answers `()`, and any other answer, a
+/// root the unit is not entered at or a Rust unwind is Ply's defect at the test's source.
+fn judged(
+  unit: TestUnit,
+  ended: entering::Ended,
+  root: String,
+  index: Int,
+) -> Option<InterleavingFailure> / {abort.raise} =
+  match ended {
+    entering::Answered(bytes) -> if bytes == unit_answer() { None }
+    else { Some({ status: "panicked", failure: answered_otherwise(root, bytes) }) },
+    other -> Some(fell_of(unit, other, root, index)),
+  }
+
+fn fell_of(
+  unit: TestUnit,
+  ended: entering::Ended,
+  root: String,
+  index: Int,
+) -> InterleavingFailure / {abort.raise} =
+  match ended {
+    entering::Failed(f) -> {
+      let raised = machine::placed(f, unit.roots, root);
+      { status: status_of(raised.diag), failure: raised }
+    },
+    entering::Panicked(message) -> { status: "panicked", failure: panicked(unit, index, message) },
+    entering::NoRoot -> { status: "panicked", failure: not_compiled(root) },
+    entering::Unanswerable(why) ->
+      { status: "panicked", failure: answered_otherwise(root, Bytes::of_string(why)) },
+    entering::Answered(bytes) -> { status: "panicked", failure: answered_otherwise(root, bytes) },
+  }
+
+/// How a report classes a run that ended with `diag`.
+pub fn status_of(diag: Diag) -> String =
+  if diag.code == b"W0612" { "abandoned" }
+  else if machine::is_defect(diag.code) { "panicked" }
+  else { "failed" }
+
+fn usage_of(unit: TestUnit, o: entering::Outcome) -> Usage / {abort.raise} =
+  {
+    duration_us: o.usage.nanos / 1000,
+    host: o.usage.host,
+    entries: match o.ended { entering::NoRoot -> 0, _ -> 1 },
+    declines: match o.ended { entering::NoRoot -> 1, _ -> 0 },
+    performs: o.usage.performs,
+    teardown: machine::warnings_of(o, unit.roots),
+  }
+
+/// What a test answers: the PLV1 of `()`.
+fn unit_answer() -> Bytes = match value::encode(VUnit) { Some(b) -> b, None -> b"" }
+
+/// The cases a listing answered: each case's label and identity, in its table's order.
+fn listed_of(bytes: Bytes) -> Option<List<Listed>> / {abort.raise} =
+  match value::decode(bytes) {
+    Some(VList(items)) ->
+      items.fold(Some([]), |acc: Option<List<Listed>>, item: Value|
+        match ((acc, item)) {
+          (Some(xs), VRecord(fields)) -> match ((
+              field_named(fields, "label"),
+              field_named(fields, "identity"),
+            )) {
+            (Some(VStr(label)), Some(VBytes(identity))) ->
+              Some(xs.push({ label: label, identity: identity })),
+            _ -> None,
+          },
+          _ -> None,
+        }),
+    _ -> None,
+  }
+
+/// The binding torn down once the run's hosted tests ran: the TLS handshakes it made, as a run
+/// prints them.
+pub fn unbound(testing: Testing) -> List<String> / {entering::machine.unbind, abort.raise} =
+  if testing.binding == 0 { [] }
+  else { listing::handshake_lines(entering::machine.unbind(testing.binding)) }
+
+/// What the binding and the run's unit came to.
+pub fn hosted_of(testing: Testing, unit: TestUnit) -> Hosted / {abort.raise} = {
+  let hermetic = !testing.options.host;
+  let disclosures = no_disclosures();
+  let digest = listing::digest_of(testing.listing, disclosures);
+  {
+    hermetic: hermetic,
+    label: if hermetic { "hermetic" } else { "host" },
+    operations: testing.listing.rows.len(),
+    digest: digest,
+    hosts: object([
+      { key: "handlers", value: int(testing.listing.handlers) },
+      { key: "operations", value: int(testing.listing.rows.len()) },
+      { key: "digest", value: Str(digest) },
+    ]),
+    reaches: range(0, unit.tests.len()).filter(|i: Int|
+      match unit.tests.at(i) {
+        Some(t) -> listing::reaches(testing.listing, t.footprint),
+        None -> false,
+      }),
+    cores: match unit.opened { Some(o) -> if hermetic { 1 } else { o.threads }, None -> 1 },
+    backend: {
+      name: "c",
+      fragment: match unit.opened { Some(o) -> o.roots, None -> 0 },
+      units: match unit.opened { Some(_) -> if hermetic { None } else { Some(1) }, None -> None },
+      load_nanos: match unit.opened {
+        Some(o) -> if hermetic { None } else { Some(o.nanos) },
+        None -> None,
+      },
+    },
+  }
 }
 
 /// The result cache, which whoever opened it handles: what opening it degraded past, the pass filed
@@ -134,7 +491,7 @@ pub type LastPass = { test: Bytes, reached: Reached }
 pub type Usage = {
   duration_us: Int,
   host: Bool,
-  /// Bodies run natively, and calls the backend was offered and declined.
+  /// Roots the unit was entered at, and roots it held none of.
   entries: Int,
   declines: Int,
   /// The operations it performed, handled ones included.
@@ -170,19 +527,9 @@ pub type Interleaved = {
   trace: Option<Bytes>,
 }
 
-/// What the first unit's backend did, apart from the entries each test counted. `unbuilt` counts the
-/// threads that could not build it and so declined every call.
-pub type Compiled = {
-  name: String,
-  fragment: Int,
-  offered: Int,
-  converted_in: Int,
-  converted_out: Int,
-  /// Absent unless the provider loaded a unit: once per worker, each load counted in `load_nanos`.
-  units: Option<Int>,
-  load_nanos: Option<Int>,
-  unbuilt: Int,
-}
+/// The first unit the run's tests ran in: how many roots it is entered at, and where a clock read
+/// it, how many units were opened and the nanoseconds that took.
+pub type Compiled = { name: String, fragment: Int, units: Option<Int>, load_nanos: Option<Int> }
 
 /// The binding a run had, and the tests of the first unit it reaches.
 pub type Hosted = {
@@ -191,7 +538,6 @@ pub type Hosted = {
   label: String,
   operations: Int,
   digest: String,
-  handshakes: List<String>,
   hosts: Json,
   reaches: List<Int>,
   cores: Int,
@@ -204,7 +550,6 @@ pub type Filed = { unflushed: Option<String>, warnings: List<Diag> }
 pub fn no_usage() -> Usage =
   { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] }
 
-/// Two runs' costs, as one test that ran both.
 /// What two runs of one test read between them: every line of either, sorted, as a trace is. `None`
 /// when either has no trace to stand in for it.
 pub fn joined_trace(a: Option<Bytes>, b: Option<Bytes>) -> Option<Bytes> =
@@ -219,6 +564,7 @@ pub fn joined_trace(a: Option<Bytes>, b: Option<Bytes>) -> Option<Bytes> =
     _ -> None,
   }
 
+/// Two runs' costs, as one test that ran both.
 pub fn sum_usage(a: Usage, b: Usage) -> Usage =
   {
     duration_us: a.duration_us + b.duration_us,
@@ -229,8 +575,108 @@ pub fn sum_usage(a: Usage, b: Usage) -> Usage =
     teardown: b.teardown.fold(a.teardown, |acc: List<Diag>, diag: Diag| acc.push(diag)),
   }
 
+// --- What a failure says -----------------------------------------------------------
+
+fn defect(message: String, labels: List<Label>, notes: List<String>) -> Raised =
+  { diag: diag_of("error", "E0505", message, labels, notes), values: [] }
+
+fn nothing_built() -> Raised =
+  defect("a test was run in a unit built to run nothing, so no backend was compiled for it", [], [
+    "this is Ply's fault: the run named no test to run and the program ran one anyway",
+  ])
+
+fn no_test(index: Int, tests: Int) -> Raised =
+  defect(
+    "no test at index " ++ index.to_string() ++ "; the program defines " ++ tests.to_string(),
+    [],
+    ["this is Ply's fault, not the program's"],
+  )
+
+fn not_compiled(root: String) -> Raised =
+  defect("the unit is entered at no `" ++ root ++ "`", [], [
+    "a body the emitter cannot compile is `E0448` where the program is built, so this is the seam rather than the body",
+    "this is Ply's fault, not the program's",
+  ])
+
+/// A root that answered what it never answers: a test answers `()`, and a listing its cases.
+fn answered_otherwise(root: String, bytes: Bytes) -> Raised / {abort.raise} =
+  {
+    diag: diag_of(
+      "error",
+      "E0505",
+      "`" ++ root ++ "` answered `" ++ String::of_bytes_lossy(b"\x010\x02") ++ "`",
+      [],
+      [
+        "the checker refuses a test whose body is not `Unit` with E0201, so no test can answer one",
+        "this is Ply's fault, not the program's",
+      ],
+    ),
+    values: match value::decode(bytes) { Some(v) -> [v], None -> [VBytes(bytes)] },
+  }
+
+/// The runtime unwound running the test at `index`: a defect in Ply, placed at the test.
+fn panicked(unit: TestUnit, index: Int, message: String) -> Raised =
+  match unit.tests.at(index) {
+    Some(t) ->
+      defect(
+        "test `" ++ String::of_bytes_lossy(t.key) ++ "` panicked: " ++ message,
+        [
+          {
+            module: t.at.module,
+            start: t.at.start,
+            end: t.at.end,
+            primary: true,
+            text: b"Ply panicked while running this test",
+          },
+        ],
+        [
+          "a panic is a defect in Ply itself, not in the test; please report it with this source",
+          "the other tests still ran, and this one was not cached",
+        ],
+      ),
+    None -> defect("test " ++ index.to_string() ++ " panicked: " ++ message, [], []),
+  }
+
+// --- Tests ------------------------------------------------------------------
+
 test "two runs' traces join into every line either read, in a trace's order" {
   assert_eq(joined_trace(Some(b"b\ty\n"), Some(b"a\tx\nb\ty\n")), Some(b"a\tx\nb\ty\n"));
   assert_eq(joined_trace(Some(b""), Some(b"")), Some(b""));
   assert_eq(joined_trace(Some(b"a\tx\n"), None), None)
+}
+
+test "a run is abandoned by its clock, panics by Ply's defect, and fails by the program's" {
+  let d = |code: String| diag_of("error", code, "x", [], []);
+  assert_eq(status_of(d("W0612")), "abandoned");
+  assert_eq(status_of(d("E0505")), "panicked");
+  assert_eq(status_of(d("E0427")), "panicked");
+  assert_eq(status_of(d("E0502")), "failed")
+}
+
+test "a test under `--host` is lent its roots, its programs and no command line" {
+  let o = {
+    ..options_from(parsed(["test", "--host", "--allow", "machine"]), "."),
+    host: false,
+    fs: [{ name: "cwd", path: "." }],
+  };
+  let quiet = grants_of(o, machine::unconfigured());
+  assert(quiet.hermetic);
+  assert_eq(quiet.fs, []);
+  assert_eq(quiet.allow, ["machine"]);
+  let hosted = grants_of({ ..o, host: true }, machine::unconfigured());
+  assert(!hosted.hermetic && hosted.spawning);
+  assert_eq(hosted.fs, [{ name: "cwd", path: "." }]);
+  assert_eq(hosted.argv, None)
+}
+
+test "a listing's answer reads as its cases, and anything else as none" {
+  let listed = VList([
+    VRecord([
+      { name: "identity", value: VBytes(b"one") },
+      { name: "label", value: VStr("holds 1") },
+    ]),
+  ]);
+  let bytes = match value::encode(listed) { Some(b) -> b, None -> b"" };
+  assert_eq(listed_of(bytes), Some([{ label: "holds 1", identity: b"one" }]));
+  assert_eq(listed_of(match value::encode(VInt(1)) { Some(b) -> b, None -> b"" }), None)
 }

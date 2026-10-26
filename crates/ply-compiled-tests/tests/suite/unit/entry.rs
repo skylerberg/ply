@@ -125,7 +125,7 @@ fn run() -> Run {
 
 /// What `root` answered over `values`, read back.
 fn answered(opened: &Opened, root: &str, values: Vec<Value>, run: &Run) -> Result<Value, String> {
-    match entry::enter(opened, root, arguments(values), run, None).ended {
+    match entry::enter(opened, root, arguments(values), run, None, None).ended {
         Ended::Answered(bytes) => Ok(codec::decode(&bytes).expect("the answer reads")),
         Ended::Failed(d) => Err(format!("failed: {d}")),
         Ended::Panicked(why) => Err(format!("panicked: {why}")),

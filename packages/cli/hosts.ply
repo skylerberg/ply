@@ -1,26 +1,27 @@
-//! `ply hosts` — the trusted computing base, enumerable in one command. What a run would bind is
-//! assembled on the Rust side and handed over as a value: a reactor belongs to the thread that
-//! drives it, and a connection pool is not something a program can hold. Everything below decides
-//! what that value says.
+//! `ply hosts` — the trusted computing base, enumerable in one command: what the runtime's own
+//! families register (`machine.hosting`), resolved against what the program declares and performs
+//! (`listing`), with the facts no row carries and the digest a CI check pins.
 
-import compiler.unit (shipped)
 import compiler.load (Derives, LoadedAnalysis)
 import args (Flags, no_flags, style_of, root_of)
 import config_schema
 import configuration
 import configuration (Report, ReportKey, Resolution)
 import env (env)
-import std.value (Value)
 import program (Timed, front_of, no_front, timed_uncached, program_view)
 import builder (builder)
+import compiler.unit (shipped)
 import std.fs (fs, Missing)
 import std.time (time)
 import compiler.check.resolve.tables (Diag)
 import diagnostic (Place, all_to_json, all_to_text)
+import listing
+import listing (Row, Credential, Transport, Filesystem, Observability, Stopping)
 import report (Answer, schema_version, ok_code, compile_error, indent, count_of, refused)
 import std.json (Json, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings)
 import std.list (prepend)
+import std.machine as entering
 import machine
 import units
 import units (emit)
@@ -28,129 +29,9 @@ import std.term (Style, plain, red)
 import std.string
 import std.text
 
-/// One operation the host registers a handler for, by the effect's name as the registration writes
-/// it: program-wide for the language's and a shipped module's, declared for the rest.
-pub type Registration = {
-  effect: String,
-  op: String,
-  deterministic: Bool,
-  repeatable: Bool,
-  handler: String,
-}
-
-/// A value of the `std` type `shape` names, as a host handler builds it.
-pub type Shape = { shape: String, value: Value }
-
-/// The trusted computing base, as the Rust side assembles it under the host flags.
-pub nondet effect hosts {
-  /// The value of the nullary definition `--config-schema` names, which `configuring` enters on the
-  /// program's unit.
-  read schema[r](root: String, front: LoadedAnalysis, library: String, name: String) -> Result<Value, List<Diag>>
-  read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
-  /// Every operation the host registers a handler for, bound or not.
-  read registrations[r]() -> List<Registration>
-  /// One value of each `std` type a socket handler builds.
-  read shapes[r]() -> List<Shape>
-}
-
-/// `hosts.preview` answered from what it is handed alone: one that reads a credential is refused.
-pub effect hermetic_hosts {
-  read preview[r](root: String, options: machine::Options, front: LoadedAnalysis, config: machine::Configured) -> Previewed
-  read registrations[r]() -> List<Registration>
-  read shapes[r]() -> List<Shape>
-}
-
-/// `body` with every schema it asks for entered on a machine loaded for that alone: this command
-/// runs nothing else, so the label a run would take is free.
-pub fn configuring<a | e>(
-  body: () -> a / {hosts.schema[host] | e},
-) -> a / {machine::machine.load[run], machine::machine.schema[run], machine::machine.drop[run] | e} =
-  handle {
-    body()
-  } with {
-    hosts.schema[host](root, front, library, name) -> {
-      let entered = match machine::machine.load[run](root, front, library) {
-        Err(refused) -> Err(refused.diags),
-        Ok(_) -> machine::machine.schema[run](name),
-      };
-      machine::machine.drop[run]();
-      entered
-    },
-  }
-
-// --- What the Rust side answers with ----------------------------------------
-
 /// How far the preview got. Each refusal has a report of its own, because each says something
 /// different about where the run stopped.
-pub type Stage = | Bound | NotLoaded | NotResolved | NotBound
-
-/// One triple the registry resolved against this program.
-pub type Row = {
-  effect: String,
-  op: String,
-  /// `None` for an operation declared without `[r]`: a singleton, not a resource named that.
-  resource: Option<String>,
-  triple: String,
-  handler: String,
-  deterministic: Bool,
-  linear: Bool,
-  blocking: Bool,
-  secrets: Bool,
-  declared_nondet: Bool,
-}
-
-pub type Credential = { name: String, fingerprint: String, certificates: Int }
-
-pub type Transport = {
-  library: String,
-  version: String,
-  provider: String,
-  versions: List<String>,
-  alpn: List<String>,
-  roots: String,
-  roots_version: String,
-  trusted: Int,
-  credentials: List<Credential>,
-}
-
-pub type Filesystem = { roots: List<machine::Named> }
-
-pub type Pool = {
-  connections: Int,
-  acquire_ms: Int,
-  statement_ms: Int,
-  idle_txn_ms: Int,
-  connect_ms: Int,
-  statement_cache: Int,
-}
-
-pub type Observability = {
-  sink: String,
-  destination: String,
-  /// `None` when the records are discarded, since a level then decides nothing.
-  level: Option<String>,
-  channels: List<String>,
-}
-
-pub type Stopping = { signals: List<String>, lead_ms: Int, drain_ms: Int }
-
-/// What the Rust side answers: everything but the configuration, which the program resolved.
-pub type Previewed = {
-  stage: Stage,
-  /// The root the load was rooted at, as a report prints it.
-  root: String,
-  handlers: Int,
-  rows: List<Row>,
-  digest: String,
-  /// Whether the run binds nothing, which is so unless `--host` was passed.
-  hermetic: Bool,
-  transport: Option<Transport>,
-  filesystem: Option<Filesystem>,
-  observability: Option<Observability>,
-  shutdown: Option<Stopping>,
-  diags: List<Diag>,
-  places: List<Place>,
-}
+pub type Stage = | Bound | NotResolved | NotBound
 
 /// The preview as the report reads it, with the configuration the program resolved.
 pub type Preview = {
@@ -366,7 +247,7 @@ fn row_json(row: Row) -> Json =
     { key: "declared_nondet", value: Bool(row.declared_nondet) },
   ])
 
-fn transport_json(t: Transport) -> Json =
+pub fn transport_json(t: Transport) -> Json =
   object([
     { key: "library", value: Str(t.library) },
     { key: "version", value: Str(t.version) },
@@ -394,7 +275,7 @@ fn transport_json(t: Transport) -> Json =
     },
   ])
 
-fn filesystem_json(f: Filesystem) -> Json =
+pub fn filesystem_json(f: Filesystem) -> Json =
   object([
     {
       key: "roots",
@@ -452,7 +333,7 @@ fn report_json(preview: Preview) -> Json / {abort.raise} = {
   object(stopping.push({ key: "diagnostics", value: all_to_json(preview.diags, preview.places) }))
 }
 
-// --- The three refusals -----------------------------------------------------
+// --- The two refusals -----------------------------------------------------
 
 /// A registration that does not resolve against the program: nothing bound and nothing ran.
 fn unresolved(style: Style, preview: Preview) -> Answer / {abort.raise} =
@@ -507,10 +388,18 @@ fn answered(style: Style, flags: Flags, preview: Preview) -> Answer / {abort.rai
   { json: report_json(preview), lines: lines, errs: errs, code: ok_code() }
 }
 
+/// What a preview comes to: its listing, or the refusal that stopped it.
+fn told(style: Style, flags: Flags, p: Preview) -> Answer / {abort.raise} =
+  match p.stage {
+    NotResolved -> unresolved(style, p),
+    NotBound -> unbound(style, p.diags, p.places),
+    Bound -> answered(style, flags, p),
+  }
+
 pub fn run(
   flags: Flags,
   options: machine::Options,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, hosts.schema[host], hosts.preview[host], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, entering::machine.open, entering::machine.enter, entering::machine.close, entering::machine.hosting, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, Derives, abort.raise, diverges, shipped.reached} = {
   let s: Style = style_of(flags);
   let t: Timed = timed_uncached(flags.paths);
   match program_view(t.program) {
@@ -522,63 +411,86 @@ pub fn run(
   }
 }
 
-/// The preview the Rust side assembled, with the configuration this side resolved: shown only when a
-/// source was read, and its warnings the binding's.
-fn shown(p: Previewed, resolution: Resolution) -> Preview =
-  {
-    stage: p.stage,
-    root: p.root,
-    handlers: p.handlers,
-    rows: p.rows,
-    digest: p.digest,
-    hermetic: p.hermetic,
-    transport: p.transport,
-    filesystem: p.filesystem,
-    configuration: if configuration::opened(resolution.configuration) {
-      Some(configuration::report(resolution.configuration))
-    } else { None },
-    observability: p.observability,
-    shutdown: p.shutdown,
-    diags: resolution.warnings.concat(p.diags),
-    places: p.places,
-  }
-
-/// The binding, over the front end `run` loaded: its configuration first, whose schema the program's
-/// own unit enters, then what the host flags open.
+/// The binding, over the front end `run` loaded: its configuration first, whose schema a unit of
+/// the program's own enters, then what the families register under what the flags lend.
 fn binding_over(
   style: Style,
   flags: Flags,
   options: machine::Options,
   front: LoadedAnalysis,
   places: List<Place>,
-) -> Answer / {hosts.schema[host], hosts.preview[host], env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, abort.raise} =
+) -> Answer / {entering::machine.open, entering::machine.enter, entering::machine.close, entering::machine.hosting, env.vars[sys], env.pwd[sys], fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, abort.raise} =
   match configuration::opened_by(options.host, options.config, |name: String|
-      match units::whole(front) {
-        Err(diags) -> Err(diags),
-        Ok(text) -> match units::library(text, options.profile) {
-          Err(diags) -> Err(diags),
-          Ok(library) -> hosts.schema[host](root_of(flags).machine, front, library, name),
-        },
-      }) {
+      configuration::schema_entered(front, options.profile, name)) {
     Err(diags) -> unbound(style, diags, places),
-    Ok(r) -> {
-      let p = shown(
-        hosts.preview[host](
-          root_of(flags).machine,
-          options,
-          front,
-          configuration::configured(r.configuration),
-        ),
-        r,
-      );
-      match p.stage {
-        NotLoaded -> refused(style, "hosts", p.diags, p.places),
-        NotResolved -> unresolved(style, p),
-        NotBound -> unbound(style, p.diags, p.places),
-        Bound -> answered(style, flags, p),
-      }
-    },
+    Ok(r) -> told(style, flags, previewed(root_of(flags).machine, options, front, r, places)),
   }
+
+/// What a run of the flags would bind, its registrations resolved against `front`'s program.
+fn previewed(
+  path: String,
+  options: machine::Options,
+  front: LoadedAnalysis,
+  resolution: Resolution,
+  places: List<Place>,
+) -> Preview / {entering::machine.hosting, abort.raise} = {
+  let configured = configuration::configured(resolution.configuration);
+  let hosting = entering::machine.hosting({
+    ..entering::no_grants(),
+    hermetic: false,
+    fs: options.fs.map(machine::lent),
+    allow: options.allow,
+    given: machine::given_of(options.tls, options.trust, options.mtls, configured).push({
+      name: "trace",
+      fields: [options.trace.sink, options.trace.level],
+    }),
+  });
+  let base: Preview = {
+    stage: Bound,
+    root: machine::project_root(path),
+    handlers: 0,
+    rows: [],
+    digest: "",
+    hermetic: !options.host,
+    transport: None,
+    filesystem: None,
+    configuration: if configuration::opened(resolution.configuration) {
+      Some(configuration::report(resolution.configuration))
+    } else { None },
+    observability: None,
+    shutdown: None,
+    diags: resolution.warnings,
+    places: places,
+  };
+  let declared = listing::declared_of(front.dump);
+  let refused = match listing::unlendable(options.allow, declared) {
+    Some(d) -> [d],
+    None -> hosting.refusals.map(machine::unplaced),
+  };
+  if refused.len() > 0 { { ..base, stage: NotBound, diags: base.diags.concat(refused) } } else {
+    match listing::resolved(hosting.registrations, declared, listing::performed(front.dump)) {
+      Err(diags) -> { ..base, stage: NotResolved, diags: base.diags.concat(diags) },
+      Ok(l) -> {
+        let d = listing::disclosures_of(
+          l,
+          hosting,
+          configured,
+          Some({ lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms }),
+        );
+        {
+          ..base,
+          handlers: l.handlers,
+          rows: l.rows,
+          digest: listing::digest_of(l, d),
+          transport: d.transport,
+          filesystem: d.filesystem,
+          observability: d.observability,
+          shutdown: d.shutdown,
+        }
+      },
+    }
+  }
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -630,6 +542,9 @@ fn flags_of(json: Bool, digest: Bool) -> Flags = { ..no_flags(), json: json, dig
 
 fn first(lines: List<String>, n: Int) -> List<String> =
   range(0, n).fold([], |acc: List<String>, i: Int| acc.push(lines.at_or(i, "")))
+
+fn answered_over(preview: Preview, flags: Flags) -> Answer / {abort.raise} =
+  told(plain(), flags, preview)
 
 test "the table is exactly the shape the contract specifies" {
   let lines = listing_lines(listed());
@@ -718,7 +633,6 @@ test "an unbound root is named rather than silently absent" {
   )
 }
 
-// Server facts come only from a live connection, and they win over the URL the flags named.
 test "a sink that discards names no level" {
   assert_eq(
     observability_lines({
@@ -782,42 +696,6 @@ test "the configuration block counts its sources and never prints a secret's val
   assert_eq(lines.at_or(4, ""), "keys       port=8137 (--set) · token=**** (deploy.env)");
   assert(!String::join(lines, "\n").contains("hunter2"))
 }
-
-/// What the Rust side answers for a preview a test builds: the report's own, less the
-/// configuration this side resolves.
-fn previewed(preview: Preview) -> Previewed =
-  {
-    stage: preview.stage,
-    root: preview.root,
-    handlers: preview.handlers,
-    rows: preview.rows,
-    digest: preview.digest,
-    hermetic: preview.hermetic,
-    transport: preview.transport,
-    filesystem: preview.filesystem,
-    observability: preview.observability,
-    shutdown: preview.shutdown,
-    diags: preview.diags,
-    places: preview.places,
-  }
-
-/// The run's own answer, over a preview the test hands it in place of the Rust side. Without
-/// `--host` nothing is read, so the environment and the tree answer nothing.
-fn answered_over(preview: Preview, flags: Flags) -> Answer / {abort.raise} =
-  handle {
-    binding_over(plain(), flags, machine::default_options(), no_front(), [])
-  } with {
-    emit.unit(front, offered) -> Ok({ text: b"", made: { bodies: [], offered: [] } }),
-    emit.compiled(text, profile) -> Ok("/unit.so"),
-    hosts.schema[host](root, front, library, name) -> Err([]),
-    hosts.preview[host](root, options, front, config) -> previewed(preview),
-    env.vars[sys]() -> [],
-    env.pwd[sys]() -> "/w",
-    fs.resolved[cwd](path) -> Missing,
-    fs.resolved[abs](path) -> Missing,
-    fs.read_file[cwd](path) -> None,
-    fs.read_file[abs](path) -> None,
-  }
 
 test "the listing opens on a blank line and every other line is indented" {
   let answer = answered_over(listed(), flags_of(false, false));
@@ -891,24 +769,4 @@ test "a registration that does not resolve is exit 2 with no tally" {
   let answer = answered_over(refused, flags_of(false, false));
   assert_eq(answer.code, 2);
   assert_eq(answer.errs, ["Error[E0424]: `db.get[users]` has no handler"])
-}
-
-test "a program that does not load is the load's own refusal" {
-  let broken: Diag = {
-    code: b"E0201",
-    notes: 0,
-    labels: [],
-    text: b"",
-    message: b"type mismatch",
-    notes_text: [],
-    severity: b"error",
-    fixes: [],
-  };
-  let unloadable: Preview = { ..nothing(), stage: NotLoaded, diags: [broken] };
-  let answer = answered_over(unloadable, flags_of(false, false));
-  assert_eq(answer.code, 2);
-  assert_eq(answer.errs, [
-    "Error[E0201]: type mismatch",
-    indent() ++ "compilation failed (1 error)",
-  ])
 }
