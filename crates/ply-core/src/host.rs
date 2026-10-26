@@ -492,9 +492,10 @@ pub fn resource_of(resource: Option<&Symbol>) -> Resource {
     }
 }
 
+/// How much of the host a run asked: every operation and native answered, and how many of those
+/// a run asking again may be answered otherwise.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct HostUse {
-    pub atoms: Footprint,
     /// Every host operation answered, `Repeatable` ones included.
     pub operations: u64,
     pub nondeterministic: u64,
@@ -509,8 +510,7 @@ impl HostUse {
         self.nondeterministic > 0
     }
 
-    pub fn record(&mut self, atom: &EffectAtom, determinism: Determinism) {
-        self.atoms = self.atoms.union(&Footprint::from_atoms([atom.clone()]));
+    pub fn record(&mut self, determinism: Determinism) {
         self.operations += 1;
         if !determinism.is_deterministic() {
             self.nondeterministic += 1;
@@ -518,7 +518,6 @@ impl HostUse {
     }
 
     pub fn absorb(&mut self, other: &HostUse) {
-        self.atoms = self.atoms.union(&other.atoms);
         self.operations += other.operations;
         self.nondeterministic += other.nondeterministic;
     }

@@ -240,6 +240,19 @@ impl Run {
 
     /// `pending`'s answer where it has one, which is then taken.
     pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
+        self.took(pending, value_of)
+    }
+
+    /// The bytes a native's job answered `pending` where it has answered, which are then taken.
+    pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
+        self.took(pending, bytes_of)
+    }
+
+    fn took<T>(
+        &self,
+        pending: &Pending,
+        read: fn(Span, &str, JobOutput) -> Result<T, Diagnostic>,
+    ) -> Result<Option<T>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
             None => return Err(err_unowned(pending)),
@@ -254,7 +267,7 @@ impl Run {
                 what,
                 answer: Some(answer),
                 ..
-            }) => value_of(span, what, answer).map(Some),
+            }) => read(span, what, answer).map(Some),
             _ => Ok(None),
         }
     }
@@ -266,11 +279,29 @@ impl Run {
         pending: &Pending,
         bound: Option<Duration>,
     ) -> Result<Option<Value>, Diagnostic> {
+        self.waited(pending, bound, Run::poll)
+    }
+
+    /// The bytes a native's job answered `pending`, waited for as [`Run::block_on`] waits.
+    pub fn block_on_bytes(
+        &self,
+        pending: &Pending,
+        bound: Option<Duration>,
+    ) -> Result<Option<Vec<u8>>, Diagnostic> {
+        self.waited(pending, bound, Run::taken)
+    }
+
+    fn waited<T>(
+        &self,
+        pending: &Pending,
+        bound: Option<Duration>,
+        take: fn(&Run, &Pending) -> Result<Option<T>, Diagnostic>,
+    ) -> Result<Option<T>, Diagnostic> {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
             let seen = self.bell.rung();
-            if let Some(value) = self.poll(pending)? {
-                return Ok(Some(value));
+            if let Some(answer) = take(self, pending)? {
+                return Ok(Some(answer));
             }
             match until {
                 None => self.bell.wait_past(seen),
@@ -322,11 +353,7 @@ fn value_of(span: Span, what: &str, answer: JobOutput) -> Result<Value, Diagnost
         JobOutput::Bytes(b) => Ok(Value::bytes(b)),
         JobOutput::Built(build) => Ok(build()),
         JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
-        JobOutput::Failed(message) => Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("{what} failed: {message}"),
-        )
-        .primary(span, "this operation reached the host and the host refused")),
+        JobOutput::Failed(message) => Err(failed(span, what, &message)),
         JobOutput::Int(i) => Ok(Value::Int(i)),
         JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
         JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
@@ -338,6 +365,26 @@ fn value_of(span: Span, what: &str, answer: JobOutput) -> Result<Value, Diagnost
         }
         JobOutput::Refused(diagnostic) => Err(diagnostic),
     }
+}
+
+/// The bytes a native's job answered, which is all one answers.
+fn bytes_of(span: Span, what: &str, answer: JobOutput) -> Result<Vec<u8>, Diagnostic> {
+    match answer {
+        JobOutput::Bytes(b) => Ok(b),
+        JobOutput::Failed(message) => Err(failed(span, what, &message)),
+        JobOutput::Refused(diagnostic) => Err(diagnostic),
+        _ => Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("{what} answered a native's job with no bytes"),
+        )
+        .primary(span, "a native's job answers bytes")),
+    }
+}
+
+#[cold]
+fn failed(span: Span, what: &str, message: &str) -> Diagnostic {
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("{what} failed: {message}"))
+        .primary(span, "this operation reached the host and the host refused")
 }
 
 struct Shared {

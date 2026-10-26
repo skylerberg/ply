@@ -49,7 +49,7 @@
 //! `execute` answers what they would; so is a row id of 9223372036854775807, past which the
 //! engine draws row ids at random. What a statement answers is then a function of the database
 //! and the values bound, and the same engine runs over an image in memory as the twin:
-//! `in_memory[app](|| ..)` answers every operation from `sqlite_run`, a builtin that performs
+//! `in_memory[app](|| ..)` answers every operation from `sqlite_run`, a native that performs
 //! nothing, so a test over it is deterministic and cached, a law may quantify over it, and
 //! neither needs a root. The twin keeps a database for each path, gives a transaction its own
 //! copy, and answers `Busy` at once to a second writer. It differs from a file in three ways: a
@@ -73,26 +73,23 @@ import std.option
 import std.gen
 
 /// One SQL statement run by SQLite over the database `image` holds, a database file's bytes or
-/// none for an empty one, and the image it leaves: the one handed in where the statement failed
-/// or only read. A function of its arguments: the engine is the one every `ply` of this version
-/// carries, and a statement that would read a clock, entropy or another file is refused. A
-/// parameter and a column's value are `kind` 0 for null, 1 an integer in `int`, 2 a float in
-/// `real`, 3 text and 4 bytes, both in `bytes`. `reads_only` refuses a statement that could
-/// write, and `strict` a table that is not `STRICT`. `wrote` is whether the statement could have
-/// changed the database, `changed` the rows it wrote itself, and `last_row_id` the row id it last
-/// inserted, or 0. `failure` says why it did not run: `kind` is what `std.sqlite` types, and
-/// `name` the constraint, limit or engine code. `std.sqlite` is how a program runs one.
+/// none for an empty one, its values and limits written as the natives below read them: parts of
+/// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
+/// its arguments: the engine is the one every `ply` of this version carries, and a statement that
+/// would read a clock, entropy or another file is refused. `reads_only` refuses a statement that
+/// could write, and `strict` a table that is not `STRICT`. `ran_over` is how the twin runs one.
 extern fn sqlite_run(
   image: Bytes,
   sql: String,
-  params: List<{ kind: Int, int: Int, real: Float, bytes: Bytes }>,
+  params: Bytes,
   reads_only: Bool,
   strict: Bool,
-  limits: { sql_bytes: Int, params: Int, rows: Int, bytes: Int, steps: Int },
-) -> { image: Bytes, columns: List<String>, rows: List<List<{ kind: Int, int: Int, real: Float, bytes: Bytes }>>, wrote: Bool, changed: Int, last_row_id: Int, failure: Option<{ kind: String, name: String, detail: String }> }
+  limits: Bytes,
+) -> Bytes
 
-/// The SQL functions a statement `sqlite_run` runs may call, in order: any other is refused.
-extern fn sqlite_functions() -> List<String>
+/// The SQL functions a statement `sqlite_run` runs may call, in order, as parts: any other is
+/// refused.
+extern fn sqlite_functions() -> Bytes
 
 /// How a database file is opened: to be read, to be read and written, or made if it is not there.
 pub type Mode = | ReadOnly | ReadWrite | Create
@@ -219,7 +216,8 @@ fn refusal_of_last(f: Failure) -> Refusal =
   else { Engine(if f.name == "" { f.kind } else { f.name }, f.detail) }
 
 /// The SQL functions a statement may call, in order.
-pub fn functions() -> List<String> = sqlite_functions()
+pub fn functions() -> List<String> / {abort.raise} =
+  parts(sqlite_functions()).map(|name: Bytes| String::of_bytes_lossy(name))
 
 // --- A statement and its parameters ------------------------------------------------------
 
@@ -948,16 +946,24 @@ fn twin_close(t: Twin, conn: Int) -> Twin =
 fn unlocked(t: Twin, o: Open, conn: Int) -> Twin =
   if t.writer.get(o.path) == Some(conn) { { ..t, writer: t.writer.remove(o.path) } } else { t }
 
-fn replied(
-  r: { image: Bytes, columns: List<String>, rows: List<List<Scalar>>, wrote: Bool, changed: Int, last_row_id: Int, failure: Option<Failure> },
-) -> Reply =
-  {
-    columns: r.columns,
-    rows: r.rows,
-    wrote: r.wrote,
-    changed: r.changed,
-    last_row_id: r.last_row_id,
-    failure: r.failure,
+/// What one statement over an image answered, and the image it left: the one handed in where it
+/// failed or only read.
+type Ran = { image: Bytes, reply: Reply }
+
+/// `sql` over the database `image` holds, as `sqlite_run` runs it.
+fn ran_over(
+  image: Bytes,
+  sql: String,
+  params: List<Scalar>,
+  reads_only: Bool,
+  strict: Bool,
+  limits: Limits,
+) -> Ran / {abort.raise} =
+  match parts(
+      sqlite_run(image, sql, scalars_written(params), reads_only, strict, limits_written(limits)),
+    ) {
+    [left, reply] -> { image: found(left).unwrap_or(image), reply: reply_read(reply) },
+    _ -> panic("the twin's engine wrote no reply"),
   }
 
 fn twin_run(
@@ -967,11 +973,11 @@ fn twin_run(
   params: List<Scalar>,
   limits: Limits,
   querying: Bool,
-) -> Stepped =
+) -> Stepped / {abort.raise} =
   match t.open.get(conn) {
     None -> { twin: t, reply: unconnected() },
     Some(o) -> if o.folding != None { { twin: t, reply: folded() } } else {
-      let ran = sqlite_run(
+      let ran = ran_over(
         image_of(t, o),
         sql,
         params,
@@ -979,7 +985,7 @@ fn twin_run(
         o.strict,
         limits,
       );
-      match ran.failure {
+      match ran.reply.failure {
         Some(f) -> if f.kind == "writes" && !querying {
           {
             twin: t,
@@ -989,9 +995,9 @@ fn twin_run(
               "this statement writes, and the connection was opened to read",
             ),
           }
-        } else { { twin: t, reply: replied(ran) } },
-        None -> if ran.wrote { twin_written(t, conn, o, ran.image, replied(ran)) }
-        else { { twin: t, reply: replied(ran) } },
+        } else { { twin: t, reply: ran.reply } },
+        None -> if ran.reply.wrote { twin_written(t, conn, o, ran.image, ran.reply) }
+        else { { twin: t, reply: ran.reply } },
       }
     },
   }
@@ -1097,22 +1103,28 @@ fn twin_backup(t: Twin, conn: Int, path: String) -> Stepped / {abort.raise} =
     },
   }
 
-fn twin_cursor(t: Twin, conn: Int, sql: String, params: List<Scalar>, limits: Limits) -> Stepped =
+fn twin_cursor(
+  t: Twin,
+  conn: Int,
+  sql: String,
+  params: List<Scalar>,
+  limits: Limits,
+) -> Stepped / {abort.raise} =
   match t.open.get(conn) {
     None -> { twin: t, reply: unconnected() },
     Some(o) -> if o.folding != None { { twin: t, reply: folded() } } else {
       // Every row at once: a page's bound is held to as each is fetched.
-      let ran = sqlite_run(image_of(t, o), sql, params, true, o.strict, {
+      let ran = ran_over(image_of(t, o), sql, params, true, o.strict, {
         ..limits,
         bytes: 9223372036854775807,
       });
-      match ran.failure {
-        Some(_) -> { twin: t, reply: replied(ran) },
+      match ran.reply.failure {
+        Some(_) -> { twin: t, reply: ran.reply },
         None -> {
-          let folding = Some({ rows: ran.rows, at: 0, bytes: limits.bytes });
+          let folding = Some({ rows: ran.reply.rows, at: 0, bytes: limits.bytes });
           {
             twin: { ..t, open: t.open.insert(conn, { ..o, folding: folding }) },
-            reply: { ..quiet(), columns: ran.columns },
+            reply: { ..quiet(), columns: ran.reply.columns },
           }
         },
       }

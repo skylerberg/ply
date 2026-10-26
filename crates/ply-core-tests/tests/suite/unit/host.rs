@@ -1,5 +1,5 @@
 use ply_core::host::*;
-use ply_core::{Diagnostic, EffectAtom, Resource, Symbol, codes};
+use ply_core::{Diagnostic, Resource, Symbol, codes};
 use std::sync::Arc;
 
 struct Never;
@@ -133,19 +133,13 @@ fn the_language_effects_are_the_ones_every_program_is_checked_with() {
 fn host_use_records_what_actually_happened() {
     let mut use_ = HostUse::default();
     assert!(use_.is_empty());
-    let atom = EffectAtom::new(
-        "db",
-        Resource::Named(Symbol::new("users")),
-        ply_core::Mode::Read,
-    );
-    use_.record(&atom, Determinism::Deterministic);
+    use_.record(Determinism::Deterministic);
     assert!(
         !use_.acted(),
         "a deterministic handler answers a re-run the same"
     );
-    use_.record(&atom, Determinism::Nondeterministic);
-    assert_eq!(use_.operations, 2, "operations count, atoms deduplicate");
-    assert_eq!(use_.atoms.atoms().count(), 1);
+    use_.record(Determinism::Nondeterministic);
+    assert_eq!(use_.operations, 2);
     assert!(!use_.is_empty());
     assert!(use_.acted());
 }

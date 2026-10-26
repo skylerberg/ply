@@ -193,18 +193,41 @@ pub fn facilities_of(runtime: &dyn HostRuntime) -> Option<&Facilities> {
     runtime.facilities()?.downcast_ref()
 }
 
+/// The bytes a native's job answered `pending`, the thread waiting for them until the drain
+/// deadline says the run is out of time.
+///
+/// # Errors
+/// The job failed, the drain ran out, or no host made `runtime`.
+pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>, Diagnostic> {
+    let facilities = facilities_of(runtime).ok_or_else(err_no_host)?;
+    let step = facilities.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
+    loop {
+        if let Some(bytes) = facilities.run.block_on_bytes(pending, step)? {
+            return Ok(bytes);
+        }
+        if let Some(expired) = facilities.drain_expired() {
+            return Err(expired);
+        }
+    }
+}
+
 /// The run `runtime` is, which an operation it asks for is submitted for.
 ///
 /// # Errors
 /// No host made the runtime, so it holds no run.
 pub fn run_of(runtime: &dyn HostRuntime) -> Result<&Arc<Run>, Diagnostic> {
-    facilities_of(runtime).map(Facilities::run).ok_or_else(|| {
-        Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            "a host operation was asked to wait under a runtime no host made",
-        )
-        .note("this is Ply's fault: report it with the program that produced it")
-    })
+    facilities_of(runtime)
+        .map(Facilities::run)
+        .ok_or_else(err_no_host)
+}
+
+#[cold]
+fn err_no_host() -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        "a host operation was asked to wait under a runtime no host made",
+    )
+    .note("this is Ply's fault: report it with the program that produced it")
 }
 
 /// The runtime: one run's operations, and what it lends the natives.

@@ -2,14 +2,12 @@
 //! statement can loosen and an authorizer that keeps it inside its own database.
 //!
 //! One [`Engine`] serves both forms. Over a file it is a connection a host handler opened and
-//! holds; over an image it is the `sqlite_run` builtin, which opens the bytes it is handed, runs one
+//! holds; over an image it is [`run_over`], which opens the bytes it is handed, runs one
 //! statement and answers the bytes that leaves, so its answer is a function of its arguments: no
 //! clock, no entropy, no file and no state kept between calls. The engine holds a generator of its
 //! own, and nothing a statement may do reads it: the functions that draw from it are refused, and so
 //! is a row at the largest row id, past which it would choose the next.
 
-use crate::value::{Fields, Value};
-use crate::{Diagnostic, Span, Symbol, codes};
 use rusqlite::config::DbConfig;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
@@ -253,14 +251,6 @@ impl Failure {
             format!("more than the {bound} its caller allowed"),
         )
     }
-
-    pub fn into_value(self) -> Value {
-        record([
-            ("detail", Value::str(self.detail)),
-            ("kind", Value::str(self.kind)),
-            ("name", Value::str(self.name)),
-        ])
-    }
 }
 
 /// What a statement answered.
@@ -287,130 +277,6 @@ impl Reply {
             ..Reply::default()
         }
     }
-
-    pub fn into_value(self) -> Value {
-        record(self.fields())
-    }
-
-    fn fields(self) -> [(&'static str, Value); 6] {
-        [
-            ("wrote", Value::Bool(self.wrote)),
-            ("changed", Value::Int(self.changed)),
-            (
-                "columns",
-                Value::list(self.columns.into_iter().map(Value::str).collect()),
-            ),
-            (
-                "failure",
-                match self.failure {
-                    Some(failure) => Value::ctor("Some", vec![failure.into_value()]),
-                    None => Value::ctor("None", Vec::new()),
-                },
-            ),
-            ("last_row_id", Value::Int(self.last_row_id)),
-            (
-                "rows",
-                Value::list(
-                    self.rows
-                        .into_iter()
-                        .map(|row| Value::list(row.into_iter().map(scalar_value).collect()))
-                        .collect(),
-                ),
-            ),
-        ]
-    }
-}
-
-fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    Value::Record(Arc::new(Fields::from_unsorted(
-        fields
-            .into_iter()
-            .map(|(name, value)| (Symbol::new(name), value))
-            .collect(),
-    )))
-}
-
-/// A `Scalar` as the record `std.sqlite` reads: `kind` is 0 for null, 1 an integer, 2 a float, 3
-/// text and 4 bytes.
-fn scalar_value(scalar: Scalar) -> Value {
-    let (kind, int, real, bytes) = match scalar {
-        Scalar::Null => (0, 0, 0.0, Vec::new()),
-        Scalar::Int(n) => (1, n, 0.0, Vec::new()),
-        Scalar::Real(x) => (2, 0, x, Vec::new()),
-        Scalar::Text(text) => (3, 0, 0.0, text.into_bytes()),
-        Scalar::Blob(blob) => (4, 0, 0.0, blob),
-    };
-    record([
-        ("bytes", Value::bytes(bytes)),
-        ("int", Value::Int(int)),
-        ("kind", Value::Int(kind)),
-        ("real", Value::Float(real)),
-    ])
-}
-
-fn field<'a>(
-    value: &'a Value,
-    name: &str,
-    span: Span,
-    what: &str,
-) -> Result<&'a Value, Diagnostic> {
-    match value {
-        Value::Record(fields) => fields.named(name),
-        _ => None,
-    }
-    .ok_or_else(|| malformed(span, what, name))
-}
-
-#[cold]
-fn malformed(span: Span, what: &str, name: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("{what} was handed a value with no `{name}`"),
-    )
-    .primary(
-        span,
-        "a well-typed call hands the record its declaration names",
-    )
-}
-
-/// The parameters of a statement, read from the list of records `std.sqlite` binds.
-pub fn scalars_of(list: &Value, span: Span, what: &str) -> Result<Vec<Scalar>, Diagnostic> {
-    list.as_list(span, what)?
-        .iter()
-        .map(|item| {
-            let kind = field(item, "kind", span, what)?.as_int(span, what)?;
-            Ok(match kind {
-                1 => Scalar::Int(field(item, "int", span, what)?.as_int(span, what)?),
-                2 => Scalar::Real(field(item, "real", span, what)?.as_float(span, what)?),
-                3 => {
-                    let bytes = field(item, "bytes", span, what)?.as_bytes(span, what)?;
-                    match std::str::from_utf8(bytes) {
-                        Ok(text) => Scalar::Text(text.to_string()),
-                        Err(_) => Scalar::Blob(bytes.to_vec()),
-                    }
-                }
-                4 => Scalar::Blob(
-                    field(item, "bytes", span, what)?
-                        .as_bytes(span, what)?
-                        .to_vec(),
-                ),
-                _ => Scalar::Null,
-            })
-        })
-        .collect()
-}
-
-impl Limits {
-    pub fn of(value: &Value, span: Span, what: &str) -> Result<Limits, Diagnostic> {
-        let int = |name: &str| field(value, name, span, what)?.as_int(span, what);
-        Ok(Limits {
-            sql_bytes: int("sql_bytes")?,
-            params: int("params")?,
-            rows: int("rows")?,
-            bytes: int("bytes")?,
-            steps: int("steps")?,
-        })
-    }
 }
 
 /// How a database file is opened.
@@ -430,16 +296,6 @@ pub struct Options {
     pub busy_ms: i64,
     /// How many prepared statements the connection keeps.
     pub statements: i64,
-}
-
-impl Options {
-    pub fn of(value: &Value, span: Span, what: &str) -> Result<Options, Diagnostic> {
-        Ok(Options {
-            strict: field(value, "strict", span, what)?.as_bool(span, what)?,
-            busy_ms: field(value, "busy_ms", span, what)?.as_int(span, what)?,
-            statements: field(value, "statements", span, what)?.as_int(span, what)?,
-        })
-    }
 }
 
 /// One step of a connection's transaction.
@@ -1238,19 +1094,21 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
     })
 }
 
-/// `sqlite_run(image, sql, params, reads_only, strict, limits)`.
-pub fn run_image(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
-    let what = "`sqlite_run`";
-    let image = args[0].as_bytes(span, what)?;
-    let sql = args[1].as_str(span, what)?;
-    let params = scalars_of(&args[2], span, what)?;
-    let reads_only = args[3].as_bool(span, what)?;
-    let strict = args[4].as_bool(span, what)?;
-    let limits = Limits::of(&args[5], span, what)?;
-    let (reply, left) = match Engine::memory(image, strict) {
+/// One statement over the database `image` holds, a database file's bytes or none for an empty
+/// one: what it answered, and the image it left where it wrote and kept what it wrote. A function
+/// of its arguments.
+pub fn run_over(
+    image: &[u8],
+    sql: &str,
+    params: &[Scalar],
+    limits: Limits,
+    reads_only: bool,
+    strict: bool,
+) -> (Reply, Option<Vec<u8>>) {
+    match Engine::memory(image, strict) {
         Err(failure) => (Reply::failed(failure), None),
         Ok(mut engine) => {
-            let reply = engine.run(sql, &params, limits, reads_only);
+            let reply = engine.run(sql, params, limits, reads_only);
             if reply.failure.is_some() || !reply.wrote {
                 (reply, None)
             } else {
@@ -1260,21 +1118,5 @@ pub fn run_image(args: &[Value], span: Span) -> Result<Value, Diagnostic> {
                 }
             }
         }
-    };
-    let image = match left {
-        Some(left) => Value::bytes(left),
-        None => args[0].clone(),
-    };
-    let mut fields: Vec<(Symbol, Value)> = reply
-        .fields()
-        .into_iter()
-        .map(|(name, value)| (Symbol::new(name), value))
-        .collect();
-    fields.push((Symbol::new("image"), image));
-    Ok(Value::Record(Arc::new(Fields::from_unsorted(fields))))
-}
-
-/// `sqlite_functions()`.
-pub fn functions() -> Value {
-    Value::list(FUNCTIONS.iter().map(Value::str).collect())
+    }
 }

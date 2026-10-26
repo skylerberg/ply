@@ -22,15 +22,12 @@ use crate::host::HostMark;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
-use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Value, codes};
+use ply_core::{Diagnostic, Resource, Value, codes};
 use ply_host::jobs::{self, Job, Work};
 use ply_host::native::{found, parts, told};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
-
-/// The effect every native here performs, under its program-wide name (`std.internal.native`).
-const NATIVE: &str = "std.internal.native.native";
 
 /// What a native says of itself when it asks the host: whether what it answers is a function of
 /// what it is handed, and whether asking again changes anything outside the program.
@@ -151,10 +148,7 @@ impl Ctx {
             self.fail(err_host_in_search(span, &operation, native));
             return false;
         }
-        self.host_use.record(
-            &EffectAtom::new(NATIVE, Resource::Singleton, Mode::Read),
-            asking.determinism,
-        );
+        self.host_use.record(asking.determinism);
         if asking.linearity.is_linear() {
             self.host_ops = self.host_ops.saturating_add(1);
             self.last_linear = Some(HostMark {
@@ -310,19 +304,18 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
         label: "a native's job",
     };
     let c = unsafe { &mut *ctx };
-    let answered = if crate::simulate::running_task_of_production(c).is_some() {
-        match unsafe { crate::simulate::park(ctx, pending) } {
-            Some(value) => value,
-            None => return TakenBytes(0),
-        }
-    } else {
-        match c.host_runtime().block_on(pending) {
-            Ok(value) => value,
+    if crate::simulate::running_task_of_production(c).is_none() {
+        let runtime = c.host_runtime();
+        return match ply_host::registry::job_bytes(&*runtime, &pending) {
+            Ok(bytes) => c.given(bytes),
             Err(d) => {
                 c.fail(d);
-                return TakenBytes(0);
+                TakenBytes(0)
             }
-        }
+        };
+    }
+    let Some(answered) = (unsafe { crate::simulate::park(ctx, pending) }) else {
+        return TakenBytes(0);
     };
     let c = unsafe { &mut *ctx };
     match &answered {

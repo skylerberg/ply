@@ -1,6 +1,4 @@
-use ply_core::builtins::{Builtin, call};
 use ply_core::sqlite::{Control, Engine, Failure, Limits, Reply, Scalar};
-use ply_core::{Span, Value};
 
 fn roomy() -> Limits {
     Limits {
@@ -617,123 +615,60 @@ fn a_statement_is_read_a_page_at_a_time() {
     );
 }
 
-fn record(fields: &[(&str, Value)]) -> Value {
-    Value::Record(std::sync::Arc::new(
-        fields
-            .iter()
-            .map(|(name, value)| (ply_core::Symbol::new(name), value.clone()))
-            .collect(),
-    ))
-}
-
-fn limits_value() -> Value {
-    record(&[
-        ("sql_bytes", Value::Int(10_000)),
-        ("params", Value::Int(100)),
-        ("rows", Value::Int(1_000)),
-        ("bytes", Value::Int(1_000_000)),
-        ("steps", Value::Int(10_000)),
-    ])
-}
-
-fn param(kind: i64, int: i64, bytes: &[u8]) -> Value {
-    record(&[
-        ("kind", Value::Int(kind)),
-        ("int", Value::Int(int)),
-        ("real", Value::Float(0.0)),
-        ("bytes", Value::bytes(bytes)),
-    ])
-}
-
-fn sqlite_run(image: &Value, sql: &str, params: Vec<Value>, reads_only: bool) -> Value {
-    call(
-        Builtin::SqliteRun,
-        vec![
-            image.clone(),
-            Value::str(sql),
-            Value::list(params),
-            Value::Bool(reads_only),
-            Value::Bool(true),
-            limits_value(),
-        ],
-        Span::DUMMY,
-    )
-    .unwrap()
-}
-
-fn named<'a>(value: &'a Value, name: &str) -> &'a Value {
-    match value {
-        Value::Record(fields) => fields.named(name).unwrap(),
-        other => panic!("no record: {other:?}"),
-    }
+/// One statement over `image` as the twin runs it, every table `STRICT`.
+fn over(image: &[u8], sql: &str, params: &[Scalar], reads_only: bool) -> (Reply, Option<Vec<u8>>) {
+    ply_core::sqlite::run_over(image, sql, params, roomy(), reads_only, true)
 }
 
 #[test]
-fn the_builtin_is_a_function_of_the_image_and_the_statement() {
-    let empty = Value::bytes(b"");
-    let made = sqlite_run(
-        &empty,
-        "CREATE TABLE t (a INTEGER, b TEXT) STRICT",
-        vec![],
-        false,
-    );
-    assert_eq!(named(&made, "failure"), &Value::ctor("None", Vec::new()));
-    let image = named(&made, "image");
-    assert_ne!(image, &empty);
-    let insert = |image: &Value| {
-        sqlite_run(
+fn a_statement_over_an_image_is_a_function_of_the_image_and_the_statement() {
+    let (made, image) = over(b"", "CREATE TABLE t (a INTEGER, b TEXT) STRICT", &[], false);
+    assert_eq!(made.failure, None);
+    let image = image.expect("a table made is an image left");
+    assert!(!image.is_empty());
+    let insert = |image: &[u8]| {
+        over(
             image,
             "INSERT INTO t VALUES (?1, ?2)",
-            vec![param(1, 7, b""), param(3, 0, "seven".as_bytes())],
+            &[Scalar::Int(7), text("seven")],
             false,
         )
     };
-    let once = insert(image);
-    let again = insert(image);
+    let once = insert(&image);
+    let again = insert(&image);
     assert_eq!(once, again);
-    assert_eq!(named(&once, "changed"), &Value::Int(1));
-    assert_eq!(named(&once, "last_row_id"), &Value::Int(1));
+    assert_eq!(once.0.changed, 1);
+    assert_eq!(once.0.last_row_id, 1);
+    let inserted = once.1.expect("a row written is an image left");
 
-    let read = sqlite_run(named(&once, "image"), "SELECT a, b FROM t", vec![], true);
-    assert_eq!(named(&read, "image"), named(&once, "image"));
+    let (read, left) = over(&inserted, "SELECT a, b FROM t", &[], true);
     assert_eq!(
-        named(&read, "columns"),
-        &Value::list(vec![Value::str("a"), Value::str("b")])
+        left, None,
+        "a statement that only reads leaves the image as it was"
     );
-    let Value::List(rows) = named(&read, "rows") else {
-        panic!("no rows")
-    };
-    let Value::List(row) = rows.get(0).unwrap() else {
-        panic!("no row")
-    };
-    assert_eq!(named(row.get(0).unwrap(), "int"), &Value::Int(7));
-    assert_eq!(named(row.get(1).unwrap(), "bytes"), &Value::bytes(b"seven"));
+    assert_eq!(read.columns, ["a", "b"]);
+    assert_eq!(read.rows, [vec![Scalar::Int(7), text("seven")]]);
 
-    let failed = sqlite_run(
-        named(&once, "image"),
+    let (failed, left) = over(
+        &inserted,
         "INSERT INTO t VALUES (random(), 'x')",
-        vec![],
+        &[],
         false,
     );
-    assert_eq!(named(&failed, "image"), named(&once, "image"));
-    assert_ne!(named(&failed, "failure"), &Value::ctor("None", Vec::new()));
+    assert_eq!(left, None);
+    assert!(failed.failure.is_some());
 
-    let unread = sqlite_run(
-        &Value::bytes(b"not a database at all"),
+    let (unread, _) = over(
+        b"not a database at all",
         "SELECT count(*) FROM sqlite_schema",
-        vec![],
+        &[],
         true,
     );
-    assert_ne!(named(&unread, "failure"), &Value::ctor("None", Vec::new()));
+    assert!(unread.failure.is_some());
 }
 
 #[test]
 fn every_admitted_function_is_one_the_engine_has() {
-    let names = call(Builtin::SqliteFunctions, vec![], Span::DUMMY).unwrap();
-    let Value::List(names) = &names else {
-        panic!("no list")
-    };
-    assert_eq!(names.len(), ply_core::sqlite::FUNCTIONS.len());
     let mut sorted = ply_core::sqlite::FUNCTIONS.to_vec();
     sorted.sort_unstable();
     sorted.dedup();

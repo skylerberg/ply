@@ -500,15 +500,12 @@ pub unsafe extern "C" fn rt_ticket_taken(ctx: *mut Ctx, token: I64) -> TakenByte
 }
 
 fn taken(c: &mut Ctx, run: &Run, token: I64) -> TakenBytes {
-    let answer = match run.poll(&ticket(token)) {
-        Ok(Some(ply_core::Value::Bytes(ref bytes))) => bytes.to_vec(),
-        Ok(_) => {
+    let answer = match run.taken(&ticket(token)) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
             c.fail(Diagnostic::error(
                 codes::INTERNAL_ERROR,
-                format!(
-                    "ticket {} was taken before it was answered with bytes",
-                    token.0
-                ),
+                format!("ticket {} was taken before it was answered", token.0),
             ));
             return TakenBytes(0);
         }

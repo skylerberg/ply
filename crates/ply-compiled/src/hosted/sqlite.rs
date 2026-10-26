@@ -1,18 +1,28 @@
 //! `std.sqlite`'s natives: the run's databases, each under the root its label names, every
-//! operation a ticket of a job on the process's waiting pool. What they are handed and answer is
-//! flat as `ply_host::sqlite` reads and writes it.
+//! operation a ticket of a job on the process's waiting pool, and the twin's statement over an
+//! image, which reaches no host. What they are handed and answer is flat as `ply_host::sqlite`
+//! reads and writes it.
 
 use super::{WRITES, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
-use crate::native::{Addr, I64};
+use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
-use ply_core::sqlite::{Control, Limits, Mode, Options, Scalar};
-use ply_host::sqlite::{SqliteHost, limits_read, root_of, scalars_read};
+use ply_core::sqlite::{Control, FUNCTIONS, Limits, Mode, Options, Scalar, run_over};
+use ply_host::native::{found, parts};
+use ply_host::sqlite::{SqliteHost, limits_read, reply_written, root_of, scalars_read};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
+        machine_native(
+            "sqlite_run",
+            rt_sqlite_run as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _, _) -> _,
+        ),
+        machine_native(
+            "sqlite_functions",
+            rt_sqlite_functions as unsafe extern "C" fn(_) -> _,
+        ),
         machine_native(
             "sqlite_open",
             rt_sqlite_open as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _) -> _,
@@ -50,6 +60,50 @@ pub(super) fn natives() -> Vec<MachineNative> {
             rt_sqlite_finish as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
     ]
+}
+
+/// One statement over the database the image at `image_at` holds, as the twin runs it: parts of
+/// the image it left, found where it wrote and kept what it wrote, and its reply. A function of
+/// what it is handed, so it asks the host nothing.
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn rt_sqlite_run(
+    ctx: *mut Ctx,
+    image_at: Addr,
+    image_n: I64,
+    sql_at: Addr,
+    sql_n: I64,
+    params_at: Addr,
+    params_n: I64,
+    reads_only: I64,
+    strict: I64,
+    limits_at: Addr,
+    limits_n: I64,
+) -> TakenBytes {
+    let c = unsafe { &mut *ctx };
+    let Some((sql, params, limits)) = statement(
+        c,
+        "sqlite_run",
+        unsafe { lent(sql_at, sql_n) },
+        unsafe { lent(params_at, params_n) },
+        unsafe { lent(limits_at, limits_n) },
+    ) else {
+        return TakenBytes(0);
+    };
+    let (reply, left) = run_over(
+        unsafe { lent(image_at, image_n) },
+        &sql,
+        &params,
+        limits,
+        reads_only.0 != 0,
+        strict.0 != 0,
+    );
+    c.given(parts(&[&found(left), &reply_written(&reply)]))
+}
+
+/// The SQL functions a statement may call, in order, as parts.
+pub unsafe extern "C" fn rt_sqlite_functions(ctx: *mut Ctx) -> TakenBytes {
+    let names: Vec<&[u8]> = FUNCTIONS.iter().map(|name| name.as_bytes()).collect();
+    unsafe { &mut *ctx }.given(parts(&names))
 }
 
 /// The run's databases and the root the label at `label` names; `None`, with the run failed,
