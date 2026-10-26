@@ -304,9 +304,6 @@ macro_rules! helpers {
 
 helpers! {
     rt_box_decimal(lo, hi) -> Word;
-    rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
-    rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
-    rt_decimal_negate(lo, hi, out);
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
     rt_no_match();
