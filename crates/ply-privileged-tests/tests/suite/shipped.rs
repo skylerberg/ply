@@ -115,8 +115,8 @@ fn the_runtime_describes_each_native_under_the_fields_a_build_reads() {
         (&concat["words"], &concat["answers"], &concat["raises"]),
         (&2.into(), &true.into(), &false.into())
     );
-    let div = named("Decimal::div");
-    assert_eq!((&div["words"], &div["raises"]), (&4.into(), &true.into()));
+    let seal = named("crypto_seal");
+    assert_eq!((&seal["words"], &seal["raises"]), (&5.into(), &true.into()));
     let decode = named("Secret::decode");
     assert_eq!(
         (&decode["words"], &decode["raises"]),

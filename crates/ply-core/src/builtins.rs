@@ -3,8 +3,6 @@
 use crate::semantics::arity_error;
 use crate::value::{Decimal, Fixed, FixedOp, Value, first_difference, type_error, values_equal};
 use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, slot};
-use rust_decimal::RoundingStrategy;
-use rust_decimal::prelude::ToPrimitive;
 
 /// A list this long is a runaway `range`, not an intent.
 const MAX_RANGE_LEN: i64 = 10_000_000;
@@ -12,8 +10,6 @@ const MAX_RANGE_LEN: i64 = 10_000_000;
 /// An array this long is a runaway length, not an intent: half a gigabyte of words.
 pub const MAX_ARRAY_LEN: i64 = 1 << 26;
 
-/// `Decimal`'s scale bound, the type's rather than a policy.
-const MAX_DECIMAL_SCALE: u32 = 28;
 /// Every builtin, once: its name in the prelude, and the type of the function compiled code calls it
 /// through, off which `ply_compiled::native` reads what the runtime reports of it. That function
 /// takes a word for each parameter, witnesses first, and answers a `Raising` where a failure of it is
@@ -92,13 +88,6 @@ builtins! { $
     BytesGzip = "Bytes::gzip" (b) -> Word;
     BytesGunzip = "Bytes::gunzip" (b) -> Word;
     BytesZstd = "Bytes::zstd" (b) -> Word;
-    DecimalDiv = "Decimal::div" (a, b, scale, mode) -> Raising;
-    DecimalRound = "Decimal::round" (d, scale, mode) -> Raising;
-    IntOfDecimal = "Int::of_decimal" (d, mode) -> Word;
-    DecimalOfFloat = "Decimal::of_float" (f) -> Word;
-    DecimalOfString = "Decimal::of_string" (s) -> Word;
-    /// The lexer's float parse over text, reaching `Float`s no route through `Decimal` does.
-    DecimalToString = "Decimal::to_string" (d) -> Word;
     Compare = "compare" (x, y) -> Word;
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues = "compare_values" (x, y) -> Word;
@@ -142,9 +131,6 @@ builtins! { $
     NumericOfInt = "numeric_of_int" (witness, n) -> Raising;
     /// `to_int(x)`, called with the witness the elaboration passes first.
     ToInt = "to_int" (witness, x) -> Word;
-    /// `None` for a NaN, an infinity, or a value past `Int` once rounded.
-    IntOfFloat = "Int::of_float" (x, mode) -> Word;
-    Round = "Float::round" (x, mode) -> Word;
     /// Bytes as a credential, and what is made of one without opening it.
     SecretOfBytes = "Secret::of_bytes" (b) -> Word;
     SecretBytes = "Secret::bytes" (s) -> Word;
@@ -574,15 +560,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
                 .map(Value::Int),
             other => Some(Value::Int(other.as_int(span, "`to_int`")?)),
         })),
-        Builtin::IntOfFloat => {
-            let x = args[0].as_float(span, "`Int::of_float`")?;
-            let r = rounded(x, rounding(&args[1], span, "Int::of_float")?);
-            Ok(option(int_of_whole(r).map(Value::Int)))
-        }
-        Builtin::Round => {
-            let x = args[0].as_float(span, "`Float::round`")?;
-            Ok(Value::Float(rounded(x, rounding(&args[1], span, "round")?)))
-        }
         // The order `Map` iterates in, so a derived `OrdDict` and map key order cannot drift.
         Builtin::Compare | Builtin::CompareValues => {
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
@@ -595,52 +572,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
                 },
                 Vec::new(),
             ))
-        }
-
-        Builtin::DecimalDiv => {
-            let a = args[0].as_decimal(span, "`Decimal::div`")?;
-            let b = args[1].as_decimal(span, "`Decimal::div`")?;
-            let scale = decimal_scale(&args[2], span, "Decimal::div")?;
-            let mode = rounding(&args[3], span, "Decimal::div")?;
-            if b.is_zero() {
-                return Err(crate::semantics::err_zero_divisor(span, "`Decimal::div`"));
-            }
-            decimal_quotient(a, b, scale, mode)
-                .map(Value::Decimal)
-                .ok_or_else(|| decimal_overflow(span, "division"))
-        }
-
-        Builtin::DecimalRound => {
-            let d = args[0].as_decimal(span, "`Decimal::round`")?;
-            let scale = decimal_scale(&args[1], span, "Decimal::round")?;
-            let mode = rounding(&args[2], span, "Decimal::round")?;
-            decimal_quotient(d, Decimal::ONE, scale, mode)
-                .map(Value::Decimal)
-                .ok_or_else(|| decimal_overflow(span, "rounding"))
-        }
-
-        Builtin::IntOfDecimal => {
-            let d = args[0].as_decimal(span, "`Int::of_decimal`")?;
-            let mode = rounding(&args[1], span, "Int::of_decimal")?;
-            Ok(option(
-                d.round_dp_with_strategy(0, mode).to_i64().map(Value::Int),
-            ))
-        }
-
-        Builtin::DecimalOfFloat => {
-            let f = args[0].as_float(span, "`Decimal::of_float`")?;
-            Ok(option(decimal_of_float(f).map(Value::Decimal)))
-        }
-
-        Builtin::DecimalOfString => {
-            let s = args[0].as_str(span, "`Decimal::of_string`")?;
-            Ok(option(parse_decimal(s).map(Value::Decimal)))
-        }
-
-        // Keeps the scale (`1.50m` renders `1.50`), so it round-trips `Decimal::of_string`.
-        Builtin::DecimalToString => {
-            let d = args[0].as_decimal(span, "`Decimal::to_string`")?;
-            Ok(Value::str(d.to_string()))
         }
 
         Builtin::Observe => {
@@ -712,158 +643,8 @@ fn option(v: Option<Value>) -> Value {
     }
 }
 
-/// `x` at a whole number, chosen as `mode` chooses a decimal's last digit.
-fn rounded(x: f64, mode: RoundingStrategy) -> f64 {
-    if !x.is_finite() {
-        return x;
-    }
-    match mode {
-        RoundingStrategy::MidpointAwayFromZero => x.round(),
-        RoundingStrategy::ToZero => x.trunc(),
-        RoundingStrategy::AwayFromZero if x.fract() != 0.0 => x.trunc() + x.signum(),
-        RoundingStrategy::AwayFromZero => x,
-        RoundingStrategy::ToPositiveInfinity => x.ceil(),
-        RoundingStrategy::ToNegativeInfinity => x.floor(),
-        _ => x.round_ties_even(),
-    }
-}
-
-/// A whole float as an `Int`, when one holds it.
-fn int_of_whole(x: f64) -> Option<i64> {
-    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
-    (x.is_finite() && (-LIMIT..LIMIT).contains(&x)).then_some(x as i64)
-}
-
-fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagnostic> {
-    let name = match v {
-        Value::Ctor { name, args } if args.is_empty() => name.as_str(),
-        other => return Err(type_error(span, &format!("`{what}`"), "Rounding", other)),
-    };
-    match name {
-        "HalfEven" => Ok(RoundingStrategy::MidpointNearestEven),
-        "HalfUp" => Ok(RoundingStrategy::MidpointAwayFromZero),
-        "Down" => Ok(RoundingStrategy::ToZero),
-        "Up" => Ok(RoundingStrategy::AwayFromZero),
-        "Ceiling" => Ok(RoundingStrategy::ToPositiveInfinity),
-        "Floor" => Ok(RoundingStrategy::ToNegativeInfinity),
-        other => Err(Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("`{other}` is not a rounding mode"),
-        )
-        .primary(span, format!("`{what}` was given `{other}`"))
-        .note("the modes are `HalfEven`, `HalfUp`, `Down`, `Up`, `Ceiling` and `Floor`")),
-    }
-}
-
-/// A scale argument, refused outside `0..=28` rather than clamped.
-fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
-    let scale = int_arg(v, span, what)?;
-    u32::try_from(scale)
-        .ok()
-        .filter(|s| *s <= MAX_DECIMAL_SCALE)
-        .ok_or_else(|| {
-            Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                format!("`{what}` needs a scale in 0..={MAX_DECIMAL_SCALE}, not {scale}"),
-            )
-            .primary(span, "`Decimal` holds at most 28 decimal places")
-        })
-}
-
-/// `a / b`, for a `b` that is not zero, with exactly `scale` digits after the point: the exact
-/// quotient rounded once, there, by `mode`. `None` where that mantissa is past 96 bits.
-///
-/// The mantissas are divided as whole numbers, a digit at a time, so no digit past the last one
-/// kept is rounded before `mode` reads what is left over.
-fn decimal_quotient(a: Decimal, b: Decimal, scale: u32, mode: RoundingStrategy) -> Option<Decimal> {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    const LIMIT: u128 = 1 << 96;
-    let negative = a.is_sign_negative() != b.is_sign_negative();
-    let (dividend, divisor) = (a.mantissa().unsigned_abs(), b.mantissa().unsigned_abs());
-    // The answer's mantissa is `dividend * 10^shift / divisor`.
-    let shift = i64::from(scale) + i64::from(b.scale()) - i64::from(a.scale());
-    let (mut quotient, mut rest) = (dividend / divisor, dividend % divisor);
-    // What the quotient leaves out, against half a unit of its last digit.
-    let (exact, half) = if shift >= 0 {
-        for _ in 0..shift {
-            // `rest` is below `divisor`, which is below 2^96, so neither product wraps.
-            rest *= 10;
-            quotient = quotient * 10 + rest / divisor;
-            rest %= divisor;
-            if quotient >= LIMIT {
-                return None;
-            }
-        }
-        (rest == 0, (rest * 2).cmp(&divisor))
-    } else {
-        let unit = 10u128.pow(u32::try_from(-shift).ok()?);
-        let dropped = quotient % unit;
-        quotient /= unit;
-        let half = match dropped.cmp(&(unit / 2)) {
-            Equal if rest > 0 => Greater,
-            other => other,
-        };
-        (dropped == 0 && rest == 0, half)
-    };
-    let away = !exact
-        && match mode {
-            RoundingStrategy::ToZero => false,
-            RoundingStrategy::AwayFromZero => true,
-            RoundingStrategy::ToPositiveInfinity => !negative,
-            RoundingStrategy::ToNegativeInfinity => negative,
-            RoundingStrategy::MidpointAwayFromZero => half != Less,
-            _ => half == Greater || (half == Equal && quotient % 2 == 1),
-        };
-    let mantissa = i128::try_from(quotient + u128::from(away)).ok()?;
-    Decimal::try_from_i128_with_scale(if negative { -mantissa } else { mantissa }, scale).ok()
-}
-
-fn decimal_overflow(span: Span, what: &str) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("`Decimal` overflow in {what}"),
-    )
-    .primary(span, "the result needs more than 96 bits of mantissa")
-    .note("`Decimal` is exact and bounded; it will not round to make room")
-}
-
-/// The shortest decimal that round-trips the float; `None` if non-finite or out of range.
-fn decimal_of_float(f: f64) -> Option<Decimal> {
-    if !f.is_finite() {
-        return None;
-    }
-    parse_decimal(&format!("{f}"))
-}
-
-/// The nearest `f64`, so `Float::of_decimal(decimal_of_float(f)) == f` wherever defined.
-pub fn float_of_decimal(d: Decimal) -> f64 {
-    d.to_string()
-        .parse::<f64>()
-        .unwrap_or_else(|_| d.to_f64().unwrap_or(f64::NAN))
-}
-
-fn parse_decimal(text: &str) -> Option<Decimal> {
-    if text.contains(['e', 'E']) {
-        Decimal::from_scientific(text).ok()
-    } else {
-        Decimal::from_str_exact(text).ok()
-    }
-}
-
 pub fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
     &hay[from..hay.len().min(from.saturating_add(max))]
-}
-
-fn int_arg(v: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
-    match v {
-        Value::Int(i) => Ok(*i),
-        other => Err(crate::value::type_error(
-            span,
-            &format!("`{what}`"),
-            "Int",
-            other,
-        )),
-    }
 }
 
 pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnostic {
