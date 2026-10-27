@@ -60,10 +60,23 @@ pub type Opened = {
   unit: Bytes,
 }
 
-/// The runnable section: the entry point the artifact runs, and what running it reads.
-type Carried = { entry: String, runnable: Runnable }
+/// The runnable section: the entry point the artifact runs, the digest of the namespace and the
+/// closure it was made from (`made_from`), and what running it reads.
+type Carried = { entry: String, made_from: Bytes, runnable: Runnable }
 
 derive bin for Carried
+
+/// The digest of the sections a runnable is made from, the namespace and the closure, as
+/// `payload_of` reads each by its name: what the runnable is held to.
+fn made_from(payload_of: (Bytes) -> Bytes) -> Bytes / {abort.raise} =
+  blake3(
+    Bytes::concat_all(
+      [b"names", b"strings", b"closure"].map(|name: Bytes| {
+        let p = payload_of(name);
+        Bytes::concat_all([u32_le(name.len()), name, u32_le(p.len()), p])
+      }),
+    ),
+  )
 
 /// What a build asks of its artifacts: one made from the program, an earlier one read back, and a
 /// library's unit. `deploying` answers it with this module; a test answers it with what it reports.
@@ -509,8 +522,17 @@ pub fn made(
                         Some(h) -> h,
                         None -> b"",
                       };
+                      let held = named_sections(pairs).push(closure_section(files));
                       let runnable = bin::encode(
-                        { entry: entry, runnable: entries::runnable_of(again, roots) },
+                        {
+                          entry: entry,
+                          made_from: made_from(|name: Bytes|
+                            match held.find(|s: Section| s.name == name) {
+                              Some(s) -> s.payload,
+                              None -> b"",
+                            }),
+                          runnable: entries::runnable_of(again, roots),
+                        },
                         carried_bin(),
                       );
                       Ok({
@@ -520,9 +542,8 @@ pub fn made(
                         head: head_of(entry_hash),
                         sections: append_all([
                           [bodies_section(bodies)],
-                          named_sections(pairs),
+                          held,
                           [
-                            closure_section(files),
                             { name: b"runnable", count: 1, payload: runnable },
                             { name: b"unit", count: 1, payload: unit.gzip() },
                           ],
@@ -803,7 +824,16 @@ pub fn opened(
                           ),
                         [e, ..] -> match ((
                             payload(b, u).gunzip(),
-                            carried(path, payload(b, r), e.name),
+                            carried(
+                              path,
+                              payload(b, r),
+                              e.name,
+                              made_from(|name: Bytes|
+                                match placed_named(o.sections, name) {
+                                  Some(p) -> payload(b, p),
+                                  None -> b"",
+                                }),
+                            ),
                           )) {
                           (None, _) ->
                             Err(invalid(path, "the artifact's unit does not inflate", [])),
@@ -831,8 +861,14 @@ pub fn opened(
     },
   }
 
-/// The runnable section `bytes`, held to the entry point `entry` the namespace names.
-fn carried(path: String, bytes: Bytes, entry: String) -> Result<Runnable, Diag> / {abort.raise} =
+/// The runnable section `bytes`, held to the entry point `entry` the namespace names and to the
+/// namespace and closure the artifact holds, whose digest is `held` (`made_from`).
+fn carried(
+  path: String,
+  bytes: Bytes,
+  entry: String,
+  held: Bytes,
+) -> Result<Runnable, Diag> / {abort.raise} =
   match bin::decode(bytes, carried_bin()) {
     Err(why) -> Err(invalid(path, "the artifact's runnable does not read: " ++ why.message, [])),
     Ok(c) -> if c.entry != entry {
@@ -841,6 +877,14 @@ fn carried(path: String, bytes: Bytes, entry: String) -> Result<Runnable, Diag> 
           path,
           "the artifact's runnable enters `" ++ c.entry ++ "`, and its namespace names `" ++ entry
             ++ "`",
+          [],
+        ),
+      )
+    } else if c.made_from != held {
+      Err(
+        invalid(
+          path,
+          "the artifact's runnable was made from another namespace or closure than it holds",
           [],
         ),
       )
