@@ -514,16 +514,17 @@ type Class =
   | CRecord(List<Field>)
   | CWord(Type)
 
-/// Whether `==` of two values of `t` is built: no part of it is a type variable or a value only the
-/// runtime reads (a runtime object or an extern type) but a secret. A function part compares by
-/// failing the run, as `==` at a type variable a function fills does, and a sum stating a `key`
-/// compares through it alone.
-pub fn equality_built(ctors: Ctors, t: Type) -> Bool / {abort.raise} =
+/// Whether `==` of two values of `t` is built, or `compare` where `order`: no part of it is a type
+/// variable or a value only the runtime reads (a runtime object or an extern type) but a kept value,
+/// which compares as what it keeps does, and a secret, which only `==` compares. A function part
+/// compares for equality by failing the run, as `==` at a type variable a function fills does, and
+/// orders not at all; a sum stating a `key` compares through it alone.
+pub fn comparison_built(ctors: Ctors, t: Type, order: Bool) -> Bool / {abort.raise} =
   iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
     match s.todo {
       [] -> Stop(true),
       [x, ..rest] -> match x {
-        TyFn(_) -> Continue({ ..s, todo: rest }),
+        TyFn(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
         _ -> match class_of(ctors, x) {
           CRecord(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
           CWalked(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
@@ -542,9 +543,9 @@ pub fn equality_built(ctors: Ctors, t: Type) -> Bool / {abort.raise} =
             },
             _ -> Continue({ ..s, todo: rest }),
           },
-          CWord(w) -> if is_secret(w) || w == named_type(b"Unit") || w == TyRecord([]) {
-            Continue({ ..s, todo: rest })
-          } else { Stop(false) },
+          CWord(w) -> if w == kept_type() || w == named_type(b"Unit") || w == TyRecord([])
+              || (!order && is_secret(w)) { Continue({ ..s, todo: rest }) }
+          else { Stop(false) },
           _ -> Continue({ ..s, todo: rest }),
         },
       },
@@ -699,19 +700,37 @@ fn ordered(
 ) -> Lowered / {abort.raise} = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
   let order = answer_of(cx, name, ty, named_type(b"Ordering"));
-  match by_root(cx, st, ty, a, b, at) {
-    Some(o) -> o,
-    None -> {
-      let made = |s: Lowered|
-        bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
-      match class_of(cx.setting.ctors, ty) {
+  let made = |s: Lowered|
+    bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
+  if ty == kept_type() { made(kept_sign(st, a, b, at)) } else {
+    match by_root(cx, st, ty, a, b, at) {
+      Some(o) -> o,
+      None -> match class_of(cx.setting.ctors, ty) {
         CRecord(fs) -> made(fields_order(cx, st, fs, a, b, at)),
         c -> if c_orders(c, ty) {
           made(sign_at(cx, { st: st, arg: a }, { st: st, arg: b }, ty, at))
         } else { through_runtime(cx, needing(st, ty, true), name, [a, b], order, at) },
-      }
-    },
+      },
+    }
   }
+}
+
+/// The sign of the order of two kept values `a` and `b`, as their type orders what they keep: the
+/// runtime's `?kept_order`, borrowing both.
+fn kept_sign(st: Lowering, a: Arg, b: Arg, at: Span) -> Lowered = {
+  let l = handed({ st: st, arg: a }, RWord, at);
+  let r = handed({ st: l.st, arg: b }, RWord, at);
+  bound_as(
+    r.st,
+    named_type(b"Int"),
+    RInt,
+    Native({
+      name: b"builtin_elaborated_kept_order_p",
+      args: [l.arg, r.arg],
+      uses: { takes: [false, false], owned: true, fails: true, stops: false },
+    }),
+    at,
+  )
 }
 
 /// `max(a, b)`, or `min(a, b)` where not `most`: the one `compare` orders last or first, `a` where
@@ -783,7 +802,8 @@ fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered /
       CWidth(w) -> over(cx, l, r, b"order", width_held(w), int, at),
       CDec -> over(cx, l, r, b"order", RDec, int, at),
       CText -> over(cx, l, r, b"bytes_order", RWord, int, at),
-      CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } } else {
+      CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } }
+      else if t == kept_type() { kept_sign(r.st, l.arg, r.arg, at) } else {
         signed(
           through_runtime(
             cx,

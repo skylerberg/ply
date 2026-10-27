@@ -18,11 +18,11 @@ import std.bytes (ascii_of_int)
 import compiler.emit.c (KBool, KBoxed, KInt, width_named)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Written, TypeOp, Reflect, Shown, Digest, Contained, Lower, Lift,
-                           root_name, root_text, op_name)
+                           Keeping, Opening, root_name, root_text, op_name)
 import compiler.emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of, runtime_object)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.lower.setting (prelude_ctor)
-import compiler.emit.marks (marked_type, marked_key, plain)
+import compiler.emit.marks (marked_type, marked_key, plain, kept_form, marked)
 import compiler.store.hash.template (written_code)
 
 // --- Externs written in place -----------------------------------------------------
@@ -130,14 +130,16 @@ fn crossing_loops() -> List<Bytes> =
 /// Whether the root of `Contained(op)` is written: a walk or a strings root `container_code` writes,
 /// or a crossing's loop `crossing_root` writes.
 pub fn contained_formed(op: Bytes) -> Bool =
-  walk_ops().contains(op) || crossing_loops().contains(op) || strings_root(op)
+  walk_ops().contains(op) || crossing_loops().contains(op) || kept_loops().contains(op)
+    || strings_root(op)
 
 /// Whether the root of `Contained(op)` only reads its operand `k`: a walk reads its containers and
 /// its index, but a gathering walk takes the list it gathers onto; a loop writing a container's items
 /// into a lowering reads its operands, and one reading them from a lifting takes the container it
-/// adds to.
+/// adds to; a keeping's or an opening's loop reads what it walks and takes what it makes.
 pub fn contained_reads(op: Bytes, k: Int) -> Bool =
   if gathering_walks().contains(op) { k != 1 }
+  else if kept_loops().contains(op) { k != 1 }
   else { walk_ops().contains(op) || op == b"lower_items" || op == b"lower_entries" }
 
 /// Each root written for containers of type `t` in `module`, as a definition of the module, so a
@@ -862,6 +864,13 @@ pub fn compared_code() -> WrittenCode =
     rows: Map::new(),
   }
 
+/// The body of `T#cmp` for a type `ty` no sum names, as lowered code over its two parameters:
+/// `compare(a, b)`, which orders them as `compare` at `ty` does.
+pub fn ordered_code(ty: Type) -> WrittenCode = {
+  let c = call_at(writing(), b"compare", [slot_code(b"a", 0), slot_code(b"b", 1)], [ty]);
+  { code: c.code, typed: c.w.typed, rows: c.w.rows }
+}
+
 /// The body of `T#cmp` for a sum of constructors `cs`, as lowered code over its two parameters, and
 /// the binder and call types it files: as the evaluator orders two constructors' values, by the
 /// constructors' names and then by each argument in turn as its type orders.
@@ -1320,15 +1329,23 @@ pub fn reflection_code(
 // --- Crossings --------------------------------------------------------------------------------
 
 /// Whether root `op` of a type is one a crossing runs, which `crossing_root` writes: a lowering, a
-/// lifting, or a loop of one over a container's items.
+/// lifting, a keeping or an opening, or a loop of one over a container's items.
 pub fn crossing_op(op: TypeOp) -> Bool =
-  match op { Lower -> true, Lift -> true, Contained(c) -> crossing_loops().contains(c), _ -> false }
+  match op {
+    Lower -> true,
+    Lift -> true,
+    Keeping -> true,
+    Opening -> true,
+    Contained(c) -> crossing_loops().contains(c) || kept_loops().contains(c),
+    _ -> false,
+  }
 
 /// The root `key`, written in `module`, a crossing runs: `lower#T`, which writes the `T` it reads
 /// into the innermost lowering as PLV1 holds it and answers `()`; `lift#T`, which reads a `T` from
-/// the innermost lifting and answers it as compiled code makes one; or a loop of one over a
-/// container's items (`crossing_loop`). The places of `T` the key marks cross carried: a value the
-/// runtime keeps with its type, as `HANDLE`, rather than reads.
+/// the innermost lifting and answers it as compiled code makes one; `keeping#T` and `opening#T`
+/// (`kept_code`); or a loop of one over a container's items (`crossing_loop`, `kept_loop`). The
+/// places of `T` the key marks cross carried: a value the runtime keeps with its type, as `HANDLE`,
+/// rather than reads.
 pub fn crossing_root(module: Bytes, ctors: Ctors, key: RootKey) -> WrittenRoot / {abort.raise} =
   match key {
     Written(w, _) -> {
@@ -1336,7 +1353,18 @@ pub fn crossing_root(module: Bytes, ctors: Ctors, key: RootKey) -> WrittenRoot /
       match w.op {
         Lower -> rooted_at(module, key, [w.ty], unit_type(), lowering_code(module, ctors, marked)),
         Lift -> rooted_at(module, key, [], w.ty, lifting_code(module, ctors, marked)),
-        Contained(c) -> match crossing_loop(module, c, w.ty, marked) {
+        Keeping ->
+          rooted_at(module, key, [w.ty], kept_form(marked), kept_code(module, ctors, marked, true)),
+        Opening ->
+          rooted_at(
+            module,
+            key,
+            [kept_form(marked)],
+            w.ty,
+            kept_code(module, ctors, marked, false),
+          ),
+        Contained(c) -> match if kept_loops().contains(c) { kept_loop(module, c, marked) }
+          else { crossing_loop(module, c, w.ty, marked) } {
           Some(r) -> r,
           None -> unwritten(module, key, b"a root no crossing runs"),
         },
@@ -1345,6 +1373,255 @@ pub fn crossing_root(module: Bytes, ctors: Ctors, key: RootKey) -> WrittenRoot /
     },
     _ -> unwritten(module, key, b"a root no crossing runs"),
   }
+
+// --- Kept crossings --------------------------------------------------------------------------------
+
+// A perform of an operation a program declares hands its clause, compiled once for every perform,
+// each value at a place its operation's own type parameters stand kept (`kept_form`), and opens
+// what the clause answers there: `keeping#T` and `opening#T`, marked at those places, make one form
+// of the other part by part.
+
+/// The loops a keeping or an opening runs over a container's items or a map's entries, into the
+/// list or map it makes.
+fn kept_loops() -> List<Bytes> =
+  [b"keeping_items", b"opening_items", b"keeping_entries", b"opening_entries"]
+
+/// The form a value of the marked type `ty` takes on the side `keeping` names: where a keeping
+/// starts, or an opening ends, its own; else the one its marked places kept.
+fn kept_side(ty: Type, kept: Bool) -> Type / {abort.raise} =
+  if kept { kept_form(ty) } else { plain(ty) }
+
+/// `x`, a part of the marked type `ty`, made into its other form: unchanged where `ty` marks no
+/// place, else by `?keeping` or `?opening` at `ty`, which the part's own root answers.
+fn kept_part(w: Writing, x: Code, ty: Type, keeping: Bool) -> { code: Code, w: Writing } =
+  if !marked(ty) { { code: x, w: w } }
+  else { call_at(w, if keeping { b"?keeping" } else { b"?opening" }, [x], [ty]) }
+
+/// The body of `keeping#T` (`keeping`) or `opening#T` over its parameter `a`, `ty` marked at the
+/// places kept: at a marked place, the value kept beside its type's descriptor (`?keep`) or what
+/// it keeps opened (`?open`); a record field by field; a sum's constructor with its arguments; a
+/// list, an array or a map item by item through a loop (`kept_loop`); a function wrapped, so the
+/// clause calls it with values kept and is answered one, its parameters made the other way: an
+/// operation generic in its own type parameters takes no row parameter, so a function it is handed
+/// performs nothing, and nor does the wrapper. A runtime object and a type variable are refused:
+/// neither has a place a perform crosses at alone.
+fn kept_code(
+  module: Bytes,
+  ctors: Ctors,
+  ty: Type,
+  keeping: Bool,
+) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
+  let a = slot_code(b"a", 0);
+  let w = writing();
+  let into = kept_side(ty, keeping);
+  let refused = |why: Bytes| { code: Err(why), w: w, here: [] };
+  let items_op = if keeping { b"keeping_items" } else { b"opening_items" };
+  // The items of the container `over` made into the list `listed` (marked) is made of, from empty.
+  let looped = |over: Type, listed: Type| {
+    let loop = marked_key(Contained(items_op), over, module);
+    let out = kept_side(listed, keeping);
+    let empty = filing(w, filed_as(out, []));
+    {
+      code: Ok(
+        call_of(module, loop, [a, { node: NList({ items: [] }), span: empty.span }, int_code(0)]),
+      ),
+      w: empty.w,
+      here: [def_of(module, loop, [kept_side(over, !keeping), out, int_type()], out)],
+    }
+  };
+  match ty {
+    TyCon(c) -> if c.name == b"^" && c.args.len() == 1 {
+      let leaf = call_at(w, if keeping { b"?keep" } else { b"?open" }, [a], [c.args.get(0)]);
+      { code: Ok(leaf.code), w: leaf.w, here: [] }
+    } else if !marked(ty) { { code: Ok(a), w: w, here: [] } }
+    else if c.name == b"List" && c.args.len() == 1 { looped(ty, ty) }
+    else if c.name == b"Array" && c.args.len() == 1 {
+      let items = looped(ty, list_type(c.args.get(0)));
+      match items.code {
+        Ok(code) -> {
+          let made = call_at(items.w, b"Array::of_list", [code], [
+            kept_side(c.args.get(0), keeping),
+          ]);
+          { code: Ok(made.code), w: made.w, here: items.here }
+        },
+        Err(_) -> items,
+      }
+    } else if c.name == b"Map" && c.args.len() == 2 {
+      let entries = list_type(
+        TyRecord([{ name: b"key", ty: c.args.get(0) }, { name: b"value", ty: c.args.get(1) }]),
+      );
+      let from = kept_side(ty, !keeping);
+      let listed = call_at(w, b"Map::entries", [a], match from { TyCon(f) -> f.args, _ -> [] });
+      let fresh = call_at(listed.w, b"Map::new", [], match into { TyCon(i) -> i.args, _ -> [] });
+      let loop = marked_key(
+        Contained(if keeping { b"keeping_entries" } else { b"opening_entries" }),
+        entries,
+        module,
+      );
+      {
+        code: Ok(call_of(module, loop, [listed.code, fresh.code, int_code(0)])),
+        w: fresh.w,
+        here: [def_of(module, loop, [kept_side(entries, !keeping), into, int_type()], into)],
+      }
+    } else if runtime_object(c.name) {
+      refused(b"a value of a runtime object an operation's own type parameter stands in")
+    } else {
+      match ctors.sums.get(c.name) {
+        None -> refused(b"a kept crossing of a type no root writes: ".concat(c.name)),
+        Some(cs) -> {
+          let arms = cs.fold(
+            { arms: [], w: w, slot: 1 },
+            |acc: { arms: List<CodeArm>, w: Writing, slot: Int }, sc: SumCtor| {
+              let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
+              let bound = range(0, args.len()).fold(
+                { pats: [], parts: [], w: acc.w },
+                |b: { pats: List<CodePattern>, parts: List<Code>, w: Writing }, j: Int| {
+                  let name = b"x".concat(ascii_of_int(j));
+                  let binder = filing(b.w, filed_as(kept_side(args.get(j), !keeping), []));
+                  let part = kept_part(
+                    binder.w,
+                    slot_code(name, acc.slot + j),
+                    args.get(j),
+                    keeping,
+                  );
+                  {
+                    pats: b.pats.push(
+                      PxVar({ name: name, slot: Some(acc.slot + j), span: binder.span }),
+                    ),
+                    parts: b.parts.push(part.code),
+                    w: part.w,
+                  }
+                },
+              );
+              let ctor = filing(bound.w, filed_as(into, []));
+              let named = {
+                node: NVar({ name: written_ctor(sc.name), slot: None }),
+                span: ctor.span,
+              };
+              {
+                arms: acc.arms.push({
+                  pat: PxCtor({ name: written_ctor(sc.name), args: bound.pats }),
+                  guard: None,
+                  body: if args.len() == 0 { named }
+                  else { bare(NApp({ func: named, args: bound.parts })) },
+                }),
+                w: ctor.w,
+                slot: acc.slot + args.len(),
+              }
+            },
+          );
+          { code: Ok(bare(NMatch({ scrutinee: a, arms: arms.arms }))), w: arms.w, here: [] }
+        },
+      }
+    },
+    TyRecord(fs) -> kept_record(a, fs, into, keeping, w),
+    TyNominal(x) -> kept_record(a, x.fields, into, keeping, w),
+    TyFn(f) -> kept_function(f.params, f.ret, kept_side(ty, !keeping), into, keeping, w),
+    TyVar(_) -> refused(b"a kept crossing at a type variable"),
+  }
+}
+
+/// A record of fields `fields` (each marked) made into its other form `into`, field by field.
+fn kept_record(
+  a: Code,
+  fields: List<Field>,
+  into: Type,
+  keeping: Bool,
+  w: Writing,
+) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
+  let made = fields.fold(
+    { fields: [], w: w },
+    |acc: { fields: List<CodeField>, w: Writing }, f: Field| {
+      let part = kept_part(acc.w, bare(NField({ base: a, field: f.name })), f.ty, keeping);
+      { fields: acc.fields.push({ name: f.name, value: part.code }), w: part.w }
+    },
+  );
+  let record = filing(made.w, filed_as(into, []));
+  { code: Ok({ node: NRecord({ fields: made.fields }), span: record.span }), w: record.w, here: [] }
+}
+
+/// The function `a` (slot 0), of form `from`, parameters `params` and answer `ret` (each marked),
+/// wrapped into its other form `into`: a closure over `a` that makes each argument the other way,
+/// calls `a`, and makes its answer this way.
+fn kept_function(
+  params: List<Type>,
+  ret: Type,
+  from: Type,
+  into: Type,
+  keeping: Bool,
+  w: Writing,
+) -> { code: Result<Code, Bytes>, w: Writing, here: List<Def> } / {abort.raise} = {
+  let n = params.len();
+  let args = range(0, n).fold(
+    { codes: [], w: w },
+    |acc: { codes: List<Code>, w: Writing }, j: Int| {
+      let p = kept_part(acc.w, slot_code(b"p".concat(ascii_of_int(j)), j), params.get(j), !keeping);
+      { codes: acc.codes.push(p.code), w: p.w }
+    },
+  );
+  // The closure reads `a` as its capture, at the type the root takes it.
+  let f = typed_slot(args.w, b"f", n, from);
+  let called = bare(NApp({ func: f.code, args: args.codes }));
+  let answer = kept_part(f.w, called, ret, keeping);
+  let lambda = filing(answer.w, filed_as(into, []));
+  {
+    code: Ok({
+      node: NLambda({
+        params: n,
+        size: n + 1,
+        captures: [{ src: 0, dst: n }],
+        body: answer.code,
+        at: lambda.span,
+      }),
+      span: lambda.span,
+    }),
+    w: rows_at(lambda.w, lambda.span, Performs({ atoms: [], tail: None })),
+    here: [],
+  }
+}
+
+/// The loop `op` (one of `kept_loops`) over the container of type `over`, marked, where `op` names
+/// one: over its parameters `a`, the items or entries, `out`, what is made so far, and `i`, the
+/// place reached, each item from `i` on made into its other form and pushed onto `out`, or each
+/// entry's key and value inserted into it.
+fn kept_loop(module: Bytes, op: Bytes, over: Type) -> Option<WrittenRoot> / {abort.raise} = {
+  let keeping = op.starts_with(b"keeping");
+  let key = marked_key(Contained(op), over, module);
+  let a = slot_code(b"a", 0);
+  let out = slot_code(b"out", 1);
+  let i = slot_code(b"i", 2);
+  let from = kept_side(over, !keeping);
+  let next = |made: Code| call_of(module, key, [a, made, binary_of(b"add", i, int_code(1))]);
+  match item_of(over) {
+    None -> None,
+    Some(item) -> {
+      let container = match over { TyCon(c) -> c.name, _ -> b"List" };
+      let at = call_at(writing(), container.concat(b"::at"), [a, i], [kept_side(item, !keeping)]);
+      let binder = filing(at.w, filed_as(kept_side(item, !keeping), []));
+      let x = slot_code(b"x", 3);
+      let body = if op.ends_with(b"entries") {
+        let key_type = field_of(item, b"key");
+        let value_type = field_of(item, b"value");
+        let k = kept_part(binder.w, bare(NField({ base: x, field: b"key" })), key_type, keeping);
+        let v = kept_part(k.w, bare(NField({ base: x, field: b"value" })), value_type, keeping);
+        let both = [kept_side(key_type, keeping), kept_side(value_type, keeping)];
+        let inserted = call_at(v.w, b"Map::insert", [out, k.code, v.code], both);
+        { code: inserted.code, w: inserted.w, into: TyCon({ name: b"Map", args: both }) }
+      } else {
+        let made = kept_part(binder.w, x, item, keeping);
+        let pushed = call_at(made.w, b"List::push", [out, made.code], [kept_side(item, keeping)]);
+        { code: pushed.code, w: pushed.w, into: kept_side(list_type(item), keeping) }
+      };
+      Some(
+        rooted_at(module, key, [from, body.into, int_type()], body.into, {
+          code: Ok(some_or(at.code, b"x", 3, binder.span, next(body.code), out)),
+          w: body.w,
+          here: [],
+        }),
+      )
+    },
+  }
+}
 
 /// Root `key` refused, saying why.
 fn unwritten(module: Bytes, key: RootKey, why: Bytes) -> WrittenRoot / {abort.raise} =
@@ -2156,7 +2433,8 @@ fn rooted_at(
 fn param_name(key: RootKey, i: Int) -> Bytes =
   match key {
     Written(w, _) -> match w.op {
-      Contained(c) -> if i == 1 { if c.starts_with(b"lift") { b"n" } else { b"i" } }
+      Contained(c) -> if kept_loops().contains(c) { match i { 0 -> b"a", 1 -> b"out", _ -> b"i" } }
+      else if i == 1 { if c.starts_with(b"lift") { b"n" } else { b"i" } }
       else if c == b"lower_entries" { b"es" }
       else if c == b"lift_items" { b"acc" }
       else if c == b"lift_entries" { b"m" }

@@ -199,13 +199,16 @@ pub struct PlyType {
 unsafe impl Sync for PlyType {}
 
 /// `kept#T`: what a value a perform hands a program's clause is kept beside, static data emitted
-/// code lays out: its type's descriptor, and the entry comparing two of its values.
+/// code lays out: its type's descriptor, and the entries comparing two of its values.
 #[repr(C)]
 pub struct PlyKept {
     pub ty: *const PlyType,
     /// 1 where two values of the type, each a word form it borrows, are equal, else 0; none where
     /// `==` is not built at the type.
     pub equal: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
+    /// The sign of the order of two values of the type, each a word form it borrows; none where
+    /// `compare` is not built at the type.
+    pub order: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
 }
 
 // SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.

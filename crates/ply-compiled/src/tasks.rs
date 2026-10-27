@@ -432,6 +432,10 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
             rt_kept_equal as unsafe extern "C" fn(_, _, _) -> _,
         ),
         n(
+            "?kept_order",
+            rt_kept_order as unsafe extern "C" fn(_, _, _) -> _,
+        ),
+        n(
             "stacks_opened",
             rt_stacks_opened as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
@@ -777,9 +781,22 @@ pub unsafe extern "C" fn rt_keep_compared(
 /// else 0. The run fails where `==` is not built at their type, as for a function or a runtime
 /// object, and where the two are of different types, which no program compares.
 pub unsafe extern "C" fn rt_kept_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
+    I64(i64::from(kept_compared(ctx, &a, &b, false) != 0))
+}
+
+/// The sign of the order of the kept values `a` and `b`, which it borrows, as their type orders
+/// them: below, at or above zero. The run fails where `compare` is not built at their type, and
+/// where the two are of different types.
+pub unsafe extern "C" fn rt_kept_order(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
+    I64(kept_compared(ctx, &a, &b, true).signum())
+}
+
+/// What the entry of the kept values' type answers for them, its equality's or, where `order`, its
+/// order's; 0 where the run fails.
+fn kept_compared(ctx: *mut Ctx, a: &Handle, b: &Handle, order: bool) -> i64 {
     // Each read out before the next is found: `a` and `b` may be one object.
-    let (Some(x), Some(y)) = (compared_of(ctx, &a), compared_of(ctx, &b)) else {
-        return I64(0);
+    let (Some(x), Some(y)) = (compared_of(ctx, a), compared_of(ctx, b)) else {
+        return 0;
     };
     if x.ty.identity != y.ty.identity {
         let why = format!(
@@ -788,29 +805,33 @@ pub unsafe extern "C" fn rt_kept_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I
             spelled(y.ty)
         );
         internal(unsafe { &mut *ctx }, why);
-        return I64(0);
+        return 0;
     }
-    match x.equal {
-        Some(equal) => I64(i64::from(unsafe { equal(ctx, x.word, y.word) } != 0)),
+    let entry = x.kept.and_then(|k| if order { k.order } else { k.equal });
+    match entry {
+        Some(f) => unsafe { f(ctx, x.word, y.word) },
         None => {
             let c = unsafe { &mut *ctx };
+            let how = if order { "order" } else { "compare" };
+            let what = if order { "" } else { " for equality" };
             c.fail(
                 Diagnostic::error(
                     codes::RUNTIME_ERROR,
-                    format!("cannot compare values of `{}` for equality", spelled(x.ty)),
+                    format!("cannot {how} values of `{}`{what}", spelled(x.ty)),
                 )
                 .primary(Span::DUMMY, "in compiled code"),
             );
-            I64(0)
+            0
         }
     }
 }
 
-/// What a kept value is compared through: its word, its type, and its type's equality.
+/// What a kept value is compared through: its word, its type, and the descriptor of its
+/// comparisons where a perform kept it.
 struct Compared {
     word: Word,
     ty: &'static PlyType,
-    equal: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
+    kept: Option<&'static PlyKept>,
 }
 
 /// What the kept value `h` is compared through, failing the run where it is none or let go of.
@@ -821,7 +842,7 @@ fn compared_of(ctx: *mut Ctx, h: &Handle) -> Option<Compared> {
         Some(v) => Some(Compared {
             word: v.word(),
             ty: v.ty(),
-            equal: compared.and_then(|k| k.equal),
+            kept: compared,
         }),
         None => {
             internal(

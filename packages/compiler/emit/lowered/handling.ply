@@ -49,7 +49,7 @@ import compiler.emit.lower.crossing (crossed, crossing_builtin, encoded_externs,
                                      worded, op_described, counts_type, holds_function)
 import compiler.emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, WHead, WEntry,
                                   entries_of)
-import compiler.emit.lower.scalars (equality_built)
+import compiler.emit.lower.scalars (comparison_built)
 import compiler.emit.print.counting (never_lifted_fn)
 import compiler.emit.written (WrittenRoot, crossing_root, container_code, container_defs,
                               entered_code, contained_formed, contained_reads, sums_crossed,
@@ -769,14 +769,21 @@ fn natives_in(body: List<Inst>) -> List<Bytes> =
       _ -> acc,
     })
 
-/// The equality entry of each `kept#T` among `statics`.
-fn kept_entries(statics: List<StaticDef>) -> List<Option<RootKey>> =
-  statics.fold([], |acc: List<Option<RootKey>>, d: StaticDef|
+/// The equality and order entries of each `kept#T` among `statics`.
+fn kept_entries(statics: List<StaticDef>) -> List<List<Option<RootKey>>> =
+  statics.fold([], |acc: List<List<Option<RootKey>>>, d: StaticDef|
     match d.laid {
-      SStruct(s) -> if s.of != b"PlyKept" { acc }
-      else { acc.push(match s.fields.at(1) { Some(WEntry(k)) -> Some(k), _ -> None }) },
+      SStruct(s) -> if s.of != b"PlyKept" { acc } else {
+        acc.push(
+          [1, 2].map(|i: Int| match s.fields.at(i) { Some(WEntry(k)) -> Some(k), _ -> None }),
+        )
+      },
       _ -> acc,
     })
+
+/// The equality and order entries `kept#T` names for `t`.
+fn compared_at(t: Type) -> List<Option<RootKey>> =
+  [keys::Equal, keys::Order].map(|op: keys::TypeOp| Some(keys::written(Worded(op), t, b"m")))
 
 test "a value a program's generic operation hands its clause crosses kept, the clause holding and answering it, and the perform opens what it answers at its own type" {
   match program_of(kept_crossings()) {
@@ -788,10 +795,8 @@ test "a value a program's generic operation hands its clause crosses kept, the c
         let called = natives_in(f.body);
         assert(called.contains(b"builtin_elaborated_keep_p"), None);
         assert(called.contains(b"builtin_elaborated_open_p"), None);
-        // Kept beside a descriptor that compares two `Int`s.
-        assert_eq(kept_entries(f.statics), [
-          Some(keys::written(Worded(keys::Equal), int_type(), b"m")),
-        ]);
+        // Kept beside a descriptor that compares and orders two `Int`s.
+        assert_eq(kept_entries(f.statics), [compared_at(int_type())]);
         // The clause, compiled once for every perform, takes and answers the kept value.
         match f.lambdas.at(0) {
           Some(Closure(c)) -> {
@@ -818,9 +823,7 @@ test "a clause compares the kept values it is handed through their type's equali
               assert(natives_in(c.body.body).contains(b"builtin_elaborated_kept_equal_p"), None),
             _ -> assert(false),
           };
-          assert_eq(kept_entries(f.statics), [
-            Some(keys::written(Worded(keys::Equal), ints, b"m")),
-          ]);
+          assert_eq(kept_entries(f.statics), [compared_at(ints)]);
           match worded(p.setting.ctors, keys::written(Worded(keys::Equal), ints, b"m")) {
             Err(no) -> assert_eq(no.why, b""),
             Ok(e) -> {
@@ -840,18 +843,91 @@ test "a clause compares the kept values it is handed through their type's equali
           }
         },
       };
-      // A value of a type `==` refuses there, or leaves open, compares by failing the run.
+      // A value of a type `==` or `compare` refuses there, or leaves open, compares by failing the
+      // run; a function compares for equality by failing it too, and orders not at all.
       let task = TyCon({ name: b"Task", args: [int_type()] });
+      let types = [
+        int_type(),
+        ints,
+        fn_type([int_type()], int_type(), row_empty()),
+        task,
+        TyRecord(fields_sorted([{ name: b"t", ty: task }])),
+        TyVar(0),
+      ];
+      assert_eq(types.map(|t: Type| comparison_built(p.setting.ctors, t, false)), [
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+      ]);
+      assert_eq(types.map(|t: Type| comparison_built(p.setting.ctors, t, true)), [
+        true,
+        true,
+        false,
+        false,
+        false,
+        false,
+      ])
+    },
+  }
+}
+
+fn nested_crossings() -> Bytes =
+  Bytes::concat_all([
+    b"effect deck {\n  write first<a>(xs: List<a>) -> Option<a>\n",
+    b"  write tallied<a>(xs: List<a>) -> Map<a, Int>\n  write twice<a>(f: (a) -> a, x: a) -> a\n}\n",
+    b"fn first() -> Option<Int> / {deck.write} = deck.first([1, 2])\n",
+    b"fn tallied() -> Map<String, Int> / {deck.write} = deck.tallied([\"a\"])\n",
+    b"fn twice() -> Int / {deck.write} = deck.twice(|n: Int| n + 1, 4)\n",
+  ])
+
+test "a value nested in what a program's generic operation is handed crosses kept part by part, through roots written for its type" {
+  match program_of(nested_crossings()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let int = int_type();
+      let rooted_call = |acc: List<RootKey>, i: Inst|
+        match i {
+          Let(l) -> match l.val {
+            Call(c) -> match c.callee { Root(k) -> acc.push(k), _ -> acc },
+            _ -> acc,
+          },
+          _ -> acc,
+        };
+      let calls = |name: Bytes|
+        match formed(p, name) {
+          Ok(f) -> f.body.fold([], rooted_call),
+          Err(no) -> panic(String::of_bytes_lossy(no.why)),
+        };
+      let at = |op: keys::TypeOp, t: Type, marks: List<Int>|
+        keys::marked(keys::written(op, t, b"m"), marks);
+      // The list is kept item by item going in; the answer's payload opened coming out.
+      assert_eq(calls(b"first"), [
+        at(keys::Keeping, list_type(int), [1]),
+        at(keys::Opening, option_type(int), [1]),
+      ]);
+      assert_eq(calls(b"tallied"), [
+        at(keys::Keeping, list_type(named(b"String")), [1]),
+        at(keys::Opening, TyCon({ name: b"Map", args: [named(b"String"), int] }), [1]),
+      ]);
+      // A function is wrapped: its parameter and answer kept where they stand.
+      assert_eq(calls(b"twice"), [at(keys::Keeping, fn_type([int], int, row_empty()), [1, 2])]);
+      // Each root writes its parts and the loops it defines, and builds.
+      let built = |k: RootKey|
+        match answered_by_form(nested_crossings(), [], k) { Ok(_) -> b"", Err(why) -> why };
       assert_eq(
         [
-          int_type(),
-          ints,
-          fn_type([int_type()], int_type(), row_empty()),
-          task,
-          TyRecord(fields_sorted([{ name: b"t", ty: task }])),
-          TyVar(0),
-        ].map(|t: Type| equality_built(p.setting.ctors, t)),
-        [true, true, true, false, false, false],
+          at(keys::Keeping, list_type(int), [1]),
+          at(keys::Opening, option_type(int), [1]),
+          at(keys::Opening, TyCon({ name: b"Map", args: [named(b"String"), int] }), [1]),
+          at(keys::Keeping, fn_type([int], int, row_empty()), [1, 2]),
+          keys::written(Worded(keys::Order), named(b"String"), b"m"),
+        ].map(
+          built,
+        ),
+        [b"", b"", b"", b"", b""],
       )
     },
   }

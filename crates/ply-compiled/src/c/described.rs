@@ -51,7 +51,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Obj as "PlyObj": rc);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
-    laid!(out, PlyKept as "PlyKept": ty, equal);
+    laid!(out, PlyKept as "PlyKept": ty, equal, order);
     laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, vars_len, vars);
     laid!(out, PlyFnDesc as "PlyFnDesc": uniform, typed, convention, release, share, keep);
     out.extend([

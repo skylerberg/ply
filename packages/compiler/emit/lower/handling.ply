@@ -12,9 +12,9 @@ import compiler.emit.evidence (evidence_type, instance_block_type, row_described
 import compiler.syntax.parsing (Span)
 import compiler.syntax.exprs (is_exit_effect, scheduler_module)
 import compiler.syntax.items (is_shipped)
-import compiler.check.types (Type, TyVar, TyFn, TyRecord, Scheme, Atom, Row, Resource, RNamed,
-                             RSingleton, RAny, RVar, is_diverges, int_type, string_type,
-                             fields_sorted, fn_type, row_empty)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom,
+                             Row, Resource, RNamed, RSingleton, RAny, RVar, is_diverges, int_type,
+                             string_type, fields_sorted, fn_type, row_empty)
 import compiler.check.infer.expr (kept_type, crossing_vars, crossing_own)
 import compiler.emit.typing (unknown_type)
 import compiler.check.resolve.tables (qualify)
@@ -24,24 +24,25 @@ import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
 import std.bytes (ascii_of_int)
 import compiler.emit.reps (Def, EffectName, OpMode, gathered_of, type_vars)
 import compiler.emit.keys (Named, unspecialised)
-import compiler.emit.roots (builtin_helper)
+import compiler.emit.marks (carried_by, kept_form)
 import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
-                          Enter, Handle, Handling, Uses, AInt, Static, Native, falls_through)
+                          Enter, Handle, Handling, Uses, AInt, Static, falls_through)
 import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Reached, Bridge,
                                    Instance, InstanceHeap, InstanceIn, Entering, ForwardsLaid,
                                    ForwardsSet, ObjectAt, Mapped, Slot, Answering, Forwarding,
                                    Forwarded, Keyed, KeyedRow, Entry, Answers, Stops, Resumes,
                                    Raises, HandleInstance, Returning, raised_at)
-import compiler.emit.lower.crossing (op_described, type_described, kept_described, effect_of,
-                                     exit_effect_named, own_types)
-import compiler.emit.lower.scalars (equality_built)
+import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
+                                     own_types)
+import compiler.emit.lower.kept (crossed_kept)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, refuse, fresh,
                                  bound_as, done, emitted, continued, filed, unfiled, type_of,
                                  handed, static_added)
 import compiler.emit.lower.evidence (words_at, routed, around, bridged, held_routed, label_resource,
                                      value_handing, described, label_value, filed_row)
 import compiler.emit.lower.held (held_as)
+import compiler.emit.lower.setting (op_mode_of)
 import compiler.emit.lower.data (recorded_as)
 import compiler.emit.lower.resumes (off_tail_code)
 
@@ -103,9 +104,16 @@ pub fn performed(
       match filed(cx, at) {
         None -> unfiled(cx, words.st, b"a perform", at),
         Some(t) -> {
-          let out = if is_raise(mode) { { st: words.st, ty: t.ty } }
-          else { crossed_out(words.st, declared.ret, kept, t.ty) };
-          let d = op_described(cx, out.st, en.global, declared, crossed.args.map(type_of), out.ty);
+          let out = if is_raise(mode) { { ty: t.ty, marked: None } }
+          else { crossed_out(declared.ret, kept, t.ty) };
+          let d = op_described(
+            cx,
+            words.st,
+            en.global,
+            declared,
+            crossed.args.map(type_of),
+            out.ty,
+          );
           let uses = {
             takes: keyed.args.map(|_: Arg| false).concat(words.args.map(|_: Arg| true)),
             owned: true,
@@ -132,9 +140,15 @@ pub fn performed(
             _ ->
               Op({ op: OHandle(Unsettled(p.op)), args: keyed.args.concat(words.args), uses: uses }),
           };
-          let answered = bound_as(d.st, out.ty, RWord, op, at);
-          if out.ty == t.ty { handed(answered, held_as(cx.setting, t.ty), at) }
-          else { opened_kept(cx, answered.st, answered.arg, t.ty, at) }
+          let answered = handed(
+            bound_as(d.st, out.ty, RWord, op, at),
+            held_as(cx.setting, out.ty),
+            at,
+          );
+          match out.marked {
+            None -> answered,
+            Some(m) -> crossed_kept(cx, answered.st, answered.arg, m, false, at),
+          }
         },
       }
     },
@@ -152,7 +166,7 @@ fn names_kept(declared: Type, kept: List<Int>) -> Bool =
   type_vars(declared).any(|v: Int| kept.contains(v))
 
 /// `a`, which a perform hands where its operation declares a value of `declared`, as the clause takes
-/// it: kept where `declared` is one of `kept`, but a value already kept, which crosses as it is.
+/// it: each place one of `kept` stands at in `declared` kept (`crossed_kept`).
 fn crossed_in(
   cx: Context,
   st: Lowering,
@@ -162,75 +176,23 @@ fn crossed_in(
   at: Span,
 ) -> Lowered / {abort.raise} =
   match declared {
-    Some(d) -> if !names_kept(d, kept) || type_of(a) == kept_type() { { st: st, arg: a } } else {
-      match d {
-        TyVar(_) -> kept_value(cx, st, a, at),
-        _ -> refuse(st, Handling, b"an own type parameter's value inside an operation's argument"),
-      }
-    },
+    Some(d) -> if !names_kept(d, kept) { { st: st, arg: a } }
+    else { crossed_kept(cx, st, a, carried_by(d, type_of(a), kept).marked, true, at) },
     None -> { st: st, arg: a },
   }
 
-/// The type a perform's entry answers where its operation declares an answer of `declared` and the
-/// checker filed `filed` for it: `Kept` where `declared` is one of `kept`, but where `filed` is.
+/// What a perform's entry answers where its operation declares an answer of `declared` and the
+/// checker filed `filed` for it: its type, each place one of `kept` stands at kept, and the
+/// answer's type so marked, which the perform opens it at.
 fn crossed_out(
-  st: Lowering,
   declared: Type,
   kept: List<Int>,
   filed: Type,
-) -> { st: Lowering, ty: Type } / {abort.raise} =
-  if !names_kept(declared, kept) || filed == kept_type() { { st: st, ty: filed } } else {
-    match declared {
-      TyVar(_) -> { st: st, ty: kept_type() },
-      _ ->
-        {
-          st: refuse(
-            st,
-            Handling,
-            b"an own type parameter's value inside an operation's answer",
-          ).st,
-          ty: filed,
-        },
-    }
+) -> { ty: Type, marked: Option<Type> } / {abort.raise} =
+  if !names_kept(declared, kept) { { ty: filed, marked: None } } else {
+    let marked_ty = carried_by(declared, filed, kept).marked;
+    { ty: kept_form(marked_ty), marked: Some(marked_ty) }
   }
-
-/// `a`, a value a perform hands its clause, kept beside the descriptor of its type, which compares
-/// two of its values where `==` at that type is built: what the runtime's `?keep` makes of it,
-/// taking it.
-fn kept_value(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered / {abort.raise} = {
-  let t = type_of(a);
-  let h = handed({ st: st, arg: a }, RWord, at);
-  let d = kept_described(cx, h.st, t, equality_built(cx.setting.ctors, t), at);
-  bound_as(
-    d.st,
-    kept_type(),
-    RWord,
-    Native({
-      name: builtin_helper(b"?keep").concat(b"_p"),
-      args: [h.arg, d.arg],
-      uses: { takes: [true, false], owned: true, fails: false, stops: false },
-    }),
-    at,
-  )
-}
-
-/// What the kept value `k` keeps, a value of `t` its type's descriptor says it is, held as `t` is;
-/// the run fails where it keeps another type's.
-fn opened_kept(cx: Context, st: Lowering, k: Arg, t: Type, at: Span) -> Lowered / {abort.raise} = {
-  let d = type_described(cx, st, t, at);
-  let w = bound_as(
-    d.st,
-    t,
-    RWord,
-    Native({
-      name: builtin_helper(b"?open").concat(b"_p"),
-      args: [k, d.arg],
-      uses: { takes: [false, false], owned: true, fails: true, stops: false },
-    }),
-    at,
-  );
-  handed(w, held_as(cx.setting, t), at)
-}
 
 /// The call a perform of `p` with `args`, lowered from `codes`, is written as where a value of the
 /// operation's own type parameters crosses and the toolchain declares its effect (GUIDE §6.1): its
@@ -1360,18 +1322,7 @@ fn effect_named(cx: Context, written: Bytes) -> Option<EffectName> / {abort.rais
         None ->
           prelude_effects().fold(None, |acc: Option<EffectName>, e: EffectInfo|
             if e.name == written {
-              Some({
-                written: e.name,
-                global: e.name,
-                ops: e.ops.map(|o: OpInfo|
-                  {
-                    name: o.name,
-                    mode: o.mode,
-                    params: o.params,
-                    ret: o.ret,
-                    own: match o.scheme { Some(s) -> s.ty_vars, None -> [] },
-                  }),
-              })
+              Some({ written: e.name, global: e.name, ops: e.ops.map(op_mode_of) })
             } else { acc }),
       },
     }
