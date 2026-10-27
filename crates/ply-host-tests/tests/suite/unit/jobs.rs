@@ -1,8 +1,10 @@
 //! The process's pools a native's job runs on, each job its run's.
 
-use ply_core::{HostRuntime, Span, Value};
+use ply_core::{HostRuntime, Span, Value, codes};
 use ply_host::jobs::{self, Work};
-use ply_host::registry::{facilities_of, run_of, unbound};
+use ply_host::registry::{facilities_of, job_bytes, run_of, unbound};
+use ply_host::signal::{Bounds, Shutdown, ShutdownSignal};
+use std::time::{Duration, Instant};
 
 fn bytes_of(answer: Result<Value, ply_core::Diagnostic>) -> Vec<u8> {
     match &answer {
@@ -68,6 +70,38 @@ fn a_failed_job_is_a_diagnostic_naming_what_asked_for_it() {
         "{}",
         failed.message
     );
+}
+
+/// A wait begun past the drain deadline ends the run though its job answers at once, so a serve
+/// loop of quick reads still stops there.
+#[test]
+fn a_wait_past_the_drain_deadline_ends_the_run_however_soon_its_job_answers() {
+    let shutdown = Shutdown::new(Bounds {
+        lead: Duration::ZERO,
+        drain: Duration::from_millis(30),
+    });
+    let runtime = ply_host::Host::new()
+        .stopping_on(shutdown.clone())
+        .runtime();
+    let quick = || Ok(b"read".to_vec());
+    let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
+    assert_eq!(bytes_of(runtime.block_on(ticket)), b"read");
+
+    assert!(shutdown.request(ShutdownSignal::Terminate));
+    let until = Instant::now() + Duration::from_secs(5);
+    while !shutdown.drain_expired() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(shutdown.drain_expired(), "a 30ms drain never expired");
+
+    let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
+    let ended = job_bytes(&*runtime, &ticket).expect_err("the drain is out of time");
+    assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
+    let ticket = submitted(&*runtime, Work::Waiting, "a test job", quick);
+    let ended = runtime
+        .block_on(ticket)
+        .expect_err("the drain is out of time");
+    assert_eq!(ended.code, codes::DRAIN_INCOMPLETE);
 }
 
 /// Every runtime one unbound factory makes, as each `parallel` branch makes its own, is over the

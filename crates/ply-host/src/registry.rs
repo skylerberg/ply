@@ -194,7 +194,8 @@ pub fn facilities_of(runtime: &dyn HostRuntime) -> Option<&Facilities> {
 }
 
 /// The bytes a native's job answered `pending`, the thread waiting for them until the drain
-/// deadline says the run is out of time.
+/// deadline says the run is out of time. A wait begun past the deadline ends the run however soon
+/// its job would answer, so a loop of quick waits still stops there.
 ///
 /// # Errors
 /// The job failed, the drain ran out, or no host made `runtime`.
@@ -202,11 +203,11 @@ pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>
     let facilities = facilities_of(runtime).ok_or_else(err_no_host)?;
     let step = facilities.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
     loop {
-        if let Some(bytes) = facilities.run.block_on_bytes(pending, step)? {
-            return Ok(bytes);
-        }
         if let Some(expired) = facilities.drain_expired() {
             return Err(expired);
+        }
+        if let Some(bytes) = facilities.run.block_on_bytes(pending, step)? {
+            return Ok(bytes);
         }
     }
 }
@@ -368,15 +369,16 @@ impl HostRuntime for Facilities {
         }
     }
 
-    /// Drive until this token resolves, or until the drain deadline says the run is out of time.
+    /// Drive until this token resolves, or until the drain deadline says the run is out of time,
+    /// which a wait begun past it says at once.
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         let step = self.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
         loop {
-            if let Some(value) = self.run.block_on(&pending, step)? {
-                return Ok(value);
-            }
             if let Some(expired) = self.drain_expired() {
                 return Err(expired);
+            }
+            if let Some(value) = self.run.block_on(&pending, step)? {
+                return Ok(value);
             }
         }
     }
