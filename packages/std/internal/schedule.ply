@@ -768,16 +768,17 @@ fn stopping<v>(
       let s1 = { ..s, tasks: s.tasks.update(id, |x: Member<v>| { ..x, cancelled: true }) };
       let shielded = shields.acquiring > 0 || shields.releasing > 0;
       match target.state {
-        Ready(Start) -> {
-          let gone = ordered(s1, Discard(id));
-          match s.policy {
-            Seeded -> state_of(gone, id, Dropped),
-            Production ->
+        // A production region keeps no task that has ended, so its handle says so before it goes.
+        Ready(Start) -> match s.policy {
+          Seeded -> state_of(ordered(s1, Discard(id)), id, Dropped),
+          Production ->
+            ordered(
               settled_cancel(
-                state_of({ ..gone, queue: gone.queue.filter(|q: Int| q != id) }, id, Stopped),
+                state_of({ ..s1, queue: s1.queue.filter(|q: Int| q != id) }, id, Stopped),
                 id,
               ),
-          }
+              Discard(id),
+            ),
         },
         Ready(_) -> if shielded { ordered(s1, HoldBack(id)) }
         else { state_of(s1, id, Ready(Unwind)) },
@@ -2204,9 +2205,9 @@ fn ran(s: Stacks, id: Int, site: Site) -> Unit / {abort.raise, native.read, nati
         if code == ask_spawn() && next.next_id > child {
           task_started(s, child, open(asked_kept(s)))
         };
-        if code == body_answered() || code == body_unwound() { task_freed(s, task) };
         let given = orders_taken(next);
         given.orders.fold((), |_u: Unit, o: Order| obeyed(s, o));
+        if code == body_answered() || code == body_unwound() { task_freed(s, task) };
         Continue({ region: given.region, last: task })
       },
       other -> Stop({ looping: { ..l, region: t.region }, turn: other }),
@@ -2341,9 +2342,10 @@ fn served_turn(
       if code == ask_spawn() && next.next_id > child {
         task_started(s, child, open(asked_kept(s)))
       };
-      if code == body_answered() || code == body_unwound() { task_freed(s, task) };
+      // An order records on a handle how its task ended, which freeing the task lets go of.
       let given = orders_taken(next);
       given.orders.fold((), |_u: Unit, o: Order| obeyed(s, o));
+      if code == body_answered() || code == body_unwound() { task_freed(s, task) };
       serving(s, { region: given.region, last: task, parks: 0 })
     },
     Idle(deadline) -> {
@@ -2643,6 +2645,20 @@ test "a production region keeps no task that has ended, and a join reads the han
   assert_eq(held(ended.region), 1);
   assert_eq(then(ended, 0, Join({ ..live(1), ended: Answered })).turn, Run(0, Resume(Joined)));
   assert_eq(code_of(then(ended, 0, Join(live(1)))), "E0413")
+}
+
+test "a production task cancelled before it starts has its handle settled before it is let go" {
+  let both = then(then(then(produced(), 0, Spawn), 1, Yield), 0, Spawn);
+  assert_eq(both.turn, Run(1, Resume(Went)));
+  let stopped = then(both, 1, Cancel(live(2), unshielded()));
+  assert_eq(stopped.turn, Run(0, Resume(Spawned(2))));
+  assert_eq(stopped.region.orders.filter(|o: Order| o == Settled(2) || o == Discard(2)), [
+    Settled(2),
+    Discard(2),
+  ]);
+  let heard = then(stopped, 0, Await({ ..live(2), ended: Cancelled }));
+  assert_eq(heard.turn, Run(1, Resume(Flag(true))));
+  assert_eq(then(heard, 1, Yield).turn, Run(0, Resume(Awaited(false))))
 }
 
 /// The run's loop over a fresh region, `parks` waits in a row having woken nothing.
