@@ -6,7 +6,7 @@
 //! kept with its type, a region's stacks, a task's body, a task's and a channel's handle) and the
 //! natives themselves, and the production region's waits: the run's tickets and its clock.
 
-use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
+use crate::emitted::{Block, Carried, Handed, Handle, PlyKept, PlyType};
 use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Addr, I64, TakenBytes};
@@ -415,12 +415,22 @@ extern "C" fn task_entry(arg: usize) {
 
 // --- The scheduler's objects -----------------------------------------------------------------
 
-/// Every native `std.internal.schedule` declares, under the name it declares it by.
+/// Every native `std.internal.schedule` declares, under the name it declares it by, then those
+/// compiled code calls itself where a perform hands a program's clause a kept value.
 pub fn natives() -> Vec<crate::c::MachineNative> {
     use crate::c::machine_native as n;
     vec![
         n("keep", rt_keep as unsafe extern "C" fn(_, _, _) -> _),
         n("open", rt_open as unsafe extern "C" fn(_, _, _) -> _),
+        n(
+            "?keep",
+            rt_keep_compared as unsafe extern "C" fn(_, _, _) -> _,
+        ),
+        n("?open", rt_open as unsafe extern "C" fn(_, _, _) -> _),
+        n(
+            "?kept_equal",
+            rt_kept_equal as unsafe extern "C" fn(_, _, _) -> _,
+        ),
         n(
             "stacks_opened",
             rt_stacks_opened as unsafe extern "C" fn(_, _, _, _, _) -> _,
@@ -557,18 +567,23 @@ pub const ANSWERED: i64 = 1;
 pub const CANCELLED: i64 = 2;
 
 /// A value of any type held beside its type's descriptor: `std.internal.schedule`'s `Kept`, what a
-/// region passes between its tasks of a value of an operation's own type parameter.
-pub struct Kept(Option<Carried>);
+/// value of an operation's own type parameter crosses as between a perform and its clause, and a
+/// region passes between its tasks. One a perform hands a program's clause holds its `kept#T`
+/// too, through which two of them compare.
+pub struct Kept {
+    value: Option<Carried>,
+    compared: Option<&'static PlyKept>,
+}
 
 impl Native for Kept {
     fn release(&mut self, ctx: *mut Ctx) {
-        if let Some(v) = self.0.take() {
+        if let Some(v) = self.value.take() {
             v.release(ctx);
         }
     }
 
     fn value(&self, ctx: *mut Ctx) -> Result<Value, String> {
-        match &self.0 {
+        match &self.value {
             Some(v) => v.lower(ctx),
             None => Err("a kept value let go of crossed".into()),
         }
@@ -730,7 +745,92 @@ fn object_made(ctx: *mut Ctx, held: Box<dyn Native>) -> Handle {
 
 /// `x`, a value of the type `ty` describes, kept: it holds the count compiled code handed with it.
 pub unsafe extern "C" fn rt_keep(ctx: *mut Ctx, x: Handed, ty: *const PlyType) -> Handle {
-    object_made(ctx, Box::new(Kept(Some(unsafe { Carried::new(x, ty) }))))
+    let value = Some(unsafe { Carried::new(x, ty) });
+    object_made(
+        ctx,
+        Box::new(Kept {
+            value,
+            compared: None,
+        }),
+    )
+}
+
+/// `x`, a value a perform hands a program's clause, kept beside `kept`, which describes its type
+/// and compares two of its values: it holds the count compiled code handed with it.
+pub unsafe extern "C" fn rt_keep_compared(
+    ctx: *mut Ctx,
+    x: Handed,
+    kept: *const PlyKept,
+) -> Handle {
+    let kept = unsafe { &*kept };
+    let value = Some(unsafe { Carried::new(x, kept.ty) });
+    object_made(
+        ctx,
+        Box::new(Kept {
+            value,
+            compared: Some(kept),
+        }),
+    )
+}
+
+/// 1 where the kept values `a` and `b`, which it borrows, are equal as their type compares them,
+/// else 0. The run fails where `==` is not built at their type, as for a function or a runtime
+/// object, and where the two are of different types, which no program compares.
+pub unsafe extern "C" fn rt_kept_equal(ctx: *mut Ctx, a: Handle, b: Handle) -> I64 {
+    // Each read out before the next is found: `a` and `b` may be one object.
+    let (Some(x), Some(y)) = (compared_of(ctx, &a), compared_of(ctx, &b)) else {
+        return I64(0);
+    };
+    if x.ty.identity != y.ty.identity {
+        let why = format!(
+            "a kept `{}` was compared with a kept `{}`",
+            spelled(x.ty),
+            spelled(y.ty)
+        );
+        internal(unsafe { &mut *ctx }, why);
+        return I64(0);
+    }
+    match x.equal {
+        Some(equal) => I64(i64::from(unsafe { equal(ctx, x.word, y.word) } != 0)),
+        None => {
+            let c = unsafe { &mut *ctx };
+            c.fail(
+                Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!("cannot compare values of `{}` for equality", spelled(x.ty)),
+                )
+                .primary(Span::DUMMY, "in compiled code"),
+            );
+            I64(0)
+        }
+    }
+}
+
+/// What a kept value is compared through: its word, its type, and its type's equality.
+struct Compared {
+    word: Word,
+    ty: &'static PlyType,
+    equal: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
+}
+
+/// What the kept value `h` is compared through, failing the run where it is none or let go of.
+fn compared_of(ctx: *mut Ctx, h: &Handle) -> Option<Compared> {
+    let kept = object::<Kept>(ctx, h, "a kept value")?;
+    let compared = kept.compared;
+    match &kept.value {
+        Some(v) => Some(Compared {
+            word: v.word(),
+            ty: v.ty(),
+            equal: compared.and_then(|k| k.equal),
+        }),
+        None => {
+            internal(
+                unsafe { &mut *ctx },
+                "a kept value was compared after it was let go of",
+            );
+            None
+        }
+    }
 }
 
 /// What `k` keeps, held once more, where it is a value of the type `ty` describes; the run fails
@@ -740,7 +840,7 @@ pub unsafe extern "C" fn rt_open(ctx: *mut Ctx, k: Handle, ty: *const PlyType) -
     let Some(kept) = object::<Kept>(ctx, &k, "a kept value") else {
         return Handed::of(0);
     };
-    match &kept.0 {
+    match &kept.value {
         Some(v) if v.ty().identity == want.identity => v.dup(ctx).handed(),
         Some(v) => {
             let why = format!(

@@ -260,6 +260,7 @@ fn the_runtime_describes_the_structs_emitted_code_lays_out_as_the_compiler_state
                     word("lift", 48),
                 ]
             ),
+            ("PlyKept", 16, vec![word("ty", 0), word("equal", 8)]),
             (
                 "PlyOp",
                 64,

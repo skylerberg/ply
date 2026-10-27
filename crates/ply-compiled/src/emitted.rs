@@ -198,6 +198,19 @@ pub struct PlyType {
 // SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.
 unsafe impl Sync for PlyType {}
 
+/// `kept#T`: what a value a perform hands a program's clause is kept beside, static data emitted
+/// code lays out: its type's descriptor, and the entry comparing two of its values.
+#[repr(C)]
+pub struct PlyKept {
+    pub ty: *const PlyType,
+    /// 1 where two values of the type, each a word form it borrows, are equal, else 0; none where
+    /// `==` is not built at the type.
+    pub equal: Option<unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word>,
+}
+
+// SAFETY: a descriptor is read-only data, which nothing writes once its unit is loaded.
+unsafe impl Sync for PlyKept {}
+
 /// `op#effect.op@T1..Tk`: an operation at its perform's type arguments, static data emitted code
 /// lays out and hands [`crate::rt::rt_dispatch`], through whose types the runtime crosses what the
 /// perform passes and is answered.
@@ -335,6 +348,11 @@ impl Carried {
         self.ty
     }
 
+    /// The word, for the entries of its type alone, which borrow it.
+    pub(crate) fn word(&self) -> Word {
+        self.word
+    }
+
     /// The value held once more, counted through its type.
     pub fn dup(&self, ctx: *mut Ctx) -> Carried {
         unsafe { (self.ty.inc)(ctx, self.word) };
@@ -420,6 +438,9 @@ unsafe impl Taken for *const PlyType {
 }
 unsafe impl Taken for *const PlyOp {
     const MACHINE: Machine = Machine::Op;
+}
+unsafe impl Taken for *const PlyKept {
+    const MACHINE: Machine = Machine::Type;
 }
 unsafe impl Taken for *const Handed {
     const MACHINE: Machine = Machine::Words;

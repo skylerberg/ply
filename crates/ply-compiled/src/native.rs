@@ -28,7 +28,7 @@ pub enum Machine {
     /// A block emitted code lays out, of which the runtime reads the count at offset 0; a function
     /// value's is called and let go through its descriptor.
     Block,
-    /// A type's descriptor, `type#T`.
+    /// A type's descriptor: `type#T`, or `kept#T`, which names `type#T` beside its comparisons.
     Type,
     /// An operation's descriptor, `op#..`.
     Op,

@@ -13,7 +13,8 @@ import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.type_syntax (MRaise)
 import compiler.syntax.exprs (is_exit_effect, exit_op)
 import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type,
-                             int_type, unit_type, bytes_type, list_type, string_type, spelled_type)
+                             int_type, unit_type, bytes_type, list_type, string_type, spelled_type,
+                             bool_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, RowArguments)
 import compiler.emit.typing (unknown_type, rows_filed_at)
 import compiler.emit.c (Width, width_named, width_index)
@@ -1036,6 +1037,44 @@ pub fn type_described(cx: Context, st: Lowering, t: Type, at: Span) -> Lowered /
     bound_as(s.st, int_type(), RInt, Static(s.name), at)
   }
 
+/// The address of `kept#T`, the descriptor a kept value of type `t` is held beside: `type#T`, and the
+/// entry comparing two values of `t` for equality where `compared`, bound as an uncounted word. At a
+/// type a body generic over it leaves open, the specialisations its callers settle describe it.
+pub fn kept_described(
+  cx: Context,
+  st: Lowering,
+  t: Type,
+  compared: Bool,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  if !settled(t) {
+    bound_as(
+      type_vars(t).fold(st, |s: Lowering, v: Int| noted(s, { var: v, reads: Exact })),
+      int_type(),
+      RInt,
+      Op({
+        op: OHandle(Unsettled(b"kept#".concat(spelled_type(t)))),
+        args: [],
+        uses: { takes: [], owned: false, fails: false, stops: false },
+      }),
+      at,
+    )
+  } else {
+    let module = cx.setting.module;
+    let ty = type_static(cx.setting.ctors, module, st, t, function_marks(t));
+    let k = static_added(
+      ty.st,
+      SStruct({
+        of: b"PlyKept",
+        fields: [
+          WAddress({ name: ty.name, tag: 0 }),
+          if compared { WEntry(keys::written(Worded(keys::Equal), t, module)) } else { WRaw(0) },
+        ],
+      }),
+    );
+    bound_as(k.st, int_type(), RInt, Static(k.name), at)
+  }
+
 /// `st` holding `op#`, the descriptor of operation `op` of effect `eff` as a perform at argument types
 /// `params` answering `answer` meets it, and that static's name: the effect's and the operation's
 /// field-table entries; the answer's type, each place an own type parameter stands at taken carried;
@@ -1339,7 +1378,41 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Result<Fn, Declined> =
             ),
           )
         },
-        _ -> Err({ by: Handling, why: b"a word-form entry of other than a lowering or a lifting" }),
+        // Two values compared as `==` at the type compares them, answering `Bool`'s word.
+        Worded(keys::Equal) -> {
+          let other = { id: 1, ty: w.ty, rep: RWord };
+          let left = { id: 2, ty: w.ty, rep: rep };
+          let right = { id: 3, ty: w.ty, rep: rep };
+          let truth = bool_type();
+          let same = { id: 4, ty: truth, rep: RBool };
+          let out = { id: 5, ty: truth, rep: RWord };
+          let let_of = |v: Var, val: Val| Let({ var: v, val: val, at: dummy_span(), unwind: [] });
+          let held_pair = if opened { [] } else {
+            [
+              let_of(left, Pack({ arg: AVar(word), to: rep })),
+              let_of(right, Pack({ arg: AVar(other), to: rep })),
+            ]
+          };
+          let compared = if opened { [AVar(word), AVar(other)] } else { [AVar(left), AVar(right)] };
+          Ok(
+            entry_fn(
+              k,
+              truth,
+              RWord,
+              [word, other],
+              held_pair.concat([
+                let_of(same, call(keys::Equal, compared, truth)),
+                let_of(out, Pack({ arg: AVar(same), to: RWord })),
+                Return(AVar(out)),
+              ]),
+            ),
+          )
+        },
+        _ ->
+          Err({
+            by: Handling,
+            why: b"a word-form entry of other than a lowering, a lifting or an equality",
+          }),
       }
     },
     _ -> Err({ by: Handling, why: b"a word-form entry of no type" }),

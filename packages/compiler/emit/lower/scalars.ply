@@ -11,8 +11,9 @@ import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Fiel
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, lit_int, is_bitop)
-import compiler.emit.reps (Ctors, has_vars, type_vars, compared_by_root, keyed_sum, numeric_sum,
-                           nullary_sum, generic_sum, written_sum)
+import compiler.emit.reps (Ctors, SumCtor, has_vars, type_vars, compared_by_root, keyed_sum,
+                           numeric_sum, nullary_sum, generic_sum, written_sum, at_args)
+import compiler.check.infer.expr (kept_type)
 import compiler.emit.answer (Scalar, Exact, literal_bits)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown, Digest, Contained)
@@ -176,8 +177,11 @@ fn classed(
           at,
         )
       } else { ranked(cx, l, r, op, ty, at) },
-      CWord(t) -> if eq && is_secret(t) { secrets_equal(l, r, op, at) }
-      else { ranked(cx, l, r, op, t, at) },
+      CWord(t) -> if eq && is_secret(t) {
+        handles_equal(l, r, op, b"builtin_elaborated_secret_equal_p", at)
+      } else if eq && t == kept_type() {
+        handles_equal(l, r, op, b"builtin_elaborated_kept_equal_p", at)
+      } else { ranked(cx, l, r, op, t, at) },
       CRecord(_) -> lacking(r.st, op),
     }
   }
@@ -209,8 +213,10 @@ fn functions_compared(st: Lowering, at: Span) -> Lowered = {
   )
 }
 
-/// `l == r` or `l != r` of two secrets, which the runtime compares in constant time, borrowing both.
-fn secrets_equal(l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
+/// `l == r` or `l != r` of two runtime objects the runtime's `native` compares, borrowing both and
+/// answering 1 where they are equal: two secrets, in constant time, or two kept values, as their
+/// type compares them.
+fn handles_equal(l: Lowered, r: Lowered, op: Bytes, native: Bytes, at: Span) -> Lowered = {
   let a = handed({ st: r.st, arg: l.arg }, RWord, at);
   let b = handed({ st: a.st, arg: r.arg }, RWord, at);
   let same = bound_as(
@@ -218,7 +224,7 @@ fn secrets_equal(l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
     named_type(b"Int"),
     RInt,
     Native({
-      name: b"builtin_elaborated_secret_equal_p",
+      name: native,
       args: [a.arg, b.arg],
       uses: { takes: [false, false], owned: true, fails: true, stops: false },
     }),
@@ -507,6 +513,44 @@ type Class =
   | CWalked(Type)
   | CRecord(List<Field>)
   | CWord(Type)
+
+/// Whether `==` of two values of `t` is built: no part of it is a type variable or a value only the
+/// runtime reads (a runtime object or an extern type) but a secret. A function part compares by
+/// failing the run, as `==` at a type variable a function fills does, and a sum stating a `key`
+/// compares through it alone.
+pub fn equality_built(ctors: Ctors, t: Type) -> Bool / {abort.raise} =
+  iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
+    match s.todo {
+      [] -> Stop(true),
+      [x, ..rest] -> match x {
+        TyFn(_) -> Continue({ ..s, todo: rest }),
+        _ -> match class_of(ctors, x) {
+          CRecord(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
+          CWalked(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
+          CSum(w) -> match w {
+            TyCon(c) -> if s.seen.contains(c.name) || keyed_sum(ctors, c.name) {
+              Continue({ ..s, todo: rest })
+            } else {
+              let cs = match ctors.sums.get(c.name) { Some(found) -> found, None -> [] };
+              Continue({
+                todo: rest.concat(
+                  cs.fold([], |acc: List<Type>, k: SumCtor|
+                    acc.concat(k.fields.map(|f: Type| at_args(f, k.params, c.args)))),
+                ),
+                seen: s.seen.push(c.name),
+              })
+            },
+            _ -> Continue({ ..s, todo: rest }),
+          },
+          CWord(w) -> if is_secret(w) || w == named_type(b"Unit") || w == TyRecord([]) {
+            Continue({ ..s, todo: rest })
+          } else { Stop(false) },
+          _ -> Continue({ ..s, todo: rest }),
+        },
+      },
+    })
+
+fn type_args(t: Type) -> List<Type> = match t { TyCon(c) -> c.args, _ -> [] }
 
 fn class_of(ctors: Ctors, ty: Type) -> Class =
   match ty {

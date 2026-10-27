@@ -3,7 +3,7 @@
 //! what the runtime's JSON description reports, each read off the constant or the type the
 //! runtime's own code uses.
 
-use crate::emitted::{PlyFnDesc, PlyOp, PlyType};
+use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
 use crate::rt::Ctx;
 use std::mem::{offset_of, size_of};
@@ -50,7 +50,7 @@ pub struct Described {
 
 /// Each struct emitted code lays out and the runtime reads, in the order
 /// `compiler.emit.layout.machine_structs` lists them: each declared before one that points at it.
-pub fn descriptors() -> [Described; 4] {
+pub fn descriptors() -> [Described; 5] {
     [
         Described {
             name: "PlyFrame",
@@ -61,6 +61,11 @@ pub fn descriptors() -> [Described; 4] {
             name: "PlyType",
             bytes: size_of::<PlyType>(),
             fields: fields!(PlyType: identity, spelled, spelled_len, inc, dec, lower, lift),
+        },
+        Described {
+            name: "PlyKept",
+            bytes: size_of::<PlyKept>(),
+            fields: fields!(PlyKept: ty, equal),
         },
         Described {
             name: "PlyOp",
