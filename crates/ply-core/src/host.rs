@@ -149,11 +149,7 @@ pub trait HostHandler: Send + Sync {
 pub type RuntimeFactory = std::sync::Arc<dyn Fn() -> std::rc::Rc<dyn HostRuntime> + Send + Sync>;
 
 pub trait HostRuntime {
-    /// Hands `pending` back through `resolved` once it resolves; refuses a token it did not mint.
-    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic>;
-    /// The watched tokens that resolved since the last call, each with its answer.
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)>;
-    /// Waits until at least one outstanding token resolves.
+    /// Waits until at least one ticket the run watches is answered.
     fn park(&self) -> Result<(), Diagnostic>;
     fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic>;
 
@@ -164,13 +160,13 @@ pub trait HostRuntime {
         None
     }
 
-    /// Nanoseconds the host's monotonic clock reads, which a production region's sleeps are
-    /// deadlines on; only the difference of two readings means anything.
+    /// Nanoseconds the host's monotonic clock reads, which the run's region's sleeps are deadlines
+    /// on; only the difference of two readings means anything.
     fn now(&self) -> Result<i64, Diagnostic> {
         Err(err_no_clock("read the clock"))
     }
 
-    /// Waits until a watched token resolves or the clock reads `deadline`, whichever is first.
+    /// Waits until a watched ticket is answered or the clock reads `deadline`, whichever is first.
     fn park_until(&self, deadline: i64) -> Result<(), Diagnostic> {
         let _ = deadline;
         Err(err_no_clock("wait on the clock"))
@@ -183,7 +179,7 @@ pub trait HostRuntime {
         Vec::new()
     }
 
-    /// Called when a production region retires `task`, whose id nothing will name again.
+    /// Called when the run's region lets go of `task`, whose id nothing will name again.
     fn end_task(&self, machine: MachineId, task: crate::sim::TaskId) {
         let _ = (machine, task);
     }
@@ -390,7 +386,7 @@ impl fmt::Debug for HostBinding {
 
 impl HostBinding {
     /// What a context entered with no binding has: it serves nothing past the program's own
-    /// handlers, and opens no production region.
+    /// handlers.
     pub fn unbound() -> HostBinding {
         HostBinding {
             entries: Vec::new(),

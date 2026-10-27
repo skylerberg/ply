@@ -16,8 +16,7 @@ use crate::rt::{
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
-use ply_core::sched::{ChanHandle, TaskHandle};
-use ply_core::sim::{ChanId, SimId, TaskId};
+use ply_core::sim::TaskId;
 use ply_core::{Diagnostic, Span, Value, codes};
 use ply_host::pool::Run;
 use std::collections::HashMap;
@@ -111,6 +110,8 @@ pub struct Region {
     live: usize,
     peak: usize,
     message: Message,
+    /// The raise the loop left for the task it resumes raising.
+    raising: Option<Diagnostic>,
 }
 
 impl Region {
@@ -127,6 +128,7 @@ impl Region {
             live: 0,
             peak: 0,
             message: Message::default(),
+            raising: None,
         })
     }
 
@@ -348,6 +350,65 @@ pub unsafe fn to_loop(region: *mut Region, request: Message) -> Message {
     unsafe { (*region).message }
 }
 
+/// Whether the task `region`'s loop resumed with `heard` runs on: `false`, its context failed, where
+/// it is to unwind after a cancel or to raise what the loop left for it, or the switch failed.
+///
+/// # Safety
+/// `region` is open on the running task's context.
+unsafe fn runs_on(region: *mut Region, heard: &Message) -> bool {
+    let r = unsafe { &mut *region };
+    let c = unsafe { &mut *r.ctx };
+    match heard.code {
+        RESUME_UNWIND => {
+            c.failed = FAILED_CANCELLED;
+            false
+        }
+        RESUME_RAISE => {
+            let d = r.raising.take().unwrap_or_else(|| {
+                Diagnostic::error(codes::INTERNAL_ERROR, "a task was resumed to raise nothing")
+            });
+            let message = d.message.clone();
+            c.pend(d, message);
+            false
+        }
+        _ => c.failed == 0,
+    }
+}
+
+/// The codes the runtime itself asks the run's region's loop with, as `std.internal.schedule`
+/// reads them: a sleep of some nanoseconds, and a wait on one of the run's tickets.
+pub const ASK_SLEEP: i64 = 11;
+pub const ASK_TICKET: i64 = 15;
+
+/// The innermost region open on `c`, where it is the run's and one of its tasks runs.
+fn production_running(c: &Ctx) -> Option<*mut Region> {
+    let (region, _) = c.regions.last()?;
+    let r = unsafe { &**region };
+    (!r.is_seeded() && r.running().is_some()).then_some(*region)
+}
+
+/// The task of the run's region running on `c`, where one runs: who performs on the machine, and a
+/// wait on the host waits there.
+pub(crate) fn production_task(c: &Ctx) -> Option<TaskId> {
+    let region = production_running(c)?;
+    unsafe { (*region).running() }.map(TaskId)
+}
+
+/// The running task of the run's region asks its loop `code` about `n` and waits while the region's
+/// other tasks run: whether it runs on, as [`runs_on`] says. `None` where no task of the run's
+/// region runs on `c`, which then waits itself.
+pub(crate) fn waited(c: &mut Ctx, code: i64, n: i64) -> Option<bool> {
+    let region = production_running(c)?;
+    let request = Message {
+        code,
+        numbers: [n, 0],
+        word: 0,
+        site: [c.performed_root, c.performed_start, c.performed_end],
+    };
+    let heard = unsafe { to_loop(region, request) };
+    Some(unsafe { runs_on(region, &heard) })
+}
+
 fn ended(code: i64) -> Message {
     Message {
         code,
@@ -557,6 +618,31 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
             "region_failed",
             rt_region_failed as unsafe extern "C" fn(_, _, _),
         ),
+        n(
+            "ticket_watch",
+            rt_ticket_watch as unsafe extern "C" fn(_, _) -> _,
+        ),
+        n(
+            "tickets_answered",
+            rt_tickets_answered as unsafe extern "C" fn(_) -> _,
+        ),
+        n(
+            "tickets_park",
+            rt_tickets_park as unsafe extern "C" fn(_, _) -> _,
+        ),
+        n("host_now", rt_host_now as unsafe extern "C" fn(_) -> _),
+        n(
+            "root_returned",
+            rt_root_returned as unsafe extern "C" fn(_, _, _),
+        ),
+        n(
+            "run_stopping",
+            rt_run_stopping as unsafe extern "C" fn(_) -> _,
+        ),
+        n(
+            "run_drained",
+            rt_run_drained as unsafe extern "C" fn(_) -> _,
+        ),
     ]
 }
 
@@ -595,14 +681,13 @@ impl Native for Kept {
 }
 
 /// One region's tasks' stacks (`Stacks`): the region, its id among the entry's regions, the
-/// message the loop last heard from a task and the one a task last heard from the loop, the raise
-/// the loop left for the task it resumes raising, and the handle each started task answers into.
+/// message the loop last heard from a task and the one a task last heard from the loop, and the
+/// handle each started task answers into.
 pub struct Stacks {
     region: Option<Box<Region>>,
     id: i64,
     asked: Message,
     heard: Message,
-    raising: Option<Diagnostic>,
     tasks: HashMap<u64, Word>,
 }
 
@@ -677,15 +762,15 @@ impl Native for TaskBody {
     }
 }
 
-/// A seeded region's task's handle (`Task`): its region, its id, how it ended and its answer.
-pub struct SeededTask {
+/// A region's task's handle (`Task`): its region, its id, how it ended and its answer.
+pub struct RegionTask {
     region: i64,
     id: i64,
     ended: i64,
     answer: Option<Word>,
 }
 
-impl Native for SeededTask {
+impl Native for RegionTask {
     fn release(&mut self, ctx: *mut Ctx) {
         if let Some(w) = self.answer.take() {
             heap::release_object(ctx, w);
@@ -693,26 +778,21 @@ impl Native for SeededTask {
     }
 
     fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        let region = SimId(u32::try_from(self.region).map_err(|_| "no region's id")?);
-        let id = TaskId(u64::try_from(self.id).map_err(|_| "a task not yet started crossed")?);
-        Ok(Value::Task(TaskHandle::unowned(region, id)))
+        Err("a task, which only its own region can hold, crossed".into())
     }
 }
 
-/// A seeded region's channel's handle (`Chan`): its region and its id.
-pub struct SeededChan {
+/// A region's channel's handle (`Chan`): its region and its id.
+pub struct RegionChan {
     region: i64,
     id: i64,
 }
 
-impl Native for SeededChan {
+impl Native for RegionChan {
     fn release(&mut self, _ctx: *mut Ctx) {}
 
     fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Ok(Value::Chan(ChanHandle {
-            region: SimId(u32::try_from(self.region).map_err(|_| "no region's id")?),
-            id: ChanId(u64::try_from(self.id).map_err(|_| "no channel's id")?),
-        }))
+        Err("a channel, which only its own region can hold, crossed".into())
     }
 }
 
@@ -902,14 +982,13 @@ pub unsafe extern "C" fn rt_stacks_opened(
         id,
         asked: Message::default(),
         heard: Message::default(),
-        raising: None,
         tasks: HashMap::new(),
     };
     object_made(ctx, Box::new(stacks))
 }
 
-/// Where a region open on this context before `s`'s was written, a seeded one's or else a
-/// production one's: its root, start or end by `which`; a root of -1 where there is none.
+/// Where a seeded region open on this context before `s`'s was written: its root, start or end by
+/// `which`; a root of -1 where there is none.
 pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -> I64 {
     let c = unsafe { &*ctx };
     let region = object::<Stacks>(ctx, &s, "a region's stacks").map(|s| s.region());
@@ -917,8 +996,7 @@ pub unsafe extern "C" fn rt_stacks_outer(ctx: *mut Ctx, s: Handle, which: I64) -
         .take_while(|(r, _)| Some(*r) != region)
         .filter(|(r, _)| unsafe { (**r).is_seeded() })
         .last()
-        .map(|(_, site)| *site)
-        .or_else(|| c.sims.last().map(|sim| sim.site));
+        .map(|(_, site)| *site);
     I64(match (outer, usize::try_from(which.0)) {
         (Some(site), Ok(i)) if i < 3 => site[i],
         _ => -1,
@@ -937,49 +1015,30 @@ pub unsafe extern "C" fn rt_handle_as(_ctx: *mut Ctx, h: Handle) -> Handle {
     Handle::of(held(h.word()))
 }
 
-/// A `bracket`'s `acquire` or `release` the running task of a region stands in: the innermost
-/// region `std.internal.schedule` opened, or a production region the runtime runs.
-pub(crate) enum Bracketed {
-    Region {
-        region: *mut Region,
-        task: u64,
-        shield: Shield,
-    },
-    Production(crate::simulate::Shielded),
+/// A `bracket`'s `acquire` or `release` the running task of the innermost region stands in.
+pub(crate) struct Bracketed {
+    region: *mut Region,
+    task: u64,
+    shield: Shield,
 }
 
 /// Enters `shield` for the running task of the innermost region running one.
 pub(crate) fn shielded(c: &mut Ctx, shield: Shield) -> Option<Bracketed> {
-    if let Some((region, _)) = c.regions.last().copied()
-        && let Some(task) = unsafe { (*region).shield(shield) }
-    {
-        return Some(Bracketed::Region {
-            region,
-            task,
-            shield,
-        });
-    }
-    let shield = match shield {
-        Shield::Acquire => ply_core::sched::Shield::Acquire,
-        Shield::Release => ply_core::sched::Shield::Release,
-    };
-    crate::simulate::shield(c, shield).map(Bracketed::Production)
+    let (region, _) = c.regions.last().copied()?;
+    let task = unsafe { (*region).shield(shield) }?;
+    Some(Bracketed {
+        region,
+        task,
+        shield,
+    })
 }
 
 /// Leaves what [`shielded`] entered: whether a cancel held back for it lands now.
 pub(crate) fn unshielded(c: &mut Ctx, entered: Option<Bracketed>) -> bool {
-    match entered {
-        None => false,
-        Some(Bracketed::Region {
-            region,
-            task,
-            shield,
-        }) => {
-            c.regions.iter().any(|(r, _)| *r == region)
-                && unsafe { (*region).unshield(task, shield) }
-        }
-        Some(Bracketed::Production(s)) => crate::simulate::unshield(c, Some(s)),
-    }
+    entered.is_some_and(|b| {
+        c.regions.iter().any(|(r, _)| *r == b.region)
+            && unsafe { (*b.region).unshield(b.task, b.shield) }
+    })
 }
 
 // --- The entry's trail -----------------------------------------------------------------------
@@ -1150,7 +1209,7 @@ unsafe fn run_started(ctx: *mut Ctx, arg: usize) {
     };
     let answer = unsafe { body.call(ctx, &[]) };
     if unsafe { (*ctx).failed } == 0
-        && let Some(t) = unsafe { native_of::<SeededTask>(task) }
+        && let Some(t) = unsafe { native_of::<RegionTask>(task) }
     {
         t.answer = Some(answer);
         t.ended = ANSWERED;
@@ -1178,7 +1237,7 @@ pub unsafe extern "C" fn rt_task_started(ctx: *mut Ctx, s: Handle, id: I64, b: H
         started.release(ctx);
         return internal(unsafe { &mut *ctx }, "a task was started under no id");
     };
-    if let Some(t) = unsafe { native_of::<SeededTask>(started.task) } {
+    if let Some(t) = unsafe { native_of::<RegionTask>(started.task) } {
         t.id = id.0;
     }
     if let Some(old) = stacks.tasks.insert(n, held(started.task)) {
@@ -1270,8 +1329,10 @@ pub unsafe extern "C" fn rt_task_resumed_raising(
             format!("the scheduler wrote a failure the runtime does not read: {why}"),
         )
     });
-    if let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") {
-        stacks.raising = Some(d);
+    if let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks")
+        && let Some(region) = stacks.region.as_mut()
+    {
+        region.raising = Some(d);
     }
     resumed(ctx, &s, id, RESUME_RAISE, 0, 0)
 }
@@ -1344,18 +1405,7 @@ fn yielded(ctx: *mut Ctx, s: &Handle, code: i64, numbers: [i64; 2], kept: Word) 
     if left.word != 0 {
         heap::release_object(ctx, left.word);
     }
-    let c = unsafe { &mut *ctx };
-    match heard.code {
-        RESUME_UNWIND => c.failed = FAILED_CANCELLED,
-        RESUME_RAISE => {
-            let d = stacks.raising.take().unwrap_or_else(|| {
-                Diagnostic::error(codes::INTERNAL_ERROR, "a task was resumed to raise nothing")
-            });
-            let message = d.message.clone();
-            c.pend(d, message);
-        }
-        _ => {}
-    }
+    unsafe { runs_on(region, &heard) };
     I64(heard.code)
 }
 
@@ -1399,11 +1449,18 @@ pub unsafe extern "C" fn rt_task_freed(ctx: *mut Ctx, s: Handle, id: I64) {
     let Ok(n) = u64::try_from(id.0) else {
         return;
     };
+    let mut production = false;
     if let Some(r) = &mut stacks.region {
         r.free(n);
+        production = !r.is_seeded();
     }
     if let Some(t) = stacks.tasks.remove(&n) {
         heap::release_object(ctx, t);
+    }
+    // A task of the run's region may hold spans of the run's trace open, which close as it ends.
+    if production {
+        let c = unsafe { &mut *ctx };
+        c.host_runtime().end_task(c.id, TaskId(n));
     }
 }
 
@@ -1462,7 +1519,7 @@ pub unsafe extern "C" fn rt_task_settled(ctx: *mut Ctx, s: Handle, id: I64) {
     if let Some(t) = u64::try_from(id.0)
         .ok()
         .and_then(|n| stacks.tasks.get(&n).copied())
-        && let Some(t) = unsafe { native_of::<SeededTask>(t) }
+        && let Some(t) = unsafe { native_of::<RegionTask>(t) }
     {
         t.ended = CANCELLED;
     }
@@ -1470,7 +1527,7 @@ pub unsafe extern "C" fn rt_task_settled(ctx: *mut Ctx, s: Handle, id: I64) {
 
 /// A handle of a task of region `region`, its id set as the region starts it.
 pub unsafe extern "C" fn rt_task_made(ctx: *mut Ctx, region: I64) -> Handle {
-    let t = SeededTask {
+    let t = RegionTask {
         region: region.0,
         id: -1,
         ended: LIVE,
@@ -1482,7 +1539,7 @@ pub unsafe extern "C" fn rt_task_made(ctx: *mut Ctx, region: I64) -> Handle {
 /// What the task's handle `t` says, by `which`: its region, its id, or how it ended.
 pub unsafe extern "C" fn rt_task_said(ctx: *mut Ctx, t: Handle, which: I64) -> I64 {
     I64(
-        object::<SeededTask>(ctx, &t, "a task's handle").map_or(-1, |t| match which.0 {
+        object::<RegionTask>(ctx, &t, "a task's handle").map_or(-1, |t| match which.0 {
             0 => t.region,
             1 => t.id,
             _ => t.ended,
@@ -1492,7 +1549,7 @@ pub unsafe extern "C" fn rt_task_said(ctx: *mut Ctx, t: Handle, which: I64) -> I
 
 /// What the task `t` names answered, held once more; the run fails where it has not answered.
 pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
-    match object::<SeededTask>(ctx, &t, "a task's handle").and_then(|t| t.answer) {
+    match object::<RegionTask>(ctx, &t, "a task's handle").and_then(|t| t.answer) {
         Some(w) => Handle::of(held(w)),
         None => {
             internal(
@@ -1508,7 +1565,7 @@ pub unsafe extern "C" fn rt_task_answer(ctx: *mut Ctx, t: Handle) -> Handle {
 pub unsafe extern "C" fn rt_chan_made(ctx: *mut Ctx, region: I64, id: I64) -> Handle {
     object_made(
         ctx,
-        Box::new(SeededChan {
+        Box::new(RegionChan {
             region: region.0,
             id: id.0,
         }),
@@ -1518,7 +1575,7 @@ pub unsafe extern "C" fn rt_chan_made(ctx: *mut Ctx, region: I64, id: I64) -> Ha
 /// What the channel's handle `c` says, by `which`: its region or its id.
 pub unsafe extern "C" fn rt_chan_said(ctx: *mut Ctx, c: Handle, which: I64) -> I64 {
     I64(
-        object::<SeededChan>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
+        object::<RegionChan>(ctx, &c, "a channel's handle").map_or(-1, |c| match which.0 {
             0 => c.region,
             _ => c.id,
         }),
@@ -1614,7 +1671,7 @@ pub unsafe extern "C" fn rt_ticket_watch(ctx: *mut Ctx, token: I64) -> I64 {
 }
 
 /// The watched tickets answered and not yet taken, ascending, each token eight bytes, least
-/// significant first; their answers stay for `ticket_taken`.
+/// significant first; their answers stay for the task that waited on each.
 pub unsafe extern "C" fn rt_tickets_answered(ctx: *mut Ctx) -> TakenBytes {
     with_run(ctx, TakenBytes(0), |c, run| {
         let bytes: Vec<u8> = (run.answered().iter())
@@ -1626,7 +1683,7 @@ pub unsafe extern "C" fn rt_tickets_answered(ctx: *mut Ctx) -> TakenBytes {
 
 /// The bytes ticket `token` was answered, taken: a job that failed fails the run, naming what
 /// asked for it, as does a ticket not yet answered.
-pub unsafe extern "C" fn rt_ticket_taken(ctx: *mut Ctx, token: I64) -> TakenBytes {
+pub fn ticket_taken(ctx: *mut Ctx, token: I64) -> TakenBytes {
     with_run(ctx, TakenBytes(0), |c, run| taken(c, run, token))
 }
 
@@ -1666,6 +1723,22 @@ pub unsafe extern "C" fn rt_tickets_park(ctx: *mut Ctx, deadline: I64) -> I64 {
             I64(0)
         }
     }
+}
+
+/// Notes what the run held as its root's body returned, before the region `s` holds the stacks of
+/// drains its other tasks: `scheduled` tasks the region still holds, and the stacks it keeps.
+pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I64) {
+    let Some(stacks) = object::<Stacks>(ctx, &s, "a region's stacks") else {
+        return;
+    };
+    let task_stacks = stacks.region.as_ref().map_or(0, |r| r.stacks());
+    let c = unsafe { &mut *ctx };
+    c.held_at_root = Some(crate::entry::Held {
+        bridges: c.heap.bridges() as u64,
+        scheduled: u64::try_from(scheduled.0).unwrap_or(0),
+        task_stacks: task_stacks as u64,
+        frame_tables: c.stack_slots() as u64,
+    });
 }
 
 /// The run's clock: nanoseconds since it began. 0, with the run failed, where it has none.

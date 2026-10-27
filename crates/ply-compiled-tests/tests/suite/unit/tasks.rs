@@ -5,8 +5,8 @@ use ply_compiled::native::{Addr, Answered, I64};
 use ply_compiled::rt::{Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, rt_taken};
 use ply_compiled::tasks::{
     self, ANSWERED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Region, Shield,
-    Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_taken, rt_ticket_watch,
-    rt_tickets_answered, rt_tickets_park,
+    Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
+    rt_tickets_park, ticket_taken,
 };
 use ply_core::{Span, codes};
 use ply_host::jobs::{self, Work};
@@ -276,7 +276,7 @@ fn a_watched_ticket_wakes_the_park_and_its_answer_is_taken_in_bytes() {
     assert_eq!(unsafe { rt_tickets_park(&mut ctx, I64(-1)) }.0, 1);
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), watched.to_le_bytes());
-    let n = unsafe { rt_ticket_taken(&mut ctx, I64(watched as i64)) };
+    let n = ticket_taken(&mut ctx, I64(watched as i64));
     assert_eq!(taken(&mut ctx, n.0), b"watched");
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is answered once");

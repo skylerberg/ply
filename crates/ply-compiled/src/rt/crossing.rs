@@ -704,19 +704,6 @@ fn lowering(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Lowering, Str
     Ok(l)
 }
 
-/// `w` lowered through `ty` into a lowering of its own: its bytes, and what stands at each handle
-/// they name, lent while `w` lives.
-pub(crate) fn lowering_of(
-    ctx: *mut Ctx,
-    w: Word,
-    ty: &'static PlyType,
-) -> Result<(Vec<u8>, Vec<Beside>), String> {
-    let l = lowering(ctx, |ctx| unsafe {
-        (ty.lower)(ctx, w);
-    })?;
-    Ok((l.w.finish(), l.beside))
-}
-
 /// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
 /// own, a lent value lowered through its type.
 fn read_back(ctx: *mut Ctx, l: Lowering) -> Result<Value, String> {

@@ -49,10 +49,7 @@ fn level_of(n: I64) -> Option<Level> {
 /// or the machine itself outside one.
 fn traced(c: &mut Ctx) -> Option<(Arc<Trace>, Owner)> {
     let trace = from_host(c, |facilities| Arc::clone(facilities.tracing()))?;
-    Some((
-        trace,
-        (c.id, crate::simulate::running_task_of_production(c)),
-    ))
+    Some((trace, (c.id, crate::tasks::production_task(c))))
 }
 
 /// The fields at `at`, as the real handler writes them.

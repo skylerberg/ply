@@ -1179,7 +1179,8 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         HostAnswer::Value(_) => panic!("a wait waits in the pool"),
     };
 
-    runtime.watch(&waiting).expect("the wait is this run's");
+    let run = ply_host::registry::run_of(&*runtime).expect("a host made the runtime");
+    run.watch(&waiting).expect("the wait is this run's");
     let parked = Instant::now();
     runtime.park().expect("two operations are outstanding");
     assert!(
@@ -1188,10 +1189,7 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         parked.elapsed()
     );
     assert!(
-        runtime
-            .resolved()
-            .iter()
-            .any(|(token, answer)| *token == waiting.token && answer.is_ok()),
+        run.answered().contains(&waiting.token) && run.poll(&waiting).is_ok(),
         "the child's end is what woke the park"
     );
 

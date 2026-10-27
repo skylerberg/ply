@@ -299,33 +299,23 @@ fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
 /// task waits for them while the region's other tasks run, and outside one the thread waits. A job
 /// that failed fails the run, naming what asked for it.
 pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
-    let pending = Pending {
-        token: ticket.0 as u64,
-        label: "a native's job",
-    };
     let c = unsafe { &mut *ctx };
-    if crate::simulate::running_task_of_production(c).is_none() {
-        let runtime = c.host_runtime();
-        return match ply_host::registry::job_bytes(&*runtime, &pending) {
-            Ok(bytes) => c.given(bytes),
-            Err(d) => {
-                c.fail(d);
-                TakenBytes(0)
+    match crate::tasks::waited(c, crate::tasks::ASK_TICKET, ticket.0) {
+        Some(true) => crate::tasks::ticket_taken(ctx, ticket),
+        Some(false) => TakenBytes(0),
+        None => {
+            let pending = Pending {
+                token: ticket.0 as u64,
+                label: "a native's job",
+            };
+            let runtime = c.host_runtime();
+            match ply_host::registry::job_bytes(&*runtime, &pending) {
+                Ok(bytes) => c.given(bytes),
+                Err(d) => {
+                    c.fail(d);
+                    TakenBytes(0)
+                }
             }
-        };
-    }
-    let Some(answered) = (unsafe { crate::simulate::park(ctx, pending) }) else {
-        return TakenBytes(0);
-    };
-    let c = unsafe { &mut *ctx };
-    match &answered {
-        Value::Bytes(bytes) => c.given(bytes.to_vec()),
-        _ => {
-            c.fail(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                "a native's job was answered with no bytes",
-            ));
-            TakenBytes(0)
         }
     }
 }

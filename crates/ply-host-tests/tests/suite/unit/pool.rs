@@ -29,13 +29,23 @@ fn answered(run: &Run, pending: Pending) -> Value {
         .expect("an unbounded wait ends answered")
 }
 
-/// What `run` collects once a watched operation has been answered.
+/// What `run` takes once a watched operation has been answered: each answered token beside its
+/// answer.
 fn collected(run: &Run) -> Vec<(u64, Result<Value, Diagnostic>)> {
     assert!(
         run.park(Some(Duration::from_secs(10)), &|| false),
         "the run watches something"
     );
-    run.resolved()
+    (run.answered().into_iter())
+        .map(|token| {
+            let pending = Pending {
+                token,
+                label: "a test job",
+            };
+            let answer = run.poll(&pending).map(|v| v.expect("answered"));
+            (token, answer)
+        })
+        .collect()
 }
 
 /// Every machine's runtime shares the host's pools, so each collects only what it submitted.
@@ -61,7 +71,7 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
             .collect::<Vec<_>>(),
         [(b.token, Value::Int(2))]
     );
-    assert!(mine.resolved().is_empty(), "an answer is handed back once");
+    assert!(mine.answered().is_empty(), "an answer is handed back once");
 }
 
 /// A job that finishes after its run has ended answers no one, and keeps no thread.

@@ -12,7 +12,6 @@ mod password;
 mod pool;
 mod process;
 mod registry;
-mod sched;
 mod signal;
 mod sockets;
 mod time;

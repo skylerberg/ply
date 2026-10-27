@@ -186,8 +186,7 @@ impl Run {
         self.bell.ring();
     }
 
-    /// Hands `pending` back through `resolved` once it is answered; refuses a token this run did
-    /// not submit.
+    /// Has `answered` name `pending` once it is answered; refuses a token this run did not submit.
     pub fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
         match lock(&self.held).get_mut(&pending.token) {
             Some(held) => {
@@ -213,29 +212,6 @@ impl Run {
             .collect();
         tokens.sort_unstable();
         tokens
-    }
-
-    /// The watched operations answered since the last call, each with its answer.
-    pub fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        let answered: Vec<(u64, Span, &'static str, JobOutput)> = {
-            let mut held = lock(&self.held);
-            let tokens: Vec<u64> = held
-                .iter()
-                .filter(|(_, h)| h.watched && h.answer.is_some())
-                .map(|(token, _)| *token)
-                .collect();
-            tokens
-                .into_iter()
-                .filter_map(|token| {
-                    let h = held.remove(&token)?;
-                    Some((token, h.span, h.what, h.answer?))
-                })
-                .collect()
-        };
-        answered
-            .into_iter()
-            .map(|(token, span, what, answer)| (token, value_of(span, what, answer)))
-            .collect()
     }
 
     /// `pending`'s answer where it has one, which is then taken.

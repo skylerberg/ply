@@ -2381,7 +2381,7 @@ The scheduler that runs a spawned task must be younger than the region whose
 hold the task can reach: open it inside the region,
 `with_hold[r](..) { h -> simulate { .. } }`, and not around it,
 `simulate { with_hold[r](..) { h -> .. } }`. An older scheduler — an enclosing
-`simulate` region (§9), or the production one a run opens outside it — drains the tasks
+`simulate` region (§9), or the run's own region outside any (§14) — drains the tasks
 nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join. A task reaches a hold through
 the closure it is handed, and through the handlers around its `task.spawn`: a
@@ -2694,7 +2694,8 @@ effect sim           { read  seed() -> Int }
 
 * The region's row gains `sim.read`, which a deterministic test may carry.
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
-  wall clock. Outside a region `task` and `clock` are the host's (§14).
+  wall clock. Outside a region `task` is the run's region's and `clock` the
+  host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
   reaches reads only the holds the task itself may (§7). A clause that answers,
   or resumes on its tail, answers the task as it would the spawner; one that
@@ -2719,8 +2720,10 @@ effect sim           { read  seed() -> Int }
   channels, so a handle that
   reaches another region past the checker, in a closure or through a type
   parameter, fails there at run time with `E0413` rather than name one of that
-  region's. `E0414`: no progress, or a spent step budget. `E0416`: nested
-  `simulate`. `E0425`: a host operation inside the region, refused before the
+  region's. `E0414`: no progress, or a spent step budget. `E0416`: a `simulate`
+  inside another; one inside a task of the run's region (§14) runs, its schedule
+  drawn from the entry's seed as any region's is. `E0425`: a host operation
+  inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
   `clock`, `random` and `sim.seed` itself.
 * A `parallel` block (§5.9) inside a region runs its branches in turn, so the
@@ -3459,11 +3462,18 @@ flags say, as the operations of `std.os`, `std.certgen`, `std.config`,
 refuses inside a `simulate` region and in a test the search re-runs, as a host
 operation does (`E0425`). One that would hold the program's thread, as a hash
 does, hands its work to the runtime's threads: as many hashes at once as the
-machine has cores, and the rest in line, while a task of a production region
+machine has cores, and the rest in line, while a task of the run's region
 that asked waits and the region's other tasks run. A test that has the machine
 compute what is a function of what it is handed, as a hash is, is cached like
 any other; one that read the machine is cached with the binding it ran under
 (§8.2), and what a real handler read under a root is what its pass stands on.
+
+`task` is answered by the run's region: every root whose row names it runs as
+the region's first task, and the region answers once every task it spawned has
+ended. Ready tasks run first in, first out. A task that sleeps, or waits on the
+host, waits while the others run; outside a task, as in a `parallel` branch,
+the thread waits. A raise no clause in a task answers fails the run. A
+`simulate` inside a task runs as anywhere else (§9).
 
 The environment is open: `config.get` and `config.secret` answer from `--set`,
 `--config`, the environment and the schema's defaults, under `ply run` and

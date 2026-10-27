@@ -1,7 +1,7 @@
 //! The runtime's vocabulary: values, spans, diagnostics and their codes, effects and their
-//! footprints, the host boundary, and the production scheduler.
+//! footprints, and the host boundary.
 
-// `Value` mixes `Arc` payloads with a task handle's `Rc`, so it is never `Send` by design.
+// `Value` holds `Arc` payloads and is not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod argv;
@@ -29,7 +29,6 @@ pub mod memo;
 mod plain;
 pub mod rc;
 pub mod reflect;
-pub mod sched;
 pub mod semantics;
 pub mod sim;
 mod span;
@@ -48,7 +47,6 @@ pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
 pub use plain::{Fun, Plain, SHOWN_DEPTH, SHOWN_ITEMS};
 pub use rc::RcStats;
-pub use sched::TaskHandle;
 pub use semantics::{strict_binary, unstated};
 pub use sim::{Seed, SimId, TaskId};
 pub use span::{

@@ -87,8 +87,6 @@ pub struct Ctx {
     pub performed: Vec<EffectAtom>,
     /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
     pub(crate) cost_marks: Vec<CostMark>,
-    /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
-    pub sims: Vec<crate::simulate::Simulation>,
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -124,6 +122,8 @@ pub struct Ctx {
     /// The trail the entry's last seeded region left, and the interleaving its regions took, each as
     /// the scheduler wrote it.
     pub(crate) trail_kept: Option<Vec<u8>>,
+    /// What the run held as its root's body returned, where the run's region noted it.
+    pub(crate) held_at_root: Option<crate::entry::Held>,
     pub interleaving: Option<Vec<u8>>,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
@@ -269,7 +269,6 @@ impl Ctx {
             current: 0,
             performed: Vec::new(),
             cost_marks: Vec::new(),
-            sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
@@ -290,6 +289,7 @@ impl Ctx {
             regions: Vec::new(),
             footprint: Vec::new(),
             trail_kept: None,
+            held_at_root: None,
             interleaving: None,
             unwind: None,
             aborting: None,
@@ -456,12 +456,13 @@ impl Ctx {
     }
 
     /// Whether a `parallel` block's branches may run on other threads: nothing they perform can then
-    /// reach a handler this entry holds, a region's scheduler or this thread's host runtime, all of
-    /// which live on this thread. `reach` is every operation the branches may perform that they do
-    /// not answer themselves, where the block's site knows it; a block that does not is kept from any
-    /// handler at all.
+    /// reach a handler this entry holds or this thread's host runtime, which live on this thread,
+    /// and no seeded region records their steps. A branch performs no `task` operation, and one
+    /// that waits waits on its own thread, so the run's region keeps no block in turn. `reach` is
+    /// every operation the branches may perform that they do not answer themselves, where the
+    /// block's site knows it; a block that does not is kept from any handler at all.
     pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
-        if !self.sims.is_empty() || !self.regions.is_empty() {
+        if (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() }) {
             return false;
         }
         self.frames_in_reach()
@@ -526,12 +527,12 @@ impl Ctx {
         self.current = 0;
         self.performed.clear();
         self.cost_marks.clear();
-        self.sims.clear();
         self.starting_detached = None;
         self.entered_sims = 0;
         self.regions.clear();
         self.footprint.clear();
         self.trail_kept = None;
+        self.held_at_root = None;
         self.interleaving = None;
         self.handlers_made = 0;
         self.holds_made = 0;
@@ -620,8 +621,6 @@ impl Ctx {
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
-        // A region left open lets go of the values its tasks passed while the entry's heap lives.
-        drop(std::mem::take(&mut self.sims));
         if let Some(p) = self.pending.take() {
             p.release();
         }

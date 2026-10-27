@@ -60,13 +60,6 @@ const REPEATABLE: &Rows = &[
     // Every draw is independent of every other, so a run may take as many as it likes.
     ("std.random.entropy", &["below", "next", "secret"]),
     ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
-    (
-        "task",
-        &[
-            "await", "cancel", "channel", "close", "join", "recv", "select", "send", "spawn",
-            "yield",
-        ],
-    ),
 ];
 
 /// A deterministic handler's test is cached with no binding to answer for it, so each one is a
@@ -98,7 +91,7 @@ fn a_registry_and_a_runtime_come_from_one_host() {
         label: "stray",
     };
     assert_eq!(
-        runtime
+        (ply_host::registry::run_of(&*runtime).expect("a host made the runtime"))
             .watch(&stray)
             .expect_err("a token nothing minted is refused")
             .code,

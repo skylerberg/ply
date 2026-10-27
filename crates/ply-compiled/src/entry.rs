@@ -204,15 +204,16 @@ pub struct Usage {
     pub updates_in_place: u64,
 }
 
-/// What a run still held when an entry's root body returned, before its production region drained:
-/// what grows with the work a long-running program does if anything is never given back.
+/// What a run still held when an entry's root body returned, before the run's region drained its
+/// other tasks: what grows with the work a long-running program does if anything is never given
+/// back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
     /// Heap objects standing for a runtime value, such as a task's handle.
     pub bridges: u64,
-    /// Tasks the production region's scheduler still tracks.
+    /// Tasks the run's region still holds.
     pub scheduled: u64,
-    /// Task stacks the production region still keeps.
+    /// Task stacks the run's region still keeps, its tasks' and those it keeps for its next ones.
     pub task_stacks: u64,
     /// Frame tables kept for stacks that are or were running.
     pub frame_tables: u64,
@@ -415,19 +416,15 @@ fn entered(
     (ended, last)
 }
 
-/// What an entry leaves once its root returned: its production region's other tasks run to their
-/// ends first, and its host runtime told the entry is over.
+/// What an entry leaves once its root returned, its run's region drained: its host runtime told
+/// the entry is over.
 fn returned(ctx: &mut Ctx) -> Last {
-    let production = ctx.sims.last();
-    let held = Held {
+    let held = ctx.held_at_root.take().unwrap_or(Held {
         bridges: ctx.heap.bridges() as u64,
-        scheduled: production.map_or(0, |sim| sim.scheduled() as u64),
-        task_stacks: production.map_or(0, |sim| sim.task_slots() as u64),
+        scheduled: 0,
+        task_stacks: 0,
         frame_tables: ctx.stack_slots() as u64,
-    };
-    if !ctx.sims.is_empty() {
-        unsafe { crate::simulate::finish_root(std::ptr::from_mut(ctx)) };
-    }
+    });
     if let Some(rt) = ctx.runtime.clone() {
         let warned = rt.end_entry_point(ctx.id);
         ctx.teardown.extend(warned);

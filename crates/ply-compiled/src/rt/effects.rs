@@ -550,15 +550,6 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
         if target.is_some() {
             return c.fail(err_handle_gone(&effect, &op));
         }
-        // Inside an open production region a `task` op is the scheduler's; outside, the host's.
-        if effect.as_str() == "task"
-            && ply_core::sim::TASK_OPS.contains(&op.as_str())
-            && !c.sims.is_empty()
-        {
-            return unsafe {
-                crate::simulate::perform(ctx, &effect, &op, args_of(args, n), described)
-            };
-        }
         return unsafe {
             to_host(
                 ctx,
@@ -691,7 +682,7 @@ fn err_handle_gone(effect: &Symbol, op: &Symbol) -> Diagnostic {
 
 /// The host's answer to an operation `described` describes, `args` its word forms, which this
 /// takes: each lowered through its parameter's type and let go through it, and the answer lifted
-/// through the operation's. One the production scheduler answers is handed it as it was performed.
+/// through the operation's. A sleep by a task of the run's region waits there instead.
 unsafe fn to_host(
     ctx: *mut Ctx,
     described: &PlyOp,

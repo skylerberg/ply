@@ -2,27 +2,12 @@
 //! shares: what one run left behind, and how a job ended, decide nothing for another's wait. A
 //! binary of its own, since each test here leaves the process's pools holding what it left.
 
-use ply_core::host::{Grants, HostRuntime, MachineId};
-use ply_core::sched::{HostPolicy, ROOT, Reply, Resumption, Scheduler, Turn};
-use ply_core::{HostRegistry, SimId, Span, Value};
+use ply_core::host::HostRuntime;
+use ply_core::{Span, Value};
 use ply_host::jobs::{self, Work};
 use ply_host::registry::{run_of, unbound};
 use std::sync::mpsc;
 use std::time::Duration;
-
-type Sched = Scheduler<usize, Value, Value>;
-
-fn production() -> Sched {
-    let mut registry = HostRegistry::new();
-    for (op, handler) in ply_host::sched::registrations() {
-        registry.register(op, handler);
-    }
-    let binding = registry
-        .granted(Grants::default())
-        .expect("no two task registrations serve one operation");
-    let permit = HostPolicy::of(&binding).expect("a bound binding mints a permit");
-    Scheduler::production(SimId(0), Span::DUMMY, permit, MachineId::next())
-}
 
 fn submitted(
     runtime: &dyn HostRuntime,
@@ -34,8 +19,8 @@ fn submitted(
     jobs::submit(work, run, Span::DUMMY, "test", what, job).expect("a thread is had")
 }
 
-/// What a run leaves when it ends with a task parked on a hash, as one that failed or cancelled
-/// that task does: a finished job its runtime watched and never collected.
+/// What a run leaves when it ends with a task waiting on a hash, as one that failed or cancelled
+/// that task does: a finished job it watched and never took.
 fn abandon_a_finished_job() {
     let gone = unbound()();
     let (ran, heard) = mpsc::channel();
@@ -43,42 +28,32 @@ fn abandon_a_finished_job() {
         let _ = ran.send(());
         Ok(vec![0])
     });
-    gone.watch(&ticket).expect("the run submitted it");
+    (run_of(&*gone).expect("a host made the runtime"))
+        .watch(&ticket)
+        .expect("the run submitted it");
     heard.recv().expect("the job ran");
 }
 
-/// A later run's production region parks on its own hash and is woken by that hash, however long
-/// it takes, whatever an earlier run of the process left in the pool.
+/// A later run waiting on its own hash is woken by that hash, however long it takes, whatever an
+/// earlier run of the process left in the pool.
 #[test]
-fn a_region_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
+fn a_run_waits_for_its_own_job_past_one_an_ended_run_left_uncollected() {
     abandon_a_finished_job();
     let rt = unbound()();
-    let mut sched = production();
-    let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
-        panic!("expected the root's step");
-    };
     let ticket = submitted(&*rt, Work::Computing, "a hash", || {
         std::thread::sleep(Duration::from_millis(200));
         Ok(b"hashed".to_vec())
     });
-    sched
-        .park_on_host(0, ticket, Span::DUMMY, &*rt)
-        .expect("the root is running");
-    match sched.next_host(&*rt) {
-        Ok(Turn::Run {
-            task,
-            resumption:
-                Resumption::Resume {
-                    value: Reply::Value(Value::Bytes(ref bytes)),
-                    ..
-                },
-        }) => {
-            assert_eq!(task, ROOT);
-            assert_eq!(bytes.to_vec(), b"hashed");
-        }
-        Ok(_) => panic!("the root was not resumed with its job's bytes"),
-        Err(d) => panic!("the region failed waiting on its own job: {}", d.message),
+    let run = run_of(&*rt).expect("a host made the runtime");
+    run.watch(&ticket).expect("the run submitted it");
+    while run.answered().is_empty() {
+        rt.park().expect("the run watches its own job");
     }
+    assert_eq!(run.answered(), vec![ticket.token]);
+    assert_eq!(
+        run.taken(&ticket).expect("its own ticket"),
+        Some(b"hashed".to_vec())
+    );
 }
 
 /// A job of the waiting pool that panics fails the run waiting on it, as one of the computing
@@ -111,7 +86,9 @@ fn one_runs_token_is_none_of_anothers() {
     let (mine, theirs) = (factory(), factory());
     let ticket = submitted(&*mine, Work::Waiting, "a lookup", || Ok(b"mine".to_vec()));
     assert!(
-        theirs.watch(&ticket).is_err(),
+        (run_of(&*theirs).expect("a host made the runtime"))
+            .watch(&ticket)
+            .is_err(),
         "another run may not watch it"
     );
     assert!(theirs.block_on(ticket).is_err(), "nor wait on it");

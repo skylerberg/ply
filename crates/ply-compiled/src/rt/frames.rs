@@ -573,32 +573,6 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
     }
 }
 
-pub(super) fn copied_frames(list: &[HandlerFrame], sharing_vars: bool) -> Vec<HandlerFrame> {
-    list.iter().map(|f| copied_frame(f, sharing_vars)).collect()
-}
-
-/// A spawned task's copies of the handlers around its spawn, at the bottom of its own stack; none
-/// may name a detached body, whose clause would capture the spawner's stack. They share the
-/// handlers' variables.
-pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
-    copied_frames(list, true)
-        .into_iter()
-        .map(|f| {
-            // The `handle` a copy stands for may be over before the task raises, so a raise the task
-            // does not answer itself leaves for the region's own surroundings instead.
-            let (raises, clauses): (Vec<FrameClause>, Vec<FrameClause>) =
-                f.clauses.into_iter().partition(FrameClause::raises);
-            raises.into_iter().for_each(FrameClause::release);
-            HandlerFrame {
-                clauses,
-                detached: None,
-                inherited: true,
-                ..f
-            }
-        })
-        .collect()
-}
-
 pub(crate) fn drop_frame(f: HandlerFrame) {
     f.clauses.into_iter().for_each(FrameClause::release);
     if f.ret != 0 {

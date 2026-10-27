@@ -9,12 +9,6 @@ use std::sync::Arc;
 struct Nothing;
 
 impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        Vec::new()
-    }
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
     }

@@ -1,6 +1,5 @@
 use crate::builtins::Builtin;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
-use crate::sched::{ChanHandle, TaskHandle};
 use crate::{Diagnostic, IntTy, Span, Symbol, codes};
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;
@@ -234,9 +233,6 @@ pub enum Value {
         args: Arc<Vec<Value>>,
     },
     Closure(Arc<Closure>),
-    /// Compared by region and id; its count is what tells a production region the task can retire.
-    Task(TaskHandle),
-    Chan(ChanHandle),
     /// A credential; a distinct variant rather than a `Ctor`, so no pattern match can unwrap it.
     Secret(Arc<Sealed>),
 }
@@ -437,8 +433,6 @@ impl Value {
             Value::Record(_) => "record",
             Value::Ctor { .. } => "variant",
             Value::Closure(_) => "function",
-            Value::Task(_) => "Task",
-            Value::Chan(_) => "Chan",
             Value::Secret(_) => "Secret",
         }
     }
@@ -533,20 +527,6 @@ impl Value {
         match self {
             Value::Map(m) => Ok(m),
             other => Err(type_error(span, what, "Map", other)),
-        }
-    }
-
-    pub fn as_task(&self, span: Span, what: &str) -> Result<&TaskHandle, Diagnostic> {
-        match self {
-            Value::Task(handle) => Ok(handle),
-            other => Err(type_error(span, what, "Task", other)),
-        }
-    }
-
-    pub fn as_chan(&self, span: Span, what: &str) -> Result<ChanHandle, Diagnostic> {
-        match self {
-            Value::Chan(handle) => Ok(*handle),
-            other => Err(type_error(span, what, "Chan", other)),
         }
     }
 }
@@ -792,12 +772,10 @@ fn discriminant(v: &Value) -> u8 {
         Value::Record(_) => 9,
         Value::Ctor { .. } => 10,
         Value::Closure(_) => 11,
-        Value::Task(_) => 13,
         Value::Secret(_) => 14,
         Value::Fixed(_) => 15,
         Value::Char(_) => 16,
         Value::Array(_) => 17,
-        Value::Chan(_) => 18,
     }
 }
 
@@ -831,8 +809,6 @@ impl Ord for Value {
                 }
                 grow(|| n1.cmp(n2).then_with(|| a1.iter().cmp(a2.iter())))
             }
-            (Value::Task(x), Value::Task(y)) => (x.region(), x.id()).cmp(&(y.region(), y.id())),
-            (Value::Chan(x), Value::Chan(y)) => x.cmp(y),
             // Unreachable from a well-typed program: a `Secret` has no order.
             (Value::Secret(x), Value::Secret(y)) => (x.text, &x.bytes).cmp(&(y.text, &y.bytes)),
             (Value::Closure(_), Value::Closure(_)) => Ordering::Equal,
@@ -994,8 +970,6 @@ fn equal_at(
                 Ok(true)
             });
         }
-        (Value::Task(x), Value::Task(y)) => x.region() == y.region() && x.id() == y.id(),
-        (Value::Chan(x), Value::Chan(y)) => x == y,
         (Value::Secret(x), Value::Secret(y)) => {
             x.text == y.text && constant_time_eq(&x.bytes, &y.bytes)
         }

@@ -37,24 +37,23 @@ fn a_jobs_ticket_is_answered_through_an_unbound_runtime_and_a_hosts() {
     assert_eq!(bytes_of(host.block_on(ticket)), [1, 2, 3]);
 }
 
-/// A production region parks a task on its ticket and collects it once it resolves.
+/// The run's region waits on a ticket it watches and takes its answer once it is answered.
 #[test]
-fn a_watched_ticket_resolves_into_the_runtime_that_watched_it() {
+fn a_watched_ticket_is_answered_to_the_run_that_watched_it() {
     let runtime = ply_host::Host::new().runtime();
     let ticket = submitted(&*runtime, Work::Waiting, "a test job", || {
         Ok(b"late".to_vec())
     });
-    runtime.watch(&ticket).expect("the run submitted it");
-    let resolved = loop {
+    let run = run_of(&*runtime).expect("a host made the runtime");
+    run.watch(&ticket).expect("the run submitted it");
+    while run.answered().is_empty() {
         runtime.park().expect("one ticket is outstanding");
-        let resolved = runtime.resolved();
-        if !resolved.is_empty() {
-            break resolved;
-        }
-    };
-    let [(token, answer)] = <[_; 1]>::try_from(resolved).expect("one ticket resolved");
-    assert_eq!(token, ticket.token);
-    assert_eq!(bytes_of(answer), b"late");
+    }
+    assert_eq!(run.answered(), [ticket.token]);
+    assert_eq!(
+        run.taken(&ticket).expect("its own ticket"),
+        Some(b"late".to_vec())
+    );
 }
 
 /// A job that answers why it failed fails the run that waits on it, naming what asked.

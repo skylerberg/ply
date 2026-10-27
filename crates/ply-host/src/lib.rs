@@ -81,7 +81,6 @@ pub mod pool;
 pub mod process;
 pub mod random;
 pub mod registry;
-pub mod sched;
 pub mod signal;
 pub mod sqlite;
 pub mod stdio;

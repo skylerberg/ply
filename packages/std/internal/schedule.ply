@@ -1841,6 +1841,32 @@ extern fn chan_said(c: Chan<Kept>, which: Int) -> Int
 /// Fails the run with the region's failure `failure_bytes` wrote.
 extern fn region_failed(failure: Bytes) -> Unit / {native.write}
 
+/// Has `tickets_answered` say the ticket of `token` once it is answered: 1, or 0 with the run
+/// failed for a ticket the run did not hand out.
+extern fn ticket_watch(token: Int) -> Int / {native.write}
+
+/// The watched tickets answered and not yet taken, ascending, each token eight bytes, the least
+/// significant first.
+extern fn tickets_answered() -> Bytes / {native.read}
+
+/// Waits until a watched ticket is answered, the run is told to stop, or the run's clock reaches
+/// `deadline` where it is not below 0: 1, or 0 with the run failed where it watches nothing and has
+/// no deadline, which nothing would end.
+extern fn tickets_park(deadline: Int) -> Int / {native.read}
+
+/// The run's clock: nanoseconds since it began.
+extern fn host_now() -> Int / {native.read}
+
+/// Notes what the run holds as its root's body returns, before the region whose stacks are `s`
+/// drains its other tasks: `scheduled` tasks it still holds, and the stacks it keeps.
+extern fn root_returned(s: Stacks, scheduled: Int) -> Unit / {native.write}
+
+/// 1 where the run has been told to stop, else 0.
+extern fn run_stopping() -> Int / {native.read}
+
+/// 1, with the run failed saying so, where its drain after a stop has run out of time; else 0.
+extern fn run_drained() -> Int / {native.write}
+
 // --- How a perform crosses ------------------------------------------------------------------
 
 // A perform of a `task` operation at a type other than `Kept` is a call of its crossing here: each
@@ -1917,6 +1943,9 @@ fn ask_sleep() -> Int = 11
 fn ask_next() -> Int = 12
 fn ask_below() -> Int = 13
 fn ask_seed() -> Int = 14
+// The runtime asks this itself, and `ask_sleep`, for a host operation or a native's job that waits
+// on the run or its clock; `tasks.rs` names them `ASK_TICKET` and `ASK_SLEEP`.
+fn ask_ticket() -> Int = 15
 
 // How a task's body ended, as `task_resumed` answers it.
 fn body_answered() -> Int = 0 - 1
@@ -1976,6 +2005,7 @@ fn request_of(
   else if code == ask_next() { Next }
   else if code == ask_below() { Below(a) }
   else if code == ask_seed() { Seed }
+  else if code == ask_ticket() { Ticket(a) }
   else if code == body_answered() { Finished }
   else if code == body_unwound() { Unwound } else if code == body_raised() {
     Raised(
@@ -1983,6 +2013,64 @@ fn request_of(
         if other == id { m } else { m.insert(other, shields_of(s, other)) }),
     )
   } else { Failed }
+}
+
+// What a region's clause for each `task` operation answers, the running task of the region whose
+// stacks are `s` asking its loop.
+
+fn join_answer(s: Stacks, t: Task<Kept>) -> Kept / {native.read, native.write} = {
+  asked_about(s, ask_join(), t);
+  task_answer(t)
+}
+
+fn await_answer(s: Stacks, t: Task<Kept>) -> Option<Kept> / {native.read, native.write} =
+  if asked_about(s, ask_await(), t) == heard_flag() && heard_number(s) == 1 { Some(task_answer(t)) }
+  else { None }
+
+fn cancel_answer(s: Stacks, t: Task<Kept>) -> Bool / {native.read, native.write} = {
+  asked_about(s, ask_cancel(), t);
+  heard_number(s) == 1
+}
+
+fn yield_answer(s: Stacks) -> Unit / {native.write} = {
+  task_yielded(s, ask_yield(), 0, 0);
+  ()
+}
+
+fn channel_answer(
+  s: Stacks,
+  region: Int,
+  capacity: Int,
+) -> Chan<Kept> / {native.read, native.write} = {
+  task_yielded(s, ask_channel(), capacity, 0);
+  chan_made(region, heard_number(s))
+}
+
+fn send_answer(s: Stacks, c: Chan<Kept>, x: Kept) -> Bool / {native.read, native.write} = {
+  task_yielded_kept(s, ask_send(), chan_said(c, 1), chan_said(c, 0), x);
+  heard_number(s) == 1
+}
+
+fn recv_answer(s: Stacks, c: Chan<Kept>) -> Option<Kept> / {native.write} =
+  if task_yielded(s, ask_recv(), chan_said(c, 1), chan_said(c, 0)) == heard_received() {
+    Some(heard_kept(s))
+  } else { None }
+
+fn close_answer(s: Stacks, c: Chan<Kept>) -> Unit / {native.write} = {
+  task_yielded(s, ask_close(), chan_said(c, 1), chan_said(c, 0));
+  ()
+}
+
+fn select_answer(
+  s: Stacks,
+  arms: List<(Chan<Kept>, Option<Kept>)>,
+  wait: Bool,
+) -> Option<(Int, Option<Kept>)> / {native.write} = {
+  let asked = arms.map(|arm: (Chan<Kept>, Option<Kept>)|
+    { chan: { region: chan_said(arm._0, 0), id: chan_said(arm._0, 1) }, send: arm._1 });
+  task_yielded_kept(s, ask_select(), if wait { 1 } else { 0 }, 0, keep(asked));
+  let went: Option<{ at: Int, got: Option<Kept> }> = open(heard_kept(s));
+  match went { Some(w) -> Some((w.at, w.got)), None -> None }
 }
 
 /// Resumes task `id` as `res`: the code of what it asks next, or of how its body ended.
@@ -2040,43 +2128,15 @@ pub fn simulated<a | e>(
       task_yielded_kept(stacks, ask_spawn(), 0, 0, keep(task_body(t, f)));
       t
     },
-    task.join(t) -> {
-      asked_about(stacks, ask_join(), t);
-      task_answer(t)
-    },
-    task.await(t) -> if asked_about(stacks, ask_await(), t) == heard_flag()
-        && heard_number(stacks) == 1 { Some(task_answer(t)) }
-    else { None },
-    task.cancel(t) -> {
-      asked_about(stacks, ask_cancel(), t);
-      heard_number(stacks) == 1
-    },
-    task.yield() -> {
-      task_yielded(stacks, ask_yield(), 0, 0);
-      ()
-    },
-    task.channel(n) -> {
-      task_yielded(stacks, ask_channel(), n, 0);
-      chan_made(id, heard_number(stacks))
-    },
-    task.send(c, x) -> {
-      task_yielded_kept(stacks, ask_send(), chan_said(c, 1), chan_said(c, 0), x);
-      heard_number(stacks) == 1
-    },
-    task.recv(c) -> if task_yielded(stacks, ask_recv(), chan_said(c, 1), chan_said(c, 0))
-        == heard_received() { Some(heard_kept(stacks)) }
-    else { None },
-    task.close(c) -> {
-      task_yielded(stacks, ask_close(), chan_said(c, 1), chan_said(c, 0));
-      ()
-    },
-    task.select(arms, wait) -> {
-      let asked = arms.map(|arm: (Chan<Kept>, Option<Kept>)|
-        { chan: { region: chan_said(arm._0, 0), id: chan_said(arm._0, 1) }, send: arm._1 });
-      task_yielded_kept(stacks, ask_select(), if wait { 1 } else { 0 }, 0, keep(asked));
-      let went: Option<{ at: Int, got: Option<Kept> }> = open(heard_kept(stacks));
-      match went { Some(w) -> Some((w.at, w.got)), None -> None }
-    },
+    task.join(t) -> join_answer(stacks, t),
+    task.await(t) -> await_answer(stacks, t),
+    task.cancel(t) -> cancel_answer(stacks, t),
+    task.yield() -> yield_answer(stacks),
+    task.channel(n) -> channel_answer(stacks, id, n),
+    task.send(c, x) -> send_answer(stacks, c, x),
+    task.recv(c) -> recv_answer(stacks, c),
+    task.close(c) -> close_answer(stacks, c),
+    task.select(arms, wait) -> select_answer(stacks, arms, wait),
     clock.now() -> {
       task_yielded(stacks, ask_now(), 0, 0);
       Instant(heard_number(stacks))
@@ -2191,6 +2251,137 @@ fn obeyed(s: Stacks, o: Order) -> Unit / {native.write} =
     Settled(id) -> task_settled(s, id),
     DropRaise(id) -> task_freed(s, id),
   }
+
+// --- The run's region ------------------------------------------------------------------------
+
+/// The run's region, which an entry runs a root that performs `task` under: `body` runs as its task
+/// 0 and every task's `task` operations are answered here, ready tasks first in, first out. A task
+/// that waits on the host or sleeps waits here while the others run. It answers once every task has
+/// ended; a raise that leaves a task lands at the entry once every other task has ended.
+pub fn scheduled<a | e>(
+  body: keep () -> a / {task.write | e},
+) -> a / {abort.raise, native.read, native.write, diverges | e} = {
+  let stacks = stacks_opened(false, nowhere().root, 0, 0);
+  let id = stacks_region(stacks);
+  let root_task = task_made(id);
+  handle {
+    task_started(stacks, 0, task_body(root_task, || keep(body())));
+    served(stacks, id);
+    open(task_answer(root_task))
+  } with {
+    task.spawn(f) -> {
+      let t = task_made(id);
+      task_yielded_kept(stacks, ask_spawn(), 0, 0, keep(task_body(t, f)));
+      t
+    },
+    task.join(t) -> join_answer(stacks, t),
+    task.await(t) -> await_answer(stacks, t),
+    task.cancel(t) -> cancel_answer(stacks, t),
+    task.yield() -> yield_answer(stacks),
+    task.channel(n) -> channel_answer(stacks, id, n),
+    task.send(c, x) -> send_answer(stacks, c, x),
+    task.recv(c) -> recv_answer(stacks, c),
+    task.close(c) -> close_answer(stacks, c),
+    task.select(arms, wait) -> select_answer(stacks, arms, wait),
+  }
+}
+
+/// What the run's loop holds: the region, the task it ran last, and how many waits on the run in a
+/// row woke nothing.
+type Serving = { region: Region<Kept>, last: Int, parks: Int }
+
+/// The run's loop over the stacks `s` of region `id`: runs the task each turn names and applies what
+/// it asks, waiting on the run where none is ready, until the region ends; then answers, fails the
+/// run, or lands the raise that left a task, as the region ended.
+fn served(s: Stacks, id: Int) -> Unit / {abort.raise, native.read, native.write, diverges} = {
+  let ended = serving(s, { region: production(id, nowhere()), last: 0, parks: 0 });
+  let r = ended.serving.region;
+  match ended.turn {
+    Complete -> (),
+    Reraise(task) -> {
+      task_restored(s, task, "");
+      ()
+    },
+    Ends(Refused(f)) -> region_failed(failure_bytes(f)),
+    Ends(TaskFailed(note)) -> {
+      task_restored(s, ended.serving.last, match note { Some(n) -> n, None -> "" });
+      ()
+    },
+    _ -> region_failed(failure_bytes(internal(r, "the run's region stopped waiting"))),
+  }
+}
+
+/// The run's loop from `l`, as far as a turn that runs nothing: that turn, and the loop there. A
+/// drain after a stop that has run out of time has failed the run, which ends the loop.
+fn serving(
+  s: Stacks,
+  l: Serving,
+) -> { serving: Serving, turn: Turn<Kept> } / {abort.raise, native.read, native.write, diverges} =
+  if run_drained() != 0 { { serving: l, turn: Ends(TaskFailed(None)) } }
+  else { served_turn(s, l, turned(l.region, { now: host_now(), stopping: run_stopping() != 0 })) }
+
+fn served_turn(
+  s: Stacks,
+  l: Serving,
+  t: Turned<Kept>,
+) -> { serving: Serving, turn: Turn<Kept> } / {abort.raise, native.read, native.write, diverges} =
+  match t.turn {
+    Run(task, res) -> {
+      let code = resumed_as(s, task, res);
+      let child = t.region.next_id;
+      let at = {
+        site: { root: asked_site(s, 0), start: asked_site(s, 1), end: asked_site(s, 2) },
+        shields: shields_of(s, task),
+        now: host_now(),
+      };
+      let request = request_of(s, t.region, task, code);
+      match request { Ticket(token) -> ticket_watch(token), _ -> 0 };
+      if task == 0 && code == body_answered() { root_returned(s, held(t.region)) };
+      let next = asked(t.region, task, request, at);
+      if code == ask_spawn() && next.next_id > child {
+        task_started(s, child, open(asked_kept(s)))
+      };
+      if code == body_answered() || code == body_unwound() { task_freed(s, task) };
+      let given = orders_taken(next);
+      given.orders.fold((), |_u: Unit, o: Order| obeyed(s, o));
+      serving(s, { region: given.region, last: task, parks: 0 })
+    },
+    Idle(deadline) -> {
+      tickets_park(match deadline { Some(d) -> d, None -> 0 - 1 });
+      let after = parked(
+        { ..l, region: t.region },
+        deadline,
+        tokens_of(tickets_answered()),
+        run_stopping() != 0,
+      );
+      match after.region.ending {
+        Some(e) -> { serving: after, turn: Ends(e) },
+        None -> serving(s, after),
+      }
+    },
+    other -> { serving: { ..l, region: t.region }, turn: other },
+  }
+
+/// The loop once a wait on the run ended with `tokens` answered: each task waiting on one of them
+/// readied, the region refused where waits that could only end by an answer woke nothing too many
+/// times in a row. A wait a stop ended is how an idle service hears a signal, and one bounded by
+/// `deadline` ends when it passes, so neither is fruitless.
+fn parked(
+  l: Serving,
+  deadline: Option<Int>,
+  tokens: List<Int>,
+  stopping: Bool,
+) -> Serving / {abort.raise} = {
+  let parks = if tokens.len() == 0 && deadline == None && !stopping { l.parks + 1 } else { 0 };
+  let region = woke(l.region, tokens);
+  if parks > fruitless_parks() { { ..l, region: broke(region, fruitless(region)), parks: parks } }
+  else { { ..l, region: region, parks: parks } }
+}
+
+/// The tokens `bytes` holds, each eight bytes, the least significant first.
+fn tokens_of(bytes: Bytes) -> List<Int> / {abort.raise} =
+  range(0, bytes.len() / 8).map(|i: Int|
+    range(0, 8).fold(0, |acc: Int, j: Int| acc | bytes.at(8 * i + j) << 8 * j))
 
 // --- Tests --------------------------------------------------------------------------
 
@@ -2452,4 +2643,33 @@ test "a production region keeps no task that has ended, and a join reads the han
   assert_eq(held(ended.region), 1);
   assert_eq(then(ended, 0, Join({ ..live(1), ended: Answered })).turn, Run(0, Resume(Joined)));
   assert_eq(code_of(then(ended, 0, Join(live(1)))), "E0413")
+}
+
+/// The run's loop over a fresh region, `parks` waits in a row having woken nothing.
+fn serving_at(parks: Int) -> Serving =
+  { region: production(0, region_site()), last: 0, parks: parks }
+
+/// The code the region ended with, where it ended refused.
+fn refused_code(l: Serving) -> String =
+  match l.region.ending { Some(Refused(f)) -> f.code, _ -> "" }
+
+test "waits on the run that wake nothing refuse the region past the bound, and none a deadline or a stop ended counts" {
+  assert_eq(refused_code(parked(serving_at(fruitless_parks()), None, [], false)), "E0505");
+  assert_eq(refused_code(parked(serving_at(fruitless_parks() - 1), None, [], false)), "");
+  assert_eq(
+    [
+      parked(serving_at(fruitless_parks()), Some(5), [], false),
+      parked(serving_at(fruitless_parks()), None, [], true),
+      parked(serving_at(3), None, [7], false),
+    ].map(|l: Serving| l.parks),
+    [0, 0, 0],
+  )
+}
+
+test "the tickets the run answered read back from their bytes, the least significant first" {
+  assert_eq(tokens_of(b"\x01\x00\x00\x00\x00\x00\x00\x00\x02\x01\x00\x00\x00\x00\x00\x00"), [
+    1,
+    258,
+  ]);
+  assert_eq(tokens_of(b""), [])
 }

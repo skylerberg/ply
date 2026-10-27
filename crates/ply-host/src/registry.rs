@@ -8,7 +8,6 @@ use crate::fs;
 use crate::pool::{Bell, Run, err_nothing_outstanding};
 use crate::process;
 use crate::random;
-use crate::sched;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
 use crate::tcp;
@@ -124,7 +123,6 @@ impl Host {
         fs::register(&mut registry, Arc::clone(&self.fs));
         process::register(&mut registry, self.process.as_ref());
         random::register(&mut registry);
-        sched::register(&mut registry);
         time::register(&mut registry, Arc::clone(&self.time));
         registry
     }
@@ -289,14 +287,6 @@ impl Facilities {
 impl HostRuntime for Facilities {
     fn facilities(&self) -> Option<&dyn std::any::Any> {
         Some(self)
-    }
-
-    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
-        self.run.watch(pending)
-    }
-
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.run.resolved()
     }
 
     /// Ends at a stop too, which an idle service sees no other way.

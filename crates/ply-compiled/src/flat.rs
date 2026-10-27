@@ -101,8 +101,8 @@ impl Writer {
         self
     }
 
-    /// A value a diagnostic shows, as `std.value.Value`: its case's place among that type's cases,
-    /// then what the case holds.
+    /// A value a diagnostic shows, as `std.value.Value`: its case's tag, then what the case holds.
+    // Tags 15 and 16 stay unused, so a toolchain of another build reads the others alike.
     pub fn plain(&mut self, p: &Plain) -> &mut Writer {
         match p {
             Plain::Unit => self.tag(0),
@@ -133,8 +133,6 @@ impl Writer {
             }),
             Plain::Fn(f) => self.tag(13).fun(f),
             Plain::Hold => self.tag(14),
-            Plain::Task(n) => self.tag(15).count(*n),
-            Plain::Chan(n) => self.tag(16).count(*n),
             Plain::Secret => self.tag(17),
             Plain::Elided(n) => self.tag(18).count(*n),
             Plain::Array(items) => self.tag(19).list(items.iter(), |w, p| {

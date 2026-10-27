@@ -13,7 +13,6 @@ mod list;
 mod memo;
 mod numerics;
 mod rc;
-mod sched;
 mod sim;
 mod span;
 mod sqlite;

@@ -18,7 +18,6 @@ pub fn world_independent(value: &Value) -> bool {
             | Value::Bytes(_)
             | Value::Secret(_)
             | Value::Unit => {}
-            Value::Task(_) | Value::Chan(_) => return false,
             Value::List(items) => pending.extend(items.iter()),
             Value::Array(items) => pending.extend(items.iter()),
             Value::Map(map) => {
