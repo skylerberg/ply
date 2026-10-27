@@ -181,7 +181,7 @@ pub(crate) struct Unwinding {
     ending: i64,
     unwind: Option<(usize, usize, Word)>,
     raise: Option<usize>,
-    entered: Option<crate::simulate::Shielded>,
+    entered: Option<crate::tasks::Bracketed>,
 }
 
 /// The words emitted code sets aside in its frame for an [`Unwinding`].
@@ -202,7 +202,7 @@ pub unsafe extern "C" fn rt_unwind_hold(ctx: *mut Ctx, held: Word) -> Word {
     let unwind = c.unwind.take();
     let raising = c.aborting.take();
     c.failed = 0;
-    let entered = crate::simulate::shield(c, Shield::Release);
+    let entered = crate::tasks::shielded(c, crate::tasks::Shield::Release);
     let raise = raising.map(|a| c.keep(Kept::Raising(a)));
     let at = held as usize as *mut Unwinding;
     // SAFETY: emitted code hands the address of `UNWINDING_WORDS` words of its frame, which hold
@@ -234,7 +234,7 @@ pub unsafe extern "C" fn rt_unwind_resume(ctx: *mut Ctx, held: Word) {
         Kept::Raising(a) => a,
         _ => unreachable!("a release keeps the raise it runs during"),
     });
-    let cancelled = crate::simulate::unshield(c, entered);
+    let cancelled = crate::tasks::unshielded(c, entered);
     if c.failed != 0 || cancelled {
         if let Some(raise) = raising {
             raise.into_failure();
