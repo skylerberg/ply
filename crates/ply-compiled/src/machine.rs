@@ -18,22 +18,6 @@ use ply_core::{Builtin, Decimal, Diagnostic, Fixed, Span, Value, codes};
 /// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
-            "?decimal_text",
-            rt_decimal_text as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?decimal_float",
-            rt_decimal_float as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?decimal_parse",
-            rt_decimal_parse as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?taken_word",
-            rt_taken_word as unsafe extern "C" fn(_, _) -> _,
-        ),
         machine_native("?blake3", rt_blake3 as unsafe extern "C" fn(_, _, _) -> _),
         machine_native(
             "?scalar_encoded",
@@ -43,9 +27,6 @@ pub fn natives() -> Vec<MachineNative> {
             "?text_encoded",
             rt_text_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native("?gzip", rt_gzip as unsafe extern "C" fn(_, _, _) -> _),
-        machine_native("?gunzip", rt_gunzip as unsafe extern "C" fn(_, _, _) -> _),
-        machine_native("?zstd", rt_zstd as unsafe extern "C" fn(_, _, _) -> _),
         machine_native(
             "?secret_of",
             rt_secret_of as unsafe extern "C" fn(_, _, _, _) -> _,
@@ -152,87 +133,6 @@ impl Ctx {
             }
         }
     }
-
-    /// The bytes of the string or byte string builtin `b` answers over `args`, as taken bytes.
-    fn taken_of(&mut self, b: Builtin, args: Vec<Value>) -> I64 {
-        match &self.builtin(b, args) {
-            Some(Value::Str(s)) => self.give(s.as_bytes().to_vec()),
-            Some(Value::Bytes(b)) => self.give(b.to_vec()),
-            Some(other) => {
-                self.fail(err_machine(&format!(
-                    "{} answered where bytes were",
-                    other.type_name()
-                )));
-                I64(0)
-            }
-            None => I64(0),
-        }
-    }
-
-    /// An `Option` builtin `b` answers over `args`: its payload's words, little-endian, as taken
-    /// bytes, and how many bytes; -1 for `None`.
-    fn parsed(&mut self, b: Builtin, args: Vec<Value>) -> I64 {
-        let payload = match &self.builtin(b, args) {
-            Some(Value::Ctor { name, args }) if name.as_str() == "Some" => args.first().cloned(),
-            _ => return I64(-1),
-        };
-        let words: Vec<u8> = match &payload {
-            Some(Value::Float(f)) => ply_core::float::bits(*f).to_le_bytes().to_vec(),
-            Some(Value::Decimal(d)) => d.serialize().to_vec(),
-            Some(Value::Fixed(f)) => f.bits().to_le_bytes().to_vec(),
-            _ => {
-                self.fail(err_machine("a parse answered no number"));
-                return I64(-1);
-            }
-        };
-        self.give(words)
-    }
-}
-
-/// `Decimal::to_string` of the `Decimal` whose two words, as `rust_decimal` serializes it, are `lo`
-/// and `hi`, as taken bytes.
-pub unsafe extern "C" fn rt_decimal_text(ctx: *mut Ctx, lo: I64, hi: I64) -> I64 {
-    let d = decimal_of(lo, hi);
-    unsafe { &mut *ctx }.taken_of(Builtin::DecimalToString, vec![Value::Decimal(d)])
-}
-
-/// `Float::of_decimal` of the `Decimal` whose two words are `lo` and `hi`, as its bits.
-pub unsafe extern "C" fn rt_decimal_float(_ctx: *mut Ctx, lo: I64, hi: I64) -> F64 {
-    F64(ply_core::float::bits(ply_core::builtins::float_of_decimal(
-        decimal_of(lo, hi),
-    )))
-}
-
-/// `Decimal::of_string` of the string at `p`: 16, its two words left as taken bytes, or -1 for
-/// `None`.
-pub unsafe extern "C" fn rt_decimal_parse(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    parse(ctx, p, n, Builtin::DecimalOfString)
-}
-
-fn parse(ctx: *mut Ctx, p: Addr, n: I64, b: Builtin) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match c.text(unsafe { lent(p, n) }) {
-        Some(s) => c.parsed(b, vec![Value::str(s)]),
-        None => I64(-1),
-    }
-}
-
-/// Word `k` of the taken bytes, little-endian, which stay taken: how emitted code reads a number a
-/// parse answered.
-pub unsafe extern "C" fn rt_taken_word(ctx: *mut Ctx, k: I64) -> I64 {
-    let c = unsafe { &mut *ctx };
-    let at = usize::try_from(k.0).ok().and_then(|k| k.checked_mul(8));
-    match at.and_then(|at| c.taken.get(at..at + 8)) {
-        Some(w) => I64(i64::from_le_bytes(w.try_into().expect("eight bytes"))),
-        None => {
-            let held = c.taken.len();
-            c.fail(err_machine(&format!(
-                "word {} of {held} taken bytes read",
-                k.0
-            )));
-            I64(0)
-        }
-    }
 }
 
 /// The encoding `digest` hashes of a scalar, left as taken bytes, answering their count: `kind` 0 a
@@ -299,34 +199,6 @@ fn encoded_given(c: &mut Ctx, v: &Value) -> I64 {
 pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     let digest = blake3::hash(unsafe { lent(p, n) });
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
-}
-
-/// `Bytes::gzip` of the `n` bytes at `p`, as taken bytes.
-pub unsafe extern "C" fn rt_gzip(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let b = Value::bytes(unsafe { lent(p, n) });
-    unsafe { &mut *ctx }.taken_of(Builtin::BytesGzip, vec![b])
-}
-
-/// `Bytes::zstd` of the `n` bytes at `p`, as taken bytes.
-pub unsafe extern "C" fn rt_zstd(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let b = Value::bytes(unsafe { lent(p, n) });
-    unsafe { &mut *ctx }.taken_of(Builtin::BytesZstd, vec![b])
-}
-
-/// `Bytes::gunzip` of the `n` bytes at `p`: how many bytes it unpacked, left as taken bytes, or -1
-/// for `None`.
-pub unsafe extern "C" fn rt_gunzip(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match &c.builtin(
-        Builtin::BytesGunzip,
-        vec![Value::bytes(unsafe { lent(p, n) })],
-    ) {
-        Some(Value::Ctor { name, args }) if name.as_str() == "Some" => match args.first() {
-            Some(Value::Bytes(b)) => c.give(b.to_vec()),
-            _ => I64(-1),
-        },
-        _ => I64(-1),
-    }
 }
 
 /// A credential holding the `n` bytes at `p`, a `Secret<String>` where `text` is not 0 and a

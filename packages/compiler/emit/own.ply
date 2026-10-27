@@ -46,7 +46,7 @@ import compiler.emit.tir (no_closure_words, Rep, RWord, RInt, RBool, RFloat, RFl
                           OStrings, RAddr, PPayload, no_links, counted, operands, fails, used_as,
                           var_of, rep_of_arg, parts_of, ends, string_uses, MFramed, OContainer,
                           Walked, Unsettled, LastOf, PPlace, word_record, read_records, MRecord,
-                          FieldMade, Supplied, Built)
+                          FieldMade, Supplied, Built, Unwinds, Unwound)
 import compiler.emit.tir.strings (ByteRead)
 import compiler.emit.verify (verified, stacked_captures, payload_of, takeable, held_in_place,
                              reuses_cells, made_width, re_held, leaves, answer_held, word_held,
@@ -299,6 +299,10 @@ fn uses_in(b: Block, m: Map<Int, Int>) -> Map<Int, Int> = {
       Restart(args) -> named(acc, args),
       Enter(e) -> named(acc, e.args),
       Handle(h) -> uses_in(h.body, named(acc, h.args)),
+      // A failure path lets go of what it names, so a record it names is no record made only to be
+      // laid in another.
+      Unwinds(Some(xs)) -> named(acc, xs.map(|x: Unwound| x.arg)),
+      Fail(x) -> named(acc, x.letting.map(|u: Unwound| u.arg)),
       _ -> acc,
     })
 }
@@ -679,6 +683,9 @@ fn sighted(s: Sight, b: Block, pass: Int) -> Sight =
       Enter(e) -> handed_in(acc, e.args),
       // A clause may resume the body more than once, so it reads as a pass of its own.
       Handle(h) -> sighted(used_in(acc, used_as(h.args, h.uses)), h.body, h.answer.id),
+      // A failure's release reads each value it names whole, so no field of one is taken.
+      Unwinds(Some(xs)) -> used_in(acc, xs.map(|u: Unwound| { arg: u.arg, takes: false })),
+      Fail(x) -> used_in(acc, x.letting.map(|u: Unwound| { arg: u.arg, takes: false })),
       _ -> acc,
     })
 
@@ -1553,7 +1560,13 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
           handed_as(e.args, match ex.enters.at(e.member) { Some(h) -> h, None -> [] }),
           Map::new(),
         ),
-      Fail(_) -> { ..acc, rev: acc.rev.push(i), live: ex.landing, takers: [] },
+      // What a failure lets go of it holds until it fails, and lets go of the counts the landing
+      // does not on the way out.
+      Fail(x) -> {
+        let live = x.letting.fold(ex.landing, |l: Live, u: Unwound| arg_live(fx, l, u.arg));
+        let unwind = live.values().filter(|v: Var| owns(fx, v) && !ex.landing.contains(v.id));
+        { ..acc, rev: acc.rev.push(Fail({ ..x, unwind: unwind })), live: live, takers: [] }
+      },
       Miss -> { ..acc, rev: acc.rev.push(i), live: ex.miss, takers: [] },
       _ -> { ..acc, rev: acc.rev.push(i) },
     })
@@ -1624,9 +1637,10 @@ fn mentioned(fx: Facts, m: Mentions, b: Block) -> Mentions =
       Reset(r) -> bound_in(args_in(acc, [AVar(r.of)]), r.token),
       Free(r) -> args_in(acc, [AVar(r.of)]),
       Opened(o) -> o.words.fold(args_in(acc, [AVar(o.of)]), bound_in),
-      Fail(_) -> acc,
+      Fail(x) -> args_in(acc, x.letting.map(|u: Unwound| u.arg)),
       Miss -> acc,
       Sited(_) -> acc,
+      Unwinds(_) -> acc,
     })
 
 fn args_in(m: Mentions, args: List<Arg>) -> Mentions =
@@ -3062,7 +3076,7 @@ test "an arm lets go before it misses of what only it reads" {
     [
       Match({
         arms: [[If({ cond: ABool(true), then: then, otherwise: miss })], [Return(AVar(q))]],
-        rest: [Fail({ why: NoArm, at: dummy_span() })],
+        rest: [Fail({ why: NoArm, at: dummy_span(), letting: [], unwind: [] })],
       }),
     ];
   let f = root_of([p, q], [], RWord, matched([Return(AVar(p))], [Miss]));
@@ -3090,7 +3104,12 @@ test "an arm lets go before a miss however deep of what it read with a count of 
   let cased = |on: Var, arm: List<Inst>, rest: List<Inst>|
     Case({ on: on, test: TLength({ at_least: 1 }), arms: [{ when: 0, body: arm }], rest: rest });
   let matched = |first: List<Inst>|
-    [Match({ arms: [first, [Return(AVar(xs))]], rest: [Fail({ why: NoArm, at: dummy_span() })] })];
+    [
+      Match({
+        arms: [first, [Return(AVar(xs))]],
+        rest: [Fail({ why: NoArm, at: dummy_span(), letting: [], unwind: [] })],
+      }),
+    ];
   let f = root_of(
     [xs, q],
     [],
@@ -3296,7 +3315,11 @@ test "a handle holds across its body what the body reads, which its landing rele
   let site = { clauses: [], ret: None, detached: None, instance: instance_alone(0) };
   let uses = { takes: [], owned: false, fails: true, stops: false };
   let inside = [
-    If({ cond: AVar(c), then: [Fail({ why: NoArm, at: dummy_span() })], otherwise: [] }),
+    If({
+      cond: AVar(c),
+      then: [Fail({ why: NoArm, at: dummy_span(), letting: [], unwind: [] })],
+      otherwise: [],
+    }),
     bind(r, call_of([AVar(p)], [0]), []),
     Assign({ var: a, arg: AVar(r) }),
   ];

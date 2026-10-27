@@ -322,15 +322,15 @@ helpers! {
     rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
     rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
     rt_decimal_negate(lo, hi, out);
-    rt_wide_op(code, a_lo, a_hi, b_lo, b_hi, out) -> Word;
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
-    rt_wide_binary(op, t, a, b) -> Word;
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);
+    rt_decimal_overflow(what);
     rt_by_zero(what);
     rt_not_an_int(value);
+    rt_not_an_int_wide(lo, hi, signed);
     rt_not_that_width(which, value);
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
@@ -390,6 +390,8 @@ helpers! {
         held: *const PlyType,
         answer: *const PlyType
     ) -> Handed;
+    rt_unwind_hold(held) -> Word;
+    rt_unwind_resume(held);
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_builtin_encoded(index: I64);
     rt_region(body: Block, answer: *const PlyType) -> Handed;
@@ -442,6 +444,10 @@ fn signature(h: &Helper) -> (&'static str, String) {
 /// declared, not defined, so a unit compiled in parts binds one table rather than one per part.
 pub fn runtime_header() -> String {
     let mut out = String::from("\n/* --- the runtime, declared --- */\n");
+    out.push_str(&format!(
+        "#define PLY_UNWINDING_WORDS {}\n",
+        crate::rt::UNWINDING_WORDS
+    ));
     for h in helpers() {
         let (ret, params) = signature(h);
         out.push_str(&format!(

@@ -112,21 +112,32 @@ pub fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Byte
     EField(f) -> mentions(f.base, params, bound, out),
     EList(l) -> l.items.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
     ETry(t) -> mentions(t.operand, params, bound, out),
-    EPerform(p) -> p.args.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
-    EHandle(h) ->
-      mentions(
-        h.body,
-        params,
-        bound,
-        h.vars.fold(
-          { out: out, bound: bound },
-          |acc: { out: List<Bytes>, bound: List<Bytes> }, v: HandlerVar|
-            {
-              out: mentions(v.init, params, acc.bound, acc.out),
-              bound: acc.bound.push(v.name.name),
-            },
-        ).out,
-      ),
+    // `x.f(..)` on a binding `x` is a call on its value, which names `x`.
+    EPerform(p) -> {
+      let receiver = p.eff.name.name;
+      let named = if is_bare(p.eff) && !bound.contains(receiver) && params.contains(receiver) {
+        out.push(receiver)
+      } else { out };
+      p.args.fold(named, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc))
+    },
+    EHandle(h) -> {
+      let vars = h.vars.fold(
+        { out: out, bound: bound },
+        |acc: { out: List<Bytes>, bound: List<Bytes> }, v: HandlerVar|
+          { out: mentions(v.init, params, acc.bound, acc.out), bound: acc.bound.push(v.name.name) },
+      );
+      let body = mentions(h.body, params, bound, vars.out);
+      let clauses = h.clauses.fold(body, |acc: List<Bytes>, c: HandleClause| {
+        let named = c.params.fold(vars.bound, |b: List<Bytes>, i: Ident| b.push(i.name));
+        let resumed = match c.resume { Some(k) -> named.push(k.name), None -> named };
+        let labelled = match c.label_binder { Some(t) -> resumed.push(t.name), None -> resumed };
+        mentions(c.body, params, labelled, acc)
+      });
+      match h.ret {
+        Some(r) -> mentions(r.body, params, vars.bound.push(r.binder.name), clauses),
+        None -> clauses,
+      }
+    },
     EWithHold(c) ->
       mentions(
         c.body,
@@ -139,7 +150,8 @@ pub fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Byte
     EParallel(v) ->
       v.branches.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
     ELit(_) -> out,
-    ETagged(_) -> out,
+    ETagged(t) ->
+      t.holes.fold(out, |acc: List<Bytes>, h: Hole| mentions(h.value, params, bound, acc)),
     EBad(_) -> out,
   }
 
@@ -729,7 +741,7 @@ fn rows_ty(
       let ps = rows_tys(expander, ft.params);
       let r = rows_ty(ps.expander, ft.ret);
       let e = rows_opt(r.expander, ft.effects);
-      { expander: e.expander, t: TFn({ span: ft.span, params: ps.ts, ret: r.t, effects: e.r }) }
+      { expander: e.expander, t: TFn({ ..ft, params: ps.ts, ret: r.t, effects: e.r }) }
     },
     TRecord(r) -> {
       let fs = r.fields.fold(

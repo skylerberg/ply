@@ -68,7 +68,7 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, DefConstraint, NumericI
                                      with_unified, is_prelude_effect, seed_atom, abort_atom,
                                      builtin_type_arity, ctor_of, effect_of, def_of,
                                      simulated_atoms, mode_eq, lit_type, record_site, record_over,
-                                     ord_needs)
+                                     ord_needs, binder_key)
 import compiler.check.infer.names (value_key, Elsewise, Found, Unnamed, of_language_type,
                                    declared_value, ctor_name, unknown_name, unknown_name_said,
                                    kept_named, language_function, module_declares, no_function_said,
@@ -1152,10 +1152,11 @@ fn infer_all(
 /// the record is laid out as its type says.
 fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / {abort.raise} = {
   let o: Inferred = infer_here(checker, expr, hint);
+  let valued = { ..o.checker, valued: o.checker.valued.push({ span: expr_span(expr), ty: o.ty }) };
   match expr {
-    ERecord(r) -> { ..o, checker: note_typed(o.checker, r.span, o.ty, []) },
-    ERecordUpdate(r) -> { ..o, checker: note_typed(o.checker, r.span, o.ty, []) },
-    _ -> o,
+    ERecord(r) -> { ..o, checker: note_typed(valued, r.span, o.ty, []) },
+    ERecordUpdate(r) -> { ..o, checker: note_typed(valued, r.span, o.ty, []) },
+    _ -> { ..o, checker: valued },
   }
 }
 
@@ -1310,17 +1311,18 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           ),
         None -> body.checker,
       };
+      let noted = note_typed(
+        leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
+        l.span,
+        fn_type(ps.tys, body.ty, row_empty()),
+        [],
+      );
       let made: Inferred = {
-        checker: note_row(
-          note_typed(
-            leaving({ ..checked, env: env_pop(checked.env) }, checker.guards),
-            l.span,
-            fn_type(ps.tys, body.ty, row_empty()),
-            [],
-          ),
-          l.span,
-          RowOf(body.row),
-        ),
+        // The ownership walk holds a release in the body to the lambda's own row.
+        checker: {
+          ..note_row(noted, l.span, RowOf(body.row)),
+          valued: noted.valued.push({ span: l.span, ty: fn_type(ps.tys, body.ty, body.row) }),
+        },
         ty: fn_type(ps.tys, body.ty, body.row),
         row: row_empty(),
       };
@@ -3184,17 +3186,17 @@ fn unwidened(checker: Checker, ty: Type) -> Widened = { checker: checker, ty: ty
 fn widen_fn(
   r: Widened,
   ty: Type,
-  g: { params: List<Type>, ret: Type, effects: Row },
+  g: { params: List<Type>, kept: List<Int>, once: Bool, ret: Type, effects: Row },
 ) -> Widened / {abort.raise} = {
   let row = resolve_row_in(r.checker, g.effects);
   match row.tail {
     Some(_) -> if r.tails.len() == 0 { unwidened(r.checker, ty) }
-    else { { checker: r.checker, ty: fn_type(g.params, r.ty, g.effects), tails: r.tails } },
+    else { { checker: r.checker, ty: TyFn({ ..g, ret: r.ty }), tails: r.tails } },
     None -> {
       let v: WithVar = new_row_var(r.checker);
       {
         checker: v.checker,
-        ty: fn_type(g.params, r.ty, { atoms: row.atoms, tail: Some(v.var) }),
+        ty: TyFn({ ..g, ret: r.ty, effects: { atoms: row.atoms, tail: Some(v.var) } }),
         tails: r.tails.push(v.var),
       }
     },
@@ -3702,7 +3704,12 @@ fn bind_pattern(
   out: List<{ name: Bytes, ty: Type }>,
 ) -> Bound / {abort.raise} =
   match p {
-    PWild(_) -> { checker: checker, out: out },
+    // The ownership walk refuses a `_` that stands for a resource.
+    PWild(w) ->
+      {
+        checker: { ..checker, valued: checker.valued.push({ span: w.span, ty: scrutinee }) },
+        out: out,
+      },
     PBad(_) -> { checker: checker, out: out },
     PVar(v) ->
       {
@@ -3846,7 +3853,16 @@ fn bind_pattern(
                 },
             },
         );
-        if r.rest { bound } else {
+        // What `..` leaves out is read by the ownership walk, which refuses one that drops a resource.
+        if r.rest {
+          {
+            ..bound,
+            checker: {
+              ..bound.checker,
+              valued: bound.checker.valued.push({ span: r.span, ty: scrutinee }),
+            },
+          }
+        } else {
           let named = r.fields.map(|f: { name: Ident, pat: Pattern }| f.name.name);
           let omitted = known.filter(|field: Field| !named.contains(field.name));
           if omitted.len() > 0 {
@@ -4086,7 +4102,8 @@ fn infer_match(
 
 // --- Effects ----------------------------------------------------------------------------------
 
-fn resolve_op(
+/// The effect and operation a perform names.
+pub fn resolve_op(
   checker: Checker,
   eff: QName,
   ident: Ident,
@@ -4111,8 +4128,10 @@ fn exit_resolved(checker: Checker, eff: QName) -> WithHit / {abort.raise} = {
   let op = {
     name: exit_op(),
     mode: MRaise,
+    multi: false,
     resource_param: false,
     params: [carried.ty],
+    kept: [],
     ret: TyVar(answer.var),
     at: at,
     scheme: Some({
@@ -4370,6 +4389,8 @@ fn op_scheme(op_info: OpInfo) -> Scheme / {abort.raise} =
       {
         ty_vars: op_free_vars(op_info),
         row_vars: [],
+        kept_vars: [],
+        multi_vars: [],
         label_vars: [],
         ty: fn_type(op_info.params, op_info.ret, row_empty()),
       },
@@ -4921,7 +4942,8 @@ fn infer_handle(
                 );
                 let bound: Checker = range(0, clause.params.len()).fold(
                   pushed,
-                  |c: Checker, i: Int|
+                  |c: Checker, i: Int| {
+                    let at = clause.params.get(i).span;
                     {
                       ..c,
                       env: env_bind(
@@ -4929,7 +4951,14 @@ fn infer_handle(
                         clause.params.get(i).name,
                         monomorphic(shape.params.get(i)),
                       ),
-                    },
+                      // The ownership walk reads what each parameter holds, by its binder's key, as a
+                      // parameter keeps no site of its own.
+                      valued: c.valued.push({
+                        span: { ..at, site: binder_key(at) },
+                        ty: shape.params.get(i),
+                      }),
+                    }
+                  },
                 );
                 // The label the call site named, as the clause body's own `String`: a clause that
                 // answers every label could not otherwise tell which one it answered.

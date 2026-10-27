@@ -9,8 +9,8 @@ pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     ply_core::float::bits(a % b) as i64
 }
 
-/// The operator codes compiled code hands [`rt_wide_binary`] and [`rt_decimal_binary`];
-/// `emit/c.ply`'s `binary_code` must match.
+/// The operator codes compiled code hands [`rt_decimal_binary`]; `emit/c.ply`'s `binary_code`
+/// must match.
 pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Add,
     BinOp::Sub,
@@ -31,164 +31,6 @@ pub(super) const BINOPS: [BinOp; 18] = [
     BinOp::Shr,
     BinOp::Ushr,
 ];
-
-/// An operator over two 64-bit widths' bits, the width at `t` in [`ply_core::INT_TYPES`]: the
-/// answer's bits, or a `Bool`'s 1 or 0, raised as the evaluator raises.
-pub unsafe extern "C" fn rt_wide_binary(ctx: *mut Ctx, op: i64, t: i64, a: i64, b: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let (Some(op), Some(ty)) = (
-        usize::try_from(op)
-            .ok()
-            .and_then(|i| BINOPS.get(i).copied()),
-        usize::try_from(t)
-            .ok()
-            .and_then(|i| ply_core::INT_TYPES.get(i).copied()),
-    ) else {
-        return ctx.fail(error("an operator this runtime has no code for"));
-    };
-    let of = |w: i64| Value::Fixed(ply_core::Fixed::new(ty, w as u64 as u128));
-    let (x, y) = (of(a), of(b));
-    match ply_core::strict_binary(op, &x, &y, Span::DUMMY, Span::DUMMY, Span::DUMMY) {
-        Ok(Value::Fixed(f)) => f.bits() as u64 as i64,
-        Ok(Value::Bool(b)) => i64::from(b),
-        Ok(other) => ctx.fail(error(format!(
-            "a width's operator answered {}",
-            other.type_name()
-        ))),
-        Err(d) if matches!(op, BinOp::Div | BinOp::Rem) && is_zero(&y) => raise_error(ctx, d),
-        Err(d) => ctx.fail(d),
-    }
-}
-
-/// What [`rt_wide_op`] does to a 128-bit width, by its code over two; `emit/c.ply`'s `wide_code`
-/// must match.
-#[derive(Clone, Copy)]
-enum WideOp {
-    /// An operator over the two, a shift's count the second's low word.
-    Binary(BinOp),
-    Negate,
-    /// A builtin over the two, a rotation's count the second's low word, `checked_neg` over the
-    /// first alone.
-    Builtin(Builtin),
-    /// The first as an `Int`, raised where an `Int` does not hold it.
-    ToInt,
-}
-
-const WIDE_OPS: [WideOp; 22] = [
-    WideOp::Binary(BinOp::Add),
-    WideOp::Binary(BinOp::Sub),
-    WideOp::Binary(BinOp::Mul),
-    WideOp::Binary(BinOp::Div),
-    WideOp::Binary(BinOp::Rem),
-    WideOp::Binary(BinOp::Shl),
-    WideOp::Binary(BinOp::Shr),
-    WideOp::Binary(BinOp::Ushr),
-    WideOp::Negate,
-    WideOp::Builtin(Builtin::WrapAdd),
-    WideOp::Builtin(Builtin::WrapSub),
-    WideOp::Builtin(Builtin::WrapMul),
-    WideOp::Builtin(Builtin::SaturatingAdd),
-    WideOp::Builtin(Builtin::SaturatingSub),
-    WideOp::Builtin(Builtin::SaturatingMul),
-    WideOp::Builtin(Builtin::CheckedAdd),
-    WideOp::Builtin(Builtin::CheckedSub),
-    WideOp::Builtin(Builtin::CheckedMul),
-    WideOp::Builtin(Builtin::CheckedNeg),
-    WideOp::Builtin(Builtin::Rotl),
-    WideOp::Builtin(Builtin::Rotr),
-    WideOp::ToInt,
-];
-
-/// Operation `code / 2` of `WIDE_OPS` over the 128-bit widths whose words are `a_lo`, `a_hi` and
-/// `b_lo`, `b_hi`, an `I128` where `code` is odd and a `U128` where it is even: the answer's two
-/// words written at `out`, or an `Int`'s one, raised or failed as the evaluator raises or fails.
-/// Answers 0 for a checked operation's `None`, else 1.
-pub unsafe extern "C" fn rt_wide_op(
-    ctx: *mut Ctx,
-    code: i64,
-    a_lo: i64,
-    a_hi: i64,
-    b_lo: i64,
-    b_hi: i64,
-    out: i64,
-) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    let ty = if code & 1 == 1 {
-        ply_core::IntTy::I128
-    } else {
-        ply_core::IntTy::U128
-    };
-    let Some(op) = usize::try_from(code >> 1)
-        .ok()
-        .and_then(|i| WIDE_OPS.get(i).copied())
-    else {
-        return ctx.fail(error(
-            "an operation over 128 bits this runtime has no code for",
-        ));
-    };
-    let wide = |lo: i64, hi: i64| {
-        ply_core::Fixed::new(ty, (u128::from(hi as u64) << 64) | u128::from(lo as u64))
-    };
-    let (x, y, count) = (wide(a_lo, a_hi), wide(b_lo, b_hi), Value::Int(b_lo));
-    let answer = match op {
-        WideOp::Binary(b) => {
-            let r = if matches!(b, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
-                count
-            } else {
-                Value::Fixed(y)
-            };
-            let d = Span::DUMMY;
-            match ply_core::strict_binary(b, &Value::Fixed(x), &r, d, d, d) {
-                Ok(v) => v,
-                Err(e) if matches!(b, BinOp::Div | BinOp::Rem) && is_zero(&r) => {
-                    return raise_error(ctx, e);
-                }
-                Err(e) => return ctx.fail(e),
-            }
-        }
-        WideOp::Negate => match x.checked_neg() {
-            Some(n) => Value::Fixed(n),
-            None => return ctx.fail(error("negation overflowed its width")),
-        },
-        WideOp::Builtin(b) => {
-            let args = match b {
-                Builtin::CheckedNeg => vec![Value::Fixed(x)],
-                Builtin::Rotl | Builtin::Rotr => vec![Value::Fixed(x), count],
-                _ => vec![Value::Fixed(x), Value::Fixed(y)],
-            };
-            match ply_core::builtins::call(b, args, Span::DUMMY) {
-                Ok(v) => v,
-                Err(e) => return ctx.fail(e),
-            }
-        }
-        WideOp::ToInt => {
-            let b = if ty == ply_core::IntTy::I128 {
-                Builtin::IntOfI128
-            } else {
-                Builtin::IntOfU128
-            };
-            match ply_core::builtins::call(b, vec![Value::Fixed(x)], Span::DUMMY) {
-                Ok(v) => v,
-                Err(e) => return raise_error(ctx, e),
-            }
-        }
-    };
-    let held = match &answer {
-        Value::Ctor { name, args } if name.as_str() == "Some" => args.first().cloned(),
-        Value::Ctor { .. } => return 0,
-        v => Some(v.clone()),
-    };
-    let words = out as *mut i64;
-    match held {
-        Some(Value::Fixed(f)) => unsafe {
-            words.write(f.bits() as u64 as i64);
-            words.add(1).write((f.bits() >> 64) as u64 as i64);
-        },
-        Some(Value::Int(n)) => unsafe { words.write(n) },
-        _ => return ctx.fail(error("an operation over 128 bits answered no width")),
-    }
-    1
-}
 
 /// The box of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
 /// and above it `hi`.
@@ -335,6 +177,41 @@ pub unsafe extern "C" fn rt_not_an_int(ctx: *mut Ctx, value: i64) {
     let d = error(format!("`Int::of_u64` was given {}", value as u64))
         .note("an `Int` is 64 bits and signed, so it does not hold every `U64`");
     raise_error(ctx, d);
+}
+
+/// `Int::of_i128`, where `signed` is not 0, or else `Int::of_u128`, of the 128-bit width whose
+/// words are `lo` and `hi`, past what an `Int` holds, raised.
+pub unsafe extern "C" fn rt_not_an_int_wide(ctx: *mut Ctx, lo: i64, hi: i64, signed: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let (ty, b) = if signed != 0 {
+        (ply_core::IntTy::I128, Builtin::IntOfI128)
+    } else {
+        (ply_core::IntTy::U128, Builtin::IntOfU128)
+    };
+    let x = ply_core::Fixed::new(ty, (u128::from(hi as u64) << 64) | u128::from(lo as u64));
+    match ply_core::builtins::call(b, vec![Value::Fixed(x)], Span::DUMMY) {
+        Err(d) => {
+            raise_error(ctx, d);
+        }
+        Ok(_) => {
+            ctx.fail(error("a 128-bit width an `Int` holds was refused as one"));
+        }
+    }
+}
+
+/// A `Decimal` operator's answer past what a `Decimal` holds exactly; `what` is `emit/c.ply`'s
+/// `overflow_code`.
+pub unsafe extern "C" fn rt_decimal_overflow(ctx: *mut Ctx, what: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let name = match what {
+        0 => "addition",
+        1 => "subtraction",
+        3 => "multiplication",
+        _ => "remainder",
+    };
+    let d = error(format!("`Decimal` overflow in {name}"))
+        .note("`Decimal` is exact and bounded; it will not round to make room");
+    ctx.fail(d);
 }
 
 /// `what` is `emit/c.ply`'s `overflow_code`.

@@ -5,13 +5,14 @@ import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Item, IDerive, Deriver, DEq, DOrd, DHash, deriver_text, Derived,
                               DeriveDef, IInstance, InstanceDef, NKey, NShow, NInvariant, NHost,
                               instance_text, INumeric, NumericDef, NumericOp, numeric_ops,
-                              numeric_by, IType, IFn, is_pub, InstanceKind)
+                              numeric_by, IType, IFn, is_pub, InstanceKind, NRelease)
 import compiler.syntax.exprs (Expr, Param, expr_span)
 import compiler.check.types (Resource, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord,
                              Field, Free, atoms_covered, row_empty, row_is_pure, atom_conflicts,
                              named_type, int_type, string_type, bool_type, fresh_new, subst_new,
                              occurs_ty, free_vars, env_new, label_of, atom_text, type_text,
-                             row_text, at_arguments, over_arg, TyNominal)
+                             row_text, at_arguments, over_arg, TyNominal, arg_row, arg_label,
+                             unit_type)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Diag, Label, qualify,
                                       error_with_labels, error_at, label_at)
 import compiler.check.resolve.sets (mentions)
@@ -228,14 +229,222 @@ fn unfit(checker: Checker, def: InstanceDef, f: DefInfo, why: Bytes, note: Bytes
           ]),
         // `checked_real_handler` judges a `host`, which states nothing of a type.
         NHost -> b"",
+        NRelease ->
+          Bytes::concat_all([
+            b"a `release` takes one `",
+            def.target.name,
+            b"`, `keep`, and lets it go where nothing consumed it",
+          ]),
       },
     ],
   )
 
+/// One `key`, `show`, `invariant` or `release` for a type of this module's own.
+fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} =
+  if def.kind == NRelease { check_release(checker, m, def) } else { check_stated(checker, m, def) }
+
+/// One `release for T by f`: the type is an `opaque` sum of this module's own, it states one
+/// release, and `f` is a function of this module that takes the value, `keep`, at the type's own
+/// parameters and labels, and answers `()`.
+fn check_release(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
+  let type_name = qualify(m.name, def.target.name);
+  match checker.types.get(type_name) {
+    None ->
+      report_error_at(
+        checker,
+        b"E0208",
+        def.target.span,
+        Bytes::concat_all([b"`", def.target.name, b"` is not a type this module declares"]),
+        b"declared in another module, or not at all",
+        [
+          b"a `release` may only name a type its own module declares, so that one function lets every value of it go",
+        ],
+      ),
+    Some(decl) -> match decl.declared {
+      DeclaredAlias(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          Bytes::concat_all([b"`", def.target.name, b"` is an alias, which states no `release`"]),
+          b"an alias is the type it names, so a `release` for one would make every value of that type a resource",
+        ),
+      DeclaredExtern ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          Bytes::concat_all([
+            b"`",
+            def.target.name,
+            b"` is an `extern type`, which states no `release`",
+          ]),
+          b"the toolchain lays out its values and lets them go",
+        ),
+      DeclaredRecord(_) ->
+        not_a_sum(
+          checker,
+          def.target,
+          decl,
+          Bytes::concat_all([b"`", def.target.name, b"` is a record, which states no `release`"]),
+          b"a resource is an opaque sum, whose constructors only its module builds and takes apart",
+        ),
+      _ -> if decl.opaque == None {
+        report_error_at_and(
+          checker,
+          b"E0225",
+          def.span,
+          Bytes::concat_all([b"`", def.target.name, b"` states a `release` but is not `opaque`"]),
+          b"this makes it a resource",
+          { module: decl.owner, span: decl.span },
+          b"declared here",
+          [
+            b"a resource is built, matched and read only by its own module, or another module could copy what it holds or take it apart without letting it go",
+            Bytes::concat_all([b"write `opaque type ", def.target.name, b"`"]),
+          ],
+        )
+      } else {
+        match instance_of(checker.instances, type_name, NRelease) {
+          Some(first) ->
+            report_error_at_and(
+              checker,
+              b"E0105",
+              def.span,
+              Bytes::concat_all([b"`", def.target.name, b"` states its `release` twice"]),
+              b"stated again here",
+              first.at,
+              b"first stated here",
+              [b"a value is let go one way; remove one"],
+            ),
+          None -> match def_of(checker, qualify(m.name, def.by.name)) {
+            None ->
+              report_error_at(
+                checker,
+                b"E0101",
+                def.by.span,
+                Bytes::concat_all([b"`", def.by.name, b"` is not a function this module declares"]),
+                b"a `release` names a function of its type's own module",
+                [],
+              ),
+            Some(f) -> release_fitted(checker, def, type_name, f),
+          },
+        }
+      },
+    },
+  }
+}
+
+/// `f` as the release of `type_name`: one parameter, written `keep`, of the type at its own
+/// parameters, labels and rows, answering `()`. Its row is the row of every definition that holds a
+/// value of the type, so it may perform what it needs to let the value go.
+fn release_fitted(
+  checker: Checker,
+  def: InstanceDef,
+  type_name: Bytes,
+  f: DefInfo,
+) -> Checker / {abort.raise} =
+  match resolve(checker, f.scheme.ty) {
+    TyFn(sig) -> if sig.params.len() != 1 {
+      unfit(
+        checker,
+        def,
+        f,
+        Bytes::concat_all([
+          b"this function takes ",
+          ascii_of_int(sig.params.len()),
+          b" parameters",
+        ]),
+        b"it is handed the value alone",
+      )
+    } else if sig.kept != [0] {
+      unfit(
+        checker,
+        def,
+        f,
+        b"this function borrows the value",
+        Bytes::concat_all([
+          b"a release takes the value it lets go: write its parameter `keep ",
+          type_text(sig.params.get(0)),
+          b"`",
+        ]),
+      )
+    } else {
+      match released_params(sig.params.get(0), type_name) {
+        None ->
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function takes `", type_text(sig.params.get(0)), b"`"]),
+            Bytes::concat_all([
+              b"its parameter is `",
+              def.target.name,
+              b"` at the type's own parameters and labels, so it lets go of every `",
+              def.target.name,
+              b"` there is",
+            ]),
+          ),
+        Some(own) -> if sig.ret != unit_type() {
+          unfit(
+            checker,
+            def,
+            f,
+            Bytes::concat_all([b"this function answers `", type_text(sig.ret), b"`"]),
+            b"a release is run where a value is let go, and nothing reads what it answers",
+          )
+        } else {
+          {
+            ..checker,
+            instances: checker.instances.push({
+              type_name: type_name,
+              kind: NRelease,
+              by: f.name,
+              params: own.params,
+              rows: own.rows,
+              answers: sig.ret,
+              at: { module: checker.module, span: def.span },
+            }),
+          }
+        },
+      }
+    },
+    _ -> checker,
+  }
+
+/// The variables `ty`, the type `type_name` at its own parameters, binds them to, labels among the
+/// parameters; none where it is the type at anything else.
+fn released_params(ty: Type, type_name: Bytes) -> Option<OwnParams> = {
+  let args = match ty {
+    TyCon(c) -> if c.name == type_name { Some(c.args) } else { None },
+    TyNominal(n) -> if n.name == type_name { Some(n.args) } else { None },
+    _ -> None,
+  };
+  match args {
+    None -> None,
+    Some(xs) ->
+      xs.fold(Some({ params: [], rows: [] }), |acc: Option<OwnParams>, a: Type|
+        match acc {
+          None -> None,
+          Some(own) -> match arg_row(a) {
+            Some(row) -> match row.tail {
+              Some(v) -> if row.atoms.len() > 0 || own.rows.contains(v) { None }
+              else { Some({ ..own, rows: own.rows.push(v) }) },
+              None -> None,
+            },
+            None -> match match arg_label(a) { Some(l) -> l, None -> a } {
+              TyVar(v) -> if own.params.contains(v) { None }
+              else { Some({ ..own, params: own.params.push(v) }) },
+              _ -> None,
+            },
+          },
+        }),
+  }
+}
+
 /// One `key for T by f`, `show for T by f` or `invariant for T by f`: the type is a sum of this
 /// module's own, for an invariant one no other module builds, it states each once, and `f` is a
 /// function of this module that takes the value alone and only answers.
-fn check_instance(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
+fn check_stated(checker: Checker, m: ParsedModule, def: InstanceDef) -> Checker / {abort.raise} = {
   let what = instance_text(def.kind);
   let one = one_of(def.kind);
   let type_name = qualify(m.name, def.target.name);
@@ -623,6 +832,14 @@ pub fn collect_stated(checker: Checker, parsed: ParsedModule) -> Checker =
         NShow -> c,
         NInvariant -> c,
         NHost -> c,
+        NRelease ->
+          {
+            ..c,
+            released: c.released.insert(
+              qualify(parsed.name, def.target.name),
+              qualify(parsed.name, def.by.name),
+            ),
+          },
       },
       INumeric(def) -> {
         let type_name = qualify(parsed.name, def.target.name);
@@ -820,7 +1037,9 @@ fn numeric_fitted(
               b"`",
               x.op.name,
               b"` is `",
-              type_text(TyFn({ params: takes, ret: own, effects: row_empty() })),
+              type_text(
+                TyFn({ kept: [], once: false, params: takes, ret: own, effects: row_empty() }),
+              ),
               b"`",
             ]),
           ],
@@ -1789,6 +2008,7 @@ pub fn fresh_cx(
     operands: [],
     typed: [],
     rows_at: [],
+    valued: [],
     witnessed: Map::new(),
     witness_refs: [],
     witness_orders: [],
@@ -1800,6 +2020,7 @@ pub fn fresh_cx(
     update_shapes: [],
     try_sites: [],
     exit_types: Map::new(),
+    release_sites: [],
     holes: [],
     member_sites: match known.walks { Given(_, sites) -> sites, _ -> [] },
     member_calls: [],
@@ -1828,6 +2049,8 @@ pub fn fresh_cx(
     instances: [],
     numeric_types: [],
     keyed_names: [],
+    released: Map::new(),
+    resourceful: [],
     ordering: Map::new(),
     carrying: Map::new(),
     stated: Map::new(),

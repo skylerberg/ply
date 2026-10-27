@@ -22,7 +22,7 @@ import compiler.check.types (Resource, RSingleton, RVar, RNamed, RAny, Atom, Row
                              fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
                              fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
                              resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
-                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable)
+                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable, owning_fn_type)
 import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
                                       error_with_labels, error_at, error_at_and)
@@ -67,11 +67,15 @@ pub type TypeDecl = {
 /// types then labels in `ty_vars` and rows in `row_vars`, which a use's arguments take the place of.
 pub type RecordDecl = { ty: Type, ty_vars: List<Int>, row_vars: List<Int> }
 
+/// `multi`: a clause for the operation may call its continuation more than once.
 pub type OpInfo = {
   name: Bytes,
   mode: Mode,
+  multi: Bool,
   resource_param: Bool,
   params: List<Type>,
+  /// The places of the parameters the handler takes, written `keep`.
+  kept: List<Int>,
   ret: Type,
   at: Location,
   scheme: Option<Scheme>,
@@ -349,6 +353,21 @@ pub type UpdateShape = { module: Int, site: Int, names: List<Bytes>, owner: Byte
 
 /// The raise a `try` answers, by its effect's program-wide name, and how many values it carries.
 pub type TrySite = { module: Int, site: Int, effect: Bytes, op: Bytes, arity: Int, owner: Bytes }
+
+/// Where a binding is let go, by a node: after the node runs; before it, where the node is the last
+/// of its scope and does not name the binding, so a tail call there stays a loop; where a raise,
+/// a clause that does not resume, or a cancel unwinds through the node, a call or a perform; or where
+/// the release of the binding the payload names at the node fails, which unwinds from there.
+pub type ReleasePlace = | ReleaseAfter | ReleaseBefore | ReleaseUnwinding | ReleaseFailing(Int)
+
+/// Where the owned value at `binding` is let go, at the site `at` in its owner's body. `binding` is
+/// its binder's key (`binder_key`), or the site of a node whose value nothing binds: a `match`'s
+/// scrutinee, or an argument a call takes while a later argument may fail.
+pub type ReleaseSite = { module: Int, owner: Bytes, binding: Int, at: Int, place: ReleasePlace }
+
+/// The key a release names the binder spelled at `span` by: its place in the text, negated so no
+/// node's site is one. A binder keeps no site of its own.
+pub fn binder_key(span: Span) -> Int = 0 - span.start - 1
 
 /// A `???` or `..` a walk met, reported when the check settles: where it stands, the variable its
 /// type is, the locals in scope at it, the written row of the definition being checked where one
@@ -728,6 +747,9 @@ pub type Checker = {
   operands: List<OperandAt>,
   typed: List<TypedAt>,
   rows_at: List<RowAt>,
+  /// The type of each expression of the definition being walked, which its ownership walk reads
+  /// once the walk is done; no answer keeps it.
+  valued: List<{ span: Span, ty: Type }>,
   witnessed: Map<Int, Witnessed>,
   witness_refs: List<WitnessRef>,
   witness_orders: List<WitnessOrder>,
@@ -741,6 +763,7 @@ pub type Checker = {
   try_sites: List<TrySite>,
   /// What each exit effect of a module's `?`s inside `handle`s carries, by module and name.
   exit_types: Map<Bytes, Type>,
+  release_sites: List<ReleaseSite>,
   /// Each hole a body walked so far holds, in the order the walk met them.
   holes: List<HoleSite>,
   member_sites: List<MemberSite>,
@@ -784,6 +807,11 @@ pub type Checker = {
   /// reads which types state `numeric`, and `keyed_names` which state a `key`.
   numeric_types: List<NumericInfo>,
   keyed_names: List<Bytes>,
+  /// Each type a `release` is stated for, and the function it names, read as the declarations are
+  /// collected; and, once they all are, every declared type that is a resource: one of those, or
+  /// one whose constructors hold one.
+  released: Map<Bytes, Bytes>,
+  resourceful: List<Bytes>,
   /// Read once the declarations are collected: the shapes ordering reads, and the positions of the
   /// parameters each declared type needs ordered wherever it is written or built.
   ordering: Shapes,
@@ -1266,7 +1294,14 @@ fn install_prelude_adts(checker: Checker) -> Checker / {abort.raise} =
         if at >= 0 { TyVar(at) } else { named_type(p) }
       });
       let ty = if fields.len() == 0 { result } else { fn_type(fields, result, row_empty()) };
-      let sc = { ty_vars: vars, row_vars: [], label_vars: [], ty: ty };
+      let sc = {
+        ty_vars: vars,
+        row_vars: [],
+        kept_vars: [],
+        multi_vars: [],
+        label_vars: [],
+        ty: ty,
+      };
       add_ctor({ ..c2, env: env_bind_global(c2.env, v.name, sc) }, {
         name: v.name,
         module: b"",
@@ -1327,13 +1362,17 @@ fn prelude_op(
   {
     name: name,
     mode: mode,
+    multi: false,
     resource_param: false,
     params: params,
+    kept: [],
     ret: ret,
     at: { module: 0, span: dummy_span() },
     scheme: Some({
       ty_vars: ty_vars,
       row_vars: row_vars,
+      kept_vars: [],
+      multi_vars: [],
       label_vars: [],
       ty: fn_type(params, ret, row),
     }),
@@ -1441,6 +1480,14 @@ pub fn simulated_atoms() -> List<Atom> / {abort.raise} =
         }))
     } else { acc })
 
+/// The operations a `simulate` region answers, each as `<effect>.<operation>`.
+pub fn simulated_ops() -> List<Bytes> / {abort.raise} =
+  prelude_effects().fold([], |acc: List<Bytes>, effect_info: EffectInfo|
+    if !simulated_names().contains(effect_info.name) { acc } else {
+      effect_info.ops.fold(acc, |ops: List<Bytes>, op_info: OpInfo|
+        ops.push(Bytes::concat_all([effect_info.name, b".", op_info.name])))
+    })
+
 // --- The prelude's functions -------------------------------------------------------------------
 
 /// A function the prelude declares: its scheme, the names its declaration gives its parameters, the
@@ -1512,7 +1559,7 @@ fn declared_type(
     TFn(f) -> {
       let ps = declared_types(d, f.params, room);
       let r = declared_type(ps.d, f.ret, room);
-      { d: r.d, ty: fn_type(ps.tys, r.ty, declared_row(r.d, f.effects)) }
+      { d: r.d, ty: owning_fn_type(ps.tys, f.kept, f.once, r.ty, declared_row(r.d, f.effects)) }
     },
     TCon(c) -> {
       let name = c.name.name.name;
@@ -1741,8 +1788,18 @@ pub fn declared(
     scheme: {
       ty_vars: range(0, ret.d.fresh.next_ty),
       row_vars: range(0, ret.d.fresh.next_row),
+      kept_vars: def.generics.kept.fold([], |vs: List<Int>, p: Ident|
+        match tys.tys.get(p.name) { Some(TyVar(v)) -> vs.push(v), _ -> vs }),
+      multi_vars: def.generics.multi.fold([], |vs: List<Int>, p: Ident|
+        match rows.rows.get(p.name) { Some(v) -> vs.push(v), None -> vs }),
       label_vars: [],
-      ty: fn_type(params.tys, ret.ty, row),
+      ty: owning_fn_type(
+        params.tys,
+        range(0, def.params.len()).filter(|i: Int| def.params.get(i).keep),
+        false,
+        ret.ty,
+        row,
+      ),
     },
     params: def.params.map(passed),
     doc: match def.doc { Some(d) -> d.lines, None -> [] },
@@ -2076,6 +2133,10 @@ fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
 derive bin for UpdateShape
 
 derive bin for TrySite
+
+derive bin for ReleasePlace
+
+derive bin for ReleaseSite
 
 derive bin for MemberSite
 

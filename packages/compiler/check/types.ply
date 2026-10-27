@@ -181,14 +181,25 @@ pub type Field = { name: Bytes, ty: Type }
 pub type Type =
   | TyVar(Int)
   | TyCon({ name: Bytes, args: List<Type> })
-  | TyFn({ params: List<Type>, ret: Type, effects: Row })
+  /// `kept` are the places of the parameters the function takes rather than borrows, and `once` a
+  /// function its call consumes.
+  | TyFn({ params: List<Type>, kept: List<Int>, once: Bool, ret: Type, effects: Row })
   /// Sorted by field name.
   | TyRecord(List<Field>)
   /// A record a `type T = new { .. }` declares: `name` and `args` are all that tell two apart, and
   /// `fields` is what they stand for, sorted by field name and written over `args`.
   | TyNominal({ name: Bytes, args: List<Type>, fields: List<Field> })
 
-pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, label_vars: List<Int>, ty: Type }
+/// `kept_vars` are the type variables of `ty_vars` written `keep`, which a resource may fill, and
+/// `multi_vars` the row variables of `row_vars` written `multi`.
+pub type Scheme = {
+  ty_vars: List<Int>,
+  row_vars: List<Int>,
+  kept_vars: List<Int>,
+  multi_vars: List<Int>,
+  label_vars: List<Int>,
+  ty: Type,
+}
 
 derive bin for Row
 
@@ -213,8 +224,18 @@ pub fn map_type(k: Type, v: Type) -> Type = TyCon({ name: b"Map", args: [k, v] }
 pub fn iter_type(s: Type, r: Type) -> Type = TyCon({ name: b"Iter", args: [s, r] })
 pub fn secret_type(ty: Type) -> Type = applied_type(b"Secret", ty)
 pub fn fn_type(params: List<Type>, ret: Type, effects: Row) -> Type =
-  TyFn({ params: params, ret: ret, effects: effects })
-pub fn monomorphic(ty: Type) -> Scheme = { ty_vars: [], row_vars: [], label_vars: [], ty: ty }
+  TyFn({ params: params, kept: [], once: false, ret: ret, effects: effects })
+
+/// `fn_type` whose parameters at `kept` are taken, and which a call consumes where `once` holds.
+pub fn owning_fn_type(
+  params: List<Type>,
+  kept: List<Int>,
+  once: Bool,
+  ret: Type,
+  effects: Row,
+) -> Type = TyFn({ params: params, kept: kept, once: once, ret: ret, effects: effects })
+pub fn monomorphic(ty: Type) -> Scheme =
+  { ty_vars: [], row_vars: [], kept_vars: [], multi_vars: [], label_vars: [], ty: ty }
 
 pub fn fields_sorted(fields: List<Field>) -> List<Field> / {abort.raise} =
   fields.fold([], |acc: List<Field>, field: Field| field_insert(acc, field))
@@ -370,6 +391,7 @@ fn rebuilt(subst: Subst, t: Type, room: Int) -> Type / {abort.raise} =
       }),
     TyFn(f) ->
       TyFn({
+        ..f,
         params: f.params.map(|p: Type|
           if bound_in(subst, p) { rebuilt(subst, p, room) } else { p }),
         ret: if bound_in(subst, f.ret) { rebuilt(subst, f.ret, room) } else { f.ret },
@@ -711,7 +733,10 @@ fn unify_structural(
     TyFn(f1) -> match b {
       TyFn(f2) -> if f1.params.len() != f2.params.len() {
         unify_failed(subst, fresh, Arity({ expected: f1.params.len(), found: f2.params.len() }))
-      } else {
+      }
+      // `kept` and `once` say nothing of a value that can be copied, so they are judged by the
+      // ownership check where a resource meets them, and never here.
+      else {
         let ps = unify_all(subst, fresh, f1.params, f2.params, true, room, tries);
         match ps.error {
           Some(_) -> ps,
@@ -987,6 +1012,7 @@ fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type / {abort.ra
     TyCon(c) -> TyCon({ name: c.name, args: c.args.map(|a: Type| rename(a, tys, rows)) }),
     TyFn(f) ->
       TyFn({
+        ..f,
         params: f.params.map(|p: Type| rename(p, tys, rows)),
         ret: rename(f.ret, tys, rows),
         effects: {
@@ -1029,6 +1055,7 @@ fn substituted(t: Type, tys: Map<Int, Type>, rows: Map<Int, Row>) -> Type / {abo
         atoms_insert(acc, rename_atom(a, tys)));
       let filled = match f.effects.tail { None -> None, Some(v) -> rows.get(v) };
       TyFn({
+        ..f,
         params: f.params.map(|p: Type| substituted(p, tys, rows)),
         ret: substituted(f.ret, tys, rows),
         effects: match filled {
@@ -1145,6 +1172,8 @@ pub fn generalize(
     scheme: {
       ty_vars: ints_difference(fv.tys, env.free.tys),
       row_vars: ints_difference(fv.rows, env.free.rows),
+      kept_vars: [],
+      multi_vars: [],
       label_vars: [],
       ty: ty,
     },
@@ -1159,7 +1188,7 @@ pub fn generalize(
 pub type TypeNode =
   | NodeVar(Int)
   | NodeCon({ name: Bytes, args: List<Bytes> })
-  | NodeFn({ params: List<Bytes>, ret: Bytes })
+  | NodeFn({ params: List<Bytes>, kept: List<Int>, once: Bool, ret: Bytes })
   | NodeRecord(List<NodeField>)
   | NodeNominal({ name: Bytes, args: List<Bytes>, fields: List<NodeField> })
 
@@ -1203,7 +1232,7 @@ pub fn held_type(table: TypeTable, ty: Type) -> { table: TypeTable, key: Bytes }
     TyFn(f) -> {
       let p = held_parts(table, f.params);
       let r = held_type(p.table, f.ret);
-      { table: r.table, node: NodeFn({ params: p.keys, ret: r.key }) }
+      { table: r.table, node: NodeFn({ params: p.keys, kept: f.kept, once: f.once, ret: r.key }) }
     },
     TyRecord(fs) -> {
       let p = held_fields(table, fs);
@@ -1322,7 +1351,7 @@ fn type_of_node(
     NodeFn(f) -> {
       let p = types_within(table, f.params, read, room);
       let r = type_within(table, f.ret, p.read, room);
-      { ty: TyFn({ params: p.tys, ret: r.ty, effects: row_empty() }), read: r.read }
+      { ty: owning_fn_type(p.tys, f.kept, f.once, r.ty, row_empty()), read: r.read }
     },
     NodeRecord(fs) -> {
       let r = fields_within(table, fs, read, room);
@@ -1344,7 +1373,7 @@ fn type_of_node(
 pub type HeldType =
   | HeldVar(Int)
   | HeldCon({ name: Bytes, args: List<Int> })
-  | HeldFn({ params: List<Int>, ret: Int, effects: Row })
+  | HeldFn({ params: List<Int>, kept: List<Int>, once: Bool, ret: Int, effects: Row })
   | HeldRecord(List<HeldField>)
   | HeldNominal({ name: Bytes, args: List<Int>, fields: List<HeldField> })
 
@@ -1390,7 +1419,10 @@ fn type_held(h: Holding, ty: Type) -> { h: Holding, at: Int } / {abort.raise} =
     TyFn(f) -> {
       let p = parts_held(h, f.params);
       let r = type_held(p.h, f.ret);
-      node_held(r.h, HeldFn({ params: p.at, ret: r.at, effects: f.effects }))
+      node_held(
+        r.h,
+        HeldFn({ params: p.at, kept: f.kept, once: f.once, ret: r.at, effects: f.effects }),
+      )
     },
     TyRecord(fs) -> {
       let p = fields_held(h, fs);
@@ -1449,7 +1481,7 @@ fn renumbered(node: HeldType, to: Map<Int, Int>) -> HeldType / {abort.raise} = {
   match node {
     HeldVar(v) -> HeldVar(v),
     HeldCon(c) -> HeldCon({ name: c.name, args: c.args.map(part) }),
-    HeldFn(f) -> HeldFn({ params: f.params.map(part), ret: part(f.ret), effects: f.effects }),
+    HeldFn(f) -> HeldFn({ ..f, params: f.params.map(part), ret: part(f.ret) }),
     HeldRecord(fs) -> HeldRecord(fields(fs)),
     HeldNominal(x) ->
       HeldNominal({ name: x.name, args: x.args.map(part), fields: fields(x.fields) }),
@@ -1500,7 +1532,7 @@ pub fn types_of(held: List<HeldType>) -> List<Type> / {abort.raise} =
     built.push(match node {
       HeldVar(v) -> TyVar(v),
       HeldCon(c) -> TyCon({ name: c.name, args: c.args.map(part) }),
-      HeldFn(f) -> TyFn({ params: f.params.map(part), ret: part(f.ret), effects: f.effects }),
+      HeldFn(f) -> owning_fn_type(f.params.map(part), f.kept, f.once, part(f.ret), f.effects),
       HeldRecord(fs) -> TyRecord(fields(fs)),
       HeldNominal(x) ->
         TyNominal({ name: x.name, args: x.args.map(part), fields: fields(x.fields) }),
@@ -1574,6 +1606,8 @@ pub fn canonical_beside(
     scheme: {
       ty_vars: scheme.ty_vars.map(|v: Int| renamed(n.tys, v)),
       row_vars: scheme.row_vars.map(|v: Int| renamed(n.rows, v)),
+      kept_vars: scheme.kept_vars.map(|v: Int| renamed(n.tys, v)),
+      multi_vars: scheme.multi_vars.map(|v: Int| renamed(n.rows, v)),
       label_vars: scheme.label_vars.map(|v: Int| renamed(n.tys, v)),
       ty: rename(scheme.ty, tys, n.rows),
     },
@@ -1706,6 +1740,7 @@ fn type_past(ty: Type, closed: (Bytes) -> Bool) -> Type / {abort.raise} =
     },
     TyFn(f) ->
       TyFn({
+        ..f,
         params: f.params.map(|p: Type| type_past(p, closed)),
         ret: type_past(f.ret, closed),
         effects: row_past(f.effects, closed),
@@ -1804,7 +1839,14 @@ fn printed(printer: Printer, ty: Type) -> { printer: Printer, text: Bytes } / {a
       None -> {
         let ps = print_tys(printer, f.params);
         let r = printed(ps.printer, f.ret);
-        let head = Bytes::concat_all([b"(", Bytes::join(ps.texts, b", "), b") -> ", r.text]);
+        let params = range(0, ps.texts.len()).map(|i: Int|
+          if f.kept.contains(i) { b"keep ".concat(ps.texts.get(i)) } else { ps.texts.get(i) });
+        let head = Bytes::concat_all([
+          if f.once { b"once (" } else { b"(" },
+          Bytes::join(params, b", "),
+          b") -> ",
+          r.text,
+        ]);
         if row_is_pure(f.effects) { { printer: r.printer, text: head } } else {
           let row = print_row(r.printer, f.effects);
           { printer: row.printer, text: Bytes::concat_all([head, b" / ", row.text]) }
@@ -2055,7 +2097,8 @@ pub fn print_scheme(
       { printer: body.printer, texts: [] },
       |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
         let o = ty_name(acc.printer, v);
-        { printer: o.printer, texts: acc.texts.push(o.name) }
+        let named = if scheme.kept_vars.contains(v) { b"keep ".concat(o.name) } else { o.name };
+        { printer: o.printer, texts: acc.texts.push(named) }
       },
     );
     let labels = scheme.label_vars.fold(
@@ -2069,7 +2112,8 @@ pub fn print_scheme(
       { printer: labels.printer, texts: [] },
       |acc: { printer: Printer, texts: List<Bytes> }, v: Int| {
         let o = row_name(acc.printer, v);
-        { printer: o.printer, texts: acc.texts.push(o.name) }
+        let named = if scheme.multi_vars.contains(v) { b"multi ".concat(o.name) } else { o.name };
+        { printer: o.printer, texts: acc.texts.push(named) }
       },
     );
     let head = if labels.texts.len() > 0 && rows.texts.len() > 0 {
@@ -2204,6 +2248,8 @@ test "the printer names variables in the order it meets them, rows apart" {
   let sc = {
     ty_vars: [7, 3],
     row_vars: [2],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [],
     ty: fn_type([TyVar(3), TyVar(7)], list_type(TyVar(3)), row_open(2)),
   };
@@ -2221,12 +2267,16 @@ test "two schemes alike but for how their variables are numbered are one scheme 
   let one = {
     ty_vars: [7, 3],
     row_vars: [12],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [5],
     ty: fn_type([TyVar(3), list_type(TyVar(7))], TyVar(3), { atoms: [send(5)], tail: Some(12) }),
   };
   let two = {
     ty_vars: [40, 21],
     row_vars: [2],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [9],
     ty: fn_type([TyVar(21), list_type(TyVar(40))], TyVar(21), { atoms: [send(9)], tail: Some(2) }),
   };
@@ -2235,6 +2285,8 @@ test "two schemes alike but for how their variables are numbered are one scheme 
   assert_eq(canonical_scheme(one), {
     ty_vars: [0, 1],
     row_vars: [0],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [2],
     ty: fn_type([TyVar(1), list_type(TyVar(0))], TyVar(1), { atoms: [send(2)], tail: Some(0) }),
   });
@@ -2294,6 +2346,8 @@ test "a label variable steps past a resource of its name" {
   let sc = {
     ty_vars: [],
     row_vars: [],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [4],
     ty: fn_type([], unit_type(), row_closed([named, var_])),
   };
@@ -2331,6 +2385,8 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
   let sc = {
     ty_vars: [1],
     row_vars: [2],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [5],
     ty: fn_type([TyVar(1)], unit_type(), { atoms: [atom], tail: Some(2) }),
   };
@@ -2339,6 +2395,8 @@ test "a scheme prints its label parameters bracketed, among the type parameters"
   let other = {
     ty_vars: [1],
     row_vars: [2],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [9],
     ty: fn_type([TyVar(1)], unit_type(), {
       atoms: [{ effect: b"net", resource: RVar(9), mode: MWrite, op: Some(b"send") }],
@@ -2353,6 +2411,8 @@ test "instantiating a scheme freshens its label parameters and hands them back" 
   let sc = {
     ty_vars: [],
     row_vars: [],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [5],
     ty: fn_type([], unit_type(), row_closed([atom])),
   };

@@ -47,7 +47,9 @@ import compiler.check.infer.checker (Location, OpInfo, EffectInfo, CtorInfo, Def
                                      abort_atom, def_of, Builtin, declared, builtins, builtin_named,
                                      update_shape_bin, try_site_bin, member_site_bin,
                                      label_site_bin, typed_site_bin, row_site_bin, witness_op_bin,
-                                     witness_ref_bin, witness_order_bin)
+                                     witness_ref_bin, witness_order_bin, ReleaseSite, ReleaseAfter,
+                                     ReleaseBefore, ReleaseUnwinding, ReleaseFailing,
+                                     release_site_bin)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
                                           collect_ctors, check_value_namespace, refuse_irregular)
@@ -61,6 +63,7 @@ import compiler.check.infer.solved (check_derives, collect_stated, check_instanc
                                     attribute_generated, check_comparisons, check_parallels,
                                     check_simulations, check_regions, fresh_cx)
 import compiler.check.infer.holes (hole_reports)
+import compiler.check.infer.resources (resourceful_types)
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
@@ -176,6 +179,8 @@ pub type Elaboration = {
   orders: List<WitnessOrder>,
   tries: List<TrySite>,
   members: List<MemberSite>,
+  /// Where each binding a body owns is let go, which the lowering writes its type's release at.
+  releases: List<ReleaseSite>,
 }
 
 fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
@@ -186,6 +191,7 @@ fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
 fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
   {
     tries: checker.try_sites,
+    releases: checker.release_sites,
     members: checker.member_sites,
     updates: checker.update_shapes,
     ops: checker.operands.fold([], |acc: List<WitnessOp>, o: OperandAt|
@@ -213,6 +219,7 @@ pub type RootFacts = {
   refs: List<WitnessRef>,
   tries: List<TrySite>,
   members: List<MemberSite>,
+  releases: List<ReleaseSite>,
   typed: List<TypedSite>,
   types: TypeTable,
   rows: List<RowSite>,
@@ -228,6 +235,7 @@ pub fn no_root_facts() -> RootFacts =
     refs: [],
     tries: [],
     members: [],
+    releases: [],
     typed: [],
     types: Map::new(),
     rows: [],
@@ -272,10 +280,20 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     let f = owned(m, x.owner);
     m.insert(x.owner, { ..f, tries: f.tries.push(x) })
   });
-  let called = facts.elaboration.members.fold(tried, |m: Map<Bytes, RootFacts>, x: MemberSite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, members: f.members.push(x) })
-  });
+  let released = facts.elaboration.releases.fold(
+    tried,
+    |m: Map<Bytes, RootFacts>, x: ReleaseSite| {
+      let f = owned(m, x.owner);
+      m.insert(x.owner, { ..f, releases: f.releases.push(x) })
+    },
+  );
+  let called = facts.elaboration.members.fold(
+    released,
+    |m: Map<Bytes, RootFacts>, x: MemberSite| {
+      let f = owned(m, x.owner);
+      m.insert(x.owner, { ..f, members: f.members.push(x) })
+    },
+  );
   let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite| {
     let f = owned(m, x.owner);
     m.insert(x.owner, { ..f, typed: f.typed.push(x) })
@@ -296,6 +314,7 @@ fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
     ops: facts.ops.map(|x: WitnessOp| { ..x, module: module, owner: owner }),
     refs: facts.refs.map(|x: WitnessRef| { ..x, module: module, owner: owner }),
     tries: facts.tries.map(|x: TrySite| { ..x, module: module, owner: owner }),
+    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: module, owner: owner }),
     members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
     typed: facts.typed.map(|x: TypedSite| { ..x, module: module, owner: owner }),
     types: facts.types,
@@ -331,6 +350,7 @@ fn lowered_only(checker: Checker) -> Checker / {abort.raise} = {
     ..checker,
     label_sites: checker.label_sites.filter(|x: LabelSite| kept(x.owner)),
     try_sites: checker.try_sites.filter(|x: TrySite| kept(x.owner)),
+    release_sites: checker.release_sites.filter(|x: ReleaseSite| kept(x.owner)),
     member_sites: checker.member_sites.map(|x: MemberSite|
       match unlowered_of(x.owner) { Some(o) -> { ..x, owner: o }, None -> x }),
     update_shapes: checker.update_shapes.filter(|x: UpdateShape| kept(x.owner)),
@@ -576,7 +596,14 @@ fn numbered(ty: Type, numbering: Map<Int, Int>, kept: List<Int>) -> Type =
         None -> if kept.contains(v) { kept_type() } else { unit_type() },
       },
       TyCon(c) -> TyCon({ ..c, args: c.args.map(again) }),
-      TyFn(f) -> TyFn({ params: f.params.map(again), ret: again(f.ret), effects: row_empty() }),
+      TyFn(f) ->
+        TyFn({
+          kept: [],
+          once: false,
+          params: f.params.map(again),
+          ret: again(f.ret),
+          effects: row_empty(),
+        }),
       TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: again(f.ty) })),
       TyNominal(x) ->
         TyNominal({
@@ -867,6 +894,7 @@ pub fn check_program_with(
     let typed: Checker = collect_nominals(collect_effects(collect_types(c1, m), m), m);
     collect_stated(check_value_namespace(refuse_irregular(collect_ctors(typed, m), m), m), m)
   });
+  let declared: Checker = { ..declared, resourceful: resourceful_types(declared) };
   let signed = resolved.order.fold(
     { checker: with_orders(declared), by: Map::new() },
     |acc: { checker: Checker, by: Map<Int, SignedModule> }, i: Int| {
@@ -1214,7 +1242,7 @@ fn placed_in(src: Bytes, from: Bytes, to: Bytes) -> Span / {abort.raise} =
 
 test "each closure a handle, a simulate and a parallel make is filed at a place of its own, and a handle's answer at the handle" {
   let src = Bytes::concat_all([
-    b"effect amb {\n  read flip() -> Bool\n}\n",
+    b"effect amb {\n  multi read flip() -> Bool\n}\n",
     b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
     b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
     b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
@@ -5081,6 +5109,8 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
   assert_eq(slice.scheme, {
     ty_vars: [],
     row_vars: [],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
@@ -5091,6 +5121,8 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
   assert_eq(declared_as(b"List::map").scheme, {
     ty_vars: [0, 1],
     row_vars: [0],
+    kept_vars: [],
+    multi_vars: [],
     label_vars: [],
     ty: fn_type(
       [list_type(TyVar(0)), fn_type([TyVar(0)], TyVar(1), row_open(0))],
@@ -7109,7 +7141,7 @@ test "a lent function parameter may be called, lent on, captured by a lambda len
     b"fn f(g: (Int) -> Int) -> Int = { let h = |x: Int| g(x); let k = h; k(1) + [1].fold(0, |a: Int, x: Int| a + h(x)) }",
     b"fn f(g: (Int) -> Int, n: Int) -> Int = if n <= 0 { g(0) } else { f(g, n - 1) }",
     b"fn f(g: (Int) -> Int) -> (Int, Int) = parallel { g(1), g(2) }",
-    b"effect ask { read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + k(2) }",
+    b"effect ask { multi read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + k(2) }",
     // A lambda's parameter is not lent, and neither is what a call answers.
     b"fn f() -> ((Int) -> Int) -> (Int) -> Int = |h: (Int) -> Int| h",
   ];
@@ -7366,4 +7398,863 @@ test "a hole nothing constrains says so, and names no candidates" {
 test "a hole in a test or a law is reported as one" {
   assert_eq(hole_diags(b"test \"t\" { assert_eq(???, 1) }").len(), 1);
   assert_eq(hole_diags(b"law \"l\" forall (n: Int) { ??? }").len(), 1)
+}
+
+// --- Resources -----------------------------------------------------------------------------------
+
+/// A resource and the functions over it a test of ownership calls: `close` consumes one, `send`
+/// borrows one, and `open` makes one.
+fn connections() -> String =
+  \\pub opaque type Conn = | Conn(Int)
+  \\
+  \\release for Conn by close
+  \\
+  \\pub fn close(c: keep Conn) -> Unit = match c { Conn(n) -> () }
+  \\
+  \\pub fn open() -> Conn = Conn(1)
+  \\
+  \\pub fn send(c: Conn, n: Int) -> Int = n
+  \\
+
+fn owned_codes(body: Bytes) -> List<Bytes> / {abort.raise} =
+  check_codes(Bytes::of_string(connections()).concat(body))
+
+test "a resource is consumed once: a use after its consumer, a second release, is refused" {
+  assert_eq(owned_codes(b"fn f() -> Unit = { let c = open(); close(c) }"), []);
+  assert_eq(owned_codes(b"fn f() -> Unit = { let c = open(); close(c); close(c) }"), [b"E0316"]);
+  assert_eq(owned_codes(b"fn f() -> Int = { let c = open(); close(c); send(c, 1) }"), [b"E0316"]);
+  // A borrow leaves it to be let go where its block ends.
+  assert_eq(owned_codes(b"fn f() -> Int = { let c = open(); send(c, 1) + send(c, 2) }"), [])
+}
+
+test "a parameter lends its resource unless it is written `keep`" {
+  assert_eq(owned_codes(b"fn f(c: Conn) -> Unit = close(c)"), [b"E0318"]);
+  assert_eq(owned_codes(b"fn f(c: keep Conn) -> Unit = close(c)"), []);
+  assert_eq(owned_codes(b"fn f(c: Conn) -> Int = send(c, 1)"), [])
+}
+
+test "a resource nothing holds is refused where it is made, and `_` holds none" {
+  assert_eq(owned_codes(b"fn f() -> Unit = { open(); () }"), [b"E0322"]);
+  assert_eq(owned_codes(b"fn f() -> Int = send(open(), 1)"), [b"E0322"]);
+  assert_eq(owned_codes(b"fn f() -> Unit = { let _ = open(); () }"), [b"E0322"])
+}
+
+test "a branch that consumes a resource leaves it consumed past the join" {
+  assert_eq(
+    owned_codes(b"fn f(b: Bool) -> Unit = { let c = open(); if b { close(c) } else { () } }"),
+    [],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(b: Bool) -> Int = { let c = open(); if b { close(c) } else { () }; send(c, 1) }",
+    ),
+    [b"E0316"],
+  )
+}
+
+/// Where `body`, over `connections`, lets go of what it owns, by each release's place in filing order;
+/// what a failing release lets go is left to `failing_places`.
+fn release_places(body: Bytes) -> List<Bytes> / {abort.raise} =
+  checker_m(Bytes::of_string(connections()).concat(body)).release_sites.fold(
+    [],
+    |acc: List<Bytes>, r: ReleaseSite|
+      match r.place {
+        ReleaseAfter -> acc.push(b"after"),
+        ReleaseBefore -> acc.push(b"before"),
+        ReleaseUnwinding -> acc.push(b"unwinding"),
+        ReleaseFailing(_) -> acc,
+      },
+  )
+
+/// For each release in `body` whose failure lets go of something, how many things it lets go.
+fn failing_places(body: Bytes) -> List<Int> / {abort.raise} = {
+  let sites = checker_m(Bytes::of_string(connections()).concat(body)).release_sites;
+  sites.fold([], |acc: List<Int>, r: ReleaseSite|
+    if r.place != ReleaseAfter && r.place != ReleaseBefore { acc } else {
+      let n = sites.filter(|x: ReleaseSite|
+        x.at == r.at && x.place == ReleaseFailing(r.binding)).len(
+      );
+      if n == 0 { acc } else { acc.push(n) }
+    })
+}
+
+test "a resource is let go where its block ends: before a last expression that does not name it" {
+  assert_eq(release_places(b"fn f() -> Int = { let c = open(); let n = 1; n }"), [b"before"]);
+  assert_eq(release_places(b"fn f() -> Int = { let c = open(); send(c, 1) }"), [
+    b"unwinding",
+    b"after",
+  ]);
+  assert_eq(release_places(b"fn f() -> Unit = { let c = open(); close(c) }"), [])
+}
+
+test "a failure lets go what the body owns, and what a call took before a later argument failed" {
+  let src = |body: Bytes|
+    Bytes::concat_all([
+      b"fn g() -> Int / {abort.raise} = 1\nfn take(c: keep Conn, n: Int) -> Unit = close(c)\n",
+      body,
+    ]);
+  assert_eq(
+    release_places(src(b"fn f() -> Unit / {abort.raise} = { let c = open(); take(c, g()) }")),
+    [b"unwinding"],
+  );
+  assert_eq(
+    release_places(src(b"fn f() -> Int / {abort.raise} = { let c = open(); send(c, g()) }")),
+    [b"unwinding", b"unwinding", b"after"],
+  );
+  // A clause runs as a body of its own: what the definition owns is let go where the `handle` fails.
+  assert_eq(
+    release_places(
+      src(
+        b"effect ask { read get() -> Int }\nfn f() -> Int / {abort.raise} = { let c = open(); let n = handle { ask.get() } with { ask.get() resume k -> k(g()) }; n + send(c, 1) }",
+      ),
+    ),
+    // `ask.get()`, `send` and `+`, which may raise; nothing in the clause.
+    [b"unwinding", b"unwinding", b"unwinding", b"after"],
+  );
+  // What the last expression does not name is let go before it runs, so a failure there holds none.
+  assert_eq(release_places(src(b"fn f() -> Int / {abort.raise} = { let c = open(); g() }")), [
+    b"before",
+  ])
+}
+
+test "a failure a handler answers lets go past the handler only what the handled body did not take" {
+  let src = |body: Bytes| Bytes::concat_all([b"fn g() -> Int / {abort.raise} = 1\n", body]);
+  assert_eq(
+    release_places(
+      src(
+        b"fn f() -> Int = { let c = open(); let n = handle { g() } with { abort.raise(m) -> 0 }; send(c, n) }",
+      ),
+    ),
+    // At the `handle` rather than at `g()`, then at `send`, then after it.
+    [b"unwinding", b"unwinding", b"after"],
+  )
+}
+
+test "a clause or a `return` clause borrows what is bound outside it, and consumes none of it" {
+  assert_eq(
+    owned_codes(
+      b"effect ask { read get() -> Int }\nfn f() -> Int = { let c = open(); handle { ask.get() } with { ask.get() resume k -> { close(c); k(1) } } }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f() -> Int = { let c = open(); let n = handle { 1 } with { return v -> { close(c); v } }; n }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"effect ask { read get() -> Int }\nfn f() -> Int = { let c = open(); handle { ask.get() } with { ask.get() resume k -> k(send(c, 1)) } }",
+    ),
+    [],
+  )
+}
+
+test "a clause's parameter the operation takes is the clause's to let go" {
+  assert_eq(
+    release_places(
+      b"effect sink { write give(c: keep Conn) -> Unit\n write count(n: Int) -> Unit }\nfn f() -> Unit = handle { sink.give(open()) } with { sink.give(c) resume k -> k(()), sink.count(n) resume k -> k(()) }",
+    ),
+    [b"before"],
+  )
+}
+
+test "a `let ... else` runs its value before its `else`, and a lent value lends its parts" {
+  assert_eq(
+    release_places(
+      b"fn upgrade(c: keep Conn) -> Option<Conn> = Some(c)\nfn f() -> Int = { let c = open(); let Some(d) = upgrade(c) else { 0 }; send(d, 1) }",
+    ),
+    // What the pattern missed is let go before the `else`.
+    [b"before", b"unwinding", b"after"],
+  );
+  assert_eq(
+    owned_codes(b"fn f(r: { conn: Conn, n: Int }) -> Int = { let { conn, n } = r; send(conn, n) }"),
+    [],
+  )
+}
+
+test "a field is moved out on every path past a branch or on none, and never inside a function" {
+  assert_eq(
+    owned_codes(
+      b"fn f(b: Bool, r: keep { a: Conn, n: Int }) -> Unit = if b { close(r.a) } else { () }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(xs: List<Int>, r: keep { a: Conn, n: Int }) -> List<Int> = xs.map(|x: Int| { close(r.a); x })",
+    ),
+    [b"E0316"],
+  )
+}
+
+test "a block that ends in a statement lets go after it, and a call of what took a resource holds it" {
+  assert_eq(release_places(b"fn f() -> Unit = { let c = open(); send(c, 1); }"), [
+    b"unwinding",
+    b"after",
+  ]);
+  assert_eq(
+    release_places(
+      b"fn h() -> Int / {abort.raise} = 1\nfn f() -> Int / {abort.raise} = { let c = open(); let g = |n: Int| { close(c); n }; g(h()) }",
+    ),
+    [b"unwinding"],
+  )
+}
+
+test "a function that consumed what it captured is only called, and letting it go lets that go" {
+  assert_eq(release_places(b"fn f() -> Unit = { let c = open(); let g = || close(c); () }"), [
+    b"before",
+  ]);
+  assert_eq(
+    owned_codes(
+      b"fn run(g: keep once () -> Unit) -> Unit = g()\nfn f() -> Unit = { let c = open(); run(|| close(c)) }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn run(g: () -> Unit) -> Unit = g()\nfn f() -> Unit = { let c = open(); let g = || close(c); run(g) }",
+    ),
+    [b"E0316"],
+  )
+}
+
+test "a function may consume what it captures only where it runs once" {
+  assert_eq(
+    owned_codes(
+      b"fn f(xs: List<Int>) -> List<Int> = { let c = open(); xs.map(|x: Int| { close(c); x }) }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(xs: List<Int>) -> List<Int> = { let c = open(); xs.map(|x: Int| send(c, x)) }",
+    ),
+    [],
+  );
+  assert_eq(owned_codes(b"fn f() -> Unit = { let c = open(); let g = || close(c); g(); g() }"), [
+    b"E0316",
+  ]);
+  assert_eq(
+    owned_codes(b"fn f() -> Int = { let c = open(); let g = || send(c, 1); close(c); g() }"),
+    [b"E0316"],
+  )
+}
+
+test "a type's own module takes a resource apart, which consumes it" {
+  assert_eq(owned_codes(b"fn f() -> Int = { let c = open(); match c { Conn(n) -> n } }"), []);
+  assert_eq(owned_codes(b"fn f() -> Int = { let c = open(); let Conn(n) = c; n + send(c, 1) }"), [
+    b"E0316",
+  ])
+}
+
+test "a release performs within the row of what lets its value go" {
+  let src = |body: Bytes|
+    Bytes::concat_all([
+      b"effect wire { write shut() -> Unit }\n",
+      b"pub opaque type Sock = | Sock(Int)\nrelease for Sock by shut_sock\n",
+      b"pub fn shut_sock(s: keep Sock) -> Unit / {wire.shut} = match s { Sock(n) -> wire.shut() }\n",
+      b"pub fn sock() -> Sock = Sock(1)\n",
+      body,
+    ]);
+  assert_eq(check_codes(src(b"fn holds() -> Unit = { let s = sock(); () }")), [b"E0302"]);
+  assert_eq(check_codes(src(b"fn holds() -> Unit / {wire.shut} = { let s = sock(); () }")), [])
+}
+
+test "a `release` is stated for an opaque type of the module's own, by a function that takes it" {
+  assert_eq(
+    check_codes(
+      b"pub type T = | T(Int)\nrelease for T by drop\npub fn drop(t: keep T) -> Unit = match t { T(n) -> () }\n",
+    ),
+    [b"E0225"],
+  );
+  assert_eq(
+    check_codes(
+      b"pub opaque type T = | T(Int)\nrelease for T by drop\npub fn drop(t: T) -> Unit = ()\n",
+    ),
+    [b"E0218"],
+  );
+  assert_eq(
+    check_codes(
+      b"pub opaque type T = | T(Int)\nrelease for T by drop\npub fn drop(t: keep T) -> Int = match t { T(n) -> n }\n",
+    ),
+    [b"E0218"],
+  )
+}
+
+test "`keep` is written only where something is taken, and a resource fills only a kept type parameter" {
+  assert_eq(owned_codes(b"fn f(n: keep Int) -> Int = n"), [b"E0323"]);
+  assert_eq(owned_codes(b"fn id<a>(x: a) -> a = x\nfn f() -> Conn = { let c = open(); id(c) }"), [
+    b"E0317",
+  ]);
+  assert_eq(owned_codes(b"fn id<keep a>(x: keep a) -> a = x\nfn f() -> Conn = id(open())"), []);
+  // A kept parameter is a resource in the body, so a copy of one is refused there.
+  assert_eq(owned_codes(b"fn twice<keep a>(x: keep a) -> (a, a) = (x, x)"), [b"E0316"])
+}
+
+test "a clause calls a one-shot operation's continuation at most once, and a `multi` one's at will" {
+  assert_eq(
+    check_codes(
+      b"effect ask { read get() -> Int }\nfn f() -> Int = handle { ask.get() } with { ask.get() resume k -> k(1) + k(2) }\n",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    check_codes(
+      b"effect amb { multi read flip() -> Bool }\nfn f() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
+    ),
+    [],
+  )
+}
+
+test "a resource is not live across a stop a clause may resume more than once" {
+  let amb = |body: Bytes|
+    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
+      body,
+    );
+  assert_eq(
+    check_codes(
+      amb(b"fn f() -> Unit / {amb.flip} = { let c = open(); let b = amb.flip(); close(c) }"),
+    ),
+    [b"E0319"],
+  );
+  // A `handle` inside the resource's block ends the continuation before it reaches what holds it.
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f() -> Unit = { let c = open(); let n = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }; close(c) }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "nothing `nondet` runs where a clause may resume the body more than once" {
+  let src = |body: Bytes|
+    Bytes::concat_all([
+      b"effect amb { multi read flip() -> Bool }\nnondet effect dial { read now() -> Int }\n",
+      body,
+    ]);
+  assert_eq(
+    check_codes(src(b"fn f() -> Int / {amb.flip, dial.now} = { let b = amb.flip(); dial.now() }")),
+    [b"E0321"],
+  );
+  assert_eq(
+    check_codes(
+      src(
+        b"fn f() -> Int / {amb.flip, dial.now} = { let n = dial.now(); if amb.flip() { n } else { 0 } }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a function that calls one that borrows a resource borrows it too, and neither outlives it" {
+  assert_eq(
+    owned_codes(
+      b"fn f() -> Int = { let c = open(); let g = || send(c, 1); let h = || g(); close(c); h() }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(b"fn f() -> Int = { let c = open(); let g = || send(c, 1); let h = || g(); h() }"),
+    [],
+  );
+  // A function a `let` binds that borrows a lent value is called or lent, never answered.
+  assert_eq(owned_codes(b"fn mk(c: Conn) -> () -> Int = { let h = || send(c, 1); h }"), [b"E0318"]);
+  assert_eq(
+    owned_codes(
+      b"fn run(g: () -> Int) -> Int = g()\nfn f(c: Conn) -> Int = { let h = || send(c, 1); run(h) }",
+    ),
+    [],
+  )
+}
+
+test "a function that took one that took a resource lets the resource go where its block ends" {
+  assert_eq(
+    release_places(b"fn f() -> Unit = { let c = open(); let g = || close(c); let h = || g(); () }"),
+    [b"before"],
+  );
+  assert_eq(
+    release_places(
+      b"fn f() -> Unit = { let c = open(); let g = || close(c); let h = || g(); h() }",
+    ),
+    [],
+  )
+}
+
+test "a guard borrows: one that would consume is refused" {
+  assert_eq(
+    owned_codes(
+      b"fn done(c: keep Conn) -> Bool = { close(c); false }\nfn f(n: Int) -> Int = { let c = open(); match n { 1 if done(c) -> 0, _ -> send(c, 1) } }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(n: Int) -> Int = { let c = open(); match n { 1 if send(c, 1) > 0 -> 0, _ -> send(c, 2) } }",
+    ),
+    [],
+  )
+}
+
+test "a block lent on whole lets nothing it binds go under the call it is lent to" {
+  assert_eq(owned_codes(b"fn f() -> Int = send({ let c = open(); c }, 1)"), [b"E0322"]);
+  assert_eq(
+    owned_codes(
+      b"fn f(o: keep Option<Conn>, d: Conn) -> Int = send(match o { Some(c) -> c, None -> d }, 1)",
+    ),
+    [b"E0322"],
+  );
+  assert_eq(
+    owned_codes(b"fn f(b: Bool, x: Conn, y: Conn) -> Int = send(if b { x } else { y }, 1)"),
+    [],
+  )
+}
+
+test "an update writes over a resource field only once it is moved out" {
+  assert_eq(
+    owned_codes(
+      b"fn swap(r: keep { conn: Conn, n: Int }, d: keep Conn) -> { conn: Conn, n: Int } = { ..r, conn: d }",
+    ),
+    [b"E0322"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn swap(r: keep { conn: Conn, n: Int }, d: keep Conn) -> { conn: Conn, n: Int } = { let old = r.conn; close(old); { ..r, conn: d } }",
+    ),
+    [],
+  )
+}
+
+test "a resource is moved out of a record one field at a time" {
+  assert_eq(
+    owned_codes(b"fn f(r: keep { inner: { conn: Conn } }) -> Unit = close(r.inner.conn)"),
+    [b"E0316"],
+  );
+  assert_eq(owned_codes(b"fn f(r: { inner: { conn: Conn } }) -> Unit = close(r.inner.conn)"), [
+    b"E0318",
+  ]);
+  assert_eq(
+    owned_codes(
+      b"fn f(r: keep { inner: { conn: Conn } }) -> Unit = { let inner = r.inner; close(inner.conn) }",
+    ),
+    [],
+  );
+  // Read through a lent record, a field is lent.
+  assert_eq(
+    owned_codes(
+      b"fn f(r: { c: Option<Conn> }) -> Int = match r.c { Some(x) -> send(x, 1), None -> 0 }",
+    ),
+    [],
+  );
+  assert_eq(owned_codes(b"fn f(r: { c: Conn }) -> Int = { let x = r.c; send(x, 1) }"), [])
+}
+
+test "`..` and an alternative's `_` drop no resource" {
+  assert_eq(
+    owned_codes(b"fn f(r: keep { a: Conn, b: Conn }) -> Unit = { let { a, .. } = r; close(a) }"),
+    [b"E0322"],
+  );
+  assert_eq(
+    owned_codes(b"fn f(r: keep { a: Conn, n: Int }) -> Unit = { let { a, .. } = r; close(a) }"),
+    [],
+  );
+  assert_eq(
+    owned_codes(b"fn f(xs: keep List<Conn>) -> Unit = match xs { [x, ..] -> close(x), [] -> () }"),
+    [b"E0322"],
+  );
+  assert_eq(
+    owned_codes(
+      b"type Two = | A(Conn, Conn) | B(Conn, Conn)\nfn f(t: keep Two) -> Unit = match t { A(c, _) | B(c, _) -> close(c) }",
+    ),
+    // Each alternative's `_` is refused where it stands.
+    [b"E0322", b"E0322"],
+  )
+}
+
+test "what a call took is as live across a stop as what the body owns" {
+  let amb = |body: Bytes|
+    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
+      body,
+    );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn take(c: keep Conn, b: Bool) -> Unit = close(c)\nfn f() -> Unit / {amb.flip} = { let c = open(); take(c, amb.flip()) }",
+      ),
+    ),
+    [b"E0319"],
+  );
+  // What a `handle` held before its body began is borrowed past a stop it answers, never consumed.
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f() -> Int = { let c = open(); handle { let b = amb.flip(); close(c); 1 } with { amb.flip() resume k -> k(true) + k(false) } }",
+      ),
+    ),
+    [b"E0319"],
+  );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f() -> Int = { let c = open(); handle { let b = amb.flip(); send(c, 1) } with { amb.flip() resume k -> k(true) + k(false) } }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a handler's variable reads what is above it, hides what it names, and holds no resource" {
+  let ask = |body: Bytes|
+    Bytes::of_string(connections()).concat(b"effect ask { read get() -> Int }\n").concat(body);
+  assert_eq(
+    check_codes(
+      ask(
+        b"fn f() -> Int = handle { ask.get() } with { var c = open(), ask.get() resume k -> k(1) }",
+      ),
+    ),
+    [b"E0322"],
+  );
+  assert_eq(
+    check_codes(
+      ask(
+        b"fn f() -> Int = { let c = open(); handle { ask.get() } with { var c = 0, ask.get() resume k -> { c = c + 1; k(c) } } }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      ask(
+        b"fn f() -> Int = { let c = open(); handle { ask.get() } with { var n = { close(c); 0 }, ask.get() resume k -> k(n) } + send(c, 1) }",
+      ),
+    ),
+    [b"E0316"],
+  )
+}
+
+test "a `once` function is called once, by what owns it" {
+  assert_eq(owned_codes(b"fn run(f: once () -> Unit) -> Unit = f()"), [b"E0318"]);
+  assert_eq(owned_codes(b"fn run(f: keep once () -> Unit) -> Unit = f()"), []);
+  assert_eq(owned_codes(b"fn run(f: keep once () -> Unit) -> Unit = { f(); f() }"), [b"E0316"])
+}
+
+test "a release that fails lets go of what is still owned where it runs" {
+  // `b` is let go first; should its release fail, `a` is let go on the way out.
+  assert_eq(failing_places(b"fn f() -> Unit = { let a = open(); let b = open(); () }"), [1]);
+  assert_eq(failing_places(b"fn f() -> Unit = { let a = open(); () }"), []);
+  // What the block answers is still owned while what it bound is let go after it.
+  assert_eq(failing_places(b"fn f() -> Conn = { let c = open(); let d = open(); d }"), [1]);
+  assert_eq(
+    failing_places(
+      b"fn wrap(c: Conn) -> Conn = open()\nfn f() -> Conn = { let c = open(); wrap(c) }",
+    ),
+    [1],
+  )
+}
+
+test "a `let` whose pattern misses lets go of what the body owns, and of the value" {
+  assert_eq(
+    release_places(
+      b"fn maybe() -> Option<Int> = None\nfn f() -> Int / {abort.raise} = { let c = open(); let Some(n) = maybe(); send(c, n) }",
+    ),
+    [b"unwinding", b"unwinding", b"unwinding", b"after"],
+  );
+  assert_eq(
+    release_places(b"fn f() -> Int = { let c = open(); let (n, m) = (1, 2); send(c, n + m) }"),
+    [b"unwinding", b"unwinding", b"after"],
+  )
+}
+
+test "a test's body is judged as a function's is, and lets go of what it owns" {
+  assert_eq(owned_codes(b"test \"t\" { let c = open(); close(c); close(c) }"), [b"E0316"]);
+  assert_eq(release_places(b"test \"t\" { let c = open(); () }"), [b"before"])
+}
+
+test "a block lent whole is refused only where it may answer what it binds" {
+  assert_eq(
+    owned_codes(
+      b"fn f(x: Conn, y: Conn) -> Int = send({ let c = open(); if send(c, 0) > 0 { x } else { y } }, 1)",
+    ),
+    [],
+  )
+}
+
+test "a lambda's body runs where it is called: what a call holds in flight and an earlier stop are not its" {
+  let amb = |body: Bytes|
+    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
+      body,
+    );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn run(c: keep Conn, g: () -> Bool / {amb.flip}) -> Bool / {amb.flip} = { close(c); g() }\nfn f() -> Bool / {amb.flip} = { let c = open(); run(c, || amb.flip()) }",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f() -> Int = { let c = open(); handle { let pick = || amb.flip(); close(c); if pick() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) } }",
+      ),
+    ),
+    [],
+  );
+  // Moving a field out, or taking a value apart, past such a stop runs again on each resumption.
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f(r: keep { conn: Conn, n: Int }) -> Int = handle { let b = amb.flip(); close(r.conn); r.n } with { amb.flip() resume k -> k(true) + k(false) }",
+      ),
+    ),
+    [b"E0319"],
+  );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f(o: keep Option<Conn>) -> Int = handle { let b = amb.flip(); match o { Some(c) -> { close(c); 1 }, None -> 0 } } with { amb.flip() resume k -> k(true) + k(false) }",
+      ),
+    ),
+    [b"E0319"],
+  )
+}
+
+test "a function that takes one that borrows borrows what it does" {
+  assert_eq(
+    owned_codes(
+      b"fn f() -> Int = { let c = open(); let d = open(); let g = || { close(c); send(d, 1) }; let h = || g(); close(d); h() }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f() -> Int = { let c = open(); let d = open(); let g = || { close(c); send(d, 1) }; let h = || g(); h() }",
+    ),
+    [],
+  )
+}
+
+test "a release performs what the row of the body letting it go names, or a `handle` around it answers" {
+  let logged = |body: Bytes|
+    Bytes::concat_all([
+      b"effect log { write note(s: String) -> Unit }\nopaque type R = | R(Int)\nrelease for R by shut\nfn shut(r: keep R) -> Unit / {log.write} = match r { R(_) -> log.note(\"x\") }\nfn run(g: () -> Int) -> Int = g()\n",
+      body,
+    ]);
+  assert_eq(check_codes(logged(b"fn f() -> Int = run(|| { let r = R(1); 1 })")), [b"E0302"]);
+  assert_eq(
+    check_codes(
+      logged(
+        b"fn f() -> Int = run(|| handle { let r = R(1); 1 } with { log.note(s) resume k -> k(()) })",
+      ),
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      logged(b"fn f() -> Int = handle { let r = R(1); 1 } with { log.note(s) resume k -> k(()) }"),
+    ),
+    [],
+  );
+  assert_eq(check_codes(logged(b"fn f() -> Int = { let r = R(1); 1 }")), [b"E0302"])
+}
+
+test "a release's row is the body's it runs in, past what a `handle` around it answers there" {
+  let logged = |body: Bytes|
+    Bytes::concat_all([
+      b"effect log { write note(s: String) -> Unit }\neffect ask { read get() -> Int }\nopaque type R = | R(Int)\nrelease for R by shut\nfn shut(r: keep R) -> Unit / {log.write} = match r { R(_) -> log.note(\"x\") }\ntype Box = | Box(R, Int)\nfn wrap(r: keep R, n: Int) -> Box = Box(r, n)\nfn zero() -> Int = 0\n",
+      body,
+    ]);
+  // A lambda whose row names what the release performs holds it.
+  assert_eq(
+    check_codes(
+      logged(
+        b"fn run(g: () -> Int / {log.write}) -> Int / {log.write} = g()\nfn f() -> Int / {log.write} = run(|| { log.note(\"y\"); let r = R(1); 1 })",
+      ),
+    ),
+    [],
+  );
+  // A clause's body runs where its `handle` stands, inside the one around that.
+  assert_eq(
+    check_codes(
+      logged(
+        b"fn f() -> Int = handle { handle { ask.get() } with { ask.get() resume k -> { let r = R(1); k(1) } } } with { log.note(s) resume k -> k(()) }",
+      ),
+    ),
+    [],
+  );
+  // What a function took and never ran is let go where its block ends, in the definition.
+  assert_eq(
+    check_codes(logged(b"fn f() -> Int = { let r = R(1); let g = || { shut(r); 1 }; 0 }")),
+    [b"E0302"],
+  );
+  // A value handed to a call that a later argument's failure lets go is let go in the definition.
+  assert_eq(check_codes(logged(b"fn f() -> Box / {abort.raise} = wrap(R(1), 10 / zero())")), [
+    b"E0302",
+  ])
+}
+
+test "a failing release lets go of what the node answers only where the node's value is taken" {
+  assert_eq(
+    failing_places(
+      b"fn peek(c: Conn) -> Bool = true\nfn f(x: Conn) -> Int = send({ let c = open(); if peek(c) { x } else { x } }, 1)",
+    ),
+    [],
+  )
+}
+
+test "an `else` consumes only what its block binds, and a branch lent on answers nothing let go after it" {
+  assert_eq(
+    owned_codes(
+      b"fn f(o: Option<Int>) -> Int = { let c = open(); let n = { let Some(x) = o else { close(c); 0 }; x }; n }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(o: Option<Int>) -> Int = { let c = open(); let Some(x) = o else { close(c); 0 }; x }",
+    ),
+    [],
+  );
+  assert_eq(
+    owned_codes(
+      b"fn f(b: Bool, d: Conn) -> Int = { let c = open(); send(if b { close(c); d } else { c }, 1) }",
+    ),
+    [b"E0322"],
+  )
+}
+
+test "an `else` answers as its block does, and a `simulate` region answers what it simulates" {
+  // What the `else` answers its block, which is taken, a failing release after it lets go.
+  assert_eq(
+    failing_places(
+      b"fn pick(c: Conn) -> Conn = open()\nfn f(o: keep Option<Conn>) -> Conn = { let c = open(); let Some(x) = o else { pick(c) }; close(c); x }",
+    ),
+    [1],
+  );
+  // A branch lent on that answers a field no resource is refused nothing.
+  assert_eq(
+    owned_codes(
+      b"type Box = { conn: Conn, n: Int }\nfn shut_box(p: keep Box) -> Unit = close(p.conn)\nfn f(b: Bool, p: keep Box) -> Int = { let k = if b { shut_box(p); 0 } else { p.n }; k }",
+    ),
+    [],
+  );
+  assert_eq(
+    check_codes(
+      b"opaque type T = | T(Int)\nrelease for T by stop\nfn stop(t: keep T) -> Unit / {clock.now} = match t { T(_) -> { let n = clock.now(); () } }\nfn f() -> Int / {abort.raise, sim.read} = simulate { let t = T(1); 1 }",
+    ),
+    [],
+  )
+}
+
+test "a continuation takes what the clause resumes the body with" {
+  let pool = |clause: Bytes|
+    Bytes::concat_all([
+      b"effect pool { write get() -> Conn }\nfn f() -> Unit = handle { let c = pool.get(); close(c) } with { pool.get() resume k -> ",
+      clause,
+      b" }",
+    ]);
+  assert_eq(owned_codes(pool(b"k(open())")), []);
+  // The body owns what it is resumed with, so the clause lets none of it go.
+  assert_eq(release_places(pool(b"{ let d = open(); k(d) }")), [])
+}
+
+test "a `return` clause owns what the body answers, however the `handle`'s value is used" {
+  assert_eq(
+    owned_codes(
+      b"fn f() -> Int = { let n = handle { open() } with { return v -> send(v, 1) }; n }",
+    ),
+    [],
+  )
+}
+
+test "a `return` clause answers as its `handle` does" {
+  assert_eq(owned_codes(b"fn f() -> Int = send(handle { 1 } with { return v -> open() }, 1)"), [
+    b"E0322",
+  ])
+}
+
+test "an `else` answers as its block does: one lent on holds nothing it makes" {
+  assert_eq(
+    owned_codes(b"fn f(o: Option<Conn>) -> Int = send({ let Some(x) = o else { open() }; x }, 1)"),
+    [b"E0322"],
+  )
+}
+
+test "a `let` whose pattern misses into its `else` lets go of the value it missed" {
+  let src = |body: Bytes|
+    Bytes::concat_all([
+      b"effect wire { write shut() -> Unit }\n",
+      b"pub opaque type Sock = | Sock(Int)\nrelease for Sock by shut_sock\n",
+      b"pub fn shut_sock(s: keep Sock) -> Unit / {wire.shut} = match s { Sock(n) -> wire.shut() }\n",
+      b"type Two = | A(Int) | B(Sock)\n",
+      body,
+    ]);
+  assert_eq(check_codes(src(b"fn f(t: keep Two) -> Int = { let A(n) = t else { 0 }; n }")), [
+    b"E0302",
+  ]);
+  assert_eq(
+    check_codes(src(b"fn f(t: keep Two) -> Int / {wire.shut} = { let A(n) = t else { 0 }; n }")),
+    [],
+  )
+}
+
+test "a call on a value is a stop where its function may make one" {
+  let amb = |body: Bytes|
+    Bytes::of_string(connections()).concat(
+      b"effect amb { multi read flip() -> Bool }\nfn Conn::flip(c: Conn) -> Bool / {amb.flip} = amb.flip()\n",
+    ).concat(
+      body,
+    );
+  assert_eq(
+    check_codes(
+      amb(b"fn f() -> Unit / {amb.flip} = { let c = open(); let b = c.flip(); close(c) }"),
+    ),
+    [b"E0319"],
+  )
+}
+
+test "a function's stop holds what is live where it is called, not where it is made" {
+  let amb = |body: Bytes|
+    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
+      body,
+    );
+  assert_eq(
+    check_codes(
+      amb(
+        b"fn f() -> Bool / {amb.flip} = { let c = open(); let g = || amb.flip(); close(c); g() }",
+      ),
+    ),
+    [],
+  )
+}
+
+test "a `try` answers what a release inside it raises, as the `handle` it is" {
+  assert_eq(
+    check_codes(
+      b"effect toml { raise syntax(e: Int) }\nopaque type T = | T(Int)\nrelease for T by stop\nfn stop(t: keep T) -> Unit / {toml.syntax} = match t { T(n) -> toml.syntax(n) }\nfn f() -> Result<Int, Int> = try { let t = T(1); toml.syntax(2) }",
+    ),
+    [],
+  )
+}
+
+test "the right of `&&` and `||` may not run, so it only borrows" {
+  assert_eq(
+    owned_codes(
+      b"fn took(c: keep Conn) -> Bool = { close(c); true }\nfn f(b: Bool) -> Bool = { let c = open(); b && took(c) }",
+    ),
+    [b"E0316"],
+  );
+  assert_eq(owned_codes(b"fn f(b: Bool) -> Bool = { let c = open(); b && send(c, 1) > 0 }"), [])
+}
+
+test "a function that borrows a record's field is used only while the record holds it" {
+  assert_eq(
+    owned_codes(
+      b"fn f(r: keep { a: Conn, n: Int }) -> Int = { let g = || send(r.a, 1); close(r.a); g() }",
+    ),
+    [b"E0316"],
+  )
 }

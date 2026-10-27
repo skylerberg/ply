@@ -3,7 +3,7 @@
 import compiler.syntax.parsing (Span, dummy_span, site_digit)
 import compiler.emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NField, NApp,
                            NRecord, NMatch, NLambda, CodePattern, PxWild, PxVar, PxCtor, CLet, CDo,
-                           CodeStmt, CodeArm, CodeField)
+                           CodeStmt, CodeArm, CodeField, PxList)
 import compiler.syntax.items (Item, IInstance, NKey, NShow, INumeric, numeric_by)
 import compiler.check.resolve.tables (qualify)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
@@ -19,7 +19,8 @@ import compiler.emit.c (KBool, KBoxed, KInt, width_named)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Written, TypeOp, Reflect, Shown, Digest, Contained, Lower, Lift,
                            Keeping, Opening, root_name, root_text, op_name)
-import compiler.emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of, runtime_object)
+import compiler.emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of, runtime_object,
+                           holds_resource, ctor_fields_at)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.lower.setting (prelude_ctor)
 import compiler.emit.marks (marked_type, marked_key, plain, kept_form, marked)
@@ -140,7 +141,10 @@ pub fn contained_formed(op: Bytes) -> Bool =
 pub fn contained_reads(op: Bytes, k: Int) -> Bool =
   if gathering_walks().contains(op) { k != 1 }
   else if kept_loops().contains(op) { k != 1 }
-  else { walk_ops().contains(op) || op == b"lower_items" || op == b"lower_entries" }
+  else {
+    walk_ops().contains(op) || op == b"lower_items" || op == b"lower_entries"
+      || op == b"let_go_items"
+  }
 
 /// Each root written for containers of type `t` in `module`, as a definition of the module, so a
 /// root's call of another, or of itself, is a call of a definition: the two-container ones take
@@ -1324,6 +1328,139 @@ pub fn reflection_code(
       TyCon({ name: b"List", args: [value] }),
     ]),
   }
+}
+
+// --- Letting go of a resource -----------------------------------------------------------------
+
+/// The root `key`, written in `module`, that lets go of a resource of type `ty`, its parameter `a`:
+/// a call of the function the type's `release` names; for a list, each item let go and then the
+/// rest, a loop; and for a sum or a record, each part that holds a resource let go, the parts a
+/// constructor holds read by a `match`. A part is let go by `?let_go`, which the lowering settles by
+/// the type the part holds.
+pub fn let_go_code(
+  module: Bytes,
+  ctors: Ctors,
+  here: List<Def>,
+  key: RootKey,
+  ty: Type,
+) -> WrittenRoot / {abort.raise} = {
+  let at = |node: Node| { node: node, span: dummy_span() };
+  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
+  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
+  let let_go = |x: Code| at(NApp({ func: at(NVar({ name: b"?let_go", slot: None })), args: [x] }));
+  let a = var(b"a", 0);
+  let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
+  let body = match fields_of {
+    Some(fs) ->
+      {
+        code: sequence(
+          fs.filter(|f: Field| holds_resource(ctors, f.ty)).map(|f: Field|
+            let_go(at(NField({ base: a, field: f.name })))),
+        ),
+        typed: Map::new(),
+        here: [],
+      },
+    None -> match ty {
+      TyCon(c) -> match ctors.released.get(c.name) {
+        Some(by) -> {
+          let local = local_root(module, by);
+          match stated_for(here, ty, |n: Bytes| if n == c.name { Some(local) } else { None }) {
+            Some(f) ->
+              {
+                code: at(
+                  NApp({
+                    func: { node: NVar({ name: f.f, slot: None }), span: placed(0) },
+                    args: [a],
+                  }),
+                ),
+                typed: Map::new().insert(placed(0).site, filed_as(f.fn_type, f.args)),
+                here: [],
+              },
+            None -> { code: unit_code(), typed: Map::new(), here: [] },
+          }
+        },
+        None -> if c.name == b"List" {
+          // Each item let go in turn, from the first, by a loop over the list lent to it.
+          let items = keys::written(Contained(b"let_go_items"), ty, module);
+          {
+            code: call_of(module, items, [a, int_code(0)]),
+            typed: Map::new(),
+            here: [def_of(module, items, [ty, int_type()], unit_type())],
+          }
+        } else {
+          match ctors.sums.get(c.name) {
+            None -> { code: unit_code(), typed: Map::new(), here: [] },
+            Some(cs) -> {
+              let walked = cs.fold(
+                { arms: [], typed: Map::new(), next: 0, slot: 1 },
+                |acc: { arms: List<CodeArm>, typed: Map<Int, Typed>, next: Int, slot: Int }, sc: SumCtor| {
+                  let fields = ctor_fields_at(sc, c.args);
+                  let held = range(0, fields.len()).filter(|j: Int|
+                    holds_resource(ctors, fields.get(j)));
+                  {
+                    arms: acc.arms.push({
+                      pat: PxCtor({
+                        name: written_ctor(sc.name),
+                        args: range(0, fields.len()).map(|j: Int|
+                          if held.contains(j) {
+                            PxVar({
+                              name: b"x".concat(ascii_of_int(j)),
+                              slot: Some(acc.slot + j),
+                              span: placed(acc.next + j),
+                            })
+                          } else { PxWild }),
+                      }),
+                      guard: None,
+                      body: sequence(
+                        held.map(|j: Int| let_go(var(b"x".concat(ascii_of_int(j)), acc.slot + j))),
+                      ),
+                    }),
+                    typed: held.fold(acc.typed, |m: Map<Int, Typed>, j: Int|
+                      m.insert(placed(acc.next + j).site, filed_as(fields.get(j), []))),
+                    next: acc.next + fields.len(),
+                    slot: acc.slot + fields.len(),
+                  }
+                },
+              );
+              {
+                code: at(NMatch({ scrutinee: a, arms: walked.arms })),
+                typed: walked.typed,
+                here: [],
+              }
+            },
+          }
+        },
+      },
+      _ -> { code: unit_code(), typed: Map::new(), here: [] },
+    },
+  };
+  rooted_at(module, key, [ty], unit_type(), {
+    code: Ok(body.code),
+    w: { next: 0, typed: body.typed },
+    here: body.here,
+  })
+}
+
+/// `let_go_items#List<T>` over its parameters `a`, lent, and `i`: each item of `a` from place `i`
+/// on let go, by `T`'s own release.
+pub fn let_go_items_code(module: Bytes, key: RootKey, ty: Type) -> WrittenRoot / {abort.raise} = {
+  let item = match ty {
+    TyCon(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type() },
+    _ -> unknown_type(),
+  };
+  let a = slot_code(b"a", 0);
+  let i = slot_code(b"i", 1);
+  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))]);
+  let got = call_at(writing(), b"List::at", [a, i], [plain(item)]);
+  let binder = filing(got.w, filed_as(plain(item), []));
+  let released = bare(
+    NApp({ func: bare(NVar({ name: b"?let_go", slot: None })), args: [slot_code(b"x", 2)] }),
+  );
+  rooted_at(module, key, [ty, int_type()], unit_type(), {
+    code: Ok(some_or(got.code, b"x", 2, binder.span, sequence([released, next]), unit_code())),
+    w: binder.w,
+    here: [],
+  })
 }
 
 // --- Crossings --------------------------------------------------------------------------------

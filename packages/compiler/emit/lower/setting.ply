@@ -22,16 +22,16 @@ import compiler.expand.rewrite (program_wide)
 import compiler.check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
 import compiler.check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite,
                                      WitnessOp, WitnessRef, RowSite, Builtin, builtins, EffectInfo,
-                                     OpInfo)
+                                     OpInfo, binder_key, ReleaseSite)
 import compiler.check.infer.definitions (Extern, MachineCall, machine_calls, parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.seam (WalkedFacts, walked_facts_bin, ctors_read)
 import compiler.front.rows (Rows, KnownDefRow, CtorRow, EffectRow, OpRow)
 import compiler.front.published (facts_read, rows_of, walked_facts)
-import compiler.emit.code (Code, lower_fn)
+import compiler.emit.code (Code, lower_fn, Releasing)
 import compiler.emit.reps (Def, Imported, Ctors, SumCtor, Ty, TyOpen, TyBytes, EffectName, OpMode,
                            EmitParam, ctors_of, ctor_sums, sig_of, def_entry, param_kinds,
-                           param_types, typed_kind, type_vars)
+                           param_types, typed_kind, type_vars, with_released)
 import compiler.emit.c (Kind, KBoxed, KInt, KBool, KFloat, KDec, bytes_join_dots)
 import compiler.emit.keys (RootKey, Named, LawBody, test_key, law_key, law_owner)
 
@@ -122,11 +122,14 @@ pub fn settings_in<b | e>(
         acc.insert(m.name, defs_in(m.name, m.module, pure, schemes)));
       let defs_of = |path: Bytes| match by_name.get(path) { Some(ds) -> ds, None -> [] };
       let read = ctors_read(a.checked);
-      let ctors = ctors_of(
-        read.rows.map(|c: CtorRow| c.name),
-        read.keyed,
-        read.numeric,
-        ctor_sums(read.rows),
+      let ctors = with_released(
+        ctors_of(
+          read.rows.map(|c: CtorRow| c.name),
+          read.keyed,
+          read.numeric,
+          ctor_sums(read.rows),
+        ),
+        read.released,
       );
       let declared = declared_schemes();
       let effects = declared_effects(a.r, checked_operations(a.checked.effects));
@@ -191,7 +194,9 @@ pub fn facts_by_item(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     into(m, x.owner, |f: RootFacts| { ..f, refs: f.refs.push(x) }));
   let tried = e.tries.fold(referenced, |m: Map<Bytes, RootFacts>, x: TrySite|
     into(m, x.owner, |f: RootFacts| { ..f, tries: f.tries.push(x) }));
-  let called = e.members.fold(tried, |m: Map<Bytes, RootFacts>, x: MemberSite|
+  let released = e.releases.fold(tried, |m: Map<Bytes, RootFacts>, x: ReleaseSite|
+    into(m, x.owner, |f: RootFacts| { ..f, releases: f.releases.push(x) }));
+  let called = e.members.fold(released, |m: Map<Bytes, RootFacts>, x: MemberSite|
     into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
   let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite|
     into(m, x.owner, |f: RootFacts| { ..f, typed: f.typed.push(x) }));
@@ -218,6 +223,14 @@ pub fn filings_of(
 pub fn labels_of(filed: Result<Filings, Bytes>) -> Map<Int, List<Bytes>> =
   match filed { Ok(f) -> f.labels, Err(_) -> Map::new() }
 
+/// Where the body of an item, of whose nodes the checker filed `filed`, lets go of the resources it
+/// owns, its parameters `params`.
+pub fn releasing_of(filed: Result<Filings, Bytes>, params: List<Param>) -> Releasing =
+  {
+    sites: match filed { Ok(f) -> f.releases, Err(_) -> [] },
+    params: params.map(|p: Param| binder_key(p.name.span)),
+  }
+
 /// Test `t` of `module` as the root a build makes of it: its run, which over cases takes a case's
 /// place and identity.
 fn test_root(module: Bytes, filed: Result<Filings, Bytes>, t: TestDef) -> Root / {abort.raise} = {
@@ -234,7 +247,14 @@ fn test_root(module: Bytes, filed: Result<Filings, Bytes>, t: TestDef) -> Root /
     params: ps,
     types: ps.map(param_type),
     answer_ty: unit_type(),
-    code: match lower_fn(names, [], labels_of(filed), test_run(t), of_binder(module)) {
+    code: match lower_fn(
+        names,
+        [],
+        labels_of(filed),
+        test_run(t),
+        of_binder(module),
+        releasing_of(filed, []),
+      ) {
       Ok(l) -> Ok(l.code),
       Err(why) -> Err(why),
     },
@@ -255,7 +275,14 @@ fn law_root_of(module: Bytes, filed: Result<Filings, Bytes>, l: LawDef) -> Root 
     answer_ty: bool_type(),
     code: match ps {
       Err(why) -> Err(why),
-      Ok(_) -> match lower_fn(names, [], labels_of(filed), l.body, of_binder(module)) {
+      Ok(_) -> match lower_fn(
+          names,
+          [],
+          labels_of(filed),
+          l.body,
+          of_binder(module),
+          releasing_of(filed, []),
+        ) {
         Ok(c) -> Ok(c.code),
         Err(why) -> Err(why),
       },
@@ -326,7 +353,14 @@ fn root_of(
     params: ps,
     types: ps.map(param_type),
     answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
-    code: match lower_fn(names, labels, labels_of(filed), def.body, of_binder(module)) {
+    code: match lower_fn(
+        names,
+        labels,
+        labels_of(filed),
+        def.body,
+        of_binder(module),
+        releasing_of(filed, def.params),
+      ) {
       Ok(l) -> Ok(l.code),
       Err(why) -> Err(why),
     },
