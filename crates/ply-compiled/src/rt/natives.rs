@@ -183,15 +183,3 @@ pub(super) unsafe extern "C" fn rt_hold_entry(ctx: *mut Ctx, _args: *const i64) 
         .note("this is Ply's fault, not the program's");
     unsafe { &mut *ctx }.fail(d)
 }
-
-/// A handler's variables read where no clause of a handler that has some runs: the lowering of
-/// `var` writes the reads inside clauses alone, so this is Ply's defect.
-#[cold]
-#[inline(never)]
-pub(super) fn no_handler_vars() -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        "a handler's variable was read where no clause of its handler runs",
-    )
-    .note("this is Ply's fault, not the program's")
-}

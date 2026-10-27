@@ -1,6 +1,6 @@
 //! A raise the runtime left pending, which a closure holding a word for `abort` raises through it as
-//! it leaves: handed over as its message to a clause's slot, and through the frame bridge's raised
-//! on as the raise it is, its diagnostic kept where nothing answers it the second time either.
+//! it leaves: handed over as its message to a clause's slot, and through the bridge's raised on as
+//! the raise it is, its diagnostic kept where nothing answers it the second time either.
 
 use crate::bare::{context_over, helper};
 use ply_compiled::c::builtin_helper_name;
@@ -79,10 +79,10 @@ fn refused(ctx: &mut Ctx) {
     unsafe { refused(ctx, 8, 5, 2, 0) };
 }
 
-/// Through the frame bridge, which no frame answers, the entry fails as the runtime left it
-/// failing: `left`'s code, message and notes, not a `panic:` made of its text.
+/// Through the bridge, which answers no raise, the entry fails as the runtime left it failing:
+/// `left`'s code, message and notes, not a `panic:` made of its text.
 fn raised_on_keeps(ctx: &mut Ctx) {
-    assert_eq!(ctx.failed, FAILED_PENDING, "no frame answers the refusal");
+    assert_eq!(ctx.failed, FAILED_PENDING, "nothing answers the refusal");
     let left = ctx
         .diagnostic
         .clone()

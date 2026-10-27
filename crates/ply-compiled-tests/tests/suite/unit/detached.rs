@@ -4,12 +4,13 @@
 
 use super::frames::{boxed, count, dup, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
+use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
 use ply_compiled::native::{Answered, I64};
-use ply_compiled::rt::{Ctx, rt_dispatch, rt_handle_install_detached};
-use std::cell::RefCell;
+use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_stop};
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// The unit's fields, by index.
@@ -33,6 +34,8 @@ thread_local! {
     /// What each continuation a clause was handed says of itself: whether its descriptor has no
     /// typed entry, and whether sharing and keeping it answer 0.
     static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
+    /// The clause's record in the running `handle`'s instance, and whether it may resume again.
+    static STOP: Cell<(*const Word, i64)> = const { Cell::new((std::ptr::null(), 0)) };
 }
 
 fn seen(n: u32) {
@@ -111,7 +114,9 @@ unsafe fn through_a_runtime_frame(ctx: *mut Ctx) -> Word {
     let (r, back) = unsafe {
         held_across(ctx, held, || {
             holding_a_box(ctx, HELD[4], || {
-                let flip = rt_dispatch(ctx, &FLIP_OP, I64(-1), I64(0), std::ptr::null());
+                let (record, again) = STOP.get();
+                let flip =
+                    rt_detached_stop(ctx, record, &FLIP_OP, I64(-1), std::ptr::null(), I64(again));
                 let flip = std::mem::transmute::<Handed, Word>(flip);
                 if (*ctx).failed != 0 {
                     0
@@ -224,15 +229,51 @@ fn unit() -> Ctx {
     context_of(&["amb", "flip"], Vec::new())
 }
 
+/// A `handle`'s instance on the heap: its head, then the clause's record, which holds its closure,
+/// the instance, its place and no `String` descriptor.
+const RECORD: usize = 4;
+const INSTANCE: Word = (HEADER + 8 * (INSTANCE_HEAD + RECORD)) as Word;
+
+unsafe extern "C" fn instance_released(ctx: *mut Ctx, h: Handed) -> Word {
+    let w = unsafe { std::mem::transmute::<Handed, Word>(h) };
+    unsafe {
+        let clause = *(w as *const Word).byte_add(HEADER).add(INSTANCE_HEAD);
+        Block::of(clause).let_go_function(ctx);
+        helper::<Free>("rt_free")(ctx, w, INSTANCE);
+    }
+    0
+}
+
+static INSTANCE_DESC: PlyFnDesc = PlyFnDesc {
+    release: instance_released,
+    ..desc(body)
+};
+
+/// The counted block of an instance of a `handle` whose one clause is `clause`, as emitted code
+/// lays one out, and the clause's record in it.
+fn instance(ctx: *mut Ctx, clause: Word) -> (Word, *const Word) {
+    let w = unsafe { helper::<Alloc>("rt_alloc_bytes")(ctx, INSTANCE) };
+    let head = unsafe { (w as *mut Word).byte_add(HEADER) };
+    let record = unsafe { head.add(INSTANCE_HEAD) };
+    let mut words = [0; INSTANCE_HEAD + RECORD];
+    words[0] = (&raw const INSTANCE_DESC) as Word;
+    words[1] = RECORD as Word;
+    words[INSTANCE_DETACHED] = -1;
+    words[INSTANCE_VARS] = RECORD as Word;
+    words[INSTANCE_HEAD..].copy_from_slice(&[clause, record as Word, 0, 0]);
+    unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), head, words.len()) };
+    (w, record)
+}
+
 /// `handle { body() } with { amb.flip() resume k -> <clause> }`, the clause resuming as `resumes`
 /// says.
 unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc, resumes: i64) -> Word {
     let body = closure(ctx, &BODY);
-    let clause = closure(ctx, clause);
-    let row: [Word; 6] = [AMB, -1, FLIP, clause, resumes, 0];
-    let answer = unsafe {
-        rt_handle_install_detached(ctx, row.as_ptr(), I64(1), Handed::of(0), Block::of(body))
-    };
+    let (instance, record) = instance(ctx, closure(ctx, clause));
+    STOP.set((record, i64::from(resumes == AGAIN)));
+    let answer =
+        unsafe { rt_detached_open(ctx, Block::of(body), Block::of(0), Block::of(instance)) };
+    unsafe { Block::of(instance).let_go_function(ctx) };
     unsafe { std::mem::transmute::<Handed, Word>(answer) }
 }
 

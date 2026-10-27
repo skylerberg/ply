@@ -1,6 +1,6 @@
 //! What the runtime does with values emitted code hands it beside their types: a perform's
-//! arguments, a raise's payload, a handler's variables and a bracket's closures, each counted,
-//! crossed and let go through the descriptors emitted code lays out. The blocks here are laid out
+//! arguments, a raise's payload, a label and a bracket's closures, each counted, crossed and let go
+//! through the descriptors emitted code lays out. The blocks here are laid out
 //! as emitted code lays one: a count at offset 0, freed by size.
 
 use crate::bare::{context, context_of, helper};
@@ -12,13 +12,13 @@ fn naming(fields: &[&str]) -> Ctx {
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
-use ply_compiled::rt::{Ctx, FAILED_PENDING, FAILED_UNWIND};
+use ply_compiled::native::I64;
+use ply_compiled::rt::{Ctx, FAILED_TARGET, HOSTED};
 use ply_core::{EffectAtom, Mode, Plain, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
-type Dispatch = unsafe extern "C" fn(*mut Ctx, *const PlyOp, Word, Word, *const Word) -> Word;
 
 /// A value of `m.Box`: a block of one word, the number it holds.
 const BOX: Word = HEADER as Word + 8;
@@ -108,8 +108,12 @@ fn op(params: &'static Params) -> PlyOp {
     }
 }
 
-fn dispatch(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
-    unsafe { helper::<Dispatch>("rt_dispatch")(ctx, op, -1, mode, args.as_ptr()) }
+/// A perform through the object a root is handed for an effect the Rust binding serves, as emitted
+/// code performs through it where nothing between answers.
+fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
+    let entry = HOSTED.slot.entry;
+    let answer = unsafe { entry(ctx, 0, op, I64(mode), I64(-1), args.as_ptr().cast()) };
+    unsafe { std::mem::transmute::<Handed, Word>(answer) }
 }
 
 #[test]
@@ -117,7 +121,7 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
     let mut ctx = naming(&["m", "boom"]);
     ctx.begin(1_000);
     let payload = boxed(&mut ctx, 42);
-    dispatch(&mut ctx, &op(&BOXES), 2, &[payload]);
+    performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     let d = ctx.take_failure().expect("the raise failed the entry");
     assert!(
         d.message.contains("`m.boom` was raised with"),
@@ -136,7 +140,7 @@ fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation
     let mut ctx = naming(&["m", "boom", "other"]);
     ctx.begin(1_000);
     let payload = boxed(&mut ctx, 42);
-    dispatch(&mut ctx, &op(&BOXES), 2, &[payload]);
+    performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     assert_ne!(ctx.failed, 0, "the raise left the entry failed");
     let at = helper::<PendingAt>("rt_pending_raised_at");
     // A clause of another operation does not take it.
@@ -157,7 +161,7 @@ fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
     let mut ctx = naming(&["abort", "raise"]);
     ctx.begin(1_000);
     let message: &str = "it broke";
-    dispatch(&mut ctx, &op(&TEXTS), 0, &[&raw const message as Word]);
+    performed(&mut ctx, &op(&TEXTS), 0, &[&raw const message as Word]);
     let d = ctx.take_failure().expect("the panic failed the entry");
     assert_eq!(d.message, "panic: it broke");
     ctx.end();
@@ -170,7 +174,7 @@ fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go
     let mut ctx = naming(&["m", "ask"]);
     ctx.begin(1_000);
     let arg = boxed(&mut ctx, 7);
-    dispatch(&mut ctx, &op(&BOXES), 0, &[arg]);
+    performed(&mut ctx, &op(&BOXES), 0, &[arg]);
     let d = ctx.take_failure().expect("nothing handles `m.ask`");
     assert!(d.message.contains("m.ask"), "{}", d.message);
     assert_eq!(ctx.heap.live(), 0, "the argument was not let go");
@@ -183,28 +187,6 @@ fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go
             "ask"
         )]
     );
-    ctx.end();
-}
-
-/// A handler's variable emitted code gave a type is let go through it when its `handle` lands.
-#[test]
-fn a_handlers_typed_variable_is_let_go_through_its_type_when_its_handle_ends() {
-    let mut ctx = context();
-    ctx.begin(1_000);
-    let install: unsafe extern "C" fn(*mut Ctx, *const Word, Word, Word) -> Word =
-        helper("rt_handle_install");
-    let typed: unsafe extern "C" fn(*mut Ctx, Word, Word, *const PlyType) =
-        helper(&builtin_helper_name("?handler_typed"));
-    let land: unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word = helper("rt_handle_land");
-    let v = boxed(&mut ctx, 3);
-    unsafe {
-        let depth = install(&mut ctx, std::ptr::null(), 0, 0);
-        typed(&mut ctx, 0, v, &BOX_T);
-        assert_eq!(ctx.heap.live(), 1);
-        assert_eq!(land(&mut ctx, depth, 9), 9);
-    }
-    assert_eq!(ctx.failed, 0);
-    assert_eq!(ctx.heap.live(), 0, "the variable was not let go");
     ctx.end();
 }
 
@@ -252,7 +234,7 @@ unsafe extern "C" fn body(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
     let n = unsafe { *(held as *const Word).byte_add(HEADER) };
     unsafe { box_dec(ctx, held) };
     if n == 6 {
-        unsafe { (*ctx).failed = FAILED_UNWIND };
+        unsafe { (*ctx).failed = FAILED_TARGET };
         return 0;
     }
     7
@@ -307,7 +289,7 @@ fn a_bracket_cleans_up_after_a_body_that_unwinds() {
     ctx.begin(1_000);
     CLEANED.with(|c| c.set(0));
     let answer = bracket(&mut ctx, &ACQUIRE_SIX);
-    assert_eq!((answer, ctx.failed), (0, FAILED_UNWIND));
+    assert_eq!((answer, ctx.failed), (0, FAILED_TARGET));
     assert_eq!(CLEANED.with(Cell::get), 6);
     assert_eq!(ctx.heap.live(), 0);
     ctx.failed = 0;
@@ -316,11 +298,10 @@ fn a_bracket_cleans_up_after_a_body_that_unwinds() {
 
 thread_local! {
     static LIFTED: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
-    static HEARD: Cell<Word> = const { Cell::new(0) };
 }
 
 /// A `String` as emitted code lays one, which here is a box standing for the text, the text kept
-/// aside: what the runtime lifts a label or a message it makes through.
+/// aside: what the runtime lifts a label through.
 unsafe extern "C" fn string_lift(ctx: *mut Ctx) -> Word {
     let text: unsafe extern "C" fn(*mut Ctx) -> Word = helper(&builtin_helper_name("?in_str"));
     let taken: unsafe extern "C" fn(*mut Ctx, *mut u8, Word) =
@@ -342,121 +323,20 @@ static STRING_T: PlyType = PlyType {
     lift: string_lift,
 };
 
-/// A clause that hears one word, lets it go as a `String`, and answers 9.
-unsafe extern "C" fn hears_a_string(ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
-    let w = unsafe { *args };
-    HEARD.with(|h| h.set(w));
-    unsafe { box_dec(ctx, w) };
-    9
-}
+type LabelString = unsafe extern "C" fn(*mut Ctx, Word, *const PlyType) -> Word;
 
-static HEARS: PlyFnDesc = desc(hears_a_string);
-
-type Install = unsafe extern "C" fn(*mut Ctx, *const Word, Word, Word) -> Word;
-type Land = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
-
-/// A clause written `[*t]` of a `handle` emitted code wrote reads its label as emitted code lays a
-/// `String`, lifted through the type its site handed, never as a string the runtime made.
+/// A clause written `[*t]` reads its label as emitted code lays a `String`, lifted through the type
+/// its site handed, never as a string the runtime made.
 #[test]
-fn an_emitted_clause_reads_its_label_lifted_through_the_string_type_its_site_handed() {
+fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
     let mut ctx = naming(&["m", "ask", "*", "files"]);
     ctx.begin(1_000);
     LIFTED.with(|l| l.borrow_mut().clear());
-    let c: *mut Ctx = &mut ctx;
-    let clause = [
-        0,
-        2,
-        1,
-        closure(&mut ctx, &HEARS),
-        0,
-        &raw const STRING_T as Word,
-    ];
-    let ask = PlyOp {
-        effect: 0,
-        op: 1,
-        answer: &raw const TEXT_T,
-        own: 0,
-        params_len: 0,
-        params: std::ptr::null(),
-        vars_len: 0,
-        vars: std::ptr::null(),
-    };
-    unsafe {
-        let depth = helper::<Install>("rt_handle_install")(c, clause.as_ptr(), 1, 0);
-        let answer = helper::<Dispatch>("rt_dispatch")(c, &ask, 3, 0, std::ptr::null());
-        assert_eq!(answer, 9, "the clause's answer is the perform's");
-        assert_eq!(helper::<Land>("rt_handle_land")(c, depth, answer), 9);
-    }
+    let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
     super::crossing::unfailed(&mut ctx);
     assert_eq!(LIFTED.with(|l| l.borrow().clone()), "files");
-    assert_eq!(ctx.heap.live(), 0, "the label or the clause was not let go");
-    ctx.end();
-}
-
-/// A message the runtime raises itself reaches an `abort.raise` clause emitted code installed as
-/// emitted code lays a `String`, and the landing of its `handle` calls the clause through its
-/// descriptor with it.
-#[test]
-fn a_raise_the_runtime_makes_reaches_an_emitted_clause_lifted_and_the_landing_calls_it() {
-    let mut ctx = crate::bare::context_over(&["abort", "raise"], Vec::new(), &["panic"]);
-    ctx.begin(1_000);
-    LIFTED.with(|l| l.borrow_mut().clear());
-    HEARD.with(|h| h.set(0));
-    let c: *mut Ctx = &mut ctx;
-    let clause = [
-        0,
-        -1,
-        1,
-        closure(&mut ctx, &HEARS),
-        3,
-        &raw const STRING_T as Word,
-    ];
-    let native = |name: &str| -> unsafe extern "C" fn(*mut Ctx, Word, Word) {
-        helper(&builtin_helper_name(name))
-    };
-    unsafe {
-        let depth = helper::<Install>("rt_handle_install")(c, clause.as_ptr(), 1, 0);
-        let open: unsafe extern "C" fn(*mut Ctx, Word) =
-            helper(&builtin_helper_name("?lower_open"));
-        open(c, 0);
-        native("?out_count")(c, ply_core::codec::tag::LIST as Word, 1);
-        native("?out_str")(c, b"no such file".as_ptr() as Word, 12);
-        helper::<unsafe extern "C" fn(*mut Ctx, Word)>("rt_builtin_encoded")(c, 0);
-        // Left pending for the code between the builtin and the frame, which may hold a `handle`
-        // answering it through its objects; the frame's landing takes what none of it took.
-        assert_eq!(ctx.failed, FAILED_PENDING, "the builtin raised");
-        assert_eq!(helper::<Land>("rt_handle_land")(c, depth, 0), 9);
-    }
-    super::crossing::unfailed(&mut ctx);
-    let said = LIFTED.with(|l| l.borrow().clone());
-    assert!(said.contains("no such file"), "{said}");
-    assert_ne!(HEARD.with(Cell::get), 0, "the clause was not called");
-    assert_eq!(
-        ctx.heap.live(),
-        0,
-        "the message or the clause was not let go"
-    );
-    ctx.end();
-}
-
-/// A `return` clause emitted code made is called through its descriptor as its `handle` lands, and
-/// let go after.
-#[test]
-fn the_return_clause_of_an_emitted_handle_is_called_through_its_descriptor_as_it_lands() {
-    unsafe extern "C" fn one_more(_ctx: *mut Ctx, _f: Word, args: *const Word) -> Word {
-        unsafe { *args + 1 }
-    }
-    static ONE_MORE: PlyFnDesc = desc(one_more);
-    let mut ctx = context();
-    ctx.begin(1_000);
-    let c: *mut Ctx = &mut ctx;
-    let ret = closure(&mut ctx, &ONE_MORE);
-    unsafe {
-        let depth = helper::<Install>("rt_handle_install")(c, std::ptr::null(), 0, ret);
-        assert_eq!(helper::<Land>("rt_handle_land")(c, depth, 41), 42);
-    }
-    super::crossing::unfailed(&mut ctx);
-    assert_eq!(ctx.heap.live(), 0, "the `return` clause was not let go");
+    unsafe { box_dec(&mut ctx, label) };
+    assert_eq!(ctx.heap.live(), 0, "the label was not let go");
     ctx.end();
 }
 

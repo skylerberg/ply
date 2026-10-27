@@ -133,8 +133,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
 #[repr(C)]
 pub(crate) struct Unwinding {
     ending: i64,
-    unwind: Option<(usize, usize, Word)>,
-    raise: Option<usize>,
     target: Word,
     pending: Option<usize>,
     entered: Option<crate::tasks::Bracketed>,
@@ -150,31 +148,17 @@ impl Unwinding {
     /// the run's, which releases nothing.
     fn set_aside(c: &mut Ctx) -> Option<Unwinding> {
         let ending = c.failed;
-        let releasing = [
-            0,
-            FAILED_UNWIND,
-            FAILED_CANCELLED,
-            FAILED_ABORT,
-            FAILED_TARGET,
-            FAILED_PENDING,
-        ];
-        if !releasing.contains(&ending) {
+        if ![0, FAILED_CANCELLED, FAILED_TARGET, FAILED_PENDING].contains(&ending) {
             return None;
         }
-        let unwind = c.unwind.take();
-        let raising = c.aborting.take();
-        // Kept in the order `taken_up` takes them back in reverse.
         let pending = c.pending.take().map(|raise| {
             let failure = c.diagnostic.take();
             c.keep(Kept::Pending(raise, failure))
         });
-        let raise = raising.map(|a| c.keep(Kept::Raising(a)));
         c.failed = 0;
         let entered = crate::tasks::shielded(c, crate::tasks::Shield::Release);
         Some(Unwinding {
             ending,
-            unwind,
-            raise,
             target: c.target,
             pending,
             entered,
@@ -184,19 +168,12 @@ impl Unwinding {
     /// What [`Unwinding::set_aside`] set aside going on again once the release ran: false where the
     /// release failed or was cancelled, whose failure replaces it.
     fn taken_up(self, c: &mut Ctx) -> bool {
-        let raising = self.raise.map(|here| match c.kept_back(here) {
-            Kept::Raising(a) => a,
-            _ => unreachable!("a release keeps the raise it runs during"),
-        });
         let pending = self.pending.map(|here| match c.kept_back(here) {
             Kept::Pending(raise, failure) => (raise, failure),
             _ => unreachable!("a release keeps the pending raise it runs during"),
         });
         let cancelled = crate::tasks::unshielded(c, self.entered);
         if c.failed != 0 || cancelled {
-            if let Some(raise) = raising {
-                raise.into_failure();
-            }
             if let Some((raise, _)) = pending {
                 raise.release();
             }
@@ -208,8 +185,6 @@ impl Unwinding {
             return false;
         }
         c.failed = self.ending;
-        c.unwind = self.unwind;
-        c.aborting = raising;
         c.target = self.target;
         if let Some((raise, diagnostic)) = pending {
             c.pending = Some(raise);
@@ -248,12 +223,8 @@ pub unsafe extern "C" fn rt_unwind_resume(ctx: *mut Ctx, held: Word) {
 
 /// [`cancel_here`] where what a clause unwinds with is emitted code's, which is abandoned uncounted.
 fn cancel_carried(c: &mut Ctx) {
-    if ![FAILED_UNWIND, FAILED_ABORT, FAILED_TARGET, FAILED_PENDING].contains(&c.failed) {
+    if ![FAILED_TARGET, FAILED_PENDING].contains(&c.failed) {
         return;
-    }
-    c.unwind = None;
-    if let Some(raise) = c.aborting.take() {
-        raise.into_failure();
     }
     if let Some(raise) = c.pending.take() {
         raise.release();

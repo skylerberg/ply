@@ -12,7 +12,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_UNWIND, lent};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, lent};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{
@@ -452,7 +452,7 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
 /// How an entry that failed ended.
 fn failure(ctx: &mut Ctx) -> Ended {
     let failed = ctx.take_failure().unwrap_or_else(|| match ctx.failed {
-        FAILED_UNWIND => Diagnostic::error(
+        FAILED_TARGET => Diagnostic::error(
             codes::RUNTIME_ERROR,
             "a `handle` clause unwound past the compiled fragment's entry",
         ),

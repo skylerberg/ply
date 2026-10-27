@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Out, Raises, Signature};
+use crate::native::{Addr, F64, I64, Native, Raises, Signature};
 use crate::rt::Ctx;
 
 /// What a released `ply`'s units open with, as it reads this runtime's description; this `ply`'s
@@ -265,9 +265,6 @@ machine! {
     "?lift_open" => rt_lift_open(Addr, I64);
     "?lift_close" => rt_lift_close();
     "?taken" => rt_taken(Addr, I64);
-    "?handler_typed" => rt_handler_typed(I64, Handed, *const PlyType);
-    "?handler_get" => rt_handler_get(I64) -> Handed;
-    "?handler_put" => rt_handler_put(I64, Handed);
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
@@ -305,8 +302,8 @@ macro_rules! taken {
 
 macro_rules! helpers {
     ($($f:ident($($p:ident $(: $t:ty)?),*) $(-> $r:ty)?;)*) => {
-        /// The helpers that are no builtin's: what the emitted C does to values, frames and
-        /// handlers. Each is written as its function's type, which that function must have.
+        /// The helpers that are no builtin's: what the emitted C does to values and handlers. Each
+        /// is written as its function's type, which that function must have.
         fn own() -> Vec<Helper> {
             vec![$({
                 let f: unsafe extern "C" fn(*mut Ctx $(, taken!($p $(: $t)?))*) $(-> $r)? =
@@ -334,9 +331,6 @@ helpers! {
     rt_not_that_width(which, value);
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
-
-    rt_handle_land(depth, value) -> Word;
-
     rt_tick();
     rt_stack_more() -> Word;
     rt_inc_shared(w);
@@ -350,14 +344,6 @@ helpers! {
     rt_released_twice(o: Block);
     rt_release_later(w: Handed, root: DropRoot);
     rt_release_drain();
-    rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
-    rt_dispatch_at(
-        handler: I64,
-        op: *const PlyOp,
-        resource: I64,
-        mode: I64,
-        args: *const Handed
-    ) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
     rt_scheduler_entered() -> Word;
     rt_scheduler_left(was);
@@ -375,16 +361,6 @@ helpers! {
         again: I64
     ) -> Handed;
     rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
-    rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
-    rt_handle_install_at(clauses: *const Word, n: I64, ret: Handed, cell: Out) -> I64;
-    rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
-    rt_handle_forwarded(
-        clauses: *const Word,
-        n: I64,
-        ret: Handed,
-        body: Block,
-        forwards: Block
-    ) -> Handed;
     rt_with_cleanup(
         acquire: Block,
         body: Block,
@@ -396,7 +372,6 @@ helpers! {
     rt_unwind_resume(held);
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_builtin_encoded(index: I64);
-    rt_region(body: Block, answer: *const PlyType) -> Handed;
     rt_branches(slots: *const Handed, n: I64);
     rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;

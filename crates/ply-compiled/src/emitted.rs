@@ -215,7 +215,7 @@ pub struct PlyKept {
 unsafe impl Sync for PlyKept {}
 
 /// `op#effect.op@T1..Tk`: an operation at its perform's type arguments, static data emitted code
-/// lays out and hands [`crate::rt::rt_dispatch`], through whose types the runtime crosses what the
+/// lays out and hands an operation's entry, through whose types the runtime crosses what the
 /// perform passes and is answered.
 #[repr(C)]
 pub struct PlyOp {
