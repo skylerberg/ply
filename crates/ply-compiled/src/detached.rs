@@ -7,8 +7,8 @@ use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
 use crate::frames::{self, PlyFrame, Snapshot};
 use crate::heap::{HEADER, Word};
 use crate::rt::{
-    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, StackCopy, call_clause, call_fun,
-    drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
+    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, Kept, StackCopy, call_clause,
+    call_fun, drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::{Diagnostic, Symbol, codes};
@@ -40,8 +40,6 @@ pub struct Detached {
     /// The counted block of the `handle`'s instance where its objects enter its clauses, which hold
     /// no frame: what the body holds of it once more, and where its variables are.
     instance: Option<Word>,
-    /// How many calls of the `handle`'s clauses at the body's stops are running.
-    clauses_running: u32,
 }
 
 /// A heap instance's block as emitted code lays it out, past its header, in words: how many its
@@ -233,7 +231,6 @@ pub(crate) unsafe fn open(
         captures: Vec::new(),
         live: None,
         instance: None,
-        clauses_running: 0,
     });
     unsafe { resume(ctx, id, None, None) }
 }
@@ -288,7 +285,6 @@ pub(crate) unsafe fn open_over(
         captures: Vec::new(),
         live: None,
         instance: Some(instance),
-        clauses_running: 0,
     });
     unsafe { resume(ctx, id, None, None) }
 }
@@ -470,7 +466,7 @@ pub(crate) unsafe fn resume(
     let instance = c.detached[id].instance;
     let mut clause_vars = None;
     if let (Some(block), Some(k)) = (instance, capture) {
-        if c.detached[id].clauses_running > 0 {
+        if clause_running(c, id) {
             clause_vars = Some(vars_kept(ctx, block));
         } else {
             let at_stop = vars_held(ctx, &unsafe { &*ctx }.detached[id].captures[k].vars);
@@ -527,10 +523,10 @@ pub(crate) unsafe fn resume(
             // from what the clause holds, whatever an earlier one did to the body's.
             let frames = c.detached[id].frames;
             let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
-            c.detached[id].clauses_running += 1;
+            let here = c.keep(Kept::Clause(id));
             let r = call_clause(ctx, closure, args, held);
             let c = unsafe { &mut *ctx };
-            c.detached[id].clauses_running -= 1;
+            c.kept_back(here);
             settle(c, id);
             drain(ctx);
             r
@@ -561,14 +557,26 @@ pub(crate) unsafe fn resume(
 /// A finished body over an instance lets go of it once no clause of its `handle` runs, since a
 /// running clause reads its variables through it.
 fn settle(c: &mut Ctx, id: usize) {
+    let running = clause_running(c, id);
     let d = &mut c.detached[id];
     if d.state == State::Done
-        && d.clauses_running == 0
+        && !running
         && d.stack.is_none()
         && let Some(block) = d.instance.take()
     {
         release_fun(block);
     }
+}
+
+/// Whether a clause of body `id`'s `handle` runs on any stack. Each stack keeps what its running
+/// clauses are, so a stack a snapshot is restored onto runs again the clauses running when it was
+/// taken, and a stack let go of runs none.
+fn clause_running(c: &Ctx, id: usize) -> bool {
+    c.stacks.iter().any(|s| {
+        s.kept
+            .iter()
+            .any(|k| matches!(k, Kept::Clause(i) if *i == id))
+    })
 }
 
 fn finish(c: &mut Ctx, id: usize) {
@@ -953,8 +961,11 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
         let d = &mut c.detached[id];
         d.state = State::Done;
         d.live = None;
-        d.clauses_running = 0;
         give_back(c, id);
+        // A clause of an outer body abandoned here may still be kept as running.
+        if let Some(block) = c.detached[id].instance.take() {
+            release_fun(block);
+        }
     }
     let c = unsafe { &mut *ctx };
     c.continuations_died.clear();

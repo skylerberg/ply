@@ -362,6 +362,7 @@ helpers! {
     rt_pending_raised_at(effect: I64, op: I64) -> Handed;
     rt_label_string(resource: I64, string: *const PlyType) -> Handed;
     rt_task_abandons(op: *const PlyOp) -> Word;
+    rt_task_captures(op: *const PlyOp) -> Word;
     rt_task_raises(op: *const PlyOp, args: *const Handed) -> Word;
     rt_detached_open(body: Block, forwards: Block, instance: Block) -> Handed;
     rt_detached_stop(

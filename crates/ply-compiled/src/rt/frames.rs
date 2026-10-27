@@ -239,6 +239,9 @@ pub(crate) enum Kept {
     Pending(Unanswered, Option<Diagnostic>),
     /// The arguments a clause emitted code made is called with, which it takes as it is entered.
     Args(Vec<Word>),
+    /// A clause of the `handle` of the detached body at this index running, which reads the
+    /// variables of that body's instance.
+    Clause(usize),
 }
 
 impl Kept {
@@ -253,7 +256,7 @@ impl Kept {
                 a.into_failure();
             }
             Kept::Pending(raise, _) => raise.release(),
-            Kept::Args(_) => {}
+            Kept::Args(_) | Kept::Clause(_) => {}
         }
     }
 }
@@ -317,6 +320,7 @@ impl StackCopy {
                 Kept::Raising(a) => Kept::Raising(a.copied()),
                 Kept::Pending(raise, failure) => Kept::Pending(raise.copied(), failure.clone()),
                 Kept::Args(words) => Kept::Args(words.clone()),
+                Kept::Clause(id) => Kept::Clause(*id),
             })
             .collect();
         let held = held

@@ -543,18 +543,8 @@ unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &Ply
         }
     }
     if inherited_off_tail {
-        let d = Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!(
-                "`{effect}.{op}` was performed in a task, and its handler resumes off the tail"
-            ),
-        )
-        .primary(c.site(), "performed here")
-        .note(
-            "the clause would capture the continuation of the body the task was spawned in, which \
-             is not the task's own: handle the operation inside the task, or resume on the tail",
-        );
-        return c.fail(d);
+        let site = c.site();
+        return c.fail(err_task_captures(&effect, &op, site));
     }
     let Some((stack, depth, closure, resumes, label, inherited)) = found else {
         if target.is_some() {
@@ -630,6 +620,16 @@ pub unsafe extern "C" fn rt_task_abandons(ctx: *mut Ctx, op: *const PlyOp) -> Wo
     c.fail(err_task_abandoned(&effect, &name, site))
 }
 
+/// Refuses a clause resuming off its tail that would stop a detached body another task began, the
+/// operation `op` describes performed in a task: what it would capture is the spawner's
+/// continuation, not the task's. 0 with the context failed.
+pub unsafe extern "C" fn rt_task_captures(ctx: *mut Ctx, op: *const PlyOp) -> Word {
+    let c = unsafe { &mut *ctx };
+    let (effect, name) = named_op(c, unsafe { &*op });
+    let site = c.site();
+    c.fail(err_task_captures(&effect, &name, site))
+}
+
 /// Leaves unanswered a raise, the operation `op` describes with the `args` it takes, that a task
 /// made and a clause of an instance another task opened would answer: no clause for a raise
 /// answers a task from around its spawn, so the raise leaves the task, and its region raises it
@@ -659,6 +659,22 @@ fn err_task_abandoned(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
     .note(
         "the clause would abandon the body the task was spawned in, which is not the task's own: \
          handle the operation inside the task, or resume on every path",
+    )
+}
+
+/// A task's perform answered by a clause, of a `handle` around its spawn, that resumes off its tail:
+/// what it would capture is the continuation of the spawner's body, not the task's.
+#[cold]
+#[inline(never)]
+fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{effect}.{op}` was performed in a task, and its handler resumes off the tail"),
+    )
+    .primary(site, "performed here")
+    .note(
+        "the clause would capture the continuation of the body the task was spawned in, which is \
+         not the task's own: handle the operation inside the task, or resume on the tail",
     )
 }
 

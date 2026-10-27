@@ -18,6 +18,7 @@ import compiler.syntax.exprs (Param, freed_by, case_at, case_identity, scheduler
 import compiler.check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, lookup,
                                       ValueSpace, qualify)
 import compiler.check.resolve.scopes (of_module, of_binder)
+import compiler.expand.rewrite (program_wide)
 import compiler.check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
 import compiler.check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite,
                                      WitnessOp, WitnessRef, RowSite, Builtin, builtins)
@@ -127,6 +128,7 @@ pub fn settings_in<b | e>(
         ctor_sums(read.rows),
       );
       let declared = declared_schemes();
+      let effects = declared_effects(a.r, expanded);
       let machine = machine_calls(parsed_natives(expanded));
       let owned = facts_by_item(facts);
       Ok(
@@ -152,7 +154,7 @@ pub fn settings_in<b | e>(
               builtins: [],
               declared: declared,
               machine: machine,
-              effects: effects_in(a.r, i, expanded),
+              effects: effects_in(a.r, i, effects),
               release: false,
             },
             m.module.items.fold([], |acc: List<ItemRoot>, item: Item| {
@@ -533,13 +535,31 @@ pub fn params_carried(
       lambda: None,
     })
 
-/// The effects module `i` names, bare or through a module's binder, each with its operations.
-pub fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<EffectName> =
-  match resolved.scopes.at(i) {
+/// Every effect the program declares, written as a clause the lowering writes names it, by its
+/// program-wide name, with the operations its declaration writes.
+pub fn declared_effects(resolved: Resolved, mods: List<ParsedModule>) -> List<EffectName> =
+  range(0, resolved.declared.len()).fold([], |acc: List<EffectName>, j: Int|
+    match resolved.declared.at(j) {
+      None -> acc,
+      Some(theirs) ->
+        theirs.effects.fold(acc, |a: List<EffectName>, b: Binding|
+          a.push({
+            written: program_wide(b.qualified),
+            global: b.qualified,
+            ops: ops_of(mods, j, b.name),
+          })),
+    })
+
+/// The effects module `i` names, bare or through a module's binder, then every one of `declared`,
+/// the program's: each with the operations of the effect its program-wide name names.
+pub fn effects_in(resolved: Resolved, i: Int, declared: List<EffectName>) -> List<EffectName> = {
+  let ops = |global: Bytes|
+    match declared.find(|e: EffectName| e.global == global) { Some(e) -> e.ops, None -> [] };
+  let named = match resolved.scopes.at(i) {
     None -> [],
     Some(scope) -> {
       let bare = scope.bound.effects.map(|b: Binding|
-        { written: b.name, global: b.qualified, ops: ops_of(mods, b.owner, b.name) });
+        { written: b.name, global: b.qualified, ops: ops(b.qualified) });
       scope.modules.fold(bare, |acc: List<EffectName>, mb: ModuleBinding|
         match resolved.declared.at(mb.target) {
           None -> acc,
@@ -548,11 +568,13 @@ pub fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<
               a.push({
                 written: Bytes::concat_all([mb.binder, b"::", b.name]),
                 global: b.qualified,
-                ops: ops_of(mods, mb.target, b.name),
+                ops: ops(b.qualified),
               })),
         })
     },
-  }
+  };
+  named.concat(declared)
+}
 
 fn ops_of(mods: List<ParsedModule>, owner: Int, name: Bytes) -> List<OpMode> =
   match mods.at(owner) {
