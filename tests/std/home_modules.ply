@@ -1,29 +1,31 @@
-//! The modules the compiler holds beneath the home modules of the language's types, which see only
-//! what they import, are the prelude and what the home modules import.
+//! The modules the compiler holds beneath the home modules of the language's types and beneath the
+//! scheduler, which read neither with no import, are what those import; and no module of the
+//! library sees itself through what it imports and what it reads with no import.
 
 import compiler.syntax.exprs
 import compiler.syntax.items
 import compiler.syntax.items (ImportDecl)
+import compiler.syntax.parsing
 import compiler.syntax.parsing (Ident)
 import std.list
 
 type File = { name: String, bytes: Bytes }
 
-/// The modules `module` imports, hidden ones among them, as its shipped source parses.
+/// The modules a source imports, hidden ones among them, as it parses.
+fn imported(bytes: Bytes) -> List<Bytes> / {abort.raise} =
+  items::parse(bytes).node.imports.map(|d: ImportDecl|
+    Bytes::join(d.path.map(|part: Ident| part.name), b"."))
+
+/// The modules `module` imports, as its shipped source parses.
 fn imports_of(files: List<File>, module: Bytes) -> List<Bytes> / {abort.raise} = {
   let path = String::of_bytes(module.slice(4, module.len())).replace(".", "/") ++ ".ply";
-  match files.filter(|f: File| f.name == path) {
-    [f, ..] ->
-      items::parse(f.bytes).node.imports.map(|d: ImportDecl|
-        Bytes::join(d.path.map(|part: Ident| part.name), b".")),
-    [] -> [],
-  }
+  match files.filter(|f: File| f.name == path) { [f, ..] -> imported(f.bytes), [] -> [] }
 }
 
-test "the modules beneath the home modules are the prelude, the home modules and all they import" {
-  let files: List<File> = embed_dir("../../packages/std");
+/// The modules of the library `from` reaches through what each imports, `from` among them.
+fn reached_from(files: List<File>, from: List<Bytes>) -> List<Bytes> / {abort.raise} = {
   let reached = range(0, files.len()).fold(
-    { seen: Map::new(), next: exprs::home_modules().push(b"std.prelude") },
+    { seen: Map::new(), next: from },
     |acc: { seen: Map<Bytes, Bool>, next: List<Bytes> }, _round: Int| {
       let fresh = acc.next.filter(|m: Bytes| !acc.seen.contains(m));
       {
@@ -33,5 +35,46 @@ test "the modules beneath the home modules are the prelude, the home modules and
       }
     },
   );
-  assert_eq(reached.seen.keys(), exprs::beneath_homes().sort())
+  reached.seen.keys()
+}
+
+test "the modules beneath the home modules are the prelude, the home modules and all they import" {
+  let files: List<File> = embed_dir("../../packages/std");
+  assert_eq(
+    reached_from(files, exprs::home_modules().push(b"std.prelude")),
+    exprs::beneath_homes().sort(),
+  )
+}
+
+test "the modules beneath the scheduler are the scheduler and all it imports" {
+  let files: List<File> = embed_dir("../../packages/std");
+  assert_eq(reached_from(files, [exprs::scheduler_module()]), exprs::beneath_scheduler().sort())
+}
+
+type Module = { name: Bytes, bytes: Bytes }
+
+test "no module of the library, the scheduler and its trail among them, sees itself" {
+  let files: List<File> = embed_dir("../../packages/std");
+  let modules = files.filter(|f: File| f.name.ends_with(".ply")).map(|f: File| {
+    let dotted = Bytes::of_string("std." ++ f.name.replace("/", "."));
+    { name: dotted.slice(0, dotted.len() - 4), bytes: f.bytes }
+  });
+  let texts = modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: Module|
+    acc.insert(m.name, m.bytes));
+  let declared = items::homes_declaring(|h: Bytes| texts.get(h));
+  let sight = modules.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: Module|
+    acc.insert(
+      m.name,
+      imported(m.bytes).concat(
+        items::read_without_import(m.name, parsing::start(m.bytes).input, || declared),
+      ).filter(|d: Bytes| d != m.name && texts.contains(d)),
+    ));
+  // Peeled of every module whose sight is peeled, what is left sees itself or one that does.
+  let left = iterate(sight.keys(), modules.len() + 2, |names: List<Bytes>| {
+    let here = names.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+    let next = names.filter(|n: Bytes|
+      (match sight.get(n) { Some(ds) -> ds, None -> [] }).any(|d: Bytes| here.contains(d)));
+    if next.len() == names.len() { Stop(next) } else { Continue(next) }
+  });
+  assert_eq(left, [])
 }

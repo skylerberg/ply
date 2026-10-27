@@ -33,7 +33,8 @@ import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, bl
                               no_expr, fn_param, param, declared_param, dump_expr, dump_param,
                               shown_binder, cases_binder, set_binder, hidden_binder, free_names,
                               free_binder, case_at, case_identity, case_body, listing, home_modules,
-                              sees_homes, prelude_module, scheduler_module)
+                              sees_homes, prelude_module, scheduler_module, beneath_scheduler,
+                              task_operations)
 import compiler.syntax.patterns (LStr)
 import std.prelude_source
 
@@ -2559,23 +2560,27 @@ pub fn read_without_import<| e>(
     )
   }
 
-/// The scheduler, where the module `name`, lexed as `input`, is another and writes `simulate { .. }`
-/// or `task.op(..)`: a region and a crossing call the scheduler, and an entry that performs `task`
-/// runs under its region. A name after `.` or `::` is another's.
-pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> = {
-  let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
-  let calls = range(0, input.token_count).any(|i: Int|
-    match kind(i) {
-      Identifier(n) -> if n == b"simulate" { kind(i + 1) == token_lbrace() } else {
-        n == b"task" && kind(i + 1) == token_dot() && kind(i + 3) == token_lparen()
-          && kind(i - 1) != token_dot()
-          && kind(i - 1) != token_coloncolon()
-          && (match kind(i + 2) { Identifier(_) -> true, _ -> false })
-      },
-      _ -> false,
-    });
-  if calls && name != scheduler_module() { [scheduler_module()] } else { [] }
-}
+/// The scheduler, where the module `name`, lexed as `input`, lies outside [`beneath_scheduler`] and
+/// writes `simulate { .. }` or performs `task`: names `task.write` or one of [`task_operations`],
+/// as a row's atom or as a perform. A region and a crossing call the scheduler, and an entry that
+/// performs `task` runs under its region. A name after `.` or `::` is another's.
+pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> =
+  if beneath_scheduler().contains(name) { [] } else {
+    let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+    let performs = range(0, input.token_count).any(|i: Int|
+      match kind(i) {
+        Identifier(n) -> if n == b"simulate" { kind(i + 1) == token_lbrace() } else {
+          n == b"task" && kind(i + 1) == token_dot() && kind(i - 1) != token_dot()
+            && kind(i - 1) != token_coloncolon()
+            && (match kind(i + 2) {
+              Identifier(op) -> op == b"write" || task_operations().contains(op),
+              _ -> false,
+            })
+        },
+        _ -> false,
+      });
+    if performs { [scheduler_module()] } else { [] }
+  }
 
 /// Each home of `declared` that declares one of the names `called`.
 pub fn homes_for(called: Map<Bytes, Bool>, declared: List<HomeNames>) -> List<Bytes> =
@@ -4230,16 +4235,23 @@ test "a module reads the home modules that declare a name it calls, unless it is
   assert_eq(homes(b"app", b"fn f(xs: List<Int>) -> Int = xs.len()\n"), [])
 }
 
-test "a module reads the scheduler where it writes `simulate` or a `task` operation that crosses" {
+test "a module reads the scheduler where it writes `simulate` or performs `task`, unless the scheduler imports it" {
   let read = |name: Bytes, src: Bytes| read_without_import(name, start(src).input, || []);
   let region = b"fn f() -> Int / {sim.read} = simulate { 1 }\n";
   let joined = b"fn f(t: Task<Int>) -> Int / {task.join, abort.raise} = task.join(t)\n";
   assert_eq(read(b"app", region), [b"std.internal.schedule"]);
   assert_eq(read(b"app", joined), [b"std.internal.schedule"]);
+  assert_eq(read(b"app", b"fn f() -> Unit / {task.write} = task.yield()\n"), [
+    b"std.internal.schedule",
+  ]);
+  // A row alone says so: the entry runs under the run's region whatever performs `task` for it.
+  assert_eq(read(b"app", b"fn f(g: () -> Unit / {task.write}) -> Unit / {task.write} = g()\n"), [
+    b"std.internal.schedule",
+  ]);
   assert_eq(read(b"std.internal.schedule", region), []);
+  assert_eq(read(b"std.internal.trail", joined), []);
   assert_eq(read(b"std.gen", region), []);
-  // An operation that crosses nothing, a string, a comment, or a name on a value is none.
-  assert_eq(read(b"app", b"fn f() -> Unit / {task.yield} = task.yield()\n"), []);
+  // A string, a comment, or a name on a value is none.
   assert_eq(
     read(b"app", b"// simulate { task.join(t) }\nfn f() -> String = \"simulate { 1 }\"\n"),
     [],
