@@ -521,7 +521,9 @@ fn applied<v>(
     Join(t) -> joined(s, task, t, at.site, false),
     Await(t) -> joined(s, task, t, at.site, true),
     Cancel(t, shields) -> cancelled(s, task, t, shields, at.site),
-    Channel(capacity) -> {
+    Channel(capacity) -> if capacity < 0 {
+      { ..readied(s, task, Raise(no_capacity(at.site, capacity))), current: None }
+    } else {
       let id = s.next_chan;
       let made = {
         ..s,
@@ -555,7 +557,8 @@ fn applied<v>(
         broke(s, internal(s, "`random.next` reached a production region, which draws nothing")),
     },
     Below(n) -> match s.policy {
-      Seeded -> {
+      Seeded -> if n < 1 { { ..readied(s, task, Raise(no_bound(at.site, n))), current: None } }
+      else {
         let d = trail::draw_below(s.trail, n);
         answered({ ..s, trail: d.trail }, task, Number(d.value))
       },
@@ -1656,6 +1659,27 @@ fn joined_cancelled(site: Site, task: Int) -> Failure =
     ],
   }
 
+/// What a `task.channel` of a negative capacity raises in the task that asked.
+fn no_capacity(site: Site, capacity: Int) -> Failure =
+  {
+    code: "E0502",
+    message: "a channel cannot hold " ++ capacity.to_string() ++ " values",
+    labels: [primary(site, "made here")],
+    notes: ["a capacity is how many sent values may wait for a receiver; `0` is a rendezvous"],
+  }
+
+/// What a `random.below` of a bound below one raises in the task that asked.
+fn no_bound(site: Site, bound: Int) -> Failure =
+  {
+    code: "E0502",
+    message: "`random.below` needs a bound above zero, but got " ++ bound.to_string(),
+    labels: [primary(site, "this bound names no value to draw")],
+    notes: [
+      "`random.below(n)` answers a value in `0..n`, which is empty for `n <= 0`",
+      "guard the bound, or use `random.next()` for the whole range",
+    ],
+  }
+
 fn cancelled_from(site: Site, target: Int, task: Int) -> Failure =
   {
     code: "E0502",
@@ -1804,7 +1828,8 @@ extern fn region_failed(failure: Bytes) -> Unit
 // A perform of a `task` operation at a type other than `Kept` is a call of its crossing here: each
 // value of the operation's type parameter crosses kept, a function answering one is wrapped to
 // keep what it answers, and an answer holding one is opened. A crossing's own perform is at `Kept`,
-// typed so where nothing else fixes its type, or it calls itself.
+// typed so where nothing else fixes its type: the emitter refuses a perform here at another type,
+// which would call its own crossing.
 
 pub fn crossing_spawn<a | e>(body: keep () -> a / e) -> Task<a> / {task.spawn | e} =
   task_as(task.spawn(|| keep(body())))
@@ -2043,24 +2068,22 @@ pub fn simulated<a | e>(
   }
 }
 
-/// The trail the entry's regions left, or the seed's own before the first.
-fn entered_trail() -> trail::Left / {abort.raise} =
-  match trail::left_of(trail_entered()) {
+/// The trail the entry's regions left, `left`, or before the first the seed's own: its `root`, its
+/// `path` two bytes a choice (`seed_path`), and the scheduling points it may take.
+fn entered_trail(left: Bytes, root: U64, path: Bytes, steps: Int) -> trail::Left / {abort.raise} =
+  match trail::left_of(left) {
     Some(l) -> l,
-    None -> {
-      let path = seed_path();
-      let root = U64::of_int(seed_root(0)) << 32 | U64::of_int(seed_root(1));
+    None ->
       {
         trail: trail::trail(
           {
             root: root,
             path: range(0, path.len() / 2).map(|i: Int| path.at(2 * i) + 256 * path.at(2 * i + 1)),
           },
-          seeded_steps(),
+          steps,
         ),
         steps: [],
-      }
-    },
+      },
   }
 
 /// What the loop holds: the region, and the task it ran last.
@@ -2070,7 +2093,13 @@ type Looping = { region: Region<Kept>, last: Int }
 /// names and applies what it asks, until the region ends; then leaves the trail and answers, fails
 /// the run, or lands the raise that left a task, as the region ended.
 fn ran(s: Stacks, id: Int, site: Site) -> Unit / {abort.raise} = {
-  let entered = entered_trail();
+  // Read here: a call of a function of no parameters is a constant its unit computes once.
+  let entered = entered_trail(
+    trail_entered(),
+    U64::of_int(seed_root(0)) << 32 | U64::of_int(seed_root(1)),
+    seed_path(),
+    seeded_steps(),
+  );
   let start = { region: seeded(id, site, entered.trail), last: 0 };
   let ended = iterate(start, entered.trail.budget + 2, |l: Looping| {
     let t = turned(l.region, { now: 0, stopping: false });
