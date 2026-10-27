@@ -27,10 +27,10 @@ import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, 
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
                           Enter, Handle, Handling, Uses, AInt, Static, falls_through)
 import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Reached, Bridge,
-                                   Instance, InstanceHeap, InstanceIn, ObjectLaid, Entering,
-                                   ForwardsLaid, ForwardsSet, ObjectAt, Mapped, Slot, Answering,
-                                   Forwarding, Forwarded, Keyed, KeyedRow, Entry, Answers, Stops,
-                                   Resumes, Raises, HandleInstance, raised_at)
+                                   Instance, InstanceHeap, InstanceIn, Entering, ForwardsLaid,
+                                   ForwardsSet, ObjectAt, Mapped, Slot, Answering, Forwarding,
+                                   Forwarded, Keyed, KeyedRow, Entry, Answers, Stops, Resumes,
+                                   Raises, HandleInstance, raised_at)
 import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
                                      own_types)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, refuse, fresh,
@@ -255,8 +255,9 @@ pub fn handle_planned(
   let returned = h.clauses.len();
   let vars = records + 4 * (returned + (if h.ret == None { 0 } else { 1 }));
   let count = handler_vars(h.body);
-  let tables = instance_keys(cx, h.clauses).fold(0, |n: Int, k: Key|
-    n + tables_of(key_planned(around, h.clauses, k)));
+  let keys = instance_keys(cx, h.clauses);
+  let tables = keys.fold(0, |n: Int, k: Key| n + tables_of(key_planned(around, h.clauses, k)));
+  let objects = keys.fold(0, |n: Int, k: Key| n + object_words(k));
   let layout = {
     operand: 0,
     records: range(0, h.clauses.len()).map(|k: Int| records + 4 * k),
@@ -274,7 +275,7 @@ pub fn handle_planned(
     ret: if h.ret == None { None } else { Some(records + 4 * returned) },
     preset: false,
   };
-  let words = vars + 2 * count + tables;
+  let words = vars + 2 * count + objects + tables;
   if detached || spawning(cx) {
     let b = bound_as(
       f.st,
@@ -536,11 +537,18 @@ pub fn instance_objects(
 ) -> { st: Lowering, words: List<Worded> } / {abort.raise} = {
   let i = plan.instance;
   let around = match plan.forwarding { Some(f) -> { ..cx, words: f.outer }, None -> cx };
-  let made = instance_keys(cx, h.clauses).fold(
-    { st: st, words: [], table: i.layout.vars + 2 * i.layout.count },
-    |acc: { st: Lowering, words: List<Worded>, table: Int }, k: Key| {
+  let keys = instance_keys(cx, h.clauses);
+  let first = i.layout.vars + 2 * i.layout.count;
+  let made = keys.fold(
+    {
+      st: st,
+      words: [],
+      object: first,
+      table: first + keys.fold(0, |n: Int, k: Key| n + object_words(k)),
+    },
+    |acc: { st: Lowering, words: List<Worded>, object: Int, table: Int }, k: Key| {
       let kp = key_planned(around, h.clauses, k);
-      let o = object_laid(around, acc.st, h.clauses, i, kp, acc.table, at);
+      let o = object_laid(around, acc.st, h.clauses, i, kp, acc.object, acc.table, at);
       {
         st: o.st,
         words: acc.words.push({
@@ -549,12 +557,17 @@ pub fn instance_objects(
           through: false,
           handled: true,
         }),
+        object: acc.object + object_words(k),
         table: acc.table + tables_of(kp),
       }
     },
   );
   { st: made.st, words: made.words }
 }
+
+/// How many words key `k`'s object takes in its instance: its flags, then an entry and its
+/// environment per operation of its effect.
+fn object_words(k: Key) -> Int = 1 + 2 * k.effect.ops.len()
 
 /// An effect and resource a `handle` answers, with the effect's operations.
 type Key = { evidence: Evidence, effect: EffectName }
@@ -636,8 +649,8 @@ fn tables_of(kp: KeyPlan) -> Int =
   kp.slots.fold(0, |n: Int, s: SlotPlan|
     match s { ByTable(t) -> n + 1 + 3 * (t.clauses.len() + t.words.len()), _ -> n })
 
-/// The object for key `kp` laid over instance `i` after `st`, its tables from word `table` of the
-/// instance on: its operands the instance, the word its key is routed to around the `handle` (zero
+/// The object for key `kp` laid at word `object` of instance `i` after `st`, so it lives as long as
+/// the instance, its tables from word `table` of the instance on: its operands the instance, the word its key is routed to around the `handle` (zero
 /// where no slot forwards to it), the words its tables forward to, then the labels the tables' rows
 /// answer.
 fn object_laid(
@@ -646,6 +659,7 @@ fn object_laid(
   clauses: List<CodeClause>,
   i: { word: Arg, layout: HandleInstance, block: Option<Arg> },
   kp: KeyPlan,
+  object: Int,
   table: Int,
   at: Span,
 ) -> Lowered / {abort.raise} = {
@@ -716,7 +730,11 @@ fn object_laid(
     outer.st,
     evidence_type(),
     RImm,
-    Op({ op: OHandle(ObjectLaid(laid.slots)), args: operands, uses: reading(operands.len()) }),
+    Op({
+      op: OHandle(ObjectAt({ at: object, slots: laid.slots })),
+      args: operands,
+      uses: reading(operands.len()),
+    }),
     at,
   )
 }

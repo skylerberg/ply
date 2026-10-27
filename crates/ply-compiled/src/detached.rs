@@ -47,9 +47,9 @@ pub struct Detached {
 /// A heap instance's block as emitted code lays it out, past its header, in words: how many its
 /// head holds before the instance, where in the head the body it is the `handle` of is (which
 /// [`open_over`] writes), and where the place of its first variable is, their count after it.
-pub(crate) const INSTANCE_HEAD: usize = 9;
+pub(crate) const INSTANCE_HEAD: usize = 7;
 pub(crate) const INSTANCE_DETACHED: usize = 4;
-pub(crate) const INSTANCE_VARS: usize = 7;
+pub(crate) const INSTANCE_VARS: usize = 5;
 
 /// A clause's record in an instance: its closure, the instance, its place, and the descriptor of
 /// `String` where it is handed one.
