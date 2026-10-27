@@ -444,6 +444,10 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
         Ok(EntryBytes::Function) => {
             Ended::Unanswerable("its answer holds a function the program wrote")
         }
+        Ok(EntryBytes::Escaping(handle)) => {
+            let boundary = ply_core::Boundary::EntryAnswer { name: root };
+            Ended::Failed(ply_core::escape::refused(&boundary, handle, Span::DUMMY))
+        }
         Ok(EntryBytes::Holding(value)) => {
             let boundary = ply_core::Boundary::EntryAnswer { name: root };
             match ply_core::escape::check(&boundary, &value, Span::DUMMY) {

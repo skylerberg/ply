@@ -5,10 +5,13 @@ use crate::value::{ClosureKind, Value};
 use crate::{Diagnostic, Span, codes};
 use std::borrow::Cow;
 
-/// What may not cross a boundary: a continuation, which no type records as one.
+/// What may not cross a boundary: a continuation, which no type records as one, and a task or a
+/// channel, which only the region that made it can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
     Continuation,
+    Task,
+    Channel,
 }
 
 impl Handle {
@@ -16,6 +19,8 @@ impl Handle {
     fn noun(self) -> &'static str {
         match self {
             Handle::Continuation => "a continuation",
+            Handle::Task => "a `Task`",
+            Handle::Channel => "a `Chan`",
         }
     }
 
@@ -24,6 +29,10 @@ impl Handle {
             Handle::Continuation => {
                 "a continuation resumes a body that lives only as long as the entry that captured \
                  it"
+            }
+            Handle::Task | Handle::Channel => {
+                "a task or a channel is a key into the region that made it, which ends before the \
+                 entry does"
             }
         }
     }
@@ -34,6 +43,24 @@ impl Handle {
             Handle::Continuation => {
                 "no type records that a function is a continuation, so it is refused at the \
                  boundary instead of wherever it would be resumed"
+            }
+            Handle::Task | Handle::Channel => {
+                "a value may carry it out of its region, which no check stops, so it is refused \
+                 at the boundary instead of wherever it would be joined"
+            }
+        }
+    }
+
+    /// What the program does instead, at an entry's answer.
+    fn instead(self) -> &'static str {
+        match self {
+            Handle::Continuation => {
+                "resume the continuation before the entry answers, and answer with what it \
+                 answers"
+            }
+            Handle::Task | Handle::Channel => {
+                "join the task, or drain the channel, inside the region that made it, and answer \
+                 with what that gives"
             }
         }
     }
@@ -116,7 +143,7 @@ impl Boundary<'_> {
         }
     }
 
-    fn remedy(&self) -> &'static str {
+    fn remedy(&self, handle: Handle) -> &'static str {
         match self {
             Boundary::HostArgument { .. } => {
                 "resume the continuation inside the clause that bound it, and perform the \
@@ -126,10 +153,7 @@ impl Boundary<'_> {
                 "a handler answers with data; a handle into the program's memory is not data it \
                  is in a position to have"
             }
-            Boundary::EntryAnswer { .. } => {
-                "resume the continuation before the entry answers, and answer with what it \
-                 answers"
-            }
+            Boundary::EntryAnswer { .. } => handle.instead(),
         }
     }
 }
@@ -168,6 +192,15 @@ pub fn check_arguments(
     Ok(())
 }
 
+/// `handle`, which no value stands for, refused at `boundary`.
+pub fn refused(boundary: &Boundary<'_>, handle: Handle, span: Span) -> Diagnostic {
+    let escapee = Escapee {
+        handle,
+        route: Vec::new(),
+    };
+    refuse(boundary, &escapee, span)
+}
+
 #[cold]
 #[inline(never)]
 fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
@@ -179,7 +212,7 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
     .note(escapee.handle.why())
     .note(boundary.outlives())
     .note(escapee.handle.unseen())
-    .note(boundary.remedy())
+    .note(boundary.remedy(escapee.handle))
 }
 
 /// Builds `route` innermost-first as the `Some` unwinds, so a clean value allocates nothing.

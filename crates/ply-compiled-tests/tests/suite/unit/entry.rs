@@ -87,6 +87,17 @@ pub fn encoded_defs() -> Vec<Def> {
             ),
         ),
         def("m.helper", 1, "  return p0;"),
+        def("m.spawned", 0, "  return 0;"),
+        def(
+            "m.spawned#entered",
+            0,
+            &format!(
+                "{}  Word t = {}(ctx, 0);\n  {}(ctx, t);\n  return 0;",
+                lifting(""),
+                native("task_made"),
+                native("?out_handle"),
+            ),
+        ),
     ]
 }
 
@@ -99,6 +110,7 @@ pub fn entering(e: &mut units::Laid) {
         "m.closure",
         "m.keep",
         "m.fail",
+        "m.spawned",
     ]
     .map(str::to_string)
     .to_vec();
@@ -171,7 +183,7 @@ fn a_unit_is_entered_only_at_its_roots() {
             "{root}"
         );
     }
-    assert_eq!(opened.roots(), 6);
+    assert_eq!(opened.roots(), 7);
 }
 
 /// A function the program wrote, or a handle, cannot leave the entry that holds it.
@@ -274,4 +286,21 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
         .flatten()
         .map(|bytes| codec::decode(&bytes).expect("the answer reads"));
     assert_eq!(answer, Some(Value::Int(100_000)));
+}
+
+/// A task in an entry's answer is refused at the boundary as a continuation is: the region it is a
+/// key into ended before the entry did.
+#[test]
+fn a_task_in_an_entrys_answer_is_refused_at_the_boundary() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let Some(opened) = opened(dir.path()) else {
+        return;
+    };
+    match entry::enter(&opened, "m.spawned", arguments(vec![]), &run(), None, None).ended {
+        Ended::Failed(d) => {
+            assert_eq!(d.code, ply_core::codes::REGION_ESCAPE_AT_BOUNDARY, "{d}");
+            assert!(d.message.contains("`m.spawned` answered a `Task`"), "{d}");
+        }
+        _ => panic!("the boundary did not refuse the task"),
+    }
 }

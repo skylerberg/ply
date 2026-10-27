@@ -785,6 +785,10 @@ impl Native for RegionTask {
     fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
         Err("a task, which only its own region can hold, crossed".into())
     }
+
+    fn escapes(&self) -> Option<ply_core::escape::Handle> {
+        Some(ply_core::escape::Handle::Task)
+    }
 }
 
 /// A region's channel's handle (`Chan`): its region and its id.
@@ -798,6 +802,10 @@ impl Native for RegionChan {
 
     fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
         Err("a channel, which only its own region can hold, crossed".into())
+    }
+
+    fn escapes(&self) -> Option<ply_core::escape::Handle> {
+        Some(ply_core::escape::Handle::Channel)
     }
 }
 

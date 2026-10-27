@@ -205,6 +205,19 @@ pub trait Native: std::any::Any {
     /// What the object reads as where it crosses into the runtime's values, as a diagnostic shows
     /// it; an error where it reads as none.
     fn value(&self, ctx: *mut crate::rt::Ctx) -> Result<Value, String>;
+
+    /// The handle of its run the object is, which no boundary lets out; none for any other.
+    fn escapes(&self) -> Option<ply_core::escape::Handle> {
+        None
+    }
+}
+
+/// What the native object `w` is as [`Native::escapes`] says.
+///
+/// # Safety
+/// `w` is a live native object.
+pub unsafe fn native_escapes(w: Word) -> Option<ply_core::escape::Handle> {
+    unsafe { (**native_slot(obj(w))).escapes() }
 }
 
 unsafe fn native_slot(o: *mut Obj) -> *mut Box<dyn Native> {
