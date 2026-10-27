@@ -60,10 +60,11 @@ pub(crate) const RECORD_STRING: usize = 3;
 /// A detached `handle`'s forwarding block, as emitted code lays it out past its header, in words:
 /// the handler (which [`open`] writes), the unit's word mapping, the static descriptor of the words
 /// it forwards, how many those are (`m`), how many words the block holds, then the `m` words each
-/// forwards to, the labels the descriptor leaves to them, and the evidence objects. An object that
-/// forwards has its slot's environment point at a pair: the address of the word it forwards to and
-/// the operation's place. Every call of a continuation sets those `m` words to what its caller hands
-/// for the same.
+/// forwards to, the `m` tasks that handed them, the labels the descriptor leaves to them, and the
+/// evidence objects. An object that forwards has its slot's environment point at a record: the
+/// address of the word it forwards to, the operation's place and the address of that word's task,
+/// which the call it forwards runs as. Every call of a continuation sets those `m` words to what its
+/// caller hands for the same, their tasks to the caller's.
 const FORWARDS_HANDLER: usize = 0;
 const FORWARDS_MAPPED: usize = 1;
 const FORWARDS_OWN: usize = 2;
@@ -86,12 +87,14 @@ fn forwards_bytes(block: Word) -> Word {
 }
 
 /// Points body `id`'s forwarding words at the words the call resuming it handed for the same, as
-/// `ctx`'s `entering_*` name them, the frame bridge where it handed none; a word that is one of the
-/// block's own objects, which the body's own clause hands back, leaves its word as it was.
+/// `ctx`'s `entering_*` name them, the frame bridge where it handed none, each as the caller's task;
+/// a word that is one of the block's own objects, which the body's own clause hands back, leaves its
+/// word and task as they were.
 fn retargeted(ctx: *mut Ctx, id: usize) {
     let c = unsafe { &mut *ctx };
     let site = std::mem::take(&mut c.entering_desc);
     let words = std::mem::take(&mut c.entering_words);
+    let task = c.task;
     let Some(block) = c.detached[id].forwards else {
         return;
     };
@@ -109,7 +112,7 @@ fn retargeted(ctx: *mut Ctx, id: usize) {
         mapped(
             ctx,
             *b.add(FORWARDS_OWN) as *const Word,
-            targets.add(m),
+            targets.add(2 * m),
             site as *const Word,
             words as *const Word,
             targets,
@@ -120,7 +123,18 @@ fn retargeted(ctx: *mut Ctx, id: usize) {
         let now = unsafe { targets.add(i) };
         if own.contains(unsafe { &*now }) {
             unsafe { now.write(was) };
+        } else {
+            unsafe { targets.add(m + i).write(task as Word) };
         }
+    }
+}
+
+/// The tasks of forwarding block `block`'s words, each `task`, which handed them as the body opened.
+fn tasks_handed(block: Word, task: i64) {
+    let b = forwards_words(block);
+    let m = unsafe { *b.add(FORWARDS_COUNT) } as usize;
+    for i in 0..m {
+        unsafe { b.add(FORWARDS_TARGETS + m + i).write(task as Word) };
     }
 }
 
@@ -195,6 +209,7 @@ pub(crate) unsafe fn open(
                 .add(FORWARDS_HANDLER)
                 .write(handler as Word)
         };
+        tasks_handed(block, c.task);
     }
     c.stacks[frames]
         .list
@@ -251,6 +266,9 @@ pub(crate) unsafe fn open_over(
             .add(INSTANCE_DETACHED)
             .write(id as Word)
     };
+    if let Some(block) = forwards {
+        tasks_handed(block, c.task);
+    }
     let sp = stack.prepare(entry, ctx as usize);
     c.detached.push(Detached {
         stack: Some(stack),

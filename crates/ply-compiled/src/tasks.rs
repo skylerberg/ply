@@ -309,18 +309,13 @@ pub unsafe fn resume(region: *mut Region, id: u64, answer: Message) -> Message {
         r.peak = r.peak.max(r.live);
     }
     let to = slot.sp;
-    let opener = c.task;
-    c.task = slot.runs_as.unwrap_or(opener);
     c.current = slot.frames.unwrap_or(r.frames);
     r.message = answer;
     r.running = Some(id);
     unsafe { switch_keeping(ctx, &raw mut r.loop_sp, to) };
     let r = unsafe { &mut *region };
     r.running = None;
-    unsafe {
-        (*ctx).current = r.frames;
-        (*ctx).task = opener;
-    }
+    unsafe { (*ctx).current = r.frames };
     r.message
 }
 
@@ -372,6 +367,9 @@ extern "C" fn task_entry(arg: usize) {
         let own = slot.stack.as_ref().expect("a task starts on its own stack");
         c.stack_floor = unsafe { own.enter() };
         c.frames = std::ptr::null_mut();
+        if let Some(n) = slot.runs_as {
+            c.task = n;
+        }
         (r.ctx, id, slot.body.take())
     };
     if let Some(body) = body {

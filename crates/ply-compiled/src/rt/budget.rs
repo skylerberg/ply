@@ -34,19 +34,20 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
 }
 
 /// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::fuel`] and [`Ctx::frames`] as this stack left them, whatever ran
-/// meanwhile, this stack the running one again and the floor its own.
+/// switches back, with [`Ctx::fuel`], [`Ctx::frames`] and [`Ctx::task`] as this stack left them,
+/// whatever ran meanwhile, this stack the running one again and the floor its own.
 ///
 /// # Safety
 /// As [`switch`], and `ctx` is the context both stacks run under.
 pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let (fuel, frames) = unsafe { ((*ctx).fuel, (*ctx).frames) };
+    let (fuel, frames, task) = unsafe { ((*ctx).fuel, (*ctx).frames, (*ctx).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
         ply_core::limit::set_running(running);
         (*ctx).fuel = fuel;
         (*ctx).frames = frames;
+        (*ctx).task = task;
         (*ctx).stack_floor = stack_floor();
     }
 }

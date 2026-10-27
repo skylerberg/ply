@@ -1,0 +1,128 @@
+//! A continuation one task captured may be resumed by another: the rest of its body raises and
+//! stops to the handles inside it as the task that began the body would, and what it performs past
+//! them goes to the handles around the call that resumes it, as the resuming task's.
+
+effect amb {
+  read flip() -> Bool
+}
+
+effect fault {
+  raise bad(n: Int)
+}
+
+effect halt {
+  write stop(code: Int) -> Int
+}
+
+type Saved = | Done(Int) | Parked((Bool) -> Saved)
+
+/// Its rest raises to the handles around whatever call resumes it.
+type Raising = | Ended(Int) | Waiting((Bool) -> Raising / {fault.bad})
+
+/// A body that stops at `amb.flip` inside a `handle` of its own for `fault.bad`, which it raises to
+/// once resumed with `true`.
+fn parked() -> Saved =
+  handle {
+    handle { if amb.flip() { fault.bad(5) } else { 2 } } with { fault.bad(n) -> n * 10 }
+  } with {
+    amb.flip() resume k -> Parked(k),
+    return v -> Done(v),
+  }
+
+/// A body that stops at each `amb.flip`, its clause parking the continuation.
+fn parked_twice() -> Saved =
+  handle {
+    let a = amb.flip();
+    let b = amb.flip();
+    if a && b { 1 } else { 2 }
+  } with {
+    amb.flip() resume k -> Parked(k),
+    return v -> Done(v),
+  }
+
+/// A body that, resumed with `true`, ends at a clause of its own that resumes on its tail and does
+/// not.
+fn halted() -> Saved =
+  handle {
+    handle {
+      if amb.flip() { halt.stop(7) + 1 } else { 2 }
+    } with {
+      halt.stop(code) resume k -> code,
+    }
+  } with {
+    amb.flip() resume k -> Parked(k),
+    return v -> Done(v),
+  }
+
+/// A body that, resumed with `true`, raises to the handles around its `handle`.
+fn waiting() -> Raising / {fault.bad} =
+  handle {
+    if amb.flip() { fault.bad(3) } else { 2 }
+  } with {
+    amb.flip() resume k -> Waiting(k),
+    return v -> Ended(v),
+  }
+
+test "a continuation a task parked, resumed by the region's body, raises to the handle inside it" {
+  let got = simulate {
+    let t = task.spawn(|| parked());
+    match task.join(t) { Parked(k) -> k(true), Done(n) -> Done(n) }
+  };
+  assert_eq(got, Done(50))
+}
+
+test "a continuation parked in the region's body, resumed by a task, raises to the handle inside it" {
+  let got = simulate {
+    match parked() {
+      Parked(k) -> {
+        let t = task.spawn(|| k(true));
+        task.join(t)
+      },
+      Done(n) -> Done(n),
+    }
+  };
+  assert_eq(got, Done(50))
+}
+
+test "a continuation a task parked stops again at its own handle when the region's body resumes it" {
+  let got = simulate {
+    let t = task.spawn(|| parked_twice());
+    match task.join(t) {
+      Parked(k) -> match k(true) { Parked(k2) -> k2(true), Done(n) -> Done(n) },
+      Done(n) -> Done(n),
+    }
+  };
+  assert_eq(got, Done(1))
+}
+
+test "a continuation a task parked ends at a clause of its own when the region's body resumes it" {
+  let got = simulate {
+    let t = task.spawn(|| halted());
+    match task.join(t) { Parked(k) -> k(true), Done(n) -> Done(n) }
+  };
+  assert_eq(got, Done(7))
+}
+
+test "a continuation a task parked raises to the handle around the region body's call of it" {
+  let got = simulate {
+    let t = task.spawn(|| handle { waiting() } with { fault.bad(n) -> Ended(n) });
+    match task.join(t) {
+      Waiting(k) -> handle { k(true) } with { fault.bad(n) -> Ended(n * 10) },
+      Ended(n) -> Ended(n),
+    }
+  };
+  assert_eq(got, Ended(30))
+}
+
+test "a continuation parked in the region's body raises to the handle around a task's call of it" {
+  let got = simulate {
+    match handle { waiting() } with { fault.bad(n) -> Ended(n) } {
+      Waiting(k) -> {
+        let t = task.spawn(|| handle { k(true) } with { fault.bad(n) -> Ended(n * 10) });
+        task.join(t)
+      },
+      Ended(n) -> Ended(n),
+    }
+  };
+  assert_eq(got, Ended(30))
+}

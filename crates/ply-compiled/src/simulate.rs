@@ -377,15 +377,12 @@ pub(crate) unsafe fn run(ctx: *mut Ctx) -> Option<Item> {
         let sim = c.sims.last_mut().expect("a region is running");
         c.current = sim.slot(task).frames;
         sim.running = Some(task);
-        let before = c.task;
-        c.task = sim.slot(task).runs_as;
         let from = &mut sim.scheduler_sp as *mut usize;
         unsafe { switch_keeping(ctx, from, sp) };
 
         let c = unsafe { &mut *ctx };
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
-        c.task = before;
         c.current = sim.stack;
     }
 }
@@ -566,6 +563,7 @@ extern "C" fn task_entry(arg: usize) {
         let floor = unsafe { own.expect("a task starts on its own stack").enter() };
         c.stack_floor = floor;
         c.frames = std::ptr::null_mut();
+        c.task = sim.slot(me).runs_as;
         (body, me)
     };
     let answered = body.run(ctx);
