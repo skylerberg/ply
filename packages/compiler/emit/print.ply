@@ -6,16 +6,19 @@
 //! instruction holding blocks, the framing around them (`emit.print.*`).
 
 import compiler.syntax.parsing (Span, span_between)
+import compiler.syntax.exprs (crossing_perform)
 import compiler.check.types (Type, TyCon)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (tick_line, int_lit)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry)
+import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry,
+                           definition_of)
 import compiler.emit.evidence (declared_arity)
 import compiler.emit.reps (Ctors, no_ctors, laid_known)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
-import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
+import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, SiteOf, InGroup, LentBy, Called,
+                             merged, spelled)
 import compiler.emit.release (drop_of)
 import compiler.emit.tir.handling (instance_alone)
 import compiler.emit.tir (no_closure_words, Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice,
@@ -96,7 +99,11 @@ fn root_printed(
   f: Fn,
   ctors: Ctors,
 ) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let body = body_printed(name, f, {
+  let sited = match definition_of(f.key) {
+    Some(d) -> if crossing_perform(d) { Some(Called) } else { None },
+    None -> None,
+  };
+  let body = body_printed(name, f, sited, {
     ..printing(param_names(f)),
     ctors: ctors,
     counting: counted_here(f.key),
@@ -327,18 +334,32 @@ fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
 /// function of its own, so its temporaries, labels and tails are its own, but the root's tables go
 /// on.
 fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing / {abort.raise} =
-  match l { Closure(c) -> body_printed(symbol, c.body, function_body(pr, lambda_names(l, nth))) }
+  match l {
+    Closure(c) -> body_printed(symbol, c.body, None, function_body(pr, lambda_names(l, nth))),
+  }
 
-/// `f`'s body, a body of the root named `symbol`: the frame record its sites link, its parameters
-/// opened, its restart label where a self call restarts it, and the tails of what it declares at
-/// its end.
-fn body_printed(symbol: Bytes, f: Fn, given: Printing) -> Printing / {abort.raise} = {
-  let pr = { ..given, placing: placing_of(f) };
+/// `f`'s body, a body of the root named `symbol` whose sites name `sited`: the frame record its sites
+/// link, its parameters opened, its restart label where a self call restarts it, and the tails of
+/// what it declares at its end. A body whose sites are its caller's keeps that site as it starts.
+fn body_printed(
+  symbol: Bytes,
+  f: Fn,
+  sited: Option<SiteOf>,
+  given: Printing,
+) -> Printing / {abort.raise} = {
+  let kept = if sited == Some(Called) {
+    line(
+      given,
+      0,
+      b"const int64_t ply_called[3] = { ctx->site_root, ctx->site_start, ctx->site_end };",
+    )
+  } else { given };
+  let pr = { ..kept, placing: placing_of(f) };
   let u = {
     symbol: symbol,
     base: f.base,
     answer: f.conv.answer,
-    site: None,
+    site: sited,
     arm: None,
     looping: None,
     // A failure leaves by raising what the runtime left pending, where the function holds a word to.
