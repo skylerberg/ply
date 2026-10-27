@@ -198,8 +198,8 @@ pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
 
 /// What each stored root lent as parts at `rp` answers on the unit compiled into the library at
 /// `lp`, entered by name with nothing, binding no host, under `steps` calls, as parts each found:
-/// the bytes a build keeps its definition's value as, or none for a root that raised, ran past its
-/// calls or is not in the unit.
+/// the answer as the run writes it, a `Bytes` holding what a build keeps its definition's value
+/// as, or none for a root that raised, ran past its calls or is not in the unit.
 pub unsafe extern "C" fn rt_shipped_values(
     ctx: *mut Ctx,
     lp: Addr,
