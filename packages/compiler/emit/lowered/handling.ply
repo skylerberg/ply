@@ -31,7 +31,8 @@ import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, SiteHere,
                                    Encoded, Unsettled, Entering, ForwardsLaid, ForwardsSet,
                                    ObjectAt, InstanceIn, Bridge, Answering, Keyed, Answers, Resumes,
-                                   Stops, Forwarded, VarInit, VarRead, VarWrite, raised_at)
+                                   Stops, Forwarded, Returning, VarInit, VarRead, VarWrite,
+                                   raised_at)
 import compiler.emit.typing (Typed)
 import compiler.check.infer.checker (FiledRows, RowArguments, Performs, prelude_effects, EffectInfo,
                                      OpInfo)
@@ -427,7 +428,7 @@ test "a clause resuming in its tail joins its arms as the word it hands back, ne
   }
 }
 
-test "a handle runs its body in place over its instance, which holds its clauses' records, and sets its answer as a word" {
+test "a handle runs its body in place over its instance, which holds its clauses' records, and sets its answer as its type holds it" {
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match handle_at(p, b"guarded") {
@@ -457,9 +458,9 @@ test "a handle runs its body in place over its instance, which holds its clauses
         assert_eq(o.st.refused, None);
         match handles_in(o.st.insts) {
           [h] -> {
-            // The body runs in place, over the instance, and sets the answer as a word.
+            // The body runs in place, over the instance, and sets the answer as the `Int` it is.
             assert(h.body.contains(add), None);
-            assert_eq(h.answer.rep, RWord);
+            assert_eq(h.answer.rep, RInt);
             assert(
               h.body.any(|i: Inst| match i { Assign(a) -> a.var == h.answer, _ -> false }),
               None,
@@ -484,9 +485,7 @@ test "a handle runs its body in place over its instance, which holds its clauses
             });
             assert_eq(h.site.clauses.map(|c: Clause| (c.effect, c.op, c.mode)), [
               (b"m.ask", b"get", 0),
-            ]);
-            // What it answers is read as the `Int` it is.
-            assert(answer_read(o.st.insts, h.answer, RInt), None)
+            ])
           },
           other -> assert_eq(other.len(), 1),
         };
@@ -1330,7 +1329,7 @@ test "a `?` inside a `handle` lowers as a raise the `handle` written around it l
       Ok(t) ->
         assert(
           t.index_of(b"ctx->failed == PLY_FAILED_TARGET") != None
-            && t.index_of(b"else if (ply_held == 1)") != None,
+            && t.index_of(b"if (ply_held == 1)") != None,
           Some(String::of_bytes_lossy(t)),
         ),
     },
@@ -1391,6 +1390,60 @@ test "no handle installs a frame: each prints over its instance, its body detach
       assert_eq(named_if(|t: Bytes| framed.any(|f: Bytes| t.index_of(f) != None)), []);
       // Each opens an instance where its body runs, taking the fuel it stands at.
       assert_eq(named_if(|t: Bytes| t.index_of(b"[0] = ctx->fuel;") == None), [])
+    },
+  }
+}
+
+test "a landing enters each clause by its type and sets the answer as its type holds it, which the body leaves to the return clause" {
+  let src = Bytes::concat_all([
+    b"effect bad {\n  raise fail(at: Int)\n}\n",
+    b"fn failing(at: Int) -> Int / {bad.fail} = if at > 0 { bad.fail(at) } else { at }\n",
+    b"fn tried(n: Int) -> Result<Int, Int> = try { failing(n) }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      match formed(p, b"tried") {
+        Err(no) -> assert_eq(no.why, b""),
+        Ok(f) -> match handles_in(f.body) {
+          [h] -> {
+            // The body hands what it answers to the return clause and never sets the answer.
+            assert(
+              h.body.any(|i: Inst|
+                match i {
+                  Do(d) -> match d.val { Op(o) -> o.op == OHandle(Returning), _ -> false },
+                  _ -> false,
+                }),
+              None,
+            );
+            assert(
+              !h.body.any(|i: Inst| match i { Assign(a) -> a.var == h.answer, _ -> false }),
+              None,
+            );
+            assert(h.answer.rep != RWord, None)
+          },
+          other -> assert_eq(other.len(), 1),
+        },
+      };
+      // The root's landing enters the raise clause, on an unwind to it and on a raise left pending,
+      // and the return clause, each by its type.
+      match printed_by_form(p, b"tried") {
+        Err(why) -> assert_eq(why, b""),
+        Ok(t) -> {
+          let landing = match t.index_of(b"ply_h0: ;") {
+            Some(at) -> {
+              let rest = t.slice(at, t.len());
+              match rest.index_of(b"\n}\n") { Some(end) -> rest.slice(0, end), None -> rest }
+            },
+            None -> b"",
+          };
+          assert(
+            landing.index_of(b"ply_uniform(") == None
+              && occurrences(landing, b"->typed)(ctx, ") == 3,
+            Some(String::of_bytes_lossy(t)),
+          )
+        },
+      }
     },
   }
 }

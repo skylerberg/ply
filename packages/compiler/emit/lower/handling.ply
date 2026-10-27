@@ -30,7 +30,7 @@ import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, 
                                    Instance, InstanceHeap, InstanceIn, Entering, ForwardsLaid,
                                    ForwardsSet, ObjectAt, Mapped, Slot, Answering, Forwarding,
                                    Forwarded, Keyed, KeyedRow, Entry, Answers, Stops, Resumes,
-                                   Raises, HandleInstance, raised_at)
+                                   Raises, HandleInstance, Returning, raised_at)
 import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
                                      own_types)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, refuse, fresh,
@@ -812,12 +812,36 @@ pub fn handled(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let detached = detaches(h.clauses);
+  let ty = match ret {
+    Some(r) -> answer_of(type_of(r)),
+    None -> if detached { answer_of(type_of(body.arg)) } else { type_of(body.arg) },
+  };
+  // The answer is held as its type holds it, and a `return` clause is handed the body's value as
+  // its parameter's type holds it; a detached body answers the runtime a word.
+  let answer_rep = if detached { RWord } else { held_as(cx.setting, ty) };
   let inner = if detached { { outer: body.st, block: [], word: None } }
   else if !falls_through(body.st.insts) {
     { outer: continued(st, body.st), block: body.st.insts, word: None }
   } else {
-    let w = handed(body, RWord, at);
-    { outer: continued(st, w.st), block: w.st.insts, word: Some(w.arg) }
+    match ret {
+      Some(r) -> {
+        let w = handed(body, held_as(cx.setting, param_of(type_of(r))), at);
+        let given = done(
+          w.st,
+          Op({
+            op: OHandle(Returning),
+            args: [plan.instance.word, w.arg],
+            uses: { takes: [false, true], owned: false, fails: false, stops: false },
+          }),
+          at,
+        );
+        { outer: continued(st, given), block: given.insts, word: None }
+      },
+      None -> {
+        let w = handed(body, answer_rep, at);
+        { outer: continued(st, w.st), block: w.st.insts, word: Some(w.arg) }
+      },
+    }
   };
   let laid = range(0, h.clauses.len()).fold(
     { st: inner.outer, args: [], takes: [], clauses: [], unknown: None },
@@ -837,10 +861,6 @@ pub fn handled(
   let all = if detached {
     { args: tail.args.push(body.arg), takes: tail.takes.push(true), at: Some(tail.args.len()) }
   } else { { args: tail.args, takes: tail.takes, at: None } };
-  let ty = match ret {
-    Some(r) -> answer_of(type_of(r)),
-    None -> if detached { answer_of(type_of(body.arg)) } else { type_of(body.arg) },
-  };
   // The `handle` only reads its closures, whose counts are the body's to let go, and, where a
   // clause may stop it, the descriptor of what it answers. A heap instance's block is read across
   // the body, so it lives until the landing; a detached body's forwarding block is the runtime's
@@ -869,7 +889,7 @@ pub fn handled(
       _ -> None,
     },
   };
-  let a = fresh(site.st, ty, RWord);
+  let a = fresh(site.st, ty, answer_rep);
   match laid.unknown {
     Some(name) -> refuse(a.st, Handling, b"an effect the lowering does not resolve: ".concat(name)),
     None -> if escapes(inner.block, false, false) {
@@ -1190,6 +1210,13 @@ fn escapes(b: Block, matched: Bool, looped: Bool) -> Bool =
 
 /// What a function of type `t` answers.
 fn answer_of(t: Type) -> Type = match t { TyFn(f) -> f.ret, _ -> unknown_type() }
+
+/// The type of the one parameter of a function of type `t`, a `return` clause's.
+fn param_of(t: Type) -> Type =
+  match t {
+    TyFn(f) -> match f.params.at(0) { Some(p) -> p, None -> unknown_type() },
+    _ -> unknown_type(),
+  }
 
 /// The effect a body names `written`: one a `try` names program-wide, one the module's scope binds,
 /// or one of the prelude's, which are known program-wide by their bare names.
