@@ -7,12 +7,12 @@ import compiler.emit.code (Code, NLit, NUnary)
 import compiler.syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes,
                                  LEmbedded, LDec, LUnit, LBad)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type,
-                             spelled_type, unit_type)
+                             spelled_type, unit_type, fn_type, monomorphic)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, lit_int, is_bitop)
 import compiler.emit.reps (Ctors, SumCtor, has_vars, type_vars, compared_by_root, keyed_sum,
-                           numeric_sum, nullary_sum, generic_sum, written_sum, at_args)
+                           numeric_sum, nullary_sum, generic_sum, written_sum, at_args, release_row)
 import compiler.check.infer.expr (kept_type)
 import compiler.emit.answer (Scalar, Exact, literal_bits)
 import compiler.emit.keys
@@ -29,6 +29,7 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, fresh, boun
                                  short_circuit, unsettled)
 import compiler.emit.lower.data (constructed_as, field)
 import compiler.emit.lower.crossing (through_runtime, blake3_of, scalar_encoding, concatenated)
+import compiler.emit.lower.evidence (Handing, handing_scheme, words_handed, evidenced)
 import compiler.emit.roots (builtin_helper)
 import compiler.expand.rewrite (FloatFunction, float_function)
 
@@ -642,7 +643,8 @@ fn rooted(
   at: Span,
 ) -> Lowered = root_called(cx, st, key, args, types, answer, at, false)
 
-/// `rooted`, where the root may stop for a handler that resumes it later where `stops`.
+/// `rooted`, where the root may stop for a handler that resumes it later where `stops`, handed
+/// past `args` the `count` words of its row as `words.args` holds them.
 fn root_called(
   cx: Context,
   st: Lowering,
@@ -652,8 +654,9 @@ fn root_called(
   answer: Type,
   at: Span,
   stops: Bool,
+  words: { count: Int, args: List<Arg> } = { count: 0, args: [] },
 ) -> Lowered = {
-  let conv = typed_convention(cx.setting.ctors, types, answer);
+  let conv = evidenced(typed_convention(cx.setting.ctors, types, answer), 0, words.count);
   let given = range(0, args.len()).fold(
     { st: st, args: [] },
     |acc: { st: Lowering, args: List<Arg> }, i: Int|
@@ -669,7 +672,7 @@ fn root_called(
     given.st,
     answer,
     conv.answer,
-    Call({ callee: Root(key), args: given.args, conv: conv, stops: stops }),
+    Call({ callee: Root(key), args: given.args.concat(words.args), conv: conv, stops: stops }),
     at,
   )
 }
@@ -957,32 +960,55 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
     at,
   )
 
-/// `a`, a resource, let go: its type's `LetGo` root called on it, which only a specialisation
-/// settles where a type variable leaves the type open.
-pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered = {
+/// `a`, a resource, let go: its type's `LetGo` root called on it and on the words the body holds
+/// for what the releases it calls perform, which only a specialisation settles where a type
+/// variable leaves the type open.
+pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
   if has_vars(ty) {
     unsettled(needing(st, ty, true), unit_type(), held_as(cx.setting, unit_type()), [a], at)
   } else {
+    let h = let_go_handing(cx, ty);
+    let w = words_handed(st, h, at);
     // A release may perform what a clause answers by stopping.
-    root_called(cx, st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true)
+    let words = { count: h.words.len(), args: w.args };
+    root_called(cx, w.st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true, words)
   }
 }
 
-/// What a failure lets go of `a`, a resource: its type's `LetGo` root, called as `let_go` calls it.
-pub fn unwound(cx: Context, st: Lowering, a: Arg) -> { st: Lowering, unwound: Unwound } = {
+/// What a failure lets go of `a`, a resource, made after `st` at `at`: its type's `LetGo` root,
+/// called as `let_go` calls it.
+pub fn unwound(
+  cx: Context,
+  st: Lowering,
+  a: Arg,
+  at: Span,
+) -> { st: Lowering, unwound: Unwound } / {abort.raise} = {
   let ty = type_of(a);
+  let h = let_go_handing(cx, ty);
+  let w = words_handed(needing(st, ty, true), h, at);
   {
-    st: needing(st, ty, true),
+    st: w.st,
     unwound: {
       arg: a,
+      words: w.args,
       callee: let_go_root(cx, ty),
-      conv: typed_convention(cx.setting.ctors, [ty], unit_type()),
+      conv: evidenced(typed_convention(cx.setting.ctors, [ty], unit_type()), 0, h.words.len()),
     },
   }
 }
 
 fn let_go_root(cx: Context, ty: Type) -> RootKey = keys::written(LetGo, ty, cx.setting.module)
+
+/// What a call of `ty`'s `LetGo` root hands it past the value, as the root's definition is declared
+/// where it is written: a word for each operation the releases it calls perform.
+fn let_go_handing(cx: Context, ty: Type) -> Handing / {abort.raise} =
+  handing_scheme(
+    cx,
+    Some(monomorphic(fn_type([ty], unit_type(), release_row(cx.setting.ctors, ty)))),
+    [],
+    [],
+  )
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
 /// where a register holds the value, checked below 64 bits exactly in a word, at 64 bits by C's

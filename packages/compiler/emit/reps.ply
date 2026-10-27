@@ -6,9 +6,9 @@ import compiler.syntax.items (FnDef)
 import compiler.syntax.type_syntax (Mode)
 import compiler.emit.code (Lambda)
 import compiler.check.resolve.tables (qualify)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
-                             spelled_type, named_type, option_type, list_type, string_type,
-                             bytes_type, row_empty, over_arg)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
+                             Atom, int_type, spelled_type, named_type, option_type, list_type,
+                             string_type, bytes_type, row_empty, over_arg, atoms_union)
 import compiler.emit.layout
 import compiler.emit.layout (WordClass, P, C, R, S, U, LWords, LSum, SumLaid, CaseLaid, CaseArgs,
                              Payload, Nullary, Inline, Boxed, WordForm, Itself, Bits, RuntimeBox,
@@ -44,9 +44,10 @@ pub type Ctors = {
   /// Each declared sum of no parameters laid once (`with_sums_laid`), by name; empty where no one
   /// laid them, and then each is laid where it is asked for.
   laid_sums: Map<Bytes, SumLaid>,
-  /// The function each declared type that states a `release` names, by the type's name
-  /// (`with_released`).
+  /// The function each declared type that states a `release` names, and the row a call of it
+  /// performs, by the type's name (`with_released`).
   released: Map<Bytes, Bytes>,
+  release_rows: Map<Bytes, Row>,
 }
 
 /// A constructor of a declared sum, by its program-wide name, its arguments' declared types, and the
@@ -85,11 +86,70 @@ pub fn ctors_of(
     unkept: unkept_of(sums),
     laid_sums: Map::new(),
     released: Map::new(),
+    release_rows: Map::new(),
   }
 
-/// `ctors` with each declared type that states a `release` and the function it names.
-pub fn with_released(ctors: Ctors, released: Map<Bytes, Bytes>) -> Ctors =
-  { ..ctors, released: released }
+/// `ctors` with each declared type that states a `release`, the function it names, and the atoms
+/// of that function's row, its scheme found by `scheme_of` under the function's name.
+pub fn with_released(
+  ctors: Ctors,
+  released: Map<Bytes, Bytes>,
+  scheme_of: (Bytes) -> Option<Scheme>,
+) -> Ctors =
+  {
+    ..ctors,
+    released: released,
+    release_rows: released.fold(Map::new(), |m: Map<Bytes, Row>, ty: Bytes, by: Bytes|
+      match scheme_of(by) {
+        Some(sc) -> match sc.ty {
+          TyFn(f) -> m.insert(ty, { atoms: f.effects.atoms, tail: None }),
+          _ -> m,
+        },
+        None -> m,
+      }),
+  }
+
+/// The row letting go of a value of `ty` performs: what the release of each resource it holds
+/// performs, as its type's `LetGo` root lets go of them. Each declared sum's constructors are read
+/// once.
+pub fn release_row(ctors: Ctors, ty: Type) -> Row / {abort.raise} =
+  if ctors.release_rows.len() == 0 { row_empty() } else {
+    let atoms = iterate(
+      { todo: [ty], seen: [], atoms: [] },
+      ctors.sums.fold(256, |n: Int, _: Bytes, cs: List<SumCtor>|
+        cs.fold(n, |m: Int, k: SumCtor| m + 4 * (k.fields.len() + 1))),
+      |w: { todo: List<Type>, seen: List<Bytes>, atoms: List<Atom> }|
+        match w.todo {
+          [] -> Stop(w.atoms),
+          [t, ..rest] -> match t {
+            TyCon(c) -> if over_arg(t) { Continue({ ..w, todo: rest }) } else {
+              match ctors.release_rows.get(c.name) {
+                Some(r) -> Continue({ ..w, todo: rest, atoms: atoms_union(w.atoms, r.atoms) }),
+                None -> {
+                  let args = rest.concat(c.args);
+                  if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
+                    match ctors.sums.get(c.name) {
+                      Some(cs) ->
+                        Continue({
+                          ..w,
+                          todo: cs.fold(args, |acc: List<Type>, k: SumCtor|
+                            acc.concat(ctor_fields_at(k, c.args))),
+                          seen: w.seen.push(c.name),
+                        }),
+                      None -> Continue({ ..w, todo: args }),
+                    }
+                  }
+                },
+              }
+            },
+            TyRecord(fs) -> Continue({ ..w, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
+            TyNominal(n) -> Continue({ ..w, todo: rest.concat(n.fields.map(|f: Field| f.ty)) }),
+            _ -> Continue({ ..w, todo: rest }),
+          },
+        },
+    );
+    { atoms: atoms, tail: None }
+  }
 
 /// Whether a value of `ty` is or holds a resource, which letting it go releases: a value of a type
 /// that states a `release`, or of a sum, record or container that holds one. A type variable may be

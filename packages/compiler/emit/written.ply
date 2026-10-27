@@ -20,7 +20,7 @@ import compiler.emit.keys
 import compiler.emit.keys (RootKey, Written, TypeOp, Reflect, Shown, Digest, Contained, Lower, Lift,
                            Keeping, Opening, root_name, root_text, op_name)
 import compiler.emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of, runtime_object,
-                           holds_resource, ctor_fields_at)
+                           holds_resource, ctor_fields_at, release_row)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.lower.setting (prelude_ctor)
 import compiler.emit.marks (marked_type, marked_key, plain, kept_form, marked)
@@ -1384,7 +1384,7 @@ pub fn let_go_code(
           {
             code: call_of(module, items, [a, int_code(0)]),
             typed: Map::new(),
-            here: [def_of(module, items, [ty, int_type()], unit_type())],
+            here: [def_of(module, items, [ty, int_type()], unit_type(), release_row(ctors, ty))],
           }
         } else {
           match ctors.sums.get(c.name) {
@@ -1433,16 +1433,24 @@ pub fn let_go_code(
       _ -> { code: unit_code(), typed: Map::new(), here: [] },
     },
   };
-  rooted_at(module, key, [ty], unit_type(), {
-    code: Ok(body.code),
-    w: { ..writing(), typed: body.typed },
-    here: body.here,
-  })
+  rooted_at(
+    module,
+    key,
+    [ty],
+    unit_type(),
+    { code: Ok(body.code), w: { ..writing(), typed: body.typed }, here: body.here },
+    release_row(ctors, ty),
+  )
 }
 
 /// `let_go_items#List<T>` over its parameters `a`, lent, and `i`: each item of `a` from place `i`
 /// on let go, by `T`'s own release.
-pub fn let_go_items_code(module: Bytes, key: RootKey, ty: Type) -> WrittenRoot / {abort.raise} = {
+pub fn let_go_items_code(
+  module: Bytes,
+  ctors: Ctors,
+  key: RootKey,
+  ty: Type,
+) -> WrittenRoot / {abort.raise} = {
   let item = match ty {
     TyCon(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type() },
     _ -> unknown_type(),
@@ -1455,11 +1463,18 @@ pub fn let_go_items_code(module: Bytes, key: RootKey, ty: Type) -> WrittenRoot /
   let released = bare(
     NApp({ func: bare(NVar({ name: b"?let_go", slot: None })), args: [slot_code(b"x", 2)] }),
   );
-  rooted_at(module, key, [ty, int_type()], unit_type(), {
-    code: Ok(some_or(got.code, b"x", 2, binder.span, sequence([released, next]), unit_code())),
-    w: binder.w,
-    here: [],
-  })
+  rooted_at(
+    module,
+    key,
+    [ty, int_type()],
+    unit_type(),
+    {
+      code: Ok(some_or(got.code, b"x", 2, binder.span, sequence([released, next]), unit_code())),
+      w: binder.w,
+      here: [],
+    },
+    release_row(ctors, ty),
+  )
 }
 
 // --- Crossings --------------------------------------------------------------------------------
@@ -2552,6 +2567,7 @@ fn rooted_at(
   params: List<Type>,
   answer: Type,
   body: { code: Result<Code, Bytes>, w: Writing, here: List<Def> },
+  row: Row = { atoms: [], tail: None },
 ) -> WrittenRoot / {abort.raise} =
   {
     params: range(0, params.len()).map(|i: Int| {
@@ -2562,7 +2578,7 @@ fn rooted_at(
     code: body.code,
     typed: body.w.typed,
     rows: body.w.rows,
-    here: [def_of(module, key, params, answer)].concat(body.here),
+    here: [def_of(module, key, params, answer, row)].concat(body.here),
   }
 
 /// The name parameter `i` of crossing root `key` is read by.
@@ -2581,15 +2597,21 @@ fn param_name(key: RootKey, i: Int) -> Bytes =
   }
 
 /// The definition a call of root `key`, written in `module`, names: taking `params`, answering
-/// `answer`, written by the emitter.
-fn def_of(module: Bytes, key: RootKey, params: List<Type>, answer: Type) -> Def / {abort.raise} =
+/// `answer`, performing `row`, written by the emitter.
+fn def_of(
+  module: Bytes,
+  key: RootKey,
+  params: List<Type>,
+  answer: Type,
+  row: Row = { atoms: [], tail: None },
+) -> Def / {abort.raise} =
   {
     name: local_root(module, root_text(root_name(key))),
     ret: Some(kind_of(answer).kind),
     ret_ty: TyOpen([]),
-    pure: true,
+    pure: row.atoms.len() == 0,
     arity: params.len(),
-    scheme: Some(monomorphic(fn_type(params, answer, row_empty()))),
+    scheme: Some(monomorphic(fn_type(params, answer, row))),
     witnesses: 0,
     lent: [],
     root: key,
