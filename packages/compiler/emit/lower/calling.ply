@@ -51,6 +51,7 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToB
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read, with_room, laid)
 import compiler.emit.lower.crossing (pending_raised)
+import compiler.emit.lower.strings (range_guarded)
 import compiler.emit.lower.handling (performed)
 import compiler.emit.lower.scalars (let_go)
 import compiler.emit.lower.evidence (Handed, Handing, handed_to, evidenced, handing, handing_filled,
@@ -320,11 +321,28 @@ fn walk_of(cx: Context, d: Defined, at: Span, args: List<Code>) -> Option<Walk> 
       let n = args.len() - 1;
       let runs = match args.at(n) { Some(f) -> runs_here(cx, f, walk_takes(b)), None -> false };
       match if runs { walk_typed(cx, d, at) } else { None } {
-        Some(t) -> if erased(t.held) || t.over.any(erased) { None }
-        else { Some({ by: b, at: n, over: t.over, held: t.held }) },
+        Some(t) -> if erased(t.held) || t.over.any(erased) { None } else {
+          let ranged = b != EntryFolding
+            && (match args.at(0) { Some(c) -> range_ends(cx, c) != None, None -> false });
+          Some({ by: b, at: n, over: t.over, held: t.held, ranged: ranged })
+        },
         None -> None,
       }
     },
+  }
+
+/// The ends a call of the builtin `range` written as `c` takes; none for any other code.
+pub fn range_ends(cx: Context, c: Code) -> Option<List<Code>> / {abort.raise} =
+  match c.node {
+    NApp(a) -> match a.func.node {
+      NVar(f) -> if f.slot == None && f.name == b"range" && a.args.len() == 2
+          && ctor_named(cx.setting, f.name) == None
+          && def_named(cx, f.name) == None
+          && extern_named(cx, f.name) == b"range" { Some(a.args) }
+      else { None },
+      _ -> None,
+    },
+    _ -> None,
   }
 
 /// What `d` does with each item where it is one of the prelude's walks, which a call runs in place
@@ -374,6 +392,18 @@ fn runs_here(cx: Context, f: Code, n: Int) -> Bool / {abort.raise} =
 /// The argument of a call run in place as `how` says that is run rather than lowered as a value.
 pub fn run_at(how: InPlace) -> Option<Int> =
   match how { Known -> None, Stepped -> Some(2), Walked(w) -> Some(w.at) }
+
+/// The argument of a call run in place as `how` says that is a call of `range` whose ends the walk
+/// counts between, which are lowered in its place after the call's other arguments.
+pub fn counted_at(how: InPlace) -> Option<Int> =
+  match how { Walked(w) -> if w.ranged { Some(0) } else { None }, _ -> None }
+
+/// The ends of the range a `ranged` walk counts between, among the arguments `lowered` holds.
+fn range_of(lowered: List<Option<Arg>>, w: Walk) -> Option<{ lo: Arg, hi: Arg }> =
+  match ((lowered.at(w.at + 1), lowered.at(w.at + 2))) {
+    (Some(Some(lo)), Some(Some(hi))) -> Some({ lo: lo, hi: hi }),
+    _ -> None,
+  }
 
 /// What the definition `f` names as a value answers where a walk run in place as `how` says runs it:
 /// its call on the parameters the frame `walk_entered` opened holds, each slot read as a lambda's
@@ -735,32 +765,50 @@ fn walk_entered(
   lowered: List<Option<Arg>>,
   w: Walk,
   at: Span,
-) -> Opened / {abort.raise} =
-  match lowered.at(0) {
-    Some(Some(xs)) -> if rep_of_arg(xs) != RWord {
-      { cx: cx, st: refuse(st, Calling, b"a walk over a list held other than as its word").st }
+) -> Opened / {abort.raise} = {
+  let v = walk_vars(cx, st, w);
+  let read = match ((w.ranged, lowered.at(0), range_of(lowered, w))) {
+    // The range's item at a place is its low end that far on.
+    (true, _, Some(r)) -> if rep_of_arg(r.lo) != RInt {
+      { st: refuse(st, Calling, b"a walk over a range from other than an integer").st, args: [] }
     } else {
-      let v = walk_vars(cx, st, w);
-      let read = match w.by {
+      {
+        st: emitted(
+          opened(v.st),
+          Let({
+            var: v.item,
+            val: Prim({ op: b"add", on: RInt, args: [r.lo, AVar(v.at)] }),
+            at: at,
+            unwind: [],
+          }),
+        ),
+        args: [AVar(v.item)],
+      }
+    },
+    (false, Some(Some(xs)), _) -> if rep_of_arg(xs) != RWord {
+      { st: refuse(st, Calling, b"a walk over a list held other than as its word").st, args: [] }
+    } else {
+      match w.by {
         EntryFolding -> {
           let e = entry_vars(cx, v.st, w);
           entry_read(cx, opened(e.st), v, e.vars, w, at)
         },
         _ -> { st: item_read_into(opened(v.st), xs, AVar(v.at), v.item, at), args: [AVar(v.item)] },
-      };
-      let params = match w.by {
-        Folding -> [AVar(v.held)].concat(read.args),
-        EntryFolding -> [AVar(v.held)].concat(read.args),
-        _ -> read.args,
-      };
-      match f.node {
-        NKnown(_) -> known_entered(cx, read.st, f, params.map(Some), at),
-        NLambda(l) -> lambda_entered(cx, read.st, l, params, true, at),
-        _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, false, at),
       }
     },
-    _ -> { cx: cx, st: refuse(st, Calling, b"a walk over no list").st },
+    _ -> { st: refuse(st, Calling, b"a walk over no list").st, args: [] },
+  };
+  let params = match w.by {
+    Folding -> [AVar(v.held)].concat(read.args),
+    EntryFolding -> [AVar(v.held)].concat(read.args),
+    _ -> read.args,
+  };
+  match f.node {
+    NKnown(_) -> known_entered(cx, read.st, f, params.map(Some), at),
+    NLambda(l) -> lambda_entered(cx, read.st, l, params, true, at),
+    _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, false, at),
   }
+}
 
 /// What a map's walk holds beside a list's walk's, numbered from `st` alike in `entered` and in
 /// `left`: the node it holds and its place there, the leaf and place a pass reads, and the map's
@@ -1227,38 +1275,47 @@ fn walk_left(
       went(h.st, h.arg)
     },
   };
-  match lowered.at(0) {
-    Some(Some(xs)) -> {
-      let ticked = range(0, 2).fold(outside(item), |s: Lowering, _: Int|
-        done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at));
+  // The loop over `n` places, `n` the list's length or how far the range reaches.
+  let looped = |s: Lowering, n: Arg| {
+    let first = match w.by {
+      Folding -> match lowered.at(1) {
+        Some(Some(init)) -> handed({ st: s, arg: init }, v.held.rep, at),
+        _ -> refuse(s, Calling, b"a fold with no first accumulator"),
+      },
+      _ -> with_room(cx, s, w.held, n, at),
+    };
+    let ended = fresh(first.st, bool_type(), RBool);
+    let pass = [
+      Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
+      Let({
+        var: ended.var,
+        val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), n] }),
+        at: at,
+        unwind: [],
+      }),
+      If({ cond: AVar(ended.var), then: [Done(AVar(v.held))], otherwise: item.insts }),
+    ];
+    {
+      st: emitted(
+        ended.st,
+        Loop({ state: [v.at, v.held], init: [AInt(0), first.arg], body: pass, answer: v.answer }),
+      ),
+      arg: AVar(v.answer),
+    }
+  };
+  let ticked = range(0, 2).fold(outside(item), |s: Lowering, _: Int|
+    done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at));
+  match ((w.ranged, lowered.at(0), range_of(lowered, w))) {
+    (true, _, Some(r)) ->
+      range_guarded(cx, ticked, r.lo, r.hi, at, |s: Lowering, lo: Arg, hi: Arg| {
+        let n = bound_as(s, int_type(), RInt, Prim({ op: b"sub", on: RInt, args: [hi, lo] }), at);
+        looped(n.st, n.arg)
+      }),
+    (false, Some(Some(xs)), _) -> {
       let n = length_read(ticked, xs, at);
-      let first = match w.by {
-        Folding -> match lowered.at(1) {
-          Some(Some(init)) -> handed({ st: n.st, arg: init }, v.held.rep, at),
-          _ -> refuse(n.st, Calling, b"a fold with no first accumulator"),
-        },
-        _ -> with_room(cx, n.st, w.held, n.arg, at),
-      };
-      let ended = fresh(first.st, bool_type(), RBool);
-      let pass = [
-        Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
-        Let({
-          var: ended.var,
-          val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), n.arg] }),
-          at: at,
-          unwind: [],
-        }),
-        If({ cond: AVar(ended.var), then: [Done(AVar(v.held))], otherwise: item.insts }),
-      ];
-      {
-        st: emitted(
-          ended.st,
-          Loop({ state: [v.at, v.held], init: [AInt(0), first.arg], body: pass, answer: v.answer }),
-        ),
-        arg: AVar(v.answer),
-      }
+      looped(n.st, n.arg)
     },
-    _ -> refuse(outside(item), Calling, b"a walk over no list"),
+    _ -> refuse(ticked, Calling, b"a walk over no list"),
   }
 }
 
