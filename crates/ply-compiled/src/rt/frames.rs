@@ -26,6 +26,15 @@ pub const FAILED_CANCELLED: i64 = 7;
 /// A raise: `Ctx::aborting` names the `handle` whose clause answers it.
 pub const FAILED_ABORT: i64 = 8;
 
+/// A clause unwinds to the `handle` instance `Ctx::target` names, whose landing reads what the clause
+/// left in it.
+pub const FAILED_TARGET: i64 = 9;
+
+/// An `abort.raise` no frame answers, which `Ctx::pending` keeps for the emitted code that holds the
+/// word answering it: [`rt_pending_raised`] hands it over. One never handed over fails the entry with
+/// the diagnostic it keeps.
+pub const FAILED_PENDING: i64 = 10;
+
 /// The mode a compiled `perform` of a `raise` operation passes, beside 0 for a read and 1 for a
 /// write.
 pub(super) const MODE_RAISE: i64 = 2;
@@ -46,8 +55,6 @@ pub struct HandlerFrame {
     pub(super) clauses: Vec<FrameClause>,
     /// The `return` clause's closure, or zero.
     pub(super) ret: Word,
-    /// A `simulate` region's clause-less frame, answering `task`, `clock`, `random` and `sim`.
-    pub(super) simulate: bool,
     /// For a `handle` resuming off the tail: the detached body whose own stack this frame bottoms.
     pub(super) detached: Option<usize>,
     /// The calls its stack had left when this frame went on, which its `handle` lands with: a
@@ -58,6 +65,9 @@ pub struct HandlerFrame {
     pub(crate) handler: u64,
     /// The handler's variables, from when its body starts.
     pub(super) vars: Option<SharedVars>,
+    /// A task's copy of a frame around its spawn, which no landing of the task's stands for: a
+    /// clause answering through it must return to the perform.
+    pub(super) inherited: bool,
 }
 
 /// A handler's variables, held, each with the type its `handle` gave it: none for one not yet set.
@@ -127,18 +137,6 @@ impl HandlerFrame {
         self.clauses.swap_remove(at)
     }
 
-    pub(super) fn simulate(fuel: i64) -> HandlerFrame {
-        HandlerFrame {
-            clauses: Vec::new(),
-            ret: 0,
-            simulate: true,
-            detached: None,
-            fuel,
-            handler: 0,
-            vars: None,
-        }
-    }
-
     /// The bottom of a detached body's own stack, which starts with the calls its opener had left.
     pub(crate) fn detached(
         clauses: Vec<FrameClause>,
@@ -149,11 +147,11 @@ impl HandlerFrame {
         HandlerFrame {
             clauses,
             ret: 0,
-            simulate: false,
             detached: Some(id),
             fuel,
             handler,
             vars: None,
+            inherited: false,
         }
     }
 
@@ -237,8 +235,13 @@ pub(crate) enum Kept {
     Landing(HandlerFrame),
     /// The raise a `bracket`'s release runs during.
     Raising(Aborting),
+    /// The pending raise a `bracket`'s release runs during, and the failure it carries.
+    Pending(Unanswered, Option<Diagnostic>),
     /// The arguments a clause emitted code made is called with, which it takes as it is entered.
     Args(Vec<Word>),
+    /// A clause of the `handle` of the detached body at this index running, which reads the
+    /// variables of that body's instance.
+    Clause(usize),
 }
 
 impl Kept {
@@ -252,7 +255,8 @@ impl Kept {
             Kept::Raising(a) => {
                 a.into_failure();
             }
-            Kept::Args(_) => {}
+            Kept::Pending(raise, _) => raise.release(),
+            Kept::Args(_) | Kept::Clause(_) => {}
         }
     }
 }
@@ -314,7 +318,9 @@ impl StackCopy {
                 ),
                 Kept::Landing(f) => Kept::Landing(frame(f)),
                 Kept::Raising(a) => Kept::Raising(a.copied()),
+                Kept::Pending(raise, failure) => Kept::Pending(raise.copied(), failure.clone()),
                 Kept::Args(words) => Kept::Args(words.clone()),
+                Kept::Clause(id) => Kept::Clause(*id),
             })
             .collect();
         let held = held
@@ -354,7 +360,7 @@ pub(crate) struct Aborting {
 pub(crate) struct Raised(pub(crate) Vec<Carried>);
 
 impl Raised {
-    fn copied(&self) -> Raised {
+    pub(super) fn copied(&self) -> Raised {
         let ctx = running();
         Raised(self.0.iter().map(|v| v.dup(ctx)).collect())
     }
@@ -395,9 +401,10 @@ pub(crate) struct FrameClause {
     pub(super) resource: Option<Symbol>,
     pub(super) op: Symbol,
     pub(crate) closure: Word,
-    /// 0: never resumes; 1: resumes in tail position; 3: answers a raise, once its `handle`'s body
-    /// is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may resume
-    /// again.
+    /// 0: takes no continuation, its value the operation's answer; 1: resumes in tail position,
+    /// unwinding to its `handle` on a path that does not; 3: answers a raise, once its `handle`'s
+    /// body is abandoned. Off the tail, only in a detached frame: 2 resumes at most once, 4 may
+    /// resume again.
     pub(super) resumes: u8,
     /// `[*t]`: the clause's first slot after the parameters is the label the call site named, lifted
     /// through this `String` type.
@@ -469,14 +476,63 @@ pub(crate) struct Reached {
 }
 
 impl HandlerFrame {
-    /// Whether a branch performing what `reach` lists could reach this frame.
-    pub(super) fn within(&self, reach: &[Reached]) -> bool {
-        self.simulate
-            || self
-                .clauses
-                .iter()
-                .any(|cl| reach.iter().any(|reached| cl.may_answer(reached)))
+    /// Whether a branch performing what `reach` lists could reach a clause of this frame that
+    /// cannot answer it from another thread. Where `crossing` is false nothing of the frame can:
+    /// a frame below it does not cross.
+    pub(super) fn within(&self, reach: &[Reached], crossing: bool) -> bool {
+        self.clauses.iter().any(|cl| {
+            !(crossing && self.crosses(cl)) && reach.iter().any(|reached| cl.may_answer(reached))
+        })
     }
+
+    /// Whether every clause of this frame can answer from another thread.
+    pub(super) fn crosses_whole(&self) -> bool {
+        self.clauses.iter().all(|cl| self.crosses(cl))
+    }
+
+    /// Whether `cl` can answer a perform of a branch running on another thread, in a copy of this
+    /// frame the branch is given: it answers by returning, so it neither unwinds to its `handle`
+    /// nor captures, its frame holds no variables, and its closure is immortal, so the threads count
+    /// nothing of it between them. A clause that resumes `k` may not on every path, and its
+    /// unwind would find no `handle` on the branch's thread.
+    pub(super) fn crosses(&self, cl: &FrameClause) -> bool {
+        self.vars.is_none()
+            && self.detached.is_none()
+            && cl.resumes == 0
+            && !cl.raises()
+            && immortal(cl.closure)
+    }
+
+    /// A copy of the clauses of this frame that cross, for a branch on another thread; none where
+    /// none does. It is never landed: its `handle` is on the thread that runs the block.
+    pub(super) fn crossing_copy(&self) -> Option<HandlerFrame> {
+        let clauses: Vec<FrameClause> = (self.clauses.iter())
+            .filter(|cl| self.crosses(cl))
+            .map(|cl| FrameClause {
+                effect: cl.effect.clone(),
+                resource: cl.resource.clone(),
+                op: cl.op.clone(),
+                closure: cl.closure,
+                resumes: cl.resumes,
+                label: cl.label,
+                string: cl.string,
+            })
+            .collect();
+        (!clauses.is_empty()).then_some(HandlerFrame {
+            clauses,
+            ret: 0,
+            detached: None,
+            fuel: self.fuel,
+            handler: self.handler,
+            vars: None,
+            inherited: false,
+        })
+    }
+}
+
+/// Whether `w` is a block no count is kept of, as a closure that captures nothing is.
+fn immortal(w: Word) -> bool {
+    heap::is_object(w) && unsafe { heap::count_of(obj(w)) } == heap::IMMORTAL
 }
 
 /// `f` again, each closure held once more, and its handler's variables shared with it where
@@ -503,7 +559,6 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
             })
             .collect(),
         ret: f.ret,
-        simulate: f.simulate,
         detached: f.detached,
         fuel: f.fuel,
         handler: f.handler,
@@ -514,32 +569,8 @@ pub(super) fn copied_frame(f: &HandlerFrame, sharing_vars: bool) -> HandlerFrame
                 shared(v.borrow().copied())
             }
         }),
+        inherited: f.inherited,
     }
-}
-
-pub(super) fn copied_frames(list: &[HandlerFrame], sharing_vars: bool) -> Vec<HandlerFrame> {
-    list.iter().map(|f| copied_frame(f, sharing_vars)).collect()
-}
-
-/// A spawned task's copies of the handlers around its spawn, at the bottom of its own stack; none
-/// may name a detached body, whose clause would capture the spawner's stack. They share the
-/// handlers' variables.
-pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
-    copied_frames(list, true)
-        .into_iter()
-        .map(|f| {
-            // The `handle` a copy stands for may be over before the task raises, so a raise the task
-            // does not answer itself leaves for the region's own surroundings instead.
-            let (raises, clauses): (Vec<FrameClause>, Vec<FrameClause>) =
-                f.clauses.into_iter().partition(FrameClause::raises);
-            raises.into_iter().for_each(FrameClause::release);
-            HandlerFrame {
-                clauses,
-                detached: None,
-                ..f
-            }
-        })
-        .collect()
 }
 
 pub(crate) fn drop_frame(f: HandlerFrame) {

@@ -146,10 +146,6 @@ builtins! { $
     CryptoSign = "crypto_sign" (scheme, key, message) -> Raising;
     CryptoVerify = "crypto_verify" (scheme, public, message, signature) -> Raising;
     CryptoAgree = "crypto_agree" (scheme, key, peer) -> Raising;
-    /// `sqlite_run(image, sql, params, reads_only, strict, limits)`: one statement over the
-    /// database an image holds, answering the image it leaves.
-    SqliteRun = "sqlite_run" (image, sql, params, reads_only, strict, limits) -> Word;
-    SqliteFunctions = "sqlite_functions" () -> Word;
     /// `Secret::encode(encoding, bytes)`: the text a credential's bytes are in an encoding, sealed.
     SecretEncode = "Secret::encode" (encoding, bytes) -> Raising;
     /// `Secret::rsa_jwk(n, e, [d, p, q, dp, dq, qi])`: the PKCS #1 document an RSA JSON Web Key's
@@ -589,8 +585,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
         Builtin::CryptoSign => crate::crypto::sign(&args[0], &args[1], &args[2], span),
         Builtin::CryptoVerify => crate::crypto::verify(args, span),
         Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
-        Builtin::SqliteRun => crate::sqlite::run_image(args, span),
-        Builtin::SqliteFunctions => Ok(crate::sqlite::functions()),
     }
 }
 

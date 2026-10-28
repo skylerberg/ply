@@ -24,7 +24,8 @@ import compiler.emit.release (released_vars)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RFlat, Leaf,
                           Var, Arg, AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer,
                           OHandle, Let, Prim, If, Containers, Static)
-import compiler.emit.tir.handling (Unsettled)
+import compiler.emit.tir.handling (Unsettled, Entering)
+import compiler.emit.lower.evidence (value_handing, builtin_row)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew,
                                      ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
                                      ColumnsOfList, ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest,
@@ -32,8 +33,8 @@ import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within
 import compiler.emit.lower.setting (imported_target, qualified, from_import, module_import,
                                     builtin_at, prelude_ctor)
 import compiler.emit.lower.held (held_as, laid_leaves)
-import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, handed, noted, filed,
-                                 unfiled, type_of, as_words, opened, continued)
+import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, done, handed, noted,
+                                 filed, unfiled, type_of, as_words, opened, continued)
 import compiler.emit.lower.base
 import compiler.emit.lower.data (constructed_as)
 import compiler.emit.lower.scalars (operated, runtime_builtin, stated, binary, numeric_in_place,
@@ -42,7 +43,8 @@ import compiler.expand.rewrite (float_function)
 import compiler.emit.statics (laid_at, KnownMap)
 import compiler.emit.tir.statics (StaticDef)
 import compiler.emit.lower.crossing (crossing_builtin, crossed, type_described, over_encoding,
-                                     by_encoding, through_runtime)
+                                     by_encoding, through_runtime, over_machine_words)
+import compiler.emit.lower.kept (kept_builtin, kept_called)
 import compiler.emit.lower.strings
 import compiler.emit.lower.strings (string_builtin)
 
@@ -87,6 +89,7 @@ fn builtin_filed(
         runtime_builtin(cx, st, b, args, at)
       } else if b == b"assert_eq" { asserted(cx, st, args, callee, at) }
       else if b == b"Map::new" && args.len() == 0 { empty_map(cx, st, args, callee, at) }
+      else if kept_builtin(b) { kept_called(cx, st, b, args, callee, at) }
       else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
       else if string_builtin(b) { strings::lowered(cx, st, b, args, callee, at) }
       else if scalar_builtin(b) { operated(cx, st, b, args, at) }
@@ -365,8 +368,8 @@ fn contained(
       } else { numeric_converted(cx, st, args.get(1), t, at) },
       None -> refuse(st, Containers, b"`numeric_of_int` at no type the checker filed"),
     }
-  } else if name == b"Bytes::position" { positioned(cx, st, args, at) }
-  else if name == b"bracket" || name == b"?hold_bracket" { bracketed(cx, st, args, at) }
+  } else if name == b"Bytes::position" { positioned(cx, st, args, callee, at) }
+  else if name == b"bracket" || name == b"?hold_bracket" { bracketed(cx, st, args, callee, at) }
   else if name.starts_with(b"Array::") || name.starts_with(b"Columns::") {
     match f.args.at(0) {
       None ->
@@ -415,9 +418,9 @@ fn unlaid(
       ),
   }
 
-/// A builtin called through the runtime, which must implement it, over its arguments' encoding,
-/// answering the type `f` gives. A hold's builtins are the runtime's natives over the hold
-/// (`held_through`).
+/// A builtin called through the runtime, which must implement it: a shipped module's over machine
+/// words where its types are machine types, and any other over its arguments' encoding, answering
+/// the type `f` gives. A hold's builtins are the runtime's natives over the hold (`held_through`).
 fn called(
   cx: Context,
   st: Lowering,
@@ -436,18 +439,33 @@ fn called(
         refuse(st, Containers, b"a hold's builtin at no type the checker filed: ".concat(name)),
     }
   } else {
-    match builtin_at(cx.setting, filed(cx, callee), name) {
-      Some(_) -> over_encoding(cx, st, name, args, callee, at),
-      None -> match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
-        None ->
-          refuse(
-            st,
-            Containers,
-            b"a builtin called at a type neither filed nor declared: ".concat(name),
-          ),
-        Some(ret) -> through_runtime(cx, st, name, args, ret, at),
-      },
+    match cx.setting.machine.get(name) {
+      Some(call) -> over_machine_words(cx, st, name, call, args, f.ret, callee, at),
+      None -> encoded_called(cx, st, name, args, f, callee, at),
     }
+  }
+
+/// A builtin called through the runtime over its arguments' encoding, answering the type `f` gives.
+fn encoded_called(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  f: Settled,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match builtin_at(cx.setting, filed(cx, callee), name) {
+    Some(_) -> over_encoding(cx, st, name, args, callee, at),
+    None -> match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
+      None ->
+        refuse(
+          st,
+          Containers,
+          b"a builtin called at a type neither filed nor declared: ".concat(name),
+        ),
+      Some(ret) -> through_runtime(cx, st, name, args, ret, at),
+    },
   }
 
 /// A hold's builtin `name` over its one operand, answering `ret`, by the runtime's native over the
@@ -979,22 +997,35 @@ fn column_of(st: Lowering, cs: Arg, k: Int, ty: Type, at: Span) -> Lowered =
 
 /// `Bytes::position(b, from, f)`, a loop in the body rather than the runtime's call, since `f` may
 /// stop for a handler its effects reach and a native's frame cannot resume: the first index found,
-/// `-1` where none is, made the `Option` it answers, `Some` of it or `None`. Reads `b` and `f`.
-fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
+/// `-1` where none is, made the `Option` it answers, `Some` of it or `None`. Reads `b` and `f`, and
+/// hands each call of `f` the descriptor and the words of the row the call at `callee` fills.
+fn positioned(
+  cx: Context,
+  st: Lowering,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
   match args {
     [b, from, f] -> {
       let bw = handed({ st: st, arg: b }, RWord, at);
       let fr = handed({ st: bw.st, arg: from }, RInt, at);
       let fw = handed({ st: fr.st, arg: f }, RWord, at);
+      let words = value_handing(cx, fw.st, builtin_row(cx, callee), at);
       let ty = option_type(int_type());
       let index = bound_as(
-        fw.st,
+        words.st,
         int_type(),
         RInt,
         Op({
           op: OContainer(Position),
-          args: [bw.arg, fr.arg, fw.arg],
-          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+          args: [bw.arg, fr.arg, fw.arg].concat(words.args),
+          uses: {
+            takes: [false, false, false, false, false],
+            owned: true,
+            fails: true,
+            stops: true,
+          },
         }),
         at,
       );
@@ -1021,8 +1052,15 @@ fn positioned(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
 
 /// `bracket(acquire, release, body)`, or a hold's region, which is one: the runtime's
 /// `rt_with_cleanup`, which takes the three closures and counts what it holds across their calls
-/// by the types of what `acquire` and `body` answer.
-fn bracketed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+/// by the types of what `acquire` and `body` answer, and hands each the words of the row they
+/// share, the one the call at `callee` fills, as a call by their type would.
+fn bracketed(
+  cx: Context,
+  st: Lowering,
+  args: List<Arg>,
+  callee: Span,
+  at: Span,
+) -> Lowered / {abort.raise} =
   match args {
     [acquire, release, body] -> match ((type_of(acquire), type_of(body))) {
       (TyFn(a), TyFn(b)) -> {
@@ -1031,8 +1069,17 @@ fn bracketed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / 
         let rw = handed({ st: bw.st, arg: release }, RWord, at);
         let held = type_described(cx, rw.st, a.ret, at);
         let answer = type_described(cx, held.st, b.ret, at);
+        let words = value_handing(cx, answer.st, builtin_row(cx, callee), at);
         let ran = bound_as(
-          answer.st,
+          done(
+            words.st,
+            Op({
+              op: OHandle(Entering),
+              args: words.args,
+              uses: { takes: [false, false], owned: false, fails: false, stops: false },
+            }),
+            at,
+          ),
           b.ret,
           RWord,
           Native({

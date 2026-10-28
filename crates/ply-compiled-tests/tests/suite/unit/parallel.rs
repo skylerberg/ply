@@ -4,7 +4,7 @@
 
 use crate::bare::{context, context_of, helper};
 use ply_compiled::emitted::{Handed, PlyFnDesc};
-use ply_compiled::heap::{HEADER, SHARED, Word};
+use ply_compiled::heap::{HEADER, IMMORTAL, SHARED, Word};
 use ply_compiled::rt::Ctx;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -152,13 +152,28 @@ fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
 /// [`APART`] branches whose site says they may perform `reached` where it names one: how many of
 /// them left the thread `ctx` runs on.
 fn apart_in(ctx: &mut Ctx, clause: Option<(Word, Word)>, reached: Option<(Word, Word)>) -> Word {
+    let clauses: Vec<Clause> = clause
+        .map(|(effect, resource)| (effect, resource, None, 0))
+        .into_iter()
+        .collect();
+    apart_under(ctx, &clauses, reached)
+}
+
+/// A clause of an effect and a resource whose closure is the one named, or else a block of
+/// [`FIRST`] made where it is installed, and which resumes as a `handle` site's table says.
+type Clause = (Word, Word, Option<Word>, Word);
+
+/// [`apart_in`] under a handler of each of `clauses`, the first outermost.
+fn apart_under(ctx: &mut Ctx, clauses: &[Clause], reached: Option<(Word, Word)>) -> Word {
     let c: *mut Ctx = ctx;
     ctx.begin(1_000);
-    let depth = clause.map(|(effect, resource)| {
-        let answers = block(c, &raw const FIRST as Word);
-        let row: [Word; 6] = [effect, resource, effect, answers, 0, 0];
-        unsafe { helper::<Install>("rt_handle_install")(c, row.as_ptr(), 1, 0) }
-    });
+    let depths: Vec<Word> = (clauses.iter())
+        .map(|&(effect, resource, closure, resumes)| {
+            let answers = closure.unwrap_or_else(|| block(c, &raw const FIRST as Word));
+            let row: [Word; 6] = [effect, resource, effect, answers, resumes, 0];
+            unsafe { helper::<Install>("rt_handle_install")(c, row.as_ptr(), 1, 0) }
+        })
+        .collect();
     let mut slots = [0; 2].map(|_| alloc(c, PAIR, &[&raw const APART as Word, c as Word]));
     match reached {
         None => unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) },
@@ -174,7 +189,7 @@ fn apart_in(ctx: &mut Ctx, clause: Option<(Word, Word)>, reached: Option<(Word, 
     for w in slots {
         free(c, w);
     }
-    if let Some(depth) = depth {
+    for depth in depths.into_iter().rev() {
         unsafe { helper::<Land>("rt_handle_land")(c, depth, 0) };
     }
     assert_eq!(ctx.heap.live(), 0, "a branch or a clause was not let go");
@@ -252,6 +267,63 @@ fn a_block_leaves_this_thread_past_every_handler_its_site_says_it_cannot_reach()
         ),
     ] {
         assert_eq!(apart(clause, reached), left, "{when}");
+    }
+}
+
+/// A closure block no count is kept of, as emitted code lays out one that captures nothing.
+#[repr(C, align(8))]
+struct Immortal {
+    rc: u32,
+    desc: &'static PlyFnDesc,
+}
+
+static ANSWERS_ANYWHERE: Immortal = Immortal {
+    rc: IMMORTAL,
+    desc: &FIRST,
+};
+
+/// A clause that answers with its value, of a frame holding no variables, whose closure is
+/// immortal, answers a branch on another thread from a copy of its frame, so a block reaching it
+/// leaves this thread; one that resumes `k`, which may unwind to its `handle` on a path that does
+/// not, or whose closure is counted, keeps the block here, and so does every frame above one that
+/// does not cross, which answers what those frames' clauses perform and raise.
+#[test]
+fn a_block_leaves_this_thread_under_clauses_that_answer_from_any_thread() {
+    if !multicore() {
+        return;
+    }
+    let immortal = &raw const ANSWERS_ANYWHERE as Word;
+    let answering = (HELD, ANY, Some(immortal), 0);
+    for (clauses, reached, left, when) in [
+        (vec![answering], Some((HELD, ANY)), 2, "reaching it"),
+        (vec![answering], None, 2, "reach unsaid"),
+        (
+            vec![(HELD, ANY, Some(immortal), 1)],
+            Some((HELD, ANY)),
+            0,
+            "under one that resumes, which may unwind",
+        ),
+        (
+            vec![(HELD, ANY, None, 0)],
+            Some((HELD, ANY)),
+            0,
+            "under one whose closure is counted",
+        ),
+        (
+            vec![(OTHER, ANY, None, 0), answering],
+            Some((HELD, ANY)),
+            0,
+            "above a frame that does not cross",
+        ),
+        (
+            vec![(OTHER, ANY, Some(immortal), 0), answering],
+            Some((HELD, ANY)),
+            2,
+            "above a frame that crosses",
+        ),
+    ] {
+        let mut ctx = context_of(&["held", "other", "conn", "wire"], Vec::new());
+        assert_eq!(apart_under(&mut ctx, &clauses, reached), left, "{when}");
     }
 }
 

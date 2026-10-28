@@ -29,7 +29,7 @@ import compiler.check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_
                              check_front_with, EmitFacts, Elaboration)
 import compiler.check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder,
                                      LabelSite, TypedSite, TrySite, MemberSite, UpdateShape,
-                                     WitnessOp, WitnessRef, witnessed, Builtin, builtins,
+                                     WitnessOp, WitnessRef, RowSite, witnessed, Builtin, builtins,
                                      ReleaseSite)
 import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key)
@@ -126,6 +126,7 @@ fn joined_facts(g: RootFacts, f: RootFacts) -> RootFacts =
     members: g.members.concat(f.members),
     typed: g.typed.concat(f.typed),
     types: types_joined(g.types, f.types),
+    rows: g.rows.concat(f.rows),
   }
 
 fn gathered(
@@ -187,6 +188,8 @@ pub fn facts_read(
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         typed: f.typed.fold([], |a: List<TypedSite>, x: TypedSite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
+        rows: f.rows.fold([], |a: List<RowSite>, x: RowSite|
+          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
       })
     },
   );
@@ -234,6 +237,7 @@ pub fn facts_read(
         },
         typed: read.facts.typed,
         types: read.facts.types,
+        rows: read.facts.rows,
       }),
   }
 }
@@ -758,41 +762,6 @@ pub fn shipped_dump(d: Dump) -> Dump =
     walked: b"",
   }
 
-/// An operation as a native program carries it: what a handler is bound to and how each argument
-/// reads out of compiled code, and none of the types a compiler checks a call against.
-pub type LinkedOp = {
-  name: Bytes,
-  mode: Bytes,
-  resource_param: Bool,
-  at: ModuleSpan,
-  carries: List<Carry>,
-}
-
-pub type LinkedEffect = {
-  name: Bytes,
-  module: Bytes,
-  simple_name: Bytes,
-  nondet: Bool,
-  ops: List<LinkedOp>,
-  at: ModuleSpan,
-}
-
-/// The answer as a native program carries it. A program runs the one definition it enters, so it
-/// carries that definition's rows and no other's: `entry`, whose row is all the host is bound for,
-/// and `root`, how it is entered. Beside them it carries what a value crossing to the host is read
-/// with, the effects' operations and `ctors`; `digest`, which names the program its unit was emitted
-/// from; and `definitions`, a `name hash` line in name order for each `fn` the entry reaches, which
-/// a process would else walk the hasher's rows for. Its spans' indices run over `modules` modules.
-pub type Linked = {
-  entry: DefRow,
-  root: EmitterRoot,
-  effects: List<LinkedEffect>,
-  ctors: List<EmitterCtor>,
-  digest: Bytes,
-  definitions: Bytes,
-  modules: Int,
-}
-
 type Reaching = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
 
 /// Every name `entry` reaches through what each hashed definition references, itself included. A
@@ -837,38 +806,19 @@ fn definitions_reached(hashes: List<HashFrame>, entry: Bytes) -> Bytes / {abort.
   )
 }
 
-/// `d` as a native program that enters `entry` carries it, its spans' indices over `modules`
-/// modules: none where the program defines no `entry` to enter.
-pub fn linked_of(d: Dump, entry: Bytes, modules: Int) -> Option<Linked> / {abort.raise} =
+/// What a native program that enters `entry` carries of its front end for the launcher: `ply entry
+/// 1`, the definition it enters, and a `name hash` line in name order for each `fn` that one
+/// reaches, which a process would else walk the hasher's rows for. None where the program defines
+/// no `entry` to enter.
+pub fn entry_front(d: Dump, entry: Bytes) -> Option<Bytes> / {abort.raise} =
   match ((
       d.defs.find(|row: DefRow| row.name == entry),
       d.emitter_roots.find(|root: EmitterRoot| root.root == entry),
     )) {
-    (Some(def), Some(root)) ->
-      Some({
-        entry: def,
-        root: root,
-        effects: d.effects.map(|e: EffectRow|
-          {
-            name: e.name,
-            module: e.module,
-            simple_name: e.simple_name,
-            nondet: e.nondet,
-            ops: e.ops.map(|o: OpRow|
-              {
-                name: o.name,
-                mode: o.mode,
-                resource_param: o.resource_param,
-                at: o.at,
-                carries: o.carries,
-              }),
-            at: e.at,
-          }),
-        ctors: d.emitter_ctors,
-        digest: d.hashes_digest,
-        definitions: definitions_reached(d.hashes, entry),
-        modules: modules,
-      }),
+    (Some(_), Some(_)) ->
+      Some(
+        Bytes::concat_all([b"ply entry 1\n", entry, b"\n", definitions_reached(d.hashes, entry)]),
+      ),
     _ -> None,
   }
 
@@ -1713,6 +1663,32 @@ test "a dump within a run keeps every test's root, and keys what it keeps as the
       assert_eq(within.keys.len(), 3);
     },
   }
+}
+
+test "a test's key reads the atoms of the rows it reads, however a set spells them" {
+  let key = |set: Bytes| {
+    let src = Bytes::concat_all([
+      b"effect store {\n  read all[r]() -> List<Int>\n  write save[r](rows: List<Int>) -> Unit\n}\n",
+      set,
+      b"\nfn listed() -> Int / {Web} = store.all[orders]().len()\n",
+      b"test \"listed\" { handle { assert_eq(listed(), 0) } with { store.all[orders]() -> [] } }\n",
+    ]);
+    match analyse(parse_all([{ name: b"m", src: src }])) {
+      Refused(_) -> panic("the program checks"),
+      Analysed(w) ->
+        dump_of(Analysed(w)).keys.filter(|k: KeyRow| k.root == test_owner(b"m", b"listed")).map(
+          |k: KeyRow| k.key,
+        ),
+    }
+  };
+  let narrow = key(b"effect set Web = {store.read[orders], store.write[audit]}");
+  assert_eq(narrow.len(), 1);
+  assert_eq(key(b"effect set Web = {store.write[audit], store.read[orders]}"), narrow);
+  assert(
+    key(b"effect set Web = {store.read[orders], store.write[audit], store.read[inventory]}")
+      != narrow,
+    Some("a widened set left the key of a test that reaches it"),
+  )
 }
 
 test "a builtin is published with its scheme and the names its parameters are documented under" {

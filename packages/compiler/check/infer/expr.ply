@@ -5,18 +5,21 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_acquire, role_hold_acquire_read, role_hold_release,
                                 role_hold_release_read, role_hold_open, role_hold_close,
                                 role_hold_body, role_hold_new_callee, role_hold_take_callee,
-                                role_tag_texts, role_tag_holes, role_var_first_read)
+                                role_hold_acquired, role_hold_release_call, role_hold_close_call,
+                                role_hold_bracket_callee, role_tag_texts, role_tag_holes,
+                                role_var_first_read)
 import std.list (prepend)
-import compiler.syntax.type_syntax (TypeExpr, mode_text, is_raise)
-import compiler.syntax.items (DOrd, member_name, member_of, Opaque)
+import compiler.syntax.type_syntax (TypeExpr, Mode, MRaise, mode_text, is_raise)
+import compiler.syntax.items (DOrd, member_name, member_of, Opaque, is_shipped)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, RaiseName,
                               Stmt, SLet, SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm,
                               HandleClause, ReturnClause, HandlerVar, RecField, expr_span,
                               is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
-                              tagged_filler, call_operator, written_operator, Slot, FromName,
-                              FromDefault, simulated_at, detached_at, branch_at, try_places)
+                              tagged_filler, call_operator, written_operator, is_exit_effect,
+                              exit_op, Slot, FromName, FromDefault, simulated_at, detached_at,
+                              resumed_at, branch_at, try_places)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                                  PBad, Lit, LInt, LFixed, LWide, pat_span, has_or)
 import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -30,9 +33,9 @@ import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, Ty
                              shallow, resolved_tail, solve_continuation_row, free_vars, unify,
                              unify_row, covariant_con, env_push, env_pop, env_bind, env_lookup,
                              env_local, env_depth_of, env_locals, instantiate_with, instantiate,
-                             rename_scheme, region_mark, written_label, leaving_type, label_type,
-                             resolve_atom, atom_text, resource_text, type_text, row_text,
-                             printer_new, print_ty, print_row, TyNominal, record_fields)
+                             rename_scheme, at_arguments, region_mark, written_label, leaving_type,
+                             label_type, resolve_atom, atom_text, resource_text, type_text,
+                             row_text, printer_new, print_ty, print_row, TyNominal, record_fields)
 import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_fix, insertion,
                                       ValueSpace, EffectSpace, lookup, lookup_declared,
                                       error_with_labels, error_at, label_at, backticked,
@@ -57,12 +60,13 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, DefConstraint, NumericI
                                      RigidParam, ConstraintSite, GroupDef, Checker, Assignable,
                                      barred, unbarred, Inferred, WithTy, WithVar, HoleSite, WithRow,
                                      WithName, Expected, WithKey, WithHit, WithResource,
-                                     WithBodyRow, Fill, hold, hold_atom, is_region_effect,
-                                     location_of, module_name, scope_of, report, report_error_at,
-                                     report_error_at_and, err_labels, backticked_text, plural,
-                                     supplied, new_ty, new_ty_var, new_row, new_row_var, resolve,
-                                     resolve_row_in, with_unified, is_prelude_effect, seed_atom,
-                                     abort_atom, builtin_type_arity, ctor_of, effect_of, def_of,
+                                     WithBodyRow, Fill, RowFound, ReadOf, RowOf, AtomOf, FilledOf,
+                                     hold, hold_atom, is_region_effect, location_of, module_name,
+                                     scope_of, report, report_error_at, report_error_at_and,
+                                     err_labels, backticked_text, plural, supplied, new_ty,
+                                     new_ty_var, new_row, new_row_var, resolve, resolve_row_in,
+                                     with_unified, is_prelude_effect, seed_atom, abort_atom,
+                                     builtin_type_arity, ctor_of, effect_of, def_of,
                                      simulated_atoms, mode_eq, lit_type, record_site, record_over,
                                      ord_needs, binder_key)
 import compiler.check.infer.names (value_key, Elsewise, Found, Unnamed, of_language_type,
@@ -208,6 +212,28 @@ fn discharge(
     performs: checker.performs.take(mark).concat(kept).concat(checker.performs.drop(until)),
   }
 }
+
+/// `checker` with a `handle` body's row made to name each operation in `answered`, where the row's
+/// tail is a variable still to solve: what that variable comes to hold, a lambda parameter's row or
+/// a continuation's, is then the `handle`'s to answer rather than passed by. A rigid row variable of
+/// the enclosing definition is never opened, so what reaches the body through it is the caller's.
+fn opened_to_clauses(checker: Checker, row: Row, answered: List<Atom>) -> Checker / {abort.raise} =
+  answered.fold(checker, |c: Checker, a: Atom| {
+    let r = resolve_row_in(c, row);
+    match r.tail {
+      None -> c,
+      Some(v) -> if is_rigid_row(c.subst, v) || atoms_covered(r.atoms, a) { c } else {
+        let o = new_row_var(c);
+        with_unified(
+          o.checker,
+          unify_row(o.checker.subst, o.checker.fresh, row_open(v), {
+            atoms: [a],
+            tail: Some(o.var),
+          }),
+        )
+      },
+    }
+  })
 
 /// The clause's resource covers the performed one: `[*]` is a clause for every label.
 fn key_named(keys: List<OpKey>, atom: Atom) -> Bool =
@@ -549,6 +575,31 @@ fn note_named(checker: Checker, span: Span, ty: Type, args: List<Type>, named: B
       }),
     }
   }
+
+/// What the walk found of the rows at `span`, resolved once the whole program is checked, as a type
+/// noted there is.
+fn note_row(checker: Checker, span: Span, found: RowFound) -> Checker =
+  note_answering(checker, span, found, b"")
+
+/// `note_row` at a handler's clause, which answers the operation `answers`, `effect.op`.
+fn note_answering(checker: Checker, span: Span, found: RowFound, answers: Bytes) -> Checker =
+  if span == dummy_span() { checker } else {
+    {
+      ..checker,
+      rows_at: checker.rows_at.push({
+        module: checker.module,
+        span: span,
+        found: found,
+        owner: checker.walking,
+        answers: answers,
+      }),
+    }
+  }
+
+/// A call at `span` noted with the row of the function type it calls through, `row`, where its
+/// callee is a value rather than a definition.
+fn through_value(checker: Checker, span: Span, source: PerformSource, row: Row) -> Checker =
+  match source { OpaquePerform -> note_row(checker, span, RowOf(row)), _ -> checker }
 
 pub fn settle_bit_ops(checker: Checker) -> Checker / {abort.raise} = {
   let entries = checker.bit_ops;
@@ -1269,7 +1320,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let made: Inferred = {
         // The ownership walk holds a release in the body to the lambda's own row.
         checker: {
-          ..noted,
+          ..note_row(noted, l.span, RowOf(body.row)),
           valued: noted.valued.push({ span: l.span, ty: fn_type(ps.tys, body.ty, body.row) }),
         },
         ty: fn_type(ps.tys, body.ty, body.row),
@@ -1705,7 +1756,11 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
       let o: Inferred = infer(acc.checker, b);
       let j: WithRow = join(o.checker, span, acc.row, o.row);
       {
-        checker: note_typed(j.checker, branch_at(b), fn_type([], o.ty, row_empty()), []),
+        checker: note_row(
+          note_typed(j.checker, branch_at(b), fn_type([], o.ty, row_empty()), []),
+          branch_at(b),
+          RowOf(o.row),
+        ),
         fs: acc.fs.push({ name: b"_".concat(ascii_of_int(i)), ty: o.ty }),
         row: j.row,
         rows: acc.rows.push({ span: expr_span(b), row: o.row }),
@@ -2117,10 +2172,16 @@ fn infer_var(checker: Checker, qname: QName, at: Span) -> Inferred / {abort.rais
         let columned: Checker = if mentions_columns(made) {
           { ..noted, columns: noted.columns.push({ module: noted.module, span: at, ty: made }) }
         } else { noted };
-        let typed: Checker = match env_depth_of(columned.env, key.name) {
-          Some(d) -> if d > 0 { held_read(columned, key.name, at, inst.ty) }
-          else { note_named(columned, at, inst.ty, inst.args, key.name) },
-          None -> note_named(columned, at, inst.ty, inst.args, key.name),
+        let global = match env_depth_of(columned.env, key.name) { Some(d) -> d == 0, None -> true };
+        let typed: Checker = if !global { held_read(columned, key.name, at, inst.ty) } else {
+          let filed: Checker = note_named(columned, at, inst.ty, inst.args, key.name);
+          if inst.rows.len() == 0 { filed } else {
+            note_row(
+              filed,
+              at,
+              ReadOf({ named: key.name, quantified: sc.row_vars, filled: inst.rows }),
+            )
+          }
         };
         { checker: note_labels(typed, at, key.name, ls, inst.ty), ty: inst.ty, row: row_empty() }
       },
@@ -3494,9 +3555,10 @@ fn applied_call(
       { checker: j.checker, ty: fn_.ret, row: j.row }
     } else {
       let source = callee_source(c, func);
+      let through: Checker = through_value(c, span, source, fn_.effects);
       let handed: { checker: Checker, tys: List<Type> } = if builtin == b"bracket" {
-        joined_callbacks(c, span, as_.tys)
-      } else { { checker: c, tys: as_.tys } };
+        joined_callbacks(through, span, as_.tys)
+      } else { { checker: through, tys: as_.tys } };
       let checked: Checker = expect_arguments(
         handed.checker,
         fn_.params,
@@ -3582,7 +3644,13 @@ fn applied_call(
       let ret: WithTy = new_ty(c);
       let eff: WithRow = new_row(ret.checker);
       let want = fn_type(as_.tys, ret.ty, eff.row);
-      let x: Expected = expect(eff.checker, expr_span(func), want, f.ty, b"callee type");
+      let x: Expected = expect(
+        through_value(eff.checker, span, callee_source(eff.checker, func), eff.row),
+        expr_span(func),
+        want,
+        f.ty,
+        b"callee type",
+      );
       let j: WithRow = join(
         repeat_tail(x.checker, eff.row.tail, [], [], span),
         span,
@@ -4039,6 +4107,62 @@ pub fn resolve_op(
   checker: Checker,
   eff: QName,
   ident: Ident,
+) -> { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> } / {abort.raise} =
+  if is_exit_effect(eff.name.name) { exit_resolved(checker, eff) }
+  else { declared_op(checker, eff, ident) }
+
+/// The one raise of an exit effect (`exit_effect`), which carries one type wherever it is
+/// raised and answered: the failure its `?`s leave a `handle` with, which the `?` written around
+/// the `handle` answering it holds to what its function answers.
+fn exit_resolved(checker: Checker, eff: QName) -> WithHit / {abort.raise} = {
+  let key = Bytes::concat_all([ascii_of_int(checker.module), b" ", eff.name.name]);
+  let carried: WithTy = match checker.exit_types.get(key) {
+    Some(t) -> { checker: checker, ty: t },
+    None -> {
+      let o: WithTy = new_ty(checker);
+      { checker: { ..o.checker, exit_types: o.checker.exit_types.insert(key, o.ty) }, ty: o.ty }
+    },
+  };
+  let answer: WithVar = new_ty_var(carried.checker);
+  let at = { module: checker.module, span: eff.span };
+  let op = {
+    name: exit_op(),
+    mode: MRaise,
+    multi: false,
+    resource_param: false,
+    params: [carried.ty],
+    kept: [],
+    ret: TyVar(answer.var),
+    at: at,
+    scheme: Some({
+      ty_vars: [answer.var],
+      row_vars: [],
+      kept_vars: [],
+      multi_vars: [],
+      label_vars: [],
+      ty: fn_type([carried.ty], TyVar(answer.var), row_empty()),
+    }),
+  };
+  {
+    checker: answer.checker,
+    hit: Some({
+      info: {
+        name: eff.name.name,
+        module: b"",
+        simple_name: eff.name.name,
+        nondet: false,
+        ops: [op],
+        at: at,
+      },
+      op: op,
+    }),
+  }
+}
+
+fn declared_op(
+  checker: Checker,
+  eff: QName,
+  ident: Ident,
 ) -> { checker: Checker, hit: Option<{ info: EffectInfo, op: OpInfo }> } / {abort.raise} = {
   let e: WithName = effect_name(checker, eff);
   match e.name {
@@ -4298,7 +4422,45 @@ fn clause_ordered(op_info: OpInfo, shape: OpShape) -> List<Int> / {abort.raise} 
 
 fn op_type(shape: OpShape) -> Type = fn_type(shape.params, shape.ret, row_empty())
 
-fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {abort.raise} = {
+/// The type a value of an operation's own type parameter crosses between its perform and its
+/// clause as, where a shipped module declares the effect: a perform keeps it, and the clause sees
+/// no type variable.
+pub fn kept_type() -> Type = TyCon({ name: b"std.internal.schedule.Kept", args: [] })
+
+/// Whether the toolchain declares effect `info`: the prelude, or a module it ships.
+pub fn shipped_effect(info: EffectInfo) -> Bool = info.module == b"" || is_shipped(info.module)
+
+/// The places, among `op_info`'s own type parameters, of those a value crosses at between a perform
+/// and its clause (`crossing_own`).
+pub fn crossing_vars(op_info: OpInfo) -> List<Int> / {abort.raise} = {
+  let sc = op_scheme(op_info);
+  let named = crossing_own(op_info.params, op_info.ret, op_info.mode, sc.ty_vars);
+  range(0, sc.ty_vars.len()).filter(|i: Int| named.contains(sc.ty_vars.get(i)))
+}
+
+/// Of `own`, the own type parameters of an operation of `mode` taking `params` and answering `ret`,
+/// those a value crosses at between a perform and its clause: each a parameter's type names, or the
+/// answer's where the operation answers.
+pub fn crossing_own(
+  params: List<Type>,
+  ret: Type,
+  mode: Mode,
+  own: List<Int>,
+) -> List<Int> / {abort.raise} = {
+  let fv = params.fold({ tys: [], rows: [] }, |acc: Free, ty: Type|
+    free_vars(subst_new(), ty, acc));
+  let named = if is_raise(mode) { fv } else { free_vars(subst_new(), ret, fv) };
+  own.filter(|v: Int| named.tys.contains(v))
+}
+
+/// A clause for `op_info`, which `info` declares, as it sees the operation: where a shipped module
+/// declares the effect, its own type parameters a value crosses at erased to `kept_type`; every
+/// other own type parameter and row rigid, those a value crosses at noted as filed `Kept`.
+fn instantiate_op_for_clause(
+  checker: Checker,
+  info: EffectInfo,
+  op_info: OpInfo,
+) -> OpShape / {abort.raise} = {
   let sc = op_scheme(op_info);
   let tys: { checker: Checker, vs: List<Int> } = sc.ty_vars.fold(
     { checker: checker, vs: [] },
@@ -4320,11 +4482,50 @@ fn instantiate_op_for_clause(checker: Checker, op_info: OpInfo) -> OpShape / {ab
       }
     },
   );
-  match rename_scheme(sc, tys.vs, rows.vs, []) {
-    TyFn(f) -> { checker: rows.checker, params: f.params, ret: f.ret, row: f.effects },
+  let crossing = crossing_vars(op_info).map(|i: Int| tys.vs.get(i));
+  let shipped = shipped_effect(info);
+  let erased = if shipped { crossing } else { [] };
+  let c = if shipped { rows.checker }
+  else { { ..rows.checker, kept_vars: rows.checker.kept_vars.concat(crossing) } };
+  match at_arguments(
+      rename_scheme(sc, tys.vs, rows.vs, []),
+      erased,
+      [],
+      erased.map(|_: Int| kept_type()),
+    ) {
+    TyFn(f) -> { checker: c, params: f.params, ret: f.ret, row: f.effects },
     _ -> panic("operation schemes are function types"),
   }
 }
+
+/// A clause for `op_info`, which `info` declares, written at `span` in a module the toolchain does
+/// not ship, refused where the toolchain declares the effect and a value crosses at one of the
+/// operation's own type parameters, which the clause would see kept.
+fn crossing_refused(
+  checker: Checker,
+  info: EffectInfo,
+  op_info: OpInfo,
+  span: Span,
+) -> Checker / {abort.raise} =
+  if !shipped_effect(info) || is_shipped(module_name(checker, checker.module))
+      || crossing_vars(op_info).len() == 0 { checker } else {
+    report_error_at(
+      checker,
+      b"E0165",
+      span,
+      Bytes::concat_all([
+        b"`",
+        as_written(checker, info.name),
+        b".",
+        op_info.name,
+        b"` is the toolchain's and generic in its own type parameters, so only a module the toolchain ships answers it",
+      ]),
+      b"a clause for it",
+      [
+        b"a value of such a parameter crosses to the clause kept with its type, which only the toolchain's own modules read",
+      ],
+    )
+  }
 
 /// Whether `x` in `x.name(..)` is a local binding, so the call is one on its value and no perform.
 fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} =
@@ -4356,7 +4557,9 @@ fn infer_perform(
   args: List<Expr>,
 ) -> Inferred / {abort.raise} = {
   // Read ahead for what the arguments are expected to be; an unknown operation is reported below.
-  let wanted = match resolve_op(checker, eff, ident).hit { Some(hit) -> hit.op.params, None -> [] };
+  // An exit effect's carried type is made where it is first read, so it is read once, below.
+  let wanted = if is_exit_effect(eff.name.name) { [] }
+  else { match resolve_op(checker, eff, ident).hit { Some(hit) -> hit.op.params, None -> [] } };
   let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
     checker,
     args,
@@ -4441,7 +4644,11 @@ fn infer_perform(
               args,
               as_.tys,
             );
-            let c1: Checker = record_site(noted, atom, span, DirectPerform);
+            let c1: Checker = note_row(
+              record_site(noted, atom, span, DirectPerform),
+              span,
+              AtomOf(atom),
+            );
             let op_row = resolve_row_in(c1, shape.row);
             let c2: Checker = op_row.atoms.fold(c1, |c: Checker, a: Atom|
               record_site(c, a, span, PerformThroughArgs));
@@ -4604,10 +4811,18 @@ fn infer_handle(
     let o: WithVar = new_row_var(b.checker);
     { checker: o.checker, v: Some(o.var) }
   } else { { checker: b.checker, v: None } };
-  let result_var: { checker: Checker, t: Option<Type> } = if escapes {
-    let o: WithTy = new_ty(cont.checker);
-    { checker: o.checker, t: Some(o.ty) }
-  } else { { checker: cont.checker, t: None } };
+  // With no `return` clause the result is the body's type, known before the clauses read it off `k`.
+  let result_var: { checker: Checker, t: Option<Type> } = if !escapes {
+    { checker: cont.checker, t: None }
+  } else {
+    match ret {
+      None -> { checker: cont.checker, t: Some(b.ty) },
+      Some(_) -> {
+        let o: WithTy = new_ty(cont.checker);
+        { checker: o.checker, t: Some(o.ty) }
+      },
+    }
+  };
   let walked: HandleAcc = clauses.fold(
     {
       checker: result_var.checker,
@@ -4631,7 +4846,11 @@ fn infer_handle(
           match res.resource {
             None -> { ..acc, checker: res.checker },
             Some(resource_) -> {
-              let shape: OpShape = instantiate_op_for_clause(res.checker, hit.op);
+              let shape: OpShape = instantiate_op_for_clause(
+                crossing_refused(res.checker, hit.info, hit.op, clause.span),
+                hit.info,
+                hit.op,
+              );
               if shape.params.len() != clause.params.len() {
                 let bound = clause.params.len();
                 {
@@ -4705,10 +4924,8 @@ fn infer_handle(
                 let whole = raise || (match clause.resume { Some(_) -> true, None -> false });
                 // A clause that resumes or answers a raise answers for the whole `handle`.
                 let result = match result_var.t { Some(t) -> t, None -> shape.ret };
-                let continuation = fn_type([shape.ret], result, match cont.v {
-                  Some(v) -> row_open(v),
-                  None -> row_empty(),
-                });
+                let resumed = match cont.v { Some(v) -> row_open(v), None -> row_empty() };
+                let continuation = fn_type([shape.ret], result, resumed);
                 // The clause runs as a closure of its operation's parameters, then the label and
                 // the continuation it binds, filed where the clause is. Its parameters bind after
                 // the handler's variables, so one of a variable's name is the parameter.
@@ -4761,8 +4978,9 @@ fn infer_handle(
                 ]);
                 let with_resume: Checker = match clause.resume {
                   Some(k) -> {
+                    // A filed type holds no row, so what resuming `k` performs is filed apart.
                     let bound_k: Checker = {
-                      ..with_label,
+                      ..note_row(with_label, resumed_at(clause.span), RowOf(resumed)),
                       env: env_bind(with_label.env, k.name, monomorphic(continuation)),
                     };
                     if !raise { bound_k } else {
@@ -4823,12 +5041,22 @@ fn infer_handle(
                       body_.ty,
                       b"a handler clause returns the operation's result",
                     );
-                    if !x.ok && op_free_vars(hit.op).len() > 0 {
+                    if !x.ok && !shipped_effect(hit.info) && op_free_vars(hit.op).len() > 0 {
                       note_universal_clause(x.checker, hit.info, hit.op)
                     } else { x.checker }
                   },
                 };
-                let j: WithRow = join(checked, span, acc.clause_rows, body_.row);
+                let j: WithRow = join(
+                  note_answering(
+                    checked,
+                    clause.span,
+                    RowOf(body_.row),
+                    Bytes::concat_all([hit.info.name, b".", hit.op.name]),
+                  ),
+                  span,
+                  acc.clause_rows,
+                  body_.row,
+                );
                 {
                   checker: j.checker,
                   // No mode atom stands for a raise, so a clause for one leaves the effect's others be.
@@ -4859,11 +5087,15 @@ fn infer_handle(
       };
       let o: Inferred = infer(bound, rc.body, hint);
       {
-        checker: note_typed(
-          { ..o.checker, env: env_pop(o.checker.env), assignable: around },
+        checker: note_row(
+          note_typed(
+            { ..o.checker, env: env_pop(o.checker.env), assignable: around },
+            rc.span,
+            fn_type([b.ty], o.ty, row_empty()),
+            [],
+          ),
           rc.span,
-          fn_type([b.ty], o.ty, row_empty()),
-          [],
+          RowOf(o.row),
         ),
         ty: o.ty,
         row: o.row,
@@ -4882,18 +5114,19 @@ fn infer_handle(
       ).checker,
     None -> returned.checker,
   };
-  let body_row = resolve_row_in(agreed, b.row);
+  let opened = opened_to_clauses(agreed, b.row, walked.around.map(|c: ClauseSite| c.op));
+  let body_row = resolve_row_in(opened, b.row);
   let remaining = body_row.atoms.filter(|a: Atom|
-    !clause_discharges(agreed, walked.handled, walked.selected, a));
+    !clause_discharges(opened, walked.handled, walked.selected, a));
   // An atom the clauses leave under a handled mode atom runs past this `handle`: refused unless the
   // enclosing definition's written row forwards it to the caller's handler.
   let missing = remaining.filter(|a: Atom|
-    atoms_covered(walked.handled, a) && !atoms_covered(agreed.declared_atoms, a));
-  let sites = resolved_sites(agreed.subst, agreed.performs.drop(mark).take(body_mark - mark));
+    atoms_covered(walked.handled, a) && !atoms_covered(opened.declared_atoms, a));
+  let sites = resolved_sites(opened.subst, opened.performs.drop(mark).take(body_mark - mark));
   let after = clauses.fold(span.start, |acc: Int, cl: HandleClause|
     max(acc, expr_span(cl.body).end));
-  let judged: Checker = if missing.len() == 0 { agreed }
-  else { incomplete(agreed, span, after, sites, walked.handled, walked.selected, missing) };
+  let judged: Checker = if missing.len() == 0 { opened }
+  else { incomplete(opened, span, after, sites, walked.handled, walked.selected, missing) };
   // A refused atom leaves the row with its report, so the signature is not told about it twice.
   let kept = atoms_difference(remaining, missing);
   let discharged: Checker = discharge(
@@ -4917,7 +5150,7 @@ fn infer_handle(
   let j3: WithRow = join(solved, span, j2.row, made.row);
   // What the `handle` answers, and the closure its body runs in where a clause resumes off its tail.
   let typed: Checker = note_typed(
-    note_typed(j3.checker, span, returned.ty, []),
+    note_row(note_typed(j3.checker, span, returned.ty, []), span, RowOf(b.row)),
     detached_at(span),
     fn_type([], b.ty, row_empty()),
     [],
@@ -4957,9 +5190,9 @@ fn named_raise(checker: Checker, name: RaiseName) -> WithHit / {abort.raise} = {
 }
 
 /// The one raise a body's row names, `abort.raise` aside: what can fail on a value raises that, so a
-/// `try` answers it only by name.
+/// `try` answers it only by name. A `?` leaving a `handle` raises no raise a `try` answers.
 fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} = {
-  let raises = row.atoms.filter(|a: Atom| is_raise(a.mode) && a != abort_atom());
+  let raises = row.atoms.filter(tried);
   let found = |a: Atom|
     match effect_of(checker, a.effect) {
       None -> None,
@@ -4984,7 +5217,7 @@ fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} 
         match row.tail {
           Some(_) ->
             [
-              b"what a row variable carries is named by the caller, not here, so it passes through: name the operation, `try[effect.op] { .. }`",
+              b"what a row variable carries is the caller's to answer, so it passes through: to answer a raise here, name it in the row the body is given",
             ],
           None -> [],
         },
@@ -5040,6 +5273,34 @@ fn one_raise(checker: Checker, span: Span, row: Row) -> WithHit / {abort.raise} 
   }
 }
 
+/// `checker` with a named `try`'s refusal where its raise could reach the body only through a rigid
+/// row variable of the enclosing definition: what that variable carries is the caller's to answer.
+fn passing_raise(checker: Checker, span: Span, row: Row, atom: Atom) -> Checker / {abort.raise} =
+  match row.tail {
+    Some(v) -> if atoms_covered(row.atoms, atom) || !is_rigid_row(checker.subst, v) { checker }
+    else {
+      let written = atom_written(checker, atom);
+      report_error_at(
+        checker,
+        b"E0311",
+        span,
+        Bytes::concat_all([b"this `try` answers `", written, b"`, which its body does not raise"]),
+        b"what its body's row variable carries is the caller's to answer",
+        [
+          Bytes::concat_all([
+            b"to answer it here, name it in the row the body is given: `/ {",
+            written,
+            b" | e}`",
+          ]),
+        ],
+      )
+    },
+    None -> checker,
+  }
+
+/// Whether a `try` that names no raise may answer `a`.
+fn tried(a: Atom) -> Bool = is_raise(a.mode) && a != abort_atom() && !is_exit_effect(a.effect)
+
 fn carried_type(params: List<Type>) -> Type / {abort.raise} =
   match params {
     [] -> unit_type(),
@@ -5083,10 +5344,7 @@ fn infer_try_block(
     // is the one report.
     None -> {
       let o: WithTy = new_ty(chosen.checker);
-      let might = match raise {
-        Some(_) -> [],
-        None -> body_row.atoms.filter(|a: Atom| is_raise(a.mode) && a != abort_atom()),
-      };
+      let might = match raise { Some(_) -> [], None -> body_row.atoms.filter(tried) };
       {
         checker: discharge(o.checker, mark, body_mark, might),
         ty: TyCon({ name: b"Result", args: [b.ty, o.ty] }),
@@ -5100,7 +5358,9 @@ fn infer_try_block(
         mode: hit.op.mode,
         op: Some(hit.op.name),
       };
-      let c: Checker = chosen.checker;
+      let opened = opened_to_clauses(chosen.checker, b.row, [atom]);
+      let answered_row = resolve_row_in(opened, b.row);
+      let c: Checker = passing_raise(opened, span, answered_row, atom);
       let carried = carried_type(hit.op.params);
       let result = TyCon({ name: b"Result", args: [b.ty, carried] });
       // The `handle` the `try` is written out as, typed where its parts will stand.
@@ -5118,21 +5378,26 @@ fn infer_try_block(
         |acc: Checker, p: { span: Span, ty: Type, args: List<Type> }|
           note_typed(acc, p.span, p.ty, p.args),
       );
+      // The clauses it is written out with only answer, so they perform nothing.
+      let rowed: Checker = [at.ret, at.clause].fold(
+        note_row(typed, span, RowOf(b.row)),
+        |acc: Checker, clause: Span| note_row(acc, clause, RowOf(row_empty())),
+      );
       let filed: Checker = {
-        ..typed,
-        try_sites: typed.try_sites.push({
-          module: typed.module,
+        ..rowed,
+        try_sites: rowed.try_sites.push({
+          module: rowed.module,
           site: span.site,
           effect: hit.info.name,
           op: hit.op.name,
           arity: hit.op.params.len(),
-          owner: typed.walking,
+          owner: rowed.walking,
         }),
       };
       {
         checker: discharge(filed, mark, body_mark, [atom]),
         ty: result,
-        row: { atoms: body_row.atoms.filter(|a: Atom| a != atom), tail: body_row.tail },
+        row: { atoms: answered_row.atoms.filter(|a: Atom| a != atom), tail: answered_row.tail },
       }
     },
   }
@@ -5471,7 +5736,11 @@ fn infer_with_hold(
         entering.row,
         b.row,
       );
-      { checker: j.checker, ty: b.ty, row: j.row }
+      {
+        checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
+        ty: b.ty,
+        row: j.row,
+      }
     },
     None -> {
       let opened: Checker = open_region(entering.checker, resource.name, label, resource.span);
@@ -5509,10 +5778,40 @@ fn infer_with_hold(
         entering.row,
         row_without_covered(resolve_row_in(recorded, b.row), handled),
       );
-      { checker: j.checker, ty: leaving_type(resolve(j.checker, b.ty), label), row: j.row }
+      {
+        checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
+        ty: leaving_type(resolve(j.checker, b.ty), label),
+        row: j.row,
+      }
     },
   }
 }
+
+/// `checker` with what the closures the hold at `span` is written out as perform filed where they
+/// are written, and the calls through them: the acquire and the open performing `acquired`, the
+/// release and the close `released`, and the body `body`; and its bracket filled with `all`, the row
+/// the three share.
+fn hold_rowed(
+  checker: Checker,
+  span: Span,
+  acquired: Row,
+  released: Row,
+  body: Row,
+  all: Row,
+) -> Checker =
+  [
+    { role: role_hold_acquire(), row: acquired },
+    { role: role_hold_open(), row: acquired },
+    { role: role_hold_acquired(), row: acquired },
+    { role: role_hold_release(), row: released },
+    { role: role_hold_release_call(), row: released },
+    { role: role_hold_close(), row: released },
+    { role: role_hold_close_call(), row: released },
+    { role: role_hold_body(), row: body },
+  ].fold(
+    note_row(checker, minted(span, role_hold_bracket_callee()), FilledOf([all])),
+    |c: Checker, x: { role: Int, row: Row }| note_row(c, minted(span, x.role), RowOf(x.row)),
+  )
 
 /// `checker` with the closures the hold at `span` is written out as filed where they are written,
 /// and the reads inside them: the acquire answering `held` and the release taking it; the open
@@ -5607,8 +5906,13 @@ fn infer_simulate(
     }),
   };
   let seed = seed_atom();
+  // The body is filed with what it performs, which the region hands it the words of.
   let recorded: Checker = record_site(
-    note_typed(noted, simulated_at(span), fn_type([], b.ty, row_empty()), []),
+    note_row(
+      note_typed(noted, simulated_at(span), fn_type([], b.ty, row_empty()), []),
+      simulated_at(span),
+      RowOf(b.row),
+    ),
     seed,
     span,
     DirectPerform,

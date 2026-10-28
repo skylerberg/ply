@@ -1,6 +1,7 @@
 //! Where the fields of the context and of the descriptors emitted code lays out lie, and where a
-//! hold keeps what it holds: what the runtime's description reports, each read off the constant or
-//! the type the runtime's own code uses.
+//! hold keeps what it holds, in the order a released `ply`'s bootstrap compares them with its own:
+//! what the runtime's JSON description reports, each read off the constant or the type the
+//! runtime's own code uses.
 
 use crate::emitted::{PlyFnDesc, PlyOp, PlyType};
 use crate::frames::PlyFrame;
@@ -32,7 +33,8 @@ macro_rules! fields {
     };
 }
 
-/// The fields of the context compiled code reads and writes itself, in the context's order.
+/// The fields of the context a released `ply`'s code reads and writes itself, in the context's
+/// order; a field this `ply`'s code reads anew is `c::described`'s alone.
 pub fn ctx_fields() -> Vec<Field> {
     fields!(Ctx: failed, fuel, stack_floor, site_root, site_start, site_end, ticks, next_tick,
         frames, release_depth, release_waiting)

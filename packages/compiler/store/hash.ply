@@ -23,7 +23,8 @@ import std.option
 import std.bytes
 import std.string
 import compiler.check.infer.checker (MemberSite)
-import compiler.store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode, Index)
+import compiler.store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode, Index,
+                                  owner_type)
 import compiler.store.hash.encoding (hex, Choice, Called, Found, Pick, Waiting)
 import compiler.store.hash.template (site_key, called_at, choice_of, test_template, law_template,
                                      spec_template, type_template, new_encoder)
@@ -494,20 +495,22 @@ fn with_spec_refs(index: Index, node: Node, own: List<Int>) -> List<Int> / {abor
     _ -> own,
   }
 
-/// `own` is what normalizing the node alone references.
+/// `own` is what normalizing the node alone references. A function of a type leads to the type,
+/// which it cannot be declared without.
 fn node_edges(index: Index, node: Node, own: List<Int>) -> List<Int> / {abort.raise} =
   match node.body {
     NodeFn(d) -> {
       let clauses = with_spec_refs(index, node, own);
       let defaults = d.params.fold([], |acc: List<Expr>, param: Param|
         match param.default { Some(x) -> acc.push(x), None -> acc });
-      clauses.concat(
+      let edges = clauses.concat(
         ret_refs(
           index,
           node.module,
           defaults.concat(d.spec.map(|clause: SpecClause| clause.expr)).push(d.body),
         ),
-      )
+      );
+      match owner_type(index, node) { Some(t) -> edges.push(t), None -> edges }
     },
     _ -> own,
   }
@@ -766,6 +769,20 @@ test "a program read with every node, test and law fixed as a fresh run fixed it
   assert_eq(held.unused, [])
 }
 
+test "a type named only as the owner of a function something calls is used, and one of an uncalled function is not" {
+  let src = b"type Tally = | Tally\nfn Tally::made() -> Int = 1\nfn Tally::idle() -> Int = 2\ntype Lone = | Lone\nfn Lone::made() -> Int = 3\npub fn f() -> Int = Tally::made()\n";
+  assert_eq(unused(indexed([{ name: b"m", src: src }])).map(|d: Diag| d.message), [
+    b"fn `m.Tally::idle` is never used",
+    b"type `m.Lone` is never used",
+    b"fn `m.Lone::made` is never used",
+  ])
+}
+
+test "a type named only as the owner of an extern function something calls is used" {
+  let src = b"extern type Spelt\nextern fn Spelt::of(b: Bytes) -> String\npub fn f(b: Bytes) -> String = Spelt::of(b)\n";
+  assert_eq(unused(indexed([{ name: b"std.spelling", src: src }])).map(|d: Diag| d.message), [])
+}
+
 test "renaming a definition does not move its hash, and a change to a callee does" {
   let a = hash_dump([
     { name: b"m", src: b"fn helper(x: Int) -> Int = x + 1\nfn f() -> Int = helper(1)" },
@@ -1011,6 +1028,27 @@ test "a listing reaches what its table and label do, and nothing only a case run
   // The test itself reaches all of it.
   let run = reached_functions(h, [TheItem(b"m.case {name_of(n)}")]).keys();
   assert(run.contains(b"m.heavy") && run.contains(b"m.table"), None)
+}
+
+test "a unit offering a test holds the scheduler's functions wherever the load holds the scheduler, which a region calls though no reference names them" {
+  let scheduler = {
+    name: b"std.internal.schedule",
+    src: b"pub fn simulated(n: Int) -> Int = nested(n)\nfn nested(n: Int) -> Int = n\n",
+  };
+  let program = {
+    name: b"m",
+    src: b"fn three() -> Int = 3\ntest \"x\" {\n  let r = simulate { three() };\n  assert_eq(r, 3)\n}\n",
+  };
+  let scheduled = [b"std.internal.schedule.nested", b"std.internal.schedule.simulated"];
+  let held = |reached: Map<Bytes, Bool>| scheduled.filter(|n: Bytes| reached.contains(n));
+  let h = hash_index(indexed([program, scheduler]));
+  assert_eq(held(reached_functions(h, [TheItem(b"m.x")])), scheduled);
+  assert_eq(held(listing_reach(h, [b"m.x"])), scheduled);
+  assert(reached_functions(h, [TheItem(b"m.x")]).contains(b"m.three"), None);
+  // A load that holds no scheduler offers nothing of one.
+  assert_eq(reached_functions(hash_index(indexed([program])), [TheItem(b"m.x")]).keys(), [
+    b"m.three",
+  ])
 }
 
 test "a function is reached through itself, never through a type or an effect of its name" {

@@ -36,17 +36,49 @@ pub struct Ctx {
     pub release_depth: i64,
     /// How many releases wait in the context's buffer for the outermost drop root to drain them.
     pub release_waiting: i64,
+    /// The `handle` instance a [`FAILED_TARGET`] failure unwinds to, which its landing compares
+    /// with its own. Compiled code reads and writes it, as it does the three below.
+    pub target: Word,
+    /// The row descriptor and words the next closure the runtime calls is handed by its uniform
+    /// entry, which takes them and sets both to 0; 0 for none, which hands it the frame bridge.
+    pub entering_desc: Word,
+    pub entering_words: Word,
+    /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
+    /// test reads what its entries performed, a cost mark is open or a seeded region runs.
+    pub recording: i64,
+    /// The evidence object of every effect that hands each operation to the frame protocol
+    /// ([`BRIDGE`]), for code that holds no word answering one.
+    pub bridge: Word,
+    /// What an entry hands its root for an effect the Rust binding serves ([`HOSTED`]) and for one
+    /// nothing answers ([`UNSERVED`]).
+    pub hosted: Word,
+    pub unserved: Word,
+    /// Where the perform a clause answers stood, as the site fields hold one, which compiled code
+    /// stores as it enters the clause: what a region's request is placed at.
+    pub performed_root: i64,
+    pub performed_start: i64,
+    pub performed_end: i64,
+    /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
+    /// which only that task may leave.
+    pub task: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
+    /// The fuel this entry began with: how deeply its calls may nest.
+    pub(super) depth_bound: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
     /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
     pub charged: Cost,
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
     pub grown: u64,
+    /// The costs as the program last left them for the scheduler's work, which it goes on from.
+    pub(crate) left_at: ProgramCost,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) time_budget_ms: u64,
+    /// The tick at which the clock is next read. Calls the program makes and calls the scheduler
+    /// makes both bring it nearer, however often each gives way to the other.
+    pub(super) clock_at: i64,
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     pub(super) last_entry: usize,
@@ -62,8 +94,6 @@ pub struct Ctx {
     pub performed: Vec<EffectAtom>,
     /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
     pub(crate) cost_marks: Vec<CostMark>,
-    /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
-    pub sims: Vec<crate::simulate::Simulation>,
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -72,12 +102,10 @@ pub struct Ctx {
     pub(crate) entry: u64,
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_core::HostBinding>,
-    /// The program this context's entries run, whose declarations say how a host operation's
-    /// arguments read; `None` for one entered without its program's answer.
-    pub(crate) program: Option<Arc<ply_core::Analysis>>,
     pub(crate) runtime: Option<Rc<dyn ply_core::HostRuntime>>,
-    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of.
-    pub(crate) runtime_factory: Option<ply_core::RuntimeFactory>,
+    /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of:
+    /// the bound run's, or one over a host of this context's own.
+    pub(crate) runtime_factory: ply_core::RuntimeFactory,
     pub(crate) declared: Option<ply_core::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
@@ -92,13 +120,28 @@ pub struct Ctx {
     /// The seed the driver set, and the step budget, for the regions this entry opens.
     pub(crate) seed: ply_core::Seed,
     pub(crate) sim_steps: u32,
-    pub(crate) trail: ply_core::region::Trail,
-    /// What the entry's regions did, for the search, once the last one has completed.
-    pub record: Option<ply_core::region::Record>,
     pub(crate) entered_sims: u32,
+    /// The regions `std.internal.schedule` opened on this context, innermost last, which a bracket
+    /// shields its running task in and a seeded step records what it touched for.
+    pub(crate) regions: Vec<(*mut crate::tasks::Region, [i64; 3])>,
+    /// What the running seeded step touched, each beside where it was made.
+    pub footprint: Vec<(crate::tasks::Touched, [i64; 3])>,
+    /// The trail the entry's last seeded region left, and the interleaving its regions took, each as
+    /// the scheduler wrote it.
+    pub(crate) trail_kept: Option<Vec<u8>>,
+    /// What the run held as its root's body returned, where the run's region noted it.
+    pub(crate) held_at_root: Option<crate::entry::Held>,
+    pub interleaving: Option<Vec<u8>>,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
     pub(crate) aborting: Option<Aborting>,
+    /// The raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
+    pub(crate) pending: Option<Unanswered>,
+    /// The words of the raise `rt_pending_raised_at` last handed compiled code, with a word to
+    /// spare past them, as a perform's arguments have.
+    pub(crate) pending_words: Vec<Word>,
+    /// Whether whoever runs this context's entries reads what they performed.
+    pub(crate) traced: bool,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     pub(super) resumed: Option<Word>,
     /// How many `handle`s this context has installed, which names the next one's frame.
@@ -118,6 +161,53 @@ pub struct Ctx {
     pub(crate) taken: Vec<u8>,
     /// The context running on this thread when this one's entry began, put back when it ends.
     pub(super) outer_running: *mut Ctx,
+}
+
+/// How a `parallel` branch failed, as its parent fails in turn.
+pub(crate) struct BranchFailure {
+    code: i64,
+    diagnostic: Option<Diagnostic>,
+    pending: Option<Unanswered>,
+}
+
+/// A raise no frame answers, left for the code around the failure, whose innermost `handle`
+/// answering it takes it: `abort.raise` of a message, or another raise with what it carries.
+pub(crate) enum Unanswered {
+    Abort(String),
+    Raised {
+        effect: Symbol,
+        op: Symbol,
+        args: Raised,
+    },
+}
+
+impl Unanswered {
+    /// Lets go of what the raise carries.
+    pub(crate) fn release(self) {
+        if let Unanswered::Raised { args, .. } = self {
+            args.release();
+        }
+    }
+
+    /// The same raise, what it carries held once more.
+    pub(crate) fn copied(&self) -> Unanswered {
+        match self {
+            Unanswered::Abort(message) => Unanswered::Abort(message.clone()),
+            Unanswered::Raised { effect, op, args } => Unanswered::Raised {
+                effect: effect.clone(),
+                op: op.clone(),
+                args: args.copied(),
+            },
+        }
+    }
+
+    /// Whether `clause` answers this raise.
+    pub(super) fn answered_by(&self, clause: &FrameClause) -> bool {
+        match self {
+            Unanswered::Abort(_) => clause.answers_raise("abort", "raise"),
+            Unanswered::Raised { effect, op, .. } => clause.answers_raise(effect, op),
+        }
+    }
 }
 
 thread_local! {
@@ -162,10 +252,24 @@ impl Ctx {
             frames: std::ptr::null_mut(),
             release_depth: 0,
             release_waiting: 0,
+            target: 0,
+            entering_desc: 0,
+            entering_words: 0,
+            recording: 0,
+            bridge: object_word(&BRIDGE),
+            hosted: object_word(&HOSTED),
+            unserved: object_word(&UNSERVED),
+            performed_root: -1,
+            performed_start: 0,
+            performed_end: 0,
+            task: 0,
             step_budget: 0,
+            depth_bound: 0,
             grown: 0,
+            left_at: ProgramCost::default(),
             deadline: None,
             time_budget_ms: 0,
+            clock_at: i64::MAX,
             heap: Heap::new(),
             last_entry: 0,
             tables,
@@ -175,14 +279,12 @@ impl Ctx {
             current: 0,
             performed: Vec::new(),
             cost_marks: Vec::new(),
-            sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
-            binding: Arc::new(ply_core::HostBinding::hermetic()),
-            program: None,
+            binding: Arc::new(ply_core::HostBinding::unbound()),
             runtime: None,
-            runtime_factory: None,
+            runtime_factory: ply_host::registry::unbound(),
             declared: None,
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
@@ -193,11 +295,17 @@ impl Ctx {
             teardown: Vec::new(),
             seed: ply_core::Seed::default(),
             sim_steps: ply_core::sim::DEFAULT_STEPS,
-            trail: ply_core::region::Trail::new(ply_core::Seed::default()),
-            record: None,
             entered_sims: 0,
+            regions: Vec::new(),
+            footprint: Vec::new(),
+            trail_kept: None,
+            held_at_root: None,
+            interleaving: None,
             unwind: None,
             aborting: None,
+            pending: None,
+            pending_words: Vec::new(),
+            traced: false,
             resumed: None,
             handlers_made: 0,
             holds_made: 0,
@@ -270,6 +378,7 @@ impl Ctx {
     pub(crate) fn branch(&self) -> Ctx {
         let mut b = Ctx::new(Arc::clone(&self.tables));
         b.fuel = self.fuel;
+        b.depth_bound = self.depth_bound;
         // Zero is no bound, so a budget spent to the last call stays a bound of one.
         b.step_budget = if self.step_budget > 0 {
             (self.step_budget - self.ticks).max(1)
@@ -281,14 +390,63 @@ impl Ctx {
         b.arm_tick();
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
-        b.runtime_factory = self.runtime_factory.clone();
-        b.program = self.program.clone();
+        b.runtime_factory = Arc::clone(&self.runtime_factory);
         b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
         b.id = self.id;
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
+        // A branch runs in the task its block is in.
+        b.task = self.task;
+        b.stacks[0].list = self.crossing_frames();
+        // What a branch performed is this entry's, read wherever this entry's is.
+        b.traced = self.recording != 0;
+        b.rearm_recording();
         b
+    }
+
+    /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
+    /// its entries, a cost mark, or a seeded region's steps. A production region reads none.
+    pub(crate) fn rearm_recording(&mut self) {
+        let seeded = (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
+        self.recording = i64::from(self.traced || !self.cost_marks.is_empty() || seeded);
+    }
+
+    /// Whoever runs this context's entries reads what they perform, or stops reading it.
+    pub fn trace_performs(&mut self, traced: bool) {
+        self.traced = traced;
+        self.rearm_recording();
+    }
+
+    /// The frames in reach of the running stack, outermost first, each with whether its clauses
+    /// may answer from another thread at all: only where every frame below it crosses whole, since
+    /// what a clause performs and raises is answered below it.
+    fn frames_in_reach(&self) -> Vec<(&HandlerFrame, bool)> {
+        let mut chain = Vec::new();
+        let mut stack = Some(self.current);
+        while let Some(s) = stack {
+            chain.push(s);
+            stack = self.stacks[s].parent;
+        }
+        let mut below_crosses = true;
+        let mut frames = Vec::new();
+        for s in chain.into_iter().rev() {
+            for f in &self.stacks[s].list {
+                frames.push((f, below_crosses));
+                below_crosses &= f.crosses_whole();
+            }
+        }
+        frames
+    }
+
+    /// Copies of what the frames in reach of the running stack answer from another thread,
+    /// outermost first, as a branch's own stack holds them.
+    fn crossing_frames(&self) -> Vec<HandlerFrame> {
+        self.frames_in_reach()
+            .into_iter()
+            .filter(|(_, crossing)| *crossing)
+            .filter_map(|(f, _)| f.crossing_copy())
+            .collect()
     }
 
     /// Takes back what a finished branch did, in the order the branches are written: its memory,
@@ -309,28 +467,21 @@ impl Ctx {
     }
 
     /// Whether a `parallel` block's branches may run on other threads: nothing they perform can then
-    /// reach a handler this entry holds, a region's scheduler or this thread's host runtime, all of
-    /// which live on this thread. `reach` is every operation the branches may perform that they do
-    /// not answer themselves, where the block's site knows it; a block that does not is kept from any
-    /// handler at all.
+    /// reach a handler this entry holds or this thread's host runtime, which live on this thread,
+    /// and no seeded region records their steps. A branch performs no `task` operation, and one
+    /// that waits waits on its own thread, so the run's region keeps no block in turn. `reach` is
+    /// every operation the branches may perform that they do not answer themselves, where the
+    /// block's site knows it; a block that does not is kept from any handler at all.
     pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
-        // A reactor this thread holds and no factory could make again belongs to this thread alone.
-        if !self.sims.is_empty() || (self.runtime.is_some() && self.runtime_factory.is_none()) {
+        if (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() }) {
             return false;
         }
-        let mut stack = Some(self.current);
-        while let Some(s) = stack {
-            let frames = &self.stacks[s].list;
-            let held = match reach {
-                Some(reach) => frames.iter().any(|f| f.within(reach)),
-                None => !frames.is_empty(),
-            };
-            if held {
-                return false;
-            }
-            stack = self.stacks[s].parent;
-        }
-        true
+        self.frames_in_reach()
+            .into_iter()
+            .all(|(f, crossing)| match reach {
+                Some(reach) => !f.within(reach, crossing),
+                None => f.crosses_whole(),
+            })
     }
 
     /// The calls left before this entry's budget is spent, or `None` when nothing bounds it.
@@ -339,12 +490,15 @@ impl Ctx {
     }
 
     /// Fails this entry as one of its `parallel` branches failed.
-    pub(crate) fn fail_from_branch(&mut self, code: i64, diagnostic: Option<Diagnostic>) {
+    pub(crate) fn fail_from_branch(&mut self, f: BranchFailure) {
         if self.failed == 0 {
-            self.failed = code;
+            self.failed = f.code;
+            self.pending = f.pending;
+        } else if let Some(p) = f.pending {
+            p.release();
         }
         if self.diagnostic.is_none() {
-            self.diagnostic = diagnostic;
+            self.diagnostic = f.diagnostic;
         }
     }
 
@@ -354,15 +508,23 @@ impl Ctx {
         self.tick();
     }
 
-    /// Between calls, and only between calls.
+    /// Between calls, and only between calls, bounded as this thread's entries are.
     pub fn begin(&mut self, fuel: i64) {
+        self.begin_bounded(fuel, step_budget(), time_budget_ms());
+    }
+
+    /// [`Ctx::begin`], the entry bounded by `steps` calls and `time_budget_ms` of wall clock, 0
+    /// for no bound.
+    pub fn begin_bounded(&mut self, fuel: i64, steps: i64, time_budget_ms: u64) {
         self.failed = 0;
         self.fuel = fuel;
+        self.depth_bound = fuel;
         self.ticks = 0;
         self.charged = Cost::default();
-        self.step_budget = step_budget();
+        self.step_budget = steps.max(0);
         self.grown = 0;
-        self.time_budget_ms = time_budget_ms();
+        self.heap.scheduling = false;
+        self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
         });
@@ -378,18 +540,27 @@ impl Ctx {
         self.current = 0;
         self.performed.clear();
         self.cost_marks.clear();
-        self.sims.clear();
         self.starting_detached = None;
-        self.trail = ply_core::region::Trail::new(self.seed.clone());
-        self.record = None;
         self.entered_sims = 0;
+        self.regions.clear();
+        self.footprint.clear();
+        self.trail_kept = None;
+        self.held_at_root = None;
+        self.interleaving = None;
         self.handlers_made = 0;
         self.holds_made = 0;
         self.unwind = None;
         self.aborting = None;
+        if let Some(p) = self.pending.take() {
+            p.release();
+        }
         self.resumed = None;
         self.release_depth = 0;
         self.release_waiting = 0;
+        self.target = 0;
+        self.entering_desc = 0;
+        self.entering_words = 0;
+        self.rearm_recording();
         self.release_later.clear();
         self.crossings.clear();
         self.taken.clear();
@@ -411,10 +582,17 @@ impl Ctx {
     /// When compiled code must call back next: the call one past the budget, the end of this
     /// chunk, or never, when the entry is bounded by neither the budget nor a clock.
     pub(super) fn arm_tick(&mut self) {
-        let chunk = self.ticks.saturating_add(TICK_CHUNK);
-        self.next_tick = match (self.step_budget > 0, self.deadline.is_some()) {
-            (true, _) => self.step_budget.saturating_add(1).min(chunk),
-            (false, true) => chunk,
+        self.clock_at = self.ticks.saturating_add(TICK_CHUNK);
+        self.arm_tick_in_chunk();
+    }
+
+    /// [`Ctx::arm_tick`] where the program gives way to the scheduler or takes over from it: the
+    /// clock is read where it was to be.
+    pub(super) fn arm_tick_in_chunk(&mut self) {
+        let budgeted = self.step_budget > 0 && !self.heap.scheduling;
+        self.next_tick = match (budgeted, self.deadline.is_some()) {
+            (true, _) => self.step_budget.saturating_add(1).min(self.clock_at),
+            (false, true) => self.clock_at,
             (false, false) => i64::MAX,
         };
     }
@@ -423,7 +601,7 @@ impl Ctx {
     /// when to call back. Both bounds are decided here, so a call itself costs one increment and
     /// one compare, and the clock is read once every [`TICK_CHUNK`] calls rather than on any.
     pub(super) fn tick(&mut self) {
-        if self.step_budget > 0 && self.ticks > self.step_budget {
+        if self.step_budget > 0 && !self.heap.scheduling && self.ticks > self.step_budget {
             let budget = self.step_budget;
             let d = Diagnostic::error(
                 codes::STEP_BUDGET,
@@ -451,20 +629,27 @@ impl Ctx {
         self.arm_tick();
     }
 
-    /// The other end of [`Ctx::begin`]: the entry gives back what it used.
-    pub fn end(&mut self) {
-        // A region left open lets go of the values its tasks passed while the entry's heap lives.
-        drop(std::mem::take(&mut self.sims));
-        crate::detached::teardown(self);
-        debug_assert!(
-            self.release_later.is_empty() && self.release_depth == 0,
-            "an entry ended with a release still running or waiting"
-        );
+    /// The thread's heap, poison site and running context put back as they were when this entry
+    /// began: what [`Ctx::end`] does first, and all a Rust unwind out of the entry can do.
+    pub(crate) fn give_thread_back(&mut self) {
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         swap_running(self.outer_running);
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.outer_running = std::ptr::null_mut();
+    }
+
+    /// The other end of [`Ctx::begin`]: the entry gives back what it used.
+    pub fn end(&mut self) {
+        if let Some(p) = self.pending.take() {
+            p.release();
+        }
+        crate::detached::teardown(self);
+        debug_assert!(
+            self.release_later.is_empty() && self.release_depth == 0,
+            "an entry ended with a release still running or waiting"
+        );
+        self.give_thread_back();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
             eprintln!(
@@ -512,9 +697,17 @@ impl Ctx {
         self.heap.held() + self.workers(|b| b.held())
     }
 
-    /// How many of the entry's blocks are live, its branches' on the pool's threads among them.
+    /// How many of the blocks the program made are live, its branches' on the pool's threads among
+    /// them: the scheduler's own are not counted.
     pub fn live(&self) -> usize {
-        self.census().iter().map(|(_, n, _)| n).sum()
+        let branches: usize = if self.pooled {
+            crate::parallel::worker_blocks(self.id.0, heap::program_live_in)
+                .into_iter()
+                .sum()
+        } else {
+            0
+        };
+        self.heap.program_live() + branches
     }
 
     /// The entry's live blocks by the payload bytes they hold, the most bytes first, with their count
@@ -538,17 +731,19 @@ impl Ctx {
     ) {
         self.binding = binding;
         self.runtime = runtime;
-        self.runtime_factory = factory;
+        if let Some(factory) = factory {
+            self.runtime_factory = factory;
+        }
     }
 
     /// The reactor this context waits on, made on first need on a `parallel` branch's thread.
-    pub(crate) fn host_runtime(&mut self) -> Option<Rc<dyn ply_core::HostRuntime>> {
-        if self.runtime.is_none()
-            && let Some(factory) = &self.runtime_factory
-        {
-            self.runtime = Some(factory());
+    pub(crate) fn host_runtime(&mut self) -> Rc<dyn ply_core::HostRuntime> {
+        if let Some(runtime) = &self.runtime {
+            return Rc::clone(runtime);
         }
-        self.runtime.clone()
+        let runtime = (self.runtime_factory)();
+        self.runtime = Some(Rc::clone(&runtime));
+        runtime
     }
 
     pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {
@@ -587,31 +782,103 @@ impl Ctx {
         self.fail_with(FAILED, d)
     }
 
-    /// Fails as a raise of `abort.raise`, bound for the innermost `handle` in reach with a clause
-    /// for it; with none, the entry fails with `d` as [`Ctx::fail`] would.
+    /// Fails as a raise of `abort.raise` made where the code's word for `abort` is the frame bridge,
+    /// bound for the innermost frame in reach with a clause for it, which is the innermost `handle`
+    /// answering it there; with none, left pending as [`Ctx::pend`] leaves it.
     pub(crate) fn raise(&mut self, d: Diagnostic, message: String) -> i64 {
         if self.failed != 0 {
             return 0;
         }
-        let Some(at) = self.raise_handler("abort", "raise") else {
-            return self.fail(d);
+        let Some(at) = self.raise_handler("abort", "raise", None) else {
+            return self.pend(d, message);
         };
         let (stack, depth, clause) = at;
-        let clause = &self.stacks[stack].list[depth].clauses[clause];
-        let message = Value::str(message);
-        // The clause takes the message as emitted code lays a `String`, lifted through the type its
-        // `handle` site handed.
-        let Some(ty) = clause.string else {
-            return self.fail(
+        let string = self.stacks[stack].list[depth].clauses[clause].string;
+        self.pending = Some(Unanswered::Abort(message));
+        self.fail_with(FAILED_PENDING, d);
+        self.bind_pending(at, string);
+        0
+    }
+
+    /// Fails as a raise of `abort.raise` of `message` the runtime makes, left pending for the code
+    /// around the failure, whose innermost `handle` answering it takes it: an instance's landing, a
+    /// frame's landing where a clause of it answers `abort.raise`, or a function holding a word for
+    /// `abort`, which raises it through that word as it leaves. `d` is what the entry fails with
+    /// should none take it.
+    pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
+        if self.failed != 0 {
+            return 0;
+        }
+        self.pending = Some(Unanswered::Abort(message));
+        self.fail_with(FAILED_PENDING, d)
+    }
+
+    /// Fails as the raise of `effect.op` carrying `args`, which no frame answers, left pending as
+    /// [`Ctx::pend`] leaves `abort.raise`. Takes `args`.
+    pub(crate) fn pend_raised(
+        &mut self,
+        d: Diagnostic,
+        effect: Symbol,
+        op: Symbol,
+        args: Raised,
+    ) -> i64 {
+        if self.failed != 0 {
+            args.release();
+            return 0;
+        }
+        self.pending = Some(Unanswered::Raised { effect, op, args });
+        self.fail_with(FAILED_PENDING, d)
+    }
+
+    /// Binds the raise left pending to the clause at `at` of a frame, which answers it: one of
+    /// `abort.raise` takes the message as emitted code lays a `String`, lifted through `string`,
+    /// the type its `handle` site handed; any other what the raise carries.
+    pub(super) fn bind_pending(
+        &mut self,
+        at: (usize, usize, usize),
+        string: Option<&'static PlyType>,
+    ) {
+        let Some(raise) = self.pending.take() else {
+            return;
+        };
+        let diagnostic = self
+            .diagnostic
+            .take()
+            .unwrap_or_else(|| self.placed(error("a raise was left pending without a failure")));
+        self.failed = 0;
+        let (stack, depth, clause) = at;
+        let message = match raise {
+            Unanswered::Abort(message) => message,
+            Unanswered::Raised { args, .. } => {
+                self.aborting = Some(Aborting {
+                    stack,
+                    depth,
+                    clause,
+                    args,
+                    diagnostic,
+                });
+                self.failed = FAILED_ABORT;
+                return;
+            }
+        };
+        let Some(ty) = string else {
+            self.fail(
                 error("an `abort.raise` clause emitted code installed has no `String` type")
                     .note("this is Ply's fault, not the program's"),
             );
+            return;
         };
-        let Some(w) = lifted(self, &message, ty) else {
-            return 0;
+        let Some(w) = lifted(self, &Value::str(message), ty) else {
+            return;
         };
-        let args = Raised(vec![unsafe { Carried::new(w, ty) }]);
-        self.bind_raise(at, args, d)
+        self.aborting = Some(Aborting {
+            stack,
+            depth,
+            clause,
+            args: Raised(vec![unsafe { Carried::new(w, ty) }]),
+            diagnostic,
+        });
+        self.failed = FAILED_ABORT;
     }
 
     /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
@@ -635,9 +902,15 @@ impl Ctx {
         0
     }
 
-    /// The stack, depth and clause that answer a raise of `effect.op`. Searched as a `perform`
-    /// searches, so frames hidden while a clause runs are passed over.
-    pub(super) fn raise_handler(&self, effect: &str, op: &str) -> Option<(usize, usize, usize)> {
+    /// The stack, depth and clause that answer a raise of `effect.op`, in the frame of handler
+    /// `target` alone where there is one. Searched as a `perform` searches, so frames hidden while a
+    /// clause runs are passed over.
+    pub(super) fn raise_handler(
+        &self,
+        effect: &str,
+        op: &str,
+        target: Option<u64>,
+    ) -> Option<(usize, usize, usize)> {
         let mut stack = self.current;
         loop {
             let found = self.stacks[stack]
@@ -645,6 +918,7 @@ impl Ctx {
                 .iter()
                 .enumerate()
                 .rev()
+                .filter(|(_, f)| target.is_none_or(|t| t == f.handler))
                 .find_map(|(depth, f)| {
                     let clause = f
                         .clauses
@@ -659,14 +933,23 @@ impl Ctx {
         }
     }
 
-    /// How a finished branch failed, a raise bound past it as the failure it carries.
-    pub(crate) fn take_branch_failure(&mut self) -> Option<(i64, Option<Diagnostic>)> {
+    /// How a finished branch failed, a raise bound past it as the failure it carries; one pending
+    /// is carried on pending.
+    pub(crate) fn take_branch_failure(&mut self) -> Option<BranchFailure> {
         if self.failed == 0 {
             return None;
         }
         Some(match self.aborting.take() {
-            Some(a) if self.failed == FAILED_ABORT => (1, Some(a.into_failure())),
-            _ => (self.failed, self.diagnostic.take()),
+            Some(a) if self.failed == FAILED_ABORT => BranchFailure {
+                code: FAILED,
+                diagnostic: Some(a.into_failure()),
+                pending: None,
+            },
+            _ => BranchFailure {
+                code: self.failed,
+                diagnostic: self.diagnostic.take(),
+                pending: self.pending.take(),
+            },
         })
     }
 
@@ -682,34 +965,43 @@ impl Ctx {
 
     /// The span the body last stored, or `Span::DUMMY` before any has.
     pub fn site(&self) -> Span {
-        self.stored_in(self.stored_root())
+        self.span_at(self.site_root, self.site_start, self.site_end)
     }
 
-    /// [`Ctx::site`] and the definition the body that stored it belongs to.
-    pub(crate) fn step_site(&self) -> StepSite {
-        let root = self.stored_root();
-        StepSite {
-            definition: root.map(|r| r.name.clone()),
-            span: self.stored_in(root),
+    /// Puts `touched` into the running seeded step of the innermost region `std.internal.schedule`
+    /// opened, made where the body last stored a site; nothing where no such step runs, and nothing
+    /// of a `task` or `clock` operation.
+    pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
+        // The scheduler orders what its own operations touch itself.
+        if let crate::tasks::Touched::Atom { effect, .. } = &touched
+            && matches!(effect.as_str(), "task" | "clock")
+        {
+            return;
+        }
+        let stepping = (self.regions.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
+        if stepping {
+            self.footprint
+                .push((touched, [self.site_root, self.site_start, self.site_end]));
         }
     }
 
-    /// Puts `access` into the running step, made where the body last stored a site.
-    pub(crate) fn record_access(&mut self, access: Access) {
-        let at = self.step_site();
-        self.trail.record_access(access, at);
+    /// The name of the definition whose root's id is `root`; none for an id no root has.
+    pub(crate) fn root_name(&self, root: i64) -> Option<&Symbol> {
+        self.root_of(root).map(|r| &r.name)
     }
 
-    pub(super) fn stored_root(&self) -> Option<&Root> {
-        let id = u64::try_from(self.site_root).ok()?;
+    /// The root whose id is `root`; none for an id below 0 or that no root has.
+    fn root_of(&self, root: i64) -> Option<&Root> {
+        let id = u64::try_from(root).ok()?;
         let roots = &self.tables.roots;
         let at = roots.binary_search_by_key(&id, |r| r.id).ok()?;
         Some(&roots[at])
     }
 
-    /// The stored offsets as a span in `root`'s definition.
-    pub(super) fn stored_in(&self, root: Option<&Root>) -> Span {
-        let Some(defined) = root.map(|r| r.span).filter(|s| !s.is_dummy()) else {
+    /// The span a site names: offsets `start..end` from the start of root `root`'s definition, as
+    /// the body stores one; `Span::DUMMY` where no root has that id or its offsets leave the source.
+    pub(crate) fn span_at(&self, root: i64, start: i64, end: i64) -> Span {
+        let Some(defined) = self.root_of(root).map(|r| r.span).filter(|s| !s.is_dummy()) else {
             return Span::DUMMY;
         };
         let at = |offset: i64| {
@@ -717,7 +1009,7 @@ impl Ctx {
                 .checked_add(offset)
                 .and_then(|o| u32::try_from(o).ok())
         };
-        match (at(self.site_start), at(self.site_end)) {
+        match (at(start), at(end)) {
             (Some(start), Some(end)) => Span::new(defined.source, start, end),
             _ => Span::DUMMY,
         }
@@ -743,9 +1035,27 @@ impl Ctx {
     }
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
+        // A raise left pending is over once its failure is taken: what it carries goes back, and
+        // the host hears of one nothing answered, which may end the run its way.
+        match self.pending.take() {
+            Some(Unanswered::Raised { effect, op, args }) => {
+                self.host_runtime().unanswered(&effect, &op);
+                args.release();
+            }
+            Some(Unanswered::Abort(_)) | None => {}
+        }
         self.diagnostic
             .take()
             .or_else(|| self.aborting.take().map(|a| a.diagnostic))
+    }
+
+    /// What the run asked of the host since the last take, and how many of those asks were
+    /// at-most-once operations.
+    pub fn take_host_use(&mut self) -> (ply_core::host::HostUse, u64) {
+        (
+            std::mem::take(&mut self.host_use),
+            std::mem::take(&mut self.host_ops),
+        )
     }
 }
 

@@ -20,23 +20,25 @@ import compiler.emit.reps (Def, has_vars)
 import compiler.emit.answer (GenericCall, Published)
 import compiler.emit.layout
 import compiler.emit.layout (Always, Inline, LWords)
-import compiler.emit.tir (Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg, AVar, AInt, AZero,
-                          Val, Prim, Literal, Static, Make, Get, Take, Tag, Pack, Gathered, Updated,
-                          FieldSet, Call, Apply, Native, Op, OHandle, Made, MClosure, MList, MCase,
-                          PLeaf, PField, PArg, PCase, PCapture, Inst, Let, Do, Decl, Assign, If,
-                          Case, Match, Loop, Next, Done, Return, Restart, Enter, Handle, Reset,
-                          Opened, Block, Fn, Member, Rooted, Lambda, Closure, Handed, Given, Lent,
-                          Returned, Owned, Borrowed, Convention, TTag, Uses, ReadsOf, LastOf,
-                          Walked, no_links, counted, rep_of_arg, used_as, operands, answered,
-                          var_of, unpacks, Unsettled, MFramed, stops_at, laid_made, word_record,
-                          Unwinds, Unwound, Fail)
+import compiler.emit.tir (no_closure_words, Rep, RWord, RInt, RBool, RFlat, RSlice, RSum, Var, Arg,
+                          AVar, AInt, AZero, Val, Prim, Literal, Static, Make, Get, Take, Tag, Pack,
+                          Gathered, Updated, FieldSet, Call, Apply, Native, Op, OHandle, Made,
+                          MClosure, MList, MCase, PLeaf, PField, PArg, PCase, PCapture, Inst, Let,
+                          Do, Decl, Assign, If, Case, Match, Loop, Next, Done, Return, Restart,
+                          Enter, Handle, Reset, Opened, Block, Fn, Member, Rooted, Lambda, Closure,
+                          Handed, Given, Lent, Returned, Owned, Borrowed, Convention, TTag, Uses,
+                          ReadsOf, LastOf, Walked, no_links, counted, rep_of_arg, used_as, operands,
+                          answered, var_of, unpacks, Unsettled, MFramed, stops_at, laid_made,
+                          word_record, Unwinds, Unwound, Fail)
 import compiler.emit.tir.handling (Perform)
 import compiler.emit.verify (payload_of, allocates, re_held)
 import compiler.emit.own (owned, may_reuse)
 import compiler.emit.lower.held (passing, ByReference, value_words)
+import compiler.emit.evidence (declared_arity)
 
-/// How a definition takes its parameters and hands back its answer, which every caller's code is
-/// written against: inferred from its body and its callees' handings, never written.
+/// How a definition takes the parameters it declares and hands back its answer, which every caller's
+/// code is written against: inferred from its body and its callees' handings, never written. What a
+/// root is handed past them for its row, which differs between its specialisations, it only reads.
 pub type Handing = { params: List<Handed>, answer: Returned }
 
 /// Where the uses are that settled a handing below lending: for each parameter given, the first use
@@ -190,7 +192,7 @@ pub fn handings_of(
 }
 
 /// `published` with a handing for each definition `lendings` call that it has none for and that
-/// declares a parameter lent: that parameter lent, every other given, as the call's arity says.
+/// declares a parameter lent: that parameter lent, every one before it given.
 fn with_declared(
   published: Map<RootName, Handing>,
   declared: Map<RootName, List<Int>>,
@@ -203,12 +205,13 @@ fn with_declared(
         Call(c) -> match callee_def(generics, c.callee) {
           Some(d) -> if m.contains(d) { m } else {
             match declared.get(d) {
-              Some(lent) ->
+              Some(lent) -> {
+                let n = lent.fold(0, |most: Int, k: Int| if k + 1 > most { k + 1 } else { most });
                 m.insert(d, {
-                  params: range(0, c.args.len()).map(|k: Int|
-                    if lent.contains(k) { Lent } else { Given }),
+                  params: range(0, n).map(|k: Int| if lent.contains(k) { Lent } else { Given }),
                   answer: Owned,
-                }),
+                })
+              },
               None -> m,
             }
           },
@@ -274,9 +277,11 @@ fn lent_as(k: RootKey) -> Option<RootName> =
   match k { At(_, _) -> None, Written(_, _) -> None, Entered(_) -> None, _ -> Some(root_name(k)) }
 
 /// `c` taking its parameters and answering as `h`, the handing of `what`. An answer borrowed holds no
-/// count of what holds none where `c` holds it: a specialisation at a scalar answers it owned.
+/// count of what holds none where `c` holds it: a specialisation at a scalar answers it owned. What
+/// `c` takes past the parameters `h` speaks for, the labels and words a root is handed for its row,
+/// it takes as `c` says.
 fn conv_handed(c: Convention, h: Handing, what: Bytes) -> Convention / {abort.raise} =
-  if h.params.len() != c.params.len() {
+  if h.params.len() > c.params.len() {
     panic(
       String::of_bytes_lossy(
         Bytes::concat_all([
@@ -292,7 +297,7 @@ fn conv_handed(c: Convention, h: Handing, what: Bytes) -> Convention / {abort.ra
   } else {
     {
       ..c,
-      params: h.params,
+      params: h.params.concat(c.params.drop(h.params.len())),
       answered: match h.answer {
         Owned -> Owned,
         Borrowed(from) -> if !counted(c.answer) { Owned } else {
@@ -314,7 +319,7 @@ fn calls_handed(
 ) -> Fn / {abort.raise} =
   {
     ..f,
-    body: block_handed(generics, handed, f.body),
+    body: block_handed(root_text(root_name(f.key)), generics, handed, f.body),
     lambdas: f.lambdas.map(|l: Lambda|
       match l { Closure(c) -> Closure({ ..c, body: calls_handed(c.body, generics, handed) }) }),
   }
@@ -323,34 +328,35 @@ fn calls_handed(
 fn generics_of(f: Fn) -> List<RootName> = f.links.generics.map(|g: GenericCall| root_name(g.callee))
 
 fn block_handed(
+  within: Bytes,
   generics: List<RootName>,
   handed: Map<RootName, Handing>,
   b: Block,
 ) -> Block / {abort.raise} =
   b.map(|i: Inst|
     match i {
-      Let(l) -> Let({ ..l, val: val_handed(generics, handed, l.val) }),
-      Do(d) -> Do({ ..d, val: val_handed(generics, handed, d.val) }),
+      Let(l) -> Let({ ..l, val: val_handed(within, generics, handed, l.val) }),
+      Do(d) -> Do({ ..d, val: val_handed(within, generics, handed, d.val) }),
       If(x) ->
         If({
           ..x,
-          then: block_handed(generics, handed, x.then),
-          otherwise: block_handed(generics, handed, x.otherwise),
+          then: block_handed(within, generics, handed, x.then),
+          otherwise: block_handed(within, generics, handed, x.otherwise),
         }),
       Case(c) ->
         Case({
           ..c,
           arms: c.arms.map(|a: { when: Int, body: Block }|
-            { when: a.when, body: block_handed(generics, handed, a.body) }),
-          rest: block_handed(generics, handed, c.rest),
+            { when: a.when, body: block_handed(within, generics, handed, a.body) }),
+          rest: block_handed(within, generics, handed, c.rest),
         }),
       Match(m) ->
         Match({
-          arms: m.arms.map(|a: Block| block_handed(generics, handed, a)),
-          rest: block_handed(generics, handed, m.rest),
+          arms: m.arms.map(|a: Block| block_handed(within, generics, handed, a)),
+          rest: block_handed(within, generics, handed, m.rest),
         }),
-      Loop(l) -> Loop({ ..l, body: block_handed(generics, handed, l.body) }),
-      Handle(h) -> Handle({ ..h, body: block_handed(generics, handed, h.body) }),
+      Loop(l) -> Loop({ ..l, body: block_handed(within, generics, handed, l.body) }),
+      Handle(h) -> Handle({ ..h, body: block_handed(within, generics, handed, h.body) }),
       Unwinds(Some(xs)) -> Unwinds(Some(unwounds_handed(generics, handed, xs))),
       Fail(x) -> Fail({ ..x, letting: unwounds_handed(generics, handed, x.letting) }),
       _ -> i,
@@ -373,6 +379,7 @@ fn unwounds_handed(
     })
 
 fn val_handed(
+  within: Bytes,
   generics: List<RootName>,
   handed: Map<RootName, Handing>,
   v: Val,
@@ -384,10 +391,18 @@ fn val_handed(
         conv: conv_handed(
           c.conv,
           handing_at(handed, generics, c.callee, c.args.len()),
-          match c.callee {
-            Root(k) -> root_text(root_name(k)),
-            Generic(n) -> b"generic call ".concat(ascii_of_int(n)),
-          },
+          Bytes::concat_all([
+            match c.callee {
+              Root(k) -> root_text(root_name(k)),
+              Generic(n) -> match generics.at(n) {
+                Some(d) ->
+                  Bytes::concat_all([b"generic call ", ascii_of_int(n), b" of ", root_text(d)]),
+                None -> b"generic call ".concat(ascii_of_int(n)),
+              },
+            },
+            b" in ",
+            within,
+          ]),
         ),
       }),
     _ -> v,
@@ -595,7 +610,7 @@ type Gone = { own: Map<Int, Span>, jumped: List<Jumped> }
 type Found = { lending: Lending, cur: Inferred, walk: Walk, gone: Gone }
 
 fn first_guess(m: Lending, resets: Map<Int, Span>) -> Inferred = {
-  let n = m.f.params.len();
+  let n = declared_arity(m.f.params);
   let reset = |k: Int| !m.lent.contains(k) && resets.contains(k);
   {
     handing: {
@@ -885,7 +900,7 @@ fn gone_in(
 /// before or now is given, with the place of the use that first gave it; the answer stays borrowed
 /// while every return answers only what it read out of what it is lent.
 fn settled(m: Lending, cur: Inferred, w: Walk, gone: Map<Int, Span>) -> Inferred = {
-  let n = m.f.params.len();
+  let n = declared_arity(m.f.params);
   let given = |k: Int|
     !m.lent.contains(k) && (cur.handing.params.at(k) == Some(Given) || gone.contains(k));
   let params = range(0, n).map(|k: Int| if given(k) { Given } else { Lent });
@@ -1539,6 +1554,7 @@ test "a parameter stored, updated in place, performed, given on, or captured by 
           Perform({
             effect: b"m.log",
             op: b"put",
+            index: 0,
             resource: b"",
             labelled: false,
             mode: 1,
@@ -1612,7 +1628,17 @@ test "a closure laid on this frame's stack only reads its captures, whatever its
       statics: [],
     };
     settled_with(
-      [{ ..f, f: { ..f.f, lambdas: [Closure({ body: lambda, captures: 1, at: dummy_span() })] } }],
+      [
+        {
+          ..f,
+          f: {
+            ..f.f,
+            lambdas: [
+              Closure({ body: lambda, captures: 1, at: dummy_span(), words: no_closure_words() }),
+            ],
+          },
+        },
+      ],
       [{ name: b"each", handing: { params: [Lent], answer: Owned } }],
     )
   };
@@ -2023,7 +2049,7 @@ test "a body is written against its own handing and each callee's, a callee noth
   } with {
     abort.raise(m) -> Bytes::of_string(m),
   };
-  assert_eq(said, b"a handing of 2 parameters for a convention of 1: m.look");
+  assert_eq(said, b"a handing of 2 parameters for a convention of 1: m.look in m.f");
   // A specialisation is written as the definition it specialises, a root written for a type as its
   // fixed handing.
   let at = { ..f, key: keys::at_key(b"m.f", [], []) };
@@ -2054,10 +2080,10 @@ test "a body is written against its own handing and each callee's, a callee noth
   };
   let rooted = {
     ..f,
-    lambdas: [Closure({ body: closure, captures: 0, at: dummy_span() })],
+    lambdas: [Closure({ body: closure, captures: 0, at: dummy_span(), words: no_closure_words() })],
     links: {
       ..no_links(),
-      generics: [{ callee: Named(b"m.look"), args: [], carried: [], fns: [] }],
+      generics: [{ callee: Named(b"m.look"), args: [], carried: [], fns: [], rows: [] }],
     },
   };
   match conventions(rooted, handed).lambdas {

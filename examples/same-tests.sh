@@ -112,7 +112,7 @@ serve() {
   local settings=(--config-schema service.config --set "SERVICE_STORE=$store" --set "SERVICE_PORT=$port"
     --set SERVICE_CONNECTIONS=400 --set "SERVICE_API_KEY=$SERVICE_API_KEY")
   if [ "$store" = postgres ]; then settings+=(--set "SERVICE_DATABASE=$db"); fi
-  "$ply" run "$here/service.ply" --host "${settings[@]}" >"$log" 2>&1 &
+  "$ply" run "$here/service.ply" "${settings[@]}" >"$log" 2>&1 &
   echo $!
 }
 

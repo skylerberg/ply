@@ -22,9 +22,9 @@ import compiler.emit.pieces (spelled)
 import compiler.emit.release (root_of)
 import compiler.emit.code (Code, NField)
 import compiler.emit.tir (Rep, RInt, RBool, RFloat, RWord, RSum, RNum, RFlat, Leaf, Var, Arg, AVar,
-                          AInt, Val, Make, Made, MList, Call, Native, Op, OContainer, OHandle,
-                          Operation, Pack, Uses, Inst, Let, Do, Fn, Lambda, Closure, Spine, Data,
-                          Containers, rep_of_arg)
+                          AInt, AZero, Val, Make, Made, MList, Call, Native, Op, OContainer,
+                          OHandle, Operation, Pack, Uses, Inst, Let, Do, Fn, Lambda, Closure, Spine,
+                          Data, Containers, rep_of_arg)
 import compiler.emit.tir.handling (Unsettled, Encoded)
 import compiler.emit.tir.containers (Laid, Length, Elements, Within, ArrayNew, ArraySet,
                                      ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet, ColumnsOfList,
@@ -38,7 +38,8 @@ import compiler.emit.lower.containers (columned, column_read, listed, item_read,
 import compiler.emit.lower.setting (Root, setting_in)
 import compiler.emit.keys (RootKey, Named, Written, Copy, root_name)
 import compiler.emit.print (printed_fn)
-import compiler.emit.compare (Program, program_of, formed, checked, printed_text, not_built)
+import compiler.emit.compare (entered_words, Program, program_of, formed, checked, printed_text,
+                              not_built)
 import compiler.emit.print.counting (takes_count)
 
 /// `src` as module `m` of a program.
@@ -507,7 +508,12 @@ test "a byte string's position is a loop in the body, its predicate called by it
       [
         {
           op: OContainer(Position),
-          uses: { takes: [false, false, false], owned: true, fails: true, stops: true },
+          uses: {
+            takes: [false, false, false, false, false],
+            owned: true,
+            fails: true,
+            stops: true,
+          },
           answer: RInt,
         },
       ],
@@ -523,6 +529,43 @@ test "a byte string's position is a loop in the body, its predicate called by it
     None -> b"",
   };
   assert(looped.len() > 0 && takes_count(looped), Some(String::of_bytes_lossy(text)))
+}
+
+test "a byte string's position hands a predicate that performs the descriptor and the words of the row its call fills" {
+  let p = program(
+    Bytes::concat_all([
+      b"effect asks {\n  write one() -> Unit\n}\n",
+      b"fn found(b: Bytes) -> Option<Int> / {asks.one, abort.raise} =\n",
+      b"  b.position(0, |c: Int| {\n    asks.one();\n    c == 32\n  })\n",
+    ]),
+  );
+  let positions = ops_in(bound_in(p, b"found")).filter(
+    |o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.op == OContainer(Position),
+  );
+  assert_eq(
+    positions.map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }| o.args.len()),
+    [5],
+  );
+  // A row that performs lays its words out: the zero is a row of none.
+  assert_eq(
+    positions.map(|o: { op: Operation, args: List<Arg>, uses: Uses, answer: Rep }|
+      match o.args.at(4) { Some(AZero(_)) -> b"none", Some(_) -> b"laid", None -> b"missing" }),
+    [b"laid"],
+  );
+  let text = form_text(p, b"found");
+  let looped = match text.index_of(b"for (int64_t ") {
+    Some(i) -> text.slice(i, text.len()),
+    None -> b"",
+  };
+  let call = match looped.index_of(b"->typed)(ctx, ") {
+    Some(i) -> {
+      let rest = looped.slice(i, looped.len());
+      match rest.index_of(b";") { Some(j) -> rest.slice(0, j), None -> rest }
+    },
+    None -> b"",
+  };
+  // Each call hands the byte, then the descriptor and the words.
+  assert(call.index_of(b"], ") != None, Some(String::of_bytes_lossy(text)))
 }
 
 test "a byte string's position named as a value is a lambda whose loop calls the predicate it is handed by its type" {
@@ -549,7 +592,9 @@ test "a byte string's position named as a value is a lambda whose loop calls the
         }),
     Err(why) -> panic(String::of_bytes_lossy(why)),
   };
-  assert_eq(positions, [{ takes: [false, false, false], owned: true, fails: true, stops: true }]);
+  assert_eq(positions, [
+    { takes: [false, false, false, false, false], owned: true, fails: true, stops: true },
+  ]);
   let text = form_text(p, b"spaced");
   assert(text.index_of(b"(const PlyFnDesc *)") != None, Some(String::of_bytes_lossy(text)))
 }
@@ -578,6 +623,32 @@ fn cleanups(p: Program, name: Bytes) -> List<Uses> / {abort.raise} =
 /// The closures are taken; the types of what is held and answered are only read.
 fn cleanup_uses() -> Uses =
   { takes: [true, true, true, false, false], owned: true, fails: true, stops: true }
+
+test "a bracket hands its closures the words of the row its call fills, which the handle around it answers" {
+  let p = program(
+    Bytes::concat_all([
+      b"effect meter {\n  read level() -> Int\n}\n",
+      b"fn under() -> Int =\n",
+      b"  handle { bracket(|| 1, |_x: Int| (), |x: Int| meter.level() + x) } with { meter.level() -> 0 }\n",
+    ]),
+  );
+  let text = form_text(p, b"under");
+  let set = entered_words(text);
+  assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(text)))
+}
+
+test "a hold's region hands its closures the words of what they perform, which the handle around it answers" {
+  let p = program(
+    Bytes::concat_all([
+      b"effect meter {\n  read level() -> Int\n}\n",
+      b"fn under() -> Int =\n",
+      b"  handle { with_hold[t](1, |_x: Int| ()) { c -> meter.level() + c.get() } } with { meter.level() -> 0 }\n",
+    ]),
+  );
+  let text = form_text(p, b"under");
+  let set = entered_words(text);
+  assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(text)))
+}
 
 test "`bracket`, named or passed as a value, is the runtime's `rt_with_cleanup`, taking its closures" {
   let p = program(
@@ -758,10 +829,10 @@ test "a name no import takes is the builtin's, and an import that takes a builti
   )
 }
 
-/// The program of `user` beside the shipped module `std.native` declaring `extern fn doubled`, run
-/// by a runtime implementing `natives`.
-fn with_doubled(user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} = {
-  let shipped = [{ name: b"std.native", src: b"pub extern fn doubled(x: Int) -> Int\n" }];
+/// The program of `user` beside the shipped module `std.native` written `native`, run by a runtime
+/// implementing `natives`.
+fn beside_native(native: Bytes, user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} = {
+  let shipped = [{ name: b"std.native", src: native }];
   match analyse_pulling_std_with([{ name: b"m", src: user }], shipped, no_rows()).out {
     Analysed(a) -> match setting_in(a, b"m") {
       Ok(s) ->
@@ -772,8 +843,23 @@ fn with_doubled(user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} = 
   }
 }
 
+/// `beside_native` of `extern fn doubled`, which takes a record and so is called over its
+/// argument's encoding.
+fn with_doubled(user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} =
+  beside_native(b"pub extern fn doubled(x: { n: Int }) -> Int\n", user, natives)
+
+/// The calls of the native `name` over its arguments' encoding `body` holds.
+fn encoded_calls(body: List<Inst>, name: Bytes) -> Int = {
+  let calls = body.filter(|i: Inst|
+    match i {
+      Do(d) -> match d.val { Op(o) -> o.op == OHandle(Encoded(name)), _ -> false },
+      _ -> false,
+    });
+  calls.len()
+}
+
 test "a builtin the runtime lacks is declined, and one written at a scalar's type goes on to scalars" {
-  let user = b"import std.native (doubled)\nfn f() -> Int = doubled(2)\n";
+  let user = b"import std.native (doubled)\nfn f() -> Int = doubled({ n: 2 })\n";
   let by = |p: Program, name: Bytes|
     match formed(p, name) { Ok(_) -> None, Err(no) -> Some(no.by) };
   assert_eq(by(with_doubled(user, []), b"f"), Some(Containers));
@@ -783,18 +869,35 @@ test "a builtin the runtime lacks is declined, and one written at a scalar's typ
 }
 
 test "a shipped module's extern is called as the builtin of its own name, over its encoding" {
-  let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n";
+  let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled({ n: 2 }) + n::doubled({ n: 3 })\n";
   match formed(with_doubled(user, [b"doubled"]), b"f") {
-    Ok(f) ->
-      assert_eq(
-        f.body.filter(|i: Inst|
-          match i {
-            Do(d) -> match d.val { Op(o) -> o.op == OHandle(Encoded(b"doubled")), _ -> false },
-            _ -> false,
-          }).len(
-        ),
-        2,
-      ),
+    Ok(f) -> assert_eq(encoded_calls(f.body, b"doubled"), 2),
+    Err(no) -> panic(String::of_bytes_lossy(no.why)),
+  }
+}
+
+test "a setting read off a program calls a shipped module's extern over machine types over machine words, as the build does" {
+  let p = beside_native(
+    b"pub extern fn halved(x: Int) -> Int\n",
+    b"import std.native (halved)\nfn f() -> Int = halved(4)\n",
+    [b"halved"],
+  );
+  assert(p.setting.machine.contains(b"halved"), None);
+  match formed(p, b"f") {
+    Ok(f) -> assert_eq(encoded_calls(f.body, b"halved"), 0),
+    Err(no) -> panic(String::of_bytes_lossy(no.why)),
+  }
+}
+
+test "a secret crosses to a native and back as its handle, never its encoding" {
+  let p = beside_native(
+    b"pub extern fn resealed(s: Secret<Bytes>) -> Secret<String>\n",
+    b"import std.native (resealed)\nfn f() -> Int = if resealed(Secret::of_bytes(b\"key\")).is_empty() { 0 } else { 1 }\n",
+    [b"resealed"],
+  );
+  assert(p.setting.machine.contains(b"resealed"), None);
+  match formed(p, b"f") {
+    Ok(f) -> assert_eq(encoded_calls(f.body, b"resealed"), 0),
     Err(no) -> panic(String::of_bytes_lossy(no.why)),
   }
 }

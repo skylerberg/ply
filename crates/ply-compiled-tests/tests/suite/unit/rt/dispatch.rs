@@ -12,7 +12,7 @@ fn naming(fields: &[&str]) -> Ctx {
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
-use ply_compiled::rt::{Ctx, FAILED_UNWIND};
+use ply_compiled::rt::{Ctx, FAILED_PENDING, FAILED_UNWIND};
 use ply_core::{EffectAtom, Mode, Plain, Resource};
 use std::cell::Cell;
 
@@ -126,6 +126,29 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
     );
     assert_eq!(d.values.iter().collect::<Vec<_>>(), [&Plain::Int(42)]);
     assert_eq!(ctx.heap.live(), 0, "the payload was not let go");
+    ctx.end();
+}
+
+type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
+
+#[test]
+fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation() {
+    let mut ctx = naming(&["m", "boom", "other"]);
+    ctx.begin(1_000);
+    let payload = boxed(&mut ctx, 42);
+    dispatch(&mut ctx, &op(&BOXES), 2, &[payload]);
+    assert_ne!(ctx.failed, 0, "the raise left the entry failed");
+    let at = helper::<PendingAt>("rt_pending_raised_at");
+    // A clause of another operation does not take it.
+    assert_eq!(unsafe { at(&mut ctx, 0, 2) }, 0);
+    assert_ne!(ctx.failed, 0);
+    // The clause of its own takes what it carries, the entry no longer failed.
+    let words = unsafe { at(&mut ctx, 0, 1) } as *const Word;
+    assert!(!words.is_null());
+    assert_eq!(ctx.failed, 0);
+    assert_eq!(unsafe { *words }, payload);
+    unsafe { box_dec(&mut ctx, payload) };
+    assert_eq!(ctx.heap.live(), 0);
     ctx.end();
 }
 
@@ -399,7 +422,9 @@ fn a_raise_the_runtime_makes_reaches_an_emitted_clause_lifted_and_the_landing_ca
         native("?out_count")(c, ply_core::codec::tag::LIST as Word, 1);
         native("?out_str")(c, b"no such file".as_ptr() as Word, 12);
         helper::<unsafe extern "C" fn(*mut Ctx, Word)>("rt_builtin_encoded")(c, 0);
-        assert_ne!(ctx.failed, 0, "the builtin raised");
+        // Left pending for the code between the builtin and the frame, which may hold a `handle`
+        // answering it through its objects; the frame's landing takes what none of it took.
+        assert_eq!(ctx.failed, FAILED_PENDING, "the builtin raised");
         assert_eq!(helper::<Land>("rt_handle_land")(c, depth, 0), 9);
     }
     super::crossing::unfailed(&mut ctx);

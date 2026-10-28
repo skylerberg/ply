@@ -2,11 +2,12 @@
 
 use ply_core::host::{HostAnswer, HostHandler, HostOp, HostRequest, HostRuntime, Linearity};
 use ply_core::{Diagnostic, Value as PlyValue, codes};
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 const EFFECT: &str = "shipped";
 
-const OPERATIONS: [(&str, &str); 13] = [
+const OPERATIONS: [(&str, &str); 11] = [
     ("names", "ply_privileged::shipped::names"),
     ("module", "ply_privileged::shipped::module"),
     ("answer", "ply_privileged::shipped::answer"),
@@ -15,8 +16,6 @@ const OPERATIONS: [(&str, &str); 13] = [
     ("version", "ply_privileged::shipped::version"),
     ("stamps", "ply_privileged::shipped::stamps"),
     ("runtime", "ply_privileged::shipped::runtime"),
-    ("runnable", "ply_privileged::shipped::runnable"),
-    ("front", "ply_privileged::shipped::front"),
     ("values", "ply_privileged::shipped::values"),
     ("entered", "ply_privileged::shipped::entered"),
     ("definitions", "ply_privileged::shipped::definitions"),
@@ -84,21 +83,27 @@ pub fn lent() -> Vec<(HostOp, Arc<dyn HostHandler>)> {
 struct Shipped;
 
 impl HostHandler for Shipped {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
+        let recorder = ply_host::observe::of(rt);
+        let noted = |note: &dyn Fn(&ply_host::observe::Recorder)| {
+            if let Some(recorder) = &recorder {
+                note(recorder);
+            }
+        };
         // The rest answer for the runtime, which a pass's store is stamped with.
         match (req.op.op.as_str(), req.args) {
-            ("names", []) => ply_host::observe::shipped(req.machine, ""),
+            ("names", []) => noted(&|r| r.shipped("")),
             ("module", [name]) => {
                 if let Ok(name) = name.as_str(span, "a module's name") {
-                    ply_host::observe::shipped(req.machine, name);
+                    noted(&|r| r.shipped(name));
                 }
             }
-            ("definitions", []) => ply_host::observe::program(req.machine),
+            ("definitions", []) => noted(&|r| r.ran_program()),
             ("reached", [view, pulled]) => {
                 let view = view.as_bytes(span, "a load's view of the shipped modules")?;
                 let pulled = pulled.as_bool(span, "whether the load pulled its modules")?;
-                ply_host::observe::reached(req.machine, &String::from_utf8_lossy(view), pulled);
+                noted(&|r| r.reached(&String::from_utf8_lossy(view), pulled));
                 return Ok(HostAnswer::Value(PlyValue::Unit));
             }
             _ => {}
@@ -112,9 +117,7 @@ impl HostHandler for Shipped {
             ),
             ("module", [name]) => {
                 let name = name.as_str(span, "a module's name")?;
-                let module =
-                    crate::shipped_modules::source(&ply_core::ModuleName::from_dotted(name))
-                        .map(str::as_bytes);
+                let module = crate::shipped_modules::source(name).map(str::as_bytes);
                 crate::payload::option(
                     module
                         .or_else(|| crate::shipped_modules::data(name))
@@ -137,38 +140,16 @@ impl HostHandler for Shipped {
             ("definitions", []) => {
                 PlyValue::bytes(ENTERED.get().map_or("", String::as_str).as_bytes())
             }
-            ("runtime", []) => runtime(),
-            ("runnable", [entry, files, dump]) => {
-                let entry = entry.as_str(span, "an entry point's name")?;
-                let bytes = crate::runnable::encode(entry, files, dump).map_err(|why| {
-                    Diagnostic::error(
-                        codes::INTERNAL_ERROR,
-                        format!("the program does not encode as a runnable: {why}"),
-                    )
-                    .primary(span, "this is Ply's fault")
-                })?;
-                PlyValue::bytes(bytes)
-            }
-            ("front", [linked]) => {
-                PlyValue::bytes(ply_core::codec::encode(linked).map_err(|why| {
-                    Diagnostic::error(
-                        codes::INTERNAL_ERROR,
-                        format!("the program's front end does not encode: {why}"),
-                    )
-                    .primary(span, "this is Ply's fault")
-                })?)
-            }
-            ("values", [files, dump, unit, roots, steps]) => {
-                values(files, dump, unit, roots, steps, span)?
-            }
-            ("entered", [unit, runnable, argument, steps]) => {
-                let unit = std::path::PathBuf::from(unit.as_str(span, "the unit's library")?);
-                let runnable =
-                    std::path::PathBuf::from(runnable.as_str(span, "the unit's runnable")?);
-                let argument = argument.as_bytes(span, "an argument")?.to_vec();
+            ("runtime", []) => PlyValue::bytes(ply_compiled::c::described()),
+            ("values", [library, roots, steps]) => values(library, roots, steps, span)?,
+            ("entered", [library, root, argument, steps]) => {
+                let library = PathBuf::from(library.as_str(span, "the unit's library")?);
+                let root = root.as_str(span, "the root to enter")?;
+                let argument = argument.as_bytes(span, "an argument")?;
                 let steps = steps.as_int(span, "the calls the entry may make")?;
-                let answered = crate::enter::entered(unit, runnable, argument, steps)?;
-                crate::payload::option(answered.map(PlyValue::bytes))
+                crate::payload::option(
+                    entry_answered(&library, root, argument, steps, span)?.map(PlyValue::bytes),
+                )
             }
             (other, _) => return Err(crate::hosts::unserved(EFFECT, other, req.span)),
         };
@@ -176,63 +157,118 @@ impl HostHandler for Shipped {
     }
 }
 
-/// What each stored root answers on the unit emitted over `files` and `dump` and compiled into the
-/// library `unit`, as [`crate::enter::stored_values`] enters them.
+/// What each of `roots`, a `const` definition's stored root, answers on the unit compiled into the
+/// library `library`: each entered by name with nothing, binding no host, under `steps` calls. A
+/// stored root answers the bytes a build keeps its definition's value as; one that raised, ran past
+/// its calls, answered anything else or is not in the unit answers none.
 fn values(
-    files: &PlyValue,
-    dump: &PlyValue,
-    unit: &PlyValue,
+    library: &PlyValue,
     roots: &PlyValue,
     steps: &PlyValue,
     span: ply_core::Span,
 ) -> Result<PlyValue, Diagnostic> {
-    let front = crate::driver::loaded_analysis_of(
-        &crate::payload::record(vec![
-            ("dump", dump.clone()),
-            ("files", files.clone()),
-            ("read_ms", PlyValue::Int(0)),
-            ("front_ms", PlyValue::Int(0)),
-            ("file_ms", PlyValue::Int(0)),
-            ("cached", PlyValue::Bool(false)),
-        ]),
-        span,
-    )?;
-    let unit = std::path::PathBuf::from(unit.as_str(span, "the unit's library")?);
+    use ply_compiled::entry::{self, Ended, Run};
+    let library = PathBuf::from(library.as_str(span, "the unit's library")?);
     let roots = roots
         .as_list(span, "the stored roots")?
         .iter()
         .map(|root| root.as_str(span, "a stored root").map(str::to_string))
         .collect::<Result<Vec<_>, _>>()?;
-    let steps = steps.as_int(span, "the calls each may make")?;
-    let answered = crate::enter::stored_values(front, unit, roots, steps)?;
+    let run = Run {
+        steps: steps.as_int(span, "the calls each may make")?,
+        ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
+    };
+    let opened = opened_unit(&library).map_err(|why| {
+        Diagnostic::error(
+            codes::BACKEND_UNAVAILABLE,
+            format!("the unit could not be loaded: {why}"),
+        )
+        .primary(span, "its constants were to be entered here")
+    })?;
+    let answered = entry::on_program_thread(|| {
+        roots
+            .iter()
+            .map(|root| {
+                match entry::enter(&opened, root, entry::no_arguments(), &run, None, None).ended {
+                    Ended::Answered(bytes) => Some(bytes),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .unwrap_or_else(|| roots.iter().map(|_| None).collect());
     Ok(PlyValue::list(
         answered
             .into_iter()
-            .map(|value| crate::payload::option(value.map(PlyValue::bytes)))
+            .map(|bytes| {
+                let kept = bytes.and_then(|b| match ply_core::codec::decode(&b) {
+                    Ok(kept @ PlyValue::Bytes(_)) => Some(kept),
+                    _ => None,
+                });
+                crate::payload::option(kept)
+            })
             .collect(),
     ))
 }
 
-/// Each builtin by its name in the prelude, then each native the compiler declares over machine
-/// data, with what the function compiled code calls it through takes and answers, as that
-/// function's type says.
-fn natives() -> impl Iterator<Item = (&'static str, ply_compiled::native::Signature)> {
-    let builtins = ply_core::Builtin::all()
-        .iter()
-        .map(|b| (b.name(), ply_compiled::rt::signature(*b)));
-    let machine = ply_compiled::c::machine_natives()
-        .iter()
-        .map(|n| (n.name, n.signature));
-    builtins.chain(machine)
+/// What `root` of the unit compiled into `library`, a function of one parameter, answers for the
+/// value the PLV1 bytes `argument` hold under `steps` calls, as the root writes it: none where it
+/// raised, ran past its calls or answered nothing a run can hold.
+fn entry_answered(
+    library: &std::path::Path,
+    root: &str,
+    argument: &[u8],
+    steps: i64,
+    span: ply_core::Span,
+) -> Result<Option<Vec<u8>>, Diagnostic> {
+    use ply_compiled::entry::{self, Ended, Run};
+    let refused = |why: String| {
+        Diagnostic::error(codes::INTERNAL_ERROR, why).primary(span, "this is Ply's fault")
+    };
+    let opened = opened_unit(library)
+        .map_err(|why| refused(format!("an entered unit does not load: {why}")))?;
+    let value = ply_core::codec::decode(argument)
+        .map_err(|why| refused(format!("an entered unit's argument does not decode: {why}")))?;
+    let arguments = ply_core::codec::encode(&PlyValue::list(vec![value]))
+        .map_err(|why| refused(format!("an entered unit's argument does not encode: {why}")))?;
+    let run = Run {
+        steps,
+        ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
+    };
+    Ok(entry::on_program_thread(|| {
+        match entry::enter(&opened, root, arguments, &run, None, None).ended {
+            Ended::Answered(bytes) => Some(bytes),
+            _ => None,
+        }
+    })
+    .flatten())
 }
 
-/// The runtime a unit is compiled against, as [`runtime`] answers it, written as JSON: what a build
-/// of a program for this runtime by another `ply` reads it from. Past what [`runtime`] answers,
-/// each native's machine kinds, the context's fields compiled code reads and the structs emitted
-/// code lays out (each field in order with its offset and bytes), and how deeply drop roots nest
-/// before a release is put off.
+/// The unit compiled into `library`, opened the first time this process asks and kept after.
+fn opened_unit(library: &std::path::Path) -> Result<Arc<ply_compiled::entry::Opened>, String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type Units = Mutex<HashMap<std::path::PathBuf, Arc<ply_compiled::entry::Opened>>>;
+    static UNITS: OnceLock<Units> = OnceLock::new();
+    let units = UNITS.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(opened) = units.lock().unwrap_or_else(|e| e.into_inner()).get(library) {
+        return Ok(Arc::clone(opened));
+    }
+    let opened = ply_compiled::entry::Opened::open(library)?;
+    let mut held = units.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Arc::clone(
+        held.entry(library.to_path_buf()).or_insert(opened),
+    ))
+}
+
+/// The runtime a unit is compiled against as a released `ply`'s bootstrap reads it, written as
+/// JSON: the C its units open and close with, the helpers they bind, each native with its machine
+/// kinds, the context's fields compiled code reads and the structs emitted code lays out (each field
+/// in order with its offset and bytes), how deeply drop roots nest before a release is put off, and
+/// where a hold keeps what it holds.
 pub fn runtime_json() -> String {
     use ply_compiled::c;
+    let natives = c::described::natives;
     serde_json::json!({
         "head": c::unit_head(),
         "tail": c::runtime_object(),
@@ -282,47 +318,4 @@ fn facts_json(facts: Vec<(&'static str, usize)>) -> serde_json::Value {
             .map(|(name, n)| (name.to_string(), serde_json::json!(n)))
             .collect(),
     )
-}
-
-/// The runtime a unit is compiled against, as `compiler.unit.Runtime` reads it: the C a unit opens
-/// and closes with, the helpers it binds by position, the natives an `extern fn` names, and what all
-/// of that is a function of.
-fn runtime() -> PlyValue {
-    use crate::payload::record;
-    use ply_compiled::c;
-    record(vec![
-        ("head", PlyValue::bytes(c::unit_head())),
-        ("tail", PlyValue::bytes(c::runtime_object())),
-        (
-            "helpers",
-            PlyValue::list(
-                c::exports::runtime_helpers()
-                    .into_iter()
-                    .map(|h| {
-                        record(vec![
-                            ("name", PlyValue::bytes(h.name)),
-                            ("args", PlyValue::Int(h.args as i64)),
-                            ("answers", PlyValue::Bool(h.answers)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        (
-            "natives",
-            PlyValue::list(
-                natives()
-                    .map(|(name, s)| {
-                        record(vec![
-                            ("name", PlyValue::bytes(name)),
-                            ("words", PlyValue::Int(s.words() as i64)),
-                            ("answers", PlyValue::Bool(s.answers())),
-                            ("raises", PlyValue::Bool(s.raises)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
-        ("identity", PlyValue::bytes(c::runtime_identity())),
-    ])
 }

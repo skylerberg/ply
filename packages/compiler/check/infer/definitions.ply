@@ -4,15 +4,15 @@ import compiler.syntax.parsing (Span, Ident, QName, dummy_span, is_bare, qname_t
                                 prelude_binder, span_between)
 import std.graph
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, MRead, ty_span, is_raise)
-import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, IEffectSet, IExtern,
-                              is_shipped, is_builtin, FnDef, TestDef, Cases, LawDef, OfSchema,
-                              SchemaIdentity, Binder, Constraint, Deriver, DEq, DOrd, DBin, DShow,
-                              DHash, DNumeric, DInteger, is_predicate, deriver_text, schema_of,
-                              SRequires, SEnsures, SCost, SSpace, SpecClause, Derived, parse,
-                              test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
-                              NInvariant, INumeric, member_name, member_of, numeric_ops, numeric_by,
-                              is_pub, NRelease)
+                                    AtomExpr, MRead, ty_span, is_raise, no_generics)
+import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet,
+                              IExtern, is_shipped, is_builtin, FnDef, TestDef, Cases, LawDef,
+                              OfSchema, SchemaIdentity, Binder, Constraint, Deriver, DEq, DOrd,
+                              DBin, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text,
+                              schema_of, SRequires, SEnsures, SCost, SSpace, SpecClause, Derived,
+                              parse, test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
+                              NInvariant, NHost, NRelease, INumeric, member_name, member_of,
+                              numeric_ops, numeric_by, is_pub, TDAlias, TDExtern)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -41,6 +41,7 @@ import compiler.check.resolve.scopes (find, of_module)
 import compiler.check.resolve.sets (pattern_binders)
 import compiler.expand.rewrite (MemberCallee, with_member_calls, Elaborated, elaborated_natives)
 import compiler.emit.layout (intrinsic_named)
+import compiler.emit.c (width_named)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.expand.derive (HoldsFunction, HoldsHandle, Unconstrained, HoldsSecret, same_deriver)
 import compiler.expand.rewrite.shared (count_in)
@@ -70,7 +71,8 @@ import compiler.check.infer.checker (TrySite, DeclaredAlias, DeclaredExtern, Dec
                                      seed_atom, builtin_type_arity, effect_of, def_of, set_def,
                                      Builtin, prelude_imports, declared, builtins, refuse_externs,
                                      mode_eq, is_direct, builtin_bound, insert_constraint,
-                                     dedup_constraints, Shapes, derivable, vars_of_type, TypedAt)
+                                     dedup_constraints, Shapes, derivable, vars_of_type, hold,
+                                     TypedAt)
 import compiler.check.infer.names (Found, of_language_type, declared_value, written_binder,
                                    simple_name_of, home_module)
 import compiler.check.infer.declarations (conv_type, conv_atom, op_named, duplicate,
@@ -275,22 +277,56 @@ pub fn signed_fns(
 /// A shipped module's own externs bound as builtins under its name; the prelude's that every module
 /// calls are bound before any module is checked.
 fn externs_bound(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
-  if !is_shipped(parsed.name) { checker }
-  else { externs_of(parsed.name, parsed.module).fold(checker, builtin_bound) }
+  if !is_shipped(parsed.name) { checker } else {
+    externs_of(parsed.name, parsed.module).fold(checker, |c: Checker, b: Builtin|
+      builtin_bound(c, asking_only(c, b)))
+  }
+
+/// `b`, whose row names a mode only of an effect that declares no operation: a native naming a mode
+/// of one with operations would look answered by a handler of that effect while it asks the machine.
+fn asking_only(c: Checker, b: Builtin) -> Builtin / {abort.raise} = {
+  let modes = match b.scheme.ty {
+    TyFn(f) -> f.effects.atoms.filter(|a: Atom| a.op == None && a.effect != hold()),
+    _ -> [],
+  };
+  match modes.find(|a: Atom|
+      match effect_of(c, a.effect) { Some(info) -> info.ops.len() > 0, None -> true }) {
+    None -> b,
+    Some(a) ->
+      panic(
+        "the shipped `extern fn " ++ String::of_bytes_lossy(b.name) ++ "` names a mode of `"
+          ++ String::of_bytes_lossy(a.effect)
+          ++ "`, which is no effect that declares no operation",
+      ),
+  }
+}
 
 /// The externs the module `name` declares as its own, each under its program-wide name, at the
-/// types the module declares or imports by name: of the prelude's, only the functions of its own
-/// types.
+/// types the module declares or imports by name, an alias of its own as the type it names: of the
+/// prelude's, only the functions of its own types.
 pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} = {
   let own = module.items.fold(
     prelude_imports(module.imports),
     |acc: Map<Bytes, Bytes>, item: Item|
-      match item { IType(t) -> acc.insert(t.name.name, qualify(name, t.name.name)), _ -> acc },
+      match item {
+        IType(t) -> acc.insert(t.name.name, qualify(name, t.name.name)),
+        IEffect(e) -> acc.insert(e.name.name, qualify(name, e.name.name)),
+        _ -> acc,
+      },
   );
+  let aliases = module.items.fold(Map::new(), |acc: Map<Bytes, TypeExpr>, item: Item|
+    match item {
+      IType(t) -> match t.body {
+        TDAlias(body) -> if t.generics != no_generics() { acc }
+        else { acc.insert(t.name.name, body) },
+        _ -> acc,
+      },
+      _ -> acc,
+    });
   module.items.fold([], |acc: List<Builtin>, item: Item|
     match item {
       IExtern(def) -> if is_builtin(name, module, def) { acc }
-      else { acc.push(declared(qualify(name, def.name.name), own, def)) },
+      else { acc.push(declared(qualify(name, def.name.name), own, def, aliases)) },
       _ -> acc,
     })
 }
@@ -308,21 +344,168 @@ pub fn natives_of(
   }
 
 /// What an `extern fn` declares of the native that implements it: the module declaring it, the name
-/// the native is found by, the words a call passes, its witnesses first, and whether a failure of it
-/// raises rather than ending the run.
-pub type Extern = { module: Bytes, name: Bytes, words: Int, raises: Bool }
+/// the native is found by, the words a call passes, its witnesses first, whether a failure of it
+/// raises rather than ending the run, and how a call crosses where it is called over machine words
+/// (`machine_call`) rather than over its arguments' encoding.
+pub type Extern = {
+  module: Bytes,
+  name: Bytes,
+  words: Int,
+  raises: Bool,
+  call: Option<MachineCall>,
+}
 
-fn extern_of(module: Bytes, name: Bytes, b: Builtin) -> Extern =
+/// How a value of a machine type crosses to a native or back over machine words.
+pub type MachineValue =
+  /// An integer's raw 64 bits: an `Int`, a `Bool` as 0 or 1, a `Char`'s scalar value, or a width of
+  /// at most 64 bits, the type it is.
+  | MachineInt(Type)
+  /// A `Float`'s bits.
+  | MachineFloat
+  /// The bytes of a string or a byte string, the type it is: lent as their address and count where
+  /// a native takes them; where it answers them, left as the context's taken bytes, which the
+  /// caller copies out, and their count answered.
+  | MachineText(Type)
+  /// A `Secret` of the type it is, as its handle: lent where a native takes one, so no byte of it
+  /// crosses but to the native, and owned by the caller where a native answers one.
+  | MachineSecret(Type)
+  /// A runtime object of the type it is, a `Task`, a `Chan` or an extern type of the native's own
+  /// module, as its handle: lent where a native takes one, owned by the caller where a native
+  /// answers one.
+  | MachineObject(Type)
+  /// A value of the native's type variable, by its place among them, as its word and its type's
+  /// descriptor: handed over where a native takes one, and handed back where a native answers one,
+  /// the descriptor of the type the call answers then passed after the parameters.
+  | MachineHanded(Int)
+  /// A function value whose row is the native's row variable at this place among them: its block,
+  /// lent, then the descriptor of the row the call fills the variable with and the words the
+  /// caller holds for it, which the native copies where it keeps the value.
+  | MachineFunction(Int)
+  /// No word: what a native that answers `()` answers.
+  | MachineUnit
+
+/// How a call of a native over machine words crosses: each parameter, then the answer.
+pub type MachineCall = { params: List<MachineValue>, answer: MachineValue }
+
+/// How a value of `t` crosses to a native over machine words, `scheme` the native's and `objects`
+/// the extern types its module declares; `None` for a type that crosses only over its encoding.
+pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<MachineValue> =
+  match t {
+    TyVar(v) -> place_of(scheme.ty_vars, v).map(MachineHanded),
+    TyFn(f) -> match f.effects.tail {
+      Some(r) -> if f.effects.atoms.len() > 0 { None }
+      else { place_of(scheme.row_vars, r).map(MachineFunction) },
+      None -> None,
+    },
+    TyCon(c) -> if c.name == b"Secret" && c.args.len() == 1 { Some(MachineSecret(t)) }
+    else if ((c.name == b"Task" || c.name == b"Chan") && c.args.len() == 1)
+        || objects.contains(c.name) { Some(MachineObject(t)) }
+    else if c.args.len() > 0 { None }
+    else if c.name == b"Int" || c.name == b"Bool" || c.name == b"Char" { Some(MachineInt(t)) }
+    else if c.name == b"Float" { Some(MachineFloat) }
+    else if c.name == b"String" || c.name == b"Bytes" { Some(MachineText(t)) }
+    else if c.name == b"Unit" { Some(MachineUnit) } else {
+      match width_named(c.name) {
+        Some(w) -> if w.bits <= 64 { Some(MachineInt(t)) } else { None },
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
+
+/// How a call of the native the shipped module `module` declares as `b` crosses over machine words,
+/// `objects` the extern types the module declares: one of a module other than `std.prelude`,
+/// generic over no label, constrained by nothing, that cannot raise, each of whose parameters is a
+/// machine type other than `()` and whose answer is one, a type variable among them only whole, or
+/// as what a task or a channel carries. Its row is not read: a native that asks the machine names
+/// what it reads there, and nothing of it crosses. `None` for any other native, which a call
+/// reaches over its arguments' encoding.
+pub fn machine_call(module: Bytes, b: Builtin, objects: List<Bytes>) -> Option<MachineCall> =
+  if module == prelude_module() || b.scheme.label_vars.len() > 0 || b.constraints.len() > 0
+      || b.contract.raises { None } else {
+    match b.scheme.ty {
+      TyFn(f) -> {
+        let crossing = |t: Type| machine_value(t, b.scheme, objects);
+        let params = f.params.map(crossing);
+        match if f.params.push(f.ret).any(laid_over_var) { None } else { crossing(f.ret) } {
+          None -> None,
+          Some(MachineFunction(_)) -> None,
+          Some(answer) -> if params.any(|p: Option<MachineValue>|
+              p == None || p == Some(MachineUnit)) { None } else {
+            Some({
+              params: params.fold([], |acc: List<MachineValue>, p: Option<MachineValue>|
+                match p { Some(v) -> acc.push(v), None -> acc }),
+              answer: answer,
+            })
+          },
+        }
+      },
+      _ -> None,
+    }
+  }
+
+/// The words a call of `c` passes: one for each parameter, but two for bytes, their address and
+/// their count, two for a value of a type variable, its word and its type's descriptor, and three
+/// for a function value; then the descriptor of a type variable's value the native answers.
+pub fn machine_words(c: MachineCall) -> Int =
+  c.params.fold(match c.answer { MachineHanded(_) -> 1, _ -> 0 }, |n: Int, v: MachineValue|
+    match v {
+      MachineText(_) -> n + 2,
+      MachineHanded(_) -> n + 2,
+      MachineFunction(_) -> n + 3,
+      _ -> n + 1,
+    })
+
+/// Whether a native's parameter or answer of type `t` holds a type variable where the type the
+/// variable stands for lays it out: anywhere but whole, in a function's type, or as what a task or
+/// a channel carries.
+fn laid_over_var(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> false,
+    TyFn(_) -> false,
+    TyCon(c) -> !(c.name == b"Task" || c.name == b"Chan") && c.args.any(names_var),
+    _ -> names_var(t),
+  }
+
+fn place_of(xs: List<Int>, x: Int) -> Option<Int> =
+  range(0, xs.len()).find(|i: Int| xs.at(i) == Some(x))
+
+/// Whether a type variable stands anywhere in `t`.
+fn names_var(t: Type) -> Bool =
+  match t {
+    TyVar(_) -> true,
+    TyCon(c) -> c.args.any(names_var),
+    TyFn(f) -> f.params.any(names_var) || names_var(f.ret),
+    TyRecord(fs) -> fs.any(|f: Field| names_var(f.ty)),
+    TyNominal(x) -> x.fields.any(|f: Field| names_var(f.ty)),
+  }
+
+/// The extern types `module` declares, by their program-wide names.
+fn extern_types(name: Bytes, module: Module) -> List<Bytes> =
+  module.items.fold([], |acc: List<Bytes>, item: Item|
+    match item {
+      IType(t) -> match t.body { TDExtern -> acc.push(qualify(name, t.name.name)), _ -> acc },
+      _ -> acc,
+    })
+
+fn extern_of(module: Bytes, name: Bytes, b: Builtin, objects: List<Bytes>) -> Extern = {
+  let call = machine_call(module, b, objects);
   {
     module: module,
     name: name,
-    words: witnessed(b.constraints).len() + b.params.len(),
+    words: match call {
+      Some(c) -> machine_words(c),
+      None -> witnessed(b.constraints).len() + b.params.len(),
+    },
     raises: b.contract.raises,
+    call: call,
   }
+}
 
 /// Each `extern fn` the prelude declares, in its order: a function it writes in Ply is none.
 pub fn prelude_externs() -> List<Extern> / {abort.raise} =
-  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin| extern_of(prelude_module(), b.name, b))
+  builtins().filter(|b: Builtin| !b.body).map(|b: Builtin|
+    extern_of(prelude_module(), b.name, b, []))
 
 /// Each `extern fn` a native implements that the module `name` declares in `text`, as the checker
 /// binds it, which only a module the toolchain ships does; a text without the word declares none
@@ -331,16 +514,18 @@ pub fn externs_in(name: Bytes, text: Bytes) -> List<Extern> / {abort.raise} =
   if text.index_of(b"extern") == None { [] } else { module_externs(name, parse(text).node) }
 
 /// `externs_in` of module `name` parsed as `module`.
-pub fn module_externs(name: Bytes, module: Module) -> List<Extern> / {abort.raise} =
+pub fn module_externs(name: Bytes, module: Module) -> List<Extern> / {abort.raise} = {
+  let objects = extern_types(name, module);
   natives_of(name, module).map(|e: { own: Bytes, builtin: Builtin }|
-    extern_of(name, e.own, e.builtin))
+    extern_of(name, e.own, e.builtin, objects))
+}
 
 /// The natives the compiler declares itself: each `extern fn` of the prelude, then each native the
 /// elaboration writes calls of.
 pub fn declared_natives() -> List<Extern> / {abort.raise} =
   prelude_externs().concat(
     elaborated_natives().map(|n: Elaborated|
-      { module: b"", name: n.name, words: n.words, raises: n.raises }),
+      { module: b"", name: n.name, words: n.words, raises: n.raises, call: None }),
   )
 
 /// Every native a program over the shipped `modules`, each by its name and text, may call, each once
@@ -357,6 +542,11 @@ pub fn program_natives(
 /// `program_natives` of a program whose modules are parsed as `mods`.
 pub fn parsed_natives(mods: List<ParsedModule>) -> List<Extern> / {abort.raise} =
   natives_beside(declared_natives(), mods.map(|m: ParsedModule| module_externs(m.name, m.module)))
+
+/// How a call of each of `natives` called over machine words crosses, by its name.
+pub fn machine_calls(natives: List<Extern>) -> Map<Bytes, MachineCall> =
+  natives.fold(Map::new(), |acc: Map<Bytes, MachineCall>, e: Extern|
+    match e.call { Some(c) -> acc.insert(e.name, c), None -> acc })
 
 /// `own`, then each of `modules`' natives and the prelude's whose name is not yet among them.
 pub fn natives_beside(
@@ -633,6 +823,7 @@ fn stated_of(parsed: ParsedModule) -> Map<Bytes, StatedFns> = {
           NKey -> acc.insert(at, { ..was, key: by }),
           NShow -> acc.insert(at, { ..was, show: by }),
           NInvariant -> acc,
+          NHost -> acc,
           NRelease -> acc,
         }
       },
@@ -4588,7 +4779,13 @@ fn keyed_room(checker: Checker) -> Int = checker.ctors.len() + checker.nominals.
 // --- What a type's module states of it ----------------------------------------------------------
 
 pub fn is_key(kind: InstanceKind) -> Bool =
-  match kind { NKey -> true, NShow -> false, NInvariant -> false, NRelease -> false }
+  match kind {
+    NKey -> true,
+    NShow -> false,
+    NInvariant -> false,
+    NHost -> false,
+    NRelease -> false,
+  }
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
@@ -4637,9 +4834,76 @@ test "an extern declares the words a call passes, its witnesses first, and wheth
       b"  extern  fn spaced<a, b>(x: a, y: b) -> a\n  where numeric(a), integer(a), numeric(b)\n\n/// Doubled.\npub extern fn doubled<a>(x: a) -> a / {abort.raise}\n  where numeric(a)\n\nfn not_one() -> Bytes = b\"extern fn one()\"\n",
     ),
     [
-      { module: b"std.native", name: b"spaced", words: 4, raises: false },
-      { module: b"std.native", name: b"doubled", words: 2, raises: true },
+      { module: b"std.native", name: b"spaced", words: 4, raises: false, call: None },
+      { module: b"std.native", name: b"doubled", words: 2, raises: true, call: None },
     ],
   );
   assert_eq(externs_in(b"m", b"extern fn doubled(x: Int) -> Int\n"), [])
+}
+
+test "a shipped module's extern over machine types is called over machine words, and any other over its encoding" {
+  let call = |src: Bytes|
+    externs_in(b"std.native", src).map(|e: Extern| { words: e.words, call: e.call });
+  let int = TyCon({ name: b"Int", args: [] });
+  let text = TyCon({ name: b"String", args: [] });
+  assert_eq(call(b"extern fn named(id: Int, sep: String) -> Bytes\n"), [
+    {
+      words: 3,
+      call: Some({
+        params: [MachineInt(int), MachineText(text)],
+        answer: MachineText(TyCon({ name: b"Bytes", args: [] })),
+      }),
+    },
+  ]);
+  assert_eq(
+    call(b"extern fn told(on: Bool, x: Float, c: Char, w: U64) -> Unit\n").map(
+      |c: { words: Int, call: Option<MachineCall> }| c.words,
+    ),
+    [4],
+  );
+  // An alias of the module's own is the type it names.
+  assert_eq(call(b"type Pid = Int\nextern fn pid() -> Pid\n"), [
+    { words: 0, call: Some({ params: [], answer: MachineInt(int) }) },
+  ]);
+  // A secret crosses as its handle, either way.
+  let secret = |of: Type| TyCon({ name: b"Secret", args: [of] });
+  assert_eq(call(b"extern fn sealed(s: Secret<Bytes>) -> Secret<String>\n"), [
+    {
+      words: 1,
+      call: Some({
+        params: [MachineSecret(secret(TyCon({ name: b"Bytes", args: [] })))],
+        answer: MachineSecret(secret(text)),
+      }),
+    },
+  ]);
+  // A value of a type variable crosses as its word and its type's descriptor, the descriptor of
+  // what a native answers passed last; a runtime object as its handle; a function value as its
+  // block, its row's descriptor and its words.
+  let kept = TyCon({ name: b"std.native.Kept", args: [] });
+  assert_eq(
+    call(b"extern type Kept\nextern fn keep<a>(x: a) -> Kept\nextern fn open<a>(k: Kept) -> a\n"),
+    [
+      { words: 2, call: Some({ params: [MachineHanded(0)], answer: MachineObject(kept) }) },
+      { words: 2, call: Some({ params: [MachineObject(kept)], answer: MachineHanded(0) }) },
+    ],
+  );
+  let task = TyCon({ name: b"Task", args: [TyVar(0)] });
+  assert_eq(call(b"extern fn started<a | e>(t: Task<a>, body: () -> Unit / e) -> Int\n"), [
+    {
+      words: 4,
+      call: Some({ params: [MachineObject(task), MachineFunction(0)], answer: MachineInt(int) }),
+    },
+  ]);
+  // A width past 64 bits, a list, a variable a list lays out, a raise or a `()` taken is crossed
+  // over its encoding.
+  [
+    b"extern fn wide(x: U128) -> Int\n",
+    b"extern fn listed(xs: List<Int>) -> Int\n",
+    b"extern fn any<a>(xs: List<a>) -> Int\n",
+    b"extern fn raised(x: Int) -> Int / {abort.raise}\n",
+    b"extern fn nothing(u: Unit) -> Int\n",
+  ].fold((), |_: Unit, src: Bytes|
+    assert_eq(call(src).map(|c: { words: Int, call: Option<MachineCall> }| c.call), [None]));
+  // A prelude's extern is a builtin, called as the runtime's builtin table says.
+  assert(prelude_externs().all(|e: Extern| e.call == None), None)
 }

@@ -37,8 +37,6 @@ pub enum Plain {
     Fn(Fun),
     /// What a `with_hold` binds; which one is the run's own.
     Hold,
-    Task(u64),
-    Chan(u64),
     /// A credential, whose payload is never copied out.
     Secret,
     /// What a bounded snapshot left out: `n` more items of a list or map, or with `0`, all
@@ -125,8 +123,6 @@ impl Plain {
                 return Err("a function the program wrote, which only its own run can hold");
             }
             Plain::Hold => return Err("a hold, which only its own `with_hold` can hold"),
-            Plain::Task(_) => return Err("a task, which only its own run can hold"),
-            Plain::Chan(_) => return Err("a channel, which only its own run can hold"),
             Plain::Secret => return Err("a credential, whose payload never leaves the runtime"),
             Plain::Elided(_) => return Err("a value a diagnostic cut short"),
         })
@@ -151,8 +147,6 @@ impl Plain {
             Plain::Map(_) => "a `Map`",
             Plain::Fn(_) => "a function",
             Plain::Hold => "a `Hold`",
-            Plain::Task(_) => "a `Task`",
-            Plain::Chan(_) => "a `Chan`",
             Plain::Secret => "a `Secret`",
             Plain::Elided(_) => "a value",
         }
@@ -254,8 +248,6 @@ fn snapshot(v: &Value, bound: Option<(usize, usize)>, depth: usize) -> Plain {
                 None => Fun::Anonymous,
             },
         }),
-        Value::Task(handle) => Plain::Task(handle.id().0),
-        Value::Chan(handle) => Plain::Chan(handle.id.0),
         Value::Secret(_) => Plain::Secret,
     }
 }

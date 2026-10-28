@@ -10,18 +10,19 @@ import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock,
                            CodeClause, CodePattern, is_label_binder)
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LUnit)
-import compiler.syntax.exprs (detached_at)
+import compiler.syntax.exprs (detached_at, scheduler_module)
 import compiler.emit.reps (Def, resumed, no_ctors)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.tir (Var, Arg, AZero, RWord, RBool, RSlice, Return, Fn, Rooted, Crossing,
-                          Declined, Spine, Calling, falls_through, rep_of_arg, Unwinds, Unwound,
-                          Fail, NoLet, var_of)
+                          Declined, Spine, Calling, Handling, falls_through, rep_of_arg, Unwinds,
+                          Unwound, Fail, NoLet, var_of)
 import compiler.emit.lower.setting (Setting, Root)
-import compiler.emit.keys (root_name, root_text, crossing)
+import compiler.emit.keys (root_name, root_text, crossing, module_of)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToBuiltin, ToDef,
-                                 ToValue, ToInPlace, Armed, ClauseMade, GroupMember, Opened,
-                                 started, refuse, opened, continued, joined, short_circuit, handed,
-                                 read_noted, read_note, read_taken, unviewed, type_of, emitted)
+                                 ToValue, ToInPlace, Armed, GroupMember, Opened, started, refuse,
+                                 opened, continued, joined, short_circuit, handed, read_noted,
+                                 read_note, read_taken, unviewed, type_of, noted, none_held, filed,
+                                 emitted)
 import compiler.emit.lower.data (constructed, recorded, field, updated)
 import compiler.emit.lower.scalars (literal, constant, operand, unary, binary, unwound)
 import compiler.emit.lower.containers (listed, columned, column_read)
@@ -30,9 +31,15 @@ import compiler.emit.lower.matching (arm_opened, closed, let_bound, let_missed, 
 import compiler.emit.lower.calling (convention, params_held, target, global, known, called, applied,
                                     entered, left, lambda_opened, closure, group_opened, grouped,
                                     known_body, step_captured, context_of, called_builtin,
-                                    resumption_closed)
+                                    resumption_closed, called_at_types, simulate_called, laid_here)
 import compiler.emit.lower.handling (performed, label, clause_frame, ret_frame, body_frame, handled,
-                                     branched, simulated)
+                                     branched, handle_entered, handle_planned, clause_held,
+                                     instance_objects, detached_landed, detaches, crossing_of,
+                                     Planned)
+import compiler.emit.lower.evidence (handed_to, root_opened, entry_opened, words_at,
+                                     handed_param_types, performed_by, filed_row, held_routed)
+import compiler.emit.evidence (evidence_type)
+import compiler.emit.answer (Rowed)
 import compiler.emit.statics (folded)
 
 /// Root `r` of `setting`, whose body lowers to `code`, lowered as a build lowers it: its body after
@@ -107,6 +114,34 @@ pub fn tail_calls(
     _ -> acc,
   }
 
+/// Clause closure `k` of a `handle` planned as `plan`, laid in this frame where the instance is:
+/// the instance's records are all that hold it, and they die with the frame.
+fn held_closure(plan: Planned, k: Lowered) -> Lowered =
+  match plan.instance.block { None -> laid_here(k), Some(_) -> k }
+
+/// The closure `task.spawn` is handed, written `x`, a lambda the expansion made of any other value:
+/// holding the words its row takes as they stand at the spawn and the heap instances they live in,
+/// since the region runs it handing none and the task may outlive the function spawning it.
+fn spawned(cx: Context, st: Lowering, x: Code) -> Lowered / {abort.raise} =
+  match x.node {
+    NLambda(l) -> {
+      let held = held_routed(cx, st, words_at(cx, l.at), l.at);
+      let frame = {
+        params: l.params,
+        size: l.size,
+        captures: l.captures,
+        resumes: false,
+        body: l.body,
+        ty: None,
+        words: [],
+        held: { words: held.words, instance: None, kept: cx.kept },
+      };
+      let o = lambda_opened(cx, held.st, frame, l.at);
+      closure(cx, held.st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
+    },
+    _ -> lowered(cx, st, x, false),
+  }
+
 /// Whether a call of `func` names, around its last argument, the resources a failure in it lets go:
 /// what `emit.code` writes where the check filed them.
 fn unwinds(func: Code) -> Bool =
@@ -133,7 +168,7 @@ fn missed_bound(
       match x.node {
         NVar(v) -> match match v.slot { Some(slot) -> acc.st.env.get(slot), None -> None } {
           Some(arg) -> {
-            let u = unwound(cx, acc.st, arg);
+            let u = unwound(cx, acc.st, arg, at);
             { st: u.st, us: acc.us.push(u.unwound) }
           },
           None -> acc,
@@ -166,7 +201,7 @@ fn unwound_around(
         |acc: { st: Lowering, unwound: List<Unwound>, at: Int }, x: Code|
           if acc.at == args.len() - 1 { acc } else {
             let o = lowered(cx, acc.st, x, false);
-            let u = unwound(cx, o.st, o.arg);
+            let u = unwound(cx, o.st, o.arg, at);
             { st: u.st, unwound: acc.unwound.push(u.unwound), at: acc.at + 1 }
           },
       );
@@ -186,17 +221,25 @@ fn unwound_around(
     },
   }
 
-/// The root lowered, or why its body is outside what the lowering covers.
+/// The root lowered, or why its body is outside what the lowering covers. A root whose key leaves a
+/// row variable of its definition unfilled is settled by its callers, at the rows they hand it.
 pub fn lowered_fn(cx: Context, body: Code) -> Result<Fn, Declined> / {abort.raise} = {
   let conv = convention(cx);
   let held = params_held(cx);
+  let declared = cx.params.len();
+  let h = handed_to(cx.setting, cx.key);
+  let handed_types = handed_param_types(h);
   let params = range(0, conv.reps.len()).map(|i: Int|
     {
       id: i,
-      ty: match cx.types.at(i) { Some(t) -> t, None -> unknown_type() },
+      ty: if i >= declared {
+        match handed_types.at(i - declared) { Some(t) -> t, None -> evidence_type() }
+      } else { match cx.types.at(i) { Some(t) -> t, None -> unknown_type() } },
       rep: match held.at(i) { Some(r) -> r, None -> conv.reps.get(i) },
     });
-  let out = lowered(cx, started(params), body, true);
+  let begun = entry_opened(root_opened(cx, started(params), params, declared, h), body.span);
+  let start = if h.unfilled { noted(begun.st, { var: 0 - 1, reads: Rowed }) } else { begun.st };
+  let out = lowered(begun.cx, start, body, true);
   let answered = if falls_through(out.st.insts) { handed(out, conv.answer, body.span) }
   else { out };
   match answered.st.refused {
@@ -504,7 +547,7 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
                 { ..acc, st: o.st, args: acc.args.push(o.arg) }
               },
             });
-          applied(cx, reads_noted(cx, args.st, args.read), f.arg, args.args, tail, c.span)
+          applied(cx, reads_noted(cx, args.st, args.read), f.arg, args.args, None, tail, c.span)
         },
         Some(t) -> {
           // A definition's call hands a view on as the callee holds it: a restart keeps walking it.
@@ -627,21 +670,28 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           },
           None -> { st: st, arg: None },
         };
+        let spawns = p.effect == b"task" && p.op == b"spawn";
         let args = p.args.fold(
           { st: lb.st, args: [] },
           |acc: { st: Lowering, args: List<Arg> }, x: Code| {
-            let o = lowered(cx, acc.st, x, false);
+            let o = if spawns { spawned(cx, acc.st, x) } else { lowered(cx, acc.st, x, false) };
             { st: o.st, args: acc.args.push(o.arg) }
           },
         );
-        performed(
-          cx,
-          args.st,
-          { effect: p.effect, op: p.op, resource: p.resource },
-          lb.arg,
-          args.args,
-          c.span,
-        )
+        let op = { effect: p.effect, op: p.op, resource: p.resource };
+        match crossing_of(cx, op, p.args, args.args, c.span) {
+          // The crossings are the scheduler's, so one of its own performs crossed would call itself.
+          Some(x) -> if module_of(cx.key) == scheduler_module() {
+            refuse(
+              args.st,
+              Handling,
+              b"a perform the scheduler writes at a type other than `Kept`: ".concat(x.name),
+            )
+          } else {
+            called_at_types(cx, args.st, x.name, x.types, x.rows, p.args, args.args, c.span)
+          },
+          None -> performed(cx, args.st, op, lb.arg, p.label, args.args, c.span),
+        }
       },
       NLabel(n) -> label(cx, st, n, c.span),
       NLambda(l) -> {
@@ -652,6 +702,8 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           resumes: false,
           body: l.body,
           ty: None,
+          words: words_at(cx, l.at),
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, l.at);
         closure(cx, st, lowered(o.cx, o.st, l.body, true), frame, Rooted, l.at)
@@ -664,10 +716,12 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
           resumes: false,
           body: x.body,
           ty: None,
+          words: words_at(cx, x.at),
+          held: none_held(),
         };
         let o = lambda_opened(cx, st, frame, x.at);
         let k = closure(cx, st, lowered(o.cx, o.st, x.body, true), frame, Rooted, x.at);
-        simulated(cx, k.st, k.arg, c.span)
+        simulate_called(cx, k.st, k.arg, filed_row(cx, x.at), c.span)
       },
       NParallel(pr) -> {
         let bs = pr.branches.fold(
@@ -677,44 +731,59 @@ fn lowered(cx: Context, st: Lowering, c: Code, tail: Bool) -> Lowered / {abort.r
             { st: o.st, args: acc.args.push(o.arg) }
           },
         );
-        branched(cx, bs.st, bs.args, pr.rooted, c.span)
+        branched(cx, bs.st, bs.args, performed_by(cx, pr.branches), pr.rooted, c.span)
       },
       NHandle(h) -> {
+        let plan = handle_planned(cx, st, h, c.span);
         let clauses = h.clauses.fold(
-          { st: st, out: [] },
-          |acc: { st: Lowering, out: List<ClauseMade> }, cl: CodeClause| {
-            let lb = match cl.label {
-              Some(lc) -> {
-                let o = lowered(cx, acc.st, lc, false);
-                { st: o.st, arg: Some(o.arg) }
-              },
-              None -> { st: acc.st, arg: None },
-            };
-            let frame = clause_frame(cx, cl);
-            let o = lambda_opened(cx, lb.st, frame, cl.at);
-            let k = closure(cx, lb.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at);
-            { st: k.st, out: acc.out.push({ label: lb.arg, closure: k.arg }) }
+          { st: plan.st, out: [] },
+          |acc: { st: Lowering, out: List<Arg> }, cl: CodeClause| {
+            let held = clause_held(cx, acc.st, plan, cl.at);
+            let frame = clause_frame(cl, held.held);
+            let o = lambda_opened(cx, held.st, frame, cl.at);
+            let k = held_closure(
+              plan,
+              closure(cx, held.st, lowered(o.cx, o.st, cl.body, true), frame, Rooted, cl.at),
+            );
+            { st: k.st, out: acc.out.push(k.arg) }
           },
         );
         let ret = match h.ret {
           Some(r) -> {
-            let frame = ret_frame(cx, r);
-            let o = lambda_opened(cx, clauses.st, frame, r.at);
-            let k = closure(cx, clauses.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at);
+            let held = clause_held(cx, clauses.st, plan, r.at);
+            let frame = ret_frame(r, held.held);
+            let o = lambda_opened(cx, held.st, frame, r.at);
+            let k = held_closure(
+              plan,
+              closure(cx, held.st, lowered(o.cx, o.st, r.body, true), frame, Rooted, r.at),
+            );
             { st: k.st, arg: Some(k.arg) }
           },
           None -> { st: clauses.st, arg: None },
         };
-        let body = match body_frame(cx, h) {
-          Some(frame) -> {
-            let at = detached_at(c.span);
-            let o = lambda_opened(cx, ret.st, frame, at);
-            closure(cx, ret.st, lowered(o.cx, o.st, h.body, true), frame, Rooted, at)
-          },
+        let body = if detaches(h.clauses) {
+          // The body runs on a stack of its own, in a closure holding the `handle`'s objects, which
+          // its landing ends.
+          let objects = instance_objects(cx, ret.st, h, plan, c.span);
+          let answer = match filed(cx, c.span) { Some(t) -> t.ty, None -> unknown_type() };
+          let frame = body_frame(cx, h, plan, objects.words, answer);
+          let at = detached_at(c.span);
+          let o = lambda_opened(cx, objects.st, frame, at);
+          let inner = lowered(o.cx, opened(o.st), h.body, false);
+          closure(
+            cx,
+            objects.st,
+            detached_landed(o.cx, o.st, inner, h, plan, answer, at),
+            frame,
+            Rooted,
+            at,
+          )
+        } else {
           // A failure inside a `handle`'s body lands in it, past nothing the run around holds.
-          None -> lowered(cx, { ..opened(ret.st), unwinding: [] }, h.body, false),
+          let e = handle_entered(cx, { ..opened(ret.st), unwinding: [] }, h, plan, c.span);
+          lowered(e.cx, e.st, h.body, false)
         };
-        let out = handled(cx, ret.st, body, clauses.out, ret.arg, h, c.span);
+        let out = handled(cx, ret.st, body, clauses.out, ret.arg, h, plan, c.span);
         { ..out, st: { ..out.st, unwinding: ret.st.unwinding } }
       },
     }

@@ -21,15 +21,15 @@ fn greeting() -> String = "hello from ply"
 fn main() -> Unit / {Console} = print(greeting())
 ```
 
-`ply run hello --host` evaluates `main`: `print` writes `hello from ply` to
+`ply run hello` evaluates `main`: `print` writes `hello from ply` to
 standard output, the run reports the value `main` returned (`()`) and exits `0`.
 Output is an effect, not a builtin: `print` takes a `String` and is
 `std.console`'s wrapper over `std.process`'s `out`, a value that is not one goes
 through interpolation (`print(f"n = {n}")`), `Console` is the three console
 streams as an effect set (`read_line` reads one line of input), all named with
-no import (§13), and `--host` binds them to the run's own console
-(`ply doc std.console`, §14); a run
-without it is hermetic and refuses them (`E0424`). The everyday commands are
+no import (§13), and `ply run` binds them to the run's own console
+(`ply doc std.console`, §14); a test is no process and is refused them
+(`E0424`). The everyday commands are
 `ply check` (parse, resolve, typecheck, infer rows), `ply test` and `ply run`.
 Each takes a `.ply` file or a directory and acts on the project that holds it;
 with no path it acts on the package the working directory is part of.
@@ -39,7 +39,7 @@ whose row says `diverges`, why its calls may not return (§5.10).
 
 **Starting a package.** `ply new demo` writes `demo/ply.pkg` and
 `demo/main.ply` — a manifest (§3.3), a `main` that prints and one test — and
-`cd demo && ply run . --host` prints `hello from demo` while `ply test` runs the
+`cd demo && ply run .` prints `hello from demo` while `ply test` runs the
 test. The directory's last segment names the package, so
 `ply new store/orders` makes `orders`; `--name` overrides it when the
 directory is not a name (`ply new lib-src --name core`), and `--lib` writes a
@@ -221,6 +221,7 @@ These are keywords only in the position shown and identifiers elsewhere:
 | `derive`, `for`, `reuse`, `transparent`, `const` | `derive <deriver> for <Type>`; `reuse fn`, `transparent fn`, `transparent reuse fn` and `const fn` at item position |
 | `for`, `in` | after a test's label: `test "..." for <name>: <Type> in <table>` (§8.1) |
 | `key`, `show`, `invariant`, `numeric`, `by` | `key for <Type> by <function>`, `show for <Type> by <function>`, `invariant for <Type> by <function>` and `numeric for <Type> by { <operation>: <function>, .. }` at item position (§4.4) |
+| `host`, `by` | `host for <effect> by <function>` at item position (§6.10) |
 | `release` | `release for <Type> by <function>` at item position (§7.1) |
 | `keep` | before a parameter's type, a function type's parameter, an operation's parameter, or a type parameter in a generic list (§4.7, §7.1) |
 | `once` | before the `(` of a function type (§7.1) |
@@ -1232,9 +1233,10 @@ secret: each is one-way in the key.
 
 A secret cannot be rendered, encoded, ordered, digested, matched on or drawn by
 a `forall`, and reaches a host operation only if that operation's registration
-allows it (`E0439`). The operations `ply` ships that take one are
-`std.password`'s, which hash a password and answer the hash, one-way in it, and
-the two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
+allows it (`E0439`), and a native only as a parameter its declaration types
+`Secret` (§12). The natives `ply` ships that take one are `std.password`'s,
+which hash a password and answer the hash, one-way in it; the operations, the
+two that write a secret out: `std.fs`'s `write_secret`, to a file its owner
 alone may read, and `std.net`'s `send_secret`, to a connection. Both write the
 same frame, all of it or nothing: plain bytes before the secret, the secret
 `raw` or in `hex`, `base64`, `base64url` or `base32`, and plain bytes after it,
@@ -1565,7 +1567,10 @@ fn sum_to(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { sum_to(n - 1, acc 
 A tail call of another function in the same module is a loop too when the two
 are in one recursive group, a set of definitions whose tail calls lead back to
 each other, so `even`/`odd` mutual recursion does not nest either. A group with
-a `handle` in a member's body is compiled definition by definition and nests.
+a `handle` in a member's body whose clause resumes off its tail (§6.6), running
+the body on a stack of its own, is compiled definition by definition and nests;
+one whose `handle`s answer, resume on their tail or answer a raise, as a `try`
+does, keeps its loop.
 
 Every other call nests, at most 10,000 deep (then `E0502`): `1 + f(n - 1)`, a
 call inside `handle`, `with_hold` or a lambda, and a call of another function.
@@ -1609,7 +1614,19 @@ it and the function's result and everything evaluated before it is pure:
 `let x = e?;`, or `parse_or_more(parse_and(ts)?)`.
 
 * It converts no errors: `Result<_, E1>` inside `-> Result<_, E2>` is `E0201`.
-* `E0118`: inside a `handle`, `try`, `with_hold` or `simulate`; inside a
+* Inside a `handle` or a `try`, in its body, a clause or its `return` clause,
+  it exits the function through it, as a raise would: every `handle` between is
+  left, none of their `return` clauses runs, and no clause answers it, a `try`'s
+  included. It stands there as it would in a body of its own, and the
+  outermost `handle` holding one stands where a `?` could (`E0119`):
+
+  ```ply
+  fn priced(sku: String) -> Result<Int, String> = {
+    let base = handle { catalog::price(sku)? + rate.get() } with { rate.get() -> 3 };
+    Ok(base * 2)
+  }
+  ```
+* `E0118`: inside a `with_hold`, a `simulate` or a `parallel` branch; inside a
   lambda without a written return type; or where `Ok`/`Err`/`Some`/`None` are
   rebound. A lambda with a written return type exits the lambda.
 * `E0119`: in an `if` branch, `match` arm or right of `&&` not in return
@@ -1637,13 +1654,15 @@ two or more branches, and `parallel` is a name wherever no `{` follows it.
 * The branches spend one step budget between them (`E0503`, §8.4), as they would
   in turn.
 * A block whose branches could reach a `handle` around it or a `simulate` region
-  (§9) runs them in turn, which answers the same. A block written in a
+  (§9) runs them in turn, which answers the same. A clause that resumes on its
+  tail, captures nothing and whose `handle` holds no `var` keeps no block in
+  turn: each branch is answered by a copy of it on its own thread. A block written in a
   definition's own body is held to that definition's row: a `handle` that
   answers no effect in it does not keep the block in turn. One inside a lambda
   or the body of a `handle` is kept in turn by any `handle` around it. So is
   one whose branches hold a task or a continuation, and so is every
   block of a program entered on another's branch, as each test of a `ply test`
-  run is. Under `--host` each branch waits on a reactor of its own.
+  run is. Each branch waits on the host through a reactor of its own.
 * `E0309`: two branches perform operations of one effect on one resource, one
   of them a `write`; or a branch's row is open (it calls a function value whose
   row is a variable) while another performs anything; or a branch opens a
@@ -1811,7 +1830,13 @@ An operation's type parameters sit just before its parameters,
 signature resolves names as a `fn` signature does, so a lowercase name its list
 does not declare, or a type name not in scope, is `E0102`. Each perform picks
 its own `a`, so a clause for the operation has to answer every type (`E0201`).
-An operation writes no `where`. Where its types name a `Map`, or a type that
+An operation of an effect the toolchain declares (`task`'s, §9) crosses
+erased instead, where a value of its type parameters crosses: its clause sees
+`Kept`, the value kept beside its type, which only the toolchain's own modules
+read; a function the perform hands that answers one is wrapped where it is
+performed, and an answer that holds one is opened there. So only a module the
+toolchain ships writes a clause for one (`E0165`). An operation writes no
+`where`. Where its types name a `Map`, or a type that
 carries an order (§4.2), whose ordering reads one of its type parameters, each
 perform is held to the order of what it picks for that parameter (`E0206`), and
 each clause for the operation assumes it; the rest of such a key is judged where
@@ -1828,7 +1853,8 @@ set of atoms with an optional tail variable: `/ {db.read[users], clock.read}`,
 `E0104`. No mode atom stands for a `raise`: a row names each one, `toml.syntax`,
 so a row is the set of ways a call can fail (§6.8). `diverges`, written bare,
 is the atom of a call that may not return (§5.10); it names no operation, and
-nothing handles it.
+nothing handles it. An effect that declares no operation is named by a mode
+atom, `native.read`, which likewise names no operation and nothing handles.
 
 An inferred row names operations: `net.send[conn](..)` adds `net.send[conn]`,
 a call adds the callee's row as written (a mode atom stays a mode atom), and a
@@ -2012,6 +2038,30 @@ value reaches it, and offers a clause per operation not yet named. A `handle`
 is judged by rows alone, so a lambda or a function-typed parameter is judged
 by its type.
 
+A `handle` answers what its body's row names and nothing else: the operations
+its body performs, and those of the definitions and function values it calls
+whose types name them. An operation that reaches the body only through a row
+variable or a label parameter of the enclosing definition is the caller's,
+whatever it turns out to be when the program runs: it goes where the
+definition's signature sends it, to the handlers around the call. So a
+definition generic over a row or a label never observes or answers what the
+row or label stands for:
+
+```ply
+fn quiet<| e>(f: () -> Int / e) -> Int / e =
+  handle { f() } with { log.note(s) -> () }
+```
+
+`quiet(|| { log.note("x"); 1 })` performs its `log.note` against the handlers
+around the call of `quiet`, never against `quiet`'s clause, which answers only a
+`log.note` that `quiet`'s own body names. A library that answers its callback's
+operations names them in the parameter's type, as `sink` names `log.note[*]`
+above and `std.db`'s `transaction` takes `body: () -> a / {db.rollback | e}` to
+answer the body's rollback itself. A clause on a label parameter answers that
+parameter, and one on a named label never answers a perform on the parameter,
+whatever label fills it. A function value takes its handlers from where it is
+called, by its row there, a continuation included (§6.6).
+
 ### 6.6 `resume`
 
 In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the
@@ -2019,7 +2069,10 @@ continuation; the clause then has the `handle`'s type. It calls `k` at most once
 (`E0316`), unless the operation is declared `multi` (§6.1), as `flip` is, when it
 may call it any number of times and the body is held to what running twice
 allows (§7.1). Without `resume`, a clause's value returns to the perform site,
-except a clause for a `raise` operation (§6.8).
+except a clause for a `raise` operation (§6.8). `k` is a function value, and may
+be kept past the `handle` and called after it has ended: what the resumed body
+performs that its own `handle`s do not answer then goes to the handlers around
+that call, not to those that were around the capture.
 
 A clause that binds `resume` and never calls it abandons the body where it stood,
 and `bracket(acquire, release, body)` is how a body that holds something lets it
@@ -2041,8 +2094,8 @@ which releases once.
 cover. `E0303`: an effect
 escaped inference (a compiler defect). `E0305`: a `handle` lacks a clause for
 an operation its body performs on an atom it handles. `E0424`: an operation
-reached the host boundary with nothing bound — pass `--host` or handle it
-(§14).
+reached the host boundary with nothing bound to serve it, as a test's own
+process streams are — handle it (§14).
 
 ### 6.8 Raising
 
@@ -2077,7 +2130,7 @@ raise in another clause goes to a `handle` further out than the one whose
 clause raised. A clause answers the raise it names and leaves the effect's
 others to pass. A raise no clause answers ends the run with `E0502`, naming the
 operation and what it carried; a test's is its failure, which is why a raise is
-in no footprint (§8.4). One raise is the host's own under `ply run --host`:
+in no footprint (§8.4). One raise is the host's own under `ply run`:
 `std.process`'s `pipe.broken`, unanswered, ends the run as the closed pipe it
 reports would have, with nothing written and status 141 (§16).
 
@@ -2087,11 +2140,15 @@ the tuple for one of several. It answers the one `raise` operation the body's
 row names, `abort.raise` aside, and takes that atom out of the row; a body that
 names none is `E0311`, and one that names several is `E0312`, where
 `try[toml.syntax] { body }` says which and lets the others pass. Naming an
-operation that is not a `raise` is `E0313`. A `try` is the `handle` with that
+operation that is not a `raise` is `E0313`. A named `try` whose raise could
+reach the body only through a row variable of the enclosing definition is
+`E0311` too: what that variable carries is the caller's to answer, so a
+function that answers a raise of its callback names it in the callback's row,
+`f: () -> a / {toml.syntax | e}`. A `try` is the `handle` with that
 one clause and `return v -> Ok(v)`, so what holds of a `handle` holds of it: a
-recursive group with one in a member's body nests (§5.7), a `?` inside one is
-`E0118`, and so is a `try` in a module that binds an `Ok` or an `Err` of its
-own. An `Err` goes back to its raise through a function:
+recursive group with one in a member's body keeps its loop (§5.7), a `?` inside
+one exits the function through it (§5.8), and a `try` in a module that binds an
+`Ok` or an `Err` of its own is `E0118`. An `Err` goes back to its raise through a function:
 `r.unwrap_or_else(|e: SyntaxError| toml.syntax(e))` (`ply doc std.result`).
 
 The prelude declares `effect abort { raise raise(message: String) }`.
@@ -2245,12 +2302,47 @@ resumption would add to what the first left.
 
 The tasks spawned under a handler share its variables (§9). A clause runs with
 no other task's clause running in between until it performs something that may
-wait, such as a `task` or `clock` operation or a host operation under
-`--host`: one that reads a variable, waits, and then assigns it may write over
+wait, such as a `task` or `clock` operation or a host operation: one that
+reads a variable, waits, and then assigns it may write over
 what another task's clause assigned meanwhile. Keep a read and the assignment
 it decides on the same side of every wait. `simulate` searches the orders in
 which tasks reach a handler's variables, so a test of such a handler meets the
 lost update.
+
+### 6.10 Real handlers
+
+An effect's own module may name the handler that answers it where nothing in
+the program does, its **real handler**:
+
+```ply
+pub nondet effect os {
+  read pid() -> Int
+}
+
+host for os by served
+
+fn served<a | e>(go: () -> a / {os.read | e}) -> a / e =
+  handle { go() } with { os.pid() -> machine_pid() }
+```
+
+Every root the runtime enters (`main`, an entry `ply run` names, a test) runs
+under the real handler of each effect its row names, once the root has handled
+what it handles: the entry calls the handler with a closure over the root, so
+an `os.pid()` that no `handle` of the program answers reaches `served`, and one
+inside `os::on` (`std.os`) never does. A root whose row names no such effect
+runs as it is. The wrapping is the entry's, after checking: a test's row, and
+so `E0412`, is what the test performs, never what a real handler does with it.
+
+Only a module the toolchain ships declares one (`E0161`), of an effect it
+declares itself (`E0162`), once (`E0163`), and its function is a handler of
+the whole effect on every label by its signature alone (`E0164`): it takes one
+nullary function whose row names every `read` and `write` operation of the
+effect, on `[*]` where the operation takes a label, beside a row variable, and
+answers what that function answers, its row the same variable and what the
+handler adds of its own: raises, and effects no real handler serves. So its
+body, checked as any function's, discharges every operation (§6.5); a raise of
+the effect stays the program's to answer. It binds no label, states no `where`
+and is no `const fn`.
 
 ## 7. Resources, holds and regions
 
@@ -2403,7 +2495,7 @@ The scheduler that runs a spawned task must be younger than the region whose
 hold the task can reach: open it inside the region,
 `with_hold[r](..) { h -> simulate { .. } }`, and not around it,
 `simulate { with_hold[r](..) { h -> .. } }`. An older scheduler — an enclosing
-`simulate` region (§9), or the production one under `--host` — drains the tasks
+`simulate` region (§9), or the run's own region outside any (§14) — drains the tasks
 nobody joined after the region's `}`, and a `task.join` inside the region does
 not license it, because no type records the join. A task reaches a hold through
 the closure it is handed, and through the handlers around its `task.spawn`: a
@@ -2463,7 +2555,10 @@ times, ordered by the atom's qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
-nothing to read (§3.5):
+nothing to read (§3.5). An operation a region's scheduler answers (`task`'s, and
+under `simulate` `clock`'s, `random`'s and `sim`'s) costs the program nothing:
+the scheduler's own work is no step, object or byte of it, and no `--steps`
+budget bounds that work:
 
 ```ply
 type Chain = | Link(Int, Chain) | End
@@ -2538,7 +2633,7 @@ test "an order renders as stored" {
 with the diff that creates a file nothing stores yet, and never writes one.
 Storing is `snapshot::accept`, which writes through `std.fs`: an entry calls
 it, and a person runs that entry with the directory lent, as
-`ply run . --host --fs snapshots=snapshots` lends it (§14). `ply doc
+`ply run . --fs snapshots=snapshots` lends it (§14). `ply doc
 std.snapshot` has the rest.
 
 ### 8.2 Selection
@@ -2554,11 +2649,12 @@ or a new `ply` that compiles a test to the same code; the selection line counts 
 (`by_code` in `--json`, reason `same code`). `ply hash` prints the hashes, and `ply check --json`
 gives each definition's and test's as `hash`.
 
-A pass is filed with what its run read of the world: each file and directory a handler read under a
-root (by the root's name, so a pass reads the same from another checkout), each shipped module it
-asked for, and what every `ply` it started read in turn, that `ply`'s own program and shipped
-modules included; and for a run that reached a host handler, the binding it ran under (whether
-`--host`, and the names `--fs`, `--exec` and `--allow` lend). A load that read a shipped module for
+A pass is filed with what its run read of the world: each file and directory the handler that
+answered it from the host read under a root (by the root's name, so a pass reads the same from
+another checkout), each shipped module it asked for, and what every `ply` it started read in turn,
+that `ply`'s own program and shipped modules included; and for a run that reached a host handler,
+the binding it ran under (the names `--fs`, `--exec` and `--allow` lend). A read a handler of the
+test's own answers touches no host and is no input. A load that read a shipped module for
 what its program reaches (§13) files the module's types, effects and imports and each function the
 program reached, by hash, in place of the module, so an edit to a function no program of the test
 reached runs nothing. It stands while each of those still answers as it did, and otherwise the test
@@ -2624,7 +2720,7 @@ A failing deterministic test that has passed before is bisected over the
 definitions that changed to name a culprit. `--bisect auto|always|never`
 (default `auto`) and `--bisect-budget N` (evaluations, default 64) control
 this. `--json` prints one object with each failure's diagnostic, declared
-footprint, suspects, culprit and replay command (`schema_version` 6); the
+footprint, suspects, culprit and replay command (`schema_version` 7); the
 suspects are ranked culprits first, then an edited definition before one whose
 hash only moved. Each result counts the operations its test performed,
 handled ones included, as `performs`. `--watch` re-runs on every `.ply` change
@@ -2715,11 +2811,20 @@ effect sim           { read  seed() -> Int }
 
 * The region's row gains `sim.read`, which a deterministic test may carry.
 * Virtual time advances only when no task is enabled, so `clock.sleep` costs no
-  wall clock. Outside a region `task` and `clock` are the host's (§14).
+  wall clock. Outside a region `task` is the run's region's and `clock` the
+  host's (§14).
 * A task performs against the handlers around its `task.spawn`, so a clause it
-  reaches reads only the holds the task itself may (§7.2); a clause that binds
-  `resume` is unreachable from a task (`E0502`), and a clause for a raise is
-  not among them (§6.8).
+  reaches reads only the holds the task itself may (§7.2). A clause that answers,
+  or resumes on its tail, answers the task as it would the spawner; one that
+  resumes off its tail, or stops the body without resuming it, would capture or
+  abandon the spawner's body rather than the task's, and is refused when the
+  task reaches it (`E0502`). A clause for a raise is not among them (§6.8).
+* A raise a spawned task makes that no clause the task installed answers leaves
+  the task, as does one nothing answers in the region's body: the region first
+  cancels every other task, so each releases the brackets it stands in (§6.6),
+  and once they have ended the raise lands where the `simulate` is written, as
+  one the region's body made. A second raise that leaves a task meanwhile goes
+  nowhere.
 * `E0413`: a `Task` or a `Chan` escapes in the region's answer: directly,
   inside a value, or inside a closure that captured it. A closure's type shows a
   captured task only as the `task.join`, `task.await` or `task.cancel` in its
@@ -2732,8 +2837,10 @@ effect sim           { read  seed() -> Int }
   channels, so a handle that
   reaches another region past the checker, in a closure or through a type
   parameter, fails there at run time with `E0413` rather than name one of that
-  region's. `E0414`: no progress, or a spent step budget. `E0416`: nested
-  `simulate`. `E0425`: a host operation inside the region, refused before the
+  region's. `E0414`: no progress, or a spent step budget. `E0416`: a `simulate`
+  inside another; one inside a task of the run's region (§14) runs, its schedule
+  drawn from the entry's seed as any region's is. `E0425`: a host operation
+  inside the region, refused before the
   handler runs and whether or not it is bound; the region answers `task`,
   `clock`, `random` and `sim.seed` itself.
 * A `parallel` block (§5.9) inside a region runs its branches in turn, so the
@@ -3346,10 +3453,35 @@ that holds one is `E0201`, as on a function, and no deriver reads one, so
 `compare`, `digest`, `show`, a `Map` key and a `derive` over it are `E0206`; its
 module states no `key`, `show` or `numeric` for it. A module below `std.internal` holds what the standard
 library shares within itself, and only a shipped module imports one (`E0159`).
-The runtime reports each native it implements, the words a call passes, whether
-it answers and whether it raises, as the Rust type of the function it binds says;
-a unit is compiled only against a runtime that implements each native it calls, an
-`extern fn` or one the compiler writes calls of, once and as declared (`E0476`).
+A shipped module's `extern fn` reads an alias of its module's as the type it
+names, and its row names a mode only of an effect it declares or imports that
+declares no operation (`native.read`), so no handler of an effect seems to
+answer a native that asks the machine.
+An `extern fn` of a shipped module other than `std.prelude` that is generic over
+no label, states no `where`, cannot raise, and takes and answers only machine
+types is called over machine words, never over its arguments' encoding: an
+`Int`, a `Bool` (0 or 1), a `Char` (its scalar value) and a width of at most 64
+bits pass as their raw 64 bits, a `Float` as its bits, a `String` or `Bytes` is
+lent as its bytes' address and count, a `Secret`, a `Task`, a `Chan` or an
+`extern type` of its module as its handle, so no byte of a secret crosses but to
+the native, a value of one of its type variables as its word, handed over, and
+its type's descriptor, and a function whose row is one of its row variables as
+its block, lent, and the descriptor and words of the row the call fills the
+variable with. A type variable stands only whole, or as what a task or a channel
+carries. Such a native answers one of those, bytes it leaves for the caller to
+copy out, a handle or a value the caller then holds, or nothing for `()`. Its
+row is not read, and nothing in it crosses.
+The runtime reports each native it implements, the machine kind of each word a
+call passes and of its answer, and whether it raises, as the Rust type of the
+function it binds says; a unit is compiled only against a runtime that
+implements each native it calls, an `extern fn` or one the compiler writes calls
+of, once and with the kinds the compiler declares: a uniform word for each word
+of a native called over its arguments' encoding, and the machine kinds of a
+native over machine words (`E0476`). It
+also reports each helper of its own that emitted code calls, and where it lays out
+what emitted code reads in place (the context's fields, a block's header, the
+descriptors); a unit is compiled only against a runtime that agrees with what the
+compiler declares of them (`E0481`).
 Most are functions of a
 type of the language's, declared under it (`extern fn List::len`) and called on
 a value or through the type as any function of a type is (§5.4): `xs.len()`,
@@ -3425,30 +3557,74 @@ modules import, what the parts it reads import in turn, and what they embed, so
 a change to any other leaves it alone.
 Of those it checks,
 counts and hashes only the functions the program reaches and the names its
-modules import, beside every type and effect and the functions a type's `key`,
-`show`, `invariant` or `numeric` names (§4.4), and none of their tests or laws; a
+modules import, beside every type and effect, the functions a type's `key`,
+`show`, `invariant` or `numeric` names (§4.4) and an effect's real handler
+(§6.10), and none of their tests or laws; a
 function it reaches is read with what its specifications name (§10), which a
 dependent's proof is owed; a load of the library's own directory reads every
 module of it, each one whole.
 
 ## 14. The host boundary
 
-Without `--host`, an operation that reaches the boundary is `E0424`, naming the
-handler that would serve it. With `--host`, a test that can reach a bound
-nondeterministic handler is cached with what it read and the binding it ran
-under (§8.2), so its pass never answers for a hermetic run; one that reaches only
-deterministic handlers, whose answers are a function of what they are handed, as
-`std.password`'s hashes are, is cached like any other. An operation performed
-inside a `simulate`
-region reaches no handler at all: it is `E0425` (§9), since the region is run
-once per interleaving. `std.signal`, `std.process` (and `std.console` on top of
-it) and `std.term` are bound only by `ply run --host`; `ply test --host`
-withholds them (`E0424`), except that a
-test run binds `process.bound`, `process.spawn`, `process.start` and the
-operations on a started child, which reach only the programs `--exec` names. All
-flags below require `--host`.
+Every run binds the host: `ply run`, `ply test` and `ply hosts` alike. What a
+run is lent by flag is only what names a place or a power: the roots `--fs`
+binds, the programs `--exec` binds and the families `--allow` lends. Everything
+else is open by default.
 
-Outside a `simulate` region, `--host` answers the language's `task` and `clock`
+An effect whose module declares its real handler (§6.10) never reaches the
+boundary: every root whose row names it runs under that handler, whatever the
+flags say, as the operations of `std.os`, `std.certgen`, `std.config`,
+`std.password`'s `kdf`, `std.dns`, `std.net`, `std.udp`, `std.sqlite`,
+`std.term`, `std.signal` and `std.trace` do. A native such a handler calls
+refuses inside a `simulate` region and in a test the search re-runs, as a host
+operation does (`E0425`). One that would hold the program's thread, as a hash
+does, hands its work to the runtime's threads: as many hashes at once as the
+machine has cores, and the rest in line, while a task of the run's region
+that asked waits and the region's other tasks run. A test that has the machine
+compute what is a function of what it is handed, as a hash is, is cached like
+any other; one that read the machine is cached with the binding it ran under
+(§8.2), and what a real handler read under a root is what its pass stands on.
+
+`task` is answered by the run's region: every root whose row names it runs as
+the region's first task, and the region answers once every task it spawned has
+ended. Ready tasks run first in, first out. A task that sleeps, or waits on the
+host, waits while the others run; outside a task, as in a `parallel` branch,
+the thread waits. A raise no clause in a task answers fails the run. A
+`simulate` inside a task runs as anywhere else (§9).
+
+The environment is open: `config.get` and `config.secret` answer from `--set`,
+`--config`, the environment and the schema's defaults, under `ply run` and
+`ply test` alike; `config` is `nondet`, so a test that reads it is one too
+(§8.2). The network is open: a run looks names up, connects
+and listens, each socket in a table of the run's own, under the label its
+operation names. The credentials a TLS listener or upgrade names are the ones
+`--tls` gives the run, so one given none holds none (`E0429`). The console is
+open: `std.term` answers from the terminal the process's streams are, and the
+run leaves it in the mode it found it in. `ply run` listens for `SIGINT` and
+`SIGTERM` where its root performs `std.signal` or accepts connections
+(`net.accept`), and drains as the flags below say. Where its root starts a child
+(`process.start` or `process.spawn`) and drains nothing, a stop ends the run's
+children and exits at once, with the code the signal would have given (130 or
+143), so no child outlives it. Ctrl-C ends any other program at once. A run
+that listens for no stop, as a test's does, is never asked to stop and hears no
+signal, installing no handler of its own.
+`std.trace` writes to the sink `--trace` names, and holds each span to being
+closed (`E0445`). A database is opened under a root `--fs` lends, so a run
+lent none opens none (`E0451`).
+
+A test that can reach a nondeterministic handler is cached with what it read
+and the binding it ran under (§8.2), so its pass never answers for a run lent
+other roots, programs or families; one that reaches only deterministic
+handlers, whose answers are a function of what they are handed, is cached like
+any other. An operation performed inside a `simulate` region reaches no handler
+at all: it is `E0425` (§9), since the region is run once per interleaving.
+`std.process` (and `std.console` on top of it) is the run's own process under
+`ply run`; `ply test` withholds it (`E0424`, naming the handler that serves it
+under `ply run`), since a test is no process, except that a test binds
+`process.bound`, `process.spawn`, `process.start` and the operations on a
+started child, which reach only the programs `--exec` names.
+
+Outside a `simulate` region, a run answers the language's `task` and `clock`
 as well. Tasks run in turn on the thread that spawned them, and one that waits,
 on a join, a channel, a host operation or a sleep, is parked alone while the
 others run. `clock.now` reads the run's monotonic clock, in nanoseconds since
@@ -3463,11 +3639,18 @@ operation and label some row of the program names, where a written mode atom
 names every operation of its mode) with its handler, determinism,
 `at-most-once`/`repeatable`, blocking and `Secret` permission, plus the run's
 TLS, filesystem, database, configuration, tracing and shutdown settings;
-`--digest` prints one `b3:` line. A handler for an effect the program does not
-declare, or for a resource it never performs, is `E0421`, two for one atom
-`E0422`, and a determinism mismatch `E0423`. A handler for an operation the
-program's own declaration of the effect lacks binds nothing: the program was
-checked against that declaration, so it performs none of it.
+`--digest` prints one `b3:` line. An effect with a real handler (§6.10) is
+listed under that function's name, its rows read off the declaration: it is
+deterministic unless the effect is `nondet`, an operation is `at-most-once`
+where it is a `write`, it blocks where the handler's clause performs
+`std.internal.native.wait` (a ticket's wait, which `job_wait` alone performs,
+the clause's own or a function's it calls), and it is handed a `Secret` where
+an argument's type holds one. A handler
+for an effect the program does not declare, or for a resource it never
+performs, is `E0421`, two for one atom `E0422`, and a determinism mismatch
+`E0423`. A handler for an operation the program's own declaration of the effect
+lacks binds nothing: the program was checked against that declaration, so it
+performs none of it.
 
 | flag | meaning |
 | --- | --- |
@@ -3476,13 +3659,13 @@ checked against that declaration, so it performs none of it.
 | `--mtls NAME` | repeatable `--tls` credential whose listeners require a client certificate: a client that presents none `--trust` verifies is refused at the handshake; `E0429` if no `--tls` names it, `E0430` without a `--trust` |
 | `--fs NAME=PATH` | repeatable filesystem root, which `std.fs`'s files and `std.sqlite`'s databases under that label live below, and where a Unix socket `net.listen_unix` or `net.connect_unix` names under it lives; `E0454` if not a directory |
 | `--exec NAME=PATH` | repeatable program a `process.spawn` or `process.start` label may start (`ply run`, `ply test`); `E0457` if it cannot be executed |
-| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine`, `tester`, `claims` (effect `prover`), `hosts`, `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise. `machine`, `tester`, `claims` and `hosts` also lend a deterministic `hermetic_` half of the same operations (`hermetic_machine` …), which answers from what it is handed alone: no host, clock, file or cache. A test's handler answers the family with it and stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
+| `--allow NAME` | repeatable privileged family lent to the program, which must declare the effect it lends: `machine` (`std.machine`'s `machine`: open a compiled unit, bind the host families the runtime serves itself from what a run is lent, and enter one of the unit's roots), `shipped` (declared in `compiler.unit`) or `toolchain` (`compilers`, `toolchain` and the nondeterministic `memory`, declared in `compiler.cc`: compile and link C with the host's compiler below the toolchain's cache, and read the program's own heap) (`ply run`, `ply test`); `E0459` otherwise, and where an operation of `machine` that lends the host, measures or clocks an entry is performed by a run not lent it. `machine`'s deterministic half, `hermetic_machine`, answers from what it is handed alone: it binds no host, clocks nothing, and needs no grant, so a test that drives a program through it stays cached. `shipped` is deterministic: the modules, the version, the C runtime this binary ships with the natives it implements, and `reached`, which tells what traces the run what a load read of those modules |
 | `--set KEY=VALUE` | configuration value; repeatable, highest precedence |
 | `--config PATH` | `KEY=VALUE` file; repeatable, above the environment |
 | `--config-schema MODULE.FN` | a `ConfigSpec`: missing key `E0441`, bad value `E0442`, undeclared key `W0607` |
 | `--trace json\|text\|off` | trace sink: JSON lines on stderr (default), text, or discard |
 | `--trace-level debug\|info\|warn\|error` | lowest level written (default `info`) |
-| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0) |
+| `--drain-lead-ms MS` | after `SIGINT`/`SIGTERM`, keep accepting this long (default 0), in a run that drains on them |
 | `--drain-ms MS` | then let in-flight requests finish (default 30000); expiry is `W0608`, exit 3 |
 
 At the stop the listeners are closed, so a parked `net.accept` answers `0`. That
@@ -3505,7 +3688,7 @@ from `std.db`, which reads and runs its own statements.
 $ ply build . --entry app.serve -o app.plyx
 $ ply build . --digest              # print `b3:...`; writes no file
 $ ply build . --diff old.plyx       # added, changed, dropped, unchanged
-$ ply run app.plyx --host
+$ ply run app.plyx
 ```
 
 A **library** — a package whose manifest names no entry and whose own modules
@@ -3637,7 +3820,7 @@ says so. `http://` is accepted only for a registry on this machine
 The registry is a Ply program, `packages/registry`:
 
 ```
-$ ply run packages/registry --host --fs store=/srv/ply \
+$ ply run packages/registry --fs store=/srv/ply \
     --tls registry=cert.pem,key.pem --set tls=registry --set port=8443 \
     --config tokens.conf
 ```
@@ -3710,11 +3893,12 @@ program's `net.connect_tls`. Every file it names must load: one that does not is
 | 1 | a test failed, or `main` raised |
 | 2 | the program did not run: bad path, syntax or type error |
 | 3 | the drain deadline expired with requests in flight |
-| *n* | `process.exit[p](n)` under `ply run --host`: the program's own, `0` to `125` |
-| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run --host` that left `pipe.broken` unanswered (`ply doc std.process`) |
+| *n* | `process.exit[p](n)` under `ply run`: the program's own, `0` to `125` |
+| 130, 143 | `SIGINT` or `SIGTERM` ended a `ply run`: the first where the run ends its children at once, a second where it drains (§14) |
+| 141 | the reader of stdout or stderr went away, as when the output is piped into `head`: nothing more is written, by `ply` or by a program under `ply run` that left `pipe.broken` unanswered (`ply doc std.process`) |
 
-Flag groups: *simulation* (§9), *host* (`--host` and §14's flags except trace
-and drain), *prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
+Flag groups: *simulation* (§9), *host* (§14's flags except trace and drain),
+*prove* (`--prove-budget`, `--prove-steps`), *trace* (`--trace`,
 `--trace-level`),
 *drain* (`--drain-ms`, `--drain-lead-ms`).
 
@@ -3763,16 +3947,16 @@ toolchain's library, the working directory is part of. `ply fmt` rewrites the pa
 `ply bootstrap` and `ply work` take theirs as written, and `ply doc` answers for a builtin or a
 shipped module where no package holds the working directory. The binary
 answers with the code the program asked to exit with. What a command needs of
-the machine is lent to the program as an effect: `ply run`, `ply test` and
-`ply prove` drive a nested program on a machine of their own, `ply hosts` and
-`ply cache` are answered what a run would bind and what the store holds, and
+the machine is lent to the program as an effect: `ply run`, `ply test`,
+`ply prove` and `ply hosts` open the unit of the program they run and enter its
+roots through `std.machine`, `ply cache` is answered what the store holds, and
 `ply replace` is lent the text it puts in a definition's place, from
 `--with FILE` or stdin. The program emits the C of every unit a command runs,
 and of what `ply bootstrap` links, itself, and compiles it there too: the
 emitter's answer for a definition, and each object a part of a unit compiles
 to, are kept under the toolchain's cache and read back while the definition,
 the emitter, the runtime and the C compiler are the ones they were made by,
-and the machine loads the library the program hands it. What the emitter needs of a
+and `machine.open` loads the library the program hands it. What the emitter needs of a
 body beyond its text — the type each operator reads its operands at, the shape
 of each record update, the labels and witnesses each call passes — the front
 end's check files with the body's row, placed from where the definition
@@ -3814,18 +3998,19 @@ the totals' units and their sum is near the total rather than equal to it.
 that is exact and slower.
 An allocation with no `ply_*` frame on its stack is counted under the site
 `<no ply frame>`.
-What a host may lend is a policy with names, one family each:
-`machine` (load, bind, enter and call a nested program), `tester`, `claims`,
-`hosts`, `shipped` and `toolchain` (compile and link C below the toolchain's cache), each with a
-summary a reviewer can read. `ply` is lent every family; another host names the ones it means, so
-`machine` — which drives another machine — is granted on purpose and not by accident. A program
-lent `machine` hands it a program as a front end's answer and the library its unit compiles to:
-`compiler.load`'s `load[r](root)` reads the `.ply` files under `root` through the `fs` root `r`,
-the path dependencies its `ply.pkg` names and what its modules embed, checks them against the
-shipped modules and emits their unit afresh, and `compiler.cc`'s `library` compiles that C, so a
-run of it is granted `--fs r=PATH`, `--allow shipped` and `--allow toolchain`, and `machine.load`
-loads the library it is handed and runs no front end of its own. A git dependency is `ply`'s to
-fetch, and `compiler.load` refuses one.
+What a host may lend is a policy with names, one family each: `machine` (open, bind and enter a
+compiled unit), `shipped` and `toolchain` (compile and link C below the toolchain's cache), each
+with a summary a reviewer can read. `ply` is lent every family; another host names the ones it
+means, so `machine` — which drives another program — is granted on purpose and not by accident.
+A program lent `machine` hands it the library a unit compiles to and the name of the root to
+enter: `compiler.load`'s `load[r](root)` reads the `.ply` files under `root` through the `fs` root
+`r`, the path dependencies its `ply.pkg` names and what its modules embed, checks them against the
+shipped modules and emits their unit afresh, `compiler.cc`'s `library` compiles that C, and
+`machine.open` loads the library it is handed, so a run of it is granted `--fs r=PATH`,
+`--allow shipped`, `--allow toolchain` and `--allow machine`. An entry's arguments are the PLV1
+list `std.value.encode` writes and its answer the PLV1 its root wrote; a failure's places are
+sites, the root they lie in and offsets from where it is written, which the program holding the
+front end places. A git dependency is `ply`'s to fetch, and `compiler.load` refuses one.
 The first run after `ply` or the program itself changes compiles the program's unit,
 which needs the C toolchain `ply run` needs and takes a few seconds; every later
 run loads the compiled object and the front end it filed beside it. A command
@@ -4072,6 +4257,11 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0158` | a `const fn` that spent the build's budget, in calls or in the size of its value |
 | `E0159` | an import of a module below `std.internal` from outside the toolchain's own modules |
 | `E0160` | a module a `derive` names whose `derive` is no deriver: not the signature, not a module of the program's own or the toolchain's, or one whose modules derive through a library deriver |
+| `E0161` | a `host for` outside a module the toolchain ships |
+| `E0162` | a `host for` an effect its module does not declare |
+| `E0163` | an effect's real handler stated twice |
+| `E0164` | a `host for` naming a function that is not a handler of the whole effect on every label |
+| `E0165` | a clause, outside a module the toolchain ships, for an operation of an effect the toolchain declares that a value of its own type parameters crosses |
 | `E0201` | type mismatch |
 | `E0202` | arity mismatch |
 | `E0203` | occurs check |
@@ -4106,7 +4296,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0308` | polymorphic recursion: a call inside a recursive group fills a type parameter with a type that grows each time round |
 | `E0309` | `parallel` branches that may not run at once: they touch one resource where one writes, or one opens a `simulate` region or performs a `task` operation |
 | `E0310` | a `numeric` or `integer` constraint no call can pass the type of: the definition used as a value, or a parameter its signature never mentions |
-| `E0311` | `try` whose body's row names no `raise` operation to answer |
+| `E0311` | `try` whose body's row names no `raise` operation to answer, or names the one it is given only through a row variable |
 | `E0312` | `try` whose body's row names several `raise` operations, and it names none |
 | `E0313` | `try` naming an operation that is not a `raise` |
 | `E0314` | assignment to a name that is not a variable of the handler whose clause it is in |
@@ -4185,6 +4375,7 @@ a program the diagnostic no longer holds for. On a terminal a fix is a
 | `E0478` | a unit whose code calls a definition lending or giving otherwise than the definition takes it |
 | `E0479` | a law schema's `identity` constraint settled at a type whose `==` is not identity |
 | `E0480` | an `invariant` for a `pub` type that is not `opaque`, which other modules could build; a parameter default naming a constructor of a type that states an `invariant`, which each call omitting the argument would build |
+| `E0481` | a unit whose runtime lacks a helper its code calls or has it otherwise, or lays out a field, a size or a constant its code reads otherwise than the compiler declares |
 | `E0501` | assertion failed |
 | `E0502` | runtime error: `panic`, a raise nothing answers, division by zero, overflow, bad index, spent budget, call limit |
 | `E0503` | spent its step budget without finishing |

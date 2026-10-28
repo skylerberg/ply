@@ -3,26 +3,18 @@ use ply_core::{
     Determinism, Diagnostic, EffectAtom, Fields, HostAnswer, HostHandler, HostOp, HostRequest,
     HostRuntime, Linearity, Mode, Resource, Span, Symbol, Value, codes,
 };
-use ply_host::pool::Pooled;
 use ply_host::process::*;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-struct Nothing;
+thread_local! {
+    /// The run a test's operations are submitted for and waited on.
+    static RUN: Rc<dyn HostRuntime> = ply_host::Host::new().runtime();
+}
 
-impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        Vec::new()
-    }
-    fn park(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn block_on(&self, _: ply_core::Pending) -> Result<Value, Diagnostic> {
-        Ok(Value::Unit)
-    }
+fn the_run() -> Rc<dyn HostRuntime> {
+    RUN.with(Rc::clone)
 }
 
 fn host(argv: &[&str]) -> Arc<ProcessHost> {
@@ -56,7 +48,7 @@ fn call(
         .expect("every operation is registered");
     handler
         .call(
-            &Nothing,
+            &*the_run(),
             &HostRequest {
                 atom: atom(op),
                 op: declaration,
@@ -300,7 +292,7 @@ fn spawn(
         Value::list(env.iter().map(|(n, v)| variable(n, v)).collect()),
     ];
     let answer = handler.call(
-        &Nothing,
+        &*the_run(),
         &HostRequest {
             atom: EffectAtom::new(
                 Symbol::new(EFFECT),
@@ -316,7 +308,7 @@ fn spawn(
         },
     )?;
     match answer {
-        HostAnswer::Pending(pending) => host.pool().block_on(pending),
+        HostAnswer::Pending(pending) => the_run().block_on(pending),
         // `blocking` is declared, so answering inline would be `E0428` in a real run.
         HostAnswer::Value(v) => panic!("a spawn waits in the pool: {}", v.type_name()),
     }
@@ -522,7 +514,7 @@ fn a_spawn_with_an_environment_entry_that_is_not_one_is_a_dispatch_defect() {
         Value::list(vec![Value::Int(1)]),
     ];
     let answer = handler.call(
-        &Nothing,
+        &*the_run(),
         &HostRequest {
             atom: EffectAtom::new(
                 Symbol::new(EFFECT),
@@ -557,7 +549,7 @@ fn answer(
         .find(|(d, _)| d.op.as_str() == op.name())
         .expect("every operation is registered");
     handler.call(
-        &Nothing,
+        &*the_run(),
         &HostRequest {
             atom: EffectAtom::new(
                 Symbol::new(EFFECT),
@@ -585,7 +577,7 @@ fn perform(
     match answer(host, op, label, &args)? {
         HostAnswer::Pending(pending) => {
             assert!(blocking, "{op:?} waited and is not declared to");
-            host.pool().block_on(pending)
+            the_run().block_on(pending)
         }
         HostAnswer::Value(v) => {
             assert!(!blocking, "{op:?} is declared to wait and did not");
@@ -1155,28 +1147,25 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
     assert!(!alive(&pid), "the child {pid} outlived the run's teardown");
 }
 
-/// A park over two facilities' pools waits for either to finish something, rather than returning
-/// with nothing done and leaving the scheduler to count it as a fruitless park.
+/// A park over operations of two pools, a child's wait and a socket's accept, waits for whichever
+/// finishes, rather than returning with nothing done and leaving the scheduler to count it as a
+/// fruitless park.
 #[test]
 fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
-    use ply_host::tcp::Net;
-    let mut executables = Executables::new();
-    executables
-        .bind("sh", std::path::Path::new(SH), Span::DUMMY)
-        .expect("a shell is a program");
-    let facilities = ply_host::Host::new()
-        .with_process(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables));
-    let host = facilities.process().expect("a process host").clone();
-    let net = facilities.net();
-    let at = Resource::Named(Symbol::new("listener"));
-    let listener = match net.listen(&at, 0, Span::DUMMY).expect("a listen") {
-        HostAnswer::Value(handle) => handle.as_int(Span::DUMMY, "a handle").expect("an Int"),
-        HostAnswer::Pending(_) => panic!("a listen answers at once"),
-    };
-    let accepting = match net.accept(&at, listener, Span::DUMMY).expect("an accept") {
-        HostAnswer::Pending(pending) => pending,
-        HostAnswer::Value(_) => panic!("an accept waits for a peer"),
-    };
+    let host = spawning("sh", SH);
+    let net = ply_host::tcp::TcpHost::new();
+    let listener = net.listen("listener", 0, Span::DUMMY).expect("a listen");
+    let runtime = the_run();
+    let accepting = ply_host::jobs::submit(
+        ply_host::jobs::Work::Waiting,
+        ply_host::registry::run_of(&*runtime).expect("a host made the run"),
+        Span::DUMMY,
+        "test",
+        "`net.accept`",
+        net.accept("listener", listener, Span::DUMMY)
+            .expect("an accept"),
+    )
+    .expect("a thread is had");
     let child = start(
         &host,
         "sleep 0.5",
@@ -1190,8 +1179,8 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         HostAnswer::Value(_) => panic!("a wait waits in the pool"),
     };
 
-    let runtime = facilities.runtime();
-    runtime.watch(&waiting).expect("the wait is this host's");
+    let run = ply_host::registry::run_of(&*runtime).expect("a host made the runtime");
+    run.watch(&waiting).expect("the wait is this run's");
     let parked = Instant::now();
     runtime.park().expect("two operations are outstanding");
     assert!(
@@ -1200,10 +1189,7 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         parked.elapsed()
     );
     assert!(
-        runtime
-            .resolved()
-            .iter()
-            .any(|(token, answer)| *token == waiting.token && answer.is_ok()),
+        run.answered().contains(&waiting.token) && run.poll(&waiting).is_ok(),
         "the child's end is what woke the park"
     );
 

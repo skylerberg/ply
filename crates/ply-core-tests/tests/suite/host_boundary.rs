@@ -2,21 +2,28 @@
 //! the operation and the handler, and says what would or would not help. Which calls reach these is
 //! the CLI suite's `host_boundary` module, over real host operations.
 
-use ply_core::host::{Pending, err_blocking_answered_inline, err_hermetic};
-use ply_core::{
-    EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes, err_footprint_escape,
-    err_no_runtime,
-};
+use ply_core::host::{err_blocking_answered_inline, err_footprint_escape, err_withheld};
+use ply_core::{EffectAtom, Footprint, Mode, Resource, Span, Symbol, codes};
 
-/// E0424 means "pass `--host`", which a handler is named for.
+/// A run that withholds an operation names the handler that serves it, where it serves it, and the
+/// twin a test answers it over.
 #[test]
-fn a_hermetic_refusal_names_the_handler_that_would_have_answered() {
-    let d = err_hermetic(Span::DUMMY, "t.net.send[socket]", "test::send");
-    assert_eq!(d.code, codes::HERMETIC_BOUNDARY);
-    assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
+fn a_withheld_refusal_names_the_handler_and_where_it_serves() {
+    let d = err_withheld(
+        Span::DUMMY,
+        "std.process.process.out[proc]",
+        &Symbol::new("std.process.process"),
+        "test::out",
+        "under `ply run`",
+    );
+    assert_eq!(d.code, codes::HOST_UNBOUND);
+    assert!(d.message.contains("process.out[proc]"), "{}", d.message);
     let notes = d.notes.join(" ");
-    assert!(notes.contains("test::send"), "{notes}");
-    assert!(notes.contains("--host"), "{notes}");
+    assert!(
+        notes.contains("`test::out` serves this under `ply run`"),
+        "{notes}"
+    );
+    assert!(notes.contains("`std.process`'s twin"), "{notes}");
 }
 
 /// The declared footprint is checked before the handler runs, or the packet is already out.
@@ -45,23 +52,6 @@ fn an_answer_outside_the_declared_footprint_names_what_was_declared() {
     assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
     let said = format!("{} {}", d.message, d.notes.join(" "));
     assert!(said.contains("t.net.write[other]"), "{said}");
-}
-
-/// A binding with no reactor is a legitimate configuration, so a token it cannot wait on is a
-/// diagnostic and not a panic.
-#[test]
-fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
-    let d = err_no_runtime(
-        Span::DUMMY,
-        "t.net.send[socket]",
-        Pending {
-            token: 7,
-            label: "send",
-        },
-        "test::send",
-    );
-    assert_eq!(d.code, codes::INTERNAL_ERROR);
-    assert!(d.message.contains("t.net.send[socket]"), "{}", d.message);
 }
 
 /// A handler declared blocking answers on the host's pool, never inline on the run's thread.

@@ -3,7 +3,8 @@
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
 import std.bin
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
+                                    AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin,
+                                    mode_text)
 import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
                               ImportDecl, INames, Constraint, Deriver, DJson, DEq, DOrd, DBin,
                               DShow, DHash, DNumeric, DInteger, DRow, DLibrary, is_predicate,
@@ -13,15 +14,15 @@ import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin,
 import compiler.syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_module)
 import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
                                  LDec, LChar)
-import compiler.check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn,
-                             TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, atoms_insert,
-                             row_empty, row_open, row_singleton, named_type, applied_type, int_type,
-                             bool_type, string_type, bytes_type, float_type, decimal_type,
-                             unit_type, list_type, option_type, fn_type, fields_sorted, ints_insert,
-                             ints_union, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
-                             fresh_row, subst_new, with_bindings, resolve_row, free_vars,
-                             env_bind_global, at_arguments, TyNominal, atom_bin, type_bin,
-                             scheme_bin, TypeTable, owning_fn_type)
+import compiler.check.types (Resource, RSingleton, RVar, RNamed, RAny, Atom, Row, Type, TyVar,
+                             TyCon, TyFn, TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified,
+                             atoms_insert, row_empty, row_open, row_singleton, named_type,
+                             applied_type, int_type, bool_type, string_type, bytes_type, float_type,
+                             decimal_type, unit_type, list_type, option_type, fn_type,
+                             fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
+                             fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
+                             resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
+                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable, owning_fn_type)
 import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
                                       error_with_labels, error_at, error_at_and)
@@ -436,6 +437,80 @@ pub type TypedAt = {
 /// places, and one record type can be large.
 pub type TypedSite = { module: Int, site: Int, ty: Bytes, args: List<Bytes>, owner: Bytes }
 
+/// A row the emitter reads at a site, as the walk found it: resolved when the check ends, as a
+/// `TypedAt` is. `answers` is the operation a handler's clause noted there answers, as `effect.op`
+/// by the effect's program-wide name; empty at any other site.
+pub type RowAt = { module: Int, span: Span, found: RowFound, owner: Bytes, answers: Bytes }
+
+/// What a walk found of the rows at one site.
+pub type RowFound =
+  /// A read of the definition `named`: `quantified` are the row variables of its scheme as the
+  /// read found it, and `filled` the variable each became.
+  | ReadOf({ named: Bytes, quantified: List<Int>, filled: List<Int> })
+  /// What a lambda, a call through a value, a `handle`'s body, a clause or a branch performs.
+  | RowOf(Row)
+  /// What a perform performs.
+  | AtomOf(Atom)
+  /// What a call the rewrite writes of a builtin generic over rows fills them with, in order.
+  | FilledOf(List<Row>)
+
+/// A `RowAt` resolved, each variable read in its owner's numbering: a row variable as its place
+/// among the owner's scheme's `row_vars`, a row ending in any other closed there, since nothing
+/// settles that variable, and a label variable as its place among its `label_vars`, any other `-1`.
+/// What the emitter hands evidence by, and what a listing reads a real handler's clauses by: at a
+/// clause, `answers` is the operation it answers (`RowAt`).
+pub type RowSite = { module: Int, site: Int, filed: FiledRows, owner: Bytes, answers: Bytes }
+
+/// The rows filed at one site, in its owner's numbering.
+pub type FiledRows =
+  /// At a read of a definition its scheme makes generic over rows: what the read fills each of the
+  /// scheme's row variables with, in the scheme's order.
+  | RowArguments(List<Row>)
+  /// At a lambda, a call through a function value, a `handle` or `try`, a clause, a `return`
+  /// clause or a `parallel` branch: what it performs. A `handle`'s is its body's, opened to what
+  /// its clauses answer; a call's is what the function type it calls through says.
+  | Performs(Row)
+  /// At a perform: the atom it performs, its label the owner's variable or a named one.
+  | PerformsAtom(Atom)
+
+/// `filed` as a reader writes it: a row variable as `e` and a label variable as `l` with its place,
+/// `?` for a label the owner does not quantify.
+pub fn filed_rows_text(filed: FiledRows) -> Bytes / {abort.raise} =
+  match filed {
+    RowArguments(rows) ->
+      Bytes::concat_all([b"[", Bytes::join(rows.map(filed_row_text), b", "), b"]"]),
+    Performs(row) -> filed_row_text(row),
+    PerformsAtom(atom) -> filed_atom_text(atom),
+  }
+
+fn filed_row_text(row: Row) -> Bytes / {abort.raise} = {
+  let atoms = Bytes::join(row.atoms.map(filed_atom_text), b", ");
+  let tail = match row.tail {
+    None -> b"",
+    Some(v) ->
+      Bytes::concat_all([if atoms.len() == 0 { b"" } else { b" " }, b"| ", filed_place(b"e", v)]),
+  };
+  Bytes::concat_all([b"{", atoms, tail, b"}"])
+}
+
+fn filed_atom_text(atom: Atom) -> Bytes / {abort.raise} = {
+  let resource = match atom.resource {
+    RSingleton -> b"",
+    RAny -> b"[*]",
+    RNamed(n) -> Bytes::concat_all([b"[", n, b"]"]),
+    RVar(v) -> Bytes::concat_all([b"[", filed_place(b"l", v), b"]"]),
+  };
+  Bytes::concat_all([
+    atom.effect,
+    b".",
+    match atom.op { Some(op) -> op, None -> mode_text(atom.mode) },
+    resource,
+  ])
+}
+
+fn filed_place(letter: Bytes, place: Int) -> Bytes / {abort.raise} =
+  if place < 0 { b"?" } else { letter.concat(ascii_of_int(place)) }
+
 pub type Assumed = { deriver: Deriver, vars: List<Int> }
 
 /// A clause of a `handle` around a spawn, typed as the function its task calls by performing `op`.
@@ -671,6 +746,7 @@ pub type Checker = {
   bit_ops: List<BitOp>,
   operands: List<OperandAt>,
   typed: List<TypedAt>,
+  rows_at: List<RowAt>,
   /// The type of each expression of the definition being walked, which its ownership walk reads
   /// once the walk is done; no answer keeps it.
   valued: List<{ span: Span, ty: Type }>,
@@ -685,6 +761,8 @@ pub type Checker = {
   updates: List<UpdateSite>,
   update_shapes: List<UpdateShape>,
   try_sites: List<TrySite>,
+  /// What each exit effect of a module's `?`s inside `handle`s carries, by module and name.
+  exit_types: Map<Bytes, Type>,
   release_sites: List<ReleaseSite>,
   /// Each hole a body walked so far holds, in the order the walk met them.
   holes: List<HoleSite>,
@@ -718,6 +796,9 @@ pub type Checker = {
   walking: Bytes,
   /// What the rows handed in say the emitter reads of each body published from them.
   kept: List<KeptFacts>,
+  /// Each rigid variable a clause sees one of its operation's own type parameters as where a value
+  /// crosses at it: the perform hands the clause such a value kept, so its sites are filed `Kept`.
+  kept_vars: List<Int>,
   /// Each body this check walked, as another check reads it.
   bodies: List<WalkedBody>,
   assumed: List<Assumed>,
@@ -1425,14 +1506,16 @@ pub type Builtin = {
   body: Bool,
 }
 
-/// What a declaration's types are read against: the variables its generic list binds, and the types
-/// the prelude imports, each under the name its module declares it by.
+/// What a declaration's types are read against: the variables its generic list binds, the types
+/// the prelude imports, each under the name its module declares it by, and the body of each alias
+/// of no parameter its module declares.
 type Declaring = {
   fresh: Fresh,
   tys: Map<Bytes, Type>,
   labels: Map<Bytes, Type>,
   rows: Map<Bytes, Int>,
   imported: Map<Bytes, Bytes>,
+  aliases: Map<Bytes, TypeExpr>,
 }
 
 fn misdeclared(what: Bytes, name: Bytes) -> String =
@@ -1441,15 +1524,21 @@ fn misdeclared(what: Bytes, name: Bytes) -> String =
 fn declared_types(
   d: Declaring,
   tys: List<TypeExpr>,
+  room: Int,
 ) -> { d: Declaring, tys: List<Type> } / {abort.raise} =
   tys.fold({ d: d, tys: [] }, |acc: { d: Declaring, tys: List<Type> }, ty: TypeExpr| {
-    let o = declared_type(acc.d, ty);
+    let o = declared_type(acc.d, ty, room);
     { d: o.d, tys: acc.tys.push(o.ty) }
   })
 
 /// A type as a declaration writes it: the language's own, or one its module declares or imports by
-/// name, at the arguments written.
-fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {abort.raise} =
+/// name, at the arguments written; an alias of its module's is the type it names, read with `room`
+/// more aliases to expand inside one another.
+fn declared_type(
+  d: Declaring,
+  ty: TypeExpr,
+  room: Int,
+) -> { d: Declaring, ty: Type } / {abort.raise} =
   match ty {
     TVar(id) -> match d.tys.get(id.name) {
       Some(t) -> { d: d, ty: t },
@@ -1461,47 +1550,59 @@ fn declared_type(d: Declaring, ty: TypeExpr) -> { d: Declaring, ty: Type } / {ab
       let fs = r.fields.fold(
         { d: d, fs: [] },
         |acc: { d: Declaring, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
-          let o = declared_type(acc.d, f.ty);
+          let o = declared_type(acc.d, f.ty, room);
           { d: o.d, fs: acc.fs.push({ name: f.name.name, ty: o.ty }) }
         },
       );
       { d: fs.d, ty: TyRecord(fields_sorted(fs.fs)) }
     },
     TFn(f) -> {
-      let ps = declared_types(d, f.params);
-      let r = declared_type(ps.d, f.ret);
+      let ps = declared_types(d, f.params, room);
+      let r = declared_type(ps.d, f.ret, room);
       { d: r.d, ty: owning_fn_type(ps.tys, f.kept, f.once, r.ty, declared_row(r.d, f.effects)) }
     },
     TCon(c) -> {
       let name = c.name.name.name;
       match d.tys.get(name) {
         Some(t) -> { d: d, ty: t },
-        None -> match d.imported.get(name) {
-          Some(full) -> {
-            let args = declared_types(d, c.args);
-            { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+        None -> match if c.args.len() == 0 { d.aliases.get(name) } else { None } {
+          // Read without itself, so an alias that names itself is no type at all.
+          Some(body) -> if room <= 0 { panic("an alias expanded past the aliases there are") }
+          else {
+            let o = declared_type({ ..d, aliases: d.aliases.remove(name) }, body, room - 1);
+            { d: { ..o.d, aliases: d.aliases }, ty: o.ty }
           },
-          None -> {
-            let args = declared_types(d, c.args);
-            if builtin_type_arity(name) != Some(args.tys.len()) {
-              panic(misdeclared(b"names a type that is not the language's own at that arity", name))
-            } else if name == b"Hold" {
-              match c.labels {
-                [l] -> match args.d.labels.get(l.name) {
-                  Some(label) ->
-                    { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
-                  None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
-                },
-                _ -> panic(misdeclared(b"names a hold without its region's label", name)),
-              }
-            } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+          None -> match d.imported.get(name) {
+            Some(full) -> {
+              let args = declared_types(d, c.args, room);
+              { d: args.d, ty: TyCon({ name: full, args: args.tys }) }
+            },
+            None -> {
+              let args = declared_types(d, c.args, room);
+              if builtin_type_arity(name) != Some(args.tys.len()) {
+                panic(
+                  misdeclared(b"names a type that is not the language's own at that arity", name),
+                )
+              } else if name == b"Hold" {
+                match c.labels {
+                  [l] -> match args.d.labels.get(l.name) {
+                    Some(label) ->
+                      { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
+                    None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
+                  },
+                  _ -> panic(misdeclared(b"names a hold without its region's label", name)),
+                }
+              } else { { d: args.d, ty: TyCon({ name: name, args: args.tys }) } }
+            },
           },
         },
       }
     },
   }
 
-/// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a row variable, or none of them.
+/// A declaration's row: `abort.raise`, a `hold.read` of a label it binds, a mode atom of an effect
+/// its module declares or imports by name (`native.read`), which a check holds to one that declares
+/// no operation, a row variable, or none of them.
 fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
   match row {
     None -> row_empty(),
@@ -1522,7 +1623,24 @@ fn declared_row(d: Declaring, row: Option<RowExpr>) -> Row / {abort.raise} =
               None -> panic(misdeclared(b"reads a hold without its region's label", hold())),
             }
           } else {
-            panic(misdeclared(b"performs more than `abort.raise` and `hold.read`", a.eff.name.name))
+            match if is_bare(a.eff) && a.op == None && a.resource == None {
+                d.imported.get(a.eff.name.name)
+              } else { None } {
+              Some(imported) ->
+                atoms_insert(acc, {
+                  effect: imported,
+                  resource: RSingleton,
+                  mode: a.mode,
+                  op: None,
+                }),
+              None ->
+                panic(
+                  misdeclared(
+                    b"performs more than `abort.raise`, `hold.read` and a mode of an effect it names",
+                    a.eff.name.name,
+                  ),
+                ),
+            }
           }),
         tail: match r.tail {
           None -> None,
@@ -1596,10 +1714,13 @@ fn contract_of(
     },
   }
 
+/// `def` as the builtin `name`, its types read against `imported` and the bodies of the aliases of
+/// no parameter its module declares, `aliases`.
 pub fn declared(
   name: Bytes,
   imported: Map<Bytes, Bytes>,
   def: ExternDef,
+  aliases: Map<Bytes, TypeExpr>,
 ) -> Builtin / {abort.raise} = {
   let tys = def.generics.types.fold(
     { fresh: fresh_new(), tys: Map::new() },
@@ -1624,14 +1745,22 @@ pub fn declared(
     },
   );
   let params = declared_types(
-    { fresh: rows.fresh, tys: tys.tys, labels: labels.tys, rows: rows.rows, imported: imported },
+    {
+      fresh: rows.fresh,
+      tys: tys.tys,
+      labels: labels.tys,
+      rows: rows.rows,
+      imported: imported,
+      aliases: aliases,
+    },
     def.params.map(|p: Param|
       match p.ty {
         Some(t) -> t,
         None -> panic(misdeclared(b"leaves a parameter untyped", p.name.name)),
       }),
+    aliases.len(),
   );
-  let ret = declared_type(params.d, def.ret);
+  let ret = declared_type(params.d, def.ret, aliases.len());
   let row = declared_row(ret.d, def.effects);
   let written = def.constraints.fold([], |acc: List<DefConstraint>, c: Constraint| {
     let param = range(0, def.generics.types.len()).fold(0 - 1, |p: Int, i: Int|
@@ -1711,7 +1840,7 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
     parsed.node.items.fold([], |acc: List<Builtin>, item: Item|
       match item {
         IExtern(def) -> if is_builtin(prelude_module(), parsed.node, def) {
-          acc.push(declared(def.name.name, imported, def))
+          acc.push(declared(def.name.name, imported, def, Map::new()))
         } else { acc },
         IFn(d) -> if !is_pub(d.vis) { acc } else {
           let whole = signed_extern(source, d);
@@ -1721,7 +1850,7 @@ pub fn builtins() -> List<Builtin> / {abort.raise} = {
             spec: whole.spec.filter(|c: SpecClause| c.kind == SRequires || c.kind == SEnsures),
           };
           acc.push({
-            ..declared(d.name.name, imported, called),
+            ..declared(d.name.name, imported, called, Map::new()),
             clauses: whole.spec.map(|c: SpecClause| written_at(whole, c.span)),
             body: true,
           })
@@ -2014,6 +2143,10 @@ derive bin for MemberSite
 derive bin for LabelSite
 
 derive bin for TypedSite
+
+derive bin for FiledRows
+
+derive bin for RowSite
 
 derive bin for WitnessOp
 

@@ -33,19 +33,20 @@ import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (dummy_span)
 import compiler.emit.keys (Named, Root)
 import compiler.emit.tir.containers (Retained)
+import compiler.emit.tir.handling (instance_alone)
 import compiler.emit.reps (TyRec, kind_of)
-import compiler.emit.tir (Rep, RWord, RInt, RBool, RFloat, RFlat, RToken, RSum, MCase, Var, Arg,
-                          AVar, AInt, ABool, AFloat, AZero, Val, Prim, Make, Get, Take, Pack, Call,
-                          Apply, Native, Gathered, Updated, FieldSet, Path, PField, PArg, PLeaf,
-                          PCase, Made, MList, MClosure, TLength, Inst, Let, Do, Decl, Assign, If,
-                          Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail, NoArm,
-                          Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member,
-                          Convention, Rooted, Lambda, Closure, Handed, Given, Lent, Owned, Borrowed,
-                          Returned, Test, TTag, Owns, ReadsOf, Lasts, Static, Op, OStrings, RAddr,
-                          PPayload, no_links, counted, operands, fails, used_as, var_of, rep_of_arg,
-                          parts_of, ends, string_uses, MFramed, OContainer, Walked, Unsettled,
-                          LastOf, PPlace, word_record, read_records, MRecord, FieldMade, Supplied,
-                          Built, Unwinds, Unwound)
+import compiler.emit.tir (no_closure_words, Rep, RWord, RInt, RBool, RFloat, RFlat, RToken, RSum,
+                          MCase, Var, Arg, AVar, AInt, ABool, AFloat, AZero, Val, Prim, Make, Get,
+                          Take, Pack, Call, Apply, Native, Gathered, Updated, FieldSet, Path,
+                          PField, PArg, PLeaf, PCase, Made, MList, MClosure, TLength, Inst, Let, Do,
+                          Decl, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
+                          Enter, Fail, NoArm, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block,
+                          Fn, Member, Convention, Rooted, Lambda, Closure, Handed, Given, Lent,
+                          Owned, Borrowed, Returned, Test, TTag, Owns, ReadsOf, Lasts, Static, Op,
+                          OStrings, RAddr, PPayload, no_links, counted, operands, fails, used_as,
+                          var_of, rep_of_arg, parts_of, ends, string_uses, MFramed, OContainer,
+                          Walked, Unsettled, LastOf, PPlace, word_record, read_records, MRecord,
+                          FieldMade, Supplied, Built, Unwinds, Unwound)
 import compiler.emit.tir.strings (ByteRead)
 import compiler.emit.verify (verified, stacked_captures, payload_of, takeable, held_in_place,
                              reuses_cells, made_width, re_held, leaves, answer_held, word_held,
@@ -222,7 +223,7 @@ fn val_renamed(v: Val, arg: (Arg) -> Arg, var: (Var) -> Var) -> Val =
     Op(o) -> Op({ ..o, args: o.args.map(arg) }),
     LastOf(x) -> LastOf(var(x)),
     Walked(w) -> Walked({ ..w, of: var(w.of) }),
-    Unsettled(args) -> Unsettled(args.map(arg)),
+    Unsettled(ops) -> Unsettled(ops.map(|o: { arg: Arg, takes: Bool }| { ..o, arg: arg(o.arg) })),
     _ -> v,
   }
 
@@ -1522,7 +1523,9 @@ fn walked_back(fx: Facts, ex: Exits, b: Block, out: Live, next: Int) -> Back =
         let inner = Map::merge(outer_reads(fx, h.body, [h.answer]), lent);
         let across = Map::merge(acc.live.remove(h.answer.id), inner);
         let k = { ..ex, looped: None, miss: Map::new(), landing: across };
-        let body = walked_back(fx, k, h.body, across.insert(h.answer.id, h.answer), acc.next);
+        // A body under a `return` clause leaves its value to the landing, which sets the answer.
+        let ends = if h.site.ret == None { across.insert(h.answer.id, h.answer) } else { across };
+        let body = walked_back(fx, k, h.body, ends, acc.next);
         let e = entered(fx, k, body, across);
         let p = planned(fx, ops, across);
         let gone = inner.values().filter(|v: Var| owns(fx, v) && !acc.live.contains(v.id));
@@ -2251,7 +2254,8 @@ test "the closures a root makes are counted as roots of their own" {
   let p = word(0);
   let q = word(1);
   let lambda = { ..root_of([p, q], [], RWord, [Return(AVar(q))]), key: Named(b"m.f#0") };
-  let closure = |body: Fn| Closure({ body: body, captures: 0, at: dummy_span() });
+  let closure = |body: Fn|
+    Closure({ body: body, captures: 0, at: dummy_span(), words: no_closure_words() });
   let f = { ..root_of([], [], RInt, [Return(AInt(0))]), lambdas: [closure(lambda)] };
   let o = owned(f);
   assert_eq(o.lambdas, [closure({ ..lambda, body: [Dec(p), Return(AVar(q))] })]);
@@ -3308,7 +3312,7 @@ test "a handle holds across its body what the body reads, which its landing rele
   let r = word(1);
   let a = word(2);
   let c = flag(3);
-  let site = { clauses: [], ret: None, detached: None };
+  let site = { clauses: [], ret: None, detached: None, instance: instance_alone(0) };
   let uses = { takes: [], owned: false, fails: true, stops: false };
   let inside = [
     If({
@@ -3338,7 +3342,7 @@ test "a handle holds across its body what the body reads, which its landing rele
       body: [],
       args: [AVar(p)],
       uses: { ..uses, takes: [false] },
-      site: { ..site, detached: Some(0) },
+      site: { ..site, detached: Some({ body: 0, forwards: 0 }) },
       answer: a,
       unwind: unwind,
     });
@@ -3547,7 +3551,7 @@ test "a handle inside another's body releases at its landing only what the outer
   let t = word(3);
   let b = word(4);
   let s = word(5);
-  let site = { clauses: [], ret: None, detached: None };
+  let site = { clauses: [], ret: None, detached: None, instance: instance_alone(0) };
   let uses = { takes: [], owned: false, fails: true, stops: false };
   let inner = |unwind: List<Var>|
     Handle({

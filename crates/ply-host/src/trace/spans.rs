@@ -24,6 +24,7 @@ pub struct Closing {
 }
 
 /// Why an `exit` names a span that is not open on the performing task's stack.
+#[derive(Debug)]
 pub enum Unbalanced {
     NeverOpened,
     AlreadyClosed,

@@ -1,8 +1,8 @@
-use ply_core::host::{
-    HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
+use ply_core::TaskId;
+use ply_core::host::MachineId;
+use ply_host::trace::{
+    Clock, Discard, Field, Json, Level, Outcome, Owner, RecordKind, Sink, Trace,
 };
-use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value};
-use ply_host::trace::{Clock, Discard, Json, Level, Op, Sink, Trace};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -45,140 +45,100 @@ impl Clock for CountedClock {
     }
 }
 
-struct NoRuntime;
-
-impl HostRuntime for NoRuntime {
-    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn park(&self) -> Result<(), Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-}
-
 struct Bench {
-    handlers: Vec<(HostOp, Arc<dyn HostHandler>)>,
-    /// Built once, outside the measurement.
-    atom: EffectAtom,
     trace: Arc<Trace>,
     clock: Arc<CountedClock>,
-    machine: MachineId,
+    owner: Owner,
+    /// Three fields, which is what an endpoint's event actually carries, read once outside the
+    /// measurement as the native reads them.
+    fields: Vec<(String, Field)>,
 }
 
-fn bench(sink: Arc<dyn Sink>, channel: &str) -> Bench {
+fn bench(sink: Arc<dyn Sink>) -> Bench {
     let clock = Arc::new(CountedClock::default());
-    let path = sink.path();
-    let trace = Arc::new(Trace::with_clock(
-        sink,
-        Arc::clone(&clock) as Arc<dyn Clock>,
-    ));
-    let mut registry = HostRegistry::new();
-    ply_host::trace::register(&mut registry, Arc::clone(&trace));
-    let declarations: Vec<HostOp> = registry.ops().cloned().collect();
-    assert!(
-        declarations.iter().all(|op| op.path == path),
-        "the listing names the sink that serves the run"
-    );
     Bench {
-        handlers: Op::ALL
-            .into_iter()
-            .zip(declarations)
-            .map(|(op, declaration)| {
-                (
-                    declaration,
-                    ply_host::trace::handler(op, Arc::clone(&trace)),
-                )
-            })
-            .collect(),
-        atom: EffectAtom::new(
-            Symbol::new(ply_host::trace::EFFECT),
-            Resource::Named(Symbol::new(channel)),
-            Mode::Write,
-        ),
-        trace,
+        trace: Arc::new(Trace::with_clock(
+            sink,
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )),
         clock,
-        machine: MachineId::next(),
+        owner: (MachineId::next(), Some(TaskId(1))),
+        fields: vec![
+            ("sku".to_string(), Field::Text("BOLT-1".to_string())),
+            ("qty".to_string(), Field::Int(3)),
+            ("rush".to_string(), Field::Bool(false)),
+        ],
     }
 }
 
 impl Bench {
-    fn at(&self, op: Op) -> &(HostOp, Arc<dyn HostHandler>) {
-        let index = Op::ALL
-            .iter()
-            .position(|candidate| *candidate == op)
-            .expect("every operation is registered");
-        &self.handlers[index]
+    fn event(&self, level: Level) {
+        self.trace.record(
+            self.owner,
+            RecordKind::Event,
+            level,
+            "orders",
+            "placed",
+            None,
+            None,
+            black_box(&self.fields),
+        );
     }
 
-    fn call(&self, op: Op, args: &[Value]) -> Result<Value, Diagnostic> {
-        let (declaration, handler) = self.at(op);
-        let request = HostRequest {
-            atom: self.atom.clone(),
-            op: declaration,
-            args,
-            span: Span::DUMMY,
-            machine: self.machine,
-            task: Some(TaskId(1)),
-            declared: None,
-        };
-        match handler.call(&NoRuntime, &request)? {
-            HostAnswer::Value(value) => Ok(value),
-            HostAnswer::Pending(_) => panic!("`trace` never waits on a peer"),
-        }
+    fn count(&self) {
+        self.trace.record(
+            self.owner,
+            RecordKind::Count,
+            Level::Info,
+            "orders",
+            "orders_placed",
+            Some(1),
+            None,
+            black_box(&self.fields),
+        );
     }
 
-    fn perform(&self, op: Op, args: &[Value]) -> Result<(), Diagnostic> {
-        black_box(self.call(op, args)?);
-        Ok(())
+    fn span(&self) {
+        let id = self
+            .trace
+            .enter(self.owner, "http", "request", black_box(&self.fields));
+        self.trace
+            .exit(self.owner, "http", id, Outcome::Ok)
+            .expect("it closes");
     }
-}
 
-fn ctor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(format!("std.trace.{name}"), args)
-}
-
-/// Three fields, which is what an endpoint's event actually carries.
-fn fields() -> Value {
-    Value::map([
-        (Value::str("sku"), ctor("FText", vec![Value::str("BOLT-1")])),
-        (Value::str("qty"), ctor("FInt", vec![Value::Int(3)])),
-        (Value::str("rush"), ctor("FBool", vec![Value::Bool(false)])),
-    ])
+    fn clock_reads(&self) -> u64 {
+        self.clock.0.load(Ordering::Relaxed)
+    }
 }
 
 const EVENTS: usize = 1_000;
 
+/// Warm first: a first call through `dyn` may fault in a page; the steady state is what is
+/// measured.
+fn steady(times: usize, mut each: impl FnMut()) -> usize {
+    for _ in 0..16 {
+        each();
+    }
+    allocations_of(|| {
+        for _ in 0..times {
+            each();
+        }
+    })
+    .1
+}
+
 #[test]
 fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
-    let b = bench(Arc::new(Discard), "orders");
-    let level = ctor("Info", Vec::new());
-    let name = Value::str("placed");
-    let fields = fields();
-    let args = [level, name, fields];
-
-    // Warm: a first call through `dyn` may fault in a page; the steady state is what is measured.
-    for _ in 0..16 {
-        b.perform(Op::Event, &args).expect("discarded");
-    }
-
-    let (_, allocs) = allocations_of(|| {
-        for _ in 0..EVENTS {
-            b.perform(Op::Event, &args).expect("discarded");
-        }
-    });
-
+    let b = bench(Arc::new(Discard));
+    assert!(!b.trace.wants(Level::Info), "the handler writes no field");
+    let allocs = steady(EVENTS, || b.event(Level::Info));
     assert_eq!(
         allocs, 0,
-        "a discarded event must cost the handler nothing; it cost {allocs} allocations over {EVENTS} events"
+        "a discarded event must cost the run nothing; it cost {allocs} allocations over {EVENTS} events"
     );
     assert_eq!(
-        b.clock.0.load(Ordering::Relaxed),
+        b.clock_reads(),
         0,
         "a discarding sink never stamps, so a disabled event pays no clock read"
     );
@@ -187,103 +147,55 @@ fn a_discarded_event_allocates_nothing_and_reads_no_clock() {
 
 #[test]
 fn a_discarded_metric_allocates_nothing() {
-    let b = bench(Arc::new(Discard), "orders");
-    let args = [Value::str("orders_placed"), Value::Int(1), fields()];
-    for _ in 0..16 {
-        b.perform(Op::Count, &args).expect("discarded");
-    }
-    let (_, allocs) = allocations_of(|| {
-        for _ in 0..EVENTS {
-            b.perform(Op::Count, &args).expect("discarded");
-        }
-    });
+    let b = bench(Arc::new(Discard));
+    let allocs = steady(EVENTS, || b.count());
     assert_eq!(allocs, 0, "a discarded counter cost {allocs} allocations");
 }
 
-/// The perform and the call site's map are still paid, so this asserts clock reads, not wall time.
 #[test]
 fn a_debug_event_under_a_warn_filter_costs_what_a_discarded_one_costs() {
-    let b = bench(Arc::new(Json::new(Level::Warn)), "orders");
-    let args = [ctor("Debug", Vec::new()), Value::str("chatty"), fields()];
-    for _ in 0..16 {
-        b.perform(Op::Event, &args).expect("filtered");
-    }
-    let (_, allocs) = allocations_of(|| {
-        for _ in 0..EVENTS {
-            b.perform(Op::Event, &args).expect("filtered");
-        }
-    });
+    let b = bench(Arc::new(Json::new(Level::Warn)));
+    assert!(!b.trace.wants(Level::Debug), "the handler writes no field");
+    let allocs = steady(EVENTS, || b.event(Level::Debug));
     assert_eq!(
         allocs, 0,
         "a filtered event must not build a record; it cost {allocs} allocations"
     );
-    assert_eq!(
-        b.clock.0.load(Ordering::Relaxed),
-        0,
-        "a filtered event is not stamped"
-    );
+    assert_eq!(b.clock_reads(), 0, "a filtered event is not stamped");
 }
 
-/// It costs the stack entry and the `Span` the operation's type requires; neither is the sink's.
+/// It costs the stack entry its `exit` is checked against, which is not the sink's.
 #[test]
-fn a_discarded_span_costs_only_the_stack_entry_and_the_span_it_must_answer() {
-    let b = bench(Arc::new(Discard), "http");
-    let name = Value::str("request");
-    let fields = fields();
-    let enter = [name, fields];
-    let ok = ctor("Ok", Vec::new());
-
-    let cycle = |b: &Bench| {
-        let span = b
-            .call(Op::Enter, &enter)
-            .expect("a span opens whatever the sink does");
-        b.perform(Op::Exit, &[span, ok.clone()]).expect("it closes");
-    };
-
-    for _ in 0..16 {
-        cycle(&b);
-    }
+fn a_discarded_span_costs_less_than_a_collected_one_and_reads_no_clock() {
     const SPANS: usize = 200;
-    let (_, allocs) = allocations_of(|| {
-        for _ in 0..SPANS {
-            cycle(&b);
-        }
-    });
-    let per_span = allocs as f64 / SPANS as f64;
-    println!("  discarded span    {per_span:.1} allocations · 0 clock reads");
+    let discarded = bench(Arc::new(Discard));
+    let discarding = steady(SPANS, || discarded.span());
+    let collected = bench(Arc::new(ply_host::trace::sink::Recording::new(
+        Level::Debug,
+    )));
+    let collecting = steady(SPANS, || collected.span());
     assert!(
-        per_span <= 8.0,
-        "a disabled span costs {per_span:.2} allocations, which is more than the `Span` record and its stack entry"
+        discarding < collecting,
+        "a disabled span cost {discarding} allocations over {SPANS} spans, a collected one {collecting}"
     );
     assert_eq!(
-        b.clock.0.load(Ordering::Relaxed),
+        discarded.clock_reads(),
         0,
         "a disabled span is never stamped, so `clock` stays out of every tracing function's row"
     );
-    assert_eq!(b.trace.open_spans(), 0, "every span was closed");
+    assert_eq!(discarded.trace.open_spans(), 0, "every span was closed");
 }
 
 /// The collected cost, for the discarded ones to be read against.
 #[test]
 fn a_collected_event_pays_for_the_record_it_asked_for() {
     let sink = Arc::new(ply_host::trace::sink::Recording::new(Level::Debug));
-    let b = bench(Arc::clone(&sink) as Arc<dyn Sink>, "orders");
-    let args = [ctor("Info", Vec::new()), Value::str("placed"), fields()];
-    for _ in 0..16 {
-        b.perform(Op::Event, &args).expect("collected");
-    }
+    let b = bench(Arc::clone(&sink) as Arc<dyn Sink>);
     const COLLECTED: usize = 200;
-    let (_, allocs) = allocations_of(|| {
-        for _ in 0..COLLECTED {
-            b.perform(Op::Event, &args).expect("collected");
-        }
-    });
-    let per_event = allocs as f64 / COLLECTED as f64;
+    let allocs = steady(COLLECTED, || b.event(Level::Info));
     assert!(
-        per_event > 0.0,
+        allocs > 0,
         "a collected event that allocated nothing would mean nothing was collected"
     );
     assert_eq!(sink.records().len(), COLLECTED + 16);
-    println!("  discarded event   0 allocations · 0 clock reads");
-    println!("  collected event   {per_event:.1} allocations · 1 clock read");
 }

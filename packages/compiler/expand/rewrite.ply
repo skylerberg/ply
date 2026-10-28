@@ -4,24 +4,29 @@
 
 import std.bin
 import std.list
-import compiler.syntax.parsing (Span, Ident, ParseDiag, span_to, bare, dump_diags, positional,
-                                starts_upper, span_between, minted, made_at, role_update_read,
-                                role_update_copy, role_update_block, role_update_let,
-                                role_update_binder, role_member_on, role_member_field,
-                                role_member_callee, role_tag_read, role_tag_let, role_tag_binder,
-                                role_tag_ok, role_witness_callee, role_witness_code, role_witness,
-                                role_witness_passed, role_witness_stated_callee,
-                                role_witness_stated_name, role_try_arg, role_try_unit,
-                                role_try_value, role_try_ok_call, role_try_err_call)
+import compiler.syntax.parsing (Span, Ident, QName, ParseDiag, span_to, bare, dump_diags,
+                                positional, starts_upper, span_between, minted, made_at,
+                                role_update_read, role_update_copy, role_update_block,
+                                role_update_let, role_update_binder, role_member_on,
+                                role_member_field, role_member_callee, role_tag_read, role_tag_let,
+                                role_tag_binder, role_tag_ok, role_witness_callee,
+                                role_witness_code, role_witness, role_witness_passed,
+                                role_witness_stated_callee, role_witness_stated_name, role_try_arg,
+                                role_try_unit, role_try_value, role_try_ok_call, role_try_err_call,
+                                role_spawn_let, role_spawn_binder, role_spawn_perform,
+                                role_spawn_lambda, role_spawn_call, role_spawn_read)
 import compiler.syntax.type_syntax (TFn, MWrite, nullary)
 import compiler.syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef,
                               schema_guard_name, parse, dump_module)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EBlock, EMatch, MatchArm,
-                              ERecord, ERecordUpdate, ETry, EField, EPerform, EHandle, ETryBlock,
-                              SLet, Param, NamedArg, RecField, expr_span, ETagged, Tagged,
-                              tagged_call, tagged_fill, slotted, slot_args, try_places)
+                              ELambda, ERecord, ERecordUpdate, ETry, EField, EPerform, EHandle,
+                              ETryBlock, SLet, Param, NamedArg, RecField, expr_span, ETagged,
+                              Tagged, tagged_call, tagged_fill, slotted, slot_args, try_places,
+                              HandleClause, is_exit_effect, exit_op)
 import compiler.syntax.patterns (LUnit, LInt, LStr, Pattern, PCtor, PVar)
 import std.bytes (ascii_of_int)
+import compiler.emit.abi
+import compiler.emit.abi (Native, native_named)
 import compiler.expand.rewrite.shared (map_item, is_tagged, tagged_in, picked_in, is_try_block,
                                        rebound, any_expr, read_at, bound_at)
 import compiler.expand.rewrite.try_operator (ctor_pattern, expand_try)
@@ -369,61 +374,47 @@ pub fn unwitnessed(e: Expr, concrete: (Bytes) -> Bool) -> Expr =
 /// it answers one, and whether a failure of it raises rather than ending the run.
 pub type Elaborated = { name: Bytes, words: Int, answers: Bool, raises: Bool }
 
-/// Every native the compiler writes calls of: the elaboration's, then the emitter's.
+/// Every native the compiler writes calls of: the elaboration's, then the emitter's, then those
+/// the emitted C calls directly over machine words.
 pub fn elaborated_natives() -> List<Elaborated> =
-  elaboration_natives().concat(emitter_natives()).concat(strings_natives()).concat(float_natives())
+  elaboration_natives().concat(emitter_natives()).concat(
+    abi::natives().map(|n: Native|
+      { name: n.name, words: n.params.len(), answers: n.answer != None, raises: n.raises }),
+  )
 
 /// A `Float` function the runtime answers, correctly rounded: its builtin's name, the native it is
 /// called through, and how many operands it takes.
 pub type FloatFunction = { name: Bytes, native: Bytes, operands: Int }
 
-/// Every `Float` function the runtime answers.
+/// Every `Float` function the runtime answers, each taking the operands its native does.
 pub fn float_functions() -> List<FloatFunction> =
   [
-    { name: b"Float::floor", native: b"?float_floor", operands: 1 },
-    { name: b"Float::ceil", native: b"?float_ceil", operands: 1 },
-    { name: b"Float::sqrt", native: b"?float_sqrt", operands: 1 },
-    { name: b"Float::exp", native: b"?float_exp", operands: 1 },
-    { name: b"Float::ln", native: b"?float_ln", operands: 1 },
-    { name: b"Float::log2", native: b"?float_log2", operands: 1 },
-    { name: b"Float::log10", native: b"?float_log10", operands: 1 },
-    { name: b"Float::sin", native: b"?float_sin", operands: 1 },
-    { name: b"Float::cos", native: b"?float_cos", operands: 1 },
-    { name: b"Float::tan", native: b"?float_tan", operands: 1 },
-    { name: b"Float::asin", native: b"?float_asin", operands: 1 },
-    { name: b"Float::acos", native: b"?float_acos", operands: 1 },
-    { name: b"Float::atan", native: b"?float_atan", operands: 1 },
-    { name: b"Float::pow", native: b"?float_pow", operands: 2 },
-    { name: b"Float::atan2", native: b"?float_atan2", operands: 2 },
-    { name: b"Float::hypot", native: b"?float_hypot", operands: 2 },
-  ]
+    { name: b"Float::floor", native: b"?float_floor" },
+    { name: b"Float::ceil", native: b"?float_ceil" },
+    { name: b"Float::sqrt", native: b"?float_sqrt" },
+    { name: b"Float::exp", native: b"?float_exp" },
+    { name: b"Float::ln", native: b"?float_ln" },
+    { name: b"Float::log2", native: b"?float_log2" },
+    { name: b"Float::log10", native: b"?float_log10" },
+    { name: b"Float::sin", native: b"?float_sin" },
+    { name: b"Float::cos", native: b"?float_cos" },
+    { name: b"Float::tan", native: b"?float_tan" },
+    { name: b"Float::asin", native: b"?float_asin" },
+    { name: b"Float::acos", native: b"?float_acos" },
+    { name: b"Float::atan", native: b"?float_atan" },
+    { name: b"Float::pow", native: b"?float_pow" },
+    { name: b"Float::atan2", native: b"?float_atan2" },
+    { name: b"Float::hypot", native: b"?float_hypot" },
+  ].map(|f: { name: Bytes, native: Bytes }|
+    {
+      name: f.name,
+      native: f.native,
+      operands: match native_named(f.native) { Some(n) -> n.params.len(), None -> 0 },
+    })
 
 /// The `Float` function builtin `name` is; `None` for any other.
 pub fn float_function(name: Bytes) -> Option<FloatFunction> =
   float_functions().find(|f: FloatFunction| f.name == name)
-
-/// The natives of the `Float` functions, each taking its operands' bits and answering its answer's.
-fn float_natives() -> List<Elaborated> =
-  float_functions().map(|f: FloatFunction|
-    { name: f.native, words: f.operands, answers: true, raises: false })
-
-/// The natives over the bytes of strings and byte strings the emitter writes calls of: each takes
-/// an address and a count for each string it reads, and answers raw bits, many of them the count
-/// of the bytes it left taken.
-fn strings_natives() -> List<Elaborated> =
-  [
-    { name: b"?blake3", words: 2 },
-    { name: b"?scalar_encoded", words: 4 },
-    { name: b"?text_encoded", words: 3 },
-    { name: b"?secret_of", words: 3 },
-    { name: b"?secret_verify", words: 3 },
-    { name: b"?secret_equal", words: 2 },
-    { name: b"?functions_compared", words: 0 },
-    { name: b"?secret_len", words: 1 },
-    { name: b"?secret_bytes", words: 1 },
-    { name: b"?secret_concat", words: 2 },
-  ].map(|n: { name: Bytes, words: Int }|
-    { name: n.name, words: n.words, answers: true, raises: false })
 
 /// The natives the elaboration writes calls of.
 fn elaboration_natives() -> List<Elaborated> =
@@ -438,70 +429,13 @@ fn elaboration_natives() -> List<Elaborated> =
     { name: b"?handler_set", words: 2, answers: true, raises: false },
   ]
 
-/// The natives the emitter writes calls of: the runtime's encoding of a value, the refusal of an
-/// operation written in place, over the numbers (`?refused`) or the text (`?refused_text`) it names,
-/// the handler's variables each held with its type, and the crossing natives, which take and answer
-/// machine words only, raw. A crossing is written a part at a time into the innermost lowering
-/// (`?out_*`) and read a part at a time from the innermost lifting (`?in_*`); `?in_decimal` and
-/// `?in_fixed` answer a value's low word and keep its high word for
-/// `?in_high`; a native that answers bytes leaves them as the crossing's taken bytes and answers
-/// their count, and `?taken` copies them out. `?cost_mark` marks what the run has cost so far, and
-/// `?cost_spent` opens a lifting of what it spent since a mark, the function the span ran lent.
-/// `?hold_made` makes a hold of a value it takes, `?hold_read` answers what a hold holds lent from
-/// it, and `?hold_taken` takes it out, the hold letting go.
+/// The natives the emitter writes calls of over a value's encoding: the runtime's encoding of a
+/// value, and an assertion's failure.
 fn emitter_natives() -> List<Elaborated> =
   [
     { name: b"?encoded", words: 1, answers: true, raises: false },
     { name: b"?assert_failed", words: 2, answers: true, raises: true },
-    { name: b"?refused", words: 4, answers: false, raises: true },
-    { name: b"?refused_text", words: 5, answers: false, raises: true },
-  ].concat(
-    [
-      { name: b"?out_tag", words: 1, answers: false },
-      { name: b"?out_int", words: 1, answers: false },
-      { name: b"?out_float", words: 1, answers: false },
-      { name: b"?out_decimal", words: 2, answers: false },
-      { name: b"?out_fixed", words: 3, answers: false },
-      { name: b"?out_char", words: 1, answers: false },
-      { name: b"?out_str", words: 2, answers: false },
-      { name: b"?out_bytes", words: 2, answers: false },
-      { name: b"?out_count", words: 2, answers: false },
-      { name: b"?out_ctor", words: 3, answers: false },
-      { name: b"?out_name", words: 2, answers: false },
-      { name: b"?out_handle", words: 1, answers: false },
-      { name: b"?out_carried", words: 2, answers: false },
-      { name: b"?out_fun", words: 3, answers: false },
-      { name: b"?out_again", words: 1, answers: true },
-      { name: b"?in_tag", words: 0, answers: true },
-      { name: b"?in_int", words: 0, answers: true },
-      { name: b"?in_float", words: 0, answers: true },
-      { name: b"?in_decimal", words: 0, answers: true },
-      { name: b"?in_fixed", words: 1, answers: true },
-      { name: b"?in_high", words: 0, answers: true },
-      { name: b"?in_char", words: 0, answers: true },
-      { name: b"?in_str", words: 0, answers: true },
-      { name: b"?in_bytes", words: 0, answers: true },
-      { name: b"?in_count", words: 1, answers: true },
-      { name: b"?in_field", words: 2, answers: false },
-      { name: b"?in_name_is", words: 2, answers: true },
-      { name: b"?in_handle", words: 0, answers: true },
-      { name: b"?in_carried", words: 0, answers: true },
-      { name: b"?lower_open", words: 1, answers: false },
-      { name: b"?lower_close", words: 0, answers: true },
-      { name: b"?lift_open", words: 2, answers: false },
-      { name: b"?lift_close", words: 0, answers: false },
-      { name: b"?taken", words: 2, answers: false },
-      { name: b"?handler_typed", words: 3, answers: false },
-      { name: b"?handler_get", words: 1, answers: true },
-      { name: b"?handler_put", words: 2, answers: false },
-      { name: b"?hold_made", words: 1, answers: true },
-      { name: b"?hold_read", words: 1, answers: true },
-      { name: b"?hold_taken", words: 1, answers: true },
-      { name: b"?cost_mark", words: 0, answers: true },
-      { name: b"?cost_spent", words: 2, answers: false },
-    ].map(|n: { name: Bytes, words: Int, answers: Bool }|
-      { name: n.name, words: n.words, answers: n.answers, raises: false }),
-  )
+  ]
 
 /// The operator at `at`, over the witness of parameter `p`, as the runtime's call `name` of `code`.
 fn witness_call(at: Span, name: Bytes, code: Int, p: Bytes, operands: List<Expr>) -> Expr = {
@@ -711,9 +645,69 @@ pub fn expand(
 ) -> { module: Module, diags: List<ParseDiag> } / {abort.raise} = {
   let tried = if has_try(module) { expand_try(module, diags) }
   else { { module: module, diags: diags } };
-  let made = with_schema_fns(tried.module);
+  let made = with_schema_fns(spawns_written(tried.module));
   { module: made, diags: rebound(made, tried.diags) }
 }
+
+// --- Spawned values ----------------------------------------------------------------------------
+
+/// Whether `p` spawns a value other than a lambda written there.
+fn spawns_value(
+  p: { span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr> },
+) -> Bool =
+  p.eff.module == None && p.eff.name.name == b"task" && p.op.name == b"spawn"
+    && (match p.args { [ELambda(_)] -> false, [_] -> true, _ -> false })
+
+/// `task.spawn(f)` of a value other than a lambda, as the spawn of a lambda holding it,
+/// `{ let ?spawned = f; task.spawn(|| ?spawned()) }`: so what a task runs is a lambda written at
+/// its spawn, which holds the words its row takes there.
+fn spawn_written(expr: Expr) -> Expr =
+  match expr {
+    EPerform(p) -> if !spawns_value(p) { expr } else {
+      let at = |role: Int| minted(p.span, role);
+      match p.args {
+        [value] ->
+          EBlock({
+            span: p.span,
+            stmts: [
+              SLet({
+                span: at(role_spawn_let()),
+                pat: bound_at(b"?spawned", at(role_spawn_binder())),
+                ty: None,
+                value: value,
+              }),
+            ],
+            tail: Some(
+              EPerform({
+                ..p,
+                span: at(role_spawn_perform()),
+                args: [
+                  ELambda({
+                    span: at(role_spawn_lambda()),
+                    params: [],
+                    ret: None,
+                    body: EApp({
+                      span: at(role_spawn_call()),
+                      func: read_at(b"?spawned", at(role_spawn_read())),
+                      named: [],
+                      args: [],
+                      labels: [],
+                    }),
+                  }),
+                ],
+              }),
+            ),
+          }),
+        _ -> expr,
+      }
+    },
+    _ -> expr,
+  }
+
+/// Every spawn of a value other than a lambda in `module` written as `spawn_written` says.
+fn spawns_written(module: Module) -> Module =
+  if !any_expr(module, |e: Expr| match e { EPerform(p) -> spawns_value(p), _ -> false }) { module }
+  else { { ..module, items: module.items.map(|item: Item| map_item(item, spawn_written)) } }
 
 // --- The law schema ----------------------------------------------------------------------------
 
@@ -876,9 +870,98 @@ test "a `?` in a function with no written return type is refused and unwrapped" 
   assert_eq(called(x.body), b"g")
 }
 
-test "a `?` inside a `try` is refused, as one inside a `handle` is" {
-  let out = dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
-  assert(out.contains("!E0118"))
+/// What a raise of an exit effect carries, where `e` is one.
+fn exit_carried(e: Expr) -> Option<Expr> =
+  match e {
+    EPerform(p) -> if is_exit_effect(p.eff.name.name) && p.op.name == exit_op() { p.args.at(0) }
+    else { None },
+    _ -> None,
+  }
+
+test "a `?` inside a `handle` raises its function's exit, which a `handle` around it answers" {
+  let x = expanded_fn(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let r = handle { g(n)? } with { a.b() -> 1 }; Ok(r) }",
+  );
+  assert_eq(x.codes, []);
+  // The `handle` stands where a `?` of its own would: the scrutinee of the block's `match`.
+  let lifted = match x.body { EBlock(b) -> b.tail, _ -> None };
+  let around = match lifted { Some(EMatch(m)) -> Some(m.scrutinee), _ -> None };
+  match around {
+    Some(EHandle(w)) -> {
+      // Its one clause answers the exit with the failure it carried, and its body is the `Ok`.
+      assert_eq(w.clauses.map(|c: HandleClause| is_exit_effect(c.eff.name.name)), [true]);
+      assert_eq(called(w.clauses.get(0).body), b"Err");
+      assert_eq(called(w.body), b"Ok");
+      // Inside, the `?`'s failure arm raises the exit with what `Err` held.
+      let inner = match w.body {
+        EApp(a) -> match a.args.at(0) {
+          Some(EHandle(h)) -> match h.body { EBlock(b) -> b.tail, other -> Some(other) },
+          _ -> None,
+        },
+        _ -> None,
+      };
+      match inner {
+        Some(m) -> {
+          let arms = arms_of(m);
+          assert_eq(arms.map(|a: { ctor: Bytes, binds: List<Bytes>, body: Expr }| a.ctor), [
+            b"Err",
+            b"Ok",
+          ]);
+          assert(exit_carried(arms.get(0).body) != None, None)
+        },
+        None -> assert(false, Some("the written `handle` stands inside the `Ok`")),
+      }
+    },
+    _ -> assert(false, Some("the block ends in the `match` of the written `handle`")),
+  }
+}
+
+test "a `?` inside a `try`, a clause, a `return` or a nested `handle` leaves by one exit" {
+  let exits = |src: Bytes| {
+    let out = dump_expanded(src);
+    assert(
+      !out.contains("!E0118") && !out.contains("!E0119") && out.contains("@657869743f"),
+      Some(out),
+    )
+  };
+  exits(b"fn f(n: Int) -> Result<Int, Bytes> = { let r = try { g(n)? }; Ok(1) }");
+  exits(b"fn f(n: Int) -> Option<Int> = handle { a.b() } with { a.b() -> g(n)? }");
+  exits(b"fn f(n: Int) -> Result<Int, Bytes> = handle { a.b() } with { return v -> g(v)? }");
+  exits(
+    b"fn f(n: Int) -> Result<Int, Bytes> = handle { Ok(handle { g(n)? } with { c.d() -> 1 }) } with { a.b() -> 1 }",
+  );
+  // One exit for the function, and one of its own for a typed lambda, which its `?` exits.
+  let named = dump_expanded(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let k = |m: Int| -> Option<Int> { handle { Some(h(m)?) } with { a.b() -> 1 } }; handle { g(n)? } with { a.b() -> 1 } }",
+  );
+  // `exit?0?0` and `exit?0?1`: the item written at 0's first and second.
+  assert(
+    !named.contains("!E0118") && !named.contains("!E0119") && named.contains("@657869743f303f30;")
+      && named.contains("@657869743f303f31;"),
+    Some(named),
+  )
+}
+
+test "a `?` inside a lambda or a region inside a `handle` exits nothing, and a `handle` holding one stands where a `?` could" {
+  let said = |src: Bytes| dump_expanded(src);
+  assert(
+    said(
+      b"fn f(n: Int) -> Result<Int, Bytes> = handle { let k = || g(n)?; Ok(1) } with { a.b() -> 1 }",
+    ).contains(
+      "!E0118",
+    ),
+  );
+  assert(
+    said(
+      b"fn f(n: Int) -> Result<Int, Bytes> = handle { simulate { g(n)? } } with { a.b() -> 1 }",
+    ).contains(
+      "!E0118",
+    ),
+  );
+  let placed = said(
+    b"fn f(n: Int) -> Result<Int, Bytes> = { let r = if n > 0 { handle { g(n)? } with { a.b() -> 1 } } else { 0 }; Ok(r) }",
+  );
+  assert(placed.contains("!E0119") && !placed.contains("!E0118"))
 }
 
 test "a `try` and a tagged literal are refused where the module binds what they are written out with" {
@@ -947,6 +1030,33 @@ test "a `try` the checker read is written out as its `handle`, and one it did no
   assert(out.contains("@5f31;"));
   assert_eq(named_program_wide(program_wide(b"m.p")), Some(b"m.p"));
   assert_eq(named_program_wide(b"p"), None)
+}
+
+test "a spawn of a value other than a lambda spawns a lambda calling it, the value bound first" {
+  let x = expanded_fn(b"fn f(work: () -> Int) -> Task<Int> / {task.write} = task.spawn(work)");
+  assert_eq(x.codes, []);
+  match x.body {
+    EBlock(b) -> {
+      // The value is bound before the spawn, so it is what it was where the spawn is written.
+      assert_eq(b.stmts.len(), 1);
+      match b.tail {
+        Some(EPerform(p)) -> match p.args {
+          [ELambda(l)] -> {
+            assert_eq(l.params.len(), 0);
+            assert_eq(called(l.body), b"?spawned")
+          },
+          _ -> assert(false, Some("the spawn is handed one lambda")),
+        },
+        _ -> assert(false, Some("the block ends in the spawn")),
+      }
+    },
+    _ -> assert(false, Some("the spawn is written out as a block")),
+  };
+  // A lambda is spawned as it is written.
+  match expanded_fn(b"fn g() -> Task<Int> / {task.write} = task.spawn(|| 1)").body {
+    EPerform(p) -> assert_eq(p.args.len(), 1),
+    _ -> assert(false, Some("a lambda's spawn is left")),
+  }
 }
 
 test "a `?` on a `let` with a written type keeps the annotation" {

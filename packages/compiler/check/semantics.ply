@@ -628,10 +628,11 @@ fn used(e: Expr, name: Bytes, calls: Int, reads: Int) -> Bool = {
   u.calls.len() == calls && u.reads == reads
 }
 
-/// Whether `walk`, handed a node, its depth, a key and a function, takes the value out of the slot
-/// it finds in the leaf at depth 0 and puts back in that slot what one call of the function answers
-/// for it, and above the leaves takes out the kid at the slot it finds, walks it one level down and
-/// puts it back there, calling the function nowhere else.
+/// Whether `walk`, handed a node, its depth, a key and a function, answers the leaf at depth 0 as
+/// it is where the slot it finds there does not hold the key, and otherwise takes the value out of
+/// that slot and puts back in it what one call of the function answers for it, and above the leaves
+/// takes out the kid at the slot it finds, walks it one level down and puts it back there, calling
+/// the function nowhere else.
 fn takes_and_puts(walk: FnDef) -> Bool =
   match ((walk.params, plain(walk.body))) {
     ([n, depth, key, f], EIf(c)) -> {
@@ -640,23 +641,39 @@ fn takes_and_puts(walk: FnDef) -> Bool =
       let fname = f.name.name;
       match ((binary(c.cond, b"le"), plain(c.then_branch), plain(c.else_branch))) {
         (Some(at), EBlock(leaf), EBlock(branch)) -> {
-          let put = match ((bound_by(leaf.stmts, b"MapNode::pair_take"), leaf.tail)) {
-            (Some(taken), Some(t)) -> match ((taken.args, called(t, b"MapNode::pair_put"))) {
-              ([from, i], Some([into, j, k, x])) -> {
-                let tn = taken.name;
-                let applied = match plain(x) {
-                  EApp(call) ->
-                    is_var(call.func, fname)
-                      && (match call.args { [v] -> field_of(v, tn, b"value"), _ -> false }),
+          let put = match leaf.tail {
+            Some(EIf(h)) -> match ((plain(h.cond), plain(h.else_branch))) {
+              (EUnary(absent), EBlock(present)) -> match ((
+                  bound_by(present.stmts, b"MapNode::pair_take"),
+                  present.tail,
+                )) {
+                (Some(taken), Some(t)) -> match ((taken.args, called(t, b"MapNode::pair_put"))) {
+                  ([from, i], Some([into, j, k, x])) -> match var_name(i) {
+                    Some(slot) -> {
+                      let tn = taken.name;
+                      let applied = match plain(x) {
+                        EApp(call) ->
+                          is_var(call.func, fname)
+                            && (match call.args { [v] -> field_of(v, tn, b"value"), _ -> false }),
+                        _ -> false,
+                      };
+                      let u = uses_in(leaf.stmts, leaf.tail, fname);
+                      absent.op == b"not"
+                        && calls_on(absent.operand, b"leaf_holds", [nn, slot, key.name.name])
+                        && is_var(h.then_branch, nn)
+                        && is_var(from, nn)
+                        && is_var(j, slot)
+                        && field_of(into, tn, b"node")
+                        && field_of(k, tn, b"key")
+                        && applied
+                        && u.calls.len() == 1
+                        && u.reads == 0
+                    },
+                    None -> false,
+                  },
                   _ -> false,
-                };
-                let u = uses_in(leaf.stmts, leaf.tail, fname);
-                is_var(from, nn) && var_name(i) != None && var_name(i) == var_name(j)
-                  && field_of(into, tn, b"node")
-                  && field_of(k, tn, b"key")
-                  && applied
-                  && u.calls.len() == 1
-                  && u.reads == 0
+                },
+                _ -> false,
               },
               _ -> false,
             },
@@ -699,80 +716,66 @@ fn takes_and_puts(walk: FnDef) -> Bool =
     _ -> false,
   }
 
-/// The entry an update of the value under one key earns, where it answers the map as it is when the
-/// key is absent, and otherwise takes the root out of the map, walks it down from the map's height,
-/// and puts what the walk answers back.
+/// The entry an update of the value under one key earns, where it takes the root out of the map,
+/// walks it down from the map's height, and puts what the walk answers back.
 fn updated_derived(fns: Map<Bytes, FnDef>, def: FnDef) -> Option<Iterates> / {abort.raise} =
   match ((def.params, plain(def.body))) {
-    ([m, key, f], EIf(c)) -> {
+    ([m, key, f], EBlock(b)) -> {
       let mn = m.name.name;
       let fname = f.name.name;
-      let absent = match plain(c.cond) {
-        EUnary(u) -> u.op == b"not" && calls_on(u.operand, b"Map::contains", [mn, key.name.name]),
-        _ -> false,
-      };
-      match ((absent && is_var(c.then_branch, mn), plain(c.else_branch))) {
-        (true, EBlock(b)) -> match ((bound_by(b.stmts, b"MapNode::map_swap"), b.tail)) {
-          (Some(taken), Some(EMatch(mt))) -> match ((taken.args, mt.arms)) {
-            ([from, nothing, height, len], [none, some]) -> match ((
-                some_arm(some),
-                var_name(height),
-              )) {
-              (Some(s), Some(hn)) -> {
-                let tn = taken.name;
-                let tall = match bound_to(b.stmts, hn) {
-                  Some(hv) -> calls_on(hv, b"MapNode::height", [mn]),
-                  None -> false,
-                };
-                let empty = match ((none.guard, none.pat)) {
-                  (None, PCtor(p)) ->
-                    p.name.name.name == b"None" && field_of(none.body, tn, b"map"),
-                  _ -> false,
-                };
-                let walked = |root: Expr|
-                  match plain(root) {
-                    EApp(w) -> match ((var_name(w.func), w.args)) {
-                      (Some(wn), [r, depth, k, g]) -> match fns.get(wn) {
-                        Some(walk) ->
-                          is_var(r, s.element) && is_var(depth, hn) && is_var(k, key.name.name)
-                            && is_var(g, fname)
-                            && takes_and_puts(walk),
-                        None -> false,
-                      },
-                      _ -> false,
+      match ((bound_by(b.stmts, b"MapNode::map_swap"), b.tail)) {
+        (Some(taken), Some(EMatch(mt))) -> match ((taken.args, mt.arms)) {
+          ([from, nothing, height, len], [none, some]) -> match ((
+              some_arm(some),
+              var_name(height),
+            )) {
+            (Some(s), Some(hn)) -> {
+              let tn = taken.name;
+              let tall = match bound_to(b.stmts, hn) {
+                Some(hv) -> calls_on(hv, b"MapNode::height", [mn]),
+                None -> false,
+              };
+              let empty = match ((none.guard, none.pat)) {
+                (None, PCtor(p)) -> p.name.name.name == b"None" && field_of(none.body, tn, b"map"),
+                _ -> false,
+              };
+              let walked = |root: Expr|
+                match plain(root) {
+                  EApp(w) -> match ((var_name(w.func), w.args)) {
+                    (Some(wn), [r, depth, k, g]) -> match fns.get(wn) {
+                      Some(walk) ->
+                        is_var(r, s.element) && is_var(depth, hn) && is_var(k, key.name.name)
+                          && is_var(g, fname)
+                          && takes_and_puts(walk),
+                      None -> false,
                     },
                     _ -> false,
-                  };
-                let put_back = match plain(s.body) {
-                  EField(whole) ->
-                    whole.field.name == b"map"
-                      && (match called(whole.base, b"MapNode::map_swap") {
-                        Some([into, root, h2, l2]) ->
-                          field_of(into, tn, b"map") && is_var(h2, hn)
-                            && var_name(l2) == var_name(len)
-                            && (match called(root, b"Some") { Some([x]) -> walked(x), _ -> false }),
-                        _ -> false,
-                      }),
+                  },
                   _ -> false,
                 };
-                let out = is_var(from, mn) && is_var(nothing, b"None")
-                  && field_of(mt.scrutinee, tn, b"old");
-                match ((
-                    out && tall && empty && put_back && used(def.body, fname, 0, 1),
-                    index_of(def.params, fname),
-                    index_of(def.params, mn),
-                  )) {
-                  (true, Some(callback), Some(at)) ->
-                    Some({
-                      callback: callback,
-                      over: [],
-                      params: [Taken(at)],
-                      answer: Updated(at),
+              let put_back = match plain(s.body) {
+                EField(whole) ->
+                  whole.field.name == b"map"
+                    && (match called(whole.base, b"MapNode::map_swap") {
+                      Some([into, root, h2, l2]) ->
+                        field_of(into, tn, b"map") && is_var(h2, hn)
+                          && var_name(l2) == var_name(len)
+                          && (match called(root, b"Some") { Some([x]) -> walked(x), _ -> false }),
+                      _ -> false,
                     }),
-                  _ -> None,
-                }
-              },
-              _ -> None,
+                _ -> false,
+              };
+              let out = is_var(from, mn) && is_var(nothing, b"None")
+                && field_of(mt.scrutinee, tn, b"old");
+              match ((
+                  out && tall && empty && put_back && used(def.body, fname, 0, 1),
+                  index_of(def.params, fname),
+                  index_of(def.params, mn),
+                )) {
+                (true, Some(callback), Some(at)) ->
+                  Some({ callback: callback, over: [], params: [Taken(at)], answer: Updated(at) }),
+                _ -> None,
+              }
             },
             _ -> None,
           },
@@ -1020,27 +1023,46 @@ test "a map's fold that skips an entry, calls twice or aside, reads past its ent
   ].fold((), |u: Unit, w: FoldWalk| assert_eq(folded_by(w), None))
 }
 
-/// The parts of a map's update written as the prelude's walk: what the leaf's put answers in the
-/// slot, the slot it puts it in, the depth it walks a kid at, and the depth it enters at.
-type UpdateWalk = { put: Bytes, put_at: Bytes, below: Bytes, start: Bytes }
+/// The parts of a map's update written as the prelude's walk: the slot whose key the leaf checks,
+/// what it answers where that slot does not hold the key, what its put answers in the slot, the
+/// slot it puts it in, the depth it walks a kid at, and the depth it enters at.
+type UpdateWalk = {
+  held_at: Bytes,
+  absent: Bytes,
+  put: Bytes,
+  put_at: Bytes,
+  below: Bytes,
+  start: Bytes,
+}
 
 fn update_written() -> UpdateWalk =
-  { put: b"f(taken.value)", put_at: b"i", below: b"depth - 1", start: b"height" }
+  {
+    held_at: b"i",
+    absent: b"n",
+    put: b"f(taken.value)",
+    put_at: b"i",
+    below: b"depth - 1",
+    start: b"height",
+  }
 
 fn updated_by(w: UpdateWalk) -> Option<Iterates> / {abort.raise} = {
   let fns = fns_of(
     parse(
       Bytes::concat_all([
         b"fn node_updated<k, v | e>(n: MapNode<k, v>, depth: Int, key: k, f: (v) -> v / e) -> MapNode<k, v> / e =\n",
-        b"  if depth <= 0 { let i = leaf_place(n, key, 0, 32); let taken = MapNode::pair_take(n, i); MapNode::pair_put(taken.node, ",
+        b"  if depth <= 0 { let i = leaf_place(n, key, 0, 32); if !leaf_holds(n, ",
+        w.held_at,
+        b", key) { ",
+        w.absent,
+        b" } else { let taken = MapNode::pair_take(n, i); MapNode::pair_put(taken.node, ",
         w.put_at,
         b", taken.key, ",
         w.put,
-        b") } else { let i = kid_place(n, key, 0, 32); let size = MapNode::kid_size(n, i); let max = MapNode::kid_max(n, i); let out = MapNode::kid_out(n, i); let kid = node_updated(out.kid, ",
+        b") } } else { let i = kid_place(n, key, 0, 32); let size = MapNode::kid_size(n, i); let max = MapNode::kid_max(n, i); let out = MapNode::kid_out(n, i); let kid = node_updated(out.kid, ",
         w.below,
         b", key, f); MapNode::kid_back(out.node, i, kid, max, size) }\n",
-        b"pub fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e =\n",
-        b"  if !Map::contains(m, key) { m } else { let height = MapNode::height(m); let len = Map::len(m); let taken = MapNode::map_swap(m, None, height, len); match taken.old { None -> taken.map, Some(root) -> MapNode::map_swap(taken.map, Some(node_updated(root, ",
+        b"pub fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e = {\n",
+        b"  let height = MapNode::height(m); let len = Map::len(m); let taken = MapNode::map_swap(m, None, height, len); match taken.old { None -> taken.map, Some(root) -> MapNode::map_swap(taken.map, Some(node_updated(root, ",
         w.start,
         b", key, f)), height, len).map } }\n",
       ]),
@@ -1049,9 +1071,11 @@ fn updated_by(w: UpdateWalk) -> Option<Iterates> / {abort.raise} = {
   match fns.get(b"Map::update") { Some(d) -> derived(fns, d), None -> None }
 }
 
-test "a map's update that reads the value in place, puts it elsewhere, calls twice, or walks the wrong depth earns no entry" {
+test "a map's update that checks another slot, loses a pair where the key is absent, reads the value in place, puts it elsewhere, calls twice, or walks the wrong depth earns no entry" {
   assert_eq(updated_by(update_written()), iterates(b"std.prelude.Map::update"));
   [
+    { ..update_written(), held_at: b"0" },
+    { ..update_written(), absent: b"MapNode::pair_take(n, i).node" },
     { ..update_written(), put: b"f(MapNode::value(n, i))" },
     { ..update_written(), put_at: b"i + 1" },
     { ..update_written(), put: b"f(f(taken.value))" },

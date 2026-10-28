@@ -1,12 +1,14 @@
-//! A nullary pure definition is a constant: its body runs once per program, and every later read is
-//! the memo's, which costs the entry that reads it no step. Counted through the machine family's
-//! accounting and bounded by its step budget, never timed.
+//! A nullary pure definition is a constant: its body runs once per unit, and every later read is
+//! the memo's, which costs the entry that reads it no step. Counted by the steps each entry spent
+//! and bounded by its step budget, never timed.
 
-import harness (Here, Shipped, bound_main, loaded, project, scratch)
-import cli.machine (machine, Called, default_options)
+import harness (Here, Shipped, Loaded, entered, loaded, project, scratch, unloaded)
+import cli.machine
+import cli.machine (default_options)
+import std.machine as entering
 import std.value (Value, VInt)
 
-effect set Driving = {machine.configure[run], machine.load[run], machine.bound[run], machine.call[run], machine.accounting[run], machine.drop[run]}
+effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
 fn constants() -> String =
   \\effect store {
@@ -45,27 +47,33 @@ fn constants() -> String =
   \\  if n <= 0 { sum } else { reads_literal(n - 1, sum + 700) }
   \\
 
-/// The program loaded and bound under `run`, each call within `steps` steps; none for no bound.
-fn bound_within(steps: Int) -> Unit / {Here, Shipped, Driving, abort.raise} = {
+/// The program compiled, opened and bound, each entry within `steps` steps; none for no bound.
+fn bound_within(steps: Int) -> Loaded / {Here, Shipped, Driving, abort.raise} = {
   project([{ path: "inner.ply", text: constants() }]);
-  loaded({ ..default_options(), steps: steps });
-  bound_main()
+  loaded({ ..default_options(), steps: steps })
 }
 
-fn answered(c: Called) -> Result<Int, Bytes> =
-  match c.answer {
-    Ok(v) -> match v { VInt(i) -> Ok(i), _ -> Err(b"not an Int") },
-    Err(r) -> Err(r.diag.code),
-  }
+/// What one entry answered, as an `Int` or the code it raised, and the steps it spent.
+type Spent = { answer: Result<Int, Bytes>, steps: Int }
 
-fn spent() -> Int / {machine.accounting[run]} = machine.accounting[run]().steps
+fn answered(l: Loaded, name: String, args: List<Value>) -> Spent / {Driving, abort.raise} = {
+  let o = entered(l, name, args);
+  {
+    answer: match machine::answer_of(o, l.roots, name) {
+      Ok(VInt(i)) -> Ok(i),
+      Ok(_) -> Err(b"not an Int"),
+      Err(r) -> Err(r.diag.code),
+    },
+    steps: o.usage.steps,
+  }
+}
 
 /// Within a budget the deep definition fits once and not twice: a remembered constant fits, and a
 /// definition run again past its first answer is the budget's own refusal.
 fn probed(name: String) -> Result<Int, Bytes> / {Here, Shipped, Driving, abort.raise} = {
-  bound_within(1500);
-  let probe = answered(machine.call[run]("inner." ++ name, [VInt(400)]));
-  machine.drop[run]();
+  let l = bound_within(1500);
+  let probe = answered(l, name, [VInt(400)]).answer;
+  let _ = unloaded(l);
   probe
 }
 
@@ -84,45 +92,33 @@ test "a published row the body never performs keeps a definition from the memo" 
 // Counted in calls: all `reads` spends beyond `reads_literal` is `constant`'s body, once.
 test "a constant read a thousand times runs its body once" {
   scratch(|| {
-    bound_within(0);
-    assert_eq(answered(machine.call[run]("inner.constant", [])), Ok(700));
-    let body = spent();
-    assert(body > 0, Some("no call of `constant`'s body was counted"));
+    let l = bound_within(0);
+    let first = answered(l, "constant", []);
+    assert_eq(first.answer, Ok(700));
+    assert(first.steps > 0, Some("no call of `constant`'s body was counted"));
     // A memo's answer costs the entry that reads it nothing.
-    assert_eq(answered(machine.call[run]("inner.constant", [])), Ok(700));
-    assert_eq(spent(), 0);
-    assert_eq(
-      answered(machine.call[run]("inner.reads_literal", [VInt(1000), VInt(0)])),
-      Ok(700000),
-    );
-    let looped = spent();
-    machine.drop[run]();
-    bound_within(0);
-    assert_eq(answered(machine.call[run]("inner.reads", [VInt(1000), VInt(0)])), Ok(700000));
-    let read = spent();
-    machine.drop[run]();
-    assert_eq(read, looped + body)
+    assert_eq(answered(l, "constant", []), { answer: Ok(700), steps: 0 });
+    let looped = answered(l, "reads_literal", [VInt(1000), VInt(0)]);
+    assert_eq(looped.answer, Ok(700000));
+    let _ = unloaded(l);
+    let fresh = bound_within(0);
+    let read = answered(fresh, "reads", [VInt(1000), VInt(0)]);
+    let _ = unloaded(fresh);
+    assert_eq(read, { answer: Ok(700000), steps: looped.steps + first.steps })
   })
 }
 
 // A name the unit never compiled and a compiled one offered the wrong number of arguments are each
-// declined before any body runs, so neither adds a step to what the accounting has counted.
+// declined before any body runs.
 test "a declined call counts no steps" {
   scratch(|| {
-    bound_within(0);
-    assert_eq(answered(machine.call[run]("inner.parameterized", [VInt(0)])), Ok(700));
-    let ran = spent();
-    assert(ran > 0, Some("the call ran no body"));
-    let _ = machine.call[run]("inner.parameterized", [VInt(0)]);
-    assert(
-      answered(machine.call[run]("inner.absent", [])) != Ok(0),
-      Some("an absent name answered"),
-    );
-    assert(
-      answered(machine.call[run]("inner.parameterized", [])) != Ok(700),
-      Some("the wrong number of arguments answered"),
-    );
-    assert_eq(spent(), ran);
-    machine.drop[run]()
+    let l = bound_within(0);
+    assert(answered(l, "parameterized", [VInt(0)]).steps > 0, Some("the call ran no body"));
+    let absent = answered(l, "absent", []);
+    assert(absent.answer != Ok(0), Some("an absent name answered"));
+    let short = answered(l, "parameterized", []);
+    assert(short.answer != Ok(700), Some("the wrong number of arguments answered"));
+    let _ = unloaded(l);
+    assert_eq((absent.steps, short.steps), (0, 0))
   })
 }

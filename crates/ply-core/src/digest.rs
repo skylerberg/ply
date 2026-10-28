@@ -107,11 +107,7 @@ fn write(h: &mut impl Sink, v: &Value, span: Span) -> Result<(), Diagnostic> {
                 grow(|| write(h, x, span))?;
             }
         }
-        Value::Float(_)
-        | Value::Closure(_)
-        | Value::Task(_)
-        | Value::Chan(_)
-        | Value::Secret(_) => {
+        Value::Float(_) | Value::Closure(_) | Value::Secret(_) => {
             return Err(Diagnostic::error(
                 codes::RUNTIME_ERROR,
                 format!("`digest` cannot hash a {}", v.type_name()),

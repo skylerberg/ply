@@ -21,14 +21,14 @@ pub enum Machine {
     Addr,
     /// The address of words the native writes.
     Out,
-    /// A runtime object the runtime lays out: a bridge or a hold.
+    /// A runtime object the runtime lays out: a bridge, a hold or what a native made.
     Handle,
     /// A value's word form, which the runtime moves and never reads.
     Handed,
     /// A block emitted code lays out, of which the runtime reads the count at offset 0; a function
     /// value's is called and let go through its descriptor.
     Block,
-    /// A type's descriptor, `type#T`.
+    /// A type's descriptor: `type#T`, or `kept#T`, which names `type#T` beside its comparisons.
     Type,
     /// An operation's descriptor, `op#..`.
     Op,
@@ -36,6 +36,11 @@ pub enum Machine {
     DropRoot,
     /// A keep root's address.
     KeepRoot,
+    /// How many bytes a native left as the context's taken bytes, which emitted code copies out.
+    Taken,
+    /// A `Secret`'s handle: lent to a native that takes one, owned by the code a native answers
+    /// one to.
+    Secret,
 }
 
 impl Machine {
@@ -55,6 +60,8 @@ impl Machine {
             Machine::Op => "Op",
             Machine::DropRoot => "DropRoot",
             Machine::KeepRoot => "KeepRoot",
+            Machine::Taken => "Taken",
+            Machine::Secret => "Secret",
         }
     }
 }
@@ -108,6 +115,12 @@ pub struct F64(pub u64);
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Addr(pub *mut u8);
+
+/// How many bytes a native left as the context's taken bytes ([`Ctx::give`]), which compiled code
+/// copies out into a string or a byte string of its own.
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TakenBytes(pub i64);
 
 /// The address of words a native writes for compiled code, as many as the native says.
 #[repr(transparent)]
@@ -206,6 +219,14 @@ unsafe impl Answered for F64 {
     }
 }
 
+unsafe impl Answered for TakenBytes {
+    const MACHINE: Option<Machine> = Some(Machine::Taken);
+    const RAISES: bool = false;
+    fn of(w: Word) -> Self {
+        TakenBytes(w)
+    }
+}
+
 /// The type of a function compiled code calls with its context and machine words.
 pub trait Native: Copy {
     const SIGNATURE: Signature;
@@ -234,3 +255,9 @@ natives_taking!(A B C);
 natives_taking!(A B C D);
 natives_taking!(A B C D E);
 natives_taking!(A B C D E F);
+natives_taking!(A B C D E F G);
+natives_taking!(A B C D E F G H);
+natives_taking!(A B C D E F G H I);
+natives_taking!(A B C D E F G H I J);
+natives_taking!(A B C D E F G H I J K);
+natives_taking!(A B C D E F G H I J K L);

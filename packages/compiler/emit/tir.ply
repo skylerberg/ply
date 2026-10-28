@@ -13,7 +13,7 @@ import compiler.emit.answer (GenericCall, Need, Pass)
 import compiler.emit.keys (RootKey, Callee, Generic, Named, TypeOp, Copy, Share, Keep)
 import compiler.emit.layout (SumLaid, LSum, LWords, P, R, WordIs, WordOutside, Nullary, Inline,
                              counts, words)
-import compiler.emit.tir.handling (HandleOp, HandleSite, Simulate, Label)
+import compiler.emit.tir.handling (HandleOp, HandleSite, WordsLaid, Label, instance_alone)
 import compiler.emit.tir.containers (ContainerOp)
 import compiler.emit.tir.calling (CallingOp)
 import compiler.emit.tir.statics (StaticDef, StaticWord)
@@ -185,9 +185,10 @@ pub type Val =
   | Op({ op: Operation, args: List<Arg>, uses: Uses })
   /// Takes the variable's count: answers it where that count was its last, and 0 otherwise.
   | LastOf(Var)
-  /// What only a specialisation computes of `args`: an operation that reads a type or layout a type
-  /// variable leaves open, whose need settles the body by its callers, so no printer meets one.
-  | Unsettled(List<Arg>)
+  /// What only a specialisation computes of its operands: an operation over a type or layout a type
+  /// variable leaves open, whose need settles the body by its callers, so no printer meets one. Each
+  /// operand is taken where the specialisation's operation takes it.
+  | Unsettled(List<{ arg: Arg, takes: Bool }>)
   /// `of` walked by its blocks as `op` says, `Copy`, `Share` or `Keep`: a copy, which takes `of`; for
   /// `Share`, every block reached marked to cross threads, answering an `RInt` that is nonzero where
   /// each may; for `Keep`, a copy no count releases. `Share` and `Keep` borrow `of`.
@@ -250,8 +251,9 @@ pub type Inst =
   /// A block known to be held only here consumed, and its counted words bound as owned.
   | Opened({ of: Var, words: List<Var> })
 
-/// A resource a failure lets go of: the value, and the call of its type's `LetGo` root on it.
-pub type Unwound = { arg: Arg, callee: RootKey, conv: Convention }
+/// A resource a failure lets go of: the value, the words handed past it for what its release
+/// performs, and the call of its type's `LetGo` root on them.
+pub type Unwound = { arg: Arg, words: List<Arg>, callee: RootKey, conv: Convention }
 
 /// What a `Fail` fails with: no arm of a `match` matched, which fails the run, or a `let`'s pattern
 /// did not hold its value, which raises.
@@ -278,9 +280,15 @@ pub type Links = {
   needs: List<Need>,
   called: List<Int>,
   passes: List<Pass>,
+  pending: Option<Pending>,
 }
 
-pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [] }
+pub fn no_links() -> Links = { generics: [], needs: [], called: [], passes: [], pending: None }
+
+/// How a function raises, as it leaves on a failure, an `abort.raise` the runtime left pending: on
+/// `word`, the evidence object it holds for `abort`, whose operation `index` the raise is, its `op#`
+/// and the descriptor of `String` the static objects `op` and `string`.
+pub type Pending = { word: Var, index: Int, op: Bytes, string: Bytes }
 
 /// One root's form. `params` are held as `conv` takes them, but a list a root of its own walks down
 /// by restarting on its rest, which it holds as a view of the list whose word `conv` takes; a
@@ -316,8 +324,19 @@ pub type Member = { key: RootKey, base: Int, params: List<Var>, conv: Convention
 
 /// The body of a closure a root makes, numbered by its place among them, and the lambda's place in
 /// the root's text. The first `captures` of `body.params` are the words the closure captured, which
-/// its C function takes before its own parameters.
-pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span })
+/// its C function takes before its own parameters; `words` what its function takes after them.
+pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span, words: ClosureWords })
+
+/// The evidence words a closure's function takes past its own parameters, as the lambda's own row
+/// says, which the closure's entry by its type reads off the words its caller hands: the name of
+/// the static descriptor of that row, how many words, how many of its captures are the labels it was
+/// made with and how many, one word each, the closure holds after them, and which of those labels
+/// each word of a label the row leaves to its caller reads.
+pub type ClosureWords = { described: Bytes, count: Int, labels: Int, held: Int, left: List<Int> }
+
+/// What a closure of a row taking no word takes.
+pub fn no_closure_words() -> ClosureWords =
+  { described: b"", count: 0, labels: 0, held: 0, left: [] }
 
 /// Which part of the lowering declined a body, or whose printer has no C for what it was handed.
 pub type Family = | Spine | Data | Calling | Matching | Handling | Scalars | Containers
@@ -464,10 +483,14 @@ pub fn operands(v: Val) -> List<{ arg: Arg, takes: Bool }> =
     Op(o) -> used_as(o.args, o.uses),
     LastOf(x) -> [{ arg: AVar(x), takes: true }],
     Walked(w) -> [{ arg: AVar(w.of), takes: w.op == Copy }],
-    Unsettled(args) -> args.map(|a: Arg| { arg: a, takes: false }),
+    Unsettled(ops) -> ops,
   }
 
 fn made_record(m: Made) -> Bool = match m { MRecord(_) -> true, _ -> false }
+
+/// `args`, each only read.
+pub fn read_only(args: List<Arg>) -> List<{ arg: Arg, takes: Bool }> =
+  args.map(|a: Arg| { arg: a, takes: false })
 
 /// `args`, values written into a record's fields: each taken, but a record held as a word, which a
 /// field lays in place and is copied in from where it lies, so it is only read.
@@ -708,7 +731,7 @@ test "each operation consumes or borrows each operand as its signature says" {
   assert_eq(answered(taken), Owns);
   assert_eq(answered(Tag(b"m.Box")), Lasts);
   let lent = { takes: [false, true], owned: false, fails: true, stops: false };
-  assert_eq(takes(Op({ op: OHandle(Simulate), args: [AVar(s), AVar(s)], uses: lent })), [
+  assert_eq(takes(Op({ op: OHandle(WordsLaid), args: [AVar(s), AVar(s)], uses: lent })), [
     false,
     true,
   ]);
@@ -764,22 +787,14 @@ test "a call stops where it says, a block where something it holds does, a handl
   assert_eq([stops_in(calling(true)), stops_in(calling(false))], [true, false]);
   // A stop in a branch of the block counts.
   assert_eq(stops_in([If({ cond: ABool(true), then: [], otherwise: calling(true) })]), true);
-  let quiet = { clauses: [], ret: None, detached: None };
-  let clause = {
-    effect: b"e",
-    op: b"op",
-    resource: b"",
-    mode: 1,
-    string: None,
-    handler: 0,
-    label: None,
-  };
+  let quiet = { clauses: [], ret: None, detached: None, instance: instance_alone(0) };
+  let clause = { effect: b"e", op: b"op", mode: 1, string: None, handler: 0 };
   assert_eq(
     [
       handle_stops(calling(false), quiet),
       handle_stops(calling(true), quiet),
       handle_stops([], { ..quiet, ret: Some(0) }),
-      handle_stops([], { ..quiet, detached: Some(1) }),
+      handle_stops([], { ..quiet, detached: Some({ body: 1, forwards: 2 }) }),
       handle_stops([], { ..quiet, clauses: [clause] }),
     ],
     [false, true, true, true, true],

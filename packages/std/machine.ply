@@ -1,0 +1,698 @@
+//! Entering a compiled unit: the capability a program that runs programs is lent, as the family
+//! `machine` (`--allow machine`).
+//!
+//! `open` loads a unit from the library its C was compiled into, `bind` makes a binding of the host
+//! families the runtime serves itself from what a run is lent alone, and `enter` runs one root of
+//! the unit on a context of its own on the calling thread, its arguments the PLV1 list of values
+//! its entry reads (`std.value.encode`), its answer the PLV1 its root wrote, untouched. No front end
+//! crosses: which root to enter, what its arguments are and what its answer or failure says are the
+//! caller's. A failure's places are sites, a root's name and offsets from the start of its
+//! definition, which a caller holding the program's front end places.
+//!
+//! `hermetic_machine` is the same operations answered from what they are handed alone: no host is
+//! bound, no clock bounds or measures an entry, and no root a trace names is known to stand, so a
+//! test that drives a program through it is deterministic and is cached. It needs no grant.
+
+import std.bin
+import std.internal.trail as trail
+import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
+                  VRecord, VCtor, VMap, VFn, VHold, VSecret, VElided, VArray, Field, Entry, Fun,
+                  FNamed, FAnonymous, FConst, FProject, FTable)
+
+/// The capability.
+pub nondet effect machine {
+  /// The unit compiled into the library at `library`, or why it did not load: a library emitted
+  /// against another runtime, among others.
+  write open(library: String) -> Result<Opened, String>
+  /// A binding of the families the runtime serves itself, made from `grants` alone, or why it could
+  /// not be made: a root that is no directory (`E0454`), a program that cannot be started
+  /// (`E0457`), a credential that does not load (`E0430`).
+  write bind(grants: Grants) -> Result<Int, List<Failure>>
+  /// `root` of the unit `unit` entered on a context of its own, `arguments` the PLV1 list its entry
+  /// reads, as `run` bounds it.
+  read enter(unit: Int, root: String, arguments: Bytes, run: Run) -> Outcome
+  /// The first read `trace` holds that no longer answers as it did under `grants`, as a person
+  /// reads it.
+  read moved(grants: Grants, trace: Bytes) -> Option<String>
+  /// What the families the runtime serves itself register, and the facts the disclosures of a run
+  /// lent `grants` print.
+  read hosting(grants: Grants) -> Hosting
+  /// The binding torn down, its children ended and its sink flushed: what its facilities report.
+  write unbind(binding: Int) -> List<Report>
+  /// The unit let go; an entry still running keeps it until it ends.
+  write close(unit: Int) -> Unit
+}
+
+/// `machine` answered from what it is handed alone.
+pub effect hermetic_machine {
+  /// As `machine.open`.
+  write open(library: String) -> Result<Opened, String>
+  /// As `machine.bind`.
+  write bind(grants: Grants) -> Result<Int, List<Failure>>
+  /// As `machine.enter`.
+  read enter(unit: Int, root: String, arguments: Bytes, run: Run) -> Outcome
+  /// As `machine.moved`.
+  read moved(grants: Grants, trace: Bytes) -> Option<String>
+  /// As `machine.hosting`.
+  read hosting(grants: Grants) -> Hosting
+  /// As `machine.unbind`.
+  write unbind(binding: Int) -> List<Report>
+  /// As `machine.close`.
+  write close(unit: Int) -> Unit
+}
+
+/// A unit opened: its handle, how many roots it is entered at, the nanoseconds loading it took, and
+/// how many threads the runtime runs `parallel` branches on.
+pub type Opened = { unit: Int, roots: Int, nanos: Int, threads: Int }
+
+/// A root or a program a run is lent, by the name a program performs it under.
+pub type Named = { name: String, path: String }
+
+/// What a run is lent. A binding binds every family the runtime serves itself, which `fs`, `exec`,
+/// `allow`, `argv`, `stderr` and `spawning` narrow; `given` holds what other families' handlers
+/// read, by name.
+pub type Grants = {
+  fs: List<Named>,
+  exec: List<Named>,
+  /// The families lent: `machine`, `shipped`, `toolchain`.
+  allow: List<String>,
+  /// The command line `process.args` answers; none for a run that is no process, as a test is.
+  argv: Option<List<String>>,
+  /// The process's own lines go to stderr, as `--json` promises stdout to its one document.
+  stderr: Bool,
+  /// Of `process`, only what starts a program `exec` names is bound, as a test is.
+  spawning: Bool,
+  given: List<Given>,
+}
+
+/// An entry another family's handler reads.
+pub type Given = { name: String, fields: List<String> }
+
+/// What lends nothing.
+pub fn no_grants() -> Grants =
+  { fs: [], exec: [], allow: [], argv: None, stderr: false, spawning: false, given: [] }
+
+/// How an entry is bounded and what it runs with.
+pub type Run = {
+  /// The binding the entry is observed under, and served by where `hosted`; 0 for none.
+  binding: Int,
+  hosted: Bool,
+  /// Calls it may make; 0 is no bound.
+  steps: Int,
+  /// Milliseconds of wall clock it may take; 0 is no clock.
+  timeout_ms: Int,
+  /// How deeply its calls may nest.
+  depth: Int,
+  /// The schedule its `simulate` regions take.
+  seed: Option<Seed>,
+  /// One of several runs of one test a search makes: reaching the host is refused.
+  re_executed: Bool,
+  /// What its root may perform: a host answer outside it is refused (`E0427`).
+  declared: Option<List<Atom>>,
+  /// Records what it read, which its outcome's trace says.
+  observe: Bool,
+  /// Reads the wall clock for how long it took.
+  measure: Bool,
+  /// Counts every operation it performs in its usage, those its own handlers answer included;
+  /// uncounted, only those a handler the runtime keeps answers.
+  counted: Bool,
+}
+
+/// A seed's root, the choices before its stream decides, and the scheduling points an
+/// interleaving may take.
+pub type Seed = { root: U64, path: List<Int>, steps: Int }
+
+/// An effect atom, its operation's mode resolved.
+pub type Atom = { effect: String, resource: Resource, write: Bool, op: Option<String> }
+
+/// What an atom names: the singleton, one label, every label, or a label the definition is generic
+/// over, by its place.
+pub type Resource = | Singleton | Labelled(String) | Every | Variable(Int)
+
+/// A run as nothing bounds it but `depth`, the calls it may nest.
+pub fn unbounded(depth: Int) -> Run =
+  {
+    binding: 0,
+    hosted: false,
+    steps: 0,
+    timeout_ms: 0,
+    depth: depth,
+    seed: None,
+    re_executed: false,
+    declared: None,
+    observe: false,
+    measure: false,
+    counted: false,
+  }
+
+/// How an entry ended, the code `process.exit` asked for, what it used, what its host runtime
+/// warned of as it ended, what its `simulate` regions did, and what it read.
+pub type Outcome = {
+  ended: Ended,
+  exit: Option<Int>,
+  usage: Usage,
+  warnings: List<Failure>,
+  interleaving: Option<Interleaving>,
+  trace: Option<Bytes>,
+}
+
+/// How an entry ended.
+pub type Ended =
+  /// The root's answer, as the PLV1 its entry wrote.
+  | Answered(Bytes)
+  /// A raise nothing answered, a runtime error, a budget spent, or an answer the boundary refuses.
+  | Failed(Failure)
+  /// The runtime itself failed, which is Ply's defect, with what it said.
+  | Panicked(String)
+  /// The unit is entered at no such root.
+  | NoRoot
+  /// The answer holds what no run but its own can hold, which is why.
+  | Unanswerable(String)
+
+/// `nanos` is 0 for a run not measured.
+pub type Usage = {
+  nanos: Int,
+  /// Whether it reached a nondeterministic host handler.
+  host: Bool,
+  steps: Int,
+  performs: Int,
+  bridges: Int,
+  scheduled: Int,
+  task_stacks: Int,
+  frame_tables: Int,
+  updates: Int,
+  updates_in_place: Int,
+}
+
+/// A runtime diagnostic: each value its text names as `value_of` reads it.
+pub type Failure = {
+  code: String,
+  severity: Severity,
+  message: String,
+  labels: List<Label>,
+  notes: List<String>,
+  values: List<Bytes>,
+}
+
+/// Whether a diagnostic stops the run, warns, or adds a note.
+pub type Severity = | Error | Warning | Note
+
+/// What a failure says of a place: `primary` for the place it is about, none for a place no root
+/// holds.
+pub type Label = { site: Option<Site>, primary: Bool, text: String }
+
+/// A place in a root's definition: offsets from its start.
+pub type Site = { root: String, start: Int, end: Int }
+
+/// What a run's `simulate` regions did: each scheduling point, and the virtual time spent.
+pub type Interleaving = { steps: List<Step>, virtual_time: Int }
+
+/// One scheduling point: the region and the task it resumed, every task it could have resumed in
+/// the order `choice` indexes, what the step after it touched and where, and the task's vector
+/// clock.
+pub type Step = {
+  region: Int,
+  task: Int,
+  enabled: List<Int>,
+  choice: Int,
+  accesses: List<Access>,
+  definition: Option<String>,
+  site: Option<Site>,
+  stamp: List<Int>,
+}
+
+/// What a step touched: an effect's atom, a handler's variable (its `handle` and its place there),
+/// or a hold, each written or only read.
+pub type Access =
+  | AAtom({ effect: String, resource: Option<String>, write: Bool, op: Option<String> })
+  | AVar({ handler: Int, index: Int, write: Bool })
+  | AHold({ id: Int, write: Bool })
+
+/// What a facility reports of a run once it is torn down, by name: `teardown` the spans left open,
+/// `handshakes` the lines a run prints of its TLS, `stopping` how a stop went, `trace` what the
+/// sink saw.
+pub type Report = { name: String, body: Bytes }
+
+/// What the families the runtime serves itself register, and the facts a run's disclosures print.
+pub type Hosting = {
+  registrations: List<Registration>,
+  /// Why a credential or a root a run is lent does not load.
+  refusals: List<Failure>,
+  /// None where the credentials refused.
+  transport: Option<Transport>,
+  roots: List<Named>,
+  sink: Sink,
+  signals: List<String>,
+}
+
+/// One operation a family the runtime serves registers: on every label the program performs it on
+/// where `resource` is none. `facility` is the disclosure its handler belongs to: `tls`, `fs`, or
+/// none.
+pub type Registration = {
+  effect: String,
+  op: String,
+  resource: Option<Resource>,
+  deterministic: Bool,
+  repeatable: Bool,
+  blocking: Bool,
+  secrets: Bool,
+  handler: String,
+  facility: String,
+}
+
+/// The TLS a run's connections use: the library and its provider, the protocol versions and ALPN
+/// names it offers, the roots it trusts (`trusted` certificates of them) and the credentials it
+/// presents.
+pub type Transport = {
+  library: String,
+  version: String,
+  provider: String,
+  versions: List<String>,
+  alpn: List<String>,
+  roots: String,
+  roots_version: String,
+  trusted: Int,
+  credentials: List<Credential>,
+}
+
+/// A credential the transport presents: its name, its certificate's fingerprint and how many
+/// certificates its chain holds.
+pub type Credential = { name: String, fingerprint: String, certificates: Int }
+
+/// `level` is none where the records are discarded.
+pub type Sink = { sink: String, destination: String, level: Option<String> }
+
+derive bin for Opened
+derive bin for Named
+derive bin for Given
+derive bin for Seed
+derive bin for Resource
+derive bin for Atom
+derive bin for Run
+derive bin for Severity
+derive bin for Site
+derive bin for Label
+derive bin for Failure
+derive bin for Access
+derive bin for Step
+derive bin for Interleaving
+derive bin for Usage
+derive bin for Ended
+derive bin for Report
+derive bin for Outcome
+derive bin for Registration
+derive bin for Credential
+derive bin for Transport
+derive bin for Sink
+derive bin for Hosting
+
+// --- The real handlers ---------------------------------------------------------------
+
+host for machine by served
+
+host for hermetic_machine by served_hermetically
+
+/// `go` with `machine` answered by the runtime.
+pub fn served<a | e>(go: () -> a / {machine.read, machine.write | e}) -> a / {abort.raise | e} =
+  handle {
+    go()
+  } with {
+    machine.open(library) -> opened_of(unit_open(library)),
+    machine.bind(grants) -> bound_of(unit_bind(written(grants))),
+    machine.enter(unit, root, arguments, run) ->
+      read(unit_enter(unit, root, arguments, bin::encode(run, run_bin())), outcome_bin()),
+    machine.moved(grants, trace) -> moved_of(unit_moved(written(grants), trace)),
+    machine.hosting(grants) -> read(unit_hosting(written(grants)), hosting_bin()),
+    machine.unbind(binding) -> read(unit_unbind(binding), reports_bin()),
+    machine.close(unit) -> unit_close(unit),
+  }
+
+/// `go` with `hermetic_machine` answered by the runtime, from what it is handed alone.
+pub fn served_hermetically<a | e>(
+  go: () -> a / {hermetic_machine.read, hermetic_machine.write | e},
+) -> a / {abort.raise | e} =
+  handle {
+    go()
+  } with {
+    hermetic_machine.open(library) -> opened_of(unit_open(library)),
+    // No host is bound, so the binding is none: an entry under it reaches only its own handlers.
+    hermetic_machine.bind(grants) -> match lending(grants) {
+      Some(refused) -> Err([refused]),
+      None -> Ok(0),
+    },
+    // Bound to no host, the entry reads nothing of the world: an observed one's pass stands on what
+    // it was handed, as an empty trace says.
+    hermetic_machine.enter(unit, root, arguments, run) -> {
+      let outcome: Outcome = read(
+        unit_enter(
+          unit,
+          root,
+          arguments,
+          bin::encode(
+            { ..run, binding: 0, hosted: false, timeout_ms: 0, measure: false },
+            run_bin(),
+          ),
+        ),
+        outcome_bin(),
+      );
+      { ..outcome, trace: if run.observe { Some(b"") } else { outcome.trace } }
+    },
+    hermetic_machine.moved(grants, trace) -> None,
+    hermetic_machine.hosting(grants) -> match lending(grants) {
+      Some(refused) ->
+        { ..read(unit_hosting(written(no_grants())), hosting_bin()), refusals: [refused] },
+      None -> read(unit_hosting(written(sealed(grants))), hosting_bin()),
+    },
+    hermetic_machine.unbind(binding) -> read(unit_unbind(binding), reports_bin()),
+    hermetic_machine.close(unit) -> unit_close(unit),
+  }
+
+/// `grants` as a run bound to no host takes them: no command line.
+fn sealed(grants: Grants) -> Grants = { ..grants, argv: None }
+
+/// The refusal of a hermetic run lent what it would read off the disk or start: a root, a program
+/// or a credential.
+fn lending(grants: Grants) -> Option<Failure> =
+  if grants.fs.len() == 0 && grants.exec.len() == 0
+      && !grants.given.any(|g: Given| g.name == "tls" || g.name == "trust") { None } else {
+    Some({
+      code: "E0459",
+      severity: Error,
+      message: "`hermetic_machine` binds no host, and the run is lent a root, a program or a credential",
+      labels: [],
+      notes: [
+        "a program that drives a run reaching the host performs `machine`, and its test is `test/nondet`",
+      ],
+      values: [],
+    })
+  }
+
+// --- What a failure shows ------------------------------------------------------------
+
+/// A value a failure names, as the runtime writes it: `Value`'s case by its place among the
+/// type's cases, then what the case holds, as `std.bin` writes each. Bytes that do not read are
+/// the runtime's defect.
+pub fn value_of(bytes: Bytes) -> Value / {abort.raise} =
+  match value_read(bytes) { Some(v) -> v, None -> panic("a value the runtime wrote does not read") }
+
+/// The value `bytes` hold whole, or none.
+pub fn value_read(bytes: Bytes) -> Option<Value> / {abort.raise} =
+  match take_value(bytes, 0, 0) {
+    Ok(t) -> if t.at == bytes.len() { Some(t.value) } else { None },
+    Err(_) -> None,
+  }
+
+fn take_value(
+  d: Bytes,
+  at: Int,
+  depth: Int,
+) -> Result<bin::Taken<Value>, bin::BinError> / {abort.raise} =
+  if depth > bin::max_depth() { Err({ at: at, message: "a value nested too deeply" }) } else {
+    let inner = |e: Bytes, from: Int| take_value(e, from, depth + 1);
+    match bin::take_tag(d, at, 20) {
+      Err(e) -> Err(e),
+      Ok(t) -> match t.value {
+        0 -> Ok({ value: VUnit, at: t.at }),
+        1 -> as_value(bin::take_bool(d, t.at), |b: Bool| VBool(b)),
+        2 -> as_value(bin::take_int(d, t.at), |n: Int| VInt(n)),
+        3 -> as_value(bin::take_float(d, t.at), |f: Float| VFloat(f)),
+        4 -> as_value(bin::take_decimal(d, t.at), |x: Decimal| VDecimal(x)),
+        5 -> match bin::take_string(d, t.at) {
+          Err(e) -> Err(e),
+          Ok(ty) -> as_value(bin::take_u128(d, ty.at), |bits: U128| VFixed(ty.value, bits)),
+        },
+        6 -> as_value(bin::take_char(d, t.at), |c: Char| VChar(c)),
+        7 -> as_value(bin::take_string(d, t.at), |s: String| VStr(s)),
+        8 -> as_value(bin::take_bytes(d, t.at), |b: Bytes| VBytes(b)),
+        9 -> as_value(bin::take_list(d, t.at, inner), |xs: List<Value>| VList(xs)),
+        10 ->
+          as_value(
+            bin::take_list(d, t.at, |e: Bytes, from: Int| take_field(e, from, depth + 1)),
+            |fs: List<Field>| VRecord(fs),
+          ),
+        11 -> match bin::take_string(d, t.at) {
+          Err(e) -> Err(e),
+          Ok(name) ->
+            as_value(bin::take_list(d, name.at, inner), |xs: List<Value>| VCtor(name.value, xs)),
+        },
+        12 ->
+          as_value(
+            bin::take_list(d, t.at, |e: Bytes, from: Int| take_entry(e, from, depth + 1)),
+            |es: List<Entry>| VMap(es),
+          ),
+        13 -> as_value(take_fun(d, t.at, depth + 1), |f: Fun| VFn(f)),
+        14 -> Ok({ value: VHold, at: t.at }),
+        17 -> Ok({ value: VSecret, at: t.at }),
+        18 -> as_value(bin::take_int(d, t.at), |n: Int| VElided(n)),
+        19 -> as_value(bin::take_list(d, t.at, inner), |xs: List<Value>| VArray(xs)),
+        // 15 and 16 are no case's, as the runtime writes a value.
+        _ -> Err({ at: at, message: "a value of no case" }),
+      },
+    }
+  }
+
+fn take_field(
+  d: Bytes,
+  at: Int,
+  depth: Int,
+) -> Result<bin::Taken<Field>, bin::BinError> / {abort.raise} =
+  match bin::take_string(d, at) {
+    Err(e) -> Err(e),
+    Ok(name) -> match take_value(d, name.at, depth) {
+      Err(e) -> Err(e),
+      Ok(v) -> Ok({ value: { name: name.value, value: v.value }, at: v.at }),
+    },
+  }
+
+fn take_entry(
+  d: Bytes,
+  at: Int,
+  depth: Int,
+) -> Result<bin::Taken<Entry>, bin::BinError> / {abort.raise} =
+  match take_value(d, at, depth) {
+    Err(e) -> Err(e),
+    Ok(k) -> match take_value(d, k.at, depth) {
+      Err(e) -> Err(e),
+      Ok(v) -> Ok({ value: { key: k.value, value: v.value }, at: v.at }),
+    },
+  }
+
+fn take_fun(
+  d: Bytes,
+  at: Int,
+  depth: Int,
+) -> Result<bin::Taken<Fun>, bin::BinError> / {abort.raise} =
+  match bin::take_tag(d, at, 5) {
+    Err(e) -> Err(e),
+    Ok(t) -> match t.value {
+      0 -> as_fun(bin::take_string(d, t.at), |name: String| FNamed(name)),
+      1 -> Ok({ value: FAnonymous, at: t.at }),
+      2 -> match bin::take_u8(d, t.at) {
+        Err(e) -> Err(e),
+        Ok(arity) ->
+          as_fun(take_value(d, arity.at, depth), |v: Value|
+            FConst({ arity: arity.value, value: v })),
+      },
+      3 -> match bin::take_u8(d, t.at) {
+        Err(e) -> Err(e),
+        Ok(arity) ->
+          as_fun(bin::take_u8(d, arity.at), |index: U8|
+            FProject({ arity: arity.value, index: index })),
+      },
+      _ -> match bin::take_u8(d, t.at) {
+        Err(e) -> Err(e),
+        Ok(arity) -> match bin::take_list(d, arity.at, |e: Bytes, from: Int|
+            take_entry(e, from, depth)) {
+          Err(e) -> Err(e),
+          Ok(es) ->
+            as_fun(take_value(d, es.at, depth), |v: Value|
+              FTable({ arity: arity.value, entries: es.value, default: v })),
+        },
+      },
+    },
+  }
+
+fn as_value<a>(
+  r: Result<bin::Taken<a>, bin::BinError>,
+  made: (a) -> Value,
+) -> Result<bin::Taken<Value>, bin::BinError> =
+  match r { Err(e) -> Err(e), Ok(t) -> Ok({ value: made(t.value), at: t.at }) }
+
+fn as_fun<a>(
+  r: Result<bin::Taken<a>, bin::BinError>,
+  made: (a) -> Fun,
+) -> Result<bin::Taken<Fun>, bin::BinError> =
+  match r { Err(e) -> Err(e), Ok(t) -> Ok({ value: made(t.value), at: t.at }) }
+
+// --- What crosses the natives -------------------------------------------------------
+
+/// `grants` as the runtime reads them: each entry by name with its fields.
+fn written(grants: Grants) -> Bytes / {abort.raise} = bin::encode(entries_of(grants), givens_bin())
+
+fn entries_of(grants: Grants) -> List<Given> = {
+  let pairs = |name: String, ns: List<Named>|
+    ns.map(|n: Named| { name: name, fields: [n.name, n.path] });
+  [
+    pairs("fs", grants.fs),
+    pairs("exec", grants.exec),
+    grants.allow.map(|f: String| { name: "allow", fields: [f] }),
+    match grants.argv { Some(argv) -> [{ name: "argv", fields: argv }], None -> [] },
+    if grants.stderr { [{ name: "stderr", fields: [] }] } else { [] },
+    if grants.spawning { [{ name: "spawning", fields: [] }] } else { [] },
+    grants.given,
+  ].fold([], |acc: List<Given>, part: List<Given>| acc.concat(part))
+}
+
+fn givens_bin() -> bin::BinCodec<List<Given>> = bin::list_bin(given_bin())
+
+fn reports_bin() -> bin::BinCodec<List<Report>> = bin::list_bin(report_bin())
+
+fn opened_of(bytes: Bytes) -> Result<Opened, String> / {abort.raise} =
+  read(bytes, bin::result_bin(opened_bin(), bin::string_bin()))
+
+fn bound_of(bytes: Bytes) -> Result<Int, List<Failure>> / {abort.raise} =
+  read(bytes, bin::result_bin(bin::int_bin(), bin::list_bin(failure_bin())))
+
+fn moved_of(bytes: Bytes) -> Option<String> / {abort.raise} =
+  read(bytes, bin::option_bin(bin::string_bin()))
+
+/// What the runtime wrote, which it writes whole: bytes that do not read are Ply's defect.
+fn read<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {abort.raise} =
+  match bin::decode(bytes, codec) {
+    Ok(x) -> x,
+    Err(e) -> panic("the runtime's answer does not read: " ++ bin::error_to_string(e)),
+  }
+
+extern fn unit_open(library: String) -> Bytes
+extern fn unit_bind(grants: Bytes) -> Bytes
+extern fn unit_enter(unit: Int, root: String, arguments: Bytes, run: Bytes) -> Bytes
+extern fn unit_moved(grants: Bytes, trace: Bytes) -> Bytes
+extern fn unit_hosting(grants: Bytes) -> Bytes
+extern fn unit_unbind(binding: Int) -> Bytes
+extern fn unit_close(unit: Int) -> Unit
+
+// --- Tests ------------------------------------------------------------------------
+
+test "a value the runtime writes reads as the value it names" {
+  assert_eq(value_read(b"\x00"), Some(VUnit));
+  assert_eq(value_read(b"\x01\x01"), Some(VBool(true)));
+  assert_eq(value_read(b"\x02\x06"), Some(VInt(3)));
+  assert_eq(value_read(b"\x02\x05"), Some(VInt(0 - 3)));
+  assert_eq(value_read(b"\x07\x02hi"), Some(VStr("hi")));
+  assert_eq(value_read(b"\x09\x02\x00\x01\x00"), Some(VList([VUnit, VBool(false)])));
+  assert_eq(value_read(b"\x0b\x04Some\x01\x02\x02"), Some(VCtor("Some", [VInt(1)])));
+  assert_eq(value_read(b"\x0a\x01\x01n\x02\x0e"), Some(VRecord([{ name: "n", value: VInt(7) }])));
+  assert_eq(value_read(b"\x0d\x00\x03inc"), Some(VFn(FNamed("inc"))));
+  assert_eq(value_read(b"\x12\x08"), Some(VElided(4)))
+}
+
+test "bytes that end inside a value, follow one, or name no case read as no value" {
+  assert_eq(value_read(b"\x02"), None);
+  assert_eq(value_read(b"\x00\x00"), None);
+  assert_eq(value_read(b"\x7f"), None)
+}
+
+test "grants are written as the runtime reads them, each entry by name with its fields" {
+  assert_eq(entries_of(no_grants()), []);
+  assert_eq(
+    entries_of({
+      ..no_grants(),
+      fs: [{ name: "cwd", path: "." }],
+      allow: ["machine"],
+      argv: Some(["a", "b"]),
+      given: [{ name: "trust", fields: ["ca.pem"] }],
+    }),
+    [
+      { name: "fs", fields: ["cwd", "."] },
+      { name: "allow", fields: ["machine"] },
+      { name: "argv", fields: ["a", "b"] },
+      { name: "trust", fields: ["ca.pem"] },
+    ],
+  );
+  assert_eq(
+    bin::decode(written({ ..no_grants(), allow: ["machine"] }), givens_bin()),
+    Ok([{ name: "allow", fields: ["machine"] }]),
+  )
+}
+
+test "an outcome reads as the runtime writes it" {
+  let bytes = Bytes::concat_all([
+    b"\x00\x02ok",
+    b"\x01\x0e",
+    b"\x00\x00\x02\x04\x00\x00\x00\x00\x00\x00",
+    b"\x01\x02E1\x01\x01w\x01\x01\x01m\x04\x00\x01\x01l\x00\x00",
+    b"\x00",
+    b"\x00",
+  ]);
+  let o = read(bytes, outcome_bin());
+  assert_eq(o.ended, Answered(b"ok"));
+  assert_eq(o.exit, Some(7));
+  assert_eq(o.usage.steps, 1);
+  assert_eq(o.usage.performs, 2);
+  assert_eq(o.warnings, [
+    {
+      code: "E1",
+      severity: Warning,
+      message: "w",
+      labels: [{ site: Some({ root: "m", start: 2, end: 0 }), primary: true, text: "l" }],
+      notes: [],
+      values: [],
+    },
+  ]);
+  assert_eq(o.interleaving, None)
+}
+
+test "an interleaving a region's trail writes reads as an outcome's" {
+  let step = {
+    region: 0,
+    task: 1,
+    enabled: [0, 1],
+    choice: 1,
+    accesses: [
+      trail::Atom("task.chan", trail::Named("#0"), trail::Write, None),
+      trail::Hold(2, trail::Read),
+    ],
+    site: Some({ root: 4, start: 1, end: 3 }),
+    stamp: [1, 1],
+  };
+  let placed = |s: trail::Site|
+    { definition: Some("f"), site: Some({ root: "f", start: s.start + 10, end: s.end + 10 }) };
+  assert_eq(
+    bin::decode(
+      trail::interleaving_of(trail::steps_written(trail::unwritten(), [step], placed), 25),
+      interleaving_bin(),
+    ),
+    Ok({
+      steps: [
+        {
+          region: 0,
+          task: 1,
+          enabled: [0, 1],
+          choice: 1,
+          accesses: [
+            AAtom({ effect: "task.chan", resource: Some("#0"), write: true, op: None }),
+            AHold({ id: 2, write: false }),
+          ],
+          definition: Some("f"),
+          site: Some({ root: "f", start: 11, end: 13 }),
+          stamp: [1, 1],
+        },
+      ],
+      virtual_time: 25,
+    }),
+  )
+}
+
+test "a run is written field by field in the order the runtime reads it" {
+  let written = bin::encode({ ..unbounded(10000), binding: 3, hosted: true }, run_bin());
+  // binding 3, hosted, no steps or clock, depth 10000, no seed, not again, nothing declared, no
+  // trace, no clock read, performs not counted.
+  assert_eq(written, b"\x06\x01\x00\x00\xa0\x9c\x01\x00\x00\x00\x00\x00\x00")
+}
+
+test "the hermetic machine refuses what it would read off the disk or start" {
+  assert_eq(lending(no_grants()), None);
+  assert(lending({ ..no_grants(), fs: [{ name: "cwd", path: "." }] }) != None);
+  assert(lending({ ..no_grants(), exec: [{ name: "git", path: "/usr/bin/git" }] }) != None);
+  assert(lending({ ..no_grants(), given: [{ name: "tls", fields: ["a", "c", "k"] }] }) != None)
+}

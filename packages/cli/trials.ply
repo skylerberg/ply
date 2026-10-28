@@ -26,7 +26,12 @@ import testing.bisect
 import testing.delta (Decl, DefKey, Facts, Row, Value, decl_key, value_key)
 import testing.facts (Baseline, Now, Node, Rehash, facts)
 import testing.mixture (Era, Mixture, choose, hashes_of, mixture_of, printed_names)
-import tester (tester, ledger, unit_over, LastPass)
+import tester
+import tester (ledger, unit_over, LastPass, Testing)
+import std.machine as entering
+import std.value (VUnit)
+import std.value
+import surface
 import std.list
 import std.option
 import std.prelude_source
@@ -312,11 +317,13 @@ fn mixture_test() -> Bytes = b"ply_tests.t0"
 
 /// The mixture that takes `flipped` from now and the rest from the baseline. A key already holding a
 /// pass answers without anything being built: a mixture runs hermetically, so its pass read nothing.
+/// `testing` is the run's, unbound, as a mixture runs.
 pub fn trial(
+  testing: Testing,
   b: Bench,
   flipped: List<DefKey>,
   filed: Option<Bytes>,
-) -> Tried / {ledger.passes, tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} = {
+) -> Tried / {ledger.passes, entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} = {
   let cached = match filed { Some(k) -> ledger.passes([k]) == [Some(b"")], None -> false };
   if cached { { trial: from_cache(a_pass()), proved: None } } else {
     match choose(b.mixture, flipped) {
@@ -335,7 +342,7 @@ pub fn trial(
               true,
             ) {
             Unprintable(_) -> unresolved(MissingBody),
-            Printed(modules) -> ran(b, modules, filed),
+            Printed(modules) -> ran(testing, b, modules, filed),
           },
         },
       },
@@ -358,10 +365,11 @@ fn checked_over(sources: List<Source>, shipped: Shipped) -> Pulled / {abort.rais
   )
 
 fn ran(
+  testing: Testing,
   b: Bench,
   modules: List<{ module: Bytes, text: Bytes }>,
   filed: Option<Bytes>,
-) -> Tried / {tester.unit[tests], tester.interleaved[tests], emit.unit, emit.compiled, abort.raise} = {
+) -> Tried / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} = {
   let sources = modules.map(|m: { module: Bytes, text: Bytes }| { name: m.module, src: m.text });
   let analysed = checked_over(sources, b.shipped);
   let held = b.shipped.shipping.read.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
@@ -399,20 +407,25 @@ fn ran(
             cached: false,
           };
           // Hermetic always: a search asks for up to its budget of these.
-          match unit_over(front, true, false) {
+          match unit_over(testing, front, true, false) {
             Err(_) -> unresolved(DifferentFailure),
-            Ok(unit) -> match tester.interleaved[tests](
+            Ok(unit) -> {
+              let verdict = tester::interleaved(
                 unit,
                 index,
                 None,
                 b.seed,
                 trial_steps(),
                 false,
-              ).run.verdict {
-              Passed -> { trial: a_pass(), proved: filed },
-              Failed(fell) -> if fell.failure.diag.code == b.code
-                  && fell.failure.diag.message == b.message { { trial: a_failure(), proved: None } }
-              else { unresolved(DifferentFailure) },
+              ).run.verdict;
+              tester::closed(unit);
+              match verdict {
+                Passed -> { trial: a_pass(), proved: filed },
+                Failed(fell) -> if fell.failure.diag.code == b.code
+                    && fell.failure.diag.message == b.message {
+                  { trial: a_failure(), proved: None }
+                } else { unresolved(DifferentFailure) },
+              }
             },
           }
         },
@@ -594,31 +607,55 @@ test "a store that cannot produce the baseline's bodies is why no mixture can be
   assert_eq(d.bench, None)
 }
 
+/// A run as nothing measured it, ended as `ended` says.
+fn outcome_of(ended: entering::Ended) -> entering::Outcome =
+  {
+    ended: ended,
+    exit: None,
+    usage: {
+      nanos: 0,
+      host: false,
+      steps: 0,
+      performs: 0,
+      bridges: 0,
+      scheduled: 0,
+      task_stacks: 0,
+      frame_tables: 0,
+      updates: 0,
+      updates_in_place: 0,
+    },
+    warnings: [],
+    interleaving: None,
+    trace: Some(b""),
+  }
+
+fn testing_of() -> Testing / {abort.raise} =
+  tester::begun(tester::options_from(surface::parsed(["test"]), "/p"))
+
 /// A mixture is printed from bodies alone, checked like any program, and run without the binding.
 fn tried(b: Bench, flipped: List<DefKey>, failing: Bool) -> Tried / {abort.raise} =
   handle {
-    trial(b, flipped, Some(b"k"))
+    trial(testing_of(), b, flipped, Some(b"k"))
   } with {
     ledger.passes(keys) -> keys.map(|k: Bytes| None),
     emit.unit(front, offered) -> Ok({ text: b"unit", made: { bodies: [], offered: [] } }),
     emit.compiled(text, profile) -> Ok("/unit.so"),
-    tester.unit[tests](front, library, hosted) -> if hosted {
+    entering::machine.open(library) -> Ok({ unit: 7, roots: 1, nanos: 0, threads: 1 }),
+    entering::machine.enter(unit, root, arguments, run) -> if run.binding != 0 || run.hosted {
       panic("a mixture reached the binding")
-    } else if front.files.len() == 0 { Err([]) }
-    else { Ok(7) },
-    tester.interleaved[tests](unit, index, case, seed, steps, again) ->
-      {
-        run: {
-          steps: [],
-          verdict: if failing {
-            Failed({ status: "failed", failure: a_raised(b"E0501", b"assertion failed") })
-          } else { Passed },
-          virtual_time: 0,
-        },
-        observed: false,
-        usage: { duration_us: 0, host: false, entries: 0, declines: 0, performs: 0, teardown: [] },
-        trace: Some(b""),
-      },
+    } else if failing {
+      outcome_of(
+        entering::Failed({
+          code: "E0501",
+          severity: entering::Error,
+          message: "assertion failed",
+          labels: [],
+          notes: [],
+          values: [],
+        }),
+      )
+    } else { outcome_of(entering::Answered(value::encode(VUnit).unwrap_or(b""))) },
+    entering::machine.close(unit) -> (),
   }
 
 test "a mixture of the two eras prints and checks, and its answer is the trial's" {
@@ -681,12 +718,14 @@ test "a mixture whose key already holds a pass is answered without being built" 
     None -> panic("a mixture can be built"),
     Some(b) -> {
       let t = handle {
-        trial(b, [value_key("leaf")], Some(b"k"))
+        trial(testing_of(), b, [value_key("leaf")], Some(b"k"))
       } with {
         ledger.passes(keys) -> keys.map(|k: Bytes| Some(b"")),
-        tester.unit[tests](front, unit, hosted) -> panic("a cached mixture was built"),
-        tester.interleaved[tests](unit, index, case, seed, steps, again) ->
-          panic("a cached mixture was run"),
+        emit.unit(front, offered) -> panic("a cached mixture was emitted"),
+        emit.compiled(text, profile) -> panic("a cached mixture was compiled"),
+        entering::machine.open(library) -> panic("a cached mixture was built"),
+        entering::machine.enter(unit, root, arguments, run) -> panic("a cached mixture was run"),
+        entering::machine.close(unit) -> panic("a cached mixture was closed"),
       };
       assert_eq(t.trial, from_cache(a_pass()));
       assert_eq(t.proved, None)

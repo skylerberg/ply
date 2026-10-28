@@ -18,7 +18,9 @@ import compiler.load (every_root, LoadedAnalysis)
 import compiler.emit.keys (RootKey, Named)
 import compiler.check.resolve.tables (Diag, error_at, error_with_labels, label_at)
 import compiler.syntax.type_syntax (TVar)
-import machine (machine, Called, default_options, unconfigured)
+import machine
+import machine (Called)
+import std.machine as entering
 import std.bin
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
@@ -325,24 +327,28 @@ fn callees_in(a: Argument, acc: List<Bytes>, left: Int) -> List<Bytes> =
     }
   }
 
-/// The value of `a`, computed on the loaded machine; `None` where it is not one a check can
-/// compute, or its computing raised.
-fn computed_value(a: Argument, left: Int) -> Option<Value> / {machine.call[literals]} =
+/// The value of `a`, each definition it is computed by entered with `call`; `None` where it is not
+/// one a check can compute, or its computing raised.
+fn computed_value(
+  a: Argument,
+  left: Int,
+  call: (String, List<Value>) -> Called / {entering::machine.enter, abort.raise},
+) -> Option<Value> / {entering::machine.enter, abort.raise} =
   if left <= 0 { None } else {
     match a {
       AText(b) -> Some(VStr(String::of_bytes_lossy(b))),
-      AList(items) -> match all_computed(items, left - 1) {
+      AList(items) -> match all_computed(items, left - 1, call) {
         Some(vs) -> Some(VList(vs)),
         None -> None,
       },
-      ACall(c) -> match all_computed(c.args, left - 1) {
+      ACall(c) -> match all_computed(c.args, left - 1, call) {
         None -> None,
-        Some(args) -> answer_of(machine.call[literals](String::of_bytes_lossy(c.callee), args)),
+        Some(args) -> answer_of(call(String::of_bytes_lossy(c.callee), args)),
       },
       ATagged(t) -> {
         let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
         let handed = match texts { [one] -> one, _ -> VList(texts) };
-        match answer_of(machine.call[literals](String::of_bytes_lossy(t.callee), [handed])) {
+        match answer_of(call(String::of_bytes_lossy(t.callee), [handed])) {
           Some(VCtor(name, [v])) -> if ctor_name(name) == "Ok" { Some(v) } else { None },
           _ -> None,
         }
@@ -351,26 +357,29 @@ fn computed_value(a: Argument, left: Int) -> Option<Value> / {machine.call[liter
     }
   }
 
-fn all_computed(xs: List<Argument>, left: Int) -> Option<List<Value>> / {machine.call[literals]} =
+fn all_computed(
+  xs: List<Argument>,
+  left: Int,
+  call: (String, List<Value>) -> Called / {entering::machine.enter, abort.raise},
+) -> Option<List<Value>> / {entering::machine.enter, abort.raise} =
   xs.fold(Some([]), |acc: Option<List<Value>>, x: Argument|
     match acc {
       None -> None,
-      Some(vs) -> match computed_value(x, left) { Some(v) -> Some(vs.push(v)), None -> None },
+      Some(vs) -> match computed_value(x, left, call) { Some(v) -> Some(vs.push(v)), None -> None },
     })
 
 fn answer_of(called: Called) -> Option<Value> =
   match called.answer { Ok(v) -> Some(v), Err(_) -> None }
 
-/// Each statement of `asked` judged on a machine loaded for them alone, each definition they are
-/// computed by called under `steps`, and each schema they are held to entered once. `hand` answers
-/// the dump their unit is emitted over, given what it enters.
+/// Each statement of `asked` judged on a unit of what they reach alone, bound to no host, each
+/// definition they are computed by called under `steps`, and each schema they are held to entered
+/// once. `hand` answers the dump their unit is emitted over, given what it enters.
 pub fn judged(
   hand: (Within) -> LoadedAnalysis / {abort.raise},
   frame: Frame,
-  root: String,
   steps: Int,
   asked: List<Asked>,
-) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} = {
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
   let schemas = asked.fold([], |acc: List<Bytes>, a: Asked|
     match a.schema {
       Some(s) -> if acc.contains(s.name) { acc } else { acc.push(s.name) },
@@ -390,37 +399,27 @@ pub fn judged(
         ),
       ) {
       Err(diags) -> Err(diags),
-      Ok(unit) -> {
-        machine.configure[literals]({ ..default_options(), steps: steps });
-        let answered = match machine.load[literals](root, front, unit) {
-          Err(refused) -> Err(refused.diags),
-          Ok(_) -> match machine.bound[literals](
-              String::of_bytes_lossy(named.get(0)),
-              unconfigured(),
-            ) {
-            Err(refused) -> Err(refused.diags),
-            Ok(_) -> {
-              let declared = schemas.fold(
-                Map::new(),
-                |acc: Map<Bytes, sql::Schema>, name: Bytes|
-                  match answer_of(machine.call[literals](String::of_bytes_lossy(name), [])) {
-                    Some(v) -> match schema_of(v) { Some(s) -> acc.insert(name, s), None -> acc },
-                    None -> acc,
-                  },
-              );
-              Ok(
-                asked.map(|a: Asked|
-                  judgement_of(
-                    match a.schema { Some(s) -> declared.get(s.name), None -> None },
-                    a,
-                    computed_value(a.statement, 64),
-                  )),
-              )
-            },
-          },
-        };
-        machine.drop[literals]();
-        answered
+      Ok(library) -> match entering::machine.open(library) {
+        Err(why) -> Err([machine::unloaded(why)]),
+        Ok(opened) -> {
+          let roots = machine::roots_of(front.dump);
+          let run = { ..entering::unbounded(machine::max_calls()), steps: steps };
+          let call = |name: String, args: List<Value>|
+            machine::called(opened.unit, roots, name, args, run);
+          let declared = schemas.fold(Map::new(), |acc: Map<Bytes, sql::Schema>, name: Bytes|
+            match answer_of(call(String::of_bytes_lossy(name), [])) {
+              Some(v) -> match schema_of(v) { Some(s) -> acc.insert(name, s), None -> acc },
+              None -> acc,
+            });
+          let judged = asked.map(|a: Asked|
+            judgement_of(
+              match a.schema { Some(s) -> declared.get(s.name), None -> None },
+              a,
+              computed_value(a.statement, 64, call),
+            ));
+          entering::machine.close(opened.unit);
+          Ok(judged)
+        },
       },
     }
   }

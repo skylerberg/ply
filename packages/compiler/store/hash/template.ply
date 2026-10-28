@@ -16,7 +16,7 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
 import compiler.syntax.items (FnDef, TypeDef, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef,
                               LawDef, Binder, Constraint, SRequires, SEnsures, SCost, SSpace,
                               SpecClause, schema_of, ReturnsFresh, ReturnsParam, TDNominal,
-                              TDExtern, InstanceDef, numeric_ops, numeric_by, member_of,
+                              TDExtern, InstanceDef, NHost, numeric_ops, numeric_by, member_of,
                               member_name)
 import compiler.check.resolve.tables (qualify)
 import compiler.check.infer.checker (MemberSite)
@@ -217,7 +217,6 @@ pub fn written_code() -> WrittenCode =
       b"shown",
       b"assert_eq",
       b"observe",
-      b"sqlite_run",
       b"private_key",
       b"rsa_jwk",
       b"range",
@@ -245,10 +244,16 @@ pub fn container_named(name: Bytes) -> Bool = name == b"List" || name == b"Map"
 
 /// What the code crossing a container to or from the runtime calls (`written_code`) where a text
 /// of `module` names the container type `name`: a root over one crosses it, at an entry or a
-/// perform, though the text names none of that code. The prelude's own texts name none of it.
+/// perform, though the text names none of that code.
 pub fn crossed_by(module: Bytes, name: Bytes) -> List<Bytes> =
-  if module == prelude_module() || !container_named(name) { [] }
-  else { written_code().calls.concat(written_code().lifts) }
+  if !container_named(name) { [] } else { crossing_calls(module) }
+
+/// What the code crossing a container to or from the runtime calls (`written_code`) where a text of
+/// `module` may cross one: an operation's own type parameter stands for whatever type a perform
+/// picks, a container among them, which the perform's descriptors cross. The prelude's own texts
+/// cross none.
+pub fn crossing_calls(module: Bytes) -> List<Bytes> =
+  if module == prelude_module() { [] } else { written_code().calls.concat(written_code().lifts) }
 
 fn module_name(encoder: Encoder) -> Bytes =
   match encoder.index.mods.at(encoder.module) { Some(found) -> found.name, None -> b"" }
@@ -307,7 +312,11 @@ fn resolved(encoder: Encoder, qname: QName) -> TemplateValue / {abort.raise} = {
               && encoder.index.scopes.get(encoder.module).modules.get(qualified) == None {
             {
               named: Unbound({ module: None, name: member_name(qualified, qname.name.name) }),
-              written: [],
+              // An extern function of a declared type, which no node stands for, leads to the type.
+              written: match type_target(encoder.index, encoder.module, None, qualified) {
+                Some(of) -> [of],
+                None -> [],
+              },
             }
           } else {
             { named: Unbound({ module: Some(qualified), name: qname.name.name }), written: called }
@@ -1350,8 +1359,10 @@ fn type_form(
     through: match items.instances.get(definition.name.name) {
       None -> [],
       Some(stated) ->
-        stated.map(|instance: InstanceDef|
-          { kind: instance.kind, by: value_of(inner, unqualified(instance.by)) }),
+        stated.filter(|instance: InstanceDef| instance.kind != NHost).map(
+          |instance: InstanceDef|
+            { kind: instance.kind, by: value_of(inner, unqualified(instance.by)) },
+        ),
     },
     // In the operations' own order, so the order a module wrote them in moves nothing.
     numerics: match items.numerics.get(definition.name.name) {
@@ -1371,11 +1382,13 @@ fn type_form(
 /// could match. Two effects differing only in their names are two effects, so the name is in its
 /// form: a published row names its atoms' effects, and nothing else would make a hash pin those
 /// names. The name is the simple one, so the same declaration vendored under another path is still
-/// that declaration. Operations are looked up by name, so they stand in their names' order.
+/// that declaration. Operations are looked up by name, so they stand in their names' order. Its real
+/// handler is a reference, so every definition that performs the effect moves with it, and a load
+/// reads it wherever it reads the effect.
 fn effect_form(
   encoder: Encoder,
   definition: EffectDef,
-) -> EffectForm<Int, Slotted> / {abort.raise} =
+) -> EffectForm<Int, Slotted, Spot> / {abort.raise} =
   {
     name: definition.name.name,
     nondet: definition.is_nondet,
@@ -1383,24 +1396,65 @@ fn effect_form(
       definition.ops.map(|operation: OpDef| operation_form(encoder, operation)),
       |operation: Operation<Int, Slotted>| operation.name,
     ),
+    served: match encoder.index.items.get(encoder.module).instances.get(definition.name.name) {
+      None -> None,
+      Some(stated) ->
+        stated.fold(None, |found: Option<TemplateValue>, instance: InstanceDef|
+          if instance.kind != NHost { found } else {
+            Some(value_of(encoder, { module: None, name: instance.by, span: instance.by.span }))
+          }),
+    },
   }
 
+/// An operation's own type parameters each carry what crossing a container calls (`crossing_calls`).
 fn operation_form(encoder: Encoder, operation: OpDef) -> Operation<Int, Slotted> / {abort.raise} = {
   let inner = {
     ..encoder,
     type_params: encoder.type_params.concat(operation.ty_params.map(|ident: Ident| ident.name)),
   };
+  let own = encoder.type_params.len();
+  let written = written_nodes(encoder, crossing_calls(module_name(encoder)));
+  let carried = |t: TemplateType| own_carrying(t, own, written);
   {
     name: operation.name.name,
     mode: operation.mode,
     multi: operation.multi,
     resource: operation.resource_param,
     types: operation.ty_params.len(),
-    parameters: types(inner, operation.params),
+    parameters: types(inner, operation.params).map(carried),
     kept: operation.kept,
-    returned: type_template(inner, operation.ret),
+    returned: carried(type_template(inner, operation.ret)),
   }
 }
+
+/// `t` with each type parameter of a level from `own` carrying `written` besides what it carried.
+fn own_carrying(t: TemplateType, own: Int, written: List<Int>) -> TemplateType =
+  match t {
+    Applied(name, w, args) -> {
+      let carries = match name { TypeParameter(level) -> level >= own, _ -> false };
+      Applied(
+        name,
+        if carries { w.concat(written) } else { w },
+        args.map(|a: TemplateType| own_carrying(a, own, written)),
+      )
+    },
+    AppliedOver(name, w, args, labels, rows) ->
+      AppliedOver(name, w, args.map(|a: TemplateType| own_carrying(a, own, written)), labels, rows),
+    Function(params, ret, row, kept, once) ->
+      Function(
+        params.map(|p: TemplateType| own_carrying(p, own, written)),
+        own_carrying(ret, own, written),
+        row,
+        kept,
+        once,
+      ),
+    Fields(fields) ->
+      Fields(
+        fields.map(|f: TypeField<Int, Slotted>|
+          { ..f, field_type: own_carrying(f.field_type, own, written) }),
+      ),
+    UnitType -> UnitType,
+  }
 
 /// A test over cases is what one case runs: the case's type and the body over it. Its table and
 /// its label are no part of that, so a case added to the table moves no other case's hash.

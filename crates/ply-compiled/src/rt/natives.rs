@@ -52,7 +52,7 @@ pub(super) fn called_over_values(ctx: &mut Ctx, b: Builtin, values: Vec<Value>) 
         Ok(v) => Some(v),
         Err(d) if signature(b).raises || divides_by_zero => {
             let message = panicked.unwrap_or_else(|| raised_message(&d));
-            ctx.raise(d, message);
+            ctx.pend(d, message);
             None
         }
         Err(d) => {
@@ -73,10 +73,10 @@ pub(super) fn raised_message(d: &Diagnostic) -> String {
         })
 }
 
-/// [`Ctx::raise`] for a runtime error that is the program's to answer.
+/// [`Ctx::pend`] for a runtime error that is the program's to answer.
 pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
     let message = raised_message(&d);
-    ctx.raise(d, message)
+    ctx.pend(d, message)
 }
 
 /// The entry's next hold, holding `held`.
@@ -119,10 +119,11 @@ fn held_in(c: &mut Ctx, h: &crate::emitted::Handle, mode: Mode) -> Option<*mut h
         );
         return None;
     };
-    if !c.sims.is_empty()
-        && let Some(id) = hold_id(h.word())
-    {
-        c.record_access(Access::Hold { id, mode });
+    if let Some(id) = hold_id(h.word()) {
+        c.touched(crate::tasks::Touched::Hold {
+            id,
+            write: mode == Mode::Write,
+        });
     }
     if hold_let_go(o) {
         let site = c.site();

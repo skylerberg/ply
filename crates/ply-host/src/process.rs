@@ -6,10 +6,10 @@ mod children;
 pub(crate) use children::{Children, Io, Output, Signal};
 pub use children::{Ended, Finished, Heard};
 
-use crate::pool::{JobOutput, Pool, Pooled, option};
+use crate::pool::{JobOutput, Pool, option};
 use crate::stdio;
 use children::{Child, Launch, Refusal, Unusable};
-use ply_core::host::{HostRegistry, MachineId};
+use ply_core::host::HostRegistry;
 use ply_core::{
     Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
     HostRuntime, Linearity, Plain, Resource, Span, Symbol, Value, codes, slot,
@@ -17,7 +17,7 @@ use ply_core::{
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -336,12 +336,6 @@ impl ProcessHost {
     }
 }
 
-impl Pooled for ProcessHost {
-    fn pool(&self) -> &Pool {
-        &self.pool
-    }
-}
-
 pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
     Op::ALL
         .iter()
@@ -356,11 +350,10 @@ pub fn registrations(host: Option<&Arc<ProcessHost>>) -> Vec<(HostOp, Arc<dyn Ho
 }
 
 /// Where an operation about the run's own process is served, for a refusal to say.
-pub const ONLY_A_RUN: &str =
-    "under `ply run --host`, and `ply test` withholds it whether or not `--host` was passed";
+pub const ONLY_A_RUN: &str = "under `ply run`, and `ply test` withholds it: a test is no process";
 
 /// Where an operation on a program `--exec` binds is served.
-const AN_EXECUTABLE: &str = "under `--host` for a label `--exec` binds to a program";
+const AN_EXECUTABLE: &str = "for a label `--exec` binds to a program";
 
 /// Withheld without a host, so a run that was given no arguments never binds a process it is not;
 /// a host that only starts programs withholds what is about the run's own process.
@@ -491,11 +484,13 @@ struct Operation {
 }
 
 impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
+    fn call(&self, rt: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
+        // Only an operation that waits is submitted for the run.
+        let run = || crate::registry::run_of(rt);
         // A withheld registration is never resolved, so this is a dispatch bug.
         let Some(host) = &self.host else {
             return Err(Diagnostic::error(
@@ -506,7 +501,7 @@ impl HostHandler for Operation {
                 ),
             )
             .primary(span, "performed here")
-            .note("only `ply run --host` binds `process`, and a withheld registration is in no binding index")
+            .note("only `ply run` binds `process`, and a withheld registration is in no binding index")
             .note("this is a defect in Ply's host dispatch rather than in the program"));
         };
         match self.op {
@@ -532,9 +527,13 @@ impl HostHandler for Operation {
             }
             Op::Flush => taken(self.op, host.sink.flush(), span),
             Op::Line => {
-                let pending =
-                    host.pool
-                        .submit(span, "process-line", Op::Line.what(), Box::new(read_line))?;
+                let pending = host.pool.submit(
+                    run()?,
+                    span,
+                    "process-line",
+                    Op::Line.what(),
+                    Box::new(read_line),
+                )?;
                 Ok(HostAnswer::Pending(pending))
             }
             Op::InBytes => {
@@ -543,6 +542,7 @@ impl HostHandler for Operation {
                     return Err(negative_read(max, span));
                 };
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-in-bytes",
                     Op::InBytes.what(),
@@ -567,19 +567,51 @@ impl HostHandler for Operation {
                 Err(exit_requested(code, span))
             }
             // The resolved atom's resource, never one the handler re-derives.
+            // Held with the started children, so a stop or a teardown ends it as it ends them.
             Op::Spawn => {
                 let Some(program) = host.executables.get(&req.atom.resource) else {
                     return Err(unbound(self.op, &req.atom.resource, span));
                 };
-                let program = program.to_path_buf();
                 let args = argument_vector(&req.args[0], span)?;
-                let dir = req.args[1].as_str(span, "a working directory")?.to_string();
-                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
+                let dir = req.args[1].as_str(span, "a working directory")?;
+                let env = traced(rt, environment(self.op, &req.args[2], span)?);
+                let io = Io {
+                    input: false,
+                    out: Output::Keep,
+                    err: Output::Keep,
+                };
+                let launch = Launch {
+                    label: &req.atom.resource,
+                    program,
+                    args: &args,
+                    dir,
+                    env: &env,
+                    io: &io,
+                };
+                let started = host.children.started(&launch, &host.sink);
+                let program = program.to_path_buf();
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-spawn",
                     Op::Spawn.what(),
-                    Box::new(move || run_to_end(&program, &args, &dir, &env, span)),
+                    Box::new(move || match started {
+                        Err(why) => JobOutput::Failed(why),
+                        Ok((_, child)) => match child.wait(None) {
+                            Ok(Some(exit)) => JobOutput::built(move || exit.value()),
+                            Err(Refusal::TooMuch { out, err }) => {
+                                JobOutput::Refused(too_much(Op::Spawn, &program, out, err, span))
+                            }
+                            Err(Refusal::Unreaped(why)) => JobOutput::Failed(format!(
+                                "`{}`'s ending could not be read: {why}",
+                                program.display()
+                            )),
+                            Ok(None) | Err(Refusal::Spent) => JobOutput::Failed(format!(
+                                "`{}` was waited on by something other than its spawn",
+                                program.display()
+                            )),
+                        },
+                    }),
                 )?;
                 Ok(HostAnswer::Pending(pending))
             }
@@ -588,7 +620,7 @@ impl HostHandler for Operation {
                     return Err(unbound(self.op, &req.atom.resource, span));
                 };
                 let args = argument_vector(&req.args[0], span)?;
-                let env = traced(req.machine, environment(self.op, &req.args[2], span)?);
+                let env = traced(rt, environment(self.op, &req.args[2], span)?);
                 let io = io_of(&req.args[3], span)?;
                 let dir = req.args[1].as_str(span, "a working directory")?;
                 // What the program wrote before the child comes before what the child writes.
@@ -604,11 +636,13 @@ impl HostHandler for Operation {
                     io: &io,
                 };
                 let started = host.children.start(&launch, &host.sink);
-                for output in [&io.out, &io.err] {
-                    if let Output::File(path) = output
-                        && let Ok(at) = Path::new(dir).join(path).canonicalize()
-                    {
-                        crate::observe::wrote(req.machine, &at);
+                if let Some(recorder) = crate::observe::of(rt) {
+                    for output in [&io.out, &io.err] {
+                        if let Output::File(path) = output
+                            && let Ok(at) = Path::new(dir).join(path).canonicalize()
+                        {
+                            recorder.wrote(&at);
+                        }
                     }
                 }
                 Ok(HostAnswer::Value(match started {
@@ -620,6 +654,7 @@ impl HostHandler for Operation {
                 let (handle, child) = child_of(host, self.op, req)?;
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-wait",
                     Op::Wait.what(),
@@ -642,6 +677,7 @@ impl HostHandler for Operation {
                 let (_, child) = child_of(host, self.op, req)?;
                 let bytes = Arc::clone(req.args[1].as_bytes(span, "the bytes to write")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-input",
                     Op::Input.what(),
@@ -658,6 +694,7 @@ impl HostHandler for Operation {
                 let (handle, child) = child_of(host, self.op, req)?;
                 let deadline = deadline(req.args[1].as_int(span, "a timeout")?);
                 let pending = host.pool.submit(
+                    run()?,
                     span,
                     "process-output-line",
                     Op::OutputLine.what(),
@@ -682,12 +719,12 @@ fn argument_vector(value: &Value, span: Span) -> Result<Vec<String>, Diagnostic>
 
 /// The whole environment a child runs under; a later entry for one name wins, as `Map::insert`
 /// does.
-/// `env` and, when a test is observing `machine`, where a `ply` the child is reports what it read.
-fn traced(machine: MachineId, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
-    if let Some(file) = crate::observe::child_trace(machine) {
+/// `env` and, where the run asking is observed, where a `ply` the child is reports what it read.
+fn traced(runtime: &dyn HostRuntime, mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    if let Some(recorder) = crate::observe::of(runtime) {
         env.push((
             crate::observe::TRACE_VAR.to_string(),
-            file.to_string_lossy().into_owned(),
+            recorder.child_trace().to_string_lossy().into_owned(),
         ));
     }
     env
@@ -852,39 +889,6 @@ fn command(program: &Path, args: &[String], dir: &str, env: &[(String, String)])
         command.current_dir(dir);
     }
     command
-}
-
-/// Each stream arrives whole or not at all; `process.start` is what streams.
-fn run_to_end(
-    program: &Path,
-    args: &[String],
-    dir: &str,
-    env: &[(String, String)],
-    span: Span,
-) -> JobOutput {
-    match command(program, args, dir, env)
-        .stdin(Stdio::null())
-        .output()
-    {
-        Err(e) => JobOutput::Failed(format!("`{}` could not be started: {e}", program.display())),
-        Ok(done) => {
-            if done.stdout.len() > MAX_CAPTURE_BYTES || done.stderr.len() > MAX_CAPTURE_BYTES {
-                return JobOutput::Refused(too_much(
-                    Op::Spawn,
-                    program,
-                    done.stdout.len(),
-                    done.stderr.len(),
-                    span,
-                ));
-            }
-            let exit = Finished {
-                ended: children::ending(&done.status),
-                out: done.stdout,
-                err: done.stderr,
-            };
-            JobOutput::built(move || exit.value())
-        }
-    }
 }
 
 #[cold]

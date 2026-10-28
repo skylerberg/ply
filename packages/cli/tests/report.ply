@@ -23,7 +23,7 @@ import std.process (process)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
-import tester (Chosen, Hosted, Options, Unlisted)
+import tester (Chosen, Hosted, Options, TestUnit, Unlisted)
 import trials (Evident)
 import testing.schedule (Atom, Counts, Scheduled, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, shared)
@@ -43,50 +43,6 @@ import std.option
 
 /// One atom of a test's footprint, as a scheduler compares them and as the printer spells it.
 pub type Printed = { atom: Atom, text: String }
-
-/// The options record, built from the parsed line.
-pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} = {
-  let machine_options = machine::options_from(p);
-  {
-    path: root,
-    json: has(p, "json"),
-    explain: has(p, "explain"),
-    no_cache: has(p, "no-cache"),
-    filters: values_of(p, "filter"),
-    shard: match value(p, "shard") { Some(v) -> surface::shard_of(v), None -> None },
-    jobs: match value(p, "jobs") { Some(v) -> parse_nat(v), None -> None },
-    steps: match value(p, "steps") {
-      Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
-      None -> 1000000000,
-    },
-    timeout: match value(p, "timeout") {
-      Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
-      None -> 60000,
-    },
-    bisect: match value(p, "bisect") { Some(v) -> v, None -> "auto" },
-    bisect_budget: match value(p, "bisect-budget") {
-      Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
-      None -> 64,
-    },
-    coverage: has(p, "coverage"),
-    mutate: value(p, "mutate"),
-    mutate_budget: match value(p, "mutate-budget") {
-      Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
-      None -> 64,
-    },
-    profile: machine_options.profile,
-    watch: has(p, "watch"),
-    host: machine_options.host,
-    tls: machine_options.tls,
-    trust: machine_options.trust,
-    mtls: machine_options.mtls,
-    fs: machine_options.fs,
-    exec: machine_options.exec,
-    allow: machine_options.allow,
-    config: machine_options.config,
-    sim: machine::sim_options_from(p),
-  }
-}
 
 pub type Refusal = { diags: List<Diag>, places: List<Place> }
 
@@ -289,18 +245,16 @@ pub type Program = {
   /// The runtime stamp a pass is filed under beside its test's hash; `None` when the run files none.
   filed_under: Option<String>,
   /// The unit the run's tests execute in.
-  unit: Int,
+  unit: TestUnit,
 }
 
 pub type Backend = {
   /// Which backend answered.
   name: String,
+  /// The roots the unit is entered at.
   fragment: Int,
-  offered: Int,
   entered: Int,
   declined: Int,
-  converted_in: Int,
-  converted_out: Int,
   /// Absent unless the provider loaded a unit: once per worker, each load counted in `load_nanos`.
   units: Option<Int>,
   load_nanos: Option<Int>,
@@ -423,9 +377,6 @@ pub type Simulated = {
 }
 
 pub type RunReport = {
-  hermetic: Bool,
-  /// `hermetic` or `host`.
-  label: String,
   operations: Int,
   digest: String,
   handshakes: List<String>,
@@ -560,20 +511,13 @@ pub fn isolated_as(reaches: List<Int>, case: Case) -> String =
 // Printed before a test runs, so it says only what the selection and the binding decided.
 
 /// What the binding says before a test runs: which tests it reaches, and how many run at once.
-pub type Opening = {
-  hermetic: Bool,
-  operations: Int,
-  digest: String,
-  reaches: List<Int>,
-  workers: Int,
-}
+pub type Opening = { operations: Int, digest: String, reaches: List<Int>, workers: Int }
 
 fn workers_of(options: Options, hosted: Hosted) -> Int =
   match options.jobs { Some(n) -> if n > 0 { n } else { hosted.cores }, None -> hosted.cores }
 
 pub fn opening_of(options: Options, program: Program, hosted: Hosted) -> Opening =
   {
-    hermetic: hosted.hermetic,
     operations: hosted.operations,
     digest: hosted.digest,
     reaches: hosted.reaches.filter(|i: Int| case_of(program, i) != None),
@@ -608,7 +552,7 @@ fn isolated_line(style: Style, c: Counts) -> List<String> / {abort.raise} =
   }
 
 pub fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abort.raise} =
-  if o.hermetic { [] } else {
+  if o.operations == 0 { [] } else {
     [
       indent() ++ bold(style, "host") ++ " " ++ bold(style, c.host.to_string()) ++ " of "
         ++ c.total.to_string()
@@ -624,8 +568,7 @@ pub fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abo
 
 /// What the tests' connections came to, which only the run itself knows.
 pub fn handshake_lines(style: Style, report: RunReport) -> List<String> =
-  if report.hermetic { [] }
-  else { report.handshakes.map(|line: String| indent() ++ dim(style, line)) }
+  report.handshakes.map(|line: String| indent() ++ dim(style, line))
 
 /// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
 pub fn simulation_line(style: Style, report: RunReport) -> List<String> / {abort.raise} =
@@ -663,9 +606,7 @@ fn backend_lines(style: Style, report: RunReport) -> List<String> =
       [
         indent() ++ bold(style, "backend") ++ " " ++ bold(style, b.name) ++ " · "
           ++ b.entered.to_string()
-          ++ " of "
-          ++ b.offered.to_string()
-          ++ " offers entered · "
+          ++ " entered · "
           ++ b.declined.to_string()
           ++ " declined · "
           ++ b.fragment.to_string()
@@ -1559,13 +1500,10 @@ fn backend_json(report: RunReport) -> Json =
       object([
         { key: "name", value: Str(b.name) },
         { key: "fragment", value: int(b.fragment) },
-        { key: "offered", value: int(b.offered) },
         { key: "load_nanos", value: int_or_null(b.load_nanos) },
         { key: "units", value: int_or_null(b.units) },
         { key: "entered", value: int(b.entered) },
         { key: "declined", value: int(b.declined) },
-        { key: "converted_in", value: int(b.converted_in) },
-        { key: "converted_out", value: int(b.converted_out) },
       ]),
   }
 
@@ -1582,7 +1520,7 @@ fn extra_documents(report: RunReport) -> List<Member> = {
 }
 
 /// Bumped whenever a field in the failure artifact changes meaning or leaves.
-fn artifact_schema() -> Int = 6
+fn artifact_schema() -> Int = 7
 
 fn document(
   flags: Flags,
@@ -1622,7 +1560,6 @@ fn document(
       },
       { key: "filters", value: Array(flags.filters.map(|f: String| Str(f))) },
       { key: "no_cache", value: Bool(flags.no_cache) },
-      { key: "binding", value: Str(report.label) },
       { key: "hosts", value: report.hosts },
       { key: "workers", value: int(report.workers) },
       { key: "options", value: with_sim(program.options, decided.sim) },
@@ -1721,7 +1658,6 @@ pub fn unbound(style: Style, refusal: Refusal) -> Answer / {abort.raise} = {
       { key: "command", value: Str("test") },
       { key: "ok", value: Bool(false) },
       { key: "exit_code", value: int(compile_error()) },
-      { key: "binding", value: Str("host") },
       { key: "diagnostics", value: all_to_json(refusal.diags, refusal.places) },
     ]),
     lines: [],

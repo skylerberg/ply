@@ -10,7 +10,7 @@ fn a_handler_may_not_choose_the_code_its_failure_is_classified_under() {
     for claimed in [
         codes::INTERNAL_ERROR,
         codes::REGION_ESCAPE_AT_BOUNDARY,
-        codes::HERMETIC_BOUNDARY,
+        codes::HOST_UNBOUND,
     ] {
         assert!(
             is_reserved_code(claimed),

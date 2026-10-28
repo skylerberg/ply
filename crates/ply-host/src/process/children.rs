@@ -159,6 +159,16 @@ impl Children {
 
     /// The handle of a child now running, or why it could not be started.
     pub(super) fn start(&self, launch: &Launch<'_>, sink: &Arc<OutputSink>) -> Result<i64, String> {
+        self.started(launch, sink).map(|(handle, _)| handle)
+    }
+
+    /// A child now running and held here, so [`Children::end_all`] ends it however it is waited
+    /// on, with its handle; or why it could not be started.
+    pub(super) fn started(
+        &self,
+        launch: &Launch<'_>,
+        sink: &Arc<OutputSink>,
+    ) -> Result<(i64, Arc<Child>), String> {
         let (out, err) = destinations(launch, sink)?;
         let mut command = super::command(launch.program, launch.args, launch.dir, launch.env);
         command
@@ -207,8 +217,8 @@ impl Children {
         table.open.retain(|_, held| !held.is_spent());
         let handle = table.next;
         table.next += 1;
-        table.open.insert(handle, child);
-        Ok(handle)
+        table.open.insert(handle, Arc::clone(&child));
+        Ok((handle, child))
     }
 
     /// The child `handle` names, if the program may use it under `at`.

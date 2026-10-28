@@ -28,7 +28,45 @@ impl Cost {
     }
 }
 
+/// What the program had cost as it last gave way to the scheduler: its calls and what memoized
+/// answers charged. The heap counts no block the scheduler makes.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ProgramCost {
+    ticks: i64,
+    charged: Cost,
+}
+
 impl Ctx {
+    /// The scheduler's own work begins, where it had not: the program's costs are kept as they
+    /// stand. Answers whether it had.
+    pub(crate) fn scheduler_entered(&mut self) -> bool {
+        if self.heap.scheduling {
+            return true;
+        }
+        self.left_at = ProgramCost {
+            ticks: self.ticks,
+            charged: self.charged,
+        };
+        self.heap.scheduling = true;
+        self.arm_tick_in_chunk();
+        false
+    }
+
+    /// The program's own work runs again, where the scheduler's ran: its costs go on from where it
+    /// left them, and the clock is read as many calls on as it was to be.
+    pub(crate) fn program_entered(&mut self) {
+        if !self.heap.scheduling {
+            return;
+        }
+        let to_clock = (self.clock_at - self.ticks).max(1);
+        let at = self.left_at;
+        self.ticks = at.ticks;
+        self.clock_at = self.ticks.saturating_add(to_clock);
+        self.charged = at.charged;
+        self.heap.scheduling = false;
+        self.arm_tick_in_chunk();
+    }
+
     /// What this entry has cost so far, memoized answers charged as if computed again.
     pub(super) fn cost(&self) -> Cost {
         Cost {
@@ -37,6 +75,19 @@ impl Ctx {
             bytes: i64::try_from(self.heap.allocated_bytes()).unwrap_or(i64::MAX),
         }
         .plus(self.charged)
+    }
+}
+
+/// The scheduler's own work begins, entered from a perform or a call of the program: answers 1 where
+/// it already ran, for [`rt_scheduler_left`].
+pub unsafe extern "C" fn rt_scheduler_entered(ctx: *mut Ctx) -> Word {
+    Word::from(unsafe { &mut *ctx }.scheduler_entered())
+}
+
+/// Leaves what [`rt_scheduler_entered`] entered: the program runs again where `was` is 0.
+pub unsafe extern "C" fn rt_scheduler_left(ctx: *mut Ctx, was: Word) {
+    if was == 0 {
+        unsafe { &mut *ctx }.program_entered();
     }
 }
 
@@ -60,6 +111,7 @@ pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx) -> I64 {
         performed: c.performed.len(),
     };
     c.cost_marks.push(mark);
+    c.rearm_recording();
     I64(c.cost_marks.len() as i64 - 1)
 }
 
@@ -84,6 +136,7 @@ pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
     };
     let (at, m) = m;
     c.cost_marks.truncate(at);
+    c.rearm_recording();
     let spent = c.cost().minus(m.cost);
     let live = c.live() as i64 - m.live;
     let mut counts: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
@@ -122,8 +175,15 @@ pub unsafe extern "C" fn rt_cost_spent(ctx: *mut Ctx, mark: I64, _f: I64) {
 /// Contexts reading one definition at once, on `parallel` branches or other threads, may each
 /// evaluate it; the first copy kept is the one every later read answers.
 pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
-    let tables = Arc::clone(&unsafe { &*ctx }.tables);
     let c = unsafe { &mut *ctx };
+    if let Ok(i) = usize::try_from(index.0)
+        && let Some(w) = c.tables.memoized(i)
+    {
+        let cost = c.tables.memo_cost(i);
+        c.charged = c.charged.plus(cost);
+        return Handed::of(w);
+    }
+    let tables = Arc::clone(&c.tables);
     let Some(&code) = usize::try_from(index.0)
         .ok()
         .and_then(|i| tables.functions.get(i))
@@ -136,10 +196,6 @@ pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> H
         return Handed::of(0);
     };
     let index = index.0 as usize;
-    if let Some(w) = tables.memoized(index) {
-        c.charged = c.charged.plus(tables.memo_cost(index));
-        return Handed::of(w);
-    }
     let before = c.cost();
     // SAFETY: as in `call_value`; a nullary function never reads the null argument pointer.
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(code) };

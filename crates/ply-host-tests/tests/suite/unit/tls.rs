@@ -641,7 +641,10 @@ struct Peer {
 
 fn peer(material: &Material) -> Peer {
     let credentials = material.credentials("api");
-    let (listener, config) = listen(&credentials, "api", 0, Span::DUMMY).expect("a TLS listener");
+    let config = credentials
+        .resolve("api", Span::DUMMY)
+        .expect("the credential is held");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
     Peer {
         listener,
         config,

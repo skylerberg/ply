@@ -222,28 +222,7 @@ pub fn opened(
     let mut exports = exports_of(defs);
     adjust(&mut exports);
     let lib = library(dir, &text(defs, &exports))?;
-    Some(ply_compiled::c::load_opened(&lib, None).map_err(|e| format!("{e:#}")))
-}
-
-/// The front end's answer a unit of `defs` is opened over, its hashes digesting to `program`'s: each
-/// definition a root of plain words, pure where `pure` names it.
-pub fn front(program: &[u8], defs: &[Def], pure: &[&str]) -> ply_core::Analysis {
-    ply_core::Analysis {
-        hashes_digest: ply_core::DefHash::of(program),
-        emitter_roots: defs
-            .iter()
-            .map(|d| ply_core::EmitterRoot {
-                root: ply_core::Symbol::new(d.name),
-                arity: d.arity,
-                pure: pure.contains(&d.name),
-                span: ply_core::Span::DUMMY,
-                params: vec![ply_core::Carry::Plain; d.arity],
-                answer: ply_core::Carry::Plain,
-                witnesses: Vec::new(),
-            })
-            .collect(),
-        ..ply_core::Analysis::default()
-    }
+    Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
 }
 
 /// One entry of `native`'s `name`, with `fuel` nested calls to spend: what it answered as a word,

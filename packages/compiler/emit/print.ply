@@ -6,26 +6,31 @@
 //! instruction holding blocks, the framing around them (`emit.print.*`).
 
 import compiler.syntax.parsing (Span, span_between)
+import compiler.syntax.exprs (crossing_perform, scheduler_module)
 import compiler.check.types (Type, TyCon)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (tick_line, int_lit)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry)
+import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry,
+                           definition_of)
+import compiler.emit.evidence (declared_arity)
 import compiler.emit.reps (Ctors, no_ctors, laid_known)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
-import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, InGroup, LentBy, merged, spelled)
+import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, SiteOf, InGroup, LentBy, Called,
+                             merged, spelled)
 import compiler.emit.release (drop_of)
-import compiler.emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt,
-                          ABool, AZero, Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag,
-                          Path, PField, PArg, PCapture, PCase, Pack, Gathered, Updated, Call, Apply,
-                          Native, Op, OHandle, OContainer, OCalling, OStrings, MClosure, MList,
-                          Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done,
-                          Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset,
-                          Free, Opened, Block, Fn, Member, Rooted, Plain, Kept, Crossing, Given,
-                          Owned, Lambda, Closure, Uses, NoArm, Spine, LastOf, Walked, Unsettled,
-                          Data, no_links, falls_through, var_said, laid_made, PPlace, Unwinds,
-                          Unwound, var_of)
+import compiler.emit.tir.handling (instance_alone)
+import compiler.emit.tir (no_closure_words, Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice,
+                          Var, Arg, AVar, AInt, ABool, AZero, Val, Prim, Literal, Static, Make,
+                          TInt, Get, Take, Tag, Path, PField, PArg, PCapture, PCase, Pack, Gathered,
+                          Updated, Call, Apply, Native, Op, OHandle, OContainer, OCalling, OStrings,
+                          MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
+                          Next, Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec,
+                          Reset, Free, Opened, Block, Fn, Member, Rooted, Plain, Kept, Crossing,
+                          Given, Owned, Lambda, Closure, Uses, NoArm, Spine, LastOf, Walked,
+                          Unsettled, Data, no_links, falls_through, var_said, laid_made, PPlace,
+                          Unwinds, Unwound, var_of)
 import compiler.emit.print.text (Under, Place, Printing, Printed, printing, function_body, line,
                                  text, pieces, pad, named, name_of, arg_text, assigned, label,
                                  check, zero, failing_return, site, slot, part_names, part_name,
@@ -34,7 +39,8 @@ import compiler.emit.print.counts (block_opened, block_closed, count_printed, wa
                                    updated, exit_through, fuel_kept)
 import compiler.emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, gathered,
                                  statics, join_declared, set_parts, returned, head_types,
-                                 head_params, params_opened, laid_dups, placed_write, laid_counted)
+                                 head_params, head_names, params_opened, laid_dups, placed_write,
+                                 laid_counted)
 import compiler.emit.print.worded (worded)
 import compiler.emit.print.placing (placing_of)
 import compiler.emit.print.fuel (fuel_head, crossed_head)
@@ -94,12 +100,20 @@ fn root_printed(
   f: Fn,
   ctors: Ctors,
 ) -> { pr: Printing, out: List<Piece> } / {abort.raise} = {
-  let body = body_printed(name, f, {
+  let sited = match definition_of(f.key) {
+    Some(d) -> if crossing_perform(d) { Some(Called) } else { None },
+    None -> None,
+  };
+  let scheduling = match definition_of(f.key) { Some(d) -> enters_scheduler(d), None -> false };
+  let own = if scheduling { name.concat(b"_scheduling") } else { name };
+  let body = body_printed(name, f, sited, {
     ..printing(param_names(f)),
     ctors: ctors,
     counting: counted_here(f.key),
   });
-  let entered = if !has_entry(f.key, f.params.len(), ctors.stated) { { pr: body, out: [] } } else {
+  let entered = if !has_entry(f.key, declared_arity(f.params), ctors.stated) {
+    { pr: body, out: [] }
+  } else {
     match f.kind {
       Kept(w) -> kept_entry(body, name, w),
       _ -> runtime_entry(body, name, entered_of(f)),
@@ -120,7 +134,8 @@ fn root_printed(
         Bytes::concat_all([
           if entered.out.len() == 0 { b"" }
           else { Bytes::concat_all([b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args);\n"]) },
-          head(name, f),
+          if scheduling { b"static " } else { b"" },
+          head(own, f),
           b" {\n",
           opening,
         ]),
@@ -129,11 +144,32 @@ fn root_printed(
       body.out,
     ).push(
       Text(b"}\n"),
-    ).concat(
+    ).concat(if scheduling { [Text(scheduler_entry(name, own, f))] } else { [] }).concat(
       entered.out,
     ),
   }
 }
+
+/// Whether the program enters the scheduler through a call of definition `d`: a crossing, or a
+/// region the scheduler opens.
+fn enters_scheduler(d: Bytes) -> Bool =
+  crossing_perform(d) || d == scheduler_module().concat(b".simulated")
+    || d == scheduler_module().concat(b".scheduled")
+
+/// The function `name` a root the program enters the scheduler through is called by, which runs it
+/// as `own` while no cost of the program counts the scheduler's work, the program's own work within
+/// it counted as it runs.
+fn scheduler_entry(name: Bytes, own: Bytes, f: Fn) -> Bytes =
+  Bytes::concat_all([
+    head(name, f),
+    b" {\n  Word was = rt_scheduler_entered_p(ctx);\n  ",
+    head_types(f.conv).answer,
+    b" r = ",
+    own,
+    b"(ctx",
+    Bytes::concat_all(head_names(f.conv).map(|p: Bytes| b", ".concat(p))),
+    b");\n  rt_scheduler_left_p(ctx, was);\n  return r;\n}\n",
+  ])
 
 /// A tail group, its first member named `name`, as its group function, which takes the member's
 /// place `which` and the widest member's parameters as words and switches on `which` to that
@@ -323,21 +359,36 @@ fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
 /// function of its own, so its temporaries, labels and tails are its own, but the root's tables go
 /// on.
 fn closure_printed(symbol: Bytes, nth: Int, l: Lambda, pr: Printing) -> Printing / {abort.raise} =
-  match l { Closure(c) -> body_printed(symbol, c.body, function_body(pr, lambda_names(l, nth))) }
+  match l {
+    Closure(c) -> body_printed(symbol, c.body, None, function_body(pr, lambda_names(l, nth))),
+  }
 
-/// `f`'s body, a body of the root named `symbol`: the frame record its sites link, its parameters
-/// opened, its restart label where a self call restarts it, and the tails of what it declares at
-/// its end.
-fn body_printed(symbol: Bytes, f: Fn, given: Printing) -> Printing / {abort.raise} = {
-  let pr = { ..given, placing: placing_of(f) };
+/// `f`'s body, a body of the root named `symbol` whose sites name `sited`: the frame record its sites
+/// link, its parameters opened, its restart label where a self call restarts it, and the tails of
+/// what it declares at its end. A body whose sites are its caller's keeps that site as it starts.
+fn body_printed(
+  symbol: Bytes,
+  f: Fn,
+  sited: Option<SiteOf>,
+  given: Printing,
+) -> Printing / {abort.raise} = {
+  let kept = if sited == Some(Called) {
+    line(
+      given,
+      0,
+      b"const int64_t ply_called[3] = { ctx->site_root, ctx->site_start, ctx->site_end };",
+    )
+  } else { given };
+  let pr = { ..kept, placing: placing_of(f) };
   let u = {
     symbol: symbol,
     base: f.base,
     answer: f.conv.answer,
-    site: None,
+    site: sited,
     arm: None,
     looping: None,
-    landing: None,
+    // A failure leaves by raising what the runtime left pending, where the function holds a word to.
+    landing: match f.links.pending { Some(_) -> Some(b"goto ply_pending;"), None -> None },
     group: None,
     unwinds: [],
     leaving: leaving_of(f),
@@ -352,7 +403,27 @@ fn body_printed(symbol: Bytes, f: Fn, given: Printing) -> Printing / {abort.rais
   let looped = if restarts(f.body) {
     text(viewed, Bytes::concat_all([b"  ply_loop: ", ticked, b"\n"]))
   } else { viewed };
-  let closed = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let body = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
+  let closed = match f.links.pending {
+    None -> body,
+    Some(pd) ->
+      text(
+        body,
+        Bytes::concat_all([
+          b"  ply_pending: ply_pending_raised(ctx, ",
+          name_of(body, pd.word),
+          b", ",
+          ascii_of_int(pd.index),
+          b", (Word)(intptr_t)&",
+          pd.op,
+          b", (Word)(intptr_t)&",
+          pd.string,
+          b");\n  ",
+          failing_return(f.conv.answer),
+          b"\n",
+        ]),
+      ),
+  };
   let done = { ..closed, placing: given.placing };
   let record = record_declared(done).concat(fuel_kept(done));
   if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
@@ -630,6 +701,7 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
                     )
                   },
                   l.n,
+                  h.args,
                   h.site,
                   h.answer,
                 ),
@@ -878,7 +950,11 @@ fn head(name: Bytes, f: Fn) -> Bytes =
     b")",
   ])
 
-test "a restart takes its arguments into temporaries before it sets the parameters, then loops" {
+/// The C of `m.count(n, acc)`, which answers `acc` where `n` is 0 and otherwise restarts on what
+/// `restart` makes of `n - 1` and `acc`, and the part of it from the restart's arm on.
+fn restart_printed(
+  restart: (Arg, Arg) -> List<Arg>,
+) -> { text: Bytes, arm: Bytes } / {abort.raise} = {
   let int = TyCon({ name: b"Int", args: [] });
   let local = |id: Int, rep: Rep| { id: id, ty: int, rep: rep };
   let n = local(0, RInt);
@@ -907,7 +983,7 @@ test "a restart takes its arguments into temporaries before it sets the paramete
         then: [Assign({ var: j, arg: AVar(acc) })],
         otherwise: [
           let_of(a, Prim({ op: b"sub", on: RInt, args: [AVar(n), AInt(1)] }), span_between(10, 15)),
-          Restart([AVar(a), AVar(acc)]),
+          Restart(restart(AVar(a), AVar(acc))),
         ],
       }),
       Return(AVar(j)),
@@ -919,8 +995,25 @@ test "a restart takes its arguments into temporaries before it sets the paramete
     statics: [],
   };
   let text = spelled(printed_fn(f, no_ctors()).pieces);
+  {
+    text: text,
+    arm: match text.index_of(b"} else {") { Some(i) -> text.slice(i, text.len()), None -> b"" },
+  }
+}
+
+test "a restart sets no parameter it hands on as itself" {
+  let p = restart_printed(|less: Arg, acc: Arg| [less, acc]);
+  assert(
+    p.arm.index_of(b"p0 = ") != None && p.arm.index_of(b"p1 = ") == None,
+    Some(String::of_bytes_lossy(p.text)),
+  )
+}
+
+test "a restart takes its arguments into temporaries before it sets the parameters, then loops" {
+  let p = restart_printed(|less: Arg, acc: Arg| [acc, less]);
+  let text = p.text;
+  let arm = p.arm;
   let said = Some(String::of_bytes_lossy(text));
-  let arm = match text.index_of(b"} else {") { Some(i) -> text.slice(i, text.len()), None -> b"" };
   let in_arm = |s: Bytes| match arm.index_of(s) { Some(i) -> i, None -> 0 - 1 };
   // Every argument is read, the second parameter's old value among them, before either is set.
   let read = in_arm(b" = p1;");
@@ -946,7 +1039,7 @@ fn handle_over(answer: Var, body: Block) -> Inst =
     body: body,
     args: [],
     uses: { takes: [], owned: false, fails: false, stops: false },
-    site: { clauses: [], ret: None, detached: None },
+    site: { clauses: [], ret: None, detached: None, instance: instance_alone(0) },
     answer: answer,
     unwind: [],
   })
@@ -1103,7 +1196,7 @@ test "a closure's function follows its root's, and its body numbers its temporar
     links: no_links(),
     statics: [],
   };
-  let l = Closure({ body: body, captures: 0, at: span_between(20, 30) });
+  let l = Closure({ body: body, captures: 0, at: span_between(20, 30), words: no_closure_words() });
   let f = { ..body, lambdas: [l] };
   let name = symbol_of(b"m.outer");
   let inner = closure_printed(name, 0, l, { ..printing(Map::new()), temps: 7, labels: 3 });
@@ -1384,7 +1477,7 @@ test "a failure inside a handle's body releases what the body holds and goes to 
       ],
       args: [],
       uses: { takes: [], owned: false, fails: false, stops: false },
-      site: { clauses: [], ret: None, detached: None },
+      site: { clauses: [], ret: None, detached: None, instance: instance_alone(0) },
       answer: answer,
       unwind: [s],
     }),
@@ -1398,7 +1491,7 @@ test "a failure inside a handle's body releases what the body holds and goes to 
   let said = Some(String::of_bytes_lossy(text));
   // A failure in the body lets go of the body's value on its way to the landing, and not of what
   // the handle holds.
-  assert(jumps.len() >= 3 && occurrences(body, released_text(b"t4")) == 1, said);
+  assert(jumps.len() >= 3 && occurrences(body, released_text(b"t2")) == 1, said);
   assert_eq(occurrences(body, released_text(b"p0")), 0);
   // The landing lets go of what the handle holds where no clause answers the failure.
   assert_eq(occurrences(after, released_text(b"p0")), 1)

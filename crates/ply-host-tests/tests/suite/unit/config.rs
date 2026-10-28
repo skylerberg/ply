@@ -1,5 +1,3 @@
-use ply_core::Symbol;
-use ply_core::host::{Determinism, Linearity};
 use ply_host::config::*;
 use std::sync::Arc;
 
@@ -67,45 +65,28 @@ fn an_unsupplied_secret_answers_none_from_both() {
     assert_eq!(snapshot.plaintext("SERVICE_API_KEY"), None);
 }
 
+/// The natives read the run's snapshot through its runtime, and a run granted none reads nothing.
 #[test]
-fn two_configuration_readers_never_conflict() {
-    use ply_core::{EffectAtom, Footprint, Mode, Resource};
-
-    let effect = Symbol::new(EFFECT);
-    let atom = |namespace: &str| {
-        Footprint::from_atoms([EffectAtom::new(
-            effect.clone(),
-            Resource::Named(Symbol::new(namespace)),
-            Mode::Read,
-        )])
-    };
-    assert!(!atom("database").conflicts_with(&atom("credentials")));
-    assert!(
-        !atom("credentials").conflicts_with(&atom("credentials")),
-        "two readers of one namespace do not conflict either, which is the whole point of a read"
+fn a_hosts_runtime_lends_its_snapshot_and_an_unbound_one_lends_none() {
+    let granted = snapshot(
+        &[
+            ("SERVICE_API_KEY", "s3cret", true),
+            ("SERVICE_REGION", "eu", false),
+        ],
+        true,
     );
-
-    // The conflicting shape too, so `conflicts_with` is shown not to answer `false` to everything.
-    let writer = Footprint::from_atoms([EffectAtom::new(
-        effect.clone(),
-        Resource::Named(Symbol::new("credentials")),
-        Mode::Write,
-    )]);
-    assert!(atom("credentials").conflicts_with(&writer));
-}
-
-#[test]
-fn the_registration_declares_what_the_snapshot_makes_true() {
-    let registry = registry(Arc::new(Snapshot::unopened()));
-    let ops: Vec<String> = registry.ops().map(|op| op.to_string()).collect();
-    assert_eq!(
-        ops,
-        ["std.config.config.get[..]", "std.config.config.secret[..]"]
-    );
-    for op in registry.ops() {
-        assert_eq!(op.determinism, Determinism::Nondeterministic);
-        assert_eq!(op.linearity, Linearity::Repeatable);
-        assert!(!op.blocking, "no source is opened at a call site");
-        assert!(op.path.starts_with("ply_host::config::"));
-    }
+    let runtime = ply_host::Host::new()
+        .configured(Arc::new(granted))
+        .runtime();
+    let lent = ply_host::registry::facilities_of(&*runtime)
+        .expect("a host made it")
+        .configuration();
+    assert_eq!(lent.get("SERVICE_REGION"), Some("eu"));
+    assert_eq!(lent.plaintext("SERVICE_API_KEY"), Some("s3cret"));
+    let unbound = ply_host::registry::unbound()();
+    let lent = ply_host::registry::facilities_of(&*unbound)
+        .expect("a host made it")
+        .configuration();
+    assert_eq!(lent.get("PATH"), None);
+    assert_eq!(lent.plaintext("SERVICE_API_KEY"), None);
 }

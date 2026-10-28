@@ -540,17 +540,7 @@ test "two mains are reported rather than resolved by load order" {
   })
 }
 
-test/nondet "run is hermetic by default and reports its binding" {
-  program(green());
-  let v = json_of(on_disk(["run", "--json"]));
-  assert(str(at(v, "binding")) == "hermetic", Some(shown(v)));
-  assert(str(at(v, "value")) == "42", Some(shown(v)));
-  let bound = json_of(on_disk(["run", "--host", "--json"]));
-  assert(str(at(bound, "binding")) == "host", Some(shown(bound)));
-  assert(str(at(bound, "value")) == "42", Some("a binding may not change what a program computes"))
-}
-
-test/nondet "a task under --host performs against the handlers around its spawn" {
+test/nondet "a task performs against the handlers around its spawn" {
   program(
     \\effect note {
     \\  read say() -> Int
@@ -567,14 +557,14 @@ test/nondet "a task under --host performs against the handlers around its spawn"
     \\  }
     \\
   );
-  let r = on_disk(["run", "--host"]);
+  let r = on_disk(["run"]);
   assert(r.code == 0, Some(said(r)));
   assert(last_line(r) == "41", Some(stdout(r)))
 }
 
 // A sleep parks the task that performs it: the thirty seconds the body sleeps for are cut at its
 // deadline, and the ten ticks beside it end before that.
-test/nondet "a deadline under --host fires on time while the task beside it keeps sleeping and waking" {
+test/nondet "a deadline fires on time while the task beside it keeps sleeping and waking" {
   program(
     \\import std.task
     \\import std.task (Done, TimedOut)
@@ -604,13 +594,13 @@ test/nondet "a deadline under --host fires on time while the task beside it keep
     \\  })
     \\
   );
-  let r = on_disk(["run", "--host"]);
+  let r = on_disk(["run"]);
   assert(r.code == 0, Some(said(r)));
   let fired = match last_line(r).int_of_string() { Some(ms) -> ms, None -> 0 - 1 };
   assert(fired >= 300 && fired < 10000, Some("a 300ms deadline fired at " ++ stdout(r)))
 }
 
-test/nondet "the clock outside `simulate` is the host's, and a hermetic run says so" {
+test/nondet "the clock outside `simulate` is the host's" {
   program(
     \\fn main() -> Int / {clock.read, clock.write} = {
     \\  let before = match clock.now() { Instant(at) -> at };
@@ -620,20 +610,14 @@ test/nondet "the clock outside `simulate` is the host's, and a hermetic run says
     \\}
     \\
   );
-  let hermetic = on_disk(["run"]);
-  assert(hermetic.code == 1, Some(said(hermetic)));
-  assert(
-    stderr(hermetic).contains("E0424") && stderr(hermetic).contains("ply_host::clock::now"),
-    Some(stderr(hermetic)),
-  );
-  let bound = on_disk(["run", "--host"]);
-  assert(bound.code == 0, Some(said(bound)));
-  let waited = match last_line(bound).int_of_string() { Some(ms) -> ms, None -> 0 - 1 };
-  assert(waited >= 20 && waited < 10000, Some("a 20ms sleep took " ++ stdout(bound)))
+  let r = on_disk(["run"]);
+  assert(r.code == 0, Some(said(r)));
+  let waited = match last_line(r).int_of_string() { Some(ms) -> ms, None -> 0 - 1 };
+  assert(waited >= 20 && waited < 10000, Some("a 20ms sleep took " ++ stdout(r)))
 }
 
 // Spawned, since what this guards against is the process going down with the task.
-test/nondet "a task that fails under --host is reported rather than aborting the process" {
+test/nondet "a task that fails is reported rather than aborting the process" {
   program(
     \\effect note {
     \\  read say() -> Int
@@ -657,15 +641,15 @@ test/nondet "a task that fails under --host is reported rather than aborting the
     \\  }
     \\
   );
-  let r = spawned(["run", "--host"], []);
+  let r = spawned(["run"], []);
   assert(r.code == 1, Some(said(r)));
-  assert(stderr(r).contains("E0303"), Some(stderr(r)));
+  assert(stderr(r).contains("E0424"), Some(stderr(r)));
   assert(!stderr(r).contains("panicked"), Some(stderr(r)))
 }
 
-// A clause that binds `resume` would capture the spawner's continuation, not the task's. Spawned,
-// since what this guards against is a panic.
-test/nondet "a task reaching a clause that binds resume is refused with a diagnostic" {
+// A clause that resumes off its tail would capture the spawner's continuation, not the task's.
+// Spawned, since what this guards against is a panic.
+test/nondet "a task reaching a clause that resumes off its tail is refused with a diagnostic" {
   program(
     \\effect ask {
     \\  multi read q() -> Int
@@ -673,7 +657,7 @@ test/nondet "a task reaching a clause that binds resume is refused with a diagno
     \\
     \\fn work() -> Int / {ask.read} = ask.q()
     \\
-    \\test "a task cannot reach a clause that binds resume" {
+    \\test "a task cannot reach a clause that resumes off its tail" {
     \\  let r = simulate {
     \\    handle {
     \\      let t = task.spawn(|| work());
@@ -692,8 +676,39 @@ test/nondet "a task reaching a clause that binds resume is refused with a diagno
   assert(!said(r).contains("panicked"), Some(said(r)))
 }
 
+// A clause that stops the body would abandon the spawner's, which the task has no part of.
+test/nondet "a task reaching a clause that does not resume is refused with a diagnostic" {
+  program(
+    \\effect ask {
+    \\  read q() -> Int
+    \\}
+    \\
+    \\fn work() -> Int / {ask.read} = ask.q() + 1
+    \\
+    \\test "a task cannot reach a clause that does not resume" {
+    \\  let r = simulate {
+    \\    handle {
+    \\      let t = task.spawn(|| work());
+    \\      task.join(t)
+    \\    } with {
+    \\      ask.q() resume k -> 7,
+    \\    }
+    \\  };
+    \\  assert_eq(r, 7)
+    \\}
+    \\
+  );
+  let r = spawned(["test", "--no-cache", "--json"], []);
+  assert(r.code != 0, Some(said(r)));
+  let failed = items(at(json_of(r), "failures"));
+  assert_eq(failed.len(), 1);
+  let d = at(failed.get(0), "diagnostic");
+  assert(str(at(d, "code")) == "E0502", Some(shown(d)));
+  assert(str(at(d, "message")).contains("its handler did not resume it"), Some(shown(d)))
+}
+
 // A run generates its own certificate: nothing checked in is trusted by anything.
-test/nondet "a program under --host generates a certificate for itself" {
+test/nondet "a program generates a certificate for itself" {
   program(
     \\import std.certgen (certgen)
     \\
@@ -706,7 +721,7 @@ test/nondet "a program under --host generates a certificate for itself" {
     \\}
     \\
   );
-  let r = on_disk(["run", "--host"]);
+  let r = on_disk(["run"]);
   assert(r.code == 0, Some(said(r)));
   let der = match last_line(r).int_of_string() { Some(n) -> n, None -> 0 };
   assert(der > 0, Some("the certificate has no DER: " ++ stdout(r)))
@@ -779,14 +794,13 @@ test/nondet "--count-alloc-sites samples by default and says so" {
 
 // --- hosts -------------------------------------------------------------------
 
-test "hosts defaults to hermetic and still says what would bind" {
+test "hosts over a program that reaches no host says why it lists nothing" {
   scratch(|| {
     program(green());
     let r = on_disk(["hosts"]);
     assert(r.code == 0, Some(said(r)));
-    assert(stdout(r).contains("hermetic"), Some(stdout(r)));
     assert(
-      stdout(r).contains("no host handler is bound"),
+      stdout(r).contains("none serves an atom this program performs"),
       Some(
         "an empty listing is indistinguishable from a registry that failed to load:\n" ++ stdout(r),
       ),
@@ -800,8 +814,8 @@ test "hosts defaults to hermetic and still says what would bind" {
 test "hosts is byte-identical across runs" {
   scratch(|| {
     program(green());
-    let once = on_disk(["hosts", "--host"]);
-    let twice = on_disk(["hosts", "--host"]);
+    let once = on_disk(["hosts"]);
+    let twice = on_disk(["hosts"]);
     assert(once.code == 0, Some(said(once)));
     assert(stdout(once) == stdout(twice), None);
     assert(stdout(once).contains("trusted computing base"), Some(stdout(once)));
@@ -810,22 +824,20 @@ test "hosts is byte-identical across runs" {
 }
 
 // The one line a CI check pins.
-test "hosts --digest is one line and does not depend on the flag" {
+test "hosts --digest is one line, the digest the JSON carries" {
   scratch(|| {
     program(green());
     let bare = on_disk(["hosts", "--digest"]);
-    let bound = on_disk(["hosts", "--host", "--digest"]);
     assert(bare.code == 0, Some(said(bare)));
     assert(bare.out.len() == 1, Some(stdout(bare)));
     let digest = String::join(bare.out, "");
     assert(digest.starts_with("b3:"), Some(digest));
-    assert(bare.out == bound.out, Some(stdout(bound)));
     let v = json_of(on_disk(["hosts", "--json"]));
     assert(str(at(v, "digest")) == digest.ascii_trim(), Some(shown(v)))
   })
 }
 
-test "hosts --json is one object carrying the binding and every row" {
+test "hosts --json is one object carrying every row" {
   scratch(|| {
     program(green());
     let v = json_of(on_disk(["hosts", "--json"]));
@@ -833,24 +845,18 @@ test "hosts --json is one object carrying the binding and every row" {
     assert(int(at(v, "schema_version")) == 1, Some(shown(v)));
     assert(truth(at(v, "ok")), Some(shown(v)));
     assert(int(at(v, "exit_code")) == 0, Some(shown(v)));
-    assert(str(at(v, "binding")) == "hermetic", Some(shown(v)));
     assert(match at(v, "hosts") { Array(_) -> true, _ -> false }, Some(shown(v)));
     assert(
       int(at(v, "operations")) == items(at(v, "hosts")).len(),
       Some("the count and the rows are one claim"),
-    );
-    let bound = json_of(on_disk(["hosts", "--host", "--json"]));
-    assert(str(at(bound, "binding")) == "host", Some(shown(bound)));
-    // Only the binding moves: the trusted computing base is the same either way.
-    assert(at(bound, "hosts") == at(v, "hosts"), None);
-    assert(at(bound, "digest") == at(v, "digest"), None)
+    )
   })
 }
 
 test "hosts on a broken program is a compile error with a clean stdout" {
   scratch(|| {
     program(broken());
-    let r = on_disk(["hosts", "--host"]);
+    let r = on_disk(["hosts"]);
     assert(r.code == 2, Some(said(r)));
     assert(stdout(r) == "", Some(stdout(r)));
     assert(stderr(r).contains("E0201"), Some(stderr(r)))

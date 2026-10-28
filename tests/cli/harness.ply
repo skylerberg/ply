@@ -15,18 +15,18 @@ import compiler.front.pkg
 import compiler.front.pkg (Supplied)
 import cli.library (Shipping, digests_of)
 import cli.builder (builder)
-import cli.claims (prover, hermetic_prover)
 import cli.env (env)
 import compiler.unit (shipped)
-import compiler.front.rows (module_of)
+import compiler.front.rows (ModuleSpan, module_of)
 import compiler.load
 import compiler.check.resolve.tables (Diag)
-import cli.hosts (hosts, hermetic_hosts)
-import cli.machine (machine, hermetic_machine, Options, unconfigured)
+import cli.diagnostic
+import cli.machine
+import cli.machine (Options, unconfigured)
 import cli.replace (edit)
 import cli.surface (spec)
-import cli.tester (tester, hermetic_tester)
 import cli.library
+import std.machine as entering
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import std.bytes
@@ -163,21 +163,21 @@ pub fn read(path: String) -> Option<String> / {Here, abort.raise} =
 pub fn working() -> String / {Here, abort.raise} =
   match fs.canonical[cwd](".") { Some(p) -> p, None -> panic("the working directory has no path") }
 
-/// Whether the program in the working directory loads under the one label, dropped first: an
-/// earlier test that failed inside a command may have left the label holding that program.
-pub fn loads_here() -> Bool / {Here, Shipped, machine.drop[run], machine.load[run], abort.raise} = {
-  machine.drop[run]();
+/// Whether the program in the working directory compiles and its unit opens.
+pub fn loads_here() -> Bool / {Here, Shipped, entering::machine.open, entering::machine.close, abort.raise} =
   match load::load[cwd](".") {
     Err(_) -> false,
     Ok(loaded) -> match cc::library[cc]("-O0", true, cc::library_flags(), loaded.unit) {
       Err(_) -> false,
-      Ok(library) -> match machine.load[run](working(), loaded.front, library) {
-        Ok(_) -> true,
+      Ok(library) -> match entering::machine.open(library) {
+        Ok(o) -> {
+          entering::machine.close(o.unit);
+          true
+        },
         Err(_) -> false,
       },
     },
   }
-}
 
 /// What the first of `diags` says, for a test that stops where a step it relies on was refused.
 pub fn first_message(diags: List<Diag>) -> String =
@@ -193,43 +193,89 @@ pub fn compiled_here() -> { front: load::LoadedAnalysis, library: String } / {He
     },
   }
 
-/// The program in the working directory loaded under `run`, configured by `options` first.
+/// The program in the working directory compiled, its unit opened, and the binding `options` lend
+/// it: what a test enters the program's definitions on.
+pub type Loaded = { unit: Int, roots: Map<Bytes, ModuleSpan>, binding: Int, options: Options }
+
+/// The program in the working directory, bound as `options` lend it.
 pub fn loaded(
   options: Options,
-) -> Unit / {Here, Shipped, machine.drop[run], machine.configure[run], machine.load[run], abort.raise} = {
-  machine.drop[run]();
-  machine.configure[run](options);
+) -> Loaded / {Here, Shipped, entering::machine.open, entering::machine.bind, abort.raise} = {
   let c = compiled_here();
-  match machine.load[run](working(), c.front, c.library) {
-    Ok(_) -> (),
-    Err(r) -> panic("the machine loads the program: " ++ first_message(r.diags)),
+  match entering::machine.open(c.library) {
+    Err(why) -> panic("the program's unit opens: " ++ why),
+    Ok(o) -> match entering::machine.bind(
+        machine::run_grants(options, unconfigured(), machine::Unheard),
+      ) {
+      Err(refused) ->
+        panic(
+          "the program binds: "
+            ++ first_message(refused.map(|f: entering::Failure| machine::unplaced(f))),
+        ),
+      Ok(binding) ->
+        {
+          unit: o.unit,
+          roots: machine::roots_of(c.front.dump),
+          binding: binding,
+          options: options,
+        },
+    },
   }
 }
 
-/// `inner.main` of the program loaded under `run`, bound.
-pub fn bound_main() -> Unit / {machine.bound[run], abort.raise} =
-  match machine.bound[run]("inner.main", unconfigured()) {
-    Ok(_) -> (),
-    Err(r) -> panic("`inner.main` binds: " ++ first_message(r.diags)),
+/// The binding torn down and the unit closed, as a test that is done with them leaves them.
+pub fn unloaded(
+  l: Loaded,
+) -> List<entering::Report> / {entering::machine.unbind, entering::machine.close} = {
+  let reports = entering::machine.unbind(l.binding);
+  entering::machine.close(l.unit);
+  reports
+}
+
+/// `inner.<entry>` entered at `args` under the binding, bounded as the options say: how it ended
+/// and what it used.
+pub fn entered(
+  l: Loaded,
+  entry: String,
+  args: List<Value>,
+) -> entering::Outcome / {entering::machine.enter} =
+  entering::machine.enter(l.unit, "inner." ++ entry, machine::arguments_of(args), {
+    ..entering::unbounded(machine::max_calls()),
+    binding: l.binding,
+    hosted: true,
+    steps: l.options.steps,
+    timeout_ms: l.options.timeout,
+  })
+
+/// What `inner.<entry>` answered, or what it raised.
+pub fn called(
+  l: Loaded,
+  entry: String,
+  args: List<Value>,
+) -> Result<Value, Diag> / {entering::machine.enter, abort.raise} =
+  match machine::answer_of(entered(l, entry, args), l.roots, "inner." ++ entry) {
+    Ok(v) -> Ok(v),
+    Err(r) -> Err(diagnostic::shown(r)),
   }
 
-/// What `inner.<entry>` answered under `run`, or what it raised.
-pub fn called(entry: String, args: List<Value>) -> Result<Value, Diag> / {machine.call[run]} =
-  match machine.call[run]("inner." ++ entry, args).answer { Ok(v) -> Ok(v), Err(r) -> Err(r.diag) }
-
 /// [`called`], where a raise is the test's failure.
-pub fn answered(entry: String, args: List<Value>) -> Value / {machine.call[run], abort.raise} =
-  match called(entry, args) {
+pub fn answered(
+  l: Loaded,
+  entry: String,
+  args: List<Value>,
+) -> Value / {entering::machine.enter, abort.raise} =
+  match called(l, entry, args) {
     Ok(v) -> v,
     Err(d) -> panic("`" ++ entry ++ "` answers: " ++ String::of_bytes_lossy(d.message)),
   }
 
-/// What `inner.<entry>` answered under `run` when it answers an `Ok` or an `Err` of text.
+/// What `inner.<entry>` answered when it answers an `Ok` or an `Err` of text.
 pub fn answered_text(
+  l: Loaded,
   entry: String,
   args: List<Value>,
-) -> Result<String, String> / {machine.call[run], abort.raise} =
-  match answered(entry, args) {
+) -> Result<String, String> / {entering::machine.enter, abort.raise} =
+  match answered(l, entry, args) {
     VCtor("Ok", [VStr(text)]) -> Ok(text),
     VCtor("Err", [VStr(text)]) -> Err(text),
     _ -> panic("`" ++ entry ++ "` answered neither an Ok nor an Err of text"),
@@ -493,6 +539,12 @@ pub fn std_modules() -> List<StdModule> / {abort.raise} =
 
 fn compiler_tree() -> List<{ name: String, bytes: Bytes }> = embed_dir("../../packages/compiler")
 
+/// Each module of the compiler's tree, which `ply` ships beside the standard library.
+pub fn compiler_modules() -> List<StdModule> / {abort.raise} =
+  compiler_tree().fold([], |acc: List<StdModule>, f: { name: String, bytes: Bytes }|
+    if !f.name.ends_with(".ply") { acc }
+    else { acc.push({ module: module_in("compiler.", f.name), src: f.bytes }) })
+
 fn tree_of(
   name: String,
 ) -> Option<{ file: String, files: List<{ name: String, bytes: Bytes }> }> / {abort.raise} =
@@ -612,9 +664,9 @@ pub fn kept_in_memory(
 }
 
 /// Written out, so an operation `main` gains and `over_tree` misses is a type error, not a disk read.
-pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], hosts.preview[host], machine.configure[run], machine.load[run], machine.opened[run], machine.reuse[run], machine.filed[run], machine.reload[run], machine.schema[run], machine.bound[run], machine.enter[run], machine.call[run], machine.accounting[run], machine.drop[run], machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], tester.read[tests], tester.write[tests], prover.configure[claims], prover.collected[claims], prover.compiled[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
+pub effect set Reached = {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.read, time.write, entropy.next, entropy.secret, process.bound[git], process.spawn[git], entering::machine.read, entering::machine.write, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry]}
 
-pub effect set Hermetic = {hermetic_tester.read[tests], hermetic_tester.write[tests], hermetic_prover.read[claims], hermetic_prover.write[claims], hermetic_hosts.read[host], hermetic_machine.configure[run], hermetic_machine.load[run], hermetic_machine.opened[run], hermetic_machine.reuse[run], hermetic_machine.filed[run], hermetic_machine.reload[run], hermetic_machine.schema[run], hermetic_machine.bound[run], hermetic_machine.enter[run], hermetic_machine.call[run], hermetic_machine.accounting[run], hermetic_machine.drop[run], hermetic_machine.configure[literals], hermetic_machine.load[literals], hermetic_machine.bound[literals], hermetic_machine.call[literals], hermetic_machine.drop[literals]}
+pub effect set Hermetic = {entering::hermetic_machine.read, entering::hermetic_machine.write}
 
 /// The test's working directory, the checkout the tests run from, `ply` run as a process with the
 /// environment it inherits, the connections a test makes to a server it started, and the wall clock
@@ -626,7 +678,7 @@ pub effect set Wire = {net.read[client], net.write[client], net.read[ports], net
 pub effect set Clock = {time.read, time.write}
 
 /// Where a run reads the shipped modules, which the harness keeps in memory and on disk alike.
-pub effect set Shipped = {shipped.module, shipped.answer, shipped.digests, shipped.names, shipped.reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, shipped.runnable, shipped.front, shipped.values, shipped.entered, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write}
+pub effect set Shipped = {shipped.module, shipped.answer, shipped.digests, shipped.names, shipped.reached, shipped.stamps, shipped.definitions, shipped.version, shipped.runtime, shipped.values, compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.entered}
 
 pub type Over<a> = { value: a, tree: MemFs }
 
@@ -906,46 +958,14 @@ pub fn over_tree<a | e>(
     time.sleep_ms(_) -> panic("`--watch` waits on a disk; in memory nothing changes"),
     process.bound[git]() -> false,
     process.spawn[git](args, dir, vars) -> panic(no_machine("`git`")),
-    hosts.preview[host](root, options, front, config) ->
-      hermetic_hosts.preview[host](root, options, front, config),
-    machine.configure[run](o) -> hermetic_machine.configure[run](o),
-    machine.load[run](root, front, unit) -> hermetic_machine.load[run](root, front, unit),
-    machine.opened[run](path, runnable, entry, closure, names, library) ->
-      hermetic_machine.opened[run](path, runnable, entry, closure, names, library),
-    machine.reuse[run](root, walked, entry) -> hermetic_machine.reuse[run](root, walked, entry),
-    machine.filed[run](front, unit) -> hermetic_machine.filed[run](front, unit),
-    machine.reload[run](front, unit) -> hermetic_machine.reload[run](front, unit),
-    machine.schema[run](name) -> hermetic_machine.schema[run](name),
-    machine.bound[run](entry, config) -> hermetic_machine.bound[run](entry, config),
-    machine.enter[run]() -> hermetic_machine.enter[run](),
-    machine.call[run](name, args) -> hermetic_machine.call[run](name, args),
-    machine.accounting[run]() -> hermetic_machine.accounting[run](),
-    machine.drop[run]() -> hermetic_machine.drop[run](),
-    machine.configure[literals](o) -> hermetic_machine.configure[literals](o),
-    machine.load[literals](root, front, unit) -> hermetic_machine.load[literals](root, front, unit),
-    machine.bound[literals](entry, config) -> hermetic_machine.bound[literals](entry, config),
-    machine.call[literals](name, args) -> hermetic_machine.call[literals](name, args),
-    machine.drop[literals]() -> hermetic_machine.drop[literals](),
-    tester.configure[tests](o) -> hermetic_tester.configure[tests](o),
-    tester.unit[tests](f, b, h) -> hermetic_tester.unit[tests](f, b, h),
-    tester.schema[tests](n) -> hermetic_tester.schema[tests](n),
-    tester.bound[tests](c) -> hermetic_tester.bound[tests](c),
-    tester.hosted[tests]() -> hermetic_tester.hosted[tests](),
-    tester.ended[tests]() -> hermetic_tester.ended[tests](),
-    tester.cases[tests](u, i) -> hermetic_tester.cases[tests](u, i),
-    tester.executed[tests](u, i, case) -> hermetic_tester.executed[tests](u, i, case),
-    tester.interleaved[tests](u, i, case, seed, n, again) ->
-      hermetic_tester.interleaved[tests](u, i, case, seed, n, again),
-    tester.moved[tests](trace) -> hermetic_tester.moved[tests](trace),
-    prover.configure[claims](options, front, world) ->
-      hermetic_prover.configure[claims](options, front, world),
-    prover.collected[claims]() -> hermetic_prover.collected[claims](),
-    prover.compiled[claims](unit) -> hermetic_prover.compiled[claims](unit),
-    prover.prepared[claims](steps) -> hermetic_prover.prepared[claims](steps),
-    prover.judged[claims](batches) -> hermetic_prover.judged[claims](batches),
-    prover.interleaved[claims](claim, point, seed, steps) ->
-      hermetic_prover.interleaved[claims](claim, point, seed, steps),
-    prover.ended[claims]() -> hermetic_prover.ended[claims](),
+    entering::machine.open(library) -> entering::hermetic_machine.open(library),
+    entering::machine.bind(grants) -> entering::hermetic_machine.bind(grants),
+    entering::machine.enter(unit, root, arguments, run) ->
+      entering::hermetic_machine.enter(unit, root, arguments, run),
+    entering::machine.moved(grants, trace) -> entering::hermetic_machine.moved(grants, trace),
+    entering::machine.hosting(grants) -> entering::hermetic_machine.hosting(grants),
+    entering::machine.unbind(binding) -> entering::hermetic_machine.unbind(binding),
+    entering::machine.close(unit) -> entering::hermetic_machine.close(unit),
     net.connect[registry](_, _, _) -> panic(no_machine("a registry")),
     net.connect_tls[registry](_, _, _) -> panic(no_machine("a registry")),
     net.handshake[registry](_) -> panic(no_machine("a registry")),
@@ -1069,8 +1089,6 @@ fn on_disk_over(
   standing: List<Source>,
   only: Bool = false,
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = {
-  // Tests share the machine they are lent, so a command starts and ends with the label empty.
-  machine.drop[run]();
   let pwd = working();
   let ran = handle {
     main()
@@ -1123,7 +1141,6 @@ fn on_disk_over(
     },
     return u -> ran_of(io),
   };
-  machine.drop[run]();
   ran
 }
 
@@ -1346,7 +1363,7 @@ fn connected_by<| e>(
   ready: (Int) -> Bool / e,
 ) -> Result<Int, String> / {abort.raise, Spawned, Wire, Clock, diverges | e} =
   match process.wait[ply](server.child, 0) {
-    Some(f) -> Err("`ply run --host` exited before listening:\n" ++ said(finished(f))),
+    Some(f) -> Err("`ply run` exited before listening:\n" ++ said(finished(f))),
     None -> {
       let probe = match net.connect[client]("127.0.0.1", server.port, 250) {
         Some(c) -> if ready(c) { Some(c) } else {

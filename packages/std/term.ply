@@ -4,10 +4,10 @@
 //! `term.is_terminal` says whether one of the process's streams is a terminal and `term.size`
 //! how large it is; `std.signal`'s `resized` says when the size has changed. `term.mode` changes
 //! how the terminal hands over what is typed, `term.input` reads it, and `term.secret_line`
-//! reads a line no part of the program can show. They are the run's own process's, so they are
-//! bound only by `ply run --host`, and `ply test` withholds them even with `--host` (`E0424`):
-//! a test answers them over a `Screen` with `over`, a scripted terminal that hands out what was
-//! typed and keeps the modes it was put in. What a program writes to a terminal it writes to
+//! reads a line no part of the program can show. They are the run's own process's, answered by
+//! the terminal its streams are, which the run leaves in the mode it found it in. A test answers
+//! them over a `Screen` with `over`, a scripted terminal that hands out what was typed and keeps
+//! the modes it was put in. What a program writes to a terminal it writes to
 //! standard output or standard error, so what was written is `std.process`'s `Captured`'s to
 //! keep, and a test of a prompt or of progress runs under both twins.
 //!
@@ -61,6 +61,7 @@
 import std.bytes
 import std.config
 import std.config (config)
+import std.internal.native (native, wait, job_wait, found, int_of)
 import std.list
 import std.laws (agrees)
 import std.process
@@ -932,7 +933,7 @@ fn stepped<[p]>(step: Step) -> Writer / {process.err_bytes[p], pipe.broken} = {
 }
 
 /// Shows `status`, as `status_step` does at the reading of the language's `clock`: the run's
-/// own under `ply run --host`, and a region's virtual one inside `simulate`.
+/// own under `ply run`, and a region's virtual one inside `simulate`.
 pub fn status<[p]>(
   w: Writer,
   text: String,
@@ -948,6 +949,60 @@ pub fn say<[p]>(
 /// Ends the progress, as `finish_step` does.
 pub fn finish<[p]>(w: Writer) -> Writer / {process.err_bytes[p], pipe.broken} =
   stepped[p](finish_step(w))
+
+// --- The real handler -------------------------------------------------------
+
+host for term by served
+
+/// `go` at the terminal the process's streams are, a read of what is typed waited for in the
+/// asking task.
+fn served<a | e>(
+  go: () -> a / {term.read, term.write | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    term.is_terminal(stream) -> term_is_terminal(stream_number(stream)),
+    term.size() -> match found(term_size()) {
+      Some(both) -> Some({ columns: int_of(both.slice(0, 8)), rows: int_of(both.slice(8, 16)) }),
+      None -> None,
+    },
+    term.mode(mode) -> mode_of(term_mode(mode_number(mode))),
+    term.input(max, timeout_ms) -> if max < 0 {
+      panic("`term.input` was asked for " ++ max.to_string() ++ " bytes")
+    } else { found(job_wait(term_input(max, timeout_ms))) },
+    term.secret_line() -> match found(job_wait(term_secret_line())) {
+      Some(number) -> Some(term_secret_taken(int_of(number))),
+      None -> None,
+    },
+  }
+
+/// Whether the stream `stream_number` numbers is a terminal.
+extern fn term_is_terminal(stream: Int) -> Bool / {native.read}
+
+/// The terminal's columns and rows, each in eight bytes, found.
+extern fn term_size() -> Bytes / {native.read}
+
+/// Puts the terminal standard input is in the mode `mode_number` numbers, answering the number of
+/// the mode it was in, or -1, nothing changed, where standard input is no terminal.
+extern fn term_mode(mode: Int) -> Int / {native.read}
+
+/// The ticket of what has been typed, at most `max` bytes, found, waiting as `term.input` says.
+extern fn term_input(max: Int, timeout_ms: Int) -> Int / {native.read}
+
+/// The ticket of one line of standard input kept for a `Secret`: the number it is kept under,
+/// found, or none at the end of input.
+extern fn term_secret_line() -> Int / {native.read}
+
+/// The line kept under `number`, which it no longer keeps.
+extern fn term_secret_taken(number: Int) -> Secret<String> / {native.read}
+
+fn stream_number(stream: Stream) -> Int = match stream { Stdin -> 0, Stdout -> 1, Stderr -> 2 }
+
+fn mode_number(mode: Mode) -> Int = match mode { Cooked -> 0, Silent -> 1, Raw -> 2 }
+
+fn mode_of(number: Int) -> Option<Mode> =
+  match number { 0 -> Some(Cooked), 1 -> Some(Silent), 2 -> Some(Raw), _ -> None }
 
 // --- The twin ---------------------------------------------------------------
 
@@ -1185,7 +1240,7 @@ test "{d.why}" for d: Decision in decisions() {
 }
 
 /// The style for standard output over a terminal and an environment a test names.
-fn found(s: Screen, set: List<{ key: String, value: String }>) -> Style =
+fn style_over(s: Screen, set: List<{ key: String, value: String }>) -> Style =
   over(s, ||
     handle {
       style_for[env](Auto, Stdout)
@@ -1194,17 +1249,20 @@ fn found(s: Screen, set: List<{ key: String, value: String }>) -> Style =
     }).value
 
 test "a program's style is decided from its stream and its environment, once" {
-  assert_eq(found(screen(80, 24), [{ key: "TERM", value: "xterm-256color" }]), style_of(Ansi256));
-  assert_eq(found(screen(80, 24), [{ key: "NO_COLOR", value: "1" }]), plain());
-  assert_eq(found(no_screen(), [{ key: "TERM", value: "xterm-256color" }]), plain());
   assert_eq(
-    found(no_screen(), [
+    style_over(screen(80, 24), [{ key: "TERM", value: "xterm-256color" }]),
+    style_of(Ansi256),
+  );
+  assert_eq(style_over(screen(80, 24), [{ key: "NO_COLOR", value: "1" }]), plain());
+  assert_eq(style_over(no_screen(), [{ key: "TERM", value: "xterm-256color" }]), plain());
+  assert_eq(
+    style_over(no_screen(), [
       { key: "CLICOLOR_FORCE", value: "1" },
       { key: "COLORTERM", value: "truecolor" },
     ]),
     style_of(TrueColor),
   );
-  assert_eq(found({ ..screen(80, 24), terminals: [Stdin, Stderr] }, []), plain())
+  assert_eq(style_over({ ..screen(80, 24), terminals: [Stdin, Stderr] }, []), plain())
 }
 
 test "an unstyled stream is written the text and nothing around it" {

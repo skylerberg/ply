@@ -1,14 +1,13 @@
 //! The obligations a project carries, and what became of each: what `ply prove` and `ply review`
-//! are both about. The load, the store and the prover are the Rust side's — a front end is not a
-//! value a program can hold, discharging a claim enters compiled bodies, and an entry does not nest
-//! on the thread this program is itself running on. Which claims are asked for, the keys their
-//! evidence is read and filed under, what the coverage, the review and the baseline come to, every
-//! line and key of both reports, and the code each run exits with are decided here.
+//! are both about. A claim's guards and propositions are entered on the program's unit through
+//! `std.machine`; which claims are asked for, at which points, what each point's judgement is, the
+//! keys their evidence is read and filed under, what the coverage, the review and the baseline come
+//! to, every line and key of both reports, and the code each run exits with are decided here.
 
 import compiler.load (LoadedAnalysis)
 import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
 import proof.discharge (Ask, AskJudged, AskInterleaved, Asked, Batch, Judgements, Interleaved,
-                        LawRun, discharged)
+                        LawRun, Mode, MWhole, MWitness, MDomain, discharged)
 import proof.evidence (evidence_of, evidence_bytes)
 import sim.plan
 import sim.plan (Seed)
@@ -20,7 +19,10 @@ import machine
 import units
 import units (emit)
 import compiler.front.facts (Analysis, schemas_instantiated)
-import compiler.front.rows (ModuleSpan)
+import compiler.front.rows (LawRow, ModuleSpan)
+import compiler.emit.keys as root_keys
+import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, law_key,
+                           root_name, root_text)
 import compiler.check.infer.checker (DefInfo)
 import compiler.check.resolve.tables (Diag, error_with_labels, error_at)
 import signature (provenance)
@@ -34,14 +36,18 @@ import std.term (Style, plain, dim, red, green, yellow)
 // names and the words it marshals, so a program that reports on them shares the one definition.
 import proof.obligation (Binding, Builds, CacheRefused, Certificate, Change, Changed, ClaimRow,
                          Cost, Counter, Coverage, Def, Defect, Ensures, Fault, Frame, Fresh,
-                         FromProof, Gap, Judged, Kind, Law, Laws, Moved, Never, NoWitness, Open,
-                         Outcome, Proved, Pure, Raised, Reason, Record, Refuted, Space, Stuck,
-                         Uncached, Unchanged, UnhandledEffect, Unproved, Vacuous, Writes, Written,
-                         certificate_summary, coverage, fault_message, fault_notes, fault_summary,
-                         filings, frame_summary, gap_summary, gap_word, hits, is_proved, laws_of,
+                         FromProof, Gap, Judged, JFailed, JFaulted, JHeld, JRaised, JRejected, Kind,
+                         Law, Laws, Moved, Never, NoWitness, Open, Outcome, Proved, Pure, Raised,
+                         Reason, Record, Refuted, Space, Stuck, Uncached, Unchanged,
+                         UnhandledEffect, Unproved, Vacuous, Writes, Written, certificate_summary,
+                         coverage, fault_message, fault_notes, fault_summary, filings,
+                         frame_summary, gap_summary, gap_word, hits, is_proved, laws_of,
                          reason_word, select, specified, stuck_summary, vacuity_summary, verdict_of,
                          plural)
 import std.value (Value, VBool, VInt, VList, render)
+import std.value
+import std.machine as entering
+import sim.recording (Passed, Failed)
 import std.time (time)
 import std.list (somes)
 import proof.rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, LinearArithmetic,
@@ -49,9 +55,6 @@ import proof.rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, LinearAr
 import std.string
 import compiler.syntax.parsing (no_module, span_between, Span)
 
-/// What the Rust side collects, discharges, reviews and accepts, in that order. Collecting comes
-/// first and once; a run then either accepts a baseline or discharges what it was asked for, and
-/// only a discharged run has a review to read.
 /// The job the run is configured with, as the program parses it: the report flags and the search
 /// bounds. `--changed`/`--accept` stay flags.
 pub type Options = {
@@ -65,39 +68,6 @@ pub type Options = {
 
 pub type ProveOptions = { budget: Option<Int>, steps: Option<Int> }
 
-pub nondet effect prover {
-  /// The world is the program as the prover reads it, built here: its declared types, its
-  /// definitions' signatures, and the obligations it owes with the search each one goes to, which
-  /// `discharged` names by position.
-  write configure[claims](options: Options, front: LoadedAnalysis, world: World) -> Unit
-  read collected[claims]() -> Result<Collected, Refusal>
-  /// The program's unit, from the library its C was compiled into: what the schema and every batch
-  /// run on.
-  write compiled[claims](library: String) -> Result<Unit, List<Diag>>
-  /// Builds what a discharge runs on, once, with the calls each evaluation of a claim may make.
-  read prepared[claims](step_budget: Int) -> Result<Unit, Refusal>
-  /// Each batch's points judged in order, many batches at once, each one claim's by its place in
-  /// the collection: a whole claim stops at the first point that settles it, a guard alone at the
-  /// first point it admits.
-  read judged[claims](batches: List<Batch>) -> List<List<Judged>>
-  /// A law over interleavings, run once at one of its points under one seed, within so many steps.
-  read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
-  /// What the entries judging made ended with since the last read, whichever thread judged them;
-  /// the read takes them.
-  read ended[claims]() -> List<Diag>
-}
-
-/// `prover` answered from what it is handed alone.
-pub effect hermetic_prover {
-  write configure[claims](options: Options, front: LoadedAnalysis, world: World) -> Unit
-  read collected[claims]() -> Result<Collected, Refusal>
-  write compiled[claims](library: String) -> Result<Unit, List<Diag>>
-  read prepared[claims](step_budget: Int) -> Result<Unit, Refusal>
-  read judged[claims](batches: List<Batch>) -> List<List<Judged>>
-  read interleaved[claims](claim: Int, point: List<Value>, seed: Seed, steps: Int) -> LawRun
-  read ended[claims]() -> List<Diag>
-}
-
 /// What a run reads from the store and files there, which whoever opened the store handles: the
 /// evidence filed under each key this program names, and the baseline a reader accepted for each
 /// definition. Every key is the program's: this is the only side that encodes one.
@@ -109,8 +79,6 @@ pub effect proofs {
   read baselines(names: List<String>) -> List<{ name: String, record: Record }>
   write accepted(records: List<{ name: String, record: Record }>) -> Accepted
 }
-
-// --- What the Rust side answers with ---
 
 /// The options record, built from the parsed line. `--changed`/`--accept` stay flags.
 pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} =
@@ -152,8 +120,7 @@ pub type Claim = {
 /// claim may make, and the search a law over interleavings runs.
 pub type Plan = { prove_budget: Int, step_budget: Int, sim: plan::Plan }
 
-/// What the runtime loaded for a run: the places its spans point into and what loading it had to
-/// say.
+/// What a run loaded: the places its spans point into and what loading it had to say.
 pub type Collected = { places: List<Place>, warnings: List<Diag> }
 
 /// What this side built of its own claims: one per obligation of the world, in its order; the
@@ -680,100 +647,421 @@ fn unanswered(claim: Claim) -> Outcome =
     bindings: [],
   })
 
-/// The program's unit, emitted and compiled here and handed to the prover: what the schema and
-/// every batch a discharge judges run on.
-pub fn compiled_over(
-  front: LoadedAnalysis,
-) -> Result<Unit, List<Diag>> / {prover.compiled[claims], emit.unit, emit.compiled, abort.raise} =
-  match units::whole(front) {
-    Err(diags) -> Err(diags),
-    Ok(text) -> match units::library(text) {
-      Err(diags) -> Err(diags),
-      Ok(library) -> prover.compiled[claims](library),
-    },
-  }
-
-/// What discharging the claims at `runs` comes to, on the program's unit: nothing is emitted for
-/// a discharge that runs nothing.
+/// What discharging the claims at `runs` comes to, on the program's unit, emitted, compiled and
+/// opened here and closed once the discharge is over: nothing is emitted for a discharge that runs
+/// nothing.
 pub fn discharged_over(
   front: LoadedAnalysis,
   collection: Collection,
   runs: List<Int>,
   settled: List<Static>,
-) -> Result<Discharged, Refusal> / {prover.compiled[claims], prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], time.elapsed_ms, emit.unit, emit.compiled, abort.raise} =
-  if runs.len() == 0 { discharge_runs(collection, runs, settled) } else {
-    match compiled_over(front) {
-      Err(diags) -> Err(Broken({ diags: diags, places: collection.places })),
-      Ok(_) -> discharge_runs(collection, runs, settled),
-    }
-  }
-
-/// What discharging the claims at these collection indices comes to, from what the static prover
-/// settled for each: the program's own searches, judged by the runtime.
-pub fn discharge_runs(
-  collection: Collection,
-  runs: List<Int>,
-  settled: List<Static>,
-) -> Result<Discharged, Refusal> / {prover.prepared[claims], prover.judged[claims], prover.interleaved[claims], prover.ended[claims], time.elapsed_ms, abort.raise} =
+) -> Result<Discharged, Refusal> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, abort.raise} =
   if runs.len() == 0 { Ok({ outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] }) } else {
-    match prover.prepared[claims](collection.plan.step_budget) {
-      Err(why) -> Err(why),
-      Ok(_) -> {
-        let started = time.elapsed_ms();
-        let asked = range(0, runs.len()).fold([], |acc: List<Asked>, k: Int|
-          match ((runs.at(k), settled.at(k))) {
-            (Some(i), Some(s)) -> match collection.world.obligations.at(i) {
-              Some(o) -> acc.push({ claim: i, obligation: o, settled: s }),
-              None -> acc,
-            },
-            _ -> acc,
-          });
-        let outcomes = discharged(asked, collection.world, collection.plan.sim, |q: Ask|
-          match q {
-            AskJudged(batches) -> Judgements(judged_in_lanes(batches, collection.lanes)),
-            AskInterleaved(claim, point, seed, steps) ->
-              Interleaved(prover.interleaved[claims](claim, point, seed, steps)),
-          });
-        // Read once every search is over, so no entry's ending is missed.
-        let ended = prover.ended[claims]();
-        Ok({
-          outcomes: outcomes,
-          duration_ms: Decimal::of_int(time.elapsed_ms() - started),
-          warnings: ended,
-        })
+    let broken = |diags: List<Diag>| Err(Broken({ diags: diags, places: collection.places }));
+    match units::whole(front) {
+      Err(diags) -> broken(diags),
+      Ok(text) -> match units::library(text) {
+        Err(diags) -> broken(diags),
+        Ok(library) -> match entering::machine.open(library) {
+          Err(why) -> broken([machine::unloaded(why)]),
+          Ok(o) -> {
+            let p = proving_of(o.unit, front, collection);
+            let d = discharge_runs(collection, p, runs, settled);
+            entering::machine.close(o.unit);
+            Ok(d)
+          },
+        },
       },
     }
   }
 
+/// What discharging the claims at these collection indices comes to, from what the static prover
+/// settled for each: the program's own searches, each point judged on `p`'s unit.
+pub fn discharge_runs(
+  collection: Collection,
+  p: Proving,
+  runs: List<Int>,
+  settled: List<Static>,
+) -> Discharged / {entering::machine.enter, time.elapsed_ms, abort.raise} = {
+  let started = time.elapsed_ms();
+  let asked = range(0, runs.len()).fold([], |acc: List<Asked>, k: Int|
+    match ((runs.at(k), settled.at(k))) {
+      (Some(i), Some(s)) -> match collection.world.obligations.at(i) {
+        Some(o) -> acc.push({ claim: i, obligation: o, settled: s }),
+        None -> acc,
+      },
+      _ -> acc,
+    });
+  let ran = handle {
+    discharged(asked, collection.world, collection.plan.sim, |q: Ask|
+      match q {
+        AskJudged(batches) -> {
+          let j = judged_in_lanes(p, batches, collection.lanes);
+          ending.ended(j.warnings);
+          Judgements(j.each)
+        },
+        AskInterleaved(claim, point, seed, steps) -> {
+          let r = interleaved(p, claim, point, seed, steps);
+          ending.ended(r.warnings);
+          Interleaved(r.run)
+        },
+      })
+  } with {
+    var warnings: List<Diag> = [],
+    ending.ended(ws) -> {
+      warnings = warnings.concat(ws);
+    },
+    return outcomes -> { outcomes: outcomes, warnings: warnings },
+  };
+  {
+    outcomes: ran.outcomes,
+    duration_ms: Decimal::of_int(time.elapsed_ms() - started),
+    warnings: once_each(ran.warnings),
+  }
+}
+
+/// What the entries a discharge made ended with, as each answer comes back.
+effect ending {
+  write ended(warnings: List<Diag>) -> Unit
+}
+
 /// Each batch is one claim's points judged in turn, and batches are independent: each in a lane of
 /// its own, or dealt across the lanes `--jobs` names, answered in the batches' order.
 fn judged_in_lanes(
+  p: Proving,
   batches: List<Batch>,
   lanes: Option<Int>,
-) -> List<List<Judged>> / {prover.judged[claims], abort.raise} = {
+) -> { each: List<List<Judged>>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} = {
   let dealt = machine::dealt(batches, lanes);
-  machine::undealt(judged_lanes(dealt, 0, dealt.len(), 64))
+  let judged = judged_lanes(p, dealt, 0, dealt.len(), 64);
+  {
+    each: machine::undealt(judged.map(|lane: List<Batched>| lane.map(|j: Batched| j.each))),
+    warnings: judged.fold([], |acc: List<Diag>, lane: List<Batched>|
+      lane.fold(acc, |into: List<Diag>, j: Batched| into.concat(j.warnings))),
+  }
 }
 
-/// Halves under a `parallel` block until one lane is left, whose batches are judged in one call.
+/// Halves under a `parallel` block until one lane is left, whose batches are judged in turn.
 /// `room` is the halvings left, and 64 take any length to one; past them the lanes go one by one.
 fn judged_lanes(
+  p: Proving,
   lanes: List<List<Batch>>,
   lo: Int,
   hi: Int,
   room: Int,
-) -> List<List<List<Judged>>> / {prover.judged[claims]} =
+) -> List<List<Batched>> / {entering::machine.enter, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || room <= 0 {
-    range(lo, hi).fold([], |out: List<List<List<Judged>>>, i: Int|
-      match lanes.at(i) { Some(lane) -> out.push(prover.judged[claims](lane)), None -> out })
+    range(lo, hi).fold([], |out: List<List<Batched>>, i: Int|
+      match lanes.at(i) { Some(lane) -> out.push(lane.map(|b: Batch| judged(p, b))), None -> out })
   } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      judged_lanes(lanes, lo, mid, room - 1),
-      judged_lanes(lanes, mid, hi, room - 1),
+      judged_lanes(p, lanes, lo, mid, room - 1),
+      judged_lanes(p, lanes, mid, hi, room - 1),
     };
-    halves._1.fold(halves._0, |out: List<List<List<Judged>>>, lane: List<List<Judged>>|
-      out.push(lane))
+    halves._0.concat(halves._1)
+  }
+
+// --- Judging a claim ---------------------------------------------------------------
+
+/// What a discharge judges on: the program's unit, the obligations the world owes in its order,
+/// where each law is declared by its key, where each root is written, and the calls each entry a
+/// claim makes may make.
+pub type Proving = {
+  unit: Int,
+  obligations: List<Obligation>,
+  laws: Map<String, { module: Bytes, label: Bytes }>,
+  roots: Map<Bytes, ModuleSpan>,
+  step_budget: Int,
+}
+
+/// The claims of `collection` judged on the opened unit `unit` of `front`.
+pub fn proving_of(unit: Int, front: LoadedAnalysis, collection: Collection) -> Proving =
+  {
+    unit: unit,
+    obligations: collection.world.obligations,
+    laws: front.dump.laws.fold(
+      Map::new(),
+      |acc: Map<String, { module: Bytes, label: Bytes }>, l: LawRow|
+        acc.insert(String::of_bytes_lossy(l.key), { module: l.module, label: l.name }),
+    ),
+    roots: machine::roots_of(front.dump),
+    step_budget: collection.plan.step_budget,
+  }
+
+/// What one batch's points came to, and what the entries that judged them ended with.
+pub type Batched = { each: List<Judged>, warnings: List<Diag> }
+
+/// Where a claim's guards and its proposition are entered: each guard's root, in the obligation's
+/// order, the proposition's, and the owner whose answer an `ensures` that binds `result` reads.
+type Roots = { guards: List<String>, body: String, call: Option<String> }
+
+/// One entry a claim makes: the value its root answered, or how it stopped.
+type Entered = { answer: Result<Value, Judged>, warnings: List<Diag> }
+
+/// The batch's points judged in order until one ends it, as its mode says.
+pub fn judged(p: Proving, batch: Batch) -> Batched / {entering::machine.enter, abort.raise} =
+  match roots_of(p, batch.claim) {
+    Err(fault) -> { each: [fault], warnings: [] },
+    Ok(r) -> {
+      let done = batch.points.fold(
+        { each: [], warnings: [], over: false },
+        |acc: { each: List<Judged>, warnings: List<Diag>, over: Bool }, point: List<Value>|
+          if acc.over { acc } else {
+            let one = match batch.mode {
+              MWhole -> judge(p, r, point),
+              _ -> {
+                let g = guard(p, r, point);
+                {
+                  answer: match g.answer { Ok(true) -> JHeld, Ok(false) -> JRejected, Err(j) -> j },
+                  warnings: g.warnings,
+                }
+              },
+            };
+            {
+              each: acc.each.push(one.answer),
+              warnings: acc.warnings.concat(one.warnings),
+              over: ends(batch.mode, one.answer),
+            }
+          },
+      );
+      { each: done.each, warnings: done.warnings }
+    },
+  }
+
+/// Whether `j` settles a batch judged in `mode`: a fault always; the whole claim at a failure or a
+/// raise; the guard alone where it admits a point, or where it raises over the domain.
+fn ends(mode: Mode, j: Judged) -> Bool =
+  match ((mode, j)) {
+    (_, JFaulted(_)) -> true,
+    (MWhole, JFailed) -> true,
+    (MWhole, JRaised(_)) -> true,
+    (MWitness, JHeld) -> true,
+    (MDomain, JRaised(_)) -> true,
+    _ -> false,
+  }
+
+/// A point of a whole claim: its guards first, always, then its proposition.
+fn judge(
+  p: Proving,
+  r: Roots,
+  point: List<Value>,
+) -> { answer: Judged, warnings: List<Diag> } / {entering::machine.enter, abort.raise} = {
+  let g = guard(p, r, point);
+  match g.answer {
+    Err(j) -> { answer: j, warnings: g.warnings },
+    Ok(false) -> { answer: JRejected, warnings: g.warnings },
+    Ok(true) -> {
+      let b = body(p, r, point);
+      {
+        answer: match b.answer { Err(j) -> j, Ok(true) -> JHeld, Ok(false) -> JFailed },
+        warnings: g.warnings.concat(b.warnings),
+      }
+    },
+  }
+}
+
+/// Whether every guard admits the point, each entered in turn until one does not.
+fn guard(
+  p: Proving,
+  r: Roots,
+  point: List<Value>,
+) -> { answer: Result<Bool, Judged>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+  r.guards.fold(
+    { answer: Ok(true), warnings: [] },
+    |acc: { answer: Result<Bool, Judged>, warnings: List<Diag> }, root: String|
+      match acc.answer {
+        Ok(true) -> {
+          let e = entered(p, root, point);
+          { answer: boolean(e.answer), warnings: acc.warnings.concat(e.warnings) }
+        },
+        _ -> acc,
+      },
+  )
+
+/// The proposition at the point: a law's binders, or an owner's parameters and then `result`, its
+/// answer at them.
+fn body(
+  p: Proving,
+  r: Roots,
+  point: List<Value>,
+) -> { answer: Result<Bool, Judged>, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+  match r.call {
+    None -> {
+      let e = entered(p, r.body, point);
+      { answer: boolean(e.answer), warnings: e.warnings }
+    },
+    Some(owner) -> {
+      let called = entered(p, owner, point);
+      match called.answer {
+        Err(j) -> { answer: Err(j), warnings: called.warnings },
+        Ok(result) -> {
+          let e = entered(p, r.body, point.push(result));
+          { answer: boolean(e.answer), warnings: called.warnings.concat(e.warnings) }
+        },
+      }
+    },
+  }
+
+/// A proposition's answer as the Boolean it states.
+fn boolean(answer: Result<Value, Judged>) -> Result<Bool, Judged> =
+  match answer {
+    Ok(VBool(b)) -> Ok(b),
+    Ok(other) ->
+      Err(
+        JFaulted({
+          code: "E0505",
+          message: "a spec expression came to `" ++ String::of_bytes_lossy(b"\x010\x02")
+            ++ "` rather than to a Boolean",
+          notes: [
+            "the type checker rejects a non-`Bool` clause with E0201, so reaching this is a defect in Ply",
+          ],
+          values: [other],
+        }),
+      ),
+    Err(j) -> Err(j),
+  }
+
+/// `root` entered at `args` on the unit, within the claim's calls, no host bound.
+fn entered(
+  p: Proving,
+  root: String,
+  args: List<Value>,
+) -> Entered / {entering::machine.enter, abort.raise} = {
+  let o = entering::machine.enter(p.unit, root, machine::arguments_of(args), {
+    ..entering::unbounded(machine::max_calls()),
+    steps: p.step_budget,
+  });
+  { answer: answered_of(o.ended, root), warnings: machine::warnings_of(o, p.roots) }
+}
+
+/// What an entry's ending says of a point: the value its root answered; a raise of the program's;
+/// or Ply's fault, which says nothing about the claim.
+fn answered_of(ended: entering::Ended, root: String) -> Result<Value, Judged> / {abort.raise} =
+  match ended {
+    entering::Answered(bytes) -> match value::decode(bytes) {
+      Some(v) -> Ok(v),
+      None -> Err(faulted("`" ++ root ++ "` answered bytes that are no value")),
+    },
+    entering::Failed(f) -> if machine::is_defect(Bytes::of_string(f.code)) {
+      Err(
+        JFaulted({
+          code: f.code,
+          message: f.message,
+          notes: f.notes,
+          values: f.values.map(entering::value_of),
+        }),
+      )
+    } else { Err(JRaised({ message: f.message, values: f.values.map(entering::value_of) })) },
+    entering::Panicked(message) -> Err(faulted("`" ++ root ++ "` panicked: " ++ message)),
+    entering::NoRoot -> Err(faulted("the unit is entered at no `" ++ root ++ "`")),
+    entering::Unanswerable(why) -> Err(faulted("`" ++ root ++ "` answered, and " ++ why)),
+  }
+
+fn faulted(message: String) -> Judged =
+  JFaulted({
+    code: "E0505",
+    message: message,
+    notes: ["this is Ply's fault, not the program's"],
+    values: [],
+  })
+
+/// Where the claim at `claim` is entered, or why it cannot be: a place that names no obligation, or
+/// one no root states, which is Ply disagreeing with itself.
+fn roots_of(p: Proving, claim: Int) -> Result<Roots, Judged> / {abort.raise} =
+  match p.obligations.at(claim) {
+    None ->
+      Err(
+        faulted(
+          "no claim at place " ++ claim.to_string() ++ "; the run holds "
+            ++ p.obligations.len().to_string(),
+        ),
+      ),
+    Some(o) -> {
+      let owner = Bytes::of_string(o.owner);
+      let clause = |kind: ClauseKind, n: Int|
+        String::of_bytes_lossy(
+          root_text(root_name(Clause({ def: Named(owner), kind: kind, n: n }))),
+        );
+      let law = |at: { module: Bytes, label: Bytes }, part: LawPart|
+        String::of_bytes_lossy(root_text(root_name(law_key(at.module, at.label, part))));
+      match o.kind {
+        Ensures(index) ->
+          Ok({
+            guards: range(0, o.guards.len()).map(|k: Int| clause(Requires, k)),
+            body: clause(root_keys::Ensures, index),
+            call: if o.result != None { Some(o.owner) } else { None },
+          }),
+        Law(_) -> match p.laws.get(o.owner) {
+          Some(at) ->
+            Ok({
+              guards: o.guards.map(|g: { module: Int, start: Int, end: Int }| law(at, LawGuard)),
+              body: law(at, LawBody),
+              call: None,
+            }),
+          None -> Err(unclaimed(o)),
+        },
+        _ -> Err(unclaimed(o)),
+      }
+    },
+  }
+
+fn unclaimed(o: Obligation) -> Judged =
+  JFaulted({
+    code: "E0505",
+    message: "the prover holds no claim for `" ++ o.owner ++ "`",
+    notes: [
+      "`proof.world` and the front end's claims are read from one program; this is Ply's fault",
+    ],
+    values: [],
+  })
+
+/// A law over interleavings, run once at `point` under `seed` within `steps` scheduling points: the
+/// interleaving it took, how its body ended, and whether it entered a `simulate` region at all.
+pub fn interleaved(
+  p: Proving,
+  claim: Int,
+  point: List<Value>,
+  seed: Seed,
+  steps: Int,
+) -> { run: LawRun, warnings: List<Diag> } / {entering::machine.enter, abort.raise} =
+  match roots_of(p, claim) {
+    Err(fault) ->
+      {
+        run: {
+          interleaving: { steps: [], verdict: Failed(fault), virtual_time: 0 },
+          observed: false,
+        },
+        warnings: [],
+      },
+    Ok(r) -> {
+      let o = entering::machine.enter(p.unit, r.body, machine::arguments_of(point), {
+        ..entering::unbounded(machine::max_calls()),
+        steps: p.step_budget,
+        seed: Some({ root: seed.root, path: seed.path, steps: max(steps, 1) }),
+      });
+      let verdict = match boolean(answered_of(o.ended, r.body)) {
+        Ok(true) -> Passed,
+        Ok(false) -> Failed(JFailed),
+        Err(j) -> Failed(j),
+      };
+      {
+        run: match o.interleaving {
+          Some(i) ->
+            {
+              interleaving: {
+                steps: i.steps.map(|s: entering::Step| machine::step_of(s, p.roots)),
+                verdict: verdict,
+                virtual_time: i.virtual_time,
+              },
+              observed: true,
+            },
+          None ->
+            { interleaving: { steps: [], verdict: verdict, virtual_time: 0 }, observed: false },
+        },
+        warnings: machine::warnings_of(o, p.roots),
+      }
+    },
   }
 
 /// The n-th answer, or none when the runtime answered fewer than were asked.

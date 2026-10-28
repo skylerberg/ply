@@ -9,7 +9,7 @@
 
 use super::*;
 use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
-use crate::native::{Addr, F64, I64};
+use crate::native::{Addr, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
 
 /// One crossing under way.
@@ -30,6 +30,10 @@ pub(crate) struct Lowering {
     /// Whether a function holding what may not leave its run was written, which the boundary
     /// refuses as the continuation it holds.
     resumes: bool,
+    /// Whether this is an entry's answer, and the first handle of its run written into it, which
+    /// the boundary refuses.
+    answers_entry: bool,
+    escaping: Option<ply_core::escape::Handle>,
 }
 
 /// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
@@ -68,6 +72,8 @@ impl Lowering {
             shareables: 0,
             functions: false,
             resumes: false,
+            answers_entry: false,
+            escaping: None,
         }
     }
 
@@ -98,7 +104,7 @@ pub enum Lifted {
 impl Lifted {
     fn release(self, ctx: *mut Ctx) {
         match self {
-            Lifted::Runtime(w) => heap::release_handle(w),
+            Lifted::Runtime(w) => heap::release_object(ctx, w),
             Lifted::Carried(v) => v.release(ctx),
         }
     }
@@ -210,6 +216,11 @@ impl Ctx {
     pub(crate) fn give(&mut self, bytes: Vec<u8>) -> I64 {
         self.taken = bytes;
         I64(self.taken.len() as i64)
+    }
+
+    /// The bytes a machine-word native answers, held until compiled code copies them out.
+    pub(crate) fn given(&mut self, bytes: Vec<u8>) -> TakenBytes {
+        TakenBytes(self.give(bytes).0)
     }
 }
 
@@ -330,10 +341,21 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
     unsafe { &mut *ctx }.write(|l| l.w.name(name));
 }
 
-/// A runtime object, its value read as it is written.
+/// A runtime object, its value read as it is written. A handle of the run in an entry's answer is
+/// left for the boundary to refuse, held as nothing.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
-    match runtime_value(h.word()) {
+    let w = h.word();
+    if heap::is_native(w)
+        && let Some(escaping) = unsafe { heap::native_escapes(w) }
+        && let Ok(l) = c.lowering()
+        && l.answers_entry
+    {
+        l.escaping.get_or_insert(escaping);
+        l.beside(Beside::Runtime(Value::Unit));
+        return;
+    }
+    match runtime_value(ctx, w) {
         Ok(v) => c.write(|l| l.beside(Beside::Runtime(v))),
         Err(why) => {
             c.fail(err_crossing(&why));
@@ -657,13 +679,16 @@ impl Ctx {
     }
 }
 
-/// What a value of a runtime object reads as: a bridge's value, or a hold, whose held value is laid
-/// out by a type the crossing does not carry, so it reads as holding none. Nothing else the runtime
-/// lays out is read here.
-pub(crate) fn runtime_value(w: Word) -> Result<Value, String> {
+/// What a value of a runtime object reads as: a bridge's value, a native object's, or a hold,
+/// whose held value is laid out by a type the crossing does not carry, so it reads as holding none.
+/// Nothing else the runtime lays out is read here.
+pub(crate) fn runtime_value(ctx: *mut Ctx, w: Word) -> Result<Value, String> {
     if let Some(id) = hold_id(w) {
         let kind = ClosureKind::Hold { held: None, id };
         return Ok(Value::Closure(Arc::new(Closure { name: None, kind })));
+    }
+    if heap::is_native(w) {
+        return unsafe { heap::native_value(ctx, w) };
     }
     if !heap::is_bridge(w) {
         return Err("a block that is no runtime handle crossed as one".to_string());
@@ -694,19 +719,6 @@ fn lowering(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Lowering, Str
         return Err("a lowering ended a crossing it did not begin".into());
     };
     Ok(l)
-}
-
-/// `w` lowered through `ty` into a lowering of its own: its bytes, and what stands at each handle
-/// they name, lent while `w` lives.
-pub(crate) fn lowering_of(
-    ctx: *mut Ctx,
-    w: Word,
-    ty: &'static PlyType,
-) -> Result<(Vec<u8>, Vec<Beside>), String> {
-    let l = lowering(ctx, |ctx| unsafe {
-        (ty.lower)(ctx, w);
-    })?;
-    Ok((l.w.finish(), l.beside))
 }
 
 /// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
@@ -834,29 +846,51 @@ pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
     }
 }
 
-/// What an entry's `R#entered` wrote of its root's answer.
-pub(crate) enum EntryAnswer {
-    /// The answer, and whether it holds a value the bytes could not, each read as the value it
-    /// stands for.
-    Read { value: Value, holding: bool },
-    /// The answer holds a function the program wrote, which only its own run can hold.
-    Function,
-}
-
 impl Ctx {
     /// Opens what an entry through `R#entered` runs between: a lowering for its answer, and over it
-    /// a lifting of `bytes`, the arguments' list, each of `held` made a runtime object for the
-    /// handle it is.
-    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
-        self.crossings
-            .push(Crossing::Lowering(Lowering::new(false)));
-        self.lift_holding(bytes, held);
+    /// a lifting of `bytes`, the arguments' list.
+    pub(crate) fn open_entry(&mut self, bytes: Vec<u8>) {
+        self.crossings.push(Crossing::Lowering(Lowering {
+            answers_entry: true,
+            ..Lowering::new(false)
+        }));
+        self.lift_holding(bytes, Vec::new());
     }
 }
 
-/// Ends the lowering [`Ctx::open_entry`] opened and reads the answer in it; an error where the entry
-/// ended that lowering or left another crossing open.
-pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
+/// What an entry's `R#entered` wrote of its root's answer, kept as the bytes it wrote.
+pub(crate) enum EntryBytes {
+    /// The answer's PLV1, untouched.
+    Bytes(Vec<u8>),
+    /// The answer holds what the bytes cannot, read as the value it stands for, so the boundary
+    /// can say why it stays in its run.
+    Holding(Value),
+    /// The answer holds a function the program wrote, which only its own run can hold.
+    Function,
+    /// The answer holds a handle of its run, the first written.
+    Escaping(ply_core::escape::Handle),
+}
+
+/// Ends the lowering [`Ctx::open_entry`] opened: the answer kept as the bytes the entry wrote
+/// where they hold all of it.
+pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
+    let l = entry_lowering(ctx)?;
+    if let Some(handle) = l.escaping {
+        released(ctx, l.beside);
+        return Ok(EntryBytes::Escaping(handle));
+    }
+    if l.functions {
+        return Ok(EntryBytes::Function);
+    }
+    if !l.beside.is_empty() || l.resumes {
+        return Ok(EntryBytes::Holding(read_back(ctx, l)?));
+    }
+    Ok(EntryBytes::Bytes(l.w.finish()))
+}
+
+/// Ends the lowering [`Ctx::open_entry`] opened and answers it; an error where the entry ended that
+/// lowering or left another crossing open.
+fn entry_lowering(ctx: *mut Ctx) -> Result<Lowering, String> {
     let c = unsafe { &mut *ctx };
     let open = c.crossings.len();
     if open != 1 {
@@ -869,15 +903,8 @@ pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryAnswer, String> {
             ),
         });
     }
-    let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
-        return Err("the entry ended the lowering its answer was to be written into".into());
-    };
-    if l.functions {
-        return Ok(EntryAnswer::Function);
+    match c.crossings.pop() {
+        Some(Crossing::Lowering(l)) => Ok(l),
+        _ => Err("the entry ended the lowering its answer was to be written into".into()),
     }
-    let holding = !l.beside.is_empty() || l.resumes;
-    Ok(EntryAnswer::Read {
-        value: read_back(ctx, l)?,
-        holding,
-    })
 }

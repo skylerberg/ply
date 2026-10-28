@@ -1,16 +1,15 @@
-//! `net` over TCP and Unix sockets, plaintext or TLS.
+//! The socket table over TCP and Unix sockets, plaintext or TLS, and datagram sockets.
 
 use super::wire::{self, Credentials, Endpoint, Probing, Refusal, SocketOption};
 use super::{
-    Handles, Net, Op, Upgrade, a_datagram_socket, not_a_datagram_socket, not_a_listener,
-    not_a_stream, not_upgradable, unknown_handle,
+    Handles, Upgrade, a_datagram_socket, bind, not_a_datagram_socket, not_a_listener, not_a_stream,
+    not_upgradable, unknown_handle,
 };
 use crate::fs;
-use crate::pool::{Inbox, JobOutput, Pool, Pooled};
+use crate::jobs::Job;
+use crate::native::{found, int};
 use crate::tls::{self, Credentials as TlsCredentials, Handshakes};
-use ply_core::{
-    Diagnostic, HostAnswer, HostRuntime, Pending, Resource, Span, Symbol, Value, codes,
-};
+use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
 use rustls::pki_types::ServerName;
 use rustls::server::ServerConfig;
 use socket2::{
@@ -156,14 +155,14 @@ struct Sockets {
 }
 
 impl Sockets {
-    fn insert(&self, at: Option<&Resource>, sock: Socket) -> i64 {
-        let handle = self.handles.open(at);
+    fn insert(&self, label: Option<&str>, sock: Socket) -> i64 {
+        let handle = self.handles.open(label);
         lock(&self.open).insert(handle, sock);
         handle
     }
 
-    fn listener(&self, handle: i64, at: &Resource, span: Span) -> Result<Listening, Diagnostic> {
-        self.handles.check(handle, at, span)?;
+    fn listener(&self, handle: i64, label: &str, span: Span) -> Result<Listening, Diagnostic> {
+        self.handles.check(handle, label, span)?;
         match lock(&self.open).get(&handle) {
             Some(Socket::Listener(listening)) => Ok(listening.clone()),
             Some(Socket::Stream(_) | Socket::Tls(_)) => Err(not_a_listener(handle, span)),
@@ -174,13 +173,8 @@ impl Sockets {
         }
     }
 
-    fn datagram(
-        &self,
-        handle: i64,
-        at: &Resource,
-        span: Span,
-    ) -> Result<Arc<UdpSocket>, Diagnostic> {
-        self.handles.check(handle, at, span)?;
+    fn datagram(&self, handle: i64, label: &str, span: Span) -> Result<Arc<UdpSocket>, Diagnostic> {
+        self.handles.check(handle, label, span)?;
         match lock(&self.open).get(&handle) {
             Some(Socket::Datagram(socket)) => Ok(Arc::clone(socket)),
             Some(_) => Err(not_a_datagram_socket(handle, span)),
@@ -188,8 +182,8 @@ impl Sockets {
         }
     }
 
-    fn stream(&self, handle: i64, at: &Resource, span: Span) -> Result<Connection, Diagnostic> {
-        self.handles.check(handle, at, span)?;
+    fn stream(&self, handle: i64, label: &str, span: Span) -> Result<Connection, Diagnostic> {
+        self.handles.check(handle, label, span)?;
         match lock(&self.open).get(&handle) {
             Some(Socket::Stream(s)) => Ok(Connection::Plain(s.clone())),
             Some(Socket::Tls(s)) => Ok(Connection::Tls(Arc::clone(s))),
@@ -205,19 +199,19 @@ impl Sockets {
     /// plaintext under the session.
     fn upgraded(
         &self,
-        op: Op,
+        what: &str,
         handle: i64,
-        at: &Resource,
+        label: &str,
         span: Span,
         secured: impl FnOnce(Arc<TcpStream>) -> Arc<tls::Session>,
     ) -> Result<(Arc<TcpStream>, Arc<tls::Session>), Diagnostic> {
-        self.handles.check(handle, at, span)?;
+        self.handles.check(handle, label, span)?;
         let mut open = lock(&self.open);
         let stream = match open.get(&handle) {
             Some(Socket::Stream(Plain::Tcp(stream))) => {
                 if Arc::strong_count(stream) > 1 {
                     return Err(not_upgradable(
-                        op,
+                        what,
                         handle,
                         "another operation is still waiting on it",
                         span,
@@ -227,10 +221,10 @@ impl Sockets {
             }
             #[cfg(unix)]
             Some(Socket::Stream(Plain::Unix(_))) => {
-                return Err(not_upgradable(op, handle, "it is a Unix socket", span));
+                return Err(not_upgradable(what, handle, "it is a Unix socket", span));
             }
             Some(Socket::Tls(_)) => {
-                return Err(not_upgradable(op, handle, "it is already TLS", span));
+                return Err(not_upgradable(what, handle, "it is already TLS", span));
             }
             Some(Socket::Listener(..) | Socket::Finished) => {
                 return Err(not_a_stream(handle, span));
@@ -251,9 +245,24 @@ impl Sockets {
     }
 }
 
+/// One of the parked `accept`s the drain wakes, counted for as long as its job is held.
+struct Accepting(Arc<AtomicUsize>);
+
+impl Accepting {
+    fn counted(accepts: &Arc<AtomicUsize>) -> Accepting {
+        accepts.fetch_add(1, Ordering::AcqRel);
+        Accepting(Arc::clone(accepts))
+    }
+}
+
+impl Drop for Accepting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 pub struct TcpHost {
     sockets: Arc<Sockets>,
-    pool: Pool,
     /// What `net.listen_tls` resolves a credential name against.
     credentials: TlsCredentials,
     handshakes: Arc<Handshakes>,
@@ -265,8 +274,6 @@ pub struct TcpHost {
     accepts: Arc<AtomicUsize>,
     /// Where the listeners the stop closed were bound.
     closed_at: Mutex<Vec<SocketAddr>>,
-    /// The tokens a machine parks on when this host is itself its runtime.
-    inbox: Arc<Inbox>,
     /// The credential each connection's `start_tls` presents, where `Presenting` named one.
     presenting: Arc<Mutex<BTreeMap<i64, String>>>,
 }
@@ -288,14 +295,12 @@ impl TcpHost {
                 open: Mutex::new(BTreeMap::new()),
                 handles: Handles::new(),
             }),
-            pool: Pool::new(),
             credentials,
             handshakes: Arc::new(Handshakes::default()),
             roots: Mutex::new(fs::Roots::new()),
             stopping: Arc::new(AtomicBool::new(false)),
             accepts: Arc::new(AtomicUsize::new(0)),
             closed_at: Mutex::new(Vec::new()),
-            inbox: Arc::new(Inbox::default()),
             presenting: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
@@ -321,42 +326,35 @@ impl TcpHost {
         }
     }
 
-    /// A datagram socket put in this host's table under `at`, answering its handle.
-    pub(crate) fn open_datagram(&self, at: &Resource, socket: UdpSocket) -> i64 {
+    /// A datagram socket put in this host's table under `label`, answering its handle.
+    pub(crate) fn open_datagram(&self, label: &str, socket: UdpSocket) -> i64 {
         self.sockets
-            .insert(Some(at), Socket::Datagram(Arc::new(socket)))
+            .insert(Some(label), Socket::Datagram(Arc::new(socket)))
     }
 
-    /// The datagram socket a handle names under `at`.
-    pub(crate) fn datagram(
+    /// The datagram socket a handle names under `label`.
+    pub fn datagram(
         &self,
         handle: i64,
-        at: &Resource,
+        label: &str,
         span: Span,
     ) -> Result<Arc<UdpSocket>, Diagnostic> {
-        self.sockets.datagram(handle, at, span)
-    }
-
-    /// A job on this host's pool, for a facility that shares its sockets' threads.
-    pub(crate) fn waiting(
-        &self,
-        span: Span,
-        label: &'static str,
-        what: &'static str,
-        job: impl FnOnce() -> JobOutput + Send + 'static,
-    ) -> Result<HostAnswer, Diagnostic> {
-        self.pool
-            .submit(span, label, what, Box::new(job))
-            .map(HostAnswer::Pending)
+        self.sockets.datagram(handle, label, span)
     }
 
     /// Where the Unix socket `path` under the root named `root` is, on this machine.
-    fn unix_path(&self, op: Op, root: &str, path: &str, span: Span) -> Result<PathBuf, Diagnostic> {
+    fn unix_path(
+        &self,
+        what: &str,
+        root: &str,
+        path: &str,
+        span: Span,
+    ) -> Result<PathBuf, Diagnostic> {
         let roots = lock(&self.roots);
         let Some(base) = roots.get(&Resource::Named(Symbol::new(root))) else {
             return Err(Diagnostic::error(
                 codes::FS_ROOT_UNBOUND,
-                format!("{} names the root `{root}`, and no root is bound to it", op.what()),
+                format!("{what} names the root `{root}`, and no root is bound to it"),
             )
             .primary(span, format!("`{root}` has no root"))
             .note(format!("bind one beside the run: `--fs {root}=<directory>`"))
@@ -370,274 +368,211 @@ impl TcpHost {
     fn described<T>(
         &self,
         socket: i64,
-        at: &Resource,
+        label: &str,
         span: Span,
         read: impl FnOnce(&Socket) -> T,
     ) -> Result<T, Diagnostic> {
-        self.sockets.handles.check(socket, at, span)?;
+        self.sockets.handles.check(socket, label, span)?;
         match lock(&self.sockets.open).get(&socket) {
             Some(sock) => Ok(read(sock)),
             None => Err(unknown_handle(socket, span)),
         }
     }
-}
 
-fn answered(value: Value) -> Result<HostAnswer, Diagnostic> {
-    Ok(HostAnswer::Value(value))
-}
-
-fn refused(refusal: Refusal) -> Result<HostAnswer, Diagnostic> {
-    answered(wire::err(&refusal))
-}
-
-impl Pooled for TcpHost {
-    fn pool(&self) -> &Pool {
-        &self.pool
-    }
-}
-
-impl Net for TcpHost {
-    fn waits(&self) -> bool {
-        true
-    }
-
-    /// `tcp` for both transports: the accepting listener, not the op, decides whether rustls runs.
-    fn path(&self, op: Op) -> &'static str {
-        match op {
-            Op::Listen => "ply_host::tcp::listen",
-            Op::ListenTls => tls::HANDLER,
-            Op::ListenOn => "ply_host::tcp::listen_on",
-            Op::ListenUnix => "ply_host::tcp::listen_unix",
-            Op::Connect => "ply_host::tcp::connect",
-            Op::ConnectTls => tls::CONNECT_HANDLER,
-            Op::ConnectTo => "ply_host::tcp::connect_to",
-            Op::ConnectUnix => "ply_host::tcp::connect_unix",
-            Op::Handshake => tls::HANDSHAKE_HANDLER,
-            Op::StartTls => tls::START_HANDLER,
-            Op::ServeTls => tls::SERVE_HANDLER,
-            Op::Accept => "ply_host::tcp::accept",
-            Op::Recv => "ply_host::tcp::recv",
-            Op::Send => "ply_host::tcp::send",
-            Op::CloseWrite => "ply_host::tcp::close_write",
-            Op::Close => "ply_host::tcp::close",
-            Op::SetOption => "ply_host::tcp::set_option",
-            Op::LocalPort => "ply_host::tcp::local_port",
-            Op::LocalAddress => "ply_host::tcp::local_address",
-            Op::PeerAddress => "ply_host::tcp::peer_address",
-            Op::PeerCredentials => "ply_host::tcp::peer_credentials",
-            Op::PeerCertificate => "ply_host::tls::peer_certificate",
-            Op::Protocol => "ply_host::tls::protocol",
-            Op::Options => "ply_host::tcp::options",
-            Op::SendSecret => "ply_host::tcp::send_secret",
-        }
-    }
-
-    fn listen(&self, at: &Resource, port: u16, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let listener = super::bind(Op::Listen.what(), port, span)?;
-        answered(Value::Int(self.sockets.insert(
-            Some(at),
+    /// A listener on `port` of the loopback address.
+    pub fn listen(&self, label: &str, port: u16, span: Span) -> Result<i64, Diagnostic> {
+        let listener = bind("`net.listen`", port, span)?;
+        Ok(self.sockets.insert(
+            Some(label),
             Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
-        )))
+        ))
     }
 
-    fn listen_tls(
+    /// A listener on `port` of the loopback address that serves TLS with `credential`; one the
+    /// run lacks is `E0429`.
+    pub fn listen_tls(
         &self,
-        at: &Resource,
+        label: &str,
         port: u16,
         credential: &str,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let (listener, config) = tls::listen(&self.credentials, credential, port, span)?;
-        answered(Value::Int(self.sockets.insert(
-            Some(at),
+    ) -> Result<i64, Diagnostic> {
+        let config = self.credentials.resolve(credential, span)?;
+        let listener = bind("`net.listen_tls`", port, span)?;
+        Ok(self.sockets.insert(
+            Some(label),
             Socket::Listener(Listening::Tcp(Arc::new(listener), Some(config))),
-        )))
+        ))
     }
 
-    /// Loopback only: a listener the rest of a network can reach is not a run's to open.
-    fn listen_on(
-        &self,
-        at: &Resource,
-        to: Endpoint,
-        options: Vec<SocketOption>,
-        _span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        if !to.ip.is_loopback() {
-            return refused(Refusal::PermissionDenied);
-        }
-        match bound(&to, &options) {
-            Ok(listener) => answered(wire::ok(Value::Int(self.sockets.insert(
-                Some(at),
+    /// A listener at exactly `to`, with `options` set before the bind: its handle, or why not.
+    pub fn listen_on(&self, label: &str, to: &Endpoint, options: &[SocketOption]) -> Vec<u8> {
+        wire::answer(bound(to, options).map(|listener| {
+            let handle = self.sockets.insert(
+                Some(label),
                 Socket::Listener(Listening::Tcp(Arc::new(listener), None)),
-            )))),
-            Err(refusal) => refused(refusal),
-        }
+            );
+            int(handle).to_vec()
+        }))
     }
 
+    /// A listener on the Unix socket at `path` under the root named `root`: its handle, or why
+    /// not.
     #[cfg(unix)]
-    fn listen_unix(
+    pub fn listen_unix(
         &self,
-        at: &Resource,
+        label: &str,
         root: &str,
         path: &str,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let path = self.unix_path(Op::ListenUnix, root, path, span)?;
-        match UnixListener::bind(&path) {
-            Ok(listener) => answered(wire::ok(Value::Int(self.sockets.insert(
-                Some(at),
-                Socket::Listener(Listening::Unix(Arc::new(listener), Arc::new(path))),
-            )))),
-            Err(e) => refused(Refusal::of(&e)),
-        }
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let path = self.unix_path("`net.listen_unix`", root, path, span)?;
+        Ok(wire::answer(match UnixListener::bind(&path) {
+            Ok(listener) => {
+                let handle = self.sockets.insert(
+                    Some(label),
+                    Socket::Listener(Listening::Unix(Arc::new(listener), Arc::new(path))),
+                );
+                Ok(int(handle).to_vec())
+            }
+            Err(e) => Err(Refusal::of(&e)),
+        }))
     }
 
     #[cfg(not(unix))]
-    fn listen_unix(
+    pub fn listen_unix(
         &self,
-        _at: &Resource,
+        _label: &str,
         _root: &str,
         _path: &str,
         _span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        refused(no_unix_sockets())
+    ) -> Result<Vec<u8>, Diagnostic> {
+        Ok(wire::answer(Err(no_unix_sockets())))
     }
 
-    /// Resolution and the connect both happen on the job's thread; the deadline covers the connect
-    /// to each address the name resolves to in turn.
-    fn connect(
-        &self,
-        at: &Resource,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-        span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
+    /// A connection to `host`, its resolution and each address it resolves to tried in turn on the
+    /// job's thread: its handle found, or none where the host was not reached before the deadline.
+    pub fn connect(&self, label: &str, host: String, port: u16, timeout: Duration) -> Job {
         let sockets = Arc::clone(&self.sockets);
-        let host = host.to_string();
-        let at = at.clone();
-        self.waiting(span, "connect", Op::Connect.what(), move || {
-            JobOutput::MaybeInt(reach(&host, port, timeout).map(|stream| {
-                sockets.insert(Some(&at), Socket::Stream(Plain::Tcp(Arc::new(stream))))
-            }))
+        let label = label.to_string();
+        Box::new(move || {
+            Ok(found(reach(&host, port, timeout).map(|stream| {
+                int(sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream)))))
+            })))
         })
     }
 
-    fn connect_tls(
-        &self,
-        at: &Resource,
-        host: &str,
-        port: u16,
-        timeout: Duration,
-        span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
+    /// `connect`, then TLS over it verifying `host`; the handshake is left to the first read or
+    /// write.
+    pub fn connect_tls(&self, label: &str, host: String, port: u16, timeout: Duration) -> Job {
         let sockets = Arc::clone(&self.sockets);
         let handshakes = Arc::clone(&self.handshakes);
         let config = self.credentials.client();
-        let host = host.to_string();
-        let at = at.clone();
-        self.waiting(span, "connect_tls", Op::ConnectTls.what(), move || {
+        let label = label.to_string();
+        Box::new(move || {
             // A host that is not a DNS name or an IP address is one no server can be verified as.
             let Ok(name) = ServerName::try_from(host.clone()) else {
-                return JobOutput::MaybeInt(None);
+                return Ok(found(None::<[u8; 8]>));
             };
-            JobOutput::MaybeInt(reach(&host, port, timeout).map(|stream| {
+            Ok(found(reach(&host, port, timeout).map(|stream| {
                 let session = tls::Session::connect(config, name, Arc::new(stream), handshakes);
-                sockets.insert(Some(&at), Socket::Tls(Arc::new(session)))
-            }))
+                int(sockets.insert(Some(&label), Socket::Tls(Arc::new(session))))
+            })))
         })
     }
 
-    fn connect_to(
+    /// A connection to exactly `to`, no name looked up, with `options` set before it connects:
+    /// its handle, or why not.
+    pub fn connect_to(
         &self,
-        at: &Resource,
+        label: &str,
         to: Endpoint,
         options: Vec<SocketOption>,
         timeout: Duration,
-        span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
+    ) -> Job {
         let sockets = Arc::clone(&self.sockets);
         let presenting = Arc::clone(&self.presenting);
-        let at = at.clone();
-        self.waiting(span, "connect_to", Op::ConnectTo.what(), move || {
-            let reached = reach_to(&to, &options, timeout).map(|stream| {
-                let handle =
-                    sockets.insert(Some(&at), Socket::Stream(Plain::Tcp(Arc::new(stream))));
-                if let Some(name) = presented(&options) {
-                    lock(&presenting).insert(handle, name);
-                }
-                handle
-            });
-            JobOutput::built(move || match reached {
-                Ok(handle) => wire::ok(Value::Int(handle)),
-                Err(refusal) => wire::err(&refusal),
-            })
+        let label = label.to_string();
+        Box::new(move || {
+            Ok(wire::answer(reach_to(&to, &options, timeout).map(
+                |stream| {
+                    let handle =
+                        sockets.insert(Some(&label), Socket::Stream(Plain::Tcp(Arc::new(stream))));
+                    if let Some(name) = presented(&options) {
+                        lock(&presenting).insert(handle, name);
+                    }
+                    int(handle).to_vec()
+                },
+            )))
         })
     }
 
+    /// A connection to the Unix socket at `path` under the root named `root`: its handle, or why
+    /// not.
     #[cfg(unix)]
-    fn connect_unix(
+    pub fn connect_unix(
         &self,
-        at: &Resource,
+        label: &str,
         root: &str,
         path: &str,
         timeout: Duration,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let path = self.unix_path(Op::ConnectUnix, root, path, span)?;
+    ) -> Result<Job, Diagnostic> {
+        let path = self.unix_path("`net.connect_unix`", root, path, span)?;
         let sockets = Arc::clone(&self.sockets);
-        let at = at.clone();
-        self.waiting(span, "connect_unix", Op::ConnectUnix.what(), move || {
-            let reached = reach_unix(&path, timeout).map(|stream| {
-                sockets.insert(Some(&at), Socket::Stream(Plain::Unix(Arc::new(stream))))
-            });
-            JobOutput::built(move || match reached {
-                Ok(handle) => wire::ok(Value::Int(handle)),
-                Err(refusal) => wire::err(&refusal),
-            })
-        })
+        let label = label.to_string();
+        Ok(Box::new(move || {
+            Ok(wire::answer(reach_unix(&path, timeout).map(|stream| {
+                let handle =
+                    sockets.insert(Some(&label), Socket::Stream(Plain::Unix(Arc::new(stream))));
+                int(handle).to_vec()
+            })))
+        }))
     }
 
     #[cfg(not(unix))]
-    fn connect_unix(
+    pub fn connect_unix(
         &self,
-        _at: &Resource,
+        _label: &str,
         _root: &str,
         _path: &str,
         _timeout: Duration,
         _span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        refused(no_unix_sockets())
+    ) -> Result<Job, Diagnostic> {
+        Ok(Box::new(|| Ok(wire::answer(Err(no_unix_sockets())))))
     }
 
-    /// No handshake here, deliberately: a session handshakes on its first read or write, so a peer
-    /// that connects and says nothing costs nothing. A client that wants it earlier asks with
-    /// `net.handshake`.
-    fn handshake(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let session = match self.sockets.stream(conn, at, span)? {
+    /// The TLS handshake, completed now rather than when a request needs it: the microseconds it
+    /// took found, or none for a connection with no handshake to complete. No handshake happens
+    /// on its own: a session handshakes on its first read or write, so a peer that connects and
+    /// says nothing costs nothing.
+    pub fn handshake(&self, label: &str, conn: i64, span: Span) -> Result<Job, Diagnostic> {
+        let session = match self.sockets.stream(conn, label, span)? {
             Connection::Tls(session) => Some(session),
             Connection::Plain(_) => None,
         };
-        self.waiting(span, "handshake", Op::Handshake.what(), move || {
-            JobOutput::MaybeInt(
+        Ok(Box::new(move || {
+            Ok(found(
                 session
                     .and_then(|session| session.handshake())
-                    .map(|us| us as i64),
-            )
-        })
+                    .map(|us| int(us as i64)),
+            ))
+        }))
     }
 
-    /// The session takes the handle before the handshake starts, so nothing reaches the plaintext
-    /// while it runs. Plaintext the caller holds unread, or the socket does, is a refusal: a TLS
-    /// server never speaks first, so it was sent behind the go-ahead to be read as if secured.
-    fn start_tls(
+    /// An open plaintext connection secured as the client's end, verifying the server as `name`:
+    /// the protocol agreed found, or why not. The session takes the handle before the handshake
+    /// starts, so nothing reaches the plaintext while it runs. Plaintext the caller holds unread,
+    /// or the socket does, is a refusal: a TLS server never speaks first, so it was sent behind
+    /// the go-ahead to be read as if secured.
+    pub fn start_tls(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
         name: &str,
         upgrade: Upgrade,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
+    ) -> Result<Job, Diagnostic> {
         let server = ServerName::try_from(name.to_string());
         let early = if upgrade.unread > 0 {
             Some((tls::REASON_INJECTED, Refusal::Injected))
@@ -659,7 +594,7 @@ impl Net for TcpHost {
         let handshakes = Arc::clone(&self.handshakes);
         let (stream, session) =
             self.sockets
-                .upgraded(Op::StartTls, conn, at, span, move |stream| {
+                .upgraded("`net.start_tls`", conn, label, span, move |stream| {
                     Arc::new(match (reason, server) {
                         (None, Ok(server)) => {
                             tls::Session::connect(config, server, stream, handshakes)
@@ -672,140 +607,147 @@ impl Net for TcpHost {
                     })
                 })?;
         if let Some((_, refusal)) = early {
-            return refused(refusal);
+            return Ok(Box::new(move || Ok(wire::answer(Err(refusal)))));
         }
-        self.waiting(span, "start_tls", Op::StartTls.what(), move || {
+        Ok(Box::new(move || {
             if tls::plaintext_waiting(&stream) {
                 session.refuse(tls::REASON_INJECTED);
-                return JobOutput::built(|| wire::err(&Refusal::Injected));
+                return Ok(wire::answer(Err(Refusal::Injected)));
             }
-            settled(&session, upgrade.timeout)
-        })
+            Ok(settled(&session, upgrade.timeout))
+        }))
     }
 
-    /// The server's end. Bytes the socket already holds are the client's handshake, which it may
-    /// send as soon as it has the go-ahead, so only what the caller read past the request to
-    /// upgrade is refused.
-    fn serve_tls(
+    /// The server's end of `start_tls`, with the credential named `credential`. Bytes the socket
+    /// already holds are the client's handshake, which it may send as soon as it has the go-ahead,
+    /// so only what the caller read past the request to upgrade is refused.
+    pub fn serve_tls(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
         credential: &str,
         upgrade: Upgrade,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
+    ) -> Result<Job, Diagnostic> {
         let credential = self.credentials.resolve(credential, span)?;
         let config = tls::server_accepting(&credential, &upgrade.alpn);
         let handshakes = Arc::clone(&self.handshakes);
         let injected = upgrade.unread > 0;
-        let (_, session) = self
-            .sockets
-            .upgraded(Op::ServeTls, conn, at, span, move |stream| {
-                Arc::new(if injected {
-                    tls::Session::refused(stream, handshakes, tls::REASON_INJECTED)
-                } else {
-                    tls::Session::new(config, stream, handshakes)
-                })
-            })?;
+        let (_, session) =
+            self.sockets
+                .upgraded("`net.serve_tls`", conn, label, span, move |stream| {
+                    Arc::new(if injected {
+                        tls::Session::refused(stream, handshakes, tls::REASON_INJECTED)
+                    } else {
+                        tls::Session::new(config, stream, handshakes)
+                    })
+                })?;
         if injected {
-            return refused(Refusal::Injected);
+            return Ok(Box::new(|| Ok(wire::answer(Err(Refusal::Injected)))));
         }
-        self.waiting(span, "serve_tls", Op::ServeTls.what(), move || {
-            settled(&session, upgrade.timeout)
-        })
+        Ok(Box::new(move || Ok(settled(&session, upgrade.timeout))))
     }
 
-    fn accept(&self, at: &Resource, listener: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
+    /// The next connection a listener takes, as its handle; `0` once the run has stopped
+    /// accepting.
+    pub fn accept(&self, label: &str, listener: i64, span: Span) -> Result<Job, Diagnostic> {
         // Before the lookup, because `stop_accepting` has already swapped the listener out.
         if self.stopping.load(Ordering::Acquire) {
-            self.sockets.handles.check(listener, at, span)?;
-            return self.waiting(span, "accept", Op::Accept.what(), || JobOutput::Int(0));
+            self.sockets.handles.check(listener, label, span)?;
+            return Ok(Box::new(|| Ok(int(0).to_vec())));
         }
-        let listening = self.sockets.listener(listener, at, span)?;
+        let listening = self.sockets.listener(listener, label, span)?;
         let sockets = Arc::clone(&self.sockets);
         let handshakes = Arc::clone(&self.handshakes);
         let stopping = Arc::clone(&self.stopping);
-        let accepts = Arc::clone(&self.accepts);
-        accepts.fetch_add(1, Ordering::AcqRel);
-        self.waiting(span, "accept", Op::Accept.what(), move || {
-            let done = JobOutput::Int(accepted(&listening, &sockets, &handshakes, &stopping));
-            accepts.fetch_sub(1, Ordering::AcqRel);
-            done
-        })
+        let parked = Accepting::counted(&self.accepts);
+        Ok(Box::new(move || {
+            let handle = accepted(&listening, &sockets, &handshakes, &stopping);
+            drop(parked);
+            Ok(int(handle).to_vec())
+        }))
     }
 
-    fn recv(
+    /// At most `max` bytes found, as soon as any arrive: none is the deadline, and an empty answer
+    /// the peer done sending.
+    pub fn recv(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
         max: usize,
         timeout: Duration,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let conn = self.sockets.stream(conn, at, span)?;
-        self.waiting(span, "recv", Op::Recv.what(), move || match conn {
+    ) -> Result<Job, Diagnostic> {
+        let conn = self.sockets.stream(conn, label, span)?;
+        Ok(Box::new(move || match conn {
             Connection::Plain(stream) => {
                 // This job owns the socket for its duration, so setting its timeout is safe.
                 stream.read_within(timeout);
-                let mut buffer = vec![0u8; max];
+                // Read behind the byte that says it was found, so the bytes are not copied again.
+                let mut buffer = vec![0u8; max + 1];
+                buffer[0] = 1;
                 // One `read`: a loop would hide short reads and closes from the program.
-                match stream.read(&mut buffer) {
+                match stream.read(&mut buffer[1..]) {
                     Ok(n) => {
-                        buffer.truncate(n);
-                        JobOutput::MaybeBytes(Some(buffer))
+                        buffer.truncate(n + 1);
+                        Ok(buffer)
                     }
-                    Err(e) if expired(&e) => JobOutput::MaybeBytes(None),
-                    Err(e) if peer_gone(&e) => JobOutput::MaybeBytes(Some(Vec::new())),
-                    Err(e) => JobOutput::Failed(e.to_string()),
+                    Err(e) if expired(&e) => Ok(found(None::<Vec<u8>>)),
+                    Err(e) if peer_gone(&e) => Ok(found(Some(b""))),
+                    Err(e) => Err(e.to_string()),
                 }
             }
-            // Never `Failed`: any TLS failure is "the peer went away", so the accept loop survives.
+            // Never a failure: any TLS failure is "the peer went away", so the accept loop survives.
             Connection::Tls(session) => {
                 session.deadline(timeout);
-                JobOutput::MaybeBytes(session.read(max))
+                Ok(found(session.read(max)))
             }
-        })
+        }))
     }
 
-    fn send(
+    /// Writes some prefix of `payload`: how many bytes it took found, none for the deadline and
+    /// `0` for the peer gone.
+    pub fn send(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
-        payload: &[u8],
+        payload: Vec<u8>,
         timeout: Duration,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let conn = self.sockets.stream(conn, at, span)?;
-        let payload = payload.to_vec();
-        self.waiting(span, "send", Op::Send.what(), move || match conn {
+    ) -> Result<Job, Diagnostic> {
+        let conn = self.sockets.stream(conn, label, span)?;
+        Ok(Box::new(move || match conn {
             Connection::Plain(stream) => {
                 stream.write_within(timeout);
                 // One `write`, which may be short under backpressure; `std.net.send_all` loops.
                 match stream.write(&payload) {
-                    Ok(n) => JobOutput::MaybeInt(Some(n as i64)),
-                    Err(e) if expired(&e) => JobOutput::MaybeInt(None),
-                    Err(e) if peer_gone(&e) => JobOutput::MaybeInt(Some(0)),
-                    Err(e) => JobOutput::Failed(e.to_string()),
+                    Ok(n) => Ok(found(Some(int(n as i64)))),
+                    Err(e) if expired(&e) => Ok(found(None::<[u8; 8]>)),
+                    Err(e) if peer_gone(&e) => Ok(found(Some(int(0)))),
+                    Err(e) => Err(e.to_string()),
                 }
             }
             Connection::Tls(session) => {
                 session.deadline(timeout);
-                JobOutput::MaybeInt(Some(session.write(&payload) as i64))
+                Ok(found(Some(int(session.write(&payload) as i64))))
             }
-        })
+        }))
     }
 
-    fn send_secret(
+    /// Every byte of `payload`, which holds a credential: byte 1 once the peer took them all, byte
+    /// 0 for a deadline or a peer gone before it did. The job's copy is wiped when it is dropped.
+    pub fn send_secret(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
-        payload: Zeroizing<Vec<u8>>,
+        payload: &[u8],
         timeout: Duration,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let conn = self.sockets.stream(conn, at, span)?;
-        self.waiting(span, "send_secret", Op::SendSecret.what(), move || {
-            JobOutput::Bool(match conn {
+    ) -> Result<Job, Diagnostic> {
+        let conn = self.sockets.stream(conn, label, span)?;
+        let payload = Zeroizing::new(payload.to_vec());
+        Ok(Box::new(move || {
+            let went = match conn {
                 Connection::Plain(stream) => {
                     stream.write_within(timeout);
                     stream.write_all(&payload).is_ok()
@@ -814,20 +756,23 @@ impl Net for TcpHost {
                     session.deadline(timeout);
                     session.write(&payload) == payload.len()
                 }
-            })
-        })
+            };
+            Ok(vec![u8::from(went)])
+        }))
     }
 
-    fn close_write(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        match self.sockets.stream(conn, at, span)? {
+    /// Ends this end's sending and leaves its reading open.
+    pub fn close_write(&self, label: &str, conn: i64, span: Span) -> Result<(), Diagnostic> {
+        match self.sockets.stream(conn, label, span)? {
             Connection::Plain(stream) => stream.shutdown(Shutdown::Write),
             Connection::Tls(session) => session.close_write(),
         }
-        answered(Value::Unit)
+        Ok(())
     }
 
-    fn close(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        self.sockets.handles.check(socket, at, span)?;
+    /// Closes a socket of any kind; its handle names nothing afterwards.
+    pub fn close(&self, label: &str, socket: i64, span: Span) -> Result<(), Diagnostic> {
+        self.sockets.handles.check(socket, label, span)?;
         let sock = lock(&self.sockets.open).remove(&socket);
         self.sockets.handles.close(socket);
         lock(&self.presenting).remove(&socket);
@@ -846,97 +791,105 @@ impl Net for TcpHost {
             }
             None => return Err(unknown_handle(socket, span)),
         }
-        answered(Value::Unit)
+        Ok(())
     }
 
-    fn set_option(
+    /// Sets one option of a socket of any kind: nothing, or why not.
+    pub fn set_option(
         &self,
-        at: &Resource,
+        label: &str,
         socket: i64,
         option: SocketOption,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let set = self.described(socket, at, span, |sock| match raw_of(sock) {
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let set = self.described(socket, label, span, |sock| match raw_of(sock) {
             Some(raw) => apply(&raw, &option).map_err(|e| Refusal::of(&e)),
             None => Err(Refusal::Reset),
         })?;
         if let (Ok(()), SocketOption::Presenting(name)) = (&set, &option) {
             lock(&self.presenting).insert(socket, name.clone());
         }
-        answered(match set {
-            Ok(()) => wire::ok(Value::Unit),
-            Err(refusal) => wire::err(&refusal),
-        })
+        Ok(wire::answer(set.map(|()| Vec::new())))
     }
 
-    fn local_port(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let address = self.described(socket, at, span, local_of)?;
-        answered(wire::option(
-            address.map(|a| Value::Int(i64::from(a.port()))),
-        ))
-    }
-
-    fn local_address(
+    /// The port this end of a socket is bound to; `None` for a listener the drain has closed.
+    pub fn local_port(
         &self,
-        at: &Resource,
+        label: &str,
         socket: i64,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let address = self.described(socket, at, span, local_of)?;
-        answered(wire::option(address.map(|a| Endpoint::of(a).value())))
+    ) -> Result<Option<u16>, Diagnostic> {
+        let address = self.described(socket, label, span, local_of)?;
+        Ok(address.map(|a| a.port()))
     }
 
-    fn peer_address(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let address = self.described(conn, at, span, |sock| match sock {
+    /// The address this end of a socket is bound to, found; none for one with no IP address.
+    pub fn local_address(
+        &self,
+        label: &str,
+        socket: i64,
+        span: Span,
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let address = self.described(socket, label, span, local_of)?;
+        Ok(found(address.map(|a| Endpoint::of(a).written())))
+    }
+
+    /// The address of a connection's far end, found; none for a listener and for a Unix socket.
+    pub fn peer_address(&self, label: &str, conn: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
+        let address = self.described(conn, label, span, |sock| match sock {
             Socket::Stream(Plain::Tcp(s)) => s.peer_addr().ok(),
             Socket::Tls(s) => s.peer_addr().ok(),
             _ => None,
         })?;
-        answered(wire::option(address.map(|a| Endpoint::of(a).value())))
+        Ok(found(address.map(|a| Endpoint::of(a).written())))
     }
 
-    fn peer_credentials(
+    /// Who holds the far end of a Unix socket, found; none for any other.
+    pub fn peer_credentials(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let credentials = self.described(conn, at, span, |sock| match sock {
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let credentials = self.described(conn, label, span, |sock| match sock {
             #[cfg(unix)]
             Socket::Stream(Plain::Unix(s)) => credentials_of(s),
             _ => None,
         })?;
-        answered(wire::option(credentials.map(|c| c.value())))
+        Ok(found(credentials.map(|c| c.written())))
     }
 
-    fn peer_certificate(
+    /// The far end's certificate on a secured connection once its handshake completed, found: the
+    /// server's to a client, the client's to a server where it presented one; none for any other.
+    pub fn peer_certificate(
         &self,
-        at: &Resource,
+        label: &str,
         conn: i64,
         span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let leaf = self.described(conn, at, span, |sock| match sock {
+    ) -> Result<Vec<u8>, Diagnostic> {
+        let leaf = self.described(conn, label, span, |sock| match sock {
             Socket::Tls(s) => s.peer_certificate(),
             _ => None,
         })?;
-        answered(wire::option(leaf.map(Value::bytes)))
+        Ok(found(leaf))
     }
 
-    fn protocol(&self, at: &Resource, conn: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let agreed = self.described(conn, at, span, |sock| match sock {
+    /// The application protocol a secured connection's handshake agreed once it completed, found;
+    /// none for any other.
+    pub fn protocol(&self, label: &str, conn: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
+        let agreed = self.described(conn, label, span, |sock| match sock {
             Socket::Tls(s) => s.protocol(),
             _ => None,
         })?;
-        answered(wire::option(agreed.map(Value::str)))
+        Ok(found(agreed))
     }
 
-    fn options(&self, at: &Resource, socket: i64, span: Span) -> Result<HostAnswer, Diagnostic> {
-        let options = self.described(socket, at, span, |sock| {
+    /// Each option the socket has, as it stands, as parts.
+    pub fn options(&self, label: &str, socket: i64, span: Span) -> Result<Vec<u8>, Diagnostic> {
+        let options = self.described(socket, label, span, |sock| {
             raw_of(sock).map_or_else(Vec::new, |raw| standing(&raw))
         })?;
-        answered(Value::list(
-            options.iter().map(SocketOption::value).collect(),
-        ))
+        Ok(SocketOption::listed(&options))
     }
 }
 
@@ -948,18 +901,16 @@ fn presented(options: &[SocketOption]) -> Option<String> {
     })
 }
 
-/// The handshake of an upgrade, completed within its deadline or refused with why.
-fn settled(session: &tls::Session, timeout: Duration) -> JobOutput {
+/// The handshake of an upgrade, completed within its deadline: the protocol agreed found, or why
+/// not.
+fn settled(session: &tls::Session, timeout: Duration) -> Vec<u8> {
     let outcome = session.settle_within(timeout).map_err(|why| match why {
         tls::Unsettled::Expired => Refusal::TimedOut,
         tls::Unsettled::Refused(tls::REASON_CERTIFICATE) => Refusal::Untrusted,
         tls::Unsettled::Refused(tls::REASON_GONE) => Refusal::Reset,
         tls::Unsettled::Refused(reason) => Refusal::Handshake(reason.to_string()),
     });
-    JobOutput::built(move || match outcome {
-        Ok(protocol) => wire::ok(wire::secured(protocol)),
-        Err(refusal) => wire::err(&refusal),
-    })
+    wire::answer(outcome.map(found))
 }
 
 /// The next connection a listener takes, as its handle; `0` once the run has stopped accepting or
@@ -1041,24 +992,6 @@ impl crate::signal::Accepting for TcpHost {
 
     fn accepts_in_flight(&self) -> usize {
         self.accepts.load(Ordering::Acquire)
-    }
-}
-
-impl HostRuntime for TcpHost {
-    fn watch(&self, pending: &Pending) -> Result<(), Diagnostic> {
-        self.pool.watch(pending, &self.inbox)
-    }
-
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        self.pool.collect(&self.inbox)
-    }
-
-    fn park(&self) -> Result<(), Diagnostic> {
-        self.pool.park()
-    }
-
-    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        self.pool.block_on(pending)
     }
 }
 

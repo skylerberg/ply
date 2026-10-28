@@ -151,17 +151,6 @@ impl EffectAtom {
             && (self == other || (self.op.is_none() && self.mode == other.mode))
     }
 
-    /// An operation atom with the mode its declaration gives it; a mode atom is unchanged.
-    pub fn with_declared_mode(
-        mut self,
-        mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>,
-    ) -> Self {
-        if let Some(mode) = self.op.as_ref().and_then(|op| mode_of(&self.effect, op)) {
-            self.mode = mode;
-        }
-        self
-    }
-
     /// The atom with its resource already written: a label variable's name depends on the text it
     /// is printed in, which [`fmt::Display`] cannot see and [`atom_texts`] can.
     pub fn text_with(&self, resource: &str) -> String {
@@ -206,13 +195,6 @@ impl Footprint {
     /// Whether some atom here covers `atom` (see [`EffectAtom::covers`]).
     pub fn covers(&self, atom: &EffectAtom) -> bool {
         self.0.iter().any(|a| a.covers(atom))
-    }
-
-    pub fn resolve_modes(&mut self, mode_of: &dyn Fn(&Symbol, &Symbol) -> Option<Mode>) {
-        self.0 = std::mem::take(&mut self.0)
-            .into_iter()
-            .map(|a| a.with_declared_mode(mode_of))
-            .collect();
     }
 
     pub fn union(&self, other: &Footprint) -> Footprint {

@@ -20,12 +20,14 @@ import compiler.load (every_root, LoadedAnalysis)
 import compiler.emit.keys (RootKey, Named, Stored)
 import compiler.syntax.parsing (Span, no_module, span_between)
 import compiler.check.resolve.tables (Diag, Label, error_at, error_with_labels, label_at)
-import compiler.unit (shipped, answers_store, baked_key, compiler_roots, const_budget, const_room,
-                      emitter_identity, identity_of, stored_root)
+import compiler.unit (shipped, shipped_runtime, answers_store, baked_key, compiler_roots,
+                      const_budget, const_room, emitter_identity, identity_of, stored_root)
 import compiler.store.kept (Record, kept_records, with_kept)
 import diagnostic (Place, shown)
 import env (env)
-import machine (machine, Called, default_options, unconfigured)
+import machine
+import machine (Called)
+import std.machine as entering
 import program (Timed, front_of, program_view, runs_statements)
 import semantics
 import sources
@@ -72,10 +74,10 @@ pub type Asked = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 /// the answering keeps.
 pub effect literal {
   /// In `asked`'s order; or what kept the definitions from being entered at all.
-  read verdicts(timed: Timed, frame: Frame, root: String, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
+  read verdicts(timed: Timed, frame: Frame, asked: List<Asked>) -> Result<List<Verdict>, List<Diag>>
   /// Each statement of `asked` judged against the schema it is held to, in `asked`'s order; or what
   /// kept the definitions from being entered at all.
-  read statements(timed: Timed, frame: Frame, root: String, asked: List<statements::Asked>) -> Result<List<Judgement>, List<Diag>>
+  read statements(timed: Timed, frame: Frame, asked: List<statements::Asked>) -> Result<List<Judgement>, List<Diag>>
 }
 
 // --- Asking -----------------------------------------------------------------------
@@ -320,21 +322,19 @@ fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> =
 pub fn unsettled(
   timed: Timed,
   frame: Frame,
-  root: String,
 ) -> List<Diag> / {literal.verdicts, literal.statements, abort.raise} =
-  literal_refusals(timed, frame, root).concat(statement_refusals(timed, frame, root))
+  literal_refusals(timed, frame).concat(statement_refusals(timed, frame))
 
 /// Only a program one of whose own modules runs a statement asks after any.
 fn statement_refusals(
   timed: Timed,
   frame: Frame,
-  root: String,
 ) -> List<Diag> / {literal.statements, abort.raise} =
   if !runs_statements(timed.program, frame) { [] } else {
     let asks = asking(frame).filter(|a: Asking| a.site.module < timed.program.files.len());
     let refused = schemas_refused(asks);
     if asks.len() == 0 { refused } else {
-      match literal.statements(timed, frame, root, asks.map(|a: Asking| a.asked)) {
+      match literal.statements(timed, frame, asks.map(|a: Asking| a.asked)) {
         Err(diags) -> refused.concat(diags),
         Ok(judgements) ->
           range(0, asks.len()).fold(refused, |acc: List<Diag>, i: Int|
@@ -343,17 +343,13 @@ fn statement_refusals(
     }
   }
 
-fn literal_refusals(
-  timed: Timed,
-  frame: Frame,
-  root: String,
-) -> List<Diag> / {literal.verdicts, abort.raise} = {
+fn literal_refusals(timed: Timed, frame: Frame) -> List<Diag> / {literal.verdicts, abort.raise} = {
   let sites = frame.tagged.filter(|site: TaggedSite| site.module < timed.program.files.len());
   let consts = const_sites(frame.outlines, frame.hashes);
   if sites.len() == 0 && consts.len() == 0 { [] } else {
     let parsers = distinct(sites);
     let asked = parsers.concat(consts.map(asked_const));
-    match literal.verdicts(timed, frame, root, asked) {
+    match literal.verdicts(timed, frame, asked) {
       Err(diags) -> diags,
       Ok(verdicts) -> {
         let literals = sites.fold([], |acc: List<Diag>, site: TaggedSite|
@@ -448,16 +444,15 @@ fn callees(asked: List<Asked>) -> List<Bytes> =
 /// the encoding of its value.
 type Judged = { verdict: Verdict, value: Option<Bytes> }
 
-/// `asked` entered on a machine loaded for them alone: a unit of the definitions they reach, each
-/// call under `steps`. A parser is handed its texts; a `const` definition is entered through its
-/// stored root, which hands back its value's encoding.
+/// `asked` entered on a unit of the definitions they reach, each call under `steps` and bound to no
+/// host. A parser is handed its texts; a `const` definition is entered through its stored root,
+/// which hands back its value's encoding.
 fn entered(
   front: LoadedAnalysis,
   frame: Frame,
-  root: String,
   asked: List<Asked>,
   steps: Int,
-) -> Result<List<Judged>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], abort.raise} =
+) -> Result<List<Judged>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
   if asked.len() == 0 { Ok([]) } else {
     let names = callees(asked);
     let reached = reach(frame.hashes, names.map(|n: Bytes| TheFn(n))).fns;
@@ -467,35 +462,19 @@ fn entered(
     );
     match units::library_over(emit.unit(front, offered)) {
       Err(diags) -> Err(diags),
-      Ok(unit) -> {
-        machine.configure[literals]({ ..default_options(), steps: steps });
-        let answered = match machine.load[literals](root, front, unit) {
-          Err(refused) -> Err(refused.diags),
-          Ok(_) -> match machine.bound[literals](
-              String::of_bytes_lossy(names.get(0)),
-              unconfigured(),
-            ) {
-            Err(refused) -> Err(refused.diags),
-            Ok(_) ->
-              Ok(
-                asked.map(|a: Asked|
-                  if is_const(a) {
-                    value_of(
-                      machine.call[literals](String::of_bytes_lossy(stored_root(a.callee)), []),
-                    )
-                  } else {
-                    {
-                      verdict: verdict_of(
-                        machine.call[literals](String::of_bytes_lossy(a.callee), [handed(a)]),
-                      ),
-                      value: None,
-                    }
-                  }),
-              ),
-          },
-        };
-        machine.drop[literals]();
-        answered
+      Ok(library) -> match entering::machine.open(library) {
+        Err(why) -> Err([machine::unloaded(why)]),
+        Ok(opened) -> {
+          let roots = machine::roots_of(front.dump);
+          let run = { ..entering::unbounded(machine::max_calls()), steps: steps };
+          let call = |name: Bytes, args: List<Value>|
+            machine::called(opened.unit, roots, String::of_bytes_lossy(name), args, run);
+          let answered = asked.map(|a: Asked|
+            if is_const(a) { value_of(call(stored_root(a.callee), [])) }
+            else { { verdict: verdict_of(call(a.callee, [handed(a)])), value: None } });
+          entering::machine.close(opened.unit);
+          Ok(answered)
+        },
       },
     }
   }
@@ -544,24 +523,24 @@ type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 /// the parsers on one machine and the `const` definitions on another, each under its budget.
 pub fn settling<a | e>(
   body: () -> a / {literal.verdicts, literal.statements | e},
-) -> a / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], abort.raise | e} =
+) -> a / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, env.bodies[sys], env.binary_version[sys], fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
     // A command that settles nothing reads neither the toolchain nor its cache.
-    literal.statements(timed, frame, root, asked) -> {
+    literal.statements(timed, frame, asked) -> {
       let bodies = below_root(env.bodies[sys]());
       let toolchain = judging(
         shipped.definitions(),
-        shipped.runtime().identity,
+        shipped_runtime().identity,
         env.binary_version[sys](),
       );
       with_kept[abs, lit](literals_store(bodies, toolchain), ||
-        judgements(toolchain, root, timed, frame, asked))
+        judgements(toolchain, timed, frame, asked))
     },
-    literal.verdicts(timed, frame, root, asked) -> {
+    literal.verdicts(timed, frame, asked) -> {
       let bodies = below_root(env.bodies[sys]());
-      let runtime = shipped.runtime();
+      let runtime = shipped_runtime();
       let toolchain = judging(shipped.definitions(), runtime.identity, env.binary_version[sys]());
       // A `const` definition's value is kept beside the emitter's answers, which a unit reads it from.
       with_kept[abs, ans](
@@ -593,7 +572,7 @@ pub fn settling<a | e>(
               // What is entered is the only verdict that reads the check's tables.
               match program_view(timed.program) {
                 None -> Err(timed.program.diags),
-                Some(view) -> verdicts_entered(timed, view, root, sought, open),
+                Some(view) -> verdicts_entered(timed, view, sought, open),
               }
             }
           }),
@@ -611,10 +590,9 @@ fn literals_store(bodies: String, toolchain: Bytes) -> String / {abort.raise} =
 fn verdicts_entered(
   timed: Timed,
   view: View,
-  root: String,
   sought: List<Sought>,
   open: List<Sought>,
-) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], kept_records.put[ans], kept_records.put[lit], abort.raise} = {
+) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, kept_records.put[ans], kept_records.put[lit], abort.raise} = {
   let front = front_of(
     timed,
     view,
@@ -623,7 +601,7 @@ fn verdicts_entered(
   let parsers = open.filter(|s: Sought| !is_const(s.asked));
   let consts = open.filter(|s: Sought| is_const(s.asked));
   let over = |some: List<Sought>, steps: Int|
-    entered(front, view.frame, root, some.map(|s: Sought| s.asked), steps);
+    entered(front, view.frame, some.map(|s: Sought| s.asked), steps);
   match over(parsers, step_budget()) {
     Err(diags) -> Err(diags),
     Ok(parsed) -> match over(consts, const_budget()) {
@@ -681,11 +659,10 @@ type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
 /// to, in their order.
 fn judgements(
   toolchain: Bytes,
-  root: String,
   timed: Timed,
   frame: Frame,
   asked: List<statements::Asked>,
-) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, machine.configure[literals], machine.load[literals], machine.bound[literals], machine.call[literals], machine.drop[literals], kept_records.get[lit], kept_records.put[lit], abort.raise} = {
+) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, kept_records.get[lit], kept_records.put[lit], abort.raise} = {
   let keyed = asked.map(|a: statements::Asked| {
     let key = judgement_key(toolchain, step_budget(), a);
     {
@@ -709,7 +686,6 @@ fn judgements(
           judged(
             |within: Within| front_of(timed, view, Some(within)),
             frame,
-            root,
             step_budget(),
             open.map(|k: Keyed| k.asked),
           ),

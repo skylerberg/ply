@@ -1,20 +1,13 @@
-//! The `signal` effect, and the coordinator that turns a stop into a shutdown.
+//! The signals `std.signal`'s real handler asks about, and the coordinator that turns a stop into a
+//! shutdown.
 
 use crate::pool::Bell;
 use crate::process::Children;
-use ply_core::host::HostRegistry;
-use ply_core::{
-    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRequest, HostResource,
-    HostRuntime, Linearity, Span, Symbol, Value, codes,
-};
+use ply_core::{Diagnostic, Span, codes};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
-
-pub const MODULE: &str = "std.signal";
-
-pub const EFFECT: &str = "std.signal.signal";
 
 /// `--drain-ms`: how long in-flight requests have to finish once accept stops.
 pub const DEFAULT_DRAIN_MS: u64 = 30_000;
@@ -124,6 +117,8 @@ struct State {
 
 pub struct Shutdown {
     bounds: Bounds,
+    /// Whether a first signal drains; one that does not ends the children and exits at once.
+    drains: bool,
     /// The whole of what a signal handler touches.
     requested: AtomicBool,
     /// Set at the stop, so a later `net.accept` answers `0` even if the table is rebuilt.
@@ -138,14 +133,45 @@ pub struct Shutdown {
     children: Mutex<Option<Weak<Children>>>,
     /// Rung with `woke`, so a reactor parked on a sleeper's deadline wakes for the stop too.
     bell: Mutex<Option<Arc<Bell>>>,
-    /// Indexed by [`Asked`].
-    watches: [Watch; 4],
 }
 
+/// The signals the process has been asked about, indexed by [`Asked`]: a signal is the process's,
+/// so one installed handler serves every run in it.
+static WATCHES: std::sync::LazyLock<[Watch; 4]> = std::sync::LazyLock::new(Default::default);
+
 impl Shutdown {
+    /// Whether `which` has arrived since it was last asked about, however many times it did:
+    /// arrivals are not counted. The first ask installs the handler, for the whole process, and
+    /// answers `false`. Only a run that listens for a stop holds a `Shutdown` to ask through, so a
+    /// run that does not, as a test's, leaves every signal as the platform has it.
+    ///
+    /// # Errors
+    /// The handler could not be installed.
+    pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
+        let watch = &WATCHES[which as usize];
+        let mut installed = lock(&watch.installed);
+        if !*installed {
+            watch_for(which, Arc::clone(&watch.arrived))?;
+            *installed = true;
+        }
+        Ok(watch.arrived.swap(false, Ordering::AcqRel))
+    }
+
+    /// A stop that drains within `bounds`, and exits at a second signal.
     pub fn new(bounds: Bounds) -> Arc<Shutdown> {
+        Shutdown::made(bounds, true)
+    }
+
+    /// A stop that ends the run's children and exits with the signal's code at the first signal,
+    /// for a run with children and nothing to drain.
+    pub fn at_once() -> Arc<Shutdown> {
+        Shutdown::made(Bounds::default(), false)
+    }
+
+    fn made(bounds: Bounds, drains: bool) -> Arc<Shutdown> {
         Arc::new(Shutdown {
             bounds,
+            drains,
             requested: AtomicBool::new(false),
             stopped_accepting: AtomicBool::new(false),
             second: AtomicBool::new(false),
@@ -155,7 +181,6 @@ impl Shutdown {
             net: Mutex::new(None),
             children: Mutex::new(None),
             bell: Mutex::new(None),
-            watches: Default::default(),
         })
     }
 
@@ -169,18 +194,6 @@ impl Shutdown {
         if let Some(bell) = lock(&self.bell).as_ref() {
             bell.ring();
         }
-    }
-
-    /// Whether `which` has arrived since it was last asked about, however many times it did:
-    /// arrivals are not counted. The first ask installs the handler and answers `false`.
-    pub fn arrived(&self, which: Asked) -> std::io::Result<bool> {
-        let watch = &self.watches[which as usize];
-        let mut installed = lock(&watch.installed);
-        if !*installed {
-            watch_for(which, Arc::clone(&watch.arrived))?;
-            *installed = true;
-        }
-        Ok(watch.arrived.swap(false, Ordering::AcqRel))
     }
 
     pub fn bounds(&self) -> Bounds {
@@ -396,7 +409,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
                 if stream.recv().await.is_none() {
                     return;
                 }
-                if !shutdown.request(which) {
+                if !shutdown.drains || !shutdown.request(which) {
                     exit_now(&shutdown, which);
                 }
             }
@@ -407,7 +420,7 @@ fn deliver(shutdown: Arc<Shutdown>, which: ShutdownSignal) {
                 if tokio::signal::ctrl_c().await.is_err() {
                     return;
                 }
-                if !shutdown.request(which) {
+                if !shutdown.drains || !shutdown.request(which) {
                     exit_now(&shutdown, which);
                 }
             }
@@ -470,135 +483,30 @@ fn watch_for(which: Asked, _: Arc<AtomicBool>) -> std::io::Result<()> {
 }
 
 fn exit_now(shutdown: &Arc<Shutdown>, which: ShutdownSignal) -> ! {
-    let connections = lock(&shutdown.net)
-        .as_ref()
-        .map_or(0, |net| net.connections_in_flight());
-    eprintln!(
-        "   abandoned   {connections} connection{} in flight",
-        if connections == 1 { "" } else { "s" },
-    );
+    if shutdown.drains {
+        let connections = lock(&shutdown.net)
+            .as_ref()
+            .map_or(0, |net| net.connections_in_flight());
+        eprintln!(
+            "   abandoned   {connections} connection{} in flight",
+            if connections == 1 { "" } else { "s" },
+        );
+    }
     shutdown.end_children();
     crate::stdio::settle();
     crate::observe::exiting();
     std::process::exit(which.exit_code());
 }
 
-pub fn registrations(shutdown: Option<&Arc<Shutdown>>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    Op::ALL
-        .iter()
-        .map(|op| {
-            let handler: Arc<dyn HostHandler> = Arc::new(Operation {
-                op: *op,
-                shutdown: shutdown.cloned(),
-            });
-            (op.declaration(), handler)
-        })
-        .collect()
-}
-
-pub fn register(registry: &mut HostRegistry, shutdown: Option<&Arc<Shutdown>>) {
-    for (op, handler) in registrations(shutdown) {
-        match shutdown {
-            Some(_) => registry.register(op, handler),
-            None => registry.register_withheld(op, handler, crate::process::ONLY_A_RUN),
-        }
-    }
-}
-
-operations! {
-    what "signal";
-    path "signal";
-    Stopping = "stopping",
-    DeadlineMs = "deadline_ms",
-    Hangup = "hangup",
-    User1 = "user1",
-    User2 = "user2",
-    Resized = "resized",
-}
-
-impl Op {
-    /// The signal an operation asks about, which the stop's two readings do not.
-    pub fn asks(self) -> Option<Asked> {
-        match self {
-            Op::Stopping | Op::DeadlineMs => None,
-            Op::Hangup => Some(Asked::Hangup),
-            Op::User1 => Some(Asked::User1),
-            Op::User2 => Some(Asked::User2),
-            Op::Resized => Some(Asked::WindowChange),
-        }
-    }
-
-    pub fn declaration(self) -> HostOp {
-        HostOp {
-            effect: Symbol::new(EFFECT),
-            op: Symbol::new(self.name()),
-            resource: HostResource::Any,
-            determinism: Determinism::Nondeterministic,
-            // An ask takes the arrival it answers, so a second one answers otherwise.
-            linearity: match self.asks() {
-                None => Linearity::Repeatable,
-                Some(_) => Linearity::AtMostOnce,
-            },
-            blocking: false,
-            secrets: false,
-            path: self.path(),
-        }
-    }
-}
-
-struct Operation {
-    op: Op,
-    shutdown: Option<Arc<Shutdown>>,
-}
-
-impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        if !req.args.is_empty() {
-            return Err(arity(self.op, req.args.len(), req.span));
-        }
-        // A withheld registration is never resolved, so this is a dispatch bug.
-        let Some(shutdown) = &self.shutdown else {
-            return Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!(
-                    "{} was dispatched to a handler this run withheld",
-                    self.op.what()
-                ),
-            )
-            .primary(req.span, "performed here")
-            .note("`ply test` registers `signal` withheld, and a withheld registration is in no binding index")
-            .note("this is a defect in Ply's host dispatch rather than in the program"));
-        };
-        Ok(HostAnswer::Value(match (self.op, self.op.asks()) {
-            (_, Some(which)) => Value::Bool(
-                shutdown
-                    .arrived(which)
-                    .map_err(|e| unheard(self.op, which, &e, req.span))?,
-            ),
-            (Op::DeadlineMs, None) => Value::Int(shutdown.deadline_ms()),
-            (_, None) => Value::Bool(shutdown.stopping()),
-        }))
-    }
-}
-
+/// What an ask that could not install its handler fails the run with, naming the operation `what`.
 #[cold]
-fn unheard(op: Op, which: Asked, e: &std::io::Error, span: Span) -> Diagnostic {
+pub fn err_unheard(what: &str, which: Asked, e: &std::io::Error, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{} could not listen for SIG{}: {e}", op.what(), which.name()),
+        format!("{what} could not listen for SIG{}: {e}", which.name()),
     )
     .primary(span, "asking about a signal installs its handler")
     .note("without the handler the signal would do what the platform does with it, so the ask is refused rather than answered `false`")
-}
-
-#[cold]
-fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("{} was performed with {got} arguments and takes none", op.what()),
-    )
-    .primary(span, "this perform reached the host handler")
-    .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
 }
 
 /// The guarded state has no invariant a panicking caller can break, so recovering is correct.

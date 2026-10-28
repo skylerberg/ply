@@ -1,89 +1,31 @@
-//! The runtime's machines, as the one capability the program's commands drive: a label's machine
-//! loads the target rooted at a path, binds the hosts an entry may reach, enters it, and tears
-//! the binding down, and every answer crosses as a value. `run` drives a whole program this way;
-//! the other commands' batches are their own effects over the same thread.
+//! What the commands that enter programs share over `std.machine`: every group of §14's flags as
+//! one record, the grants and the runs a command makes of them, and a runtime failure placed in the
+//! program a front end holds. Which root runs, what it is handed and what its answer means are each
+//! command's own.
 
-import compiler.load (LoadedAnalysis)
 import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
 import surface (range_of)
-import compiler.check.resolve.tables (Diag)
-import diagnostic (Place, Raised)
+import compiler.check.resolve.tables (Diag, Label)
+import compiler.check.types (Atom, RNamed, RSingleton, RVar, RAny)
+import compiler.front.rows (Dump, EmitterRoot, ModuleSpan)
+import compiler.syntax.parsing (no_module)
+import compiler.syntax.type_syntax (MWrite)
+import diagnostic (Place, Raised, diag_of, noted, shown)
 import entry (Main, Module)
+import std.bin
 import std.json (Json)
-import std.value (Value)
+import std.list
+import std.machine as entering
+import std.value (Value, VList)
+import std.value
 import sim.plan
 import sim.plan (Seed)
+import sim.recording (Step, AAtom, AVar, AHold)
 import std.string
 
-/// What the Rust side loads, binds, enters and tears down, in that order and each once. The
-/// binding lives on the thread the entry runs on, which is why binding and entering are two
-/// operations: what a run may reach has to be disclosed before it reaches any of it.
-pub nondet effect machine {
-  write configure[m](options: Options) -> Unit
-  /// The program the caller loaded and compiled: its front end and the library of its unit.
-  read load[m](root: String, front: LoadedAnalysis, library: String) -> Result<Read, Refusal>
-  /// The program an artifact holds, from the parts of it this side read out and checked: its
-  /// runnable, the entry its namespace names, the closure it prints, the hash each name is under,
-  /// and the library its unit was compiled into here.
-  read opened[m](path: String, runnable: Bytes, entry: String, closure: List<Closed>, names: List<Hashed>, library: String) -> Result<Unit, Refusal>
-  /// The load `entry` filed, over this run's own files; `None` when the entry does not read or does
-  /// not fit the walk, and the label is left for a load over a front end.
-  read reuse[m](root: String, walked: WalkKey, entry: Bytes) -> Option<Read>
-  /// The entry a later run's `reuse` takes `front` and `library` back from, once a load over them
-  /// held; `None` when the entry would not read back whole, and so is not worth filing.
-  read filed[m](front: LoadedAnalysis, library: String) -> Option<Bytes>
-  read reload[m](front: LoadedAnalysis, library: String) -> Result<Read, Refusal>
-  /// The value of the nullary definition `--config-schema` names, entered on the loaded target's
-  /// own unit before anything is bound.
-  read schema[m](name: String) -> Result<Value, List<Diag>>
-  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
-  write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Called
-  read accounting[m]() -> Accounting
-  write drop[m]() -> Unit
-}
-
-/// `machine` answered from what it is handed alone: no host, clock, disk read or reuse.
-pub effect hermetic_machine {
-  write configure[m](options: Options) -> Unit
-  read load[m](root: String, front: LoadedAnalysis, library: String) -> Result<Read, Refusal>
-  read opened[m](path: String, runnable: Bytes, entry: String, closure: List<Closed>, names: List<Hashed>, library: String) -> Result<Unit, Refusal>
-  read reuse[m](root: String, walked: WalkKey, entry: Bytes) -> Option<Read>
-  read filed[m](front: LoadedAnalysis, library: String) -> Option<Bytes>
-  read reload[m](front: LoadedAnalysis, library: String) -> Result<Read, Refusal>
-  read schema[m](name: String) -> Result<Value, List<Diag>>
-  read bound[m](entry: String, config: Configured) -> Result<Bound, Refusal>
-  write enter[m]() -> Ended
-  read call[m](name: String, args: List<Value>) -> Called
-  read accounting[m]() -> Accounting
-  write drop[m]() -> Unit
-}
-
-/// A run's walk: the key it hashes to with the toolchain, which names its entry, and the files
-/// `reuse` places that entry over, the modules it read, the root's and then each dependency's, and
-/// the manifests. A front end places the shipped modules it pulled between the two, and the filed
-/// answer says which modules those were.
-pub type WalkKey = { key: String, modules: List<Place>, manifests: List<Place> }
-
-/// What the machine measured since it was last asked: the calls the runtime counted, the wall
-/// clock those calls took, the reuse counters they left behind, and the most any entry held when
-/// its root returned. Reading it resets it.
-pub type Accounting = { steps: Int, micros: Int, counters: Counters, held: Held }
-
-/// What a run still held when an entry's root body returned, before its production region drained:
-/// heap objects standing for a runtime value (a task's handle), the tasks and task stacks the
-/// region still keeps, and frame tables. Each grows with the work a long-running program does if
-/// something is never given back.
-pub type Held = { bridges: Int, scheduled: Int, task_stacks: Int, frame_tables: Int }
-
-/// One call's value, or what it raised, and what the entry ended with.
-pub type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
-
-// --- What a machine is configured with ----------------------------------------
-
-/// The host a run binds, and how: every group of §14's flags as a value. The program parses and
-/// validates; the machine reads typed fields. This is the one record every machine-driving
-/// command shares; each reads the subset its command takes.
+/// What a run binds, and how: every group of §14's flags as a value. The program parses and
+/// validates; the grants and runs it makes of them read typed fields. This is the one record every
+/// command that enters a program shares; each reads the subset its command takes.
 pub type TlsCredential = { name: String, cert: String, key: String }
 pub type Named = { name: String, path: String }
 
@@ -99,7 +41,7 @@ pub type Configured = {
   opened: Bool,
 }
 
-/// What a run with no `--host` binds, whatever its flags or the environment hold.
+/// What a run no source configured binds.
 pub fn unconfigured() -> Configured = { values: [], schema: None, opened: false }
 
 /// The search a simulated test or law runs, as §9's flags say it: every field is in the key of what
@@ -115,7 +57,6 @@ pub type SimulationOptions = {
 pub type TraceOptions = { sink: String, level: String }
 
 pub type Options = {
-  host: Bool,
   /// `--json`: stdout is the one document's, so the entry's own lines go to stderr.
   json: Bool,
   tls: List<TlsCredential>,
@@ -124,8 +65,7 @@ pub type Options = {
   mtls: List<String>,
   fs: List<Named>,
   exec: List<Named>,
-  /// The privileged families `--allow` granted the program this run drives, by name; a host lends
-  /// only what the program declares.
+  /// The privileged families `--allow` granted the program this run drives, by name.
   allow: List<String>,
   config: ConfigOptions,
   trace: TraceOptions,
@@ -139,12 +79,11 @@ pub type Options = {
   argv: List<String>,
 }
 
-/// Every default a machine-driving command takes when its flags say nothing. One record, so a
-/// program that is not the CLI, a test harness among them, can drive a machine without inventing
-/// a second copy of the defaults, and the CLI's own parse below spreads over it.
+/// Every default a command that enters a program takes when its flags say nothing. One record, so
+/// a program that is not the CLI, a test harness among them, can enter one without inventing a
+/// second copy of the defaults, and the CLI's own parse below spreads over it.
 pub fn default_options() -> Options =
   {
-    host: false,
     json: false,
     tls: [],
     trust: [],
@@ -161,6 +100,242 @@ pub fn default_options() -> Options =
     seed: None,
     profile: "development",
     argv: [],
+  }
+
+/// Every operation of the capability a command enters programs with.
+pub effect set Entering = {entering::machine.open, entering::machine.bind, entering::machine.hosting, entering::machine.enter, entering::machine.moved, entering::machine.unbind, entering::machine.close}
+
+// --- Grants and runs --------------------------------------------------------------
+
+/// How deeply an entry's calls may nest.
+pub fn max_calls() -> Int = 10000
+
+/// A root or a program a run is lent, as `std.machine` names one.
+pub fn lent(n: Named) -> entering::Named = { name: n.name, path: n.path }
+
+/// How a run meets `INT` and `TERM`. `Unheard` installs nothing, so the platform ends the
+/// process; `Ends` ends the run's children and exits with the code the signal would have given;
+/// `Drains` stops accepting and drains within `--drain-lead-ms` and `--drain-ms`.
+pub type Stop = | Unheard | Ends | Drains
+
+/// `--drain-lead-ms` and `--drain-ms`.
+pub type Drain = { lead_ms: Int, drain_ms: Int }
+
+/// What `ply run` lends the program it runs: its roots, its programs, its command line, its
+/// credentials, its configuration, its sink, the families `--allow` names, and its `stop`.
+pub fn run_grants(o: Options, config: Configured, stop: Stop) -> entering::Grants =
+  {
+    ..entering::no_grants(),
+    fs: o.fs.map(lent),
+    exec: o.exec.map(lent),
+    allow: o.allow,
+    argv: Some(o.argv),
+    stderr: o.json,
+    given: given_of(o.tls, o.trust, o.mtls, config).push({
+      name: "trace",
+      fields: [o.trace.sink, o.trace.level],
+    }).concat(match stop {
+      Unheard -> [],
+      Ends -> [{ name: "end", fields: [] }],
+      Drains -> [{ name: "drain", fields: [o.drain_lead_ms.to_string(), o.drain_ms.to_string()] }],
+    }),
+  }
+/// What the families still served in Rust read of a run: its credentials, the trust it adds to the
+/// roots, the listeners that require a client certificate, and its configuration.
+pub fn given_of(
+  tls: List<TlsCredential>,
+  trust: List<String>,
+  mtls: List<String>,
+  config: Configured,
+) -> List<entering::Given> =
+  tls.map(|c: TlsCredential| { name: "tls", fields: [c.name, c.cert, c.key] }).concat(
+    trust.map(|t: String| { name: "trust", fields: [t] }),
+  ).concat(
+    mtls.map(|m: String| { name: "mtls", fields: [m] }),
+  ).concat(
+    config.values.map(|v: { key: String, value: String, secret: Bool }|
+      { name: "config", fields: [v.key, v.value, if v.secret { "secret" } else { "plain" }] }),
+  ).concat(match config.schema {
+    Some(s) ->
+      [
+        {
+          name: "schema",
+          fields: s.keys.fold(
+            [s.function],
+            |acc: List<String>, k: { name: String, shape: String }| acc.push(k.name).push(k.shape),
+          ),
+        },
+      ],
+    None -> [],
+  }).concat(if config.opened { [{ name: "configured", fields: [] }] } else { [] })
+
+/// An atom of a front end's row, as an entry's declared footprint holds it.
+pub fn atom_of(a: Atom) -> entering::Atom =
+  {
+    effect: String::of_bytes_lossy(a.effect),
+    resource: match a.resource {
+      RNamed(name) -> entering::Labelled(String::of_bytes_lossy(name)),
+      RSingleton -> entering::Singleton,
+      RVar(n) -> entering::Variable(n),
+      RAny -> entering::Every,
+    },
+    write: match a.mode { MWrite -> true, _ -> false },
+    op: match a.op { Some(op) -> Some(String::of_bytes_lossy(op)), None -> None },
+  }
+
+/// The root a load of `path` is rooted at, as a report prints it: a source file's directory, or the
+/// path with every `.` component dropped, `.` where nothing is left.
+pub fn project_root(path: String) -> String = {
+  let parts = path.split("/").filter(|p: String| p != ".");
+  let kept = if path.ends_with(".ply") {
+    range(0, parts.len() - 1).fold([], |acc: List<String>, i: Int| acc.push(parts.at_or(i, "")))
+  } else { parts };
+  let joined = String::join(kept, "/");
+  if joined == "" { if path.starts_with("/") { "/" } else { "." } } else { joined }
+}
+
+/// Where each root a unit of `d` is entered at is written, which a failure's sites are offsets
+/// from.
+pub fn roots_of(d: Dump) -> Map<Bytes, ModuleSpan> =
+  d.emitter_roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, r: EmitterRoot|
+    m.insert(r.root, r.at))
+
+/// The PLV1 list a root is handed, of `values`.
+pub fn arguments_of(values: List<Value>) -> Bytes =
+  match value::encode(VList(values)) { Some(b) -> b, None -> b"" }
+
+// --- Failures placed ------------------------------------------------------------------
+
+/// A runtime diagnostic's codes that say Ply failed rather than the program: a test that ends with
+/// one is `panicked`, and a claim's point says nothing.
+pub fn is_defect(code: Bytes) -> Bool =
+  code == b"E0505" || code == b"E0427" || code == b"E0439" || code == b"E0415"
+
+/// `f` as a report renders it: each site placed in the module its root is written in, at an offset
+/// from where that root's definition starts. A raise with no place says what failed and not what
+/// was running, so it names `entry`, where there is one.
+pub fn placed(
+  f: entering::Failure,
+  roots: Map<Bytes, ModuleSpan>,
+  entry: String,
+) -> Raised / {abort.raise} = {
+  let labels = f.labels.map(|l: entering::Label| {
+    let text = Bytes::of_string(l.text);
+    match site_of(l.site, roots) {
+      Some(at) ->
+        { module: at.module, start: at.start, end: at.end, primary: l.primary, text: text },
+      None -> { module: no_module(), start: 0, end: 0, primary: l.primary, text: text },
+    }
+  });
+  let diag = diag_of(severity_word(f.severity), f.code, f.message, labels, f.notes);
+  let unplaced = entry != "" && labels.all(|l: Label| l.module == no_module());
+  {
+    diag: if unplaced { noted(diag, [unplaced_note(entry)]) } else { diag },
+    values: f.values.map(entering::value_of),
+  }
+}
+
+/// `f`, which no program wrote, as a report renders it: a binding's refusal among them.
+pub fn unplaced(f: entering::Failure) -> Diag / {abort.raise} = shown(placed(f, Map::new(), ""))
+
+/// Where a site lies in the modules: its root's place, and the site's offsets from it.
+pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, ModuleSpan>) -> Option<ModuleSpan> =
+  match site {
+    None -> None,
+    Some(s) -> match roots.get(Bytes::of_string(s.root)) {
+      Some(root) ->
+        Some({ module: root.module, start: root.start + s.start, end: root.start + s.end }),
+      None -> None,
+    },
+  }
+
+fn severity_word(s: entering::Severity) -> String =
+  match s { entering::Error -> "error", entering::Warning -> "warning", entering::Note -> "note" }
+
+fn unplaced_note(entry: String) -> String =
+  "this raise has no place in the source: it happened while `" ++ entry
+    ++ "` was running, in code the runtime runs on the program's behalf"
+
+/// A scheduling point as `sim` reads it, its site placed as `placed` places a label's.
+pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
+  {
+    region: s.region,
+    task: s.task,
+    enabled: s.enabled,
+    choice: s.choice,
+    accesses: s.accesses.map(|a: entering::Access|
+      match a {
+        entering::AAtom(x) -> AAtom(x),
+        entering::AVar(x) -> AVar(x),
+        entering::AHold(x) -> AHold(x),
+      }),
+    site: {
+      definition: s.definition,
+      span: match site_of(s.site, roots) {
+        Some(at) -> at,
+        None -> { module: no_module(), start: 0, end: 0 },
+      },
+    },
+    stamp: s.stamp,
+  }
+
+/// One call's value, or what it raised, and what the entry ended with.
+pub type Called = { answer: Result<Value, Raised>, warnings: List<Diag> }
+
+/// `name` of `unit` called with `args` under `run`: its answer or what it raised, and what the
+/// entry ended with.
+pub fn called(
+  unit: Int,
+  roots: Map<Bytes, ModuleSpan>,
+  name: String,
+  args: List<Value>,
+  run: entering::Run,
+) -> Called / {entering::machine.enter, abort.raise} = {
+  let o = entering::machine.enter(unit, name, arguments_of(args), run);
+  { answer: answer_of(o, roots, name), warnings: warnings_of(o, roots) }
+}
+
+/// What an entry's outcome says of its answer: the value it answered, or what it raised, Ply's
+/// defect where the runtime failed rather than the program. An entry that chose its exit code
+/// raised nothing, and answers `()`, as `process.exit` does.
+pub fn answer_of(
+  o: entering::Outcome,
+  roots: Map<Bytes, ModuleSpan>,
+  name: String,
+) -> Result<Value, Raised> / {abort.raise} =
+  if o.exit != None { Ok(value::VUnit) } else {
+    match o.ended {
+      entering::Answered(bytes) -> match value::decode(bytes) {
+        Some(v) -> Ok(v),
+        None -> Err(defect(name, "answered bytes that are no value")),
+      },
+      entering::Failed(f) -> Err(placed(f, roots, name)),
+      entering::Panicked(message) -> Err(defect(name, "panicked: " ++ message)),
+      entering::NoRoot -> Err(defect(name, "is no root of the unit it was entered on")),
+      entering::Unanswerable(why) -> Err(defect(name, "answered, and " ++ why)),
+    }
+  }
+
+/// What an entry ended with, placed.
+pub fn warnings_of(
+  o: entering::Outcome,
+  roots: Map<Bytes, ModuleSpan>,
+) -> List<Diag> / {abort.raise} = o.warnings.map(|w: entering::Failure| shown(placed(w, roots, "")))
+
+/// A unit the runtime could not open, which says why: one compiled against another runtime, among
+/// others.
+pub fn unloaded(why: String) -> Diag =
+  diag_of("error", "E0450", "the unit could not be loaded: " ++ why, [], [
+    "a unit is compiled against the runtime that opens it; this is Ply's fault",
+  ])
+
+/// Ply failed entering `name`, rather than the program.
+pub fn defect(name: String, why: String) -> Raised =
+  {
+    diag: diag_of("error", "E0505", "`" ++ name ++ "` " ++ why, [], [
+      "this is Ply's fault, not the program's",
+    ]),
+    values: [],
   }
 
 // --- Tests ------------------------------------------------------------------
@@ -198,7 +373,61 @@ test "the defaults are one record" {
   assert_eq(default_options().trace.level, "info")
 }
 
-// --- What the Rust side answers with ----------------------------------------
+test "a run is lent what its flags name, and the stop it meets a signal with" {
+  let quiet = run_grants(
+    { ..default_options(), allow: ["shipped"], argv: ["a"] },
+    unconfigured(),
+    Unheard,
+  );
+  assert_eq(quiet.argv, Some(["a"]));
+  assert_eq(quiet.allow, ["shipped"]);
+  assert_eq(quiet.given.map(|g: entering::Given| g.name), ["trace"]);
+  let serving = run_grants(
+    {
+      ..default_options(),
+      fs: [{ name: "cwd", path: "." }],
+      argv: ["a"],
+      tls: [{ name: "api", cert: "c.pem", key: "k.pem" }],
+      drain_lead_ms: 250,
+    },
+    { values: [{ key: "port", value: "80", secret: false }], schema: None, opened: true },
+    Drains,
+  );
+  assert_eq(serving.fs, [{ name: "cwd", path: "." }]);
+  assert_eq(serving.given.map(|g: entering::Given| g.name), [
+    "tls",
+    "config",
+    "configured",
+    "trace",
+    "drain",
+  ]);
+  assert_eq(serving.given.at(4), Some({ name: "drain", fields: ["250", "30000"] }));
+  let starting = run_grants(default_options(), unconfigured(), Ends);
+  assert_eq(starting.given.at(1), Some({ name: "end", fields: [] }))
+}
+test "a failure's sites are placed at their roots, and an unplaced raise names its entry" {
+  let roots = Map::new().insert(b"m.f", { module: 0, start: 100, end: 120 });
+  let failure: entering::Failure = {
+    code: "E0502",
+    severity: entering::Error,
+    message: "boom",
+    labels: [{ site: Some({ root: "m.f", start: 3, end: 7 }), primary: true, text: "here" }],
+    notes: [],
+    values: [],
+  };
+  let r = placed(failure, roots, "m.main");
+  assert_eq(r.diag.labels, [{ module: 0, start: 103, end: 107, primary: true, text: b"here" }]);
+  assert_eq(r.diag.notes, 0);
+  let lost = placed(
+    { ..failure, labels: [{ site: None, primary: true, text: "here" }] },
+    roots,
+    "m.main",
+  );
+  assert_eq(lost.diag.labels.map(|l: Label| l.module), [no_module()]);
+  assert_eq(lost.diag.notes, 1)
+}
+
+// --- What a command runs over ----------------------------------------------
 
 pub type Refusal = {
   diags: List<Diag>,
@@ -211,7 +440,7 @@ pub type Refusal = {
 /// What this run runs: a project the front end loaded, or an artifact opened from a file.
 pub type Target = | Project(Program) | Deployed(Artifact)
 
-/// What the machine read of the program it loaded.
+/// What a run read of the program it loaded.
 pub type Read = {
   /// The root the load was rooted at, as a report prints it.
   root: String,
@@ -240,26 +469,22 @@ pub fn program_of(read: Read, mains: List<Main>, modules: List<Module>) -> Targe
 
 pub type Artifact = { path: String, digest: String, entry: String, definitions: Int }
 
-/// A module of an artifact's closure, and a name it holds with the hash of what it names.
-pub type Closed = { path: String, text: Bytes }
-pub type Hashed = { name: String, hash: Bytes }
-
-/// What the binding discloses before anything runs. A hermetic run discloses nothing, because
-/// there is nothing it could reach.
+/// What the binding discloses before anything runs. A run that performs nothing of the host
+/// discloses nothing, because there is nothing it could reach.
 pub type Bound = {
-  hermetic: Bool,
   operations: Int,
   digest: String,
   /// The banner the trace sink writes for itself.
   trace: Option<String>,
-  /// Only a run with `--host` listens for a signal.
+  /// Only a run that meets a stop itself names the signals it stops on.
   signals: Option<Signals>,
 }
 
-pub type Signals = { names: List<String>, lead_ms: Int, drain_ms: Int }
+/// The signals a run stops on, and its drain where it drains rather than ending at once.
+pub type Signals = { names: List<String>, drain: Option<Drain> }
 
-/// What the machine reused. `in_place` is `None` when nothing was updated at all, which is not a
-/// ratio of zero.
+/// What a run reused. `in_place` is `None` when nothing was updated at all, which is not a ratio
+/// of zero.
 pub type Counters = { updates: Int, updates_in_place: Int, in_place: Option<Decimal> }
 
 /// What was in flight when a signal asked the run to stop; `None` when nobody asked.
@@ -269,6 +494,9 @@ pub type Stopping = { signal: Option<String>, listeners: Int, connections: Int, 
 pub type Teardown = { lead_ms: Int, drain_ms: Int, spans_left_open: Int }
 
 pub type Trace = { events: Int, spans: Int, abandoned: Int, flushed: Bool }
+
+derive bin for Stopping
+derive bin for Trace
 
 /// What the entry did, once the binding is torn down.
 pub type Ended = {
@@ -370,12 +598,11 @@ fn cut_pair(text: String) -> Option<(String, String)> / {abort.raise} =
 fn split_once(text: String, sep: String) -> Option<(String, String)> / {abort.raise} =
   match text.split_once(sep) { Some(cut) -> Some((cut.head, cut.tail)), None -> None }
 
-/// The whole options record, from the parsed line. Each command's machine reads the subset its
-/// flags cover; the parser already refused a flag the command does not take.
+/// The whole options record, from the parsed line. Each command reads the subset its flags cover;
+/// the parser already refused a flag the command does not take.
 pub fn options_from(p: Parsed) -> Options / {abort.raise} =
   {
     ..default_options(),
-    host: has(p, "host"),
     json: has(p, "json"),
     tls: creds(p),
     trust: values_of(p, "trust"),

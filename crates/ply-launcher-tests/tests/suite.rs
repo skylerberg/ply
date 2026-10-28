@@ -13,14 +13,6 @@ use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
 struct Idle;
 
 impl HostRuntime for Idle {
-    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        Vec::new()
-    }
-
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
     }

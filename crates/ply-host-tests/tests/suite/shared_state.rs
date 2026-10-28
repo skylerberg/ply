@@ -1,36 +1,17 @@
 // A `Value::Record` holds an `Arc` and a `Value` is not `Send`, by `ply-core`'s design.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::host::{
-    HostAnswer, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
-};
-use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, TaskId, Value, codes};
+use ply_core::host::MachineId;
+use ply_core::{Diagnostic, Span, TaskId, codes};
 use ply_host::config::{Entry, Snapshot};
-use ply_host::pool::Pooled;
 use ply_host::signal::{Accepting, Bounds, Shutdown, ShutdownSignal};
-use ply_host::tcp::{Net, TcpHost};
+use ply_host::tcp::TcpHost;
 use ply_host::trace::sink::Recording;
-use ply_host::trace::{Clock, Level, Op, Outcome, OwnedRecord, RecordKind, Sink, Trace};
+use ply_host::trace::spans::err_unbalanced;
+use ply_host::trace::{Clock, Level, Outcome, OwnedRecord, RecordKind, Sink, Trace};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
-
-struct NoRuntime;
-
-impl HostRuntime for NoRuntime {
-    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn park(&self) -> Result<(), Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-    fn block_on(&self, _: Pending) -> Result<Value, Diagnostic> {
-        unreachable!("`trace` never answers `Pending`")
-    }
-}
 
 /// Ascends by one per read, so golden assertions hold nothing that moves with the wall clock.
 #[derive(Default)]
@@ -45,7 +26,6 @@ impl Clock for Ticking {
 struct Driver {
     trace: Arc<Trace>,
     sink: Arc<Recording>,
-    declarations: Vec<HostOp>,
 }
 
 fn driver() -> Driver {
@@ -54,13 +34,7 @@ fn driver() -> Driver {
         Arc::clone(&sink) as Arc<dyn Sink>,
         Arc::new(Ticking::default()),
     ));
-    let mut registry = HostRegistry::new();
-    ply_host::trace::register(&mut registry, Arc::clone(&trace));
-    Driver {
-        declarations: registry.ops().cloned().collect(),
-        trace,
-        sink,
-    }
+    Driver { trace, sink }
 }
 
 /// One entry point of a run, which is what a `ply test` worker is.
@@ -87,94 +61,34 @@ impl EntryPoint {
 }
 
 impl Driver {
-    fn perform(
-        &self,
-        who: EntryPoint,
-        op: Op,
-        channel: &str,
-        args: &[Value],
-    ) -> Result<Value, Diagnostic> {
-        let index = Op::ALL
-            .iter()
-            .position(|candidate| *candidate == op)
-            .expect("every operation is registered");
-        let handler = ply_host::trace::handler(op, Arc::clone(&self.trace));
-        let request = HostRequest {
-            atom: EffectAtom::new(
-                Symbol::new(ply_host::trace::EFFECT),
-                Resource::Named(Symbol::new(channel)),
-                Mode::Write,
-            ),
-            op: &self.declarations[index],
-            args,
-            span: Span::DUMMY,
-            machine: who.machine,
-            task: who.task,
-            declared: None,
-        };
-        match handler.call(&NoRuntime, &request)? {
-            HostAnswer::Value(value) => Ok(value),
-            HostAnswer::Pending(_) => panic!("`trace` never waits on a peer"),
-        }
+    fn enter(&self, who: EntryPoint, channel: &str, name: &str) -> i64 {
+        self.trace
+            .enter((who.machine, who.task), channel, name, &[])
     }
 
-    fn enter(&self, who: EntryPoint, channel: &str, name: &str) -> Value {
-        self.perform(
-            who,
-            Op::Enter,
+    /// `E0445`, as the real handler's native fails the run, where `id` names no span `who` holds.
+    fn exit(&self, who: EntryPoint, channel: &str, id: i64) -> Result<(), Diagnostic> {
+        self.trace
+            .exit((who.machine, who.task), channel, id, Outcome::Ok)
+            .map_err(|why| err_unbalanced(Span::DUMMY, "`trace.exit`", id, &why))
+    }
+
+    fn event(&self, who: EntryPoint, channel: &str, name: &str) {
+        self.trace.record(
+            (who.machine, who.task),
+            RecordKind::Event,
+            Level::Info,
             channel,
-            &[Value::str(name), Value::empty_map()],
-        )
-        .expect("`trace.enter` never refuses")
-    }
-
-    fn exit(&self, who: EntryPoint, channel: &str, span: Value) -> Result<Value, Diagnostic> {
-        self.perform(who, Op::Exit, channel, &[span, ctor("Ok", Vec::new())])
-    }
-
-    fn event(&self, who: EntryPoint, channel: &str, name: &str) -> Value {
-        self.perform(
-            who,
-            Op::Event,
-            channel,
-            &[
-                ctor("Info", Vec::new()),
-                Value::str(name),
-                Value::empty_map(),
-            ],
-        )
-        .expect("`trace.event` never refuses")
+            name,
+            None,
+            None,
+            &[],
+        );
     }
 
     fn records(&self) -> Vec<OwnedRecord> {
         self.sink.records()
     }
-}
-
-fn ctor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(format!("std.trace.{name}"), args)
-}
-
-fn span_id(value: &Value) -> i64 {
-    match value {
-        Value::Record(fields) => match fields.get(&Symbol::new("id")) {
-            Some(Value::Int(id)) => *id,
-            other => panic!("a `Span` carries an `Int` id, not {other:?}"),
-        },
-        other => panic!("`trace.enter` answers a record, not {}", other.type_name()),
-    }
-}
-
-/// A span id is an ordinary, forgeable record; `E0445` when it names nothing this task holds.
-fn forged(id: i64, channel: &str) -> Value {
-    Value::Record(Arc::new(
-        [
-            (Symbol::new("id"), Value::Int(id)),
-            (Symbol::new("channel"), Value::str(channel)),
-        ]
-        .into_iter()
-        .collect(),
-    ))
 }
 
 fn rendered(diagnostic: &Diagnostic) -> String {
@@ -196,10 +110,10 @@ fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
     // `b` opens and closes a whole span while `a`'s is open.
     let outer_b = d.enter(b, "items", "list_items");
     d.event(b, "items", "scanned");
-    d.exit(b, "items", outer_b.clone())
+    d.exit(b, "items", outer_b)
         .expect("`b` closes its own span");
     d.event(a, "orders", "priced");
-    d.exit(a, "orders", outer_a.clone())
+    d.exit(a, "orders", outer_a)
         .expect("`a`'s span is still open and still `a`'s");
 
     let records = d.records();
@@ -218,12 +132,12 @@ fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
     );
     assert_eq!(
         by_name("scanned").span,
-        span_id(&outer_b),
+        outer_b,
         "`b`'s event landed in the wrong span"
     );
     assert_eq!(
         by_name("priced").span,
-        span_id(&outer_a),
+        outer_a,
         "`a`'s event landed in the wrong span, so `b`'s exit closed `a`'s span"
     );
     // An `Abandoned` here would mean one entry point's exit swept up the other's.
@@ -288,7 +202,7 @@ fn a_task_resumed_later_records_under_the_span_it_opened() {
         .expect("task two closes its own");
     // Task one resumes. Its next record must be in `held` and nothing else.
     d.event(one, "orders", "resumed");
-    d.exit(one, "orders", held.clone())
+    d.exit(one, "orders", held)
         .expect("task one's span is still open");
 
     let records = d.records();
@@ -297,8 +211,7 @@ fn a_task_resumed_later_records_under_the_span_it_opened() {
         .find(|r| r.name == "resumed")
         .expect("the resumed event was written");
     assert_eq!(
-        resumed.span,
-        span_id(&held),
+        resumed.span, held,
         "a continuation resumed after another task's span attached to the wrong span"
     );
     assert_eq!(
@@ -311,14 +224,14 @@ fn a_task_resumed_later_records_under_the_span_it_opened() {
 fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work() {
     // Alone: the first span of this entry point is 1.
     let d = driver();
-    let alone = span_id(&d.enter(entry_point(), "orders", "place_order"));
+    let alone = d.enter(entry_point(), "orders", "place_order");
 
     // Beside a footprint-disjoint entry point that opened two spans on another channel first.
     let d = driver();
     let other = entry_point();
     let _ = d.enter(other, "items", "list_items");
     let _ = d.enter(other, "items", "featured");
-    let beside = span_id(&d.enter(entry_point(), "orders", "place_order"));
+    let beside = d.enter(entry_point(), "orders", "place_order");
 
     assert_eq!(alone, 1);
     assert_eq!(
@@ -329,9 +242,9 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
     // Within one entry point they still ascend and are never reused.
     let d = driver();
     let mine = entry_point();
-    let first = span_id(&d.enter(mine, "orders", "a"));
-    let second = span_id(&d.enter(mine, "orders", "b"));
-    let third = span_id(&d.enter(mine.in_task(1), "orders", "c"));
+    let first = d.enter(mine, "orders", "a");
+    let second = d.enter(mine, "orders", "b");
+    let third = d.enter(mine.in_task(1), "orders", "c");
     assert_eq!(
         [first, second, third],
         [1, 2, 3],
@@ -341,12 +254,13 @@ fn a_span_id_a_program_receives_does_not_move_with_a_disjoint_entry_points_work(
 
 #[test]
 fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
-    let program_span = forged(1, "orders");
+    // A `Span` is an ordinary, forgeable record, so a program may name an id it never opened.
+    let program_span = 1;
 
     // Alone.
     let d = driver();
     let alone = d
-        .exit(entry_point(), "orders", program_span.clone())
+        .exit(entry_point(), "orders", program_span)
         .expect_err("a forged span is `E0445`");
     assert_eq!(alone.code, codes::SPAN_UNBALANCED);
     assert!(
@@ -360,7 +274,7 @@ fn an_unbalanced_exit_is_diagnosed_from_the_entry_points_own_span_table() {
     let other = entry_point();
     let _ = d.enter(other, "items", "list_items");
     let beside = d
-        .exit(entry_point(), "orders", program_span.clone())
+        .exit(entry_point(), "orders", program_span)
         .expect_err("a forged span is `E0445`");
     assert_eq!(beside.code, codes::SPAN_UNBALANCED);
     assert!(
@@ -482,31 +396,19 @@ fn two_snapshots_in_one_process_do_not_see_each_other() {
     assert_eq!(Snapshot::unopened().get("SERVICE_REGION"), None);
 }
 
-fn listener_label() -> Resource {
-    Resource::Named(Symbol::new("listener"))
+const LISTENER: &str = "listener";
+
+fn listen(net: &TcpHost) -> i64 {
+    net.listen(LISTENER, 0, Span::DUMMY)
+        .expect("a loopback port")
 }
 
-fn settle(host: &TcpHost, answered: Result<HostAnswer, Diagnostic>) -> Value {
-    match answered.expect("the operation was accepted") {
-        HostAnswer::Value(value) => value,
-        HostAnswer::Pending(pending) => {
-            let until = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(value) = host.pool().poll(&pending).expect("this host's token") {
-                    return value;
-                }
-                assert!(Instant::now() < until, "`{pending}` never resolved");
-                let _ = host.pool().park_until(Duration::from_millis(20));
-            }
-        }
-    }
-}
-
-fn int(value: &Value) -> i64 {
-    match value {
-        Value::Int(i) => *i,
-        other => panic!("not an Int: {}", other.type_name()),
-    }
+/// What a listener's next `accept` answers, its job run here.
+fn accepted(net: &TcpHost, listener: i64) -> i64 {
+    let job = net
+        .accept(LISTENER, listener, Span::DUMMY)
+        .expect("the accept is taken");
+    ply_host::native::int_of(&job().expect("the accept ran")).expect("a handle")
 }
 
 fn until_phase_two(shutdown: &Arc<Shutdown>) {
@@ -564,34 +466,7 @@ fn a_host_with_no_coordinator_is_never_stopping() {
     );
 }
 
-/// The registrations are the same either way, so `ply hosts` lists them; only binding differs.
-#[test]
-fn a_withheld_signal_handler_refuses_rather_than_answering() {
-    let withheld = ply_host::signal::registrations(None);
-    assert_eq!(withheld.len(), ply_host::signal::Op::ALL.len());
-    let (declaration, handler) = &withheld[0];
-    assert_eq!(declaration.path, "ply_host::signal::stopping");
-    let request = HostRequest {
-        atom: EffectAtom::new(
-            Symbol::new(ply_host::signal::EFFECT),
-            Resource::Singleton,
-            Mode::Read,
-        ),
-        op: declaration,
-        args: &[],
-        span: Span::DUMMY,
-        machine: MachineId::next(),
-        task: None,
-        declared: None,
-    };
-    let Err(refused) = handler.call(&NoRuntime, &request) else {
-        panic!("a withheld handler has no flag to read and must refuse");
-    };
-    assert_eq!(refused.code, codes::INTERNAL_ERROR);
-    assert!(refused.message.contains("withheld"), "{}", refused.message);
-}
-
-/// `ply run --host` calls `signal::listen` well before `Host::stopping_on` wires the socket table.
+/// A run that listens calls `signal::listen` well before `Host::stopping_on` wires the socket table.
 #[test]
 fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     let shutdown = Shutdown::new(Bounds {
@@ -605,7 +480,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     // Wired to the coordinator exactly as `Hosts::open_stopping` wires them.
     let net = Arc::new(TcpHost::new());
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
-    let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
+    let listener = listen(&net);
 
     assert!(shutdown.stopping(), "the run is stopping");
     assert!(
@@ -614,10 +489,7 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
     );
 
     assert_eq!(
-        int(&settle(
-            &net,
-            net.accept(&listener_label(), listener, Span::DUMMY)
-        )),
+        accepted(&net, listener),
         0,
         "a run that was already stopping when the socket table arrived answers 0, which is what \
          ends a sequential accept loop"
@@ -634,20 +506,11 @@ fn a_signal_before_the_coordinator_is_wired_still_stops_accept() {
         drain: Duration::from_secs(5),
     });
     let late = Arc::new(TcpHost::new());
-    let listener = int(&settle(
-        &late,
-        late.listen(&listener_label(), 0, Span::DUMMY),
-    ));
+    let listener = listen(&late);
     assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
     shutdown.attach_net(Arc::clone(&late) as Arc<dyn Accepting>);
-    assert_eq!(
-        int(&settle(
-            &late,
-            late.accept(&listener_label(), listener, Span::DUMMY)
-        )),
-        0
-    );
+    assert_eq!(accepted(&late, listener), 0);
     assert_eq!(
         shutdown.at_stop().0,
         1,
@@ -663,16 +526,13 @@ fn a_signal_after_the_coordinator_is_wired_stops_accept() {
     });
     let net = Arc::new(TcpHost::new());
     shutdown.attach_net(Arc::clone(&net) as Arc<dyn Accepting>);
-    let listener = int(&settle(&net, net.listen(&listener_label(), 0, Span::DUMMY)));
+    let listener = listen(&net);
 
     assert!(shutdown.request(ShutdownSignal::Terminate));
     until_phase_two(&shutdown);
 
     assert_eq!(
-        int(&settle(
-            &net,
-            net.accept(&listener_label(), listener, Span::DUMMY)
-        )),
+        accepted(&net, listener),
         0,
         "a listener the drain closed answers 0, which is what ends a sequential accept loop"
     );

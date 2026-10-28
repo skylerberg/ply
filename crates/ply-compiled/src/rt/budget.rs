@@ -5,7 +5,12 @@ use super::*;
 /// The prologue's refusal: this call would nest past the budget the machine handed the entry.
 pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
-    let d = error("this call would nest past the machine's own bound on nested calls");
+    let depth = ctx.depth_bound;
+    let d = Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("recursion limit of {depth} nested calls exceeded"),
+    )
+    .primary(ctx.site(), "the call that overran it");
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
@@ -34,19 +39,20 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
 }
 
 /// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::fuel`] and [`Ctx::frames`] as this stack left them, whatever ran
-/// meanwhile, this stack the running one again and the floor its own.
+/// switches back, with [`Ctx::fuel`], [`Ctx::frames`] and [`Ctx::task`] as this stack left them,
+/// whatever ran meanwhile, this stack the running one again and the floor its own.
 ///
 /// # Safety
 /// As [`switch`], and `ctx` is the context both stacks run under.
 pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let (fuel, frames) = unsafe { ((*ctx).fuel, (*ctx).frames) };
+    let (fuel, frames, task) = unsafe { ((*ctx).fuel, (*ctx).frames, (*ctx).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
         ply_core::limit::set_running(running);
         (*ctx).fuel = fuel;
         (*ctx).frames = frames;
+        (*ctx).task = task;
         (*ctx).stack_floor = stack_floor();
     }
 }

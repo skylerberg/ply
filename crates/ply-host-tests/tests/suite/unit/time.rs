@@ -9,12 +9,6 @@ use std::sync::Arc;
 struct Nothing;
 
 impl HostRuntime for Nothing {
-    fn watch(&self, _: &ply_core::Pending) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-    fn resolved(&self) -> Vec<(u64, Result<Value, Diagnostic>)> {
-        Vec::new()
-    }
     fn park(&self) -> Result<(), Diagnostic> {
         Ok(())
     }
@@ -82,17 +76,12 @@ fn the_registrations_declare_what_a_reviewer_relies_on() {
     }
 }
 
-/// Inside `simulate` the language's `clock` is virtual time, which the region answers by name;
-/// this is the host's time wherever it is performed, so its name must not be one the simulator
-/// claims.
+/// Inside `simulate` the language's `clock` is virtual time; this is the host's time wherever it
+/// is performed, under a name of its own.
 #[test]
-fn the_simulator_answers_no_effect_this_module_declares() {
+fn every_operation_this_module_registers_is_of_its_own_effect() {
     let simple = EFFECT.rsplit('.').next().expect("a dotted effect name");
     assert_eq!(simple, "time");
-    assert!(
-        !ply_core::SEEDED_EFFECTS.contains(&simple),
-        "`{simple}` is answered by `simulate`, where this module's effect is the host's"
-    );
     let time = Arc::new(TimeHost::new());
     for (op, _) in registrations(&time) {
         assert_eq!(op.effect.as_str(), EFFECT, "{op}");

@@ -7,12 +7,13 @@ import compiler.emit.code (Code, NLit, NUnary)
 import compiler.syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes,
                                  LEmbedded, LDec, LUnit, LBad)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type,
-                             spelled_type, unit_type)
+                             spelled_type, unit_type, fn_type, monomorphic)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, lit_int, is_bitop)
-import compiler.emit.reps (Ctors, has_vars, type_vars, compared_by_root, keyed_sum, numeric_sum,
-                           nullary_sum, generic_sum, written_sum)
+import compiler.emit.reps (Ctors, SumCtor, has_vars, type_vars, compared_by_root, keyed_sum,
+                           numeric_sum, nullary_sum, generic_sum, written_sum, at_args, release_row)
+import compiler.check.infer.expr (kept_type)
 import compiler.emit.answer (Scalar, Exact, literal_bits)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown, Digest, Contained,
@@ -20,7 +21,7 @@ import compiler.emit.keys (RootKey, TypeOp, Root, Order, Stated, Reflect, Shown,
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RUnit, RImm,
                           Arg, AVar, AInt, AZero, ABool, AFloat, ANum, AChar, Val, Prim, Literal,
                           Get, Tag, Call, Native, Let, Decl, Assign, If, Scalars, rep_of_arg,
-                          comparison, arithmetic, shift, Unwound)
+                          comparison, arithmetic, shift, Unwound, read_only)
 import compiler.emit.lower.setting (declared_at, prelude_ctor)
 import compiler.emit.lower.held (held_as, typed_convention, width_held)
 import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, fresh, bound, bound_as, opened,
@@ -28,6 +29,7 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, fresh, boun
                                  short_circuit, unsettled)
 import compiler.emit.lower.data (constructed_as, field)
 import compiler.emit.lower.crossing (through_runtime, blake3_of, scalar_encoding, concatenated)
+import compiler.emit.lower.evidence (Handing, handing_scheme, words_handed, evidenced)
 import compiler.emit.roots (builtin_helper)
 import compiler.expand.rewrite (FloatFunction, float_function)
 
@@ -85,7 +87,8 @@ pub fn unary(cx: Context, o: Lowered, op: Bytes, at: Span) -> Lowered =
         CWidth(w) -> alone(cx, o, op, width_held(w), ty, at),
         CFloat -> if op == b"neg" { alone(cx, o, op, RFloat, ty, at) } else { lacking(o.st, op) },
         CDec -> if op == b"neg" { alone(cx, o, op, RDec, ty, at) } else { lacking(o.st, op) },
-        CWord(t) -> unsettled(needing(o.st, t, true), ty, held_as(cx.setting, ty), [o.arg], at),
+        CWord(t) ->
+          unsettled(needing(o.st, t, true), ty, held_as(cx.setting, ty), read_only([o.arg]), at),
         CSum(t) -> if op == b"neg" && numeric_sum(cx.setting.ctors, t) {
           stated(cx, o.st, op, [o.arg], [t], t, at)
         } else { lacking(o.st, op) },
@@ -177,8 +180,11 @@ fn classed(
           at,
         )
       } else { ranked(cx, l, r, op, ty, at) },
-      CWord(t) -> if eq && is_secret(t) { secrets_equal(l, r, op, at) }
-      else { ranked(cx, l, r, op, t, at) },
+      CWord(t) -> if eq && is_secret(t) {
+        handles_equal(l, r, op, b"builtin_elaborated_secret_equal_p", at)
+      } else if eq && t == kept_type() {
+        handles_equal(l, r, op, b"builtin_elaborated_kept_equal_p", at)
+      } else { ranked(cx, l, r, op, t, at) },
       CRecord(_) -> lacking(r.st, op),
     }
   }
@@ -210,8 +216,10 @@ fn functions_compared(st: Lowering, at: Span) -> Lowered = {
   )
 }
 
-/// `l == r` or `l != r` of two secrets, which the runtime compares in constant time, borrowing both.
-fn secrets_equal(l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
+/// `l == r` or `l != r` of two runtime objects the runtime's `native` compares, borrowing both and
+/// answering 1 where they are equal: two secrets, in constant time, or two kept values, as their
+/// type compares them.
+fn handles_equal(l: Lowered, r: Lowered, op: Bytes, native: Bytes, at: Span) -> Lowered = {
   let a = handed({ st: r.st, arg: l.arg }, RWord, at);
   let b = handed({ st: a.st, arg: r.arg }, RWord, at);
   let same = bound_as(
@@ -219,7 +227,7 @@ fn secrets_equal(l: Lowered, r: Lowered, op: Bytes, at: Span) -> Lowered = {
     named_type(b"Int"),
     RInt,
     Native({
-      name: b"builtin_elaborated_secret_equal_p",
+      name: native,
       args: [a.arg, b.arg],
       uses: { takes: [false, false], owned: true, fails: true, stops: false },
     }),
@@ -487,6 +495,45 @@ type Class =
   | CRecord(List<Field>)
   | CWord(Type)
 
+/// Whether `==` of two values of `t` is built, or `compare` where `order`: no part of it is a type
+/// variable or a value only the runtime reads (a runtime object or an extern type) but a kept value,
+/// which compares as what it keeps does, and a secret, which only `==` compares. A function part
+/// compares for equality by failing the run, as `==` at a type variable a function fills does, and
+/// orders not at all; a sum stating a `key` compares through it alone.
+pub fn comparison_built(ctors: Ctors, t: Type, order: Bool) -> Bool / {abort.raise} =
+  iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
+    match s.todo {
+      [] -> Stop(true),
+      [x, ..rest] -> match x {
+        TyFn(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
+        _ -> match class_of(ctors, x) {
+          CRecord(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
+          CWalked(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
+          CSum(w) -> match w {
+            TyCon(c) -> if s.seen.contains(c.name) || keyed_sum(ctors, c.name) {
+              Continue({ ..s, todo: rest })
+            } else {
+              let cs = match ctors.sums.get(c.name) { Some(found) -> found, None -> [] };
+              Continue({
+                todo: rest.concat(
+                  cs.fold([], |acc: List<Type>, k: SumCtor|
+                    acc.concat(k.fields.map(|f: Type| at_args(f, k.params, c.args)))),
+                ),
+                seen: s.seen.push(c.name),
+              })
+            },
+            _ -> Continue({ ..s, todo: rest }),
+          },
+          CWord(w) -> if w == kept_type() || w == named_type(b"Unit") || w == TyRecord([])
+              || (!order && is_secret(w)) { Continue({ ..s, todo: rest }) }
+          else { Stop(false) },
+          _ -> Continue({ ..s, todo: rest }),
+        },
+      },
+    })
+
+fn type_args(t: Type) -> List<Type> = match t { TyCon(c) -> c.args, _ -> [] }
+
 fn class_of(ctors: Ctors, ty: Type) -> Class =
   match ty {
     TyRecord(fs) -> if fs.len() > 0 && !has_vars(ty) { CRecord(fs) } else { CWord(ty) },
@@ -571,7 +618,13 @@ fn ranked(cx: Context, l: Lowered, r: Lowered, op: Bytes, ty: Type, at: Span) ->
     None -> if op != b"eq" && op != b"ne" { lacking(r.st, op) }
     else if is_function(ty) { functions_compared(r.st, at) } else {
       let truth = named_type(b"Bool");
-      unsettled(needing(r.st, ty, true), truth, held_as(cx.setting, truth), [l.arg, r.arg], at)
+      unsettled(
+        needing(r.st, ty, true),
+        truth,
+        held_as(cx.setting, truth),
+        read_only([l.arg, r.arg]),
+        at,
+      )
     },
     Some(o) -> {
       let s = bound(
@@ -597,7 +650,8 @@ fn rooted(
   at: Span,
 ) -> Lowered = root_called(cx, st, key, args, types, answer, at, false)
 
-/// `rooted`, where the root may stop for a handler that resumes it later where `stops`.
+/// `rooted`, where the root may stop for a handler that resumes it later where `stops`, handed
+/// past `args` the `count` words of its row as `words.args` holds them.
 fn root_called(
   cx: Context,
   st: Lowering,
@@ -607,8 +661,9 @@ fn root_called(
   answer: Type,
   at: Span,
   stops: Bool,
+  words: { count: Int, args: List<Arg> } = { count: 0, args: [] },
 ) -> Lowered = {
-  let conv = typed_convention(cx.setting.ctors, types, answer);
+  let conv = evidenced(typed_convention(cx.setting.ctors, types, answer), 0, words.count);
   let given = range(0, args.len()).fold(
     { st: st, args: [] },
     |acc: { st: Lowering, args: List<Arg> }, i: Int|
@@ -624,7 +679,7 @@ fn root_called(
     given.st,
     answer,
     conv.answer,
-    Call({ callee: Root(key), args: given.args, conv: conv, stops: stops }),
+    Call({ callee: Root(key), args: given.args.concat(words.args), conv: conv, stops: stops }),
     at,
   )
 }
@@ -646,19 +701,37 @@ fn ordered(
 ) -> Lowered / {abort.raise} = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
   let order = answer_of(cx, name, ty, named_type(b"Ordering"));
-  match by_root(cx, st, ty, a, b, at) {
-    Some(o) -> o,
-    None -> {
-      let made = |s: Lowered|
-        bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
-      match class_of(cx.setting.ctors, ty) {
+  let made = |s: Lowered|
+    bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
+  if ty == kept_type() { made(kept_sign(st, a, b, at)) } else {
+    match by_root(cx, st, ty, a, b, at) {
+      Some(o) -> o,
+      None -> match class_of(cx.setting.ctors, ty) {
         CRecord(fs) -> made(fields_order(cx, st, fs, a, b, at)),
         c -> if c_orders(c, ty) {
           made(sign_at(cx, { st: st, arg: a }, { st: st, arg: b }, ty, at))
         } else { through_runtime(cx, needing(st, ty, true), name, [a, b], order, at) },
-      }
-    },
+      },
+    }
   }
+}
+
+/// The sign of the order of two kept values `a` and `b`, as their type orders what they keep: the
+/// runtime's `?kept_order`, borrowing both.
+fn kept_sign(st: Lowering, a: Arg, b: Arg, at: Span) -> Lowered = {
+  let l = handed({ st: st, arg: a }, RWord, at);
+  let r = handed({ st: l.st, arg: b }, RWord, at);
+  bound_as(
+    r.st,
+    named_type(b"Int"),
+    RInt,
+    Native({
+      name: b"builtin_elaborated_kept_order_p",
+      args: [l.arg, r.arg],
+      uses: { takes: [false, false], owned: true, fails: true, stops: false },
+    }),
+    at,
+  )
 }
 
 /// `max(a, b)`, or `min(a, b)` where not `most`: the one `compare` orders last or first, `a` where
@@ -730,7 +803,8 @@ fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered /
       CWidth(w) -> over(cx, l, r, b"order", width_held(w), int, at),
       CDec -> over(cx, l, r, b"order", RDec, int, at),
       CText -> over(cx, l, r, b"bytes_order", RWord, int, at),
-      CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } } else {
+      CWord(t) -> if t == named_type(b"Unit") { { st: r.st, arg: AInt(0) } }
+      else if t == kept_type() { kept_sign(r.st, l.arg, r.arg, at) } else {
         signed(
           through_runtime(
             cx,
@@ -893,32 +967,61 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
     at,
   )
 
-/// `a`, a resource, let go: its type's `LetGo` root called on it, which only a specialisation
-/// settles where a type variable leaves the type open.
-pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered = {
+/// `a`, a resource, let go: its type's `LetGo` root called on it and on the words the body holds
+/// for what the releases it calls perform, which only a specialisation settles where a type
+/// variable leaves the type open.
+pub fn let_go(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
   if has_vars(ty) {
-    unsettled(needing(st, ty, true), unit_type(), held_as(cx.setting, unit_type()), [a], at)
+    unsettled(
+      needing(st, ty, true),
+      unit_type(),
+      held_as(cx.setting, unit_type()),
+      read_only([a]),
+      at,
+    )
   } else {
+    let h = let_go_handing(cx, ty);
+    let w = words_handed(st, h, at);
     // A release may perform what a clause answers by stopping.
-    root_called(cx, st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true)
+    let words = { count: h.words.len(), args: w.args };
+    root_called(cx, w.st, let_go_root(cx, ty), [a], [ty], unit_type(), at, true, words)
   }
 }
 
-/// What a failure lets go of `a`, a resource: its type's `LetGo` root, called as `let_go` calls it.
-pub fn unwound(cx: Context, st: Lowering, a: Arg) -> { st: Lowering, unwound: Unwound } = {
+/// What a failure lets go of `a`, a resource, made after `st` at `at`: its type's `LetGo` root,
+/// called as `let_go` calls it.
+pub fn unwound(
+  cx: Context,
+  st: Lowering,
+  a: Arg,
+  at: Span,
+) -> { st: Lowering, unwound: Unwound } / {abort.raise} = {
   let ty = type_of(a);
+  let h = let_go_handing(cx, ty);
+  let w = words_handed(needing(st, ty, true), h, at);
   {
-    st: needing(st, ty, true),
+    st: w.st,
     unwound: {
       arg: a,
+      words: w.args,
       callee: let_go_root(cx, ty),
-      conv: typed_convention(cx.setting.ctors, [ty], unit_type()),
+      conv: evidenced(typed_convention(cx.setting.ctors, [ty], unit_type()), 0, h.words.len()),
     },
   }
 }
 
 fn let_go_root(cx: Context, ty: Type) -> RootKey = keys::written(LetGo, ty, cx.setting.module)
+
+/// What a call of `ty`'s `LetGo` root hands it past the value, as the root's definition is declared
+/// where it is written: a word for each operation the releases it calls perform.
+fn let_go_handing(cx: Context, ty: Type) -> Handing / {abort.raise} =
+  handing_scheme(
+    cx,
+    Some(monomorphic(fn_type([ty], unit_type(), release_row(cx.setting.ctors, ty)))),
+    [],
+    [],
+  )
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
 /// where a register holds the value, checked below 64 bits exactly in a word, at 64 bits by C's

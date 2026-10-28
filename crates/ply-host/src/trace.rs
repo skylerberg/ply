@@ -1,27 +1,21 @@
-//! The `trace` effect and the sinks that serve it.
+//! The records `std.trace`'s real handler writes through its natives, the spans it keeps open, and
+//! the sinks that serve them.
 
+mod fields;
 pub mod sink;
 pub mod spans;
-mod value;
 
+pub use fields::fields_read;
 pub use sink::{
     Clock, DISCARD_PATH, Discard, Field, HostClock, Json, Outcome, OwnedRecord, Record, RecordKind,
     Sink, Text,
 };
-pub use spans::{Owner, Spans};
+pub use spans::{Owner, Spans, Unbalanced};
 
 use ply_core::host::MachineId;
-use ply_core::{
-    Determinism, Diagnostic, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest,
-    HostResource, HostRuntime, Linearity, Resource, Span, Symbol, TaskId, codes,
-};
-use std::collections::BTreeMap;
+use ply_core::{Decimal, Diagnostic, Resource, Symbol, TaskId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-
-pub const MODULE: &str = "std.trace";
-
-pub const EFFECT: &str = "std.trace.trace";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
@@ -38,43 +32,6 @@ impl Level {
             Level::Info => "info",
             Level::Warn => "warn",
             Level::Error => "error",
-        }
-    }
-}
-
-operations! {
-    what "trace";
-    Event = "event" / 3,
-    Enter = "enter" / 2,
-    Exit = "exit" / 2,
-    Count = "count" / 3,
-    Gauge = "gauge" / 3,
-    Time = "time" / 3,
-}
-
-impl Op {
-    fn kind(self) -> RecordKind {
-        match self {
-            Op::Event => RecordKind::Event,
-            Op::Enter => RecordKind::Enter,
-            Op::Exit => RecordKind::Exit,
-            Op::Count => RecordKind::Count,
-            Op::Gauge => RecordKind::Gauge,
-            Op::Time => RecordKind::Time,
-        }
-    }
-
-    pub fn declaration(self, path: &'static str) -> HostOp {
-        HostOp {
-            effect: Symbol::new(EFFECT),
-            op: Symbol::new(self.name()),
-            resource: HostResource::Any,
-            determinism: Determinism::Nondeterministic,
-            linearity: Linearity::AtMostOnce,
-            blocking: false,
-            // A `Field` has no constructor over a `Secret`.
-            secrets: false,
-            path,
         }
     }
 }
@@ -124,6 +81,11 @@ impl Trace {
         self.sink.destination()
     }
 
+    /// Whether the sink writes a record at `level`: one it does not costs nothing past asking.
+    pub fn wants(&self, level: Level) -> bool {
+        self.sink.wants(level)
+    }
+
     pub fn counts(&self) -> Counts {
         let spans = lock(&self.spans);
         Counts {
@@ -170,6 +132,92 @@ impl Trace {
         self.flushed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One `event`, `count`, `gauge` or `time` record on `channel`, inside the innermost span
+    /// `owner` has open; nothing where the sink does not want `level`, no clock read among it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &self,
+        owner: Owner,
+        kind: RecordKind,
+        level: Level,
+        channel: &str,
+        name: &str,
+        amount: Option<i64>,
+        value: Option<Decimal>,
+        fields: &[(String, Field)],
+    ) {
+        if !self.sink.wants(level) {
+            return;
+        }
+        let (span, parent) = lock(&self.spans).innermost(owner);
+        let ts = self.clock.micros();
+        self.events.fetch_add(1, Ordering::Relaxed);
+        self.sink.write(&Record {
+            ts,
+            kind,
+            level,
+            channel,
+            name,
+            span,
+            parent,
+            outcome: &Outcome::Ok,
+            amount,
+            value,
+            fields,
+        });
+    }
+
+    /// Opens a span on `channel` inside the innermost one `owner` has open, answering its id. The
+    /// span is kept whatever the sink does, so whether an `exit` balances cannot depend on
+    /// `--trace`; its record is written where the sink wants `info`.
+    pub fn enter(
+        &self,
+        owner: Owner,
+        channel: &str,
+        name: &str,
+        fields: &[(String, Field)],
+    ) -> i64 {
+        let wanted = self.sink.wants(Level::Info);
+        let started = wanted.then(|| self.clock.micros());
+        let opened = lock(&self.spans).enter(owner, labelled(channel), name.into(), started);
+        if wanted {
+            self.events.fetch_add(1, Ordering::Relaxed);
+            self.sink.write(&Record {
+                ts: started.unwrap_or_default(),
+                kind: RecordKind::Enter,
+                level: Level::Info,
+                channel,
+                name: &opened.name,
+                span: opened.id,
+                parent: opened.parent,
+                outcome: &Outcome::Ok,
+                amount: None,
+                value: None,
+                fields,
+            });
+        }
+        opened.id
+    }
+
+    /// Closes span `id` on `channel` with how it ended, and every span `owner` opened inside it
+    /// that is still open, `Abandoned`.
+    ///
+    /// # Errors
+    /// `id` is no span `owner` has open on `channel`.
+    pub fn exit(
+        &self,
+        owner: Owner,
+        channel: &str,
+        id: i64,
+        outcome: Outcome,
+    ) -> Result<(), Unbalanced> {
+        let closings = lock(&self.spans).exit(owner, id, &labelled(channel), outcome)?;
+        for closing in &closings {
+            self.emit_close(closing);
+        }
+        Ok(())
+    }
+
     fn emit_close(&self, closing: &spans::Closing) {
         if !self.sink.wants(Level::Info) {
             return;
@@ -192,187 +240,11 @@ impl Trace {
     }
 }
 
-pub fn register(registry: &mut HostRegistry, trace: Arc<Trace>) {
-    let path = trace.sink.path();
-    for op in Op::ALL {
-        registry.register(op.declaration(path), handler(op, Arc::clone(&trace)));
-    }
-}
-
-pub fn handler(op: Op, trace: Arc<Trace>) -> Arc<dyn HostHandler> {
-    Arc::new(Operation { op, trace })
-}
-
-pub fn registry(trace: Arc<Trace>) -> HostRegistry {
-    let mut registry = HostRegistry::new();
-    register(&mut registry, trace);
-    registry
-}
-
-pub struct Operation {
-    pub op: Op,
-    pub trace: Arc<Trace>,
-}
-
-impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        let span = req.span;
-        if req.args.len() != self.op.arity() {
-            return Err(arity(self.op, req.args.len(), span));
-        }
-        // The resolved atom's resource, never one the handler re-derives.
-        let channel = &req.atom.resource;
-        let owner: Owner = (req.machine, req.task);
-        match self.op {
-            // Span state is kept whatever the sink does, so `E0445` cannot depend on `--trace`.
-            Op::Enter => self.enter(req, channel, owner),
-            Op::Exit => self.exit(req, channel, owner, span),
-            // Stateless: a sink that wants nothing is answered before any decoding or clock read.
-            Op::Event => {
-                let level = value::level(&req.args[0], span)?;
-                self.simple(req, channel, owner, level, 1)
-            }
-            Op::Count | Op::Gauge | Op::Time => self.simple(req, channel, owner, Level::Info, 0),
-        }
-    }
-}
-
-impl Operation {
-    /// `event`, `count`, `gauge` and `time`: one record, no state.
-    fn simple(
-        &self,
-        req: &HostRequest<'_>,
-        channel: &Resource,
-        owner: Owner,
-        level: Level,
-        name_at: usize,
-    ) -> Result<HostAnswer, Diagnostic> {
-        if !self.trace.sink.wants(level) {
-            return Ok(HostAnswer::Value(ply_core::Value::Unit));
-        }
-        let span = req.span;
-        let name = req.args[name_at].as_str(span, "a record's name")?;
-        let (amount, value) = match self.op {
-            Op::Count | Op::Time => (Some(req.args[1].as_int(span, "an amount")?), None),
-            Op::Gauge => (None, Some(req.args[1].as_decimal(span, "a gauge's value")?)),
-            _ => (None, None),
-        };
-        let fields = value::fields(&req.args[2], span)?;
-        let (in_span, parent) = self.enclosing(owner);
-        let ts = self.trace.clock.micros();
-        self.trace.events.fetch_add(1, Ordering::Relaxed);
-        self.trace.sink.write(&Record {
-            ts,
-            kind: self.op.kind(),
-            level,
-            channel: spans::label(channel),
-            name,
-            span: in_span,
-            parent,
-            outcome: &Outcome::Ok,
-            amount,
-            value,
-            fields: &fields,
-        });
-        Ok(HostAnswer::Value(ply_core::Value::Unit))
-    }
-
-    fn enter(
-        &self,
-        req: &HostRequest<'_>,
-        channel: &Resource,
-        owner: Owner,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let span = req.span;
-        let wanted = self.trace.sink.wants(Level::Info);
-        // Shares the argument's `Arc<str>`, so keeping the name is free even under `--trace off`.
-        let name = match &req.args[0] {
-            ply_core::Value::Str(s) => Arc::clone(s),
-            other => return Err(value_error(span, "a span's name", other)),
-        };
-        let started = wanted.then(|| self.trace.clock.micros());
-        let opened = lock(&self.trace.spans).enter(owner, channel.clone(), name, started);
-        if wanted {
-            let fields = value::fields(&req.args[1], span)?;
-            self.trace.events.fetch_add(1, Ordering::Relaxed);
-            self.trace.sink.write(&Record {
-                ts: started.unwrap_or_default(),
-                kind: RecordKind::Enter,
-                level: Level::Info,
-                channel: spans::label(channel),
-                name: &opened.name,
-                span: opened.id,
-                parent: opened.parent,
-                outcome: &Outcome::Ok,
-                amount: None,
-                value: None,
-                fields: &fields,
-            });
-        }
-        Ok(HostAnswer::Value(span_value(opened.id, channel)))
-    }
-
-    fn exit(
-        &self,
-        req: &HostRequest<'_>,
-        channel: &Resource,
-        owner: Owner,
-        span: Span,
-    ) -> Result<HostAnswer, Diagnostic> {
-        let id = value::span_id(&req.args[0], span)?;
-        let outcome = value::outcome(&req.args[1], span)?;
-        let closings = match lock(&self.trace.spans).exit(owner, id, channel, outcome) {
-            Ok(closings) => closings,
-            Err(why) => {
-                return Err(spans::err_unbalanced(span, self.op.what(), id, &why));
-            }
-        };
-        for closing in &closings {
-            self.trace.emit_close(closing);
-        }
-        Ok(HostAnswer::Value(ply_core::Value::Unit))
-    }
-
-    fn enclosing(&self, owner: Owner) -> (i64, i64) {
-        lock(&self.trace.spans).innermost(owner)
-    }
-}
-
-pub(crate) static ID: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("id"));
-static CHANNEL: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("channel"));
-
-fn span_value(id: i64, channel: &Resource) -> ply_core::Value {
-    let mut fields = BTreeMap::new();
-    fields.insert(ID.clone(), ply_core::Value::Int(id));
-    fields.insert(CHANNEL.clone(), ply_core::Value::str(spans::label(channel)));
-    ply_core::Value::Record(Arc::new(fields.into_iter().collect()))
+fn labelled(channel: &str) -> Resource {
+    Resource::Named(Symbol::new(channel))
 }
 
 /// Poison is ignored: a panic cannot break "innermost last", since a push is one `Vec::push`.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cold]
-fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "{} was performed with {got} arguments and takes {}",
-            op.what(),
-            op.arity()
-        ),
-    )
-    .primary(span, "this perform reached the trace sink")
-    .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
-}
-
-#[cold]
-fn value_error(span: Span, what: &str, got: &ply_core::Value) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("{what} expects String, but got {}", got.type_name()),
-    )
-    .primary(span, "this perform reached the trace sink")
-    .note("inference checks a perform's argument types, so reaching this means the evaluator was handed a module that was never checked")
 }

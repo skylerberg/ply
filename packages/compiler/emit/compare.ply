@@ -8,13 +8,14 @@ import compiler.front.facts (Analysis)
 import compiler.front.published (analyse, dump_of, no_rows)
 import compiler.front (analyse_pulling_std_with)
 import compiler.front.rows (ModuleRow)
-import compiler.syntax.exprs (prelude_module)
+import compiler.syntax.exprs (prelude_module, scheduler_module)
 import std.prelude_source
 import compiler.check.resolve.tables (Diag, qualify)
 import compiler.check.types (spelled_type)
 import std.bytes (ascii_of_int, hex_digit)
 import compiler.emit (emit_roots_answer)
 import compiler.check.infer.definitions (Extern, program_natives)
+import compiler.emit.answer
 import compiler.emit.answer (RootAnswer, Body, GenericCall, SharedFn, settled_by_callers)
 import compiler.emit.entry (built_form)
 import compiler.emit.keys (RootKey, FnArg, Named, root_name, root_text)
@@ -50,15 +51,81 @@ pub fn program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} =
     },
   }
 
+/// The functions of `std.internal.schedule` a region and a perform crossing at a type of its own
+/// call, as it declares them, each answering nothing it would.
+fn scheduler_stub() -> Bytes =
+  Bytes::concat_all([
+    b"import std.internal.native (native)\n",
+    b"pub fn simulated<a | e>(root: Int, start: Int, end: Int, body: keep () -> a / {task.write, clock.read, clock.write, random.write, sim.read | e}) -> a / {abort.raise, native.read, native.write | e} = abort.raise(\"none\")\n",
+    b"pub fn crossing_spawn<a | e>(body: keep () -> a / e) -> Task<a> / {task.spawn | e} = task.spawn(body)\n",
+    b"pub fn crossing_join<a>(t: Task<a>) -> a / {task.join, abort.raise} = abort.raise(\"none\")\n",
+    b"pub fn crossing_cancel<a>(t: Task<a>) -> Bool / {task.cancel} = false\n",
+    b"pub fn crossing_await<a>(t: Task<a>) -> Option<a> / {task.await} = None\n",
+    b"pub fn crossing_channel<a>(capacity: Int) -> Chan<a> / {task.channel, abort.raise} = abort.raise(\"none\")\n",
+    b"pub fn crossing_send<a>(c: Chan<a>, x: a) -> Bool / {task.send} = false\n",
+    b"pub fn crossing_recv<a>(c: Chan<a>) -> Option<a> / {task.recv} = None\n",
+    b"pub fn crossing_close<a>(c: Chan<a>) -> Unit / {task.close} = ()\n",
+    b"pub fn crossing_select<a>(arms: List<(Chan<a>, Option<a>)>, wait: Bool) -> Option<(Int, Option<a>)> / {task.select} = None\n",
+  ])
+
+/// `program_of` of `src` loaded beside a scheduler of `std.internal.schedule`'s functions' shapes,
+/// which a `simulate` and a `task` operation that crosses call.
+pub fn scheduled_program_of(src: Bytes) -> Result<Program, Bytes> / {abort.raise} = {
+  let shipped = [
+    { name: scheduler_module(), src: scheduler_stub() },
+    { name: b"std.internal.native", src: b"pub nondet effect native {}\n" },
+  ];
+  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+    Refused(diags) -> Err(Bytes::join(diags.map(|d: Diag| d.message), b"\n")),
+    Analysed(a) -> match setting_in(a, b"m") {
+      Err(why) -> Err(why),
+      Ok(s) ->
+        Ok({
+          src: src,
+          analysis: a,
+          setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
+          roots: s.roots,
+        }),
+    },
+  }
+}
+
 /// Root `m.<name>` of `p` lowered to the form as a build lowers it, its body after `known_body`, or
 /// why it was not.
 pub fn formed(p: Program, name: Bytes) -> Result<Fn, Declined> / {abort.raise} =
-  match p.roots.fold(None, |acc: Option<Root>, r: Root|
-      if r.key == Named(qualify(b"m", name)) { Some(r) } else { acc }) {
+  formed_at(p, Named(qualify(b"m", name)))
+
+fn formed_at(p: Program, key: RootKey) -> Result<Fn, Declined> / {abort.raise} =
+  match p.roots.fold(None, |acc: Option<Root>, r: Root| if r.key == key { Some(r) } else { acc }) {
     None -> Err({ by: Spine, why: b"no such definition" }),
     Some(r) -> match r.code {
       Err(why) -> Err({ by: Spine, why: why }),
       Ok(code) -> root_lowered(p.setting, r, code),
+    },
+  }
+
+/// Root `<module>.<name>` of a load of module `m`, of text `src`, beside the shipped modules
+/// `shipped`, lowered as `formed` lowers one of `m`, or why it was not.
+pub fn shipped_formed(
+  src: Bytes,
+  shipped: List<{ name: Bytes, src: Bytes }>,
+  module: Bytes,
+  name: Bytes,
+) -> Result<Fn, Declined> / {abort.raise} =
+  match analyse_pulling_std_with([{ name: b"m", src: src }], shipped, no_rows()).out {
+    Refused(diags) -> Err({ by: Spine, why: Bytes::join(diags.map(|d: Diag| d.message), b"\n") }),
+    Analysed(a) -> match setting_in(a, module) {
+      Err(why) -> Err({ by: Spine, why: why }),
+      Ok(s) ->
+        formed_at(
+          {
+            src: src,
+            analysis: a,
+            setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
+            roots: s.roots,
+          },
+          Named(qualify(module, name)),
+        ),
     },
   }
 
@@ -74,6 +141,32 @@ pub fn checked(p: Program, name: Bytes) -> Result<Fn, Bytes> / {abort.raise} =
       }
     },
   }
+
+/// The words each `Entering` in C text `text` hands the runtime, as the text names them: `0` where
+/// it hands none. A context's emptying of what it was handed hands nothing, so is none of them.
+pub fn entered_words(text: Bytes) -> List<Bytes> / {abort.raise} = {
+  let desc = b"ctx->entering_desc = ";
+  let words = b"; ctx->entering_words = ";
+  iterate({ from: 0, out: [] }, text.len() + 1, |s: { from: Int, out: List<Bytes> }|
+    match text.slice(s.from, text.len()).index_of(desc) {
+      None -> Stop(s.out),
+      Some(i) -> {
+        let start = s.from + i + desc.len();
+        let rest = text.slice(start, text.len());
+        match rest.index_of(words) {
+          None -> Stop(s.out),
+          Some(j) -> {
+            let after = rest.slice(j + words.len(), rest.len());
+            let end = match after.index_of(b";") { Some(k) -> k, None -> after.len() };
+            Continue({
+              from: start + j + words.len() + end,
+              out: if rest.slice(0, j) == b"0" { s.out } else { s.out.push(after.slice(0, end)) },
+            })
+          },
+        }
+      },
+    })
+}
 
 /// Root `m.<name>` of `p` as the form prints it once it is checked, or why it was not printed.
 pub fn printed_by_form(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.raise} =
@@ -159,10 +252,14 @@ pub fn answered_by_form(
               [],
               d.embeds,
               d.rows,
+              d.effects,
               d.walked,
             ).fold(None, |acc: Option<RootAnswer>, r: RootAnswer|
               if r.name == root { Some(r) } else { acc }) {
-            Some(r) -> match r.answer { Body(b) -> Ok(b.text), _ -> Err(b"refused") },
+            Some(r) -> match r.answer {
+              Body(b) -> Ok(b.text),
+              answer::Refused(no) -> Err(b"refused: ".concat(no.why)),
+            },
             None -> Err(b"no such root"),
           }
         } with {

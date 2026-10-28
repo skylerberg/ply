@@ -1,13 +1,15 @@
-//! The C every emitted unit opens with. It mirrors `heap.rs` and `rt.rs`, and
-//! `the_prelude_agrees_with_the_layouts_it_mirrors` checks it against them.
+//! The helpers a loaded unit binds, each read off its function's type, and the C a unit a released
+//! `ply` emits opens and closes with, which this runtime's description still hands it.
 
 use crate::emitted::{Block, DropRoot, Handed, Handle, KeepRoot, PlyOp, PlyType};
 use crate::heap::Word;
-use crate::native::{Addr, F64, I64, Native, Raises, Signature};
+use crate::native::{Addr, F64, I64, Native, Out, Raises, Signature};
 use crate::rt::Ctx;
 
-/// `rt_*` is declared, not defined: `ply_bind` supplies the addresses after `dlopen`, since a
-/// shared object cannot see symbols the host executable did not export.
+/// What a released `ply`'s units open with, as it reads this runtime's description; this `ply`'s
+/// emitter writes its own (`compiler.emit.print.head`). `rt_*` is declared, not defined:
+/// `ply_bind` supplies the addresses after `dlopen`, since a shared object cannot see symbols the
+/// host executable did not export.
 pub const PRELUDE: &str = r#"
 #include <stdint.h>
 /* tcc's arm64 linker writes every call as one branch, which reaches 128 MB and no further, and says
@@ -156,13 +158,12 @@ static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return v >= -(INT64_C(1) << 62) && v < (INT64_C(1) << 62); }
 "#;
 
-/// A runtime helper the emitted C may call: arguments past the context, whether it answers, and
-/// the function a loaded unit binds it to.
+/// A runtime helper the emitted C may call: what it takes past the context and answers, as its
+/// function's type says, and the function a loaded unit binds it to.
 #[derive(Clone, Copy)]
 pub struct Helper {
     pub name: &'static str,
-    pub args: usize,
-    pub answers: bool,
+    pub signature: Signature,
     pub address: *const (),
 }
 
@@ -175,15 +176,24 @@ impl Helper {
     fn of<F: Native>(name: &'static str, f: F) -> Helper {
         Helper {
             name,
-            args: F::SIGNATURE.words(),
-            answers: F::SIGNATURE.answers(),
+            signature: F::SIGNATURE,
             address: f.address(),
         }
     }
+
+    /// The words a call passes past the context.
+    pub fn args(&self) -> usize {
+        self.signature.words()
+    }
+
+    pub fn answers(&self) -> bool {
+        self.signature.answers()
+    }
 }
 
-/// A native the compiler declares itself over machine data, under the name it declares and with
-/// its function's signature; bound as the helper [`builtin_helper_name`] names for it.
+/// A native over machine data, under the name the compiler or a shipped module's `extern fn`
+/// declares and with its function's signature; bound as the helper [`builtin_helper_name`] names
+/// for it.
 pub struct MachineNative {
     pub name: &'static str,
     pub signature: Signature,
@@ -267,13 +277,18 @@ machine! {
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
 }
 
-/// The natives the compiler declares itself over machine data: the crossings' and the rest of
-/// this table's, then strings' and byte strings' (`crate::machine`).
+/// The natives over machine data: the crossings' and the rest of this table's, then strings' and
+/// byte strings' (`crate::machine`), then those the standard library's real handlers call
+/// (`crate::hosted`), then what `std.machine` declares (`crate::entry`) and what
+/// `std.internal.schedule` does (`crate::tasks`).
 pub fn machine_natives() -> &'static [MachineNative] {
     static ALL: std::sync::OnceLock<Vec<MachineNative>> = std::sync::OnceLock::new();
     ALL.get_or_init(|| {
         let mut all = machine_table();
         all.extend(crate::machine::natives());
+        all.extend(crate::hosted::natives());
+        all.extend(crate::entry::natives());
+        all.extend(crate::tasks::natives());
         all
     })
 }
@@ -336,8 +351,40 @@ helpers! {
     rt_release_later(w: Handed, root: DropRoot);
     rt_release_drain();
     rt_dispatch(op: *const PlyOp, resource: I64, mode: I64, args: *const Handed) -> Handed;
+    rt_dispatch_at(
+        handler: I64,
+        op: *const PlyOp,
+        resource: I64,
+        mode: I64,
+        args: *const Handed
+    ) -> Handed;
+    rt_performed(op: *const PlyOp, resource: I64, mode: I64);
+    rt_scheduler_entered() -> Word;
+    rt_scheduler_left(was);
+    rt_pending_raised_at(effect: I64, op: I64) -> Handed;
+    rt_label_string(resource: I64, string: *const PlyType) -> Handed;
+    rt_task_abandons(op: *const PlyOp) -> Word;
+    rt_task_captures(op: *const PlyOp) -> Word;
+    rt_task_raises(op: *const PlyOp, args: *const Handed) -> Word;
+    rt_detached_open(body: Block, forwards: Block, instance: Block) -> Handed;
+    rt_detached_stop(
+        record: *const Word,
+        op: *const PlyOp,
+        resource: I64,
+        args: *const Handed,
+        again: I64
+    ) -> Handed;
+    rt_pending_raised(string: *const PlyType, bridged: I64) -> Handed;
     rt_handle_install(clauses: *const Word, n: I64, ret: Handed) -> I64;
+    rt_handle_install_at(clauses: *const Word, n: I64, ret: Handed, cell: Out) -> I64;
     rt_handle_install_detached(clauses: *const Word, n: I64, ret: Handed, body: Block) -> Handed;
+    rt_handle_forwarded(
+        clauses: *const Word,
+        n: I64,
+        ret: Handed,
+        body: Block,
+        forwards: Block
+    ) -> Handed;
     rt_with_cleanup(
         acquire: Block,
         body: Block,
@@ -375,15 +422,21 @@ pub fn helpers() -> &'static [Helper] {
     })
 }
 
+/// The runtime's own helpers, which are no native's.
+pub fn own_helpers() -> &'static [Helper] {
+    let all = helpers();
+    &all[..all.len() - machine_natives().len()]
+}
+
 /// The line that opens the runtime's definitions: everything from it on is the unit's tail, the
 /// one translation unit that defines what [`runtime_header`] declares.
 pub const RUNTIME_MARK: &str = "/* --- the runtime, bound at load --- */";
 
 /// A helper's C return type and parameter list.
 fn signature(h: &Helper) -> (&'static str, String) {
-    let ret = if h.answers { "Word" } else { "void" };
+    let ret = if h.answers() { "Word" } else { "void" };
     let mut params = String::from("PlyCtx*");
-    for _ in 0..h.args {
+    for _ in 0..h.args() {
         params.push_str(", Word");
     }
     (ret, params)

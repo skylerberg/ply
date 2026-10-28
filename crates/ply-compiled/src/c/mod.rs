@@ -2,8 +2,8 @@
 //! `PLY_C_*`, `PLY_CC*` and `PLY_HEAP_*` knobs never change a program's meaning.
 
 mod build;
+pub mod described;
 pub mod descriptor;
-pub mod dump;
 mod encoding;
 pub mod exports;
 pub mod linked;
@@ -14,12 +14,13 @@ pub mod sweep;
 pub mod tables;
 
 pub use build::{Native, load_linked, load_opened};
+pub use described::described;
 pub use exports::{Exports, Unserved};
 pub use load::{Library, cache_dir};
 pub(crate) use prelude::machine_native;
 pub use prelude::{
     MachineNative, PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, machine_natives,
-    pointer_name, runtime_header, runtime_object,
+    own_helpers, pointer_name, runtime_header, runtime_object,
 };
 
 /// The runtime's sources, as `build.rs` digests them, less how C is compiled, kept, swept and
@@ -99,7 +100,8 @@ pub fn kept_root(
     caches.unwrap_or(temp).join("ply").join(kind)
 }
 
-/// What every unit's C opens with, up to its first bucket: the prelude and the runtime declared.
+/// What a released `ply`'s units open with, up to their first bucket: the prelude and the runtime
+/// declared.
 pub fn unit_head() -> String {
     format!("{PRELUDE}{}\n", runtime_header())
 }

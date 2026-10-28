@@ -6,22 +6,19 @@ use crate::heap::Word;
 use crate::rt::Ctx;
 use ply_core::handler::err_unhandled;
 use ply_core::host::{
-    Bound, HostAnswer, HostBinding, HostRequest, attribute, err_blocking_answered_inline,
-    err_hermetic, err_host_in_search, err_withheld, operation_label,
+    Bound, HostAnswer, HostBinding, HostRequest, Unserved, attribute, carries_secret,
+    check_host_answer, err_blocking_answered_inline, err_footprint_escape, err_host_in_search,
+    err_host_in_simulation, err_secret_to_host, err_withheld, operation_label, resource_of,
 };
-use ply_core::sim::TASK_OPS;
-use ply_core::{
-    Diagnostic, Span, Symbol, Unbound, Value, carries_secret, check_host_answer, codes,
-    err_footprint_escape, err_host_in_simulation, err_no_runtime, err_secret_to_host,
-    err_unenumerated_atom,
-};
+use ply_core::{Diagnostic, Span, Symbol, Value, codes};
+use ply_core::{EffectAtom, Mode};
 use std::sync::Arc;
 
 /// An at-most-once host operation an entry performed, which a second resumption would replay.
 pub(crate) struct HostMark {
-    operation: String,
-    path: &'static str,
-    span: Span,
+    pub(crate) operation: String,
+    pub(crate) path: &'static str,
+    pub(crate) span: Span,
 }
 
 /// A second resumption across an at-most-once host operation.
@@ -73,50 +70,31 @@ fn bound<'b>(
 ) -> Result<Bound<'b>, Diagnostic> {
     let span = c.site();
     let operation = operation_label(effect, op, resource);
-    let would = binding.would_serve(effect, op, resource);
     let resolved = binding.resolve(effect, op, resource);
     // Ahead of every other refusal: under a seed the region is re-run per schedule, so an answer
-    // any handler could give -- bound, withheld or hermetic -- would differ between interleavings.
-    if let Some(region) = crate::simulate::seeded_region(c)
-        && (would.is_some() || resolved.is_some())
+    // any handler could give, bound or withheld, would differ between interleavings.
+    if let Some(region) = crate::tasks::seeded_region(c)
+        && !matches!(resolved, Err(Unserved::Unregistered))
     {
         return Err(err_host_in_simulation(span, &operation, region));
     }
-    resolved.ok_or_else(|| match would {
-        None => err_unhandled(span, effect, op, resource),
-        Some(path) if binding.is_hermetic() => {
-            let hermetic = err_hermetic(span, &operation, path);
-            if c.re_executed {
-                hermetic.note(
-                    "`--host` would then refuse this: the search runs a seeded test whole once per interleaving, so a handler would answer it once per schedule",
-                )
-            } else {
-                hermetic
-            }
-        }
-        Some(path) => match binding.withholds(effect, op, resource) {
-            Some(served) => err_withheld(span, &operation, effect, path, served),
-            None => err_unenumerated_atom(span, &operation, path),
-        },
+    resolved.map_err(|unserved| match unserved {
+        Unserved::Unregistered => err_unhandled(span, effect, op, resource),
+        Unserved::Withheld { path, served } => err_withheld(span, &operation, effect, path, served),
     })
 }
 
-/// Whether `effect.op`, which nothing on the stack answers and the binding serves, is the production
-/// scheduler's: a `task` operation, or a sleep inside an open production region, which parks the
-/// task alone. Outside one no task could run meanwhile, and a sleep is the host's.
+/// Whether `effect.op`, which nothing on the stack answers, is a sleep by a task of the run's
+/// region, which waits there while the region's other tasks run. Outside one no task could run
+/// meanwhile, and a sleep is the host's.
 pub(crate) fn production_scheduled(c: &Ctx, effect: &Symbol, op: &Symbol) -> bool {
-    match effect.as_str() {
-        "task" => TASK_OPS.contains(&op.as_str()),
-        "clock" => {
-            op.as_str() == "sleep" && crate::simulate::running_task_of_production(c).is_some()
-        }
-        _ => false,
-    }
+    effect.as_str() == "clock"
+        && op.as_str() == "sleep"
+        && crate::tasks::production_task(c).is_some()
 }
 
-/// [`serve`] of an operation emitted code performed that [`production_scheduled`] says is the
-/// production scheduler's: the binding's refusals, the region opened for a `task` operation where
-/// none is, and `args` handed to it as they were performed, which this takes.
+/// [`serve`] of a sleep [`production_scheduled`] says is the run's region's: the binding's
+/// refusals, then the task waits in its region for the nanoseconds `args` hold, which this takes.
 pub(crate) unsafe fn schedule(
     ctx: *mut Ctx,
     described: &PlyOp,
@@ -128,26 +106,46 @@ pub(crate) unsafe fn schedule(
     let c = unsafe { &mut *ctx };
     let binding = Arc::clone(&c.binding);
     let refused = bound(c, &binding, effect, op, resource).err();
-    let opened = refused.is_none()
-        && (effect.as_str() != "task"
-            || unsafe { crate::simulate::open_production(ctx, effect, op) });
-    if !opened {
-        for (w, ty) in args.iter().zip(described.params()) {
-            unsafe { Carried::new(Handed::of(*w), *ty) }.release(ctx);
-        }
-        let c = unsafe { &mut *ctx };
-        return refused.map_or(0, |d| c.fail(d));
+    let lowered: Vec<Result<Value, String>> = args
+        .iter()
+        .zip(described.params())
+        .map(|(w, ty)| {
+            let carried = unsafe { Carried::new(Handed::of(*w), *ty) };
+            let value = carried.lower(ctx);
+            carried.release(ctx);
+            value
+        })
+        .collect();
+    let c = unsafe { &mut *ctx };
+    if let Some(d) = refused {
+        return c.fail(d);
     }
-    unsafe { crate::simulate::perform(ctx, effect, op, args, described) }
+    let span = c.site();
+    let nanos = match lowered.first() {
+        Some(Ok(d)) => ply_core::sim::nanos_of(d, span, "clock.sleep"),
+        _ => Err(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a sleep reached the run's region with no duration it could read",
+        )),
+    };
+    match nanos {
+        Ok(n) => {
+            crate::tasks::waited(c, crate::tasks::ASK_SLEEP, n);
+            0
+        }
+        Err(d) => c.fail(d),
+    }
 }
 
 /// `effect.op` performed on the host with `values`, through the machine's checks in the machine's
-/// order. [`production_scheduled`] operations are [`schedule`]'s.
+/// order, `mode` as its declaration states it. [`production_scheduled`] operations are
+/// [`schedule`]'s.
 pub(crate) unsafe fn serve(
     ctx: *mut Ctx,
     effect: &Symbol,
     op: &Symbol,
     resource: Option<&Symbol>,
+    mode: Mode,
     values: Vec<Value>,
 ) -> Served {
     let c = unsafe { &mut *ctx };
@@ -159,7 +157,7 @@ pub(crate) unsafe fn serve(
         Ok(bound) => bound,
         Err(d) => return failed(c, d),
     };
-    let atom = bound.atom.clone();
+    let atom = EffectAtom::operation(effect.clone(), resource_of(resource), mode, op.clone());
     let declaration = bound.op.clone();
     let handler = Arc::clone(bound.handler);
     if let Some(declared) = &c.declared
@@ -192,15 +190,12 @@ pub(crate) unsafe fn serve(
             args: &values,
             span,
             machine: c.id,
-            task: crate::simulate::running_task_of_production(c),
+            task: crate::tasks::production_task(c),
             declared: c.declared.as_ref(),
         };
-        match &runtime {
-            Some(rt) => handler.call(rt.as_ref(), &request),
-            None => handler.call(&Unbound, &request),
-        }
+        handler.call(runtime.as_ref(), &request)
     };
-    c.host_use.record(&atom, declaration.determinism);
+    c.host_use.record(declaration.determinism);
     if declaration.linearity.is_linear() {
         c.host_ops = c.host_ops.saturating_add(1);
         c.last_linear = Some(HostMark {
@@ -223,23 +218,14 @@ pub(crate) unsafe fn serve(
             }
             value
         }
+        // A task of the run's region waits there for the answer, which is then at hand.
         HostAnswer::Pending(pending) => {
-            if crate::simulate::running_task_of_production(c).is_some() {
-                match unsafe { crate::simulate::park(ctx, pending) } {
-                    Some(value) => value,
-                    None => return Served::Word(0),
-                }
-            } else {
-                let Some(rt) = runtime else {
-                    return failed(
-                        c,
-                        err_no_runtime(span, &operation, pending, declaration.path),
-                    );
-                };
-                match rt.block_on(pending) {
+            match crate::tasks::waited(c, crate::tasks::ASK_TICKET, pending.token as i64) {
+                Some(false) => return Served::Word(0),
+                Some(true) | None => match runtime.block_on(pending) {
                     Ok(value) => value,
                     Err(d) => return failed(c, d),
-                }
+                },
             }
         }
     };

@@ -2,14 +2,19 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_core::escape::Boundary;
-use ply_core::{Diagnostic, Span, Symbol, Value, codes};
+use ply_core::{Closure, ClosureKind, Diagnostic, Span, Symbol, Value, codes};
 use std::sync::Arc;
 
-fn task() -> Value {
-    Value::Task(ply_core::TaskHandle::unowned(
-        ply_core::SimId(0),
-        ply_core::sim::TaskId(0),
-    ))
+/// Assembled, since only the C backend has a continuation's code.
+fn continuation() -> Value {
+    Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Continuation {
+            code: 0,
+            arity: 1,
+            captured: Vec::new(),
+        },
+    }))
 }
 
 /// A handler that answers with the boundary's own code has its classification taken back: the run
@@ -48,10 +53,10 @@ fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
     let d = ply_core::escape::check_arguments(
         "ext.ask[socket]",
         "test::forge",
-        &[Value::Int(1), task()],
+        &[Value::Int(1), continuation()],
         Span::DUMMY,
     )
-    .expect_err("argument 2 carries a task");
+    .expect_err("argument 2 carries a continuation");
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert!(d.message.contains("argument 2"), "{}", d.message);
@@ -67,7 +72,7 @@ fn a_handle_in_a_host_operations_argument_is_refused_and_the_position_named() {
 fn a_handle_in_a_trace_field_is_the_host_boundary_and_nothing_further() {
     let fields = Value::list(vec![Value::Ctor {
         name: Symbol::new("std.trace.Str"),
-        args: Arc::new(vec![Value::str("k"), task()]),
+        args: Arc::new(vec![Value::str("k"), continuation()]),
     }]);
 
     let d = ply_core::escape::check(

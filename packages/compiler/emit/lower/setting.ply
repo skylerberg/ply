@@ -7,35 +7,38 @@ import std.bin
 import std.bytes
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (Ident, Span, span_between, prelude_binder)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon)
+import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, mode_text)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
                              bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty,
                              unit_type)
 import compiler.emit.typing (Typed, Filings, filings, no_filings, filed_as, unknown_type)
-import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, IEffect, OpDef, FnDef, TestDef,
-                              LawDef, Binder, INames, IModule, IAlias, test_run)
-import compiler.syntax.exprs (Param, freed_by, case_at, case_identity)
+import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, FnDef, TestDef, LawDef, Binder,
+                              INames, IModule, IAlias, test_run)
+import compiler.syntax.exprs (Param, freed_by, case_at, case_identity, scheduler_module)
 import compiler.check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, lookup,
                                       ValueSpace, qualify)
 import compiler.check.resolve.scopes (of_module, of_binder)
+import compiler.expand.rewrite (program_wide)
 import compiler.check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
 import compiler.check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite,
-                                     WitnessOp, WitnessRef, Builtin, builtins, binder_key,
-                                     ReleaseSite)
+                                     WitnessOp, WitnessRef, RowSite, Builtin, builtins, EffectInfo,
+                                     OpInfo, binder_key, ReleaseSite)
+import compiler.check.infer.definitions (Extern, MachineCall, machine_calls, parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.seam (WalkedFacts, walked_facts_bin, ctors_read)
-import compiler.front.rows (Rows, KnownDefRow, CtorRow)
+import compiler.front.rows (Rows, KnownDefRow, CtorRow, EffectRow, OpRow)
 import compiler.front.published (facts_read, rows_of, walked_facts)
 import compiler.emit.code (Code, lower_fn, Releasing)
 import compiler.emit.reps (Def, Imported, Ctors, SumCtor, Ty, TyOpen, TyBytes, EffectName, OpMode,
                            EmitParam, ctors_of, ctor_sums, sig_of, def_entry, param_kinds,
-                           param_types, typed_kind, with_released)
+                           param_types, typed_kind, type_vars, with_released)
 import compiler.emit.c (Kind, KBoxed, KInt, KBool, KFloat, KDec, bytes_join_dots)
 import compiler.emit.keys (RootKey, Named, LawBody, test_key, law_key, law_owner)
 
 /// What the emitter hands the lowering for every root of one module: `builtins` are the natives the
-/// program declares, and `declared` the scheme the prelude declares each builtin at, by the same
-/// name, over variables numbered from zero in the order a call's type arguments are filed.
+/// program declares, `declared` the scheme the prelude declares each builtin at, by the same
+/// name, over variables numbered from zero in the order a call's type arguments are filed, and
+/// `machine` how a call of each native of a shipped module called over machine words crosses.
 pub type Setting = {
   module: Bytes,
   here: List<Def>,
@@ -43,6 +46,7 @@ pub type Setting = {
   ctors: Ctors,
   builtins: List<Bytes>,
   declared: Map<Bytes, Scheme>,
+  machine: Map<Bytes, MachineCall>,
   effects: List<EffectName>,
   release: Bool,
 }
@@ -84,6 +88,14 @@ pub fn setting_in(
     },
   }
 
+/// The scheduler as an import of every module where the load read it, bound to its module's name,
+/// which no source can write as a binder.
+pub fn scheduler_imported(defs_of: (Bytes) -> List<Def>) -> List<Imported> = {
+  let defs = defs_of(scheduler_module());
+  if defs.len() == 0 { [] }
+  else { [{ name: scheduler_module(), module: scheduler_module(), defs: defs, whole: true }] }
+}
+
 /// A body a module writes, a definition's, a test's or a law's, and its root. A test over cases is
 /// its run's root, and a law its body's.
 pub type ItemRoot = { item: Item, root: Root }
@@ -118,8 +130,11 @@ pub fn settings_in<b | e>(
           ctor_sums(read.rows),
         ),
         read.released,
+        |by: Bytes| schemes.get(by),
       );
       let declared = declared_schemes();
+      let effects = declared_effects(a.r, checked_operations(a.checked.effects));
+      let machine = machine_calls(parsed_natives(expanded));
       let owned = facts_by_item(facts);
       Ok(
         wanted.filter(|i: Int| i < expanded.len()).map(|i: Int| {
@@ -137,11 +152,14 @@ pub fn settings_in<b | e>(
                 m.module,
                 defs_of,
                 facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+              ).concat(
+                scheduler_imported(defs_of),
               ),
               ctors: ctors,
               builtins: [],
               declared: declared,
-              effects: effects_in(a.r, i, expanded),
+              machine: machine,
+              effects: effects_in(a.r, i, effects),
               release: false,
             },
             m.module.items.fold([], |acc: List<ItemRoot>, item: Item| {
@@ -181,8 +199,10 @@ pub fn facts_by_item(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
     into(m, x.owner, |f: RootFacts| { ..f, releases: f.releases.push(x) }));
   let called = e.members.fold(released, |m: Map<Bytes, RootFacts>, x: MemberSite|
     into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
-  facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite|
-    into(m, x.owner, |f: RootFacts| { ..f, typed: f.typed.push(x) }))
+  let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite|
+    into(m, x.owner, |f: RootFacts| { ..f, typed: f.typed.push(x) }));
+  facts.rows.fold(typed, |m: Map<Bytes, RootFacts>, x: RowSite|
+    into(m, x.owner, |f: RootFacts| { ..f, rows: f.rows.push(x) }))
 }
 
 /// What the checker filed for the nodes of the item `owner` names, by site, or why that cannot be
@@ -551,13 +571,31 @@ pub fn params_carried(
       lambda: None,
     })
 
-/// The effects module `i` names, bare or through a module's binder, each with its operations.
-pub fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<EffectName> =
-  match resolved.scopes.at(i) {
+/// Every effect the program declares, written as a clause the lowering writes names it, by its
+/// program-wide name, with its operations as `operations` holds them.
+pub fn declared_effects(resolved: Resolved, operations: Operations) -> List<EffectName> =
+  range(0, resolved.declared.len()).fold([], |acc: List<EffectName>, j: Int|
+    match resolved.declared.at(j) {
+      None -> acc,
+      Some(theirs) ->
+        theirs.effects.fold(acc, |a: List<EffectName>, b: Binding|
+          a.push({
+            written: program_wide(b.qualified),
+            global: b.qualified,
+            ops: match operations.get(b.qualified) { Some(xs) -> xs, None -> [] },
+          })),
+    })
+
+/// The effects module `i` names, bare or through a module's binder, then every one of `declared`,
+/// the program's: each with the operations of the effect its program-wide name names.
+pub fn effects_in(resolved: Resolved, i: Int, declared: List<EffectName>) -> List<EffectName> = {
+  let ops = |global: Bytes|
+    match declared.find(|e: EffectName| e.global == global) { Some(e) -> e.ops, None -> [] };
+  let named = match resolved.scopes.at(i) {
     None -> [],
     Some(scope) -> {
       let bare = scope.bound.effects.map(|b: Binding|
-        { written: b.name, global: b.qualified, ops: ops_of(mods, b.owner, b.name) });
+        { written: b.name, global: b.qualified, ops: ops(b.qualified) });
       scope.modules.fold(bare, |acc: List<EffectName>, mb: ModuleBinding|
         match resolved.declared.at(mb.target) {
           None -> acc,
@@ -566,49 +604,61 @@ pub fn effects_in(resolved: Resolved, i: Int, mods: List<ParsedModule>) -> List<
               a.push({
                 written: Bytes::concat_all([mb.binder, b"::", b.name]),
                 global: b.qualified,
-                ops: ops_of(mods, mb.target, b.name),
+                ops: ops(b.qualified),
               })),
         })
     },
-  }
-
-fn ops_of(mods: List<ParsedModule>, owner: Int, name: Bytes) -> List<OpMode> =
-  match mods.at(owner) {
-    None -> [],
-    Some(m) ->
-      m.module.items.fold([], |acc: List<OpMode>, item: Item|
-        match item {
-          IEffect(e) -> if e.name.name == name { e.ops.map(op_mode_of) } else { acc },
-          _ -> acc,
-        }),
-  }
-
-/// Operation `op` as a perform reads it: a parameter or the answer written as one of the operation's
-/// own type parameters is that parameter's variable, numbered by its place among them, and any other
-/// `_`.
-fn op_mode_of(op: OpDef) -> OpMode = {
-  let own = |te: TypeExpr| {
-    let named = match te {
-      TVar(i) -> Some(i.name),
-      TCon(c) -> if c.args.len() == 0 && c.name.module == None { Some(c.name.name.name) }
-      else { None },
-      _ -> None,
-    };
-    match named {
-      Some(n) ->
-        op.ty_params.fold({ ty: unknown_type(), k: 0 }, |acc: { ty: Type, k: Int }, p: Ident|
-          { ty: if p.name == n { TyVar(acc.k) } else { acc.ty }, k: acc.k + 1 }).ty,
-      None -> unknown_type(),
-    }
   };
-  {
-    name: op.name.name,
-    mode: op.mode,
-    params: op.params.map(own),
-    ret: own(op.ret),
-    own: range(0, op.ty_params.len()),
-  }
+  named.concat(declared)
 }
+
+/// Each effect's operations as a perform reads them, by the effect's program-wide name.
+pub type Operations = Map<Bytes, List<OpMode>>
+
+/// Operation `o` as its check typed it, as a perform reads it: its parameters and answer, and its
+/// own type parameters (`own_of`).
+pub fn op_mode_of(o: OpInfo) -> OpMode =
+  {
+    name: o.name,
+    mode: o.mode,
+    params: o.params,
+    ret: o.ret,
+    own: own_of(o.scheme, o.params, o.ret),
+  }
+
+/// The own type parameters of an operation of `params` and answer `ret`: the variables `scheme`
+/// quantifies, where it has one, else every variable its types name, which are its own alone, in the
+/// order they first stand.
+fn own_of(scheme: Option<Scheme>, params: List<Type>, ret: Type) -> List<Int> =
+  match scheme {
+    Some(s) -> s.ty_vars,
+    None ->
+      params.push(ret).fold([], |acc: List<Int>, t: Type|
+        type_vars(t).fold(acc, |a: List<Int>, v: Int| if a.contains(v) { a } else { a.push(v) })),
+  }
+
+/// The operations of each of `effects`, as a check typed them.
+pub fn checked_operations(effects: List<EffectInfo>) -> Operations =
+  effects.fold(Map::new(), |acc: Operations, e: EffectInfo|
+    acc.insert(e.name, e.ops.map(op_mode_of)))
+
+/// The operations of each of `effects`, as a front end's answer publishes them.
+pub fn published_operations(effects: List<EffectRow>) -> Operations =
+  effects.fold(Map::new(), |acc: Operations, e: EffectRow|
+    acc.insert(
+      e.name,
+      e.ops.map(|o: OpRow|
+        {
+          name: o.name,
+          mode: match [MRead, MWrite, MRaise].find(|m: Mode| mode_text(m) == o.mode) {
+            Some(m) -> m,
+            None -> MBad,
+          },
+          params: o.params,
+          ret: o.ret,
+          own: own_of(o.scheme, o.params, o.ret),
+        }),
+    ))
 
 /// What module `index`, parsed as `x_module`, imports: each import as it is written and as it
 /// resolves, then each module a function of a type or a copied default is named through by a binder
@@ -704,6 +754,7 @@ fn ctor_setting(imports: List<Imported>, names: List<Bytes>) -> Setting =
     ),
     builtins: [],
     declared: Map::new(),
+    machine: Map::new(),
     effects: [],
     release: false,
   }

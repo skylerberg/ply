@@ -2,7 +2,8 @@
 //! written for a type, a test, a law, a clause, a stored value or an entry. Its name is printed from
 //! the key, never read back into one.
 
-import compiler.check.types (Type, TyCon, TyRecord, TyNominal, Field, spelled_type, type_bin)
+import compiler.check.types (Type, TyCon, TyFn, TyRecord, TyNominal, Field, Resource, RNamed,
+                             RSingleton, RVar, RAny, spelled_type, type_bin, resource_bin)
 import compiler.check.resolve.tables (qualify, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
@@ -11,7 +12,9 @@ import std.math (ilog2)
 import std.pace (paced)
 
 /// A root. `Named` is a definition, by its qualified name. `At` is a definition at type arguments,
-/// running in place the lambdas `lent` names where it calls the parameters they are handed as.
+/// running in place the lambdas `lent` names where it calls the parameters they are handed as, and
+/// at `rows`, what each of its scheme's row variables holds, in the scheme's order, where it has
+/// any: the words it is handed for each, a label in them its caller's (`Evidence`).
 /// `Written` is an operation written for a type, in the module that declares the type where its name
 /// is qualified, and otherwise in `home`, the module asking; its `marks` are the places in `ty` (0
 /// `ty` itself, then each argument's subtree in order) that stand for an operation's own type
@@ -24,7 +27,7 @@ import std.pace (paced)
 /// as, which only this module's constructors make, so it is spelled once and never outlives a change.
 pub type RootKey =
   | Named(Bytes)
-  | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg> }, RootName)
+  | At({ def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> }, RootName)
   | Written({ op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }, RootName)
   | Test({ module: Bytes, digest: Bytes })
   | Cases(RootKey)
@@ -51,14 +54,22 @@ pub type KeyArg = | KeyType(Type) | KeyLayout({ key: Bytes, at: Type })
 /// wherever the definition moves.
 pub type FnArg = { param: Int, owner: RootKey, nth: Int }
 
-/// An operation written per type. `Equal` and `Order` compare two values of a declared sum;
-/// `Contained` is one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release`
-/// count a value of the type once more and once fewer; `Cased` is `op` done to the box of the sum's
-/// case at place `case`, which a recursive sum holds its own type in; `Worded` is `op` taking and
-/// answering the type's word form, which the runtime calls through the type's descriptor; `Held` is
-/// `op` taking the value as a body holds it, in the words its type lays it in. `Stated` is one of
-/// the operations a `numeric` names a function for (`add`, `sub`, `mul`, `neg`, `of_int`), a call
-/// of that function. `LetGo` lets go of a resource: its type's `release`, or each resource it holds.
+/// What one evidence word answers: an effect's operations on one resource, which one object serves
+/// whatever atoms of the effect a row names there. A label variable is a place: in a definition's
+/// own row, its label parameter's; in a key's rows, `RVar(k)` the `k`th label the caller hands the
+/// specialisation beside its words.
+pub type Evidence = { effect: Bytes, resource: Resource }
+
+/// An operation written per type. `Equal` and `Order` compare two values of the type; `Contained` is
+/// one of a container's walks (`equal`, `ordered`, their loops); `Dup` and `Release` count a value
+/// of the type once more and once fewer; `Cased` is `op` done to the box of the sum's case at place
+/// `case`, which a recursive sum holds its own type in; `Worded` is `op` taking and answering the
+/// type's word form, which the runtime calls through the type's descriptor; `Held` is `op` taking
+/// the value as a body holds it, in the words its type lays it in. `Stated` is one of the
+/// operations a `numeric` names a function for (`add`, `sub`, `mul`, `neg`, `of_int`), a call of
+/// that function. `Keeping` makes of a value the one its marked places kept, which a perform hands a
+/// program's clause, and `Opening` makes of one with those places kept the value they kept. `LetGo`
+/// lets go of a resource: its type's `release`, or each resource it holds.
 pub type TypeOp =
   | Equal
   | Order
@@ -79,6 +90,8 @@ pub type TypeOp =
   | Cased({ op: TypeOp, case: Int })
   | Worded(TypeOp)
   | Held(TypeOp)
+  | Keeping
+  | Opening
 
 /// A function a call reaches: a root by its key, or the `n`th generic call of the body making the
 /// call, which the unit settles on a root once every body's needs are known.
@@ -91,6 +104,7 @@ pub opaque type RootName = | RootName(Bytes)
 derive bin for KeyArg
 derive bin for TypeOp
 derive bin for FnArg
+derive bin for Evidence
 derive bin for LawPart
 derive bin for ClauseKind
 derive bin for RootKey
@@ -115,8 +129,10 @@ pub fn root_name(k: RootKey) -> RootName =
 /// never for deciding what a root is, which its key says.
 pub fn root_text(n: RootName) -> Bytes = match n { RootName(b) -> b }
 
-/// What a specialisation of `def` at `args`, running `lent` in place, is called.
-fn at_spelled(a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg> }) -> RootName =
+/// What a specialisation of `def` at `args`, running `lent` in place, at `rows`, is called.
+fn at_spelled(
+  a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg>, rows: List<List<Evidence>> },
+) -> RootName =
   RootName(
     Bytes::concat_all(
       [
@@ -136,21 +152,87 @@ fn at_spelled(a: { def: Bytes, args: List<KeyArg>, lent: List<FnArg> }) -> RootN
             b":",
             ascii_of_int(f.nth),
           ])),
+      ).concat(
+        a.rows.map(|r: List<Evidence>| b"/".concat(evidence_spelled(r))),
       ),
     ),
   )
 
-/// What operation `w.op`, written for `w.ty` with its marks, is called.
+/// Words `ws` as a name spells them: each effect, and its resource between brackets where it names
+/// one, a key's label `k` as `#k`.
+pub fn evidence_spelled(ws: List<Evidence>) -> Bytes =
+  Bytes::concat_all([
+    b"{",
+    Bytes::join(
+      ws.map(|w: Evidence|
+        match w.resource {
+          RSingleton -> w.effect,
+          RNamed(n) -> Bytes::concat_all([w.effect, b"[", n, b"]"]),
+          RAny -> w.effect.concat(b"[*]"),
+          RVar(k) -> Bytes::concat_all([w.effect, b"[#", ascii_of_int(k), b"]"]),
+        }),
+      b",",
+    ),
+    b"}",
+  ])
+
+/// What operation `w.op`, written for `w.ty` with its marks, is called. A keeping's or an opening's
+/// name holds the functions its type holds whole, which it wraps by what they take and answer.
 fn written_spelled(w: { op: TypeOp, ty: Type, home: Bytes, marks: List<Int> }) -> RootName = {
   let ty = if w.marks.len() == 0 { name_spelled(w.ty) } else {
     Bytes::concat_all([name_spelled(w.ty), b"^", Bytes::join(w.marks.map(ascii_of_int), b",")])
   };
+  let wrapped = match w.op {
+    Keeping -> holds_function(w.ty),
+    Opening -> holds_function(w.ty),
+    _ -> false,
+  };
+  let named = if wrapped { Bytes::concat_all([ty, b"@", digest_spelled(whole_spelled(w.ty))]) }
+  else { ty };
   RootName(match w.op {
-    Equal -> ty.concat(b"#eq"),
-    Order -> ty.concat(b"#cmp"),
-    _ -> qualify(type_module(w.ty, w.home), Bytes::concat_all([op_name(w.op), b"#", ty])),
+    Equal -> named.concat(b"#eq"),
+    Order -> named.concat(b"#cmp"),
+    _ -> qualify(type_module(w.ty, w.home), Bytes::concat_all([op_name(w.op), b"#", named])),
   })
 }
+
+fn holds_function(ty: Type) -> Bool =
+  match ty {
+    TyFn(_) -> true,
+    TyCon(c) -> c.args.any(holds_function),
+    TyRecord(fs) -> fs.any(|f: Field| holds_function(f.ty)),
+    TyNominal(x) -> x.args.any(holds_function) || x.fields.any(|f: Field| holds_function(f.ty)),
+    _ -> false,
+  }
+
+/// `ty` spelled whole, a function by what it takes and answers, which no layout's representative
+/// spells.
+fn whole_spelled(ty: Type) -> Bytes =
+  match ty {
+    TyFn(f) ->
+      Bytes::concat_all([
+        b"(",
+        Bytes::join(f.params.map(whole_spelled), b","),
+        b")->",
+        whole_spelled(f.ret),
+      ]),
+    TyCon(c) -> applied_spelled(c.name, c.args),
+    TyRecord(fs) ->
+      Bytes::concat_all([
+        b"{",
+        Bytes::join(
+          fs.map(|f: Field| Bytes::concat_all([f.name, b":", whole_spelled(f.ty)])),
+          b",",
+        ),
+        b"}",
+      ]),
+    TyNominal(x) -> applied_spelled(x.name, x.args),
+    _ -> spelled_type(ty),
+  }
+
+fn applied_spelled(name: Bytes, args: List<Type>) -> Bytes =
+  if args.len() == 0 { name }
+  else { Bytes::concat_all([name, b"<", Bytes::join(args.map(whole_spelled), b","), b">"]) }
 
 fn spelled(k: RootKey) -> Bytes =
   match k {
@@ -317,6 +399,8 @@ pub fn op_name(op: TypeOp) -> Bytes =
     Cased(c) -> Bytes::concat_all([op_name(c.op), b".", ascii_of_int(c.case)]),
     Worded(o) -> b"word_".concat(op_name(o)),
     Held(o) -> b"held_".concat(op_name(o)),
+    Keeping -> b"keeping",
+    Opening -> b"opening",
   }
 
 /// The module a root's body is written in: its definition's, test's or law's, or where a written
@@ -385,6 +469,10 @@ pub fn key_types(k: RootKey) -> List<Type> =
 /// The lambdas a root runs in place of calls of the parameters they are handed as.
 pub fn key_lent(k: RootKey) -> List<FnArg> = match k { At(a, _) -> a.lent, _ -> [] }
 
+/// What a root's key fills its definition's row variables with, in its scheme's order: none but for
+/// a specialisation at rows.
+pub fn key_rows(k: RootKey) -> List<List<Evidence>> = match k { At(a, _) -> a.rows, _ -> [] }
+
 /// Definition `def` at the types `args`, running `lent` in place.
 pub fn at_key(def: Bytes, args: List<Type>, lent: List<FnArg>) -> RootKey =
   at_keyed(def, args.map(KeyType), lent)
@@ -395,8 +483,17 @@ pub fn judged_at(def: Bytes, vars: Int) -> RootKey =
   at_key(def, range(0, vars).map(|_: Int| TyCon({ name: b"Int", args: [] })), [])
 
 /// Definition `def` at `args`, each a type or a layout, running `lent` in place.
-pub fn at_keyed(def: Bytes, args: List<KeyArg>, lent: List<FnArg>) -> RootKey = {
-  let a = { def: def, args: args, lent: lent };
+pub fn at_keyed(def: Bytes, args: List<KeyArg>, lent: List<FnArg>) -> RootKey =
+  at_rowed(def, args, lent, [])
+
+/// Definition `def` at `args`, running `lent` in place, its row variables at `rows`.
+pub fn at_rowed(
+  def: Bytes,
+  args: List<KeyArg>,
+  lent: List<FnArg>,
+  rows: List<List<Evidence>>,
+) -> RootKey = {
+  let a = { def: def, args: args, lent: lent, rows: rows };
   At(a, at_spelled(a))
 }
 

@@ -1,0 +1,876 @@
+//! The trusted computing base a run binds, resolved in this program from the real handlers the
+//! program's effects name, what the runtime's own families register (`machine.hosting`), and what
+//! the program declares and performs: each operation a run would serve, the refusals a
+//! registration that does not fit the program meets, the facts no row carries, and the digest a CI
+//! check pins.
+
+import compiler.front.rows (Dump, EffectRow, OpRow, DefRow, TestRow, LawRow, ModuleSpan,
+                            module_span_bin)
+import compiler.check.types (Atom, Resource, RNamed, RSingleton, RVar, RAny, Type, mentions_secret)
+import compiler.check.resolve.tables (Diag, Label)
+import compiler.syntax.type_syntax (mode_text, MRead, MWrite)
+import diagnostic (diag_of)
+import machine (Configured, Named, Stop, Unheard, Ends, Drains, Drain)
+import std.bin
+import std.bytes
+import std.bytes (u64_le)
+import std.hash (blake3)
+import std.list
+import std.machine as entering
+import std.option
+import std.string
+
+/// One triple the registrations resolve to against this program.
+pub type Row = {
+  effect: String,
+  op: String,
+  /// `None` for an operation declared without `[r]`: a singleton, not a resource named that.
+  resource: Option<String>,
+  triple: String,
+  handler: String,
+  deterministic: Bool,
+  linear: Bool,
+  blocking: Bool,
+  secrets: Bool,
+  declared_nondet: Bool,
+}
+
+/// The rows, ascending by effect, operation and label, and how many registrations there were.
+pub type Listing = { rows: List<Row>, handlers: Int }
+
+pub type Credential = { name: String, fingerprint: String, certificates: Int }
+
+pub type Transport = {
+  library: String,
+  version: String,
+  provider: String,
+  versions: List<String>,
+  alpn: List<String>,
+  roots: String,
+  roots_version: String,
+  trusted: Int,
+  credentials: List<Credential>,
+}
+
+pub type Filesystem = { roots: List<Named> }
+
+pub type Observability = {
+  sink: String,
+  destination: String,
+  /// `None` when the records are discarded, since a level then decides nothing.
+  level: Option<String>,
+  channels: List<String>,
+}
+
+/// The signals a run stops on, and its drain where it drains rather than ending at once.
+pub type Stopping = { signals: List<String>, drain: Option<Drain> }
+
+/// The blocks a listing prints under its table: facts no row can carry.
+pub type Disclosures = {
+  transport: Option<Transport>,
+  filesystem: Option<Filesystem>,
+  configured: Configured,
+  observability: Option<Observability>,
+  shutdown: Option<Stopping>,
+}
+
+/// An effect the program declares, as a binding is resolved against it: `host` its real handler,
+/// by program-wide name, where its module declares one.
+pub type Declared = {
+  name: Bytes,
+  simple_name: Bytes,
+  nondet: Bool,
+  at: ModuleSpan,
+  ops: List<DeclaredOp>,
+  host: Option<Bytes>,
+}
+
+/// `mode` is `read` or `write`; `secrets` is whether an argument may hold a `Secret`, and `waits`
+/// whether the effect's real handler waits on a ticket in its clause (`EffectRow`'s `waits`).
+pub type DeclaredOp = {
+  name: Bytes,
+  mode: Bytes,
+  resource_param: Bool,
+  at: ModuleSpan,
+  secrets: Bool,
+  waits: Bool,
+}
+
+derive bin for DeclaredOp
+derive bin for Declared
+
+/// Every effect the program declares.
+pub fn declared_of(d: Dump) -> List<Declared> =
+  d.effects.map(|e: EffectRow|
+    {
+      name: e.name,
+      simple_name: e.simple_name,
+      nondet: e.nondet,
+      at: e.at,
+      ops: e.ops.map(|o: OpRow|
+        {
+          name: o.name,
+          mode: o.mode,
+          resource_param: o.resource_param,
+          at: o.at,
+          secrets: o.params.any(|t: Type| mentions_secret(t)),
+          waits: e.waits.contains(o.name),
+        }),
+      host: e.host,
+    })
+
+/// A family `--allow` names, and the effects it lends.
+type Family = { name: String, effects: List<String> }
+
+fn families() -> List<Family> =
+  [
+    { name: "machine", effects: ["machine", "hermetic_machine"] },
+    { name: "shipped", effects: ["shipped"] },
+    { name: "toolchain", effects: ["compilers", "toolchain", "memory"] },
+  ]
+
+/// Why a run cannot lend what `--allow` names (`E0459`): a name that is no family, or a family none
+/// of whose effects the program declares, which would reach nothing.
+pub fn unlendable(allow: List<String>, declared: List<Declared>) -> Option<Diag> / {abort.raise} =
+  allow.fold(None, |found: Option<Diag>, name: String|
+    match found {
+      Some(_) -> found,
+      None -> match families().find(|f: Family| f.name == name) {
+        None ->
+          Some(
+            diag_of(
+              "error",
+              "E0459",
+              "`" ++ name ++ "` is not a family a host lends; it lends "
+                ++ String::join(families().map(|f: Family| f.name), ", "),
+              [],
+              [],
+            ),
+          ),
+        Some(f) -> if f.effects.any(|e: String|
+            declared.any(|d: Declared| String::of_bytes_lossy(d.simple_name) == e)) { None } else {
+          let named = String::join(f.effects.map(|e: String| "`" ++ e ++ "`"), " or ");
+          Some(
+            diag_of(
+              "error",
+              "E0459",
+              "`--allow " ++ name ++ "` was granted and the program declares no " ++ named
+                ++ " effect",
+              [],
+              [
+                "a family the program does not declare reaches nothing",
+                "`" ++ name ++ "` lends the operations of " ++ named
+                  ++ ", and a run lends only what the program it runs can reach",
+              ],
+            ),
+          )
+        },
+      },
+    })
+
+/// Every atom a definition, a test or a law of the program has in its footprint.
+pub fn performed(d: Dump) -> List<Atom> =
+  d.defs.fold([], |acc: List<Atom>, row: DefRow| acc.concat(row.footprint)).concat(
+    d.tests.fold([], |acc: List<Atom>, row: TestRow| acc.concat(row.footprint)),
+  ).concat(
+    d.laws.fold([], |acc: List<Atom>, row: LawRow| acc.concat(row.footprint)),
+  )
+
+/// The rows the real handlers the program's effects name and the registrations resolve to against
+/// the program, or every registration-time refusal: an effect nobody declares (`E0421`), two
+/// declarations of one name or two handlers of one triple (`E0422`), a nondeterministic handler of
+/// an effect not declared `nondet` (`E0423`).
+pub fn resolved(
+  registrations: List<entering::Registration>,
+  effects: List<Declared>,
+  performed: List<Atom>,
+) -> Result<Listing, List<Diag>> / {abort.raise} = {
+  let start: Resolving = { rows: Map::new(), claimed: Map::new(), diags: [] };
+  let served = effects.fold(start, |acc: Resolving, e: Declared| really_served(acc, e, performed));
+  let done = registrations.fold(served, |acc: Resolving, r: entering::Registration|
+    resolve_one(acc, r, effects, performed));
+  let handlers = registrations.len() + effects.filter(|e: Declared| e.host != None).len();
+  if done.diags.len() == 0 { Ok({ rows: done.rows.values(), handlers: handlers }) }
+  else { Err(done.diags) }
+}
+
+/// The rows the real handler of `e`, where its module declares one, serves: each operation on each
+/// label the program performs it on. What the declaration says is what the handler is: it is
+/// deterministic unless the effect is `nondet`, an operation is at most once where it writes, it
+/// blocks where its clause, as checked, waits on a ticket, and it may be handed a `Secret` where an
+/// argument's type holds one.
+fn really_served(acc: Resolving, e: Declared, performed: List<Atom>) -> Resolving / {abort.raise} =
+  match e.host {
+    None -> acc,
+    Some(by) -> {
+      let handler = String::of_bytes_lossy(by);
+      e.ops.fold(acc, |a: Resolving, op: DeclaredOp|
+        performed_labels(e, op, performed).fold(a, |b: Resolving, label: Resource| {
+          let key = row_key(e, op, label);
+          {
+            ..b,
+            claimed: b.claimed.insert(key, handler),
+            rows: b.rows.insert(key, {
+              effect: String::of_bytes_lossy(e.name),
+              op: String::of_bytes_lossy(op.name),
+              resource: label_name(label),
+              triple: triple_of(e, op, label),
+              handler: handler,
+              deterministic: !e.nondet,
+              linear: op.mode == b"write",
+              blocking: op.waits,
+              secrets: op.secrets,
+              declared_nondet: e.nondet,
+            }),
+          }
+        }))
+    },
+  }
+
+type Resolving = { rows: Map<Bytes, Row>, claimed: Map<Bytes, String>, diags: List<Diag> }
+
+fn resolve_one(
+  acc: Resolving,
+  r: entering::Registration,
+  effects: List<Declared>,
+  performed: List<Atom>,
+) -> Resolving / {abort.raise} =
+  if r.handler == "" { { ..acc, diags: acc.diags.push(anonymous(r)) } } else {
+    match effects.filter(|e: Declared| names_registration(r.effect, e)) {
+      [] -> if r.resource != None { { ..acc, diags: acc.diags.push(unknown_effect(r, effects)) } }
+      else { acc },
+      [declaration] -> match declaration.ops.find(|o: DeclaredOp|
+          String::of_bytes_lossy(o.name) == r.op) {
+        None -> acc,
+        Some(op) -> if !r.deterministic && !declaration.nondet {
+          { ..acc, diags: acc.diags.push(determinism(r, declaration)) }
+        } else {
+          let labels = candidates(r, declaration, op, performed);
+          if !op.resource_param && labels.any(|l: Resource| l != RSingleton) {
+            { ..acc, diags: acc.diags.push(resource_unexpected(r, op)) }
+          } else {
+            labels.fold(acc, |a: Resolving, label: Resource|
+              rowed(a, r, declaration, op, label, performed))
+          }
+        },
+      },
+      several -> { ..acc, diags: acc.diags.push(ambiguous(r, several)) },
+    }
+  }
+
+/// Whether a registration for `registered` is for `e`: the standard library's and the language's
+/// own effects by their program-wide name, the rest by their declared name.
+fn names_registration(registered: String, e: Declared) -> Bool =
+  if registered == "std" || registered.starts_with("std.")
+      || language_effects().contains(registered) { Bytes::of_string(registered) == e.name }
+  else { Bytes::of_string(registered) == e.simple_name }
+
+fn language_effects() -> List<String> = ["task", "clock", "random", "sim", "abort", "diverges"]
+
+/// The labels a registration serves: the one it names, or each the program performs the operation
+/// on, where it serves every label.
+fn candidates(
+  r: entering::Registration,
+  declaration: Declared,
+  op: DeclaredOp,
+  performed: List<Atom>,
+) -> List<Resource> =
+  match r.resource {
+    Some(named) -> [resource_of(named)],
+    None -> performed_labels(declaration, op, performed),
+  }
+
+/// Each label the program performs `op` of `declaration` on, by the operation or by its mode. A
+/// label a caller fills is no resource to serve: the call that fills it names one.
+fn performed_labels(
+  declaration: Declared,
+  op: DeclaredOp,
+  performed: List<Atom>,
+) -> List<Resource> =
+  performed.fold([], |acc: List<Resource>, a: Atom|
+    if a.effect == declaration.name && !is_variable(a.resource)
+        && (match a.op { Some(o) -> o == op.name, None -> mode_text(a.mode) == op.mode })
+        && !acc.contains(a.resource) { acc.push(a.resource) }
+    else { acc })
+
+fn is_variable(r: Resource) -> Bool = match r { RVar(_) -> true, _ -> false }
+
+fn resource_of(r: entering::Resource) -> Resource =
+  match r {
+    entering::Singleton -> RSingleton,
+    entering::Labelled(name) -> RNamed(Bytes::of_string(name)),
+    entering::Every -> RAny,
+    entering::Variable(n) -> RVar(n),
+  }
+
+fn rowed(
+  acc: Resolving,
+  r: entering::Registration,
+  declaration: Declared,
+  op: DeclaredOp,
+  label: Resource,
+  performed: List<Atom>,
+) -> Resolving / {abort.raise} = {
+  let triple = triple_of(declaration, op, label);
+  let unused = r.resource != None
+    && !performed.any(|p: Atom|
+      p.effect == declaration.name && p.resource == label
+        && (p.op == Some(op.name) || (p.op == None && mode_text(p.mode) == op.mode)));
+  if unused { { ..acc, diags: acc.diags.push(unused_resource(r, triple, declaration)) } } else {
+    let key = row_key(declaration, op, label);
+    match acc.claimed.get(key) {
+      Some(first) -> { ..acc, diags: acc.diags.push(conflict(r, first)) },
+      None ->
+        {
+          ..acc,
+          claimed: acc.claimed.insert(key, r.handler),
+          rows: acc.rows.insert(key, {
+            effect: String::of_bytes_lossy(declaration.name),
+            op: r.op,
+            resource: label_name(label),
+            triple: triple,
+            handler: r.handler,
+            deterministic: r.deterministic,
+            linear: !r.repeatable,
+            blocking: r.blocking,
+            secrets: r.secrets,
+            declared_nondet: declaration.nondet,
+          }),
+        },
+    }
+  }
+}
+
+/// `op` of `declaration` on `label`, as a row prints it.
+fn triple_of(declaration: Declared, op: DeclaredOp, label: Resource) -> String =
+  String::of_bytes_lossy(declaration.name) ++ "." ++ String::of_bytes_lossy(op.name)
+    ++ label_text(label)
+
+/// What the rows are claimed and ordered by: the effect, the operation and the label.
+fn row_key(declaration: Declared, op: DeclaredOp, label: Resource) -> Bytes =
+  Bytes::concat_all([declaration.name, b"\x00", op.name, b"\x00", label_key(label)])
+
+/// The label a row names, `None` where the operation is on no label.
+fn label_name(r: Resource) -> Option<String> =
+  match r { RNamed(n) -> Some(String::of_bytes_lossy(n)), _ -> None }
+
+/// A label as a triple prints it.
+fn label_text(r: Resource) -> String =
+  match r {
+    RNamed(n) -> "[" ++ String::of_bytes_lossy(n) ++ "]",
+    RSingleton -> "",
+    RAny -> "[*]",
+    RVar(n) -> "[$" ++ n.to_string() ++ "]",
+  }
+
+/// A label as the rows sort by it: a named one before the singleton before every label, as an
+/// atom orders its resources.
+fn label_key(r: Resource) -> Bytes =
+  match r {
+    RNamed(n) -> b"0".concat(n),
+    RVar(n) -> b"1".concat(Bytes::of_string(n.to_string())),
+    RSingleton -> b"2",
+    RAny -> b"3",
+  }
+
+/// Whether a run reaching `footprint` reaches the host: an atom of it covers a row a
+/// nondeterministic handler serves.
+pub fn reaches(listing: Listing, footprint: List<Atom>) -> Bool =
+  footprint.any(|a: Atom|
+    listing.rows.any(|row: Row|
+      !row.deterministic && String::of_bytes_lossy(a.effect) == row.effect
+        && (match a.op { Some(o) -> String::of_bytes_lossy(o) == row.op, None -> true })
+        && label_matches(a.resource, row.resource)))
+
+fn label_matches(r: Resource, row: Option<String>) -> Bool =
+  match ((r, row)) {
+    (RNamed(n), Some(name)) -> String::of_bytes_lossy(n) == name,
+    (RSingleton, None) -> true,
+    _ -> false,
+  }
+
+// --- What no row carries -------------------------------------------------------------
+
+/// The blocks a run's listing prints, from what the runtime says of its families and what this
+/// program resolved: the TLS stack where a row can listen or the run holds a credential, the roots
+/// where a row reads a file or opens a database or the run binds one, the configuration where a
+/// source was read, the sink where a row traces on a channel, and the signals the run stops on where
+/// it meets a stop itself (`stop_of`).
+pub fn disclosures_of(
+  listing: Listing,
+  hosting: entering::Hosting,
+  configured: Configured,
+  stop: Option<Drain>,
+) -> Disclosures = {
+  let facility = |name: String|
+    hosting.registrations.any(|r: entering::Registration|
+      r.facility == name && listing.rows.any(|row: Row| row.handler == r.handler));
+  let channels = listing.rows.fold([], |acc: List<String>, row: Row|
+    if row.effect == "std.trace.trace" {
+      match row.resource { Some(c) -> if acc.contains(c) { acc } else { acc.push(c) }, None -> acc }
+    } else { acc }).sort(
+  );
+  {
+    transport: match hosting.transport {
+      Some(t) -> if t.credentials.len() > 0 || t.trusted > 0 {
+        Some({
+          library: t.library,
+          version: t.version,
+          provider: t.provider,
+          versions: t.versions,
+          alpn: t.alpn,
+          roots: t.roots,
+          roots_version: t.roots_version,
+          trusted: t.trusted,
+          credentials: t.credentials.map(|c: entering::Credential|
+            { name: c.name, fingerprint: c.fingerprint, certificates: c.certificates }),
+        })
+      } else { None },
+      None -> None,
+    },
+    filesystem: if facility("fs") || listing.rows.any(|row: Row| row.effect == "std.sqlite.sqlite")
+        || hosting.roots.len() > 0 {
+      Some({ roots: hosting.roots.map(|n: entering::Named| { name: n.name, path: n.path }) })
+    } else { None },
+    configured: configured,
+    observability: if channels.len() == 0 { None } else {
+      Some({
+        sink: hosting.sink.sink,
+        destination: hosting.sink.destination,
+        level: hosting.sink.level,
+        channels: channels,
+      })
+    },
+    shutdown: match stop {
+      Some(bounds) -> match stop_of(listing.rows) {
+        Unheard -> None,
+        Ends -> Some({ signals: hosting.signals, drain: None }),
+        Drains -> Some({ signals: hosting.signals, drain: Some(bounds) }),
+      },
+      None -> None,
+    },
+  }
+}
+
+/// How a run that binds `rows` meets a stop: it drains where it asks for one or accepts
+/// connections, which a drain closes; it ends its children and exits where it starts a child,
+/// which would otherwise outlive it; and any other is left to the platform, which ends it.
+pub fn stop_of(rows: List<Row>) -> Stop =
+  if rows.any(|row: Row|
+      row.effect == "std.signal.signal" || (row.effect == "std.net.net" && row.op == "accept")) {
+    Drains
+  } else if rows.any(|row: Row|
+      row.effect == "std.process.process" && (row.op == "start" || row.op == "spawn")) { Ends }
+  else { Unheard }
+
+/// No block: a run that discloses nothing past its rows, whose digest is theirs alone.
+pub fn no_disclosures() -> Disclosures =
+  {
+    transport: None,
+    filesystem: None,
+    configured: { values: [], schema: None, opened: false },
+    observability: None,
+    shutdown: None,
+  }
+
+/// The line a run prints of its sink.
+pub fn banner(o: Observability) -> String =
+  o.sink ++ " → " ++ o.destination ++ (match o.level { Some(l) -> " · level " ++ l, None -> "" })
+    ++ " · channels "
+    ++ String::join(o.channels, " ")
+
+// --- What a binding reports --------------------------------------------------------
+
+/// The TLS handshakes a binding completed and refused, with how many each reason refused.
+pub type Handshakes = { completed: Int, refused: Int, reasons: List<Refused> }
+
+pub type Refused = { reason: String, count: Int }
+
+derive bin for Refused
+derive bin for Handshakes
+
+/// The report named `name` among what a binding said as it was torn down, read by `codec`; none
+/// where it said nothing of the kind.
+pub fn report_of<a>(
+  reports: List<entering::Report>,
+  name: String,
+  codec: bin::BinCodec<a>,
+) -> Option<a> / {abort.raise} =
+  match reports.find(|r: entering::Report| r.name == name) {
+    Some(r) -> match bin::decode(r.body, codec) {
+      Ok(x) -> Some(x),
+      Err(why) -> panic("the runtime's `" ++ name ++ "` report does not read: " ++ why.message),
+    },
+    None -> None,
+  }
+
+/// The lines a run prints of its handshakes, none where it made none.
+pub fn handshake_lines(reports: List<entering::Report>) -> List<String> / {abort.raise} =
+  match report_of(reports, "handshakes", handshakes_bin()) {
+    Some(h) ->
+      [
+        "handshakes: " ++ h.completed.to_string() ++ " completed, " ++ h.refused.to_string()
+          ++ " refused",
+      ].concat(
+        h.reasons.map(|r: Refused| "  " ++ r.count.to_string() ++ " " ++ r.reason),
+      ),
+    None -> [],
+  }
+
+// --- The digest --------------------------------------------------------------------
+
+/// The one line a CI check pins of what a run trusts: the rows, and every block past them but the
+/// paths and the values a deployment chooses for itself.
+pub fn digest_of(listing: Listing, d: Disclosures) -> String / {abort.raise} =
+  if d.transport == None && d.filesystem == None && d.observability == None && d.shutdown == None
+      && d.configured.schema == None { short(rows_digest(listing)) } else {
+    short(
+      blake3(
+        Bytes::concat_all([
+          b"ply.hosts.transport.v1\x00",
+          rows_digest(listing),
+          match d.transport { Some(t) -> transport_hashed(t), None -> b"" },
+          match d.filesystem {
+            Some(f) ->
+              f.roots.fold(b"ply.hosts.filesystem.v1\x00", |acc: Bytes, n: Named|
+                Bytes::concat_all([acc, Bytes::of_string(n.name), b"\x00"])),
+            None -> b"",
+          },
+          match d.configured.schema {
+            Some(s) ->
+              s.keys.fold(
+                b"ply.hosts.configuration.v1\x00".concat(sized(s.function)),
+                |acc: Bytes, k: { name: String, shape: String }|
+                  Bytes::concat_all([acc, sized(k.name), sized(k.shape)]),
+              ),
+            None -> b"",
+          },
+          match d.observability {
+            Some(o) ->
+              o.channels.fold(
+                Bytes::concat_all([
+                  b"ply.hosts.observability.v1\x00",
+                  sized(o.sink),
+                  sized(o.destination),
+                  sized(match o.level { Some(l) -> l, None -> "" }),
+                  u64_le(o.channels.len()),
+                ]),
+                |acc: Bytes, c: String| acc.concat(sized(c)),
+              ),
+            None -> b"",
+          },
+          match d.shutdown {
+            Some(s) -> match s.drain {
+              Some(drain) ->
+                Bytes::concat_all([
+                  s.signals.fold(b"ply.hosts.shutdown.v1\x00", |acc: Bytes, n: String|
+                    acc.concat(sized(n))),
+                  u64_le(drain.lead_ms),
+                  u64_le(drain.drain_ms),
+                ]),
+              None ->
+                s.signals.fold(b"ply.hosts.shutdown.ends.v1\x00", |acc: Bytes, n: String|
+                  acc.concat(sized(n))),
+            },
+            None -> b"",
+          },
+        ]),
+      ),
+    )
+  }
+
+/// BLAKE3 over the rows, domain-tagged and length-prefixed.
+fn rows_digest(listing: Listing) -> Bytes / {abort.raise} =
+  blake3(
+    listing.rows.fold(b"ply.hosts.1".concat(u64_le(listing.rows.len())), |acc: Bytes, row: Row|
+      Bytes::concat_all([
+        acc,
+        sized(row.triple),
+        sized(row.handler),
+        flag(row.deterministic),
+        flag(row.linear),
+        flag(row.blocking),
+        flag(row.secrets),
+        flag(row.declared_nondet),
+      ])),
+  )
+
+/// The credential names, the provider and the library version, never a key.
+fn transport_hashed(t: Transport) -> Bytes =
+  Bytes::concat_all([
+    sized(t.library),
+    sized(t.version),
+    sized(t.provider),
+    sized(t.roots),
+    sized(t.roots_version),
+    u64_le(t.trusted),
+    u64_le(t.credentials.len()),
+  ]).concat(
+    Bytes::concat_all(t.credentials.map(|c: Credential| sized(c.name))),
+  )
+
+fn sized(text: String) -> Bytes = {
+  let b = Bytes::of_string(text);
+  u64_le(b.len()).concat(b)
+}
+
+fn flag(b: Bool) -> Bytes = if b { b"\x01" } else { b"\x00" }
+
+/// `b3:` and the digest's first six bytes, as a report prints one.
+fn short(digest: Bytes) -> String / {abort.raise} = "b3:" ++ digest.slice(0, 6).hex_of()
+
+// --- The refusals -------------------------------------------------------------------
+
+fn registered(r: entering::Registration) -> String =
+  r.effect ++ "." ++ r.op
+    ++ (match r.resource {
+      Some(entering::Singleton) -> "",
+      Some(entering::Labelled(name)) -> "[" ++ name ++ "]",
+      Some(entering::Every) -> "[*]",
+      Some(entering::Variable(n)) -> "[$" ++ n.to_string() ++ "]",
+      None -> "[..]",
+    })
+
+fn spanned(at: ModuleSpan, text: Bytes) -> Label =
+  { module: at.module, start: at.start, end: at.end, primary: false, text: text }
+
+fn anonymous(r: entering::Registration) -> Diag =
+  diag_of(
+    "error",
+    "E0421",
+    "a host handler for `" ++ registered(r) ++ "` declares no Rust path",
+    [],
+    [
+      "`ply hosts` prints the path, and it is the reviewable identity of a member of the trusted computing base",
+      "give the registration a `path` naming the function that serves it, such as `ply_host::fs::read_file`",
+    ],
+  )
+
+fn unknown_effect(r: entering::Registration, effects: List<Declared>) -> Diag / {abort.raise} =
+  diag_of(
+    "error",
+    "E0421",
+    "`" ++ r.handler ++ "` registers for `" ++ registered(r)
+      ++ "`, which this program does not declare",
+    [],
+    ["no effect named `" ++ r.effect ++ "` is declared anywhere in the program"].concat(
+      match nearest_effect(r.effect, effects) {
+        Some(near) ->
+          [
+            "the closest declared effect is `" ++ near ++ "`",
+            "declare `effect " ++ r.effect
+              ++ "` with the operations this handler serves, or register against `"
+              ++ simple_of(near)
+              ++ "`",
+          ],
+        None -> [],
+      },
+    ).push(
+      "a host handler's triple is its footprint claim; a claim about an effect nothing declares is a claim about nothing",
+    ),
+  )
+
+fn ambiguous(r: entering::Registration, declared: List<Declared>) -> Diag =
+  diag_of(
+    "error",
+    "E0422",
+    "`" ++ r.handler ++ "` registers for `" ++ registered(r) ++ "`, and this program declares `"
+      ++ r.effect
+      ++ "` "
+      ++ declared.len().to_string()
+      ++ " times",
+    declared.map(|e: Declared| spanned(e.at, b"declared here")),
+    [
+      "declared as "
+        ++ String::join(
+          declared.map(|e: Declared| "`" ++ String::of_bytes_lossy(e.name) ++ "`"),
+          " and ",
+        ),
+      "effects are nominal, so these are different effects that share a spelling, and one host handler cannot be both",
+      "rename one declaration, or keep a single one and import it where it is used",
+    ],
+  )
+
+fn determinism(r: entering::Registration, declaration: Declared) -> Diag = {
+  let simple = String::of_bytes_lossy(declaration.simple_name);
+  diag_of(
+    "error",
+    "E0423",
+    "`" ++ r.handler ++ "` is nondeterministic, but `effect " ++ simple
+      ++ "` is not declared `nondet`",
+    [spanned(declaration.at, b"declared here, without `nondet`")],
+    [
+      "write `nondet effect " ++ simple ++ "` so that a `det` test reaching it is E0412",
+      "or declare the handler `Determinism::Deterministic` if its answers really are a function of the program state",
+      "the declaration is the authority: a binding may not change what inference computed, or `ply check` would answer differently from what a run binds",
+    ],
+  )
+}
+
+fn resource_unexpected(r: entering::Registration, op: DeclaredOp) -> Diag =
+  diag_of(
+    "error",
+    "E0421",
+    "`" ++ r.handler ++ "` registers for `" ++ registered(r) ++ "`, but `" ++ r.effect ++ "."
+      ++ r.op
+      ++ "` is not resource-parameterized",
+    [spanned(op.at, b"declared without `[r]`")],
+    [
+      "an operation declared without `[r]` has one singleton resource",
+      "register `HostResource::Only(Resource::Singleton)`, or add `[r]` to the declaration",
+    ],
+  )
+
+fn unused_resource(r: entering::Registration, triple: String, declaration: Declared) -> Diag =
+  diag_of(
+    "error",
+    "E0421",
+    "`" ++ r.handler ++ "` registers for `" ++ triple ++ "`, which this program never performs",
+    [spanned(declaration.at, b"the effect is declared here")],
+    [
+      "no definition, test or law in the program has that atom in its footprint",
+      "check the resource label, or register `HostResource::Any` to serve whichever labels the program uses",
+    ],
+  )
+
+fn conflict(r: entering::Registration, first: String) -> Diag =
+  diag_of("error", "E0422", "two host handlers claim `" ++ registered(r) ++ "`", [], [
+    "`" ++ first ++ "` and `" ++ r.handler ++ "` both serve it",
+    "which one answers would decide which real resource is touched; narrow one registration's resource, or remove it",
+  ])
+
+/// The declared effect nearest `wanted`: one of its simple name, else the one sharing the longest
+/// start with it, where that is at least two letters and half the shorter name.
+fn nearest_effect(wanted: String, effects: List<Declared>) -> Option<String> / {abort.raise} = {
+  let simple = simple_of(wanted);
+  match effects.find(|e: Declared| String::of_bytes_lossy(e.simple_name) == simple) {
+    Some(e) -> Some(String::of_bytes_lossy(e.name)),
+    None ->
+      effects.fold(None, |best: Option<{ shared: Int, name: String }>, e: Declared| {
+        let name = String::of_bytes_lossy(e.name);
+        let own = simple_of(name);
+        let shared = shared_prefix(own, simple);
+        if shared >= 2 && shared * 2 >= min(own.len(), simple.len())
+            && (match best {
+              Some(b) ->
+                shared > b.shared
+                  || (shared == b.shared
+                  && Bytes::of_string(name).compare(Bytes::of_string(b.name)) == Less),
+              None -> true,
+            }) { Some({ shared: shared, name: name }) }
+        else { best }
+      }).map(|b: { shared: Int, name: String }| b.name),
+  }
+}
+
+fn simple_of(name: String) -> String = match name.split(".").last() { Some(s) -> s, None -> name }
+
+fn shared_prefix(a: String, b: String) -> Int = {
+  let x = Bytes::of_string(a);
+  let y = Bytes::of_string(b);
+  range(0, min(x.len(), y.len())).fold(
+    { n: 0, going: true },
+    |acc: { n: Int, going: Bool }, i: Int|
+      if acc.going && x.at(i) == y.at(i) { { n: acc.n + 1, going: true } }
+      else { { ..acc, going: false } },
+  ).n
+}
+
+/// `kdf`, served by its real handler: `hash` hands it a secret and waits on a ticket, `stamp`
+/// writes on a label, and `idle` is performed by nothing.
+fn hashing() -> Declared = {
+  let at: ModuleSpan = { module: 0, start: 0, end: 0 };
+  let op = |name: Bytes, mode: Bytes, labelled: Bool, secrets: Bool, waits: Bool|
+    { name: name, mode: mode, resource_param: labelled, at: at, secrets: secrets, waits: waits };
+  {
+    name: b"std.password.kdf",
+    simple_name: b"kdf",
+    nondet: false,
+    at: at,
+    ops: [
+      op(b"hash", b"read", false, true, true),
+      op(b"stamp", b"write", true, false, false),
+      op(b"idle", b"read", false, false, false),
+    ],
+    host: Some(b"std.password.served"),
+  }
+}
+
+fn hashed() -> List<Atom> =
+  [
+    { effect: b"std.password.kdf", resource: RSingleton, mode: MRead, op: Some(b"hash") },
+    { effect: b"std.password.kdf", resource: RNamed(b"log"), mode: MWrite, op: None },
+  ]
+
+test "a real handler serves each operation of its effect on each label the program performs it on" {
+  match resolved([], [hashing()], hashed()) {
+    Err(diags) -> panic("refused with " ++ diags.len().to_string() ++ " diagnostics"),
+    Ok(l) -> {
+      assert_eq(l.handlers, 1);
+      assert_eq(
+        l.rows.map(|r: Row|
+          (
+            r.triple,
+            r.handler,
+            r.deterministic,
+            r.linear,
+            r.blocking,
+            r.secrets,
+            r.declared_nondet,
+          )),
+        [
+          ("std.password.kdf.hash", "std.password.served", true, false, true, true, false),
+          ("std.password.kdf.stamp[log]", "std.password.served", true, true, false, false, false),
+        ],
+      );
+      assert(!reaches(l, hashed()), Some("a deterministic handler reaches no host"))
+    },
+  }
+}
+
+/// A row of `named.op` on no label, as a run binds it.
+fn bound_row(named: String, op: String) -> Row =
+  {
+    effect: named,
+    op: op,
+    resource: None,
+    triple: named ++ "." ++ op,
+    handler: "",
+    deterministic: false,
+    linear: false,
+    blocking: false,
+    secrets: false,
+    declared_nondet: true,
+  }
+
+test "a run drains where it asks for a stop or accepts, ends at once where it starts a child, and is otherwise left to the platform" {
+  let start = bound_row("std.process.process", "start");
+  let spawn = bound_row("std.process.process", "spawn");
+  let accept = bound_row("std.net.net", "accept");
+  let asks = bound_row("std.signal.signal", "stopping");
+  let prints = bound_row("std.process.process", "out");
+  assert_eq(stop_of([]), Unheard);
+  assert_eq(stop_of([prints, bound_row("std.net.net", "connect")]), Unheard);
+  assert_eq(stop_of([prints, start]), Ends);
+  assert_eq(stop_of([spawn]), Ends);
+  assert_eq(stop_of([start, accept]), Drains);
+  assert_eq(stop_of([asks, spawn]), Drains)
+}
+
+test "a registration of an operation a real handler serves is a second handler of it" {
+  let registered: entering::Registration = {
+    effect: "std.password.kdf",
+    op: "hash",
+    resource: None,
+    deterministic: true,
+    repeatable: true,
+    blocking: false,
+    secrets: true,
+    handler: "ply_host::kdf::hash",
+    facility: "",
+  };
+  match resolved([registered], [hashing()], hashed()) {
+    Ok(_) -> panic("two handlers of `kdf.hash` were listed"),
+    Err(diags) -> assert_eq(diags.map(|d: Diag| d.code), [b"E0422"]),
+  }
+}

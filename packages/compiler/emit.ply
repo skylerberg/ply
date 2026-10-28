@@ -6,28 +6,29 @@ import compiler.emit.code (Code, lower_fn)
 import compiler.syntax.items (Module, Derived, Item, IFn, ITest, ILaw, IType, parse, with_prelude,
                               Binder, SpecClause, SRequires, SEnsures, SCost, SSpace, FnDef,
                               test_run, test_listing, IInstance, VariantDef, TDSum, INumeric,
-                              NumericOp, NKey, NInvariant, TestDef)
+                              NumericOp, NKey, NInvariant, NHost, TestDef)
 import compiler.check.resolve.tables (ParsedModule, Source, Diag, Resolved, qualify, default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
 import compiler.check.resolve.scopes (PackageDeps, no_packages, of_binder)
 import compiler.expand.derive (expand_derives)
 import compiler.check.infer.checker (MemberSite, WitnessOp, listing_ty)
 import compiler.check.infer (RootFacts, expanded_mods)
-import compiler.check.infer.definitions (Extern, parsed_natives)
-import compiler.check.types (Type, TyCon, TyVar, TyFn, Scheme, int_type, bool_type, bytes_type,
-                             unit_type, fn_type, monomorphic, row_empty)
+import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, machine_calls)
+import compiler.check.types (Type, TyCon, TyVar, TyFn, Scheme, Atom, int_type, bool_type,
+                             bytes_type, unit_type, fn_type, monomorphic, row_empty, read_atoms)
 import compiler.emit.lower.setting (Setting, declared_schemes, walked_read, defs_in,
-                                    resolved_imports, effects_in, params_carried, law_params,
-                                    facts_by_item, filings_of, labels_of, param_type, releasing_of)
+                                    resolved_imports, effects_in, declared_effects, params_carried,
+                                    law_params, facts_by_item, filings_of, labels_of, param_type,
+                                    scheduler_imported, published_operations, releasing_of)
 import compiler.emit.lower.calling (known_body, lambdas_of, named_in, def_in)
 import compiler.emit.lower.scalars (walked_container)
 import compiler.emit.typing (Typed, Filings, no_filings)
-import compiler.front.rows (Rows, KnownDefRow, ModuleDerivations)
+import compiler.front.rows (Rows, KnownDefRow, KnownTestRow, ModuleDerivations, EffectRow)
 import compiler.front.published (facts_read)
 import std.list
 import compiler.front.diagnostics (with_prelude_source)
 import compiler.store.hash.template (written_code)
-import compiler.syntax.exprs (Param, Expr, case_at, case_identity)
+import compiler.syntax.exprs (Param, Expr, case_at, case_identity, prelude_hosts)
 import compiler.expand.rewrite (expand)
 import compiler.expand.embed (EmbedAt, embed_tables, rewritten)
 import compiler.emit.c (KBoxed, KInt, Kind, bytes_join)
@@ -45,10 +46,11 @@ import compiler.emit.lend (Handing, Settled, handings_of, lendings_of, declared_
 import compiler.emit.reps (Ctors, SumCtor, Ty, TyBytes, TyOpen, Def, Imported, EffectName,
                            EmitParam, BoundLambda, OwnerLambdas, kind_of, boxed, Sig, sig_of,
                            param_kinds, param_types, typed_kind, filings_at, at_args, substituted)
-import compiler.emit.written (WrittenRoot, CrossedSums, container_code, contained_formed,
-                              crossing_root, crossing_op, entered_code, stored_code, crosses,
-                              equality_code, ordering_code, keyed_by, keyed_code, numeric_stated,
-                              stated_code, digest_code, reflection_code, let_go_code,
+import compiler.emit.written (WrittenRoot, WrittenCode, CrossedSums, container_code,
+                              contained_formed, crossing_root, crossing_op, entered_code,
+                              stored_code, crosses, equality_code, compared_code, ordering_code,
+                              ordered_code, keyed_by, keyed_code, numeric_stated, stated_code,
+                              digest_code, reflection_code, called_def, let_go_code,
                               let_go_items_code)
 import compiler.emit.entry (Prepared, RootForm, Formed, Unformed, root_formed, formed_from,
                             emitted_of)
@@ -134,11 +136,24 @@ pub fn emit_program(
   placed: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
+  effects: List<EffectRow>,
   walked: Bytes,
   published: List<Published> = [],
 ) -> List<Emitted> / {abort.raise} =
   emitted_program(
-    lowered_program(given, ctors, release, roots, pkgs, placed, embeds, rows, walked, published),
+    lowered_program(
+      given,
+      ctors,
+      release,
+      roots,
+      pkgs,
+      placed,
+      embeds,
+      rows,
+      effects,
+      walked,
+      published,
+    ),
   )
 
 /// Each root `w` holds written against the handings the lending inference settles for the
@@ -210,10 +225,11 @@ fn lowered_program(
   placed: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
+  effects: List<EffectRow>,
   walked: Bytes,
   published: List<Published>,
 ) -> Walked / {abort.raise} =
-  match scope_of(given, ctors, release, roots, pkgs, placed, embeds, rows, walked) {
+  match scope_of(given, ctors, release, roots, pkgs, placed, embeds, rows, effects, walked) {
     Err(why) ->
       {
         roots: refused_rather_than_emitted(roots, why),
@@ -242,10 +258,20 @@ pub type Scope = {
   stated: Map<Bytes, List<Bytes>>,
   ctors: Ctors,
   builtins: List<Bytes>,
+  /// How a call of each native of a shipped module called over machine words crosses.
+  machine: Map<Bytes, MachineCall>,
   release: Bool,
   declared: Map<Bytes, Scheme>,
   lent: Map<RootName, List<Int>>,
+  /// Each effect whose module declares its real handler, by program-wide name.
+  hosts: Map<Bytes, Hosting>,
+  /// The atoms each test performs once it has handled what it handles, by its key.
+  test_rows: Map<Bytes, List<Atom>>,
 }
+
+/// An effect's real handler as an entry calls it: by `call`, a name `import` binds and no source
+/// can write.
+pub type Hosting = { call: Bytes, import: Imported }
 
 /// A module of a scope as the roots in it are lowered: the definitions it writes and those it
 /// imports, the effects it names, and the operations its check witnessed.
@@ -269,7 +295,8 @@ pub fn answered(
 /// lowers nothing, where a module does not parse or the program does not resolve. `pkgs` and
 /// `placed` are the program's package tables, empty for one without packages: resolution then
 /// treats every module as one package's, which is what no packages means. A library derivation
-/// expands to what `derived` says its load's deriver wrote.
+/// expands to what `derived` says its load's deriver wrote. Each effect's operations are read as
+/// `effects` publishes them.
 pub fn scope_of(
   given: List<Source>,
   ctors: Ctors,
@@ -279,6 +306,7 @@ pub fn scope_of(
   placed: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
+  effects: List<EffectRow>,
   walked: Bytes,
   derived: List<ModuleDerivations> = [],
 ) -> Result<Scope, Bytes> / {abort.raise} = {
@@ -384,47 +412,67 @@ pub fn scope_of(
                         List::push(match acc.get(o.module) { Some(xs) -> xs, None -> [] }, o),
                       ),
                   );
-                  Ok({
-                    mods: mods,
-                    places: range(0, mods.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-                      acc.insert(mods.get(i).name, i)),
-                    modules: range(0, mods.len()).map(|i: Int| {
-                      let m = mods.get(i);
-                      {
-                        here: defs_of(m.name),
-                        imports: resolved_imports(
-                          x.r,
-                          i,
-                          mods,
-                          m.module,
-                          defs_of,
-                          match members.get(i) { Some(xs) -> xs, None -> [] },
+                  let natives = parsed_natives(mods);
+                  let declared = declared_effects(x.r, published_operations(effects));
+                  match hostings(mods, defs_of) {
+                    Err(why) -> Err(why),
+                    Ok(hosts) ->
+                      Ok({
+                        mods: mods,
+                        places: range(0, mods.len()).fold(
+                          Map::new(),
+                          |acc: Map<Bytes, Int>, i: Int| acc.insert(mods.get(i).name, i),
                         ),
-                        effects: effects_in(x.r, i, mods),
-                        ops: match ops.get(i) { Some(xs) -> xs, None -> [] },
-                      }
-                    }),
-                    resolved: x.r,
-                    schemes: schemes,
-                    // What the check filed of each item's nodes, which its roots and the lambdas it
-                    // lends are read under.
-                    owned: facts_by_item(facts),
-                    reading: reading,
-                    stated: stated_by_tag(mods),
-                    ctors: {
-                      ..ctors,
-                      keyed: keyed_tags(mods).fold(ctors.keyed, |acc: List<Bytes>, k: Bytes|
-                        if acc.contains(k) { acc } else { acc.push(k) }),
-                    },
-                    builtins: parsed_natives(mods).map(|e: Extern| e.name),
-                    release: release,
-                    declared: declared_schemes(),
-                    lent: program.fold(
-                      Map::new(),
-                      |m: Map<RootName, List<Int>>, module: Bytes, defs: List<Def>|
-                        declared_lent(m, module, defs),
-                    ),
-                  })
+                        modules: range(0, mods.len()).map(|i: Int| {
+                          let m = mods.get(i);
+                          {
+                            here: defs_of(m.name),
+                            imports: resolved_imports(
+                              x.r,
+                              i,
+                              mods,
+                              m.module,
+                              defs_of,
+                              match members.get(i) { Some(xs) -> xs, None -> [] },
+                            ).concat(
+                              scheduler_imported(defs_of),
+                            ),
+                            effects: effects_in(x.r, i, declared),
+                            ops: match ops.get(i) { Some(xs) -> xs, None -> [] },
+                          }
+                        }),
+                        resolved: x.r,
+                        schemes: schemes,
+                        // What the check filed of each item's nodes, which its roots and the lambdas
+                        // it lends are read under.
+                        owned: facts_by_item(facts),
+                        reading: reading,
+                        stated: stated_by_tag(mods),
+                        ctors: {
+                          ..ctors,
+                          keyed: keyed_tags(mods).fold(ctors.keyed, |acc: List<Bytes>, k: Bytes|
+                            if acc.contains(k) { acc } else { acc.push(k) }),
+                        },
+                        builtins: natives.map(|e: Extern| e.name),
+                        machine: machine_calls(natives),
+                        release: release,
+                        declared: declared_schemes(),
+                        lent: program.fold(
+                          Map::new(),
+                          |m: Map<RootName, List<Int>>, module: Bytes, defs: List<Def>|
+                            declared_lent(m, module, defs),
+                        ),
+                        hosts: prelude_hosted(hosts, defs_of),
+                        test_rows: rows.tests.fold(
+                          Map::new(),
+                          |m: Map<Bytes, List<Atom>>, r: KnownTestRow|
+                            match read_atoms(r.footprint) {
+                              Some(xs) -> m.insert(r.key, xs),
+                              None -> m,
+                            },
+                        ),
+                      }),
+                  }
                 },
               }
             },
@@ -434,6 +482,73 @@ pub fn scope_of(
     },
   }
 }
+
+/// Each effect of `mods` whose module declares its real handler, and how an entry calls it: through
+/// a binder named for the effect, which no source can write, over the handler's definition as its
+/// module holds it (`defs_of`). Refused where a module holds no definition of a handler it names,
+/// since every root performing the effect would otherwise run under none.
+fn hostings(
+  mods: List<ParsedModule>,
+  defs_of: (Bytes) -> List<Def>,
+) -> Result<Map<Bytes, Hosting>, Bytes> / {abort.raise} =
+  mods.fold(Ok(Map::new()), |acc: Result<Map<Bytes, Hosting>, Bytes>, m: ParsedModule|
+    m.module.items.fold(acc, |held: Result<Map<Bytes, Hosting>, Bytes>, item: Item|
+      match ((held, item)) {
+        (Ok(a), IInstance(d)) -> if d.kind != NHost { held } else {
+          let served = qualify(m.name, d.target.name);
+          match defs_of(m.name).find(|def: Def| def.name == d.by.name) {
+            None ->
+              Err(
+                Bytes::concat_all([
+                  b"the real handler `",
+                  d.by.name,
+                  b"` of `",
+                  served,
+                  b"` is no definition the emitter holds",
+                ]),
+              ),
+            Some(def) ->
+              Ok(
+                a.insert(served, {
+                  call: Bytes::concat_all([served, b"::", d.by.name]),
+                  import: { name: served, module: m.name, defs: [def], whole: true },
+                }),
+              ),
+          }
+        },
+        _ -> held,
+      }))
+
+/// `hosts` and the real handler of each of the prelude's effects that has one (`prelude_hosts`),
+/// where the load holds its module.
+fn prelude_hosted(
+  hosts: Map<Bytes, Hosting>,
+  defs_of: (Bytes) -> List<Def>,
+) -> Map<Bytes, Hosting> / {abort.raise} =
+  prelude_hosts().fold(
+    hosts,
+    |acc: Map<Bytes, Hosting>, h: { effect: Bytes, module: Bytes, by: Bytes }|
+      match defs_of(h.module).find(|d: Def| d.name == h.by) {
+        None -> acc,
+        Some(def) ->
+          acc.insert(h.effect, {
+            call: Bytes::concat_all([h.module, b"::", h.by]),
+            import: { name: h.module, module: h.module, defs: [def], whole: true },
+          }),
+      },
+  )
+
+/// The real handlers a root performing `effects` runs under, in the order an entry nests them: one
+/// for each of them whose module declares one, by program-wide name, beside that effect.
+fn hosted_by(
+  hosts: Map<Bytes, Hosting>,
+  effects: List<Bytes>,
+) -> List<{ effect: Bytes, hosting: Hosting }> / {abort.raise} =
+  effects.fold([], |acc: List<Bytes>, e: Bytes|
+    if acc.contains(e) || !hosts.contains(e) { acc } else { acc.push(e) }).sort_by(
+    |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
+  ).fold([], |acc: List<{ effect: Bytes, hosting: Hosting }>, e: Bytes|
+    match hosts.get(e) { Some(h) -> acc.push({ effect: e, hosting: h }), None -> acc })
 
 /// The roots `roots` keys lowered in `s`, in its modules' order, each written against `handed` where
 /// it calls a definition lowered apart.
@@ -520,6 +635,7 @@ fn module_at_formed(f: Forming, i: Int) -> List<RootForm> / {abort.raise} =
           ctors: f.scope.ctors,
           builtins: f.scope.builtins,
           declared: f.scope.declared,
+          machine: f.scope.machine,
           effects: tab.effects,
           release: f.scope.release,
         },
@@ -699,7 +815,7 @@ fn stated_by_tag(mods: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
   mods.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
     m.module.items.fold(acc, |a: Map<Bytes, List<Bytes>>, item: Item|
       match item {
-        IInstance(d) -> if d.kind == NInvariant { a }
+        IInstance(d) -> if d.kind == NInvariant || d.kind == NHost { a }
         else { stating(m, a, d.target.name, [d.by.name]) },
         INumeric(d) -> stating(m, a, d.target.name, d.ops.map(|x: NumericOp| x.by.name)),
         _ -> a,
@@ -879,7 +995,7 @@ fn written_formed(
       e.params,
       true,
       e.code,
-      Ok({ ..no_filings(), typed: e.typed }),
+      Ok({ ..no_filings(), typed: e.typed, rows: e.rows }),
     );
   let r = { key: w.key, op: op_name(w.op), ty: w.ty };
   let reflective = match w.op { Reflect -> true, Shown -> true, Digest -> true, _ -> false };
@@ -906,29 +1022,29 @@ fn written_formed(
   } else if w.op == keys::LetGo {
     out.push(written_root(r.key, let_go_code(module, s.ctors, here, r.key, r.ty)))
   } else if w.op == Contained(b"let_go_items") {
-    out.push(written_root(r.key, let_go_items_code(module, r.key, r.ty)))
+    out.push(written_root(r.key, let_go_items_code(module, s.ctors, r.key, r.ty)))
   } else if w.op == keys::Equal || w.op == Order {
     // A declared sum's comparisons are written where it is declared, above; a built-in sum's,
-    // which no module declares, wherever one is asked for, from its constructors.
+    // which no module declares, wherever one is asked for, from its constructors; any other
+    // type's, which a kept value's descriptor asks for, are `==` and `compare` of its two values.
+    let held = kind_of(w.ty);
+    let param = |n: Bytes| { name: n, kind: held.kind, ty: held.ty, of: Some(w.ty), lambda: None };
+    let formed = |e: WrittenCode|
+      out.push(
+        formed_from(
+          s,
+          0,
+          w.key,
+          [param(b"a"), param(b"b")],
+          true,
+          Ok(e.code),
+          Ok({ ..no_filings(), typed: e.typed, rows: e.rows }),
+        ),
+      );
     match built_in_cases(s.ctors, w.ty) {
-      None -> out,
-      Some(cs) -> {
-        let held = kind_of(w.ty);
-        let param = |n: Bytes|
-          { name: n, kind: held.kind, ty: held.ty, of: Some(w.ty), lambda: None };
-        let e = if w.op == keys::Equal { equality_code(cs) } else { ordering_code(cs) };
-        out.push(
-          formed_from(
-            s,
-            0,
-            w.key,
-            [param(b"a"), param(b"b")],
-            true,
-            Ok(e.code),
-            Ok({ ..no_filings(), typed: e.typed }),
-          ),
-        )
-      },
+      None -> if summed(s.ctors, w.ty) { out }
+      else { formed(if w.op == keys::Equal { compared_code() } else { ordered_code(w.ty) }) },
+      Some(cs) -> formed(if w.op == keys::Equal { equality_code(cs) } else { ordering_code(cs) }),
     }
   } else if !reflective { out } else {
     let e = if r.op == b"digest" { digest_code(module, s.ctors, here, x_module.items, r.ty) }
@@ -942,11 +1058,15 @@ fn written_formed(
         [{ name: b"a", kind: held.kind, ty: held.ty, of: Some(r.ty), lambda: None }],
         true,
         Ok(e.code),
-        Ok({ ..no_filings(), typed: e.typed }),
+        Ok({ ..no_filings(), typed: e.typed, rows: e.rows }),
       ),
     )
   }
 }
+
+/// Whether `ty` is a sum, a module's or the language's, whose comparisons its constructors write.
+fn summed(ctors: Ctors, ty: Type) -> Bool =
+  match ty { TyCon(c) -> ctors.sums.get(c.name) != None, _ -> false }
 
 /// The constructors of `ty` where it is a sum no module declares, the prelude's `Instant` and
 /// `Duration` among them, at its arguments; none for any other type.
@@ -1090,12 +1210,20 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
         clause_roots(
           {
             out: {
-              let entered = entering(s, wanted, Named(p.full), schemes.get(p.full), out);
+              let entered = entering(
+                s,
+                wanted,
+                f.scope.hosts,
+                Named(p.full),
+                schemes.get(p.full),
+                out,
+              );
               // Only a `const` definition has a stored root, which a build enters.
               if d.baked == None { entered } else {
                 entering(
                   s,
                   wanted,
+                  f.scope.hosts,
                   Stored(Named(p.full)),
                   Some(monomorphic(fn_type([], bytes_type(), row_empty()))),
                   storing(s, wanted, p.full, schemes.get(p.full), entered),
@@ -1131,9 +1259,9 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           },
         ]
       };
-      let rooted = |key: RootKey, taken: List<EmitParam>, body: Expr|
+      let rooted = |within: Setting, key: RootKey, taken: List<EmitParam>, body: Expr|
         root_formed(
-          s,
+          within,
           t.span.start,
           key,
           taken.map(|p: EmitParam| p.name),
@@ -1142,13 +1270,26 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           filed(),
           body,
         );
+      // A test's entry is typed by what it performs once it has handled what it handles, and its
+      // run takes the words of that row its entry hands it.
+      let performs = {
+        atoms: match f.scope.test_rows.get(qualify(module, t.name)) { Some(xs) -> xs, None -> [] },
+        tail: None,
+      };
+      let ran = {
+        ..s,
+        here: s.here.push(
+          called_def(module, tested, ps.map(param_type), unit_type(), performs, false),
+        ),
+      };
       let run = entering(
         s,
         wanted,
+        f.scope.hosts,
         tested,
-        Some(monomorphic(fn_type(ps.map(param_type), unit_type(), row_empty()))),
+        Some(monomorphic(fn_type(ps.map(param_type), unit_type(), performs))),
         if !wants_root(wanted, tested) { acc.out }
-        else { acc.out.push(rooted(tested, ps, test_run(t))) },
+        else { acc.out.push(rooted(ran, tested, ps, test_run(t))) },
       );
       let listing = Cases(tested);
       let out = match t.cases {
@@ -1157,10 +1298,11 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           entering(
             s,
             wanted,
+            f.scope.hosts,
             listing,
             Some(monomorphic(fn_type([], listing_ty(), row_empty()))),
             if !wants_root(wanted, listing) { run }
-            else { run.push(rooted(listing, [], test_listing(c))) },
+            else { run.push(rooted(s, listing, [], test_listing(c))) },
           )
         },
       };
@@ -1239,7 +1381,7 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
               let held = kind_of(ty);
               { name: n, kind: held.kind, ty: held.ty, of: Some(ty), lambda: None }
             };
-            let formed = |ps: List<EmitParam>, e: Result<{ code: Code, typed: Map<Int, Typed> }, Bytes>|
+            let formed = |ps: List<EmitParam>, e: Result<WrittenCode, Bytes>|
               match e {
                 Ok(x) ->
                   formed_from(
@@ -1249,7 +1391,7 @@ fn item_formed(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
                     ps,
                     true,
                     Ok(x.code),
-                    Ok({ ..no_filings(), typed: x.typed }),
+                    Ok({ ..no_filings(), typed: x.typed, rows: x.rows }),
                   ),
                 Err(why) ->
                   formed_from(s, t.span.start, d.key, ps, true, Err(why), Ok(no_filings())),
@@ -1312,11 +1454,14 @@ fn judged_args(vars: List<Int>) -> List<Type> =
   range(0, vars.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
 
 /// `out` and, where `wanted` holds it, the entry the runtime enters root `root` through, `root`
-/// typed by `scheme`, each type variable an `Int`: a definition called by name at those types, as
-/// any caller calls it, and a claim root as it is judged; refused for a root of no function.
+/// typed by `scheme`, each type variable an `Int` and each row variable the empty row: a definition
+/// called by name at those, as any caller calls it, and a claim root as it is judged; refused for a
+/// root of no function. The call runs under the real handler of each effect `scheme`'s row names
+/// that `hosts` holds.
 fn entering(
   s: Setting,
   wanted: Map<RootName, Bool>,
+  hosts: Map<Bytes, Hosting>,
   root: RootKey,
   scheme: Option<Scheme>,
   out: List<RootForm>,
@@ -1328,26 +1473,43 @@ fn entering(
         TyFn(f) -> {
           let ints = judged_args(sc.ty_vars);
           let called = match root {
-            Named(_) -> { callee: root, at: sc.ty_vars.map(|_: Int| int_type()) },
-            _ -> { callee: judged_callee(root, sc.ty_vars.len()), at: [] },
+            Named(_) ->
+              {
+                callee: root,
+                at: sc.ty_vars.map(|_: Int| int_type()),
+                rows: sc.row_vars.map(|_: Int| row_empty()),
+              },
+            _ -> { callee: judged_callee(root, sc.ty_vars.len()), at: [], rows: [] },
           };
+          let hosted = hosted_by(hosts, f.effects.atoms.map(|a: Atom| a.effect));
           let e = entered_code(
             s.module,
             root,
             called.callee,
             called.at,
+            called.rows,
             f.params.map(|t: Type| substituted(t, ints)),
             substituted(f.ret, ints),
+            f.effects,
+            hosted.map(|h: { effect: Bytes, hosting: Hosting }|
+              { call: h.hosting.call, effect: h.effect, adds: added_by(h.hosting) }),
+            pure: s.here.any(|d: Def| d.root == called.callee && d.pure),
           );
           out.push(
             formed_from(
-              { ..s, here: s.here.concat(e.here) },
+              {
+                ..s,
+                here: s.here.concat(e.here),
+                imports: s.imports.concat(
+                  hosted.map(|h: { effect: Bytes, hosting: Hosting }| h.hosting.import),
+                ),
+              },
               0,
               key,
               e.params,
               true,
               e.code,
-              Ok({ ..no_filings(), typed: e.typed }),
+              Ok({ ..no_filings(), typed: e.typed, rows: e.rows }),
             ),
           )
         },
@@ -1358,6 +1520,15 @@ fn entering(
     }
   }
 }
+
+/// The atoms real handler `h`'s own row adds to what it answers, as its definition's scheme
+/// writes them.
+fn added_by(h: Hosting) -> List<Atom> =
+  h.import.defs.fold([], |acc: List<Atom>, d: Def|
+    match d.scheme {
+      Some(sc) -> match sc.ty { TyFn(f) -> acc.concat(f.effects.atoms), _ -> acc },
+      None -> acc,
+    })
 
 /// What the entry of claim root `root`, over `vars` type variables, calls: `root` itself where it
 /// has none, else a clause at the specialisation its definition is judged at (`judged_at`).
@@ -1380,9 +1551,12 @@ fn judged(
   vars: List<Int>,
   out: List<RootForm>,
 ) -> List<RootForm> / {abort.raise} =
+
+  // A claim performs nothing, so it runs under no real handler.
   entering(
     s,
     wanted,
+    Map::new(),
     root,
     Some({
       ..monomorphic(fn_type(params.map(param_type), bool_type(), row_empty())),
@@ -1408,7 +1582,7 @@ fn storing(
       Some(sc) -> match sc.ty {
         TyFn(f) -> if f.params.len() > 0 { refused(b"a stored root of a definition of parameters") }
         else {
-          let e = stored_code(s.module, Named(full), f.ret);
+          let e = stored_code(s.module, Named(full), f.ret, f.effects);
           out.push(
             formed_from(
               { ..s, here: s.here.concat(e.here) },
@@ -1417,7 +1591,7 @@ fn storing(
               e.params,
               true,
               e.code,
-              Ok({ ..no_filings(), typed: e.typed }),
+              Ok({ ..no_filings(), typed: e.typed, rows: e.rows }),
             ),
           )
         },
@@ -1571,9 +1745,10 @@ fn clause_roots(
 /// The roots `wanted` keys, resolved against the whole program: one entry per root emitted or
 /// refused, in its order, so the driver can drop what was refused. `embeds` is what the front end's
 /// answer says it embedded, `rows` what it published for every definition and test, which spare a
-/// walk of every module no wanted root is in, `walked` what its check read of the modules it walked
-/// whole, which spares a walk of those too, and `published` the handings of the definitions other
-/// answers hold, which the calls of these are written against.
+/// walk of every module no wanted root is in, `effects` what it published of every effect,
+/// `walked` what its check read of the modules it walked whole, which spares a walk of those too,
+/// and `published` the handings of the definitions other answers hold, which the calls of these are
+/// written against.
 pub fn emit_roots_answer(
   names: List<Bytes>,
   srcs: List<Bytes>,
@@ -1583,6 +1758,7 @@ pub fn emit_roots_answer(
   module_packages: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
+  effects: List<EffectRow>,
   walked: Bytes,
   published: List<Published> = [],
 ) -> List<RootAnswer> / {abort.raise} =
@@ -1596,6 +1772,7 @@ pub fn emit_roots_answer(
       module_packages,
       embeds,
       rows,
+      effects,
       walked,
       published,
     ),
@@ -1611,6 +1788,7 @@ pub fn lowered_roots(
   module_packages: List<Int>,
   embeds: List<EmbedAt>,
   rows: Rows,
+  effects: List<EffectRow>,
   walked: Bytes,
   published: List<Published> = [],
 ) -> Walked / {abort.raise} =
@@ -1623,6 +1801,7 @@ pub fn lowered_roots(
     module_packages,
     embeds,
     rows,
+    effects,
     walked,
     published,
   )
@@ -1646,3 +1825,19 @@ pub fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
       name: match names.at(i) { Some(n) -> n, None -> b"" },
       src: match srcs.at(i) { Some(t) -> t, None -> b"" },
     })
+
+test "an effect whose real handler the emitter holds no definition of is refused, not left unhosted" {
+  let fact = {
+    name: b"std.fact",
+    module: parse(b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\n").node,
+    derived: [],
+  };
+  match hostings([fact], |_: Bytes| []) {
+    Ok(_) -> assert(false, Some("hosted by no definition")),
+    Err(why) ->
+      assert_eq(
+        why,
+        b"the real handler `served` of `std.fact.fact` is no definition the emitter holds",
+      ),
+  }
+}

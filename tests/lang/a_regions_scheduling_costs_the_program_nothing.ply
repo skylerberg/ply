@@ -1,0 +1,79 @@
+// What a region's scheduler does to answer a task's operations is no cost of the program's: an
+// operation it answers counts no call, no object and no byte, in `simulate` and in the run's
+// region, so a program's costs are its own calls' whatever the scheduler does.
+
+fn yielded(n: Int) -> Unit / {task.write} =
+  if n <= 0 { () } else {
+    task.yield();
+    yielded(n - 1)
+  }
+
+fn echoed(requests: Chan<Int>, replies: Chan<Int>) -> Unit / {task.write, diverges} =
+  match task.recv(requests) {
+    Some(x) -> {
+      task.send(replies, x + 1);
+      echoed(requests, replies)
+    },
+    None -> (),
+  }
+
+fn asked(requests: Chan<Int>, replies: Chan<Int>, n: Int, sum: Int) -> Int / {task.write} =
+  if n <= 0 { sum } else {
+    task.send(requests, n);
+    let got = match task.recv(replies) { Some(x) -> x, None -> 0 };
+    asked(requests, replies, n - 1, sum + got)
+  }
+
+/// `trips` round trips between two tasks, then `yields` yields in each.
+fn traded(trips: Int, yields: Int) -> Int / {task.write, diverges, abort.raise} = {
+  let requests = task.channel(0);
+  let replies = task.channel(0);
+  let other = task.spawn(|| {
+    echoed(requests, replies);
+    yielded(yields)
+  });
+  let sum = asked(requests, replies, trips, 0);
+  task.close(requests);
+  yielded(yields);
+  task.join(other);
+  sum
+}
+
+type Spent = { steps: Int, allocations: Int, bytes: Int }
+
+fn spent(trips: Int, yields: Int) -> Spent / {sim.read, diverges, abort.raise} = {
+  let m = metered(|| simulate { traded(trips, yields) });
+  { steps: m.steps, allocations: m.allocations, bytes: m.bytes }
+}
+
+fn served(trips: Int, yields: Int) -> Spent / {task.write, diverges, abort.raise} = {
+  let m = metered(|| traded(trips, yields));
+  { steps: m.steps, allocations: m.allocations, bytes: m.bytes }
+}
+
+fn more(a: Spent, b: Spent) -> Spent =
+  { steps: b.steps - a.steps, allocations: b.allocations - a.allocations, bytes: b.bytes - a.bytes }
+
+// Each trip is a pass of `asked` and of `echoed`, and each yield a pass of `yielded` in each task.
+test "a task's operations a simulate region answers cost the program nothing" {
+  assert_eq(more(spent(0, 0), spent(100, 50)), { steps: 300, allocations: 0, bytes: 0 })
+}
+
+test/nondet "a task's operations the run's region answers cost the program nothing" {
+  assert_eq(more(served(0, 0), served(100, 50)), { steps: 300, allocations: 0, bytes: 0 })
+}
+
+test "the steps a simulate region records leave no object of the program's live" {
+  assert_eq(simulate { metered(|| yielded(10)).live }, 0)
+}
+
+test/nondet "what a channel of the run's region holds of its own is no object of the program's" {
+  let c: Chan<Int> = task.channel(4);
+  assert_eq(
+    metered(|| {
+      task.send(c, 1);
+      0
+    }).live,
+    0,
+  )
+}

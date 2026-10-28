@@ -1,4 +1,3 @@
-mod dump;
 mod stage;
 mod sweep;
 
@@ -65,18 +64,25 @@ fn a_natives_signature_is_its_functions_type() {
     );
 }
 
-/// A native over machine data is bound as a builtin's helper is, under the name the compiler gives
-/// it, which neither a builtin nor another of them has, at the words and kinds its function takes.
+/// A native over machine data is bound as a builtin's helper is, under the name the compiler or a
+/// shipped module's `extern fn` gives it, which neither a builtin nor another of them has, at the
+/// words and kinds its function takes.
 #[test]
 fn every_native_over_machine_data_has_a_helper_of_its_own() {
     use ply_compiled::c::machine_natives;
     use ply_compiled::native::Machine;
     let machine = machine_natives();
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
+    let declared: Vec<&str> = ply_compiled::hosted::natives()
+        .iter()
+        .chain(ply_compiled::entry::natives().iter())
+        .chain(ply_compiled::tasks::natives().iter())
+        .map(|n| n.name)
+        .collect();
     for n in machine {
         assert!(
-            n.name.starts_with('?'),
-            "`{}` is no name the compiler declares",
+            n.name.starts_with('?') || declared.contains(&n.name),
+            "`{}` is no name the compiler or a shipped module declares",
             n.name
         );
         assert!(
@@ -87,8 +93,7 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         let name = builtin_helper_name(n.name);
         let found: Vec<_> = helpers().iter().filter(|h| h.name == name).collect();
         assert_eq!(found.len(), 1, "`{name}`");
-        assert_eq!(found[0].args, n.signature.words(), "`{name}`");
-        assert_eq!(found[0].answers, n.signature.answers(), "`{name}`");
+        assert_eq!(found[0].signature, n.signature, "`{name}`");
         assert!(
             !n.signature.params.contains(&Machine::Word),
             "`{}` takes a uniform word",
@@ -101,6 +106,53 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         .expect("`?out_str`");
     assert_eq!(out_str.signature.params, [Machine::Addr, Machine::I64]);
     assert_eq!(out_str.signature.answer, None);
+}
+
+/// What the runtime says of itself to a compiler is read off its own functions and structs: each
+/// helper of its own and each native with what its function's type takes and answers, and where it
+/// lays out what emitted code reads in place.
+#[test]
+fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
+    use ply_compiled::rt::Ctx;
+    let text = ply_compiled::c::described();
+    assert_eq!(text.lines().next(), Some("ply runtime 1"));
+    for line in [
+        "helper rt_release_later 0 - Handed DropRoot",
+        "helper rt_alloc_bytes 0 Block Word",
+        "helper rt_tick 0 -",
+        "native ?out_str 0 - Addr I64",
+        "native ?refused 1 - I64 I64 I64 I64",
+        "native Secret::concat 0 Word Word Word",
+    ] {
+        assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
+    }
+    let own = ply_compiled::c::own_helpers();
+    let helpers = text.lines().filter(|l| l.starts_with("helper ")).count();
+    assert_eq!(helpers, own.len());
+    assert!(own.iter().all(|h| !h.name.starts_with("builtin_")));
+    let fact = |name: &str| {
+        let line = format!("fact {name} ");
+        let found = text.lines().find_map(|l| l.strip_prefix(line.as_str()));
+        found
+            .unwrap_or_else(|| panic!("no fact `{name}`"))
+            .parse::<usize>()
+            .expect("a fact is a number")
+    };
+    assert_eq!(
+        fact("PlyCtx.release_depth.at"),
+        std::mem::offset_of!(Ctx, release_depth)
+    );
+    assert_eq!(fact("PlyCtx.frames.bytes"), 8);
+    assert_eq!(fact("PlyObj.bytes"), ply_compiled::heap::HEADER);
+    assert_eq!(
+        fact("PlyFnDesc.bytes"),
+        size_of::<ply_compiled::emitted::PlyFnDesc>()
+    );
+    assert_eq!(fact("count.frame"), ply_compiled::heap::FRAME as usize);
+    assert_eq!(
+        fact("release_depth"),
+        ply_compiled::rt::RELEASE_DEPTH as usize
+    );
 }
 
 #[test]
@@ -299,7 +351,7 @@ fn the_preludes_checked_arithmetic_agrees_with_and_without_the_overflow_builtins
         let Some(lib) = units::library(dir.path(), &text) else {
             return;
         };
-        let (native, _) = ply_compiled::c::load_opened(&lib, None).expect("the unit loads");
+        let (native, _) = ply_compiled::c::load_opened(&lib).expect("the unit loads");
         let wrong = units::entered(&native, "m.checked", 10, &[]).expect("it answers");
         assert_eq!(imm_value(wrong), 0, "with {head:?}");
     }
@@ -347,7 +399,7 @@ fn deep_calls() -> [units::Def; 2] {
 const DEEP: i64 = 20_000;
 
 /// An entry begun where a Rust recursion grew onto a stacker segment, or anywhere else the runtime
-/// does not know, as `Bodies::run` begins one.
+/// does not know.
 struct Unknown {
     ctx: *mut ply_compiled::rt::Ctx,
     entry: ply_compiled::rt::Entry,
@@ -469,7 +521,10 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
         ply_compiled::rt::FAILED_OUT_OF_FUEL,
         "a runaway recursion ended some other way: {raised}"
     );
-    assert!(raised.contains("bound on nested calls"), "{raised}");
+    assert!(
+        raised.contains("recursion limit of 10000 nested calls exceeded"),
+        "{raised}"
+    );
 }
 
 /// A unit says each constant with its row of the code table.
@@ -499,55 +554,4 @@ fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
     assert_eq!(read.entered, ["m.main"]);
     let words = ply_compiled::c::Exports::decode(tables).expect("the table reads");
     assert!(words.entered.is_empty());
-}
-
-/// `m.double`, compiled and opened as a program's unit entered through `m.double#entered`.
-fn doubling(dir: &std::path::Path) -> Option<(ply_core::Analysis, std::path::PathBuf)> {
-    let defs = [
-        def("m.double", 1, "  return ply_imm(ply_imm_value(p0) * 2);"),
-        def("m.double#entered", 0, &units::int_entry("m.double")),
-    ];
-    let mut exports = units::exports_of(&defs);
-    exports.entered = vec!["m.double".to_string()];
-    let lib = units::library(dir, &units::text(&defs, &exports))?;
-    Some((units::front(b"doubling", &defs[..1], &[]), lib))
-}
-
-/// The unit is loaded once to read what it holds, and every backend over it answers alike.
-#[test]
-fn every_backend_over_a_unit_answers_what_it_holds() {
-    use ply_core::{Provider, Symbol, Value};
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some((front, lib)) = doubling(dir.path()) else {
-        return;
-    };
-    let unit = ply_compiled::Unit::opened(&front, &lib).expect("the unit opens");
-    assert_eq!(unit.compiled(), ["m.double", "m.double#entered"]);
-    let first = std::sync::Arc::clone(&unit).attach();
-    let second = std::sync::Arc::clone(&unit).attach();
-    assert_eq!(unit.compilation().units, 2);
-    for backend in [&first, &second] {
-        assert!(backend.describes(front.hashes_digest));
-        assert_eq!(
-            backend.enter(&Symbol::new("m.double"), &[Value::Int(21)], 10_000),
-            Some(Value::Int(42))
-        );
-    }
-}
-
-/// A program loaded and let go leaves nothing behind: its unit, the front end's answer it holds and
-/// its loaded image go with the last backend over it.
-#[test]
-fn a_unit_nothing_holds_is_freed() {
-    use ply_core::Provider;
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some((front, lib)) = doubling(dir.path()) else {
-        return;
-    };
-    let unit = ply_compiled::Unit::opened(&front, &lib).expect("the unit opens");
-    let held = std::sync::Arc::downgrade(&unit);
-    let backend = unit.attach();
-    assert!(held.upgrade().is_some(), "a backend holds its unit");
-    drop(backend);
-    assert!(held.upgrade().is_none(), "a unit nothing holds was kept");
 }

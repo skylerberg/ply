@@ -50,72 +50,16 @@ fn written(rows: &Rows) -> Vec<(String, Vec<String>)> {
         .collect()
 }
 
-const DETERMINISTIC: &Rows = &[
-    // A hash is a function of the password, the salt and the parameters.
-    (
-        "std.password.kdf",
-        &["argon2", "bcrypt", "pbkdf2", "scrypt"],
-    ),
-];
+const DETERMINISTIC: &Rows = &[];
 
 const REPEATABLE: &Rows = &[
-    ("certgen", &["issue"]),
     // A wait changes nothing outside the program: crossed twice, it waits twice.
     ("clock", &["now", "sleep"]),
-    ("std.config.config", &["get", "secret"]),
-    // A question to a resolver changes nothing it asks about.
-    ("std.dns.dns", &["lookup", "reverse", "servers"]),
-    // A socket's port and its two addresses are fixed while it is open, and so is who holds its
-    // far end; its options are read as they stand, and reading them sets none.
-    (
-        "std.net.net",
-        &[
-            "local_address",
-            "local_port",
-            "options",
-            "peer_address",
-            "peer_certificate",
-            "peer_credentials",
-            "protocol",
-        ],
-    ),
-    // What the machine says of itself is read, never taken.
-    (
-        "std.os.os",
-        &[
-            "arch",
-            "cpus",
-            "endian",
-            "executable",
-            "family",
-            "hostname",
-            "name",
-            "pid",
-            "pointer_bits",
-            "user",
-        ],
-    ),
-    // Hashing again computes the same bytes and changes nothing outside the program.
-    (
-        "std.password.kdf",
-        &["argon2", "bcrypt", "pbkdf2", "scrypt"],
-    ),
     // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
     ("std.process.process", &["args", "bound"]),
     // Every draw is independent of every other, so a run may take as many as it likes.
     ("std.random.entropy", &["below", "next", "secret"]),
-    ("std.signal.signal", &["deadline_ms", "stopping"]),
-    // Asking what a stream is, or how large the terminal is, changes neither.
-    ("std.term.term", &["is_terminal", "size"]),
     ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
-    ("std.udp.udp", &["local_address", "options"]),
-    (
-        "task",
-        &[
-            "await", "cancel", "channel", "close", "join", "recv", "select", "send", "spawn",
-            "yield",
-        ],
-    ),
 ];
 
 /// A deterministic handler's test is cached with no binding to answer for it, so each one is a
@@ -147,7 +91,7 @@ fn a_registry_and_a_runtime_come_from_one_host() {
         label: "stray",
     };
     assert_eq!(
-        runtime
+        (ply_host::registry::run_of(&*runtime).expect("a host made the runtime"))
             .watch(&stray)
             .expect_err("a token nothing minted is refused")
             .code,

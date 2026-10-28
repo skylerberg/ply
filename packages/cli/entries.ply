@@ -3,13 +3,21 @@
 //! beside the answer `ply run` files, so a run that takes one back names its entry without it.
 
 import compiler.front.diagnostics (parse_all)
-import compiler.front.rows (DefRow, Dump, ModuleRow, OrdinalRow)
+import compiler.front.rows (DefRow, Dump, EmitterRoot, ModuleRow, ModuleSpan, OrdinalRow,
+                            module_span_bin)
 import compiler.front.published (analyse, dump_of)
+import compiler.check.types (Atom, atom_bin)
 import compiler.load (LoadedAnalysis, SourceFile)
+import diagnostic (Place)
 import entry (Main, Module)
+import listing
+import listing (Declared, declared_bin)
+import machine
 import paths
 import compiler.syntax.items (is_shipped)
 import std.bin
+import std.list
+import std.machine as entering
 import std.prelude_source
 
 pub type Entries = { mains: List<Main>, modules: List<Module> }
@@ -104,19 +112,86 @@ pub fn named(entries: Entries, resolved: List<paths::Resolved>) -> Entries =
     modules: entries.modules.filter(|m: Module| paths::names_any(resolved, m.path)),
   }
 
+// --- What running an entry reads ------------------------------------------------
+
+/// What running a program's entry points reads of its front end, which `ply run` keeps for a later
+/// run over the same closure and an artifact carries for its own: where each root of the unit is
+/// written, what each entry point may perform, and the effects the program declares and performs,
+/// which a binding is resolved against.
+pub type Runnable = {
+  roots: List<Rooted>,
+  footprints: List<Footprint>,
+  declared: List<Declared>,
+  performed: List<Atom>,
+}
+
+/// A root of the unit, and where its definition is written.
+pub type Rooted = { root: Bytes, at: ModuleSpan }
+
+/// What the entry point `name` may perform: a host answer outside it is refused (`E0427`).
+pub type Footprint = { name: Bytes, atoms: List<Atom> }
+
+derive bin for Rooted
+derive bin for Footprint
+derive bin for Runnable
+
+/// What running the entry points `entries` of `front` reads of it. A performed atom is kept once.
+pub fn runnable_of(front: LoadedAnalysis, entries: List<Bytes>) -> Runnable / {abort.raise} =
+  {
+    roots: front.dump.emitter_roots.map(|r: EmitterRoot| { root: r.root, at: r.at }),
+    footprints: front.dump.defs.filter(|d: DefRow| entries.contains(d.name)).map(|d: DefRow|
+      { name: d.name, atoms: d.footprint }),
+    declared: listing::declared_of(front.dump),
+    performed: listing::performed(front.dump).fold(
+      Map::new(),
+      |acc: Map<Bytes, Atom>, a: Atom| acc.insert(bin::encode(a, atom_bin()), a),
+    ).values(
+    ),
+  }
+
+/// Where each root of the unit is written, which a failure's sites are offsets from.
+pub fn roots_of(r: Runnable) -> Map<Bytes, ModuleSpan> =
+  r.roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, x: Rooted| m.insert(x.root, x.at))
+
+/// What the entry point `name` may perform, as an entry's declared footprint holds it.
+pub fn footprint_of(r: Runnable, name: String) -> Option<List<entering::Atom>> =
+  match r.footprints.find(|f: Footprint| f.name == Bytes::of_string(name)) {
+    Some(f) -> Some(f.atoms.map(machine::atom_of)),
+    None -> None,
+  }
+
 // --- As `ply run` keeps them ----------------------------------------------------
 
 /// A `main` or a module, flat: `module` is empty for a module.
 type Held = { name: String, module: String, path: String, index: Int, start: Int, end: Int }
 
-/// What `ply run` keeps of a load: the entry points it offered, and the machine's own entry for the
-/// front and the unit.
-type Kept = { mains: List<Held>, modules: List<Held>, front: Bytes }
+/// A file the load read: a shipped module's text is kept as the load placed it, which is what an
+/// importer reads of it; any other file's is the walk's, and kept as none.
+pub type KeptFile = { path: String, name: String, text: Bytes }
+
+/// What `ply run` keeps of a load: the entry points it offered, the library its unit was compiled
+/// into, the files it read, and what running it reads of its front end.
+type Kept = {
+  mains: List<Held>,
+  modules: List<Held>,
+  library: String,
+  files: List<KeptFile>,
+  runnable: Runnable,
+}
 
 derive bin for Held
+derive bin for KeptFile
 derive bin for Kept
 
-pub fn kept(entries: Entries, front: Bytes) -> Bytes / {abort.raise} =
+/// What a later run over the same closure takes back of a load.
+pub type Taken = { entries: Entries, library: String, files: List<KeptFile>, runnable: Runnable }
+
+pub fn kept(
+  entries: Entries,
+  library: String,
+  files: List<SourceFile>,
+  runnable: Runnable,
+) -> Bytes / {abort.raise} =
   bin::encode(
     {
       mains: entries.mains.map(|m: Main|
@@ -137,13 +212,20 @@ pub fn kept(entries: Entries, front: Bytes) -> Bytes / {abort.raise} =
           start: m.at.start,
           end: m.at.end,
         }),
-      front: front,
+      library: library,
+      files: files.map(|f: SourceFile|
+        {
+          path: f.path,
+          name: f.name,
+          text: if is_shipped(Bytes::of_string(f.name)) { f.text } else { b"" },
+        }),
+      runnable: runnable,
     },
     kept_bin(),
   )
 
 /// What `kept` filed, or `None` for bytes it did not write.
-pub fn taken(filed: Bytes) -> Option<{ entries: Entries, front: Bytes }> / {abort.raise} =
+pub fn taken(filed: Bytes) -> Option<Taken> / {abort.raise} =
   match bin::decode(filed, kept_bin()) {
     Err(_) -> None,
     Ok(k) ->
@@ -159,9 +241,40 @@ pub fn taken(filed: Bytes) -> Option<{ entries: Entries, front: Bytes }> / {abor
           modules: k.modules.map(|h: Held|
             { name: h.name, path: h.path, at: { module: h.index, start: h.start, end: h.end } }),
         },
-        front: k.front,
+        library: k.library,
+        files: k.files,
+        runnable: k.runnable,
       }),
   }
+
+/// The files a kept load read, over this run's walk: its modules, the shipped modules the load
+/// pulled as it placed them, then its manifests, in the order the load read them, so a span
+/// renders as this run's own front end would render it. `None` where the walk does not fit.
+pub fn placed_over(
+  files: List<KeptFile>,
+  modules: List<Place>,
+  manifests: List<Place>,
+) -> Option<List<Place>> / {abort.raise} = {
+  let own = modules.len();
+  let pulled = files.len() - own - manifests.len();
+  let walked = modules.concat(manifests);
+  if pulled < 0 { None } else {
+    range(0, files.len()).fold(Some([]), |acc: Option<List<Place>>, i: Int|
+      match ((acc, files.at(i))) {
+        (Some(placed), Some(f)) -> if i >= own && i < own + pulled {
+          if is_shipped(Bytes::of_string(f.name)) {
+            Some(placed.push({ path: f.path, text: f.text }))
+          } else { None }
+        } else {
+          match walked.at(if i < own { i } else { i - pulled }) {
+            Some(w) -> Some(placed.push(w)),
+            None -> None,
+          }
+        },
+        _ -> None,
+      })
+  }
+}
 
 // --- Tests ------------------------------------------------------------------
 
@@ -229,13 +342,51 @@ test "every module the load read is offered, placed at the end of its file" {
 }
 
 test "what a run keeps of a load reads back as it was filed, and nothing else reads" {
-  let offered = of_front(front_over([{ name: "m", text: "fn main() -> Int = 1\n" }]));
-  match taken(kept(offered, b"the machine's own entry")) {
+  let front = front_over([{ name: "m", text: "fn main() -> Int = 1\n" }]);
+  let offered = of_front(front);
+  let runnable = runnable_of(front, [b"m.main"]);
+  match taken(kept(offered, "/cache/m.dylib", front.files, runnable)) {
     None -> panic("what `kept` wrote reads back"),
     Some(k) -> {
       assert_eq(k.entries, offered);
-      assert_eq(k.front, b"the machine's own entry")
+      assert_eq(k.library, "/cache/m.dylib");
+      assert_eq(k.runnable, runnable);
+      // The walk holds the program's own text; a shipped module's is the load's.
+      assert_eq(k.files.map(|f: KeptFile| f.text.len() > 0), [false, true])
     },
   };
   assert(taken(b"an entry of another shape") == None, None)
+}
+
+test "an entry point's footprint is kept by its name, with the effects the program declares" {
+  let front = front_over([
+    {
+      name: "m",
+      text: "effect log {\n  write note(s: String) -> Unit\n}\nfn main() -> Int / {log.note} = {\n  log.note(\"x\");\n  1\n}\n",
+    },
+  ]);
+  let runnable = runnable_of(front, [b"m.main"]);
+  match footprint_of(runnable, "m.main") {
+    Some(atoms) -> assert(atoms.any(|a: entering::Atom| a.effect == "m.log" && a.write)),
+    None -> panic("`m.main` is an entry point"),
+  };
+  assert_eq(footprint_of(runnable, "m.other"), None);
+  assert(runnable.declared.any(|d: Declared| d.name == b"m.log"))
+}
+
+test "a kept load is placed over this run's walk, its shipped modules as the load read them" {
+  let files = [
+    { path: "m.ply", name: "m", text: b"" },
+    { path: "<std>/prelude.ply", name: "std.prelude", text: b"the prelude" },
+    { path: "ply.pkg", name: "", text: b"" },
+  ];
+  let m = { path: "m.ply", text: b"fn main() -> Int = 1\n" };
+  let pkg = { path: "ply.pkg", text: b"fn package() -> Manifest = app()\n" };
+  assert_eq(
+    placed_over(files, [m], [pkg]),
+    Some([m, { path: "<std>/prelude.ply", text: b"the prelude" }, pkg]),
+  );
+  // A walk of more files than the load read, or one short of a module it read, does not fit.
+  assert_eq(placed_over(files, [m, m, m], [pkg]), None);
+  assert_eq(placed_over([{ path: "n.ply", name: "n", text: b"" }].concat(files), [m], [pkg]), None)
 }

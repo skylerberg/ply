@@ -225,6 +225,14 @@ pub fn read_line() -> Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// A line read for a `Secret`, wiped when it is dropped.
+pub type SecretLine = zeroize::Zeroizing<String>;
+
+/// [`read_line`] for a `Secret`: the line is never held but wiped.
+pub fn read_secret_line() -> Result<Option<SecretLine>> {
+    Ok(read_line()?.map(zeroize::Zeroizing::new))
+}
+
 /// Whether standard input has something to read before `deadline`; its end is something to read.
 fn readable_by(deadline: Instant) -> Result<bool> {
     loop {
@@ -349,6 +357,12 @@ pub fn set_mode(mode: Mode) -> Result<Option<Mode>> {
 pub fn settle() -> bool {
     make_way();
     let untold = std::mem::take(&mut lock(&HELD_OUT).untold);
+    restore_terminal();
+    untold
+}
+
+/// Puts standard input's terminal back as the process found it, where `set_mode` changed it.
+pub fn restore_terminal() {
     let mut terminal = lock(&TERMINAL);
     if let Some(original) = &terminal.original
         && terminal.mode != Mode::Cooked
@@ -357,7 +371,6 @@ pub fn settle() -> bool {
         unsafe { libc::tcsetattr(IN, libc::TCSADRAIN, original) };
         terminal.mode = Mode::Cooked;
     }
-    untold
 }
 
 /// The guarded state has no invariant a panicking caller can break, so recovering is correct.

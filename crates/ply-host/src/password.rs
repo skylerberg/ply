@@ -1,25 +1,16 @@
-//! The `std.password` facility: the functions a password is hashed with.
+//! The functions a password is hashed with, which `std.password`'s natives run.
 //!
-//! Argon2, scrypt, bcrypt and PBKDF2 are each a function of what they are handed, so each is
-//! registered deterministic, and each is built to take a long time, so it runs on a thread of this
-//! facility's pool while the scheduler holds a token. A password arrives as a `Secret` and is
-//! copied once, for that thread, into a buffer that is wiped when the hash is made.
+//! Argon2, scrypt, bcrypt and PBKDF2 are each a function of what they are handed, and each is
+//! built to take a long time, so it runs as a job of the process's computing pool while the task
+//! that asked waits. A password is copied once, for that job, into a buffer that is wiped when the
+//! hash is made.
 //!
-//! Every number that multiplies the work is bounded before a thread is started: a program may
-//! perform these directly, and the parameters of a stored hash are whatever its writer chose.
+//! Every number that multiplies the work is bounded before a job is started: a program may perform
+//! these directly, and the parameters of a stored hash are whatever its writer chose.
 
-use crate::pool::{JobOutput, Pool, Pooled};
-use ply_core::host::{
-    Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
-    HostRuntime, Linearity,
-};
-use ply_core::{Diagnostic, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Span, codes};
 use std::num::NonZeroU32;
-use std::sync::Arc;
 use zeroize::Zeroizing;
-
-/// Must match the effect `std.password` declares.
-pub const EFFECT: &str = "std.password.kdf";
 
 /// The most memory one Argon2 hash fills, in KiB: 2 GiB, RFC 9106's first recommended option.
 pub const MAX_MEMORY_KIB: i64 = 1 << 21;
@@ -44,43 +35,6 @@ pub const MAX_LENGTH: i64 = 64;
 
 /// The bytes of a password bcrypt reads, its terminating zero among them.
 pub const BCRYPT_KEY_BYTES: usize = 72;
-
-operations! {
-    what "kdf";
-    path "password";
-    Argon2 = "argon2" / 9,
-    Scrypt = "scrypt" / 6,
-    Bcrypt = "bcrypt" / 3,
-    Pbkdf2 = "pbkdf2" / 5,
-}
-
-impl Op {
-    /// The thread name a job runs under.
-    fn label(self) -> &'static str {
-        match self {
-            Op::Argon2 => "kdf-argon2",
-            Op::Scrypt => "kdf-scrypt",
-            Op::Bcrypt => "kdf-bcrypt",
-            Op::Pbkdf2 => "kdf-pbkdf2",
-        }
-    }
-
-    pub fn declaration(self) -> HostOp {
-        HostOp {
-            effect: Symbol::new(EFFECT),
-            op: Symbol::new(self.name()),
-            resource: HostResource::Any,
-            // A hash is a function of the password, the salt and the parameters, and nothing else.
-            determinism: Determinism::Deterministic,
-            // Performing one again computes the same bytes and changes nothing outside the program.
-            linearity: Linearity::Repeatable,
-            blocking: true,
-            // The password is the argument. No answer and no refusal carries any of it.
-            secrets: true,
-            path: self.path(),
-        }
-    }
-}
 
 /// One hash to make, checked against the bounds, holding its own copy of everything it reads.
 pub struct Work(Kind);
@@ -361,43 +315,6 @@ impl Work {
         }))
     }
 
-    /// The operation's arguments as its declaration in `std.password` types them.
-    fn read(op: Op, args: &[Value], span: Span) -> Result<Work, Diagnostic> {
-        let what = op.what();
-        let int = |i: usize| args[i].as_int(span, what);
-        let bytes = |i: usize| args[i].as_bytes(span, what).map(|b| &b[..]);
-        let checked = match op {
-            Op::Argon2 => Work::argon2(
-                args[0].as_str(span, what)?,
-                opened(&args[1], op, span)?,
-                bytes(2)?,
-                opened(&args[3], op, span)?,
-                bytes(4)?,
-                int(5)?,
-                int(6)?,
-                int(7)?,
-                int(8)?,
-            ),
-            Op::Scrypt => Work::scrypt(
-                opened(&args[0], op, span)?,
-                bytes(1)?,
-                int(2)?,
-                int(3)?,
-                int(4)?,
-                int(5)?,
-            ),
-            Op::Bcrypt => Work::bcrypt(opened(&args[0], op, span)?, bytes(1)?, int(2)?),
-            Op::Pbkdf2 => Work::pbkdf2(
-                args[0].as_str(span, what)?,
-                opened(&args[1], op, span)?,
-                bytes(2)?,
-                int(3)?,
-                int(4)?,
-            ),
-        };
-        checked.map_err(|why| refused(op, &why, span))
-    }
-
     /// The hash, on the thread that calls this.
     ///
     /// # Errors
@@ -489,116 +406,14 @@ fn narrow(n: i64) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("{n}, which no parameter of a hash reaches"))
 }
 
-/// A credential's bytes, which only this side of the boundary reads.
-fn opened(v: &Value, op: Op, span: Span) -> Result<&[u8], Diagnostic> {
-    match v {
-        Value::Secret(held) if !held.is_text() => Ok(held.bytes()),
-        _ => Err(unsealed(op, span)),
-    }
-}
-
-pub struct PasswordHost {
-    pool: Pool,
-}
-
-impl Default for PasswordHost {
-    fn default() -> PasswordHost {
-        PasswordHost::new()
-    }
-}
-
-impl PasswordHost {
-    /// As many hashes run at once as the machine has cores, and the rest wait their turn: each
-    /// fills a core and its own memory, so more at once would finish no sooner and hold more, and
-    /// a login server's burst is a line here, not a refusal.
-    pub fn new() -> PasswordHost {
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        PasswordHost {
-            pool: Pool::queued(cores),
-        }
-    }
-}
-
-impl Pooled for PasswordHost {
-    fn pool(&self) -> &Pool {
-        &self.pool
-    }
-}
-
-pub fn registrations(host: &Arc<PasswordHost>) -> Vec<(HostOp, Arc<dyn HostHandler>)> {
-    Op::ALL
-        .iter()
-        .map(|op| {
-            let handler: Arc<dyn HostHandler> = Arc::new(Operation {
-                op: *op,
-                host: Arc::clone(host),
-            });
-            (op.declaration(), handler)
-        })
-        .collect()
-}
-
-pub fn register(registry: &mut HostRegistry, host: Arc<PasswordHost>) {
-    for (op, handler) in registrations(&host) {
-        registry.register(op, handler);
-    }
-}
-
-struct Operation {
-    op: Op,
-    host: Arc<PasswordHost>,
-}
-
-impl HostHandler for Operation {
-    fn call(&self, _: &dyn HostRuntime, req: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-        let span = req.span;
-        if req.args.len() != self.op.arity() {
-            return Err(arity(self.op, req.args.len(), span));
-        }
-        let work = Work::read(self.op, req.args, span)?;
-        let pending = self.host.pool.submit(
-            span,
-            self.op.label(),
-            self.op.what(),
-            Box::new(move || match work.run() {
-                Ok(tag) => JobOutput::Bytes(tag),
-                Err(why) => JobOutput::Failed(why),
-            }),
-        )?;
-        Ok(HostAnswer::Pending(pending))
-    }
-}
-
+/// The refusal of `what` (`kdf.argon2`, ..) asked for `why`, which ends the run where it was asked.
 #[cold]
-fn refused(op: Op, why: &str, span: Span) -> Diagnostic {
+pub fn refused(what: &str, why: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("{} was asked for {why}", op.what()),
+        format!("{what} was asked for {why}"),
     )
     .primary(span, "performed here")
     .note("the host bounds what one hash may cost before it starts one")
     .note("`std.password` holds the parameters of a stored hash to the same bounds and answers a refusal, so only a perform of the operation itself reaches this")
-}
-
-#[cold]
-fn unsealed(op: Op, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!("{} was handed a password that is not a `Secret<Bytes>`", op.what()),
-    )
-    .primary(span, "performed here")
-    .note("the operation's declaration types it, so reaching this means the evaluator was handed a module that was never checked")
-}
-
-#[cold]
-fn arity(op: Op, given: usize, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!(
-            "{} takes {} argument(s) and was given {given}",
-            op.what(),
-            op.arity()
-        ),
-    )
-    .primary(span, "this call does not match the declaration")
 }

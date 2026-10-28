@@ -2,18 +2,23 @@
 //! closures, function values, bodies run in place, steps and tail groups.
 
 import compiler.check.resolve.tables (qualify)
+import compiler.syntax.exprs (scheduler_module)
 import compiler.check.types (Type, TyCon, int_type, bool_type)
 import compiler.emit.keys (RootKey, FnArg, Named, Root, Generic, LawPart, LawGuard, LawBody, at_key,
-                           RootName, root_name, root_text, filed_as, test_key, law_key)
+                           RootName, root_name, root_text, filed_as, test_key, law_key, at_rowed,
+                           KeyType, Evidence)
+import compiler.check.types (RSingleton)
+import compiler.emit.tir (OHandle)
+import compiler.emit.tir.handling (Bridge, Perform, InstanceHeap)
 import compiler.emit.reps (filings_at, BoundLambda, has_vars)
 import compiler.emit.typing (no_filings, unknown_type)
-import compiler.emit.tir (Rep, RInt, RBool, RWord, RFlat, RSum, RSlice, MCase, Var, Arg, AVar, AInt,
-                          Val, Call, Apply, Make, Get, Pack, Gathered, Prim, Native, Op, OCalling,
-                          OContainer, MClosure, PCapture, TTag, Inst, Let, Do, If, Case, Match,
-                          Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
+import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MCase, Var, Arg, AVar,
+                          AInt, Val, Call, Apply, Make, Get, Pack, Gathered, Prim, Native, Op,
+                          OCalling, OContainer, MClosure, PCapture, TTag, Inst, Let, Do, If, Case,
+                          Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
                           Closure, Declined, Family, Spine, Data, Calling, Matching, Handling,
                           Scalars, Containers, RNum, TInt, TRange, Convention, Lambda, Lent, Given,
-                          Plain, rep_of_arg, MFramed)
+                          Plain, Handle, rep_of_arg, MFramed)
 import compiler.emit.tir.calling (ConstantRead, Ticked)
 import compiler.emit.tir.containers (Rest)
 import compiler.emit.lower (lowered_fn, lowered_group)
@@ -24,7 +29,8 @@ import compiler.emit.entry (built_form)
 import compiler.emit.own (owned)
 import compiler.emit.verify (verified)
 import compiler.emit.roots (symbol_of)
-import compiler.emit.compare (Program, program_of, printed_text, unbuilt, answered_by_form)
+import compiler.emit.compare (Program, program_of, scheduled_program_of, printed_text, unbuilt,
+                              answered_by_form, shipped_formed)
 import compiler.emit.lower.held (passing, ByReference, values_of, value_words)
 import compiler.emit.layout (register_words)
 import compiler.emit.print.made (head_types)
@@ -72,6 +78,12 @@ fn corpus() -> Bytes =
     b"fn seek(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { probe(o, n - 1) }\n",
     b"fn probe(o: Option<{ x: Int, y: Int }>, n: Int) -> Option<{ x: Int, y: Int }> / {diverges} = if n == 0 { o } else { seek(o, n - 2) }\n",
     b"fn lends_on(x: Int) -> Int = apply_to(|y: Int| { let g = |z: Int| z + x; g(y) + applied(|w: Int| w + y, y) }, x)\n",
+    b"effect log {\n  write note(n: Int) -> Unit\n}\n",
+    b"fn apply_in<T | e>(f: (T) -> T / e, x: T) -> T / e = f(x)\n",
+    b"fn noted_by(f: (Int) -> Int / {log.note}, x: Int) -> Int / {log.note} = f(x)\n",
+    b"fn lends_noting(x: Int) -> Int / {log.note} = apply_in(|y: Int| noted_by(|w: Int| { log.note(w); w + y }, y), x)\n",
+    b"fn noting<T>(f: (T) -> T / {log.note}, x: T) -> T / {log.note} = f(x)\n",
+    b"fn lends_closed(x: Int) -> Int / {log.note} = noting(|y: Int| { log.note(y); y }, x)\n",
     b"fn raised_step(n: Int) -> Int / {abort.raise} = iterate(0, n, |i: Int| { let next = if i >= 10 { Stop(i) } else { Continue(i + 1) }; if i == 5 { abort.raise(\"five\") } else { () }; next })\n",
     b"fn paired_step(n: Int) -> Int / {abort.raise} = iterate(pair(0, 1), n, |q: { x: Int, y: Int }| if q.x >= 10 { Stop(q.x + q.y) } else { Continue(pair(q.y, q.x + q.y)) })\n",
     b"fn walk1(p: { x: Int, y: Int }, n: Int) -> { x: Int, y: Int } = if n <= 0 { p } else { walk1(pair(p.y, p.x), n - 1) }\n",
@@ -292,6 +304,51 @@ fn closure_of(f: Fn, nth: Int) -> Option<{ body: Fn, captures: Int }> =
     None -> None,
   }
 
+/// Every `let` of `b`, and of each `handle`'s body inside it.
+fn lets_handled(b: Block) -> List<{ var: Var, val: Val }> =
+  b.fold([], |acc: List<{ var: Var, val: Val }>, i: Inst|
+    match i {
+      Let(l) -> acc.push({ var: l.var, val: l.val }),
+      Handle(h) -> acc.concat(lets_handled(h.body)),
+      _ -> acc,
+    })
+
+test "a handle where a task may be spawned lays its instance on the heap, which the closure the spawn is handed holds" {
+  let src = Bytes::concat_all([
+    b"effect note {\n  write say(n: Int) -> Unit\n}\n",
+    b"fn sayer() -> Int / {abort.raise, sim.read} = simulate { handle { let t = task.spawn(|| { note.say(1); 2 }); task.join(t) } with { note.say(n) -> () } }\n",
+  ]);
+  match scheduled_program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lowered_as_built(p, b"sayer") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> {
+        let lets = f.lambdas.fold(
+          lets_handled(f.body),
+          |acc: List<{ var: Var, val: Val }>, l: Lambda|
+            match l { Closure(c) -> acc.concat(lets_handled(c.body.body)) },
+        );
+        let blocks = lets.filter(|x: { var: Var, val: Val }|
+          match x.val {
+            Op(o) -> match o.op { OHandle(InstanceHeap(_)) -> true, _ -> false },
+            _ -> false,
+          });
+        assert_eq(blocks.len(), 1);
+        // A closure is made holding the block: the one the spawn is handed.
+        assert(
+          lets.any(|x: { var: Var, val: Val }|
+            match x.val {
+              Make(m) ->
+                m.args.any(|a: Arg| blocks.any(|b: { var: Var, val: Val }| a == AVar(b.var))),
+              _ -> false,
+            }),
+          None,
+        )
+      },
+    },
+  }
+}
+
 test "a call of a definition hands its arguments as the callee carries them" {
   match form(b"twice") {
     Err(why) -> assert_eq(why, b""),
@@ -356,7 +413,7 @@ test "a lambda and a function value take a small record as its fields too" {
       assert_eq(
         vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
           match v { Apply(a) -> acc.push(a.conv.reps.push(a.conv.answer)), _ -> acc }),
-        [[fields, RInt]],
+        [[fields, RImm, RImm, RInt]],
       ),
   }
 }
@@ -366,7 +423,7 @@ test "a call of a generic definition is the body's generic call at the reference
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
       assert_eq(f.links.generics, [
-        { callee: Named(b"m.ident"), args: [int_type()], carried: [0], fns: [] },
+        { callee: Named(b"m.ident"), args: [int_type()], carried: [0], fns: [], rows: [] },
       ]);
       assert_eq(
         vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
@@ -389,6 +446,7 @@ test "a call of a generic definition is the body's generic call at the reference
           args: [TyCon({ name: b"String", args: [] })],
           carried: [],
           fns: [],
+          rows: [],
         },
       ]),
   }
@@ -459,14 +517,22 @@ test "a closure is a block of its own, its descriptor first, whose entries give 
       has(b"rt_alloc_bytes_p(ctx, 24)");
       has(Bytes::concat_all([b")[0] = (Word)(intptr_t)&", name, b"_desc"]));
       // The runtime's ABI: a descriptor's entries in their places, each taking the block. The entry
-      // by words is the one every closure of this convention shares, written once: it counts the
-      // closure once more and calls its typed entry.
+      // by words is the one every closure of this convention shares, written once: it takes the
+      // row the runtime set for it, counts the closure once more and calls its typed entry.
       has(Bytes::concat_all([b"const PlyFnDesc ", name, b"_desc = { ply_c_"]));
       has(Bytes::concat_all([b", (void (*)(void))", name, b"_typed, "]));
       has(b"static Word ply_c_");
-      has(b"(PlyCtx *ctx, Word self, const Word *args) {\n  ply_dup(self);");
+      has(
+        Bytes::concat_all([
+          b"(PlyCtx *ctx, Word self, const Word *args) {\n",
+          b"  Word ed = ctx->entering_desc;\n  Word ew = ctx->entering_words;\n",
+          b"  ctx->entering_desc = 0; ctx->entering_words = 0;\n  ply_dup(self);",
+        ]),
+      );
       has(b"((const PlyFnDesc *)(intptr_t)ply_words(self)[0])->typed)(ctx, self, ");
-      has(name.concat(b"_typed(PlyCtx *ctx, Word self, int64_t p0)"));
+      // Past its parameter, the descriptor of the row its caller names and the words for it, which
+      // a closure of a row that takes none reads nothing of.
+      has(name.concat(b"_typed(PlyCtx *ctx, Word self, int64_t p0, Word p1, Word p2)"));
       // The typed entry, which takes the closure, moves the capture out of a block held only there
       // and gives the block back, and otherwise lets the closure go through its descriptor, since
       // the runtime does not walk its captures; the uniform entry borrows it. The captured `Int`
@@ -611,6 +677,44 @@ test "a definition or a constructor named as a value is the closure of a lambda 
   }
 }
 
+test "a scheduler function of no parameters over a native that reads the run is called each time, where one over a pure native is read once" {
+  let scheduler = {
+    name: scheduler_module(),
+    src: Bytes::concat_all([
+      b"import std.internal.native (native)\n",
+      b"extern fn seed_path() -> Bytes / {native.read}\n",
+      b"extern fn site_placed(root: Int, start: Int, end: Int) -> Bytes\n",
+      b"fn path() -> Bytes / {native.read} = seed_path()\n",
+      b"fn placed() -> Bytes = site_placed(0, 0, 0)\n",
+      b"pub fn ran() -> Int / {native.read} = path().len() + placed().len()\n",
+      b"pub fn simulated<a | e>(root: Int, start: Int, end: Int, body: keep () -> a / {task.write, clock.read, clock.write, random.write, sim.read | e}) -> a / {abort.raise, native.read | e} = {\n",
+      b"  let _ = ran();\n",
+      b"  abort.raise(\"none\")\n",
+      b"}\n",
+    ]),
+  };
+  let native = { name: b"std.internal.native", src: b"pub nondet effect native {}\n" };
+  // The region pulls the scheduler into the load.
+  let region = b"fn main() -> Int / {abort.raise, sim.read} = simulate { 1 }\n";
+  match shipped_formed(region, [scheduler, native], scheduler_module(), b"ran") {
+    Err(no) -> assert_eq(no.why, b""),
+    Ok(f) -> {
+      let read = |callee: Bytes|
+        vals_in(f.body).filter(|v: Val|
+          match v {
+            Op(o) -> match o.op {
+              OCalling(ConstantRead(c)) ->
+                c.callee == Root(Named(qualify(scheduler_module(), callee))),
+              _ -> false,
+            },
+            _ -> false,
+          }).len(
+        );
+      assert_eq([b"path", b"placed"].map(read), [0, 1])
+    },
+  }
+}
+
 test "a hold's closures and what its builtins answer are typed by the hold, so nothing it binds is of no known type" {
   match form(b"held") {
     Err(why) -> assert_eq(why, b""),
@@ -661,6 +765,7 @@ test "a lambda handed where its callee lends it lies in the caller's frame, and 
           args: [int_type()],
           carried: [0],
           fns: [{ param: 0, owner: Named(b"m.lends"), nth: 0 }],
+          rows: [],
         },
       ]);
       assert_eq(
@@ -671,14 +776,14 @@ test "a lambda handed where its callee lends it lies in the caller's frame, and 
   }
 }
 
-test "a function value is applied through the convention its type has, and the parameter is noted as called" {
+test "a function value is applied through the convention its type has, its row's descriptor and words after its parameters, and the parameter is noted as called" {
   match form(b"applied") {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
       assert_eq(
         vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
           match v { Apply(a) -> acc.push(a.conv.reps.push(a.conv.answer)), _ -> acc }),
-        [[RInt, RInt]],
+        [[RInt, RImm, RImm, RInt]],
       );
       assert_eq(f.links.called, [0])
     },
@@ -815,13 +920,23 @@ fn specialised_form(
   args: List<Type>,
   fns: List<FnArg>,
   lent: List<Option<BoundLambda>>,
+) -> Result<Fn, Bytes> / {abort.raise} = specialised_rowed(p, name, args, fns, lent, [])
+
+/// `specialised_form` with the root's row variables at `rows`.
+fn specialised_rowed(
+  p: Program,
+  name: Bytes,
+  args: List<Type>,
+  fns: List<FnArg>,
+  lent: List<Option<BoundLambda>>,
+  rows: List<List<Evidence>>,
 ) -> Result<Fn, Bytes> / {abort.raise} =
   match match root_at(p, name) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such root"),
     Some(r) -> match r.code {
       Err(why) -> Err(why),
       Ok(code) -> {
-        let key = at_key(filed_as(r.key), args, fns);
+        let key = at_rowed(filed_as(r.key), args.map(KeyType), fns, rows);
         let params = range(0, r.params.len()).map(|i: Int|
           match lent.at(i) {
             Some(Some(bl)) -> { ..r.params.get(i), lambda: Some(bl) },
@@ -850,6 +965,17 @@ fn lent_run(
   args: List<Type>,
   param: Int,
 ) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
+  lent_rowed(p, lender, generic, args, param, [])
+
+/// `lent_run` with the generic's row variables at `rows`.
+fn lent_rowed(
+  p: Program,
+  lender: Bytes,
+  generic: Bytes,
+  args: List<Type>,
+  param: Int,
+  rows: List<List<Evidence>>,
+) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
   match match root_at(p, lender) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such lender"),
     Some(l) -> match l.code {
@@ -872,12 +998,13 @@ fn lent_run(
               base: l.base,
               written: written,
             };
-            match specialised_form(
+            match specialised_rowed(
                 p,
                 generic,
                 args,
                 [{ param: param, owner: l.key, nth: 0 }],
                 range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
+                rows,
               ) {
               Ok(f) -> Ok({ f: f, base: l.base }),
               Err(why) -> Err(why),
@@ -915,6 +1042,55 @@ test "another root's lambda a specialisation runs in place takes its lender's si
           ),
           1,
         )
+      },
+    },
+  }
+}
+
+test "a closure a lent lambda makes performs through its own words, never the frame bridge" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_rowed(p, b"lends_noting", b"apply_in", [int_type()], 0, [
+        [{ effect: b"m.log", resource: RSingleton }],
+      ]) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) -> {
+        let bridged = |f: Fn|
+          vals_in(f.body).filter(|v: Val| match v { Op(o) -> o.op == OHandle(Bridge), _ -> false });
+        let performs = |f: Fn|
+          vals_in(f.body).filter(|v: Val|
+            match v {
+              Op(o) -> match o.op { OHandle(Perform(_)) -> true, _ -> false },
+              _ -> false,
+            });
+        let closures = range(0, run.f.lambdas.len()).fold([], |acc: List<Fn>, k: Int|
+          match closure_of(run.f, k) { Some(c) -> acc.push(c.body), None -> acc });
+        // The closure the lent lambda hands `noted_by` performs `log.note`, through the word it is
+        // handed, as the specialisation's body hands `noted_by` the word it was handed.
+        assert_eq(closures.map(|f: Fn| performs(f).len()), [1]);
+        assert_eq(closures.map(|f: Fn| bridged(f).len()).concat([bridged(run.f).len()]), [0, 0])
+      },
+    },
+  }
+}
+
+test "a lambda lent to a parameter of a closed row performs through the word its callee holds for it" {
+  match program_of(corpus()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_run(p, b"lends_closed", b"noting", [int_type()], 0) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(run) -> {
+        let ops = vals_in(run.f.body).fold([], |acc: List<Bytes>, v: Val|
+          match v {
+            Op(o) -> match o.op {
+              OHandle(Perform(_)) -> acc.push(b"perform"),
+              OHandle(Bridge) -> acc.push(b"bridge"),
+              _ -> acc,
+            },
+            _ -> acc,
+          });
+        // `noting`'s own word for `log`, which a call of `f` there would hand it, answers the perform.
+        assert_eq(ops, [b"perform"])
       },
     },
   }
@@ -1232,6 +1408,65 @@ fn insts_in(b: Block) -> List<Inst> =
           a.concat(insts_in(arm))),
       _ -> acc.push(i),
     })
+
+fn labelled() -> Bytes =
+  Bytes::concat_all([
+    b"effect net {\n  write send[s](payload: Int) -> Int\n}\n",
+    b"fn hop<[l], [k]>(n: Int, sum: Int) -> Int / {net.send[l], net.send[k]} =\n",
+    b"  if n <= 0 { sum } else { hop[k, l](n - 1, sum + net.send[l](n)) }\n",
+    b"fn said<[l]>(n: (Int) -> Int / {net.send[l]}) -> Int / {net.send[l]} = n(1)\n",
+    b"fn sent() -> Int / {net.send[db]} = said(|x: Int| net.send[db](x))\n",
+  ])
+
+test "a self call passing its labels otherwise than it was given them hands its jump the words of the labels it passes" {
+  match program_of(labelled()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lowered_as_built(p, b"hop") {
+      Err(no) -> assert_eq(no.why, b""),
+      // Its words are its last two parameters, one for each label, which the jump swaps.
+      Ok(f) -> {
+        let words = f.params.drop(f.params.len() - 2).map(AVar);
+        assert_eq(
+          insts_in(f.body).fold([], |acc: List<List<Arg>>, i: Inst|
+            match i { Restart(args) -> acc.push(args.drop(args.len() - 2)), _ -> acc }),
+          [words.reverse()],
+        )
+      },
+    },
+  }
+}
+
+test "a self call passing on the words it was given in one array restarts on that array, never on one laid in the loop" {
+  let src = Bytes::concat_all([
+    [b"e0", b"e1", b"e2", b"e3", b"e4"].fold(b"", |acc: Bytes, e: Bytes|
+      Bytes::concat_all([acc, b"effect ", e, b" {\n  write go() -> Unit\n}\n"])),
+    b"fn spin(n: Int) -> Int / {e0.go, e1.go, e2.go, e3.go, e4.go} =\n",
+    b"  if n <= 0 { 0 } else { e0.go(); spin(n - 1) }\n",
+  ]);
+  match program_of(src) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lowered_as_built(p, b"spin") {
+      Err(no) -> assert_eq(no.why, b""),
+      // Five words are more than the root takes one by one, so it takes them as one array.
+      Ok(f) ->
+        assert_eq(
+          insts_in(f.body).fold([], |acc: List<List<Arg>>, i: Inst|
+            match i { Restart(args) -> acc.push(args.drop(1)), _ -> acc }),
+          [f.params.drop(1).map(AVar)],
+        ),
+    },
+  }
+}
+
+test "a lambda handed at a parameter whose row names the callee's label runs as a closure, its words read at the label the call fills" {
+  match program_of(labelled()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lowered_as_built(p, b"sent") {
+      Err(no) -> assert_eq(no.why, b""),
+      Ok(f) -> assert_eq(f.links.generics.map(|g: GenericCall| g.fns), []),
+    },
+  }
+}
 
 test "a tail group is one root whose case runs each member, a tail call into another member entering it" {
   match group_form([b"even", b"odd"]) {
@@ -1705,7 +1940,7 @@ test "a closure and a function value take a sum wider than a call's registers by
       assert_eq(
         vals_in(f.body).fold([], |acc: List<Bool>, v: Val|
           match v { Apply(a) -> acc.concat(a.conv.reps.map(wide)), _ -> acc }),
-        [true],
+        [true, false, false],
       ),
   }
 }

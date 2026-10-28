@@ -5,36 +5,34 @@ use crate::value::{ClosureKind, Value};
 use crate::{Diagnostic, Span, codes};
 use std::borrow::Cow;
 
+/// What may not cross a boundary: a continuation, which no type records as one, and a task or a
+/// channel, which only the region that made it can hold.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Handle {
-    Task,
-    Chan,
     Continuation,
+    Task,
+    Channel,
 }
 
 impl Handle {
     /// A continuation has no type of its own to name: its type is a function's.
     fn noun(self) -> &'static str {
         match self {
-            Handle::Task => "a `Task`",
-            Handle::Chan => "a `Chan`",
             Handle::Continuation => "a continuation",
+            Handle::Task => "a `Task`",
+            Handle::Channel => "a `Chan`",
         }
     }
 
     fn why(self) -> &'static str {
         match self {
-            Handle::Task => {
-                "a `Task` is a key into a scheduler, and the scheduler dies with the region that \
-                 opened it"
-            }
-            Handle::Chan => {
-                "a `Chan` is a key into a scheduler, and the scheduler dies with the region that \
-                 opened it"
-            }
             Handle::Continuation => {
                 "a continuation resumes a body that lives only as long as the entry that captured \
                  it"
+            }
+            Handle::Task | Handle::Channel => {
+                "a task or a channel is a key into the region that made it, which ends before the \
+                 entry does"
             }
         }
     }
@@ -42,14 +40,27 @@ impl Handle {
     /// Why no type refused it before the boundary did.
     fn unseen(self) -> &'static str {
         match self {
-            Handle::Task | Handle::Chan => {
-                "the escape brand makes this a type error wherever a type still mentions the \
-                 brand; this is the boundary where none does, so it is refused here instead of \
-                 read later"
-            }
             Handle::Continuation => {
                 "no type records that a function is a continuation, so it is refused at the \
                  boundary instead of wherever it would be resumed"
+            }
+            Handle::Task | Handle::Channel => {
+                "a value may carry it out of its region, which no check stops, so it is refused \
+                 at the boundary instead of wherever it would be joined"
+            }
+        }
+    }
+
+    /// What the program does instead, at an entry's answer.
+    fn instead(self) -> &'static str {
+        match self {
+            Handle::Continuation => {
+                "resume the continuation before the entry answers, and answer with what it \
+                 answers"
+            }
+            Handle::Task | Handle::Channel => {
+                "join the task, or drain the channel, inside the region that made it, and answer \
+                 with what that gives"
             }
         }
     }
@@ -83,14 +94,6 @@ pub enum Boundary<'a> {
         operation: &'a str,
         path: &'static str,
     },
-    /// The value a host runtime resolved a parked token to.
-    HostToken {
-        label: &'static str,
-        token: u64,
-    },
-    EntryPoint {
-        name: &'a str,
-    },
     EntryAnswer {
         name: &'a str,
     },
@@ -111,12 +114,6 @@ impl Boundary<'_> {
             Boundary::HostAnswer { operation, .. } => {
                 format!("`{operation}` answered with {what}{reached}")
             }
-            Boundary::HostToken { label, token } => {
-                format!("the host runtime resolved `{label}` (#{token}) to {what}{reached}")
-            }
-            Boundary::EntryPoint { name } => {
-                format!("`{name}` was called with {what}{reached}")
-            }
             Boundary::EntryAnswer { name } => format!("`{name}` answered {what}{reached}"),
         }
     }
@@ -124,8 +121,7 @@ impl Boundary<'_> {
     fn label(&self) -> &'static str {
         match self {
             Boundary::HostArgument { .. } => "performed here",
-            Boundary::HostAnswer { .. } | Boundary::HostToken { .. } => "the answer to this",
-            Boundary::EntryPoint { .. } => "entered here",
+            Boundary::HostAnswer { .. } => "the answer to this",
             Boundary::EntryAnswer { .. } => "answered here",
         }
     }
@@ -140,14 +136,6 @@ impl Boundary<'_> {
                 "`{path}` is outside the program, so a handle it produced names no region this \
                  run allocated"
             )),
-            Boundary::HostToken { .. } => Cow::Borrowed(
-                "a host runtime is outside the program, so a handle it produced names no region \
-                 this run allocated",
-            ),
-            Boundary::EntryPoint { .. } => Cow::Borrowed(
-                "an entry point starts a run of its own, so a handle carried in from another run \
-                 names nothing this one made",
-            ),
             Boundary::EntryAnswer { .. } => Cow::Borrowed(
                 "an entry point's answer goes to its caller, which keeps it after the entry has \
                  ended and closed every region it opened",
@@ -156,36 +144,21 @@ impl Boundary<'_> {
     }
 
     fn remedy(&self, handle: Handle) -> &'static str {
-        match (self, handle) {
-            (Boundary::HostArgument { .. }, Handle::Task | Handle::Chan) => {
-                "read the value inside the region and perform the operation with something that \
-                 does not reach a region"
-            }
-            (Boundary::HostArgument { .. }, Handle::Continuation) => {
+        match self {
+            Boundary::HostArgument { .. } => {
                 "resume the continuation inside the clause that bound it, and perform the \
                  operation with what it answers"
             }
-            (Boundary::HostAnswer { .. } | Boundary::HostToken { .. }, _) => {
+            Boundary::HostAnswer { .. } => {
                 "a handler answers with data; a handle into the program's memory is not data it \
                  is in a position to have"
             }
-            (Boundary::EntryPoint { .. }, _) => {
-                "call the entry point with data, and let the program make its own tasks, channels \
-                 and continuations"
-            }
-            (Boundary::EntryAnswer { .. }, Handle::Task | Handle::Chan) => {
-                "read the value inside the region and answer with something that does not reach \
-                 a region"
-            }
-            (Boundary::EntryAnswer { .. }, Handle::Continuation) => {
-                "resume the continuation before the entry answers, and answer with what it \
-                 answers"
-            }
+            Boundary::EntryAnswer { .. } => handle.instead(),
         }
     }
 }
 
-/// The first region-bound handle `value` can reach, with the route to it.
+/// The first continuation `value` can reach, with the route to it.
 pub fn carries(value: &Value) -> Option<Escapee> {
     let mut route = Vec::new();
     let handle = find(value, &mut route)?;
@@ -219,6 +192,15 @@ pub fn check_arguments(
     Ok(())
 }
 
+/// `handle`, which no value stands for, refused at `boundary`.
+pub fn refused(boundary: &Boundary<'_>, handle: Handle, span: Span) -> Diagnostic {
+    let escapee = Escapee {
+        handle,
+        route: Vec::new(),
+    };
+    refuse(boundary, &escapee, span)
+}
+
 #[cold]
 #[inline(never)]
 fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic {
@@ -236,9 +218,6 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
 /// Builds `route` innermost-first as the `Some` unwinds, so a clean value allocates nothing.
 fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
-        Value::Task(_) => Some(Handle::Task),
-        Value::Chan(_) => Some(Handle::Chan),
-
         Value::Int(_)
         | Value::Fixed(_)
         | Value::Char(_)

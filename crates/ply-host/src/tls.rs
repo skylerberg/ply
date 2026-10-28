@@ -17,25 +17,10 @@ use rustls::{
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
-
-/// The Rust path `ply hosts` prints for `net.listen_tls`; it must name [`listen`].
-pub const HANDLER: &str = "ply_host::tls::listen";
-
-/// The Rust path `ply hosts` prints for `net.connect_tls`; it must name [`connect`].
-pub const CONNECT_HANDLER: &str = "ply_host::tls::connect";
-
-/// The Rust path `ply hosts` prints for `net.handshake`; it must name [`Session::handshake`].
-pub const HANDSHAKE_HANDLER: &str = "ply_host::tls::handshake";
-
-/// The Rust path `ply hosts` prints for `net.start_tls`, the client's end of an upgrade.
-pub const START_HANDLER: &str = "ply_host::tls::start";
-
-/// The Rust path `ply hosts` prints for `net.serve_tls`, the server's end of an upgrade.
-pub const SERVE_HANDLER: &str = "ply_host::tls::serve";
 
 pub const LIBRARY: &str = "rustls";
 pub const VERSION: &str = "0.23.43";
@@ -552,17 +537,6 @@ pub fn fingerprint(leaf: &CertificateDer<'_>) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
-}
-
-pub fn listen(
-    credentials: &Credentials,
-    credential: &str,
-    port: u16,
-    span: Span,
-) -> Result<(TcpListener, Arc<ServerConfig>), Diagnostic> {
-    let config = credentials.resolve(credential, span)?;
-    let listener = crate::tcp::bind("`net.listen_tls`", port, span)?;
-    Ok((listener, config))
 }
 
 /// `Read + Write` by value over a shared stream, so `close` can shut it down under a parked read.

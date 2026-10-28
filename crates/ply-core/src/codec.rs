@@ -150,7 +150,7 @@ pub fn write_value(
             }
             _ => w.handle(handle(v)?),
         },
-        Value::Task(_) | Value::Chan(_) | Value::Secret(_) => w.handle(handle(v)?),
+        Value::Secret(_) => w.handle(handle(v)?),
     }
     Ok(())
 }

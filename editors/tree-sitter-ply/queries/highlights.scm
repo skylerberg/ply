@@ -39,6 +39,7 @@
   "invariant"
   "release"
   "numeric"
+  "host"
   "once"
   "multi"
   "forall"

@@ -1,12 +1,10 @@
 mod spans;
 
 use ply_core::host::MachineId;
-use ply_core::host::Pending;
-use ply_core::{
-    Determinism, Diagnostic, EffectAtom, HostAnswer, HostHandler, HostRequest, HostResource,
-    HostRuntime, Linearity, Mode, Resource, Span, Symbol, TaskId, codes,
-};
+use ply_core::{Span, TaskId, codes};
+use ply_host::native::{int, parts};
 use ply_host::trace::sink::{OwnedRecord, Recording};
+use ply_host::trace::spans::err_unbalanced;
 use ply_host::trace::*;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
@@ -30,23 +28,6 @@ impl Clock for Counting {
 impl Counting {
     fn reads(&self) -> u64 {
         self.reads.load(Ordering::Relaxed)
-    }
-}
-
-struct NoRuntime;
-
-impl HostRuntime for NoRuntime {
-    fn watch(&self, _: &Pending) -> Result<(), Diagnostic> {
-        unreachable!("nothing here answers `Pending`")
-    }
-    fn resolved(&self) -> Vec<(u64, Result<ply_core::Value, Diagnostic>)> {
-        unreachable!("nothing here answers `Pending`")
-    }
-    fn park(&self) -> Result<(), Diagnostic> {
-        unreachable!("nothing here answers `Pending`")
-    }
-    fn block_on(&self, _: Pending) -> Result<ply_core::Value, Diagnostic> {
-        unreachable!("nothing here answers `Pending`")
     }
 }
 
@@ -86,32 +67,40 @@ fn discarding() -> (Arc<Trace>, Arc<Counting>) {
     )
 }
 
-fn ctor(name: &str, args: Vec<ply_core::Value>) -> ply_core::Value {
-    ply_core::Value::ctor(format!("{MODULE}.{name}"), args)
-}
-
-fn no_fields() -> ply_core::Value {
-    ply_core::Value::empty_map()
-}
-
-fn field(key: &str, value: ply_core::Value) -> ply_core::Value {
-    ply_core::Value::map([(ply_core::Value::str(key), value)])
+fn field(key: &str, value: Field) -> Vec<(String, Field)> {
+    vec![(key.to_string(), value)]
 }
 
 impl Fixture {
-    fn perform(&self, op: Op, at: &str, args: Vec<ply_core::Value>) -> ply_core::Value {
-        self.as_task(None, op, at, args)
-            .unwrap_or_else(|d| panic!("{d:?}"))
+    fn owner(&self, task: Option<TaskId>) -> Owner {
+        (self.machine, task)
     }
 
-    fn as_task(
+    fn enter_as(&self, task: Option<TaskId>, at: &str, name: &str) -> i64 {
+        self.trace.enter(self.owner(task), at, name, &[])
+    }
+
+    fn exit_as(
         &self,
         task: Option<TaskId>,
-        op: Op,
         at: &str,
-        args: Vec<ply_core::Value>,
-    ) -> Result<ply_core::Value, Diagnostic> {
-        perform_on(&self.trace, self.machine, task, op, at, args)
+        id: i64,
+        outcome: Outcome,
+    ) -> Result<(), Unbalanced> {
+        self.trace.exit(self.owner(task), at, id, outcome)
+    }
+
+    fn event_with(&self, at: &str, level: Level, name: &str, fields: &[(String, Field)]) {
+        self.trace.record(
+            self.owner(None),
+            RecordKind::Event,
+            level,
+            at,
+            name,
+            None,
+            None,
+            fields,
+        );
     }
 
     fn kinds(&self) -> Vec<RecordKind> {
@@ -123,103 +112,17 @@ impl Fixture {
     }
 }
 
-fn perform_on(
-    trace: &Arc<Trace>,
-    machine: MachineId,
-    task: Option<TaskId>,
-    op: Op,
-    at: &str,
-    args: Vec<ply_core::Value>,
-) -> Result<ply_core::Value, Diagnostic> {
-    let handler = Operation {
-        op,
-        trace: Arc::clone(trace),
-    };
-    let declaration = op.declaration("ply_host::trace::tests");
-    let atom = EffectAtom::new(
-        Symbol::new(EFFECT),
-        Resource::Named(Symbol::new(at)),
-        Mode::Write,
-    );
-    let request = HostRequest {
-        atom,
-        op: &declaration,
-        args: &args,
-        span: Span::DUMMY,
-        machine,
-        task,
-        declared: None,
-    };
-    match handler.call(&NoRuntime, &request)? {
-        HostAnswer::Value(value) => Ok(value),
-        HostAnswer::Pending(_) => panic!("`trace` never waits on a peer"),
-    }
+fn enter(f: &Fixture, at: &str, name: &str) -> i64 {
+    f.enter_as(None, at, name)
 }
 
-fn enter(f: &Fixture, at: &str, name: &str) -> ply_core::Value {
-    f.perform(Op::Enter, at, vec![ply_core::Value::str(name), no_fields()])
+fn exit(f: &Fixture, at: &str, id: i64) {
+    f.exit_as(None, at, id, Outcome::Ok)
+        .expect("the span is open");
 }
 
-fn exit(f: &Fixture, at: &str, span: ply_core::Value) -> ply_core::Value {
-    f.perform(Op::Exit, at, vec![span, ctor("Ok", Vec::new())])
-}
-
-fn event(f: &Fixture, at: &str, level: &str, name: &str) -> ply_core::Value {
-    f.perform(
-        Op::Event,
-        at,
-        vec![
-            ctor(level, Vec::new()),
-            ply_core::Value::str(name),
-            no_fields(),
-        ],
-    )
-}
-
-/// The resource is a channel and every operation `Any`, so `bind` yields a row per channel used.
-#[test]
-fn every_operation_registers_per_channel_at_most_once_and_not_blocking() {
-    for op in Op::ALL {
-        let declaration = op.declaration("ply_host::trace::discard");
-        assert_eq!(declaration.effect.as_str(), EFFECT);
-        assert_eq!(declaration.resource, HostResource::Any);
-        assert_eq!(declaration.determinism, Determinism::Nondeterministic);
-        assert_eq!(
-            declaration.linearity,
-            Linearity::AtMostOnce,
-            "replaying `{}` writes its record twice, and a duplicated span is a wrong answer",
-            op.name()
-        );
-        assert!(!declaration.blocking, "`{}` waits on nothing", op.name());
-    }
-}
-
-#[test]
-fn the_listing_names_the_sink_that_actually_serves_the_run() {
-    let discard = registry(Arc::new(Trace::new(Arc::new(Discard))));
-    assert!(
-        discard
-            .ops()
-            .all(|op| op.path == "ply_host::trace::discard"),
-        "a discarding run must not claim to be writing JSON"
-    );
-    let json = registry(Arc::new(Trace::new(Arc::new(Json::new(Level::Info)))));
-    assert!(json.ops().all(|op| op.path == "ply_host::trace::json"));
-    assert_eq!(json.len(), Op::ALL.len());
-}
-
-#[test]
-fn enter_answers_a_span_carrying_its_id_and_its_channel() {
-    let f = fixture();
-    let span = enter(&f, "orders", "place_order");
-    let ply_core::Value::Record(fields) = &span else {
-        panic!("a `Span` is a record: {span:?}");
-    };
-    assert_eq!(fields[&Symbol::new("id")], ply_core::Value::Int(1));
-    assert_eq!(
-        fields[&Symbol::new("channel")],
-        ply_core::Value::str("orders")
-    );
+fn event(f: &Fixture, at: &str, level: Level, name: &str) {
+    f.event_with(at, level, name, &[]);
 }
 
 #[test]
@@ -227,7 +130,8 @@ fn a_nested_span_records_its_parent_and_an_event_inside_it_records_the_span() {
     let f = fixture();
     let outer = enter(&f, "http", "request");
     let inner = enter(&f, "http", "query");
-    event(&f, "http", "Warn", "slow");
+    assert_eq!((outer, inner), (1, 2), "ids ascend from one");
+    event(&f, "http", Level::Warn, "slow");
     exit(&f, "http", inner);
     exit(&f, "http", outer);
 
@@ -256,23 +160,12 @@ fn a_nested_span_records_its_parent_and_an_event_inside_it_records_the_span() {
 #[test]
 fn a_span_opened_in_one_task_does_not_close_in_another() {
     let f = fixture();
-    let first = f
-        .as_task(
-            Some(TaskId(1)),
-            Op::Enter,
-            "http",
-            vec![ply_core::Value::str("request"), no_fields()],
-        )
-        .expect("task 1 opens a span");
+    let first = f.enter_as(Some(TaskId(1)), "http", "request");
 
-    let refused = f
-        .as_task(
-            Some(TaskId(2)),
-            Op::Exit,
-            "http",
-            vec![first.clone(), ctor("Ok", Vec::new())],
-        )
+    let why = f
+        .exit_as(Some(TaskId(2)), "http", first, Outcome::Ok)
         .expect_err("task 2 must not close task 1's span");
+    let refused = err_unbalanced(Span::DUMMY, "`trace.exit`", first, &why);
     assert_eq!(refused.code, codes::SPAN_UNBALANCED);
     assert!(
         refused.notes.iter().any(|n| n.contains("task @1")),
@@ -281,37 +174,41 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
 
     // Nothing was recorded for the refusal, and the span is still task 1's to close.
     assert_eq!(f.kinds(), [RecordKind::Enter]);
-    f.as_task(
-        Some(TaskId(1)),
-        Op::Exit,
-        "http",
-        vec![first, ctor("Ok", Vec::new())],
-    )
-    .expect("task 1 closes its own span");
+    f.exit_as(Some(TaskId(1)), "http", first, Outcome::Ok)
+        .expect("task 1 closes its own span");
     assert_eq!(f.kinds(), [RecordKind::Enter, RecordKind::Exit]);
+}
+
+#[test]
+fn a_span_closed_on_another_channel_is_refused() {
+    let f = fixture();
+    let id = enter(&f, "http", "request");
+    let why = f
+        .exit_as(None, "db", id, Outcome::Ok)
+        .expect_err("the channel is part of the span");
+    assert!(matches!(why, Unbalanced::OtherChannel(_)), "{why:?}");
+    exit(&f, "http", id);
 }
 
 /// Checked against the tree the records imply, not the driver's own bookkeeping.
 #[test]
 fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     let f = fixture();
-    let one = |op, args| {
-        f.as_task(Some(TaskId(1)), op, "http", args)
-            .expect("task 1")
-    };
-    let two = |op, args| {
-        f.as_task(Some(TaskId(2)), op, "http", args)
-            .expect("task 2")
+    let one = Some(TaskId(1));
+    let two = Some(TaskId(2));
+    let close = |task, id| {
+        f.exit_as(task, "http", id, Outcome::Ok)
+            .expect("the task closes its own span")
     };
 
-    let a = one(Op::Enter, vec![ply_core::Value::str("a"), no_fields()]);
-    let b = two(Op::Enter, vec![ply_core::Value::str("b"), no_fields()]);
-    let a_inner = one(Op::Enter, vec![ply_core::Value::str("a2"), no_fields()]);
-    let b_inner = two(Op::Enter, vec![ply_core::Value::str("b2"), no_fields()]);
-    two(Op::Exit, vec![b_inner, ctor("Ok", Vec::new())]);
-    one(Op::Exit, vec![a_inner, ctor("Ok", Vec::new())]);
-    two(Op::Exit, vec![b, ctor("Ok", Vec::new())]);
-    one(Op::Exit, vec![a, ctor("Ok", Vec::new())]);
+    let a = f.enter_as(one, "http", "a");
+    let b = f.enter_as(two, "http", "b");
+    let a_inner = f.enter_as(one, "http", "a2");
+    let b_inner = f.enter_as(two, "http", "b2");
+    close(two, b_inner);
+    close(one, a_inner);
+    close(two, b);
+    close(one, a);
 
     // The reference: each name's `enter`, and what its parent's name is.
     let records = f.records();
@@ -340,14 +237,13 @@ fn closing_an_outer_span_abandons_the_spans_above_it() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     let _inner = enter(&f, "orders", "reserve");
-    f.perform(
-        Op::Exit,
+    f.exit_as(
+        None,
         "orders",
-        vec![
-            outer,
-            ctor("Failed", vec![ply_core::Value::str("rolled back")]),
-        ],
-    );
+        outer,
+        Outcome::Failed("rolled back".to_string()),
+    )
+    .expect("the outer span is open");
 
     let records = f.records();
     assert_eq!(
@@ -409,15 +305,8 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
 fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
     let f = fixture();
     let task = TaskId(3);
-    for (at, name) in [("http", "request"), ("db", "query")] {
-        f.as_task(
-            Some(task),
-            Op::Enter,
-            at,
-            vec![ply_core::Value::str(name), no_fields()],
-        )
-        .unwrap_or_else(|d| panic!("{d:?}"));
-    }
+    f.enter_as(Some(task), "http", "request");
+    f.enter_as(Some(task), "db", "query");
     enter(&f, "http", "serve");
 
     f.trace.end_task(f.machine, task);
@@ -451,13 +340,7 @@ fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
 #[test]
 fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_ends() {
     let f = fixture();
-    f.as_task(
-        Some(TaskId(3)),
-        Op::Enter,
-        "db",
-        vec![ply_core::Value::str("query"), no_fields()],
-    )
-    .unwrap_or_else(|d| panic!("{d:?}"));
+    f.enter_as(Some(TaskId(3)), "db", "query");
     f.trace.end_task(f.machine, TaskId(3));
     assert_eq!(f.trace.open_spans(), 0);
 
@@ -491,14 +374,8 @@ fn the_spans_left_open_are_what_the_warnings_counted() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     enter(&f, "orders", "reserve");
-    f.perform(Op::Exit, "orders", vec![outer, ctor("Ok", Vec::new())]);
-    f.as_task(
-        Some(TaskId(3)),
-        Op::Enter,
-        "db",
-        vec![ply_core::Value::str("query"), no_fields()],
-    )
-    .unwrap_or_else(|d| panic!("{d:?}"));
+    exit(&f, "orders", outer);
+    f.enter_as(Some(TaskId(3)), "db", "query");
     f.trace.end_task(f.machine, TaskId(3));
     enter(&f, "http", "request");
 
@@ -547,90 +424,51 @@ fn teardown_writes_before_it_flushes() {
 #[test]
 fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
     let f = fixture();
-    f.perform(
-        Op::Count,
-        "orders",
-        vec![
-            ply_core::Value::str("orders_placed"),
-            ply_core::Value::Int(3),
-            no_fields(),
-        ],
-    );
-    f.perform(
-        Op::Gauge,
-        "orders",
-        vec![
-            ply_core::Value::str("shelf"),
-            ply_core::Value::Decimal("41.75".parse().expect("a decimal")),
-            no_fields(),
-        ],
-    );
-    f.perform(
-        Op::Time,
-        "orders",
-        vec![
-            ply_core::Value::str("place_order"),
-            ply_core::Value::Int(8213),
-            no_fields(),
-        ],
-    );
+    let owner = f.owner(None);
+    let gauge: ply_core::Decimal = "41.75".parse().expect("a decimal");
+    let metric = |kind, name, amount, value| {
+        f.trace
+            .record(owner, kind, Level::Info, "orders", name, amount, value, &[])
+    };
+    metric(RecordKind::Count, "orders_placed", Some(3), None);
+    metric(RecordKind::Gauge, "shelf", None, Some(gauge));
+    metric(RecordKind::Time, "place_order", Some(8213), None);
 
     let records = f.records();
     assert_eq!(
         f.kinds(),
         [RecordKind::Count, RecordKind::Gauge, RecordKind::Time]
     );
+    assert!(records.iter().all(|r| r.channel == "orders"));
     assert_eq!(records[0].amount, Some(3));
     assert_eq!(
         records[1].value,
-        Some("41.75".parse().expect("a decimal")),
+        Some(gauge),
         "a gauge is a `Decimal`, so a test can assert on it"
     );
     assert_eq!(records[2].amount, Some(8213));
-    assert!(
-        records.iter().all(|r| r.level == Level::Info),
-        "a metric is the shape of a thing that happened"
-    );
 }
 
 #[test]
 fn a_discarded_record_reads_no_clock_and_writes_nothing() {
     let (trace, clock) = discarding();
-    let machine = MachineId::next();
-    let span = perform_on(
-        &trace,
-        machine,
-        None,
-        Op::Enter,
-        "orders",
-        vec![ply_core::Value::str("place_order"), no_fields()],
-    )
-    .expect("a span opens whatever the sink does");
-
+    let owner = (MachineId::next(), None);
+    let id = trace.enter(owner, "orders", "place_order", &[]);
     for _ in 0..64 {
-        perform_on(
-            &trace,
-            machine,
-            None,
-            Op::Event,
+        trace.record(
+            owner,
+            RecordKind::Event,
+            Level::Error,
             "orders",
-            vec![
-                ctor("Error", Vec::new()),
-                ply_core::Value::str("placed"),
-                field("sku", ctor("FText", vec![ply_core::Value::str("BOLT-1")])),
-            ],
-        )
-        .expect("an event is discarded, not refused");
+            "placed",
+            None,
+            None,
+            &field("sku", Field::Text("BOLT-1".to_string())),
+        );
     }
-    perform_on(
-        &trace,
-        machine,
-        None,
-        Op::Exit,
-        "orders",
-        vec![span, ctor("Ok", Vec::new())],
-    )
-    .expect("the span closes");
+    trace
+        .exit(owner, "orders", id, Outcome::Ok)
+        .expect("the span closes");
 
     assert_eq!(
         clock.reads(),
@@ -638,6 +476,10 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
         "a discarding sink never stamps, so a disabled span pays no clock read"
     );
     assert_eq!(trace.counts().events, 0);
+    assert!(
+        !trace.wants(Level::Error),
+        "the handler need not write a field"
+    );
 }
 
 /// `E0445` is about the program, so a verdict that moved with `--trace off` would be undebuggable.
@@ -645,27 +487,13 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
 fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     let (trace, _) = discarding();
     let machine = MachineId::next();
-    let span = perform_on(
-        &trace,
-        machine,
-        Some(TaskId(1)),
-        Op::Enter,
-        "http",
-        vec![ply_core::Value::str("request"), no_fields()],
-    )
-    .expect("a span opens");
+    let id = trace.enter((machine, Some(TaskId(1))), "http", "request", &[]);
     assert_eq!(trace.open_spans(), 1);
 
-    let refused = perform_on(
-        &trace,
-        machine,
-        Some(TaskId(2)),
-        Op::Exit,
-        "http",
-        vec![span.clone(), ctor("Ok", Vec::new())],
-    )
-    .expect_err("the other task still may not close it");
-    assert_eq!(refused.code, codes::SPAN_UNBALANCED);
+    let why = trace
+        .exit((machine, Some(TaskId(2))), "http", id, Outcome::Ok)
+        .expect_err("the other task still may not close it");
+    assert!(matches!(why, Unbalanced::OtherOwner(_)), "{why:?}");
 
     let warning = trace
         .end_entry_point(machine)
@@ -678,16 +506,17 @@ fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     );
 }
 
-/// The perform and the call site's map are paid before the sink is asked; only the record is saved.
+/// Only the record is saved: the sink is asked before anything is stamped.
 #[test]
 fn a_level_filter_drops_the_record_and_reads_no_clock() {
     let f = fixture_at(Level::Warn);
-    event(&f, "orders", "Debug", "chatty");
-    event(&f, "orders", "Info", "ordinary");
+    assert!(!f.trace.wants(Level::Info));
+    event(&f, "orders", Level::Debug, "chatty");
+    event(&f, "orders", Level::Info, "ordinary");
     assert_eq!(f.clock.reads(), 0);
     assert!(f.records().is_empty());
 
-    event(&f, "orders", "Warn", "slow");
+    event(&f, "orders", Level::Warn, "slow");
     assert_eq!(f.clock.reads(), 1);
     assert_eq!(f.kinds(), [RecordKind::Event]);
 
@@ -708,7 +537,7 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
 fn a_closing_span_carries_the_duration_the_sink_measured() {
     let f = fixture();
     let span = enter(&f, "http", "request");
-    event(&f, "http", "Info", "midway");
+    event(&f, "http", Level::Info, "midway");
     exit(&f, "http", span);
     let records = f.records();
     assert_eq!(records[0].ts, 1);
@@ -723,26 +552,14 @@ fn a_closing_span_carries_the_duration_the_sink_measured() {
 #[test]
 fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
     let f = fixture();
-    f.perform(
-        Op::Event,
+    f.event_with(
         "orders",
-        vec![
-            ctor("Info", Vec::new()),
-            ply_core::Value::str("placed"),
-            ply_core::Value::map([
-                (
-                    ply_core::Value::str("level"),
-                    ctor("FText", vec![ply_core::Value::str("error")]),
-                ),
-                (
-                    ply_core::Value::str("span"),
-                    ctor("FInt", vec![ply_core::Value::Int(9999)]),
-                ),
-                (
-                    ply_core::Value::str("ts"),
-                    ctor("FInt", vec![ply_core::Value::Int(0)]),
-                ),
-            ]),
+        Level::Info,
+        "placed",
+        &[
+            ("level".to_string(), Field::Text("error".to_string())),
+            ("span".to_string(), Field::Int(9999)),
+            ("ts".to_string(), Field::Int(0)),
         ],
     );
     let line = f.sink.lines().pop().expect("one line");
@@ -755,65 +572,37 @@ fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
 #[test]
 fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
     let f = fixture();
-    let render = |value: ply_core::Value| -> String {
-        f.perform(
-            Op::Event,
-            "orders",
-            vec![
-                ctor("Info", Vec::new()),
-                ply_core::Value::str("x"),
-                field("f", value),
-            ],
-        );
+    let render = |value: Field| -> String {
+        f.event_with("orders", Level::Info, "x", &field("f", value));
         let line = f.sink.lines().pop().expect("a line");
         let at = line.find("\"fields\"").expect("the fields object");
         line[at..].to_string()
     };
+    assert_eq!(render(Field::Int(-3)), r#""fields":{"f":-3}}"#);
+    assert_eq!(render(Field::Bool(true)), r#""fields":{"f":true}}"#);
     assert_eq!(
-        render(ctor("FInt", vec![ply_core::Value::Int(-3)])),
-        r#""fields":{"f":-3}}"#
-    );
-    assert_eq!(
-        render(ctor("FBool", vec![ply_core::Value::Bool(true)])),
-        r#""fields":{"f":true}}"#
-    );
-    assert_eq!(
-        render(ctor("FText", vec![ply_core::Value::str("a\"b\nc")])),
+        render(Field::Text("a\"b\nc".to_string())),
         r#""fields":{"f":"a\"b\nc"}}"#
     );
     // A `Decimal` is a string: a JSON number consumer would round its scale away.
     assert_eq!(
-        render(ctor(
-            "FDecimal",
-            vec![ply_core::Value::Decimal(
-                "41.750".parse().expect("a decimal")
-            )]
-        )),
+        render(Field::Decimal("41.750".parse().expect("a decimal"))),
         r#""fields":{"f":"41.750"}}"#
     );
     assert_eq!(
-        render(ctor("FBytes", vec![ply_core::Value::bytes([0u8, 255, 16])])),
+        render(Field::Bytes(vec![0, 255, 16])),
         r#""fields":{"f":"00ff10"}}"#
     );
     // JSON has no NaN, so a writer that emitted one would produce a document no parser accepts.
+    assert_eq!(render(Field::Float(f64::NAN)), r#""fields":{"f":"NaN"}}"#);
+    assert_eq!(render(Field::Float(1.5)), r#""fields":{"f":1.5}}"#);
+    // JSON arrives as the text `std.json` wrote, and is written as it is.
     assert_eq!(
-        render(ctor("FFloat", vec![ply_core::Value::Float(f64::NAN)])),
-        r#""fields":{"f":"NaN"}}"#
-    );
-    assert_eq!(
-        render(ctor("FFloat", vec![ply_core::Value::Float(1.5)])),
-        r#""fields":{"f":1.5}}"#
+        render(Field::Json(r#"{"n":2,"sku":"BOLT-1"}"#.to_string())),
+        r#""fields":{"f":{"n":2,"sku":"BOLT-1"}}}"#
     );
 
-    f.perform(
-        Op::Event,
-        "orders",
-        vec![
-            ctor("Info", Vec::new()),
-            ply_core::Value::str("x"),
-            no_fields(),
-        ],
-    );
+    event(&f, "orders", Level::Info, "x");
     assert!(
         f.sink
             .lines()
@@ -825,57 +614,11 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
 }
 
 #[test]
-fn a_json_field_is_serialized_by_the_one_writer_this_crate_has() {
-    let f = fixture();
-    let json = |name: &str, args: Vec<ply_core::Value>| {
-        ply_core::Value::ctor(format!("std.json.{name}"), args)
-    };
-    f.perform(
-        Op::Event,
-        "orders",
-        vec![
-            ctor("Info", Vec::new()),
-            ply_core::Value::str("x"),
-            field(
-                "body",
-                ctor(
-                    "FJson",
-                    vec![json(
-                        "Object",
-                        vec![ply_core::Value::map([
-                            (
-                                ply_core::Value::str("sku"),
-                                json("Str", vec![ply_core::Value::str("BOLT-1")]),
-                            ),
-                            (
-                                ply_core::Value::str("n"),
-                                json(
-                                    "Number",
-                                    vec![ply_core::Value::Decimal("2".parse().expect("a decimal"))],
-                                ),
-                            ),
-                        ])],
-                    )],
-                ),
-            ),
-        ],
-    );
-    let line = f.sink.lines().pop().expect("a line");
-    assert!(
-        line.ends_with(r#""fields":{"body":{"n":2,"sku":"BOLT-1"}}}"#),
-        "{line}"
-    );
-}
-
-#[test]
 fn an_exit_carries_its_outcome_and_a_failure_carries_its_reason() {
     let f = fixture();
     let span = enter(&f, "orders", "place_order");
-    f.perform(
-        Op::Exit,
-        "orders",
-        vec![span, ctor("Failed", vec![ply_core::Value::str("23514")])],
-    );
+    f.exit_as(None, "orders", span, Outcome::Failed("23514".to_string()))
+        .expect("the span is open");
     let line = f.sink.lines().pop().expect("a line");
     assert!(
         line.contains(r#""outcome":"failed","reason":"23514""#),
@@ -886,57 +629,53 @@ fn an_exit_carries_its_outcome_and_a_failure_carries_its_reason() {
 }
 
 #[test]
-fn two_field_sets_built_in_different_orders_render_identically() {
-    let render = |entries: [(&str, i64); 3]| {
-        let f = fixture();
-        f.perform(
-            Op::Event,
-            "orders",
-            vec![
-                ctor("Info", Vec::new()),
-                ply_core::Value::str("x"),
-                ply_core::Value::map(entries.map(|(k, v)| {
-                    (
-                        ply_core::Value::str(k),
-                        ctor("FInt", vec![ply_core::Value::Int(v)]),
-                    )
-                })),
-            ],
-        );
-        f.sink.lines().pop().expect("a line")
+fn fields_read_each_kind_as_the_real_handler_writes_it() {
+    let written = parts(&[
+        b"n",
+        &[&[0u8][..], &int(-3)].concat(),
+        b"on",
+        &[1, 1],
+        b"sku",
+        b"\x02BOLT-1",
+        b"x",
+        &[&[3u8][..], &int(ply_core::float::bits(1.5) as i64)].concat(),
+        b"shelf",
+        b"\x0441.750",
+        b"raw",
+        &[5, 0, 255],
+        b"body",
+        b"\x06{\"n\":2}",
+    ]);
+    let read = fields_read(&written).expect("every field reads");
+    let named = |name: &str| {
+        read.iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, field)| field.clone())
+            .expect("the field is there")
     };
+    assert_eq!(read.len(), 7);
+    assert_eq!(named("n"), Field::Int(-3));
+    assert_eq!(named("on"), Field::Bool(true));
+    assert_eq!(named("sku"), Field::Text("BOLT-1".to_string()));
+    assert_eq!(named("x"), Field::Float(1.5));
     assert_eq!(
-        render([("a", 1), ("b", 2), ("c", 3)]),
-        render([("c", 3), ("a", 1), ("b", 2)])
+        named("shelf"),
+        Field::Decimal("41.750".parse().expect("a decimal"))
     );
+    assert_eq!(named("raw"), Field::Bytes(vec![0, 255]));
+    assert_eq!(named("body"), Field::Json("{\"n\":2}".to_string()));
+    assert_eq!(fields_read(&[]), Some(Vec::new()));
 }
 
 #[test]
-fn a_perform_the_front_end_could_not_have_produced_is_plys_fault() {
-    let f = fixture();
-    let wrong_arity = perform_on(
-        &f.trace,
-        f.machine,
-        None,
-        Op::Event,
-        "orders",
-        vec![ctor("Info", Vec::new())],
-    )
-    .expect_err("an event takes three arguments");
-    assert_eq!(wrong_arity.code, codes::INTERNAL_ERROR);
-
-    let wrong_level = perform_on(
-        &f.trace,
-        f.machine,
-        None,
-        Op::Event,
-        "orders",
-        vec![
-            ply_core::Value::Int(3),
-            ply_core::Value::str("x"),
-            no_fields(),
-        ],
-    )
-    .expect_err("a level is a constructor");
-    assert_eq!(wrong_level.code, codes::INTERNAL_ERROR);
+fn fields_read_refuses_bytes_the_real_handler_never_writes() {
+    let unpaired = parts(&[b"n"]);
+    assert_eq!(fields_read(&unpaired), None, "a name with no field");
+    let unknown = parts(&[b"n", b"\x09"]);
+    assert_eq!(fields_read(&unknown), None, "a kind no field has");
+    let flag = parts(&[b"on", &[1, 2]]);
+    assert_eq!(fields_read(&flag), None, "a flag is 0 or 1");
+    let decimal = parts(&[b"shelf", b"\x04forty"]);
+    assert_eq!(fields_read(&decimal), None, "a decimal's text is a decimal");
+    assert_eq!(fields_read(&[0, 0, 0, 9, 1]), None, "a part cut short");
 }

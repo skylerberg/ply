@@ -3,23 +3,16 @@
 
 mod argv;
 mod builtins;
-mod carry;
 mod codec;
-mod compiled;
 mod crypto;
-mod decode;
 mod escape;
-mod evaluator;
 mod float;
 mod footprint;
-mod hash;
 mod host;
 mod list;
 mod memo;
 mod numerics;
 mod rc;
-mod region;
-mod sched;
 mod sim;
 mod span;
 mod sqlite;

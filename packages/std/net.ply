@@ -18,7 +18,7 @@
 //! `dns.lookup`, orders the addresses with `dns::interleave`, and connects with `connect_to`, so a
 //! test's table decides where a name connects and a caller that validated an address connects to
 //! that address. Its `timeout_ms` is one deadline on the clock for the lookup and every attempt,
-//! and it is held to a `std.task` deadline around it, so it runs under `simulate` or `--host` with
+//! and it is held to a `std.task` deadline around it, so it runs under `simulate` or a run with
 //! `task::unbounded` or a deadline above it. It tries one address at a time and races none.
 //! Every connection has `NoDelay` on; a `SocketOption` is set as a connection or a
 //! listener opens, or later with `set_option`, and `options` reads each back.
@@ -44,15 +44,19 @@
 //! own listener, in which case the two ends are joined. It refuses what the host refuses, in the
 //! host's words. Nothing waits in it: a read with nothing to answer is a deadline.
 
+import std.bytes
+import std.bytes (i64_be, u16_be)
 import std.dns
 import std.dns (dns)
+import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
 import std.io
 import std.io (Sink, Source)
 import std.ip
 import std.ip (Ip, SocketAddress, ip)
 import std.list
+import std.option
 import std.task
-import std.time (after, as_millis, between, millis)
+import std.time (after, as_millis, as_nanos, between, millis, nanos, seconds)
 
 /// Why a socket operation did not do what it was asked.
 pub type Refusal =
@@ -675,6 +679,47 @@ fn deadline(operation: String, timeout_ms: Int) -> Unit / {abort.raise} =
     )
   } else { () }
 
+/// `max`, refused where a read asks for no bytes: an empty answer is the peer done sending, so a
+/// read of none would answer as the end of the stream does.
+fn asked_for(max: Int) -> Int / {abort.raise} =
+  if max <= 0 { panic("`net.recv` was asked for " ++ max.to_string() ++ " bytes") } else { max }
+
+/// Refuses a write of nothing, which would answer as a peer gone does.
+fn something_to(operation: String, empty: Bool) -> Unit / {abort.raise} =
+  if empty { panic("`net." ++ operation ++ "` was given an empty payload") } else { () }
+
+/// Whether a run may listen at `at`: a listener the rest of a network can reach is not a run's to
+/// open.
+fn listenable(at: SocketAddress) -> Bool = ip::is_loopback(ip::socket_ip(at))
+
+/// `option`, refused where it sets a size or a wait below zero.
+fn option_checked(option: SocketOption) -> SocketOption / {abort.raise} = {
+  let sized = |bytes: Int|
+    if bytes < 0 { panic("a socket buffer was sized at " ++ bytes.to_string() ++ " bytes") }
+    else { () };
+  let waited = |d: Duration|
+    if as_nanos(d) < 0 {
+      panic("a socket was given a duration of " ++ as_nanos(d).to_string() ++ " nanoseconds")
+    } else { () };
+  match option {
+    SendBuffer(bytes) -> sized(bytes),
+    ReceiveBuffer(bytes) -> sized(bytes),
+    Linger(Some(d)) -> waited(d),
+    KeepAlive(Some(p)) -> {
+      waited(p.idle);
+      match p.interval { Some(d) -> waited(d), None -> () };
+      match p.count {
+        Some(n) -> if n < 0 || n > 4294967295 {
+          panic("a socket was given a probe count of " ++ n.to_string())
+        } else { () },
+        None -> (),
+      }
+    },
+    _ -> (),
+  };
+  option
+}
+
 fn no_socket<a>(id: Int) -> a / {abort.raise} =
   panic("there is no open socket with handle " ++ id.to_string())
 
@@ -857,8 +902,8 @@ pub fn mem_listen_on(
   at: SocketAddress,
   options: List<SocketOption>,
 ) -> Stepped<Result<Int, Refusal>> / {abort.raise} =
-  if !ip::is_loopback(ip::socket_ip(at)) { { net: n, answer: Err(PermissionDenied) } }
-  else { bind(n, label, ip::socket_ip(at), ip::socket_port(at), None, options) }
+  if !listenable(at) { { net: n, answer: Err(PermissionDenied) } }
+  else { bind(n, label, ip::socket_ip(at), ip::socket_port(at), None, options.map(option_checked)) }
 
 /// What `net.listen_unix` answers over the network, which keeps the path bound until the
 /// listener closes.
@@ -948,7 +993,7 @@ pub fn mem_connect_to(
   timeout_ms: Int,
 ) -> Stepped<Result<Int, Refusal>> / {abort.raise} = {
   deadline("connect_to", timeout_ms);
-  opened(n, label, Some(to), ip::render_socket(to), options)
+  opened(n, label, Some(to), ip::render_socket(to), options.map(option_checked))
 }
 
 /// What `net.connect_unix` answers over the network.
@@ -1059,24 +1104,23 @@ pub fn mem_recv(
   timeout_ms: Int,
 ) -> Stepped<Option<Bytes>> / {abort.raise} = {
   deadline("recv", timeout_ms);
-  if max <= 0 { panic("`net.recv` was asked for " ++ max.to_string() ++ " bytes") } else {
-    let asked = listened(conn_of(n, label, conn));
-    let c = { ..asked, deadlines: asked.deadlines.push(timeout_ms) };
-    let most = if n.short > 0 { min(max, n.short) } else { max };
-    match c.script {
-      [] -> { net: with_conn(n, conn, c), answer: if c.fed { None } else { Some(b"") } },
-      [Says(bytes), ..rest] -> if bytes.len() > most {
-        let left = bytes.slice(most, bytes.len());
-        {
-          net: with_conn(n, conn, { ..c, script: [Says(left)].concat(rest) }),
-          answer: Some(bytes.slice(0, most)),
-        }
-      } else { { net: with_conn(n, conn, { ..c, script: rest }), answer: Some(bytes) } },
-      [Repeats(bytes), ..] ->
-        { net: with_conn(n, conn, c), answer: Some(bytes.slice(0, min(most, bytes.len()))) },
-      [Stalls, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
-      _ -> { net: with_conn(n, conn, c), answer: None },
-    }
+  let wanted = asked_for(max);
+  let asked = listened(conn_of(n, label, conn));
+  let c = { ..asked, deadlines: asked.deadlines.push(timeout_ms) };
+  let most = if n.short > 0 { min(wanted, n.short) } else { wanted };
+  match c.script {
+    [] -> { net: with_conn(n, conn, c), answer: if c.fed { None } else { Some(b"") } },
+    [Says(bytes), ..rest] -> if bytes.len() > most {
+      let left = bytes.slice(most, bytes.len());
+      {
+        net: with_conn(n, conn, { ..c, script: [Says(left)].concat(rest) }),
+        answer: Some(bytes.slice(0, most)),
+      }
+    } else { { net: with_conn(n, conn, { ..c, script: rest }), answer: Some(bytes) } },
+    [Repeats(bytes), ..] ->
+      { net: with_conn(n, conn, c), answer: Some(bytes.slice(0, min(most, bytes.len()))) },
+    [Stalls, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
+    _ -> { net: with_conn(n, conn, c), answer: None },
   }
 }
 
@@ -1090,18 +1134,17 @@ pub fn mem_send(
   timeout_ms: Int,
 ) -> Stepped<Option<Int>> / {abort.raise} = {
   deadline("send", timeout_ms);
-  if payload.len() == 0 { panic("`net.send` was given an empty payload") } else {
-    let c = listened(conn_of(n, label, conn));
-    if c.ended || c.gone { { net: with_conn(n, conn, c), answer: Some(0) } } else {
-      match c.script {
-        [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
-        _ -> {
-          let size = if n.short > 0 { min(payload.len(), n.short) } else { payload.len() };
-          let part = payload.slice(0, size);
-          let mine = listened({ ..c, sent: c.sent.concat(part), unheard: c.unheard.concat(part) });
-          { net: passed_on(with_conn(n, conn, mine), c.joined, part), answer: Some(size) }
-        },
-      }
+  something_to("send", payload.len() == 0);
+  let c = listened(conn_of(n, label, conn));
+  if c.ended || c.gone { { net: with_conn(n, conn, c), answer: Some(0) } } else {
+    match c.script {
+      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: None },
+      _ -> {
+        let size = if n.short > 0 { min(payload.len(), n.short) } else { payload.len() };
+        let part = payload.slice(0, size);
+        let mine = listened({ ..c, sent: c.sent.concat(part), unheard: c.unheard.concat(part) });
+        { net: passed_on(with_conn(n, conn, mine), c.joined, part), answer: Some(size) }
+      },
     }
   }
 }
@@ -1141,28 +1184,26 @@ pub fn mem_send_secret(
 ) -> Stepped<Bool> / {abort.raise} = {
   deadline("send_secret", timeout_ms);
   let framed = sent_secret(before, secret, encoding, after);
-  if framed.is_empty() { panic("`net.send_secret` was given an empty payload") } else {
-    let c = listened(conn_of(n, label, conn));
-    if c.ended || c.gone { { net: with_conn(n, conn, c), answer: false } }
-    else if c.joined != None {
-      panic(
-        "the twin cannot hand a credential to the program's own end of socket " ++ conn.to_string()
-          ++ ": nothing in Ply opens it",
-      )
-    } else {
-      let kept = { ..c, sealed: c.sealed.push(framed) };
-      match c.script {
-        [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: false },
-        [Hears(expected), ..] ->
-          panic(
-            "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
-              ++ "\" and the program sent a credential",
-          ),
-        [HearsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
-          { net: with_conn(n, conn, listened({ ..kept, script: rest })), answer: true }
-        } else { panic("the peer was to hear one credential and the program sent another") },
-        _ -> { net: with_conn(n, conn, kept), answer: true },
-      }
+  something_to("send_secret", framed.is_empty());
+  let c = listened(conn_of(n, label, conn));
+  if c.ended || c.gone { { net: with_conn(n, conn, c), answer: false } } else if c.joined != None {
+    panic(
+      "the twin cannot hand a credential to the program's own end of socket " ++ conn.to_string()
+        ++ ": nothing in Ply opens it",
+    )
+  } else {
+    let kept = { ..c, sealed: c.sealed.push(framed) };
+    match c.script {
+      [Blocks, ..rest] -> { net: with_conn(n, conn, { ..c, script: rest }), answer: false },
+      [Hears(expected), ..] ->
+        panic(
+          "the peer was to hear \"" ++ String::of_bytes_lossy(expected)
+            ++ "\" and the program sent a credential",
+        ),
+      [HearsSecret(expected), ..rest] -> if Secret::of_bytes(expected) == framed {
+        { net: with_conn(n, conn, listened({ ..kept, script: rest })), answer: true }
+      } else { panic("the peer was to hear one credential and the program sent another") },
+      _ -> { net: with_conn(n, conn, kept), answer: true },
     }
   }
 }
@@ -1333,8 +1374,9 @@ pub fn mem_set_option(
   n: MemNet,
   label: String,
   socket: Int,
-  option: SocketOption,
-) -> Stepped<Result<Unit, Refusal>> / {abort.raise} =
+  asked: SocketOption,
+) -> Stepped<Result<Unit, Refusal>> / {abort.raise} = {
+  let option = option_checked(asked);
   match n.conns.get(socket) {
     Some(_) -> {
       let c = conn_of(n, label, socket);
@@ -1359,6 +1401,7 @@ pub fn mem_set_option(
       }
     },
   }
+}
 
 /// What `net.options` answers over the network: each option set, as it was last set.
 pub fn mem_options(n: MemNet, label: String, socket: Int) -> List<SocketOption> / {abort.raise} =
@@ -1554,7 +1597,424 @@ pub fn on_mem<a | e>(
     return value -> { value: value, net: t },
   }
 
+// --- The real handler -------------------------------------------------------
+
+host for net by served
+
+/// `go` with every socket operation done on the machine, each socket under the label its clause
+/// binds, and every operation that waits waiting in the asking task. Each clause answers with its
+/// value and the handler holds nothing, so a `parallel` branch is answered on its own thread.
+fn served<a | e>(
+  go: () -> a / {net.read[*], net.write[*] | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    net.listen[*label](port) -> net_listen(label, port_checked("listen", port)),
+    net.listen_tls[*label](port, credential) ->
+      net_listen_tls(label, port_checked("listen_tls", port), credential),
+    net.listen_on[*label](at, options) -> if !listenable(at) { Err(PermissionDenied) } else {
+      refused_or(net_listen_on(label, address_written(at), options_written(options)), int_of)
+    },
+    net.listen_unix[*label](root, path) -> refused_or(net_listen_unix(label, root, path), int_of),
+    net.connect[*label](host, port, timeout_ms) -> {
+      deadline("connect", timeout_ms);
+      int_found(job_wait(net_connect(label, host, port_checked("connect", port), timeout_ms)))
+    },
+    net.connect_tls[*label](host, port, timeout_ms) -> {
+      deadline("connect_tls", timeout_ms);
+      int_found(
+        job_wait(net_connect_tls(label, host, port_checked("connect_tls", port), timeout_ms)),
+      )
+    },
+    net.connect_to[*label](to, options, timeout_ms) -> {
+      deadline("connect_to", timeout_ms);
+      let asked = net_connect_to(label, address_written(to), options_written(options), timeout_ms);
+      refused_or(job_wait(asked), int_of)
+    },
+    net.connect_unix[*label](root, path, timeout_ms) -> {
+      deadline("connect_unix", timeout_ms);
+      refused_or(job_wait(net_connect_unix(label, root, path, timeout_ms)), int_of)
+    },
+    net.handshake[*label](conn) -> int_found(job_wait(net_handshake(label, conn))),
+    net.start_tls[*label](conn, name, alpn, unread, timeout_ms) -> {
+      deadline("start_tls", timeout_ms);
+      let asked = net_start_tls(label, conn, name, texts_written(alpn), unread.len(), timeout_ms);
+      refused_or(job_wait(asked), secured_read)
+    },
+    net.serve_tls[*label](conn, credential, alpn, unread, timeout_ms) -> {
+      deadline("serve_tls", timeout_ms);
+      let asked = net_serve_tls(
+        label,
+        conn,
+        credential,
+        texts_written(alpn),
+        unread.len(),
+        timeout_ms,
+      );
+      refused_or(job_wait(asked), secured_read)
+    },
+    net.accept[*label](listener) -> int_of(job_wait(net_accept(label, listener))),
+    net.recv[*label](conn, max, timeout_ms) -> {
+      deadline("recv", timeout_ms);
+      found(job_wait(net_recv(label, conn, asked_for(max), timeout_ms)))
+    },
+    net.send[*label](conn, payload, timeout_ms) -> {
+      deadline("send", timeout_ms);
+      something_to("send", payload.len() == 0);
+      int_found(job_wait(net_send(label, conn, payload, timeout_ms)))
+    },
+    net.send_secret[*label](conn, before, secret, encoding, after, timeout_ms) -> {
+      deadline("send_secret", timeout_ms);
+      let framed = sent_secret(before, secret, encoding, after);
+      something_to("send_secret", framed.is_empty());
+      job_wait(net_send_secret(label, conn, framed, timeout_ms)) == b"\x01"
+    },
+    net.close_write[*label](conn) -> net_close_write(label, conn),
+    net.close[*label](socket) -> net_close(label, socket),
+    net.set_option[*label](socket, option) ->
+      refused_or(net_set_option(label, socket, option_written(option)), |_: Bytes| ()),
+    net.local_port[*label](socket) -> {
+      let at = net_local_port(label, socket);
+      if at < 0 { None } else { Some(at) }
+    },
+    net.local_address[*label](socket) -> address_found(net_local_address(label, socket)),
+    net.peer_address[*label](conn) -> address_found(net_peer_address(label, conn)),
+    net.peer_credentials[*label](conn) -> match found(net_peer_credentials(label, conn)) {
+      Some(flat) -> Some(credentials_read(flat)),
+      None -> None,
+    },
+    net.peer_certificate[*label](conn) -> found(net_peer_certificate(label, conn)),
+    net.protocol[*label](conn) -> text_found(net_protocol(label, conn)),
+    net.options[*label](socket) -> options_read(net_options(label, socket)),
+  }
+
+/// A listener on `port` of the loopback address, as its handle.
+extern fn net_listen(label: String, port: Int) -> Int / {native.read}
+
+/// A listener on `port` of the loopback address serving TLS with `credential`, as its handle.
+extern fn net_listen_tls(label: String, port: Int, credential: String) -> Int / {native.read}
+
+/// A listener at exactly the address written, with the options written set before it binds.
+extern fn net_listen_on(label: String, at: Bytes, options: Bytes) -> Bytes / {native.read}
+
+/// A listener on the Unix socket at `path` under `root`.
+extern fn net_listen_unix(label: String, root: String, path: String) -> Bytes / {native.read}
+
+/// The ticket of a connection to `host`, its handle found.
+extern fn net_connect(
+  label: String,
+  host: String,
+  port: Int,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of a TLS connection to `host`, verified as it, its handle found.
+extern fn net_connect_tls(
+  label: String,
+  host: String,
+  port: Int,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of a connection to exactly the address written.
+extern fn net_connect_to(
+  label: String,
+  to: Bytes,
+  options: Bytes,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of a connection to the Unix socket at `path` under `root`.
+extern fn net_connect_unix(
+  label: String,
+  root: String,
+  path: String,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of a connection's TLS handshake, the microseconds it took found.
+extern fn net_handshake(label: String, conn: Int) -> Int / {native.read}
+
+/// The ticket of a plaintext connection secured as its client.
+extern fn net_start_tls(
+  label: String,
+  conn: Int,
+  name: String,
+  alpn: Bytes,
+  unread: Int,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of a plaintext connection secured as its server.
+extern fn net_serve_tls(
+  label: String,
+  conn: Int,
+  credential: String,
+  alpn: Bytes,
+  unread: Int,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// The ticket of the next connection a listener takes.
+extern fn net_accept(label: String, listener: Int) -> Int / {native.read}
+
+/// The ticket of at most `max` bytes of a connection, found.
+extern fn net_recv(label: String, conn: Int, max: Int, timeout_ms: Int) -> Int / {native.read}
+
+/// The ticket of a write of some prefix of `payload`, how many bytes it took found.
+extern fn net_send(label: String, conn: Int, payload: Bytes, timeout_ms: Int) -> Int / {native.read}
+
+/// The ticket of a write of every byte of `framed`.
+extern fn net_send_secret(
+  label: String,
+  conn: Int,
+  framed: Secret<Bytes>,
+  timeout_ms: Int,
+) -> Int / {native.read}
+
+/// Ends a connection's sending.
+extern fn net_close_write(label: String, conn: Int) -> Unit / {native.read}
+
+/// Closes a socket.
+extern fn net_close(label: String, socket: Int) -> Unit / {native.read}
+
+/// Sets the option written on a socket.
+extern fn net_set_option(label: String, socket: Int, option: Bytes) -> Bytes / {native.read}
+
+/// The port this end of a socket is bound to, or -1 for none.
+extern fn net_local_port(label: String, socket: Int) -> Int / {native.read}
+
+/// The address this end of a socket is bound to, found.
+extern fn net_local_address(label: String, socket: Int) -> Bytes / {native.read}
+
+/// The address of a connection's far end, found.
+extern fn net_peer_address(label: String, conn: Int) -> Bytes / {native.read}
+
+/// Who holds the far end of a Unix socket, found.
+extern fn net_peer_credentials(label: String, conn: Int) -> Bytes / {native.read}
+
+/// The far end's certificate on a secured connection, found.
+extern fn net_peer_certificate(label: String, conn: Int) -> Bytes / {native.read}
+
+/// The application protocol a secured connection's handshake agreed, found.
+extern fn net_protocol(label: String, conn: Int) -> Bytes / {native.read}
+
+/// Each option a socket has, as parts.
+extern fn net_options(label: String, socket: Int) -> Bytes / {native.read}
+
+// --- What the host's socket natives read and write ----------------------------
+
+/// The integer a native found.
+fn int_found(said: Bytes) -> Option<Int> / {abort.raise} =
+  match found(said) { Some(flat) -> Some(int_of(flat)), None -> None }
+
+/// The text a native found.
+fn text_found(said: Bytes) -> Option<String> =
+  match found(said) { Some(flat) -> Some(String::of_bytes_lossy(flat)), None -> None }
+
+/// The socket address a native found.
+fn address_found(said: Bytes) -> Option<SocketAddress> / {abort.raise} =
+  match found(said) { Some(flat) -> Some(address_read(flat)), None -> None }
+
+fn texts_written(texts: List<String>) -> Bytes =
+  in_parts(texts.map(|t: String| Bytes::of_string(t)))
+
+/// What an upgrade settled: the protocol the two ends agreed, found.
+fn secured_read(said: Bytes) -> Secured = { protocol: text_found(said) }
+
+/// Parts: the user, the group, and the process, empty where the platform does not say.
+fn credentials_read(flat: Bytes) -> PeerCredentials / {abort.raise} =
+  match parts(flat) {
+    [user, group, process] ->
+      { user: int_of(user), group: int_of(group), process: process.i64_be_at(0) },
+    _ -> panic("a socket native wrote no credentials"),
+  }
+
+/// A socket address as the host's socket natives read and write one: parts of its address's bytes,
+/// its port in two bytes, and its zone, empty for none.
+pub fn address_written(at: SocketAddress) -> Bytes =
+  in_parts([
+    ip::to_bytes(ip::socket_ip(at)),
+    u16_be(ip::socket_port(at)),
+    match ip::socket_zone(at) { Some(zone) -> Bytes::of_string(zone), None -> b"" },
+  ])
+
+/// The socket address `address_written` writes.
+pub fn address_read(flat: Bytes) -> SocketAddress / {abort.raise} =
+  match parts(flat) {
+    [address, port, zone] -> match ip::of_bytes(address) {
+      Some(a) -> {
+        let at = ip::socket_at(a, port.u16_be_at(0).unwrap_or(0));
+        if zone.len() == 0 { at } else {
+          match ip::in_zone(at, String::of_bytes_lossy(zone)) { Some(zoned) -> zoned, None -> at }
+        }
+      },
+      None -> panic("a socket native wrote no address"),
+    },
+    _ -> panic("a socket native wrote no address"),
+  }
+
+/// A socket option as the host's socket natives read and write one: its setting's byte, as
+/// `with_option` numbers settings, and then what it sets: a flag's byte, a size's eight bytes, or
+/// for an option that may set nothing, byte 0, or byte 1 and what it sets.
+pub fn option_written(asked: SocketOption) -> Bytes / {abort.raise} = {
+  let option = option_checked(asked);
+  byte_of_int(setting(option)).concat(match option {
+    NoDelay(on) -> flag_written(on),
+    KeepAlive(None) -> b"\x00",
+    KeepAlive(Some(p)) ->
+      b"\x01".concat(
+        in_parts([
+          i64_be(as_nanos(p.idle)),
+          match p.interval { Some(d) -> i64_be(as_nanos(d)), None -> b"" },
+          match p.count { Some(n) -> i64_be(n), None -> b"" },
+        ]),
+      ),
+    ReuseAddress(on) -> flag_written(on),
+    ReusePort(on) -> flag_written(on),
+    SendBuffer(bytes) -> i64_be(bytes),
+    ReceiveBuffer(bytes) -> i64_be(bytes),
+    Linger(None) -> b"\x00",
+    Linger(Some(d)) -> b"\x01".concat(i64_be(as_nanos(d))),
+    Broadcast(on) -> flag_written(on),
+    MulticastLoop(on) -> flag_written(on),
+    JoinGroup(group, interface) -> group_written(group, interface),
+    LeaveGroup(group, interface) -> group_written(group, interface),
+    Presenting(name) -> Bytes::of_string(name),
+  })
+}
+
+fn flag_written(on: Bool) -> Bytes = if on { b"\x01" } else { b"\x00" }
+
+/// Parts: the group's address bytes and the interface, empty for the one the host picks.
+fn group_written(group: Ip, interface: Option<String>) -> Bytes =
+  in_parts([
+    ip::to_bytes(group),
+    match interface { Some(name) -> Bytes::of_string(name), None -> b"" },
+  ])
+
+/// The option `option_written` writes.
+fn option_read(flat: Bytes) -> SocketOption / {abort.raise} = {
+  let rest = flat.slice(1, flat.len());
+  let on = rest.len() > 0 && rest.at(0) == 1;
+  let after = if rest.len() > 0 { rest.slice(1, rest.len()) } else { b"" };
+  match flat.at(0) {
+    0 -> NoDelay(on),
+    1 -> KeepAlive(if on { Some(probing_read(after)) } else { None }),
+    2 -> ReuseAddress(on),
+    3 -> ReusePort(on),
+    4 -> SendBuffer(int_of(rest)),
+    5 -> ReceiveBuffer(int_of(rest)),
+    6 -> Linger(if on { Some(nanos(int_of(after))) } else { None }),
+    7 -> Broadcast(on),
+    8 -> MulticastLoop(on),
+    9 -> match group_read(rest) { (group, interface) -> JoinGroup(group, interface) },
+    10 -> match group_read(rest) { (group, interface) -> LeaveGroup(group, interface) },
+    _ -> Presenting(String::of_bytes_lossy(rest)),
+  }
+}
+
+fn probing_read(flat: Bytes) -> Probing / {abort.raise} =
+  match parts(flat) {
+    [idle, interval, count] ->
+      {
+        idle: nanos(int_of(idle)),
+        interval: match interval.i64_be_at(0) { Some(n) -> Some(nanos(n)), None -> None },
+        count: count.i64_be_at(0),
+      },
+    _ -> panic("a socket native wrote no probing"),
+  }
+
+fn group_read(flat: Bytes) -> (Ip, Option<String>) / {abort.raise} =
+  match parts(flat) {
+    [address, interface] -> match ip::of_bytes(address) {
+      Some(group) ->
+        (group, if interface.len() == 0 { None } else { Some(String::of_bytes_lossy(interface)) }),
+      None -> panic("a socket native wrote no group"),
+    },
+    _ -> panic("a socket native wrote no group"),
+  }
+
+/// `options` as the host's socket natives read them: each written, as parts.
+pub fn options_written(options: List<SocketOption>) -> Bytes / {abort.raise} =
+  in_parts(options.map(option_written))
+
+/// The options `options_written` writes.
+pub fn options_read(flat: Bytes) -> List<SocketOption> / {abort.raise} =
+  parts(flat).map(option_read)
+
+/// The refusal a socket native wrote: its kind's byte, `Refused` 1 to `Other` 11 in declaration
+/// order, then `Handshake`'s reason, or `Other`'s code and words as parts.
+fn refusal_read(flat: Bytes) -> Refusal / {abort.raise} = {
+  let rest = flat.slice(1, flat.len());
+  match flat.at(0) {
+    1 -> Refused,
+    2 -> Unreachable,
+    3 -> TimedOut,
+    4 -> Reset,
+    5 -> NameNotFound,
+    6 -> AddressInUse,
+    7 -> PermissionDenied,
+    8 -> Injected,
+    9 -> Untrusted,
+    10 -> Handshake(String::of_bytes_lossy(rest)),
+    _ -> match parts(rest) {
+      [code, words] -> Other(int_of(code), String::of_bytes_lossy(words)),
+      _ -> Other(0, String::of_bytes_lossy(rest)),
+    },
+  }
+}
+
+/// What a socket native answered where the operation may be refused: byte 1 and what `ok` reads of
+/// the rest, or byte 0 and the refusal.
+pub fn refused_or<a | e>(
+  said: Bytes,
+  ok: (Bytes) -> a / e,
+) -> Result<a, Refusal> / {abort.raise | e} = {
+  let rest = said.slice(1, said.len());
+  if said.at(0) == 1 { Ok(ok(rest)) } else { Err(refusal_read(rest)) }
+}
+
 // --- Tests ------------------------------------------------------------------
+
+test "an address, an option and a refusal read back as the host's natives write them" {
+  let addresses = [
+    ip::read_socket("192.0.2.1:80"),
+    ip::read_socket("[2001:db8::1]:443"),
+    ip::read_socket("[fe80::1%en0]:8080"),
+  ];
+  assert_eq(addresses.map(|at: SocketAddress| address_read(address_written(at))), addresses);
+  let probing: Probing = { idle: seconds(60), interval: Some(seconds(5)), count: Some(3) };
+  let options = [
+    NoDelay(true),
+    KeepAlive(Some(probing)),
+    KeepAlive(Some({ idle: seconds(1), interval: None, count: None })),
+    KeepAlive(None),
+    ReuseAddress(false),
+    ReusePort(true),
+    SendBuffer(65536),
+    ReceiveBuffer(0),
+    Linger(Some(millis(250))),
+    Linger(None),
+    Broadcast(true),
+    MulticastLoop(false),
+    JoinGroup(ip::read("239.0.0.1"), Some("en0")),
+    LeaveGroup(ip::read("ff02::1"), None),
+    Presenting("client"),
+  ];
+  assert_eq(options_read(options_written(options)), options);
+  assert_eq(options_read(options_written([])), []);
+  let refused = |kind: Bytes| refused_or(b"\x00".concat(kind), |_: Bytes| ());
+  assert_eq(refused(b"\x01"), Err(Refused));
+  assert_eq(refused(b"\x09"), Err(Untrusted));
+  assert_eq(refused(b"\x0Ano shared cipher"), Err(Handshake("no shared cipher")));
+  assert_eq(
+    refused(b"\x0B".concat(in_parts([i64_be(61), b"refused by the system"]))),
+    Err(Other(61, "refused by the system")),
+  );
+  assert_eq(refused_or(b"\x01".concat(i64_be(7)), int_of), Ok(7))
+}
 
 fn head(queued: List<Bytes>) -> Bytes = match queued { [first, ..] -> first, _ -> b"" }
 

@@ -16,8 +16,9 @@ import compiler.emit.tir (FieldSet, Rep, RWord, RInt, RBool, RNum, RFlat, RSlice
                           answered, unpacks, fails, used_as, rep_of_arg, var_of, parts_of, Test,
                           TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MCase, PCase,
                           PPayload, OContainer, OStrings, stops_at, Uses, string_uses, framed_reads,
-                          MFramed, PPlace, word_record, Unwinds, Unwound)
+                          MFramed, PPlace, word_record, OHandle, RImm, Unwinds, Unwound)
 import compiler.emit.tir.containers (Taken)
+import compiler.emit.tir.handling (instance_alone, Returning)
 import compiler.emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock,
                                   Copied, Grown, ByteRead, string_args, string_answer)
 import compiler.emit.layout
@@ -734,12 +735,13 @@ fn handle_walked(f: Fn, cx: Within, acc: Walk, i: Inst) -> Walk =
       Some(t) -> faulted(acc, b"a reuse token read as a value: v", t),
       None -> if taken_whole(acc.h, x.args) != None {
         { ..acc, fault: Some(b"a block used whole after a field was taken out of it") }
-      } else if x.args.any(|a: Arg|
-          match var_of(a) { Some(v) -> acc.h.stacks.contains(v.id), None -> false }) {
+      } else if (x.site.detached != None || x.site.instance.heap != None)
+          && x.args.any(|a: Arg|
+            match var_of(a) { Some(v) -> acc.h.stacks.contains(v.id), None -> false }) {
         {
           ..acc,
           fault: Some(
-            b"a closure on this frame's stack handed to a handle, whose clauses may keep it",
+            b"a closure on this frame's stack handed to a handle whose instance may outlive it",
           ),
         }
       } else {
@@ -761,16 +763,25 @@ fn handle_walked(f: Fn, cx: Within, acc: Walk, i: Inst) -> Walk =
             ),
           }
         } else if x.site.detached != None { after } else {
+          // A body under a `return` clause leaves its value to the landing, which sets the answer.
+          let returns = x.site.ret != None;
+          let ends = if returns { across.owned } else { after.h.owned };
           let body = walked(
             f,
             { ..cx, looped: None, landing: across.owned, arm: None, handled: true },
-            { ..h, h: declared(across, x.answer.id), missed: None, done: false },
+            {
+              ..h,
+              h: if returns { across } else { declared(across, x.answer.id) },
+              missed: None,
+              done: false,
+            },
             x.body,
           );
           if body.fault != None { { ..h, fault: body.fault } }
-          else if !body.live { after } else if body.h.joins.get(x.answer.id) != Some(true) {
+          else if !body.live { after }
+          else if !returns && body.h.joins.get(x.answer.id) != Some(true) {
             { ..h, fault: Some(b"a handle's body that ends without its answer") }
-          } else if pending_held(body.h, after.h.owned) != after.h.owned {
+          } else if pending_held(body.h, ends) != ends {
             {
               ..h,
               fault: Some(
@@ -2164,7 +2175,7 @@ test "a handle's body leaves to its landing what the handle holds across it" {
   let r = word(1);
   let a = word(2);
   let c = flag(3);
-  let site = { clauses: [], ret: None, detached: None };
+  let site = { clauses: [], ret: None, detached: None, instance: instance_alone(0) };
   let uses = { takes: [], owned: false, fails: true, stops: false };
   let landed = |body: List<Inst>, unwind: List<Var>, landing: List<Var>|
     root_of([p, c], [], RWord, [
@@ -2599,7 +2610,41 @@ test "an arm's misses hand the next arm only the joins declared before the match
   )
 }
 
-test "a field taken before any miss is taken for the next arm, a read by name is held, and no handle is handed a stacked closure" {
+test "a body under a return clause hands what it answers to the landing, which sets the answer" {
+  let p = word(0);
+  let r = word(1);
+  let a = word(2);
+  let handled = |ret: Option<Int>|
+    verified(
+      root_of([p], [], RWord, [
+        Handle({
+          body: [
+            bind(r, call_of([AVar(p)], [0]), []),
+            Do({
+              val: Op({
+                op: OHandle(Returning),
+                args: [AZero(RImm), AVar(r)],
+                uses: { takes: [false, true], owned: false, fails: false, stops: false },
+              }),
+              at: dummy_span(),
+              unwind: [],
+            }),
+          ],
+          args: [],
+          uses: { takes: [], owned: false, fails: true, stops: false },
+          site: { clauses: [], ret: ret, detached: None, instance: instance_alone(0) },
+          answer: a,
+          unwind: [p],
+        }),
+        Dec(p),
+        Return(AVar(a)),
+      ]),
+    );
+  assert_eq(handled(Some(0)), None);
+  assert_eq(handled(None), Some(b"a handle's body that ends without its answer"))
+}
+
+test "a field taken before any miss is taken for the next arm, a read by name is held, and a handle is handed a stacked closure only over an instance in the frame" {
   let p = word(0);
   let c = flag(1);
   let x = word(2);
@@ -2635,24 +2680,35 @@ test "a field taken before any miss is taken for the next arm, a read by name is
     }),
     [],
   );
-  assert_eq(
+  let handed = |detached: Bool, heap: Option<Int>|
     verified(
       root_of([p], [], RWord, [
         laid,
         Handle({
-          body: [],
+          body: if detached { [] }
+          else { [Inc({ var: p, n: 1 }), Assign({ var: a, arg: AVar(p) })] },
           args: [AVar(k)],
           uses: { takes: [false], owned: false, fails: true, stops: false },
-          site: { clauses: [], ret: None, detached: Some(0) },
+          site: {
+            clauses: [],
+            ret: None,
+            detached: if detached { Some({ body: 0, forwards: 0 }) } else { None },
+            instance: { ..instance_alone(0), heap: heap },
+          },
           answer: a,
           unwind: [p],
         }),
         Dec(p),
         Return(AVar(a)),
       ]),
-    ),
-    Some(b"a closure on this frame's stack handed to a handle, whose clauses may keep it"),
-  )
+    );
+  // An instance in this frame holds the closure no longer than the frame stands; one the body may
+  // leave behind, detached or on the heap, could.
+  assert_eq(handed(false, None), None);
+  let outlives = Some(
+    b"a closure on this frame's stack handed to a handle whose instance may outlive it",
+  );
+  assert_eq([handed(true, None), handed(false, Some(0))], [outlives, outlives])
 }
 
 test "a case arm on a constructor is one its test names" {

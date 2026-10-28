@@ -4,14 +4,14 @@ import compiler.syntax.parsing (Span, Ident, span_key, is_bare, span_bin)
 import compiler.syntax.items (Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet,
                               SpecClause, SRequires, SEnsures, SCost, SSpace, INames, FnDef, LawDef,
                               OfSchema, Derived, is_pub, DRow, DLibrary, schema_named,
-                              schema_guard_name, dump_item, stated_type)
+                              schema_guard_name, dump_item, stated_type, real_handler_of)
 import compiler.syntax.type_syntax (TCon)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Param, SLet,
                               SLetElse, SExpr, SAssign, HandlerVar, RecField, expr_span, ETagged,
                               Tagged, Hole, TaggedPart, tagged_parts, tagged_part_bin,
-                              prelude_module)
+                              prelude_module, prelude_hosts)
 import compiler.syntax.patterns (Lit, LInt, LStr, LBytes)
 import compiler.check.types (unit_type, TypeTable, HeldType, held_type_bin, types_held, types_of)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify,
@@ -28,7 +28,7 @@ import compiler.check.infer (CheckOutput, types_named, types_joined, stated, Emi
 import compiler.check.infer.checker (Location, DefInfo, TestInfo, LawInfo, EffectInfo, OpInfo,
                                      CtorInfo, KeptFacts, WalkedBody, WitnessOrder, LabelSite,
                                      TypedSite, TrySite, MemberSite, UpdateShape, WitnessOp,
-                                     WitnessRef, InstanceInfo, NumericInfo, def_info_bin,
+                                     WitnessRef, RowSite, InstanceInfo, NumericInfo, def_info_bin,
                                      test_info_bin, law_info_bin, effect_info_bin, ctor_info_bin,
                                      instance_info_bin, numeric_info_bin, kept_facts_bin,
                                      ReleaseSite)
@@ -98,7 +98,14 @@ fn outline_of(
               span: d.span,
             }),
           ),
-        IEffect(d) -> acc.push(OEffect({ name: d.name.name, public: is_pub(d.vis) })),
+        IEffect(d) ->
+          acc.push(
+            OEffect({
+              name: d.name.name,
+              public: is_pub(d.vis),
+              host: real_handler_of(parsed.module, d.name.name),
+            }),
+          ),
         _ -> acc,
       }),
     declared: module_items(parsed),
@@ -137,6 +144,28 @@ pub fn effect_written(outlines: List<Outline>) -> Map<Bytes, Bool> =
   outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
     o.items.fold(acc, |a: Map<Bytes, Bool>, item: Outlined|
       match item { OEffect(e) -> a.insert(qualify(o.name, e.name), e.public), _ -> a }))
+
+/// Each effect whose module declares its real handler, and each of the prelude's whose handler's
+/// module the load holds (`prelude_hosts`), beside that handler, both by program-wide name.
+pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
+  outlines.fold(Map::new(), |acc: Map<Bytes, Bytes>, o: Outline| {
+    let declared = o.items.fold(acc, |a: Map<Bytes, Bytes>, item: Outlined|
+      match item {
+        OEffect(e) -> match e.host {
+          Some(by) -> a.insert(qualify(o.name, e.name), qualify(o.name, by)),
+          None -> a,
+        },
+        _ -> a,
+      });
+    prelude_hosts().fold(
+      declared,
+      |a: Map<Bytes, Bytes>, h: { effect: Bytes, module: Bytes, by: Bytes }|
+        if h.module == o.name
+            && o.items.any(|item: Outlined| match item { OFn(f) -> f.name == h.by, _ -> false }) {
+          a.insert(h.effect, qualify(o.name, h.by))
+        } else { a },
+    )
+  })
 
 /// A prelude effect has no source entry and is public.
 pub fn effect_public_of(m: Map<Bytes, Bool>, effect_info: EffectInfo) -> Bool =
@@ -531,6 +560,7 @@ pub fn no_module_tables() -> ModuleTables =
       },
       typed: [],
       types: Map::new(),
+      rows: [],
     },
     kept: [],
   }
@@ -569,6 +599,7 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
       ..t.facts,
       label_sites: t.facts.label_sites.map(|x: LabelSite| { ..x, module: m(x.module) }),
       typed: t.facts.typed.map(|x: TypedSite| { ..x, module: m(x.module) }),
+      rows: t.facts.rows.map(|x: RowSite| { ..x, module: m(x.module) }),
       elaboration: {
         updates: e.updates.map(|x: UpdateShape| { ..x, module: m(x.module) }),
         ops: e.ops.map(|x: WitnessOp| { ..x, module: m(x.module) }),
@@ -630,6 +661,7 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
           label_sites: c.facts.label_sites.filter(|x: LabelSite| mine(x.module)),
           typed: c.facts.typed.filter(|x: TypedSite| mine(x.module)),
           types: types_named(c.facts.types, c.facts.typed.filter(|x: TypedSite| mine(x.module))),
+          rows: c.facts.rows.filter(|x: RowSite| mine(x.module)),
           elaboration: {
             updates: e.updates.filter(|x: UpdateShape| mine(x.module)),
             ops: e.ops.filter(|x: WitnessOp| mine(x.module)),
@@ -760,6 +792,7 @@ fn cut_tables(t: ModuleTables, o: Outline, reached: Map<Bytes, Bool>) -> ModuleT
       label_sites: t.facts.label_sites.filter(|x: LabelSite| owned(x.owner)),
       typed: t.facts.typed.filter(|x: TypedSite| owned(x.owner)),
       types: types_named(t.facts.types, t.facts.typed.filter(|x: TypedSite| owned(x.owner))),
+      rows: t.facts.rows.filter(|x: RowSite| owned(x.owner)),
       elaboration: {
         updates: e.updates.filter(|x: UpdateShape| owned(x.owner)),
         ops: e.ops.filter(|x: WitnessOp| owned(x.owner)),
@@ -841,6 +874,7 @@ fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} 
         t.facts.types,
         t.facts.typed.filter(|x: TypedSite| of_definitions(x.owner)),
       ),
+      rows: t.facts.rows.filter(|x: RowSite| of_definitions(x.owner)),
       elaboration: {
         ..e,
         updates: e.updates.filter(|x: UpdateShape| of_definitions(x.owner)),
@@ -1214,6 +1248,8 @@ fn merged_tables(
         of_definitions(x.owner)),
       types: checked_order.fold(Map::new(), |acc: TypeTable, t: ModuleTables|
         types_joined(acc, t.facts.types)),
+      rows: phased(checked_order, placed, |t: ModuleTables| t.facts.rows, |x: RowSite|
+        of_definitions(x.owner)),
       elaboration: {
         updates: phased(
           checked_order,

@@ -1,5 +1,4 @@
-//! A unit's tables, which every thread running the unit reads: its memo, roots and the identities of
-//! what it keeps.
+//! A unit's tables, which every thread running the unit reads: its memo and its roots.
 
 use super::*;
 
@@ -36,52 +35,9 @@ pub struct Tables {
 pub struct Root {
     pub id: u64,
     pub name: Symbol,
-    /// Its definition's span in the text the unit runs over: a site is an offset from its start.
-    /// Never cached: definitions move.
+    /// What its sites are placed against: the unit holds no source, so the span names the root by
+    /// its index among the unit's roots, and a site is an offset from its definition's start.
     pub span: Span,
-}
-
-/// How many calls of roots over memo words a unit remembers.
-pub const CALL_MEMO_LIMIT: usize = 64;
-
-/// How many of an answer's direct parts get identities of their own.
-pub(super) const PARTS_LIMIT: usize = 64;
-
-/// A handed-out value's allocation, plus a list's window onto it: an identity without a walk.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Identity {
-    Record(usize),
-    Str(usize),
-    Bytes(usize),
-    List(usize),
-    Array(usize),
-}
-
-/// The identities of `v` and of its direct parts, the first [`PARTS_LIMIT`] of them: what a body
-/// that takes a value apart may hand back in.
-pub(crate) fn identities(v: &Value) -> Vec<Identity> {
-    let parts: Box<dyn Iterator<Item = &Value>> = match v {
-        Value::Record(fields) => Box::new(fields.iter().map(|(_, part)| part)),
-        Value::Ctor { args, .. } => Box::new(args.iter()),
-        Value::List(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
-        Value::Array(items) if items.len() <= PARTS_LIMIT => Box::new(items.iter()),
-        _ => Box::new(std::iter::empty()),
-    };
-    identity(v)
-        .into_iter()
-        .chain(parts.take(PARTS_LIMIT).filter_map(identity))
-        .collect()
-}
-
-pub(crate) fn identity(v: &Value) -> Option<Identity> {
-    Some(match v {
-        Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
-        Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),
-        Value::Bytes(b) => Identity::Bytes(Arc::as_ptr(b) as *const u8 as usize),
-        Value::List(items) => Identity::List(items.identity()),
-        Value::Array(items) => Identity::Array(Arc::as_ptr(items) as usize),
-        _ => return None,
-    })
 }
 
 impl Tables {

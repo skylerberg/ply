@@ -10,13 +10,15 @@ import compiler.syntax.parsing (Span, dummy_span)
 import std.bytes (ascii_of_int)
 import compiler.emit.reps (EmitParam)
 import compiler.emit.answer (Need)
-import compiler.emit.keys (RootKey, root_name, root_text)
+import compiler.emit.keys (RootKey, Evidence, root_name, root_text)
+import compiler.emit.evidence (Own)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, Var, Arg, AVar, AInt, ABool,
                           AFloat, ANum, AChar, AZero, Val, Pack, Native, Inst, Let, Do, Decl,
                           Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter,
                           Fail, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Lambda, Links,
                           Declined, Family, Spine, RWord, RUnit, RSlice, Gathered, Prim, Unsettled,
-                          rep_of_arg, falls_through, counted, operands, parts_of, Unwinds, Unwound)
+                          rep_of_arg, falls_through, counted, operands, parts_of, no_links, Unwinds,
+                          Unwound)
 import compiler.emit.lower.setting (Setting)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.tir.statics (StaticDef, StaticLaid, SPlain, WAddress, WBytes, named)
@@ -35,7 +37,12 @@ import compiler.emit.tir.statics (StaticDef, StaticLaid, SPlain, WAddress, WByte
 /// as read under this setting, and `written` what it lends then: the lambdas its body writes and
 /// the definitions it hands as values, read once for the whole body. `filed` is what the checker
 /// filed for the nodes of the body being lowered: the root's item's, or its lender's in a lambda run
-/// in place.
+/// in place. `words` are the evidence words the body holds, innermost first; `rows` and `labels`
+/// what the root's key fills its definition's row variables with and how many label parameters the
+/// definition has, which the checker's rows are read at; `label_names` those parameters' names in
+/// their order, which a label a call fills is read by; `label_values` the value each label of the
+/// root's numbering has in the function being lowered, where it holds one; and `handed` the root's
+/// parameters past its definition's, which a restart hands back as they are.
 pub type Context = {
   setting: Setting,
   filed: Filings,
@@ -59,7 +66,71 @@ pub type Context = {
   captured: List<Int>,
   lends: Bool,
   written: List<code::Lambda>,
+  words: List<Worded>,
+  rows: List<List<Evidence>>,
+  labels: Int,
+  label_names: List<Bytes>,
+  label_values: List<Option<Arg>>,
+  handed: List<Arg>,
+  instance: Option<Instanced>,
+  /// The counted blocks of the heap instances the body's words live in, which a closure holding
+  /// those words holds too.
+  kept: List<Arg>,
 }
+
+/// The instance of the `handle` whose clauses or body a function is, which holds that handle's
+/// variables from word `vars`.
+pub type Instanced = { word: Arg, vars: Int }
+
+/// What a function of its own takes from where it is made rather than from its caller: the words
+/// its row needs, each with what it answers, the instance of the `handle` it is a clause of, and
+/// the counted blocks of the heap instances those words live in.
+pub type Held = { words: List<Worded>, instance: Option<Instanced>, kept: List<Arg> }
+
+/// Nothing held: a function that takes its words from its caller.
+pub fn none_held() -> Held = { words: [], instance: None, kept: [] }
+
+/// How many words a function holding `h` captures for it, the counted blocks after the rest.
+pub fn held_count(h: Held) -> Int =
+  h.words.len() + (if h.instance == None { 0 } else { 1 }) + h.kept.len()
+
+/// What a function holding `h` captures for it where it is made: the words, the instance, then the
+/// counted blocks.
+pub fn held_args(h: Held) -> List<Arg> =
+  h.words.map(|w: Worded| w.word).concat(match h.instance {
+    Some(i) -> [i.word],
+    None -> [],
+  }).concat(
+    h.kept,
+  )
+
+/// The counted blocks a function holding `h` holds inside, read off `params`, its captures of what
+/// it holds.
+pub fn held_kept(h: Held, params: List<Var>) -> List<Arg> =
+  params.drop(h.words.len() + (if h.instance == None { 0 } else { 1 })).take(h.kept.len()).map(AVar)
+
+/// The words a function holding `h` holds inside, read off `params`, its captures of them.
+pub fn held_words(h: Held, params: List<Var>) -> List<Worded> =
+  range(0, h.words.len()).fold([], |acc: List<Worded>, i: Int|
+    match ((h.words.at(i), params.at(i))) {
+      (Some(w), Some(p)) -> acc.push({ ..w, word: AVar(p) }),
+      _ -> acc,
+    })
+
+/// The instance a function holding `h` holds inside, read off `params`, its captures.
+pub fn held_instance(h: Held, params: List<Var>) -> Option<Instanced> =
+  match h.instance {
+    None -> None,
+    Some(i) -> match params.at(h.words.len()) {
+      Some(p) -> Some({ ..i, word: AVar(p) }),
+      None -> None,
+    },
+  }
+
+/// An evidence word a body holds: what it answers, the word, whether it came through a row variable
+/// of the frame it was handed to, which no `handle` answers, and whether a `handle` of the body
+/// made it.
+pub type Worded = { evidence: Evidence, word: Arg, through: Bool, handled: Bool }
 
 /// Where a call in tail position goes without a call of its own: to the root's start where it calls
 /// the root's own definition, its parameters held there as `Restarts` says, to a member of the
@@ -98,8 +169,10 @@ pub type Target =
 /// A body lowered as a function of its own: how many parameters lead its slots, its frame's size,
 /// what it copies in from the frame around it, whether its last parameter is the continuation a
 /// handler's clause binds, a word of no type the runtime calls, the body, whose reads of what it
-/// copies in say the types its closure holds them at, and its function type where no node of the
-/// source files one, as the checker files a lambda's.
+/// copies in say the types its closure holds them at, its function type where no node of the
+/// source files one, as the checker files a lambda's, the evidence words it is handed, in the
+/// root's numbering, as its own row says, and what it holds from where it is made instead, which a
+/// function the runtime or a `handle` calls holds.
 pub type Frame = {
   params: Int,
   size: Int,
@@ -107,6 +180,8 @@ pub type Frame = {
   resumes: Bool,
   body: Code,
   ty: Option<Type>,
+  words: List<Own>,
+  held: Held,
 }
 
 /// A body to lower under a context of its own, from its first state.
@@ -114,9 +189,6 @@ pub type Opened = { cx: Context, st: Lowering }
 
 /// A `match` arm lowered: the arm as written, its guard's value where it has one, and its body.
 pub type Armed = { arm: CodeArm, guard: Option<Lowered>, body: Lowered }
-
-/// A `handle` clause made: the label it keys on where it names one, and its closure.
-pub type ClauseMade = { label: Option<Arg>, closure: Arg }
 
 /// A member of a tail group: its context and its body.
 pub type GroupMember = { cx: Context, body: Code }
@@ -131,7 +203,7 @@ pub fn started(params: List<Var>) -> Lowering =
     refused: None,
     lambdas: [],
     statics: [],
-    links: { generics: [], needs: [], called: [], passes: [] },
+    links: no_links(),
     unwinding: [],
   }
 
@@ -156,10 +228,16 @@ pub fn bound_as(st: Lowering, ty: Type, rep: Rep, val: Val, at: Span) -> Lowered
   { st: emitted(v.st, Let({ var: v.var, val: val, at: at, unwind: [] })), arg: AVar(v.var) }
 }
 
-/// What only a specialisation computes of `args`, a value of type `ty` held as `rep`: `st` has noted
-/// the need that settles the body by its callers, so no printer meets it.
-pub fn unsettled(st: Lowering, ty: Type, rep: Rep, args: List<Arg>, at: Span) -> Lowered =
-  bound_as(st, ty, rep, Unsettled(args), at)
+/// What only a specialisation computes of `ops`, a value of type `ty` held as `rep`, each operand
+/// taken where the specialisation takes it: `st` has noted the need that settles the body by its
+/// callers, so no printer meets it.
+pub fn unsettled(
+  st: Lowering,
+  ty: Type,
+  rep: Rep,
+  ops: List<{ arg: Arg, takes: Bool }>,
+  at: Span,
+) -> Lowered = bound_as(st, ty, rep, Unsettled(ops), at)
 
 /// `val` done for what it does, its answer let go.
 pub fn done(st: Lowering, val: Val, at: Span) -> Lowering =

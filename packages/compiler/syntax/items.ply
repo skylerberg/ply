@@ -33,7 +33,8 @@ import compiler.syntax.exprs (Expr, ELit, EApp, EVar, Param, expr, scrutinee, bl
                               no_expr, fn_param, param, declared_param, dump_expr, dump_param,
                               shown_binder, cases_binder, set_binder, hidden_binder, free_names,
                               free_binder, case_at, case_identity, case_body, listing, home_modules,
-                              sees_homes, prelude_module)
+                              sees_homes, prelude_module, scheduler_module, beneath_scheduler,
+                              task_operations)
 import compiler.syntax.patterns (LStr)
 import std.prelude_source
 
@@ -319,7 +320,10 @@ derive bin for Derivation
 /// `invariant for Balance by valid`, what every value of an opaque sum satisfies, which each
 /// constructor application in its module is an obligation to show and every other value assumes;
 /// and `release for Conn by close` for letting a value go, which makes the type a resource.
-pub type InstanceKind = | NKey | NShow | NInvariant | NRelease
+/// `host for os by served` is what an effect's own module says its performs go through where no
+/// handler of the program answers them: the real handler every root whose row names the effect
+/// runs under. Its `target` names the effect.
+pub type InstanceKind = | NKey | NShow | NInvariant | NRelease | NHost
 
 derive bin for InstanceKind
 
@@ -331,6 +335,7 @@ pub fn instance_text(kind: InstanceKind) -> Bytes =
     NShow -> b"show",
     NInvariant -> b"invariant",
     NRelease -> b"release",
+    NHost -> b"host",
   }
 
 /// One function a `numeric` names, and the operation it names it for.
@@ -449,6 +454,19 @@ pub fn stated_type(item: Item) -> Option<Ident> =
     IExtern(_) -> None,
   }
 
+/// The function `module` names the real handler of its effect `name` (`host for name by f`), by
+/// its name in the module; the first where it names two, which the checker refuses.
+pub fn real_handler_of(module: Module, name: Bytes) -> Option<Bytes> =
+  module.items.fold(None, |found: Option<Bytes>, item: Item|
+    match found {
+      Some(_) -> found,
+      None -> match item {
+        IInstance(d) -> if d.kind == NHost && d.target.name == name { Some(d.by.name) }
+        else { None },
+        _ -> None,
+      },
+    })
+
 pub fn item_span(item: Item) -> Span =
   match item {
     IFn(d) -> d.span,
@@ -543,8 +561,8 @@ pub fn at_item_start(input: Input, parser: Parser) -> Bool = {
     || at_numeric_start(input, parser)
 }
 
-/// `key`, `show`, `invariant` and `release` are contextual: one opens an item only before `for`, so
-/// `fn key(..)` and a field named `show` keep their meaning.
+/// `key`, `show`, `invariant`, `release` and `host` are contextual: one opens an item only before
+/// `for`, so `fn key(..)` and a field named `host` keep their meaning.
 pub fn at_instance_start(input: Input, parser: Parser) -> Bool =
   instance_kind_at(input, parser) != None
     && (match token_kind_at(input, parser, 1) { Identifier(n) -> n == b"for", _ -> false })
@@ -554,6 +572,7 @@ fn instance_kind_at(input: Input, parser: Parser) -> Option<InstanceKind> =
   else if at_ident_text(input, parser, b"show") { Some(NShow) }
   else if at_ident_text(input, parser, b"invariant") { Some(NInvariant) }
   else if at_ident_text(input, parser, b"release") { Some(NRelease) }
+  else if at_ident_text(input, parser, b"host") { Some(NHost) }
   else { None }
 
 /// `numeric` is contextual as `key` is: a constraint `numeric(a)` and a definition of that name
@@ -2061,9 +2080,10 @@ pub fn derive_def(
   }
 }
 
-// --- `key`, `show`, `invariant` and `release` ----------------------------------
+// --- `key`, `show`, `invariant`, `release` and `host` ------------------------
 
-/// One `key for T by f`, `show for T by f`, `invariant for T by f` or `release for T by f`.
+/// One `key for T by f`, `show for T by f`, `invariant for T by f`, `release for T by f` or
+/// `host for e by f`.
 pub fn instance_def(
   input: Input,
   parser: Parser,
@@ -2074,11 +2094,14 @@ pub fn instance_def(
   };
   let st = advance(input, parser);
   let f = advance(input, st.parser);
-  let { parser, node: target } = expect_ident(input, f.parser, b"the type, after `for`")?;
+  let { parser, node: target } = expect_ident(input, f.parser, if kind == NHost {
+    b"the effect, after `for`"
+  } else { b"the type, after `for`" })?;
   if !at_ident_text(input, parser, b"by") {
     Err(
       error_here(input, parser, match kind {
         NInvariant -> b"`by` and the function every value of the type satisfies",
+        NHost -> b"`by` and the function that is the effect's real handler",
         _ -> b"`by` and the function the type's values go through",
       }),
     )
@@ -2344,8 +2367,8 @@ pub fn item_at(
         parser,
         unexpected(),
         pub_span,
-        b"a `key`, a `show`, an `invariant` or a `release` cannot be `pub`",
-        [b"it is part of what its type is, and reaches wherever the type does"],
+        b"a `key`, a `show`, an `invariant`, a `release` or a `host` cannot be `pub`",
+        [b"it is part of what its type or effect is, and reaches wherever that does"],
       ),
     )?;
     Ok({ parser: d.parser, node: IInstance(d.node) })
@@ -2362,7 +2385,7 @@ pub fn item_at(
       error_here(
         input,
         parser,
-        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`, `show`, `invariant`, `release`, or `numeric`",
+        b"an item: `fn`, `type`, `effect`, `nondet effect`, `effect set`, `test`, `law`, `law schema`, `derive`, `key`, `show`, `invariant`, `release`, `numeric`, or `host`",
       ),
     )
   }
@@ -2560,17 +2583,41 @@ fn ident_length(b: Bytes, from: Int) -> Int / {abort.raise} =
 /// A home module and the names it declares a function of a type under.
 pub type HomeNames = { home: Bytes, names: Map<Bytes, Bool> }
 
-/// The home modules the module `name` reads with no import: each that `declared` says declares a
-/// function of a type under a name its text, lexed as `input`, calls ([`called_names`]), where the
-/// module sees them.
-pub fn homes_called<| e>(
+/// The shipped modules the module `name` reads with no import, where it sees the home modules: each
+/// home that `declared` says declares a function of a type under a name its text, lexed as `input`,
+/// calls ([`called_names`]), and the scheduler as [`scheduler_read`] says.
+pub fn read_without_import<| e>(
   name: Bytes,
   input: Input,
   declared: () -> List<HomeNames> / e,
 ) -> List<Bytes> / e =
   if !sees_homes(name) { [] } else {
     let called = called_names(input);
-    if called.len() == 0 { [] } else { homes_for(called, declared()) }
+    (if called.len() == 0 { [] } else { homes_for(called, declared()) }).concat(
+      scheduler_read(name, input),
+    )
+  }
+
+/// The scheduler, where the module `name`, lexed as `input`, lies outside [`beneath_scheduler`] and
+/// writes `simulate { .. }` or performs `task`: names `task.write` or one of [`task_operations`],
+/// as a row's atom or as a perform. A region and a crossing call the scheduler, and an entry that
+/// performs `task` runs under its region. A name after `.` or `::` is another's.
+pub fn scheduler_read(name: Bytes, input: Input) -> List<Bytes> =
+  if beneath_scheduler().contains(name) { [] } else {
+    let kind = |i: Int| match input.tokens.at(i) { Some(t) -> t.kind, None -> EndOfInput };
+    let performs = range(0, input.token_count).any(|i: Int|
+      match kind(i) {
+        Identifier(n) -> if n == b"simulate" { kind(i + 1) == token_lbrace() } else {
+          n == b"task" && kind(i + 1) == token_dot() && kind(i - 1) != token_dot()
+            && kind(i - 1) != token_coloncolon()
+            && (match kind(i + 2) {
+              Identifier(op) -> op == b"write" || task_operations().contains(op),
+              _ -> false,
+            })
+        },
+        _ -> false,
+      });
+    if performs { [scheduler_module()] } else { [] }
   }
 
 /// Each home of `declared` that declares one of the names `called`.
@@ -2579,7 +2626,7 @@ pub fn homes_for(called: Map<Bytes, Bool>, declared: List<HomeNames>) -> List<By
     |d: HomeNames| d.home,
   )
 
-/// What each home module `text_of` holds declares, as [`homes_called`] reads it.
+/// What each home module `text_of` holds declares, as [`read_without_import`] reads it.
 pub fn homes_declaring<| e>(
   text_of: (Bytes) -> Option<Bytes> / e,
 ) -> List<HomeNames> / {abort.raise | e} =
@@ -2954,7 +3001,8 @@ fn may_start(k: TokenKind) -> Bool =
         || n == b"show"
         || n == b"invariant"
         || n == b"release"
-        || n == b"numeric",
+        || n == b"numeric"
+        || n == b"host",
     _ -> false,
   }
 
@@ -4166,13 +4214,40 @@ test "`invariant for T by f` is an item, and `invariant` is not reserved" {
   );
   assert(parse(b"invariant for T valid\n").parser.diags.len() > 0);
   assert_eq(parse(b"pub invariant for T by valid\n").parser.diags.map(|d: ParseDiag| d.message), [
-    b"a `key`, a `show`, an `invariant` or a `release` cannot be `pub`",
+    b"a `key`, a `show`, an `invariant`, a `release` or a `host` cannot be `pub`",
   ]);
   // Without `for` the word opens nothing, and what would is named.
   assert(
     parse(b"pub invariant T\n").parser.diags.any(|d: ParseDiag|
-      d.message.contains(b"`key`, `show`, `invariant`, `release`, or `numeric`")),
+      d.message.contains(b"`key`, `show`, `invariant`, `release`, `numeric`, or `host`")),
   )
+}
+
+test "`host for e by f` is an item naming an effect, and `host` is not reserved" {
+  let r = parse(b"effect e {\n  read get() -> Int\n}\nhost for e by served\n");
+  assert_eq(r.parser.diags.len(), 0);
+  match r.node.items {
+    [IEffect(_), IInstance(h)] -> {
+      assert_eq(h.kind, NHost);
+      assert_eq(instance_text(h.kind), b"host");
+      assert_eq((h.target.name, h.by.name), (b"e", b"served"))
+    },
+    _ -> panic("an effect and its real handler"),
+  };
+  assert_eq(
+    parse(
+      b"fn host(host: Int) -> { host: Int } = { host: host }\nfn f() -> Int = { let host = 1; host }\n",
+    ).parser.diags.len(
+    ),
+    0,
+  );
+  assert(
+    parse(b"host for e served\n").parser.diags.any(|d: ParseDiag|
+      d.message.contains(b"the effect's real handler")),
+  );
+  assert_eq(parse(b"pub host for e by served\n").parser.diags.map(|d: ParseDiag| d.message), [
+    b"a `key`, a `show`, an `invariant`, a `release` or a `host` cannot be `pub`",
+  ])
 }
 
 test "`release for T by f` is an item, and `release` is not reserved" {
@@ -4222,11 +4297,36 @@ test "a module reads the home modules that declare a name it calls, unless it is
   ];
   assert_eq(declared.map(|d: HomeNames| d.names.keys()), [[b"reverse"], [b"or_else"]]);
   let src = b"fn f(xs: List<Int>) -> Int = xs.reverse().len()\n";
-  let homes = |name: Bytes, src: Bytes| homes_called(name, start(src).input, || declared);
+  let homes = |name: Bytes, src: Bytes| read_without_import(name, start(src).input, || declared);
   assert_eq(homes(b"app", src), [b"std.list"]);
   assert_eq(homes(b"std.oid", src), [b"std.list"]);
   assert_eq(homes(b"std.gen", src), []);
   assert_eq(homes(b"app", b"fn f(xs: List<Int>) -> Int = xs.len()\n"), [])
+}
+
+test "a module reads the scheduler where it writes `simulate` or performs `task`, unless the scheduler imports it" {
+  let read = |name: Bytes, src: Bytes| read_without_import(name, start(src).input, || []);
+  let region = b"fn f() -> Int / {sim.read} = simulate { 1 }\n";
+  let joined = b"fn f(t: Task<Int>) -> Int / {task.join, abort.raise} = task.join(t)\n";
+  assert_eq(read(b"app", region), [b"std.internal.schedule"]);
+  assert_eq(read(b"app", joined), [b"std.internal.schedule"]);
+  assert_eq(read(b"app", b"fn f() -> Unit / {task.write} = task.yield()\n"), [
+    b"std.internal.schedule",
+  ]);
+  // A row alone says so: the entry runs under the run's region whatever performs `task` for it.
+  assert_eq(read(b"app", b"fn f(g: () -> Unit / {task.write}) -> Unit / {task.write} = g()\n"), [
+    b"std.internal.schedule",
+  ]);
+  assert_eq(read(b"std.internal.schedule", region), []);
+  assert_eq(read(b"std.internal.trail", joined), []);
+  assert_eq(read(b"std.gen", region), []);
+  // A string, a comment, or a name on a value is none.
+  assert_eq(
+    read(b"app", b"// simulate { task.join(t) }\nfn f() -> String = \"simulate { 1 }\"\n"),
+    [],
+  );
+  assert_eq(read(b"app", b"fn f(task: Int) -> String = task.to_string()\n"), []);
+  assert_eq(read(b"app", b"fn f(r: { task: Task<Int> }) -> Int = r.task.join()\n"), [])
 }
 
 test "an importer reads no test or law, nor a private item or an import only they reach" {

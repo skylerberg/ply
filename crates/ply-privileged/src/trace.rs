@@ -50,11 +50,23 @@ impl LevelArg {
 }
 
 impl TraceOptions {
-    /// What `ply test` always binds: its `--trace` flag already means the definition trace.
-    pub fn silent() -> TraceOptions {
+    /// The sink and level a run's `trace SINK LEVEL` entry names, `json` at `info` without one.
+    pub fn of_grants(grants: &ply_core::host::Grants) -> TraceOptions {
+        let Some([sink, level]) = grants.named("trace").next() else {
+            return TraceOptions::default();
+        };
         TraceOptions {
-            sink: SinkArg::Off,
-            level: LevelArg::Info,
+            sink: match sink.as_str() {
+                "text" => SinkArg::Text,
+                "off" => SinkArg::Off,
+                _ => SinkArg::Json,
+            },
+            level: match level.as_str() {
+                "debug" => LevelArg::Debug,
+                "warn" => LevelArg::Warn,
+                "error" => LevelArg::Error,
+                _ => LevelArg::Info,
+            },
         }
     }
 
