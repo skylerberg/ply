@@ -120,12 +120,18 @@ fn the_natives_write_what_the_codec_writes() {
     assert_eq!(bytes, encode(&v).unwrap());
 }
 
+/// A block of one word past its header, counted `rc`, its address the word that stands for it.
+fn block(rc: u32) -> Box<[u64; 2]> {
+    Box::new([u64::from(rc), 0])
+}
+
 /// Asked of a value written before, a lowering that shares writes it again as `AGAIN`, which reads
 /// back as a copy; one that does not writes it whole each time.
 #[test]
 fn a_value_written_twice_is_written_again_only_where_the_lowering_shares() {
     let mut ctx = context();
-    let (shared, inner) = (0x1000 as Word, 0x2000 as Word);
+    let (a, b) = (block(1), block(1));
+    let (shared, inner) = (a.as_ptr() as Word, b.as_ptr() as Word);
     let write = |ctx: *mut Ctx| unsafe {
         let again: A1 = native("?out_again");
         native::<N2>("?out_count")(ctx, tag::LIST as Word, 3);
@@ -157,6 +163,28 @@ fn a_value_written_twice_is_written_again_only_where_the_lowering_shares() {
         "{} bytes shared, {} not",
         with.len(),
         without.len()
+    );
+}
+
+/// A static stands for every value of its contents, a string's and a byte string's alike, so a
+/// lowering that shares writes it whole each time, never as `AGAIN`.
+#[test]
+fn a_static_is_written_whole_each_time_a_lowering_shares() {
+    let mut ctx = context();
+    let s = block(ply_compiled::heap::IMMORTAL);
+    let w = s.as_ptr() as Word;
+    let bytes = lowered(&mut ctx, true, |ctx| unsafe {
+        let again: A1 = native("?out_again");
+        native::<N2>("?out_count")(ctx, tag::LIST as Word, 2);
+        assert_eq!(again(ctx, w), 0);
+        text(ctx, "?out_str", b"a");
+        assert_eq!(again(ctx, w), 0);
+        text(ctx, "?out_bytes", b"a");
+    });
+    assert_eq!(ctx.failed, 0);
+    assert_eq!(
+        decode(&bytes).unwrap(),
+        Value::list(vec![Value::str("a"), Value::bytes(b"a")])
     );
 }
 

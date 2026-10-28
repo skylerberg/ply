@@ -409,6 +409,12 @@ pub unsafe extern "C" fn rt_out_again(ctx: *mut Ctx, w: Handed) -> I64 {
         return I64(0);
     };
     let w = w.word();
+    // A static is one object for every value of its contents, a string's and a byte string's
+    // alike, so only a heap object's word names one value.
+    if heap::is_object(w) && unsafe { heap::count_of(heap::obj(w)) } == heap::IMMORTAL {
+        s.next = None;
+        return I64(0);
+    }
     match s.numbered.get(&w) {
         Some(&n) => {
             l.w.again(n);
