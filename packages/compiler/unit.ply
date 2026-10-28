@@ -5275,6 +5275,7 @@ test "a generic definition's entry is taken, its call settled where the entry ju
         b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
         b"pub fn made<a>(make: () -> a) -> a = make()\n",
         b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+        b"pub fn counted<a>(xs: Columns<a>) -> Int = xs.len()\n",
       ]),
     },
   ];
@@ -5291,10 +5292,16 @@ test "a generic definition's entry is taken, its call settled where the entry ju
     Err(why) -> assert_eq(why, b""),
     Ok(e) -> {
       let entry = |n: Bytes| root_name(Entered(Named(n)));
-      assert_eq(e.produced.dropped.filter(|d: Dropped| d.function == entry(b"m.first")), []);
-      // A function crosses only out, and a witnessed variable has no specialisation at `Int`.
       assert_eq(
-        [b"m.first", b"m.made", b"m.total"].filter(|n: Bytes| e.produced.taken.contains(entry(n))),
+        e.produced.dropped.filter(|d: Dropped|
+          [entry(b"m.first"), entry(b"m.counted")].contains(d.function)),
+        [],
+      );
+      // A function crosses only out, a witnessed variable has no specialisation at `Int`, and a
+      // `Columns` at `Int` would hold no records.
+      assert_eq(
+        [b"m.first", b"m.made", b"m.total", b"m.counted"].filter(|n: Bytes|
+          e.produced.taken.contains(entry(n))),
         [b"m.first"],
       )
     },
@@ -5367,11 +5374,14 @@ test "an entry runs under the real handler of each effect its root's row names, 
   }
 }
 
-test "an entry of a root that performs `task` runs it under the run's region, `task`'s real handler" {
+test "an entry of a root that performs `task` runs it under the run's region, `task`'s real handler, and one that performs `clock` too under `clock`'s" {
   let user = [
     {
       name: b"m",
-      src: b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
+      src: Bytes::concat_all([
+        b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
+        b"pub fn timed() -> Int / {task.write, clock.read} = {\n  task.yield();\n  match clock.now() { Instant(n) -> n }\n}\n",
+      ]),
     },
   ];
   let clauses = [
@@ -5396,6 +5406,8 @@ test "an entry of a root that performs `task` runs it under the run's region, `t
           Bytes::concat_all([b"    task.", c, b" -> abort.raise(\"none\"),\n"])),
       ),
       b"  }\n",
+      b"pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / e =\n",
+      b"  handle { go() } with {\n    clock.now() -> Instant(0),\n    clock.sleep(_d) -> (),\n  }\n",
     ]),
   };
   let dump = dump_of(analyse_pulling_std_with(user, [scheduler], no_rows()).out);
@@ -5417,7 +5429,7 @@ test "an entry of a root that performs `task` runs it under the run's region, `t
       let entry = |n: Bytes| root_name(Entered(Named(n)));
       assert_eq(
         e.produced.dropped.filter(|d: Dropped|
-          [entry(b"m.yielded"), entry(b"m.plain")].contains(d.function)),
+          [entry(b"m.yielded"), entry(b"m.plain"), entry(b"m.timed")].contains(d.function)),
         [],
       );
       // Taken at what the entry answers, as any generic function its callers settle.
@@ -5791,33 +5803,44 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
   let native = [
     {
       name: b"std.native",
-      src: b"pub extern fn counted(x: Option<Int>) -> Int\npub extern fn named(id: Int) -> String\n",
+      src: b"pub extern fn counted(x: Int) -> Int\npub extern fn named(id: Int) -> String\n",
     },
   ];
   let program = [
     {
       name: b"m",
-      src: b"import std.native (counted, named)\nfn f() -> Int = counted(Some(1))\nfn g() -> String = named(7)\n",
+      src: b"import std.native (counted, named)\nfn f() -> Int = counted(1)\nfn g() -> String = named(7)\n",
     },
   ];
-  let counted = |words: Int| uniform_native(b"counted", words, true, false);
+  let counted = |params: List<Machine>|
+    { name: b"counted", params: params, answer: Some(abi::I64), raises: false };
   let named = |answer: Machine|
     { name: b"named", params: [abi::I64], answer: Some(answer), raises: false };
   let implemented = |a: Native, b: Native|
     declared_natives().map(declared_signature).push(a).push(b);
-  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::Taken)))), []);
-  assert_eq(refusal(held_over(program, native, implemented(counted(2), named(abi::Taken)))), [
-    b"E0476",
-    b"`extern fn counted` of `std.native` takes [Word], answers Word and cannot raise, and the runtime's native takes [Word, Word], answers Word and cannot raise",
-    natives_refused([]).notes_text.get(0),
-  ]);
-  // One called over machine words binds a native of the kinds its call passes: bytes are told from
-  // an integer by theirs.
-  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::I64)))), [
-    b"E0476",
-    b"`extern fn named` of `std.native` takes [I64], answers Taken and cannot raise, and the runtime's native takes [I64], answers I64 and cannot raise",
-    natives_refused([]).notes_text.get(0),
-  ])
+  assert_eq(
+    refusal(held_over(program, native, implemented(counted([abi::I64]), named(abi::Taken)))),
+    [],
+  );
+  assert_eq(
+    refusal(
+      held_over(program, native, implemented(counted([abi::I64, abi::I64]), named(abi::Taken))),
+    ),
+    [
+      b"E0476",
+      b"`extern fn counted` of `std.native` takes [I64], answers I64 and cannot raise, and the runtime's native takes [I64, I64], answers I64 and cannot raise",
+      natives_refused([]).notes_text.get(0),
+    ],
+  );
+  // A native binds the kinds its call passes: bytes are told from an integer by theirs.
+  assert_eq(
+    refusal(held_over(program, native, implemented(counted([abi::I64]), named(abi::I64)))),
+    [
+      b"E0476",
+      b"`extern fn named` of `std.native` takes [I64], answers Taken and cannot raise, and the runtime's native takes [I64], answers I64 and cannot raise",
+      natives_refused([]).notes_text.get(0),
+    ],
+  )
 }
 
 test "a unit declares a shipped module's native over machine words where a bucket calls it, and binds it after the rest" {
