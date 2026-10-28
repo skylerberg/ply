@@ -1,36 +1,62 @@
 # AGENTS.md
 
-Ply is a general-purpose programming language. Its compiler is written in Ply
-(`packages/compiler`), and `ply` is a native program: the CLI (`packages/cli`) compiled
-to C and linked with the runtime, a static library cargo builds (`crates/ply-runtime`). `ply`
-builds `ply`: `ply bootstrap` links a checkout's runtime library with what the checkout's builder
-makes of its CLI. `scripts/bootstrap.sh` is the rebuild when an edit changes what `ply` does:
-cargo, then `ply bootstrap` run by the `ply` in `target/`, or by the last release in a checkout
-with none, which drives the first bootstrap only. An edit to the compiler's or the standard
-library's own code tests without a new binary: a load inside the checkout reads both from the
-checkout, as `std.*` and `compiler.*`, and `scripts/iterate.sh <package> [filters...]` runs `ply
-check` and `ply test` of the package with the newest `ply` the checkout has. `PLY_C_PHASES=1`
-prints what a bootstrap's steps took.
+Ply is a general-purpose programming language. [`GOALS.md`](GOALS.md) says what it is for and is
+the source of truth for every design decision. A human wrote it: never edit it.
 
 Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 
-## Prose
+## How `ply` is built
 
-- Prose is `README.md`, `docs/`, and this file. A document earns its place by being read: it
-  says what a reader needs and nothing more, and it is deleted when it stops being true. No
-  status files, reports, ledgers or dated readings. Git history and PR descriptions hold the
-  history.
-- Comments: default to none. Write one only for a non-obvious why, an invariant the types don't
-  enforce, or a trap, and keep it to one line. No history ("used to", "since #123"), no
-  references to PRs or documents, no figures.
-- Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers, and
-  the rule above does not bound them: say what the signature cannot (what an answer means, when it
-  raises, units, edge cases), never restate the type or row, and open with a one-sentence summary.
-  No examples: the tests that name a definition are its examples, and `ply callers` lists them.
+- `ply` is a native program made of three Ply packages and one Rust library:
+  - `packages/compiler`: the compiler, written in Ply.
+  - `packages/std`: the standard library.
+  - `packages/cli`: the command-line program.
+  - `crates/ply-runtime`: the runtime, a static library that cargo builds.
+- `ply bootstrap` builds a new `ply` from a checkout. The running `ply` compiles the checkout's
+  compiler into a program called the *builder*. The builder compiles the CLI to C, and that C is
+  linked with the runtime library.
+- `scripts/bootstrap.sh` is the full rebuild: cargo builds the runtime, then the `ply` in `target/`
+  runs `ply bootstrap`. A fresh checkout has no `ply` yet, so the script downloads the latest
+  release (`scripts/stage0.sh`) for the first bootstrap. `PLY_C_PHASES=1` prints how long each step
+  took.
+- You need a new binary only when an edit changes what `ply` itself does. Inside a checkout, `ply`
+  reads `std.*` and `compiler.*` from the checkout's sources, so `scripts/iterate.sh <package>
+  [filters...]` checks and tests an edit to the compiler or the standard library with the newest
+  `ply` you have.
+
+## Writing
+
+- Write plainly. Use short sentences, one idea each, in common words. Use the standard term for a
+  standard idea: "returns", not "answers"; "borrows", not a new verb. Define a term the first time
+  you use it.
+- Prose is `README.md`, `docs/GUIDE.md` and this file. A document says what its reader needs and
+  nothing more, and is deleted when it stops being true. No status files, reports, logs or dated
+  notes: git history and PR descriptions hold history.
+- State a direction as the direction. No hedging and no time estimates.
 - Correct in place. Never write "previously", "corrected" or "a draft of this said".
-- Measurements belong in the PR description of the change they decide, not in the tree.
-- Tests check the program, never a document.
+- Measurements belong in the description of the PR they decide, not in the tree.
 - PR descriptions and commit messages: a few lines on what changed and why.
+
+## Comments
+
+- Default to none. Clear names and small functions should explain the code; a comment that
+  restates it is noise. Write one only for a reason the code cannot show, an invariant the types
+  do not enforce, or a trap, and keep it to one line. Delete stale or redundant comments you pass.
+- No history ("used to", "since #123"), no references to PRs or documents, no figures.
+- Doc comments (`///` above a declaration, `//!` at the head of a module) are for callers. Open
+  with a one-sentence summary, then say what the signature cannot: what the result means, when it
+  raises, units, edge cases. Never restate the type. No examples: the tests that name a definition
+  are its examples, and `ply callers` lists them.
+
+## Naming
+
+- Name a thing by what it is or does, in full words: `return_type`, not `ret_ty`; `expression`,
+  not `expr`. Abbreviations are fine only where they are the everyday word outside this project
+  (`url`, `json`, `http`).
+- Don't invent terms. Use the established name for an established idea. Where Ply has a genuinely
+  new idea, give it a plain name and define it in the guide.
+- No version or age markers (`v2`, `new_`, `old_`) and no task, PR or card numbers in names.
+- Where a keyword takes the plain word, name the role instead (`original`, `annotation`).
 
 ## Work
 
@@ -40,43 +66,65 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - Do the work; don't narrate it. Never open a PR whose only content is a finding, a measurement
   or a plan.
 - Read the call sites before planning a change. Don't plan from prose.
-- Measure only what decides a choice in front of you. One slow CI run is not a work item:
-  hosted runners sometimes start jobs late.
-- One implementation: don't add environment switches, fallbacks or second paths to get a test
-  green.
+- One goal, one PR. Bugs found on the way go in it, with their tests. Split only when one change
+  must be on `main` before another can build on it.
+- Find waste by reading what the code computes, copies and repeats. Measure only a number that
+  decides a choice in front of you. One slow CI run is not a work item: hosted runners sometimes
+  start jobs late.
+- Work that only serves tests or proofs, such as counting steps, must cost a production run
+  nothing.
+- One implementation: no environment switches, fallbacks or second paths to get a test green, and
+  no stopgap that a planned change will delete.
+- A rule lives in one place. When two places restate one rule, route both through one function in
+  the module that owns it and delete the copy.
 - No backwards compatibility: delete retired flags, APIs and modes outright.
+- New code is Ply. Port Rust to Ply when work reaches it.
+
+## Tests
+
+- Tests check the program, never a document.
+- Write only the tests that matter, and keep each small and fast.
+- Assert relations rather than counts a layout change would move: equal at two sizes, equal to a
+  reference, `live == 0`.
+- A test that touches a real resource uses a handler instead. A few `test/nondet` tests check the
+  real handlers.
+- Rust tests test only the Rust: none compiles Ply or reads the standard library. Ply tests cover
+  what Ply programs do, including the runtime's internals.
 
 ## Mechanics
 
-- Tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
-  touch. Run `cargo fmt --all` before pushing; CI runs clippy with `-D warnings`.
-- The CLI's tests are the Ply package `tests/cli`; `.github/ci-ply.sh run
-  cli-<module>` runs one module with the grants CI gives it.
-- CI is `.github/workflows/ci.yml`; `.github/ci-shards.sh` holds its gate tables and lists the Ply
-  runs, each one `ply test` of a package, and the jobs that take them.
-- `ply bootstrap` builds the builder (`packages/compiler`'s `build.main`) with the `ply` that
-  runs it, and the builder builds the CLI. CI bootstraps twice: the latest release first, then the
-  `ply` that made, which takes the builder and the shipped modules' answers the first kept unless
-  the definitions that make them moved. The release parses the builder's modules, so the compiler,
-  `std.prelude`, which every module imports, and the shipped modules the compiler imports (`grep
-  -rh '^import std' packages/compiler` and what those import) cannot use a language rule the same
-  pull request introduces; the rest of `packages/std` can. Likewise the release's bootstrap drives the pull request's builder and links
-  its runtime, so the builder's arguments, the runtime's description and the pack's layout change
-  only in a form the release still speaks.
-- A file below `packages/std` that is not a `.ply` is data a shipped module embeds by its
-  path from the module (`embed("oid/names.txt")` in `oid.ply`). It ships in every binary and a
-  load reads it whenever it pulls the module, so a test's fixtures stay in
-  `tests/std`.
-- `packages/` holds the Ply packages and `crates/` the cargo packages; `ply.work` says which is
-  which part of `ply`, and CI and the scripts read it with `ply work`. CI publishes each main `ply`
-  to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
-- Rust tests test the Rust: none compiles Ply or reads the shipped modules. What a Ply program
-  does, the runtime's internals included, is tested by Ply tests.
-- A `ply.lock` records a path dependency in this checkout (proof, sim, store, testing) by name and
-  version only, so editing one moves no lock. Adding or dropping a dependency or bumping a version
-  does: run `ply resolve` on the lock's directory, as CI's lock gate does for every `ply.lock`.
-- `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit
-  codes, or diagnostic codes updates it in the same PR. The builtins and the standard library are
-  documented by their doc comments, which a change to them updates.
+- Before pushing, run the cheap checks CI fails on: `ply fmt --check` on the packages you changed;
+  `cargo fmt --all --check` and `cargo clippy --workspace --all-targets -- -D warnings` when Rust
+  changed; `scripts/ci-lint.sh` when CI files changed; and `npx tree-sitter generate` and `npx
+  tree-sitter test` in `editors/tree-sitter-ply` when syntax changed. Push, then run anything slower
+  alongside CI.
+- Rust tests live in sibling `<crate>-tests` crates, so a `pub` change can break crates you didn't
+  touch.
+- The CLI's tests are the Ply package `tests/cli`. `.github/ci-ply.sh run cli-<module>` runs one
+  module with the permissions CI gives it.
+- CI is `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists CI's Ply test runs (each is `ply
+  test` of one package) and which job runs each.
+- CI bootstraps twice. First the latest release builds the pull request's builder; then the `ply`
+  that produced builds itself again, reusing the first builder unless the code that makes it
+  changed. Because the release compiles the builder:
+  - The compiler, `std.prelude` and the standard library modules the compiler imports (`grep -rh
+    '^import std' packages/compiler`, and what those import) cannot use a language feature added in
+    the same pull request. The rest of `packages/std` can.
+  - The builder's command-line arguments, how the runtime describes itself to the compiler, and
+    the layout of the data appended to a `ply` binary can change only in a form the release still
+    understands.
+- A file under `packages/std` that is not `.ply` is data a standard library module embeds by its
+  path (`embed("oid/names.txt")` in `oid.ply`). It ships inside every `ply` binary, so test
+  fixtures go in `tests/std`, not here.
+- `packages/` holds the Ply packages and `crates/` the cargo packages. `ply.work` says which
+  package plays which part of `ply`; CI and the scripts read it with `ply work`. CI publishes each
+  build of `main` to the rolling `main-latest` release, which `scripts/stage0.sh` downloads.
+- A `ply.lock` records a path dependency inside this checkout (proof, sim, store, testing) by name
+  and version only, so editing that package changes no lock. Adding or removing a dependency, or
+  changing a version, does: run `ply resolve` in the lock's directory, as CI does for every
+  `ply.lock`.
+- `docs/GUIDE.md` is the user manual. A change to syntax, types, CLI commands, flags or exit codes
+  updates it in the same PR. Diagnostic codes are documented in `packages/cli/explain.ply`, which
+  `ply explain` prints. Builtins and the standard library are documented by their doc comments.
 
 This file stays short. Don't add a rule in response to one incident; fix the cause instead.

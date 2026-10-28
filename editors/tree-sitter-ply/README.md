@@ -1,17 +1,17 @@
 # tree-sitter-ply
 
-A tree-sitter grammar for Ply. It is a second reading of the language beside
-`packages/compiler`, written so editors highlight Ply and so a rule the
-language gains or drops fails a check here.
+A tree-sitter grammar for Ply, so editors can highlight and indent Ply code. It
+is a second parser beside the one in `packages/compiler`, so a syntax change
+that is not made here too fails its checks.
 
 | path | holds |
 | --- | --- |
-| `grammar.js` | the grammar: the lexer's tokens and the parser's rules |
-| `src/` | what `tree-sitter generate` writes, the C parser among it, committed so a consumer builds nothing |
-| `queries/highlights.scm` | the highlight queries, in the captures every tree-sitter editor reads |
-| `queries/indents.scm` | the indent queries, laid out as `ply fmt` lays a program out |
-| `test/corpus/` | the cases `tree-sitter test` holds the tree to |
-| `scripts/parse-modules.sh` | every Ply module in this tree, parsed with the grammar and refused on a syntax error |
+| `grammar.js` | the grammar: tokens and parsing rules |
+| `src/` | the output of `tree-sitter generate`, including the C parser; committed so users need no build step |
+| `queries/highlights.scm` | highlighting queries, using the standard capture names |
+| `queries/indents.scm` | indentation queries that match `ply fmt`'s layout |
+| `test/corpus/` | test cases for `tree-sitter test` |
+| `scripts/parse-modules.sh` | parses every Ply file in the repository and fails on a syntax error |
 
 ## Working on it
 
@@ -19,11 +19,11 @@ language gains or drops fails a check here.
 npm install
 npx tree-sitter generate   # rewrites src/, which is committed
 npx tree-sitter test
-scripts/parse-modules.sh   # needs no argument; finds the tree from its own path
+scripts/parse-modules.sh
 ```
 
-`src/parser.c` is generated and committed, so a consumer needs no toolchain: a
-change to `grammar.js` that is not followed by `tree-sitter generate` fails CI.
+`src/parser.c` is generated and committed. CI fails if `grammar.js` changes
+without running `tree-sitter generate`.
 
 ## Neovim
 
@@ -36,8 +36,9 @@ mkdir -p ~/.config/nvim/queries/ply
 cp queries/highlights.scm queries/indents.scm ~/.config/nvim/queries/ply/
 ```
 
-Then map the filetype, start the parser, and turn indentation on. The ftdetect
-guards the extension, since a 3D mesh opens with a line holding `ply`:
+Then set the filetype, start the parser, and turn on indentation. The `.ply`
+extension is also used by the Polygon File Format (3D meshes), whose files start
+with a line holding `ply`, so the filetype rule skips those:
 
 ```vim
 " ~/.config/nvim/ftdetect/ply.vim
@@ -45,31 +46,26 @@ au BufReadPost,BufNewFile *.ply if getline(1) !=# 'ply' | setfiletype ply | endi
 ```
 
 ```lua
--- ~/.config/nvim/ftplugin/ply.lua; two spaces a level, as `ply fmt` writes
+-- ~/.config/nvim/ftplugin/ply.lua: two spaces per level, as `ply fmt` writes
 vim.bo.expandtab = true
 vim.bo.shiftwidth = 2
 vim.treesitter.start()
 require('nvim-treesitter.indent').attach(0)
 ```
 
-`indents.scm` is nvim-treesitter's query, so indentation there needs its indent
-module; an editor that reads `indents.scm` itself (Helix, Zed) needs neither
-this nor `vim.treesitter.start()`. A checkout of this directory on `runtimepath`
-serves the same files, since Neovim finds `queries/` under it; nvim-treesitter's
-archived `master` branch does not know `ply`, which is why the ftplugin starts it.
-
-The `.ply` extension is also the Polygon File Format's (a 3D mesh); the
-ftdetect above leaves such a file to whatever else claims it, since its first
-line is the mesh's header and not source.
+In Neovim, `indents.scm` needs nvim-treesitter's indent module. Editors that
+read `indents.scm` themselves (Helix, Zed) need neither that nor
+`vim.treesitter.start()`. Instead of copying files, you can put a checkout of
+this directory on `runtimepath`. nvim-treesitter does not know about Ply, which
+is why the ftplugin starts the parser itself.
 
 ## GitHub
 
-GitHub highlights through a TextMate grammar in Linguist, not tree-sitter, so
-this grammar does not reach it. Linguist takes a language once enough public
-`.ply` files exist (about two thousand, over two hundred repositories) and reads
-a sample set, which the 3D meshes under the same extension complicate; a
-TextMate grammar is the other half of that work.
+GitHub highlights code with TextMate grammars through Linguist, not with
+tree-sitter, so this grammar does not help there. Linguist adds a language only
+once many public repositories use it, and Ply would also need a TextMate grammar
+and a way to tell its files from 3D meshes.
 
 ## License
 
-MIT, as the repository.
+MIT, like the rest of the repository.
