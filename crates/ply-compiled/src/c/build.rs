@@ -123,7 +123,6 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
         modules: _,
         refusals: _,
         fields,
-        builtins,
         entered,
     } = exports;
     let entered = entered
@@ -160,7 +159,6 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
         .collect();
     let tables = Tables {
         fields,
-        builtins,
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         memo_costs: functions
             .iter()

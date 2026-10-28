@@ -2,7 +2,7 @@
 //! natives: written as the codec writes them, read back part by part, and crossings begun inside
 //! others leaving the outer as they found it.
 
-use crate::bare::{context, context_calling, helper};
+use crate::bare::{context, helper};
 use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
@@ -369,95 +369,6 @@ fn a_128_bit_widths_two_words_box_as_its_two_words() {
     unsafe { boxed(&mut ctx, 1, 0, width(IntTy::U64)) };
     let said = ctx.take_failure().expect("a diagnostic").message;
     assert!(said.contains("no 128-bit width"), "{said}");
-}
-
-/// `args` lowered as the list of a builtin's arguments, the builtin at `index` called over them.
-fn called_encoded(c: *mut Ctx, index: Word, args: impl FnOnce(*mut Ctx)) {
-    unsafe {
-        native::<N1>("?lower_open")(c, 0);
-        args(c);
-        helper::<N1>("rt_builtin_encoded")(c, index);
-    }
-}
-
-/// What a builder an earlier release compiled calls over its arguments' encoding: `to_int`, whose
-/// answer a lifting of an `Option<Int>` holds, and `panic`, which raises its message.
-#[test]
-fn panic_and_to_int_are_answered_over_their_arguments_encoding() {
-    let mut ctx = context_calling(&["to_int", "panic"]);
-    let c: *mut Ctx = &mut ctx;
-    unsafe {
-        called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-            native::<N1>("?out_int")(c, 0);
-            native::<N1>("?out_int")(c, -5);
-        });
-        assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 1);
-        assert_eq!(
-            native::<A2>("?in_name_is")(c, b"Some".as_ptr() as Word, 4),
-            1
-        );
-        assert_eq!(native::<A0>("?in_int")(c), -5i64 as Word);
-        native::<N0>("?lift_close")(c);
-        called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-            native::<N1>("?out_int")(c, 0);
-            native::<N3>("?out_fixed")(c, width(IntTy::U64), -1, 0);
-        });
-        assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 0);
-        assert_eq!(
-            native::<A2>("?in_name_is")(c, b"None".as_ptr() as Word, 4),
-            1
-        );
-        native::<N0>("?lift_close")(c);
-    }
-    unfailed(&mut ctx);
-    let c: *mut Ctx = &mut ctx;
-    called_encoded(c, 1, |c| unsafe {
-        native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-        text(c, "?out_str", b"stop");
-    });
-    let raised = ctx.take_failure().expect("a panic raises");
-    assert_eq!(raised.message, "panic: stop");
-}
-
-/// A builtin that raises ends the lowering of its arguments and opens nothing, so the crossing it
-/// was called inside goes on where it was.
-#[test]
-fn a_builtin_called_encoded_that_raises_opens_nothing() {
-    let mut ctx = context_calling(&["panic"]);
-    let outer = lowered(&mut ctx, false, |c| unsafe {
-        native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-        native::<N1>("?out_int")(c, 1);
-        called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            text(c, "?out_str", b"no such file");
-        });
-        native::<N1>("?out_int")(c, 2);
-    });
-    let said = ctx.take_failure().expect("the builtin raised").message;
-    assert!(said.contains("no such file"), "{said}");
-    let whole = written(|w| {
-        w.count(tag::LIST, 2);
-        w.int(1);
-        w.int(2);
-    });
-    assert_eq!(outer, whole);
-}
-
-/// A builtin is called over a lowering of its arguments and nothing else.
-#[test]
-fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_context() {
-    let mut ctx = context_calling(&["to_int"]);
-    unsafe { helper::<N1>("rt_builtin_encoded")(&mut ctx, 0) };
-    let said = ctx.take_failure().expect("a diagnostic").message;
-    assert!(said.contains("no lowering open"), "{said}");
-    let mut ctx = context_calling(&["panic"]);
-    called_encoded(&mut ctx, 1, |c| unsafe {
-        native::<N2>("?out_count")(c, tag::LIST as Word, 0);
-    });
-    let said = ctx.take_failure().expect("a diagnostic").message;
-    assert!(said.contains("builtin 1 of a pool of 1"), "{said}");
 }
 
 /// A crossing begun inside another works on a frame of its own, and the outer one goes on where it

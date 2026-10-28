@@ -1,5 +1,5 @@
-//! Arithmetic over `Float`s' bits, `Decimal`s' and 128-bit widths' words, their boxes, and the
-//! failures compiled arithmetic and matching raise.
+//! A `Float`'s remainder, the boxes of `Decimal`s and 128-bit widths, and the failures compiled
+//! arithmetic and matching raise.
 
 use super::*;
 
@@ -33,86 +33,9 @@ fn two_words(ctx: &mut Ctx, lo: i64, hi: i64) -> Word {
     o as Word
 }
 
-/// The `Decimal` two words of compiled code's `PlyDec` hold.
-pub(super) fn decimal_of(lo: i64, hi: i64) -> ply_core::Decimal {
-    let mut bytes = [0u8; 16];
-    bytes[..8].copy_from_slice(&lo.to_le_bytes());
-    bytes[8..].copy_from_slice(&hi.to_le_bytes());
-    ply_core::Decimal::deserialize(bytes)
-}
-
-/// Writes `d`'s two words at `out`, compiled code's `PlyDec`.
-pub(super) unsafe fn write_decimal(out: i64, d: ply_core::Decimal) {
-    let bytes = d.serialize();
-    let words = out as *mut i64;
-    unsafe {
-        words.write(i64::from_le_bytes(
-            bytes[..8].try_into().expect("eight bytes"),
-        ));
-        words.add(1).write(i64::from_le_bytes(
-            bytes[8..].try_into().expect("eight bytes"),
-        ));
-    }
-}
-
 /// The box of the `Decimal` whose two words are `lo` and `hi`.
 pub unsafe extern "C" fn rt_box_decimal(ctx: *mut Ctx, lo: i64, hi: i64) -> i64 {
     two_words(unsafe { &mut *ctx }, lo, hi)
-}
-
-/// An arithmetic operator over two `Decimal`s' words, as an earlier release's emitter codes it
-/// (`0` add, `1` subtract, `2` multiply, `4` remainder): its answer's two words written at `out`.
-pub unsafe extern "C" fn rt_decimal_binary(
-    ctx: *mut Ctx,
-    op: i64,
-    a_lo: i64,
-    a_hi: i64,
-    b_lo: i64,
-    b_hi: i64,
-    out: i64,
-) {
-    let ctx = unsafe { &mut *ctx };
-    let (a, b) = (decimal_of(a_lo, a_hi), decimal_of(b_lo, b_hi));
-    let (answer, what) = match op {
-        0 => (a.checked_add(b), "addition"),
-        1 => (a.checked_sub(b), "subtraction"),
-        2 => (a.checked_mul(b), "multiplication"),
-        4 if b.is_zero() => {
-            raise_error(ctx, error("remainder by zero"));
-            return;
-        }
-        4 => (a.checked_rem(b), "remainder"),
-        _ => {
-            ctx.fail(error("an operator this runtime has no code for"));
-            return;
-        }
-    };
-    match answer {
-        Some(d) => unsafe { write_decimal(out, d) },
-        None => {
-            ctx.fail(
-                error(format!("`Decimal` overflow in {what}"))
-                    .note("`Decimal` is exact and bounded; it will not round to make room"),
-            );
-        }
-    }
-}
-
-/// How two `Decimal`s' words order as `Decimal`s: -1, 0 or 1, equal at any scale that holds the
-/// same number.
-pub unsafe extern "C" fn rt_decimal_compare(
-    _ctx: *mut Ctx,
-    a_lo: i64,
-    a_hi: i64,
-    b_lo: i64,
-    b_hi: i64,
-) -> i64 {
-    decimal_of(a_lo, a_hi).cmp(&decimal_of(b_lo, b_hi)) as i64
-}
-
-/// A `Decimal`'s negation, its two words written at `out`.
-pub unsafe extern "C" fn rt_decimal_negate(_ctx: *mut Ctx, lo: i64, hi: i64, out: i64) {
-    unsafe { write_decimal(out, -decimal_of(lo, hi)) }
 }
 
 /// A `match` whose arms did not cover the value.

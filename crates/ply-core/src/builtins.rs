@@ -1,5 +1,4 @@
-//! The builtins a builder an earlier release compiled still calls through the runtime, by name, and
-//! the failures the runtime raises for the builtins compiled code writes.
+//! The failures the runtime raises for the builtins compiled code writes.
 
 use crate::codec::Writer;
 use crate::{Diagnostic, Span, codes, slot};
@@ -9,62 +8,6 @@ const MAX_RANGE_LEN: i64 = 10_000_000;
 
 /// An array this long is a runaway length, not an intent: half a gigabyte of words.
 pub const MAX_ARRAY_LEN: i64 = 1 << 26;
-
-/// Every builtin, once: its name in the prelude, and the type of the function compiled code calls it
-/// through, off which `ply_compiled::native` reads what the runtime reports of it. That function
-/// takes a word for each parameter, witnesses first, and answers a `Raising` where a failure of it is
-/// a raise of `abort.raise`, which the prelude's scheme for it carries in its row and a `handle`
-/// answers, or a `Word` where a failure ends the run.
-macro_rules! builtins {
-    (@count) => { 0 };
-    (@count $first:ident $($rest:ident)*) => { 1 + builtins!(@count $($rest)*) };
-    ($d:tt $( $(#[$doc:meta])* $variant:ident = $name:literal ($($param:ident),*) -> $answer:ident; )*) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        pub enum Builtin {
-            $( $(#[$doc])* $variant, )*
-        }
-
-        impl Builtin {
-            pub fn from_name(name: &str) -> Option<Builtin> {
-                match name {
-                    $( $name => Some(Builtin::$variant), )*
-                    _ => None,
-                }
-            }
-
-            pub fn name(self) -> &'static str {
-                match self {
-                    $( Builtin::$variant => $name, )*
-                }
-            }
-
-            /// The parameters of the function compiled code calls it through.
-            pub fn words(self) -> usize {
-                match self {
-                    $( Builtin::$variant => builtins!(@count $($param)*), )*
-                }
-            }
-
-            pub fn all() -> &'static [Builtin] {
-                &[ $( Builtin::$variant, )* ]
-            }
-        }
-
-        /// Hands `$m` every builtin as `Variant "name" (parameters) Answer;`: what is made one per
-        /// builtin is made from this table.
-        #[macro_export]
-        macro_rules! each_builtin {
-            ($d m:ident) => {
-                $d m! { $( $variant $name ($($param),*) $answer; )* }
-            };
-        }
-    };
-}
-
-builtins! { $
-    Panic = "panic" (message) -> Raising;
-    ToInt = "to_int" (witness, x) -> Word;
-}
 
 pub fn start_outside(from: i64, len: usize, span: Span, what: &str) -> Diagnostic {
     Diagnostic::error(

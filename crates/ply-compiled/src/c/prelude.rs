@@ -116,8 +116,6 @@ machine! {
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
-    "?cost_mark" => rt_cost_mark() -> I64;
-    "?cost_spent" => rt_cost_spent(I64, I64);
     "?in_carried" => rt_in_carried() -> Handed;
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
     "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
@@ -166,9 +164,6 @@ macro_rules! helpers {
 
 helpers! {
     rt_box_decimal(lo, hi) -> Word;
-    rt_decimal_binary(op, a_lo, a_hi, b_lo, b_hi, out);
-    rt_decimal_compare(a_lo, a_hi, b_lo, b_hi) -> Word;
-    rt_decimal_negate(lo, hi, out);
     rt_float_rem(a, b) -> Word;
     rt_no_fuel();
     rt_no_match();
@@ -221,9 +216,7 @@ helpers! {
     rt_unwind_hold(held) -> Word;
     rt_unwind_resume(held);
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
-    rt_builtin_encoded(index: I64);
     rt_branches(slots: *const Handed, n: I64);
-    rt_branches_past(slots: *const Handed, n: I64, reach: *const Word, count: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
     rt_never_lifted();
 }

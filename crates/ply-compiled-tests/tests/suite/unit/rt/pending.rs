@@ -2,7 +2,7 @@
 //! it leaves: handed over as its message to a clause's slot, and through the bridge's raised on as
 //! the raise it is, its diagnostic kept where nothing answers it the second time either.
 
-use crate::bare::{context_over, helper};
+use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::PlyType;
 use ply_compiled::heap::{HEADER, Word};
@@ -105,7 +105,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 
 #[test]
 fn a_refusal_raised_on_through_the_bridge_keeps_its_note() {
-    let mut ctx = context_over(&["abort", "raise"], Vec::new(), &[]);
+    let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin(1_000);
     refused(&mut ctx);
     raised_on_keeps(&mut ctx);
@@ -114,7 +114,7 @@ fn a_refusal_raised_on_through_the_bridge_keeps_its_note() {
 /// A failed `assert` inside a lambda of a test is this: unanswered, it is `E0501` with its message.
 #[test]
 fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
-    let mut ctx = context_over(&["abort", "raise"], Vec::new(), &[]);
+    let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin(1_000);
     let said = "the sides differ";
     // `assert` with a message, numbered as `REFUSED` numbers it.
@@ -137,7 +137,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
 /// A clause's slot is handed the message, and the entry fails no longer: the clause answers it.
 #[test]
 fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
-    let mut ctx = context_over(&["abort", "raise"], Vec::new(), &[]);
+    let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin(1_000);
     refused(&mut ctx);
     let message = unsafe { helper::<Pending>("rt_pending_raised")(&mut ctx, &STRING_T, 0) };

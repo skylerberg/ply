@@ -83,22 +83,12 @@ pub struct Slot {
     pub env: Word,
 }
 
-/// The bridge: what code that holds no word for an effect performs it through, answered as
-/// [`HOSTED`] answers.
+/// The bridge: what code that holds no word for an effect performs it through: an operation is
+/// unhandled, and a raise is left unanswered.
 pub static BRIDGE: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
         entry: bridged,
-        env: 0,
-    },
-};
-
-/// What a release's entry hands its root for an effect it took a Rust binding to serve: an
-/// operation is unhandled, since no binding serves one, and a raise is left unanswered.
-pub static HOSTED: RuntimeObject = RuntimeObject {
-    flags: 1,
-    slot: Slot {
-        entry: hosted,
         env: 0,
     },
 };
@@ -129,17 +119,6 @@ unsafe extern "C" fn bridged(
     unsafe { at_entry(ctx, op, mode, resource, args, true) }
 }
 
-unsafe extern "C" fn hosted(
-    ctx: *mut Ctx,
-    _env: Word,
-    op: *const PlyOp,
-    mode: I64,
-    resource: I64,
-    args: *const Handed,
-) -> Handed {
-    unsafe { at_entry(ctx, op, mode, resource, args, true) }
-}
-
 unsafe extern "C" fn unserved(
     ctx: *mut Ctx,
     _env: Word,
@@ -152,15 +131,15 @@ unsafe extern "C" fn unserved(
 }
 
 /// A perform the object its entry hands answers, since nothing between answers it: a raise left
-/// unanswered, and any other operation refused, as unhandled where the object is the bridge or
-/// [`HOSTED`] and as unserved otherwise.
+/// unanswered, and any other operation refused, as unhandled where the object is the bridge and
+/// as unserved otherwise.
 unsafe fn at_entry(
     ctx: *mut Ctx,
     op: *const PlyOp,
     mode: I64,
     resource: I64,
     args: *const Handed,
-    hosted: bool,
+    unhandled: bool,
 ) -> Handed {
     let c = unsafe { &mut *ctx };
     let described = unsafe { &*op };
@@ -170,14 +149,14 @@ unsafe fn at_entry(
         return Handed::of(unanswered(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
-    if hosted {
+    if unhandled {
         let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
         recorded(c, &effect, &name, resource.as_ref(), mode);
     }
     let_go(ctx, args, described);
     let c = unsafe { &mut *ctx };
     let site = c.site();
-    let d = if hosted {
+    let d = if unhandled {
         ply_core::handler::err_unhandled(site, &effect, &name, resource.as_ref())
     } else {
         let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
@@ -432,16 +411,4 @@ pub unsafe extern "C" fn rt_branches(ctx: *mut Ctx, slots: *const Handed, n: I64
     let allowed = unsafe { &*ctx }.runs_branches_at_once();
     let slots = slots.cast::<Word>().cast_mut();
     unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed) }
-}
-
-/// [`rt_branches`] as the release's emitter calls it, beside what the block's site says its
-/// branches may perform, in `count` pairs at `reach`, which nothing reads.
-pub unsafe extern "C" fn rt_branches_past(
-    ctx: *mut Ctx,
-    slots: *const Handed,
-    n: I64,
-    _reach: *const Word,
-    _count: I64,
-) {
-    unsafe { rt_branches(ctx, slots, n) }
 }

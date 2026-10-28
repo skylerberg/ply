@@ -78,12 +78,10 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.fail#entered",
             0,
             &format!(
-                "{}  {}(ctx, 0);\n  {}(ctx, {}, 1);\n  {}(ctx, (Word)(intptr_t)buf, n);\n  rt_builtin_encoded_p(ctx, 0);\n  return 0;",
+                // An `assert` failing with the text it was handed, numbered as `REFUSED` numbers it.
+                "{}  {}(ctx, 21, (Word)(intptr_t)buf, n, 0, 0);\n  return 0;",
                 lifting(&string_read()),
-                native("?lower_open"),
-                native("?out_count"),
-                ply_core::codec::tag::LIST,
-                native("?out_str"),
+                native("?refused_text"),
             ),
         ),
         def("m.helper", 1, "  return p0;"),
@@ -114,7 +112,6 @@ pub fn entering(e: &mut units::Laid) {
     ]
     .map(str::to_string)
     .to_vec();
-    e.builtins = vec![ply_core::Builtin::Panic];
 }
 
 /// The unit of [`encoded_defs`], opened with no front end; none where no C compiler is found.
@@ -246,7 +243,7 @@ fn a_raise_ends_its_entry_and_no_other() {
     };
     for _ in 0..2 {
         let raised = answered(&opened, "m.fail", arguments(1, |w| w.str(b"no")), &run())
-            .expect_err("a panic raises");
+            .expect_err("a failed assertion raises");
         assert!(raised.contains("no"), "{raised}");
         assert_eq!(int_answered(&opened, "m.double", &[5], &run()), Ok(10));
     }

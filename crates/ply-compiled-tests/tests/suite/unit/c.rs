@@ -21,7 +21,7 @@ fn a_natives_signature_is_its_functions_type() {
     use ply_compiled::emitted::{Handed, PlyType};
     use ply_compiled::heap::Word;
     use ply_compiled::native::Machine::{self, Addr, Handed as Moved, I64, Type, Words};
-    use ply_compiled::native::{Native, Raising, Signature};
+    use ply_compiled::native::{Native, Raises, Signature};
     use ply_compiled::rt::Ctx;
     let of = |params: &'static [Machine], answer, raises| Signature {
         params,
@@ -37,8 +37,8 @@ fn a_natives_signature_is_its_functions_type() {
         of(&[Machine::Word, Words], Some(Machine::Word), false)
     );
     assert_eq!(
-        <unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word, Word) -> Raising as Native>::SIGNATURE,
-        of(&[Machine::Word; 6], Some(Machine::Word), true)
+        <unsafe extern "C" fn(*mut Ctx, Word, Word) -> Raises as Native>::SIGNATURE,
+        of(&[Machine::Word; 2], None, true)
     );
     type Typed = unsafe extern "C" fn(
         *mut Ctx,
@@ -51,20 +51,10 @@ fn a_natives_signature_is_its_functions_type() {
         <Typed as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
-    let to_int = ply_core::Builtin::from_name("to_int").expect("a builtin");
-    assert_eq!(
-        ply_compiled::rt::signature(to_int),
-        of(&[Machine::Word; 2], Some(Machine::Word), false)
-    );
-    let panic = ply_core::Builtin::from_name("panic").expect("a builtin");
-    assert_eq!(
-        ply_compiled::rt::signature(panic),
-        of(&[Machine::Word], Some(Machine::Word), true)
-    );
 }
 
 /// A native over machine data is bound as a builtin's helper is, under the name the compiler or a
-/// shipped module's `extern fn` gives it, which neither a builtin nor another of them has, at the
+/// shipped module's `extern fn` gives it, which no other native has, at the
 /// words and kinds its function takes.
 #[test]
 fn every_native_over_machine_data_has_a_helper_of_its_own() {
@@ -83,11 +73,6 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
         assert!(
             n.name.starts_with('?') || declared.contains(&n.name),
             "`{}` is no name the compiler or a shipped module declares",
-            n.name
-        );
-        assert!(
-            ply_core::Builtin::from_name(n.name).is_none(),
-            "`{}`",
             n.name
         );
         let name = builtin_helper_name(n.name);
@@ -122,8 +107,6 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
         "helper rt_tick 0 -",
         "native ?out_str 0 - Addr I64",
         "native ?refused 1 - I64 I64 I64 I64",
-        "native to_int 0 Word Word Word",
-        "native panic 1 Word Word",
     ] {
         assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
     }
@@ -184,21 +167,6 @@ fn a_units_table_reads_as_a_unit_writes_it() {
     assert_eq!(read.modules, 3);
     assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.entered, ["m.main"]);
-    assert_eq!(read.encode(), said);
-}
-
-/// The builder the release builds names the builtins it calls through the runtime before its
-/// fields, and reads as it was written.
-#[test]
-fn a_table_naming_builtins_reads_them_before_its_fields() {
-    let said =
-        "helpers 0\nconstants 0\nmodules 1\nrefused 0\nbuiltins 2\npanic\nto_int\nfields 1\nop\n";
-    let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
-    assert_eq!(
-        read.builtins,
-        [ply_core::Builtin::Panic, ply_core::Builtin::ToInt]
-    );
-    assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.encode(), said);
 }
 

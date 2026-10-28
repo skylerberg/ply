@@ -2,7 +2,7 @@
 //! bind by name, so a unit serves while the runtime has every helper its C calls.
 
 use super::descriptor::Descriptor;
-use super::encoding::{count, decode_pools, encode_pools, line};
+use super::encoding::{count, decode_fields, encode_fields, line};
 use super::prelude::helpers;
 use anyhow::{Result, anyhow};
 use ply_core::Symbol;
@@ -49,7 +49,6 @@ pub struct Exports {
     /// What the fixpoint dropped and why.
     pub refusals: Vec<(String, String)>,
     pub fields: Vec<Symbol>,
-    pub builtins: Vec<ply_core::Builtin>,
     /// Each root the unit is entered at through its `R#entered`, as its [`ENTERED`] lines say.
     pub entered: Vec<String>,
 }
@@ -115,7 +114,7 @@ impl Exports {
         for (function, construct) in &self.refusals {
             out.push_str(&format!("{function}\n{construct}\n"));
         }
-        out.push_str(&encode_pools(&self.builtins, &self.fields));
+        out.push_str(&encode_fields(&self.fields));
         for root in &self.entered {
             out.push_str(&format!("{ENTERED}{root}\n"));
         }
@@ -155,7 +154,7 @@ impl Exports {
             let construct = line(s, &mut at)?.to_string();
             refusals.push((function, construct));
         }
-        let t = decode_pools(s, &mut at)?;
+        let fields = decode_fields(s, &mut at)?;
         // Each root entered, a line each; a line a later unit says reads as nothing.
         let mut entered = Vec::new();
         while at < s.len() {
@@ -168,8 +167,7 @@ impl Exports {
             constants,
             modules,
             refusals,
-            fields: t.fields,
-            builtins: t.builtins,
+            fields,
             entered,
         })
     }
