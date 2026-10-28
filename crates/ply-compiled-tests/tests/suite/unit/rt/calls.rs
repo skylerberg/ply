@@ -224,7 +224,7 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
 type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
 type Left = unsafe extern "C" fn(*mut Ctx, Word);
 
-/// The program's calls and allocations, as `metered` and a budget count them.
+/// The program's calls and allocations, as a test's reading and a budget count them.
 fn spent(ctx: &Ctx) -> (i64, usize, usize) {
     (ctx.ticks, ctx.heap.allocated(), ctx.heap.allocated_bytes())
 }

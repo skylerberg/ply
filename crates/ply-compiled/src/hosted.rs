@@ -1,7 +1,7 @@
 //! The natives the real handlers of the standard library's host effects call (`host for`): each asks
 //! the machine the program runs on and answers machine data, integers, bytes or a secret, which the
-//! effect's module reads into its own types. Each refuses where a run may not reach the host,
-//! inside a `simulate` region or in a test the search re-runs, as a host operation does.
+//! effect's module reads into its own types. Each that asks the host refuses where a run may not
+//! reach it, inside a `simulate` region or in a test the search re-runs, as a host operation does.
 //!
 //! A native that would block the program's thread hands a job to the process's pools and answers a
 //! ticket, which `job_wait` reads the job's bytes by: the running task waits in a production
@@ -12,6 +12,7 @@
 mod dns;
 mod env;
 mod fs;
+pub mod meter;
 mod process;
 pub mod random;
 pub mod shipped;
@@ -134,6 +135,7 @@ pub fn natives() -> Vec<MachineNative> {
     natives.extend(dns::natives());
     natives.extend(env::natives());
     natives.extend(fs::natives());
+    natives.extend(meter::natives());
     natives.extend(process::natives());
     natives.extend(random::natives());
     natives.extend(shipped::natives());

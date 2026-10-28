@@ -41,7 +41,8 @@ pub const EFFECT_IN_SPEC: &str = "E0417";
 /// A `forall` binder type with no generator, an effectful function type, or a row variable.
 pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
 pub const OBLIGATION_REFUTED: &str = "E0419";
-/// An operation reached the host boundary with nothing bound to serve it.
+/// An operation reached the host boundary with nothing bound to serve it, or a run that is no
+/// test's read what it cost.
 pub const HOST_UNBOUND: &str = "E0424";
 /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
 pub const HOST_IN_SIMULATION: &str = "E0425";

@@ -2366,13 +2366,15 @@ and under `simulate` also `clock`'s, `random`'s and `sim`'s) cost the program no
 scheduler's own work counts no steps, objects or bytes, and no `--steps` budget limits it.
 
 ```ply
+import std.pace (spent)
+
 type Chain = | Link(Int, Chain) | End
 
 fn chain(n: Int) -> Chain = if n <= 0 { End } else { Link(n, chain(n - 1)) }
 
 test "ten more levels cost ten more calls and ten more objects" {
-  let small = metered(|| chain(10));
-  let large = metered(|| chain(20));
+  let small = spent(|| chain(10));
+  let large = spent(|| chain(20));
   assert_eq(large.steps - small.steps, 10);
   assert_eq(large.allocations - small.allocations, 10)
 }

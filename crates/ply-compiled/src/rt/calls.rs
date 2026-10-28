@@ -68,7 +68,7 @@ impl Ctx {
     }
 
     /// What this entry has cost so far, memoized answers charged as if computed again.
-    pub(super) fn cost(&self) -> Cost {
+    pub fn cost(&self) -> Cost {
         Cost {
             steps: self.ticks,
             allocations: i64::try_from(self.heap.allocated()).unwrap_or(i64::MAX),
@@ -100,8 +100,11 @@ pub(crate) struct CostMark {
     performed: usize,
 }
 
-/// Marks what this entry has cost so far, the stops nothing can resume any longer dropped first as
-/// `metered` drops them, and answers the mark, which [`rt_cost_spent`] reads back.
+// `?cost_mark` and `?cost_spent` are bound by the release's emitter, which still declares them;
+// nothing this compiler emits calls them.
+
+/// Marks what this entry has cost so far, the stops nothing can resume any longer dropped first,
+/// and answers the mark, which [`rt_cost_spent`] reads back.
 pub unsafe extern "C" fn rt_cost_mark(ctx: *mut Ctx) -> I64 {
     crate::detached::drain(ctx);
     let c = unsafe { &mut *ctx };

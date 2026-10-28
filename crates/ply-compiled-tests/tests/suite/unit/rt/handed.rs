@@ -342,7 +342,7 @@ fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
     ctx.end();
 }
 
-/// The natives a stretch of an entry's cost is read with, as `metered` reads it.
+/// The natives a stretch of an entry's cost is read with, as the release's emitter reads it.
 struct Costs {
     mark: unsafe extern "C" fn(*mut Ctx) -> Word,
     spent: unsafe extern "C" fn(*mut Ctx, Word, Word),
@@ -368,7 +368,7 @@ fn costs() -> Costs {
     }
 }
 
-/// What a stretch of an entry cost, read back as `metered` reads it: a record of the calls it made,
+/// What a stretch of an entry cost, read back as a lifting: a record of the calls it made,
 /// its allocations and their bytes, the objects live since, and each atom performed with how many
 /// times, in the atoms' order.
 #[test]

@@ -66,7 +66,7 @@ pub struct Ctx {
     /// The fuel this entry began with: how deeply its calls may nest.
     pub(super) depth_bound: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
-    /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
+    /// read it, so a test reads the same cost whether a constant was memoized or not. Not budgeted.
     pub charged: Cost,
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
@@ -139,6 +139,8 @@ pub struct Ctx {
     pub(crate) pending_words: Vec<Word>,
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
+    /// Whether the entry is a test's, whose program may read what it has cost.
+    pub tested: bool,
     /// How many holds this entry has made, which numbers the next.
     pub(super) holds_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
@@ -289,6 +291,7 @@ impl Ctx {
             pending: None,
             pending_words: Vec::new(),
             traced: false,
+            tested: false,
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             release_later: Vec::new(),
@@ -338,6 +341,7 @@ impl Ctx {
         b.sim_steps = self.sim_steps;
         // A branch runs in the task its block is in.
         b.task = self.task;
+        b.tested = self.tested;
         // What a branch performed is this entry's, read wherever this entry's is.
         b.traced = self.recording != 0;
         b.rearm_recording();
@@ -530,6 +534,13 @@ impl Ctx {
         swap_running(self.outer_running);
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.outer_running = std::ptr::null_mut();
+    }
+
+    /// How many of the program's objects are still live once what the entry's bodies hold is given
+    /// back: each one a value nothing let go of.
+    pub fn left_live(&mut self) -> usize {
+        crate::detached::teardown(self);
+        self.live()
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.

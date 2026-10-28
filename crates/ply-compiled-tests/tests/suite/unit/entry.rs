@@ -293,6 +293,48 @@ fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
     assert_eq!(answer, Some(Value::Int(100_000)));
 }
 
+/// A test's entry that answered says how many of its objects nothing let go of, and any other entry
+/// counts none.
+#[test]
+fn a_tests_entry_counts_the_objects_it_left_live() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let defs = vec![
+        def("m.kept", 1, "  rt_alloc_bytes_p(ctx, 16);\n  return p0;"),
+        def("m.kept#entered", 0, &int_entry("m.kept")),
+        def(
+            "m.freed",
+            1,
+            "  Word b = rt_alloc_bytes_p(ctx, 16);\n  rt_free_p(ctx, b, 16);\n  return p0;",
+        ),
+        def("m.freed#entered", 0, &int_entry("m.freed")),
+    ];
+    let mut exports = units::exports_of(&defs);
+    exports.entered = ["m.kept", "m.freed"].map(str::to_string).to_vec();
+    let Some(lib) = units::library(dir.path(), &units::text(&defs, &exports)) else {
+        return;
+    };
+    let opened = Opened::open(&lib).expect("the unit opens");
+    let live = |root: &str, tested: bool| {
+        let run = Run { tested, ..run() };
+        let o = entry::enter(
+            &opened,
+            root,
+            arguments(vec![Value::Int(1)]),
+            &run,
+            None,
+            None,
+        );
+        assert!(matches!(o.ended, Ended::Answered(_)), "`{root}` answered");
+        o.usage.live
+    };
+    assert_eq!([live("m.kept", true), live("m.freed", true)], [1, 0]);
+    assert_eq!(
+        live("m.kept", false),
+        0,
+        "an entry that is no test's counts nothing"
+    );
+}
+
 /// A task in an entry's answer is refused at the boundary as a continuation is: the region it is a
 /// key into ended before the entry did.
 #[test]

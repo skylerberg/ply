@@ -145,8 +145,9 @@ pub struct Run {
     pub re_executed: bool,
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
-    /// Whether its usage counts every perform, those its own handlers answer included.
-    pub counted: bool,
+    /// Whether the entry is a test's: its usage counts every perform, those its own handlers answer
+    /// included, and the objects it leaves live, and its program may read what it costs.
+    pub tested: bool,
 }
 
 impl Run {
@@ -159,7 +160,7 @@ impl Run {
             seed: None,
             re_executed: false,
             measure: false,
-            counted: false,
+            tested: false,
         }
     }
 }
@@ -193,6 +194,9 @@ pub struct Usage {
     pub held: Held,
     pub updates: u64,
     pub updates_in_place: u64,
+    /// Objects of the program's still live once a test's entry answered and gave back what its
+    /// bodies held: each one nothing let go of. 0 for any other entry.
+    pub live: u64,
 }
 
 /// What a run still held when an entry's root body returned, before the run's region drained its
@@ -275,7 +279,8 @@ pub fn enter(
         ctx.set_host(bound.binding(), Some(runtime), Some(factory));
     }
     ctx.re_executed = run.re_executed;
-    ctx.trace_performs(run.counted);
+    ctx.tested = run.tested;
+    ctx.trace_performs(run.tested);
     let (seed, steps) = run
         .seed
         .clone()
@@ -308,6 +313,7 @@ pub fn enter(
                     updates_in_place: counters
                         .updates_in_place
                         .saturating_sub(counted.updates_in_place),
+                    live: last.live,
                 },
                 warnings: std::mem::take(&mut ctx.teardown),
                 interleaving: last.interleaving,
@@ -348,6 +354,7 @@ struct Last {
     performs: u64,
     held: Held,
     interleaving: Option<Vec<u8>>,
+    live: u64,
 }
 
 /// An entry a Rust unwind left: its host runtime and the pool are told it is over, and its context
@@ -387,12 +394,15 @@ fn entered(
     // SAFETY: the unit owns the entry's pages and outlives the call, `ctx` is this entry's alone,
     // and an `R#entered` takes no words.
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
-    let last = returned(ctx);
+    let mut last = returned(ctx);
     let ended = if ctx.failed != 0 {
         failure(ctx)
     } else {
         answered(ctx, root)
     };
+    if run.tested && matches!(ended, Ended::Answered(_)) {
+        last.live = ctx.left_live() as u64;
+    }
     ctx.end();
     std::mem::forget(giving_back);
     (ended, last)
@@ -416,6 +426,7 @@ fn returned(ctx: &mut Ctx) -> Last {
         performs: ctx.performed.len() as u64,
         held,
         interleaving: ctx.interleaving.take(),
+        live: 0,
     }
 }
 
@@ -758,7 +769,7 @@ struct Asked {
 }
 
 /// `run := int binding, bool hosted, int steps, int timeout_ms, int depth, option(seed),
-/// bool re_executed, bool observe, bool measure, bool counted`.
+/// bool re_executed, bool observe, bool measure, bool tested`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
@@ -769,7 +780,7 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let re_executed = r.bool()?;
     let observe = r.bool()?;
     let measure = r.bool()?;
-    let counted = r.bool()?;
+    let tested = r.bool()?;
     Ok(Asked {
         binding,
         hosted,
@@ -781,7 +792,7 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
             seed,
             re_executed,
             measure,
-            counted,
+            tested,
         },
     })
 }
@@ -803,7 +814,8 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),
 /// option(bytes) trace`; `ended := tag 0 bytes answer | 1 failure | 2 string panic | 3 no root |
 /// 4 string why unanswerable`; `usage := int nanos, bool host, int steps, int performs, int
-/// bridges, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place`.
+/// bridges, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place,
+/// int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
         Ended::Answered(bytes) => {
@@ -836,7 +848,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         .count(u.held.task_stacks)
         .count(u.held.frame_tables)
         .count(u.updates)
-        .count(u.updates_in_place);
+        .count(u.updates_in_place)
+        .count(u.live);
     w.list(outcome.warnings.iter(), |w, d| {
         write_failure(w, d, Some(opened))
     });
