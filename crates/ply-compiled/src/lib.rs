@@ -23,5 +23,3 @@ pub mod secret;
 pub mod stack;
 pub mod tasks;
 mod vm;
-
-pub use c::Refused;
