@@ -11,6 +11,7 @@ time will be dominated by:
 * Slow build times
 * Large and slow test suites
 * Finding and fixing bugs
+* Sorting out conflicts with other agents
 * Dealing with security issues
 
 Ply is meant to be the perfect language to build performant and reliable
@@ -42,9 +43,9 @@ safely and only rerun tests that actually might be impacted by a change.
 ### Signature-based development
 
 The signature of each function and the shape of each type says everything
-important about the code. Putting the types, the effects, and proved assertions
-about the costs of a function, we can prevent most bugs that would otherwise
-arise in code.
+important about the code. By putting the types, the effects, and proved
+assertions about the costs of a function in the signature, we can prevent most
+bugs that would otherwise arise in code.
 
 Putting everything in the function signatures makes it easier to design and
 review code for humans and LLMs. For design, writing the types and function
@@ -60,8 +61,9 @@ costs into the signature allows us to be confident the code is not
 algorithmically incorrect (e.g., we can know that the function never allocates
 or that it has O(n * log n) time complexity).
 
-We can also be confident that the code only effects what we think it should
+We can also be confident that the code only affects what we think it should
 (e.g., the code cannot unexpectedly access the filesystem).
+
 
 ### Performant enough for the job
 
@@ -125,3 +127,25 @@ include a comprehensive standard library and a large set of blessed packages to
 limit how many targets there are in the supply chain that can be compromised.
 Furthermore, ply should limit what dependencies can do by leveraging its effects
 as a capabilities system.
+
+### LLM-friendly
+
+This language is about making LLM-based software development more effective.
+Syntax should be easily predictable for LLMs, tools should enable automatic
+fixes of issues in a well structured way. Language constructs should push LLMs
+in the direction of making performant, bug-free, maintainable, extendable code.
+
+By tracing what each bit of code depends on, we can know exactly what changes
+might be impacted by a change. This should allow agents to review all of the
+code that depends on the code they are changing. This also allows multiple
+agents to work in the same codebase at the same time with less chance of
+colliding because they can find exactly where and how their work overlapped.
+
+#### How we do it
+
+Ply must include tools that help agents and reviewers assess what each change
+impacts. Ply must include tools to change code in structured ways (e.g., rename
+a definition).
+
+Ply should include tools that help with context management by showing them the
+signatures of each function that they impacted with their change.
