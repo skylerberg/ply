@@ -3,22 +3,15 @@
 //! front end. `--explain` is how a test sees which it was; everything else a run says is the same
 //! either way.
 
-import harness (scratch, Ran, Server, Source, project, program, write, read, working, on_disk,
-                spawned, serving, ended, finished, said, stdout, stderr, json_of, at, path, str,
-                int, truth, shown, Here, Reached, Shipped, assert_ok, dep, manifest)
+import harness (Spawned, Ran, Server, project, program, write, read, spawned, serving, ended,
+                finished, said, stdout, stderr, json_of, at, path, str, truth, shown, Here,
+                assert_ok, dep, manifest)
 import std.fs (fs)
 import std.json (Json, Null, Array, Str)
 import std.string
-import std.time (time)
 import std.list
 
-/// A comment no other run's program carries, so a key a spawned `ply` files is this test's own: a
-/// key that another run filed would be taken, and a first run here would not be one.
-fn unique(text: String) -> String / {time.elapsed_us, time.now_ms} =
-  text ++ "// " ++ time.now_ms().to_string() ++ "-" ++ time.elapsed_us().to_string() ++ "\n"
-
-fn run(args: List<String>) -> Ran / {Reached, Shipped, abort.raise, diverges} =
-  on_disk(["run"].concat(args))
+fn run(args: List<String>) -> Ran / {Spawned, abort.raise} = spawned(["run"].concat(args))
 
 /// Whether the run's load took an answer an earlier run filed, as `--explain` says.
 fn reused(r: Ran) -> Bool / {abort.raise} =
@@ -37,100 +30,92 @@ fn reused(r: Ran) -> Bool / {abort.raise} =
 /// disclosed.
 fn value(r: Ran) -> String = match r.out.at(r.out.len() - 1) { Some(l) -> l.trim(), None -> "" }
 
-test "a second run of an unchanged package takes the answer the first filed" {
-  scratch(|| {
-    program("fn main() -> Int = 42\n");
-    let first = run(["--explain"]);
-    assert_ok(first);
-    assert(!reused(first), Some("a first run has nothing to reuse"));
-    let second = run(["--explain"]);
-    assert_ok(second);
-    assert(reused(second), Some(stderr(second)));
-    assert_eq(value(first), "42");
-    assert_eq(value(second), "42")
-  })
+test/nondet "a second run of an unchanged package takes the answer the first filed" {
+  program("fn main() -> Int = 42\n");
+  let first = run(["--explain"]);
+  assert_ok(first);
+  assert(!reused(first), Some("a first run has nothing to reuse"));
+  let second = run(["--explain"]);
+  assert_ok(second);
+  assert(reused(second), Some(stderr(second)));
+  assert_eq(value(first), "42");
+  assert_eq(value(second), "42")
 }
 
 // Everything a run says without `--explain`, compared whole: the reused answer is placed over this
 // run's own files, so nothing it reports can tell the two apart.
-test "a reused load reports exactly what a built one reported" {
-  scratch(|| {
-    program("fn main() -> Int = 42\n");
-    let built = run([]);
-    let again = run([]);
-    assert(reused(run(["--explain"])), None);
-    assert_eq(stdout(built), stdout(again));
-    assert_eq(stderr(built), stderr(again));
-    assert_eq(built.code, again.code);
-    let document = json_of(run(["--json"]));
-    assert(
-      at(document, "files") == Array([Str("m.ply"), Str("<std>/prelude.ply")]),
-      Some(shown(document)),
-    );
-    assert(str(at(document, "value")) == "42", Some(shown(document)));
-    assert(at(document, "front_end") == Null, Some(shown(document)))
-  })
+test/nondet "a reused load reports exactly what a built one reported" {
+  program("fn main() -> Int = 42\n");
+  let built = run([]);
+  let again = run([]);
+  assert(reused(run(["--explain"])), None);
+  assert_eq(stdout(built), stdout(again));
+  assert_eq(stderr(built), stderr(again));
+  assert_eq(built.code, again.code);
+  let document = json_of(run(["--json"]));
+  assert(
+    at(document, "files") == Array([Str("m.ply"), Str("<std>/prelude.ply")]),
+    Some(shown(document)),
+  );
+  assert(str(at(document, "value")) == "42", Some(shown(document)));
+  assert(at(document, "front_end") == Null, Some(shown(document)))
 }
 
 // A raise is reported where it happened in the source a reader has open, and the reused answer's
 // spans are into this run's own files, so they read the same.
-test "a raise on a reused load is placed where a built one placed it" {
-  scratch(|| {
-    program(
-      "fn boom() -> Int / {abort.raise} = panic(\"boom\")\n\nfn main() -> Int / {abort.raise} = boom() + 1\n",
-    );
-    let built = run([]);
-    let again = run(["--explain"]);
-    assert(reused(again), None);
-    let after = run([]);
-    assert(built.code == 1, Some(stderr(built)));
-    assert_eq(after.code, 1);
-    assert(stderr(built).contains("raised at m.ply:1:"), Some(stderr(built)));
-    assert_eq(stderr(built), stderr(after));
-    assert_eq(stdout(built), stdout(after))
-  })
+test/nondet "a raise on a reused load is placed where a built one placed it" {
+  program(
+    "fn boom() -> Int / {abort.raise} = panic(\"boom\")\n\nfn main() -> Int / {abort.raise} = boom() + 1\n",
+  );
+  let built = run([]);
+  let again = run(["--explain"]);
+  assert(reused(again), None);
+  let after = run([]);
+  assert(built.code == 1, Some(stderr(built)));
+  assert_eq(after.code, 1);
+  assert(stderr(built).contains("raised at m.ply:1:"), Some(stderr(built)));
+  assert_eq(stderr(built), stderr(after));
+  assert_eq(stdout(built), stdout(after))
 }
 
 fn appended(p: String, text: String) -> Unit / {Here, abort.raise} =
   match read(p) { Some(body) -> write(p, body ++ text), None -> panic("`" ++ p ++ "` reads") }
 
 // app -> lib -> base, each a package of its own beside the others.
-test "an edit to a module or a dependency runs the front end again, and one that moves no answer does not" {
-  scratch(|| {
-    project([
-      { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
-      { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
-      { path: "lib/ply.pkg", text: manifest("lib", dep("base", "../base")) },
-      {
-        path: "lib/answer.ply",
-        text: "import base.deep\npub fn answer() -> Int = deep::deep() + 35\n",
-      },
-      { path: "base/ply.pkg", text: manifest("base", "") },
-      { path: "base/deep.ply", text: "pub fn deep() -> Int = 7\n" },
-    ]);
-    let app = |expect_reused: Bool, value_is: String| {
-      let out = run(["--explain", "app"]);
-      assert_ok(out);
-      assert(reused(out) == expect_reused, Some(stderr(out)));
-      assert_eq(value(out), value_is)
-    };
-    app(false, "42");
-    app(true, "42");
-    write("base/deep.ply", "pub fn deep() -> Int = 8\n");
-    app(false, "43");
-    app(true, "43");
-    appended("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
-    app(false, "43");
-    app(true, "43");
-    // A comment in a manifest moves no judgment of the packages, so no answer the load asked.
-    appended("lib/ply.pkg", "// edited\n");
-    app(true, "43");
-    appended("app/ply.pkg", "// edited\n");
-    app(true, "43");
-    write("app/main.ply", "import lib.answer\nfn main() -> Int = answer::answer() * 2\n");
-    app(false, "86");
-    app(true, "86")
-  })
+test/nondet "an edit to a module or a dependency runs the front end again, and one that moves no answer does not" {
+  project([
+    { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+    { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
+    { path: "lib/ply.pkg", text: manifest("lib", dep("base", "../base")) },
+    {
+      path: "lib/answer.ply",
+      text: "import base.deep\npub fn answer() -> Int = deep::deep() + 35\n",
+    },
+    { path: "base/ply.pkg", text: manifest("base", "") },
+    { path: "base/deep.ply", text: "pub fn deep() -> Int = 7\n" },
+  ]);
+  let app = |expect_reused: Bool, value_is: String| {
+    let out = run(["--explain", "app"]);
+    assert_ok(out);
+    assert(reused(out) == expect_reused, Some(stderr(out)));
+    assert_eq(value(out), value_is)
+  };
+  app(false, "42");
+  app(true, "42");
+  write("base/deep.ply", "pub fn deep() -> Int = 8\n");
+  app(false, "43");
+  app(true, "43");
+  appended("lib/answer.ply", "\npub fn unused() -> Int = 0\n");
+  app(false, "43");
+  app(true, "43");
+  // A comment in a manifest moves no judgment of the packages, so no answer the load asked.
+  appended("lib/ply.pkg", "// edited\n");
+  app(true, "43");
+  appended("app/ply.pkg", "// edited\n");
+  app(true, "43");
+  write("app/main.ply", "import lib.answer\nfn main() -> Int = answer::answer() * 2\n");
+  app(false, "86");
+  app(true, "86")
 }
 
 fn schemas() -> String =
@@ -186,22 +171,20 @@ test/nondet "a reused load is granted and bound anew" {
   assert_eq(stdout(hit), stdout(miss))
 }
 
-test "a single file is keyed and reused as a package is" {
-  scratch(|| {
-    program("fn main() -> Int = 42\n");
-    let first = run(["--explain", "m.ply"]);
-    assert_ok(first);
-    assert(!reused(first), None);
-    let second = run(["--explain", "m.ply"]);
-    assert_ok(second);
-    assert(reused(second), None);
-    assert_eq(value(second), "42")
-  })
+test/nondet "a single file is keyed and reused as a package is" {
+  program("fn main() -> Int = 42\n");
+  let first = run(["--explain", "m.ply"]);
+  assert_ok(first);
+  assert(!reused(first), None);
+  let second = run(["--explain", "m.ply"]);
+  assert_ok(second);
+  assert(reused(second), None);
+  assert_eq(value(second), "42")
 }
 
 // Two processes, so each files what it built while the other may be reading.
 test/nondet "two runs of one package at once both run it" {
-  program(unique("fn main() -> Int = 42\n"));
+  program("fn main() -> Int = 42\n");
   let one = serving(["run"], [], 0);
   let two = serving(["run"], [], 0);
   [one, two].fold((), |u: Unit, server: Server| {
@@ -214,36 +197,34 @@ test/nondet "two runs of one package at once both run it" {
   assert(reused(after), Some(stderr(after)))
 }
 
-test "a kept answer that does not read is built again and written over" {
-  scratch(|| {
-    program("fn main() -> Int = 42\n");
-    let explained = || json_of(run(["--json", "--explain"]));
-    let first = explained();
-    assert(!truth(path(first, ["front_end", "reused"])), Some(shown(first)));
-    let key = str(path(first, ["front_end", "key"]));
-    // Every segment of the memo store cut to its first `to` bytes, and how many there were.
-    let cut = |to: Int|
-      List::fold(
-        match fs.list_dir[cwd](".ply-cache/memo") { Some(names) -> names, None -> [] },
-        0,
-        |n: Int, name: String|
-          if !name.starts_with("seg-") { n } else {
-            let entry = ".ply-cache/memo/" ++ name;
-            let whole = match fs.read_file[cwd](entry) { Some(b) -> b, None -> b"" };
-            if !fs.write_file[cwd](entry, whole.slice(0, min(to, whole.len()))) {
-              panic("a segment is torn")
-            };
-            n + 1
-          },
-      );
-    if cut(9) == 0 { panic("the run kept its answer in no segment") };
-    let torn = explained();
-    assert(!truth(path(torn, ["front_end", "reused"])), Some(shown(torn)));
-    assert(str(at(torn, "value")) == "42", Some(shown(torn)));
-    let after = explained();
-    assert(truth(path(after, ["front_end", "reused"])), Some(shown(after)));
-    assert_eq(str(path(after, ["front_end", "key"])), key);
-    cut(0);
-    assert(!truth(path(explained(), ["front_end", "reused"])), None)
-  })
+test/nondet "a kept answer that does not read is built again and written over" {
+  program("fn main() -> Int = 42\n");
+  let explained = || json_of(run(["--json", "--explain"]));
+  let first = explained();
+  assert(!truth(path(first, ["front_end", "reused"])), Some(shown(first)));
+  let key = str(path(first, ["front_end", "key"]));
+  // Every segment of the memo store cut to its first `to` bytes, and how many there were.
+  let cut = |to: Int|
+    List::fold(
+      match fs.list_dir[cwd](".ply-cache/memo") { Some(names) -> names, None -> [] },
+      0,
+      |n: Int, name: String|
+        if !name.starts_with("seg-") { n } else {
+          let entry = ".ply-cache/memo/" ++ name;
+          let whole = match fs.read_file[cwd](entry) { Some(b) -> b, None -> b"" };
+          if !fs.write_file[cwd](entry, whole.slice(0, min(to, whole.len()))) {
+            panic("a segment is torn")
+          };
+          n + 1
+        },
+    );
+  if cut(9) == 0 { panic("the run kept its answer in no segment") };
+  let torn = explained();
+  assert(!truth(path(torn, ["front_end", "reused"])), Some(shown(torn)));
+  assert(str(at(torn, "value")) == "42", Some(shown(torn)));
+  let after = explained();
+  assert(truth(path(after, ["front_end", "reused"])), Some(shown(after)));
+  assert_eq(str(path(after, ["front_end", "key"])), key);
+  cut(0);
+  assert(!truth(path(explained(), ["front_end", "reused"])), None)
 }

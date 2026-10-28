@@ -3,11 +3,8 @@
 //! value in place of the body. One that cannot be evaluated is refused at its definition by every
 //! command that would otherwise run it.
 
-import harness (Ran, Source, in_memory, kept_in_memory, tree, scratch, project, on_disk, json_of,
-                at, nth, items, str, int, codes, diagnostic, stdout, said, assert_ok, file_of,
-                manifest, dep, Hermetic, Shipped)
-import std.fs
-import std.fs (MemFs)
+import harness (Ran, Source, project, write, read, spawned, json_of, at, nth, items, str, int,
+                codes, diagnostic, stdout, said, assert_ok, manifest, dep, Here)
 import std.json (Json)
 import std.string
 
@@ -60,24 +57,24 @@ fn numbers(text: String) -> Source = { path: "numbers.txt", text: text }
 
 fn program(text: String) -> List<Source> = [squares(), holding(), numbers(text)]
 
-fn written(t: MemFs, source: Source) -> MemFs / {abort.raise} =
-  fs::mem_write(t, "w/" ++ source.path, Bytes::of_string(source.text)).fs
+fn put(source: Source) -> Unit / {Here, abort.raise} = write(source.path, source.text)
 
 fn passed(ran: Ran) -> Int / {abort.raise} = int(at(at(json_of(ran), "summary"), "passed"))
 
-test "a `const fn` is evaluated by the build, and a run reads its value at no cost" {
-  let files = program("1\n2\n3\n");
-  assert_ok(in_memory(tree(files), ["check"]));
-  let ran = in_memory(tree(files), ["run"]);
+test/nondet "a `const fn` is evaluated by the build, and a run reads its value at no cost" {
+  project(program("1\n2\n3\n"));
+  assert_ok(spawned(["check"]));
+  let ran = spawned(["run"]);
   assert_ok(ran);
   assert(stdout(ran).contains("14"), Some(said(ran)));
-  let tested = in_memory(tree(files), ["test", "--json", "--no-cache"]);
+  let tested = spawned(["test", "--json", "--no-cache"]);
   assert_ok(tested);
   assert_eq(passed(tested), 2)
 }
 
-test "a `const fn` performs nothing where it is called, whatever its body could raise" {
-  let types = stdout(in_memory(tree(program("1\n")), ["check", "--types"]));
+test/nondet "a `const fn` performs nothing where it is called, whatever its body could raise" {
+  project(program("1\n"));
+  let types = stdout(spawned(["check", "--types"]));
   match types.split_once("   m m.ply") {
     None -> panic("no heading for `m` in:\n" ++ types),
     // No row follows `table`'s type, where one follows `computed`'s.
@@ -91,19 +88,22 @@ test "a `const fn` performs nothing where it is called, whatever its body could 
   }
 }
 
-test "a value is evaluated again when its body, what it reaches or a file it embeds moves" {
-  let first = kept_in_memory(tree(program("1\n2\n3\n")), ["run"], [], None);
-  assert(stdout(first.ran).contains("14"), Some(said(first.ran)));
+test/nondet "a value is evaluated again when its body, what it reaches or a file it embeds moves" {
+  project(program("1\n2\n3\n"));
+  let first = spawned(["run"]);
+  assert(stdout(first).contains("14"), Some(said(first)));
   // The file it embeds.
-  let longer = kept_in_memory(written(first.tree, numbers("1\n2\n3\n4\n")), ["run"], [], None);
-  assert(stdout(longer.ran).contains("30"), Some(said(longer.ran)));
+  put(numbers("1\n2\n3\n4\n"));
+  let longer = spawned(["run"]);
+  assert(stdout(longer).contains("30"), Some(said(longer)));
   // What it reaches, in another module.
   let cubed = {
     path: "squares.ply",
     text: squares().text.replace("Some(n) -> n * n", "Some(n) -> n * n * n"),
   };
-  let reached = kept_in_memory(written(longer.tree, cubed), ["run"], [], None);
-  assert(stdout(reached.ran).contains("100"), Some(said(reached.ran)));
+  put(cubed);
+  let reached = spawned(["run"]);
+  assert(stdout(reached).contains("100"), Some(said(reached)));
   // Its own body.
   let doubled = {
     path: "m.ply",
@@ -112,10 +112,13 @@ test "a value is evaluated again when its body, what it reaches or a file it emb
       "const fn table() -> Array<Int> = parsed(embed(\"numbers.txt\").concat(b\"5\\n\"))",
     ),
   };
-  let own = kept_in_memory(written(reached.tree, doubled), ["run"], [], None);
-  assert(stdout(own.ran).contains("225"), Some(said(own.ran)));
+  put(doubled);
+  let own = spawned(["run"]);
+  assert(stdout(own).contains("225"), Some(said(own)));
   // Back where it was, the value kept then answers again.
-  let back = in_memory(written(written(own.tree, squares()), holding()), ["run"]);
+  put(squares());
+  put(holding());
+  let back = spawned(["run"]);
   assert(stdout(back).contains("30"), Some(said(back)))
 }
 
@@ -143,29 +146,29 @@ fn reading(modules: List<String>, sum: String) -> Source =
   }
 
 // One definition under two modules' names hashes as one, and a kept value names its constructors.
-test "one `const fn` text in two modules is two values, each of its own module's constructors" {
-  let both = reading(["first", "second"], "first::sizes() * 10 + second::sizes()");
-  let ran = in_memory(tree([kinds("first"), kinds("second"), both]), ["run"]);
+test/nondet "one `const fn` text in two modules is two values, each of its own module's constructors" {
+  project([
+    kinds("first"),
+    kinds("second"),
+    reading(["first", "second"], "first::sizes() * 10 + second::sizes()"),
+  ]);
+  let ran = spawned(["run"]);
   assert_ok(ran);
   assert(stdout(ran).contains("33"), Some(said(ran)));
   // What a build of one kept is none of the other's, read by a later build.
-  let alone = kept_in_memory(
-    tree([kinds("first"), reading(["first"], "first::sizes()")]),
-    ["run"],
-    [],
-    None,
-  );
-  assert(stdout(alone.ran).contains("3"), Some(said(alone.ran)));
-  let later = in_memory(
-    written(written(alone.tree, kinds("second")), reading(["second"], "second::sizes() + 4")),
-    ["run"],
-  );
+  project([kinds("first"), reading(["first"], "first::sizes()")]);
+  let alone = spawned(["run"]);
+  assert(stdout(alone).contains("3"), Some(said(alone)));
+  put(kinds("second"));
+  put(reading(["second"], "second::sizes() + 4"));
+  let later = spawned(["run"]);
   assert_ok(later);
   assert(stdout(later).contains("7"), Some(said(later)))
 }
 
-test "a `const fn` that raises is refused at its definition, where it raised beside it" {
-  let ran = in_memory(tree(program("1\ntwo\n")), ["check", "--json"]);
+test/nondet "a `const fn` that raises is refused at its definition, where it raised beside it" {
+  project(program("1\ntwo\n"));
+  let ran = spawned(["check", "--json"]);
   assert_eq(ran.code, 2);
   let v = json_of(ran);
   assert_eq(codes(v), ["E0157"]);
@@ -180,38 +183,33 @@ test "a `const fn` that raises is refused at its definition, where it raised bes
   assert_eq(str(at(nth(at(diagnostic(v), "labels"), 1), "message")), "raised here")
 }
 
-test "every command that would run a `const fn` refuses the one a build cannot evaluate" {
-  let files = program("1\ntwo\n");
+test/nondet "every command that would run a `const fn` refuses the one a build cannot evaluate" {
+  project(program("1\ntwo\n"));
   [["run"], ["test"], ["prove"], ["build", ".", "-o", "m.plyx"]].fold(
     (),
     |_: Unit, line: List<String>| {
-      let ran = in_memory(tree(files), line);
+      let ran = spawned(line);
       assert_eq(ran.code, 2);
       assert(said(ran).contains("E0157"), Some(said(ran)))
     },
   )
 }
 
-test "a refused `const fn` is refused again by a check that reads its module's stub, and mended by its file" {
-  let first = kept_in_memory(tree(program("1\ntwo\n")), ["check", "--explain"], [], None);
-  assert_eq(first.ran.code, 2);
-  let second = kept_in_memory(first.tree, ["check", "--explain"], [], None);
-  assert_eq(second.ran.code, 2);
-  assert(said(second.ran).contains("E0157"), Some(said(second.ran)));
-  let mended = kept_in_memory(
-    written(second.tree, numbers("1\n2\n")),
-    ["check", "--explain"],
-    [],
-    None,
-  );
-  assert_ok(mended.ran);
+test/nondet "a refused `const fn` is refused again by a check that reads its module's stub, and mended by its file" {
+  project(program("1\ntwo\n"));
+  assert_eq(spawned(["check", "--explain"]).code, 2);
+  let second = spawned(["check", "--explain"]);
+  assert_eq(second.code, 2);
+  assert(said(second).contains("E0157"), Some(said(second)));
+  put(numbers("1\n2\n"));
+  assert_ok(spawned(["check", "--explain"]));
   // A warm check and a warm run answer what the cold ones did.
-  assert_ok(in_memory(mended.tree, ["check", "--explain"]));
-  let ran = in_memory(mended.tree, ["run"]);
+  assert_ok(spawned(["check", "--explain"]));
+  let ran = spawned(["run"]);
   assert(stdout(ran).contains("5"), Some(said(ran)))
 }
 
-test "a `const fn` that does not end within the build's budget is refused" {
+test/nondet "a `const fn` that does not end within the build's budget is refused" {
   let counting =
     \\const fn slow() -> Int = count(200000000, 0)
     \\
@@ -220,15 +218,18 @@ test "a `const fn` that does not end within the build's budget is refused" {
     \\fn main() -> Int = slow()
     \\
   ;
-  let ran = in_memory(tree([{ path: "m.ply", text: counting }]), ["check", "--json"]);
+  project([{ path: "m.ply", text: counting }]);
+  let ran = spawned(["check", "--json"]);
   let v = json_of(ran);
   assert_eq(codes(v), ["E0158"]);
   assert(str(at(diagnostic(v), "message")).contains("within 100000000 calls"), Some(said(ran)))
 }
 
-test "a `const fn` is what a build can evaluate and keep, or the check says which it is not" {
-  let refused = |text: String|
-    codes(json_of(in_memory(tree([{ path: "m.ply", text: text }]), ["check", "--json"])));
+test/nondet "a `const fn` is what a build can evaluate and keep, or the check says which it is not" {
+  let refused = |text: String| {
+    project([{ path: "m.ply", text: text }]);
+    codes(json_of(spawned(["check", "--json"])))
+  };
   assert_eq(refused("const fn f(n: Int) -> Int = n\n"), ["E0156"]);
   assert_eq(refused("const fn f<a>() -> List<a> = []\n"), ["E0156"]);
   assert_eq(refused("const fn f() -> Int / {abort.raise} = 1\n"), ["E0156"]);
@@ -264,14 +265,12 @@ fn measuring() -> Source =
       \\
   }
 
-test "an artifact holds the value, and a run of it evaluates nothing" {
-  scratch(|| {
-    project([squares(), measuring(), numbers("1\n2\n3\n")]);
-    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
-    let ran = on_disk(["run", "m.plyx", "--steps", "10"]);
-    assert_ok(ran);
-    assert(stdout(ran).contains("3014"), Some(said(ran)))
-  })
+test/nondet "an artifact holds the value, and a run of it evaluates nothing" {
+  project([squares(), measuring(), numbers("1\n2\n3\n")]);
+  assert_ok(spawned(["build", ".", "-o", "m.plyx"]));
+  let ran = spawned(["run", "m.plyx", "--steps", "10"]);
+  assert_ok(ran);
+  assert(stdout(ran).contains("3014"), Some(said(ran)))
 }
 
 /// A `const fn` over a scanner written in a range pattern and a sum that wraps, which `main`
@@ -293,16 +292,14 @@ fn scanning() -> Source =
       \\
   }
 
-test "an artifact of a `const fn` written in a range pattern and a wrapping operator runs to its value" {
-  scratch(|| {
-    project([scanning()]);
-    let ran = on_disk(["run", "--steps", "10"]);
-    assert(stdout(ran).contains("7000"), Some(said(ran)));
-    assert_ok(on_disk(["build", ".", "-o", "m.plyx"]));
-    let built = on_disk(["run", "m.plyx", "--steps", "10"]);
-    assert_ok(built);
-    assert(stdout(built).contains("7000"), Some(said(built)))
-  })
+test/nondet "an artifact of a `const fn` written in a range pattern and a wrapping operator runs to its value" {
+  project([scanning()]);
+  let ran = spawned(["run", "--steps", "10"]);
+  assert(stdout(ran).contains("7000"), Some(said(ran)));
+  assert_ok(spawned(["build", ".", "-o", "m.plyx"]));
+  let built = spawned(["run", "m.plyx", "--steps", "10"]);
+  assert_ok(built);
+  assert(stdout(built).contains("7000"), Some(said(built)))
 }
 
 /// A package `lib` whose table is a `const fn`, and an `app` that reads it.
@@ -323,7 +320,7 @@ fn depending(table: String) -> List<Source> =
 
 // A run whose budget is past what reading the table takes and short of what evaluating its body
 // does reads the value the build kept.
-test "a dependency's `const fn` is evaluated for the program that reaches it, warm as cold" {
+test/nondet "a dependency's `const fn` is evaluated for the program that reaches it, warm as cold" {
   let table =
     \\pub const fn squares() -> Array<Int> =
     \\  Array::of_list(range(0, 100).map(|i: Int| i * i).filter(|n: Int| n < 25))
@@ -331,36 +328,36 @@ test "a dependency's `const fn` is evaluated for the program that reaches it, wa
     \\pub const fn unread() -> Int = 7
     \\
   ;
-  let cold = kept_in_memory(tree(depending(table)), ["run", "app", "--steps", "20"], [], None);
-  assert_ok(cold.ran);
-  assert(stdout(cold.ran).contains("5000"), Some(said(cold.ran)));
-  let checked = kept_in_memory(cold.tree, ["check", "app", "--explain"], [], None);
-  assert_ok(checked.ran);
-  let warm = kept_in_memory(checked.tree, ["check", "app", "--explain"], [], None);
-  assert_ok(warm.ran);
-  let again = in_memory(warm.tree, ["run", "app", "--steps", "20"]);
+  project(depending(table));
+  let cold = spawned(["run", "app", "--steps", "20"]);
+  assert_ok(cold);
+  assert(stdout(cold).contains("5000"), Some(said(cold)));
+  assert_ok(spawned(["check", "app", "--explain"]));
+  assert_ok(spawned(["check", "app", "--explain"]));
+  let again = spawned(["run", "app", "--steps", "20"]);
   assert(stdout(again).contains("5000"), Some(said(again)))
 }
 
-test "a dependency's `const fn` that raises refuses the program that holds it, where it is written" {
+test/nondet "a dependency's `const fn` that raises refuses the program that holds it, where it is written" {
   let table =
     \\pub const fn squares() -> Array<Int> = Array::of_list([1 / none()])
     \\
     \\fn none() -> Int = 0
     \\
   ;
-  let first = kept_in_memory(tree(depending(table)), ["check", "app", "--json"], [], None);
-  let v = json_of(first.ran);
+  project(depending(table));
+  let first = spawned(["check", "app", "--json"]);
+  let v = json_of(first);
   assert_eq(codes(v), ["E0157"]);
   assert(
     str(at(nth(at(diagnostic(v), "labels"), 0), "file")).ends_with("lib/table.ply"),
-    Some(said(first.ran)),
+    Some(said(first)),
   );
   // Read through its package's stub by the next check, it is refused the same.
-  assert_eq(codes(json_of(in_memory(first.tree, ["check", "app", "--json"]))), ["E0157"])
+  assert_eq(codes(json_of(spawned(["check", "app", "--json"]))), ["E0157"])
 }
 
-test "a mutant of what a `const fn` reaches runs its body, never the value kept of the original" {
+test/nondet "a mutant of what a `const fn` reaches runs its body, never the value kept of the original" {
   let source =
     \\fn bump(n: Int) -> Int = n + 1
     \\
@@ -369,30 +366,27 @@ test "a mutant of what a `const fn` reaches runs its body, never the value kept 
     \\test "the table holds each number bumped" { assert_eq(table(), [1, 2, 3]) }
     \\
   ;
-  let first = kept_in_memory(tree([{ path: "m.ply", text: source }]), ["test"], [], None);
-  assert_ok(first.ran);
-  let mutated = in_memory(first.tree, ["test", "--mutate", "m.bump", "--json"]);
+  project([{ path: "m.ply", text: source }]);
+  assert_ok(spawned(["test"]));
+  let mutated = spawned(["test", "--mutate", "m.bump", "--json"]);
   let m = at(json_of(mutated), "mutants");
   assert(int(at(m, "killed")) >= 1, Some(said(mutated)));
   assert_eq(int(at(m, "survived")), 0)
 }
 
-test "a `const fn` nothing calls is evaluated with the rest, in the program's own modules" {
+test/nondet "a `const fn` nothing calls is evaluated with the rest, in the program's own modules" {
   let unused = {
     path: "m.ply",
     text: "const fn broken() -> Int = 1 / none()\n\nfn none() -> Int = 0\n\nfn main() -> Int = 7\n",
   };
-  assert_eq(codes(json_of(in_memory(tree([unused]), ["check", "--json"]))), ["E0157"])
+  project([unused]);
+  assert_eq(codes(json_of(spawned(["check", "--json"]))), ["E0157"])
 }
 
-test "a `const fn` is printed as it is written, and documented as one" {
-  let source = "/// The answer.\npub   const   fn answer( ) -> Int = 42\n";
-  let formatted = kept_in_memory(tree([{ path: "m.ply", text: source }]), ["fmt"], [], None);
-  assert_ok(formatted.ran);
-  assert_eq(
-    file_of(formatted.tree, "m.ply"),
-    Some("/// The answer.\npub const fn answer() -> Int = 42\n"),
-  );
-  let doc = stdout(in_memory(formatted.tree, ["doc", "m.answer"]));
+test/nondet "a `const fn` is printed as it is written, and documented as one" {
+  project([{ path: "m.ply", text: "/// The answer.\npub   const   fn answer( ) -> Int = 42\n" }]);
+  assert_ok(spawned(["fmt"]));
+  assert_eq(read("m.ply"), Some("/// The answer.\npub const fn answer() -> Int = 42\n"));
+  let doc = stdout(spawned(["doc", "m.answer"]));
   assert(doc.contains("pub const fn answer() -> Int"), Some(doc))
 }

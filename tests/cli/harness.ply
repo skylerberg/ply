@@ -1,9 +1,9 @@
-//! Every test drives `ply` from this module, and no other names it. Three ways, cheapest first:
-//! `in_memory` runs the program over a tree held as a value; `on_disk` runs it in the scratch
-//! directory the run was started in, through the machine families `--allow` lends; `spawned` starts
-//! the binary `--exec ply` names, for what only a process has: the launcher, its environment and
-//! exit codes, signals, and the output of a program it runs. `serving` leaves one running for a
-//! test to talk to over a socket.
+//! Every test drives `ply` from this module, and no other names it. `spawned` starts the binary
+//! `--exec ply` names in the scratch directory the run was started in. A command that compiles
+//! nothing may run in this process instead, in the suite's own copy of the CLI: `in_memory` over a
+//! tree held as a value, `on_disk` over the working directory. Both refuse a command that compiles
+//! the program (`compiling`), and what a check compiles to run. `serving` leaves a `ply` running for
+//! a test to talk to.
 
 import cli.ply (main)
 import cli.paths
@@ -47,7 +47,7 @@ import std.process (process, Var, Finished, Exited, Signalled, Captured, capture
                     Discard, Said, Signal, Kill, Terminate)
 import std.term (term)
 import std.time (time)
-import std.value (Value, VCtor, VStr)
+import std.value (Value)
 import std.path (join, normalize, segments)
 import std.pkg (Dep, Manifest, Path, ToolchainParts, Workspace)
 import std.string
@@ -110,10 +110,13 @@ pub fn shown(j: Json) -> String / {abort.raise} = json::to_string(j)
 /// What a scratch directory holds to say it may be emptied.
 pub fn scratch_marker() -> String = ".ply-scratch"
 
-/// Where `ply run` and `ply check` file what they reuse: in a stage beside the test's files, hidden
-/// as a cache is, which the machine's memo store shares, so a fresh directory holds none an earlier
-/// test filed.
-pub fn reused_dir() -> String = ".ply-stage/reused"
+/// The stage every run of a test keeps what it reuses in, a `ply` it starts included: beside the
+/// test's files, hidden as a cache is. `fresh` keeps it, since the shipped modules a `ply` lays out
+/// there are the binary's alone, and empties what it reuses.
+fn stage() -> String = ".ply-stage"
+
+/// Where `ply run` and `ply check` file what they reuse, in the stage.
+pub fn reused_dir() -> String = stage() ++ "/reused"
 
 /// Where a run keeps the emitter's answers: beside the test's files, so a fresh directory holds none
 /// an earlier test kept.
@@ -122,8 +125,8 @@ pub fn bodies() -> String = ".ply-bodies"
 /// A file of a project: its path from the project's directory, and its text.
 pub type Source = { path: String, text: String }
 
-/// The working directory emptied for one test, its marker kept. One without the marker is never
-/// emptied: a run started anywhere else deletes nothing.
+/// The working directory emptied for one test, its marker and its stage kept, and nothing reused in
+/// the stage. One without the marker is never emptied: a run started anywhere else deletes nothing.
 pub fn fresh() -> Unit / {Here, abort.raise} =
   match fs.list_dir[cwd](".") {
     None -> panic("the working directory cannot be listed"),
@@ -134,8 +137,11 @@ pub fn fresh() -> Unit / {Here, abort.raise} =
       )
     } else {
       names.fold((), |u: Unit, name: String|
-        if name == scratch_marker() || fs.remove_tree[cwd](name) { u }
-        else { panic("could not empty the working directory of `" ++ name ++ "`") })
+        if name == scratch_marker() || name == stage() || fs.remove_tree[cwd](name) { u }
+        else { panic("could not empty the working directory of `" ++ name ++ "`") });
+      if fs.exists[cwd](reused_dir()) && !fs.remove_tree[cwd](reused_dir()) {
+        panic("could not empty `" ++ reused_dir() ++ "`")
+      }
     },
   }
 
@@ -161,7 +167,7 @@ pub fn read(path: String) -> Option<String> / {Here, abort.raise} =
   match fs.read_file[cwd](path) { Some(b) -> Some(String::of_bytes(b)), None -> None }
 
 /// The working directory's absolute path, which is the run's own.
-pub fn working() -> String / {Here, abort.raise} =
+pub fn working() -> String / {fs.read[cwd], abort.raise} =
   match fs.canonical[cwd](".") { Some(p) -> p, None -> panic("the working directory has no path") }
 
 /// Whether the program in the working directory compiles and its unit opens.
@@ -270,18 +276,6 @@ pub fn answered(
     Err(d) -> panic("`" ++ entry ++ "` answers: " ++ String::of_bytes_lossy(d.message)),
   }
 
-/// What `inner.<entry>` answered when it answers an `Ok` or an `Err` of text.
-pub fn answered_text(
-  l: Loaded,
-  entry: String,
-  args: List<Value>,
-) -> Result<String, String> / {entering::machine.enter, abort.raise} =
-  match answered(l, entry, args) {
-    VCtor("Ok", [VStr(text)]) -> Ok(text),
-    VCtor("Err", [VStr(text)]) -> Err(text),
-    _ -> panic("`" ++ entry ++ "` answered neither an Ok nor an Err of text"),
-  }
-
 /// The repository's absolute path, which a test hands `ply` to reach a tree it ships.
 pub fn repo() -> String / {Repo, abort.raise} =
   match fs.canonical[repo](".") {
@@ -386,19 +380,50 @@ pub fn comparable(v: Json) -> Json =
     other -> other,
   }
 
+/// The line `check_answer` and `cold_answer` check with.
+fn checking() -> List<String> = ["check", "--explain", "--json"]
+
 /// The working directory's program checked as it stands, through its memo store.
 pub fn check_answer() -> Json / {Reached, Shipped, abort.raise, diverges} =
-  comparable(json_of(on_disk(["check", "--explain", "--json"])))
+  comparable(json_of(on_disk(checking())))
 
 /// The same sources checked from nothing: in memory, beside no cache.
 pub fn cold_answer() -> Json / {Hermetic, Shipped, Here, abort.raise, diverges} =
-  comparable(json_of(in_memory(tree(sources_here()), ["check", "--explain", "--json"])))
+  comparable(json_of(in_memory(tree(sources_here()), checking())))
+
+/// Where `spawned_cold` lays the sources out: hidden, as a cache is, so no walk of them reads it.
+fn cold_dir() -> String = ".cold"
+
+/// `ply ARGV` over the sources here from nothing: laid out alone in a directory of their own, with a
+/// stage of its own, so it takes nothing an earlier run filed but the emitter's answers.
+pub fn spawned_cold(argv: List<String>) -> Ran / {Spawned, Here, abort.raise} = {
+  let sources = sources_here();
+  if fs.exists[cwd](cold_dir()) && !fs.remove_tree[cwd](cold_dir()) {
+    panic("could not empty `" ++ cold_dir() ++ "`")
+  };
+  sources.fold((), |u: Unit, source: Source| write(joined(cold_dir(), source.path), source.text));
+  let own = { name: "PLY_C_STAGE", value: working() ++ "/" ++ cold_dir() ++ "/" ++ stage() };
+  spawned_in(cold_dir(), argv, [own])
+}
 
 /// A check through the memo store answers what a cold check of the same sources does. The warm run
 /// goes first, so the store it reads is the one the last step left.
 pub fn warm_agrees(what: String) -> Json / {Reached, Hermetic, Shipped, abort.raise, diverges} = {
   let warm = check_answer();
   let cold = cold_answer();
+  agreeing(what, warm, cold)
+}
+
+/// `warm_agrees` with each check a `ply` of its own, for a program whose check compiles what it
+/// runs: a `const fn`, a deriver or a literal's parser.
+pub fn spawned_warm_agrees(what: String) -> Json / {Spawned, Here, abort.raise} = {
+  let warm = comparable(json_of(spawned(checking())));
+  let cold = comparable(json_of(spawned_cold(checking())));
+  agreeing(what, warm, cold)
+}
+
+/// `warm` where it is `cold`, the answer from nothing; otherwise the test fails showing both.
+fn agreeing(what: String, warm: Json, cold: Json) -> Json / {abort.raise} = {
   assert(
     warm == cold,
     Some(
@@ -674,7 +699,7 @@ pub effect set Hermetic = {entering::hermetic_machine.read, entering::hermetic_m
 /// it waits on them by.
 pub effect set Here = {fs.read[cwd], fs.write[cwd]}
 pub effect set Repo = {fs.read[repo]}
-pub effect set Spawned = {config.get[env], process.read[ply], process.write[ply]}
+pub effect set Spawned = {config.get[env], process.read[ply], process.write[ply], fs.read[cwd]}
 pub effect set Wire = {net.read[client], net.write[client], net.read[ports], net.write[ports]}
 pub effect set Clock = {time.read, time.write}
 
@@ -1019,11 +1044,29 @@ fn declared(root: command_line::Command, path: List<String>) -> Option<command_l
       },
     })
 
+fn surface() -> command_line::Spec = spec("0.0.0-test")
+
+/// The commands that compile the program they are handed. A test starts these as a process: in this
+/// one, each would compile with the suite's own copy of the compiler and keep no emitter answer.
+fn compiling() -> List<String> = ["attest", "bootstrap", "build", "prove", "review", "run", "test"]
+
+/// Why `ply ARGV` may not run in this process, as a test failure says it.
+fn not_here(argv: List<String>, what: String) -> String =
+  "`ply " ++ String::join(argv, " ") ++ "` " ++ what
+    ++ ": start it with `spawned`, in a `test/nondet` over the working directory"
+
+/// Whether `argv` runs a command that compiles the program.
+fn compiles(argv: List<String>) -> Bool / {abort.raise} =
+  match command_line::parse(surface(), argv) {
+    command_line::Run(p) -> match p.path { [word, ..] -> compiling().contains(word), [] -> false },
+    _ -> false,
+  }
+
 /// `argv` naming the working directory where it leaves its path off. A test's tree is a directory
 /// of modules that no package holds: a program when a line names it, and nothing to find when one
 /// does not.
 fn here_named(argv: List<String>) -> List<String> / {abort.raise} = {
-  let surface = spec("0.0.0-test");
+  let surface = surface();
   let left_off = match command_line::parse(surface, argv) {
     command_line::Run(p) -> match declared(surface.root, p.path) {
       None -> false,
@@ -1048,9 +1091,8 @@ fn here_named(argv: List<String>) -> List<String> / {abort.raise} = {
 /// `ply` in the working directory, bound as the launcher binds it: `cwd` and `abs` are the run's
 /// own roots and every family a command drives a machine with is lent by `--allow`. The streams,
 /// the environment, the text `ply replace` reads and the shipped modules are the harness's. The
-/// command is this suite's own copy of the CLI, compiled as a test is and keeping no emitter answer
-/// from one test to the next, so a program that imports much of the library loads far slower here
-/// than under `spawned`.
+/// command is this suite's own copy of the CLI, which refuses a command that compiles the program:
+/// that runs under `spawned`.
 pub fn on_disk(argv: List<String>) -> Ran / {Reached, Shipped, abort.raise, diverges} =
   on_disk_with(argv, [], None)
 
@@ -1063,7 +1105,8 @@ pub fn on_disk_with(
 
 /// `ply` handed shipped modules in which each of `shipped`, named as it is filed, stands in for the
 /// module or data file this binary ships, or is one more: what a compiler that shipped those would
-/// have run. A module is filed as `<name>.ply` and a data file under its own name.
+/// have run. A module is filed as `<name>.ply` and a data file under its own name. No built `ply`
+/// ships them, so this runs any command, one that compiles the program included.
 pub fn on_disk_shipping(
   argv: List<String>,
   shipped: List<Source>,
@@ -1090,6 +1133,8 @@ fn on_disk_over(
   standing: List<Source>,
   only: Bool = false,
 ) -> Ran / {Reached, Shipped, abort.raise, diverges} = {
+  let refusing = standing.len() == 0;
+  if refusing && compiles(argv) { panic(not_here(argv, "compiles the program")) };
   let pwd = working();
   let ran = handle {
     main()
@@ -1106,6 +1151,17 @@ fn on_disk_over(
     env.variable(name) -> var_of(vars, name),
     env.variables() -> vars,
     term.is_terminal(_) -> false,
+    // A check compiles what it runs, too: a `const fn` or a literal's parser it evaluates, and a
+    // library deriver, which it asks the toolchain's cache for first, warm or cold.
+    entering::machine.open(library) -> if refusing {
+      panic(not_here(argv, "compiled the program to run it"))
+    } else { entering::machine.open(library) },
+    shipped.values(library, roots, steps) -> if refusing {
+      panic(not_here(argv, "compiled a `const fn` or a literal's parser to evaluate it"))
+    } else { shipped.values(library, roots, steps) },
+    toolchain.held(path) -> if refusing {
+      panic(not_here(argv, "asked for what a library deriver it compiles answers"))
+    } else { toolchain.held(path) },
     shipped.version() -> version(),
     // No binary is measured: which one runs a test is no part of what it asserts.
     shipped.binary_bytes() -> None,
@@ -1148,11 +1204,10 @@ fn on_disk_over(
 // --- As a process ------------------------------------------------------------
 
 /// What a `ply` child inherits of this run's environment: where the toolchain is found, where caches
-/// default to and where this run was told to keep its own, so a child takes the emitter answers
-/// the run already holds, and nothing else, so no variable in the shell that started the run
-/// decides what a test asserts.
-fn inherited() -> List<String> =
-  ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE", "PLY_C_STAGE"]
+/// default to and the C cache this run was told to keep, so a child takes the emitter answers the
+/// run already holds, and nothing else, so no variable in the shell that started the run decides
+/// what a test asserts.
+fn inherited() -> List<String> = ["PATH", "HOME", "TMPDIR", "TEMP", "TMP", "PLY_C_CACHE"]
 
 /// `vars`, then each inherited variable they do not name.
 pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
@@ -1161,6 +1216,12 @@ pub fn environment(vars: List<Var>) -> List<Var> / {config.get[env]} =
       match config.get[env](name) { Some(v) -> acc.push({ name: name, value: v }), None -> acc }
     })
 
+/// What a `ply` child is started with: `environment(vars)`, and the working directory's stage
+/// unless `vars` name one.
+fn ply_environment(vars: List<Var>) -> List<Var> / {config.get[env], fs.read[cwd], abort.raise} =
+  if vars.any(|v: Var| v.name == "PLY_C_STAGE") { environment(vars) }
+  else { environment(vars).push({ name: "PLY_C_STAGE", value: working() ++ "/" ++ stage() }) }
+
 /// The words the binary is started with: `--color never` ahead of the line, so one that spells
 /// `--color` itself wins.
 fn started(argv: List<String>) -> List<String> / {abort.raise} =
@@ -1168,7 +1229,7 @@ fn started(argv: List<String>) -> List<String> / {abort.raise} =
 
 /// The binary `--exec ply` names, started in the working directory with `--color never` ahead of
 /// `argv`, so one that spells `--color` itself wins.
-pub fn spawned(argv: List<String>, vars: List<Var>) -> Ran / {Spawned, abort.raise} =
+pub fn spawned(argv: List<String>, vars: List<Var> = []) -> Ran / {Spawned, abort.raise} =
   spawned_in("", argv, vars)
 
 /// As `spawned`, started in `dir` under the working directory.
@@ -1177,12 +1238,12 @@ pub fn spawned_in(
   argv: List<String>,
   vars: List<Var>,
 ) -> Ran / {Spawned, abort.raise} =
-  finished(process.spawn[ply](started(argv), dir, environment(vars)))
+  finished(process.spawn[ply](started(argv), dir, ply_environment(vars)))
 
 /// Each of `argvs` run as `spawned` runs one, all started at once and answered in order.
 pub fn spawned_together(argvs: List<List<String>>) -> List<Ran> / {Spawned, abort.raise} = {
   let children = argvs.map(|argv: List<String>|
-    match process.start[ply](started(argv), "", environment([]), {
+    match process.start[ply](started(argv), "", ply_environment([]), {
         input: false,
         out: Keep,
         err: Keep,
@@ -1223,7 +1284,7 @@ pub fn reserve() -> Int / {Wire, abort.raise} = {
 
 /// The binary started as `spawned` starts it and left running, its streams kept for `ended`.
 pub fn serving(argv: List<String>, vars: List<Var>, port: Int) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", ply_environment(vars), {
       input: false,
       out: Keep,
       err: Keep,
@@ -1243,7 +1304,7 @@ pub fn listening(argv: List<String>, vars: List<Var>) -> Server / {Spawned, abor
   talking(argv, vars, true)
 
 fn talking(argv: List<String>, vars: List<Var>, input: Bool) -> Server / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", ply_environment(vars), {
       input: input,
       out: Lines,
       err: Discard,
@@ -1270,7 +1331,7 @@ pub fn spawned_fed(
   vars: List<Var>,
   input: Bytes,
 ) -> Finished / {Spawned, abort.raise} =
-  match process.start[ply](started(argv), "", environment(vars), {
+  match process.start[ply](started(argv), "", ply_environment(vars), {
       input: true,
       out: Keep,
       err: Keep,
@@ -1291,7 +1352,7 @@ pub fn spawned_fed(
 /// What a run of `ply` needs that only a shell gives it: a pipe whose reader leaves, and a
 /// terminal. The shell is the one `--exec sh` names, and the `ply` it starts is the one this run
 /// is, which a run of the suite also names `--exec ply`.
-pub effect set Shell = {config.get[env], process.read[sh], process.write[sh], os.read}
+pub effect set Shell = {config.get[env], process.read[sh], process.write[sh], os.read, fs.read[cwd]}
 
 /// The path of the `ply` this run is.
 pub fn this_ply() -> String / {os.executable, abort.raise} =
@@ -1305,8 +1366,8 @@ fn shell_ply(argv: List<String>) -> String / {abort.raise} =
     None -> panic("an argument no shell word spells"),
   }
 
-fn shell_environment() -> List<Var> / {config.get[env], os.executable, abort.raise} =
-  environment([]).push({ name: "PLY", value: this_ply() })
+fn shell_environment() -> List<Var> / {config.get[env], fs.read[cwd], os.executable, abort.raise} =
+  ply_environment([]).push({ name: "PLY", value: this_ply() })
 
 /// `ply` run with its output piped into `reader`, a shell command: what the reader wrote, and on
 /// stderr what the run wrote there and then `status` and the code it exited with.
@@ -1517,8 +1578,8 @@ pub fn failure_codes(report: Json) -> List<String> =
 
 pub fn code_of(report: Json) -> String = str(at(diagnostic(report), "code"))
 
-pub fn tested(flags: List<String>) -> Json / {Reached, Shipped, abort.raise, diverges} =
-  json_of(on_disk(["test", "--json"].concat(flags)))
+pub fn tested(flags: List<String>) -> Json / {Spawned, abort.raise} =
+  json_of(spawned(["test", "--json"].concat(flags)))
 
 /// The tests a `ply test --json` report ran rather than took from a pass, by name.
 pub fn selected(report: Json) -> List<String> =
@@ -1551,10 +1612,10 @@ pub fn dep(name: String, at_path: String) -> String =
 
 pub fn exists(p: String) -> Bool / {fs.exists[cwd]} = fs.exists[cwd](p)
 
-pub fn proved_here(flags: List<String>) -> Json / {Reached, Shipped, abort.raise, diverges} =
-  json_of(on_disk(["prove", "--no-cache", "--json"].concat(flags)))
+pub fn proved_here(flags: List<String>) -> Json / {Spawned, abort.raise} =
+  json_of(spawned(["prove", "--no-cache", "--json"].concat(flags)))
 
-pub fn proved(source: String) -> Json / {Reached, Shipped, abort.raise, diverges} = {
+pub fn proved(source: String) -> Json / {Spawned, Here, abort.raise} = {
   program(source);
   proved_here([])
 }
