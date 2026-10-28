@@ -13,7 +13,7 @@ use crate::heap::{bridged, obj};
 use crate::native::{Addr, F64, I64, Raises};
 use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
 use ply_core::builtins::{assert_failure, call, not_found};
-use ply_core::{Builtin, Decimal, Diagnostic, Fixed, Span, Value, codes};
+use ply_core::{Builtin, Decimal, Diagnostic, Span, Value, codes};
 
 /// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {
@@ -146,29 +146,32 @@ pub unsafe extern "C" fn rt_scalar_encoded(
     lo: I64,
     hi: I64,
 ) -> I64 {
+    use ply_core::digest::{Scalar, scalar};
     let c = unsafe { &mut *ctx };
-    let v = match kind.0 {
-        0 => Some(Value::Unit),
-        1 => Some(Value::Bool(lo.0 != 0)),
-        2 => Some(Value::Int(lo.0)),
+    let s = match kind.0 {
+        0 => Some(Scalar::Unit),
+        1 => Some(Scalar::Bool(lo.0 != 0)),
+        2 => Some(Scalar::Int(lo.0)),
         3 => usize::try_from(t.0)
             .ok()
             .and_then(|i| ply_core::INT_TYPES.get(i))
             .map(|ty| {
-                let bits = (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64);
-                Value::Fixed(Fixed::new(*ty, bits))
+                Scalar::Width(
+                    *ty,
+                    (u128::from(hi.0 as u64) << 64) | u128::from(lo.0 as u64),
+                )
             }),
         4 => u32::try_from(lo.0)
             .ok()
-            .and_then(char::from_u32)
-            .map(Value::Char),
-        5 => Some(Value::Decimal(decimal_of(lo, hi))),
+            .filter(|c| char::from_u32(*c).is_some())
+            .map(Scalar::Char),
+        5 => Some(Scalar::Decimal(decimal_of(lo, hi))),
         _ => None,
     };
-    let Some(v) = v else {
-        return I64(c.fail(err_machine("a scalar's encoding of no scalar")));
-    };
-    encoded_given(c, &v)
+    match s {
+        Some(s) => c.give(scalar(s)),
+        None => I64(c.fail(err_machine("a scalar's encoding of no scalar"))),
+    }
 }
 
 /// The encoding `digest` hashes of the string, where `text` is not 0, or else the byte string, of
@@ -176,23 +179,10 @@ pub unsafe extern "C" fn rt_scalar_encoded(
 pub unsafe extern "C" fn rt_text_encoded(ctx: *mut Ctx, text: I64, p: Addr, n: I64) -> I64 {
     let c = unsafe { &mut *ctx };
     let bytes = unsafe { lent(p, n) };
-    let v = if text.0 != 0 {
-        match c.text(bytes) {
-            Some(s) => Value::str(s),
-            None => return I64(0),
-        }
-    } else {
-        Value::bytes(bytes)
-    };
-    encoded_given(c, &v)
-}
-
-/// `v`'s encoding left as taken bytes, its count answered.
-fn encoded_given(c: &mut Ctx, v: &Value) -> I64 {
-    match ply_core::digest::encoded(v, Span::DUMMY) {
-        Ok(bytes) => c.give(bytes),
-        Err(d) => I64(c.fail(d)),
+    if text.0 != 0 && c.text(bytes).is_none() {
+        return I64(0);
     }
+    c.give(ply_core::digest::text(text.0 != 0, bytes))
 }
 
 /// The BLAKE3 digest of the `n` bytes at `p`, as taken bytes.

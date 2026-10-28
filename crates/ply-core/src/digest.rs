@@ -3,7 +3,7 @@
 //! no digest.
 
 use crate::limit::grow;
-use crate::{Diagnostic, Span, Value, codes};
+use crate::{Decimal, Diagnostic, IntTy, Span, Value, codes};
 
 /// `b3:` and a digest's first twelve hex characters: every digest Ply prints for a person to
 /// compare is written this way.
@@ -29,6 +29,30 @@ pub fn encoded(v: &Value, span: Span) -> Result<Vec<u8>, Diagnostic> {
     Ok(out)
 }
 
+/// A scalar as compiled code holds it, which the encoding writes alone: a width by its type and bits.
+pub enum Scalar {
+    Unit,
+    Bool(bool),
+    Int(i64),
+    Width(IntTy, u128),
+    Char(u32),
+    Decimal(Decimal),
+}
+
+/// `s`'s encoding: what [`digest`] hashes of it.
+pub fn scalar(s: Scalar) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_scalar(&mut out, s);
+    out
+}
+
+/// A string's encoding where `text`, else a byte string's.
+pub fn text(text: bool, b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    blob(&mut out, if text { 7 } else { 8 }, b);
+    out
+}
+
 /// Where an encoding is written: a hasher, or the bytes themselves.
 trait Sink {
     fn update(&mut self, b: &[u8]);
@@ -48,24 +72,12 @@ impl Sink for Vec<u8> {
 
 fn write(h: &mut impl Sink, v: &Value, span: Span) -> Result<(), Diagnostic> {
     match v {
-        Value::Unit => tag(h, 0),
-        Value::Bool(b) => tag(h, if *b { 2 } else { 1 }),
-        Value::Int(n) => int(h, *n),
-        // Below 64 bits a width is the `Int` it reads as, which is how compiled code holds it.
-        Value::Fixed(f) if f.ty.bits() < 64 => int(h, f.bits() as i64),
-        Value::Fixed(f) => {
-            tag(h, 4);
-            h.update(&[f.ty as u8]);
-            h.update(&f.raw().to_le_bytes());
-        }
-        Value::Char(c) => {
-            tag(h, 5);
-            h.update(&u32::from(*c).to_le_bytes());
-        }
-        Value::Decimal(d) => {
-            tag(h, 6);
-            h.update(&d.normalize().serialize());
-        }
+        Value::Unit => write_scalar(h, Scalar::Unit),
+        Value::Bool(b) => write_scalar(h, Scalar::Bool(*b)),
+        Value::Int(n) => write_scalar(h, Scalar::Int(*n)),
+        Value::Fixed(f) => write_scalar(h, Scalar::Width(f.ty, f.bits())),
+        Value::Char(c) => write_scalar(h, Scalar::Char(u32::from(*c))),
+        Value::Decimal(d) => write_scalar(h, Scalar::Decimal(*d)),
         Value::Str(s) => blob(h, 7, s.as_bytes()),
         Value::Bytes(b) => blob(h, 8, b),
         Value::List(items) => {
@@ -120,6 +132,38 @@ fn write(h: &mut impl Sink, v: &Value, span: Span) -> Result<(), Diagnostic> {
         }
     }
     Ok(())
+}
+
+fn write_scalar(h: &mut impl Sink, s: Scalar) {
+    match s {
+        Scalar::Unit => tag(h, 0),
+        Scalar::Bool(b) => tag(h, if b { 2 } else { 1 }),
+        Scalar::Int(n) => int(h, n),
+        Scalar::Width(ty, bits) => {
+            let bits = ty.normalize(bits);
+            // Below 64 bits a width is the `Int` it reads as, which is how compiled code holds it.
+            if ty.bits() < 64 {
+                int(h, bits as i64);
+            } else {
+                let raw = if ty.bits() == 128 {
+                    bits
+                } else {
+                    bits & (u128::MAX >> (128 - ty.bits()))
+                };
+                tag(h, 4);
+                h.update(&[ty as u8]);
+                h.update(&raw.to_le_bytes());
+            }
+        }
+        Scalar::Char(c) => {
+            tag(h, 5);
+            h.update(&c.to_le_bytes());
+        }
+        Scalar::Decimal(d) => {
+            tag(h, 6);
+            h.update(&d.normalize().serialize());
+        }
+    }
 }
 
 fn tag(h: &mut impl Sink, t: u8) {
