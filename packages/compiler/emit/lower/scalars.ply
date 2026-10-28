@@ -31,7 +31,7 @@ import compiler.emit.lower.data (constructed_as, field)
 import compiler.emit.lower.crossing (through_runtime, blake3_of, scalar_encoding, concatenated)
 import compiler.emit.lower.evidence (Handing, handing_scheme, words_handed, evidenced)
 import compiler.emit.roots (builtin_helper)
-import compiler.expand.rewrite (FloatFunction, float_function)
+import compiler.expand.rewrite (FloatFunction, float_function, numeric_ops_numbered)
 
 /// A literal as the operand it is, or read from the pool into a variable of its type where no
 /// register holds it: a string, bytes, an embedded file, a `Decimal`, `()` and a width past 64 bits.
@@ -323,7 +323,8 @@ fn decided(cx: Context, l: Lowered, r: Lowered, at: Span) -> Lowered = {
 
 /// Builtin `name` over `args`, which `containers` hands on as one written in place at the type its
 /// operands hold: an order, a reflection, an encoding, an identity test, a width's wrapping,
-/// saturating and checked arithmetic and its conversions, and a `Float`'s.
+/// saturating and checked arithmetic and its conversions, an operator over a witness, and a
+/// `Float`'s.
 pub fn operated(
   cx: Context,
   st: Lowering,
@@ -371,6 +372,9 @@ pub fn operated(
       else if decimal_conversion(name) { decimal_converted(cx, st, name, a, at) }
       else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
         width_arithmetic(cx, st, name, args, at)
+      } else if name == b"to_int" { int_held(cx, st, args, at) }
+      else if name == b"?numeric_binary" || name == b"?numeric_unary" {
+        witnessed_operator(cx, st, name, args, at)
       } else if name == b"?stated_witness" { witnessed(cx, st, a, at) } else {
         match of_int_width(name) {
           Some(w) -> {
@@ -457,12 +461,19 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
     _ -> None,
   }
 
-/// Whether `numeric_of_int` at `ty` is a conversion written in place: at `Int`, `Float` or a width.
+/// Whether `numeric_of_int` at `ty` is a conversion written in place: at `Int`, `Float`, `Decimal`
+/// or a width.
 pub fn numeric_in_place(ctors: Ctors, ty: Type) -> Bool =
-  match class_of(ctors, ty) { CInt -> true, CFloat -> true, CWidth(_) -> true, _ -> false }
+  match class_of(ctors, ty) {
+    CInt -> true,
+    CFloat -> true,
+    CDec -> true,
+    CWidth(_) -> true,
+    _ -> false,
+  }
 
 /// `numeric_of_int(n)` at `ty`, where `numeric_in_place` holds: `n` itself at `Int`, else `n`
-/// converted as `Float::of_int` or the width's `of_int` converts it.
+/// converted as `Float::of_int`, `Decimal::of_int` or the width's `of_int` converts it.
 pub fn numeric_converted(
   cx: Context,
   st: Lowering,
@@ -471,9 +482,11 @@ pub fn numeric_converted(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let x = handed({ st: st, arg: n }, RInt, at);
+  let converted = |op: Bytes| bound(cx, x.st, ty, Prim({ op: op, on: RInt, args: [x.arg] }), at);
   match class_of(cx.setting.ctors, ty) {
-    CFloat -> bound(cx, x.st, ty, Prim({ op: b"to_float", on: RInt, args: [x.arg] }), at),
-    CWidth(w) -> bound(cx, x.st, ty, Prim({ op: b"of_int", on: RInt, args: [x.arg] }), at),
+    CFloat -> converted(b"to_float"),
+    CDec -> converted(b"to_decimal"),
+    CWidth(_) -> converted(b"of_int"),
     _ -> x,
   }
 }
@@ -1029,8 +1042,7 @@ fn let_go_handing(cx: Context, ty: Type) -> Handing / {abort.raise} =
 
 /// A width's or an `Int`'s wrapping, saturating or checked builtin at the type its operands hold, in C
 /// where a register holds the value, checked below 64 bits exactly in a word, at 64 bits by C's
-/// overflow tests and at 128 bits over the width's two words; by the runtime's builtin at any other
-/// type.
+/// overflow tests and at 128 bits over the width's two words. The check admits no other type.
 fn width_arithmetic(
   cx: Context,
   st: Lowering,
@@ -1071,9 +1083,97 @@ fn width_arithmetic(
       let word = RNum({ bits: 64, signed: true });
       checked_in_place(cx, st, name, a, b, { ty: ty, held: RInt, on: word }, answer, at)
     },
-    _ -> through_runtime(cx, needing(st, ty, false), name, args, answer, at),
+    _ -> refuse(st, Scalars, b"an integer's builtin at a type that is no integer: ".concat(name)),
   }
 }
+
+/// `to_int(x)`, the elaboration's witness first, at the integer type `x` holds: `Some` of it at
+/// `Int` and at a width every value of which an `Int` holds, and at a wider one `Some` where the
+/// `Int` holds it and `None` where it does not.
+fn int_held(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
+  match args {
+    [_, x] -> {
+      let ty = type_of(x);
+      let int = named_type(b"Int");
+      let option = answer_of(cx, b"to_int", ty, TyCon({ name: b"Option", args: [int] }));
+      let some = |l: Lowered| constructed_as(cx, l.st, prelude_ctor(b"Some"), [l.arg], option, at);
+      match class_of(cx.setting.ctors, ty) {
+        CInt -> some(handed({ st: st, arg: x }, RInt, at)),
+        CWidth(w) -> if w.bits < 64 || (w.bits == 64 && w.signed) {
+          some(alone(cx, { st: st, arg: x }, b"to_int", RNum(w), int, at))
+        } else {
+          let h = handed({ st: st, arg: x }, width_held(w), at);
+          let fits = bound(
+            cx,
+            h.st,
+            named_type(b"Bool"),
+            if w.bits == 64 {
+              Prim({
+                op: b"le",
+                on: RNum(w),
+                args: [h.arg, ANum({ width: w, bits: 9223372036854775807 })],
+              })
+            } else { Prim({ op: b"fits_int", on: RWide(w), args: [h.arg] }) },
+            at,
+          );
+          let value = bound(
+            cx,
+            opened(fits.st),
+            int,
+            Prim({
+              op: if w.bits == 64 { b"narrow" } else { b"lo" },
+              on: width_held(w),
+              args: [h.arg],
+            }),
+            at,
+          );
+          some_where(cx, fits, value, option, at)
+        },
+        _ -> if has_vars(ty) { through_runtime(cx, st, b"to_int", args, option, at) }
+        else { refuse(st, Scalars, b"`to_int` at a type that is no integer") },
+      }
+    },
+    _ -> refuse(st, Scalars, b"`to_int` called other than with a witness and a value"),
+  }
+
+/// An operator the elaboration wrote over the witness of a `numeric` or `integer` parameter,
+/// `?numeric_binary(op, witness, x, y)` or `?numeric_unary(op, witness, x)`: where its operands'
+/// type is known, that type's operator as written at it; where a type variable leaves it open, what
+/// only a specialisation computes.
+fn witnessed_operator(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  match args {
+    [AInt(k), _, x, y] -> match numeric_ops_numbered().at(k) {
+      None -> refuse(st, Scalars, b"an operator over a witness numbered as none is"),
+      Some(op) -> {
+        let ty = match x { AInt(_) -> type_of(y), _ -> type_of(x) };
+        if !has_vars(ty) { binary(cx, { st: st, arg: x }, { st: st, arg: y }, op, at) } else {
+          through_runtime(
+            cx,
+            st,
+            name,
+            args,
+            if comparison(op) { named_type(b"Bool") } else { ty },
+            at,
+          )
+        }
+      },
+    },
+    [AInt(k), _, x] -> if !has_vars(type_of(x)) {
+      unary(cx, { st: st, arg: x }, if k == 1 { b"bitnot" } else { b"neg" }, at)
+    } else { through_runtime(cx, st, name, args, type_of(x), at) },
+    _ ->
+      refuse(
+        st,
+        Scalars,
+        b"an operator over a witness written other than as the elaboration writes it",
+      ),
+  }
 
 /// A width's checked arithmetic below 64 bits, answering an `Option` of type `option`: exact in 64
 /// bits, `Some` of the answer where the width holds it and `None` where it does not. Only an
@@ -1229,6 +1329,9 @@ fn arity(name: Bytes) -> Int =
       || wrapping(name)
       || saturating(name)
       || (name.starts_with(b"checked_") && name != b"checked_neg") { 2 }
+  else if name == b"to_int" { 2 }
+  else if name == b"?numeric_binary" { 4 }
+  else if name == b"?numeric_unary" { 3 }
   else { match float_function(name) { Some(f) -> f.operands, None -> 1 } }
 
 /// `Float` function `name` over `args`: each operand handed its native as its bits, and the bits

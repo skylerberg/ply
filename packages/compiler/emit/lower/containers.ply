@@ -23,8 +23,9 @@ import compiler.emit.roots (builtin_helper, generated_builtin)
 import compiler.emit.release (released_vars)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RFlat, Leaf,
                           Var, Arg, AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer,
-                          OHandle, Let, Prim, If, Containers, Static)
+                          OHandle, OCalling, Let, Prim, If, Containers, Static, rep_of_arg)
 import compiler.emit.tir.handling (Unsettled, Entering)
+import compiler.emit.tir.calling (Observed)
 import compiler.emit.lower.evidence (value_handing, builtin_row)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew,
                                      ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
@@ -84,6 +85,7 @@ fn builtin_filed(
           b"an imported name that is neither a definition nor a builtin: ".concat(name),
         ),
       Some(b) -> if b == b"assert_eq" { asserted(cx, st, args, callee, at) }
+      else if b == b"observe" { observed(cx, st, args, at) }
       else if b == b"Map::new" && args.len() == 0 { empty_map(cx, st, args, callee, at) }
       else if kept_builtin(b) { kept_called(cx, st, b, args, callee, at) }
       else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
@@ -128,6 +130,29 @@ fn asserted(
       }
     },
     _ -> refuse(st, Containers, b"`assert_eq` of other than two values"),
+  }
+
+/// `observe(x)`: `x`, read without a count of its own into a value the C compiler knows nothing of,
+/// so what made `x` runs though nothing else reads it, and nothing that reads the answer is worked
+/// out ahead.
+fn observed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
+  match args {
+    [x] -> {
+      let ty = type_of(x);
+      let held = handed({ st: st, arg: x }, held_as(cx.setting, ty), at);
+      bound_as(
+        held.st,
+        ty,
+        rep_of_arg(held.arg),
+        Op({
+          op: OCalling(Observed),
+          args: [held.arg],
+          uses: { takes: [false], owned: false, fails: false, stops: false },
+        }),
+        at,
+      )
+    },
+    _ -> refuse(st, Containers, b"`observe` of other than one value"),
   }
 
 /// `Map::new()`: the empty map laid out as static data, immortal as the runtime's own is, which a
@@ -448,7 +473,7 @@ fn encoded_called(
 ) -> Lowered / {abort.raise} =
   match builtin_at(cx.setting, filed(cx, callee), name) {
     Some(_) -> over_encoding(cx, st, name, args, callee, at),
-    None -> match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
+    None -> match f.ret {
       None ->
         refuse(
           st,
@@ -492,18 +517,6 @@ fn held_through(
     },
     _ -> refuse(st, Containers, b"a hold's builtin of other than one operand: ".concat(name)),
   }
-
-/// What a native the elaboration writes calls of answers, which no declaration states: an operator
-/// at a type a witness stands for its operands' type, but `<`, `<=`, `>` and `>=`, which the
-/// elaboration numbers 5 to 8, a `Bool`.
-fn elaborated_answer(name: Bytes, args: List<Arg>) -> Option<Type> =
-  if name == b"?numeric_binary" {
-    match args {
-      [AInt(k), _, x, _] -> Some(if k >= 5 && k <= 8 { bool_type() } else { type_of(x) }),
-      _ -> None,
-    }
-  } else if name == b"?numeric_unary" { match args { [_, _, x] -> Some(type_of(x)), _ -> None } }
-  else { None }
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -1117,6 +1130,9 @@ pub fn scalar_builtin(name: Bytes) -> Bool =
       b"checked_sub",
       b"checked_mul",
       b"checked_neg",
+      b"to_int",
+      b"?numeric_binary",
+      b"?numeric_unary",
       b"U8::of_int",
       b"U16::of_int",
       b"U32::of_int",

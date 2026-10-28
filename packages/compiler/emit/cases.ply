@@ -1040,17 +1040,119 @@ test "a builtin the runtime answers a sum of crosses over its encoding, and a wo
   ])
 }
 
-test "a builtin crossing over its encoding is handed the witnesses the elaboration passes first, as the runtime declares it" {
-  let src = b"fn whole(x: U8) -> Option<Int> = to_int(x)\n";
-  let out = emit_all_program([{ name: b"m", src: src }], [], true);
-  assert_eq(out.map(|e: Emitted| e.why), [None]);
-  let code = own_code(out.get(0).text);
-  // The runtime's `to_int` takes a witness, then the value.
-  assert(code.index_of(b"rt_builtin_encoded_p(") != None, Some(String::of_bytes_lossy(code)));
-  assert(
-    code.index_of(b"builtin_elaborated_out_count_p(ctx, INT64_C(9), INT64_C(2))") != None,
-    Some(String::of_bytes_lossy(code)),
-  )
+/// The integer types, and the numeric types the elaboration hands a witness for beyond them: `m`'s
+/// `Length` states its own arithmetic.
+fn integer_types() -> List<Bytes> =
+  [b"Int", b"U8", b"U16", b"U32", b"U64", b"I8", b"I16", b"I32", b"I64", b"U128", b"I128"]
+
+fn numeric_types() -> List<Bytes> = integer_types().concat([b"Float", b"Decimal", b"m.Length"])
+
+/// The names of the roots `answers` holds that the emitter refused, or whose code hands a value to
+/// the runtime over its encoding.
+fn crossing_answers(answers: List<RootAnswer>) -> List<Bytes> =
+  answers.fold([], |acc: List<Bytes>, a: RootAnswer|
+    match a.answer {
+      Refused(r) -> acc.push(Bytes::concat_all([answer_name(a), b": ", r.why])),
+      Body(b) -> if b.text.index_of(b"rt_builtin_encoded_p(") != None
+          || b.text.index_of(b"builtin_elaborated_lower_open_p(") != None {
+        acc.push(answer_name(a))
+      } else { acc },
+    })
+
+test "every number builtin is code the emitter writes, at every type it is called at" {
+  let length = Bytes::concat_all([
+    b"type Length = | Metres(Int) | Millimetres(Int)\n",
+    b"key for Length by millimetres\n",
+    b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: metres }\n",
+    b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+    b"fn plus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) + millimetres(b))\n",
+    b"fn minus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) - millimetres(b))\n",
+    b"fn times(a: Length, b: Length) -> Length = Millimetres(millimetres(a) * millimetres(b))\n",
+    b"fn negated(a: Length) -> Length = Millimetres(0 - millimetres(a))\n",
+    b"fn metres(n: Int) -> Length = Metres(n)\n",
+  ]);
+  let at_type = |t: Bytes|
+    Bytes::concat_all([
+      b"fn rows_",
+      t,
+      b"(a: ",
+      t,
+      b", b: ",
+      t,
+      b", n: Int) -> List<Option<",
+      t,
+      b">> = [checked_add(a, b), checked_sub(a, b), checked_mul(a, b), checked_neg(a), ",
+      b"Some(wrap_add(a, b)), Some(wrap_sub(a, b)), Some(wrap_mul(a, b)), Some(saturating_add(a, b)), ",
+      b"Some(saturating_sub(a, b)), Some(saturating_mul(a, b)), Some(rotl(a, n)), Some(rotr(a, n)), ",
+      b"Some(observe(a))]\n",
+      b"fn whole_",
+      t,
+      b"(a: ",
+      t,
+      b") -> Option<Int> = to_int(a)\n",
+    ]);
+  let src = Bytes::concat_all([
+    length,
+    Bytes::concat_all(integer_types().map(at_type)),
+    b"fn ints(a: U8, b: U16, c: U32, d: U64, e: I8, f: I16, g: I32, h: I64, i: U128, j: I128) -> List<Int> / {abort.raise} = ",
+    b"[Int::of_u8(a), Int::of_u16(b), Int::of_u32(c), Int::of_u64(d), Int::of_i8(e), Int::of_i16(f), ",
+    b"Int::of_i32(g), Int::of_i64(h), Int::of_u128(i), Int::of_i128(j)]\n",
+    b"fn arith<a>(x: a, y: a) -> List<a> / {abort.raise} where numeric(a) = [x + y, x - y, x * y, -x, numeric_of_int(3), observe(x)]\n",
+    b"fn ordered<a>(x: a, y: a) -> List<Bool> where numeric(a) = [x < y, x <= y, x > y, x >= y]\n",
+    b"fn bits<a>(x: a, y: a) -> List<a> / {abort.raise} where integer(a) = [x / y, x % y, x & y, x | y, x ^ y, x << 1, x >> 1, x >>> 1, ~x]\n",
+    b"fn whole<a>(x: a) -> Option<Int> where integer(a) = to_int(x)\n",
+    // A witness the specialisation does not undo, its parameter named only inside a record.
+    b"fn held<a>(p: { x: a, y: a }) -> List<a> where numeric(a) = [p.x + p.y, -p.x]\n",
+  ]);
+  let concrete = integer_types().fold([Named(b"m.ints")], |acc: List<RootKey>, t: Bytes|
+    acc.push(Named(b"m.rows_".concat(t))).push(Named(b"m.whole_".concat(t))));
+  let generic = numeric_types().fold([], |acc: List<RootKey>, t: Bytes|
+    acc.concat([b"m.arith", b"m.ordered", b"m.held"].map(|d: Bytes| at_spelled(d, [t])))).concat(
+    integer_types().fold([], |acc: List<RootKey>, t: Bytes|
+      acc.concat([b"m.bits", b"m.whole"].map(|d: Bytes| at_spelled(d, [t])))),
+  );
+  let wanted = concrete.concat(generic);
+  let answers = answers_at([b"m"], [src], [b"m.Length"], wanted);
+  assert_eq(answers.len(), wanted.len());
+  assert_eq(crossing_answers(answers), [])
+}
+
+test "observe answers its value hidden from the C compiler behind the head's barrier, at any type, calling nothing" {
+  let src = Bytes::concat_all([
+    b"type Shape = | Dot | Line(Int)\n",
+    b"fn seen<a>(x: a) -> a = observe(x)\n",
+    b"fn text(s: String) -> String = observe(s)\n",
+    b"fn point(p: { x: Int, s: String }) -> { x: Int, s: String } = observe(p)\n",
+    b"fn shape(s: Shape) -> Shape = observe(s)\n",
+    b"fn apply(f: keep (Int) -> Int) -> Int = observe(f)(1)\n",
+    b"fn constant() -> Int = observe(1000) * 2\n",
+    b"fn nothing() -> Unit = observe(())\n",
+    b"fn amount(d: Decimal) -> Decimal = observe(d)\n",
+    b"fn wide(w: U128) -> U128 = observe(w)\n",
+  ]);
+  let seen = [at_spelled(b"m.seen", [b"String"]), at_spelled(b"m.seen", [b"Float"])];
+  let named = [b"m.text", b"m.point", b"m.shape", b"m.apply", b"m.constant", b"m.nothing"];
+  let pairs = [b"m.amount", b"m.wide"];
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"m.Shape"],
+    named.concat(pairs).map(Named).concat(seen),
+  );
+  assert_eq(crossing_answers(answers), []);
+  let text = |name: Bytes|
+    match answers.filter(|a: RootAnswer| answer_name(a) == name) {
+      [a] -> match a.answer { Body(b) -> b.text, Refused(_) -> b"" },
+      _ -> b"",
+    };
+  let lacking = |names: List<Bytes>, part: Bytes|
+    names.filter(|n: Bytes| text(n).index_of(part) == None);
+  // A value of no words has nothing to hide.
+  assert_eq(
+    lacking(named.filter(|n: Bytes| n != b"m.nothing").concat(seen.map(printed)), b"ply_observed("),
+    [],
+  );
+  assert_eq(lacking(pairs, b"ply_observed_pair("), [])
 }
 
 test "a record rebuilt from another's fields is written into the constructor that holds it" {
