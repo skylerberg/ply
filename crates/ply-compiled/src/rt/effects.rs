@@ -5,8 +5,7 @@ use super::*;
 /// The label a clause written `[*t]` reads, lifted through the `String` type its `handle` site
 /// handed; 0 with the context failed where it does not lift.
 pub(crate) fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
-    let label = Value::Str(Arc::from(label.as_str()));
-    lifted(ctx, &label, string).map_or(0, Handed::word)
+    string_lifted(ctx, label.as_str(), string).map_or(0, Handed::word)
 }
 
 /// The label the field-table entry `resource` names, lifted through `string`, the type of `String`:
@@ -428,8 +427,7 @@ pub unsafe extern "C" fn rt_pending_raised(
     };
     c.failed = 0;
     c.diagnostic = None;
-    let message = Value::str(message);
-    lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+    string_lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
 }
 
 /// The words of the raise [`FAILED_PENDING`] stands for, where it is a raise of the effect and

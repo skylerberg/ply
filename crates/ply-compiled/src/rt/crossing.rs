@@ -788,6 +788,14 @@ pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
     lifted_from(ctx, bytes, beside, ty)
 }
 
+/// `s` lifted through `string`, the type of `String`; `None` with the context failed where it does
+/// not cross.
+pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
+    let mut w = codec::Writer::new();
+    w.str(s.as_bytes());
+    lifted_from(ctx, w.finish(), Vec::new(), string)
+}
+
 /// `bytes` lifted through `ty`, `beside` the handles they name, whose counts it takes; `None` with
 /// the context failed where they do not cross.
 pub(crate) fn lifted_from(
