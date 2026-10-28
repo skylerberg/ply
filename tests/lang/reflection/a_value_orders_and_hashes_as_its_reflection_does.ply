@@ -1,0 +1,171 @@
+//! `compare`, `digest`, `reflect` and `shown` agree at every kind of type, however a body reaches
+//! them: `compare` orders two values as `std.value.order` orders their reflections, `digest` is
+//! BLAKE3 of the encoding that order's values are written in, and `shown` is `reflect` where no type
+//! states a `show`. A type that states a `key` orders and hashes as its key.
+
+import std.value (Value, Entry, Field, VUnit, VBool, VInt, VFixed, VChar, VDecimal, VStr, VBytes,
+                  VList, VArray, VMap, VRecord, VCtor, VHold, VSecret, VFn, FAnonymous, reflect,
+                  shown, order, width_of)
+
+type Shape = | Circle(Int) | Rect({ w: Int, h: U8 }) | Nothing
+
+type Tree<a> = | Leaf(a) | Node(Tree<a>, Tree<a>)
+
+type Point = new { x: Int, y: I8 }
+
+type Name = | Name(String)
+
+key for Name by size
+
+fn size(n: Name) -> Int = match n { Name(s) -> s.len() }
+
+/// Whether `compare` orders each two of `xs` as `order` orders their reflections, and each of them
+/// hashes the encoding of its reflection and is shown as it is reflected.
+fn agree<a>(xs: List<a>) -> Bool / {abort.raise}
+  where derivable(ord, a), derivable(hash, a)
+=
+  xs.all(|x: a|
+    digest(x) == Bytes::blake3(encoding(reflect(x))) && shown(x) == reflect(x)
+      && xs.all(|y: a|
+        compare(x, y) == order(reflect(x), reflect(y)) && compare_values(x, y) == compare(x, y)))
+
+/// The bytes a value's digest hashes, written over what `v` reads it as: its kind's tag, then its
+/// payload, a count or a length as eight bytes least significant first, a record's fields in
+/// their names' order and a constructor by the name its module declares.
+fn encoding(v: Value) -> Bytes / {abort.raise} =
+  match v {
+    VUnit -> tag(0),
+    VBool(b) -> tag(if b { 2 } else { 1 }),
+    VInt(n) -> tag(3).concat(le(n, 8)),
+    VFixed(ty, bits) -> fixed(ty, bits),
+    VChar(c) -> tag(5).concat(le(Int::of_char(c), 4)),
+    VDecimal(d) -> tag(6).concat(least(d)),
+    VStr(s) -> blob(7, Bytes::of_string(s)),
+    VBytes(b) -> blob(8, b),
+    VList(xs) -> xs.fold(counted(9, xs.len()), |out: Bytes, x: Value| out.concat(encoding(x))),
+    VArray(xs) -> xs.fold(counted(10, xs.len()), |out: Bytes, x: Value| out.concat(encoding(x))),
+    VMap(es) ->
+      es.fold(counted(11, es.len()), |out: Bytes, e: Entry|
+        out.concat(encoding(e.key)).concat(encoding(e.value))),
+    VRecord(fs) ->
+      fs.fold(counted(12, fs.len()), |out: Bytes, f: Field|
+        out.concat(blob(13, Bytes::of_string(f.name))).concat(encoding(f.value))),
+    VCtor(name, args) -> {
+      let parts = name.split(".");
+      let simple = match parts.at(parts.len() - 1) { Some(s) -> s, None -> name };
+      args.fold(
+        blob(14, Bytes::of_string(simple)).concat(counted(15, args.len())),
+        |out: Bytes, x: Value| out.concat(encoding(x)),
+      )
+    },
+    _ -> abort.raise("a value no digest hashes"),
+  }
+
+fn tag(t: Int) -> Bytes / {abort.raise} = byte_of_int(t)
+
+/// `n`'s low `k` bytes, least significant first.
+fn le(n: Int, k: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, k).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
+
+fn counted(t: Int, n: Int) -> Bytes / {abort.raise} = tag(t).concat(le(n, 8))
+
+fn blob(t: Int, b: Bytes) -> Bytes / {abort.raise} = counted(t, b.len()).concat(b)
+
+/// A width below 64 bits as the `Int` it reads as; from 64 bits on, its place among the widths and
+/// its sixteen bytes.
+fn fixed(ty: String, bits: U128) -> Bytes / {abort.raise} = {
+  let width = width_of(ty);
+  if width < 64 {
+    let n = Int::of_u128(bits);
+    tag(3).concat(
+      le(if ty.starts_with("I") && n >> width - 1 == 1 { n - (1 << width) } else { n }, 8),
+    )
+  } else {
+    let places = ["U8", "U16", "U32", "U64", "I8", "I16", "I32", "I64", "U128", "I128"];
+    let place = range(0, places.len()).fold(0, |p: Int, i: Int|
+      if places.at(i) == Some(ty) { i } else { p });
+    Bytes::concat_all(
+      [tag(4), byte_of_int(place)].concat(
+        range(0, 16).map(|i: Int| byte_of_int(Int::of_u128(bits >> 8 * i & 255u128))),
+      ),
+    )
+  }
+}
+
+/// `d` at its least scale, as `Decimal::bits` holds it: `1.50` as `1.5`.
+fn least(d: Decimal) -> Bytes / {abort.raise} = {
+  let text = Decimal::to_string(d);
+  let zeros = if !text.contains(".") { text } else {
+    iterate(text, text.len() + 1, |t: String|
+      if t.ends_with("0") { Continue(t.slice(0, t.len() - 1)) } else { Stop(t) })
+  };
+  let cut = if zeros.ends_with(".") { zeros.slice(0, zeros.len() - 1) } else { zeros };
+  let w = match Decimal::of_string(cut) { Some(x) -> Decimal::bits(x), None -> Decimal::bits(d) };
+  le(w._0, 8).concat(le(w._1, 8))
+}
+
+test "a scalar and a width order and hash as their reflections do" {
+  assert(agree([-5, 0, 7, 9223372036854775807]));
+  assert(agree([false, true]));
+  assert(agree(['a', '\u{e9}', 'z']));
+  assert(agree(["", "a", "ab", "b"]));
+  assert(agree([b"", b"\x00", b"\xff"]));
+  assert(agree([()]));
+  assert(agree([1.5m, 1.50m, -2m, 0m, 120m]));
+  assert(agree([0u8, 200u8]));
+  assert(agree([-3i8, 4i8]));
+  assert(agree([0u64, 18446744073709551615u64]));
+  assert(agree([-1i64, 1i64]));
+  assert(agree([0u128, 340282366920938463463374607431768211455u128]));
+  assert(agree([-1i128, 5i128]))
+}
+
+test "a sum, a record and a container order and hash as their reflections do" {
+  assert(agree([Circle(1), Circle(2), Rect({ w: 1, h: 2u8 }), Nothing]));
+  assert(agree([Leaf(1), Node(Leaf(1), Leaf(2)), Leaf(0)]));
+  let points: List<Point> = [{ x: 1, y: -1i8 }, { x: 1, y: 2i8 }, { x: 0, y: 5i8 }];
+  assert(agree(points));
+  assert(agree([{ a: 1, b: Nothing }, { a: 1, b: Circle(0) }, { a: 0, b: Nothing }]));
+  assert(agree([[], [1], [1, 2], [2]]));
+  assert(agree([Array::of_list([Nothing]), Array::of_list([]), Array::of_list([Circle(3)])]));
+  assert(agree([Map::new(), Map::new().insert("a", [1]), Map::new().insert("b", [])]));
+  assert(
+    agree([
+      Columns::of_list([{ x: 1, y: true }]),
+      Columns::of_list([]),
+      Columns::of_list([{ x: 0, y: false }]),
+    ]),
+  );
+  assert(agree([None, Some(Circle(1)), Some(Nothing)]));
+  let results: List<Result<Int, String>> = [Ok(1), Err("x"), Ok(0)];
+  assert(agree(results));
+  assert(agree([Less, Equal, Greater]));
+  assert(agree([Leaf({ s: [Nothing], t: None }), Leaf({ s: [], t: Some(Leaf(1u8)) })]))
+}
+
+test "a type that states a key orders and hashes as its key" {
+  let names = [Name("ab"), Name("cd"), Name("e")];
+  assert(
+    names.all(|x: Name|
+      digest(x) == Bytes::blake3(tag(16).concat(encoding(reflect(size(x)))))
+        && names.all(|y: Name| compare(x, y) == compare(size(x), size(y)))),
+  )
+}
+
+test "a `Columns` reads, hashes and orders as the array of its records" {
+  let rows = [{ x: 2, y: true }, { x: 1, y: false }];
+  let columns = Columns::of_list(rows);
+  let array = Array::of_list(rows);
+  assert_eq(reflect(columns), reflect(array));
+  assert_eq(shown(columns), shown(array));
+  assert_eq(digest(columns), digest(array));
+  assert_eq(compare(columns, Columns::of_list([])), compare(array, Array::of_list([])))
+}
+
+test "a credential, a hold and a function read as what stands for each" {
+  assert_eq(reflect(Secret::of_string("pw")), VSecret);
+  assert_eq(shown({ k: Secret::of_bytes(b"k") }), VRecord([{ name: "k", value: VSecret }]));
+  assert_eq(with_hold[h](1, |_: Int| ()) { held -> reflect(held) }, VHold);
+  assert_eq(reflect(|n: Int| n + 1), VFn(FAnonymous));
+  assert_eq(shown([size]), VList([VFn(FAnonymous)]))
+}

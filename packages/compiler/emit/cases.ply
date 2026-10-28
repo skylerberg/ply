@@ -7,7 +7,7 @@ import compiler.syntax.parsing (span_key, span_between)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.check.infer (facts_at)
 import compiler.check.types (Type, TyCon, TyRecord, RSingleton, int_type, bytes_type, string_type,
-                             type_spelled)
+                             type_spelled, fn_type, row_empty)
 import compiler.emit.typing (unknown_type)
 import compiler.front
 import compiler.front.rows (Rows, KnownDefRow, Dump, CtorRow, EmitterCtor)
@@ -41,7 +41,7 @@ import compiler.emit.lower.setting (Root)
 import compiler.emit.typing (Typed)
 import compiler.unit (offered_roots)
 import compiler.emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer,
-                      lowered_roots, zip_sources)
+                      lowered_roots, zip_sources, scope_of, answered)
 import compiler.emit.entry (RootForm, Formed, Unformed, emitted_of)
 import compiler.emit.print.counting (last_fn, rel_fn, free_fn, call_text, call_start, takes_count,
                                      lets_count_go, lets_go_of, counts_any)
@@ -1744,6 +1744,213 @@ test "a value is digested through a root written for its type, its parts encoded
   assert(has(record, symbol_of(sum).concat(b"(ctx, ")), None);
   // A keyed type is its key.
   assert(body(keyed).tables.calls.contains(Named(b"m.cents")), None)
+}
+
+/// A module `m` of types of each kind, the program holding `std.value` beside it.
+fn typed_fixture() -> Bytes =
+  Bytes::concat_all([
+    b"import std.value (Value, reflect, shown)\n",
+    b"type Shape = | Circle(Int) | Rect({ w: Int, h: U8 }) | Nothing\n",
+    b"type Tree<a> = | Leaf(a) | Node(Tree<a>, Tree<a>)\n",
+    b"type Stamp = | Stamp(Int)\n",
+    b"show for Stamp by stamped\n",
+    b"fn stamped(s: Stamp) -> String = \"s\"\n",
+    b"type Name = | Name(String)\n",
+    b"key for Name by folded\n",
+    b"fn folded(n: Name) -> String = match n { Name(s) -> s }\n",
+    b"type Point = new { x: Int, y: U8 }\n",
+    b"fn gr<a>(x: a) -> Value = reflect(x)\n",
+    b"fn gs<a>(x: a) -> Value = shown(x)\n",
+    b"fn gc<a>(x: a, y: a) -> Ordering where derivable(ord, a) = compare(x, y)\n",
+    b"fn gd<a>(x: a) -> Bytes where derivable(hash, a) = digest(x)\n",
+  ])
+
+/// The answer of every root `start` keys and of each root written for a type its bodies call,
+/// closed over those calls as a unit walks them, lowered over `typed_fixture` and `defs`.
+fn reached_from(defs: Bytes, start: List<RootKey>) -> List<RootAnswer> / {abort.raise} = {
+  let src = typed_fixture().concat(defs);
+  let shipped = [value_fixture()];
+  let analysed = analyse_pulling_std_with(zip_sources([b"m"], [src]), shipped, no_rows()).out;
+  match analysed { seam::Refused(diags) -> panic(String::of_bytes_lossy(said(diags))), _ -> () };
+  let d = dump_of(analysed);
+  let given = shipped.push({ name: b"m", src: src });
+  match scope_of(
+      given,
+      loaded_ctors(d, []),
+      true,
+      start,
+      [],
+      [],
+      d.embeds,
+      d.rows,
+      d.effects,
+      d.walked,
+    ) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(s) ->
+      iterate(
+        { answers: [], next: start },
+        64,
+        |w: { answers: List<RootAnswer>, next: List<RootKey> }|
+          if w.next.len() == 0 { Stop(w.answers) } else {
+            let all = w.answers.concat(answered(s, w.next, Map::new()));
+            let held = all.map(|a: RootAnswer| a.name);
+            Continue({
+              answers: all,
+              next: all.fold([], |acc: List<RootKey>, a: RootAnswer|
+                match a.answer {
+                  Body(b) ->
+                    b.tables.calls.fold(acc, |more: List<RootKey>, c: RootKey|
+                      match c {
+                        Written(_, _) -> if held.contains(root_name(c)) || more.contains(c) { more }
+                        else { more.push(c) },
+                        _ -> more,
+                      }),
+                  Refused(_) -> acc,
+                }),
+            })
+          },
+      ),
+  }
+}
+
+test "compare, reflect, shown and digest are written at every settled type, none crossing to the runtime" {
+  // Each type both orders and hashes, then each only reflects.
+  let both = [
+    b"Int",
+    b"Bool",
+    b"Char",
+    b"String",
+    b"Bytes",
+    b"Unit",
+    b"Decimal",
+    b"U8",
+    b"I64",
+    b"U128",
+    b"Ordering",
+    b"Shape",
+    b"Tree<Int>",
+    b"Stamp",
+    b"Name",
+    b"Point",
+    b"{}",
+    b"{ a: Int, b: Shape }",
+    b"List<Shape>",
+    b"Array<Point>",
+    b"Map<String, List<Name>>",
+    b"Columns<{ x: Int, y: Bool }>",
+    b"Option<Shape>",
+    b"Result<Int, String>",
+    b"Tree<{ s: List<Name>, t: Option<Tree<U8>> }>",
+  ];
+  let all = both.concat([
+    b"Float",
+    b"keep (Int) -> Int",
+    b"Secret<String>",
+    b"{ f: Float, g: List<Float> }",
+  ]);
+  // Each type's functions are named for its place: `c`, `v` and `d` where it orders and hashes.
+  let fns = |i: Int| if i < both.len() { [b"c", b"v", b"d", b"r", b"s"] } else { [b"r", b"s"] };
+  let defs = Bytes::concat_all(
+    range(0, all.len()).map(|i: Int| {
+      let t = all.get(i);
+      let n = ascii_of_int(i);
+      let one = |f: Bytes, answer: Bytes, call: Bytes|
+        Bytes::concat_all([b"fn ", f, n, b"(a: ", t, b") -> ", answer, b" = ", call, b"(a)\n"]);
+      let two = |f: Bytes, call: Bytes|
+        Bytes::concat_all([
+          b"fn ",
+          f,
+          n,
+          b"(a: ",
+          t,
+          b", b: ",
+          t,
+          b") -> Ordering = ",
+          call,
+          b"(a, b)\n",
+        ]);
+      let reflected = one(b"r", b"Value", b"reflect").concat(one(b"s", b"Value", b"shown"));
+      if i < both.len() {
+        Bytes::concat_all([
+          two(b"c", b"compare"),
+          two(b"v", b"compare_values"),
+          one(b"d", b"Bytes", b"digest"),
+          reflected,
+        ])
+      } else { reflected }
+    }),
+  );
+  let named = range(0, all.len()).fold([], |acc: List<Bytes>, i: Int|
+    acc.concat(fns(i).map(|f: Bytes| Bytes::concat_all([b"m.", f, ascii_of_int(i)]))));
+  // A generic body is settled at its callers' types, each specialisation written as those are.
+  let settled = [b"{a:Int,b:m.Shape}", b"List<m.Shape>", b"m.Tree<Int>"].fold(
+    [],
+    |acc: List<RootKey>, t: Bytes|
+      acc.concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(|g: Bytes| at_spelled(g, [t]))),
+  );
+  // What a kept value's descriptor orders it by, at types no source orders.
+  let kept = [
+    TyCon({ name: b"Float", args: [] }),
+    TyRecord([
+      { name: b"f", ty: TyCon({ name: b"Float", args: [] }) },
+      { name: b"n", ty: int_type() },
+    ]),
+    TyCon({ name: b"List", args: [TyCon({ name: b"Float", args: [] })] }),
+    TyCon({ name: b"Unit", args: [] }),
+    TyRecord([]),
+  ].map(|t: Type| in_m(Order, t));
+  let answers = reached_from(
+    defs,
+    named.map(Named).concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(Named)).concat(settled).concat(
+      kept,
+    ),
+  );
+  assert_eq(
+    answers.fold([], |acc: List<Bytes>, a: RootAnswer|
+      match a.answer {
+        Body(b) -> if b.text.index_of(b"rt_builtin_encoded_p") == None { acc }
+        else { acc.push(answer_name(a)) },
+        Refused(r) -> acc.push(Bytes::concat_all([answer_name(a), b": ", r.why])),
+      }),
+    [],
+  );
+  // The walk reached the roots a `Columns` is reflected, shown and digested through.
+  let columns = TyCon({
+    name: b"Columns",
+    args: [
+      TyRecord([
+        { name: b"x", ty: int_type() },
+        { name: b"y", ty: TyCon({ name: b"Bool", args: [] }) },
+      ]),
+    ],
+  });
+  let names = answers.map(answer_name);
+  assert_eq(
+    [in_m(Reflect, columns), in_m(Shown, columns), in_m(Digest, columns)].map(printed).filter(
+      |n: Bytes| !names.contains(n),
+    ),
+    [],
+  )
+}
+
+test "an order or a digest of a type none is derived for is refused where it is written" {
+  let refused = [
+    in_m(Order, TyRecord([{ name: b"f", ty: fn_type([int_type()], int_type(), row_empty()) }])),
+    in_m(Order, TyCon({ name: b"Secret", args: [string_type()] })),
+    in_m(Digest, TyRecord([{ name: b"f", ty: TyCon({ name: b"Float", args: [] }) }])),
+  ];
+  let answers = reached_from(b"", refused);
+  assert_eq(
+    refused.map(printed).filter(|n: Bytes|
+      !answers.any(|a: RootAnswer|
+        answer_name(a) == n
+          && (match a.answer {
+            Refused(r) -> r.why.index_of(b"none is derived for") != None,
+            Body(_) -> false,
+          }))),
+    [],
+  )
 }
 
 test "an `Ok` of a record held as its box, records laid in it, is made and compared" {
