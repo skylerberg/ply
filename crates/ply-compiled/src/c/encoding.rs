@@ -11,9 +11,12 @@ pub(super) struct Pools {
 }
 
 pub(super) fn encode_pools(builtins: &[Builtin], fields: &[Symbol]) -> String {
-    let mut out = format!("builtins {}\n", builtins.len());
-    for b in builtins {
-        out.push_str(&format!("{}\n", b.name()));
+    let mut out = String::new();
+    if !builtins.is_empty() {
+        out.push_str(&format!("builtins {}\n", builtins.len()));
+        for b in builtins {
+            out.push_str(&format!("{}\n", b.name()));
+        }
     }
     out.push_str(&format!("fields {}\n", fields.len()));
     for f in fields {
@@ -22,15 +25,19 @@ pub(super) fn encode_pools(builtins: &[Builtin], fields: &[Symbol]) -> String {
     out
 }
 
-/// Inverse of [`encode_pools`]; leaves the cursor after them.
+/// Inverse of [`encode_pools`]; leaves the cursor after them. Only a builder the release built
+/// names builtins, which it calls through [`crate::rt::rt_builtin_encoded`].
 pub(super) fn decode_pools(s: &str, at: &mut usize) -> Option<Pools> {
     let mut t = Pools::default();
-    let n = count(line(s, at)?, "builtins")?;
-    for _ in 0..n {
-        t.builtins
-            .push(Builtin::from_name(&Symbol::new(line(s, at)?))?);
+    let mut next = line(s, at)?;
+    if let Some(n) = count(next, "builtins") {
+        for _ in 0..n {
+            t.builtins
+                .push(Builtin::from_name(&Symbol::new(line(s, at)?))?);
+        }
+        next = line(s, at)?;
     }
-    let n = count(line(s, at)?, "fields")?;
+    let n = count(next, "fields")?;
     for _ in 0..n {
         t.fields.push(Symbol::new(line(s, at)?));
     }

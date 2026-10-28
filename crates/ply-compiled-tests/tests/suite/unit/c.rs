@@ -177,13 +177,28 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
 /// roots, in that order.
 #[test]
 fn a_units_table_reads_as_a_unit_writes_it() {
-    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nbuiltins 0\nfields 1\nop\n\
+    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nfields 1\nop\n\
                 entered m.main\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.modules, 3);
     assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.entered, ["m.main"]);
+    assert_eq!(read.encode(), said);
+}
+
+/// The builder the release builds names the builtins it calls through the runtime before its
+/// fields, and reads as it was written.
+#[test]
+fn a_table_naming_builtins_reads_them_before_its_fields() {
+    let said =
+        "helpers 0\nconstants 0\nmodules 1\nrefused 0\nbuiltins 2\npanic\nto_int\nfields 1\nop\n";
+    let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
+    assert_eq!(
+        read.builtins,
+        [ply_core::Builtin::Panic, ply_core::Builtin::ToInt]
+    );
+    assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.encode(), said);
 }
 
@@ -418,7 +433,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 /// A unit says each constant with its row of the code table.
 #[test]
 fn a_unit_says_its_constants_slots() {
-    let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\nbuiltins 0\nfields 0\n";
+    let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\nfields 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.encode(), with);
@@ -432,7 +447,7 @@ fn a_unit_says_its_constants_slots() {
 /// among lines a runtime that does not know them reads as nothing.
 #[test]
 fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
-    let tables = "helpers 0\nconstants 0\nmodules 0\nrefused 0\nbuiltins 0\nfields 0\n";
+    let tables = "helpers 0\nconstants 0\nmodules 0\nrefused 0\nfields 0\n";
     let said = format!("{tables}entered m.main\nentered m.run\n");
     let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");
     assert_eq!(read.entered, ["m.main", "m.run"]);
