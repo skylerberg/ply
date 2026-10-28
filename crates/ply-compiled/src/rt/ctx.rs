@@ -107,7 +107,6 @@ pub struct Ctx {
     /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of:
     /// the bound run's, or one over a host of this context's own.
     pub(crate) runtime_factory: ply_core::RuntimeFactory,
-    pub(crate) declared: Option<ply_core::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
     pub(crate) host_ops: u64,
@@ -272,7 +271,6 @@ impl Ctx {
             binding: Arc::new(ply_core::HostBinding::unbound()),
             runtime: None,
             runtime_factory: ply_host::registry::unbound(),
-            declared: None,
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
             host_ops: 0,
@@ -334,7 +332,6 @@ impl Ctx {
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
         b.runtime_factory = Arc::clone(&self.runtime_factory);
-        b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
         b.id = self.id;
         b.seed = self.seed.clone();

@@ -1,5 +1,6 @@
 //! The prelude, in one definition per builtin.
 
+use crate::crypto::over_values;
 use crate::semantics::arity_error;
 use crate::value::{Decimal, Fixed, FixedOp, Value, first_difference, type_error, values_equal};
 use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, slot};
@@ -565,26 +566,24 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
         Builtin::SecretOfBytes => Ok(Value::secret_bytes(
             args[0].as_bytes(span, "`Secret::of_bytes`")?,
         )),
-        Builtin::SecretEncode => crate::crypto::encode(&args[0], &args[1], span),
-        Builtin::SecretRsaJwk => crate::crypto::rsa_jwk(args, span),
-        Builtin::SecretBytes => crate::crypto::utf8(&args[0], span),
-        Builtin::SecretConcat => crate::crypto::concat(&args[0], &args[1], span),
-        Builtin::SecretDecode => crate::crypto::decode(&args[0], &args[1], span),
-        Builtin::SecretPrivateKey => crate::crypto::private_key(&args[0], span),
-        Builtin::SecretHmac => crate::crypto::hmac(&args[0], &args[1], &args[2], span),
-        Builtin::SecretHkdfExtract => {
-            crate::crypto::hkdf_extract(&args[0], &args[1], &args[2], span)
-        }
+        Builtin::SecretEncode => over_values::encode(&args[0], &args[1], span),
+        Builtin::SecretRsaJwk => over_values::rsa_jwk(args, span),
+        Builtin::SecretBytes => over_values::utf8(&args[0], span),
+        Builtin::SecretConcat => over_values::concat(&args[0], &args[1], span),
+        Builtin::SecretDecode => over_values::decode(&args[0], &args[1], span),
+        Builtin::SecretPrivateKey => over_values::private_key(&args[0], span),
+        Builtin::SecretHmac => over_values::hmac(&args[0], &args[1], &args[2], span),
+        Builtin::SecretHkdfExtract => over_values::hkdf_extract(&args[0], &args[1], &args[2], span),
         Builtin::SecretHkdfExpand => {
-            crate::crypto::hkdf_expand(&args[0], &args[1], &args[2], &args[3], span)
+            over_values::hkdf_expand(&args[0], &args[1], &args[2], &args[3], span)
         }
-        Builtin::SecretPbkdf2 => crate::crypto::pbkdf2(args, span),
-        Builtin::CryptoSeal => crate::crypto::seal(args, span),
-        Builtin::CryptoOpen => crate::crypto::open(args, span),
-        Builtin::CryptoPublic => crate::crypto::public(&args[0], &args[1], span),
-        Builtin::CryptoSign => crate::crypto::sign(&args[0], &args[1], &args[2], span),
-        Builtin::CryptoVerify => crate::crypto::verify(args, span),
-        Builtin::CryptoAgree => crate::crypto::agree(&args[0], &args[1], &args[2], span),
+        Builtin::SecretPbkdf2 => over_values::pbkdf2(args, span),
+        Builtin::CryptoSeal => over_values::seal(args, span),
+        Builtin::CryptoOpen => over_values::open(args, span),
+        Builtin::CryptoPublic => over_values::public(&args[0], &args[1], span),
+        Builtin::CryptoSign => over_values::sign(&args[0], &args[1], &args[2], span),
+        Builtin::CryptoVerify => over_values::verify(args, span),
+        Builtin::CryptoAgree => over_values::agree(&args[0], &args[1], &args[2], span),
     }
 }
 

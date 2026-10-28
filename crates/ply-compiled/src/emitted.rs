@@ -160,8 +160,8 @@ impl Handle {
     }
 }
 
-/// A `Secret`'s handle: a bridge to the credential, lent to a native that takes it and owned by
-/// the code a native answers it to.
+/// A `Secret`'s handle: the runtime object holding the credential ([`crate::secret::Sealed`]), lent
+/// to a native that takes it and owned by the code a native answers it to.
 #[repr(transparent)]
 pub struct SecretHandle(Word);
 

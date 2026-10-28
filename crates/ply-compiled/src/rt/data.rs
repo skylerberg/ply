@@ -261,10 +261,13 @@ pub enum Refused {
     StringFind,
     Assert,
     BytesPosition,
+    SecretDecode,
+    SecretEncode,
+    SecretRsaJwk,
 }
 
 /// Every [`Refused`], each numbered by its place here as emitted code numbers it.
-pub const REFUSED: [Refused; 23] = [
+pub const REFUSED: [Refused; 26] = [
     Refused::ArrayNew,
     Refused::ColumnsNew,
     Refused::ArrayOfList,
@@ -288,6 +291,9 @@ pub const REFUSED: [Refused; 23] = [
     Refused::StringFind,
     Refused::Assert,
     Refused::BytesPosition,
+    Refused::SecretDecode,
+    Refused::SecretEncode,
+    Refused::SecretRsaJwk,
 ];
 
 impl Refused {
@@ -317,6 +323,9 @@ impl Refused {
             Refused::StringFind => "String::find",
             Refused::Assert => "assert",
             Refused::BytesPosition => "Bytes::position",
+            Refused::SecretDecode => "Secret::decode",
+            Refused::SecretEncode => "Secret::encode",
+            Refused::SecretRsaJwk => "Secret::rsa_jwk",
         }
     }
 
@@ -367,7 +376,8 @@ pub(crate) fn refused_unknown(c: &mut Ctx, what: I64) {
 /// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
 /// `byte_of_int` and `Bytes::index_of_byte` a byte `a`; `Bytes::index_of_from` a start `a` in `b`
 /// bytes, and `Bytes::scan` and `Bytes::scan_until` that and a budget `c`; `range` its ends `a` and
-/// `b`; `Bytes::split` and `String::split` nothing. Any other `what` fails the entry as Ply's fault.
+/// `b`; `Bytes::split` and `String::split` nothing; `Secret::rsa_jwk` a list of `a` numbers, which
+/// is not six. Any other `what` fails the entry as Ply's fault.
 #[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c: I64) -> Raises {
     use ply_core::builtins as said;
@@ -405,6 +415,14 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         }
         Refused::Range => said::range_too_long(site, a.0, b.0),
         Refused::BytesSplit | Refused::StringSplit => said::empty_separator(site, name),
+        Refused::SecretRsaJwk => ply_core::crypto::misuse(
+            site,
+            "`Secret::rsa_jwk`",
+            format!(
+                "an RSA key's private numbers are six, and this list holds {}",
+                a.0
+            ),
+        ),
         _ => {
             refused_unknown(cx, what);
             return Raises(());

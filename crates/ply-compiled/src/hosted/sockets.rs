@@ -2,11 +2,12 @@
 //! the label the clause that asks binds. What they are handed and answer is flat as
 //! `ply_host::tcp::wire` reads and writes it; an operation that waits answers a ticket.
 
-use super::{READS, WRITES, asked, done, from_host, given, handed, opened, secret_of, waited};
+use super::{READS, WRITES, asked, done, from_host, given, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
+use crate::secret;
 use ply_core::Diagnostic;
 use ply_host::native::parts_of;
 use ply_host::tcp::{Endpoint, MAX_RECV, SocketOption, TcpHost, Upgrade};
@@ -606,13 +607,13 @@ pub unsafe extern "C" fn rt_net_send_secret(
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return I64(0);
         };
-        let Some(framed) = secret_of(c, &framed) else {
+        let Some(framed) = secret::held(c, &framed) else {
             return I64(0);
         };
         let Some(timeout) = handed(c, "net_send_secret", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let job = net.send_secret(label, conn.0, opened(&framed), timeout, c.site());
+        let job = net.send_secret(label, conn.0, framed.bytes(), timeout, c.site());
         waited(c, "net_send_secret", "`net.send_secret`", job)
     })
 }

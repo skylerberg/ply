@@ -20,6 +20,7 @@ pub mod machine;
 pub mod native;
 mod parallel;
 pub mod rt;
+pub mod secret;
 pub mod stack;
 pub mod tasks;
 mod vm;

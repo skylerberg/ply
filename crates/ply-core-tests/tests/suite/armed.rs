@@ -802,7 +802,7 @@ fn ply_item_bodies_masked(text: &[u8]) -> Vec<bool> {
 
 /// A code a `.ply` source raises. The compiler passes the code as a byte literal —
 /// `diag1(b"E0128", ..)`, `err1(cx, b"E0201", ..)` — and the CLI as the text `diag_of` is handed
-/// after the severity, `diag_of("error", "E0421", ..)`; a plain `"E0128"` anywhere else, in a
+/// after the severity, `diag_of("error", "E0459", ..)`; a plain `"E0128"` anywhere else, in a
 /// rendered-text assertion or in `explain`'s table, is not one.
 fn ply_armed_numbers(sources: &[Source]) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -1296,7 +1296,7 @@ fn every_registered_code_is_constructed_in_production() {
              or Diagnostic::warning(codes::NAME, ..), or passes codes::NAME to a wrapper listed \
              in CODE_INDIRECTION, or a `.ply` source a member ships raises its number as a byte \
              literal, as `diag1(b\"E0128\", ..)` does, or as the code `diag_of` is handed, as \
-             `diag_of(\"error\", \"E0421\", ..)` does. A row in the registry table, an entry in \
+             `diag_of(\"error\", \"E0459\", ..)` does. A row in the registry table, an entry in \
              crates/ply-core/src/host.rs's RESERVED_CODES, any other `\"E0128\"` string, and any \
              mention under #[cfg(test)], inside a Ply `test` or `law` body, or under \
              crates/*/tests/ are NOT armings.",

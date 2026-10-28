@@ -75,6 +75,7 @@ fn every_native_over_machine_data_has_a_helper_of_its_own() {
     assert!(machine.len() > 30, "only {} machine natives", machine.len());
     let declared: Vec<&str> = ply_compiled::hosted::natives()
         .iter()
+        .chain(ply_compiled::secret::natives().iter())
         .chain(ply_compiled::entry::natives().iter())
         .chain(ply_compiled::tasks::natives().iter())
         .map(|n| n.name)

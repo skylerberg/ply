@@ -93,8 +93,8 @@ pub static BRIDGE: RuntimeObject = RuntimeObject {
     },
 };
 
-/// What an entry hands its root for an effect the Rust binding serves: an operation goes to the
-/// binding, and a raise is left unanswered.
+/// What a release's entry hands its root for an effect it took a Rust binding to serve: an
+/// operation is unhandled, since no binding serves one, and a raise is left unanswered.
 pub static HOSTED: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
@@ -152,7 +152,8 @@ unsafe extern "C" fn unserved(
 }
 
 /// A perform the object its entry hands answers, since nothing between answers it: a raise left
-/// unanswered, and any other operation handed to the Rust binding where `hosted`, else refused.
+/// unanswered, and any other operation refused, as unhandled where the object is the bridge or
+/// [`HOSTED`] and as unserved otherwise.
 unsafe fn at_entry(
     ctx: *mut Ctx,
     op: *const PlyOp,
@@ -169,26 +170,20 @@ unsafe fn at_entry(
         return Handed::of(unanswered(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
-    let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
-    if !hosted {
-        let_go(ctx, args, described);
-        let c = unsafe { &mut *ctx };
-        let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
-        let d = ply_core::host::err_unserved(c.site(), &operation);
-        return Handed::of(c.fail(d));
+    if hosted {
+        let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
+        recorded(c, &effect, &name, resource.as_ref(), mode);
     }
-    recorded(c, &effect, &name, resource.as_ref(), mode);
-    Handed::of(unsafe {
-        to_host(
-            ctx,
-            described,
-            &effect,
-            &name,
-            resource.as_ref(),
-            mode,
-            args,
-        )
-    })
+    let_go(ctx, args, described);
+    let c = unsafe { &mut *ctx };
+    let site = c.site();
+    let d = if hosted {
+        ply_core::handler::err_unhandled(site, &effect, &name, resource.as_ref())
+    } else {
+        let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
+        ply_core::host::err_unserved(site, &operation)
+    };
+    Handed::of(c.fail(d))
 }
 
 /// The effect and the operation `described` describes, by their program-wide names.
@@ -311,47 +306,6 @@ fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
         "the clause would capture the continuation of the body the task was spawned in, which is \
          not the task's own: handle the operation inside the task, or resume on the tail",
     )
-}
-
-/// The host's answer to an operation `described` describes, `args` its word forms, which this
-/// takes: each lowered through its parameter's type and let go through it, and the answer lifted
-/// through the operation's. A sleep by a task of the run's region waits there instead.
-unsafe fn to_host(
-    ctx: *mut Ctx,
-    described: &PlyOp,
-    effect: &Symbol,
-    op: &Symbol,
-    resource: Option<&Symbol>,
-    mode: Mode,
-    args: &[Word],
-) -> i64 {
-    if crate::host::production_scheduled(unsafe { &*ctx }, effect, op) {
-        return unsafe { crate::host::schedule(ctx, described, effect, op, resource, args) };
-    }
-    let values = lowered_values(ctx, args, described.params());
-    let_go(ctx, args, described);
-    let values = match values {
-        Ok(values) => values,
-        Err(why) => {
-            let operation = ply_core::host::operation_label(effect, op, resource);
-            let d = error(format!(
-                "an argument of `{operation}` does not lower: {why}"
-            ))
-            .note("this is Ply's fault, not the program's");
-            return unsafe { &mut *ctx }.fail(d);
-        }
-    };
-    let served = unsafe { crate::host::serve(ctx, effect, op, resource, mode, values) };
-    answered(ctx, served, described)
-}
-
-/// What a perform is answered: a value lifted through `described`'s answer, or 0 with the context
-/// failed.
-fn answered(ctx: *mut Ctx, served: Served, described: &PlyOp) -> i64 {
-    match served {
-        Served::Word(w) => w,
-        Served::Value(v) => lifted(ctx, &v, described.answer()).map_or(0, Handed::word),
-    }
 }
 
 /// What a raise carries, as values a diagnostic shows, lowered through their types.

@@ -1,82 +1,19 @@
 use ply_core::host::*;
-use ply_core::{Resource, Symbol};
 
-fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
-    HostOp {
-        effect: Symbol::new(effect),
-        op: Symbol::new(name),
-        resource,
-        determinism: Determinism::Nondeterministic,
-        linearity: Linearity::AtMostOnce,
-        path: "test::handler",
-    }
-}
-
-fn named(r: &str) -> HostResource {
-    HostResource::Only(Resource::Named(Symbol::new(r)))
-}
-
-/// The path of what `binding` serves `effect.op[label]` by, where anything does.
-fn resolved(
-    binding: &HostBinding,
-    effect: &str,
-    op: &str,
-    label: Option<&str>,
-) -> Option<&'static str> {
-    let label = label.map(Symbol::new);
-    (binding.resolve(&Symbol::new(effect), &Symbol::new(op), label.as_ref())).map(|op| op.path)
-}
-
-/// A granted binding serves a perform by its effect's declared name, a reserved or a language
-/// effect's by its program-wide one.
+/// A run's binding keeps what the run is lent, which the natives of the real handlers read.
 #[test]
-fn a_granted_binding_resolves_by_name() {
-    let mut lent = HostRegistry::new();
-    for registered in [
-        op("db", "get", HostResource::Any),
-        op("std.net.net", "send", named("socket")),
-        op("clock", "now", HostResource::Any),
-    ] {
-        lent.register(registered);
-    }
-    let binding = lent.granted(Grants::default());
+fn a_granted_binding_keeps_what_its_run_is_lent() {
+    let binding = HostBinding::granted(Grants::default().with("allow", &["toolchain"]));
     assert!(binding.is_granted());
-    assert_eq!(
-        resolved(&binding, "store.db", "get", Some("users")),
-        Some("test::handler")
-    );
-    assert_eq!(
-        resolved(&binding, "std.net.net", "send", Some("socket")),
-        Some("test::handler")
-    );
-    assert_eq!(
-        resolved(&binding, "clock", "now", None),
-        Some("test::handler")
-    );
-    for (effect, op, label) in [
-        ("app.net", "send", Some("socket")),
-        ("std.net.net", "send", Some("other")),
-        ("m.clock", "now", None),
-    ] {
-        assert_eq!(resolved(&binding, effect, op, label), None, "{effect}.{op}");
-    }
+    assert!(binding.grants().allows("toolchain"));
+    assert!(!binding.grants().allows("memory"));
 }
 
 #[test]
-fn an_unbound_binding_serves_nothing() {
+fn an_unbound_binding_is_lent_nothing() {
     let binding = HostBinding::unbound();
     assert!(!binding.is_granted());
-    assert_eq!(resolved(&binding, "db", "get", Some("users")), None);
-}
-
-/// A registration by one of these names is matched by program-wide name, so the list must be the
-/// effects every program is checked with, which the compiler's own tests pin as well.
-#[test]
-fn the_language_effects_are_the_ones_every_program_is_checked_with() {
-    assert_eq!(
-        LANGUAGE_EFFECTS,
-        ["task", "clock", "random", "sim", "abort", "diverges"]
-    );
+    assert_eq!(binding.grants(), &Grants::default());
 }
 
 #[test]

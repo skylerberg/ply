@@ -8,12 +8,10 @@
 //! name answers.
 
 use crate::c::{MachineNative, machine_native};
-use crate::emitted::SecretHandle;
-use crate::heap::{bridged, obj};
 use crate::native::{Addr, F64, I64, Raises};
 use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
-use ply_core::builtins::{assert_failure, call, not_found};
-use ply_core::{Builtin, Decimal, Diagnostic, Span, Value, codes};
+use ply_core::builtins::{assert_failure, not_found};
+use ply_core::{Decimal, Diagnostic, Span, Value, codes};
 
 /// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {
@@ -28,32 +26,8 @@ pub fn natives() -> Vec<MachineNative> {
             rt_text_encoded as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
         machine_native(
-            "?secret_of",
-            rt_secret_of as unsafe extern "C" fn(_, _, _, _) -> _,
-        ),
-        machine_native(
-            "?secret_verify",
-            rt_secret_verify as unsafe extern "C" fn(_, _, _, _) -> _,
-        ),
-        machine_native(
             "?functions_compared",
             rt_functions_compared as unsafe extern "C" fn(_) -> _,
-        ),
-        machine_native(
-            "?secret_equal",
-            rt_secret_equal as unsafe extern "C" fn(_, _, _) -> _,
-        ),
-        machine_native(
-            "?secret_len",
-            rt_secret_len as unsafe extern "C" fn(_, _) -> _,
-        ),
-        machine_native(
-            "?secret_bytes",
-            rt_secret_bytes as unsafe extern "C" fn(_, _) -> _,
-        ),
-        machine_native(
-            "?secret_concat",
-            rt_secret_concat as unsafe extern "C" fn(_, _, _) -> _,
         ),
         machine_native(
             "?refused_text",
@@ -111,18 +85,6 @@ fn err_machine(why: &str) -> Diagnostic {
 }
 
 impl Ctx {
-    /// What value builtin `b` answers over `args`; `None` with the context failed where it errs,
-    /// which none of the builtins called here does over arguments of their types.
-    fn builtin(&mut self, b: Builtin, args: Vec<Value>) -> Option<Value> {
-        match call(b, args, Span::DUMMY) {
-            Ok(v) => Some(v),
-            Err(d) => {
-                self.fail(d);
-                None
-            }
-        }
-    }
-
     /// The UTF-8 a string lends, which emitted code only ever makes valid.
     pub(crate) fn text<'a>(&mut self, bytes: &'a [u8]) -> Option<&'a str> {
         match std::str::from_utf8(bytes) {
@@ -191,57 +153,6 @@ pub unsafe extern "C" fn rt_blake3(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     unsafe { &mut *ctx }.give(digest.as_bytes().to_vec())
 }
 
-/// A credential holding the `n` bytes at `p`, a `Secret<String>` where `text` is not 0 and a
-/// `Secret<Bytes>` otherwise, with the one count emitted code takes.
-pub unsafe extern "C" fn rt_secret_of(ctx: *mut Ctx, p: Addr, n: I64, text: I64) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
-    let bytes = unsafe { lent(p, n) };
-    let made = if text.0 != 0 {
-        match c.text(bytes) {
-            Some(s) => c.builtin(Builtin::SecretOfString, vec![Value::str(s)]),
-            None => None,
-        }
-    } else {
-        c.builtin(Builtin::SecretOfBytes, vec![Value::bytes(bytes)])
-    };
-    match made {
-        Some(v @ Value::Secret(_)) => SecretHandle::of(c.heap.bridge(v)),
-        _ => SecretHandle::of(0),
-    }
-}
-
-/// 1 where the credential `stored`, which is lent, is a `Secret<String>` holding the string at `p`,
-/// compared in constant time; else 0.
-pub unsafe extern "C" fn rt_secret_verify(
-    ctx: *mut Ctx,
-    stored: SecretHandle,
-    p: Addr,
-    n: I64,
-) -> I64 {
-    let c = unsafe { &mut *ctx };
-    let Some(held) = secret_held(c, &stored) else {
-        return I64(0);
-    };
-    let Some(s) = c.text(unsafe { lent(p, n) }) else {
-        return I64(0);
-    };
-    match c.builtin(Builtin::SecretVerify, vec![held, Value::str(s)]) {
-        Some(Value::Bool(b)) => I64(i64::from(b)),
-        _ => I64(0),
-    }
-}
-
-/// The secret the lent handle `s` holds, or none where it is no runtime object, which fails the
-/// entry as Ply's fault.
-pub(crate) fn secret_held(c: &mut Ctx, s: &SecretHandle) -> Option<Value> {
-    let w = s.word();
-    if !crate::heap::is_bridge(w) {
-        c.fail(err_machine("a credential that is no runtime object"));
-        return None;
-    }
-    Some(unsafe { bridged(obj(w)) }.clone())
-}
-
 /// Fails the run: two functions were compared for equality, which no function has. Answers 0.
 pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     let c = unsafe { &mut *ctx };
@@ -255,63 +166,12 @@ pub unsafe extern "C" fn rt_functions_compared(ctx: *mut Ctx) -> I64 {
     I64(0)
 }
 
-/// 1 where the secrets the lent handles `a` and `b` hold are equal, their bytes compared in constant
-/// time; else 0.
-pub unsafe extern "C" fn rt_secret_equal(ctx: *mut Ctx, a: SecretHandle, b: SecretHandle) -> I64 {
-    let c = unsafe { &mut *ctx };
-    let (Some(x), Some(y)) = (secret_held(c, &a), secret_held(c, &b)) else {
-        return I64(0);
-    };
-    match ply_core::values_equal(&x, &y, Span::DUMMY) {
-        Ok(same) => I64(i64::from(same)),
-        Err(d) => {
-            c.fail(d);
-            I64(0)
-        }
-    }
-}
-
-/// How many bytes the secret the lent handle `s` holds; 0 where it holds none.
-pub unsafe extern "C" fn rt_secret_len(ctx: *mut Ctx, s: SecretHandle) -> I64 {
-    let c = unsafe { &mut *ctx };
-    match &secret_held(c, &s) {
-        Some(Value::Secret(held)) => I64(held.bytes().len() as i64),
-        _ => I64(0),
-    }
-}
-
-/// `Secret::bytes` of the secret the lent handle `s` holds, as a handle of its own.
-pub unsafe extern "C" fn rt_secret_bytes(ctx: *mut Ctx, s: SecretHandle) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
-    let made = secret_held(c, &s).and_then(|v| c.builtin(Builtin::SecretBytes, vec![v]));
-    match made {
-        Some(v @ Value::Secret(_)) => SecretHandle::of(c.heap.bridge(v)),
-        _ => SecretHandle::of(0),
-    }
-}
-
-/// `Secret::concat` of the secrets the lent handles `a` and `b` hold, as a handle of its own.
-pub unsafe extern "C" fn rt_secret_concat(
-    ctx: *mut Ctx,
-    a: SecretHandle,
-    b: SecretHandle,
-) -> SecretHandle {
-    let c = unsafe { &mut *ctx };
-    let made = match (secret_held(c, &a), secret_held(c, &b)) {
-        (Some(x), Some(y)) => c.builtin(Builtin::SecretConcat, vec![x, y]),
-        _ => None,
-    };
-    match made {
-        Some(v @ Value::Secret(_)) => SecretHandle::of(c.heap.bridge(v)),
-        _ => SecretHandle::of(0),
-    }
-}
-
 /// [`rt_refused`](crate::rt::rt_refused) for a builtin whose refusal names text, `what` numbered as
 /// [`REFUSED`](crate::rt::REFUSED) numbers it: `String::find`, which did not find the `m` bytes at
 /// `q` among the `n` at `p`; `String::of_bytes`, given the `n` bytes at `p`, which are not UTF-8;
-/// `assert`, whose message is the string of `n` bytes at `p`, or none where `n` is below 0. Any other
-/// `what` fails the entry as Ply's fault.
+/// `assert`, whose message is the string of `n` bytes at `p`, or none where `n` is below 0;
+/// `Secret::decode` and `Secret::encode`, whose encoding, the `n` bytes at `p`, is none they read or
+/// write. Any other `what` fails the entry as Ply's fault.
 #[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn rt_refused_text(
     ctx: *mut Ctx,
@@ -346,6 +206,18 @@ pub unsafe extern "C" fn rt_refused_text(
                 }
             };
             assert_failure(&message, site)
+        }
+        Refused::SecretDecode | Refused::SecretEncode => {
+            let Some(encoding) = c.text(unsafe { lent(p, n) }) else {
+                return Raises(());
+            };
+            let (what, does) = if r == Refused::SecretDecode {
+                ("`Secret::decode`", "reads")
+            } else {
+                ("`Secret::encode`", "writes")
+            };
+            let why = format!("`{encoding}` is no encoding it {does}");
+            ply_core::crypto::misuse(site, what, why)
         }
         _ => {
             refused_unknown(c, what);

@@ -6,7 +6,7 @@
 //! refusal names, raw, and the runtime raises as the builtin always has.
 
 import compiler.syntax.parsing (Span, dummy_span)
-import compiler.syntax.patterns (LUnit, LInt)
+import compiler.syntax.patterns (LUnit, LInt, LBytes)
 import compiler.check.types (Type, TyCon, TyFn, TyRecord, int_type, bool_type, string_type,
                              bytes_type, option_type, named_type, list_type, fn_type, monomorphic,
                              row_empty)
@@ -29,9 +29,9 @@ import compiler.emit.lower.setting (ctor_named, ctor_sum, prelude_ctor)
 import compiler.emit.lower.held (held_as, case_index, arg_word, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, done, handed, opened,
                                  pair_words, continued, joined, short_circuit, filed)
-import compiler.emit.lower.data (constructed_as, open_needed)
+import compiler.emit.lower.data (constructed_as, open_needed, recorded_as)
 import compiler.emit.lower.scalars (literal)
-import compiler.emit.lower.crossing (addressed, taken_out, over_encoding, blake3_of, concatenated)
+import compiler.emit.lower.crossing (addressed, taken_out, blake3_of, concatenated)
 
 /// Whether a call of builtin `name` is written here.
 pub fn string_builtin(name: Bytes) -> Bool = written().contains(name)
@@ -77,27 +77,8 @@ fn written() -> List<Bytes> =
     b"Secret::bytes",
     b"Secret::concat",
     b"assert",
-  ].concat(
-    encoded(),
-  )
+  ].concat(secret_derivations())
 
-/// The builtins over strings and byte strings always called over their arguments' encoding: cold,
-/// raising, or taking more than a native's six words.
-fn encoded() -> List<Bytes> =
-  [
-    b"Secret::encode",
-    b"Secret::decode",
-    b"Secret::hmac",
-    b"Secret::hkdf_extract",
-    b"Secret::hkdf_expand",
-    b"Secret::pbkdf2",
-    b"crypto_seal",
-    b"crypto_open",
-    b"crypto_public",
-    b"crypto_sign",
-    b"crypto_verify",
-    b"crypto_agree",
-  ]
 
 /// Builtin `name`, one `string_builtin` holds, called on `args`; `callee` is where its name is
 /// written, which the extern's types are filed under.
@@ -119,8 +100,8 @@ pub fn lowered(
     },
     None -> named,
   };
-  if encoded().contains(name) { over_encoding(cx, st, name, args, callee, at) }
-  else if secret_operation(name) { secret_operated(c, st, args) } else {
+  if secret_operation(name) { secret_operated(c, st, args) }
+  else if secret_derivations().contains(name) { secret_derived(c, st, args) } else {
     match args {
       [a, b] -> if name == b"String::concat" || name == b"Bytes::concat" {
         concatenated(c.cx, st, a, b, ty, c.at)
@@ -533,6 +514,284 @@ fn verified(c: Asked, st: Lowering, s: Arg, a: Arg) -> Lowered / {abort.raise} =
   compared(v.st, b"ne", v.arg, AInt(0), c.at)
 }
 
+/// The builtins that compute over a secret's bytes: each a native over the secrets' handles, which
+/// they borrow, and the bytes of the names and plain operands, answering `None` where the native
+/// answers that it has nothing, and the builtin's refusal where a name names nothing it takes.
+fn secret_derivations() -> List<Bytes> =
+  [
+    b"Secret::decode",
+    b"Secret::encode",
+    b"Secret::private_key",
+    b"Secret::rsa_jwk",
+    b"Secret::hmac",
+    b"Secret::hkdf_extract",
+    b"Secret::hkdf_expand",
+    b"Secret::pbkdf2",
+  ]
+
+fn secret_derived(c: Asked, st: Lowering, args: List<Arg>) -> Lowered / {abort.raise} = {
+  let n = c.name;
+  match args {
+    [der] -> if n == b"Secret::private_key" { private_key_read(c, st, der) }
+    else { refuse(st, Containers, b"a secret's builtin on one operand: ".concat(n)) },
+    [a, b] -> if n == b"Secret::decode" { secret_decoded(c, st, a, b) }
+    else if n == b"Secret::encode" { secret_encoded(c, st, a, b) }
+    else { refuse(st, Containers, b"a secret's builtin on two operands: ".concat(n)) },
+    [a, b, x] -> if n == b"Secret::hmac" { secret_hmac(c, st, a, b, x) }
+    else if n == b"Secret::hkdf_extract" { hkdf_extracted(c, st, a, b, x) }
+    else if n == b"Secret::rsa_jwk" { rsa_jwk_made(c, st, a, b, x) }
+    else { refuse(st, Containers, b"a secret's builtin on three operands: ".concat(n)) },
+    [hash, key, info, length] -> hkdf_expanded(c, st, hash, key, info, length),
+    [hash, password, salt, iterations, length] ->
+      pbkdf2_derived(c, st, hash, password, salt, iterations, length),
+    _ -> refuse(st, Containers, b"a secret's builtin on other operands: ".concat(n)),
+  }
+}
+
+fn secret_of(of: Type) -> Type = TyCon({ name: b"Secret", args: [of] })
+
+/// The secret native `native` makes of `args`, which it borrows, held as a `Secret` of `of`.
+fn secret_made(
+  c: Asked,
+  st: Lowering,
+  native: Bytes,
+  args: List<Arg>,
+  of: Type,
+) -> Lowered / {abort.raise} = {
+  let secret = secret_of(of);
+  let made = bound_as(
+    st,
+    secret,
+    RWord,
+    Native({
+      name: native_of(native),
+      args: args,
+      uses: { takes: args.map(|_: Arg| false), owned: true, fails: false, stops: false },
+    }),
+    c.at,
+  );
+  handed(made, held_as(c.cx.setting, secret), c.at)
+}
+
+/// `Some` of the secret of bytes `made`, or `None` where it is empty: a native that makes none
+/// makes an empty one, where what it makes is never empty.
+fn found_secret(c: Asked, made: Lowered) -> Lowered / {abort.raise} = {
+  let n = native_int(made.st, b"?secret_len", [made.arg], c.at);
+  let k = arith(n.st, b"sub", n.arg, AInt(1), c.at);
+  maybe(c.cx, k, secret_of(bytes_type()), |r: Lowering| { st: r, arg: made.arg }, c.at)
+}
+
+/// `Secret::decode(encoding, text)`: `?secret_decodes` says whether the text is one of the
+/// encoding, 0, or not, -1, or the encoding is none it reads, -2, its refusal.
+fn secret_decoded(c: Asked, st: Lowering, encoding: Arg, text: Arg) -> Lowered / {abort.raise} = {
+  let e = addressed(st, encoding, c.at);
+  let t = handed({ st: e.st, arg: text }, RWord, c.at);
+  let s = native_int(t.st, b"?secret_decodes", [e.address, e.count, t.arg], c.at);
+  let reads = compared(s.st, b"ge", s.arg, AInt(0 - 1), c.at);
+  failing_else(
+    c,
+    reads,
+    maybe(
+      c.cx,
+      { st: opened(reads.st), arg: s.arg },
+      secret_of(bytes_type()),
+      |r: Lowering|
+        secret_made(c, r, b"?secret_decoded", [e.address, e.count, t.arg], bytes_type()),
+      c.at,
+    ),
+    |r: Lowering| refused_text(c, r, [e.address, e.count]),
+  )
+}
+
+/// `Secret::encode(encoding, bytes)`, its refusal where `?secret_encodes` says the encoding is none
+/// it writes.
+fn secret_encoded(c: Asked, st: Lowering, encoding: Arg, bytes: Arg) -> Lowered / {abort.raise} = {
+  let e = addressed(st, encoding, c.at);
+  let b = handed({ st: e.st, arg: bytes }, RWord, c.at);
+  let w = native_int(b.st, b"?secret_encodes", [e.address, e.count], c.at);
+  let writes = compared(w.st, b"ne", w.arg, AInt(0), c.at);
+  failing_else(
+    c,
+    writes,
+    secret_made(
+      c,
+      opened(writes.st),
+      b"?secret_encoded",
+      [e.address, e.count, b.arg],
+      string_type(),
+    ),
+    |r: Lowering| refused_text(c, r, [e.address, e.count]),
+  )
+}
+
+/// `Secret::private_key(der)`: the scheme `?secret_key_scheme` leaves taken, none for a count below
+/// 0, and the key of that scheme the document holds.
+fn private_key_read(c: Asked, st: Lowering, der: Arg) -> Lowered / {abort.raise} = {
+  let d = handed({ st: st, arg: der }, RWord, c.at);
+  let n = native_int(d.st, b"?secret_key_scheme", [d.arg], c.at);
+  let key = secret_of(bytes_type());
+  let found = TyRecord([{ name: b"key", ty: key }, { name: b"scheme", ty: string_type() }]);
+  maybe(
+    c.cx,
+    n,
+    found,
+    |r: Lowering| {
+      let scheme = taken_out(r, n.arg, string_type(), c.at);
+      let s = addressed(scheme.st, scheme.arg, c.at);
+      let k = secret_made(c, s.st, b"?secret_key", [d.arg, s.address, s.count], bytes_type());
+      recorded_as(
+        c.cx,
+        k.st,
+        [{ name: b"key", arg: k.arg }, { name: b"scheme", arg: scheme.arg }],
+        found,
+        c.at,
+      )
+    },
+    c.at,
+  )
+}
+
+/// `Secret::rsa_jwk(n, e, private)`: refused for a list that is not six long, else the document
+/// `?secret_rsa_jwk` makes of the six texts `jwk_from` joins, none where it makes none.
+fn rsa_jwk_made(c: Asked, st: Lowering, n: Arg, e: Arg, private: Arg) -> Lowered / {abort.raise} = {
+  let xs = handed({ st: st, arg: private }, RWord, c.at);
+  let count = bound_as(
+    xs.st,
+    int_type(),
+    RInt,
+    Op({
+      op: OContainer(Length),
+      args: [xs.arg],
+      uses: { takes: [false], owned: false, fails: false, stops: false },
+    }),
+    c.at,
+  );
+  let six = compared(count.st, b"eq", count.arg, AInt(6), c.at);
+  let texts = list_type(secret_of(string_type()));
+  let none = secret_made(
+    c,
+    opened(six.st),
+    b"?secret_of",
+    [AInt(0), AInt(0), AInt(0)],
+    bytes_type(),
+  );
+  let joined = root_called(c, none.st, b"jwk_from", texts, [xs.arg, AInt(0), none.arg]);
+  let ns = addressed(joined.st, n, c.at);
+  let es = addressed(ns.st, e, c.at);
+  failing_else(
+    c,
+    six,
+    found_secret(
+      c,
+      secret_made(
+        c,
+        es.st,
+        b"?secret_rsa_jwk",
+        [ns.address, ns.count, es.address, es.count, joined.arg],
+        bytes_type(),
+      ),
+    ),
+    |r: Lowering| refused(c, r, [count.arg]),
+  )
+}
+
+/// `Secret::hmac(hash, key, message)`: the tag `?secret_hmac` leaves taken, none for a count below
+/// 0.
+fn secret_hmac(
+  c: Asked,
+  st: Lowering,
+  hash: Arg,
+  key: Arg,
+  message: Arg,
+) -> Lowered / {abort.raise} = {
+  let h = addressed(st, hash, c.at);
+  let k = handed({ st: h.st, arg: key }, RWord, c.at);
+  let m = addressed(k.st, message, c.at);
+  let n = native_int(m.st, b"?secret_hmac", [h.address, h.count, k.arg, m.address, m.count], c.at);
+  maybe(c.cx, n, bytes_type(), |r: Lowering| taken_out(r, n.arg, bytes_type(), c.at), c.at)
+}
+
+/// `Secret::hkdf_extract(hash, salt, key)`.
+fn hkdf_extracted(
+  c: Asked,
+  st: Lowering,
+  hash: Arg,
+  salt: Arg,
+  key: Arg,
+) -> Lowered / {abort.raise} = {
+  let h = addressed(st, hash, c.at);
+  let s = addressed(h.st, salt, c.at);
+  let k = handed({ st: s.st, arg: key }, RWord, c.at);
+  found_secret(
+    c,
+    secret_made(
+      c,
+      k.st,
+      b"?secret_hkdf_extract",
+      [h.address, h.count, s.address, s.count, k.arg],
+      bytes_type(),
+    ),
+  )
+}
+
+/// `Secret::hkdf_expand(hash, key, info, length)`, none where `?secret_hkdf_expands` says it
+/// expands to no such length.
+fn hkdf_expanded(
+  c: Asked,
+  st: Lowering,
+  hash: Arg,
+  key: Arg,
+  info: Arg,
+  length: Arg,
+) -> Lowered / {abort.raise} = {
+  let h = addressed(st, hash, c.at);
+  let k = handed({ st: h.st, arg: key }, RWord, c.at);
+  let i = addressed(k.st, info, c.at);
+  let l = handed({ st: i.st, arg: length }, RInt, c.at);
+  let s = native_int(l.st, b"?secret_hkdf_expands", [h.address, h.count, l.arg], c.at);
+  maybe(
+    c.cx,
+    s,
+    secret_of(bytes_type()),
+    |r: Lowering|
+      secret_made(
+        c,
+        r,
+        b"?secret_hkdf_expand",
+        [h.address, h.count, k.arg, i.address, i.count, l.arg],
+        bytes_type(),
+      ),
+    c.at,
+  )
+}
+
+/// `Secret::pbkdf2(hash, password, salt, iterations, length)`.
+fn pbkdf2_derived(
+  c: Asked,
+  st: Lowering,
+  hash: Arg,
+  password: Arg,
+  salt: Arg,
+  iterations: Arg,
+  length: Arg,
+) -> Lowered / {abort.raise} = {
+  let h = addressed(st, hash, c.at);
+  let p = handed({ st: h.st, arg: password }, RWord, c.at);
+  let s = addressed(p.st, salt, c.at);
+  let it = handed({ st: s.st, arg: iterations }, RInt, c.at);
+  let l = handed({ st: it.st, arg: length }, RInt, c.at);
+  found_secret(
+    c,
+    secret_made(
+      c,
+      l.st,
+      b"?secret_pbkdf2",
+      [h.address, h.count, p.arg, s.address, s.count, it.arg, l.arg],
+      bytes_type(),
+    ),
+  )
+}
+
 /// `assert(cond, message)`: `()` where `cond` holds, else the builtin's refusal, which carries the
 /// message.
 fn asserted(c: Asked, st: Lowering, cond: Arg, message: Arg) -> Lowered / {abort.raise} = {
@@ -773,7 +1032,16 @@ pub type Written = {
 
 /// Whether `op` names a root written here: each a loop, the builtin's call starting it.
 pub fn strings_root(op: Bytes) -> Bool =
-  [b"range_from", b"split_from", b"chars_from", b"of_chars_from", b"concat_all_from"].contains(op)
+  [
+    b"range_from",
+    b"split_from",
+    b"chars_from",
+    b"of_chars_from",
+    b"concat_all_from",
+    b"jwk_from",
+  ].contains(
+    op,
+  )
 
 /// What root `op` takes and answers at the type `t` it is written for: its parameters' names and
 /// types, then its answer's.
@@ -793,6 +1061,9 @@ fn root_typed(op: Bytes, t: Type) -> { params: List<{ name: Bytes, ty: Type }>, 
     }
   } else if op == b"of_chars_from" {
     { params: [p(b"cs", t), p(b"i", int_type()), p(b"acc", string_type())], ret: string_type() }
+  } else if op == b"jwk_from" {
+    let joined = secret_of(bytes_type());
+    { params: [p(b"xs", t), p(b"i", int_type()), p(b"acc", joined)], ret: joined }
   } else {
     { params: [p(b"bs", t), p(b"i", int_type()), p(b"acc", bytes_type())], ret: bytes_type() }
   }
@@ -1014,6 +1285,32 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> Written / {abort.raise
         ]),
       ),
     }
+  } else if op == b"jwk_from" {
+    // Each text after the ones before it, behind a `.`, which no base64url text holds.
+    let dot = builtin(b"Secret::of_bytes", 3, [at(NLit(LBytes(b".")))]);
+    let text = builtin(b"Secret::bytes", 4, [local(b"x", 3)]);
+    {
+      code: on_some(
+        builtin(b"List::at", 1, [v(0), v(1)]),
+        b"x",
+        3,
+        2,
+        again([
+          v(0),
+          bin(b"add", v(1), lit(1)),
+          builtin(b"Secret::concat", 5, [v(2), builtin(b"Secret::concat", 6, [dot, text])]),
+        ]),
+        v(2),
+      ),
+      typed: filed([
+        { k: 1, ty: unknown_type(), args: [item] },
+        { k: 2, ty: item, args: [] },
+        { k: 3, ty: unknown_type(), args: [] },
+        { k: 4, ty: unknown_type(), args: [] },
+        { k: 5, ty: unknown_type(), args: [] },
+        { k: 6, ty: unknown_type(), args: [] },
+      ]),
+    }
   } else {
     // `concat_all_from`: each byte string appended to the one grown so far.
     {
@@ -1074,6 +1371,11 @@ test "each root written here takes its own parameters and is the one definition 
       t: list_type(bytes_type()),
       params: [list_type(bytes_type()), int_type(), bytes_type()],
     },
+    {
+      op: b"jwk_from",
+      t: list_type(secret_of(string_type())),
+      params: [list_type(secret_of(string_type())), int_type(), secret_of(bytes_type())],
+    },
   ];
   cases.fold((), |_: Unit, x: { op: Bytes, t: Type, params: List<Type> }| {
     assert(strings_root(x.op), None);
@@ -1098,20 +1400,20 @@ test "a refusal is numbered as the runtime numbers it, and those between the con
       b"String::find",
       b"assert",
       b"Bytes::position",
+      b"Secret::decode",
+      b"Secret::rsa_jwk",
     ].map(
       refusal,
     ),
-    [0, 7, 8, 17, 20, 21, 22],
+    [0, 7, 8, 17, 20, 21, 22, 23, 25],
   );
   assert_eq(refusal(b"Bytes::concat"), 0 - 1);
-  assert(refusals().drop(8).take(refusals().len() - 9).all(string_builtin), None)
+  assert(refusals().drop(8).filter(|n: Bytes| n != b"Bytes::position").all(string_builtin), None)
 }
 
 test "the builtins written here are told apart from the rest, those always over their encoding among them" {
   assert(
-    [b"String::concat", b"Bytes::at", b"range", b"String::split", b"crypto_seal"].all(
-      string_builtin,
-    ),
+    [b"String::concat", b"Bytes::at", b"range", b"String::split", b"panic"].all(string_builtin),
     None,
   );
   assert(![b"List::len", b"Bytes::len", b"Bytes::position"].any(string_builtin), None)

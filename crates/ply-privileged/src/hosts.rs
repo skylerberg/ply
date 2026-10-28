@@ -99,7 +99,7 @@ impl Hosts {
         }
         Ok(Hosts {
             host: Arc::new(facilities),
-            binding: Arc::new(ply_host::registry().granted(grants.clone())),
+            binding: Arc::new(HostBinding::granted(grants.clone())),
             stop,
         })
     }

@@ -41,20 +41,12 @@ pub const EFFECT_IN_SPEC: &str = "E0417";
 /// A `forall` binder type with no generator, an effectful function type, or a row variable.
 pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
 pub const OBLIGATION_REFUTED: &str = "E0419";
-/// A host registration names an effect, operation or resource the program does not declare.
-pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
-/// Two host registrations claim one atom.
-pub const HOST_HANDLER_CONFLICT: &str = "E0422";
-/// A host handler declared nondeterministic for an effect not declared `nondet`.
-pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
 /// An operation reached the host boundary with nothing bound to serve it.
 pub const HOST_UNBOUND: &str = "E0424";
 /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
 pub const HOST_IN_SIMULATION: &str = "E0425";
 /// A continuation was resumed a second time across an at-most-once host operation.
 pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
-/// A host handler answered an atom outside its entry point's declared footprint.
-pub const HOST_FOOTPRINT_ESCAPE: &str = "E0427";
 /// A listener, a connection presenting one, or `--mtls` named a credential the binding does not
 /// hold.
 pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";

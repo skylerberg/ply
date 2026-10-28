@@ -130,6 +130,7 @@ pub fn machine_natives() -> &'static [MachineNative] {
     ALL.get_or_init(|| {
         let mut all = machine_table();
         all.extend(crate::machine::natives());
+        all.extend(crate::secret::natives());
         all.extend(crate::hosted::natives());
         all.extend(crate::entry::natives());
         all.extend(crate::tasks::natives());

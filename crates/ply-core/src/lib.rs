@@ -1,5 +1,5 @@
-//! The runtime's vocabulary: values, spans, diagnostics and their codes, effects and their
-//! footprints, and the host boundary.
+//! The runtime's vocabulary: values, spans, diagnostics and their codes, effects and their atoms,
+//! and the host boundary.
 
 // `Value` holds `Arc` payloads and is not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
@@ -38,10 +38,10 @@ mod value;
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use builtins::{Builtin, assert_failure, assertion_failure};
 pub use escape::{Boundary, Escapee, Handle};
-pub use footprint::{EffectAtom, Footprint, Mode, Resource, atom_texts, label_var_name};
+pub use footprint::{EffectAtom, Mode, Resource, label_var_name};
 pub use host::{
-    Determinism, HostBinding, HostOp, HostRegistry, HostResource, HostRuntime, HostUse, Linearity,
-    Pending, RuntimeFactory, ShutdownReport,
+    Determinism, HostBinding, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
+    ShutdownReport,
 };
 pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};

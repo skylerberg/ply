@@ -3,12 +3,12 @@
 //! Each answers what `ply_host::fs` writes of it. A read is no function of its arguments, and
 //! asking twice may answer otherwise, so every one is asked as a write.
 
-use super::{WRITES, asked, from_host, handed, opened, secret_of, text_at};
+use super::{WRITES, asked, from_host, handed, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64};
 use crate::rt::{Ctx, lent};
-use ply_core::Value;
+use crate::secret;
 use ply_core::crypto::Framing;
 use ply_host::fs::{Chunk, Op, Opening, Second};
 use ply_host::jobs::Work;
@@ -429,13 +429,13 @@ pub unsafe extern "C" fn rt_fs_write_secret(
         (lp, ln),
         (pp, pn),
         |c| {
-            let held = secret_of(c, &secret)?;
+            let held = secret::held(c, &secret)?;
             let encoding = text_at(c, ep, en)?;
             let framing = Framing::named(&encoding, Op::WriteSecret.what(), c.site())
                 .map_err(|d| c.fail(d))
                 .ok()?;
             let (before, after) = unsafe { (lent(bp, bn), lent(ap, an)) };
-            Some(Second::Sealed(framing.framed(before, opened(&held), after)))
+            Some(Second::Sealed(framing.framed(before, held.bytes(), after)))
         },
     )
 }
@@ -484,7 +484,7 @@ pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> Secre
     asked(ctx, "fs_secret_taken", WRITES, SecretHandle::of(0), |c| {
         let kept = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
         match handed(c, "fs_secret_taken", "a secret's number", kept) {
-            Some(kept) => SecretHandle::of(c.heap.bridge(Value::secret_bytes(&kept))),
+            Some(kept) => secret::sealed(c, false, kept),
             None => SecretHandle::of(0),
         }
     })

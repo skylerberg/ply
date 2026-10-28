@@ -2,7 +2,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 mod certgen;
-mod clock;
 mod config;
 mod fs;
 mod jobs;

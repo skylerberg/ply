@@ -15,10 +15,7 @@ use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, lent};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
-use ply_core::{
-    Diagnostic, EffectAtom, Footprint, Mode, Resource, Seed, Severity, SourceId, Span, Symbol,
-    codes,
-};
+use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
 use ply_host::observe::Recorder;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -94,8 +91,7 @@ pub trait Binder: Send + Sync {
     /// A binding of the families from `grants` alone, or why it could not be made.
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>>;
 
-    /// What the families register under `grants`, and the facts a run's disclosures print, written
-    /// as `std.machine`'s `Hosting`.
+    /// The facts a run's disclosures print under `grants`, written as `std.machine`'s `Hosting`.
     fn hosting(&self, grants: &Grants, w: &mut Writer);
 
     /// The first read `trace` holds that no longer answers as it did under `grants`, as a person
@@ -147,8 +143,6 @@ pub struct Run {
     pub seed: Option<(Seed, u32)>,
     /// One of several runs of one test a search makes: reaching the host is refused.
     pub re_executed: bool,
-    /// What the root may perform, which a host answer outside is refused against.
-    pub declared: Option<Footprint>,
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
     /// Whether its usage counts every perform, those its own handlers answer included.
@@ -164,7 +158,6 @@ impl Run {
             depth,
             seed: None,
             re_executed: false,
-            declared: None,
             measure: false,
             counted: false,
         }
@@ -281,7 +274,6 @@ pub fn enter(
         let runtime: Rc<dyn HostRuntime> = factory();
         ctx.set_host(bound.binding(), Some(runtime), Some(factory));
     }
-    ctx.declared = run.declared.clone();
     ctx.re_executed = run.re_executed;
     ctx.trace_performs(run.counted);
     let (seed, steps) = run
@@ -626,7 +618,7 @@ unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
     unsafe { &mut *ctx }.given(w.finish())
 }
 
-/// `hosting`: what the families register under the grants, and the disclosures' facts.
+/// `hosting`: the disclosures' facts under the grants.
 unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
@@ -766,7 +758,7 @@ struct Asked {
 }
 
 /// `run := int binding, bool hosted, int steps, int timeout_ms, int depth, option(seed),
-/// bool re_executed, option(list(atom)) declared, bool observe, bool measure, bool counted`.
+/// bool re_executed, bool observe, bool measure, bool counted`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
@@ -775,7 +767,6 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let depth = r.int()?;
     let seed = r.option(read_seed)?;
     let re_executed = r.bool()?;
-    let declared = r.option(|r| r.list(read_atom))?;
     let observe = r.bool()?;
     let measure = r.bool()?;
     let counted = r.bool()?;
@@ -789,7 +780,6 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
             depth,
             seed,
             re_executed,
-            declared: declared.map(Footprint::from_atoms),
             measure,
             counted,
         },
@@ -808,48 +798,6 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
         Seed::at(root, path),
         u32::try_from(steps.max(1)).unwrap_or(u32::MAX),
     ))
-}
-
-/// `atom := string effect, resource, bool write, option(string) op`.
-fn read_atom(r: &mut Reader<'_>) -> Result<EffectAtom, String> {
-    let effect = Symbol::new(r.str()?);
-    let resource = read_resource(r)?;
-    let mode = if r.bool()? { Mode::Write } else { Mode::Read };
-    Ok(match r.option(Reader::str)? {
-        Some(op) => EffectAtom::operation(effect, resource, mode, Symbol::new(op)),
-        None => EffectAtom::new(effect, resource, mode),
-    })
-}
-
-/// `resource := tag 0 singleton | 1 string labelled | 2 every | 3 int variable`.
-pub fn read_resource(r: &mut Reader<'_>) -> Result<Resource, String> {
-    Ok(match r.tag(4)? {
-        0 => Resource::Singleton,
-        1 => Resource::Named(Symbol::new(r.str()?)),
-        2 => Resource::Every,
-        _ => {
-            let n = r.count()?;
-            Resource::Var(u32::try_from(n).map_err(|_| format!("a label variable {n}"))?)
-        }
-    })
-}
-
-/// `resource`, as [`read_resource`] reads it.
-pub fn write_resource(w: &mut Writer, resource: &Resource) {
-    match resource {
-        Resource::Singleton => {
-            w.tag(0);
-        }
-        Resource::Named(name) => {
-            w.tag(1).str(name.as_str());
-        }
-        Resource::Every => {
-            w.tag(2);
-        }
-        Resource::Var(n) => {
-            w.tag(3).count(u64::from(*n));
-        }
-    }
 }
 
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),

@@ -5,7 +5,7 @@ use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::I64;
 use crate::rt::Ctx;
-use ply_core::Value;
+use crate::secret;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
@@ -46,7 +46,7 @@ pub unsafe extern "C" fn rt_entropy_secret(ctx: *mut Ctx, n: I64) -> SecretHandl
         READS,
         SecretHandle::of(0),
         |c| match ply_host::random::drawn(usize::try_from(n.0).unwrap_or(0)) {
-            Ok(bytes) => SecretHandle::of(c.heap.bridge(Value::secret_bytes(&bytes))),
+            Ok(bytes) => secret::sealed(c, false, bytes),
             Err(d) => {
                 c.fail(d);
                 SecretHandle::of(0)

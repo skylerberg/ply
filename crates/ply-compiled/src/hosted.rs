@@ -28,13 +28,15 @@ use crate::emitted::SecretHandle;
 use crate::host::HostMark;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
+use crate::secret;
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
-use ply_core::{Diagnostic, Resource, Value, codes};
+use ply_core::{Diagnostic, Resource, codes};
 use ply_host::jobs::{self, Failure, Job, Work};
 use ply_host::native::{found, parts, parts_of, told};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// What a native says of itself when it asks the host: whether what it answers is a function of
 /// what it is handed, and whether asking again changes anything outside the program.
@@ -269,19 +271,6 @@ fn granted<R>(
         return refused;
     }
     asked(ctx, native, asking, refused, answer)
-}
-
-/// The secret the lent handle `s` holds.
-fn secret_of(c: &mut Ctx, s: &SecretHandle) -> Option<Value> {
-    crate::machine::secret_held(c, s)
-}
-
-/// A secret's bytes, which only this side of the boundary reads.
-fn opened(v: &Value) -> &[u8] {
-    match v {
-        Value::Secret(held) => held.bytes(),
-        _ => &[],
-    }
 }
 
 /// What `read` takes of the facilities the run's host lends; `None`, with the run failed, for a
@@ -520,8 +509,8 @@ pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> Sec
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return SecretHandle::of(0);
         };
-        let plain = configured(c, key, true).unwrap_or_default();
-        SecretHandle::of(c.heap.bridge(Value::secret_text(&plain)))
+        let plain = Zeroizing::new(configured(c, key, true).unwrap_or_default().into_bytes());
+        secret::sealed(c, true, plain)
     })
 }
 
@@ -543,7 +532,8 @@ pub unsafe extern "C" fn rt_kdf_argon2(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_argon2", COMPUTES, I64(0), |c| {
-        let (Some(password), Some(key)) = (secret_of(c, &password), secret_of(c, &key)) else {
+        let (Some(password), Some(key)) = (secret::held(c, &password), secret::held(c, &key))
+        else {
             return I64(0);
         };
         let Some(variant) = c.text(unsafe { lent(variant_at, variant_len) }) else {
@@ -551,9 +541,9 @@ pub unsafe extern "C" fn rt_kdf_argon2(
         };
         let work = password::Work::argon2(
             variant,
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
-            opened(&key),
+            key.bytes(),
             unsafe { lent(data_at, data_len) },
             memory.0,
             passes.0,
@@ -577,11 +567,11 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_scrypt", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
         let work = password::Work::scrypt(
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
             log_n.0,
             r.0,
@@ -601,14 +591,11 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
     cost: I64,
 ) -> I64 {
     asked(ctx, "kdf_bcrypt", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
-        let work = password::Work::bcrypt(
-            opened(&password),
-            unsafe { lent(salt_at, salt_len) },
-            cost.0,
-        );
+        let work =
+            password::Work::bcrypt(password.bytes(), unsafe { lent(salt_at, salt_len) }, cost.0);
         c.hashed("kdf_bcrypt", "`kdf.bcrypt`", work)
     })
 }
@@ -626,7 +613,7 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_pbkdf2", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
         let Some(hash) = c.text(unsafe { lent(hash_at, hash_len) }) else {
@@ -634,7 +621,7 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
         };
         let work = password::Work::pbkdf2(
             hash,
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
             iterations.0,
             length.0,

@@ -1027,7 +1027,7 @@ test "a builtin the runtime answers a sum of crosses over its encoding, and a wo
     b"fn added(a: Int, b: Int) -> Option<Int> = checked_add(a, b)\n",
     b"fn multiplied(a: Int, b: Int) -> Option<Int> = checked_mul(a, b)\n",
     b"fn wide(a: U64, b: U64) -> Option<U64> = checked_add(a, b)\n",
-    b"fn decoded(s: Secret<String>) -> Option<Secret<Bytes>> / {abort.raise} = Secret::decode(\"hex\", s)\n",
+    b"fn whole(x: U8) -> Option<Int> = to_int(x)\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
@@ -1153,6 +1153,86 @@ test "observe answers its value hidden from the C compiler behind the head's bar
     [],
   );
   assert_eq(lacking(pairs, b"ply_observed_pair("), [])
+}
+
+test "a secret's builtins are written over the natives of its handle, none over their arguments' encoding" {
+  let calls = [
+    { src: b"Secret::decode(\"hex\", t)", native: b"secret_decoded" },
+    { src: b"Secret::encode(\"hex\", b)", native: b"secret_encoded" },
+    { src: b"Secret::private_key(b)", native: b"secret_key" },
+    { src: b"Secret::rsa_jwk(m, m, ts)", native: b"secret_rsa_jwk" },
+    { src: b"Secret::hmac(\"SHA-256\", b, m)", native: b"secret_hmac" },
+    { src: b"Secret::hkdf_extract(\"SHA-256\", m, b)", native: b"secret_hkdf_extract" },
+    { src: b"Secret::hkdf_expand(\"SHA-256\", b, m, 32)", native: b"secret_hkdf_expand" },
+    { src: b"Secret::pbkdf2(\"SHA-256\", b, m, 1, 32)", native: b"secret_pbkdf2" },
+    {
+      src: b"Secret::concat(Secret::bytes(Secret::of_string(\"a\")), b)",
+      native: b"secret_concat",
+    },
+    { src: b"Secret::verify(t, \"a\") == Secret::is_empty(b)", native: b"secret_verify" },
+  ];
+  let params = b"(t: Secret<String>, b: Secret<Bytes>, m: Bytes, ts: List<Secret<String>>)";
+  let src = Bytes::concat_all(
+    range(0, calls.len()).map(|i: Int|
+      Bytes::concat_all([
+        b"fn f",
+        ascii_of_int(i),
+        params,
+        b" -> Unit / {abort.raise} = { let _ = ",
+        calls.get(i).src,
+        b"; () }\n",
+      ])),
+  );
+  let out = emit_all_program([{ name: b"m", src: src }], [], true);
+  assert_eq(out.map(|e: Emitted| e.why), calls.map(|_: { src: Bytes, native: Bytes }| None));
+  assert_eq(
+    range(0, calls.len()).filter(|i: Int| {
+      let code = own_code(out.get(i).text);
+      code.index_of(b"rt_builtin_encoded_p(") != None
+        || code.index_of(builtin_helper(b"?".concat(calls.get(i).native)).concat(b"_p(")) == None
+    }),
+    [],
+  )
+}
+
+test "the crypto operations call their natives over machine words, the natives answering what they refuse" {
+  let crypto = Bytes::concat_all([
+    b"pub fn crypto_seal(cipher: String, key: Secret<Bytes>, nonce: Bytes, associated: Bytes, plaintext: Bytes) -> Bytes / {abort.raise} = {\n",
+    b"  let sealed = crypto_sealed(cipher, key, nonce, associated, plaintext);\n",
+    b"  if sealed.len() == 0 { abort.raise(\"too long\") } else { sealed }\n",
+    b"}\n",
+    b"pub fn crypto_verify(scheme: String, public: Bytes, message: Bytes, signature: Bytes) -> Bool / {abort.raise} =\n",
+    b"  match crypto_verified(scheme, public, message, signature) { 1 -> true, 0 -> false, _ -> abort.raise(\"no scheme\") }\n",
+    b"pub fn crypto_agree(scheme: String, key: Secret<Bytes>, peer: Bytes) -> Option<Secret<Bytes>> / {abort.raise} =\n",
+    b"  if !crypto_agrees(scheme) { abort.raise(\"no scheme\") } else {\n",
+    b"    let shared = crypto_agreed(scheme, key, peer);\n",
+    b"    if shared.len() == 0 { None } else { Some(shared) }\n",
+    b"  }\n",
+    b"extern fn crypto_sealed(cipher: String, key: Secret<Bytes>, nonce: Bytes, associated: Bytes, plaintext: Bytes) -> Bytes\n",
+    b"extern fn crypto_verified(scheme: String, public: Bytes, message: Bytes, signature: Bytes) -> Int\n",
+    b"extern fn crypto_agrees(scheme: String) -> Bool\n",
+    b"extern fn crypto_agreed(scheme: String, key: Secret<Bytes>, peer: Bytes) -> Secret<Bytes>\n",
+  ]);
+  let module = b"std.internal.crypto";
+  let roots = [
+    { name: b"crypto_seal", natives: [b"crypto_sealed"] },
+    { name: b"crypto_verify", natives: [b"crypto_verified"] },
+    { name: b"crypto_agree", natives: [b"crypto_agrees", b"crypto_agreed"] },
+  ];
+  let answers = answers_at(
+    [module],
+    [crypto],
+    [b"Some", b"None"],
+    roots.map(|r: { name: Bytes, natives: List<Bytes> }| Named(qualify(module, r.name))),
+  );
+  assert_eq(
+    roots.filter(|r: { name: Bytes, natives: List<Bytes> }| {
+      let code = own_code(answered_body(answers, qualify(module, r.name)).text);
+      code.index_of(b"rt_builtin_encoded_p(") != None
+        || r.natives.any(|n: Bytes| code.index_of(builtin_helper(n).concat(b"_p(")) == None)
+    }).map(|r: { name: Bytes, natives: List<Bytes> }| r.name),
+    [],
+  )
 }
 
 test "a record rebuilt from another's fields is written into the constructor that holds it" {

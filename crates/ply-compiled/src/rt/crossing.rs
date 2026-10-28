@@ -669,7 +669,7 @@ impl Ctx {
     fn lift_holding(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
         let beside = held
             .into_iter()
-            .map(|v| Lifted::Runtime(self.heap.bridge(v)))
+            .map(|v| Lifted::Runtime(crate::secret::runtime_object(&mut self.heap, v)))
             .collect();
         self.lift_from(bytes, beside);
     }
@@ -756,22 +756,6 @@ fn arguments(v: Value) -> Result<Vec<Value>, String> {
     }
 }
 
-/// The values `args` stand for, each lowered through its type.
-pub(crate) fn lowered_values(
-    ctx: *mut Ctx,
-    args: &[Word],
-    types: &[&'static PlyType],
-) -> Result<Vec<Value>, String> {
-    arguments(lowered_value(ctx, |ctx| {
-        if let Ok(l) = unsafe { &mut *ctx }.lowering() {
-            l.w.count(tag::LIST, args.len() as u64);
-        }
-        for (w, ty) in args.iter().zip(types) {
-            unsafe { (ty.lower)(ctx, *w) };
-        }
-    })?)
-}
-
 /// `v`'s bytes, and the values they cannot hold in the order their handles name them.
 pub(crate) fn encoded(v: &Value) -> (Vec<u8>, Vec<Value>) {
     let mut held = Vec::new();
@@ -790,7 +774,7 @@ pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
     let c = unsafe { &mut *ctx };
     let beside = held
         .into_iter()
-        .map(|v| Lifted::Runtime(c.heap.bridge(v)))
+        .map(|v| Lifted::Runtime(crate::secret::runtime_object(&mut c.heap, v)))
         .collect();
     lifted_from(ctx, bytes, beside, ty)
 }

@@ -2,7 +2,6 @@
 
 // A line for each family, here and wherever else they are listed, in alphabetical order: two
 // families added at once then touch different lines.
-use crate::clock;
 use crate::config;
 use crate::fs;
 use crate::pool::{Bell, Run, err_nothing_outstanding};
@@ -12,10 +11,8 @@ use crate::sqlite;
 use crate::tcp;
 use crate::time;
 use crate::trace;
-use ply_core::host::{
-    HostOp, HostRegistry, HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport,
-};
-use ply_core::{Diagnostic, Span, Symbol, TaskId, Value, codes};
+use ply_core::host::{HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport};
+use ply_core::{Diagnostic, Span, Symbol, TaskId, codes};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -150,42 +147,6 @@ impl Host {
     pub fn shutdown(&self) -> Option<&Arc<Shutdown>> {
         self.shutdown.as_ref()
     }
-}
-
-/// Every operation the runtime serves itself: the language's `clock`.
-pub fn registry() -> HostRegistry {
-    let mut registry = HostRegistry::new();
-    clock::register(&mut registry);
-    registry
-}
-
-/// What the runtime answers `op`, one of [`registry`]'s, performed with `args` under `runtime`.
-///
-/// # Errors
-/// The clock refused, or `op` is none of [`registry`]'s.
-pub fn answer(
-    op: &HostOp,
-    runtime: &dyn HostRuntime,
-    args: &[Value],
-    span: Span,
-) -> Result<Value, Diagnostic> {
-    match clock::Op::of(op) {
-        Some(clock) => clock::answer(clock, runtime, args, span),
-        None => Err(err_unserved(op, span)),
-    }
-}
-
-#[cold]
-fn err_unserved(op: &HostOp, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        format!(
-            "`{}.{}` reached the host boundary, which answers only the language's `clock`",
-            op.effect, op.op
-        ),
-    )
-    .primary(span, "performed here")
-    .note("this is a defect in Ply's host dispatch rather than in the program")
 }
 
 /// A runtime factory for a run no host was bound for: every runtime it makes, a `parallel`
