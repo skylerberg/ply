@@ -1,7 +1,7 @@
 //! The natives the real handlers of the standard library's host effects call (`host for`): each asks
 //! the machine the program runs on and answers machine data, integers, bytes or a secret, which the
-//! effect's module reads into its own types. Each refuses where a run may not reach the host,
-//! inside a `simulate` region or in a test the search re-runs, as a host operation does.
+//! effect's module reads into its own types. Each that asks the host refuses where a run may not
+//! reach it, inside a `simulate` region or in a test the search re-runs, as a host operation does.
 //!
 //! A native that would block the program's thread hands a job to the process's pools and answers a
 //! ticket, which `job_wait` reads the job's bytes by: the running task waits in a production
@@ -10,10 +10,18 @@
 //! A native answering structured data writes it in the flat forms of `ply_host::native`.
 
 mod dns;
+mod env;
+mod fs;
+pub mod meter;
+mod process;
+pub mod random;
+pub mod shipped;
 pub mod signal;
 mod sockets;
 mod sqlite;
 pub mod term;
+pub mod time;
+pub mod toolchain;
 mod trace;
 
 use crate::c::{MachineNative, machine_native};
@@ -21,13 +29,15 @@ use crate::emitted::SecretHandle;
 use crate::host::HostMark;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
+use crate::secret;
 use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
-use ply_core::{Diagnostic, Resource, Value, codes};
-use ply_host::jobs::{self, Job, Work};
-use ply_host::native::{found, parts, told};
+use ply_core::{Diagnostic, Resource, codes};
+use ply_host::jobs::{self, Failure, Job, Work};
+use ply_host::native::{found, parts, parts_of, told};
 use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 /// What a native says of itself when it asks the host: whether what it answers is a function of
 /// what it is handed, and whether asking again changes anything outside the program.
@@ -123,10 +133,18 @@ pub fn natives() -> Vec<MachineNative> {
         ),
     ];
     natives.extend(dns::natives());
+    natives.extend(env::natives());
+    natives.extend(fs::natives());
+    natives.extend(meter::natives());
+    natives.extend(process::natives());
+    natives.extend(random::natives());
+    natives.extend(shipped::natives());
     natives.extend(signal::natives());
     natives.extend(sockets::natives());
     natives.extend(sqlite::natives());
     natives.extend(term::natives());
+    natives.extend(time::natives());
+    natives.extend(toolchain::natives());
     natives.extend(trace::natives());
     natives
 }
@@ -170,10 +188,22 @@ impl Ctx {
         work: Work,
         job: impl FnOnce() -> Result<Vec<u8>, String> + Send + 'static,
     ) -> I64 {
+        self.refusing(native, what, work, move || job().map_err(Failure::Said))
+    }
+
+    /// The ticket of `job` as [`Ctx::submitted`] hands one, where the job may refuse with a
+    /// diagnostic of its own.
+    fn refusing(
+        &mut self,
+        native: &'static str,
+        what: &'static str,
+        work: Work,
+        job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+    ) -> I64 {
         let span = self.site();
         let runtime = self.host_runtime();
         let submitted = ply_host::registry::run_of(&*runtime)
-            .and_then(|run| jobs::submit(work, run, span, native, what, job));
+            .and_then(|run| jobs::refusing(work, run, span, native, what, job));
         match submitted {
             Ok(pending) => I64(pending.token as i64),
             Err(d) => {
@@ -219,17 +249,30 @@ fn asked<R>(
     }
 }
 
-/// The secret the lent handle `s` holds.
-fn secret_of(c: &mut Ctx, s: &SecretHandle) -> Option<Value> {
-    crate::machine::secret_held(c, s)
-}
-
-/// A secret's bytes, which only this side of the boundary reads.
-fn opened(v: &Value) -> &[u8] {
-    match v {
-        Value::Secret(held) => held.bytes(),
-        _ => &[],
+/// What `answer` answers where the run is lent `family` and the native `native` may ask the host
+/// as `asking` says; `refused`, with the run failed, where it is not lent the family.
+fn granted<R>(
+    ctx: *mut Ctx,
+    family: &'static str,
+    native: &'static str,
+    asking: Asking,
+    refused: R,
+    answer: impl FnOnce(&mut Ctx) -> R,
+) -> R {
+    let c = unsafe { &mut *ctx };
+    if !c.binding.grants().allows(family) {
+        c.fail(
+            Diagnostic::error(
+                codes::CAPABILITY_UNDECLARED,
+                format!(
+                    "the native `{native}` is the family `{family}`'s, which this run is not lent"
+                ),
+            )
+            .note(format!("`--allow {family}` lends it")),
+        );
+        return refused;
     }
+    asked(ctx, native, asking, refused, answer)
 }
 
 /// What `read` takes of the facilities the run's host lends; `None`, with the run failed, for a
@@ -288,6 +331,28 @@ fn waited(
     }
 }
 
+/// The text a native was lent at `p`; `None`, with the run failed, where it is not UTF-8.
+fn text_at(c: &mut Ctx, p: Addr, n: I64) -> Option<String> {
+    c.text(unsafe { lent(p, n) }).map(str::to_string)
+}
+
+/// The texts lent as parts at `p`; `None`, with the run failed, where they are not.
+fn texts_at(c: &mut Ctx, p: Addr, n: I64) -> Option<Vec<String>> {
+    let read = parts_of(unsafe { lent(p, n) }).and_then(|texts| {
+        texts
+            .into_iter()
+            .map(|t| String::from_utf8(t.to_vec()).ok())
+            .collect::<Option<Vec<String>>>()
+    });
+    if read.is_none() {
+        c.fail(Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a native was handed a list of texts as parts that are not",
+        ));
+    }
+    read
+}
+
 /// The run failed where `done` is a diagnostic.
 fn done(c: &mut Ctx, done: Result<(), Diagnostic>) {
     if let Err(d) = done {
@@ -320,10 +385,13 @@ pub unsafe extern "C" fn rt_job_wait(ctx: *mut Ctx, ticket: I64) -> TakenBytes {
     }
 }
 
-/// What a real handler read of the root the label at `label_at` names, at the path at `path_at`
-/// below it, or wrote there, entered into the record of the run asking where it is observed: `kind`
-/// 0 a file's bytes, 1 a directory's names, 2 what is there, 3 every path below, and 4 a write. A
-/// label no root is bound to holds nothing to record. It asks nothing of the host itself.
+/// What a real handler read or wrote, entered into the record of the run asking where it is
+/// observed. Under the root the label at `label_at` names, at the path at `path_at` below it,
+/// `kind` 0 is a file's bytes read, 1 a directory's names, 2 what is there, 3 every path below,
+/// and 4 a write; a label no root is bound to holds nothing to record. Of what the binary ships,
+/// the label empty, 5 is the shipped module the path names read (every module's name for the empty
+/// path), 6 the program the launcher entered, and 7 and 8 a load's view at the path of the shipped
+/// modules it reached, which it pulled itself for 7. It asks nothing of the host itself.
 pub unsafe extern "C" fn rt_observed(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -343,6 +411,20 @@ pub unsafe extern "C" fn rt_observed(
     ) else {
         return;
     };
+    let how = match kind.0 {
+        0 => Some(Read::File),
+        1 => Some(Read::Dir),
+        2 => Some(Read::Kind),
+        3 => Some(Read::Tree),
+        4 => None,
+        5 => return recorder.shipped(path),
+        6 => return recorder.ran_program(),
+        7 | 8 => return recorder.reached(path, kind.0 == 7),
+        _ => {
+            handed(c, "observed", "a kind of read", None::<()>);
+            return;
+        }
+    };
     let resource = Resource::Named(ply_core::Symbol::new(label));
     let Some(Some(root)) = from_host(c, |facilities| {
         facilities.roots().get(&resource).map(Path::to_path_buf)
@@ -351,17 +433,6 @@ pub unsafe extern "C" fn rt_observed(
     };
     // The path as the program named it: where a link in it leads is read again when the record is.
     let target = root.join(path);
-    let how = match kind.0 {
-        0 => Some(Read::File),
-        1 => Some(Read::Dir),
-        2 => Some(Read::Kind),
-        3 => Some(Read::Tree),
-        4 => None,
-        _ => {
-            handed(c, "observed", "a kind of read", None::<()>);
-            return;
-        }
-    };
     match how {
         Some(how) => recorder.read(how, &target),
         None => recorder.wrote(&target),
@@ -440,8 +511,8 @@ pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> Sec
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return SecretHandle::of(0);
         };
-        let plain = configured(c, key, true).unwrap_or_default();
-        SecretHandle::of(c.heap.bridge(Value::secret_text(&plain)))
+        let plain = Zeroizing::new(configured(c, key, true).unwrap_or_default().into_bytes());
+        secret::sealed(c, true, plain)
     })
 }
 
@@ -463,7 +534,8 @@ pub unsafe extern "C" fn rt_kdf_argon2(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_argon2", COMPUTES, I64(0), |c| {
-        let (Some(password), Some(key)) = (secret_of(c, &password), secret_of(c, &key)) else {
+        let (Some(password), Some(key)) = (secret::held(c, &password), secret::held(c, &key))
+        else {
             return I64(0);
         };
         let Some(variant) = c.text(unsafe { lent(variant_at, variant_len) }) else {
@@ -471,9 +543,9 @@ pub unsafe extern "C" fn rt_kdf_argon2(
         };
         let work = password::Work::argon2(
             variant,
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
-            opened(&key),
+            key.bytes(),
             unsafe { lent(data_at, data_len) },
             memory.0,
             passes.0,
@@ -497,11 +569,11 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_scrypt", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
         let work = password::Work::scrypt(
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
             log_n.0,
             r.0,
@@ -521,14 +593,11 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
     cost: I64,
 ) -> I64 {
     asked(ctx, "kdf_bcrypt", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
-        let work = password::Work::bcrypt(
-            opened(&password),
-            unsafe { lent(salt_at, salt_len) },
-            cost.0,
-        );
+        let work =
+            password::Work::bcrypt(password.bytes(), unsafe { lent(salt_at, salt_len) }, cost.0);
         c.hashed("kdf_bcrypt", "`kdf.bcrypt`", work)
     })
 }
@@ -546,7 +615,7 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     length: I64,
 ) -> I64 {
     asked(ctx, "kdf_pbkdf2", COMPUTES, I64(0), |c| {
-        let Some(password) = secret_of(c, &password) else {
+        let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
         let Some(hash) = c.text(unsafe { lent(hash_at, hash_len) }) else {
@@ -554,7 +623,7 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
         };
         let work = password::Work::pbkdf2(
             hash,
-            opened(&password),
+            password.bytes(),
             unsafe { lent(salt_at, salt_len) },
             iterations.0,
             length.0,

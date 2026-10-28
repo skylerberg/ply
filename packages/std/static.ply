@@ -44,6 +44,7 @@ import std.string
 import std.time (nanos_at)
 import std.url (url_decode)
 import std.gen
+import std.pace (meter, spent)
 
 // --- Entity tags ------------------------------------------------------------
 
@@ -1082,19 +1083,42 @@ test "a file is read a chunk at a time, and a HEAD carries the length a GET woul
   assert_eq((small.body, small.length), (b"0123456789abcdefghij", Some(20)));
   let head = fetched(http::Head, "/data/parts.csv", [], default_options());
   assert_eq((head.status, head.body, head.length), (200, b"", Some(20)));
-  let looked = metered(|| fetched(http::Head, "/data/parts.csv", [], default_options()));
-  assert(
-    !looked.performs.any(|p: { atom: String, count: Int }|
-      p.atom.contains("fs.open") || p.atom.contains("fs.read")),
-    Some("a HEAD opened or read the file"),
-  );
+  // What a HEAD opens or reads, counted between the serving and the files.
+  let asked = {
+    ..http::request_to(http::Head, "example.org", "/data/parts.csv", b""),
+    headers: fields([]),
+  };
+  let reads = with_rand(rand(7), ||
+    fs::on_mem[site](site(), ||
+      handle {
+        http::gathered(serve[site](asked, asked.path, default_options(), noon()).body, 1048576)
+      } with {
+        var n = 0,
+        fs.kind[site](path) -> fs.kind[site](path),
+        fs.stat[site](path) -> fs.stat[site](path),
+        fs.close[site](file) -> fs.close[site](file),
+        fs.open[site](path, how) -> {
+          n = n + 1;
+          fs.open[site](path, how)
+        },
+        fs.read_at[site](path, at, most) -> {
+          n = n + 1;
+          fs.read_at[site](path, at, most)
+        },
+        fs.read_chunk[site](file, most) -> {
+          n = n + 1;
+          fs.read_chunk[site](file, most)
+        },
+        return _body -> n,
+      }).value).value;
+  assert(reads == 0, Some("a HEAD opened or read the file"));
   assert_eq(fetched(http::Post, "/data/parts.csv", [], default_options()).status, 405);
   assert_eq(fetched(http::Get, "/empty/readme.txt", [], default_options()).body, b"")
 }
 
 /// What serving `/big.bin`, a file of `size` bytes each read of which is answered with `block`, to a
 /// client over a connection whose sends are counted and let go cost, and the bytes it sent.
-fn served_large(size: Int, block: Bytes) -> { sent: Int, bytes: Int } / {abort.raise} = {
+fn served_large(size: Int, block: Bytes) -> { sent: Int, bytes: Int } / {meter.read, abort.raise} = {
   let looked = fs::on_mem[big](fs::mem_of([{ path: "big.bin", body: b"" }]), ||
     fs.stat[big]("big.bin"));
   let stat = match looked.value {
@@ -1103,7 +1127,7 @@ fn served_large(size: Int, block: Bytes) -> { sent: Int, bytes: Int } / {abort.r
   };
   let asked = b"GET /big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
   let options = { ..default_options(), chunk: block.len() };
-  let cost = metered(||
+  let cost = spent(||
     handle {
       with_rand(rand(7), ||
         http::serve_connection[conn](7, http::default_limits(), |req: Request|

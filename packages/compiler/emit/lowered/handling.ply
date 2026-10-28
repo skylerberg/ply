@@ -29,10 +29,9 @@ import compiler.emit.tir (Rep, RInt, RWord, RUnit, RImm, RAddr, Var, Arg, AVar, 
 import compiler.emit.tir
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, SiteHere,
-                                   Encoded, Unsettled, Entering, ForwardsLaid, ForwardsSet,
-                                   ObjectAt, InstanceIn, Bridge, Answering, Keyed, Answers, Resumes,
-                                   Stops, Forwarded, Returning, VarInit, VarRead, VarWrite,
-                                   raised_at)
+                                   Unsettled, Entering, ForwardsLaid, ForwardsSet, ObjectAt,
+                                   InstanceIn, Bridge, Answering, Keyed, Answers, Resumes, Stops,
+                                   Forwarded, Returning, VarInit, VarRead, VarWrite, raised_at)
 import compiler.emit.typing (Typed)
 import compiler.check.infer.checker (FiledRows, RowArguments, Performs, prelude_effects, EffectInfo,
                                      OpInfo)
@@ -45,8 +44,9 @@ import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, no
 import compiler.emit.lower.calling (context_of)
 import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched,
                                      handle_planned, detaches)
-import compiler.emit.lower.crossing (crossed, crossing_builtin, encoded_externs, type_described,
-                                     worded, op_described, counts_type, holds_function)
+import compiler.emit.lower.crossing (crossed, crossing_builtin, type_described, worded,
+                                     op_described, holds_function)
+import compiler.emit.lower.containers (builtin)
 import compiler.emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, WHead, WEntry,
                                   entries_of)
 import compiler.emit.lower.scalars (comparison_built)
@@ -937,39 +937,29 @@ fn blocks() -> Bytes =
   Bytes::concat_all([
     b"effect meter {\n  read level() -> Int\n}\n",
     b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
-    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
-    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
   ])
 
-test "a parallel block hands the runtime its branches and tells it its definition's row where that row is closed" {
+test "a parallel block hands the runtime its branches and the descriptor of each one's answer" {
   match program_of(blocks()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
       let int = named(b"Int");
       let branches = [AVar(closure_of(0, int)), AVar(closure_of(1, int))];
-      let lowered = |name: Bytes, own: Bool|
+      let lowered = |name: Bytes|
         match rooted(p, name) {
           None -> [],
           Some(r) ->
-            branched(
-              r.cx,
-              { ..started([]), next: 2 },
-              branches,
-              row_empty(),
-              own,
-              place(),
-            ).st.insts,
+            branched(r.cx, { ..started([]), next: 2 }, branches, row_empty(), place()).st.insts,
         };
-      let ran = |name: Bytes, own: Bool| ops_in(lowered(name, own));
       // What the block gathers is read at each answer's place, the tuple made of those reads.
       assert_eq(
-        lowered(b"reads", true).fold([], |acc: List<Path>, i: Inst|
+        lowered(b"reads").fold([], |acc: List<Path>, i: Inst|
           match i { Let(x) -> match x.val { Get(g) -> acc.push(g.path), _ -> acc }, _ -> acc }),
         [PField({ name: b"_0", at: 0 }), PField({ name: b"_1", at: 1 })],
       );
-      match ran(b"reads", true) {
+      match ops_in(lowered(b"reads")) {
         [o] -> {
-          assert_eq(o.op, Parallel({ reach: Some([{ effect: b"m.meter", resource: None }]) }));
+          assert_eq(o.op, Parallel);
           assert_eq((o.var.ty, o.var.rep), (gathered_of([int, int]), RWord));
           // The closures, taken, then the descriptor of each one's answer, read.
           assert_eq(o.args.take(2), branches);
@@ -982,14 +972,7 @@ test "a parallel block hands the runtime its branches and tells it its definitio
           })
         },
         other -> assert_eq(other.len(), 1),
-      };
-      let told = |name: Bytes, own: Bool|
-        ran(name, own).map(|o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }| o.op);
-      // A row left open says nothing; a definition that performs nothing says so.
-      assert_eq(told(b"open", true), [Parallel({ reach: None })]);
-      assert_eq(told(b"pure", true), [Parallel({ reach: Some([]) })]);
-      // A block outside its definition's own body is told nothing.
-      assert_eq(told(b"reads", false), [Parallel({ reach: None })])
+      }
     },
   }
 }
@@ -1123,7 +1106,7 @@ test "a parallel block's answers are moved into a box in the branches' order, an
   let described = range(11, 22).map(|i: Int| local(i, named(b"Int"), RInt));
   let printed = printed_fn(
     fn_of(b"many", branches.concat(described), [
-      op_let(word(22), Parallel({ reach: None }), branches.concat(described).map(|v: Var| AVar(v))),
+      op_let(word(22), Parallel, branches.concat(described).map(|v: Var| AVar(v))),
       Return(AVar(word(22))),
     ]),
     no_ctors(),
@@ -1144,33 +1127,7 @@ test "a parallel block's answers are moved into a box in the branches' order, an
     text.index_of(b"rt_alloc_bytes_p(ctx, 96);") != None
       && text.index_of(b"ply_words(t2)[10] = t1[10];") != None,
     said,
-  );
-  // Told the definition's row, the runtime reads each effect and resource it names by its entry.
-  let reach = [
-    { effect: b"m.meter", resource: None },
-    { effect: b"m.net", resource: Some(b"conn") },
-  ];
-  let pair = [word(0), word(1), local(2, named(b"Int"), RInt), local(3, named(b"Int"), RInt)];
-  let told = spelled(
-    printed_fn(
-      fn_of(b"told", pair, [
-        op_let(word(4), Parallel({ reach: Some(reach) }), pair.map(|v: Var| AVar(v))),
-        op_let(word(5), Parallel({ reach: Some([]) }), pair.map(|v: Var| AVar(v))),
-        Return(AVar(word(4))),
-      ]),
-      no_ctors(),
-    ).pieces,
-  );
-  // Each effect of the row and its resource (none, or the resource's entry) as a pair of words; an
-  // empty row as none.
-  assert(
-    told.index_of(b"{@@f0@@, -1, @@f1@@, @@f2@@}") != None,
-    Some(String::of_bytes_lossy(told)),
-  );
-  assert_eq(call_args(told, b"rt_branches_past_p").map(|a: List<Bytes>| [a.get(2), a.get(4)]), [
-    [b"2", b"2"],
-    [b"2", b"0"],
-  ])
+  )
 }
 
 test "where an instruction is written is its root, then its offsets from the root's definition" {
@@ -1601,7 +1558,7 @@ test "a label's clauses print as entries and tables over the instance, a detache
       let text = |name: Bytes| match printed_by_form(p, name) { Ok(t) -> t, Err(why) -> why };
       let has = |t: Bytes, s: Bytes| t.index_of(s) != None;
       assert(
-        has(text(b"once"), b"&ply_resumes_labelled") && !has(text(b"once"), b"rt_handle_install"),
+        has(text(b"once"), b"&ply_resumes_labelled"),
         Some(String::of_bytes_lossy(text(b"once"))),
       );
       assert(
@@ -1611,15 +1568,14 @@ test "a label's clauses print as entries and tables over the instance, a detache
       assert(
         has(text(b"told"), b"rt_detached_open_p(") && has(text(b"told"), b"&ply_stops_again")
           && has(text(b"told"), b"&ply_forwarded")
-          && has(text(b"told"), b"&ply_words_mapped")
-          && !has(text(b"told"), b"rt_handle_install"),
+          && has(text(b"told"), b"&ply_words_mapped"),
         Some(String::of_bytes_lossy(text(b"told"))),
       )
     },
   }
 }
 
-test "no handle installs a frame: each prints over its instance, its body detached or not" {
+test "each handle opens an instance where its body runs, detached or not, at the fuel it stands at" {
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -1637,16 +1593,8 @@ test "no handle installs a frame: each prints over its instance, its body detach
       ];
       let texts = names.map(|n: Bytes|
         match printed_by_form(p, n) { Ok(t) -> t, Err(why) -> n.concat(b": ").concat(why) });
-      let framed = [
-        b"rt_handle_install",
-        b"rt_handle_land",
-        b"rt_handle_forwarded",
-        b"rt_dispatch",
-      ];
       let named_if = |keep: (Bytes) -> Bool|
         range(0, names.len()).filter(|k: Int| keep(texts.get(k))).map(|k: Int| names.get(k));
-      assert_eq(named_if(|t: Bytes| framed.any(|f: Bytes| t.index_of(f) != None)), []);
-      // Each opens an instance where its body runs, taking the fuel it stands at.
       assert_eq(named_if(|t: Bytes| t.index_of(b"[0] = ctx->fuel;") == None), [])
     },
   }
@@ -1794,10 +1742,7 @@ test "a handle over an instance sets and reads each of its words through the ins
 fn rows() -> Bytes =
   Bytes::concat_all([
     b"effect meter {\n  read level() -> Int\n}\n",
-    b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
-    b"fn reads() -> (Int, Int) / {meter.level} = parallel { meter.level(), meter.level() }\n",
     b"fn under() -> (Int, Int) = handle { parallel { meter.level(), meter.level() } } with { meter.level() -> 0 }\n",
-    b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
   ])
 
 test "a parallel block is handed the words of what it performs, which the handle around it answers" {
@@ -1809,23 +1754,6 @@ test "a parallel block is handed the words of what it performs, which the handle
         let set = entered_words(t);
         assert(set.len() > 0 && !set.contains(b"0"), Some(String::of_bytes_lossy(t)))
       },
-    },
-  }
-}
-
-test "a parallel block tells the runtime its definition's row only where that row holds all its branches reach" {
-  match program_of(rows()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> {
-      let calls = |helper: Bytes|
-        [b"pure", b"reads", b"under", b"open"].map(|n: Bytes|
-          match printed_by_form(p, n) {
-            Ok(t) -> Ok(t.index_of(helper) != None),
-            Err(why) -> Err(why),
-          });
-      // A block under a `handle`, or in a definition whose row is left open, is told nothing.
-      assert_eq(calls(b"rt_branches_past_p(ctx, "), [Ok(true), Ok(true), Ok(false), Ok(false)]);
-      assert_eq(calls(b"rt_branches_p(ctx, "), [Ok(false), Ok(false), Ok(true), Ok(true)])
     },
   }
 }
@@ -1959,7 +1887,6 @@ fn part_of(v: Val) -> List<Bytes> / {abort.raise} =
     Op(o) -> match o.op {
       OContainer(Taken) -> [b"taken"],
       OContainer(Length) -> [b"length"],
-      OHandle(Encoded(name)) -> [b"encoded ".concat(name)],
       OHandle(Unsettled(name)) -> [b"unsettled ".concat(name)],
       _ -> [b"op"],
     },
@@ -2088,40 +2015,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
   }
 }
 
-test "an extern called over its encoding writes its arguments as a list, has the runtime answer it, and reads its answer" {
-  match program_of(crossings()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match rooted(p, b"same") {
-      None -> assert(false),
-      Some(r) -> match r.code.node {
-        NApp(a) -> {
-          let start = params_of(r.cx);
-          let args = start.vars.map(AVar);
-          let l = crossed(r.cx, start.st, b"assert_eq", args, a.func.span, place());
-          assert_eq(l.st.refused, None);
-          assert_eq(crossed_parts(l.st.insts), [
-            b"builtin_elaborated_lower_open_p",
-            b"builtin_elaborated_out_count_p",
-            b"m.lower#Int",
-            b"m.lower#Int",
-            b"encoded assert_eq",
-            b"m.lift#Unit",
-            b"builtin_elaborated_lift_close_p",
-          ]);
-          assert_eq(
-            calls_in(l.st.insts).take(2).map(
-              |c: { callee: Bytes, args: List<Arg>, handed: List<Handed> }| c.args,
-            ),
-            [[args.get(0)], [args.get(1)]],
-          )
-        },
-        _ -> assert(false),
-      },
-    },
-  }
-}
-
-test "an extern called over its encoding at a type left open is the specialisations' to settle" {
+test "an `assert_eq` at a type left open is the specialisations' to settle" {
   match program_of(crossings()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match rooted(p, b"alike") {
@@ -2129,7 +2023,7 @@ test "an extern called over its encoding at a type left open is the specialisati
       Some(r) -> match r.code.node {
         NApp(a) -> {
           let start = params_of(r.cx);
-          let l = crossed(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func.span, place());
+          let l = builtin(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func.span, place());
           assert_eq(l.st.refused, None);
           assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
           assert(l.st.links.needs.any(|n: Need| n.reads == Exact));
@@ -2144,30 +2038,6 @@ test "an extern called over its encoding at a type left open is the specialisati
         },
         _ -> assert(false),
       },
-    },
-  }
-}
-
-test "the runtime's answer to an extern called over its encoding is asked by the builtin's place in the unit's table" {
-  match program_of(crossings()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> {
-      let text = printed_text(
-        p,
-        fn_of(b"asks", [], [
-          Do({
-            val: Op({
-              op: OHandle(Encoded(b"assert_eq")),
-              args: [],
-              uses: { takes: [], owned: false, fails: true, stops: false },
-            }),
-            at: place(),
-            unwind: [],
-          }),
-          Return(AInt(0)),
-        ]),
-      );
-      assert_eq(call_args(text, b"rt_builtin_encoded_p"), [[b"ctx", b"@@b=assert_eq@@"]])
     },
   }
 }
@@ -2535,15 +2405,6 @@ test "a written root calls only crossing builtins, what it files a type for, and
           contained_reads(c, 0)),
         [true, true, false, false],
       );
-      // A body calling a builtin whose call writes crossing code references what that code calls.
-      assert_eq(
-        encoded_externs().push(b"observe").filter(|n: Bytes|
-          !written_code().builtins.contains(match n.split(b"::").last() {
-            Some(x) -> x,
-            None -> n,
-          })),
-        [],
-      );
       // A record's fields are written in name order, each after its name; a sum's constructor is
       // read back by its program-wide name, the last by elimination.
       let written_names = |k: RootKey|
@@ -2802,53 +2663,6 @@ test "a type's word-form entries open the word for its lowering and box what its
             match i { Let(l) -> match l.val { Pack(x) -> acc.push(x.to), _ -> acc }, _ -> acc })),
         [[RInt], [RWord]],
       )
-    },
-  }
-}
-
-test "a metered call marks the run's cost, calls its function, and lifts what it spent beside the answer" {
-  let src = b"fn spent(xs: List<Int>) -> Int = { let m = metered(|| xs.len()); m.live + m.value + m.performs.len() }\n";
-  match program_of(src) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match checked(p, b"spent") {
-      Err(why) -> assert_eq(why, b""),
-      Ok(f) -> {
-        let first = |at: (Inst) -> Bool / {abort.raise}|
-          range(0, f.body.len()).fold(0 - 1, |acc: Int, i: Int|
-            if acc < 0 && at(f.body.get(i)) { i } else { acc });
-        let native = |part: Bytes|
-          first(|i: Inst|
-            match i {
-              Let(l) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
-              Do(_) -> crossed_parts([i]).any(|n: Bytes| n.index_of(part) != None),
-              _ -> false,
-            });
-        let applied = first(|i: Inst|
-          match i { Let(l) -> match l.val { tir::Apply(_) -> true, _ -> false }, _ -> false });
-        let function = match f.body.get(applied) {
-          Let(l) -> match l.val { tir::Apply(a) -> a.f, _ -> AInt(0) },
-          _ -> AInt(0),
-        };
-        let released = first(|i: Inst| match i { tir::Dec(v) -> AVar(v) == function, _ -> false });
-        let order = [
-          native(b"cost_mark"),
-          applied,
-          native(b"cost_spent"),
-          native(b"lift#"),
-          native(b"lift_close"),
-        ];
-        // The mark, the call, the reading and the lifting, in that order.
-        assert(
-          order.all(|i: Int| i >= 0) && order.sort() == order,
-          Some(String::of_bytes_lossy(printed_text(p, f))),
-        );
-        // The function is held until the counts are read, so its release is not among them.
-        assert(released > native(b"cost_spent"), Some(String::of_bytes_lossy(printed_text(p, f))));
-        // Nothing goes through the runtime's callback.
-        assert(printed_text(p, f).index_of(b"metered") == None, None);
-        // The counts cross back by the lifting written for their type.
-        assert(written_whole(p.setting.ctors, keys::written(Lift, counts_type(), b"m")), None)
-      },
     },
   }
 }

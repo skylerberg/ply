@@ -1,35 +1,48 @@
-//! The cryptographic natives the toolchain implements, which `std.crypto` and `std.ed25519` are
-//! written over.
+//! The cryptographic operations the toolchain implements, which `std.crypto` and `std.ed25519` are
+//! written over: each checks what it is handed and raises for what it takes no part of, and the
+//! natives below it compute.
+
+import std.internal.native (found)
 
 /// `plaintext` sealed under a 32-byte key and a nonce, bound to `associated`: the ciphertext and
 /// then its 16-byte tag. `cipher` is `"aes-256-gcm"` or `"chacha20-poly1305"`, whose nonce is 12
 /// bytes, or `"xchacha20-poly1305"`, whose nonce is 24. Raises for any other cipher or length.
 /// Sealing two messages under one key and nonce gives both away: `std.crypto` is what keeps a
 /// nonce from being used twice.
-pub extern fn crypto_seal(
+pub fn crypto_seal(
   cipher: String,
   key: Secret<Bytes>,
   nonce: Bytes,
   associated: Bytes,
   plaintext: Bytes,
-) -> Bytes / {abort.raise}
+) -> Bytes / {abort.raise} = {
+  keyed("`crypto_seal`", cipher, key, nonce);
+  let sealed = crypto_sealed(cipher, key, nonce, associated, plaintext);
+  if sealed.len() == 0 {
+    abort.raise("`crypto_seal`: the message is longer than the cipher seals under one nonce")
+  } else { sealed }
+}
 
 /// What `crypto_seal` sealed; `None` when the key, the nonce, `associated` or a byte of `sealed`
 /// is not what it was sealed with. Raises as `crypto_seal` does.
-pub extern fn crypto_open(
+pub fn crypto_open(
   cipher: String,
   key: Secret<Bytes>,
   nonce: Bytes,
   associated: Bytes,
   sealed: Bytes,
-) -> Option<Bytes> / {abort.raise}
+) -> Option<Bytes> / {abort.raise} = {
+  keyed("`crypto_open`", cipher, key, nonce);
+  found(crypto_opened(cipher, key, nonce, associated, sealed))
+}
 
 /// A private key's public key. `scheme` is `"ed25519"` (a 32-byte seed to 32 bytes), `"x25519"`
 /// (32 bytes to 32), `"p256"`, `"p384"`, `"p521"` or `"k256"` (a big-endian scalar of 32, 48, 66
 /// or 32 bytes to the uncompressed point) or `"rsa"` (a PKCS #8 or PKCS #1 document, of 2048 to
 /// 4096 bits, to its PKCS #1 public key). `None` for a key that is none of its scheme; raises for
 /// any other scheme.
-pub extern fn crypto_public(scheme: String, key: Secret<Bytes>) -> Option<Bytes> / {abort.raise}
+pub fn crypto_public(scheme: String, key: Secret<Bytes>) -> Option<Bytes> / {abort.raise} =
+  said("`crypto_public`", "`" ++ scheme ++ "` is no key it has", crypto_public_key(scheme, key))
 
 /// A signature over `message`, a function of the key and the message alone. `scheme` is
 /// `"ed25519"` (RFC 8032, 64 bytes); `"ecdsa-p256-sha256"`, `"ecdsa-p384-sha384"`,
@@ -39,11 +52,16 @@ pub extern fn crypto_public(scheme: String, key: Secret<Bytes>) -> Option<Bytes>
 /// as long as the digest, HMAC under the key of the message's digest, so the signature too is a
 /// function of the two). The keys are `crypto_public`'s; `None` for one that is none of its
 /// scheme, and raises for any other scheme.
-pub extern fn crypto_sign(
+pub fn crypto_sign(
   scheme: String,
   key: Secret<Bytes>,
   message: Bytes,
-) -> Option<Bytes> / {abort.raise}
+) -> Option<Bytes> / {abort.raise} =
+  said(
+    "`crypto_sign`",
+    "`" ++ scheme ++ "` is no signature it makes",
+    crypto_signature(scheme, key, message),
+  )
 
 /// Whether `signature` is `message` signed by the key `public` is, under `crypto_sign`'s schemes
 /// (a PSS salt of any value), but for `"ecdsa-p384-sha384"`, whose signature is DER here, as it is
@@ -51,19 +69,244 @@ pub extern fn crypto_sign(
 /// and a secp256k1 `s` in the high half is taken as its low twin. `false` for a key or a
 /// signature that is not one: an Ed25519 `S` at or past the group order, an ECDSA `r` or `s` out
 /// of range, a point off the curve, an RSA key under 2048 bits. Raises for any other scheme.
-pub extern fn crypto_verify(
+pub fn crypto_verify(
   scheme: String,
   public: Bytes,
   message: Bytes,
   signature: Bytes,
-) -> Bool / {abort.raise}
+) -> Bool / {abort.raise} =
+  match crypto_verified(scheme, public, message, signature) {
+    1 -> true,
+    0 -> false,
+    _ -> abort.raise("`crypto_verify`: `" ++ scheme ++ "` is no signature it checks"),
+  }
 
 /// The secret two keys share: `"x25519"` (RFC 7748) or `"p256"` (the shared point's 32-byte `x`).
 /// `None` for a key that is none of its scheme, a peer that is no point of the curve, and an
 /// X25519 result of all zeros. Raises for any other scheme. What it answers is not uniform: derive
 /// keys from it with HKDF.
-pub extern fn crypto_agree(
+pub fn crypto_agree(
   scheme: String,
   key: Secret<Bytes>,
   peer: Bytes,
-) -> Option<Secret<Bytes>> / {abort.raise}
+) -> Option<Secret<Bytes>> / {abort.raise} =
+  if !crypto_agrees(scheme) {
+    abort.raise("`crypto_agree`: `" ++ scheme ++ "` is no agreement it has")
+  } else {
+    let shared = crypto_agreed(scheme, key, peer);
+    if shared.len() == 0 { None } else { Some(shared) }
+  }
+
+/// Raises, as the operation `what` does, for a cipher it has not, a key that is not 32 bytes, or a
+/// nonce that is not as long as the cipher's.
+fn keyed(what: String, cipher: String, key: Secret<Bytes>, nonce: Bytes) -> Unit / {abort.raise} = {
+  let wanted = crypto_nonce_length(cipher);
+  if wanted == 0 { abort.raise(what ++ ": `" ++ cipher ++ "` is no cipher it has") }
+  else if key.len() != 32 {
+    abort.raise(what ++ ": a key is 32 bytes, and this one is " ++ key.len().to_string())
+  } else if nonce.len() != wanted {
+    abort.raise(
+      what ++ ": a `" ++ cipher ++ "` nonce is " ++ wanted.to_string() ++ " bytes, and this one is "
+        ++ nonce.len().to_string(),
+    )
+  } else { () }
+}
+
+/// What a native that can find nothing told, as the operation `what` answers it: found, or a raise
+/// saying `why` for the empty answer it gives a name it has not.
+fn said(what: String, why: String, told: Bytes) -> Option<Bytes> / {abort.raise} =
+  if told.len() == 0 { abort.raise(what ++ ": " ++ why) } else { found(told) }
+
+// The natives, each a function of its arguments that cannot fail: where it has nothing to answer,
+// it answers empty bytes, an empty secret or a code. A name each takes is the operation's above.
+
+/// How many bytes a nonce of `cipher` is; 0 for a cipher `crypto_seal` has not.
+extern fn crypto_nonce_length(cipher: String) -> Int
+
+/// `crypto_seal`'s answer, never empty; empty where it refuses.
+extern fn crypto_sealed(
+  cipher: String,
+  key: Secret<Bytes>,
+  nonce: Bytes,
+  associated: Bytes,
+  plaintext: Bytes,
+) -> Bytes
+
+/// `crypto_open`'s answer, as `found` reads it.
+extern fn crypto_opened(
+  cipher: String,
+  key: Secret<Bytes>,
+  nonce: Bytes,
+  associated: Bytes,
+  sealed: Bytes,
+) -> Bytes
+
+/// `crypto_public`'s answer, as `found` reads it; empty for a scheme it has not.
+extern fn crypto_public_key(scheme: String, key: Secret<Bytes>) -> Bytes
+
+/// `crypto_sign`'s answer, as `found` reads it; empty for a scheme it has not.
+extern fn crypto_signature(scheme: String, key: Secret<Bytes>, message: Bytes) -> Bytes
+
+/// `crypto_verify`'s answer, 1 for `true` and 0 for `false`; -1 for a scheme it has not.
+extern fn crypto_verified(scheme: String, public: Bytes, message: Bytes, signature: Bytes) -> Int
+
+/// Whether `crypto_agree` has `scheme`.
+extern fn crypto_agrees(scheme: String) -> Bool
+
+/// `crypto_agree`'s secret, never empty; empty where it answers `None`.
+extern fn crypto_agreed(scheme: String, key: Secret<Bytes>, peer: Bytes) -> Secret<Bytes>
+
+// --- Tests -----------------------------------------------------------------------------------
+
+/// What `go` raised, where it raised.
+fn raised<a>(go: () -> a / {abort.raise}) -> Option<String> =
+  match try[abort.raise] { go() } { Err(m) -> Some(m), Ok(_) -> None }
+
+test "a secret is written in the encodings it reads, and a text no encoding writes reads as none" {
+  let bytes = Secret::of_bytes(b"foobar");
+  ["hex", "base64", "base64url", "base32"].fold((), |_: Unit, e: String|
+    assert(Secret::decode(e, Secret::encode(e, bytes)) == Some(bytes), Some(e)));
+  assert(Secret::encode("hex", bytes) == Secret::of_string("666f6f626172"));
+  assert(Secret::decode("base32-typed", Secret::of_string("mzxw 6ytb-oi")) == Some(bytes));
+  assert(Secret::decode("hex", Secret::of_string("")) == Some(Secret::of_bytes(b"")));
+  assert(Secret::decode("hex", Secret::of_string("6g")) == None);
+  assert(Secret::decode("base64", Secret::of_string("Zm9v=")) == None)
+}
+
+test "an encoding a secret is not written or read in raises, naming it" {
+  let text = Secret::of_string("x");
+  assert_eq(
+    raised(|| Secret::decode("rot13", text)),
+    Some("`Secret::decode`: `rot13` is no encoding it reads"),
+  );
+  assert_eq(
+    raised(|| Secret::encode("base32-typed", Secret::of_bytes(b"x"))),
+    Some("`Secret::encode`: `base32-typed` is no encoding it writes"),
+  )
+}
+
+test "a keyed hash is none under a hash it has not, and a derived key none past its bounds" {
+  let key = Secret::of_bytes(b"key");
+  assert_eq(
+    Secret::hmac("SHA-256", key, b"The quick brown fox jumps over the lazy dog"),
+    Some(
+      b"\xf7\xbc\x83\xf4\x30\x53\x84\x24\xb1\x32\x98\xe6\xaa\x6f\xb1\x43".concat(
+        b"\xef\x4d\x59\xa1\x49\x46\x17\x59\x97\x47\x9d\xbc\x2d\x1a\x3c\xd8",
+      ),
+    ),
+  );
+  assert_eq(Secret::hmac("MD5", key, b"m"), None);
+  assert(Secret::hkdf_extract("MD5", b"salt", key) == None);
+  match Secret::hkdf_extract("SHA-256", b"salt", key) {
+    None -> assert(false, Some("no key extracted")),
+    Some(prk) -> {
+      assert(Secret::hkdf_expand("SHA-256", prk, b"", 0) == Some(Secret::of_bytes(b"")));
+      let longest = Secret::hkdf_expand("SHA-256", prk, b"", 255 * 32);
+      assert(match longest { Some(k) -> k.len() == 255 * 32, None -> false });
+      [0 - 1, 255 * 32 + 1].fold((), |_: Unit, n: Int|
+        assert(Secret::hkdf_expand("SHA-256", prk, b"", n) == None, Some(n.to_string())));
+      assert(Secret::hkdf_expand("MD5", prk, b"", 0) == None)
+    },
+  };
+  assert(
+    Secret::pbkdf2("SHA-1", Secret::of_bytes(b"password"), b"salt", 1, 20)
+      == Some(
+        Secret::of_bytes(
+          b"\x0c\x60\xc8\x0f\x96\x1f\x0e\x71\xf3\xa9\xb5\x24\xaf\x60\x12\x06\x2f\xe0\x37\xa6",
+        ),
+      ),
+  );
+  [(0, 20), (4294967296, 20), (1, 0), (1, 1048577)].fold((), |_: Unit, bad: (Int, Int)|
+    assert(Secret::pbkdf2("SHA-256", key, b"salt", bad._0, bad._1) == None, None))
+}
+
+/// A PKCS #8 document of the Ed25519 key `seed` is.
+fn ed25519_document(seed: Bytes) -> Bytes =
+  b"\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20".concat(seed)
+
+test "a private key is read out of its document with its scheme, and a document of none is none" {
+  let seed = b"s".repeat(32);
+  match Secret::private_key(Secret::of_bytes(ed25519_document(seed))) {
+    None -> assert(false, Some("no key read")),
+    Some(found) -> {
+      assert_eq(found.scheme, "ed25519");
+      assert(found.key == Secret::of_bytes(seed));
+      assert_eq(
+        crypto_public("ed25519", found.key),
+        crypto_public("ed25519", Secret::of_bytes(seed)),
+      )
+    },
+  };
+  assert(Secret::private_key(Secret::of_bytes(b"no key")) == None)
+}
+
+test "an RSA key's numbers are six, and texts that are no base64url make no key" {
+  let sealed = |t: String| Secret::of_string(t);
+  let texts = ["!", "!", "!", "!", "!", "!"].map(sealed);
+  assert(Secret::rsa_jwk(b"\x01", b"\x03", texts) == None);
+  assert(
+    Secret::rsa_jwk(b"\x01", b"\x03", ["AQ", "AQ", "AQ", "AQ", "AQ", "AQ"].map(sealed)) == None,
+  );
+  assert_eq(
+    raised(|| Secret::rsa_jwk(b"\x01", b"\x03", texts.take(5))),
+    Some("`Secret::rsa_jwk`: an RSA key's private numbers are six, and this list holds 5"),
+  )
+}
+
+test "what is sealed opens under its key, and a turned bit or another key opens nothing" {
+  let key = Secret::of_bytes(b"k".repeat(32));
+  let nonce = b"n".repeat(12);
+  let sealed = crypto_seal("chacha20-poly1305", key, nonce, b"bound", b"attack");
+  assert_eq(sealed.len(), 6 + 16);
+  assert_eq(crypto_open("chacha20-poly1305", key, nonce, b"bound", sealed), Some(b"attack"));
+  assert_eq(crypto_open("chacha20-poly1305", key, nonce, b"other", sealed), None);
+  let other = Secret::of_bytes(b"j".repeat(32));
+  assert_eq(crypto_open("chacha20-poly1305", other, nonce, b"bound", sealed), None)
+}
+
+test "a cipher, a key or a scheme the operations take no part of raises, naming it" {
+  let key = Secret::of_bytes(b"k".repeat(32));
+  assert_eq(
+    raised(|| crypto_seal("des", key, b"n", b"", b"m")),
+    Some("`crypto_seal`: `des` is no cipher it has"),
+  );
+  assert_eq(
+    raised(||
+      crypto_open("aes-256-gcm", Secret::of_bytes(b"k".repeat(16)), b"n".repeat(12), b"", b"")),
+    Some("`crypto_open`: a key is 32 bytes, and this one is 16"),
+  );
+  assert_eq(
+    raised(|| crypto_public("rot13", key)),
+    Some("`crypto_public`: `rot13` is no key it has"),
+  );
+  assert_eq(
+    raised(|| crypto_sign("rot13", key, b"m")),
+    Some("`crypto_sign`: `rot13` is no signature it makes"),
+  );
+  assert_eq(
+    raised(|| crypto_verify("rot13", b"", b"m", b"")),
+    Some("`crypto_verify`: `rot13` is no signature it checks"),
+  );
+  assert_eq(
+    raised(|| crypto_agree("p384", key, b"")),
+    Some("`crypto_agree`: `p384` is no agreement it has"),
+  )
+}
+
+test "a key that is none of its scheme signs nothing, and a peer of small order shares nothing" {
+  let short = Secret::of_bytes(b"k".repeat(3));
+  assert_eq(crypto_public("p256", short), None);
+  assert_eq(crypto_sign("ecdsa-p256-sha256", short, b"m"), None);
+  let key = Secret::of_bytes(b"k".repeat(32));
+  assert(crypto_agree("x25519", key, b"\x00".repeat(32)) == None);
+  match crypto_public("ed25519", key) {
+    None -> assert(false, Some("no public key")),
+    Some(public) -> match crypto_sign("ed25519", key, b"m") {
+      None -> assert(false, Some("no signature")),
+      Some(signature) -> {
+        assert(crypto_verify("ed25519", public, b"m", signature));
+        assert(!crypto_verify("ed25519", public, b"n", signature))
+      },
+    },
+  }
+}

@@ -1,91 +1,10 @@
 use ply_core::codes;
-use ply_core::host::{Determinism, HostOp, Linearity, Pending};
-use ply_host::{Host, registry};
-use std::collections::{BTreeMap, BTreeSet};
+use ply_core::host::Pending;
+use ply_host::Host;
 
 #[test]
-fn the_trusted_computing_base_declares_everything_it_must() {
-    let registry = registry();
-    assert!(
-        !registry.is_empty(),
-        "a registry that loads nothing is indistinguishable from a registry that failed to load"
-    );
-    for op in registry.ops() {
-        assert!(
-            op.path.starts_with("ply_host::"),
-            "`{op}` is identified as `{}`, which names no Rust path a reviewer can find",
-            op.path
-        );
-    }
-}
-
-/// An effect and operations of it. A table of them is written as [`operations`] answers: a row an
-/// effect, effects ascending and each row's operations ascending, so a family's rows are its own
-/// lines wherever it is registered.
-type Rows = [(&'static str, &'static [&'static str])];
-
-/// The operations the registry holds that `holds` is true of.
-fn operations(holds: impl Fn(&HostOp) -> bool) -> Vec<(String, Vec<String>)> {
-    let mut by_effect: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for op in registry().ops().filter(|op| holds(op)) {
-        by_effect
-            .entry(op.effect.as_str().to_string())
-            .or_default()
-            .insert(op.op.as_str().to_string());
-    }
-    by_effect
-        .into_iter()
-        .map(|(effect, ops)| (effect, ops.into_iter().collect()))
-        .collect()
-}
-
-fn written(rows: &Rows) -> Vec<(String, Vec<String>)> {
-    rows.iter()
-        .map(|(effect, ops)| {
-            (
-                effect.to_string(),
-                ops.iter().map(|op| op.to_string()).collect(),
-            )
-        })
-        .collect()
-}
-
-const DETERMINISTIC: &Rows = &[];
-
-const REPEATABLE: &Rows = &[
-    // A wait changes nothing outside the program: crossed twice, it waits twice.
-    ("clock", &["now", "sleep"]),
-    // `--exec` is resolved once, before anything runs, so what it bound is read the same twice.
-    ("std.process.process", &["args", "bound"]),
-    // Every draw is independent of every other, so a run may take as many as it likes.
-    ("std.random.entropy", &["below", "next", "secret"]),
-    ("std.time.time", &["elapsed_ms", "elapsed_us", "now_ms"]),
-];
-
-/// A deterministic handler's test is cached with no binding to answer for it, so each one is a
-/// claim that the answer is a function of the arguments alone.
-#[test]
-fn every_deterministic_operation_is_one_that_was_argued_for() {
-    assert_eq!(
-        operations(|op| op.determinism == Determinism::Deterministic),
-        written(DETERMINISTIC)
-    );
-}
-
-/// `Repeatable` is the one column that silently re-opens multi-shot resumption over the boundary.
-#[test]
-fn every_repeatable_operation_is_one_that_was_argued_for() {
-    assert_eq!(
-        operations(|op| op.linearity == Linearity::Repeatable),
-        written(REPEATABLE)
-    );
-}
-
-#[test]
-fn a_registry_and_a_runtime_come_from_one_host() {
-    let host = Host::new();
-    assert!(!host.registry().is_empty());
-    let runtime = host.runtime();
+fn a_runtime_refuses_a_token_it_did_not_mint() {
+    let runtime = Host::new().runtime();
     let stray = Pending {
         token: 0,
         label: "stray",

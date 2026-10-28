@@ -2,11 +2,11 @@
 //! block allocated and looks at each one as it is freed, so the test can say whether a credential's
 //! bytes are anywhere on the heap and whether a block that held them was given back unwiped.
 
-use ply_core::builtins::{Builtin, call};
-use ply_core::crypto::Framing;
-use ply_core::{Span, Value};
+use ply_core::Span;
+use ply_core::crypto::{self, Framing};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use zeroize::Zeroizing;
 
 const SLOTS: usize = 1 << 18;
 const EMPTY: usize = 0;
@@ -145,24 +145,15 @@ fn stop() {
     unlock();
 }
 
-fn done(b: Builtin, args: Vec<Value>) -> Value {
-    call(b, args, Span::DUMMY).expect("the builtin answers")
-}
-
-fn held(v: Value) -> Value {
-    match &v {
-        Value::Ctor { name, args } if name.as_str() == "Some" => args[0].clone(),
-        other => panic!("no answer: {other:?}"),
-    }
-}
+type Wiped = Zeroizing<Vec<u8>>;
 
 /// A path a secret takes: what it is called, the bytes looked for, and what it makes of the plain
-/// values it is handed, every one of them made before the watch starts.
+/// bytes it is handed, every one of them made before the watch starts.
 struct Path {
     name: &'static str,
     marker: Vec<u8>,
-    plain: Vec<Value>,
-    made: fn(&[Value]) -> Vec<Value>,
+    plain: Vec<Vec<u8>>,
+    made: fn(&[Vec<u8>]) -> Vec<Wiped>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -178,7 +169,6 @@ fn rsa_document() -> Vec<u8> {
 
 fn paths() -> Vec<Path> {
     let key: Vec<u8> = (0..32).map(|i| 0xa0 ^ (i * 7) as u8).collect();
-    let salt = Value::bytes(b"salt");
     let mut derived = [0u8; 32];
     ring::pbkdf2::derive(
         ring::pbkdf2::PBKDF2_HMAC_SHA256,
@@ -201,155 +191,79 @@ fn paths() -> Vec<Path> {
     pkcs8.extend(&key);
     vec![
         Path {
-            name: "sealed from bytes, cloned, and held in a list and a map",
-            marker: key.clone(),
-            plain: vec![Value::bytes(&key)],
-            made: |plain| {
-                let secret = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                vec![
-                    secret.clone(),
-                    Value::list(vec![secret.clone()]),
-                    Value::map([(Value::Int(1), secret)]),
-                ]
-            },
-        },
-        Path {
-            name: "sealed from a string and turned to bytes",
-            marker: hex(&key).into_bytes(),
-            plain: vec![Value::str(hex(&key))],
-            made: |plain| {
-                let text = done(Builtin::SecretOfString, vec![plain[0].clone()]);
-                vec![done(Builtin::SecretBytes, vec![text.clone()]), text]
-            },
-        },
-        Path {
-            name: "joined from two halves",
-            marker: key.clone(),
-            plain: vec![Value::bytes(&key[..16]), Value::bytes(&key[16..])],
-            made: |plain| {
-                let a = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                let b = done(Builtin::SecretOfBytes, vec![plain[1].clone()]);
-                vec![done(Builtin::SecretConcat, vec![a, b])]
-            },
-        },
-        Path {
             name: "decoded from hex and encoded back",
             marker: key.clone(),
-            plain: vec![Value::str(hex(&key))],
+            plain: vec![hex(&key).into_bytes()],
             made: |plain| {
-                let text = done(Builtin::SecretOfString, vec![plain[0].clone()]);
-                let bytes = held(done(Builtin::SecretDecode, vec![Value::str("hex"), text]));
-                vec![
-                    done(
-                        Builtin::SecretEncode,
-                        vec![Value::str("base64"), bytes.clone()],
-                    ),
-                    bytes,
-                ]
+                let bytes = crypto::decode("hex", &plain[0]).expect("hex");
+                let text = crypto::encode("base64", &bytes).expect("base64");
+                vec![bytes, text]
             },
         },
         Path {
             name: "framed as a host operation writes it and read back out of the frame",
             marker: key.clone(),
-            plain: vec![Value::bytes(&key)],
+            plain: vec![key.clone()],
             made: |plain| {
-                let secret = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                let Value::Secret(held) = &secret else {
-                    panic!("a secret")
-                };
-                let mut out = Vec::new();
+                let mut out = vec![Zeroizing::new(plain[0].clone())];
                 for name in ["raw", "hex", "base64"] {
                     let framing = Framing::named(name, "a frame", Span::DUMMY).expect("a framing");
-                    let line = framing.framed(b"key ", held.bytes(), b"\n");
-                    let back = framing
-                        .unframed(&line, b"key ", b"\n")
-                        .expect("its own frame");
-                    out.push(Value::secret_bytes(&back));
+                    let line = framing.framed(b"key ", &plain[0], b"\n");
+                    let framing = Framing::named(name, "a frame", Span::DUMMY).expect("a framing");
+                    out.push(
+                        framing
+                            .unframed(&line, b"key ", b"\n")
+                            .expect("its own frame"),
+                    );
+                    out.push(line);
                 }
-                out.push(secret);
                 out
             },
         },
         Path {
             name: "derived by PBKDF2",
             marker: derived.to_vec(),
-            plain: vec![Value::bytes(&key), salt],
+            plain: vec![key.clone()],
             made: |plain| {
-                let password = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                vec![held(done(
-                    Builtin::SecretPbkdf2,
-                    vec![
-                        Value::str("SHA-256"),
-                        password,
-                        plain[1].clone(),
-                        Value::Int(2),
-                        Value::Int(32),
-                    ],
-                ))]
+                vec![crypto::pbkdf2("SHA-256", &plain[0], b"salt", 2, 32).expect("a key")]
             },
         },
         Path {
             name: "expanded by HKDF",
             marker: expanded.to_vec(),
-            plain: vec![Value::bytes(&key)],
+            plain: vec![key.clone()],
             made: |plain| {
-                let prk = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                vec![held(done(
-                    Builtin::SecretHkdfExpand,
-                    vec![
-                        Value::str("SHA-256"),
-                        prk,
-                        Value::bytes(b"info"),
-                        Value::Int(32),
-                    ],
-                ))]
+                vec![crypto::hkdf_expand("SHA-256", &plain[0], b"info", 32).expect("a key")]
             },
         },
         Path {
             name: "read out of a PKCS #8 document, then signed and agreed with",
             marker: key.clone(),
-            plain: vec![Value::bytes(&pkcs8)],
+            plain: vec![pkcs8],
             made: |plain| {
-                let document = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                let found = held(done(Builtin::SecretPrivateKey, vec![document]));
-                let Value::Record(found) = &found else {
-                    panic!("a record")
-                };
-                let seed = found
-                    .into_iter()
-                    .find(|(k, _)| k.as_str() == "key")
-                    .map(|(_, v)| v.clone())
-                    .unwrap();
-                let signature = done(
-                    Builtin::CryptoSign,
-                    vec![Value::str("ed25519"), seed.clone(), Value::bytes(b"m")],
-                );
-                let public = done(
-                    Builtin::CryptoPublic,
-                    vec![Value::str("x25519"), seed.clone()],
-                );
-                let shared = done(
-                    Builtin::CryptoAgree,
-                    vec![Value::str("x25519"), seed.clone(), held(public)],
-                );
-                vec![seed, signature, shared]
+                let (_, seed) = crypto::private_key(&plain[0]).expect("a private key");
+                let signature = crypto::sign("ed25519", &seed, b"m")
+                    .expect("a scheme")
+                    .expect("a signature");
+                let public = crypto::public("x25519", &seed)
+                    .expect("a scheme")
+                    .expect("a public key");
+                let shared = crypto::agree("x25519", &seed, &public)
+                    .expect("a scheme")
+                    .expect("a shared secret");
+                vec![seed, Zeroizing::new(signature), shared]
             },
         },
         Path {
             name: "an RSA document read and signed with under PSS",
             marker: document[document.len() - 48..].to_vec(),
-            plain: vec![Value::bytes(&document)],
+            plain: vec![document.clone()],
             made: |plain| {
-                let document = done(Builtin::SecretOfBytes, vec![plain[0].clone()]);
-                let signature = done(
-                    Builtin::CryptoSign,
-                    vec![
-                        Value::str("rsa-pss-sha256"),
-                        document.clone(),
-                        Value::bytes(b"m"),
-                    ],
-                );
-                vec![document, signature]
+                let held = Zeroizing::new(plain[0].clone());
+                let signature = crypto::sign("rsa-pss-sha256", &held, b"m")
+                    .expect("a scheme")
+                    .expect("a signature");
+                vec![held, Zeroizing::new(signature)]
             },
         },
         Path {
@@ -357,12 +271,15 @@ fn paths() -> Vec<Path> {
             marker: document[document.len() - 48..].to_vec(),
             plain: jwk_texts(&document),
             made: |plain| {
-                let texts = plain[2..]
-                    .iter()
-                    .map(|text| done(Builtin::SecretOfString, vec![text.clone()]))
-                    .collect();
-                let args = vec![plain[0].clone(), plain[1].clone(), Value::list(texts)];
-                vec![held(done(Builtin::SecretRsaJwk, args))]
+                let private = [
+                    &plain[2][..],
+                    &plain[3][..],
+                    &plain[4][..],
+                    &plain[5][..],
+                    &plain[6][..],
+                    &plain[7][..],
+                ];
+                vec![crypto::rsa_jwk(&plain[0], &plain[1], private).expect("a key")]
             },
         },
     ]
@@ -402,18 +319,15 @@ fn integers(der: &[u8]) -> Vec<Vec<u8>> {
 }
 
 /// `n` and `e` as bytes, then each private number of a PKCS #1 document as its base64url text.
-fn jwk_texts(document: &[u8]) -> Vec<Value> {
+fn jwk_texts(document: &[u8]) -> Vec<Vec<u8>> {
     let numbers = integers(document);
-    let mut out = vec![Value::bytes(&numbers[1]), Value::bytes(&numbers[2])];
+    let mut out = vec![numbers[1].clone(), numbers[2].clone()];
     for number in &numbers[3..] {
-        let sealed = done(
-            Builtin::SecretEncode,
-            vec![Value::str("base64url"), Value::secret_bytes(number)],
+        out.push(
+            crypto::encode("base64url", number)
+                .expect("base64url")
+                .to_vec(),
         );
-        let Value::Secret(text) = &sealed else {
-            panic!("a secret")
-        };
-        out.push(Value::str(text.text().expect("a text")));
     }
     out
 }
@@ -451,7 +365,7 @@ fn the_watch_sees_a_plain_copy_freed_unwiped() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let marker = b"a plain value, freed as it stands";
     watch(marker);
-    let plain = Value::bytes(marker);
+    let plain = marker.to_vec();
     let (live, _) = seen();
     drop(plain);
     let (after, freed) = seen();

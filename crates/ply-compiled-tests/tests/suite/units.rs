@@ -1,9 +1,10 @@
-//! Units written by hand: C bodies over the prelude and the runtime's own object, beside the table a
-//! unit says about itself, compiled by the host's C compiler into a library the runtime opens. What
-//! the emitter writes is the compiler's to test; these test what the runtime does with a unit.
+//! Units written by hand: C bodies over a head this harness writes from the runtime's own
+//! description and helper table, beside the table a unit says about itself, compiled by the host's
+//! C compiler into a library the runtime opens. What the emitter writes is the compiler's to test;
+//! these test what the runtime does with a unit.
 
-use ply_compiled::c::exports::runtime_helpers;
-use ply_compiled::c::{Exports, PRELUDE, runtime_header, runtime_object};
+use ply_compiled::c::exports::HelperShape;
+use ply_compiled::c::{Exports, builtin_helper_name, described, helpers};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
@@ -25,7 +26,84 @@ pub fn def(name: &'static str, arity: usize, body: &str) -> Def {
 
 /// The C pointer a unit calls the native the compiler declares as `name` through.
 pub fn native(name: &str) -> String {
-    ply_compiled::c::pointer_name(&ply_compiled::c::builtin_helper_name(name))
+    pointer(&builtin_helper_name(name))
+}
+
+/// The C pointer a unit calls `helper` through.
+fn pointer(helper: &str) -> String {
+    format!("{helper}_p")
+}
+
+/// The fact `name` of the runtime's description.
+fn fact(name: &str) -> usize {
+    let line = format!("fact {name} ");
+    (described().lines())
+        .find_map(|l| l.strip_prefix(line.as_str()))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("the runtime describes no `{name}`"))
+}
+
+/// What a unit here opens with: words and immediates, the context's fields its bodies read, each
+/// where the runtime's description lays it, and each helper's pointer declared.
+fn head() -> String {
+    let mut out = String::from(
+        "#include <stdint.h>\ntypedef int64_t Word;\n\
+         static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }\n\
+         static inline int64_t ply_imm_value(Word w) { return w >> 1; }\n\
+         typedef struct PlyCtx {\n",
+    );
+    let mut fields: Vec<(usize, usize, &str)> = ["failed", "fuel", "stack_floor"]
+        .iter()
+        .map(|f| {
+            let at = fact(&format!("PlyCtx.{f}.at"));
+            (at, fact(&format!("PlyCtx.{f}.bytes")), *f)
+        })
+        .collect();
+    fields.sort();
+    let mut end = 0;
+    for (at, bytes, name) in fields {
+        assert_eq!(bytes, 8, "the context's `{name}` is a word");
+        if at > end {
+            out.push_str(&format!("  char before_{name}[{}];\n", at - end));
+        }
+        out.push_str(&format!("  int64_t {name};\n"));
+        end = at + bytes;
+    }
+    out.push_str("} PlyCtx;\n");
+    for h in helpers() {
+        let (answer, params) = signature(h.args(), h.answers());
+        out.push_str(&format!(
+            "extern {answer} (*{})({params});\n",
+            pointer(h.name)
+        ));
+    }
+    out
+}
+
+/// The helper pointers defined, and the `ply_bind` that fills them in the runtime's order.
+fn bound() -> String {
+    let mut out = String::new();
+    for h in helpers() {
+        let (answer, params) = signature(h.args(), h.answers());
+        out.push_str(&format!("{answer} (*{})({params});\n", pointer(h.name)));
+    }
+    out.push_str("void ply_bind(void **fns) {\n");
+    for (i, h) in helpers().iter().enumerate() {
+        let (answer, params) = signature(h.args(), h.answers());
+        let p = pointer(h.name);
+        out.push_str(&format!("  {p} = ({answer} (*)({params}))fns[{i}];\n"));
+    }
+    out.push_str("}\n");
+    out
+}
+
+/// A helper's C return type and parameters: the context, then `args` words.
+fn signature(args: usize, answers: bool) -> (&'static str, String) {
+    let params = std::iter::once("PlyCtx*").chain(std::iter::repeat_n("Word", args));
+    (
+        if answers { "Word" } else { "void" },
+        params.collect::<Vec<_>>().join(", "),
+    )
 }
 
 /// The C that opens an `R#entered`: the arguments' list read, `read` reading each, and the
@@ -93,7 +171,13 @@ impl DerefMut for Laid {
 pub fn exports_of(defs: &[Def]) -> Laid {
     Laid {
         says: Exports {
-            helpers: runtime_helpers(),
+            helpers: (helpers().iter())
+                .map(|h| HelperShape {
+                    name: h.name.to_string(),
+                    args: h.args(),
+                    answers: h.answers(),
+                })
+                .collect(),
             constants: Vec::new(),
             modules: 1,
             refusals: Vec::new(),
@@ -114,12 +198,11 @@ pub fn exports_of(defs: &[Def]) -> Laid {
     }
 }
 
-/// The unit's C: the prelude and the runtime declared, each definition and the entry the runtime
-/// calls it through, the runtime's object, and what the unit lays out for its loader: the table
-/// `exports` says, and the code table `exports.lambdas` names and the definitions `exports.taken`
-/// names, each by address.
+/// The unit's C: its head, each definition and the entry the runtime calls it through, the helper
+/// pointers bound, and what the unit lays out for its loader: the table `exports` says, and the
+/// code table `exports.lambdas` names and the definitions `exports.taken` names, each by address.
 pub fn text(defs: &[Def], exports: &Laid) -> String {
-    let mut out = format!("{PRELUDE}{}\n", runtime_header());
+    let mut out = head();
     for d in defs {
         let params: String = (0..d.arity).map(|i| format!(", Word p{i}")).collect();
         let args: String = (0..d.arity).map(|i| format!(", args[{i}]")).collect();
@@ -132,7 +215,7 @@ pub fn text(defs: &[Def], exports: &Laid) -> String {
             d.body
         ));
     }
-    out.push_str(&runtime_object());
+    out.push_str(&bound());
     let slot_of = |name: &String| {
         let entry = &(exports.taken.iter().find(|t| t.name == *name))
             .unwrap_or_else(|| panic!("the unit does not take the constant `{name}`"))

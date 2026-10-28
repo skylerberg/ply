@@ -1,15 +1,19 @@
+mod meter;
+mod time;
+mod toolchain;
+
 use crate::bare::context;
 use ply_compiled::hosted::signal::rt_signal_arrived;
 use ply_compiled::hosted::term::rt_term_secret_taken;
 use ply_compiled::hosted::{rt_job_wait, rt_kdf_bcrypt, rt_observed, rt_os_cpus};
-use ply_compiled::machine::{rt_secret_len, rt_secret_of};
 use ply_compiled::native::{Addr, I64};
 use ply_compiled::rt::{Ctx, rt_taken};
+use ply_compiled::secret::{rt_secret_len, rt_secret_of};
 use ply_core::host::MachineId;
 use ply_core::{HostBinding, HostRuntime, Span};
 use ply_host::jobs::{self, Work};
 use ply_host::observe::{Binary, Recorder, World};
-use ply_host::stdio::SecretLine;
+use ply_host::pool::Kept;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -70,12 +74,12 @@ fn a_secret_line_is_taken_from_its_run_and_none_outlives_the_entry_point() {
     let mut ctx = context();
     let runtime = hosted(&mut ctx);
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
-    let kept = run.keep_secret(SecretLine::new("hunter2".to_string()));
+    let kept = run.keep_secret(Kept::new(b"hunter2".to_vec()));
     let secret = unsafe { rt_term_secret_taken(&mut ctx, I64(kept)) };
     assert!(ctx.take_failure().is_none());
     assert_eq!(unsafe { rt_secret_len(&mut ctx, secret) }.0, 7);
 
-    let left = run.keep_secret(SecretLine::new("hunter3".to_string()));
+    let left = run.keep_secret(Kept::new(b"hunter3".to_vec()));
     let _ = runtime.end_entry_point(MachineId::next());
     unsafe { rt_term_secret_taken(&mut ctx, I64(left)) };
     assert!(
@@ -159,6 +163,41 @@ fn a_real_handler_s_read_is_entered_into_its_run_s_record_by_its_root() {
         .map(|line| line.rsplit_once('\t').map_or(line, |(at, _)| at))
         .collect();
     assert_eq!(read, ["file\tapp\ta.db\t"], "{trace}");
+}
+
+/// What a real handler read of the binary goes into its run's record without a root: a shipped
+/// module by its name and the program the launcher entered, each digested by the binary.
+#[test]
+fn a_real_handler_s_read_of_the_binary_is_entered_into_its_run_s_record() {
+    let runtime = ply_host::Host::new().runtime();
+    let mut ctx = context();
+    ctx.set_host(
+        Arc::new(HostBinding::unbound()),
+        Some(Rc::clone(&runtime)),
+        None,
+    );
+    let recorder = Arc::new(Recorder::default());
+    ply_host::observe::records_into(&*runtime, &recorder);
+    for (path, kind) in [(&b"std.list"[..], 5), (b"", 6)] {
+        let (label_at, label_n) = addr(b"");
+        let (path_at, path_n) = addr(path);
+        unsafe { rt_observed(&mut ctx, label_at, label_n, path_at, path_n, I64(kind)) };
+    }
+    assert!(ctx.take_failure().is_none());
+    let shipped = |name: &str| (name == "std.list").then(|| "listed".to_string());
+    let config = std::collections::BTreeMap::new();
+    let world = World {
+        roots: &[],
+        binding: "b".to_string(),
+        config: &config,
+        binary: Binary {
+            shipped: &shipped,
+            program: "entered".to_string(),
+        },
+    };
+    let trace = ply_host::observe::finished(&recorder, &world, false).expect("a trace");
+    assert!(trace.contains("shipped\tstd.list\tlisted"), "{trace}");
+    assert!(trace.contains("program\tentered"), "{trace}");
 }
 
 /// Outside a production region the thread waits for a job, and is handed its bytes.

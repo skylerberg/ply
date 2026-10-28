@@ -3,13 +3,14 @@
 //! run's answers, kept or abandoned, never wake another's wait. Every pool mints from one count of
 //! tokens.
 
+use crate::jobs::Failure;
 use crate::observe::Recorder;
-use crate::stdio::SecretLine;
-use ply_core::{Diagnostic, Pending, Span, Symbol, Value, codes};
+use ply_core::{Diagnostic, Pending, Span, codes};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
+use zeroize::Zeroizing;
 
 /// How many operations of a pool that gives each a thread may be running at once.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
@@ -18,35 +19,8 @@ pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 /// mint the same one, and none mints 0, which a zeroed `Pending` carries.
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
-/// What a job answered, in a form that crosses threads: the `Value` is built where it is polled.
-pub enum JobOutput {
-    /// Whether a write happened; a filesystem's state is not the program's error.
-    Bool(bool),
-    /// What a read of a stream answered: empty at its end.
-    Bytes(Vec<u8>),
-    /// An answer in a shape of the facility's own.
-    Built(Box<dyn FnOnce() -> Value + Send>),
-    /// A constructor with no fields, by the program-wide name the declaring module gives it.
-    Ctor(&'static str),
-    /// The operation failed in a way that is neither the peer's doing nor a deadline.
-    Failed(String),
-    Int(i64),
-    MaybeBytes(Option<Vec<u8>>),
-    MaybeInt(Option<i64>),
-    /// `None` at end of input, which is what reading a line past the last one answers.
-    MaybeString(Option<String>),
-    /// `None` when it is not a directory this run can read.
-    MaybeStrings(Option<Vec<String>>),
-    Refused(Diagnostic),
-}
-
-impl JobOutput {
-    /// An answer no variant here holds: `build` makes it on the thread that polls, from what the
-    /// job sends there.
-    pub fn built(build: impl FnOnce() -> Value + Send + 'static) -> JobOutput {
-        JobOutput::Built(Box::new(build))
-    }
-}
+/// What a job answered: its bytes, or why it answered none.
+pub type JobOutput = Result<Vec<u8>, Failure>;
 
 type Job = Box<dyn FnOnce() -> JobOutput + Send + 'static>;
 
@@ -90,8 +64,8 @@ impl Bell {
 /// One run's operations, of whichever pool runs each: an operation is the run's from its
 /// submission until the run takes its answer. The run holds this, and each operation's job holds it
 /// weakly, so the answer of a job that finishes after its run has ended is dropped, and what an
-/// ended run left goes with it. The lines its jobs read for a `Secret` are kept here too, until the
-/// run takes them or its entry point ends, and so is the record a test's reads are entered into.
+/// ended run left goes with it. What its jobs read for a `Secret` is kept here too, until the run
+/// takes it or its entry point ends, and so is the record a test's reads are entered into.
 pub struct Run {
     held: Mutex<HashMap<u64, Held>>,
     secrets: Mutex<Secrets>,
@@ -99,12 +73,15 @@ pub struct Run {
     bell: Arc<Bell>,
 }
 
-/// The lines read for a `Secret` and not yet taken, each under the number its job answered, wiped
+/// A secret's bytes as a job read them, wiped when they are dropped.
+pub type Kept = Zeroizing<Vec<u8>>;
+
+/// What was read for a `Secret` and not yet taken, each under the number its job answered, wiped
 /// as each is dropped.
 #[derive(Default)]
 struct Secrets {
     last: i64,
-    kept: HashMap<i64, SecretLine>,
+    kept: HashMap<i64, Kept>,
 }
 
 /// An operation a run holds, until its answer is taken.
@@ -141,21 +118,21 @@ impl Run {
         lock(&self.recorder).clone()
     }
 
-    /// Keeps `line` for this run under a number no other line of it is kept under, answered.
-    pub fn keep_secret(&self, line: SecretLine) -> i64 {
+    /// Keeps `secret` for this run under a number nothing else of it is kept under, answered.
+    pub fn keep_secret(&self, secret: Kept) -> i64 {
         let mut secrets = lock(&self.secrets);
         secrets.last += 1;
         let number = secrets.last;
-        secrets.kept.insert(number, line);
+        secrets.kept.insert(number, secret);
         number
     }
 
-    /// The line kept under `number`, which the run then keeps no longer.
-    pub fn take_secret(&self, number: i64) -> Option<SecretLine> {
+    /// The secret kept under `number`, which the run then keeps no longer.
+    pub fn take_secret(&self, number: i64) -> Option<Kept> {
         lock(&self.secrets).kept.remove(&number)
     }
 
-    /// Drops every line kept and not taken, each wiped: what an entry point that ended did not
+    /// Drops every secret kept and not taken, each wiped: what an entry point that ended did not
     /// take, nothing after it may.
     pub fn drop_secrets(&self) {
         lock(&self.secrets).kept.clear();
@@ -204,7 +181,7 @@ impl Run {
             .any(|held| held.watched && held.answer.is_some())
     }
 
-    /// The watched operations answered and not yet taken, ascending, their answers left for `poll`.
+    /// The watched operations answered and not yet taken, ascending, their answers left for `taken`.
     pub fn answered(&self) -> Vec<u64> {
         let mut tokens: Vec<u64> = (lock(&self.held).iter())
             .filter(|(_, h)| h.watched && h.answer.is_some())
@@ -214,21 +191,8 @@ impl Run {
         tokens
     }
 
-    /// `pending`'s answer where it has one, which is then taken.
-    pub fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
-        self.took(pending, value_of)
-    }
-
     /// The bytes a native's job answered `pending` where it has answered, which are then taken.
     pub fn taken(&self, pending: &Pending) -> Result<Option<Vec<u8>>, Diagnostic> {
-        self.took(pending, bytes_of)
-    }
-
-    fn took<T>(
-        &self,
-        pending: &Pending,
-        read: fn(Span, &str, JobOutput) -> Result<T, Diagnostic>,
-    ) -> Result<Option<T>, Diagnostic> {
         let mut held = lock(&self.held);
         match held.get(&pending.token) {
             None => return Err(err_unowned(pending)),
@@ -243,40 +207,22 @@ impl Run {
                 what,
                 answer: Some(answer),
                 ..
-            }) => read(span, what, answer).map(Some),
+            }) => bytes_of(span, what, answer).map(Some),
             _ => Ok(None),
         }
     }
 
-    /// `pending`'s answer once it has one, waiting for at most `bound` where one is given:
-    /// `None` where the bound passed first.
+    /// The bytes a native's job answered `pending` once it has answered, waiting for at most
+    /// `bound` where one is given: `None` where the bound passed first.
     pub fn block_on(
         &self,
         pending: &Pending,
         bound: Option<Duration>,
-    ) -> Result<Option<Value>, Diagnostic> {
-        self.waited(pending, bound, Run::poll)
-    }
-
-    /// The bytes a native's job answered `pending`, waited for as [`Run::block_on`] waits.
-    pub fn block_on_bytes(
-        &self,
-        pending: &Pending,
-        bound: Option<Duration>,
     ) -> Result<Option<Vec<u8>>, Diagnostic> {
-        self.waited(pending, bound, Run::taken)
-    }
-
-    fn waited<T>(
-        &self,
-        pending: &Pending,
-        bound: Option<Duration>,
-        take: fn(&Run, &Pending) -> Result<Option<T>, Diagnostic>,
-    ) -> Result<Option<T>, Diagnostic> {
         let until = bound.map(|bound| Instant::now() + bound);
         loop {
             let seen = self.bell.rung();
-            if let Some(answer) = take(self, pending)? {
+            if let Some(answer) = self.taken(pending)? {
                 return Ok(Some(answer));
             }
             match until {
@@ -321,40 +267,12 @@ impl Run {
     }
 }
 
-/// What the operation `what` asked at `span` answered, as the run reads it, a failure naming what
-/// asked for it.
-fn value_of(span: Span, what: &str, answer: JobOutput) -> Result<Value, Diagnostic> {
-    match answer {
-        JobOutput::Bool(b) => Ok(Value::Bool(b)),
-        JobOutput::Bytes(b) => Ok(Value::bytes(b)),
-        JobOutput::Built(build) => Ok(build()),
-        JobOutput::Ctor(name) => Ok(Value::ctor(name, Vec::new())),
-        JobOutput::Failed(message) => Err(failed(span, what, &message)),
-        JobOutput::Int(i) => Ok(Value::Int(i)),
-        JobOutput::MaybeBytes(b) => Ok(option(b.map(Value::bytes))),
-        JobOutput::MaybeInt(n) => Ok(option(n.map(Value::Int))),
-        JobOutput::MaybeString(text) => Ok(option(text.map(Value::str))),
-        JobOutput::MaybeStrings(names) => {
-            Ok(option(names.map(|names| {
-                Value::list(names.into_iter().map(Value::str).collect())
-            })))
-        }
-        JobOutput::Refused(diagnostic) => Err(diagnostic),
-    }
-}
-
 /// The bytes a native's job answered, which is all one answers.
 fn bytes_of(span: Span, what: &str, answer: JobOutput) -> Result<Vec<u8>, Diagnostic> {
-    match answer {
-        JobOutput::Bytes(b) => Ok(b),
-        JobOutput::Failed(message) => Err(failed(span, what, &message)),
-        JobOutput::Refused(diagnostic) => Err(diagnostic),
-        _ => Err(Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("{what} answered a native's job with no bytes"),
-        )
-        .primary(span, "a native's job answers bytes")),
-    }
+    answer.map_err(|failure| match failure {
+        Failure::Said(message) => failed(span, what, &message),
+        Failure::Refused(diagnostic) => diagnostic,
+    })
 }
 
 #[cold]
@@ -525,7 +443,7 @@ impl Pool {
 /// failed.
 fn finish(entry: Entry, freed: impl FnOnce()) {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(entry.job))
-        .unwrap_or_else(|_| JobOutput::Failed("the host panicked doing it".to_string()));
+        .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())));
     freed();
     if let Some(run) = entry.run.upgrade() {
         run.file(entry.token, outcome);
@@ -606,23 +524,6 @@ fn err_no_thread(what: &str, why: &std::io::Error, span: Span) -> Diagnostic {
         format!("{what} could not start: {why}"),
     )
     .primary(span, "the host could not spawn a thread for this operation")
-}
-
-/// Built on the polling thread: a `Value` holds `Rc` and never crosses threads.
-pub(crate) fn option(v: Option<Value>) -> Value {
-    match v {
-        Some(v) => Value::ctor("Some", vec![v]),
-        None => Value::ctor("None", Vec::new()),
-    }
-}
-
-pub(crate) fn record<const N: usize>(fields: [(&str, Value); N]) -> Value {
-    Value::Record(Arc::new(
-        fields
-            .into_iter()
-            .map(|(name, value)| (Symbol::new(name), value))
-            .collect(),
-    ))
 }
 
 /// A poisoned lock means a job thread panicked.

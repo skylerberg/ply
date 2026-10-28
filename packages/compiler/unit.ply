@@ -4,6 +4,7 @@
 //! implements and lays out, and is refused where that disagrees with the compiler.
 
 import compiler.store.hash.encoding (hex)
+import std.internal.native (native, observed, found, parts, in_parts, int_of)
 import compiler.check.types (Type, TyVar, TyFn, TyCon, Scheme, type_text, type_spelled, digits,
                              string_type)
 import compiler.emit.answer (Answer, Body, Refused, RootAnswer, Tables, Defined, Head, Expect,
@@ -17,7 +18,7 @@ import compiler.emit.statics (known_of_value, kept_root)
 import compiler.emit.entry (Formed, emitted_of)
 import compiler.emit.release (root_of)
 import std.value
-import std.value (Value, VList, VInt, VRecord, VStr, VMap)
+import std.value (Value, VList, VInt, VRecord, VStr, VMap, VBytes)
 import compiler.emit.statics (SStr, statics_of)
 import compiler.emit.roots (builtin_helper, symbol_of, entry_of, root_id)
 import compiler.emit.keys
@@ -59,7 +60,7 @@ import compiler.check.resolve.tables (Diag, Label, error_with_labels)
 import std.bin
 import std.list
 import std.graph
-import std.pace (paced, outgrown)
+import std.pace (meter, paced, spent, outgrown)
 import std.bytes (u64_le, hex_digit, ascii_of_int)
 import std.fs
 import std.fs (fs)
@@ -95,6 +96,8 @@ pub effect shipped {
   /// `pulled` is whether the load read them itself, rather than re-analysing one that did.
   read reached(view: Bytes, pulled: Bool) -> Unit
   read version() -> String
+  /// The running binary's size, or `None` where it cannot be measured, which fails nothing.
+  read binary_bytes() -> Option<Int>
   read stamps() -> String
   /// The runtime this binary is linked with, as its library describes itself
   /// (`compiler.emit.abi.runtime_of` reads it).
@@ -108,12 +111,110 @@ pub effect shipped {
   /// `steps` calls: its value's encoding, or none where it raised, ran past its calls, or the unit
   /// holds no such root.
   read values(library: String, roots: List<String>, steps: Int) -> List<Option<Bytes>>
-  /// What `root`, a function of one parameter of the unit compiled into the library `library`,
-  /// answers for `argument` under `steps` calls, no host bound, each value as PLV1 writes it: none
-  /// where it raised, ran past its calls or the unit holds no such root. The unit is opened the
-  /// first time a process enters it and kept for every later call.
-  read entered(library: String, root: String, argument: Bytes, steps: Int) -> Option<Bytes>
+  /// What `root` of the unit compiled into the library `library` answers for `arguments`, the list
+  /// of what it takes, under `steps` calls, no host bound, each value as PLV1 writes it: none where
+  /// it raised, ran past its calls or the unit holds no such root. The unit is opened the first
+  /// time a process enters it and kept for every later call.
+  read entered(library: String, root: String, arguments: Bytes, steps: Int) -> Option<Bytes>
 }
+
+host for shipped by shipping
+
+/// `go` with what this binary ships, which a run is lent with `--allow shipped`.
+fn shipping<a | e>(go: () -> a / {shipped.read | e}) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    shipped.names() -> {
+      observed("", "", 5);
+      parts(shipped_names()).map(|name: Bytes| String::of_bytes_lossy(name))
+    },
+    shipped.module(name) -> {
+      observed("", name, 5);
+      found(shipped_module(name))
+    },
+    shipped.answer(path, offset, len) -> if offset < 0 || len < 0 { None }
+    else { found(shipped_answer(path, offset, len)) },
+    shipped.digests() -> shipped_digests(),
+    shipped.reached(view, pulled) ->
+      observed("", String::of_bytes_lossy(view), if pulled { 7 } else { 8 }),
+    shipped.version() -> String::of_bytes_lossy(shipped_version()),
+    shipped.binary_bytes() -> match found(shipped_binary_bytes()) {
+      Some(n) -> Some(int_of(n)),
+      None -> None,
+    },
+    shipped.stamps() -> String::of_bytes_lossy(shipped_stamps()),
+    shipped.runtime() -> shipped_described(),
+    shipped.definitions() -> {
+      observed("", "", 6);
+      shipped_definitions()
+    },
+    shipped.values(library, roots, steps) ->
+      kept_values(
+        shipped_values(library, in_parts(roots.map(|root: String| Bytes::of_string(root))), steps),
+      ),
+    shipped.entered(library, root, arguments, steps) ->
+      found(shipped_entered(library, root, arguments, steps)),
+  }
+
+/// Every shipped module's name, as parts.
+extern fn shipped_names() -> Bytes / {native.read}
+
+/// A shipped module's text or a data file's bytes by its name, found.
+extern fn shipped_module(name: String) -> Bytes / {native.read}
+
+/// The frames of `len` bytes at `offset` of the pack's answer file `path`, found.
+extern fn shipped_answer(path: String, offset: Int, len: Int) -> Bytes / {native.read}
+
+/// Each file this binary ships and its digest.
+extern fn shipped_digests() -> Bytes / {native.read}
+
+/// This binary's version.
+extern fn shipped_version() -> Bytes / {native.read}
+
+/// The running binary's size in eight bytes, found where it can be measured.
+extern fn shipped_binary_bytes() -> Bytes / {native.read}
+
+/// The runtime's stamps.
+extern fn shipped_stamps() -> Bytes / {native.read}
+
+/// The runtime this binary is linked with, as its library describes itself.
+extern fn shipped_described() -> Bytes / {native.read}
+
+/// The program the launcher entered, a `name hash` line each.
+extern fn shipped_definitions() -> Bytes / {native.read}
+
+/// What each stored root of `roots`, as parts, answers on the unit compiled into `library`, as
+/// parts each found.
+extern fn shipped_values(library: String, roots: Bytes, steps: Int) -> Bytes / {native.read}
+
+/// What `shipped_values` said, each stored root's answer as the run wrote it: the encoding of a
+/// definition's value the root answers as `Bytes`, each read out of it; none for a root that
+/// answered nothing or anything else.
+fn kept_values(said: Bytes) -> List<Option<Bytes>> / {abort.raise} =
+  parts(said).map(|answer: Bytes|
+    match found(answer) {
+      Some(written) -> match value::decode(written) { Some(VBytes(kept)) -> Some(kept), _ -> None },
+      None -> None,
+    })
+
+test "a stored root's answer is kept as the encoding its `Bytes` hold, and anything else as none" {
+  let answered = |v: Value| match value::encode(v) { Some(b) -> b"\x01".concat(b), None -> b"" };
+  let kept = match value::encode(VStr("version")) { Some(b) -> b, None -> b"" };
+  assert_eq(kept_values(in_parts([answered(VBytes(kept)), b"\x00", answered(VStr("bare"))])), [
+    Some(kept),
+    None,
+    None,
+  ])
+}
+
+/// What `root` of the unit compiled into `library` answers for `arguments`, found.
+extern fn shipped_entered(
+  library: String,
+  root: String,
+  arguments: Bytes,
+  steps: Int,
+) -> Bytes / {native.read}
 
 /// The runtime this binary is linked with, as it describes itself.
 pub fn shipped_runtime() -> Runtime / {shipped.runtime, abort.raise} =
@@ -193,13 +294,10 @@ fn machine_bound(declared: List<Extern>) -> List<Native> / {abort.raise} =
     else { acc.push({ ..declared_signature(e), name: builtin_helper(e.name) }) })
 
 /// The C helper of each native a unit's bodies call, by its name without the `_p` its pointer
-/// adds, and of each native a body reads as a value, which the runtime calls as that native.
+/// adds.
 fn natives_called(made: Made) -> Map<Bytes, Bool> / {abort.raise} =
   made.bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, k: UnitBody|
-    k.tables.builtins.fold(
-      pointers_named(k.text, b"builtin_", acc),
-      |into: Map<Bytes, Bool>, b: Bytes| into.insert(builtin_helper(b), true),
-    ))
+    pointers_named(k.text, b"builtin_", acc))
 
 fn identifier_bytes() -> Bytes / {abort.raise} =
   Bytes::concat_all(
@@ -780,7 +878,7 @@ fn unkeyed_why(name: Bytes) -> Bytes =
 
 /// What a unit names that is not code, each table sorted by content and each entry once, so a
 /// position is a rank among what the unit holds and a body's C is a function of the unit's content.
-type Pools = { fields: List<Bytes>, builtins: List<Bytes>, lambdas: List<Bytes> }
+type Pools = { fields: List<Bytes>, lambdas: List<Bytes> }
 
 /// The tables of `bodies`, whose static objects are `statics`, the field table holding the names
 /// those statics' words name beside the bodies' own.
@@ -798,7 +896,6 @@ fn pools_of(
         statics.fold([], |acc: List<Bytes>, d: StaticDef| acc.concat(static_fields(d))),
       ),
     ),
-    builtins: ordered(all(|tables: Tables| tables.builtins)),
     lambdas: ordered(
       constant_entries.map(|c: { name: RootName, entry: Bytes }|
         entry_named(c.name, c.entry)).concat(
@@ -852,10 +949,10 @@ fn static_fields(d: StaticDef) -> List<Bytes> =
   words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
     match w { WField(n) -> acc.push(n), _ -> acc })
 
-type Placed = { fields: Map<Bytes, Int>, builtins: Map<Bytes, Int>, lambdas: Map<Bytes, Int> }
+type Placed = { fields: Map<Bytes, Int>, lambdas: Map<Bytes, Int> }
 
 fn placed_of(p: Pools) -> Placed / {abort.raise} =
-  { fields: positions(p.fields), builtins: positions(p.builtins), lambdas: positions(p.lambdas) }
+  { fields: positions(p.fields), lambdas: positions(p.lambdas) }
 
 fn place(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
   match m.get(key) {
@@ -901,8 +998,7 @@ fn hole_key(h: Hole, tables: Tables) -> Option<Bytes> / {abort.raise} =
   if h.kind == 84 { Some(b"T".concat(h.digits)) }
   else if h.kind == 114 { None } else {
     let i = digits(h.digits);
-    if h.kind == 98 { Some(b"b".concat(tables.builtins.get(i))) }
-    else if h.kind == 102 { Some(b"f".concat(tables.fields.get(i))) }
+    if h.kind == 102 { Some(b"f".concat(tables.fields.get(i))) }
     else if h.kind == 108 { Some(b"l".concat(tables.lambdas.get(i))) }
     else { panic("an emitted placeholder of no kind the unit resolves") }
   }
@@ -912,7 +1008,6 @@ fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.rais
   let kind = key.at(0);
   let rest = key.slice(1, key.len());
   if kind == 84 { place(tags, rest) }
-  else if kind == 98 { place(p.builtins, rest) }
   else if kind == 102 { place(p.fields, rest) }
   else { place(p.lambdas, rest) }
 }
@@ -995,7 +1090,6 @@ fn exports_text(
       dropped.map(|d: Dropped|
         Bytes::concat_all([root_text(d.function), b"\n", d.construct, b"\n"])),
     ),
-    lines(b"builtins", p.builtins),
     lines(b"fields", p.fields),
     Bytes::concat_all(
       entered.map(|r: RootName| Bytes::concat_all([b"entered ", root_text(r), b"\n"])),
@@ -2456,7 +2550,7 @@ fn place_walked<s | e>(
     { walk: answered_now(p, types, w, roots, read, ask), steps: 1 },
     66,
     |b: { walk: Walk<s>, steps: Int }| {
-      let named = found(b.walk);
+      let named = called_unheld(b.walk);
       let read_all = { ..b.walk, unread: [] };
       // Only once every generic body is in are the needs closed, so no call settles on a part of them.
       let next = if named.len() > 0 { { walk: read_all, more: named } }
@@ -2684,7 +2778,7 @@ fn found_reached(
 /// body calls, each clause an entry judges at its definition's specialisation, and the generic body
 /// of each definition a body calls generically, whose needs settle those calls. Of a body's other
 /// calls none can be new: it calls a specialisation only as itself.
-fn found<s>(w: Walk<s>) -> Map<RootName, RootKey> =
+fn called_unheld<s>(w: Walk<s>) -> Map<RootName, RootKey> =
   w.unread.fold(Map::new(), |acc: Map<RootName, RootKey>, n: RootName|
     match w.answers.get(n) {
       Some(Body(b)) -> {
@@ -4614,12 +4708,13 @@ fn chained(n: Int) -> List<{ name: Bytes, src: Bytes }> =
     }
   })
 
-/// How many objects the emission of a chain of `n` modules holds live once its walk ends.
-fn held_by_walk(n: Int) -> Int / {abort.raise} = {
+/// How many objects the emission of a chain of `n` modules allocates, those it holds once its walk
+/// ends among them.
+fn made_by_walk(n: Int) -> Int / {meter.read, abort.raise} = {
   let modules = chained(n);
   let dump = dump_of(analyse(parse_all(modules)));
   let sources = sources_placed(dump, modules);
-  metered(||
+  spent(||
     emitted(
       a_runtime(b"r"),
       dump,
@@ -4628,11 +4723,11 @@ fn held_by_walk(n: Int) -> Int / {abort.raise} = {
       offered_roots(dump).keys,
       |_: Bytes| None,
       |_: List<Record>| (),
-    )).live
+    )).allocations
 }
 
-test "what a unit's walk holds grows with the program it walks, no faster" {
-  let measures = [4, 8, 16, 32].map(|n: Int| { size: n, steps: held_by_walk(n), bound: n });
+test "what a unit's walk allocates grows with the program it walks, no faster" {
+  let measures = [4, 8, 16, 32].map(|n: Int| { size: n, steps: made_by_walk(n), bound: n });
   assert(!outgrown(measures), Some(f"{measures}"))
 }
 
@@ -5173,6 +5268,7 @@ test "a generic definition's entry is taken, its call settled where the entry ju
         b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
         b"pub fn made<a>(make: () -> a) -> a = make()\n",
         b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+        b"pub fn counted<a>(xs: Columns<a>) -> Int = xs.len()\n",
       ]),
     },
   ];
@@ -5189,10 +5285,16 @@ test "a generic definition's entry is taken, its call settled where the entry ju
     Err(why) -> assert_eq(why, b""),
     Ok(e) -> {
       let entry = |n: Bytes| root_name(Entered(Named(n)));
-      assert_eq(e.produced.dropped.filter(|d: Dropped| d.function == entry(b"m.first")), []);
-      // A function crosses only out, and a witnessed variable has no specialisation at `Int`.
       assert_eq(
-        [b"m.first", b"m.made", b"m.total"].filter(|n: Bytes| e.produced.taken.contains(entry(n))),
+        e.produced.dropped.filter(|d: Dropped|
+          [entry(b"m.first"), entry(b"m.counted")].contains(d.function)),
+        [],
+      );
+      // A function crosses only out, a witnessed variable has no specialisation at `Int`, and a
+      // `Columns` at `Int` would hold no records.
+      assert_eq(
+        [b"m.first", b"m.made", b"m.total", b"m.counted"].filter(|n: Bytes|
+          e.produced.taken.contains(entry(n))),
         [b"m.first"],
       )
     },
@@ -5210,9 +5312,9 @@ fn defined_in(text: Bytes, symbol: Bytes) -> Bytes / {abort.raise} =
     None -> b"",
   }
 
-/// Root `key`'s C in unit text `text` where it performs, and never through the frame bridge, which
-/// no `handle` answering by its clauses' values is on: what it performs reaches the real handler's
-/// object through the words its entry hands it. Empty where it does.
+/// Root `key`'s C in unit text `text` where it performs, and never through the bridge: what it
+/// performs reaches the real handler's object through the words its entry hands it. Empty where it
+/// does.
 fn bridged_in(text: Bytes, key: RootKey) -> Bytes / {abort.raise} = {
   let own = defined_in(text, symbol_of(root_text(root_name(key))));
   if own.index_of(b"ply_perform(") != None && own.index_of(b"ctx->bridge") == None { b"" }
@@ -5265,11 +5367,14 @@ test "an entry runs under the real handler of each effect its root's row names, 
   }
 }
 
-test "an entry of a root that performs `task` runs it under the run's region, `task`'s real handler" {
+test "an entry of a root that performs `task` runs it under the run's region, `task`'s real handler, and one that performs `clock` too under `clock`'s" {
   let user = [
     {
       name: b"m",
-      src: b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
+      src: Bytes::concat_all([
+        b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
+        b"pub fn timed() -> Int / {task.write, clock.read} = {\n  task.yield();\n  match clock.now() { Instant(n) -> n }\n}\n",
+      ]),
     },
   ];
   let clauses = [
@@ -5294,6 +5399,8 @@ test "an entry of a root that performs `task` runs it under the run's region, `t
           Bytes::concat_all([b"    task.", c, b" -> abort.raise(\"none\"),\n"])),
       ),
       b"  }\n",
+      b"pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / e =\n",
+      b"  handle { go() } with {\n    clock.now() -> Instant(0),\n    clock.sleep(_d) -> (),\n  }\n",
     ]),
   };
   let dump = dump_of(analyse_pulling_std_with(user, [scheduler], no_rows()).out);
@@ -5315,7 +5422,7 @@ test "an entry of a root that performs `task` runs it under the run's region, `t
       let entry = |n: Bytes| root_name(Entered(Named(n)));
       assert_eq(
         e.produced.dropped.filter(|d: Dropped|
-          [entry(b"m.yielded"), entry(b"m.plain")].contains(d.function)),
+          [entry(b"m.yielded"), entry(b"m.plain"), entry(b"m.timed")].contains(d.function)),
         [],
       );
       // Taken at what the entry answers, as any generic function its callers settle.
@@ -5361,8 +5468,9 @@ test "an entry hands its root, for each effect nothing of the program answers, t
         symbol_of(root_text(root_name(Entered(Named(b"m.main"))))),
       );
       let held = |object: Bytes| entry.split(object).len() - 1;
-      // `ask` and `abort` share the refusal, `time` is the Rust binding's, `clock` the frames'.
-      assert_eq([b"ctx->unserved", b"ctx->hosted", b"ctx->bridge"].map(held), [1, 1, 1])
+      // `ask`, `abort` and a `time` no real handler serves share the refusal; `clock`, whose real
+      // handler this load holds no scheduler for, is the bridge's.
+      assert_eq([b"ctx->unserved", b"ctx->bridge"].map(held), [1, 1])
     },
   }
 }
@@ -5688,33 +5796,44 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
   let native = [
     {
       name: b"std.native",
-      src: b"pub extern fn counted(x: Option<Int>) -> Int\npub extern fn named(id: Int) -> String\n",
+      src: b"pub extern fn counted(x: Int) -> Int\npub extern fn named(id: Int) -> String\n",
     },
   ];
   let program = [
     {
       name: b"m",
-      src: b"import std.native (counted, named)\nfn f() -> Int = counted(Some(1))\nfn g() -> String = named(7)\n",
+      src: b"import std.native (counted, named)\nfn f() -> Int = counted(1)\nfn g() -> String = named(7)\n",
     },
   ];
-  let counted = |words: Int| uniform_native(b"counted", words, true, false);
+  let counted = |params: List<Machine>|
+    { name: b"counted", params: params, answer: Some(abi::I64), raises: false };
   let named = |answer: Machine|
     { name: b"named", params: [abi::I64], answer: Some(answer), raises: false };
   let implemented = |a: Native, b: Native|
     declared_natives().map(declared_signature).push(a).push(b);
-  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::Taken)))), []);
-  assert_eq(refusal(held_over(program, native, implemented(counted(2), named(abi::Taken)))), [
-    b"E0476",
-    b"`extern fn counted` of `std.native` takes [Word], answers Word and cannot raise, and the runtime's native takes [Word, Word], answers Word and cannot raise",
-    natives_refused([]).notes_text.get(0),
-  ]);
-  // One called over machine words binds a native of the kinds its call passes: bytes are told from
-  // an integer by theirs.
-  assert_eq(refusal(held_over(program, native, implemented(counted(1), named(abi::I64)))), [
-    b"E0476",
-    b"`extern fn named` of `std.native` takes [I64], answers Taken and cannot raise, and the runtime's native takes [I64], answers I64 and cannot raise",
-    natives_refused([]).notes_text.get(0),
-  ])
+  assert_eq(
+    refusal(held_over(program, native, implemented(counted([abi::I64]), named(abi::Taken)))),
+    [],
+  );
+  assert_eq(
+    refusal(
+      held_over(program, native, implemented(counted([abi::I64, abi::I64]), named(abi::Taken))),
+    ),
+    [
+      b"E0476",
+      b"`extern fn counted` of `std.native` takes [I64], answers I64 and cannot raise, and the runtime's native takes [I64, I64], answers I64 and cannot raise",
+      natives_refused([]).notes_text.get(0),
+    ],
+  );
+  // A native binds the kinds its call passes: bytes are told from an integer by theirs.
+  assert_eq(
+    refusal(held_over(program, native, implemented(counted([abi::I64]), named(abi::I64)))),
+    [
+      b"E0476",
+      b"`extern fn named` of `std.native` takes [I64], answers Taken and cannot raise, and the runtime's native takes [I64], answers I64 and cannot raise",
+      natives_refused([]).notes_text.get(0),
+    ],
+  )
 }
 
 test "a unit declares a shipped module's native over machine words where a bucket calls it, and binds it after the rest" {

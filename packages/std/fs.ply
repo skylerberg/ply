@@ -44,6 +44,7 @@
 //! would leave of a tree: together they say what a crash at each step of a write leaves behind. A
 //! test imports both `std.fs` and `std.fs (fs)` to name the module and the effect.
 
+import std.internal.native (native, wait, job_wait, observed, found, parts, int_of)
 import std.laws (inverse)
 import std.list
 import std.path (segments)
@@ -276,6 +277,314 @@ pub fn mode_of_bits(bits: Int) -> Mode = {
   let of = |triple: Int| access(triple & 4 != 0, triple & 2 != 0, triple & 1 != 0);
   { owner: of(bits / 64 & 7), group: of(bits / 8 & 7), other: of(bits & 7) }
 }
+
+// --- The real handler -------------------------------------------------------
+
+host for fs by served
+
+/// `go` with the files under the roots the run binds, each operation waited for in the asking task
+/// and what it read or wrote entered into an observed run's record. A stamp, a sync, a lock, the
+/// room a file system has and what is read or written through an open file record nothing: a stamp
+/// is when and not what, the room is the machine's, and an open file is recorded when it opens.
+fn served<a | e>(
+  go: () -> a / {fs.read[*], fs.write[*] | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    fs.read_file[*l](path) -> noted(l, path, 0, found(job_wait(fs_read_file(l, path)))),
+    fs.read_at[*l](path, offset, len) -> if offset < 0 || len < 0 {
+      panic(
+        "`fs.read_at` was given offset " ++ offset.to_string() ++ " and length " ++ len.to_string(),
+      )
+    } else { noted(l, path, 0, found(job_wait(fs_read_at(l, path, offset, len)))) },
+    fs.list_dir[*l](path) ->
+      noted(l, path, 1, match found(job_wait(fs_list_dir(l, path))) {
+        Some(names) -> Some(parts(names).map(|name: Bytes| String::of_bytes_lossy(name))),
+        None -> None,
+      }),
+    fs.kind[*l](path) -> noted(l, path, 2, kind_of(job_wait(fs_kind(l, path)))),
+    fs.resolved[*l](path) -> noted(l, path, 2, kind_of(job_wait(fs_resolved(l, path)))),
+    fs.exists[*l](path) -> noted(l, path, 2, did(job_wait(fs_exists(l, path)))),
+    fs.file_size[*l](path) -> noted(l, path, 0, number(job_wait(fs_file_size(l, path)))),
+    fs.modified_ms[*l](path) -> number(job_wait(fs_modified_ms(l, path))),
+    fs.write_file[*l](path, body) -> noted(l, path, 4, did(job_wait(fs_write_file(l, path, body)))),
+    fs.append[*l](path, body) -> noted(l, path, 4, number(job_wait(fs_append(l, path, body)))),
+    fs.create_dir[*l](path) -> noted(l, path, 4, did(job_wait(fs_create_dir(l, path)))),
+    fs.remove[*l](path) -> noted(l, path, 4, did(job_wait(fs_remove(l, path)))),
+    fs.rename[*l](from, to) -> noted(l, from, 4, did(job_wait(fs_rename(l, from, to)))),
+    fs.sync[*l](path) -> did(job_wait(fs_sync(l, path))),
+    fs.lock[*l](path) -> did(job_wait(fs_lock(l, path))),
+    fs.unlock[*l](path) -> did(job_wait(fs_unlock(l, path))),
+    fs.copy[*l](from, to) -> noted(l, from, 4, did(job_wait(fs_copy(l, from, to)))),
+    fs.remove_tree[*l](path) -> noted(l, path, 4, did(job_wait(fs_remove_tree(l, path)))),
+    fs.temp_dir[*l](dir, prefix) -> match text(job_wait(fs_temp_dir(l, dir, prefix))) {
+      Some(made) -> noted(l, made, 4, Some(made)),
+      None -> None,
+    },
+    fs.canonical[*l](path) -> noted(l, path, 2, text(job_wait(fs_canonical(l, path)))),
+    fs.mode[*l](path) ->
+      noted(l, path, 0, match found(job_wait(fs_mode(l, path))) {
+        Some(bits) -> Some(mode_of_bits(int_of(bits))),
+        None -> None,
+      }),
+    fs.set_mode[*l](path, mode) ->
+      noted(l, path, 4, did(job_wait(fs_set_mode(l, path, mode_bits(mode))))),
+    fs.symlink[*l](path, target) -> noted(l, path, 4, did(job_wait(fs_symlink(l, path, target)))),
+    fs.read_link[*l](path) -> noted(l, path, 0, text(job_wait(fs_read_link(l, path)))),
+    fs.walk[*l](path) ->
+      noted(l, path, 3, match found(job_wait(fs_walk(l, path))) {
+        Some(flat) -> Some(parts(flat).map(|entry: Bytes| entry_of(entry))),
+        None -> None,
+      }),
+    fs.set_modified[*l](path, ms) -> if ms < 0 {
+      panic("`fs.set_modified` was given " ++ ms.to_string() ++ " milliseconds")
+    } else { noted(l, path, 4, did(job_wait(fs_set_modified(l, path, ms)))) },
+    fs.open[*l](path, how) -> {
+      let said = job_wait(fs_open(l, path, opening_number(how)));
+      observed(l, path, match how { ToRead -> 0, _ -> 4 });
+      let rest = said.slice(1, said.len());
+      if said.at(0) == 1 { Ok(int_of(rest)) } else { Err(refused_of(rest)) }
+    },
+    fs.read_chunk[*l](file, max) -> if max < 0 {
+      panic("`fs.read_chunk` was asked for " ++ max.to_string() ++ " bytes")
+    } else { found(job_wait(fs_read_chunk(l, file, max))) },
+    fs.write_chunk[*l](file, body) -> did(job_wait(fs_write_chunk(l, file, body))),
+    fs.close[*l](file) -> did(job_wait(fs_close(l, file))),
+    fs.stat[*l](path) ->
+      noted(
+        l,
+        path,
+        2,
+        noted(l, path, 0, match found(job_wait(fs_stat(l, path))) {
+          Some(flat) -> Some(stat_of(flat)),
+          None -> None,
+        }),
+      ),
+    fs.scan[*l](path, deep) ->
+      noted(l, path, 3, match found(job_wait(fs_scan(l, path, deep))) {
+        Some(flat) -> Some(parts(flat).map(|seen: Bytes| seen_of(seen))),
+        None -> None,
+      }),
+    fs.space[*l](path) -> match found(job_wait(fs_space(l, path))) {
+      Some(flat) -> Some(space_of(flat)),
+      None -> None,
+    },
+    fs.link[*l](path, to) -> {
+      let said = job_wait(fs_link(l, path, to));
+      observed(l, path, 4);
+      if said.at(0) == 1 { Ok(()) } else { Err(refused_of(said.slice(1, said.len()))) }
+    },
+    fs.write_secret[*l](path, before, secret, encoding, after) ->
+      noted(l, path, 4, did(job_wait(fs_write_secret(l, path, before, secret, encoding, after)))),
+    fs.read_secret[*l](path, before, encoding, after) ->
+      noted(l, path, 0, match found(job_wait(fs_read_secret(l, path, before, encoding, after))) {
+        Some(number) -> Some(fs_secret_taken(int_of(number))),
+        None -> None,
+      }),
+  }
+
+/// `answer`, with what the operation that answered it did at `path` under the root `l` names
+/// entered into an observed run's record as `observed`'s `kind`.
+fn noted<b>(l: String, path: String, kind: Int, answer: b) -> b / {native.read} = {
+  observed(l, path, kind);
+  answer
+}
+
+fn did(said: Bytes) -> Bool / {abort.raise} = said.at(0) == 1
+
+fn number(said: Bytes) -> Option<Int> / {abort.raise} =
+  match found(said) { Some(n) -> Some(int_of(n)), None -> None }
+
+fn text(said: Bytes) -> Option<String> =
+  match found(said) { Some(t) -> Some(String::of_bytes_lossy(t)), None -> None }
+
+fn kind_of(said: Bytes) -> Kind / {abort.raise} =
+  match said.at(0) { 0 -> File, 1 -> Dir, 2 -> Symlink, _ -> Missing }
+
+fn opening_number(how: Opening) -> Int =
+  match how { ToRead -> 0, ToWrite -> 1, ToAppend -> 2, ToCreate -> 3 }
+
+fn refused_of(flat: Bytes) -> Refused / {abort.raise} =
+  match flat.at(0) {
+    0 -> NotFound,
+    1 -> Denied,
+    2 -> NotAFile,
+    3 -> NotADirectory,
+    4 -> Exists,
+    5 -> NoSpace,
+    _ -> match parts(flat.slice(1, flat.len())) {
+      [code, words] -> Other(int_of(code), String::of_bytes_lossy(words)),
+      _ -> panic("a file system's native wrote no refusal"),
+    },
+  }
+
+fn entry_of(flat: Bytes) -> Entry / {abort.raise} =
+  match parts(flat) {
+    [path, kind] -> { path: String::of_bytes_lossy(path), kind: kind_of(kind) },
+    _ -> panic("a file system's native wrote no entry"),
+  }
+
+fn stat_of(flat: Bytes) -> Stat / {abort.raise} =
+  match parts(flat) {
+    [kind, size, modified, mode, links, device, id] ->
+      {
+        kind: kind_of(kind),
+        size: int_of(size),
+        modified: Instant(int_of(modified)),
+        mode: mode_of_bits(int_of(mode)),
+        links: int_of(links),
+        device: int_of(device),
+        id: int_of(id),
+      },
+    _ -> panic("a file system's native wrote no stat"),
+  }
+
+fn seen_of(flat: Bytes) -> Seen / {abort.raise} =
+  match parts(flat) {
+    [path, stat] -> { path: String::of_bytes_lossy(path), stat: stat_of(stat) },
+    _ -> panic("a file system's native wrote no entry"),
+  }
+
+fn space_of(flat: Bytes) -> Space / {abort.raise} =
+  match parts(flat) {
+    [total, free, available, inodes, inodes_free] ->
+      {
+        total: int_of(total),
+        free: int_of(free),
+        available: int_of(available),
+        inodes: int_of(inodes),
+        inodes_free: int_of(inodes_free),
+      },
+    _ -> panic("a file system's native wrote no space"),
+  }
+
+/// The ticket of a file's whole contents, found; refused above one read's bound.
+extern fn fs_read_file(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of what is there of `len` bytes from `offset`, found.
+extern fn fs_read_at(label: String, path: String, offset: Int, len: Int) -> Int / {native.read}
+
+/// The ticket of a directory's names as parts, found.
+extern fn fs_list_dir(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of what the path names, a link unfollowed, as `kind_of` reads its byte.
+extern fn fs_kind(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of what the path resolves to, as `kind_of` reads its byte.
+extern fn fs_resolved(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of whether anything is at the path, as `did` reads it.
+extern fn fs_exists(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of a file's size, found.
+extern fn fs_file_size(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of when the path was last modified, found.
+extern fn fs_modified_ms(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of `body` written as a whole file.
+extern fn fs_write_file(label: String, path: String, body: Bytes) -> Int / {native.read}
+
+/// The ticket of the offset `body` landed at, found.
+extern fn fs_append(label: String, path: String, body: Bytes) -> Int / {native.read}
+
+/// The ticket of the directory made with its missing ancestors.
+extern fn fs_create_dir(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of one file, link or empty directory removed.
+extern fn fs_remove(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of `from` moved to `to`.
+extern fn fs_rename(label: String, from: String, to: String) -> Int / {native.read}
+
+/// The ticket of what was written to the path made durable.
+extern fn fs_sync(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of the lock file at the path taken.
+extern fn fs_lock(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of a lock this run took released.
+extern fn fs_unlock(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of a file copied over the destination.
+extern fn fs_copy(label: String, from: String, to: String) -> Int / {native.read}
+
+/// The ticket of a directory removed with everything under it.
+extern fn fs_remove_tree(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of a new directory's path, found.
+extern fn fs_temp_dir(label: String, dir: String, prefix: String) -> Int / {native.read}
+
+/// The ticket of the host's absolute path, found.
+extern fn fs_canonical(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of the path's nine permission bits, found.
+extern fn fs_mode(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of the nine permission bits `bits` set.
+extern fn fs_set_mode(label: String, path: String, bits: Int) -> Int / {native.read}
+
+/// The ticket of the path made a link to `target`.
+extern fn fs_symlink(label: String, path: String, target: String) -> Int / {native.read}
+
+/// The ticket of the target a link holds, found.
+extern fn fs_read_link(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of every entry under a directory, each its path and its kind's byte, as parts of
+/// parts, found.
+extern fn fs_walk(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of the path stamped `ms` milliseconds after the epoch.
+extern fn fs_set_modified(label: String, path: String, ms: Int) -> Int / {native.read}
+
+/// The ticket of a file opened as `opening_number` numbers `how`: byte 1 and its descriptor, or
+/// byte 0 and why not.
+extern fn fs_open(label: String, path: String, how: Int) -> Int / {native.read}
+
+/// The ticket of at most `max` bytes of an open file, found.
+extern fn fs_read_chunk(label: String, file: Int, max: Int) -> Int / {native.read}
+
+/// The ticket of `body` written through an open file.
+extern fn fs_write_chunk(label: String, file: Int, body: Bytes) -> Int / {native.read}
+
+/// The ticket of an open file let go.
+extern fn fs_close(label: String, file: Int) -> Int / {native.read}
+
+/// The ticket of what one look reads of the path, as `stat_of` reads it, found.
+extern fn fs_stat(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of every entry under a directory with what one look reads of it, as parts of what
+/// `seen_of` reads, found.
+extern fn fs_scan(label: String, path: String, deep: Bool) -> Int / {native.read}
+
+/// The ticket of the room in the file system that holds the path, as `space_of` reads it, found.
+extern fn fs_space(label: String, path: String) -> Int / {native.read}
+
+/// The ticket of `path` made another name for the file at `to`: byte 1, or byte 0 and why not.
+extern fn fs_link(label: String, path: String, to: String) -> Int / {native.read}
+
+/// The ticket of `secret` written between `before` and `after` as a file only its owner reads.
+extern fn fs_write_secret(
+  label: String,
+  path: String,
+  before: Bytes,
+  secret: Secret<Bytes>,
+  encoding: String,
+  after: Bytes,
+) -> Int / {native.read}
+
+/// The ticket of the number the run keeps the secret between `before` and `after` under, found.
+extern fn fs_read_secret(
+  label: String,
+  path: String,
+  before: Bytes,
+  encoding: String,
+  after: Bytes,
+) -> Int / {native.read}
+
+/// The secret the run keeps under `number`, which it no longer keeps.
+extern fn fs_secret_taken(number: Int) -> Secret<Bytes> / {native.read}
 
 /// One directory tree, as a value. A link maps to its target as written; a path `modes` holds no
 /// entry for has the mode a fresh file or directory gets. `opened` holds each descriptor not yet

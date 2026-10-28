@@ -12,27 +12,26 @@ import compiler.emit.evidence (evidence_type, instance_block_type, row_described
 import compiler.syntax.parsing (Span)
 import compiler.syntax.exprs (is_exit_effect, scheduler_module)
 import compiler.syntax.items (is_shipped)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Atom,
-                             Row, Resource, RNamed, RSingleton, RAny, RVar, is_diverges, int_type,
-                             string_type, fields_sorted, fn_type, row_empty)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Row, Resource,
+                             RNamed, RSingleton, RAny, RVar, int_type, string_type, fields_sorted,
+                             fn_type, row_empty)
 import compiler.check.infer.expr (kept_type, crossing_vars, crossing_own)
 import compiler.emit.typing (unknown_type)
-import compiler.check.resolve.tables (qualify)
 import compiler.expand.rewrite (named_program_wide)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
 import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
 import std.bytes (ascii_of_int)
-import compiler.emit.reps (Def, EffectName, OpMode, gathered_of, type_vars)
-import compiler.emit.keys (Named, unspecialised, module_of)
+import compiler.emit.reps (EffectName, OpMode, gathered_of, type_vars)
+import compiler.emit.keys (module_of)
 import compiler.emit.marks (carried_by, kept_form)
 import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
                           Enter, Handle, Handling, Uses, AInt, Static, falls_through)
-import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Reached, Bridge,
-                                   Instance, InstanceHeap, InstanceIn, Entering, ForwardsLaid,
-                                   ForwardsSet, ObjectAt, Mapped, Slot, Answering, Forwarding,
-                                   Forwarded, Keyed, KeyedRow, Entry, Answers, Schedules, Stops,
-                                   Resumes, Raises, HandleInstance, Returning, raised_at)
+import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Bridge, Instance,
+                                   InstanceHeap, InstanceIn, Entering, ForwardsLaid, ForwardsSet,
+                                   ObjectAt, Mapped, Slot, Answering, Forwarding, Forwarded, Keyed,
+                                   KeyedRow, Entry, Answers, Schedules, Stops, Resumes, Raises,
+                                   HandleInstance, Returning, raised_at)
 import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
                                      own_types)
 import compiler.emit.lower.kept (crossed_kept)
@@ -49,9 +48,9 @@ import compiler.emit.lower.resumes (off_tail_code)
 /// Operation `op` of `effect` performed on `resource` with `args`, at `label` where one is read,
 /// written `written`: the label opened as the field-table entry it is, each argument handed over as
 /// a word to the entry of the object the body holds for the effect there, and what the entry
-/// answers, a word, held as the type the checker filed for the perform. Where a program declares
-/// the effect, a value of one of the operation's own type parameters crosses kept, as the clause,
-/// compiled once for every perform, holds it (`kept_by`).
+/// answers, a word, held as `answer`, or, where that is `None`, as the type the checker filed for
+/// the perform. Where a program declares the effect, a value of one of the operation's own type
+/// parameters crosses kept, as the clause, compiled once for every perform, holds it (`kept_by`).
 pub fn performed(
   cx: Context,
   st: Lowering,
@@ -59,6 +58,7 @@ pub fn performed(
   label: Option<Arg>,
   written: Option<Code>,
   args: List<Arg>,
+  answer: Option<Type>,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match effect_named(cx, p.effect) {
@@ -101,11 +101,15 @@ pub fn performed(
           { st: w.st, args: acc.args.push(w.arg) }
         },
       );
-      match filed(cx, at) {
+      let typed = match answer {
+        Some(a) -> Some(a),
+        None -> match filed(cx, at) { Some(f) -> Some(f.ty), None -> None },
+      };
+      match typed {
         None -> unfiled(cx, words.st, b"a perform", at),
-        Some(t) -> {
-          let out = if is_raise(mode) { { ty: t.ty, marked: None } }
-          else { crossed_out(declared.ret, kept, t.ty) };
+        Some(ty) -> {
+          let out = if is_raise(mode) { { ty: ty, marked: None } }
+          else { crossed_out(declared.ret, kept, ty) };
           let d = op_described(
             cx,
             words.st,
@@ -405,7 +409,7 @@ type Placed = { targets: Int, tasks: Int, labels: Int, forwards: List<Int>, word
 
 /// A word around a detached `handle` its body forwards to, and how many operations the effect it
 /// answers has; none for an effect whose operations the lowering does not know, which the body
-/// reaches through the frame bridge.
+/// reaches through the bridge.
 type Outer = { word: Worded, ops: Int }
 
 /// A detached body's forwarding block laid out on the heap after `st`: its header, the words around
@@ -474,7 +478,7 @@ fn forwarding(
       { st: o.st, words: acc.words.push({ ..f.word, word: o.arg }) }
     },
   );
-  // A word whose effect's operations the lowering does not know reaches the frames.
+  // A word whose effect's operations the lowering does not know reaches the bridge.
   let unknown = cx.words.filter(|w: Worded| !outer.contains(w));
   let bridged_unknown = if unknown.len() == 0 { { st: forwarded.st, words: [] } } else {
     let b = bound_as(
@@ -553,7 +557,7 @@ fn handler_vars(body: Code) -> Int =
   }
 
 /// What a clause or the return clause of a `handle` planned as `plan`, written at `at`, holds: the
-/// words its row takes as they stand around the `handle`, each the frame bridge where none answers,
+/// words its row takes as they stand around the `handle`, each the bridge where none answers,
 /// and the instance.
 pub fn clause_held(
   cx: Context,
@@ -1077,14 +1081,12 @@ fn preset_clauses(cx: Context, clauses: List<CodeClause>) -> List<Clause> / {abo
 /// A `parallel` block of the closures `branches`, which perform `performs`: the runtime runs them,
 /// at once where it may, handing each the words of that row, and the block answers the tuple of
 /// their answers. Each branch's answer is handed with the descriptor of its type, which lets it go
-/// where another branch failed. Where the block is in its definition's own body, the runtime is told
-/// what the definition's row lets the branches reach.
+/// where another branch failed.
 pub fn branched(
   cx: Context,
   st: Lowering,
   branches: List<Arg>,
   performs: Row,
-  rooted: Bool,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let closures = branches.fold(
@@ -1101,7 +1103,7 @@ pub fn branched(
       { st: d.st, args: acc.args.push(d.arg) }
     },
   );
-  // A branch raises `abort.raise` through the frame bridge, which leaves it pending for the block to
+  // A branch raises `abort.raise` through the bridge, which leaves it pending for the block to
   // carry back and raise where it stands, so a block that can merely fail still runs at once.
   let unaborted = { ..cx, words: cx.words.filter(|w: Worded| w.evidence.effect != b"abort") };
   let handing = value_handing(unaborted, described.st, performs, at);
@@ -1121,7 +1123,7 @@ pub fn branched(
     ),
   );
   let op = Op({
-    op: OHandle(Parallel({ reach: if rooted { owner_reach(cx) } else { None } })),
+    op: OHandle(Parallel),
     args: words.args,
     uses: {
       takes: closures.args.map(|_: Arg| true).concat(described.args.map(|_: Arg| false)),
@@ -1344,24 +1346,3 @@ fn op_mode(e: EffectName, op: Bytes) -> Mode = op_declared(e, op).mode
 
 /// A mode as the runtime numbers it.
 fn mode_code(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MRaise -> 2, MBad -> 0 }
-
-/// Every operation the root's row says it may perform and does not answer, by program-wide names:
-/// what a `parallel` block in its own body may reach of the handlers its callers installed. Nothing
-/// where the row is left open or no definition's scheme speaks for the root.
-fn owner_reach(cx: Context) -> Option<List<Reached>> =
-  match cx.setting.here.fold(None, |found: Option<Scheme>, d: Def|
-      if unspecialised(cx.key) == Named(qualify(cx.setting.module, d.name)) { d.scheme }
-      else { found }) {
-    None -> None,
-    Some(s) -> match s.ty {
-      TyFn(f) -> match f.effects.tail {
-        Some(_) -> None,
-        None ->
-          Some(
-            f.effects.atoms.filter(|a: Atom| !is_diverges(a)).map(|a: Atom|
-              { effect: a.effect, resource: match a.resource { RNamed(n) -> Some(n), _ -> None } }),
-          ),
-      },
-      _ -> None,
-    },
-  }

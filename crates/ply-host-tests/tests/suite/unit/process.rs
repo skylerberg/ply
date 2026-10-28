@@ -1,15 +1,13 @@
-use ply_core::host::MachineId;
-use ply_core::{
-    Determinism, Diagnostic, EffectAtom, Fields, HostAnswer, HostHandler, HostOp, HostRequest,
-    HostRuntime, Linearity, Mode, Resource, Span, Symbol, Value, codes,
-};
+use ply_core::{Diagnostic, HostRuntime, Span, Symbol, codes};
+use ply_host::jobs::{Failure, Refusing};
+use ply_host::native::{int_of, parts_of};
 use ply_host::process::*;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 thread_local! {
-    /// The run a test's operations are submitted for and waited on.
+    /// The run a test's jobs are submitted for and waited on.
     static RUN: Rc<dyn HostRuntime> = ply_host::Host::new().runtime();
 }
 
@@ -24,110 +22,20 @@ fn host(argv: &[&str]) -> Arc<ProcessHost> {
     ))
 }
 
-fn atom(op: Op) -> EffectAtom {
-    let mode = if matches!(op, Op::Args | Op::Bound) {
-        Mode::Read
-    } else {
-        Mode::Write
-    };
-    EffectAtom::new(
-        Symbol::new(EFFECT),
-        Resource::Named(Symbol::new("proc")),
-        mode,
-    )
-}
-
-fn call(
-    handlers: &[(HostOp, Arc<dyn HostHandler>)],
-    op: Op,
-    args: &[Value],
-) -> Result<Value, Diagnostic> {
-    let (declaration, handler) = handlers
-        .iter()
-        .find(|(d, _)| d.op.as_str() == op.name())
-        .expect("every operation is registered");
-    handler
-        .call(
-            &*the_run(),
-            &HostRequest {
-                atom: atom(op),
-                op: declaration,
-                args,
-                span: Span::DUMMY,
-                machine: MachineId(0),
-                task: None,
-                declared: None,
-            },
-        )
-        .map(|answer| match answer {
-            HostAnswer::Value(v) => v,
-            HostAnswer::Pending(_) => panic!("a process operation waits on nothing"),
-        })
-}
-
-fn value(answer: Result<Value, Diagnostic>) -> Value {
-    match answer {
-        Ok(v) => v,
-        Err(d) => panic!("refused: {} {}", d.code, d.message),
-    }
-}
-
-fn text(s: &str) -> Value {
-    Value::Str(s.into())
-}
-
-#[test]
-fn the_registrations_declare_what_a_reviewer_relies_on() {
-    let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    assert_eq!(handlers.len(), Op::ALL.len());
-    for (op, _) in &handlers {
-        assert_eq!(op.effect.as_str(), EFFECT);
-        assert_eq!(op.determinism, Determinism::Nondeterministic);
-        // Each of these waits outside this process, on another one, on a person or on a pipe a
-        // child drains at its own pace, so each goes to the pool rather than parking the machine.
-        let waits = matches!(
-            op.op.as_str(),
-            "spawn" | "line" | "in_bytes" | "wait" | "input" | "output_line"
-        );
-        assert_eq!(op.blocking, waits, "{op}");
-        assert!(!op.secrets, "a line or a code is never a credential");
-        assert!(op.path.starts_with("ply_host::process::"));
-        // Neither the arguments nor the executables a run was given change while it runs.
-        let expected = if matches!(op.op.as_str(), "args" | "bound") {
-            Linearity::Repeatable
-        } else {
-            Linearity::AtMostOnce
-        };
-        assert_eq!(op.linearity, expected, "{op}");
-    }
-}
+const S: Span = Span::DUMMY;
 
 #[test]
 fn args_answers_the_vector_it_was_given() {
     let host = host(&["a", "b c"]);
-    let handlers = registrations(Some(&host));
-    assert_eq!(
-        value(call(&handlers, Op::Args, &[])),
-        Value::list(vec![text("a"), text("b c")])
-    );
-    assert_eq!(
-        value(call(&handlers, Op::Args, &[])),
-        value(call(&handlers, Op::Args, &[]))
-    );
-    assert_eq!(host.argv(), ["a", "b c"]);
+    assert_eq!(host.args(S).expect("a run's own process"), ["a", "b c"]);
 }
 
 #[test]
 fn a_captured_sink_collects_both_streams_in_order() {
     let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    assert_eq!(value(call(&handlers, Op::Out, &[text("one")])), Value::Unit);
-    assert_eq!(value(call(&handlers, Op::Err, &[text("two")])), Value::Unit);
-    assert_eq!(
-        value(call(&handlers, Op::Out, &[text("three")])),
-        Value::Unit
-    );
+    host.line(Stream::Out, "one", S).expect("a write");
+    host.line(Stream::Err, "two", S).expect("a write");
+    host.line(Stream::Out, "three", S).expect("a write");
     assert_eq!(
         host.captured(),
         [
@@ -142,31 +50,18 @@ fn a_captured_sink_collects_both_streams_in_order() {
 #[test]
 fn bytes_are_written_as_they_are_and_a_line_keeps_its_place_among_them() {
     let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    let raw = Value::bytes(b"\x00\xff no newline");
-    assert_eq!(
-        value(call(&handlers, Op::OutBytes, std::slice::from_ref(&raw))),
-        Value::Bool(true)
-    );
-    assert_eq!(
-        value(call(&handlers, Op::Err, &[text("warn")])),
-        Value::Unit
-    );
-    assert_eq!(
-        value(call(&handlers, Op::ErrBytes, &[raw])),
-        Value::Bool(true)
-    );
-    assert_eq!(
-        value(call(&handlers, Op::Out, &[text("done")])),
-        Value::Unit
-    );
-    assert_eq!(value(call(&handlers, Op::Flush, &[])), Value::Bool(true));
+    let raw = b"\x00\xff no newline";
+    assert!(host.write(Stream::Out, raw, S).expect("a write"));
+    host.line(Stream::Err, "warn", S).expect("a write");
+    assert!(host.write(Stream::Err, raw, S).expect("a write"));
+    host.line(Stream::Out, "done", S).expect("a write");
+    assert!(host.flush(S).expect("a flush"));
     assert_eq!(
         host.captured(),
         [
-            (Stream::Out, b"\x00\xff no newline".to_vec()),
+            (Stream::Out, raw.to_vec()),
             (Stream::Err, b"warn\n".to_vec()),
-            (Stream::Err, b"\x00\xff no newline".to_vec()),
+            (Stream::Err, raw.to_vec()),
             (Stream::Out, b"done\n".to_vec()),
         ]
     );
@@ -178,27 +73,14 @@ fn a_host_whose_streams_are_captured_leaves_an_unanswered_raise_to_the_run() {
     let host = host(&[]);
     host.unanswered(&Symbol::new(PIPE_EFFECT), &Symbol::new(PIPE_BROKEN));
     host.settle();
-    assert_eq!(PIPE_EFFECT, format!("{MODULE}.pipe"));
-}
-
-#[test]
-fn a_read_of_a_negative_length_is_refused_before_anything_waits() {
-    let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    let refused = call(&handlers, Op::InBytes, &[Value::Int(-1)]).expect_err("no such read");
-    assert_eq!(refused.code, codes::RUNTIME_ERROR);
-    assert!(refused.message.contains("-1"), "{}", refused.message);
 }
 
 #[test]
 fn exit_records_the_first_code_and_unwinds() {
     let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    let refused = call(&handlers, Op::Exit, &[Value::Int(3)]).expect_err("an exit never resumes");
-    assert_eq!(refused.code, codes::PROCESS_EXIT);
+    assert_eq!(host.exit(3, S).code, codes::PROCESS_EXIT);
     assert_eq!(host.requested_exit(), Some(3));
-    let again = call(&handlers, Op::Exit, &[Value::Int(4)]).expect_err("an exit never resumes");
-    assert_eq!(again.code, codes::PROCESS_EXIT);
+    assert_eq!(host.exit(4, S).code, codes::PROCESS_EXIT);
     assert_eq!(
         host.requested_exit(),
         Some(3),
@@ -206,50 +88,35 @@ fn exit_records_the_first_code_and_unwinds() {
     );
 }
 
+/// A test is no process of its own: what it would write, read or exit with is withheld, naming
+/// where it is served.
 #[test]
-fn exit_refuses_a_code_the_shell_could_not_carry() {
-    let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    for code in [-1, 126, 256] {
-        let refused = call(&handlers, Op::Exit, &[Value::Int(code)]).expect_err("out of range");
-        assert_eq!(refused.code, codes::RUNTIME_ERROR, "{code}");
-        assert!(refused.message.contains("0 to 125"), "{}", refused.message);
+fn a_host_that_only_starts_programs_withholds_the_runs_own_process() {
+    let host = ProcessHost::spawning(Executables::new());
+    let refusals = [
+        host.args(S).map(|_| ()).expect_err("no arguments"),
+        host.line(Stream::Out, "x", S).expect_err("no stream"),
+        host.write(Stream::Err, b"x", S)
+            .map(|_| ())
+            .expect_err("no stream"),
+        host.flush(S).map(|_| ()).expect_err("no stream"),
+        host.read_line(S).map(|_| ()).expect_err("no input"),
+        host.read(1, S).map(|_| ()).expect_err("no input"),
+        host.exit(0, S),
+    ];
+    for refused in refusals {
+        assert_eq!(refused.code, codes::HOST_UNBOUND, "{}", refused.message);
+        assert!(
+            refused
+                .notes
+                .iter()
+                .any(|n| n.contains("`ply test` withholds it")),
+            "{:?}",
+            refused.notes
+        );
     }
-    assert_eq!(host.requested_exit(), None);
-    for code in [0, 125] {
-        let asked =
-            call(&handlers, Op::Exit, &[Value::Int(code)]).expect_err("an exit never resumes");
-        assert_eq!(asked.code, codes::PROCESS_EXIT, "{code}");
-    }
-    assert_eq!(host.requested_exit(), Some(0));
-}
-
-#[test]
-fn an_argument_of_the_wrong_type_is_the_handlers_refusal() {
-    let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    assert!(call(&handlers, Op::Out, &[Value::Int(1)]).is_err());
-    assert!(call(&handlers, Op::Exit, &[text("1")]).is_err());
     assert!(host.captured().is_empty());
     assert_eq!(host.requested_exit(), None);
-}
-
-// Arity is inference's, so the wrong count means the module was never checked.
-#[test]
-fn the_wrong_arity_is_a_dispatch_defect() {
-    let host = host(&[]);
-    let handlers = registrations(Some(&host));
-    let refused = call(&handlers, Op::Args, &[Value::Unit]).expect_err("args takes nothing");
-    assert_eq!(refused.code, codes::INTERNAL_ERROR);
-    let refused = call(&handlers, Op::Out, &[]).expect_err("out takes a line");
-    assert_eq!(refused.code, codes::INTERNAL_ERROR);
-}
-
-#[test]
-fn a_withheld_registration_refuses_dispatch() {
-    let handlers = registrations(None);
-    let refused = call(&handlers, Op::Args, &[]).expect_err("nothing answers without a host");
-    assert_eq!(refused.code, codes::INTERNAL_ERROR);
 }
 
 // --- Spawning ---------------------------------------------------------------
@@ -262,16 +129,35 @@ const PATH: (&str, &str) = ("PATH", "/usr/bin:/bin");
 fn spawning(label: &str, program: &str) -> Arc<ProcessHost> {
     let mut executables = Executables::new();
     executables
-        .bind(label, std::path::Path::new(program), Span::DUMMY)
+        .bind(label, std::path::Path::new(program), S)
         .expect("the program binds");
     Arc::new(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables))
 }
 
-fn variable(name: &str, value: &str) -> Value {
-    Value::Record(Arc::new(Fields::from_iter([
-        (Symbol::new("name"), text(name)),
-        (Symbol::new("value"), text(value)),
-    ])))
+/// What a job answered, run on this thread.
+fn ran(job: Refusing) -> Result<Vec<u8>, Diagnostic> {
+    job().map_err(|failure| match failure {
+        Failure::Refused(refusal) => refusal,
+        Failure::Said(why) => panic!("the job failed: {why}"),
+    })
+}
+
+/// A child's ending as [`Finished::flat`] wrote it.
+fn finished(flat: &[u8]) -> Finished {
+    let [kind, n, out, err] = parts_of(flat)
+        .expect("parts")
+        .try_into()
+        .expect("four parts");
+    let n = int_of(n).expect("an integer");
+    Finished {
+        ended: if int_of(kind) == Some(0) {
+            Ended::Exited(n)
+        } else {
+            Ended::Signalled(n)
+        },
+        out: out.to_vec(),
+        err: err.to_vec(),
+    }
 }
 
 fn spawn(
@@ -280,87 +166,53 @@ fn spawn(
     args: &[&str],
     dir: &str,
     env: &[(&str, &str)],
-) -> Result<Value, Diagnostic> {
-    let handlers = registrations(Some(host));
-    let (declaration, handler) = handlers
+) -> Result<Finished, Diagnostic> {
+    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    let env: Vec<(String, String)> = env
         .iter()
-        .find(|(d, _)| d.op.as_str() == "spawn")
-        .expect("spawn is registered");
-    let arguments = [
-        Value::list(args.iter().map(|a| text(a)).collect()),
-        text(dir),
-        Value::list(env.iter().map(|(n, v)| variable(n, v)).collect()),
-    ];
-    let answer = handler.call(
-        &*the_run(),
-        &HostRequest {
-            atom: EffectAtom::new(
-                Symbol::new(EFFECT),
-                Resource::Named(Symbol::new(label)),
-                Mode::Write,
-            ),
-            op: declaration,
-            args: &arguments,
-            span: Span::DUMMY,
-            machine: MachineId(0),
-            task: None,
-            declared: None,
-        },
-    )?;
-    match answer {
-        HostAnswer::Pending(pending) => the_run().block_on(pending),
-        // `blocking` is declared, so answering inline would be `E0428` in a real run.
-        HostAnswer::Value(v) => panic!("a spawn waits in the pool: {}", v.type_name()),
-    }
-}
-
-fn field<'a>(record: &'a Value, name: &str) -> &'a Value {
-    match record {
-        Value::Record(fields) => fields
-            .get(&Symbol::new(name))
-            .unwrap_or_else(|| panic!("no field `{name}`")),
-        other => panic!("not a record: {}", other.type_name()),
-    }
-}
-
-/// The constructor's program-wide name and the number it carries.
-fn ending(record: &Value) -> (String, i64) {
-    match field(record, "ended") {
-        Value::Ctor { name, args } => (
-            name.to_string(),
-            args[0].as_int(Span::DUMMY, "a code").expect("an Int"),
-        ),
-        other => panic!("not a variant: {}", other.type_name()),
-    }
-}
-
-fn bytes(record: &Value, name: &str) -> Vec<u8> {
-    match field(record, name) {
-        Value::Bytes(b) => b.to_vec(),
-        other => panic!("not Bytes: {}", other.type_name()),
-    }
+        .map(|(n, v)| ((*n).to_string(), (*v).to_string()))
+        .collect();
+    let job = host.spawn(label, &args, dir, &env, S)?;
+    Ok(finished(&ran(job)?))
 }
 
 #[test]
 fn a_spawn_answers_with_the_code_and_everything_both_streams_took() {
     let host = spawning("sh", SH);
-    let done = value(spawn(
+    let done = spawn(
         &host,
         "sh",
         &["-c", "printf built; printf 'warning' 1>&2; exit 3"],
         "",
         &[PATH],
-    ));
-    assert_eq!(ending(&done), ("std.process.Exited".to_string(), 3));
-    assert_eq!(bytes(&done, "out").as_slice(), b"built");
-    assert_eq!(bytes(&done, "err").as_slice(), b"warning");
+    )
+    .expect("a spawn");
+    assert_eq!(done.ended, Ended::Exited(3));
+    assert_eq!(done.out, b"built");
+    assert_eq!(done.err, b"warning");
 }
 
 #[test]
 fn a_signal_is_an_ending_of_its_own_rather_than_a_code() {
     let host = spawning("sh", SH);
-    let done = value(spawn(&host, "sh", &["-c", "kill -9 $$"], "", &[PATH]));
-    assert_eq!(ending(&done), ("std.process.Signalled".to_string(), 9));
+    let done = spawn(&host, "sh", &["-c", "kill -9 $$"], "", &[PATH]).expect("a spawn");
+    assert_eq!(done.ended, Ended::Signalled(9));
+}
+
+/// A spawn is one of the run's children, so a stop or a teardown that ends them ends it too.
+#[test]
+fn ending_the_children_ends_a_spawn_still_running() {
+    let host = spawning("sh", SH);
+    let args = ["-c".to_string(), "exec sleep 600".to_string()];
+    let job = host.spawn("sh", &args, "", &[], S).expect("a spawn");
+    host.end_children();
+    let ended = Instant::now();
+    let done = finished(&ran(job).expect("an ending"));
+    assert_eq!(done.ended, Ended::Signalled(9));
+    assert!(
+        ended.elapsed() < Duration::from_secs(60),
+        "the spawn ran on"
+    );
 }
 
 /// The run's own environment is the classic hidden input, so a spawn inherits none of it.
@@ -369,7 +221,7 @@ fn a_spawn_sees_only_the_environment_it_was_given() {
     // nextest runs one test per process, so this environment is this test's alone.
     unsafe { std::env::set_var("PLY_SPAWN_WITNESS", "leaked") };
     let host = spawning("sh", SH);
-    let done = value(spawn(
+    let done = spawn(
         &host,
         "sh",
         &[
@@ -378,8 +230,9 @@ fn a_spawn_sees_only_the_environment_it_was_given() {
         ],
         "",
         &[("PLY_UNIT", "lexer")],
-    ));
-    assert_eq!(bytes(&done, "out").as_slice(), b"lexer-unset");
+    )
+    .expect("a spawn");
+    assert_eq!(done.out, b"lexer-unset");
 }
 
 #[test]
@@ -387,15 +240,16 @@ fn a_spawn_runs_in_the_directory_it_was_given() {
     let dir = tempfile::tempdir().expect("a temporary directory");
     std::fs::write(dir.path().join("marker"), b"here\n").unwrap();
     let host = spawning("sh", SH);
-    let done = value(spawn(
+    let done = spawn(
         &host,
         "sh",
         &["-c", "read line < marker; printf %s \"$line\""],
         &dir.path().to_string_lossy(),
         &[PATH],
-    ));
-    assert_eq!(ending(&done), ("std.process.Exited".to_string(), 0));
-    assert_eq!(bytes(&done, "out").as_slice(), b"here");
+    )
+    .expect("a spawn");
+    assert_eq!(done.ended, Ended::Exited(0));
+    assert_eq!(done.out, b"here");
 }
 
 /// The label is the capability: without one bound, nothing about the call decides what runs.
@@ -418,9 +272,6 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
         "the diagnostic should name the question a program can ask first: {:?}",
         refused.notes
     );
-    // And the same refusal is what the shared constructor produces for any label.
-    let direct = unbound(Op::Spawn, &Resource::Named(Symbol::new("cc")), Span::DUMMY);
-    assert_eq!(direct.code, codes::PROCESS_EXEC_UNBOUND);
 }
 
 /// The table the run was given is the whole answer, and asking again reads the same one.
@@ -428,19 +279,11 @@ fn a_spawn_of_an_unbound_label_names_the_flag_that_would_bind_it() {
 fn bound_answers_whether_the_run_bound_a_program_to_the_label() {
     let shell = spawning("sh", SH);
     for _ in 0..2 {
-        assert_eq!(
-            perform(&shell, Op::Bound, "sh", Vec::new()).expect("an answer"),
-            Value::Bool(true)
-        );
-        assert_eq!(
-            perform(&shell, Op::Bound, "cc", Vec::new()).expect("an answer"),
-            Value::Bool(false)
-        );
+        assert!(shell.bound("sh"));
+        assert!(!shell.bound("cc"));
     }
-    let bare = host(&[]);
-    assert_eq!(
-        perform(&bare, Op::Bound, "sh", Vec::new()).expect("an answer"),
-        Value::Bool(false),
+    assert!(
+        !host(&[]).bound("sh"),
         "a run given no `--exec` binds nothing"
     );
 }
@@ -453,23 +296,23 @@ fn an_exec_that_cannot_be_started_does_not_bind() {
     let mut executables = Executables::new();
 
     let missing = executables
-        .bind("cc", &dir.path().join("absent"), Span::DUMMY)
+        .bind("cc", &dir.path().join("absent"), S)
         .expect_err("a program that is not there");
     assert_eq!(missing.code, codes::PROCESS_EXEC_INVALID);
 
     let directory = executables
-        .bind("cc", dir.path(), Span::DUMMY)
+        .bind("cc", dir.path(), S)
         .expect_err("a directory is not a program");
     assert_eq!(directory.code, codes::PROCESS_EXEC_INVALID);
 
     let unreadable = executables
-        .bind("cc", &plain, Span::DUMMY)
+        .bind("cc", &plain, S)
         .expect_err("a file with no execute bit");
     assert_eq!(unreadable.code, codes::PROCESS_EXEC_INVALID);
     assert!(executables.is_empty());
 
     executables
-        .bind("sh", std::path::Path::new(SH), Span::DUMMY)
+        .bind("sh", std::path::Path::new(SH), S)
         .expect("a shell is a program");
     assert_eq!(
         executables
@@ -500,199 +343,82 @@ fn an_exec_argument_is_a_label_and_a_path() {
     }
 }
 
-#[test]
-fn a_spawn_with_an_environment_entry_that_is_not_one_is_a_dispatch_defect() {
-    let host = spawning("sh", SH);
-    let handlers = registrations(Some(&host));
-    let (declaration, handler) = handlers
-        .iter()
-        .find(|(d, _)| d.op.as_str() == "spawn")
-        .expect("spawn is registered");
-    let arguments = [
-        Value::list(vec![text("-c"), text("true")]),
-        text(""),
-        Value::list(vec![Value::Int(1)]),
-    ];
-    let answer = handler.call(
-        &*the_run(),
-        &HostRequest {
-            atom: EffectAtom::new(
-                Symbol::new(EFFECT),
-                Resource::Named(Symbol::new("sh")),
-                Mode::Write,
-            ),
-            op: declaration,
-            args: &arguments,
-            span: Span::DUMMY,
-            machine: MachineId(0),
-            task: None,
-            declared: None,
-        },
-    );
-    match answer {
-        Ok(_) => panic!("an Int is not an environment entry"),
-        Err(refused) => assert_eq!(refused.code, codes::INTERNAL_ERROR),
-    }
-}
-
 // --- Children ---------------------------------------------------------------
 
-fn answer(
-    host: &Arc<ProcessHost>,
-    op: Op,
-    label: &str,
-    args: &[Value],
-) -> Result<HostAnswer, Diagnostic> {
-    let handlers = registrations(Some(host));
-    let (declaration, handler) = handlers
-        .iter()
-        .find(|(d, _)| d.op.as_str() == op.name())
-        .expect("every operation is registered");
-    handler.call(
-        &*the_run(),
-        &HostRequest {
-            atom: EffectAtom::new(
-                Symbol::new(EFFECT),
-                Resource::Named(Symbol::new(label)),
-                Mode::Write,
-            ),
-            op: declaration,
-            args,
-            span: Span::DUMMY,
-            machine: MachineId(0),
-            task: None,
-            declared: None,
-        },
-    )
+fn wired(input: bool, out: Output, err: Output) -> Io {
+    Io { input, out, err }
 }
 
-/// One perform, answered as the declaration says it is: inline, or by waiting on the pool.
-fn perform(
-    host: &Arc<ProcessHost>,
-    op: Op,
-    label: &str,
-    args: Vec<Value>,
-) -> Result<Value, Diagnostic> {
-    let blocking = op.declaration().blocking;
-    match answer(host, op, label, &args)? {
-        HostAnswer::Pending(pending) => {
-            assert!(blocking, "{op:?} waited and is not declared to");
-            the_run().block_on(pending)
-        }
-        HostAnswer::Value(v) => {
-            assert!(!blocking, "{op:?} is declared to wait and did not");
-            Ok(v)
-        }
-    }
+fn file(path: &str) -> Output {
+    Output::File(path.to_string())
 }
 
-fn constructor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(format!("std.process.{name}"), args)
-}
-
-fn to(output: &str) -> Value {
-    constructor(output, Vec::new())
-}
-
-fn file(path: &str) -> Value {
-    constructor("File", vec![text(path)])
-}
-
-fn wired(input: bool, out: Value, err: Value) -> Value {
-    Value::Record(Arc::new(Fields::from_iter([
-        (Symbol::new("input"), Value::Bool(input)),
-        (Symbol::new("out"), out),
-        (Symbol::new("err"), err),
-    ])))
-}
-
-/// What `start` answered: the handle, or why the child could not start.
+/// What `start` answered under `label`: the handle, or why the child could not start.
 fn launched(
     host: &Arc<ProcessHost>,
     label: &str,
     script: &str,
     dir: &str,
-    io: Value,
-) -> Result<i64, String> {
-    let answer = perform(
-        host,
-        Op::Start,
+    io: Io,
+) -> Result<Result<i64, String>, Diagnostic> {
+    let env = [(PATH.0.to_string(), PATH.1.to_string())];
+    host.start(
         label,
-        vec![
-            Value::list(vec![text("-c"), text(script)]),
-            text(dir),
-            Value::list(vec![variable(PATH.0, PATH.1)]),
-            io,
-        ],
+        &["-c".to_string(), script.to_string()],
+        dir,
+        &env,
+        &io,
+        S,
     )
-    .expect("a start answers");
-    match &answer {
-        Value::Ctor { name, args } if name.as_str() == "Ok" => {
-            Ok(args[0].as_int(Span::DUMMY, "a handle").expect("an Int"))
-        }
-        Value::Ctor { name, args } if name.as_str() == "Err" => Err(args[0]
-            .as_str(Span::DUMMY, "a reason")
-            .expect("a String")
-            .to_string()),
-        other => panic!("not a `Result`: {other:?}"),
-    }
 }
 
 /// `sh -c script` under `[sh]`, running.
-fn start(host: &Arc<ProcessHost>, script: &str, dir: &str, io: Value) -> i64 {
-    launched(host, "sh", script, dir, io).unwrap_or_else(|why| panic!("not started: {why}"))
+fn start(host: &Arc<ProcessHost>, script: &str, dir: &str, io: Io) -> i64 {
+    launched(host, "sh", script, dir, io)
+        .expect("a start answers")
+        .unwrap_or_else(|why| panic!("not started: {why}"))
 }
 
-fn wait(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Result<Option<Value>, Diagnostic> {
-    perform(
-        host,
-        Op::Wait,
-        "sh",
-        vec![Value::Int(child), Value::Int(timeout_ms)],
-    )
-    .map(|answer| match &answer {
-        Value::Ctor { name, args } if name.as_str() == "Some" => Some(args[0].clone()),
-        Value::Ctor { name, .. } if name.as_str() == "None" => None,
-        other => panic!("not an `Option`: {other:?}"),
+fn wait_as(
+    host: &Arc<ProcessHost>,
+    label: &str,
+    child: i64,
+    timeout_ms: i64,
+) -> Result<Option<Finished>, Diagnostic> {
+    let found = ran(host.wait(label, child, timeout_ms, S)?)?;
+    Ok(match found.split_first() {
+        Some((1, flat)) => Some(finished(flat)),
+        _ => None,
     })
 }
 
-fn signal(host: &Arc<ProcessHost>, child: i64, which: &str) -> Result<Value, Diagnostic> {
-    perform(
-        host,
-        Op::Signal,
-        "sh",
-        vec![Value::Int(child), constructor(which, Vec::new())],
-    )
+fn wait(
+    host: &Arc<ProcessHost>,
+    child: i64,
+    timeout_ms: i64,
+) -> Result<Option<Finished>, Diagnostic> {
+    wait_as(host, "sh", child, timeout_ms)
 }
 
-fn input(host: &Arc<ProcessHost>, child: i64, bytes: &[u8]) -> Result<Value, Diagnostic> {
-    perform(
-        host,
-        Op::Input,
-        "sh",
-        vec![Value::Int(child), Value::bytes(bytes)],
-    )
+fn signal(host: &Arc<ProcessHost>, child: i64, which: Signal) -> Result<bool, Diagnostic> {
+    host.signal("sh", child, which, S)
+}
+
+fn input(host: &Arc<ProcessHost>, child: i64, bytes: &[u8]) -> Result<bool, Diagnostic> {
+    let job = host.input("sh", child, bytes.to_vec(), S)?;
+    Ok(job().expect("a write answers") == [1])
 }
 
 fn heard(host: &Arc<ProcessHost>, child: i64, timeout_ms: i64) -> Heard {
-    let answer = perform(
-        host,
-        Op::OutputLine,
-        "sh",
-        vec![Value::Int(child), Value::Int(timeout_ms)],
-    )
+    let flat = ran(host
+        .output_line("sh", child, timeout_ms, S)
+        .expect("a usable child"))
     .expect("a line, a silence or an end");
-    match &answer {
-        Value::Ctor { name, args } if name.as_str() == "std.process.Said" => Heard::Said(
-            args[0]
-                .as_str(Span::DUMMY, "a line")
-                .expect("a String")
-                .to_string(),
-        ),
-        Value::Ctor { name, .. } if name.as_str() == "std.process.Quiet" => Heard::Quiet,
-        Value::Ctor { name, .. } if name.as_str() == "std.process.Closed" => Heard::Closed,
-        other => panic!("not a `Heard`: {other:?}"),
+    match flat.split_first() {
+        Some((0, line)) => Heard::Said(String::from_utf8(line.to_vec()).expect("text")),
+        Some((1, _)) => Heard::Quiet,
+        Some((2, _)) => Heard::Closed,
+        _ => panic!("not a `Heard`: {flat:?}"),
     }
 }
 
@@ -711,7 +437,7 @@ fn sleeper(host: &Arc<ProcessHost>) -> (i64, String) {
         host,
         "echo $$; exec sleep 600",
         "",
-        wired(false, to("Lines"), to("Discard")),
+        wired(false, Output::Lines, Output::Discard),
     );
     match heard(host, child, 10_000) {
         Heard::Said(pid) => {
@@ -729,7 +455,7 @@ fn a_started_child_runs_beside_the_program_until_a_wait_hands_it_back() {
         &host,
         "sleep 1; printf done; exit 4",
         "",
-        wired(false, to("Keep"), to("Keep")),
+        wired(false, Output::Keep, Output::Keep),
     );
     assert_eq!(
         wait(&host, child, 0).expect("a wait"),
@@ -744,9 +470,9 @@ fn a_started_child_runs_beside_the_program_until_a_wait_hands_it_back() {
     let done = wait(&host, child, -1)
         .expect("a wait")
         .expect("a negative timeout waits for the end");
-    assert_eq!(ending(&done), ("std.process.Exited".to_string(), 4));
-    assert_eq!(bytes(&done, "out").as_slice(), b"done");
-    assert!(bytes(&done, "err").is_empty());
+    assert_eq!(done.ended, Ended::Exited(4));
+    assert_eq!(done.out, b"done");
+    assert!(done.err.is_empty());
 }
 
 #[test]
@@ -756,16 +482,13 @@ fn a_terminated_child_ends_by_the_signal() {
         &host,
         "exec sleep 60",
         "",
-        wired(false, to("Discard"), to("Discard")),
+        wired(false, Output::Discard, Output::Discard),
     );
-    assert_eq!(
-        signal(&host, child, "Terminate").expect("a live child"),
-        Value::Bool(true)
-    );
+    assert!(signal(&host, child, Signal::Terminate).expect("a live child"));
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("a terminated child ends");
-    assert_eq!(ending(&done), ("std.process.Signalled".to_string(), 15));
+    assert_eq!(done.ended, Ended::Signalled(15));
 }
 
 #[test]
@@ -775,11 +498,11 @@ fn a_signal_to_a_child_that_has_ended_answers_false() {
         &host,
         "exit 0",
         "",
-        wired(false, to("Discard"), to("Discard")),
+        wired(false, Output::Discard, Output::Discard),
     );
     // A signal that lands before the child is gone still reaches it; the answer turns once it is.
     let until = Instant::now() + Duration::from_secs(10);
-    while signal(&host, child, "Hangup").expect("an unspent handle") != Value::Bool(false) {
+    while signal(&host, child, Signal::Hangup).expect("an unspent handle") {
         assert!(Instant::now() < until, "the child never ended");
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -789,44 +512,41 @@ fn a_signal_to_a_child_that_has_ended_answers_false() {
 #[test]
 fn a_child_fed_over_its_input_answers_what_it_read() {
     let host = spawning("sh", SH);
-    let child = start(&host, "exec cat", "", wired(true, to("Keep"), to("Keep")));
-    assert_eq!(
-        input(&host, child, b"hello\n").expect("a write"),
-        Value::Bool(true)
+    let child = start(
+        &host,
+        "exec cat",
+        "",
+        wired(true, Output::Keep, Output::Keep),
     );
-    assert_eq!(
-        input(&host, child, b"world\n").expect("a write"),
-        Value::Bool(true)
-    );
-    assert_eq!(
-        perform(&host, Op::EndInput, "sh", vec![Value::Int(child)]).expect("an end"),
-        Value::Unit
-    );
-    assert_eq!(
-        input(&host, child, b"late\n").expect("a write"),
-        Value::Bool(false),
+    assert!(input(&host, child, b"hello\n").expect("a write"));
+    assert!(input(&host, child, b"world\n").expect("a write"));
+    host.end_input("sh", child, S).expect("an end");
+    assert!(
+        !input(&host, child, b"late\n").expect("a write"),
         "an input once ended takes nothing"
     );
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("`cat` ends at the end of its input");
-    assert_eq!(ending(&done), ("std.process.Exited".to_string(), 0));
-    assert_eq!(bytes(&done, "out").as_slice(), b"hello\nworld\n");
+    assert_eq!(done.ended, Ended::Exited(0));
+    assert_eq!(done.out, b"hello\nworld\n");
 }
 
 #[test]
 fn a_child_started_without_input_reads_nothing_and_takes_nothing() {
     let host = spawning("sh", SH);
-    let child = start(&host, "exec cat", "", wired(false, to("Keep"), to("Keep")));
-    assert_eq!(
-        input(&host, child, b"unread").expect("a write"),
-        Value::Bool(false)
+    let child = start(
+        &host,
+        "exec cat",
+        "",
+        wired(false, Output::Keep, Output::Keep),
     );
+    assert!(!input(&host, child, b"unread").expect("a write"));
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("`cat` of an empty input ends");
-    assert_eq!(ending(&done), ("std.process.Exited".to_string(), 0));
-    assert!(bytes(&done, "out").is_empty());
+    assert_eq!(done.ended, Ended::Exited(0));
+    assert!(done.out.is_empty());
 }
 
 #[test]
@@ -836,7 +556,7 @@ fn lines_arrive_one_at_a_time_and_the_unread_ones_come_back_at_the_wait() {
         &host,
         "printf 'one\\ntwo\\r\\nthree\\nfour'",
         "",
-        wired(false, to("Lines"), to("Keep")),
+        wired(false, Output::Lines, Output::Keep),
     );
     assert_eq!(heard(&host, child, 10_000), Heard::Said("one".to_string()));
     assert_eq!(
@@ -848,8 +568,7 @@ fn lines_arrive_one_at_a_time_and_the_unread_ones_come_back_at_the_wait() {
         .expect("a wait")
         .expect("it ended");
     assert_eq!(
-        bytes(&done, "out").as_slice(),
-        b"three\nfour",
+        done.out, b"three\nfour",
         "the lines no one read, as the child wrote them"
     );
 }
@@ -861,7 +580,7 @@ fn a_quiet_child_is_quiet_until_it_speaks_and_closed_once_it_is_done() {
         &host,
         "sleep 1; echo late",
         "",
-        wired(false, to("Lines"), to("Discard")),
+        wired(false, Output::Lines, Output::Discard),
     );
     assert_eq!(heard(&host, child, 50), Heard::Quiet);
     assert_eq!(heard(&host, child, -1), Heard::Said("late".to_string()));
@@ -874,7 +593,7 @@ fn a_quiet_child_is_quiet_until_it_speaks_and_closed_once_it_is_done() {
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("it ended");
-    assert!(bytes(&done, "out").is_empty(), "every line was read");
+    assert!(done.out.is_empty(), "every line was read");
 }
 
 #[test]
@@ -884,7 +603,7 @@ fn both_streams_as_lines_arrive_in_one_order_and_go_back_to_their_own_stream() {
         &host,
         "echo first; sleep 0.3; echo second 1>&2",
         "",
-        wired(false, to("Lines"), to("Lines")),
+        wired(false, Output::Lines, Output::Lines),
     );
     assert_eq!(heard(&host, read, 10_000), Heard::Said("first".to_string()));
     assert_eq!(
@@ -897,13 +616,13 @@ fn both_streams_as_lines_arrive_in_one_order_and_go_back_to_their_own_stream() {
         &host,
         "echo first; echo second 1>&2",
         "",
-        wired(false, to("Lines"), to("Lines")),
+        wired(false, Output::Lines, Output::Lines),
     );
     let done = wait(&host, unread, 10_000)
         .expect("a wait")
         .expect("it ended");
-    assert_eq!(bytes(&done, "out").as_slice(), b"first\n");
-    assert_eq!(bytes(&done, "err").as_slice(), b"second\n");
+    assert_eq!(done.out, b"first\n");
+    assert_eq!(done.err, b"second\n");
 }
 
 #[test]
@@ -913,7 +632,7 @@ fn a_child_with_no_lines_to_read_is_closed_at_once() {
         &host,
         "exec sleep 60",
         "",
-        wired(false, to("Discard"), to("Keep")),
+        wired(false, Output::Discard, Output::Keep),
     );
     assert_eq!(heard(&host, child, -1), Heard::Closed);
 }
@@ -936,7 +655,7 @@ fn a_file_output_lands_in_the_childs_directory_and_starts_empty() {
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("it ended");
-    assert!(bytes(&done, "out").is_empty() && bytes(&done, "err").is_empty());
+    assert!(done.out.is_empty() && done.err.is_empty());
     assert_eq!(
         std::fs::read_to_string(dir.path().join("log.txt")).unwrap(),
         "to-out\nto-err\n",
@@ -952,7 +671,7 @@ fn kept_output_past_the_bound_is_drained_and_refused_at_the_wait() {
         &host,
         &format!("head -c {over} /dev/zero"),
         "",
-        wired(false, to("Keep"), to("Discard")),
+        wired(false, Output::Keep, Output::Discard),
     );
     // The child finishes rather than blocking on a full pipe, and the refusal comes at the wait.
     let refused = wait(&host, child, 60_000).expect_err("more than a kept stream holds");
@@ -973,13 +692,13 @@ fn a_spent_handle_and_one_never_answered_are_refusals_rather_than_children() {
         &host,
         "exit 0",
         "",
-        wired(false, to("Discard"), to("Discard")),
+        wired(false, Output::Discard, Output::Discard),
     );
     assert!(wait(&host, child, -1).expect("a wait").is_some());
     for refused in [
-        wait(&host, child, 0).map(|_| Value::Unit),
-        signal(&host, child, "Kill"),
-        input(&host, child, b"x"),
+        wait(&host, child, 0).map(|_| ()),
+        signal(&host, child, Signal::Kill).map(|_| ()),
+        input(&host, child, b"x").map(|_| ()),
     ] {
         let refused = refused.expect_err("a spent handle names nothing");
         assert_eq!(refused.code, codes::RUNTIME_ERROR);
@@ -1003,7 +722,7 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
     let mut executables = Executables::new();
     for label in ["sh", "shell"] {
         executables
-            .bind(label, std::path::Path::new(SH), Span::DUMMY)
+            .bind(label, std::path::Path::new(SH), S)
             .expect("a shell is a program");
     }
     let host =
@@ -1012,15 +731,9 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
         &host,
         "exec sleep 60",
         "",
-        wired(false, to("Discard"), to("Discard")),
+        wired(false, Output::Discard, Output::Discard),
     );
-    let refused = perform(
-        &host,
-        Op::Wait,
-        "shell",
-        vec![Value::Int(child), Value::Int(0)],
-    )
-    .expect_err("this child is `[sh]`");
+    let refused = wait_as(&host, "shell", child, 0).expect_err("this child is `[sh]`");
     assert_eq!(refused.code, codes::RUNTIME_ERROR);
     assert!(
         refused.message.contains("[sh]") && refused.message.contains("[shell]"),
@@ -1032,16 +745,12 @@ fn a_child_is_used_under_the_label_it_was_started_as() {
 #[test]
 fn a_start_of_an_unbound_label_names_the_flag_that_would_bind_it() {
     let host = spawning("sh", SH);
-    let refused = perform(
+    let refused = launched(
         &host,
-        Op::Start,
         "cc",
-        vec![
-            Value::list(Vec::new()),
-            text(""),
-            Value::list(Vec::new()),
-            wired(false, to("Keep"), to("Keep")),
-        ],
+        "true",
+        "",
+        wired(false, Output::Keep, Output::Keep),
     )
     .expect_err("`cc` is bound to nothing");
     assert_eq!(refused.code, codes::PROCESS_EXEC_UNBOUND);
@@ -1065,8 +774,9 @@ fn a_child_that_cannot_start_is_an_answer_rather_than_a_diagnostic() {
         "sh",
         "true",
         "/a/directory/that/is/not/there",
-        wired(false, to("Keep"), to("Keep")),
+        wired(false, Output::Keep, Output::Keep),
     )
+    .expect("a start answers")
     .expect_err("there is no such directory to start in");
     assert!(nowhere.contains("could not be started"), "{nowhere}");
     let unopened = launched(
@@ -1077,9 +787,10 @@ fn a_child_that_cannot_start_is_an_answer_rather_than_a_diagnostic() {
         wired(
             false,
             file("/a/directory/that/is/not/there/log"),
-            to("Keep"),
+            Output::Keep,
         ),
     )
+    .expect("a start answers")
     .expect_err("there is no such directory to write in");
     assert!(unopened.contains("could not be opened"), "{unopened}");
 }
@@ -1091,15 +802,12 @@ fn an_inheriting_child_writes_where_the_program_does() {
         &host,
         "echo from-child; echo complaint 1>&2",
         "",
-        wired(false, to("Inherit"), to("Inherit")),
+        wired(false, Output::Inherit, Output::Inherit),
     );
     let done = wait(&host, child, 10_000)
         .expect("a wait")
         .expect("it ended");
-    assert!(
-        bytes(&done, "out").is_empty(),
-        "an inherited stream is not kept"
-    );
+    assert!(done.out.is_empty(), "an inherited stream is not kept");
     let mut lines = host.captured();
     lines.sort_by_key(|(stream, _)| matches!(stream, Stream::Err));
     assert_eq!(
@@ -1137,7 +845,7 @@ fn dropping_the_host_kills_and_reaps_the_children_it_holds() {
 fn the_runs_teardown_ends_the_children_it_leaves() {
     let mut executables = Executables::new();
     executables
-        .bind("sh", std::path::Path::new(SH), Span::DUMMY)
+        .bind("sh", std::path::Path::new(SH), S)
         .expect("a shell is a program");
     let facilities = ply_host::Host::new()
         .with_process(ProcessHost::new(Vec::new(), OutputSink::captured()).executing(executables));
@@ -1147,37 +855,40 @@ fn the_runs_teardown_ends_the_children_it_leaves() {
     assert!(!alive(&pid), "the child {pid} outlived the run's teardown");
 }
 
-/// A park over operations of two pools, a child's wait and a socket's accept, waits for whichever
+/// A park over jobs of two pools, a child's wait and a socket's accept, waits for whichever
 /// finishes, rather than returning with nothing done and leaving the scheduler to count it as a
 /// fruitless park.
 #[test]
 fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
     let host = spawning("sh", SH);
     let net = ply_host::tcp::TcpHost::new();
-    let listener = net.listen("listener", 0, Span::DUMMY).expect("a listen");
+    let listener = net.listen("listener", 0, S).expect("a listen");
     let runtime = the_run();
+    let run = ply_host::registry::run_of(&*runtime).expect("a host made the run");
     let accepting = ply_host::jobs::submit(
         ply_host::jobs::Work::Waiting,
-        ply_host::registry::run_of(&*runtime).expect("a host made the run"),
-        Span::DUMMY,
+        run,
+        S,
         "test",
         "`net.accept`",
-        net.accept("listener", listener, Span::DUMMY)
-            .expect("an accept"),
+        net.accept("listener", listener, S).expect("an accept"),
     )
     .expect("a thread is had");
     let child = start(
         &host,
         "sleep 0.5",
         "",
-        wired(false, to("Discard"), to("Discard")),
+        wired(false, Output::Discard, Output::Discard),
     );
-    let waiting = match answer(&host, Op::Wait, "sh", &[Value::Int(child), Value::Int(-1)])
-        .expect("a wait")
-    {
-        HostAnswer::Pending(pending) => pending,
-        HostAnswer::Value(_) => panic!("a wait waits in the pool"),
-    };
+    let waiting = ply_host::jobs::refusing(
+        ply_host::jobs::Work::Waiting,
+        run,
+        S,
+        "test",
+        "`process.wait`",
+        host.wait("sh", child, -1, S).expect("a wait"),
+    )
+    .expect("a thread is had");
 
     let run = ply_host::registry::run_of(&*runtime).expect("a host made the runtime");
     run.watch(&waiting).expect("the wait is this run's");
@@ -1189,14 +900,12 @@ fn a_park_over_a_child_and_a_socket_waits_for_whichever_finishes() {
         parked.elapsed()
     );
     assert!(
-        run.answered().contains(&waiting.token) && run.poll(&waiting).is_ok(),
+        run.answered().contains(&waiting.token) && run.taken(&waiting).is_ok(),
         "the child's end is what woke the park"
     );
 
     let peer = std::net::TcpStream::connect(net.local_addr(listener).expect("a bound port"))
         .expect("a peer connects");
-    runtime
-        .block_on(accepting)
-        .expect("the accept takes the peer");
+    ply_host::registry::job_bytes(&*runtime, &accepting).expect("the accept takes the peer");
     drop(peer);
 }

@@ -6,18 +6,15 @@
 use crate::emitted::{Block, Handed, PlyFnDesc, PlyType};
 use crate::frames::{self, PlyFrame, Snapshot};
 use crate::heap::{HEADER, Word};
-use crate::rt::{
-    Ctx, FAILED_ABORT, FAILED_UNWIND, FrameClause, HandlerFrame, Kept, StackCopy, call_clause,
-    call_fun, drop_frame, no_stack_to_take, release_fun, release_vars, switch_keeping,
-};
+use crate::rt::{Ctx, Kept, call_clause, call_fun, no_stack_to_take, release_fun, switch_keeping};
 use crate::stack::{Stack, switch};
-use ply_core::{Diagnostic, Symbol, codes};
+use ply_core::{Diagnostic, codes};
 
 pub struct Detached {
     stack: Option<Stack>,
-    /// The body's own frames, the handle's at the bottom; its parent is where `k` was last called.
-    frames: usize,
-    /// The body's saved stack pointer, and the frames current when it stopped.
+    /// The body's own stack, by its index in [`Ctx::stacks`].
+    own_stack: usize,
+    /// The body's saved stack pointer, and the stack running when it stopped.
     sp: usize,
     saved_current: usize,
     /// The chain of frame records on the stack the body last stopped from, as it stopped.
@@ -29,41 +26,39 @@ pub struct Detached {
     answer: Word,
     /// Owned here, not by the entry frame, which every restored snapshot would release again.
     body: Word,
-    ret: Word,
-    /// The block whose objects the body, clauses and `return` clause hold for what their rows take
-    /// around the `handle`, kept as the closures are.
+    /// The block whose objects the body and clauses hold for what their rows take around the
+    /// `handle`, kept as the body is.
     forwards: Option<Word>,
     starting: Option<Word>,
     state: State,
     captures: Vec<Capture>,
     live: Option<usize>,
-    /// The counted block of the `handle`'s instance where its objects enter its clauses, which hold
-    /// no frame: what the body holds of it once more, and where its variables are.
+    /// The counted block of the `handle`'s instance: what the body holds of it once more, and where
+    /// its variables are.
     instance: Option<Word>,
 }
 
 /// A heap instance's block as emitted code lays it out, past its header, in words: how many its
 /// head holds before the instance, where in the head the body it is the `handle` of is (which
 /// [`open_over`] writes), and where the place of its first variable is, their count after it.
-pub(crate) const INSTANCE_HEAD: usize = 7;
-pub(crate) const INSTANCE_DETACHED: usize = 4;
-pub(crate) const INSTANCE_VARS: usize = 5;
+pub const INSTANCE_HEAD: usize = 7;
+pub const INSTANCE_DETACHED: usize = 4;
+pub const INSTANCE_VARS: usize = 5;
 
 /// A clause's record in an instance: its closure, the instance, its place, and the descriptor of
 /// `String` where it is handed one.
-pub(crate) const RECORD_CLOSURE: usize = 0;
-pub(crate) const RECORD_INSTANCE: usize = 1;
-pub(crate) const RECORD_STRING: usize = 3;
+pub const RECORD_CLOSURE: usize = 0;
+pub const RECORD_INSTANCE: usize = 1;
+pub const RECORD_STRING: usize = 3;
 
-/// A detached `handle`'s forwarding block, as emitted code lays it out past its header, in words:
-/// the handler (which [`open`] writes), the unit's word mapping, the static descriptor of the words
-/// it forwards, how many those are (`m`), how many words the block holds, then the `m` words each
-/// forwards to, the `m` tasks that handed them, the labels the descriptor leaves to them, and the
-/// evidence objects. An object that forwards has its slot's environment point at a record: the
-/// address of the word it forwards to, the operation's place and the address of that word's task,
-/// which the call it forwards runs as. Every call of a continuation sets those `m` words to what its
-/// caller hands for the same, their tasks to the caller's.
-const FORWARDS_HANDLER: usize = 0;
+/// A detached `handle`'s forwarding block, as emitted code lays it out past its header, in words: a
+/// spare word, the unit's word mapping, the static descriptor of the words it forwards, how many
+/// those are (`m`), how many words the block holds, then the `m` words each forwards to, the `m`
+/// tasks that handed them, the labels the descriptor leaves to them, and the evidence objects. An
+/// object that forwards has its slot's environment point at a record: the address of the word it
+/// forwards to, the operation's place and the address of that word's task, which the call it
+/// forwards runs as. Every call of a continuation sets those `m` words to what its caller hands for
+/// the same, their tasks to the caller's.
 const FORWARDS_MAPPED: usize = 1;
 const FORWARDS_OWN: usize = 2;
 const FORWARDS_COUNT: usize = 3;
@@ -85,7 +80,7 @@ fn forwards_bytes(block: Word) -> Word {
 }
 
 /// Points body `id`'s forwarding words at the words the call resuming it handed for the same, as
-/// `ctx`'s `entering_*` name them, the frame bridge where it handed none, each as the caller's task;
+/// `ctx`'s `entering_*` name them, the bridge where it handed none, each as the caller's task;
 /// a word that is one of the block's own objects, which the body's own clause hands back, leaves its
 /// word and task as they were.
 fn retargeted(ctx: *mut Ctx, id: usize) {
@@ -138,10 +133,10 @@ fn tasks_handed(block: Word, task: i64) {
 
 /// What a stop leaves behind.
 struct Capture {
-    /// What a restore puts back: the stack's bytes with their records' slots held, and its frames,
-    /// what its runtime frames kept and the variables its running clauses hold. `None` for a stop
-    /// resumed at most once, and for one from a stack other than the body's own.
-    kept: Option<(Snapshot, StackCopy)>,
+    /// What a restore puts back: the stack's bytes with their records' slots held, and what its
+    /// runtime frames kept. `None` for a stop resumed at most once, and for one from a stack other
+    /// than the body's own.
+    kept: Option<(Snapshot, Vec<Kept>)>,
     /// The values of an instance's variables as the body stood at this stop, each held once more
     /// beside its type's descriptor: what a resumption from outside a clause of the `handle`
     /// continues with.
@@ -172,73 +167,10 @@ enum Stopped {
 
 const ONE_SHOT: &str = "the `handle` this continuation was captured in has already ended";
 
-/// `rt_handle_install_detached` and `rt_handle_forwarded`: runs the body on a fresh stack until it
-/// stops; answers the handle's value. Takes `forwards`, the body's forwarding block where it has one,
-/// whose handler word this sets.
-pub(crate) unsafe fn open(
-    ctx: *mut Ctx,
-    clauses: Vec<FrameClause>,
-    ret: Word,
-    body: Word,
-    forwards: Option<Word>,
-) -> Word {
-    drain(ctx);
-    let c = unsafe { &mut *ctx };
-    let Some(stack) = Stack::take() else {
-        clauses.into_iter().for_each(FrameClause::release);
-        if ret != 0 {
-            release_fun(ret);
-        }
-        release_fun(body);
-        if let Some(block) = forwards {
-            unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
-        }
-        return no_stack_to_take(c);
-    };
-    let id = c.detached.len();
-    let opener = c.current;
-    let fuel = c.fuel;
-    let frames = c.open_stack(Some(opener));
-    c.stacks[frames].body = Some(id);
-    let handler = c.next_handler();
-    if let Some(block) = forwards {
-        unsafe {
-            forwards_words(block)
-                .add(FORWARDS_HANDLER)
-                .write(handler as Word)
-        };
-        tasks_handed(block, c.task);
-    }
-    c.stacks[frames]
-        .list
-        .push(HandlerFrame::detached(clauses, id, fuel, handler));
-    let sp = stack.prepare(entry, ctx as usize);
-    c.detached.push(Detached {
-        stack: Some(stack),
-        frames,
-        sp,
-        saved_current: frames,
-        head: std::ptr::null_mut(),
-        resumer_sp: 0,
-        resumer_current: 0,
-        request: None,
-        answer: 0,
-        body,
-        ret,
-        forwards,
-        starting: Some(body),
-        state: State::Fresh,
-        captures: Vec::new(),
-        live: None,
-        instance: None,
-    });
-    unsafe { resume(ctx, id, None, None) }
-}
-
-/// `rt_detached_open`: runs the body of a `handle` whose objects enter its clauses on a fresh stack
-/// until it stops or ends; answers the `handle`'s value, its landing the body's own. Takes `body`
-/// and `forwards`, the body's forwarding block where it has one; holds `instance`, the counted
-/// block of the `handle`'s instance, once more, writing the body's place into its head.
+/// `rt_detached_open`: runs the body of a `handle` on a fresh stack until it stops or ends; answers
+/// the `handle`'s value, its landing the body's own. Takes `body` and `forwards`, the body's
+/// forwarding block where it has one; holds `instance`, the counted block of the `handle`'s
+/// instance, once more, writing the body's place into its head.
 pub(crate) unsafe fn open_over(
     ctx: *mut Ctx,
     body: Word,
@@ -255,8 +187,7 @@ pub(crate) unsafe fn open_over(
         return no_stack_to_take(c);
     };
     let id = c.detached.len();
-    let frames = c.open_stack(Some(c.current));
-    c.stacks[frames].body = Some(id);
+    let own_stack = c.open_stack();
     Block::of(instance).dup();
     unsafe {
         instance_head(instance)
@@ -269,16 +200,15 @@ pub(crate) unsafe fn open_over(
     let sp = stack.prepare(entry, ctx as usize);
     c.detached.push(Detached {
         stack: Some(stack),
-        frames,
+        own_stack,
         sp,
-        saved_current: frames,
+        saved_current: own_stack,
         head: std::ptr::null_mut(),
         resumer_sp: 0,
         resumer_current: 0,
         request: None,
         answer: 0,
         body,
-        ret: 0,
         forwards,
         starting: Some(body),
         state: State::Fresh,
@@ -460,9 +390,9 @@ pub(crate) unsafe fn resume(
         }
     }
     let c = unsafe { &mut *ctx };
-    // Over an instance, a resumption from a clause of the `handle` continues with that clause's
-    // variables, which it gets back as they were once the body stops again; one from anywhere else
-    // continues with those the body had at its stop.
+    // A resumption from a clause of the `handle` continues with that clause's variables, which it
+    // gets back as they were once the body stops again; one from anywhere else continues with those
+    // the body had at its stop.
     let instance = c.detached[id].instance;
     let mut clause_vars = None;
     if let (Some(block), Some(k)) = (instance, capture) {
@@ -474,27 +404,13 @@ pub(crate) unsafe fn resume(
         }
     }
     let c = unsafe { &mut *ctx };
-    if capture.is_some() && instance.is_none() {
-        let frames = c.detached[id].frames;
-        let values = c.stacks[frames]
-            .list
-            .first()
-            .and_then(|f| c.held_by(f.handler));
-        if let Some(v) = values {
-            if let Some(f) = c.stacks[frames].list.first_mut() {
-                f.set_vars(&v.borrow());
-            }
-            release_vars(v);
-        }
-    }
     let d = &mut c.detached[id];
     if let Some(a) = answer {
         d.answer = a;
     }
     d.resumer_current = c.current;
     d.state = State::Running;
-    let (frames, current, sp) = (d.frames, d.saved_current, d.sp);
-    c.stacks[frames].parent = Some(c.current);
+    let (current, sp) = (d.saved_current, d.sp);
     c.current = current;
     if d.state == State::Running && d.starting.is_some() {
         c.starting_detached = Some(id);
@@ -519,12 +435,8 @@ pub(crate) unsafe fn resume(
             }
             let c = unsafe { &mut *ctx };
             args.push(token(c, id, k));
-            // The clause works on its own copy of the variables, so each resumption it makes starts
-            // from what the clause holds, whatever an earlier one did to the body's.
-            let frames = c.detached[id].frames;
-            let held = c.stacks[frames].list.first().and_then(|f| f.vars_copied());
             let here = c.keep(Kept::Clause(id));
-            let r = call_clause(ctx, closure, args, held);
+            let r = call_clause(ctx, closure, args);
             let c = unsafe { &mut *ctx };
             c.kept_back(here);
             settle(c, id);
@@ -572,11 +484,9 @@ fn settle(c: &mut Ctx, id: usize) {
 /// clauses are, so a stack a snapshot is restored onto runs again the clauses running when it was
 /// taken, and a stack let go of runs none.
 fn clause_running(c: &Ctx, id: usize) -> bool {
-    c.stacks.iter().any(|s| {
-        s.kept
-            .iter()
-            .any(|k| matches!(k, Kept::Clause(i) if *i == id))
-    })
+    c.stacks
+        .iter()
+        .any(|s| s.iter().any(|k| matches!(k, Kept::Clause(i) if *i == id)))
 }
 
 fn finish(c: &mut Ctx, id: usize) {
@@ -593,10 +503,9 @@ fn give_back(c: &mut Ctx, id: usize) {
         return;
     }
     d.stack = None;
-    for f in [std::mem::take(&mut d.body), std::mem::take(&mut d.ret)] {
-        if f != 0 {
-            release_fun(f);
-        }
+    let body = std::mem::take(&mut d.body);
+    if body != 0 {
+        release_fun(body);
     }
     if let Some(block) = c.detached[id].forwards.take() {
         unsafe { Block::of(block).free(&raw mut c.heap, forwards_bytes(block)) };
@@ -609,15 +518,18 @@ fn give_back(c: &mut Ctx, id: usize) {
 fn capture_stop(ctx: *mut Ctx, id: usize, again: bool) -> usize {
     let c = unsafe { &mut *ctx };
     let d = &c.detached[id];
-    let (sp, own, head) = (d.sp, d.frames, d.head);
+    let (sp, own, head) = (d.sp, d.own_stack, d.head);
     // A stop from a task's stack or a nested body's has none to copy: the frames waiting there are
     // not the ones a restore would write back.
     let kept = match d.stack.as_ref() {
         Some(stack) if again && d.saved_current == own => {
             let stack: *const Stack = stack;
             unsafe { Snapshot::take(ctx, &*stack, sp, head) }.map(|snapshot| {
-                let s = &unsafe { &*ctx }.stacks[own];
-                (snapshot, StackCopy::of(&s.list, &s.kept, &s.held))
+                let kept = unsafe { &*ctx }.stacks[own]
+                    .iter()
+                    .map(Kept::copied)
+                    .collect();
+                (snapshot, kept)
             })
         }
         _ => None,
@@ -664,16 +576,10 @@ fn restore(ctx: *mut Ctx, id: usize, k: usize) -> bool {
         .as_ref()
         .expect("a body with a snapshot keeps its stack");
     unsafe { snapshot.restore(ctx, &*stack) };
-    let copy = StackCopy::of(&captured.list, &captured.kept, &captured.held);
-    let (own, sp, head) = (d.frames, snapshot.sp(), snapshot.head());
+    let copy = captured.iter().map(Kept::copied).collect();
+    let (own, sp, head) = (d.own_stack, snapshot.sp(), snapshot.head());
     let c = unsafe { &mut *ctx };
-    let s = &mut c.stacks[own];
-    StackCopy {
-        list: std::mem::replace(&mut s.list, copy.list),
-        kept: std::mem::replace(&mut s.kept, copy.kept),
-        held: std::mem::replace(&mut s.held, copy.held),
-    }
-    .release();
+    let_go_of_kept(std::mem::replace(&mut c.stacks[own], copy));
     let d = &mut c.detached[id];
     d.sp = sp;
     d.saved_current = own;
@@ -683,22 +589,9 @@ fn restore(ctx: *mut Ctx, id: usize, k: usize) -> bool {
     true
 }
 
-/// The body's `perform`: hands the clause to whoever resumed the body, returns what `k` got. The
-/// clause may resume it `again`. Nothing uncounted may be owned across the switch (each restore
-/// would free it again), so `owned` is dropped first.
-pub(crate) unsafe fn stop(
-    ctx: *mut Ctx,
-    id: usize,
-    closure: Word,
-    args: Vec<Word>,
-    again: bool,
-    owned: (Symbol, Symbol, Option<Symbol>),
-) -> Word {
-    drop(owned);
-    unsafe { stopped(ctx, id, closure, args, again) }
-}
-
-/// [`stop`] with nothing uncounted owned across the switch.
+/// The body's perform: hands the clause to whoever resumed the body, which may resume it `again`,
+/// and answers what `k` got. Nothing uncounted may be owned across the switch, since each restore
+/// would free it again.
 unsafe fn stopped(ctx: *mut Ctx, id: usize, closure: Word, args: Vec<Word>, again: bool) -> Word {
     let c = unsafe { &mut *ctx };
     let head = c.frames;
@@ -734,50 +627,9 @@ extern "C" fn entry(arg: usize) {
         c.frames = frames::base();
         (id, body)
     };
-    let mut r = call_fun(ctx, body, &[]);
+    // The body ends in its `handle`'s landing, which answers what unwinds to it.
+    let r = call_fun(ctx, body, &[]);
     let c = unsafe { &mut *ctx };
-    let frames = c.detached[id].frames;
-    let mut frame = c.stacks[frames].list.pop();
-    if let Some(f) = &frame {
-        f.land(c);
-    }
-    let mut held = frame.as_ref().and_then(HandlerFrame::held);
-    // A zero-shot clause of this frame unwinds to it, and a raise its clause answers lands here;
-    // `return` is applied to neither. What the body left open goes back in `finish`.
-    let mut answered = false;
-    if c.failed == FAILED_UNWIND
-        && let Some((stack, depth, v)) = c.unwind.take()
-    {
-        if stack == frames && depth == 0 {
-            c.failed = 0;
-            r = v;
-            answered = true;
-        } else {
-            c.unwind = Some((stack, depth, v));
-        }
-    }
-    if c.failed == FAILED_ABORT
-        && let Some(a) = c.aborting.take_if(|a| a.stack == frames && a.depth == 0)
-        && let Some(f) = frame.as_mut()
-    {
-        c.failed = 0;
-        let clause = f.take_clause(a.clause);
-        r = call_clause(ctx, clause.closure, a.args.handed(), held.take());
-        clause.release();
-        answered = true;
-    }
-    let c = unsafe { &mut *ctx };
-    let ret = c.detached[id].ret;
-    if c.failed == 0 && ret != 0 && !answered {
-        r = Ctx::holding(ctx, held.take(), || call_fun(ctx, ret, &[r]));
-    }
-    if let Some((_, v)) = held {
-        release_vars(v);
-    }
-    let c = unsafe { &mut *ctx };
-    if let Some(f) = frame {
-        drop_frame(f);
-    }
     let d = &mut c.detached[id];
     d.request = Some(if c.failed != 0 {
         Stopped::Failed
@@ -890,9 +742,9 @@ fn drop_stop(ctx: *mut Ctx, id: usize, k: usize) {
     let vars = std::mem::take(&mut d.captures[k].vars);
     vars_let_go(ctx, vars);
     let waiting = d.state == State::Suspended && d.live == Some(k);
-    if let Some((snapshot, stack)) = kept {
+    if let Some((snapshot, stack_kept)) = kept {
         unsafe { snapshot.release(ctx) };
-        stack.release();
+        let_go_of_kept(stack_kept);
     }
     if waiting {
         abandon(ctx, id);
@@ -904,7 +756,7 @@ fn drop_stop(ctx: *mut Ctx, id: usize, k: usize) {
 }
 
 /// Lets go of what a body suspended at a stop that will never be resumed holds: its frames'
-/// records on the stack it stopped from, and its stack's handler state. It runs no program code: a
+/// records on the stack it stopped from, and what its own stack keeps. It runs no program code: a
 /// `bracket` the body was inside does not release.
 fn abandon(ctx: *mut Ctx, id: usize) {
     let d = &mut unsafe { &mut *ctx }.detached[id];
@@ -912,25 +764,25 @@ fn abandon(ctx: *mut Ctx, id: usize) {
     d.live = None;
     let (head, own) = (
         std::mem::replace(&mut d.head, std::ptr::null_mut()),
-        d.frames,
+        d.own_stack,
     );
     unsafe { frames::release_live(ctx, head) };
-    let_go_of_handlers(ctx, own);
+    let_go_of_stack(ctx, own);
 }
 
-fn let_go_of_handlers(ctx: *mut Ctx, own: usize) {
+/// Lets go of what stack `own` keeps.
+fn let_go_of_stack(ctx: *mut Ctx, own: usize) {
     if let Some(s) = unsafe { &mut *ctx }.stacks.get_mut(own) {
-        StackCopy {
-            list: std::mem::take(&mut s.list),
-            kept: std::mem::take(&mut s.kept),
-            held: std::mem::take(&mut s.held),
-        }
-        .release();
+        let_go_of_kept(std::mem::take(s));
     }
 }
 
+fn let_go_of_kept(kept: Vec<Kept>) {
+    kept.into_iter().for_each(Kept::release);
+}
+
 /// Gives back what the entry's bodies still hold at its end: every snapshot, every suspended body's
-/// frames and handler state, and every stack and closure. Runs before the entry's heap ends.
+/// frames and what its stack keeps, and every stack and closure. Runs before the entry's heap ends.
 pub(crate) fn teardown(ctx: *mut Ctx) {
     drain(ctx);
     let bodies = unsafe { &*ctx }.detached.len();
@@ -940,19 +792,19 @@ pub(crate) fn teardown(ctx: *mut Ctx) {
             (
                 d.state == State::Suspended,
                 d.state == State::Done,
-                d.frames,
+                d.own_stack,
             )
         };
         if suspended {
             abandon(ctx, id);
         } else if !done {
-            let_go_of_handlers(ctx, own);
+            let_go_of_stack(ctx, own);
         }
         for k in 0..unsafe { &*ctx }.detached[id].captures.len() {
             let kept = unsafe { &mut *ctx }.detached[id].captures[k].kept.take();
-            if let Some((snapshot, stack)) = kept {
+            if let Some((snapshot, stack_kept)) = kept {
                 unsafe { snapshot.release(ctx) };
-                stack.release();
+                let_go_of_kept(stack_kept);
             }
             let vars = std::mem::take(&mut unsafe { &mut *ctx }.detached[id].captures[k].vars);
             vars_let_go(ctx, vars);

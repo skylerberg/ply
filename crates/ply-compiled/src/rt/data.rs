@@ -1,6 +1,7 @@
 //! The runtime's part of `bracket`, and the refusals and notes compiled code over data raises or makes.
 
 use super::*;
+use crate::native::Addr;
 
 /// `bracket(acquire, release, body)`: `body` given what `acquire` answered and `cleanup` given it
 /// after, however `body` ends: by returning, by a raise or a clause that did not resume it unwinding
@@ -133,8 +134,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
 #[repr(C)]
 pub(crate) struct Unwinding {
     ending: i64,
-    unwind: Option<(usize, usize, Word)>,
-    raise: Option<usize>,
     target: Word,
     pending: Option<usize>,
     entered: Option<crate::tasks::Bracketed>,
@@ -150,31 +149,17 @@ impl Unwinding {
     /// the run's, which releases nothing.
     fn set_aside(c: &mut Ctx) -> Option<Unwinding> {
         let ending = c.failed;
-        let releasing = [
-            0,
-            FAILED_UNWIND,
-            FAILED_CANCELLED,
-            FAILED_ABORT,
-            FAILED_TARGET,
-            FAILED_PENDING,
-        ];
-        if !releasing.contains(&ending) {
+        if ![0, FAILED_CANCELLED, FAILED_TARGET, FAILED_PENDING].contains(&ending) {
             return None;
         }
-        let unwind = c.unwind.take();
-        let raising = c.aborting.take();
-        // Kept in the order `taken_up` takes them back in reverse.
         let pending = c.pending.take().map(|raise| {
             let failure = c.diagnostic.take();
             c.keep(Kept::Pending(raise, failure))
         });
-        let raise = raising.map(|a| c.keep(Kept::Raising(a)));
         c.failed = 0;
         let entered = crate::tasks::shielded(c, crate::tasks::Shield::Release);
         Some(Unwinding {
             ending,
-            unwind,
-            raise,
             target: c.target,
             pending,
             entered,
@@ -184,19 +169,12 @@ impl Unwinding {
     /// What [`Unwinding::set_aside`] set aside going on again once the release ran: false where the
     /// release failed or was cancelled, whose failure replaces it.
     fn taken_up(self, c: &mut Ctx) -> bool {
-        let raising = self.raise.map(|here| match c.kept_back(here) {
-            Kept::Raising(a) => a,
-            _ => unreachable!("a release keeps the raise it runs during"),
-        });
         let pending = self.pending.map(|here| match c.kept_back(here) {
             Kept::Pending(raise, failure) => (raise, failure),
             _ => unreachable!("a release keeps the pending raise it runs during"),
         });
         let cancelled = crate::tasks::unshielded(c, self.entered);
         if c.failed != 0 || cancelled {
-            if let Some(raise) = raising {
-                raise.into_failure();
-            }
             if let Some((raise, _)) = pending {
                 raise.release();
             }
@@ -208,8 +186,6 @@ impl Unwinding {
             return false;
         }
         c.failed = self.ending;
-        c.unwind = self.unwind;
-        c.aborting = raising;
         c.target = self.target;
         if let Some((raise, diagnostic)) = pending {
             c.pending = Some(raise);
@@ -248,12 +224,8 @@ pub unsafe extern "C" fn rt_unwind_resume(ctx: *mut Ctx, held: Word) {
 
 /// [`cancel_here`] where what a clause unwinds with is emitted code's, which is abandoned uncounted.
 fn cancel_carried(c: &mut Ctx) {
-    if ![FAILED_UNWIND, FAILED_ABORT, FAILED_TARGET, FAILED_PENDING].contains(&c.failed) {
+    if ![FAILED_TARGET, FAILED_PENDING].contains(&c.failed) {
         return;
-    }
-    c.unwind = None;
-    if let Some(raise) = c.aborting.take() {
-        raise.into_failure();
     }
     if let Some(raise) = c.pending.take() {
         raise.release();
@@ -290,10 +262,13 @@ pub enum Refused {
     StringFind,
     Assert,
     BytesPosition,
+    SecretDecode,
+    SecretEncode,
+    SecretRsaJwk,
 }
 
 /// Every [`Refused`], each numbered by its place here as emitted code numbers it.
-pub const REFUSED: [Refused; 23] = [
+pub const REFUSED: [Refused; 26] = [
     Refused::ArrayNew,
     Refused::ColumnsNew,
     Refused::ArrayOfList,
@@ -317,6 +292,9 @@ pub const REFUSED: [Refused; 23] = [
     Refused::StringFind,
     Refused::Assert,
     Refused::BytesPosition,
+    Refused::SecretDecode,
+    Refused::SecretEncode,
+    Refused::SecretRsaJwk,
 ];
 
 impl Refused {
@@ -346,6 +324,9 @@ impl Refused {
             Refused::StringFind => "String::find",
             Refused::Assert => "assert",
             Refused::BytesPosition => "Bytes::position",
+            Refused::SecretDecode => "Secret::decode",
+            Refused::SecretEncode => "Secret::encode",
+            Refused::SecretRsaJwk => "Secret::rsa_jwk",
         }
     }
 
@@ -396,7 +377,8 @@ pub(crate) fn refused_unknown(c: &mut Ctx, what: I64) {
 /// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
 /// `byte_of_int` and `Bytes::index_of_byte` a byte `a`; `Bytes::index_of_from` a start `a` in `b`
 /// bytes, and `Bytes::scan` and `Bytes::scan_until` that and a budget `c`; `range` its ends `a` and
-/// `b`; `Bytes::split` and `String::split` nothing. Any other `what` fails the entry as Ply's fault.
+/// `b`; `Bytes::split` and `String::split` nothing; `Secret::rsa_jwk` a list of `a` numbers, which
+/// is not six. Any other `what` fails the entry as Ply's fault.
 #[allow(improper_ctypes_definitions)]
 pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c: I64) -> Raises {
     use ply_core::builtins as said;
@@ -434,12 +416,48 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         }
         Refused::Range => said::range_too_long(site, a.0, b.0),
         Refused::BytesSplit | Refused::StringSplit => said::empty_separator(site, name),
+        Refused::SecretRsaJwk => ply_core::crypto::misuse(
+            site,
+            "`Secret::rsa_jwk`",
+            format!(
+                "an RSA key's private numbers are six, and this list holds {}",
+                a.0
+            ),
+        ),
         _ => {
             refused_unknown(cx, what);
             return Raises(());
         }
     };
     refuse(cx, r, refused);
+    Raises(())
+}
+
+/// `assert_eq` found its two values unequal: raised for `abort.raise` to answer, showing the actual
+/// value, the `n` PLV1 bytes at `actual`, and the expected, the `m` at `expected`, which the CLI
+/// renders, noting where the two first part.
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn rt_assert_failed(
+    ctx: *mut Ctx,
+    actual: Addr,
+    n: I64,
+    expected: Addr,
+    m: I64,
+) -> Raises {
+    let c = unsafe { &mut *ctx };
+    let (e, a) = (ply_core::slot(0), ply_core::slot(1));
+    let d = Diagnostic::error(
+        codes::ASSERTION_FAILED,
+        format!("assertion failed: expected {e}, found {a}"),
+    )
+    .primary(c.site(), "these values are not equal")
+    .note(format!("expected: {e}"))
+    .note(format!("actual:   {a}"))
+    .showing(vec![
+        unsafe { lent(expected, m) }.to_vec(),
+        unsafe { lent(actual, n) }.to_vec(),
+    ]);
+    raise_error(c, d);
     Raises(())
 }
 

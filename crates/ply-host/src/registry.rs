@@ -2,21 +2,17 @@
 
 // A line for each family, here and wherever else they are listed, in alphabetical order: two
 // families added at once then touch different lines.
-use crate::clock;
 use crate::config;
 use crate::fs;
 use crate::pool::{Bell, Run, err_nothing_outstanding};
 use crate::process;
-use crate::random;
 use crate::signal::{self, Accepting, Shutdown};
 use crate::sqlite;
 use crate::tcp;
 use crate::time;
 use crate::trace;
-use ply_core::host::{
-    HostRegistry, HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport,
-};
-use ply_core::{Diagnostic, Span, Symbol, TaskId, Value, codes};
+use ply_core::host::{HostRuntime, MachineId, Pending, RuntimeFactory, ShutdownReport};
+use ply_core::{Diagnostic, Span, Symbol, TaskId, codes};
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
@@ -116,17 +112,6 @@ impl Host {
         self.net.credentials()
     }
 
-    pub fn registry(&self) -> HostRegistry {
-        let mut registry = HostRegistry::new();
-        clock::register(&mut registry, Arc::clone(&self.time));
-        // Registered whatever `--fs` said, so a run that bound no root gets `E0451`, not `E0424`.
-        fs::register(&mut registry, Arc::clone(&self.fs));
-        process::register(&mut registry, self.process.as_ref());
-        random::register(&mut registry);
-        time::register(&mut registry, Arc::clone(&self.time));
-        registry
-    }
-
     /// One per machine, each a run of its own: the pools are shared, but every operation is the
     /// run's that submitted it.
     pub fn runtime(&self) -> Rc<dyn HostRuntime> {
@@ -164,21 +149,6 @@ impl Host {
     }
 }
 
-/// Every registration this binary serves, of a host that holds nothing: what a listing of the
-/// families the runtime serves itself names.
-pub fn registry() -> HostRegistry {
-    Host::new()
-        .traced(Arc::new(trace::Trace::default()))
-        .stopping_on(Shutdown::new(signal::Bounds::default()))
-        .with_process(process::ProcessHost::new(
-            Vec::new(),
-            process::OutputSink::Real {
-                out: process::Stream::Out,
-            },
-        ))
-        .registry()
-}
-
 /// A runtime factory for a run no host was bound for: every runtime it makes, a `parallel`
 /// branch's among them, is over one host of its own, made when the first runtime is.
 pub fn unbound() -> RuntimeFactory {
@@ -204,7 +174,7 @@ pub fn job_bytes(runtime: &dyn HostRuntime, pending: &Pending) -> Result<Vec<u8>
         if let Some(expired) = facilities.drain_expired() {
             return Err(expired);
         }
-        if let Some(bytes) = facilities.run.block_on_bytes(pending, step)? {
+        if let Some(bytes) = facilities.run.block_on(pending, step)? {
             return Ok(bytes);
         }
     }
@@ -268,9 +238,19 @@ impl Facilities {
         self.fs.roots()
     }
 
+    /// The files under the roots, and the locks and descriptors the run holds of them.
+    pub fn files(&self) -> &Arc<fs::FsHost> {
+        &self.fs
+    }
+
     /// The database connections the run holds open.
     pub fn databases(&self) -> &Arc<sqlite::SqliteHost> {
         &self.sqlite
+    }
+
+    /// The run's own process and the programs it may start, where it was lent either.
+    pub fn process(&self) -> Option<&Arc<process::ProcessHost>> {
+        self.process.as_ref()
     }
 
     /// The stop the run listens for, where it listens for one.
@@ -356,20 +336,6 @@ impl HostRuntime for Facilities {
         }
         ShutdownReport {
             spans_left_open: usize::try_from(self.trace.left_open()).unwrap_or(usize::MAX),
-        }
-    }
-
-    /// Drive until this token resolves, or until the drain deadline says the run is out of time,
-    /// which a wait begun past it says at once.
-    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        let step = self.shutdown.as_ref().map(|_| signal::DRAIN_POLL);
-        loop {
-            if let Some(expired) = self.drain_expired() {
-                return Err(expired);
-            }
-            if let Some(value) = self.run.block_on(&pending, step)? {
-                return Ok(value);
-            }
         }
     }
 

@@ -2,50 +2,11 @@
 //! runtime serves itself.
 
 use ply_compiled::entry::Grants;
-use ply_core::host::{Determinism, HostBinding, HostHandler, HostOp, HostResource, Linearity};
-use ply_core::{Diagnostic, Span, Symbol};
+use ply_core::host::HostBinding;
+use ply_core::{Diagnostic, Span};
 use ply_host::config::{Entry, Snapshot};
 use ply_host::tls;
 use std::sync::Arc;
-
-/// One host operation and the handler that serves it, as a caller lends it to an entry.
-pub type LentOp = (HostOp, Arc<dyn HostHandler>);
-
-/// One operation of a privileged family. Each family reads the world, a tree, a clock, a cache, a
-/// toolchain or the process environment, so none is a function of program state; each answers
-/// before the perform returns rather than handing back a token to poll; and none is handed a
-/// `Secret`.
-pub fn privileged_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
-    HostOp {
-        effect: Symbol::new(effect),
-        op: Symbol::new(op),
-        resource: HostResource::Any,
-        determinism: Determinism::Nondeterministic,
-        linearity,
-        blocking: false,
-        secrets: false,
-        path,
-    }
-}
-
-/// One operation of a hermetic half, served by a deterministic handler.
-pub fn hermetic_op(effect: &str, op: &str, linearity: Linearity, path: &'static str) -> HostOp {
-    HostOp {
-        determinism: Determinism::Deterministic,
-        ..privileged_op(effect, op, linearity, path)
-    }
-}
-
-/// A perform of a privileged family's operation that its handler does not serve.
-#[cold]
-pub fn unserved(effect: &str, op: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(
-        ply_core::codes::INTERNAL_ERROR,
-        format!("`{effect}.{op}` is not an operation this command serves"),
-    )
-    .primary(span, "performed here")
-    .note("the effect and its handler are written together; this is Ply's fault")
-}
 
 /// What a run has bound: the facilities its handlers act on, the binding, and what stops it where
 /// it listens for a signal.
@@ -59,9 +20,9 @@ pub struct Hosts {
 impl Hosts {
     /// The binding of every family this runtime serves itself, from what a run is lent alone: no
     /// program's rows are read. Its roots, its programs and its command line narrow what they
-    /// serve; `lent` are the caller's families beside them. A run lent `drain LEAD_MS DRAIN_MS`
-    /// drains on `INT` or `TERM`; one lent `end` ends its children and exits at once.
-    pub fn granted(grants: &Grants, lent: Vec<LentOp>) -> Result<Hosts, Vec<Diagnostic>> {
+    /// serve. A run lent `drain LEAD_MS DRAIN_MS` drains on `INT` or `TERM`; one lent `end` ends
+    /// its children and exits at once.
+    pub fn granted(grants: &Grants) -> Result<Hosts, Vec<Diagnostic>> {
         let pairs = |name: &'static str| {
             grants.named(name).filter_map(|fields| match fields {
                 [name, path] => Some((name.clone(), std::path::PathBuf::from(path))),
@@ -136,14 +97,9 @@ impl Hosts {
         if let Some(stop) = &stop {
             facilities = facilities.stopping_on(Arc::clone(stop));
         }
-        let facilities = Arc::new(facilities);
-        let mut registry = facilities.registry();
-        for (op, handler) in lent {
-            registry.register(op, handler);
-        }
         Ok(Hosts {
-            host: facilities,
-            binding: Arc::new(registry.granted(grants.clone())?),
+            host: Arc::new(facilities),
+            binding: Arc::new(HostBinding::granted(grants.clone())),
             stop,
         })
     }

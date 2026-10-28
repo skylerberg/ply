@@ -11,7 +11,7 @@ pub struct Ctx {
     pub failed: i64,
     /// Nested native calls the running stack is still allowed. A call spends one and its return
     /// gives it back; a frame a failure returns through gives nothing back, so whatever runs on
-    /// past a failure first puts this where it stood ([`HandlerFrame::land`]). It is the running
+    /// past a failure first puts this where it stood. It is the running
     /// stack's own: a switch saves it with the stack it leaves and puts back the other's.
     pub fuel: i64,
     /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
@@ -40,14 +40,14 @@ pub struct Ctx {
     /// with its own. Compiled code reads and writes it, as it does the three below.
     pub target: Word,
     /// The row descriptor and words the next closure the runtime calls is handed by its uniform
-    /// entry, which takes them and sets both to 0; 0 for none, which hands it the frame bridge.
+    /// entry, which takes them and sets both to 0; 0 for none, which hands it the bridge.
     pub entering_desc: Word,
     pub entering_words: Word,
     /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
     /// test reads what its entries performed, a cost mark is open or a seeded region runs.
     pub recording: i64,
-    /// The evidence object of every effect that hands each operation to the frame protocol
-    /// ([`BRIDGE`]), for code that holds no word answering one.
+    /// The evidence object of every effect for code that holds no word answering one
+    /// ([`BRIDGE`]).
     pub bridge: Word,
     /// What an entry hands its root for an effect the Rust binding serves ([`HOSTED`]) and for one
     /// nothing answers ([`UNSERVED`]).
@@ -66,7 +66,7 @@ pub struct Ctx {
     /// The fuel this entry began with: how deeply its calls may nest.
     pub(super) depth_bound: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
-    /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
+    /// read it, so a test reads the same cost whether a constant was memoized or not. Not budgeted.
     pub charged: Cost,
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
@@ -85,8 +85,9 @@ pub struct Ctx {
     pub tables: Arc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
-    /// One per stack run in this entry, the entry's own first; `current` is the one running.
-    pub(crate) stacks: Vec<Frames>,
+    /// What the runtime's frames on each stack run in this entry keep ([`Kept`]), the innermost
+    /// last, the entry's own stack first; `current` is the one running.
+    pub(crate) stacks: Vec<Vec<Kept>>,
     /// Indices of `stacks` a finished production task gave back, which nothing names any longer.
     pub(super) free_stacks: Vec<usize>,
     pub(crate) current: usize,
@@ -94,7 +95,7 @@ pub struct Ctx {
     pub performed: Vec<EffectAtom>,
     /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
     pub(crate) cost_marks: Vec<CostMark>,
-    /// The detached bodies this entry has opened, named by index from their frames and tokens.
+    /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
     /// The running entry's number, which no other entry in the process shares: a continuation
@@ -106,7 +107,6 @@ pub struct Ctx {
     /// What makes a reactor, which a `parallel` branch on another thread needs one of its own of:
     /// the bound run's, or one over a host of this context's own.
     pub(crate) runtime_factory: ply_core::RuntimeFactory,
-    pub(crate) declared: Option<ply_core::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
     pub(crate) host_ops: u64,
@@ -132,9 +132,6 @@ pub struct Ctx {
     /// What the run held as its root's body returned, where the run's region noted it.
     pub(crate) held_at_root: Option<crate::entry::Held>,
     pub interleaving: Option<Vec<u8>>,
-    /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
-    pub(crate) unwind: Option<(usize, usize, Word)>,
-    pub(crate) aborting: Option<Aborting>,
     /// The raise [`FAILED_PENDING`] stands for; its diagnostic is `diagnostic`.
     pub(crate) pending: Option<Unanswered>,
     /// The words of the raise `rt_pending_raised_at` last handed compiled code, with a word to
@@ -142,10 +139,8 @@ pub struct Ctx {
     pub(crate) pending_words: Vec<Word>,
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
-    /// The value a clause handed to `resume` in tail position, read back when the clause returns.
-    pub(super) resumed: Option<Word>,
-    /// How many `handle`s this context has installed, which names the next one's frame.
-    pub(super) handlers_made: u64,
+    /// Whether the entry is a test's, whose program may read what it has cost.
+    pub tested: bool,
     /// How many holds this entry has made, which numbers the next.
     pub(super) holds_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
@@ -170,8 +165,9 @@ pub(crate) struct BranchFailure {
     pending: Option<Unanswered>,
 }
 
-/// A raise no frame answers, left for the code around the failure, whose innermost `handle`
-/// answering it takes it: `abort.raise` of a message, or another raise with what it carries.
+/// A raise no clause answers in place, left for the code around the failure, whose innermost
+/// `handle` answering it takes it: `abort.raise` of a message, or another raise with what it
+/// carries.
 pub(crate) enum Unanswered {
     Abort(String),
     Raised {
@@ -198,14 +194,6 @@ impl Unanswered {
                 op: op.clone(),
                 args: args.copied(),
             },
-        }
-    }
-
-    /// Whether `clause` answers this raise.
-    pub(super) fn answered_by(&self, clause: &FrameClause) -> bool {
-        match self {
-            Unanswered::Abort(_) => clause.answers_raise("abort", "raise"),
-            Unanswered::Raised { effect, op, .. } => clause.answers_raise(effect, op),
         }
     }
 }
@@ -274,7 +262,7 @@ impl Ctx {
             last_entry: 0,
             tables,
             diagnostic: None,
-            stacks: vec![Frames::under(None)],
+            stacks: vec![Vec::new()],
             free_stacks: Vec::new(),
             current: 0,
             performed: Vec::new(),
@@ -285,7 +273,6 @@ impl Ctx {
             binding: Arc::new(ply_core::HostBinding::unbound()),
             runtime: None,
             runtime_factory: ply_host::registry::unbound(),
-            declared: None,
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
             host_ops: 0,
@@ -301,13 +288,10 @@ impl Ctx {
             trail_kept: None,
             held_at_root: None,
             interleaving: None,
-            unwind: None,
-            aborting: None,
             pending: None,
             pending_words: Vec::new(),
             traced: false,
-            resumed: None,
-            handlers_made: 0,
+            tested: false,
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             release_later: Vec::new(),
@@ -318,57 +302,17 @@ impl Ctx {
         }
     }
 
-    /// A name for the `handle` being installed, which no other in this context shares.
-    pub(crate) fn next_handler(&mut self) -> u64 {
-        self.handlers_made += 1;
-        self.handlers_made
-    }
-
-    /// `call`, made while the handler's variables `held` are the clause's: a clause or the `return`
-    /// clause of a handler that has some. Takes `held`.
-    pub(crate) fn holding<T>(
-        ctx: *mut Ctx,
-        held: Option<(u64, SharedVars)>,
-        call: impl FnOnce() -> T,
-    ) -> T {
-        let Some(h) = held else {
-            return call();
-        };
-        let stack = unsafe { &*ctx }.current;
-        unsafe { &mut *ctx }.stacks[stack].held.push(h);
-        let r = call();
-        if let Some((_, v)) = unsafe { &mut *ctx }.stacks[stack].held.pop() {
-            release_vars(v);
-        }
-        r
-    }
-
-    /// The variables of the running clause of `handler`: on this stack, or on one this stack was
-    /// entered from, as a body or a task opened inside the clause runs.
-    pub(crate) fn held_by(&self, handler: u64) -> Option<SharedVars> {
-        let mut at = Some(self.current);
-        for _ in 0..self.stacks.len() {
-            let frames = &self.stacks[at?];
-            if let Some((_, v)) = frames.held.iter().rev().find(|(h, _)| *h == handler) {
-                return Some(Rc::clone(v));
-            }
-            at = frames.entered_from.or(frames.parent);
-        }
-        None
-    }
-
     /// Keeps `k` on the running stack while a runtime frame calls into the program; answers the
     /// stack, for [`Ctx::kept_back`].
     pub(crate) fn keep(&mut self, k: Kept) -> usize {
         let s = self.current;
-        self.stacks[s].kept.push(k);
+        self.stacks[s].push(k);
         s
     }
 
     /// What the frame that kept on stack `s` kept there: the last kept there.
     pub(crate) fn kept_back(&mut self, s: usize) -> Kept {
         self.stacks[s]
-            .kept
             .pop()
             .expect("a runtime frame finds what it kept when its call returns")
     }
@@ -391,14 +335,13 @@ impl Ctx {
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
         b.runtime_factory = Arc::clone(&self.runtime_factory);
-        b.declared = self.declared.clone();
         b.re_executed = self.re_executed;
         b.id = self.id;
         b.seed = self.seed.clone();
         b.sim_steps = self.sim_steps;
         // A branch runs in the task its block is in.
         b.task = self.task;
-        b.stacks[0].list = self.crossing_frames();
+        b.tested = self.tested;
         // What a branch performed is this entry's, read wherever this entry's is.
         b.traced = self.recording != 0;
         b.rearm_recording();
@@ -418,37 +361,6 @@ impl Ctx {
         self.rearm_recording();
     }
 
-    /// The frames in reach of the running stack, outermost first, each with whether its clauses
-    /// may answer from another thread at all: only where every frame below it crosses whole, since
-    /// what a clause performs and raises is answered below it.
-    fn frames_in_reach(&self) -> Vec<(&HandlerFrame, bool)> {
-        let mut chain = Vec::new();
-        let mut stack = Some(self.current);
-        while let Some(s) = stack {
-            chain.push(s);
-            stack = self.stacks[s].parent;
-        }
-        let mut below_crosses = true;
-        let mut frames = Vec::new();
-        for s in chain.into_iter().rev() {
-            for f in &self.stacks[s].list {
-                frames.push((f, below_crosses));
-                below_crosses &= f.crosses_whole();
-            }
-        }
-        frames
-    }
-
-    /// Copies of what the frames in reach of the running stack answer from another thread,
-    /// outermost first, as a branch's own stack holds them.
-    fn crossing_frames(&self) -> Vec<HandlerFrame> {
-        self.frames_in_reach()
-            .into_iter()
-            .filter(|(_, crossing)| *crossing)
-            .filter_map(|(f, _)| f.crossing_copy())
-            .collect()
-    }
-
     /// Takes back what a finished branch did, in the order the branches are written: its memory,
     /// its calls, and what it performed.
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
@@ -466,22 +378,11 @@ impl Ctx {
         self.teardown.append(&mut branch.teardown);
     }
 
-    /// Whether a `parallel` block's branches may run on other threads: nothing they perform can then
-    /// reach a handler this entry holds or this thread's host runtime, which live on this thread,
-    /// and no seeded region records their steps. A branch performs no `task` operation, and one
-    /// that waits waits on its own thread, so the run's region keeps no block in turn. `reach` is
-    /// every operation the branches may perform that they do not answer themselves, where the
-    /// block's site knows it; a block that does not is kept from any handler at all.
-    pub(crate) fn runs_branches_at_once(&self, reach: Option<&[Reached]>) -> bool {
-        if (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() }) {
-            return false;
-        }
-        self.frames_in_reach()
-            .into_iter()
-            .all(|(f, crossing)| match reach {
-                Some(reach) => !f.within(reach, crossing),
-                None => f.crosses_whole(),
-            })
+    /// Whether a `parallel` block's branches may run on other threads: where no seeded region
+    /// records their steps. A branch performs no `task` operation, and one that waits waits on its
+    /// own thread, so the run's region keeps no block in turn.
+    pub(crate) fn runs_branches_at_once(&self) -> bool {
+        !(self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
     }
 
     /// The calls left before this entry's budget is spent, or `None` when nothing bounds it.
@@ -535,7 +436,7 @@ impl Ctx {
         self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
-        self.stacks.push(Frames::under(None));
+        self.stacks.push(Vec::new());
         self.free_stacks.clear();
         self.current = 0;
         self.performed.clear();
@@ -547,14 +448,10 @@ impl Ctx {
         self.trail_kept = None;
         self.held_at_root = None;
         self.interleaving = None;
-        self.handlers_made = 0;
         self.holds_made = 0;
-        self.unwind = None;
-        self.aborting = None;
         if let Some(p) = self.pending.take() {
             p.release();
         }
-        self.resumed = None;
         self.release_depth = 0;
         self.release_waiting = 0;
         self.target = 0;
@@ -637,6 +534,13 @@ impl Ctx {
         swap_running(self.outer_running);
         self.outer = (std::ptr::null_mut(), std::ptr::null());
         self.outer_running = std::ptr::null_mut();
+    }
+
+    /// How many of the program's objects are still live once what the entry's bodies hold is given
+    /// back: each one a value nothing let go of.
+    pub fn left_live(&mut self) -> usize {
+        crate::detached::teardown(self);
+        self.live()
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
@@ -746,34 +650,27 @@ impl Ctx {
         runtime
     }
 
-    pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {
-        &mut self.stacks[self.current].list
-    }
-
-    /// A new stack's frames, chained under `parent`; its index names it.
-    pub(crate) fn open_stack(&mut self, parent: Option<usize>) -> usize {
+    /// A new stack, keeping nothing yet; its index names it.
+    pub(crate) fn open_stack(&mut self) -> usize {
         match self.free_stacks.pop() {
-            Some(stack) => {
-                self.stacks[stack] = Frames::under(parent);
-                stack
-            }
+            Some(stack) => stack,
             None => {
-                self.stacks.push(Frames::under(parent));
+                self.stacks.push(Vec::new());
                 self.stacks.len() - 1
             }
         }
     }
 
-    /// Gives back a dead stack's index, its frames already gone; nothing may name it.
+    /// Gives back a dead stack's index; nothing may name it.
     pub(crate) fn close_stack(&mut self, stack: usize) {
-        debug_assert!(
-            self.stacks[stack].list.is_empty(),
-            "a stack gave its index back while still holding frames"
-        );
+        for k in std::mem::take(&mut self.stacks[stack]) {
+            k.release();
+        }
         self.free_stacks.push(stack);
     }
 
-    /// The stacks' frame tables this entry holds, given-back ones included: what a leak grows.
+    /// The stacks' tables of what they keep this entry holds, given-back ones included: what a
+    /// leak grows.
     pub fn stack_slots(&self) -> usize {
         self.stacks.len()
     }
@@ -782,29 +679,10 @@ impl Ctx {
         self.fail_with(FAILED, d)
     }
 
-    /// Fails as a raise of `abort.raise` made where the code's word for `abort` is the frame bridge,
-    /// bound for the innermost frame in reach with a clause for it, which is the innermost `handle`
-    /// answering it there; with none, left pending as [`Ctx::pend`] leaves it.
-    pub(crate) fn raise(&mut self, d: Diagnostic, message: String) -> i64 {
-        if self.failed != 0 {
-            return 0;
-        }
-        let Some(at) = self.raise_handler("abort", "raise", None) else {
-            return self.pend(d, message);
-        };
-        let (stack, depth, clause) = at;
-        let string = self.stacks[stack].list[depth].clauses[clause].string;
-        self.pending = Some(Unanswered::Abort(message));
-        self.fail_with(FAILED_PENDING, d);
-        self.bind_pending(at, string);
-        0
-    }
-
     /// Fails as a raise of `abort.raise` of `message` the runtime makes, left pending for the code
-    /// around the failure, whose innermost `handle` answering it takes it: an instance's landing, a
-    /// frame's landing where a clause of it answers `abort.raise`, or a function holding a word for
-    /// `abort`, which raises it through that word as it leaves. `d` is what the entry fails with
-    /// should none take it.
+    /// around the failure, whose innermost `handle` answering it takes it: an instance's landing,
+    /// or a function holding a word for `abort`, which raises it through that word as it leaves.
+    /// `d` is what the entry fails with should none take it.
     pub(crate) fn pend(&mut self, d: Diagnostic, message: String) -> i64 {
         if self.failed != 0 {
             return 0;
@@ -813,8 +691,8 @@ impl Ctx {
         self.fail_with(FAILED_PENDING, d)
     }
 
-    /// Fails as the raise of `effect.op` carrying `args`, which no frame answers, left pending as
-    /// [`Ctx::pend`] leaves `abort.raise`. Takes `args`.
+    /// Fails as the raise of `effect.op` carrying `args`, which no clause answers in place, left
+    /// pending as [`Ctx::pend`] leaves `abort.raise`. Takes `args`.
     pub(crate) fn pend_raised(
         &mut self,
         d: Diagnostic,
@@ -830,126 +708,16 @@ impl Ctx {
         self.fail_with(FAILED_PENDING, d)
     }
 
-    /// Binds the raise left pending to the clause at `at` of a frame, which answers it: one of
-    /// `abort.raise` takes the message as emitted code lays a `String`, lifted through `string`,
-    /// the type its `handle` site handed; any other what the raise carries.
-    pub(super) fn bind_pending(
-        &mut self,
-        at: (usize, usize, usize),
-        string: Option<&'static PlyType>,
-    ) {
-        let Some(raise) = self.pending.take() else {
-            return;
-        };
-        let diagnostic = self
-            .diagnostic
-            .take()
-            .unwrap_or_else(|| self.placed(error("a raise was left pending without a failure")));
-        self.failed = 0;
-        let (stack, depth, clause) = at;
-        let message = match raise {
-            Unanswered::Abort(message) => message,
-            Unanswered::Raised { args, .. } => {
-                self.aborting = Some(Aborting {
-                    stack,
-                    depth,
-                    clause,
-                    args,
-                    diagnostic,
-                });
-                self.failed = FAILED_ABORT;
-                return;
-            }
-        };
-        let Some(ty) = string else {
-            self.fail(
-                error("an `abort.raise` clause emitted code installed has no `String` type")
-                    .note("this is Ply's fault, not the program's"),
-            );
-            return;
-        };
-        let Some(w) = lifted(self, &Value::str(message), ty) else {
-            return;
-        };
-        self.aborting = Some(Aborting {
-            stack,
-            depth,
-            clause,
-            args: Raised(vec![unsafe { Carried::new(w, ty) }]),
-            diagnostic,
-        });
-        self.failed = FAILED_ABORT;
-    }
-
-    /// Sends a raise on its way to the clause at `at`, which is handed `args`; `d` is what the
-    /// entry fails with should that frame be gone.
-    pub(super) fn bind_raise(
-        &mut self,
-        at: (usize, usize, usize),
-        args: Raised,
-        d: Diagnostic,
-    ) -> i64 {
-        let (stack, depth, clause) = at;
-        let diagnostic = self.placed(d);
-        self.aborting = Some(Aborting {
-            stack,
-            depth,
-            clause,
-            args,
-            diagnostic,
-        });
-        self.failed = FAILED_ABORT;
-        0
-    }
-
-    /// The stack, depth and clause that answer a raise of `effect.op`, in the frame of handler
-    /// `target` alone where there is one. Searched as a `perform` searches, so frames hidden while a
-    /// clause runs are passed over.
-    pub(super) fn raise_handler(
-        &self,
-        effect: &str,
-        op: &str,
-        target: Option<u64>,
-    ) -> Option<(usize, usize, usize)> {
-        let mut stack = self.current;
-        loop {
-            let found = self.stacks[stack]
-                .list
-                .iter()
-                .enumerate()
-                .rev()
-                .filter(|(_, f)| target.is_none_or(|t| t == f.handler))
-                .find_map(|(depth, f)| {
-                    let clause = f
-                        .clauses
-                        .iter()
-                        .position(|cl| cl.answers_raise(effect, op))?;
-                    Some((stack, depth, clause))
-                });
-            if found.is_some() {
-                return found;
-            }
-            stack = self.stacks[stack].parent?;
-        }
-    }
-
     /// How a finished branch failed, a raise bound past it as the failure it carries; one pending
     /// is carried on pending.
     pub(crate) fn take_branch_failure(&mut self) -> Option<BranchFailure> {
         if self.failed == 0 {
             return None;
         }
-        Some(match self.aborting.take() {
-            Some(a) if self.failed == FAILED_ABORT => BranchFailure {
-                code: FAILED,
-                diagnostic: Some(a.into_failure()),
-                pending: None,
-            },
-            _ => BranchFailure {
-                code: self.failed,
-                diagnostic: self.diagnostic.take(),
-                pending: self.pending.take(),
-            },
+        Some(BranchFailure {
+            code: self.failed,
+            diagnostic: self.diagnostic.take(),
+            pending: self.pending.take(),
         })
     }
 
@@ -1044,9 +812,7 @@ impl Ctx {
             }
             Some(Unanswered::Abort(_)) | None => {}
         }
-        self.diagnostic
-            .take()
-            .or_else(|| self.aborting.take().map(|a| a.diagnostic))
+        self.diagnostic.take()
     }
 
     /// What the run asked of the host since the last take, and how many of those asks were

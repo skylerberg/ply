@@ -1,5 +1,5 @@
 use astro_float::{BigFloat, Consts, RoundingMode, Sign};
-use ply_core::Value;
+use ply_core::codec::Writer;
 use ply_core::float::{self, CANONICAL_NAN_BITS, bits, total_cmp};
 use std::cmp::Ordering;
 
@@ -271,6 +271,12 @@ fn every_float_function_answers_the_nearest_float_to_the_exact_value() {
     }
 }
 
+fn encoded(x: f64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.float(bits(x));
+    w.finish()
+}
+
 #[test]
 fn a_nan_reads_as_the_one_nan_whatever_bits_made_it() {
     for nan in [
@@ -282,10 +288,7 @@ fn a_nan_reads_as_the_one_nan_whatever_bits_made_it() {
         assert_eq!(bits(nan), CANONICAL_NAN_BITS);
         assert_eq!(total_cmp(nan, f64::NAN), Ordering::Equal);
         assert_eq!(total_cmp(nan, f64::INFINITY), Ordering::Greater);
-        assert_eq!(
-            ply_core::codec::encode(&Value::Float(nan)),
-            ply_core::codec::encode(&Value::Float(f64::NAN)),
-        );
+        assert_eq!(encoded(nan), encoded(f64::NAN));
     }
     assert_eq!(total_cmp(-0.0, 0.0), Ordering::Less);
 }

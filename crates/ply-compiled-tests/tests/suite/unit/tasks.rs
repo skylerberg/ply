@@ -2,7 +2,7 @@ use crate::bare::context;
 use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
 use ply_compiled::native::{Addr, Answered, I64};
-use ply_compiled::rt::{Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, rt_taken};
+use ply_compiled::rt::{Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, rt_taken};
 use ply_compiled::tasks::{
     self, ANSWERED, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, Region, Shield,
     Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
@@ -96,7 +96,7 @@ unsafe fn unwinds(ctx: *mut Ctx, _: usize) {
 }
 
 unsafe fn raises(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = FAILED_ABORT };
+    unsafe { (*ctx).failed = FAILED_TARGET };
 }
 
 unsafe fn breaks(ctx: *mut Ctx, _: usize) {
@@ -123,7 +123,7 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     assert_eq!(unsafe { (*c).failed }, 0);
     assert!(!region.restore(1, None), "an unwound task leaves nothing");
     assert!(region.restore(2, None));
-    assert_eq!(unsafe { (*c).failed }, FAILED_ABORT);
+    assert_eq!(unsafe { (*c).failed }, FAILED_TARGET);
     unsafe { (*c).failed = 0 };
     assert!(region.restore(3, Some("noted".to_string())));
     assert_eq!(unsafe { (*c).failed }, 1);
@@ -394,7 +394,7 @@ fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() 
         d.message
     );
     let_go(&mut ctx, k);
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }
 
 thread_local! {
@@ -502,7 +502,7 @@ fn a_task_runs_its_body_with_the_words_its_maker_held_and_answers_into_its_handl
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
     assert!(ctx.take_failure().is_none());
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }
 
 #[test]
@@ -554,5 +554,5 @@ fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }

@@ -1,8 +1,10 @@
+use crate::bare::context;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
-    HEADER, Heap, Obj, Word, bridged, enter, leave, obj, poison, poisoning, release_handle, word_at,
+    HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison, poisoning, release_object,
+    word_at,
 };
-use ply_core::Value;
+use ply_compiled::rt::Ctx;
 use std::sync::Arc;
 
 /// A block of `payload` bytes past its header, from `h`: its word, which a `Block` is.
@@ -15,9 +17,22 @@ fn freed(h: &mut Heap, w: Word, payload: usize) {
     unsafe { std::mem::transmute::<Word, Block>(w).free(h, (HEADER + payload) as Word) }
 }
 
-/// The value bridge `w` holds.
-fn bridged_value(w: Word) -> Value {
-    unsafe { bridged(obj(w)) }.clone()
+/// What a native object holds in these tests: text, whose count of holders says how many native
+/// objects holding it are not yet dropped.
+pub(super) struct Holding(pub(super) Arc<str>);
+
+impl Native for Holding {
+    fn release(&mut self, _ctx: *mut Ctx) {}
+}
+
+fn holding(text: &str) -> Box<dyn Native> {
+    Box::new(Holding(Arc::from(text)))
+}
+
+/// The text the native object `w` holds.
+fn held_by(w: Word) -> Arc<str> {
+    let held = unsafe { native_of::<Holding>(w) }.expect("a native object holding text");
+    Arc::clone(&held.0)
 }
 
 #[test]
@@ -78,59 +93,76 @@ fn a_block_given_back_is_reused_by_the_next_of_its_size_within_an_entry() {
     );
     freed(&mut h, kept, 16);
     assert_ne!(block(&mut h, 64), kept, "a larger block is not its size's");
-    let bridge = h.bridge(Value::Float(1.5));
-    release_handle(bridge);
-    let again = h.bridge(Value::Float(2.5));
-    assert_eq!(again, bridge, "a dead bridge's block is the next bridge's");
-    assert_eq!(bridged_value(again), Value::Float(2.5));
     leave();
     h.end();
 }
 
-/// The end drops what the table lists, so a block listed twice would drop its tenant twice.
 #[test]
-fn the_bridge_table_lists_each_live_bridge_once_and_the_end_drops_each_once() {
-    let mut h = Heap::new();
+fn a_dead_native_objects_block_is_the_next_native_objects() {
+    let mut ctx = context();
+    let first = ctx.heap.native(holding("first"));
+    release_object(&raw mut ctx, first);
+    let again = ctx.heap.native(holding("second"));
+    assert_eq!(
+        again, first,
+        "a dead native object's block is the next native object's"
+    );
+    assert_eq!(&*held_by(again), "second");
+    assert_eq!(ctx.heap.recycled(), 1);
+    assert_eq!(ctx.heap.natives(), 1);
+}
+
+/// The end drops what the table lists, so a block listed twice would drop what it holds twice.
+#[test]
+fn the_table_lists_each_live_native_object_once_and_the_end_drops_each_once() {
+    let mut ctx = context();
     let held: Arc<str> = Arc::from("held");
-    enter(&mut h);
-    let words: Vec<Word> = (0..8).map(|_| h.bridge(Value::Str(held.clone()))).collect();
+    let words: Vec<Word> = (0..8)
+        .map(|_| ctx.heap.native(Box::new(Holding(Arc::clone(&held)))))
+        .collect();
     for i in [3, 0, 7, 4] {
-        release_handle(words[i]);
+        release_object(&raw mut ctx, words[i]);
     }
-    assert_eq!(h.bridges(), 4, "a dead bridge stayed in the table");
+    assert_eq!(
+        ctx.heap.natives(),
+        4,
+        "a dead native object stayed in the table"
+    );
     assert_eq!(Arc::strong_count(&held), 5);
 
-    let reused: Vec<Word> = (0..4).map(|i| h.bridge(Value::Int(i))).collect();
+    let reused: Vec<Word> = (0..4)
+        .map(|i| ctx.heap.native(holding(&i.to_string())))
+        .collect();
     assert!(
         reused.iter().all(|w| words.contains(w)),
-        "a bridge took fresh memory with dead bridges' blocks on hand"
+        "a native object took fresh memory with dead ones' blocks on hand"
     );
-    assert_eq!(h.bridges(), 8);
+    assert_eq!(ctx.heap.natives(), 8);
     for (i, w) in reused.iter().enumerate() {
-        assert_eq!(bridged_value(*w), Value::Int(i as i64));
+        assert_eq!(&*held_by(*w), i.to_string());
     }
     for i in [1, 2, 5, 6] {
-        assert_eq!(bridged_value(words[i]), Value::Str(held.clone()));
+        assert!(Arc::ptr_eq(&held_by(words[i]), &held));
     }
 
     // Out of listing order, so removals move entries into the holes they leave.
     for w in [reused[1], words[6], reused[3], words[1], reused[0]] {
-        release_handle(w);
+        release_object(&raw mut ctx, w);
     }
-    assert_eq!(h.bridges(), 3);
+    assert_eq!(ctx.heap.natives(), 3);
     assert_eq!(Arc::strong_count(&held), 3);
 
-    // With no heap entered the block cannot go back, so it stays listed, dead.
-    leave();
-    release_handle(words[5]);
-    assert_eq!(h.bridges(), 3);
+    // Let go under another context, the block cannot go back to its heap, so it stays listed, dead.
+    let mut other = context();
+    release_object(&raw mut other, words[5]);
+    assert_eq!(ctx.heap.natives(), 3);
     assert_eq!(Arc::strong_count(&held), 2);
-    h.end();
-    assert_eq!(h.bridges(), 0);
+    ctx.heap.end();
+    assert_eq!(ctx.heap.natives(), 0);
     assert_eq!(
         Arc::strong_count(&held),
         1,
-        "the end dropped a bridged value other than once"
+        "the end dropped what a native object holds other than once"
     );
 }
 
@@ -144,8 +176,8 @@ fn own_test_name(leaf: &str) -> String {
 
 /// `PLY_HEAP_POISON` is read once per process, so the poisoned heap runs in a process of its own.
 #[test]
-fn under_poisoning_a_stale_word_that_reaches_a_reused_bridge_block_is_caught() {
-    let name = own_test_name("a_stale_word_meets_a_reused_bridge_block_poisoned");
+fn under_poisoning_a_stale_word_that_reaches_a_reused_native_object_block_is_caught() {
+    let name = own_test_name("a_stale_word_meets_a_reused_native_object_block_poisoned");
     let out = std::process::Command::new(std::env::current_exe().expect("the test binary"))
         .args([name.as_str(), "--exact", "--ignored", "--nocapture"])
         .env("PLY_HEAP_POISON", "1")
@@ -167,23 +199,25 @@ fn under_poisoning_a_stale_word_that_reaches_a_reused_bridge_block_is_caught() {
 #[test]
 #[ignore = "run under `PLY_HEAP_POISON` by the test above"]
 #[should_panic(expected = "a stale read: a block that has died")]
-fn a_stale_word_meets_a_reused_bridge_block_poisoned() {
+fn a_stale_word_meets_a_reused_native_object_block_poisoned() {
     assert!(poisoning(), "`PLY_HEAP_POISON` is not set");
-    let mut h = Heap::new();
-    enter(&mut h);
-    let stale = h.bridge(Value::Float(1.5));
-    release_handle(stale);
-    let tenant = h.bridge(Value::Float(2.5));
-    assert_eq!(tenant, stale, "the dead bridge's block was not reused");
-    assert_eq!(bridged_value(tenant), Value::Float(2.5));
-    release_handle(tenant);
+    let mut ctx = context();
+    let stale = ctx.heap.native(holding("first"));
+    release_object(&raw mut ctx, stale);
+    let tenant = ctx.heap.native(holding("second"));
+    assert_eq!(
+        tenant, stale,
+        "the dead native object's block was not reused"
+    );
+    assert_eq!(&*held_by(tenant), "second");
+    release_object(&raw mut ctx, tenant);
     let payload = unsafe { word_at(stale as *mut Obj, 1) };
     assert_eq!(
         payload,
         poison::word(),
-        "the dead bridge's payload was not poisoned"
+        "the dead native object's payload was not poisoned"
     );
-    bridged_value(stale);
+    held_by(stale);
 }
 
 /// A block another heap gave out goes back to it, not to the heap of the entry running.
@@ -207,28 +241,29 @@ fn a_block_dying_under_another_heap_goes_back_to_its_own() {
 }
 
 /// A branch's blocks are the parent's once it adopts the branch's heap, and the parent keeps
-/// bumping where it was.
+/// bumping where it was; the branch's native objects join the parent's table after its own.
 #[test]
-fn an_adopted_heap_keeps_its_blocks_and_its_bridges() {
-    let mut parent = Heap::new();
-    block(&mut parent, 8);
+fn an_adopted_heap_keeps_its_blocks_and_its_native_objects() {
+    let mut ctx = context();
+    block(&mut ctx.heap, 8);
+    let own = ctx.heap.native(holding("the parent's"));
     let mut branch = Heap::new();
     block(&mut branch, 24);
-    let float = branch.bridge(Value::Float(2.5));
-    let (mine, theirs) = (parent.live(), branch.live());
-    parent.adopt_heap(branch);
-    block(&mut parent, 8);
+    let adopted = branch.native(holding("the branch's"));
+    let (mine, theirs) = (ctx.heap.live(), branch.live());
+    ctx.heap.adopt_heap(branch);
+    block(&mut ctx.heap, 8);
     assert_eq!(
-        parent.live(),
+        ctx.heap.live(),
         mine + theirs + 1,
         "the branch's blocks are the parent's"
     );
-    assert_eq!(bridged_value(float), Value::Float(2.5));
-    enter(&mut parent);
-    release_handle(float);
-    leave();
-    assert_eq!(parent.bridges(), 0);
-    parent.end();
+    assert_eq!(ctx.heap.natives(), 2);
+    assert_eq!(&*held_by(adopted), "the branch's");
+    release_object(&raw mut ctx, adopted);
+    assert_eq!(ctx.heap.natives(), 1);
+    assert_eq!(&*held_by(own), "the parent's");
+    ctx.heap.end();
 }
 
 #[test]

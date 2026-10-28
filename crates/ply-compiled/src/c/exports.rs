@@ -15,17 +15,6 @@ pub struct HelperShape {
     pub answers: bool,
 }
 
-pub fn runtime_helpers() -> Vec<HelperShape> {
-    helpers()
-        .iter()
-        .map(|h| HelperShape {
-            name: h.name.to_string(),
-            args: h.args(),
-            answers: h.answers(),
-        })
-        .collect()
-}
-
 /// A digest of the runtime's whole helper table, for cache keys (stricter than serving needs).
 pub fn helpers_digest() -> String {
     let mut h = blake3::Hasher::new();

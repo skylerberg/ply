@@ -1,7 +1,5 @@
 //! Seeds, the ids of regions, tasks and channels, and what a region reads of a perform it answers.
 
-use crate::value::Value;
-use crate::{Diagnostic, Span};
 use std::fmt;
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
@@ -53,19 +51,6 @@ impl fmt::Display for ChanId {
 
 /// Default scheduling steps per interleaving before the region is [`crate::codes::DEADLOCK`].
 pub const DEFAULT_STEPS: u32 = 100_000;
-
-/// The nanoseconds an `Instant` or a `Duration` holds.
-pub fn nanos_of(value: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
-    match value {
-        Value::Ctor { args, .. } if args.len() == 1 => args[0].as_int(span, what),
-        other => Err(crate::value::type_error(
-            span,
-            what,
-            "an `Instant` or a `Duration`",
-            other,
-        )),
-    }
-}
 
 /// The operations of `task`, which a region's scheduler answers.
 pub const TASK_OPS: &[&str] = &[

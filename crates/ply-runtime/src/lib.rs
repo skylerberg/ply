@@ -27,18 +27,6 @@ pub extern "C" fn ply_runtime_described() -> *const c_char {
         .as_ptr()
 }
 
-/// The runtime this library is, as JSON, which a released `ply`'s bootstrap reads.
-#[unsafe(no_mangle)]
-pub extern "C" fn ply_runtime_describe() -> *const c_char {
-    static DESCRIBED: std::sync::OnceLock<std::ffi::CString> = std::sync::OnceLock::new();
-    DESCRIBED
-        .get_or_init(|| {
-            std::ffi::CString::new(ply_privileged::shipped::runtime_json())
-                .expect("a description holds no NUL")
-        })
-        .as_ptr()
-}
-
 /// Runs the linked program, whose unit lays `unit` out, and answers its exit code. The command
 /// line is read from the process, as Rust's own `main` reads it.
 ///
@@ -67,7 +55,7 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
         eprintln!("ply: {why}");
         return 2;
     }
-    let program = match ply_launcher::linked_program(env!("CARGO_PKG_VERSION")) {
+    let program = match ply_launcher::linked_program() {
         Ok(program) => program,
         Err(diagnostic) => {
             eprintln!("{diagnostic}");
@@ -84,9 +72,7 @@ unsafe fn run(unit: *const Descriptor) -> c_int {
         }
     };
     let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    // Every command family's ops are lent unconfigured to the program, which is this binary's own;
-    // the program configures what it drives.
-    let launched = ply_launcher::run(program, &root, argv, ply_privileged::policy::all(), count);
+    let launched = ply_launcher::run(program, &root, argv, count);
     for warning in launched.warnings {
         eprintln!("{warning}");
     }

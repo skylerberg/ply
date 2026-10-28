@@ -113,6 +113,8 @@ fn refused_of(exports: &Exports) -> Vec<Refused> {
 
 /// A loaded object, what it lays out and what it says, made into an enterable `Native`: each root's
 /// sites are placed by its index among the roots (`crate::entry::site_span`).
+// `Tables` holds a `Heap`, whose raw block pointers are neither `Send` nor `Sync`.
+#[allow(clippy::arc_with_non_send_sync)]
 fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<Native> {
     let helpers = exports.bound()?;
     let Exports {

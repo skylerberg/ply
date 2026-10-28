@@ -354,7 +354,8 @@ From loosest to tightest binding. All binary operators are left-associative.
   width is 64 bits. They never fail.
   - Each is a builtin call: `a +% b` is `wrap_add(a, b)`, with the same hash. The others are
     `wrap_sub`, `wrap_mul`, `saturating_add`, `saturating_sub` and `saturating_mul`.
-  - The operands must be one built-in integer type known at the call site. A type parameter, even
+  - The operands must be one built-in integer type known at the call site, or, where the builtin is
+    named as a value, the type it is used at. A type parameter, even
     one constrained by `integer(a)`, is `E0210`; any other type is `E0201`; a type with its own
     `numeric` is `E0223`.
   - Because `%` and `|` directly after `+`, `-` or `*` form one of these operators, write a space
@@ -651,8 +652,8 @@ raised and where. One that exceeds the budget, or whose value encodes to more th
 hash, which covers its body, everything it reaches and every file it embeds, so it is evaluated
 again only after one of those changes.
 
-A call of a `const fn` reads the stored value and does not run the body: `metered` (§8.1) counts no
-steps or allocations for it. A program built without stored values, such as a mutant (§8.5) or a
+A call of a `const fn` reads the stored value and does not run the body: `std.pace`'s `spent`
+(§8.1) counts no steps or allocations for it. A program built without stored values, such as a mutant (§8.5) or a
 bisection step (§8.4), evaluates the body once per run instead. The result is the same either way,
 since the body is pure.
 
@@ -1090,8 +1091,7 @@ public key, sealing or opening a message and key agreement (`std.crypto`). The r
 signature, a public key) are not secret, since each is one-way in the key.
 
 A secret cannot be shown, encoded, ordered, hashed, matched on or drawn by a `forall`. It can reach
-a host operation only if that operation's registration allows it (`E0439`), and a native function
-only through a parameter declared `Secret` (§12). The functions that accept one are:
+a native function only through a parameter declared `Secret` (§12). The functions that accept one are:
 
 - `std.password`'s hashing natives, which return a one-way hash;
 - `std.fs`'s `write_secret`, which writes to a file only its owner can read;
@@ -2348,16 +2348,22 @@ referenced or given arguments.
   (such as a comparison missing its `assert`) is `E0201`.
 - `assert(cond)`, `assert(cond, Some("why"))` and `assert_eq(actual, expected)` fail with `E0501`.
   `assert_eq` reports both values and their first difference. Any other failure is `E0502`.
+- A test that passes but leaves one of its own objects alive once it ends fails with `E0505`. This
+  is checked after its tasks finish and its bodies release what they held. Every value is released
+  once nothing holds it, so an object left alive is a leak, and a defect in Ply. What the build
+  stored, a cached constant's stored copy, and what a scheduler holds for itself are not the test's.
 
-**Measuring cost.** `metered(f)` returns `f()` together with what it cost, counted by the runtime
-rather than by the clock, so the numbers are the same on every machine:
+**Measuring cost.** `std.pace`'s `spent(f)` returns `f()` together with what it cost, counted by
+the runtime rather than by the clock, so the numbers are the same on every machine:
 
-- `steps`: the calls it made, counted as `--steps` counts them;
+- `steps`: the calls it made, `f`'s own included, counted as `--steps` counts them;
 - `allocations`: the objects it created;
-- `bytes`: the memory those took (an update in place costs none; a copy does);
-- `live`: how many more objects are alive after it returns, so a value above zero for an `f` that
-  returns a number means a leak;
-- `performs`: each atom it performed and how many times, ordered by the atom's name.
+- `bytes`: the memory those took (an update in place costs none; a copy does).
+
+`spent` reads these through the effect `pace::meter`. Its real handler (§6.10) serves only a run of
+`ply test`: what a computation costs is the compiler's choice, so no program's result may depend on
+it, and any other run fails at its first reading with `E0424`. The readings themselves are not part
+of what `spent` returns. To count what a test performs, handle the effect in the test.
 
 A cached constant costs what computing it costs, whether or not an earlier call computed it, so a
 cost is the same however often it is read, and the same in both build profiles (§8.6). A `const fn`
@@ -2366,13 +2372,15 @@ and under `simulate` also `clock`'s, `random`'s and `sim`'s) cost the program no
 scheduler's own work counts no steps, objects or bytes, and no `--steps` budget limits it.
 
 ```ply
+import std.pace (spent)
+
 type Chain = | Link(Int, Chain) | End
 
 fn chain(n: Int) -> Chain = if n <= 0 { End } else { Link(n, chain(n - 1)) }
 
 test "ten more levels cost ten more calls and ten more objects" {
-  let small = metered(|| chain(10));
-  let large = metered(|| chain(20));
+  let small = spent(|| chain(10));
+  let large = spent(|| chain(20));
   assert_eq(large.steps - small.steps, 10);
   assert_eq(large.allocations - small.allocations, 10)
 }
@@ -2999,8 +3007,8 @@ proves by running:
   what its body takes: `List::at`, `List::push` and `List::set` take at most a constant number,
   since a list's internal tree is never deeper than an `Int` has bits, and a `Map` function on one
   key takes the steps of one walk down the map's tree.
-- `Map::fold`, `iterate`, `Map::update`, `Bytes::position` and `metered` call a literal lambda or
-  named definition as many times as an argument's size allows. `List::map`, `List::filter` and
+- `Map::fold`, `iterate`, `Map::update` and `Bytes::position` call a literal lambda or named
+  definition as many times as an argument's size allows. `List::map`, `List::filter` and
   `List::fold` cost what they state, `cost xs.len() * k`: one step per element plus each call of
   the function. What `map` and `filter` return is no longer than their input. A raise ends the call.
 - A call of a definition costs its steps at its arguments' sizes; a call of another package's
@@ -3073,8 +3081,8 @@ nothing and are last holds only what its last call holds, whatever it descends o
 which a call back passes a value held elsewhere is treated as held elsewhere on every call. A call of
 another package's definition holds its first `space` bound, but only when each argument that is not
 a number or function is held alone. `List::map`, `List::filter` and `List::fold`, which state no
-bound, hold what their function holds once per element, as `Map::fold`, `iterate`, `Map::update`,
-`Bytes::position` and `metered` do per call, and `map` and `filter` also hold a list as long as their
+bound, hold what their function holds once per element, as `Map::fold`, `iterate`, `Map::update`
+and `Bytes::position` do per call, and `map` and `filter` also hold a list as long as their
 input. A `space` clause on a definition that performs anything other than a raise is `E0463`.
 Anything else leaves the bound `unproved` (`E0474`), stopped at `unbounded` with the reason.
 
@@ -3302,8 +3310,9 @@ Everything else is open by default.
 
 **Real handlers.** An effect whose module declares a real handler (§6.10) never reaches the host
 boundary directly: every root whose row names it runs under that handler, whatever the flags. The
-operations of `std.os`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`, `std.net`,
-`std.udp`, `std.sqlite`, `std.term`, `std.signal` and `std.trace` work this way. A native function
+operations of `std.os`, `std.env`, `std.certgen`, `std.config`, `std.password`'s `kdf`, `std.dns`,
+`std.net`, `std.udp`, `std.sqlite`, `std.term`, `std.signal`, `std.trace`, `std.time`,
+`std.random`'s `entropy`, `std.process` and `std.fs` work this way. A native function
 such a handler calls refuses to run inside a `simulate` region, and in a test the search reruns, as a
 host operation does (`E0425`). A native that would block the program's thread, such as hashing, hands
 the work to the runtime's own threads (as many at once as the machine has cores, the rest queued),
@@ -3317,7 +3326,8 @@ first in, first out. A task that sleeps or waits on the host waits while the oth
 a task, such as a `parallel` branch, blocks its thread. A raise no clause in a task handles fails the
 run. A `simulate` inside a task runs as anywhere else (§9).
 
-Outside a `simulate` region, the runtime also handles `clock`. Tasks run in turn on the thread that
+Outside a `simulate` region, `clock` is handled by its real handler,
+`std.internal.schedule.clocked`, which every root whose row names it runs under. Tasks run in turn on the thread that
 spawned them, and one that waits (on a join, a channel, a host operation or a sleep) is set aside
 while the others run. `clock.now` reads a monotonic clock, in nanoseconds since the run began, and
 `clock.sleep` waits until a deadline on it. A cancel stops a sleep, as in a region (§9), so a
@@ -3326,6 +3336,8 @@ deadline one task sets for another fires while the rest of the program keeps wor
 
 **What is open by default.**
 
+- The environment: `std.env` reads the process's variables and working directory, which a test
+  sets with `env::on`.
 - Configuration: `config.get` and `config.secret` read from `--set`, `--config`, the environment
   and the schema's defaults, under both `ply run` and `ply test`. `config` is `nondet`, so a test that
   reads it must be a `test/nondet` (§8.3).
@@ -3364,11 +3376,6 @@ line. An effect with a real handler (§6.10) is listed under that handler's name
 unless the effect is `nondet`; an operation is `at-most-once` when it is a `write`; it blocks when
 the handler's clause waits on the runtime's threads; and it may receive a `Secret` when an argument's
 type holds one.
-
-A host registration for an effect the program does not declare, or for a resource it never uses, is
-`E0421`; two for one atom is `E0422`; and a determinism mismatch is `E0423`. A handler for an
-operation the program's own declaration of the effect lacks does nothing: the program was checked
-against its declaration, so it never performs that operation.
 
 | flag | meaning |
 | --- | --- |

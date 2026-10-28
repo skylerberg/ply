@@ -4,8 +4,8 @@
 
 use crate::bare::{context_of, helper};
 use ply_compiled::c::builtin_helper_name;
-use ply_compiled::emitted::{Handed, PlyFnDesc, PlyType};
-use ply_compiled::heap::{IMMORTAL, Obj, Word};
+use ply_compiled::emitted::PlyType;
+use ply_compiled::heap::Word;
 use ply_compiled::rt::{Ctx, FAILED_PENDING};
 use ply_core::{Diagnostic, codes};
 
@@ -111,64 +111,19 @@ static STRING_T: PlyType = PlyType {
     lift: read_text,
 };
 
-unsafe extern "C" fn never_called(_ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
-    0
-}
+type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
 
-unsafe extern "C" fn stays(_ctx: *mut Ctx, _w: Word) -> Word {
-    0
-}
-
-unsafe extern "C" fn released(_ctx: *mut Ctx, _f: Handed) -> Word {
-    0
-}
-
-static CLAUSE: PlyFnDesc = PlyFnDesc {
-    uniform: never_called,
-    typed: None,
-    convention: 0,
-    release: released,
-    share: stays,
-    keep: stays,
-};
-
-/// A static closure over nothing: an immortal count, then the descriptor's address.
-#[repr(C)]
-struct Static {
-    h: Obj,
-    desc: &'static PlyFnDesc,
-}
-
-static CLOSURE: Static = Static {
-    h: Obj {
-        rc: IMMORTAL,
-        made_by_scheduler: false,
-    },
-    desc: &CLAUSE,
-};
-
-/// How the context failed once `refuse` ran under a `handle` with an `abort.raise` clause.
+/// How the context failed once `refuse` ran, a raise it left pending taken as code holding a clause
+/// for `abort.raise` takes it.
 fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
     ctx.begin(1_000);
     let c: *mut Ctx = &mut ctx;
-    let clause = [
-        0,
-        -1,
-        1,
-        &raw const CLOSURE as Word,
-        3,
-        &raw const STRING_T as Word,
-    ];
-    let install: unsafe extern "C" fn(*mut Ctx, *const Word, Word, Word) -> Word =
-        helper("rt_handle_install");
-    let land: unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word = helper("rt_handle_land");
     let failed = unsafe {
-        let depth = install(c, clause.as_ptr(), 1, 0);
         refuse(c);
         let failed = (*c).failed;
-        land(c, depth, 0);
         if failed == FAILED_PENDING {
+            helper::<Pending>("rt_pending_raised")(c, &STRING_T, 0);
             assert_eq!((*c).failed, 0, "the clause answered the raise");
         }
         failed
@@ -186,7 +141,7 @@ fn a_refusal_is_a_raise_where_its_builtin_raises_and_fails_the_run_where_it_fail
             helper::<Refused>(&builtin_helper_name("?refused"))(c, what, a, b, 0)
         })
     };
-    // A raise is left pending for the code around the builtin, which the frame's landing takes.
+    // A raise is left pending for the code around the builtin, which a clause for it takes.
     assert_eq!(numbers(4, 9, 2), FAILED_PENDING, "`Array::get` raises");
     assert_eq!(numbers(8, 9, 2), FAILED_PENDING, "`Bytes::at` raises");
     assert_eq!(numbers(17, 0, 20_000_000), 1, "`range` fails the run");

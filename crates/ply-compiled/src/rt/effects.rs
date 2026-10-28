@@ -1,80 +1,11 @@
-//! Handlers, `perform` and `parallel`.
+//! The runtime's evidence objects, raises left pending, detached bodies' entries and `parallel`.
 
 use super::*;
-
-/// Installs a handler and answers its depth: the clause closures and `ret`, the `return` clause or
-/// 0 where it has none, are taken until it pops.
-pub unsafe extern "C" fn rt_handle_install(
-    ctx: *mut Ctx,
-    clauses: *const Word,
-    n: I64,
-    ret: Handed,
-) -> I64 {
-    I64(installed(unsafe { &mut *ctx }, clauses, n, ret).0)
-}
-
-/// [`rt_handle_install`] for a `handle` whose evidence objects reach its frame by its handler,
-/// which this writes to `cell`.
-pub unsafe extern "C" fn rt_handle_install_at(
-    ctx: *mut Ctx,
-    clauses: *const Word,
-    n: I64,
-    ret: Handed,
-    cell: Out,
-) -> I64 {
-    let (depth, handler) = installed(unsafe { &mut *ctx }, clauses, n, ret);
-    unsafe { cell.0.write(handler as i64) };
-    I64(depth)
-}
-
-/// A handler installed on the running stack: its depth there and its handler.
-fn installed(c: &mut Ctx, clauses: *const Word, n: I64, ret: Handed) -> (i64, u64) {
-    let clauses = clauses_of(c, clauses, n.0);
-    let fuel = c.fuel;
-    let handler = c.next_handler();
-    let frames = c.frames();
-    frames.push(HandlerFrame {
-        clauses,
-        ret: ret.word(),
-        detached: None,
-        fuel,
-        handler,
-        vars: None,
-        inherited: false,
-    });
-    ((frames.len() - 1) as i64, handler)
-}
-
-/// A `handle` site's clause table: per clause the effect, resource (negative for none) and op
-/// as field-table indices, the closure, its `resumes`, and the `String` type where the clause
-/// binds its label or answers `abort.raise`, 0 otherwise.
-pub(super) fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
-    let words = args_of(clauses, n * 6);
-    let name = |i: i64| c.tables.fields[i as usize].clone();
-    words
-        .chunks(6)
-        .map(|w| {
-            let (effect, op) = (name(w[0]), name(w[2]));
-            let raise = is_abort(effect.as_str(), op.as_str());
-            let string = (w[5] != 0).then(|| unsafe { &*(w[5] as *const PlyType) });
-            FrameClause {
-                resource: (w[1] >= 0).then(|| name(w[1])),
-                closure: w[3],
-                resumes: w[4] as u8,
-                label: string.filter(|_| !raise),
-                string,
-                effect,
-                op,
-            }
-        })
-        .collect()
-}
 
 /// The label a clause written `[*t]` reads, lifted through the `String` type its `handle` site
 /// handed; 0 with the context failed where it does not lift.
 pub(crate) fn label_word(ctx: *mut Ctx, string: &'static PlyType, label: &Symbol) -> Word {
-    let label = Value::Str(Arc::from(label.as_str()));
-    lifted(ctx, &label, string).map_or(0, Handed::word)
+    string_lifted(ctx, label.as_str(), string).map_or(0, Handed::word)
 }
 
 /// The label the field-table entry `resource` names, lifted through `string`, the type of `String`:
@@ -94,39 +25,6 @@ pub unsafe extern "C" fn rt_label_string(
         return Handed::of(c.fail(error("a clause on every label was performed at no label")));
     };
     Handed::of(label_word(ctx, unsafe { &*string }, &label))
-}
-
-/// A `handle` whose clause resumes off the tail: `body`, a nullary closure, runs on its own stack.
-/// The clauses, `return` clause (0 for none) and body are taken.
-pub unsafe extern "C" fn rt_handle_install_detached(
-    ctx: *mut Ctx,
-    clauses: *const Word,
-    n: I64,
-    ret: Handed,
-    body: Block,
-) -> Handed {
-    let c = unsafe { &mut *ctx };
-    let clauses = clauses_of(c, clauses, n.0);
-    let body = unsafe { std::mem::transmute::<Block, Word>(body) };
-    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, None) })
-}
-
-/// [`rt_handle_install_detached`] for a body, clauses and `return` clause that hold the words of
-/// `forwards`, a block laid out as [`crate::detached::Forwards`] says, which this takes: the body
-/// keeps it as long as anything can resume it.
-pub unsafe extern "C" fn rt_handle_forwarded(
-    ctx: *mut Ctx,
-    clauses: *const Word,
-    n: I64,
-    ret: Handed,
-    body: Block,
-    forwards: Block,
-) -> Handed {
-    let c = unsafe { &mut *ctx };
-    let clauses = clauses_of(c, clauses, n.0);
-    let body = unsafe { std::mem::transmute::<Block, Word>(body) };
-    let forwards = unsafe { std::mem::transmute::<Block, Word>(forwards) };
-    Handed::of(unsafe { crate::detached::open(ctx, clauses, ret.word(), body, Some(forwards)) })
 }
 
 /// The body of a `handle` whose objects enter its clauses, `body` a nullary closure, run on a stack
@@ -163,144 +61,6 @@ pub unsafe extern "C" fn rt_detached_stop(
     Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0, again.0 != 0) })
 }
 
-/// The `k` a clause is handed where it resumes on the tail: one immortal block holding nothing but
-/// its descriptor, since a tail resumption only records its value.
-#[repr(C)]
-struct ResumeBlock {
-    header: heap::Obj,
-    desc: &'static PlyFnDesc,
-}
-
-static RESUME_DESC: PlyFnDesc = PlyFnDesc {
-    uniform: resume_uniform,
-    typed: None,
-    convention: 0,
-    release: never_released,
-    share: resumes_here_only,
-    keep: resumes_here_only,
-};
-
-static RESUME: ResumeBlock = ResumeBlock {
-    header: heap::Obj {
-        rc: heap::IMMORTAL,
-        made_by_scheduler: false,
-    },
-    desc: &RESUME_DESC,
-};
-
-unsafe extern "C" fn resume_uniform(ctx: *mut Ctx, _k: Word, args: *const Word) -> Word {
-    let v = unsafe { *args };
-    let c = unsafe { &mut *ctx };
-    // A tail resumption reads no words; those its caller set are no other closure's.
-    c.entering_desc = 0;
-    c.entering_words = 0;
-    c.resumed = Some(v);
-    v
-}
-
-unsafe extern "C" fn never_released(_ctx: *mut Ctx, _k: Handed) -> Word {
-    unreachable!("an immortal block is never released")
-}
-
-/// A resumption is its perform's: it crosses to no other thread and outlives no entry.
-unsafe extern "C" fn resumes_here_only(_ctx: *mut Ctx, _k: Word) -> Word {
-    0
-}
-
-/// The `k` a tail-resuming clause is handed.
-fn resume_token() -> Word {
-    &raw const RESUME as Word
-}
-
-pub(super) fn hide_above(
-    c: &mut Ctx,
-    stack: usize,
-    depth: usize,
-) -> Vec<(usize, Vec<HandlerFrame>)> {
-    let mut hidden = Vec::new();
-    let mut s = c.current;
-    while s != stack {
-        hidden.push((s, std::mem::take(&mut c.stacks[s].list)));
-        s = c.stacks[s]
-            .parent
-            .expect("the handler's stack is in the chain");
-    }
-    hidden.push((stack, c.stacks[stack].list.split_off(depth)));
-    hidden
-}
-
-pub(super) fn restore_hidden(c: &mut Ctx, hidden: Vec<(usize, Vec<HandlerFrame>)>) {
-    for (s, frames) in hidden.into_iter().rev() {
-        c.stacks[s].list.extend(frames);
-    }
-}
-
-/// `perform` of the operation `op` describes, at the perform's types, `args` holding a word form
-/// for each of its parameters, which this takes. A clause, a region's scheduler or a detached body
-/// takes the words as they are; the host is handed what they lower to through the parameters'
-/// types, and its answer is lifted through the operation's. A raise's payload is held carried,
-/// through the same types.
-pub unsafe extern "C" fn rt_dispatch(
-    ctx: *mut Ctx,
-    op: *const PlyOp,
-    resource: I64,
-    mode: I64,
-    args: *const Handed,
-) -> Handed {
-    unsafe { dispatched(ctx, None, op, resource, mode, args) }
-}
-
-/// [`rt_dispatch`] reaching the frame of handler `handler` alone: what the evidence object of a
-/// `handle` the runtime's frames hold hands it, so the perform reaches that `handle` whatever frames
-/// stand nearer it.
-pub unsafe extern "C" fn rt_dispatch_at(
-    ctx: *mut Ctx,
-    handler: I64,
-    op: *const PlyOp,
-    resource: I64,
-    mode: I64,
-    args: *const Handed,
-) -> Handed {
-    unsafe { dispatched(ctx, Some(handler.0 as u64), op, resource, mode, args) }
-}
-
-/// A perform the frames answer, by the nearest that answers it or by the one of handler `target`.
-unsafe fn dispatched(
-    ctx: *mut Ctx,
-    target: Option<u64>,
-    op: *const PlyOp,
-    resource: I64,
-    mode: I64,
-    args: *const Handed,
-) -> Handed {
-    let c = unsafe { &mut *ctx };
-    let described = unsafe { &*op };
-    let (effect, name) = named_op(c, described);
-    let args = args_of(args.cast(), described.params_len);
-    if mode.0 == MODE_RAISE || is_abort(effect.as_str(), name.as_str()) {
-        let raised = raised_of(args, described);
-        return Handed::of(raise_from_perform(c, &effect, &name, raised, target));
-    }
-    let performing = Performing {
-        effect,
-        op: name,
-        resource: resource.0,
-        mode: mode.0,
-        target,
-    };
-    Handed::of(unsafe { performed(ctx, performing, args, described) })
-}
-
-/// What [`performed`] searches the frames for: an operation on a resource (negative for none) in a
-/// mode, answered by the nearest frame or, with a `target`, by that handler's frame alone.
-struct Performing {
-    effect: Symbol,
-    op: Symbol,
-    resource: i64,
-    mode: i64,
-    target: Option<u64>,
-}
-
 /// An operation's entry in an evidence object, as compiled code calls it: the slot's environment,
 /// the operation's descriptor, its mode, the resource (negative for none) and its arguments' words.
 pub type OpEntry =
@@ -323,8 +83,8 @@ pub struct Slot {
     pub env: Word,
 }
 
-/// The frame bridge, which hands every perform to [`rt_dispatch`], which searches the frames: what
-/// code that holds no word for an effect performs it through.
+/// The bridge: what code that holds no word for an effect performs it through, answered as
+/// [`HOSTED`] answers.
 pub static BRIDGE: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
@@ -333,8 +93,8 @@ pub static BRIDGE: RuntimeObject = RuntimeObject {
     },
 };
 
-/// What an entry hands its root for an effect the Rust binding serves: an operation goes to the
-/// binding, no frame searched, and a raise is left unanswered.
+/// What a release's entry hands its root for an effect it took a Rust binding to serve: an
+/// operation is unhandled, since no binding serves one, and a raise is left unanswered.
 pub static HOSTED: RuntimeObject = RuntimeObject {
     flags: 1,
     slot: Slot {
@@ -366,7 +126,7 @@ unsafe extern "C" fn bridged(
     resource: I64,
     args: *const Handed,
 ) -> Handed {
-    unsafe { rt_dispatch(ctx, op, resource, mode, args) }
+    unsafe { at_entry(ctx, op, mode, resource, args, true) }
 }
 
 unsafe extern "C" fn hosted(
@@ -392,7 +152,8 @@ unsafe extern "C" fn unserved(
 }
 
 /// A perform the object its entry hands answers, since nothing between answers it: a raise left
-/// unanswered, and any other operation handed to the Rust binding where `hosted`, else refused.
+/// unanswered, and any other operation refused, as unhandled where the object is the bridge or
+/// [`HOSTED`] and as unserved otherwise.
 unsafe fn at_entry(
     ctx: *mut Ctx,
     op: *const PlyOp,
@@ -409,26 +170,20 @@ unsafe fn at_entry(
         return Handed::of(unanswered(c, &effect, &name, raised_of(args, described)));
     }
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
-    let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
-    if !hosted {
-        let_go(ctx, args, described);
-        let c = unsafe { &mut *ctx };
-        let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
-        let d = ply_core::host::err_unserved(c.site(), &operation);
-        return Handed::of(c.fail(d));
+    if hosted {
+        let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
+        recorded(c, &effect, &name, resource.as_ref(), mode);
     }
-    recorded(c, &effect, &name, resource.as_ref(), mode);
-    Handed::of(unsafe {
-        to_host(
-            ctx,
-            described,
-            &effect,
-            &name,
-            resource.as_ref(),
-            mode,
-            args,
-        )
-    })
+    let_go(ctx, args, described);
+    let c = unsafe { &mut *ctx };
+    let site = c.site();
+    let d = if hosted {
+        ply_core::handler::err_unhandled(site, &effect, &name, resource.as_ref())
+    } else {
+        let operation = ply_core::host::operation_label(&effect, &name, resource.as_ref());
+        ply_core::host::err_unserved(site, &operation)
+    };
+    Handed::of(c.fail(d))
 }
 
 /// The effect and the operation `described` describes, by their program-wide names.
@@ -476,133 +231,14 @@ fn recorded(c: &mut Ctx, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>
 }
 
 /// Notes a perform of the operation `op` describes, on the field-table entry `resource` (negative
-/// for none) in `mode`, that a clause answered in place, as [`rt_dispatch`] notes every perform it
-/// is handed. Compiled code calls it only while [`Ctx::recording`] is armed.
+/// for none) in `mode`, that a clause answered, as the entry's objects note each perform they are
+/// handed. Compiled code calls it only while [`Ctx::recording`] is armed.
 pub unsafe extern "C" fn rt_performed(ctx: *mut Ctx, op: *const PlyOp, resource: I64, mode: I64) {
     let c = unsafe { &mut *ctx };
     let (effect, name) = named_op(c, unsafe { &*op });
     let resource = (resource.0 >= 0).then(|| c.tables.fields[resource.0 as usize].clone());
     let mode = if mode.0 != 0 { Mode::Write } else { Mode::Read };
     recorded(c, &effect, &name, resource.as_ref(), mode);
-}
-
-/// [`rt_dispatch`] past a raise.
-unsafe fn performed(ctx: *mut Ctx, p: Performing, args: &[Word], described: &PlyOp) -> i64 {
-    let Performing {
-        effect,
-        op,
-        resource,
-        mode,
-        target,
-    } = p;
-    let c = unsafe { &mut *ctx };
-    let n = args.len() as i64;
-    let args = args.as_ptr();
-    let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
-    let mode = if mode != 0 { Mode::Write } else { Mode::Read };
-    recorded(c, &effect, &op, resource.as_ref(), mode);
-    let mut found = None;
-    let mut inherited_off_tail = false;
-    let mut stack = c.current;
-    'search: loop {
-        for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
-            if target.is_some_and(|t| t != f.handler) {
-                continue;
-            }
-            if let Some(cl) = f
-                .clauses
-                .iter()
-                .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
-            {
-                if cl.off_tail() {
-                    let Some(id) = f.detached else {
-                        inherited_off_tail = true;
-                        break 'search;
-                    };
-                    let (closure, again) = (cl.closure, cl.again());
-                    let mut bound: Vec<Word> = args_of(args, n).to_vec();
-                    if let (Some(string), Some(label)) = (cl.label, &resource) {
-                        bound.push(label_word(ctx, string, label));
-                    }
-                    // Moved in: a local owning memory across the switch is freed once per restore.
-                    return unsafe {
-                        crate::detached::stop(
-                            ctx,
-                            id,
-                            closure,
-                            bound,
-                            again,
-                            (effect, op, resource),
-                        )
-                    };
-                }
-                found = Some((stack, i, cl.closure, cl.resumes != 0, cl.label, f.inherited));
-                break 'search;
-            }
-        }
-        match c.stacks[stack].parent {
-            Some(p) => stack = p,
-            None => break,
-        }
-    }
-    if inherited_off_tail {
-        let site = c.site();
-        return c.fail(err_task_captures(&effect, &op, site));
-    }
-    let Some((stack, depth, closure, resumes, label, inherited)) = found else {
-        if target.is_some() {
-            return c.fail(err_handle_gone(&effect, &op));
-        }
-        return unsafe {
-            to_host(
-                ctx,
-                described,
-                &effect,
-                &op,
-                resource.as_ref(),
-                mode,
-                args_of(args, n),
-            )
-        };
-    };
-    let mut call_args: Vec<Word> = args_of(args, n).to_vec();
-    // A clause written `[*t]` reads the label its call site named, before the continuation does.
-    if let (Some(string), Some(label)) = (label, &resource) {
-        call_args.push(label_word(ctx, string, label));
-    }
-    // Where nothing on the task's stack lands for the frame, a clause that does not resume is refused.
-    let abandoning = (inherited && resumes).then(|| (effect.clone(), op.clone(), c.site()));
-    drop((effect, op, resource));
-    // The clause runs outside its handler: that frame and all above it are hidden until it returns.
-    let held = c.stacks[stack].list[depth].held();
-    let hidden = hide_above(c, stack, depth);
-    if resumes {
-        call_args.push(resume_token());
-        c.resumed = None;
-    }
-    let here = c.keep(Kept::Hidden(hidden));
-    let r = call_clause(ctx, closure, call_args, held);
-    let c = unsafe { &mut *ctx };
-    let Kept::Hidden(hidden) = c.kept_back(here) else {
-        unreachable!("a clause's call keeps the frames it hid");
-    };
-    restore_hidden(c, hidden);
-    if c.failed != 0 {
-        return 0;
-    }
-    if !resumes {
-        return r;
-    }
-    match (c.resumed.take(), abandoning) {
-        (Some(v), _) => v,
-        // What the clause answered is emitted code's, abandoned uncounted as an unwind's is.
-        (None, Some((effect, op, site))) => c.fail(err_task_abandoned(&effect, &op, site)),
-        (None, None) => {
-            c.unwind = Some((stack, depth, r));
-            c.failed = FAILED_UNWIND;
-            0
-        }
-    }
 }
 
 /// Refuses a clause leaving an instance another task opened, the operation `op` describes performed
@@ -672,96 +308,6 @@ fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
     )
 }
 
-/// A perform or raise sent to a `handle` whose frame is no longer installed where it was made: an
-/// evidence object outlived the `handle` it was laid out for.
-#[cold]
-#[inline(never)]
-fn err_handle_gone(effect: &Symbol, op: &Symbol) -> Diagnostic {
-    error(format!(
-        "`{effect}.{op}` reached for a `handle` that is no longer installed"
-    ))
-    .note("this is Ply's fault, not the program's")
-}
-
-/// The host's answer to an operation `described` describes, `args` its word forms, which this
-/// takes: each lowered through its parameter's type and let go through it, and the answer lifted
-/// through the operation's. A sleep by a task of the run's region waits there instead.
-unsafe fn to_host(
-    ctx: *mut Ctx,
-    described: &PlyOp,
-    effect: &Symbol,
-    op: &Symbol,
-    resource: Option<&Symbol>,
-    mode: Mode,
-    args: &[Word],
-) -> i64 {
-    if crate::host::production_scheduled(unsafe { &*ctx }, effect, op) {
-        return unsafe { crate::host::schedule(ctx, described, effect, op, resource, args) };
-    }
-    let values = lowered_values(ctx, args, described.params());
-    let_go(ctx, args, described);
-    let values = match values {
-        Ok(values) => values,
-        Err(why) => {
-            let operation = ply_core::host::operation_label(effect, op, resource);
-            let d = error(format!(
-                "an argument of `{operation}` does not lower: {why}"
-            ))
-            .note("this is Ply's fault, not the program's");
-            return unsafe { &mut *ctx }.fail(d);
-        }
-    };
-    let served = unsafe { crate::host::serve(ctx, effect, op, resource, mode, values) };
-    answered(ctx, served, described)
-}
-
-/// What a perform is answered: a value lifted through `described`'s answer, or 0 with the context
-/// failed.
-fn answered(ctx: *mut Ctx, served: Served, described: &PlyOp) -> i64 {
-    match served {
-        Served::Word(w) => w,
-        Served::Value(v) => lifted(ctx, &v, described.answer()).map_or(0, Handed::word),
-    }
-}
-
-/// What a raise carries, as values a diagnostic shows, lowered through their types.
-fn raised_values(c: &mut Ctx, args: &Raised) -> Vec<Result<Value, String>> {
-    let ctx: *mut Ctx = c;
-    args.0.iter().map(|v| v.lower(ctx)).collect()
-}
-
-/// A raise, which no clause answers where it is performed: the frame whose clause does is unwound
-/// to first, and with none in reach the entry fails. Takes the arguments.
-pub(super) fn raise_from_perform(
-    c: &mut Ctx,
-    effect: &Symbol,
-    op: &Symbol,
-    args: Raised,
-    target: Option<u64>,
-) -> i64 {
-    if c.failed != 0 {
-        args.release();
-        return 0;
-    }
-    let Some(at) = c.raise_handler(effect.as_str(), op.as_str(), target) else {
-        if target.is_some() {
-            args.release();
-            return c.fail(err_handle_gone(effect, op));
-        }
-        return unanswered(c, effect, op, args);
-    };
-    let d = if is_abort(effect.as_str(), op.as_str()) {
-        Diagnostic::error(
-            codes::RUNTIME_ERROR,
-            format!("panic: {}", raised_message(c, &args)),
-        )
-    } else {
-        Diagnostic::error(codes::RUNTIME_ERROR, format!("`{effect}.{op}` was raised"))
-    };
-    let d = d.primary(c.site(), "raised here");
-    c.bind_raise(at, args, d)
-}
-
 /// A raise no `handle` answers, left pending for the code around it, as [`Ctx::pend`] says, with
 /// what the entry fails with should nothing take it: `abort.raise` a panic of its message, any other
 /// raise naming the operation and what it carried. Takes the arguments.
@@ -777,11 +323,15 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
             .primary(c.site(), "raised here");
         return c.pend(d, message);
     }
-    // Only a raise no frame answers is shown what it carried: one a clause takes is not read.
-    let carried: Vec<Plain> = raised_values(c, &args)
-        .iter()
-        .map(|v| v.as_ref().map_or(Plain::Elided(0), Plain::shown))
-        .collect();
+    // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
+    let carried: Result<Vec<Vec<u8>>, String> = args.0.iter().map(|v| shown(c, v)).collect();
+    let carried = match carried {
+        Ok(carried) => carried,
+        Err(why) => {
+            args.release();
+            return c.fail(err_crossing(&why));
+        }
+    };
     let slots: Vec<String> = (0..carried.len()).map(ply_core::slot).collect();
     let with = if slots.is_empty() {
         String::new()
@@ -800,25 +350,31 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
 
 /// The message an `abort.raise` carries, empty where it does not lower to a string.
 fn raised_message(c: &mut Ctx, args: &Raised) -> String {
-    match raised_values(c, args).first() {
-        Some(Ok(Value::Str(s))) => s.to_string(),
-        _ => String::new(),
-    }
+    let text = |bytes: Vec<u8>| -> Option<String> {
+        let mut r = ply_core::codec::Reader::new(bytes).ok()?;
+        r.expect(ply_core::codec::tag::STR).ok()?;
+        let s = r.str().ok()?.to_string();
+        r.end().ok().map(|()| s)
+    };
+    args.0
+        .first()
+        .and_then(|v| shown(c, v).ok())
+        .and_then(text)
+        .unwrap_or_default()
 }
 
 /// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays
 /// it out, the entry no longer failed: for compiled code to raise it through the word that answers
-/// it. Where that word's slot is the frame bridge's or [`UNSERVED`]'s (`bridged` not 0), the raise
-/// goes on from here as the one it is, its diagnostic kept: to a frame that answers it, or pending
-/// again, and this answers 0 with the entry failed. 0 with the entry failed as it was where nothing
-/// is pending.
+/// it. Where that word's slot is [`BRIDGE`]'s or [`UNSERVED`]'s (`bridged` not 0), the raise
+/// stays pending as it is, its diagnostic kept, for the code around to take. 0 with the entry
+/// failed as it was where nothing is pending or the raise stays so.
 pub unsafe extern "C" fn rt_pending_raised(
     ctx: *mut Ctx,
     string: *const PlyType,
     bridged: I64,
 ) -> Handed {
     let c = unsafe { &mut *ctx };
-    if c.failed != FAILED_PENDING {
+    if c.failed != FAILED_PENDING || bridged.0 != 0 {
         return Handed::of(0);
     }
     let message = match c.pending.take() {
@@ -829,16 +385,8 @@ pub unsafe extern "C" fn rt_pending_raised(
         }
     };
     c.failed = 0;
-    let diagnostic = c.diagnostic.take();
-    if bridged.0 != 0 {
-        let d = diagnostic.unwrap_or_else(|| {
-            Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-        });
-        c.raise(d, message);
-        return Handed::of(0);
-    }
-    let message = Value::str(message);
-    lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
+    c.diagnostic = None;
+    string_lifted(ctx, &message, unsafe { &*string }).unwrap_or(Handed::of(0))
 }
 
 /// The words of the raise [`FAILED_PENDING`] stands for, where it is a raise of the effect and
@@ -871,130 +419,6 @@ pub unsafe extern "C" fn rt_pending_raised_at(ctx: *mut Ctx, effect: I64, op: I6
     Handed::of(c.pending_words.as_ptr() as Word)
 }
 
-/// Refuses a `simulate` an older emitter wrote as a call of the runtime, letting go of its body: a
-/// region is `std.internal.schedule`'s. A released `ply` refuses a runtime that lacks this helper.
-pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, body: Block, _answer: *const PlyType) -> Handed {
-    unsafe { body.let_go_function(ctx) };
-    let c = unsafe { &mut *ctx };
-    Handed::of(c.fail(Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        "a `simulate` was emitted as a call of the runtime, which runs no region",
-    )))
-}
-
-/// The `handle` at `depth` is over: pops its frames, catches an unwind to it, applies `return`.
-pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -> i64 {
-    let c = unsafe { &mut *ctx };
-    let depth = depth as usize;
-    let stack = c.current;
-    let mut popped = c.frames().split_off(depth);
-    let mine = if popped.is_empty() {
-        None
-    } else {
-        Some(popped.remove(0))
-    };
-    for f in popped {
-        drop_frame(f);
-    }
-    if let Some(f) = &mine {
-        f.land(c);
-    }
-    // A raise left pending that nothing inside the frame took is the frame's where a clause of it
-    // answers it.
-    if c.failed == FAILED_PENDING
-        && let Some(f) = &mine
-        && let Some(clause) =
-            (c.pending.as_ref()).and_then(|p| f.clauses.iter().position(|cl| p.answered_by(cl)))
-    {
-        let string = f.clauses[clause].string;
-        c.bind_pending((stack, depth, clause), string);
-    }
-    if c.failed == FAILED_ABORT
-        && let Some(a) = c.aborting.take_if(|a| a.stack == stack && a.depth == depth)
-    {
-        c.failed = 0;
-        let mut f = mine.expect("a raise is bound for a frame still installed");
-        let clause = f.take_clause(a.clause);
-        let held = f.held();
-        drop_frame(f);
-        // The clause runs outside its `handle`, which is over: its value is the `handle`'s.
-        let r = call_clause(ctx, clause.closure, a.args.handed(), held);
-        clause.release();
-        return r;
-    }
-    if c.failed == FAILED_UNWIND
-        && let Some((target_stack, target, v)) = c.unwind.take()
-    {
-        if target_stack == stack && target == depth {
-            c.failed = 0;
-            if let Some(f) = mine {
-                drop_frame(f);
-            }
-            return v;
-        }
-        c.unwind = Some((target_stack, target, v));
-    }
-    if c.failed != 0 {
-        if let Some(f) = mine {
-            drop_frame(f);
-        }
-        return 0;
-    }
-    let Some(f) = mine else {
-        return value;
-    };
-    if f.ret == 0 {
-        drop_frame(f);
-        return value;
-    }
-    let (ret, held) = (f.ret, f.held());
-    let here = c.keep(Kept::Landing(f));
-    let r = Ctx::holding(ctx, held, || call_fun(ctx, ret, &[value]));
-    let c = unsafe { &mut *ctx };
-    c.kept_back(here).release();
-    r
-}
-
-/// Variable `i` of the `handle` whose body starts, given its first value `x` and `ty`, the type
-/// every value it holds has.
-pub unsafe extern "C" fn rt_handler_typed(ctx: *mut Ctx, i: I64, x: Handed, ty: *const PlyType) {
-    let c = unsafe { &mut *ctx };
-    let v = unsafe { Carried::new(x, ty) };
-    let current = c.current;
-    let Some(f) = c.stacks[current].list.last_mut() else {
-        v.release(ctx);
-        c.fail(no_handler_vars());
-        return;
-    };
-    f.vars
-        .get_or_insert_with(|| shared(HandlerVars(Vec::new())))
-        .borrow_mut()
-        .set(i.0 as usize, v);
-}
-
-/// Variable `i` of the handler whose clause runs, held once more for the caller.
-pub unsafe extern "C" fn rt_handler_get(ctx: *mut Ctx, i: I64) -> Handed {
-    let c = unsafe { &mut *ctx };
-    let Some((_, v)) = c.stacks[c.current].held.last() else {
-        c.fail(no_handler_vars());
-        return Handed::of(0);
-    };
-    Handed::of(v.borrow().get(i.0 as usize))
-}
-
-/// Variable `i` of the handler whose clause runs, given `x`; what it held is let go.
-pub unsafe extern "C" fn rt_handler_put(ctx: *mut Ctx, i: I64, x: Handed) {
-    let c = unsafe { &mut *ctx };
-    let Some((_, v)) = c.stacks[c.current].held.last() else {
-        c.fail(no_handler_vars());
-        return;
-    };
-    let put = v.borrow_mut().put(i.0 as usize, x);
-    if let Err(why) = put {
-        c.fail(error(why).note("this is Ply's fault, not the program's"));
-    }
-}
-
 /// One more holder of a shared block, for compiled code, which has no atomics of its own.
 pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
     heap::inc_shared(w);
@@ -1005,39 +429,19 @@ pub unsafe extern "C" fn rt_inc_shared(_ctx: *mut Ctx, w: i64) {
 /// failed or never ran leaves 0, and one that answered its answer, for emitted code to let go at
 /// its type.
 pub unsafe extern "C" fn rt_branches(ctx: *mut Ctx, slots: *const Handed, n: I64) {
-    let allowed = unsafe { &*ctx }.runs_branches_at_once(None);
+    let allowed = unsafe { &*ctx }.runs_branches_at_once();
     let slots = slots.cast::<Word>().cast_mut();
     unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed) }
 }
 
-/// [`rt_branches`] of a block whose site knows what its branches may perform: `reach` holds `count`
-/// pairs of field-table indices, an effect and its resource (negative for any).
+/// [`rt_branches`] as the release's emitter calls it, beside what the block's site says its
+/// branches may perform, in `count` pairs at `reach`, which nothing reads.
 pub unsafe extern "C" fn rt_branches_past(
     ctx: *mut Ctx,
     slots: *const Handed,
     n: I64,
-    reach: *const Word,
-    count: I64,
+    _reach: *const Word,
+    _count: I64,
 ) {
-    let allowed = unsafe { reaching(ctx, reach, count.0) };
-    let slots = slots.cast::<Word>().cast_mut();
-    unsafe { crate::parallel::run(ctx, slots, n.0 as usize, allowed) }
-}
-
-/// Whether a `parallel` block's branches may run at once, `reach` holding what they may perform as
-/// [`rt_branches_past`] takes it.
-unsafe fn reaching(ctx: *mut Ctx, reach: *const i64, count: i64) -> bool {
-    let reach: Vec<Reached> = {
-        let c = unsafe { &*ctx };
-        let name = |i: i64| c.tables.fields[i as usize].clone();
-        args_of(reach, count * 2)
-            .chunks(2)
-            .map(|w| Reached {
-                effect: name(w[0]),
-                resource: (w[1] >= 0).then(|| name(w[1])),
-            })
-            .collect()
-    };
-    // Decided and let go before a branch runs, which may stop a detached body on this stack.
-    unsafe { &*ctx }.runs_branches_at_once(Some(&reach))
+    unsafe { rt_branches(ctx, slots, n) }
 }

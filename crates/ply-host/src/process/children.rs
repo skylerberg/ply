@@ -1,8 +1,8 @@
 //! Children that run beside the program: started, fed, read, signalled and reaped by handle.
 
 use super::{MAX_CAPTURE_BYTES, OutputSink, Stream};
-use crate::pool::record;
-use ply_core::{Resource, Value};
+use crate::native::{int, parts};
+use ply_core::Resource;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Read, Write};
@@ -24,7 +24,8 @@ pub enum Ended {
     Signalled(i64),
 }
 
-/// A `std.process.Finished`: how a child ended and what it left in each stream.
+/// How a child ended and what it left in each stream.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Finished {
     pub ended: Ended,
     pub out: Vec<u8>,
@@ -32,22 +33,17 @@ pub struct Finished {
 }
 
 impl Finished {
-    pub(super) fn value(self) -> Value {
-        let ended = match self.ended {
-            Ended::Exited(code) => Value::ctor("std.process.Exited", vec![Value::Int(code)]),
-            Ended::Signalled(signal) => {
-                Value::ctor("std.process.Signalled", vec![Value::Int(signal)])
-            }
+    /// As parts: 0 for an exit or 1 for a signal, the code or the signal, then each stream.
+    pub fn flat(self) -> Vec<u8> {
+        let (kind, n) = match self.ended {
+            Ended::Exited(code) => (0, code),
+            Ended::Signalled(signal) => (1, signal),
         };
-        record([
-            ("ended", ended),
-            ("err", Value::bytes(self.err)),
-            ("out", Value::bytes(self.out)),
-        ])
+        parts(&[&int(kind)[..], &int(n)[..], &self.out[..], &self.err[..]])
     }
 }
 
-/// A `std.process.Heard`: what `process.output_line` answers.
+/// What a read of a child's `Lines` streams heard.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Heard {
     Said(String),
@@ -56,26 +52,44 @@ pub enum Heard {
 }
 
 impl Heard {
-    pub(super) fn value(self) -> Value {
+    /// Byte 0 and the line, byte 1 for nothing before the timeout, or byte 2 for the end.
+    pub fn flat(self) -> Vec<u8> {
         match self {
-            Heard::Said(line) => Value::ctor("std.process.Said", vec![Value::str(line)]),
-            Heard::Quiet => Value::ctor("std.process.Quiet", Vec::new()),
-            Heard::Closed => Value::ctor("std.process.Closed", Vec::new()),
+            Heard::Said(line) => [&[0u8][..], line.as_bytes()].concat(),
+            Heard::Quiet => vec![1],
+            Heard::Closed => vec![2],
         }
     }
 }
 
-/// `std.process.Output`: where one of a child's output streams goes.
+/// Where one of a child's output streams goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Output {
     Keep,
     Discard,
     Inherit,
     Lines,
+    /// A file, relative to the child's directory, written from empty.
     File(String),
 }
 
-/// `std.process.Io`.
+impl Output {
+    /// The output `kind` numbers, `file` its path where it is a file: `Keep` 0, `Discard` 1,
+    /// `Inherit` 2, `Lines` 3 and `File` 4.
+    pub fn of(kind: i64, file: &str) -> Option<Output> {
+        Some(match kind {
+            0 => Output::Keep,
+            1 => Output::Discard,
+            2 => Output::Inherit,
+            3 => Output::Lines,
+            4 => Output::File(file.to_string()),
+            _ => return None,
+        })
+    }
+}
+
+/// How a started child is wired: whether it reads what the program writes, and where each of its
+/// output streams goes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Io {
     pub input: bool,
@@ -83,7 +97,7 @@ pub struct Io {
     pub err: Output,
 }
 
-/// `std.process.Signal`.
+/// A signal a child may be sent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Signal {
     Hangup,
@@ -93,6 +107,22 @@ pub enum Signal {
     User1,
     User2,
     WindowChange,
+}
+
+impl Signal {
+    /// The signal `number` numbers, in the order the variants are declared from 0.
+    pub fn of(number: i64) -> Option<Signal> {
+        Some(match number {
+            0 => Signal::Hangup,
+            1 => Signal::Interrupt,
+            2 => Signal::Terminate,
+            3 => Signal::Kill,
+            4 => Signal::User1,
+            5 => Signal::User2,
+            6 => Signal::WindowChange,
+            _ => return None,
+        })
+    }
 }
 
 /// What one `process.start` asked for, with the executable its label resolved to.

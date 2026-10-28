@@ -28,54 +28,11 @@ macro_rules! natives {
 
 ply_core::each_builtin!(natives);
 
-/// `b` over `values`: its answer, or `None` where it raised, as it raises, or failed the context.
-pub(super) fn called_over_values(ctx: &mut Ctx, b: Builtin, values: Vec<Value>) -> Option<Value> {
-    let site = ctx.site();
-    let panicked = match (b, values.first()) {
-        (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
-        _ => None,
-    };
-    // An operator over an `integer` parameter raises for a zero divisor, as one written at its
-    // type does; its overflow, like theirs, ends the run.
-    let divides_by_zero = match (b, values.as_slice()) {
-        (Builtin::NumericBinary, [Value::Int(op), _, _, divisor]) => {
-            matches!(
-                usize::try_from(*op)
-                    .ok()
-                    .and_then(|i| ply_core::builtins::NUMERIC_OPS.get(i)),
-                Some(BinOp::Div | BinOp::Rem)
-            ) && is_zero(divisor)
-        }
-        _ => false,
-    };
-    match ply_core::builtins::call(b, values, site) {
-        Ok(v) => Some(v),
-        Err(d) if signature(b).raises || divides_by_zero => {
-            let message = panicked.unwrap_or_else(|| raised_message(&d));
-            ctx.pend(d, message);
-            None
-        }
-        Err(d) => {
-            ctx.fail(d);
-            None
-        }
-    }
-}
-
-/// A runtime error's message as a clause for `abort.raise` is given it, each value the text names
-/// told by its kind: nothing in Rust renders one.
-pub(super) fn raised_message(d: &Diagnostic) -> String {
-    d.values
-        .iter()
-        .enumerate()
-        .fold(d.message.clone(), |text, (i, v)| {
-            text.replace(&ply_core::slot(i), v.describe())
-        })
-}
-
-/// [`Ctx::pend`] for a runtime error that is the program's to answer.
+/// [`Ctx::pend`] for a runtime error that is the program's to answer: a clause for `abort.raise`
+/// is given its message, each value the text names told by its kind, since nothing in Rust renders
+/// one.
 pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
-    let message = raised_message(&d);
+    let message = d.described(&d.message);
     ctx.pend(d, message)
 }
 
@@ -182,16 +139,4 @@ pub(super) unsafe extern "C" fn rt_hold_entry(ctx: *mut Ctx, _args: *const i64) 
     let d = Diagnostic::error(codes::INTERNAL_ERROR, "a hold was called as a function")
         .note("this is Ply's fault, not the program's");
     unsafe { &mut *ctx }.fail(d)
-}
-
-/// A handler's variables read where no clause of a handler that has some runs: the lowering of
-/// `var` writes the reads inside clauses alone, so this is Ply's defect.
-#[cold]
-#[inline(never)]
-pub(super) fn no_handler_vars() -> Diagnostic {
-    Diagnostic::error(
-        codes::INTERNAL_ERROR,
-        "a handler's variable was read where no clause of its handler runs",
-    )
-    .note("this is Ply's fault, not the program's")
 }

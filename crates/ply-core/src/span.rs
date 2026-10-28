@@ -1,7 +1,6 @@
 //! Spans, sources and diagnostics; `packages/cli/diagnostic.ply` renders them.
 
-use crate::Plain;
-use serde::{Deserialize, Serialize};
+use crate::codec::{FORMAT, shown, tag};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt;
@@ -47,22 +46,12 @@ impl std::ops::Deref for Symbol {
         &self.0
     }
 }
-impl Serialize for Symbol {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-impl<'de> Deserialize<'de> for Symbol {
-    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
-        Ok(Symbol::new(String::deserialize(d)?))
-    }
-}
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SourceId(pub u32);
 
 /// A half-open byte range within a [`SourceId`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
     pub source: SourceId,
     pub start: u32,
@@ -166,15 +155,14 @@ impl SourceMap {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Severity {
     Error,
     Warning,
     Note,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Label {
     pub span: Span,
     pub message: String,
@@ -183,20 +171,20 @@ pub struct Label {
 }
 
 /// One replacement a fix makes: `text` in place of `span`; an empty span inserts, empty text deletes.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
     pub span: Span,
     pub text: String,
 }
 
 /// A change that applies as it is and leaves a program the diagnostic no longer holds for.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fix {
     pub title: String,
     pub edits: Vec<Edit>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub code: &'static str,
@@ -204,15 +192,14 @@ pub struct Diagnostic {
     pub labels: Vec<Label>,
     pub notes: Vec<String>,
     pub fixes: Sparse<Fix>,
-    /// What the text names by [`slot`], rendered only by the CLI.
-    #[serde(default, skip_serializing_if = "Sparse::is_empty")]
-    pub values: Sparse<Plain>,
+    /// What the text names by [`slot`], each as the PLV1 bytes of a value a diagnostic shows,
+    /// rendered only by the CLI.
+    pub values: Sparse<Vec<u8>>,
 }
 
 /// A list most diagnostics leave empty, held as one pointer: every runtime `Result` carries a
 /// `Diagnostic`, so its size is paid on every call.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::box_collection)]
 pub struct Sparse<T>(Option<Box<Vec<T>>>);
 
@@ -330,8 +317,8 @@ impl Diagnostic {
         self
     }
 
-    /// Carries `values`, which the text names by [`slot`].
-    pub fn showing(mut self, values: Vec<Plain>) -> Self {
+    /// Carries `values`, each a value's PLV1 bytes, which the text names by [`slot`].
+    pub fn showing(mut self, values: Vec<Vec<u8>>) -> Self {
         self.values = values.into();
         self
     }
@@ -351,7 +338,7 @@ impl Diagnostic {
                 .parse::<usize>()
                 .ok()
                 .and_then(|i| self.values.get(i))
-                .map_or("a value", Plain::describe);
+                .map_or("a value", |v| told(v));
             out.push_str(said);
             rest = &after[close + 1..];
         }
@@ -384,6 +371,32 @@ impl Diagnostic {
             })
             .collect();
         notes.into_iter().fold(self, Diagnostic::note)
+    }
+}
+
+/// What a reader with no renderer is told in place of the value whose PLV1 bytes are `bytes`: its
+/// kind, read off the tag it opens with.
+fn told(bytes: &[u8]) -> &'static str {
+    let at = FORMAT.len();
+    match bytes.get(at).copied() {
+        Some(tag::UNIT) => "`()`",
+        Some(tag::FALSE | tag::TRUE) => "a `Bool`",
+        Some(tag::INT) => "an `Int`",
+        Some(tag::FLOAT) => "a `Float`",
+        Some(tag::DECIMAL) => "a `Decimal`",
+        Some(tag::FIXED) => "a fixed-width integer",
+        Some(tag::CHAR) => "a `Char`",
+        Some(tag::STR) => "a `String`",
+        Some(tag::BYTES) => "a `Bytes`",
+        Some(tag::LIST) => "a `List`",
+        Some(tag::ARRAY) => "an `Array`",
+        Some(tag::RECORD) => "a record",
+        Some(tag::CTOR) => "a variant",
+        Some(tag::MAP) => "a `Map`",
+        Some(tag::FUN) => "a function",
+        Some(tag::HANDLE) if bytes.get(at + 1).copied() == Some(shown::HOLD as u8) => "a `Hold`",
+        Some(tag::HANDLE) => "a `Secret`",
+        _ => "a value",
     }
 }
 

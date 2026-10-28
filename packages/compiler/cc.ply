@@ -6,6 +6,7 @@
 
 import std.bytes
 import std.hash (blake3)
+import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
 import std.list
 import std.string
 
@@ -27,6 +28,10 @@ pub effect compilers {
 pub effect toolchain {
   /// The cache's directory.
   read cache() -> String
+  /// The directory `ply run` and `ply check` file what they reuse in, which the toolchain sweeps.
+  read reused() -> String
+  /// The directory the emitter's answers are kept in between runs, which the toolchain sweeps.
+  read bodies() -> String
   /// How many compilers run at once.
   read jobs() -> Int
   /// Whether the cache holds `path`, which records a use of it.
@@ -724,6 +729,151 @@ pub fn executable<[c]>(
   }
 }
 
+// --- The real handlers -----------------------------------------------------------
+//
+// The family `toolchain`, which a run is lent with `--allow toolchain`: each native refuses a run
+// not lent it.
+
+host for compilers by compiling
+
+/// `go` with each C compiler the host has, by its label, each run a job of the run's that the
+/// asking task waits for.
+fn compiling<a | e>(
+  go: () -> a / {compilers.read[*], compilers.write[*] | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    compilers.found[*label]() -> match found(compilers_found(label)) {
+      Some(said) -> match parts(said) {
+        [path, identity, support] ->
+          Some({
+            path: String::of_bytes_lossy(path),
+            identity: identity,
+            support: parts(support).map(|flag: Bytes| String::of_bytes_lossy(flag)),
+          }),
+        _ -> panic("a compiler's native wrote no compiler"),
+      },
+      None -> None,
+    },
+    compilers.started[*label](args) -> {
+      let said = compilers_started(label, in_parts(args.map(|a: String| Bytes::of_string(a))));
+      if said.at(0) == 1 { Ok(int_of(said.slice(1, said.len()))) }
+      else { Err(String::of_bytes_lossy(said.slice(1, said.len()))) }
+    },
+    compilers.finished[*label](job) -> found(job_wait(job)),
+  }
+
+/// The compiler the label names, found: its path, what identifies it, and its support flags as
+/// parts, as parts.
+extern fn compilers_found(label: String) -> Bytes / {native.read}
+
+/// The compiler the label names started with `args`, as parts: byte 1 and the ticket of its end,
+/// which answers what `compilers.finished` reads; or byte 0 and why it could not start.
+extern fn compilers_started(label: String, args: Bytes) -> Bytes / {native.read}
+
+host for toolchain by cached
+
+/// `go` with the toolchain's cache read and written below it on the host, and each program linked
+/// there run as a job of the run's that the asking task waits for.
+fn cached<a | e>(
+  go: () -> a / {toolchain.read, toolchain.write | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    toolchain.cache() -> String::of_bytes_lossy(toolchain_cache()),
+    toolchain.reused() -> String::of_bytes_lossy(toolchain_reused()),
+    toolchain.bodies() -> String::of_bytes_lossy(toolchain_bodies()),
+    toolchain.jobs() -> toolchain_jobs(),
+    toolchain.holds(path) -> toolchain_holds(path),
+    toolchain.held(path) -> found(toolchain_held(path)),
+    toolchain.written(path, bytes) -> toolchain_written(path, bytes),
+    toolchain.moved(from, to) -> toolchain_moved(from, to),
+    toolchain.appended(path, bytes) -> toolchain_appended(path, bytes),
+    toolchain.scratch() -> match found(toolchain_scratch()) {
+      Some(dir) -> Some(String::of_bytes_lossy(dir)),
+      None -> None,
+    },
+    toolchain.cleared(dir) -> toolchain_cleared(dir),
+    toolchain.libraries() ->
+      parts(toolchain_libraries()).map(|name: Bytes| String::of_bytes_lossy(name)),
+    toolchain.ran(path, args) -> {
+      let ticket = toolchain_ran(path, in_parts(args.map(|a: String| Bytes::of_string(a))));
+      match parts(job_wait(ticket)) {
+        [code, out] -> { code: int_of(code), out: out },
+        _ -> panic("a linked program's native wrote no run"),
+      }
+    },
+  }
+
+/// The cache's directory.
+extern fn toolchain_cache() -> Bytes / {native.read}
+
+/// The directory what `ply run` and `ply check` reuse is filed in.
+extern fn toolchain_reused() -> Bytes / {native.read}
+
+/// The directory the emitter's answers are kept in.
+extern fn toolchain_bodies() -> Bytes / {native.read}
+
+/// How many compilers run at once.
+extern fn toolchain_jobs() -> Int / {native.read}
+
+/// Whether the cache holds `path`, which records a use of it.
+extern fn toolchain_holds(path: String) -> Bool / {native.read}
+
+/// What the cache holds at `path`, found.
+extern fn toolchain_held(path: String) -> Bytes / {native.read}
+
+/// Whether `bytes` were written whole at `path`.
+extern fn toolchain_written(path: String, bytes: Bytes) -> Bool / {native.read}
+
+/// Whether `from` was moved whole to `to`.
+extern fn toolchain_moved(from: String, to: String) -> Bool / {native.read}
+
+/// Whether `bytes` were added after what `path` holds.
+extern fn toolchain_appended(path: String, bytes: Bytes) -> Bool / {native.read}
+
+/// A new directory of the asker's own below the cache, found.
+extern fn toolchain_scratch() -> Bytes / {native.read}
+
+/// `dir` below the cache removed with everything under it.
+extern fn toolchain_cleared(dir: String) -> Unit / {native.read}
+
+/// What the runtime's library needs linked after it, as parts.
+extern fn toolchain_libraries() -> Bytes / {native.read}
+
+/// The ticket of the program at `path` below the cache run to its end with `args`, as parts: what
+/// it ended with and what it wrote to standard output, as parts.
+extern fn toolchain_ran(path: String, args: Bytes) -> Int / {native.read}
+
+host for memory by measured
+
+/// `go` with the asking program's own heap read.
+fn measured<a | e>(go: () -> a / {memory.read | e}) -> a / {native.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    memory.heap() -> match parts(memory_heap()) {
+      [live, held] -> { live: int_of(live), held: int_of(held) },
+      _ -> panic("the heap's native wrote no reading"),
+    },
+    memory.census() ->
+      parts(memory_census()).map(|sort: Bytes|
+        match parts(sort) {
+          [what, objects, bytes] ->
+            { what: String::of_bytes_lossy(what), objects: int_of(objects), bytes: int_of(bytes) },
+          _ -> panic("the heap's native wrote no census"),
+        }),
+  }
+
+/// What the heap holds, its live bytes and those held for them, as parts.
+extern fn memory_heap() -> Bytes / {native.read}
+
+/// The live objects, the most bytes first, each a sort's words, its count and its bytes, as parts
+/// of parts.
+extern fn memory_census() -> Bytes / {native.read}
+
 // --- Tests -----------------------------------------------------------------------
 
 fn unit_text() -> Bytes =
@@ -808,6 +958,8 @@ fn ran_over(
     compilers.finished[cc](job) -> said(match runs.get(job).last() { Some(f) -> f, None -> "" }),
     toolchain.jobs() -> 1,
     toolchain.cache() -> panic("a run reads no cache"),
+    toolchain.reused() -> panic("a run reads no cache"),
+    toolchain.bodies() -> panic("a run reads no cache"),
     toolchain.holds(path) -> panic("a run reads no cache"),
     toolchain.held(path) -> panic("a run reads no cache"),
     toolchain.libraries() -> panic("a run links no library"),

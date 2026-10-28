@@ -1,12 +1,51 @@
-//! Whether the steps a computation takes keep pace with a bound as its size doubles.
+//! What a computation costs, which a test reads, and whether the steps it takes keep pace with a
+//! bound as its size doubles.
 //!
-//! `paced` runs a body at the sizes 1, 2, 4 … 4096, counting its steps as `metered` does, and
-//! asserts they grow no faster than the bound over the last two spans between the sizes it read,
-//! so constant factors and lower-order terms do not count. It is a test's evidence about the sizes
-//! it ran and no proof: a bound on every call is a `cost` clause, which `ply prove` proves or
-//! refuses.
+//! `spent` answers what a function cost in what the runtime counts rather than in time: the calls
+//! it made, the objects it allocated and the bytes those took. It reads them through `meter`, which
+//! only `ply test` answers: any other run fails at its first reading with `E0424`, since what a
+//! computation costs is its compiler's to choose, and no program's answer may hang on it.
 //!
-//! This module imports no other, so that any module may import it to test itself.
+//! `paced` runs a body at the sizes 1, 2, 4 … 4096, counting its steps as `spent` does, and asserts
+//! they grow no faster than the bound over the last two spans between the sizes it read, so
+//! constant factors and lower-order terms do not count. It is a test's evidence about the sizes it
+//! ran and no proof: a bound on every call is a `cost` clause, which `ply prove` proves or refuses.
+//!
+//! This module imports only `std.internal.native`, so that any module may import it to test
+//! itself but the home modules and those beneath them, which it reads with no import.
+
+import std.internal.native (native)
+
+/// What a test's run has cost so far.
+pub effect meter {
+  /// The calls the run has made, each counted as `--steps` counts them, the objects it allocated
+  /// and the bytes those took, since it began.
+  read reading() -> Cost
+}
+
+/// What a computation cost: its calls, the objects it allocated and the bytes those took, which an
+/// update in place does not spend and a copy does.
+pub type Cost = { steps: Int, allocations: Int, bytes: Int }
+
+/// What `f()` answers, beside what it cost: the calls it made, its own among them, the objects it
+/// allocated and the bytes those took. A memoized constant costs what computing it costs, whether
+/// or not an earlier call computed it; a `const fn` a build kept costs nothing to read; and what a
+/// region's scheduler does to answer a task's operations costs nothing, nor does reading the meter.
+pub fn spent<a | e>(
+  f: () -> a / e,
+) -> { value: a, steps: Int, allocations: Int, bytes: Int } / {meter.read | e} = {
+  let before = meter.reading();
+  let value = f();
+  let after = meter.reading();
+  // Only a reading lies between `after` and `again`, and `after - before` holds one as well.
+  let again = meter.reading();
+  {
+    value: value,
+    steps: after.steps - before.steps - (again.steps - after.steps),
+    allocations: after.allocations - before.allocations - (again.allocations - after.allocations),
+    bytes: after.bytes - before.bytes - (again.bytes - after.bytes),
+  }
+}
 
 /// One size a body was run at: the steps it took there, and its bound there.
 pub type Measure = { size: Int, steps: Int, bound: Int }
@@ -50,14 +89,14 @@ pub fn measured<a | e>(
   least: Int,
   bound: (Int) -> Int / {abort.raise},
   body: (Int) -> a / e,
-) -> List<Measure> / {abort.raise | e} =
+) -> List<Measure> / {meter.read, abort.raise | e} =
   sizes().filter(|n: Int| n >= least).fold(
     { measures: [], spent: false },
     |acc: { measures: List<Measure>, spent: Bool }, n: Int|
       if acc.spent { acc } else {
         let allowed = bound(n);
         if allowed <= 0 { acc } else {
-          let steps = metered(|| body(n)).steps;
+          let steps = spent(|| body(n)).steps;
           {
             measures: acc.measures.push({ size: n, steps: steps, bound: allowed }),
             spent: steps > size_limit(),
@@ -80,14 +119,14 @@ fn lines(measures: List<Measure>) -> String =
 pub fn paced<a | e>(
   bound: (Int) -> Int / {abort.raise},
   body: (Int) -> a / e,
-) -> Unit / {abort.raise | e} = paced_from(1, bound, body)
+) -> Unit / {meter.read, abort.raise | e} = paced_from(1, bound, body)
 
 /// `paced` over the sizes from `least` up.
 pub fn paced_from<a | e>(
   least: Int,
   bound: (Int) -> Int / {abort.raise},
   body: (Int) -> a / e,
-) -> Unit / {abort.raise | e} = held(measured(least, bound, body))
+) -> Unit / {meter.read, abort.raise | e} = held(measured(least, bound, body))
 
 fn held(measures: List<Measure>) -> Unit / {abort.raise} =
   if measures.len() < least_sizes() {
@@ -98,6 +137,25 @@ fn held(measures: List<Measure>) -> Unit / {abort.raise} =
   } else if outgrown(measures) { panic("the steps outgrew the bound: " ++ lines(measures)) }
   else { () }
 
+// --- The real handler -------------------------------------------------------
+
+host for meter by served
+
+/// `go` with its readings answered by the runtime, which answers them in a test's run alone.
+fn served<a | e>(go: () -> a / {meter.read | e}) -> a / {native.read | e} =
+  handle {
+    go()
+  } with {
+    meter.reading() ->
+      { steps: meter_steps(), allocations: meter_allocations(), bytes: meter_bytes() },
+  }
+
+extern fn meter_steps() -> Int / {native.read}
+
+extern fn meter_allocations() -> Int / {native.read}
+
+extern fn meter_bytes() -> Int / {native.read}
+
 // --- Tests ------------------------------------------------------------------
 
 fn measured_by(steps: (Int) -> Int, bound: (Int) -> Int) -> List<Measure> =
@@ -106,7 +164,7 @@ fn measured_by(steps: (Int) -> Int, bound: (Int) -> Int) -> List<Measure> =
 fn ilog2(n: Int) -> Int =
   range(0, 63).fold(0, |k: Int, i: Int| if n >> i + 1 > 0 { i + 1 } else { k })
 
-fn failure(run: () -> Unit / {abort.raise}) -> Option<String> =
+fn failure(run: () -> Unit / {meter.read, abort.raise}) -> Option<String> / {meter.read} =
   handle { run() } with { abort.raise(message) -> Some(message), return _done -> None }
 
 fn total(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)
@@ -162,7 +220,25 @@ test "a body is run at each size from the least whose bound is positive" {
   let body = |n: Int| total(range(0, n));
   let read = measured(2, |n: Int| if n == 8 { 0 } else { n }, body);
   assert_eq(read.map(|m: Measure| m.size), [2, 4, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]);
-  assert_eq(read.at(0), Some({ size: 2, steps: metered(|| body(2)).steps, bound: 2 }))
+  assert_eq(read.at(0), Some({ size: 2, steps: spent(|| body(2)).steps, bound: 2 }))
+}
+
+type Chain = | Link(Int, Chain) | End
+
+fn chain(n: Int) -> Chain = if n <= 0 { End } else { Link(n, chain(n - 1)) }
+
+test "a call is a step and an object built an allocation, and reading the meter costs nothing" {
+  let small = spent(|| chain(10));
+  let large = spent(|| chain(20));
+  assert_eq([large.steps - small.steps, large.allocations - small.allocations, large.bytes], [
+    10,
+    10,
+    2 * small.bytes,
+  ]);
+  let nothing = spent(|| 7);
+  assert_eq([nothing.value, nothing.allocations, nothing.bytes], [7, 0, 0]);
+  // The one step there may be is the call of the function itself.
+  assert(nothing.steps == 0 || nothing.steps == 1, Some(nothing.steps.to_string()))
 }
 
 test "a body that keeps pace passes, and one that outgrows its bound fails naming its sizes" {

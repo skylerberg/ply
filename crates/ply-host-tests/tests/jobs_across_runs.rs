@@ -2,10 +2,10 @@
 //! shares: what one run left behind, and how a job ended, decide nothing for another's wait. A
 //! binary of its own, since each test here leaves the process's pools holding what it left.
 
+use ply_core::Span;
 use ply_core::host::HostRuntime;
-use ply_core::{Span, Value};
 use ply_host::jobs::{self, Work};
-use ply_host::registry::{run_of, unbound};
+use ply_host::registry::{job_bytes, run_of, unbound};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -69,7 +69,7 @@ fn a_waiting_job_that_panics_fails_the_run_that_waits_on_it() {
             "`a waiting job`",
             || -> Result<Vec<u8>, String> { panic!("the job broke") },
         );
-        let outcome = runtime.block_on(ticket);
+        let outcome = job_bytes(&*runtime, &ticket);
         let _ = answered.send(outcome.map(|_| ()).map_err(|d| d.message));
     });
     match heard.recv_timeout(Duration::from_secs(10)) {
@@ -91,9 +91,9 @@ fn one_runs_token_is_none_of_anothers() {
             .is_err(),
         "another run may not watch it"
     );
-    assert!(theirs.block_on(ticket).is_err(), "nor wait on it");
-    match &mine.block_on(ticket) {
-        Ok(Value::Bytes(bytes)) => assert_eq!(bytes.to_vec(), b"mine"),
-        other => panic!("the run that submitted it was not answered: {other:?}"),
+    assert!(job_bytes(&*theirs, &ticket).is_err(), "nor wait on it");
+    match job_bytes(&*mine, &ticket) {
+        Ok(bytes) => assert_eq!(bytes, b"mine"),
+        Err(d) => panic!("the run that submitted it was not answered: {}", d.message),
     }
 }

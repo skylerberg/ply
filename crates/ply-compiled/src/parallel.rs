@@ -116,7 +116,8 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-/// Whether every word of the row whose descriptor and words are `words` is the frame bridge.
+/// Whether every word of the row whose descriptor and words are `words` is the bridge
+/// ([`crate::rt::BRIDGE`]).
 fn bridged_only(c: &Ctx, (desc, words): (Word, Word)) -> bool {
     if desc == 0 {
         return true;

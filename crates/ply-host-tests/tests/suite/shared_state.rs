@@ -1,6 +1,3 @@
-// A `Value::Record` holds an `Arc` and a `Value` is not `Send`, by `ply-core`'s design.
-#![allow(clippy::arc_with_non_send_sync)]
-
 use ply_core::host::MachineId;
 use ply_core::{Diagnostic, Span, TaskId, codes};
 use ply_host::config::{Entry, Snapshot};

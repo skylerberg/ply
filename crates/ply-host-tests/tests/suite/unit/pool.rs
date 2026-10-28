@@ -1,7 +1,6 @@
 use ply_core::host::MachineId;
-use ply_core::{Diagnostic, Pending, Span, Value, codes};
-use ply_host::pool::{Bell, JobOutput, MAX_BLOCKING_OPERATIONS, Pool, Run};
-use ply_host::stdio::SecretLine;
+use ply_core::{Diagnostic, Pending, Span, codes};
+use ply_host::pool::{Bell, JobOutput, Kept, MAX_BLOCKING_OPERATIONS, Pool, Run};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,18 +11,28 @@ fn run() -> Arc<Run> {
     Run::new(Arc::new(Bell::default()))
 }
 
+/// The bytes a job that answers `n` writes.
+fn written(n: i64) -> Vec<u8> {
+    n.to_be_bytes().to_vec()
+}
+
+/// What a job that answers `n` answers.
+fn said(n: i64) -> JobOutput {
+    Ok(written(n))
+}
+
 fn submitted(pool: &Pool, run: &Arc<Run>, answer: i64) -> Pending {
     pool.submit(
         run,
         Span::DUMMY,
         "test",
         "a test job",
-        Box::new(move || JobOutput::Int(answer)),
+        Box::new(move || said(answer)),
     )
     .expect("the pool takes the job")
 }
 
-fn answered(run: &Run, pending: Pending) -> Value {
+fn answered(run: &Run, pending: Pending) -> Vec<u8> {
     run.block_on(&pending, None)
         .unwrap_or_else(|d| panic!("{d:?}"))
         .expect("an unbounded wait ends answered")
@@ -31,7 +40,7 @@ fn answered(run: &Run, pending: Pending) -> Value {
 
 /// What `run` takes once a watched operation has been answered: each answered token beside its
 /// answer.
-fn collected(run: &Run) -> Vec<(u64, Result<Value, Diagnostic>)> {
+fn collected(run: &Run) -> Vec<(u64, Result<Vec<u8>, Diagnostic>)> {
     assert!(
         run.park(Some(Duration::from_secs(10)), &|| false),
         "the run watches something"
@@ -42,7 +51,7 @@ fn collected(run: &Run) -> Vec<(u64, Result<Value, Diagnostic>)> {
                 token,
                 label: "a test job",
             };
-            let answer = run.poll(&pending).map(|v| v.expect("answered"));
+            let answer = run.taken(&pending).map(|v| v.expect("answered"));
             (token, answer)
         })
         .collect()
@@ -69,7 +78,7 @@ fn a_run_collects_its_own_operations_and_none_of_anothers() {
             .into_iter()
             .map(|(token, answer)| (token, answer.expect("answered")))
             .collect::<Vec<_>>(),
-        [(b.token, Value::Int(2))]
+        [(b.token, written(2))]
     );
     assert!(mine.answered().is_empty(), "an answer is handed back once");
 }
@@ -91,7 +100,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             Box::new(move || {
                 // Each holds until the test's sender is gone.
                 let _ = released.lock().map(|r| r.recv());
-                JobOutput::Int(0)
+                said(0)
             }),
         )
         .expect("the pool takes the job");
@@ -102,7 +111,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             Span::DUMMY,
             "test",
             "one too many",
-            Box::new(|| JobOutput::Int(0))
+            Box::new(|| said(0))
         )
         .is_err(),
         "every thread is held"
@@ -117,7 +126,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             Span::DUMMY,
             "test",
             "a later job",
-            Box::new(|| JobOutput::Int(9)),
+            Box::new(|| said(9)),
         ) {
             Ok(pending) => break pending,
             Err(_) => {
@@ -129,7 +138,7 @@ fn an_ended_runs_operation_is_dropped_and_frees_its_thread() {
             }
         }
     };
-    assert_eq!(answered(&after, pending), Value::Int(9));
+    assert_eq!(answered(&after, pending), written(9));
 }
 
 /// A pool that gives each operation a thread refuses the one past its bound; a queued one has no
@@ -142,7 +151,7 @@ fn a_queued_pool_answers_more_operations_than_a_thread_each_would_be_given() {
         .map(|i| (i, submitted(&pool, &asking, i)))
         .collect();
     for (i, token) in asked {
-        assert_eq!(answered(&asking, token), Value::Int(i));
+        assert_eq!(answered(&asking, token), written(i));
     }
 }
 
@@ -164,7 +173,7 @@ fn a_queued_pool_runs_no_more_at_once_than_it_has_threads() {
                     most.fetch_max(running.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     std::thread::sleep(Duration::from_millis(20));
                     running.fetch_sub(1, Ordering::SeqCst);
-                    JobOutput::Int(0)
+                    said(0)
                 }),
             )
             .expect("the pool takes the job")
@@ -200,7 +209,7 @@ fn a_job_that_panics_fails_its_own_operation_and_the_next_is_answered() {
             .block_on(&broken, None)
             .expect_err("a panic is the operation's failure");
         assert_eq!(failed.code, codes::RUNTIME_ERROR);
-        assert_eq!(answered(&asking, after), Value::Int(7));
+        assert_eq!(answered(&asking, after), written(7));
     }
 }
 
@@ -246,7 +255,7 @@ fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
             "a slow job",
             Box::new(|| {
                 std::thread::sleep(Duration::from_millis(200));
-                JobOutput::Int(1)
+                said(1)
             }),
         )
         .expect("the pool takes the job");
@@ -264,11 +273,11 @@ fn a_park_wakes_for_its_own_answer_and_not_for_anothers() {
     );
 }
 
-fn secret(text: &str) -> SecretLine {
-    SecretLine::new(text.to_string())
+fn secret(text: &str) -> Kept {
+    Kept::new(text.as_bytes().to_vec())
 }
 
-/// A line read for a `Secret` is its run's, taken once, by that run alone.
+/// What is read for a `Secret` is its run's, taken once, by that run alone.
 #[test]
 fn a_secret_is_taken_once_and_by_the_run_that_kept_it() {
     let (mine, theirs) = (run(), run());
@@ -279,10 +288,10 @@ fn a_secret_is_taken_once_and_by_the_run_that_kept_it() {
         "another run's number names nothing of this one's"
     );
     assert_eq!(
-        mine.take_secret(kept).as_deref().map(String::as_str),
-        Some("hunter2")
+        mine.take_secret(kept).as_deref().map(Vec::as_slice),
+        Some(&b"hunter2"[..])
     );
-    assert!(mine.take_secret(kept).is_none(), "a line is taken once");
+    assert!(mine.take_secret(kept).is_none(), "a secret is taken once");
 }
 
 /// A run whose entry point ends between reading a secret and taking it leaves nothing held.

@@ -41,30 +41,19 @@ pub const EFFECT_IN_SPEC: &str = "E0417";
 /// A `forall` binder type with no generator, an effectful function type, or a row variable.
 pub const UNQUANTIFIABLE_TYPE: &str = "E0418";
 pub const OBLIGATION_REFUTED: &str = "E0419";
-/// A host registration names an effect, operation or resource the program does not declare.
-pub const HOST_OPERATION_UNKNOWN: &str = "E0421";
-/// Two host registrations claim one atom.
-pub const HOST_HANDLER_CONFLICT: &str = "E0422";
-/// A host handler declared nondeterministic for an effect not declared `nondet`.
-pub const HOST_DETERMINISM_MISMATCH: &str = "E0423";
-/// An operation reached the host boundary with nothing bound to serve it.
+/// An operation reached the host boundary with nothing bound to serve it, or a run that is no
+/// test's read what it cost.
 pub const HOST_UNBOUND: &str = "E0424";
 /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
 pub const HOST_IN_SIMULATION: &str = "E0425";
 /// A continuation was resumed a second time across an at-most-once host operation.
 pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
-/// A host handler answered an atom outside its entry point's declared footprint.
-pub const HOST_FOOTPRINT_ESCAPE: &str = "E0427";
-/// A handler declared `blocking: true` answered a value inline instead of a pending token.
-pub const HOST_BLOCKING_ANSWER: &str = "E0428";
 /// A listener, a connection presenting one, or `--mtls` named a credential the binding does not
 /// hold.
 pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
 /// A `--tls` credential that does not load, or whose key does not match its certificate; a
 /// certificate to trust that does not load; or `--mtls` with nothing to verify a client against.
 pub const TLS_CREDENTIAL_INVALID: &str = "E0430";
-/// A `Secret` passed to a host operation whose registration does not accept one.
-pub const SECRET_TO_HOST: &str = "E0439";
 /// A configuration source, or the `--config-schema` definition, that the run cannot read.
 pub const CONFIG_UNAVAILABLE: &str = "E0440";
 /// A deployable artifact whose contents do not verify against its own digests.

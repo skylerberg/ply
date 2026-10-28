@@ -1,9 +1,9 @@
-//! The launcher: enter the program this executable was linked with, with the command line, the
-//! shipped modules beside it, and its environment lent.
+//! The launcher: enter the program this executable was linked with, with the command line and the
+//! shipped modules beside it.
 //!
 //! This is the whole of what stands between the operating system and the program `ply` is: the
 //! big-stack thread, the definition the pack says the program enters, the `cwd` and `shipped`
-//! roots, the process and environment bindings, and the exit code.
+//! roots, the process binding, and the exit code.
 
 use ply_compiled::entry::{self, Ended, Grants, Opened};
 use ply_core::{Diagnostic, codes};
@@ -16,69 +16,36 @@ pub const FRONT: &str = "program/front";
 /// The line a front of this launcher's own format opens with, which the program's builder writes.
 const FRONT_FORMAT: &[u8] = b"ply entry 1\n";
 
-/// What a launched program is: the definition it enters, the stage its shipped modules are laid
-/// out under, and the binary's version for the environment it may ask about.
+/// What a launched program is: the definition it enters and the stage its shipped modules are laid
+/// out under.
 pub struct Program {
     pub entry: String,
     /// Each `fn` the entry reaches and its hash, a `name hash` line each in name order.
     pub definitions: String,
     /// The stage's identity: the shipped modules land under it, beside the C cache.
     pub stage: String,
-    pub version: String,
 }
 
 /// The program this executable was linked with, as its pack names it.
-pub fn linked_program(version: &str) -> Result<Program, Diagnostic> {
+pub fn linked_program() -> Result<Program, Diagnostic> {
     let pack = ply_pack::installed();
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
         return Err(unlinked(format!("its pack carries no `{FRONT}`")));
     };
-    let (entry, definitions) = match bytes.strip_prefix(FRONT_FORMAT) {
-        Some(rest) => {
-            let text = std::str::from_utf8(rest)
-                .map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
-            let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
-            (entry.to_string(), definitions.to_string())
-        }
-        None => released_front(bytes)?,
+    let Some(rest) = bytes.strip_prefix(FRONT_FORMAT) else {
+        return Err(unlinked(format!(
+            "`{FRONT}` is not a front this launcher reads"
+        )));
     };
+    let text =
+        std::str::from_utf8(rest).map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
+    let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
-        entry,
-        definitions,
+        entry: entry.to_string(),
+        definitions: definitions.to_string(),
         stage: format!("native-{stage}"),
-        version: version.to_string(),
     })
-}
-
-/// The entry and definitions of the front a release's `ply bootstrap` packs a builder with: a
-/// `front.Linked` in the value codec, of which nothing else is read.
-fn released_front(bytes: &[u8]) -> Result<(String, String), Diagnostic> {
-    use ply_core::Value;
-    let value = ply_core::codec::decode(bytes)
-        .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    fn field<'v>(v: &'v Value, name: &str) -> Option<&'v Value> {
-        match v {
-            Value::Record(fields) => fields
-                .iter()
-                .find(|(k, _)| k.as_str() == name)
-                .map(|(_, v)| v),
-            _ => None,
-        }
-    }
-    let text = |v: Option<&Value>| match v {
-        Some(Value::Str(s)) => Some(s.to_string()),
-        Some(Value::Bytes(b)) => String::from_utf8(b.to_vec()).ok(),
-        _ => None,
-    };
-    let entry = text(field(&value, "entry").and_then(|e| field(e, "name")));
-    let definitions = text(field(&value, "definitions"));
-    match (entry, definitions) {
-        (Some(entry), Some(definitions)) => Ok((entry, definitions)),
-        _ => Err(unlinked(format!(
-            "`{FRONT}` names no entry and definitions"
-        ))),
-    }
 }
 
 #[cold]
@@ -281,13 +248,11 @@ impl Launched {
     }
 }
 
-/// Enter the program on the command's own big-stack thread, lent `lent` beside the families the
-/// runtime serves itself and the launcher's own environment.
+/// Enter the program on the command's own big-stack thread, lent every family.
 pub fn run(
     program: Program,
     root: &Path,
     argv: Vec<String>,
-    mut lent: Vec<ply_privileged::hosts::LentOp>,
     count: Option<crate::count::Asked>,
 ) -> Launched {
     ply_compiled::c::sweep::once();
@@ -302,7 +267,6 @@ pub fn run(
     ply_privileged::shipped::stamp(stamps());
     ply_privileged::shipped::entered(&program.entry, definitions);
     let grants = grants(root, &shipped, &argv);
-    lent.extend(crate::env::registrations(&program.version));
     let entry = program.entry;
     // The program is the tool's own work rather than a program under test, so the budgets a run
     // gives a program are not its. The entry runs on a thread of its own, with the stack a front
@@ -311,7 +275,7 @@ pub fn run(
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
         .spawn(move || {
-            let launch = || ply_compiled::rt::unbounded(|| entered(&entry, &grants, lent));
+            let launch = || ply_compiled::rt::unbounded(|| entered(&entry, &grants));
             match count {
                 Some(asked) => {
                     let (launched, counted, sites) =
@@ -350,8 +314,8 @@ pub fn run(
     }
 }
 
-/// The linked program's `entry` entered with nothing, under the binding `grants` and `lent` make.
-fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp>) -> Launched {
+/// The linked program's `entry` entered with nothing, under the binding `grants` make.
+fn entered(entry: &str, grants: &Grants) -> Launched {
     let opened = match Opened::linked() {
         Ok(opened) => opened,
         Err(why) => {
@@ -361,7 +325,7 @@ fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp
             ));
         }
     };
-    let hosts = match ply_privileged::hosts::Hosts::granted(grants, lent) {
+    let hosts = match ply_privileged::hosts::Hosts::granted(grants) {
         Ok(hosts) => hosts,
         Err(diagnostics) => {
             return Launched::refused(diagnostics.into_iter().next().unwrap_or_else(|| {
@@ -376,7 +340,7 @@ fn entered(entry: &str, grants: &Grants, lent: Vec<ply_privileged::hosts::LentOp
     let outcome = entry::enter(
         &opened,
         entry,
-        entry::no_arguments(),
+        entry::NO_ARGUMENTS.to_vec(),
         &run,
         Some(&hosts),
         None,
@@ -418,4 +382,3 @@ fn placed(d: &Diagnostic, opened: &Opened) -> String {
 
 pub mod code;
 pub mod count;
-pub mod env;

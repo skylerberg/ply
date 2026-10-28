@@ -1,83 +1,9 @@
-//! The launcher's environment family answered as a native program's `env.*` asks it, and its own
-//! `--count-allocs` flag.
+//! The launcher's own `--count-allocs` flag.
 
 /// The counting allocator is a whole-binary decision, so this test binary installs it too, which
 /// is what makes the window tests meaningful here.
 #[global_allocator]
 static ALLOCATOR: ply_launcher::count::Counting = ply_launcher::count::Counting;
-
-use ply_core::host::{HostAnswer, HostOp, HostRequest, HostRuntime, MachineId, Pending};
-use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, Value};
-
-/// A runtime nothing waits on: the environment answers on the spot.
-struct Idle;
-
-impl HostRuntime for Idle {
-    fn park(&self) -> Result<(), Diagnostic> {
-        Ok(())
-    }
-
-    fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
-        panic!("the environment never waits, and `{}` did", pending.label)
-    }
-}
-
-/// What the launcher's `env.<op>[e](args)` answers.
-fn asked(op: &str, args: Vec<Value>) -> Value {
-    let registrations = ply_launcher::env::registrations("9.9.9-test");
-    let (declared, handler) = registrations
-        .iter()
-        .find(|(declared, _)| declared.op.as_str() == op)
-        .unwrap_or_else(|| panic!("the launcher lends no `env.{op}`"));
-    let request = HostRequest {
-        atom: EffectAtom::new("env", Resource::Named(Symbol::new("e")), Mode::Read),
-        op: declared as &HostOp,
-        args: &args,
-        span: Span::DUMMY,
-        machine: MachineId::next(),
-        task: None,
-        declared: None,
-    };
-    match handler.call(&Idle, &request) {
-        Ok(HostAnswer::Value(value)) => value,
-        Ok(HostAnswer::Pending(p)) => panic!("`env.{op}` waited on `{}`", p.label),
-        Err(d) => panic!("`env.{op}` refused: {d}"),
-    }
-}
-
-#[test]
-fn a_program_reads_its_environment() {
-    // Safety: the test is alone in its process (nextest), so the variable is its own.
-    unsafe { std::env::set_var("PLY_LAUNCHER_TEST_MARK", "here") };
-    assert_eq!(
-        asked("var", vec![Value::str("PLY_LAUNCHER_TEST_MARK")]),
-        Value::ctor("Some", vec![Value::str("here")])
-    );
-    assert_eq!(
-        asked("var", vec![Value::str("PLY_LAUNCHER_TEST_ABSENT")]),
-        Value::ctor("None", Vec::new())
-    );
-    let listed = asked("vars", Vec::new());
-    let Value::List(vars) = &listed else {
-        panic!("`env.vars` answered no list");
-    };
-    let marked = ply_privileged::payload::record(vec![
-        ("name", Value::str("PLY_LAUNCHER_TEST_MARK")),
-        ("value", Value::str("here")),
-    ]);
-    assert_eq!(vars.iter().filter(|v| **v == marked).count(), 1);
-    assert_eq!(
-        asked("terminal", vec![Value::str("nowhere")]),
-        Value::Bool(false)
-    );
-    assert_eq!(
-        asked("binary_version", Vec::new()),
-        Value::str("9.9.9-test")
-    );
-    unsafe { std::env::remove_var("PLY_LAUNCHER_TEST_MARK") };
-}
-
-// --- `--count-allocs` ---------------------------------------------------------
 
 /// The launcher's own flag, taken out of the line wherever it is written; the program parses
 /// what is left and never sees it.

@@ -69,8 +69,9 @@ TAB=$'\t'
 # (`workspace`).
 # The parts the CLI's suite runs in, `cli-part-<k>`, each a job's `ply test --shard K/N`: its
 # `test/nondet` tests drive `ply` in one working directory, so a `ply test` takes those one after
-# another, and with them one job would run close to its limit.
-CLI_PARTS=2
+# another. A change to the compiler runs every test again, and each part must finish all of its
+# tests within its job's deadline.
+CLI_PARTS=4
 # A package's own tests and proofs share one job, `packages`, in turn: each loads little. These take
 # a job of their own instead: the compiler's own tests take every core.
 RUNS_ALONE=(package-compiler)

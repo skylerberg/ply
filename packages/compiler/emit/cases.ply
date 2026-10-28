@@ -7,7 +7,7 @@ import compiler.syntax.parsing (span_key, span_between)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.check.infer (facts_at)
 import compiler.check.types (Type, TyCon, TyRecord, RSingleton, int_type, bytes_type, string_type,
-                             type_spelled)
+                             type_spelled, fn_type, row_empty)
 import compiler.emit.typing (unknown_type)
 import compiler.front
 import compiler.front.rows (Rows, KnownDefRow, Dump, CtorRow, EmitterCtor)
@@ -41,7 +41,7 @@ import compiler.emit.lower.setting (Root)
 import compiler.emit.typing (Typed)
 import compiler.unit (offered_roots)
 import compiler.emit (said, refused_rather_than_emitted, emit_program, emit_roots_answer,
-                      lowered_roots, zip_sources)
+                      lowered_roots, zip_sources, scope_of, answered)
 import compiler.emit.entry (RootForm, Formed, Unformed, emitted_of)
 import compiler.emit.print.counting (last_fn, rel_fn, free_fn, call_text, call_start, takes_count,
                                      lets_count_go, lets_go_of, counts_any)
@@ -260,7 +260,6 @@ test "a body that fails inside a `handle` leaves through the handle's landing, w
   assert_eq(leaves(b"rt_not_that_width_p(ctx, "), [true, true]);
   // A byte read past the end raises as `Bytes::at` does, over the index and the length alone.
   assert_eq(leaves(b"builtin_elaborated_refused_p(ctx, INT64_C(8), "), [true, true]);
-  assert_eq(bodies.map(|body: Bytes| body.index_of(b"rt_builtin_encoded_p")), [None, None]);
   assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
 }
 
@@ -283,7 +282,7 @@ test "a step `iterate` runs in place captures for a detached `handle` only slots
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"rt_detached_open_p(") != None), [true])
 }
 
-test "a `parallel` block tells the runtime its definition's row only where that row holds all its branches reach" {
+test "every `parallel` block hands the runtime its branches alike, wherever it is written" {
   let src = Bytes::concat_all([
     b"effect meter { read level() -> Int }\n",
     b"fn pure(n: Int) -> (Int, Int) = parallel { n + 1, n + 2 }\n",
@@ -305,8 +304,7 @@ test "a `parallel` block tells the runtime its definition's row only where that 
   let answers = answers_at([b"m"], [src], [], keys);
   let calls = |helper: Bytes|
     names.map(|n: Bytes| answered_body(answers, n).text.index_of(helper) != None);
-  assert_eq(calls(b"rt_branches_past_p(ctx, "), [true, true, false, false, false]);
-  assert_eq(calls(b"rt_branches_p(ctx, "), [false, false, true, true, true])
+  assert_eq(calls(b"rt_branches_p(ctx, "), [true, true, true, true, true])
 }
 
 test "a program that will not parse is refused, and the refusal carries the parser's words" {
@@ -1007,39 +1005,199 @@ test "a value's layout is read off its node's type where the value carries none"
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
   assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  // `max` orders the two field by field and answers one; neither crosses to the runtime.
-  assert_eq(has(b"rt_builtin_encoded_p("), [false, false, false, false]);
+  // `max` orders the two field by field and answers one.
   assert_eq(has(b"builtin_max_p"), [false, false, false, false])
 }
 
-test "a builtin the runtime answers a sum of crosses over its encoding, and a word's checked arithmetic is written in place" {
-  let src = Bytes::concat_all([
-    b"fn added(a: Int, b: Int) -> Option<Int> = checked_add(a, b)\n",
-    b"fn multiplied(a: Int, b: Int) -> Option<Int> = checked_mul(a, b)\n",
-    b"fn wide(a: U64, b: U64) -> Option<U64> = checked_add(a, b)\n",
-    b"fn decoded(s: Secret<String>) -> Option<Secret<Bytes>> / {abort.raise} = Secret::decode(\"hex\", s)\n",
+/// The integer types, and the numeric types the elaboration hands a witness for beyond them: `m`'s
+/// `Length` states its own arithmetic.
+fn integer_types() -> List<Bytes> =
+  [b"Int", b"U8", b"U16", b"U32", b"U64", b"I8", b"I16", b"I32", b"I64", b"U128", b"I128"]
+
+fn numeric_types() -> List<Bytes> = integer_types().concat([b"Float", b"Decimal", b"m.Length"])
+
+/// The names of the roots `answers` holds that the emitter refused, or whose code hands a value to
+/// the runtime over its encoding.
+fn crossing_answers(answers: List<RootAnswer>) -> List<Bytes> =
+  answers.fold([], |acc: List<Bytes>, a: RootAnswer|
+    match a.answer {
+      Refused(r) -> acc.push(Bytes::concat_all([answer_name(a), b": ", r.why])),
+      Body(b) -> if b.text.index_of(b"builtin_elaborated_lower_open_p(") != None {
+        acc.push(answer_name(a))
+      } else { acc },
+    })
+
+test "every number builtin is code the emitter writes, at every type it is called at" {
+  let length = Bytes::concat_all([
+    b"type Length = | Metres(Int) | Millimetres(Int)\n",
+    b"key for Length by millimetres\n",
+    b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: metres }\n",
+    b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+    b"fn plus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) + millimetres(b))\n",
+    b"fn minus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) - millimetres(b))\n",
+    b"fn times(a: Length, b: Length) -> Length = Millimetres(millimetres(a) * millimetres(b))\n",
+    b"fn negated(a: Length) -> Length = Millimetres(0 - millimetres(a))\n",
+    b"fn metres(n: Int) -> Length = Metres(n)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", src: src }], [], true);
-  assert_eq(out.map(|e: Emitted| e.why), [None, None, None, None]);
-  let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  // The runtime makes a sum as an object of its own, which no layout emitted code reads holds.
-  assert_eq(has(b"rt_builtin_encoded_p("), [false, false, false, true]);
-  assert_eq([has(b"builtin_checked_add_p"), has(b"builtin_checked_mul_p")], [
-    [false, false, false, false],
-    [false, false, false, false],
-  ])
+  let at_type = |t: Bytes|
+    Bytes::concat_all([
+      b"fn rows_",
+      t,
+      b"(a: ",
+      t,
+      b", b: ",
+      t,
+      b", n: Int) -> List<Option<",
+      t,
+      b">> = [checked_add(a, b), checked_sub(a, b), checked_mul(a, b), checked_neg(a), ",
+      b"Some(wrap_add(a, b)), Some(wrap_sub(a, b)), Some(wrap_mul(a, b)), Some(saturating_add(a, b)), ",
+      b"Some(saturating_sub(a, b)), Some(saturating_mul(a, b)), Some(rotl(a, n)), Some(rotr(a, n)), ",
+      b"Some(observe(a))]\n",
+      b"fn whole_",
+      t,
+      b"(a: ",
+      t,
+      b") -> Option<Int> = to_int(a)\n",
+    ]);
+  let src = Bytes::concat_all([
+    length,
+    Bytes::concat_all(integer_types().map(at_type)),
+    b"fn ints(a: U8, b: U16, c: U32, d: U64, e: I8, f: I16, g: I32, h: I64, i: U128, j: I128) -> List<Int> / {abort.raise} = ",
+    b"[Int::of_u8(a), Int::of_u16(b), Int::of_u32(c), Int::of_u64(d), Int::of_i8(e), Int::of_i16(f), ",
+    b"Int::of_i32(g), Int::of_i64(h), Int::of_u128(i), Int::of_i128(j)]\n",
+    b"fn arith<a>(x: a, y: a) -> List<a> / {abort.raise} where numeric(a) = [x + y, x - y, x * y, -x, numeric_of_int(3), observe(x)]\n",
+    b"fn ordered<a>(x: a, y: a) -> List<Bool> where numeric(a) = [x < y, x <= y, x > y, x >= y]\n",
+    b"fn bits<a>(x: a, y: a) -> List<a> / {abort.raise} where integer(a) = [x / y, x % y, x & y, x | y, x ^ y, x << 1, x >> 1, x >>> 1, ~x]\n",
+    b"fn whole<a>(x: a) -> Option<Int> where integer(a) = to_int(x)\n",
+    // A witness the specialisation does not undo, its parameter named only inside a record.
+    b"fn held<a>(p: { x: a, y: a }) -> List<a> where numeric(a) = [p.x + p.y, -p.x]\n",
+  ]);
+  let concrete = integer_types().fold([Named(b"m.ints")], |acc: List<RootKey>, t: Bytes|
+    acc.push(Named(b"m.rows_".concat(t))).push(Named(b"m.whole_".concat(t))));
+  let generic = numeric_types().fold([], |acc: List<RootKey>, t: Bytes|
+    acc.concat([b"m.arith", b"m.ordered", b"m.held"].map(|d: Bytes| at_spelled(d, [t])))).concat(
+    integer_types().fold([], |acc: List<RootKey>, t: Bytes|
+      acc.concat([b"m.bits", b"m.whole"].map(|d: Bytes| at_spelled(d, [t])))),
+  );
+  let wanted = concrete.concat(generic);
+  let answers = answers_at([b"m"], [src], [b"m.Length"], wanted);
+  assert_eq(answers.len(), wanted.len());
+  assert_eq(crossing_answers(answers), [])
 }
 
-test "a builtin crossing over its encoding is handed the witnesses the elaboration passes first, as the runtime declares it" {
-  let src = b"fn whole(x: U8) -> Option<Int> = to_int(x)\n";
+test "observe answers its value hidden from the C compiler behind the head's barrier, at any type, calling nothing" {
+  let src = Bytes::concat_all([
+    b"type Shape = | Dot | Line(Int)\n",
+    b"fn seen<a>(x: a) -> a = observe(x)\n",
+    b"fn text(s: String) -> String = observe(s)\n",
+    b"fn point(p: { x: Int, s: String }) -> { x: Int, s: String } = observe(p)\n",
+    b"fn shape(s: Shape) -> Shape = observe(s)\n",
+    b"fn apply(f: keep (Int) -> Int) -> Int = observe(f)(1)\n",
+    b"fn constant() -> Int = observe(1000) * 2\n",
+    b"fn nothing() -> Unit = observe(())\n",
+    b"fn amount(d: Decimal) -> Decimal = observe(d)\n",
+    b"fn wide(w: U128) -> U128 = observe(w)\n",
+  ]);
+  let seen = [at_spelled(b"m.seen", [b"String"]), at_spelled(b"m.seen", [b"Float"])];
+  let named = [b"m.text", b"m.point", b"m.shape", b"m.apply", b"m.constant", b"m.nothing"];
+  let pairs = [b"m.amount", b"m.wide"];
+  let answers = answers_at(
+    [b"m"],
+    [src],
+    [b"m.Shape"],
+    named.concat(pairs).map(Named).concat(seen),
+  );
+  assert_eq(crossing_answers(answers), []);
+  let text = |name: Bytes|
+    match answers.filter(|a: RootAnswer| answer_name(a) == name) {
+      [a] -> match a.answer { Body(b) -> b.text, Refused(_) -> b"" },
+      _ -> b"",
+    };
+  let lacking = |names: List<Bytes>, part: Bytes|
+    names.filter(|n: Bytes| text(n).index_of(part) == None);
+  // A value of no words has nothing to hide.
+  assert_eq(
+    lacking(named.filter(|n: Bytes| n != b"m.nothing").concat(seen.map(printed)), b"ply_observed("),
+    [],
+  );
+  assert_eq(lacking(pairs, b"ply_observed_pair("), [])
+}
+
+test "a secret's builtins are written over the natives of its handle, none over their arguments' encoding" {
+  let calls = [
+    { src: b"Secret::decode(\"hex\", t)", native: b"secret_decoded" },
+    { src: b"Secret::encode(\"hex\", b)", native: b"secret_encoded" },
+    { src: b"Secret::private_key(b)", native: b"secret_key" },
+    { src: b"Secret::rsa_jwk(m, m, ts)", native: b"secret_rsa_jwk" },
+    { src: b"Secret::hmac(\"SHA-256\", b, m)", native: b"secret_hmac" },
+    { src: b"Secret::hkdf_extract(\"SHA-256\", m, b)", native: b"secret_hkdf_extract" },
+    { src: b"Secret::hkdf_expand(\"SHA-256\", b, m, 32)", native: b"secret_hkdf_expand" },
+    { src: b"Secret::pbkdf2(\"SHA-256\", b, m, 1, 32)", native: b"secret_pbkdf2" },
+    {
+      src: b"Secret::concat(Secret::bytes(Secret::of_string(\"a\")), b)",
+      native: b"secret_concat",
+    },
+    { src: b"Secret::verify(t, \"a\") == Secret::is_empty(b)", native: b"secret_verify" },
+  ];
+  let params = b"(t: Secret<String>, b: Secret<Bytes>, m: Bytes, ts: List<Secret<String>>)";
+  let src = Bytes::concat_all(
+    range(0, calls.len()).map(|i: Int|
+      Bytes::concat_all([
+        b"fn f",
+        ascii_of_int(i),
+        params,
+        b" -> Unit / {abort.raise} = { let _ = ",
+        calls.get(i).src,
+        b"; () }\n",
+      ])),
+  );
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
-  assert_eq(out.map(|e: Emitted| e.why), [None]);
-  let code = own_code(out.get(0).text);
-  // The runtime's `to_int` takes a witness, then the value.
-  assert(code.index_of(b"rt_builtin_encoded_p(") != None, Some(String::of_bytes_lossy(code)));
-  assert(
-    code.index_of(b"builtin_elaborated_out_count_p(ctx, INT64_C(9), INT64_C(2))") != None,
-    Some(String::of_bytes_lossy(code)),
+  assert_eq(out.map(|e: Emitted| e.why), calls.map(|_: { src: Bytes, native: Bytes }| None));
+  assert_eq(
+    range(0, calls.len()).filter(|i: Int| {
+      let code = own_code(out.get(i).text);
+      code.index_of(builtin_helper(b"?".concat(calls.get(i).native)).concat(b"_p(")) == None
+    }),
+    [],
+  )
+}
+
+test "the crypto operations call their natives over machine words, the natives answering what they refuse" {
+  let crypto = Bytes::concat_all([
+    b"pub fn crypto_seal(cipher: String, key: Secret<Bytes>, nonce: Bytes, associated: Bytes, plaintext: Bytes) -> Bytes / {abort.raise} = {\n",
+    b"  let sealed = crypto_sealed(cipher, key, nonce, associated, plaintext);\n",
+    b"  if sealed.len() == 0 { abort.raise(\"too long\") } else { sealed }\n",
+    b"}\n",
+    b"pub fn crypto_verify(scheme: String, public: Bytes, message: Bytes, signature: Bytes) -> Bool / {abort.raise} =\n",
+    b"  match crypto_verified(scheme, public, message, signature) { 1 -> true, 0 -> false, _ -> abort.raise(\"no scheme\") }\n",
+    b"pub fn crypto_agree(scheme: String, key: Secret<Bytes>, peer: Bytes) -> Option<Secret<Bytes>> / {abort.raise} =\n",
+    b"  if !crypto_agrees(scheme) { abort.raise(\"no scheme\") } else {\n",
+    b"    let shared = crypto_agreed(scheme, key, peer);\n",
+    b"    if shared.len() == 0 { None } else { Some(shared) }\n",
+    b"  }\n",
+    b"extern fn crypto_sealed(cipher: String, key: Secret<Bytes>, nonce: Bytes, associated: Bytes, plaintext: Bytes) -> Bytes\n",
+    b"extern fn crypto_verified(scheme: String, public: Bytes, message: Bytes, signature: Bytes) -> Int\n",
+    b"extern fn crypto_agrees(scheme: String) -> Bool\n",
+    b"extern fn crypto_agreed(scheme: String, key: Secret<Bytes>, peer: Bytes) -> Secret<Bytes>\n",
+  ]);
+  let module = b"std.internal.crypto";
+  let roots = [
+    { name: b"crypto_seal", natives: [b"crypto_sealed"] },
+    { name: b"crypto_verify", natives: [b"crypto_verified"] },
+    { name: b"crypto_agree", natives: [b"crypto_agrees", b"crypto_agreed"] },
+  ];
+  let answers = answers_at(
+    [module],
+    [crypto],
+    [b"Some", b"None"],
+    roots.map(|r: { name: Bytes, natives: List<Bytes> }| Named(qualify(module, r.name))),
+  );
+  assert_eq(
+    roots.filter(|r: { name: Bytes, natives: List<Bytes> }| {
+      let code = own_code(answered_body(answers, qualify(module, r.name)).text);
+      r.natives.any(|n: Bytes| code.index_of(builtin_helper(n).concat(b"_p(")) == None)
+    }).map(|r: { name: Bytes, natives: List<Bytes> }| r.name),
+    [],
   )
 }
 
@@ -1736,6 +1894,212 @@ test "a value is digested through a root written for its type, its parts encoded
   assert(body(keyed).tables.calls.contains(Named(b"m.cents")), None)
 }
 
+/// A module `m` of types of each kind, the program holding `std.value` beside it.
+fn typed_fixture() -> Bytes =
+  Bytes::concat_all([
+    b"import std.value (Value, reflect, shown)\n",
+    b"type Shape = | Circle(Int) | Rect({ w: Int, h: U8 }) | Nothing\n",
+    b"type Tree<a> = | Leaf(a) | Node(Tree<a>, Tree<a>)\n",
+    b"type Stamp = | Stamp(Int)\n",
+    b"show for Stamp by stamped\n",
+    b"fn stamped(s: Stamp) -> String = \"s\"\n",
+    b"type Name = | Name(String)\n",
+    b"key for Name by folded\n",
+    b"fn folded(n: Name) -> String = match n { Name(s) -> s }\n",
+    b"type Point = new { x: Int, y: U8 }\n",
+    b"fn gr<a>(x: a) -> Value = reflect(x)\n",
+    b"fn gs<a>(x: a) -> Value = shown(x)\n",
+    b"fn gc<a>(x: a, y: a) -> Ordering where derivable(ord, a) = compare(x, y)\n",
+    b"fn gd<a>(x: a) -> Bytes where derivable(hash, a) = digest(x)\n",
+  ])
+
+/// The answer of every root `start` keys and of each root written for a type its bodies call,
+/// closed over those calls as a unit walks them, lowered over `typed_fixture` and `defs`.
+fn reached_from(defs: Bytes, start: List<RootKey>) -> List<RootAnswer> / {abort.raise} = {
+  let src = typed_fixture().concat(defs);
+  let shipped = [value_fixture()];
+  let analysed = analyse_pulling_std_with(zip_sources([b"m"], [src]), shipped, no_rows()).out;
+  match analysed { seam::Refused(diags) -> panic(String::of_bytes_lossy(said(diags))), _ -> () };
+  let d = dump_of(analysed);
+  let given = shipped.push({ name: b"m", src: src });
+  match scope_of(
+      given,
+      loaded_ctors(d, []),
+      true,
+      start,
+      [],
+      [],
+      d.embeds,
+      d.rows,
+      d.effects,
+      d.walked,
+    ) {
+    Err(why) -> panic(String::of_bytes_lossy(why)),
+    Ok(s) ->
+      iterate(
+        { answers: [], next: start },
+        64,
+        |w: { answers: List<RootAnswer>, next: List<RootKey> }|
+          if w.next.len() == 0 { Stop(w.answers) } else {
+            let all = w.answers.concat(answered(s, w.next, Map::new()));
+            let held = all.map(|a: RootAnswer| a.name);
+            Continue({
+              answers: all,
+              next: all.fold([], |acc: List<RootKey>, a: RootAnswer|
+                match a.answer {
+                  Body(b) ->
+                    b.tables.calls.fold(acc, |more: List<RootKey>, c: RootKey|
+                      match c {
+                        Written(_, _) -> if held.contains(root_name(c)) || more.contains(c) { more }
+                        else { more.push(c) },
+                        _ -> more,
+                      }),
+                  Refused(_) -> acc,
+                }),
+            })
+          },
+      ),
+  }
+}
+
+test "compare, reflect, shown and digest are written at every settled type, none crossing to the runtime" {
+  // Each type both orders and hashes, then each only reflects.
+  let both = [
+    b"Int",
+    b"Bool",
+    b"Char",
+    b"String",
+    b"Bytes",
+    b"Unit",
+    b"Decimal",
+    b"U8",
+    b"I64",
+    b"U128",
+    b"Ordering",
+    b"Shape",
+    b"Tree<Int>",
+    b"Stamp",
+    b"Name",
+    b"Point",
+    b"{}",
+    b"{ a: Int, b: Shape }",
+    b"List<Shape>",
+    b"Array<Point>",
+    b"Map<String, List<Name>>",
+    b"Columns<{ x: Int, y: Bool }>",
+    b"Option<Shape>",
+    b"Result<Int, String>",
+    b"Tree<{ s: List<Name>, t: Option<Tree<U8>> }>",
+  ];
+  let all = both.concat([
+    b"Float",
+    b"keep (Int) -> Int",
+    b"Secret<String>",
+    b"{ f: Float, g: List<Float> }",
+  ]);
+  // Each type's functions are named for its place: `c`, `v` and `d` where it orders and hashes.
+  let fns = |i: Int| if i < both.len() { [b"c", b"v", b"d", b"r", b"s"] } else { [b"r", b"s"] };
+  let defs = Bytes::concat_all(
+    range(0, all.len()).map(|i: Int| {
+      let t = all.get(i);
+      let n = ascii_of_int(i);
+      let one = |f: Bytes, answer: Bytes, call: Bytes|
+        Bytes::concat_all([b"fn ", f, n, b"(a: ", t, b") -> ", answer, b" = ", call, b"(a)\n"]);
+      let two = |f: Bytes, call: Bytes|
+        Bytes::concat_all([
+          b"fn ",
+          f,
+          n,
+          b"(a: ",
+          t,
+          b", b: ",
+          t,
+          b") -> Ordering = ",
+          call,
+          b"(a, b)\n",
+        ]);
+      let reflected = one(b"r", b"Value", b"reflect").concat(one(b"s", b"Value", b"shown"));
+      if i < both.len() {
+        Bytes::concat_all([
+          two(b"c", b"compare"),
+          two(b"v", b"compare_values"),
+          one(b"d", b"Bytes", b"digest"),
+          reflected,
+        ])
+      } else { reflected }
+    }),
+  );
+  let named = range(0, all.len()).fold([], |acc: List<Bytes>, i: Int|
+    acc.concat(fns(i).map(|f: Bytes| Bytes::concat_all([b"m.", f, ascii_of_int(i)]))));
+  // A generic body is settled at its callers' types, each specialisation written as those are.
+  let settled = [b"{a:Int,b:m.Shape}", b"List<m.Shape>", b"m.Tree<Int>"].fold(
+    [],
+    |acc: List<RootKey>, t: Bytes|
+      acc.concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(|g: Bytes| at_spelled(g, [t]))),
+  );
+  // What a kept value's descriptor orders it by, at types no source orders.
+  let kept = [
+    TyCon({ name: b"Float", args: [] }),
+    TyRecord([
+      { name: b"f", ty: TyCon({ name: b"Float", args: [] }) },
+      { name: b"n", ty: int_type() },
+    ]),
+    TyCon({ name: b"List", args: [TyCon({ name: b"Float", args: [] })] }),
+    TyCon({ name: b"Unit", args: [] }),
+    TyRecord([]),
+  ].map(|t: Type| in_m(Order, t));
+  let answers = reached_from(
+    defs,
+    named.map(Named).concat([b"m.gr", b"m.gs", b"m.gc", b"m.gd"].map(Named)).concat(settled).concat(
+      kept,
+    ),
+  );
+  assert_eq(
+    answers.fold([], |acc: List<Bytes>, a: RootAnswer|
+      match a.answer {
+        Body(_) -> acc,
+        Refused(r) -> acc.push(Bytes::concat_all([answer_name(a), b": ", r.why])),
+      }),
+    [],
+  );
+  // The walk reached the roots a `Columns` is reflected, shown and digested through.
+  let columns = TyCon({
+    name: b"Columns",
+    args: [
+      TyRecord([
+        { name: b"x", ty: int_type() },
+        { name: b"y", ty: TyCon({ name: b"Bool", args: [] }) },
+      ]),
+    ],
+  });
+  let names = answers.map(answer_name);
+  assert_eq(
+    [in_m(Reflect, columns), in_m(Shown, columns), in_m(Digest, columns)].map(printed).filter(
+      |n: Bytes| !names.contains(n),
+    ),
+    [],
+  )
+}
+
+test "an order or a digest of a type none is derived for is refused where it is written" {
+  let refused = [
+    in_m(Order, TyRecord([{ name: b"f", ty: fn_type([int_type()], int_type(), row_empty()) }])),
+    in_m(Order, TyCon({ name: b"Secret", args: [string_type()] })),
+    in_m(Digest, TyRecord([{ name: b"f", ty: TyCon({ name: b"Float", args: [] }) }])),
+  ];
+  let answers = reached_from(b"", refused);
+  assert_eq(
+    refused.map(printed).filter(|n: Bytes|
+      !answers.any(|a: RootAnswer|
+        answer_name(a) == n
+          && (match a.answer {
+            Refused(r) -> r.why.index_of(b"none is derived for") != None,
+            Body(_) -> false,
+          }))),
+    [],
+  )
+}
+
 test "an `Ok` of a record held as its box, records laid in it, is made and compared" {
   let ints = |p: Bytes, n: Int|
     Bytes::join(range(0, n).map(|i: Int| Bytes::concat_all([p, ascii_of_int(i), b": Int"])), b", ");
@@ -1790,16 +2154,11 @@ test "a keyed sum is compared and ordered by its key through roots its module wr
     { at: b"m.bags", root: roots.get(2) },
     { at: b"m.top", root: roots.get(1) },
   ].fold((), |_: Unit, c: { at: Bytes, root: RootKey }| {
-    assert(body(c.at).tables.calls.contains(c.root), Some(String::of_bytes_lossy(c.at)));
-    assert(body(c.at).text.index_of(b"rt_builtin_encoded_p") == None, None)
+    assert(body(c.at).tables.calls.contains(c.root), Some(String::of_bytes_lossy(c.at)))
   });
-  // `max` picks by that order, and the runtime is handed neither.
-  assert_eq(body(b"m.top").tables.builtins, []);
   // Each root orders the two keys, which the key's function answers.
   assert(body(printed(roots.get(0))).tables.calls.contains(Named(b"m.folded")), None);
-  assert(body(printed(roots.get(1))).tables.calls.contains(Named(b"m.folded")), None);
-  roots.map(printed).fold((), |_: Unit, r: Bytes|
-    assert(body(r).text.index_of(b"rt_builtin_encoded_p") == None, Some(String::of_bytes_lossy(r))))
+  assert(body(printed(roots.get(1))).tables.calls.contains(Named(b"m.folded")), None)
 }
 
 test "a type's stated arithmetic is called through roots its module writes, and a generic body is settled at the type" {
@@ -1902,7 +2261,7 @@ test "a generic body another module defines is settled at a type whose module st
   }
 }
 
-test "`assert_eq` compares as `==` does, and hands the runtime two values only where they differ" {
+test "`assert_eq` compares as `==` does, and only where they differ hands the runtime the bytes of each, through no builtin" {
   let src = Bytes::concat_all([
     b"type Name = | Name(String)\n",
     b"key for Name by folded\n",
@@ -1929,8 +2288,14 @@ test "`assert_eq` compares as `==` does, and hands the runtime two values only w
       None -> panic(String::of_bytes_lossy(b"no answer for ".concat(n))),
     };
   [b"m.same", printed(at_name)].fold((), |_: Unit, n: Bytes| {
-    assert(body(n).tables.calls.contains(in_m(keys::Equal, name)), Some(String::of_bytes_lossy(n)));
-    assert_eq(body(n).tables.builtins, [b"?assert_failed"])
+    let said = Some(String::of_bytes_lossy(n));
+    assert(body(n).tables.calls.contains(in_m(keys::Equal, name)), said);
+    assert_eq(
+      [b"builtin_elaborated_shown_open_p(", b"builtin_elaborated_assert_failed_p("].map(
+        |c: Bytes| body(n).text.index_of(c) != None,
+      ),
+      [true, true],
+    )
   })
 }
 
@@ -1957,8 +2322,7 @@ test "a generic sum is shown by the function its module states, at the sum's arg
   // The runtime shows no deque: the function is called at `Int`.
   assert_eq(body.tables.generics.calls.map(|g: GenericCall| { callee: g.callee, args: g.args }), [
     { callee: Named(b"m.written"), args: [TyCon({ name: b"Int", args: [] })] },
-  ]);
-  assert_eq(body.tables.builtins, [])
+  ])
 }
 
 test "a generic keyed sum is digested as its key, which its function answers at the sum's arguments" {
@@ -2378,7 +2742,6 @@ test "a string's builtin that is refused hands the runtime the words it was refu
     let native = if r.text { b"builtin_elaborated_refused_text_p(ctx, INT64_C(" }
     else { b"builtin_elaborated_refused_p(ctx, INT64_C(" };
     own_code(b.text).index_of(native.concat(ascii_of_int(r.code)).concat(b"), ")) == None
-      || own_code(b.text).index_of(b"rt_builtin_encoded_p") != None
       || b.tables.calls.any(|c: RootKey|
         match c { Written(w, _) -> crossings.contains(w.op), _ -> false })
   });
@@ -2582,10 +2945,7 @@ test "two columns are compared and ordered by roots that read each record in pla
     ordered,
   ]);
   assert(answered_body(answers, b"m.same").tables.calls.contains(equal), None);
-  assert(answered_body(answers, b"m.ordered").tables.calls.contains(ordered), None);
-  // The runtime reads no columns emitted code lays out.
-  [b"m.same", b"m.ordered", printed(equal), printed(ordered)].fold((), |_: Unit, n: Bytes|
-    assert(answered_body(answers, n).tables.builtins == [], Some(String::of_bytes_lossy(n))))
+  assert(answered_body(answers, b"m.ordered").tables.calls.contains(ordered), None)
 }
 
 test "an `Iter` compares as its type's root, by its case and then its payload, wherever it is compared" {
@@ -3180,7 +3540,7 @@ test "the emitter writes an embed out as the front end's answer says it was read
   }
 }
 
-test "a shipped module's extern is called as the builtin of its own name, over its encoding, or over machine words where its types are machine types" {
+test "a shipped module's extern over machine types is called over machine words, and a call of one over others is refused" {
   let names = [b"std.native", b"m"];
   let srcs = [
     b"pub extern fn counted(x: { n: Int }) -> Int\npub extern fn doubled(x: Int) -> Int\n",
@@ -3205,21 +3565,20 @@ test "a shipped module's extern is called as the builtin of its own name, over i
     d.effects,
     d.walked,
   );
-  let code_of = |name: Bytes|
+  let answer_of = |name: Bytes|
     match answers.find(|a: RootAnswer| a.name == root_name(Named(name))) {
-      Some(a) -> match a.answer {
-        Body(b) -> own_code(b.text),
-        Refused(r) -> panic(String::of_bytes_lossy(r.why)),
-      },
+      Some(a) -> a.answer,
       None -> panic("no answer"),
     };
-  let encoded = code_of(b"m.f");
-  assert_eq(encoded.split(b"rt_builtin_encoded_p(ctx").len(), 3);
-  assert(encoded.index_of(b"native_") == None, Some(String::of_bytes_lossy(encoded)));
-  // Over its words alone, through the pointer its unit binds, nothing encoded.
-  let worded = code_of(b"m.g");
-  assert_eq(worded.split(b"builtin_doubled_p(ctx, ").len(), 3);
-  assert(worded.index_of(b"rt_builtin_encoded_p") == None, Some(String::of_bytes_lossy(worded)))
+  match answer_of(b"m.f") {
+    Refused(r) -> assert(r.why.index_of(b"counted") != None, Some(String::of_bytes_lossy(r.why))),
+    Body(_) -> panic("a call of a native over its arguments' encoding was written"),
+  };
+  // Over its words alone, through the pointer its unit binds.
+  match answer_of(b"m.g") {
+    Body(b) -> assert_eq(own_code(b.text).split(b"builtin_doubled_p(ctx, ").len(), 3),
+    Refused(r) -> panic(String::of_bytes_lossy(r.why)),
+  }
 }
 
 /// A function of the prelude calling each extern the emitter writes in place, as the prelude's own
@@ -4283,8 +4642,7 @@ test "a scalar read out of an Option holds no count, whatever made the Option" {
     _ -> b"",
   };
   assert(
-    char_of.index_of(b"rt_builtin_encoded_p(") == None
-      && char_of.index_of(b"builtin_char_of_int_p(") == None,
+    char_of.index_of(b"builtin_char_of_int_p(") == None,
     Some(String::of_bytes_lossy(char_of)),
   );
   // A character's scalar value is read in place too.
@@ -4366,7 +4724,6 @@ test "a byte `byte_of_int` answers is handed to a list with no count taken again
   assert(
     text.index_of(b"ply_byte_text(ctx, ") != None
       && text.index_of(b"builtin_elaborated_refused_p(ctx, INT64_C(12), ") != None
-      && text.index_of(b"rt_builtin_encoded_p") == None
       && text.index_of(b"ply_list_room(ctx, ") != None,
     Some(String::of_bytes_lossy(text)),
   );

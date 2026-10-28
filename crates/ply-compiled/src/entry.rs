@@ -12,13 +12,10 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_UNWIND, lent};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_TARGET, lent};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
-use ply_core::{
-    Diagnostic, EffectAtom, Footprint, Mode, Resource, Seed, Severity, SourceId, Span, Symbol,
-    codes,
-};
+use ply_core::{Diagnostic, Seed, Severity, SourceId, Span, Symbol, codes};
 use ply_host::observe::Recorder;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -79,11 +76,9 @@ impl Opened {
     }
 }
 
-/// The arguments of a root that takes none: the PLV1 of the empty list.
-pub fn no_arguments() -> Vec<u8> {
-    ply_core::codec::encode(&ply_core::Value::list(Vec::new()))
-        .expect("the empty list is written whole")
-}
+/// The arguments of a root that takes none: the PLV1 of the empty list, its format and then the
+/// list's tag and its count.
+pub const NO_ARGUMENTS: &[u8] = b"PLV1\x09\x00";
 
 /// The span a unit with no source gives the root at `at` among its roots: a site of that root.
 pub(crate) fn site_span(at: usize) -> Span {
@@ -96,8 +91,7 @@ pub trait Binder: Send + Sync {
     /// A binding of the families from `grants` alone, or why it could not be made.
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>>;
 
-    /// What the families register under `grants`, and the facts a run's disclosures print, written
-    /// as `std.machine`'s `Hosting`.
+    /// The facts a run's disclosures print under `grants`, written as `std.machine`'s `Hosting`.
     fn hosting(&self, grants: &Grants, w: &mut Writer);
 
     /// The first read `trace` holds that no longer answers as it did under `grants`, as a person
@@ -149,12 +143,11 @@ pub struct Run {
     pub seed: Option<(Seed, u32)>,
     /// One of several runs of one test a search makes: reaching the host is refused.
     pub re_executed: bool,
-    /// What the root may perform, which a host answer outside is refused against.
-    pub declared: Option<Footprint>,
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
-    /// Whether its usage counts every perform, those its own handlers answer included.
-    pub counted: bool,
+    /// Whether the entry is a test's: its usage counts every perform, those its own handlers answer
+    /// included, and the objects it leaves live, and its program may read what it costs.
+    pub tested: bool,
 }
 
 impl Run {
@@ -166,9 +159,8 @@ impl Run {
             depth,
             seed: None,
             re_executed: false,
-            declared: None,
             measure: false,
-            counted: false,
+            tested: false,
         }
     }
 }
@@ -202,6 +194,9 @@ pub struct Usage {
     pub held: Held,
     pub updates: u64,
     pub updates_in_place: u64,
+    /// Objects of the program's still live once a test's entry answered and gave back what its
+    /// bodies held: each one nothing let go of. 0 for any other entry.
+    pub live: u64,
 }
 
 /// What a run still held when an entry's root body returned, before the run's region drained its
@@ -209,8 +204,8 @@ pub struct Usage {
 /// back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
-    /// Heap objects standing for a runtime value, such as a task's handle.
-    pub bridges: u64,
+    /// Native objects the runtime made, such as a task's handle.
+    pub native_objects: u64,
     /// Tasks the run's region still holds.
     pub scheduled: u64,
     /// Task stacks the run's region still keeps, its tasks' and those it keeps for its next ones.
@@ -266,37 +261,32 @@ pub fn enter(
     let recorder = own
         .clone()
         .or_else(|| watch.as_ref().and_then(|w| w.caller.clone()));
-    let binding = match bound {
-        Some(bound) => {
-            let made = bound.runtime_factory();
-            // Each runtime the entry makes, a `parallel` branch's among them, records into one record.
-            let factory: RuntimeFactory = match &recorder {
-                Some(recorder) => {
-                    let recorder = Arc::clone(recorder);
-                    Arc::new(move || {
-                        let runtime = made();
-                        ply_host::observe::records_into(&*runtime, &recorder);
-                        runtime
-                    })
-                }
-                None => made,
-            };
-            let runtime: Rc<dyn HostRuntime> = factory();
-            ctx.set_host(bound.binding(), Some(runtime), Some(factory));
-            Some(bound.binding())
-        }
-        None => None,
-    };
-    ctx.declared = run.declared.clone();
+    if let Some(bound) = bound {
+        let made = bound.runtime_factory();
+        // Each runtime the entry makes, a `parallel` branch's among them, records into one record.
+        let factory: RuntimeFactory = match &recorder {
+            Some(recorder) => {
+                let recorder = Arc::clone(recorder);
+                Arc::new(move || {
+                    let runtime = made();
+                    ply_host::observe::records_into(&*runtime, &recorder);
+                    runtime
+                })
+            }
+            None => made,
+        };
+        let runtime: Rc<dyn HostRuntime> = factory();
+        ctx.set_host(bound.binding(), Some(runtime), Some(factory));
+    }
     ctx.re_executed = run.re_executed;
-    ctx.trace_performs(run.counted);
+    ctx.tested = run.tested;
+    ctx.trace_performs(run.tested);
     let (seed, steps) = run
         .seed
         .clone()
         .unwrap_or_else(|| (Seed::default(), ply_core::sim::DEFAULT_STEPS));
     ctx.seed = seed;
     ctx.sim_steps = steps.max(1);
-    let id = ctx.id;
     // The counters are this thread's, an outer entry's among them, so the entry's are a difference.
     let counted = ply_core::rc::stats();
     let started = Instant::now();
@@ -308,9 +298,6 @@ pub fn enter(
     } else {
         0
     };
-    if let Some(binding) = &binding {
-        binding.machine_ended(id);
-    }
     let mut outcome = match entered {
         Ok((ended, last)) => {
             let counters = ply_core::rc::stats();
@@ -326,6 +313,7 @@ pub fn enter(
                     updates_in_place: counters
                         .updates_in_place
                         .saturating_sub(counted.updates_in_place),
+                    live: last.live,
                 },
                 warnings: std::mem::take(&mut ctx.teardown),
                 interleaving: last.interleaving,
@@ -366,6 +354,7 @@ struct Last {
     performs: u64,
     held: Held,
     interleaving: Option<Vec<u8>>,
+    live: u64,
 }
 
 /// An entry a Rust unwind left: its host runtime and the pool are told it is over, and its context
@@ -405,12 +394,15 @@ fn entered(
     // SAFETY: the unit owns the entry's pages and outlives the call, `ctx` is this entry's alone,
     // and an `R#entered` takes no words.
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
-    let last = returned(ctx);
+    let mut last = returned(ctx);
     let ended = if ctx.failed != 0 {
         failure(ctx)
     } else {
         answered(ctx, root)
     };
+    if run.tested && matches!(ended, Ended::Answered(_)) {
+        last.live = ctx.left_live() as u64;
+    }
     ctx.end();
     std::mem::forget(giving_back);
     (ended, last)
@@ -420,7 +412,7 @@ fn entered(
 /// the entry is over.
 fn returned(ctx: &mut Ctx) -> Last {
     let held = ctx.held_at_root.take().unwrap_or(Held {
-        bridges: ctx.heap.bridges() as u64,
+        native_objects: ctx.heap.natives() as u64,
         scheduled: 0,
         task_stacks: 0,
         frame_tables: ctx.stack_slots() as u64,
@@ -434,6 +426,7 @@ fn returned(ctx: &mut Ctx) -> Last {
         performs: ctx.performed.len() as u64,
         held,
         interleaving: ctx.interleaving.take(),
+        live: 0,
     }
 }
 
@@ -444,17 +437,11 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
         Ok(EntryBytes::Function) => {
             Ended::Unanswerable("its answer holds a function the program wrote")
         }
-        Ok(EntryBytes::Escaping(handle)) => {
+        Ok(EntryBytes::Escaping(escapee)) => {
             let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            Ended::Failed(ply_core::escape::refused(&boundary, handle, Span::DUMMY))
+            Ended::Failed(ply_core::escape::refused(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding(value)) => {
-            let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            match ply_core::escape::check(&boundary, &value, Span::DUMMY) {
-                Err(refused) => Ended::Failed(refused),
-                Ok(()) => Ended::Unanswerable("its answer holds a handle of its run"),
-            }
-        }
+        Ok(EntryBytes::Holding) => Ended::Unanswerable("its answer holds a handle of its run"),
         Err(why) => Ended::Failed(crate::rt::err_crossing(&why)),
     }
 }
@@ -462,7 +449,7 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
 /// How an entry that failed ended.
 fn failure(ctx: &mut Ctx) -> Ended {
     let failed = ctx.take_failure().unwrap_or_else(|| match ctx.failed {
-        FAILED_UNWIND => Diagnostic::error(
+        FAILED_TARGET => Diagnostic::error(
             codes::RUNTIME_ERROR,
             "a `handle` clause unwound past the compiled fragment's entry",
         ),
@@ -642,7 +629,7 @@ unsafe extern "C" fn rt_unit_unbind(ctx: *mut Ctx, binding: I64) -> TakenBytes {
     unsafe { &mut *ctx }.given(w.finish())
 }
 
-/// `hosting`: what the families register under the grants, and the disclosures' facts.
+/// `hosting`: the disclosures' facts under the grants.
 unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
     let c = unsafe { &mut *ctx };
     let Some(grants) = read_or_fail(c, unsafe { lent(p, n) }, read_grants) else {
@@ -782,7 +769,7 @@ struct Asked {
 }
 
 /// `run := int binding, bool hosted, int steps, int timeout_ms, int depth, option(seed),
-/// bool re_executed, option(list(atom)) declared, bool observe, bool measure, bool counted`.
+/// bool re_executed, bool observe, bool measure, bool tested`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
@@ -791,10 +778,9 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let depth = r.int()?;
     let seed = r.option(read_seed)?;
     let re_executed = r.bool()?;
-    let declared = r.option(|r| r.list(read_atom))?;
     let observe = r.bool()?;
     let measure = r.bool()?;
-    let counted = r.bool()?;
+    let tested = r.bool()?;
     Ok(Asked {
         binding,
         hosted,
@@ -805,9 +791,8 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
             depth,
             seed,
             re_executed,
-            declared: declared.map(Footprint::from_atoms),
             measure,
-            counted,
+            tested,
         },
     })
 }
@@ -826,52 +811,11 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
     ))
 }
 
-/// `atom := string effect, resource, bool write, option(string) op`.
-fn read_atom(r: &mut Reader<'_>) -> Result<EffectAtom, String> {
-    let effect = Symbol::new(r.str()?);
-    let resource = read_resource(r)?;
-    let mode = if r.bool()? { Mode::Write } else { Mode::Read };
-    Ok(match r.option(Reader::str)? {
-        Some(op) => EffectAtom::operation(effect, resource, mode, Symbol::new(op)),
-        None => EffectAtom::new(effect, resource, mode),
-    })
-}
-
-/// `resource := tag 0 singleton | 1 string labelled | 2 every | 3 int variable`.
-pub fn read_resource(r: &mut Reader<'_>) -> Result<Resource, String> {
-    Ok(match r.tag(4)? {
-        0 => Resource::Singleton,
-        1 => Resource::Named(Symbol::new(r.str()?)),
-        2 => Resource::Every,
-        _ => {
-            let n = r.count()?;
-            Resource::Var(u32::try_from(n).map_err(|_| format!("a label variable {n}"))?)
-        }
-    })
-}
-
-/// `resource`, as [`read_resource`] reads it.
-pub fn write_resource(w: &mut Writer, resource: &Resource) {
-    match resource {
-        Resource::Singleton => {
-            w.tag(0);
-        }
-        Resource::Named(name) => {
-            w.tag(1).str(name.as_str());
-        }
-        Resource::Every => {
-            w.tag(2);
-        }
-        Resource::Var(n) => {
-            w.tag(3).count(u64::from(*n));
-        }
-    }
-}
-
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),
 /// option(bytes) trace`; `ended := tag 0 bytes answer | 1 failure | 2 string panic | 3 no root |
 /// 4 string why unanswerable`; `usage := int nanos, bool host, int steps, int performs, int
-/// bridges, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place`.
+/// native_objects, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place,
+/// int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
         Ended::Answered(bytes) => {
@@ -899,12 +843,13 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         .bool(u.host)
         .count(u.steps)
         .count(u.performs)
-        .count(u.held.bridges)
+        .count(u.held.native_objects)
         .count(u.held.scheduled)
         .count(u.held.task_stacks)
         .count(u.held.frame_tables)
         .count(u.updates)
-        .count(u.updates_in_place);
+        .count(u.updates_in_place)
+        .count(u.live);
     w.list(outcome.warnings.iter(), |w, d| {
         write_failure(w, d, Some(opened))
     });
@@ -917,8 +862,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
 }
 
 /// `failure := string code, tag severity, string message, list(label), list(string) notes,
-/// list(bytes) values`; `label := option(site), bool primary, string text`; each value as
-/// [`Writer::plain`] writes it. A label at no site of `opened` is unplaced.
+/// list(bytes) values`; `label := option(site), bool primary, string text`; each value its PLV1,
+/// as [`Diagnostic::values`] holds it. A label at no site of `opened` is unplaced.
 pub fn write_failure(w: &mut Writer, d: &Diagnostic, opened: Option<&Opened>) {
     w.str(d.code)
         .tag(match d.severity {
@@ -934,10 +879,8 @@ pub fn write_failure(w: &mut Writer, d: &Diagnostic, opened: Option<&Opened>) {
     w.list(d.notes.iter(), |w, n| {
         w.str(n);
     });
-    w.list(d.values.iter(), |w, p| {
-        let mut value = Writer::new();
-        value.plain(p);
-        w.bytes(&value.finish());
+    w.list(d.values.iter(), |w, v| {
+        w.bytes(v);
     });
 }
 

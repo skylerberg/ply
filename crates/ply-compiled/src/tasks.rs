@@ -11,13 +11,13 @@ use crate::flat::Reader;
 use crate::heap::{self, Native, Word, native_of};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{
-    Aborting, Ctx, FAILED_ABORT, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, FAILED_UNWIND,
-    Unanswered, drop_frame, lent, no_stack_to_take, switch_keeping,
+    Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, Unanswered, lent, no_stack_to_take,
+    switch_keeping,
 };
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
 use ply_core::sim::TaskId;
-use ply_core::{Diagnostic, Span, Value, codes};
+use ply_core::{Diagnostic, Span, codes};
 use ply_host::pool::Run;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -68,15 +68,13 @@ struct Stashed {
     failed: i64,
     diagnostic: Option<Diagnostic>,
     pending: Option<Unanswered>,
-    unwind: Option<(usize, usize, Word)>,
-    aborting: Option<Aborting>,
     target: Word,
 }
 
 impl Stashed {
     fn release(self) {
-        if let Some(a) = self.aborting {
-            a.args.release();
+        if let Some(p) = self.pending {
+            p.release();
         }
     }
 }
@@ -86,8 +84,8 @@ struct Slot {
     stack: Option<Stack>,
     sp: usize,
     body: Option<Body>,
-    /// The task's frame stack, chained to the region's, once it has started.
-    frames: Option<usize>,
+    /// The task's stack's index in [`Ctx::stacks`], once it has started.
+    stack_index: Option<usize>,
     shields: Shields,
     stashed: Option<Stashed>,
     /// What `Ctx.task` says while it runs ([`task_number`]); none for the region's body, which runs
@@ -99,8 +97,8 @@ struct Slot {
 pub struct Region {
     ctx: *mut Ctx,
     seeded: bool,
-    /// The frame stack the region was opened on, which each task's chains to.
-    frames: usize,
+    /// The index in [`Ctx::stacks`] of the stack the region was opened on.
+    opened_on: usize,
     /// The calls a task may nest as it starts: as many as were left where the region was opened,
     /// however deep the loop that starts it stands.
     fuel: i64,
@@ -123,7 +121,7 @@ impl Region {
         Box::new(Region {
             ctx,
             seeded,
-            frames: unsafe { (*ctx).current },
+            opened_on: unsafe { (*ctx).current },
             fuel: unsafe { (*ctx).fuel },
             loop_sp: 0,
             running: None,
@@ -237,8 +235,6 @@ impl Region {
             (d, _) => d,
         };
         c.pending = s.pending;
-        c.unwind = s.unwind;
-        c.aborting = s.aborting;
         c.target = s.target;
         true
     }
@@ -258,11 +254,8 @@ impl Region {
         if let Some(s) = slot.stashed {
             s.release();
         }
-        if let Some(frames) = slot.frames {
-            for f in std::mem::take(&mut c.stacks[frames].list) {
-                drop_frame(f);
-            }
-            c.close_stack(frames);
+        if let Some(index) = slot.stack_index {
+            c.close_stack(index);
         }
         if let Some(stack) = slot.stack {
             self.live = self.live.saturating_sub(1);
@@ -308,20 +301,18 @@ pub unsafe fn resume(region: *mut Region, id: u64, answer: Message) -> Message {
         };
         slot.sp = stack.prepare(task_entry, region as usize);
         slot.stack = Some(stack);
-        let frames = c.open_stack(Some(r.frames));
-        c.stacks[frames].entered_from = Some(r.frames);
-        slot.frames = Some(frames);
+        slot.stack_index = Some(c.open_stack());
         r.live += 1;
         r.peak = r.peak.max(r.live);
     }
     let to = slot.sp;
-    c.current = slot.frames.unwrap_or(r.frames);
+    c.current = slot.stack_index.unwrap_or(r.opened_on);
     r.message = answer;
     r.running = Some(id);
     unsafe { switch_keeping(ctx, &raw mut r.loop_sp, to) };
     let r = unsafe { &mut *region };
     r.running = None;
-    unsafe { (*ctx).current = r.frames };
+    unsafe { (*ctx).current = r.opened_on };
     r.message
 }
 
@@ -457,16 +448,11 @@ extern "C" fn task_entry(arg: usize) {
             (UNWOUND, None)
         }
         failed => {
-            let raised = matches!(
-                failed,
-                FAILED_ABORT | FAILED_UNWIND | FAILED_TARGET | FAILED_PENDING
-            );
+            let raised = matches!(failed, FAILED_TARGET | FAILED_PENDING);
             let s = Stashed {
                 failed,
                 diagnostic: c.diagnostic.take(),
                 pending: c.pending.take(),
-                unwind: c.unwind.take(),
-                aborting: c.aborting.take(),
                 target: std::mem::take(&mut c.target),
             };
             c.failed = 0;
@@ -695,13 +681,6 @@ impl Native for Kept {
             v.release(ctx);
         }
     }
-
-    fn value(&self, ctx: *mut Ctx) -> Result<Value, String> {
-        match &self.value {
-            Some(v) => v.lower(ctx),
-            None => Err("a kept value let go of crossed".into()),
-        }
-    }
 }
 
 /// One region's tasks' stacks (`Stacks`): the region, its id among the entry's regions, the
@@ -740,10 +719,6 @@ impl Native for Stacks {
             heap::release_object(ctx, t);
         }
     }
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a region's stacks crossed".into())
-    }
 }
 
 /// At the entry's end, with the context going, the region's stacks are left to the process.
@@ -780,10 +755,6 @@ impl Native for TaskBody {
             s.release(ctx);
         }
     }
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a task's body crossed".into())
-    }
 }
 
 /// A region's task's handle (`Task`): its region, its id, how it ended and its answer.
@@ -801,10 +772,6 @@ impl Native for RegionTask {
         }
     }
 
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a task, which only its own region can hold, crossed".into())
-    }
-
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
         Some(ply_core::escape::Handle::Task)
     }
@@ -818,10 +785,6 @@ pub struct RegionChan {
 
 impl Native for RegionChan {
     fn release(&mut self, _ctx: *mut Ctx) {}
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a channel, which only its own region can hold, crossed".into())
-    }
 
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
         Some(ply_core::escape::Handle::Channel)
@@ -1794,7 +1757,7 @@ pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I
     let task_stacks = stacks.region.as_ref().map_or(0, |r| r.stacks());
     let c = unsafe { &mut *ctx };
     c.held_at_root = Some(crate::entry::Held {
-        bridges: c.heap.bridges() as u64,
+        native_objects: c.heap.natives() as u64,
         scheduled: u64::try_from(scheduled.0).unwrap_or(0),
         task_stacks: task_stacks as u64,
         frame_tables: c.stack_slots() as u64,

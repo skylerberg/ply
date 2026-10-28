@@ -41,6 +41,7 @@
 //! program, spawns over `Runs`, and started children over `Children`.
 
 import std.gen
+import std.internal.native (native, wait, job_wait, found, parts, in_parts, int_of)
 
 /// The program's own process, and the children it runs; `spawn` runs another to its end, and `start`
 /// runs one beside the program.
@@ -146,6 +147,163 @@ pub type Signal = | Hangup | Interrupt | Terminate | Kill | User1 | User2 | Wind
 /// What `output_line` heard: the next line of any `Lines` stream without its ending, nothing before
 /// the timeout, or the end of every `Lines` stream once each line has been read.
 pub type Heard = | Said(String) | Quiet | Closed
+
+// --- The real handler -------------------------------------------------------
+
+host for process by served
+
+/// `go` with the run's own process and the programs `--exec` binds, what waits on another program,
+/// on a person or on a child's pipe waited for in the asking task.
+fn served<a | e>(
+  go: () -> a / {process.read[*], process.write[*] | e},
+) -> a / {native.read, wait.read, abort.raise | e} =
+  handle {
+    go()
+  } with {
+    process.args[*p]() -> parts(process_args()).map(|arg: Bytes| String::of_bytes_lossy(arg)),
+    process.bound[*label]() -> process_bound(label),
+    process.out[*p](text) -> process_line(0, text),
+    process.err[*p](text) -> process_line(1, text),
+    process.out_bytes[*p](bytes) -> process_write(0, bytes),
+    process.err_bytes[*p](bytes) -> process_write(1, bytes),
+    process.flush[*p]() -> process_flush(),
+    process.line[*p]() -> match found(job_wait(process_read_line())) {
+      Some(line) -> Some(String::of_bytes_lossy(line)),
+      None -> None,
+    },
+    process.in_bytes[*p](max) -> if max < 0 {
+      panic("`process.in_bytes` was asked for " ++ max.to_string() ++ " bytes")
+    } else { job_wait(process_read(max)) },
+    process.exit[*p](code) -> if code < 0 || code > 125 {
+      panic("`process.exit` was given " ++ code.to_string() ++ ", and an exit code is 0 to 125")
+    } else { process_exit(code) },
+    process.spawn[*label](args, dir, env) ->
+      finished_of(job_wait(process_spawn(label, texts(args), dir, environment(env)))),
+    process.start[*label](args, dir, env, io) -> {
+      let said = process_start(label, texts(args), dir, environment(env), wiring(io));
+      let rest = said.slice(1, said.len());
+      if said.at(0) == 1 { Ok(int_of(rest)) } else { Err(String::of_bytes_lossy(rest)) }
+    },
+    process.wait[*label](child, timeout_ms) -> match found(
+        job_wait(process_wait(label, child, timeout_ms)),
+      ) {
+      Some(flat) -> Some(finished_of(flat)),
+      None -> None,
+    },
+    process.signal[*label](child, signal) -> process_signal(label, child, signal_number(signal)),
+    process.input[*label](child, bytes) -> job_wait(process_input(label, child, bytes)) == b"\x01",
+    process.end_input[*label](child) -> process_end_input(label, child),
+    process.output_line[*label](child, timeout_ms) ->
+      heard_of(job_wait(process_output_line(label, child, timeout_ms))),
+  }
+
+fn texts(each: List<String>) -> Bytes = in_parts(each.map(|t: String| Bytes::of_string(t)))
+
+fn environment(env: List<Var>) -> Bytes =
+  in_parts(
+    env.fold([], |acc: List<Bytes>, v: Var|
+      acc.push(Bytes::of_string(v.name)).push(Bytes::of_string(v.value))),
+  )
+
+/// As parts: a byte 1 where the child reads input and each stream's number, then each stream's
+/// file.
+fn wiring(io: Io) -> Bytes / {abort.raise} =
+  in_parts([
+    Bytes::concat_all(
+      [if io.input { 1 } else { 0 }, output_number(io.out), output_number(io.err)].map(|b: Int|
+        byte_of_int(b)),
+    ),
+    Bytes::of_string(output_file(io.out)),
+    Bytes::of_string(output_file(io.err)),
+  ])
+
+fn output_number(o: Output) -> Int =
+  match o { Keep -> 0, Discard -> 1, Inherit -> 2, Lines -> 3, File(_) -> 4 }
+
+fn output_file(o: Output) -> String = match o { File(path) -> path, _ -> "" }
+
+fn signal_number(s: Signal) -> Int =
+  match s {
+    Hangup -> 0,
+    Interrupt -> 1,
+    Terminate -> 2,
+    Kill -> 3,
+    User1 -> 4,
+    User2 -> 5,
+    WindowChange -> 6,
+  }
+
+fn finished_of(flat: Bytes) -> Finished / {abort.raise} =
+  match parts(flat) {
+    [kind, n, out, err] ->
+      {
+        ended: if int_of(kind) == 0 { Exited(int_of(n)) } else { Signalled(int_of(n)) },
+        out: out,
+        err: err,
+      },
+    _ -> panic("a child's native wrote no ending"),
+  }
+
+fn heard_of(flat: Bytes) -> Heard / {abort.raise} =
+  match flat.at(0) {
+    0 -> Said(String::of_bytes_lossy(flat.slice(1, flat.len()))),
+    1 -> Quiet,
+    _ -> Closed,
+  }
+
+/// The arguments the run was given, as parts.
+extern fn process_args() -> Bytes / {native.read}
+
+/// Whether the run bound a program to `label`.
+extern fn process_bound(label: String) -> Bool / {native.read}
+
+/// `text` and a line ending written to standard output, for `stream` 0, or standard error; a
+/// stream whose reader has gone ends the process.
+extern fn process_line(stream: Int, text: String) -> Unit / {native.read}
+
+/// Whether `bytes` reached standard output, for `stream` 0, or standard error.
+extern fn process_write(stream: Int, bytes: Bytes) -> Bool / {native.read}
+
+/// Whether what standard output's buffer held reached it.
+extern fn process_flush() -> Bool / {native.read}
+
+/// The ticket of one line of standard input without its ending, found.
+extern fn process_read_line() -> Int / {native.read}
+
+/// The ticket of what comes next on standard input, at most `max` bytes.
+extern fn process_read(max: Int) -> Int / {native.read}
+
+/// The run ended with `code`.
+extern fn process_exit(code: Int) -> Unit / {native.read}
+
+/// The ticket of the program `label` names run to its end, its arguments and its environment's
+/// names and values as parts: how it ended, its code or signal, and both streams, as parts.
+extern fn process_spawn(label: String, args: Bytes, dir: String, env: Bytes) -> Int / {native.read}
+
+/// A child started as `process_spawn` starts one and wired as `wiring` writes it: byte 1 and its
+/// handle, or byte 0 and why it could not start.
+extern fn process_start(
+  label: String,
+  args: Bytes,
+  dir: String,
+  env: Bytes,
+  wiring: Bytes,
+) -> Bytes / {native.read}
+
+/// The ticket of how the child ended, found once it has.
+extern fn process_wait(label: String, child: Int, timeout_ms: Int) -> Int / {native.read}
+
+/// Whether the signal `signal_number` numbers reached the child.
+extern fn process_signal(label: String, child: Int, signal: Int) -> Bool / {native.read}
+
+/// The ticket of `bytes` written to the child's input: byte 1 where every byte was.
+extern fn process_input(label: String, child: Int, bytes: Bytes) -> Int / {native.read}
+
+/// The child's input closed.
+extern fn process_end_input(label: String, child: Int) -> Unit / {native.read}
+
+/// The ticket of what `output_line` heard: byte 0 and a line, 1 for nothing or 2 for the end.
+extern fn process_output_line(label: String, child: Int, timeout_ms: Int) -> Int / {native.read}
 
 // --- The twin ---------------------------------------------------------------
 

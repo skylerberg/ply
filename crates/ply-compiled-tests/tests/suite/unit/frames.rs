@@ -2,6 +2,7 @@
 //! computation's frames would be, between its stack pointer and its stack's top, and a runtime
 //! frame's record holding a value of every kind it may hold.
 
+use super::heap::Holding;
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
 use ply_compiled::frames::{Held, PlyFrame, Snapshot, base, held_across, release_live};
@@ -9,7 +10,6 @@ use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::Ctx;
 use ply_compiled::stack::Stack;
-use ply_core::Value;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -135,8 +135,8 @@ fn closure(ctx: *mut Ctx, marker: Word, capture: Word) -> Word {
     w
 }
 
-/// A closure over a box, a carried box and a bridge to `text`, as a runtime frame holds them, and
-/// their words, for the test to count.
+/// A closure over a box, a carried box and a native object holding `text`, as a runtime frame holds
+/// them, and their words, for the test to count.
 pub(super) fn every_kind(
     ctx: *mut Ctx,
     markers: [Word; 3],
@@ -145,7 +145,7 @@ pub(super) fn every_kind(
     let [f, capture, x] = markers;
     let f = closure(ctx, f, boxed(ctx, capture));
     let x = boxed(ctx, x);
-    let h = unsafe { (*ctx).heap.bridge(Value::Str(Arc::clone(text))) };
+    let h = unsafe { (*ctx).heap.native(Box::new(Holding(Arc::clone(text)))) };
     let held = unsafe {
         [
             Held::Closure(Block::of(f)),

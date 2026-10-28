@@ -3,14 +3,15 @@
 //! others leaving the outer as they found it.
 
 use crate::bare::{context, context_calling, helper};
+use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::{Carried, Handed, PlyType};
 use ply_compiled::heap::{HEADER, Word, imm, word_at};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::{Ctx, Lifted};
-use ply_core::codec::{decode, encode, tag};
-use ply_core::{Decimal, Fields, Fixed, INT_TYPES, IntTy, Symbol, Value};
-use std::sync::Arc;
+use ply_core::codec::{Writer, fun, shown, tag};
+use ply_core::float::bits;
+use ply_core::{Decimal, Fixed, INT_TYPES, IntTy};
 
 type N0 = unsafe extern "C" fn(*mut Ctx);
 type A0 = unsafe extern "C" fn(*mut Ctx) -> Word;
@@ -44,13 +45,11 @@ fn lowered(ctx: &mut Ctx, again: bool, write: impl FnOnce(*mut Ctx)) -> Vec<u8> 
     }
 }
 
-fn record(fields: Vec<(&str, Value)>) -> Value {
-    Value::Record(Arc::new(Fields::from_unsorted(
-        fields
-            .into_iter()
-            .map(|(k, v)| (Symbol::new(k), v))
-            .collect(),
-    )))
+/// `write` over a fresh writer: the bytes the codec writes of a value written a part at a time.
+fn written(write: impl FnOnce(&mut Writer)) -> Vec<u8> {
+    let mut w = Writer::new();
+    write(&mut w);
+    w.finish()
 }
 
 fn width(ty: IntTy) -> Word {
@@ -97,35 +96,44 @@ fn the_natives_write_what_the_codec_writes() {
     });
     assert_eq!(ctx.failed, 0);
     let wide = (7u128 << 64) | u128::from(u64::MAX);
-    let v = record(vec![
-        ("a_decimal", Value::Decimal(d)),
-        (
-            "b_narrow",
-            Value::Fixed(Fixed::new(IntTy::I8, -1i128 as u128)),
-        ),
-        ("c_wide", Value::Fixed(Fixed::new(IntTy::U128, wide))),
-        ("d_int", Value::Int(-5)),
-        ("e_text", Value::str("né")),
-        ("f_some", Value::ctor("Some", vec![Value::Unit])),
-        ("g_flag", Value::Bool(true)),
-        (
-            "h_list",
-            Value::list(vec![
-                Value::Float(1.5),
-                Value::Char('c'),
-                Value::bytes(b"\x00\xff"),
-            ]),
-        ),
-    ]);
-    assert_eq!(bytes, encode(&v).unwrap());
+    let expected = written(|w| {
+        w.count(tag::RECORD, 8);
+        w.name(b"a_decimal");
+        w.decimal(d.serialize());
+        w.name(b"b_narrow");
+        w.fixed(Fixed::new(IntTy::I8, -1i128 as u128));
+        w.name(b"c_wide");
+        w.fixed(Fixed::new(IntTy::U128, wide));
+        w.name(b"d_int");
+        w.int(-5);
+        w.name(b"e_text");
+        w.str("né".as_bytes());
+        w.name(b"f_some");
+        w.ctor(b"Some", 1);
+        w.tag(tag::UNIT);
+        w.name(b"g_flag");
+        w.tag(tag::TRUE);
+        w.name(b"h_list");
+        w.count(tag::LIST, 3);
+        w.float(bits(1.5));
+        w.char(u32::from('c'));
+        w.bytes(b"\x00\xff");
+    });
+    assert_eq!(bytes, expected);
 }
 
-/// Asked of a value written before, a lowering that shares writes it again as `AGAIN`, which reads
-/// back as a copy; one that does not writes it whole each time.
+/// A block of one word past its header, counted `rc`, its address the word that stands for it.
+fn block(rc: u32) -> Box<[u64; 2]> {
+    Box::new([u64::from(rc), 0])
+}
+
+/// Asked of a value written before, a lowering that shares writes it again as `AGAIN`, numbered as
+/// each string, bytes, list, array or map opened; one that does not writes it whole each time.
 #[test]
 fn a_value_written_twice_is_written_again_only_where_the_lowering_shares() {
     let mut ctx = context();
-    let (shared, inner) = (0x1000 as Word, 0x2000 as Word);
+    let (a, b) = (block(1), block(1));
+    let (shared, inner) = (a.as_ptr() as Word, b.as_ptr() as Word);
     let write = |ctx: *mut Ctx| unsafe {
         let again: A1 = native("?out_again");
         native::<N2>("?out_count")(ctx, tag::LIST as Word, 3);
@@ -144,14 +152,25 @@ fn a_value_written_twice_is_written_again_only_where_the_lowering_shares() {
     let with = lowered(&mut ctx, true, write);
     let without = lowered(&mut ctx, false, write);
     assert_eq!(ctx.failed, 0);
-    let s = Value::str("a string long enough to share");
-    let whole = Value::list(vec![
-        Value::list(vec![s.clone()]),
-        Value::list(vec![s.clone()]),
-        s,
-    ]);
-    assert_eq!(without, encode(&whole).unwrap());
-    assert_eq!(decode(&with).unwrap(), whole);
+    let s = b"a string long enough to share";
+    let whole = written(|w| {
+        w.count(tag::LIST, 3);
+        for _ in 0..2 {
+            w.count(tag::LIST, 1);
+            w.str(s);
+        }
+        w.str(s);
+    });
+    // The outer list is 0, the inner list 1 and its string 2.
+    let shared = written(|w| {
+        w.count(tag::LIST, 3);
+        w.count(tag::LIST, 1);
+        w.str(s);
+        w.again(1);
+        w.again(2);
+    });
+    assert_eq!(without, whole);
+    assert_eq!(with, shared);
     assert!(
         with.len() + 50 < without.len(),
         "{} bytes shared, {} not",
@@ -160,19 +179,49 @@ fn a_value_written_twice_is_written_again_only_where_the_lowering_shares() {
     );
 }
 
+/// A static stands for every value of its contents, a string's and a byte string's alike, so a
+/// lowering that shares writes it whole each time, never as `AGAIN`.
+#[test]
+fn a_static_is_written_whole_each_time_a_lowering_shares() {
+    let mut ctx = context();
+    let s = block(ply_compiled::heap::IMMORTAL);
+    let w = s.as_ptr() as Word;
+    let bytes = lowered(&mut ctx, true, |ctx| unsafe {
+        let again: A1 = native("?out_again");
+        native::<N2>("?out_count")(ctx, tag::LIST as Word, 2);
+        assert_eq!(again(ctx, w), 0);
+        text(ctx, "?out_str", b"a");
+        assert_eq!(again(ctx, w), 0);
+        text(ctx, "?out_bytes", b"a");
+    });
+    assert_eq!(ctx.failed, 0);
+    let whole = written(|w| {
+        w.count(tag::LIST, 2);
+        w.str(b"a");
+        w.bytes(b"a");
+    });
+    assert_eq!(bytes, whole);
+}
+
 /// Bytes the codec wrote, read a part at a time as a value's type reads them.
 #[test]
 fn the_natives_read_what_the_codec_writes() {
     let mut ctx = context();
     let d = Decimal::new(271828, 5);
-    let v = Value::list(vec![
-        Value::ctor("m.Pair", vec![Value::Int(-9), Value::str("ok")]),
-        record(vec![("x", Value::Float(-0.25)), ("y", Value::Char('é'))]),
-        Value::Decimal(d),
-        Value::Fixed(Fixed::new(IntTy::I16, -2i128 as u128)),
-        Value::Bool(false),
-    ]);
-    let bytes = encode(&v).unwrap();
+    let bytes = written(|w| {
+        w.count(tag::LIST, 5);
+        w.ctor(b"m.Pair", 2);
+        w.int(-9);
+        w.str(b"ok");
+        w.count(tag::RECORD, 2);
+        w.name(b"x");
+        w.float(bits(-0.25));
+        w.name(b"y");
+        w.char(u32::from('é'));
+        w.decimal(d.serialize());
+        w.fixed(Fixed::new(IntTy::I16, -2i128 as u128));
+        w.tag(tag::FALSE);
+    });
     let c: *mut Ctx = &mut ctx;
     unsafe {
         native::<N2>("?lift_open")(c, bytes.as_ptr() as Word, bytes.len() as Word);
@@ -242,14 +291,18 @@ fn lift_and(bytes: &[u8], read: impl FnOnce(*mut Ctx)) -> String {
 /// Bytes that do not hold what a type reads are Ply's defect, and fail the context.
 #[test]
 fn bytes_that_do_not_read_as_the_type_fail_the_context() {
-    let int = encode(&Value::Int(3)).unwrap();
+    let int = written(|w| w.int(3));
     let said = lift_and(&int, |c| unsafe {
         native::<A0>("?in_float")(c);
     });
     assert!(said.contains("tagged 3 where one tagged 4"), "{said}");
     let said = lift_and(&int, |_| {});
     assert!(said.contains("bytes follow"), "{said}");
-    let rec = encode(&record(vec![("x", Value::Int(1))])).unwrap();
+    let rec = written(|w| {
+        w.count(tag::RECORD, 1);
+        w.name(b"x");
+        w.int(1);
+    });
     let said = lift_and(&rec, |c| unsafe {
         native::<A1>("?in_count")(c, tag::RECORD as Word);
         native::<N2>("?in_field")(c, b"y".as_ptr() as Word, 1);
@@ -266,13 +319,13 @@ fn bytes_that_do_not_read_as_the_type_fail_the_context() {
 fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
     let mut ctx = context();
     let wide = (5u128 << 64) | 9;
-    let v = Value::list(vec![
-        Value::Fixed(Fixed::new(IntTy::U128, wide)),
-        Value::Fixed(Fixed::new(IntTy::I128, -3i128 as u128)),
-        Value::Fixed(Fixed::new(IntTy::U8, 255)),
-        Value::Fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX))),
-    ]);
-    let bytes = encode(&v).unwrap();
+    let bytes = written(|w| {
+        w.count(tag::LIST, 4);
+        w.fixed(Fixed::new(IntTy::U128, wide));
+        w.fixed(Fixed::new(IntTy::I128, -3i128 as u128));
+        w.fixed(Fixed::new(IntTy::U8, 255));
+        w.fixed(Fixed::new(IntTy::U64, u128::from(u64::MAX)));
+    });
     let c: *mut Ctx = &mut ctx;
     unsafe {
         native::<N2>("?lift_open")(c, bytes.as_ptr() as Word, bytes.len() as Word);
@@ -289,7 +342,7 @@ fn a_wide_values_high_word_is_kept_for_one_ask_after_its_low_word() {
         native::<N0>("?lift_close")(c);
     }
     unfailed(&mut ctx);
-    let one = encode(&Value::Fixed(Fixed::new(IntTy::U128, wide))).unwrap();
+    let one = written(|w| w.fixed(Fixed::new(IntTy::U128, wide)));
     let said = lift_and(&one, |c| unsafe {
         native::<A1>("?in_fixed")(c, width(IntTy::U128));
         native::<A0>("?in_high")(c);
@@ -327,16 +380,17 @@ fn called_encoded(c: *mut Ctx, index: Word, args: impl FnOnce(*mut Ctx)) {
     }
 }
 
-/// A builtin called over its arguments' encoding answers a lifting of its answer's, and what the
-/// bytes cannot hold crosses beside them both ways.
+/// What a builder an earlier release compiled calls over its arguments' encoding: `to_int`, whose
+/// answer a lifting of an `Option<Int>` holds, and `panic`, which raises its message.
 #[test]
-fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
-    let mut ctx = context_calling(&["checked_neg", "Secret::verify", "Secret::of_string"]);
+fn panic_and_to_int_are_answered_over_their_arguments_encoding() {
+    let mut ctx = context_calling(&["to_int", "panic"]);
     let c: *mut Ctx = &mut ctx;
     unsafe {
         called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            native::<N1>("?out_int")(c, 5);
+            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
+            native::<N1>("?out_int")(c, 0);
+            native::<N1>("?out_int")(c, -5);
         });
         assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 1);
         assert_eq!(
@@ -345,69 +399,26 @@ fn a_builtin_called_encoded_answers_a_lifting_of_its_answer() {
         );
         assert_eq!(native::<A0>("?in_int")(c), -5i64 as Word);
         native::<N0>("?lift_close")(c);
-        called_encoded(c, 2, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            text(c, "?out_str", b"hunter2");
-        });
-        let secret = native::<A0>("?in_handle")(c);
-        native::<N0>("?lift_close")(c);
-        called_encoded(c, 1, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-            native::<N1>("?out_handle")(c, secret);
-            text(c, "?out_str", b"hunter3");
-        });
-        assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
-        native::<N0>("?lift_close")(c);
-    }
-    unfailed(&mut ctx);
-}
-
-/// A runtime object is read as it is written into a lowering, so the code that wrote it may let it
-/// go before the builtin the lowering is read for runs.
-#[test]
-fn a_runtime_object_written_into_a_lowering_outlives_the_count_that_wrote_it() {
-    let mut ctx = context_calling(&["Secret::verify", "Secret::of_string"]);
-    let c: *mut Ctx = &mut ctx;
-    unsafe {
-        called_encoded(c, 1, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            text(c, "?out_str", b"hunter2");
-        });
-        let secret = native::<A0>("?in_handle")(c);
-        native::<N0>("?lift_close")(c);
         called_encoded(c, 0, |c| {
             native::<N2>("?out_count")(c, tag::LIST as Word, 2);
-            native::<N1>("?out_handle")(c, secret);
-            helper::<N1>("rt_handle_free")(c, secret);
-            text(c, "?out_str", b"hunter3");
-        });
-        assert_eq!(native::<A0>("?in_tag")(c), tag::FALSE as Word);
-        native::<N0>("?lift_close")(c);
-    }
-    unfailed(&mut ctx);
-}
-
-/// A hold written into a lowering reads as a hold, whatever it holds, which no crossing reads.
-#[test]
-fn a_hold_written_into_a_lowering_reads_as_a_hold() {
-    let mut ctx = context_calling(&["reflect"]);
-    let c: *mut Ctx = &mut ctx;
-    let name = b"std.value.VHold";
-    unsafe {
-        let hold = native::<A1>("?hold_made")(c, imm(42));
-        called_encoded(c, 0, |c| {
-            native::<N2>("?out_count")(c, tag::LIST as Word, 1);
-            native::<N1>("?out_handle")(c, hold);
+            native::<N1>("?out_int")(c, 0);
+            native::<N3>("?out_fixed")(c, width(IntTy::U64), -1, 0);
         });
         assert_eq!(native::<A1>("?in_count")(c, tag::CTOR as Word), 0);
         assert_eq!(
-            native::<A2>("?in_name_is")(c, name.as_ptr() as Word, name.len() as Word),
+            native::<A2>("?in_name_is")(c, b"None".as_ptr() as Word, 4),
             1
         );
         native::<N0>("?lift_close")(c);
-        helper::<N1>("rt_handle_free")(c, hold);
     }
     unfailed(&mut ctx);
+    let c: *mut Ctx = &mut ctx;
+    called_encoded(c, 1, |c| unsafe {
+        native::<N2>("?out_count")(c, tag::LIST as Word, 1);
+        text(c, "?out_str", b"stop");
+    });
+    let raised = ctx.take_failure().expect("a panic raises");
+    assert_eq!(raised.message, "panic: stop");
 }
 
 /// A builtin that raises ends the lowering of its arguments and opens nothing, so the crossing it
@@ -426,20 +437,22 @@ fn a_builtin_called_encoded_that_raises_opens_nothing() {
     });
     let said = ctx.take_failure().expect("the builtin raised").message;
     assert!(said.contains("no such file"), "{said}");
-    assert_eq!(
-        decode(&outer).unwrap(),
-        Value::list(vec![Value::Int(1), Value::Int(2)])
-    );
+    let whole = written(|w| {
+        w.count(tag::LIST, 2);
+        w.int(1);
+        w.int(2);
+    });
+    assert_eq!(outer, whole);
 }
 
 /// A builtin is called over a lowering of its arguments and nothing else.
 #[test]
 fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_context() {
-    let mut ctx = context_calling(&["checked_neg"]);
+    let mut ctx = context_calling(&["to_int"]);
     unsafe { helper::<N1>("rt_builtin_encoded")(&mut ctx, 0) };
     let said = ctx.take_failure().expect("a diagnostic").message;
     assert!(said.contains("no lowering open"), "{said}");
-    let mut ctx = context_calling(&["digest"]);
+    let mut ctx = context_calling(&["panic"]);
     called_encoded(&mut ctx, 1, |c| unsafe {
         native::<N2>("?out_count")(c, tag::LIST as Word, 0);
     });
@@ -452,7 +465,7 @@ fn a_builtin_called_encoded_with_no_lowering_or_outside_its_pool_fails_the_conte
 #[test]
 fn a_crossing_inside_a_crossing_leaves_the_outer_as_it_was() {
     let mut ctx = context();
-    let inner_bytes = encode(&Value::Int(7)).unwrap();
+    let inner_bytes = written(|w| w.int(7));
     let mut written_inside = Vec::new();
     let outer = lowered(&mut ctx, false, |c| unsafe {
         native::<N2>("?out_count")(c, tag::LIST as Word, 3);
@@ -465,7 +478,7 @@ fn a_crossing_inside_a_crossing_leaves_the_outer_as_it_was() {
         let n = native::<A0>("?lower_close")(c);
         let mut b = vec![0u8; n as usize];
         native::<N2>("?taken")(c, b.as_mut_ptr() as Word, n);
-        assert_eq!(decode(&b).unwrap(), Value::Int(2));
+        assert_eq!(b, written(|w| w.int(2)));
         native::<N2>("?lift_open")(c, inner_bytes.as_ptr() as Word, inner_bytes.len() as Word);
         let seven = native::<A0>("?in_int")(c);
         native::<N0>("?lift_close")(c);
@@ -473,11 +486,14 @@ fn a_crossing_inside_a_crossing_leaves_the_outer_as_it_was() {
         native::<N1>("?out_int")(c, 3);
     });
     unfailed(&mut ctx);
-    assert_eq!(
-        decode(&outer).unwrap(),
-        Value::list(vec![Value::Int(1), Value::Int(7), Value::Int(3)])
-    );
-    assert_eq!(decode(&written_inside).unwrap(), Value::Int(0));
+    let whole = written(|w| {
+        w.count(tag::LIST, 3);
+        w.int(1);
+        w.int(7);
+        w.int(3);
+    });
+    assert_eq!(outer, whole);
+    assert_eq!(written_inside, written(|w| w.int(0)));
 }
 
 #[test]
@@ -539,55 +555,81 @@ unsafe extern "C" fn lower_pair(ctx: *mut Ctx, w: Word) -> Word {
     0
 }
 
+/// What a diagnostic shows of a value is its bytes alone: a credential and a hold each a handle at
+/// the position saying what it is, the credential's payload nowhere, and a carried value written in
+/// place through its type and what it carries through theirs.
 #[test]
-fn a_carried_value_lowers_through_its_type_and_what_it_carries_through_theirs() {
+fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
     let mut ctx = context();
-    let pair = unsafe { Carried::new(Handed::of(40), &PAIR) };
-    let v = pair.lower(&mut ctx).expect("it lowers");
-    assert_eq!(
-        v,
-        record(vec![
-            ("first", Value::Int(40)),
-            ("second", Value::ctor("m.Inner", vec![Value::Int(41)])),
-        ])
-    );
-    assert_eq!(ctx.failed, 0);
-    pair.release(&mut ctx);
-}
-
-/// A runtime object crosses as itself.
-#[test]
-fn a_bridge_lowered_as_a_handle_reads_as_what_it_bridges() {
-    static BRIDGED: PlyType = PlyType {
-        identity: 4,
-        spelled: b"Secret<String>".as_ptr(),
-        spelled_len: 14,
-        inc: unread,
-        dec: unread,
-        lower: lower_handle,
-        lift: nothing,
+    let secret = sealed(&mut ctx, b"hunter2", true);
+    let c: *mut Ctx = &mut ctx;
+    let bytes = unsafe {
+        let hold = native::<A1>("?hold_made")(c, imm(42));
+        native::<N0>("?shown_open")(c);
+        native::<N2>("?out_count")(c, tag::LIST as Word, 3);
+        native::<N1>("?out_handle")(c, secret);
+        native::<N1>("?out_handle")(c, hold);
+        native::<N2>("?out_carried")(c, 40, &raw const PAIR as Word);
+        let n = native::<A0>("?lower_close")(c);
+        let mut out = vec![0u8; n as usize];
+        native::<N2>("?taken")(c, out.as_mut_ptr() as Word, n);
+        helper::<N1>("rt_handle_free")(c, hold);
+        out
     };
-    unsafe extern "C" fn lower_handle(ctx: *mut Ctx, w: Word) -> Word {
-        unsafe { native::<N1>("?out_handle")(ctx, w) };
-        0
-    }
+    unfailed(&mut ctx);
+    let mut w = Writer::new();
+    w.count(tag::LIST, 3);
+    w.handle(shown::SEALED);
+    w.handle(shown::HOLD);
+    w.count(tag::RECORD, 2);
+    w.name(b"first");
+    w.int(40);
+    w.name(b"second");
+    w.ctor(b"m.Inner", 1);
+    w.int(41);
+    assert_eq!(bytes, w.finish());
+    assert!(!bytes.windows(7).any(|b| b == b"hunter2"));
+}
+
+/// An `assert_eq` that failed raises `E0501` showing the expected value and then the actual, each the
+/// bytes it was handed, and a clause for the raise is told each by its kind.
+#[test]
+fn a_failed_assertion_raises_showing_the_expected_value_then_the_actual() {
+    type N4 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
     let mut ctx = context();
-    let b = ctx.heap.bridge(Value::secret_text("hunter2"));
-    let held = unsafe { Carried::new(Handed::of(b), &BRIDGED) };
-    let v = held.lower(&mut ctx).expect("it lowers");
-    assert!(matches!(v, Value::Secret(_)), "{v:?}");
-    held.release(&mut ctx);
+    let actual = written(|w| w.int(2));
+    let expected = written(|w| w.str(b"x"));
+    unsafe {
+        native::<N4>("?assert_failed")(
+            &mut ctx,
+            actual.as_ptr() as Word,
+            actual.len() as Word,
+            expected.as_ptr() as Word,
+            expected.len() as Word,
+        )
+    };
+    let d = ctx.take_failure().expect("the assertion raised");
+    assert_eq!(d.code, ply_core::codes::ASSERTION_FAILED);
+    assert_eq!(d.values.iter().collect::<Vec<_>>(), [&expected, &actual]);
+    assert_eq!(
+        d.described(&d.message),
+        "assertion failed: expected a `String`, found an `Int`"
+    );
 }
 
 #[test]
-fn a_function_the_program_wrote_crosses_by_name_which_only_its_own_run_reads_back() {
+fn a_function_the_program_wrote_crosses_by_its_name() {
     let mut ctx = context();
     let name = b"m.double";
     let named = lowered(&mut ctx, false, |c| unsafe {
         native::<N3>("?out_fun")(c, 0, name.as_ptr() as Word, name.len() as Word)
     });
-    let refused = decode(&named).unwrap_err();
-    assert!(refused.contains("only its own run"), "{refused}");
+    unfailed(&mut ctx);
+    let by_name = written(|w| {
+        w.fun(fun::NAMED);
+        w.name(name);
+    });
+    assert_eq!(named, by_name);
 }
 
 /// A value of `m.Box`, a block of one word, counted at its offset 0 and freed by size.
@@ -622,17 +664,17 @@ static BOX: PlyType = PlyType {
 /// A lifting of a list of `handles`, each a position beside the bytes, with a runtime object at
 /// position 0 and a box carried with its type at position 1; answers the box.
 fn lifting_beside(ctx: &mut Ctx, handles: &[u64]) -> Word {
-    let mut w = ply_core::codec::Writer::new();
+    let mut w = Writer::new();
     w.count(tag::LIST, handles.len() as u64);
     for at in handles {
         w.handle(*at);
     }
     let b = unsafe { helper::<A1>("rt_alloc_bytes")(ctx, BOX_BYTES) };
-    let bridge = ctx.heap.bridge(Value::secret_text("hunter2"));
+    let secret = sealed(ctx, b"hunter2", true);
     let carried = unsafe { Carried::new(Handed::of(b), &BOX) };
     ctx.lift_from(
         w.finish(),
-        vec![Lifted::Runtime(bridge), Lifted::Carried(carried)],
+        vec![Lifted::Runtime(secret), Lifted::Carried(carried)],
     );
     b
 }
@@ -665,7 +707,7 @@ fn a_carried_value_lifted_moves_its_count_to_compiled_code_and_one_left_is_let_g
         0,
         "the box left beside the bytes was not let go"
     );
-    assert_eq!(ctx.heap.bridges(), 0);
+    assert_eq!(ctx.heap.natives(), 0);
     ctx.end();
 }
 
@@ -696,7 +738,7 @@ fn a_handle_read_as_the_other_kind_fails_the_crossing_and_is_let_go_with_it() {
         }
         let failure = ctx.take_failure().expect("the crossing failed").message;
         assert!(failure.contains(said), "{failure}");
-        assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+        assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
         ctx.failed = 0;
         ctx.end();
     }
@@ -724,5 +766,76 @@ fn handed_words_are_the_words_compiled_code_passes() {
     assert_eq!(
         unsafe { std::mem::transmute::<Handed, Word>(<Handed as Answered>::of(5)) },
         5
+    );
+}
+
+fn resumes(w: &mut Writer) {
+    w.fun(fun::RESUMES);
+}
+
+#[test]
+fn data_holding_no_continuation_has_no_way_to_one() {
+    let bytes = written(|w| {
+        w.count(tag::LIST, 4);
+        w.int(1);
+        w.str(b"two");
+        w.count(tag::MAP, 0);
+        w.handle(0);
+    });
+    assert_eq!(ply_compiled::rt::continuation_in(&bytes), Ok(None));
+}
+
+#[test]
+fn the_way_to_a_continuation_reads_outermost_first() {
+    let bytes = written(|w| {
+        w.count(tag::LIST, 2);
+        w.int(0);
+        w.count(tag::RECORD, 1);
+        w.name(b"saved");
+        w.ctor(b"m.Just", 1);
+        resumes(w);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&bytes),
+        Ok(Some(vec![
+            "item 1".to_string(),
+            "field `saved`".to_string(),
+            "`m.Just`'s argument 1".to_string()
+        ]))
+    );
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&written(resumes)),
+        Ok(Some(Vec::new()))
+    );
+}
+
+#[test]
+fn a_continuation_is_found_past_every_kind_of_part_before_it() {
+    let bytes = written(|w| {
+        w.count(tag::ARRAY, 1);
+        w.count(tag::MAP, 2);
+        w.float(0);
+        w.char(u32::from('c'));
+        w.decimal([0; 16]);
+        resumes(w);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&bytes),
+        Ok(Some(vec![
+            "element 0".to_string(),
+            "a map entry".to_string()
+        ]))
+    );
+    let table = written(|w| {
+        w.fun(fun::TABLE);
+        w.varint(1);
+        w.varint(1);
+        w.int(1);
+        resumes(w);
+        w.int(0);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&table),
+        Ok(Some(Vec::new()))
     );
 }

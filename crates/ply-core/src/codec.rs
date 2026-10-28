@@ -1,13 +1,9 @@
-//! PLV1: plain values as bytes. How a cache keeps an answer it does not interpret, and the one
-//! format a compiled value crosses into the runtime and back in. A value the bytes cannot hold (a
-//! task, a channel, a credential, a hold, a function the program wrote) crosses as a
-//! [`tag::HANDLE`], a position in the handles kept beside the bytes; [`encode`] and [`decode`] keep
-//! none, and refuse one.
+//! PLV1: plain values as bytes, the one format a compiled value crosses into the runtime and back
+//! in, written and read a part at a time. A value the bytes cannot hold (a task, a channel, a
+//! credential, a hold, a function the program wrote) crosses as a [`tag::HANDLE`], a position.
 
-use crate::value::{Closure, ClosureKind, Decimal, Fields, Fixed, Synth, Value};
-use crate::{INT_TYPES, IntTy, List, Symbol};
+use crate::{Fixed, INT_TYPES, IntTy, Symbol};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// What every encoding opens with.
 pub const FORMAT: &[u8; 4] = b"PLV1";
@@ -52,136 +48,20 @@ pub mod fun {
     pub const RESUMES: u8 = 5;
 }
 
+/// The position a [`tag::HANDLE`] is written at in a value a diagnostic shows, which keeps nothing
+/// beside its bytes: what the runtime object is, as `std.value.decode_shown` reads it.
+pub mod shown {
+    /// A credential, or any other runtime object but a hold.
+    pub const SEALED: u64 = 0;
+    pub const HOLD: u64 = 1;
+}
+
 /// Whether a value of `tag` is numbered for [`tag::AGAIN`].
 pub fn shareable(t: u8) -> bool {
     matches!(t, tag::STR | tag::BYTES | tag::LIST | tag::ARRAY | tag::MAP)
 }
 
-pub fn encode(v: &Value) -> Result<Vec<u8>, String> {
-    encode_with(v, &mut |v| {
-        Err(format!("a {} is not plain data", v.type_name()))
-    })
-}
-
-/// `v`'s bytes, each value they cannot hold handed to `handle`, which answers the position it keeps
-/// that value at. A function the prover generated is data, and is written whole.
-pub fn encode_with(
-    v: &Value,
-    handle: &mut dyn FnMut(&Value) -> Result<u64, String>,
-) -> Result<Vec<u8>, String> {
-    let mut w = Writer::new();
-    write_value(&mut w, v, handle)?;
-    Ok(w.finish())
-}
-
-/// Writes `v` whole, each value the bytes cannot hold handed to `handle` as [`encode_with`] does.
-pub fn write_value(
-    w: &mut Writer,
-    v: &Value,
-    handle: &mut dyn FnMut(&Value) -> Result<u64, String>,
-) -> Result<(), String> {
-    match v {
-        Value::Unit => w.tag(tag::UNIT),
-        &Value::Bool(b) => w.tag(if b { tag::TRUE } else { tag::FALSE }),
-        &Value::Int(n) => w.int(n),
-        Value::Float(x) => w.float(crate::float::bits(*x)),
-        Value::Decimal(d) => w.decimal(d.serialize()),
-        Value::Fixed(f) => w.fixed(*f),
-        &Value::Char(c) => w.char(u32::from(c)),
-        Value::Str(s) => w.str(s.as_bytes()),
-        Value::Bytes(b) => w.bytes(b),
-        Value::List(items) => {
-            w.count(tag::LIST, items.len() as u64);
-            for item in items.iter() {
-                write_value(w, item, handle)?;
-            }
-        }
-        Value::Array(items) => {
-            w.count(tag::ARRAY, items.len() as u64);
-            for item in items.iter() {
-                write_value(w, item, handle)?;
-            }
-        }
-        Value::Map(m) => {
-            w.count(tag::MAP, m.len() as u64);
-            for (k, v) in m.iter() {
-                write_value(w, k, handle)?;
-                write_value(w, v, handle)?;
-            }
-        }
-        Value::Record(fields) => {
-            w.count(tag::RECORD, fields.len() as u64);
-            for (name, v) in fields.iter() {
-                w.name(name.as_bytes());
-                write_value(w, v, handle)?;
-            }
-        }
-        Value::Ctor { name, args } => {
-            w.ctor(name.as_bytes(), args.len() as u64);
-            for arg in args.iter() {
-                write_value(w, arg, handle)?;
-            }
-        }
-        Value::Closure(c) => match &c.kind {
-            ClosureKind::Synth { arity, rule } => {
-                let arity = u64::from(*arity);
-                match rule {
-                    Synth::Const(x) => {
-                        w.fun(fun::CONST);
-                        w.varint(arity);
-                        write_value(w, x, handle)?;
-                    }
-                    Synth::Project(index) => {
-                        w.fun(fun::PROJECT);
-                        w.varint(arity);
-                        w.varint(u64::from(*index));
-                    }
-                    Synth::Table { entries, default } => {
-                        w.fun(fun::TABLE);
-                        w.varint(arity);
-                        w.varint(entries.len() as u64);
-                        for (k, x) in entries {
-                            write_value(w, k, handle)?;
-                            write_value(w, x, handle)?;
-                        }
-                        write_value(w, default, handle)?;
-                    }
-                }
-            }
-            _ => w.handle(handle(v)?),
-        },
-        Value::Secret(_) => w.handle(handle(v)?),
-    }
-    Ok(())
-}
-
-pub fn decode(bytes: &[u8]) -> Result<Value, String> {
-    decode_with(bytes, &mut |at| {
-        Err(format!(
-            "handle {at}, and no handles were kept beside the bytes"
-        ))
-    })
-}
-
-/// The value `bytes` hold, each [`tag::HANDLE`] the value `handle` answers for its position, and
-/// each [`tag::AGAIN`] a copy of the value it names. A function the program wrote is refused: only
-/// its own run can hold one.
-pub fn decode_with(
-    bytes: &[u8],
-    handle: &mut dyn FnMut(u64) -> Result<Value, String>,
-) -> Result<Value, String> {
-    let mut d = Decoder {
-        r: Reader::new(bytes)?,
-        handle,
-        opened: Vec::new(),
-    };
-    let v = d.value()?;
-    d.r.end()?;
-    Ok(v)
-}
-
-/// PLV1 written a part at a time: what [`encode`] writes a `Value` with, and what compiled code
-/// writes one with through the runtime. Each method writes one whole part; which parts make a value
+/// PLV1 written a part at a time: what compiled code writes a value with through the runtime. Each method writes one whole part; which parts make a value
 /// is the caller's to keep.
 pub struct Writer {
     out: Vec<u8>,
@@ -317,15 +197,13 @@ impl Writer {
     }
 }
 
-/// PLV1 read a part at a time, over bytes it borrows or owns: what [`decode`] reads a `Value` with,
-/// and what compiled code reads one with through the runtime. Every read answers an error where
-/// the bytes end early or do not hold what it reads.
+/// PLV1 read a part at a time, over bytes it borrows or owns: what compiled code reads a value with
+/// through the runtime. Every read answers an error where the bytes end early or do not hold what
+/// it reads.
 pub struct Reader<B> {
     bytes: B,
     at: usize,
     symbols: Vec<Symbol>,
-    // Set while a value is read a second time, whose names were numbered the first.
-    again: bool,
 }
 
 impl<B: AsRef<[u8]>> Reader<B> {
@@ -338,7 +216,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
             bytes,
             at: FORMAT.len(),
             symbols: Vec::new(),
-            again: false,
         })
     }
 
@@ -455,9 +332,7 @@ impl<B: AsRef<[u8]>> Reader<B> {
                 let b = self.blob()?;
                 let name =
                     Symbol::new(std::str::from_utf8(b).map_err(|_| "a name that is not UTF-8")?);
-                if !self.again {
-                    self.symbols.push(name.clone());
-                }
+                self.symbols.push(name.clone());
                 Ok(name)
             }
             n => self
@@ -465,165 +340,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
                 .get(n as usize - 1)
                 .cloned()
                 .ok_or_else(|| format!("name {n} before it was written")),
-        }
-    }
-}
-
-struct Decoder<'b, 'h> {
-    r: Reader<&'b [u8]>,
-    handle: &'h mut dyn FnMut(u64) -> Result<Value, String>,
-    /// Where each shareable value opens, and whether it has closed, in the order they open.
-    opened: Vec<(usize, bool)>,
-}
-
-impl Decoder<'_, '_> {
-    fn value(&mut self) -> Result<Value, String> {
-        let start = self.r.at();
-        let t = self.r.byte()?;
-        if !shareable(t) || self.r.again {
-            return self.body(t);
-        }
-        let n = self.opened.len();
-        self.opened.push((start, false));
-        let v = self.body(t)?;
-        self.opened[n].1 = true;
-        Ok(v)
-    }
-
-    fn values(&mut self, n: usize) -> Result<Vec<Value>, String> {
-        let mut items = Vec::with_capacity(n);
-        for _ in 0..n {
-            items.push(self.value()?);
-        }
-        Ok(items)
-    }
-
-    fn body(&mut self, t: u8) -> Result<Value, String> {
-        let r = &mut self.r;
-        Ok(match t {
-            tag::UNIT => Value::Unit,
-            tag::FALSE => Value::Bool(false),
-            tag::TRUE => Value::Bool(true),
-            tag::INT => Value::Int(r.int()?),
-            tag::FLOAT => Value::Float(f64::from_bits(u64::from_le_bytes(r.array()?))),
-            tag::DECIMAL => Value::Decimal(Decimal::deserialize(r.array()?)),
-            tag::FIXED => Value::Fixed(r.fixed()?),
-            tag::CHAR => Value::Char(r.char()?),
-            tag::STR => Value::str(r.str()?),
-            tag::BYTES => Value::bytes(r.blob()?),
-            tag::LIST => {
-                let n = r.count()?;
-                Value::List(List::from(self.values(n)?))
-            }
-            tag::ARRAY => {
-                let n = r.count()?;
-                Value::array(self.values(n)?)
-            }
-            tag::MAP => {
-                let n = r.count()?;
-                let mut entries = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let k = self.value()?;
-                    entries.push((k, self.value()?));
-                }
-                Value::map(entries)
-            }
-            tag::RECORD => {
-                let n = r.count()?;
-                let mut fields = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let name = self.r.symbol()?;
-                    fields.push((name, self.value()?));
-                }
-                Value::Record(Arc::new(Fields::from_unsorted(fields)))
-            }
-            tag::CTOR => {
-                let name = r.symbol()?;
-                let n = r.count()?;
-                Value::ctor(name, self.values(n)?)
-            }
-            tag::HANDLE => {
-                let at = r.varint()?;
-                (self.handle)(at)?
-            }
-            tag::FUN => self.function()?,
-            tag::AGAIN => {
-                let n = r.varint()?;
-                let &(at, closed) = usize::try_from(n)
-                    .ok()
-                    .and_then(|n| self.opened.get(n))
-                    .ok_or_else(|| format!("value {n} again before it was written"))?;
-                if !closed {
-                    return Err(format!("value {n} again inside itself"));
-                }
-                // Read again from where it opened: its names were numbered the first time.
-                let (was_at, was_again) = (self.r.at, self.r.again);
-                (self.r.at, self.r.again) = (at, true);
-                let v = self.value();
-                (self.r.at, self.r.again) = (was_at, was_again);
-                v?
-            }
-            other => {
-                return Err(format!(
-                    "a value tagged {other}, which this format does not have"
-                ));
-            }
-        })
-    }
-
-    fn function(&mut self) -> Result<Value, String> {
-        let case = self.r.byte()?;
-        let synth = |arity: u64, rule: Synth| -> Result<Value, String> {
-            let arity = u8::try_from(arity).map_err(|_| "a function of more than 255 arguments")?;
-            Ok(Value::Closure(Arc::new(Closure {
-                name: None,
-                kind: ClosureKind::Synth { arity, rule },
-            })))
-        };
-        match case {
-            fun::NAMED | fun::ANON => {
-                if case == fun::NAMED {
-                    self.r.symbol()?;
-                }
-                Err("a function the program wrote, which only its own run can hold".into())
-            }
-            fun::RESUMES => Ok(Value::Closure(Arc::new(Closure {
-                name: None,
-                kind: ClosureKind::Continuation {
-                    code: 0,
-                    arity: 0,
-                    captured: Vec::new(),
-                },
-            }))),
-            fun::CONST => {
-                let arity = self.r.varint()?;
-                synth(arity, Synth::Const(self.value()?))
-            }
-            fun::PROJECT => {
-                let arity = self.r.varint()?;
-                let index = self.r.varint()?;
-                if index >= arity {
-                    return Err("a generated function whose argument is not one of its own".into());
-                }
-                synth(arity, Synth::Project(index as u8))
-            }
-            fun::TABLE => {
-                let arity = self.r.varint()?;
-                if arity == 0 {
-                    return Err("a table of no arguments".into());
-                }
-                let n = self.r.count()?;
-                let mut entries = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let k = self.value()?;
-                    entries.push((k, self.value()?));
-                }
-                let default = self.value()?;
-                synth(arity, Synth::Table { entries, default })
-            }
-            other => Err(format!(
-                "a function of case {other}, which this format does not have"
-            )),
         }
     }
 }

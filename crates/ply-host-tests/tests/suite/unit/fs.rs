@@ -1,11 +1,12 @@
-use ply_core::host::MachineId;
-use ply_core::{
-    Diagnostic, EffectAtom, HostAnswer, HostRequest, Mode, Resource, Span, Symbol, Value, codes,
-};
+use ply_core::crypto::Framing;
+use ply_core::{Diagnostic, Span, codes};
 use ply_host::fs::*;
+use ply_host::jobs::Failure;
+use ply_host::native::{int_of, parts_of};
+use ply_host::pool::{Bell, Run};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 fn root() -> tempfile::TempDir {
@@ -45,11 +46,7 @@ fn a_symlink_out_of_the_root_is_refused() {
     let outside = root();
     let outside_real = outside.path().canonicalize().unwrap();
     std::fs::write(outside_real.join("secrets"), b"s").unwrap();
-
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside_real, real.join("link")).unwrap();
-    #[cfg(not(unix))]
-    return;
 
     let refusal = confine(&real, "link/secrets", span()).expect_err("it should be refused");
     assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
@@ -62,11 +59,7 @@ fn a_write_through_a_symlinked_directory_is_refused() {
     let real = dir.path().canonicalize().unwrap();
     let outside = root();
     let outside_real = outside.path().canonicalize().unwrap();
-
-    #[cfg(unix)]
     std::os::unix::fs::symlink(&outside_real, real.join("out")).unwrap();
-    #[cfg(not(unix))]
-    return;
 
     let refusal = confine(&real, "out/artifact.plyx", span()).expect_err("it should be refused");
     assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
@@ -82,12 +75,7 @@ fn a_write_through_a_link_to_a_missing_path_outside_the_root_is_refused() {
     std::os::unix::fs::symlink(&made, real.join("link")).unwrap();
     let fs = rooted(&real);
 
-    let refused = perform(
-        &fs,
-        Op::WriteFile,
-        "cache",
-        &[Value::str("link"), Value::bytes(b"x")],
-    );
+    let refused = perform(&fs, Op::WriteFile, "link", body(b"x"));
     assert!(!made.exists(), "the write landed outside the root");
     assert_eq!(
         refused.expect_err("the link leads out").code,
@@ -110,8 +98,9 @@ fn a_root_that_is_not_a_directory_does_not_bind() {
 
 #[test]
 fn an_unbound_label_names_the_flag_that_would_bind_it() {
-    let d = unbound(Op::ReadFile, &Resource::Named(Symbol::new("src")), span());
+    let d = unbound(Op::Lock, "src", span());
     assert_eq!(d.code, codes::FS_ROOT_UNBOUND);
+    assert!(d.message.contains("`fs.lock`"), "{}", d.message);
     assert!(
         d.notes.iter().any(|n| n.contains("--fs src=")),
         "the diagnostic should name the flag: {:?}",
@@ -194,108 +183,94 @@ fn a_lock_with_no_directory_to_sit_in_is_refused_without_waiting() {
     );
 }
 
-#[test]
-fn the_lock_operations_are_declared_and_confined_like_every_other() {
-    assert!(Op::ALL.contains(&Op::Lock));
-    assert!(Op::ALL.contains(&Op::Unlock));
-    assert_eq!(Op::Lock.name(), "lock");
-    assert_eq!(Op::Unlock.name(), "unlock");
-    let dir = root();
-    let real = dir.path().canonicalize().unwrap();
-    let refusal = confine(&real, "../lock", span()).expect_err("it should be refused");
-    assert_eq!(refusal.code, codes::FS_PATH_ESCAPES_ROOT);
-    let no_root = unbound(Op::Lock, &Resource::Named(Symbol::new("cache")), span());
-    assert_eq!(no_root.code, codes::FS_ROOT_UNBOUND);
-    assert!(no_root.message.contains("`fs.lock`"), "{}", no_root.message);
-}
+// --- Asking the host ----------------------------------------------------------
 
-// --- Appending, ranged reads and syncing ------------------------------------
-
-fn rooted(at: &std::path::Path) -> Arc<FsHost> {
+fn rooted(at: &Path) -> FsHost {
     let mut roots = Roots::new();
     roots.bind("cache", at, span()).expect("the root binds");
-    Arc::new(FsHost::new(roots))
+    FsHost::new(roots)
 }
 
-/// The operation as a run performs it: through the handler, the pool, and back as a `Value`.
-fn perform(fs: &Arc<FsHost>, op: Op, label: &str, args: &[Value]) -> Result<Value, Diagnostic> {
-    let handlers = registrations(fs);
-    let (declaration, handler) = handlers
-        .iter()
-        .find(|(d, _)| d.op.as_str() == op.name())
-        .expect("every operation is registered");
-    let runtime = ply_host::Host::new().runtime();
-    let answer = handler.call(
-        &*runtime,
-        &HostRequest {
-            atom: EffectAtom::new(
-                Symbol::new(EFFECT),
-                Resource::Named(Symbol::new(label)),
-                Mode::Write,
-            ),
-            op: declaration,
-            args,
-            span: span(),
-            machine: MachineId(0),
-            task: None,
-            declared: None,
-        },
-    )?;
-    match answer {
-        HostAnswer::Pending(pending) => runtime.block_on(pending),
-        HostAnswer::Value(v) => Ok(v),
-    }
-}
-
-fn done(answer: Result<Value, Diagnostic>) -> Value {
-    answer.unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message))
-}
-
-fn option(v: &Value) -> Option<&Value> {
-    match v {
-        Value::Ctor { name, args } if name.as_str() == "Some" => Some(&args[0]),
-        Value::Ctor { name, .. } if name.as_str() == "None" => None,
-        other => panic!("not an Option: {}", other.type_name()),
-    }
-}
-
-fn maybe_bytes(v: &Value) -> Option<Vec<u8>> {
-    option(v).map(|inner| match inner {
-        Value::Bytes(b) => b.to_vec(),
-        other => panic!("not Bytes: {}", other.type_name()),
+/// What a job answered, run on this thread.
+fn ran(job: ply_host::jobs::Refusing) -> Result<Vec<u8>, Diagnostic> {
+    job().map_err(|failure| match failure {
+        Failure::Refused(refusal) => refusal,
+        Failure::Said(why) => panic!("the job failed: {why}"),
     })
 }
 
-fn maybe_int(v: &Value) -> Option<i64> {
-    option(v).map(|inner| match inner {
-        Value::Int(n) => *n,
-        other => panic!("not an Int: {}", other.type_name()),
-    })
+/// The operation as the real handler asks it, under `label`.
+fn asked(
+    fs: &FsHost,
+    op: Op,
+    label: &str,
+    path: &str,
+    second: Second,
+) -> Result<Vec<u8>, Diagnostic> {
+    ran(fs.asked(op, label, path.to_string(), second, span())?)
 }
 
-fn boolean(v: &Value) -> bool {
-    match v {
-        Value::Bool(b) => *b,
-        other => panic!("not a Bool: {}", other.type_name()),
+/// The operation under `cache`.
+fn perform(fs: &FsHost, op: Op, path: &str, second: Second) -> Result<Vec<u8>, Diagnostic> {
+    asked(fs, op, "cache", path, second)
+}
+
+fn on(fs: &FsHost, op: Op, path: &str, second: Second) -> Vec<u8> {
+    perform(fs, op, path, second).unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message))
+}
+
+fn body(bytes: &[u8]) -> Second {
+    Second::Body(bytes.to_vec())
+}
+
+fn other(path: &str) -> Second {
+    Second::Path(path.to_string())
+}
+
+fn did(said: Vec<u8>) -> bool {
+    match said.as_slice() {
+        [1] => true,
+        [0] => false,
+        other => panic!("not whether it was done: {other:?}"),
     }
 }
 
-fn append(fs: &Arc<FsHost>, path: &str, body: &[u8]) -> Option<i64> {
-    maybe_int(&done(perform(
-        fs,
-        Op::Append,
-        "cache",
-        &[Value::str(path), Value::bytes(body)],
-    )))
+fn found(said: &[u8]) -> Option<&[u8]> {
+    match said.split_first() {
+        Some((1, rest)) => Some(rest),
+        Some((0, [])) => None,
+        _ => panic!("nothing found or not: {said:?}"),
+    }
 }
 
-fn read_at(fs: &Arc<FsHost>, path: &str, offset: i64, len: i64) -> Option<Vec<u8>> {
-    maybe_bytes(&done(perform(
-        fs,
-        Op::ReadAt,
-        "cache",
-        &[Value::str(path), Value::Int(offset), Value::Int(len)],
-    )))
+fn found_bytes(said: Vec<u8>) -> Option<Vec<u8>> {
+    found(&said).map(<[u8]>::to_vec)
+}
+
+fn found_int(said: Vec<u8>) -> Option<i64> {
+    found(&said).map(|n| int_of(n).expect("eight bytes"))
+}
+
+fn found_text(said: Vec<u8>) -> Option<String> {
+    found(&said).map(|t| String::from_utf8(t.to_vec()).expect("text"))
+}
+
+fn kind(said: Vec<u8>) -> Kind {
+    match said.as_slice() {
+        [0] => Kind::File,
+        [1] => Kind::Dir,
+        [2] => Kind::Symlink,
+        [3] => Kind::Missing,
+        other => panic!("not a kind: {other:?}"),
+    }
+}
+
+fn append(fs: &FsHost, path: &str, bytes: &[u8]) -> Option<i64> {
+    found_int(on(fs, Op::Append, path, body(bytes)))
+}
+
+fn read_at(fs: &FsHost, path: &str, offset: i64, len: i64) -> Option<Vec<u8>> {
+    found_bytes(on(fs, Op::ReadAt, path, Second::Range { offset, len }))
 }
 
 /// What a flush of an append-only cache does, and what its cost is: the frame, not the file.
@@ -354,25 +329,6 @@ fn a_ranged_read_of_what_is_not_a_file_is_none() {
     assert_eq!(read_at(&fs, "sub", 0, 4), None);
 }
 
-/// A file cannot answer a negative range, so it is arithmetic that went wrong rather than a state.
-#[test]
-fn a_negative_offset_or_length_is_refused_rather_than_clamped() {
-    let dir = root();
-    let fs = rooted(dir.path());
-    std::fs::write(dir.path().canonicalize().unwrap().join("a.dat"), b"0123").unwrap();
-
-    for (offset, len) in [(-1, 4), (0, -1), (-1, -1)] {
-        let refused = perform(
-            &fs,
-            Op::ReadAt,
-            "cache",
-            &[Value::str("a.dat"), Value::Int(offset), Value::Int(len)],
-        )
-        .expect_err("a negative range");
-        assert_eq!(refused.code, codes::RUNTIME_ERROR, "{offset}..{len}");
-    }
-}
-
 #[test]
 fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
     let dir = root();
@@ -380,12 +336,11 @@ fn the_bound_is_on_one_call_and_points_at_the_ranged_read() {
     let refused = perform(
         &fs,
         Op::ReadAt,
-        "cache",
-        &[
-            Value::str("a.dat"),
-            Value::Int(0),
-            Value::Int(MAX_READ_BYTES as i64 + 1),
-        ],
+        "a.dat",
+        Second::Range {
+            offset: 0,
+            len: MAX_READ_BYTES as i64 + 1,
+        },
     )
     .expect_err("more than one read answers");
     assert_eq!(refused.code, codes::FS_FILE_TOO_LARGE);
@@ -404,137 +359,37 @@ fn a_sync_flushes_a_file_or_a_directory_and_answers_false_for_neither() {
     let fs = rooted(dir.path());
     assert_eq!(append(&fs, "frontend.dat", b"frame"), Some(0));
 
-    let sync = |path: &str| boolean(&done(perform(&fs, Op::Sync, "cache", &[Value::str(path)])));
+    let sync = |path: &str| did(on(&fs, Op::Sync, path, Second::None));
     // The data file, then the directory whose rename must survive with it.
     assert!(sync("frontend.dat"));
     assert!(sync(""));
     assert!(!sync("absent.dat"));
 }
 
+/// Every operation names its root by its label, and a label no root is bound to reaches no file.
 #[test]
-fn the_new_operations_are_confined_like_every_other() {
+fn every_operation_refuses_a_label_no_root_is_bound_to() {
     let dir = root();
     let fs = rooted(dir.path());
-    for op in [Op::Append, Op::Sync] {
-        let args: Vec<Value> = match op {
-            Op::Append => vec![Value::str("../escape.dat"), Value::bytes(b"x")],
-            _ => vec![Value::str("../escape.dat")],
-        };
-        let refused = perform(&fs, op, "cache", &args).expect_err("it leaves the root");
-        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{}", op.name());
+    for op in Op::ALL {
+        for (path, second, _) in given(op, "a") {
+            let refused =
+                asked(&fs, op, "elsewhere", &path, second).expect_err("`elsewhere` has no root");
+            assert_eq!(refused.code, codes::FS_ROOT_UNBOUND, "{}", op.what());
+        }
     }
-    let refused = perform(
-        &fs,
-        Op::ReadAt,
-        "cache",
-        &[Value::str("../escape.dat"), Value::Int(0), Value::Int(4)],
-    )
-    .expect_err("it leaves the root");
-    assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
-
-    // And an unbound label reaches no file at all.
-    let refused = perform(
-        &fs,
-        Op::Append,
-        "elsewhere",
-        &[Value::str("a.dat"), Value::bytes(b"x")],
-    )
-    .expect_err("`elsewhere` has no root");
-    assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
-}
-
-#[test]
-fn the_new_operations_are_declared_with_the_arity_they_take() {
-    let dir = root();
-    let fs = rooted(dir.path());
-    let handlers = registrations(&fs);
-    for op in [Op::ReadAt, Op::Append, Op::Sync] {
-        assert!(Op::ALL.contains(&op), "{}", op.name());
-        let (declaration, _) = handlers
-            .iter()
-            .find(|(d, _)| d.op.as_str() == op.name())
-            .unwrap_or_else(|| panic!("`{}` is not registered", op.name()));
-        // Every one of them waits on a disk, so every one waits in the pool.
-        assert!(declaration.blocking, "{}", op.name());
-        assert!(
-            declaration.path.starts_with("ply_host::fs::"),
-            "{}",
-            op.name()
-        );
+    for chunk in [Chunk::Read(1), Chunk::Write(b"x".to_vec()), Chunk::Close] {
+        let refused = fs
+            .on_file("elsewhere", 1, chunk, span())
+            .map(|_| ())
+            .expect_err("`elsewhere` has no root");
+        assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
     }
-    assert_eq!(Op::ReadAt.name(), "read_at");
-    assert_eq!(Op::Append.name(), "append");
-    assert_eq!(Op::Sync.name(), "sync");
-
-    // Arity is inference's, so the wrong count means the module was never checked.
-    let refused = perform(&fs, Op::ReadAt, "cache", &[Value::str("a.dat")])
-        .expect_err("a ranged read takes three");
-    assert_eq!(refused.code, codes::RUNTIME_ERROR);
 }
 
 // --- Copies, trees, temporary directories, modes, links, walks and stamps ---
 
-fn on(fs: &Arc<FsHost>, op: Op, args: &[Value]) -> Value {
-    done(perform(fs, op, "cache", args))
-}
-
-fn maybe_str(v: &Value) -> Option<String> {
-    option(v).map(|inner| match inner {
-        Value::Str(s) => s.to_string(),
-        other => panic!("not a String: {}", other.type_name()),
-    })
-}
-
-fn ctor_name(v: &Value) -> String {
-    match v {
-        Value::Ctor { name, .. } => name.as_str().to_string(),
-        other => panic!("not a constructor: {}", other.type_name()),
-    }
-}
-
-fn record(fields: Vec<(&str, Value)>) -> Value {
-    Value::Record(Arc::new(
-        fields
-            .into_iter()
-            .map(|(name, value)| (Symbol::new(name), value))
-            .collect(),
-    ))
-}
-
-fn access_of(bits: u32) -> Value {
-    record(vec![
-        ("execute", Value::Bool(bits & 1 != 0)),
-        ("read", Value::Bool(bits & 4 != 0)),
-        ("write", Value::Bool(bits & 2 != 0)),
-    ])
-}
-
-fn mode_value(bits: u32) -> Value {
-    record(vec![
-        ("group", access_of(bits >> 3 & 7)),
-        ("other", access_of(bits & 7)),
-        ("owner", access_of(bits >> 6 & 7)),
-    ])
-}
-
-fn mode_bits_of(v: &Value) -> u32 {
-    let Value::Record(fields) = v else {
-        panic!("not a mode: {}", v.type_name())
-    };
-    let triple = |who: &str| {
-        let Some(Value::Record(access)) = fields.named(who) else {
-            panic!("no `{who}`")
-        };
-        let bit = |name: &str, value: u32| match access.named(name) {
-            Some(Value::Bool(true)) => value,
-            _ => 0,
-        };
-        bit("read", 4) | bit("write", 2) | bit("execute", 1)
-    };
-    triple("owner") << 6 | triple("group") << 3 | triple("other")
-}
-
-fn file_mode(path: &std::path::Path) -> u32 {
+fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path).unwrap().permissions().mode() & 0o777
 }
@@ -549,8 +404,7 @@ fn a_copy_carries_the_bytes_and_permission_bits_and_never_a_directory() {
     std::fs::set_permissions(real.join("a.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
     std::fs::create_dir(real.join("d")).unwrap();
 
-    let copy =
-        |from: &str, to: &str| boolean(&on(&fs, Op::Copy, &[Value::str(from), Value::str(to)]));
+    let copy = |from: &str, to: &str| did(on(&fs, Op::Copy, from, other(to)));
     assert!(copy("a.txt", "b.txt"));
     assert_eq!(std::fs::read(real.join("b.txt")).unwrap(), b"x");
     assert_eq!(file_mode(&real.join("b.txt")), 0o600);
@@ -577,7 +431,7 @@ fn a_tree_is_removed_whole_and_a_link_in_it_is_not_followed() {
     std::fs::write(real.join("keep.txt"), b"k").unwrap();
     std::os::unix::fs::symlink("../keep.txt", real.join("t/link")).unwrap();
 
-    let remove_tree = |path: &str| boolean(&on(&fs, Op::RemoveTree, &[Value::str(path)]));
+    let remove_tree = |path: &str| did(on(&fs, Op::RemoveTree, path, Second::None));
     assert!(remove_tree("t"));
     assert!(!real.join("t").exists());
     assert_eq!(std::fs::read(real.join("keep.txt")).unwrap(), b"k");
@@ -600,10 +454,11 @@ fn a_temporary_directory_is_new_each_time_and_named_as_the_root_names_it() {
     std::fs::create_dir(real.join("scratch")).unwrap();
 
     let temp = |under: &str, prefix: &str| {
-        maybe_str(&on(
+        found_text(on(
             &fs,
             Op::TempDir,
-            &[Value::str(under), Value::str(prefix)],
+            under,
+            Second::Name(prefix.to_string()),
         ))
     };
     let one = temp("scratch", "t-").expect("a directory is made");
@@ -627,7 +482,7 @@ fn canonical_answers_the_real_path_and_nothing_for_a_missing_one() {
     std::fs::write(real.join("a.txt"), b"x").unwrap();
     std::os::unix::fs::symlink("a.txt", real.join("l")).unwrap();
 
-    let canonical = |path: &str| maybe_str(&on(&fs, Op::Canonical, &[Value::str(path)]));
+    let canonical = |path: &str| found_text(on(&fs, Op::Canonical, path, Second::None));
     let file = real.join("a.txt").display().to_string();
     assert_eq!(canonical("a.txt"), Some(file.clone()));
     assert_eq!(
@@ -646,20 +501,14 @@ fn a_mode_reads_and_sets_the_nine_bits() {
     let fs = rooted(&real);
     std::fs::write(real.join("run.sh"), b"#!/bin/sh\n").unwrap();
 
-    assert!(boolean(&on(
-        &fs,
-        Op::SetMode,
-        &[Value::str("run.sh"), mode_value(0o750)]
-    )));
+    assert!(did(on(&fs, Op::SetMode, "run.sh", Second::Mode(0o750))));
     assert_eq!(file_mode(&real.join("run.sh")), 0o750);
-    let read = on(&fs, Op::Mode, &[Value::str("run.sh")]);
-    assert_eq!(mode_bits_of(option(&read).expect("a mode")), 0o750);
-    assert!(option(&on(&fs, Op::Mode, &[Value::str("absent")])).is_none());
-    assert!(!boolean(&on(
-        &fs,
-        Op::SetMode,
-        &[Value::str("absent"), mode_value(0o644)]
-    )));
+    assert_eq!(
+        found_int(on(&fs, Op::Mode, "run.sh", Second::None)),
+        Some(0o750)
+    );
+    assert_eq!(found_int(on(&fs, Op::Mode, "absent", Second::None)), None);
+    assert!(!did(on(&fs, Op::SetMode, "absent", Second::Mode(0o644))));
 }
 
 #[test]
@@ -671,36 +520,29 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
     std::fs::create_dir(real.join("d")).unwrap();
 
     let link = |path: &str, target: &str| {
-        perform(
-            &fs,
-            Op::Symlink,
-            "cache",
-            &[Value::str(path), Value::str(target)],
-        )
+        perform(&fs, Op::Symlink, path, Second::Target(target.to_string()))
     };
-    assert!(boolean(&done(link("l", "a.txt"))));
-    assert!(boolean(&done(link("d/up", "../a.txt"))));
+    let made = |path: &str, target: &str| did(link(path, target).expect("the link stays"));
+    assert!(made("l", "a.txt"));
+    assert!(made("d/up", "../a.txt"));
     assert_eq!(
-        maybe_str(&on(&fs, Op::ReadLink, &[Value::str("d/up")])),
+        found_text(on(&fs, Op::ReadLink, "d/up", Second::None)),
         Some("../a.txt".to_string())
     );
+    assert_eq!(kind(on(&fs, Op::Kind, "l", Second::None)), Kind::Symlink);
     assert_eq!(
-        ctor_name(&on(&fs, Op::Kind, &[Value::str("l")])),
-        "std.fs.Symlink"
-    );
-    assert_eq!(
-        maybe_str(&on(&fs, Op::ReadLink, &[Value::str("a.txt")])),
+        found_text(on(&fs, Op::ReadLink, "a.txt", Second::None)),
         None
     );
     assert!(
-        !boolean(&done(link("l", "a.txt"))),
+        !made("l", "a.txt"),
         "a path that is there is not made a link"
     );
     // A target is read from the directory the link is made in, wherever a link above it leads.
     std::fs::create_dir_all(real.join("d/e/f")).unwrap();
     std::os::unix::fs::symlink("..", real.join("d/back")).unwrap();
     std::os::unix::fs::symlink("e/f", real.join("d/deep")).unwrap();
-    assert!(boolean(&done(link("d/deep/up", "../../../a.txt"))));
+    assert!(made("d/deep/up", "../../../a.txt"));
     assert_eq!(std::fs::read(real.join("d/e/f/up")).unwrap(), b"x");
     for (path, target) in [
         ("out", "../elsewhere"),
@@ -717,6 +559,23 @@ fn a_link_is_made_inside_the_root_and_one_out_of_it_is_refused() {
     }
 }
 
+/// The entries a walk answered, each its path and kind.
+fn entries(said: Vec<u8>) -> Option<Vec<(String, Kind)>> {
+    found(&said).map(|flat| {
+        parts_of(flat)
+            .expect("parts")
+            .into_iter()
+            .map(|entry| match parts_of(entry).expect("parts").as_slice() {
+                [path, k] => (
+                    String::from_utf8(path.to_vec()).expect("text"),
+                    kind(k.to_vec()),
+                ),
+                other => panic!("not an entry: {other:?}"),
+            })
+            .collect()
+    })
+}
+
 #[test]
 fn a_walk_is_depth_first_in_byte_order_and_never_follows_a_link() {
     let dir = root();
@@ -728,44 +587,25 @@ fn a_walk_is_depth_first_in_byte_order_and_never_follows_a_link() {
     std::fs::write(real.join("a-c.txt"), b"c").unwrap();
     std::os::unix::fs::symlink("a", real.join("link")).unwrap();
 
-    let walk = |path: &str| -> Option<Vec<(String, String)>> {
-        option(&on(&fs, Op::Walk, &[Value::str(path)])).map(|entries| {
-            let Value::List(entries) = entries else {
-                panic!("not a list")
-            };
-            entries
-                .iter()
-                .map(|e| {
-                    let Value::Record(fields) = e else {
-                        panic!("not a record")
-                    };
-                    let path = match fields.named("path") {
-                        Some(Value::Str(s)) => s.to_string(),
-                        _ => panic!("no path"),
-                    };
-                    (path, ctor_name(fields.named("kind").expect("a kind")))
-                })
-                .collect()
-        })
-    };
-    let entry = |p: &str, k: &str| (p.to_string(), format!("std.fs.{k}"));
+    let walk = |path: &str| entries(on(&fs, Op::Walk, path, Second::None));
+    let entry = |p: &str, k: Kind| (p.to_string(), k);
     assert_eq!(
         walk(""),
         Some(vec![
-            entry("a", "Dir"),
-            entry("a/b.txt", "File"),
-            entry("a/z", "Dir"),
-            entry("a/z/y.txt", "File"),
-            entry("a-c.txt", "File"),
-            entry("link", "Symlink"),
+            entry("a", Kind::Dir),
+            entry("a/b.txt", Kind::File),
+            entry("a/z", Kind::Dir),
+            entry("a/z/y.txt", Kind::File),
+            entry("a-c.txt", Kind::File),
+            entry("link", Kind::Symlink),
         ])
     );
     assert_eq!(
         walk("./a"),
         Some(vec![
-            entry("a/b.txt", "File"),
-            entry("a/z", "Dir"),
-            entry("a/z/y.txt", "File"),
+            entry("a/b.txt", Kind::File),
+            entry("a/z", Kind::Dir),
+            entry("a/z/y.txt", Kind::File),
         ])
     );
     assert_eq!(walk("a/b.txt"), None);
@@ -773,29 +613,20 @@ fn a_walk_is_depth_first_in_byte_order_and_never_follows_a_link() {
 }
 
 #[test]
-fn a_stamp_sets_the_modification_time_and_one_before_the_epoch_is_refused() {
+fn a_stamp_sets_the_modification_time() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
     std::fs::write(real.join("a.txt"), b"x").unwrap();
     std::fs::create_dir(real.join("d")).unwrap();
 
-    let stamp = |path: &str, ms: i64| {
-        perform(
-            &fs,
-            Op::SetModified,
-            "cache",
-            &[Value::str(path), Value::Int(ms)],
-        )
-    };
-    let modified = |path: &str| maybe_int(&on(&fs, Op::ModifiedMs, &[Value::str(path)]));
+    let stamp = |path: &str, ms: i64| did(on(&fs, Op::SetModified, path, Second::Millis(ms)));
+    let modified = |path: &str| found_int(on(&fs, Op::ModifiedMs, path, Second::None));
     for path in ["a.txt", "d"] {
-        assert!(boolean(&done(stamp(path, 1_000_000_000_000))), "{path}");
+        assert!(stamp(path, 1_000_000_000_000), "{path}");
         assert_eq!(modified(path), Some(1_000_000_000_000), "{path}");
     }
-    assert!(!boolean(&done(stamp("absent", 1))));
-    let refused = stamp("a.txt", -1).expect_err("before the epoch");
-    assert_eq!(refused.code, codes::RUNTIME_ERROR);
+    assert!(!stamp("absent", 1));
 }
 
 #[test]
@@ -804,65 +635,49 @@ fn every_operation_that_names_a_second_path_confines_it_too() {
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
     std::fs::write(real.join("a.txt"), b"x").unwrap();
-    for (op, args) in [
-        (Op::Copy, vec![Value::str("a.txt"), Value::str("../b.txt")]),
-        (Op::Copy, vec![Value::str("../a.txt"), Value::str("b.txt")]),
-        (Op::RemoveTree, vec![Value::str("../x")]),
-        (Op::TempDir, vec![Value::str("../"), Value::str("t")]),
-        (Op::Walk, vec![Value::str("/")]),
-        (Op::Canonical, vec![Value::str("../a.txt")]),
-        (Op::Mode, vec![Value::str("../a.txt")]),
-        (Op::SetMode, vec![Value::str("../a.txt"), mode_value(0o644)]),
-        (Op::Symlink, vec![Value::str("../l"), Value::str("a.txt")]),
-        (Op::ReadLink, vec![Value::str("../l")]),
-        (Op::SetModified, vec![Value::str("../a.txt"), Value::Int(1)]),
+    for (op, path, second) in [
+        (Op::Copy, "a.txt", other("../b.txt")),
+        (Op::Copy, "../a.txt", other("b.txt")),
+        (Op::RemoveTree, "../x", Second::None),
+        (Op::TempDir, "../", Second::Name("t".into())),
+        (Op::Walk, "/", Second::None),
+        (Op::Canonical, "../a.txt", Second::None),
+        (Op::Mode, "../a.txt", Second::None),
+        (Op::SetMode, "../a.txt", Second::Mode(0o644)),
+        (Op::Symlink, "../l", Second::Target("a.txt".into())),
+        (Op::ReadLink, "../l", Second::None),
+        (Op::SetModified, "../a.txt", Second::Millis(1)),
     ] {
-        let refused = perform(&fs, op, "cache", &args).expect_err("it leaves the root");
-        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{}", op.name());
-    }
-    for op in [
-        Op::Copy,
-        Op::TempDir,
-        Op::SetMode,
-        Op::Symlink,
-        Op::SetModified,
-    ] {
-        let refused =
-            perform(&fs, op, "cache", &[Value::str("a.txt")]).expect_err("it takes two arguments");
-        assert_eq!(refused.code, codes::RUNTIME_ERROR, "{}", op.name());
+        let refused = perform(&fs, op, path, second).expect_err("it leaves the root");
+        assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{}", op.what());
     }
 }
 
 // --- Open files ---
 
-fn opened(fs: &Arc<FsHost>, label: &str, path: &str, how: &str) -> Result<i64, String> {
-    let how = Value::ctor(format!("std.fs.{how}"), Vec::new());
-    match &done(perform(fs, Op::Open, label, &[Value::str(path), how])) {
-        Value::Ctor { name, args } if name.as_str() == "Ok" => match &args[0] {
-            Value::Int(descriptor) => Ok(*descriptor),
-            other => panic!("not a descriptor: {}", other.type_name()),
-        },
-        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
-        other => panic!("not a `Result`: {}", other.type_name()),
+fn opened(fs: &FsHost, label: &str, path: &str, how: Opening) -> Result<i64, Vec<u8>> {
+    let said = asked(fs, Op::Open, label, path, Second::Opening(how))
+        .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message));
+    match said.split_first() {
+        Some((1, descriptor)) => Ok(int_of(descriptor).expect("eight bytes")),
+        Some((0, why)) => Err(why.to_vec()),
+        _ => panic!("not what an open answers: {said:?}"),
     }
 }
 
-fn chunk(fs: &Arc<FsHost>, label: &str, descriptor: i64, max: i64) -> Option<Vec<u8>> {
-    maybe_bytes(&done(perform(
-        fs,
-        Op::ReadChunk,
-        label,
-        &[Value::Int(descriptor), Value::Int(max)],
-    )))
+fn on_file(fs: &FsHost, label: &str, descriptor: i64, chunk: Chunk) -> Vec<u8> {
+    ran(fs
+        .on_file(label, descriptor, chunk, span())
+        .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message)))
+    .unwrap_or_else(|d| panic!("refused: {} {}", d.code, d.message))
 }
 
-fn closed(fs: &Arc<FsHost>, label: &str, descriptor: i64) -> bool {
-    boolean(&done(perform(
-        fs,
-        Op::Close,
-        label,
-        &[Value::Int(descriptor)],
-    )))
+fn chunk(fs: &FsHost, label: &str, descriptor: i64, max: u64) -> Option<Vec<u8>> {
+    found_bytes(on_file(fs, label, descriptor, Chunk::Read(max)))
+}
+
+fn closed(fs: &FsHost, label: &str, descriptor: i64) -> bool {
+    did(on_file(fs, label, descriptor, Chunk::Close))
 }
 
 #[test]
@@ -872,9 +687,9 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
     let mut roots = Roots::new();
     roots.bind("cache", here.path(), span()).unwrap();
     roots.bind("other", there.path(), span()).unwrap();
-    let fs = Arc::new(FsHost::new(roots));
+    let fs = FsHost::new(roots);
 
-    let first = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    let first = opened(&fs, "cache", "log", Opening::Read).expect("the file opens");
     assert_eq!(chunk(&fs, "cache", first, 4), Some(b"abcd".to_vec()));
     // Another root's label reaches nothing this root opened: not to read it, not to close it.
     assert_eq!(chunk(&fs, "other", first, 4), None);
@@ -886,7 +701,7 @@ fn a_descriptor_is_open_under_the_root_that_opened_it_until_it_is_closed() {
     assert!(!closed(&fs, "cache", first));
     assert_eq!(chunk(&fs, "cache", first, 4), None);
     // A descriptor names one open, so the next open answers another.
-    let second = opened(&fs, "cache", "log", "ToRead").expect("the file opens again");
+    let second = opened(&fs, "cache", "log", Opening::Read).expect("the file opens again");
     assert_ne!(second, first);
 }
 
@@ -896,32 +711,23 @@ fn an_open_says_why_a_file_did_not_open_and_is_confined_like_every_other() {
     let fs = rooted(dir.path());
     std::fs::create_dir(dir.path().join("d")).unwrap();
     assert_eq!(
-        opened(&fs, "cache", "absent", "ToRead"),
-        Err("std.fs.NotFound".into())
+        opened(&fs, "cache", "absent", Opening::Read),
+        Err(Refusal::NotFound.flat())
     );
-    for how in ["ToRead", "ToWrite", "ToAppend"] {
+    for how in [Opening::Read, Opening::Write, Opening::Append] {
         assert_eq!(
             opened(&fs, "cache", "d", how),
-            Err("std.fs.NotAFile".into())
+            Err(Refusal::NotAFile.flat())
         );
     }
     assert_eq!(
-        opened(&fs, "cache", "no/f", "ToWrite"),
-        Err("std.fs.NotFound".into())
+        opened(&fs, "cache", "no/f", Opening::Write),
+        Err(Refusal::NotFound.flat())
     );
 
-    let how = Value::ctor("std.fs.ToRead", Vec::new());
-    let refused = perform(
-        &fs,
-        Op::Open,
-        "cache",
-        &[Value::str("../escape"), how.clone()],
-    )
-    .expect_err("it leaves the root");
+    let refused = perform(&fs, Op::Open, "../escape", Second::Opening(Opening::Read))
+        .expect_err("it leaves the root");
     assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
-    let refused = perform(&fs, Op::Open, "elsewhere", &[Value::str("a"), how])
-        .expect_err("`elsewhere` has no root");
-    assert_eq!(refused.code, codes::FS_ROOT_UNBOUND);
 }
 
 #[test]
@@ -929,27 +735,16 @@ fn a_chunk_costs_at_most_what_it_asks_for_and_the_bound_is_on_one_read() {
     let dir = root();
     let fs = rooted(dir.path());
     std::fs::write(dir.path().join("log"), vec![7u8; 4096]).unwrap();
-    let file = opened(&fs, "cache", "log", "ToRead").expect("the file opens");
+    let file = opened(&fs, "cache", "log", Opening::Read).expect("the file opens");
     assert_eq!(chunk(&fs, "cache", file, 0), Some(Vec::new()));
     assert_eq!(chunk(&fs, "cache", file, 100).map(|b| b.len()), Some(100));
 
-    let over = perform(
-        &fs,
-        Op::ReadChunk,
-        "cache",
-        &[Value::Int(file), Value::Int(MAX_READ_BYTES as i64 + 1)],
-    )
-    .expect_err("more than one read answers");
+    let over = fs
+        .on_file("cache", file, Chunk::Read(MAX_READ_BYTES + 1), span())
+        .map(|_| ())
+        .expect_err("more than one read answers");
     assert_eq!(over.code, codes::FS_FILE_TOO_LARGE);
-    let negative = perform(
-        &fs,
-        Op::ReadChunk,
-        "cache",
-        &[Value::Int(file), Value::Int(-1)],
-    )
-    .expect_err("a negative length");
-    assert_eq!(negative.code, codes::RUNTIME_ERROR);
-    // Neither refusal moved the descriptor.
+    // The refusal did not move the descriptor.
     assert_eq!(chunk(&fs, "cache", file, 4096).map(|b| b.len()), Some(3996));
 }
 
@@ -964,11 +759,12 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
     std::fs::write(real.join("d/a.txt"), b"x").unwrap();
     std::os::unix::fs::symlink("nowhere", real.join("d/l")).unwrap();
 
-    let made = opened(&fs, "cache", "d/new", "ToCreate").expect("nothing is there");
-    assert!(boolean(&on(
+    let made = opened(&fs, "cache", "d/new", Opening::Create).expect("nothing is there");
+    assert!(did(on_file(
         &fs,
-        Op::WriteChunk,
-        &[Value::Int(made), Value::bytes(b"mine")]
+        "cache",
+        made,
+        Chunk::Write(b"mine".to_vec())
     )));
     assert!(closed(&fs, "cache", made));
     assert_eq!(std::fs::read(real.join("d/new")).unwrap(), b"mine");
@@ -976,68 +772,54 @@ fn a_file_made_exclusively_is_its_owners_alone_and_is_made_only_where_nothing_is
 
     for there in ["d/new", "d/a.txt", "d", "d/l"] {
         assert_eq!(
-            opened(&fs, "cache", there, "ToCreate"),
-            Err("std.fs.Exists".into()),
+            opened(&fs, "cache", there, Opening::Create),
+            Err(Refusal::Exists.flat()),
             "{there}"
         );
     }
     // The link was refused as itself: nothing was made where it points.
     assert!(!real.join("d/nowhere").exists());
     assert_eq!(
-        opened(&fs, "cache", "no/new", "ToCreate"),
-        Err("std.fs.NotFound".into())
+        opened(&fs, "cache", "no/new", Opening::Create),
+        Err(Refusal::NotFound.flat())
     );
     assert_eq!(
-        opened(&fs, "cache", "d/a.txt/new", "ToCreate"),
-        Err("std.fs.NotADirectory".into())
+        opened(&fs, "cache", "d/a.txt/new", Opening::Create),
+        Err(Refusal::NotADirectory.flat())
     );
 }
 
-fn maybe_sealed(v: &Value) -> Option<Vec<u8>> {
-    option(v).map(|inner| match inner {
-        Value::Secret(held) => held.bytes().to_vec(),
-        other => panic!("not a Secret: {}", other.type_name()),
-    })
+fn sealed(encoding: &str, secret: &[u8]) -> Second {
+    let framing = Framing::named(encoding, Op::WriteSecret.what(), span()).expect("an encoding");
+    Second::Sealed(framing.framed(b"key ", secret, b"\n"))
 }
 
-fn write_secret(
-    fs: &Arc<FsHost>,
-    path: &str,
-    secret: &Value,
-    encoding: &str,
-) -> Result<Value, Diagnostic> {
-    perform(
-        fs,
-        Op::WriteSecret,
-        "cache",
-        &[
-            Value::str(path),
-            Value::bytes(b"key "),
-            secret.clone(),
-            Value::str(encoding),
-            Value::bytes(b"\n"),
-        ],
-    )
+fn write_secret(fs: &FsHost, path: &str, encoding: &str) -> Result<Vec<u8>, Diagnostic> {
+    perform(fs, Op::WriteSecret, path, sealed(encoding, b"\x01\x23\xab"))
 }
 
+/// The secret a file holds between `before` and `after`, kept by a run and taken back from it.
 fn read_secret(
-    fs: &Arc<FsHost>,
+    fs: &FsHost,
     path: &str,
     before: &[u8],
     encoding: &str,
     after: &[u8],
 ) -> Option<Vec<u8>> {
-    maybe_sealed(&done(perform(
+    let run = Run::new(Arc::new(Bell::default()));
+    let framing = Framing::named(encoding, Op::ReadSecret.what(), span()).expect("an encoding");
+    let said = on(
         fs,
         Op::ReadSecret,
-        "cache",
-        &[
-            Value::str(path),
-            Value::bytes(before),
-            Value::str(encoding),
-            Value::bytes(after),
-        ],
-    )))
+        path,
+        Second::Frame {
+            before: before.to_vec(),
+            framing,
+            after: after.to_vec(),
+            keeper: Arc::downgrade(&run),
+        },
+    );
+    found_int(said).map(|number| run.take_secret(number).expect("the run keeps it").to_vec())
 }
 
 #[test]
@@ -1048,7 +830,6 @@ fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
     let fs = rooted(&real);
     std::fs::write(real.join("old.key"), b"a longer plain file than the key").unwrap();
     std::fs::set_permissions(real.join("old.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
-    let key = Value::secret_bytes(b"\x01\x23\xab");
 
     for (path, encoding, line) in [
         ("new.key", "hex", &b"key 0123ab\n"[..]),
@@ -1056,7 +837,7 @@ fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
         ("raw.key", "raw", b"key \x01\x23\xab\n"),
     ] {
         assert!(
-            boolean(&done(write_secret(&fs, path, &key, encoding))),
+            did(write_secret(&fs, path, encoding).expect("a write")),
             "{path}"
         );
         assert_eq!(std::fs::read(real.join(path)).unwrap(), line, "{path}");
@@ -1067,12 +848,9 @@ fn a_secret_is_written_in_its_frame_as_its_owners_alone_whatever_was_there() {
             "{path}"
         );
     }
-    assert!(!boolean(&done(write_secret(
-        &fs,
-        "no/new.key",
-        &key,
-        "hex"
-    ))));
+    assert!(!did(
+        write_secret(&fs, "no/new.key", "hex").expect("a write")
+    ));
     assert!(!real.join("no").exists());
 }
 
@@ -1104,92 +882,73 @@ fn a_secret_is_read_back_only_from_inside_the_frame_it_was_written_in() {
     );
 }
 
+/// A secret read after its run ended is kept by no one, and answers as one not there.
 #[test]
-fn a_secret_write_refuses_a_plain_body_an_unknown_encoding_and_a_path_out_of_the_root() {
+fn a_secret_read_for_a_run_that_has_ended_is_kept_by_no_one() {
     let dir = root();
     let real = dir.path().canonicalize().unwrap();
     let fs = rooted(&real);
-    let key = Value::secret_bytes(b"hunter2");
-
-    let plain = write_secret(&fs, "plain.key", &Value::bytes(b"hunter2"), "hex")
-        .expect_err("a plain body is not a secret");
-    assert!(!plain.message.contains("hunter2"), "{}", plain.message);
-    let unknown = write_secret(&fs, "a.key", &key, "rot13").expect_err("no such encoding");
-    assert_eq!(unknown.code, codes::RUNTIME_ERROR);
-    assert!(
-        unknown.message.contains("`fs.write_secret`"),
-        "{}",
-        unknown.message
-    );
-    assert!(!unknown.message.contains("hunter2"), "{}", unknown.message);
-    let unread = perform(
+    std::fs::write(real.join("a.key"), b"key 0123ab\n").unwrap();
+    let framing = Framing::named("hex", Op::ReadSecret.what(), span()).expect("an encoding");
+    let said = on(
         &fs,
         Op::ReadSecret,
-        "cache",
-        &[
-            Value::str("a.key"),
-            Value::bytes(b""),
-            Value::str("base32-typed"),
-            Value::bytes(b""),
-        ],
-    )
-    .expect_err("a typed text is read by `Secret::decode` alone");
-    assert_eq!(unread.code, codes::RUNTIME_ERROR);
-    let escaped = write_secret(&fs, "../out.key", &key, "hex").expect_err("it leaves the root");
+        "a.key",
+        Second::Frame {
+            before: b"key ".to_vec(),
+            framing,
+            after: b"\n".to_vec(),
+            keeper: Weak::new(),
+        },
+    );
+    assert_eq!(found_int(said), None);
+}
+
+#[test]
+fn a_secret_write_refuses_an_unknown_encoding_and_a_path_out_of_the_root() {
+    let dir = root();
+    let real = dir.path().canonicalize().unwrap();
+    let fs = rooted(&real);
+    for what in [Op::WriteSecret.what(), Op::ReadSecret.what()] {
+        let Err(unknown) = Framing::named("rot13", what, span()) else {
+            panic!("no such encoding")
+        };
+        assert_eq!(unknown.code, codes::RUNTIME_ERROR);
+        assert!(unknown.message.contains(what), "{}", unknown.message);
+    }
+    let escaped = write_secret(&fs, "../out.key", "hex").expect_err("it leaves the root");
     assert_eq!(escaped.code, codes::FS_PATH_ESCAPES_ROOT);
     assert!(std::fs::read_dir(&real).unwrap().next().is_none());
 }
 
-/// A `std.fs.Stat`, as a test reads one.
-#[derive(Debug, PartialEq)]
-struct Looked {
-    kind: String,
-    size: i64,
-    modified: i64,
-    mode: u32,
-    links: i64,
-    device: i64,
-    id: i64,
-}
-
-fn looked(v: &Value) -> Looked {
-    let Value::Record(fields) = v else {
-        panic!("not a stat: {}", v.type_name())
-    };
-    let int = |name: &str| match fields.named(name) {
-        Some(Value::Int(n)) => *n,
-        _ => panic!("no `{name}`"),
-    };
-    let modified = match fields.named("modified") {
-        Some(Value::Ctor { name, args }) if name.as_str() == "Instant" => match args.as_slice() {
-            [Value::Int(nanos)] => *nanos,
-            _ => panic!("an `Instant` holds one `Int`"),
-        },
-        _ => panic!("no `modified`"),
-    };
-    Looked {
-        kind: ctor_name(fields.named("kind").expect("a kind")),
-        size: int("size"),
-        modified,
-        mode: mode_bits_of(fields.named("mode").expect("a mode")),
-        links: int("links"),
-        device: int("device"),
-        id: int("id"),
+/// What one look read, as [`Stat::flat`] writes it.
+fn looked(flat: &[u8]) -> Stat {
+    let [k, size, modified, mode, links, device, id] = parts_of(flat)
+        .expect("parts")
+        .try_into()
+        .expect("seven parts");
+    let int = |n: &[u8]| int_of(n).expect("eight bytes");
+    Stat {
+        kind: kind(k.to_vec()),
+        size: int(size),
+        modified: int(modified),
+        mode: u32::try_from(int(mode)).expect("nine bits"),
+        links: int(links),
+        device: int(device),
+        id: int(id),
     }
 }
 
-fn stat(fs: &Arc<FsHost>, path: &str) -> Option<Looked> {
-    option(&on(fs, Op::Stat, &[Value::str(path)])).map(looked)
+fn stat(fs: &FsHost, path: &str) -> Option<Stat> {
+    found(&on(fs, Op::Stat, path, Second::None)).map(looked)
 }
 
-fn linked(fs: &Arc<FsHost>, path: &str, to: &str) -> Result<(), String> {
-    match &on(fs, Op::Link, &[Value::str(path), Value::str(to)]) {
-        Value::Ctor { name, args } if name.as_str() == "Ok" => {
-            assert!(matches!(args.as_slice(), [Value::Unit]));
-            Ok(())
-        }
-        Value::Ctor { name, args } if name.as_str() == "Err" => Err(ctor_name(&args[0])),
-        other => panic!("not a `Result`: {}", other.type_name()),
+fn linked(fs: &FsHost, path: &str, to: &str) -> Result<(), Vec<u8>> {
+    let said = on(fs, Op::Link, path, other(to));
+    match said.split_first() {
+        Some((1, [])) => Ok(()),
+        Some((0, why)) => Err(why.to_vec()),
+        _ => panic!("not what a link answers: {said:?}"),
     }
 }
 
@@ -1208,8 +967,8 @@ fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
     let file = stat(&fs, "d/a.txt").expect("a file is there");
     assert_eq!(
         file,
-        Looked {
-            kind: "std.fs.File".into(),
+        Stat {
+            kind: Kind::File,
             size: 3,
             modified: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
             mode: 0o640,
@@ -1220,23 +979,19 @@ fn one_look_reads_a_path_as_itself_and_nothing_for_what_is_not_there() {
     );
 
     let folder = stat(&fs, "d").expect("a directory is there");
-    assert_eq!(
-        (folder.kind.as_str(), folder.size, folder.links),
-        ("std.fs.Dir", 0, 1)
-    );
+    assert_eq!((folder.kind, folder.size, folder.links), (Kind::Dir, 0, 1));
     assert_eq!(folder.mode, file_mode(&real.join("d")));
 
     // The link is read, not followed: it is no file, and it is not the file it points at.
     let link = stat(&fs, "d/l").expect("a link is there");
     assert_eq!(
-        (link.kind.as_str(), link.size, link.mode, link.links),
-        ("std.fs.Symlink", 0, 0o777, 1)
+        (link.kind, link.size, link.mode, link.links),
+        (Kind::Symlink, 0, 0o777, 1)
     );
     assert_ne!(link.id, file.id);
 
     assert_eq!(stat(&fs, "d/absent"), None);
-    let refused =
-        perform(&fs, Op::Stat, "cache", &[Value::str("../d")]).expect_err("it leaves the root");
+    let refused = perform(&fs, Op::Stat, "../d", Second::None).expect_err("it leaves the root");
     assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT);
 }
 
@@ -1251,50 +1006,52 @@ fn a_scan_is_a_walk_with_a_look_at_each_entry_and_goes_below_only_when_asked() {
     std::fs::write(real.join("a-c.txt"), b"").unwrap();
     std::os::unix::fs::symlink("a", real.join("link")).unwrap();
 
-    let scan = |path: &str, deep: bool| -> Option<Vec<(String, String, i64)>> {
-        option(&on(&fs, Op::Scan, &[Value::str(path), Value::Bool(deep)])).map(|entries| {
-            let Value::List(entries) = entries else {
-                panic!("not a list")
-            };
-            entries
-                .iter()
-                .map(|e| {
-                    let Value::Record(fields) = e else {
-                        panic!("not a record")
-                    };
-                    let path = match fields.named("path") {
-                        Some(Value::Str(s)) => s.to_string(),
-                        _ => panic!("no path"),
-                    };
-                    let found = looked(fields.named("stat").expect("a stat"));
-                    (path, found.kind, found.size)
+    let scan = |path: &str, deep: bool| -> Option<Vec<(String, Kind, i64)>> {
+        let said = on(&fs, Op::Scan, path, Second::Deep(deep));
+        found(&said).map(|flat| {
+            parts_of(flat)
+                .expect("parts")
+                .into_iter()
+                .map(|seen| match parts_of(seen).expect("parts").as_slice() {
+                    [path, stat] => {
+                        let found = looked(stat);
+                        (
+                            String::from_utf8(path.to_vec()).expect("text"),
+                            found.kind,
+                            found.size,
+                        )
+                    }
+                    other => panic!("not an entry: {other:?}"),
                 })
                 .collect()
         })
     };
-    let entry = |p: &str, k: &str, size: i64| (p.to_string(), format!("std.fs.{k}"), size);
+    let entry = |p: &str, k: Kind, size: i64| (p.to_string(), k, size);
     assert_eq!(
         scan("", true),
         Some(vec![
-            entry("a", "Dir", 0),
-            entry("a/b.txt", "File", 1),
-            entry("a/z", "Dir", 0),
-            entry("a/z/y.txt", "File", 2),
-            entry("a-c.txt", "File", 0),
-            entry("link", "Symlink", 0),
+            entry("a", Kind::Dir, 0),
+            entry("a/b.txt", Kind::File, 1),
+            entry("a/z", Kind::Dir, 0),
+            entry("a/z/y.txt", Kind::File, 2),
+            entry("a-c.txt", Kind::File, 0),
+            entry("link", Kind::Symlink, 0),
         ])
     );
     assert_eq!(
         scan("", false),
         Some(vec![
-            entry("a", "Dir", 0),
-            entry("a-c.txt", "File", 0),
-            entry("link", "Symlink", 0),
+            entry("a", Kind::Dir, 0),
+            entry("a-c.txt", Kind::File, 0),
+            entry("link", Kind::Symlink, 0),
         ])
     );
     assert_eq!(
         scan("./a/", false),
-        Some(vec![entry("a/b.txt", "File", 1), entry("a/z", "Dir", 0)])
+        Some(vec![
+            entry("a/b.txt", Kind::File, 1),
+            entry("a/z", Kind::Dir, 0)
+        ])
     );
     assert_eq!(scan("a/b.txt", true), None);
     assert_eq!(scan("absent", true), None);
@@ -1321,32 +1078,24 @@ fn a_file_takes_a_second_name_and_nothing_else_does() {
 
     // A copy onto the file itself, by either name, would empty it before reading it.
     for (from, to) in [("twin.txt", "d/a.txt"), ("d/a.txt", "d/a.txt")] {
-        assert!(
-            boolean(&on(&fs, Op::Copy, &[Value::str(from), Value::str(to)])),
-            "{from} -> {to}"
-        );
+        assert!(did(on(&fs, Op::Copy, from, other(to))), "{from} -> {to}");
         assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"both");
     }
 
-    let refused = |path: &str, to: &str, why: &str| {
-        assert_eq!(
-            linked(&fs, path, to),
-            Err(format!("std.fs.{why}")),
-            "{path} -> {to}"
-        );
+    let refused = |path: &str, to: &str, why: Refusal| {
+        assert_eq!(linked(&fs, path, to), Err(why.flat()), "{path} -> {to}");
     };
-    refused("n", "absent", "NotFound");
-    refused("n", "d", "NotAFile");
-    refused("n", "l", "NotAFile");
-    refused("l", "d/a.txt", "Exists");
-    refused("twin.txt", "d/a.txt", "Exists");
-    refused("no/n", "d/a.txt", "NotFound");
-    refused("d/a.txt/n", "d/a.txt", "NotADirectory");
+    refused("n", "absent", Refusal::NotFound);
+    refused("n", "d", Refusal::NotAFile);
+    refused("n", "l", Refusal::NotAFile);
+    refused("l", "d/a.txt", Refusal::Exists);
+    refused("twin.txt", "d/a.txt", Refusal::Exists);
+    refused("no/n", "d/a.txt", Refusal::NotFound);
+    refused("d/a.txt/n", "d/a.txt", Refusal::NotADirectory);
     assert!(!real.join("n").exists());
 
     for (path, to) in [("../n", "d/a.txt"), ("n", "/d/a.txt")] {
-        let refused = perform(&fs, Op::Link, "cache", &[Value::str(path), Value::str(to)])
-            .expect_err("it leaves the root");
+        let refused = perform(&fs, Op::Link, path, other(to)).expect_err("it leaves the root");
         assert_eq!(refused.code, codes::FS_PATH_ESCAPES_ROOT, "{path} -> {to}");
     }
 }
@@ -1359,16 +1108,12 @@ fn the_room_of_a_file_system_is_answered_for_a_path_that_names_something() {
     std::fs::write(real.join("a.txt"), b"x").unwrap();
 
     let room = |path: &str| -> Option<[i64; 5]> {
-        option(&on(&fs, Op::Space, &[Value::str(path)])).map(|space| {
-            let Value::Record(fields) = space else {
-                panic!("not a record")
-            };
-            ["total", "free", "available", "inodes", "inodes_free"].map(|name| {
-                match fields.named(name) {
-                    Some(Value::Int(n)) => *n,
-                    _ => panic!("no `{name}`"),
-                }
-            })
+        found(&on(&fs, Op::Space, path, Second::None)).map(|flat| {
+            let parts: [&[u8]; 5] = parts_of(flat)
+                .expect("parts")
+                .try_into()
+                .expect("five parts");
+            parts.map(|n| int_of(n).expect("eight bytes"))
         })
     };
     let [total, free, available, inodes, inodes_free] = room("").expect("the root is there");
@@ -1377,30 +1122,6 @@ fn the_room_of_a_file_system_is_answered_for_a_path_that_names_something() {
     // One file system holds the root and the file in it.
     assert_eq!(room("a.txt").map(|r| r[0]), Some(total));
     assert_eq!(room("absent"), None);
-}
-
-#[test]
-fn a_look_a_scan_the_room_and_a_second_name_are_registered_and_wait_in_the_pool() {
-    let dir = root();
-    let fs = rooted(dir.path());
-    let handlers = registrations(&fs);
-    for (op, name, arity) in [
-        (Op::Stat, "stat", 1),
-        (Op::Scan, "scan", 2),
-        (Op::Space, "space", 1),
-        (Op::Link, "link", 2),
-    ] {
-        assert_eq!((op.name(), op.arity()), (name, arity));
-        let (declaration, _) = handlers
-            .iter()
-            .find(|(d, _)| d.op.as_str() == name)
-            .unwrap_or_else(|| panic!("`{name}` is not registered"));
-        assert!(declaration.blocking, "{name}");
-        assert_eq!(declaration.path, format!("ply_host::fs::{name}"));
-        let refused = perform(&fs, op, "elsewhere", &vec![Value::str("a"); arity])
-            .expect_err("`elsewhere` has no root");
-        assert_eq!(refused.code, codes::FS_ROOT_UNBOUND, "{name}");
-    }
 }
 
 // --- Links that lead out of the root ---
@@ -1497,12 +1218,13 @@ fn held(dir: &Path) -> Vec<String> {
     out
 }
 
-/// Every way `op` is given `path`, each with whether it then acts on a link that is the path's
-/// last name rather than on what the link leads to. No arm is a wildcard, so an operation added to
-/// the family does not compile until it says how it takes a path.
-fn given(op: Op, path: &str) -> Vec<(Vec<Value>, bool)> {
-    let p = || Value::str(path);
-    let how = |name: &str| Value::ctor(format!("std.fs.{name}"), Vec::new());
+/// Every way `op` is given `path`: the path it is asked of, what it is handed beside it, and
+/// whether it then acts on a link that is the path's last name rather than on what the link leads
+/// to. No arm is a wildcard, so an operation added to the family does not compile until it says
+/// how it takes a path.
+fn given(op: Op, path: &str) -> Vec<(String, Second, bool)> {
+    let p = || path.to_string();
+    let plain = || "plain.txt".to_string();
     match op {
         Op::ReadFile
         | Op::ListDir
@@ -1514,7 +1236,7 @@ fn given(op: Op, path: &str) -> Vec<(Vec<Value>, bool)> {
         | Op::Canonical
         | Op::Mode
         | Op::Walk
-        | Op::Space => vec![(vec![p()], false)],
+        | Op::Space => vec![(p(), Second::None, false)],
         Op::Kind
         | Op::Exists
         | Op::Remove
@@ -1522,45 +1244,42 @@ fn given(op: Op, path: &str) -> Vec<(Vec<Value>, bool)> {
         | Op::Unlock
         | Op::RemoveTree
         | Op::ReadLink
-        | Op::Stat => vec![(vec![p()], true)],
-        Op::ReadAt => vec![(vec![p(), Value::Int(0), Value::Int(4)], false)],
-        Op::WriteFile | Op::Append => vec![(vec![p(), Value::bytes(b"x")], false)],
-        Op::WriteSecret => vec![(
-            vec![
-                p(),
-                Value::bytes(b"key "),
-                Value::secret_bytes(b"x"),
-                Value::str("hex"),
-                Value::bytes(b"\n"),
-            ],
-            false,
-        )],
+        | Op::Stat => vec![(p(), Second::None, true)],
+        Op::ReadAt => vec![(p(), Second::Range { offset: 0, len: 4 }, false)],
+        Op::WriteFile | Op::Append => vec![(p(), body(b"x"), false)],
+        Op::WriteSecret => vec![(p(), sealed("hex", b"x"), false)],
         Op::ReadSecret => vec![(
-            vec![p(), Value::bytes(b""), Value::str("raw"), Value::bytes(b"")],
+            p(),
+            Second::Frame {
+                before: Vec::new(),
+                framing: Framing::named("raw", op.what(), span()).expect("an encoding"),
+                after: Vec::new(),
+                keeper: Weak::new(),
+            },
             false,
         )],
-        Op::TempDir => vec![(vec![p(), Value::str("t-")], false)],
-        Op::SetMode => vec![(vec![p(), mode_value(0o600)], false)],
-        Op::SetModified => vec![(vec![p(), Value::Int(1000)], false)],
-        Op::Scan => vec![(vec![p(), Value::Bool(true)], false)],
-        Op::Symlink => vec![(vec![p(), Value::str("plain.txt")], true)],
+        Op::TempDir => vec![(p(), Second::Name("t-".into()), false)],
+        Op::SetMode => vec![(p(), Second::Mode(0o600), false)],
+        Op::SetModified => vec![(p(), Second::Millis(1000), false)],
+        Op::Scan => vec![(p(), Second::Deep(true), false)],
+        Op::Symlink => vec![(p(), Second::Target(plain()), true)],
         Op::Open => vec![
-            (vec![p(), how("ToRead")], false),
-            (vec![p(), how("ToWrite")], false),
-            (vec![p(), how("ToAppend")], false),
-            (vec![p(), how("ToCreate")], true),
+            (p(), Second::Opening(Opening::Read), false),
+            (p(), Second::Opening(Opening::Write), false),
+            (p(), Second::Opening(Opening::Append), false),
+            (p(), Second::Opening(Opening::Create), true),
         ],
         Op::Rename => vec![
-            (vec![p(), Value::str("moved")], true),
-            (vec![Value::str("plain.txt"), p()], true),
+            (p(), other("moved"), true),
+            (plain(), Second::Path(p()), true),
         ],
         Op::Copy => vec![
-            (vec![p(), Value::str("copied")], false),
-            (vec![Value::str("plain.txt"), p()], false),
+            (p(), other("copied"), false),
+            (plain(), Second::Path(p()), false),
         ],
         Op::Link => vec![
-            (vec![p(), Value::str("plain.txt")], true),
-            (vec![Value::str("named"), p()], true),
+            (p(), Second::Path(plain()), true),
+            ("named".to_string(), Second::Path(p()), true),
         ],
         // An open file is named by the descriptor `open` answered, and takes no path.
         Op::ReadChunk | Op::WriteChunk | Op::Close => Vec::new(),
@@ -1569,25 +1288,14 @@ fn given(op: Op, path: &str) -> Vec<(Vec<Value>, bool)> {
 
 #[test]
 fn no_operation_reaches_through_a_link_out_of_the_root() {
-    let registered: Vec<String> = {
-        let dir = root();
-        registrations(&rooted(dir.path()))
-            .iter()
-            .map(|(declaration, _)| declaration.op.as_str().to_string())
-            .collect()
-    };
-    for name in &registered {
-        let op = *Op::ALL
-            .iter()
-            .find(|op| op.name() == name)
-            .unwrap_or_else(|| panic!("`{name}` is registered and is no `Op`"));
+    for op in Op::ALL {
         for way in Way::ALL {
-            for (args, itself) in given(op, way.path()) {
+            for (path, second, itself) in given(op, way.path()) {
                 let (inside, outside) = linked_out();
                 let fs = rooted(inside.path());
                 let before = held(outside.path());
-                let answer = perform(&fs, op, "cache", &args);
-                let said = format!("`{name}` given `{}` ({way:?})", way.path());
+                let answer = perform(&fs, op, &path, second);
+                let said = format!("{} given `{}` ({way:?})", op.what(), way.path());
                 if itself && way.names_the_link() {
                     assert!(answer.is_ok(), "{said} acts on the link itself");
                 } else {
@@ -1614,42 +1322,31 @@ fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
         let fs = rooted(&here);
         let before = held(outside.path());
         let target = std::fs::read_link(here.join(name)).unwrap();
-        let path = || Value::str(name);
 
-        assert_eq!(ctor_name(&on(&fs, Op::Kind, &[path()])), "std.fs.Symlink");
-        assert!(boolean(&on(&fs, Op::Exists, &[path()])));
+        assert_eq!(kind(on(&fs, Op::Kind, name, Second::None)), Kind::Symlink);
+        assert!(did(on(&fs, Op::Exists, name, Second::None)));
+        assert_eq!(stat(&fs, name).map(|found| found.kind), Some(Kind::Symlink));
         assert_eq!(
-            stat(&fs, name).map(|found| found.kind),
-            Some("std.fs.Symlink".to_string())
-        );
-        assert_eq!(
-            maybe_str(&on(&fs, Op::ReadLink, &[path()])),
+            found_text(on(&fs, Op::ReadLink, name, Second::None)),
             target.to_str().map(str::to_string)
         );
         assert_eq!(
-            opened(&fs, "cache", name, "ToCreate"),
-            Err("std.fs.Exists".into())
+            opened(&fs, "cache", name, Opening::Create),
+            Err(Refusal::Exists.flat())
         );
-        assert_eq!(linked(&fs, "named", name), Err("std.fs.NotAFile".into()));
-        assert_eq!(linked(&fs, name, "plain.txt"), Err("std.fs.Exists".into()));
-        assert!(!boolean(&on(
+        assert_eq!(linked(&fs, "named", name), Err(Refusal::NotAFile.flat()));
+        assert_eq!(linked(&fs, name, "plain.txt"), Err(Refusal::Exists.flat()));
+        assert!(!did(on(
             &fs,
             Op::Symlink,
-            &[path(), Value::str("plain.txt")]
+            name,
+            Second::Target("plain.txt".into())
         )));
 
-        assert!(boolean(&on(
-            &fs,
-            Op::Rename,
-            &[path(), Value::str("moved")]
-        )));
+        assert!(did(on(&fs, Op::Rename, name, other("moved"))));
         assert_eq!(std::fs::read_link(here.join("moved")).unwrap(), target);
         std::fs::write(here.join("new.txt"), b"new").unwrap();
-        assert!(boolean(&on(
-            &fs,
-            Op::Rename,
-            &[Value::str("new.txt"), Value::str("moved")]
-        )));
+        assert!(did(on(&fs, Op::Rename, "new.txt", other("moved"))));
         assert_eq!(std::fs::read(here.join("moved")).unwrap(), b"new");
 
         std::os::unix::fs::symlink(&target, here.join("again")).unwrap();
@@ -1658,7 +1355,7 @@ fn an_operation_on_a_link_itself_reads_moves_and_removes_one_that_leads_out() {
         } else {
             Op::Remove
         };
-        assert!(boolean(&on(&fs, remove, &[Value::str("again")])));
+        assert!(did(on(&fs, remove, "again", Second::None)));
         assert!(std::fs::symlink_metadata(here.join("again")).is_err());
         assert_eq!(held(outside.path()), before, "through `{name}`");
     }
@@ -1688,14 +1385,8 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
     let fs = rooted(&real);
     std::fs::create_dir(real.join("d")).unwrap();
     std::fs::write(real.join("d/a.txt"), b"a").unwrap();
-    let read = |path: &str| maybe_bytes(&on(&fs, Op::ReadFile, &[Value::str(path)]));
-    let write = |path: &str| {
-        boolean(&on(
-            &fs,
-            Op::WriteFile,
-            &[Value::str(path), Value::bytes(b"w")],
-        ))
-    };
+    let read = |path: &str| found_bytes(on(&fs, Op::ReadFile, path, Second::None));
+    let write = |path: &str| did(on(&fs, Op::WriteFile, path, body(b"w")));
 
     // A link to what is not there yet is written through, and one that names the root's own
     // absolute path stays inside it.
@@ -1715,20 +1406,20 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
         assert_eq!(read(nowhere), None, "{nowhere}");
         assert!(!write(nowhere), "{nowhere}");
         assert_eq!(
-            opened(&fs, "cache", nowhere, "ToWrite"),
-            Err("std.fs.NotFound".into()),
+            opened(&fs, "cache", nowhere, Opening::Write),
+            Err(Refusal::NotFound.flat()),
             "{nowhere}"
         );
         assert_eq!(
-            ctor_name(&on(&fs, Op::Resolved, &[Value::str(nowhere)])),
-            "std.fs.Missing",
+            kind(on(&fs, Op::Resolved, nowhere, Second::None)),
+            Kind::Missing,
             "{nowhere}"
         );
     }
     assert_eq!(std::fs::read(real.join("d/a.txt")).unwrap(), b"a");
     assert_eq!(
-        ctor_name(&on(&fs, Op::Kind, &[Value::str("round")])),
-        "std.fs.Symlink"
+        kind(on(&fs, Op::Kind, "round", Second::None)),
+        Kind::Symlink
     );
 
     // A link's target that steps back out of a name that is not there names nothing, as the

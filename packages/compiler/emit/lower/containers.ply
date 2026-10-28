@@ -23,8 +23,9 @@ import compiler.emit.roots (builtin_helper, generated_builtin)
 import compiler.emit.release (released_vars)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RFlat, Leaf,
                           Var, Arg, AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer,
-                          OHandle, Let, Prim, If, Containers, Static)
+                          OHandle, OCalling, Let, Prim, If, Containers, Static, rep_of_arg)
 import compiler.emit.tir.handling (Unsettled, Entering)
+import compiler.emit.tir.calling (Observed)
 import compiler.emit.lower.evidence (value_handing, builtin_row)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew,
                                      ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
@@ -37,13 +38,13 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, refuse, bound_as, d
                                  filed, unfiled, type_of, as_words, opened, continued)
 import compiler.emit.lower.base
 import compiler.emit.lower.data (constructed_as)
-import compiler.emit.lower.scalars (operated, runtime_builtin, stated, binary, numeric_in_place,
-                                    numeric_converted, decimal_conversion)
+import compiler.emit.lower.scalars (operated, stated, binary, numeric_in_place, numeric_converted,
+                                    decimal_conversion)
 import compiler.expand.rewrite (float_function)
 import compiler.emit.statics (laid_at, KnownMap)
 import compiler.emit.tir.statics (StaticDef)
-import compiler.emit.lower.crossing (crossing_builtin, crossed, type_described, over_encoding,
-                                     by_encoding, through_runtime, over_machine_words)
+import compiler.emit.lower.crossing (crossing_builtin, crossed, type_described, over_machine_words,
+                                     settled, left_to_callers, assertion_failed)
 import compiler.emit.lower.kept (kept_builtin, kept_called)
 import compiler.emit.lower.strings
 import compiler.emit.lower.strings (string_builtin)
@@ -83,11 +84,8 @@ fn builtin_filed(
           Containers,
           b"an imported name that is neither a definition nor a builtin: ".concat(name),
         ),
-      Some(b) -> if written_part(name) && filed(cx, callee) == None {
-        // Written code files a part's type where a root of its own writes it; the rest only the
-        // runtime can answer, the root that asks among them.
-        runtime_builtin(cx, st, b, args, at)
-      } else if b == b"assert_eq" { asserted(cx, st, args, callee, at) }
+      Some(b) -> if b == b"assert_eq" { asserted(cx, st, args, at) }
+      else if b == b"observe" { observed(cx, st, args, at) }
       else if b == b"Map::new" && args.len() == 0 { empty_map(cx, st, args, callee, at) }
       else if kept_builtin(b) { kept_called(cx, st, b, args, callee, at) }
       else if crossing_builtin(b) { crossed(cx, st, b, args, callee, at) }
@@ -97,41 +95,51 @@ fn builtin_filed(
     },
   }
 
-/// `assert_eq(actual, expected)`: the two compared as `==` compares them, and handed the runtime over
-/// their encoding only where they differ, which raises with both shown. In a body generic over their
-/// type, the runtime's builtin, which only the specialisations its callers settle run.
-fn asserted(
-  cx: Context,
-  st: Lowering,
-  args: List<Arg>,
-  callee: Span,
-  at: Span,
-) -> Lowered / {abort.raise} =
+/// `assert_eq(actual, expected)`: the two compared as `==` compares them, and only where they differ
+/// handed the runtime as what a diagnostic shows of each, which raises with both shown. In a body
+/// generic over their type, the specialisations its callers settle compare them.
+fn asserted(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {abort.raise} =
   match args {
     [a, b] -> {
       let ty = type_of(a);
-      if has_vars(ty) { crossed(cx, st, b"assert_eq", args, callee, at) } else {
+      if has_vars(ty) {
+        left_to_callers(cx, st, b"assert_eq", args, { params: [ty, ty], ret: unit_type() }, at)
+      } else {
         let equal = binary(cx, { st: st, arg: a }, { st: st, arg: b }, b"eq", at);
-        let failed = by_encoding(
-          cx,
-          opened(equal.st),
-          b"?assert_failed",
-          args,
-          { params: [ty, ty], ret: unit_type() },
-          at,
-        );
+        let failed = assertion_failed(cx, opened(equal.st), a, b, ty, at);
         {
           st: {
-            ..continued(equal.st, failed.st),
-            insts: equal.st.insts.push(
-              If({ cond: equal.arg, then: [], otherwise: failed.st.insts }),
-            ),
+            ..continued(equal.st, failed),
+            insts: equal.st.insts.push(If({ cond: equal.arg, then: [], otherwise: failed.insts })),
           },
           arg: AZero(RUnit),
         }
       }
     },
     _ -> refuse(st, Containers, b"`assert_eq` of other than two values"),
+  }
+
+/// `observe(x)`: `x`, read without a count of its own into a value the C compiler knows nothing of,
+/// so what made `x` runs though nothing else reads it, and nothing that reads the answer is worked
+/// out ahead.
+fn observed(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered =
+  match args {
+    [x] -> {
+      let ty = type_of(x);
+      let held = handed({ st: st, arg: x }, held_as(cx.setting, ty), at);
+      bound_as(
+        held.st,
+        ty,
+        rep_of_arg(held.arg),
+        Op({
+          op: OCalling(Observed),
+          args: [held.arg],
+          uses: { takes: [false], owned: false, fails: false, stops: false },
+        }),
+        at,
+      )
+    },
+    _ -> refuse(st, Containers, b"`observe` of other than one value"),
   }
 
 /// `Map::new()`: the empty map laid out as static data, immortal as the runtime's own is, which a
@@ -152,11 +160,6 @@ fn empty_map(
     },
     None -> contained(cx, st, b"Map::new", args, called_at(cx, b"Map::new", callee), callee, at),
   }
-
-/// Whether `name` is a builtin written code calls on a part of the value its root takes, encoding or
-/// reflecting it at the type filed for the part.
-fn written_part(name: Bytes) -> Bool =
-  name == b"?encoded" || name == b"?reflect" || name == b"?shown"
 
 /// Whether field `name` of `base` is read from its column, with no record made: `base` a call of the
 /// builtin `Columns::get` of two, whose records the checker settled to a type that lays them out and
@@ -377,8 +380,13 @@ fn contained(
       Some(t) -> match if name.starts_with(b"Array::") {
           match element_of(cx, t) { Some(e) -> Some([e]), None -> None }
         } else { columns_of(cx, t) } {
-        None -> if open(t) { unlaid(cx, layout_needed(st, t), name, args, f, at) }
-        else { called(cx, st, name, args, f, callee, at) },
+        None -> if open(t) { unlaid(cx, layout_needed(st, t), name, args, f, at) } else {
+          refuse(
+            st,
+            Containers,
+            b"an array's elements laid out no way the emitter knows: ".concat(name),
+          )
+        },
         Some(es) -> if name.starts_with(b"Array::") {
           arrayed(cx, layout_noted(st, t), name, args, t, es, f, at)
         } else { columns_called(cx, layout_noted(st, t), name, args, t, es, f, at) },
@@ -418,9 +426,9 @@ fn unlaid(
       ),
   }
 
-/// A builtin called through the runtime, which must implement it: a shipped module's over machine
-/// words where its types are machine types, and any other over its arguments' encoding, answering
-/// the type `f` gives. A hold's builtins are the runtime's natives over the hold (`held_through`).
+/// A builtin called through the runtime, which must implement it: a shipped module's native over
+/// machine words, answering the type `f` gives, and a hold's builtins as the runtime's natives over
+/// the hold (`held_through`). The emitter writes every other builtin at the types a call settles.
 fn called(
   cx: Context,
   st: Lowering,
@@ -441,12 +449,14 @@ fn called(
   } else {
     match cx.setting.machine.get(name) {
       Some(call) -> over_machine_words(cx, st, name, call, args, f.ret, callee, at),
-      None -> encoded_called(cx, st, name, args, f, callee, at),
+      None -> left_open(cx, st, name, args, f, callee, at),
     }
   }
 
-/// A builtin called through the runtime over its arguments' encoding, answering the type `f` gives.
-fn encoded_called(
+/// Builtin `name`, which the emitter writes at settled types, called at types a type variable
+/// leaves open: the specialisations its callers settle write it. At settled types, it is a builtin
+/// the emitter writes no code for, refused.
+fn left_open(
   cx: Context,
   st: Lowering,
   name: Bytes,
@@ -454,19 +464,26 @@ fn encoded_called(
   f: Settled,
   callee: Span,
   at: Span,
-) -> Lowered / {abort.raise} =
-  match builtin_at(cx.setting, filed(cx, callee), name) {
-    Some(_) -> over_encoding(cx, st, name, args, callee, at),
-    None -> match match f.ret { Some(r) -> Some(r), None -> elaborated_answer(name, args) } {
-      None ->
-        refuse(
-          st,
-          Containers,
-          b"a builtin called at a type neither filed nor declared: ".concat(name),
-        ),
-      Some(ret) -> through_runtime(cx, st, name, args, ret, at),
+) -> Lowered / {abort.raise} = {
+  let types = match builtin_at(cx.setting, filed(cx, callee), name) {
+    Some(t) -> Some(t),
+    None -> match f.ret {
+      Some(ret) -> Some({ params: args.map(type_of), ret: ret }),
+      None -> None,
     },
+  };
+  match types {
+    Some(t) -> if t.params.push(t.ret).all(settled) {
+      refuse(st, Containers, b"a builtin the emitter writes no code for: ".concat(name))
+    } else { left_to_callers(cx, st, name, args, t, at) },
+    None ->
+      refuse(
+        st,
+        Containers,
+        b"a builtin called at a type neither filed nor declared: ".concat(name),
+      ),
   }
+}
 
 /// A hold's builtin `name` over its one operand, answering `ret`, by the runtime's native over the
 /// hold, which never reads what the hold holds: `?hold_new` makes a hold of the value's word form,
@@ -501,18 +518,6 @@ fn held_through(
     },
     _ -> refuse(st, Containers, b"a hold's builtin of other than one operand: ".concat(name)),
   }
-
-/// What a native the elaboration writes calls of answers, which no declaration states: an operator
-/// at a type a witness stands for its operands' type, but `<`, `<=`, `>` and `>=`, which the
-/// elaboration numbers 5 to 8, a `Bool`.
-fn elaborated_answer(name: Bytes, args: List<Arg>) -> Option<Type> =
-  if name == b"?numeric_binary" {
-    match args {
-      [AInt(k), _, x, _] -> Some(if k >= 5 && k <= 8 { bool_type() } else { type_of(x) }),
-      _ -> None,
-    }
-  } else if name == b"?numeric_unary" { match args { [_, _, x] -> Some(type_of(x)), _ -> None } }
-  else { None }
 
 /// `st` noting each type variable that leaves the layout of an element of type `t` unknown, which a
 /// specialisation would lay its elements out by.
@@ -1126,6 +1131,9 @@ pub fn scalar_builtin(name: Bytes) -> Bool =
       b"checked_sub",
       b"checked_mul",
       b"checked_neg",
+      b"to_int",
+      b"?numeric_binary",
+      b"?numeric_unary",
       b"U8::of_int",
       b"U16::of_int",
       b"U32::of_int",
