@@ -28,7 +28,7 @@ import compiler.emit.tir (Rep, RInt, RBool, RImm, RWord, RFloat, RNum, RDec, RWi
                           Pending, no_links)
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.strings (Grown)
-import compiler.emit.tir.handling (HandleOp, Encoded, Unsettled, VarInit, VarRead, VarWrite)
+import compiler.emit.tir.handling (HandleOp, Unsettled, VarInit, VarRead, VarWrite)
 import compiler.emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField, WHead)
 import compiler.emit.release (word_form_heads)
 import compiler.emit.lower.setting (CallTypes, builtin_at, op_mode_of)
@@ -44,39 +44,6 @@ import compiler.check.infer.definitions (MachineCall, MachineInt, MachineFloat, 
                                          MachineSecret, MachineObject, MachineHanded,
                                          MachineFunction, MachineUnit)
 import compiler.emit.lower.evidence (value_handing)
-
-/// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
-/// runtime decodes, answers as it always has, and encodes the answer of.
-pub fn encoded_externs() -> List<Bytes> = []
-
-/// Extern `name` called on `args` over their encoding, as `by_encoding` calls it; in a body generic
-/// over its types, a call settled in the specialisations its callers settle. `callee` is where its
-/// name is written, which the types it is called at are filed under.
-pub fn over_encoding(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  callee: Span,
-  at: Span,
-) -> Lowered / {abort.raise} =
-  match builtin_at(cx.setting, filed(cx, callee), name) {
-    None -> refuse(st, Handling, b"an extern called over its encoding at no type: ".concat(name)),
-    Some(types) -> encoded_at(cx, st, name, args, types, at),
-  }
-
-/// Extern `name` called on `args` over their encoding at `types`, as `by_encoding` calls it; where a
-/// type variable leaves them open, a call settled in the specialisations its callers settle.
-fn encoded_at(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  types: CallTypes,
-  at: Span,
-) -> Lowered / {abort.raise} =
-  if types.params.push(types.ret).all(settled) { by_encoding(cx, st, name, args, types, at) }
-  else { left_to_callers(cx, st, name, args, types, at) }
 
 /// Builtin `name` called on `args` at `types`, which a type variable leaves open: a placeholder no
 /// printer sees, in a body its callers settle at those types and lower again.
@@ -101,27 +68,14 @@ pub fn left_to_callers(
     at,
   )
 
-/// Builtin `name` the runtime answers, called on `args` over their encoding, answering a value of
-/// `ty`.
-pub fn through_runtime(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  ty: Type,
-  at: Span,
-) -> Lowered / {abort.raise} =
-  encoded_at(cx, st, name, args, { params: args.map(type_of), ret: ty }, at)
-
 /// Whether a call of builtin `name` is lowered here: a crossing native, a part of a crossing root,
-/// an encoding or a decoding, or an extern called over its arguments' encoding.
+/// an encoding or a decoding.
 pub fn crossing_builtin(name: Bytes) -> Bool =
   machine_named(name) != None || name == b"?lower" || name == b"?lift" || name == b"?encode"
     || name == b"?decode"
     || name == b"?out_carried"
     || name == b"?in_carried"
     || handler_builtin(name)
-    || encoded_externs().contains(name)
 
 /// Builtin `name`, one `crossing_builtin` holds, called on `args`; `callee` is where its name is
 /// written, which the type a generic one is called at is filed under.
@@ -168,8 +122,7 @@ pub fn crossed(
       [b] -> decoded(cx, st, b, at_type, at),
       _ -> refuse(st, Handling, b"a decoding of other than one byte string"),
     }
-  } else if encoded_externs().contains(name) { over_encoding(cx, st, name, args, callee, at) }
-  else {
+  } else {
     match machine_named(name) {
       Some(m) -> machine(cx, st, m, args, at_type, at),
       None -> refuse(st, Handling, b"a crossing builtin this family does not lower: ".concat(name)),
@@ -298,7 +251,7 @@ fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abor
 }
 
 /// Whether `ty` names every part of a value of it: no type variable and no word erased to `_`.
-fn settled(ty: Type) -> Bool =
+pub fn settled(ty: Type) -> Bool =
   match ty {
     TyCon(c) -> c.name != b"_" && c.args.all(settled),
     TyVar(_) -> false,
@@ -364,52 +317,6 @@ fn decoded(cx: Context, st: Lowering, b: Arg, ty: Type, at: Span) -> Lowered / {
   let v = lifted_part(cx, opened, ty, at);
   { st: native_done(v.st, b"?lift_close", [], true, at), arg: v.arg }
 }
-
-/// Extern `name` called over its arguments' encoding at `types`, those it takes and answers: each
-/// argument lowered at its type into a list the runtime decodes and calls the extern on, which raises
-/// as the extern does, or opens a lifting of its answer's encoding, which the answer is read from.
-pub fn by_encoding(
-  cx: Context,
-  st: Lowering,
-  name: Bytes,
-  args: List<Arg>,
-  types: CallTypes,
-  at: Span,
-) -> Lowered / {abort.raise} =
-  if types.params.len() != args.len() {
-    refuse(st, Handling, b"an extern called over its encoding with other arguments: ".concat(name))
-  } else {
-    let opened = native_done(st, b"?lower_open", [AInt(0)], false, at);
-    let head = native_done(opened, b"?out_count", [AInt(9), AInt(args.len())], false, at);
-    let written = range(0, args.len()).fold(head, |s: Lowering, i: Int|
-      lowered_part(cx, s, args.get(i), types.params.get(i), at).st);
-    let call = Op({
-      op: OHandle(Encoded(name)),
-      args: [],
-      uses: { takes: [], owned: false, fails: true, stops: false },
-    });
-    // One that never answers raises with nothing open: its answer is a word nothing reads.
-    if never_answers(cx, name, args.len()) {
-      handed(bound_as(written, types.ret, RWord, call, at), held_as(cx.setting, types.ret), at)
-    } else {
-      let answer = lifted_part(cx, done(written, call, at), types.ret, at);
-      { st: native_done(answer.st, b"?lift_close", [], true, at), arg: answer.arg }
-    }
-  }
-
-/// Whether extern `name`, called on `n` arguments, never answers: its declared answer holds a type
-/// variable none of its parameters does, and the call passes no witness that would fix it, so it
-/// only raises, as `panic` does.
-fn never_answers(cx: Context, name: Bytes, n: Int) -> Bool =
-  match cx.setting.declared.get(name) {
-    Some(sc) -> match sc.ty {
-      TyFn(f) ->
-        n == f.params.len()
-          && type_vars(f.ret).any(|v: Int| !f.params.any(|p: Type| type_vars(p).contains(v))),
-      _ -> false,
-    },
-    None -> false,
-  }
 
 // --- The crossing natives ------------------------------------------------------------------
 
