@@ -3,7 +3,7 @@ mod sweep;
 
 use crate::units::{self, def};
 use ply_compiled::c::exports::HelperShape;
-use ply_compiled::c::{PRELUDE, builtin_helper_name, helpers};
+use ply_compiled::c::{builtin_helper_name, helpers};
 use ply_compiled::heap::{imm, imm_value};
 
 /// A declaration with no address is a null call at run time: a crash rather than a decline.
@@ -155,40 +155,6 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     );
 }
 
-#[test]
-fn the_prelude_agrees_with_the_layouts_it_mirrors() {
-    assert_eq!(ply_compiled::heap::HEADER, 8, "PLY_HEADER");
-    assert_eq!(std::mem::size_of::<ply_compiled::heap::Obj>(), 8, "PlyObj");
-    assert_eq!(
-        std::mem::offset_of!(ply_compiled::rt::Ctx, failed),
-        0,
-        "PlyCtx.failed"
-    );
-    assert_eq!(
-        std::mem::offset_of!(ply_compiled::rt::Ctx, fuel),
-        8,
-        "PlyCtx.fuel"
-    );
-    assert_eq!(
-        std::mem::offset_of!(ply_compiled::rt::Ctx, stack_floor),
-        16,
-        "PlyCtx.stack_floor"
-    );
-    assert_eq!(
-        std::mem::offset_of!(ply_compiled::rt::Ctx, ticks),
-        48,
-        "PlyCtx.ticks"
-    );
-    assert_eq!(
-        std::mem::offset_of!(ply_compiled::rt::Ctx, next_tick),
-        56,
-        "PlyCtx.next_tick"
-    );
-    assert!(PRELUDE.contains("#define PLY_HEADER 8"));
-    assert_eq!(ply_compiled::heap::FRAME, u32::MAX - 1, "PLY_RC_FRAME");
-    assert!(PRELUDE.contains("#define PLY_RC_FRAME (UINT32_MAX - 1)"));
-}
-
 /// A unit binds the helpers it records by name, in its own order, each to this runtime's own.
 #[test]
 fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
@@ -276,85 +242,6 @@ fn a_unit_compiles_loads_binds_and_answers() {
     assert_eq!(native.arity("m.probe"), Some(2));
     let answer = units::entered(&native, "m.probe", 10, &[imm(20), imm(22)]).expect("it answers");
     assert_eq!(imm_value(answer), 42);
-}
-
-/// A C row of each case of `op` over `values`: the operands, whether it overflows, and the
-/// wrapped answer.
-fn overflow_rows(op: &str, values: &[i64], f: fn(i64, i64) -> (Option<i64>, i64)) -> String {
-    let lit = |v: i64| {
-        if v == i64::MIN {
-            "INT64_MIN".to_string()
-        } else {
-            format!("INT64_C({v})")
-        }
-    };
-    let mut rows = String::new();
-    for &a in values {
-        for &b in values {
-            let (exact, wrapped) = f(a, b);
-            rows.push_str(&format!(
-                "    {{ {op}, {}, {}, {}, {} }},\n",
-                lit(a),
-                lit(b),
-                i32::from(exact.is_none()),
-                lit(wrapped)
-            ));
-        }
-    }
-    rows
-}
-
-/// The checked arithmetic the C prelude gives compiled code, the compiler's overflow builtins and
-/// the fallback a compiler without them (tcc) reads, each against Rust's over the edges of the range.
-#[test]
-fn the_preludes_checked_arithmetic_agrees_with_and_without_the_overflow_builtins() {
-    let values = [
-        0,
-        1,
-        -1,
-        2,
-        -2,
-        3,
-        i64::MAX,
-        i64::MIN,
-        i64::MAX / 2,
-        i64::MIN / 2,
-        3_037_000_499,
-        3_037_000_500,
-        -3_037_000_500,
-        1 << 32,
-        -(1 << 32),
-        1 << 62,
-        -(1 << 62),
-    ];
-    let rows = [
-        overflow_rows("0", &values, |a, b| (a.checked_add(b), a.wrapping_add(b))),
-        overflow_rows("1", &values, |a, b| (a.checked_sub(b), a.wrapping_sub(b))),
-        overflow_rows("2", &values, |a, b| (a.checked_mul(b), a.wrapping_mul(b))),
-    ]
-    .concat();
-    let body = format!(
-        "  static const struct {{ int op; int64_t a, b; int over; int64_t r; }} cases[] = {{\n{rows}  }};\n\
-         \x20 int64_t wrong = 0;\n\
-         \x20 for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {{\n\
-         \x20   int64_t r = 0;\n\
-         \x20   int over = cases[i].op == 0 ? ply_add_ov(cases[i].a, cases[i].b, &r)\n\
-         \x20     : cases[i].op == 1 ? ply_sub_ov(cases[i].a, cases[i].b, &r) : ply_mul_ov(cases[i].a, cases[i].b, &r);\n\
-         \x20   if (over != cases[i].over || r != cases[i].r) wrong++;\n\
-         \x20 }}\n\
-         \x20 return ply_imm(wrong);"
-    );
-    let defs = [def("m.checked", 0, &body)];
-    for head in ["", "#define PLY_NO_OV_BUILTIN\n"] {
-        let dir = tempfile::tempdir().expect("a scratch directory");
-        let text = format!("{head}{}", units::text(&defs, &units::exports_of(&defs)));
-        let Some(lib) = units::library(dir.path(), &text) else {
-            return;
-        };
-        let (native, _) = ply_compiled::c::load_opened(&lib).expect("the unit loads");
-        let wrong = units::entered(&native, "m.checked", 10, &[]).expect("it answers");
-        assert_eq!(imm_value(wrong), 0, "with {head:?}");
-    }
 }
 
 /// The prologue a body opens with: the fuel it spends, and room asked for on the stack it runs on

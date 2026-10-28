@@ -168,15 +168,12 @@ fn a_bridge_is_given_back_with_the_value_it_bridged() {
 #[test]
 fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;
-    use ply_compiled::laid::hold;
     let mut ctx = context();
     ctx.begin(1_000);
     let held = alloc(&mut ctx, sized(1));
     let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };
-    let [("held", at)] = hold()[..] else {
-        panic!("a hold is described by the one word it holds at");
-    };
+    let at = ply_compiled::rt::HOLD_HELD;
     assert_eq!(unsafe { word_at(obj(h), at) }, held);
     unsafe { *(h as *mut Word).byte_add(HEADER).add(at) = 0 };
     free(&mut ctx, held, sized(1));

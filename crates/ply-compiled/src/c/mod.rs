@@ -18,10 +18,7 @@ pub use described::described;
 pub use exports::{Exports, Unserved};
 pub use load::{Library, cache_dir};
 pub(crate) use prelude::machine_native;
-pub use prelude::{
-    MachineNative, PRELUDE, RUNTIME_MARK, builtin_helper_name, helpers, machine_natives,
-    own_helpers, pointer_name, runtime_header, runtime_object,
-};
+pub use prelude::{MachineNative, builtin_helper_name, helpers, machine_natives, own_helpers};
 
 /// The runtime's sources, as `build.rs` digests them, less how C is compiled, kept, swept and
 /// loaded and how Rust asks the compiler: what an answer computed inside a loaded unit is a
@@ -98,12 +95,6 @@ pub fn kept_root(
             .or(home.map(|h| h.join(".cache")))
     };
     caches.unwrap_or(temp).join("ply").join(kind)
-}
-
-/// What a released `ply`'s units open with, up to their first bucket: the prelude and the runtime
-/// declared.
-pub fn unit_head() -> String {
-    format!("{PRELUDE}{}\n", runtime_header())
 }
 
 /// What a unit emitted against this runtime is a function of on the runtime's side: the sources

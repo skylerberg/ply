@@ -32,51 +32,20 @@ pub fn linked_program() -> Result<Program, Diagnostic> {
     let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
         return Err(unlinked(format!("its pack carries no `{FRONT}`")));
     };
-    let (entry, definitions) = match bytes.strip_prefix(FRONT_FORMAT) {
-        Some(rest) => {
-            let text = std::str::from_utf8(rest)
-                .map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
-            let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
-            (entry.to_string(), definitions.to_string())
-        }
-        None => released_front(bytes)?,
+    let Some(rest) = bytes.strip_prefix(FRONT_FORMAT) else {
+        return Err(unlinked(format!(
+            "`{FRONT}` is not a front this launcher reads"
+        )));
     };
+    let text =
+        std::str::from_utf8(rest).map_err(|_| unlinked(format!("`{FRONT}` is not UTF-8")))?;
+    let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
     let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
-        entry,
-        definitions,
+        entry: entry.to_string(),
+        definitions: definitions.to_string(),
         stage: format!("native-{stage}"),
     })
-}
-
-/// The entry and definitions of the front a release's `ply bootstrap` packs a builder with: a
-/// `front.Linked` in the value codec, of which nothing else is read.
-fn released_front(bytes: &[u8]) -> Result<(String, String), Diagnostic> {
-    use ply_core::Value;
-    let value = ply_core::codec::decode(bytes)
-        .map_err(|why| unlinked(format!("`{FRONT}` does not decode: {why}")))?;
-    fn field<'v>(v: &'v Value, name: &str) -> Option<&'v Value> {
-        match v {
-            Value::Record(fields) => fields
-                .iter()
-                .find(|(k, _)| k.as_str() == name)
-                .map(|(_, v)| v),
-            _ => None,
-        }
-    }
-    let text = |v: Option<&Value>| match v {
-        Some(Value::Str(s)) => Some(s.to_string()),
-        Some(Value::Bytes(b)) => String::from_utf8(b.to_vec()).ok(),
-        _ => None,
-    };
-    let entry = text(field(&value, "entry").and_then(|e| field(e, "name")));
-    let definitions = text(field(&value, "definitions"));
-    match (entry, definitions) {
-        (Some(entry), Some(definitions)) => Ok((entry, definitions)),
-        _ => Err(unlinked(format!(
-            "`{FRONT}` names no entry and definitions"
-        ))),
-    }
 }
 
 #[cold]
