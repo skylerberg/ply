@@ -3,10 +3,10 @@
 //! drop roots here are written as emitted code writes one.
 
 use crate::bare::{context, helper};
+use crate::unit::heap::Holding;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{HEADER, IMMORTAL, SHARED, Word, obj, word_at};
 use ply_compiled::rt::{Ctx, RELEASE_DEPTH};
-use ply_core::Value;
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
 
@@ -152,15 +152,15 @@ fn of_holders_on_many_threads_only_the_last_to_let_a_shared_block_go_releases_it
 }
 
 #[test]
-fn a_bridge_is_given_back_with_the_value_it_bridged() {
+fn a_native_object_is_given_back_with_what_it_holds() {
     let mut ctx = context();
     let held: Arc<str> = Arc::from("held");
-    let b = ctx.heap.bridge(Value::Str(held.clone()));
+    let b = ctx.heap.native(Box::new(Holding(Arc::clone(&held))));
     let free_handle: Given = helper("rt_handle_free");
     unsafe { free_handle(&mut ctx, b) };
     assert_eq!(count(b), 0);
     assert_eq!(Arc::strong_count(&held), 1);
-    assert_eq!(ctx.heap.bridges(), 0);
+    assert_eq!(ctx.heap.natives(), 0);
 }
 
 /// `drop#Hold<a>` reads what a hold holds at the payload word the description reports, and empties
@@ -190,19 +190,17 @@ fn a_block_given_back_is_counted_zero_until_it_is_taken_again() {
     let (mut mine, mut other) = (context(), context());
     let sized = alloc(&mut mine, 32);
     let elsewhere = alloc(&mut mine, 32);
-    let bridge = mine.heap.bridge(Value::str("bridged"));
-    let released = mine.heap.bridge(Value::str("released"));
+    let given_back = mine.heap.native(Box::new(Holding(Arc::from("given back"))));
+    let released = mine.heap.native(Box::new(Holding(Arc::from("released"))));
     free(&mut mine, sized, 32);
     free(&mut other, elsewhere, 32);
     let free_handle: Given = helper("rt_handle_free");
-    unsafe { free_handle(&mut mine, bridge) };
-    ply_compiled::heap::enter(&mut mine.heap);
-    ply_compiled::heap::release_handle(released);
-    ply_compiled::heap::leave();
+    unsafe { free_handle(&mut mine, given_back) };
+    ply_compiled::heap::release_object(&raw mut mine, released);
     for (w, given) in [
         (sized, "freed by its size"),
         (elsewhere, "freed under another context"),
-        (bridge, "a handle given back"),
+        (given_back, "a handle given back"),
         (released, "a handle whose last holder let it go"),
     ] {
         assert_eq!(count(w), 0, "a block {given}");

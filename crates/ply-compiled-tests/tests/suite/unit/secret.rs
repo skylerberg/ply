@@ -29,7 +29,7 @@ fn lent(bytes: &[u8]) -> (Word, Word) {
 }
 
 /// A secret of `bytes`, a `Secret<String>` where `text`.
-fn sealed(ctx: &mut Ctx, bytes: &[u8], text: bool) -> Word {
+pub(super) fn sealed(ctx: &mut Ctx, bytes: &[u8], text: bool) -> Word {
     let (p, n) = lent(bytes);
     unsafe { native::<A3>("?secret_of")(ctx, p, n, Word::from(text)) }
 }

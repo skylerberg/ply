@@ -11,7 +11,7 @@ use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, F64, I64, Raises};
 use crate::rt::{Ctx, Refused, lent, refuse, refused_numbered, refused_unknown};
 use ply_core::builtins::{assert_failure, not_found};
-use ply_core::{Decimal, Diagnostic, Span, Value, codes};
+use ply_core::{Decimal, Diagnostic, Span, codes};
 
 /// Every native here, under the name the compiler declares it by.
 pub fn natives() -> Vec<MachineNative> {

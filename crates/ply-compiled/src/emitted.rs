@@ -307,13 +307,6 @@ impl Block {
     }
 }
 
-/// `w` lowered through `ty` into a crossing of its own, read back as a value.
-fn lowered(ctx: *mut Ctx, w: Word, ty: &'static PlyType) -> Result<ply_core::Value, String> {
-    crate::rt::lowered_value(ctx, |ctx| unsafe {
-        (ty.lower)(ctx, w);
-    })
-}
-
 /// A value compiled code handed the runtime with its type: held, and counted only through its
 /// [`PlyType`]. Nothing but the type reads its word.
 #[repr(C)]
@@ -334,17 +327,6 @@ impl Carried {
             word: w.0,
             ty: unsafe { &*ty },
         }
-    }
-
-    /// `w`, which compiled code lends, held once more through its type: compiled code may let it go
-    /// while this holds it.
-    ///
-    /// # Safety
-    /// As [`Carried::new`].
-    pub(crate) unsafe fn kept_of(ctx: *mut Ctx, w: Handed, ty: *const PlyType) -> Carried {
-        let ty = unsafe { &*ty };
-        unsafe { (ty.inc)(ctx, w.0) };
-        Carried { word: w.0, ty }
     }
 
     pub fn ty(&self) -> &'static PlyType {
@@ -373,11 +355,6 @@ impl Carried {
     /// The value handed to compiled code, which takes this count of it.
     pub fn handed(self) -> Handed {
         Handed(self.word)
-    }
-
-    /// The value as its type writes it, read back: what a diagnostic shows of it.
-    pub fn lower(&self, ctx: *mut Ctx) -> Result<ply_core::Value, String> {
-        lowered(ctx, self.word, self.ty)
     }
 }
 

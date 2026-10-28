@@ -394,7 +394,7 @@ fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() 
         d.message
     );
     let_go(&mut ctx, k);
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }
 
 thread_local! {
@@ -502,7 +502,7 @@ fn a_task_runs_its_body_with_the_words_its_maker_held_and_answers_into_its_handl
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
     assert!(ctx.take_failure().is_none());
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }
 
 #[test]
@@ -554,5 +554,5 @@ fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
-    assert_eq!((ctx.heap.live(), ctx.heap.bridges()), (0, 0));
+    assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
 }

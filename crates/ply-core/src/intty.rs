@@ -112,3 +112,42 @@ impl fmt::Display for IntTy {
         f.write_str(self.name())
     }
 }
+
+/// A fixed-width integer; its bits are always normalized, so derived `Eq` and `Hash` are by value.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Fixed {
+    pub ty: IntTy,
+    bits: u128,
+}
+
+impl Fixed {
+    pub fn new(ty: IntTy, bits: u128) -> Fixed {
+        Fixed {
+            ty,
+            bits: ty.normalize(bits),
+        }
+    }
+
+    /// Truncated to the width and sign-extended past it.
+    pub fn bits(self) -> u128 {
+        self.bits
+    }
+
+    /// The value, wherever an `i128` holds it: every width's but a `U128` past `i128::MAX`.
+    pub fn to_i128(self) -> Option<i128> {
+        if self.ty.signed() {
+            Some(self.bits as i128)
+        } else {
+            i128::try_from(self.bits).ok()
+        }
+    }
+
+    /// The bits with nothing above this type's width.
+    pub fn raw(self) -> u128 {
+        if self.ty.bits() == 128 {
+            self.bits
+        } else {
+            self.bits & (u128::MAX >> (128 - self.ty.bits()))
+        }
+    }
+}

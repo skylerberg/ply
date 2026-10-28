@@ -11,11 +11,11 @@
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
-use crate::heap::{self, Heap, Word};
+use crate::heap;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
 use ply_core::crypto::{self, Encodes};
-use ply_core::{Diagnostic, Span, Value, codes};
+use ply_core::{Diagnostic, Span, codes};
 use zeroize::Zeroizing;
 
 /// Every native here, under the name the compiler or `std.internal.crypto` declares it by.
@@ -147,15 +147,6 @@ impl Sealed {
 
 impl heap::Native for Sealed {
     fn release(&mut self, _ctx: *mut Ctx) {}
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        if !self.text {
-            return Ok(Value::secret_bytes(&self.bytes));
-        }
-        std::str::from_utf8(&self.bytes)
-            .map(Value::secret_text)
-            .map_err(|_| "a secret text that is not UTF-8".to_string())
-    }
 }
 
 /// The handle of a new secret holding `bytes`, which it takes: a `Secret<String>` where `text`,
@@ -167,18 +158,6 @@ pub(crate) fn sealed(c: &mut Ctx, text: bool, bytes: Zeroizing<Vec<u8>>) -> Secr
 /// A new `Secret<Bytes>` holding `bytes`, which it takes.
 fn sealed_bytes(c: &mut Ctx, bytes: Zeroizing<Vec<u8>>) -> SecretHandle {
     sealed(c, false, bytes)
-}
-
-/// The runtime object a value the runtime answered stands for beside a lifting's bytes: a secret of
-/// its own for a `Secret`, so every native here reads it, and a bridge for any other value.
-pub(crate) fn runtime_object(heap: &mut Heap, v: Value) -> Word {
-    match &v {
-        Value::Secret(held) => heap.native(Box::new(Sealed {
-            text: held.is_text(),
-            bytes: Zeroizing::new(held.bytes().to_vec()),
-        })),
-        _ => heap.bridge(v),
-    }
 }
 
 /// The secret the lent handle `s` holds; none, with the entry failed as Ply's fault, where it holds

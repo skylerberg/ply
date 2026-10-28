@@ -1,10 +1,9 @@
 //! The blocks compiled code and the runtime lay out: a one-word header, the count, then the payload,
 //! which only the code that made the block reads. A word is a scalar's bits or a block's address;
-//! what the runtime keeps of its own (a bridged [`Value`], a hold) it tells apart by its first
+//! what the runtime keeps of its own (a native object, a hold) it tells apart by its first
 //! payload word.
 
 use crate::blocks::{self, Blocks};
-use ply_core::Value;
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 pub type Word = i64;
@@ -168,48 +167,23 @@ pub unsafe fn set_word(o: *mut Obj, i: usize, w: Word) {
 pub const CLOSURE_CODE: usize = 0;
 pub const CLOSURE_CAPTURES: usize = 1;
 
-/// What a bridge's first payload word holds: the address of this, which no other block's first word
-/// holds.
-static BRIDGE_MARK: u8 = 0;
-
-/// The payload word a bridge keeps its place in its heap's table in, and where its owned `Value`
-/// starts.
-const BRIDGE_AT: usize = 1;
-const BRIDGE_VALUE: usize = 2;
-
-/// A bridge's payload: its mark, its place, then one owned `Value`.
-const BRIDGE_BYTES: usize = 8 * BRIDGE_VALUE + std::mem::size_of::<Value>();
-
-/// The bridged value lives in the payload as an owned `Value`.
-unsafe fn bridge_slot(o: *mut Obj) -> *mut Value {
-    unsafe { words(o).add(BRIDGE_VALUE) as *mut Value }
-}
-
-/// Whether `w` is a bridge's block.
-pub fn is_bridge(w: Word) -> bool {
-    is_object(w) && unsafe { word_at(obj(w), 0) } == &raw const BRIDGE_MARK as Word
-}
-
-pub unsafe fn bridged<'a>(o: *mut Obj) -> &'a Value {
-    unsafe { &*bridge_slot(o) }
-}
+/// The payload word a native object keeps its place in its heap's table in, and where what it
+/// holds starts.
+const LISTED_AT: usize = 1;
+const NATIVE_HELD: usize = 2;
 
 /// What a native object's first payload word holds: the address of this.
 static NATIVE_MARK: u8 = 0;
 
 /// A native object's payload: its mark, its place in its heap's table, then what a native made it
 /// of, boxed.
-const NATIVE_BYTES: usize = 8 * BRIDGE_VALUE + std::mem::size_of::<Box<dyn Native>>();
+const NATIVE_BYTES: usize = 8 * NATIVE_HELD + std::mem::size_of::<Box<dyn Native>>();
 
 /// What a runtime object a native makes holds: a word in a scheduler's handle, a region's stacks.
 /// Its Rust memory goes with the object; what it holds of emitted code's it lets go of as its last
 /// holder lets it go, and at the entry's end the entry's memory goes whole.
 pub trait Native: std::any::Any {
     fn release(&mut self, ctx: *mut crate::rt::Ctx);
-
-    /// What the object reads as where it crosses into the runtime's values, as a diagnostic shows
-    /// it; an error where it reads as none.
-    fn value(&self, ctx: *mut crate::rt::Ctx) -> Result<Value, String>;
 
     /// The handle of its run the object is, which no boundary lets out; none for any other.
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
@@ -226,15 +200,7 @@ pub unsafe fn native_escapes(w: Word) -> Option<ply_core::escape::Handle> {
 }
 
 unsafe fn native_slot(o: *mut Obj) -> *mut Box<dyn Native> {
-    unsafe { words(o).add(BRIDGE_VALUE) as *mut Box<dyn Native> }
-}
-
-/// What the native object `w` reads as, as [`Native::value`] says.
-///
-/// # Safety
-/// `w` is a live native object; `ctx` is the running entry's.
-pub unsafe fn native_value(ctx: *mut crate::rt::Ctx, w: Word) -> Result<Value, String> {
-    unsafe { (**native_slot(obj(w))).value(ctx) }
+    unsafe { words(o).add(NATIVE_HELD) as *mut Box<dyn Native> }
 }
 
 /// Whether `w` is a native object's block.
@@ -257,9 +223,8 @@ pub unsafe fn native_of<'a, T: Native>(w: Word) -> Option<&'a mut T> {
 /// An entry's blocks, whose memory goes back whole at its end; a persistent heap's never does.
 pub struct Heap {
     blocks: Blocks,
-    /// The bridges whose `Value` the end drops and the native objects whose contents it drops,
-    /// each block's [`BRIDGE_AT`] its index here.
-    bridges: Vec<*mut Obj>,
+    /// The native objects whose contents the end drops, each block's [`LISTED_AT`] its index here.
+    natives: Vec<*mut Obj>,
     persistent: bool,
     /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither these
     /// counts nor the program's live blocks count them.
@@ -340,18 +305,18 @@ pub fn swap_current(heap: *mut Heap) -> *mut Heap {
     CURRENT.with(|c| c.replace(heap))
 }
 
-/// Gives back a dead block of `object` bytes. Only the heap that owns the block may: its bridge
-/// leaves the table first, so the bridge that takes the block next is not listed twice, and a
-/// bridge another heap owns stays listed there, dead, until that heap's end.
-unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, bridge: bool) {
+/// Gives back a dead block of `object` bytes. Only the heap that owns the block may: a native
+/// object leaves the table first, so the one that takes the block next is not listed twice, and
+/// one another heap owns stays listed there, dead, until that heap's end.
+unsafe fn give_back(o: *mut Obj, heap: *mut Heap, object: usize, listed: bool) {
     unsafe {
         if heap.is_null() || !(*heap).blocks.owns(o.cast(), object) {
-            if !bridge {
+            if !listed {
                 blocks::hand_back(o.cast(), object);
             }
             return;
         }
-        if bridge {
+        if listed {
             (*heap).unlist(o);
         }
         // Reused even when poisoned: holding dead blocks back exhausts memory.
@@ -404,17 +369,14 @@ unsafe fn sized_as(o: *mut Obj, heap: *mut Heap, object: usize) {
 }
 
 /// Gives back a runtime handle whose last holder was emitted code, with what the runtime keeps for
-/// it, and without a walk: a bridge's value is dropped, a native object lets go of what it holds
-/// and is dropped, and a hold's words are left unread, emitted code having let go of what it held.
+/// it, and without a walk: a native object lets go of what it holds and is dropped, and a hold's
+/// words are left unread, emitted code having let go of what it held.
 /// `ctx`, which a native object lets go of what it holds through, is null only for another.
 pub(crate) unsafe fn free_handle(o: *mut Obj, heap: *mut Heap, ctx: *mut crate::rt::Ctx) {
     unsafe {
         debug_assert!((*o).rc == SHARED || (*o).rc == 1);
         let w = o as Word;
-        let (payload, listed) = if is_bridge(w) {
-            std::ptr::drop_in_place(bridge_slot(o));
-            (BRIDGE_BYTES, true)
-        } else if is_native(w) {
+        let (payload, listed) = if is_native(w) {
             assert!(
                 !ctx.is_null(),
                 "a native object was let go of outside any context"
@@ -448,7 +410,7 @@ pub(crate) unsafe fn last_of_shared(o: *mut Obj) -> bool {
     last
 }
 
-/// One holder fewer of `w`, a bridge or a hold; the last gives it back to the running entry's heap.
+/// One holder fewer of `w`, a native object or a hold; the last gives it back to the running entry's heap.
 pub fn release_handle(w: Word) {
     unsafe { released(w, CURRENT.with(|c| c.get()), std::ptr::null_mut()) }
 }
@@ -491,7 +453,7 @@ impl Heap {
     pub fn new() -> Heap {
         Heap {
             blocks: Blocks::default(),
-            bridges: Vec::new(),
+            natives: Vec::new(),
             persistent: false,
             scheduling: false,
             count: 0,
@@ -505,9 +467,9 @@ impl Heap {
     /// Takes over a finished branch's memory: its blocks are this entry's from here on.
     pub fn adopt_heap(&mut self, mut other: Heap) {
         self.blocks.adopt(std::mem::take(&mut other.blocks));
-        for o in other.bridges.drain(..) {
-            unsafe { set_word(o, BRIDGE_AT, self.bridges.len() as Word) };
-            self.bridges.push(o);
+        for o in other.natives.drain(..) {
+            unsafe { set_word(o, LISTED_AT, self.natives.len() as Word) };
+            self.natives.push(o);
         }
         self.delayed.extend(other.delayed.drain(..));
         self.count += other.count;
@@ -569,35 +531,31 @@ impl Heap {
         self.blocks.reused()
     }
 
-    /// How many bridges the table lists: what a leak of them grows.
-    pub fn bridges(&self) -> usize {
-        self.bridges.len()
+    /// How many native objects the table lists: what a leak of them grows.
+    pub fn natives(&self) -> usize {
+        self.natives.len()
     }
 
-    /// Takes a dying bridge out of the table, the last entry moving into its place.
+    /// Takes a dying native object out of the table, the last entry moving into its place.
     unsafe fn unlist(&mut self, o: *mut Obj) {
-        let at = unsafe { word_at(o, BRIDGE_AT) } as usize;
+        let at = unsafe { word_at(o, LISTED_AT) } as usize;
         debug_assert!(
-            self.bridges.get(at) == Some(&o),
-            "a bridge died into a heap whose table does not hold it"
+            self.natives.get(at) == Some(&o),
+            "a native object died into a heap whose table does not hold it"
         );
-        self.bridges.swap_remove(at);
-        if let Some(&moved) = self.bridges.get(at) {
-            unsafe { set_word(moved, BRIDGE_AT, at as Word) };
+        self.natives.swap_remove(at);
+        if let Some(&moved) = self.natives.get(at) {
+            unsafe { set_word(moved, LISTED_AT, at as Word) };
         }
     }
 
-    /// Drops the `Value` of every bridge and what every native object holds, of those still
-    /// listed; one released with no heap entered stays listed, dead, and is skipped.
-    fn drop_bridges(&mut self) {
-        for o in self.bridges.drain(..) {
+    /// Drops what every native object holds, of those still listed; one released with no heap
+    /// entered stays listed, dead, and is skipped.
+    fn drop_natives(&mut self) {
+        for o in self.natives.drain(..) {
             unsafe {
                 if (*o).rc != 0 {
-                    if is_native(o as Word) {
-                        std::ptr::drop_in_place(native_slot(o));
-                    } else {
-                        std::ptr::drop_in_place(bridge_slot(o));
-                    }
+                    std::ptr::drop_in_place(native_slot(o));
                 }
             }
         }
@@ -626,27 +584,15 @@ impl Heap {
         p
     }
 
-    /// A bridge holding `v`, which it takes.
-    pub fn bridge(&mut self, v: Value) -> Word {
-        let o = self.raw_alloc(BRIDGE_BYTES);
-        unsafe {
-            set_word(o, 0, &raw const BRIDGE_MARK as Word);
-            set_word(o, BRIDGE_AT, self.bridges.len() as Word);
-            bridge_slot(o).write(v);
-        }
-        self.bridges.push(o);
-        o as Word
-    }
-
-    /// A native object holding `held`, which it takes, listed beside the bridges.
+    /// A native object holding `held`, which it takes, listed in the table.
     pub fn native(&mut self, held: Box<dyn Native>) -> Word {
         let o = self.raw_alloc(NATIVE_BYTES);
         unsafe {
             set_word(o, 0, &raw const NATIVE_MARK as Word);
-            set_word(o, BRIDGE_AT, self.bridges.len() as Word);
+            set_word(o, LISTED_AT, self.natives.len() as Word);
             native_slot(o).write(held);
         }
-        self.bridges.push(o);
+        self.natives.push(o);
         o as Word
     }
 
@@ -655,7 +601,7 @@ impl Heap {
         if self.persistent {
             return;
         }
-        self.drop_bridges();
+        self.drop_natives();
         self.blocks.reset();
         self.count = 0;
         self.bytes = 0;
@@ -665,6 +611,6 @@ impl Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        self.drop_bridges();
+        self.drop_natives();
     }
 }

@@ -51,16 +51,15 @@ fn a_natives_signature_is_its_functions_type() {
         <Typed as Native>::SIGNATURE,
         of(&[Addr, I64, Moved, Type], Some(I64), false)
     );
-    let concat = ply_core::Builtin::from_name("Secret::concat").expect("a builtin");
-    let words = of(&[Machine::Word; 2], Some(Machine::Word), false);
-    assert_eq!(ply_compiled::rt::signature(concat), words);
-    let at = ply_core::Builtin::from_name("Secret::decode").expect("a builtin");
+    let to_int = ply_core::Builtin::from_name("to_int").expect("a builtin");
     assert_eq!(
-        ply_compiled::rt::signature(at),
-        Signature {
-            raises: true,
-            ..words
-        }
+        ply_compiled::rt::signature(to_int),
+        of(&[Machine::Word; 2], Some(Machine::Word), false)
+    );
+    let panic = ply_core::Builtin::from_name("panic").expect("a builtin");
+    assert_eq!(
+        ply_compiled::rt::signature(panic),
+        of(&[Machine::Word], Some(Machine::Word), true)
     );
 }
 
@@ -123,7 +122,8 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
         "helper rt_tick 0 -",
         "native ?out_str 0 - Addr I64",
         "native ?refused 1 - I64 I64 I64 I64",
-        "native Secret::concat 0 Word Word Word",
+        "native to_int 0 Word Word Word",
+        "native panic 1 Word Word",
     ] {
         assert!(text.lines().any(|l| l == line), "no `{line}` in:\n{text}");
     }

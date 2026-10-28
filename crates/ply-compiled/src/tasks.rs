@@ -17,7 +17,7 @@ use crate::rt::{
 use crate::stack::{Stack, switch};
 use ply_core::host::Pending;
 use ply_core::sim::TaskId;
-use ply_core::{Diagnostic, Span, Value, codes};
+use ply_core::{Diagnostic, Span, codes};
 use ply_host::pool::Run;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -681,13 +681,6 @@ impl Native for Kept {
             v.release(ctx);
         }
     }
-
-    fn value(&self, ctx: *mut Ctx) -> Result<Value, String> {
-        match &self.value {
-            Some(v) => v.lower(ctx),
-            None => Err("a kept value let go of crossed".into()),
-        }
-    }
 }
 
 /// One region's tasks' stacks (`Stacks`): the region, its id among the entry's regions, the
@@ -726,10 +719,6 @@ impl Native for Stacks {
             heap::release_object(ctx, t);
         }
     }
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a region's stacks crossed".into())
-    }
 }
 
 /// At the entry's end, with the context going, the region's stacks are left to the process.
@@ -766,10 +755,6 @@ impl Native for TaskBody {
             s.release(ctx);
         }
     }
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a task's body crossed".into())
-    }
 }
 
 /// A region's task's handle (`Task`): its region, its id, how it ended and its answer.
@@ -787,10 +772,6 @@ impl Native for RegionTask {
         }
     }
 
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a task, which only its own region can hold, crossed".into())
-    }
-
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
         Some(ply_core::escape::Handle::Task)
     }
@@ -804,10 +785,6 @@ pub struct RegionChan {
 
 impl Native for RegionChan {
     fn release(&mut self, _ctx: *mut Ctx) {}
-
-    fn value(&self, _ctx: *mut Ctx) -> Result<Value, String> {
-        Err("a channel, which only its own region can hold, crossed".into())
-    }
 
     fn escapes(&self) -> Option<ply_core::escape::Handle> {
         Some(ply_core::escape::Handle::Channel)
@@ -1780,7 +1757,7 @@ pub unsafe extern "C" fn rt_root_returned(ctx: *mut Ctx, s: Handle, scheduled: I
     let task_stacks = stacks.region.as_ref().map_or(0, |r| r.stacks());
     let c = unsafe { &mut *ctx };
     c.held_at_root = Some(crate::entry::Held {
-        bridges: c.heap.bridges() as u64,
+        native_objects: c.heap.natives() as u64,
         scheduled: u64::try_from(scheduled.0).unwrap_or(0),
         task_stacks: task_stacks as u64,
         frame_tables: c.stack_slots() as u64,

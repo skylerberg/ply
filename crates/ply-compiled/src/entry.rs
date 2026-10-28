@@ -204,8 +204,8 @@ pub struct Usage {
 /// back.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Held {
-    /// Heap objects standing for a runtime value, such as a task's handle.
-    pub bridges: u64,
+    /// Native objects the runtime made, such as a task's handle.
+    pub native_objects: u64,
     /// Tasks the run's region still holds.
     pub scheduled: u64,
     /// Task stacks the run's region still keeps, its tasks' and those it keeps for its next ones.
@@ -412,7 +412,7 @@ fn entered(
 /// the entry is over.
 fn returned(ctx: &mut Ctx) -> Last {
     let held = ctx.held_at_root.take().unwrap_or(Held {
-        bridges: ctx.heap.bridges() as u64,
+        native_objects: ctx.heap.natives() as u64,
         scheduled: 0,
         task_stacks: 0,
         frame_tables: ctx.stack_slots() as u64,
@@ -814,7 +814,7 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),
 /// option(bytes) trace`; `ended := tag 0 bytes answer | 1 failure | 2 string panic | 3 no root |
 /// 4 string why unanswerable`; `usage := int nanos, bool host, int steps, int performs, int
-/// bridges, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place,
+/// native_objects, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place,
 /// int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
@@ -843,7 +843,7 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         .bool(u.host)
         .count(u.steps)
         .count(u.performs)
-        .count(u.held.bridges)
+        .count(u.held.native_objects)
         .count(u.held.scheduled)
         .count(u.held.task_stacks)
         .count(u.held.frame_tables)

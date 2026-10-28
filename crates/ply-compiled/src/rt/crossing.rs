@@ -19,10 +19,11 @@ pub(crate) enum Crossing {
     Lifting(Lifting),
 }
 
-/// Bytes being written, and what crosses beside them, each lent for as long as the crossing lasts.
+/// Bytes being written, and the handles they hold of what they cannot: a runtime object, or a value
+/// of a type the runtime keeps, neither of which anything reads back.
 pub(crate) struct Lowering {
     w: Writer,
-    beside: Vec<Beside>,
+    handles: u64,
     sharing: Option<Sharing>,
     /// The strings, bytes, lists, arrays and maps written so far, which `AGAIN` numbers.
     shareables: u64,
@@ -41,23 +42,6 @@ pub(crate) struct Lowering {
     shown: bool,
 }
 
-/// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
-/// go of what it wrote before the lowering is read: a runtime object's value, or a value compiled
-/// code lent with its type, held once more until the lowering ends.
-pub(crate) enum Beside {
-    Runtime(Value),
-    Carried(Carried),
-}
-
-/// Lets go of what a lowering's `beside` holds.
-pub(crate) fn released(ctx: *mut Ctx, beside: Vec<Beside>) {
-    for b in beside {
-        if let Beside::Carried(v) = b {
-            v.release(ctx);
-        }
-    }
-}
-
 /// What a lowering that writes a value shared as `AGAIN` knows of the values written so far.
 struct Sharing {
     numbered: HashMap<Word, u64>,
@@ -69,7 +53,7 @@ impl Lowering {
     fn new(again: bool) -> Lowering {
         Lowering {
             w: Writer::new(),
-            beside: Vec::new(),
+            handles: 0,
             sharing: again.then(|| Sharing {
                 numbered: HashMap::new(),
                 next: None,
@@ -102,9 +86,9 @@ impl Lowering {
         }
     }
 
-    fn beside(&mut self, b: Beside) {
-        self.w.handle(self.beside.len() as u64);
-        self.beside.push(b);
+    fn handle(&mut self) {
+        self.w.handle(self.handles);
+        self.handles += 1;
     }
 }
 
@@ -360,9 +344,8 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
     unsafe { &mut *ctx }.write(|l| l.w.name(name));
 }
 
-/// A runtime object, its value read as it is written. A handle of the run in an entry's answer is
-/// left for the boundary to refuse, held as nothing; in a value a diagnostic shows, nothing is read
-/// or held.
+/// A runtime object, written as a handle: one of the run in an entry's answer is noted for the
+/// boundary to refuse, and in a value a diagnostic shows, the handle says what the object is.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
     let w = h.word();
@@ -381,31 +364,19 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
         && l.answers_entry
     {
         l.escaping.get_or_insert(escaping);
-        l.beside(Beside::Runtime(Value::Unit));
-        return;
     }
-    match runtime_value(ctx, w) {
-        Ok(v) => c.write(|l| l.beside(Beside::Runtime(v))),
-        Err(why) => {
-            c.fail(err_crossing(&why));
-        }
-    }
+    c.write(Lowering::handle);
 }
 
 /// A value the runtime keeps rather than reads, with its type, which compiled code lends: what is
-/// in the position of an operation's own type parameter, held until the lowering ends; in a value a
+/// in the position of an operation's own type parameter, written as a handle; in a value a
 /// diagnostic shows, written in place through its type.
 pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const PlyType) {
     if unsafe { &*ctx }.showing() {
         unsafe { ((*ty).lower)(ctx, w.word()) };
         return;
     }
-    let held = unsafe { Carried::kept_of(ctx, w, ty) };
-    let c = unsafe { &mut *ctx };
-    match c.lowering() {
-        Ok(l) => l.beside(Beside::Carried(held)),
-        Err(_) => held.release(ctx),
-    }
+    unsafe { &mut *ctx }.write(Lowering::handle);
 }
 
 /// A function the program wrote, `f`, which compiled code lends: named by the `len` bytes at
@@ -641,11 +612,8 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
     let Some(Crossing::Lowering(l)) = c.crossings.pop() else {
         unreachable!("the innermost crossing is a lowering");
     };
-    if !l.beside.is_empty() {
-        c.fail(err_crossing(
-            "a value the bytes cannot hold, which no handles were kept beside",
-        ));
-        released(ctx, l.beside);
+    if l.handles > 0 {
+        c.fail(err_crossing("a value the bytes hold only a handle of"));
         return I64(0);
     }
     c.give(l.w.finish())
@@ -706,15 +674,6 @@ impl Ctx {
         }));
     }
 
-    /// Begins a lifting of `bytes`, each of `held` made a runtime object for the handle it is.
-    fn lift_holding(&mut self, bytes: Vec<u8>, held: Vec<Value>) {
-        let beside = held
-            .into_iter()
-            .map(|v| Lifted::Runtime(crate::secret::runtime_object(&mut self.heap, v)))
-            .collect();
-        self.lift_from(bytes, beside);
-    }
-
     /// Ends the innermost lifting, letting go of what compiled code did not take of its handles;
     /// an error where bytes are left.
     fn close_lifting(&mut self) -> Result<(), String> {
@@ -725,30 +684,6 @@ impl Ctx {
         l.beside.into_iter().flatten().for_each(|b| b.release(ctx));
         l.r.end()
     }
-}
-
-/// What a value of a runtime object reads as: a bridge's value, a native object's, or a hold,
-/// whose held value is laid out by a type the crossing does not carry, so it reads as holding none.
-/// Nothing else the runtime lays out is read here.
-pub(crate) fn runtime_value(ctx: *mut Ctx, w: Word) -> Result<Value, String> {
-    if let Some(id) = hold_id(w) {
-        let kind = ClosureKind::Hold { held: None, id };
-        return Ok(Value::Closure(Arc::new(Closure { name: None, kind })));
-    }
-    if heap::is_native(w) {
-        return unsafe { heap::native_value(ctx, w) };
-    }
-    if !heap::is_bridge(w) {
-        return Err("a block that is no runtime handle crossed as one".to_string());
-    }
-    Ok(unsafe { bridged(obj(w)) }.clone())
-}
-
-/// What `write` writes into a lowering of its own, read back as a value, each handle as the value
-/// it stands for: a runtime object's own, a carried value lowered through its type.
-pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Value, String> {
-    let l = lowering(ctx, Lowering::new(false), write)?;
-    read_back(ctx, l)
 }
 
 /// The PLV1 bytes a diagnostic shows of `v`, which it borrows, lowered through its type.
@@ -779,23 +714,6 @@ fn lowering(
         return Err("a lowering ended a crossing it did not begin".into());
     };
     Ok(l)
-}
-
-/// A lowering's bytes read as a value, each handle as the value it stands for: a runtime object's
-/// own, a lent value lowered through its type.
-fn read_back(ctx: *mut Ctx, l: Lowering) -> Result<Value, String> {
-    let bytes = l.w.finish();
-    let beside = l.beside;
-    let read = codec::decode_with(&bytes, &mut |at| match usize::try_from(at)
-        .ok()
-        .and_then(|at| beside.get(at))
-    {
-        Some(Beside::Runtime(v)) => Ok(v.clone()),
-        Some(Beside::Carried(v)) => v.lower(ctx),
-        None => Err(format!("handle {at}, which was not kept")),
-    });
-    released(ctx, beside);
-    read
 }
 
 /// `s` lifted through `string`, the type of `String`; `None` with the context failed where it does
@@ -850,8 +768,6 @@ pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
         return;
     };
     let bytes = l.w.finish();
-    released(ctx, l.beside);
-    let c = unsafe { &mut *ctx };
     if let Err(why) = encoded_called(c, b, &bytes) {
         c.fail(err_crossing(&why));
     }
@@ -904,7 +820,7 @@ impl Ctx {
             answers_entry: true,
             ..Lowering::new(false)
         }));
-        self.lift_holding(bytes, Vec::new());
+        self.lift_from(bytes, Vec::new());
     }
 }
 
@@ -925,9 +841,8 @@ pub(crate) enum EntryBytes {
 /// where they hold all of it.
 pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
     let l = entry_lowering(ctx)?;
-    let held = !l.beside.is_empty();
+    let held = l.handles > 0;
     let bytes = l.w.finish();
-    released(ctx, l.beside);
     if let Some(handle) = l.escaping {
         return Ok(EntryBytes::Escaping(Escapee {
             handle,

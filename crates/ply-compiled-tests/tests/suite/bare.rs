@@ -2,9 +2,6 @@
 //! each helper at the address a unit binds, called at the C type every helper has, a word for each
 //! parameter and for its answer.
 
-// `Value` pins `Arc` for its shared payloads.
-#![allow(clippy::arc_with_non_send_sync)]
-
 use ply_compiled::c::helpers;
 use ply_compiled::heap::Heap;
 use ply_compiled::rt::{Ctx, Tables};
@@ -29,6 +26,8 @@ pub fn context_calling(builtins: &[&str]) -> Ctx {
 
 /// A context over a unit whose bodies read `fields`, whose compiled functions are `functions`, by
 /// index, and whose pool of builtins holds those named `builtins`, in order.
+// `Tables` holds a `Heap`, whose raw block pointers are neither `Send` nor `Sync`.
+#[allow(clippy::arc_with_non_send_sync)]
 pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
     Ctx::new(Arc::new(Tables {
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
