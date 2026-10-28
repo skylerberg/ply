@@ -745,40 +745,6 @@ fn read_back(ctx: *mut Ctx, l: Lowering) -> Result<Value, String> {
     read
 }
 
-/// The items of the list of arguments `v` is.
-fn arguments(v: Value) -> Result<Vec<Value>, String> {
-    match &v {
-        Value::List(items) => Ok(items.iter().cloned().collect()),
-        other => Err(format!(
-            "{} where the arguments' list was read",
-            other.type_name()
-        )),
-    }
-}
-
-/// `v`'s bytes, and the values they cannot hold in the order their handles name them.
-pub(crate) fn encoded(v: &Value) -> (Vec<u8>, Vec<Value>) {
-    let mut held = Vec::new();
-    let bytes = codec::encode_with(v, &mut |x| {
-        held.push(x.clone());
-        Ok(held.len() as u64 - 1)
-    })
-    .expect("a value is written whole but for what is kept beside it");
-    (bytes, held)
-}
-
-/// `v` lifted through `ty`, each value the bytes cannot hold made a runtime object; `None` with the
-/// context failed where it does not cross.
-pub(crate) fn lifted(ctx: *mut Ctx, v: &Value, ty: &PlyType) -> Option<Handed> {
-    let (bytes, held) = encoded(v);
-    let c = unsafe { &mut *ctx };
-    let beside = held
-        .into_iter()
-        .map(|v| Lifted::Runtime(crate::secret::runtime_object(&mut c.heap, v)))
-        .collect();
-    lifted_from(ctx, bytes, beside, ty)
-}
-
 /// `s` lifted through `string`, the type of `String`; `None` with the context failed where it does
 /// not cross.
 pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {

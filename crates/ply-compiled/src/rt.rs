@@ -9,8 +9,8 @@ use crate::native::{I64, Native, Raises, Raising, Signature};
 use crate::stack::{Stack, switch};
 use ply_core::builtins::hold_released;
 use ply_core::{
-    BinOp, Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span,
-    Symbol, Value, codes,
+    Builtin, Closure, ClosureKind, Diagnostic, EffectAtom, Mode, Plain, Resource, Span, Symbol,
+    Value, codes,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
