@@ -2479,8 +2479,10 @@ Flags:
   (`moved` in `--json`). It also shows what a pass is recorded under (the test's hash, the runtime,
   and the compiled code; `filed_under` in `--json`), and where the run's time went, phase by phase
   (`phases` in `--json`).
-- `--filter SUBSTRING` runs tests whose `<module>.<label>` contains the text. Repeat it to run tests
-  matching any of them.
+- `--filter SUBSTRING` runs tests whose `<module>.<label>` contains the text. A filter that names a
+  module, one holding a `.` with a whole dotted run that is a module's name (`std.ascii85.`,
+  `std.ascii85`), matches only from within a test's `<module>.`, never inside a label. Repeat it to
+  run tests matching any of them.
 - `--shard K/N` runs part K of N of the selected tests. Tests are split by a hash of their name, so
   a test is always in the same part, and parts `1/N` to `N/N` together run each test once.
 - `--no-cache` ignores recorded results and cached checks.
@@ -2491,7 +2493,9 @@ value. A case added to the table runs alone, wherever it is added. Reordering th
 rewording the label runs nothing. Editing the body runs every case, and editing what the table is
 built from runs only the cases whose values changed. A case's label is the one its holes produce,
 which is what `--filter` and `--shard` match. Listing the cases runs the table, so a run that
-reports on a test over cases builds the program even when every case has a pass.
+reports on a test over cases builds the program even when every case has a pass. A run lists only
+the tables of the modules its path names that a `--filter` could match a case of: a filter that
+names a module lists that module's tables and those beneath it.
 
 ### 8.3 Determinism
 
@@ -2954,7 +2958,8 @@ is part of what dependents are checked and proved against.
 
 Flags:
 
-- `--filter SUBSTRING`: the claims whose owner's name contains the text; repeat to match any.
+- `--filter SUBSTRING`: the claims whose owner's name contains the text, as `ply test` matches a
+  key (§8.2); repeat to match any.
 - `--prove-budget N`: static reasoning steps per claim; a claim that runs out is `unproved`.
 - `--prove-steps N`: calls per evaluation of a claim (default 1,000,000,000).
 - `--reach`: ask the static prover alone about every claim, cached or not. Under `--json`, each
