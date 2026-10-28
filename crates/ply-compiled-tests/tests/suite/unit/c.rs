@@ -521,7 +521,10 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
         ply_compiled::rt::FAILED_OUT_OF_FUEL,
         "a runaway recursion ended some other way: {raised}"
     );
-    assert!(raised.contains("bound on nested calls"), "{raised}");
+    assert!(
+        raised.contains("recursion limit of 10000 nested calls exceeded"),
+        "{raised}"
+    );
 }
 
 /// A unit says each constant with its row of the code table.

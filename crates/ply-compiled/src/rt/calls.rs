@@ -28,12 +28,11 @@ impl Cost {
     }
 }
 
-/// What the program had cost as it last gave way to the scheduler: its calls, the heap's counts and
-/// what memoized answers charged.
+/// What the program had cost as it last gave way to the scheduler: its calls and what memoized
+/// answers charged. The heap counts no block the scheduler makes.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ProgramCost {
     ticks: i64,
-    heap: (usize, usize),
     charged: Cost,
 }
 
@@ -41,31 +40,31 @@ impl Ctx {
     /// The scheduler's own work begins, where it had not: the program's costs are kept as they
     /// stand. Answers whether it had.
     pub(crate) fn scheduler_entered(&mut self) -> bool {
-        if self.scheduling {
+        if self.heap.scheduling {
             return true;
         }
         self.left_at = ProgramCost {
             ticks: self.ticks,
-            heap: self.heap.counts(),
             charged: self.charged,
         };
-        self.scheduling = true;
-        self.arm_tick();
+        self.heap.scheduling = true;
+        self.arm_tick_in_chunk();
         false
     }
 
     /// The program's own work runs again, where the scheduler's ran: its costs go on from where it
-    /// left them.
+    /// left them, and the clock is read as many calls on as it was to be.
     pub(crate) fn program_entered(&mut self) {
-        if !self.scheduling {
+        if !self.heap.scheduling {
             return;
         }
+        let to_clock = (self.clock_at - self.ticks).max(1);
         let at = self.left_at;
         self.ticks = at.ticks;
-        self.heap.recounted(at.heap);
+        self.clock_at = self.ticks.saturating_add(to_clock);
         self.charged = at.charged;
-        self.scheduling = false;
-        self.arm_tick();
+        self.heap.scheduling = false;
+        self.arm_tick_in_chunk();
     }
 
     /// What this entry has cost so far, memoized answers charged as if computed again.

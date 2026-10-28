@@ -21,10 +21,12 @@ pub const FRAME: u32 = u32::MAX - 1;
 /// block is never unique, so nothing reuses it in place.
 pub const SHARED: u32 = 1 << 31;
 
-/// A block's header: its count, in the low half of the word before its payload.
+/// A block's header: its count, in the low half of the word before its payload, and whether the
+/// scheduler's own work made it, which emitted code never reads.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
+    pub made_by_scheduler: bool,
 }
 
 pub const HEADER: usize = 8;
@@ -98,7 +100,10 @@ pub mod poison {
     use super::{IMMORTAL, Obj, Word, is_object};
 
     /// Immortal, so a read through it is caught and never counted.
-    static POISONED: Obj = Obj { rc: IMMORTAL };
+    static POISONED: Obj = Obj {
+        rc: IMMORTAL,
+        made_by_scheduler: false,
+    };
 
     pub fn word() -> Word {
         &raw const POISONED as Word
@@ -256,7 +261,10 @@ pub struct Heap {
     /// each block's [`BRIDGE_AT`] its index here.
     bridges: Vec<*mut Obj>,
     persistent: bool,
-    /// Blocks allocated since the last reset, and the bytes they took.
+    /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither these
+    /// counts nor the program's live blocks count them.
+    pub(crate) scheduling: bool,
+    /// Blocks the program allocated since the last reset, and the bytes they took.
     count: usize,
     bytes: usize,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
@@ -283,6 +291,18 @@ pub(crate) fn census_in(blocks: &Blocks) -> Vec<(usize, usize, usize)> {
         e.1 += bytes - HEADER;
     });
     sorted(tally)
+}
+
+/// How many live blocks of `blocks` the program made, the scheduler's own not among them.
+pub(crate) fn program_live_in(blocks: &Blocks) -> usize {
+    let mut n = 0;
+    blocks.each(|block, _| {
+        let o = block.cast::<Obj>();
+        if unsafe { (*o).rc != 0 && !(*o).made_by_scheduler } {
+            n += 1;
+        }
+    });
+    n
 }
 
 /// Two censuses as one, each size's counts and bytes summed, the most bytes first.
@@ -473,6 +493,7 @@ impl Heap {
             blocks: Blocks::default(),
             bridges: Vec::new(),
             persistent: false,
+            scheduling: false,
             count: 0,
             bytes: 0,
             delayed: std::collections::VecDeque::new(),
@@ -538,15 +559,9 @@ impl Heap {
         self.bytes
     }
 
-    /// The blocks and bytes allocated since the last reset, as [`Heap::recounted`] puts them back.
-    pub(crate) fn counts(&self) -> (usize, usize) {
-        (self.count, self.bytes)
-    }
-
-    /// The counts as [`Heap::counts`] read them: what was allocated since is not counted.
-    pub(crate) fn recounted(&mut self, (count, bytes): (usize, usize)) {
-        self.count = count;
-        self.bytes = bytes;
+    /// How many live blocks the program made, the scheduler's own not among them.
+    pub(crate) fn program_live(&self) -> usize {
+        program_live_in(&self.blocks)
     }
 
     /// Allocations that took a dead block rather than fresh memory.
@@ -593,14 +608,21 @@ impl Heap {
         (HEADER + payload_bytes.max(8) + 7) & !7
     }
 
-    /// A fresh block of `payload_bytes` past its header, counted once, its payload left as a
-    /// recycled block's last tenant wrote it.
+    /// A fresh block of `payload_bytes` past its header, counted once where the program made it,
+    /// its payload left as a recycled block's last tenant wrote it.
     pub(crate) fn raw_alloc(&mut self, payload_bytes: usize) -> *mut Obj {
         let size = Heap::object_size(payload_bytes);
         let p: *mut Obj = self.blocks.take(size).cast();
-        unsafe { p.write(Obj { rc: 1 }) };
-        self.count += 1;
-        self.bytes += size;
+        unsafe {
+            p.write(Obj {
+                rc: 1,
+                made_by_scheduler: self.scheduling,
+            })
+        };
+        if !self.scheduling {
+            self.count += 1;
+            self.bytes += size;
+        }
         p
     }
 

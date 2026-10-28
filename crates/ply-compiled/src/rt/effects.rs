@@ -181,7 +181,10 @@ static RESUME_DESC: PlyFnDesc = PlyFnDesc {
 };
 
 static RESUME: ResumeBlock = ResumeBlock {
-    header: heap::Obj { rc: heap::IMMORTAL },
+    header: heap::Obj {
+        rc: heap::IMMORTAL,
+        made_by_scheduler: false,
+    },
     desc: &RESUME_DESC,
 };
 

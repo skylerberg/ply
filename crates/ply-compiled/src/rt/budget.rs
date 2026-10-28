@@ -5,7 +5,12 @@ use super::*;
 /// The prologue's refusal: this call would nest past the budget the machine handed the entry.
 pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
-    let d = error("this call would nest past the machine's own bound on nested calls");
+    let depth = ctx.depth_bound;
+    let d = Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("recursion limit of {depth} nested calls exceeded"),
+    )
+    .primary(ctx.site(), "the call that overran it");
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 

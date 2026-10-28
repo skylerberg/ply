@@ -276,3 +276,47 @@ fn no_budget_of_calls_bounds_the_schedulers_own_work() {
     assert!(ctx.take_failure().is_none());
     ctx.end();
 }
+
+type Tick = unsafe extern "C" fn(*mut Ctx);
+
+/// `n` calls as compiled code counts each, calling back where the counter reaches `next_tick`,
+/// until the context fails.
+fn calls_made(ctx: *mut Ctx, n: i64) {
+    for _ in 0..n {
+        let c = unsafe { &mut *ctx };
+        c.ticks += 1;
+        if c.ticks >= c.next_tick {
+            unsafe { helper::<Tick>("rt_tick")(ctx) };
+        }
+        if unsafe { (*ctx).failed } != 0 {
+            return;
+        }
+    }
+}
+
+// Main read the clock every 4096 calls, so a run past its deadline was abandoned within them.
+#[test]
+fn a_time_budget_ends_a_program_that_gives_way_to_the_scheduler_between_short_stretches() {
+    let mut ctx = context_of(&[], Vec::new());
+    ctx.begin_bounded(1_000, 0, 1);
+    let c: *mut Ctx = &mut ctx;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let (entered, left) = (
+        helper::<Entered>("rt_scheduler_entered"),
+        helper::<Left>("rt_scheduler_left"),
+    );
+    for _ in 0..1_000 {
+        calls_made(c, 10);
+        let was = unsafe { entered(c) };
+        calls_made(c, 100);
+        unsafe { left(c, was) };
+        if unsafe { (*c).failed } != 0 {
+            break;
+        }
+    }
+    assert!(
+        ctx.take_failure().is_some(),
+        "110000 calls past the deadline, and the clock never read"
+    );
+    ctx.end();
+}

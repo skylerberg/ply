@@ -12,7 +12,7 @@
 use crate::c::Native;
 use crate::flat::{Reader, Writer};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_OUT_OF_FUEL, FAILED_UNWIND, lent};
+use crate::rt::{Ctx, EntryBytes, FAILED, FAILED_UNWIND, lent};
 pub use ply_core::host::Grants;
 use ply_core::host::{HostBinding, HostRuntime, RuntimeFactory};
 use ply_core::{
@@ -407,7 +407,7 @@ fn entered(
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
     let last = returned(ctx);
     let ended = if ctx.failed != 0 {
-        failure(ctx, run.depth)
+        failure(ctx)
     } else {
         answered(ctx, root)
     };
@@ -460,30 +460,22 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
 }
 
 /// How an entry that failed ended.
-fn failure(ctx: &mut Ctx, depth: i64) -> Ended {
-    let failed = if ctx.failed == FAILED_OUT_OF_FUEL {
-        Diagnostic::error(
+fn failure(ctx: &mut Ctx) -> Ended {
+    let failed = ctx.take_failure().unwrap_or_else(|| match ctx.failed {
+        FAILED_UNWIND => Diagnostic::error(
             codes::RUNTIME_ERROR,
-            format!("recursion limit of {depth} nested calls exceeded"),
+            "a `handle` clause unwound past the compiled fragment's entry",
+        ),
+        FAILED => Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "the compiled body failed without recording why",
         )
-        .primary(ctx.site(), "the call that overran it")
-    } else {
-        ctx.take_failure().unwrap_or_else(|| match ctx.failed {
-            FAILED_UNWIND => Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                "a `handle` clause unwound past the compiled fragment's entry",
-            ),
-            FAILED => Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                "the compiled body failed without recording why",
-            )
-            .primary(ctx.site(), "the last site it reached"),
-            other => Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!("the compiled body failed ({other}) without recording why"),
-            ),
-        })
-    };
+        .primary(ctx.site(), "the last site it reached"),
+        other => Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!("the compiled body failed ({other}) without recording why"),
+        ),
+    });
     Ended::Failed(failed)
 }
 

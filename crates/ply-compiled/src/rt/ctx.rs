@@ -63,19 +63,22 @@ pub struct Ctx {
     pub task: i64,
     /// The calls this entry may make; 0 is no bound.
     pub(super) step_budget: i64,
+    /// The fuel this entry began with: how deeply its calls may nest.
+    pub(super) depth_bound: i64,
     /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
     /// read it, so `metered` counts the same whether a constant was memoized or not. Not budgeted.
     pub charged: Cost,
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
     pub grown: u64,
-    /// Whether the scheduler's own work runs, which no cost of the program counts and no budget of
-    /// calls bounds, and the costs as the program last left them, which it goes on from.
-    pub(crate) scheduling: bool,
+    /// The costs as the program last left them for the scheduler's work, which it goes on from.
     pub(crate) left_at: ProgramCost,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) time_budget_ms: u64,
+    /// The tick at which the clock is next read. Calls the program makes and calls the scheduler
+    /// makes both bring it nearer, however often each gives way to the other.
+    pub(super) clock_at: i64,
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     pub(super) last_entry: usize,
@@ -261,11 +264,12 @@ impl Ctx {
             performed_end: 0,
             task: 0,
             step_budget: 0,
+            depth_bound: 0,
             grown: 0,
-            scheduling: false,
             left_at: ProgramCost::default(),
             deadline: None,
             time_budget_ms: 0,
+            clock_at: i64::MAX,
             heap: Heap::new(),
             last_entry: 0,
             tables,
@@ -374,6 +378,7 @@ impl Ctx {
     pub(crate) fn branch(&self) -> Ctx {
         let mut b = Ctx::new(Arc::clone(&self.tables));
         b.fuel = self.fuel;
+        b.depth_bound = self.depth_bound;
         // Zero is no bound, so a budget spent to the last call stays a bound of one.
         b.step_budget = if self.step_budget > 0 {
             (self.step_budget - self.ticks).max(1)
@@ -513,11 +518,12 @@ impl Ctx {
     pub fn begin_bounded(&mut self, fuel: i64, steps: i64, time_budget_ms: u64) {
         self.failed = 0;
         self.fuel = fuel;
+        self.depth_bound = fuel;
         self.ticks = 0;
         self.charged = Cost::default();
         self.step_budget = steps.max(0);
         self.grown = 0;
-        self.scheduling = false;
+        self.heap.scheduling = false;
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
@@ -576,11 +582,17 @@ impl Ctx {
     /// When compiled code must call back next: the call one past the budget, the end of this
     /// chunk, or never, when the entry is bounded by neither the budget nor a clock.
     pub(super) fn arm_tick(&mut self) {
-        let chunk = self.ticks.saturating_add(TICK_CHUNK);
-        let budgeted = self.step_budget > 0 && !self.scheduling;
+        self.clock_at = self.ticks.saturating_add(TICK_CHUNK);
+        self.arm_tick_in_chunk();
+    }
+
+    /// [`Ctx::arm_tick`] where the program gives way to the scheduler or takes over from it: the
+    /// clock is read where it was to be.
+    pub(super) fn arm_tick_in_chunk(&mut self) {
+        let budgeted = self.step_budget > 0 && !self.heap.scheduling;
         self.next_tick = match (budgeted, self.deadline.is_some()) {
-            (true, _) => self.step_budget.saturating_add(1).min(chunk),
-            (false, true) => chunk,
+            (true, _) => self.step_budget.saturating_add(1).min(self.clock_at),
+            (false, true) => self.clock_at,
             (false, false) => i64::MAX,
         };
     }
@@ -589,7 +601,7 @@ impl Ctx {
     /// when to call back. Both bounds are decided here, so a call itself costs one increment and
     /// one compare, and the clock is read once every [`TICK_CHUNK`] calls rather than on any.
     pub(super) fn tick(&mut self) {
-        if self.step_budget > 0 && !self.scheduling && self.ticks > self.step_budget {
+        if self.step_budget > 0 && !self.heap.scheduling && self.ticks > self.step_budget {
             let budget = self.step_budget;
             let d = Diagnostic::error(
                 codes::STEP_BUDGET,
@@ -685,9 +697,17 @@ impl Ctx {
         self.heap.held() + self.workers(|b| b.held())
     }
 
-    /// How many of the entry's blocks are live, its branches' on the pool's threads among them.
+    /// How many of the blocks the program made are live, its branches' on the pool's threads among
+    /// them: the scheduler's own are not counted.
     pub fn live(&self) -> usize {
-        self.census().iter().map(|(_, n, _)| n).sum()
+        let branches: usize = if self.pooled {
+            crate::parallel::worker_blocks(self.id.0, heap::program_live_in)
+                .into_iter()
+                .sum()
+        } else {
+            0
+        };
+        self.heap.program_live() + branches
     }
 
     /// The entry's live blocks by the payload bytes they hold, the most bytes first, with their count

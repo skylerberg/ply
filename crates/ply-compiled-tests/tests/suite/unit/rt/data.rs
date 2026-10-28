@@ -140,7 +140,10 @@ struct Static {
 }
 
 static CLOSURE: Static = Static {
-    h: Obj { rc: IMMORTAL },
+    h: Obj {
+        rc: IMMORTAL,
+        made_by_scheduler: false,
+    },
     desc: &CLAUSE,
 };
 
