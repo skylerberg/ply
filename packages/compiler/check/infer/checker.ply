@@ -6,11 +6,11 @@ import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, T
                                     AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin,
                                     mode_text)
 import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
-                              ImportDecl, INames, Constraint, Deriver, DJson, DEq, DOrd, DBin,
-                              DShow, DHash, DNumeric, DInteger, DRow, DLibrary, is_predicate,
-                              deriver_tag, SpecKind, SRequires, SEnsures, SCost, SSpace, SpecClause,
-                              Derived, parse, TDExtern, InstanceKind, is_pub, Opaque, spec_kind_bin,
-                              deriver_bin, instance_kind_bin)
+                              ImportDecl, INames, Constraint, Deriver, DEq, DOrd, DShow, DHash,
+                              DNumeric, DInteger, DKept, is_predicate, deriver_tag, SpecKind,
+                              SRequires, SEnsures, SCost, SSpace, SpecClause, Derived, parse,
+                              TDExtern, InstanceKind, is_pub, Opaque, spec_kind_bin, deriver_bin,
+                              instance_kind_bin)
 import compiler.syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_module)
 import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
                                  LDec, LChar)
@@ -28,9 +28,8 @@ import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_
                                       error_with_labels, error_at, error_at_and)
 import compiler.expand.rewrite (NumericWitness, numeric_witness_bin, MemberCallee)
 import std.prelude_source
-import compiler.expand.derive (DeriveRefusal, HoldsFunction, Unconstrained, NullInsideOption,
-                               HoldsNative, Leaf, Structural, Refused, Nominal, constructor_shape,
-                               null_encoded_name, same_deriver)
+import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, Unconstrained, HoldsNative,
+                                          Leaf, Structural, Refused, Nominal, constructor_shape)
 import std.bytes (ascii_of_int)
 import std.option
 import std.string
@@ -1123,16 +1122,13 @@ pub fn supplied(n: Int) -> Bytes =
 
 pub fn what_of(deriver: Deriver) -> Bytes =
   match deriver {
-    DJson -> b"JSON encoding",
     DEq -> b"structural equality",
     DOrd -> b"order",
-    DBin -> b"binary encoding",
     DShow -> b"rendering",
     DHash -> b"content hash",
     DNumeric -> b"arithmetic",
     DInteger -> b"integer arithmetic",
-    DRow -> b"row",
-    DLibrary(binder) -> Bytes::concat_all([b"`", binder, b"` derivation"]),
+    DKept -> b"value a build keeps",
   }
 
 pub fn row_aliases(def: FnDef) -> List<Bytes> =
@@ -2008,7 +2004,7 @@ pub fn insert_constraint(
 pub fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> / {abort.raise} =
   xs.fold([], |acc: List<DefConstraint>, c: DefConstraint|
     if acc.len() > 0 && acc.get(acc.len() - 1).param == c.param
-        && same_deriver(acc.get(acc.len() - 1).deriver, c.deriver) { acc }
+        && acc.get(acc.len() - 1).deriver == c.deriver { acc }
     else { acc.push(c) })
 
 // --- Derivability ------------------------------------------------------------------------------
@@ -2032,9 +2028,6 @@ pub type AlgebraicShape = {
 pub type Shapes = Map<Bytes, AlgebraicShape>
 
 pub fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = adts.get(name)
-
-fn json_null_encoded(ty: Type) -> Bool =
-  match ty { TyCon(c) -> null_encoded_name(c.name), _ -> false }
 
 pub fn derivable(
   deriver: Deriver,
@@ -2075,9 +2068,7 @@ fn derivable_within(
     TyCon(c) -> match constructor_shape(deriver, c.name) {
       Leaf -> None,
       Refused(why) -> Some({ ty: ty, why: why }),
-      Structural -> if same_deriver(deriver, DJson) && c.name == b"Option" && c.args.len() > 0
-          && json_null_encoded(c.args.get(0)) { Some({ ty: ty, why: NullInsideOption }) }
-      else { first_blocked(deriver, c.args, adts, assumed, visiting, room) },
+      Structural -> first_blocked(deriver, c.args, adts, assumed, visiting, room),
       Nominal ->        // A recursive type is derivable exactly when its non-recursive parts are.
         if visiting.contains(c.name) { None } else {
           match find_adt(adts, c.name) {

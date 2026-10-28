@@ -35,7 +35,8 @@ import compiler.emit.lower.setting (imported_target, qualified, from_import, mod
                                     builtin_at, prelude_ctor)
 import compiler.emit.lower.held (held_as, laid_leaves)
 import compiler.emit.lower.base (Context, Lowering, Lowered, unreachable, bound_as, done, handed,
-                                 noted, filed, unfiled, type_of, as_words, opened, continued)
+                                 noted, filed, unfiled, type_of, as_words, opened, continued, fresh,
+                                 emitted)
 import compiler.emit.lower.base
 import compiler.emit.lower.data (constructed_as)
 import compiler.emit.lower.scalars (operated, stated, binary, numeric_in_place, numeric_converted,
@@ -259,18 +260,51 @@ pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered 
 
 /// Item `i` of the list `xs`, which a length test admitted, as a value of `item` is held: borrowed
 /// from the list, a scalar read out of its word.
-pub fn item_read(cx: Context, st: Lowering, xs: Arg, i: Arg, item: Type) -> Lowered =
-  bound_as(
-    layout_needed(st, item),
-    item,
-    held_as(cx.setting, item),
-    Op({
-      op: OContainer(ItemAt),
-      args: [xs, i],
-      uses: { takes: [false, false], owned: false, fails: false, stops: false },
+pub fn item_read(cx: Context, st: Lowering, xs: Arg, i: Arg, item: Type) -> Lowered = {
+  let v = fresh(st, item, held_as(cx.setting, item));
+  { st: item_read_into(v.st, xs, i, v.var, dummy_span()), arg: AVar(v.var) }
+}
+
+/// `st` binding `into` to item `i` of the list `xs` as `item_read` reads it.
+pub fn item_read_into(st: Lowering, xs: Arg, i: Arg, into: Var, at: Span) -> Lowering =
+  emitted(
+    layout_needed(st, into.ty),
+    Let({
+      var: into,
+      val: Op({
+        op: OContainer(ItemAt),
+        args: [xs, i],
+        uses: { takes: [false, false], owned: false, fails: false, stops: false },
+      }),
+      at: at,
+      unwind: [],
     }),
-    dummy_span(),
   )
+
+/// How many items the list `xs` holds, read off its header.
+pub fn length_read(st: Lowering, xs: Arg, at: Span) -> Lowered / {abort.raise} =
+  read_in_place(st, Length, [xs], int_type(), RInt, at)
+
+/// An empty list of type `list` with room for `n` items: `List::with_capacity(n)`.
+pub fn with_room(cx: Context, st: Lowering, list: Type, n: Arg, at: Span) -> Lowered = {
+  // The room is its items' words, which the item's layout says.
+  let laid_st = match list {
+    TyCon(c) -> match c.args.at(0) { Some(item) -> layout_needed(st, item), None -> st },
+    _ -> st,
+  };
+  let count = handed({ st: laid_st, arg: n }, RInt, at);
+  bound_as(
+    count.st,
+    list,
+    RWord,
+    Op({
+      op: OContainer(Room),
+      args: [count.arg],
+      uses: { takes: [false], owned: true, fails: false, stops: false },
+    }),
+    at,
+  )
+}
 
 /// The items of the list `xs`, of type `ty`, from `k` on, which a length test admitted: a list of
 /// their own sharing `xs`'s trie, `xs` read, each item it copies counted as its type counts it.
@@ -332,25 +366,7 @@ fn contained(
     }
   } else if name == b"List::with_capacity" && args.len() == 1 {
     match ((f.ret, args)) {
-      (Some(ret), [n]) -> {
-        // The room is its items' words, which the item's layout says.
-        let laid_st = match ret {
-          TyCon(c) -> match c.args.at(0) { Some(item) -> layout_needed(st, item), None -> st },
-          _ -> st,
-        };
-        let count = handed({ st: laid_st, arg: n }, RInt, at);
-        bound_as(
-          count.st,
-          ret,
-          RWord,
-          Op({
-            op: OContainer(Room),
-            args: [count.arg],
-            uses: { takes: [false], owned: true, fails: false, stops: false },
-          }),
-          at,
-        )
-      },
+      (Some(ret), [n]) -> with_room(cx, st, ret, n, at),
       _ -> unreachable(b"an empty list made at no type the checker filed"),
     }
   } else if name == b"numeric_of_int" && args.len() == 2
@@ -578,7 +594,7 @@ type Answer = | Plain(Rep) | Item | Fields
 type Laying = { operands: List<Operand>, answer: Answer, owned: Bool }
 
 /// Extern `op` called on `args`, answering a value of `ty`, written over the runtime's objects.
-fn laid(
+pub fn laid(
   cx: Context,
   st: Lowering,
   op: Intrinsic,

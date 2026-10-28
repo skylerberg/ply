@@ -3,8 +3,8 @@
 import compiler.syntax.parsing (Span, Ident, span_key, is_bare, span_bin)
 import compiler.syntax.items (Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet,
                               SpecClause, SRequires, SEnsures, SCost, SSpace, INames, FnDef, LawDef,
-                              OfSchema, Derived, is_pub, DRow, DLibrary, schema_named,
-                              schema_guard_name, dump_item, stated_type, real_handler_of)
+                              OfSchema, Derived, is_pub, IDerive, schema_named, schema_guard_name,
+                              dump_item, stated_type, real_handler_of)
 import compiler.syntax.type_syntax (TCon)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
@@ -42,8 +42,9 @@ import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list
 import compiler.expand.rewrite.shared (tagged_in, picked_in)
-import compiler.expand.derive (RowField, row_shape, generated_name, same_deriver, row_field_bin,
-                               derivation_of)
+import compiler.expand.derive (derivation_of, deriver_module)
+import compiler.expand.declared (declaration_of)
+import std.derive.codec
 import compiler.expand.embed (EmbedAt, ItemWants, item_wants_bin, wants_by_item, embed_at_bin)
 import compiler.syntax.items (is_std, is_compiler, is_shipped, is_written)
 import std.bytes (ascii_of_int)
@@ -117,10 +118,7 @@ fn outline_of(
       match stated_type(item) { Some(t) -> acc.push(qualify(parsed.name, t.name)), None -> acc }),
     set_texts: parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
       match item { IEffectSet(_) -> acc.push(dump_item(item)), _ -> acc }),
-    derived: parsed.derived.filter(|d: Derived|
-      match d.deriver { DLibrary(_) -> true, _ -> false }).map(
-      derivation_of,
-    ),
+    derived: parsed.derived.map(derivation_of),
   }
 
 /// `parsed`'s outline as its text alone says it: no effect set is resolved and no law reads a schema
@@ -1439,7 +1437,7 @@ pub fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List
 
 /// An argument as a check reads it before anything runs: text as written, literals joined by `++`
 /// included; the call of a definition, by its program-wide name and the hash of all it reaches, on
-/// arguments read the same way; the call of a row codec `derive row` wrote, by the fields it reads;
+/// arguments read the same way; the call of a row codec `derive sql` wrote, by the fields it reads;
 /// a tagged literal, by its parser and its texts; a list; a constructor applied, by its type's
 /// program-wide name and its own; or anything else.
 pub type Argument =
@@ -1477,15 +1475,52 @@ fn of_statement_module(callee: Bytes) -> Bool =
 /// codec a module derives, by the program-wide name of the function that answers it.
 type Reading = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
 
+/// How a field of a row is read: by the reader of `std.sql`'s that it names, as an `Option` of what
+/// it holds, as an array of what the reader it names reads, as the document it holds, or through its
+/// type's own JSON codec.
+pub type RowRead = | RScalar(Bytes) | ROptional(RowRead) | RArray(Bytes) | RDocument | RByJson
+
+/// A field of a record's row: its column and how it is read.
+pub type RowField = { name: Bytes, read: RowRead }
+
+derive bin for RowRead
+derive bin for RowField
+
+/// Each row codec `derive sql` writes in `mods`, by the program-wide name of the function that
+/// answers it, and the fields it reads: what `std.derive.codec` writes the codec's readers from. A
+/// module an entry stands for holds its `derive sql` as written, beside the types it reads.
 fn derived_rows(mods: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
   mods.fold(Map::new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
-    parsed.derived.fold(acc, |rows: Map<Bytes, List<RowField>>, d: Derived|
-      if !same_deriver(d.deriver, DRow) { rows } else {
-        match row_shape(parsed.module, d.target) {
-          Some(fields) -> rows.insert(qualify(parsed.name, generated_name(DRow, d.target)), fields),
-          None -> rows,
-        }
+    parsed.module.items.fold(acc, |rows: Map<Bytes, List<RowField>>, item: Item|
+      match item {
+        IDerive(d) -> if deriver_module(parsed.module, d.deriver) != Some(b"std.sql") { rows }
+        else {
+          match codec::row_columns(
+              declaration_of(parsed.name, parsed.module, d.target.name, d.deriver),
+            ) {
+            Some(columns) ->
+              rows.insert(
+                qualify(
+                  parsed.name,
+                  Bytes::of_string(codec::row_function(String::of_bytes(d.target.name))),
+                ),
+                columns.map(|c: codec::RowColumn|
+                  { name: Bytes::of_string(c.name), read: read_of(c.read) }),
+              ),
+            None -> rows,
+          }
+        },
+        _ -> rows,
       }))
+
+fn read_of(read: codec::RowRead) -> RowRead =
+  match read {
+    codec::Scalar(reader) -> RScalar(Bytes::of_string(reader)),
+    codec::Optional(inner) -> ROptional(read_of(inner)),
+    codec::Array(reader) -> RArray(Bytes::of_string(reader)),
+    codec::Document -> RDocument,
+    codec::ByJson(_) -> RByJson,
+  }
 
 /// Every call of what a statement module declares that module `i` of `w` holds, where it imports
 /// one, under no hash: a module's check fixes none. A statement module's own calls are its

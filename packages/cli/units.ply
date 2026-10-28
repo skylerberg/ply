@@ -7,10 +7,10 @@ import compiler.front.rows (BakedRow)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
-import compiler.cc (compilers, toolchain, TooWide, Unexported)
+import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Baked, Emission, Made, Scoped, scope_key, shipped, shipped_runtime,
-                      answers_store, baked_key, emitted, emitter_identity, held)
+import compiler.unit (Baked, Emission, Made, shipped, shipped_runtime, answers_store, baked_key,
+                      emitted, emitter_identity, held)
 import compiler.store.kept (Record, kept_records, with_kept)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text)
 import std.env (env)
@@ -101,24 +101,14 @@ fn kept_values<| e>(
   }
 
 /// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
-/// the toolchain's cache: the unit, and the scope it walked under for an ask of another unit of this
-/// program, or `None` where the walk built no scope to keep.
+/// the toolchain's cache.
 fn unit_of(
   front: LoadedAnalysis,
   offered: List<RootKey>,
-  scoped: Option<Scoped>,
-) -> { unit: Result<Emitted, List<Diag>>, scoped: Option<Scoped> } / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
+) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped_runtime();
   let started = time.elapsed_ms();
-  // The roots the program offers, not the ones this ask wants: a scope read for this ask holds the
-  // facts of every root another ask of the same program may name, so both walk under one scope.
-  let facts_of = every_root(front);
-  let key = scope_key(front.dump, texts(front), front.inputs, facts_of);
-  let scope = match scoped {
-    Some(s) -> if s.key == key { Some(s.scope) } else { None },
-    None -> None,
-  };
   let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), || {
     let read = |key: Bytes| kept_records.get[ans](key);
     emitted(
@@ -130,18 +120,10 @@ fn unit_of(
       read,
       |rs: List<Record>| kept_records.put[ans](rs),
       kept_values(front.dump.baked, offered, read),
-      scope_held: scope,
-      facts_of: Some(facts_of),
     )
   });
   told(emission, identity, time.elapsed_ms() - started);
-  {
-    unit: emitted_of(front, emission),
-    scoped: match emission {
-      Ok(e) -> match e.scope { Some(s) -> Some({ key: key, scope: s }), None -> None },
-      Err(_) -> None,
-    },
-  }
+  emitted_of(front, emission)
 }
 
 /// A unit's C alone, for whoever only enters it.
@@ -189,12 +171,7 @@ pub fn emitting<a | e>(
   handle {
     body()
   } with {
-    var scoped: Option<Scoped> = None,
-    emit.unit(front, offered) -> {
-      let r = unit_of(front, offered, scoped);
-      scoped = r.scoped;
-      r.unit
-    },
+    emit.unit(front, offered) -> unit_of(front, offered),
     emit.compiled(text, profile) -> compiled_of(text, profile),
   }
 
@@ -215,11 +192,13 @@ pub fn library_over(
 
 /// Which compiler a profile compiles with, at what level, and whether its code checks what it
 /// assumes. `PLY_C_PROFILE` wins over the flag. `development` compiles fast for code that runs slowly
-/// enough, and checked: tcc where it is installed, else `cc -O0`; `release` is `cc -O2`. `PLY_CC`
-/// names `cc`'s program and is used whatever the profile, and `PLY_CC_OPT` names the level.
+/// enough, and checked: tcc where it compiles for x86-64 Linux, else `cc -O0`; `release` is `cc -O2`.
+/// Elsewhere a library tcc links does not hold a unit: its arm64 calls reach only 128 MB, and on
+/// macOS dyld misreads the exports it writes. `PLY_CC` names `cc`'s program and is used whatever the
+/// profile, and `PLY_CC_OPT` names the level.
 fn chosen(
   profile: String,
-) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], env.variable} = {
+) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
   let release = match env.variable("PLY_C_PROFILE") {
     Some(p) -> p == "release",
     None -> profile == "release",
@@ -229,7 +208,8 @@ fn chosen(
     None -> if release { "-O2" } else { "-O0" },
   };
   {
-    tcc: !release && env.variable("PLY_CC") == None && compilers.found[tcc]() != None,
+    tcc: !release && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
+      && cc::targets_x86_64_linux[tcc](),
     level: level,
     checked: !release,
   }
@@ -241,22 +221,14 @@ fn unbuildable(why: String) -> Diag =
   ])
 
 /// `text` compiled into a library the toolchain's cache keeps: an object for each part not compiled
-/// before, and a link where the cache holds none of them together. tcc lays out no veneers, and on
-/// macOS garbles the exports of a library of many symbols, so a unit too wide for its direct calls to
-/// span, or whose exports tcc garbled, compiles with `cc`.
+/// before, and a link where the cache holds none of them together.
 fn compiled_of(
   text: Bytes,
   profile: String,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
   let choice = chosen(profile);
-  let built = if !choice.tcc {
-    cc::library[cc](choice.level, choice.checked, cc::library_flags(), text)
-  } else {
-    match cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text, false) {
-      Err(TooWide) -> cc::library[cc](choice.level, choice.checked, cc::library_flags(), text),
-      Err(Unexported) -> cc::library[cc](choice.level, choice.checked, cc::library_flags(), text),
-      by_tcc -> by_tcc,
-    }
-  };
-  match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(cc::why_unbuilt(why))]) }
+  let built = if choice.tcc {
+    cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text)
+  } else { cc::library[cc](choice.level, choice.checked, cc::library_flags(), text) };
+  match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
 }

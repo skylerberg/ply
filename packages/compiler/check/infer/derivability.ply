@@ -1,0 +1,90 @@
+//! What `derivable(D, t)` reads of a type constructor, and why one refuses: the table the checker's
+//! `derivable` walks a type by.
+
+import compiler.syntax.items (Deriver, DEq, DOrd, DShow, DHash, DNumeric, DInteger, DKept)
+
+/// Why a type is not derivable for a deriver.
+pub type DeriveRefusal =
+  | HoldsFunction
+  | HoldsHandle
+  | HoldsFloat
+  | Unconstrained(Int)
+  | HoldsSecret
+  | HoldsNative
+
+/// How `derivable` reads a type constructor: as a leaf, through its arguments, not at all and why,
+/// or through the declared type it names.
+pub type ConstructorShape = | Leaf | Structural | Refused(DeriveRefusal) | Nominal
+
+pub fn constructor_shape(deriver: Deriver, name: Bytes) -> ConstructorShape =
+  if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit"
+      || name == b"Decimal"
+      || name == b"Char" { Leaf } else if name == b"Float" {
+    match deriver { DOrd -> Refused(HoldsFloat), DHash -> Refused(HoldsFloat), _ -> Leaf }
+  } else if name == b"List" || name == b"Array" || name == b"Columns" || name == b"Option"
+      || name == b"Map"
+      || name == b"Result"
+      || name == b"Ordering"
+      || name == b"Rounding"
+      || name == b"Instant"
+      || name == b"Duration" { Structural }
+  else if deriver == DKept && is_fixed_width(name) { Leaf }
+  else if deriver == DKept && name == b"Iter" { Structural }
+  else if name == b"Hold" || name == b"Task" || name == b"Chan" { Refused(HoldsHandle) }
+  else if name == b"Secret" { match deriver { DEq -> Leaf, _ -> Refused(HoldsSecret) } }
+  else { Nominal }
+
+fn is_fixed_width(name: Bytes) -> Bool =
+  name == b"U8" || name == b"U16" || name == b"U32" || name == b"U64" || name == b"U128"
+    || name == b"I8"
+    || name == b"I16"
+    || name == b"I32"
+    || name == b"I64"
+    || name == b"I128"
+
+pub fn refusal_reason(w: DeriveRefusal, deriver: Deriver, simple: Bytes) -> Bytes =
+  match w {
+    HoldsFloat -> float_reason(deriver),
+    HoldsHandle -> Bytes::concat_all([b"a `", simple, b"` names a location rather than a value"]),
+    HoldsSecret -> secret_reason(deriver),
+    HoldsNative -> Bytes::concat_all([b"a `", simple, b"` is laid out by the toolchain"]),
+    _ -> b"",
+  }
+
+pub fn float_reason(deriver: Deriver) -> Bytes =
+  match deriver {
+    DHash ->
+      b"`Float` has no hash that agrees with `==`: `NaN != NaN`, and `0.0 == -0.0` in different bits",
+    _ -> b"`Float` is not ordered: `NaN != NaN`",
+  }
+
+pub fn secret_reason(deriver: Deriver) -> Bytes =
+  match deriver {
+    DOrd -> b"a credential has no order",
+    DEq -> b"a credential has no structural equality to derive",
+    DShow -> b"a rendering would write the credential out",
+    DHash -> b"a hash of a credential is something to test guesses against",
+    DNumeric -> b"a credential is not a number",
+    DInteger -> b"a credential is not an integer",
+    DKept -> b"a build would write the credential into the binary",
+  }
+
+pub fn refusal_note(w: DeriveRefusal, deriver: Deriver) -> Option<Bytes> =
+  match w {
+    HoldsSecret -> match deriver {
+      DOrd ->
+        Some(
+          b"an ordering over a credential leaks a bit of position per comparison and recovers the value in calls proportional to its length; `==` compares two, and `Secret::verify` is the check a program actually wants",
+        ),
+      DShow ->
+        Some(
+          b"a credential is never shown, in an interpolated string or anywhere else; show what the `Secret` guards or names instead",
+        ),
+      DHash ->
+        Some(
+          b"hash what the `Secret` guards or names instead; a password wants `std.password`, not a content hash",
+        ),
+      _ -> None,
+    },
+    _ -> None,
+  }

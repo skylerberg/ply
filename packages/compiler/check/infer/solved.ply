@@ -16,9 +16,8 @@ import compiler.check.types (Resource, RVar, RAny, Atom, Row, Type, TyVar, TyCon
 import compiler.check.resolve.tables (ParsedModule, Resolved, Diag, Label, qualify,
                                       error_with_labels, error_at, label_at)
 import compiler.check.resolve.sets (mentions)
-import compiler.expand.derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
-                               NullInsideOption, HoldsSecret, HoldsNative, float_reason,
-                               null_in_option_note, same_deriver)
+import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat,
+                                          Unconstrained, HoldsSecret, HoldsNative, float_reason)
 import std.bytes
 import std.bytes (ascii_of_int)
 import std.option
@@ -42,150 +41,28 @@ import compiler.check.infer.derivable (native_notes, secret_notes, handle_what, 
                                        instance_shapes, deriver_shapes, shapes_for, OwnParams,
                                        own_params)
 
-// --- The two passes that read what expansion produced --------------------------------------------
-
-fn expanded_here(parsed: ParsedModule, def: DeriveDef) -> Bool =
-  parsed.derived.fold(false, |acc: Bool, d: Derived|
-    acc || (same_deriver(d.deriver, def.deriver) && d.target == def.target.name))
-
-/// The target as a solved type when it has no parameters; an alias's reports are dropped, already made at its declaration.
-fn derive_target(
-  checker: Checker,
-  parsed: ParsedModule,
-  target: Bytes,
-) -> Option<WithTy> / {abort.raise} = {
-  let qualified = qualify(parsed.name, target);
-  match checker.types.get(qualified) {
-    None -> None,
-    Some(decl) -> if decl.params.len() > 0 || decl.labels.len() > 0 || decl.rows.len() > 0 { None }
-    else {
-      match decl.declared {
-        DeclaredSum -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
-        DeclaredExtern -> Some({ checker: checker, ty: TyCon({ name: qualified, args: [] }) }),
-        DeclaredRecord(_) -> match checker.nominals.get(qualified) {
-          Some(r) -> Some({ checker: checker, ty: r.ty }),
-          None -> None,
-        },
-        DeclaredAlias(alias) -> {
-          let mark = checker.diags.len();
-          let inner: Checker = {
-            ..checker,
-            ty_params: Map::new(),
-            row_params: Map::new(),
-            label_params: Map::new(),
-            alias_stack: checker.alias_stack.push(qualified),
-            module: decl.owner,
-          };
-          let o: WithTy = conv_type(inner, alias);
-          Some({
-            checker: {
-              ..o.checker,
-              ty_params: checker.ty_params,
-              row_params: checker.row_params,
-              label_params: checker.label_params,
-              alias_stack: checker.alias_stack,
-              module: checker.module,
-              diags: o.checker.diags.take(mark),
-            },
-            ty: o.ty,
-          })
-        },
-      }
-    },
-  }
-}
-
-fn why_notes_for_derive(
+/// Why a key's answer cannot be ordered or hashed by `deriver`.
+fn why_notes_for_key(
   w: DeriveRefusal,
   deriver: Deriver,
   b: Blocked,
   blocker: Bytes,
 ) -> List<Bytes> =
   match w {
-    NullInsideOption ->
-      [
-        Bytes::concat_all([b"`", blocker, b"` writes `None` and its payload alike"]),
-        null_in_option_note(),
-      ],
     HoldsFloat -> [float_reason(deriver)],
-    HoldsFunction -> [b"a function has no encoding to derive"],
+    HoldsFunction -> [b"a function has no order and no content to hash"],
     HoldsHandle ->
       [
         Bytes::concat_all([
           b"a `",
           handle_what(b.ty),
-          b"` names a location rather than a value, so it has no encoding",
+          b"` names a location rather than a value, so it has no order",
         ]),
       ],
     HoldsSecret -> secret_notes(deriver),
     HoldsNative -> native_notes(blocker, deriver),
     Unconstrained(_) -> [],
   }
-
-/// A `derive` the checker refuses: where it stands, and what is said of it.
-type RefusedDerive = { at: Place, diag: Diag }
-
-/// `derivable(D, T)` over each `derive`'s target as a solved type, and the derives it refuses,
-/// which are reported once [`attribute_generated`] has set their bodies aside.
-pub fn check_derives(
-  checker: Checker,
-) -> { checker: Checker, refused: List<RefusedDerive> } / {abort.raise} = {
-  let shapes = deriver_shapes(checker.instances, algebraic_shapes(checker));
-  range(0, checker.modules.len()).fold(
-    { checker: checker, refused: [] },
-    |acc: { checker: Checker, refused: List<RefusedDerive> }, i: Int| {
-      let m = acc.checker.modules.get(i);
-      m.module.items.fold(
-        acc,
-        |cc: { checker: Checker, refused: List<RefusedDerive> }, item: Item|
-          match item {
-            IDerive(def) -> if !expanded_here(m, def) { cc } else {
-              match derive_target({ ..cc.checker, module: i }, m, def.target.name) {
-                None -> cc,
-                Some(o) -> match derivable(def.deriver, o.ty, shapes_for(shapes, def.deriver), []) {
-                  None -> { ..cc, checker: o.checker },
-                  Some(blocked) -> match blocked.why {
-                    Unconstrained(_) -> { ..cc, checker: o.checker },
-                    _ -> {
-                      let blocker = type_text(blocked.ty);
-                      let dv = deriver_text(def.deriver);
-                      {
-                        checker: o.checker,
-                        refused: cc.refused.push({
-                          at: { module: i, start: def.span.start, end: def.span.end },
-                          diag: error_at(
-                            b"E0206",
-                            i,
-                            def.span,
-                            Bytes::concat_all([
-                              b"`",
-                              dv,
-                              b"` cannot be derived for `",
-                              def.target.name,
-                              b"`",
-                            ]),
-                            Bytes::concat_all([b"`", blocker, b"` has no ", what_of(def.deriver)]),
-                            why_notes_for_derive(blocked.why, def.deriver, blocked, blocker).push(
-                              Bytes::concat_all([
-                                b"write the dictionary for `",
-                                def.target.name,
-                                b"` by hand, or change the field",
-                              ]),
-                            ),
-                          ),
-                        }),
-                      }
-                    },
-                  },
-                },
-              }
-            },
-            _ -> cc,
-          },
-      )
-    },
-  )
-}
 
 // --- What a type's module states of it ----------------------------------------------------------
 
@@ -810,9 +687,9 @@ fn beyond_carried(checker: Checker, type_name: Bytes, f: DefInfo, own: OwnParams
       match f.scheme.ty_vars.at(c.param) {
         None -> true,
         Some(v) ->
-          !(same_deriver(c.deriver, DOrd) && carried.contains(v))
+          !(c.deriver == DOrd && carried.contains(v))
             && !stated.any(|s: DefConstraint|
-              same_deriver(s.deriver, c.deriver)
+              s.deriver == c.deriver
                 && (match own.params.at(s.param) { Some(w) -> w == v, None -> false })),
       })
   }
@@ -1202,7 +1079,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
                           b"`",
                         ]),
                         Bytes::concat_all([b"this key answers `", type_text(x.answers), b"`"]),
-                        why_notes_for_derive(blocked.why, deriver, blocked, blocker).push(
+                        why_notes_for_key(blocked.why, deriver, blocked, blocker).push(
                           b"one key decides `==`, `compare`, `digest` and a `Map`'s order, so what it answers is ordered and hashed",
                         ),
                       ),
@@ -1216,14 +1093,10 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise} = {
   }
 }
 
-/// Anything a generated definition failed on, other than a name it could not see, is Ply's fault,
-/// unless its derive is one of `refused`: a refused derive has no body to fault, so all that is said
-/// of it is its refusal. A derive whose body could not see a name is said to be that alone: what
-/// the body then fails on follows from the missing name.
-pub fn attribute_generated(
-  checker: Checker,
-  refused: List<RefusedDerive>,
-) -> Checker / {abort.raise} = {
+/// Anything a generated definition failed on, other than a name it could not see, is its deriver's
+/// fault. A derive whose body could not see a name is said to be that alone: what the body then
+/// fails on follows from the missing name.
+pub fn attribute_generated(checker: Checker) -> Checker / {abort.raise} = {
   let spans = range(0, checker.modules.len()).fold([], |acc: List<Place>, i: Int|
     checker.modules.get(i).derived.fold(acc, |places: List<Place>, d: Derived|
       places.push({ module: i, start: d.span.start, end: d.span.end })));
@@ -1236,7 +1109,6 @@ pub fn attribute_generated(
       },
       None -> None,
     };
-  let set_aside = refused.map(|r: RefusedDerive| r.at);
   let unseen = checker.diags.fold([], |acc: List<Place>, d: Diag|
     if d.code != b"E0206" { acc }
     else { match derived_at(d) { Some(at) -> acc.push(at), None -> acc } });
@@ -1245,13 +1117,10 @@ pub fn attribute_generated(
     diags: checker.diags.fold([], |acc: List<Diag>, d: Diag|
       match derived_at(d) {
         None -> acc.push(d),
-        Some(at) -> if set_aside.contains(at) { acc }
-        else if d.code == b"E0206" { acc.push(d) }
+        Some(at) -> if d.code == b"E0206" { acc.push(d) }
         else if unseen.contains(at) { acc }
         else { acc.push(blamed_on_deriver(d)) },
-      }).concat(
-      refused.map(|r: RefusedDerive| r.diag),
-    ),
+      }),
   }
 }
 
@@ -1260,16 +1129,13 @@ type Place = { module: Int, start: Int, end: Int }
 
 fn blamed_on_deriver(d: Diag) -> Diag =
   {
-    code: b"E0505",
+    code: b"E0155",
     notes: d.notes + 2,
     labels: d.labels,
     text: d.text,
-    message: b"a derived definition does not typecheck",
-    notes_text: push_front_bytes(
-      b"this is a compiler bug in the deriver: ".concat(d.message),
-      d.notes_text,
-    ).push(
-      b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours",
+    message: b"a definition the deriver wrote does not typecheck",
+    notes_text: push_front_bytes(b"it fails with: ".concat(d.message), d.notes_text).push(
+      b"a deriver writes definitions that check; this is a fault in the deriver's module",
     ),
     severity: d.severity,
     fixes: d.fixes,
