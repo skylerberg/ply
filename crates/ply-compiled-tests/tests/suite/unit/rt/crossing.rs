@@ -726,3 +726,81 @@ fn handed_words_are_the_words_compiled_code_passes() {
         5
     );
 }
+
+/// `write` over a fresh writer, as an entry's answer is written.
+fn written(write: impl FnOnce(&mut ply_core::codec::Writer)) -> Vec<u8> {
+    let mut w = ply_core::codec::Writer::new();
+    write(&mut w);
+    w.finish()
+}
+
+fn resumes(w: &mut ply_core::codec::Writer) {
+    w.fun(ply_core::codec::fun::RESUMES);
+}
+
+#[test]
+fn data_holding_no_continuation_has_no_way_to_one() {
+    let bytes = written(|w| {
+        w.count(tag::LIST, 4);
+        w.int(1);
+        w.str(b"two");
+        w.count(tag::MAP, 0);
+        w.handle(0);
+    });
+    assert_eq!(ply_compiled::rt::continuation_in(&bytes), Ok(None));
+}
+
+#[test]
+fn the_way_to_a_continuation_reads_outermost_first() {
+    let bytes = written(|w| {
+        w.count(tag::LIST, 2);
+        w.int(0);
+        w.count(tag::RECORD, 1);
+        w.name(b"saved");
+        w.ctor(b"m.Just", 1);
+        resumes(w);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&bytes),
+        Ok(Some(vec![
+            "item 1".to_string(),
+            "field `saved`".to_string(),
+            "`m.Just`'s argument 1".to_string()
+        ]))
+    );
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&written(resumes)),
+        Ok(Some(Vec::new()))
+    );
+}
+
+#[test]
+fn a_continuation_is_found_past_every_kind_of_part_before_it() {
+    let bytes = written(|w| {
+        w.count(tag::ARRAY, 1);
+        w.count(tag::MAP, 2);
+        w.float(0);
+        w.char(u32::from('c'));
+        w.decimal([0; 16]);
+        resumes(w);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&bytes),
+        Ok(Some(vec![
+            "element 0".to_string(),
+            "a map entry".to_string()
+        ]))
+    );
+    let table = written(|w| {
+        w.fun(ply_core::codec::fun::TABLE);
+        w.varint(1);
+        w.varint(1);
+        w.int(1);
+        resumes(w);
+        w.int(0);
+    });
+    assert_eq!(
+        ply_compiled::rt::continuation_in(&table),
+        Ok(Some(Vec::new()))
+    );
+}

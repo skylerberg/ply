@@ -11,6 +11,7 @@ use super::*;
 use crate::emitted::{Block, Carried, Handed, Handle, PlyType};
 use crate::native::{Addr, F64, I64, TakenBytes};
 use ply_core::codec::{self, Reader, Writer, fun, tag};
+use ply_core::{Escapee, escape};
 
 /// One crossing under way.
 pub(crate) enum Crossing {
@@ -33,7 +34,7 @@ pub(crate) struct Lowering {
     /// Whether this is an entry's answer, and the first handle of its run written into it, which
     /// the boundary refuses.
     answers_entry: bool,
-    escaping: Option<ply_core::escape::Handle>,
+    escaping: Option<escape::Handle>,
 }
 
 /// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
@@ -820,9 +821,9 @@ pub(crate) fn lifted_from(
 }
 
 /// Calls the unit's builtin at `index` in its pool over the arguments the innermost lowering holds,
-/// a list of them in order, and ends that lowering. Where the builtin answers, a lifting of its
-/// answer is open for compiled code to read and end, each value the bytes cannot hold a runtime
-/// object beside them; where it raises, as it raises, or fails, none is.
+/// a list of them in order, and ends that lowering: what a builder the previous release compiled
+/// still calls this way, `panic` and `to_int`, each read from its arguments' bytes. Where `to_int`
+/// answers, a lifting of its answer is open for compiled code to read and end; `panic` raises.
 pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
     let c = unsafe { &mut *ctx };
     let Some(l) = c.end_lowering() else {
@@ -839,18 +840,50 @@ pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
         )));
         return;
     };
-    let args = read_back(ctx, l).and_then(arguments);
+    let bytes = l.w.finish();
+    released(ctx, l.beside);
     let c = unsafe { &mut *ctx };
-    let args = match args {
-        Ok(args) => args,
-        Err(why) => {
-            c.fail(err_crossing(&why));
-            return;
+    if let Err(why) = encoded_called(c, b, &bytes) {
+        c.fail(err_crossing(&why));
+    }
+}
+
+/// `b` over the arguments' list `bytes` hold, as [`rt_builtin_encoded`] calls it.
+fn encoded_called(c: &mut Ctx, b: Builtin, bytes: &[u8]) -> Result<(), String> {
+    let mut r = Reader::new(bytes)?;
+    r.expect(tag::LIST)?;
+    match (b, r.count()?) {
+        (Builtin::Panic, 1) => {
+            r.expect(tag::STR)?;
+            let message = r.str()?.to_string();
+            let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
+                .primary(c.site(), "`panic` called here");
+            c.pend(d, message);
+            Ok(())
         }
-    };
-    if let Some(answer) = called_over_values(c, b, args) {
-        let (bytes, held) = encoded(&answer);
-        c.lift_holding(bytes, held);
+        (Builtin::ToInt, 2) => {
+            r.expect(tag::INT)?;
+            r.int()?;
+            let int = match r.byte()? {
+                tag::INT => Some(r.int()?),
+                tag::FIXED => r.fixed()?.to_i128().and_then(|v| i64::try_from(v).ok()),
+                t => return Err(format!("`to_int` of a value tagged {t}")),
+            };
+            let mut w = codec::Writer::new();
+            match int {
+                Some(n) => {
+                    w.ctor(b"Some", 1);
+                    w.int(n);
+                }
+                None => w.ctor(b"None", 0),
+            }
+            c.lift_from(w.finish(), Vec::new());
+            Ok(())
+        }
+        (b, _) => Err(format!(
+            "`{}` over its arguments' encoding, which only `panic` and `to_int` are",
+            b.name()
+        )),
     }
 }
 
@@ -870,30 +903,146 @@ impl Ctx {
 pub(crate) enum EntryBytes {
     /// The answer's PLV1, untouched.
     Bytes(Vec<u8>),
-    /// The answer holds what the bytes cannot, read as the value it stands for, so the boundary
-    /// can say why it stays in its run.
-    Holding(Value),
+    /// The answer holds what the bytes cannot, which only its own run can hold.
+    Holding,
     /// The answer holds a function the program wrote, which only its own run can hold.
     Function,
-    /// The answer holds a handle of its run, the first written.
-    Escaping(ply_core::escape::Handle),
+    /// The answer holds a continuation or a handle of its run, the first written, which the
+    /// boundary refuses.
+    Escaping(Escapee),
 }
 
 /// Ends the lowering [`Ctx::open_entry`] opened: the answer kept as the bytes the entry wrote
 /// where they hold all of it.
 pub(crate) fn close_entry(ctx: *mut Ctx) -> Result<EntryBytes, String> {
     let l = entry_lowering(ctx)?;
+    let held = !l.beside.is_empty();
+    let bytes = l.w.finish();
+    released(ctx, l.beside);
     if let Some(handle) = l.escaping {
-        released(ctx, l.beside);
-        return Ok(EntryBytes::Escaping(handle));
+        return Ok(EntryBytes::Escaping(Escapee {
+            handle,
+            route: Vec::new(),
+        }));
     }
     if l.functions {
         return Ok(EntryBytes::Function);
     }
-    if !l.beside.is_empty() || l.resumes {
-        return Ok(EntryBytes::Holding(read_back(ctx, l)?));
+    if l.resumes
+        && let Some(route) = continuation_in(&bytes)?
+    {
+        return Ok(EntryBytes::Escaping(Escapee {
+            handle: escape::Handle::Continuation,
+            route,
+        }));
     }
-    Ok(EntryBytes::Bytes(l.w.finish()))
+    if held || l.resumes {
+        return Ok(EntryBytes::Holding);
+    }
+    Ok(EntryBytes::Bytes(bytes))
+}
+
+/// The way to the first continuation `bytes` hold, outermost first, where they hold one.
+pub fn continuation_in(bytes: &[u8]) -> Result<Option<Vec<String>>, String> {
+    let mut r = Reader::new(bytes)?;
+    let mut route = Vec::new();
+    if !walked(&mut r, &mut route)? {
+        return Ok(None);
+    }
+    route.reverse();
+    Ok(Some(route))
+}
+
+/// Reads one value, answering whether it reaches a continuation, with the way to it in `route`,
+/// innermost first.
+fn walked(r: &mut Reader<&[u8]>, route: &mut Vec<String>) -> Result<bool, String> {
+    let t = r.byte()?;
+    let found = |route: &mut Vec<String>, step: String| {
+        route.push(step);
+        Ok(true)
+    };
+    match t {
+        tag::UNIT | tag::FALSE | tag::TRUE => {}
+        tag::INT => {
+            r.int()?;
+        }
+        tag::FLOAT => {
+            r.array::<8>()?;
+        }
+        tag::DECIMAL => {
+            r.array::<16>()?;
+        }
+        tag::FIXED => {
+            r.fixed()?;
+        }
+        tag::CHAR | tag::HANDLE | tag::AGAIN => {
+            r.varint()?;
+        }
+        tag::STR | tag::BYTES => {
+            r.blob()?;
+        }
+        tag::LIST | tag::ARRAY => {
+            let noun = if t == tag::LIST { "item" } else { "element" };
+            for i in 0..r.count()? {
+                if walked(r, route)? {
+                    return found(route, format!("{noun} {i}"));
+                }
+            }
+        }
+        tag::MAP => {
+            for _ in 0..r.count()? {
+                if walked(r, route)? {
+                    return found(route, "a key".into());
+                }
+                if walked(r, route)? {
+                    return found(route, "a map entry".into());
+                }
+            }
+        }
+        tag::RECORD => {
+            for _ in 0..r.count()? {
+                let name = r.symbol()?;
+                if walked(r, route)? {
+                    return found(route, format!("field `{name}`"));
+                }
+            }
+        }
+        tag::CTOR => {
+            let name = r.symbol()?;
+            for i in 0..r.varint()? {
+                if walked(r, route)? {
+                    return found(route, format!("`{name}`'s argument {}", i + 1));
+                }
+            }
+        }
+        tag::FUN => match r.byte()? {
+            fun::RESUMES => return Ok(true),
+            fun::NAMED => {
+                r.symbol()?;
+            }
+            fun::ANON => {}
+            fun::CONST => {
+                r.varint()?;
+                return walked(r, route);
+            }
+            fun::PROJECT => {
+                r.varint()?;
+                r.varint()?;
+            }
+            fun::TABLE => {
+                r.varint()?;
+                for _ in 0..r.varint()? {
+                    if walked(r, route)? || walked(r, route)? {
+                        return Ok(true);
+                    }
+                }
+                return walked(r, route);
+            }
+            case => return Err(format!("a function of case {case}")),
+        },
+        t => return Err(format!("a value tagged {t}")),
+    }
+    Ok(false)
 }
 
 /// Ends the lowering [`Ctx::open_entry`] opened and answers it; an error where the entry ended that

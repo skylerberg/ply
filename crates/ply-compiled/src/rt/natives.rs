@@ -28,40 +28,6 @@ macro_rules! natives {
 
 ply_core::each_builtin!(natives);
 
-/// `b` over `values`: its answer, or `None` where it raised, as it raises, or failed the context.
-pub(super) fn called_over_values(ctx: &mut Ctx, b: Builtin, values: Vec<Value>) -> Option<Value> {
-    let site = ctx.site();
-    let panicked = match (b, values.first()) {
-        (Builtin::Panic, Some(Value::Str(s))) => Some(s.to_string()),
-        _ => None,
-    };
-    // An operator over an `integer` parameter raises for a zero divisor, as one written at its
-    // type does; its overflow, like theirs, ends the run.
-    let divides_by_zero = match (b, values.as_slice()) {
-        (Builtin::NumericBinary, [Value::Int(op), _, _, divisor]) => {
-            matches!(
-                usize::try_from(*op)
-                    .ok()
-                    .and_then(|i| ply_core::builtins::NUMERIC_OPS.get(i)),
-                Some(BinOp::Div | BinOp::Rem)
-            ) && is_zero(divisor)
-        }
-        _ => false,
-    };
-    match ply_core::builtins::call(b, values, site) {
-        Ok(v) => Some(v),
-        Err(d) if signature(b).raises || divides_by_zero => {
-            let message = panicked.unwrap_or_else(|| raised_message(&d));
-            ctx.pend(d, message);
-            None
-        }
-        Err(d) => {
-            ctx.fail(d);
-            None
-        }
-    }
-}
-
 /// A runtime error's message as a clause for `abort.raise` is given it, each value the text names
 /// told by its kind: nothing in Rust renders one.
 pub(super) fn raised_message(d: &Diagnostic) -> String {

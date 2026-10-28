@@ -434,17 +434,11 @@ fn answered(ctx: &mut Ctx, root: &str) -> Ended {
         Ok(EntryBytes::Function) => {
             Ended::Unanswerable("its answer holds a function the program wrote")
         }
-        Ok(EntryBytes::Escaping(handle)) => {
+        Ok(EntryBytes::Escaping(escapee)) => {
             let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            Ended::Failed(ply_core::escape::refused(&boundary, handle, Span::DUMMY))
+            Ended::Failed(ply_core::escape::refused(&boundary, &escapee, Span::DUMMY))
         }
-        Ok(EntryBytes::Holding(value)) => {
-            let boundary = ply_core::Boundary::EntryAnswer { name: root };
-            match ply_core::escape::check(&boundary, &value, Span::DUMMY) {
-                Err(refused) => Ended::Failed(refused),
-                Ok(()) => Ended::Unanswerable("its answer holds a handle of its run"),
-            }
-        }
+        Ok(EntryBytes::Holding) => Ended::Unanswerable("its answer holds a handle of its run"),
         Err(why) => Ended::Failed(crate::rt::err_crossing(&why)),
     }
 }
