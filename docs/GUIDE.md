@@ -157,7 +157,9 @@ where they are not.
 
 Source is UTF-8, and one that is not is read up to its first byte that is no
 part of a character, which is `X0001`; whitespace only separates tokens and
-there is no layout rule. A comment is `//` to end of line.
+there is no layout rule. A comment is `//` to end of line. A byte-order mark at
+the head of a file is no part of it, and a `#!` line opening a file is a
+comment, so a script may open with one.
 
 A *doc comment* documents a declaration for whoever calls or names it. `///`
 lines document the `fn`, `extern fn`, `type`, `effect`, effect operation, `effect
