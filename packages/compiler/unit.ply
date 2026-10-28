@@ -328,13 +328,9 @@ fn pointers_named(
     })
 
 /// What the natives whose helpers are `called` are declared to be, as `program_natives` declares
-/// them over the shipped `modules`, each module's text the one `text_of` finds; the modules are read
-/// only where the compiler does not declare every one itself.
-fn called_externs(
-  called: Map<Bytes, Bool>,
-  modules: List<ModuleRow>,
-  text_of: (ModuleRow) -> Option<Bytes>,
-) -> List<Extern> / {abort.raise} = {
+/// them over the modules the unit of `p` reads; the modules are read only where the compiler does
+/// not declare every one itself.
+fn called_externs(called: Map<Bytes, Bool>, p: Program) -> List<Extern> / {abort.raise} = {
   let calls = |e: Extern| called.contains(builtin_helper(e.name));
   let own = declared_natives();
   let rest = own.fold(called, |acc: Map<Bytes, Bool>, e: Extern|
@@ -342,8 +338,13 @@ fn called_externs(
   if rest.len() == 0 { own.filter(calls) } else {
     natives_beside(
       own,
-      modules.fold([], |acc: List<List<Extern>>, m: ModuleRow|
-        match text_of(m) { Some(text) -> acc.push(externs_in(m.name, text)), None -> acc }),
+      p.modules.fold([], |acc: List<List<Extern>>, m: ModuleRow|
+        if !p.read.contains(m.name) { acc } else {
+          match text_at(p, m.index) {
+            Some(text) -> acc.push(externs_in(m.name, text)),
+            None -> acc,
+          }
+        }),
     ).filter(
       calls,
     )
@@ -620,8 +621,7 @@ pub type Produced = { text: Bytes, taken: List<RootName>, dropped: List<Dropped>
 
 /// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
 /// the offered roots each covered, the natives the unit calls that the runtime does not implement as
-/// they are declared, its calls written against a handing other than their callee's, and the scope
-/// it walked under, for an ask of another unit of the same program to walk under.
+/// they are declared, and its calls written against a handing other than their callee's.
 pub type Emission = {
   produced: Produced,
   kept: Int,
@@ -629,7 +629,6 @@ pub type Emission = {
   unserved: List<Unserved>,
   unbound: List<Unbound>,
   misassumed: List<Misassumed>,
-  scope: Option<Result<emit::Scope, Bytes>>,
 }
 
 /// Each root's answer, a group's one body answering for every member.
@@ -1184,8 +1183,6 @@ type Placing = {
   bucket: Int,
   text: Bytes,
   reaches: List<RootName>,
-  /// The definitions its C defines: a group's members, or its own.
-  defines: List<RootName>,
   /// The static objects its C names, which the unit's tail defines.
   statics: List<Bytes>,
   /// The functions closures alike share that its C names, which its part defines once.
@@ -1212,52 +1209,6 @@ fn prototype(symbol: Bytes, head: Head) -> Bytes =
     b");\n",
   ])
 
-fn far_table(id: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b"ply_far_", hex_digit(id / 16), hex_digit(id % 16)])
-
-/// Where the head defines `PLY_FAR`, each of `reached`, a bucket's calls into other buckets, is
-/// called through `table`, an address apiece: a load and a call of what it loads, which reaches
-/// anywhere, where a call of the function's name reaches only so far.
-fn far_calls(table: Bytes, reached: List<Taken>) -> Bytes / {abort.raise} =
-  if reached.len() == 0 { b"" } else {
-    Bytes::concat_all([
-      b"#ifdef PLY_FAR\nstatic void *const ",
-      table,
-      b"[] = {",
-      Bytes::concat_all(reached.map(|t: Taken| Bytes::concat_all([b" (void *)&", t.symbol, b","]))),
-      b" 0 };\n",
-      Bytes::concat_all(
-        range(0, reached.len()).map(|i: Int| {
-          let t = reached.get(i);
-          Bytes::concat_all([
-            b"#define ",
-            t.symbol,
-            b"(...) ((",
-            t.head.answer,
-            b" (*)(PlyCtx*",
-            Bytes::concat_all(t.head.params.map(|p: Bytes| b", ".concat(p))),
-            b"))",
-            table,
-            b"[",
-            ascii_of_int(i),
-            b"])(__VA_ARGS__)\n",
-          ])
-        }),
-      ),
-      b"#endif\n",
-    ])
-  }
-
-/// The end of what [`far_calls`] defines, so the bucket after this one reads its names as written.
-fn far_ended(reached: List<Taken>) -> Bytes =
-  if reached.len() == 0 { b"" } else {
-    Bytes::concat_all([
-      b"#ifdef PLY_FAR\n",
-      Bytes::concat_all(reached.map(|t: Taken| Bytes::concat_all([b"#undef ", t.symbol, b"\n"]))),
-      b"#endif\n",
-    ])
-  }
-
 fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     hex_digit(p.bucket / 16),
@@ -1271,9 +1222,9 @@ fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
 /// then the tail, `statics`, the static objects' definitions, what the unit says about itself and
 /// `tables`, what it lays out for its loader: one translation unit that the loader also compiles in
 /// parts, cut on the marks. A bucket declares its table and its statics and never defines them, so
-/// its C reads the same whatever the unit holds beside it, and calls what another defines as
-/// [`far_calls`] says. A bucket declares the pointer to each of `machine`, the natives of shipped
-/// modules the unit calls over machine words, that its bodies call, and the tail binds them all.
+/// its C reads the same whatever the unit holds beside it. A bucket declares the pointer to each of
+/// `machine`, the natives of shipped modules the unit calls over machine words, that its bodies call,
+/// and the tail binds them all.
 fn assembled(
   bodies: List<Placing>,
   sizes: Map<Int, Int>,
@@ -1290,21 +1241,10 @@ fn assembled(
     if last >= 0 && acc.get(last).get(0).bucket == p.bucket { acc.set(last, acc.get(last).push(p)) }
     else { acc.push([p]) }
   });
-  let reached_by = |group: List<Placing>| {
-    let here = group.fold(Map::new(), |acc: Map<RootName, Bool>, p: Placing|
-      p.defines.fold(acc, |a: Map<RootName, Bool>, n: RootName| a.insert(n, true)));
-    names_ordered(group.fold([], |acc: List<RootName>, p: Placing| acc.concat(p.reaches))).fold(
-      [],
-      |acc: List<Taken>, name: RootName|
-        if here.contains(name) { acc }
-        else { match taken.get(name) { Some(t) -> acc.push(t), None -> acc } },
-    )
-  };
   Bytes::concat_all([
     unit_head(),
     Bytes::concat_all(
-      groups.map(|group: List<Placing>| {
-        let reached = reached_by(group);
+      groups.map(|group: List<Placing>|
         Bytes::concat_all([
           bucket_mark(group.get(0).bucket),
           b"\n",
@@ -1336,13 +1276,10 @@ fn assembled(
               machine.filter(|n: Native| called.contains(n.name)).map(pointer_declared),
             )
           },
-          far_calls(far_table(group.get(0).bucket), reached),
           b"\n",
           shared_written(group),
           Bytes::concat_all(group.map(|p: Placing| p.text.concat(b"\n"))),
-          far_ended(reached),
-        ])
-      }),
+        ])),
     ),
     unit_tail(machine),
     statics,
@@ -1499,7 +1436,6 @@ pub fn produce(
         match locals.get(b) { Some(l) -> l, None -> Map::new() },
       ),
       reaches: reaches_of(m.body.name, m.body.tables),
-      defines: answered(m.body),
       statics: m.body.tables.statics.map(|d: StaticDef| d.name),
       shared: m.body.tables.shared,
     }
@@ -1610,12 +1546,14 @@ pub fn codes(made: Made) -> Map<RootName, Bytes> / {abort.raise} = {
 // --- Emitting what no earlier run kept --------------------------------------------
 
 /// What the front end's answer says the emitter works over: each root, the modules in program order,
-/// and what each module imports.
+/// what each module imports, and the modules a unit reads.
 type Program = {
   roots: Map<RootName, EmitterRoot>,
   keys: Map<RootName, Bytes>,
   modules: List<ModuleRow>,
   imports: Map<Bytes, List<Bytes>>,
+  /// Each module the unit reads, by its name, with the modules it depends on (`modules_read`).
+  read: Map<Bytes, List<Bytes>>,
   sources: List<Bytes>,
   /// A digest of what each module embeds, by its index: the emitter writes each call out as its bytes.
   embeds: Map<Int, Bytes>,
@@ -1627,17 +1565,21 @@ type Program = {
   /// Each declared type's hash, which covers all it reaches, by its name: another program may
   /// declare another type under the same name.
   declared: Map<Bytes, Bytes>,
-  /// Each module's text digested, by its name, taken once however many roots it writes.
+  /// Each module's text the unit reads digested, by its name, taken once however many roots it writes.
   digests: Map<Bytes, Bytes>,
   /// The functions the program's types state, each printed with the entry the runtime calls it by.
   stated: Map<Bytes, Bool>,
 }
 
-fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
+/// The program `dump` answers, its modules' texts `sources`, as a unit over `roots` reads it.
+fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program / {abort.raise} = {
   let keyed = rows_keyed(dump);
   let named = |row: Bytes| match keyed.get(row) { Some(k) -> Some(root_name(k)), None -> None };
   let by_name = dump.modules.fold(Map::new(), |acc: Map<Bytes, ModuleRow>, m: ModuleRow|
     acc.insert(m.name, m));
+  // The program's own prelude, which every module imports; a scope left without one takes the
+  // shipped prelude's text.
+  let read = modules_read(by_name, sources, modules_lowered(roots).keys().push(prelude_module()));
   let reads = dump.embeds.fold(Map::new(), |acc: Map<Int, List<Bytes>>, e: EmbedAt|
     match by_name.get(e.module) {
       None -> acc,
@@ -1666,6 +1608,7 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
       match by_name.get(o.module) { Some(m) -> acc.push(m), None -> acc }),
     imports: by_name.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, n: Bytes, m: ModuleRow|
       acc.insert(n, m.imports)),
+    read: read,
     sources: sources,
     embeds: reads.fold(Map::new(), |acc: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
       acc.insert(i, blake3(Bytes::concat_all(ordered(parts))))),
@@ -1688,10 +1631,51 @@ fn program_of(dump: Dump, sources: List<Bytes>) -> Program / {abort.raise} = {
           _ -> acc,
         })
     },
-    digests: dump.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
-      match sources.at(m.index) { Some(t) -> acc.insert(m.name, blake3(t)), None -> acc }),
+    digests: read.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: Bytes, _: List<Bytes>|
+      match match by_name.get(m) { Some(row) -> sources.at(row.index), None -> None } {
+        Some(t) -> acc.insert(m, blake3(t)),
+        None -> acc,
+      }),
     stated: stated_fns(dump),
   }
+}
+
+/// Each module the roots written in `starts` read, by its name, with the modules it depends on: what
+/// it imports and what it reads with no import (a type's home, the scheduler), closed over those.
+/// `by_name` holds the program's modules, whose texts `sources` holds by index; a module is lexed
+/// only once the closure reaches it.
+fn modules_read(
+  by_name: Map<Bytes, ModuleRow>,
+  sources: List<Bytes>,
+  starts: List<Bytes>,
+) -> Map<Bytes, List<Bytes>> / {abort.raise} = {
+  let text = |m: Bytes| match by_name.get(m) { Some(row) -> sources.at(row.index), None -> None };
+  let declared = homes_declaring(text);
+  let deps = |m: Bytes| {
+    let homes = match text(m) {
+      Some(t) -> read_without_import(m, parsing::start(t).input, || declared),
+      None -> [],
+    };
+    (match by_name.get(m) { Some(row) -> row.imports, None -> [] }).concat(homes).filter(
+      |d: Bytes| d != m && by_name.contains(d),
+    )
+  };
+  // Each round reads a module no earlier one did.
+  iterate(
+    { read: Map::new(), next: starts.filter(|m: Bytes| by_name.contains(m)) },
+    by_name.len() + 1,
+    |s: { read: Map<Bytes, List<Bytes>>, next: List<Bytes> }| {
+      let read = s.next.fold(s.read, |acc: Map<Bytes, List<Bytes>>, m: Bytes|
+        if acc.contains(m) { acc } else { acc.insert(m, deps(m)) });
+      let next = s.next.fold([], |acc: List<Bytes>, m: Bytes|
+        if s.read.contains(m) { acc } else {
+          (match read.get(m) { Some(ds) -> ds, None -> [] }).fold(acc, |a: List<Bytes>, d: Bytes|
+            if read.contains(d) { a } else { a.push(d) })
+        });
+      if next.len() == 0 { Stop({ read: read, next: [] }) }
+      else { Continue({ read: read, next: next }) }
+    },
+  ).read
 }
 
 /// The functions the program's types state: each `key`, `show` and `numeric` function.
@@ -1706,9 +1690,9 @@ fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(i
 
 /// What a kept answer is a function of beyond the emitter and the runtime: the root's name, the key
 /// the front end gave it, the text it is written in, since its sites are offsets into that text, and
-/// what its module embeds, which that text's calls are written out as; for a specialisation, the
-/// kinds it is at, the declarations of the types it is at, and the definitions whose lambdas it
-/// runs; for a root written from a type, its
+/// what its module embeds, which that text's calls are written out as; for a specialisation, and a
+/// clause judged at one, the kinds it is at, the declarations of the types it is at, and the
+/// definitions whose lambdas it runs; for a root written from a type, its
 /// module's text and the program's `types`, which together say how it is written. `None` for a root
 /// with no key or no place, which is asked again every time.
 fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / {abort.raise} = {
@@ -1749,6 +1733,17 @@ fn root_material(program: Program, types: Bytes, k: RootKey) -> Option<Bytes> / 
     Named(n) -> match definition_material(program, root_name(k)) {
       Some(m) -> Some(if program.stated.contains(n) { m.concat(b"\x00stated") } else { m }),
       None -> None,
+    },
+    // A clause judged at a specialisation is its definition's clause at the types that names.
+    Clause(c) -> match c.def {
+      At(a, _) -> match definition_material(
+          program,
+          root_name(Clause({ ..c, def: Named(a.def) })),
+        ) {
+        Some(m) -> Some(Bytes::concat_all([m, b"\x00", name, declarations_named(program, c.def)])),
+        None -> None,
+      },
+      _ -> definition_material(program, root_name(k)),
     },
     _ -> definition_material(program, root_name(k)),
   }
@@ -2023,8 +2018,8 @@ fn program_ctors(dump: Dump, ctors: List<Ctor>) -> Ctors = {
   })
 }
 
-/// The emitter's scope over every module of `p`, each whole, reading what the check filed of the
-/// bodies `roots` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
+/// The emitter's scope over each module the unit reads, each whole, reading what the check filed of
+/// the bodies `roots` reads (`emit.scope_of`): built once, when a walk first asks the emitter for a
 /// root.
 fn scope_over(
   dump: Dump,
@@ -2032,19 +2027,19 @@ fn scope_over(
   ctors: List<Ctor>,
   roots: List<RootKey>,
 ) -> Result<emit::Scope, Bytes> / {abort.raise} = {
-  let names = p.modules.map(|m: ModuleRow| m.name);
+  let read = p.modules.filter(|m: ModuleRow| p.read.contains(m.name));
+  let names = read.map(|m: ModuleRow| m.name);
   emit::scope_of(
     emit::zip_sources(
       names,
-      p.modules.map(|m: ModuleRow| match text_at(p, m.index) { Some(t) -> t, None -> b"" }),
+      read.map(|m: ModuleRow| match text_at(p, m.index) { Some(t) -> t, None -> b"" }),
     ),
     program_ctors(dump, ctors),
     true,
     roots,
     if dump.packages.len() == 0 { [{ prefix: b"", deps: [] }] } else { dump.packages },
     if dump.packages.len() == 0 { names.map(|_: Bytes| 0) } else {
-      range(0, names.len()).map(|i: Int|
-        match dump.module_packages.at(i) { Some(k) -> k, None -> 0 })
+      read.map(|m: ModuleRow| match dump.module_packages.at(m.index) { Some(k) -> k, None -> 0 })
     },
     dump.embeds,
     dump.rows,
@@ -2052,66 +2047,6 @@ fn scope_over(
     dump.walked,
     derived: dump.derived,
   )
-}
-
-/// A program's scope kept from one ask of the emitter to the next: the digest of what it was read
-/// from, and the scope itself. A build asks for more than one unit of one program (the unit its
-/// `const` values are evaluated in, then the unit it ships), and the scope is the same value for
-/// each, so all but the first ask take it from here.
-pub type Scoped = { key: Bytes, scope: Result<emit::Scope, Bytes> }
-
-/// What a scope over a program is read from, digested: the front end's identity for the analysis it
-/// published, each module's name and text, each file the program embeds, the packages it resolves
-/// against, and the owners whose facts a scope over `facts_of` reads (`emit.read_in`). The scope is
-/// a function of these, so asks that agree on them share one.
-pub fn scope_key(
-  dump: Dump,
-  sources: List<Bytes>,
-  inputs: Map<Bytes, Bytes>,
-  facts_of: List<RootKey>,
-) -> Bytes / {abort.raise} = {
-  let embedded = inputs.entries().map(|e: { key: Bytes, value: Bytes }|
-    Bytes::concat_all([sized(e.key), sized(e.value)]));
-  let packages = dump.packages.map(|p: PackageDeps|
-    Bytes::concat_all([sized(p.prefix)].concat(p.deps.map(|d: Bytes| sized(d)))));
-  let module_packages = dump.module_packages.map(|k: Int|
-    Bytes::concat_all([ascii_of_int(k), b"\x00"]));
-  let read = emit::read_in(dump.rows, facts_of).keys().map(|n: Bytes| sized(n));
-  blake3(
-    Bytes::concat_all([
-      sized(dump.hashes_digest),
-      Bytes::concat_all(dump.modules.map(|m: ModuleRow| sized(m.name))),
-      Bytes::concat_all(sources.map(|s: Bytes| sized(s))),
-      Bytes::concat_all(embedded),
-      Bytes::concat_all(packages),
-      Bytes::concat_all(module_packages),
-      Bytes::concat_all(read),
-    ]),
-  )
-}
-
-test "a scope's key holds while asks read the same facts, and moves with anything it reads" {
-  let dump = three_modules_dump();
-  let texts = three_modules();
-  let roots = [Named(b"a.f")];
-  let one = scope_key(dump, texts, Map::new(), roots);
-  // Every owner these roots are dealt with holds facts, so both asks read every definition's, and
-  // the scope one of them resolves answers the other's.
-  assert_eq(
-    emit::read_in(dump.rows, roots).keys(),
-    emit::read_in(dump.rows, [Named(b"a.f"), Named(b"b.g")]).keys(),
-  );
-  assert_eq(scope_key(dump, texts, Map::new(), [Named(b"a.f"), Named(b"b.g")]), one);
-  // A root no row holds facts of makes its ask read an owner another ask does not.
-  assert(scope_key(dump, texts, Map::new(), [Named(b"a.absent")]) != one, None);
-  // So does a root filed under a name no definition has, which is why a driver hands the roots its
-  // program offers rather than the ones one ask of it wants: `Stored`, `Written`, `Test` and a
-  // clause's roots each file under a name of their own.
-  assert(scope_key(dump, texts, Map::new(), [Stored(Named(b"a.f"))]) != one, None);
-  // Any module's text, and any file the program embeds, moves it.
-  let edited = texts.set(1, b"pub fn g(x: Int) -> Int = x\n");
-  assert(scope_key(dump, edited, Map::new(), roots) != one, None);
-  assert(scope_key(dump, texts, Map::new().insert(b"h", b"x"), roots) != one, None)
 }
 
 /// What the emitter answers in `scope` for `roots`, each written against `handed` where it calls a
@@ -2358,38 +2293,21 @@ fn groups_whole(
     else { Continue(split.fold(k, |m: Map<RootName, Answer>, n: RootName| m.remove(n))) }
   })
 
-/// Where each module's definitions settle their handings: past every module it imports or reads a
-/// type's functions from (its home), so each callee of a body outside the body's own module is
-/// answered at an earlier place. Imports form no cycle, so the places are found within a step a
-/// module.
-fn places_of(p: Program) -> Map<Bytes, Int> / {abort.raise} = {
-  let names = p.modules.map(|m: ModuleRow| m.name);
-  let texts = p.modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, m: ModuleRow|
-    match text_at(p, m.index) { Some(t) -> acc.insert(m.name, t), None -> acc });
-  let declared = homes_declaring(|h: Bytes| texts.get(h));
-  let deps = names.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: Bytes| {
-    let homes = match texts.get(m) {
-      Some(t) -> read_without_import(m, parsing::start(t).input, || declared),
-      None -> [],
-    };
-    acc.insert(
-      m,
-      (match p.imports.get(m) { Some(xs) -> xs, None -> [] }).concat(homes).filter(|d: Bytes|
-        d != m),
-    )
-  });
-  iterate(Map::new(), names.len() + 2, |at: Map<Bytes, Int>| {
-    let next = names.fold(Map::new(), |acc: Map<Bytes, Int>, m: Bytes|
+/// Where each module the unit reads settles its definitions' handings: past every module it depends
+/// on (`modules_read`), so each callee of a body outside the body's own module is answered at an
+/// earlier place. Imports form no cycle, so the places are found within a step a module.
+fn places_of(p: Program) -> Map<Bytes, Int> / {abort.raise} =
+  iterate(Map::new(), p.read.len() + 2, |at: Map<Bytes, Int>| {
+    let next = p.read.fold(Map::new(), |acc: Map<Bytes, Int>, m: Bytes, deps: List<Bytes>|
       acc.insert(
         m,
-        (match deps.get(m) { Some(ds) -> ds, None -> [] }).fold(0, |n: Int, d: Bytes| {
+        deps.fold(0, |n: Int, d: Bytes| {
           let past = match at.get(d) { Some(l) -> l + 1, None -> 0 };
           if past > n { past } else { n }
         }),
       ));
     if next == at { Stop(next) } else { Continue(next) }
   })
-}
 
 /// The module a root is lowered with: a specialisation that runs a lambda goes with its lender's
 /// module, which its call lowers too.
@@ -2889,18 +2807,15 @@ fn kept_body(ctors: Ctors, p: Program, b: Baked) -> Answer / {abort.raise} = {
 }
 
 /// The unit over `every` root offered: each one's answer taken from what an earlier run kept where it
-/// stands, the emitter asked for the rest, in one scope over the program built when it is first
-/// asked, what it answered kept for the next run, and the unit produced over all of it. `inputs`
-/// holds the bytes of each file `dump` says the program embeds, by digest. `read` reads a record of
-/// the store of answers `answers_store` names, and `keep` keeps a batch of them, each batch as the
-/// emitter answers it. A root the emitter answers nothing for is refused. A root `baked` names is
-/// held as that value in place of its body, which the emitter is not asked for. Each place the unit
-/// walks is told to `phases` as it ends. `scope_held` is the scope an earlier ask of this program
-/// walked under, which this one walks under too, or `None` to resolve the program here. `facts_of`
-/// are the roots whose bodies the scope reads what the check filed of; it is the roots offered where
-/// none is given, so that every root a walk may be asked for is one the scope holds facts of.
-/// `entered` are the roots the runtime enters, each through an entry the unit holds: every root
-/// offered where none is given, as a machine may enter any of them.
+/// stands, the emitter asked for the rest, in one scope over the modules the roots read built when
+/// it is first asked, what it answered kept for the next run, and the unit produced over all of it.
+/// `inputs` holds the bytes of each file `dump` says the program embeds, by digest. `read` reads a
+/// record of the store of answers `answers_store` names, and `keep` keeps a batch of them, each batch
+/// as the emitter answers it. A root the emitter answers nothing for is refused. A root `baked` names
+/// is held as that value in place of its body, which the emitter is not asked for. Each place the
+/// unit walks is told to `phases` as it ends. `entered` are the roots the runtime enters, each
+/// through an entry the unit holds: every root offered where none is given, as a machine may enter
+/// any of them.
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2911,11 +2826,9 @@ pub fn emitted<| e>(
   keep: (List<Record>) -> Unit / e,
   baked: List<Baked> = [],
   phases: Option<{ now: () -> Int / e, told: (PlaceTally) -> Unit / e }> = None,
-  scope_held: Option<Result<emit::Scope, Bytes>> = None,
-  facts_of: Option<List<RootKey>> = None,
   entered: Option<List<RootKey>> = None,
 ) -> Result<Emission, Bytes> / {abort.raise | e} = {
-  let p = program_of(dump, sources);
+  let p = program_of(dump, sources, every);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
   let wanted = every.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
     acc.insert(root_name(k), true));
@@ -2928,7 +2841,6 @@ pub fn emitted<| e>(
     Entered,
   );
   let offered = every.filter(|k: RootKey| !values.contains(root_name(k))).concat(entries);
-  let reading = match facts_of { Some(rs) -> rs, None -> offered };
   let program = program_ctors(dump, ctors);
   let all = walked(
     p,
@@ -2938,9 +2850,9 @@ pub fn emitted<| e>(
     read,
     keep,
     phases,
-    scope_held,
+    None,
     |held: Option<Result<emit::Scope, Bytes>>, roots: List<RootKey>, handed: Map<RootName, Handing>, done: Done| {
-      let scope = match held { Some(s) -> s, None -> scope_over(dump, p, ctors, reading) };
+      let scope = match held { Some(s) -> s, None -> scope_over(dump, p, ctors, offered) };
       let pieces = dealt(p, roots);
       let a = answers_at_once(scope, pieces, 0, pieces.len(), 64, handed, done);
       { held: Some(scope), answers: unpacked(a), found: a.found }
@@ -2978,21 +2890,15 @@ pub fn emitted<| e>(
       p.modules.len(),
       held,
       inputs,
-      |called: Map<Bytes, Bool>|
-        machine_bound(called_externs(called, p.modules, |m: ModuleRow| text_at(p, m.index))),
+      |called: Map<Bytes, Bool>| machine_bound(called_externs(called, p)),
     );
     Ok({
       produced: produced,
       kept: all.kept,
       asked: all.asked,
       unserved: unserved(runtime),
-      unbound: unbound(
-        runtime.natives,
-        called_externs(natives_called(produced.made), p.modules, |m: ModuleRow|
-          text_at(p, m.index)),
-      ),
+      unbound: unbound(runtime.natives, called_externs(natives_called(produced.made), p)),
       misassumed: misassumed_in(all.answers, produced.taken),
-      scope: all.emitter,
     })
   }
 }
@@ -4167,48 +4073,6 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
   })
 }
 
-test "where the head defines `PLY_FAR` a bucket calls what another defines through its table, and its own directly" {
-  let caller = b"m.caller";
-  let callee = bucket_apart(b"m.callee", [caller]);
-  let p = produce(
-    [],
-    [offer(caller, 0), offer(callee, 2)],
-    1,
-    by_def([
-      { key: caller, value: one_body(caller, [callee]) },
-      { key: callee, value: headed(one_body(callee, []), word_head(2)) },
-    ]),
-    Map::new(),
-    no_machine,
-  );
-  let calling = bucket_part(p.text, def_bucket(caller));
-  let shown = Some(String::of_bytes_lossy(calling));
-  let table = far_table(def_bucket(caller));
-  let opened = calling.index_of(
-    Bytes::concat_all([
-      b"#ifdef PLY_FAR\nstatic void *const ",
-      table,
-      b"[] = { (void *)&f_",
-      callee,
-      b", 0 };\n#define f_",
-      callee,
-      b"(...) ((Word (*)(PlyCtx*, Word, Word))",
-      table,
-      b"[0])(__VA_ARGS__)\n#endif\n",
-    ]),
-  );
-  let defined = calling.index_of(Bytes::concat_all([b"Word f_", caller, b"(PlyCtx *ctx)"]));
-  let ended = calling.index_of(
-    Bytes::concat_all([b"#ifdef PLY_FAR\n#undef f_", callee, b"\n#endif\n"]),
-  );
-  match ((opened, defined, ended)) {
-    (Some(o), Some(d), Some(x)) -> assert(o < d && d < x, shown),
-    _ -> assert(false, shown),
-  };
-  assert(calling.index_of(b"#define f_".concat(caller)) == None, shown);
-  assert(bucket_part(p.text, def_bucket(callee)).index_of(b"PLY_FAR") == None, None)
-}
-
 // A call written to another head than its callee's is C two compilers disagree over silently, as
 // a `Word` and an `int64_t` are one type; the unit refuses it instead.
 test "specialisations alike but for their names are one root" {
@@ -4413,8 +4277,30 @@ fn three_modules_dump() -> Dump / {abort.raise} = {
   )
 }
 
+test "a unit reads the modules its roots are written in and what those import, and no other" {
+  let dump = three_modules_dump();
+  let over = |root: Bytes| program_of(dump, three_modules(), [Named(root)]);
+  let read = |root: Bytes| over(root).read.keys().filter(|m: Bytes| m != prelude_module());
+  assert_eq(read(b"c.h"), [b"c"]);
+  assert_eq(read(b"b.g"), [b"b", b"c"]);
+  assert_eq(read(b"a.f"), [b"a", b"b", b"c"]);
+  let p = over(b"b.g");
+  assert_eq(p.digests.keys(), [b"b", b"c"]);
+  // The scope over what `b.g` reads answers it.
+  assert_eq(
+    answers_in(scope_over(dump, p, [], [Named(b"b.g")]), [Named(b"b.g")], Map::new()).map(
+      |r: RootAnswer| match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why },
+    ),
+    [b"b.g"],
+  )
+}
+
 test "roots written for types are dealt apart, however many one module writes" {
-  let p = program_of(three_modules_dump(), three_modules());
+  let p = program_of(
+    three_modules_dump(),
+    three_modules(),
+    offered_roots(three_modules_dump()).keys,
+  );
   let written = range(0, pieces()).map(|i: Int|
     keys::written(keys::Drop, spelled(b"a.T".concat(ascii_of_int(i))), b"a"));
   let lists = dealt(p, written.push(Named(b"a.f")));
@@ -4424,7 +4310,7 @@ test "roots written for types are dealt apart, however many one module writes" {
 
 test "a module's definitions are dealt together, its specialisations by their definitions, each once" {
   let dump = three_modules_dump();
-  let p = program_of(dump, three_modules());
+  let p = program_of(dump, three_modules(), offered_roots(dump).keys);
   let at = |def: Bytes, lent: List<FnArg>| at_key(def, [string_type()], lent);
   let lent = at(b"c.even", [{ param: 0, owner: Named(b"b.g"), nth: 0 }]);
   let missed = offered_roots(dump).keys.concat([at(b"c.h", []), at(b"c.odd", []), lent]);
@@ -4460,13 +4346,14 @@ test "a root's kept answer moves with what its module embeds, and with no other 
         embeds: [{ module: b"c", key: b"file:data.txt", read: Ok([embed_file(b"", bytes)]) }],
       },
       three_modules(),
+      offered_roots(dump).keys,
     );
   let one = root_material(embedding(b"one"), b"", Named(b"c.h"));
   assert(one != None, None);
   assert(one != root_material(embedding(b"two"), b"", Named(b"c.h")), None);
   assert_eq(
     root_material(embedding(b"one"), b"", Named(b"a.f")),
-    root_material(program_of(dump, three_modules()), b"", Named(b"a.f")),
+    root_material(program_of(dump, three_modules(), offered_roots(dump).keys), b"", Named(b"a.f")),
   );
   // A specialisation's moves with its definition's, and with what each lender of a lambda it runs.
   let spec = |p: Program, lender: Bytes|
@@ -4482,12 +4369,10 @@ fn declaring(cases: Bytes) -> Program / {abort.raise} = {
     Bytes::concat_all([b"pub type E = ", cases, b"\n"]),
     b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
   ];
-  program_of(
-    dump_of(
-      analyse(parse_all([{ name: b"s", src: texts.get(0) }, { name: b"g", src: texts.get(1) }])),
-    ),
-    texts,
-  )
+  let dump = dump_of(
+    analyse(parse_all([{ name: b"s", src: texts.get(0) }, { name: b"g", src: texts.get(1) }])),
+  );
+  program_of(dump, texts, offered_roots(dump).keys)
 }
 
 test "a specialisation's kept answer moves with the declaration of a type it is at, not its name alone" {
@@ -4505,7 +4390,7 @@ test "a specialisation's kept answer moves with the declaration of a type it is 
 
 test "a root written from a type is kept under its module's text and the program's types" {
   let dump = three_modules_dump();
-  let p = program_of(dump, three_modules());
+  let p = program_of(dump, three_modules(), offered_roots(dump).keys);
   let types = types_material(dump);
   let reflected = keys::written(keys::Reflect, spelled(b"{x:Int}"), b"a");
   let kept = root_material(p, types, reflected);
@@ -4517,7 +4402,7 @@ test "a root written from a type is kept under its module's text and the program
   assert(
     kept
       != root_material(
-        program_of(dump, three_modules().map(|s: Bytes| s.concat(b"\n"))),
+        program_of(dump, three_modules().map(|s: Bytes| s.concat(b"\n")), offered_roots(dump).keys),
         types,
         reflected,
       ),
@@ -4550,7 +4435,6 @@ test "a call written against a handing its callee does not publish fails the bui
     unserved: [],
     unbound: [],
     misassumed: wrong,
-    scope: None,
   };
   match held(dump, [], Ok(e)) {
     Ok(_) -> assert(false, Some("a unit holding a call against the wrong handing was held")),
@@ -4599,7 +4483,7 @@ test "a body written against a handing that moved is asked for again, with its r
 
 test "a walk answers the roots it deals over lists, place by place, as the emitter answers them in one" {
   let dump = three_modules_dump();
-  let p = program_of(dump, three_modules());
+  let p = program_of(dump, three_modules(), offered_roots(dump).keys);
   let missed = offered_roots(dump).keys;
   let scope = scope_over(dump, p, [], missed);
   let together = answers_of(answers_in(scope, missed, Map::new()));
@@ -5083,7 +4967,7 @@ test "each root a program offers is keyed by the row that says what it is, and p
   // A judge enters a clause and a law's guard and body as the runtime enters a definition, a
   // generic one's at the specialisation it is judged at; a law over a type variable is proved over
   // its sort, never entered.
-  let p = program_of(dump, sources_placed(dump, user.concat([cases])));
+  let p = program_of(dump, sources_placed(dump, user.concat([cases])), offers.keys);
   let mine = offers.keys.filter(|k: RootKey| module_of(k) == b"m");
   assert_eq(
     mine.filter(|k: RootKey| entered_root(p, k)),
@@ -5225,6 +5109,21 @@ test "a generic definition's clause is entered at the specialisation it is judge
       assert(!e.produced.dropped.any(|d: Dropped| judged.contains(d.function)), None)
     },
   }
+}
+
+test "a warm unit asks the emitter for nothing, a generic definition's judged clause among what it reads back" {
+  let user = [{ name: b"m", src: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" }];
+  kept_bodies(|| {
+    assert(unit_in_store(user).asked > 0, None);
+    let warm = unit_in_store(user);
+    assert_eq(warm.asked, 0);
+    assert(
+      warm.produced.taken.contains(
+        root_name(Clause({ def: judged_at(b"m.none", 1), kind: Ensures, n: 0 })),
+      ),
+      None,
+    )
+  })
 }
 
 test "a definition a type states keeps the entry by words the runtime calls it through, and one taking a parameter has none" {
@@ -5578,7 +5477,7 @@ test "a clause over a function its definition answers has no entry, as a functio
     },
   ];
   let dump = dump_of(analyse(parse_all(user)));
-  let p = program_of(dump, sources_placed(dump, user));
+  let p = program_of(dump, sources_placed(dump, user), offered_roots(dump).keys);
   assert(entered_root(p, Named(b"m.adder")), None);
   assert(!entered_root(p, Clause({ def: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
 }
@@ -5909,8 +5808,8 @@ test "a function of a type a module calls with no import is read from its home, 
     },
   ];
   let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows()).out);
-  let p = program_of(dump, sources_placed(dump, user.concat(shipped)));
   let root = Named(b"m.first");
+  let p = program_of(dump, sources_placed(dump, user.concat(shipped)), [root]);
   // Placed past its home, the module is answered with the home's handings.
   let places = places_of(p);
   assert(
@@ -5932,8 +5831,8 @@ test "a law's body over a sort it leaves uninterpreted is lowered as a generic b
     },
   ];
   let dump = dump_of(analyse(parse_all(user)));
-  let p = program_of(dump, sources_placed(dump, user));
   let root = law_key(b"m", b"identity is identity", LawBody);
+  let p = program_of(dump, sources_placed(dump, user), [root]);
   assert_eq(
     answers_in(scope_over(dump, p, [], [root]), [root], Map::new()).map(|r: RootAnswer|
       match r.answer { Body(_) -> root_text(r.name), Refused(no) -> no.why }),
@@ -6366,8 +6265,8 @@ fn walk_in_store(
   user: List<{ name: Bytes, src: Bytes }>,
 ) -> Walk<Counted> / {body_store.get, body_store.put, abort.raise} = {
   let dump = dump_of(analyse_pulling_std_with(user, [], no_rows()).out);
-  let p = program_of(dump, sources_placed(dump, user));
   let offered = offered_roots(dump).keys;
+  let p = program_of(dump, sources_placed(dump, user), offered);
   let ctors = dump.emitter_ctors.map(|c: EmitterCtor| { name: c.name, arity: c.arity });
   walked(
     p,
@@ -6414,7 +6313,7 @@ fn log2(n: Int) -> Int =
   range(0, 63).fold(0, |k: Int, i: Int| if n >> i + 1 > 0 { i + 1 } else { k })
 
 test "a walk's steps grow with the roots it answers, however long the chain of calls that finds them" {
-  let p = program_of(three_modules_dump(), []);
+  let p = program_of(three_modules_dump(), [], []);
   // Root `i` of a chain of roots written for types of module `a`, each calling the next.
   let link = |i: Int| keys::written(keys::Drop, spelled(b"a.T".concat(ascii_of_int(i))), b"a");
   paced(|n: Int| n * (log2(n) + 1), |n: Int| {

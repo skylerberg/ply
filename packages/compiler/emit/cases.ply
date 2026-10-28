@@ -291,12 +291,12 @@ test "every `parallel` block hands the runtime its branches alike, wherever it i
     b"fn nested(xs: List<Int>) -> List<(Int, Int)> = xs.map(|m: Int| parallel { m + 1, m + 2 })\n",
     b"fn open<| e>(g: () -> Int / e) -> (Int, Int) / e = parallel { g(), 1 }\n",
   ]);
-  // `nested`'s lambda runs in the loop of `map` specialised for it, whose row is its lambda's.
+  // `nested`'s lambda runs in the loop its `map` is in `nested` itself.
   let keys = [
     Named(b"m.pure"),
     Named(b"m.reads"),
     Named(b"m.handled"),
-    prelude_loop(b"mapped_from", b"m.nested", 5, [b"Int", b"{_0:Int,_1:Int}"]),
+    Named(b"m.nested"),
     // Generic over its row, `open` is printed only at a row a caller fills it with.
     keys::at_rowed(b"m.open", [], [], [[]]),
   ];
@@ -522,19 +522,24 @@ test "a definition takes and answers a float as itself, and a call says the head
 test "a lambda run in another root reads its parameters and captures at their types, a field where the record's type lays it" {
   let src = Bytes::concat_all([
     b"type Fld = { name: Bytes, n: Int }\n",
-    b"fn mapped(fs: List<Fld>) -> List<Int> = fs.map(|f: Fld| f.n)\n",
-    b"fn folded(fs: List<Fld>) -> Int = fs.fold(0, |acc: Int, f: Fld| acc + f.n)\n",
-    b"fn captured(f: Fld, xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + f.n)\n",
-    b"fn offset(k: Int, xs: List<Int>) -> List<Int> = xs.map(|x: Int| { let j = k - 1; x + j })\n",
+    b"fn each(fs: List<Fld>, g: (Fld) -> Int) -> List<Int> = fs.map(g)\n",
+    b"fn total(fs: List<Fld>, g: (Int, Fld) -> Int) -> Int = fs.fold(0, g)\n",
+    b"fn bumped(xs: List<Int>, g: (Int) -> Int) -> List<Int> = xs.map(g)\n",
+    b"fn mapped(fs: List<Fld>) -> List<Int> = each(fs, |f: Fld| f.n)\n",
+    b"fn folded(fs: List<Fld>) -> Int = total(fs, |acc: Int, f: Fld| acc + f.n)\n",
+    b"fn captured(f: Fld, xs: List<Int>) -> List<Int> = bumped(xs, |x: Int| x + f.n)\n",
+    b"fn offset(k: Int, xs: List<Int>) -> List<Int> = bumped(xs, |x: Int| { let j = k - 1; x + j })\n",
     b"fn stepped(f: Fld) -> Int / {abort.raise} = iterate(f, 9, |t: Fld| if t.n > 3 { Stop(t.n) } else { Continue({ ..t, n: t.n + 1 }) })\n",
   ]);
-  // `map` and `fold` run their lambdas in the loops of `std.prelude` specialised for them, where an
-  // item and a capture arrive as words.
+  // Each walk runs the lambda its caller lent it in its loop, where an item and a capture arrive as
+  // words.
+  let lent = |def: Bytes, owner: Bytes|
+    at_key(def, [], [{ param: 1, owner: Named(owner), nth: 0 }]);
   let loops = [
-    prelude_loop(b"mapped_from", b"m.mapped", 5, [b"m.Fld{n:Int,name:Bytes}", b"Int"]),
-    prelude_loop(b"folded_from", b"m.folded", 5, [b"m.Fld{n:Int,name:Bytes}", b"Int"]),
-    prelude_loop(b"mapped_from", b"m.captured", 5, [b"Int", b"Int"]),
-    prelude_loop(b"mapped_from", b"m.offset", 5, [b"Int", b"Int"]),
+    lent(b"m.each", b"m.mapped"),
+    lent(b"m.total", b"m.folded"),
+    lent(b"m.bumped", b"m.captured"),
+    lent(b"m.bumped", b"m.offset"),
   ];
   let keys = [b"m.mapped", b"m.folded", b"m.captured", b"m.offset", b"m.stepped"].map(Named).concat(
     loops,
@@ -551,8 +556,12 @@ test "a lambda run in another root reads its parameters and captures at their ty
 }
 
 test "a lambda another root lent reads its captures at the types the checker filed for their reads" {
-  let src = b"type Fld = { name: Bytes, n: Int }\nfn captured(f: Fld, xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + f.n)\n";
-  let loop = prelude_loop(b"mapped_from", b"m.captured", 5, [b"Int", b"Int"]);
+  let src = Bytes::concat_all([
+    b"type Fld = { name: Bytes, n: Int }\n",
+    b"fn bumped(xs: List<Int>, g: (Int) -> Int) -> List<Int> = xs.map(g)\n",
+    b"fn captured(f: Fld, xs: List<Int>) -> List<Int> = bumped(xs, |x: Int| x + f.n)\n",
+  ]);
+  let loop = at_key(b"m.bumped", [], [{ param: 1, owner: Named(b"m.captured"), nth: 0 }]);
   let d = dump_of(analyse(parse_all(zip_sources([b"m"], [src]))));
   let w = lowered_roots(
     [b"m"],
@@ -576,7 +585,7 @@ test "a lambda another root lent reads its captures at the types the checker fil
       },
       Unformed(_) -> acc,
     });
-  // `f`, the record the lambda captures, read where `captured` lent the lambda to `map`'s loops.
+  // `f`, the record the lambda captures, read where `captured` lent the lambda to `bumped`'s walk.
   assert(read.len() > 0 && read.all(|t: Type| t != unknown_type()), None)
 }
 
@@ -2769,61 +2778,73 @@ fn answered_body(
 fn calls_a_value(code: Bytes) -> Bool =
   code.index_of(b"->typed)(ctx") != None || code.index_of(b"->uniform(ctx") != None
 
-/// The root of `callee`, a `std.prelude` loop, at the types `args` spell, that runs the lambda
-/// `owner` hands at `param`.
-fn prelude_loop(
-  callee: Bytes,
-  owner: Bytes,
-  param: Int,
-  args: List<Bytes>,
-) -> RootKey / {abort.raise} =
-  keys::at_rowed(
-    qualify(prelude_module(), callee),
-    types_spelled(args).map(keys::KeyType),
-    [{ param: param, owner: Named(owner), nth: 0 }],
-    // The loop's one row variable, which the lambda it runs fills with nothing.
-    [[]],
-  )
-
-test "a list's map, filter and fold are the prelude's functions, whose loops run the lambda in place" {
+test "a list's map, filter and fold over a lambda are a loop in the caller, the prelude's walking a function value" {
   let src = Bytes::concat_all([
     b"fn bumped(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n",
     b"fn kept(xs: List<Int>) -> List<Int> = xs.filter(|x: Int| x > 2)\n",
     b"fn summed(xs: List<Int>) -> Int = xs.fold(0, |s: Int, x: Int| s + x)\n",
     b"effect tick { write tock() -> Unit }\n",
     b"fn handled(xs: List<Int>) -> List<Int> = xs.map(|x: Int| handle { tick.tock(); x } with { tick.tock() resume k -> k(()), return v -> v })\n",
+    b"fn added(s: Int, x: Int) -> Int = s + x\n",
+    b"fn named(xs: List<Int>) -> Int = xs.fold(0, added)\n",
+    b"fn known(xs: List<Int>, k: Int) -> List<Int> = { let f = |x: Int| x + k; xs.map(f) }\n",
+    b"fn by(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(f)\n",
   ]);
-  // Each walks the items of the list's leaves and then its tail in one loop.
-  let loops = [
-    prelude_loop(b"mapped_from", b"m.bumped", 5, [b"Int", b"Int"]),
-    prelude_loop(b"kept_from", b"m.kept", 5, [b"Int"]),
-    prelude_loop(b"folded_from", b"m.summed", 5, [b"Int", b"Int"]),
-  ];
-  // The same loops at those types where no lambda is run in place, as a call handing none settles,
-  // each at a row that holds nothing.
-  let generic = [
-    rowed_at(b"std.prelude.mapped_from", [b"Int", b"Int"]),
-    rowed_at(b"std.prelude.kept_from", [b"Int"]),
-    rowed_at(b"std.prelude.folded_from", [b"Int", b"Int"]),
-  ];
-  let answers = answers_at(
-    [b"m"],
-    [src],
-    [],
-    [b"m.bumped", b"m.kept", b"m.summed", b"m.handled"].map(Named).concat(loops).concat(generic),
-  );
+  // The prelude's walk where no lambda is known, at a row that holds nothing.
+  let generic = rowed_at(b"std.prelude.mapped_from", [b"Int", b"Int"]);
+  let callers = [b"m.bumped", b"m.kept", b"m.summed", b"m.handled", b"m.named", b"m.known"];
+  let answers = answers_at([b"m"], [src], [], callers.push(b"m.by").map(Named).push(generic));
   let call = |name: Bytes|
     answered_body(answers, name).tables.generics.calls.map(|g: GenericCall|
       { callee: g.callee, lent: g.fns.len() });
-  assert_eq(call(b"m.bumped"), [{ callee: Named(b"std.prelude.List::map"), lent: 1 }]);
-  assert_eq(call(b"m.kept"), [{ callee: Named(b"std.prelude.List::filter"), lent: 1 }]);
-  assert_eq(call(b"m.summed"), [{ callee: Named(b"std.prelude.List::fold"), lent: 1 }]);
-  // A lambda holding a `handle` is no root's to run in place.
-  assert_eq(call(b"m.handled"), [{ callee: Named(b"std.prelude.List::map"), lent: 0 }]);
-  // Each loop runs the lambda where the loop handed none calls the value it is handed.
+  let push = [{ callee: Named(b"std.prelude.List::push"), lent: 0 }];
+  assert_eq(callers.map(call), [push, push, [], push, [], push]);
+  assert_eq(call(b"m.by"), [{ callee: Named(b"std.prelude.List::map"), lent: 0 }]);
+  // Each caller runs its lambda in its own loop, where only a clause's resumption calls a value;
+  // the walk handed a function value calls it.
   let calling = |name: Bytes| calls_a_value(own_code(answered_body(answers, name).text));
-  assert_eq(generic.map(printed).map(calling), [true, true, true]);
-  assert_eq(loops.map(printed).map(calling), [false, false, false])
+  assert_eq(callers.map(calling), [false, false, false, true, false, false]);
+  assert(calling(printed(generic)), None)
+}
+
+test "a program's folds, maps and filters over a lambda emit no root of the prelude's walks" {
+  let src = Bytes::concat_all([
+    b"fn summed(xs: List<Int>) -> Int = xs.fold(0, |s: Int, x: Int| s + x)\n",
+    b"fn tallied(m: Map<String, Int>) -> Int = m.fold(0, |t: Int, k: String, v: Int| t + k.len() * v)\n",
+    b"fn kept(xs: List<String>, n: Int) -> List<String> = xs.filter(|s: String| s.len() > n)\n",
+    b"fn nested(xss: List<List<Int>>) -> Int = xss.fold(0, |t: Int, xs: List<Int>| t + xs.map(|x: Int| x * 2).fold(0, |s: Int, x: Int| s + x))\n",
+    b"fn each(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(f)\n",
+    b"fn lent(xs: List<Int>) -> List<Int> = each(xs, |x: Int| x - 1)\n",
+  ]);
+  let out = emit_all_program([{ name: b"m", src: src }], [], true);
+  let why = Bytes::concat_all(
+    out.map(|e: Emitted| match e.why { Some(w) -> w.concat(b"\n"), None -> b"" }),
+  );
+  assert(why.len() == 0, Some(String::of_bytes_lossy(why)));
+  let walks = [
+    b"List::fold",
+    b"List::map",
+    b"List::filter",
+    b"folded_from",
+    b"mapped_from",
+    b"kept_from",
+    b"Map::fold",
+    b"map_folded",
+  ];
+  let walking = |n: Bytes|
+    walks.any(|w: Bytes| {
+      let full = qualify(prelude_module(), w);
+      n == full || n.starts_with(full.concat(b"@"))
+    });
+  // Only `each` calls a walk, handing it the function value it holds and lending it nothing.
+  let calls = out.fold([], |acc: List<GenericCall>, e: Emitted|
+    acc.concat(e.tables.generics.calls));
+  assert_eq(
+    calls.filter(|g: GenericCall| match g.callee { Named(n) -> walking(n), _ -> false }).map(
+      |g: GenericCall| { callee: g.callee, lent: g.fns.len() },
+    ),
+    [{ callee: Named(b"std.prelude.List::map"), lent: 0 }],
+  )
 }
 
 test "a map's value is read by `std.prelude`'s `Map::get` down its tree, its keys compared at their type" {
@@ -3060,12 +3081,12 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
     b"fn held(f: keep (Int) -> Int) -> List<(Int) -> Int> = [f]\n",
     b"fn same<a>(x: a) -> a = x\n",
     b"fn applied(n: Int) -> Int = apply(|x: Int| x + n, 1)\n",
-    b"fn mapped(xs: List<Int>, n: Int) -> List<Int> = xs.map(|x: Int| x + n)\n",
+    b"fn updated(m: Map<Int, Int>, n: Int) -> Map<Int, Int> = m.update(1, |x: Int| x + n)\n",
     b"fn kept(n: Int) -> List<(Int) -> Int> = held(|x: Int| x + n)\n",
     b"fn passed(n: Int) -> (Int) -> Int = same(|x: Int| x + n)\n",
     b"fn bare(n: Int) -> Int = apply(|x: Int| x + 1, n)\n",
   ]);
-  let names = [b"m.applied", b"m.mapped", b"m.kept", b"m.passed", b"m.bare"];
+  let names = [b"m.applied", b"m.updated", b"m.kept", b"m.passed", b"m.bare"];
   let answers = answers_at([b"m"], [src], [], names.map(Named));
   let code = |name: Bytes| own_code(answered_body(answers, name).text);
   let has = |text: Bytes| names.map(|n: Bytes| code(n).index_of(text) != None);
@@ -3152,11 +3173,12 @@ test "a lambda that captures nothing is one value made once, wherever it goes" {
 }
 
 test "a lambda inside a lambda another root runs is lent as its owner's" {
-  let src = b"fn nested(xss: List<List<Int>>) -> List<List<Int>> = xss.map(|xs: List<Int>| xs.map(|x: Int| x + 1))\n";
-  let ints = TyCon({ name: b"List", args: [int_type()] });
-  let outer = at_key(b"std.prelude.mapped_from", [ints, ints], [
-    { param: 5, owner: Named(b"m.nested"), nth: 0 },
+  let src = Bytes::concat_all([
+    b"fn rows(xss: List<List<Int>>, g: (List<Int>) -> List<Int>) -> List<List<Int>> = xss.map(g)\n",
+    b"fn row(xs: List<Int>, g: (Int) -> Int) -> List<Int> = xs.map(g)\n",
+    b"fn nested(xss: List<List<Int>>) -> List<List<Int>> = rows(xss, |xs: List<Int>| row(xs, |x: Int| x + 1))\n",
   ]);
+  let outer = at_key(b"m.rows", [], [{ param: 1, owner: Named(b"m.nested"), nth: 0 }]);
   let answers = answers_at([b"m"], [src], [], [Named(b"m.nested"), outer]);
   let body = match answers.fold(None, |acc: Option<RootAnswer>, a: RootAnswer|
       if a.name == root_name(outer) { Some(a) } else { acc }) {
@@ -4525,19 +4547,17 @@ test "a buffer read out of a record this body holds alone reaches its append uns
     b"fn widened(n: Int) -> Bytes / {abort.raise} = iterate({ out: b\"\", n: n, a: 0, b: 0 }, n + 1, |s: W| if s.n <= 0 { Stop(s.out) } else { Continue({ out: s.out ++ b\"x\", n: s.n - 1, a: s.a, b: s.b }) })\n",
     b"fn guarded(t: T, k: Int) -> Bytes = match t { T(out, n) if n > k -> out ++ b\"y\", T(out, _) -> out }\n",
   ]);
-  // `fold` runs each lambda in the loop of `std.prelude` the unit settles its call on.
   let keyed = [
     b"m.pattern",
     b"m.ctor",
     b"m.update",
     b"m.fields",
     b"m.iterated",
+    b"m.folded",
     b"m.widened",
     b"m.guarded",
   ].map(
     Named,
-  ).push(
-    prelude_loop(b"folded_from", b"m.folded", 5, [b"Int", b"{n:Int,out:Bytes}"]),
   );
   let names = keyed.map(printed);
   let answers = answers_at([b"m"], [src], [b"Stop", b"Continue", b"m.T"], keyed);

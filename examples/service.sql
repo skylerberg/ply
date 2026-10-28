@@ -39,7 +39,7 @@ create table "orders" (
   -- a check-then-act between two requests; a sequence is not.
   "id" bigint not null default nextval('orders_id_seq'),
   "customer" text not null,
-  -- `lines` is a `List<Line>` and `state` is a sum, and `derive row` flattens
+  -- `lines` is a `List<Line>` and `state` is a sum, and `derive sql` flattens
   -- neither: both are `jsonb` columns written through the json codec this
   -- service already derived for its wire format. `std.db` has no opinion about
   -- normalization — a service that wanted `order_lines` as a table of its own

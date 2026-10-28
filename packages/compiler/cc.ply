@@ -363,48 +363,24 @@ pub fn objects_kept<[c]>(
   }
 }
 
-/// Why a library was not built: what refused it; that its code is wider than a direct call reaches
-/// on the machine it is for, which only a linker that lays out veneers links right; or that tcc wrote
-/// exports in which a loader does not find the library's descriptor where it lies.
-pub type Unbuilt = | BuildFailed(String) | TooWide | Unexported
-
-/// What a person is told of why a library was not built.
-pub fn why_unbuilt(u: Unbuilt) -> String =
-  match u {
-    BuildFailed(why) -> why,
-    TooWide -> "the library's code is wider than a direct call reaches",
-    Unexported -> "the library's exports do not name its descriptor where it lies",
-  }
-
 /// The library `objects` link into, kept in the cache by what decides it, so a unit linked once opens
-/// from the cache: its path. Where the linker is tcc, which lays out no `veneers`, a library a direct
-/// call cannot span is refused, and so is one whose exports do not name its descriptor; the cache
-/// keeps each refusal.
+/// from the cache: its path, or why it was not linked.
 pub fn shared<[c]>(
   t: Toolchain,
   objects: List<String>,
   work: String,
-  veneers: Bool = true,
-) -> Result<String, Unbuilt> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
   let library = library_of(t, objects);
-  if toolchain.holds(library) { Ok(cache ++ "/" ++ library) }
-  else if !veneers && toolchain.holds(too_wide(library)) { Err(TooWide) }
-  else if !veneers && toolchain.holds(unexported(library)) { Err(Unexported) } else {
+  if toolchain.holds(library) { Ok(cache ++ "/" ++ library) } else {
     let made = work ++ "/unit.so";
     match ran[c]([t.support.concat(["-shared", "-o", cache ++ "/" ++ made].concat(objects))]) {
-      Err(why) -> Err(BuildFailed(why)),
+      Err(why) -> Err(why),
       Ok(_) -> match toolchain.held(made) {
-        None -> Err(BuildFailed("the C compiler linked no library")),
-        Some(linked) -> if !veneers && !spanned(linked) {
-          let _ = toolchain.written(too_wide(library), b"");
-          Err(TooWide)
-        } else if !veneers && !exports_descriptor(linked) {
-          let _ = toolchain.written(unexported(library), b"");
-          Err(Unexported)
-        } else if toolchain.written(made, stack_marked(linked)) && toolchain.moved(made, library) {
-          Ok(cache ++ "/" ++ library)
-        } else { Err(BuildFailed("the library could not be kept in the toolchain's cache")) },
+        None -> Err("the C compiler linked no library"),
+        Some(linked) -> if toolchain.written(made, stack_marked(linked))
+            && toolchain.moved(made, library) { Ok(cache ++ "/" ++ library) }
+        else { Err("the library could not be kept in the toolchain's cache") },
       },
     }
   }
@@ -413,207 +389,6 @@ pub fn shared<[c]>(
 /// Where the cache keeps the library `objects`, by their paths in it, link into.
 fn library_of(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
   key_of(t, ["-shared", "stack-marked"], objects.map(Bytes::of_string)) ++ ".so"
-
-/// Where the cache keeps word that `library` is too wide to link without veneers.
-fn too_wide(library: String) -> String = library ++ ".wide"
-
-/// Where the cache keeps word that tcc's exports of `library` do not name its descriptor.
-fn unexported(library: String) -> String = library ++ ".unexported"
-
-/// Whether a loader finds `library`'s descriptor where it lies: for a 64-bit little-endian Mach-O
-/// library, `_ply_descriptor` read from its exports trie as dyld reads it, at the address its symbol
-/// table gives; any other library as it is linked. tcc's Mach-O writer garbles the trie of a library
-/// of many symbols, and dyld then answers a lookup with an address no symbol has.
-pub fn exports_descriptor(library: Bytes) -> Bool / {abort.raise} =
-  if library.len() < 32 || !library.starts_with(b"\xCF\xFA\xED\xFE") { true } else {
-    let name = b"_ply_descriptor";
-    let found = range(0, le(library, 16, 4)).fold(
-      { at: 32, trie: None, symbol: None },
-      |s: { at: Int, trie: Option<Int>, symbol: Option<Int> }, _i: Int|
-        if s.at + 8 > library.len() { s } else {
-          let cmd = le(library, s.at, 4);
-          let next = { ..s, at: s.at + le(library, s.at + 4, 4) };
-          // `LC_DYLD_EXPORTS_TRIE`, and `LC_DYLD_INFO`'s export range.
-          if cmd == 0x80000033 && s.at + 16 <= library.len() {
-            {
-              ..next,
-              trie: trie_found(library, le(library, s.at + 8, 4), le(library, s.at + 12, 4), name),
-            }
-          } else if (cmd == 0x22 || cmd == 0x80000022) && s.at + 48 <= library.len() {
-            {
-              ..next,
-              trie: trie_found(library, le(library, s.at + 40, 4), le(library, s.at + 44, 4), name),
-            }
-          } else if cmd == 0x2 && s.at + 24 <= library.len() {
-            { ..next, symbol: symbol_value(library, s.at, name) }
-          } else { next }
-        },
-    );
-    found.trie != None && found.trie == found.symbol
-  }
-
-/// The address the exports trie of `size` bytes at `from` in `library` gives `name`, read as dyld
-/// reads it: down the edges `name` begins with, to a node that exports it at an address; `None` where
-/// no edge leads there or the trie does not read.
-fn trie_found(library: Bytes, from: Int, size: Int, name: Bytes) -> Option<Int> / {abort.raise} =
-  if from + size > library.len() { None } else {
-    let trie = library.slice(from, from + size);
-    // Each step follows an edge of at least one byte, so `name` runs out within as many steps.
-    range(0, name.len() + 1).fold(
-      { node: 0, rest: name, found: None, done: false },
-      |w: Walk, _k: Int| if w.done { w } else { walked_from(trie, w) },
-    ).found
-  }
-
-/// A walk down an exports trie: the node it is at, what of the name is left to match, and the address
-/// once found.
-type Walk = { node: Int, rest: Bytes, found: Option<Int>, done: Bool }
-
-/// `w` one node further: the address where nothing is left to match and the node exports one, else
-/// at the child whose edge begins what is left; done where neither is.
-fn walked_from(trie: Bytes, w: Walk) -> Walk / {abort.raise} = {
-  let stop = { ..w, done: true };
-  match uleb(trie, w.node) {
-    None -> stop,
-    Some(info) -> if w.rest.len() == 0 {
-      if info.value == 0 { stop } else {
-        match uleb(trie, info.next) {
-          // Only a regular export, at an address, is the descriptor.
-          Some(flags) -> if flags.value != 0 { stop } else {
-            match uleb(trie, flags.next) {
-              Some(a) -> { ..stop, found: Some(a.value) },
-              None -> stop,
-            }
-          },
-          None -> stop,
-        }
-      }
-    } else {
-      let kids = info.next + info.value;
-      if kids >= trie.len() { stop } else {
-        range(0, trie.at(kids)).fold(
-          { at: kids + 1, next: stop },
-          |c: { at: Int, next: Walk }, _j: Int|
-            match trie.slice(c.at, trie.len()).index_of(b"\x00") {
-              None -> { ..c, at: trie.len() },
-              Some(end) -> {
-                let edge = trie.slice(c.at, c.at + end);
-                match uleb(trie, c.at + end + 1) {
-                  None -> { ..c, at: trie.len() },
-                  Some(child) ->
-                    {
-                      at: child.next,
-                      next: if edge.len() > 0 && c.next.done && w.rest.starts_with(edge) {
-                        {
-                          node: child.value,
-                          rest: w.rest.slice(edge.len(), w.rest.len()),
-                          found: None,
-                          done: false,
-                        }
-                      } else { c.next },
-                    },
-                }
-              },
-            },
-        ).next
-      }
-    },
-  }
-}
-
-/// The unsigned LEB128 number at `at` in `b`, and where it ends; `None` past `b`'s end or ten bytes.
-fn uleb(b: Bytes, at: Int) -> Option<{ value: Int, next: Int }> / {abort.raise} =
-  range(0, 10).fold({ value: 0, shift: 0, at: at, ended: None }, |u: Uleb, _k: Int|
-    if u.ended != None || u.at >= b.len() { u } else {
-      let byte = b.at(u.at);
-      let value = u.value | (byte & 0x7F) << u.shift;
-      if byte < 128 {
-        { ..u, value: value, at: u.at + 1, ended: Some({ value: value, next: u.at + 1 }) }
-      } else { { value: value, shift: u.shift + 7, at: u.at + 1, ended: None } }
-    }).ended
-
-type Uleb = { value: Int, shift: Int, at: Int, ended: Option<{ value: Int, next: Int }> }
-
-/// The value the symbol table of the `LC_SYMTAB` command at `at` in `library` gives the external
-/// symbol `name` a section defines, where it has one.
-fn symbol_value(library: Bytes, at: Int, name: Bytes) -> Option<Int> / {abort.raise} = {
-  let symbols = le(library, at + 8, 4);
-  let count = le(library, at + 12, 4);
-  let strings = le(library, at + 16, 4);
-  let size = le(library, at + 20, 4);
-  let wanted = name.concat(b"\x00");
-  if symbols + 16 * count > library.len() || strings + size > library.len() { None } else {
-    range(0, count).fold(None, |acc: Option<Int>, i: Int|
-      if acc != None { acc } else {
-        let e = symbols + 16 * i;
-        let from = strings + le(library, e, 4);
-        // `N_SECT` and `N_EXT`.
-        if library.at(e + 4) & 0x0F != 0x0F || from + wanted.len() > strings + size { None }
-        else if library.slice(from, from + wanted.len()) == wanted { Some(le(library, e + 8, 8)) }
-        else { None }
-      })
-  }
-}
-
-/// How far a direct call reaches on arm64, either way.
-fn branch_reach() -> Int = 134217728
-
-/// The addresses a segment of a library's code is mapped at, `to` past its end.
-type Mapped = { from: Int, to: Int }
-
-/// Where each executable segment of `library` is mapped, where it is a 64-bit little-endian Mach-O
-/// library for arm64.
-fn macho_code(library: Bytes) -> List<Mapped> / {abort.raise} =
-  if library.len() < 32 || !library.starts_with(b"\xCF\xFA\xED\xFE")
-      || le(library, 4, 4) != 0x0100000C { [] } else {
-    range(0, le(library, 16, 4)).fold(
-      { at: 32, code: [] },
-      |s: { at: Int, code: List<Mapped> }, _i: Int|
-        if s.at + 8 > library.len() { s } else {
-          let next = s.at + le(library, s.at + 4, 4);
-          // `LC_SEGMENT_64`, mapped executable.
-          if le(library, s.at, 4) != 0x19 || s.at + 72 > library.len()
-              || le(library, s.at + 60, 4) / 4 % 2 == 0 { { ..s, at: next } } else {
-            let from = le(library, s.at + 24, 8);
-            { at: next, code: s.code.push({ from: from, to: from + le(library, s.at + 32, 8) }) }
-          }
-        },
-    ).code
-  }
-
-/// Where each executable segment of `library` is mapped, where it is a 64-bit little-endian ELF
-/// library for arm64.
-fn elf_code(library: Bytes) -> List<Mapped> / {abort.raise} =
-  if library.len() < 64 || !library.starts_with(b"\x7FELF\x02\x01") || le(library, 18, 2) != 183 {
-    []
-  } else {
-    let at = le(library, 32, 8);
-    let each = le(library, 54, 2);
-    let count = le(library, 56, 2);
-    if each < 56 || at + count * each > library.len() { [] } else {
-      range(0, count).fold([], |code: List<Mapped>, i: Int| {
-        let h = at + i * each;
-        // `PT_LOAD`, mapped executable.
-        if le(library, h, 4) != 1 || le(library, h + 4, 4) % 2 == 0 { code } else {
-          let from = le(library, h + 16, 8);
-          code.push({ from: from, to: from + le(library, h + 40, 8) })
-        }
-      })
-    }
-  }
-
-/// Whether a direct call reaches from any of `library`'s code to any other: 128 MB either way on
-/// arm64, and further on any other machine a unit is built for.
-pub fn spanned(library: Bytes) -> Bool / {abort.raise} = {
-  let code = macho_code(library).concat(elf_code(library));
-  match code.at(0) {
-    None -> true,
-    Some(first) ->
-      code.fold(first.to, |hi: Int, m: Mapped| if m.to > hi { m.to } else { hi })
-        - code.fold(first.from, |lo: Int, m: Mapped| if m.from < lo { m.from } else { lo })
-        <= branch_reach(),
-  }
-}
 
 /// The integer `count` bytes of `b` from `from` hold, least significant first.
 fn le(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
@@ -665,18 +440,35 @@ pub fn stack_marked(library: Bytes) -> Bytes / {abort.raise} = {
 /// The flags every object of a library a program loads compiles with.
 pub fn library_flags() -> List<String> = ["-fPIC", "-fno-strict-aliasing"]
 
+/// Where the cache keeps the probe [`targets_x86_64_linux`] preprocesses.
+fn probe_path() -> String = "probe/x86_64_linux.c"
+
+/// Whether the compiler labelled `c` compiles for x86-64 Linux: whether it preprocesses a probe that
+/// stops for any other target. `false` where it is not installed.
+pub fn targets_x86_64_linux<[c]>() -> Bool / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let kept = toolchain.holds(probe_path())
+    || toolchain.written(
+      probe_path(),
+      b"#if !defined(__x86_64__) || !defined(__linux__)\n#error\n#endif\n",
+    );
+  if !kept { false } else {
+    match ran[c]([["-E", toolchain.cache() ++ "/" ++ probe_path()]]) {
+      Ok(_) -> true,
+      Err(_) -> false,
+    }
+  }
+}
+
 /// `text`, a unit's C, compiled by the compiler labelled `c` at `level`, checked or not, with `flags`
-/// and linked into a library the cache keeps: its path, or why it was not built. `veneers` is
-/// [`shared`]'s.
+/// and linked into a library the cache keeps: its path, or why it was not built.
 pub fn library<[c]>(
   level: String,
   checked: Bool,
   flags: List<String>,
   text: Bytes,
-  veneers: Bool = true,
-) -> Result<String, Unbuilt> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
   match compilers.found[c]() {
-    None -> Err(BuildFailed("no C compiler is installed to compile the unit with")),
+    None -> Err("no C compiler is installed to compile the unit with"),
     Some(compiler) -> {
       let t = toolchain_of(compiler, level, checked);
       let parts = split(text);
@@ -688,11 +480,11 @@ pub fn library<[c]>(
       // A unit built before is a library the cache holds, which needs no room to build in.
       if toolchain.holds(made) { Ok(cache ++ "/" ++ made) } else {
         match toolchain.scratch() {
-          None -> Err(BuildFailed("the toolchain's cache has no room to compile in")),
+          None -> Err("the toolchain's cache has no room to compile in"),
           Some(work) -> {
             let built = match objects[c](t, parts, flags, work) {
-              Err(why) -> Err(BuildFailed(why)),
-              Ok(objects) -> shared[c](t, objects, work, veneers),
+              Err(why) -> Err(why),
+              Ok(objects) -> shared[c](t, objects, work),
             };
             toolchain.cleared(work);
             built
@@ -998,6 +790,49 @@ test "a compile runs every part, and fails once with what the compiler said of e
   assert_eq(ran_over(runs, |_: String| None).answer, Ok(()))
 }
 
+/// What `targets_x86_64_linux` answers where the probe is kept as `kept` says, the compiler starts as
+/// `start` says and says `said` of its run; and each run it was started with.
+fn probed(
+  kept: Bool,
+  start: Result<Int, String>,
+  said: Option<Bytes>,
+) -> { fits: Bool, runs: List<List<String>> } / {abort.raise} =
+  handle {
+    targets_x86_64_linux[cc]()
+  } with {
+    var runs: List<List<String>> = [],
+    compilers.started[cc](args) -> {
+      runs = runs.push(args);
+      start
+    },
+    compilers.finished[cc](job) -> said,
+    toolchain.cache() -> "/cache",
+    toolchain.jobs() -> 1,
+    toolchain.holds(path) -> false,
+    toolchain.written(path, bytes) -> kept,
+    toolchain.reused() -> panic("a probe reads no store"),
+    toolchain.bodies() -> panic("a probe reads no store"),
+    toolchain.held(path) -> panic("a probe reads nothing back"),
+    toolchain.libraries() -> panic("a probe links nothing"),
+    toolchain.moved(from, to) -> panic("a probe moves nothing"),
+    toolchain.appended(path, bytes) -> panic("a probe appends nothing"),
+    toolchain.scratch() -> panic("a probe needs no room"),
+    toolchain.cleared(dir) -> panic("a probe clears nothing"),
+    toolchain.ran(path, args) -> panic("a probe runs no program"),
+    return fits -> { fits: fits, runs: runs },
+  }
+
+test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and not where it stops, is missing or has no probe" {
+  let fits = probed(true, Ok(0), None);
+  assert(fits.fits, None);
+  assert_eq(fits.runs, [["-E", "/cache/probe/x86_64_linux.c"]]);
+  assert(!probed(true, Ok(0), Some(b"x86_64_linux.c:2: error: #error")).fits, None);
+  assert(!probed(true, Err("no `tcc` is installed"), None).fits, None);
+  let unkept = probed(false, Ok(0), None);
+  assert(!unkept.fits, None);
+  assert_eq(unkept.runs, [])
+}
+
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"\x7FELF\x02\x01",
@@ -1032,114 +867,4 @@ test "what is not a 64-bit little-endian ELF file is left as it is" {
   );
   let big_endian = b"\x7FELF\x02\x02".concat(b"\x00".repeat(120));
   assert_eq(stack_marked(big_endian), big_endian)
-}
-
-fn macho_of(cpu: Int, segments: List<Bytes>) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    [
-      b"\xCF\xFA\xED\xFE",
-      le_of(cpu, 4),
-      b"\x00".repeat(8),
-      le_of(segments.len(), 4),
-      b"\x00".repeat(12),
-    ].concat(
-      segments,
-    ),
-  )
-
-/// A Mach-O segment mapped `size` bytes from `at`, with `prot` as its initial protection.
-fn segment(prot: Int, at: Int, size: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    le_of(0x19, 4),
-    le_of(72, 4),
-    b"\x00".repeat(16),
-    le_of(at, 8),
-    le_of(size, 8),
-    b"\x00".repeat(20),
-    le_of(prot, 4),
-    b"\x00".repeat(8),
-  ])
-
-/// An ELF program header loading `size` bytes at `at`, with `flags`.
-fn loaded(flags: Int, at: Int, size: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    le_of(1, 4),
-    le_of(flags, 4),
-    b"\x00".repeat(8),
-    le_of(at, 8),
-    b"\x00".repeat(16),
-    le_of(size, 8),
-    b"\x00".repeat(8),
-  ])
-
-/// An `LC_SYMTAB` command: `count` symbols at `symbols`, their names' `size` bytes at `strings`.
-fn symtab(symbols: Int, count: Int, strings: Int, size: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    le_of(0x2, 4),
-    le_of(24, 4),
-    le_of(symbols, 4),
-    le_of(count, 4),
-    le_of(strings, 4),
-    le_of(size, 4),
-  ])
-
-/// An arm64 Mach-O library whose symbol table puts `_ply_descriptor` at `at` and whose exports trie
-/// is `trie`.
-fn exporting(at: Int, trie: Bytes) -> Bytes / {abort.raise} = {
-  let head = 32 + 24 + 16;
-  let names = b"\x00_ply_descriptor\x00";
-  let symbol = Bytes::concat_all([le_of(1, 4), b"\x0F\x01", le_of(0, 2), le_of(at, 8)]);
-  let commands = [
-    symtab(head, 1, head + 16, names.len()),
-    Bytes::concat_all([
-      le_of(0x80000033, 4),
-      le_of(16, 4),
-      le_of(head + 16 + names.len(), 4),
-      le_of(trie.len(), 4),
-    ]),
-  ];
-  Bytes::concat_all([macho_of(0x0100000C, commands), symbol, names, trie])
-}
-
-/// An exports trie of `name` alone at `at`, below 128: the root's one edge to a node exporting it.
-fn trie_of(name: Bytes, at: Int) -> Bytes / {abort.raise} = {
-  let root = Bytes::concat_all([b"\x00\x01", name, b"\x00"]);
-  Bytes::concat_all([root, byte_of_int(root.len() + 1), b"\x02\x00", byte_of_int(at), b"\x00"])
-}
-
-test "a Mach-O library is handed to the loader only where its exports name its descriptor where its symbols put it" {
-  assert(exports_descriptor(exporting(72, trie_of(b"_ply_descriptor", 72))), None);
-  // Down two edges, past a sibling that shares their prefix.
-  let shared = Bytes::concat_all([
-    b"\x00\x01_ply_\x00\x09",
-    b"\x00\x02exports\x00\x20descriptor\x00\x24",
-    b"\x02\x00\x10\x00",
-    b"\x02\x00\x48\x00",
-  ]);
-  assert(exports_descriptor(exporting(72, shared)), None);
-  // A trie that names it elsewhere, names something else or does not read, as tcc's can.
-  assert(!exports_descriptor(exporting(72, trie_of(b"_ply_descriptor", 80))), None);
-  assert(!exports_descriptor(exporting(72, trie_of(b"_ply_other", 72))), None);
-  assert(!exports_descriptor(exporting(72, b"\x00\x05\xFF\xFF")), None);
-  assert(!exports_descriptor(exporting(72, b"")), None);
-  // What is no Mach-O library is taken as linked.
-  assert(exports_descriptor(b""), None);
-  assert(exports_descriptor(elf_of(183, b"", 0)), None)
-}
-
-test "an arm64 Mach-O library is spanned while its code is within a direct call's reach" {
-  let arm64 = 0x0100000C;
-  let data = segment(3, branch_reach(), 3 * branch_reach());
-  assert(spanned(macho_of(arm64, [segment(5, 0, branch_reach()), data])));
-  assert(!spanned(macho_of(arm64, [segment(5, 0, branch_reach() + 1), data])));
-  assert(!spanned(macho_of(arm64, [segment(5, 0, 64), data, segment(5, branch_reach(), 64)])));
-  assert(spanned(macho_of(0x01000007, [segment(5, 0, 2 * branch_reach())])));
-  assert(spanned(macho_of(arm64, [segment(5, 0, 2 * branch_reach())]).slice(0, 80)))
-}
-
-test "an arm64 ELF library is spanned while its code is within a direct call's reach" {
-  let code = |size: Int| loaded(5, 0, size).concat(loaded(6, branch_reach(), 3 * branch_reach()));
-  assert(spanned(elf_of(183, code(branch_reach()), 2)));
-  assert(!spanned(elf_of(183, code(branch_reach() + 1), 2)));
-  assert(spanned(elf_of(62, code(2 * branch_reach()), 2)))
 }

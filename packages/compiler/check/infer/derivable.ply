@@ -9,9 +9,9 @@ import compiler.check.types (Type, TyVar, TyCon, TyRecord, TyFn, Field, ints_ins
                              arg_row)
 import compiler.check.resolve.tables (Diag, Label, qualify, default_binder, error_at, label_at)
 import compiler.expand.rewrite (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
-import compiler.expand.derive (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat, Unconstrained,
-                               NullInsideOption, HoldsSecret, HoldsNative, refusal_note,
-                               secret_reason, float_reason, null_in_option_note, same_deriver)
+import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat,
+                                          Unconstrained, HoldsSecret, HoldsNative, refusal_note,
+                                          secret_reason, float_reason)
 import std.bytes
 import std.option
 import std.string
@@ -80,7 +80,6 @@ fn why_notes_for_map_key(
           b"` names a location rather than a value, so two of them have no order",
         ]),
       ],
-    NullInsideOption -> [],
     HoldsSecret -> secret_notes(DOrd),
     HoldsNative -> native_notes(blocker, DOrd),
     Unconstrained(v) ->
@@ -119,11 +118,6 @@ fn why_notes_for_constraint(
         ]),
       ],
     HoldsFloat -> [float_reason(deriver), b"use `Decimal` for exact numbers"],
-    NullInsideOption ->
-      [
-        Bytes::concat_all([b"`", blocker, b"` writes `None` and its payload alike"]),
-        null_in_option_note(),
-      ],
     HoldsSecret -> secret_notes(deriver),
     HoldsNative -> native_notes(blocker, deriver),
     Unconstrained(v) ->
@@ -275,7 +269,7 @@ type Holding = { name: Bytes, params: List<Int>, fields: List<Type> }
 type StatedVar = { deriver: Deriver, var: Int }
 
 fn push_stated(xs: List<StatedVar>, deriver: Deriver, v: Int) -> List<StatedVar> =
-  if xs.any(|x: StatedVar| x.var == v && same_deriver(x.deriver, deriver)) { xs }
+  if xs.any(|x: StatedVar| x.var == v && x.deriver == deriver) { xs }
   else { xs.push({ deriver: deriver, var: v }) }
 
 /// The constraints the types mentioned in `t` state of the variables their arguments hold.
@@ -330,8 +324,7 @@ fn stated_carrying(
         let added = all.fold(had, |cs: List<DefConstraint>, x: StatedVar|
           match h.params.find_index(|p: Int| p == x.var) {
             None -> cs,
-            Some(i) -> if cs.any(|c: DefConstraint|
-                c.param == i && same_deriver(c.deriver, x.deriver)) { cs }
+            Some(i) -> if cs.any(|c: DefConstraint| c.param == i && c.deriver == x.deriver) { cs }
             else { insert_constraint(cs, { deriver: x.deriver, param: i }) },
           });
         if added.len() == had.len() { acc }
@@ -553,11 +546,11 @@ fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option
   match ty {
     TyCon(k) -> if k.args.len() != 0 { None }
     else if is_int_name(k.name) { Some(ConcreteWitness(k.name)) }
-    else if same_deriver(site.deriver, DNumeric) && (k.name == b"Float" || k.name == b"Decimal") {
+    else if site.deriver == DNumeric && (k.name == b"Float" || k.name == b"Decimal") {
       Some(ConcreteWitness(k.name))
     }
     // `numeric(a)` holds the ordered comparisons, which a type takes from its `key`.
-    else if same_deriver(site.deriver, DNumeric) {
+    else if site.deriver == DNumeric {
       match numeric_of(checker.numeric_types, k.name) {
         Some(x) -> match instance_of(checker.instances, k.name, NKey) {
           Some(_) -> Some(StatedWitness(x.ctor)),
@@ -664,11 +657,11 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
             Bytes::concat_all([
               b"`",
               type_text(ty),
-              if same_deriver(site.deriver, DInteger) { b"` is not an integer type" }
+              if site.deriver == DInteger { b"` is not an integer type" }
               else { b"` is not a numeric type" },
             ]),
             Bytes::concat_all([b"`", callee, b"` requires `", dv, b"(\xc2\xb7)` here"]),
-            if same_deriver(site.deriver, DInteger) {
+            if site.deriver == DInteger {
               [b"the integer types are `Int` and the eight fixed-width integers"]
             } else {
               [
@@ -716,8 +709,7 @@ pub fn instance_of(
 
 /// Whether a type that states a `key` is read through it for `deriver`: compared, ordered and hashed
 /// as what its key answers is, whatever it holds.
-fn through_key(deriver: Deriver) -> Bool =
-  same_deriver(deriver, DEq) || same_deriver(deriver, DOrd) || same_deriver(deriver, DHash)
+fn through_key(deriver: Deriver) -> Bool = deriver == DEq || deriver == DOrd || deriver == DHash
 
 /// Each type's first statement of one kind, by the type's name.
 fn stated_by_type(instances: List<InstanceInfo>, kind: InstanceKind) -> Map<Bytes, InstanceInfo> =
@@ -730,7 +722,7 @@ fn stated_by_type(instances: List<InstanceInfo>, kind: InstanceKind) -> Map<Byte
 pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
   if instances.len() == 0 { adts } else {
     let keyed = through_key(deriver);
-    if !keyed && !same_deriver(deriver, DShow) { adts } else {
+    if !keyed && !(deriver == DShow) { adts } else {
       let stated = stated_by_type(instances, if keyed { NKey } else { NShow });
       adts.fold(adts, |acc: Shapes, name: Bytes, shape: AlgebraicShape|
         match stated.get(name) {
@@ -758,7 +750,7 @@ pub fn deriver_shapes(instances: List<InstanceInfo>, adts: Shapes) -> DeriverSha
 
 pub fn shapes_for(shapes: DeriverShapes, deriver: Deriver) -> Shapes =
   if through_key(deriver) { shapes.keyed }
-  else if same_deriver(deriver, DShow) { shapes.shown }
+  else if deriver == DShow { shapes.shown }
   else { shapes.plain }
 
 pub type OwnParams = { params: List<Int>, rows: List<Int> }
