@@ -903,6 +903,75 @@ test "a step iterate runs is a loop over its state and budget, each pass going o
   }
 }
 
+/// Walks of the prelude's fold, map and filter, each over a lambda written here, a definition named
+/// as a value or a lambda a slot is known to hold.
+fn walks() -> Bytes =
+  Bytes::concat_all([
+    b"fn summed(xs: List<Int>) -> Int = xs.fold(0, |s: Int, x: Int| s + x)\n",
+    b"fn bumped(xs: List<Int>, k: Int) -> List<Int> = xs.map(|x: Int| x + k)\n",
+    b"fn kept(xs: List<String>) -> List<String> = xs.filter(|s: String| s.len() > 2)\n",
+    b"fn added(s: Int, x: Int) -> Int = s + x\n",
+    b"fn named(xs: List<Int>) -> Int = xs.fold(0, added)\n",
+    b"fn known(xs: List<Int>, k: Int) -> List<Int> = { let f = |x: Int| x * k; xs.map(f) }\n",
+    b"fn tallied(m: Map<Int, Int>) -> Int = m.fold(0, |s: Int, k: Int, v: Int| s + k * v)\n",
+  ])
+
+/// How many values each loop of `b` holds across its passes, its branches', cases' and arms' too.
+fn loops_in(b: Block) -> List<Int> =
+  b.fold([], |acc: List<Int>, i: Inst|
+    match i {
+      Loop(l) -> acc.push(l.state.len()).concat(loops_in(l.body)),
+      If(x) -> acc.concat(loops_in(x.then)).concat(loops_in(x.otherwise)),
+      Case(c) ->
+        c.arms.fold(acc, |a: List<Int>, arm: { when: Int, body: Block }|
+          a.concat(loops_in(arm.body))).concat(
+          loops_in(c.rest),
+        ),
+      Match(m) ->
+        m.arms.fold(acc, |a: List<Int>, arm: Block| a.concat(loops_in(arm))).concat(
+          loops_in(m.rest),
+        ),
+      _ -> acc,
+    })
+
+test "a fold, map or filter over a lambda is one loop in its caller, the lambda's body run in each pass" {
+  match program_of(walks()) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(p) -> {
+      let names = [b"summed", b"bumped", b"kept", b"named", b"known", b"tallied"];
+      let forms = names.map(|n: Bytes|
+        match lowered_as_built(p, n) {
+          Ok(f) -> f,
+          Err(no) -> panic(String::of_bytes_lossy(Bytes::concat_all([n, b": ", no.why]))),
+        });
+      // Each loop goes round the place of the item it reads and what it holds: the accumulator, or
+      // the list it builds; a map's also the node it holds and the place there.
+      assert_eq(forms.map(|f: Fn| loops_in(f.body)), [[2], [2], [2], [2], [2], [4]]);
+      // None applies a function value; the walk's call, its loop and each pass count a step, and so
+      // does a lambda's run, where a definition's call counts its own.
+      let applied = |f: Fn|
+        vals_in(f.body).filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len();
+      let ticked = |f: Fn|
+        vals_in(f.body).filter(|v: Val|
+          match v { Op(o) -> o.op == OCalling(Ticked), _ -> false }).len(
+        );
+      assert_eq(forms.map(applied), [0, 0, 0, 0, 0, 0]);
+      assert_eq(forms.map(ticked), [4, 4, 4, 3, 4, 4]);
+      // A map and a filter push onto the list they build, and a map's fold finds its leaves as the
+      // prelude's does; nothing calls the prelude's walks.
+      let prelude = |n: Bytes| Named(b"std.prelude.".concat(n));
+      assert_eq(forms.map(|f: Fn| f.links.generics.map(|g: GenericCall| g.callee)), [
+        [],
+        [prelude(b"List::push")],
+        [prelude(b"List::push")],
+        [],
+        [prelude(b"List::push")],
+        [prelude(b"node_max"), prelude(b"leaf_above"), prelude(b"first_leaf")],
+      ])
+    },
+  }
+}
+
 /// Where the corpus's root `name` stands among the analysed program's roots.
 fn root_at(p: Program, name: Bytes) -> Option<Int> =
   range(0, p.roots.len()).fold(None, |acc: Option<Int>, i: Int|
@@ -1172,12 +1241,13 @@ test "a lent lambda run where its arguments and captures arrive as a type variab
 
 test "a fold's accumulator erased to `Option<_>`, its payload's word, is read as the `Option` of a record its lambda was written for, which is its cases" {
   let src = Bytes::concat_all([
+    b"fn upto<b>(n: Int, i: Int, acc: b, g: (b, Int) -> b) -> b = if i >= n { acc } else { upto(n, i + 1, g(acc, i), g) }\n",
     b"fn spans(n: Int) -> Option<{ at: Int, n: Int }> =\n",
-    b"  range(0, n).fold(None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
+    b"  upto(n, 0, None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
     b"    match acc { Some(a) -> Some({ at: a.at, n: a.n + 1 }), None -> Some({ at: k, n: 1 }) })\n",
   ]);
   let words = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
-  match answered_by_form(src, [], prelude_fold([unknown_type(), words], b"m.spans")) {
+  match answered_by_form(src, [], lent_fold(b"m.upto", [words], 3, b"m.spans")) {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
   }
@@ -1185,22 +1255,38 @@ test "a fold's accumulator erased to `Option<_>`, its payload's word, is read as
 
 test "a lent lambda's parameter is read at what its written type says, a type variable of its lender's read as a word" {
   let src = Bytes::concat_all([
+    b"fn most<c>(xs: List<c>, g: (Int, c) -> Int) -> Int = xs.fold(0, g)\n",
     b"fn heaviest<a>(pairs: List<{ item: a, weight: Int }>) -> Int =\n",
-    b"  pairs.fold(0, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
+    b"  most(pairs, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
   ]);
-  match answered_by_form(src, [], prelude_fold([unknown_type(), int_type()], b"m.heaviest")) {
+  match answered_by_form(src, [], lent_fold(b"m.most", [unknown_type()], 1, b"m.heaviest")) {
     Err(why) -> assert_eq(why, b""),
     Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
   }
 }
 
-/// The prelude's fold loop at `args`, running the first lambda `lender` writes.
-fn prelude_fold(args: List<Type>, lender: Bytes) -> RootKey =
-  at_key(b"std.prelude.folded_from", args, [{ param: 5, owner: Named(lender), nth: 0 }])
+test "a walk over what a specialisation erased calls the prelude's walk, which lets go of none of it" {
+  let src = Bytes::concat_all([
+    b"fn upto<b>(n: Int, init: b, g: (b, Int) -> b) -> b = range(0, n).fold(init, g)\n",
+    b"fn spans(n: Int) -> Option<{ at: Int, n: Int }> =\n",
+    b"  upto(n, None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
+    b"    match acc { Some(a) -> Some({ at: a.at, n: a.n + 1 }), None -> Some({ at: k, n: 1 }) })\n",
+  ]);
+  let words = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
+  match answered_by_form(src, [], lent_fold(b"m.upto", [words], 2, b"m.spans")) {
+    Err(why) -> assert_eq(why, b""),
+    Ok(text) -> assert(text.index_of(b"ply_std_prelude_List_fold_") != None, None),
+  }
+}
+
+/// The fold `def` at `args`, running at parameter `param` the first lambda `lender` writes.
+fn lent_fold(def: Bytes, args: List<Type>, param: Int, lender: Bytes) -> RootKey =
+  at_key(def, args, [{ param: param, owner: Named(lender), nth: 0 }])
 
 test "a closure a root writes calls a lambda the root was lent through its closure, as a function value" {
   let src = Bytes::concat_all([
-    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> = xs.map(|x: T| f(f(x)))\n",
+    b"fn each<T>(xs: List<T>, g: (T) -> T) -> List<T> = xs.map(g)\n",
+    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> = each(xs, |x: T| f(f(x)))\n",
     b"fn bumped(xs: List<Int>) -> List<Int> = twice_each(xs, |n: Int| n + 1)\n",
   ]);
   match program_of(src) {
