@@ -7,7 +7,7 @@ import compiler.front.rows (BakedRow)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
-import compiler.cc (compilers, toolchain, TooWide, Unexported)
+import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
 import compiler.unit (Baked, Dropped, Emission, Made, Scoped, scope_key, shipped, shipped_runtime,
                       answers_store, baked_key, emitted, emitter_identity, held)
@@ -258,11 +258,13 @@ pub fn library_over(
 
 /// Which compiler a profile compiles with, at what level, and whether its code checks what it
 /// assumes. `PLY_C_PROFILE` wins over the flag. `development` compiles fast for code that runs slowly
-/// enough, and checked: tcc where it is installed, else `cc -O0`; `release` is `cc -O2`. `PLY_CC`
-/// names `cc`'s program and is used whatever the profile, and `PLY_CC_OPT` names the level.
+/// enough, and checked: tcc where it compiles for x86-64 Linux, else `cc -O0`; `release` is `cc -O2`.
+/// Elsewhere a library tcc links does not hold a unit: its arm64 calls reach only 128 MB, and on
+/// macOS dyld misreads the exports it writes. `PLY_CC` names `cc`'s program and is used whatever the
+/// profile, and `PLY_CC_OPT` names the level.
 fn chosen(
   profile: String,
-) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], env.variable} = {
+) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
   let release = match env.variable("PLY_C_PROFILE") {
     Some(p) -> p == "release",
     None -> profile == "release",
@@ -272,7 +274,8 @@ fn chosen(
     None -> if release { "-O2" } else { "-O0" },
   };
   {
-    tcc: !release && env.variable("PLY_CC") == None && compilers.found[tcc]() != None,
+    tcc: !release && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
+      && cc::targets_x86_64_linux[tcc](),
     level: level,
     checked: !release,
   }
@@ -284,22 +287,14 @@ fn unbuildable(why: String) -> Diag =
   ])
 
 /// `text` compiled into a library the toolchain's cache keeps: an object for each part not compiled
-/// before, and a link where the cache holds none of them together. tcc lays out no veneers, and on
-/// macOS garbles the exports of a library of many symbols, so a unit too wide for its direct calls to
-/// span, or whose exports tcc garbled, compiles with `cc`.
+/// before, and a link where the cache holds none of them together.
 fn compiled_of(
   text: Bytes,
   profile: String,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
   let choice = chosen(profile);
-  let built = if !choice.tcc {
-    cc::library[cc](choice.level, choice.checked, cc::library_flags(), text)
-  } else {
-    match cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text, false) {
-      Err(TooWide) -> cc::library[cc](choice.level, choice.checked, cc::library_flags(), text),
-      Err(Unexported) -> cc::library[cc](choice.level, choice.checked, cc::library_flags(), text),
-      by_tcc -> by_tcc,
-    }
-  };
-  match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(cc::why_unbuilt(why))]) }
+  let built = if choice.tcc {
+    cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text)
+  } else { cc::library[cc](choice.level, choice.checked, cc::library_flags(), text) };
+  match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
 }
