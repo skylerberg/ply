@@ -8,7 +8,7 @@ use ply_compiled::emitted::{Carried, Handed, PlyType};
 use ply_compiled::heap::{HEADER, Word, word_at};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::{Ctx, Lifted};
-use ply_core::codec::{decode, encode, tag};
+use ply_core::codec::{Writer, decode, encode, shown, tag};
 use ply_core::{Decimal, Fields, Fixed, INT_TYPES, IntTy, Symbol, Value};
 use std::sync::Arc;
 
@@ -539,6 +539,68 @@ fn a_carried_value_lowers_through_its_type_and_what_it_carries_through_theirs() 
     );
     assert_eq!(ctx.failed, 0);
     pair.release(&mut ctx);
+}
+
+/// What a diagnostic shows of a value is its bytes alone: a credential and a hold each a handle at
+/// the position saying what it is, the credential's payload nowhere, and a carried value written in
+/// place through its type.
+#[test]
+fn a_value_a_diagnostic_shows_keeps_nothing_beside_its_bytes() {
+    let mut ctx = context();
+    let secret = ctx.heap.bridge(Value::secret_text("hunter2"));
+    let c: *mut Ctx = &mut ctx;
+    let bytes = unsafe {
+        let hold = native::<A1>("?hold_made")(c, imm(42));
+        native::<N0>("?shown_open")(c);
+        native::<N2>("?out_count")(c, tag::LIST as Word, 3);
+        native::<N1>("?out_handle")(c, secret);
+        native::<N1>("?out_handle")(c, hold);
+        native::<N2>("?out_carried")(c, 40, &raw const PAIR as Word);
+        let n = native::<A0>("?lower_close")(c);
+        let mut out = vec![0u8; n as usize];
+        native::<N2>("?taken")(c, out.as_mut_ptr() as Word, n);
+        helper::<N1>("rt_handle_free")(c, hold);
+        out
+    };
+    unfailed(&mut ctx);
+    let mut w = Writer::new();
+    w.count(tag::LIST, 3);
+    w.handle(shown::SEALED);
+    w.handle(shown::HOLD);
+    w.count(tag::RECORD, 2);
+    w.name(b"first");
+    w.int(40);
+    w.name(b"second");
+    w.ctor(b"m.Inner", 1);
+    w.int(41);
+    assert_eq!(bytes, w.finish());
+    assert!(!bytes.windows(7).any(|b| b == b"hunter2"));
+}
+
+/// An `assert_eq` that failed raises `E0501` showing the expected value and then the actual, each the
+/// bytes it was handed, and a clause for the raise is told each by its kind.
+#[test]
+fn a_failed_assertion_raises_showing_the_expected_value_then_the_actual() {
+    type N4 = unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word);
+    let mut ctx = context();
+    let actual = encode(&Value::Int(2)).unwrap();
+    let expected = encode(&Value::str("x")).unwrap();
+    unsafe {
+        native::<N4>("?assert_failed")(
+            &mut ctx,
+            actual.as_ptr() as Word,
+            actual.len() as Word,
+            expected.as_ptr() as Word,
+            expected.len() as Word,
+        )
+    };
+    let d = ctx.take_failure().expect("the assertion raised");
+    assert_eq!(d.code, ply_core::codes::ASSERTION_FAILED);
+    assert_eq!(d.values.iter().collect::<Vec<_>>(), [&expected, &actual]);
+    assert_eq!(
+        d.described(&d.message),
+        "assertion failed: expected a `String`, found an `Int`"
+    );
 }
 
 /// A runtime object crosses as itself.

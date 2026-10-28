@@ -108,6 +108,7 @@ machine! {
     "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
     "?in_handle" => rt_in_handle() -> Handle;
     "?lower_open" => rt_lower_open(I64);
+    "?shown_open" => rt_shown_open();
     "?lower_close" => rt_lower_close() -> I64;
     "?lift_open" => rt_lift_open(Addr, I64);
     "?lift_close" => rt_lift_close();
@@ -119,6 +120,7 @@ machine! {
     "?cost_spent" => rt_cost_spent(I64, I64);
     "?in_carried" => rt_in_carried() -> Handed;
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
+    "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
 
 /// The natives over machine data: the crossings' and the rest of this table's, then strings' and

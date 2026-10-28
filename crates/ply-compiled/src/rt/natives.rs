@@ -28,20 +28,11 @@ macro_rules! natives {
 
 ply_core::each_builtin!(natives);
 
-/// A runtime error's message as a clause for `abort.raise` is given it, each value the text names
-/// told by its kind: nothing in Rust renders one.
-pub(super) fn raised_message(d: &Diagnostic) -> String {
-    d.values
-        .iter()
-        .enumerate()
-        .fold(d.message.clone(), |text, (i, v)| {
-            text.replace(&ply_core::slot(i), v.describe())
-        })
-}
-
-/// [`Ctx::pend`] for a runtime error that is the program's to answer.
+/// [`Ctx::pend`] for a runtime error that is the program's to answer: a clause for `abort.raise`
+/// is given its message, each value the text names told by its kind, since nothing in Rust renders
+/// one.
 pub(crate) fn raise_error(ctx: &mut Ctx, d: Diagnostic) -> i64 {
-    let message = raised_message(&d);
+    let message = d.described(&d.message);
     ctx.pend(d, message)
 }
 

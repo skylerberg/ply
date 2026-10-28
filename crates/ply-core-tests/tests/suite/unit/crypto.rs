@@ -1,5 +1,5 @@
 use ply_core::builtins::{Builtin, call};
-use ply_core::{Plain, Span, Value, codes};
+use ply_core::{Span, Value, codes};
 
 fn done(b: Builtin, args: Vec<Value>) -> Value {
     call(b, args, Span::DUMMY).unwrap()
@@ -70,7 +70,7 @@ fn what_is_made_of_a_secret_is_a_secret() {
         done(Builtin::SecretConcat, vec![secret(b"hun"), secret(b"ter2")]),
     ];
     for v in &made {
-        assert_eq!(Plain::of(v), Plain::Secret);
+        assert!(matches!(v, Value::Secret(_)), "{v:?}");
         assert_eq!(opened(v), b"hunter2");
     }
     let answered = [
@@ -107,10 +107,7 @@ fn what_is_made_of_a_secret_is_a_secret() {
         ),
     ];
     for v in &answered {
-        assert_eq!(
-            Plain::of(v),
-            Plain::Ctor("Some".to_string(), vec![Plain::Secret])
-        );
+        assert_eq!(format!("{v:?}"), r#"Ctor("Some", [Secret])"#);
     }
 }
 
@@ -337,7 +334,7 @@ fn a_private_key_is_read_from_its_document_and_stays_sealed() {
             .unwrap()
     };
     assert_eq!(field("scheme"), Value::str("ed25519"));
-    assert_eq!(Plain::of(&field("key")), Plain::Secret);
+    assert!(matches!(field("key"), Value::Secret(_)));
     assert_eq!(opened(&field("key")), seed);
 }
 
@@ -419,7 +416,7 @@ fn a_secret_encodes_as_rfc_4648_writes_and_decodes_back() {
                 Builtin::SecretEncode,
                 vec![Value::str(encoding), secret(bytes)],
             );
-            assert_eq!(Plain::of(&sealed), Plain::Secret);
+            assert!(matches!(sealed, Value::Secret(_)));
             let back = done(Builtin::SecretDecode, vec![Value::str(encoding), sealed]);
             assert_eq!(opened(held(&back).unwrap()), bytes, "{encoding} of {n}");
         }
@@ -658,7 +655,7 @@ fn an_rsa_jwk_makes_the_document_its_numbers_came_from_and_numbers_that_disagree
     };
     let texts = |private: &[Vec<u8>]| private.iter().map(|n| sealed_text(n)).collect::<Vec<_>>();
     let made = done(Builtin::SecretRsaJwk, args(texts(&numbers[3..])));
-    assert_eq!(Plain::of(held(&made).unwrap()), Plain::Secret);
+    assert!(matches!(held(&made), Some(Value::Secret(_))));
     assert_eq!(opened(held(&made).unwrap()), document);
     let mut wrong = numbers[3..].to_vec();
     wrong.swap(1, 2);

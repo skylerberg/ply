@@ -35,6 +35,10 @@ pub(crate) struct Lowering {
     /// the boundary refuses.
     answers_entry: bool,
     escaping: Option<escape::Handle>,
+    /// Whether this is a value a diagnostic shows, which keeps nothing beside its bytes: a runtime
+    /// object written as a handle at the position [`codec::shown`] gives what it is, and a carried
+    /// value written whole through its type.
+    shown: bool,
 }
 
 /// What crosses beside a lowering's bytes, held by the lowering itself, since compiled code may let
@@ -75,6 +79,15 @@ impl Lowering {
             resumes: false,
             answers_entry: false,
             escaping: None,
+            shown: false,
+        }
+    }
+
+    /// A lowering of a value a diagnostic shows, a value written a second time written as `AGAIN`.
+    fn shown() -> Lowering {
+        Lowering {
+            shown: true,
+            ..Lowering::new(true)
         }
     }
 
@@ -173,6 +186,11 @@ impl Ctx {
             Some(Crossing::Lowering(l)) => Ok(l),
             _ => unreachable!("the innermost crossing is a lowering"),
         }
+    }
+
+    /// Whether the innermost crossing is a lowering of a value a diagnostic shows.
+    fn showing(&self) -> bool {
+        matches!(self.crossings.last(), Some(Crossing::Lowering(l)) if l.shown)
     }
 
     /// Ends the innermost lowering, answering it whole; `None` with the context failed where the
@@ -343,10 +361,20 @@ pub unsafe extern "C" fn rt_out_name(ctx: *mut Ctx, p: Addr, n: I64) {
 }
 
 /// A runtime object, its value read as it is written. A handle of the run in an entry's answer is
-/// left for the boundary to refuse, held as nothing.
+/// left for the boundary to refuse, held as nothing; in a value a diagnostic shows, nothing is read
+/// or held.
 pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
     let c = unsafe { &mut *ctx };
     let w = h.word();
+    if c.showing() {
+        let kind = if hold_id(w).is_some() {
+            codec::shown::HOLD
+        } else {
+            codec::shown::SEALED
+        };
+        c.write(|l| l.w.handle(kind));
+        return;
+    }
     if heap::is_native(w)
         && let Some(escaping) = unsafe { heap::native_escapes(w) }
         && let Ok(l) = c.lowering()
@@ -365,8 +393,13 @@ pub unsafe extern "C" fn rt_out_handle(ctx: *mut Ctx, h: Handle) {
 }
 
 /// A value the runtime keeps rather than reads, with its type, which compiled code lends: what is
-/// in the position of an operation's own type parameter, held until the lowering ends.
+/// in the position of an operation's own type parameter, held until the lowering ends; in a value a
+/// diagnostic shows, written in place through its type.
 pub unsafe extern "C" fn rt_out_carried(ctx: *mut Ctx, w: Handed, ty: *const PlyType) {
+    if unsafe { &*ctx }.showing() {
+        unsafe { ((*ty).lower)(ctx, w.word()) };
+        return;
+    }
     let held = unsafe { Carried::kept_of(ctx, w, ty) };
     let c = unsafe { &mut *ctx };
     match c.lowering() {
@@ -590,6 +623,14 @@ pub unsafe extern "C" fn rt_lower_open(ctx: *mut Ctx, again: I64) {
         .push(Crossing::Lowering(Lowering::new(again.0 != 0)));
 }
 
+/// Begins a lowering of a value a diagnostic shows inside whatever crossing is under way, which
+/// [`rt_lower_close`] ends: nothing is held beside its bytes.
+pub unsafe extern "C" fn rt_shown_open(ctx: *mut Ctx) {
+    unsafe { &mut *ctx }
+        .crossings
+        .push(Crossing::Lowering(Lowering::shown()));
+}
+
 /// Ends the innermost lowering, which holds no handle: its bytes' count, the bytes left as the
 /// taken bytes.
 pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
@@ -706,16 +747,28 @@ pub(crate) fn runtime_value(ctx: *mut Ctx, w: Word) -> Result<Value, String> {
 /// What `write` writes into a lowering of its own, read back as a value, each handle as the value
 /// it stands for: a runtime object's own, a carried value lowered through its type.
 pub(crate) fn lowered_value(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Value, String> {
-    let l = lowering(ctx, write)?;
+    let l = lowering(ctx, Lowering::new(false), write)?;
     read_back(ctx, l)
 }
 
-/// What `write` writes into a lowering of its own.
-fn lowering(ctx: *mut Ctx, write: impl FnOnce(*mut Ctx)) -> Result<Lowering, String> {
+/// The PLV1 bytes a diagnostic shows of `v`, which it borrows, lowered through its type.
+pub(crate) fn shown(ctx: *mut Ctx, v: &Carried) -> Result<Vec<u8>, String> {
+    let l = lowering(ctx, Lowering::shown(), |ctx| unsafe {
+        (v.ty().lower)(ctx, v.word());
+    })?;
+    Ok(l.w.finish())
+}
+
+/// What `write` writes into `opened`, a lowering of its own.
+fn lowering(
+    ctx: *mut Ctx,
+    opened: Lowering,
+    write: impl FnOnce(*mut Ctx),
+) -> Result<Lowering, String> {
     let depth = unsafe { &*ctx }.crossings.len();
     unsafe { &mut *ctx }
         .crossings
-        .push(Crossing::Lowering(Lowering::new(false)));
+        .push(Crossing::Lowering(opened));
     write(ctx);
     let c = unsafe { &mut *ctx };
     if c.crossings.len() != depth + 1 {

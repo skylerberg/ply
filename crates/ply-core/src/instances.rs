@@ -55,10 +55,6 @@ pub fn running() -> Option<Instances> {
     RUNNING.with(Cell::get)
 }
 
-pub(crate) fn keyed(ctor: &Symbol) -> bool {
-    running().is_some_and(|i| (i.keyed)(i.unit, ctor))
-}
-
 /// `v` is a constructor's value.
 pub(crate) fn key(v: &Value) -> Option<Value> {
     let i = running()?;

@@ -1,7 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{Map, PathStep, Plain, Span, Value, values_equal};
+use ply_core::{Map, Span, Value, values_equal};
 use rust_decimal::Decimal;
 use std::cmp::Ordering;
 use std::process::Command;
@@ -40,7 +40,7 @@ fn keys(m: &Value) -> Vec<String> {
 /// A value's structure, scale and all, as the tests spell it; a reader is shown one by
 /// `std.value.render`.
 fn shape(v: &Value) -> String {
-    format!("{:?}", Plain::of(v))
+    format!("{v:?}")
 }
 
 fn map_of(pairs: Vec<(Value, Value)>) -> Value {
@@ -398,28 +398,4 @@ fn a_deep_chain_of_maps_drops_without_aborting() {
         v = Value::Map(m);
     }
     drop(v);
-}
-
-#[test]
-fn a_failing_comparison_locates_the_entry_that_differs() {
-    let a = map_of(vec![
-        (Value::str("x"), Value::Int(1)),
-        (Value::str("y"), Value::Int(2)),
-    ]);
-    let b = map_of(vec![
-        (Value::str("y"), Value::Int(9)),
-        (Value::str("x"), Value::Int(1)),
-    ]);
-    let d = ply_core::first_difference(&a, &b).expect("the two differ at one entry");
-    assert!(
-        matches!(d.path.as_slice(), [PathStep::Key(k)] if *k == Value::str("y")),
-        "{:?}",
-        d.path
-    );
-    assert_eq!(d.expected, Value::Int(9));
-    assert_eq!(d.actual, Value::Int(2));
-
-    // Different key sets have no entry to blame, so the pair is reported whole.
-    let c = map_of(vec![(Value::str("x"), Value::Int(1))]);
-    assert!(ply_core::first_difference(&a, &c).is_none());
 }

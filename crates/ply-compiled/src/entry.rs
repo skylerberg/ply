@@ -849,8 +849,8 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
 }
 
 /// `failure := string code, tag severity, string message, list(label), list(string) notes,
-/// list(bytes) values`; `label := option(site), bool primary, string text`; each value as
-/// [`Writer::plain`] writes it. A label at no site of `opened` is unplaced.
+/// list(bytes) values`; `label := option(site), bool primary, string text`; each value its PLV1,
+/// as [`Diagnostic::values`] holds it. A label at no site of `opened` is unplaced.
 pub fn write_failure(w: &mut Writer, d: &Diagnostic, opened: Option<&Opened>) {
     w.str(d.code)
         .tag(match d.severity {
@@ -866,10 +866,8 @@ pub fn write_failure(w: &mut Writer, d: &Diagnostic, opened: Option<&Opened>) {
     w.list(d.notes.iter(), |w, n| {
         w.str(n);
     });
-    w.list(d.values.iter(), |w, p| {
-        let mut value = Writer::new();
-        value.plain(p);
-        w.bytes(&value.finish());
+    w.list(d.values.iter(), |w, v| {
+        w.bytes(v);
     });
 }
 

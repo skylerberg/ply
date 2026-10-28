@@ -26,7 +26,6 @@ pub use expr::{BinOp, render_float};
 pub use intty::{INT_TYPES, IntTy};
 pub use list::List;
 pub mod memo;
-mod plain;
 pub mod rc;
 pub mod reflect;
 pub mod semantics;
@@ -36,7 +35,7 @@ pub mod sqlite;
 mod value;
 
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
-pub use builtins::{Builtin, assert_failure, assertion_failure};
+pub use builtins::{Builtin, assert_failure};
 pub use escape::{Boundary, Escapee, Handle};
 pub use footprint::{EffectAtom, Mode, Resource, label_var_name};
 pub use host::{
@@ -45,7 +44,6 @@ pub use host::{
 };
 pub use instances::Instances;
 pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET, MAX_VALUE_DEPTH};
-pub use plain::{Fun, Plain};
 pub use rc::RcStats;
 pub use semantics::{strict_binary, unstated};
 pub use sim::{Seed, SimId, TaskId};
@@ -54,6 +52,6 @@ pub use span::{
     intern_code, slot,
 };
 pub use value::{
-    Closure, ClosureKind, Decimal, Difference, Fields, Fixed, FixedOp, Map, PathStep, Sealed,
-    Synth, Value, constant_time_eq, first_difference, type_error, values_equal,
+    Closure, ClosureKind, Decimal, Fields, Fixed, FixedOp, Map, Sealed, Synth, Value,
+    constant_time_eq, type_error, values_equal,
 };

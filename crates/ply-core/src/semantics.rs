@@ -289,8 +289,8 @@ pub(crate) fn err_fixed_overflow(span: Span, what: &str, a: Fixed, b: Fixed) -> 
     Diagnostic::error(codes::RUNTIME_ERROR, format!("integer overflow in {what}"))
         .primary(span, detail)
         .showing(vec![
-            crate::Plain::shown(&Value::Fixed(a)),
-            crate::Plain::shown(&Value::Fixed(b)),
+            crate::builtins::fixed_shown(a),
+            crate::builtins::fixed_shown(b),
         ])
 }
 

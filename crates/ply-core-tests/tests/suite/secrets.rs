@@ -1,7 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{Closure, ClosureKind, Plain, Value, codes, constant_time_eq, values_equal};
+use ply_core::{Closure, ClosureKind, Value, codes, constant_time_eq, values_equal};
 use std::sync::Arc;
 
 #[test]
@@ -12,9 +12,11 @@ fn a_secret_is_copied_out_with_no_payload_whatever_it_holds() {
         Value::secret_bytes(b"\x00\xff"),
         Value::secret_bytes(b"hunter2"),
     ] {
-        assert_eq!(Plain::of(&secret), Plain::Secret);
-        assert_eq!(Plain::shown(&secret), Plain::Secret);
-        assert!(!format!("{secret:?}").contains("hunter2"));
+        assert_eq!(format!("{secret:?}"), "Secret");
+        assert_eq!(
+            ply_core::reflect::value_of(&secret),
+            Value::ctor("std.value.VSecret", Vec::new())
+        );
     }
 }
 
@@ -27,12 +29,8 @@ fn a_nested_secret_is_copied_out_with_no_payload() {
         inner,
     ]);
     assert_eq!(
-        Plain::of(&outer),
-        Plain::List(vec![
-            Plain::Ctor("Some".to_string(), vec![Plain::Secret]),
-            Plain::Map(vec![(Plain::Str("password".to_string()), Plain::Secret)]),
-            Plain::Secret,
-        ])
+        format!("{outer:?}"),
+        r#"List([Ctor("Some", [Secret]), Map([(Str("password"), Secret)]), Secret])"#
     );
 }
 

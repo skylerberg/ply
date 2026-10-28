@@ -1,5 +1,5 @@
 use ply_core::codec::{Writer, decode, decode_with, encode, encode_with, fun, tag};
-use ply_core::{Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Plain, Symbol, Synth, Value};
+use ply_core::{Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Symbol, Synth, Value};
 use std::sync::Arc;
 
 fn record(fields: Vec<(&str, Value)>) -> Value {
@@ -144,10 +144,11 @@ fn a_generated_function_comes_back_answering_as_it_did_nested_or_alone() {
     let Value::Ctor { args, .. } = field("t") else {
         panic!()
     };
-    // `Value` does not compare closures; their plain forms say what each answers.
-    assert_eq!(Plain::of(fs[0]), Plain::of(&constant));
-    assert_eq!(Plain::of(fs[1]), Plain::of(&project));
-    assert_eq!(Plain::of(&args[0]), Plain::of(&table));
+    // `Value` does not compare closures; their structures say what each answers.
+    let structure = |v: &Value| format!("{v:?}");
+    assert_eq!(structure(fs[0]), structure(&constant));
+    assert_eq!(structure(fs[1]), structure(&project));
+    assert_eq!(structure(&args[0]), structure(&table));
     for f in [constant, project, table] {
         assert_eq!(encode(&round_trip(&f)).unwrap(), encode(&f).unwrap());
     }

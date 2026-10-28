@@ -226,6 +226,108 @@ fn slot_value(index: String, values: List<Value>) -> Option<Value> / {abort.rais
   if index.len() > 9 || index.starts_with("-") { None }
   else { match index.int_of_string() { Some(at) -> values.at(at), None -> None } }
 
+fn slot(i: Int) -> String / {abort.raise} = opener() ++ i.to_string() ++ closer()
+
+// --- Where two values part ----------------------------------------------------
+
+/// One step into a value: an item by its index, an entry by its key, a field by its name, or an
+/// argument by its constructor's name and its place.
+type Step = | PIndex(Int) | PKey(Value) | PField(String) | PArg(String, Int)
+
+/// Where two values part: the steps to the place, and what each holds there.
+type Parting = { path: List<Step>, expected: Value, actual: Value }
+
+/// The note a failed assertion makes of where `actual` first parts from `expected` beneath both: the
+/// path there and what each holds there, each value standing in a slot numbered from `first`, beside
+/// the values its slots name in order. None where they are equal, or part only as wholes. Two lists
+/// or arrays of one length are read item by item, two maps whose keys agree entry by entry, two
+/// records whose fields are named alike field by field, and two values of one constructor argument
+/// by argument.
+pub fn difference_note(
+  actual: Value,
+  expected: Value,
+  first: Int,
+) -> Option<{ note: String, values: List<Value> }> / {abort.raise} =
+  match parted(actual, expected, true) {
+    None -> None,
+    Some(p) -> {
+      let said = p.path.fold(
+        { text: "", values: [] },
+        |acc: { text: String, values: List<Value> }, s: Step|
+          match s {
+            PIndex(i) -> { ..acc, text: acc.text ++ "[" ++ i.to_string() ++ "]" },
+            PKey(k) ->
+              {
+                text: acc.text ++ "[" ++ slot(first + acc.values.len()) ++ "]",
+                values: acc.values.push(k),
+              },
+            PField(name) -> { ..acc, text: acc.text ++ "." ++ name },
+            PArg(ctor, i) -> { ..acc, text: acc.text ++ "." ++ ctor ++ "." ++ i.to_string() },
+          },
+      );
+      let at = first + said.values.len();
+      Some({
+        note: "first difference at `" ++ said.text ++ "`: expected " ++ slot(at) ++ ", found "
+          ++ slot(at + 1),
+        values: said.values.push(p.expected).push(p.actual),
+      })
+    },
+  }
+
+fn parted(actual: Value, expected: Value, top: Bool) -> Option<Parting> =
+  match ((actual, expected)) {
+    (VList(a), VList(e)) -> if a.len() == e.len() { items_parted(a, e) }
+    else { whole(actual, expected, top) },
+    (VArray(a), VArray(e)) -> if a.len() == e.len() { items_parted(a, e) }
+    else { whole(actual, expected, top) },
+    (VMap(a), VMap(e)) -> if keys_agree(a, e) {
+      first_parted(a.len(), |i: Int|
+        match ((a.at(i), e.at(i))) {
+          (Some(x), Some(y)) -> within(PKey(x.key), x.value, y.value),
+          _ -> None,
+        })
+    } else { whole(actual, expected, top) },
+    (VRecord(a), VRecord(e)) -> if a.map(|f: Field| f.name) == e.map(|f: Field| f.name) {
+      first_parted(a.len(), |i: Int|
+        match ((a.at(i), e.at(i))) {
+          (Some(x), Some(y)) -> within(PField(x.name), x.value, y.value),
+          _ -> None,
+        })
+    } else { whole(actual, expected, top) },
+    (VCtor(n, a), VCtor(m, e)) -> if n == m && a.len() == e.len() {
+      first_parted(a.len(), |i: Int|
+        match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> within(PArg(n, i), x, y), _ -> None })
+    } else { whole(actual, expected, top) },
+    _ -> whole(actual, expected, top),
+  }
+
+fn items_parted(a: List<Value>, e: List<Value>) -> Option<Parting> =
+  first_parted(a.len(), |i: Int|
+    match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> within(PIndex(i), x, y), _ -> None })
+
+/// Whether two maps' keys are the same keys in the same order, as the runtime orders keys.
+fn keys_agree(a: List<Entry>, e: List<Entry>) -> Bool =
+  a.len() == e.len()
+    && range(0, a.len()).all(|i: Int|
+      match ((a.at(i), e.at(i))) { (Some(x), Some(y)) -> order(x.key, y.key) == Equal, _ -> false })
+
+/// The first of `n` places where `part` finds two values part, by place.
+fn first_parted(n: Int, part: (Int) -> Option<Parting>) -> Option<Parting> =
+  range(0, n).fold(None, |found: Option<Parting>, i: Int|
+    match found { Some(_) -> found, None -> part(i) })
+
+fn within(step: Step, actual: Value, expected: Value) -> Option<Parting> =
+  match parted(actual, expected, false) {
+    Some(p) -> Some({ ..p, path: [step].concat(p.path) }),
+    None -> None,
+  }
+
+/// Two values part here only below the top, which the assertion's own text says, and where they
+/// differ.
+fn whole(actual: Value, expected: Value, top: Bool) -> Option<Parting> =
+  if top || actual == expected { None }
+  else { Some({ path: [], expected: expected, actual: actual }) }
+
 // --- Fixed widths -----------------------------------------------------------
 
 /// How many bits the fixed-width integer type `ty` names, as `"U8"` or `"I64"`: 128 for any other.
@@ -381,13 +483,29 @@ pub fn encode(v: Value) -> Option<Bytes> =
   }
 
 /// The value the PLV1 bytes `b` hold, a value written again as `AGAIN` read as a copy of where it
-/// was first written. `None` where `b` holds no one whole value of the format, or a handle, which
-/// only a crossing keeps beside its bytes.
-pub fn decode(b: Bytes) -> Option<Value> =
+/// was first written, and a continuation as `FAnonymous`. `None` where `b` holds no one whole value
+/// of the format, or a handle, which only a crossing keeps beside its bytes.
+pub fn decode(b: Bytes) -> Option<Value> = decoded(b, false, b.len() + 1)
+
+/// The value a diagnostic shows, whose PLV1 bytes `b` the runtime wrote keeping nothing beside them,
+/// read as `decode` reads one but that a handle reads as what its position says the runtime object
+/// is, `VHold` at 1 and `VSecret` at any other, and a value nested past `shown_levels` levels as
+/// `VElided(0)`.
+pub fn decode_shown(b: Bytes) -> Option<Value> = decoded(b, true, shown_levels())
+
+/// How many levels deep `decode_shown` reads before what is nested deeper reads as `VElided(0)`:
+/// past what `render` shows, and short of how deeply its reader's calls may nest.
+pub fn shown_levels() -> Int = 256
+
+fn decoded(b: Bytes, shown: Bool, levels: Int) -> Option<Value> =
   handle {
     if !b.starts_with(b"PLV1") { None } else {
       // A level of nesting is at most three calls deep and takes a byte at least.
-      let read = read_value(b, { at: 4, names: [], opened: [] }, 3 * b.len() + 3);
+      let read = read_value(
+        b,
+        { at: 4, names: [], opened: [], levels: levels, shown: shown },
+        3 * b.len() + 3,
+      );
       if read.r.at == b.len() { Some(read.v) } else { None }
     }
   } with {
@@ -541,23 +659,106 @@ fn fixed_bytes(ty: String, bits: U128) -> Bytes / {abort.raise} = {
   }
 }
 
-/// Where reading has reached, each name read so far in the order it was first written, and each
-/// string, bytes, list, array and map value in the order it opened, once it has closed.
-type Reading = { at: Int, names: List<String>, opened: List<Option<Value>> }
+/// Where reading has reached, each name read so far in the order it was first written, each string,
+/// bytes, list, array and map value in the order it opened, once it has closed, how many levels
+/// deeper a value is read before it reads as `VElided(0)`, and whether the bytes are a value a
+/// diagnostic shows, whose handles say what they are.
+type Reading = {
+  at: Int,
+  names: List<String>,
+  opened: List<Option<Value>>,
+  levels: Int,
+  shown: Bool,
+}
 
 type ReadValue = { v: Value, r: Reading }
 
 /// The value at `r` of `b`, read in at most `depth` nested calls.
 fn read_value(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
-  if depth <= 0 { abort.raise("a value nested deeper than its bytes") } else {
+  if depth <= 0 { abort.raise("a value nested deeper than its bytes") }
+  else if r.levels == 0 { { v: VElided(0), r: skipped(b, r) } } else {
     let t = b.at(r.at);
-    let past = { ..r, at: r.at + 1 };
-    if t == 7 || t == 8 || t == 9 || t == 10 || t == 14 {
+    let past = { ..r, at: r.at + 1, levels: r.levels - 1 };
+    let read = if t == 7 || t == 8 || t == 9 || t == 10 || t == 14 {
       let n = past.opened.len();
       let body = read_body(b, t, { ..past, opened: past.opened.push(None) }, depth - 1);
       { v: body.v, r: { ..body.r, opened: body.r.opened.set(n, Some(body.v)) } }
-    } else { read_body(b, t, past, depth - 1) }
+    } else { read_body(b, t, past, depth - 1) };
+    { v: read.v, r: { ..read.r, levels: r.levels } }
   }
+
+/// What is left to read past a value as `skipped` reads it: `left` more fields, each a name and
+/// then a value, or values.
+type Left = { fields: Bool, left: Int }
+
+/// `r` past the value at `r.at`, read without a call per level of it: each name it writes in full
+/// numbered, and each string, bytes, list, array and map that opens in it kept as `VElided(0)`.
+fn skipped(b: Bytes, r: Reading) -> Reading / {abort.raise} =
+  iterate(
+    { r: r, todo: [{ fields: false, left: 1 }] },
+    b.len() + 2,
+    |s: { r: Reading, todo: List<Left> }|
+      match s.todo.last() {
+        None -> Stop(s.r),
+        Some(top) -> {
+          let rest = if top.left == 1 { s.todo.take(s.todo.len() - 1) }
+          else { s.todo.set(s.todo.len() - 1, { ..top, left: top.left - 1 }) };
+          if top.fields {
+            let name = read_name(b, s.r);
+            Continue({ r: name.r, todo: rest.push({ fields: false, left: 1 }) })
+          } else {
+            let h = head_skipped(b, s.r);
+            Continue({ r: h.r, todo: if h.left.left == 0 { rest } else { rest.push(h.left) } })
+          }
+        },
+      },
+  )
+
+/// `r` past the head of the value at `r.at`, and what of the value is left to read.
+fn head_skipped(b: Bytes, r: Reading) -> { r: Reading, left: Left } / {abort.raise} = {
+  let t = b.at(r.at);
+  let at = r.at + 1;
+  let alone = |to: Int| { r: { ..r, at: to }, left: { fields: false, left: 0 } };
+  let opened = |to: Int, n: Int|
+    {
+      r: { ..r, at: to, opened: r.opened.push(Some(VElided(0))) },
+      left: { fields: false, left: n },
+    };
+  if t <= 2 { alone(at) }
+  else if t == 3 || t == 13 || t == 15 || t == 17 { alone(read_varint(b, at).at) }
+  else if t == 4 { alone(at + 8) }
+  else if t == 5 { alone(at + 16) } else if t == 6 {
+    // The two 128-bit widths come last among the format's widths, and write a high word.
+    let low = read_varint(b, at + 1);
+    alone(if b.at(at) >= 8 { read_varint(b, low.at).at } else { low.at })
+  } else if t == 7 || t == 8 { opened(read_blob(b, at).at, 0) } else if t == 9 || t == 14 {
+    let n = read_count(b, at);
+    opened(n.at, n.n)
+  } else if t == 10 {
+    let n = read_count(b, at);
+    opened(n.at, 2 * n.n)
+  } else if t == 11 {
+    let n = read_count(b, at);
+    { r: { ..r, at: n.at }, left: { fields: true, left: n.n } }
+  } else if t == 12 {
+    let name = read_name(b, { ..r, at: at });
+    let n = read_count(b, name.r.at);
+    { r: { ..name.r, at: n.at }, left: { fields: false, left: n.n } }
+  } else if t == 16 {
+    let kind = b.at(at);
+    if kind == 0 {
+      let name = read_name(b, { ..r, at: at + 1 });
+      { r: name.r, left: { fields: false, left: 0 } }
+    } else if kind == 1 || kind == 5 { alone(at + 1) } else {
+      let arity = read_varint(b, at + 1);
+      if kind == 2 { { r: { ..r, at: arity.at }, left: { fields: false, left: 1 } } }
+      else if kind == 3 { alone(read_varint(b, arity.at).at) } else if kind == 4 {
+        let n = read_count(b, arity.at);
+        { r: { ..r, at: n.at }, left: { fields: false, left: 2 * n.n + 1 } }
+      } else { abort.raise("a function of a case this format does not have") }
+    }
+  } else { abort.raise("a value tagged as this format has none") }
+}
 
 fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
   if depth <= 0 { abort.raise("a value nested deeper than its bytes") }
@@ -629,6 +830,9 @@ fn read_body(b: Bytes, t: Int, r: Reading, depth: Int) -> ReadValue / {abort.rai
       Some(Some(v)) -> { v: v, r: { ..r, at: n.at } },
       _ -> abort.raise("a value again before it was written whole"),
     }
+  } else if t == 15 && r.shown {
+    let n = read_varint(b, r.at);
+    { v: if n.u == 1u128 { VHold } else { VSecret }, r: { ..r, at: n.at } }
   } else { abort.raise("a value tagged as this format has none, or a handle") }
 
 fn read_values(
@@ -665,7 +869,7 @@ fn read_fun(b: Bytes, r: Reading, depth: Int) -> ReadValue / {abort.raise} =
     if kind == 0 {
       let name = read_name(b, past);
       { v: VFn(FNamed(name.name)), r: name.r }
-    } else if kind == 1 { { v: VFn(FAnonymous), r: past } } else {
+    } else if kind == 1 || kind == 5 { { v: VFn(FAnonymous), r: past } } else {
       let arity = read_varint(b, past.at);
       let a = U8::of_int(Int::of_u128(arity.u));
       let after = { ..past, at: arity.at };
@@ -1101,5 +1305,106 @@ test "a decimal, a width and a float come back as they went" {
         None -> 0,
       }),
     floats.map(bits_of_float),
+  )
+}
+
+/// What a diagnostic shows of `v`: its encoding read back and rendered.
+fn shown_text(v: Value) -> String =
+  match encode(v) {
+    Some(b) -> match decode_shown(b) { Some(x) -> render(x), None -> "no value" },
+    None -> "no bytes",
+  }
+
+test "a value a diagnostic shows renders as the value it was written from" {
+  gen::check(values(), |v: Value| encode(v) == None || shown_text(v) == render(v))
+}
+
+test "what a diagnostic shows reads as a program writes each kind of value" {
+  assert_eq(
+    shown_text(
+      VRecord([{ name: "at", value: VInt(1) }, { name: "why", value: VStr("not a digit") }]),
+    ),
+    "{at: 1, why: \"not a digit\"}",
+  );
+  assert_eq(shown_text(VCtor("orders.Shipped", [VInt(3)])), "Shipped(3)");
+  assert_eq(shown_text(VCtor("Some", [VList([VInt(1), VInt(2)])])), "Some([1, 2])");
+  assert_eq(shown_text(VMap([{ key: VStr("k"), value: VDecimal(1.50m) }])), "{\"k\": 1.50}");
+  assert_eq(shown_text(VArray([VChar('a')])), "Array::of_list(['a'])");
+  assert_eq(shown_text(VFixed("I8", 255u128)), "-1");
+  assert_eq(shown_text(VFixed("U128", ~0u128)), "340282366920938463463374607431768211455");
+  assert_eq(shown_text(VStr("a\"b\n")), "\"a\\\"b\\n\"");
+  assert_eq(shown_text(VFloat(0.5)), "0.5");
+  let long = VList(range(0, 40).map(|i: Int| VInt(i)));
+  assert_eq(shown_text(VList([long])), render(VList([long])));
+  let deep = range(0, 20).fold(VInt(0), |acc: Value, _: Int| VList([acc]));
+  assert_eq(shown_text(deep), render(deep))
+}
+
+test "a handle a diagnostic shows reads as the runtime object its position says it is" {
+  let plv1 = |b: Bytes| b"PLV1".concat(b);
+  let told = |b: Bytes| match decode_shown(plv1(b)) { Some(v) -> render(v), None -> "no value" };
+  assert_eq(told(b"\x0f\x00"), "Secret(****)");
+  assert_eq(told(b"\x0f\x01"), "<hold>");
+  assert_eq(told(b"\x0b\x01\x00\x05token\x0f\x00"), "{token: Secret(****)}");
+  // Only a value a diagnostic shows says what its handles are.
+  assert_eq(decode(plv1(b"\x0f\x00")), None);
+  // A continuation is a function the program wrote, with no name of its own.
+  assert_eq([decode(plv1(b"\x10\x05")), decode_shown(plv1(b"\x10\x05"))], [
+    Some(VFn(FAnonymous)),
+    Some(VFn(FAnonymous)),
+  ])
+}
+
+test "a value a diagnostic shows is read so deep, and what it holds past that is skipped whole" {
+  // The first item nests as many lists as are read around a string, which the second is again.
+  let nested = Bytes::concat_all(range(0, shown_levels()).map(|_: Int| b"\x09\x01"));
+  let b = Bytes::concat_all([b"PLV1\x09\x02", nested, b"\x07\x01x\x11\x81\x02"]);
+  let second = |read: Option<Value>| match read { Some(VList([_, x])) -> Some(x), _ -> None };
+  assert_eq(second(decode(b)), Some(VStr("x")));
+  assert_eq(second(decode_shown(b)), Some(VElided(0)));
+  let deep = range(0, shown_levels() + 9).fold(VStr("end"), |acc: Value, _: Int| VList([acc]));
+  match encode(VList([deep, VInt(5)])) {
+    Some(written) -> assert_eq(second(decode_shown(written)), Some(VInt(5))),
+    None -> assert(false),
+  }
+}
+
+test "an assertion notes where its values first part, each value there and each key on the way in a slot" {
+  let noted = |actual: Value, expected: Value|
+    match difference_note(actual, expected, 2) {
+      Some(n) -> filled(n.note, [expected, actual].concat(n.values)),
+      None -> "",
+    };
+  let row = |n: Int| VRecord([{ name: "id", value: VInt(1) }, { name: "qty", value: VInt(n) }]);
+  assert_eq(
+    noted(VList([row(1), row(2)]), VList([row(1), row(3)])),
+    "first difference at `[1].qty`: expected 3, found 2",
+  );
+  assert_eq(
+    noted(
+      VMap([{ key: VStr("x"), value: VInt(0) }, { key: VStr("y"), value: VInt(1) }]),
+      VMap([{ key: VStr("x"), value: VInt(0) }, { key: VStr("y"), value: VInt(2) }]),
+    ),
+    "first difference at `[\"y\"]`: expected 2, found 1",
+  );
+  let chain = |n: Int, bottom: String|
+    range(0, n).fold(VCtor(bottom, []), |acc: Value, _: Int| VCtor("m.Link", [acc]));
+  assert_eq(
+    noted(chain(100, "m.Nil"), chain(100, "m.End")),
+    "first difference at `" ++ ".m.Link.0".repeat(100) ++ "`: expected End, found Nil",
+  );
+  assert_eq(
+    noted(VList([VList([VInt(1)])]), VList([VList([])])),
+    "first difference at `[0]`: expected [], found [1]",
+  );
+  // Values that part only as wholes, or not at all, say no more than the assertion does.
+  assert_eq(
+    [
+      noted(VInt(1), VInt(2)),
+      noted(VList([VInt(1)]), VList([VInt(1), VInt(2)])),
+      noted(VMap([{ key: VInt(1), value: VInt(1) }]), VMap([{ key: VInt(2), value: VInt(1) }])),
+      noted(VList([VInt(1)]), VList([VInt(1)])),
+    ],
+    ["", "", "", ""],
   )
 }

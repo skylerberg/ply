@@ -308,12 +308,6 @@ fn err_task_captures(effect: &Symbol, op: &Symbol, site: Span) -> Diagnostic {
     )
 }
 
-/// What a raise carries, as values a diagnostic shows, lowered through their types.
-fn raised_values(c: &mut Ctx, args: &Raised) -> Vec<Result<Value, String>> {
-    let ctx: *mut Ctx = c;
-    args.0.iter().map(|v| v.lower(ctx)).collect()
-}
-
 /// A raise no `handle` answers, left pending for the code around it, as [`Ctx::pend`] says, with
 /// what the entry fails with should nothing take it: `abort.raise` a panic of its message, any other
 /// raise naming the operation and what it carried. Takes the arguments.
@@ -330,10 +324,14 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
         return c.pend(d, message);
     }
     // Only a raise nothing answers is shown what it carried: one a clause takes is not read.
-    let carried: Vec<Plain> = raised_values(c, &args)
-        .iter()
-        .map(|v| v.as_ref().map_or(Plain::Elided(0), Plain::shown))
-        .collect();
+    let carried: Result<Vec<Vec<u8>>, String> = args.0.iter().map(|v| shown(c, v)).collect();
+    let carried = match carried {
+        Ok(carried) => carried,
+        Err(why) => {
+            args.release();
+            return c.fail(err_crossing(&why));
+        }
+    };
     let slots: Vec<String> = (0..carried.len()).map(ply_core::slot).collect();
     let with = if slots.is_empty() {
         String::new()
@@ -352,10 +350,17 @@ pub(super) fn unanswered(c: &mut Ctx, effect: &Symbol, op: &Symbol, args: Raised
 
 /// The message an `abort.raise` carries, empty where it does not lower to a string.
 fn raised_message(c: &mut Ctx, args: &Raised) -> String {
-    match raised_values(c, args).first() {
-        Some(Ok(Value::Str(s))) => s.to_string(),
-        _ => String::new(),
-    }
+    let text = |bytes: Vec<u8>| -> Option<String> {
+        let mut r = ply_core::codec::Reader::new(bytes).ok()?;
+        r.expect(ply_core::codec::tag::STR).ok()?;
+        let s = r.str().ok()?.to_string();
+        r.end().ok().map(|()| s)
+    };
+    args.0
+        .first()
+        .and_then(|v| shown(c, v).ok())
+        .and_then(text)
+        .unwrap_or_default()
 }
 
 /// The message of the raise [`FAILED_PENDING`] stands for, as `string`, the type of `String`, lays

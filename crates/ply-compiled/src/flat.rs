@@ -4,8 +4,6 @@
 //! one, a `Bool` one byte, a `Float` its bits as eight bytes little-endian, bytes and text a count
 //! and the bytes, a list a count and its items, an option a tag (0 none, 1 some) and its value.
 
-use ply_core::{Fun, Plain};
-
 /// Bytes being written.
 #[derive(Default)]
 pub struct Writer {
@@ -21,12 +19,7 @@ impl Writer {
         self.bytes
     }
 
-    pub fn varint(&mut self, n: u64) -> &mut Writer {
-        self.wide(u128::from(n))
-    }
-
-    /// A varint of up to 128 bits, as `std.bin` writes a `U128`.
-    fn wide(&mut self, mut n: u128) -> &mut Writer {
+    pub fn varint(&mut self, mut n: u64) -> &mut Writer {
         while n >= 0x80 {
             self.bytes.push((n as u8 & 0x7f) | 0x80);
             n >>= 7;
@@ -50,11 +43,6 @@ impl Writer {
 
     pub fn bool(&mut self, b: bool) -> &mut Writer {
         self.bytes.push(u8::from(b));
-        self
-    }
-
-    pub fn byte(&mut self, b: u8) -> &mut Writer {
-        self.bytes.push(b);
         self
     }
 
@@ -99,66 +87,6 @@ impl Writer {
             write(self, item);
         }
         self
-    }
-
-    /// A value a diagnostic shows, as `std.value.Value`: its case's tag, then what the case holds.
-    // Tags 15 and 16 stay unused, so a toolchain of another build reads the others alike.
-    pub fn plain(&mut self, p: &Plain) -> &mut Writer {
-        match p {
-            Plain::Unit => self.tag(0),
-            Plain::Bool(b) => self.tag(1).bool(*b),
-            Plain::Int(n) => self.tag(2).int(*n),
-            Plain::Float(f) => {
-                self.tag(3);
-                self.bytes
-                    .extend_from_slice(&ply_core::float::bits(*f).to_le_bytes());
-                self
-            }
-            Plain::Decimal(d) => self.tag(4).str(&d.to_string()),
-            Plain::Fixed { ty, bits } => self.tag(5).str(ty.name()).wide(*bits),
-            Plain::Char(c) => self.tag(6).varint(u64::from(*c)),
-            Plain::Str(s) => self.tag(7).str(s),
-            Plain::Bytes(b) => self.tag(8).bytes(b),
-            Plain::List(items) => self.tag(9).list(items.iter(), |w, p| {
-                w.plain(p);
-            }),
-            Plain::Record(fields) => self.tag(10).list(fields.iter(), |w, (name, p)| {
-                w.str(name).plain(p);
-            }),
-            Plain::Ctor(name, args) => self.tag(11).str(name).list(args.iter(), |w, p| {
-                w.plain(p);
-            }),
-            Plain::Map(entries) => self.tag(12).list(entries.iter(), |w, (k, v)| {
-                w.plain(k).plain(v);
-            }),
-            Plain::Fn(f) => self.tag(13).fun(f),
-            Plain::Hold => self.tag(14),
-            Plain::Secret => self.tag(17),
-            Plain::Elided(n) => self.tag(18).count(*n),
-            Plain::Array(items) => self.tag(19).list(items.iter(), |w, p| {
-                w.plain(p);
-            }),
-        }
-    }
-
-    fn fun(&mut self, f: &Fun) -> &mut Writer {
-        match f {
-            Fun::Named(name) => self.tag(0).str(name),
-            Fun::Anonymous => self.tag(1),
-            Fun::Const { arity, value } => self.tag(2).byte(*arity).plain(value),
-            Fun::Project { arity, index } => self.tag(3).byte(*arity).byte(*index),
-            Fun::Table {
-                arity,
-                entries,
-                default,
-            } => self
-                .tag(4)
-                .byte(*arity)
-                .list(entries.iter(), |w, (k, v)| {
-                    w.plain(k).plain(v);
-                })
-                .plain(default),
-        }
     }
 }
 

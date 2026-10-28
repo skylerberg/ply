@@ -458,10 +458,63 @@ fn take_children(v: &mut Value, out: &mut Vec<Value>) {
     }
 }
 
-/// Structural, for a developer; a reader is shown a value by `std.value.render`.
+/// Structural, for a developer, and never a credential's bytes; a reader is shown a value by
+/// `std.value.render`.
 impl fmt::Debug for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&crate::Plain::of(self), f)
+        let tuple = |f: &mut fmt::Formatter<'_>, name: &str, x: &dyn fmt::Debug| {
+            grow(|| f.debug_tuple(name).field(x).finish())
+        };
+        match self {
+            Value::Unit => f.write_str("Unit"),
+            Value::Bool(b) => tuple(f, "Bool", b),
+            Value::Int(n) => tuple(f, "Int", n),
+            Value::Float(x) => tuple(f, "Float", x),
+            Value::Decimal(d) => tuple(f, "Decimal", d),
+            Value::Fixed(x) => f
+                .debug_struct("Fixed")
+                .field("ty", &x.ty)
+                .field("bits", &x.raw())
+                .finish(),
+            Value::Char(c) => tuple(f, "Char", c),
+            Value::Str(s) => tuple(f, "Str", s),
+            Value::Bytes(b) => tuple(f, "Bytes", b),
+            Value::List(xs) => tuple(f, "List", &xs.iter().collect::<Vec<_>>()),
+            Value::Array(xs) => tuple(f, "Array", xs),
+            Value::Map(m) => tuple(f, "Map", &m.iter().collect::<Vec<_>>()),
+            Value::Record(fields) => tuple(
+                f,
+                "Record",
+                &fields
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v))
+                    .collect::<Vec<_>>(),
+            ),
+            Value::Ctor { name, args } => grow(|| {
+                f.debug_tuple("Ctor")
+                    .field(&name.as_str())
+                    .field(args)
+                    .finish()
+            }),
+            Value::Closure(c) => match (&c.kind, &c.name) {
+                (ClosureKind::Hold { .. }, _) => f.write_str("Hold"),
+                (ClosureKind::Synth { arity, rule }, _) => match rule {
+                    Synth::Const(value) => {
+                        write!(f, "Fn(Const {{ arity: {arity}, value: {value:?} }})")
+                    }
+                    Synth::Project(index) => {
+                        write!(f, "Fn(Project {{ arity: {arity}, index: {index} }})")
+                    }
+                    Synth::Table { entries, default } => write!(
+                        f,
+                        "Fn(Table {{ arity: {arity}, entries: {entries:?}, default: {default:?} }})"
+                    ),
+                },
+                (_, Some(name)) => write!(f, "Fn(Named({:?}))", name.as_str()),
+                (_, None) => f.write_str("Fn(Anonymous)"),
+            },
+            Value::Secret(_) => f.write_str("Secret"),
+        }
     }
 }
 
@@ -712,8 +765,7 @@ pub fn type_error(span: Span, what: &str, expected: &str, got: &Value) -> Diagno
         codes::RUNTIME_ERROR,
         format!("{what} expects {expected}, but got {}", got.type_name()),
     )
-    .primary(span, format!("this is {}", crate::slot(0)))
-    .showing(vec![crate::Plain::shown(got)])
+    .primary(span, "this value")
 }
 
 /// Comparing functions is an error rather than a silently-false answer.
@@ -844,102 +896,4 @@ fn equal_at(
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.len() == b.len() && bool::from(a.ct_eq(b))
-}
-
-/// Where two unequal values first part, and what each holds there.
-#[derive(Debug)]
-pub struct Difference {
-    pub path: Vec<PathStep>,
-    pub expected: Value,
-    pub actual: Value,
-}
-
-/// One step into a value.
-#[derive(Debug)]
-pub enum PathStep {
-    Index(usize),
-    Key(Value),
-    Field(Symbol),
-    Arg(Symbol, usize),
-}
-
-/// Where two unequal values first part. A keyed value is equal to another as their keys are, which
-/// only the program reads, so a part outside every keyed value is sought first, and a keyed value is
-/// where they part only where nothing else differs, compared then as a whole by what it holds.
-pub fn first_difference(actual: &Value, expected: &Value) -> Option<Difference> {
-    fn go(
-        actual: &Value,
-        expected: &Value,
-        path: &mut Vec<PathStep>,
-        depth: usize,
-        keyed: bool,
-    ) -> Option<Difference> {
-        if depth >= MAX_VALUE_DEPTH {
-            return None;
-        }
-        let within = |step: PathStep, x: &Value, y: &Value, path: &mut Vec<PathStep>| {
-            path.push(step);
-            let found = go(x, y, path, depth + 1, keyed);
-            if found.is_none() {
-                path.pop();
-            }
-            found
-        };
-        match (actual, expected) {
-            (Value::List(a), Value::List(e)) if a.len() == e.len() => grow(|| {
-                a.iter()
-                    .zip(e.iter())
-                    .enumerate()
-                    .find_map(|(i, (x, y))| within(PathStep::Index(i), x, y, path))
-            }),
-            (Value::Array(a), Value::Array(e)) if a.len() == e.len() => grow(|| {
-                a.iter()
-                    .zip(e.iter())
-                    .enumerate()
-                    .find_map(|(i, (x, y))| within(PathStep::Index(i), x, y, path))
-            }),
-            // Only when key sets agree, so a differing shape reports the whole maps.
-            (Value::Map(a), Value::Map(e)) if a.len() == e.len() && a.keys().eq(e.keys()) => {
-                grow(|| {
-                    a.iter()
-                        .zip(e.values())
-                        .find_map(|((k, x), y)| within(PathStep::Key(k.clone()), x, y, path))
-                })
-            }
-            (Value::Record(a), Value::Record(e)) if a.keys().eq(e.keys()) => grow(|| {
-                a.iter()
-                    .zip(e.values())
-                    .find_map(|((k, x), y)| within(PathStep::Field(k.clone()), x, y, path))
-            }),
-            // Two keyed values differ as wholes: their fields are not what is compared.
-            (Value::Ctor { name: n1, args: a1 }, Value::Ctor { name: n2, args: a2 })
-                if n1 == n2 && a1.len() == a2.len() && !crate::instances::keyed(n1) =>
-            {
-                grow(|| {
-                    a1.iter()
-                        .zip(a2.iter())
-                        .enumerate()
-                        .find_map(|(i, (x, y))| within(PathStep::Arg(n1.clone(), i), x, y, path))
-                })
-            }
-            (Value::Ctor { name: n1, .. }, Value::Ctor { .. })
-                if !keyed && crate::instances::keyed(n1) =>
-            {
-                None
-            }
-            (a, e) => {
-                if equal_at(a, e, Span::DUMMY, depth, false).unwrap_or(false) || path.is_empty() {
-                    None
-                } else {
-                    Some(Difference {
-                        path: std::mem::take(path),
-                        expected: e.clone(),
-                        actual: a.clone(),
-                    })
-                }
-            }
-        }
-    }
-    go(actual, expected, &mut Vec::new(), 0, false)
-        .or_else(|| go(actual, expected, &mut Vec::new(), 0, true))
 }

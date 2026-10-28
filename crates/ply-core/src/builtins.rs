@@ -1,9 +1,10 @@
 //! The prelude, in one definition per builtin.
 
+use crate::codec::Writer;
 use crate::crypto::over_values;
 use crate::semantics::arity_error;
-use crate::value::{Decimal, Fixed, FixedOp, Value, first_difference, type_error, values_equal};
-use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, PathStep, Plain, Span, codes, slot};
+use crate::value::{Decimal, Fixed, FixedOp, Value, type_error};
+use crate::{BinOp, Diagnostic, INT_TYPES, IntTy, Span, codes, slot};
 
 /// A list this long is a runaway `range`, not an intent.
 const MAX_RANGE_LEN: i64 = 10_000_000;
@@ -63,10 +64,6 @@ macro_rules! builtins {
 }
 
 builtins! { $
-    AssertEq = "assert_eq" (actual, expected) -> Raising;
-    /// `assert_eq` failing where compiled code compared the two and found them unequal: raises with
-    /// both shown, comparing nothing. No source can spell it.
-    AssertFailed = "?assert_failed" (actual, expected) -> Raising;
     WrapAdd = "wrap_add" (a, b) -> Word;
     WrapSub = "wrap_sub" (a, b) -> Word;
     WrapMul = "wrap_mul" (a, b) -> Word;
@@ -260,16 +257,6 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
     }
 
     match b {
-        Builtin::AssertEq => {
-            if values_equal(&args[0], &args[1], span)? {
-                Ok(Value::Unit)
-            } else {
-                Err(assertion_failure(&args[0], &args[1], span))
-            }
-        }
-
-        Builtin::AssertFailed => Err(assertion_failure(&args[0], &args[1], span)),
-
         // A rotation left is one right by the rest of the width.
         Builtin::Rotr | Builtin::Rotl => {
             let what = format!("`{}`", b.name());
@@ -357,7 +344,7 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
                 .note(format!(
                     "an `Int` is 64 bits and signed, so it does not hold every `{t}`"
                 ))
-                .showing(vec![Plain::shown(&args[0])])),
+                .showing(vec![fixed_shown(f)])),
             }
         }
 
@@ -425,7 +412,7 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
             }
         }
 
-        Builtin::Reflect => Ok(crate::reflect::value_of(&Plain::of(&args[0]))),
+        Builtin::Reflect => Ok(crate::reflect::value_of(&args[0])),
 
         Builtin::Shown => Ok(crate::reflect::shown_of(&args[0])),
 
@@ -536,14 +523,10 @@ fn call_with(b: Builtin, args: &mut [Value], span: Span) -> Result<Value, Diagno
         }
 
         Builtin::Panic => {
-            let (message, values) = match &args[0] {
-                Value::Str(s) => (s.to_string(), Vec::new()),
-                other => (slot(0), vec![Plain::shown(other)]),
-            };
+            let message = args[0].as_str(span, "`panic`")?;
             Err(
                 Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-                    .primary(span, "`panic` called here")
-                    .showing(values),
+                    .primary(span, "`panic` called here"),
             )
         }
 
@@ -675,10 +658,21 @@ pub fn not_found(span: Span, s: &str, needle: &str) -> Diagnostic {
     )
     .primary(span, "this substring does not occur")
     .note("guard with `String::contains`, which answers the same question as a `Bool`")
-    .showing(vec![
-        Plain::Str(needle.to_string()),
-        Plain::Str(s.to_string()),
-    ])
+    .showing(vec![text_shown(needle), text_shown(s)])
+}
+
+/// The PLV1 bytes of the `String` `s`, as a diagnostic shows it.
+fn text_shown(s: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.str(s.as_bytes());
+    w.finish()
+}
+
+/// The PLV1 bytes of the width `f`, as a diagnostic shows it.
+pub(crate) fn fixed_shown(f: Fixed) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.fixed(f);
+    w.finish()
 }
 
 /// `what`, a slicing builtin, given the range `start..end` of a value of `len` `unit`, which does not
@@ -725,55 +719,15 @@ pub fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) 
     ))
 }
 
-pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagnostic {
-    let (e, a) = (slot(0), slot(1));
-    let mut values = vec![Plain::shown(expected), Plain::shown(actual)];
-    let mut diag = Diagnostic::error(
-        codes::ASSERTION_FAILED,
-        format!("assertion failed: expected {e}, found {a}"),
-    )
-    .primary(span, "these values are not equal")
-    .note(format!("expected: {e}"))
-    .note(format!("actual:   {a}"));
-
-    if let Some(d) = first_difference(actual, expected) {
-        let mut path = String::new();
-        for step in d.path {
-            match step {
-                PathStep::Index(i) => path.push_str(&format!("[{i}]")),
-                PathStep::Key(k) => {
-                    path.push_str(&format!("[{}]", slot(values.len())));
-                    values.push(Plain::shown(&k));
-                }
-                PathStep::Field(name) => path.push_str(&format!(".{name}")),
-                PathStep::Arg(ctor, i) => path.push_str(&format!(".{ctor}.{i}")),
-            }
-        }
-        let (de, da) = (slot(values.len()), slot(values.len() + 1));
-        values.push(Plain::shown(&d.expected));
-        values.push(Plain::shown(&d.actual));
-        diag = diag.note(format!(
-            "first difference at `{path}`: expected {de}, found {da}"
-        ));
-    }
-    diag.showing(values)
-}
-
-pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
+/// `assert` given a condition that is false, noting `message` where it has one.
+pub fn assert_failure(message: Option<&str>, span: Span) -> Diagnostic {
     let diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
         "assertion failed: condition is false",
     )
     .primary(span, "this condition evaluated to false");
-    let carried = match message {
-        Value::Ctor { name, args, .. } if name.as_str() == "Some" => args.first(),
-        Value::Ctor { .. } => None,
-        // A non-`Option` message comes only from an unchecked call.
-        other => Some(other),
-    };
-    match carried {
-        Some(Value::Str(s)) => diag.note(s.to_string()),
-        Some(other) => diag.note(slot(0)).showing(vec![Plain::shown(other)]),
+    match message {
+        Some(s) => diag.note(s),
         None => diag,
     }
 }

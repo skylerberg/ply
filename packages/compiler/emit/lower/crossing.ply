@@ -1,6 +1,7 @@
 //! Values crossing into the runtime and back: written as PLV1 a part at a time through the runtime's
 //! crossing natives (a lowering), read back the same way (a lifting), and what is built on them:
-//! `?encode`, `?decode`, and an extern the runtime answers over its arguments' encoding.
+//! `?encode`, `?decode`, what a failed `assert_eq` shows, and an extern the runtime answers over its
+//! arguments' encoding.
 //! A crossing native takes and answers machine data only: an integer's raw bits, a `Float`'s bits,
 //! the address and length of a byte string's bytes, a runtime object's word.
 //!
@@ -48,7 +49,7 @@ import compiler.emit.lower.evidence (value_handing)
 
 /// The externs a body calls over its arguments' encoding whatever type it calls them at, which the
 /// runtime decodes, answers as it always has, and encodes the answer of.
-pub fn encoded_externs() -> List<Bytes> = [b"assert_eq"]
+pub fn encoded_externs() -> List<Bytes> = []
 
 /// Extern `name` called on `args` over their encoding, as `by_encoding` calls it; in a body generic
 /// over its types, a call settled in the specialisations its callers settle. `callee` is where its
@@ -76,20 +77,31 @@ fn encoded_at(
   types: CallTypes,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  if types.params.push(types.ret).all(settled) { by_encoding(cx, st, name, args, types, at) } else {
-    bound(
-      cx,
-      types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
-        type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
-      types.ret,
-      Op({
-        op: OHandle(Unsettled(name)),
-        args: args,
-        uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
-      }),
-      at,
-    )
-  }
+  if types.params.push(types.ret).all(settled) { by_encoding(cx, st, name, args, types, at) }
+  else { left_to_callers(cx, st, name, args, types, at) }
+
+/// Builtin `name` called on `args` at `types`, which a type variable leaves open: a placeholder no
+/// printer sees, in a body its callers settle at those types and lower again.
+pub fn left_to_callers(
+  cx: Context,
+  st: Lowering,
+  name: Bytes,
+  args: List<Arg>,
+  types: CallTypes,
+  at: Span,
+) -> Lowered =
+  bound(
+    cx,
+    types.params.push(types.ret).fold(st, |s: Lowering, t: Type|
+      type_vars(t).fold(s, |n: Lowering, v: Int| noted(n, { var: v, reads: Exact }))),
+    types.ret,
+    Op({
+      op: OHandle(Unsettled(name)),
+      args: args,
+      uses: { takes: args.map(|_: Arg| false), owned: true, fails: true, stops: false },
+    }),
+    at,
+  )
 
 /// Builtin `name` the runtime answers, called on `args` over their encoding, answering a value of
 /// `ty`.
@@ -312,6 +324,38 @@ fn encoded(
   let written = lowered_part(cx, opened, x, ty, at);
   let n = native_int(written.st, b"?lower_close", [], true, at);
   taken_out(n.st, n.arg, bytes_type(), at)
+}
+
+/// `x`, of type `ty`, as the bytes a diagnostic shows of it: a lowering of its own that keeps nothing
+/// beside its bytes, `x` written into it, and the bytes it ends with copied out.
+fn shown(cx: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> Lowered / {abort.raise} = {
+  let opened = native_done(st, b"?shown_open", [], false, at);
+  let written = lowered_part(cx, opened, x, ty, at);
+  let n = native_int(written.st, b"?lower_close", [], true, at);
+  taken_out(n.st, n.arg, bytes_type(), at)
+}
+
+/// `assert_eq(actual, expected)` over two values of type `ty` found unequal: each as the bytes a
+/// diagnostic shows of it, handed to the runtime, which raises with both shown.
+pub fn assertion_failed(
+  cx: Context,
+  st: Lowering,
+  actual: Arg,
+  expected: Arg,
+  ty: Type,
+  at: Span,
+) -> Lowering / {abort.raise} = {
+  let a = shown(cx, st, actual, ty, at);
+  let e = shown(cx, a.st, expected, ty, at);
+  let a_at = addressed(e.st, a.arg, at);
+  let e_at = addressed(a_at.st, e.arg, at);
+  native_done(
+    e_at.st,
+    b"?assert_failed",
+    [a_at.address, a_at.count, e_at.address, e_at.count],
+    true,
+    at,
+  )
 }
 
 /// The value of type `ty` the encoding `b` holds: a lifting of its own over `b`'s bytes, the value

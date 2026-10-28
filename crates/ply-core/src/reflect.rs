@@ -1,8 +1,8 @@
-//! A value as `std.value.Value` holds it: what a program reflects on, and what a diagnostic's values
-//! become before they are rendered.
+//! A value as `std.value.Value` holds it: what a program reflects on.
 
 use crate::limit::grow;
-use crate::{Fun, IntTy, Plain, Symbol, Value as PlyValue};
+use crate::value::{ClosureKind, Synth};
+use crate::{IntTy, Symbol, Value as PlyValue};
 use std::sync::Arc;
 
 fn value_ctor(name: &str, args: Vec<PlyValue>) -> PlyValue {
@@ -23,94 +23,97 @@ fn byte(n: u8) -> PlyValue {
     PlyValue::Fixed(crate::Fixed::new(IntTy::U8, u128::from(n)))
 }
 
+/// All of `v`, a hold as `VHold` and a credential as `VSecret`.
 #[allow(clippy::arc_with_non_send_sync)]
-pub fn value_of(p: &Plain) -> PlyValue {
+pub fn value_of(v: &PlyValue) -> PlyValue {
     let entry =
-        |(k, v): &(Plain, Plain)| record(vec![("key", value_of(k)), ("value", value_of(v))]);
-    let entries = |es: &[(Plain, Plain)]| PlyValue::list(es.iter().map(entry).collect());
-    match p {
-        Plain::Unit => value_ctor("VUnit", vec![]),
-        Plain::Bool(b) => value_ctor("VBool", vec![PlyValue::Bool(*b)]),
-        Plain::Int(i) => value_ctor("VInt", vec![PlyValue::Int(*i)]),
-        Plain::Float(f) => value_ctor("VFloat", vec![PlyValue::Float(*f)]),
-        Plain::Decimal(d) => value_ctor("VDecimal", vec![PlyValue::Decimal(*d)]),
-        Plain::Fixed { ty, bits } => value_ctor(
+        |(k, x): (&PlyValue, &PlyValue)| record(vec![("key", value_of(k)), ("value", value_of(x))]);
+    let items = |xs: &mut dyn Iterator<Item = &PlyValue>| {
+        PlyValue::list(grow(|| xs.map(value_of).collect()))
+    };
+    match v {
+        PlyValue::Unit => value_ctor("VUnit", vec![]),
+        PlyValue::Bool(b) => value_ctor("VBool", vec![PlyValue::Bool(*b)]),
+        PlyValue::Int(i) => value_ctor("VInt", vec![PlyValue::Int(*i)]),
+        PlyValue::Float(f) => value_ctor("VFloat", vec![PlyValue::Float(*f)]),
+        PlyValue::Decimal(d) => value_ctor("VDecimal", vec![PlyValue::Decimal(*d)]),
+        PlyValue::Fixed(f) => value_ctor(
             "VFixed",
             vec![
-                PlyValue::str(ty.name()),
-                PlyValue::Fixed(crate::Fixed::new(IntTy::U128, *bits)),
+                PlyValue::str(f.ty.name()),
+                PlyValue::Fixed(crate::Fixed::new(IntTy::U128, f.raw())),
             ],
         ),
-        Plain::Char(c) => value_ctor("VChar", vec![PlyValue::Char(*c)]),
-        Plain::Str(s) => value_ctor("VStr", vec![PlyValue::str(s)]),
-        Plain::Bytes(b) => value_ctor("VBytes", vec![PlyValue::bytes(b)]),
-        Plain::List(items) => value_ctor(
-            "VList",
-            vec![PlyValue::list(grow(|| {
-                items.iter().map(value_of).collect()
-            }))],
-        ),
-        Plain::Array(items) => value_ctor(
-            "VArray",
-            vec![PlyValue::list(grow(|| {
-                items.iter().map(value_of).collect()
-            }))],
-        ),
-        Plain::Record(fields) => value_ctor(
+        PlyValue::Char(c) => value_ctor("VChar", vec![PlyValue::Char(*c)]),
+        PlyValue::Str(s) => value_ctor("VStr", vec![PlyValue::str(s)]),
+        PlyValue::Bytes(b) => value_ctor("VBytes", vec![PlyValue::bytes(b)]),
+        PlyValue::List(xs) => value_ctor("VList", vec![items(&mut xs.iter())]),
+        PlyValue::Array(xs) => value_ctor("VArray", vec![items(&mut xs.iter())]),
+        PlyValue::Record(fields) => value_ctor(
             "VRecord",
             vec![PlyValue::list(grow(|| {
                 fields
                     .iter()
-                    .map(|(name, v)| {
-                        record(vec![("name", PlyValue::str(name)), ("value", value_of(v))])
+                    .map(|(name, x)| {
+                        record(vec![
+                            ("name", PlyValue::str(name.as_str())),
+                            ("value", value_of(x)),
+                        ])
                     })
                     .collect()
             }))],
         ),
-        Plain::Ctor(name, args) => value_ctor(
+        PlyValue::Ctor { name, args } => value_ctor(
             "VCtor",
-            vec![
-                PlyValue::str(name),
-                PlyValue::list(grow(|| args.iter().map(value_of).collect())),
-            ],
+            vec![PlyValue::str(name.as_str()), items(&mut args.iter())],
         ),
-        Plain::Map(es) => value_ctor("VMap", vec![grow(|| entries(es))]),
-        Plain::Fn(f) => value_ctor(
-            "VFn",
-            vec![match f {
-                Fun::Named(name) => value_ctor("FNamed", vec![PlyValue::str(name)]),
-                Fun::Anonymous => value_ctor("FAnonymous", vec![]),
-                Fun::Const { arity, value } => value_ctor(
-                    "FConst",
-                    vec![record(vec![
-                        ("arity", byte(*arity)),
-                        ("value", grow(|| value_of(value))),
-                    ])],
-                ),
-                Fun::Project { arity, index } => value_ctor(
-                    "FProject",
-                    vec![record(vec![
-                        ("arity", byte(*arity)),
-                        ("index", byte(*index)),
-                    ])],
-                ),
-                Fun::Table {
-                    arity,
-                    entries: es,
-                    default,
-                } => value_ctor(
-                    "FTable",
-                    vec![record(vec![
-                        ("arity", byte(*arity)),
-                        ("entries", grow(|| entries(es))),
-                        ("default", grow(|| value_of(default))),
-                    ])],
-                ),
-            }],
+        PlyValue::Map(m) => value_ctor(
+            "VMap",
+            vec![PlyValue::list(grow(|| m.iter().map(entry).collect()))],
         ),
-        Plain::Hold => value_ctor("VHold", vec![]),
-        Plain::Secret => value_ctor("VSecret", vec![]),
-        Plain::Elided(n) => value_ctor("VElided", vec![PlyValue::Int(*n as i64)]),
+        PlyValue::Closure(c) => match &c.kind {
+            ClosureKind::Hold { .. } => value_ctor("VHold", vec![]),
+            ClosureKind::Synth { arity, rule } => value_ctor(
+                "VFn",
+                vec![match rule {
+                    Synth::Const(x) => value_ctor(
+                        "FConst",
+                        vec![record(vec![
+                            ("arity", byte(*arity)),
+                            ("value", grow(|| value_of(x))),
+                        ])],
+                    ),
+                    Synth::Project(index) => value_ctor(
+                        "FProject",
+                        vec![record(vec![
+                            ("arity", byte(*arity)),
+                            ("index", byte(*index)),
+                        ])],
+                    ),
+                    Synth::Table { entries, default } => value_ctor(
+                        "FTable",
+                        vec![record(vec![
+                            ("arity", byte(*arity)),
+                            (
+                                "entries",
+                                PlyValue::list(grow(|| {
+                                    entries.iter().map(|(k, x)| entry((k, x))).collect()
+                                })),
+                            ),
+                            ("default", grow(|| value_of(default))),
+                        ])],
+                    ),
+                }],
+            ),
+            ClosureKind::Continuation { .. } => value_ctor(
+                "VFn",
+                vec![match &c.name {
+                    Some(name) => value_ctor("FNamed", vec![PlyValue::str(name.as_str())]),
+                    None => value_ctor("FAnonymous", vec![]),
+                }],
+            ),
+        },
+        PlyValue::Secret(_) => value_ctor("VSecret", vec![]),
     }
 }
 
@@ -153,6 +156,6 @@ pub fn shown_of(v: &PlyValue) -> PlyValue {
                     .collect()
             }))],
         ),
-        leaf => value_of(&Plain::of(leaf)),
+        leaf => value_of(leaf),
     }
 }

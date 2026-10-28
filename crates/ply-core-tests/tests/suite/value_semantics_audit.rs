@@ -1,7 +1,7 @@
 // `Value`'s `Arc` payloads are deliberately not `Send`.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{Decimal, Plain, Span, Value, assertion_failure, first_difference, values_equal};
+use ply_core::{Decimal, Span, Value, values_equal};
 use std::sync::Arc;
 
 /// A credential, and its payload held apart, to count who else holds it.
@@ -12,67 +12,6 @@ fn credential(text: &str) -> (Value, Arc<ply_core::Sealed>) {
     };
     let payload = Arc::clone(payload);
     (secret, payload)
-}
-
-/// A failing assertion's diagnostic is what a report prints and a failure document carries.
-#[test]
-fn the_assertion_differ_never_descends_into_a_credential() {
-    let hidden = "hunter2";
-    let other = "correct-horse-battery-staple";
-    let secret = Value::secret_text;
-    let record = |s: Value| {
-        Value::Record(Arc::new(
-            [(ply_core::Symbol::new("password"), s)]
-                .into_iter()
-                .collect(),
-        ))
-    };
-
-    let pairs: Vec<(&str, Value, Value)> = vec![
-        ("bare", secret(hidden), secret(other)),
-        (
-            "in a list",
-            Value::list(vec![Value::Int(1), secret(hidden)]),
-            Value::list(vec![Value::Int(1), secret(other)]),
-        ),
-        ("in a record", record(secret(hidden)), record(secret(other))),
-        (
-            "in a variant",
-            Value::ctor("Login", vec![secret(hidden)]),
-            Value::ctor("Login", vec![secret(other)]),
-        ),
-        (
-            "as a map value",
-            Value::map([(Value::str("ada"), secret(hidden))]),
-            Value::map([(Value::str("ada"), secret(other))]),
-        ),
-        (
-            "a list against a shorter one",
-            Value::list(vec![secret(hidden)]),
-            Value::list(vec![secret(hidden), secret(other)]),
-        ),
-    ];
-
-    for (label, actual, expected) in pairs {
-        let failed = assertion_failure(&actual, &expected, Span::DUMMY);
-        for text in [
-            format!("{failed:?}"),
-            format!("{:?}", first_difference(&actual, &expected)),
-            format!("{:?}", first_difference(&expected, &actual)),
-        ] {
-            assert!(
-                !text.contains(hidden) && !text.contains(other),
-                "{label}: a payload reached what a failure keeps: {text}"
-            );
-        }
-        assert!(
-            failed
-                .values
-                .iter()
-                .any(|v| format!("{v:?}").contains("Secret")),
-            "{label}: the credential is missing from the carried values, so something else stood in"
-        );
-    }
 }
 
 /// Every value shape this evaluator can hold, in pairs, for the scan below.
@@ -250,7 +189,7 @@ fn a_key_holding_a_credential_is_held_as_given_and_never_copied_out() {
         ),
         other => panic!("the credential stopped being a `Secret`: {other:?}"),
     }
-    let copied = format!("{:?}", Plain::of(&m));
+    let copied = format!("{m:?}");
     assert!(
         copied.contains("Secret"),
         "a key lost its credential: {copied}"

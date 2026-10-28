@@ -14,7 +14,7 @@ use ply_compiled::emitted::{Handed, PlyFnDesc, PlyOp, PlyType};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::I64;
 use ply_compiled::rt::{Ctx, FAILED_TARGET, HOSTED};
-use ply_core::{EffectAtom, Mode, Plain, Resource};
+use ply_core::{EffectAtom, Mode, Resource};
 use std::cell::Cell;
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -128,7 +128,9 @@ fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_i
         "{}",
         d.message
     );
-    assert_eq!(d.values.iter().collect::<Vec<_>>(), [&Plain::Int(42)]);
+    let mut shown = ply_core::codec::Writer::new();
+    shown.int(42);
+    assert_eq!(d.values.iter().collect::<Vec<_>>(), [&shown.finish()]);
     assert_eq!(ctx.heap.live(), 0, "the payload was not let go");
     ctx.end();
 }

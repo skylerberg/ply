@@ -198,14 +198,14 @@ pub unsafe extern "C" fn rt_refused_text(
         }
         Refused::Assert => {
             let message = if n.0 < 0 {
-                Value::ctor("None", Vec::new())
+                None
             } else {
                 match c.text(unsafe { lent(p, n) }) {
-                    Some(s) => Value::ctor("Some", vec![Value::str(s)]),
+                    Some(s) => Some(s),
                     None => return Raises(()),
                 }
             };
-            assert_failure(&message, site)
+            assert_failure(message, site)
         }
         Refused::SecretDecode | Refused::SecretEncode => {
             let Some(encoding) = c.text(unsafe { lent(p, n) }) else {

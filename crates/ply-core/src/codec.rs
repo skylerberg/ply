@@ -52,6 +52,14 @@ pub mod fun {
     pub const RESUMES: u8 = 5;
 }
 
+/// The position a [`tag::HANDLE`] is written at in a value a diagnostic shows, which keeps nothing
+/// beside its bytes: what the runtime object is, as `std.value.decode_shown` reads it.
+pub mod shown {
+    /// A credential, or any other runtime object but a hold.
+    pub const SEALED: u64 = 0;
+    pub const HOLD: u64 = 1;
+}
+
 /// Whether a value of `tag` is numbered for [`tag::AGAIN`].
 pub fn shareable(t: u8) -> bool {
     matches!(t, tag::STR | tag::BYTES | tag::LIST | tag::ARRAY | tag::MAP)

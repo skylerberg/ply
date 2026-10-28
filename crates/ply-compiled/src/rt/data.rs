@@ -1,6 +1,7 @@
 //! The runtime's part of `bracket`, and the refusals and notes compiled code over data raises or makes.
 
 use super::*;
+use crate::native::Addr;
 
 /// `bracket(acquire, release, body)`: `body` given what `acquire` answered and `cleanup` given it
 /// after, however `body` ends: by returning, by a raise or a clause that did not resume it unwinding
@@ -429,6 +430,34 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         }
     };
     refuse(cx, r, refused);
+    Raises(())
+}
+
+/// `assert_eq` found its two values unequal: raised for `abort.raise` to answer, showing the actual
+/// value, the `n` PLV1 bytes at `actual`, and the expected, the `m` at `expected`, which the CLI
+/// renders, noting where the two first part.
+#[allow(improper_ctypes_definitions)]
+pub unsafe extern "C" fn rt_assert_failed(
+    ctx: *mut Ctx,
+    actual: Addr,
+    n: I64,
+    expected: Addr,
+    m: I64,
+) -> Raises {
+    let c = unsafe { &mut *ctx };
+    let (e, a) = (ply_core::slot(0), ply_core::slot(1));
+    let d = Diagnostic::error(
+        codes::ASSERTION_FAILED,
+        format!("assertion failed: expected {e}, found {a}"),
+    )
+    .primary(c.site(), "these values are not equal")
+    .note(format!("expected: {e}"))
+    .note(format!("actual:   {a}"))
+    .showing(vec![
+        unsafe { lent(expected, m) }.to_vec(),
+        unsafe { lent(actual, n) }.to_vec(),
+    ]);
+    raise_error(c, d);
     Raises(())
 }
 
