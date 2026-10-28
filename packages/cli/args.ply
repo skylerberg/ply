@@ -88,9 +88,65 @@ pub fn no_flags() -> Flags =
 /// nothing it writes.
 pub fn style_of(flags: Flags) -> Style = if flags.color { ansi() } else { plain() }
 
-/// Whether `--filter` keeps `key`: no filter keeps everything, and any one substring keeps it.
-pub fn kept(filters: List<String>, key: String) -> Bool =
-  filters.len() == 0 || filters.fold(false, |hit: Bool, f: String| hit || key.contains(f))
+/// Whether `--filter` keeps `key`, the key of an item of the module `module`, `modules` holding the
+/// name of each module of the load: no filter keeps everything, and any one that keeps it does. A
+/// filter keeps a key it is contained in; one that names a module (`names_module`) only where it
+/// begins within the key's `<module>.`, so it never matches the text of a label.
+pub fn kept(
+  filters: List<String>,
+  modules: Map<String, Bool>,
+  module: String,
+  key: String,
+) -> Bool / {abort.raise} =
+  filters.len() == 0
+    || filters.any(|f: String|
+      if !names_module(f, modules) { key.contains(f) } else {
+        let k = Bytes::of_string(key);
+        // Every occurrence that begins within `<module>.` ends within this many bytes.
+        let window = Bytes::of_string(module).len() + Bytes::of_string(f).len();
+        k.slice(0, if window < k.len() { window } else { k.len() }).index_of(Bytes::of_string(f))
+          != None
+      })
+
+/// Whether `--filter` could keep a key of an item of `module`, whatever follows the key's
+/// `<module>.`: all a run knows of a test over cases before its table lists its labels.
+pub fn could_keep(
+  filters: List<String>,
+  modules: Map<String, Bool>,
+  module: String,
+) -> Bool / {abort.raise} =
+  filters.len() == 0
+    || filters.any(|f: String|
+      !names_module(f, modules)
+        || {
+          let head = Bytes::of_string(module ++ ".");
+          let text = Bytes::of_string(f);
+          range(0, head.len()).any(|at: Int| {
+            let rest = head.slice(at, head.len());
+            rest.starts_with(text) || text.starts_with(rest)
+          })
+        })
+
+/// The modules `names` names, as `kept` reads them.
+pub fn module_names(names: List<Bytes>) -> Map<String, Bool> =
+  names.fold(Map::new(), |acc: Map<String, Bool>, n: Bytes|
+    acc.insert(String::of_bytes_lossy(n), true))
+
+/// Whether filter `f` names a module: it holds a `.`, and a whole dotted run of it is the name of
+/// one of `modules`.
+fn names_module(f: String, modules: Map<String, Bool>) -> Bool =
+  f.contains(".")
+    && {
+      let parts = f.split(".");
+      range(0, parts.len()).any(|from: Int|
+        parts.drop(from).fold(
+          { run: None, named: false },
+          |s: { run: Option<String>, named: Bool }, part: String| {
+            let run = match s.run { Some(r) -> r ++ "." ++ part, None -> part };
+            { run: Some(run), named: s.named || modules.contains(run) }
+          },
+        ).named)
+    }
 
 // --- The adapter: a parsed line as the Flags the commands read -----------------------------
 
@@ -201,7 +257,52 @@ test "a line the parser refuses leaves the defaults rather than half a set of fl
 test "`ply test`'s `--filter` repeats, and a key any one of them matches is kept" {
   let filters = from_argv("test", ["--filter", "a.", "--filter", "b.x"]).filters;
   assert_eq(filters, ["a.", "b.x"]);
-  assert(kept(filters, "b.xy"));
-  assert(!kept(filters, "c.x"));
-  assert(kept([], "c.x"))
+  let none = Map::new();
+  assert(kept(filters, none, "b", "b.xy"));
+  assert(!kept(filters, none, "c", "c.x"));
+  assert(kept([], none, "c", "c.x"))
+}
+
+/// Modules a filter can name, one inside another.
+fn named_modules() -> Map<String, Bool> =
+  Map::new().insert("std.ascii85", true).insert("std.ascii85.sub", true).insert("std.base64", true)
+
+test "a filter that names a module keeps keys from that module on, and other text keeps any key holding it" {
+  let ms = named_modules();
+  // A label holding a module's name is no match for a filter naming that module.
+  assert(!kept(["std.ascii85."], ms, "std.base64", "std.base64.std.ascii85. as text"));
+  assert(kept(["std.ascii85."], ms, "std.ascii85", "std.ascii85.an encode"));
+  assert(kept(["std.ascii85"], ms, "std.ascii85.sub", "std.ascii85.sub.a case"));
+  assert(kept(["ascii85.an"], ms, "std.ascii85", "std.ascii85.an encode"));
+  // Text naming no module matches a label wherever it is, dots among it.
+  assert(kept(["is written z"], ms, "std.base64", "std.base64.0 is written z"));
+  assert(kept(["1.5"], ms, "std.base64", "std.base64.1.5 rounds"));
+  assert(kept(["base64"], ms, "std.ascii85", "std.ascii85.not base64"))
+}
+
+test "a filter keeps a key only of a module it could keep, whatever the label" {
+  let ms = named_modules();
+  let filters = [
+    "std.ascii85.",
+    "std.ascii85",
+    "ascii85.an",
+    "std.",
+    "sub.a",
+    "is written",
+    "1.5",
+    "std.base64.0",
+  ];
+  let modules = ["std.ascii85", "std.ascii85.sub", "std.base64", "app"];
+  let labels = ["an encode", "std.ascii85. as text", "0 is written z", "a case", "1.5 rounds"];
+  assert(
+    filters.all(|f: String|
+      modules.all(|m: String|
+        could_keep([f], ms, m) || labels.all(|l: String| !kept([f], ms, m, m ++ "." ++ l)))),
+    None,
+  );
+  // What a run lists for `std.ascii85.`: that module's tables and those beneath it.
+  assert_eq(modules.filter(|m: String| could_keep(["std.ascii85."], ms, m)), [
+    "std.ascii85",
+    "std.ascii85.sub",
+  ])
 }
