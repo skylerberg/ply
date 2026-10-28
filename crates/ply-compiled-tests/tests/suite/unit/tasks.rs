@@ -366,11 +366,13 @@ fn a_steps_footprint_is_written_as_the_trail_reads_it_and_taken_once() {
         },
         [0, 0, 0],
     ));
+    assert_eq!(unsafe { tasks::rt_footprint_held(&mut ctx) }.0, 2);
     let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
     assert_eq!(
         taken(&mut ctx, n.0),
         b"\x02\x00\x03log\x00\x01x\x01\x00\x06\x02\x04\x02\x12\x00\x00\x00\x00"
     );
+    assert_eq!(unsafe { tasks::rt_footprint_held(&mut ctx) }.0, 0);
     let n = unsafe { tasks::rt_footprint_taken(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), b"\x00");
 }

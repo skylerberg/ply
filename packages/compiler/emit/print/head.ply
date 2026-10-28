@@ -102,9 +102,11 @@ fn prelude() -> Bytes / {abort.raise} =
     b"#endif\n",
     b"#ifdef PLY_FAR\n",
     b"#include <stddef.h>\n",
+    // arm64 loads and stores a word at any alignment.
     b"static void *memcpy(void *d, const void *s, size_t n) {\n",
     b"  unsigned char *a = d;\n",
     b"  const unsigned char *b = s;\n",
+    b"  for (; n >= 8; n -= 8, a += 8, b += 8) *(uint64_t *)a = *(const uint64_t *)b;\n",
     b"  while (n--) *a++ = *b++;\n",
     b"  return d;\n",
     b"}\n",
@@ -116,6 +118,11 @@ fn prelude() -> Bytes / {abort.raise} =
     b"  return d;\n",
     b"}\n",
     b"static void *memset(void *d, int c, size_t n) {\n",
+    b"  if (c == 0 && (((uintptr_t)d | n) & 7) == 0) {\n",
+    b"    uint64_t *x = d;\n",
+    b"    for (n /= 8; n; n--) *x++ = 0;\n",
+    b"    return d;\n",
+    b"  }\n",
     b"  unsigned char *a = d;\n",
     b"  while (n--) *a++ = (unsigned char)c;\n",
     b"  return d;\n",
@@ -141,8 +148,9 @@ fn prelude() -> Bytes / {abort.raise} =
     b"\n",
     declared(ctx_struct()),
     b"#define PLY_SITE(ctx, r, s, e) ((ctx)->site_root = (r), (ctx)->site_start = (s), (ctx)->site_end = (e))\n",
-    b"static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }\n",
-    b"static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }\n",
+    // Macros, since tcc inlines no function.
+    b"#define ply_words(w) ((Word *)((char *)(intptr_t)(w) + PLY_HEADER))\n",
+    b"#define ply_obj(w) ((PlyObj *)(intptr_t)(w))\n",
     b"static inline uint32_t ply_le32(uint32_t v) {\n",
     b"#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__\n",
     b"  return __builtin_bswap32(v);\n",
@@ -161,16 +169,8 @@ fn prelude() -> Bytes / {abort.raise} =
     b"static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_sub_overflow(a, b, r); }\n",
     b"static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_mul_overflow(a, b, r); }\n",
     b"#else\n",
-    b"static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) {\n",
-    b"  uint64_t s = (uint64_t)a + (uint64_t)b;\n",
-    b"  *r = (int64_t)s;\n",
-    b"  return (int)((((uint64_t)a ^ s) & ((uint64_t)b ^ s)) >> 63);\n",
-    b"}\n",
-    b"static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {\n",
-    b"  uint64_t s = (uint64_t)a - (uint64_t)b;\n",
-    b"  *r = (int64_t)s;\n",
-    b"  return (int)((((uint64_t)a ^ (uint64_t)b) & ((uint64_t)a ^ s)) >> 63);\n",
-    b"}\n",
+    b"#define ply_add_ov(a, b, r) ({ uint64_t ply_a_ = (uint64_t)(a), ply_b_ = (uint64_t)(b), ply_s_ = ply_a_ + ply_b_; *(r) = (int64_t)ply_s_; (int)(((ply_a_ ^ ply_s_) & (ply_b_ ^ ply_s_)) >> 63); })\n",
+    b"#define ply_sub_ov(a, b, r) ({ uint64_t ply_a_ = (uint64_t)(a), ply_b_ = (uint64_t)(b), ply_s_ = ply_a_ - ply_b_; *(r) = (int64_t)ply_s_; (int)(((ply_a_ ^ ply_b_) & (ply_a_ ^ ply_s_)) >> 63); })\n",
     // A product's magnitude must divide back, then fit the sign's range, one more below zero.
     b"static inline int ply_mul_ov(int64_t a, int64_t b, int64_t *r) {\n",
     b"  uint64_t x = a < 0 ? 0 - (uint64_t)a : (uint64_t)a;\n",
@@ -225,8 +225,9 @@ fn head_part() -> Bytes / {abort.raise} =
 /// arguments' words, which has two words to spare past them. A clause's slot has the clause's
 /// record in its `handle`'s instance as its environment: the clause's closure, the instance, the
 /// clause's place, counted from 1, and the descriptor of `String`. `ply_answers` answers the perform
-/// with what the clause answers; `ply_resumes` hands the clause a continuation in the first spare
-/// word, which records what it is resumed with, and a clause that did not resume unwinds to its
+/// with what the clause answers, and `ply_schedules` likewise for the scheduler's clauses, whose
+/// work no cost of the program counts; `ply_resumes` hands the clause a continuation in the first
+/// spare word, which records what it is resumed with, and a clause that did not resume unwinds to its
 /// instance with what it answered; their `_labelled` twins first hand a clause binding its label
 /// the perform's, as a `String`, in the first spare word, the continuation in the next;
 /// `ply_raises` leaves the raise's arguments in the instance and unwinds to it, whose landing runs
@@ -287,6 +288,12 @@ fn entries_defined() -> Bytes =
     b"  ply_performed_here(ctx);\n",
     b"  if (ctx->recording) rt_performed_p(ctx, op, res, mode);\n",
     b"  return ply_uniform(ctx, e[0], (const Word *)(intptr_t)args);\n",
+    b"}\n",
+    b"static Word ply_schedules(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
+    b"  Word was = rt_scheduler_entered_p(ctx);\n",
+    b"  Word r = ply_answers(ctx, env, op, mode, res, args);\n",
+    b"  rt_scheduler_left_p(ctx, was);\n",
+    b"  return r;\n",
     b"}\n",
     b"static Word ply_answers_labelled(PlyCtx *ctx, Word env, Word op, Word mode, Word res, Word args) {\n",
     b"  const Word *e = (const Word *)(intptr_t)env;\n",
@@ -541,43 +548,43 @@ fn drops() -> Bytes / {abort.raise} = {
 fn helpers() -> Bytes = {
   let floor = ascii_of_int(pointer_floor());
   let tags = ascii_of_int((1 << tag_bits()) - 1);
+  // Macros, since tcc inlines no function; each reads its operand once.
   Bytes::concat_all([
-    b"static inline int ",
-    call_text(last_fn(), [b"PlyCtx *ctx", b"Word o"]),
-    b" {\n",
-    b"  PlyObj *h = ply_obj(o);\n",
-    b"  uint32_t rc = h->rc;\n",
-    b"  if (rc >= PLY_RC_FRAME) return 0;\n",
-    b"  if (rc >= UINT32_C(0x80000000)) return (int)",
-    call_text(dec_shared_last_fn(), [b"ctx", b"o"]),
-    b";\n",
-    b"  if (rc > 1) { h->rc = rc - 1; return 0; }\n",
     b"#ifdef PLY_CHECKED\n",
-    b"  if (rc == 0) ",
+    b"#  define ply_released_twice(ctx, o, rc) if (rc == 0) ",
     call_text(released_twice_fn(), [b"ctx", b"o"]),
     b";\n",
+    b"#else\n",
+    b"#  define ply_released_twice(ctx, o, rc)\n",
     b"#endif\n",
-    b"  return 1;\n",
-    b"}\n",
-    b"static inline void ",
-    call_text(dup_fn(), [b"Word o"]),
-    b" {\n",
-    b"  if (!o) return;\n",
-    b"  PlyObj *h = ply_obj(o);\n",
-    b"  uint32_t rc = h->rc;\n",
-    b"  if (rc < UINT32_C(0x80000000)) h->rc = rc + 1;\n",
-    b"  else if (rc < PLY_RC_FRAME) ",
-    call_text(inc_shared_fn(), [b"0", b"o"]),
-    b";\n",
-    b"}\n",
-    b"typedef Word (*PlyDrop)(PlyCtx *, Word);\n",
-    b"static inline void ",
-    call_text(rel_fn(), [b"PlyCtx *ctx", b"Word o", b"PlyDrop d"]),
-    b" {\n",
-    b"  if (o && ",
+    b"#define ",
     call_text(last_fn(), [b"ctx", b"o"]),
-    b") d(ctx, o);\n",
-    b"}\n",
+    b" ({ \\\n",
+    b"  Word ply_last_o = (o); PlyObj *h = ply_obj(ply_last_o); uint32_t rc = h->rc; int ply_last_r = 0; \\\n",
+    b"  if (rc >= PLY_RC_FRAME) {} \\\n",
+    b"  else if (rc >= UINT32_C(0x80000000)) ply_last_r = (int)",
+    call_text(dec_shared_last_fn(), [b"ctx", b"ply_last_o"]),
+    b"; \\\n",
+    b"  else if (rc > 1) h->rc = rc - 1; \\\n",
+    b"  else { ply_released_twice(ctx, ply_last_o, rc) ply_last_r = 1; } \\\n",
+    b"  ply_last_r; })\n",
+    b"#define ",
+    call_text(dup_fn(), [b"o"]),
+    b" ({ \\\n",
+    b"  Word ply_dup_o = (o); \\\n",
+    b"  if (ply_dup_o) { \\\n",
+    b"    PlyObj *h = ply_obj(ply_dup_o); uint32_t rc = h->rc; \\\n",
+    b"    if (rc < UINT32_C(0x80000000)) h->rc = rc + 1; \\\n",
+    b"    else if (rc < PLY_RC_FRAME) ",
+    call_text(inc_shared_fn(), [b"0", b"ply_dup_o"]),
+    b"; \\\n",
+    b"  } })\n",
+    b"typedef Word (*PlyDrop)(PlyCtx *, Word);\n",
+    b"#define ",
+    call_text(rel_fn(), [b"ctx", b"o", b"d"]),
+    b" ({ Word ply_rel_o = (o); if (ply_rel_o && ",
+    call_text(last_fn(), [b"ctx", b"ply_rel_o"]),
+    b") (d)(ctx, ply_rel_o); })\n",
     b"static inline void ",
     call_text(rel_sum_fn(), [b"PlyCtx *ctx", b"Word w", b"PlyDrop d"]),
     b" {\n",
@@ -883,7 +890,7 @@ test "each machine struct is declared before one that points at it, its fields i
   })
 }
 
-test "each sequence the printers share is defined once in the head, as a function a use calls" {
+test "each sequence the printers share is defined once in the head, which each use names" {
   let h = head_part();
   let shared = [
     entered_fn(),

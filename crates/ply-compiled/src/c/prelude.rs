@@ -359,6 +359,8 @@ helpers! {
         args: *const Handed
     ) -> Handed;
     rt_performed(op: *const PlyOp, resource: I64, mode: I64);
+    rt_scheduler_entered() -> Word;
+    rt_scheduler_left(was);
     rt_pending_raised_at(effect: I64, op: I64) -> Handed;
     rt_label_string(resource: I64, string: *const PlyType) -> Handed;
     rt_task_abandons(op: *const PlyOp) -> Word;

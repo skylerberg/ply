@@ -220,3 +220,59 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
     );
     ctx.end();
 }
+
+type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
+type Left = unsafe extern "C" fn(*mut Ctx, Word);
+
+/// The program's calls and allocations, as `metered` and a budget count them.
+fn spent(ctx: &Ctx) -> (i64, usize, usize) {
+    (ctx.ticks, ctx.heap.allocated(), ctx.heap.allocated_bytes())
+}
+
+#[test]
+fn the_schedulers_own_work_costs_the_program_nothing_however_it_nests() {
+    let mut ctx = context_of(&[], Vec::new());
+    ctx.begin_bounded(1_000, 0, 0);
+    let c: *mut Ctx = &mut ctx;
+    let (entered, left) = (
+        helper::<Entered>("rt_scheduler_entered"),
+        helper::<Left>("rt_scheduler_left"),
+    );
+    ctx.ticks = 5;
+    let mine = boxed(c, 1);
+    let before = spent(&ctx);
+    let outer = unsafe { entered(c) };
+    let inner = unsafe { entered(c) };
+    ctx.ticks += 100;
+    let theirs = boxed(c, 2);
+    unsafe { left(c, inner) };
+    assert_ne!(
+        spent(&ctx),
+        before,
+        "a nested entry leaves the scheduler running"
+    );
+    unsafe { left(c, outer) };
+    assert_eq!((outer, inner), (0, 1));
+    assert_eq!(spent(&ctx), before);
+    let_go(c, theirs);
+    let_go(c, mine);
+    ctx.end();
+}
+
+#[test]
+fn no_budget_of_calls_bounds_the_schedulers_own_work() {
+    let mut ctx = context_of(&[], Vec::new());
+    ctx.begin_bounded(1_000, 10, 0);
+    let c: *mut Ctx = &mut ctx;
+    let was = unsafe { helper::<Entered>("rt_scheduler_entered")(c) };
+    assert_eq!(
+        ctx.next_tick,
+        i64::MAX,
+        "no tick is asked for while only a budget bounds the run"
+    );
+    ctx.ticks += 50;
+    unsafe { helper::<Left>("rt_scheduler_left")(c, was) };
+    assert_eq!((ctx.ticks, ctx.next_tick), (0, 11));
+    assert!(ctx.take_failure().is_none());
+    ctx.end();
+}

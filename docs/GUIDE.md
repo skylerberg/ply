@@ -2555,7 +2555,10 @@ times, ordered by the atom's qualified name. A
 memoized constant costs what computing it costs, whether or not an earlier call
 computed it, so a cost is the same however often it is read, and the same
 under either profile (§8.6); a `const fn` a build kept the value of costs
-nothing to read (§3.5):
+nothing to read (§3.5). An operation a region's scheduler answers (`task`'s, and
+under `simulate` `clock`'s, `random`'s and `sim`'s) costs the program nothing:
+the scheduler's own work is no step, object or byte of it, and no `--steps`
+budget bounds that work:
 
 ```ply
 type Chain = | Link(Int, Chain) | End

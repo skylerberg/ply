@@ -409,7 +409,12 @@ pub(crate) fn waited(c: &mut Ctx, code: i64, n: i64) -> Option<bool> {
         word: 0,
         site: [c.performed_root, c.performed_start, c.performed_end],
     };
+    let was = c.scheduler_entered();
+    let ctx: *mut Ctx = c;
     let heard = unsafe { to_loop(region, request) };
+    if !was {
+        unsafe { &mut *ctx }.program_entered();
+    }
     Some(unsafe { runs_on(region, &heard) })
 }
 
@@ -442,6 +447,8 @@ extern "C" fn task_entry(arg: usize) {
         unsafe { (body.run)(ctx, body.arg) };
     }
     let c = unsafe { &mut *ctx };
+    // A body that failed left without saying the program's work ended.
+    c.scheduler_entered();
     let site = [c.site_root, c.site_start, c.site_end];
     let (code, stashed) = match c.failed {
         0 => (FINISHED, None),
@@ -514,6 +521,14 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
             rt_stacks_outer as unsafe extern "C" fn(_, _, _) -> _,
         ),
         n("task_as", rt_handle_as as unsafe extern "C" fn(_, _) -> _),
+        n(
+            "program_resumed",
+            rt_program_resumed as unsafe extern "C" fn(_, _, _, _) -> _,
+        ),
+        n(
+            "program_paused",
+            rt_program_paused as unsafe extern "C" fn(_, _, _) -> _,
+        ),
         n("chan_as", rt_handle_as as unsafe extern "C" fn(_, _) -> _),
         n(
             "trail_entered",
@@ -536,6 +551,10 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
         n(
             "footprint_taken",
             rt_footprint_taken as unsafe extern "C" fn(_) -> _,
+        ),
+        n(
+            "footprint_held",
+            rt_footprint_held as unsafe extern "C" fn(_) -> _,
         ),
         n(
             "task_body",
@@ -1023,6 +1042,29 @@ pub fn seeded_region(c: &Ctx) -> Option<Span> {
     unsafe { (**region).is_seeded() }.then(|| c.span_at(*root, *start, *end))
 }
 
+/// `body`, which it takes and hands back, the program's own work running from here: its costs go
+/// on from where it left them. The two descriptors are of `body`'s type, as handed and as answered.
+pub unsafe extern "C" fn rt_program_resumed(
+    ctx: *mut Ctx,
+    body: Handed,
+    _handed: *const PlyType,
+    _answered: *const PlyType,
+) -> Handed {
+    unsafe { &mut *ctx }.program_entered();
+    body
+}
+
+/// `answer`, a value of the type `ty` describes, kept as [`rt_keep`] keeps it, the program's own
+/// work having ended with it: the keeping is the scheduler's.
+pub unsafe extern "C" fn rt_program_paused(
+    ctx: *mut Ctx,
+    answer: Handed,
+    ty: *const PlyType,
+) -> Handle {
+    unsafe { &mut *ctx }.scheduler_entered();
+    unsafe { rt_keep(ctx, answer, ty) }
+}
+
 /// A task's or a channel's handle as the same handle at another type, held once more.
 pub unsafe extern "C" fn rt_handle_as(_ctx: *mut Ctx, h: Handle) -> Handle {
     Handle::of(held(h.word()))
@@ -1130,6 +1172,11 @@ pub unsafe extern "C" fn rt_site_placed(
     });
     let bytes = w.finish();
     c.given(bytes)
+}
+
+/// How many accesses the running seeded step touched since its footprint was last taken.
+pub unsafe extern "C" fn rt_footprint_held(ctx: *mut Ctx) -> I64 {
+    I64(unsafe { &*ctx }.footprint.len() as i64)
 }
 
 /// What the running seeded step touched since this was last asked, each access beside where it was

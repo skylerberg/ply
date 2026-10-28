@@ -69,6 +69,10 @@ pub struct Ctx {
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
     pub grown: u64,
+    /// Whether the scheduler's own work runs, which no cost of the program counts and no budget of
+    /// calls bounds, and the costs as the program last left them, which it goes on from.
+    pub(crate) scheduling: bool,
+    pub(crate) left_at: ProgramCost,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) time_budget_ms: u64,
@@ -258,6 +262,8 @@ impl Ctx {
             task: 0,
             step_budget: 0,
             grown: 0,
+            scheduling: false,
+            left_at: ProgramCost::default(),
             deadline: None,
             time_budget_ms: 0,
             heap: Heap::new(),
@@ -511,6 +517,7 @@ impl Ctx {
         self.charged = Cost::default();
         self.step_budget = steps.max(0);
         self.grown = 0;
+        self.scheduling = false;
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
@@ -570,7 +577,8 @@ impl Ctx {
     /// chunk, or never, when the entry is bounded by neither the budget nor a clock.
     pub(super) fn arm_tick(&mut self) {
         let chunk = self.ticks.saturating_add(TICK_CHUNK);
-        self.next_tick = match (self.step_budget > 0, self.deadline.is_some()) {
+        let budgeted = self.step_budget > 0 && !self.scheduling;
+        self.next_tick = match (budgeted, self.deadline.is_some()) {
             (true, _) => self.step_budget.saturating_add(1).min(chunk),
             (false, true) => chunk,
             (false, false) => i64::MAX,
@@ -581,7 +589,7 @@ impl Ctx {
     /// when to call back. Both bounds are decided here, so a call itself costs one increment and
     /// one compare, and the clock is read once every [`TICK_CHUNK`] calls rather than on any.
     pub(super) fn tick(&mut self) {
-        if self.step_budget > 0 && self.ticks > self.step_budget {
+        if self.step_budget > 0 && !self.scheduling && self.ticks > self.step_budget {
             let budget = self.step_budget;
             let d = Diagnostic::error(
                 codes::STEP_BUDGET,
@@ -941,8 +949,15 @@ impl Ctx {
     }
 
     /// Puts `touched` into the running seeded step of the innermost region `std.internal.schedule`
-    /// opened, made where the body last stored a site; nothing where no such step runs.
+    /// opened, made where the body last stored a site; nothing where no such step runs, and nothing
+    /// of a `task` or `clock` operation.
     pub(crate) fn touched(&mut self, touched: crate::tasks::Touched) {
+        // The scheduler orders what its own operations touch itself.
+        if let crate::tasks::Touched::Atom { effect, .. } = &touched
+            && matches!(effect.as_str(), "task" | "clock")
+        {
+            return;
+        }
         let stepping = (self.regions.last()).is_some_and(|(r, _)| unsafe { (**r).is_stepping() });
         if stepping {
             self.footprint

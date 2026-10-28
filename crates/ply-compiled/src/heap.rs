@@ -538,6 +538,17 @@ impl Heap {
         self.bytes
     }
 
+    /// The blocks and bytes allocated since the last reset, as [`Heap::recounted`] puts them back.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.count, self.bytes)
+    }
+
+    /// The counts as [`Heap::counts`] read them: what was allocated since is not counted.
+    pub(crate) fn recounted(&mut self, (count, bytes): (usize, usize)) {
+        self.count = count;
+        self.bytes = bytes;
+    }
+
     /// Allocations that took a dead block rather than fresh memory.
     pub fn recycled(&self) -> usize {
         self.blocks.reused()

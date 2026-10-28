@@ -1249,6 +1249,16 @@ extern fn MapNode::map_swap<k, v>(
   len: Int,
 ) -> { map: Map<k, v>, old: Option<MapNode<k, v>> }
 
+/// The step a search of a leaf holding `count` pairs starts from: the greatest power of two not
+/// above it, from which halving reaches every place.
+fn first_step(count: Int) -> Int =
+  if count >= 32 { 32 }
+  else if count >= 16 { 16 }
+  else if count >= 8 { 8 }
+  else if count >= 4 { 4 }
+  else if count >= 2 { 2 }
+  else { 1 }
+
 /// Where `key` stands among a leaf's keys, found `step` pairs at a time and half as many each
 /// time: how many lie below it past the `at` already passed.
 fn leaf_place<k, v>(n: MapNode<k, v>, key: k, at: Int, step: Int) -> Int
@@ -1334,8 +1344,11 @@ fn found_under<k, v>(n: MapNode<k, v>, key: k, depth: Int, at: Int, step: Int) -
       probe <= MapNode::count(n) && compare(MapNode::key(n, probe - 1), key) == Less
     } else { probe < MapNode::count(n) && compare(MapNode::kid_max(n, probe - 1), key) == Less };
     found_under(n, key, depth, if past { probe } else { at }, step / 2)
-  } else if depth > 0 { found_under(MapNode::kid(n, at), key, depth - 1, 0, 32) }
-  else if at < MapNode::count(n) && compare(MapNode::key(n, at), key) == Equal {
+  } else if depth > 0 {
+    let kid = MapNode::kid(n, at);
+    found_under(kid, key, depth - 1, 0, if depth > 1 { 32 }
+    else { first_step(MapNode::count(kid)) })
+  } else if at < MapNode::count(n) && compare(MapNode::key(n, at), key) == Equal {
     Some(MapNode::value(n, at))
   } else { None }
 
@@ -1345,7 +1358,7 @@ fn key_located<k, v>(n: MapNode<k, v>, key: k, depth: Int, below: Int) -> Int
   where derivable(ord, k)
 =
   if depth <= 0 {
-    let i = leaf_place(n, key, 0, 32);
+    let i = leaf_place(n, key, 0, first_step(MapNode::count(n)));
     2 * (below + i) + (if leaf_holds(n, i, key) { 1 } else { 0 })
   } else {
     let i = kid_place(n, key, 0, 32);
@@ -1383,7 +1396,7 @@ fn leaf_put<k, v>(
   where derivable(ord, k)
 = {
   let count = MapNode::count(n);
-  let i = leaf_place(n, key, 0, 32);
+  let i = leaf_place(n, key, 0, first_step(MapNode::count(n)));
   if leaf_holds(n, i, key) {
     let kept = MapNode::key(n, i);
     { added: false, node: MapNode::pair_set(n, i, kept, value), right: None }
@@ -1441,8 +1454,8 @@ fn node_put<k, v>(
     }
   }
 
-/// The node `n`, whose leaves are `depth` branches down and one of which holds `key`, with `f` of
-/// that key's value in its place: the leaf holds neither while `f` runs.
+/// The node `n`, whose leaves are `depth` branches down, with `f` of `key`'s value in its place
+/// where a leaf holds `key`: the leaf holds neither while `f` runs.
 fn node_updated<k, v | e>(
   n: MapNode<k, v>,
   depth: Int,
@@ -1452,9 +1465,11 @@ fn node_updated<k, v | e>(
   where derivable(ord, k)
 =
   if depth <= 0 {
-    let i = leaf_place(n, key, 0, 32);
-    let taken = MapNode::pair_take(n, i);
-    MapNode::pair_put(taken.node, i, taken.key, f(taken.value))
+    let i = leaf_place(n, key, 0, first_step(MapNode::count(n)));
+    if !leaf_holds(n, i, key) { n } else {
+      let taken = MapNode::pair_take(n, i);
+      MapNode::pair_put(taken.node, i, taken.key, f(taken.value))
+    }
   } else {
     let i = kid_place(n, key, 0, 32);
     let size = MapNode::kid_size(n, i);
@@ -1470,7 +1485,7 @@ fn node_rekeyed<k, v>(n: MapNode<k, v>, depth: Int, key: k) -> MapNode<k, v>
   where derivable(ord, k)
 =
   if depth <= 0 {
-    let i = leaf_place(n, key, 0, 32);
+    let i = leaf_place(n, key, 0, first_step(MapNode::count(n)));
     let taken = MapNode::pair_take(n, i);
     MapNode::pair_put(taken.node, i, key, taken.value)
   } else {
@@ -1486,7 +1501,7 @@ fn node_removed<k, v>(n: MapNode<k, v>, depth: Int, key: k) -> Option<MapNode<k,
   where derivable(ord, k)
 =
   if depth <= 0 {
-    let i = leaf_place(n, key, 0, 32);
+    let i = leaf_place(n, key, 0, first_step(MapNode::count(n)));
     let rest = MapNode::pair_take(n, i).node;
     if MapNode::count(rest) == 0 { None } else { Some(rest) }
   } else {
@@ -1817,21 +1832,25 @@ pub fn Map::insert<a, b>(m: Map<a, b>, key: a, value: b) -> Map<a, b> = {
 /// The map with `f` of the value under `key` in its place, keeping the key it holds; the same map
 /// where `key` is absent. The map no longer holds the value while `f` runs, so where the map is
 /// held once `f` holds it once.
-pub fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e =
-  if !Map::contains(m, key) { m } else {
-    let height = MapNode::height(m);
-    let len = Map::len(m);
-    let taken = MapNode::map_swap(m, None, height, len);
-    match taken.old {
-      None -> taken.map,
-      Some(root) ->
-        MapNode::map_swap(taken.map, Some(node_updated(root, height, key, f)), height, len).map,
-    }
+pub fn Map::update<a, b | e>(m: Map<a, b>, key: a, f: (b) -> b / e) -> Map<a, b> / e = {
+  let height = MapNode::height(m);
+  let len = Map::len(m);
+  let taken = MapNode::map_swap(m, None, height, len);
+  match taken.old {
+    None -> taken.map,
+    Some(root) ->
+      MapNode::map_swap(taken.map, Some(node_updated(root, height, key, f)), height, len).map,
   }
+}
 
 /// The value under the key `compare` finds equal to `key`.
 pub fn Map::get<a, b>(m: Map<a, b>, key: a) -> Option<b> =
-  match MapNode::root(m) { None -> None, Some(r) -> found_under(r, key, MapNode::height(m), 0, 32) }
+  match MapNode::root(m) {
+    None -> None,
+    Some(r) ->
+      found_under(r, key, MapNode::height(m), 0, if MapNode::height(m) > 0 { 32 }
+      else { first_step(MapNode::count(r)) }),
+  }
 
 /// Whether the map holds a key `compare` finds equal to `key`.
 pub fn Map::contains<a, b>(m: Map<a, b>, key: a) -> Bool =
