@@ -15,25 +15,11 @@ pub fn context() -> Ctx {
 
 /// A context over a unit whose bodies read `fields` and whose compiled functions are `functions`,
 /// by index.
-pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
-    context_over(fields, functions, &[])
-}
-
-/// A context over a unit whose pool of builtins holds those named `builtins`, in order.
-pub fn context_calling(builtins: &[&str]) -> Ctx {
-    context_over(&[], Vec::new(), builtins)
-}
-
-/// A context over a unit whose bodies read `fields`, whose compiled functions are `functions`, by
-/// index, and whose pool of builtins holds those named `builtins`, in order.
 // `Tables` holds a `Heap`, whose raw block pointers are neither `Send` nor `Sync`.
 #[allow(clippy::arc_with_non_send_sync)]
-pub fn context_over(fields: &[&str], functions: Vec<usize>, builtins: &[&str]) -> Ctx {
+pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
     Ctx::new(Arc::new(Tables {
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
-        builtins: (builtins.iter())
-            .map(|b| ply_core::Builtin::from_name(b).unwrap_or_else(|| panic!("no builtin `{b}`")))
-            .collect(),
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
         memo_costs: (functions.iter())
             .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))

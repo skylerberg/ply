@@ -1,32 +1,7 @@
-//! The builtins compiled code calls, each through an entry of its own, and their bodies.
+//! What the runtime does for the builtins compiled code writes: raising their failures and holding
+//! what a hold holds.
 
 use super::*;
-
-/// `Word`, once for each name it is given: a native's parameters as its type spells them.
-macro_rules! word {
-    ($param:ident) => {
-        Word
-    };
-}
-
-macro_rules! natives {
-    ($($variant:ident $name:literal ($($param:ident),*) $answer:ident;)*) => {
-        /// The type of the function compiled code calls each builtin through.
-        mod native_type {
-            use super::{Ctx, Raising, Word};
-            $( pub type $variant = unsafe extern "C" fn(*mut Ctx $(, word!($param))*) -> $answer; )*
-        }
-
-        /// What builtin `b` takes and answers, as its native's type says.
-        pub fn signature(b: Builtin) -> Signature {
-            match b {
-                $( Builtin::$variant => <native_type::$variant as Native>::SIGNATURE, )*
-            }
-        }
-    };
-}
-
-ply_core::each_builtin!(natives);
 
 /// [`Ctx::pend`] for a runtime error that is the program's to answer: a clause for `abort.raise`
 /// is given its message, each value the text names told by its kind, since nothing in Rust renders

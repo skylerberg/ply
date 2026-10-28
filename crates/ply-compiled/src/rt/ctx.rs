@@ -44,14 +44,14 @@ pub struct Ctx {
     pub entering_desc: Word,
     pub entering_words: Word,
     /// Whether a perform a clause answers in place is recorded through [`rt_performed`]: while a
-    /// test reads what its entries performed, a cost mark is open or a seeded region runs.
+    /// test reads what its entries performed or a seeded region runs.
     pub recording: i64,
     /// The evidence object of every effect for code that holds no word answering one
     /// ([`BRIDGE`]).
     pub bridge: Word,
-    /// What an entry hands its root for an effect the Rust binding serves ([`HOSTED`]) and for one
-    /// nothing answers ([`UNSERVED`]).
+    /// A word no code reads, where the release's compiler lays the context out with one.
     pub hosted: Word,
+    /// What an entry hands its root for an effect nothing answers ([`UNSERVED`]).
     pub unserved: Word,
     /// Where the perform a clause answers stood, as the site fields hold one, which compiled code
     /// stores as it enters the clause: what a region's request is placed at.
@@ -93,8 +93,6 @@ pub struct Ctx {
     pub(crate) current: usize,
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace.
     pub performed: Vec<EffectAtom>,
-    /// The marks [`rt_cost_mark`] took that no [`rt_cost_spent`] has read back yet, the latest last.
-    pub(crate) cost_marks: Vec<CostMark>,
     /// The detached bodies this entry has opened, named by index from their instances and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
@@ -245,7 +243,7 @@ impl Ctx {
             entering_words: 0,
             recording: 0,
             bridge: object_word(&BRIDGE),
-            hosted: object_word(&HOSTED),
+            hosted: 0,
             unserved: object_word(&UNSERVED),
             performed_root: -1,
             performed_start: 0,
@@ -266,7 +264,6 @@ impl Ctx {
             free_stacks: Vec::new(),
             current: 0,
             performed: Vec::new(),
-            cost_marks: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
             entry: 0,
@@ -349,10 +346,10 @@ impl Ctx {
     }
 
     /// Arms or disarms [`Ctx::recording`] by who reads what this entry performs now: whoever runs
-    /// its entries, a cost mark, or a seeded region's steps. A production region reads none.
+    /// its entries, or a seeded region's steps. A production region reads none.
     pub(crate) fn rearm_recording(&mut self) {
         let seeded = (self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() });
-        self.recording = i64::from(self.traced || !self.cost_marks.is_empty() || seeded);
+        self.recording = i64::from(self.traced || seeded);
     }
 
     /// Whoever runs this context's entries reads what they perform, or stops reading it.
@@ -440,7 +437,6 @@ impl Ctx {
         self.free_stacks.clear();
         self.current = 0;
         self.performed.clear();
-        self.cost_marks.clear();
         self.starting_detached = None;
         self.entered_sims = 0;
         self.regions.clear();

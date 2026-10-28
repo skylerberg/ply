@@ -3,10 +3,10 @@
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
 use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};
-use crate::native::{I64, Native, Raises, Raising, Signature};
+use crate::native::{I64, Raises};
 use crate::stack::{Stack, switch};
 use ply_core::builtins::hold_released;
-use ply_core::{Builtin, Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
+use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicI64;

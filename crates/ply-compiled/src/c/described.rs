@@ -12,12 +12,9 @@ use crate::rt::Ctx;
 use std::fmt::Write;
 use std::mem::{offset_of, size_of};
 
-/// Each native compiled code calls, under the name the compiler declares it by: each builtin, then
-/// each native over machine data.
+/// Each native compiled code calls, under the name the compiler declares it by.
 pub fn natives() -> impl Iterator<Item = (&'static str, Signature)> {
-    let builtins = (ply_core::Builtin::all().iter()).map(|b| (b.name(), crate::rt::signature(*b)));
-    let machine = machine_natives().iter().map(|n| (n.name, n.signature));
-    builtins.chain(machine)
+    machine_natives().iter().map(|n| (n.name, n.signature))
 }
 
 /// The size of the field `field` borrows out of an `S`.

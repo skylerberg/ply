@@ -182,7 +182,6 @@ pub fn exports_of(defs: &[Def]) -> Laid {
             modules: 1,
             refusals: Vec::new(),
             fields: Vec::new(),
-            builtins: Vec::new(),
             entered: Vec::new(),
         },
         lambdas: Vec::new(),

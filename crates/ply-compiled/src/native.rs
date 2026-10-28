@@ -88,11 +88,6 @@ impl Signature {
     }
 }
 
-/// The word a native that may raise answers: meaningless where it left a raise in the context.
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Raising(pub Word);
-
 /// What a native that answers nothing but may raise returns: nothing, the raise left in the context.
 /// Transparent over `()`, it is returned as `()` is, so the emitted C declares the native `void`;
 /// a native returning it allows `improper_ctypes_definitions`, which does not know that.
@@ -184,14 +179,6 @@ unsafe impl Answered for Word {
     const RAISES: bool = false;
     fn of(w: Word) -> Self {
         w
-    }
-}
-
-unsafe impl Answered for Raising {
-    const MACHINE: Option<Machine> = Some(Machine::Word);
-    const RAISES: bool = true;
-    fn of(w: Word) -> Self {
-        Raising(w)
     }
 }
 

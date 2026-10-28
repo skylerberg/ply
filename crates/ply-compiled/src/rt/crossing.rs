@@ -177,16 +177,6 @@ impl Ctx {
         matches!(self.crossings.last(), Some(Crossing::Lowering(l)) if l.shown)
     }
 
-    /// Ends the innermost lowering, answering it whole; `None` with the context failed where the
-    /// innermost crossing is no lowering.
-    fn end_lowering(&mut self) -> Option<Lowering> {
-        self.lowering().ok()?;
-        match self.crossings.pop() {
-            Some(Crossing::Lowering(l)) => Some(l),
-            _ => unreachable!("the innermost crossing is a lowering"),
-        }
-    }
-
     fn lifting(&mut self) -> Result<&mut Lifting, i64> {
         if !matches!(self.crossings.last(), Some(Crossing::Lifting(_))) {
             return Err(self.fail(err_crossing("a value read with no lifting open")));
@@ -745,71 +735,6 @@ pub(crate) fn lifted_from(
         c.fail(err_crossing(&why));
     }
     (c.failed == 0).then(|| <Handed as crate::native::Answered>::of(w))
-}
-
-/// Calls the unit's builtin at `index` in its pool over the arguments the innermost lowering holds,
-/// a list of them in order, and ends that lowering: what a builder the previous release compiled
-/// still calls this way, `panic` and `to_int`, each read from its arguments' bytes. Where `to_int`
-/// answers, a lifting of its answer is open for compiled code to read and end; `panic` raises.
-pub unsafe extern "C" fn rt_builtin_encoded(ctx: *mut Ctx, index: I64) {
-    let c = unsafe { &mut *ctx };
-    let Some(l) = c.end_lowering() else {
-        return;
-    };
-    let Some(&b) = usize::try_from(index.0)
-        .ok()
-        .and_then(|i| c.tables.builtins.get(i))
-    else {
-        c.fail(err_crossing(&format!(
-            "builtin {} of a pool of {}",
-            index.0,
-            c.tables.builtins.len()
-        )));
-        return;
-    };
-    let bytes = l.w.finish();
-    if let Err(why) = encoded_called(c, b, &bytes) {
-        c.fail(err_crossing(&why));
-    }
-}
-
-/// `b` over the arguments' list `bytes` hold, as [`rt_builtin_encoded`] calls it.
-fn encoded_called(c: &mut Ctx, b: Builtin, bytes: &[u8]) -> Result<(), String> {
-    let mut r = Reader::new(bytes)?;
-    r.expect(tag::LIST)?;
-    match (b, r.count()?) {
-        (Builtin::Panic, 1) => {
-            r.expect(tag::STR)?;
-            let message = r.str()?.to_string();
-            let d = Diagnostic::error(codes::RUNTIME_ERROR, format!("panic: {message}"))
-                .primary(c.site(), "`panic` called here");
-            c.pend(d, message);
-            Ok(())
-        }
-        (Builtin::ToInt, 2) => {
-            r.expect(tag::INT)?;
-            r.int()?;
-            let int = match r.byte()? {
-                tag::INT => Some(r.int()?),
-                tag::FIXED => r.fixed()?.to_i128().and_then(|v| i64::try_from(v).ok()),
-                t => return Err(format!("`to_int` of a value tagged {t}")),
-            };
-            let mut w = codec::Writer::new();
-            match int {
-                Some(n) => {
-                    w.ctor(b"Some", 1);
-                    w.int(n);
-                }
-                None => w.ctor(b"None", 0),
-            }
-            c.lift_from(w.finish(), Vec::new());
-            Ok(())
-        }
-        (b, _) => Err(format!(
-            "`{}` over its arguments' encoding, which only `panic` and `to_int` are",
-            b.name()
-        )),
-    }
 }
 
 impl Ctx {

@@ -15,8 +15,6 @@ pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 pub struct Tables {
     /// Every field name a compiled body reads, so a field access is an index.
     pub fields: Vec<Symbol>,
-    /// Every builtin a compiled body may call.
-    pub builtins: Vec<Builtin>,
     /// Every compiled function's finalized address by index, for building native closures.
     pub functions: Vec<usize>,
     /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.

@@ -1,7 +1,7 @@
 //! `parallel` blocks as emitted code runs them: closure blocks laid out as it lays them, and their
 //! branches on threads of their own where they may cross.
 
-use crate::bare::{context, context_of, helper};
+use crate::bare::{context, helper};
 use ply_compiled::emitted::{Handed, PlyFnDesc};
 use ply_compiled::heap::{HEADER, SHARED, Word};
 use ply_compiled::rt::Ctx;
@@ -10,7 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Run = unsafe extern "C" fn(*mut Ctx, *mut Word, Word);
-type RunPast = unsafe extern "C" fn(*mut Ctx, *mut Word, Word, *const Word, Word);
 
 /// A box of one word, the number it holds, and a closure block of its descriptor alone.
 const BLOCK: Word = HEADER as Word + 8;
@@ -104,7 +103,7 @@ unsafe extern "C" fn apart(ctx: *mut Ctx, f: Word, _args: *const Word) -> Word {
 /// of them left the thread it entered on.
 unsafe extern "C" fn enters(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let mut inner = context();
-    block(ctx, left_apart(&mut inner, None))
+    block(ctx, left_apart(&mut inner))
 }
 
 const fn desc(
@@ -145,21 +144,12 @@ fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
     slots
 }
 
-/// A block of two [`APART`] branches, whose site says they may perform the effect and resource
-/// `reached` where it names one: how many of them left the thread `ctx` runs on.
-fn left_apart(ctx: &mut Ctx, reached: Option<(Word, Word)>) -> Word {
+/// A block of two [`APART`] branches: how many of them left the thread `ctx` runs on.
+fn left_apart(ctx: &mut Ctx) -> Word {
     let c: *mut Ctx = ctx;
     ctx.begin(1_000);
     let mut slots = [0; 2].map(|_| alloc(c, PAIR, &[&raw const APART as Word, c as Word]));
-    match reached {
-        None => unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) },
-        Some((effect, resource)) => {
-            let reach = [effect, resource];
-            unsafe {
-                helper::<RunPast>("rt_branches_past")(c, slots.as_mut_ptr(), 2, reach.as_ptr(), 1)
-            }
-        }
-    }
+    unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
     assert_eq!(ctx.failed, 0);
     let left = held(slots[0]) + held(slots[1]);
     for w in slots {
@@ -170,19 +160,6 @@ fn left_apart(ctx: &mut Ctx, reached: Option<(Word, Word)>) -> Word {
     left
 }
 
-/// A block whose site says what its branches may perform leaves this thread as one whose site does
-/// not: no `handle` keeps a clause on this thread for a branch to reach.
-#[test]
-fn a_block_leaves_this_thread_whatever_its_site_says_it_reaches() {
-    // On one core every block runs its branches in turn, and there is nothing to tell apart.
-    if !multicore() {
-        return;
-    }
-    let mut ctx = context_of(&["held"], Vec::new());
-    assert_eq!(left_apart(&mut ctx, None), 2, "its reach unsaid");
-    assert_eq!(left_apart(&mut ctx, Some((0, -1))), 2, "its reach said");
-}
-
 /// A thread waiting on a block takes up other branches of the pool, so a machine that waited inside
 /// another machine's branch would carry that machine's other work on its own stack.
 #[test]
@@ -191,7 +168,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
         return;
     }
     assert_eq!(
-        left_apart(&mut context(), None),
+        left_apart(&mut context()),
         2,
         "a block entered on a thread of its own"
     );
