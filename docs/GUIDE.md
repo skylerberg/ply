@@ -3091,65 +3091,63 @@ whether its implementation, its spec and its claims changed. The baseline is key
 
 ## 11. Derivation
 
+`derive d for T` calls `d::derive(declaration)` of the module the file imports as `d`, before the
+rest of the module is read. Its result is source code for the functions it derives, read into the
+module as if written there:
+
 ```ply
 import std.json
 
 pub type Line = { sku: String, qty: Int, unit_price: Decimal }
 derive json for Line
+// line_json : () -> json::JsonCodec<Line>
 ```
 
-| deriver | generates | type |
-| --- | --- | --- |
-| `json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
-| `bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
-| `row` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
+The toolchain ships these derivers, each documented in its module:
 
-Any other name is a library deriver (below). `snake_case` is `std.text`'s, so two types that give
-the same name (`HTTPRequest` and `HttpRequest` both give `http_request`) are `E0105`. A `derive`
-must be in the module that declares its type (`E0208`).
+| deriver | module | generates | type |
+| --- | --- | --- | --- |
+| `json` | `std.json` | `<snake_case(T)>_json` | `std.json.JsonCodec<T>` |
+| `bin` | `std.bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
+| `sql` | `std.sql` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
+| `map` | `std.derive.map` | `T::map` | the value with each type parameter's values mapped |
 
-A parameterized type's generated function takes one codec per type parameter:
+`snake_case` is `std.text`'s, so two types that give the same name (`HTTPRequest` and `HttpRequest`
+both give `http_request`) are `E0105`. A `derive` must be in the module that declares its type
+(`E0208`).
+
+A codec of a parameterized type takes one codec per type parameter, named as the parameter is:
 
 ```ply
 pub type Box<a> = { label: String, inner: a }
 derive json for Box
 // box_json : <a>(JsonCodec<a>) -> JsonCodec<Box<a>>
 
-fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String
-  where derivable(json, a) =
+fn encode<a>(b: Box<a>, c: json::JsonCodec<a>) -> String =
   json::encode_string(b, box_json(c))
 ```
 
-`where derivable(D, p)` goes after the row and before any `requires`. Codecs are plain values:
-`json::decode_bytes(body, order_json())`. A `new` record (§4.2) derives like a plain record with its
-fields: the same documents, bytes and shape.
+Codecs are plain values: `json::decode_bytes(body, order_json())`. A `new` record (§4.2) derives like
+a plain record with its fields: the same documents, bytes and shape. A codec for a type that
+contains itself, directly or through the types its module derives, takes a nesting limit and passes
+one less to each level, so the recursion visibly ends (§5.10). Beyond the limit, decoding is an
+error and encoding panics (`ply doc std.derive.codec`).
 
-**Recursive types.** A `json` or `bin` codec for a type that contains itself, directly or through
-other types the module derives, takes a nesting limit and passes one less to each level, so the
-recursion visibly ends (§5.10). A `json` codec is two definitions: `tree_json()` calls
-`tree_json_at(json::max_depth())`. A `bin` codec is a definition for each of its functions
-(`tree_bin_put`, `tree_bin_take` and `tree_bin_shape`), which call each other by name, so no level
-builds a codec value; `tree_bin()` passes `bin::max_depth()` to each. Beyond the limit, decoding is
-an error and encoding panics. The `json` limit is 128 levels, as deep as `parse` reads; the `bin`
-limit is 10,000, as deep as calls can nest (§5.7).
+**What cannot be derived.** A refusal is `E0206` at the field or variant that blocks the derivation:
 
-**What cannot be derived.** `E0206` names the field that blocks a derivation:
+- a function, a `Task`, a `Chan` or a `Secret`, which no codec writes;
+- an `Option<Unit>` or an `Option<Option<a>>`, whose `None` and `Some` would be one JSON document;
+- a type that takes a label (§4.5).
 
-- function types, `Task`, `Chan` and `Secret`;
-- `Option<Unit>` and `Option<Option<a>>` (for `json`);
-- a type that takes a label (§4.5), or a field whose type is given one, since only a function's row
-  uses labels;
-- a `derive json` or `derive bin` in a module that does not import `std.json` or `std.bin`.
-
-A row parameter the fields do not use is passed through: `tagged_json : <a | e>(JsonCodec<a>) ->
-JsonCodec<Tagged<a | e>>`. A type with a `key` or `show` (§4.4) is encoded by its fields as they
-are.
+A field whose type's module derives no codec is `E0206` at the name the generated body cannot see. A
+type with a `key` or `show` (§4.4) is encoded by its fields as they are.
 
 `==`, `compare`, `digest` and `show` need no derivation: they work on any value its type allows.
 `where derivable(eq, a)`, `derivable(ord, a)`, `derivable(hash, a)` and `derivable(show, a)` require
-a type parameter to support them.
+a type parameter to support them. `where derivable(D, p)` goes after the row and before any
+`requires`.
 
-**SQL rows.** `row` maps a record to a row of a SQL table, one column per field named after the
+**SQL rows.** `sql` maps a record to a row of a SQL table, one column per field named after the
 field, read and written in field declaration order:
 
 ```ply
@@ -3159,7 +3157,7 @@ import std.json
 pub type Line = { sku: String, qty: Int }
 pub type Order = { id: Int, customer: String, note: Option<String>, lines: List<Line> }
 derive json for Line
-derive row for Order
+derive sql for Order
 // order_row : () -> sql::RowCodec<Order>
 ```
 
@@ -3168,34 +3166,22 @@ derive row for Order
   it holds.
 - Any other field is a `jsonb` document read and written with its type's own `json` codec, which the
   module must import `std.json` for and derive.
-- The derivation needs `import std.sql`. A sum, a type with parameters, and an empty record have no
-  row (`E0206`). `row` cannot be used in a `where` (`E0207`).
+- A sum, a type with parameters, and an empty record have no row (`E0206`).
 - The codec's `fields` are what the SQL check compares a statement's columns against, when `std.db`'s
   `fetch` reads rows with it (§16).
 
-**Library derivers.** A deriver can be a module. `derive d for T`, where `d` is not a built-in
-deriver, calls `d::derive(declaration)` of the module imported as `d`, before the rest of the module
-is read. Its result is source code for the functions it derives, read into the module as if written
-there:
+**Writing a deriver.**
 
-```ply
-import std.derive.map
-
-pub type Tree<a> = | Leaf(a) | Node(List<Tree<a>>)
-derive map for Tree
-// Tree::map : <a, a_mapped | e>(Tree<a>, a: (a) -> a_mapped / e) -> Tree<a_mapped> / e
-```
-
-- A deriver is `pub fn derive(declaration: derive::Declaration) -> Result<String,
+- A deriver is any module's `pub fn derive(declaration: derive::Declaration) -> Result<String,
   derive::Refused>`, performing nothing but raises. `std.derive` describes a declaration.
 - The checker compiles a deriver once and runs it for each declaration in isolation, with a `const
   fn`'s budget (§3.5). Each result is cached under the declaration and the source of the modules the
   deriver reaches, so it reruns only after an edit to one of them.
 - A deriver is a standard library module or one of the program's own, and a deriver's own modules
-  cannot use library derivers.
-- A name that is neither a built-in deriver nor an imported module is `E0207`. A module whose
-  `derive` is not a deriver is `E0160`. A refusal is `E0206` at the field or variant it names. A
-  deriver that raises, runs out of budget, or returns anything other than functions is `E0155`.
+  derive nothing through a deriver.
+- A name no import binds is `E0207`. A module whose `derive` is not a deriver is `E0160`. A deriver
+  that raises, runs out of budget, returns anything other than functions, or writes a definition
+  that does not check is `E0155`.
 
 `std.derive.map` writes `T::map` for a sum or a `new` record: the value rebuilt with each type
 parameter's values replaced by what its function returns, calling the functions in the order the
@@ -3705,7 +3691,7 @@ three things after checking and before anything else:
    - `E0470`: a construct the check does not follow (`with`, a set operation, a subquery in `from`,
      a window function, `on conflict`), reported where the check stops.
    - `E0437`: the columns a `fetch` returns do not match the fields of the row type its codec reads,
-     when `derive row` wrote it (§11): by name, type and nullability, where a `left join` makes the
+     when `derive sql` wrote it (§11): by name, type and nullability, where a `left join` makes the
      joined table's columns nullable.
 
    Results are cached under the hashes of everything the statement and schema reach. At run time,
