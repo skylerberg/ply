@@ -1,88 +1,96 @@
 //! The typed tree: a body as the checker found it, written out. Each node holds its type and what
 //! the checker resolved there, so nothing that reads the tree looks a node's facts up by its site.
+//! The tree is generic in how it writes a type: the checker and what lowers a body hold `Type`s,
+//! and a body stored with its row names each type by its key in the row's table.
 
-import compiler.syntax.parsing (Span)
-import compiler.syntax.patterns (Lit)
-import compiler.check.types (Type, Row)
+import compiler.syntax.parsing (Span, span_bin)
+import compiler.syntax.patterns (Lit, lit_bin)
+import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
+import std.bin
 import std.list
 
 /// One node: what it is, where its text stands, and its type.
-pub type TypedExpr = { node: TypedNode, span: Span, ty: Type }
+pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t }
 
-pub type TypedNode =
+pub type TypedNode<t> =
   | TypedLit(Lit)
-  | TypedRead(Reading)
-  | TypedUnary({ op: Bytes, operand: TypedExpr })
-  | TypedBinary({ op: Bytes, lhs: TypedExpr, rhs: TypedExpr })
+  | TypedRead(Reading<t>)
+  | TypedUnary({ op: Bytes, operand: TypedExpr<t> })
+  | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t> })
   /// `args` are in the callee's parameters' order, a default the call leaves out among them.
-  | TypedCall({ callee: TypedExpr, args: List<TypedExpr> })
-  | TypedIf({ cond: TypedExpr, then_branch: TypedExpr, else_branch: TypedExpr })
-  | TypedMatch({ scrutinee: TypedExpr, arms: List<TypedArm> })
-  | TypedBlock({ stmts: List<TypedStmt>, tail: Option<TypedExpr> })
-  | TypedList(List<TypedExpr>)
-  | TypedRecord(List<TypedField>)
+  | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>> })
+  | TypedIf({ cond: TypedExpr<t>, then_branch: TypedExpr<t>, else_branch: TypedExpr<t> })
+  | TypedMatch({ scrutinee: TypedExpr<t>, arms: List<TypedArm<t>> })
+  | TypedBlock({ stmts: List<TypedStmt<t>>, tail: Option<TypedExpr<t>> })
+  | TypedList(List<TypedExpr<t>>)
+  | TypedRecord(List<TypedField<t>>)
   /// `{ ..base, f: e }`: the base's record with the fields `sets` writes replaced, at the node's type.
-  | TypedUpdate({ base: TypedExpr, sets: List<TypedField> })
-  | TypedFieldRead({ base: TypedExpr, field: Bytes })
-  /// `effect` is the effect's name across the program, and `resource` the label as written.
-  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, args: List<TypedExpr> })
-  | TypedLambda({ params: List<TypedParam>, body: TypedExpr, row: Row })
-  | TypedSimulate(TypedThunk)
-  | TypedParallel(List<TypedThunk>)
+  | TypedUpdate({ base: TypedExpr<t>, sets: List<TypedField<t>> })
+  | TypedFieldRead({ base: TypedExpr<t>, field: Bytes })
+  /// `effect` is the effect's name across the program, `resource` the label as written, and `atom`
+  /// what the perform performs.
+  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<TypedExpr<t>> })
+  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpr<t>, row: Row })
+  | TypedSimulate(TypedThunk<t>)
+  | TypedParallel(List<TypedThunk<t>>)
   /// `row` is what the body performs. `vars` are the handler's variables, made before the body
   /// runs, which its clauses read and assign.
-  | TypedHandle({ body: TypedExpr, row: Row, clauses: List<TypedClause>, ret: Option<TypedReturn>, vars: List<TypedHandlerVar> })
+  | TypedHandle({ body: TypedExpr<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
 
-/// What a name read as a value is: a binder in scope, a definition at the type arguments the read
-/// fills, a constructor of a declared sum, or a builtin.
-pub type Reading =
+/// What a name read as a value is: a binder in scope; a definition at the type arguments and rows
+/// the read fills, `rows` filling the scheme's row variables `quantified` as the read found them;
+/// a constructor of a declared sum at the type arguments it fills; or a builtin at the type
+/// arguments and rows it fills, the rows in its own order.
+pub type Reading<t> =
   | ReadLocal(Bytes)
-  | ReadDefinition({ full: Bytes, args: List<Type> })
-  | ReadConstructor({ sum: Bytes, name: Bytes, case: Int })
-  | ReadBuiltin(Bytes)
+  | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, quantified: List<Int> })
+  | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
+  | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row> })
 
-pub type TypedParam = { name: Bytes, ty: Type, span: Span }
+pub type TypedParam<t> = { name: Bytes, ty: t, span: Span }
 
 /// A body run as a function of no parameters, and what it performs.
-pub type TypedThunk = { body: TypedExpr, row: Row }
+pub type TypedThunk<t> = { body: TypedExpr<t>, row: Row }
 
-pub type TypedField = { name: Bytes, value: TypedExpr }
+pub type TypedField<t> = { name: Bytes, value: TypedExpr<t> }
 
-pub type TypedArm = { pat: TypedPattern, guard: Option<TypedExpr>, body: TypedExpr }
+pub type TypedArm<t> = { pat: TypedPattern<t>, guard: Option<TypedExpr<t>>, body: TypedExpr<t> }
 
 /// A pattern, each binder with the type it binds and each constructor resolved to its case.
-pub type TypedPattern =
+pub type TypedPattern<t> =
   | TypedWild
-  | TypedBinder({ name: Bytes, ty: Type, span: Span })
+  | TypedBinder({ name: Bytes, ty: t, span: Span })
   | TypedLitPattern(Lit)
   | TypedRange({ lo: Lit, hi: Lit })
-  | TypedCase({ sum: Bytes, name: Bytes, case: Int, args: List<TypedPattern> })
-  | TypedRecordPattern({ fields: List<{ name: Bytes, pat: TypedPattern }>, rest: Bool })
-  | TypedListPattern({ items: List<TypedPattern>, rest: Option<TypedPattern> })
-  | TypedOr(List<TypedPattern>)
+  | TypedCase({ sum: Bytes, name: Bytes, case: Int, args: List<TypedPattern<t>> })
+  | TypedRecordPattern({ fields: List<TypedFieldPattern<t>>, rest: Bool })
+  | TypedListPattern({ items: List<TypedPattern<t>>, rest: Option<TypedPattern<t>> })
+  | TypedOr(List<TypedPattern<t>>)
 
-pub type TypedStmt =
-  | TypedLet({ pat: TypedPattern, value: TypedExpr, span: Span })
+pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
+
+pub type TypedStmt<t> =
+  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
-  | TypedLetElse({ pat: TypedPattern, value: TypedExpr, fallback: TypedExpr, span: Span })
-  | TypedDo(TypedExpr)
+  | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
+  | TypedDo(TypedExpr<t>)
   /// `name = value;`: a clause giving its handler's variable a new value.
-  | TypedAssign({ name: Bytes, value: TypedExpr, span: Span })
+  | TypedAssign({ name: Bytes, value: TypedExpr<t>, span: Span })
 
 /// A clause of a `handle`: the operation it answers, under the label written or under every label,
 /// its parameters, the label it binds where it answers every label, its continuation, and its body.
 /// It runs as a closure of type `ty`; `row` is what its body performs and `resumed` what resuming
 /// its continuation does.
-pub type TypedClause = {
+pub type TypedClause<t> = {
   effect: Bytes,
   op: Bytes,
   resource: Option<Bytes>,
   every_label: Bool,
-  params: List<TypedParam>,
-  label: Option<TypedParam>,
-  resume: Option<TypedParam>,
-  body: TypedExpr,
-  ty: Type,
+  params: List<TypedParam<t>>,
+  label: Option<TypedParam<t>>,
+  resume: Option<TypedParam<t>>,
+  body: TypedExpr<t>,
+  ty: t,
   row: Row,
   resumed: Row,
   span: Span,
@@ -90,51 +98,86 @@ pub type TypedClause = {
 
 /// A `handle`'s `return` clause, run as a closure of type `ty` on the body's answer; `row` is what
 /// it performs.
-pub type TypedReturn = { binder: TypedParam, body: TypedExpr, ty: Type, row: Row, span: Span }
+pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, ty: t, row: Row, span: Span }
 
 /// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
-pub type TypedHandlerVar = { name: Bytes, ty: Type, init: TypedExpr, span: Span }
+pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpr<t>, span: Span }
+
+derive bin for TypedExpr
+
+derive bin for TypedNode
+
+derive bin for Reading
+
+derive bin for TypedParam
+
+derive bin for TypedThunk
+
+derive bin for TypedField
+
+derive bin for TypedArm
+
+derive bin for TypedPattern
+
+derive bin for TypedFieldPattern
+
+derive bin for TypedStmt
+
+derive bin for TypedClause
+
+derive bin for TypedReturn
+
+derive bin for TypedHandlerVar
 
 // --- Building nodes --------------------------------------------------------------------------------
 
 // Each builder takes what the check found of a node's parts, none for a part the check reported an
 // error in, and makes the node only where every part is there.
 
-pub fn unary_of(op: Bytes, operand: Option<TypedExpr>) -> Option<TypedNode> =
+pub fn unary_of(op: Bytes, operand: Option<TypedExpr<Type>>) -> Option<TypedNode<Type>> =
   match operand { Some(x) -> Some(TypedUnary({ op: op, operand: x })), None -> None }
 
-pub fn binary_of(op: Bytes, lhs: Option<TypedExpr>, rhs: Option<TypedExpr>) -> Option<TypedNode> =
+pub fn binary_of(
+  op: Bytes,
+  lhs: Option<TypedExpr<Type>>,
+  rhs: Option<TypedExpr<Type>>,
+) -> Option<TypedNode<Type>> =
   match ((lhs, rhs)) {
     (Some(l), Some(r)) -> Some(TypedBinary({ op: op, lhs: l, rhs: r })),
     _ -> None,
   }
 
-pub fn call_of(callee: Option<TypedExpr>, args: List<Option<TypedExpr>>) -> Option<TypedNode> =
+pub fn call_of(
+  callee: Option<TypedExpr<Type>>,
+  args: List<Option<TypedExpr<Type>>>,
+) -> Option<TypedNode<Type>> =
   match ((callee, Option::all(args))) {
     (Some(f), Some(xs)) -> Some(TypedCall({ callee: f, args: xs })),
     _ -> None,
   }
 
 pub fn if_of(
-  cond: Option<TypedExpr>,
-  then_branch: Option<TypedExpr>,
-  else_branch: Option<TypedExpr>,
-) -> Option<TypedNode> =
+  cond: Option<TypedExpr<Type>>,
+  then_branch: Option<TypedExpr<Type>>,
+  else_branch: Option<TypedExpr<Type>>,
+) -> Option<TypedNode<Type>> =
   match ((cond, then_branch, else_branch)) {
     (Some(c), Some(t), Some(e)) -> Some(TypedIf({ cond: c, then_branch: t, else_branch: e })),
     _ -> None,
   }
 
-pub fn list_of(items: List<Option<TypedExpr>>) -> Option<TypedNode> =
+pub fn list_of(items: List<Option<TypedExpr<Type>>>) -> Option<TypedNode<Type>> =
   match Option::all(items) { Some(xs) -> Some(TypedList(xs)), None -> None }
 
-pub fn field_read_of(base: Option<TypedExpr>, field: Bytes) -> Option<TypedNode> =
+pub fn field_read_of(base: Option<TypedExpr<Type>>, field: Bytes) -> Option<TypedNode<Type>> =
   match base { Some(b) -> Some(TypedFieldRead({ base: b, field: field })), None -> None }
 
-pub fn record_of(fields: List<{ name: Bytes, value: Option<TypedExpr> }>) -> Option<TypedNode> =
+pub fn record_of(
+  fields: List<{ name: Bytes, value: Option<TypedExpr<Type>> }>,
+) -> Option<TypedNode<Type>> =
   match fields.fold(
       Some([]),
-      |acc: Option<List<TypedField>>, f: { name: Bytes, value: Option<TypedExpr> }|
+      |acc: Option<List<TypedField<Type>>>, f: { name: Bytes, value: Option<TypedExpr<Type>> }|
         match ((acc, f.value)) {
           (Some(fs), Some(v)) -> Some(fs.push({ name: f.name, value: v })),
           _ -> None,
@@ -145,41 +188,44 @@ pub fn record_of(fields: List<{ name: Bytes, value: Option<TypedExpr> }>) -> Opt
   }
 
 pub fn arm_of(
-  pat: Option<TypedPattern>,
-  guard: Option<Option<TypedExpr>>,
-  body: Option<TypedExpr>,
-) -> Option<TypedArm> =
+  pat: Option<TypedPattern<Type>>,
+  guard: Option<Option<TypedExpr<Type>>>,
+  body: Option<TypedExpr<Type>>,
+) -> Option<TypedArm<Type>> =
   match ((pat, guard, body)) {
     (Some(p), Some(Some(g)), Some(b)) -> Some({ pat: p, guard: Some(g), body: b }),
     (Some(p), None, Some(b)) -> Some({ pat: p, guard: None, body: b }),
     _ -> None,
   }
 
-pub fn match_of(scrutinee: Option<TypedExpr>, arms: List<Option<TypedArm>>) -> Option<TypedNode> =
+pub fn match_of(
+  scrutinee: Option<TypedExpr<Type>>,
+  arms: List<Option<TypedArm<Type>>>,
+) -> Option<TypedNode<Type>> =
   match ((scrutinee, Option::all(arms))) {
     (Some(s), Some(xs)) -> Some(TypedMatch({ scrutinee: s, arms: xs })),
     _ -> None,
   }
 
-pub fn do_of(e: Option<TypedExpr>) -> Option<TypedStmt> =
+pub fn do_of(e: Option<TypedExpr<Type>>) -> Option<TypedStmt<Type>> =
   match e { Some(x) -> Some(TypedDo(x)), None -> None }
 
 pub fn let_of(
-  pat: Option<TypedPattern>,
-  value: Option<TypedExpr>,
+  pat: Option<TypedPattern<Type>>,
+  value: Option<TypedExpr<Type>>,
   span: Span,
-) -> Option<TypedStmt> =
+) -> Option<TypedStmt<Type>> =
   match ((pat, value)) {
     (Some(p), Some(v)) -> Some(TypedLet({ pat: p, value: v, span: span })),
     _ -> None,
   }
 
 pub fn let_else_of(
-  pat: Option<TypedPattern>,
-  value: Option<TypedExpr>,
-  fallback: Option<TypedExpr>,
+  pat: Option<TypedPattern<Type>>,
+  value: Option<TypedExpr<Type>>,
+  fallback: Option<TypedExpr<Type>>,
   span: Span,
-) -> Option<TypedStmt> =
+) -> Option<TypedStmt<Type>> =
   match ((pat, value, fallback)) {
     (Some(p), Some(v), Some(f)) ->
       Some(TypedLetElse({ pat: p, value: v, fallback: f, span: span })),
@@ -190,33 +236,33 @@ pub fn case_pattern_of(
   sum: Bytes,
   name: Bytes,
   case: Int,
-  args: List<Option<TypedPattern>>,
-) -> Option<TypedPattern> =
+  args: List<Option<TypedPattern<Type>>>,
+) -> Option<TypedPattern<Type>> =
   match Option::all(args) {
     Some(ps) -> Some(TypedCase({ sum: sum, name: name, case: case, args: ps })),
     None -> None,
   }
 
 pub fn list_pattern_of(
-  items: List<Option<TypedPattern>>,
-  rest: Option<Option<TypedPattern>>,
-) -> Option<TypedPattern> =
+  items: List<Option<TypedPattern<Type>>>,
+  rest: Option<Option<TypedPattern<Type>>>,
+) -> Option<TypedPattern<Type>> =
   match ((Option::all(items), rest)) {
     (Some(ps), Some(Some(r))) -> Some(TypedListPattern({ items: ps, rest: Some(r) })),
     (Some(ps), None) -> Some(TypedListPattern({ items: ps, rest: None })),
     _ -> None,
   }
 
-pub fn or_pattern_of(alts: List<Option<TypedPattern>>) -> Option<TypedPattern> =
+pub fn or_pattern_of(alts: List<Option<TypedPattern<Type>>>) -> Option<TypedPattern<Type>> =
   match Option::all(alts) { Some(ps) -> Some(TypedOr(ps)), None -> None }
 
 pub fn record_pattern_of(
-  fields: List<{ name: Bytes, pat: Option<TypedPattern> }>,
+  fields: List<{ name: Bytes, pat: Option<TypedPattern<Type>> }>,
   rest: Bool,
-) -> Option<TypedPattern> =
+) -> Option<TypedPattern<Type>> =
   match fields.fold(
       Some([]),
-      |acc: Option<List<{ name: Bytes, pat: TypedPattern }>>, f: { name: Bytes, pat: Option<TypedPattern> }|
+      |acc: Option<List<TypedFieldPattern<Type>>>, f: { name: Bytes, pat: Option<TypedPattern<Type>> }|
         match ((acc, f.pat)) {
           (Some(fs), Some(p)) -> Some(fs.push({ name: f.name, pat: p })),
           _ -> None,
@@ -230,20 +276,24 @@ pub fn perform_of(
   effect_name: Bytes,
   op: Bytes,
   resource: Option<Bytes>,
-  args: List<Option<TypedExpr>>,
-) -> Option<TypedNode> =
+  atom: Atom,
+  args: List<Option<TypedExpr<Type>>>,
+) -> Option<TypedNode<Type>> =
   match Option::all(args) {
-    Some(xs) -> Some(TypedPerform({ effect: effect_name, op: op, resource: resource, args: xs })),
+    Some(xs) ->
+      Some(TypedPerform({ effect: effect_name, op: op, resource: resource, atom: atom, args: xs })),
     None -> None,
   }
 
-pub fn simulate_of(body: Option<TypedExpr>, row: Row) -> Option<TypedNode> =
+pub fn simulate_of(body: Option<TypedExpr<Type>>, row: Row) -> Option<TypedNode<Type>> =
   match body { Some(b) -> Some(TypedSimulate({ body: b, row: row })), None -> None }
 
-pub fn parallel_of(branches: List<{ body: Option<TypedExpr>, row: Row }>) -> Option<TypedNode> =
+pub fn parallel_of(
+  branches: List<{ body: Option<TypedExpr<Type>>, row: Row }>,
+) -> Option<TypedNode<Type>> =
   match branches.fold(
       Some([]),
-      |acc: Option<List<TypedThunk>>, b: { body: Option<TypedExpr>, row: Row }|
+      |acc: Option<List<TypedThunk<Type>>>, b: { body: Option<TypedExpr<Type>>, row: Row }|
         match ((acc, b.body)) {
           (Some(ts), Some(x)) -> Some(ts.push({ body: x, row: b.row })),
           _ -> None,
@@ -257,7 +307,7 @@ pub fn parallel_of(branches: List<{ body: Option<TypedExpr>, row: Row }>) -> Opt
 pub fn params_typed(
   names: List<{ name: Bytes, span: Span }>,
   tys: List<Type>,
-) -> Option<List<TypedParam>> =
+) -> Option<List<TypedParam<Type>>> =
   match names.zip_strict(tys) {
     Some(ps) ->
       Some(
@@ -269,15 +319,15 @@ pub fn params_typed(
 
 pub fn clause_of(
   head: { effect: Bytes, op: Bytes, resource: Option<Bytes>, every_label: Bool },
-  params: Option<List<TypedParam>>,
-  label: Option<TypedParam>,
-  resume: Option<TypedParam>,
-  body: Option<TypedExpr>,
+  params: Option<List<TypedParam<Type>>>,
+  label: Option<TypedParam<Type>>,
+  resume: Option<TypedParam<Type>>,
+  body: Option<TypedExpr<Type>>,
   ty: Type,
   row: Row,
   resumed: Row,
   span: Span,
-) -> Option<TypedClause> =
+) -> Option<TypedClause<Type>> =
   match ((params, body)) {
     (Some(ps), Some(b)) ->
       Some({
@@ -298,12 +348,12 @@ pub fn clause_of(
   }
 
 pub fn return_of(
-  binder: TypedParam,
-  body: Option<TypedExpr>,
+  binder: TypedParam<Type>,
+  body: Option<TypedExpr<Type>>,
   ty: Type,
   row: Row,
   span: Span,
-) -> Option<TypedReturn> =
+) -> Option<TypedReturn<Type>> =
   match body {
     Some(b) -> Some({ binder: binder, body: b, ty: ty, row: row, span: span }),
     None -> None,
@@ -312,18 +362,18 @@ pub fn return_of(
 pub fn handler_var_of(
   name: Bytes,
   ty: Type,
-  init: Option<TypedExpr>,
+  init: Option<TypedExpr<Type>>,
   span: Span,
-) -> Option<TypedHandlerVar> =
+) -> Option<TypedHandlerVar<Type>> =
   match init { Some(i) -> Some({ name: name, ty: ty, init: i, span: span }), None -> None }
 
 pub fn handle_of(
-  body: Option<TypedExpr>,
+  body: Option<TypedExpr<Type>>,
   row: Row,
-  clauses: List<Option<TypedClause>>,
-  ret: Option<Option<TypedReturn>>,
-  vars: List<Option<TypedHandlerVar>>,
-) -> Option<TypedNode> =
+  clauses: List<Option<TypedClause<Type>>>,
+  ret: Option<Option<TypedReturn<Type>>>,
+  vars: List<Option<TypedHandlerVar<Type>>>,
+) -> Option<TypedNode<Type>> =
   match ((body, Option::all(clauses), ret, Option::all(vars))) {
     (Some(b), Some(cs), None, Some(vs)) ->
       Some(TypedHandle({ body: b, row: row, clauses: cs, ret: None, vars: vs })),
@@ -332,25 +382,33 @@ pub fn handle_of(
     _ -> None,
   }
 
-pub fn assign_of(name: Bytes, value: Option<TypedExpr>, span: Span) -> Option<TypedStmt> =
+pub fn assign_of(
+  name: Bytes,
+  value: Option<TypedExpr<Type>>,
+  span: Span,
+) -> Option<TypedStmt<Type>> =
   match value { Some(v) -> Some(TypedAssign({ name: name, value: v, span: span })), None -> None }
 
 pub fn update_of(
-  base: Option<TypedExpr>,
-  sets: List<{ name: Bytes, value: Option<TypedExpr> }>,
-) -> Option<TypedNode> =
+  base: Option<TypedExpr<Type>>,
+  sets: List<{ name: Bytes, value: Option<TypedExpr<Type>> }>,
+) -> Option<TypedNode<Type>> =
   match ((base, record_of(sets))) {
     (Some(b), Some(TypedRecord(fs))) -> Some(TypedUpdate({ base: b, sets: fs })),
     _ -> None,
   }
 
-pub fn lambda_of(params: List<TypedParam>, body: Option<TypedExpr>, row: Row) -> Option<TypedNode> =
+pub fn lambda_of(
+  params: List<TypedParam<Type>>,
+  body: Option<TypedExpr<Type>>,
+  row: Row,
+) -> Option<TypedNode<Type>> =
   match body { Some(b) -> Some(TypedLambda({ params: params, body: b, row: row })), None -> None }
 
 pub fn block_of(
-  stmts: List<Option<TypedStmt>>,
-  tail: Option<Option<TypedExpr>>,
-) -> Option<TypedNode> =
+  stmts: List<Option<TypedStmt<Type>>>,
+  tail: Option<Option<TypedExpr<Type>>>,
+) -> Option<TypedNode<Type>> =
   match ((Option::all(stmts), tail)) {
     (Some(ss), Some(Some(t))) -> Some(TypedBlock({ stmts: ss, tail: Some(t) })),
     (Some(ss), None) -> Some(TypedBlock({ stmts: ss, tail: None })),
@@ -360,9 +418,9 @@ pub fn block_of(
 // --- Walking the tree ------------------------------------------------------------------------------
 
 /// `e` with each node rewritten by `f` once its parts are.
-pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
-  let go = |x: TypedExpr| rewritten(x, f);
-  let opt = |x: Option<TypedExpr>| match x { Some(y) -> Some(rewritten(y, f)), None -> None };
+pub fn rewritten(e: TypedExpr<Type>, f: (TypedExpr<Type>) -> TypedExpr<Type>) -> TypedExpr<Type> = {
+  let go = |x: TypedExpr<Type>| rewritten(x, f);
+  let opt = |x: Option<TypedExpr<Type>>| match x { Some(y) -> Some(rewritten(y, f)), None -> None };
   f({
     ..e,
     node: match e.node {
@@ -378,11 +436,12 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
       TypedMatch(m) ->
         TypedMatch({
           scrutinee: go(m.scrutinee),
-          arms: m.arms.map(|a: TypedArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+          arms: m.arms.map(|a: TypedArm<Type>|
+            { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
         }),
       TypedBlock(b) ->
         TypedBlock({
-          stmts: b.stmts.map(|s: TypedStmt|
+          stmts: b.stmts.map(|s: TypedStmt<Type>|
             match s {
               TypedLet(l) -> TypedLet({ ..l, value: go(l.value) }),
               TypedLetElse(l) ->
@@ -394,24 +453,24 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
         }),
       TypedList(xs) -> TypedList(xs.map(go)),
       TypedRecord(fs) ->
-        TypedRecord(fs.map(|fd: TypedField| { name: fd.name, value: go(fd.value) })),
+        TypedRecord(fs.map(|fd: TypedField<Type>| { name: fd.name, value: go(fd.value) })),
       TypedUpdate(u) ->
         TypedUpdate({
           base: go(u.base),
-          sets: u.sets.map(|fd: TypedField| { name: fd.name, value: go(fd.value) }),
+          sets: u.sets.map(|fd: TypedField<Type>| { name: fd.name, value: go(fd.value) }),
         }),
       TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
       TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
       TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
       TypedSimulate(t) -> TypedSimulate({ ..t, body: go(t.body) }),
-      TypedParallel(ts) -> TypedParallel(ts.map(|t: TypedThunk| { ..t, body: go(t.body) })),
+      TypedParallel(ts) -> TypedParallel(ts.map(|t: TypedThunk<Type>| { ..t, body: go(t.body) })),
       TypedHandle(h) ->
         TypedHandle({
           ..h,
           body: go(h.body),
-          clauses: h.clauses.map(|c: TypedClause| { ..c, body: go(c.body) }),
+          clauses: h.clauses.map(|c: TypedClause<Type>| { ..c, body: go(c.body) }),
           ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
-          vars: h.vars.map(|v: TypedHandlerVar| { ..v, init: go(v.init) }),
+          vars: h.vars.map(|v: TypedHandlerVar<Type>| { ..v, init: go(v.init) }),
         }),
       TypedLit(l) -> TypedLit(l),
       TypedRead(r) -> TypedRead(r),
@@ -420,10 +479,10 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
 }
 
 /// Every node of `e`, each before its parts.
-pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
-  let all = |xs: List<TypedExpr>|
-    xs.fold([], |acc: List<TypedExpr>, x: TypedExpr| acc.concat(nodes_of(x)));
-  let opt = |x: Option<TypedExpr>| match x { Some(y) -> nodes_of(y), None -> [] };
+pub fn nodes_of(e: TypedExpr<Type>) -> List<TypedExpr<Type>> = {
+  let all = |xs: List<TypedExpr<Type>>|
+    xs.fold([], |acc: List<TypedExpr<Type>>, x: TypedExpr<Type>| acc.concat(nodes_of(x)));
+  let opt = |x: Option<TypedExpr<Type>>| match x { Some(y) -> nodes_of(y), None -> [] };
   [e].concat(match e.node {
     TypedUnary(u) -> nodes_of(u.operand),
     TypedBinary(b) -> nodes_of(b.lhs).concat(nodes_of(b.rhs)),
@@ -431,11 +490,11 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
     TypedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
     TypedMatch(m) ->
       nodes_of(m.scrutinee).concat(
-        m.arms.fold([], |acc: List<TypedExpr>, a: TypedArm|
+        m.arms.fold([], |acc: List<TypedExpr<Type>>, a: TypedArm<Type>|
           acc.concat(opt(a.guard)).concat(nodes_of(a.body))),
       ),
     TypedBlock(b) ->
-      b.stmts.fold([], |acc: List<TypedExpr>, s: TypedStmt|
+      b.stmts.fold([], |acc: List<TypedExpr<Type>>, s: TypedStmt<Type>|
         acc.concat(match s {
           TypedLet(l) -> nodes_of(l.value),
           TypedLetElse(l) -> nodes_of(l.value).concat(nodes_of(l.fallback)),
@@ -445,16 +504,16 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
         opt(b.tail),
       ),
     TypedList(xs) -> all(xs),
-    TypedRecord(fs) -> all(fs.map(|fd: TypedField| fd.value)),
-    TypedUpdate(u) -> nodes_of(u.base).concat(all(u.sets.map(|fd: TypedField| fd.value))),
+    TypedRecord(fs) -> all(fs.map(|fd: TypedField<Type>| fd.value)),
+    TypedUpdate(u) -> nodes_of(u.base).concat(all(u.sets.map(|fd: TypedField<Type>| fd.value))),
     TypedFieldRead(r) -> nodes_of(r.base),
     TypedPerform(p) -> all(p.args),
     TypedLambda(l) -> nodes_of(l.body),
     TypedSimulate(t) -> nodes_of(t.body),
-    TypedParallel(ts) -> all(ts.map(|t: TypedThunk| t.body)),
+    TypedParallel(ts) -> all(ts.map(|t: TypedThunk<Type>| t.body)),
     TypedHandle(h) ->
-      all(h.vars.map(|v: TypedHandlerVar| v.init)).concat(nodes_of(h.body)).concat(
-        all(h.clauses.map(|c: TypedClause| c.body)),
+      all(h.vars.map(|v: TypedHandlerVar<Type>| v.init)).concat(nodes_of(h.body)).concat(
+        all(h.clauses.map(|c: TypedClause<Type>| c.body)),
       ).concat(match h.ret { Some(r) -> nodes_of(r.body), None -> [] }),
     TypedLit(_) -> [],
     TypedRead(_) -> [],
@@ -464,20 +523,23 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
 // --- Defaults a call on a value copies -------------------------------------------------------------
 
 /// A parameter's default copied into the call at site `call`, typed: the argument at `place`.
-pub type PlacedDefault = { call: Int, place: Int, value: Option<TypedExpr> }
+pub type PlacedDefault = { call: Int, place: Int, value: Option<TypedExpr<Type>> }
 
 /// `e` with each default in `defaults` put in its call's arguments at its place. None where a
 /// default is not typed or its call is not one of `e`'s.
-pub fn defaults_placed(e: TypedExpr, defaults: List<PlacedDefault>) -> Option<TypedExpr> =
+pub fn defaults_placed(
+  e: TypedExpr<Type>,
+  defaults: List<PlacedDefault>,
+) -> Option<TypedExpr<Type>> =
   if defaults.len() == 0 { Some(e) } else {
     let by_call = defaults.fold(Map::new(), |m: Map<Int, List<PlacedDefault>>, d: PlacedDefault|
       m.insert(d.call, match m.get(d.call) { Some(ds) -> ds.push(d), None -> [d] }));
-    let calls = nodes_of(e).filter(|x: TypedExpr|
+    let calls = nodes_of(e).filter(|x: TypedExpr<Type>|
       match x.node { TypedCall(_) -> by_call.contains(x.span.site), _ -> false });
     let untyped = defaults.any(|d: PlacedDefault| match d.value { Some(_) -> false, None -> true });
     if calls.len() != by_call.len() || untyped { None } else {
       Some(
-        rewritten(e, |x: TypedExpr|
+        rewritten(e, |x: TypedExpr<Type>|
           match ((x.node, by_call.get(x.span.site))) {
             (TypedCall(c), Some(ds)) ->
               {
@@ -486,7 +548,7 @@ pub fn defaults_placed(e: TypedExpr, defaults: List<PlacedDefault>) -> Option<Ty
                   callee: c.callee,
                   args: ds.sort_by(|a: PlacedDefault, b: PlacedDefault| a.place <= b.place).fold(
                     c.args,
-                    |args: List<TypedExpr>, d: PlacedDefault|
+                    |args: List<TypedExpr<Type>>, d: PlacedDefault|
                       match d.value {
                         Some(v) -> args.take(d.place).push(v).concat(args.drop(d.place)),
                         None -> args,
