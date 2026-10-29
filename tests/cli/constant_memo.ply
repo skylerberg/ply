@@ -1,6 +1,6 @@
 //! A nullary pure definition is a constant: its body runs once per unit, and every later read is
-//! the memo's. Told by the clock with a wide margin each way: one run of the body takes a small part
-//! of it, and the hundreds a definition run again at each read would take are far past it.
+//! the memo's. Told by the call depth limit: each probe reads a definition from deep enough that
+//! running its body there would pass the limit, so only a read the memo answers comes back.
 
 import harness (Here, Shipped, Loaded, entered, loaded, project, scratch, unloaded)
 import cli.machine
@@ -17,42 +17,44 @@ fn constants() -> String =
   \\
   \\fn main() -> Int = 0
   \\
-  \\fn spin(n: Int, counted: Int) -> Int = if n <= 0 { counted } else { spin(n - 1, counted + 1) }
+  \\fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
   \\
-  \\pub fn constant() -> Int = spin(20000000, 0)
+  \\pub fn constant() -> Int = deep(6000)
   \\
-  \\pub fn parameterized(ignored: Int) -> Int = spin(20000000, 0)
+  \\pub fn parameterized(ignored: Int) -> Int = deep(6000)
   \\
   \\// Performs nothing; the row is the published claim and is what decides this.
-  \\pub fn over_declared() -> Int / {store.read} = spin(20000000, 0)
+  \\pub fn over_declared() -> Int / {store.read} = deep(6000)
   \\
-  \\fn nest_constant(n: Int) -> Int = if n <= 0 { constant() } else { nest_constant(n - 1) + constant() }
+  \\fn nest_constant(n: Int) -> Int = if n <= 0 { constant() } else { nest_constant(n - 1) + 0 }
   \\
   \\fn nest_parameterized(n: Int) -> Int =
-  \\  if n <= 0 { parameterized(0) } else { nest_parameterized(n - 1) + parameterized(0) }
+  \\  if n <= 0 { parameterized(0) } else { nest_parameterized(n - 1) + 0 }
   \\
   \\fn nest_over_declared(n: Int) -> Int / {store.read} =
-  \\  if n <= 0 { over_declared() } else { nest_over_declared(n - 1) + over_declared() }
+  \\  if n <= 0 { over_declared() } else { nest_over_declared(n - 1) + 0 }
   \\
-  \\pub fn probe_constant(n: Int) -> Int = nest_constant(n)
+  \\fn nest_reads(n: Int) -> Int = if n <= 0 { reads(1000, 0) } else { nest_reads(n - 1) + 0 }
   \\
-  \\pub fn probe_parameterized(n: Int) -> Int = nest_parameterized(n)
+  \\pub fn probe_constant(n: Int) -> Int = constant() + nest_constant(n)
   \\
-  \\pub fn probe_over_declared(n: Int) -> Int / {store.read} = nest_over_declared(n)
+  \\pub fn probe_parameterized(n: Int) -> Int = parameterized(0) + nest_parameterized(n)
+  \\
+  \\pub fn probe_over_declared(n: Int) -> Int / {store.read} =
+  \\  over_declared() + nest_over_declared(n)
+  \\
+  \\pub fn probe_reads(n: Int) -> Int = constant() + nest_reads(n)
   \\
   \\pub fn reads(n: Int, sum: Int) -> Int = if n <= 0 { sum } else { reads(n - 1, sum + constant()) }
   \\
 
-/// What one run of a constant's body answers.
-fn work() -> Int = 20000000
+/// What a definition's body answers, and how deeply it nests to answer it.
+fn work() -> Int = 6000
 
-/// The milliseconds each entry may take.
-fn clock_ms() -> Int = 3000
-
-/// The program compiled, opened and bound, each entry under `clock_ms`.
+/// The program compiled, opened and bound.
 fn bound() -> Loaded / {Here, Shipped, Driving, abort.raise} = {
   project([{ path: "inner.ply", text: constants() }]);
-  loaded({ ..default_options(), timeout: clock_ms() })
+  loaded(default_options())
 }
 
 /// What one entry answered, as an `Int`, or the code it ended with.
@@ -67,37 +69,29 @@ fn answered(
     Err(r) -> Err(r.diag.code),
   }
 
-/// `name` read at every depth from a thousand down: within the clock only where the body runs once.
+/// `name` read once near the top, then again `work()` calls deep, where its body would nest past
+/// the call depth limit: within it only where the memo answers the second read.
 fn probed(name: String) -> Result<Int, Bytes> / {Here, Shipped, Driving, abort.raise} = {
   let l = bound();
-  let probe = answered(l, name, [VInt(1000)]);
+  let probe = answered(l, name, [VInt(work())]);
   let _ = unloaded(l);
   probe
 }
 
 test "a nullary pure definition is evaluated once, whatever depth reads it again" {
-  scratch(|| { assert_eq(probed("probe_constant"), Ok(1001 * work())) })
+  scratch(|| { assert_eq(probed("probe_constant"), Ok(2 * work())) })
 }
 
 test "a definition with a parameter is no constant, however dead the parameter is" {
-  scratch(|| { assert_eq(probed("probe_parameterized"), Err(b"W0612")) })
+  scratch(|| { assert_eq(probed("probe_parameterized"), Err(b"E0502")) })
 }
 
 test "a published row the body never performs keeps a definition from the memo" {
-  scratch(|| { assert_eq(probed("probe_over_declared"), Err(b"W0612")) })
+  scratch(|| { assert_eq(probed("probe_over_declared"), Err(b"E0502")) })
 }
 
 test "a constant read a thousand times runs its body once" {
-  scratch(|| {
-    let l = bound();
-    assert_eq(answered(l, "constant", []), Ok(work()));
-    assert_eq(answered(l, "reads", [VInt(1000), VInt(0)]), Ok(1000 * work()));
-    let _ = unloaded(l);
-    let fresh = bound();
-    let read = answered(fresh, "reads", [VInt(1000), VInt(0)]);
-    let _ = unloaded(fresh);
-    assert_eq(read, Ok(1000 * work()))
-  })
+  scratch(|| { assert_eq(probed("probe_reads"), Ok(1001 * work())) })
 }
 
 // A name the unit never compiled and a compiled one offered the wrong number of arguments are each
