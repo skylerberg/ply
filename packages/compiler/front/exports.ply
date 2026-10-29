@@ -20,8 +20,8 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               IEffectSet, IExtern, is_shipped, IInstance, INumeric, TDSum,
                               ImportDecl, IModule, IAlias, INames, VariantDef, OpDef, Derived,
                               Derivation, parse, parse_started, header, header_of, is_written,
-                              item_span, import_decl_bin, owner_of, item_owner, member_of,
-                              member_name, is_builtin, derivation_bin)
+                              item_span, import_decl_bin, owner_of, item_owner, test_of_owner,
+                              member_of, member_name, is_builtin, derivation_bin)
 import compiler.syntax.fmt (printed_alone)
 import compiler.syntax.exprs (EBlock, expr_span, freed_by, prelude_module, map_literal_call)
 import compiler.store.hash.forms (Fixed, Fixing, NodeRef, HashOutput, fixed_nodes, fixing_of,
@@ -36,7 +36,7 @@ import compiler.expand.embed (EmbedFile)
 import compiler.syntax.lexer (lex, Token, Identifier, Punctuation, Keyword, StringLiteral,
                               InterpolatedHead, LineString, EndOfInput, is_ident_start, bound_names)
 import compiler.syntax.parsing (Ident, Span, starts_upper, dummy_span, start, started)
-import compiler.check.infer.checker (DefInfo, Raise, Walks, Every)
+import compiler.check.infer.checker (DefInfo, TestInfo, Raise, Walks, Every)
 import compiler.check.types (canonical_scheme, Scheme)
 
 /// A name another module's text says: `name` is declared by `module`, or every name it declares
@@ -1468,6 +1468,27 @@ pub fn owner_source<| e>(
   )
 }
 
+/// `m`, parsed from `o`'s text, with each test named as its owner says: a test whose label an
+/// earlier test of its module has is named apart only beside that test.
+fn named_as_owned(m: Module, o: OwnerSource) -> Module / {abort.raise} =
+  {
+    ..m,
+    items: m.items.map(|item: Item|
+      match item {
+        ITest(d) -> {
+          let start = d.span.start - o.offset;
+          match o.items.find(|x: ItemAt| x.from <= start && start < x.from + x.len) {
+            Some(x) -> match test_of_owner(x.owner) {
+              Some(name) -> ITest({ ..d, name: name }),
+              None -> item,
+            },
+            None -> item,
+          }
+        },
+        _ -> item,
+      }),
+  }
+
 /// `o`, an owner's source, standing where `placed` says, checked against what it reads, each module
 /// it imports standing where `placing` says. `walks` is how the check treats its bodies where it
 /// does not walk every one, given the place its module has among those it reads.
@@ -1478,8 +1499,15 @@ pub fn checked_owner(
   reading: Reading,
   walks: Option<(Int) -> Walks / {abort.raise}> = None,
 ) -> { pulled: Pulled, at: Int } / {abort.raise} = {
-  // Its `derive`s expanded alone would write what the rest of their module decides otherwise.
-  let parsed = parse_from(0, o.source, parse(o.source.src), taken: o.derived);
+  // Its `derive`s expanded alone, and its tests named alone, would write what the rest of their
+  // module decides otherwise.
+  let raw = parse(o.source.src);
+  let parsed = parse_from(
+    0,
+    o.source,
+    { ..raw, node: named_as_owned(raw.node, o) },
+    taken: o.derived,
+  );
   let s = staged_against(o.source, placed, o.deps, o.fixed, placing, {
     ..reading,
     given: reading.given.push(parsed),
@@ -1625,6 +1653,52 @@ fn agreed_owner(
   }
 }
 
+/// Owner `o` of module `i` of `whole`, whose root modules are `sources`, checked alone against what
+/// it reads.
+fn checked_apart(
+  whole: Analysis,
+  sources: List<Source>,
+  i: Int,
+  o: Bytes,
+  shipped: List<Source> = [],
+) -> Analysis / {abort.raise} = {
+  let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+    acc.insert(s.name, s.src));
+  // `std.prelude`, which every module imports, is read beside them as the toolchain ships it.
+  let read = with_prelude_source(sources.concat(shipped)).fold(
+    Map::new(),
+    |acc: Map<Bytes, Bytes>, s: Source| acc.insert(s.name, s.src),
+  );
+  let text_at = |k: Int| match read.get(whole.mods.get(k).name) { Some(t) -> t, None -> b"" };
+  let exports = range(0, whole.mods.len()).fold(Map::new(), |acc: Map<Bytes, Exports>, k: Int|
+    acc.insert(whole.mods.get(k).name, exports_of(whole, k, text_at(k))));
+  let reading = {
+    pkgs: { root: b"", manifest: None, supplied: [] },
+    tested: true,
+    whole: shipped,
+    data: [],
+    embeds: [],
+    given: [],
+    judged: None,
+    unread: [],
+  };
+  let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
+  let parsed = whole.mods.get(i);
+  let source = owner_source(
+    parsed,
+    parse(text_at(i)).node,
+    text_at(i),
+    import_targets(whole, i),
+    o,
+    |module: Bytes, n: Bytes| entries_in(exports, module, n),
+    |_: Bytes| seen_by(whole, i),
+  );
+  match checked_owner(source, InRoot, placing, reading).pulled.out {
+    Refused(ds) -> refused_apart(Bytes::concat_all([parsed.name, b".", o]), "checks", ds),
+    Analysed(w) -> w,
+  }
+}
+
 /// Each owner of each module of `sources` that owns a function, checked alone against what it reads,
 /// beside `whole`'s check of it.
 fn per_owner(
@@ -1633,57 +1707,55 @@ fn per_owner(
 ) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
   let texts = sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
     acc.insert(s.name, s.src));
-  // `std.prelude`, which every module imports, is read beside them as the toolchain ships it.
-  let read = with_prelude_source(sources).fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-    acc.insert(s.name, s.src));
-  let text_at = |i: Int| match read.get(whole.mods.get(i).name) { Some(t) -> t, None -> b"" };
-  let exports = range(0, whole.mods.len()).fold(Map::new(), |acc: Map<Bytes, Exports>, i: Int|
-    acc.insert(whole.mods.get(i).name, exports_of(whole, i, text_at(i))));
-  let reading = {
-    pkgs: { root: b"", manifest: None, supplied: [] },
-    tested: true,
-    whole: [],
-    data: [],
-    embeds: [],
-    given: [],
-    judged: None,
-    unread: [],
-  };
-  let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
   range(0, whole.mods.len()).fold(
     [],
     |acc: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, i: Int| {
       let parsed = whole.mods.get(i);
       let name = parsed.name;
-      if !texts.contains(name) { acc } else {
-        let raw = parse(text_at(i)).node;
-        let fns = fn_owners(raw, parsed);
-        let owned_by = |o: Bytes, n: Bytes| fns.get(simple_of(name, n)) == Some(o);
-        let owners = raw.items.fold(Map::new(), |m: Map<Bytes, Bytes>, item: Item|
-          match item { IFn(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
-        );
-        owners.fold(acc, |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
-          let source = owner_source(
-            parsed,
-            raw,
-            text_at(i),
-            import_targets(whole, i),
-            o,
-            |module: Bytes, n: Bytes| entries_in(exports, module, n),
-            |_: Bytes| seen_by(whole, i),
+      match texts.get(name) {
+        None -> acc,
+        Some(text) -> {
+          let raw = parse(text).node;
+          let fns = fn_owners(raw, parsed);
+          let owned_by = |o: Bytes, n: Bytes| fns.get(simple_of(name, n)) == Some(o);
+          let owners = raw.items.fold(Map::new(), |m: Map<Bytes, Bytes>, item: Item|
+            match item { IFn(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
           );
-          let apart = match checked_owner(source, InRoot, placing, reading).pulled.out {
-            Refused(ds) -> refused_apart(Bytes::concat_all([name, b".", o]), "checks", ds),
-            Analysed(w) -> w,
-          };
-          a.push({
-            owner: Bytes::concat_all([name, b".", o]),
-            whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
-            apart: agreed_owner(apart, name, |n: Bytes| owned_by(o, n)),
+          owners.fold(acc, |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
+            let apart = checked_apart(whole, sources, i, o);
+            a.push({
+              owner: Bytes::concat_all([name, b".", o]),
+              whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
+              apart: agreed_owner(apart, name, |n: Bytes| owned_by(o, n)),
+            })
           })
-        })
+        },
       }
     },
+  )
+}
+
+test "a test checked alone keeps the name its module gives it beside an earlier test of its label" {
+  let src = b"test \"holds {n}\" for n: Int in [1] { assert(n > 0) }\n\n// the second\ntest \"holds {n}\" for n: Int in [2] { assert(n > 0) }\n";
+  let sources = [{ name: b"m", src: src }];
+  // Stand-ins for the two shipped modules a test over cases reads.
+  let shipped = [
+    {
+      name: b"std.cases",
+      src: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+    },
+    { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+  ];
+  let whole = outcome(analyse_pulling_std_with(sources, shipped, no_rows()));
+  let m = range(0, whole.mods.len()).fold(0, |k: Int, j: Int|
+    if whole.mods.get(j).name == b"m" { j } else { k });
+  let keys = |w: Analysis|
+    w.checked.tests.filter(|t: TestInfo| t.module == b"m").map(|t: TestInfo| t.key);
+  assert_eq(keys(whole), [b"m.holds {n}", b"m.holds {n} (2)"]);
+  assert_eq(
+    [b"test holds {n}", b"test holds {n} (2)"].map(|o: Bytes|
+      keys(checked_apart(whole, sources, m, o, shipped: shipped))),
+    [[b"m.holds {n}"], [b"m.holds {n} (2)"]],
   )
 }
 

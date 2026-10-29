@@ -6,13 +6,14 @@ import std.graph
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
                                     AtomExpr, MRead, ty_span, is_raise, no_generics)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IEffectSet,
-                              IExtern, is_shipped, is_builtin, FnDef, TestDef, Cases, LawDef,
-                              OfSchema, SchemaIdentity, Binder, Constraint, Deriver, DEq, DOrd,
-                              DKept, DShow, DHash, DNumeric, DInteger, is_predicate, deriver_text,
-                              schema_of, SRequires, SEnsures, SCost, SSpace, SpecClause, Derived,
-                              parse, test_run, test_listing, IInstance, InstanceKind, NKey, NShow,
-                              NInvariant, NHost, NRelease, INumeric, member_name, member_of,
-                              numeric_ops, numeric_by, is_pub, TDAlias, TDExtern)
+                              IExtern, is_shipped, is_builtin, FnDef, TestDef, Cases, cases_form,
+                              LawDef, OfSchema, SchemaIdentity, Binder, Constraint, Deriver, DEq,
+                              DOrd, DKept, DShow, DHash, DNumeric, DInteger, is_predicate,
+                              deriver_text, schema_of, SRequires, SEnsures, SCost, SSpace,
+                              SpecClause, Derived, parse, test_run, test_listing, IInstance,
+                              InstanceKind, NKey, NShow, NInvariant, NHost, NRelease, INumeric,
+                              member_name, member_of, numeric_ops, numeric_by, is_pub, TDAlias,
+                              TDExtern)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -3361,33 +3362,69 @@ fn close_unreachable_row(checker: Checker, signature: Signature) -> Checker / {a
 
 // --- Tests and laws --------------------------------------------------------------------------------
 
-/// A cached footprint carries the determinism verdict: an effect's `nondet` marker is part of its declaration's hash.
 /// The first of `labels` named `name`, where one is.
 fn labelled(labels: List<{ name: Bytes, span: Span }>, name: Bytes) -> Option<Span> =
   labels.fold(None, |span: Option<Span>, l: { name: Bytes, span: Span }|
     match span { Some(_) -> span, None -> if l.name == name { Some(l.span) } else { None } })
 
+/// A test's label as the module's other tests see it: `form` is `cases_form`'s, `None` for a plain
+/// test.
+type TestLabel = { label: Bytes, span: Span, form: Option<Bytes> }
+
+/// The first of `earlier` whose label `later` may not share: any of the same label, unless both
+/// range over cases with holes in their labels and over different tables.
+fn shared_label(earlier: List<TestLabel>, later: TestLabel) -> Option<TestLabel> =
+  earlier.fold(None, |found: Option<TestLabel>, e: TestLabel|
+    match found {
+      Some(_) -> found,
+      None -> if e.label != later.label { None } else {
+        match ((e.form, later.form)) {
+          (Some(a), Some(b)) -> if a != b { None } else { Some(e) },
+          _ -> Some(e),
+        }
+      },
+    })
+
+fn refuse_shared_label(
+  checker: Checker,
+  later: TestLabel,
+  first: TestLabel,
+) -> Checker / {abort.raise} = {
+  let over_one_table = first.form != None && later.form != None;
+  report_error_at_and(
+    checker,
+    b"E0105",
+    later.span,
+    Bytes::concat_all([
+      if over_one_table { b"two tests over the same table are labelled " }
+      else { b"two tests are labelled " },
+      debug_quoted(later.label),
+    ]),
+    b"relabelled here",
+    { module: checker.module, span: first.span },
+    b"first labelled here",
+    [
+      if over_one_table { b"their cases would have the same labels" } else {
+        b"only tests over cases may share a label, and only a label with holes, because each case is named by the label it produces"
+      },
+    ],
+  )
+}
+
 pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} = {
   let walked = parsed.module.items.fold(
     { checker: checker, labels: [] },
-    |acc: { checker: Checker, labels: List<{ name: Bytes, span: Span }> }, item: Item|
+    |acc: { checker: Checker, labels: List<TestLabel> }, item: Item|
       match item {
         ITest(def) -> {
-          let seen: Checker = match labelled(acc.labels, def.name) {
+          let written: TestLabel = {
+            label: def.label,
+            span: def.label_span,
+            form: match def.cases { Some(c) -> cases_form(c), None -> None },
+          };
+          let seen: Checker = match shared_label(acc.labels, written) {
             None -> acc.checker,
-            Some(first) ->
-              report_error_at_and(
-                acc.checker,
-                b"E0105",
-                def.name_span,
-                Bytes::concat_all([b"two tests are labelled ", debug_quoted(def.name)]),
-                b"relabelled here",
-                { module: acc.checker.module, span: first },
-                b"first labelled here",
-                [
-                  b"a test is keyed `<module>.<label>`, so one label names one test; a test over cases that shares another's body and case type can range over both tables at once",
-                ],
-              ),
+            Some(first) -> refuse_shared_label(acc.checker, written, first),
           };
           let c: Checker = { ..seen, scope: seen.scope + 1 };
           let owner = test_owner(parsed.name, def.name);
@@ -3471,7 +3508,7 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               }),
               walking: b"",
             },
-            labels: acc.labels.push({ name: def.name, span: def.name_span }),
+            labels: acc.labels.push(written),
           }
         },
         _ -> acc,
@@ -3592,9 +3629,9 @@ fn check_determinism(
             ),
             label_at(
               c.module,
-              def.name_span,
+              def.label_span,
               false,
-              Bytes::concat_all([b"test `", def.name, b"` is deterministic"]),
+              Bytes::concat_all([b"test `", def.label, b"` is deterministic"]),
             ),
           ],
           indirect.concat([

@@ -11,13 +11,13 @@ import surface
 import machine
 import compiler.front.published (no_rows)
 import compiler.front.seam (Analysed, Refused, Within, view_of, test_root_at)
-import compiler.front.facts (View)
+import compiler.front.facts (View, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
 import compiler.unit (codes, shipped)
 import compiler.store.hash.forms (TheItem, Which, listing_reach, reached_functions)
-import compiler.check.infer.checker (DefInfo, TestInfo)
+import compiler.check.infer.checker (DefInfo, TestInfo, Location)
 import compiler.emit.keys (RootKey, Named, Cases, Clause, RootName, root_name)
-import compiler.check.resolve.tables (Diag, Source, qualify)
+import compiler.check.resolve.tables (Diag, Label, Source, qualify)
 import diagnostic (Raised, diag_of, shown)
 import program (Timed, keep_command)
 import results
@@ -303,8 +303,150 @@ fn starting(
       ),
   }
 
-pub fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ranged = {
+/// One thing a run identifies by a key: test `test` by its name, or its case at position `case`
+/// by that case's label.
+type Claim = { test: Int, case: Option<Int> }
+
+fn claimed(claims: Map<Bytes, List<Claim>>, key: Bytes, by: Claim) -> Map<Bytes, List<Claim>> =
+  claims.insert(key, List::push(match claims.get(key) { Some(held) -> held, None -> [] }, by))
+
+/// The listings, except that a test fails as a whole, running none of its cases, when one of its
+/// cases has the label of another case in its table, of another test, or of a case of another
+/// test. A run identifies each case by its label, so two with one label would be mixed up.
+fn distinct_labels(
+  tests: List<TestInfo>,
+  labels: List<Location>,
+  listings: Map<Int, Result<List<Listed>, Unlisted>>,
+) -> Map<Int, Result<List<Listed>, Unlisted>> = {
+  let case_key = |t: TestInfo, c: Listed| qualify(t.module, Bytes::of_string(c.label));
+  let claims = range(0, tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Claim>>, i: Int|
+    match tests.at(i) {
+      None -> acc,
+      Some(t) -> {
+        let named = claimed(acc, t.key, { test: i, case: None });
+        match listings.get(i) {
+          Some(Ok(listing)) ->
+            range(0, listing.len()).fold(named, |a: Map<Bytes, List<Claim>>, k: Int|
+              match listing.at(k) {
+                Some(c) -> claimed(a, case_key(t, c), { test: i, case: Some(k) }),
+                None -> a,
+              }),
+          _ -> named,
+        }
+      },
+    });
+  listings.fold(
+    listings,
+    |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: Result<List<Listed>, Unlisted>|
+      match ((listed, tests.at(i))) {
+        (Ok(listing), Some(t)) -> {
+          let first = range(0, listing.len()).fold(None, |found: Option<Unlisted>, k: Int|
+            match ((found, listing.at(k))) {
+              (None, Some(c)) ->
+                label_clash(labels, i, k, c.label, match claims.get(case_key(t, c)) {
+                  Some(all) -> all,
+                  None -> [],
+                }),
+              _ -> found,
+            });
+          match first { Some(why) -> acc.insert(i, Err(why)), None -> acc }
+        },
+        _ -> acc,
+      },
+  )
+}
+
+/// Why test `i` fails when its case at position `k` has the label `label`, given everything in
+/// the run with that label's key; `None` when nothing else has it. `labels` is where each test's
+/// label is written.
+fn label_clash(
+  labels: List<Location>,
+  i: Int,
+  k: Int,
+  label: String,
+  claims: List<Claim>,
+) -> Option<Unlisted> =
+  match labels.at(i) {
+    None -> None,
+    Some(at) -> match claims.filter(|c: Claim| c.test != i) {
+      [other, ..] -> {
+        let named = other.case == None;
+        Some(
+          refused(
+            at,
+            match labels.at(other.test) {
+              Some(o) ->
+                [
+                  pointing(o, false, if named { "this test has that name" }
+                  else { "a case of this test has that label" }),
+                ],
+              None -> [],
+            },
+            "the case at position " ++ k.to_string() ++ " of the table has the label \"" ++ label
+              ++ "\", which "
+              ++ (if named { "is the name of another test" }
+              else { "a case of another test also has" }),
+          ),
+        )
+      },
+      [] -> {
+        let own = claims.fold([], |at: List<Int>, c: Claim|
+          match c.case { Some(n) -> at.push(n), None -> at });
+        if own.len() < 2 { None } else {
+          Some(
+            refused(
+              at,
+              [],
+              "the cases at positions " ++ places(own) ++ " of the table have the same label, \""
+                ++ label
+                ++ "\"",
+            ),
+          )
+        }
+      },
+    },
+  }
+
+/// A test failing as a whole with `message`, pointing at its label `at` and at `also`.
+fn refused(at: Location, also: List<Label>, message: String) -> Unlisted =
+  {
+    status: "failed",
+    failure: {
+      diag: diag_of("error", "E0105", message, [pointing(at, true, "this test")].concat(also), [
+        "each test and each case in a module needs its own label, so none of this test's cases ran",
+      ]),
+      values: [],
+    },
+  }
+
+fn pointing(at: Location, primary: Bool, text: String) -> Label =
+  {
+    module: at.module,
+    start: at.span.start,
+    end: at.span.end,
+    primary: primary,
+    text: Bytes::of_string(text),
+  }
+
+/// Positions in a table, listing the first three and counting the rest.
+fn places(at: List<Int>) -> String =
+  match at {
+    [a, b] -> a.to_string() ++ " and " ++ b.to_string(),
+    [a, b, c] -> a.to_string() ++ ", " ++ b.to_string() ++ " and " ++ c.to_string(),
+    [a, b, c, ..more] ->
+      a.to_string() ++ ", " ++ b.to_string() ++ ", " ++ c.to_string() ++ " and "
+        ++ more.len().to_string()
+        ++ " more",
+    [a] -> a.to_string(),
+    [] -> "",
+  }
+
+pub fn ranged(
+  analysis: View,
+  listings: Map<Int, Result<List<Listed>, Unlisted>>,
+) -> Ranged / {abort.raise} = {
   let tests = analysis.checked.tests;
+  let cases = distinct_labels(tests, test_label_spans(analysis.frame.outlines), listings);
   let plain = range(0, tests.len()).map(|i: Int|
     entry_of(i, match tests.at(i) { Some(t) -> t.key, None -> b"" }));
   if cases.len() == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {

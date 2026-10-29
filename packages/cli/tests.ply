@@ -15,14 +15,14 @@ import compiler.front.rows (KeyRow, EmitterRoot)
 import compiler.store.hash.forms (TheItem, reach)
 import compiler.check.infer.checker (TestInfo)
 import compiler.emit.keys (Cases, root_name, root_text, test_key, test_owner)
-import compiler.check.resolve.tables (error_with_labels)
+import compiler.check.resolve.tables (Label, error_with_labels)
 import diagnostic (Place, diag_of)
 import report (indent)
 import std.json (Null, Bool, to_string)
 import std.value (VInt, VList, render_all, shown_characters)
 import std.term (plain)
 import tester
-import tester (Testing, options_from)
+import tester (Testing, Listed, Unlisted, options_from)
 import std.machine as entering
 import testing.keys (case_hash)
 import testing.bisect (Auto, NoBodies, Skipped, Trial, a_failure, a_pass)
@@ -43,7 +43,7 @@ import tests.report (Printed, Phases, Entry, Case, Decided, shared_of, classes_o
                      secondary_lines, at_lines, seed_lines, described, case_json, placed_cases,
                      fault_json, answered, test_at)
 import tests.concluded (entry_of, job_of, ran_job, fault_of, replay_of)
-import tests.cases (scope_of, over_cases, listing_within, run_within, ranged)
+import tests.cases (scope_of, over_cases, listing_within, run_within, ranged, Ranged)
 import tests.run (rows_of, declared_effects, case_view)
 
 // --- Tests ------------------------------------------------------------------
@@ -957,13 +957,14 @@ test "a run lists a test over cases only where a filter could keep one of its ca
 /// A program with a test over cases, over stand-ins for the two shipped modules its item reads
 /// through.
 fn ranging() -> View / {abort.raise} =
+  ranging_over(
+    b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n",
+  )
+
+/// Module `m` of `src`, over the same stand-ins.
+fn ranging_over(src: Bytes) -> View / {abort.raise} =
   match analyse_pulling_std_with(
-      [
-        {
-          name: b"m",
-          src: b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n",
-        },
-      ],
+      [{ name: b"m", src: src }],
       [
         {
           name: b"std.cases",
@@ -1011,6 +1012,86 @@ test "a case is a test of its own: its label names it, its test's hash and its i
   let reached = |a: View| reach(a.frame.hashes, [TheItem(b"m.holds 1")]).fns.keys();
   assert(reached(over.analysis).contains(b"m.table") && reached(over.analysis).contains(b"m.held"));
   assert(!reached(over.judged).contains(b"m.table") && reached(over.judged).contains(b"m.held"))
+}
+
+fn listing(labels: List<String>) -> Result<List<Listed>, Unlisted> =
+  Ok(labels.map(|l: String| { label: l, identity: Bytes::of_string(l) }))
+
+/// Each entry's test name, followed by the failure of a test whose cases were not run.
+fn entered(over: Ranged) -> List<String> =
+  over.entries.map(|e: Entry|
+    String::of_bytes_lossy(e.of)
+      ++ (match e.unlisted {
+        Some(why) -> ": " ++ String::of_bytes_lossy(why.failure.diag.message),
+        None -> "",
+      }))
+
+test "tests over cases may share a label, but each case in a module needs its own label" {
+  let src = b"test \"plain\" { () }\ntest \"holds {n}\" for n: Int in [1, 2] { () }\ntest \"holds {n}\" for n: Int in [3] { () }\n";
+  let whole = ranging_over(src);
+  assert_eq(whole.checked.tests.map(|t: TestInfo| t.key), [
+    b"m.plain",
+    b"m.holds {n}",
+    b"m.holds {n} (2)",
+  ]);
+  let apart = ranged(
+    whole,
+    Map::new().insert(1, listing(["holds 1", "holds 2"])).insert(2, listing(["holds 3"])),
+  );
+  assert_eq(apart.analysis.checked.tests.map(|t: TestInfo| t.key), [
+    b"m.plain",
+    b"m.holds 1",
+    b"m.holds 2",
+    b"m.holds 3",
+  ]);
+  assert_eq(entered(apart), ["m.plain", "m.holds {n}", "m.holds {n}", "m.holds {n} (2)"]);
+  // A test with a case whose label is already used fails as a whole; the others still run.
+  let clashed = ranged(
+    whole,
+    Map::new().insert(1, listing(["holds 1", "plain"])).insert(2, listing(["holds 3"])),
+  );
+  assert_eq(entered(clashed), [
+    "m.plain",
+    "m.holds {n}: the case at position 1 of the table has the label \"plain\", which is the name of another test",
+    "m.holds {n} (2)",
+  ]);
+  // It is the mistake two tests of one label are, and points at the two labels.
+  match match clashed.entries.at(1) { Some(e) -> e.unlisted, None -> None } {
+    Some(why) -> {
+      assert_eq(why.failure.diag.code, b"E0105");
+      assert_eq(why.failure.diag.labels.map(|l: Label| src.slice(l.start, l.end)), [
+        b"\"holds {n}\"",
+        b"\"plain\"",
+      ])
+    },
+    None -> panic("the first test over cases fails as a whole"),
+  };
+  assert_eq(
+    entered(
+      ranged(
+        whole,
+        Map::new().insert(1, listing(["holds 1", "holds 2"])).insert(2, listing(["holds 2"])),
+      ),
+    ),
+    [
+      "m.plain",
+      "m.holds {n}: the case at position 1 of the table has the label \"holds 2\", which a case of another test also has",
+      "m.holds {n} (2): the case at position 0 of the table has the label \"holds 2\", which a case of another test also has",
+    ],
+  );
+  assert_eq(
+    entered(
+      ranged(
+        whole,
+        Map::new().insert(1, listing(["a", "b", "a", "a", "a", "a"])).insert(2, listing(["c"])),
+      ),
+    ),
+    [
+      "m.plain",
+      "m.holds {n}: the cases at positions 0, 2, 3 and 2 more of the table have the same label, \"a\"",
+      "m.holds {n} (2)",
+    ],
+  )
 }
 
 test "a run enters what the tests it runs reach, and listing enters what lists their tables" {
