@@ -40,7 +40,8 @@ pub type WalkedNode =
   /// `effect` is the effect's name across the program, `resource` the label as written, and `atom`
   /// what the perform performs.
   | WalkedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<Walked> })
-  | WalkedLambda({ params: List<TypedParam<Type>>, body: Walked, row: Row })
+  /// `kept` are the places of the parameters written `keep`.
+  | WalkedLambda({ params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row })
   | WalkedSimulate(WalkedThunk)
   | WalkedParallel(List<WalkedThunk>)
   /// `row` is what the body performs. `vars` are the handler's variables, made before the body
@@ -68,12 +69,18 @@ pub type WalkedThunk = { body: Walked, row: Row }
 
 pub type WalkedField = { name: Bytes, value: Walked }
 
-pub type WalkedArm = { pat: TypedPattern<Type>, guard: Option<Walked>, body: Walked }
+/// An arm, `pat_span` where its pattern is written.
+pub type WalkedArm = {
+  pat: TypedPattern<Type>,
+  pat_span: Span,
+  guard: Option<Walked>,
+  body: Walked,
+}
 
 pub type WalkedStmt =
   | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span, pat_span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
-  | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span })
+  | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span, pat_span: Span })
   | WalkedDo(Walked)
   /// `name = value;`: a clause giving its handler's variable a new value.
   | WalkedAssign({ name: Bytes, value: Walked, span: Span })
@@ -161,12 +168,14 @@ pub fn record_of(fields: List<{ name: Bytes, value: Option<Walked> }>) -> Option
 
 pub fn arm_of(
   pat: Option<TypedPattern<Type>>,
+  pat_span: Span,
   guard: Option<Option<Walked>>,
   body: Option<Walked>,
 ) -> Option<WalkedArm> =
   match ((pat, guard, body)) {
-    (Some(p), Some(Some(g)), Some(b)) -> Some({ pat: p, guard: Some(g), body: b }),
-    (Some(p), None, Some(b)) -> Some({ pat: p, guard: None, body: b }),
+    (Some(p), Some(Some(g)), Some(b)) ->
+      Some({ pat: p, pat_span: pat_span, guard: Some(g), body: b }),
+    (Some(p), None, Some(b)) -> Some({ pat: p, pat_span: pat_span, guard: None, body: b }),
     _ -> None,
   }
 
@@ -195,10 +204,11 @@ pub fn let_else_of(
   value: Option<Walked>,
   fallback: Option<Walked>,
   span: Span,
+  pat_span: Span,
 ) -> Option<WalkedStmt> =
   match ((pat, value, fallback)) {
     (Some(p), Some(v), Some(f)) ->
-      Some(WalkedLetElse({ pat: p, value: v, fallback: f, span: span })),
+      Some(WalkedLetElse({ pat: p, value: v, fallback: f, span: span, pat_span: pat_span })),
     _ -> None,
   }
 
@@ -228,7 +238,7 @@ pub fn or_pattern_of(alts: List<Option<TypedPattern<Type>>>) -> Option<TypedPatt
 
 pub fn record_pattern_of(
   fields: List<{ name: Bytes, pat: Option<TypedPattern<Type>> }>,
-  rest: Bool,
+  rest: Option<{ span: Span, ty: Type }>,
 ) -> Option<TypedPattern<Type>> =
   match fields.fold(
       Some([]),
@@ -360,10 +370,14 @@ pub fn update_of(
 
 pub fn lambda_of(
   params: List<TypedParam<Type>>,
+  kept: List<Int>,
   body: Option<Walked>,
   row: Row,
 ) -> Option<WalkedNode> =
-  match body { Some(b) -> Some(WalkedLambda({ params: params, body: b, row: row })), None -> None }
+  match body {
+    Some(b) -> Some(WalkedLambda({ params: params, kept: kept, body: b, row: row })),
+    None -> None,
+  }
 
 pub fn block_of(
   stmts: List<Option<WalkedStmt>>,
@@ -396,7 +410,7 @@ pub fn rewritten(e: Walked, f: (Walked) -> Walked) -> Walked = {
       WalkedMatch(m) ->
         WalkedMatch({
           scrutinee: go(m.scrutinee),
-          arms: m.arms.map(|a: WalkedArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+          arms: m.arms.map(|a: WalkedArm| { ..a, guard: opt(a.guard), body: go(a.body) }),
         }),
       WalkedBlock(b) ->
         WalkedBlock({
@@ -452,6 +466,49 @@ pub fn defaults_filled(e: Walked, copies: List<Option<Walked>>) -> Option<Walked
         }),
     )
   }
+
+/// Every node of `e`, each before its parts.
+pub fn walked_nodes(e: Walked) -> List<Walked> = {
+  let all = |xs: List<Walked>|
+    xs.fold([], |acc: List<Walked>, x: Walked| acc.concat(walked_nodes(x)));
+  let opt = |x: Option<Walked>| match x { Some(y) -> walked_nodes(y), None -> [] };
+  [e].concat(match e.node {
+    WalkedLit(_) -> [],
+    WalkedRead(_) -> [],
+    WalkedDefault(_) -> [],
+    WalkedUnary(u) -> walked_nodes(u.operand),
+    WalkedBinary(b) -> walked_nodes(b.lhs).concat(walked_nodes(b.rhs)),
+    WalkedCall(c) -> walked_nodes(c.callee).concat(all(c.args)),
+    WalkedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
+    WalkedMatch(m) ->
+      walked_nodes(m.scrutinee).concat(
+        m.arms.fold([], |acc: List<Walked>, a: WalkedArm|
+          acc.concat(opt(a.guard)).concat(walked_nodes(a.body))),
+      ),
+    WalkedBlock(b) ->
+      b.stmts.fold([], |acc: List<Walked>, s: WalkedStmt|
+        acc.concat(match s {
+          WalkedLet(l) -> walked_nodes(l.value),
+          WalkedLetElse(l) -> walked_nodes(l.value).concat(walked_nodes(l.fallback)),
+          WalkedDo(x) -> walked_nodes(x),
+          WalkedAssign(a) -> walked_nodes(a.value),
+        })).concat(
+        opt(b.tail),
+      ),
+    WalkedList(xs) -> all(xs),
+    WalkedRecord(fs) -> all(fs.map(|f: WalkedField| f.value)),
+    WalkedUpdate(u) -> walked_nodes(u.base).concat(all(u.sets.map(|f: WalkedField| f.value))),
+    WalkedFieldRead(r) -> walked_nodes(r.base),
+    WalkedPerform(p) -> all(p.args),
+    WalkedLambda(l) -> walked_nodes(l.body),
+    WalkedSimulate(t) -> walked_nodes(t.body),
+    WalkedParallel(ts) -> all(ts.map(|t: WalkedThunk| t.body)),
+    WalkedHandle(h) ->
+      all(h.vars.map(|v: WalkedHandlerVar| v.init)).concat(walked_nodes(h.body)).concat(
+        all(h.clauses.map(|c: WalkedClause| c.body)),
+      ).concat(match h.ret { Some(r) -> walked_nodes(r.body), None -> [] }),
+  })
+}
 
 // --- Settling ------------------------------------------------------------------------------------------
 
@@ -511,7 +568,7 @@ fn settled_thunk(t: WalkedThunk, s: Settling) -> Option<TypedThunk<Type>> / {abo
 
 fn settled_pattern(p: TypedPattern<Type>, s: Settling) -> TypedPattern<Type> / {abort.raise} =
   match p {
-    TypedWild -> TypedWild,
+    TypedWild(w) -> TypedWild({ span: (s.span)(w.span), ty: (s.ty)(w.ty) }),
     TypedBinder(v) -> TypedBinder({ name: v.name, ty: (s.ty)(v.ty), span: (s.span)(v.span) }),
     TypedLitPattern(l) -> TypedLitPattern(l),
     TypedRange(g) -> TypedRange(g),
@@ -521,7 +578,10 @@ fn settled_pattern(p: TypedPattern<Type>, s: Settling) -> TypedPattern<Type> / {
       TypedRecordPattern({
         fields: rp.fields.map(|f: TypedFieldPattern<Type>|
           { name: f.name, pat: settled_pattern(f.pat, s) }),
-        rest: rp.rest,
+        rest: match rp.rest {
+          Some(at) -> Some({ span: (s.span)(at.span), ty: (s.ty)(at.ty) }),
+          None -> None,
+        },
       }),
     TypedListPattern(lp) ->
       TypedListPattern({
