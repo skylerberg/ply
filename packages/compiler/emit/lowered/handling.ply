@@ -43,17 +43,18 @@ import compiler.syntax.exprs (crossing_operations, task_operations, scheduler_mo
 import compiler.emit.answer (Need, Exact, GenericCall)
 import compiler.emit.lower.setting (Root, prelude_ctor)
 import compiler.emit.lower.held (held_as)
-import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, none_held, read_typed)
+import compiler.emit.lower.base (Context, Lowering, Lowered, started, emitted, opened, none_held,
+                                 read_typed)
 import compiler.emit.lower.calling (context_of)
 import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched,
                                      handle_planned, detaches)
-import compiler.emit.lower.crossing (crossed, crossing_builtin, type_described, worded,
-                                     op_described, holds_function)
+import compiler.emit.lower.crossing (crossed, crossing_builtin, type_described, shown_described,
+                                     worded, op_described)
 import compiler.emit.lower.containers (builtin)
 import compiler.emit.tir.statics (StaticDef, SStruct, WAddress, WRaw, WField, WHead, WEntry,
                                   entries_of)
 import compiler.emit.lower.scalars (comparison_built)
-import compiler.emit.print.counting (never_lifted_fn)
+import compiler.emit.print.counting (never_lifted_fn, never_shown_fn)
 import compiler.emit.written (WrittenRoot, crossing_root, container_code, container_defs,
                               entered_code, contained_formed, contained_reads, sums_crossed,
                               crosses, crossing_op)
@@ -664,13 +665,12 @@ test "a place an operation's own type parameter stands at crosses carried, which
           |c: { name: Bytes, filed: Option<Typed> }|
             { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } },
         );
-      // A value carried whole crosses as what the runtime keeps of it.
-      assert_eq(names(marked(Lift, int, [0])), [{ name: b"?in_carried", at: [int] }]);
+      // A value carried whole crosses as what the runtime keeps of it, and a part carried by the
+      // root of its type marked whole.
       assert_eq(names(marked(Lower, int, [0])), [{ name: b"?out_carried", at: [int] }]);
-      // A part carried is read by the root of its type marked whole.
       assert(
-        names(marked(Lift, opt, [1])).any(|c: { name: Bytes, at: List<Type> }|
-          c.name == b"?lift" && c.at == [marked_type(int, [0])]),
+        names(marked(Lower, opt, [1])).any(|c: { name: Bytes, at: List<Type> }|
+          c.name == b"?lower" && c.at == [marked_type(int, [0])]),
       );
       assert(
         names(marked(Lower, list_type(int), [1])).any(|c: { name: Bytes, at: List<Type> }|
@@ -723,7 +723,8 @@ test "an operation's descriptor names its types at the perform, the parameters i
             }
           },
         };
-        // An answer an own type parameter stands in is read with that place carried.
+        // An answer is counted through its type and never crossed. A raise's argument is lowered for
+        // the diagnostic that shows it, the place its own type parameter stands at carried.
         let recv = {
           ..send,
           name: b"recv",
@@ -731,11 +732,31 @@ test "an operation's descriptor names its types at the perform, the parameters i
           ret: option_type(TyVar(0)),
         };
         let got = op_described(r.cx, start.st, b"task", recv, [chan_type(int)], option_type(int));
+        let crossing = |k: RootKey|
+          match k { Written(w, _) -> w.op == Worded(Lower) || w.op == Worded(Lift), _ -> false };
+        assert(!got.st.statics.any(|s: StaticDef| entries_of(s).any(crossing)), None);
+        // Nor a `String` an own type parameter stands at whole, which crosses carried: the runtime
+        // lifts only the `String` emitted code hands it, with no place carried.
+        let take = { ..recv, name: b"take", params: [], ret: TyVar(0) };
+        let text = op_described(r.cx, start.st, b"task", take, [], string_type());
+        let carried_crossing = |k: RootKey|
+          match k { Written(w, _) -> crossing(k) && w.marks.len() > 0, _ -> false };
+        assert(text.name != None, None);
+        assert(!text.st.statics.any(|s: StaticDef| entries_of(s).any(carried_crossing)), None);
+        let fail = {
+          name: b"fail",
+          mode: MRaise,
+          params: [option_type(TyVar(0))],
+          ret: TyVar(1),
+          own: [0, 1],
+        };
+        let raised = op_described(r.cx, start.st, b"oops", fail, [option_type(int)], unit_type());
         assert(
-          got.st.statics.any(|s: StaticDef|
+          raised.st.statics.any(|s: StaticDef|
             entries_of(s).contains(
-              keys::marked(keys::written(Worded(Lift), option_type(int), b"m"), [1]),
+              keys::marked(keys::written(Worded(Lower), option_type(int), b"m"), [1]),
             )),
+          None,
         );
         // At a type left open, the specialisations describe it.
         assert_eq(
@@ -1118,7 +1139,7 @@ test "a parallel block's answers are moved into a box in the branches' order, an
   );
   // Each answer lies at its branch's place, the runtime asked for no record of them.
   assert(
-    text.index_of(b"rt_alloc_bytes_p(ctx, 96);") != None
+    text.index_of(b"ply_alloc(ctx, 96);") != None
       && text.index_of(b"ply_words(t2)[10] = t1[10];") != None,
     said,
   )
@@ -1921,39 +1942,6 @@ fn calls_in(
     match i { Let(l) -> called(l.val), Do(d) -> called(d.val), _ -> acc }
   })
 
-test "an encoding opens a lowering, hands the value to its type's root as the root takes it, and copies out the bytes it ends with" {
-  match program_of(crossings()) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match rooted(p, b"held") {
-      None -> assert(false),
-      Some(r) -> {
-        let start = params_of(r.cx);
-        let s = start.vars.get(0);
-        let l = crossed(r.cx, start.st, b"?encode", [AVar(s)], bare_read(b"?encode"), place());
-        assert_eq(crossed_parts(l.st.insts), [
-          b"builtin_elaborated_lower_open_p",
-          b"m.lower#String",
-          b"builtin_elaborated_lower_close_p",
-          b"taken",
-        ]);
-        assert_eq(calls_in(l.st.insts), [
-          { callee: b"m.lower#String", args: [AVar(s)], handed: [Given] },
-        ]);
-        assert_eq(match l.arg { AVar(v) -> v.ty, _ -> int_type() }, bytes_type());
-        // Decoding opens a lifting over the bytes' address and count and asks the type's root.
-        let back = crossed(r.cx, l.st, b"?decode", [l.arg], bare_read(b"?decode"), place());
-        assert_eq(crossed_parts(back.st.insts.drop(l.st.insts.len())), [
-          b"payload",
-          b"length",
-          b"builtin_elaborated_lift_open_p",
-          b"m.lift#Bytes",
-          b"builtin_elaborated_lift_close_p",
-        ])
-      },
-    },
-  }
-}
-
 test "a crossing native is handed machine words: a string as its bytes' address and count, a float as its bits" {
   match program_of(crossings()) {
     Err(why) -> assert_eq(why, b""),
@@ -2533,6 +2521,11 @@ test "a type crosses where its roots and those of every type it crosses at are w
           crosses(bare, option_type(list_type(int_type())), false),
         ],
         [false, true, false],
+      );
+      // A runtime object crosses out as a handle, and no lifting holds a handle beside its bytes.
+      assert_eq(
+        [crosses(bare, chan_type(int_type()), false), crosses(bare, chan_type(int_type()), true)],
+        [true, false],
       )
     },
   }
@@ -2550,58 +2543,42 @@ test "a type's descriptor is laid once, its identity and spelling before the ent
         let twice = type_described(r.cx, once.st, shape, place());
         assert_eq(twice.st.statics, once.st.statics);
         assert_eq(once.st.statics.len(), 2);
-        let key = |op: keys::TypeOp| keys::written(op, shape, b"m");
-        match once.st.statics.at(1) {
-          None -> assert(false),
-          Some(d) -> {
-            assert_eq(entries_of(d), [
-              key(Dup),
-              key(keys::Release),
-              key(Worded(Lower)),
-              key(Worded(Lift)),
-            ]);
-            match d.laid {
-              SStruct(s) -> {
-                assert_eq(s.of, b"PlyType");
-                assert_eq(s.fields.drop(1).take(2), [
-                  WAddress({ name: once.st.statics.get(0).name, tag: 0 }),
-                  WRaw(b"m.Shape".len()),
-                ])
-              },
-              _ -> assert(false),
-            }
+        let key = |op: keys::TypeOp, t: Type| keys::written(op, t, b"m");
+        let laid = |d: Lowered|
+          match d.st.statics.at(1) { Some(s) -> s, None -> panic("a descriptor laid no static") };
+        let lowering = |s: StaticDef| match s.laid { SStruct(x) -> x.fields.at(5), _ -> None };
+        let lifting = |s: StaticDef| match s.laid { SStruct(x) -> x.fields.at(6), _ -> None };
+        let d = laid(once);
+        // The runtime counts a value of any type it holds, and lowers or lifts one only where it
+        // must: each other entry is its refusal.
+        assert_eq(entries_of(d), [key(Dup, shape), key(keys::Release, shape)]);
+        assert_eq([lowering(d), lifting(d)], [
+          Some(WHead(never_shown_fn())),
+          Some(WHead(never_lifted_fn())),
+        ]);
+        match d.laid {
+          SStruct(s) -> {
+            assert_eq(s.of, b"PlyType");
+            assert_eq(s.fields.drop(1).take(2), [
+              WAddress({ name: once.st.statics.get(0).name, tag: 0 }),
+              WRaw(b"m.Shape".len()),
+            ])
           },
+          _ -> assert(false),
         };
         // The address is an uncounted word, the static's.
         assert_eq(rep_of_arg(once.arg), RInt);
-        // A value that can hold a function crosses out and never back: no lifting is asked for its
-        // type, whose descriptor lifts by the runtime's refusal; through a sum's case and a record too.
-        let hook = TyCon({ name: b"m.Hook", args: [] });
-        [hook, option_type(hook), TyRecord([{ name: b"h", ty: hook }])].fold(
-          (),
-          |_: Unit, t: Type| {
-            let d = type_described(r.cx, start.st, t, place());
-            match d.st.statics.at(1) {
-              None -> assert(false, None),
-              Some(s) -> {
-                assert(!entries_of(s).contains(keys::written(Worded(Lift), t, b"m")), None);
-                match s.laid {
-                  SStruct(x) -> assert_eq(x.fields.at(6), Some(WHead(never_lifted_fn()))),
-                  _ -> assert(false, None),
-                }
-              },
-            }
-          },
-        );
-        assert(!holds_function(r.cx.setting.ctors, shape), None);
-        // A channel crosses as a handle whatever it holds, so one of functions lifts.
-        assert(
-          !holds_function(
-            r.cx.setting.ctors,
-            chan_type(fn_type([int_type()], int_type(), row_empty())),
-          ),
-          None,
-        );
+        // A type whose values a diagnostic shows is lowered, and `String`, the one type the runtime
+        // makes a value of, lifted.
+        let shown = laid(shown_described(r.cx, start.st, shape, place()));
+        assert_eq(entries_of(shown), [
+          key(Dup, shape),
+          key(keys::Release, shape),
+          key(Worded(Lower), shape),
+        ]);
+        let string = laid(type_described(r.cx, start.st, string_type(), place()));
+        assert_eq(lifting(string), Some(WEntry(key(Worded(Lift), string_type()))));
+        assert_eq(lowering(string), Some(WHead(never_shown_fn())));
         // At a type left open, the specialisations describe it, and nothing is laid.
         let open = type_described(r.cx, start.st, list_type(TyVar(0)), place());
         assert_eq(open.st.statics, []);

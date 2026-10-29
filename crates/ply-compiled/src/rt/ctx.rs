@@ -61,6 +61,9 @@ pub struct Ctx {
     /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
     /// which only that task may leave.
     pub task: i64,
+    /// What compiled code takes a small block from the heap by, and gives one back to, without
+    /// calling the runtime: the heap's own, wherever the heap moves.
+    pub alloc: *mut crate::heap::Alloc,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub heap: Heap,
@@ -192,6 +195,8 @@ pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
 
 impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
+        let mut heap = Heap::new();
+        let alloc = heap.alloc();
         Ctx {
             failed: 0,
             fuel: RELEASED_FUEL,
@@ -213,10 +218,11 @@ impl Ctx {
             performed_start: 0,
             performed_end: 0,
             task: 0,
+            alloc,
             grown: 0,
             deadline: None,
             time_budget_ms: 0,
-            heap: Heap::new(),
+            heap,
             last_entry: 0,
             tables,
             diagnostic: None,
@@ -347,7 +353,7 @@ impl Ctx {
         self.unwatch();
         self.failed = 0;
         self.grown = 0;
-        self.heap.scheduling = false;
+        self.heap.set_scheduling(false);
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)

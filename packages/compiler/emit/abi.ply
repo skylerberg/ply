@@ -114,7 +114,6 @@ fn called(name: Bytes, params: List<Machine>, answer: Option<Machine>) -> Native
 pub fn helpers() -> List<Native> =
   [
     called(b"rt_box_decimal", uniform(2), Some(Word)),
-    called(b"rt_float_rem", uniform(2), Some(Word)),
     called(b"rt_no_match", [], None),
     called(b"rt_let_no_match", [], None),
     called(b"rt_overflow", uniform(1), None),
@@ -155,6 +154,7 @@ pub fn helpers() -> List<Native> =
     called(b"rt_memo", [I64, KeepRoot], Some(Handed)),
     called(b"rt_const", [I64, KeepRoot], Some(Handed)),
     called(b"rt_never_lifted", [], None),
+    called(b"rt_never_shown", [], None),
   ]
 
 fn raising(n: Native) -> Native = { ..n, raises: true }
@@ -204,17 +204,13 @@ pub fn natives() -> List<Native> =
     called(b"?in_count", [I64], Some(I64)),
     called(b"?in_field", [Addr, I64], None),
     called(b"?in_name_is", [Addr, I64], Some(I64)),
-    called(b"?in_handle", [], Some(Handle)),
-    called(b"?lower_open", [I64], None),
     called(b"?shown_open", [], None),
     called(b"?lower_close", [], Some(I64)),
-    called(b"?lift_open", [Addr, I64], None),
     called(b"?lift_close", [], None),
     called(b"?taken", [Addr, I64], None),
     called(b"?hold_made", [Handed], Some(Handle)),
     called(b"?hold_read", [Handle], Some(Handed)),
     called(b"?hold_taken", [Handle], Some(Handed)),
-    called(b"?in_carried", [], Some(Handed)),
     raising(called(b"?refused", [I64, I64, I64, I64], None)),
     called(b"?blake3", [Addr, I64], Some(I64)),
     called(b"?scalar_encoded", [I64, I64, I64, I64], Some(I64)),
@@ -246,9 +242,6 @@ pub fn natives() -> List<Native> =
     called(b"?kept_order", [Handle, Handle], Some(I64)),
   ].concat(
     [
-      b"?float_floor",
-      b"?float_ceil",
-      b"?float_sqrt",
       b"?float_exp",
       b"?float_ln",
       b"?float_log2",
@@ -270,12 +263,16 @@ pub fn native_named(name: Bytes) -> Option<Native> = natives().find(|n: Native| 
 
 // --- What both lay out ------------------------------------------------------------
 
-/// `PlyObj`, a block's header: its count, in the low half of the word before the block's payload.
+/// `PlyObj`, a block's header: its count, in the low half of the word before the block's payload,
+/// and whether the scheduler's own work made the block.
 pub fn obj_struct() -> MachineStruct =
   {
     name: b"PlyObj",
     bytes: header_bytes(),
-    fields: [{ name: b"rc", decl: b"uint32_t rc", at: 0, bytes: 4 }],
+    fields: [
+      { name: b"rc", decl: b"uint32_t rc", at: 0, bytes: 4 },
+      { name: b"made_by_scheduler", decl: b"uint8_t made_by_scheduler", at: 4, bytes: 1 },
+    ],
   }
 
 /// `PlyCtx`, the context every function is handed, as far as emitted code reads and writes it:
@@ -284,11 +281,12 @@ pub fn obj_struct() -> MachineStruct =
 /// 0 outside any region, a region's body runs as the task that opened the region, every other task
 /// as a number no task of any region in the process shares, and a detached body as the task that
 /// began it, whichever resumes it. A `handle`'s instance records it as it opens, and only that task
-/// may leave it.
+/// may leave it. `alloc` is what emitted code takes a small block from the heap by and gives one
+/// back to without calling the runtime (`alloc_struct`).
 pub fn ctx_struct() -> MachineStruct =
   {
     name: b"PlyCtx",
-    bytes: 176,
+    bytes: 184,
     // A released `ply`'s bootstrap compares the first eleven as listed, so a new field goes last.
     // The released compiler's code spends fuel in the word at 8; the two words at 48 are the
     // runtime's own.
@@ -312,8 +310,76 @@ pub fn ctx_struct() -> MachineStruct =
       { name: b"performed_start", decl: b"int64_t performed_start", at: 152, bytes: 8 },
       { name: b"performed_end", decl: b"int64_t performed_end", at: 160, bytes: 8 },
       { name: b"task", decl: b"int64_t task", at: 168, bytes: 8 },
+      { name: b"alloc", decl: b"struct PlyAlloc *alloc", at: 176, bytes: 8 },
     ],
   }
+
+/// `PlyPage`, a page of a heap's blocks of one size: its dead blocks, each naming the next at
+/// `alloc_laid().link_at`; where those never handed out begin and where its blocks end; the heap
+/// that owns it; the bytes of a block; how many are live; and whether its class lists it. Emitted
+/// code takes a block from the page its class fills and gives one back to a page in place, as the
+/// runtime would.
+pub fn page_struct() -> MachineStruct =
+  {
+    name: b"PlyPage",
+    bytes: 72,
+    fields: [
+      { name: b"free", decl: b"unsigned char *free", at: 0, bytes: 8 },
+      { name: b"fresh", decl: b"unsigned char *fresh", at: 8, bytes: 8 },
+      { name: b"end", decl: b"unsigned char *end", at: 16, bytes: 8 },
+      { name: b"owner", decl: b"const void *owner", at: 24, bytes: 8 },
+      { name: b"handing", decl: b"uint32_t handing", at: 32, bytes: 4 },
+      { name: b"next", decl: b"struct PlyPage *next", at: 40, bytes: 8 },
+      { name: b"prev", decl: b"struct PlyPage *prev", at: 48, bytes: 8 },
+      { name: b"block", decl: b"uint32_t block", at: 56, bytes: 4 },
+      { name: b"live", decl: b"uint32_t live", at: 60, bytes: 4 },
+      { name: b"class", decl: b"uint8_t class", at: 64, bytes: 1 },
+      { name: b"listed", decl: b"uint8_t listed", at: 65, bytes: 1 },
+      { name: b"spare", decl: b"uint8_t spare", at: 66, bytes: 1 },
+    ],
+  }
+
+/// `PlyFilling`, a heap's blocks as emitted code takes them: by class, the page being filled; the
+/// heap's name, which each page it owns holds as its owner; and how many blocks handed out had held
+/// an object before.
+pub fn filling_struct() -> MachineStruct =
+  {
+    name: b"PlyFilling",
+    bytes: 8 * alloc_classes() + 16,
+    fields: [
+      {
+        name: b"pages",
+        decl: Bytes::concat_all([b"PlyPage *pages[", ascii_of_int(alloc_classes()), b"]"]),
+        at: 0,
+        bytes: 8 * alloc_classes(),
+      },
+      { name: b"name", decl: b"const void *name", at: 8 * alloc_classes(), bytes: 8 },
+      { name: b"reused", decl: b"uint64_t reused", at: 8 * alloc_classes() + 8, bytes: 8 },
+    ],
+  }
+
+/// `PlyAlloc`, a heap as emitted code takes its small blocks: its blocks; how many blocks the
+/// program allocated; and, while not 0, that every block goes through the runtime.
+pub fn alloc_struct() -> MachineStruct =
+  {
+    name: b"PlyAlloc",
+    bytes: 24,
+    fields: [
+      { name: b"blocks", decl: b"PlyFilling *blocks", at: 0, bytes: 8 },
+      { name: b"count", decl: b"uint64_t count", at: 8, bytes: 8 },
+      { name: b"slow", decl: b"uint64_t slow", at: 16, bytes: 8 },
+    ],
+  }
+
+/// How many classes a heap sorts its blocks into.
+fn alloc_classes() -> Int = 65
+
+/// Where a heap's pages lie: in segments of `segment` bytes, each aligned to its size, holding its
+/// pages' headers from byte `pages_at` and its pages `page` bytes apart, so a block's address names
+/// its page; a block of at most `word_classes` words is of the class its words number; and a dead
+/// block names the next at byte `link_at`.
+pub fn alloc_laid() -> { segment: Int, page: Int, pages_at: Int, word_classes: Int, link_at: Int } =
+  { segment: 4194304, page: 65536, pages_at: 8, word_classes: 16, link_at: 8 }
 
 /// `PlyFrame`: a frame that may stop links one into the context's `frames` around the call, its
 /// slots after it, and `each` lets go of every slot; the runtime passes its `d` as -1.
@@ -404,7 +470,16 @@ pub fn kept_struct() -> MachineStruct =
 /// Every struct emitted code lays out and the runtime reads, each declared before a struct that
 /// points at it.
 pub fn machine_structs() -> List<MachineStruct> =
-  [frame_struct(), type_struct(), kept_struct(), op_struct(), fn_desc_struct()]
+  [
+    page_struct(),
+    filling_struct(),
+    alloc_struct(),
+    frame_struct(),
+    type_struct(),
+    kept_struct(),
+    op_struct(),
+    fn_desc_struct(),
+  ]
 
 /// The count of a block nothing counts or frees, as a unit's static data and the memo hold, which
 /// the C spells `UINT32_MAX`.
@@ -522,6 +597,21 @@ pub fn facts() -> Map<Bytes, Int> =
   ).insert(
     b"unwinding.words",
     unwinding_words(),
+  ).insert(
+    b"alloc.segment",
+    alloc_laid().segment,
+  ).insert(
+    b"alloc.page",
+    alloc_laid().page,
+  ).insert(
+    b"alloc.pages_at",
+    alloc_laid().pages_at,
+  ).insert(
+    b"alloc.word_classes",
+    alloc_laid().word_classes,
+  ).insert(
+    b"alloc.link_at",
+    alloc_laid().link_at,
   )
 
 // --- The runtime's description ------------------------------------------------------

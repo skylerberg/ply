@@ -19,6 +19,20 @@ pub fn found(bytes: Option<impl AsRef<[u8]>>) -> Vec<u8> {
     }
 }
 
+/// What `read` appends to a buffer of `capacity` bytes, found, or none where it fails: read in
+/// after the leading byte, so its bytes are not copied again.
+pub fn found_read(
+    capacity: usize,
+    read: impl FnOnce(&mut Vec<u8>) -> std::io::Result<usize>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(capacity.saturating_add(1));
+    out.push(1);
+    match read(&mut out) {
+        Ok(_) => out,
+        Err(_) => vec![0],
+    }
+}
+
 /// `parts` one after another, each behind its count.
 pub fn parts(parts: &[&[u8]]) -> Vec<u8> {
     let mut out = Vec::new();

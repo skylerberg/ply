@@ -15,9 +15,10 @@ import compiler.emit.roots (builtin_helper)
 import compiler.cc (tail_mark)
 import compiler.emit.print.frames (chain_defined)
 import compiler.emit.print.counting (dup_fn, last_fn, rel_fn, rel_sum_fn, rel_box_fn, free_fn,
-                                     inc_shared_fn, dec_shared_last_fn, free_block_fn,
-                                     release_later_fn, release_drain_fn, released_twice_fn,
-                                     box_released_fn, never_lifted_fn, never_lifted_rt_fn,
+                                     inc_shared_fn, dec_shared_last_fn, free_block_fn, alloc_fn,
+                                     alloc_block_fn, release_later_fn, release_drain_fn,
+                                     released_twice_fn, box_released_fn, never_lifted_fn,
+                                     never_lifted_rt_fn, never_shown_fn, never_shown_rt_fn,
                                      call_text, calls)
 import compiler.emit.release (immediate_heads, box_heads, scalar_box_words)
 import compiler.emit.print.probe (probed_helper, probed_fn)
@@ -154,6 +155,11 @@ fn prelude() -> Bytes / {abort.raise} =
     b"#  define ply_observed(x) __asm__ __volatile__(\"\" : \"+m,r\"(x) : : \"memory\")\n",
     b"#  define ply_observed_pair(x) __asm__ __volatile__(\"\" : \"+m\"(x) : : \"memory\")\n",
     b"#endif\n",
+    // The `Float` operations IEEE 754 fixes every answer of, which the C library computes exactly.
+    b"double sqrt(double);\n",
+    b"double floor(double);\n",
+    b"double ceil(double);\n",
+    b"double fmod(double, double);\n",
     b"static inline double ply_f64(int64_t bits) { union { int64_t i; double d; } u; u.i = bits; return u.d; }\n",
     b"static inline int64_t ply_f64_bits(double d) { union { int64_t i; double d; } u; u.d = d; return u.i; }\n",
     b"typedef struct { Word lo, hi; } PlyDec;\n",
@@ -177,11 +183,11 @@ fn prelude() -> Bytes / {abort.raise} =
 fn head_part() -> Bytes / {abort.raise} =
   Bytes::concat_all([
     b"\n",
+    structs(),
     helpers(),
     wide_helpers(),
     decimal_helpers(),
     b"\n",
-    structs(),
     b"typedef struct { PlyObj h; const PlyFnDesc *desc; } PlyFnBlock;\n",
     words_mapped(),
     entries_defined(),
@@ -564,13 +570,7 @@ fn helpers() -> Bytes = {
       b") d(ctx, w);\n",
     ]),
     b"}\n",
-    b"static inline void ",
-    call_text(free_fn(), [b"PlyCtx *ctx", b"Word o", b"int64_t bytes"]),
-    b" {\n",
-    b"  ",
-    call_text(free_block_fn(), [b"ctx", b"o", b"bytes"]),
-    b";\n",
-    b"}\n",
+    allocation(),
     b"static inline void ",
     call_text(rel_box_fn(), [b"PlyCtx *ctx", b"Word o", b"int64_t bytes"]),
     b" {\n",
@@ -613,6 +613,94 @@ fn described_heads(tags: Bytes) -> Bytes = {
       call_text(never_lifted_rt_fn(), [b"ctx"]),
       b"; return 0; }\n",
     ]),
+    Bytes::concat_all([
+      b"static inline Word ",
+      call_text(never_shown_fn(), [b"PlyCtx *ctx", b"Word w"]),
+      b" { (void)w; ",
+      call_text(never_shown_rt_fn(), [b"ctx"]),
+      b"; return 0; }\n",
+    ]),
+  ])
+}
+
+/// `ply_alloc` and `ply_free`, which take a block of at most `alloc_laid().word_classes` words from
+/// the heap and give one back in place, as the runtime would: a block from the page its class
+/// fills, its dead blocks first; and a block given back to a page this heap owns, listed and left
+/// with another live block. Any other block, or any block while the heap's `slow` is set, goes
+/// through the runtime, which keeps the rest of what its pages say.
+fn allocation() -> Bytes = {
+  let laid = abi::alloc_laid();
+  let link = ascii_of_int(laid.link_at);
+  let small = Bytes::concat_all([
+    b"size >= ",
+    ascii_of_int(laid.link_at + 8),
+    b" && size <= ",
+    ascii_of_int(8 * laid.word_classes),
+    b" && !a->slow",
+  ]);
+  let segment = ascii_of_int(laid.segment);
+  Bytes::concat_all([
+    b"static inline Word ",
+    call_text(alloc_fn(), [b"PlyCtx *ctx", b"int64_t bytes"]),
+    b" {\n",
+    b"  int64_t size = (bytes + 7) & ~(int64_t)7;\n",
+    b"  PlyAlloc *a = ctx->alloc;\n",
+    b"  if (",
+    small,
+    b") {\n",
+    b"    PlyFilling *f = a->blocks;\n",
+    b"    PlyPage *p = f->pages[size >> 3];\n",
+    b"    unsigned char *b = 0;\n",
+    b"    if (p && p->free) { b = p->free; p->free = *(unsigned char **)(b + ",
+    link,
+    b"); f->reused += 1; }\n",
+    b"    else if (p && (uint64_t)(p->end - p->fresh) >= p->block) { b = p->fresh; p->fresh = b + p->block; }\n",
+    b"    if (b) {\n",
+    b"      p->live += 1;\n",
+    b"      ((PlyObj *)b)->rc = 1;\n",
+    b"      ((PlyObj *)b)->made_by_scheduler = 0;\n",
+    b"      a->count += 1;\n",
+    b"      return (Word)(intptr_t)b;\n",
+    b"    }\n",
+    b"  }\n",
+    b"  return ",
+    call_text(alloc_block_fn(), [b"ctx", b"bytes"]),
+    b";\n",
+    b"}\n",
+    b"static inline void ",
+    call_text(free_fn(), [b"PlyCtx *ctx", b"Word o", b"int64_t bytes"]),
+    b" {\n",
+    b"  int64_t size = (bytes + 7) & ~(int64_t)7;\n",
+    b"  PlyAlloc *a = ctx->alloc;\n",
+    b"  if (",
+    small,
+    b" && ply_obj(o)->rc == 1) {\n",
+    b"    uintptr_t at = (uintptr_t)o;\n",
+    Bytes::concat_all([
+      b"    PlyPage *p = (PlyPage *)((at & ~(uintptr_t)(",
+      segment,
+      b" - 1)) + ",
+      ascii_of_int(laid.pages_at),
+      b") + (at & (",
+      segment,
+      b" - 1)) / ",
+      ascii_of_int(laid.page),
+      b";\n",
+    ]),
+    b"    if (p->owner == a->blocks->name && p->block == (uint32_t)size && p->listed && p->live > 1) {\n",
+    b"      ply_obj(o)->rc = 0;\n",
+    b"      *(unsigned char **)(at + ",
+    link,
+    b") = p->free;\n",
+    b"      p->free = (unsigned char *)at;\n",
+    b"      p->live -= 1;\n",
+    b"      return;\n",
+    b"    }\n",
+    b"  }\n",
+    b"  ",
+    call_text(free_block_fn(), [b"ctx", b"o", b"bytes"]),
+    b";\n",
+    b"}\n",
   ])
 }
 
@@ -740,8 +828,35 @@ test "a raise or a stop at an instance lets go of what an unwind it replaces lef
   )
 }
 
-test "a descriptor lifts a type a value of which can hold a function by the runtime's refusal" {
-  assert(calls(defined_in(head_part(), never_lifted_fn()), never_lifted_rt_fn()), None)
+test "a small block is taken from its class's page and given back to its page in place, and any other through the runtime" {
+  let h = head_part();
+  // Each body nests blocks, so it ends at the first brace that closes a line alone.
+  let body = |f: Bytes|
+    match h.index_of(Bytes::concat_all([b" ", f, b"("])) {
+      Some(i) -> match h.index_of_from(b"\n}\n", i) { Some(j) -> h.slice(i, j), None -> b"" },
+      None -> b"",
+    };
+  let alloc = body(alloc_fn());
+  let free = body(free_fn());
+  assert(calls(alloc, alloc_block_fn()) && calls(free, free_block_fn()), None);
+  assert(
+    [b"f->pages[size >> 3]", b"a->count += 1;", b"made_by_scheduler = 0;", b"!a->slow"].all(
+      |part: Bytes| alloc.index_of(part) != None,
+    ),
+    Some(String::of_bytes_lossy(alloc)),
+  );
+  // A page this heap owns that keeps another live block takes one back; any other block, the
+  // runtime, which lists and retires pages.
+  assert(
+    [b"p->owner == a->blocks->name", b"p->live > 1", b"p->listed", b"rc == 1"].all(|part: Bytes|
+      free.index_of(part) != None),
+    Some(String::of_bytes_lossy(free)),
+  )
+}
+
+test "a descriptor lifts and lowers what the runtime never asks it to by the runtime's refusal" {
+  assert(calls(defined_in(head_part(), never_lifted_fn()), never_lifted_rt_fn()), None);
+  assert(calls(defined_in(head_part(), never_shown_fn()), never_shown_rt_fn()), None)
 }
 
 test "a drop root nests to the release depth, then puts its block off; the outermost drains what was put off" {
@@ -774,8 +889,13 @@ test "the head declares the context and a block's header field by field, at thei
       None,
     )
   });
-  // The count takes the low half of the header's word; the rest is padding.
-  assert(h.index_of(b"  uint32_t rc;\n  char ply_gap_4[4];\n} PlyObj;") != None, None)
+  // The count takes the low half of the header's word, and the byte after it whether the scheduler
+  // made the block; the rest is padding.
+  assert(
+    h.index_of(b"  uint32_t rc;\n  uint8_t made_by_scheduler;\n  char ply_gap_5[3];\n} PlyObj;")
+      != None,
+    None,
+  )
 }
 
 test "the head declares a pointer to each function the unit binds once, and the tail defines it and binds it in the unit's order" {

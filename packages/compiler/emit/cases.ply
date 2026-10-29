@@ -43,8 +43,8 @@ import compiler.emit.code (Code, code_parts)
 import compiler.unit (offered_roots)
 import compiler.emit (said, emit_program, emit_roots_answer, lowered_roots, zip_sources, scope_of,
                       answered)
-import compiler.emit.print.counting (rel_fn, free_fn, call_start, takes_count, lets_count_go,
-                                     lets_go_of, counts_any)
+import compiler.emit.print.counting (allocates, rel_fn, free_fn, call_start, takes_count,
+                                     lets_count_go, lets_go_of, counts_any)
 import compiler.emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture, Decl,
                           Pack, AZero, Lambda, Closure, Fn)
 import compiler.front.seam
@@ -370,8 +370,8 @@ test "a `Float` is a C `double`: its operators are C's own and a literal is its 
   assert_eq(has(b"double "), [true, true, true, true]);
   // `0.5` is `0x3FE0_0000_0000_0000`.
   assert_eq(has(b"ply_f64(INT64_C(4602678819172646912))"), [true, false, false, false]);
-  // C has no `%` on doubles; the runtime answers it as the evaluator does.
-  assert_eq(has(b"rt_float_rem_p"), [false, false, true, false])
+  // C has no `%` on doubles: the C library's `fmod`, exact on every machine, answers it.
+  assert_eq(has(b"fmod("), [false, false, true, false])
 }
 
 /// A head a body wrote a call to, its callee by name.
@@ -441,14 +441,7 @@ test "a record holds every `Float` field as its bits, wherever the field stands"
     false,
   ]);
   // `Point` and `weighed`'s record are two words each, answered as them: no root makes a box.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(24));"), [
-    false,
-    false,
-    false,
-    false,
-    false,
-    false,
-  ]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false, false, false]);
   // A record of a known type holds a `Float` as its bits wherever it was made, so a read is a load,
   // the 70th field's at its place as the first's: in the box a record this wide is held as.
   assert(
@@ -482,13 +475,13 @@ test "a record holds a record wider than the registers in place, wherever it is 
   // `Outer` is one box holding the inner record's words behind a header, and the list.
   let made = own_code(out.get(0).text);
   assert(
-    made.split(b"rt_alloc_bytes_p").len() == 2 && made.index_of(b"PLY_RC_FRAME") != None,
+    made.split(b"ply_alloc").len() == 2 && made.index_of(b"PLY_RC_FRAME") != None,
     Some(String::of_bytes_lossy(out.get(0).text)),
   );
   // A field of the inner record is read where it lies in `Outer`'s box, nothing boxed.
   assert(
     out.get(4).text.index_of(b")[40]") != None
-      && own_code(out.get(4).text).index_of(b"rt_alloc_bytes_p") == None,
+      && own_code(out.get(4).text).index_of(b"ply_alloc") == None,
     Some(String::of_bytes_lossy(out.get(4).text)),
   )
 }
@@ -905,7 +898,7 @@ test "a record of a record type holds it in place, its words among its holder's"
   // A `Segment` is its points' words, its label's and its zone's: wider than the registers, it is
   // held as its box, made by `segment` and copied through its type's `Copy` root by an update that
   // finds it shared.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(80));"), [true, false, false, false, false, false]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(80));"), [true, false, false, false, false, false]);
   assert_eq(has(b"_copy_"), [false, false, false, true, false, true]);
   // No record is made behind a header, nothing is moved out of a holder, and no `Float` is boxed.
   [b"rt_alloc_p(", b"(ply_words(p0) + ", b"rt_box_float_p"].fold((), |_: Unit, t: Bytes|
@@ -992,13 +985,6 @@ fn integer_types() -> List<Bytes> =
 
 fn numeric_types() -> List<Bytes> = integer_types().concat([b"Float", b"Decimal", b"m.Length"])
 
-/// The names of the roots `answers` holds whose code hands a value to the runtime over its encoding.
-fn crossing_answers(answers: List<RootAnswer>) -> List<Bytes> =
-  answers.fold([], |acc: List<Bytes>, a: RootAnswer|
-    if a.answer.text.index_of(b"builtin_elaborated_lower_open_p(") != None {
-      acc.push(answer_name(a))
-    } else { acc })
-
 test "every number builtin is code the emitter writes, at every type it is called at" {
   let length = Bytes::concat_all([
     b"type Length = | Metres(Int) | Millimetres(Int)\n",
@@ -1053,8 +1039,7 @@ test "every number builtin is code the emitter writes, at every type it is calle
   );
   let wanted = concrete.concat(generic);
   let answers = answers_at([b"m"], [src], [b"m.Length"], wanted);
-  assert_eq(answers.len(), wanted.len());
-  assert_eq(crossing_answers(answers), [])
+  assert_eq(answers.len(), wanted.len())
 }
 
 test "observe answers its value hidden from the C compiler behind the head's barrier, at any type, calling nothing" {
@@ -1079,7 +1064,6 @@ test "observe answers its value hidden from the C compiler behind the head's bar
     [b"m.Shape"],
     named.concat(pairs).map(Named).concat(seen),
   );
-  assert_eq(crossing_answers(answers), []);
   let text = |name: Bytes|
     match answers.filter(|a: RootAnswer| answer_name(a) == name) { [a] -> a.answer.text, _ -> b"" };
   let lacking = |names: List<Bytes>, part: Bytes|
@@ -1182,7 +1166,7 @@ test "a record rebuilt from another's fields is written into the constructor tha
   // The field copied out of the old record is a word this body holds, and the new record is
   // gathered into the constructor's words: no record and no case is made to be copied in.
   assert_eq(has(b"rt_alloc_p("), [false, false]);
-  assert_eq(has(b"rt_alloc_bytes_p("), [false, false])
+  assert_eq(has(b"ply_alloc("), [false, false])
 }
 
 test "what an operation answers and what a clause is handed are read by their types" {
@@ -1253,7 +1237,7 @@ test "an Option of a pointer is one word wherever it is held, and no object is m
   ]);
   // Built, matched, handed across a call, answered, stored, nested or compared, no object is made.
   let none = [false, false, false, false, false, false, false, false, false];
-  assert_eq(has(b"rt_alloc_bytes_p"), none);
+  assert_eq(has(b"ply_alloc"), none);
   // An item is read by `std.prelude`'s `List::at`, which answers it as its payload's word.
   assert_eq(
     out.map(|e: Emitted|
@@ -1284,7 +1268,7 @@ test "a Result is its case's words in the code that knows it, its error's record
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.len(), 4);
   // Built, answered, handed on by `?` and matched, no object is made, whatever the error holds.
-  assert_eq(has(b"rt_alloc_bytes_p"), [false, false, false, false])
+  assert_eq(has(b"ply_alloc"), [false, false, false, false])
 }
 
 test "a Result whose error is a small record crosses a call as its constructor and the record's fields" {
@@ -2299,7 +2283,7 @@ test "an array is made, written and listed into as the type of its elements lays
   // type.
   assert_eq(has(array_made()), [true, true, true, true]);
   // A record lies in the array as its two words, a stride apart, no box made; an `Int` is its bits.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(24));"), [false, false, false, false]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false]);
   assert_eq(has(b") * 2);"), [true, true, false, false]);
   // A record written over is let go of by its type: its byte string through the string's drop.
   assert_eq(has(call_start(rel_fn(), [b"ctx"]).concat(b"ply_words(")), [false, true, false, false]);
@@ -2873,7 +2857,7 @@ test "a byte `byte_of_int` answers is the unit's own, so a loop appending bytes 
     answered_body(answers_at([b"m"], [src], [], [Named(b"m.bytes")]), b"m.bytes").text,
   );
   assert(
-    text.index_of(b"ply_byte_text(") != None && outside_appends(text).index_of(b"rt_alloc") == None,
+    text.index_of(b"ply_byte_text(") != None && !allocates(outside_appends(text)),
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -2924,7 +2908,7 @@ test "a lambda a call lends is laid out on the caller's stack with its descripto
   // however it settles; one kept is a block of its own, and a lambda that captures nothing is the
   // root's one block of it.
   assert_eq(has(b"[PLY_HEADER / 8 + "), [true, true, false, false, false]);
-  assert_eq(has(b"rt_alloc_bytes_p("), [false, false, true, true, false]);
+  assert_eq(has(b"ply_alloc("), [false, false, true, true, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, false, false, true]);
   // The captured `Int` lies in the block as its bits, which nothing counts.
   assert_eq(has(b"ply_rel_int"), [false, false, false, false, false])
@@ -2983,7 +2967,7 @@ test "a lambda a `std.prelude` function hands on to a native is laid out with th
     code(b"std.prelude.raised").index_of(b"[PLY_HEADER / 8 + 0] = (Word)(intptr_t)&") != None,
     None,
   );
-  assert(code(b"std.prelude.raised").index_of(b"rt_alloc_bytes_p(") == None, None)
+  assert(code(b"std.prelude.raised").index_of(b"ply_alloc(") == None, None)
 }
 
 test "a lambda that captures nothing is one value made once, wherever it goes" {
@@ -3051,7 +3035,7 @@ test "a record holds an Option among its words" {
   assert_eq(out.len(), 3);
   // Built, read and matched, updated: the field is the `Option`'s one word throughout, no object
   // made.
-  assert_eq(has(b"rt_alloc"), [false, false, false])
+  assert_eq(out.map(|e: Emitted| allocates(own_code(e.text))), [false, false, false])
 }
 
 test "a constructor holds its arguments as its declaration types them" {
@@ -3070,7 +3054,7 @@ test "a constructor holds its arguments as its declaration types them" {
   // A circle's point and radius lie in the sum's words after its tag word, a label's string among
   // them: a value is never boxed, built as an object, held behind a header or tested by its
   // object's tag.
-  [b"rt_alloc_bytes_p(", b"rt_alloc_p(", b"->layout == "].fold((), |_: Unit, t: Bytes|
+  [b"ply_alloc(", b"rt_alloc_p(", b"->layout == "].fold((), |_: Unit, t: Bytes|
     assert_eq(has(t), [false, false, false, false, false]))
 }
 
@@ -3085,7 +3069,7 @@ test "a record of ints crosses a call as its fields and lies in a list as them, 
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.len(), 4);
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(24));"), [false, false, false, false]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false]);
   assert_eq(out.get(1).tables.symbols.map(|d: Defined| d.head), [
     { answer: b"int64_t", params: [b"int64_t", b"int64_t"] },
   ])
@@ -3106,7 +3090,7 @@ test "a record literal held in place is written there, with no record made first
   assert_eq(out.len(), 5);
   // The literal's fields are the holder's words: a sum's case and a record are gathered with
   // nothing made.
-  assert_eq(has(b"rt_alloc"), [false, false, false, false, false])
+  assert_eq(out.map(|e: Emitted| allocates(e.text)), [false, false, false, false, false])
 }
 
 test "a record holding a small record in place crosses a call as its leaves" {
@@ -3120,7 +3104,7 @@ test "a record holding a small record in place crosses a call as its leaves" {
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
   assert_eq(out.len(), 3);
   // The record held lies in a list as its three words: no box is made of it.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [false, false, false]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(32));"), [false, false, false]);
   // The holding crosses as its three fields, and the answer comes back as its first leaf, `at`, then
   // the holding's fields through one buffer.
   assert_eq(out.get(0).tables.symbols.map(|d: Defined| d.head), [
@@ -3279,7 +3263,7 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
   // A line holds its price as two words and its count after them, each as its own bits: flat and
   // raw, as a record of a price alone is. It crosses a call as its fields, and no root makes a box
   // of its three words.
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(32));"), [
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(32));"), [
     false,
     false,
     false,
@@ -3288,7 +3272,7 @@ test "a `Decimal` is held in registers as its two words, and in a record or an a
     false,
     false,
   ]);
-  assert_eq(has(b"rt_alloc_bytes_p(ctx, INT64_C(24));"), [
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [
     false,
     false,
     false,
@@ -3330,7 +3314,7 @@ test "a field of a `Columns`' record is loaded from its column, with no record m
   // list holding one whole in place. The runtime reads no `Columns` a body made: an index naming no
   // record raises as the builtin does.
   assert_eq(has(b"ply_f64("), [true, false, true]);
-  assert_eq(has(b"rt_alloc_bytes_p("), [false, false, false]);
+  assert_eq(has(b"ply_alloc("), [false, false, false]);
   assert_eq(has(b"rt_alloc_p("), [false, false, false]);
   assert_eq(has(b"builtin_elaborated_refused_p(ctx, 6, "), [true, true, true])
 }
@@ -4339,8 +4323,7 @@ test "a buffer read out of a record this body holds alone reaches its append uns
       let body = code(n);
       // The append grows the buffer in place where it holds the room, else into a block it makes.
       match body.index_of(appended()) {
-        Some(c) ->
-          takes_count(body.slice(0, c)) || outside_appends(body).index_of(b"rt_alloc") != None,
+        Some(c) -> takes_count(body.slice(0, c)) || allocates(outside_appends(body)),
         None -> true,
       }
     }),
@@ -4460,7 +4443,7 @@ test "a constant tree is static boxes, its leaves and cases laid as the printer 
     match out.filter(|e: Emitted| emitted_name(e) == name) { [e] -> own_code(e.text), _ -> b"" };
   assert_eq(
     [b"m.small", b"m.broad"].filter(|n: Bytes|
-      text(n).index_of(b"rt_alloc") != None || text(n).index_of(b"&ply_k_") == None),
+      allocates(text(n)) || text(n).index_of(b"&ply_k_") == None),
     [],
   );
   // The constant is no count a body takes or lets go of.
@@ -4542,8 +4525,7 @@ test "an accumulator read more than once is still answered as its fields at the 
   assert_eq(out.len(), 2);
   // The update makes no record: the root answers the fields it sets and keeps.
   let has = |text: Bytes| out.map(|e: Emitted| own_code(e.text).index_of(text) != None);
-  [b"rt_alloc_p(", b"rt_alloc_bytes_p("].fold((), |_: Unit, t: Bytes|
-    assert_eq(has(t), [false, false]))
+  [b"rt_alloc_p(", b"ply_alloc("].fold((), |_: Unit, t: Bytes| assert_eq(has(t), [false, false]))
 }
 
 test "a branch lets go as it opens of a parameter only another branch takes, and of nothing of a record whose field it read" {
@@ -4866,7 +4848,7 @@ test "a body is written against the handing another answer publishes for its cal
 /// The C an array's allocation opens with.
 fn array_made() -> Bytes =
   Bytes::concat_all([
-    b"rt_alloc_bytes_p(ctx, ",
+    b"ply_alloc(ctx, ",
     ascii_of_int(header_bytes() + 8 * head_words(array_head())),
     b" + 8 * (",
   ])

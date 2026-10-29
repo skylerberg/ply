@@ -225,6 +225,7 @@ helpers! {
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
     rt_const(index: I64, keep: KeepRoot) -> Handed;
     rt_never_lifted();
+    rt_never_shown();
 }
 
 /// The helper a builtin is called through, named for it. An elaboration's `?` is spelled out, since

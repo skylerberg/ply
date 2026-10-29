@@ -1,6 +1,7 @@
 //! Where a native's job runs when it would block the program's thread: pools for the whole
 //! process, so a test run's machines and a `parallel`'s branches share one bound of threads between
-//! them, while each job stays the run's that submitted it.
+//! them, while each job stays the run's that submitted it; or that thread itself, where nothing
+//! else of the run could go on while it waits.
 
 use crate::pool::{MAX_BLOCKING_OPERATIONS, Pool, Run};
 use ply_core::host::Pending;
@@ -67,6 +68,19 @@ pub fn submit(
     refusing(work, run, span, label, what, move || {
         job().map_err(Failure::Said)
     })
+}
+
+/// `job` run for `run` on this thread, its ticket answered as it is handed: for a job no other task
+/// of the run could go on beside, which a thread of a pool would only make wait longer. As
+/// [`refusing`] runs it otherwise.
+pub fn done_here(
+    run: &Run,
+    span: Span,
+    label: &'static str,
+    what: &'static str,
+    job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
+) -> Pending {
+    run.done_here(span, label, what, job)
 }
 
 /// `job` as [`submit`] runs it, where the job may refuse with a diagnostic of its own.
