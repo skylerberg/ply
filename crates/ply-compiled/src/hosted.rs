@@ -3,9 +3,11 @@
 //! effect's module reads into its own types. Each that asks the host refuses where a run may not
 //! reach it, inside a `simulate` region or in a test the search re-runs, as a host operation does.
 //!
-//! A native that would block the program's thread hands a job to the process's pools and answers a
-//! ticket, which `job_wait` reads the job's bytes by: the running task waits in a production
-//! region while the region's other tasks run, and the thread waits outside one.
+//! A native that would block the program's thread answers a ticket, which `job_wait` reads the
+//! job's bytes by. In a production region the job runs on the process's pools while the region's
+//! other tasks run. Outside one, where no other task could run, a job that reads files or computes
+//! runs on the program's thread; one that waits on what is outside the process still runs on a
+//! pool, so a shutdown's drain can give up waiting on it.
 //!
 //! A native answering structured data writes it in the flat forms of `ply_host::native`.
 
@@ -176,9 +178,9 @@ impl Ctx {
         true
     }
 
-    /// The ticket of `job` on `work`'s pool, the job this context's run's, which `native` asked for
-    /// as `what`, a diagnostic names it by; 0, with the run failed, where no thread could be had
-    /// for it.
+    /// The ticket of `job`, the job this context's run's, which `native` asked for as `what`, a
+    /// diagnostic names it by: run as the module says, on `work`'s pool or here. 0, with the run
+    /// failed, where no thread could be had for it.
     fn submitted(
         &mut self,
         native: &'static str,
@@ -199,9 +201,15 @@ impl Ctx {
         job: impl FnOnce() -> Result<Vec<u8>, Failure> + Send + 'static,
     ) -> I64 {
         let span = self.site();
+        let here = work != Work::Waiting && crate::tasks::production_task(self).is_none();
         let runtime = self.host_runtime();
-        let submitted = ply_host::registry::run_of(&*runtime)
-            .and_then(|run| jobs::refusing(work, run, span, native, what, job));
+        let submitted = ply_host::registry::run_of(&*runtime).and_then(|run| {
+            if here {
+                Ok(jobs::done_here(run, span, native, what, job))
+            } else {
+                jobs::refusing(work, run, span, native, what, job)
+            }
+        });
         match submitted {
             Ok(pending) => I64(pending.token as i64),
             Err(d) => {

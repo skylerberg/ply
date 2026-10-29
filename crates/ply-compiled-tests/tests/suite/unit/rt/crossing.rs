@@ -5,10 +5,10 @@
 use crate::bare::{context, helper};
 use crate::unit::secret::sealed;
 use ply_compiled::c::builtin_helper_name;
-use ply_compiled::emitted::{Carried, Handed, PlyType};
-use ply_compiled::heap::{HEADER, Word, imm, word_at};
+use ply_compiled::emitted::{Handed, PlyType};
+use ply_compiled::heap::{Word, imm, word_at};
 use ply_compiled::native::Answered;
-use ply_compiled::rt::{Ctx, Lifted};
+use ply_compiled::rt::Ctx;
 use ply_core::codec::{Writer, fun, shown, tag};
 use ply_core::float::bits;
 use ply_core::{Decimal, Fixed, INT_TYPES, IntTy};
@@ -255,18 +255,23 @@ fn the_natives_read_what_the_codec_writes() {
     unfailed(&mut ctx);
 }
 
-/// What a descriptor lifts a type that can hold a function by fails the entry, saying a function
-/// never crosses back.
+/// What a descriptor lifts or lowers by where the runtime never asks it to fails the entry, saying
+/// which.
 #[test]
-fn a_lifting_of_a_type_that_can_hold_a_function_fails_the_entry() {
-    let mut ctx = context();
-    ctx.begin(1_000);
-    let refused: unsafe extern "C" fn(*mut Ctx) = helper("rt_never_lifted");
-    unsafe { refused(&mut ctx) };
-    assert_ne!(ctx.failed, 0, "the lifting was not refused");
-    let why = format!("{:?}", ctx.take_failure());
-    assert!(why.contains("never back"), "{why}");
-    ctx.end();
+fn a_descriptors_refusal_fails_the_entry() {
+    for (refusal, said) in [
+        ("rt_never_lifted", "lifts only a `String`"),
+        ("rt_never_shown", "does not lower it"),
+    ] {
+        let mut ctx = context();
+        ctx.begin(1_000);
+        let refused: unsafe extern "C" fn(*mut Ctx) = helper(refusal);
+        unsafe { refused(&mut ctx) };
+        assert_ne!(ctx.failed, 0, "{refusal} refused nothing");
+        let why = format!("{:?}", ctx.take_failure());
+        assert!(why.contains(said), "{why}");
+        ctx.end();
+    }
 }
 
 /// Asserts the context did not fail, saying why where it did.
@@ -543,115 +548,16 @@ fn a_function_the_program_wrote_crosses_by_its_name() {
     assert_eq!(named, by_name);
 }
 
-/// A value of `m.Box`, a block of one word, counted at its offset 0 and freed by size.
-const BOX_BYTES: Word = (HEADER + 8) as Word;
-
-unsafe extern "C" fn box_inc(_ctx: *mut Ctx, w: Word) -> Word {
-    unsafe { *(w as *mut u32) += 1 };
-    0
-}
-
-unsafe extern "C" fn box_dec(ctx: *mut Ctx, w: Word) -> Word {
-    unsafe {
-        if *(w as *const u32) > 1 {
-            *(w as *mut u32) -= 1;
-        } else {
-            helper::<N2>("rt_free")(ctx, w, BOX_BYTES);
-        }
-    }
-    0
-}
-
-static BOX: PlyType = PlyType {
-    identity: 5,
-    spelled: b"m.Box".as_ptr(),
-    spelled_len: 5,
-    inc: box_inc,
-    dec: box_dec,
-    lower: unread,
-    lift: nothing,
-};
-
-/// A lifting of a list of `handles`, each a position beside the bytes, with a runtime object at
-/// position 0 and a box carried with its type at position 1; answers the box.
-fn lifting_beside(ctx: &mut Ctx, handles: &[u64]) -> Word {
-    let mut w = Writer::new();
-    w.count(tag::LIST, handles.len() as u64);
-    for at in handles {
-        w.handle(*at);
-    }
-    let b = unsafe { helper::<A1>("rt_alloc_bytes")(ctx, BOX_BYTES) };
-    let secret = sealed(ctx, b"hunter2", true);
-    let carried = unsafe { Carried::new(Handed::of(b), &BOX) };
-    ctx.lift_from(
-        w.finish(),
-        vec![Lifted::Runtime(secret), Lifted::Carried(carried)],
-    );
-    b
-}
-
-/// A value the runtime kept with its type is handed to compiled code with the count the lifting
-/// held; what compiled code leaves of the lifting is let go through its type when it ends.
+/// No lifting holds a handle beside its bytes, so a runtime object or a carried value read from one
+/// fails the crossing.
 #[test]
-fn a_carried_value_lifted_moves_its_count_to_compiled_code_and_one_left_is_let_go() {
-    let mut ctx = context();
-    ctx.begin(1_000);
-    let c: *mut Ctx = &mut ctx;
-    let b = lifting_beside(&mut ctx, &[1]);
-    unsafe {
-        assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 1);
-        assert_eq!(native::<A0>("?in_carried")(c), b);
-        native::<N0>("?lift_close")(c);
-    }
-    unfailed(&mut ctx);
-    assert_eq!((ctx.heap.live(), unsafe { *(b as *const u32) }), (1, 1));
-    unsafe { box_dec(&mut ctx, b) };
-    assert_eq!(ctx.heap.live(), 0);
-    lifting_beside(&mut ctx, &[]);
-    unsafe {
-        assert_eq!(native::<A1>("?in_count")(c, tag::LIST as Word), 0);
-        native::<N0>("?lift_close")(c);
-    }
-    unfailed(&mut ctx);
-    assert_eq!(
-        ctx.heap.live(),
-        0,
-        "the box left beside the bytes was not let go"
-    );
-    assert_eq!(ctx.heap.natives(), 0);
-    ctx.end();
-}
-
-/// A runtime object and a value kept with its type are read by their own natives alone; one read
-/// as the other is left beside the bytes, and let go with them.
-#[test]
-fn a_handle_read_as_the_other_kind_fails_the_crossing_and_is_let_go_with_it() {
-    for (at, read, said) in [
-        (
-            1,
-            "?in_handle",
-            "a value kept with its type, read as a runtime object",
-        ),
-        (
-            0,
-            "?in_carried",
-            "a runtime object, read as a value kept with its type",
-        ),
-    ] {
-        let mut ctx = context();
-        ctx.begin(1_000);
-        let c: *mut Ctx = &mut ctx;
-        lifting_beside(&mut ctx, &[at]);
-        unsafe {
-            native::<A1>("?in_count")(c, tag::LIST as Word);
+fn a_handle_read_from_a_lifting_fails_the_crossing() {
+    let bytes = written(|w| w.handle(0));
+    for read in ["?in_handle", "?in_carried"] {
+        let said = lift_and(&bytes, |c| unsafe {
             assert_eq!(native::<A0>(read)(c), 0);
-            native::<N0>("?lift_close")(c);
-        }
-        let failure = ctx.take_failure().expect("the crossing failed").message;
-        assert!(failure.contains(said), "{failure}");
-        assert_eq!((ctx.heap.live(), ctx.heap.natives()), (0, 0));
-        ctx.failed = 0;
-        ctx.end();
+        });
+        assert!(said.contains("holds none"), "{read}: {said}");
     }
 }
 

@@ -6,12 +6,12 @@ impl Ctx {
     /// The scheduler's own work begins, where it had not: the blocks it makes are not the
     /// program's. Answers whether it had.
     pub(crate) fn scheduler_entered(&mut self) -> bool {
-        std::mem::replace(&mut self.heap.scheduling, true)
+        self.heap.set_scheduling(true)
     }
 
     /// The program's own work runs again, where the scheduler's ran.
     pub(crate) fn program_entered(&mut self) {
-        self.heap.scheduling = false;
+        self.heap.set_scheduling(false);
     }
 }
 

@@ -4,9 +4,10 @@
 //! out what emitted code reads in place, each as a named integer.
 
 use super::prelude::{machine_natives, own_helpers};
+use crate::blocks::{self, Filling, Page, Segment};
 use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
-use crate::heap::{self, Obj};
+use crate::heap::{self, Alloc, Obj};
 use crate::native::{Machine, Signature};
 use crate::rt::Ctx;
 use std::fmt::Write;
@@ -45,14 +46,23 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Ctx as "PlyCtx": failed, fuel, stack_floor, site_root, site_start, site_end, ticks,
         next_tick, frames, release_depth, release_waiting, target, entering_desc, entering_words,
         recording, bridge, hosted, unserved, performed_root,
-        performed_start, performed_end, task);
-    laid!(out, Obj as "PlyObj": rc);
+        performed_start, performed_end, task, alloc);
+    laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
+    laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
+        listed, spare);
+    laid!(out, Filling as "PlyFilling": pages, name, reused);
+    laid!(out, Alloc as "PlyAlloc": blocks, count, slow);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
     laid!(out, PlyKept as "PlyKept": ty, equal, order);
     laid!(out, PlyOp as "PlyOp": effect, op, answer, own, params_len, params, vars_len, vars);
     laid!(out, PlyFnDesc as "PlyFnDesc": uniform, typed, convention, release, share, keep);
     out.extend([
+        ("alloc.segment", blocks::SEGMENT),
+        ("alloc.page", blocks::PAGE),
+        ("alloc.pages_at", offset_of!(Segment, pages)),
+        ("alloc.word_classes", blocks::WORD_CLASSES),
+        ("alloc.link_at", blocks::LINK_AT),
         ("count.frame", heap::FRAME as usize),
         ("count.immortal", heap::IMMORTAL as usize),
         ("count.shared", heap::SHARED as usize),
