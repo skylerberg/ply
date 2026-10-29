@@ -1,12 +1,13 @@
-//! Reads of a pure nullary definition, as emitted code writes one for a constant: the first
-//! evaluates the definition and keeps its value for good through the type's keep root, and each
-//! later read answers that copy. The definitions and keep roots here are written as emitted code
-//! writes them, over blocks laid out as it lays one.
+//! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
+//! definition and keeps its value for good through the type's keep root, and each later read
+//! answers that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
+//! roots here are written as emitted code writes them, over blocks laid out as it lays one.
 
 use crate::bare::{context_of, helper};
+use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::KeepRoot;
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
-use ply_compiled::rt::{Ctx, Tables};
+use ply_compiled::rt::{Ctx, FAILED, Tables};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -233,5 +234,56 @@ fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
     let_go(c, nested);
     let_go(c, theirs);
     let_go(c, mine);
+    ctx.end();
+}
+
+fn read_const(ctx: *mut Ctx) -> Word {
+    unsafe { helper::<Memo>("rt_const")(ctx, 0, keep_box) }
+}
+
+static TENS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn ten(ctx: *mut Ctx, _args: *const Word) -> Word {
+    TENS.fetch_add(1, Ordering::SeqCst);
+    boxed(ctx, 10)
+}
+
+#[test]
+fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
+    let mut ctx = defining(ten);
+    let c: *mut Ctx = &mut ctx;
+    let first = read_const(c);
+    let second = read_const(c);
+    let third = read_const(c);
+    assert_eq!(TENS.load(Ordering::SeqCst), 1, "evaluated once");
+    assert_eq!(held(first), 10);
+    assert_eq!((held(second), count(second)), (10, IMMORTAL));
+    assert_eq!(third, second);
+    let_go(c, first);
+    ctx.end();
+}
+
+/// `Bytes::at` refused, left pending as a raise of `abort.raise`.
+unsafe extern "C" fn refusing(ctx: *mut Ctx, _args: *const Word) -> Word {
+    let refused: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
+        helper(&builtin_helper_name("?refused"));
+    unsafe { refused(ctx, 8, 5, 2, 0) };
+    0
+}
+
+#[test]
+fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
+    let mut ctx = defining(refusing);
+    let c: *mut Ctx = &mut ctx;
+    assert_eq!(read_const(c), 0);
+    assert_eq!(ctx.failed, FAILED, "a plain failure, no raise pending");
+    let said = ctx.take_failure().expect("a diagnostic");
+    assert!(
+        said.notes
+            .iter()
+            .any(|n| n.contains("`const fn` must return")),
+        "{said:?}"
+    );
+    assert_eq!(ctx.tables.memoized(0), None);
     ctx.end();
 }

@@ -258,8 +258,7 @@ and the text is read like an interpolated string's (escapes apply, `{{` and `}}`
 - If the parser returns `Err`, the literal is an error (`E0153`) reported at character `offset` of
   the text as written, with `message`. An escape or a doubled brace counts as one character, and
   the offset just past the end points at the closing quote.
-- A parser that raises, or does not finish within a `const fn`'s time limit (§3.5), is an error
-  (`E0154`).
+- A parser that raises, or does not finish within 60 seconds of wall clock, is an error (`E0154`).
 
 The literal's hash covers its parser and its text. Editing anything the parser depends on rechecks
 every definition that uses the tag. `f` and `b` are not tags, since `f"` and `b"` start the strings
@@ -627,7 +626,7 @@ A missing path, a directory passed to `embed`, a file passed to `embed_dir`, an 
 a file that changed between checking and building is an error (`E0146`). A module that defines or
 imports its own `embed` or `embed_dir` uses that one instead.
 
-### 3.5 Constants computed at build time
+### 3.5 Constants
 
 ```ply
 type Status = { code: Int, reason: String }
@@ -635,8 +634,9 @@ type Status = { code: Int, reason: String }
 const fn statuses() -> Array<Status> = parsed(embed("status_codes.csv"))
 ```
 
-A `const fn` is evaluated once when the program is built, and the program reads the stored value.
-This is how to turn a data file into a table without paying for it at run time.
+A `const fn` is a value the program computes once. Its body runs the first time a run reads it.
+Every later read in the same process returns the same value. This is how to turn a data file into a
+table that is parsed once, not on every read.
 
 - It takes no parameters, has no type, label or row parameters, and writes no row.
 - Its body may raise, and may do nothing else. It must return, so no call that may not return
@@ -644,26 +644,13 @@ This is how to turn a data file into a table without paying for it at run time.
 - Its value must be data: no function, `Task`, `Chan` or `Secret`, at any depth.
 - Anything else is `E0156`.
 
-Its row is empty no matter what its body could raise, because the build already saw it not raise.
 `pub const fn` exports it. `const` cannot be combined with `transparent` or `reuse`.
 
-`ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate every `const fn` before
-doing anything else, with a limit of 60 seconds of wall clock. One that raises is `E0157`, showing
-what it raised and where. One that does not finish within the limit, or whose value encodes to more
-than 16 MiB, is `E0158`. In either case nothing in the program runs. The value is cached under the
-definition's hash, which covers its body, everything it reaches and every file it embeds, so it is
-evaluated again only after one of those changes. A `const fn` that ran out of time is not cached,
-since the clock says nothing about the program.
+Its row is empty, whatever its body could raise. A raise that leaves the body ends the run, and no
+handler around the read can catch it. Nothing checks a `const fn` before it runs, so test what it
+returns.
 
-A call of a `const fn` reads the stored value and does not run the body. A program built without
-stored values, such as a mutant (§8.5) or a bisection step (§8.4), evaluates the body once per run
-instead. The result is the same either way, since the body is pure.
-
-Storage is compact. An `Array` of `Int`s that fit in 63 bits, or of fixed widths narrower than 64
-bits, is stored as one block of words. An `Array` of records, `Float`s, 64-bit widths or
-`Decimal`s stores each element in place. Other elements become separate objects when the value is
-read. A map is stored in order and read back without comparing keys, and shared parts are stored
-once.
+A plain function of no parameters that performs nothing is also computed once per process.
 
 A `const fn` of type `std.sql.Schema` is a database schema: the SQL statements of its module, and
 of every module that imports it, are checked against it before anything runs (§16). A module whose
@@ -2357,6 +2344,7 @@ referenced or given arguments.
   once nothing holds it, so an object left alive is a leak, and a defect in Ply. What the build
   stored, a cached constant's stored copy, and what a scheduler holds for itself are not the test's.
 
+
 **Tests over cases.** A test can run once for each element of a table. Each run is a *case*:
 
 ```ply
@@ -3144,10 +3132,10 @@ derive sql for Order
 
 - A deriver is any module's `pub fn derive(declaration: derive::Declaration) -> Result<String,
   derive::Refused>`, performing nothing but raises. `std.derive` describes a declaration.
-- The checker compiles a deriver once and runs it for each declaration in isolation, with a `const
-  fn`'s time limit (§3.5). Each result is cached under the declaration and the source of the modules
-  the deriver reaches, so it reruns only after an edit to one of them. A run that raised or ran out
-  of time is not cached.
+- The checker compiles a deriver once and runs it for each declaration in isolation, with a limit
+  of 60 seconds of wall clock. Each result is cached under the declaration and the source of the
+  modules the deriver reaches, so it reruns only after an edit to one of them. A run that raised or
+  ran out of time is not cached.
 - A deriver is a standard library module or one of the program's own, and a deriver's own modules
   derive nothing through a deriver.
 - A name no import binds is `E0207`. A module whose `derive` is not a deriver is `E0160`. A deriver
@@ -3376,8 +3364,8 @@ $ ply run app.plyx
 
 - the program's definitions, by hash;
 - those definitions printed back to source, without tests, laws, comments or anything unreachable;
-- what `ply run` loads: that source, checked again, and its compiled code, which holds the value of
-  each `const fn` (§3.5). So running a `.plyx` checks nothing and evaluates no `const fn`.
+- what `ply run` loads: that source, checked again, and its compiled code. So running a `.plyx`
+  checks nothing.
 
 What is included is what each definition refers to. An effect or type with the same name as a
 function is a separate definition, so a program that names only the effect includes nothing the
@@ -3629,21 +3617,17 @@ reuse it.
   failure.
 
 **What runs before the program.** `ply check`, `ply run`, `ply test`, `ply build` and `ply prove` do
-three things after checking and before anything else:
+two things after checking and before anything else:
 
 1. **Tagged literals** (§2.3). Each literal in the root package's modules is parsed by calling its
-   parser, in isolation with no permissions, with the time limit a `const fn` has (§3.5). A refusal
+   parser, in isolation with no permissions, with a limit of 60 seconds of wall clock. A refusal
    is `E0153` or `E0154`. The verdict depends only on the parser and the text, so it is cached under
    the hash of everything the parser reaches and the text, and a parser runs again only for a new
    text or after an edit to something it reaches. A parser that runs out of time is not cached, since
    the clock says nothing about the parser. A dependency's literals are that package's to check. In
    a program loaded without this step, a literal its parser rejects ends the run where it is read
    (`E0502`).
-2. **Constants** (§3.5). Each `const fn` in the program, whichever package declares it, is
-   evaluated in isolation, and its value is cached under the definition's hash. A `const fn` that
-   raises is evaluated again by every load until it is fixed, so its error points at the current
-   source.
-3. **SQL statements.** The statements the root package's modules run are checked against the schema
+2. **SQL statements.** The statements the root package's modules run are checked against the schema
    (§3.5) their module reaches: each `db.query`, `db.batch`, `db.execute`, `db.returning` and
    `db.copy_out`; `std.db`'s `fetch` and `fetch_returning`; and `std.sqlite`'s `query`, `execute`,
    `returning`, `run` and `fold_rows`. A statement is checked when it can be computed before the

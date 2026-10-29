@@ -1705,7 +1705,7 @@ fn lent_target(checker: Checker, q: QName) -> Target / {abort.raise} =
 /// signature alone says of its counts. `row` is what its body performs. An unwritten row the body
 /// overran is reported already; its callers are checked against what the body performs, so one
 /// check names every row the program has to write. A `const` publishes the empty row whatever its
-/// body raises: the build saw it raise nothing.
+/// body raises: a raise that leaves it ends the run.
 fn published_fn(
   checker: Checker,
   parsed: ParsedModule,
@@ -1718,7 +1718,7 @@ fn published_fn(
   let body_row = resolve_row_in(c, row);
   let overran = match def.effects {
     Some(_) -> false,
-    None -> def.baked == None && (body_row.atoms.len() > 0 || body_row.tail != None),
+    None -> def.constant == None && (body_row.atoms.len() > 0 || body_row.tail != None),
   };
   let fn_ty = if overran { fn_type(sig.params, sig.ret, body_row) } else { sig.fn_ty };
   let g: Generalized = generalize(c.subst, c.env, fn_ty);
@@ -1953,8 +1953,8 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
           repeats: counted.repeats,
           ending: ending_of(slot),
           summary: summary_of(slot),
-          // A `const` raised nothing when the build evaluated it, so no place in it is one to guard.
-          raises: if raised_inside || def.baked != None { [] } else { count.raises },
+          // A raise that leaves a `const` ends the run, so no place in it is one to guard.
+          raises: if raised_inside || def.constant != None { [] } else { count.raises },
         })
       },
     });
@@ -2137,7 +2137,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
     },
   );
   let popped: Checker = { ..checked, env: env_pop(checked.env) };
-  let shaped: Checker = match def.baked {
+  let shaped: Checker = match def.constant {
     Some(at) -> check_const_shape(popped, def, at, signature),
     None -> popped,
   };
@@ -2543,7 +2543,7 @@ fn check_upper_bound(
   inferred: Row,
 ) -> Checker / {abort.raise} =
   match def.effects {
-    None -> match def.baked {
+    None -> match def.constant {
       Some(at) -> check_const_row(checker, def, at, inferred),
       None -> check_unwritten(checker, def, inferred),
     },
@@ -2668,12 +2668,12 @@ fn const_refused(
     checker,
     b"E0156",
     Bytes::concat_all([b"`", def.name.name, b"` is `const`, and ", what]),
-    [primary, label_at(checker.module, at, false, b"a build evaluates this and keeps its value")],
+    [primary, label_at(checker.module, at, false, b"evaluated once, at its first read")],
     notes,
   )
 
-/// What a build can evaluate once and keep as data: a definition nothing is handed to, that writes
-/// no row, and answers no function, `Hold`, `Task`, `Chan` or `Secret`.
+/// What a process can evaluate once and keep as data: a definition nothing is handed to, that
+/// writes no row, and answers no function, `Hold`, `Task`, `Chan` or `Secret`.
 fn check_const_shape(
   checker: Checker,
   def: FnDef,
@@ -2681,7 +2681,7 @@ fn check_const_shape(
   sig: Signature,
 ) -> Checker / {abort.raise} = {
   let handed = [
-    b"a build evaluates a `const fn` once, before any call of it, so nothing can be handed to it",
+    b"a `const fn` is evaluated once, at its first read, so nothing can be handed to it",
   ];
   let binders = def.generics.types.concat(def.generics.labels).concat(def.generics.effects);
   let bound: Checker = match binders.at(0) {
@@ -2717,9 +2717,7 @@ fn check_const_shape(
         at,
         b"writes a row",
         label_at(taken.module, r.span, true, b"a `const fn` writes none"),
-        [
-          b"a `const fn` performs nothing: what its body could raise, the build that evaluates it sees it not raise",
-        ],
+        [b"a `const fn` performs nothing: a raise that leaves its body ends the run"],
       ),
   };
   // A type parameter is refused above; the type it leaves open says nothing more.
@@ -2732,7 +2730,7 @@ fn check_const_shape(
           rowed,
           def,
           at,
-          b"answers a value a build cannot keep",
+          b"answers a value that is not data",
           label_at(
             rowed.module,
             match def.ret { Some(t) -> ty_span(t), None -> def.name.span },
@@ -2750,15 +2748,15 @@ fn check_const_shape(
             ]),
           ),
           [
-            b"a build keeps a `const fn`'s value as data, which a function, a `Hold`, a `Task`, a `Chan` and a `Secret` are not",
+            b"a process keeps a `const fn`'s value for good, as data, which a function, a `Hold`, a `Task`, a `Chan` and a `Secret` are not",
           ],
         ),
     },
   }
 }
 
-/// A build evaluates a `const fn` where nothing answers an effect: its body may raise, which the
-/// build sees it not do, and performs nothing else, a call that may not return included.
+/// A `const fn` is evaluated where nothing answers an effect: its body may raise, which ends the
+/// run, and performs nothing else, a call that may not return included.
 fn check_const_row(
   unclosed: Checker,
   def: FnDef,
@@ -2787,7 +2785,7 @@ fn check_const_row(
           at,
           b"may not return",
           label_at(module, span, true, b"this call may not return"),
-          [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+          [b"a `const fn` is evaluated with no step budget, so it must end: call only what ends"],
         )
       } else {
         const_refused(
@@ -2800,7 +2798,7 @@ fn check_const_row(
             None -> b"performed in this body",
           }),
           [
-            b"a build evaluates a `const fn` before the program runs, where nothing answers an effect: its body may raise, and performs nothing else",
+            b"a `const fn` is evaluated where nothing answers an effect: its body may raise, and performs nothing else",
             b"read a file with `embed`, and handle any other effect inside the body",
           ],
         )
@@ -2974,11 +2972,11 @@ fn unwritten_divergence(
   start_of: (Bytes) -> Int / {abort.raise},
 ) -> Checker / {abort.raise} =
   match ending {
-    Diverges(d) -> if d.through != None || says_diverges { checker } else if def.baked != None {
+    Diverges(d) -> if d.through != None || says_diverges { checker } else if def.constant != None {
       const_refused(
         checker,
         def,
-        match def.baked { Some(at) -> at, None -> def.name.span },
+        match def.constant { Some(at) -> at, None -> def.name.span },
         b"may not return",
         label_at(
           checker.module,
@@ -2989,7 +2987,7 @@ fn unwritten_divergence(
           true,
           b"this call back into its group is not seen to descend",
         ),
-        [b"a build evaluates a `const fn`, so it ends: call only what ends"],
+        [b"a `const fn` is evaluated with no step budget, so it must end: call only what ends"],
       )
     } else {
       report(

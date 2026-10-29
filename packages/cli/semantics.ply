@@ -4,8 +4,68 @@
 //! none of the other's.
 
 import std.bytes
+import compiler.cc (toolchain)
+import compiler.unit (shipped, identity_of, file_kept, keep_file)
 import fingerprint (specimen, fingerprint)
+import std.fs
+import std.fs (fs)
+import std.path (below_root)
+import std.random (entropy)
+import std.time (time)
 
 /// The version, the head of what the meanings come to over the fingerprint's specimen: it moves with
-/// every change to one of them the specimen reaches, and a build of `ply` holds it.
+/// every change to one of them the specimen reaches. Working it out analyses the specimen from
+/// nothing, so a command that reads it in every run asks `semantics.cached` instead.
 pub const fn version() -> String = fingerprint(specimen()).slice(0, 8).hex_of()
+
+/// What a command asks of the version where every run reads it. What answers is `caching`, which
+/// `main` runs every command under. The answer is `version()`, so the effect is a deterministic one.
+pub effect semantics {
+  read cached() -> String
+}
+
+/// `body` with `semantics.cached` answered from the toolchain's cache, where the version is kept
+/// under the identity of the code that works it out: worked out by the first process of a binary to
+/// ask, and read back by every later one.
+pub fn caching<a | e>(
+  body: () -> a / {semantics.cached | e},
+) -> a / {shipped.definitions, toolchain.bodies, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var known: Option<String> = None,
+    semantics.cached() -> match known {
+      Some(v) -> v,
+      None -> {
+        let dir = below_root(toolchain.bodies()) ++ "/semantics";
+        let key = identity_of(shipped.definitions(), [b"semantics.version"]);
+        let v = match file_kept[abs](dir, key) {
+          Some(bytes) -> String::of_bytes_lossy(bytes),
+          None -> {
+            let worked_out = version();
+            keep_file[abs](dir, key, Bytes::of_string(worked_out));
+            worked_out
+          },
+        };
+        known = Some(v);
+        v
+      },
+    },
+  }
+
+// A version the cache holds for this code is what every later process reads, worked out by none.
+test "the version is read back from the toolchain's cache, under the identity of the code that works it out" {
+  let definitions = b"semantics.version abc\n";
+  let key = String::of_bytes(identity_of(definitions, [b"semantics.version"]));
+  let tree = fs::mem_of([{ path: below_root("/bodies") ++ "/semantics/" ++ key, body: b"cached" }]);
+  let read = fs::on_mem[abs](tree, ||
+    handle {
+      caching(|| [semantics.cached(), semantics.cached()])
+    } with {
+      shipped.definitions() -> definitions,
+      toolchain.bodies() -> "/bodies",
+      entropy.next() -> 0,
+      time.now_ms() -> 0,
+    });
+  assert_eq(read.value, ["cached", "cached"])
+}
