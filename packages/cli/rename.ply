@@ -35,6 +35,7 @@ import compiler.check.resolve.bindings (written, Written, Reference, Member, Ref
                                         CalledName, ArgumentName)
 import compiler.check.infer (item_owner)
 import compiler.check.infer.checker (MemberSite)
+import compiler.check.member (MemberTarget, CallsFunction)
 import compiler.syntax.lexer (lex, Token, Comment, Identifier, StringLiteral, LineString,
                               BytesLiteral, InterpolatedHead, InterpolatedMiddle, InterpolatedTail,
                               is_ident_start, is_ident_continue)
@@ -411,7 +412,7 @@ type Read = {
   index: Int,
   name: Bytes,
   entries: List<Entry>,
-  calls: Map<Bytes, Map<Int, Bytes>>,
+  calls: Map<Bytes, Map<Int, MemberTarget>>,
   imports: List<{ decl: ImportDecl, target: Int }>,
   externs: Map<Bytes, Bool>,
   effects: List<{ name: Bytes, ops: List<Bytes> }>,
@@ -455,13 +456,13 @@ fn key_of(l: Loaded, qualified: Bytes) -> Bytes / {abort.raise} = {
 
 /// What each call on a value in the module at `index` calls, by its owner and site: the function's
 /// program-wide name, a builtin's name after its qualifier, or nothing for a function a field holds.
-fn calls_of(a: Analysis, index: Int) -> Map<Bytes, Map<Int, Bytes>> =
-  a.checked.facts.members.fold(Map::new(), |acc: Map<Bytes, Map<Int, Bytes>>, s: MemberSite|
-    if s.module != index { acc } else {
-      let callee = if s.callee.len() > 0 || s.name.len() == 0 { s.callee }
-      else { qualify(s.qualifier, s.name) };
-      acc.insert(s.owner, acc.get(s.owner).unwrap_or(Map::new()).insert(s.site, callee))
-    })
+fn calls_of(a: Analysis, index: Int) -> Map<Bytes, Map<Int, MemberTarget>> =
+  a.checked.facts.members.fold(
+    Map::new(),
+    |acc: Map<Bytes, Map<Int, MemberTarget>>, s: MemberSite|
+      if s.module != index { acc }
+      else { acc.insert(s.owner, acc.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)) },
+  )
 
 /// The entries of `tree`, the module at `index` named `name` as written: its imports', then each
 /// item's.
@@ -848,23 +849,22 @@ fn member_new(rn: Renaming, l: Loaded, r: Read, owner: Bytes, m: Member) -> Byte
   match m.kind {
     FieldName -> field_name(rn.renames, m.name),
     CalledName(call) -> match calls.get(call) {
-      None -> field_name(rn.renames, m.name),
-      Some(callee) -> if callee.len() == 0 { field_name(rn.renames, m.name) } else {
-        match rn.definitions.values.get(key_of(l, callee)) {
-          None -> m.name,
-          Some(n) -> match member_of(m.name) {
-            Some(w) -> member_name(w.of, own_part(n)),
-            None -> own_part(n),
-          },
-        }
+      Some(CallsFunction(callee)) -> match rn.definitions.values.get(key_of(l, callee)) {
+        None -> m.name,
+        Some(n) -> match member_of(m.name) {
+          Some(w) -> member_name(w.of, own_part(n)),
+          None -> own_part(n),
+        },
       },
+      _ -> field_name(rn.renames, m.name),
     },
     ArgumentName(a) -> {
       let callee = match calls.get(a.call) {
-        Some(c) -> c,
-        None -> match a.callee { Definition(d) -> d.qualified, _ -> b"" },
+        Some(CallsFunction(c)) -> Some(c),
+        Some(_) -> None,
+        None -> match a.callee { Definition(d) -> Some(d.qualified), _ -> None },
       };
-      match rn.declared.get(key_of(l, callee)) {
+      match callee.and_then(|c: Bytes| rn.declared.get(key_of(l, c))) {
         Some(file) -> simple_name(rn.renames, file, m.name),
         None -> m.name,
       }
@@ -1059,7 +1059,7 @@ fn entry_failures(
   imports: Bool,
   before: Entry,
   now: Entry,
-  calls: Map<Bytes, Map<Int, Bytes>>,
+  calls: Map<Bytes, Map<Int, MemberTarget>>,
 ) -> List<Failure> / {abort.raise} = {
   let refs = before.names.references;
   let wrong = if imports {
@@ -1074,8 +1074,13 @@ fn entry_failures(
   };
   let was = r.calls.get(before.owner).unwrap_or(Map::new());
   let is = calls.get(now.owner).unwrap_or(Map::new());
-  let retargeted = was.fold(0, |n: Int, site: Int, callee: Bytes|
-    if is.get(site) == Some(qualified_after(rn, l, ValueSpace, callee)) { n } else { n + 1 });
+  let retargeted = was.fold(0, |n: Int, site: Int, target: MemberTarget| {
+    let expected = match target {
+      CallsFunction(c) -> CallsFunction(qualified_after(rn, l, ValueSpace, c)),
+      other -> other,
+    };
+    if is.get(site) == Some(expected) { n } else { n + 1 }
+  });
   wrong.map(|x: Reference| moved_failure(r, x)).concat(if retargeted == 0 { [] } else {
     [
       {

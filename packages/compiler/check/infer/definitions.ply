@@ -46,7 +46,9 @@ import compiler.check.resolve.tables (ParsedModule, Binding, ModuleBinding, Decl
 import compiler.check.resolve.scopes (find, of_module)
 import compiler.expand.rewrite.shared (picked_in)
 import compiler.check.resolve.bindings (item_binders)
-import compiler.expand.rewrite (MemberCallee, with_member_calls, Elaborated, elaborated_natives)
+import compiler.expand.rewrite (MemberCallee, WrittenOut, InField, with_member_calls, Elaborated,
+                                elaborated_natives)
+import compiler.check.member (MemberTarget, CallsFunction, CallsField)
 import compiler.emit.layout (intrinsic_named)
 import compiler.emit.c (width_named)
 import compiler.emit.keys (test_owner, law_owner)
@@ -1232,7 +1234,8 @@ fn walked_or_filed(
 /// `sites` being the calls on values the walk of that body wrote out.
 fn lent_refused(checker: Checker, def: FnDef, sites: List<MemberSite>) -> Checker / {abort.raise} =
   if !lent::lends(def) { checker } else {
-    let at = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite| m.insert(x.site, x.callee));
+    let at = sites.fold(Map::new(), |m: Map<Int, MemberTarget>, x: MemberSite|
+      m.insert(x.site, x.callee));
     lent::refusals(checker.module, def, checker.binders, {
       named: |q: QName| lent_target(checker, q),
       member: |s: Span| at.get(s.site),
@@ -1302,7 +1305,7 @@ fn owned_judged(
     || at.fold(false, |found: Bool, k: Int, t: Type| found || resource(t))
     || count_in(b.body, |e: Expr| match e { EHandle(_) -> true, _ -> false }) > 0;
   if !any { { checker: { ..checker, valued: [] }, held: [] } } else {
-    let members = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite|
+    let members = sites.fold(Map::new(), |m: Map<Int, MemberTarget>, x: MemberSite|
       m.insert(x.site, x.callee));
     let taking = |name: Bytes| -> Option<Taking> {
       match checker.takings.get(name) {
@@ -1329,10 +1332,7 @@ fn owned_judged(
             ToUnknown -> None,
           },
         member: |span: Span|
-          match members.get(span.site) {
-            Some(callee) -> if callee.len() == 0 { None } else { taking(callee) },
-            None -> None,
-          },
+          match members.get(span.site) { Some(CallsFunction(n)) -> taking(n), _ -> None },
         op_kept: |eff: QName, op: Ident|
           match resolve_op(checker, eff, op).hit { Some(hit) -> hit.op.kept, None -> [] },
         opened: |t: Type|
@@ -4813,15 +4813,22 @@ pub fn members_in(
 ) -> Map<Bytes, Map<Int, MemberCallee>> =
   all.fold(Map::new(), |acc: Map<Bytes, Map<Int, MemberCallee>>, s: MemberSite|
     if s.module != module { acc } else {
-      let params = match signatures.get(s.callee) { Some(g) -> g.params, None -> [] };
+      let params = match s.callee {
+        CallsFunction(n) -> match signatures.get(n) { Some(g) -> g.params, None -> [] },
+        _ -> [],
+      };
       let sites = match acc.get(s.owner) { Some(m) -> m, None -> Map::new() };
       acc.insert(
         s.owner,
-        sites.insert(s.site, {
-          qualifier: s.qualifier,
-          name: s.name,
-          names: params.map(|p: ParamInfo| p.name),
-          defaults: params.map(|p: ParamInfo| p.default),
+        sites.insert(s.site, match s.callee {
+          CallsField -> InField,
+          _ ->
+            WrittenOut({
+              qualifier: s.qualifier,
+              name: s.name,
+              names: params.map(|p: ParamInfo| p.name),
+              defaults: params.map(|p: ParamInfo| p.default),
+            }),
         }),
       )
     })
