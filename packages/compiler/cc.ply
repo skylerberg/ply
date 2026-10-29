@@ -95,10 +95,19 @@ pub type Toolchain = {
 /// A unit's C cut at its marks: the head every part compiles after, then each part by its label.
 pub type Parts = { head: Bytes, parts: List<{ label: String, text: Bytes }> }
 
-fn bucket_mark() -> Bytes = b"/* --- bucket "
+fn mark_opener() -> Bytes = b"/* --- "
 
-/// The line a unit's runtime part opens with: everything from it on is one part, which defines the
-/// pointers the head declares and what the unit says and lays out for its loader.
+fn part_opener() -> Bytes = b"/* --- part "
+
+fn mark_closer() -> Bytes = b" --- */"
+
+/// The line that opens the part of a unit labelled `label`. `label` holds no newline, as a mark is
+/// one line, and no space, as a manifest parts a label from its digest at a space.
+pub fn part_mark(label: String) -> Bytes =
+  Bytes::concat_all([part_opener(), Bytes::of_string(label), mark_closer()])
+
+/// The line that opens a unit's runtime part, labelled `runtime`, which defines the pointers the
+/// head declares and binds them at load.
 pub fn tail_mark() -> Bytes = b"/* --- the runtime, bound at load --- */"
 
 /// Where `mark` begins a line of `text` at or after `from`.
@@ -107,35 +116,58 @@ fn line_start(text: Bytes, mark: Bytes, from: Int) -> Option<Int> / {abort.raise
     match text.index_of_from(b"\n".concat(mark), from) { Some(at) -> Some(at + 1), None -> None }
   }
 
-/// `text` cut into its head and its parts, the largest first: each bucket from its mark to the
-/// next, labelled by its hex id, and the runtime from its mark, labelled `runtime`. A compile starts
-/// the parts in this order and waits for the oldest it started, so the long ones run beside one
-/// another and hold no short one's place. A text with no marks is all head and an empty runtime
-/// part.
-pub fn split(text: Bytes) -> Parts / {abort.raise} = {
-  let tail_at = match line_start(text, tail_mark(), 0) { Some(at) -> at, None -> text.len() };
-  let starts = iterate(
+/// The label of the part `line` opens, or `None` where it is no mark.
+fn label_of(line: Bytes) -> Option<String> / {abort.raise} =
+  if line == tail_mark() { Some("runtime") }
+  else if line.len() >= part_opener().len() + mark_closer().len() && line.starts_with(part_opener())
+      && line.ends_with(mark_closer()) {
+    Some(String::of_bytes(line.slice(part_opener().len(), line.len() - mark_closer().len())))
+  } else { None }
+
+/// Each mark of `text` in order: where its line starts, and the label of the part it opens.
+fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
+  iterate(
     { from: 0, found: [] },
     text.len() + 1,
-    |s: { from: Int, found: List<Int> }|
-      match line_start(text, bucket_mark(), s.from) {
-        Some(at) -> if at >= tail_at { Stop(s.found) }
-        else { Continue({ from: at + bucket_mark().len(), found: s.found.push(at) }) },
+    |s: { from: Int, found: List<{ at: Int, label: String }> }|
+      match line_start(text, mark_opener(), s.from) {
         None -> Stop(s.found),
+        Some(at) -> {
+          let end = match text.index_of_from(b"\n", at) { Some(e) -> e, None -> text.len() };
+          Continue({
+            from: end,
+            found: match label_of(text.slice(at, end)) {
+              Some(label) -> s.found.push({ at: at, label: label }),
+              None -> s.found,
+            },
+          })
+        },
       },
-  );
-  let buckets = range(0, starts.len()).map(|i: Int| {
-    let start = starts.get(i);
-    let end = match starts.at(i + 1) { Some(next) -> next, None -> tail_at };
-    let at_id = start + bucket_mark().len();
-    { label: String::of_bytes(text.slice(at_id, at_id + 2)), text: text.slice(start, end) }
-  });
-  {
-    head: text.slice(0, match starts.at(0) { Some(first) -> first, None -> tail_at }),
-    parts: buckets.push({ label: "runtime", text: text.slice(tail_at, text.len()) }).sort_by(
-      |a: { label: String, text: Bytes }, b: { label: String, text: Bytes }|
-        a.text.len() > b.text.len(),
-    ),
+  )
+
+/// `text` cut into its head, the text before its first mark, and its parts, the largest first. A
+/// mark is a line [`part_mark`] or [`tail_mark`] wrote, and each part runs from its mark to the next.
+/// A compile starts the parts in this order and waits for the oldest it started, so the long ones
+/// run beside one another and hold no short one's place. A text with no marks is all head and an
+/// empty runtime part. Panics where two parts share a label, which only an emitter's bug makes.
+pub fn split(text: Bytes) -> Parts / {abort.raise} = {
+  let found = marks(text);
+  let labels = found.map(|m: { at: Int, label: String }| m.label).sort();
+  match range(1, labels.len()).find(|i: Int| labels.get(i) == labels.get(i - 1)) {
+    Some(i) -> panic("two parts of a unit are labelled `" ++ labels.get(i) ++ "`"),
+    None -> (),
+  };
+  match found.at(0) {
+    None -> { head: text, parts: [{ label: "runtime", text: b"" }] },
+    Some(first) ->
+      {
+        head: text.slice(0, first.at),
+        parts: range(0, found.len()).map(|i: Int| {
+          let end = match found.at(i + 1) { Some(next) -> next.at, None -> text.len() };
+          { label: found.get(i).label, text: text.slice(found.get(i).at, end) }
+        }).sort_by(|a: { label: String, text: Bytes }, b: { label: String, text: Bytes }|
+          a.text.len() > b.text.len()),
+      },
   }
 }
 
@@ -324,6 +356,10 @@ pub fn holds_sources(sources: List<Source>) -> Bool / {toolchain.read} =
 fn object_of(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
   "obj/" ++ key_of(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
 
+/// The objects of a unit's parts by their paths, in the parts' order, and how many of them this
+/// build compiled: the cache held the rest.
+pub type Objects = { paths: List<String>, compiled: Int }
+
 /// The objects `targets` names, those of `missing` compiled from `inputs`, one each, into place.
 fn compiled<[c]>(
   t: Toolchain,
@@ -332,7 +368,7 @@ fn compiled<[c]>(
   missing: List<Int>,
   inputs: List<String>,
   work: String,
-) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+) -> Result<Objects, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
   let object = |k: Int| work ++ "/" ++ missing.get(k).to_string() ++ ".o";
   let runs = range(0, missing.len()).map(|k: Int|
@@ -349,8 +385,9 @@ fn compiled<[c]>(
       // same one leave one.
       let placed = range(0, missing.len()).fold(true, |ok: Bool, k: Int|
         ok && toolchain.moved(object(k), targets.get(missing.get(k))));
-      if placed { Ok(targets.map(|o: String| cache ++ "/" ++ o)) }
-      else { Err("an object could not be kept in the toolchain's cache") }
+      if placed {
+        Ok({ paths: targets.map(|o: String| cache ++ "/" ++ o), compiled: missing.len() })
+      } else { Err("an object could not be kept in the toolchain's cache") }
     },
   }
 }
@@ -363,12 +400,12 @@ pub fn objects<[c]>(
   parts: Parts,
   flags: List<String>,
   work: String,
-) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+) -> Result<Objects, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
   let sources = sources_of(parts);
   let targets = sources.map(|s: Source| object_of(t, flags, s));
   let missing = range(0, targets.len()).filter(|i: Int| !toolchain.holds(targets.get(i)));
-  let source = |i: Int| work ++ "/" ++ sources.get(i).label ++ ".c";
+  let source = |i: Int| work ++ "/" ++ i.to_string() ++ ".c";
   let written = missing.fold(true, |ok: Bool, i: Int|
     ok && toolchain.written(source(i), parts.head.concat(parts.parts.get(i).text)));
   if !written { Err("the C to compile could not be written to the toolchain's cache") } else {
@@ -383,7 +420,7 @@ pub fn objects_kept<[c]>(
   sources: List<Source>,
   flags: List<String>,
   work: String,
-) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+) -> Result<Objects, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
   let cache = toolchain.cache();
   let targets = sources.map(|s: Source| object_of(t, flags, s));
   let missing = range(0, targets.len()).filter(|i: Int| !toolchain.holds(targets.get(i)));
@@ -525,7 +562,7 @@ pub fn library<[c]>(
           Some(work) -> {
             let built = match objects[c](t, parts, flags, work) {
               Err(why) -> Err(why),
-              Ok(objects) -> shared[c](t, objects, work),
+              Ok(objects) -> shared[c](t, objects.paths, work),
             };
             toolchain.cleared(work);
             built
@@ -709,35 +746,76 @@ extern fn memory_census() -> Bytes / {native.read}
 
 // --- Tests -----------------------------------------------------------------------
 
-fn unit_text() -> Bytes =
-  b"#include <x>\n/* --- bucket 0a --- */\nint a;\n/* --- bucket 1f --- */\nint b;\n\n/* --- the runtime, bound at load --- */\nint r;\n"
+/// The runtime part of [`unit_text`], which holds a comment that is no mark.
+fn runtime_text() -> Bytes =
+  tail_mark().concat(b"\nint r;\n/* --- what the loader reads --- */\nint s;\n")
 
-test "a unit cuts at its marks into a head and its parts, the largest first, which hold all of it" {
+/// A unit's C with parts before and after its runtime part, whose labels in order are
+/// [`unit_labels`].
+fn unit_text() -> Bytes =
+  Bytes::concat_all([
+    b"#include <x>\n",
+    part_mark("0123456789abcdef"),
+    b"\nint a;\n",
+    part_mark("1f"),
+    b"\nint b;\n\n",
+    runtime_text(),
+    part_mark("fields"),
+    b"\nint f[] = { 1, 2, 3 };\n",
+  ])
+
+fn unit_labels() -> List<String> = ["0123456789abcdef", "1f", "runtime", "fields"]
+
+fn part_label(part: { label: String, text: Bytes }) -> String = part.label
+
+test "a unit cuts at every mark, each label read whole, into a head and parts that hold all of it" {
   let p = split(unit_text());
   assert_eq(p.head, b"#include <x>\n");
-  assert_eq(p.parts.map(|x: { label: String, text: Bytes }| x.label), ["runtime", "1f", "0a"]);
-  assert_eq(
-    Bytes::concat_all([p.head, p.parts.get(2).text, p.parts.get(1).text, p.parts.get(0).text]),
-    unit_text(),
-  );
-  assert_eq(p.parts.get(0).text, b"/* --- the runtime, bound at load --- */\nint r;\n")
+  assert_eq(p.parts.map(part_label).sort(), unit_labels().sort());
+  let text_of = |wanted: String|
+    match p.parts.find(|x: { label: String, text: Bytes }| x.label == wanted) {
+      Some(x) -> x.text,
+      None -> b"",
+    };
+  assert_eq(Bytes::concat_all([p.head].concat(unit_labels().map(text_of))), unit_text());
+  // A mark after the tail mark starts a part of its own.
+  assert_eq(text_of("runtime"), runtime_text())
 }
 
-test "parts of one size keep the unit's order" {
-  let p = split(b"/* --- bucket 1f --- */\nint b;\n/* --- bucket 0a --- */\nint a;\n");
-  assert_eq(p.parts.map(|x: { label: String, text: Bytes }| x.label), ["1f", "0a", "runtime"])
+test "parts come largest first, and parts of one size keep the unit's order" {
+  assert(
+    split(unit_text()).parts.map(|x: { label: String, text: Bytes }| 0 - x.text.len()).is_sorted(),
+    None,
+  );
+  let p = split(
+    Bytes::concat_all([part_mark("1f"), b"\nint b;\n", part_mark("0a"), b"\nint a;\n"]),
+  );
+  assert_eq(p.parts.map(part_label), ["1f", "0a"])
 }
 
 test "a text with no marks is all head, beside an empty runtime part" {
-  let p = split(b"int x;\n");
-  assert_eq(p.head, b"int x;\n");
+  let text = b"int x;\n/* --- part of a comment */\nint y;\n";
+  let p = split(text);
+  assert_eq(p.head, text);
   assert_eq(p.parts, [{ label: "runtime", text: b"" }])
+}
+
+test "two parts of one label are an emitter's bug, which names the label" {
+  let said = handle {
+    let _ = split(
+      Bytes::concat_all([part_mark("ab"), b"\nint a;\n", part_mark("ab"), b"\nint b;\n"]),
+    );
+    ""
+  } with {
+    abort.raise(m) -> m,
+  };
+  assert(said.contains("`ab`"), Some(said))
 }
 
 test "a part's source is the digest of its C with the head before it" {
   let p = split(unit_text());
   let sources = sources_of(p);
-  assert_eq(sources.map(|s: Source| s.label), ["runtime", "1f", "0a"]);
+  assert_eq(sources.map(|s: Source| s.label), p.parts.map(part_label));
   assert_eq(sources.get(0).digest, blake3(p.head.concat(p.parts.get(0).text)).hex_of());
   let moved = sources_of({ ..p, head: b"#include <y>\n" });
   assert(moved.get(1).digest != sources.get(1).digest, Some("the head is part of every source"))
@@ -876,6 +954,64 @@ test "a compiler compiles for x86-64 Linux where it preprocesses the probe, and 
   let unkept = probed(false, Ok(0), None);
   assert(!unkept.fits, None);
   assert_eq(unkept.runs, [])
+}
+
+/// What `build` returns where the cache holds just `held` and every compile, write and move
+/// succeeds; and each path it wrote to.
+fn built_over(
+  held: List<String>,
+  build: () -> Result<Objects, String> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise},
+) -> { made: Result<Objects, String>, written: List<String> } / {abort.raise} =
+  handle {
+    build()
+  } with {
+    var written: List<String> = [],
+    compilers.started[cc](args) -> Ok(0),
+    compilers.finished[cc](job) -> None,
+    toolchain.cache() -> "/cache",
+    toolchain.jobs() -> 1,
+    toolchain.holds(path) -> held.contains(path),
+    toolchain.written(path, bytes) -> {
+      written = written.push(path);
+      true
+    },
+    toolchain.moved(from, to) -> true,
+    toolchain.reused() -> panic("a build reads no store"),
+    toolchain.bodies() -> panic("a build reads no store"),
+    toolchain.held(path) -> panic("a build reads nothing back"),
+    toolchain.libraries() -> panic("a build links nothing"),
+    toolchain.appended(path, bytes) -> panic("a build appends nothing"),
+    toolchain.scratch() -> panic("a build is given its room"),
+    toolchain.cleared(dir) -> panic("a build clears nothing"),
+    toolchain.ran(path, args) -> panic("a build runs no program"),
+    return made -> { made: made, written: written },
+  }
+
+test "a build compiles the parts whose objects the cache does not hold, each from C of its own" {
+  let t = toolchain_of({ path: "cc", identity: b"cc 1", support: [] }, "-O2", false);
+  // Two parts share a label, so only a file named by something else keeps their C apart.
+  let parts = {
+    head: b"#include <x>\n",
+    parts: [
+      { label: "a", text: b"int a;\n" },
+      { label: "a", text: b"int b;\n" },
+      { label: "c", text: b"int c;\n" },
+    ],
+  };
+  let sources = sources_of(parts);
+  let targets = sources.map(|s: Source| object_of(t, [], s));
+  let paths = targets.map(|o: String| "/cache/" ++ o);
+  let fresh = built_over([targets.get(2)], || objects[cc](t, parts, [], "work"));
+  assert_eq(fresh.made, Ok({ paths: paths, compiled: 2 }));
+  assert_eq(fresh.written.unique(), fresh.written);
+  assert_eq(fresh.written.len(), 2);
+  assert_eq(built_over(targets, || objects[cc](t, parts, [], "work")), {
+    made: Ok({ paths: paths, compiled: 0 }),
+    written: [],
+  });
+  let kept = built_over([targets.get(0)].concat(sources.map(kept_source)), ||
+    objects_kept[cc](t, sources, [], "work"));
+  assert_eq(kept.made, Ok({ paths: paths, compiled: 2 }))
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
