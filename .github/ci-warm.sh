@@ -11,6 +11,10 @@
 #                         Nothing found, or a download that failed, leaves the run to build.
 # ci-warm.sh handed NAME  likewise the artifact NAME of this run, which `build-ply` packed for the
 #                         run's other jobs
+# ci-warm.sh foreign      the C cache and stages another toolchain's run left, less the stages: each
+#                         file of the C cache is named by what decides it, so it serves any toolchain
+#                         that names it, but a stage's records do not say which compiler wrote them
+#                         (every builder writes `memo-std`)
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
 stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
@@ -64,7 +68,7 @@ case "${1:-}" in
         case "$(basename "$dir")" in
           # Files swept one by one, as `sweep`'s `BY_FILE` takes them: each a runnable or an
           # answer of its own.
-          answered | reused | programs) find "$dir" -type f ! -newer "$mark" -delete ;;
+          answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
           # A stage, and the memo stores, go whole: its `.used` stamp is what a load writes.
           *) [ -n "$(find "$dir" -type f -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
         esac
@@ -101,8 +105,12 @@ case "${1:-}" in
       echo "the stage $name did not come back: this job starts from the cache"
     fi
     ;;
+  foreign)
+    rm -rf "$stage"
+    echo "kept $(megabytes "$cache") MB of another toolchain's C cache, and none of its stages"
+    ;;
   *)
-    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME" >&2
+    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | handed NAME | foreign" >&2
     exit 2
     ;;
 esac
