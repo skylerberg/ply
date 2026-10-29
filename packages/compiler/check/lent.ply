@@ -5,7 +5,7 @@
 //! signature alone, so a callee's body never decides what a caller may lend it.
 
 import compiler.syntax.parsing (Span, Ident, QName, is_bare)
-import compiler.syntax.patterns (Pattern)
+import compiler.syntax.patterns (Pattern, binder_names)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, ETagged,
@@ -14,7 +14,6 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
 import compiler.syntax.items (FnDef)
 import compiler.syntax.type_syntax (TFn, ty_span)
 import compiler.check.resolve.tables (Diag, Edit, error_at, with_fix, insertion, list_names)
-import compiler.check.resolve.sets (pattern_binders)
 import std.list
 
 /// How a function takes what a call passes its parameter `name`: `lent`, a function it may only
@@ -74,7 +73,9 @@ type Local = { lent: List<Bytes>, answers: List<Bytes> }
 
 /// Each local, and `room`, the rounds a `handle`'s answer is read again in, one more than there
 /// are lent parameters, since each round that changes it adds one.
-type Scope = { locals: Map<Bytes, Local>, callees: Callees, room: Int }
+/// Each local by the site of the name that binds it, read through `binders`, the binder of each
+/// local the definition names by the site of the name.
+type Scope = { locals: Map<Int, Local>, binders: Map<Int, Int>, callees: Callees, room: Int }
 
 type Stated = { s: Scope, v: Valued }
 
@@ -86,13 +87,18 @@ pub fn lends(def: FnDef) -> Bool = def.params.any(|p: Param| passed(p).lent)
 
 /// Where `def`'s body would hold a parameter lent to it past its call, each refused as a diagnostic
 /// of the module numbered `module`, the fix for a parameter offered once.
-pub fn refusals(module: Int, def: FnDef, callees: Callees) -> List<Diag> / {abort.raise} =
+pub fn refusals(
+  module: Int,
+  def: FnDef,
+  binders: Map<Int, Int>,
+  callees: Callees,
+) -> List<Diag> / {abort.raise} =
   if !lends(def) { [] } else {
     let lent = def.params.filter(|p: Param| passed(p).lent).map(|p: Param| p.name.name);
     let s = def.params.fold(
-      { locals: Map::new(), callees: callees, room: lent.len() + 1 },
+      { locals: Map::new(), binders: binders, callees: callees, room: lent.len() + 1 },
       |sc: Scope, p: Param|
-        bound(sc, p.name.name, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
+        bound(sc, p.name, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
     );
     held(s, quiet(), def.body, Answered).escapes.fold(
       { diags: [], fixed: [] },
@@ -193,16 +199,18 @@ fn place_text(place: Place) -> Bytes =
   }
 
 fn local(s: Scope, q: QName) -> Option<Local> =
-  if is_bare(q) { s.locals.get(q.name.name) } else { None }
+  if !is_bare(q) { None }
+  else { match s.binders.get(q.name.span.site) { Some(b) -> s.locals.get(b), None -> None } }
 
-fn bound(s: Scope, name: Bytes, lent: List<Bytes>) -> Scope =
+fn bound(s: Scope, name: Ident, lent: List<Bytes>) -> Scope =
   bound_local(s, name, { lent: lent, answers: [] })
 
-fn bound_local(s: Scope, name: Bytes, l: Local) -> Scope = { ..s, locals: s.locals.insert(name, l) }
+fn bound_local(s: Scope, name: Ident, l: Local) -> Scope =
+  { ..s, locals: s.locals.insert(name.span.site, l) }
 
 /// Every binder of `p`, each bound to what the value it takes apart may be.
 fn bound_pattern(s: Scope, p: Pattern, l: Local) -> Scope =
-  pattern_binders(p, []).fold(s, |sc: Scope, n: Bytes| bound_local(sc, n, l))
+  binder_names(p).fold(s, |sc: Scope, n: Ident| bound_local(sc, n, l))
 
 fn params_of(lent: List<Lent>) -> List<Bytes> =
   lent.fold([], |ps: List<Bytes>, l: Lent| ps.push_unique(l.param))
@@ -262,7 +270,7 @@ fn walk(s: Scope, seen: Seen, e: Expr) -> Valued / {abort.raise} =
     EBinary(b) -> plain(spent(s, spent(s, seen, b.lhs), b.rhs)),
     EUnary(u) -> plain(spent(s, seen, u.operand)),
     ELambda(l) -> {
-      let inner = l.params.fold(s, |sc: Scope, p: Param| bound(sc, p.name.name, []));
+      let inner = l.params.fold(s, |sc: Scope, p: Param| bound(sc, p.name, []));
       let body = held(inner, { ..seen, read: [] }, l.body, Answered);
       {
         seen: read({ ..body, read: seen.read }, body.read),
@@ -299,11 +307,7 @@ fn walk(s: Scope, seen: Seen, e: Expr) -> Valued / {abort.raise} =
     },
     EHandle(h) -> handled(s, seen, h.body, h.ret, h.clauses, h.vars),
     EWithHold(w) ->
-      walk(
-        bound(s, w.binder.name, []),
-        spent(s, held(s, seen, w.acquire, Stored), w.release),
-        w.body,
-      ),
+      walk(bound(s, w.binder, []), spent(s, held(s, seen, w.acquire, Stored), w.release), w.body),
     ESimulate(x) -> walk(s, seen, x.body),
     EParallel(p) -> plain(each(s, seen, p.branches, Stored)),
     ETagged(t) -> plain(each(s, seen, t.holes.map(|h: Hole| h.value), Stored)),
@@ -421,8 +425,8 @@ fn statements(s: Scope, seen: Seen, stmts: List<Stmt>) -> Stated / {abort.raise}
 
 /// A clause's scope: its parameters and the label it binds, none of them lent.
 fn clause_scope(s: Scope, c: HandleClause) -> Scope = {
-  let given = c.params.fold(s, |sc: Scope, p: Ident| bound(sc, p.name, []));
-  match c.label_binder { Some(t) -> bound(given, t.name, []), None -> given }
+  let given = c.params.fold(s, |sc: Scope, p: Ident| bound(sc, p, []));
+  match c.label_binder { Some(t) -> bound(given, t, []), None -> given }
 }
 
 /// A `handle`: its value is its body's, or its `return` clause's, or a resuming clause's, and what
@@ -438,10 +442,10 @@ fn handled(
   vars: List<HandlerVar>,
 ) -> Valued / {abort.raise} = {
   let inits = vars.fold({ s: s, seen: seen }, |acc: { s: Scope, seen: Seen }, v: HandlerVar|
-    { s: bound(acc.s, v.name.name, []), seen: held(acc.s, acc.seen, v.init, Stored) });
+    { s: bound(acc.s, v.name, []), seen: held(acc.s, acc.seen, v.init, Stored) });
   let b = walk(s, { ..inits.seen, read: [] }, body);
   let returning = match ret {
-    Some(r) -> bound_local(inits.s, r.binder.name, local_of(b)),
+    Some(r) -> bound_local(inits.s, r.binder, local_of(b)),
     None -> inits.s,
   };
   let caught = clauses.fold(
@@ -458,7 +462,7 @@ fn handled(
     None -> { seen: after, lent: b.lent, answers: b.answers },
   };
   let resumed = |c: HandleClause, k: Ident, answers: List<Bytes>|
-    bound_local(clause_scope(inits.s, c), k.name, { lent: caught, answers: answers });
+    bound_local(clause_scope(inits.s, c), k, { lent: caught, answers: answers });
   let answers = answering(
     clauses,
     resumed,
