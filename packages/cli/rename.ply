@@ -1,0 +1,1310 @@
+//! `ply rename`: renames definitions, locals, operations, fields and modules in many files at once.
+//! Each name is edited where the program's own resolution and check say it is written, and the
+//! renamed program is checked again: the rename is refused unless every name still refers to what
+//! it did.
+
+import std.fs (fs, File, Missing)
+import std.json (Json, Str, Bool, Number, Array, Null, object)
+import std.list
+import std.bytes
+import std.string
+import args (Flags)
+import paths (Rooted, Resolved, child, parent_of, displayed, kind, read_file, write_file,
+              create_dir, move_file, spelled, rooted, here)
+import library
+import std.path (normalize)
+import report (Answer, schema_version, ok_code, compile_error)
+import walk (Failure)
+import sources
+import program (Program, load_program, walked)
+import diagnostic (errors_text)
+import builder (builder)
+import std.random (entropy)
+import std.time (time)
+import compiler.cc (toolchain)
+import compiler.load (Derives)
+import compiler.unit (shipped)
+import compiler.front.facts (Analysis)
+import compiler.front.seam (Refused, Analysed)
+import compiler.check.resolve.tables (Source, ParsedModule, Diag, Decls, Declared, Namespace,
+                                      ValueSpace, TypeSpace, EffectSpace, SetSpace, space,
+                                      namespaces)
+import compiler.check.resolve.bindings (written, Written, Reference, Member, Refers, Local,
+                                        Definition, Operation, Module, Unbound, FieldName,
+                                        CalledName, ArgumentName)
+import compiler.check.infer (item_owner)
+import compiler.check.infer.checker (MemberSite)
+import compiler.syntax.lexer (lex, Token, Comment, Identifier, StringLiteral, LineString,
+                              BytesLiteral, InterpolatedHead, InterpolatedMiddle, InterpolatedTail,
+                              is_ident_start, is_ident_continue)
+import compiler.syntax.items (parse, Module, ImportDecl, IAlias, Item, IEffect, IExtern, OpDef,
+                              member_of, member_name)
+import compiler.syntax.parsing (is_made)
+import compiler.syntax.sites (numbered_module)
+
+type Defined = { file: String, old: Bytes, new: Bytes }
+
+type Moved = { path: String, new: Bytes }
+
+type OperationLine = { file: String, effect_name: Bytes, op: Bytes, new: Bytes }
+
+type Renames = {
+  words: Bool,
+  names: Map<Bytes, Bytes>,
+  defined: List<Defined>,
+  modules: List<Moved>,
+  operations: List<OperationLine>,
+}
+
+type Piece = { text: Bytes, word: Bool }
+
+type Library = { root: Rooted, name: String }
+
+type Applying = { at: Int, parts: List<Bytes> }
+
+fn shown(b: Bytes) -> String = "`" ++ String::of_bytes_lossy(b) ++ "`"
+
+fn is_upper(c: Int) -> Bool = c >= 65 && c <= 90
+
+fn is_lower(c: Int) -> Bool = c >= 97 && c <= 122
+
+fn is_letter(c: Int) -> Bool = is_upper(c) || is_lower(c)
+
+fn is_name(text: Bytes) -> Bool / {abort.raise} =
+  text.len() > 0 && is_ident_start(text.at(0))
+    && !range(0, text.len()).any(|i: Int| !is_ident_continue(text.at(i)))
+
+fn is_word(text: Bytes) -> Bool / {abort.raise} =
+  text.len() > 0 && is_lower(text.at(0))
+    && !range(0, text.len()).any(|i: Int|
+      !(is_lower(text.at(i)) || (text.at(i) >= 48 && text.at(i) <= 57)))
+
+fn is_words(text: Bytes) -> Bool / {abort.raise} = !text.split(b"_").any(|w: Bytes| !is_word(w))
+
+fn fields_of(line: Bytes) -> List<Bytes> / {abort.raise} =
+  [b"\t", b"\r"].fold(line.split(b" "), |parts: List<Bytes>, separator: Bytes|
+    parts.fold([], |acc: List<Bytes>, part: Bytes| acc.concat(part.split(separator)))).filter(
+    |f: Bytes| f != b"",
+  )
+
+fn refusal_of(
+  renames: Renames,
+  taken: Bool,
+  old: Bytes,
+  new: Bytes,
+) -> Option<String> / {abort.raise} =
+  if taken { Some(shown(old) ++ " appears twice") }
+  else if renames.words && !(is_word(old) && is_words(new)) {
+    Some(
+      "with `--words`, an old word is lowercase letters and digits, and a new one is such words joined by `_`",
+    )
+  } else if !renames.words && !(is_name(old) && is_name(new)) {
+    Some(shown(old) ++ " and " ++ shown(new) ++ " must both be valid names")
+  } else { None }
+
+fn names_module(field: Bytes) -> Bool = field.ends_with(b".ply") || field.ends_with(b"/")
+
+fn with_line(renames: Renames, fields: List<Bytes>) -> Result<Renames, String> / {abort.raise} =
+  if fields.len() == 2 && names_module(fields.get(0)) {
+    let path = String::of_bytes_lossy(fields.get(0));
+    if renames.words { Err("`--words` renames words, not modules") }
+    else if renames.modules.any(|m: Moved| m.path == path) { Err(path ++ " appears twice") }
+    else if !is_name(fields.get(1)) { Err(shown(fields.get(1)) ++ " is not a valid module name") }
+    else { Ok({ ..renames, modules: renames.modules.push({ path: path, new: fields.get(1) }) }) }
+  } else if fields.len() == 2 {
+    let old = fields.get(0);
+    let taken = renames.names.contains(old) || renames.defined.any(|d: Defined| d.old == old);
+    match refusal_of(renames, taken, old, fields.get(1)) {
+      Some(why) -> Err(why),
+      None -> Ok({ ..renames, names: renames.names.insert(old, fields.get(1)) }),
+    }
+  } else if fields.len() == 3 && !renames.words && fields.get(1).index_of(b".") != None {
+    let file = String::of_bytes_lossy(fields.get(0));
+    let parts = fields.get(1).split(b".");
+    if parts.len() != 2 || !is_name(parts.get(0)) || !is_name(parts.get(1))
+        || !is_name(fields.get(2)) {
+      Err(
+        shown(fields.get(1)) ++ " must be an effect and one of its operations, like `fs.read_file`",
+      )
+    } else if renames.operations.any(|o: OperationLine|
+        o.file == file && o.effect_name == parts.get(0) && o.op == parts.get(1)) {
+      Err(shown(fields.get(1)) ++ " appears twice")
+    } else {
+      Ok({
+        ..renames,
+        operations: renames.operations.push({
+          file: file,
+          effect_name: parts.get(0),
+          op: parts.get(1),
+          new: fields.get(2),
+        }),
+      })
+    }
+  } else if fields.len() == 3 && !renames.words {
+    let file = String::of_bytes_lossy(fields.get(0));
+    let old = fields.get(1);
+    let taken = renames.names.contains(old)
+      || renames.defined.any(|d: Defined| d.old == old && d.file == file);
+    match refusal_of(renames, taken, old, fields.get(2)) {
+      Some(why) -> Err(why),
+      None ->
+        Ok({
+          ..renames,
+          defined: renames.defined.push({
+            file: String::of_bytes_lossy(fields.get(0)),
+            old: fields.get(1),
+            new: fields.get(2),
+          }),
+        }),
+    }
+  } else {
+    Err(
+      "each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+    )
+  }
+
+fn renames_of(text: Bytes, words: Bool) -> Result<Renames, String> / {abort.raise} = {
+  let lines = text.split(b"\n");
+  range(0, lines.len()).fold(
+    Ok({ words: words, names: Map::new(), defined: [], modules: [], operations: [] }),
+    |acc: Result<Renames, String>, i: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(renames) -> {
+          let fields = fields_of(lines.get(i));
+          if fields.len() == 0 { acc } else {
+            match with_line(renames, fields) {
+              Ok(r) -> Ok(r),
+              Err(why) -> Err("line " ++ (i + 1).to_string() ++ ": " ++ why),
+            }
+          }
+        },
+      },
+  )
+}
+
+fn breaks_at(name: Bytes, i: Int) -> Bool / {abort.raise} = {
+  let c = name.at(i);
+  let before = name.at(i - 1);
+  if is_letter(c) != is_letter(before) || c == 95 != (before == 95) { true }
+  else if is_lower(before) && is_upper(c) { true }
+  else { is_upper(before) && is_upper(c) && i + 1 < name.len() && is_lower(name.at(i + 1)) }
+}
+
+fn pieces_of(name: Bytes) -> List<Piece> / {abort.raise} = {
+  let bounds = [0].concat(range(1, name.len()).filter(|i: Int| breaks_at(name, i))).push(
+    name.len(),
+  );
+  range(0, bounds.len() - 1).map(|k: Int| {
+    let text = name.slice(bounds.get(k), bounds.get(k + 1));
+    { text: text, word: is_letter(text.at(0)) }
+  })
+}
+
+fn mapped_bytes(text: Bytes, change: (Int) -> Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, text.len()).map(|i: Int| byte_of_int(change(text.at(i)))))
+
+fn lower(text: Bytes) -> Bytes / {abort.raise} =
+  mapped_bytes(text, |c: Int| if is_upper(c) { c + 32 } else { c })
+
+fn upper(text: Bytes) -> Bytes / {abort.raise} =
+  mapped_bytes(text, |c: Int| if is_lower(c) { c - 32 } else { c })
+
+fn capitalized(word: Bytes) -> Bytes / {abort.raise} =
+  upper(word.slice(0, 1)).concat(word.slice(1, word.len()))
+
+fn joined(words: List<Bytes>, separator: Bytes) -> Bytes =
+  words.fold(b"", |acc: Bytes, w: Bytes|
+    if acc == b"" { w } else { Bytes::concat_all([acc, separator, w]) })
+
+fn written_as(piece: Bytes, words: List<Bytes>, shouting: Bool) -> Bytes / {abort.raise} =
+  if is_lower(piece.at(0)) { joined(words, b"_") }
+  else if shouting { joined(words.map(upper), b"_") }
+  else { Bytes::concat_all(words.map(capitalized)) }
+
+fn renamed(renames: Renames, name: Bytes) -> Bytes / {abort.raise} =
+  if !renames.words { match renames.names.get(name) { Some(n) -> n, None -> name } } else {
+    let shouting = !range(0, name.len()).any(|i: Int| is_lower(name.at(i)));
+    Bytes::concat_all(
+      pieces_of(name).map(|p: Piece|
+        if !p.word { p.text } else {
+          match renames.names.get(lower(p.text)) {
+            Some(replacement) -> written_as(p.text, replacement.split(b"_"), shouting),
+            None -> p.text,
+          }
+        }),
+    )
+  }
+
+fn is_text(t: Token) -> Bool =
+  match t.kind {
+    StringLiteral(_) -> true,
+    LineString(_) -> true,
+    BytesLiteral(_) -> true,
+    InterpolatedHead(_) -> true,
+    InterpolatedMiddle(_) -> true,
+    InterpolatedTail(_) -> true,
+    _ -> false,
+  }
+
+fn name_bytes() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+fn line_at(text: Bytes, at: Int) -> Int / {abort.raise} = text.slice(0, at).split(b"\n").len()
+
+fn spelled_names(text: Bytes) -> List<{ start: Int, name: Bytes }> / {abort.raise} =
+  range(0, text.len()).filter(|i: Int|
+    is_ident_start(text.at(i)) && (i == 0 || !is_ident_continue(text.at(i - 1)))).map(|i: Int|
+    { start: i, name: text.slice(i, text.skip(i, name_bytes())) })
+
+/// Each string in a file that holds a renamed name as a whole word, once per string and name.
+fn mentions_in(
+  path: String,
+  text: Bytes,
+  tokens: List<Token>,
+  olds: Map<Bytes, Bool>,
+) -> List<Mention> / {abort.raise} =
+  tokens.filter(is_text).fold([], |acc: List<Mention>, t: Token|
+    spelled_names(text.slice(t.start, t.end)).fold(
+      { seen: Map::new(), found: acc },
+      |s: { seen: Map<Bytes, Bool>, found: List<Mention> }, n: { start: Int, name: Bytes }|
+        if !olds.contains(n.name) || s.seen.contains(n.name) { s } else {
+          {
+            seen: s.seen.insert(n.name, true),
+            found: s.found.push({
+              path: path,
+              line: line_at(text, t.start + n.start),
+              name: n.name,
+            }),
+          }
+        },
+    ).found)
+
+/// Each string in a file that holds the full name of a module that moves.
+fn module_mentions(
+  path: String,
+  text: Bytes,
+  tokens: List<Token>,
+  names: List<Bytes>,
+) -> List<Mention> / {abort.raise} =
+  tokens.filter(is_text).fold([], |acc: List<Mention>, t: Token| {
+    let inside = text.slice(t.start, t.end);
+    names.fold(acc, |found: List<Mention>, name: Bytes|
+      match inside.index_of(name) {
+        Some(at) -> found.push({ path: path, line: line_at(text, t.start + at), name: name }),
+        None -> found,
+      })
+  })
+
+fn module_path(file: Rooted, package: Rooted) -> String / {abort.raise} =
+  file.path.slice(if package.path == "" { 0 } else { package.path.len() + 1 }, file.path.len() - 4)
+
+fn in_root(path: String, at: Rooted) -> String / {abort.raise} =
+  if at.label == "abs" && path.starts_with("/") { path.slice(1, path.len()) } else { path }
+
+fn package_of(
+  file: Rooted,
+  libraries: List<Library>,
+) -> Option<Rooted> / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+  let parts = file.path.split("/");
+  match range(0, parts.len()).map(|k: Int| parts.len() - 1 - k).map(|k: Int|
+      { label: file.label, path: String::join(parts.take(k), "/") }).find(|dir: Rooted|
+      kind(child(dir, "ply.pkg")) == File) {
+    Some(package) -> Some(package),
+    None ->
+      libraries.find(|l: Library|
+        l.root.label == file.label && file.path.starts_with(l.root.path ++ "/")).map(
+        |l: Library| l.root,
+      ),
+  }
+}
+
+fn libraries_of(
+  given: List<Resolved>,
+) -> List<Library> / {fs.resolved[abs], fs.read_file[abs], abort.raise} =
+  given.fold([], |acc: List<Library>, r: Resolved|
+    match library::part_of(r.absolute) {
+      Some(part) -> if normalize(r.absolute) == part.dir {
+        acc.push({ root: rooted(r), name: part.prefix })
+      } else { acc },
+      None -> acc,
+    })
+
+fn applied(text: Bytes, edits: List<Edit>) -> Bytes / {abort.raise} = {
+  let done = edits.sort_by_key(|e: Edit| e.start).fold(
+    { at: 0, parts: [] },
+    |s: Applying, e: Edit|
+      { at: e.end, parts: s.parts.push(text.slice(s.at, e.start)).push(e.text) },
+  );
+  Bytes::concat_all(done.parts.push(text.slice(done.at, text.len())))
+}
+
+// --- What the programs read --------------------------------------------------
+
+/// One item of a file, or the file's imports: what it writes, and the owner its item's check files
+/// what it found under.
+type Entry = { owner: Bytes, names: Written }
+
+/// A file the rename edits, as its program's check reads it: its module's index and name; what its
+/// imports and each item write, read from its text as written; what each call on a value calls, by
+/// its item's owner and the call's site, empty where it calls the function a field holds; each
+/// import's target module; the names it declares `extern`; and each effect it declares, with its
+/// operations.
+type Read = {
+  file: sources::File,
+  index: Int,
+  name: Bytes,
+  entries: List<Entry>,
+  calls: Map<Bytes, Map<Int, Bytes>>,
+  imports: List<{ decl: ImportDecl, target: Bytes }>,
+  externs: Map<Bytes, Bool>,
+  effects: List<{ name: Bytes, ops: List<Bytes> }>,
+}
+
+/// A program the rename loaded: what its load read, the path it was loaded for, each module's name
+/// and declarations as its check read them, and each of its files the rename edits.
+type Loaded = {
+  program: Program,
+  root: String,
+  names: List<Bytes>,
+  declarations: List<Decls>,
+  reads: List<Read>,
+}
+
+fn calls_of(a: Analysis, index: Int) -> Map<Bytes, Map<Int, Bytes>> =
+  a.checked.facts.elaboration.members.fold(
+    Map::new(),
+    |acc: Map<Bytes, Map<Int, Bytes>>, s: MemberSite|
+      if s.module != index { acc }
+      else { acc.insert(s.owner, acc.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)) },
+  )
+
+/// The entries of `tree`, the module at `index` named `name` as written: its imports', then each
+/// item's.
+fn entries_of(a: Analysis, index: Int, name: Bytes, tree: Module) -> List<Entry> / {abort.raise} = {
+  let names = written(a.r, index, tree);
+  range(0, names.len()).map(|k: Int|
+    {
+      owner: if k == 0 { b"" } else { item_owner(name, tree.items.get(k - 1)) },
+      names: names.get(k),
+    })
+}
+
+fn read_of(a: Analysis, file: sources::File) -> Option<Read> / {abort.raise} = {
+  let name = Bytes::of_string(file.module);
+  match range(0, a.mods.len()).find(|i: Int| a.mods.get(i).name == name) {
+    None -> None,
+    Some(index) -> {
+      let tree = numbered_module(parse(file.text).node);
+      let targets = a.r.imports.get(index);
+      Some({
+        file: file,
+        index: index,
+        name: name,
+        entries: entries_of(a, index, name, tree),
+        calls: calls_of(a, index),
+        imports: range(0, tree.imports.len()).fold(
+          [],
+          |acc: List<{ decl: ImportDecl, target: Bytes }>, k: Int|
+            match targets.at(k) {
+              Some(t) -> acc.push({ decl: tree.imports.get(k), target: a.mods.get(t).name }),
+              None -> acc,
+            },
+        ),
+        externs: tree.items.fold(Map::new(), |acc: Map<Bytes, Bool>, item: Item|
+          match item { IExtern(x) -> acc.insert(x.name.name, true), _ -> acc }),
+        effects: tree.items.fold([], |acc: List<{ name: Bytes, ops: List<Bytes> }>, item: Item|
+          match item {
+            IEffect(e) -> acc.push({ name: e.name.name, ops: e.ops.map(|op: OpDef| op.name.name) }),
+            _ -> acc,
+          }),
+      })
+    },
+  }
+}
+
+fn under(at: Rooted, root: Rooted) -> Bool =
+  at.label == root.label
+    && (root.path == "" || root.path == "." || at.path == root.path
+    || at.path.starts_with(root.path ++ "/"))
+
+/// Each program a path names, loaded and checked with every body walked, but one whose files an
+/// earlier path's program already holds; and each program that does not check.
+fn loads_of(
+  given: List<Resolved>,
+) -> { loads: List<Loaded>, failures: List<Failure> } / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let roots = given.map(rooted);
+  given.fold(
+    { loads: [], failures: [] },
+    |acc: { loads: List<Loaded>, failures: List<Failure> }, path: Resolved| {
+      let root = rooted(path);
+      if acc.loads.any(|l: Loaded| l.program.files.any(|f: sources::File| under(f.at, root))) {
+        acc
+      } else {
+        // The shipped modules are read whole: a cut to what the program reaches is by name.
+        let program = load_program([path], interfaced: false);
+        let refused = |ds: List<Diag>|
+          {
+            ..acc,
+            failures: acc.failures.push({
+              path: displayed(root),
+              why: "does not check: " ++ errors_text(ds),
+            }),
+          };
+        match program.frame {
+          None -> refused(program.diags),
+          Some(_) -> match walked(program, program.sources, program.shipping).out {
+            Refused(ds) -> refused(ds),
+            Analysed(a) ->
+              {
+                ..acc,
+                loads: acc.loads.push({
+                  program: program,
+                  root: displayed(root),
+                  names: a.mods.map(|m: ParsedModule| m.name),
+                  declarations: a.r.declarations,
+                  reads: program.files.filter(|f: sources::File|
+                    roots.any(|r: Rooted| under(f.at, r))).fold(
+                    [],
+                    |reads: List<Read>, f: sources::File|
+                      match read_of(a, f) { Some(r) -> reads.push(r), None -> reads },
+                  ),
+                }),
+              },
+          },
+        }
+      }
+    },
+  )
+}
+
+// --- What the map renames -----------------------------------------------------
+
+/// A value per program-wide name, in each namespace.
+type Spaces = {
+  values: Map<Bytes, Bytes>,
+  types: Map<Bytes, Bytes>,
+  effects: Map<Bytes, Bytes>,
+  sets: Map<Bytes, Bytes>,
+}
+
+fn no_spaces() -> Spaces =
+  { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
+
+fn in_space(s: Spaces, namespace: Namespace) -> Map<Bytes, Bytes> =
+  match namespace {
+    ValueSpace -> s.values,
+    TypeSpace -> s.types,
+    EffectSpace -> s.effects,
+    SetSpace -> s.sets,
+  }
+
+fn with_entry(s: Spaces, namespace: Namespace, key: Bytes, value: Bytes) -> Spaces =
+  match namespace {
+    ValueSpace -> { ..s, values: s.values.insert(key, value) },
+    TypeSpace -> { ..s, types: s.types.insert(key, value) },
+    EffectSpace -> { ..s, effects: s.effects.insert(key, value) },
+    SetSpace -> { ..s, sets: s.sets.insert(key, value) },
+  }
+
+type ModuleMove = { to: Rooted, name: Bytes }
+
+/// What the map comes to over the loaded programs: each definition's new name, by its namespace
+/// and program-wide name; each effect's operations' new names; each module's new name and file, by
+/// its name; and the functions the edited files declare, whose parameters a named argument names.
+type Renaming = {
+  renames: Renames,
+  definitions: Spaces,
+  operations: Map<Bytes, Map<Bytes, Bytes>>,
+  modules: Map<Bytes, ModuleMove>,
+  declared: Map<Bytes, Bool>,
+  refusals: List<Failure>,
+}
+
+/// `name`'s new name, declared in `file`: as a line naming the file renames it, else as the map
+/// renames every name spelled so.
+fn simple_name(renames: Renames, file: String, name: Bytes) -> Bytes / {abort.raise} =
+  match renames.defined.find(|d: Defined| d.file == file && d.old == name) {
+    Some(d) -> d.new,
+    None -> renamed(renames, name),
+  }
+
+/// The new name of the definition `decls` declares as `name` in `file`. A function of a type the
+/// module declares takes the type's new name too.
+fn declared_name(
+  renames: Renames,
+  file: String,
+  decls: Decls,
+  name: Bytes,
+) -> Bytes / {abort.raise} =
+  match member_of(name) {
+    Some(m) ->
+      member_name(
+        if space(decls, TypeSpace).any(|d: Declared| d.name == m.of) {
+          simple_name(renames, file, m.of)
+        } else { m.of },
+        simple_name(renames, file, m.member),
+      ),
+    None -> simple_name(renames, file, name),
+  }
+
+fn own_part(name: Bytes) -> Bytes / {abort.raise} =
+  match member_of(name) { Some(m) -> m.member, None -> name }
+
+fn extern_refusal(path: String, name: Bytes) -> Failure / {abort.raise} =
+  {
+    path: path,
+    why: shown(own_part(name)) ++ " is declared with `extern`, so code outside Ply uses that name",
+  }
+
+fn with_definitions(rn: Renaming, r: Read, decls: Decls) -> Renaming / {abort.raise} = {
+  let path = displayed(r.file.at);
+  namespaces().fold(rn, |acc: Renaming, namespace: Namespace|
+    space(decls, namespace).fold(acc, |into: Renaming, d: Declared| {
+      let new = declared_name(rn.renames, path, decls, d.name);
+      let seen = if namespace == ValueSpace { into.declared.insert(d.qualified, true) }
+      else { into.declared };
+      if new == d.name { { ..into, declared: seen } } else if r.externs.contains(d.name) {
+        { ..into, declared: seen, refusals: into.refusals.push(extern_refusal(path, d.name)) }
+      } else {
+        {
+          ..into,
+          declared: seen,
+          definitions: with_entry(into.definitions, namespace, d.qualified, new),
+        }
+      }
+    }))
+}
+
+fn with_operations(rn: Renaming, r: Read, decls: Decls) -> Renaming / {abort.raise} = {
+  let path = displayed(r.file.at);
+  r.effects.fold(rn, |acc: Renaming, e: { name: Bytes, ops: List<Bytes> }|
+    match space(decls, EffectSpace).find(|d: Declared| d.name == e.name) {
+      None -> acc,
+      Some(declared) ->
+        e.ops.fold(acc, |into: Renaming, op: Bytes| {
+          let new = match rn.renames.operations.find(|o: OperationLine|
+              o.file == path && o.effect_name == e.name && o.op == op) {
+            Some(o) -> o.new,
+            None -> renamed(rn.renames, op),
+          };
+          if new == op { into } else {
+            {
+              ..into,
+              operations: into.operations.insert(
+                declared.qualified,
+                into.operations.get(declared.qualified).unwrap_or(Map::new()).insert(op, new),
+              ),
+            }
+          }
+        }),
+    })
+}
+
+/// Where `r`'s module moves, its file within `package`: a line naming the file or a directory above
+/// it renames that part, and the map renames every part spelled as an old name. Its name follows,
+/// part for part.
+fn with_move(rn: Renaming, r: Read, package: Rooted) -> Renaming / {abort.raise} = {
+  let at = r.file.at;
+  let parts = module_path(at, package).split("/");
+  let base = if package.path == "" { "" } else { package.path ++ "/" };
+  let lined = rn.renames.modules.fold(parts, |acc: List<String>, m: Moved| {
+    let path = in_root(m.path, at);
+    let index = if !path.ends_with("/") { if path == at.path { parts.len() - 1 } else { -1 } }
+    else if at.path.starts_with(path) && path.starts_with(base) {
+      path.slice(base.len(), path.len() - 1).split("/").len() - 1
+    } else { -1 };
+    if index < 0 { acc }
+    else { acc.take(index).push(String::of_bytes_lossy(m.new)).concat(acc.drop(index + 1)) }
+  });
+  let new = lined.map(|part: String|
+    String::of_bytes_lossy(renamed(rn.renames, Bytes::of_string(part))));
+  let named = r.name.split(b".");
+  let kept = named.len() - parts.len();
+  if new == parts { rn } else if kept < 0 || named.drop(kept) != parts.map(Bytes::of_string) {
+    {
+      ..rn,
+      refusals: rn.refusals.push({
+        path: displayed(at),
+        why: "its module's name, " ++ shown(r.name) ++ ", does not follow its file's path",
+      }),
+    }
+  } else {
+    {
+      ..rn,
+      modules: rn.modules.insert(r.name, {
+        to: child(package, String::join(new, "/") ++ ".ply"),
+        name: joined(named.take(kept).concat(new.map(Bytes::of_string)), b"."),
+      }),
+    }
+  }
+}
+
+fn renaming_of(
+  renames: Renames,
+  loads: List<Loaded>,
+  libraries: List<Library>,
+) -> Renaming / {fs.kind[cwd], fs.kind[abs], abort.raise} =
+  loads.fold(
+    {
+      renames: renames,
+      definitions: no_spaces(),
+      operations: Map::new(),
+      modules: Map::new(),
+      declared: Map::new(),
+      refusals: [],
+    },
+    |acc: Renaming, l: Loaded|
+      l.reads.fold(acc, |rn: Renaming, r: Read| {
+        let decls = l.declarations.get(r.index);
+        let named = with_operations(with_definitions(rn, r, decls), r, decls);
+        match package_of(r.file.at, libraries) {
+          Some(package) -> with_move(named, r, package),
+          None -> named,
+        }
+      }),
+  )
+
+// --- The edits ----------------------------------------------------------------
+
+/// Text in place of `start` to `end`, writing the names `names`.
+type Edit = { start: Int, end: Int, text: Bytes, names: List<Bytes> }
+
+/// A file's edits; each name it writes, by the new names it is given and whether it is kept
+/// anywhere, which says whether a comment's mention of it follows; and what is wrong with them.
+type Edited = {
+  edits: List<Edit>,
+  renamed: Map<Bytes, List<Bytes>>,
+  kept: Map<Bytes, Bool>,
+  failures: List<Failure>,
+}
+
+/// What a module qualifier `text`, naming the module at `m`, becomes: the last part of its new
+/// name, unless an alias binds it.
+fn qualifier_new(rn: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes / {abort.raise} =
+  match l.names.at(m) {
+    None -> text,
+    Some(name) -> match rn.modules.get(name) {
+      None -> text,
+      Some(move) -> if r.imports.any(|i: { decl: ImportDecl, target: Bytes }|
+          match i.decl.kind { IAlias(a) -> a.name == text, _ -> false }) { text }
+      else { move.name.split(b".").at(move.name.split(b".").len() - 1).unwrap_or(text) },
+    },
+  }
+
+fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
+  match x.refers {
+    Local(_) -> renamed(rn.renames, x.name),
+    Definition(d) -> match in_space(rn.definitions, d.namespace).get(d.qualified) {
+      Some(n) -> if member_of(x.name) != None { n } else { own_part(n) },
+      None -> x.name,
+    },
+    Operation(o) -> match rn.operations.get(o.effect) {
+      Some(ops) -> ops.get(o.name).unwrap_or(x.name),
+      None -> x.name,
+    },
+    Module(m) -> qualifier_new(rn, l, r, x.name, m),
+    Unbound -> x.name,
+  }
+
+/// What a member `m` of the item `owner` becomes. A call on a value with no member site calls the
+/// function a field holds, so its name is a field's.
+fn member_new(rn: Renaming, r: Read, owner: Bytes, m: Member) -> Bytes / {abort.raise} = {
+  let calls = r.calls.get(owner).unwrap_or(Map::new());
+  match m.kind {
+    FieldName -> renamed(rn.renames, m.name),
+    CalledName(call) -> match calls.get(call) {
+      None -> renamed(rn.renames, m.name),
+      Some(callee) -> if callee.len() == 0 { renamed(rn.renames, m.name) } else {
+        match rn.definitions.values.get(callee) {
+          None -> m.name,
+          Some(n) -> match member_of(m.name) {
+            Some(w) -> member_name(w.of, own_part(n)),
+            None -> own_part(n),
+          },
+        }
+      },
+    },
+    ArgumentName(a) -> {
+      let callee = match calls.get(a.call) {
+        Some(c) -> c,
+        None -> match a.callee { Definition(d) -> d.qualified, _ -> b"" },
+      };
+      if rn.declared.contains(callee) { renamed(rn.renames, m.name) } else { m.name }
+    },
+  }
+}
+
+fn parts_of(name: Bytes) -> List<Bytes> / {abort.raise} =
+  match member_of(name) { Some(m) -> [m.of, m.member], None -> [name] }
+
+/// `edited` with the name `name`, written from `start` to `end`, given `new`.
+fn noted_edit(
+  edited: Edited,
+  text: Bytes,
+  path: String,
+  start: Int,
+  end: Int,
+  name: Bytes,
+  new: Bytes,
+) -> Edited / {abort.raise} =
+  if new == name { { ..edited, kept: edited.kept.insert(name, true) } }
+  else if text.slice(start, end) != name {
+    {
+      ..edited,
+      failures: edited.failures.push({
+        path: path ++ ":" ++ line_at(text, start).to_string(),
+        why: shown(name) ++ " is not written where its program's check places it",
+      }),
+    }
+  } else {
+    let olds = edited.renamed.get(name).unwrap_or([]);
+    {
+      ..edited,
+      edits: edited.edits.push({ start: start, end: end, text: new, names: parts_of(new) }),
+      renamed: edited.renamed.insert(name, if olds.contains(new) { olds } else { olds.push(new) }),
+    }
+  }
+
+fn import_edits(rn: Renaming, r: Read) -> List<Edit> / {abort.raise} =
+  r.imports.fold([], |acc: List<Edit>, i: { decl: ImportDecl, target: Bytes }|
+    match rn.modules.get(i.target) {
+      None -> acc,
+      Some(move) -> {
+        let old = i.target.split(b".");
+        let new = move.name.split(b".");
+        let offset = old.len() - i.decl.path.len();
+        if offset < 0 { acc } else {
+          range(0, i.decl.path.len()).fold(acc, |edits: List<Edit>, j: Int|
+            match ((old.at(offset + j), new.at(offset + j))) {
+              (Some(before), Some(after)) -> if before == after { edits } else {
+                let part = i.decl.path.get(j);
+                edits.push({
+                  start: part.span.start,
+                  end: part.span.end,
+                  text: after,
+                  names: [after],
+                })
+              },
+              _ -> edits,
+            })
+        }
+      },
+    })
+
+fn edited_of(rn: Renaming, l: Loaded, r: Read) -> Edited / {abort.raise} = {
+  let text = r.file.text;
+  let path = displayed(r.file.at);
+  r.entries.fold(
+    { edits: import_edits(rn, r), renamed: Map::new(), kept: Map::new(), failures: [] },
+    |acc: Edited, e: Entry| {
+      let fields = e.names.members.fold(Map::new(), |m: Map<Int, Bytes>, x: Member|
+        match x.kind { FieldName -> m.insert(x.start, member_new(rn, r, e.owner, x)), _ -> m });
+      let shorthands = e.names.references.fold(Map::new(), |m: Map<Int, Bool>, x: Reference|
+        if x.shorthand { m.insert(x.start, true) } else { m });
+      let referred = e.names.references.fold(acc, |done: Edited, x: Reference|
+        if is_made(x.site) { done } else {
+          let new = reference_new(rn, l, r, x);
+          let field = fields.get(x.start).unwrap_or(x.name);
+          if x.shorthand && field != new {
+            // `{ x }` whose field and value part ways is written out as `field: value`.
+            {
+              ..done,
+              kept: done.kept.insert(x.name, true),
+              edits: done.edits.push({
+                start: x.start,
+                end: x.end,
+                text: Bytes::concat_all([field, b": ", new]),
+                names: [field, new],
+              }),
+            }
+          } else { noted_edit(done, text, path, x.start, x.end, x.name, new) }
+        });
+      e.names.members.fold(referred, |done: Edited, x: Member|
+        if shorthands.contains(x.start) { done } else {
+          noted_edit(done, text, path, x.start, x.end, x.name, member_new(rn, r, e.owner, x))
+        })
+    },
+  )
+}
+
+/// The edits naming a renamed name inside backticks in a comment, where every use of the name in
+/// the file takes the one new name.
+fn comment_edits(
+  text: Bytes,
+  comments: List<Comment>,
+  edited: Edited,
+) -> List<Edit> / {abort.raise} =
+  comments.fold([], |acc: List<Edit>, c: Comment| {
+    let body = text.slice(c.start, c.end);
+    let ticks = range(0, body.len()).filter(|i: Int| body.at(i) == 96);
+    range(0, ticks.len() / 2).fold(acc, |edits: List<Edit>, k: Int| {
+      let from = c.start + ticks.get(2 * k) + 1;
+      let lexed = lex(text.slice(from, c.start + ticks.get(2 * k + 1)));
+      if lexed.diags.len() > 0 { edits } else {
+        lexed.tokens.fold(edits, |done: List<Edit>, t: Token|
+          match t.kind {
+            Identifier(n) -> match edited.renamed.get(n) {
+              Some([new]) -> if edited.kept.contains(n) { done } else {
+                done.push({ start: from + t.start, end: from + t.end, text: new, names: [] })
+              },
+              _ -> done,
+            },
+            _ -> done,
+          })
+      }
+    })
+  })
+
+fn keyword_refusal(new: Bytes) -> Option<Failure> / {abort.raise} =
+  match lex(new).tokens.at(0) {
+    Some(t) -> match t.kind {
+      Identifier(n) -> if n == new { None }
+      else { Some({ path: "", why: shown(new) ++ " is not a valid name" }) },
+      _ -> Some({ path: "", why: shown(new) ++ " is a keyword" }),
+    },
+    None -> Some({ path: "", why: shown(new) ++ " is not a valid name" }),
+  }
+
+// --- Checking the renamed program ---------------------------------------------
+
+/// How a program before the renames maps onto it after them: each module's index after, by its
+/// name before; each definition's program-wide name after, by its name before, as its module
+/// declares them in order; and each module whose declarations no longer pair.
+type Mapping = { modules: Map<Bytes, Int>, pairs: Spaces, failures: List<Failure> }
+
+fn paired(acc: Mapping, before: Decls, after: Decls, name: Bytes) -> Mapping / {abort.raise} =
+  namespaces().fold(acc, |m: Mapping, namespace: Namespace| {
+    let was = space(before, namespace);
+    let is = space(after, namespace);
+    if was.len() != is.len() {
+      {
+        ..m,
+        failures: m.failures.push({
+          path: String::of_bytes_lossy(name),
+          why: "two of its definitions would have the same name",
+        }),
+      }
+    } else {
+      range(0, was.len()).fold(m, |into: Mapping, k: Int|
+        {
+          ..into,
+          pairs: with_entry(into.pairs, namespace, was.get(k).qualified, is.get(k).qualified),
+        })
+    }
+  })
+
+fn mapping_of(l: Loaded, after: Analysis, texts: Map<Bytes, Source>) -> Mapping / {abort.raise} = {
+  let index = range(0, after.mods.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
+    m.insert(after.mods.get(i).name, i));
+  range(0, l.names.len()).fold(
+    { modules: Map::new(), pairs: no_spaces(), failures: [] },
+    |acc: Mapping, i: Int| {
+      let old = l.names.get(i);
+      let new = match texts.get(old) { Some(t) -> t.name, None -> old };
+      match index.get(new) {
+        None -> acc,
+        Some(j) ->
+          paired(
+            { ..acc, modules: acc.modules.insert(old, j) },
+            l.declarations.get(i),
+            after.r.declarations.get(j),
+            old,
+          ),
+      }
+    },
+  )
+}
+
+/// What `refers`, in the program before the renames, refers to after them.
+fn mapped(rn: Renaming, l: Loaded, m: Mapping, refers: Refers) -> Refers / {abort.raise} =
+  match refers {
+    Local(b) -> Local(b),
+    Definition(d) ->
+      Definition({
+        qualified: in_space(m.pairs, d.namespace).get(d.qualified).unwrap_or(d.qualified),
+        namespace: d.namespace,
+      }),
+    Operation(o) ->
+      Operation({
+        effect: m.pairs.effects.get(o.effect).unwrap_or(o.effect),
+        name: match rn.operations.get(o.effect) {
+          Some(ops) -> ops.get(o.name).unwrap_or(o.name),
+          None -> o.name,
+        },
+      }),
+    Module(i) -> match l.names.at(i) {
+      Some(name) -> match m.modules.get(name) { Some(j) -> Module(j), None -> Unbound },
+      None -> Unbound,
+    },
+    Unbound -> Unbound,
+  }
+
+fn moved_failure(r: Read, x: Reference) -> Failure / {abort.raise} =
+  {
+    path: displayed(r.file.at) ++ ":" ++ line_at(r.file.text, x.start).to_string(),
+    why: shown(x.name) ++ " would refer to something else after the renames",
+  }
+
+/// What is wrong with one item, or the imports, of `r` after the renames: a name that refers to
+/// something else, or a call on a value that calls another function. An import's names have no
+/// site, so they pair by their place.
+fn entry_failures(
+  rn: Renaming,
+  l: Loaded,
+  m: Mapping,
+  r: Read,
+  imports: Bool,
+  before: Entry,
+  now: Entry,
+  calls: Map<Bytes, Map<Int, Bytes>>,
+) -> List<Failure> / {abort.raise} = {
+  let refs = before.names.references;
+  let wrong = if imports {
+    range(0, refs.len()).filter(|i: Int|
+      now.names.references.at(i).map(|y: Reference| y.refers)
+        != Some(mapped(rn, l, m, refs.get(i).refers))).map(|i: Int| refs.get(i))
+  } else {
+    let by_site = now.names.references.fold(Map::new(), |acc: Map<Int, Refers>, y: Reference|
+      acc.insert(y.site, y.refers));
+    refs.filter(|x: Reference|
+      !is_made(x.site) && by_site.get(x.site) != Some(mapped(rn, l, m, x.refers)))
+  };
+  let was = r.calls.get(before.owner).unwrap_or(Map::new());
+  let is = calls.get(now.owner).unwrap_or(Map::new());
+  let retargeted = was.fold(0, |n: Int, site: Int, callee: Bytes|
+    if is.get(site) == Some(m.pairs.values.get(callee).unwrap_or(callee)) { n } else { n + 1 });
+  wrong.map(|x: Reference| moved_failure(r, x)).concat(if retargeted == 0 { [] } else {
+    [
+      {
+        path: displayed(r.file.at),
+        why: "a call on a value in `" ++ String::of_bytes_lossy(before.owner)
+          ++ "` would call another function after the renames",
+      },
+    ]
+  })
+}
+
+/// What is wrong with `after`, the program renamed: a module whose declarations no longer pair with
+/// what it declared, or what is wrong with an item of an edited file.
+fn compared(
+  rn: Renaming,
+  l: Loaded,
+  after: Analysis,
+  texts: Map<Bytes, Source>,
+) -> List<Failure> / {abort.raise} = {
+  let m = mapping_of(l, after, texts);
+  l.reads.fold(m.failures, |acc: List<Failure>, r: Read|
+    match ((m.modules.get(r.name), texts.get(r.name))) {
+      (Some(j), Some(t)) -> {
+        let now = entries_of(after, j, t.name, numbered_module(parse(t.src).node));
+        let calls = calls_of(after, j);
+        if now.len() != r.entries.len() {
+          acc.push({ path: displayed(r.file.at), why: "would no longer parse as it did" })
+        } else {
+          range(0, now.len()).fold(acc, |found: List<Failure>, k: Int|
+            found.concat(entry_failures(rn, l, m, r, k == 0, r.entries.get(k), now.get(k), calls)))
+        }
+      },
+      _ -> acc,
+    })
+}
+
+/// What is wrong with the program `l` loaded once every edited file holds its renamed text.
+fn verified(rn: Renaming, l: Loaded, texts: Map<Bytes, Source>) -> List<Failure> / {abort.raise} = {
+  let spliced = |s: Source| match texts.get(s.name) { Some(t) -> t, None -> s };
+  match walked(l.program, l.program.sources.map(spliced), {
+      ..l.program.shipping,
+      read: l.program.shipping.read.map(spliced),
+    }).out {
+    Refused(ds) ->
+      [{ path: l.root, why: "would not check after the renames: " ++ errors_text(ds) }],
+    Analysed(after) -> compared(rn, l, after, texts),
+  }
+}
+
+// --- The plan -------------------------------------------------------------------
+
+type Change = { at: Rooted, text: Bytes, changed: Bool, to: Option<Rooted> }
+
+type Mention = { path: String, line: Int, name: Bytes }
+
+type Plan = { changes: List<Change>, mentions: List<Mention>, refusals: List<Failure> }
+
+/// The lines naming a file the paths hold none of, or a name the file does not declare.
+fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.raise} = {
+  let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
+    acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
+  let file_of = |path: String|
+    reads.find(|x: { load: Loaded, read: Read }| displayed(x.read.file.at) == path);
+  let missing = |path: String| { path: path, why: "is not among the files being renamed" };
+  let declares = |x: { load: Loaded, read: Read }, name: Bytes|
+    namespaces().any(|namespace: Namespace|
+      space(x.load.declarations.get(x.read.index), namespace).any(|d: Declared|
+        d.name == name || own_part(d.name) == name));
+  renames.defined.fold([], |acc: List<Failure>, d: Defined|
+    match file_of(d.file) {
+      None -> acc.push(missing(d.file)),
+      Some(x) -> if declares(x, d.old) { acc }
+      else { acc.push({ path: d.file, why: "declares no " ++ shown(d.old) }) },
+    }).concat(
+    renames.operations.fold([], |acc: List<Failure>, o: OperationLine|
+      match file_of(o.file) {
+        None -> acc.push(missing(o.file)),
+        Some(x) -> if x.read.effects.any(|e: { name: Bytes, ops: List<Bytes> }|
+            e.name == o.effect_name && e.ops.contains(o.op)) { acc } else {
+          acc.push({
+            path: o.file,
+            why: "declares no operation " ++ shown(Bytes::concat_all([o.effect_name, b".", o.op])),
+          })
+        },
+      }),
+  ).concat(
+    renames.modules.fold([], |acc: List<Failure>, m: Moved|
+      if reads.any(|x: { load: Loaded, read: Read }| {
+          let f = displayed(x.read.file.at);
+          f == m.path || (m.path.ends_with("/") && f.starts_with(m.path))
+        }) { acc }
+      else { acc.push(missing(m.path)) }),
+  )
+}
+
+fn planned(
+  renames: Renames,
+  loads: List<Loaded>,
+  libraries: List<Library>,
+) -> Plan / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+  let rn = renaming_of(renames, loads, libraries);
+  let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
+    acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
+  let edited = reads.map(|x: { load: Loaded, read: Read }| edited_of(rn, x.load, x.read));
+  let changes = range(0, reads.len()).map(|i: Int| {
+    let r = reads.get(i).read;
+    let e = edited.get(i);
+    let text = applied(
+      r.file.text,
+      e.edits.concat(comment_edits(r.file.text, lex(r.file.text).comments, e)),
+    );
+    {
+      at: r.file.at,
+      text: text,
+      changed: text != r.file.text,
+      to: rn.modules.get(r.name).map(|m: ModuleMove| m.to),
+    }
+  });
+  let moved_names = rn.modules.keys();
+  let qualifiers = moved_names.fold(Map::new(), |acc: Map<Bytes, Bool>, name: Bytes|
+    match name.split(b".").at(name.split(b".").len() - 1) {
+      Some(last) -> acc.insert(last, true),
+      None -> acc,
+    });
+  let olds = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
+    e.renamed.fold(acc, |into: Map<Bytes, Bool>, old: Bytes, _: List<Bytes>|
+      if qualifiers.contains(old) { into } else { into.insert(old, true) }));
+  let names = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
+    e.edits.fold(acc, |into: Map<Bytes, Bool>, x: Edit|
+      x.names.fold(into, |n: Map<Bytes, Bool>, name: Bytes| n.insert(name, true))));
+  let named = names.keys().fold([], |acc: List<Failure>, name: Bytes|
+    match keyword_refusal(name) { Some(f) -> acc.push(f), None -> acc });
+  let targets = changes.fold(Map::new(), |acc: Map<String, List<String>>, change: Change|
+    match change.to {
+      Some(to) ->
+        acc.insert(displayed(to), acc.get(displayed(to)).unwrap_or([]).push(displayed(change.at))),
+      None -> acc,
+    });
+  let crowded = targets.fold([], |acc: List<Failure>, target: String, from: List<String>|
+    if from.len() > 1 {
+      acc.push({ path: target, why: String::join(from, " and ") ++ " would both be moved here" })
+    } else { acc });
+  let taken = changes.fold([], |acc: List<Failure>, change: Change|
+    match change.to {
+      Some(to) -> if kind(to) != Missing {
+        acc.push({
+          path: displayed(to),
+          why: displayed(change.at) ++ " would be moved here, but this file already exists",
+        })
+      } else { acc },
+      None -> acc,
+    });
+  let refusals = rn.refusals.concat(unmatched(renames, loads)).concat(named).concat(
+    edited.fold([], |acc: List<Failure>, e: Edited| acc.concat(e.failures)),
+  ).concat(
+    crowded,
+  ).concat(
+    taken,
+  );
+  let texts = range(0, reads.len()).fold(Map::new(), |acc: Map<Bytes, Source>, i: Int| {
+    let r = reads.get(i).read;
+    acc.insert(r.name, {
+      name: match rn.modules.get(r.name) { Some(m) -> m.name, None -> r.name },
+      src: changes.get(i).text,
+    })
+  });
+  {
+    changes: changes.filter(|change: Change| change.changed || change.to != None),
+    mentions: reads.fold([], |acc: List<Mention>, x: { load: Loaded, read: Read }| {
+      let r = x.read;
+      let tokens = lex(r.file.text).tokens;
+      acc.concat(mentions_in(displayed(r.file.at), r.file.text, tokens, olds)).concat(
+        module_mentions(displayed(r.file.at), r.file.text, tokens, moved_names),
+      )
+    }),
+    refusals: if refusals.len() > 0 { refusals }
+    else { loads.fold([], |acc: List<Failure>, l: Loaded| acc.concat(verified(rn, l, texts))) },
+  }
+}
+
+// --- The answer ------------------------------------------------------------------
+
+fn saved(
+  change: Change,
+) -> Option<Failure> / {fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs]} =
+  if change.changed && !write_file(change.at, change.text) {
+    Some({ path: displayed(change.at), why: "could not write" })
+  } else {
+    match change.to {
+      None -> None,
+      Some(to) -> {
+        let room = match parent_of(to) { Some(dir) -> create_dir(dir), None -> true };
+        if room && move_file(change.at, to) { None }
+        else { Some({ path: displayed(change.at), why: "could not move to " ++ displayed(to) }) }
+      },
+    }
+  }
+
+fn json_report(plan: Plan, failures: List<Failure>, code: Int) -> Json =
+  object([
+    { key: "command", value: Str("rename") },
+    { key: "schema_version", value: Number(Decimal::of_int(schema_version())) },
+    { key: "ok", value: Bool(code == 0) },
+    { key: "exit_code", value: Number(Decimal::of_int(code)) },
+    {
+      key: "files",
+      value: Array(
+        plan.changes.map(|change: Change|
+          object([
+            { key: "path", value: Str(displayed(change.at)) },
+            {
+              key: "moved_to",
+              value: match change.to { Some(to) -> Str(displayed(to)), None -> Null },
+            },
+          ])),
+      ),
+    },
+    {
+      key: "mentions",
+      value: Array(
+        plan.mentions.map(|m: Mention|
+          object([
+            { key: "path", value: Str(m.path) },
+            { key: "line", value: Number(Decimal::of_int(m.line)) },
+            { key: "name", value: Str(String::of_bytes_lossy(m.name)) },
+          ])),
+      ),
+    },
+    {
+      key: "errors",
+      value: Array(
+        failures.map(|f: Failure|
+          object([{ key: "path", value: Str(f.path) }, { key: "error", value: Str(f.why) }])),
+      ),
+    },
+  ])
+
+fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> Answer = {
+  let code = if failures.len() > 0 { compile_error() }
+  else if check && plan.changes.len() > 0 { 1 }
+  else { ok_code() };
+  let verb = if check { "would rename in " } else { "renamed in " };
+  {
+    json: json_report(plan, failures, code),
+    lines: plan.changes.fold([], |acc: List<String>, change: Change| {
+      let renamed_in = if change.changed { acc.push(verb ++ displayed(change.at)) } else { acc };
+      match change.to {
+        Some(to) ->
+          renamed_in.push(
+            (if check { "would move " } else { "moved " }) ++ displayed(change.at) ++ " to "
+              ++ displayed(to),
+          ),
+        None -> renamed_in,
+      }
+    }),
+    errs: failures.map(|f: Failure|
+      "error: " ++ (if f.path == "" { "" } else { f.path ++ ": " }) ++ f.why).concat(
+      plan.mentions.map(|m: Mention|
+        "warning: " ++ m.path ++ ":" ++ m.line.to_string()
+          ++ ": a string contains the renamed name "
+          ++ shown(m.name)),
+    ),
+    code: code,
+  }
+}
+
+fn refused_with(why: String) -> Answer =
+  answered({ changes: [], mentions: [], refusals: [] }, [{ path: "", why: why }], false)
+pub fn run(
+  flags: Flags,
+) -> Answer / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+  match flags.map {
+    None -> refused_with("list the renames in a file and pass it with `--map FILE`"),
+    Some(map) -> match read_file(spelled(map)) {
+      None -> refused_with(map ++ ": could not read"),
+      Some(text) -> match renames_of(text, flags.words) {
+        Err(why) -> refused_with(map ++ ": " ++ why),
+        Ok(renames) -> {
+          let given = if flags.paths.len() == 0 { [here()] } else { flags.paths };
+          let loading = loads_of(given);
+          if loading.failures.len() > 0 {
+            answered({ changes: [], mentions: [], refusals: [] }, loading.failures, false)
+          } else {
+            let plan = planned(renames, loading.loads, libraries_of(given));
+            if plan.refusals.len() > 0 || flags.check { answered(plan, plan.refusals, flags.check) }
+            else {
+              answered(
+                plan,
+                plan.changes.fold([], |acc: List<Failure>, change: Change|
+                  match saved(change) { Some(f) -> acc.push(f), None -> acc }),
+                false,
+              )
+            }
+          }
+        },
+      },
+    },
+  }
+
+// --- Tests ------------------------------------------------------------------
+
+fn words_of(map: Bytes) -> Renames / {abort.raise} =
+  match renames_of(map, true) { Ok(r) -> r, Err(why) -> panic(why) }
+
+test "`--words` replaces a word inside names and keeps each name's casing" {
+  let r = words_of(b"ty type\nexpr type_expression\n");
+  assert_eq(renamed(r, b"ty_vars"), b"type_vars");
+  assert_eq(renamed(r, b"TyCon"), b"TypeCon");
+  assert_eq(renamed(r, b"MAX_TY"), b"MAX_TYPE");
+  assert_eq(renamed(r, b"EExpr"), b"ETypeExpression");
+  assert_eq(renamed(r, b"expr2"), b"type_expression2");
+  assert_eq(renamed(r, b"__ty"), b"__type");
+  assert_eq(renamed(r, b"types"), b"types");
+  assert_eq(renamed(r, b"TDNominal"), b"TDNominal")
+}
+
+fn refusal_in(map: Bytes, words: Bool) -> Option<String> / {abort.raise} =
+  match renames_of(map, words) { Ok(_) -> None, Err(why) -> Some(why) }
+
+test "each line of a map needs an old name and a new name" {
+  assert_eq(refusal_in(b"a b\n\n  c\td\r\n", false), None);
+  assert_eq(
+    refusal_in(b"a b c d\n", false),
+    Some(
+      "line 1: each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+    ),
+  );
+  assert_eq(refusal_in(b"m.ply a b\nn.ply a c\n", false), None);
+  assert_eq(refusal_in(b"m.ply a b\nm.ply a c\n", false), Some("line 2: `a` appears twice"));
+  assert(refusal_in(b"m.ply a b\n", true) != None);
+  assert_eq(refusal_in(b"a b\na c\n", false), Some("line 2: `a` appears twice"));
+  assert(refusal_in(b"Ty type\n", true) != None);
+  assert(refusal_in(b"ty Type\n", true) != None);
+  assert_eq(refusal_in(b"ty type_name\n", true), None)
+}
