@@ -316,7 +316,8 @@ store_dirs() {
 
 # The stores of kept records, the emitter's answers among them, each a directory `sweep` takes whole
 # (its `STORES`).
-stores="ply-c-cache/bodies"
+# shellcheck disable=SC2100 # `ci-shards.sh verify` reads this line as written.
+stores=ply-c-cache/bodies
 
 # Each store a run since the mark used, into DIR whole: its manifest and segments, without what a
 # run holds open in it.
