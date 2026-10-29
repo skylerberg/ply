@@ -166,7 +166,8 @@ impl Run {
 pub enum Ended {
     /// The root answered: its answer's PLV1.
     Answered(Vec<u8>),
-    /// A raise nothing answered, a runtime error, a budget spent, or an answer the boundary refuses.
+    /// A raise nothing answered, a runtime error, the clock run out, or an answer the boundary
+    /// refuses.
     Failed(Diagnostic),
     /// A Rust unwind out of the entry, with what it said.
     Panicked(String),

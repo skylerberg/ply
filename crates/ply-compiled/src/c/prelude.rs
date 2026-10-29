@@ -176,7 +176,6 @@ helpers! {
     rt_not_that_width(which, value);
     rt_iterate_bad(what, n);
     rt_shift_count(n, which);
-    rt_tick();
     rt_stack_more() -> Word;
     rt_inc_shared(w);
     rt_note_update(in_place, copied);

@@ -1429,10 +1429,9 @@ A loop that never ends runs until a clock stops it. A test, and each entry `ply 
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
 server is meant to run forever; `--timeout MS` sets one.
 
-`range`, the byte scanners, `List::map`, `List::filter` and `List::fold` do not nest calls.
-`std.prelude` writes the list functions in Ply as tail calls over the list's internal tree, so
-each element costs a step of the walk (plus the steps of `push` for `map` and `filter`), besides
-what the function they are given takes. `iterate` is a loop with an early exit and a step budget:
+`range`, the byte scanners, `List::map`, `List::filter` and `List::fold` do not nest calls:
+`std.prelude` writes the list functions in Ply as tail calls over the list's internal tree.
+`iterate` is a loop with an early exit and a budget of passes:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
