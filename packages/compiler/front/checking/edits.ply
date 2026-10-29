@@ -49,11 +49,13 @@ import compiler.front.checking (world_of, looked, fresh_registry, Answered, fact
 
 // --- Through a session of edits -------------------------------------------------------------
 
-/// The steps whose answer through the memo store, kept from step to step, is not the fresh one.
+/// The steps where the result through the memo store, kept from step to step, differs from a fresh
+/// check, or where a group was checked or hashed when it should not have been: a group the run asks
+/// for must run when what it reads changed since its record was made, and be reused otherwise.
 fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
   steps.fold(
-    { held: nothing_held(), inputs: Map::new(), hashes: Map::new(), off: [] },
-    |s: { held: Held, inputs: Map<Bytes, Bytes>, hashes: Map<Bytes, Bytes>, off: List<Bytes> }, step: Step| {
+    { held: nothing_held(), checks: Map::new(), hashes: Map::new(), off: [] },
+    |s: { held: Held, checks: Map<Bytes, Bytes>, hashes: Map<Bytes, Bytes>, off: List<Bytes> }, step: Step| {
       let warm = answered_over(s.held, step.sources);
       let now = said(warm.outcome);
       let whole = said(analyse(parse_all(step.sources)));
@@ -63,73 +65,28 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
           Publishing(_) -> now == whole,
           Refusing(_) -> match now { Refusing(_) -> true, Publishing(_) -> false },
         });
-      // The groups the edit checks again are those whose check reads otherwise, each once; none where
-      // modules import one another in a cycle, which checks no module.
-      let inputs = match inputs_over(fresh.held, step.sources, b"group inputs") {
-        Some(i) -> i,
-        None -> s.inputs,
-      };
-      // Likewise the groups it hashes again. A load that refuses asks for no hashing of its own, so
-      // what is hashed again is what a run settles: the hashing of each module hashed before, which
-      // asks each group the module holds now, a group new to it among them, and each group whose hash
-      // one of those reads. A group that is gone is hashed anew where it comes back.
-      let refused = match fresh.outcome { Refused(_) -> true, Analysed(_) -> false };
-      let asked = ran_for(warm.run, group_hash_query()).fold(
-        Map::new(),
-        |acc: Map<Bytes, Bool>, k: Bytes| acc.insert(k, true),
+      let checked = pulled(
+        warm.run,
+        group_query(),
+        s.checks,
+        inputs_over(fresh.held, step.sources, b"group inputs"),
       );
-      let hashed_modules = s.hashes.fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes, _: Bytes|
-        acc.insert(decoded(k, group_named_bin(), "a group's names").module, true));
-      let now_hashes = match inputs_over(fresh.held, step.sources, b"hash inputs") {
-        Some(h) -> if refused {
-          h.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: Bytes, v: Bytes|
-            if asked.contains(k)
-                || hashed_modules.contains(
-                  decoded(k, group_named_bin(), "a group's names").module,
-                ) { acc.insert(k, v) }
-            else { acc })
-        } else { h },
-        None -> s.hashes,
-      };
-      let hashes = now_hashes;
-      // A group runs once, or twice where the edit gives it something new to read: its height in
-      // the store, which orders a run's settling, is from before it read that.
-      // Where the groups run are not those whose reads moved, each once or twice: which were, and
-      // which ran.
-      let off_by = |was: Map<Bytes, Bytes>, now: Map<Bytes, Bytes>, query: Bytes| {
-        let ran = ran_for(warm.run, query).filter(|k: Bytes| now.contains(k));
-        let times = ran.fold(Map::new(), |acc: Map<Bytes, Int>, k: Bytes|
-          acc.insert(k, match acc.get(k) { Some(n) -> n + 1, None -> 1 }));
-        let moved = sorted_bytes(now.keys().filter(|k: Bytes| was.get(k) != now.get(k)));
-        // A record taken back from before an edit undone moves its answer with no body run.
-        let back = restored_for(warm.run, query).filter(|k: Bytes|
-          moved.contains(k) && !times.contains(k));
-        let thrice = sorted_bytes(
-          times.fold([], |acc: List<Bytes>, k: Bytes, n: Int|
-            if n > 2 { acc.push(k) } else { acc }),
-        );
-        if moved != sorted_bytes(times.keys().concat(back)) || thrice != [] {
-          Some(
-            Bytes::concat_all([
-              b": moved ",
-              groups_shown(moved),
-              b", ran ",
-              groups_shown(sorted_bytes(times.keys())),
-              if thrice == [] { b"" } else { b", more than twice ".concat(groups_shown(thrice)) },
-            ]),
-          )
-        } else { None }
-      };
+      let hashed = pulled(
+        warm.run,
+        group_hash_query(),
+        s.hashes,
+        inputs_over(fresh.held, step.sources, b"hash inputs"),
+      );
       {
         held: warm.held,
-        inputs: inputs,
-        hashes: hashes,
+        checks: checked.made,
+        hashes: hashed.made,
         off: if !agrees {
           s.off.push(Bytes::concat_all([step.what, fixing_apart(warm.fixing, fresh.fixing)]))
         } else {
-          match off_by(s.inputs, inputs, group_query()) {
+          match checked.off {
             Some(why) -> s.off.push(Bytes::concat_all([step.what, b" (work)", why])),
-            None -> match off_by(s.hashes, now_hashes, group_hash_query()) {
+            None -> match hashed.off {
               Some(why) -> s.off.push(Bytes::concat_all([step.what, b" (hash work)", why])),
               None -> s.off,
             },
@@ -138,6 +95,57 @@ fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       }
     },
   ).off
+
+/// How `run` handled the records of `query`, a group's check or its hashing, given what each group
+/// read when its record was last made, `made`, and what it reads now, `now`: the groups it ran though
+/// their reads had not changed, and those it reused though they had; and what each group's record is
+/// made over after the run. Nothing is judged where modules import one another in a cycle, which
+/// checks no module.
+fn pulled(
+  run: Run,
+  query: Bytes,
+  made: Map<Bytes, Bytes>,
+  now: Option<Map<Bytes, Bytes>>,
+) -> { made: Map<Bytes, Bytes>, off: Option<Bytes> } / {abort.raise} =
+  match now {
+    None -> { made: made, off: None },
+    Some(reads) -> {
+      let q = match fresh_registry().get(query) {
+        Some(x) -> x,
+        None -> panic("the registry holds the query"),
+      };
+      let ran = ran_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
+        acc.insert(k, true));
+      // A record restored after an edit is undone is made again without running its body.
+      let back = restored_for(run, query).fold(Map::new(), |acc: Map<Bytes, Bool>, k: Bytes|
+        acc.insert(k, true));
+      let groups = reads.keys();
+      let moved = |g: Bytes| made.get(g) != reads.get(g);
+      let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
+      let stale = sorted_bytes(
+        groups.filter(|g: Bytes|
+          run.settled.contains(memo::key_of(q, g)) && !ran.contains(g) && !back.contains(g)
+            && moved(g)),
+      );
+      {
+        made: groups.fold(made, |acc: Map<Bytes, Bytes>, g: Bytes|
+          if ran.contains(g) || back.contains(g) {
+            acc.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
+          } else { acc }),
+        off: if needless == [] && stale == [] { None } else {
+          Some(
+            Bytes::concat_all([
+              b": ran ",
+              groups_shown(needless),
+              b" though its reads had not changed; reused ",
+              groups_shown(stale),
+              b" though they had",
+            ]),
+          )
+        },
+      }
+    },
+  }
 
 /// Each of `groups`, encoded group names, as its module and owners.
 fn groups_shown(groups: List<Bytes>) -> Bytes / {abort.raise} =
@@ -241,11 +249,13 @@ fn inputs_over(
         hash: b"group inputs",
         body: group_inputs_answer,
         kept: true,
+        summarized: false,
       }).insert(b"hash inputs", {
         name: b"hash inputs",
         hash: b"hash inputs",
         body: hash_inputs_answer,
         kept: true,
+        summarized: false,
       });
       let cycles = cycles_among(qs, started(qs), w.own);
       if cycles.refused.len() > 0 { None } else {

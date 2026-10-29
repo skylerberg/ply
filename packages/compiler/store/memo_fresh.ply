@@ -1,0 +1,344 @@
+//! Runs through a memo store, or a store and a pack, compared with a run over an empty store: they
+//! return the same results and run no more bodies. A module of its own, which nothing imports.
+
+import std.hash (blake3)
+import compiler.store.memo
+import compiler.store.memo (Query, Held, Run, memo, answer, started, key_of, ran_for, ran_total,
+                            nothing_held, over_held, packed_of, read_whole)
+import compiler.store.packs
+
+/// The files a test's runs read, and the store they leave.
+type State = { files: Map<Bytes, Bytes>, held: Held }
+
+fn state(files: List<{ at: Bytes, text: Bytes }>) -> State =
+  {
+    files: files.fold(Map::new(), |acc: Map<Bytes, Bytes>, f: { at: Bytes, text: Bytes }|
+      acc.insert(f.at, f.text)),
+    held: nothing_held(),
+  }
+
+fn edited(s: State, at: Bytes, text: Bytes) -> State = { ..s, files: s.files.insert(at, text) }
+
+/// `s`'s files over an empty store.
+fn emptied(s: State) -> State = { ..s, held: nothing_held() }
+
+fn files_of(s: State) -> Bytes =
+  Bytes::concat_all(
+    s.files.fold([], |acc: List<Bytes>, at: Bytes, text: Bytes|
+      acc.push(at).push(b" ").push(blake3(text)).push(b"\n")),
+  )
+
+fn pack_over(q: Map<Bytes, Query<| {}>>, s: State) -> packs::Written / {abort.raise} =
+  packed_of(s.held, q, files_of(s))
+
+type Answers = { outputs: List<Bytes>, run: Run, state: State }
+
+/// Each of `names` asked for `input`, in order, by one run over `s` with `packed` below its store.
+fn asked(
+  q: Map<Bytes, Query<| {}>>,
+  s: State,
+  packed: Option<packs::Written>,
+  names: List<Bytes>,
+  input: Bytes,
+) -> Answers / {abort.raise} = {
+  let done = over_held(
+    s.held,
+    |path: String, offset: Int, len: Int| packs::frame_in(packed, path, offset, len),
+    files_of(s),
+    |_: Bytes, at: Bytes| s.files.get(at),
+    ||
+      names.fold(
+        { outputs: [], run: started(q) },
+        |acc: { outputs: List<Bytes>, run: Run }, name: Bytes| {
+          let a = answer(q, acc.run, name, input);
+          { outputs: acc.outputs.push(a.output), run: a.run }
+        },
+      ),
+  );
+  { outputs: done.value.outputs, run: done.value.run, state: { ..s, held: done.held } }
+}
+
+fn tried(f: () -> List<Bytes> / {abort.raise}) -> Option<List<Bytes>> =
+  handle { Some(f()) } with { abort.raise(_) -> None }
+
+fn key_in(q: Map<Bytes, Query<| {}>>, name: Bytes, input: Bytes) -> Bytes =
+  match q.get(name) { Some(found) -> key_of(found, input), None -> b"" }
+
+fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> Query<| {}> =
+  { name: name, hash: hash, body: body, kept: true, summarized: false }
+
+fn length_of(input: Bytes) -> Bytes / {memo.read} =
+  Bytes::of_string(read_whole(input).len().to_string())
+
+fn doubled_length(input: Bytes) -> Bytes / {memo.read} =
+  Bytes::of_string(Int::to_string(2 * read_whole(input).len()))
+
+fn longer(input: Bytes) -> Bytes / {memo.read} = b"long ".concat(memo.ask(b"length", input))
+
+fn middled(input: Bytes) -> Bytes / {memo.read} = b"mid ".concat(memo.ask(b"length", input))
+
+fn topped(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"middle", input).concat(b"!")
+
+fn lengths(length_hash: Bytes) -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"length", query(b"length", length_hash, length_of)).insert(
+    b"longer",
+    query(b"longer", b"l1", longer),
+  )
+
+/// `top`, which keeps a summary, over `middle` and `length`, which keep none.
+fn summed() -> Map<Bytes, Query<| {}>> =
+  lengths(b"h1").insert(b"top", { ..query(b"top", b"t1", topped), summarized: true }).insert(
+    b"middle",
+    query(b"middle", b"m1", middled),
+  )
+
+// --- Judging a record for `memo.kept` ---------------------------------------------------------
+
+/// A check of a module whole, as the checker's `whole` is: it reads the file `w`, and offers
+/// `verdict` whether `group`'s record would be reused.
+fn whole_of(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = read_whole(b"w");
+  memo.offer(b"verdict", input, if memo.kept(b"group", input) { b"kept" } else { b"not kept" });
+  b"done"
+}
+
+fn verdict_of(input: Bytes) -> Bytes / {memo.read} =
+  match memo.offered() { Some(v) -> v, None -> b"no verdict" }
+
+fn entry_of(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.head(b"whole", input);
+  b"entry"
+}
+
+fn group_by_entry(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.head(b"entry", input);
+  b"group"
+}
+
+fn group_by_whole(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.head(b"whole", input);
+  b"group"
+}
+
+fn group_by_both(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.head(b"offering", input);
+  let _ = memo.head(b"entry", input);
+  b"group"
+}
+
+/// Offers `taker` what it answers of the file `of`.
+fn offering_of(input: Bytes) -> Bytes / {memo.read} = {
+  memo.offer(b"taker", input, b"t ".concat(read_whole(b"of")));
+  b"offered"
+}
+
+/// What `offering` offered, or else what `alone` works out, read over the file `of` either way.
+fn taker_of(input: Bytes) -> Bytes / {memo.read} = {
+  let _ = memo.head(b"offering", input);
+  match memo.offered() {
+    Some(v) -> {
+      let _ = read_whole(b"of");
+      v
+    },
+    None -> memo.ask(b"alone", input),
+  }
+}
+
+fn alone_of(input: Bytes) -> Bytes / {memo.read} = b"t ".concat(read_whole(b"of"))
+
+fn judging_queries(group: Query<| {}>) -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"whole", query(b"whole", b"w1", whole_of)).insert(
+    b"verdict",
+    query(b"verdict", b"v1", verdict_of),
+  ).insert(
+    b"entry",
+    query(b"entry", b"e1", entry_of),
+  ).insert(
+    b"group",
+    group,
+  ).insert(
+    b"offering",
+    query(b"offering", b"o1", offering_of),
+  ).insert(
+    b"taker",
+    query(b"taker", b"k1", taker_of),
+  ).insert(
+    b"alone",
+    query(b"alone", b"a1", alone_of),
+  )
+
+test "a record is judged kept where nothing below it moved, though a record below asks the one judging" {
+  let q = judging_queries(query(b"group", b"g1", group_by_entry));
+  let first = asked(q, state([{ at: b"w", text: b"1" }]), None, [b"group"], b"m");
+  let again = asked(
+    q,
+    edited(first.state, b"w", b"2"),
+    None,
+    [b"whole", b"verdict", b"group"],
+    b"m",
+  );
+  // `group` stands: `entry` reads `whole`, which answers as it did.
+  assert_eq(ran_for(again.run, b"group"), []);
+  assert_eq(again.outputs, [b"done", b"kept", b"group"])
+}
+
+test "a record that reads the one judging it is judged by that one's stored answer" {
+  let q = judging_queries(query(b"group", b"g1", group_by_whole));
+  let first = asked(q, state([{ at: b"w", text: b"1" }]), None, [b"group"], b"m");
+  let again = asked(
+    q,
+    edited(first.state, b"w", b"2"),
+    None,
+    [b"whole", b"verdict", b"group"],
+    b"m",
+  );
+  assert_eq(again.outputs, [b"done", b"kept", b"group"])
+}
+
+/// `judging_queries` over `group_by_both`, run once with `of` holding `A`, and the world it leaves
+/// with `w` and `of` moved.
+fn offered_while_judged() -> { q: Map<Bytes, Query<| {}>>, first: State, now: State } / {abort.raise} = {
+  let q = judging_queries(query(b"group", b"g1", group_by_both));
+  let first = asked(
+    q,
+    state([{ at: b"w", text: b"1" }, { at: b"of", text: b"A" }]),
+    None,
+    [b"group", b"taker"],
+    b"m",
+  );
+  { q: q, first: first.state, now: edited(edited(first.state, b"w", b"2"), b"of", b"B") }
+}
+
+test "what a body offers while a record is judged is taken, though the judgment stops at the one judging" {
+  let x = offered_while_judged();
+  let warm = asked(x.q, x.now, None, [b"whole", b"taker"], b"m");
+  let cold = asked(x.q, emptied(x.now), None, [b"whole", b"taker"], b"m");
+  assert_eq(warm.outputs, cold.outputs);
+  // A fresh run's `taker` takes what `offering` offers, so `alone` does not run.
+  assert_eq(ran_for(warm.run, b"alone"), ran_for(cold.run, b"alone"))
+}
+
+test "a body run while a record is judged is counted, though the judgment stops at the one judging" {
+  let x = offered_while_judged();
+  let warm = asked(x.q, x.now, None, [b"whole", b"taker"], b"m");
+  let key = key_in(x.q, b"offering", b"m");
+  // `offering`'s record is made anew over `of`, so its body ran.
+  assert(warm.state.held.records.get(key) != x.first.held.records.get(key));
+  assert_eq(ran_for(warm.run, b"offering"), [b"m"])
+}
+
+fn kept_longer(input: Bytes) -> Bytes / {memo.read} =
+  if memo.kept(b"longer", input) { b"kept" } else { b"not kept" }
+
+test "a record an undone edit takes back is judged kept" {
+  let q = lengths(b"h1").insert(b"probe", query(b"probe", b"p1", kept_longer));
+  let first = asked(q, state([{ at: b"a", text: b"four" }]), None, [b"longer"], b"a");
+  let moved = asked(q, edited(first.state, b"a", b"forty"), None, [b"longer"], b"a");
+  let undone = asked(q, edited(moved.state, b"a", b"four"), None, [b"probe", b"longer"], b"a");
+  // An ask takes `longer`'s earlier record back, with no body run.
+  assert_eq(ran_for(undone.run, b"longer"), []);
+  assert_eq(undone.outputs, [b"kept", b"long 4"])
+}
+
+fn kept_length(input: Bytes) -> Bytes / {memo.read} =
+  if memo.kept(b"length", input) { b"kept" } else { b"not kept" }
+
+test "a record whose long answer no store holds is judged not kept" {
+  let text = b"word ".repeat(1000);
+  let q = Map::new().insert(b"length", {
+    ..query(b"length", b"h1", read_whole),
+    kept: false,
+  }).insert(
+    b"probe",
+    query(b"probe", b"p1", kept_length),
+  );
+  let first = asked(q, state([{ at: b"a", text: text }]), None, [b"length"], b"a");
+  let again = asked(q, first.state, None, [b"probe", b"length"], b"a");
+  // The store kept the record and not its answer, so an ask runs the body.
+  assert_eq(ran_for(again.run, b"length"), [b"a"]);
+  assert_eq(again.outputs.get(0), b"not kept")
+}
+
+fn moded(input: Bytes) -> Bytes / {memo.read} =
+  if memo.world(b"file", b"mode") == Some(b"old") { memo.ask(b"fragile", input) } else { b"new" }
+
+fn fragile(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if memo.world(b"file", b"ff") == Some(b"bad") { panic("the file `ff` is bad") } else { b"fine" }
+
+fn kept_moded(input: Bytes) -> Bytes / {memo.read} =
+  if memo.kept(b"moded", input) { b"kept" } else { b"not kept" }
+
+test "judging a record fails no run that a run over an empty store answers" {
+  let q = Map::new().insert(b"moded", query(b"moded", b"d1", moded)).insert(b"fragile", {
+    name: b"fragile",
+    hash: b"f1",
+    body: fragile,
+    kept: true,
+    summarized: false,
+  }).insert(
+    b"probe",
+    query(b"probe", b"p1", kept_moded),
+  );
+  let first = asked(
+    q,
+    state([{ at: b"mode", text: b"old" }, { at: b"ff", text: b"good" }]),
+    None,
+    [b"moded"],
+    b"x",
+  );
+  let bad = edited(first.state, b"ff", b"bad");
+  let cold = tried(|| asked(q, emptied(bad), None, [b"probe"], b"x").outputs);
+  assert_eq(cold, Some([b"not kept"]));
+  assert_eq(tried(|| asked(q, bad, None, [b"probe"], b"x").outputs), cold)
+}
+
+// --- Packs ----------------------------------------------------------------------------------
+
+test "a pack below a store made over other files runs no more bodies than the pack below an empty store" {
+  let q = lengths(b"h1");
+  let four = asked(q, state([{ at: b"a", text: b"four" }]), None, [b"longer"], b"a");
+  let packed = pack_over(q, four.state);
+  // The store's records were made before the pack was below it, over another text.
+  let forty = asked(q, state([{ at: b"a", text: b"forty" }]), None, [b"longer"], b"a");
+  let now = {
+    files: state([{ at: b"a", text: b"four" }, { at: b"z", text: b"more" }]).files,
+    held: forty.state.held,
+  };
+  let warm = asked(q, now, Some(packed), [b"longer"], b"a");
+  let cold = asked(q, emptied(now), Some(packed), [b"longer"], b"a");
+  assert_eq(warm.outputs, cold.outputs);
+  assert_eq(ran_total(warm.run), ran_total(cold.run))
+}
+
+// --- Summaries ------------------------------------------------------------------------------
+
+test "runs alternating between two definitions below a summary run no body once each has run" {
+  let one = summed();
+  let two = summed().insert(b"length", query(b"length", b"h2", doubled_length));
+  let first = asked(one, state([{ at: b"a", text: b"four" }]), None, [b"top"], b"a");
+  let second = asked(two, first.state, None, [b"top"], b"a");
+  let third = asked(one, second.state, None, [b"top"], b"a");
+  let fourth = asked(two, third.state, None, [b"top"], b"a");
+  assert_eq([first.outputs, second.outputs, third.outputs, fourth.outputs], [
+    [b"mid 4!"],
+    [b"mid 8!"],
+    [b"mid 4!"],
+    [b"mid 8!"],
+  ]);
+  assert_eq([ran_total(third.run), ran_total(fourth.run)], [0, 0])
+}
+
+fn over_taker(input: Bytes) -> Bytes / {memo.read} = memo.ask(b"taker", input).concat(b"!")
+
+test "a summary over an answer taken from an offer moves with what the offer was made from" {
+  let q = judging_queries(query(b"group", b"g1", group_by_entry)).insert(b"offering", {
+    ..query(b"offering", b"o1", offering_of),
+    summarized: true,
+  }).insert(b"over", { ..query(b"over", b"v1", over_taker), summarized: true });
+  let first = asked(q, state([{ at: b"of", text: b"A" }]), None, [b"over"], b"m");
+  let moved = edited(first.state, b"of", b"B");
+  assert_eq(
+    asked(q, moved, None, [b"over"], b"m").outputs,
+    asked(q, emptied(moved), None, [b"over"], b"m").outputs,
+  )
+}
