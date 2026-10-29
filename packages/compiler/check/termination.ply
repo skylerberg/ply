@@ -22,6 +22,7 @@ import compiler.check.known (is_integer_name, bool_name, string_name, bytes_name
 import compiler.check.semantics (Iterates, Handed, Element, Threaded, Mapped, Kept, Folded,
                                  iterates, prelude_iterates)
 import std.bin
+import std.graph
 import std.list
 import std.math (pow)
 
@@ -87,6 +88,10 @@ pub type Term =
   /// As long as the place: what a write at an index leaves of it.
   | SameLength(Place)
   | UnknownTerm
+  /// A value each of whose elements and fields is a part of one of the places, each of another
+  /// parameter: what joins two parameters' parts, as `List::concat` does, which a call whose
+  /// arguments are parts of one place answers parts of that place.
+  | PartsOfAny(List<Place>)
 
 /// How a definition calls each function it is handed, and what it answers, in its own parameters'
 /// terms: what a call of it tells a group that hands it a member or a lambda.
@@ -263,7 +268,40 @@ fn looping(g: Group, calls: List<List<Call>>, stated: Bool) -> Option<Unending> 
   );
   let graphs = range(0, g.defs.len()).fold([], |acc: List<Graph>, i: Int|
     calls.get(i).fold(acc, |gs: List<Graph>, c: Call| added(gs, call_graph(g, measures, i, c))));
-  searched(g.defs.len(), graphs)
+  searched(g.defs.len(), deciding(measures, graphs))
+}
+
+/// `graphs` with only the arcs inside a cycle of arcs, from member to member and measure to
+/// measure, that holds a strict one. A loop shrinks a measure only along such a cycle, so no other
+/// arc decides whether one does, and leaving them out keeps the graphs the search tells apart few.
+fn deciding(measures: List<List<Measure>>, graphs: List<Graph>) -> List<Graph> / {abort.raise} = {
+  let starts = measures.fold([0], |acc: List<Int>, ms: List<Measure>|
+    acc.push(acc.at_or(acc.len() - 1, 0) + ms.len()));
+  let node = |member: Int, m: Int| starts.at_or(member, 0) + m;
+  let edges = graphs.fold([], |acc: List<graph::Edge>, x: Graph|
+    x.arcs.fold(acc, |es: List<graph::Edge>, r: Arc|
+      es.push({ from: node(x.from, r.a), target: node(x.to, r.b) })));
+  let total = starts.at_or(starts.len() - 1, 0);
+  let parts = graph::components(graph::of_edges(total, edges));
+  let component = range(0, parts.len()).fold(Map::new(), |m: Map<Int, Int>, i: Int|
+    parts.get(i).fold(m, |acc: Map<Int, Int>, v: Int| acc.insert(v, i)));
+  let inside = |x: Graph, r: Arc|
+    component.get(node(x.from, r.a)) == component.get(node(x.to, r.b));
+  let shrinking = graphs.fold(Map::new(), |m: Map<Int, Bool>, x: Graph|
+    x.arcs.fold(m, |acc: Map<Int, Bool>, r: Arc|
+      if r.strict && inside(x, r) {
+        match component.get(node(x.from, r.a)) { Some(c) -> acc.insert(c, true), None -> acc }
+      } else { acc }));
+  graphs.fold([], |acc: List<Graph>, x: Graph|
+    added(acc, {
+      ..x,
+      arcs: x.arcs.filter(|r: Arc|
+        inside(x, r)
+          && (match component.get(node(x.from, r.a)) {
+            Some(c) -> shrinking.contains(c),
+            None -> false,
+          })),
+    }))
 }
 
 fn idempotent(x: Graph) -> Bool / {abort.raise} = same_arcs(composed(x, x).arcs, x.arcs)
@@ -784,6 +822,7 @@ fn project(t: Term, field: Bytes) -> Term =
     Wrapped(_) -> UnknownTerm,
     SameLength(_) -> UnknownTerm,
     UnknownTerm -> UnknownTerm,
+    PartsOfAny(_) -> UnknownTerm,
   }
 
 /// An element or a field of the value, or one of theirs: of a list's tail, an element of the list.
@@ -824,6 +863,8 @@ fn made_of(t: Term) -> Term =
     },
     Below(p) -> PartsOf(p),
     Inside(p) -> PartsOf(p),
+    PartsOf(p) -> PartsOf(p),
+    PartsOfAny(ps) -> PartsOfAny(ps),
     NoParts -> NoParts,
     _ -> UnknownTerm,
   }
@@ -838,6 +879,7 @@ fn parts(t: Term) -> Term =
     Below(p) -> PartsOf(p),
     Inside(p) -> PartsOf(p),
     PartsOf(p) -> PartsOf(p),
+    PartsOfAny(ps) -> PartsOfAny(ps),
     NoParts -> NoParts,
     _ -> UnknownTerm,
   }
@@ -882,13 +924,37 @@ fn with_part(xs: Term, x: Term) -> Term =
     match parts(xs) {
       PartsOf(p) -> if part_of(x, p) { PartsOf(p) } else {
         match part_place(x) {
-          Some(q) -> if within(p, q) { PartsOf(q) } else { UnknownTerm },
+          Some(q) -> if within(p, q) { PartsOf(q) }
+          else if q.param != p.param { parts_of_places([p, q]) }
+          else { UnknownTerm },
           None -> UnknownTerm,
         }
+      },
+      PartsOfAny(ps) -> match part_place(x) {
+        Some(q) -> parts_of_places(ps.push(q)),
+        None -> UnknownTerm,
       },
       _ -> UnknownTerm,
     }
   }
+
+/// What is made of parts of `places`: of one place per parameter, the widest the places of that
+/// parameter lie in.
+fn parts_of_places(places: List<Place>) -> Term = {
+  let widest = places.fold([], |acc: List<Place>, p: Place|
+    match acc.find(|q: Place| q.param == p.param) {
+      Some(q) ->
+        acc.map(|r: Place|
+          if r.param == p.param { { param: p.param, path: common_prefix(q.path, p.path) } }
+          else { r }),
+      None -> acc.push(p),
+    });
+  match widest {
+    [] -> NoParts,
+    [one] -> PartsOf(one),
+    _ -> PartsOfAny(widest.sort_by_key(|q: Place| q.param)),
+  }
+}
 
 /// What a call of a function its entry describes answers, where the lambda it is handed answers a
 /// part of what it walks, or the accumulator a fold threads through it.
@@ -1230,6 +1296,9 @@ fn translated(context: MemberContext, t: Term, args: List<Term>) -> Term / {abor
     Wrapped(x) -> Wrapped(translated(context, x, args)),
     SameLength(p) -> same_length(along(actual(args, p.param), p.path)),
     UnknownTerm -> UnknownTerm,
+    PartsOfAny(ps) ->
+      ps.fold(NoParts, |acc: Term, p: Place|
+        join(acc, made_of(along(actual(args, p.param), p.path)))),
   }
 
 /// What a write at an index leaves of a value: a place's length, kept.
@@ -1391,15 +1460,21 @@ fn joined_parts(a: Term, b: Term) -> Term =
   else if b == NoParts { widened(a) } else {
     match place_of(a) {
       Some(p) -> match place_of(b) {
-        Some(q) -> if p.param != q.param { UnknownTerm } else {
+        Some(q) -> if p.param != q.param { parts_of_places([p, q]) } else {
           let c = { param: p.param, path: common_prefix(p.path, q.path) };
           if !(proper_part(a, c) && proper_part(b, c)) { PartsOf(c) }
           else if below_kind(a) && below_kind(b) { Below(c) }
           else { Inside(c) }
         },
-        None -> UnknownTerm,
+        None -> match b { PartsOfAny(qs) -> parts_of_places(qs.push(p)), _ -> UnknownTerm },
       },
-      None -> UnknownTerm,
+      None -> match a {
+        PartsOfAny(ps) -> match b {
+          PartsOfAny(qs) -> parts_of_places(ps.concat(qs)),
+          _ -> match place_of(b) { Some(q) -> parts_of_places(ps.push(q)), None -> UnknownTerm },
+        },
+        _ -> UnknownTerm,
+      },
     }
   }
 
@@ -1426,7 +1501,11 @@ fn proper_part(t: Term, c: Place) -> Bool =
 /// Reached through elements and fields alone.
 fn below_kind(t: Term) -> Bool = match t { Below(_) -> true, Exactly(_) -> true, _ -> false }
 
-fn widened(t: Term) -> Term = match place_of(t) { Some(p) -> PartsOf(p), None -> UnknownTerm }
+fn widened(t: Term) -> Term =
+  match t {
+    PartsOfAny(_) -> t,
+    _ -> match place_of(t) { Some(p) -> PartsOf(p), None -> UnknownTerm },
+  }
 
 /// The place a term is, or is a part of.
 fn place_of(t: Term) -> Option<Place> =

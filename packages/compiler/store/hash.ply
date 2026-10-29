@@ -1,17 +1,11 @@
 //! Content addressing: a definition's identity is its normalized structure, so a name is never part of it.
 //! A float literal hashes by its IEEE bit pattern.
 
-import compiler.syntax.parsing (Span, Ident, span_bin, dummy_span)
+import compiler.syntax.parsing (Span, span_bin, dummy_span)
 import std.bin
 import compiler.syntax.type_syntax (TypeExpr)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause, HandlerVar,
-                              RecField, ETagged, Hole, expr_span, prelude_module)
-import compiler.syntax.items (Module, Item, IFn, SpecClause, Derived, parse, is_pub, schema_of)
+import compiler.syntax.exprs (Expr, ELambda, Param, expr_span, prelude_module, expr_nodes_folded)
+import compiler.syntax.items (Module, SpecClause, Derived, parse, is_pub, schema_of)
 import compiler.expand.rewrite (expand)
 import compiler.check.resolve.tables (Source, Diag, label_at, diag_bin)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules, dump_diags)
@@ -28,7 +22,7 @@ import compiler.store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, 
 import compiler.store.hash.encoding (hex, Choice, Found, Pick, Waiting)
 import compiler.store.hash.template (site_key, called_at, choice_at, test_template, law_template,
                                      spec_template, type_template, new_encoder)
-import compiler.store.hash.fill (Finished, references, type_references)
+import compiler.store.hash.fill (references, type_references)
 import compiler.store.hash.forms (First, build_index, listed_refs, member_hash, framed_picks,
                                   open_picks_bin, HashOutput, Refs, solo_body, member_body, Shapes,
                                   shapes_of, over_of, NodeRef, Fixed, FixedTest, FixedLaw, Fixing,
@@ -521,53 +515,10 @@ fn ret_refs(index: Index, module: Int, exprs: List<Expr>) -> List<Int> / {abort.
       type_template(new_encoder(index, module), t)),
   )
 
+/// `out` with the return type each lambda in `e` writes, in the order they are written.
 fn lambda_rets(e: Expr, out: List<TypeExpr>) -> List<TypeExpr> =
-  match e {
-    ELambda(l) -> lambda_rets(l.body, match l.ret { Some(t) -> out.push(t), None -> out }),
-    ELit(_) -> out,
-    ETagged(t) -> t.holes.fold(out, |acc: List<TypeExpr>, h: Hole| lambda_rets(h.value, acc)),
-    EVar(_) -> out,
-    EHole(_) -> out,
-    EBad(_) -> out,
-    EBinary(b) -> lambda_rets(b.rhs, lambda_rets(b.lhs, out)),
-    EUnary(u) -> lambda_rets(u.operand, out),
-    EApp(a) ->
-      a.args.fold(lambda_rets(a.func, out), |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
-    EIf(i) -> lambda_rets(i.else_branch, lambda_rets(i.then_branch, lambda_rets(i.cond, out))),
-    EMatch(m) ->
-      m.arms.fold(lambda_rets(m.scrutinee, out), |acc: List<TypeExpr>, arm: MatchArm|
-        lambda_rets(arm.body, match arm.guard { Some(g) -> lambda_rets(g, acc), None -> acc })),
-    EBlock(b) -> {
-      let walked = b.stmts.fold(out, |acc: List<TypeExpr>, s: Stmt|
-        match s {
-          SLet(x) -> lambda_rets(x.value, acc),
-          SLetElse(x) -> lambda_rets(x.fallback, lambda_rets(x.value, acc)),
-          SExpr(x) -> lambda_rets(x, acc),
-          SAssign(x) -> lambda_rets(x.value, acc),
-        });
-      match b.tail { Some(t) -> lambda_rets(t, walked), None -> walked }
-    },
-    ERecord(r) -> r.fields.fold(out, |acc: List<TypeExpr>, f: RecField| lambda_rets(f.value, acc)),
-    ERecordUpdate(r) ->
-      r.fields.fold(lambda_rets(r.base, out), |acc: List<TypeExpr>, f: RecField|
-        lambda_rets(f.value, acc)),
-    ETry(t) -> lambda_rets(t.operand, out),
-    EField(f) -> lambda_rets(f.base, out),
-    EList(l) -> l.items.fold(out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
-    EPerform(p) -> p.args.fold(out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
-    EHandle(h) -> {
-      let inits = h.vars.fold(out, |acc: List<TypeExpr>, v: HandlerVar| lambda_rets(v.init, acc));
-      let clauses = h.clauses.fold(
-        lambda_rets(h.body, inits),
-        |acc: List<TypeExpr>, c: HandleClause| lambda_rets(c.body, acc),
-      );
-      match h.ret { Some(rc) -> lambda_rets(rc.body, clauses), None -> clauses }
-    },
-    EWithHold(c) -> lambda_rets(c.body, lambda_rets(c.release, lambda_rets(c.acquire, out))),
-    ESimulate(s) -> lambda_rets(s.body, out),
-    ETryBlock(t) -> lambda_rets(t.body, out),
-    EParallel(v) -> v.branches.fold(out, |acc: List<TypeExpr>, x: Expr| lambda_rets(x, acc)),
-  }
+  expr_nodes_folded(e, out, |acc: List<TypeExpr>, x: Expr|
+    match x { ELambda(l) -> match l.ret { Some(t) -> acc.push(t), None -> acc }, _ -> acc })
 
 /// A schema's guard is a root, so a schema nothing instantiates is reported once, by its own name.
 fn is_root(index: Index, node: Node) -> Bool / {abort.raise} =

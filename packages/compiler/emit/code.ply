@@ -15,17 +15,20 @@ import compiler.check.typed (TypedExpr, TypedLit, TypedRead, TypedUnary, TypedBi
                              TypedLitPattern, TypedRange, TypedCase, TypedRecordPattern,
                              TypedListPattern, TypedOr, TypedFieldPattern, TypedStmt, TypedLet,
                              TypedLetElse, TypedDo, TypedAssign, TypedClause, TypedReturn,
-                             TypedHandlerVar, typed_nodes, NumericWitness, ConcreteWitness,
+                             TypedHandlerVar, typed_expr_nodes, NumericWitness, ConcreteWitness,
                              ParamWitness, StatedWitness, witness_param, TypedRelease, HeldByNode,
                              ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
                              ReleaseFailing, binder_key, holder_key)
 import compiler.expand.rewrite (witness_code, stated_witness_name, numeric_op_code)
+import std.derive.children
 import std.list
 import std.bytes (hex_digit, ascii_of_int)
 import std.string
 
 /// One lowered node: what it is, where its text stands, and its type.
 pub type Code = { node: Node, span: Span, ty: Type }
+
+derive children for Code
 
 pub type Node =
   | NLit(Lit)
@@ -150,84 +153,6 @@ pub fn read_name(c: Code) -> Option<Bytes> =
     NCtor(k) -> Some(k.name),
     NBuiltin(b) -> Some(b.name),
     _ -> None,
-  }
-
-/// `c` with `f` applied to each node after its parts.
-pub fn nodes_mapped(c: Code, f: (Node) -> Node) -> Code = {
-  let go = |x: Code| nodes_mapped(x, f);
-  let opt = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
-  let fields = |fs: List<CodeField>| fs.map(|x: CodeField| { name: x.name, value: go(x.value) });
-  let lambda = |l: Lambda| { ..l, body: go(l.body) };
-  let node = match c.node {
-    NUnary(u) -> NUnary({ ..u, operand: go(u.operand) }),
-    NBinary(b) -> NBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
-    NApp(a) -> NApp({ ..a, func: go(a.func), args: a.args.map(go) }),
-    NIf(i) ->
-      NIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
-    NBlock(b) ->
-      NBlock({
-        stmts: b.stmts.map(|s: CodeStmt|
-          match s {
-            CLet(l) -> CLet({ ..l, value: go(l.value) }),
-            CLetPat(l) -> CLetPat({ ..l, value: go(l.value) }),
-            CDo(d) -> CDo({ code: go(d.code) }),
-          }),
-        tail: opt(b.tail),
-      }),
-    NList(l) -> NList({ items: l.items.map(go) }),
-    NRecord(r) -> NRecord({ fields: fields(r.fields) }),
-    NMatch(m) ->
-      NMatch({
-        scrutinee: go(m.scrutinee),
-        arms: m.arms.map(|a: CodeArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
-      }),
-    NPerform(p) -> NPerform({ ..p, label: opt(p.label), args: p.args.map(go) }),
-    NLambda(l) -> NLambda(lambda(l)),
-    NSimulate(s) -> NSimulate({ ..s, body: go(s.body) }),
-    NParallel(p) -> NParallel({ branches: p.branches.map(go) }),
-    NHandle(h) ->
-      NHandle({
-        ..h,
-        body: go(h.body),
-        clauses: h.clauses.map(|cl: CodeClause| { ..cl, label: opt(cl.label), body: go(cl.body) }),
-        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
-      }),
-    NField(x) -> NField({ ..x, base: go(x.base) }),
-    NUpdate(u) -> NUpdate({ ..u, base: go(u.base), sets: fields(u.sets) }),
-    NKnown(k) -> NKnown({ ..k, lambda: lambda(k.lambda) }),
-    _ -> c.node,
-  };
-  { ..c, node: f(node) }
-}
-
-/// The code `c` holds, each part once.
-pub fn code_parts(c: Code) -> List<Code> =
-  match c.node {
-    NUnary(u) -> [u.operand],
-    NBinary(b) -> [b.lhs, b.rhs],
-    NApp(a) -> a.args.push(a.func),
-    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
-    NBlock(b) ->
-      b.stmts.fold(match b.tail { Some(t) -> [t], None -> [] }, |acc: List<Code>, s: CodeStmt|
-        acc.push(match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code })),
-    NList(l) -> l.items,
-    NRecord(r) -> r.fields.map(|f: CodeField| f.value),
-    NMatch(m) ->
-      m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
-        List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
-    NPerform(p) -> match p.label { Some(l) -> p.args.push(l), None -> p.args },
-    NLambda(l) -> [l.body],
-    NSimulate(s) -> [s.body],
-    NParallel(p) -> p.branches,
-    NHandle(h) ->
-      h.clauses.fold(
-        match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
-        |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
-      ),
-    NField(f) -> [f.base],
-    NUpdate(u) -> u.sets.map(|f: CodeField| f.value).push(u.base),
-    NKnown(k) -> [k.lambda.body],
-    _ -> [],
   }
 
 // --- the dump ---------------------------------------------------------------
@@ -539,7 +464,7 @@ type Binder = { name: Bytes, depth: Int, slot: Int, ty: Type }
 /// The keys of what a release in `body` lets go: a node's own value a failing release after it
 /// names is held by the node itself.
 fn released_in(body: TypedExpr<Type>) -> Map<Int, Bool> =
-  typed_nodes(body).fold(Map::new(), |acc: Map<Int, Bool>, e: TypedExpr<Type>|
+  typed_expr_nodes(body).fold(Map::new(), |acc: Map<Int, Bool>, e: TypedExpr<Type>|
     e.releases.fold(acc, |m: Map<Int, Bool>, r: TypedRelease|
       match r.place {
         ReleaseFailing(_) -> if r.held == HeldByNode(e.span.site) { m }
@@ -1414,7 +1339,7 @@ fn snapshotted(
   lower: (Stack) -> Lowered / {abort.raise},
 ) -> Lowered / {abort.raise} =
   if stack.held.len() == 0 { lower(stack) } else {
-    let used = typed_nodes(e).fold([], |acc: List<HeldVar>, x: TypedExpr<Type>|
+    let used = typed_expr_nodes(e).fold([], |acc: List<HeldVar>, x: TypedExpr<Type>|
       match x.node {
         TypedRead(ReadLocal(n)) -> match held_var(stack, n) {
           Some(h) -> if acc.any(|y: HeldVar| y.name == n) { acc } else { acc.push(h) },

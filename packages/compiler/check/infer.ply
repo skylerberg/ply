@@ -34,7 +34,7 @@ import std.string
 import compiler.check.lent (Passed, passed)
 import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
-                             typed_body_bin, typed_nodes, part_key, TypedRead, TypedUpdate,
+                             typed_body_bin, typed_expr_nodes, part_key, TypedRead, TypedUpdate,
                              WholeBody, TypedParam, NumericWitness, ConcreteWitness, ParamWitness,
                              witness_param, BodyPart, TypedCall, TypedLambda, TypedSimulate,
                              TypedParallel, TypedHandle, TypedPerform, TypedClause, TypedThunk,
@@ -1074,7 +1074,7 @@ fn settled_m(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
 /// The nodes of the bodies the check behind `checker` settled in module 0 whose places `picked`
 /// picks.
 fn nodes_where(checker: Checker, picked: (Span) -> Bool) -> List<TypedExpr<Type>> / {abort.raise} =
-  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).filter(
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_expr_nodes(b.body)).filter(
     |e: TypedExpr<Type>| picked(e.span),
   )
 
@@ -1168,7 +1168,7 @@ fn rows_of_node(e: TypedExpr<Type>) -> List<Bytes> / {abort.raise} = {
 /// `checker` settled in module 0 performs, or the rows a read fills, where `picked` picks its place;
 /// a branch's place is its body's.
 fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
-  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_expr_nodes(b.body)).flat_map(
     |e: TypedExpr<Type>| {
       let own = if picked(e.span) { rows_of_node(e) } else { [] };
       match e.node {
@@ -1212,13 +1212,12 @@ test "a clause binding its continuation holds what resuming it performs" {
     b"effect trace {\n  write step() -> Unit\n}\n",
     b"fn traced() -> Int / {trace.write} = handle { let b = amb.flip(); trace.step(); if b { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + 1 }\n",
   ]);
-  let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
-    |e: TypedExpr<Type>|
-      match e.node {
-        TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
-        _ -> [],
-      },
-  );
+  let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>|
+    typed_expr_nodes(b.body)).flat_map(|e: TypedExpr<Type>|
+    match e.node {
+      TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
+      _ -> [],
+    });
   assert_eq(resumed, [b"{m.trace.step}"])
 }
 
@@ -1858,7 +1857,7 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
 fn passed_in(checker: Checker) -> List<List<NumericWitness>> / {abort.raise} =
   settled_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).flat_map(
     |b: TypedBody<Type>|
-      typed_nodes(b.body).fold([], |acc: List<List<NumericWitness>>, e: TypedExpr<Type>|
+      typed_expr_nodes(b.body).fold([], |acc: List<List<NumericWitness>>, e: TypedExpr<Type>|
         match e.node {
           TypedRead(ReadDefinition(d)) -> if d.witnesses.len() == 0 { acc }
           else { acc.push(d.witnesses) },
@@ -5383,6 +5382,52 @@ test "a list written of parts, pushed or filtered or mapped to parts, is made of
   assert(diverges(walked(b"again", b"Many(xs) -> any(xs.push(t)), _ -> false"), b"again"))
 }
 
+test "a list joined of several places' parts is made of the parts a call hands it" {
+  let tree = b"type T = | Leaf | Node(T, T) | Many(List<T>)\n";
+  let sized = |kids: Bytes|
+    Bytes::concat_all([
+      tree,
+      b"fn kids(t: T) -> List<T> = match t { ",
+      kids,
+      b", Leaf -> [] }\n",
+      b"fn size(t: T) -> Int = 1 + kids(t).fold(0, |n: Int, k: T| n + size(k))\n",
+    ]);
+  assert(!diverges(sized(b"Node(l, r) -> [l].concat([r]), Many(xs) -> xs.concat([])"), b"size"));
+  // Joined with the tree itself, a list holds an element that is no smaller.
+  assert(diverges(sized(b"Node(l, r) -> [l].concat([t]), Many(xs) -> xs"), b"size"));
+  // A helper of two lists answers parts of either, which a call of two parts' lists makes one place's.
+  assert(
+    !diverges(
+      tree.concat(
+        b"fn both(a: List<T>, b: List<T>) -> List<T> = a.concat(b)\nfn size(t: T) -> Int = match t { Node(l, r) -> 1 + both([l], [r]).fold(0, |n: Int, k: T| n + size(k)), Many(xs) -> 1 + xs.fold(0, |n: Int, k: T| n + size(k)), Leaf -> 1 }\n",
+      ),
+      b"size",
+    ),
+  );
+  // `flat_map` calls its function with each element, here a part of the tree.
+  assert(
+    !diverges(
+      tree.concat(
+        b"fn kids(t: T) -> List<T> = match t { Node(l, r) -> [l, r], Many(xs) -> xs, Leaf -> [] }\nfn all(t: T) -> List<T> = [t].concat(kids(t).flat_map(all))\n",
+      ),
+      b"all",
+    ),
+  )
+}
+
+test "a group whose calls reorder what never shrinks ends as its one shrinking measure says" {
+  // Swapping and rotating eight parameters orders them every way, which no loop that shrinks `t`
+  // reads.
+  let src = b"type T = | Leaf | Node(T, T)\nfn spin(t: T, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int = match t { Leaf -> a, Node(l, r) -> spin(l, b, a, c, d, e, f, g, h) + spin(r, b, c, d, e, f, g, h, a) }\n";
+  assert(!diverges(src, b"spin"));
+  assert(
+    diverges(
+      b"type T = | Leaf | Node(T, T)\nfn spin(t: T, a: Int, b: Int) -> Int = match t { Leaf -> a, Node(l, r) -> spin(l, b, a) + spin(t, a, b) }\n",
+      b"spin",
+    ),
+  )
+}
+
 /// Where a site's call is in the source the checker read, as an offset.
 fn offset_of(cx: Checker, s: Site) -> Int / {abort.raise} =
   match def_of(cx, s.caller) {
@@ -8167,7 +8212,7 @@ test "a read inside its own recursive group settles at its definition's own vari
     b"fn len<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + len(rest) }",
     b"m.len",
   ).flat_map(
-    typed_nodes,
+    typed_expr_nodes,
   ).fold([], |acc: List<List<Type>>, e: TypedExpr<Type>|
     match e.node {
       TypedRead(ReadDefinition(d)) -> if d.full == b"m.len" { acc.push(d.args) } else { acc },
@@ -8181,7 +8226,7 @@ test "an update settles with the fields it copies from its base" {
     b"fn moved(p: {x: Int, y: Int}) -> {x: Int, y: Int} = { ..p, x: 1 }",
     b"m.moved",
   ).flat_map(
-    typed_nodes,
+    typed_expr_nodes,
   ).fold([], |acc: List<List<Bytes>>, e: TypedExpr<Type>|
     match e.node { TypedUpdate(u) -> acc.push(u.copies), _ -> acc });
   assert_eq(copies, [[b"y"]])

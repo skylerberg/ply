@@ -9,8 +9,8 @@ import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, ISchema, Ty
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
-                              SLetElse, SExpr, SAssign, HandlerVar, Param, NamedArg, MatchArm,
-                              HandleClause, RecField, expr_span, ETagged, Tagged, Hole)
+                              SLetElse, SExpr, SAssign, Param, MatchArm, RecField, expr_span,
+                              ETagged, Tagged, expr_nodes_mapped, expr_nodes_folded)
 
 // --- Shared ---------------------------------------------------------------------
 
@@ -83,100 +83,10 @@ pub fn is_pure(e: Expr) -> Bool =
 
 // --- Record update -----------------------------------------------------------------------
 
-/// Children first, then the node through `f`: a nested update inside a written field expands
-/// before its owner, and what `f` builds is not visited again.
-pub fn map_expr(e: Expr, f: (Expr) -> Expr) -> Expr = {
-  let go = |x: Expr| map_expr(x, f);
-  let opt = |x: Option<Expr>| match x { None -> None, Some(y) -> Some(map_expr(y, f)) };
-  let fields = |fs: List<RecField>| fs.map(|fl: RecField| { name: fl.name, value: go(fl.value) });
-  f(match e {
-    EBinary(b) -> EBinary({ span: b.span, op: b.op, lhs: go(b.lhs), rhs: go(b.rhs) }),
-    EUnary(u) -> EUnary({ span: u.span, op: u.op, operand: go(u.operand) }),
-    ELambda(l) -> ELambda({ span: l.span, body: go(l.body), params: l.params, ret: l.ret }),
-    EApp(a) ->
-      EApp({
-        span: a.span,
-        func: go(a.func),
-        named: a.named.map(|arg: NamedArg|
-          { name: arg.name, value: go(arg.value), span: arg.span }),
-        args: a.args.map(go),
-        labels: a.labels,
-      }),
-    EIf(i) ->
-      EIf({
-        span: i.span,
-        cond: go(i.cond),
-        then_branch: go(i.then_branch),
-        else_branch: go(i.else_branch),
-      }),
-    EMatch(m) ->
-      EMatch({
-        span: m.span,
-        scrutinee: go(m.scrutinee),
-        arms: m.arms.map(|arm: MatchArm|
-          { pat: arm.pat, guard: opt(arm.guard), body: go(arm.body), span: arm.span }),
-      }),
-    EBlock(b) ->
-      EBlock({
-        span: b.span,
-        tail: opt(b.tail),
-        stmts: b.stmts.map(|stmt: Stmt|
-          match stmt {
-            SLet(l) -> SLet({ span: l.span, pat: l.pat, ty: l.ty, value: go(l.value) }),
-            SLetElse(l) ->
-              SLetElse({
-                span: l.span,
-                pat: l.pat,
-                ty: l.ty,
-                value: go(l.value),
-                fallback: go(l.fallback),
-              }),
-            SExpr(x) -> SExpr(go(x)),
-            SAssign(x) -> SAssign({ ..x, value: go(x.value) }),
-          }),
-      }),
-    ERecord(r) -> ERecord({ span: r.span, fields: fields(r.fields) }),
-    ERecordUpdate(r) -> ERecordUpdate({ span: r.span, base: go(r.base), fields: fields(r.fields) }),
-    EField(fl) -> EField({ span: fl.span, base: go(fl.base), field: fl.field }),
-    ETry(t) -> ETry({ span: t.span, operand: go(t.operand) }),
-    EList(l) -> EList({ span: l.span, items: l.items.map(go) }),
-    EPerform(x) ->
-      EPerform({ span: x.span, eff: x.eff, op: x.op, resource: x.resource, args: x.args.map(go) }),
-    EHandle(h) ->
-      EHandle({
-        span: h.span,
-        body: go(h.body),
-        ret: match h.ret {
-          None -> None,
-          Some(rc) -> Some({ binder: rc.binder, body: go(rc.body), span: rc.span }),
-        },
-        clauses: h.clauses.map(|c: HandleClause|
-          {
-            eff: c.eff,
-            op: c.op,
-            resource: c.resource,
-            every_label: c.every_label,
-            label_binder: c.label_binder,
-            resume: c.resume,
-            body: go(c.body),
-            span: c.span,
-            params: c.params,
-          }),
-        vars: h.vars.map(|v: HandlerVar| { ..v, init: go(v.init) }),
-      }),
-    EWithHold(c) ->
-      EWithHold({ ..c, acquire: go(c.acquire), release: go(c.release), body: go(c.body) }),
-    ESimulate(x) -> ESimulate({ span: x.span, body: go(x.body) }),
-    EParallel(x) -> EParallel({ span: x.span, branches: x.branches.map(go) }),
-    ETryBlock(t) -> ETryBlock({ ..t, body: go(t.body) }),
-    ETagged(t) -> ETagged({ ..t, holes: t.holes.map(|h: Hole| { ..h, value: go(h.value) }) }),
-    _ -> e,
-  })
-}
-
-/// Every expression an item holds, through `map_expr`.
+/// Every expression an item holds, each mapped after the ones inside it, so what `f` builds is not
+/// visited again.
 pub fn map_item(item: Item, f: (Expr) -> Expr) -> Item = {
-  let go = |x: Expr| map_expr(x, f);
+  let go = |x: Expr| expr_nodes_mapped(x, f);
   match item {
     IFn(d) ->
       IFn({
@@ -217,88 +127,28 @@ pub fn tagged_in(module: Module) -> List<Tagged> =
 
 /// Every expression `wanted` picks among those a module's definitions, tests and laws hold, in the
 /// order they are written, one that holds another before it.
-pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> =
+pub fn picked_in(module: Module, wanted: (Expr) -> Bool) -> List<Expr> = {
+  let picked = |e: Expr, found: List<Expr>|
+    expr_nodes_folded(e, found, |acc: List<Expr>, x: Expr|
+      if wanted(x) { acc.push(x) } else { acc });
   module.items.fold([], |acc: List<Expr>, item: Item|
     match item {
       IFn(d) ->
-        d.spec.fold(picked(d.body, wanted, acc), |out: List<Expr>, clause: SpecClause|
-          picked(clause.expr, wanted, out)),
+        d.spec.fold(picked(d.body, acc), |out: List<Expr>, clause: SpecClause|
+          picked(clause.expr, out)),
       // Over cases, the label and the table are written before the body.
       ITest(d) ->
-        picked(d.body, wanted, match d.cases {
+        picked(d.body, match d.cases {
           None -> acc,
-          Some(c) -> picked(c.table, wanted, picked(c.label, wanted, acc)),
+          Some(c) -> picked(c.table, picked(c.label, acc)),
         }),
       // An instantiation's guard is given what its body is, which is picked once, in the body.
       ILaw(d) -> {
-        let guarded = match ((d.guard, d.of)) {
-          (Some(g), None) -> picked(g, wanted, acc),
-          _ -> acc,
-        };
-        picked(d.body, wanted, guarded)
+        let guarded = match ((d.guard, d.of)) { (Some(g), None) -> picked(g, acc), _ -> acc };
+        picked(d.body, guarded)
       },
       _ -> acc,
     })
-
-/// Every node `e` is or holds, each before what it holds.
-pub fn nodes_of(e: Expr) -> List<Expr> = picked(e, |_: Expr| true, [])
-
-fn picked(e: Expr, wanted: (Expr) -> Bool, found: List<Expr>) -> List<Expr> = {
-  let out = if wanted(e) { found.push(e) } else { found };
-  let all = |es: List<Expr>, acc: List<Expr>|
-    es.fold(acc, |a: List<Expr>, x: Expr| picked(x, wanted, a));
-  let maybe = |o: Option<Expr>, acc: List<Expr>|
-    match o { None -> acc, Some(x) -> picked(x, wanted, acc) };
-  let fields = |fs: List<RecField>, acc: List<Expr>|
-    fs.fold(acc, |a: List<Expr>, f: RecField| picked(f.value, wanted, a));
-  match e {
-    EHole(_) -> out,
-    EBinary(b) -> picked(b.rhs, wanted, picked(b.lhs, wanted, out)),
-    EUnary(u) -> picked(u.operand, wanted, out),
-    ELambda(l) -> picked(l.body, wanted, out),
-    EApp(a) ->
-      a.named.fold(all(a.args, picked(a.func, wanted, out)), |acc: List<Expr>, arg: NamedArg|
-        picked(arg.value, wanted, acc)),
-    EIf(i) ->
-      picked(i.else_branch, wanted, picked(i.then_branch, wanted, picked(i.cond, wanted, out))),
-    EMatch(m) ->
-      m.arms.fold(picked(m.scrutinee, wanted, out), |acc: List<Expr>, arm: MatchArm|
-        picked(arm.body, wanted, maybe(arm.guard, acc))),
-    EBlock(b) ->
-      maybe(
-        b.tail,
-        b.stmts.fold(out, |acc: List<Expr>, stmt: Stmt|
-          match stmt {
-            SLet(l) -> picked(l.value, wanted, acc),
-            SLetElse(l) -> picked(l.fallback, wanted, picked(l.value, wanted, acc)),
-            SExpr(x) -> picked(x, wanted, acc),
-            SAssign(x) -> picked(x.value, wanted, acc),
-          }),
-      ),
-    ERecord(r) -> fields(r.fields, out),
-    ERecordUpdate(r) -> fields(r.fields, picked(r.base, wanted, out)),
-    ETry(t) -> picked(t.operand, wanted, out),
-    EField(f) -> picked(f.base, wanted, out),
-    EList(l) -> all(l.items, out),
-    EPerform(x) -> all(x.args, out),
-    EHandle(h) -> {
-      let inits = h.vars.fold(out, |acc: List<Expr>, v: HandlerVar| picked(v.init, wanted, acc));
-      let clauses = h.clauses.fold(
-        picked(h.body, wanted, inits),
-        |acc: List<Expr>, c: HandleClause| picked(c.body, wanted, acc),
-      );
-      match h.ret { None -> clauses, Some(rc) -> picked(rc.body, wanted, clauses) }
-    },
-    EWithHold(c) ->
-      picked(c.body, wanted, picked(c.release, wanted, picked(c.acquire, wanted, out))),
-    ESimulate(x) -> picked(x.body, wanted, out),
-    EParallel(x) -> all(x.branches, out),
-    ETryBlock(t) -> picked(t.body, wanted, out),
-    ETagged(t) -> t.holes.fold(out, |acc: List<Expr>, h: Hole| picked(h.value, wanted, acc)),
-    ELit(_) -> out,
-    EVar(_) -> out,
-    EBad(_) -> out,
-  }
 }
 
 // --- The try block ---------------------------------------------------------------------------
@@ -434,47 +284,5 @@ pub fn any_expr(module: Module, p: (Expr) -> Bool) -> Bool =
       }))
 
 /// How many expressions within `e`, itself included, `p` holds for.
-pub fn count_in(e: Expr, p: (Expr) -> Bool) -> Int = {
-  let all = |es: List<Expr>| es.fold(0, |n: Int, x: Expr| n + count_in(x, p));
-  let maybe = |o: Option<Expr>| match o { None -> 0, Some(x) -> count_in(x, p) };
-  (if p(e) { 1 } else { 0 })
-    + (match e {
-      EBinary(b) -> count_in(b.lhs, p) + count_in(b.rhs, p),
-      EUnary(u) -> count_in(u.operand, p),
-      ELambda(l) -> count_in(l.body, p) + l.params.fold(0, |n: Int, x: Param| n + maybe(x.default)),
-      EApp(a) ->
-        count_in(a.func, p) + all(a.args)
-          + a.named.fold(0, |n: Int, arg: NamedArg| n + count_in(arg.value, p)),
-      EIf(i) -> count_in(i.cond, p) + count_in(i.then_branch, p) + count_in(i.else_branch, p),
-      EMatch(m) ->
-        count_in(m.scrutinee, p)
-          + m.arms.fold(0, |n: Int, arm: MatchArm| n + count_in(arm.body, p) + maybe(arm.guard)),
-      EBlock(b) ->
-        b.stmts.fold(0, |n: Int, stmt: Stmt|
-            n
-              + (match stmt {
-                SLet(l) -> count_in(l.value, p),
-                SLetElse(l) -> count_in(l.value, p) + count_in(l.fallback, p),
-                SExpr(x) -> count_in(x, p),
-                SAssign(x) -> count_in(x.value, p),
-              }))
-          + maybe(b.tail),
-      ERecord(r) -> r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
-      ERecordUpdate(r) ->
-        count_in(r.base, p) + r.fields.fold(0, |n: Int, f: RecField| n + count_in(f.value, p)),
-      ETry(t) -> count_in(t.operand, p),
-      EField(f) -> count_in(f.base, p),
-      EList(l) -> all(l.items),
-      EPerform(x) -> all(x.args),
-      EHandle(h) ->
-        count_in(h.body, p) + h.clauses.fold(0, |n: Int, c: HandleClause| n + count_in(c.body, p))
-          + (match h.ret { None -> 0, Some(rc) -> count_in(rc.body, p) })
-          + h.vars.fold(0, |n: Int, v: HandlerVar| n + count_in(v.init, p)),
-      EWithHold(c) -> count_in(c.acquire, p) + count_in(c.release, p) + count_in(c.body, p),
-      ESimulate(x) -> count_in(x.body, p),
-      EParallel(x) -> all(x.branches),
-      ETryBlock(x) -> count_in(x.body, p),
-      ETagged(t) -> t.holes.fold(0, |n: Int, h: Hole| n + count_in(h.value, p)),
-      _ -> 0,
-    })
-}
+pub fn count_in(e: Expr, p: (Expr) -> Bool) -> Int =
+  expr_nodes_folded(e, 0, |n: Int, x: Expr| if p(x) { n + 1 } else { n })
