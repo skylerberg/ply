@@ -1,4 +1,3 @@
-mod meter;
 mod time;
 mod toolchain;
 
@@ -31,16 +30,15 @@ fn addr(bytes: &[u8]) -> (Addr, I64) {
 #[test]
 fn a_native_that_asks_the_machine_leaves_the_run_having_read_it() {
     let mut ctx = context();
-    assert!(!ctx.take_host_use().0.acted());
+    assert!(!ctx.take_host_use().acted());
     let cpus = unsafe { rt_os_cpus(&mut ctx) };
     assert!(cpus.0 >= 1);
     assert!(ctx.take_failure().is_none());
-    let (used, at_most_once) = ctx.take_host_use();
+    let used = ctx.take_host_use();
     assert!(
         used.acted(),
         "a read of the machine left the run hermetic: {used:?}"
     );
-    assert_eq!(at_most_once, 0);
 }
 
 /// The ticket of `job`, submitted for `ctx`'s run as a native submits one.
@@ -255,7 +253,7 @@ fn a_hash_is_a_ticket_of_a_deterministic_job_and_one_past_its_bounds_is_refused(
         })
         .collect();
     assert_eq!(taken(&mut ctx, n.0), tag);
-    let (used, _) = ctx.take_host_use();
+    let used = ctx.take_host_use();
     assert_eq!(used.operations, 1);
     assert!(!used.acted(), "a hash read the machine: {used:?}");
 

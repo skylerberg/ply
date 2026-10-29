@@ -1,6 +1,6 @@
 //! A nullary pure definition is a constant: its body runs once per unit, and every later read is
-//! the memo's, which costs the entry that reads it no step. Counted by the steps each entry spent
-//! and bounded by its step budget, never timed.
+//! the memo's. Told by the call depth limit: each probe reads a definition from deep enough that
+//! running its body there would pass the limit, so only a read the memo answers comes back.
 
 import harness (Here, Shipped, Loaded, entered, loaded, project, scratch, unloaded)
 import cli.machine
@@ -19,12 +19,12 @@ fn constants() -> String =
   \\
   \\fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
   \\
-  \\pub fn constant() -> Int = deep(700)
+  \\pub fn constant() -> Int = deep(6000)
   \\
-  \\pub fn parameterized(ignored: Int) -> Int = deep(700)
+  \\pub fn parameterized(ignored: Int) -> Int = deep(6000)
   \\
   \\// Performs nothing; the row is the published claim and is what decides this.
-  \\pub fn over_declared() -> Int / {store.read} = deep(700)
+  \\pub fn over_declared() -> Int / {store.read} = deep(6000)
   \\
   \\fn nest_constant(n: Int) -> Int = if n <= 0 { constant() } else { nest_constant(n - 1) + 0 }
   \\
@@ -34,6 +34,8 @@ fn constants() -> String =
   \\fn nest_over_declared(n: Int) -> Int / {store.read} =
   \\  if n <= 0 { over_declared() } else { nest_over_declared(n - 1) + 0 }
   \\
+  \\fn nest_reads(n: Int) -> Int = if n <= 0 { reads(1000, 0) } else { nest_reads(n - 1) + 0 }
+  \\
   \\pub fn probe_constant(n: Int) -> Int = constant() + nest_constant(n)
   \\
   \\pub fn probe_parameterized(n: Int) -> Int = parameterized(0) + nest_parameterized(n)
@@ -41,84 +43,67 @@ fn constants() -> String =
   \\pub fn probe_over_declared(n: Int) -> Int / {store.read} =
   \\  over_declared() + nest_over_declared(n)
   \\
+  \\pub fn probe_reads(n: Int) -> Int = constant() + nest_reads(n)
+  \\
   \\pub fn reads(n: Int, sum: Int) -> Int = if n <= 0 { sum } else { reads(n - 1, sum + constant()) }
   \\
-  \\pub fn reads_literal(n: Int, sum: Int) -> Int =
-  \\  if n <= 0 { sum } else { reads_literal(n - 1, sum + 700) }
-  \\
 
-/// The program compiled, opened and bound, each entry within `steps` steps; none for no bound.
-fn bound_within(steps: Int) -> Loaded / {Here, Shipped, Driving, abort.raise} = {
+/// What a definition's body answers, and how deeply it nests to answer it.
+fn work() -> Int = 6000
+
+/// The program compiled, opened and bound.
+fn bound() -> Loaded / {Here, Shipped, Driving, abort.raise} = {
   project([{ path: "inner.ply", text: constants() }]);
-  loaded({ ..default_options(), steps: steps })
+  loaded(default_options())
 }
 
-/// What one entry answered, as an `Int` or the code it raised, and the steps it spent.
-type Spent = { answer: Result<Int, Bytes>, steps: Int }
-
-fn answered(l: Loaded, name: String, args: List<Value>) -> Spent / {Driving, abort.raise} = {
-  let o = entered(l, name, args);
-  {
-    answer: match machine::answer_of(o, l.roots, name) {
-      Ok(VInt(i)) -> Ok(i),
-      Ok(_) -> Err(b"not an Int"),
-      Err(r) -> Err(r.diag.code),
-    },
-    steps: o.usage.steps,
+/// What one entry answered, as an `Int`, or the code it ended with.
+fn answered(
+  l: Loaded,
+  name: String,
+  args: List<Value>,
+) -> Result<Int, Bytes> / {Driving, abort.raise} =
+  match machine::answer_of(entered(l, name, args), l.roots, name) {
+    Ok(VInt(i)) -> Ok(i),
+    Ok(_) -> Err(b"not an Int"),
+    Err(r) -> Err(r.diag.code),
   }
-}
 
-/// Within a budget the deep definition fits once and not twice: a remembered constant fits, and a
-/// definition run again past its first answer is the budget's own refusal.
+/// `name` read once near the top, then again `work()` calls deep, where its body would nest past
+/// the call depth limit: within it only where the memo answers the second read.
 fn probed(name: String) -> Result<Int, Bytes> / {Here, Shipped, Driving, abort.raise} = {
-  let l = bound_within(1500);
-  let probe = answered(l, name, [VInt(400)]).answer;
+  let l = bound();
+  let probe = answered(l, name, [VInt(work())]);
   let _ = unloaded(l);
   probe
 }
 
 test "a nullary pure definition is evaluated once, whatever depth reads it again" {
-  scratch(|| { assert_eq(probed("probe_constant"), Ok(1400)) })
+  scratch(|| { assert_eq(probed("probe_constant"), Ok(2 * work())) })
 }
 
 test "a definition with a parameter is no constant, however dead the parameter is" {
-  scratch(|| { assert_eq(probed("probe_parameterized"), Err(b"E0503")) })
+  scratch(|| { assert_eq(probed("probe_parameterized"), Err(b"E0502")) })
 }
 
 test "a published row the body never performs keeps a definition from the memo" {
-  scratch(|| { assert_eq(probed("probe_over_declared"), Err(b"E0503")) })
+  scratch(|| { assert_eq(probed("probe_over_declared"), Err(b"E0502")) })
 }
 
-// Counted in calls: all `reads` spends beyond `reads_literal` is `constant`'s body, once.
 test "a constant read a thousand times runs its body once" {
-  scratch(|| {
-    let l = bound_within(0);
-    let first = answered(l, "constant", []);
-    assert_eq(first.answer, Ok(700));
-    assert(first.steps > 0, Some("no call of `constant`'s body was counted"));
-    // A memo's answer costs the entry that reads it nothing.
-    assert_eq(answered(l, "constant", []), { answer: Ok(700), steps: 0 });
-    let looped = answered(l, "reads_literal", [VInt(1000), VInt(0)]);
-    assert_eq(looped.answer, Ok(700000));
-    let _ = unloaded(l);
-    let fresh = bound_within(0);
-    let read = answered(fresh, "reads", [VInt(1000), VInt(0)]);
-    let _ = unloaded(fresh);
-    assert_eq(read, { answer: Ok(700000), steps: looped.steps + first.steps })
-  })
+  scratch(|| { assert_eq(probed("probe_reads"), Ok(1001 * work())) })
 }
 
 // A name the unit never compiled and a compiled one offered the wrong number of arguments are each
 // declined before any body runs.
-test "a declined call counts no steps" {
+test "a call of no definition, or with the wrong arguments, is declined" {
   scratch(|| {
-    let l = bound_within(0);
-    assert(answered(l, "parameterized", [VInt(0)]).steps > 0, Some("the call ran no body"));
+    let l = bound();
+    assert_eq(answered(l, "parameterized", [VInt(0)]), Ok(work()));
     let absent = answered(l, "absent", []);
-    assert(absent.answer != Ok(0), Some("an absent name answered"));
     let short = answered(l, "parameterized", []);
-    assert(short.answer != Ok(700), Some("the wrong number of arguments answered"));
     let _ = unloaded(l);
-    assert_eq((absent.steps, short.steps), (0, 0))
+    assert(absent != Ok(0), Some("an absent name answered"));
+    assert(short != Ok(work()), Some("the wrong number of arguments answered"))
   })
 }

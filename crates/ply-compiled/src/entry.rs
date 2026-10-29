@@ -132,8 +132,6 @@ pub struct Watch<'a> {
 /// How an entry is bounded and what it is run with.
 #[derive(Clone, Debug)]
 pub struct Run {
-    /// Calls the entry may make; 0 is no bound.
-    pub steps: i64,
     /// Milliseconds of wall clock the entry may take; 0 is no clock.
     pub timeout_ms: u64,
     /// How deeply its calls may nest.
@@ -146,7 +144,7 @@ pub struct Run {
     /// Whether to read the wall clock for how long the entry took.
     pub measure: bool,
     /// Whether the entry is a test's: its usage counts every perform, those its own handlers answer
-    /// included, and the objects it leaves live, and its program may read what it costs.
+    /// included, and the objects it leaves live.
     pub tested: bool,
 }
 
@@ -154,7 +152,6 @@ impl Run {
     /// A run bounded by nothing but how deeply its calls nest, as a program's own entry is.
     pub fn unbounded(depth: i64) -> Run {
         Run {
-            steps: 0,
             timeout_ms: 0,
             depth,
             seed: None,
@@ -169,7 +166,8 @@ impl Run {
 pub enum Ended {
     /// The root answered: its answer's PLV1.
     Answered(Vec<u8>),
-    /// A raise nothing answered, a runtime error, a budget spent, or an answer the boundary refuses.
+    /// A raise nothing answered, a runtime error, the clock run out, or an answer the boundary
+    /// refuses.
     Failed(Diagnostic),
     /// A Rust unwind out of the entry, with what it said.
     Panicked(String),
@@ -186,8 +184,6 @@ pub struct Usage {
     pub nanos: u64,
     /// Whether it reached a nondeterministic host handler.
     pub host: bool,
-    /// Calls the entry made.
-    pub steps: u64,
     /// The operations it performed: every one where the run counted them, else those a handler
     /// the runtime keeps answered.
     pub performs: u64,
@@ -279,7 +275,6 @@ pub fn enter(
         ctx.set_host(bound.binding(), Some(runtime), Some(factory));
     }
     ctx.re_executed = run.re_executed;
-    ctx.tested = run.tested;
     ctx.trace_performs(run.tested);
     let (seed, steps) = run
         .seed
@@ -306,7 +301,6 @@ pub fn enter(
                 usage: Usage {
                     nanos,
                     host: ctx.host_use.acted(),
-                    steps: last.steps,
                     performs: last.performs,
                     held: last.held,
                     updates: counters.updates.saturating_sub(counted.updates),
@@ -350,7 +344,6 @@ pub fn on_program_thread<T: Send>(enter: impl FnOnce() -> T + Send) -> Option<T>
 
 /// What an entry leaves for its outcome once its root returned.
 struct Last {
-    steps: u64,
     performs: u64,
     held: Held,
     interleaving: Option<Vec<u8>>,
@@ -386,7 +379,7 @@ fn entered(
     run: &Run,
     root: &str,
 ) -> (Ended, Last) {
-    ctx.begin_bounded(run.depth, run.steps, run.timeout_ms);
+    ctx.begin_bounded(run.depth, run.timeout_ms);
     let giving_back = GivingBack(std::ptr::from_mut(ctx));
     ctx.open_entry(arguments);
     let entering = std::ptr::from_mut(ctx);
@@ -422,7 +415,6 @@ fn returned(ctx: &mut Ctx) -> Last {
         ctx.teardown.extend(warned);
     }
     Last {
-        steps: u64::try_from(ctx.ticks).unwrap_or(0),
         performs: ctx.performed.len() as u64,
         held,
         interleaving: ctx.interleaving.take(),
@@ -768,12 +760,11 @@ struct Asked {
     run: Run,
 }
 
-/// `run := int binding, bool hosted, int steps, int timeout_ms, int depth, option(seed),
-/// bool re_executed, bool observe, bool measure, bool tested`.
+/// `run := int binding, bool hosted, int timeout_ms, int depth, option(seed), bool re_executed,
+/// bool observe, bool measure, bool tested`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
-    let steps = r.int()?;
     let timeout_ms = r.count()?;
     let depth = r.int()?;
     let seed = r.option(read_seed)?;
@@ -786,7 +777,6 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
         hosted,
         observe,
         run: Run {
-            steps,
             timeout_ms,
             depth,
             seed,
@@ -813,9 +803,8 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),
 /// option(bytes) trace`; `ended := tag 0 bytes answer | 1 failure | 2 string panic | 3 no root |
-/// 4 string why unanswerable`; `usage := int nanos, bool host, int steps, int performs, int
-/// native_objects, int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place,
-/// int live`.
+/// 4 string why unanswerable`; `usage := int nanos, bool host, int performs, int native_objects,
+/// int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place, int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
         Ended::Answered(bytes) => {
@@ -841,7 +830,6 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
     let u = &outcome.usage;
     w.count(u.nanos)
         .bool(u.host)
-        .count(u.steps)
         .count(u.performs)
         .count(u.held.native_objects)
         .count(u.held.scheduled)

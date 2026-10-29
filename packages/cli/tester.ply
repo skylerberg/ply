@@ -6,7 +6,6 @@
 //! nothing and run at once.
 
 import compiler.load (LoadedAnalysis)
-import compiler.front.published (FiledBody, FiledDef)
 import compiler.front.rows (Dump, EmitterRoot, ModuleSpan, TestRow)
 import compiler.store.hash.forms (ModuleHashed, Reached)
 import compiler.emit.keys (Cases, root_name, root_text, test_key)
@@ -23,76 +22,41 @@ import std.list
 import std.machine as entering
 import std.value (Value, VUnit, VInt, VBytes, VRecord, VStr, VList, field_named)
 import std.value
-import testing.conclude (Filing, ReachedHashes)
-import std.cli (Parsed, has, parse_nat, value, values_of)
+import testing.conclude (Filing)
+import std.cli (Parsed, has, parse_nat, value)
 import surface
 import surface (Shard, parsed)
 import units
 import units (emit)
 
-/// What a run is configured with: the report flags, the machine's budgets and bounds, and what of
-/// the host it is lent.
+/// What a run of tests is configured with beyond the shared flags: what the run selects, how it
+/// searches and reports, and in `machine` the clock, the profile and what of the host each test is
+/// lent.
 pub type Options = {
-  path: String,
-  json: Bool,
-  explain: Bool,
-  no_cache: Bool,
-  filters: List<String>,
   /// `--shard K/N`: of the tests the rest selects, those whose key hashes into part K.
   shard: Option<Shard>,
   jobs: Option<Int>,
-  steps: Int,
-  timeout: Int,
-  bisect: String,
-  bisect_budget: Int,
   coverage: Bool,
   mutate: Option<String>,
   mutate_budget: Int,
-  profile: String,
-  watch: Bool,
-  tls: List<machine::TlsCredential>,
-  trust: List<String>,
-  mtls: List<String>,
-  fs: List<machine::Named>,
-  /// The programs a test's `process.spawn` may start, and the families the tests are lent.
-  exec: List<machine::Named>,
-  allow: List<String>,
-  config: machine::ConfigOptions,
+  machine: machine::Options,
   sim: machine::SimulationOptions,
 }
 
 /// The options record, built from the parsed line.
-pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} = {
-  let machine_options = machine::options_from(p);
+pub fn options_from(p: Parsed) -> Options / {abort.raise} = {
   let count = |long: String, default: Int|
     match value(p, long) {
       Some(v) -> match parse_nat(v) { Some(n) -> n, None -> 0 },
       None -> default,
     };
   {
-    path: root,
-    json: has(p, "json"),
-    explain: has(p, "explain"),
-    no_cache: has(p, "no-cache"),
-    filters: values_of(p, "filter"),
     shard: match value(p, "shard") { Some(v) -> surface::shard_of(v), None -> None },
     jobs: match value(p, "jobs") { Some(v) -> parse_nat(v), None -> None },
-    steps: count("steps", 1000000000),
-    timeout: count("timeout", 60000),
-    bisect: match value(p, "bisect") { Some(v) -> v, None -> "auto" },
-    bisect_budget: count("bisect-budget", 64),
     coverage: has(p, "coverage"),
     mutate: value(p, "mutate"),
     mutate_budget: count("mutate-budget", 64),
-    profile: machine_options.profile,
-    watch: has(p, "watch"),
-    tls: machine_options.tls,
-    trust: machine_options.trust,
-    mtls: machine_options.mtls,
-    fs: machine_options.fs,
-    exec: machine_options.exec,
-    allow: machine_options.allow,
-    config: machine_options.config,
+    machine: machine::options_from(p),
     sim: machine::sim_options_from(p),
   }
 }
@@ -121,17 +85,14 @@ pub fn no_unit(testing: Testing) -> TestUnit =
   { opened: None, testing: testing, hosted: false, tests: [], roots: Map::new() }
 
 /// A unit tests run in, from a front end the program ran: its C emitted and compiled here under
-/// `profile` and opened, or one that opens nothing for a run that executes nothing.
+/// the run's profile and opened.
 pub fn unit_over(
   testing: Testing,
   front: LoadedAnalysis,
-  build: Bool,
-  hosted: Bool,
-  profile: String = "development",
 ) -> Result<TestUnit, List<Diag>> / {entering::machine.open, emit.unit, emit.compiled, abort.raise} =
-  match units::wanted(front, build, profile) {
+  match units::wanted(front, true, testing.options.machine.profile) {
     Err(diags) -> Err(diags),
-    Ok(library) -> unit_of(testing, front, library, hosted),
+    Ok(library) -> unit_of(testing, front, library, true),
   }
 
 /// A unit tests run in, from a front end and the library its unit was compiled into, if any.
@@ -164,7 +125,7 @@ pub fn bound(
   d: Dump,
   config: machine::Configured,
 ) -> Result<Testing, List<Diag>> / {entering::machine.bind, entering::machine.hosting, abort.raise} = {
-  let grants = grants_of(testing.options, config);
+  let grants = grants_of(testing.options.machine, config);
   let declared = listing::declared_of(d);
   match listing::unlendable(grants.allow, declared) {
     Some(refused) -> Err([refused]),
@@ -196,12 +157,12 @@ pub fn moved(
   supplied: machine::Configured,
   trace: Bytes,
 ) -> Option<String> / {entering::machine.moved, abort.raise} =
-  entering::machine.moved(grants_of(options, supplied), trace)
+  entering::machine.moved(grants_of(options.machine, supplied), trace)
 
 /// What a test is lent: its roots, the programs it may start, its credentials, its configuration
 /// and the families `--allow` names, never the command line, and of `process` only what starts a
 /// program `--exec` names, since a test is no process.
-pub fn grants_of(o: Options, config: machine::Configured) -> entering::Grants =
+pub fn grants_of(o: machine::Options, config: machine::Configured) -> entering::Grants =
   {
     ..entering::no_grants(),
     fs: o.fs.map(machine::lent),
@@ -214,16 +175,15 @@ pub fn grants_of(o: Options, config: machine::Configured) -> entering::Grants =
     }),
   }
 
-/// How a test of `unit` is entered: as a test's run, under the run's budgets, its reads recorded
-/// for its pass. A unit no test of reaches the binding, a mutant's or a mixture's, files no pass,
-/// so nothing records what it read.
+/// How a test of `unit` is entered: as a test's run, under the run's clock, its reads recorded
+/// for its pass. A unit no test of reaches the binding, such as a mutant's, files no pass, so
+/// nothing records what it read.
 fn run_of(unit: TestUnit, seed: Option<entering::Seed>, re_executed: Bool) -> entering::Run =
   {
     ..entering::unbounded(machine::max_calls()),
     binding: if unit.hosted { unit.testing.binding } else { 0 },
     hosted: unit.hosted,
-    steps: unit.testing.options.steps,
-    timeout_ms: unit.testing.options.timeout,
+    timeout_ms: unit.testing.options.machine.timeout,
     seed: seed,
     re_executed: re_executed,
     observe: unit.hosted,
@@ -244,8 +204,7 @@ pub fn cases(
       let listing = String::of_bytes_lossy(root_text(root_name(Cases(test_key(t.module, t.name)))));
       let outcome = entering::machine.enter(o.unit, listing, machine::arguments_of([]), {
         ..entering::unbounded(machine::max_calls()),
-        steps: unit.testing.options.steps,
-        timeout_ms: unit.testing.options.timeout,
+        timeout_ms: unit.testing.options.machine.timeout,
       });
       match outcome.ended {
         entering::Answered(bytes) -> match listed_of(bytes) {
@@ -384,7 +343,7 @@ fn fell_of(
 
 /// How a report classes a run that ended with `diag`.
 pub fn status_of(diag: Diag) -> String =
-  if diag.code == b"W0612" { "abandoned" }
+  if machine::is_abandoned(diag.code) { "abandoned" }
   else if machine::is_defect(diag.code) { "panicked" }
   else { "failed" }
 
@@ -454,21 +413,20 @@ pub fn hosted_of(testing: Testing, unit: TestUnit) -> Hosted / {abort.raise} = {
 
 /// The result cache, which whoever opened it handles: what opening it degraded past, the pass filed
 /// under each key and each code key as the trace its run read, whether each definition was ever
-/// seen, what each test reached when it last passed, stored bodies, and filed interfaces.
+/// seen, what each test reached when it last passed, and the text of each definition it reached.
 pub effect ledger {
   read opened() -> List<Diag>
   read passes(keys: List<Bytes>) -> List<Option<Bytes>>
   read code_passes(keys: List<Bytes>) -> List<Option<Bytes>>
   read seen(hashes: List<Bytes>) -> List<Bool>
   read baselines(keys: List<Bytes>) -> List<Option<LastPass>>
-  read bodies(hashes: List<Bytes>) -> List<Option<Bytes>>
-  /// The digest of each definition's interface, by its hash.
-  read interfaces(hashes: List<Bytes>) -> List<Option<Bytes>>
-  /// Of what passing tests reached, what the store holds no interface or no body of.
-  read unfiled(reached: ReachedHashes) -> ReachedHashes
-  /// What a filed pass ran, as a later era's bisection reads it: each definition's interface and
-  /// each body by its hash, and the era of `modules`, each module's record among it.
-  write history(defs: List<FiledDef>, bodies: List<FiledBody>, modules: List<ModuleHashed>) -> Unit
+  /// The text of each definition or test, by its hash, as it read when it was filed.
+  read texts(hashes: List<Bytes>) -> List<Option<Bytes>>
+  /// Of `hashes`, those the store holds no text of.
+  read unfiled(hashes: List<Bytes>) -> List<Bytes>
+  /// What a filed pass ran, as a later failure reads it: each text by its hash, and the era of
+  /// `modules`, each module's record among it.
+  write history(texts: List<{ hash: Bytes, text: Bytes }>, modules: List<ModuleHashed>) -> Unit
   write filed(filing: Filing) -> Filed
 }
 
@@ -664,10 +622,7 @@ test "a run is abandoned by its clock, panics by Ply's defect, and fails by the 
 }
 
 test "a test is lent its roots, its programs and no command line" {
-  let o = {
-    ..options_from(parsed(["test", "--allow", "machine"]), "."),
-    fs: [{ name: "cwd", path: "." }],
-  };
+  let o = options_from(parsed(["test", "--allow", "machine", "--fs", "cwd=."])).machine;
   let lent = grants_of(o, machine::unconfigured());
   assert(lent.spawning);
   assert_eq(lent.fs, [{ name: "cwd", path: "." }]);
@@ -683,7 +638,6 @@ fn answered_leaving(live: Int) -> entering::Outcome =
     usage: {
       nanos: 0,
       host: false,
-      steps: 0,
       performs: 0,
       native_objects: 0,
       scheduled: 0,
@@ -699,7 +653,7 @@ fn answered_leaving(live: Int) -> entering::Outcome =
   }
 
 test "a test that answered but left objects of its own live is Ply's defect, saying how many" {
-  let unit = no_unit(begun(options_from(parsed(["test"]), ".")));
+  let unit = no_unit(begun(options_from(parsed(["test"]))));
   assert_eq(judged(unit, answered_leaving(0), "m.t", 0), None);
   match judged(unit, answered_leaving(2), "m.t", 0) {
     Some(f) -> {

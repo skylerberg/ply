@@ -5,7 +5,7 @@
 //! program's: this side only runs what it is asked to and confines where it writes. A compiler's
 //! output is a function of what it is given, so compiling and the cache are asked as computing.
 
-use super::{Asking, COMPUTES, READS, granted, text_at, texts_at};
+use super::{Determinism, Deterministic, Nondeterministic, granted, text_at, texts_at};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
@@ -92,11 +92,11 @@ pub(super) fn natives() -> Vec<MachineNative> {
 fn lent_toolchain<R>(
     ctx: *mut Ctx,
     native: &'static str,
-    asking: Asking,
+    determinism: Determinism,
     refused: R,
     answer: impl FnOnce(&mut Ctx) -> R,
 ) -> R {
-    granted(ctx, "toolchain", native, asking, refused, answer)
+    granted(ctx, "toolchain", native, determinism, refused, answer)
 }
 
 /// Where the compiler `label` names is: `cc` as `PLY_CC` names it, a path or a name on `PATH`, and
@@ -224,7 +224,7 @@ fn landed(target: &Path, bytes: &[u8]) -> bool {
 /// The compiler the label at `p` names, found: its path, what identifies it, and its support
 /// flags as parts, as parts.
 pub unsafe extern "C" fn rt_compilers_found(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    lent_toolchain(ctx, "compilers_found", COMPUTES, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "compilers_found", Deterministic, TakenBytes(0), |c| {
         let Some(label) = text_at(c, p, n) else {
             return TakenBytes(0);
         };
@@ -268,49 +268,55 @@ pub unsafe extern "C" fn rt_compilers_started(
     ap: Addr,
     an: I64,
 ) -> TakenBytes {
-    lent_toolchain(ctx, "compilers_started", COMPUTES, TakenBytes(0), |c| {
-        let (Some(label), Some(args)) = (text_at(c, lp, ln), texts_at(c, ap, an)) else {
-            return TakenBytes(0);
-        };
-        let Some(program) = compiler_path(&label) else {
-            let why = format!("no `{label}` is installed");
-            return c.given([&[0u8][..], why.as_bytes()].concat());
-        };
-        let child = Command::new(&program)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn();
-        let child = match child {
-            Ok(child) => child,
-            Err(e) => {
-                let why = format!("`{}`: {e}", program.display());
+    lent_toolchain(
+        ctx,
+        "compilers_started",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            let (Some(label), Some(args)) = (text_at(c, lp, ln), texts_at(c, ap, an)) else {
+                return TakenBytes(0);
+            };
+            let Some(program) = compiler_path(&label) else {
+                let why = format!("no `{label}` is installed");
                 return c.given([&[0u8][..], why.as_bytes()].concat());
+            };
+            let child = Command::new(&program)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn();
+            let child = match child {
+                Ok(child) => child,
+                Err(e) => {
+                    let why = format!("`{}`: {e}", program.display());
+                    return c.given([&[0u8][..], why.as_bytes()].concat());
+                }
+            };
+            let ticket = c.submitted(
+                "compilers_started",
+                "a compiler",
+                Work::Waiting,
+                move || {
+                    Ok(match child.wait_with_output() {
+                        Ok(out) if out.status.success() => vec![0],
+                        Ok(out) => found(Some(out.stderr)),
+                        Err(e) => found(Some(e.to_string().into_bytes())),
+                    })
+                },
+            );
+            if ticket.0 == 0 {
+                return TakenBytes(0);
             }
-        };
-        let ticket = c.submitted(
-            "compilers_started",
-            "a compiler",
-            Work::Waiting,
-            move || {
-                Ok(match child.wait_with_output() {
-                    Ok(out) if out.status.success() => vec![0],
-                    Ok(out) => found(Some(out.stderr)),
-                    Err(e) => found(Some(e.to_string().into_bytes())),
-                })
-            },
-        );
-        if ticket.0 == 0 {
-            return TakenBytes(0);
-        }
-        c.given([&[1u8][..], &int(ticket.0)[..]].concat())
-    })
+            c.given([&[1u8][..], &int(ticket.0)[..]].concat())
+        },
+    )
 }
 
 /// The cache's directory.
 pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_cache", COMPUTES, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "toolchain_cache", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::cache_dir().display().to_string().into_bytes())
     })
 }
@@ -318,7 +324,7 @@ pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
 /// The directory what `ply run` and `ply check` reuse is filed in, under the stage root, where the
 /// sweep keeps it to the cache's budget.
 pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_reused", COMPUTES, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
         let dir = crate::c::stage::stage_dir(crate::c::sweep::REUSED);
         c.given(dir.display().to_string().into_bytes())
     })
@@ -326,21 +332,21 @@ pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
 
 /// The directory the emitter's answers are kept in between runs, under the toolchain's sweep.
 pub unsafe extern "C" fn rt_toolchain_bodies(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_bodies", COMPUTES, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "toolchain_bodies", Deterministic, TakenBytes(0), |c| {
         c.given(crate::c::bodies_dir().display().to_string().into_bytes())
     })
 }
 
 /// How many compilers run at once: the processors the process may run on.
 pub unsafe extern "C" fn rt_toolchain_jobs(ctx: *mut Ctx) -> I64 {
-    lent_toolchain(ctx, "toolchain_jobs", COMPUTES, I64(1), |_| {
+    lent_toolchain(ctx, "toolchain_jobs", Deterministic, I64(1), |_| {
         I64(std::thread::available_parallelism().map_or(1, |n| n.get()) as i64)
     })
 }
 
 /// 1 where the cache holds a file at the path at `p`, which records a use of it; else 0.
 pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    lent_toolchain(ctx, "toolchain_holds", COMPUTES, I64(0), |c| {
+    lent_toolchain(ctx, "toolchain_holds", Deterministic, I64(0), |c| {
         let Some(at) = below_at(c, p, n) else {
             return I64(0);
         };
@@ -354,7 +360,7 @@ pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I
 
 /// What the cache holds at the path at `p`, found.
 pub unsafe extern "C" fn rt_toolchain_held(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_held", COMPUTES, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "toolchain_held", Deterministic, TakenBytes(0), |c| {
         let Some(at) = below_at(c, p, n) else {
             return TakenBytes(0);
         };
@@ -370,7 +376,7 @@ pub unsafe extern "C" fn rt_toolchain_written(
     bp: Addr,
     bn: I64,
 ) -> I64 {
-    lent_toolchain(ctx, "toolchain_written", COMPUTES, I64(0), |c| {
+    lent_toolchain(ctx, "toolchain_written", Deterministic, I64(0), |c| {
         let Some(at) = below_at(c, p, n) else {
             return I64(0);
         };
@@ -386,7 +392,7 @@ pub unsafe extern "C" fn rt_toolchain_moved(
     tp: Addr,
     tn: I64,
 ) -> I64 {
-    lent_toolchain(ctx, "toolchain_moved", COMPUTES, I64(0), |c| {
+    lent_toolchain(ctx, "toolchain_moved", Deterministic, I64(0), |c| {
         let (Some(from), Some(to)) = (below_at(c, fp, fnn), below_at(c, tp, tn)) else {
             return I64(0);
         };
@@ -408,7 +414,7 @@ pub unsafe extern "C" fn rt_toolchain_appended(
     bn: I64,
 ) -> I64 {
     use std::io::Write;
-    lent_toolchain(ctx, "toolchain_appended", COMPUTES, I64(0), |c| {
+    lent_toolchain(ctx, "toolchain_appended", Deterministic, I64(0), |c| {
         let Some(at) = below_at(c, p, n) else {
             return I64(0);
         };
@@ -423,29 +429,35 @@ pub unsafe extern "C" fn rt_toolchain_appended(
 
 /// A new directory of the asker's own below the cache, its path there found.
 pub unsafe extern "C" fn rt_toolchain_scratch(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_scratch", COMPUTES, TakenBytes(0), |c| {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let name = format!(
-            "work/{}-{nanos}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        );
-        let at = crate::c::cache_dir().join(&name);
-        // A new directory, never one another build is writing into.
-        let made = at
-            .parent()
-            .is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
-            && std::fs::create_dir(&at).is_ok();
-        c.given(found(made.then(|| name.into_bytes())))
-    })
+    lent_toolchain(
+        ctx,
+        "toolchain_scratch",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let name = format!(
+                "work/{}-{nanos}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            );
+            let at = crate::c::cache_dir().join(&name);
+            // A new directory, never one another build is writing into.
+            let made = at
+                .parent()
+                .is_some_and(|parent| std::fs::create_dir_all(parent).is_ok())
+                && std::fs::create_dir(&at).is_ok();
+            c.given(found(made.then(|| name.into_bytes())))
+        },
+    )
 }
 
 /// The directory at `p` below the cache removed with everything under it.
 pub unsafe extern "C" fn rt_toolchain_cleared(ctx: *mut Ctx, p: Addr, n: I64) {
-    lent_toolchain(ctx, "toolchain_cleared", COMPUTES, (), |c| {
+    lent_toolchain(ctx, "toolchain_cleared", Deterministic, (), |c| {
         if let Some(at) = below_at(c, p, n) {
             let _ = std::fs::remove_dir_all(at);
         }
@@ -454,10 +466,16 @@ pub unsafe extern "C" fn rt_toolchain_cleared(ctx: *mut Ctx, p: Addr, n: I64) {
 
 /// What the runtime's library needs linked after it on this platform, as parts.
 pub unsafe extern "C" fn rt_toolchain_libraries(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "toolchain_libraries", COMPUTES, TakenBytes(0), |c| {
-        let names: Vec<&[u8]> = libraries().iter().map(|l| l.as_bytes()).collect();
-        c.given(parts(&names))
-    })
+    lent_toolchain(
+        ctx,
+        "toolchain_libraries",
+        Deterministic,
+        TakenBytes(0),
+        |c| {
+            let names: Vec<&[u8]> = libraries().iter().map(|l| l.as_bytes()).collect();
+            c.given(parts(&names))
+        },
+    )
 }
 
 /// The ticket of the program at the path at `p` below the cache run to its end with the arguments
@@ -470,7 +488,7 @@ pub unsafe extern "C" fn rt_toolchain_ran(
     ap: Addr,
     an: I64,
 ) -> I64 {
-    lent_toolchain(ctx, "toolchain_ran", COMPUTES, I64(0), |c| {
+    lent_toolchain(ctx, "toolchain_ran", Deterministic, I64(0), |c| {
         let (Some(program), Some(args)) = (below_at(c, p, n), texts_at(c, ap, an)) else {
             return I64(0);
         };
@@ -506,7 +524,7 @@ pub unsafe extern "C" fn rt_toolchain_ran(
 /// What the asking program's heap holds, read without a walk: its live bytes and those held for
 /// them, each eight bytes, as parts.
 pub unsafe extern "C" fn rt_memory_heap(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "memory_heap", READS, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "memory_heap", Nondeterministic, TakenBytes(0), |c| {
         let (live, held) = (c.live_bytes() as i64, c.held() as i64);
         c.given(parts(&[&int(live)[..], &int(held)[..]]))
     })
@@ -515,7 +533,7 @@ pub unsafe extern "C" fn rt_memory_heap(ctx: *mut Ctx) -> TakenBytes {
 /// The asking program's live objects, the most bytes first: each a sort's words, how many there
 /// are and their bytes past their headers, as parts of parts.
 pub unsafe extern "C" fn rt_memory_census(ctx: *mut Ctx) -> TakenBytes {
-    lent_toolchain(ctx, "memory_census", READS, TakenBytes(0), |c| {
+    lent_toolchain(ctx, "memory_census", Nondeterministic, TakenBytes(0), |c| {
         let each: Vec<Vec<u8>> = c
             .census()
             .into_iter()

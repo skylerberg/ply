@@ -5,6 +5,7 @@ use crate::units::{self, def};
 use ply_compiled::c::exports::HelperShape;
 use ply_compiled::c::{builtin_helper_name, helpers};
 use ply_compiled::heap::{imm, imm_value};
+use std::sync::atomic::Ordering::Relaxed;
 
 /// A declaration with no address is a null call at run time: a crash rather than a decline.
 #[test]
@@ -104,7 +105,7 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     for line in [
         "helper rt_release_later 0 - Handed DropRoot",
         "helper rt_alloc_bytes 0 Block Word",
-        "helper rt_tick 0 -",
+        "helper rt_no_fuel 0 -",
         "native ?out_str 0 - Addr I64",
         "native ?refused 1 - I64 I64 I64 I64",
     ] {
@@ -390,7 +391,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     let mut ctx = native.context();
     ctx.begin(10_000);
     let here = 0u8;
-    ctx.stack_floor = std::ptr::from_ref(&here) as usize - 64 * 1024;
+    (ctx.stack_floor).store(std::ptr::from_ref(&here) as usize - 64 * 1024, Relaxed);
     let args = [imm(0)];
     let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
@@ -405,6 +406,54 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
         raised.contains("recursion limit of 10000 nested calls exceeded"),
         "{raised}"
     );
+}
+
+/// A loop's restart probes the floor as a prologue does, reading it anew each pass.
+const RESTART: &str = "  ply_loop: { char probe; if ((uintptr_t)&probe < (uintptr_t)*(volatile int64_t *)&ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
+
+/// A loop that makes no call ends at its restart once its clock runs out.
+#[test]
+fn a_loop_past_its_clock_ends_at_its_next_restart() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let forever = def(
+        "m.forever",
+        1,
+        &format!("{PROLOGUE}  int64_t n = 0;\n{RESTART}  n += 1;\n  goto ply_loop;"),
+    );
+    let Some(loaded) = units::opened(dir.path(), &[forever], |_| {}) else {
+        return;
+    };
+    let native = loaded.expect("the unit loads");
+    let entry = native.entry("m.forever").expect("`m.forever` is taken");
+    let mut ctx = native.context();
+    ctx.begin_bounded(1_000, 20);
+    let args = [imm(0)];
+    let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
+    let failed = ctx.failed;
+    let said = ctx.take_failure().map(|d| d.message).unwrap_or_default();
+    ctx.end();
+    assert_eq!(failed, ply_compiled::rt::FAILED_ABANDONED, "{said}");
+    assert!(said.contains("abandoned after 20 ms"), "{said}");
+}
+
+/// The watchdog writes to a context only while its entry runs, since the context may be reused or
+/// freed after.
+#[test]
+fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
+    let native = units::opened(
+        tempfile::tempdir().expect("a scratch directory").path(),
+        &[],
+        |_| {},
+    );
+    let Some(loaded) = native else {
+        return;
+    };
+    let mut ctx = loaded.expect("the unit loads").context();
+    ctx.begin_bounded(1_000, 1);
+    ctx.end();
+    ctx.stack_floor.store(7, Relaxed);
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    assert_eq!(ctx.stack_floor.load(Relaxed), 7);
 }
 
 /// A unit says each constant with its row of the code table.

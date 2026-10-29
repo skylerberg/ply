@@ -44,7 +44,6 @@ import std.string
 import std.time (nanos_at)
 import std.url (url_decode)
 import std.gen
-import std.pace (meter, spent)
 
 // --- Entity tags ------------------------------------------------------------
 
@@ -1114,57 +1113,4 @@ test "a file is read a chunk at a time, and a HEAD carries the length a GET woul
   assert(reads == 0, Some("a HEAD opened or read the file"));
   assert_eq(fetched(http::Post, "/data/parts.csv", [], default_options()).status, 405);
   assert_eq(fetched(http::Get, "/empty/readme.txt", [], default_options()).body, b"")
-}
-
-/// What serving `/big.bin`, a file of `size` bytes each read of which is answered with `block`, to a
-/// client over a connection whose sends are counted and let go cost, and the bytes it sent.
-fn served_large(size: Int, block: Bytes) -> { sent: Int, bytes: Int } / {meter.read, abort.raise} = {
-  let looked = fs::on_mem[big](fs::mem_of([{ path: "big.bin", body: b"" }]), ||
-    fs.stat[big]("big.bin"));
-  let stat = match looked.value {
-    Some(st) -> { ..st, size: size },
-    None -> panic("the file is there"),
-  };
-  let asked = b"GET /big.bin HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
-  let options = { ..default_options(), chunk: block.len() };
-  let cost = spent(||
-    handle {
-      with_rand(rand(7), ||
-        http::serve_connection[conn](7, http::default_limits(), |req: Request|
-          serve[big](req, req.path, options, noon())))
-    } with {
-      var wire = { sent: 0, reads: 0 },
-      fs.kind[big](path) -> fs::File,
-      fs.stat[big](path) -> Some(stat),
-      fs.open[big](path, how) -> Ok(3),
-      fs.read_chunk[big](file, most) ->
-        Some(if most == block.len() { block } else { block.slice(0, most) }),
-      fs.close[big](file) -> true,
-      fs.read_at[big](path, at, most) -> None,
-      net.recv[conn](c, most, wait) -> {
-        let w = wire;
-        wire = { ..w, reads: w.reads + 1 };
-        Some(if w.reads == 0 { asked } else { b"" })
-      },
-      net.send[conn](c, payload, wait) -> {
-        wire = { ..wire, sent: wire.sent + payload.len() };
-        Some(payload.len())
-      },
-      net.close[conn](c) -> (),
-      net.peer_address[conn](c) -> None,
-      net.peer_certificate[conn](c) -> None,
-      return served -> wire.sent,
-    });
-  { sent: cost.value, bytes: cost.bytes }
-}
-
-test "a 100 MB file is served a chunk at a time, holding a few chunks however large it is" {
-  let kilo = Bytes::of_string(range(0, 256).fold("", |acc: String, _i: Int| acc ++ "data"));
-  let block = Bytes::concat_all(range(0, 1024).map(|_i: Int| kilo));
-  let size = 100 * 1048576;
-  let ran = served_large(size, block);
-  // Every byte of the file went out, after a head of fewer than 400 bytes.
-  assert(ran.sent > size && ran.sent < size + 400);
-  // A body held whole, or copied once on its way, would be a hundred times the block.
-  assert(ran.bytes < 4 * block.len(), Some(ran.bytes.to_string() ++ " bytes allocated"))
 }

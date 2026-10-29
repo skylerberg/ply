@@ -3,12 +3,14 @@
 //! value shapes (`--seed`, `--tls`, `--fs`, `--exec`, `--sim-roots`), and the one cross-rule a flag
 //! cannot say alone (`--sim random` against `--sim-budget`).
 
+import compiler.cc
 import sim.plan
 import std.cli (Choice, Command, Flag, Help, Nat, Outcome, Parsed, Pos, Positional, Refused, Run,
                 Spec, Text, Version, bare, body, checking, command, conflicting, defaulted, excused,
                 faults, has, help, many, parse, parse_nat, positional, refusal_text, repeated,
                 requiring, switch, value, valued, values_of, version_line, with_default, with_extra,
                 with_positionals, with_short, with_subs, with_trailing)
+import std.list
 import std.string
 
 // --- The value shapes -----------------------------------------------------------
@@ -110,8 +112,25 @@ fn filter_flag(help: String) -> Flag = valued("filter", "SUBSTRING", Text, help)
 fn jobs_flag() -> Flag =
   with_short(valued("jobs", "N", Pos, "Worker threads. Defaults to one per core."), "j")
 
-fn profile_flag(default: String, help: String) -> Flag =
-  with_default(valued("profile", "PROFILE", Text, help), default)
+/// The milliseconds of wall clock a test, or an entry a claim's evaluation makes, may take where
+/// `--timeout` names none.
+pub fn default_timeout_ms() -> Int = 60000
+
+fn timeout_flag(help: String) -> Flag =
+  with_default(valued("timeout", "MS", Nat, help), default_timeout_ms().to_string())
+
+fn profile_flag(help: String) -> Flag =
+  with_default(
+    valued("profile", "PROFILE", Choice(cc::profiles().map(|p: cc::Profile| p.name)), help),
+    cc::development().name,
+  )
+
+/// The profile `--profile` names, or `development` for a command without the flag.
+pub fn profile_of(p: Parsed) -> cc::Profile =
+  match cc::profiles().find(|named: cc::Profile| value(p, "profile") == Some(named.name)) {
+    Some(named) -> named,
+    None -> cc::development(),
+  }
 
 fn simulation_flags() -> List<Flag> =
   [
@@ -377,11 +396,8 @@ fn prove_flags() -> List<Flag> =
       Pos,
       "Static inference steps per obligation; one whose budget runs out is left unproved.",
     ),
-    valued(
-      "prove-steps",
-      "N",
-      Nat,
-      "Calls per evaluation of a claim (default 1000000000); 0 is no bound.",
+    timeout_flag(
+      "Wall clock for each entry a claim's evaluation makes, in milliseconds; past it the evaluation is abandoned, proves nothing and is not cached. 0 is no clock.",
     ),
   ]
 
@@ -467,41 +483,8 @@ fn test_cmd() -> Command =
               shard_ok,
             ),
             jobs_flag(),
-            with_default(
-              valued(
-                "steps",
-                "N",
-                Nat,
-                "Calls one test may make; past it the test fails with E0503. 0 is no bound.",
-              ),
-              "1000000000",
-            ),
-            with_default(
-              valued(
-                "timeout",
-                "MS",
-                Nat,
-                "Wall clock per test, in milliseconds; past it the run is abandoned rather than judged, and nothing it did is recorded. 0 is no clock.",
-              ),
-              "60000",
-            ),
-            with_default(
-              valued(
-                "bisect",
-                "WHEN",
-                Choice(["auto", "always", "never"]),
-                "Attribute a failure to its change; `auto` bisects only a det test that has passed before.",
-              ),
-              "auto",
-            ),
-            with_default(
-              valued(
-                "bisect-budget",
-                "N",
-                Nat,
-                "Hybrid programs a bisection may evaluate; counted, not timed, so runs agree.",
-              ),
-              "64",
+            timeout_flag(
+              "Wall clock per test, in milliseconds; past it the run is abandoned rather than judged, and nothing it did is recorded. 0 is no clock.",
             ),
             switch(
               "coverage",
@@ -526,7 +509,6 @@ fn test_cmd() -> Command =
               "64",
             ),
             profile_flag(
-              "development",
               "C toolchain: `development` (`tcc` on x86-64 Linux, else `cc -O0`) or `release` (`cc -O2`).",
             ),
             switch(
@@ -626,29 +608,20 @@ fn run_cmd() -> Command =
     with_positionals(
       command(
         "run",
-        "Evaluate `main` (a directory must hold exactly one), or run a built `.plyx`.",
+        "Evaluate `main` (a directory must hold exactly one), or run a built `.plyx`. Stdout holds only what the program writes.",
         flat([
           [
             json_flag(),
             switch(
               "explain",
-              "Say whether the front end ran or an earlier run's answer was reused, and where the load's time went.",
-            ),
-            with_default(
-              valued(
-                "steps",
-                "N",
-                Nat,
-                "Calls the entry point may make; past it the run fails with E0503. 0 is no bound, which is the default: an entry that serves forever is a program, not a runaway.",
-              ),
-              "0",
+              "On stderr: whether the front end ran or an earlier run's answer was reused, where the load's time went, what the run may reach and how it stops, and after the run, how a stop went.",
             ),
             with_default(
               valued(
                 "timeout",
                 "MS",
                 Nat,
-                "Wall clock for the entry point, in milliseconds; past it the run is abandoned rather than judged. 0 is no clock.",
+                "Wall clock for the entry point, in milliseconds; past it the run is abandoned rather than judged. 0 is no clock, which is the default: an entry that serves forever is a program, not a runaway.",
               ),
               "0",
             ),
@@ -662,7 +635,6 @@ fn run_cmd() -> Command =
               seed_ok,
             ),
             profile_flag(
-              "development",
               "C toolchain: `development` (`tcc` on x86-64 Linux, else `cc -O0`) or `release` (`cc -O2`).",
             ),
             repeated(
@@ -1053,16 +1025,20 @@ fn bootstrap_cmd() -> Command =
       "Build a native `ply` from a checkout's sources, linked with the runtime cargo built of it.",
       [
         profile_flag(
-          "development",
-          "Both compile the C with `cc -O2`; `development`'s checks its reference counts.",
+          "Both compile the C with `cc -O2`. `development` checks its reference counts and uses `target/debug`; `release` uses `target/release`.",
         ),
         valued(
           "runtime",
           "LIBRARY",
           Text,
-          "The runtime's library to link with; by default the static library of the cargo package `ply.work` names its `runtime`, below `target/<profile>`.",
+          "The runtime's library to link with; by default the static library of the cargo package `ply.work` names its `runtime`, in the profile's directory.",
         ),
-        valued("out", "PATH", Text, "Where the `ply` goes; `target/<profile>/ply` by default."),
+        valued(
+          "out",
+          "PATH",
+          Text,
+          "Where the `ply` goes; `ply` in the profile's directory by default.",
+        ),
         json_flag(),
       ],
     ),
@@ -1281,14 +1257,6 @@ test "every command that binds the host takes the credentials it lends" {
   ["run", "test", "hosts"].fold((), |u: Unit, cmd: String|
     assert_eq(value(ran([cmd, "--tls", "api=a.pem,b.key"]), "tls"), Some("api=a.pem,b.key")))
 }
-test "the bisection switches default to auto and refuse a fourth word" {
-  let p = ran(["test"]);
-  assert_eq(value(p, "bisect"), Some("auto"));
-  assert(
-    refusal(["test", "--bisect", "sometimes"]).contains("[possible values: auto, always, never]"),
-  );
-  assert_eq(value(ran(["test", "--bisect", "never"]), "bisect"), Some("never"))
-}
 
 test "the simulation flags conflict with a seed" {
   let text = refusal(["test", "--seed", "7", "--sim", "random"]);
@@ -1432,6 +1400,15 @@ test "a profile and the host flags stand alone" {
   assert(has(ran(["run", "--fs", "src=./crates"]), "fs"));
   assert_eq(value(ran(["run", "--drain-ms", "5000"]), "drain-ms"), Some("5000"));
   assert_eq(value(ran(["run", "--trace", "text"]), "trace"), Some("text"))
+}
+
+test "`--profile` takes only a profile's name, and a command without it compiles under development" {
+  assert_eq(profile_of(ran(["test", "--profile", "release"])), cc::release());
+  assert_eq(profile_of(ran(["run"])), cc::development());
+  assert_eq(profile_of(ran(["check"])), cc::development());
+  assert(
+    refusal(["test", "--profile", "debug"]).contains("[possible values: development, release]"),
+  )
 }
 
 test "`contracts` takes a name and two versions and no path" {

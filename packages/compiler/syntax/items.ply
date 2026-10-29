@@ -15,11 +15,11 @@ import compiler.syntax.parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar
                                 token_lt, token_gt, token_underscore, token_ge, token_pipe,
                                 token_slash, token_arrow, token_hashbracket, at_pos, keyword_pub,
                                 keyword_fn, keyword_type, keyword_effect, keyword_nondet,
-                                keyword_test, keyword_import, dump_node, dump_count, dump_presence,
-                                dump_payload, dump_word, dump_bool, dump_list, dump_opt, dump_ident,
-                                dump_qname, dump_diags, Doc, doc_at, module_doc, token_between,
-                                dump_doc, primary_span_of, span_bin, ident_bin, span_between,
-                                prelude_binder)
+                                keyword_test, keyword_import, dump_node, erase_spans, dump_count,
+                                dump_presence, dump_payload, dump_word, dump_bool, dump_list,
+                                dump_opt, dump_ident, dump_qname, dump_diags, Doc, doc_at,
+                                module_doc, token_between, dump_doc, primary_span_of, span_bin,
+                                ident_bin, span_between, prelude_binder)
 import std.bin
 import std.list
 import compiler.syntax.lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead,
@@ -68,8 +68,8 @@ derive bin for ImportDecl
 
 /// What `derivable(D, a)` and the predicates hold a type to: `DEq`, `DOrd`, `DShow` and `DHash`
 /// are what `==`, `compare`, `show` and `digest` read of a value, `DNumeric` and `DInteger` the
-/// predicates `numeric(a)` and `integer(a)`, and `DKept` what a build keeps of a `const`'s value,
-/// which no constraint names.
+/// predicates `numeric(a)` and `integer(a)`, and `DKept` what a process keeps of a `const`'s
+/// value, which no constraint names.
 pub type Deriver = | DEq | DOrd | DShow | DHash | DNumeric | DInteger | DKept
 
 derive bin for Deriver
@@ -139,8 +139,8 @@ pub type FnDef = {
   reuse: Option<Span>,
   /// The span of a `transparent` before `fn`: its body is part of what another package reads of it.
   transparent: Option<Span>,
-  /// The span of a `const` before `fn`: a build evaluates the body and keeps its value.
-  baked: Option<Span>,
+  /// The span of a `const` before `fn`: its body runs once, at the first read.
+  constant: Option<Span>,
   /// `decreases n - i`: the measure its recursion descends, where the checker sees none itself.
   decreases: Option<Expr>,
   body: Expr,
@@ -230,8 +230,6 @@ pub type TypeDef = {
 pub type OpDef = {
   name: Ident,
   mode: Mode,
-  /// Written `multi`: a clause for it may call its continuation more than once.
-  multi: Bool,
   resource_param: Bool,
   ty_params: List<Ident>,
   params: List<TypeExpr>,
@@ -266,8 +264,12 @@ pub type Cases = {
 }
 
 pub type TestDef = {
+  /// The label as written, between its quotes.
+  label: Bytes,
+  label_span: Span,
+  /// What identifies the test in its module: its label, or where an earlier test has that label,
+  /// the label with a count after it (`named_tests`).
   name: Bytes,
-  name_span: Span,
   is_nondet: Bool,
   cases: Option<Cases>,
   body: Expr,
@@ -387,7 +389,7 @@ pub fn no_fn() -> FnDef =
     returns: None,
     reuse: None,
     transparent: None,
-    baked: None,
+    constant: None,
     decreases: None,
     body: no_expr(),
     doc: None,
@@ -477,10 +479,16 @@ pub fn owner_of(item: Item) -> Option<Bytes> =
 /// its own name, which no declaration's name can be.
 pub fn item_owner(item: Item) -> Bytes =
   match item {
-    ITest(d) -> b"test ".concat(d.name),
+    ITest(d) -> test_owned_as(d.name),
     ILaw(d) -> b"law ".concat(d.name),
     _ -> match owner_of(item) { Some(o) -> o, None -> b"" },
   }
+
+fn test_owned_as(name: Bytes) -> Bytes = b"test ".concat(name)
+
+/// The name of the test that owner `owner` is, where it is a test's.
+pub fn test_of_owner(owner: Bytes) -> Option<Bytes> / {abort.raise} =
+  if owner.starts_with(b"test ") { Some(owner.slice(5, owner.len())) } else { None }
 
 // --- Schemas ----------------------------------------------------------------
 
@@ -1035,7 +1043,7 @@ pub fn fn_def(
   vis: Vis,
   reuse: Option<Span>,
   transparent: Option<Span>,
-  baked: Option<Span> = None,
+  constant: Option<Span> = None,
 ) -> Result<Parsed<FnDef>, Parser> / {abort.raise} = {
   let st = advance(input, parser);
   let { parser, node: name } = fn_name(input, st.parser, b"a function name after `fn`")?;
@@ -1076,7 +1084,7 @@ pub fn fn_def(
       returns: rt,
       reuse: reuse,
       transparent: transparent,
-      baked: baked,
+      constant: constant,
       decreases: dec,
       body: body,
       doc: None,
@@ -1802,7 +1810,6 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
         node: {
           name: name,
           mode: MRaise,
-          multi: false,
           resource_param: false,
           ty_params: [],
           params: written.map(|p: OpParam| p.ty),
@@ -1817,16 +1824,13 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
   }
 }
 
-/// One operation of an effect. `raise` is contextual, as `read` and `write` are, and so is a `multi`
-/// before either of those.
+/// One operation of an effect. `raise` is contextual, as `read` and `write` are.
 pub fn op_def(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} =
   if at_ident_text(input, parser, b"raise") { raise_op(input, parser) }
   else { moded_op(input, parser) }
 
 fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {abort.raise} = {
   let start = current_span(input, parser);
-  let multi = at_ident_text(input, parser, b"multi");
-  let parser = if multi { advance(input, parser).parser } else { parser };
   let { parser, node: m } = mode(input, parser)?;
   let { parser, node: name } = expect_ident(input, parser, b"an operation name")?;
   let { parser, node: rp } = op_resource_param(input, parser)?;
@@ -1852,7 +1856,6 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     node: {
       name: name,
       mode: m,
-      multi: multi,
       resource_param: rp,
       ty_params: tps,
       params: written.map(|p: OpParam| p.ty),
@@ -2140,17 +2143,17 @@ fn test_nondet(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {
   }
 }
 
-type Labelled = { parser: Parser, name: Bytes, span: Span, label: Expr }
+type Labelled = { parser: Parser, text: Bytes, span: Span, label: Expr }
 
 /// A label is text, or before `for` a template: the lexer reads that one as an interpolated string,
-/// and its name is the template as written.
+/// and its text is the template as written.
 fn test_label(input: Input, parser: Parser) -> Result<Labelled, Parser> / {abort.raise} =
   match token_kind(input, parser) {
     StringLiteral(s) -> {
       let sp = current_span(input, parser);
       Ok({
         parser: bump(input, parser),
-        name: s,
+        text: s,
         span: sp,
         label: ELit({ span: sp, lit: LStr(s) }),
       })
@@ -2162,7 +2165,7 @@ fn test_label(input: Input, parser: Parser) -> Result<Labelled, Parser> / {abort
       let sp = expr_span(l.node);
       Ok({
         parser: l.parser,
-        name: input.source.slice(sp.start + 1, sp.end - 1),
+        text: input.source.slice(sp.start + 1, sp.end - 1),
         span: sp,
         label: l.node,
       })
@@ -2214,8 +2217,9 @@ pub fn test_def(input: Input, parser: Parser) -> Result<Parsed<TestDef>, Parser>
   Ok({
     parser: parser,
     node: {
-      name: nm.name,
-      name_span: nm.span,
+      label: nm.text,
+      label_span: nm.span,
+      name: nm.text,
       is_nondet: nd,
       cases: cases,
       body: body,
@@ -2446,7 +2450,7 @@ pub fn run(input: Input, parser: Parser) -> Parsed<Module> / {abort.raise} = {
     node: {
       doc: module_doc(input),
       imports: gathered.concat(free_imports(input, gathered)),
-      items: published(done.items),
+      items: published(named_tests(done.items)),
     },
   }
 }
@@ -2689,6 +2693,46 @@ fn published(items: List<Item>) -> List<Item> =
         },
         _ -> item,
       })
+  }
+
+/// Names each test by its label, but a test whose label an earlier test has: that one is named by
+/// the label plus the first of ` (2)`, ` (3)`, … that no test has as its label or name. So no two
+/// tests of a module share a name, whichever labels the checker lets them share.
+fn named_tests(items: List<Item>) -> List<Item> / {abort.raise} = {
+  let written = items.fold(Map::new(), |acc: Map<Bytes, Bool>, item: Item|
+    match item { ITest(d) -> acc.insert(d.label, true), _ -> acc });
+  let walked = items.fold(
+    { named: Map::new(), items: [] },
+    |acc: { named: Map<Bytes, Bool>, items: List<Item> }, item: Item|
+      match item {
+        ITest(d) -> {
+          let name = if !acc.named.contains(d.label) { d.label } else {
+            iterate(2, written.len() + acc.named.len() + 1, |n: Int| {
+              let counted = Bytes::concat_all([
+                d.label,
+                b" (",
+                Bytes::of_string(n.to_string()),
+                b")",
+              ]);
+              if written.contains(counted) || acc.named.contains(counted) { Continue(n + 1) }
+              else { Stop(counted) }
+            })
+          };
+          { named: acc.named.insert(name, true), items: acc.items.push(ITest({ ..d, name: name })) }
+        },
+        _ -> { ..acc, items: acc.items.push(item) },
+      },
+  );
+  walked.items
+}
+
+/// A test over cases' case type and table as trees, which two tests may share a label over only
+/// where they differ, or `None` where its label has no holes: then every case has the label as
+/// written, so the label cannot be shared.
+pub fn cases_form(c: Cases) -> Option<Bytes> / {abort.raise} =
+  match c.label {
+    ELit(_) -> None,
+    _ -> Some(erase_spans(dump_ty(c.ty).concat(dump_expr(c.table)))),
   }
 
 /// Where the module's first test over cases says `for`: listing and choosing a case call `std.cases`.
@@ -3275,7 +3319,7 @@ pub fn dump_fn(def: FnDef) -> Bytes / {abort.raise} =
     dump_list(def.constraints, dump_constraint),
     dump_list(def.spec, dump_spec),
     match def.decreases { Some(e) -> dump_word(b"decreases").concat(dump_expr(e)), None -> b"" },
-    match def.baked { Some(s) -> dump_node(s, b"cst"), None -> b"" },
+    match def.constant { Some(s) -> dump_node(s, b"cst"), None -> b"" },
     dump_expr(def.body),
     dump_doc_if(def.doc),
   ])
@@ -3357,7 +3401,6 @@ pub fn dump_op(op: OpDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(op.span, b"op"),
     dump_ident(op.name),
-    if op.multi { dump_word(b"multi") } else { b"" },
     dump_mode(op.mode),
     dump_bool(op.resource_param),
     dump_list(op.ty_params, dump_ident),
@@ -3381,8 +3424,8 @@ pub fn dump_effect(effect_def: EffectDef) -> Bytes / {abort.raise} =
 pub fn dump_test(test_def: TestDef) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     dump_node(test_def.span, b"tst"),
-    dump_node(test_def.name_span, b"tnm"),
-    dump_payload(test_def.name),
+    dump_node(test_def.label_span, b"tnm"),
+    dump_payload(test_def.label),
     dump_bool(test_def.is_nondet),
     dump_expr(test_def.body),
     match test_def.cases {
@@ -3767,8 +3810,9 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
   assert_eq(r.parser.diags.len(), 0);
   match r.node.items {
     [ITest(d)] -> {
+      assert_eq(d.label, b"n {c.n}");
       assert_eq(d.name, b"n {c.n}");
-      assert_eq(d.name_span, span_between(12, 21));
+      assert_eq(d.label_span, span_between(12, 21));
       assert(d.is_nondet);
       match d.cases {
         Some(c) -> {
@@ -3788,6 +3832,50 @@ test "a test over cases binds a name at a type and ranges over a table, and its 
   // A tagged literal's holes are its tag's to read: they bring in neither.
   assert_eq(parse(b"fn f(n: Int) -> Int = sh\"a {n}\"\n").node.imports.len(), 0);
   assert_eq(parse(b"fn f(n: Int) -> Int = sh\"a {f\"{n}\"}\"\n").node.imports.len(), 1)
+}
+
+test "a test whose label an earlier test has is named by the label and a count, and keeps its label" {
+  let tests = |src: Bytes|
+    parse(src).node.items.fold([], |acc: List<Bytes>, item: Item|
+      match item { ITest(d) -> acc.push(d.label.concat(b" -> ").concat(d.name)), _ -> acc });
+  let over = |label: Bytes|
+    Bytes::concat_all([b"test \"", label, b"\" for n: Int in [1] { () }\n"]);
+  let plain = |label: Bytes| Bytes::concat_all([b"test \"", label, b"\" { () }\n"]);
+  assert_eq(tests(Bytes::concat_all([over(b"a {n}"), over(b"a {n}"), over(b"a {n}")])), [
+    b"a {n} -> a {n}",
+    b"a {n} -> a {n} (2)",
+    b"a {n} -> a {n} (3)",
+  ]);
+  // A count that some test has as its label is passed over.
+  assert_eq(tests(Bytes::concat_all([plain(b"a"), plain(b"a"), plain(b"a (2)")])), [
+    b"a -> a",
+    b"a -> a (3)",
+    b"a (2) -> a (2)",
+  ])
+}
+
+test "two tests over cases may share a label only where its holes run over different tables" {
+  let form = |src: Bytes|
+    match parse(src).node.items {
+      [ITest(d)] -> match d.cases { Some(c) -> cases_form(c), None -> None },
+      _ -> panic("one test"),
+    };
+  assert_eq(form(b"test \"a\" for n: Int in [1] { () }\n"), None);
+  assert(form(b"test \"a {n}\" for n: Int in [1, 2] { () }\n") != None, None);
+  assert_eq(
+    form(b"test \"a {n}\" for n: Int in [1, 2] { () }\n"),
+    form(b"test \"a {n}\"  for n: Int in [1,\n  2] { assert(n > 0) }\n"),
+  );
+  assert(
+    form(b"test \"a {n}\" for n: Int in [1, 2] { () }\n")
+      != form(b"test \"a {n}\" for n: Int in [1, 3] { () }\n"),
+    None,
+  );
+  assert(
+    form(b"test \"a {n}\" for n: Int in table() { () }\n")
+      != form(b"test \"a {n}\" for n: Row in table() { () }\n"),
+    None,
+  )
 }
 
 test "a test over cases names its case's type and its table, and only a quoted label takes holes" {

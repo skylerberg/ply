@@ -5,7 +5,7 @@
 //! that asked, under a number, and answers the number found, and `term_secret_taken` makes the
 //! secret of what the run keeps.
 
-use super::{READS, WRITES, asked, from_host, handed, waited};
+use super::{Nondeterministic, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{I64, TakenBytes};
@@ -62,83 +62,113 @@ fn mode_number(mode: Mode) -> i64 {
 
 /// 1 where the stream numbered `stream` (standard input 0, output 1, error 2) is a terminal.
 pub unsafe extern "C" fn rt_term_is_terminal(ctx: *mut Ctx, stream: I64) -> I64 {
-    asked(ctx, "term_is_terminal", READS, I64(0), |c: &mut Ctx| {
-        let stream = match stream.0 {
-            0 => Some(Standard::In),
-            1 => Some(Standard::Out),
-            2 => Some(Standard::Err),
-            _ => None,
-        };
-        match handed(c, "term_is_terminal", "a stream", stream) {
-            Some(stream) => I64(i64::from(stdio::is_terminal(stream))),
-            None => I64(0),
-        }
-    })
+    asked(
+        ctx,
+        "term_is_terminal",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let stream = match stream.0 {
+                0 => Some(Standard::In),
+                1 => Some(Standard::Out),
+                2 => Some(Standard::Err),
+                _ => None,
+            };
+            match handed(c, "term_is_terminal", "a stream", stream) {
+                Some(stream) => I64(i64::from(stdio::is_terminal(stream))),
+                None => I64(0),
+            }
+        },
+    )
 }
 
 /// The terminal's columns and rows, each in eight bytes, found.
 pub unsafe extern "C" fn rt_term_size(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "term_size", READS, TakenBytes(0), |c: &mut Ctx| {
-        let size = stdio::terminal_size()
-            .map(|(columns, rows)| [int(i64::from(columns)), int(i64::from(rows))].concat());
-        c.given(found(size))
-    })
+    asked(
+        ctx,
+        "term_size",
+        Nondeterministic,
+        TakenBytes(0),
+        |c: &mut Ctx| {
+            let size = stdio::terminal_size()
+                .map(|(columns, rows)| [int(i64::from(columns)), int(i64::from(rows))].concat());
+            c.given(found(size))
+        },
+    )
 }
 
 /// The terminal standard input is put in the mode numbered `mode`, answering the mode it was in,
 /// or -1, nothing changed, where standard input is no terminal.
 pub unsafe extern "C" fn rt_term_mode(ctx: *mut Ctx, mode: I64) -> I64 {
-    asked(ctx, "term_mode", WRITES, I64(-1), |c: &mut Ctx| {
-        let Some(mode) = handed(c, "term_mode", "a mode", mode_of(mode.0)) else {
-            return I64(-1);
-        };
-        match stdio::set_mode(mode) {
-            Ok(was) => I64(was.map_or(-1, mode_number)),
-            Err(e) => {
-                let span = c.site();
-                c.fail(unset(mode, &e, span));
-                I64(-1)
+    asked(
+        ctx,
+        "term_mode",
+        Nondeterministic,
+        I64(-1),
+        |c: &mut Ctx| {
+            let Some(mode) = handed(c, "term_mode", "a mode", mode_of(mode.0)) else {
+                return I64(-1);
+            };
+            match stdio::set_mode(mode) {
+                Ok(was) => I64(was.map_or(-1, mode_number)),
+                Err(e) => {
+                    let span = c.site();
+                    c.fail(unset(mode, &e, span));
+                    I64(-1)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// The ticket of what has been typed, at most `max` bytes, found; none where nothing came within
 /// `timeout_ms`, which waits as long as it takes where it is negative.
 pub unsafe extern "C" fn rt_term_input(ctx: *mut Ctx, max: I64, timeout_ms: I64) -> I64 {
-    asked(ctx, "term_input", WRITES, I64(0), |c: &mut Ctx| {
-        let Some(max) = handed(c, "term_input", "a length", usize::try_from(max.0).ok()) else {
-            return I64(0);
-        };
-        let deadline = u64::try_from(timeout_ms.0)
-            .ok()
-            .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
-        let job: Job = Box::new(move || match stdio::read_within(max, deadline) {
-            Ok(bytes) => Ok(found(bytes)),
-            Err(e) => Err(format!("the terminal could not be read: {e}")),
-        });
-        waited(c, "term_input", "`term.input`", Ok(job))
-    })
+    asked(
+        ctx,
+        "term_input",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some(max) = handed(c, "term_input", "a length", usize::try_from(max.0).ok()) else {
+                return I64(0);
+            };
+            let deadline = u64::try_from(timeout_ms.0)
+                .ok()
+                .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)));
+            let job: Job = Box::new(move || match stdio::read_within(max, deadline) {
+                Ok(bytes) => Ok(found(bytes)),
+                Err(e) => Err(format!("the terminal could not be read: {e}")),
+            });
+            waited(c, "term_input", "`term.input`", Ok(job))
+        },
+    )
 }
 
 /// The ticket of one line of standard input kept for a `Secret` by the run that asked: the number
 /// it is kept under, found, or none at the end of input. A line read after its run ended is wiped
 /// as it is dropped.
 pub unsafe extern "C" fn rt_term_secret_line(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "term_secret_line", WRITES, I64(0), |c: &mut Ctx| {
-        let Some(run) = from_host(c, |facilities| Arc::downgrade(facilities.run())) else {
-            return I64(0);
-        };
-        let job: Job = Box::new(move || match stdio::read_secret_line() {
-            Ok(Some(mut line)) => {
-                let kept = ply_host::pool::Kept::new(std::mem::take(&mut *line).into_bytes());
-                Ok(found(run.upgrade().map(|run| int(run.keep_secret(kept)))))
-            }
-            Ok(None) => Ok(found(None::<[u8; 8]>)),
-            Err(e) => Err(format!("standard input could not be read: {e}")),
-        });
-        waited(c, "term_secret_line", "`term.secret_line`", Ok(job))
-    })
+    asked(
+        ctx,
+        "term_secret_line",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some(run) = from_host(c, |facilities| Arc::downgrade(facilities.run())) else {
+                return I64(0);
+            };
+            let job: Job = Box::new(move || match stdio::read_secret_line() {
+                Ok(Some(mut line)) => {
+                    let kept = ply_host::pool::Kept::new(std::mem::take(&mut *line).into_bytes());
+                    Ok(found(run.upgrade().map(|run| int(run.keep_secret(kept)))))
+                }
+                Ok(None) => Ok(found(None::<[u8; 8]>)),
+                Err(e) => Err(format!("standard input could not be read: {e}")),
+            });
+            waited(c, "term_secret_line", "`term.secret_line`", Ok(job))
+        },
+    )
 }
 
 /// The line the run keeps under `number`, as a secret that only a `Secret`'s own readers read.
@@ -146,7 +176,7 @@ pub unsafe extern "C" fn rt_term_secret_taken(ctx: *mut Ctx, number: I64) -> Sec
     asked(
         ctx,
         "term_secret_taken",
-        WRITES,
+        Nondeterministic,
         SecretHandle::of(0),
         |c: &mut Ctx| {
             let line = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();

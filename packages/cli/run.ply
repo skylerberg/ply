@@ -22,9 +22,11 @@ import configuration
 import configuration (Configuration, Resolution)
 import std.config (SInt, SSecret)
 import compiler.check.resolve.tables (Diag, Label)
-import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
+import diagnostic (Place, Raised, Spot, raised_json, shown, spot_of, to_json, all_to_json,
+                   all_to_text)
 import entries
 import entry (Main, Module, entry_point)
+import compiler.cc
 import compiler.cc (toolchain)
 import std.env (env)
 import paths
@@ -45,7 +47,7 @@ import report (Answer, indent, ok_code, compile_error, count_of, refused, warned
 import std.json (Json, Null, Str, Bool, Number, Array, Member, Object, object, to_string, int,
                  string_or_null, strings)
 import std.value (Value, VInt, VUnit, render)
-import std.process (process, Captured, captured, out_step, err_step)
+import std.process (process, captured, err_step)
 import std.term (Style, dim, plain, red)
 import signing (provenance_of, public_of, signatures_path, unkeyed)
 import std.signed (signed_of, vouched_by)
@@ -151,12 +153,6 @@ fn signal_lines(style: Style, bound: Bound) -> List<String> =
       ],
   }
 
-fn wrote(lines: List<String>, i: Int) -> Unit / {process.out[proc]} =
-  if i >= lines.len() { () } else {
-    process.out[proc](lines.at_or(i, ""));
-    wrote(lines, i + 1)
-  }
-
 fn warned(lines: List<String>, i: Int) -> Unit / {process.err[proc]} =
   if i >= lines.len() { () } else {
     process.err[proc](lines.at_or(i, ""));
@@ -164,22 +160,27 @@ fn warned(lines: List<String>, i: Int) -> Unit / {process.err[proc]} =
   }
 
 /// Written while the entry is still ahead of the run: a disclosure made afterwards discloses
-/// nothing. `--json` promises stdout to the one object, so a run that makes that promise says
-/// none of this aloud and carries all of it in the document instead.
+/// nothing. Stdout is the program's, so the configuration's warnings go to stderr, and what the run
+/// may reach goes there too under `--explain`. `--json` carries all of it in the document instead.
 fn disclosed(
   style: Style,
   flags: Flags,
   target: Target,
   bound: Bound,
   resolution: Resolution,
-) -> Unit / {process.out[proc], process.err[proc], abort.raise} =
+) -> Unit / {process.err[proc], abort.raise} =
   if flags.json { () } else {
     warned(all_to_text(style, resolution.warnings, places_of(target)), 0);
-    wrote(
-      binding_lines(style, bound, resolution.configuration).concat(program_lines(style, target)),
-      0,
-    );
-    warned(signal_lines(style, bound), 0)
+    if flags.explain {
+      warned(
+        binding_lines(style, bound, resolution.configuration).concat(
+          program_lines(style, target),
+        ).concat(
+          signal_lines(style, bound),
+        ),
+        0,
+      )
+    }
   }
 
 // --- What is reported once it is over ----------------------------------------
@@ -188,7 +189,7 @@ fn disclosed(
 fn drained(diag: Diag) -> Bool = diag.code == b"W0608"
 
 /// An abandoned run raised nothing: the clock stopped it where it stood.
-fn abandoned(diag: Diag) -> Bool = diag.code == b"W0612"
+fn abandoned(diag: Diag) -> Bool = machine::is_abandoned(diag.code)
 
 fn expired_of(e: Ended) -> Bool = match e.raised { Some(r) -> drained(r.diag), None -> false }
 
@@ -328,7 +329,7 @@ fn document(
   e: Ended,
   ok: Bool,
   code: Int,
-  diags: List<Diag>,
+  raised: Option<Raised>,
 ) -> Json / {abort.raise} =
   object(
     [
@@ -348,7 +349,15 @@ fn document(
         value: configuration::report_json(configuration::report(resolution.configuration)),
       },
       { key: "shutdown", value: shutdown_json(e) },
-      { key: "diagnostics", value: all_to_json(diags, places_of(target)) },
+      {
+        key: "diagnostics",
+        value: Array(
+          noted(resolution, e).map(|d: Diag| to_json(d, places_of(target))).concat(match raised {
+            Some(r) -> [raised_json(r, places_of(target))],
+            None -> [],
+          }),
+        ),
+      },
     ]),
   )
 
@@ -357,9 +366,15 @@ fn document(
 /// Everything the run has to say about itself that is not the entry's own answer.
 fn noted(resolution: Resolution, e: Ended) -> List<Diag> = resolution.warnings.concat(e.warnings)
 
-/// The program chose its code and returned no value, so none is printed.
-fn exited(
+/// What `--explain` adds once the run is over: the handshakes, and how a stop went.
+fn explained_end(style: Style, flags: Flags, e: Ended) -> List<String> =
+  if flags.explain { handshake_lines(style, e).concat(stop_lines(style, e)) } else { [] }
+
+/// `main` returned, or the program chose its own code. Either way nothing goes to stdout: the
+/// value is `--json`'s to report.
+fn finished(
   style: Style,
+  flags: Flags,
   target: Target,
   en: String,
   resolution: Resolution,
@@ -367,41 +382,29 @@ fn exited(
   code: Int,
 ) -> Answer / {abort.raise} =
   {
-    json: document(target, en, resolution, e, code == ok_code(), code, noted(resolution, e)),
-    lines: handshake_lines(style, e),
-    errs: stop_lines(style, e).concat(warned_lines(style, e.warnings)),
+    json: document(target, en, resolution, e, code == ok_code(), code, None),
+    lines: [],
+    errs: explained_end(style, flags, e).concat(warned_lines(style, e.warnings)),
     code: code,
-  }
-
-fn answered(
-  style: Style,
-  target: Target,
-  en: String,
-  resolution: Resolution,
-  e: Ended,
-) -> Answer / {abort.raise} =
-  {
-    json: document(target, en, resolution, e, true, ok_code(), noted(resolution, e)),
-    lines: handshake_lines(style, e).concat([
-      indent() ++ (match e.value { Some(v) -> render(v), None -> "" }),
-    ]),
-    errs: stop_lines(style, e).concat(warned_lines(style, e.warnings)),
-    code: ok_code(),
   }
 
 fn raised(
   style: Style,
+  flags: Flags,
   target: Target,
   en: String,
   resolution: Resolution,
   e: Ended,
-  diag: Diag,
+  r: Raised,
 ) -> Answer / {abort.raise} = {
+  let diag = shown(r);
   let code = if drained(diag) { drain_incomplete() } else { failed() };
   {
-    json: document(target, en, resolution, e, false, code, noted(resolution, e).push(diag)),
+    json: document(target, en, resolution, e, false, code, Some(r)),
     lines: [],
-    errs: stop_lines(style, e).concat(all_to_text(style, [diag], places_of(target))).concat(
+    errs: explained_end(style, flags, e).concat(
+      all_to_text(style, [diag], places_of(target)),
+    ).concat(
       raised_at(style, target, diag),
     ).concat(
       warned_lines(style, e.warnings),
@@ -412,16 +415,17 @@ fn raised(
 
 fn ended(
   style: Style,
+  flags: Flags,
   target: Target,
   en: String,
   resolution: Resolution,
   e: Ended,
 ) -> Answer / {abort.raise} =
   match e.exit {
-    Some(code) -> exited(style, target, en, resolution, e, code),
+    Some(code) -> finished(style, flags, target, en, resolution, e, code),
     None -> match e.raised {
-      None -> answered(style, target, en, resolution, e),
-      Some(r) -> raised(style, target, en, resolution, e, shown(r)),
+      None -> finished(style, flags, target, en, resolution, e, ok_code()),
+      Some(r) -> raised(style, flags, target, en, resolution, e, r),
     },
   }
 
@@ -493,14 +497,14 @@ fn started<| e>(
   en: String,
   cfg: Result<Resolution, List<Diag>>,
   bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
-) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
+) -> Answer / {process.err[proc], abort.raise | e} =
   match cfg {
     Err(diags) -> unbound(style, { diags: diags, places: places_of(target), artifact: None }),
     Ok(r) -> match bind(en, configuration::configured(r.configuration)) {
       Err(why) -> unbound(style, why),
       Ok(b) -> {
         disclosed(style, flags, target, b.bound, r);
-        ended(style, target, en, r, (b.enter)())
+        ended(style, flags, target, en, r, (b.enter)())
       },
     },
   }
@@ -511,7 +515,7 @@ fn chosen<| e>(
   target: Target,
   cfg: Result<Resolution, List<Diag>>,
   bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
-) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
+) -> Answer / {process.err[proc], abort.raise | e} =
   match entry_of(target) {
     Err(d) -> unentered(style, target, d),
     Ok(en) -> started(style, flags, target, en, cfg, bind),
@@ -530,14 +534,15 @@ fn configured_over(
 
 /// The binding `options` make for the entry `en` of `loaded`, answering `config`, and the entry
 /// run under it; or why it cannot be made: a family the program does not declare (`E0459`), or a
-/// facility that does not load.
+/// facility that does not load. `stderr` is `machine::run_grants`'s.
 fn bound_over(
   loaded: Loaded,
   options: Options,
   en: String,
   config: Configured,
+  stderr: Bool,
 ) -> Result<Entered<| {entering::machine.enter, entering::machine.unbind, abort.raise}>, Refusal> / {entering::machine.hosting, entering::machine.bind, abort.raise} = {
-  let unheard = machine::run_grants(options, config, machine::Unheard);
+  let unheard = machine::run_grants(options, config, machine::Unheard, stderr);
   let declared = loaded.runnable.declared;
   let refused = |diags: List<Diag>|
     Err({ diags: diags, places: places_of(loaded.target), artifact: None });
@@ -548,7 +553,7 @@ fn bound_over(
       if hosting.refusals.len() > 0 { refused(hosting.refusals.map(machine::unplaced)) } else {
         let l = listing::resolved(declared, loaded.runnable.performed);
         let stop = listing::stop_of(l.rows);
-        match entering::machine.bind(machine::run_grants(options, config, stop)) {
+        match entering::machine.bind(machine::run_grants(options, config, stop, stderr)) {
           Err(failures) -> refused(failures.map(machine::unplaced)),
           Ok(binding) -> {
             let bounds = { lead_ms: options.drain_lead_ms, drain_ms: options.drain_ms };
@@ -590,7 +595,6 @@ fn entered(
     ..entering::unbounded(machine::max_calls()),
     binding: binding,
     hosted: true,
-    steps: options.steps,
     timeout_ms: options.timeout,
     seed: match options.seed {
       Some(s) -> Some({ root: s.root, path: s.path, steps: plan::default_steps() }),
@@ -671,7 +675,7 @@ fn handshakes_json(reports: List<entering::Report>) -> Json / {abort.raise} = {
 pub fn run(
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, shipped.definitions, shipped.runtime, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
   let s: Style = style_of(flags);
   // An artifact is not a program to analyse: what it holds is its own definitions, and the front
   // end never sees it. Only sources are a load this side runs, so only their schema is resolved
@@ -700,7 +704,7 @@ pub fn run(
 fn deployed_target(
   path: String,
   bytes: Option<Bytes>,
-  profile: String,
+  profile: cc::Profile,
 ) -> Result<Loaded, Refusal> / {entering::machine.open, emit.compiled, shipped.definitions, shipped.runtime, abort.raise} =
   if path.ends_with(".plyz") { Err({ diags: [a_library(path)], places: [], artifact: None }) }
   else {
@@ -843,7 +847,7 @@ fn sourced(
   style: Style,
   flags: Flags,
   options: Options,
-) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
+) -> Answer / {shipped.answer, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Entering, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, diverges, shipped.reached} = {
   let started = time.elapsed_ms();
   let project: sources::Project = load_resolved(flags.paths);
   let key = command_key(queried::program(), asked_of(flags, options));
@@ -924,8 +928,8 @@ fn built(
   key: Bytes,
   marks: List<Bytes>,
   started: Int,
-) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, Entering, process.out[proc], process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, shipped.reached} = {
-  let t: Timed = timed_over(flags.paths, project, started);
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, Entering, process.err[proc], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, toolchain.reused, priced.report, literal.verdicts, literal.statements, Derives, abort.raise, shipped.reached} = {
+  let t: Timed = timed_over(flags.paths, project, started, flags.verify_deps);
   match program_view(t.program) {
     // A load refusal, in the shape the machine's own refusals take: nothing ran, and the
     // diagnostics say why.
@@ -954,7 +958,7 @@ fn loaded_built(
   view: View,
   key: Bytes,
   marks: List<Bytes>,
-) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, Entering, process.out[proc], process.err[proc], env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
+) -> Answer / {shipped.answer, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], time.elapsed_ms, Entering, process.err[proc], env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], emit.unit, emit.compiled, fs.write[abs], Derives, abort.raise} = {
   let asked = time.elapsed_ms();
   let front = front_of(timed, view);
   let emitted = match units::whole(front) {
@@ -1017,7 +1021,7 @@ fn over(
   options: Options,
   loaded: Result<Loaded, Refusal>,
   l: Option<Loading>,
-) -> Answer / {Entering, process.out[proc], process.err[proc], env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+) -> Answer / {Entering, process.err[proc], env.variables, env.working_directory, fs.resolved[cwd], fs.resolved[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match loaded {
     Err(why) -> unloaded(style, why),
     Ok(t) -> {
@@ -1026,7 +1030,7 @@ fn over(
         flags,
         Ok(t.target),
         configured_over(t, options),
-        |en: String, config: Configured| bound_over(t, options, en, config),
+        |en: String, config: Configured| bound_over(t, options, en, config, flags.json),
         l,
       );
       entering::machine.close(t.unit.unit);
@@ -1044,7 +1048,7 @@ fn reported<| e>(
   cfg: Result<Resolution, List<Diag>>,
   bind: (String, Configured) -> Result<Entered<| e>, Refusal> / e,
   l: Option<Loading>,
-) -> Answer / {process.out[proc], process.err[proc], abort.raise | e} =
+) -> Answer / {process.err[proc], abort.raise | e} =
   match target {
     Err(why) -> unloaded(style, why),
     Ok(t) -> match l {
@@ -1176,8 +1180,8 @@ fn a_diag(code: Bytes, message: Bytes, labels: List<Label>) -> Diag =
 fn nothing() -> Refusal = { diags: [], places: [], artifact: None }
 
 /// The run's own answer over a load, a binding and an entry the test hands it in place of the
-/// runtime, with whatever it wrote on either stream captured beside it.
-type RunCapture = { answer: Answer, out: List<String>, err: List<String> }
+/// runtime, with what it wrote on stderr while the entry ran captured beside it.
+type RunCapture = { answer: Answer, err: List<String> }
 
 fn ran_over(
   flags: Flags,
@@ -1231,25 +1235,21 @@ fn ran_loaded(
     )
   } with {
     var io = captured([]),
-    process.out[proc](text) -> {
-      io = out_step(io, text);
-    },
     process.err[proc](text) -> {
       io = err_step(io, text);
     },
-    return answer -> { answer: answer, out: io.out, err: io.err },
+    return answer -> { answer: answer, err: io.err },
   }
 
 fn bare() -> Flags / {abort.raise} = from_argv("run", [])
 
 fn as_json() -> Flags / {abort.raise} = from_argv("run", ["--json"])
 
-test "a value the entry answered with is one indented line and exit 0" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), answered_with(VInt(42)));
+test "a run that answered says nothing of its own, not even the value, and exits 0" {
+  let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
   assert_eq(ran.answer.code, 0);
-  assert_eq(ran.answer.lines, ["   42"]);
+  assert_eq(ran.answer.lines, []);
   assert_eq(ran.answer.errs, []);
-  assert_eq(ran.out, []);
   assert_eq(ran.err, [])
 }
 
@@ -1273,42 +1273,41 @@ test "the object keys off `command` and `exit_code`, and names the entry and its
 
 // What a run may reach is disclosed while the entry is still ahead of it, so it goes out on the
 // stream as the program runs rather than in the answer collected after it.
-test "a bound run discloses what it may reach before the entry is entered" {
+test "under `--explain` a bound run discloses what it may reach before the entry is entered" {
   let ran = ran_loaded(
-    bare(),
+    explaining(),
     Ok(a_program()),
     Ok(configured_service()),
     Ok(a_binding()),
     answered_with(VInt(42)),
     None,
   );
-  assert_eq(ran.out, [
+  assert_eq(ran.err, [
     "   binding host · 7 operations · b3:aabbccddeeff",
     "   config      2 keys · 2 environment · 1 secret (values not shown)",
     "   trace       json on stderr · info",
-  ]);
-  assert_eq(ran.err, [
     "   shutdown    signals SIGINT SIGTERM · lead 0ms · drain 30000ms · second signal exits 130/143",
   ]);
-  assert_eq(ran.answer.lines, ["   42"])
+  assert_eq(ran.answer.lines, [])
 }
 
-test "a run that ends at once on a stop says so before the entry is entered" {
+test "under `--explain` a run that ends at once on a stop says so before the entry is entered" {
   let ending = { ..a_binding(), signals: Some({ names: ["SIGINT", "SIGTERM"], drain: None }) };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(ending), answered_with(VInt(42)));
-  assert_eq(ran.err, ["   shutdown    signals SIGINT SIGTERM · children ended · exits 130/143"])
+  let ran = ran_over(explaining(), Ok(a_program()), Ok(ending), answered_with(VInt(42)));
+  assert_eq(
+    ran.err.at_or(ran.err.len() - 1, ""),
+    "   shutdown    signals SIGINT SIGTERM · children ended · exits 130/143",
+  )
 }
 
 test "`--json` promises stdout to the one object, so nothing else is written at all" {
   let ran = ran_over(as_json(), Ok(a_program()), Ok(a_binding()), answered_with(VInt(42)));
-  assert_eq(ran.out, []);
   assert_eq(ran.err, []);
   assert(to_string(ran.answer.json).contains("\"value\":\"42\""))
 }
 
 test "a run that performs nothing of the host discloses nothing, because there is nothing it could reach" {
-  let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), answered_with(VUnit));
-  assert_eq(ran.out, []);
+  let ran = ran_over(explaining(), Ok(a_program()), Ok(reaching_nothing()), answered_with(VUnit));
   assert_eq(ran.err, [])
 }
 
@@ -1331,14 +1330,19 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
   assert_eq(ran.answer.errs.at_or(ran.answer.errs.len() - 1, ""), "   raised at m.ply:1:20")
 }
 
-test "a raise shows the values it carries, rendered where its text names them" {
+test "a raise shows the values it carries where its text names them, and the document each whole" {
   let raise = {
     ..answered_with(VInt(42)),
     value: None,
     raised: Some({ diag: a_diag(b"E0501", b"expected \x010\x02", []), values: [VInt(3)] }),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
-  assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: expected 3")
+  assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: expected 3");
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), raise).answer.json,
+  );
+  assert(text.contains("\"message\":\"expected 3\""));
+  assert(text.contains("\"values\":[\"3\"]"))
 }
 
 test "an expired drain is exit 3, and is not attributed to a line of the program" {
@@ -1365,20 +1369,24 @@ test "a program that chose its own exit code is answered with that code and no v
   assert(text.contains("\"value\":null"))
 }
 
-test "a stopped run says what was in flight, how long the drain took, and what it left open" {
+test "under `--explain` a stopped run says its handshakes, what was in flight, how long the drain took, and what it left open" {
   let stopped = {
     ..answered_with(VUnit),
     stopping: Some({ signal: Some("SIGTERM"), listeners: 1, connections: 2, elapsed_ms: 40 }),
     teardown: { ..no_teardown(), spans_left_open: 1 },
     trace: Some({ events: 9, spans: 4, abandoned: 2, flushed: true }),
+    handshakes: ["handshakes: 1 completed, 0 refused"],
   };
-  let ran = ran_over(bare(), Ok(a_program()), Ok(a_binding()), stopped);
+  let ran = ran_over(explaining(), Ok(a_program()), Ok(a_binding()), stopped);
+  assert_eq(ran.answer.lines, []);
   assert_eq(ran.answer.errs, [
+    "   handshakes: 1 completed, 0 refused",
     "   stopping    signal SIGTERM · lead 0ms · drain 30000ms · 1 listener(s) closed · 2 connection(s) in flight",
     "   drained       40ms since the signal",
     "   teardown    1 span(s) left open · sink flushed",
     "   trace       9 event(s) · 4 span(s) · 2 abandoned · flushed",
-  ])
+  ]);
+  assert_eq(ran_over(bare(), Ok(a_program()), Ok(a_binding()), stopped).answer.errs, [])
 }
 
 test "the shutdown block counts the spans left open, as the warning that named them did" {
@@ -1409,11 +1417,11 @@ fn warned_of_spans() -> List<String> =
     "     = each was closed `Abandoned` and written",
   ]
 
-test "spans an entry left open are warned of on stderr under its answer, and its exit 0 stands" {
+test "spans an entry left open are warned of on stderr, and its exit 0 stands" {
   let finished = { ..answered_with(VInt(3)), warnings: [left_open()] };
   let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), finished);
   assert_eq(ran.answer.code, 0);
-  assert_eq(ran.answer.lines, ["   3"]);
+  assert_eq(ran.answer.lines, []);
   assert_eq(ran.answer.errs, warned_of_spans());
   let text = to_string(
     ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), finished).answer.json,
@@ -1444,8 +1452,13 @@ test "a raise that left spans open is said first, and the spans after where it w
 }
 
 test "an artifact says which file it ran, its digest, and what it carries" {
-  let ran = ran_over(bare(), Ok(an_artifact()), Ok(reaching_nothing()), answered_with(VInt(42)));
-  assert_eq(ran.out, ["   program b3:1f2e3d4c5b6a · 3 definitions"]);
+  let ran = ran_over(
+    explaining(),
+    Ok(an_artifact()),
+    Ok(reaching_nothing()),
+    answered_with(VInt(42)),
+  );
+  assert_eq(ran.err, ["   program b3:1f2e3d4c5b6a · 3 definitions"]);
   let text = to_string(
     ran_over(
       as_json(),
@@ -1553,7 +1566,6 @@ test "an entry's updates in place are a share of its updates, and no share of no
   let usage: entering::Usage = {
     nanos: 0,
     host: false,
-    steps: 0,
     performs: 0,
     native_objects: 0,
     scheduled: 0,
@@ -1613,13 +1625,13 @@ test "`--explain` says whether the front end ran, under which key, and where the
     "   front end   built b3:0123456789ab · read 7ms · front 1774ms · write back 44ms · load 1392ms",
   );
   // Said before the entry runs, ahead of what the binding discloses on the same stream.
-  assert_eq(built.err.at_or(1, ""), loaded(bare(), a_build()).err.at_or(0, ""));
+  assert_eq(built.err.at_or(1, ""), "   binding host · 7 operations · b3:aabbccddeeff");
+  assert_eq(loaded(bare(), a_build()).err, []);
   assert_eq(built.answer, loaded(bare(), a_build()).answer)
 }
 
 test "`--json --explain` carries the load in the one document and says nothing aloud" {
   let ran = loaded(from_argv("run", ["--json", "--explain"]), a_reuse());
-  assert_eq(ran.out, []);
   assert_eq(ran.err, []);
   let text = to_string(ran.answer.json);
   assert(text.contains("\"front_end\":{\"key\":\"" ++ a_key() ++ "\""));

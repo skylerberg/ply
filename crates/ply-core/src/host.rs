@@ -17,20 +17,6 @@ impl Determinism {
     }
 }
 
-/// Whether replaying this operation changes anything outside the program.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Linearity {
-    AtMostOnce,
-    Repeatable,
-}
-
-impl Linearity {
-    /// Whether performing this counts against a later resumption.
-    pub fn is_linear(self) -> bool {
-        self == Linearity::AtMostOnce
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct MachineId(pub u64);
 

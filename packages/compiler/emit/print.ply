@@ -7,9 +7,9 @@
 
 import compiler.syntax.parsing (Span, span_between)
 import compiler.syntax.exprs (crossing_perform, scheduler_module)
-import compiler.check.types (Type, TyCon)
+import compiler.check.types (Type, TyCon, int_type, string_type, bool_type)
 import std.bytes (ascii_of_int)
-import compiler.emit.c (tick_line, int_lit)
+import compiler.emit.c (int_lit)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Root, Written, root_name, root_text, has_entry,
@@ -21,29 +21,28 @@ import compiler.emit.pieces (Piece, Text, Hole, Symbol, TagOf, SiteOf, InGroup, 
                              merged, spelled)
 import compiler.emit.release (drop_of)
 import compiler.emit.tir.handling (instance_alone)
-import compiler.emit.tir (no_closure_words, Rep, RInt, RBool, RWord, RFlat, RSum, RUnit, RSlice,
-                          Var, Arg, AVar, AInt, ABool, AZero, Val, Prim, Literal, Static, Make,
-                          TInt, Get, Take, Tag, Path, PField, PArg, PCapture, PCase, Pack, Gathered,
-                          Updated, Call, Apply, Native, Op, OHandle, OContainer, OCalling, OStrings,
-                          MClosure, MList, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop,
-                          Next, Done, Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec,
-                          Reset, Free, Opened, Block, Fn, Member, Rooted, Plain, Kept, Crossing,
-                          Given, Owned, Lambda, Closure, Uses, NoArm, LastOf, Walked, Unsettled,
-                          no_links, falls_through, var_said, laid_made, PPlace, Unwinds, Unwound,
-                          var_of)
+import compiler.emit.tir (carried_vars, reps_of, all_given, param_rep, no_closure_words, Rep, RInt,
+                          RBool, RWord, RFlat, RSum, RUnit, RSlice, Var, Arg, AVar, AInt, ABool,
+                          AZero, Val, Prim, Literal, Static, Make, TInt, Get, Take, Tag, Path,
+                          PField, PArg, PCapture, PCase, Pack, Gathered, Updated, Call, Apply,
+                          Native, Op, OHandle, OContainer, OCalling, OStrings, MClosure, MList,
+                          Inst, Let, Do, Decl, Assign, If, Case, Match, Miss, Loop, Next, Done,
+                          Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset,
+                          Free, Opened, Block, Fn, Member, Rooted, Plain, Given, Owned, Lambda,
+                          Closure, Uses, NoArm, LastOf, Walked, Unsettled, no_links, falls_through,
+                          var_said, laid_made, PPlace, Unwinds, Unwound, var_of)
 import compiler.emit.print.text (Under, Place, Printing, Printed, printing, function_body, line,
                                  text, pieces, pad, named, name_of, arg_text, assigned, label,
-                                 check, zero, failing_return, site, slot, part_names, part_name,
+                                 check, failing_return, site, slot, part_names, part_name,
                                  unprinted, fuel_returned)
 import compiler.emit.print.counts (block_opened, block_closed, count_printed, walked_value, last_of,
                                    updated, exit_through, fuel_kept)
-import compiler.emit.print.made (c_type, c_types, as_word, word_as, word_parts, made, got, gathered,
-                                 statics, join_declared, set_parts, returned, head_types,
-                                 head_params, head_names, params_opened, laid_dups, placed_write,
-                                 laid_counted)
+import compiler.emit.print.made (c_type, as_word, word_as, word_parts, made, got, gathered, statics,
+                                 join_declared, set_parts, returned, head_types, head_params,
+                                 head_names, params_opened, placed_write, laid_counted)
 import compiler.emit.print.worded (worded)
 import compiler.emit.print.placing (placing_of)
-import compiler.emit.print.fuel (fuel_head, crossed_head)
+import compiler.emit.print.fuel (fuel_head, restart_probe)
 import compiler.emit.print.prims (literal, prim)
 import compiler.emit.print.containers (contained, container_op)
 import compiler.emit.print.strings (string_op)
@@ -53,8 +52,7 @@ import compiler.emit.print.tested (case_opened, case_arm, case_arm_closed, case_
 import compiler.emit.print.invoked (call, applied, closure_made, restarted, entered_member,
                                     loop_opened, loop_closed, next, done, calling_op, lambda_names,
                                     lambda_text, group_wrapper, capture_got, member_returned,
-                                    runtime_entry, entered_of, kept_entry, group_buffers,
-                                    member_opened)
+                                    runtime_entry, entered_of, group_buffers, member_opened)
 import compiler.emit.lower.held (passing, ByReference)
 import compiler.emit.print.handled (handle_opened, handle_closed, landing_jump, effect_op)
 import compiler.emit.print.frames (site_linked, handle_linked, unlinked, record_declared,
@@ -112,19 +110,12 @@ fn root_printed(
   });
   let entered = if !has_entry(f.key, declared_arity(f.params), ctors.stated) {
     { pr: body, out: [] }
-  } else {
-    match f.kind {
-      Kept(w) -> kept_entry(body, name, w),
-      _ -> runtime_entry(body, name, entered_of(f)),
-    }
-  };
-  // A plain root counts no steps; a drop root nests only so deep, past which its block waits.
+  } else { runtime_entry(body, name, entered_of(f)) };
+  // A plain root spends no fuel; a drop root nests only so deep, past which its block waits.
   let opening = match f.kind {
     Rooted -> fuel_head(f.conv.answer),
-    Crossing -> crossed_head(f.conv.answer),
     Plain -> if !dropping(f.key) { b"" }
     else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
-    Kept(_) -> b"",
   };
   {
     pr: entered.pr,
@@ -282,7 +273,7 @@ fn group_printed(
           record_declared(switched),
           fuel_kept(switched),
           b"  ply_loop: ",
-          tick_line(failing_return(f.conv.answer)),
+          restart_probe(f.conv.answer),
           b"\n  switch (which) {\n",
         ]),
       ),
@@ -344,9 +335,7 @@ fn counted_here(k: RootKey) -> Option<Type> =
 fn leaving_of(f: Fn) -> Bytes =
   match f.kind {
     Rooted -> fuel_returned(),
-    Crossing -> fuel_returned(),
     Plain -> if dropping(f.key) { b"ply_drop_done(ctx);" } else { b"" },
-    Kept(_) -> b"",
   }
 
 fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
@@ -391,15 +380,15 @@ fn body_printed(
     unwinds: [],
     leaving: leaving_of(f),
   };
-  let opened = params_opened(f.params.map(|v: Var| name_of(pr, v)), f.conv.reps).fold(
+  let opened = params_opened(f.params.map(|v: Var| name_of(pr, v)), reps_of(f.conv)).fold(
     pr,
     |q: Printing, l: Bytes| line(q, 0, l),
   );
   let viewed = views_opened(f, opened);
-  // A plain root's restart counts no tick.
-  let ticked = match f.kind { Rooted -> tick_line(failing_return(f.conv.answer)), _ -> b";" };
+  // A plain root's loop walks a value, which ends.
+  let probed = match f.kind { Rooted -> restart_probe(f.conv.answer), _ -> b";" };
   let looped = if restarts(f.body) {
-    text(viewed, Bytes::concat_all([b"  ply_loop: ", ticked, b"\n"]))
+    text(viewed, Bytes::concat_all([b"  ply_loop: ", probed, b"\n"]))
   } else { viewed };
   let body = block_closed(printed(u, looped, f.body, 0), pr.block, 0, falls_through(f.body));
   let closed = match f.links.pending {
@@ -432,7 +421,7 @@ fn body_printed(
 fn views_opened(f: Fn, pr: Printing) -> Printing =
   range(0, f.params.len()).fold(pr, |q: Printing, i: Int|
     match f.params.at(i) {
-      Some(v) -> if v.rep != RSlice || f.conv.reps.at(i) != Some(RWord) { q } else {
+      Some(v) -> if v.rep != RSlice || param_rep(f.conv, i) != Some(RWord) { q } else {
         let word = name_of(q, v);
         line(
           q,
@@ -627,14 +616,14 @@ fn printed(home: Under, pr: Printing, b: Block, depth: Int) -> Printing / {abort
               let l = label(acc);
               let looped = {
                 ..u,
-                looping: Some({ label: l.n, state: lp.state, answer: lp.answer }),
+                looping: Some({ label: l.n, state: carried_vars(lp.state), answer: lp.answer }),
               };
               loop_closed(
                 p,
                 block_closed(
                   printed(
                     looped,
-                    block_opened(loop_opened(p, l.pr, l.n, lp.state, lp.init, lp.answer)),
+                    block_opened(loop_opened(p, l.pr, l.n, lp.state, lp.answer)),
                     lp.body,
                     inner,
                   ),
@@ -947,7 +936,7 @@ fn head(name: Bytes, f: Fn) -> Bytes =
 fn restart_printed(
   restart: (Arg, Arg) -> List<Arg>,
 ) -> { text: Bytes, arm: Bytes } / {abort.raise} = {
-  let int = TyCon({ name: b"Int", args: [] });
+  let int = int_type();
   let local = |id: Int, rep: Rep| { id: id, ty: int, rep: rep };
   let n = local(0, RInt);
   let acc = local(1, RInt);
@@ -960,13 +949,12 @@ fn restart_printed(
     kind: Rooted,
     params: [n, acc],
     conv: {
-      params: [Given, Given],
-      reps: [RInt, RInt],
+      params: [{ handed: Given, rep: RInt }, { handed: Given, rep: RInt }],
       answer: RInt,
       destined: false,
       answered: Owned,
     },
-    answer_ty: TyCon({ name: b"Int", args: [] }),
+    answer_ty: int_type(),
     body: [
       let_of(c, Prim({ op: b"eq", on: RInt, args: [AVar(n), AInt(0)] }), span_between(0, 0)),
       Decl(j),
@@ -1023,7 +1011,7 @@ test "a restart takes its arguments into temporaries before it sets the paramete
   )
 }
 
-fn word_var(id: Int) -> Var = { id: id, ty: TyCon({ name: b"String", args: [] }), rep: RWord }
+fn word_var(id: Int) -> Var = { id: id, ty: string_type(), rep: RWord }
 
 /// A `handle` with no clauses running `body`, holding nothing across it, its answer `answer`.
 fn handle_over(answer: Var, body: Block) -> Inst =
@@ -1044,7 +1032,7 @@ fn answering(answer: Var, body: Block) -> Bytes / {abort.raise} =
         key: Named(b"m.guarded"),
         kind: Rooted,
         params: [],
-        conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
+        conv: { params: [], answer: RWord, destined: false, answered: Owned },
         answer_ty: answer.ty,
         body: body.push(Return(AVar(answer))),
         lambdas: [],
@@ -1110,18 +1098,28 @@ test "a fail inside a handle's body goes to its landing, never out of the functi
 fn occurrences(t: Bytes, s: Bytes) -> Int / {abort.raise} = t.split(s).len() - 1
 
 test "a tail group is one function switching on its member's place, each arm opening its member's words" {
-  let int = TyCon({ name: b"Int", args: [] });
+  let int = int_type();
   let which = { id: 0, ty: int, rep: RInt };
   let n = { id: 1, ty: int, rep: RInt };
   let m = { id: 2, ty: int, rep: RInt };
-  let conv = { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned };
+  let conv = {
+    params: [{ handed: Given, rep: RInt }],
+    answer: RInt,
+    destined: false,
+    answered: Owned,
+  };
   let text = spelled(
     printed_fn(
       {
         key: Named(b"m.even"),
         kind: Rooted,
         params: [which],
-        conv: { params: [Given], reps: [RInt], answer: RWord, destined: false, answered: Owned },
+        conv: {
+          params: [{ handed: Given, rep: RInt }],
+          answer: RWord,
+          destined: false,
+          answered: Owned,
+        },
         answer_ty: m.ty,
         body: [
           Case({
@@ -1172,14 +1170,19 @@ test "a tail group is one function switching on its member's place, each arm ope
 }
 
 test "a closure's function follows its root's, and its body numbers its temporaries afresh" {
-  let int = TyCon({ name: b"Int", args: [] });
+  let int = int_type();
   let x = { id: 0, ty: int, rep: RInt };
   let j = { id: 1, ty: int, rep: RInt };
   let body = {
     key: Named(b"m.outer"),
     kind: Rooted,
     params: [x],
-    conv: { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: Given, rep: RInt }],
+      answer: RInt,
+      destined: false,
+      answered: Owned,
+    },
     answer_ty: int,
     body: [Decl(j), Assign({ var: j, arg: AVar(x) }), Return(AVar(j))],
     lambdas: [],
@@ -1211,7 +1214,12 @@ test "a plain root counts no fuel or ticks; a drop root nests through the releas
       key: keys::written(op, ty, b"m"),
       kind: Plain,
       params: [o],
-      conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
+      conv: {
+        params: [{ handed: Given, rep: RWord }],
+        answer: RWord,
+        destined: false,
+        answered: Owned,
+      },
       answer_ty: ty,
       body: [If({ cond: AVar(o), then: [Restart([AVar(o)])], otherwise: [Return(AZero(RWord))] })],
       lambdas: [],
@@ -1260,13 +1268,12 @@ fn int_root(params: List<Var>, body: Block) -> Fn =
     kind: Rooted,
     params: params,
     conv: {
-      params: params.map(|_: Var| Given),
-      reps: params.map(|v: Var| v.rep),
+      params: all_given(params.map(|v: Var| v.rep)),
       answer: RInt,
       destined: false,
       answered: Owned,
     },
-    answer_ty: TyCon({ name: b"Int", args: [] }),
+    answer_ty: int_type(),
     body: body,
     lambdas: [],
     base: 100,
@@ -1276,7 +1283,7 @@ fn int_root(params: List<Var>, body: Block) -> Fn =
   }
 
 test "a lent run's failure sites name its lender and count from its text, until the run ends" {
-  let int = TyCon({ name: b"Int", args: [] });
+  let int = int_type();
   let v = |id: Int| { id: id, ty: int, rep: RInt };
   let add = |x: Var, at: Span|
     Let({
@@ -1331,7 +1338,12 @@ test "a field taken moves out of a block held only here, in place in another or 
   let field = word_var(1);
   let f = {
     ..int_root([block], [Let({ var: field, val: Take({ of: block, path: PField({ name: b"bytes", at: 1 }) }), at: span_between(0, 0), unwind: [] }), Return(AInt(0))]),
-    conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: Given, rep: RWord }],
+      answer: RWord,
+      destined: false,
+      answered: Owned,
+    },
   };
   let text = spelled(printed_fn(f, no_ctors()).pieces);
   // Its slot is emptied where the block is held only here, and the field counted once more else.
@@ -1343,7 +1355,7 @@ test "a field taken moves out of a block held only here, in place in another or 
 }
 
 test "a constructor's tag is a hole the unit writes in" {
-  let k = { id: 0, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+  let k = { id: 0, ty: int_type(), rep: RInt };
   let pr = printed_fn(
     int_root([], [
       Let({ var: k, val: Tag(b"m.Box"), at: span_between(0, 0), unwind: [] }),
@@ -1360,8 +1372,7 @@ fn called(args: List<Arg>) -> Val =
     callee: Root(Named(b"m.g")),
     args: args,
     conv: {
-      params: args.map(|_: Arg| Given),
-      reps: args.map(|_: Arg| RWord),
+      params: all_given(args.map(|_: Arg| RWord)),
       answer: RWord,
       destined: false,
       answered: Owned,
@@ -1380,8 +1391,7 @@ fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
       {
         ..int_root(params, body),
         conv: {
-          params: params.map(|_: Var| Given),
-          reps: params.map(|v: Var| v.rep),
+          params: all_given(params.map(|v: Var| v.rep)),
           answer: RWord,
           destined: false,
           answered: Owned,
@@ -1393,11 +1403,7 @@ fn word_root(params: List<Var>, body: Block) -> Bytes / {abort.raise} =
 
 /// What letting go of a `String` named `name` prints: a call of its type's drop root, a hole.
 fn released_text(name: Bytes) -> Bytes / {abort.raise} =
-  call_text(rel_fn(), [
-    b"ctx",
-    name,
-    spelled([Hole(Symbol(Root(drop_of(TyCon({ name: b"String", args: [] })))))]),
-  ]).concat(
+  call_text(rel_fn(), [b"ctx", name, spelled([Hole(Symbol(Root(drop_of(string_type()))))])]).concat(
     b";",
   )
 
@@ -1429,7 +1435,7 @@ test "each failure releases what it holds through tails that failures holding al
 
 test "a tail stands in the block its value was declared in, and goes on to the tails of the blocks around it" {
   let s = word_var(0);
-  let flag = { id: 1, ty: TyCon({ name: b"Bool", args: [] }), rep: RBool };
+  let flag = { id: 1, ty: bool_type(), rep: RBool };
   let j = word_var(2);
   let a = word_var(3);
   let b = word_var(4);
@@ -1491,7 +1497,7 @@ test "a failure inside a handle's body releases what the body holds and goes to 
 
 test "a value whose C tests for no failure adds no tail" {
   let s = word_var(0);
-  let n = { id: 1, ty: TyCon({ name: b"Int", args: [] }), rep: RInt };
+  let n = { id: 1, ty: int_type(), rep: RInt };
   let half = { ..n, id: 2 };
   let a = word_var(3);
   let quiet = word_root([s, n], [

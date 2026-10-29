@@ -6,7 +6,6 @@ import std.fs (fs, mem_empty)
 import std.random (entropy)
 import std.time (time)
 import std.bytes
-import compiler.store.hash (body_key)
 import compiler.store.hash.forms (ModuleRecord, module_record_bin, record_digest, recorded_graph,
                                   recorded_hashes)
 import engine (Store, Found, Hit, Miss, Bad, Warning, Trouble, Corrupt, Unreadable, OtherVersion,
@@ -18,8 +17,6 @@ import std.hash (blake3)
 
 // --- Tables -----------------------------------------------------------------
 
-fn t_defs() -> Int = 2
-fn t_bodies() -> Int = 4
 fn t_passed() -> Int = 5
 fn t_pass_records() -> Int = 6
 fn t_seen() -> Int = 7
@@ -29,10 +26,9 @@ fn t_stamps() -> Int = 11
 fn t_code_passes() -> Int = 14
 fn t_eras() -> Int = 15
 fn t_modules() -> Int = 16
+fn t_texts() -> Int = 17
 
 // --- Records ----------------------------------------------------------------
-
-pub type Body = { encoding: Int, bytes: Bytes }
 
 /// What a test last passed at: its hash, the era it passed in, and where a walk of that era's module
 /// records starts to find what it reached: at what `of` references, or at what its cases run where
@@ -48,7 +44,6 @@ pub type Review = { def: Bytes, specs: List<Bytes> }
 /// the code its test ran answers to, which no compiler change moves.
 pub type Stamps = { runtime: String, code: String }
 
-derive bin for Body
 derive bin for PassRecord
 derive bin for Named
 derive bin for Review
@@ -57,7 +52,6 @@ derive bin for Stamps
 /// Every stored record's shape, so a store written under another encoding of any of them is not read.
 pub fn schema() -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    bin::shape_digest(body_bin()),
     bin::shape_digest(named_bin(pass_record_bin())),
     bin::shape_digest(named_bin(review_bin())),
     bin::shape_digest(stamps_bin()),
@@ -102,7 +96,7 @@ fn groups(was: Stamps, now: Stamps) -> List<Group> =
       what: "the test results and discharged obligations",
       was: was.runtime,
       now: now.runtime,
-      tables: [t_passed(), t_pass_records(), t_seen(), t_evidence(), t_defs()],
+      tables: [t_passed(), t_pass_records(), t_seen(), t_evidence()],
     },
     {
       what: "the passes filed under the code their tests ran",
@@ -297,51 +291,22 @@ fn renew<a, [r]>(
   }
 
 // --- What a passing run's definitions were -----------------------------------------
-// A failure's bisection reads what its test last passed against: the era it passed in, that era's
-// module records, and each definition's interface and body by its hash.
+// A failure's suspects are read against what its test last passed against: the era it passed in,
+// that era's module records, and each definition's text by its hash.
 
-/// What a definition published, under its hash: it is a function of the hash.
-pub fn def_of<[r]>(cache: Cache, hash: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
-  read[r](cache, t_defs(), hash, bin::bytes_bin(), "interface")
+/// The source text of the definition `hash` names, as it read when it was filed.
+pub fn text<[r]>(cache: Cache, hash: Bytes) -> Read<Bytes> / {fs.read[r], abort.raise} =
+  read[r](cache, t_texts(), hash, bin::bytes_bin(), "definition text")
 
-/// A write of what is already there is no write.
-pub fn put_def<[r]>(cache: Cache, hash: Bytes, value: Bytes) -> Cache / {fs.read[r], abort.raise} =
-  renew[r](cache, t_defs(), hash, bin::bytes_bin(), value)
+/// Files the text of the definition `hash` names, unless one is filed already. Two texts with one
+/// hash differ only in what a hash leaves out, such as comments, so the first one stays.
+pub fn put_text(cache: Cache, hash: Bytes, text: Bytes) -> Cache / {abort.raise} =
+  if held(cache.store, t_texts(), hash) { cache }
+  else { write(cache, t_texts(), hash, bin::bytes_bin(), text) }
 
-/// Whether an interface is filed under `hash`, read from the index alone.
-pub fn holds_def(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
-  held(cache.store, t_defs(), hash)
-
-pub fn body<[r]>(cache: Cache, hash: Bytes) -> Read<Body> / {fs.read[r], abort.raise} = {
-  let got = read[r](cache, t_bodies(), hash, body_bin(), "body");
-  match got.value {
-    Some(b) -> if body_key(b.bytes) == Some(hash) { got } else {
-      { value: None, cache: noted(got.cache, damaged("body", "its envelope names another hash")) }
-    },
-    None -> got,
-  }
-}
-
-/// A body whose envelope does not name `hash` is not filed: it could never be read back.
-/// A body is keyed by a digest of itself, so a different body already there means its encoding
-/// depends on something the hash does not cover: the one stored is kept and the run warned.
-pub fn put_body<[r]>(cache: Cache, hash: Bytes, b: Body) -> Cache / {fs.read[r], abort.raise} =
-  if body_key(b.bytes) != Some(hash) { cache } else {
-    match get[r](cache.store, t_bodies(), hash) {
-      Hit(old) -> if old == bin::encode(b, body_bin()) { cache } else {
-        noted(
-          cache,
-          "two different bodies were stored for definition `" ++ hash.hex_of().slice(0, 12)
-            ++ "`; the one already stored is kept",
-        )
-      },
-      _ -> write(cache, t_bodies(), hash, body_bin(), b),
-    }
-  }
-
-/// Whether a body is filed under `hash`, read from the index alone.
-pub fn holds_body(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
-  held(cache.store, t_bodies(), hash)
+/// Whether a text is filed under `hash`, read from the index alone.
+pub fn holds_text(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
+  held(cache.store, t_texts(), hash)
 
 fn era_domain() -> Bytes = b"ply.era.1"
 
@@ -543,8 +508,7 @@ pub fn put_review(cache: Cache, def: Bytes, r: Review) -> Cache / {abort.raise} 
 // --- Upkeep -----------------------------------------------------------------
 
 pub type Counts = {
-  defs: Int,
-  bodies: Int,
+  texts: Int,
   passed: Int,
   pass_records: Int,
   eras: Int,
@@ -556,8 +520,7 @@ pub type Counts = {
 
 pub fn counts(cache: Cache) -> Counts / {abort.raise} =
   {
-    defs: keys(cache.store, t_defs()).len(),
-    bodies: keys(cache.store, t_bodies()).len(),
+    texts: keys(cache.store, t_texts()).len(),
     passed: keys(cache.store, t_passed()).len(),
     pass_records: keys(cache.store, t_pass_records()).len(),
     eras: keys(cache.store, t_eras()).len(),
@@ -567,11 +530,16 @@ pub fn counts(cache: Cache) -> Counts / {abort.raise} =
     reviews: keys(cache.store, t_reviews()).len(),
   }
 
-/// How many interfaces, bodies, eras and module records a prune dropped.
-pub type Pruned = { defs: Int, bodies: Int, eras: Int, modules: Int }
+/// How many definition texts, eras and module records a prune dropped.
+pub type Pruned = { texts: Int, eras: Int, modules: Int }
 
-/// The tests whose pass record names each era, each by where a walk of it starts.
-type Passed = { eras: Map<Bytes, List<{ key: Bytes, case: Bool }>>, cache: Cache }
+/// The tests whose pass record names each era, each by where a walk of it starts, and the hash
+/// each test passed at.
+type Passed = {
+  eras: Map<Bytes, List<{ key: Bytes, case: Bool }>>,
+  tests: Map<Bytes, Bool>,
+  cache: Cache,
+}
 
 /// What a prune keeps live: each module record a kept era names, each one decoded, and the hash of
 /// each definition a test reached in the era it last passed in.
@@ -582,12 +550,13 @@ type Live = {
   cache: Cache,
 }
 
-/// Drops every era no pass record names, every module record no kept era names, and every interface
-/// and body no test reached in the era it last passed in: a bisection reads only what a test last
-/// passed against. Each era is walked once, from all the tests that last passed in it.
+/// Drops every era no pass record names, every module record no kept era names, and every text
+/// that is neither of a test as it last passed nor of a definition it reached then: a failure reads
+/// only what its test last passed against. Each era is walked once, from all the tests that last
+/// passed in it.
 pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r], abort.raise} = {
   let passed = keys(cache.store, t_pass_records()).fold(
-    { eras: Map::new(), cache: cache },
+    { eras: Map::new(), tests: Map::new(), cache: cache },
     |acc: Passed, k: Bytes| {
       let got = read[r](
         acc.cache,
@@ -602,6 +571,7 @@ pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r
           let tests = match acc.eras.get(era) { Some(ts) -> ts, None -> [] };
           {
             eras: acc.eras.insert(era, tests.push({ key: n.value.of, case: n.value.case })),
+            tests: acc.tests.insert(n.value.test_hash, true),
             cache: got.cache,
           }
         },
@@ -648,16 +618,11 @@ pub fn prune<[r]>(cache: Cache) -> { pruned: Pruned, cache: Cache } / {fs.read[r
   };
   let gone_eras = swept(live.cache, t_eras(), |k: Bytes| passed.eras.contains(k));
   let gone_modules = swept(gone_eras.cache, t_modules(), |k: Bytes| live.modules.contains(k));
-  let defs = swept(gone_modules.cache, t_defs(), |k: Bytes| live.hashes.contains(k));
-  let bodies = swept(defs.cache, t_bodies(), |k: Bytes| live.hashes.contains(k));
+  let texts = swept(gone_modules.cache, t_texts(), |k: Bytes|
+    live.hashes.contains(k) || passed.tests.contains(k));
   {
-    pruned: {
-      defs: defs.gone,
-      bodies: bodies.gone,
-      eras: gone_eras.gone,
-      modules: gone_modules.gone,
-    },
-    cache: bodies.cache,
+    pruned: { texts: texts.gone, eras: gone_eras.gone, modules: gone_modules.gone },
+    cache: texts.cache,
   }
 }
 
@@ -679,13 +644,6 @@ pub fn compact_cache<[r]>(cache: Cache) -> Cache / {fs.read[r], fs.write[r], abo
 // --- Tests ------------------------------------------------------------------
 
 fn built() -> Stamps = { runtime: "runtime", code: "code" }
-
-/// A body alone in its component, which says nothing of what its calls on values call.
-fn solo(payload: Bytes) -> Body =
-  { encoding: 7, bytes: byte_of_int(0) ++ b"\x00\x00\x00\x00" ++ payload }
-
-fn key_of_body(b: Body) -> Bytes / {abort.raise} =
-  match body_key(b.bytes) { Some(k) -> k, None -> b"" }
 
 /// A module record holding one definition of each of `names`, each under the hash its name keys,
 /// and the test `m.t`, which references the first.
@@ -711,12 +669,11 @@ fn record_in(modules: List<Bytes>) -> PassRecord =
   { test_hash: name_key("t"), era: era_digest(modules), of: b"m.t", case: false }
 
 test "every table round-trips through a flush and a reopen" {
-  let b = solo(b"body bytes");
   let m = holding(["m.f"]);
   let run = on_twin(mem_empty(), || {
     let c1 = open_cache[mem]("cache", built());
-    let c2 = put_def[mem](c1, name_key("m.f"), b"F");
-    let c3 = put_era(put_module_record(put_body(c2, key_of_body(b), b), m), [record_digest(m)]);
+    let c2 = put_text(c1, name_key("m.f"), b"fn f() -> Int = 1\n");
+    let c3 = put_era(put_module_record(c2, m), [record_digest(m)]);
     let c4 = put_pass_record(
       observe_definition(put_passed(c3, name_key("result"), b""), name_key("m.f")),
       b"m.t",
@@ -728,11 +685,9 @@ test "every table round-trips through a flush and a reopen" {
     });
     let c = flush_cache[mem](c5);
     let r = open_cache[mem]("cache", built());
-    assert_eq(def_of[mem](r, name_key("m.f")).value, Some(b"F"));
-    assert_eq(def_of[mem](r, name_key("m.g")).value, None);
-    assert(holds_def(r, name_key("m.f")) && !holds_def(r, name_key("m.g")));
-    assert_eq(body[mem](r, key_of_body(b)).value, Some(b));
-    assert(holds_body(r, key_of_body(b)));
+    assert_eq(text[mem](r, name_key("m.f")).value, Some(b"fn f() -> Int = 1\n"));
+    assert_eq(text[mem](r, name_key("m.g")).value, None);
+    assert(holds_text(r, name_key("m.f")) && !holds_text(r, name_key("m.g")));
     assert_eq(passed[mem](r, name_key("result")).value, Some(true));
     assert_eq(passed[mem](r, name_key("other")).value, Some(false));
     assert(knows_definition(r, name_key("m.f")) && !knows_definition(r, name_key("m.g")));
@@ -745,7 +700,7 @@ test "every table round-trips through a flush and a reopen" {
     assert(holds_module_record(r, record_digest(m)));
     assert_eq(evidence[mem](r, name_key("claim")).value, Some(b"evidence"));
     assert_eq(review[mem](r, b"m.f").value, Some({ def: name_key("m.f"), specs: [name_key("s")] }));
-    assert_eq(counts(r).defs, 1);
+    assert_eq(counts(r).texts, 1);
     warnings(c)
   });
   assert_eq(run.value, [])
@@ -768,31 +723,6 @@ test "an era or a module record not under its own digest is not filed or not rea
   assert_eq(run.value.warned, 1)
 }
 
-test "a body is filed only under the hash its envelope names" {
-  let b = solo(b"x");
-  let member = {
-    encoding: 7,
-    bytes: Bytes::concat_all([byte_of_int(1), b"\x02\x00\x00\x00", b"\x00\x00\x00\x00", b"group"]),
-  };
-  assert_eq(body_key(member.bytes), Some(blake3(blake3(b"group") ++ b"\x02\x00\x00\x00")));
-  assert_eq(body_key(b"\x07"), None);
-  let run = on_twin(mem_empty(), || {
-    let c = put_body(
-      put_body(open_cache[mem]("cache", built()), name_key("wrong"), b),
-      key_of_body(member),
-      member,
-    );
-    let r = open_cache[mem]("cache", built());
-    let flushed = flush_cache[mem](c);
-    let again = open_cache[mem]("cache", built());
-    [
-      body[mem](again, name_key("wrong")).value == None,
-      body[mem](again, key_of_body(member)).value == Some(member),
-    ]
-  });
-  assert_eq(run.value, [true, true])
-}
-
 test "prune keeps what each test reached in the era it last passed in, and drops the rest" {
   let live = holding(["m.passed", "m.stale"]);
   let dead = holding(["m.orphan"]);
@@ -806,59 +736,48 @@ test "prune keeps what each test reached in the era it last passed in, and drops
       b"m.t",
       record_in([record_digest(live)]),
     );
-    let c2 = ["m.passed", "m.stale", "m.orphan"].fold(c1, |cache: Cache, n: String|
-      put_def[mem](cache, name_key(n), b"v"));
-    let c3 = put_body(c2, key_of_body(solo(b"orphan")), solo(b"orphan"));
-    let p = prune[mem](flush_cache[mem](c3));
+    let c2 = ["m.passed", "m.stale", "m.orphan", "t"].fold(c1, |cache: Cache, n: String|
+      put_text(cache, name_key(n), b"v"));
+    let p = prune[mem](flush_cache[mem](c2));
     let kept = flush_cache[mem](p.cache);
     let r = open_cache[mem]("cache", built());
     {
       pruned: p.pruned,
-      defs: ["m.passed", "m.stale", "m.orphan"].map(|n: String| holds_def(r, name_key(n))),
+      texts: ["m.passed", "m.stale", "m.orphan", "t"].map(|n: String| holds_text(r, name_key(n))),
       modules: [live, dead].map(|m: Bytes| holds_module_record(r, record_digest(m))),
     }
   });
   // `m.stale` is in an era a test last passed in, and no test of that era reached it.
-  assert_eq(run.value.pruned, { defs: 2, bodies: 1, eras: 1, modules: 1 });
-  assert_eq(run.value.defs, [true, false, false]);
+  assert_eq(run.value.pruned, { texts: 2, eras: 1, modules: 1 });
+  // The test's own text stays with its pass record.
+  assert_eq(run.value.texts, [true, false, false, true]);
   assert_eq(run.value.modules, [true, false])
 }
 
 test "the schema is a function of the stored shapes alone" {
   assert_eq(schema(), schema());
-  assert_eq(schema().len(), 8 * 32)
+  assert_eq(schema().len(), 7 * 32)
 }
 
 test "two runs filing different entries both keep theirs" {
   let run = on_twin(mem_empty(), || {
-    let a = put_def[mem](open_cache[mem]("cache", built()), name_key("m.a"), b"A");
-    let b = put_def[mem](open_cache[mem]("cache", built()), name_key("m.b"), b"B");
+    let a = put_text(open_cache[mem]("cache", built()), name_key("m.a"), b"A");
+    let b = put_text(open_cache[mem]("cache", built()), name_key("m.b"), b"B");
     let a1 = flush_cache[mem](a);
     let b1 = flush_cache[mem](b);
     let r = open_cache[mem]("cache", built());
-    [def_of[mem](r, name_key("m.a")).value, def_of[mem](r, name_key("m.b")).value]
+    [text[mem](r, name_key("m.a")).value, text[mem](r, name_key("m.b")).value]
   });
   assert_eq(run.value, [Some(b"A"), Some(b"B")])
 }
 
-test "filing what is already filed writes nothing, and a second body for one hash is refused" {
-  let b = solo(b"body");
+test "a text filed under a hash already holding one writes nothing, and the first is kept" {
   let run = on_twin(mem_empty(), || {
-    let c0 = put_body(
-      put_def(open_cache[mem]("cache", built()), name_key("m.f"), b"F"),
-      key_of_body(b),
-      b,
-    );
-    let c1 = flush_cache[mem](c0);
-    let again = put_body(
-      put_def(open_cache[mem]("cache", built()), name_key("m.f"), b"F"),
-      key_of_body(b),
-      b,
-    );
-    let other = put_body(again, key_of_body(b), { encoding: 8, bytes: b.bytes });
-    { pending: pending(other.store), warned: warnings(other).len() }
+    let _c1 = flush_cache[mem](put_text(open_cache[mem]("cache", built()), name_key("m.f"), b"F"));
+    let again = put_text(open_cache[mem]("cache", built()), name_key("m.f"), b"F // a comment");
+    { pending: pending(again.store), kept: text[mem](again, name_key("m.f")).value }
   });
-  assert_eq(run.value, { pending: 0, warned: 1 })
+  assert_eq(run.value, { pending: 0, kept: Some(b"F") })
 }
 
 test "an upstream's passes and evidence answer here, and what this run learns is published there" {
