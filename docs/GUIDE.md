@@ -2434,13 +2434,15 @@ The report is printed as the run goes:
 
 1. what was selected and how it will run: the groups and workers, isolation, the host permissions,
    and what `--explain` says about selection;
-2. each group's results as that group finishes, in the order the groups ran, so a long run shows
-   progress and its first failure early;
+2. each group's results as that group finishes, in the order the groups ran, with the message and
+   place of each test that did not pass under its line. A long run shows progress and its first
+   failure early, and a run that ends early still shows every result it finished;
 3. the run's own figures (handshakes, the backend, simulation, and with `--explain` where the time
    went), the summary, and each failure's diagnosis.
 
-`--json` prints one object when the run ends. `--workspace` prints each package's heading before
-it runs.
+Under `--json`, items 1 and 2 go to standard error as the run goes, and one object goes to standard
+output when the run ends, in place of item 3. `--workspace` prints each package's heading before it
+runs.
 
 `--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). It
 is not a verdict: a test over it is *abandoned* (`W0612`), reported separately from failures,
@@ -2858,7 +2860,11 @@ proof may use what it promises but never unfolds its body; that package proves i
 fn` is known by its body too: a proof anywhere may unfold it, so its body and everything it reaches
 is part of what dependents are checked and proved against.
 
-**`ply prove` output.** It reports the definitions that carry no claim, then each claim's outcome.
+**`ply prove` output.** It first says how many definitions carry a claim. It then prints each
+claim's outcome as soon as the claim is decided: those the cache answered first, then the rest as
+they are proved. It ends with the definitions that no claim that holds covers, and the tally.
+Under `--json`, the lines it prints as it runs go to stderr, and the object takes the place of the
+rest (§16).
 
 - An `unproved` claim says what stands between it and a proof. Under `--json` this is `gap` (a
   sentence) and `gap_kind`: `open` (with each place the prover stopped as `stuck`);
@@ -3498,7 +3504,8 @@ color if `FORCE_COLOR` is set; otherwise none if `NO_COLOR` is set; otherwise co
 `CLICOLOR_FORCE` is set; otherwise color only on a terminal whose `TERM` is not `dumb`.
 
 **JSON.** Every command takes `--json`, and then prints exactly one compact JSON object on stdout,
-with sorted keys.
+with sorted keys. What a command prints while it runs, such as each result of `ply test` and `ply
+prove`, then goes to stderr, so a run that crashes or is stopped still shows what it finished.
 
 **Environment.** The command reads `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM`, `COLORTERM`,
 `PLY_CACHE_UPSTREAM` (§1), `PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the `PLY_C_*` variables
