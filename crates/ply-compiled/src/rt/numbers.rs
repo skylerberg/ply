@@ -3,7 +3,8 @@
 
 use super::*;
 
-/// `a % b` over two `Float`s' bits, which C reaches only through `fmod`.
+/// `a % b` over two `Float`s' bits. Compiled code calls `fmod`; a builder the release built still
+/// binds this.
 pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
     ply_core::float::bits(a % b) as i64

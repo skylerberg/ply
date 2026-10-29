@@ -55,6 +55,8 @@ macro_rules! float_functions {
 }
 
 float_functions! {
+    // Compiled code computes `floor`, `ceil` and `sqrt` in C; a builder the release built still
+    // binds these three.
     "?float_floor" => rt_float_floor = f64::floor(x);
     "?float_ceil" => rt_float_ceil = f64::ceil(x);
     "?float_sqrt" => rt_float_sqrt = f64::sqrt(x);
