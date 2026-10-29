@@ -3564,9 +3564,9 @@ their paths as written. `ply doc` works outside any package for builtins and the
 needs a C toolchain and takes a few seconds. Later runs reuse the compiled code.
 
 **Reusing earlier answers.** `ply check`, `ply test`, `ply run` and `ply defs` remember their last
-answer for the same command line. When nothing they read has changed since, they return it without
-loading the program; when something changed but every module still checks the same, they also
-reuse it.
+answer for the same command line. While nothing the run that made the answer read has changed,
+they return it without loading the program. Otherwise they load the program and check again only
+what reads something that changed.
 
 - `ply run --explain` says `reused` or `built` on stderr before the program starts, with timings
   (`front_end` in `--json`). A reused run still sets up permissions (`--allow`, `--exec`, `--fs`) and

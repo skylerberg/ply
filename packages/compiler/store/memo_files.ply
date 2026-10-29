@@ -1,19 +1,11 @@
-//! The memo store as segments in a directory (`segments`): what a run kept is one segment, named by
-//! the store's manifest when the run ends, so a later run sees all of it or none. A segment holds the
-//! records the run kept and the longer answers as frames, and tables of rows: what the run says of
-//! each key it touched, the keys it left marked, what it saw at each place of the world, who read
-//! each place or asked each record, where each longer answer lies, and the queries its records
-//! answer under with when each was last seen running. The newest row of a key says what it answers,
-//! how high it stands and whether it is marked; the newest that brought a record says where it lies,
-//! always in its own segment.
+//! The memo store as segments in a directory (`segments`). What a run stores is one segment, which
+//! the store's manifest names when the run ends, so a later run sees all of it or none. A segment
+//! holds the run's records and long results as frames, and tables of rows: one per key the run
+//! stored, where each long result lies, and the queries its records belong to, with when each was
+//! last used. A key's newest row gives its record's result digest and where the record lies.
 //!
-//! A row vouches for a record to the stamps it names: what names the queries a run answers under, the
-//! pack below the store and the shipped files the run reads. A record is taken without its reads
-//! being asked again only where the run's own stamp vouches for it: walking the key's rows newest
-//! first, a row its stamp vouches in says whether the record stands; a row of other stamps that
-//! marks the key, or brought it a new record, says it does not; a row of other stamps that only
-//! checked it says nothing. So a `ply` of other queries running over the store writes only that it
-//! checked what it took, and two taking turns each keep what they checked.
+//! The run that asks for a record checks it by its reads (`memo`), so a store gives the same
+//! results whatever `ply` wrote it, and a run that only reused records writes nothing.
 //!
 //! A store keeps itself small. A run that names a segment writes the newest segments again as one
 //! while each is at most twice what follows it, so a store is a handful of segments and a byte is
@@ -22,42 +14,32 @@
 //! lately answered under, while they hold no more than the run's own hold: a store two `ply`s
 //! take turns on holds both, and what only the dropped records named goes too.
 
-import std.bin
 import std.fs
 import std.fs (fs)
 import std.bytes (u32_le, u64_le)
 import std.list
 import compiler.store.memo
-import compiler.store.memo (Record, Seen, memo, memo_keep, answer, started, at_height, digest_of,
-                            height_named, inline_named, kept_inline, output_named, record_bytes,
-                            record_from, seen_bin, settles)
+import compiler.store.memo (Record, Look, memo, memo_keep, answer, started, digest_of, inline_named,
+                            kept_inline, output_named, record_bytes, record_from)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (Manifest, Segment, Table, Writing, Named)
 
 /// What names the shapes this store keeps: a `ply` that keeps others has a manifest of its own.
-fn shapes() -> Bytes = b"ply memo store: rows 2, records 5".blake3()
+fn shapes() -> Bytes = b"ply memo store: rows 3, records 6".blake3()
 
 /// The directories of a store laid out as a file a record, which no run of this layout reads.
 fn retired() -> List<String> = ["records", "outputs", "places", "links", "marked", "holds", "runs"]
 
 fn records_table() -> Int = 1
 
-fn marked_table() -> Int = 2
+fn answers_table() -> Int = 2
 
-fn places_table() -> Int = 3
+fn queries_table() -> Int = 3
 
-fn readers_table() -> Int = 4
-
-fn answers_table() -> Int = 5
-
-fn queries_table() -> Int = 6
-
-fn record_width() -> Int = 88
+fn record_width() -> Int = 80
 
 fn key_width() -> Int = 32
-
-fn reader_width() -> Int = 64
 
 /// A key, where a frame lies and how long its payload is.
 fn placed_width() -> Int = 44
@@ -65,54 +47,31 @@ fn placed_width() -> Int = 44
 /// A query's name in the store and when it was last seen.
 fn query_width() -> Int = 40
 
-/// What a segment says of a key: whether its record is marked; whether the segment brought the
-/// record, which then lies in it at `offset` and is `size` bytes; whether the row breaks with what
-/// older rows say, so that only the stamps it names take the record unchecked; the place of the
-/// record's query among the segment's queries; the key's height; the stamps that vouch for the
-/// record, a bit for each of the segment's; and the hash of the record's answer.
-type Row = {
-  marked: Bool,
-  brought: Bool,
-  breaks: Bool,
-  query: Int,
-  height: Int,
-  vouchers: Int,
-  offset: Int,
-  size: Int,
-  answer: Bytes,
-}
+/// A segment's row for a key: whether the segment holds the record, at `offset` and `size` bytes
+/// long; the position of the record's query among the segment's queries; and the hash of the
+/// record's result.
+type Row = { brought: Bool, query: Int, offset: Int, size: Int, answer: Bytes }
 
 /// What follows a key in the row that says `r` of it.
 fn row_rest(r: Row) -> Bytes / {abort.raise} =
   Bytes::concat_all([
-    byte_of_int(
-      (if r.marked { 1 } else { 0 }) + (if r.brought { 2 } else { 0 })
-        + (if r.breaks { 4 } else { 0 }),
-    ),
+    byte_of_int(if r.brought { 1 } else { 0 }),
     byte_of_int(0),
     byte_of_int(r.query & 255),
     byte_of_int(r.query >> 8 & 255),
-    u32_le(r.height),
-    u32_le(r.vouchers),
     u64_le(r.offset),
     u32_le(r.size),
     r.answer,
   ])
 
-fn row_from(b: Bytes) -> Row / {abort.raise} = {
-  let flags = b.at(32);
+fn row_from(b: Bytes) -> Row / {abort.raise} =
   {
-    marked: flags & 1 == 1,
-    brought: flags & 2 == 2,
-    breaks: flags & 4 == 4,
+    brought: b.at(32) & 1 == 1,
     query: b.at(34) + b.at(35) * 256,
-    height: segments::word_at(b, 36),
-    vouchers: segments::word_at(b, 40),
-    offset: segments::long_at(b, 44),
-    size: segments::word_at(b, 52),
-    answer: b.slice(56, 88),
+    offset: segments::long_at(b, 36),
+    size: segments::word_at(b, 44),
+    answer: b.slice(48, 80),
   }
-}
 
 /// The digest of the answer kept under `key`.
 fn answer_digest(key: Bytes) -> Bytes = b"=".concat(key)
@@ -122,53 +81,38 @@ type Found = { token: Bytes, offset: Int, size: Int }
 
 // --- What a run holds of the store ------------------------------------------
 
-/// What the segments say of a key: its newest row, the query that row names and when that query was
-/// last seen, and whether the run's stamp vouches for the record.
-type Known = { row: Row, query: Bytes, seen: Int, trusted: Bool }
+/// What the segments hold for a key: its newest row, that row's query and when the query was last
+/// used.
+type Known = { row: Row, query: Bytes, seen: Int }
 
-/// What a run says of a key it kept a record under, checked, marked or raised: the hash of the
-/// record's answer, its query and when that was last seen, the key's height, where the record lies
-/// in the run's segment where the run brought it, and whether the run vouches for it.
-type Mine = {
-  answer: Bytes,
-  query: Bytes,
-  seen: Int,
-  height: Int,
-  frame: Option<{ offset: Int, size: Int }>,
-  vouch: Bool,
-}
+/// A key the run stored a record under: the hash of the record's result, its query and when that
+/// was last used, and where the record lies in the run's segment.
+type Mine = { answer: Bytes, query: Bytes, seen: Int, frame: Option<{ offset: Int, size: Int }> }
 
-/// What a run saw at a place it looked at, and its digest.
-type Looked = { value: Option<Bytes>, digest: Bytes }
-
-/// What a run holds of a store: the stamp it runs under, the queries it answers under and when it
-/// began; what it saw at each place it looked at, by the place's id; the manifest it read; each
-/// table read so far, by its segment's token and its number; the segments a table of which did not
-/// read, after the first of which nothing kept is vouched for; what the segments say of each key
-/// asked; what this run says of each key it touched, and the marks on each as it leaves them, the
-/// store's own all one mark; how many marks it has made; the run's segment; each place as last
-/// seen, read when first asked, and those this run saw; the readers it noted, under what they read;
-/// where each longer answer it kept lies; the answers records hold inside them, and for each answer
-/// a row named, a key whose record may hold it; each record read; the longer answers read or kept,
-/// held while they come to no more than a bound, and how many bytes they are; those a segment names
-/// and does not hold; the answers kept for the rest of the run only; and the pack below the store,
-/// whether its records stand as they are, each record of it read, and those this run found standing.
+/// A run's view of a store:
+/// - `own`, `now`: the queries the run uses and when it began;
+/// - `looked`: what it found at each place it looked at, by the place's id;
+/// - `manifest`, `tables`, `lost`: the manifest it read, each table read so far by segment and
+///   number, and the segments with a table that did not read;
+/// - `known`, `mine`: the segments' newest row for each key asked, and each key the run stored;
+/// - `out`, `answers`: the run's own segment and where each long result it stored lies;
+/// - `inlined`, `named`, `read`: results held inside records, a key whose record may hold each
+///   result a row named, and each record frame read;
+/// - `held`, `holding`: long results read or stored, held up to a size bound, and their bytes;
+/// - `unread`: long results a segment names but cannot be read;
+/// - `transient`: results stored for this run only;
+/// - `pack`, `trusted`, `packed`: the pack below the store, whether its records can be reused
+///   unchecked, and each pack record read.
 type Open = {
-  stamp: Bytes,
   own: Map<Bytes, Bool>,
   now: Int,
-  looked: Map<Bytes, Looked>,
+  looked: Map<Bytes, Look>,
   manifest: Manifest,
   tables: Map<Bytes, Bytes>,
   lost: List<Bytes>,
   known: Map<Bytes, Option<Known>>,
   mine: Map<Bytes, Mine>,
-  marks: Map<Bytes, List<Bytes>>,
-  minted: Int,
   out: Writing,
-  places: Option<Map<Bytes, Seen>>,
-  saw: Map<Bytes, Seen>,
-  readers: Map<Bytes, List<Bytes>>,
   answers: Map<Bytes, Bytes>,
   inlined: Map<Bytes, Bytes>,
   named: Map<Bytes, Bytes>,
@@ -180,7 +124,6 @@ type Open = {
   pack: packs::Reading,
   trusted: Bool,
   packed: Map<Bytes, Option<Bytes>>,
-  checked: Map<Bytes, Bool>,
 }
 
 /// How many bytes of longer answers a run holds, so that one asked again is not read again.
@@ -191,12 +134,8 @@ fn holding(o: Open, name: Bytes, answer: Bytes) -> Open =
   if o.held.contains(name) || o.holding + answer.len() > held_bound() { o }
   else { { ..o, held: o.held.insert(name, answer), holding: o.holding + answer.len() } }
 
-/// The stamp a run writes under until it names one: every run that names none shares it.
-fn stamp_of(named: Bytes) -> Bytes = if named.len() == 32 { named } else { named.blake3() }
-
 fn opened(m: Manifest, now: Int) -> Open =
   {
-    stamp: stamp_of(b""),
     own: Map::new(),
     now: now,
     looked: Map::new(),
@@ -205,12 +144,7 @@ fn opened(m: Manifest, now: Int) -> Open =
     lost: [],
     known: Map::new(),
     mine: Map::new(),
-    marks: Map::new(),
-    minted: 0,
     out: segments::unwritten(),
-    places: None,
-    saw: Map::new(),
-    readers: Map::new(),
     answers: Map::new(),
     inlined: Map::new(),
     named: Map::new(),
@@ -222,7 +156,6 @@ fn opened(m: Manifest, now: Int) -> Open =
     pack: packs::none(),
     trusted: false,
     packed: Map::new(),
-    checked: Map::new(),
   }
 
 /// The rows of `table` in `seg`, read once a run: a table that does not read is no rows, and its
@@ -259,14 +192,8 @@ fn query_in(queries: Bytes, nth: Int) -> { query: Bytes, seen: Int } / {abort.ra
   else { { query: queries.slice(at, at + 32), seen: segments::long_at(queries, at + 32) } }
 }
 
-/// Whether `stamp` vouches for `row` of `seg`: a segment below the floor vouches for nothing.
-fn vouches(m: Manifest, seg: Segment, row: Row, stamp: Bytes) -> Bool =
-  !segments::below_floor(m, seg)
-    && range(0, seg.stamps.len()).fold(false, |any: Bool, i: Int|
-      any || (row.vouchers >> i & 1 == 1 && seg.stamps.at(i) == Some(stamp)))
-
-/// What the segments say of `key` under the run's stamp, found once a run: nothing where no
-/// segment holds a row of it.
+/// The newest row any segment holds for `key`, looked up once a run: none where no segment has
+/// one.
 fn known_of<[r]>(
   dir: String,
   o: Open,
@@ -276,29 +203,15 @@ fn known_of<[r]>(
     Some(k) -> { open: o, known: k },
     None -> {
       let found = iterate(
-        { i: o.manifest.segments.len() - 1, open: o, newest: None },
+        { i: o.manifest.segments.len() - 1, open: o },
         1000000,
-        |x: { i: Int, open: Open, newest: Option<{ row: Row, seg: Segment }> }|
-          if x.i < 0 { Stop({ open: x.open, newest: x.newest, trusted: false }) } else {
+        |x: { i: Int, open: Open }|
+          if x.i < 0 { Stop({ open: x.open, newest: None }) } else {
             let seg = x.open.manifest.segments.get(x.i);
             let t = table[r](dir, x.open, seg, records_table());
             match segments::row_of(t.rows, record_width(), key) {
-              None -> Continue({ i: x.i - 1, open: t.open, newest: x.newest }),
-              Some(b) -> {
-                let row = row_from(b);
-                let newest = match x.newest {
-                  Some(_) -> x.newest,
-                  None -> Some({ row: row, seg: seg }),
-                };
-                match settles({
-                    own: vouches(t.open.manifest, seg, row, t.open.stamp),
-                    stands: !row.marked,
-                    fresh: row.breaks,
-                  }) {
-                  Some(trusted) -> Stop({ open: t.open, newest: newest, trusted: trusted }),
-                  None -> Continue({ i: x.i - 1, open: t.open, newest: newest }),
-                }
-              },
+              None -> Continue({ i: x.i - 1, open: t.open }),
+              Some(b) -> Stop({ open: t.open, newest: Some({ row: row_from(b), seg: seg }) }),
             }
           },
       );
@@ -307,10 +220,7 @@ fn known_of<[r]>(
         Some(n) -> {
           let t = table[r](dir, found.open, n.seg, queries_table());
           let q = query_in(t.rows, n.row.query);
-          {
-            open: t.open,
-            known: Some({ row: n.row, query: q.query, seen: q.seen, trusted: found.trusted }),
-          }
+          { open: t.open, known: Some({ row: n.row, query: q.query, seen: q.seen }) }
         },
       };
       {
@@ -383,141 +293,10 @@ fn answer_row<[r]>(
       }
     })
 
-/// Each place a segment's one frame of places holds, laid over `acc`.
-fn places_in(acc: Map<Bytes, Seen>, frame: Bytes) -> Map<Bytes, Seen> / {abort.raise} =
-  iterate({ at: 0, acc: acc }, 100000000, |x: { at: Int, acc: Map<Bytes, Seen> }|
-    if x.at + 36 > frame.len() { Stop(x.acc) } else {
-      let size = segments::word_at(frame, x.at + 32);
-      let next = x.at + 36 + size;
-      if next > frame.len() { Stop(x.acc) } else {
-        match bin::decode(frame.slice(x.at + 36, next), seen_bin()) {
-          Ok(s) -> Continue({ at: next, acc: x.acc.insert(frame.slice(x.at, x.at + 32), s) }),
-          Err(_) -> Continue({ at: next, acc: x.acc }),
-        }
-      }
-    })
-
-fn places_frame(saw: Map<Bytes, Seen>) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    saw.fold([], |acc: List<Bytes>, id: Bytes, s: Seen| {
-      let body = bin::encode(s, seen_bin());
-      acc.push(id).push(u32_le(body.len())).push(body)
-    }),
-  )
-
-/// The places `seg` saw, laid over `acc`: `rows` is its table of them, one row naming one frame.
-fn places_over<[r]>(
-  dir: String,
-  seg: Segment,
-  rows: Bytes,
-  acc: Map<Bytes, Seen>,
-) -> Map<Bytes, Seen> / {fs.read[r], abort.raise} =
-  if rows.len() < placed_width() { acc } else {
-    match segments::payload[r](
-        dir,
-        seg.token,
-        segments::long_at(rows, 32),
-        segments::word_at(rows, 40),
-      ) {
-      Some(frame) -> places_in(acc, frame),
-      None -> acc,
-    }
-  }
-
-/// Each place the store last saw, the newest segment's word last: read once a run.
-fn places_of<[r]>(
-  dir: String,
-  o: Open,
-) -> { open: Open, places: Map<Bytes, Seen> } / {fs.read[r], abort.raise} =
-  match o.places {
-    Some(held) -> { open: o, places: held },
-    None -> {
-      let read = o.manifest.segments.fold(
-        { open: o, places: Map::new() },
-        |acc: { open: Open, places: Map<Bytes, Seen> }, seg: Segment| {
-          let t = table[r](dir, acc.open, seg, places_table());
-          { open: t.open, places: places_over[r](dir, seg, t.rows, acc.places) }
-        },
-      );
-      let all = o.saw.fold(read.places, |acc: Map<Bytes, Seen>, id: Bytes, s: Seen|
-        acc.insert(id, s));
-      { open: { ..read.open, places: Some(all) }, places: all }
-    },
-  }
-
-/// The bytes of the keys `bytes` lists, each once.
-fn keys_in(bytes: Bytes) -> List<Bytes> =
-  range(0, bytes.len() / 32).fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int|
-    acc.insert(bytes.slice(i * 32, i * 32 + 32), true)).keys(
-  )
-
-/// The keys of the records the store notes as readers of `id`, and those this run noted.
-fn readers_of<[r]>(
-  dir: String,
-  o: Open,
-  id: Bytes,
-) -> { open: Open, keys: List<Bytes> } / {fs.read[r], abort.raise} = {
-  let read = o.manifest.segments.fold(
-    { open: o, keys: [] },
-    |acc: { open: Open, keys: List<Bytes> }, seg: Segment| {
-      let t = table[r](dir, acc.open, seg, readers_table());
-      {
-        open: t.open,
-        keys: segments::rows_of(t.rows, reader_width(), id).fold(
-          acc.keys,
-          |ks: List<Bytes>, row: Bytes| ks.push(row.slice(32, 64)),
-        ),
-      }
-    },
-  );
-  let noted = match o.readers.get(id) { Some(ks) -> ks, None -> [] };
-  {
-    open: read.open,
-    keys: keys_in(Bytes::concat_all(noted.fold(read.keys, |ks: List<Bytes>, k: Bytes| ks.push(k)))),
-  }
-}
-
-/// The keys a segment's table of marked keys names, and those this run changed the marks of.
-fn marked_in<[r]>(
-  dir: String,
-  o: Open,
-) -> { open: Open, keys: Map<Bytes, Bool> } / {fs.read[r], abort.raise} =
-  o.manifest.segments.fold(
-    {
-      open: o,
-      keys: o.marks.fold(Map::new(), |ks: Map<Bytes, Bool>, key: Bytes, _: List<Bytes>|
-        ks.insert(key, true)),
-    },
-    |acc: { open: Open, keys: Map<Bytes, Bool> }, seg: Segment| {
-      let t = table[r](dir, acc.open, seg, marked_table());
-      {
-        open: t.open,
-        keys: range(0, t.rows.len() / 32).fold(acc.keys, |ks: Map<Bytes, Bool>, i: Int|
-          ks.insert(t.rows.slice(i * 32, i * 32 + 32), true)),
-      }
-    },
-  )
-
-/// The record `bytes` hold at `height`, or nothing where they do not read as one: a key's height
-/// is its rows', which outgrows the one its record was kept with.
-fn record_of(bytes: Option<Bytes>, height: Int) -> Option<Record> / {abort.raise} =
-  match bytes {
-    None -> None,
-    Some(b) -> match record_from(b) {
-      Some(rec) -> Some({ ..rec, height: if height > rec.height { height } else { rec.height } }),
-      None -> None,
-    },
-  }
-
 // --- Ending a run ------------------------------------------------------------
 
 /// What a segment says of a key, the row's query by its name in the store.
 type Told = { row: Row, query: Bytes }
-
-/// Each reader a run noted, as a row: what was read, then the key of who read it.
-fn reader_set(noted: Map<Bytes, List<Bytes>>) -> Map<Bytes, Bool> =
-  noted.fold(Map::new(), |acc: Map<Bytes, Bool>, id: Bytes, keys: List<Bytes>|
-    keys.fold(acc, |m: Map<Bytes, Bool>, key: Bytes| m.insert(id.concat(key), true)))
 
 /// `seen` with `query` seen at `at`, where that is later than it holds.
 fn seen_at(seen: Map<Bytes, Int>, query: Bytes, at: Int) -> Map<Bytes, Int> =
@@ -526,15 +305,12 @@ fn seen_at(seen: Map<Bytes, Int>, query: Bytes, at: Int) -> Map<Bytes, Int> =
     None -> seen.insert(query, at),
   }
 
-/// The tables of a segment that says `told` of its keys: their rows, each naming its query by its
-/// place among `seen`, which holds every one of them with when it was last seen; the keys it marks;
-/// where the one frame of the places it saw lies and how long it is, where it saw any; the readers
-/// it noted; and where each longer answer it holds lies and how long it is.
+/// The tables of a segment with the rows `told`: one per key, naming its query by position among
+/// `seen`, which lists every query with when it was last used; and where each long result lies and
+/// how long it is.
 fn tables_of(
   told: Map<Bytes, Told>,
   seen: Map<Bytes, Int>,
-  places: Option<Bytes>,
-  readers: Map<Bytes, Bool>,
   answers: Map<Bytes, Bytes>,
 ) -> List<Table> / {abort.raise} = {
   let nth = seen.fold(Map::new(), |acc: Map<Bytes, Int>, query: Bytes, _: Int|
@@ -542,14 +318,6 @@ fn tables_of(
   [
     segments::table(records_table(), told, |_: Bytes, t: Told|
       Some(row_rest({ ..t.row, query: match nth.get(t.query) { Some(i) -> i, None -> 65535 } }))),
-    segments::table(marked_table(), told, |_: Bytes, t: Told|
-      if t.row.marked { Some(b"") } else { None }),
-    segments::table(
-      places_table(),
-      match places { Some(at) -> Map::new().insert(b"\x00".repeat(32), at), None -> Map::new() },
-      |_: Bytes, at: Bytes| Some(at),
-    ),
-    segments::table(readers_table(), readers, |_: Bytes, _: Bool| Some(b"")),
     segments::table(answers_table(), answers, |_: Bytes, at: Bytes| Some(at)),
     segments::table(queries_table(), seen, |_: Bytes, at: Int| Some(u64_le(at))),
   ]
@@ -558,13 +326,12 @@ fn tables_of(
 /// Where a frame lies in its own segment and how long its payload is, as a row holds the two.
 fn lying(offset: Int, size: Int) -> Bytes = u64_le(offset).concat(u32_le(size))
 
-/// Whether the run kept nothing a later run would read.
-fn kept_nothing(o: Open) -> Bool = o.mine.len() == 0 && o.saw.len() == 0 && o.readers.len() == 0
+/// Whether the run stored nothing a later run would read.
+fn kept_nothing(o: Open) -> Bool = o.mine.len() == 0
 
-/// What `o`, a run's hold of the store in `dir`, kept, written as the run's segment and named by
-/// the store's manifest: the places it saw as one frame, then its tables. A run that kept nothing
-/// writes nothing, and one the file system refused leaves the store as it found it. A run that
-/// named a segment leaves the store small and swept.
+/// What the run `o` stored, written as its segment in the store in `dir` and named in the manifest.
+/// A run that stored nothing writes nothing, and one the file system refused leaves the store as it
+/// was. A run that names a segment also merges and sweeps the store to keep it small.
 fn committed<[r]>(
   dir: String,
   run: String,
@@ -572,19 +339,12 @@ fn committed<[r]>(
   o: Open,
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} =
   if kept_nothing(o) { () } else {
-    let frame = places_frame(o.saw);
-    let places = if o.saw.len() == 0 { { writing: o.out, at: 0 } }
-    else { segments::framing(o.out, frame) };
     let told = o.mine.fold(Map::new(), |acc: Map<Bytes, Told>, key: Bytes, x: Mine| {
       let lies = match x.frame { Some(f) -> f, None -> { offset: 0, size: 0 } };
       acc.insert(key, {
         row: {
-          marked: match o.marks.get(key) { Some(ms) -> ms.len() > 0, None -> false },
           brought: x.frame != None,
-          breaks: x.frame != None,
           query: 0,
-          height: x.height,
-          vouchers: if x.vouch { 1 } else { 0 },
           offset: lies.offset,
           size: lies.size,
           answer: x.answer,
@@ -597,22 +357,9 @@ fn committed<[r]>(
         seen.insert(query, o.now)),
       |seen: Map<Bytes, Int>, _: Bytes, x: Mine| seen_at(seen, x.query, x.seen),
     );
-    let tables = tables_of(
-      told,
-      seen,
-      if o.saw.len() == 0 { None } else { Some(lying(places.at, frame.len())) },
-      reader_set(o.readers),
-      o.answers,
-    );
-    match segments::finished[r](dir, shapes(), token, places.writing, tables, [o.stamp]) {
+    match segments::finished[r](dir, shapes(), token, o.out, tables_of(told, seen, o.answers)) {
       None -> (),
-      Some(seg) -> match segments::committed[r](
-          dir,
-          shapes(),
-          o.manifest.generation,
-          seg,
-          without: o.lost,
-        ) {
+      Some(seg) -> match segments::committed[r](dir, shapes(), seg, without: o.lost) {
         Named(m) -> {
           let from = segments::merging(m);
           if from < m.segments.len() - 1 {
@@ -634,8 +381,8 @@ fn committed<[r]>(
 /// What a merge dropped: records, and the longer answers no record it kept names, with their bytes.
 pub type Compacted = { records: Int, answers: Int, bytes: Int }
 
-/// A segment being merged, with its rows of records, of queries, of longer answers and of readers.
-type Merging = { seg: Segment, records: Bytes, queries: Bytes, answers: Bytes, readers: Bytes }
+/// A segment being merged, with its rows of records, of queries and of longer answers.
+type Merging = { seg: Segment, records: Bytes, queries: Bytes, answers: Bytes }
 
 /// What a merge carries of a key: its row as the merged segment will hold it, its query, and where
 /// its record lies in a segment being merged, where one of them brought it.
@@ -715,73 +462,36 @@ fn read_all<[r]>(
           segments::rows[r](dir, seg, records_table()),
           segments::rows[r](dir, seg, queries_table()),
           segments::rows[r](dir, seg, answers_table()),
-          segments::rows[r](dir, seg, readers_table()),
         )) {
-        (Some(records), Some(queries), Some(answers), Some(readers)) ->
-          Some(
-            done.push({
-              seg: seg,
-              records: records,
-              queries: queries,
-              answers: answers,
-              readers: readers,
-            }),
-          ),
+        (Some(records), Some(queries), Some(answers)) ->
+          Some(done.push({ seg: seg, records: records, queries: queries, answers: answers })),
         _ -> None,
       },
     })
 
-/// What a merge of `all`, segments of `m` oldest first, carries of each key they hold a row of: its
-/// newest row, saying of the record what its rows said together, each stamp named by its place
-/// among `stamps`; its query; and where its record lies in the newest of them that brought it one.
-fn carried_of(
-  m: Manifest,
-  all: List<Merging>,
-  stamps: List<Bytes>,
-) -> Map<Bytes, Carried> / {abort.raise} =
-  all.fold(Map::new(), |acc: Map<Bytes, Carried>, x: Merging| {
-    // Where each of the segment's stamps lies among the merged segment's.
-    let moves = x.seg.stamps.map(|s: Bytes|
-      if segments::below_floor(m, x.seg) { 0 - 1 } else {
-        range(0, stamps.len()).fold(0 - 1, |found: Int, j: Int|
-          if stamps.at(j) == Some(s) { j } else { found })
-      });
+/// What a merge of `all`, segments oldest first, carries for each key they have a row for: its
+/// newest row, its query, and where its record lies in the newest segment that holds it.
+fn carried_of(all: List<Merging>) -> Map<Bytes, Carried> / {abort.raise} =
+  all.fold(Map::new(), |acc: Map<Bytes, Carried>, x: Merging|
     range(0, x.records.len() / record_width()).fold(acc, |into: Map<Bytes, Carried>, i: Int| {
       let b = x.records.slice(i * record_width(), (i + 1) * record_width());
       let key = b.slice(0, 32);
       let row = row_from(b);
-      let vouchers = range(0, moves.len()).fold(0, |v: Int, j: Int|
-        match moves.at(j) {
-          Some(to) -> if to >= 0 && row.vouchers >> j & 1 == 1 { v | 1 << to } else { v },
-          None -> v,
-        });
       let here = if row.brought { Some({ token: x.seg.token, offset: row.offset, size: row.size }) }
       else { None };
       let query = query_in(x.queries, row.query).query;
-      into.insert(key, match into.get(key) {
-        None -> { row: { ..row, vouchers: vouchers }, query: query, from: here },
-        Some(c) -> {
-          // A row that marks, or brought a record, breaks with the older ones; so does one
-          // that checked a marked record. One that checked a record that stands adds its
-          // stamps to those that vouch for it.
-          let breaks = row.marked || row.breaks || c.row.marked;
-          {
-            row: {
-              ..row,
-              breaks: breaks || c.row.breaks,
-              vouchers: if breaks { vouchers } else { c.row.vouchers | vouchers },
-              height: if c.row.height > row.height { c.row.height } else { row.height },
-            },
-            query: query,
-            from: match here {
-              Some(_) -> here,
-              None -> if c.row.answer == row.answer { c.from } else { None },
-            },
-          }
+      into.insert(key, {
+        row: row,
+        query: query,
+        from: match here {
+          Some(_) -> here,
+          None -> match into.get(key) {
+            Some(c) -> if c.row.answer == row.answer { c.from } else { None },
+            None -> None,
+          },
         },
       })
-    })
-  })
+    }))
 
 /// The queries whose records a rewrite of a whole store keeps, as `keeping` says: `carried` is what
 /// the store holds of each key, `all` its segments and `seen` when each query was last answered
@@ -833,13 +543,11 @@ fn living(
   }
 
 /// The segments of `m` from the one at `from` on written again as one, which the manifest then
-/// names in their place: of each key its newest row, saying of the record what its rows said
-/// together, so each stamp takes it or checks it as before; the records and longer answers those
-/// rows name, where the merged segments hold them; the places and readers they noted. Where that is
-/// every segment, a record goes with every row of it where `keeping` does not keep its query; with
-/// it go the answers only such records named, and each reader that is no record any more. What it
-/// dropped: nothing where a table of a segment does not read, which the next run to name a segment
-/// finds, or where a run named a segment while it worked.
+/// names in their place: each key's newest row, and the records and long results those rows name,
+/// where the merged segments hold them. When that is every segment, a record is dropped where
+/// `keeping` does not keep its query, along with the results only such records named. Returns what
+/// it dropped, or none where a segment's table does not read, which the next run to name a segment
+/// finds, or where another run named a segment meanwhile.
 fn merged<[r]>(
   dir: String,
   m: Manifest,
@@ -852,18 +560,12 @@ fn merged<[r]>(
   match read_all[r](dir, merging) {
     None -> None,
     Some(all) -> {
-      // The newest segment's stamps first: past thirty-two, the oldest vouch no more.
-      let stamps = merging.reverse().fold([], |acc: List<Bytes>, seg: Segment|
-        if segments::below_floor(m, seg) { acc } else {
-          seg.stamps.fold(acc, |a: List<Bytes>, s: Bytes|
-            if a.contains(s) || a.len() >= 32 { a } else { a.push(s) })
-        });
       let seen = all.fold(Map::new(), |acc: Map<Bytes, Int>, x: Merging|
         range(0, x.queries.len() / query_width()).fold(acc, |into: Map<Bytes, Int>, i: Int| {
           let q = query_in(x.queries, i);
           seen_at(into, q.query, q.seen)
         }));
-      let carried = carried_of(m, all, stamps);
+      let carried = carried_of(all);
       let live = living(keeping, whole, all, carried, seen);
       let kept = carried.fold(
         { keys: Map::new(), dropped: 0 },
@@ -876,10 +578,10 @@ fn merged<[r]>(
       let wanted = kept.keys.fold(Map::new(), |acc: Map<Bytes, Bool>, _: Bytes, c: Carried|
         acc.insert(c.row.answer, true));
       // Each frame to carry, by the segment it lies in and where, so that they are read in order.
-      let places = range(0, merging.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
+      let nth = range(0, merging.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
         acc.insert(merging.get(i).token, i));
       let order = |f: Found|
-        match places.get(f.token) { Some(i) -> i * 1099511627776 + f.offset, None -> 0 - 1 };
+        match nth.get(f.token) { Some(i) -> i * 1099511627776 + f.offset, None -> 0 - 1 };
       let records = kept.keys.fold(Map::new(), |acc: Map<Int, Frame>, key: Bytes, c: Carried|
         match c.from {
           Some(f) -> acc.insert(order(f), { at: f, name: key, answer: false }),
@@ -973,28 +675,8 @@ fn merged<[r]>(
           query: c.query,
         })
       });
-      let saw = merging.fold(Map::new(), |acc: Map<Bytes, Seen>, seg: Segment|
-        match segments::rows[r](dir, seg, places_table()) {
-          Some(rows) -> places_over[r](dir, seg, rows, acc),
-          None -> acc,
-        });
-      let frame = places_frame(saw);
-      let places_at = if saw.len() == 0 { { writing: copied.out, at: 0 } }
-      else { segments::framing(copied.out, frame) };
-      let readers = all.fold(Map::new(), |acc: Map<Bytes, Bool>, x: Merging|
-        range(0, x.readers.len() / reader_width()).fold(acc, |into: Map<Bytes, Bool>, i: Int| {
-          let row = x.readers.slice(i * reader_width(), (i + 1) * reader_width());
-          if whole && !kept.keys.contains(row.slice(32, 64)) { into }
-          else { into.insert(row, true) }
-        }));
-      let tables = tables_of(
-        told,
-        seen_kept,
-        if saw.len() == 0 { None } else { Some(lying(places_at.at, frame.len())) },
-        readers,
-        copied.answers,
-      );
-      match segments::finished[r](dir, shapes(), token, places_at.writing, tables, stamps) {
+      let tables = tables_of(told, seen_kept, copied.answers);
+      match segments::finished[r](dir, shapes(), token, copied.out, tables) {
         None -> None,
         Some(seg) -> match segments::swapped[r](dir, shapes(), m, from, seg) {
           Named(_) ->
@@ -1011,24 +693,20 @@ fn merged<[r]>(
 
 // --- A run over the store -----------------------------------------------------
 
-/// `work` run over the memo store in `dir`, with `look` answering what the world holds now: what it
-/// keeps is named by the store when the run ends. Where `dir` holds no record under a key, the pack
-/// below it is asked, through `read`, which answers what a frame of the pack's file holds. `world`
-/// lists the shipped files the run reads: the pack's records stand as they are where they were made
-/// under the run's stamp over those very files, and are held to their reads otherwise; none is
-/// copied into `dir`. The stamp the run names the pack and those files too, so a record kept over
-/// another pack or other files is checked before it is taken (`packs`). `covers` says which noted
-/// places the run's world looks at: the rest are not brought to what it holds, so a run that sees
-/// less of the world spoils nothing of what a run that sees more noted. `commands` are the hashes
-/// the answers of the running `ply`'s own commands are kept under ([`memo::recorded`]), which a run
-/// that writes the store again keeps as it keeps the records of its own queries.
+/// `work` run over the memo store in `dir`, with `look` reading the world. What the run stores is
+/// named in the store when the run ends. Where `dir` holds no record under a key, the pack below it
+/// is asked through `read`, which returns a frame of the pack's file. `world` lists the shipped
+/// files the run reads: the pack's records are reused unchecked where the pack was made by the run's
+/// queries over exactly those files, and are checked by their reads otherwise; none is copied into
+/// `dir` unless the run stores it again. `commands` are the hashes the running `ply` stores its own
+/// commands' results under ([`memo::recorded`]); a run that rewrites the store keeps those records
+/// as it keeps its own queries'.
 pub fn kept<a, [r] | e>(
   dir: String,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_keep.read, memo_keep.write, abort.raise},
-  covers: (Bytes, Bytes) -> Bool = |_: Bytes, _: Bytes| true,
   commands: List<Bytes> = [],
 ) -> a / {fs.read[r], fs.write[r], abort.raise | e} = {
   let run = segments::entered[r](dir);
@@ -1059,94 +737,46 @@ pub fn kept<a, [r] | e>(
         { open: noted(now, found.bytes), bytes: found.bytes }
       },
     };
+  // The bytes of the pack's record under `key` where the pack can be reused unchecked, which win
+  // over the store's: none where it cannot, or where the run stored a record under the key itself.
+  let standing_at = |o: Open, key: Bytes|
+    if !o.trusted || o.mine.contains(key) { { open: o, bytes: None } } else { packed_at(o, key) };
   // The longer answer the pack below holds under `digest`, beside `o` with what was read to find it.
   let packed_answer = |o: Open, digest: Bytes| {
     let found = packs::answer(o.pack, read, digest);
     { open: { ..o, pack: found.reading }, answer: found.bytes }
   };
-  let stored = |o: Open, key: Bytes| known_of[r](dir, o, key);
-  // The answer and the height of the record kept under `key`: the run's word, else the store's.
+  // The result digest of the record under `key`: the run's own, else the store's.
   let held = |o: Open, key: Bytes|
     match o.mine.get(key) {
-      Some(x) -> { open: o, held: Some({ answer: x.answer, height: x.height }) },
+      Some(x) -> { open: o, held: Some(x.answer) },
       None -> {
-        let k = stored(o, key);
-        {
-          open: k.open,
-          held: match k.known {
-            Some(kn) -> Some({ answer: kn.row.answer, height: kn.row.height }),
-            None -> None,
-          },
-        }
+        let k = known_of[r](dir, o, key);
+        { open: k.open, held: match k.known { Some(kn) -> Some(kn.row.answer), None -> None } }
       },
     };
-  // The marks on `key` as the run leaves them: those it changed, else the store's, all one mark.
-  let marks = |o: Open, key: Bytes|
-    match o.marks.get(key) {
-      Some(ms) -> { open: o, marks: ms },
-      None -> {
-        let k = stored(o, key);
-        {
-          open: k.open,
-          marks: match k.known {
-            Some(kn) -> if kn.row.marked { [b"kept"] } else { [] },
-            None -> [],
-          },
-        }
-      },
-    };
-  let marked_as = |o: Open, key: Bytes, ms: List<Bytes>| { ..o, marks: o.marks.insert(key, ms) };
-  // What the run says of `key` from here on: `change` of what it said, or of what the store says.
-  // Nothing where no record is kept under the key.
-  let saying = |o0: Open, key: Bytes, change: (Mine) -> Mine| {
-    let m = marks(o0, key);
-    let o = marked_as(m.open, key, m.marks);
-    match o.mine.get(key) {
-      Some(x) -> { ..o, mine: o.mine.insert(key, change(x)) },
-      None -> {
-        let k = stored(o, key);
-        match k.known {
-          Some(kn) ->
-            {
-              ..k.open,
-              mine: k.open.mine.insert(
-                key,
-                change({
-                  answer: kn.row.answer,
-                  query: kn.query,
-                  seen: kn.seen,
-                  height: kn.row.height,
-                  frame: None,
-                  vouch: false,
-                }),
-              ),
-            },
-          None -> k.open,
-        }
-      },
-    }
-  };
   let looked = |o: Open, kind: Bytes, place: Bytes| {
     let id = memo::place_id(kind, place);
     match o.looked.get(id) {
       Some(x) -> { open: o, looked: x },
       None -> {
-        let value = look(kind, place);
-        let x = { value: value, digest: digest_of(value) };
+        let value = if kind == memo::pack_kind() { memo::pack_place(o.pack.index, world) }
+        else { look(kind, place) };
+        let x = { kind: kind, at: place, value: value, digest: digest_of(value) };
         { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
       },
     }
   };
-  // The bytes of the record kept under `key`, read once a run.
+  // The bytes of the store's record under `key`, read once a run.
   let own = |o0: Open, key: Bytes| {
     let h0 = held(o0, key);
     match h0.held {
       None -> { open: h0.open, bytes: None },
-      Some(h) -> {
+      Some(answer) -> {
         let o = h0.open;
         let lies = match match o.mine.get(key) { Some(x) -> x.frame, None -> None } {
           Some(f) -> { open: o, at: Some({ token: token, offset: f.offset, size: f.size }) },
-          None -> frame_row[r](dir, o, key, h.answer),
+          None -> frame_row[r](dir, o, key, answer),
         };
         match lies.at {
           None -> { open: lies.open, bytes: None },
@@ -1159,7 +789,8 @@ pub fn kept<a, [r] | e>(
                 let now = noted(lies.open, framed);
                 match framed {
                   Some(b) -> { open: { ..now, read: now.read.insert(name, b) }, bytes: Some(b) },
-                  None -> { open: now, bytes: None },
+                  // A record that does not read is stored again with its result, which may not read either.
+                  None -> { open: { ..now, unread: now.unread.insert(answer, true) }, bytes: None },
                 }
               },
             }
@@ -1186,14 +817,9 @@ pub fn kept<a, [r] | e>(
       Some(name) -> {
         // A row is a key and what follows it: a key of another length would misplace every row.
         if key.len() != key_width() { panic("a memo key is thirty-two bytes") };
-        // A fresh record answers for what the store only left unchecked: its marks stay.
-        let m = marks(o0, key);
-        let h = held(marked_as(m.open, key, m.marks), key);
-        let was = match h.held { Some(x) -> x.height, None -> 0 };
         let bytes = record_bytes(rec, inline);
-        let o = h.open;
-        let f = segments::framing(o.out, bytes);
-        let o1 = { ..o, out: f.writing };
+        let f = segments::framing(o0.out, bytes);
+        let o1 = { ..o0, out: f.writing };
         let o2 = match inline {
           Some(a) -> { ..o1, inlined: o1.inlined.insert(rec.output, a) },
           None -> o1,
@@ -1224,9 +850,7 @@ pub fn kept<a, [r] | e>(
             answer: name,
             query: rec.query.blake3(),
             seen: o3.now,
-            height: if was > rec.height { was } else { rec.height },
             frame: Some({ offset: f.at, size: bytes.len() }),
-            vouch: true,
           }),
         }
       },
@@ -1236,54 +860,54 @@ pub fn kept<a, [r] | e>(
   } with {
     var st = found,
     memo_keep.head(key) -> {
-      let h = held(st, key);
-      st = h.open;
-      match h.held {
-        Some(x) -> {
-          let digest = answer_digest(x.answer);
-          st = { ..st, named: st.named.insert(digest, key) };
-          Some(digest)
-        },
+      let p = standing_at(st, key);
+      st = p.open;
+      match p.bytes {
+        Some(b) -> output_named(b),
         None -> {
-          let p = packed_at(st, key);
-          st = p.open;
-          match p.bytes { Some(b) -> output_named(b), None -> None }
-        },
-      }
-    },
-    memo_keep.height(key) -> {
-      let h = held(st, key);
-      st = h.open;
-      match h.held {
-        Some(x) -> x.height,
-        None -> {
-          let p = packed_at(st, key);
-          st = p.open;
-          match p.bytes { Some(b) -> height_named(b), None -> 0 }
+          let h = held(st, key);
+          st = h.open;
+          match h.held {
+            Some(answer) -> {
+              let digest = answer_digest(answer);
+              st = { ..st, named: st.named.insert(digest, key) };
+              Some(digest)
+            },
+            None -> {
+              let q = packed_at(st, key);
+              st = q.open;
+              match q.bytes { Some(b) -> output_named(b), None -> None }
+            },
+          }
         },
       }
     },
     memo_keep.record(key) -> {
-      let mine = own(st, key);
-      let h = held(mine.open, key);
-      st = h.open;
-      match mine.bytes {
-        Some(b) -> record_of(Some(b), match h.held { Some(x) -> x.height, None -> 0 }),
-        // The pack's record only where the store keeps none of its own under the key.
-        None -> match h.held {
-          Some(_) -> None,
-          None -> {
-            let p = packed_at(st, key);
-            st = p.open;
-            record_of(p.bytes, 0)
-          },
+      let p = standing_at(st, key);
+      st = p.open;
+      match p.bytes {
+        Some(b) -> record_from(b),
+        None -> {
+          let mine = own(st, key);
+          st = mine.open;
+          match mine.bytes {
+            Some(b) -> record_from(b),
+            // The pack's record only where the store keeps none of its own under the key.
+            None -> {
+              let h = held(st, key);
+              st = h.open;
+              match h.held {
+                Some(_) -> None,
+                None -> {
+                  let q = packed_at(st, key);
+                  st = q.open;
+                  match q.bytes { Some(b) -> record_from(b), None -> None }
+                },
+              }
+            },
+          }
         },
       }
-    },
-    memo_keep.stored(key) -> {
-      let h = held(st, key);
-      st = h.open;
-      match h.held { Some(_) -> true, None -> false }
     },
     memo_keep.output(digest) -> {
       let i = inside(st, digest);
@@ -1346,9 +970,6 @@ pub fn kept<a, [r] | e>(
     memo_keep.adopt(key, rec) -> {
       st = keeping(st, key, rec, st.inlined.get(rec.output), None);
     },
-    memo_keep.raise(key, height) -> {
-      st = saying(st, key, |x: Mine| if height > x.height { { ..x, height: height } } else { x });
-    },
     memo_keep.now(kind, place) -> {
       let l = looked(st, kind, place);
       st = l.open;
@@ -1359,116 +980,25 @@ pub fn kept<a, [r] | e>(
       st = l.open;
       l.looked.digest
     },
-    memo_keep.places() -> {
-      let p = places_of[r](dir, st);
+    memo_keep.looked() -> st.looked.values().map(|x: Look| memo::World(x.kind, x.at, x.digest)),
+    memo_keep.standing(key) -> {
+      let p = standing_at(st, key);
       st = p.open;
-      p.places.fold([], |acc: List<Seen>, _: Bytes, s: Seen|
-        if covers(s.kind, s.at) { acc.push(s) } else { acc })
+      p.bytes != None
     },
-    memo_keep.seen(id) -> {
-      let p = places_of[r](dir, st);
-      st = p.open;
-      p.places.get(id)
-    },
-    memo_keep.see(id, s) -> {
-      let p = places_of[r](dir, st);
-      st = { ..p.open, places: Some(p.places.insert(id, s)), saw: p.open.saw.insert(id, s) };
-    },
-    memo_keep.readers(id) -> {
-      let found = readers_of[r](dir, st, id);
-      st = found.open;
-      found.keys
-    },
-    memo_keep.link(id, key) -> {
+    memo_keep.running(id, queries) -> {
       st = {
         ..st,
-        readers: st.readers.insert(
-          id,
-          List::push(match st.readers.get(id) { Some(ks) -> ks, None -> [] }, key),
-        ),
-      };
-    },
-    memo_keep.marks(key) -> {
-      let m = marks(st, key);
-      st = m.open;
-      if m.marks.len() > 0 { m.marks } else {
-        let vouched = match st.mine.get(key) { Some(x) -> x.vouch, None -> false };
-        let unchecked = if vouched { false } else {
-          let k = stored(st, key);
-          st = k.open;
-          match k.known {
-            Some(kn) -> !kn.trusted || st.lost.len() > 0,
-            // A record of the pack below stands as it is only where the pack does, or where
-            // this run checked it: it notes no reads, so no later run is told that one moved.
-            None -> if st.trusted || st.checked.contains(key) { false } else {
-              let p = packed_at(st, key);
-              st = p.open;
-              p.bytes != None
-            },
-          }
-        };
-        if unchecked { [memo::unchecked()] } else { [] }
-      }
-    },
-    memo_keep.marked() -> {
-      let named = marked_in[r](dir, st);
-      let walked = named.keys.fold(
-        { open: named.open, keys: [] },
-        |acc: { open: Open, keys: List<Bytes> }, key: Bytes, _: Bool| {
-          let query = match acc.open.mine.get(key) {
-            Some(x) -> { open: acc.open, query: Some(x.query) },
-            None -> {
-              let k = stored(acc.open, key);
-              { open: k.open, query: match k.known { Some(kn) -> Some(kn.query), None -> None } }
-            },
-          };
-          match query.query {
-            Some(q) -> if query.open.own.contains(q) {
-              let m = marks(query.open, key);
-              { open: m.open, keys: if m.marks.len() > 0 { acc.keys.push(key) } else { acc.keys } }
-            } else { { open: query.open, keys: acc.keys } },
-            None -> { open: query.open, keys: acc.keys },
-          }
-        },
-      );
-      st = walked.open;
-      walked.keys
-    },
-    memo_keep.mark(key) -> {
-      let m = marks(st, key);
-      let o = m.open;
-      st = saying(
-        {
-          ..o,
-          marks: o.marks.insert(key, m.marks.push(Bytes::of_string(o.minted.to_string()))),
-          minted: o.minted + 1,
-        },
-        key,
-        |x: Mine| x,
-      );
-    },
-    memo_keep.unmark(key, gone) -> {
-      let m = marks(st, key);
-      let h = held(marked_as(m.open, key, m.marks.filter(|mk: Bytes| !gone.contains(mk))), key);
-      st = match h.held {
-        Some(_) -> saying(h.open, key, |x: Mine| { ..x, vouch: true }),
-        None -> { ..h.open, checked: h.open.checked.insert(key, true) },
-      };
-    },
-    memo_keep.stamped(named, queries) -> {
-      let stamp = stamp_of(named);
-      st = {
-        ..st,
-        known: Map::new(),
         own: queries.concat(commands).fold(Map::new(), |own: Map<Bytes, Bool>, q: Bytes|
           own.insert(q.blake3(), true)),
-        stamp: packs::above(st.pack.index, stamp, world),
-        trusted: match st.pack.index { Some(i) -> packs::stands(i, stamp, world), None -> false },
+        trusted: match st.pack.index { Some(i) -> packs::stands(i, id, world), None -> false },
       };
+      // A command's result over the pack depends on which pack it is.
+      if st.pack.index != None {
+        let l = looked(st, memo::pack_kind(), b"");
+        st = l.open;
+      }
     },
-    memo_keep.vouches() ->
-      st.manifest.segments.fold(false, |any: Bool, seg: Segment|
-        any || (!segments::below_floor(st.manifest, seg) && seg.stamps.contains(st.stamp))),
     return value -> {
       match run { Some(path) -> committed[r](dir, path, token, st), None -> () };
       value
@@ -1480,7 +1010,7 @@ pub fn kept<a, [r] | e>(
 
 // --- Reading a store apart from a run -----------------------------------------
 
-/// The bytes of the record the store `o` holds of keeps under `key`, at the key's height.
+/// The bytes of the store's record under `key`.
 fn kept_at<[r]>(
   dir: String,
   o: Open,
@@ -1494,10 +1024,7 @@ fn kept_at<[r]>(
       {
         open: lies.open,
         bytes: match lies.at {
-          Some(at) -> match segments::payload[r](dir, at.token, at.offset, at.size) {
-            Some(b) -> Some(at_height(b, known.row.height)),
-            None -> None,
-          },
+          Some(at) -> segments::payload[r](dir, at.token, at.offset, at.size),
           None -> None,
         },
       }
@@ -1507,7 +1034,10 @@ fn kept_at<[r]>(
 
 /// The record the store in `dir` holds under `key`.
 pub fn record_at<[r]>(dir: String, key: Bytes) -> Option<Record> / {fs.read[r], abort.raise} =
-  record_of(kept_at[r](dir, opened(segments::manifest[r](dir, shapes()), 0), key).bytes, 0)
+  match kept_at[r](dir, opened(segments::manifest[r](dir, shapes()), 0), key).bytes {
+    Some(b) -> record_from(b),
+    None -> None,
+  }
 
 /// What a pack being written from a store holds so far: the store as read, the frames written, where
 /// each record's and each longer answer's frame lies, and each record's answer.
@@ -1520,14 +1050,14 @@ type Packing = {
 }
 
 /// The pack of the records under each of `keys` in the store `from` and the longer answers they
-/// name, as `packs` lays one out: each frame compressed by `compress`, made under `stamp` over the
-/// shipped files `files` lists. A record whose answer the store no longer holds is left out. How
+/// name, as `packs` lays one out: each frame compressed by `compress`, made by the queries
+/// `queries` names over the shipped files `files` lists. A record whose answer the store no longer holds is left out. How
 /// many records it holds.
 pub fn packed<[r]>(
   from: String,
   keys: List<Bytes>,
   compress: (Bytes) -> Bytes / {abort.raise},
-  stamp: Bytes,
+  queries: Bytes,
   files: Bytes,
 ) -> { written: packs::Written, records: Int } / {fs.read[r], abort.raise} = {
   let laid = keys.fold(
@@ -1595,7 +1125,7 @@ pub fn packed<[r]>(
       laid.answers,
       laid.answered,
       compress,
-      stamp,
+      queries,
       files,
     ),
     records: laid.records.len(),
@@ -1699,8 +1229,8 @@ pub fn usage<[r]>(dir: String, queries: List<Bytes>) -> Usage / {fs.read[r], abo
 }
 
 /// The store in `dir` written again as one segment that keeps only the records of `queries`, each
-/// a query's hash: every other record is dropped, with every answer no record left names, each
-/// reader that is no record any more, and every row but the newest of a key. A dropped record is
+/// a query's hash: every other record is dropped, with every answer no record left names, and
+/// every row but the newest of a key. A dropped record is
 /// answered again by the next run that asks it. A compaction a run commits under lands nothing.
 pub fn compacted<[r]>(
   dir: String,
@@ -1728,16 +1258,18 @@ pub fn compacted<[r]>(
 fn quoted(input: Bytes) -> Bytes / {memo.read} =
   Bytes::concat_all([b"\"", memo.ask(b"text", input), b"\""])
 
-/// The queries of the tests, and one nothing asks, whose hash alone tells two stamps apart.
+/// A query of the tests, its longer answers kept and no summary.
+fn query(name: Bytes, hash: Bytes, body: keep (Bytes) -> Bytes / {memo.read}) -> memo::Query<| {}> =
+  { name: name, hash: hash, body: body, kept: true, summarized: false }
+
+/// The queries of the tests, and one nothing asks, whose hash alone tells two sets of them apart.
 fn test_queries(spare: Bytes) -> Map<Bytes, memo::Query<| {}>> =
-  Map::new().insert(b"text", {
-    name: b"text",
-    hash: b"t1",
-    body: memo::read_whole,
-    kept: true,
-  }).insert(b"quoted", { name: b"quoted", hash: b"q1", body: quoted, kept: true }).insert(
+  Map::new().insert(b"text", query(b"text", b"t1", memo::read_whole)).insert(
+    b"quoted",
+    query(b"quoted", b"q1", quoted),
+  ).insert(
     b"spare",
-    { name: b"spare", hash: spare, body: memo::read_whole, kept: true },
+    query(b"spare", spare, memo::read_whole),
   )
 
 /// What `quoted` answers over the store in `s` for a file holding `text`, asked by a run whose
@@ -1764,9 +1296,7 @@ fn asked_keeping<[r]>(
   lasting: Bool,
 ) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
   let queries = test_queries(b"").insert(b"text", {
-    name: b"text",
-    hash: b"t1",
-    body: memo::read_whole,
+    ..query(b"text", b"t1", memo::read_whole),
     kept: lasting,
   });
   kept[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), || {
@@ -1808,37 +1338,14 @@ test "a store is its manifest and a handful of segments, and a run that keeps no
   assert_eq(fs::on_mem[abs](moved.tree, || quoted_under[abs](b"forty", b"")).value.ran, 0)
 }
 
-test "a record another stamp kept is checked before it is taken, and no body runs where it stands" {
-  let one = b"one";
-  let two = b"two";
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", one));
-  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", two));
+test "a store kept under other queries answers as its own, and a run that only checks writes nothing" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b"one"));
+  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", b"two"));
   assert_eq(other.value, { output: b"\"four\"", ran: 0 });
-  // The second stamp wrote that it checked them; from then on neither writes.
-  assert(other.tree.files != first.tree.files);
-  let back = fs::on_mem[abs](other.tree, || quoted_under[abs](b"four", one));
+  assert_eq(other.tree.files, first.tree.files);
+  let back = fs::on_mem[abs](other.tree, || quoted_under[abs](b"four", b"one"));
   assert_eq(back.value.ran, 0);
-  assert_eq(back.tree.files, other.tree.files);
-  let forth = fs::on_mem[abs](back.tree, || quoted_under[abs](b"four", two));
-  assert_eq(forth.value.ran, 0);
-  assert_eq(forth.tree.files, other.tree.files)
-}
-
-test "a store vouches to a run of a stamp that kept or checked in it, and to no other" {
-  let vouched_under = |tree: fs::MemFs, spare: Bytes| {
-    let queries = test_queries(spare);
-    fs::on_mem[abs](tree, ||
-      kept[abs]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
-        memo::vouched_to(answer(queries, started(queries), b"quoted", b"a").run)))
-  };
-  let first = vouched_under(fs::mem_of([]), b"one");
-  assert(!first.value);
-  assert(vouched_under(first.tree, b"one").value);
-  let other = vouched_under(first.tree, b"two");
-  assert(!other.value);
-  // Having checked what the first kept, the second is vouched to as well.
-  assert(vouched_under(other.tree, b"two").value);
-  assert(vouched_under(other.tree, b"one").value)
+  assert_eq(back.tree.files, first.tree.files)
 }
 
 test "a run under queries a store never saw writes nothing until it asks" {
@@ -1851,14 +1358,12 @@ test "a run under queries a store never saw writes nothing until it asks" {
   assert_eq(idle.tree.files, first.tree.files)
 }
 
-test "what moved under one stamp is answered again under another" {
-  let one = b"one";
-  let two = b"two";
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", one));
-  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", two));
-  let moved = fs::on_mem[abs](other.tree, || quoted_under[abs](b"forty", two));
+test "what moved under some queries is answered again under others" {
+  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_under[abs](b"four", b"one"));
+  let other = fs::on_mem[abs](first.tree, || quoted_under[abs](b"four", b"two"));
+  let moved = fs::on_mem[abs](other.tree, || quoted_under[abs](b"forty", b"two"));
   assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
-  let back = fs::on_mem[abs](moved.tree, || quoted_under[abs](b"forty", one));
+  let back = fs::on_mem[abs](moved.tree, || quoted_under[abs](b"forty", b"one"));
   assert_eq(back.value, { output: b"\"forty\"", ran: 0 })
 }
 
@@ -1902,7 +1407,6 @@ test "two runs at once over an edit leave a store that answers as a fresh one" {
   assert_eq(after.value.output, b"\"forty\"");
   let settled = fs::on_mem[abs](after.tree, || quoted_under[abs](b"forty", b""));
   assert_eq(settled.value, { output: b"\"forty\"", ran: 0 });
-  // Neither run saw what the other kept, so the store vouched for neither.
   let cold = racing(fs::mem_of([]));
   assert_eq(
     fs::on_mem[abs](cold.tree, || quoted_under[abs](b"forty", b"")).value.output,
@@ -1931,12 +1435,13 @@ test "a compaction leaves one segment holding the records of the queries it is g
 /// How many bodies ran as `quoted` was asked over the store in `s`, for a file holding `four`, by a
 /// run whose two queries hash with `tag`: another `ply`'s for another tag.
 fn quoted_tagged<[r]>(tag: Bytes) -> Int / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = Map::new().insert(b"text", {
-    name: b"text",
-    hash: b"t".concat(tag),
-    body: memo::read_whole,
-    kept: true,
-  }).insert(b"quoted", { name: b"quoted", hash: b"q".concat(tag), body: quoted, kept: true });
+  let queries = Map::new().insert(
+    b"text",
+    query(b"text", b"t".concat(tag), memo::read_whole),
+  ).insert(
+    b"quoted",
+    query(b"quoted", b"q".concat(tag), quoted),
+  );
   kept[r]("s", packs::no_pack, b"", |_: Bytes, _: Bytes| Some(b"four"), ||
     memo::ran_total(answer(queries, started(queries), b"quoted", b"a").run))
 }
@@ -1982,7 +1487,7 @@ fn command_outlived<[r]>(
     packs::no_pack,
     b"",
     |_: Bytes, _: Bytes| Some(text),
-    || memo::recorded(queries, key, b"p", [], output, []),
+    || memo::recorded(queries, key, b"p", [], [], output),
     commands: commands,
   );
   kept[r](
@@ -2076,7 +1581,7 @@ fn quoted_pack(
     match queries.get(name) { Some(q) -> memo::key_of(q, b"a"), None -> b"" });
   fs::on_mem[abs](fs::mem_of([]), || {
     quoted_over[abs](text);
-    packed[abs]("s", keys.concat(also), packs::as_is, memo::stamp_of(queries), b"files")
+    packed[abs]("s", keys.concat(also), packs::as_is, memo::queries_id(queries), b"files")
   }).value
 }
 
@@ -2111,11 +1616,14 @@ test "a pack holds the records asked for and the answers they name, and a run be
   let stands = below(b"files", long);
   assert_eq(stands.value, { output: quoted_long, ran: 0 });
   assert_eq(segments_in(stands.tree), []);
-  assert_eq(below(b"other files", long).value, { output: quoted_long, ran: 0 });
+  // Over other files the pack's records are held to their reads, and stand where those do.
+  let checked = below(b"other files", long);
+  assert_eq(checked.value, { output: quoted_long, ran: 0 });
+  assert_eq(segments_in(checked.tree), []);
   assert_eq(below(b"other files", b"four").value, { output: b"\"four\"", ran: 2 })
 }
 
-// The files listed are the same in both runs, so only what the store noted says the text moved.
+// The files listed are the same in both runs, so only what the records read says the text moved.
 test "what a run answered again over a pack it does not trust is answered again where its reads move" {
   let pack = quoted_pack(b"long ".repeat(1000), []).written;
   let first = quoted_below(fs::mem_of([]), pack, b"other files", b"four");
@@ -2142,14 +1650,11 @@ test "a run keeps what it wrote through the merge its write makes, and a later r
     kept[abs]("s", packs::no_pack, b"", look, ||
       memo::asked_reads(answer(queries, started(queries), b"quoted", b"a").run)));
   let filed = session(loaded.tree, || {
-    memo::recorded(queries, key, b"c1", loaded.value, said, []);
+    memo::recorded(queries, key, b"c1", loaded.value, [], said);
     None
   });
   assert(held(filed.tree), Some("the run's own record outlives the merge its write made"));
-  assert_eq(
-    session(filed.tree, || memo::standing(queries, started(queries), key).output).value,
-    Some(said),
-  );
+  assert_eq(session(filed.tree, || memo::standing(queries, key)).value, Some(said));
   // A run that keeps less than the command weighs, and enough to merge the whole store again.
   let later = session(filed.tree, || {
     range(0, 10).fold(started(queries), |run: memo::Run, i: Int|
@@ -2169,17 +1674,43 @@ test "taking back a command's answer asks the file system the same handful of th
       kept[abs]("s", packs::no_pack, b"", world, || {
         let run = range(0, files).fold(started(queries), |run: memo::Run, i: Int|
           answer(queries, run, b"quoted", Bytes::of_string(i.to_string())).run);
-        memo::recorded(queries, key, b"c1", memo::asked_reads(run), b"done", [])
+        memo::recorded(queries, key, b"c1", memo::asked_reads(run), memo_keep.looked(), b"done")
       });
       compacted[abs]("s", [b"t1", b"q1", b"c1"])
     }).tree;
   let taken = |tree: fs::MemFs|
     fs::on_mem_counted[abs](tree, ||
-      kept[abs]("s", packs::no_pack, b"", world, ||
-        memo::standing(queries, started(queries), key).output));
+      kept[abs]("s", packs::no_pack, b"", world, || memo::standing(queries, key)));
   let few = taken(built(3));
   let many = taken(built(200));
   assert_eq(many.value, Some(b"done"));
   assert_eq(few.asked, many.asked);
   assert(many.asked <= 12)
+}
+
+/// Each of as many files as `input` has bytes quoted, one after another.
+fn quoting_all(input: Bytes) -> Bytes / {memo.read} =
+  range(0, input.len()).fold(b"", |acc: Bytes, i: Int|
+    acc.concat(memo.ask(b"quoted", Bytes::of_string(i.to_string()))))
+
+test "a record whose summary stands is taken reading no record below it, however many there are" {
+  let queries = test_queries(b"").insert(b"all", {
+    ..query(b"all", b"a1", quoting_all),
+    summarized: true,
+  });
+  let world = |_: Bytes, at: Bytes| Some(at);
+  let built = |files: Int|
+    fs::on_mem[abs](fs::mem_of([]), || {
+      kept[abs]("s", packs::no_pack, b"", world, ||
+        answer(queries, started(queries), b"all", b"x".repeat(files)).output);
+      compacted[abs]("s", [b"t1", b"q1", b"a1"])
+    }).tree;
+  let taken = |tree: fs::MemFs, files: Int|
+    fs::on_mem_counted[abs](tree, ||
+      kept[abs]("s", packs::no_pack, b"", world, ||
+        memo::ran_total(answer(queries, started(queries), b"all", b"x".repeat(files)).run)));
+  let few = taken(built(3), 3);
+  let many = taken(built(200), 200);
+  assert_eq([few.value, many.value], [0, 0]);
+  assert_eq(few.asked, many.asked)
 }
