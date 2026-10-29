@@ -30,7 +30,7 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     if c.out_of_time() {
         return 0;
     }
-    // A floor another context's growth or a restored frame left stale needs no system call.
+    // A floor another context's growth or a switch of stacks left stale needs no system call.
     let floor = stack_floor();
     if at >= floor {
         c.stack_floor.store(floor, Relaxed);

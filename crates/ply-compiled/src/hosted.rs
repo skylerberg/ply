@@ -25,11 +25,11 @@ mod trace;
 
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
-use crate::host::HostMark;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
 use crate::secret;
-use ply_core::host::{Determinism, Linearity, Pending, err_host_in_search, err_host_in_simulation};
+use ply_core::host::Determinism::{self, Deterministic, Nondeterministic};
+use ply_core::host::{Pending, err_host_in_search, err_host_in_simulation};
 use ply_core::{Diagnostic, Resource, codes};
 use ply_host::jobs::{self, Failure, Job, Work};
 use ply_host::native::{found, parts, parts_of, told};
@@ -37,32 +37,6 @@ use ply_host::password;
 use ply_host::registry::Facilities;
 use std::path::Path;
 use zeroize::Zeroizing;
-
-/// What a native says of itself when it asks the host: whether what it answers is a function of
-/// what it is handed, and whether asking again changes anything outside the program.
-#[derive(Clone, Copy)]
-struct Asking {
-    determinism: Determinism,
-    linearity: Linearity,
-}
-
-/// Asking the machine what it may answer otherwise the next time, changing nothing.
-const READS: Asking = Asking {
-    determinism: Determinism::Nondeterministic,
-    linearity: Linearity::Repeatable,
-};
-
-/// Changing what is outside the program, which asking again would change again.
-const WRITES: Asking = Asking {
-    determinism: Determinism::Nondeterministic,
-    linearity: Linearity::AtMostOnce,
-};
-
-/// Computing a function of what the native is handed, off the program's thread.
-const COMPUTES: Asking = Asking {
-    determinism: Determinism::Deterministic,
-    linearity: Linearity::Repeatable,
-};
 
 /// Every native here, under the name its module declares it by.
 pub fn natives() -> Vec<MachineNative> {
@@ -148,12 +122,11 @@ pub fn natives() -> Vec<MachineNative> {
 }
 
 impl Ctx {
-    /// Whether the native `native` may ask the host now. Where it may, the run has asked it as
-    /// `asking` says, as a host operation is asked: a nondeterministic answer means its pass
-    /// answers only for the binding it ran under, and an at-most-once one is not replayed by a
-    /// second resumption. Where it may not, the run fails as a host operation's would, and the
+    /// Whether the native `native` may ask the host now. Where it may, the run has asked it as a
+    /// host operation is asked: a `Nondeterministic` answer means its pass answers only for the
+    /// binding it ran under. Where it may not, the run fails as a host operation's would, and the
     /// native answers nothing it reads.
-    fn reaches_host(&mut self, native: &'static str, asking: Asking) -> bool {
+    fn reaches_host(&mut self, native: &'static str, determinism: Determinism) -> bool {
         let operation = format!("the native `{native}`");
         let span = self.site();
         if let Some(region) = crate::tasks::seeded_region(self) {
@@ -164,15 +137,7 @@ impl Ctx {
             self.fail(err_host_in_search(span, &operation, native));
             return false;
         }
-        self.host_use.record(asking.determinism);
-        if asking.linearity.is_linear() {
-            self.host_ops = self.host_ops.saturating_add(1);
-            self.last_linear = Some(HostMark {
-                operation,
-                path: native,
-                span,
-            });
-        }
+        self.host_use.record(determinism);
         true
     }
 
@@ -230,17 +195,17 @@ impl Ctx {
     }
 }
 
-/// What `answer` answers, where the native `native` may ask the host as `asking` says; `refused`
-/// where it may not.
+/// What `answer` answers, where the native `native` may ask the host for an answer of
+/// `determinism`; `refused` where it may not.
 fn asked<R>(
     ctx: *mut Ctx,
     native: &'static str,
-    asking: Asking,
+    determinism: Determinism,
     refused: R,
     answer: impl FnOnce(&mut Ctx) -> R,
 ) -> R {
     let c = unsafe { &mut *ctx };
-    if c.reaches_host(native, asking) {
+    if c.reaches_host(native, determinism) {
         answer(c)
     } else {
         refused
@@ -248,12 +213,12 @@ fn asked<R>(
 }
 
 /// What `answer` answers where the run is lent `family` and the native `native` may ask the host
-/// as `asking` says; `refused`, with the run failed, where it is not lent the family.
+/// for an answer of `determinism`; `refused`, with the run failed, where it is not lent the family.
 fn granted<R>(
     ctx: *mut Ctx,
     family: &'static str,
     native: &'static str,
-    asking: Asking,
+    determinism: Determinism,
     refused: R,
     answer: impl FnOnce(&mut Ctx) -> R,
 ) -> R {
@@ -270,7 +235,7 @@ fn granted<R>(
         );
         return refused;
     }
-    asked(ctx, native, asking, refused, answer)
+    asked(ctx, native, determinism, refused, answer)
 }
 
 /// What `read` takes of the facilities the run's host lends; `None`, with the run failed, for a
@@ -440,7 +405,7 @@ pub unsafe extern "C" fn rt_observed(
 /// A new self-signed certificate for `localhost`, told: its certificate, its key, its DER and its
 /// fingerprint as parts.
 pub unsafe extern "C" fn rt_certgen_issue(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "certgen_issue", READS, TakenBytes(0), |c| {
+    asked(ctx, "certgen_issue", Nondeterministic, TakenBytes(0), |c| {
         let said = match ply_host::certgen::issue(&[]) {
             Ok(issued) => [
                 &[1u8][..],
@@ -484,7 +449,7 @@ fn configured(c: &mut Ctx, key: &str, secret: bool) -> Option<String> {
 
 /// The run's plain value of the key at `p`, found.
 pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    asked(ctx, "config_get", READS, TakenBytes(0), |c| {
+    asked(ctx, "config_get", Nondeterministic, TakenBytes(0), |c| {
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return TakenBytes(0);
         };
@@ -495,7 +460,7 @@ pub unsafe extern "C" fn rt_config_get(ctx: *mut Ctx, p: Addr, n: I64) -> TakenB
 
 /// 1 where the run holds a secret value of the key at `p`, else 0.
 pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
-    asked(ctx, "config_secret_held", READS, I64(0), |c| {
+    asked(ctx, "config_secret_held", Nondeterministic, I64(0), |c| {
         let Some(key) = c.text(unsafe { lent(p, n) }) else {
             return I64(0);
         };
@@ -505,13 +470,19 @@ pub unsafe extern "C" fn rt_config_secret_held(ctx: *mut Ctx, p: Addr, n: I64) -
 
 /// The run's secret value of the key at `p`, empty where it holds none.
 pub unsafe extern "C" fn rt_config_secret(ctx: *mut Ctx, p: Addr, n: I64) -> SecretHandle {
-    asked(ctx, "config_secret", READS, SecretHandle::of(0), |c| {
-        let Some(key) = c.text(unsafe { lent(p, n) }) else {
-            return SecretHandle::of(0);
-        };
-        let plain = Zeroizing::new(configured(c, key, true).unwrap_or_default().into_bytes());
-        secret::sealed(c, true, plain)
-    })
+    asked(
+        ctx,
+        "config_secret",
+        Nondeterministic,
+        SecretHandle::of(0),
+        |c| {
+            let Some(key) = c.text(unsafe { lent(p, n) }) else {
+                return SecretHandle::of(0);
+            };
+            let plain = Zeroizing::new(configured(c, key, true).unwrap_or_default().into_bytes());
+            secret::sealed(c, true, plain)
+        },
+    )
 }
 
 /// The ticket of Argon2 version 1.3 over what `kdf.argon2` is handed.
@@ -531,7 +502,7 @@ pub unsafe extern "C" fn rt_kdf_argon2(
     lanes: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_argon2", COMPUTES, I64(0), |c| {
+    asked(ctx, "kdf_argon2", Deterministic, I64(0), |c| {
         let (Some(password), Some(key)) = (secret::held(c, &password), secret::held(c, &key))
         else {
             return I64(0);
@@ -566,7 +537,7 @@ pub unsafe extern "C" fn rt_kdf_scrypt(
     p: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_scrypt", COMPUTES, I64(0), |c| {
+    asked(ctx, "kdf_scrypt", Deterministic, I64(0), |c| {
         let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
@@ -590,7 +561,7 @@ pub unsafe extern "C" fn rt_kdf_bcrypt(
     salt_len: I64,
     cost: I64,
 ) -> I64 {
-    asked(ctx, "kdf_bcrypt", COMPUTES, I64(0), |c| {
+    asked(ctx, "kdf_bcrypt", Deterministic, I64(0), |c| {
         let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
@@ -612,7 +583,7 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
     iterations: I64,
     length: I64,
 ) -> I64 {
-    asked(ctx, "kdf_pbkdf2", COMPUTES, I64(0), |c| {
+    asked(ctx, "kdf_pbkdf2", Deterministic, I64(0), |c| {
         let Some(password) = secret::held(c, &password) else {
             return I64(0);
         };
@@ -632,73 +603,77 @@ pub unsafe extern "C" fn rt_kdf_pbkdf2(
 
 /// The name the toolchain gives the system this binary was built for.
 pub unsafe extern "C" fn rt_os_system(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_system", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_system", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::OS.as_bytes().to_vec())
     })
 }
 
 /// The name the toolchain gives the architecture this binary was built for.
 pub unsafe extern "C" fn rt_os_machine(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_machine", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_machine", Nondeterministic, TakenBytes(0), |c| {
         c.given(std::env::consts::ARCH.as_bytes().to_vec())
     })
 }
 
 /// The system's name and release, as `uname -sr` prints them, told.
 pub unsafe extern "C" fn rt_os_uname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_uname", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_uname", Nondeterministic, TakenBytes(0), |c| {
         c.given(told(ply_host::os::name()))
     })
 }
 
 /// The name the kernel holds for the machine, told.
 pub unsafe extern "C" fn rt_os_hostname(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_hostname", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_hostname", Nondeterministic, TakenBytes(0), |c| {
         c.given(told(ply_host::os::hostname()))
     })
 }
 
 /// The processors the process may run on at once.
 pub unsafe extern "C" fn rt_os_cpus(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_cpus", READS, I64(0), |_| I64(ply_host::os::cpus()))
+    asked(ctx, "os_cpus", Nondeterministic, I64(0), |_| {
+        I64(ply_host::os::cpus())
+    })
 }
 
 /// The id of the user the process runs as.
 pub unsafe extern "C" fn rt_os_uid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_uid", READS, I64(0), |_| I64(ply_host::os::uid()))
+    asked(ctx, "os_uid", Nondeterministic, I64(0), |_| {
+        I64(ply_host::os::uid())
+    })
 }
 
 /// The name the system's records give the user of id `id`, found.
 pub unsafe extern "C" fn rt_os_user_name(ctx: *mut Ctx, id: I64) -> TakenBytes {
-    asked(ctx, "os_user_name", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_user_name", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::user_name(id.0)))
     })
 }
 
 /// The process's id.
 pub unsafe extern "C" fn rt_os_pid(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pid", READS, I64(0), |_| {
+    asked(ctx, "os_pid", Nondeterministic, I64(0), |_| {
         I64(i64::from(std::process::id()))
     })
 }
 
 /// The executable the process runs, its links followed, found.
 pub unsafe extern "C" fn rt_os_executable(ctx: *mut Ctx) -> TakenBytes {
-    asked(ctx, "os_executable", READS, TakenBytes(0), |c| {
+    asked(ctx, "os_executable", Nondeterministic, TakenBytes(0), |c| {
         c.given(found(ply_host::os::executable()))
     })
 }
 
 /// 1 where the machine's words are big-endian, else 0.
 pub unsafe extern "C" fn rt_os_big_endian(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_big_endian", READS, I64(0), |_| {
+    asked(ctx, "os_big_endian", Nondeterministic, I64(0), |_| {
         I64(i64::from(cfg!(target_endian = "big")))
     })
 }
 
 /// The width of an address on the machine, in bits.
 pub unsafe extern "C" fn rt_os_pointer_bits(ctx: *mut Ctx) -> I64 {
-    asked(ctx, "os_pointer_bits", READS, I64(0), |_| {
+    asked(ctx, "os_pointer_bits", Nondeterministic, I64(0), |_| {
         I64(i64::from(usize::BITS))
     })
 }

@@ -5,7 +5,7 @@
 use super::heap::Holding;
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Block, Carried, Handed, PlyFnDesc, PlyType};
-use ply_compiled::frames::{Held, PlyFrame, Snapshot, base, held_across, release_live};
+use ply_compiled::frames::{Held, PlyFrame, base, held_across, release_live};
 use ply_compiled::heap::{HEADER, Word};
 use ply_compiled::native::Answered;
 use ply_compiled::rt::Ctx;
@@ -198,29 +198,6 @@ fn the_chain_head_follows_the_eight_fields_every_unit_reads_and_a_record_is_two_
     assert_eq!(offset_of!(PlyFrame, each), 8);
 }
 
-/// A snapshot holds every record once more, innermost first, and stops at the base; a restore puts
-/// the bytes back and holds them again; dropping the copy lets go of what the copy's own records
-/// hold, whatever the stack holds since.
-#[test]
-fn a_snapshot_and_each_restore_hold_every_record_once_and_the_copy_lets_go_of_its_own() {
-    let mut ctx = context();
-    let stack = Stack::take().expect("the system maps a stack");
-    let sp = stack.top() - 4096;
-    let head = laid(&stack, sp);
-    let snapshot =
-        unsafe { Snapshot::take(&mut ctx, &stack, sp, head) }.expect("sp is on the stack");
-    assert_eq!((snapshot.sp(), snapshot.head()), (sp, head));
-    assert_eq!(walked(), [(3, 1), (2, 1), (1, 1)]);
-    let scribbled = |byte| unsafe { std::ptr::write_bytes(sp as *mut u8, byte, stack.top() - sp) };
-    scribbled(0xAB);
-    unsafe { snapshot.restore(&mut ctx, &stack) };
-    assert_eq!(walked(), [(3, 1), (2, 1), (1, 1)]);
-    assert_eq!(unsafe { (*head.cast::<Record>()).slot }, 3);
-    scribbled(0xCD);
-    unsafe { snapshot.release(&mut ctx) };
-    assert_eq!(walked(), [(3, -1), (2, -1), (1, -1)]);
-}
-
 /// A body abandoned at a stop lets go of what its live records hold, innermost first.
 #[test]
 fn a_live_chain_released_lets_go_of_every_record_once() {
@@ -232,46 +209,34 @@ fn a_live_chain_released_lets_go_of_every_record_once() {
 }
 
 #[test]
-fn a_chain_with_no_record_walks_nothing_and_a_stop_off_the_stack_takes_no_snapshot() {
+fn a_chain_with_no_record_walks_nothing() {
     let mut ctx = context();
-    let stack = Stack::take().expect("the system maps a stack");
-    let other = Stack::take().expect("the system maps a stack");
-    let sp = stack.top() - 256;
     for head in [std::ptr::null_mut(), base()] {
-        let snapshot =
-            unsafe { Snapshot::take(&mut ctx, &stack, sp, head) }.expect("sp is on the stack");
-        unsafe {
-            snapshot.restore(&mut ctx, &stack);
-            snapshot.release(&mut ctx);
-            release_live(&mut ctx, head);
-        }
+        unsafe { release_live(&mut ctx, head) };
     }
     assert!(walked().is_empty());
-    assert!(unsafe { Snapshot::take(&mut ctx, &stack, other.top() - 64, base()) }.is_none());
 }
 
-/// A runtime frame's record counts a closure through its descriptor, a carried value through its
-/// type and a handle as a handle, and gives each back to the frame when its call returns.
+/// A runtime frame's record lets go of a closure through its descriptor, a carried value through
+/// its type and a handle as a handle, and gives each back to the frame when its call returns.
 #[test]
-fn a_runtime_frames_record_counts_each_slot_as_its_kind_is_counted() {
+fn a_runtime_frames_record_lets_go_of_each_slot_as_its_kind_is_counted() {
     let mut owned = context();
     owned.frames = base();
     let ctx = &raw mut owned;
     let text: Arc<str> = Arc::from("held");
     let (held, words) = every_kind(ctx, [5, 2, 3], &text);
-    let counts = || words.map(count);
+    // Each held once more, so the record's letting go leaves the frame's own.
+    words.iter().copied().for_each(dup);
     let (seen, back) = unsafe {
         held_across(ctx, held, || {
             let record = (*ctx).frames;
             let linked = record != base() && (*record).prev == base();
-            let slots = record.add(1).cast::<Word>();
-            ((*record).each)(ctx, slots, 1);
-            let up = counts();
-            ((*record).each)(ctx, slots, -1);
-            (linked, up, counts())
+            ((*record).each)(ctx, record.add(1).cast::<Word>(), -1);
+            (linked, words.map(count))
         })
     };
-    assert_eq!(seen, (true, [2, 2, 2], [1, 1, 1]));
+    assert_eq!(seen, (true, [1, 1, 1]));
     assert_eq!(
         unsafe { (*ctx).frames },
         base(),

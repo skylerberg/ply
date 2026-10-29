@@ -2,7 +2,7 @@
 //! the running task's of this machine. A record's fields cross flat as `ply_host::trace` reads them,
 //! and only where the sink wants the record.
 
-use super::{READS, WRITES, asked, done, from_host, handed};
+use super::{Nondeterministic, asked, done, from_host, handed};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64};
 use crate::rt::{Ctx, lent};
@@ -64,13 +64,19 @@ fn fields(c: &mut Ctx, native: &str, at: Addr, n: I64) -> Option<Vec<(String, Fi
 
 /// 1 where the run's sink writes a record at the level numbered `level`.
 pub unsafe extern "C" fn rt_trace_wants(ctx: *mut Ctx, level: I64) -> I64 {
-    asked(ctx, "trace_wants", READS, I64(0), |c: &mut Ctx| {
-        let Some(level) = handed(c, "trace_wants", "a level", level_of(level)) else {
-            return I64(0);
-        };
-        let wants = from_host(c, |facilities| facilities.tracing().wants(level));
-        I64(i64::from(wants.unwrap_or(false)))
-    })
+    asked(
+        ctx,
+        "trace_wants",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some(level) = handed(c, "trace_wants", "a level", level_of(level)) else {
+                return I64(0);
+            };
+            let wants = from_host(c, |facilities| facilities.tracing().wants(level));
+            I64(i64::from(wants.unwrap_or(false)))
+        },
+    )
 }
 
 /// One record of the kind numbered `kind` (`event` 0, `count` 1, `gauge` 2, `time` 3) on the
@@ -91,7 +97,7 @@ pub unsafe extern "C" fn rt_trace_record(
     fields_at: Addr,
     fields_n: I64,
 ) {
-    asked(ctx, "trace_record", WRITES, (), |c: &mut Ctx| {
+    asked(ctx, "trace_record", Nondeterministic, (), |c: &mut Ctx| {
         let kind = match kind.0 {
             0 => Some(RecordKind::Event),
             1 => Some(RecordKind::Count),
@@ -143,21 +149,27 @@ pub unsafe extern "C" fn rt_trace_enter(
     fields_at: Addr,
     fields_n: I64,
 ) -> I64 {
-    asked(ctx, "trace_enter", WRITES, I64(0), |c: &mut Ctx| {
-        let (Some(channel), Some(name)) = (
-            c.text(unsafe { lent(channel_at, channel_n) }),
-            c.text(unsafe { lent(name_at, name_n) }),
-        ) else {
-            return I64(0);
-        };
-        let Some(fields) = fields(c, "trace_enter", fields_at, fields_n) else {
-            return I64(0);
-        };
-        let Some((trace, owner)) = traced(c) else {
-            return I64(0);
-        };
-        I64(trace.enter(owner, channel, name, &fields))
-    })
+    asked(
+        ctx,
+        "trace_enter",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let (Some(channel), Some(name)) = (
+                c.text(unsafe { lent(channel_at, channel_n) }),
+                c.text(unsafe { lent(name_at, name_n) }),
+            ) else {
+                return I64(0);
+            };
+            let Some(fields) = fields(c, "trace_enter", fields_at, fields_n) else {
+                return I64(0);
+            };
+            let Some((trace, owner)) = traced(c) else {
+                return I64(0);
+            };
+            I64(trace.enter(owner, channel, name, &fields))
+        },
+    )
 }
 
 /// Closes span `id` on the channel at `channel_at` with the outcome numbered `outcome` (`Ok` 0,
@@ -172,7 +184,7 @@ pub unsafe extern "C" fn rt_trace_exit(
     reason_at: Addr,
     reason_n: I64,
 ) {
-    asked(ctx, "trace_exit", WRITES, (), |c: &mut Ctx| {
+    asked(ctx, "trace_exit", Nondeterministic, (), |c: &mut Ctx| {
         let (Some(channel), Some(reason)) = (
             c.text(unsafe { lent(channel_at, channel_n) }),
             c.text(unsafe { lent(reason_at, reason_n) }),

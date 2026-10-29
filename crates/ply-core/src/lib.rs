@@ -28,8 +28,7 @@ pub use crypto::constant_time_eq;
 pub use escape::{Boundary, Escapee, Handle};
 pub use footprint::{EffectAtom, Mode, Resource, label_var_name};
 pub use host::{
-    Determinism, HostBinding, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
-    ShutdownReport,
+    Determinism, HostBinding, HostRuntime, HostUse, Pending, RuntimeFactory, ShutdownReport,
 };
 pub use limit::DEFAULT_MAX_CALLS;
 pub use rc::RcStats;

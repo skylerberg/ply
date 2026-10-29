@@ -81,7 +81,7 @@ pub(crate) const HOLD_BYTES: usize = 8 * (3 + CLOSURE_CAPTURES);
 /// A hold, as a closure no call enters: what it holds in its first capture, emptied once it has let
 /// go; `id`, its number in the entry, in its second, which names it to the scheduler; and in its
 /// third whether it has let go, as one made with nothing held has, so a second release or a read
-/// after is refused. A continuation resumed twice shares it.
+/// after is refused.
 pub(crate) fn hold_word(heap: &mut Heap, held: Option<Word>, id: u64) -> Word {
     let o = heap.raw_alloc(HOLD_BYTES);
     unsafe {
