@@ -3684,6 +3684,13 @@ packages/std/fs.ply fs.read_file load_file
 The operation is renamed inside the effect's declaration and wherever a file that imports from that
 module writes `fs.read_file`: calls, effect lists in signatures, and handlers.
 
+To rename only a record field, start the line with `.`. The field is renamed in every record type
+that has it and at every use, and a function or local variable spelled the same stays as it is:
+
+```
+.held cached
+```
+
 Types and values have separate names, so renaming a type leaves a variant or function spelled the
 same alone. If a module's name changes, its file moves: renaming `held` to `cached` moves
 `held/store.ply` to `cached/store.ply`.
@@ -3701,7 +3708,8 @@ letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon
 `ply rename` changes nothing, and exits 2, if:
 
 - a path's program does not check before the renames;
-- a line names a file the paths do not hold, or a name that file does not bind;
+- a line names a file the paths do not hold, a name that file does not bind, or a field no record
+  has;
 - a new name is a keyword or not a valid name;
 - a renamed name is declared with `extern`, so code outside Ply uses that name;
 - a module's file would be moved onto a file that already exists, or two files onto one;
