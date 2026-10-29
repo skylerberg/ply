@@ -104,6 +104,14 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
   module with the permissions CI gives it.
 - CI is `.github/workflows/ci.yml`. `.github/ci-shards.sh` lists CI's Ply test runs (each is `ply
   test` of one package) and which job runs each.
+- A pull request bootstraps only when it changes the runtime's Rust, `ply.work`, the compiler, the
+  CLI, a package their manifests name, or `std.prelude`, whose text the checker reads builtins
+  from. Otherwise its suites run with the newest `ply` main bootstrapped of those, which reads the
+  rest of the checkout's standard library from its sources. Main bootstraps whenever any of the
+  library changed, so a library change reaches the `ply` binary only once it merges.
+- A standard library module's behavior is covered by its own tests or `tests/std`, which run on the
+  checkout's library. The CLI's suite tests the CLI: the programs it checks and runs see the library
+  the binary ships, which is main's on a pull request that bootstraps nothing.
 - CI bootstraps twice. First the latest release builds the pull request's builder; then the `ply`
   that produced builds itself again, reusing the first builder unless the code that makes it
   changed. Because the release compiles the builder:
