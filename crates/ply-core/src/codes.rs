@@ -90,8 +90,6 @@ pub const CAPABILITY_UNDECLARED: &str = "E0459";
 pub const ASSERTION_FAILED: &str = "E0501";
 /// A failure the language defines: `panic`, division by zero, overflow, a resource limit.
 pub const RUNTIME_ERROR: &str = "E0502";
-/// An entry point, test or evaluation spent its step budget without finishing.
-pub const STEP_BUDGET: &str = "E0503";
 pub const INTERNAL_ERROR: &str = "E0505";
 /// Cache codes are warnings: cache trouble is never a fault in the user's program.
 pub const CACHE_UNREADABLE: &str = "W0601";

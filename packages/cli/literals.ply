@@ -1,13 +1,14 @@
 //! What a load enters before anything runs: its tagged literals' parsers, its `const` definitions
 //! and its statements. `tag"text"` is the call `tag::literal("text")`, and one with holes the call
 //! of `tag::compile` on the texts around them, and a load that checked has not yet run either: here
-//! each one the run's own modules hold is entered on a machine of its own, under a step budget, and
-//! what its parser answers is the literal's verdict. A verdict is a function of the parser and the
-//! texts, so it is kept under the hash of all the parser reaches and the texts, in the toolchain's
-//! cache. A `const` definition is entered the same way, handed nothing: the encoding of what it
-//! answers is kept there too, under the hash of all the definition reaches, and every unit emitted
-//! after holds the value, laid out as static data, in place of the body. A statement a call runs is
-//! computed the same way and judged by `statements`.
+//! each one the run's own modules hold is entered on a machine of its own, stopped by the clock past
+//! `const_timeout_ms`, and what its parser answers is the literal's verdict. A verdict is a function
+//! of the parser and the texts, so it is kept under the hash of all the parser reaches and the
+//! texts, in the toolchain's cache; one the clock stopped is not, and is never kept. A `const`
+//! definition is entered the same way, handed nothing: the encoding of what it answers is kept there
+//! too, under the hash of all the definition reaches, and every unit emitted after holds the value,
+//! laid out as static data, in place of the body. A statement a call runs is computed the same way
+//! and judged by `statements`.
 
 import compiler.syntax.exprs (TaggedPart)
 import compiler.front.facts (View, Frame, TaggedSite)
@@ -21,9 +22,9 @@ import compiler.emit.keys (RootKey, Named, Stored)
 import compiler.syntax.parsing (Span, no_module, span_between)
 import compiler.check.resolve.tables (Diag, Label, error_at, error_with_labels, label_at)
 import compiler.unit (shipped, shipped_runtime, answers_store, baked_key, compiler_roots,
-                      const_budget, const_room, emitter_identity, identity_of, stored_root)
+                      const_timeout_ms, const_room, emitter_identity, identity_of, stored_root)
 import compiler.store.kept (Record, kept_records, with_kept)
-import diagnostic (Place, shown)
+import diagnostic (Place, diag_of, shown)
 import compiler.cc
 import compiler.cc (toolchain)
 import machine
@@ -46,19 +47,16 @@ import units
 import units (emit)
 import std.path (below_root)
 
-/// The calls a literal's parser may make before the check gives up on it.
-pub fn step_budget() -> Int = 10000000
-
 /// What a parser said of its texts. `Rejected` is its own `Err`: which text, where in it in
-/// characters, and why. `Raised` is a parser that raised instead of answering, and `Spent` one the
-/// budget stopped. A `const` definition is `Accepted` once its value is kept, `RaisedAt` where its
-/// raise has a place in the program, and `Oversize`, with the bytes its value's encoding takes,
-/// where those are past `const_room`.
+/// characters, and why. `Raised` is a parser that raised instead of answering, and `Abandoned` one
+/// the clock stopped (`W0612`). A `const` definition is `Accepted` once its value is kept,
+/// `RaisedAt` where its raise has a place in the program, and `Oversize`, with the bytes its value's
+/// encoding takes, where those are past `const_room`.
 pub type Verdict =
   | Accepted
   | Rejected({ part: Int, offset: Int, message: String })
   | Raised(String)
-  | Spent
+  | Abandoned
   | Oversize(Int)
   | RaisedAt({ message: String, module: Int, start: Int, end: Int })
 
@@ -219,29 +217,31 @@ fn refusal(
           [ran(site), b"a parser answers `Err` of a text it refuses, saying where and why"],
         ),
       ),
-    Spent ->
+    Abandoned ->
       Some(
         error_at(
           b"E0154",
           site.module,
           site.span,
-          Bytes::concat_all([
-            spelled(site),
-            b" did not answer this literal within ",
-            Bytes::of_string(step_budget().to_string()),
-            b" calls",
-          ]),
+          Bytes::concat_all([spelled(site), b" did not finish this literal in time"]),
           b"its parser gave no answer",
-          [ran(site), b"that is the budget a check gives each literal"],
+          [ran(site), time_given(b"a check gives each literal's parser")],
         ),
       ),
   }
 
+/// The note that `whose` gives what it enters `const_timeout_ms` of wall clock.
+fn time_given(whose: Bytes) -> Bytes =
+  Bytes::concat_all([
+    whose,
+    b" ",
+    Bytes::of_string(const_timeout_ms().to_string()),
+    b" ms of wall clock, and stops it there",
+  ])
+
 fn asked_const(site: ConstSite) -> Asked = { callee: site.name, hash: site.hash, parts: [] }
 
 fn is_const(a: Asked) -> Bool = a.parts.len() == 0
-
-fn budget_of(a: Asked) -> Int = if is_const(a) { const_budget() } else { step_budget() }
 
 fn const_refused(
   site: ConstSite,
@@ -281,19 +281,11 @@ fn const_refusal(site: ConstSite, verdict: Verdict) -> Option<Diag> =
           label_at(r.module, span_between(r.start, r.end), false, b"raised here"),
         ]),
       ),
-    Spent ->
+    Abandoned ->
       Some(
-        const_refused(
-          site,
-          b"E0158",
-          Bytes::concat_all([
-            b"did not answer within ",
-            Bytes::of_string(const_budget().to_string()),
-            b" calls",
-          ]),
-          [],
-          [b"that is the budget a build gives each `const fn`"],
-        ),
+        const_refused(site, b"E0158", b"did not finish in time", [], [
+          time_given(b"a build gives each `const fn`"),
+        ]),
       ),
     Oversize(n) ->
       Some(
@@ -380,7 +372,8 @@ fn verdict_of(called: Called) -> Verdict / {abort.raise} =
   match called.answer {
     Err(raised) -> {
       let diag = shown(raised);
-      if diag.code == b"E0503" { Spent } else { Raised(String::of_bytes_lossy(diag.message)) }
+      if machine::is_abandoned(diag.code) { Abandoned }
+      else { Raised(String::of_bytes_lossy(diag.message)) }
     },
     Ok(value) -> match value {
       VCtor(name, args) -> if name == "Ok" { Accepted } else {
@@ -413,7 +406,7 @@ fn value_of(called: Called) -> Judged / {abort.raise} =
       let message = String::of_bytes_lossy(diag.message);
       let placed = diag.labels.filter(|l: Label| l.primary && l.module != no_module());
       {
-        verdict: if diag.code == b"E0503" { Spent } else {
+        verdict: if machine::is_abandoned(diag.code) { Abandoned } else {
           match placed.at(0) {
             Some(l) -> RaisedAt({ message: message, module: l.module, start: l.start, end: l.end }),
             None -> Raised(message),
@@ -445,14 +438,13 @@ fn callees(asked: List<Asked>) -> List<Bytes> =
 /// the encoding of its value.
 type Judged = { verdict: Verdict, value: Option<Bytes> }
 
-/// `asked` entered on a unit of the definitions they reach, each call under `steps` and bound to no
-/// host. A parser is handed its texts; a `const` definition is entered through its stored root,
-/// which hands back its value's encoding.
+/// `asked` entered on a unit of the definitions they reach, each call as a check enters one
+/// (`machine::evaluation_run`). A parser is handed its texts; a `const` definition is entered
+/// through its stored root, which hands back its value's encoding.
 fn entered(
   front: LoadedAnalysis,
   frame: Frame,
   asked: List<Asked>,
-  steps: Int,
 ) -> Result<List<Judged>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} =
   if asked.len() == 0 { Ok([]) } else {
     let names = callees(asked);
@@ -467,9 +459,14 @@ fn entered(
         Err(why) -> Err([machine::unloaded(why)]),
         Ok(opened) -> {
           let roots = machine::roots_of(front.dump);
-          let run = { ..entering::unbounded(machine::max_calls()), steps: steps };
           let call = |name: Bytes, args: List<Value>|
-            machine::called(opened.unit, roots, String::of_bytes_lossy(name), args, run);
+            machine::called(
+              opened.unit,
+              roots,
+              String::of_bytes_lossy(name),
+              args,
+              machine::evaluation_run(),
+            );
           let answered = asked.map(|a: Asked|
             if is_const(a) { value_of(call(stored_root(a.callee), [])) }
             else { { verdict: verdict_of(call(a.callee, [handed(a)])), value: None } });
@@ -480,16 +477,15 @@ fn entered(
     }
   }
 
-/// What a verdict is a function of: the toolchain that entered the definition, the budget, the
-/// definition by the hash of all it reaches, and the texts.
+/// What a verdict is a function of: the toolchain that entered the definition, the definition by
+/// the hash of all it reaches, and the texts.
 fn verdict_key(toolchain: Bytes, a: Asked) -> Bytes / {abort.raise} =
   hex(
     blake3(
       Bytes::concat_all([
-        sized(b"ply literal verdict 2"),
+        sized(b"ply literal verdict 3"),
         sized(hex(bin::shape_digest(verdict_bin()))),
         sized(toolchain),
-        sized(Bytes::of_string(budget_of(a).to_string())),
         sized(a.hash),
         sized(Bytes::of_string(a.parts.len().to_string())),
         Bytes::concat_all(a.parts.map(sized)),
@@ -520,8 +516,8 @@ fn judging_roots() -> List<Bytes> = compiler_roots().push(b"literals.settling")
 type Sought = { asked: Asked, key: Bytes, value: Bytes, kept: Option<Verdict> }
 
 /// `body` with every verdict it asks for read from the toolchain's cache, and the definitions of the
-/// rest entered once and their verdicts kept there, a `const` definition's value beside its own:
-/// the parsers on one machine and the `const` definitions on another, each under its budget.
+/// rest entered once, on one machine, and their verdicts kept there, a `const` definition's value
+/// beside its own.
 pub fn settling<a | e>(
   body: () -> a / {literal.verdicts, literal.statements | e},
 ) -> a / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, toolchain.bodies, shipped.version, fs.read[abs], fs.write[abs], abort.raise | e} =
@@ -581,79 +577,56 @@ pub fn settling<a | e>(
 fn literals_store(bodies: String, toolchain: Bytes) -> String / {abort.raise} =
   bodies ++ "/literals-" ++ blake3(toolchain).slice(0, 8).hex_of()
 
-/// The verdicts `sought` holds, `open` among them entered on machines loaded over `view`, and what
-/// they answered kept: each verdict in the store of verdicts, each value beside the emitter's
-/// answers.
+/// The verdicts `sought` holds, `open` among them entered on a machine loaded over `view`, and what
+/// they answered kept: each `cacheable` verdict in the store of verdicts, each value beside the
+/// emitter's answers.
 fn verdicts_entered(
   timed: Timed,
   view: View,
   sought: List<Sought>,
   open: List<Sought>,
 ) -> Result<List<Verdict>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, kept_records.put[ans], kept_records.put[lit], abort.raise} = {
-  let front = front_of(
-    timed,
-    view,
-    Some(entering(view.frame, callees(open.map(|s: Sought| s.asked)))),
-  );
-  let parsers = open.filter(|s: Sought| !is_const(s.asked));
-  let consts = open.filter(|s: Sought| is_const(s.asked));
-  let over = |some: List<Sought>, steps: Int|
-    entered(front, view.frame, some.map(|s: Sought| s.asked), steps);
-  match over(parsers, step_budget()) {
+  let asked = open.map(|s: Sought| s.asked);
+  let front = front_of(timed, view, Some(entering(view.frame, callees(asked))));
+  match entered(front, view.frame, asked) {
     Err(diags) -> Err(diags),
-    Ok(parsed) -> match over(consts, const_budget()) {
-      Err(diags) -> Err(diags),
-      Ok(evaluated) -> {
-        let judged = parsed.concat(evaluated);
-        let entries = parsers.concat(consts);
-        let kept = range(0, entries.len()).fold(
-          { values: [], verdicts: [] },
-          |acc: { values: List<Record>, verdicts: List<Record> }, i: Int|
-            match judged.at(i) {
-              None -> acc,
-              Some(j) -> {
-                let s = entries.get(i);
-                let values = match j.value {
+    Ok(judged) -> {
+      let records = range(0, open.len()).fold(
+        { values: [], verdicts: [] },
+        |acc: { values: List<Record>, verdicts: List<Record> }, i: Int|
+          match judged.at(i) {
+            None -> acc,
+            Some(j) -> {
+              let s = open.get(i);
+              {
+                values: match j.value {
                   Some(bytes) -> acc.values.push({ key: s.value, bytes: bytes }),
                   None -> acc.values,
-                };
-                // A place is this load's, which an edit elsewhere moves under the same hash.
-                match j.verdict {
-                  RaisedAt(_) -> { values: values, verdicts: acc.verdicts },
-                  v ->
-                    {
-                      values: values,
-                      verdicts: acc.verdicts.push({
-                        key: s.key,
-                        bytes: bin::encode(v, verdict_bin()),
-                      }),
-                    },
-                }
-              },
+                },
+                verdicts: if cacheable(j.verdict) {
+                  acc.verdicts.push({ key: s.key, bytes: bin::encode(j.verdict, verdict_bin()) })
+                } else { acc.verdicts },
+              }
             },
-        );
-        kept_records.put[ans](kept.values);
-        kept_records.put[lit](kept.verdicts);
-        Ok(
-          settled(
-            sought,
-            open.map(|s: Sought|
-              range(0, entries.len()).fold(Spent, |found: Verdict, i: Int|
-                if entries.get(i).key == s.key {
-                  match judged.at(i) { Some(j) -> j.verdict, None -> found }
-                } else { found })),
-          ),
-        )
-      },
+          },
+      );
+      kept_records.put[ans](records.values);
+      kept_records.put[lit](records.verdicts);
+      Ok(settled(sought, judged.map(|j: Judged| j.verdict)))
     },
   }
 }
+
+/// Whether a verdict is a function of the definition and its texts alone, which the cache may keep:
+/// a raise's place is this load's, which an edit elsewhere moves under the same hash, and the clock
+/// is this machine's.
+fn cacheable(v: Verdict) -> Bool = match v { RaisedAt(_) -> false, Abandoned -> false, _ -> true }
 
 /// A statement asked after, the key its judgement is kept under, and the judgement kept there.
 type Keyed = { asked: statements::Asked, key: Bytes, kept: Option<Judgement> }
 
 /// Each statement's judgement: the one kept for it, or the one the statements not kept were judged
-/// to, in their order.
+/// to, in their order. One the clock stopped is `Unjudged`, and is not kept.
 fn judgements(
   toolchain: Bytes,
   timed: Timed,
@@ -661,7 +634,7 @@ fn judgements(
   asked: List<statements::Asked>,
 ) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, kept_records.get[lit], kept_records.put[lit], abort.raise} = {
   let keyed = asked.map(|a: statements::Asked| {
-    let key = judgement_key(toolchain, step_budget(), a);
+    let key = judgement_key(toolchain, a);
     {
       asked: a,
       key: key,
@@ -683,7 +656,6 @@ fn judgements(
           judged(
             |within: Within| front_of(timed, view, Some(within)),
             frame,
-            step_budget(),
             open.map(|k: Keyed| k.asked),
           ),
       } {
@@ -692,8 +664,9 @@ fn judgements(
         kept_records.put[lit](
           range(0, open.len()).fold([], |acc: List<Record>, i: Int|
             match found.at(i) {
-              Some(j) -> acc.push({ key: open.get(i).key, bytes: bin::encode(j, judgement_bin()) }),
-              None -> acc,
+              Some(Some(j)) ->
+                acc.push({ key: open.get(i).key, bytes: bin::encode(j, judgement_bin()) }),
+              _ -> acc,
             }),
         );
         Ok(
@@ -704,7 +677,10 @@ fn judgements(
                 Some(j) -> { out: acc.out.push(j), next: acc.next },
                 None ->
                   {
-                    out: acc.out.push(match found.at(acc.next) { Some(j) -> j, None -> Unjudged }),
+                    out: acc.out.push(match found.at(acc.next) {
+                      Some(Some(j)) -> j,
+                      _ -> Unjudged,
+                    }),
                     next: acc.next + 1,
                   },
               },
@@ -759,8 +735,15 @@ test "a character of a literal's text is placed where its source spells it" {
   assert_eq(spelled_at(braced, all, 3), Some(span_between(9, 10)))
 }
 
-test "a parser's answer is read as its verdict, and a spent budget is told from a raise" {
+test "a parser's answer is read as its verdict, and the clock stopping it is told from a raise" {
   let answered = |v: Value| verdict_of({ answer: Ok(v), warnings: [] });
+  let failed = |code: String|
+    verdict_of({
+      answer: Err({ diag: diag_of("error", code, "m", [], []), values: [] }),
+      warnings: [],
+    });
+  assert_eq(failed("W0612"), Abandoned);
+  assert_eq(failed("E0502"), Raised("m"));
   assert_eq(answered(VCtor("Ok", [VInt(1)])), Accepted);
   assert_eq(
     answered(
@@ -805,7 +788,7 @@ test "a refused literal is placed inside its text, and one past it at the whole 
     labelled(Rejected({ part: 0, offset: 40, message: "too short" })),
     Some({ code: b"E0153", start: 3, end: 8 }),
   );
-  assert_eq(labelled(Spent), Some({ code: b"E0154", start: 0, end: 8 }));
+  assert_eq(labelled(Abandoned), Some({ code: b"E0154", start: 0, end: 8 }));
   assert_eq(labelled(Raised("boom")), Some({ code: b"E0154", start: 0, end: 8 }))
 }
 
@@ -843,7 +826,15 @@ test "verdicts kept come back in the order they were sought, the rest from what 
     { asked: a, key: b"2", value: b"", kept: Some(Accepted) },
     { asked: a, key: b"3", value: b"", kept: None },
   ];
-  assert_eq(settled(sought, [Spent, Raised("x")]), [Spent, Accepted, Raised("x")])
+  assert_eq(settled(sought, [Abandoned, Raised("x")]), [Abandoned, Accepted, Raised("x")])
+}
+
+test "a verdict the clock decided, or one placed in this load, is never kept" {
+  assert(!cacheable(Abandoned));
+  assert(!cacheable(RaisedAt({ message: "m", module: 0, start: 1, end: 2 })));
+  assert(cacheable(Raised("m")));
+  assert(cacheable(Rejected({ part: 0, offset: 1, message: "m" })));
+  assert(cacheable(Accepted))
 }
 
 test "a `const` definition's answer is its value's encoding, kept only where a build has room" {
@@ -866,15 +857,14 @@ test "a `const` definition's answer is its value's encoding, kept only where a b
     match placed { Some(d) -> d.labels.map(|l: Label| (l.module, l.start, l.primary)), None -> [] },
     [(0, 9, true), (1, 3, false)],
   );
-  assert_eq(refused(Spent), Some({ code: b"E0158", start: 9, end: 14 }));
+  assert_eq(refused(Abandoned), Some({ code: b"E0158", start: 9, end: 14 }));
   assert_eq(refused(Oversize(const_room() + 1)), Some({ code: b"E0158", start: 9, end: 14 }))
 }
 
-test "a `const` definition is asked with no text, under its own budget" {
+test "a `const` definition is asked with no text" {
   let a = asked_const({ module: 0, span: span_between(0, 1), name: b"m.table", hash: b"h" });
   assert(is_const(a));
-  assert_eq(budget_of(a), const_budget());
-  assert_eq(budget_of({ ..a, parts: [b"x"] }), step_budget());
+  assert(!is_const({ ..a, parts: [b"x"] }));
   assert(verdict_key(b"t", a) != verdict_key(b"t", { ..a, hash: b"g" }))
 }
 

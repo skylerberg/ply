@@ -31,7 +31,7 @@ pub use host::{
     Determinism, HostBinding, HostRuntime, HostUse, Linearity, Pending, RuntimeFactory,
     ShutdownReport,
 };
-pub use limit::{DEFAULT_MAX_CALLS, DEFAULT_STEP_BUDGET};
+pub use limit::DEFAULT_MAX_CALLS;
 pub use rc::RcStats;
 pub use rust_decimal::Decimal;
 pub use sim::{Seed, SimId, TaskId};

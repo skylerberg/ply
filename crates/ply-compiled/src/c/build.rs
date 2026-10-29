@@ -145,10 +145,6 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
     let tables = Tables {
         fields,
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
-        memo_costs: functions
-            .iter()
-            .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
-            .collect(),
         functions,
         immortals: std::sync::Mutex::new(Heap::persistent()),
         roots,

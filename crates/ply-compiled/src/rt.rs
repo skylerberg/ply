@@ -10,7 +10,7 @@ use ply_core::{Diagnostic, EffectAtom, Mode, Resource, Span, Symbol, codes};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 mod budget;

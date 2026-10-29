@@ -3,9 +3,10 @@
 //! call that runs it, to the row type a derived codec reads its rows into, and to the schema its
 //! module declares or imports: a `const fn` whose type is `std.sql.Schema`. The statements and the
 //! schema are computed on a machine of their own, as a literal's parser is, and what the check
-//! found is kept in the toolchain's cache under the hashes of all they reach. A codec's fields are
-//! read from the type `derive sql` wrote it for, as `std.derive.codec` reads them, since a value that
-//! holds functions does not cross back from the machine.
+//! found is kept in the toolchain's cache under the hashes of all they reach, unless the clock
+//! stopped a call it needed. A codec's fields are read from the type `derive sql` wrote it for, as
+//! `std.derive.codec` reads them, since a value that holds functions does not cross back from the
+//! machine.
 
 import compiler.front.facts (Frame, StatementSite, Argument, AText, ACall, ARow, ATagged, AList,
                              ACtor, AOther, statement_modules, RowField, RowRead, RScalar,
@@ -274,17 +275,16 @@ fn operation_text(o: Operation) -> Bytes =
 
 fn kind_key(k: sql::FieldKind) -> Bytes = Bytes::of_string(sql::field_text(k))
 
-/// What a judgement is a function of: the toolchain that judged it, the budget, the schema by the
-/// hash of all it reaches, and the statement asked after, each definition it is computed by under
-/// the hash of all that reaches.
-pub fn judgement_key(toolchain: Bytes, budget: Int, a: Asked) -> Bytes / {abort.raise} =
+/// What a judgement is a function of: the toolchain that judged it, the schema by the hash of all it
+/// reaches, and the statement asked after, each definition it is computed by under the hash of all
+/// that reaches.
+pub fn judgement_key(toolchain: Bytes, a: Asked) -> Bytes / {abort.raise} =
   hex(
     blake3(
       Bytes::concat_all([
-        sized(b"ply statement judgement 2"),
+        sized(b"ply statement judgement 3"),
         sized(hex(bin::shape_digest(judgement_bin()))),
         sized(toolchain),
-        sized(ascii_of_int(budget)),
         sized(match a.schema { Some(s) -> s.hash, None -> b"" }),
         sized(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
         sized(operation_text(a.operation)),
@@ -327,59 +327,71 @@ fn callees_in(a: Argument, acc: List<Bytes>, left: Int) -> List<Bytes> =
     }
   }
 
-/// The value of `a`, each definition it is computed by entered with `call`; `None` where it is not
-/// one a check can compute, or its computing raised.
+/// What computing an argument came to: its value; `Unknown` where a check cannot compute it or its
+/// computing raised; or `Stopped` where the clock stopped a call it needs, which says nothing of the
+/// program.
+type Computed = | Known(Value) | Unknown | Stopped
+
+/// The value of `a`, each definition it is computed by entered with `call`.
 fn computed_value(
   a: Argument,
   left: Int,
   call: (String, List<Value>) -> Called / {entering::machine.enter, abort.raise},
-) -> Option<Value> / {entering::machine.enter, abort.raise} =
-  if left <= 0 { None } else {
+) -> Computed / {entering::machine.enter, abort.raise} =
+  if left <= 0 { Unknown } else {
     match a {
-      AText(b) -> Some(VStr(String::of_bytes_lossy(b))),
+      AText(b) -> Known(VStr(String::of_bytes_lossy(b))),
       AList(items) -> match all_computed(items, left - 1, call) {
-        Some(vs) -> Some(VList(vs)),
-        None -> None,
+        Ok(vs) -> Known(VList(vs)),
+        Err(c) -> c,
       },
       ACall(c) -> match all_computed(c.args, left - 1, call) {
-        None -> None,
-        Some(args) -> answer_of(call(String::of_bytes_lossy(c.callee), args)),
+        Err(e) -> e,
+        Ok(args) -> computed_of(call(String::of_bytes_lossy(c.callee), args)),
       },
       ATagged(t) -> {
         let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
         let handed = match texts { [one] -> one, _ -> VList(texts) };
-        match answer_of(call(String::of_bytes_lossy(t.callee), [handed])) {
-          Some(VCtor(name, [v])) -> if ctor_name(name) == "Ok" { Some(v) } else { None },
-          _ -> None,
+        match computed_of(call(String::of_bytes_lossy(t.callee), [handed])) {
+          Known(VCtor(name, [v])) -> if ctor_name(name) == "Ok" { Known(v) } else { Unknown },
+          Stopped -> Stopped,
+          _ -> Unknown,
         }
       },
-      _ -> None,
+      _ -> Unknown,
     }
   }
 
+/// The values of `xs`, or what the first with none came to.
 fn all_computed(
   xs: List<Argument>,
   left: Int,
   call: (String, List<Value>) -> Called / {entering::machine.enter, abort.raise},
-) -> Option<List<Value>> / {entering::machine.enter, abort.raise} =
-  xs.fold(Some([]), |acc: Option<List<Value>>, x: Argument|
+) -> Result<List<Value>, Computed> / {entering::machine.enter, abort.raise} =
+  xs.fold(Ok([]), |acc: Result<List<Value>, Computed>, x: Argument|
     match acc {
-      None -> None,
-      Some(vs) -> match computed_value(x, left, call) { Some(v) -> Some(vs.push(v)), None -> None },
+      Err(_) -> acc,
+      Ok(vs) -> match computed_value(x, left, call) {
+        Known(v) -> Ok(vs.push(v)),
+        other -> Err(other),
+      },
     })
 
-fn answer_of(called: Called) -> Option<Value> =
-  match called.answer { Ok(v) -> Some(v), Err(_) -> None }
+fn computed_of(called: Called) -> Computed =
+  match called.answer {
+    Ok(v) -> Known(v),
+    Err(raised) -> if machine::is_abandoned(raised.diag.code) { Stopped } else { Unknown },
+  }
 
-/// Each statement of `asked` judged on a unit of what they reach alone, bound to no host, each
-/// definition they are computed by called under `steps`, and each schema they are held to entered
-/// once. `hand` answers the dump their unit is emitted over, given what it enters.
+/// Each statement of `asked` judged on a unit of what they reach alone, each definition they are
+/// computed by called as a check enters one (`machine::evaluation_run`), and each schema they are
+/// held to entered once: none for one the clock stopped a call of, which says nothing of the
+/// program. `hand` answers the dump their unit is emitted over, given what it enters.
 pub fn judged(
   hand: (Within) -> LoadedAnalysis / {abort.raise},
   frame: Frame,
-  steps: Int,
   asked: List<Asked>,
-) -> Result<List<Judgement>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
+) -> Result<List<Option<Judgement>>, List<Diag>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
   let schemas = asked.fold([], |acc: List<Bytes>, a: Asked|
     match a.schema {
       Some(s) -> if acc.contains(s.name) { acc } else { acc.push(s.name) },
@@ -387,7 +399,7 @@ pub fn judged(
     });
   let named = asked.fold(schemas, |acc: List<Bytes>, a: Asked| callees_in(a.statement, acc, 64));
   if named.len() == 0 {
-    Ok(asked.map(|a: Asked| judgement_of(None, a, computed_text(a.statement))))
+    Ok(asked.map(|a: Asked| Some(judgement_of(None, a, computed_text(a.statement)))))
   } else {
     let reached = reach(frame.hashes, named.map(|n: Bytes| TheFn(n))).fns;
     let front = hand({ owners: reached, tests: Map::new() });
@@ -404,20 +416,26 @@ pub fn judged(
         Err(why) -> Err([machine::unloaded(why)]),
         Ok(opened) -> {
           let roots = machine::roots_of(front.dump);
-          let run = { ..entering::unbounded(machine::max_calls()), steps: steps };
           let call = |name: String, args: List<Value>|
-            machine::called(opened.unit, roots, name, args, run);
-          let declared = schemas.fold(Map::new(), |acc: Map<Bytes, sql::Schema>, name: Bytes|
-            match answer_of(call(String::of_bytes_lossy(name), [])) {
-              Some(v) -> match schema_of(v) { Some(s) -> acc.insert(name, s), None -> acc },
-              None -> acc,
-            });
-          let judged = asked.map(|a: Asked|
-            judgement_of(
-              match a.schema { Some(s) -> declared.get(s.name), None -> None },
-              a,
-              computed_value(a.statement, 64, call),
-            ));
+            machine::called(opened.unit, roots, name, args, machine::evaluation_run());
+          let declared = schemas.fold(Map::new(), |acc: Map<Bytes, Computed>, name: Bytes|
+            acc.insert(name, computed_of(call(String::of_bytes_lossy(name), []))));
+          let judged = asked.map(|a: Asked| {
+            match match a.schema { Some(s) -> declared.get(s.name), None -> None } {
+              Some(Stopped) -> None,
+              held -> match computed_value(a.statement, 64, call) {
+                Stopped -> None,
+                value ->
+                  Some(
+                    judgement_of(
+                      match held { Some(Known(v)) -> schema_of(v), _ -> None },
+                      a,
+                      match value { Known(v) -> Some(v), _ -> None },
+                    ),
+                  ),
+              },
+            }
+          });
           entering::machine.close(opened.unit);
           Ok(judged)
         },

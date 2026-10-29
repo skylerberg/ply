@@ -76,7 +76,7 @@ pg=$(postgres_bin)
 # What a run of the CLI's suite is given: the `ply` its tests start and the programs they start beside
 # it, a postgres where there is one, its scratch directory and the filesystem, the repository, and
 # every family a command enters a program with, since its tests run the commands in this process.
-cli_grants=(--timeout 900000 --steps 0 --json
+cli_grants=(--timeout 900000 --json
   --exec "ply=$ply" --exec sh=/bin/sh --exec "git=$(command -v git)"
   ${pg:+--exec "initdb=$pg/initdb" --exec "postgres=$pg/postgres" --exec "psql=$pg/psql"}
   --fs cwd=. --fs abs=/ --fs "repo=$root"

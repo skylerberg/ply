@@ -2,6 +2,7 @@ use crate::units;
 use ply_compiled::rt::{STACK_MARGIN, switch_keeping};
 use ply_compiled::stack::{CHUNK, RESERVE, Stack, switch};
 use std::cell::RefCell;
+use std::sync::atomic::Ordering::Relaxed;
 
 struct Pong {
     main: usize,
@@ -281,12 +282,12 @@ extern "C" fn grow_then_stop(arg: usize) {
     let g = arg as *mut Grows;
     unsafe {
         let task = &*(*g).task;
-        (*(*g).ctx).stack_floor = task.enter();
+        (*(*g).ctx).stack_floor.store(task.enter(), Relaxed);
         if task.extend() {
-            (*(*g).ctx).stack_floor = task.floor();
+            (*(*g).ctx).stack_floor.store(task.floor(), Relaxed);
         }
         switch_keeping((*g).ctx, &raw mut (*g).sp, (*g).main);
-        (*g).floor_when_resumed = (*(*g).ctx).stack_floor;
+        (*g).floor_when_resumed = (*(*g).ctx).stack_floor.load(Relaxed);
         let mut spent = 0;
         switch(&mut spent, (*g).main);
     }
@@ -317,10 +318,12 @@ fn a_task_that_grew_resumes_under_its_own_floor() {
         let first = task.prepare(grow_then_stop, g as usize);
         switch_keeping((*g).ctx, &raw mut (*g).main, first);
         assert!(
-            !task.holds((*(*g).ctx).stack_floor),
+            !task.holds((*(*g).ctx).stack_floor.load(Relaxed)),
             "the stack the task stopped to kept its floor"
         );
-        (*(*g).ctx).stack_floor = task.top() - CHUNK + STACK_MARGIN;
+        (*(*g).ctx)
+            .stack_floor
+            .store(task.top() - CHUNK + STACK_MARGIN, Relaxed);
         switch_keeping((*g).ctx, &raw mut (*g).main, (*g).sp);
         assert!(
             task.floor() < task.top() - CHUNK + STACK_MARGIN,

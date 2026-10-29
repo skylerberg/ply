@@ -426,7 +426,8 @@ extern "C" fn task_entry(arg: usize) {
         let slot = r.slots.get_mut(&id).expect("a starting task has its slot");
         let c = unsafe { &mut *r.ctx };
         let own = slot.stack.as_ref().expect("a task starts on its own stack");
-        c.stack_floor = unsafe { own.enter() };
+        c.stack_floor
+            .store(unsafe { own.enter() }, Ordering::Relaxed);
         c.frames = std::ptr::null_mut();
         c.fuel = r.fuel;
         if let Some(n) = slot.runs_as {

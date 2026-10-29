@@ -229,9 +229,8 @@ pub struct Heap {
     /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither these
     /// counts nor the program's live blocks count them.
     pub(crate) scheduling: bool,
-    /// Blocks the program allocated since the last reset, and the bytes they took.
+    /// Blocks the program allocated since the last reset.
     count: usize,
-    bytes: usize,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
     poison: bool,
@@ -457,7 +456,6 @@ impl Heap {
             persistent: false,
             scheduling: false,
             count: 0,
-            bytes: 0,
             delayed: std::collections::VecDeque::new(),
             poison: poisoning(),
             delay: delay(),
@@ -473,7 +471,6 @@ impl Heap {
         }
         self.delayed.extend(other.delayed.drain(..));
         self.count += other.count;
-        self.bytes += other.bytes;
     }
 
     /// `blocks` in place of the blocks this heap takes from, which it answers.
@@ -513,12 +510,6 @@ impl Heap {
     /// Blocks allocated since the last reset.
     pub fn allocated(&self) -> usize {
         self.count
-    }
-
-    /// The bytes the blocks allocated since the last reset took, headers included: what an update
-    /// that copies spends and one in place does not.
-    pub fn allocated_bytes(&self) -> usize {
-        self.bytes
     }
 
     /// How many live blocks the program made, the scheduler's own not among them.
@@ -579,7 +570,6 @@ impl Heap {
         };
         if !self.scheduling {
             self.count += 1;
-            self.bytes += size;
         }
         p
     }
@@ -604,7 +594,6 @@ impl Heap {
         self.drop_natives();
         self.blocks.reset();
         self.count = 0;
-        self.bytes = 0;
         self.delayed.clear();
     }
 }
