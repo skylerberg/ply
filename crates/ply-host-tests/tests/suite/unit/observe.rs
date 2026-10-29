@@ -79,6 +79,21 @@ fn a_run_is_traced_by_what_it_read_under_the_root_that_holds_it() {
 }
 
 #[test]
+fn a_listing_moves_when_a_name_comes_to_name_something_else() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/a"), b"one").unwrap();
+    let roots = rooted(dir.path());
+    let recorder = Recorder::default();
+    recorder.read(Read::Dir, &dir.path().join("src"));
+    let trace = observe::finished(&recorder, &world(&roots, "b"), false).unwrap();
+    assert!(stands(&trace, &world(&roots, "b")));
+    std::fs::remove_file(dir.path().join("src/a")).unwrap();
+    std::fs::create_dir(dir.path().join("src/a")).unwrap();
+    assert!(moved(&trace, &world(&roots, "b")));
+}
+
+#[test]
 fn a_directory_the_test_wrote_into_is_read_without_what_it_wrote() {
     let dir = tempfile::tempdir().unwrap();
     let pkg = dir.path().join("pkg");

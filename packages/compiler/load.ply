@@ -43,8 +43,8 @@ import compiler.store.kept (Record)
 import compiler.check.infer.definitions (program_natives)
 import std.hash (blake3)
 import std.fs
-import std.fs (fs, File, Dir, Missing, Symlink)
-import std.path (is_absolute, join, normalize, parent)
+import std.fs (fs, Listed, File, Dir, Missing, Symlink)
+import std.path (extension, is_absolute, join, normalize, parent)
 import std.list
 import std.prelude_source
 import compiler.syntax.parsing (no_module, dummy_span)
@@ -92,29 +92,47 @@ fn nowhere(message: String) -> Diag =
 /// level adds at least two, so a deeper directory could not be listed anyway.
 fn walk_room() -> Int = 2048
 
-/// Every `.ply` file below `dir`, by its path below it: keyed, so a walk reads them in path order as
-/// `ply` reads a project. A symlink is not followed, and a directory that holds a `ply.pkg` is a
-/// package of its own, none of whose files are this one's.
-fn below<[r]>(
+pub fn is_ply(name: String) -> Bool = extension(name) == Some("ply")
+
+/// What a walk of a directory found: each `.ply` file below it, and each directory and `.ply` file
+/// it could not read, in walk order and by the path below it, `""` being the directory itself.
+pub type Modules = { files: List<String>, unread: List<String> }
+
+/// Every `.ply` file below `dir`, never through a symlink nor into a directory `skipped` names.
+/// Where `own`, a directory below that holds a `ply.pkg` is a package of its own, none of whose files
+/// are this one's.
+pub fn modules_below<[r]>(dir: String, own: Bool) -> Modules / {fs.list_dir[r]} =
+  modules_in[r](dir, "", fs.list_dir[r](dir), { files: [], unread: [] }, walk_room(), own)
+
+/// What a walk of `dir` finds from the listing of its directory `under`.
+fn modules_in<[r]>(
   dir: String,
   under: String,
-  found: Map<String, Bool>,
+  listing: Option<List<Listed>>,
+  found: Modules,
   room: Int,
-) -> Map<String, Bool> / {fs.list_dir[r], fs.kind[r]} =
-  match fs.list_dir[r](joined(dir, under)) {
-    None -> found,
-    Some(names) ->
-      names.fold(found, |acc: Map<String, Bool>, name: String| {
-        let path = joined(under, name);
-        match fs.kind[r](joined(dir, path)) {
-          Dir -> if skipped(name) || room <= 0
-              || fs.kind[r](joined(dir, joined(path, "ply.pkg"))) != Missing { acc }
-          else { below[r](dir, path, acc, room - 1) },
-          File -> if name.ends_with(".ply") { acc.insert(path, true) } else { acc },
-          _ -> acc,
+  own: Bool,
+) -> Modules / {fs.list_dir[r]} =
+  match listing {
+    None -> { ..found, unread: found.unread.push(under) },
+    Some(listed) ->
+      listed.fold(found, |acc: Modules, l: Listed| {
+        let path = joined(under, l.name);
+        match l.kind {
+          File -> if is_ply(l.name) { { ..acc, files: acc.files.push(path) } } else { acc },
+          Dir -> if skipped(l.name) || room <= 0 { acc } else {
+            let inner = fs.list_dir[r](joined(dir, path));
+            if own && holds_package(inner) { acc }
+            else { modules_in[r](dir, path, inner, acc, room - 1, own) }
+          },
+          Symlink -> acc,
+          Missing -> if is_ply(l.name) { { ..acc, unread: acc.unread.push(path) } } else { acc },
         }
       }),
   }
+
+fn holds_package(listing: Option<List<Listed>>) -> Bool =
+  match listing { Some(listed) -> listed.any(|l: Listed| l.name == "ply.pkg"), None -> false }
 
 /// One package as it lies below its root: its manifest when it holds one, and its modules, each
 /// named by its path below the root.
@@ -122,8 +140,8 @@ pub type Package = { root: String, manifest: Option<Bytes>, files: List<SourceFi
 
 fn package_at<[r]>(
   root: String,
-) -> Result<Package, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], abort.raise} = {
-  let read = below[r](root, "", Map::new(), walk_room()).keys().fold(
+) -> Result<Package, List<Diag>> / {fs.list_dir[r], fs.read_file[r], abort.raise} = {
+  let read = modules_below[r](root, true).files.sort().fold(
     Ok([]),
     |acc: Result<List<SourceFile>, List<Diag>>, p: String|
       match acc {
@@ -164,7 +182,7 @@ fn unfetched(key: Bytes) -> Diag =
 /// they were read: what the front end judges the graph from.
 fn packages_of<[r]>(
   root: Package,
-) -> Result<List<Package>, List<Diag>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], abort.raise} =
+) -> Result<List<Package>, List<Diag>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
   iterate(Ok([]), 4096, |acc: Result<List<Package>, List<Diag>>|
     match acc {
       Err(e) -> Stop(Err(e)),
@@ -196,37 +214,44 @@ fn embed_target(file: String, path: String) -> String = normalize(join(parent(fi
 fn unread(target: String, what: String) -> BytesRead =
   Err(Bytes::of_string("`" ++ target ++ "` " ++ what))
 
-/// Every file under `dir`, by its path below it and in that order; nothing under a name starting
-/// with `.` is read.
-fn listed<[r]>(
+/// Where a walk of an embedded directory stopped: the path it could not go on from, and what was
+/// wrong there.
+pub type Unwalked = { path: String, why: String }
+
+/// Every file `embed_dir` reads under `dir`: by its path below `dir`, beside its path under the
+/// root, and in that order. Nothing under a name starting with `.` is read.
+pub fn embedded_below<[r]>(
+  dir: String,
+) -> Result<Map<String, String>, Unwalked> / {fs.list_dir[r]} =
+  embedded_in[r](dir, "", Map::new(), walk_room())
+
+fn embedded_in<[r]>(
   dir: String,
   under: String,
   found: Map<String, String>,
   room: Int,
-) -> Result<Map<String, String>, Bytes> / {fs.list_dir[r], fs.kind[r]} =
+) -> Result<Map<String, String>, Unwalked> / {fs.list_dir[r]} =
   match fs.list_dir[r](joined(dir, under)) {
-    None -> Err(Bytes::of_string("`" ++ joined(dir, under) ++ "` could not be listed")),
-    Some(names) ->
-      names.fold(Ok(found), |acc: Result<Map<String, String>, Bytes>, n: String|
+    None -> Err({ path: joined(dir, under), why: "could not be listed" }),
+    Some(entries) ->
+      entries.fold(Ok(found), |acc: Result<Map<String, String>, Unwalked>, l: Listed|
         match acc {
           Err(_) -> acc,
-          Ok(m) -> if n.starts_with(".") { acc } else {
-            let path = joined(under, n);
-            match fs.kind[r](joined(dir, path)) {
+          Ok(m) -> if l.name.starts_with(".") { acc } else {
+            let path = joined(under, l.name);
+            match l.kind {
               Dir -> if room <= 0 {
-                Err(
-                  Bytes::of_string("`" ++ joined(dir, path) ++ "` is deeper than a path can name"),
-                )
-              } else { listed[r](dir, path, m, room - 1) },
+                Err({ path: joined(dir, path), why: "is deeper than a path can name" })
+              } else { embedded_in[r](dir, path, m, room - 1) },
               _ -> Ok(m.insert(path, joined(dir, path))),
             }
           },
         }),
   }
 
-fn read_dir<[r]>(dir: String) -> BytesRead / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
-  match listed[r](dir, "", Map::new(), walk_room()) {
-    Err(why) -> Err(why),
+fn read_dir<[r]>(dir: String) -> BytesRead / {fs.list_dir[r], fs.read_file[r]} =
+  match embedded_below[r](dir) {
+    Err(stopped) -> unread(stopped.path, stopped.why),
     Ok(found) ->
       found.fold(Ok([]), |acc: BytesRead, name: String, path: String|
         match acc {
@@ -324,7 +349,7 @@ pub type Prepared = { own: Package, deps: List<Package>, pkgs: PackageSources }
 /// `ply` would have to fetch are each a refusal.
 pub fn prepared<[r]>(
   root: String,
-) -> Result<Prepared, Unloaded> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], abort.raise} =
+) -> Result<Prepared, Unloaded> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
   match package_at[r](root) {
     Err(diags) -> Err(unloaded(diags)),
     Ok(own) -> if own.files.len() == 0 {

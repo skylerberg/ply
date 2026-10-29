@@ -41,7 +41,7 @@ const OWN: char = '\u{1f}';
 pub enum Read {
     /// The bytes, or that there are none.
     File,
-    /// The names in it, or that it is not a directory.
+    /// The names in it, each with what it is, or that it is not a directory.
     Dir,
     /// What is there: a file, a directory, a link, or nothing.
     Kind,
@@ -507,21 +507,18 @@ fn answered(how: Read, path: &Path, own: &[PathBuf]) -> String {
                 hasher.update(b"none");
             }
         },
-        Read::Dir => match std::fs::read_dir(path) {
-            Ok(entries) => {
-                let mut names: Vec<String> = entries
-                    .flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|name| name != STORE && !own.iter().any(|o| o == Path::new(name)))
-                    .collect();
-                names.sort();
-                hasher.update(b"names\0");
-                for name in names {
+        Read::Dir => match crate::fs::listed(path) {
+            Some(entries) => {
+                hasher.update(b"entries\0");
+                for (name, kind) in entries {
+                    if name == STORE || own.iter().any(|o| o == Path::new(&name)) {
+                        continue;
+                    }
                     hasher.update(name.as_bytes());
-                    hasher.update(&[0]);
+                    hasher.update(&[0, kind.number()]);
                 }
             }
-            Err(_) => {
+            None => {
                 hasher.update(b"none");
             }
         },
