@@ -18,6 +18,7 @@ import compiler.check.infer.checker (ReleaseSite, ReleaseAfter, ReleaseBefore, R
                                      ReleaseFailing)
 import std.list
 import std.bytes (hex_digit, ascii_of_int)
+import compiler.check.resolve.bindings (body_binders)
 import std.string
 
 /// One lowered node: what it is, and where its text stands.
@@ -362,27 +363,32 @@ fn dump_node(n: Node) -> Bytes / {abort.raise} =
 // Forward pass: every binding gets a slot and slot numbers never go back, so a window is sized by
 // bindings, not by how many are live at once.
 
-type Bind = { name: Bytes, slot: Int }
+/// What a slot holds: a local by the site of the name that binds it, or a value held for the node
+/// at a site; or a name the lowering gives a label parameter or a value of its own, which no
+/// program can spell.
+type SlotKey = | Bound(Int) | Own(Bytes)
+
+type Bind = { key: SlotKey, slot: Int }
 
 /// `names` is the barrier's window in order; `scope` is what is visible here, innermost last.
 type Frame = {
   names: List<Bytes>,
   scope: List<Bind>,
   captures: List<Capture>,
-  capture_names: List<Bytes>,
+  capture_keys: List<SlotKey>,
 }
 
-fn bind(frame: Frame, name: Bytes) -> Frame =
+/// `frame` with `key` held by a new slot, shown as `name`.
+fn bind(frame: Frame, key: SlotKey, name: Bytes) -> Frame =
   {
     names: frame.names.push(name),
-    scope: frame.scope.push({ name: name, slot: frame.names.len() }),
+    scope: frame.scope.push({ key: key, slot: frame.names.len() }),
     captures: frame.captures,
-    capture_names: frame.capture_names,
+    capture_keys: frame.capture_keys,
   }
 
-fn find(frame: Frame, name: Bytes) -> Option<Int> =
-  frame.scope.fold(None, |acc: Option<Int>, b: Bind|
-    if b.name == name { Some(b.slot) } else { acc })
+fn find(frame: Frame, key: SlotKey) -> Option<Int> =
+  frame.scope.fold(None, |acc: Option<Int>, b: Bind| if b.key == key { Some(b.slot) } else { acc })
 
 /// The barriers in scope, innermost last. A free name is threaded through every barrier between use and binding.
 type Stack = {
@@ -395,9 +401,8 @@ type Stack = {
   releases: Releases,
   /// Where each binder a release names put its name, by the binder's key.
   binders: Map<Int, Binder>,
-  /// The keys an or-pattern's first alternative gives its names, which the check names every
-  /// alternative's binders by.
-  rekey: Map<Bytes, Int>,
+  /// The binder of each local the body names, by the site of the name.
+  locals: Map<Int, Int>,
 }
 
 /// Where a body lets go of the resources it owns, as the check filed it, and the binder site of each
@@ -409,7 +414,7 @@ pub type Releasing = { sites: List<ReleaseSite>, params: List<Int> }
 type Releases = { at: Map<Int, List<ReleaseSite>>, held: Map<Int, Bool> }
 
 /// The barrier, by depth, and the slot a binder put its name in.
-type Binder = { name: Bytes, depth: Int, slot: Int }
+type Binder = { key: SlotKey, name: Bytes, depth: Int, slot: Int }
 
 fn releases_of(r: Releasing) -> Releases =
   r.sites.fold({ at: Map::new(), held: Map::new() }, |acc: Releases, x: ReleaseSite|
@@ -426,7 +431,7 @@ fn releases_of(r: Releasing) -> Releases =
 fn st_top(stack: Stack) -> Frame =
   match stack.frames.at(stack.frames.len() - 1) { Some(f) -> f, None -> empty_frame() }
 
-fn empty_frame() -> Frame = { names: [], scope: [], captures: [], capture_names: [] }
+fn empty_frame() -> Frame = { names: [], scope: [], captures: [], capture_keys: [] }
 
 fn st_at(stack: Stack, i: Int) -> Frame =
   match stack.frames.at(i) { Some(f) -> f, None -> empty_frame() }
@@ -444,37 +449,37 @@ fn st_push(stack: Stack, frame: Frame) -> Stack = { ..stack, frames: stack.frame
 fn st_pop(stack: Stack) -> Stack =
   { ..stack, frames: range(0, stack.frames.len() - 1).map(|j: Int| st_at(stack, j)) }
 
-/// The depth whose barrier has `name` in scope or already captures it, innermost first.
-fn st_depth(stack: Stack, name: Bytes) -> Option<Int> =
+/// The depth whose barrier has `key` in scope or already captures it, innermost first.
+fn st_depth(stack: Stack, key: SlotKey) -> Option<Int> =
   range(0, stack.frames.len()).fold(None, |acc: Option<Int>, i: Int| {
     let f = st_at(stack, i);
-    match find(f, name) {
+    match find(f, key) {
       Some(_) -> Some(i),
-      None -> match find_cap(f, name) { Some(_) -> Some(i), None -> acc },
+      None -> match find_cap(f, key) { Some(_) -> Some(i), None -> acc },
     }
   })
 
-fn slot_in(f: Frame, name: Bytes) -> Option<Int> =
-  match find(f, name) { Some(s) -> Some(s), None -> find_cap(f, name) }
+fn slot_in(f: Frame, key: SlotKey) -> Option<Int> =
+  match find(f, key) { Some(s) -> Some(s), None -> find_cap(f, key) }
 
 /// Resolves `name` at the innermost barrier, threading a capture through every barrier between when it is free.
 type SlotLookup = { slot: Option<Int>, stack: Stack }
 
-fn resolve(stack: Stack, name: Bytes) -> SlotLookup =
-  match st_depth(stack, name) {
+fn resolve(stack: Stack, key: SlotKey, name: Bytes) -> SlotLookup =
+  match st_depth(stack, key) {
     None -> { slot: None, stack: stack },
     Some(d) -> {
-      let start = match slot_in(st_at(stack, d), name) { Some(s) -> s, None -> 0 };
+      let start = match slot_in(st_at(stack, d), key) { Some(s) -> s, None -> 0 };
       range(d + 1, stack.frames.len()).fold(
         { slot: Some(start), stack: stack },
         |acc: SlotLookup, i: Int| {
           let f = st_at(acc.stack, i);
           let from = match acc.slot { Some(s) -> s, None -> 0 };
-          match find_cap(f, name) {
+          match find_cap(f, key) {
             Some(s) -> { slot: Some(s), stack: acc.stack },
             None -> {
-              let g = capture(f, name, from);
-              { slot: find_cap(g, name), stack: st_set(acc.stack, i, g) }
+              let g = capture(f, key, name, from);
+              { slot: find_cap(g, key), stack: st_set(acc.stack, i, g) }
             },
           }
         },
@@ -492,7 +497,7 @@ pub fn is_label_binder(name: Bytes) -> Bool = name.starts_with(b"[")
 fn label_code(stack: Stack, name: Bytes) -> Option<Lowered> =
   if !stack.labels.contains(name) { None } else {
     let binder = label_binder(name);
-    let r = resolve(stack, binder);
+    let r = resolve(stack, Own(binder), binder);
     Some({
       code: { span: dummy_span(), node: NVar({ name: binder, slot: r.slot }) },
       stack: r.stack,
@@ -515,17 +520,38 @@ fn label_args(stack: Stack, span: Span) -> Labels =
   )
 
 /// A block's binders leave scope at its end, but the slots they took are never reused.
-fn bind_st(stack: Stack, name: Bytes) -> Stack = st_top_set(stack, bind(st_top(stack), name))
+fn bind_st(stack: Stack, key: SlotKey, name: Bytes) -> Stack =
+  st_top_set(stack, bind(st_top(stack), key, name))
 
-/// `name` bound by the binder at `site`, which a release may name it by.
-fn bind_at(stack: Stack, name: Bytes, site: Int) -> Stack =
-  binder_noted(bind_st(stack, name), name, site, stack.frames.len() - 1, st_top(stack).names.len())
+/// The local `name` binds: its own site's, or an or-pattern's first alternative's.
+fn binder_site(stack: Stack, name: Ident) -> Int =
+  stack.locals.get(name.span.site).unwrap_or(name.span.site)
+
+/// The local `name` binds, held by a new slot, which a release may name it by.
+fn bind_at(stack: Stack, name: Ident) -> Stack = {
+  let site = binder_site(stack, name);
+  binder_noted(
+    bind_st(stack, Bound(site), name.name),
+    name.name,
+    site,
+    stack.frames.len() - 1,
+    st_top(stack).names.len(),
+  )
+}
 
 /// `stack` noting that the binder at `site` put `name` in slot `slot` of barrier `depth`, where a
 /// release names it.
 fn binder_noted(stack: Stack, name: Bytes, site: Int, depth: Int, slot: Int) -> Stack =
   if !stack.releases.held.contains(site) { stack } else {
-    { ..stack, binders: stack.binders.insert(site, { name: name, depth: depth, slot: slot }) }
+    {
+      ..stack,
+      binders: stack.binders.insert(site, {
+        key: Bound(site),
+        name: name,
+        depth: depth,
+        slot: slot,
+      }),
+    }
   }
 
 fn unscope(frame: Frame, to: Int) -> Frame =
@@ -533,29 +559,28 @@ fn unscope(frame: Frame, to: Int) -> Frame =
     names: frame.names,
     scope: take(frame.scope, to),
     captures: frame.captures,
-    capture_names: frame.capture_names,
+    capture_keys: frame.capture_keys,
   }
 
 fn unscope_st(stack: Stack, to: Int) -> Stack = st_top_set(stack, unscope(st_top(stack), to))
 
 fn depth_of(stack: Stack) -> Int = st_top(stack).scope.len()
 
-fn find_cap(frame: Frame, name: Bytes) -> Option<Int> =
-  range(0, frame.capture_names.len()).fold(None, |acc: Option<Int>, i: Int|
-    if frame.capture_names.at_or(i, b"") == name {
+fn find_cap(frame: Frame, key: SlotKey) -> Option<Int> =
+  range(0, frame.capture_keys.len()).fold(None, |acc: Option<Int>, i: Int|
+    if frame.capture_keys.at(i) == Some(key) {
       match frame.captures.at(i) { Some(c) -> Some(c.dst), None -> acc }
     } else { acc })
 
-fn capture(frame: Frame, name: Bytes, src: Int) -> Frame =
+fn capture(frame: Frame, key: SlotKey, name: Bytes, src: Int) -> Frame =
   {
     names: frame.names.push(name),
     scope: frame.scope,
     captures: frame.captures.push({ src: src, dst: frame.names.len() }),
-    capture_names: frame.capture_names.push(name),
+    capture_keys: frame.capture_keys.push(key),
   }
 
-fn take(xs: List<Bind>, n: Int) -> List<Bind> =
-  range(0, n).fold([], |acc: List<Bind>, i: Int| acc.push(xs.at_or(i, { name: b"", slot: 0 })))
+fn take(xs: List<Bind>, n: Int) -> List<Bind> = xs.take(n)
 
 // --- the lowering -----------------------------------------------------------
 
@@ -607,8 +632,17 @@ fn lower_node(e: Expr, stack: Stack) -> Lowered / {abort.raise} =
         },
       None -> {
         let name = x.name.name.name;
-        let r = resolve(stack, name);
-        { code: { span: expr_span(e), node: NVar({ name: name, slot: r.slot }) }, stack: r.stack }
+        match stack.locals.get(x.name.name.span.site) {
+          Some(b) -> {
+            let r = resolve(stack, Bound(b), name);
+            {
+              code: { span: expr_span(e), node: NVar({ name: name, slot: r.slot }) },
+              stack: r.stack,
+            }
+          },
+          None ->
+            { code: { span: expr_span(e), node: NVar({ name: name, slot: None }) }, stack: stack },
+        }
       },
     },
     EUnary(x) -> {
@@ -706,13 +740,7 @@ fn lower_node(e: Expr, stack: Stack) -> Lowered / {abort.raise} =
     // The binder is in scope for the body only; the init is evaluated before it exists.
     // A lambda opens its own barrier; a name it reads from outside becomes a capture.
     ELambda(x) ->
-      lower_lambda(
-        x.params.map(|param: Param| param.name.name),
-        x.params.map(|param: Param| param.name.span.site),
-        x.body,
-        stack,
-        expr_span(e),
-      ),
+      lower_lambda(x.params.map(|param: Param| param.name), x.body, stack, expr_span(e)),
     // `simulate` opens a barrier, as a lambda does, and takes no parameters.
     ESimulate(x) -> {
       let b = lower_in(x.body, st_push(stack, empty_frame()));
@@ -733,7 +761,7 @@ fn lower_node(e: Expr, stack: Stack) -> Lowered / {abort.raise} =
     // Each branch is a lambda with no parameters.
     EParallel(x) -> {
       let r = x.branches.fold({ codes: [], stack: stack }, |sq: Seq, b: Expr| {
-        let o = lower_lambda([], [], b, sq.stack, branch_at(b));
+        let o = lower_lambda([], b, sq.stack, branch_at(b));
         { codes: sq.codes.push(o.code), stack: o.stack }
       });
       { code: { span: expr_span(e), node: NParallel({ branches: r.codes }) }, stack: r.stack }
@@ -744,10 +772,10 @@ fn lower_node(e: Expr, stack: Stack) -> Lowered / {abort.raise} =
       let cls = x.clauses.fold(
         { clauses: [], stack: b.stack },
         |acc: { clauses: List<CodeClause>, stack: Stack }, c: HandleClause| {
-          let named = c.params.map(|i: Ident| i.name);
-          let with_label = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
-          let names = match c.resume { Some(rid) -> with_label.push(rid.name), None -> with_label };
-          let inner = names.fold(empty_frame(), |g: Frame, n: Bytes| bind(g, n));
+          let with_label = match c.label_binder { Some(t) -> c.params.push(t), None -> c.params };
+          let names = match c.resume { Some(rid) -> with_label.push(rid), None -> with_label };
+          let inner = names.fold(empty_frame(), |g: Frame, n: Ident|
+            bind(g, Bound(n.span.site), n.name));
           // The clause's resource is read where the table is built, outside the clause's own barrier.
           // A `[*]` clause keys on the wildcard rather than on a label, so it answers every
           // label the table is asked about.
@@ -792,7 +820,7 @@ fn lower_node(e: Expr, stack: Stack) -> Lowered / {abort.raise} =
             stack: cls.stack,
           },
         Some(r) -> {
-          let inner = bind(empty_frame(), r.binder.name);
+          let inner = bind(empty_frame(), Bound(r.binder.span.site), r.binder.name);
           let entered = binder_noted(
             st_push(cls.stack, inner),
             r.binder.name,
@@ -834,12 +862,14 @@ fn as_update(
   // Two different copied-from variables make this a plain literal.
   let copies = fields.fold(
     { names: [], bad: false },
-    |acc: { names: List<Bytes>, bad: Bool }, f: RecField|
+    |acc: { names: List<Variable>, bad: Bool }, f: RecField|
       match copy_base(f, stack) {
         None -> acc,
-        Some(n) -> if acc.names.len() == 0 { { names: [n], bad: acc.bad } }
-        else if acc.names.at_or(0, b"") == n { acc }
-        else { { names: acc.names, bad: true } },
+        Some(n) -> match acc.names.at(0) {
+          None -> { names: [n], bad: acc.bad },
+          Some(first) -> if first.binder == n.binder { acc }
+          else { { names: acc.names, bad: true } },
+        },
       },
   );
   if copies.bad { None } else {
@@ -848,7 +878,8 @@ fn as_update(
     let base = match copies.names.at(0) {
       Some(n) ->
         Some({
-          name: n,
+          binder: n.binder,
+          name: n.name,
           at: fields.fold(dummy_span(), |at: Span, f: RecField|
             match f.value {
               EField(x) -> if at == dummy_span() && copy_base(f, stack) == Some(n) {
@@ -861,8 +892,7 @@ fn as_update(
         fields.fold(None, |acc: Option<Projected>, f: RecField|
           match acc {
             Some(_) -> acc,
-            None -> if copy_base(f, stack) != None { None }
-            else { projected_var(f.value, stack, []) },
+            None -> if copy_base(f, stack) != None { None } else { projected_var(f.value, stack) },
           }),
     };
     match base {
@@ -871,21 +901,18 @@ fn as_update(
         let name = read.name;
         // Walked in field order, so each copy resolves the base, and each capture is numbered, where it stands.
         let o = fields.fold({ codes: [], stack: stack }, |a: Seq, f: RecField|
-          if copy_base(f, stack) == Some(name) {
-            { codes: a.codes, stack: resolve(a.stack, name).stack }
+          if copied_from(f, stack, read.binder) {
+            { codes: a.codes, stack: resolve(a.stack, Bound(read.binder), name).stack }
           } else {
             let v = lower_in(f.value, a.stack);
             { codes: a.codes.push(v.code), stack: v.stack }
           });
-        match resolve(o.stack, name).slot {
+        match resolve(o.stack, Bound(read.binder), name).slot {
           None -> None,
           Some(sl) -> {
             let copied = fields.fold([], |acc: List<Bytes>, f: RecField|
-              match copy_base(f, stack) {
-                Some(n) -> if n == name { acc.push(f.name.name) } else { acc },
-                None -> acc,
-              });
-            let sets = fields.filter(|f: RecField| copy_base(f, stack) != Some(name));
+              if copied_from(f, stack, read.binder) { acc.push(f.name.name) } else { acc });
+            let sets = fields.filter(|f: RecField| !copied_from(f, stack, read.binder));
             Some({
               code: {
                 span: span,
@@ -972,8 +999,9 @@ fn copy_path(field: RecField, stack: Stack) -> Option<Bytes> =
 /// `e` spelled as a path of field reads off an in-scope variable, where it is one.
 fn path_spelled(e: Expr, stack: Stack) -> Option<Bytes> =
   match e {
-    EVar(v) -> if v.name.module != None { None } else {
-      match st_depth(stack, v.name.name.name) { Some(_) -> Some(v.name.name.name), None -> None }
+    EVar(v) -> match variable(stack, v.name) {
+      Some(n) -> Some(ascii_of_int(n.binder)),
+      None -> None,
     },
     EField(x) -> match path_spelled(x.base, stack) {
       Some(s) -> Some(Bytes::concat_all([s, b".", x.field.name])),
@@ -987,107 +1015,82 @@ fn path_spelled(e: Expr, stack: Stack) -> Option<Bytes> =
 fn in_flight(value: Expr, stack: Stack) -> Bool =
   stack.releases.held.contains(expr_span(value).site)
 
-/// The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
-fn copy_base(field: RecField, stack: Stack) -> Option<Bytes> =
+/// A local in scope here: the site of the name that binds it, and the name.
+type Variable = { binder: Int, name: Bytes }
+
+/// The local the bare name `q` reads, where it is in scope here.
+fn variable(stack: Stack, q: QName) -> Option<Variable> =
+  if q.module != None { None } else {
+    match stack.locals.get(q.name.span.site) {
+      Some(b) -> if st_depth(stack, Bound(b)) == None { None }
+      else { Some({ binder: b, name: q.name.name }) },
+      None -> None,
+    }
+  }
+
+/// The in-scope variable a field copies from, when the field is `b.<its own name>`.
+fn copy_base(field: RecField, stack: Stack) -> Option<Variable> =
   match field.value {
-    EField(x) -> if x.field.name != field.name.name || in_flight(field.value, stack) { None } else {
-      match x.base {
-        EVar(v) -> if v.name.module != None { None } else {
-          match st_depth(stack, v.name.name.name) {
-            Some(_) -> Some(v.name.name.name),
-            None -> None,
-          }
-        },
-        _ -> None,
-      }
-    },
+    EField(x) -> if x.field.name != field.name.name || in_flight(field.value, stack) { None }
+    else { match x.base { EVar(v) -> variable(stack, v.name), _ -> None } },
     _ -> None,
   }
 
-/// A variable a field is read out of, and the read of it.
-type Projected = { name: Bytes, at: Span }
+fn copied_from(field: RecField, stack: Stack, binder: Int) -> Bool =
+  match copy_base(field, stack) { Some(v) -> v.binder == binder, None -> false }
 
-/// The first in-scope variable a field read projects from inside `e`; a name `e` binds itself is never the base.
-fn projected_var(e: Expr, stack: Stack, inner: List<Bytes>) -> Option<Projected> = {
+/// A variable a field is read out of, and the read of it.
+type Projected = { binder: Int, name: Bytes, at: Span }
+
+/// The first in-scope variable a field read projects from inside `e`.
+fn projected_var(e: Expr, stack: Stack) -> Option<Projected> = {
   let first = |exprs: List<Expr>|
     exprs.fold(None, |acc: Option<Projected>, x: Expr|
-      match acc { Some(_) -> acc, None -> projected_var(x, stack, inner) });
+      match acc { Some(_) -> acc, None -> projected_var(x, stack) });
   match e {
     EField(x) -> match x.base {
-      EVar(v) -> if v.name.module == None && !inner.contains(v.name.name.name)
-          && st_depth(stack, v.name.name.name) != None {
-        Some({ name: v.name.name.name, at: v.span })
-      } else { projected_var(x.base, stack, inner) },
-      _ -> projected_var(x.base, stack, inner),
+      EVar(v) -> match variable(stack, v.name) {
+        Some(n) -> Some({ binder: n.binder, name: n.name, at: v.span }),
+        None -> projected_var(x.base, stack),
+      },
+      _ -> projected_var(x.base, stack),
     },
-    EUnary(x) -> projected_var(x.operand, stack, inner),
+    EUnary(x) -> projected_var(x.operand, stack),
     EBinary(x) -> first([x.lhs, x.rhs]),
-    EApp(x) -> match projected_var(x.func, stack, inner) {
-      Some(n) -> Some(n),
-      None -> first(x.args),
-    },
+    EApp(x) -> match projected_var(x.func, stack) { Some(n) -> Some(n), None -> first(x.args) },
     EIf(x) -> first([x.cond, x.then_branch, x.else_branch]),
-    EMatch(x) -> projected_var(x.scrutinee, stack, inner),
+    EMatch(x) -> projected_var(x.scrutinee, stack),
     EBlock(x) -> {
-      let walked = x.stmts.fold(
-        { found: None, inner: inner },
-        |acc: { found: Option<Projected>, inner: List<Bytes> }, stmt: Stmt|
-          match acc.found {
-            Some(_) -> acc,
-            None -> match stmt {
-              SLet(l) ->
-                {
-                  found: projected_var(l.value, stack, acc.inner),
-                  inner: pat_binders(l.pat, acc.inner),
-                },
-              SLetElse(l) ->
-                {
-                  found: match projected_var(l.value, stack, acc.inner) {
-                    Some(n) -> Some(n),
-                    None -> projected_var(l.fallback, stack, acc.inner),
-                  },
-                  inner: pat_binders(l.pat, acc.inner),
-                },
-              SExpr(v) -> { found: projected_var(v, stack, acc.inner), inner: acc.inner },
-              SAssign(v) -> { found: projected_var(v.value, stack, acc.inner), inner: acc.inner },
+      let found = x.stmts.fold(None, |acc: Option<Projected>, stmt: Stmt|
+        match acc {
+          Some(_) -> acc,
+          None -> match stmt {
+            SLet(l) -> projected_var(l.value, stack),
+            SLetElse(l) -> match projected_var(l.value, stack) {
+              Some(n) -> Some(n),
+              None -> projected_var(l.fallback, stack),
             },
+            SExpr(v) -> projected_var(v, stack),
+            SAssign(v) -> projected_var(v.value, stack),
           },
-      );
-      match walked.found {
+        });
+      match found {
         Some(n) -> Some(n),
-        None -> match x.tail { Some(t) -> projected_var(t, stack, walked.inner), None -> None },
+        None -> match x.tail { Some(t) -> projected_var(t, stack), None -> None },
       }
     },
     ERecord(x) -> first(x.fields.map(|field: RecField| field.value)),
-    ERecordUpdate(x) -> match projected_var(x.base, stack, inner) {
+    ERecordUpdate(x) -> match projected_var(x.base, stack) {
       Some(n) -> Some(n),
       None -> first(x.fields.map(|field: RecField| field.value)),
     },
-    ETry(x) -> projected_var(x.operand, stack, inner),
+    ETry(x) -> projected_var(x.operand, stack),
     EList(x) -> first(x.items),
     EPerform(x) -> first(x.args),
-    EHandle(x) -> projected_var(x.body, stack, inner),
+    EHandle(x) -> projected_var(x.body, stack),
     _ -> None,
   }
 }
-
-fn pat_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
-  match p {
-    PVar(v) -> out.push(v.name.name),
-    PCtor(c) -> c.args.fold(out, |acc: List<Bytes>, a: Pattern| pat_binders(a, acc)),
-    PRecord(r) ->
-      r.fields.fold(out, |acc: List<Bytes>, f: { name: Ident, pat: Pattern }|
-        pat_binders(f.pat, acc)),
-    PList(l) -> {
-      let items = l.items.fold(out, |acc: List<Bytes>, a: Pattern| pat_binders(a, acc));
-      match l.rest { Some(r) -> pat_binders(r, items), None -> items }
-    },
-    POr(o) -> o.alts.fold(out, |acc: List<Bytes>, a: Pattern| pat_binders(a, acc)),
-    PWild(_) -> out,
-    PLit(_) -> out,
-    PRange(_) -> out,
-    PBad(_) -> out,
-  }
 
 fn nth(codes: List<Code>, i: Int) -> Code =
   match codes.at(i) { Some(c) -> c, None -> { span: dummy_span(), node: NLit(LUnit) } }
@@ -1103,30 +1106,26 @@ fn lower_seq(exprs: List<Expr>, stack: Stack) -> Seq / {abort.raise} =
 /// A lambda over `params`, bound at `sites`: its body lowered behind a barrier, which the captures
 /// cross.
 fn lower_lambda(
-  params: List<Bytes>,
-  sites: List<Int>,
+  params: List<Ident>,
   body: Expr,
   stack: Stack,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let inner = params.fold(
-    { names: [], scope: [], captures: [], capture_names: [] },
-    |g: Frame, n: Bytes| bind(g, n),
-  );
+  let inner = params.fold(empty_frame(), |g: Frame, p: Ident| bind(g, Bound(p.span.site), p.name));
   let depth = stack.frames.len();
-  let entered = range(0, sites.len()).fold(st_push(stack, inner), |st: Stack, k: Int|
-    binder_noted(st, params.at_or(k, b""), sites.get(k), depth, k));
-  lam_of(params, lower_in(body, entered), at)
+  let entered = range(0, params.len()).fold(st_push(stack, inner), |st: Stack, k: Int|
+    binder_noted(st, params.get(k).name, params.get(k).span.site, depth, k));
+  lam_of(params.len(), lower_in(body, entered), at)
 }
 
 /// Pops the lambda's barrier; the stack below keeps the captures threaded into it.
-fn lam_of(params: List<Bytes>, b: Lowered, at: Span) -> Lowered = {
+fn lam_of(params: Int, b: Lowered, at: Span) -> Lowered = {
   let inner = st_top(b.stack);
   {
     code: {
       span: dummy_span(),
       node: NLambda({
-        params: params.len(),
+        params: params,
         size: inner.names.len(),
         captures: inner.captures,
         body: b.code,
@@ -1174,13 +1173,10 @@ fn arms_into(
   guard: Option<Expr>,
   body: (Stack) -> Lowered / {abort.raise},
 ) -> ArmAcc / {abort.raise} =
-  if !has_or(pat) { arm_into(acc, pat, guard, body) } else {
-    let alts = alternatives_of(pat);
-    let first = match alts.at(0) { Some(p) -> binder_names(p), None -> [] };
-    let keys = first.fold(Map::new(), |m: Map<Bytes, Int>, i: Ident| m.insert(i.name, i.span.site));
-    // Each alternative binds under the first one's keys, which its guard and body then read.
-    alts.fold(acc, |a: ArmAcc, alt: Pattern|
-      arm_into({ ..a, stack: { ..a.stack, rekey: keys } }, alt, guard, body))
+  if !has_or(pat) { arm_into(acc, pat, guard, body) }
+  else {
+    // Each alternative is an arm of its own, binding the locals the first one's names bind.
+    alternatives_of(pat).fold(acc, |a: ArmAcc, alt: Pattern| arm_into(a, alt, guard, body))
   }
 
 /// Arm binders leave scope at the arm's end; their slots are not reused.
@@ -1192,8 +1188,7 @@ fn arm_into(
 ) -> ArmAcc / {abort.raise} = {
   let pd = depth_of(acc.stack);
   let lowered = lower_pat(alt, acc.stack);
-  // What the pattern binds is renamed; a name the guard or body binds again is its own.
-  let pat = { ..lowered, stack: { ..lowered.stack, rekey: Map::new() } };
+  let pat = lowered;
   let g = lower_guard(guard, pat.stack);
   let b = body(g.stack);
   {
@@ -1299,10 +1294,7 @@ fn straight(acc: BlockAcc, stmt: Stmt) -> BlockAcc / {abort.raise} =
             stmts: acc.stmts.push(
               CLet({ name: name, slot: st_top(o.stack).names.len(), value: o.code }),
             ),
-            stack: match l.pat {
-              PVar(v) -> bind_at(o.stack, name, v.name.span.site),
-              _ -> o.stack,
-            },
+            stack: match l.pat { PVar(v) -> bind_at(o.stack, v.name), _ -> o.stack },
           },
       }
     },
@@ -1322,10 +1314,9 @@ fn lower_pat(pattern: Pattern, stack: Stack) -> PatOut / {abort.raise} =
   match pattern {
     PWild(_) -> { pat: PxWild, stack: stack },
     PVar(v) -> {
-      let name = v.name.name;
-      let key = match stack.rekey.get(name) { Some(k) -> k, None -> v.name.span.site };
-      let g = bind_at(stack, name, key);
-      { pat: PxVar({ name: name, slot: slot_in(st_top(g), name), span: v.span }), stack: g }
+      let g = bind_at(stack, v.name);
+      let slot = slot_in(st_top(g), Bound(binder_site(stack, v.name)));
+      { pat: PxVar({ name: v.name.name, slot: slot, span: v.span }), stack: g }
     },
     PLit(v) -> { pat: PxLit(v.lit), stack: stack },
     PRange(v) -> { pat: PxRange({ lo: v.lo, hi: v.hi }), stack: stack },
@@ -1431,10 +1422,11 @@ fn released_around(span: Span, o: Lowered) -> Lowered = {
     let slot = st_top(at).names.len();
     let depth = depth_of(at);
     // Noted whether or not a later node reads it: a failing release after this one names it.
-    let named = bind_st(at, b"?released");
+    let named = bind_st(at, Bound(span.site), b"?released");
     let bound = {
       ..named,
       binders: named.binders.insert(span.site, {
+        key: Bound(span.site),
         name: b"?released",
         depth: at.frames.len() - 1,
         slot: slot,
@@ -1530,8 +1522,8 @@ fn held_codes(s: Stack, rs: List<ReleaseSite>) -> { codes: List<Code>, stack: St
             }),
           }
         } else if b.depth < top
-            && range(b.depth + 1, top + 1).all(|i: Int| find(st_at(acc.stack, i), b.name) == None) {
-          let l = resolve(acc.stack, b.name);
+            && range(b.depth + 1, top + 1).all(|i: Int| find(st_at(acc.stack, i), b.key) == None) {
+          let l = resolve(acc.stack, b.key, b.name);
           {
             codes: acc.codes.push({
               span: dummy_span(),
@@ -1558,7 +1550,7 @@ fn held_by(s: Stack, name: Bytes, value: Code, then: (Code) -> Code) -> Lowered 
         tail: Some(then(read)),
       }),
     },
-    stack: unscope_st(bind_st(s, name), depth),
+    stack: unscope_st(bind_st(s, Own(name), name), depth),
   }
 }
 
@@ -1635,7 +1627,7 @@ fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
 /// other of the module's is. Panics where two different nodes stand at one site, which expansion
 /// never writes.
 pub fn lower_fn(
-  params: List<Bytes>,
+  params: List<Ident>,
   labels: List<Bytes>,
   sites: Map<Int, List<Bytes>>,
   body: Expr,
@@ -1646,11 +1638,9 @@ pub fn lower_fn(
     Some(why) -> panic(String::of_bytes_lossy(why)),
     None -> {
       let start = labels.fold(
-        params.fold(
-          { names: [], scope: [], captures: [], capture_names: [] },
-          |frame: Frame, p: Bytes| bind(frame, p),
-        ),
-        |frame: Frame, l: Bytes| bind(frame, label_binder(l)),
+        params.fold(empty_frame(), |frame: Frame, p: Ident|
+          bind(frame, Bound(p.span.site), p.name)),
+        |frame: Frame, l: Bytes| bind(frame, Own(label_binder(l)), label_binder(l)),
       );
       let releases = releases_of(releasing);
       let stack = range(0, releasing.params.len()).fold(
@@ -1661,9 +1651,9 @@ pub fn lower_fn(
           own: own,
           releases: releases,
           binders: Map::new(),
-          rekey: Map::new(),
+          locals: body_binders(params, body),
         },
-        |st: Stack, k: Int| binder_noted(st, params.at_or(k, b""), releasing.params.get(k), 0, k),
+        |st: Stack, k: Int| binder_noted(st, params.get(k).name, releasing.params.get(k), 0, k),
       );
       let o = lower_in(body, stack);
       { code: o.code, size: st_top(o.stack).names.len() }

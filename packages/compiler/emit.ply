@@ -3,6 +3,8 @@
 
 import compiler.syntax.parsing (Ident, ParseDiag)
 import compiler.emit.code (Code, lower_fn)
+import compiler.syntax.items (case_params, result_name)
+import compiler.syntax.type_syntax (TypeExpr)
 import compiler.syntax.items (Module, Derived, Item, IFn, ITest, ILaw, IType, parse, with_prelude,
                               Binder, SpecClause, SRequires, SEnsures, SCost, SSpace, FnDef,
                               test_run, test_listing, IInstance, VariantDef, TDSum, INumeric,
@@ -637,7 +639,10 @@ fn owner_read(s: Scope, owner: RootKey) -> Option<OwnerLambdas> / {abort.raise} 
           Some(t) -> {
             let filed = filed_of(filed_as(owner));
             let l = lower_fn(
-              if t.cases != None { [case_at(), case_identity()] } else { [] },
+              match t.cases {
+                Some(c) -> case_params(c).map(|p: { name: Ident, ty: TypeExpr }| p.name),
+                None -> [],
+              },
               [],
               filed.labels,
               test_run(t),
@@ -651,7 +656,7 @@ fn owner_read(s: Scope, owner: RootKey) -> Option<OwnerLambdas> / {abort.raise} 
           let source = definition_at(s.ctors, of.base, d, of.args, schemes, module_at(i).ops);
           let filed = filed_of(of.base);
           let l = lower_fn(
-            d.params.map(|param: Param| param.name.name),
+            d.params.map(|param: Param| param.name),
             d.generics.labels.map(|ident: Ident| ident.name),
             filed.labels,
             source.body,
@@ -1154,16 +1159,12 @@ fn item_walked(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
           },
         ]
       };
-      let rooted = |within: Setting, key: RootKey, taken: List<EmitParam>, body: Expr|
-        root_formed(
-          within,
-          t.span.start,
-          key,
-          taken.map(|p: EmitParam| p.name),
-          taken,
-          filed(),
-          body,
-        );
+      let rooted = |within: Setting, key: RootKey, taken: List<EmitParam>, binders: List<Ident>, body: Expr|
+        root_formed(within, t.span.start, key, binders, taken, filed(), body);
+      let case_binders = match t.cases {
+        Some(c) -> case_params(c).map(|p: { name: Ident, ty: TypeExpr }| p.name),
+        None -> [],
+      };
       // A test's entry is typed by what it performs once it has handled what it handles, and its
       // run takes the words of that row its entry hands it.
       let performs = {
@@ -1183,7 +1184,7 @@ fn item_walked(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
         tested,
         Some(monomorphic(fn_type(ps.map(param_type), unit_type(), performs))),
         if !wants_root(wanted, tested) { acc.out }
-        else { acc.out.push(rooted(ran, tested, ps, test_run(t))) },
+        else { acc.out.push(rooted(ran, tested, ps, case_binders, test_run(t))) },
       );
       let listing = Cases(tested);
       let out = match t.cases {
@@ -1196,7 +1197,7 @@ fn item_walked(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
             listing,
             Some(monomorphic(fn_type([], listing_ty(), row_empty()))),
             if !wants_root(wanted, listing) { run }
-            else { run.push(rooted(s, listing, [], test_listing(c))) },
+            else { run.push(rooted(s, listing, [], [], test_listing(c))) },
           )
         },
       };
@@ -1209,12 +1210,12 @@ fn item_walked(x: ItemsForming, acc: Walk, item: Item) -> Walk / {abort.raise} =
         wants_root(wanted, part(which)) || wants_root(wanted, Entered(part(which)));
       if !asked(LawGuard) && !asked(LawBody) { acc } else {
         let filed = filed_of(law_owner(module, d.name));
-        let names = d.binders.map(|binder: Binder| binder.name.name);
+        let binders = d.binders.map(|binder: Binder| binder.name);
         let ps = law_params(law_owner(module, d.name), filed, d.binders);
         // Each part, then the entry a judge enters it through.
         let rooted = |out: List<Fn>, which: LawPart, body: Expr|
           judged(s, wanted, part(which), ps, [], if !wants_root(wanted, part(which)) { out }
-          else { out.push(root_formed(s, d.span.start, part(which), names, ps, filed, body)) });
+          else { out.push(root_formed(s, d.span.start, part(which), binders, ps, filed, body)) });
         let with_guard = match d.guard { None -> acc.out, Some(g) -> rooted(acc.out, LawGuard, g) };
         { out: rooted(with_guard, LawBody, d.body) }
       }
@@ -1491,7 +1492,7 @@ fn prepare(
 /// `filed`.
 fn written_code_of(module: Bytes, def: FnDef, filed: Filings) -> Code / {abort.raise} =
   lower_fn(
-    def.params.map(|param: Param| param.name.name),
+    def.params.map(|param: Param| param.name),
     def.generics.labels.map(|ident: Ident| ident.name),
     filed.labels,
     def.body,
@@ -1518,9 +1519,10 @@ fn clause_roots(
   let ints = judged_args(vars);
   let clause = |kind: ClauseKind, k: Int| Clause({ def: Named(full), kind: kind, n: k });
   // A clause, a generic definition's also at the specialisation its entry calls, and its entry.
-  let rooted = |out: List<Fn>, key: RootKey, ns: List<Bytes>, ps: List<EmitParam>, e: Expr| {
+  let params = def.params.map(|param: Param| param.name);
+  let rooted = |out: List<Fn>, key: RootKey, binders: List<Ident>, ns: List<Bytes>, ps: List<EmitParam>, e: Expr| {
     let own = if !wants_root(wanted, key) { out }
-    else { out.push(root_formed(s, def.span.start, key, ns, ps, filed, e)) };
+    else { out.push(root_formed(s, def.span.start, key, binders, ps, filed, e)) };
     let at = judged_callee(key, vars.len());
     let specialised = if at == key || !wants_root(wanted, at) { own } else {
       let tys = ps.map(|p: EmitParam| substituted(param_type(p), ints));
@@ -1529,7 +1531,7 @@ fn clause_roots(
           s,
           def.span.start,
           at,
-          ns,
+          binders,
           params_carried(ns, tys.map(|t: Type| Some(kind_of(t))), tys.map(|t: Type| Some(t))),
           filings_at(filed, ints),
           written_at(s.ctors, full, def, ints, schemes, e),
@@ -1545,7 +1547,7 @@ fn clause_roots(
         SRequires -> {
           let key = clause(Requires, w.requires);
           {
-            out: rooted(w.out, key, names, params_carried(names, kinds, types), c.expr),
+            out: rooted(w.out, key, params, names, params_carried(names, kinds, types), c.expr),
             requires: w.requires + 1,
             ensures: w.ensures,
           }
@@ -1558,7 +1560,14 @@ fn clause_roots(
             let rkinds = kinds.push(Some(match sig { Some(g) -> kind_of(g.ret), None -> boxed() }));
             let rtypes = types.push(match sig { Some(g) -> Some(g.ret), None -> None });
             {
-              out: rooted(w.out, key, rnames, params_carried(rnames, rkinds, rtypes), c.expr),
+              out: rooted(
+                w.out,
+                key,
+                params.push({ name: result_name(), span: c.span }),
+                rnames,
+                params_carried(rnames, rkinds, rtypes),
+                c.expr,
+              ),
               requires: w.requires,
               ensures: w.ensures + 1,
             }
