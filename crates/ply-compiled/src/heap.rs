@@ -488,11 +488,6 @@ impl Heap {
         &raw mut *self.alloc
     }
 
-    /// Whether the scheduler's own work runs.
-    pub(crate) fn scheduling(&self) -> bool {
-        self.scheduling
-    }
-
     /// The scheduler's own work begins, where `on`, or the program's runs again: whether the
     /// scheduler's ran before.
     pub(crate) fn set_scheduling(&mut self, on: bool) -> bool {
