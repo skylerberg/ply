@@ -2,7 +2,7 @@ use ply_core::crypto::Framing;
 use ply_core::{Diagnostic, Span, codes};
 use ply_host::fs::*;
 use ply_host::jobs::Failure;
-use ply_host::native::{int_of, parts_of};
+use ply_host::native::{found_read, int_of, parts_of};
 use ply_host::pool::{Bell, Run};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -1427,4 +1427,16 @@ fn a_link_inside_the_root_is_followed_as_far_as_a_path_may_pass_and_no_further()
     std::os::unix::fs::symlink("absent/../d/a.txt", real.join("back")).unwrap();
     assert_eq!(read("back"), None);
     assert!(!write("back"));
+}
+
+/// What a read appends is found after the leading byte, and a read that fails finds nothing.
+#[test]
+fn a_read_is_found_in_place_or_not_at_all() {
+    let read = found_read(3, |out| {
+        out.extend_from_slice(b"abc");
+        Ok(3)
+    });
+    assert_eq!(found_bytes(read), Some(b"abc".to_vec()));
+    let failed = found_read(3, |_| Err(std::io::Error::other("unreadable")));
+    assert_eq!(found_bytes(failed), None);
 }

@@ -154,6 +154,21 @@ impl Run {
         lock(&self.held).remove(&token);
     }
 
+    /// `job` run on this thread, its answer held as an operation's until the run takes it: for a
+    /// job no other task of the run could go on beside. Its ticket is answered as it is handed.
+    pub fn done_here(
+        &self,
+        span: Span,
+        label: &'static str,
+        what: &'static str,
+        job: impl FnOnce() -> JobOutput + Send + 'static,
+    ) -> Pending {
+        let token = NEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        self.enter(token, span, what);
+        self.file(token, outcome_of(Box::new(job)));
+        Pending { token, label }
+    }
+
     /// Files a job's answer and rings the bell, after the answer is in place, so a wait that
     /// woke finds it.
     fn file(&self, token: u64, answer: JobOutput) {
@@ -438,12 +453,16 @@ impl Pool {
     }
 }
 
+/// What `job` answered: one that panics is answered as one that failed.
+fn outcome_of(job: Job) -> JobOutput {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+        .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())))
+}
+
 /// Runs a job, gives back its thread with `freed`, and files its answer with its run where the run
-/// has not ended: what every pool's threads do with a job. One that panics is answered as one that
-/// failed.
+/// has not ended: what every pool's threads do with a job.
 fn finish(entry: Entry, freed: impl FnOnce()) {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(entry.job))
-        .unwrap_or_else(|_| Err(Failure::Said("the host panicked doing it".to_string())));
+    let outcome = outcome_of(entry.job);
     freed();
     if let Some(run) = entry.run.upgrade() {
         run.file(entry.token, outcome);

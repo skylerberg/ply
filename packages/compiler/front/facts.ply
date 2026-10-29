@@ -23,13 +23,13 @@ import compiler.store.hash.forms (HashOutput, Fixing, by_name, reached_functions
                                   TheDecl, TheItem, hashes_fixed)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
-import compiler.check.infer (CheckOutput, types_named, types_joined, stated, EmitFacts,
-                             emit_facts_bin)
+import compiler.check.typed (TypedBody)
+import compiler.check.infer (CheckOutput, types_joined, stated, EmitFacts, emit_facts_bin,
+                             facts_moved, facts_kept)
 import compiler.check.infer.checker (Location, DefInfo, TestInfo, LawInfo, EffectInfo, OpInfo,
-                                     CtorInfo, KeptFacts, WalkedBody, WitnessOrder, LabelSite,
-                                     TypedSite, TrySite, MemberSite, UpdateShape, WitnessOp,
-                                     WitnessRef, RowSite, InstanceInfo, NumericInfo, def_info_bin,
-                                     test_info_bin, law_info_bin, effect_info_bin, ctor_info_bin,
+                                     CtorInfo, KeptFacts, WalkedBody, WitnessOrder, MemberSite,
+                                     InstanceInfo, NumericInfo, def_info_bin, test_info_bin,
+                                     law_info_bin, effect_info_bin, ctor_info_bin,
                                      instance_info_bin, numeric_info_bin, kept_facts_bin,
                                      ReleaseSite)
 import compiler.check.infer.solved (prelude_tables)
@@ -551,22 +551,7 @@ pub fn no_module_tables() -> ModuleTables =
     ctors: [],
     instances: [],
     numeric: [],
-    facts: {
-      pure: [],
-      label_sites: [],
-      elaboration: {
-        updates: [],
-        ops: [],
-        refs: [],
-        orders: [],
-        tries: [],
-        members: [],
-        releases: [],
-      },
-      typed: [],
-      types: Map::new(),
-      rows: [],
-    },
+    facts: { pure: [], orders: [], members: [], releases: [], types: Map::new(), bodies: [] },
     kept: [],
   }
 
@@ -588,8 +573,6 @@ fn moved_module(module: Int, from: Int, to: Int) -> Int = if module == from { to
 /// `tests` and `laws`.
 fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> ModuleTables = {
   let at = |l: Location| moved_location(l, from, to);
-  let m = |module: Int| moved_module(module, from, to);
-  let e = t.facts.elaboration;
   {
     ..t,
     defs: t.defs.map(|d: DefInfo| { ..d, at: at(d.at) }),
@@ -600,21 +583,7 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
     ctors: t.ctors.map(|c: CtorInfo| { ..c, at: at(c.at) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: at(x.at) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: at(x.at) }),
-    facts: {
-      ..t.facts,
-      label_sites: t.facts.label_sites.map(|x: LabelSite| { ..x, module: m(x.module) }),
-      typed: t.facts.typed.map(|x: TypedSite| { ..x, module: m(x.module) }),
-      rows: t.facts.rows.map(|x: RowSite| { ..x, module: m(x.module) }),
-      elaboration: {
-        updates: e.updates.map(|x: UpdateShape| { ..x, module: m(x.module) }),
-        ops: e.ops.map(|x: WitnessOp| { ..x, module: m(x.module) }),
-        refs: e.refs.map(|x: WitnessRef| { ..x, module: m(x.module) }),
-        orders: e.orders.map(|x: WitnessOrder| { ..x, module: m(x.module) }),
-        tries: e.tries.map(|x: TrySite| { ..x, module: m(x.module) }),
-        releases: e.releases.map(|x: ReleaseSite| { ..x, module: m(x.module) }),
-        members: e.members.map(|x: MemberSite| { ..x, module: m(x.module) }),
-      },
-    },
+    facts: facts_moved(t.facts, |module: Int| moved_module(module, from, to)),
   }
 }
 
@@ -624,7 +593,6 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
   let parsed = w.mods.get(i);
   let mine = |module: Int| module == i;
   let c = w.checked;
-  let e = c.facts.elaboration;
   let tests = c.tests.filter(|t: TestInfo| t.module == name);
   let laws = c.laws.filter(|l: LawInfo| l.module == name);
   let owned = |owner: Bytes| of_module(name, owner);
@@ -662,20 +630,9 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
         instances: c.instances.filter(|x: InstanceInfo| mine(x.at.module)),
         numeric: c.numeric_types.filter(|x: NumericInfo| mine(x.at.module)),
         facts: {
+          ..facts_kept(c.facts, |module: Int, owner: Bytes| mine(module)),
           pure: c.facts.pure.filter(|n: Bytes| of_module(name, n)),
-          label_sites: c.facts.label_sites.filter(|x: LabelSite| mine(x.module)),
-          typed: c.facts.typed.filter(|x: TypedSite| mine(x.module)),
-          types: types_named(c.facts.types, c.facts.typed.filter(|x: TypedSite| mine(x.module))),
-          rows: c.facts.rows.filter(|x: RowSite| mine(x.module)),
-          elaboration: {
-            updates: e.updates.filter(|x: UpdateShape| mine(x.module)),
-            ops: e.ops.filter(|x: WitnessOp| mine(x.module)),
-            refs: e.refs.filter(|x: WitnessRef| mine(x.module)),
-            orders: e.orders.filter(|x: WitnessOrder| mine(x.module)),
-            tries: e.tries.filter(|x: TrySite| mine(x.module)),
-            releases: e.releases.filter(|x: ReleaseSite| mine(x.module)),
-            members: e.members.filter(|x: MemberSite| mine(x.module)),
-          },
+          orders: c.facts.orders.filter(|x: WitnessOrder| mine(x.module)),
         },
         kept: c.kept.filter(|k: KeptFacts| owned(k.name)),
       },
@@ -784,30 +741,21 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
 
 /// `t`, the tables of the shipped module `o` outlines as it answered, cut to what a program reaches
 /// of it, `reached`: a function it does not reach, its sites and every test and law are left out.
-fn cut_tables(t: ModuleTables, o: Outline, reached: Map<Bytes, Bool>) -> ModuleTables = {
-  let owned = |owner: Bytes| reached.contains(owner);
-  let e = t.facts.elaboration;
+fn cut_tables(
+  t: ModuleTables,
+  o: Outline,
+  reached: Map<Bytes, Bool>,
+) -> ModuleTables / {abort.raise} = {
   {
     ..t,
     defs: t.defs.filter(|d: DefInfo| reached.contains(d.name)),
     tests: [],
     laws: [],
     facts: {
+      ..facts_kept(t.facts, |module: Int, owner: Bytes| reached.contains(owner)),
       pure: t.facts.pure.filter(|n: Bytes| reached.contains(n)),
-      label_sites: t.facts.label_sites.filter(|x: LabelSite| owned(x.owner)),
-      typed: t.facts.typed.filter(|x: TypedSite| owned(x.owner)),
-      types: types_named(t.facts.types, t.facts.typed.filter(|x: TypedSite| owned(x.owner))),
-      rows: t.facts.rows.filter(|x: RowSite| owned(x.owner)),
-      elaboration: {
-        updates: e.updates.filter(|x: UpdateShape| owned(x.owner)),
-        ops: e.ops.filter(|x: WitnessOp| owned(x.owner)),
-        refs: e.refs.filter(|x: WitnessRef| owned(x.owner)),
-        // A witness order names its definition as written.
-        orders: e.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
-        tries: e.tries.filter(|x: TrySite| owned(x.owner)),
-        releases: e.releases.filter(|x: ReleaseSite| owned(x.owner)),
-        members: e.members.filter(|x: MemberSite| owned(x.owner)),
-      },
+      // A witness order names its definition as written.
+      orders: t.facts.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
     },
     kept: t.kept.filter(|k: KeptFacts| reached.contains(k.name)),
   }
@@ -864,32 +812,13 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
 
 /// `t`, the tables of the module `o` outlines, read without its tests and laws.
 fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} = {
-  let e = t.facts.elaboration;
   let apart = walked_apart([o]);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ..t,
     tests: [],
     laws: [],
-    facts: {
-      ..t.facts,
-      label_sites: t.facts.label_sites.filter(|x: LabelSite| of_definitions(x.owner)),
-      typed: t.facts.typed.filter(|x: TypedSite| of_definitions(x.owner)),
-      types: types_named(
-        t.facts.types,
-        t.facts.typed.filter(|x: TypedSite| of_definitions(x.owner)),
-      ),
-      rows: t.facts.rows.filter(|x: RowSite| of_definitions(x.owner)),
-      elaboration: {
-        ..e,
-        updates: e.updates.filter(|x: UpdateShape| of_definitions(x.owner)),
-        ops: e.ops.filter(|x: WitnessOp| of_definitions(x.owner)),
-        refs: e.refs.filter(|x: WitnessRef| of_definitions(x.owner)),
-        tries: e.tries.filter(|x: TrySite| of_definitions(x.owner)),
-        releases: e.releases.filter(|x: ReleaseSite| of_definitions(x.owner)),
-        members: e.members.filter(|x: MemberSite| of_definitions(x.owner)),
-      },
-    },
+    facts: facts_kept(t.facts, |module: Int, owner: Bytes| of_definitions(owner)),
     kept: t.kept.filter(|k: KeptFacts| of_definitions(k.name)),
   }
 }
@@ -1243,58 +1172,24 @@ fn merged_tables(
     seeded_tests: [],
     facts: {
       pure: checked_order.fold([], |acc: List<Bytes>, t: ModuleTables| acc.concat(t.facts.pure)),
-      label_sites: phased(
+      orders: checked_order.fold([], |acc: List<WitnessOrder>, t: ModuleTables|
+        acc.concat(t.facts.orders)),
+      members: phased(checked_order, placed, |t: ModuleTables| t.facts.members, |x: MemberSite|
+        of_definitions(x.owner)),
+      releases: phased(
         checked_order,
         placed,
-        |t: ModuleTables| t.facts.label_sites,
-        |x: LabelSite| of_definitions(x.owner),
+        |t: ModuleTables| t.facts.releases,
+        |x: ReleaseSite| of_definitions(x.owner),
       ),
-      typed: phased(checked_order, placed, |t: ModuleTables| t.facts.typed, |x: TypedSite|
-        of_definitions(x.owner)),
+      bodies: phased(
+        checked_order,
+        placed,
+        |t: ModuleTables| t.facts.bodies,
+        |x: TypedBody<Bytes>| of_definitions(x.owner),
+      ),
       types: checked_order.fold(Map::new(), |acc: TypeTable, t: ModuleTables|
         types_joined(acc, t.facts.types)),
-      rows: phased(checked_order, placed, |t: ModuleTables| t.facts.rows, |x: RowSite|
-        of_definitions(x.owner)),
-      elaboration: {
-        updates: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.updates,
-          |x: UpdateShape| of_definitions(x.owner),
-        ),
-        ops: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.ops,
-          |x: WitnessOp| of_definitions(x.owner),
-        ),
-        refs: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.refs,
-          |x: WitnessRef| of_definitions(x.owner),
-        ),
-        orders: checked_order.fold([], |acc: List<WitnessOrder>, t: ModuleTables|
-          acc.concat(t.facts.elaboration.orders)),
-        tries: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.tries,
-          |x: TrySite| of_definitions(x.owner),
-        ),
-        releases: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.releases,
-          |x: ReleaseSite| of_definitions(x.owner),
-        ),
-        members: phased(
-          checked_order,
-          placed,
-          |t: ModuleTables| t.facts.elaboration.members,
-          |x: MemberSite| of_definitions(x.owner),
-        ),
-      },
     },
     kept: checked_order.fold([], |acc: List<KeptFacts>, t: ModuleTables| acc.concat(t.kept)),
     instances: checked_order.fold([], |acc: List<InstanceInfo>, t: ModuleTables|

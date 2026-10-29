@@ -189,9 +189,11 @@ pub struct PlyType {
     pub inc: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
     /// One holder fewer, the last releasing the value as its type does.
     pub dec: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    /// Appends the value's encoding to the context's lowering, borrowing it.
+    /// Appends the value's encoding to the context's lowering, borrowing it: the runtime's refusal
+    /// where no diagnostic shows a value of the type.
     pub lower: unsafe extern "C" fn(*mut Ctx, Word) -> Word,
-    /// Reads a value of the type from the context's lifting, answering its word form.
+    /// Reads a value of the type from the context's lifting, answering its word form: the runtime's
+    /// refusal for every type but `String`.
     pub lift: unsafe extern "C" fn(*mut Ctx) -> Word,
 }
 

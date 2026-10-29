@@ -19,7 +19,7 @@ import std.list
 // --- Layout -----------------------------------------------------------------
 
 /// Moves whenever the bytes on disk change meaning: a manifest of another format reads as none.
-fn format() -> Int = 2
+fn format() -> Int = 3
 
 fn segment_magic() -> Bytes = b"PLYSEGM1"
 
@@ -54,16 +54,15 @@ pub fn long_at(b: Bytes, at: Int) -> Int = match b.u64_at(at) { Some(n) -> n, No
 /// and their checksum.
 pub type Part = { table: Int, width: Int, count: Int, offset: Int, sum: Bytes }
 
-/// A segment as the manifest names it: its token, the generation that named it, its length, the
-/// stamps its rows are written under, which a row names by their places among them, and its tables.
-pub type Segment = { token: Bytes, at: Int, size: Int, stamps: List<Bytes>, parts: List<Part> }
+/// A segment as the manifest names it: its token, the generation that named it, its length and its
+/// tables.
+pub type Segment = { token: Bytes, at: Int, size: Int, parts: List<Part> }
 
-/// The segments a store is, oldest first; the generation of its last commit; and the floor: a
-/// segment named below it says what was kept and vouches for nothing.
-pub type Manifest = { generation: Int, floor: Int, segments: List<Segment> }
+/// The segments a store is, oldest first, and the generation of its last commit.
+pub type Manifest = { generation: Int, segments: List<Segment> }
 
 /// A store that holds nothing.
-pub fn nothing() -> Manifest = { generation: 0, floor: 0, segments: [] }
+pub fn nothing() -> Manifest = { generation: 0, segments: [] }
 
 fn manifest_name(shapes: Bytes) -> String / {abort.raise} =
   "manifest-" ++ shapes.slice(0, 8).hex_of()
@@ -86,8 +85,6 @@ fn segment_bytes(s: Segment) -> Bytes =
     s.token,
     u64_le(s.at),
     u64_le(s.size),
-    u32_le(s.stamps.len()),
-    Bytes::concat_all(s.stamps),
     u32_le(s.parts.len()),
     Bytes::concat_all(s.parts.map(part_bytes)),
   ])
@@ -97,7 +94,6 @@ fn manifest_bytes(m: Manifest) -> Bytes / {abort.raise} = {
     manifest_magic(),
     u32_le(format()),
     u64_le(m.generation),
-    u64_le(m.floor),
     u32_le(m.segments.len()),
     Bytes::concat_all(m.segments.map(segment_bytes)),
   ]);
@@ -129,9 +125,7 @@ fn segments_from(
   acc: List<Segment>,
 ) -> List<Segment> / {abort.raise} =
   if left <= 0 { acc } else {
-    let stamps = word_at(b, at + 24);
-    let after = at + 28 + stamps * 32;
-    let parts = parts_from(b, after + 4, word_at(b, after), []);
+    let parts = parts_from(b, at + 28, word_at(b, at + 24), []);
     segments_from(
       b,
       parts.at,
@@ -140,7 +134,6 @@ fn segments_from(
         token: b.slice(at, at + 8),
         at: long_at(b, at + 8),
         size: long_at(b, at + 16),
-        stamps: range(0, stamps).map(|i: Int| b.slice(at + 28 + i * 32, at + 60 + i * 32)),
         parts: parts.value,
       }),
     )
@@ -149,14 +142,9 @@ fn segments_from(
 /// The manifest `b` holds: none for bytes of another format, or that do not match their checksum.
 fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
   let n = b.len();
-  if n < 40 || b.slice(0, 8) != manifest_magic() || word_at(b, 8) != format() { None }
-  else if checksum(b.slice(0, n - 8)) != b.slice(n - 8, n) { None } else {
-    Some({
-      generation: long_at(b, 12),
-      floor: long_at(b, 20),
-      segments: segments_from(b, 32, word_at(b, 28), []),
-    })
-  }
+  if n < 32 || b.slice(0, 8) != manifest_magic() || word_at(b, 8) != format() { None }
+  else if checksum(b.slice(0, n - 8)) != b.slice(n - 8, n) { None }
+  else { Some({ generation: long_at(b, 12), segments: segments_from(b, 24, word_at(b, 20), []) }) }
 }
 
 /// The manifest the store in `dir` holds for `shapes`: nothing where there is none, or where what is
@@ -186,9 +174,6 @@ pub fn others<[r]>(dir: String, shapes: Bytes) -> Bool / {fs.read[r], abort.rais
       any || (name.starts_with("manifest-") && name != own && !name.starts_with(own ++ ".")),
   )
 }
-
-/// Whether `seg` lies below `m`'s floor.
-pub fn below_floor(m: Manifest, seg: Segment) -> Bool = seg.at < m.floor
 
 // --- A run's hold on a store -------------------------------------------------
 
@@ -461,15 +446,14 @@ pub fn table<v>(
 }
 
 /// The segment `token` names finished: what waits of `w` appended, then each of `tables` that holds
-/// a row, in order. What a manifest names it as, its rows written under `stamps`: none where the
-/// file system refused a write. The file is no part of the store until a manifest names it.
+/// a row, in order. What a manifest names it as: none where the file system refused a write. The
+/// file is no part of the store until a manifest names it.
 pub fn finished<[r]>(
   dir: String,
   shapes: Bytes,
   token: Bytes,
   w: Writing,
   tables: List<Table>,
-  stamps: List<Bytes>,
 ) -> Option<Segment> / {fs.write[r], abort.raise} = {
   let laid = tables.fold(
     { at: w.end, parts: [], bytes: [] },
@@ -489,8 +473,7 @@ pub fn finished<[r]>(
       },
   );
   let done = landed[r](dir, shapes, token, w, Bytes::concat_all(laid.bytes));
-  if done.dead { None }
-  else { Some({ token: token, at: 0, size: done.end, stamps: stamps, parts: laid.parts }) }
+  if done.dead { None } else { Some({ token: token, at: 0, size: done.end, parts: laid.parts }) }
 }
 
 /// What a commit came to: the manifest it wrote; `Held`, where another run would not let the lock
@@ -517,16 +500,12 @@ fn replaced<[r]>(
 }
 
 /// `seg` named as the newest segment of the store in `dir`: the manifest is read again under the
-/// store's lock, `seg` takes the next generation, and the manifest is replaced whole. `read` is
-/// the generation of the manifest the run that wrote `seg` read. Where another run has committed
-/// since, the floor goes above `seg` too: neither run saw what the other wrote, so nothing either
-/// kept is vouched for until it is checked again. `without` names segments the run found damaged:
-/// they are named no longer, and the floor rises to `seg`, which alone is vouched for. A `lasting`
-/// commit is synced to the disk before it answers.
+/// store's lock, `seg` takes the next generation, and the manifest is replaced whole. `without`
+/// names segments the run found damaged, which are named no longer. A `lasting` commit is synced to
+/// the disk before it answers.
 pub fn committed<[r]>(
   dir: String,
   shapes: Bytes,
-  read: Int,
   seg: Segment,
   without: List<Bytes> = [],
   lasting: Bool = false,
@@ -536,9 +515,6 @@ pub fn committed<[r]>(
     let at = now.generation + 1;
     let next = {
       generation: at,
-      floor: if now.generation != read { at + 1 }
-      else if without.len() > 0 { at }
-      else { now.floor },
       segments: now.segments.filter(|s: Segment| !without.contains(s.token)).push({
         ..seg,
         at: at,
@@ -551,7 +527,7 @@ pub fn committed<[r]>(
 
 /// The segments of `m` from the one at `from` on replaced by `seg`, which holds what they held,
 /// where the store's manifest is still `m`: how a merge lands, and `Moved` where a run committed
-/// while it worked. `seg` is vouched for as the segments it replaces were.
+/// while it worked.
 pub fn swapped<[r]>(
   dir: String,
   shapes: Bytes,
@@ -563,11 +539,7 @@ pub fn swapped<[r]>(
   if !fs.lock[r](lock_path(dir)) { Held } else {
     let now = manifest[r](dir, shapes);
     let at = m.generation + 1;
-    let next = {
-      generation: at,
-      floor: m.floor,
-      segments: m.segments.take(from).push({ ..seg, at: at }),
-    };
+    let next = { generation: at, segments: m.segments.take(from).push({ ..seg, at: at }) };
     let done = now.generation == m.generation && replaced[r](dir, shapes, seg.token, next, lasting);
     fs.unlock[r](lock_path(dir));
     if now.generation != m.generation { Moved } else if done { Named(next) } else { Unwritten }
@@ -653,8 +625,6 @@ pub fn swept<[r]>(
 
 fn test_shapes() -> Bytes = b"shapes".blake3()
 
-fn test_stamp() -> Bytes = b"stamp".blake3()
-
 /// A segment of the store in `dir` keeping `shapes`, holding `pairs`, each a frame and a row of its
 /// key and where the frame lies, in a table numbered one: what the manifest would name it as.
 fn written_as<[r]>(
@@ -674,14 +644,9 @@ fn written_as<[r]>(
       }
     },
   );
-  match finished[r](
-      dir,
-      shapes,
-      token,
-      placed.writing,
-      [table(1, placed.rows, |_: Bytes, at: Bytes| Some(at))],
-      [test_stamp()],
-    ) {
+  match finished[r](dir, shapes, token, placed.writing, [
+      table(1, placed.rows, |_: Bytes, at: Bytes| Some(at)),
+    ]) {
     Some(seg) -> seg,
     None -> panic("the test's file system refused a segment"),
   }
@@ -723,19 +688,17 @@ test "what a segment holds is read back through the manifest, the newest segment
       { key: b"a".blake3(), value: b"one" },
       { key: b"b".blake3(), value: b"two" },
     ]);
-    let m1 = named(committed[abs]("s", test_shapes(), 0, first));
+    let m1 = named(committed[abs]("s", test_shapes(), first));
     let second = written[abs]("s", b"token--2", [{ key: b"a".blake3(), value: b"anew" }]);
-    let m2 = named(committed[abs]("s", test_shapes(), m1.generation, second));
+    let m2 = named(committed[abs]("s", test_shapes(), second));
     {
       generations: [m1.generation, m2.generation],
-      floor: m2.floor,
       a: held[abs]("s", b"a".blake3()),
       b: held[abs]("s", b"b".blake3()),
       c: held[abs]("s", b"c".blake3()),
     }
   });
   assert_eq(run.value.generations, [1, 2]);
-  assert_eq(run.value.floor, 0);
   assert_eq(run.value.a, Some(b"anew"));
   assert_eq(run.value.b, Some(b"two"));
   assert_eq(run.value.c, None);
@@ -743,29 +706,23 @@ test "what a segment holds is read back through the manifest, the newest segment
   assert_eq(names_in(run.tree, "s").len(), 3)
 }
 
-test "a commit made over a manifest another run replaced raises the floor above both" {
+test "a commit made over a manifest another run replaced names both segments" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let a = written[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     let b = written[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
-    let first = named(committed[abs]("s", test_shapes(), 0, a));
-    let second = named(committed[abs]("s", test_shapes(), 0, b));
-    { first: first.floor, second: second, both: held[abs]("s", b"a".blake3()) }
+    committed[abs]("s", test_shapes(), a);
+    let second = named(committed[abs]("s", test_shapes(), b));
+    { second: second, a: held[abs]("s", b"a".blake3()), b: held[abs]("s", b"b".blake3()) }
   });
-  assert_eq(run.value.first, 0);
   assert_eq(run.value.second.generation, 2);
-  assert_eq(run.value.second.floor, 3);
-  assert(
-    run.value.second.segments.fold(true, |all: Bool, s: Segment|
-      all && below_floor(run.value.second, s)),
-  );
-  // What the earlier run kept is still there to be read.
-  assert_eq(run.value.both, Some(b"one"))
+  assert_eq(run.value.second.segments.len(), 2);
+  assert_eq([run.value.a, run.value.b], [Some(b"one"), Some(b"two")])
 }
 
 test "a manifest or a table that does not verify reads as none, never as part of one" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let seg = written[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
-    let m = named(committed[abs]("s", test_shapes(), 0, seg));
+    let m = named(committed[abs]("s", test_shapes(), seg));
     let whole = rows[abs]("s", m.segments.get(0), 1) != None;
     let torn = rows[abs](
       "s",
@@ -789,7 +746,7 @@ test "a manifest or a table that does not verify reads as none, never as part of
 test "a store keeping other shapes in the same directory has a manifest of its own" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let seg = written[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
-    committed[abs]("s", test_shapes(), 0, seg);
+    committed[abs]("s", test_shapes(), seg);
     manifest[abs]("s", b"other shapes".blake3())
   });
   assert_eq(run.value, nothing())
@@ -798,9 +755,9 @@ test "a store keeping other shapes in the same directory has a manifest of its o
 test "a merge lands only where no run committed while it worked, and replaces what it merged" {
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let a = written[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
-    let m1 = named(committed[abs]("s", test_shapes(), 0, a));
+    let m1 = named(committed[abs]("s", test_shapes(), a));
     let b = written[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
-    let m2 = named(committed[abs]("s", test_shapes(), m1.generation, b));
+    let m2 = named(committed[abs]("s", test_shapes(), b));
     let both = written[abs]("s", b"token--c", [
       { key: b"a".blake3(), value: b"one" },
       { key: b"b".blake3(), value: b"two" },
@@ -821,10 +778,10 @@ test "a merge lands only where no run committed while it worked, and replaces wh
   assert_eq(run.value.b, Some(b"two"))
 }
 
-fn sized(size: Int) -> Segment = { token: b"", at: 0, size: size, stamps: [], parts: [] }
+fn sized(size: Int) -> Segment = { token: b"", at: 0, size: size, parts: [] }
 
 test "the newest segments are due as one while each is at most twice what follows it" {
-  let due = |sizes: List<Int>| merging({ generation: 0, floor: 0, segments: sizes.map(sized) });
+  let due = |sizes: List<Int>| merging({ generation: 0, segments: sizes.map(sized) });
   // Nothing to merge: no segment, one, or a newest far smaller than the one before it.
   assert_eq(due([]), 0 - 1);
   assert_eq(due([400]), 0);
@@ -839,7 +796,7 @@ test "the newest segments are due as one while each is at most twice what follow
 test "a sweep removes what no manifest names, and nothing while another run is there" {
   let made = fs::on_mem[abs](fs::mem_of([{ path: "s/records/of-a", body: b"old" }]), || {
     let a = written[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
-    committed[abs]("s", test_shapes(), 0, a);
+    committed[abs]("s", test_shapes(), a);
     written[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
     written_as[abs]("s", b"other shapes".blake3(), b"token--o", [
       { key: b"o".blake3(), value: b"other" },
@@ -872,10 +829,10 @@ test "a sweep leaves the segments of a store of other shapes while its manifest 
   let other = b"other shapes".blake3();
   let made = fs::on_mem[abs](fs::mem_of([]), || {
     let a = written[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
-    committed[abs]("s", test_shapes(), 0, a);
+    committed[abs]("s", test_shapes(), a);
     written[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
     let o = written_as[abs]("s", other, b"token--o", [{ key: b"o".blake3(), value: b"other" }]);
-    committed[abs]("s", other, 0, o);
+    committed[abs]("s", other, o);
     let run = entered[abs]("s");
     swept[abs]("s", test_shapes(), match run { Some(path) -> path, None -> "" }, []);
     left[abs](run)

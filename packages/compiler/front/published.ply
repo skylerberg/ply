@@ -1,21 +1,20 @@
 //! The rows an analysis publishes for the driver.
 
-import compiler.syntax.parsing (Ident, QName, ParseDiag, dummy_span, parse_diag, parse_label, start,
-                                prelude_binder)
-import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, TDSum, SpecClause, SpecKind,
-                              SRequires, SEnsures, SCost, SSpace, FnDef, LawDef, OfSchema, Binder)
-import compiler.syntax.exprs (Expr, EVar, EApp, Param, expr_span, prelude_module)
-import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
-                           NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel, NHandle, NField,
-                           NUpdate, NKnown, CodeField, CodeArm, CodeClause, CodeStmt, CLet, CLetPat,
-                           CDo, CodePattern, CodePatternField, Capture, PxCtor, PxRecord, PxList,
-                           lower_fn)
-import compiler.check.types (Scheme, Type, Field, Atom, Resource, TyFn, TyVar, TyCon, TyRecord,
-                             TyNominal, int_type, unit_type, type_at, HeldType, held_type_bin,
-                             types_held, types_of, canonical_beside, resource_bin)
+import compiler.syntax.parsing (Span, Ident, ParseDiag, dummy_span, moved_by, parse_diag,
+                                parse_label, start)
+import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, TDSum, SpecKind, FnDef, LawDef,
+                              OfSchema)
+import compiler.syntax.exprs (expr_span, prelude_module, prelude_own)
+import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NIf,
+                           NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate,
+                           NParallel, NHandle, NField, NUpdate, NKnown, CodeField, CodeArm,
+                           CodeClause, CodeStmt, CLet, CLetPat, CDo, Capture, lower_fn)
+import compiler.check.types (Scheme, Type, Row, Field, Atom, Resource, TyFn, TyVar, TyCon, TyRecord,
+                             TyNominal, int_type, unit_type, HeldType, held_type_bin, types_held,
+                             types_of, canonical_beside, resource_bin)
 import compiler.syntax.type_syntax (Mode, mode_bin)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, ValueSpace, qualify,
-                                      module_of_name)
+import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify, module_of_name,
+                                      default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
 import compiler.check.resolve.scopes (find)
 import compiler.check.resolve.defaults (seeing_all)
@@ -24,18 +23,20 @@ import compiler.store.hash.forms (HashOutput, build_index, Fixing, by_name, reac
                                   Which, TheFn, TheDecl, TheItem)
 import compiler.store.hash (UseNode, hashed_and_unused, body_key, checked_hashes)
 import compiler.store.hash.printed (print_bodies, Printed, Unprintable)
+import compiler.check.typed
+import compiler.check.typed (TypedBody, TypedExpr, TypedCall, TypedRead, ReadDefinition, BodyPart,
+                             WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
+                             unwitnessed, typed_nodes, nodes_mapped, TypedNode, ReadBuiltin)
 import compiler.check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_root_facts,
-                             elaborated, ended, stated, elaboration_with, updated_mods,
-                             check_front_with, EmitFacts, Elaboration)
+                             elaborated, ended, stated, bodies_with, bodies_read, check_front_with,
+                             EmitFacts)
 import compiler.check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder,
-                                     LabelSite, TypedSite, TrySite, MemberSite, UpdateShape,
-                                     WitnessOp, WitnessRef, RowSite, witnessed, Builtin, builtins,
-                                     ReleaseSite)
+                                     MemberSite, witnessed, Builtin, builtins, ReleaseSite)
 import compiler.check.infer.definitions (natives_of)
-import compiler.emit.keys (test_owner, test_key)
+import compiler.emit.keys (test_owner, test_key, law_owner)
 import compiler.check.termination (Ends, Stated)
-import compiler.check.semantics (prelude_iterates)
 import compiler.check.lent (Passed)
+import compiler.check.semantics (prelude_iterates)
 import compiler.front.diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed,
                                    with_prelude_source)
 import compiler.front.pkg (PackageSources, Closure, closure, closed, pins_of, first_segment)
@@ -45,13 +46,11 @@ import std.prelude_source
 import std.bin
 import std.hash (blake3)
 import std.list
-import compiler.expand.rewrite (fn_has_update)
 import compiler.expand.embed (EmbedAt, ItemWants)
 import compiler.syntax.items (parse)
-import compiler.syntax.items (result_name)
-import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, EmitterCtor, Carry, KnownDefRow,
-                            KnownTestRow, Rows, known_def_row_bin, rows_bin, ModuleSpan, DefRow,
-                            TestRow, OpRow, EffectRow, HDef, HashFrame, Dump, answered_diag)
+import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows,
+                            known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow, HDef,
+                            HashFrame, Dump, answered_diag)
 import compiler.front.facts (Analysis, pkg_tables, toolchain_tree, tree_named, home_of, Tree,
                              NoTree)
 import compiler.front.seam (test_root_at, view_of, view_dump, Analysed, AnalysisOutcome, Refused,
@@ -118,16 +117,10 @@ type Gathered = { facts: RootFacts, missing: Option<Bytes> }
 /// `f`, a body's facts, gathered into `g`'s.
 fn joined_facts(g: RootFacts, f: RootFacts) -> RootFacts =
   {
-    label_sites: g.label_sites.concat(f.label_sites),
-    updates: g.updates.concat(f.updates),
-    ops: g.ops.concat(f.ops),
-    refs: g.refs.concat(f.refs),
-    tries: g.tries.concat(f.tries),
-    releases: g.releases.concat(f.releases),
     members: g.members.concat(f.members),
-    typed: g.typed.concat(f.typed),
+    releases: g.releases.concat(f.releases),
     types: types_joined(g.types, f.types),
-    rows: g.rows.concat(f.rows),
+    bodies: g.bodies.concat(f.bodies),
   }
 
 fn gathered(
@@ -166,30 +159,18 @@ pub fn facts_read(
     acc.insert(row.name, row.facts));
   let tests = rows.tests.fold(Map::new(), |acc: Map<Bytes, Bytes>, row: KnownTestRow|
     acc.insert(row.owner, row.facts));
-  // A law's sites are walked afresh by every check, so they come as they stand.
+  // A law's bodies are walked afresh by every check, so they come as they stand.
   let loose = w.loose.fold(
     { ..no_root_facts(), types: rows.types },
     |acc: RootFacts, l: { owner: Bytes, facts: RootFacts }| {
       let f = l.facts;
       joined_facts(acc, {
-        ..f,
-        label_sites: f.label_sites.fold([], |a: List<LabelSite>, x: LabelSite|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        updates: f.updates.fold([], |a: List<UpdateShape>, x: UpdateShape|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        ops: f.ops.fold([], |a: List<WitnessOp>, x: WitnessOp|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        refs: f.refs.fold([], |a: List<WitnessRef>, x: WitnessRef|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        tries: f.tries.fold([], |a: List<TrySite>, x: TrySite|
+        members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         releases: f.releases.fold([], |a: List<ReleaseSite>, x: ReleaseSite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        typed: f.typed.fold([], |a: List<TypedSite>, x: TypedSite|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        rows: f.rows.fold([], |a: List<RowSite>, x: RowSite|
+        types: f.types,
+        bodies: f.bodies.fold([], |a: List<TypedBody<Bytes>>, x: TypedBody<Bytes>|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
       })
     },
@@ -225,20 +206,12 @@ pub fn facts_read(
     None ->
       Ok({
         pure: w.pure,
-        label_sites: read.facts.label_sites,
-        elaboration: {
-          updates: read.facts.updates,
-          ops: read.facts.ops,
-          refs: read.facts.refs,
-          orders: w.orders.fold([], |acc: List<WitnessOrder>, x: WitnessOrder|
-            match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
-          tries: read.facts.tries,
-          releases: read.facts.releases,
-          members: read.facts.members,
-        },
-        typed: read.facts.typed,
+        orders: w.orders.fold([], |acc: List<WitnessOrder>, x: WitnessOrder|
+          match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
+        members: read.facts.members,
+        releases: read.facts.releases,
         types: read.facts.types,
-        rows: read.facts.rows,
+        bodies: read.facts.bodies,
       }),
   }
 }
@@ -597,7 +570,7 @@ pub fn checked_closure(h: Hashed, rows: Rows, walks: Walks) -> AnalysisOutcome /
         let kept = kept_calls(h.mods, checked);
         checked_hashes(
           h.hashes,
-          checked.facts.elaboration.members.concat(kept.sites),
+          checked.facts.members.concat(kept.sites),
           kept.unread,
           checked.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: TestInfo|
             if kept.unread.contains(test_owner(t.module, t.name)) { acc.insert(t.key, true) }
@@ -866,144 +839,6 @@ fn row_of(name: Bytes, b: Builtin) -> BuiltinRow =
     witnesses: witnessed(b.constraints).len(),
   }
 
-/// What `written` names in `module`: a definition by its program-wide name, else the name as
-/// written. The lowering names a function `std.prelude` writes in Ply as the builtin it is called
-/// as; one with an entry in `semantics` is named by its definition, whose clauses a reader reads.
-fn global_name(r: Resolved, module: Int, written: Bytes) -> Bytes / {abort.raise} = {
-  let q: QName = match written.index_of(b"::") {
-    Some(i) ->
-      {
-        module: Some({ name: written.slice(0, i), span: dummy_span() }),
-        name: { name: written.slice(i + 2, written.len()), span: dummy_span() },
-        span: dummy_span(),
-      },
-    None -> { module: None, name: { name: written, span: dummy_span() }, span: dummy_span() },
-  };
-  let prelude: QName = {
-    module: Some({ name: prelude_binder(), span: dummy_span() }),
-    name: { name: written, span: dummy_span() },
-    span: dummy_span(),
-  };
-  match find(r, module, ValueSpace, q) {
-    Some(b) -> b.qualified,
-    None -> if prelude_iterates(written) == None { written }
-    else { match find(r, module, ValueSpace, prelude) { Some(b) -> b.qualified, None -> written } },
-  }
-}
-
-fn named_pat(r: Resolved, m: Int, p: CodePattern) -> CodePattern / {abort.raise} =
-  match p {
-    PxCtor(c) ->
-      PxCtor({
-        name: global_name(r, m, c.name),
-        args: c.args.map(|a: CodePattern| named_pat(r, m, a)),
-      }),
-    PxRecord(rc) ->
-      PxRecord({
-        fields: rc.fields.map(|f: CodePatternField| { name: f.name, pat: named_pat(r, m, f.pat) }),
-        rest: rc.rest,
-      }),
-    PxList(l) ->
-      PxList({
-        items: l.items.map(|i: CodePattern| named_pat(r, m, i)),
-        rest: match l.rest { Some(x) -> Some(named_pat(r, m, x)), None -> None },
-      }),
-    _ -> p,
-  }
-
-fn named_fields(
-  resolved: Resolved,
-  m: Int,
-  fs: List<CodeField>,
-) -> List<CodeField> / {abort.raise} =
-  fs.map(|field: CodeField| { name: field.name, value: named(resolved, m, field.value) })
-
-fn named_opt(r: Resolved, m: Int, c: Option<Code>) -> Option<Code> / {abort.raise} =
-  match c { Some(x) -> Some(named(r, m, x)), None -> None }
-
-fn named_stmt(resolved: Resolved, m: Int, stmt: CodeStmt) -> CodeStmt / {abort.raise} =
-  match stmt {
-    CLet(l) -> CLet({ name: l.name, slot: l.slot, value: named(resolved, m, l.value) }),
-    CLetPat(l) ->
-      CLetPat({
-        span: l.span,
-        pat: named_pat(resolved, m, l.pat),
-        value: named(resolved, m, l.value),
-      }),
-    CDo(d) -> CDo({ code: named(resolved, m, d.code) }),
-  }
-
-/// `c`, lowered in module `m`, with each global it reads named program-wide, as a claim names it.
-pub fn named(resolved: Resolved, m: Int, c: Code) -> Code / {abort.raise} = {
-  let n = |x: Code| named(resolved, m, x);
-  let ns = |codes: List<Code>| codes.map(|x: Code| named(resolved, m, x));
-  let node = match c.node {
-    NLit(_) -> c.node,
-    NLabel(_) -> c.node,
-    NVar(v) -> match v.slot {
-      Some(_) -> c.node,
-      None -> NVar({ name: global_name(resolved, m, v.name), slot: None }),
-    },
-    NUnary(u) -> NUnary({ op: u.op, operand: n(u.operand) }),
-    NBinary(b) -> NBinary({ op: b.op, lhs: n(b.lhs), rhs: n(b.rhs) }),
-    NApp(a) -> NApp({ func: n(a.func), args: ns(a.args) }),
-    NKnown(_) -> c.node,
-    NIf(i) ->
-      NIf({ cond: n(i.cond), then_branch: n(i.then_branch), else_branch: n(i.else_branch) }),
-    NBlock(b) ->
-      NBlock({
-        stmts: b.stmts.map(|stmt: CodeStmt| named_stmt(resolved, m, stmt)),
-        tail: named_opt(resolved, m, b.tail),
-      }),
-    NList(l) -> NList({ items: ns(l.items) }),
-    NRecord(rc) -> NRecord({ fields: named_fields(resolved, m, rc.fields) }),
-    NMatch(x) ->
-      NMatch({
-        scrutinee: n(x.scrutinee),
-        arms: x.arms.map(|a: CodeArm|
-          {
-            pat: named_pat(resolved, m, a.pat),
-            guard: named_opt(resolved, m, a.guard),
-            body: named(resolved, m, a.body),
-          }),
-      }),
-    NPerform(p) ->
-      NPerform({
-        effect: p.effect,
-        op: p.op,
-        resource: p.resource,
-        label: named_opt(resolved, m, p.label),
-        args: ns(p.args),
-      }),
-    NLambda(l) -> NLambda({ ..l, body: n(l.body) }),
-    NSimulate(x) -> NSimulate({ ..x, body: n(x.body) }),
-    NParallel(x) -> NParallel({ ..x, branches: ns(x.branches) }),
-    NHandle(h) ->
-      NHandle({
-        body: n(h.body),
-        clauses: h.clauses.map(|clause: CodeClause|
-          {
-            effect: clause.effect,
-            op: clause.op,
-            resource: clause.resource,
-            label: named_opt(resolved, m, clause.label),
-            params: clause.params,
-            binds_label: clause.binds_label,
-            resume: clause.resume,
-            size: clause.size,
-            captures: clause.captures,
-            body: named(resolved, m, clause.body),
-            at: clause.at,
-          }),
-        ret: match h.ret { Some(x) -> Some({ ..x, body: n(x.body) }), None -> None },
-      }),
-    NField(f) -> NField({ base: n(f.base), field: f.field }),
-    NUpdate(u) ->
-      NUpdate({ base: n(u.base), copies: u.copies, sets: named_fields(resolved, m, u.sets) }),
-  };
-  { node: node, span: c.span }
-}
-
 /// What the prover reads of a program: each `fn`'s lowered body, clauses and `decreases` measure, and
 /// whether the checker saw its calls end, or saw them end only by the measures its group states; each
 /// sum type's variant count; and each law. A body the lowering does not take is `None`, which reads
@@ -1020,21 +855,97 @@ pub type Lowered = { at: ModuleSpan, code: Code }
 
 pub type ClaimClause = { kind: SpecKind, clause: Lowered }
 
-fn lowered(r: Resolved, m: Int, params: List<Ident>, expr: Expr) -> Code / {abort.raise} =
-  named(r, m, lower_fn(params, [], Map::new(), expr).code)
+/// The bodies a check settled, by owner.
+type Settled = Map<Bytes, List<TypedBody<Type>>>
 
-fn lowered_at(
-  resolved: Resolved,
-  m: Int,
-  params: List<Ident>,
-  expr: Expr,
-) -> Lowered / {abort.raise} =
-  { at: span_at(m, expr_span(expr)), code: lowered(resolved, m, params, expr) }
+fn settled_by_owner(bodies: List<TypedBody<Type>>) -> Settled =
+  bodies.fold(Map::new(), |m: Settled, b: TypedBody<Type>|
+    m.insert(b.owner, match m.get(b.owner) { Some(xs) -> xs.push(b), None -> [b] }))
+
+/// Body `part` of `owner`, whose item's text starts at `base`, as the prover reads it: lowered over
+/// its parameters, then the label parameters `labels`. None where the check settled none or it does
+/// not lower, which reads as unreached.
+fn claimed(
+  settled: Settled,
+  owner: Bytes,
+  part: BodyPart,
+  base: Int,
+  labels: List<Bytes> = [],
+) -> Option<Code> / {abort.raise} =
+  match settled_at(settled, owner, part, base) {
+    None -> None,
+    Some(b) -> {
+      let l = lower_fn(b.params, labels, b.body);
+      if l.failed.len() > 0 { None } else { Some(l.code) }
+    },
+  }
+
+/// Body `part` of `owner` as the prover reads it, drawing every type parameter as `Int`
+/// (`unwitnessed`), its places counted from the start of the program's text, the item's being at
+/// `base`.
+fn settled_at(
+  settled: Settled,
+  owner: Bytes,
+  part: BodyPart,
+  base: Int,
+) -> Option<TypedBody<Type>> / {abort.raise} =
+  match match settled.get(owner) {
+      Some(bs) -> bs.find(|b: TypedBody<Type>| b.part == part),
+      None -> None,
+    } {
+    None -> None,
+    Some(b) ->
+      Some(
+        body_retyped(unwitnessed(b), (), {
+          ty: |t: Type, u: Unit| { ty: t, state: u },
+          row: |r: Row| r,
+          atom: |a: Atom| a,
+          span: |sp: Span| moved_by(sp, base),
+        }).out,
+      ),
+  }
+
+/// The prelude's functions the prover models as builtins, by their names in the prelude: each
+/// builtin the prelude declares, written in Ply or not, but those that iterate, whose `cost` bounds
+/// it reads.
+pub fn prover_modelled() -> Map<Bytes, Bool> / {abort.raise} =
+  builtins().fold(Map::new(), |m: Map<Bytes, Bool>, b: Builtin|
+    match prelude_iterates(b.name) { Some(_) -> m, None -> m.insert(b.name, true) })
+
+/// The builtin the prover reads a read of definition `full` as: one of `modelled`, by its name in
+/// the prelude; none for any other read, a definition to it.
+pub fn prover_builtin(modelled: Map<Bytes, Bool>, full: Bytes) -> Option<Bytes> =
+  match prelude_own(full) {
+    Some(name) -> if modelled.contains(name) { Some(name) } else { None },
+    None -> None,
+  }
+
+/// `b` with each read of a definition `modelled` holds a read of the builtin it models.
+fn prelude_builtins(
+  modelled: Map<Bytes, Bool>,
+  b: TypedBody<Type>,
+) -> TypedBody<Type> / {abort.raise} =
+  {
+    ..b,
+    body: nodes_mapped(b.body, |n: TypedNode<Type>|
+      match n {
+        TypedRead(ReadDefinition(d)) -> match prover_builtin(modelled, d.full) {
+          Some(name) ->
+            TypedRead(ReadBuiltin({ name: name, args: d.args, rows: d.rows, witnesses: [] })),
+          None -> n,
+        },
+        _ -> n,
+      }),
+  }
+
+/// A clause the check settled, which it settles of every checked definition.
+fn clause_claimed(c: Option<Code>) -> Code / {abort.raise} =
+  match c { Some(x) -> x, None -> panic("a checked definition's clause the check did not settle") }
 
 /// `result` takes the slot after the parameters, as the obligation's binders place it. An opaque
 /// definition is claimed by its spec alone: what it promises, not how it is written.
 fn def_claim(
-  resolved: Resolved,
+  settled: Settled,
   m: Int,
   module: Bytes,
   def: FnDef,
@@ -1042,42 +953,35 @@ fn def_claim(
   ends: Bool,
   stated: Bool,
 ) -> Claim / {abort.raise} = {
-  let params = def.params.map(|param: Param| param.name);
+  let full = qualify(module, def.name.name);
+  let labels = def.generics.labels.map(|i: Ident| i.name);
+  let code = |part: BodyPart| claimed(settled, full, part, def.span.start, labels);
   let costed = range(0, def.params.len()).filter(|i: Int| def.params.get(i).cost != None);
-  let cost_names = def.params.fold([], |acc: List<Ident>, param: Param|
-    match param.cost { Some(k) -> acc.push(k), None -> acc });
   let spaced = range(0, def.params.len()).filter(|i: Int| def.params.get(i).space != None);
-  let space_names = def.params.fold([], |acc: List<Ident>, param: Param|
-    match param.space { Some(s) -> acc.push(s), None -> acc });
   // A `transparent` definition's body is part of what other modules read of it.
   let shown = !opaque || def.transparent != None;
   ClaimDef({
-    name: qualify(module, def.name.name),
+    name: full,
     ends: ends,
     stated: stated,
-    params: params.len(),
+    params: def.params.len(),
     costed: costed,
     spaced: spaced,
-    body: if shown { Some(lowered(resolved, m, params, def.body)) } else { None },
+    body: if shown { code(WholeBody) } else { None },
     measure: match def.decreases {
-      Some(e) -> if shown { Some(lowered(resolved, m, params, e)) } else { None },
+      Some(_) -> if shown { code(MeasureBody) } else { None },
       None -> None,
     },
-    spec: def.spec.map(|clause: SpecClause|
+    spec: range(0, def.spec.len()).map(|i: Int| {
+      let clause = def.spec.get(i);
       {
         kind: clause.kind,
-        clause: lowered_at(
-          resolved,
-          m,
-          match clause.kind {
-            SRequires -> params,
-            SEnsures -> params.push({ name: result_name(), span: clause.span }),
-            SCost -> params.concat(cost_names),
-            SSpace -> params.concat(space_names),
-          },
-          clause.expr,
-        ),
-      }),
+        clause: {
+          at: span_at(m, expr_span(clause.expr)),
+          code: clause_claimed(code(ClauseBody(i))),
+        },
+      }
+    }),
   })
 }
 
@@ -1109,13 +1013,13 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
   match c.node {
     NLit(_) -> c,
     NLabel(_) -> c,
-    NVar(v) -> match v.slot {
-      Some(s) -> match given.get(s) { Some(x) -> x, None -> c },
-      None -> c,
-    },
+    NVar(v) -> match given.get(v.slot) { Some(x) -> x, None -> c },
+    NDef(_) -> c,
+    NCtor(_) -> c,
+    NBuiltin(_) -> c,
     NUnary(u) -> { ..c, node: NUnary({ op: u.op, operand: g(u.operand) }) },
     NBinary(b) -> { ..c, node: NBinary({ op: b.op, lhs: g(b.lhs), rhs: g(b.rhs) }) },
-    NApp(a) -> { ..c, node: NApp({ func: g(a.func), args: gs(a.args) }) },
+    NApp(a) -> { ..c, node: NApp({ ..a, func: g(a.func), args: gs(a.args) }) },
     NKnown(_) -> c,
     NIf(i) ->
       {
@@ -1151,16 +1055,7 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
         }),
       },
     NPerform(p) ->
-      {
-        ..c,
-        node: NPerform({
-          effect: p.effect,
-          op: p.op,
-          resource: p.resource,
-          label: given_opt(p.label, given),
-          args: gs(p.args),
-        }),
-      },
+      { ..c, node: NPerform({ ..p, label: given_opt(p.label, given), args: gs(p.args) }) },
     NLambda(l) -> {
       let past = given_past(l.captures, given);
       { ..c, node: NLambda({ ..l, captures: past.captures, body: given_in(l.body, past.given) }) }
@@ -1174,6 +1069,7 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
       {
         ..c,
         node: NHandle({
+          ..h,
           body: g(h.body),
           clauses: h.clauses.map(|clause: CodeClause| {
             let past = given_past(clause.captures, given);
@@ -1206,32 +1102,43 @@ fn fn_named(module: Module, name: Bytes) -> Option<FnDef> =
 
 /// What an instantiation's guard or body states: its schema's, with what it was given written where
 /// the schema names its parameters, so the claim reads, proves and is cited as that law written out.
-/// `call` is the schema's definition called with the arguments and then the binders.
+/// `call` is the law's body as the check settled it, the schema's definition called with the
+/// arguments and then the binders.
 fn instantiated(
   mods: List<ParsedModule>,
-  r: Resolved,
-  m: Int,
+  settled: Settled,
   binders: Int,
   of: OfSchema,
-  call: Expr,
+  call: TypedExpr<Type>,
 ) -> Option<Code> / {abort.raise} =
-  match ((call, home_of(mods, of))) {
-    (EApp(a), Some(home)) -> match a.func {
-      EVar(callee) -> match fn_named(mods.get(home).module, callee.name.name.name) {
+  match ((call.node, home_of(mods, of))) {
+    (TypedCall(a), Some(home)) -> match a.callee.node {
+      TypedRead(ReadDefinition(callee)) -> match fn_named(
+          mods.get(home).module,
+          default_binder(callee.full),
+        ) {
         None -> None,
-        Some(def) -> {
-          let params = def.params.len() - binders;
-          let names = def.params.map(|param: Param| param.name);
-          let body = lowered(r, home, names.drop(params).concat(names.take(params)), def.body);
-          let given = range(0, params).fold(
-            Some(Map::new()),
-            |acc: Option<Map<Int, Code>>, k: Int|
-              match ((acc, a.args.at(k))) {
-                (Some(held), Some(arg)) -> Some(held.insert(binders + k, lowered(r, m, [], arg))),
-                _ -> None,
-              },
-          );
-          match given { Some(held) -> Some(given_in(body, held)), None -> None }
+        Some(def) -> match settled_at(settled, callee.full, WholeBody, def.span.start) {
+          None -> None,
+          Some(b) -> {
+            let params = def.params.len() - binders;
+            let l = lower_fn(b.params.drop(params).concat(b.params.take(params)), [], b.body);
+            let given = range(0, params).fold(
+              Some(Map::new()),
+              |acc: Option<Map<Int, Code>>, k: Int|
+                match ((acc, a.args.at(k))) {
+                  (Some(held), Some(arg)) -> {
+                    let x = lower_fn([], [], arg);
+                    if x.failed.len() > 0 { None } else { Some(held.insert(binders + k, x.code)) }
+                  },
+                  _ -> None,
+                },
+            );
+            match given {
+              Some(held) -> if l.failed.len() > 0 { None } else { Some(given_in(l.code, held)) },
+              None -> None,
+            }
+          },
         },
       },
       _ -> None,
@@ -1239,46 +1146,58 @@ fn instantiated(
     _ -> None,
   }
 
-/// A law's guard or body as the prover reads it.
+/// A law's guard or body, `part`, as the prover reads it.
 fn stating(
   mods: List<ParsedModule>,
-  r: Resolved,
-  m: Int,
+  settled: Settled,
+  owner: Bytes,
   law_def: LawDef,
-  expr: Expr,
-) -> Code / {abort.raise} = {
-  let names = law_def.binders.map(|binder: Binder| binder.name);
-  let written = match law_def.of {
-    Some(of) -> instantiated(mods, r, m, names.len(), of, expr),
-    None -> None,
-  };
-  match written { Some(w) -> w, None -> lowered(r, m, names, expr) }
-}
+  part: BodyPart,
+) -> Option<Code> / {abort.raise} =
+  match law_def.of {
+    Some(of) -> match settled_at(settled, owner, part, law_def.span.start) {
+      Some(b) -> match instantiated(mods, settled, law_def.binders.len(), of, b.body) {
+        Some(w) -> Some(w),
+        None -> claimed(settled, owner, part, law_def.span.start),
+      },
+      None -> None,
+    },
+    None -> claimed(settled, owner, part, law_def.span.start),
+  }
 
 fn law_claim(
   mods: List<ParsedModule>,
-  r: Resolved,
+  settled: Settled,
   m: Int,
   module: Bytes,
   law_def: LawDef,
-) -> Claim / {abort.raise} =
+) -> Claim / {abort.raise} = {
+  let owner = law_owner(module, law_def.name);
   ClaimLaw({
     key: qualify(module, law_def.name),
     guard: match law_def.guard {
-      Some(g) -> Some({ at: span_at(m, expr_span(g)), code: stating(mods, r, m, law_def, g) }),
+      Some(g) ->
+        Some({
+          at: span_at(m, expr_span(g)),
+          code: clause_claimed(stating(mods, settled, owner, law_def, typed::LawGuard)),
+        }),
       None -> None,
     },
-    body: stating(mods, r, m, law_def, law_def.body),
+    body: clause_claimed(stating(mods, settled, owner, law_def, typed::LawBody)),
   })
+}
 
 fn claims_of_modules(
   mods: List<ParsedModule>,
-  resolved: Resolved,
+  bodies: List<TypedBody<Type>>,
   wanted: List<Int>,
   opaque: (Bytes) -> Bool,
   ends: Map<Bytes, Bool>,
   stated: Map<Bytes, Bool>,
-) -> List<Claim> / {abort.raise} =
+) -> List<Claim> / {abort.raise} = {
+  // Each body as the prover reads it, the prelude's builtins it models among what it reads.
+  let modelled = prover_modelled();
+  let settled = settled_by_owner(bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, b)));
   wanted.fold([], |acc: List<Claim>, i: Int| {
     let m = mods.get(i);
     m.module.items.fold(acc, |a: List<Claim>, item: Item|
@@ -1287,7 +1206,7 @@ fn claims_of_modules(
           let name = qualify(m.name, d.name.name);
           a.push(
             def_claim(
-              resolved,
+              settled,
               i,
               m.name,
               d,
@@ -1302,10 +1221,11 @@ fn claims_of_modules(
           TDSum(vs) -> a.push(ClaimSum({ name: qualify(m.name, d.name.name), variants: vs.len() })),
           _ -> a,
         },
-        ILaw(d) -> a.push(law_claim(mods, resolved, i, m.name, d)),
+        ILaw(d) -> a.push(law_claim(mods, settled, i, m.name, d)),
         _ -> a,
       })
   })
+}
 
 pub fn claims(
   given: List<Source>,
@@ -1341,8 +1261,8 @@ pub fn claims(
 
         // `std.prelude`, read beside modules that leave it out, claims nothing of theirs.
         claims_of_modules(
-          updated_mods(x.mods, e.elaboration, x.r.signatures),
-          x.r,
+          x.mods,
+          e.bodies,
           range(0, given.len()),
           |m: Bytes| false,
           e.ends,
@@ -1353,21 +1273,21 @@ pub fn claims(
 }
 
 /// The claims of the modules at `wanted`, ascending and closed under imports, lowered as `claims`
-/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and what
-/// lowering reads of the checker — the shape of each record update — is what the check filed, as
-/// the emitter reads it. A module the run does not own is claimed by its specs.
+/// lowers them, from a program `analyse` checked: its parse and resolution are reused, and the
+/// bodies lowered are those the check settled, as the emitter reads them. A module the run does not
+/// own is claimed by its specs.
 pub fn claims_in(
   analysis: Analysis,
   wanted: List<Int>,
   owned: (Bytes) -> Bool = |m: Bytes| true,
 ) -> List<Claim> / {abort.raise} = {
-  let shapes = match facts_read(rows_of(analysis), walked_facts(analysis), None, analysis.mods) {
-    Ok(facts) -> facts.elaboration,
+  let bodies = match facts_read(rows_of(analysis), walked_facts(analysis), None, analysis.mods) {
+    Ok(facts) -> bodies_read(facts.bodies, facts.types),
     Err(_) -> rechecked(analysis, wanted),
   };
   claims_of_modules(
-    updated_mods(analysis.mods, shapes, analysis.r.signatures),
-    analysis.r,
+    analysis.mods,
+    bodies,
     wanted,
     |m: Bytes| !owned(m),
     ended(analysis.checked.defs),
@@ -1375,16 +1295,13 @@ pub fn claims_in(
   )
 }
 
-/// What the checker makes of each record update at `wanted`, walked again where the check filed no
-/// facts to read: every other definition and test is seeded with its rows.
-pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.raise} = {
+/// The bodies the check settles of the definitions at `wanted`, walked again where the check filed
+/// no facts to read: every other definition and test is seeded with its rows.
+pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>> / {abort.raise} = {
   let walked = wanted.fold(Map::new(), |acc: Map<Bytes, Bool>, i: Int| {
     let m = analysis.mods.get(i);
     m.module.items.fold(acc, |a: Map<Bytes, Bool>, item: Item|
-      match item {
-        IFn(d) -> if fn_has_update(d) { a.insert(qualify(m.name, d.name.name), true) } else { a },
-        _ -> a,
-      })
+      match item { IFn(d) -> a.insert(qualify(m.name, d.name.name), true), _ -> a })
   });
   let rows = rows_of(analysis);
   // The analysis held every promise already, so this check of it holds none again.
@@ -1396,9 +1313,9 @@ pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> Elaboration / {abort.
     },
     0,
   );
-  match elaboration_with(analysis.r, analysis.mods, known) {
+  match bodies_with(analysis.r, analysis.mods, known) {
     None -> panic("a program the front end checked does not check"),
-    Some(shapes) -> shapes,
+    Some(bodies) -> bodies,
   }
 }
 
@@ -1517,17 +1434,25 @@ test "the types a body binds and uses are filed by key, read from one table the 
           Some(r) -> match facts_at(r.facts, 0, b"") { Some(f) -> f, None -> no_root_facts() },
           None -> no_root_facts(),
         };
-      let read = |k: Bytes| type_at(rows.types, k, Map::new()).ty;
       // A row holds keys only: the types are the rows' one table's.
       assert_eq(sites(b"m.go").types.len(), 0);
+      let bodies = |name: Bytes| bodies_read(sites(name).bodies, rows.types);
       // `go` uses `first` at `Int`.
       assert_eq(
-        sites(b"m.go").typed.filter(|s: TypedSite| s.args.len() > 0).map(|s: TypedSite|
-          s.args.map(read)),
+        bodies(b"m.go").flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).fold(
+          [],
+          |acc: List<List<Type>>, e: TypedExpr<Type>|
+            match e.node { TypedRead(ReadDefinition(d)) -> acc.push(d.args), _ -> acc },
+        ),
         [[int_type()]],
       );
-      // `first` binds `x` at its own parameter, the scheme's first variable.
-      assert_eq(sites(b"m.first").typed.map(|s: TypedSite| read(s.ty)), [TyVar(0)])
+      // `first` takes `d` at its own type parameter, the scheme's first variable.
+      assert_eq(
+        bodies(b"m.first").flat_map(|b: TypedBody<Type>| b.params).filter(
+          |p: TypedParam<Type>| p.name == b"d",
+        ).map(|p: TypedParam<Type>| p.ty),
+        [TyVar(0)],
+      )
     },
   }
 }

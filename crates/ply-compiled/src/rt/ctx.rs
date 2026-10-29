@@ -9,13 +9,11 @@ pub(super) static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
-    /// Nested native calls the running stack is still allowed. A call spends one and its return
-    /// gives it back; a frame a failure returns through gives nothing back, so whatever runs on
-    /// past a failure first puts this where it stood. It is the running
-    /// stack's own: a switch saves it with the stack it leaves and puts back the other's.
+    /// A word the released compiler's code spends one of as a call starts and gives back as it
+    /// returns, calling [`rt_no_fuel`] at none: [`RELEASED_FUEL`], so it never runs out.
     pub fuel: i64,
-    /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
-    /// The watchdog raises it past every frame once the entry's clock runs out ([`watched`]).
+    /// The lowest address a compiled frame may begin at. The watchdog raises it past every frame
+    /// once the entry's clock runs out ([`watched`]).
     pub stack_floor: std::sync::atomic::AtomicUsize,
     /// The site the body stored before a fallible call, as bytes from its root's start; the root
     /// is `-1` until one is.
@@ -23,8 +21,8 @@ pub struct Ctx {
     pub site_start: i64,
     pub site_end: i64,
     // The runtime's own two, in the words between the fields emitted code reads.
-    /// The fuel this entry began with: how deeply its calls may nest.
-    pub(super) depth_bound: i64,
+    /// The wall clock the running entry may take, in milliseconds; 0 is none.
+    pub(super) time_budget_ms: u64,
     /// Chunks of stack this entry's calls made writable past what their stacks started with, so
     /// growing is observable.
     pub grown: u64,
@@ -63,9 +61,11 @@ pub struct Ctx {
     /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
     /// which only that task may leave.
     pub task: i64,
+    /// What compiled code takes a small block from the heap by, and gives one back to, without
+    /// calling the runtime: the heap's own, wherever the heap moves.
+    pub alloc: *mut crate::heap::Alloc,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
-    pub(super) time_budget_ms: u64,
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     pub(super) last_entry: usize,
@@ -195,9 +195,11 @@ pub fn with_running<T>(f: impl FnOnce(&Ctx) -> T) -> Option<T> {
 
 impl Ctx {
     pub fn new(tables: Arc<Tables>) -> Ctx {
+        let mut heap = Heap::new();
+        let alloc = heap.alloc();
         Ctx {
             failed: 0,
-            fuel: 0,
+            fuel: RELEASED_FUEL,
             stack_floor: std::sync::atomic::AtomicUsize::new(0),
             site_root: -1,
             site_start: 0,
@@ -216,11 +218,11 @@ impl Ctx {
             performed_start: 0,
             performed_end: 0,
             task: 0,
-            depth_bound: 0,
+            alloc,
             grown: 0,
             deadline: None,
             time_budget_ms: 0,
-            heap: Heap::new(),
+            heap,
             last_entry: 0,
             tables,
             diagnostic: None,
@@ -279,8 +281,6 @@ impl Ctx {
     /// what is left of its bounds, and nothing of its own, so it can run on another thread.
     pub(crate) fn branch(&self) -> Ctx {
         let mut b = Ctx::new(Arc::clone(&self.tables));
-        b.fuel = self.fuel;
-        b.depth_bound = self.depth_bound;
         b.deadline = self.deadline;
         b.time_budget_ms = self.time_budget_ms;
         b.entry = self.entry;
@@ -343,19 +343,17 @@ impl Ctx {
     }
 
     /// Between calls, and only between calls, with no clock.
-    pub fn begin(&mut self, fuel: i64) {
-        self.begin_bounded(fuel, 0);
+    pub fn begin(&mut self) {
+        self.begin_bounded(0);
     }
 
     /// [`Ctx::begin`], the entry bounded by `time_budget_ms` of wall clock, 0 for none. The context
     /// stays where it is until [`Ctx::end`], since the watchdog writes to it.
-    pub fn begin_bounded(&mut self, fuel: i64, time_budget_ms: u64) {
+    pub fn begin_bounded(&mut self, time_budget_ms: u64) {
         self.unwatch();
         self.failed = 0;
-        self.fuel = fuel;
-        self.depth_bound = fuel;
         self.grown = 0;
-        self.heap.scheduling = false;
+        self.heap.set_scheduling(false);
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)

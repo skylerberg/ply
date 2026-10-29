@@ -346,7 +346,7 @@ From loosest to tightest binding. All binary operators are left-associative.
     conditions show an `Int` divisor is not zero.
   - Overflow, a `Decimal` result that cannot be represented exactly, and a shift count that is
     negative or at least the type's width end the program (`E0502`). These are machine limits
-    like the call depth limit, and do not appear in effect rows.
+    like running out of stack, and do not appear in effect rows.
   - `<<` discards bits shifted out. The `checked_*` builtins return `None` instead of failing
     (§12).
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
@@ -1408,9 +1408,9 @@ clause resumes somewhere other than its tail (§6.6): it runs the body on a sepa
 calls nest. A group whose `handle`s return directly, resume in tail position, or handle a raise (as
 `try` does) keeps its loop.
 
-Every other call nests, up to 10,000 deep (`E0502` beyond that): `1 + f(n - 1)`, a call inside
-`handle`, `with_hold` or a lambda, and a call of another function. Each task has its own depth
-(§9).
+Every other call nests: `1 + f(n - 1)`, a call inside `handle`, `with_hold` or a lambda, and a call
+of another function. Only the stack bounds how deep calls nest. It holds a gigabyte, and a call
+that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
 
 A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
@@ -1958,7 +1958,7 @@ pattern does not match (§5.1); `iterate` past its budget; `task.join` of a canc
 
 - A signature that leaves `abort.raise` out of its row when its body can raise is `E0302`, which
   names the operation and offers the row to write.
-- Overflow and the call depth limit end the program regardless of the row.
+- Overflow and running out of stack end the program regardless of the row.
 - A clause for `abort.raise` receives the message: `panic`'s argument, or what would otherwise be
   reported.
 - Unhandled, it is `E0501` for a failed assertion and `E0502` for anything else.
@@ -3547,7 +3547,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | lists the standard library's modules. `--show [NAME]` (a module's source, or a data file a module embeds), `--digest`. Used by `ply bootstrap`: `--answers DIR` (precompute every standard library module's check results into `DIR/pack`), `--answering` (print one line identifying how this `ply` checks the standard library; two `ply`s that print the same line produce the same results). No path. |
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
-| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` documents the standard library, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
+| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
 | `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if the renamed program would not check, or a name in it would refer to something else. See **Renaming** below. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
@@ -3572,9 +3572,9 @@ their paths as written. `ply doc` works outside any package for builtins and the
 needs a C toolchain and takes a few seconds. Later runs reuse the compiled code.
 
 **Reusing earlier answers.** `ply check`, `ply test`, `ply run` and `ply defs` remember their last
-answer for the same command line. When nothing they read has changed since, they return it without
-loading the program; when something changed but every module still checks the same, they also
-reuse it.
+answer for the same command line. While nothing the run that made the answer read has changed,
+they return it without loading the program. Otherwise they load the program and check again only
+what reads something that changed.
 
 - `ply run --explain` says `reused` or `built` on stderr before the program starts, with timings
   (`front_end` in `--json`). A reused run still sets up permissions (`--allow`, `--exec`, `--fs`) and

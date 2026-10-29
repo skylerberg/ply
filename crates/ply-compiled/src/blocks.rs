@@ -13,9 +13,14 @@ use std::sync::atomic::{AtomicPtr, AtomicU32};
 use std::sync::{Mutex, PoisonError};
 
 /// A mapping's bytes, which it is aligned to, so a block's address names its segment and page.
-const SEGMENT: usize = 4 << 20;
-const PAGE: usize = 64 << 10;
+pub(crate) const SEGMENT: usize = 4 << 20;
+pub(crate) const PAGE: usize = 64 << 10;
 const PAGES: usize = SEGMENT / PAGE;
+/// How many classes, from the first, each hold the blocks of one count of words: a block of at most
+/// this many words is of the class its words number.
+pub(crate) const WORD_CLASSES: usize = 16;
+/// Where a dead block names the next dead one: its second word.
+pub(crate) const LINK_AT: usize = 8;
 /// The largest block a page holds.
 pub const SMALL: usize = 8 << 10;
 const CLASSES: usize = 65;
@@ -61,44 +66,48 @@ unsafe fn segment_given(segment: *mut Segment) {
 
 /// What other threads hand back to a heap: dead blocks, each naming the next in its second word.
 #[derive(Default)]
-struct Returned {
+pub(crate) struct Returned {
     small: AtomicPtr<u8>,
     large: AtomicPtr<u8>,
 }
 
-struct Page {
+/// Laid out as `compiler.emit.abi` declares `PlyPage`: compiled code takes a block from the page
+/// its class fills and gives one back to a page in place, as [`pop`] and [`Blocks::give`] do.
+#[repr(C)]
+pub(crate) struct Page {
     /// Dead blocks, each naming the next in its second word.
-    free: *mut u8,
+    pub(crate) free: *mut u8,
     /// Where the blocks never handed out begin, and where the page's blocks end.
-    fresh: *mut u8,
-    end: *mut u8,
+    pub(crate) fresh: *mut u8,
+    pub(crate) end: *mut u8,
     /// The heap whose thread alone touches the rest of this.
-    owner: AtomicPtr<Returned>,
+    pub(crate) owner: AtomicPtr<Returned>,
     /// Blocks of this page other threads are handing back to `owner` right now (see [`Handing`]).
-    handing: AtomicU32,
-    next: *mut Page,
-    prev: *mut Page,
+    pub(crate) handing: AtomicU32,
+    pub(crate) next: *mut Page,
+    pub(crate) prev: *mut Page,
     /// A block's bytes; zero while the page holds none and waits for any class.
-    block: u32,
-    live: u32,
-    class: u8,
+    pub(crate) block: u32,
+    pub(crate) live: u32,
+    pub(crate) class: u8,
     /// On its class's list, or on one of the lists of emptied pages.
-    listed: bool,
+    pub(crate) listed: bool,
     /// Emptied and kept as it is, not let go.
-    spare: bool,
+    pub(crate) spare: bool,
 }
 
 /// All zeros is a segment none of whose pages holds a block.
-struct Segment {
+#[repr(C)]
+pub(crate) struct Segment {
     /// Pages holding blocks.
     held: usize,
-    pages: [Page; PAGES],
+    pub(crate) pages: [Page; PAGES],
 }
 
 /// The size class of a block of `bytes`: every word count up to sixteen, then eight to a doubling.
 pub fn class_of(bytes: usize) -> usize {
     let words = bytes / 8;
-    if words <= 16 {
+    if words <= WORD_CLASSES {
         return words;
     }
     let n = words - 1;
@@ -108,10 +117,10 @@ pub fn class_of(bytes: usize) -> usize {
 
 /// The bytes of a class's blocks: the most a size of the class asks for.
 pub fn block_of(class: usize) -> usize {
-    if class <= 16 {
+    if class <= WORD_CLASSES {
         return class * 8;
     }
-    let k = class - 17;
+    let k = class - WORD_CLASSES - 1;
     (9 + k % 8) << (k / 8 + 4)
 }
 
@@ -144,7 +153,7 @@ unsafe fn room(page: *mut Page) -> (*mut u8, usize) {
 }
 
 unsafe fn link(block: *mut u8) -> *mut *mut u8 {
-    unsafe { block.add(8).cast() }
+    unsafe { block.add(LINK_AT).cast() }
 }
 
 /// The heap a block, of `bytes` when it was taken, was last handed out by or adopted into.
@@ -308,13 +317,25 @@ impl Drop for Handing {
     }
 }
 
+/// What compiled code reads and writes of a heap's blocks to take and give back a block in place,
+/// laid out as `compiler.emit.abi` declares `PlyFilling`.
+#[repr(C)]
+pub(crate) struct Filling {
+    /// By class, the pages with a block on hand, the first the one being filled.
+    pub(crate) pages: [*mut Page; CLASSES],
+    /// The heap's name, which each page it owns holds as its owner.
+    pub(crate) name: *const Returned,
+    /// Blocks handed out that had held an object before.
+    pub(crate) reused: usize,
+}
+
 /// One heap's blocks. Only the thread running the heap takes from it and gives to it; any thread
 /// may [`hand_back`] a block of it.
 pub struct Blocks {
     /// Boxed, so its address is the heap's name wherever the heap moves.
     returned: Box<Returned>,
-    /// By class, the pages with a block on hand, the first the one being filled.
-    filling: [*mut Page; CLASSES],
+    /// Boxed, so compiled code finds it wherever the heap moves.
+    filling: Box<Filling>,
     spare: *mut Page,
     spares: usize,
     /// Emptied pages let go, and pages never used.
@@ -324,21 +345,25 @@ pub struct Blocks {
     segments: BTreeSet<usize>,
     /// The bytes of each block the system allocator holds, by its address.
     large: BTreeMap<usize, usize>,
-    reused: usize,
 }
 
 impl Default for Blocks {
     fn default() -> Blocks {
+        let returned = Box::<Returned>::default();
+        let filling = Box::new(Filling {
+            pages: [null_mut(); CLASSES],
+            name: &raw const *returned,
+            reused: 0,
+        });
         Blocks {
-            returned: Box::default(),
-            filling: [null_mut(); CLASSES],
+            returned,
+            filling,
             spare: null_mut(),
             spares: 0,
             clean: null_mut(),
             empty: 0,
             segments: BTreeSet::new(),
             large: BTreeMap::new(),
-            reused: 0,
         }
     }
 }
@@ -346,6 +371,11 @@ impl Default for Blocks {
 impl Blocks {
     fn name(&self) -> *mut Returned {
         (&raw const *self.returned).cast_mut()
+    }
+
+    /// What compiled code takes blocks from and gives them back to, wherever these blocks move.
+    pub(crate) fn filling(&mut self) -> *mut Filling {
+        &raw mut *self.filling
     }
 
     /// A block of at least `bytes`, a multiple of eight, holding whatever was last there.
@@ -366,9 +396,9 @@ impl Blocks {
                 return block;
             }
             let class = class_of(bytes);
-            let page = self.filling[class];
+            let page = self.filling.pages[class];
             if !page.is_null() {
-                let block = pop(page, &mut self.reused);
+                let block = pop(page, &mut self.filling.reused);
                 if !block.is_null() {
                     return block;
                 }
@@ -382,20 +412,20 @@ impl Blocks {
     unsafe fn refill(&mut self, class: usize) -> *mut u8 {
         unsafe {
             loop {
-                let page = self.filling[class];
+                let page = self.filling.pages[class];
                 if page.is_null() {
                     if self.regain(self.name()) {
                         continue;
                     }
                     let page = self.page(class);
-                    push(&mut self.filling[class], page);
+                    push(&mut self.filling.pages[class], page);
                     continue;
                 }
-                let block = pop(page, &mut self.reused);
+                let block = pop(page, &mut self.filling.reused);
                 if !block.is_null() {
                     return block;
                 }
-                unlink(&mut self.filling[class], page);
+                unlink(&mut self.filling.pages[class], page);
             }
         }
     }
@@ -483,11 +513,11 @@ impl Blocks {
             (*page).live -= 1;
             let class = (*page).class as usize;
             if (*page).live == 0 {
-                if self.filling[class] != page {
+                if self.filling.pages[class] != page {
                     self.retire(page);
                 }
             } else if !(*page).listed {
-                push_behind(&mut self.filling[class], page);
+                push_behind(&mut self.filling.pages[class], page);
             }
         }
     }
@@ -497,7 +527,7 @@ impl Blocks {
     unsafe fn retire(&mut self, page: *mut Page) {
         unsafe {
             if (*page).listed {
-                unlink(&mut self.filling[(*page).class as usize], page);
+                unlink(&mut self.filling.pages[(*page).class as usize], page);
             }
             self.shelve(page);
             let segment = segment_of(page);
@@ -629,7 +659,7 @@ impl Blocks {
 
     /// Blocks handed out that had held an object before.
     pub fn reused(&self) -> usize {
-        self.reused
+        self.filling.reused
     }
 
     /// Takes over everything `other` holds: its blocks are this heap's from here on, and its pages
@@ -647,7 +677,7 @@ impl Blocks {
                     if (*page).live > 0 {
                         (*page).owner.store(self.name(), SeqCst);
                         if (*page).listed {
-                            push_behind(&mut self.filling[(*page).class as usize], page);
+                            push_behind(&mut self.filling.pages[(*page).class as usize], page);
                         }
                     } else if (*page).block > 0 || (*page).spare {
                         // A page the branch was filling holds no live block and was never retired.
@@ -671,7 +701,7 @@ impl Blocks {
             other.quiet();
             self.segments.append(&mut other.segments);
             self.large.append(&mut other.large);
-            self.reused += other.reused;
+            self.filling.reused += other.filling.reused;
             self.regain(other.name());
         }
     }
@@ -707,12 +737,12 @@ impl Blocks {
                 Some(address) == kept
             });
             *self.returned = Returned::default();
-            self.filling = [null_mut(); CLASSES];
+            self.filling.pages = [null_mut(); CLASSES];
+            self.filling.reused = 0;
             self.spare = null_mut();
             self.spares = 0;
             self.clean = null_mut();
             self.empty = 0;
-            self.reused = 0;
             if let Some(address) = kept {
                 let segment = address as *mut Segment;
                 segment.write_bytes(0, 1);
