@@ -2,8 +2,8 @@
 //! refused by name when it is malformed, and a secret that reaches no stream; a test reads the
 //! environment as a run does.
 
-import harness (scratch, Ran, program, write, on_disk, on_disk_with, spawned, said, stdout, stderr,
-                json_of, at, path, items, str, int, truth, shown, Reached, Shipped, Spawned)
+import harness (scratch, Ran, program, write, on_disk, spawned, said, stdout, stderr, json_of, at,
+                path, items, str, int, truth, shown, Spawned)
 import std.json (Json)
 import std.process (Var, var)
 import std.string
@@ -51,15 +51,10 @@ fn secret_main() -> String =
   \\  }
   \\
 
-/// `ply` in the test's directory with `vars` for its environment.
-fn with_env(
-  argv: List<String>,
-  vars: List<Var>,
-) -> Ran / {Reached, Shipped, abort.raise, diverges} = on_disk_with(argv, vars, None)
-
-/// Its whole output is the resolved configuration, so precedence is read from it.
-fn hosts(extra: List<String>, vars: List<Var>) -> Ran / {Reached, Shipped, abort.raise, diverges} =
-  with_env(["hosts", "--json"].concat(extra), vars)
+/// Its whole output is the resolved configuration, so precedence is read from it. A schema is entered
+/// on a unit of the program compiled for it, which only a `ply` of its own may do.
+fn hosts(extra: List<String>, vars: List<Var>) -> Ran / {Spawned, abort.raise} =
+  spawned(["hosts", "--json"].concat(extra), vars)
 
 fn key_of(report: Json, name: String) -> Json / {abort.raise} =
   match items(path(report, ["configuration", "keys"])).filter(|k: Json|
@@ -70,31 +65,29 @@ fn key_of(report: Json, name: String) -> Json / {abort.raise} =
 
 fn region_of(ran: Ran) -> Json / {abort.raise} = key_of(json_of(ran), "SERVICE_REGION")
 
-test "precedence is set, then file, then environment, then default" {
-  scratch(|| {
-    program(service());
-    write("deploy.env", "SERVICE_REGION=file\n");
-    let schema = ["--config-schema", "m.spec", "--set", "SERVICE_PORT=8137"];
-    let everything = [var("SERVICE_REGION", "environment"), var("SERVICE_API_KEY", "k")];
+test/nondet "precedence is set, then file, then environment, then default" {
+  program(service());
+  write("deploy.env", "SERVICE_REGION=file\n");
+  let schema = ["--config-schema", "m.spec", "--set", "SERVICE_PORT=8137"];
+  let everything = [var("SERVICE_REGION", "environment"), var("SERVICE_API_KEY", "k")];
 
-    let all = region_of(
-      hosts(schema.concat(["--set", "SERVICE_REGION=set", "--config", "deploy.env"]), everything),
-    );
-    assert_eq(str(at(all, "value")), "set");
-    assert_eq(str(at(all, "source")), "--set");
+  let all = region_of(
+    hosts(schema.concat(["--set", "SERVICE_REGION=set", "--config", "deploy.env"]), everything),
+  );
+  assert_eq(str(at(all, "value")), "set");
+  assert_eq(str(at(all, "source")), "--set");
 
-    let no_set = region_of(hosts(schema.concat(["--config", "deploy.env"]), everything));
-    assert_eq(str(at(no_set, "value")), "file");
-    assert_eq(str(at(no_set, "source")), "deploy.env");
+  let no_set = region_of(hosts(schema.concat(["--config", "deploy.env"]), everything));
+  assert_eq(str(at(no_set, "value")), "file");
+  assert_eq(str(at(no_set, "source")), "deploy.env");
 
-    let no_files = region_of(hosts(schema, everything));
-    assert_eq(str(at(no_files, "value")), "environment");
-    assert_eq(str(at(no_files, "source")), "env");
+  let no_files = region_of(hosts(schema, everything));
+  assert_eq(str(at(no_files, "value")), "environment");
+  assert_eq(str(at(no_files, "source")), "env");
 
-    let nothing = region_of(hosts(schema, [var("SERVICE_API_KEY", "k")]));
-    assert_eq(str(at(nothing, "value")), "us");
-    assert_eq(str(at(nothing, "source")), "default")
-  })
+  let nothing = region_of(hosts(schema, [var("SERVICE_API_KEY", "k")]));
+  assert_eq(str(at(nothing, "value")), "us");
+  assert_eq(str(at(nothing, "source")), "default")
 }
 
 test "a malformed config file is E0440 naming the file and line" {
@@ -127,85 +120,69 @@ test "an unreadable config file is E0440" {
   })
 }
 
-test "a required key nothing supplies is E0441 at startup" {
-  scratch(|| {
-    program(service());
-    let r = with_env(["run", "--config-schema", "m.spec"], []);
-    let text = stderr(r);
-    assert(r.code != 0, Some(text));
-    assert(text.contains("E0441"), Some(text));
-    assert(text.contains("SERVICE_PORT"), Some(text));
-    assert(text.contains("SERVICE_API_KEY"), Some(text));
-    assert(text.contains("environment variable"), Some(text));
-    assert(
-      !text.contains("binding host"),
-      Some("the refusal comes before anything is bound: " ++ text),
-    )
-  })
+test/nondet "a required key nothing supplies is E0441 at startup" {
+  program(service());
+  let r = spawned(["run", "--config-schema", "m.spec"], []);
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0441"), Some(text));
+  assert(text.contains("SERVICE_PORT"), Some(text));
+  assert(text.contains("SERVICE_API_KEY"), Some(text));
+  assert(text.contains("environment variable"), Some(text));
+  assert(
+    !text.contains("binding host"),
+    Some("the refusal comes before anything is bound: " ++ text),
+  )
 }
 
-test "a value that is not of its shape is E0442 naming the source" {
-  scratch(|| {
-    program(service());
-    let r = with_env(["run", "--config-schema", "m.spec", "--set", "SERVICE_PORT=eight"], [
-      var("SERVICE_API_KEY", "k"),
-    ]);
-    let text = stderr(r);
-    assert(r.code != 0, Some(text));
-    assert(text.contains("E0442"), Some(text));
-    assert(text.contains("SERVICE_PORT"), Some(text));
-    assert(text.contains("--set"), Some(text));
-    assert(text.contains("eight"), Some("a plain value is shown: " ++ text))
-  })
+test/nondet "a value that is not of its shape is E0442 naming the source" {
+  program(service());
+  let r = spawned(["run", "--config-schema", "m.spec", "--set", "SERVICE_PORT=eight"], [
+    var("SERVICE_API_KEY", "k"),
+  ]);
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0442"), Some(text));
+  assert(text.contains("SERVICE_PORT"), Some(text));
+  assert(text.contains("--set"), Some(text));
+  assert(text.contains("eight"), Some("a plain value is shown: " ++ text))
 }
 
 // The one refusal that must not quote what it refused.
-test "a malformed secret is E0442 and prints no value" {
-  scratch(|| {
-    program(service());
-    let r = with_env(
-      [
-        "run",
-        "--config-schema",
-        "m.spec",
-        "--set",
-        "SERVICE_PORT=8137",
-        "--set",
-        "SERVICE_API_KEY=",
-      ],
-      [],
-    );
-    let text = stderr(r);
-    assert(r.code != 0, Some(text));
-    assert(text.contains("E0442"), Some(text));
-    assert(text.contains("SERVICE_API_KEY"), Some(text));
-    assert(text.contains("not printed"), Some(text))
-  })
+test/nondet "a malformed secret is E0442 and prints no value" {
+  program(service());
+  let r = spawned(
+    ["run", "--config-schema", "m.spec", "--set", "SERVICE_PORT=8137", "--set", "SERVICE_API_KEY="],
+    [],
+  );
+  let text = stderr(r);
+  assert(r.code != 0, Some(text));
+  assert(text.contains("E0442"), Some(text));
+  assert(text.contains("SERVICE_API_KEY"), Some(text));
+  assert(text.contains("not printed"), Some(text))
 }
 
-test "an undeclared set warns and an undeclared environment key does not" {
-  scratch(|| {
-    program(service());
-    let r = with_env(
-      [
-        "hosts",
-        "--config-schema",
-        "m.spec",
-        "--set",
-        "SERVICE_PORT=8137",
-        "--set",
-        "SERVICE_PROT=8138",
-      ],
-      [var("SERVICE_API_KEY", "k"), var("AWS_PROFILE", "nothing to do with this program")],
-    );
-    assert(r.code == 0, Some(stderr(r)));
-    assert(said(r).contains("W0607"), Some(said(r)));
-    assert(said(r).contains("SERVICE_PROT"), Some(said(r)));
-    assert(
-      !said(r).contains("AWS_PROFILE"),
-      Some("an environment name is not a typo somebody made in this run: " ++ said(r)),
-    )
-  })
+test/nondet "an undeclared set warns and an undeclared environment key does not" {
+  program(service());
+  let r = spawned(
+    [
+      "hosts",
+      "--config-schema",
+      "m.spec",
+      "--set",
+      "SERVICE_PORT=8137",
+      "--set",
+      "SERVICE_PROT=8138",
+    ],
+    [var("SERVICE_API_KEY", "k"), var("AWS_PROFILE", "nothing to do with this program")],
+  );
+  assert(r.code == 0, Some(stderr(r)));
+  assert(said(r).contains("W0607"), Some(said(r)));
+  assert(said(r).contains("SERVICE_PROT"), Some(said(r)));
+  assert(
+    !said(r).contains("AWS_PROFILE"),
+    Some("an environment name is not a typo somebody made in this run: " ++ said(r)),
+  )
 }
 
 test "a config schema naming no definition lists what the program has" {
@@ -256,32 +233,28 @@ test/nondet "a secret arrives as a secret and appears in no stream" {
     assert(!stream.contains("correct-horse"), Some("the credential reached a stream: " ++ stream)))
 }
 
-test "the JSON report carries a secret's key and source and not its value" {
-  scratch(|| {
-    program(secret_main());
-    let r = hosts(["--config-schema", "m.spec"], [var("SERVICE_API_KEY", "correct-horse")]);
-    let key = key_of(json_of(r), "SERVICE_API_KEY");
-    assert_eq(str(at(key, "value")), "****");
-    assert_eq(str(at(key, "source")), "env");
-    assert(truth(at(key, "secret")), Some(shown(key)));
-    assert(!stdout(r).contains("correct-horse"), Some(stdout(r)))
-  })
+test/nondet "the JSON report carries a secret's key and source and not its value" {
+  program(secret_main());
+  let r = hosts(["--config-schema", "m.spec"], [var("SERVICE_API_KEY", "correct-horse")]);
+  let key = key_of(json_of(r), "SERVICE_API_KEY");
+  assert_eq(str(at(key, "value")), "****");
+  assert_eq(str(at(key, "source")), "env");
+  assert(truth(at(key, "secret")), Some(shown(key)));
+  assert(!stdout(r).contains("correct-horse"), Some(stdout(r)))
 }
 
-test "a test supplying configuration is det and cached" {
-  scratch(|| {
-    program(service());
-    let report = json_of(on_disk(["test", "--json"]));
-    assert(truth(at(report, "ok")), Some(shown(report)));
-    let second = json_of(on_disk(["test", "--json"]));
-    assert(truth(at(second, "ok")), Some(shown(second)));
-    assert(
-      int(path(second, ["summary", "cached"])) == 1,
-      Some("the second run is a cache hit: " ++ shown(second)),
-    );
-    assert(int(path(second, ["selection", "selected"])) == 0, Some(shown(second)));
-    assert(int(path(second, ["selection", "by_code"])) == 0, Some(shown(second)))
-  })
+test/nondet "a test supplying configuration is det and cached" {
+  program(service());
+  let report = json_of(spawned(["test", "--json"]));
+  assert(truth(at(report, "ok")), Some(shown(report)));
+  let second = json_of(spawned(["test", "--json"]));
+  assert(truth(at(second, "ok")), Some(shown(second)));
+  assert(
+    int(path(second, ["summary", "cached"])) == 1,
+    Some("the second run is a cache hit: " ++ shown(second)),
+  );
+  assert(int(path(second, ["selection", "selected"])) == 0, Some(shown(second)));
+  assert(int(path(second, ["selection", "by_code"])) == 0, Some(shown(second)))
 }
 
 /// Of a `ply test --json` with `vars`, how many tests the cache answered.
@@ -303,24 +276,22 @@ test/nondet "a test that reads configuration is cached while each key it read an
   assert_eq(cached_with(us.push(var("SERVICE_UNREAD", "any"))), 2)
 }
 
-test "an unhandled config read in a det test is E0412" {
-  scratch(|| {
-    program(
-      \\import std.config
-      \\import std.config (config)
-      \\
-      \\pub fn region() -> Option<String> / {config.read[server]} =
-      \\  config.get[server]("SERVICE_REGION")
-      \\
-      \\test "reaches the environment" {
-      \\  assert_eq(region(), None)
-      \\}
-      \\
-    );
-    let r = on_disk(["test"]);
-    assert(r.code != 0, Some(stderr(r)));
-    assert(stderr(r).contains("E0412"), Some(stderr(r)))
-  })
+test/nondet "an unhandled config read in a det test is E0412" {
+  program(
+    \\import std.config
+    \\import std.config (config)
+    \\
+    \\pub fn region() -> Option<String> / {config.read[server]} =
+    \\  config.get[server]("SERVICE_REGION")
+    \\
+    \\test "reaches the environment" {
+    \\  assert_eq(region(), None)
+    \\}
+    \\
+  );
+  let r = spawned(["test"]);
+  assert(r.code != 0, Some(stderr(r)));
+  assert(stderr(r).contains("E0412"), Some(stderr(r)))
 }
 
 test/nondet "a run and a test read configuration from the environment, `--set` over it" {
