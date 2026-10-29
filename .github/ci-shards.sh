@@ -489,7 +489,8 @@ ci_files() {
 # compared: it is the part a restore can match on, and the part both sides spell out. A cache is
 # for what a miss only slows: the repository's other runs evict any entry while a run's jobs wait
 # for runners, so a key that names the run is one a later run reads, and none is restored with
-# `fail-on-cache-miss`.
+# `fail-on-cache-miss`. No job restores a key it saved: the cache does not always show a key at once
+# after a save, so the read fails a save that worked.
 cmd_cache_keys() {
   local files=() file family
   for family in ${PER_JOB[@]+"${PER_JOB[@]}"}; do
@@ -519,6 +520,7 @@ cmd_cache_keys() {
       if (key == "") return
       steplit[++nlit] = key
       if (kind == "save") {
+        jobsaved[key] = FILENAME ":" FNR
         if (per_job(key) && index(value, key "${{ matrix.id }}-") == 0) jobless[++njobless] = FILENAME ":" FNR " saves \"" key "\""
         if (key in saved) return
         saved[key] = 1
@@ -530,6 +532,7 @@ cmd_cache_keys() {
         read[key] = 1
       } else {
         read[key] = 1
+        if (key in jobsaved) readback[++nreadback] = FILENAME ":" FNR " restores \"" key "\", which its job saved at " jobsaved[key]
       }
     }
     # A step is done: what it saves is saved from its path, and what it restores is only an entry
@@ -542,7 +545,9 @@ cmd_cache_keys() {
       if (mode == "restore" && stepfail && steprun) needed[++nneeded] = stepwhere
       nlit = 0; steppath = ""; inpath = 0; stepfail = 0; steprun = 0
     }
-    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
+    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0; split("", jobsaved) }
+    # A job of a workflow is a run of steps of its own.
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); mode = ""; inkeys = 0; split("", jobsaved); next }
     # A new list item is a new step; the rules below read the one they are in.
     /^[[:space:]]*-[[:space:]]/ { flush(); mode = ""; inkeys = 0 }
     /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
@@ -629,6 +634,10 @@ cmd_cache_keys() {
       # evicted, and a re-run of it fails the same way.
       for (i = 1; i <= nneeded; i++) {
         printf "FAIL: %s restores a key that names the run with fail-on-cache-miss: what a job needs from another job of its run goes as an artifact\n", needed[i] > "/dev/stderr"
+        bad = 1
+      }
+      for (i = 1; i <= nreadback; i++) {
+        printf "FAIL: %s: the cache does not always show a key at once after a save\n", readback[i] > "/dev/stderr"
         bad = 1
       }
       nf = split(families, fk, " ")
