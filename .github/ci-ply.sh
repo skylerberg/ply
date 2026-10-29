@@ -2,11 +2,13 @@
 # The Ply runs (`ci-shards.sh`'s), each one `ply test` of a package: over the CLI's suite with the
 # grants its harness drives `ply` with, from a scratch directory of the run's own, or a package's own
 # suite as `ply test` runs it, the standard library's among them; the proof runs, the standard
-# library's (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each. A run fails when a test fails or a claim does not hold, when the run refuses, and
-# when it selects no test or proves no claim, so a renamed test never stops being run quietly; a part
-# of the CLI's suite takes the tests whose keys hash to it, which may be none. It fails too when its
-# load ran a body again because a store had lost the answer its record names, which is a run made
-# cold by a defect and not by an edit.
+# library's (`proofs`) and each package's (`laws-<id>`), are a `ply prove` each. Each prints every
+# result to the log as it finishes, on standard error, and the report `--json` writes when it ends
+# is read for the rest. A run fails when a test fails or a claim does not hold, when the run refuses
+# or ends without a report, and when it selects no test or proves no claim, so a renamed test never
+# stops being run quietly; a part of the CLI's suite takes the tests whose keys hash to it, which may
+# be none. It fails too when its load ran a body again because a store had lost the answer its
+# record names, which is a run made cold by a defect and not by an edit.
 #
 #   ci-ply.sh run ID [ARG...]
 #       the runs the job ID takes (`ci-shards.sh job-runs ID`), in turn, or one run, or one module
@@ -108,6 +110,20 @@ stopped_run() {
   echo "::error::the run $2 was stopped at the job's deadline after $((($(now_ms) - $1) / 1000))s: what it finished is kept, and a re-run of this job starts from it"
 }
 
+# Whether the run left a report at $1: a `ply` that crashed or was killed wrote none.
+reported() {
+  jq -e 'type == "object"' "$1" > /dev/null 2>&1
+}
+
+# What the run ID says when it ended with STATUS and no report. What it finished is in the log above.
+unreported() {
+  if (($2 > 128)); then
+    echo "the run $1 crashed: signal $(($2 - 128)) ended it before it wrote a report" >&2
+  else
+    echo "the run $1 exited with status $2 and wrote no report" >&2
+  fi
+}
+
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
 # directory of its own, which its harness empties before each test and refuses without the marker,
 # and any other package as `ply test` runs it, granted nothing.
@@ -141,12 +157,19 @@ timed() {
   jq -r --arg p "$2" '.results[]? | "\((.duration_ms // 0) | floor)\t\($p)\t\(.key // .name)"' "$1" 2>/dev/null
 }
 
-# Each test a run ran, with how it ended, its seconds, why it ran (the read that moved, for a
-# `changed` one) and `unfiled` for a pass no trace stands in for; and each it took from the cache.
+# Why each test a run ran was selected (the read that moved, for a `changed` one), with `unfiled`
+# for a pass no trace stands in for; and each test it took from the cache. How each one that ran
+# ended was printed as it finished.
 listed() {
-  jq -r '(.selection.tests // [] | map({key: .key, value: (.reason + (if .moved then ": " + .moved else "" end))}) | from_entries) as $why
-    | (.results[]? | "\(.status)\t\(((.duration_ms // 0) / 100 | floor) / 10)s\t\(.key // .name)\t\($why[.key // .name] // "")\(if .cached == false then " (unfiled)" else "" end)"),
-      (.selection.tests[]? | select(.reason == "cached") | "cached\t\t\(.key)")' "$1" 2>/dev/null
+  jq -r '(.results // [] | map({key: (.key // .name), value: .cached}) | from_entries) as $ran
+    | .selection.tests[]? | .key as $key
+    | select(.reason == "cached" or ($ran | has($key)))
+    | "\(.reason)\t\($key)\(if .moved then ": " + .moved else "" end)\(if $ran[$key] == false then " (unfiled)" else "" end)"' "$1" 2>/dev/null
+}
+
+# How the tests of a run ended, counted.
+summed() {
+  jq -r '.summary // {} | "summary: \(.passed // 0) passed, \(.failed // 0) failed, \(.abandoned // 0) abandoned, \(.cached // 0) cached"' "$1" 2>/dev/null
 }
 
 # What a report's load took of the stores as kept, what it ran anew, and how many of those it ran
@@ -182,8 +205,8 @@ placed() {
   for filter in ${rest%%"$TAB"*}; do picked+=(--filter "$filter"); done
 }
 
-# `ply test` of the run ID with ARGs added: each test it ran, where its time went, and what failed.
-# STOPPED when the deadline ended it.
+# `ply test` of the run ID with ARGs added: each test's result as it finishes, then why each ran,
+# where the time went, and what failed. STOPPED when the deadline ended it.
 tests_of() {
   local id=$1 path part status=0 selected out started
   local -a picked=()
@@ -197,7 +220,13 @@ tests_of() {
     rm -f "$out"
     return "$STOPPED"
   fi
+  if ! reported "$out"; then
+    unreported "$id" "$status"
+    rm -f "$out"
+    return 1
+  fi
   listed "$out"
+  summed "$out"
   timed "$out" "$path" >> "$durations"
   spent "$out" "$(($(now_ms) - started))"
   selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
@@ -220,7 +249,8 @@ tests_of() {
 }
 
 # `ply prove` of the run ID with ARGs added, the library's and its fixtures' claims (`proofs`) or a
-# package's (`laws-<id>`); it fails when it proves no claim. STOPPED when the deadline ended it.
+# package's (`laws-<id>`): each claim as it is decided, then the tally. It fails when it proves no
+# claim. STOPPED when the deadline ended it.
 proofs_of() {
   local id=$1 path part status=0 out started all cached discharging
   local -a picked=()
@@ -233,6 +263,11 @@ proofs_of() {
     stopped_run "$started" "$id"
     rm -f "$out"
     return "$STOPPED"
+  fi
+  if ! reported "$out"; then
+    unreported "$id" "$status"
+    rm -f "$out"
+    return 1
   fi
   discharging=$(jq '(.duration_ms // 0) | floor' "$out" 2>/dev/null || echo 0)
   all=$(jq '.obligations // [] | length' "$out" 2>/dev/null || echo 0)
@@ -281,7 +316,7 @@ store_dirs() {
 
 # The stores of kept records, the emitter's answers among them, each a directory `sweep` takes whole
 # (its `STORES`).
-stores=ply-c-cache/bodies
+stores="ply-c-cache/bodies"
 
 # Each store a run since the mark used, into DIR whole: its manifest and segments, without what a
 # run holds open in it.
@@ -338,7 +373,13 @@ case "${1:-}" in
     done
     [ "${#args[@]}" -gt 0 ] || { echo "usage: ci-ply.sh nightly [MODULE...] [ARG...]" >&2; exit 2; }
     tested "$(work cli-tests)" "${args[@]}" > "$out" || status=$?
+    if ! reported "$out"; then
+      unreported nightly "$status"
+      rm -f "$out"
+      exit 1
+    fi
     listed "$out"
+    summed "$out"
     selected=$(jq -s 'map(.selection.tests // [] | length) | add // 0' "$out" 2>/dev/null || echo 0)
     if [ "$status" -ne 0 ] || [ "$selected" -eq 0 ]; then
       [ "$selected" -gt 0 ] || echo "the nightly run selected no test" >&2
@@ -363,7 +404,7 @@ case "${1:-}" in
     # A kept store replaces the one in place whole: it grew from it, and the segments of two
     # manifests do not mix file by file.
     for store in "$dir/$stores"/*/; do
-      [ -d "$store" ] && rm -rf "$caches/$stores/$(basename "$store")"
+      [ -d "$store" ] && rm -rf "${caches:?}/$stores/$(basename "$store")"
     done
     tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
     ;;
