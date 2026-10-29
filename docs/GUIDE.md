@@ -2342,8 +2342,12 @@ is a host resource, an at-most-once operation on it refuses the second resumptio
 `test "label" { ... }` is an item with a block body (§6.5 shows one). A test cannot be `pub`,
 referenced or given arguments.
 
-- A test is identified as `<module>.<label>`. Two tests (or two laws) in one module cannot share a
-  label (`E0105`). A test over cases is identified by its label as written, holes and all.
+- A test is identified as `<module>.<name>`, and its name is its label as written, holes and all.
+  Two tests (or two laws) in one module cannot share a label (`E0105`), with one exception: two
+  tests over cases may share a label that has holes, as long as their case types or tables are
+  written differently. Each of their cases is named by the label it produces (below). A test whose
+  label an earlier test has is named by the label followed by the first of ` (2)`, ` (3)`, … that
+  no test has as its label or name.
 - The body must have type `Unit`: a test passes when it finishes, so one that ends with a value
   (such as a comparison missing its `assert`) is `E0201`.
 - `assert(cond)`, `assert(cond, Some("why"))` and `assert_eq(actual, expected)` fail with `E0501`.
@@ -2407,18 +2411,19 @@ test "resolves {c.reference}" for c: Resolution in resolutions() {
   many cases read it. A record literal in it is a `new` record when the case type is one (§4.2).
 - The name is bound in the body and in the label. The label is read like an interpolated string
   (§2.3): each `{expr}` is a hole, and `{{` and `}}` are braces.
-- Each case is identified by the label its holes produce, so cases must produce distinct labels. A
-  table with two cases that produce the same label fails as one test, naming the label and both
-  positions, and no case runs. Two identical cases produce the same label, and a label with no
-  holes fits only a table of one case.
+- Each case is identified as `<module>.<label>`, using the label its holes produce, so every case
+  and test in a module needs its own label. If a case has the same label as another case in its
+  table, another test's name or a case of another test, its test fails as a whole with `E0105`,
+  naming the label, and none of its cases runs. Two identical cases produce the same label, and a label with no holes
+  fits only a table of one case.
 - Cases are told apart by their value as built, which is finer than `==`: `1.5m` and `1.50m` are
   two cases, as are two values of a keyed type (§4.4) whose keys are equal. So one case's pass
   never stands for a case its body could tell apart.
 - The case type must be hashable without a `key` (`derivable(hash, ·)`, `E0206`): no `Float`,
   function, `Task`, `Chan` or `Secret`, including inside a keyed type.
 - Cases are listed before any test runs, so the table and the label may raise (any `raise`
-  operation, §6.8) but do nothing else (`E0469`). A table that raises fails as one test under the
-  label as written. An empty table is no test.
+  operation, §6.8) but do nothing else (`E0469`). A table that raises fails as a whole, under the
+  test's name. An empty table is no test.
 - A tagged literal (§2.3) in a table, a label hole or a body is checked when the program loads, like
   any other.
 - A module with a test over cases imports `std.cases` automatically, so `std.cases` itself cannot
