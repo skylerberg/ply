@@ -115,7 +115,7 @@ fn a_block_freed_at_another_size_than_it_was_allocated_at_is_refused() {
 fn a_kept_block_is_immortal_and_outlives_the_entry_that_made_it() {
     let mut ctx = context();
     let kept: Alloc = helper("rt_alloc_kept");
-    ctx.begin(1_000);
+    ctx.begin();
     let w = unsafe { kept(&mut ctx, 32) };
     unsafe { *(w as *mut Word).byte_add(HEADER) = 42 };
     assert_eq!(count(w), IMMORTAL);
@@ -166,7 +166,7 @@ fn a_native_object_is_given_back_with_what_it_holds() {
 fn a_hold_keeps_what_it_holds_at_the_word_the_runtime_describes() {
     use ply_compiled::c::builtin_helper_name;
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let held = alloc(&mut ctx, sized(1));
     let made: Counted = helper(&builtin_helper_name("?hold_made"));
     let h = unsafe { made(&mut ctx, held) };

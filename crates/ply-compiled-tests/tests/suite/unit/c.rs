@@ -234,46 +234,29 @@ fn a_unit_compiles_loads_binds_and_answers() {
     let native = loaded.expect("the unit loads");
     assert_eq!(native.names(), ["m.probe"]);
     assert_eq!(native.arity("m.probe"), Some(2));
-    let answer = units::entered(&native, "m.probe", 10, &[imm(20), imm(22)]).expect("it answers");
+    let answer = units::entered(&native, "m.probe", &[imm(20), imm(22)]).expect("it answers");
     assert_eq!(imm_value(answer), 42);
 }
 
-/// The prologue a body opens with: the fuel it spends, and room asked for on the stack it runs on
-/// where its frame lies below the floor.
-const PROLOGUE: &str = "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n\
-     \x20 { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n\
-     \x20 ctx->fuel -= 1;\n";
+/// The prologue a body opens with: room asked for on the stack it runs on where its frame lies below
+/// the floor.
+const PROLOGUE: &str = "  { char probe; if ((uintptr_t)&probe < ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
-/// `ladder(n)` is `n` calls deep, none of them a tail call, each frame a kilobyte and more;
-/// `spin` has no base case.
-fn deep_calls() -> [units::Def; 2] {
+/// `ladder(n)` is `n` calls deep, none of them a tail call, each frame a kilobyte and more.
+fn deep_calls() -> [units::Def; 1] {
     let ladder = units::symbol("m.ladder");
-    let spin = units::symbol("m.spin");
-    [
-        def(
-            "m.ladder",
-            1,
-            &format!(
-                "{PROLOGUE}  volatile char pad[1024];\n\
-                 \x20 int64_t n = ply_imm_value(p0);\n\
-                 \x20 pad[n & 1023] = 1;\n\
-                 \x20 Word r = ply_imm(0);\n\
-                 \x20 if (n > 0) {{ r = {ladder}(ctx, ply_imm(n - 1)); if (ctx->failed) return 0; r = ply_imm(ply_imm_value(r) + pad[n & 1023]); }}\n\
-                 \x20 ctx->fuel += 1;\n\
-                 \x20 return r;"
-            ),
+    [def(
+        "m.ladder",
+        1,
+        &format!(
+            "{PROLOGUE}  volatile char pad[1024];\n\
+             \x20 int64_t n = ply_imm_value(p0);\n\
+             \x20 pad[n & 1023] = 1;\n\
+             \x20 Word r = ply_imm(0);\n\
+             \x20 if (n > 0) {{ r = {ladder}(ctx, ply_imm(n - 1)); if (ctx->failed) return 0; r = ply_imm(ply_imm_value(r) + pad[n & 1023]); }}\n\
+             \x20 return r;"
         ),
-        def(
-            "m.spin",
-            1,
-            &format!(
-                "{PROLOGUE}  Word r = {spin}(ctx, ply_imm(ply_imm_value(p0) + 1));\n\
-                 \x20 if (ctx->failed) return 0;\n\
-                 \x20 ctx->fuel += 1;\n\
-                 \x20 return ply_imm(ply_imm_value(r) + 1);"
-            ),
-        ),
-    ]
+    )]
 }
 
 /// Twenty megabytes of frames and more: past a stack's first two chunks.
@@ -308,7 +291,7 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
     let native = loaded.expect("the unit loads");
     let mut ctx = native.context();
-    ctx.begin(DEEP * 2);
+    ctx.begin();
     let mut u = Unknown {
         ctx: &raw mut ctx,
         entry: native.entry("m.ladder").expect("`m.ladder` is taken"),
@@ -330,8 +313,8 @@ fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
 }
 
 /// A recursion past a stack's first chunk makes the stack writable further down and answers on
-/// it, so how deep a program nests is what its fuel says. An entry begun where the runtime knows no
-/// stack is given one of its own.
+/// it, so a program nests as deeply as its stack's reservation holds. An entry begun where the
+/// runtime knows no stack is given one of its own.
 #[test]
 fn a_recursion_past_a_stacks_first_chunk_grows_it_in_place_and_answers() {
     let Some((answer, grown, failed, raised)) = ladder_from_an_unknown_stack() else {
@@ -357,7 +340,7 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
             let native = loaded.expect("the unit loads");
             let entry = native.entry("m.ladder").expect("`m.ladder` is taken");
             let mut ctx = native.context();
-            ctx.begin(DEEP * 2);
+            ctx.begin();
             let args = [imm(DEEP)];
             let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
             let failed = ctx.failed;
@@ -379,35 +362,6 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
     assert!(raised.contains("what the native stack holds"), "{raised}");
 }
 
-/// Growing is not a licence to recurse for ever: depth is the fuel's to bound.
-#[test]
-fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some(loaded) = units::opened(dir.path(), &deep_calls(), |_| {}) else {
-        return;
-    };
-    let native = loaded.expect("the unit loads");
-    let entry = native.entry("m.spin").expect("`m.spin` is taken");
-    let mut ctx = native.context();
-    ctx.begin(10_000);
-    let here = 0u8;
-    (ctx.stack_floor).store(std::ptr::from_ref(&here) as usize - 64 * 1024, Relaxed);
-    let args = [imm(0)];
-    let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
-    let failed = ctx.failed;
-    let raised = ctx.take_failure().map(|d| d.message).unwrap_or_default();
-    ctx.end();
-    assert_eq!(
-        failed,
-        ply_compiled::rt::FAILED_OUT_OF_FUEL,
-        "a runaway recursion ended some other way: {raised}"
-    );
-    assert!(
-        raised.contains("recursion limit of 10000 nested calls exceeded"),
-        "{raised}"
-    );
-}
-
 /// A loop's restart probes the floor as a prologue does, reading it anew each pass.
 const RESTART: &str = "  ply_loop: { char probe; if ((uintptr_t)&probe < (uintptr_t)*(volatile int64_t *)&ctx->stack_floor && !rt_stack_more_p(ctx)) return 0; }\n";
 
@@ -426,7 +380,7 @@ fn a_loop_past_its_clock_ends_at_its_next_restart() {
     let native = loaded.expect("the unit loads");
     let entry = native.entry("m.forever").expect("`m.forever` is taken");
     let mut ctx = native.context();
-    ctx.begin_bounded(1_000, 20);
+    ctx.begin_bounded(20);
     let args = [imm(0)];
     let _ = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
@@ -449,7 +403,7 @@ fn an_entry_that_ended_before_its_clock_ran_out_is_left_alone() {
         return;
     };
     let mut ctx = loaded.expect("the unit loads").context();
-    ctx.begin_bounded(1_000, 1);
+    ctx.begin_bounded(1);
     ctx.end();
     ctx.stack_floor.store(7, Relaxed);
     std::thread::sleep(std::time::Duration::from_millis(50));

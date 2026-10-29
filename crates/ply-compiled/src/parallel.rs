@@ -185,6 +185,9 @@ impl Handed {
         let site_was = heap::poison::swap(&raw const c.site_root);
         let running_was = crate::rt::swap_running(ctx);
         branch.answer = call(ctx, branch.closure);
+        if c.failed == crate::rt::FAILED_OUT_OF_STACK {
+            crate::rt::let_go_below_here();
+        }
         let_go(ctx, branch.closure);
         // A reactor belongs to the thread that made it, and this branch is over.
         c.runtime = None;

@@ -334,7 +334,7 @@ fn entered(entry: &str, grants: &Grants) -> Launched {
             }));
         }
     };
-    let run = entry::Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64);
+    let run = entry::Run::unbounded();
     let outcome = entry::enter(
         &opened,
         entry,

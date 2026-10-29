@@ -33,7 +33,8 @@ import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, SiteHere,
                                    Unsettled, Entering, ForwardsLaid, ForwardsSet, ObjectAt,
                                    InstanceIn, Bridge, Answering, Keyed, Answers, Resumes, Stops,
-                                   Forwarded, Returning, VarInit, VarRead, VarWrite, raised_at)
+                                   Forwarded, Returning, VarInit, VarRead, VarWrite, raised_at,
+                                   task_at)
 import compiler.emit.typing (Typed)
 import compiler.check.infer.checker (FiledRows, RowArguments, Performs, prelude_effects, EffectInfo,
                                      OpInfo)
@@ -1400,7 +1401,12 @@ test "a clause on every label is its object's slot, handed the label it binds be
           _ -> acc,
         },
     ),
-    [ObjectAt({ at: 9, slots: [Answering({ entry: Resumes, record: 5, labelled: true })] })],
+    [
+      ObjectAt({
+        at: raised_at() + 4,
+        slots: [Answering({ entry: Resumes, record: raised_at(), labelled: true })],
+      }),
+    ],
   );
   assert_eq(f.sites.map(|s: HandleSite| s.detached), [None])
 }
@@ -1417,13 +1423,19 @@ test "clauses of one operation on a label and on every label are a table its slo
     // The object past the variables, then its table.
     [
       ObjectAt({
-        at: 13,
+        at: raised_at() + 8,
         slots: [
           Keyed({
-            table: 16,
+            table: raised_at() + 11,
             rows: [
-              { label: Some(2), enters: Answering({ entry: Answers, record: 5, labelled: false }) },
-              { label: None, enters: Answering({ entry: Answers, record: 9, labelled: true }) },
+              {
+                label: Some(2),
+                enters: Answering({ entry: Answers, record: raised_at(), labelled: false }),
+              },
+              {
+                label: None,
+                enters: Answering({ entry: Answers, record: raised_at() + 4, labelled: true }),
+              },
             ],
           }),
         ],
@@ -1446,7 +1458,10 @@ test "a detached body's block is the heap's, forwarding what is around its handl
   assert_eq(laid, [
     ForwardsLaid(13),
     ObjectAt({ at: 7, slots: [Forwarded({ target: 5, task: 6, record: 10 })] }),
-    ObjectAt({ at: 9, slots: [Answering({ entry: Stops, record: raised_at(), labelled: false })] }),
+    ObjectAt({
+      at: raised_at() + 4,
+      slots: [Answering({ entry: Stops, record: raised_at(), labelled: false })],
+    }),
   ]);
   let instance = f.ops.fold(
     [],
@@ -1458,7 +1473,7 @@ test "a detached body's block is the heap's, forwarding what is around its handl
       [],
       |acc: List<Option<Arg>>, o: { var: Var, op: HandleOp, args: List<Arg>, uses: Uses }|
         match o.op {
-          ObjectAt(x) -> if x.at == 9 { acc.push(o.args.at(0)) } else { acc },
+          ObjectAt(x) -> if x.at == raised_at() + 4 { acc.push(o.args.at(0)) } else { acc },
           _ -> acc,
         },
     ),
@@ -1562,7 +1577,7 @@ test "a label's clauses print as entries and tables over the instance, a detache
   }
 }
 
-test "each handle opens an instance where its body runs, detached or not, at the fuel it stands at" {
+test "each handle opens an instance where its body runs, detached or not, owned by the task that opens it" {
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
@@ -1582,7 +1597,7 @@ test "each handle opens an instance where its body runs, detached or not, at the
         match printed_by_form(p, n) { Ok(t) -> t, Err(why) -> n.concat(b": ").concat(why) });
       let named_if = |keep: (Bytes) -> Bool|
         range(0, names.len()).filter(|k: Int| keep(texts.get(k))).map(|k: Int| names.get(k));
-      assert_eq(named_if(|t: Bytes| t.index_of(b"[0] = ctx->fuel;") == None), [])
+      assert_eq(named_if(|t: Bytes| t.index_of(task_set()) == None), [])
     },
   }
 }
@@ -1646,8 +1661,8 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> match printed_by_form(p, b"guarded") {
       Err(why) -> assert_eq(why, b""),
-      // The handle opens where its instance takes the fuel it stands at.
-      Ok(t) -> match t.index_of(b"[0] = ctx->fuel;") {
+      // The handle opens where its instance takes the task opening it.
+      Ok(t) -> match t.index_of(task_set()) {
         None -> assert(false),
         Some(from) -> {
           // The body runs to the last jump to its landing.
@@ -1662,6 +1677,9 @@ test "a body that fails inside a handle leaves by the handle's landing, whatever
     },
   }
 }
+
+/// What a `handle` writes as it opens into its instance's word for the task opening it.
+fn task_set() -> Bytes = Bytes::concat_all([b"[", ascii_of_int(task_at()), b"] = ctx->task;"])
 
 /// The C name `text` declares last before `end`, as `Word name` declares it.
 fn declared_before(text: Bytes, end: Bytes) -> Bytes / {abort.raise} =
@@ -1704,12 +1722,12 @@ test "a handle over an instance sets and reads each of its words through the ins
           Bytes::concat_all([b" = (Word)(intptr_t)(", array, b" + 4);"]),
         );
         assert(array != b"" && instance != b"", said);
-        // Its fuel is set and its landing taken through it, and the clauses' closures read it as
+        // Its task is set and its landing taken through it, and the clauses' closures read it as
         // their capture: no closure the handle lays out is indexed as its words.
         let target = t.split(b"ctx->target == ").get(1);
         assert(target.starts_with(instance.concat(b")")), said);
         assert(
-          t.index_of(Bytes::concat_all([b"((Word *)(intptr_t)", instance, b")[0] = ctx->fuel;"]))
+          t.index_of(Bytes::concat_all([b"((Word *)(intptr_t)", instance, b")", task_set()]))
             != None,
           said,
         );

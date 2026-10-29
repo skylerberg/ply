@@ -10,8 +10,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 
-/// The address space each stack reserves: 10,000 nested calls of frames past 100 KB each, so the
-/// fuel ends a recursion before its stack does.
+/// The address space each stack reserves, which bounds how deeply a computation on it nests.
 pub const RESERVE: usize = 1 << 30;
 
 /// Made writable at a time, from the top down; a stack starts with one.

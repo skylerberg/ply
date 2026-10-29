@@ -223,7 +223,7 @@ pub unsafe extern "C" fn rt_shipped_entered(
         let arguments = unsafe { lent(ap, an) }.to_vec();
         let run = Run {
             timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
-            ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
+            ..Run::unbounded()
         };
         let answered = entry::on_program_thread(|| {
             match entry::enter(&opened, &root, arguments, &run, None, None).ended {

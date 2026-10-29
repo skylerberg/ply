@@ -13,7 +13,7 @@ fn a_hold_lends_and_hands_back_the_word_it_was_made_of_and_refuses_a_read_once_l
     let read: Held = helper("builtin_elaborated_hold_read");
     let taken: Held = helper("builtin_elaborated_hold_taken");
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let c: *mut Ctx = &mut ctx;
     // Raw words the runtime would take for objects, if it read them: it never does.
     for word in [4096i64, 8, 0, -8] {

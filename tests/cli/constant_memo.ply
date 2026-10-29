@@ -1,6 +1,6 @@
 //! A nullary pure definition is a constant: its body runs once per unit, and every later read is
-//! the memo's. Told by the call depth limit: each probe reads a definition from deep enough that
-//! running its body there would pass the limit, so only a read the memo answers comes back.
+//! the memo's. Told by the updates a run counts: each body writes an array in place, so a probe
+//! that ran a body twice counts twice the writes of one run.
 
 import harness (Here, Shipped, Loaded, entered, loaded, project, scratch, unloaded)
 import cli.machine
@@ -17,39 +17,30 @@ fn constants() -> String =
   \\
   \\fn main() -> Int = 0
   \\
-  \\fn deep(n: Int) -> Int = if n <= 0 { 0 } else { 1 + deep(n - 1) }
+  \\fn filled(xs: Array<Int>, i: Int) -> Array<Int> =
+  \\  if i < 0 || i >= xs.len() { xs } else { filled(xs.set(i, i), i + 1) }
   \\
-  \\pub fn constant() -> Int = deep(6000)
+  \\pub fn constant() -> Int = filled(Array::of_list([0, 0, 0, 0, 0, 0, 0, 0]), 0).len()
   \\
-  \\pub fn parameterized(ignored: Int) -> Int = deep(6000)
+  \\pub fn parameterized(ignored: Int) -> Int = filled(Array::of_list([0, 0, 0, 0, 0, 0, 0, 0]), 0).len()
   \\
   \\// Performs nothing; the row is the published claim and is what decides this.
-  \\pub fn over_declared() -> Int / {store.read} = deep(6000)
-  \\
-  \\fn nest_constant(n: Int) -> Int = if n <= 0 { constant() } else { nest_constant(n - 1) + 0 }
-  \\
-  \\fn nest_parameterized(n: Int) -> Int =
-  \\  if n <= 0 { parameterized(0) } else { nest_parameterized(n - 1) + 0 }
-  \\
-  \\fn nest_over_declared(n: Int) -> Int / {store.read} =
-  \\  if n <= 0 { over_declared() } else { nest_over_declared(n - 1) + 0 }
-  \\
-  \\fn nest_reads(n: Int) -> Int = if n <= 0 { reads(1000, 0) } else { nest_reads(n - 1) + 0 }
-  \\
-  \\pub fn probe_constant(n: Int) -> Int = constant() + nest_constant(n)
-  \\
-  \\pub fn probe_parameterized(n: Int) -> Int = parameterized(0) + nest_parameterized(n)
-  \\
-  \\pub fn probe_over_declared(n: Int) -> Int / {store.read} =
-  \\  over_declared() + nest_over_declared(n)
-  \\
-  \\pub fn probe_reads(n: Int) -> Int = constant() + nest_reads(n)
+  \\pub fn over_declared() -> Int / {store.read} =
+  \\  filled(Array::of_list([0, 0, 0, 0, 0, 0, 0, 0]), 0).len()
   \\
   \\pub fn reads(n: Int, sum: Int) -> Int = if n <= 0 { sum } else { reads(n - 1, sum + constant()) }
   \\
+  \\pub fn probe_constant() -> Int = constant() + constant()
+  \\
+  \\pub fn probe_parameterized() -> Int = parameterized(0) + parameterized(0)
+  \\
+  \\pub fn probe_over_declared() -> Int / {store.read} = over_declared() + over_declared()
+  \\
+  \\pub fn probe_reads() -> Int = reads(1000, 0)
+  \\
 
-/// What a definition's body answers, and how deeply it nests to answer it.
-fn work() -> Int = 6000
+/// What a definition's body answers.
+fn work() -> Int = 8
 
 /// The program compiled, opened and bound.
 fn bound() -> Loaded / {Here, Shipped, Driving, abort.raise} = {
@@ -57,41 +48,52 @@ fn bound() -> Loaded / {Here, Shipped, Driving, abort.raise} = {
   loaded(default_options())
 }
 
-/// What one entry answered, as an `Int`, or the code it ended with.
-fn answered(
+/// What one entry answered, as an `Int`, or the code it ended with, and the updates it counted.
+fn ran(
   l: Loaded,
   name: String,
   args: List<Value>,
-) -> Result<Int, Bytes> / {Driving, abort.raise} =
-  match machine::answer_of(entered(l, name, args), l.roots, name) {
+) -> { answer: Result<Int, Bytes>, updates: Int } / {Driving, abort.raise} = {
+  let o = entered(l, name, args);
+  let answer = match machine::answer_of(o, l.roots, name) {
     Ok(VInt(i)) -> Ok(i),
     Ok(_) -> Err(b"not an Int"),
     Err(r) -> Err(r.diag.code),
-  }
-
-/// `name` read once near the top, then again `work()` calls deep, where its body would nest past
-/// the call depth limit: within it only where the memo answers the second read.
-fn probed(name: String) -> Result<Int, Bytes> / {Here, Shipped, Driving, abort.raise} = {
-  let l = bound();
-  let probe = answered(l, name, [VInt(work())]);
-  let _ = unloaded(l);
-  probe
+  };
+  { answer: answer, updates: o.usage.updates }
 }
 
-test "a nullary pure definition is evaluated once, whatever depth reads it again" {
-  scratch(|| { assert_eq(probed("probe_constant"), Ok(2 * work())) })
+/// What probe `name` answered, and how many times it ran a body: its updates over those of one run
+/// of a body, which `parameterized`, no constant, runs at each entry.
+fn probed(
+  name: String,
+) -> { answer: Result<Int, Bytes>, runs: Int } / {Here, Shipped, Driving, abort.raise} = {
+  let l = bound();
+  let once = ran(l, "parameterized", [VInt(0)]);
+  let probe = ran(l, name, []);
+  let _ = unloaded(l);
+  assert(
+    once.answer == Ok(work()) && once.updates > 0,
+    Some("one run of a body counts its writes"),
+  );
+  assert(probe.updates % once.updates == 0, Some("a probe counts whole runs of a body"));
+  { answer: probe.answer, runs: probe.updates / once.updates }
+}
+
+test "a nullary pure definition is evaluated once, however often it is read" {
+  scratch(|| { assert_eq(probed("probe_constant"), { answer: Ok(2 * work()), runs: 1 }) })
 }
 
 test "a definition with a parameter is no constant, however dead the parameter is" {
-  scratch(|| { assert_eq(probed("probe_parameterized"), Err(b"E0502")) })
+  scratch(|| { assert_eq(probed("probe_parameterized"), { answer: Ok(2 * work()), runs: 2 }) })
 }
 
 test "a published row the body never performs keeps a definition from the memo" {
-  scratch(|| { assert_eq(probed("probe_over_declared"), Err(b"E0502")) })
+  scratch(|| { assert_eq(probed("probe_over_declared"), { answer: Ok(2 * work()), runs: 2 }) })
 }
 
 test "a constant read a thousand times runs its body once" {
-  scratch(|| { assert_eq(probed("probe_reads"), Ok(1001 * work())) })
+  scratch(|| { assert_eq(probed("probe_reads"), { answer: Ok(1000 * work()), runs: 1 }) })
 }
 
 // A name the unit never compiled and a compiled one offered the wrong number of arguments are each
@@ -99,9 +101,9 @@ test "a constant read a thousand times runs its body once" {
 test "a call of no definition, or with the wrong arguments, is declined" {
   scratch(|| {
     let l = bound();
-    assert_eq(answered(l, "parameterized", [VInt(0)]), Ok(work()));
-    let absent = answered(l, "absent", []);
-    let short = answered(l, "parameterized", []);
+    assert_eq(ran(l, "parameterized", [VInt(0)]).answer, Ok(work()));
+    let absent = ran(l, "absent", []).answer;
+    let short = ran(l, "parameterized", []).answer;
     let _ = unloaded(l);
     assert(absent != Ok(0), Some("an absent name answered"));
     assert(short != Ok(work()), Some("the wrong number of arguments answered"))

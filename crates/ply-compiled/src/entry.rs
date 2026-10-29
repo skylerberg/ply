@@ -134,8 +134,6 @@ pub struct Watch<'a> {
 pub struct Run {
     /// Milliseconds of wall clock the entry may take; 0 is no clock.
     pub timeout_ms: u64,
-    /// How deeply its calls may nest.
-    pub depth: i64,
     /// The schedule its `simulate` regions take and the steps each interleaving may take; the
     /// default seed where none is named.
     pub seed: Option<(Seed, u32)>,
@@ -149,11 +147,10 @@ pub struct Run {
 }
 
 impl Run {
-    /// A run bounded by nothing but how deeply its calls nest, as a program's own entry is.
-    pub fn unbounded(depth: i64) -> Run {
+    /// A run nothing bounds, as a program's own entry is.
+    pub fn unbounded() -> Run {
         Run {
             timeout_ms: 0,
-            depth,
             seed: None,
             re_executed: false,
             measure: false,
@@ -379,7 +376,7 @@ fn entered(
     run: &Run,
     root: &str,
 ) -> (Ended, Last) {
-    ctx.begin_bounded(run.depth, run.timeout_ms);
+    ctx.begin_bounded(run.timeout_ms);
     let giving_back = GivingBack(std::ptr::from_mut(ctx));
     ctx.open_entry(arguments);
     let entering = std::ptr::from_mut(ctx);
@@ -387,6 +384,9 @@ fn entered(
     // SAFETY: the unit owns the entry's pages and outlives the call, `ctx` is this entry's alone,
     // and an `R#entered` takes no words.
     crate::rt::on_known_stack(entering, || unsafe { entry(entering, none.as_ptr()) });
+    if ctx.failed == crate::rt::FAILED_OUT_OF_STACK {
+        crate::rt::let_go_below_here();
+    }
     let mut last = returned(ctx);
     let ended = if ctx.failed != 0 {
         failure(ctx)
@@ -760,13 +760,12 @@ struct Asked {
     run: Run,
 }
 
-/// `run := int binding, bool hosted, int timeout_ms, int depth, option(seed), bool re_executed,
-/// bool observe, bool measure, bool tested`.
+/// `run := int binding, bool hosted, int timeout_ms, option(seed), bool re_executed, bool observe,
+/// bool measure, bool tested`.
 fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
     let binding = r.int()?;
     let hosted = r.bool()?;
     let timeout_ms = r.count()?;
-    let depth = r.int()?;
     let seed = r.option(read_seed)?;
     let re_executed = r.bool()?;
     let observe = r.bool()?;
@@ -778,7 +777,6 @@ fn read_run(r: &mut Reader<'_>) -> Result<Asked, String> {
         observe,
         run: Run {
             timeout_ms,
-            depth,
             seed,
             re_executed,
             measure,
