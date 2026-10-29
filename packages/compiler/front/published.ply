@@ -20,7 +20,7 @@ import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolution, qu
                                       module_of_name, default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
 import compiler.check.resolve.scopes (find)
-import compiler.check.resolve.defaults (make_all_visible)
+import compiler.check.resolve.defaults (make_all_visible, ResolvedProgram)
 import compiler.store.hash.graph (Index, TestNode, LawNode, Node, NodeFn)
 import compiler.store.hash.forms (HashOutput, build_index, CachedHashes, by_name, reached_functions,
                                   Subject, FunctionNamed, DeclarationNamed, ItemKeyed)
@@ -56,8 +56,8 @@ import compiler.syntax.items (parse)
 import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows,
                             known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow,
                             DefinitionHashRow, HashTableRow, Dump, normalized_diag)
-import compiler.front.facts (Analysis, pkg_tables, toolchain_tree, tree_named, home_of,
-                             ToolchainTree, NoTree)
+import compiler.front.facts (Analysis, PackageTables, pkg_tables, toolchain_tree, tree_named,
+                             home_of, ToolchainTree, NoTree)
 import compiler.front.seam (test_root_at, checked_program_of, view_dump, Analysed, AnalysisOutcome,
                             Refused, known_from_rows, InferredFacts, inferred_facts_of, rows_from)
 
@@ -498,68 +498,71 @@ pub fn hashed_closure(
   embeds: List<ModuleEmbed> = [],
   cuts: List<StubCuts> = [],
   checked: Option<Bytes> = None,
-) -> Result<HashedProgram, List<Diag>> / {abort.raise} = {
-  // The packages' identity reports ahead of anything the program text has to say: manifest
-  // and graph diags point one slot past every module, in manifest order.
+) -> Result<HashedProgram, List<Diag>> / {abort.raise} =
+  match resolved_closure(parsed, clo, root_count, tree) {
+    Err(diags) -> Err(diags),
+    Ok(resolved) -> {
+      let x = match checked {
+        Some(_) -> { ..resolved.program, r: make_all_visible(resolved.program.r) },
+        None -> resolved.program,
+      };
+      let built = build_index(x.mods, x.r);
+      if built.diags.len() > 0 { Err(built.diags.map(outside_every_module)) } else {
+        let hashed = hashed_and_unused(built.index, fixed, resolved.tables.module_packages);
+        Ok({
+          mods: x.mods,
+          r: x.r,
+          index: built.index,
+          hashes: hashed.hashes,
+          unused: hashed.unused.filter(|diag: Diag|
+            diag.labels.any(
+              |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+                l.primary && l.module < root_count,
+            )),
+          uses: hashed.uses,
+          closure: clo,
+          packages: resolved.tables.pkgs,
+          module_packages: resolved.tables.module_packages,
+          root_count: root_count,
+          embeds: embeds,
+          texts: parsed.map(|p: ParsedSource| p.src),
+          cuts: cuts.fold(Map::new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
+            acc.insert(c.name, c.cuts)),
+          embed_items: Map::new(),
+        })
+      }
+    },
+  }
+
+pub fn resolved_closure(
+  parsed: List<ParsedSource>,
+  clo: Closure,
+  root_count: Int,
+  tree: ToolchainTree,
+) -> Result<{ program: ResolvedProgram, tables: PackageTables }, List<Diag>> / {abort.raise} = {
   let pkg_diags = std_squats(parsed.take(root_count).map(|p: ParsedSource| p.name), tree).fold(
     clo.diags,
     |acc: List<{ slot: Int, diag: ParseDiag }>, sd: { slot: Int, diag: ParseDiag }| acc.push(sd),
   );
+  let early = parsed.fold([], |acc: List<Diag>, p: ParsedSource| acc.concat(p.diags));
   if pkg_diags.len() > 0 {
     Err(
       pkg_diags.map(|sd: { slot: Int, diag: ParseDiag }|
         if sd.slot < 0 { diag_in_module(0 - sd.slot - 1, sd.diag) }
         else { diag_in_module(parsed.len() + sd.slot, sd.diag) }),
     )
-  } else {
-    let early = parsed.fold([], |acc: List<Diag>, p: ParsedSource| acc.concat(p.diags));
-    if early.len() > 0 { Err(early) } else {
-      let tables = pkg_tables(parsed.map(|p: ParsedSource| p.name), root_count, clo, tree);
-      match resolve_packaged(
-          parsed.map(|p: ParsedSource| p.module),
-          tables.pkgs,
-          tables.module_packages,
-          tables.std,
-          tables.compiler,
-          tables.shipped,
-        ) {
-        ResolveFailed(ds) -> Err(ds.map(outside_every_module)),
-        ResolveSucceeded(resolved) -> {
-          let x = match checked {
-            Some(_) -> { ..resolved, r: make_all_visible(resolved.r) },
-            None -> resolved,
-          };
-          let built = build_index(x.mods, x.r);
-          if built.diags.len() > 0 { Err(built.diags.map(outside_every_module)) } else {
-            // Hashing reads the tree, not the checker, so what has moved is known before anything is checked.
-            let hashed = hashed_and_unused(built.index, fixed, tables.module_packages);
-            {
-              Ok({
-                mods: x.mods,
-                r: x.r,
-                index: built.index,
-                hashes: hashed.hashes,
-                // A dependency's unused definitions are its own package's to report.
-                unused: hashed.unused.filter(|diag: Diag|
-                  diag.labels.any(
-                    |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-                      l.primary && l.module < root_count,
-                  )),
-                uses: hashed.uses,
-                closure: clo,
-                packages: tables.pkgs,
-                module_packages: tables.module_packages,
-                root_count: root_count,
-                embeds: embeds,
-                texts: parsed.map(|p: ParsedSource| p.src),
-                cuts: cuts.fold(Map::new(), |acc: Map<Bytes, List<Cut>>, c: StubCuts|
-                  acc.insert(c.name, c.cuts)),
-                embed_items: Map::new(),
-              })
-            }
-          }
-        },
-      }
+  } else if early.len() > 0 { Err(early) } else {
+    let tables = pkg_tables(parsed.map(|p: ParsedSource| p.name), root_count, clo, tree);
+    match resolve_packaged(
+        parsed.map(|p: ParsedSource| p.module),
+        tables.pkgs,
+        tables.module_packages,
+        tables.std,
+        tables.compiler,
+        tables.shipped,
+      ) {
+      ResolveFailed(ds) -> Err(ds.map(outside_every_module)),
+      ResolveSucceeded(resolved) -> Ok({ program: resolved, tables: tables }),
     }
   }
 }
@@ -578,13 +581,13 @@ pub fn checked_closure(
       checked: checked,
       index: h.index,
       hashes: {
-        let calls = value_calls(h.mods, checked);
+        let kept = kept_calls(h.mods, checked);
         checked_hashes(
           h.hashes,
-          calls.sites,
-          calls.unread,
+          checked.facts.members.concat(kept.sites),
+          kept.unread,
           checked.tests.fold(Map::new(), |acc: Map<Bytes, Bool>, t: TestInfo|
-            if calls.unread.contains(test_owner(t.module, t.name)) { acc.insert(t.key, true) }
+            if kept.unread.contains(test_owner(t.module, t.name)) { acc.insert(t.key, true) }
             else { acc }),
         )
       },
@@ -605,7 +608,7 @@ pub fn checked_closure(
 /// The calls on values made by each body `checked` walked, and by each it published from its rows,
 /// as its row filed them, in its module's place in `mods`; and each of those whose row filed no
 /// calls, whose body's calls no check here found.
-pub fn value_calls(
+fn kept_calls(
   mods: List<ParsedModule>,
   checked: CheckOutput,
 ) -> { sites: List<MemberSite>, unread: Map<Bytes, Bool> } / {abort.raise} = {
@@ -639,7 +642,7 @@ pub fn value_calls(
     },
   );
   {
-    sites: checked.facts.members.concat(read.sites),
+    sites: read.sites,
     unread: checked.seeded.concat(
       checked.tests.fold([], |acc: List<Bytes>, t: TestInfo|
         if checked.cached_tests.contains(t.key) { acc.push(test_owner(t.module, t.name)) }

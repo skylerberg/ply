@@ -5,14 +5,18 @@
 //! analyses the program whole again, each definition taken as its module answered it.
 
 import compiler.cc (toolchain)
-import compiler.load (Derives, LoadedAnalysis, SourceFile, report_viewed)
+import compiler.load (Derives, LoadedAnalysis, SourceFile, report_viewed, derivation_result)
+import compiler.expand.derive (DeriverRequest)
+import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.unit (shipped)
 import std.fs (fs)
 import std.time (time)
 import compiler.front.seam (Refused, Analysed, TestRunScope, view_dump, checked_program_of)
 import compiler.front.facts (Analysis, ShippedView, CheckedProgram, Frame, TableReads, ModuleShape,
                              assembled_load, no_reads, pulled_at, statement_modules)
-import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, pins_of_load)
+import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, pins_of_load,
+                       resolved_pulling_std_with)
+import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline, KnownDefRow,
                             KnownTestRow, ModuleDerivations)
 import compiler.front.published (dump_of, no_rows)
@@ -23,7 +27,7 @@ import compiler.store.hash.forms (HashOutput, NodeRef, FunctionNamed, Subject, C
                                   ModuleHashes, no_cached_hashes, joined_cached_hashes)
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
-import compiler.syntax.items (Item, FunctionItem)
+import compiler.syntax.items (Item, FunctionItem, parse)
 import compiler.check.infer.checker (DefInfo, TestInfo, LawInfo, Location)
 import compiler.check.termination (Terminates, unknown_summary)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, Label, error_at, qualify)
@@ -447,6 +451,103 @@ pub fn whole_of(program: Program) -> Result<Analysis, List<Diag>> / {abort.raise
     },
   }
 
+pub type Parses = Map<Bytes, ParsedSource>
+
+fn parsed_into<| e>(
+  parses: Parses,
+  sources: List<Source>,
+  parsing: (Source) -> ParsedSource / {abort.raise | e},
+) -> Parses / {abort.raise | e} =
+  sources.fold(parses, |acc: Parses, s: Source|
+    match acc.get(s.name) {
+      Some(p) -> if p.src == s.src { acc } else { acc.insert(s.name, parsing(s)) },
+      None -> acc.insert(s.name, parsing(s)),
+    })
+
+fn resolved_from(
+  sources: List<Source>,
+  shipping: ShippedInputs,
+  pkgs: PackageSources,
+  embeds: List<Embed>,
+  parses: Parses,
+) -> Result<ResolvedProgram, List<Diag>> / {abort.raise} =
+  resolved_pulling_std_with(
+    sources,
+    shipping.read,
+    pkgs,
+    embeds.map(|embed: Embed| embed.embedded),
+    shipping.unread,
+    shipping.data,
+    shipping.asked,
+    shipping.pulls,
+    parses.values(),
+  )
+
+fn supplied_sources(pkgs: PackageSources) -> List<Source> =
+  pkgs.supplied.fold([], |acc: List<Source>, p: SuppliedPackage| acc.concat(p.modules))
+
+pub fn resolution_of(
+  program: Program,
+  parses: Parses,
+) -> { resolved: Result<ResolvedProgram, List<Diag>>, parses: Parses } / {abort.raise} =
+  match program.frame {
+    None -> { resolved: Err(program.diags), parses: parses },
+    Some(_) -> {
+      let derived = module_derivations(program);
+      let now = parsed_into(
+        parses,
+        program.sources.concat(supplied_sources(program.pkgs)).concat(program.shipping.read),
+        |s: Source|
+          parse_from(
+            0,
+            s,
+            parse(s.src),
+            derivations: match derived.find(|m: ModuleDerivations| m.module == s.name) {
+              Some(m) -> m.derivations,
+              None -> [],
+            },
+          ),
+      );
+      {
+        resolved: resolved_from(
+          program.sources,
+          program.shipping,
+          program.pkgs,
+          program.embeds,
+          now,
+        ),
+        parses: now,
+      }
+    },
+  }
+
+pub fn renamed_resolution(
+  paths: List<paths::ResolvedPath>,
+  shipping: ShippedInputs,
+  parses: Parses,
+) -> { resolved: Result<ResolvedProgram, List<Diag>>, parses: Parses } / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} = {
+  let project: Project = load_resolved(paths);
+  if project.diags.len() > 0 { { resolved: Err(project.diags), parses: parses } } else {
+    let pkgs = pkgs_of(project);
+    let own = project.sources.concat(supplied_sources(pkgs));
+    let names = own.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source| acc.insert(s.name, true));
+    let texts = project.sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
+      acc.insert(s.name, s.src));
+    let shipped = { ..shipping, read: shipping.read.filter(|s: Source| !names.contains(s.name)) };
+    let now = parsed_into(parses, own.concat(shipped.read), |s: Source|
+      parse_from(
+        0,
+        s,
+        parse(s.src),
+        library: Some(|ask: DeriverRequest| derivation_result(ask, texts)),
+      ));
+    {
+      resolved: resolved_from(project.sources, shipped, pkgs, embeds_parsed(project), now),
+      parses: now,
+    }
+  }
+}
+
 fn unproved_measure(u: UnprovedMeasure) -> Diag =
   error_at(
     b"E0467",
@@ -583,11 +684,11 @@ fn source_files(program: Program, frame: Frame) -> List<SourceFile> / {abort.rai
 /// Each module of `project`'s own packages and each shipped module they pull, answered checked
 /// through the memo store beside the project.
 fn check_modules(
-  store: Option<paths::ResolvedPath>,
+  paths: List<paths::ResolvedPath>,
   project: Project,
 ) -> QueryResults / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], shipped.read_pack, Derives, abort.raise} =
   if !usable(project) { module_queries::nothing() } else {
-    match store {
+    match paths.at(0) {
       None -> module_queries::query_uncached(project),
       Some(r) -> {
         let dir = paths::in_root(r, ".ply-cache/memo").path;
@@ -699,16 +800,9 @@ fn check_modules_uncached(
 pub fn load_program(
   paths: List<paths::ResolvedPath>,
   verify: Bool,
-) -> Program / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
-  load_program_with_store(paths.at(0), paths, verify)
-
-pub fn load_program_with_store(
-  store: Option<paths::ResolvedPath>,
-  paths: List<paths::ResolvedPath>,
-  verify: Bool,
 ) -> Program / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let project: Project = load_resolved(paths);
-  let answers = check_modules(store, project);
+  let answers = check_modules(paths, project);
   let shipping = shipping_cached(answers.pulled, answers.wants);
   let p: Program = verified(
     project,
@@ -789,7 +883,7 @@ pub fn timed_over(
   started: Int,
   verify: Bool,
 ) -> TimedLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
-  let answers = check_modules(paths.at(0), project);
+  let answers = check_modules(paths, project);
   let shipping = shipping_cached(answers.pulled, answers.wants);
   let read_done = time.elapsed_ms();
   let p: Program = verified(

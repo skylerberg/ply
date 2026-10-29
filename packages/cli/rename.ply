@@ -1,8 +1,8 @@
 import std.fs (fs, Missing)
 import std.json (Json, Str, Bool, Number, Array, Null, object)
 import args (Flags)
-import paths (RootedPath, ResolvedPath, absolute, parent_of, displayed, kind, read_file, write_file,
-              create_dir, move_file, rooted_path, here)
+import paths (RootedPath, absolute, parent_of, displayed, kind, read_file, write_file, create_dir,
+              move_file, rooted_path, here)
 import std.env (env)
 import report (CommandOutput, schema_version, ok_code, compile_error)
 import walk (Failure)
@@ -19,8 +19,9 @@ import rename.lines (Moved, OperationLine, Renames, keyword_refusal, renamed, re
 import rename.strings (Mention, mentions_in, module_mentions)
 import rename.programs (Entry, Library, Loaded, Read, libraries_of, loads_of)
 import rename.edits (Edit, Edited, ModuleMove, applied, comment_edits, edited_of, moved_name,
-                     own_part, renaming_of)
-import rename.verify (Renamed, verified)
+                     own_part, renaming_of, uses_renamed)
+import rename.verify (Renamed, retargeted_calls, verified)
+import program (Parses)
 
 type Change = { at: RootedPath, text: Bytes, changed: Bool, to: Option<RootedPath> }
 
@@ -80,7 +81,6 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
 }
 
 fn planned(
-  store: Option<ResolvedPath>,
   pwd: String,
   renames: Renames,
   loads: List<Loaded>,
@@ -146,6 +146,17 @@ fn planned(
     crowded,
   ).concat(
     taken,
+  ).concat(
+    retargeted_calls(rn, loads),
+  ).concat(
+    loads.fold([], |acc: List<Failure>, l: Loaded|
+      l.unrenamed.fold(acc, |found: List<Failure>, r: Read|
+        if !uses_renamed(rn, l, r) { found } else {
+          found.push({
+            path: displayed(r.file.at),
+            reason: "uses a name the renames change, but is not under the paths",
+          })
+        })),
   );
   let texts = range(0, reads.len()).fold(Map::new(), |acc: Map<String, Bytes>, i: Int|
     acc.insert(absolute(rn.pwd, reads.get(i).read.file.at), changes.get(i).text));
@@ -180,8 +191,13 @@ fn planned(
             else { { ..acc, texts: acc.texts.insert(absolute(rn.pwd, change.at), change.text) } },
           },
       );
-      loads.fold([], |acc: List<Failure>, l: Loaded|
-        acc.concat(verified(store, rn, l, library, texts, renamed)))
+      loads.fold(
+        { failures: [], parses: Map::new() },
+        |acc: { failures: List<Failure>, parses: Parses }, l: Loaded| {
+          let checked = verified(rn, l, library, texts, renamed, acc.parses);
+          { failures: acc.failures.concat(checked.failures), parses: checked.parses }
+        },
+      ).failures
     },
   }
 }
@@ -286,12 +302,11 @@ pub fn run(
           let given = if flags.paths.len() == 0 { [here()] } else { flags.paths };
           let pwd = env.working_directory();
           let libraries = libraries_of(given);
-          let store = given.at(0);
-          let loading = loads_of(store, given, pwd);
+          let loading = loads_of(given, pwd);
           if loading.failures.len() > 0 {
             answered({ changes: [], mentions: [], refusals: [] }, loading.failures, false)
           } else {
-            let plan = planned(store, pwd, renames, loading.loads, libraries);
+            let plan = planned(pwd, renames, loading.loads, libraries);
             if flags.check { answered(plan, plan.refusals, true) } else if plan.refusals.len() > 0 {
               answered({ changes: [], mentions: [], refusals: [] }, plan.refusals, false)
             } else {

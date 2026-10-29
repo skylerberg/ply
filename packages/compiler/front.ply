@@ -19,6 +19,7 @@ import compiler.check.resolve.tables (Source, ParsedModule, Diag, Label, Fix, Ed
                                       error_at, backticked, import_module_name, path_span,
                                       module_of_name)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
+import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.store.hash.graph (TestNode, LawNode, Node, NodeFn)
 import compiler.store.hash.forms (build_index, CachedHashes, by_name, reached_functions, Subject,
                                   FunctionNamed, DeclarationNamed, ItemKeyed, cached_hashes_of)
@@ -33,8 +34,8 @@ import compiler.check.typed (TypedBody)
 import compiler.check.termination (Termination, Terminates, unknown_summary)
 import compiler.front.diagnostics (ParsedSource, parse_header_at, parse_all, parse_at, parse_from,
                                    diag_in_module, with_prelude_source)
-import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, JudgedPackages, closure,
-                           closure_of_judged, pins_of)
+import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, JudgedPackages, Closure,
+                           closure, closure_of_judged, pins_of)
 import std.prelude_source
 import std.bin
 import std.hash (blake3)
@@ -57,14 +58,15 @@ import compiler.front.facts (outlines_of, guard_bounds, Bounded, encode_tables, 
                              module_facts, functions_of, tests_of, assembled_program, cuts_of,
                              Analysis, CallArgument, ConstructorArgument, ListArgument,
                              OtherArgument, TextArgument, StatementSite, sites_in, statements_of,
-                             toolchain_tree, tree_named, ShippedView)
+                             toolchain_tree, tree_named, ShippedView, ToolchainTree)
 import compiler.front.seam (root_keys, checked_program_of, view_dump, Analysed, AnalysisOutcome,
                             Refused)
 import compiler.front.published (no_rows, encode_rows, decode_rows, rows_of, inferred_facts,
                                  facts_read, StoredBody, stored_bodies, StubCuts, analyse,
-                                 analyse_with, HashedProgram, hashed_closure, checked_closure,
-                                 runtime_dump, entry_header, dump_of, Claim, ClaimDef, ClaimLaw,
-                                 ClaimSum, ClaimClause, claims, claims_in, rechecked, untested)
+                                 analyse_with, HashedProgram, hashed_closure, resolved_closure,
+                                 checked_closure, runtime_dump, entry_header, dump_of, Claim,
+                                 ClaimDef, ClaimLaw, ClaimSum, ClaimClause, claims, claims_in,
+                                 rechecked, untested)
 
 // --- Pulling in the shipped modules --------------------------------------------
 
@@ -863,47 +865,29 @@ pub fn viewed_text(viewed: List<ShippedView>) -> Bytes = {
   )
 }
 
-pub fn staged_pulling_std_with(
+type PulledLoad = {
+  pulled: PullState,
+  package_closure: Closure,
+  tree: ToolchainTree,
+  embeds_at: List<ModuleEmbed>,
+  items: Map<Bytes, List<ItemEmbeds>>,
+}
+
+fn pulled_load(
   user: List<Source>,
   shipped: List<Source>,
-  pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
-  // What hashing fixed of each node, test and law another run answered for, which this load takes
-  // in place of hashing it again.
-  fixed: CachedHashes = { nodes: [], tests: [], laws: [] },
-  embeds: List<EmbedRecord> = [],
-  // Whether the program's tests and laws are read. A program to ship is the definition it enters
-  // and all that reaches, which is never a test or a law.
-  tested: Bool = true,
-  // The shipped modules there are and `shipped` does not hold, because this load pulls none of them
-  // (`shipped_inputs_of`).
-  unread: List<Bytes> = [],
-  // Whether a shipped module is read only for what the program reaches. A check of one module
-  // against the entries it reads reads every one whole; a tree of the toolchain's own is whole as
-  // any root is, and what it pulls of the rest of the library is read for what it reaches.
-  reached: Bool = true,
-  // The data files the modules of `shipped` embed (`shipped_inputs_of`), each under its name among the
-  // shipped modules.
-  data: List<EmbedFile> = [],
-  // Shipped modules pulled whatever the program imports: what a module's check stands in for its
-  // imports.
-  required: List<Bytes> = [],
-  // Whether `user` is modules of a tree of the toolchain's own read apart from any program: they
-  // load as that tree does, though they are not the whole of it.
-  apart: Bool = false,
-  // What each shipped module's text says it pulls, which the text as an importer reads it may no
-  // longer say (`shipped_inputs_of`).
-  pulls: List<ModuleDependencies> = [],
-  // A parse of a source made already, taken in place of parsing its text again where it refused
-  // nothing, so where it stands among the sources is in no label of it.
-  given: List<ParsedSource> = [],
-  // What the load's library derivers wrote for each module, which a source parsed here expands its
-  // derives to: no deriver runs here.
-  derived: List<ModuleDerivations> = [],
-  // The packages as a load judged them already, taken in place of judging `pkgs`' manifests.
-  judged: Option<JudgedPackages> = None,
-  // The module a check against entries checks, which the others stand in for what it reads of.
-  checked: Option<Bytes> = None,
-) -> StagedLoad / {abort.raise} = {
+  pkgs: PackageSources,
+  embeds: List<EmbedRecord>,
+  tested: Bool,
+  unread: List<Bytes>,
+  data: List<EmbedFile>,
+  required: List<Bytes>,
+  apart: Bool,
+  pulls: List<ModuleDependencies>,
+  given: List<ParsedSource>,
+  derived: List<ModuleDerivations>,
+  judged: Option<JudgedPackages>,
+) -> PulledLoad / {abort.raise} = {
   let package_closure = match judged {
     Some(j) -> closure_of_judged(j, pkgs.supplied),
     None -> closure(pkgs, user.map(|s: Source| s.name)),
@@ -970,19 +954,79 @@ pub fn staged_pulling_std_with(
     given,
     derived,
   );
+  { pulled: x, package_closure: package_closure, tree: tree, embeds_at: written.at, items: items }
+}
+
+pub fn staged_pulling_std_with(
+  user: List<Source>,
+  shipped: List<Source>,
+  pkgs: PackageSources = { root: b"", manifest: None, supplied: [] },
+  // What hashing fixed of each node, test and law another run answered for, which this load takes
+  // in place of hashing it again.
+  fixed: CachedHashes = { nodes: [], tests: [], laws: [] },
+  embeds: List<EmbedRecord> = [],
+  // Whether the program's tests and laws are read. A program to ship is the definition it enters
+  // and all that reaches, which is never a test or a law.
+  tested: Bool = true,
+  // The shipped modules there are and `shipped` does not hold, because this load pulls none of them
+  // (`shipped_inputs_of`).
+  unread: List<Bytes> = [],
+  // Whether a shipped module is read only for what the program reaches. A check of one module
+  // against the entries it reads reads every one whole; a tree of the toolchain's own is whole as
+  // any root is, and what it pulls of the rest of the library is read for what it reaches.
+  reached: Bool = true,
+  // The data files the modules of `shipped` embed (`shipped_inputs_of`), each under its name among the
+  // shipped modules.
+  data: List<EmbedFile> = [],
+  // Shipped modules pulled whatever the program imports: what a module's check stands in for its
+  // imports.
+  required: List<Bytes> = [],
+  // Whether `user` is modules of a tree of the toolchain's own read apart from any program: they
+  // load as that tree does, though they are not the whole of it.
+  apart: Bool = false,
+  // What each shipped module's text says it pulls, which the text as an importer reads it may no
+  // longer say (`shipped_inputs_of`).
+  pulls: List<ModuleDependencies> = [],
+  // A parse of a source made already, taken in place of parsing its text again where it refused
+  // nothing, so where it stands among the sources is in no label of it.
+  given: List<ParsedSource> = [],
+  // What the load's library derivers wrote for each module, which a source parsed here expands its
+  // derives to: no deriver runs here.
+  derived: List<ModuleDerivations> = [],
+  // The packages as a load judged them already, taken in place of judging `pkgs`' manifests.
+  judged: Option<JudgedPackages> = None,
+  // The module a check against entries checks, which the others stand in for what it reads of.
+  checked: Option<Bytes> = None,
+) -> StagedLoad / {abort.raise} = {
+  let load = pulled_load(
+    user,
+    shipped,
+    pkgs,
+    embeds,
+    tested,
+    unread,
+    data,
+    required,
+    apart,
+    pulls,
+    given,
+    derived,
+    judged,
+  );
+  let x = load.pulled;
   let hashed = |parsed: List<ParsedSource>|
     match hashed_closure(
         parsed,
-        package_closure,
+        load.package_closure,
         user.len(),
-        tree,
+        load.tree,
         fixed,
-        written.at.concat(x.embeds),
+        load.embeds_at.concat(x.embeds),
         x.cuts,
         checked,
       ) {
       Err(diags) -> Err(diags),
-      Ok(h) -> Ok({ ..h, embed_items: items }),
+      Ok(h) -> Ok({ ..h, embed_items: load.items }),
     };
   if x.diags.len() > 0 { { pulled: x.pulled, hashed: Err(x.diags), shipped_views: [] } }
   else if !reached || x.pulled.len() == 0 {
@@ -1001,6 +1045,40 @@ pub fn staged_pulling_std_with(
           shipped_views: shipped_views_of(h, |name: Bytes| reach.contains(name)),
         }
       },
+    }
+  }
+}
+
+pub fn resolved_pulling_std_with(
+  user: List<Source>,
+  shipped: List<Source>,
+  pkgs: PackageSources,
+  embeds: List<EmbedRecord>,
+  unread: List<Bytes>,
+  data: List<ShippedData>,
+  required: List<Bytes>,
+  pulls: List<ModuleDependencies>,
+  given: List<ParsedSource>,
+) -> Result<ResolvedProgram, List<Diag>> / {abort.raise} = {
+  let load = pulled_load(
+    user,
+    shipped,
+    pkgs,
+    embeds,
+    true,
+    unread,
+    embed_files_of(data),
+    required,
+    false,
+    pulls,
+    given,
+    [],
+    None,
+  );
+  if load.pulled.diags.len() > 0 { Err(load.pulled.diags) } else {
+    match resolved_closure(load.pulled.parsed, load.package_closure, user.len(), load.tree) {
+      Err(diags) -> Err(diags),
+      Ok(resolved) -> Ok(resolved.program),
     }
   }
 }

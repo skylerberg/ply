@@ -3555,7 +3555,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
 | `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
-| `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if the renamed program would not check, or a name in it would refer to something else. See **Renaming** below. |
+| `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if a name or a call in the renamed program would refer to something else. See **Renaming** below. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
 | `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |
 | `ply resolve [path]` | writes `ply.lock` from the manifests: each dependency's name, version, and the digest of each one not in this checkout (`in the checkout` for the rest; `"digest": null` in `--json`). Parses no modules. The only command that downloads registry dependencies, from `PLY_REGISTRY`, with their interface and attestation where published (`interface` and `attestation` in `--json`; attestations trusted as `PLY_ATTESTERS` says, §15.1). |
@@ -3719,12 +3719,20 @@ letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon
 - a new name is a keyword or not a valid name;
 - a renamed name is declared with `extern`, so code outside Ply uses that name;
 - a module's file would be moved onto a file that already exists, or two files onto one;
-- the renamed program would not check, or a name in it would refer to something other than what it
-  did: two definitions with one name, or a local that another local of its new name hides.
+- a name in the renamed program would refer to something other than what it did: two definitions
+  with one name, or a local that another local of its new name hides;
+- a call on a value, like `x.size()`, could call another function, because another function it can
+  see gets the same new name;
+- a record would name a field twice.
+
+These checks mean the renamed program has the same types as before, so `ply rename` does not
+type-check it again. Code written inside strings is the exception: a string that a deriver turns
+into code, or one that names a definition, keeps its old text, and `ply check` reports what it
+breaks.
 
 Only files under the paths are changed. A file of the same package outside the paths that uses a
-renamed name stops the rename, because the renamed program would not check. Another package that
-uses a renamed name is not checked; `ply check` reports it.
+renamed name stops the rename. Another package that uses a renamed name is not checked; `ply check`
+reports it.
 
 **Editing one definition.** `ply show NAME` and `ply replace NAME` read and rewrite one definition
 without touching anything else in the file. The replacement is one item of the same kind and name,
