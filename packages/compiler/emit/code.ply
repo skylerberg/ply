@@ -6,26 +6,30 @@ import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, 
 import compiler.syntax.exprs (simulated_at)
 import compiler.check.types (Type, TyVar, TyFn, FunctionType, Row, Atom, row_empty, unit_type,
                              int_type, string_type, fn_type)
-import compiler.check.typed (TypedExpr, TypedLit, TypedRead, TypedUnary, TypedBinary, TypedCall,
-                             TypedIf, TypedMatch, TypedBlock, TypedList, TypedRecord, TypedUpdate,
-                             TypedFieldRead, TypedPerform, TypedLambda, TypedSimulate,
-                             TypedParallel, TypedHandle, ReadLocal, ReadDefinition, ReadConstructor,
-                             ReadBuiltin, FilledLabel, LabelNamed, LabelParam, TypedParam,
-                             TypedThunk, TypedField, TypedArm, TypedPattern, TypedWild, TypedBinder,
-                             TypedLitPattern, TypedRange, TypedCase, TypedRecordPattern,
-                             TypedListPattern, TypedOr, TypedFieldPattern, TypedStmt, TypedLet,
-                             TypedLetElse, TypedDo, TypedAssign, TypedClause, TypedReturn,
-                             TypedHandlerVar, typed_nodes, NumericWitness, ConcreteWitness,
-                             ParamWitness, StatedWitness, witness_param)
+import compiler.check.typed (TypedExpr, pattern_binders, TypedLit, TypedRead, TypedUnary,
+                             TypedBinary, TypedCall, TypedIf, TypedMatch, TypedBlock, TypedList,
+                             TypedRecord, TypedUpdate, TypedFieldRead, TypedPerform, TypedLambda,
+                             TypedSimulate, TypedParallel, TypedHandle, ReadLocal, ReadDefinition,
+                             ReadConstructor, ReadBuiltin, FilledLabel, LabelNamed, LabelParam,
+                             TypedParam, TypedThunk, TypedField, TypedArm, TypedPattern, TypedWild,
+                             TypedBinder, TypedLitPattern, TypedRange, TypedCase,
+                             TypedRecordPattern, TypedListPattern, TypedOr, TypedFieldPattern,
+                             TypedStmt, TypedLet, TypedLetElse, TypedDo, TypedAssign, TypedClause,
+                             TypedReturn, TypedHandlerVar, typed_expr_nodes_folded, NumericWitness,
+                             ConcreteWitness, ParamWitness, StatedWitness, witness_param,
+                             TypedRelease, HeldByNode, ReleaseAfter, ReleaseBefore,
+                             ReleaseUnwinding, ReleaseMissing, ReleaseFailing, binding_key,
+                             holder_key)
 import compiler.expand.rewrite (witness_code, stated_witness_name, numeric_op_code)
-import compiler.check.infer.checker (ReleaseSite, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
-                                     ReleaseFailing, binding_key)
+import std.derive.children
 import std.list
 import std.bytes (hex_digit, ascii_of_int)
 import std.string
 
 /// One lowered node: what it is, where its text stands, and its type.
 pub type Code = { node: Node, span: Span, ty: Type }
+
+derive children for Code
 
 pub type Node =
   | NLit(Lit)
@@ -160,84 +164,6 @@ pub fn read_name(c: Code) -> Option<Bytes> =
     NCtor(k) -> Some(k.name),
     NBuiltin(b) -> Some(b.name),
     _ -> None,
-  }
-
-/// `c` with `f` applied to each node after its parts.
-pub fn nodes_mapped(c: Code, f: (Node) -> Node) -> Code = {
-  let go = |x: Code| nodes_mapped(x, f);
-  let opt = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
-  let fields = |fs: List<CodeField>| fs.map(|x: CodeField| { name: x.name, value: go(x.value) });
-  let lambda = |l: Lambda| { ..l, body: go(l.body) };
-  let node = match c.node {
-    NUnary(u) -> NUnary({ ..u, operand: go(u.operand) }),
-    NBinary(b) -> NBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
-    NApp(a) -> NApp({ ..a, func: go(a.func), args: a.args.map(go) }),
-    NIf(i) ->
-      NIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
-    NBlock(b) ->
-      NBlock({
-        stmts: b.stmts.map(|s: CodeStmt|
-          match s {
-            CLet(l) -> CLet({ ..l, value: go(l.value) }),
-            CLetPat(l) -> CLetPat({ ..l, value: go(l.value) }),
-            CDo(d) -> CDo({ code: go(d.code) }),
-          }),
-        tail: opt(b.tail),
-      }),
-    NList(l) -> NList({ items: l.items.map(go) }),
-    NRecord(r) -> NRecord({ fields: fields(r.fields) }),
-    NMatch(m) ->
-      NMatch({
-        scrutinee: go(m.scrutinee),
-        arms: m.arms.map(|a: CodeArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
-      }),
-    NPerform(p) -> NPerform({ ..p, label: opt(p.label), args: p.args.map(go) }),
-    NLambda(l) -> NLambda(lambda(l)),
-    NSimulate(s) -> NSimulate({ ..s, body: go(s.body) }),
-    NParallel(p) -> NParallel({ branches: p.branches.map(go) }),
-    NHandle(h) ->
-      NHandle({
-        ..h,
-        body: go(h.body),
-        clauses: h.clauses.map(|cl: CodeClause| { ..cl, label: opt(cl.label), body: go(cl.body) }),
-        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
-      }),
-    NField(x) -> NField({ ..x, base: go(x.base) }),
-    NUpdate(u) -> NUpdate({ ..u, base: go(u.base), sets: fields(u.sets) }),
-    NKnown(k) -> NKnown({ ..k, lambda: lambda(k.lambda) }),
-    _ -> c.node,
-  };
-  { ..c, node: f(node) }
-}
-
-/// The code `c` holds, each part once.
-pub fn code_parts(c: Code) -> List<Code> =
-  match c.node {
-    NUnary(u) -> [u.operand],
-    NBinary(b) -> [b.lhs, b.rhs],
-    NApp(a) -> a.args.push(a.func),
-    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
-    NBlock(b) ->
-      b.stmts.fold(match b.tail { Some(t) -> [t], None -> [] }, |acc: List<Code>, s: CodeStmt|
-        acc.push(match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code })),
-    NList(l) -> l.items,
-    NRecord(r) -> r.fields.map(|f: CodeField| f.value),
-    NMatch(m) ->
-      m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
-        List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
-    NPerform(p) -> match p.label { Some(l) -> p.args.push(l), None -> p.args },
-    NLambda(l) -> [l.body],
-    NSimulate(s) -> [s.body],
-    NParallel(p) -> p.branches,
-    NHandle(h) ->
-      h.clauses.fold(
-        match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
-        |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
-      ),
-    NField(f) -> [f.base],
-    NUpdate(u) -> u.sets.map(|f: CodeField| f.value).push(u.base),
-    NKnown(k) -> [k.lambda.body],
-    _ -> [],
   }
 
 // --- the dump ---------------------------------------------------------------
@@ -527,7 +453,8 @@ fn find(frame: Frame, name: Bytes) -> Option<Int> =
 type Stack = {
   frames: List<Frame>,
   labels: List<Bytes>,
-  releases: Releases,
+  /// The keys (`holder_key`) of what a release in the body lets go.
+  released: Map<Int, Bool>,
   /// Where each binder a release names put its name, by the binder's key.
   binders: Map<Int, Binder>,
   /// The keys an or-pattern's first alternative gives its names, which the check names every
@@ -542,24 +469,19 @@ type Stack = {
 /// the barrier of the clause, inside which a binder of its name hides it.
 type HeldVar = { name: Bytes, at: Int, ty: Type, depth: Int }
 
-/// Where the check lets go of what a body owns, read by site: the releases at each node, and the
-/// sites a release names as what it lets go, a binder's or that of a node whose value no binder holds.
-type Releases = { at: Map<Int, List<ReleaseSite>>, held: Map<Int, Bool> }
-
 /// The barrier, by depth, the slot a binder put its name in, and the type it holds.
 type Binder = { name: Bytes, depth: Int, slot: Int, ty: Type }
 
-fn releases_of(sites: List<ReleaseSite>) -> Releases =
-  sites.fold({ at: Map::new(), held: Map::new() }, |acc: Releases, x: ReleaseSite|
-    {
-      at: acc.at.insert(x.at, match acc.at.get(x.at) { Some(xs) -> xs.push(x), None -> [x] }),
-      // A node's own value a failing release after it names is held by the node itself.
-      held: match x.place {
-        ReleaseFailing(_) -> if x.binding == x.at { acc.held }
-        else { acc.held.insert(x.binding, true) },
-        _ -> acc.held.insert(x.binding, true),
-      },
-    })
+/// The keys of what a release in `body` lets go: a node's own value a failing release after it
+/// names is held by the node itself.
+fn released_in(body: TypedExpr<Type>) -> Map<Int, Bool> =
+  typed_expr_nodes_folded(body, Map::new(), |acc: Map<Int, Bool>, e: TypedExpr<Type>|
+    e.releases.fold(acc, |m: Map<Int, Bool>, r: TypedRelease|
+      match r.place {
+        ReleaseFailing(_) -> if r.held == HeldByNode(e.span.site) { m }
+        else { m.insert(holder_key(r.held), true) },
+        _ -> m.insert(holder_key(r.held), true),
+      }))
 
 fn st_top(stack: Stack) -> Frame =
   match stack.frames.at(stack.frames.len() - 1) { Some(f) -> f, None -> empty_frame() }
@@ -703,7 +625,7 @@ fn bind_at(stack: Stack, name: Bytes, site: Int, ty: Type) -> Stack =
 /// `stack` noting that the binder at `site` put `name`, of type `ty`, in slot `slot` of barrier
 /// `depth`, where a release names it.
 fn binder_noted(stack: Stack, name: Bytes, site: Int, depth: Int, slot: Int, ty: Type) -> Stack =
-  if !stack.releases.held.contains(site) { stack } else {
+  if !stack.released.contains(site) { stack } else {
     {
       ..stack,
       binders: stack.binders.insert(site, { name: name, depth: depth, slot: slot, ty: ty }),
@@ -750,7 +672,7 @@ fn at(e: TypedExpr<Type>, node: Node) -> Code = { node: node, span: e.span, ty: 
 
 fn lower_in(e: TypedExpr<Type>, stack: Stack) -> Lowered / {abort.raise} = {
   let o = lower_node(e, stack);
-  if stack.releases.held.len() == 0 { o } else { released_around(e.span, o) }
+  if stack.released.len() == 0 { o } else { released_around(e, o) }
 }
 
 fn lower_seq(exprs: List<TypedExpr<Type>>, stack: Stack) -> Seq / {abort.raise} =
@@ -1113,7 +1035,7 @@ fn path_spelled(e: TypedExpr<Type>, stack: Stack) -> Option<Bytes> =
 /// Whether a failure may let go of `value` before what it is handed to holds it, which only a node
 /// lowered where it stands can be.
 fn in_flight(value: TypedExpr<Type>, stack: Stack) -> Bool =
-  stack.releases.held.contains(value.span.site)
+  stack.released.contains(value.span.site)
 
 /// The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
 fn copy_base(field: TypedField<Type>, stack: Stack) -> Option<Bytes> =
@@ -1158,7 +1080,7 @@ fn projected_var(e: TypedExpr<Type>, stack: Stack, inner: List<Bytes>) -> Option
               TypedLet(l) ->
                 {
                   found: projected_var(l.value, stack, acc.inner),
-                  inner: acc.inner.concat(typed_binders(l.pat)),
+                  inner: acc.inner.concat(pattern_binders(l.pat).map(|b: TypedParam<Type>| b.name)),
                 },
               TypedLetElse(l) ->
                 {
@@ -1166,7 +1088,7 @@ fn projected_var(e: TypedExpr<Type>, stack: Stack, inner: List<Bytes>) -> Option
                     Some(n) -> Some(n),
                     None -> projected_var(l.fallback, stack, acc.inner),
                   },
-                  inner: acc.inner.concat(typed_binders(l.pat)),
+                  inner: acc.inner.concat(pattern_binders(l.pat).map(|b: TypedParam<Type>| b.name)),
                 },
               TypedDo(v) -> { found: projected_var(v, stack, acc.inner), inner: acc.inner },
               TypedAssign(v) ->
@@ -1194,27 +1116,6 @@ fn projected_var(e: TypedExpr<Type>, stack: Stack, inner: List<Bytes>) -> Option
     TypedParallel(_) -> None,
   }
 }
-
-/// The names `pattern` binds.
-fn typed_binders(pattern: TypedPattern<Type>) -> List<Bytes> =
-  match pattern {
-    TypedBinder(v) -> [v.name],
-    TypedCase(c) ->
-      c.args.fold([], |acc: List<Bytes>, a: TypedPattern<Type>| acc.concat(typed_binders(a))),
-    TypedRecordPattern(r) ->
-      r.fields.fold([], |acc: List<Bytes>, f: TypedFieldPattern<Type>|
-        acc.concat(typed_binders(f.pat))),
-    TypedListPattern(l) -> {
-      let items = l.items.fold([], |acc: List<Bytes>, a: TypedPattern<Type>|
-        acc.concat(typed_binders(a)));
-      match l.rest { Some(r) -> items.concat(typed_binders(r)), None -> items }
-    },
-    TypedOr(alts) ->
-      alts.fold([], |acc: List<Bytes>, a: TypedPattern<Type>| acc.concat(typed_binders(a))),
-    TypedWild -> [],
-    TypedLitPattern(_) -> [],
-    TypedRange(_) -> [],
-  }
 
 /// A lambda over `params` written at `at`: its body lowered behind a barrier, which the captures
 /// cross, performing `row`.
@@ -1428,7 +1329,7 @@ fn snapshotted(
   lower: (Stack) -> Lowered / {abort.raise},
 ) -> Lowered / {abort.raise} =
   if stack.held.len() == 0 { lower(stack) } else {
-    let used = typed_nodes(e).fold([], |acc: List<HeldVar>, x: TypedExpr<Type>|
+    let used = typed_expr_nodes_folded(e, [], |acc: List<HeldVar>, x: TypedExpr<Type>|
       match x.node {
         TypedRead(ReadLocal(n)) -> match held_var(stack, n) {
           Some(h) -> if acc.any(|y: HeldVar| y.name == n) { acc } else { acc.push(h) },
@@ -1602,10 +1503,7 @@ fn lower_from(
       [p] -> {
         let o = lower_in(l.value, acc.stack);
         // What a miss lets go of is read where the value stands, before the pattern binds.
-        let missed = match o.stack.releases.at.get(l.pat_span.site) {
-          Some(xs) -> xs.filter(|x: ReleaseSite| x.place == ReleaseUnwinding),
-          None -> [],
-        };
+        let missed = l.value.releases.filter(|x: TypedRelease| x.place == ReleaseMissing);
         let unwound = held_codes(o.stack, missed);
         let s = slotted(p, unwound.stack);
         next({
@@ -1679,7 +1577,7 @@ type PatOut = { pat: CodePattern, stack: Stack }
 /// until `slotted` gives it its own.
 fn alternatives(p: TypedPattern<Type>) -> List<CodePattern> =
   match p {
-    TypedWild -> [PxWild],
+    TypedWild(_) -> [PxWild],
     TypedBinder(v) -> [PxVar({ name: v.name, slot: 0, span: v.span, ty: v.ty })],
     TypedLitPattern(l) -> [PxLit(l)],
     TypedRange(r) -> [PxRange({ lo: r.lo, hi: r.hi })],
@@ -1690,7 +1588,7 @@ fn alternatives(p: TypedPattern<Type>) -> List<CodePattern> =
       choices(
         r.fields.map(|f: TypedFieldPattern<Type>|
           alternatives(f.pat).map(|q: CodePattern| { name: f.name, pat: q })),
-      ).map(|fs: List<CodePatternField>| PxRecord({ fields: fs, rest: r.rest })),
+      ).map(|fs: List<CodePatternField>| PxRecord({ fields: fs, rest: r.rest != None })),
     TypedListPattern(l) -> {
       let rests: List<Option<CodePattern>> = match l.rest {
         Some(x) -> alternatives(x).map(Some),
@@ -1786,15 +1684,16 @@ pub fn irrefutable(pattern: CodePattern) -> Bool =
 
 // --- releases ---------------------------------------------------------------
 
-/// `o`, the node at `span` lowered, with what the check lets go there: its value held by a slot of
-/// its own where a release names it; the resources a failure in it lets go named around it; and
-/// those let go before it runs or after it.
-fn released_around(span: Span, o: Lowered) -> Lowered = {
+/// `o`, the node `e` lowered, with what the check lets go there: its value held by a slot of its own
+/// where a release names it; the resources a failure in it lets go named around it; and those let
+/// go before it runs or after it.
+fn released_around(e: TypedExpr<Type>, o: Lowered) -> Lowered = {
+  let span = e.span;
   // The check files them the latest bound first.
-  let here = match o.stack.releases.at.get(span.site) { Some(xs) -> xs, None -> [] };
-  let unwinding = here.filter(|x: ReleaseSite| x.place == ReleaseUnwinding);
-  let after = here.filter(|x: ReleaseSite| x.place == ReleaseAfter);
-  let before = here.filter(|x: ReleaseSite| x.place == ReleaseBefore);
+  let here = e.releases;
+  let unwinding = here.filter(|x: TypedRelease| x.place == ReleaseUnwinding);
+  let after = here.filter(|x: TypedRelease| x.place == ReleaseAfter);
+  let before = here.filter(|x: TypedRelease| x.place == ReleaseBefore);
   let unwound = held_codes(o.stack, unwinding);
   let guarded = if unwinding.len() == 0 { { code: o.code, stack: unwound.stack } } else {
     { code: hidden_call(b"?unwinds", unwound.codes.push(o.code), o.code.ty), stack: unwound.stack }
@@ -1825,7 +1724,7 @@ fn released_around(span: Span, o: Lowered) -> Lowered = {
   let first = let_goes(ended.stack, before, here);
   let made = preceded(first.codes, ended.code);
   let s = first.stack;
-  if !s.releases.held.contains(span.site) { { code: made, stack: s } } else {
+  if !s.released.contains(span.site) { { code: made, stack: s } } else {
     let slot = st_top(s).names.len();
     {
       code: held_then(b"?held", slot, made, []),
@@ -1867,15 +1766,15 @@ fn preceded(calls: List<Code>, code: Code) -> Code =
 
 /// A call letting go of each of `rs` in turn, between markers naming what `here`, the releases at
 /// the node, files for its release failing.
-fn let_goes(s: Stack, rs: List<ReleaseSite>, here: List<ReleaseSite>) -> Seq =
-  rs.fold({ codes: [], stack: s }, |acc: Seq, r: ReleaseSite| {
+fn let_goes(s: Stack, rs: List<TypedRelease>, here: List<TypedRelease>) -> Seq =
+  rs.fold({ codes: [], stack: s }, |acc: Seq, r: TypedRelease| {
     let own = held_codes(acc.stack, [r]);
     match own.codes.at(0) {
       None -> { ..acc, stack: own.stack },
       Some(x) -> {
         let failing = held_codes(
           own.stack,
-          here.filter(|y: ReleaseSite| y.place == ReleaseFailing(r.binding)),
+          here.filter(|y: TypedRelease| y.place == ReleaseFailing(r.held)),
         );
         let call = hidden_call(b"?let_go", [x], unit_type());
         {
@@ -1889,9 +1788,9 @@ fn let_goes(s: Stack, rs: List<ReleaseSite>, here: List<ReleaseSite>) -> Seq =
 
 /// A read of the slot each of `rs` lets go of: its binder's in this barrier, or one captured from
 /// the barrier it is bound in, where no barrier between binds its name again.
-fn held_codes(s: Stack, rs: List<ReleaseSite>) -> Seq =
-  rs.fold({ codes: [], stack: s }, |acc: Seq, r: ReleaseSite|
-    match acc.stack.binders.get(r.binding) {
+fn held_codes(s: Stack, rs: List<TypedRelease>) -> Seq =
+  rs.fold({ codes: [], stack: s }, |acc: Seq, r: TypedRelease|
+    match acc.stack.binders.get(holder_key(r.held)) {
       Some(b) -> {
         let top = acc.stack.frames.len() - 1;
         if b.depth == top {
@@ -1990,13 +1889,11 @@ fn fields_read(fs: List<CodeField>, before: List<Int>) -> List<Int> =
 pub type LoweredBody = { code: Code, size: Int, failed: List<Bytes> }
 
 /// One body, its slots resolved: `params` lead its window, then the label parameters `labels` a
-/// label-generic definition takes after them. `releases` are where the check lets go of what the
-/// body owns.
+/// label-generic definition takes after them.
 pub fn lower_fn(
   params: List<TypedParam<Type>>,
   labels: List<Bytes>,
   body: TypedExpr<Type>,
-  releases: List<ReleaseSite> = [],
 ) -> LoweredBody / {abort.raise} = {
   let start = with_labels(params.map(|p: TypedParam<Type>| p.name), labels.map(label_binder)).fold(
     empty_frame(),
@@ -2006,7 +1903,7 @@ pub fn lower_fn(
     {
       frames: [start],
       labels: labels,
-      releases: releases_of(releases),
+      released: released_in(body),
       binders: Map::new(),
       rekey: Map::new(),
       held: [],

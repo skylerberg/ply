@@ -1,23 +1,29 @@
 //! Ownership. A resource is a value of a type that states a `release`, a value holding one, or a
 //! function its call consumes. It is never copied: a binding of one the body owns is consumed at
-//! most once on each path, and one lent to the body never. The walk judges a body by the types
-//! inference gave its nodes and how what it calls takes its arguments, and answers where each owned
-//! binding a path leaves live is let go: where its block, its body or its branch ends, or where a
-//! way out of its block leaves early. The emitter writes its type's release there.
+//! most once on each path, and one lent to the body never. The walk judges a body by the tree the
+//! check's walk built of it, each node with its type, and how what it calls takes its arguments, and
+//! answers where each owned binding a path leaves live is let go: where its block, its body or its
+//! branch ends, or where a way out of its block leaves early. The emitter writes its type's release
+//! there.
 
-import compiler.syntax.parsing (Span, Ident, QName, is_bare, dummy_span)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PCtor, PRecord, PList, POr, pat_span)
-import compiler.syntax.type_syntax (TypeExpr)
-import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
-                              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
-                              EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, ETagged,
-                              Stmt, SLet, SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm,
-                              HandleClause, ReturnClause, HandlerVar, Hole, RecField, expr_span)
-import compiler.check.types (Type, TyFn, Field, record_fields, unit_type)
+import compiler.syntax.parsing (Span)
+import compiler.check.types (Type, TyFn, Row, Field, record_fields, unit_type)
+import compiler.check.typed (TypedParam, pattern_binders, TypedPattern, TypedWild, TypedBinder,
+                             TypedCase, TypedRecordPattern, TypedListPattern, TypedOr,
+                             TypedFieldPattern, Holder, HeldByBinder, HeldByNode, ReleasePlace,
+                             ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
+                             ReleaseFailing, binding_key, holder_key)
+import compiler.check.infer.walked (Walked, WalkedLit, WalkedRead, WalkedLocal, WalkedDefinition,
+                                    WalkedConstructor, WalkedBuiltin, WalkedUnary, WalkedBinary,
+                                    WalkedCall, WalkedIf, WalkedMatch, WalkedBlock, WalkedList,
+                                    WalkedRecord, WalkedUpdate, WalkedFieldRead, WalkedPerform,
+                                    WalkedLambda, WalkedSimulate, WalkedParallel, WalkedHandle,
+                                    WalkedDefault, WalkedArm, WalkedStmt, WalkedLet, WalkedLetElse,
+                                    WalkedDo, WalkedAssign, WalkedField, WalkedThunk, WalkedClause,
+                                    WalkedReturn, WalkedHandlerVar, walked_nodes_folded)
 import compiler.check.resolve.tables (Diag, error_at, error_at_and)
-import compiler.expand.rewrite.shared (nodes_of)
-import compiler.check.infer.checker (ReleasePlace, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
-                                     ReleaseFailing, simulated_ops, binding_key)
+import compiler.check.infer.checker (simulated_ops)
+import compiler.check.infer.names (simple_name_of)
 import std.list
 import std.option
 
@@ -27,59 +33,65 @@ pub type Facts = {
   module: Int,
   /// Whether a value of the resolved type is a resource.
   resource: (Type) -> Bool / {abort.raise},
-  /// The resolved type inference gave the node at a span: an expression, a pattern, or a clause's
-  /// parameter.
-  type_at: (Span) -> Option<Type> / {abort.raise},
-  /// How the definition a name calls takes its arguments, where it names one.
-  named: (QName) -> Option<Taking> / {abort.raise},
-  /// How the function a call on a value calls takes its arguments, by the span the check wrote the
-  /// call out at; none for a call of what a field holds.
-  member: (Span) -> Option<Taking> / {abort.raise},
-  /// The places of the parameters of an operation its handler takes.
-  op_kept: (QName, Ident) -> List<Int> / {abort.raise},
+  /// A type of the tree as the check resolved it.
+  resolved: (Type) -> Type / {abort.raise},
+  /// How the definition or builtin the check holds under a name takes its arguments, where it holds
+  /// one.
+  taking: (Bytes) -> Option<Taking> / {abort.raise},
+  /// The places of the parameters of an operation its handler takes, by the effect's name across
+  /// the program and the operation's.
+  op_kept: (Bytes, Bytes) -> List<Int> / {abort.raise},
   /// Whether a value of the resolved type states a `release` itself, so that taking it apart, which
   /// only its own module may, consumes it whole and runs no release.
   opened: (Type) -> Bool / {abort.raise},
-  /// The operation a clause or a perform names, as `<effect>.<operation>`.
-  op_named: (QName, Ident) -> Bytes / {abort.raise},
-  /// The raises a `try` at a span answers, each as `<effect>.<operation>`.
-  try_ops: (Span) -> List<Bytes> / {abort.raise},
 }
 
-/// How a definition takes its arguments: the names a call may pass them by, and the places of
-/// those written `keep`; `all` for a constructor, which takes every value it is handed.
-pub type Taking = { names: List<Bytes>, kept: List<Int>, all: Bool }
+/// How a definition takes its arguments: the places of those written `keep`; `all` for a
+/// constructor, which takes every value it is handed.
+pub type Taking = { kept: List<Int>, all: Bool }
 
 fn takes(t: Taking, i: Int) -> Bool = t.all || t.kept.contains(i)
 
-/// Where an owned binding is let go, by the node at `at`: after it, a block, a branch's body, a
-/// lambda's, a clause's or the definition's; before it, where it is the last expression of the
-/// binding's scope and does not name the binding; or where a failure unwinds through it. `binding`
-/// is its binder's site, or the site of a node whose value no binding holds: the
-/// scrutinee of a `match`, or an argument a call takes before a later one may fail.
+/// A parameter of the body judged: its name, where it is written, its type, and whether it is
+/// written `keep`, which makes it the body's to let go.
+pub type Param = { name: Bytes, span: Span, ty: Type, keep: Bool }
+
+/// Where an owned value is let go, by the node at `at`, as `place` says: after a block, a branch's
+/// body, a lambda's, a clause's or the definition's; before the last expression of its scope where
+/// that does not name it; or where a failure unwinds through the node. `held` is its binder, or the
+/// node that made a value no binder holds: the scrutinee of a `match`, or an argument a call takes
+/// before a later one may fail.
 pub type Release = {
-  binding: Int,
+  held: Holder,
   ty: Type,
   at: Span,
   place: ReleasePlace,
-  /// The body the release runs in, the innermost lambda's site or the definition's 0, and the
+  /// What the lambda the release runs in performs, none in the definition's body, and the
   /// operations the `handle`s around it there answer.
-  body: Int,
+  row: Option<Row>,
   answered: List<Bytes>,
 }
 
-/// Where a release runs: the body, and what the `handle`s around it there answer.
-type Where = { body: Int, answered: List<Bytes> }
+/// Where a release runs: what the lambda it runs in performs, and what the `handle`s around it there
+/// answer.
+type Where = { row: Option<Row>, answered: List<Bytes> }
 
 /// What the walk of a body found: what it refuses, where each binding it owns is let go, and the type
 /// of each value it owns, any of which it may let go, so that its row performs their releases.
 pub type Owned = { diags: List<Diag>, releases: List<Release>, held: List<Owning> }
 
-/// A value a body owns, which a release may let go: bound at `at` as `name`, of type `ty`, in the
-/// body `frame` names (the definition's 0, a lambda's its site, a clause's or region's below 0), and
-/// `answered` the operations the `handle`s around it in that body answer, which its release may
-/// perform without its body's row naming them.
-pub type Owning = { key: Int, frame: Int, ty: Type, at: Span, name: Bytes, answered: List<Bytes> }
+/// A value a body owns, which a release may let go: bound at `at` as `name`, of type `ty`; `row`
+/// what the lambda it is let go in performs, none in the definition's body; and `answered` the
+/// operations the `handle`s around it there answer, which its release may perform without that row
+/// naming them.
+pub type Owning = {
+  held: Holder,
+  row: Option<Row>,
+  ty: Type,
+  at: Span,
+  name: Bytes,
+  answered: List<Bytes>,
+}
 
 /// How an expression's value is used where it stands.
 type Pos =
@@ -99,12 +111,12 @@ type Pos =
 /// says what it captured.
 type Fn = { span: Span, held: Bool, local: Bool }
 
-/// A binding the walk follows, by `key`: its binder's [`binding_key`], or a node's site for a value
-/// no binder holds.
+/// A binding the walk follows, by `key`, its holder's (`holder_key`).
 /// `depth` is how many functions in it is bound, so a use deeper than that captures it, and `frame`
 /// the body that runs it: the definition's, a lambda's or a clause's.
 type Binding = {
   key: Int,
+  holder: Holder,
   name: Bytes,
   at: Span,
   ty: Type,
@@ -120,8 +132,9 @@ type Binding = {
   /// For a function a `let` binds that consumed what it captured: those bindings, which letting the
   /// function go uncalled lets go.
   holds: List<Int>,
-  /// The body it is bound in, and the operations the `handle`s around it there answer.
-  body: Int,
+  /// Where it is let go: what the lambda it is bound in performs, and the operations the `handle`s
+  /// around it there answer.
+  row: Option<Row>,
   answered: List<Bytes>,
 }
 
@@ -150,24 +163,25 @@ type St = {
   flight: List<Held>,
 }
 
-/// An owned value a failure lets go: where it is bound, or the node that made it, and its type.
-type Held = { binding: Int, ty: Type }
+/// An owned value a failure lets go: what holds it, and its type.
+type Held = { holder: Holder, ty: Type }
 
 /// What a function's body captured from outside it: the bindings it consumed and the owned bindings
 /// it borrows, each by the site it is bound at.
 type Captured = { consumed: List<Int>, borrows: List<Int> }
 
-/// The binder of each local the body names, by the site of the name; the functions the walk is inside of, innermost last; the sites bound in the block, body
+/// The functions the walk is inside of, innermost last; the sites bound in the block, body
 /// or arm being walked, which its end lets go; and the body running here, whose failures let go
 /// only what it binds.
 type Scope = {
-  binders: Map<Int, Int>,
   fns: List<Fn>,
   block: List<Int>,
   handles: List<Handling>,
   frame: Int,
   /// The innermost lambda's site, or 0 in the definition's body: where what runs here runs.
   body: Int,
+  /// What the innermost lambda performs, none in the definition's body.
+  row: Option<Row>,
   /// How the innermost block's value is used, which an `else` answering it answers as.
   answer: Pos,
 }
@@ -175,23 +189,17 @@ type Scope = {
 type Bound = { s: Scope, st: St }
 
 /// Where a body, a definition's or a test's, would copy a resource, use one after consuming it, or
-/// consume one it was lent; and what it owns. `params` are the definition's, at `param_types`.
-pub fn owned(
-  f: Facts,
-  binders: Map<Int, Int>,
-  params: List<Param>,
-  body: Expr,
-  param_types: List<Type>,
-) -> Owned / {abort.raise} = {
-  let start: Bound = range(0, params.len()).fold(
+/// consume one it was lent; and what it owns. `params` are the definition's.
+pub fn owned(f: Facts, params: List<Param>, body: Walked) -> Owned / {abort.raise} = {
+  let start: Bound = params.fold(
     {
       s: {
-        binders: binders,
         fns: [],
         block: [],
         handles: [],
         frame: 0,
         body: 0,
+        row: None,
         answer: Taken(b"answered"),
       },
       st: {
@@ -203,12 +211,9 @@ pub fn owned(
         flight: [],
       },
     },
-    |acc: Bound, i: Int| {
-      let p = params.get(i);
-      match param_types.at(i) {
-        Some(t) -> bound(f, acc, p.name, t, f.resource(t), p.keep),
-        None -> acc,
-      }
+    |acc: Bound, p: Param| {
+      let t = f.resolved(p.ty);
+      bound(acc, p.name, p.span, t, f.resource(t), p.keep)
     },
   );
   let walked = let_go(
@@ -216,7 +221,7 @@ pub fn owned(
     walk(f, start.s, released_before(start.st, start.s, body), body, Taken(b"answered")),
     start.s,
     body,
-    expr_span(body),
+    body.span,
     Taken(b"answered"),
   );
   {
@@ -224,12 +229,13 @@ pub fn owned(
     releases: walked.releases,
     // What may be let go is what a release is placed for, in the body it runs in.
     held: walked.releases.fold([], |acc: List<Owning>, r: Release| {
+      let bound = walked.bindings.get(holder_key(r.held));
       let x = {
-        key: r.binding,
-        frame: r.body,
+        held: r.held,
+        row: r.row,
         ty: r.ty,
-        at: match walked.bindings.get(r.binding) { Some(b) -> b.at, None -> r.at },
-        name: match walked.bindings.get(r.binding) { Some(b) -> b.name, None -> b"a value" },
+        at: match bound { Some(b) -> b.at, None -> r.at },
+        name: match bound { Some(b) -> b.name, None -> b"a value" },
         answered: r.answered,
       };
       if acc.contains(x) { acc } else { acc.push(x) }
@@ -237,44 +243,52 @@ pub fn owned(
   }
 }
 
+/// Whether `e` reads a resource or answers an operation, which only a body that does has to be
+/// judged for.
+pub fn judged(f: Facts, e: Walked) -> Bool / {abort.raise} =
+  walked_nodes_folded(e, false, |found: Bool, x: Walked|
+    found || resource_at(f, x) || (match x.node { WalkedHandle(_) -> true, _ -> false }))
+
+fn type_of(f: Facts, e: Walked) -> Type / {abort.raise} = f.resolved(e.ty)
+
+fn resource_at(f: Facts, e: Walked) -> Bool / {abort.raise} = f.resource(type_of(f, e))
+
 /// `st` with each owned binding of `sites` a path leaves live let go where its scope, the node at
 /// `at`, ends, the last bound first, and gone past it: before `last`, the scope's last expression,
 /// where that does not name it, and after the scope otherwise.
-fn let_go(f: Facts, st: St, s: Scope, last: Expr, at: Span, pos: Pos) -> St / {abort.raise} =
+fn let_go(f: Facts, st: St, s: Scope, last: Walked, at: Span, pos: Pos) -> St / {abort.raise} =
   s.block.reverse().fold(st, |acc: St, site: Int|
     match acc.bindings.get(site) {
       Some(b) -> if !live(b) { acc } else {
-        let place = released_by(acc, s.binders, b, last);
+        let place = released_by(acc, b, last);
         releasing(
           gone_at(acc, b, at, b"let go where its block ends"),
           b,
           place.at,
           place.place,
-          answered_at(f, expr_span(last), place.place, pos),
+          answered_at(f, last, place.place, pos),
         )
       },
       None -> acc,
     })
 
-/// What the node at `at` answers, where a release placed as `place` runs after it, it is a resource
+/// What the node `at` answers, where a release placed as `place` runs after it, it is a resource
 /// and `pos` takes it: a failing release lets it go too. One only lent is its owner's to let go.
-fn answered_at(f: Facts, at: Span, place: ReleasePlace, pos: Pos) -> List<Held> / {abort.raise} =
+fn answered_at(f: Facts, at: Walked, place: ReleasePlace, pos: Pos) -> List<Held> / {abort.raise} =
   if place != ReleaseAfter || (match pos { Taken(_) -> false, _ -> true }) { [] } else {
-    match f.type_at(at) {
-      Some(t) -> if f.resource(t) { [{ binding: at.site, ty: t }] } else { [] },
-      None -> [],
-    }
+    let t = type_of(f, at);
+    if f.resource(t) { [{ holder: HeldByNode(at.span.site), ty: t }] } else { [] }
   }
 
 /// `st` with `b` let go at `at` as `place` says, and, where its release fails, what is still owned
 /// there let go on that way out: the rest of what `b` holds, `value`, what the node at `at` answered,
 /// and what the body owns live and what calls around hold in flight.
 fn releasing(st: St, b: Binding, at: Span, place: ReleasePlace, value: List<Held>) -> St = {
-  let w = { body: b.body, answered: b.answered };
+  let w = { row: b.row, answered: b.answered };
   let held = held_by(st, b);
-  let keys = held.map(|x: Held| x.binding);
+  let holders = held.map(|x: Held| x.holder);
   let owned = st.bindings.fold([], |acc: List<Held>, key: Int, x: Binding|
-    if x.frame == b.frame && key != b.key && !keys.contains(key) && live(x) {
+    if x.frame == b.frame && key != b.key && !holders.contains(x.holder) && live(x) {
       acc.concat(held_by(st, x))
     } else { acc });
   // The latest first: what calls hold in flight, the latest taken first, then the bindings, whose
@@ -284,58 +298,52 @@ fn releasing(st: St, b: Binding, at: Span, place: ReleasePlace, value: List<Held
     { st: released(st, held, at, place, w), later: held },
     |acc: { st: St, later: List<Held> }, x: Held| {
       let later = acc.later.drop(1);
-      { st: released(acc.st, later.concat(around), at, ReleaseFailing(x.binding), w), later: later }
+      { st: released(acc.st, later.concat(around), at, ReleaseFailing(x.holder), w), later: later }
     },
   ).st
 }
 
 /// Whether a release placed as `p` runs on a way out a failure takes.
 fn on_failure(p: ReleasePlace) -> Bool =
-  match p { ReleaseUnwinding -> true, ReleaseFailing(_) -> true, _ -> false }
+  match p {
+    ReleaseUnwinding -> true,
+    ReleaseMissing -> true,
+    ReleaseFailing(_) -> true,
+    _ -> false,
+  }
 
 /// `st` with each owned binding of `sites` refused that `last`, the scope's last expression, hands on
 /// as a resource it only lends or reads: its scope's end lets it go while what it is handed to still
 /// reads it.
-fn lent_out(f: Facts, st: St, s: Scope, last: Expr, pos: Pos) -> St / {abort.raise} =
+fn lent_out(f: Facts, st: St, s: Scope, last: Walked, pos: Pos) -> St / {abort.raise} =
   match pos {
-    Lent -> lent_on(f, st, s.block, s.binders, last),
-    Read -> lent_on(f, st, s.block, s.binders, last),
+    Lent -> lent_on(f, st, s.block, last),
+    Read -> lent_on(f, st, s.block, last),
     _ -> st,
   }
 
-fn lent_on(
-  f: Facts,
-  st: St,
-  sites: List<Int>,
-  binders: Map<Int, Int>,
-  last: Expr,
-) -> St / {abort.raise} =
-  if !resource_at(f, expr_span(last)) { st } else {
+fn lent_on(f: Facts, st: St, sites: List<Int>, last: Walked) -> St / {abort.raise} =
+  if !resource_at(f, last) { st } else {
     sites.fold(st, |acc: St, key: Int|
       match acc.bindings.get(key) {
-        Some(b) -> if live(b) && answers(binders, last, b.key) {
-          said(acc, made_and_dropped(f, last, Lent))
-        } else { acc },
+        Some(b) -> if live(b) && answers(last, b.key) { said(acc, made_and_dropped(f, last, Lent)) }
+        else { acc },
         None -> acc,
       })
   }
 
-/// Whether `e` may answer what the binding `name` holds, or a field of it, rather than a value it
+/// Whether `e` may answer what the binding `key` holds, or a field of it, rather than a value it
 /// makes: a call answers what it owns, and a value built of the binding takes it.
-fn answers(binders: Map<Int, Int>, e: Expr, key: Int) -> Bool =
-  match e {
-    EVar(v) -> read_binder(binders, v.name) == Some(key),
-    EField(x) -> answers(binders, x.base, key),
-    EBlock(b) -> match b.tail { Some(t) -> answers(binders, t, key), None -> false },
-    EIf(i) -> answers(binders, i.then_branch, key) || answers(binders, i.else_branch, key),
-    EMatch(m) -> m.arms.any(|a: MatchArm| answers(binders, a.body, key)),
-    EHandle(h) -> answers(binders, h.body, key),
-    ETryBlock(t) -> answers(binders, t.body, key),
+fn answers(e: Walked, key: Int) -> Bool =
+  match e.node {
+    WalkedRead(WalkedLocal(l)) -> binding_key(l.binder) == key,
+    WalkedFieldRead(x) -> answers(x.base, key),
+    WalkedBlock(b) -> match b.tail { Some(t) -> answers(t, key), None -> false },
+    WalkedIf(i) -> answers(i.then_branch, key) || answers(i.else_branch, key),
+    WalkedMatch(m) -> m.arms.any(|a: WalkedArm| answers(a.body, key)),
+    WalkedHandle(h) -> answers(h.body, key),
     _ -> false,
   }
-
-fn read_binder(binders: Map<Int, Int>, q: QName) -> Option<Int> =
-  if is_bare(q) { binders.get(q.name.span.site).map(binding_key) } else { None }
 
 /// `st` with each owned binding of `sites` live here let go after the node at `at`, the last bound
 /// first.
@@ -373,7 +381,7 @@ fn quiet(op: Bytes) -> Bool =
   )
 
 /// A block's statements walked so far, and how many.
-type Walked = { s: Scope, st: St, at: Int }
+type Walk = { s: Scope, st: St, at: Int }
 
 /// Whether `b` owns what it holds here.
 fn live(b: Binding) -> Bool = b.owned && b.gone == None && b.taken.len() == 0
@@ -382,11 +390,11 @@ fn live(b: Binding) -> Bool = b.owned && b.gone == None && b.taken.len() == 0
 /// or, for a continuation, nothing, which the clause that never calls it abandons.
 fn held_by(st: St, b: Binding) -> List<Held> =
   match b.kind {
-    Value -> [{ binding: b.key, ty: b.ty }],
+    Value -> [{ holder: b.holder, ty: b.ty }],
     Taker ->
       b.holds.fold([], |acc: List<Held>, site: Int|
         match st.bindings.get(site) {
-          Some(x) -> acc.push({ binding: x.key, ty: x.ty }),
+          Some(x) -> acc.push({ holder: x.holder, ty: x.ty }),
           None -> acc,
         }),
     Continuation -> [],
@@ -409,49 +417,42 @@ fn released(st: St, held: List<Held>, at: Span, place: ReleasePlace, w: Where) -
     ..st,
     releases: held.fold(st.releases, |acc: List<Release>, x: Held|
       acc.push({
-        binding: x.binding,
+        held: x.holder,
         ty: x.ty,
         at: at,
         place: place,
-        body: w.body,
+        row: w.row,
         answered: w.answered,
       })),
   }
 
 /// Where `b` is let go at the end of its scope, whose last expression is `last`: before it where it
 /// does not name the binding, so a tail call there stays a loop, and after it otherwise.
-fn released_by(
-  st: St,
-  binders: Map<Int, Int>,
-  b: Binding,
-  last: Expr,
-) -> { at: Span, place: ReleasePlace } =
-  {
-    at: expr_span(last),
-    place: if named_by(st, binders, last, b) { ReleaseAfter } else { ReleaseBefore },
-  }
+fn released_by(st: St, b: Binding, last: Walked) -> { at: Span, place: ReleasePlace } =
+  { at: last.span, place: if named_by(st, last, b) { ReleaseAfter } else { ReleaseBefore } }
 
 /// Whether `e` reads `b`, or a function a `let` binds that borrows or holds it.
-fn named_by(st: St, binders: Map<Int, Int>, e: Expr, b: Binding) -> Bool = {
+fn named_by(st: St, e: Walked, b: Binding) -> Bool = {
   let keys = st.bindings.fold([b.key], |acc: List<Int>, key: Int, x: Binding|
     if x.borrows.contains(b.key) || x.holds.contains(b.key) { acc.push(key) } else { acc });
-  nodes_of(e).any(|x: Expr|
-    match x {
-      EVar(v) -> match read_binder(binders, v.name) { Some(k) -> keys.contains(k), None -> false },
-      _ -> false,
-    })
+  walked_nodes_folded(e, false, |found: Bool, x: Walked|
+    found
+      || (match x.node {
+        WalkedRead(WalkedLocal(l)) -> keys.contains(binding_key(l.binder)),
+        _ -> false,
+      }))
 }
 
 /// `st` with each owned binding of `sites` that `last`, its scope's last expression, does not name
 /// let go before `last` runs, the last bound first, so `last` runs without it.
-fn released_before(st: St, s: Scope, last: Expr) -> St =
+fn released_before(st: St, s: Scope, last: Walked) -> St =
   s.block.reverse().fold(st, |acc: St, key: Int|
     match acc.bindings.get(key) {
-      Some(b) -> if !live(b) || named_by(acc, s.binders, last, b) { acc } else {
+      Some(b) -> if !live(b) || named_by(acc, last, b) { acc } else {
         releasing(
-          gone_at(acc, b, expr_span(last), b"let go before its block's last expression"),
+          gone_at(acc, b, last.span, b"let go before its block's last expression"),
           b,
-          expr_span(last),
+          last.span,
           ReleaseBefore,
           [],
         )
@@ -459,17 +460,17 @@ fn released_before(st: St, s: Scope, last: Expr) -> St =
       None -> acc,
     })
 
-/// `st` with each owned binding of `sites` live here let go after the node at `at`, on a way out of
-/// its scope that the path on does not take, and still live on the path that goes on.
-fn let_go_leaving(f: Facts, st: St, sites: List<Int>, at: Span, pos: Pos) -> St / {abort.raise} = {
+/// `st` with each owned binding of `sites` live here let go after the node `at`, on a way out of its
+/// scope that the path on does not take, and still live on the path that goes on.
+fn let_go_leaving(f: Facts, st: St, sites: List<Int>, at: Walked, pos: Pos) -> St / {abort.raise} = {
   let value = answered_at(f, at, ReleaseAfter, pos);
   let leaving = sites.reverse().fold(st, |acc: St, site: Int|
     match acc.bindings.get(site) {
       Some(b) -> if !live(b) { acc } else {
         releasing(
-          gone_at(acc, b, at, b"let go on a way out of its block"),
+          gone_at(acc, b, at.span, b"let go on a way out of its block"),
           b,
-          at,
+          at.span,
           ReleaseAfter,
           value,
         )
@@ -481,29 +482,41 @@ fn let_go_leaving(f: Facts, st: St, sites: List<Int>, at: Span, pos: Pos) -> St 
 
 /// What a failure at the call or perform at `at` lets go, the latest first: the arguments calls
 /// around it took from earlier places, and what the running body owns live there.
-fn unwinding(s: Scope, st: St, at: Span) -> St = {
+fn unwinding(s: Scope, st: St, at: Span) -> St = failing(s, st, at, ReleaseUnwinding)
+
+/// What a failure at the node at `at` lets go, the latest first, placed as `place` says.
+fn failing(s: Scope, st: St, at: Span, place: ReleasePlace) -> St = {
   let owned = st.bindings.fold([], |acc: List<Held>, site: Int, b: Binding|
     if b.frame == s.frame && live(b) { acc.concat(held_by(st, b)) } else { acc });
-  released(st, st.flight.reverse().concat(owned), at, ReleaseUnwinding, here(s))
+  released(st, st.flight.reverse().concat(owned), at, place, here(s))
 }
 
 // --- Bindings ----------------------------------------------------------------------------------
 
-/// `name` bound to a value of type `ty`, owned where `owned` holds and lent otherwise, and followed
-/// where `followed` holds: a resource, or a function that borrows one. Any other binding only
-/// shadows the names it hides.
-fn bound(f: Facts, b: Bound, name: Ident, ty: Type, followed: Bool, owned: Bool) -> Bound =
-  bound_as(b, name, ty, followed, owned, Value)
+/// `name`, bound at `at`, to a value of type `ty`, owned where `owned` holds and lent otherwise, and
+/// followed where `followed` holds: a resource, or a function that borrows one.
+fn bound(b: Bound, name: Bytes, at: Span, ty: Type, followed: Bool, owned: Bool) -> Bound =
+  bound_as(b, name, at, ty, followed, owned, Value)
 
-fn bound_as(b: Bound, name: Ident, ty: Type, followed: Bool, owned: Bool, kind: Kind) -> Bound =
+fn bound_as(
+  b: Bound,
+  name: Bytes,
+  at: Span,
+  ty: Type,
+  followed: Bool,
+  owned: Bool,
+  kind: Kind,
+) -> Bound =
   if !followed { b } else {
-    let key = binding_key(name.span.site);
+    let key = binding_key(at.site);
+    let w = here(b.s);
     {
       s: { ..b.s, block: b.s.block.push(key) },
       st: put(b.st, {
         key: key,
-        name: name.name,
-        at: name.span,
+        holder: HeldByBinder(at.site),
+        name: name,
+        at: at,
         ty: ty,
         kind: kind,
         owned: owned,
@@ -513,25 +526,28 @@ fn bound_as(b: Bound, name: Ident, ty: Type, followed: Bool, owned: Bool, kind: 
         taken: [],
         borrows: [],
         holds: [],
-        body: b.s.body,
-        answered: answered_here(b.s),
+        row: w.row,
+        answered: w.answered,
       }),
     }
   }
 
-/// Where a release at this point of `s` runs: the body, and what the `handle`s around this point in
-/// it answer, a lambda's being where it is called.
+/// Where a release at this point of `s` runs: what the lambda around it performs, and what the
+/// `handle`s around this point in that lambda answer, those around a lambda being where it is called.
 fn here(s: Scope) -> Where =
   {
-    body: s.body,
+    row: s.row,
     answered: s.handles.fold([], |acc: List<Bytes>, h: Handling|
       if h.body == s.body { acc.concat(h.ops) } else { acc }),
   }
 
-fn answered_here(s: Scope) -> List<Bytes> = here(s).answered
+/// The binding the local read `l` names, where the walk follows it.
+fn binding_of(st: St, l: { name: Bytes, binder: Int }) -> Option<Binding> =
+  st.bindings.get(binding_key(l.binder))
 
-fn binding_named(s: Scope, st: St, q: QName) -> Option<Binding> =
-  match read_binder(s.binders, q) { Some(key) -> st.bindings.get(key), None -> None }
+/// The binding `e` reads, where it is a read of a followed local.
+fn binding_read(s: Scope, st: St, e: Walked) -> Option<Binding> =
+  match e.node { WalkedRead(WalkedLocal(l)) -> binding_of(st, l), _ -> None }
 
 fn put(st: St, b: Binding) -> St = { ..st, bindings: st.bindings.insert(b.key, b) }
 
@@ -594,64 +610,65 @@ fn captured_by(st: St, crossed: List<Fn>, b: Binding, consumed: Bool) -> St =
       { ..acc, captured: acc.captured.insert(fun.span.site, now) }
     })
 
-/// A binding the function `b` borrows that a path has since consumed.
+/// A binding the function `b` borrows that a path has since consumed, whole or in part.
 fn borrowed_gone(st: St, b: Binding) -> Option<Binding> =
-  b.borrows.fold(None, |acc: Option<Binding>, site: Int|
+  b.borrows.fold(None, |acc: Option<Binding>, k: Int|
     match acc {
       Some(_) -> acc,
-      None -> match st.bindings.get(site) {
-        Some(l) -> if l.gone != None || l.taken.len() > 0 { Some(l) } else { None },
+      None -> match st.bindings.get(k) {
+        Some(x) -> if x.gone != None || x.taken.len() > 0 { Some(x) } else { None },
         None -> None,
       },
     })
 
 // --- Expressions ---------------------------------------------------------------------------------
 
-fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
-  match e {
-    ELit(_) -> st,
-    EHole(_) -> st,
-    EBad(_) -> st,
-    EVar(v) -> match binding_named(s, st, v.name) {
-      Some(b) -> used(f, s, st, b, v.span, pos),
+fn walk(f: Facts, s: Scope, st: St, e: Walked, pos: Pos) -> St / {abort.raise} =
+  match e.node {
+    WalkedLit(_) -> st,
+    WalkedDefault(_) -> st,
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
+      Some(b) -> used(f, s, st, b, e.span, pos),
       None -> st,
     },
+    WalkedRead(_) -> st,
     // Arithmetic may raise, which unwinds past what the body holds.
-    EBinary(b) -> {
-      let sides = [b.lhs, b.rhs].fold({ st: st, left: st }, |acc: { st: St, left: St }, x: Expr|
-        { st: walk(f, s, acc.st, x, Read), left: acc.st });
+    WalkedBinary(b) -> {
+      let sides = [b.lhs, b.rhs].fold(
+        { st: st, left: st },
+        |acc: { st: St, left: St }, x: Walked| { st: walk(f, s, acc.st, x, Read), left: acc.st },
+      );
       let both = if b.op == b"and" || b.op == b"or" {
         borrowed_only(
           f,
           sides.left,
           sides.st,
-          expr_span(b.rhs),
+          b.rhs.span,
           b"the right of `&&` or `||`, which may not run",
         )
       } else { sides.st };
-      if quiet(b.op) { both } else { unwinding(s, both, b.span) }
+      if quiet(b.op) { both } else { unwinding(s, both, e.span) }
     },
-    EUnary(u) -> {
+    WalkedUnary(u) -> {
       let operand = walk(f, s, st, u.operand, Read);
-      if u.op == b"neg" { unwinding(s, operand, u.span) } else { operand }
+      if u.op == b"neg" { unwinding(s, operand, e.span) } else { operand }
     },
-    ELambda(l) -> fresh(f, lambda(f, s, st, l, fn_at(l.span, pos), []).st, e, pos),
-    EApp(a) ->
-      fresh(f, landed(s, st, applied(f, s, st, a.span, a.func, a.args, a.named), a.span), e, pos),
-    EIf(i) -> {
+    WalkedLambda(l) -> fresh(f, lambda(f, s, st, e, l, fn_at(e.span, pos), []).st, e, pos),
+    WalkedCall(c) -> fresh(f, landed(s, st, applied(f, s, st, c.callee, c.args), e.span), e, pos),
+    WalkedIf(i) -> {
       let c = walk(f, s, st, i.cond, Read);
       let branches = [i.then_branch, i.else_branch];
-      joined(f, s.binders, c, [c, c], branches.map(|x: Expr| walk(f, s, c, x, pos)), branches, pos)
+      joined(f, c, [c, c], branches.map(|x: Walked| walk(f, s, c, x, pos)), branches, pos)
     },
-    EMatch(m) -> matched(f, s, st, m.span, m.scrutinee, m.arms, pos),
-    EBlock(b) -> {
+    WalkedMatch(m) -> matched(f, s, st, e, m.scrutinee, m.arms, pos),
+    WalkedBlock(b) -> {
       // A block with no tail ends in its last statement where that is an expression.
       let last = b.stmts.len() - 1;
       let ends_in_statement = (match b.tail { Some(_) -> false, None -> true })
-        && (match b.stmts.at(last) { Some(SExpr(_)) -> true, _ -> false });
+        && (match b.stmts.at(last) { Some(WalkedDo(_)) -> true, _ -> false });
       let walked = b.stmts.fold(
         { s: { ..s, block: [], answer: pos }, st: st, at: 0 },
-        |acc: Walked, x: Stmt|
+        |acc: Walk, x: WalkedStmt|
           if ends_in_statement && acc.at == last { acc } else {
             let o = statement(f, { s: acc.s, st: acc.st }, x);
             { s: o.s, st: o.st, at: acc.at + 1 }
@@ -670,137 +687,108 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
             ),
             walked.s,
             t,
-            b.span,
+            e.span,
             pos,
           ),
         None -> match b.stmts.at(last) {
-          Some(SExpr(x)) ->
+          Some(WalkedDo(x)) ->
             let_go(
               f,
               walk(f, walked.s, released_before(walked.st, walked.s, x), x, Dropped),
               walked.s,
               x,
-              b.span,
+              e.span,
               Dropped,
             ),
-          _ -> let_go_after(walked.st, walked.s.block, b.span),
+          _ -> let_go_after(walked.st, walked.s.block, e.span),
         },
       }
     },
-    ERecord(r) -> {
-      let held = r.fields.fold(st, |acc: St, x: RecField|
+    WalkedRecord(fs) -> {
+      let held = fs.fold(st, |acc: St, x: WalkedField|
         flown(f, s, acc, walk(f, s, acc, x.value, in_record()), x.value, in_record()));
       fresh(f, { ..held, flight: st.flight }, e, pos)
     },
-    ERecordUpdate(r) -> {
-      let how = if resource_at(f, expr_span(r.base)) { Taken(b"updated into a new record") }
-      else { Read };
-      let base = match r.base {
-        EVar(v) -> update_of(f, s, st, v, r.fields, how),
-        _ -> replaced(f, s, walk(f, s, st, r.base, how), r.base, r.fields),
+    WalkedUpdate(u) -> {
+      let how = if resource_at(f, u.base) { Taken(b"updated into a new record") } else { Read };
+      // A binding is judged after `replaced`, which may make it whole again.
+      let base = match binding_read(s, st, u.base) {
+        Some(_) -> {
+          let checked = replaced(f, s, st, u.base, u.sets);
+          match binding_read(s, checked, u.base) {
+            Some(b) -> used(f, s, checked, b, u.base.span, how),
+            None -> checked,
+          }
+        },
+        None -> replaced(f, s, walk(f, s, st, u.base, how), u.base, u.sets),
       };
-      let held = r.fields.fold(flown(f, s, st, base, r.base, how), |acc: St, x: RecField|
+      let held = u.sets.fold(flown(f, s, st, base, u.base, how), |acc: St, x: WalkedField|
         flown(f, s, acc, walk(f, s, acc, x.value, in_record()), x.value, in_record()));
       fresh(f, { ..held, flight: st.flight }, e, pos)
     },
-    // Written out as the `match` it is before the check, so none reaches here.
-    ETry(t) -> walk(f, s, st, t.operand, pos),
     // The record a field is read out of is walked here unless it is a name, which `field` judges.
-    EField(x) ->
+    WalkedFieldRead(x) ->
       field(
         f,
         s,
         st,
-        match x.base { EVar(_) -> st, _ -> walk(f, s, st, x.base, Lent) },
-        x.span,
+        match x.base.node { WalkedRead(WalkedLocal(_)) -> st, _ -> walk(f, s, st, x.base, Lent) },
+        e,
         x.base,
         x.field,
         pos,
       ),
-    EList(l) -> {
+    WalkedList(items) -> {
       let how = Taken(b"held in a list");
-      let held = l.items.fold(st, |acc: St, x: Expr|
+      let held = items.fold(st, |acc: St, x: Walked|
         flown(f, s, acc, walk(f, s, acc, x, how), x, how));
       fresh(f, { ..held, flight: st.flight }, e, pos)
     },
-    EPerform(p) -> match f.member(p.span) {
-      // `x.f(..)` on a binding `x` is a call on its value.
-      Some(t) -> {
-        let called = passed_to(
-          f,
-          s,
-          receiver_used(f, s, st, p.eff, t),
-          { taking: t, from: 1, params: [] },
-          p.args,
-          [],
-        );
-        fresh(f, landed(s, st, called, p.span), e, pos)
-      },
-      None -> {
-        let kept = f.op_kept(p.eff, p.op);
-        let how = Bytes::concat_all([
-          b"handed to `",
-          p.eff.name.name,
-          b".",
-          p.op.name,
-          b"`, which takes it",
-        ]);
-        let args = p.args.fold({ st: st, at: 0 }, |acc: { st: St, at: Int }, x: Expr|
-          {
-            st: {
-              let pos = if kept.contains(acc.at) { Taken(how) } else { Lent };
-              flown(f, s, acc.st, walk(f, s, acc.st, x, pos), x, pos)
-            },
-            at: acc.at + 1,
-          }).st;
-        fresh(f, landed(s, st, args, p.span), e, pos)
-      },
+    WalkedPerform(p) -> {
+      let kept = f.op_kept(p.effect, p.op);
+      let how = Bytes::concat_all([
+        b"handed to `",
+        simple_name_of(p.effect),
+        b".",
+        p.op,
+        b"`, which takes it",
+      ]);
+      let args = p.args.fold({ st: st, at: 0 }, |acc: { st: St, at: Int }, x: Walked|
+        {
+          st: {
+            let pos = if kept.contains(acc.at) { Taken(how) } else { Lent };
+            flown(f, s, acc.st, walk(f, s, acc.st, x, pos), x, pos)
+          },
+          at: acc.at + 1,
+        }).st;
+      fresh(f, landed(s, st, args, e.span), e, pos)
     },
-    EHandle(h) -> handled(f, s, st, h, pos),
-    EWithHold(w) -> {
-      let acquired = walk(f, s, st, w.acquire, Taken(b"held by the region"));
-      let released = walk(f, s, acquired, w.release, Read);
-      let inner = apart(s, w.span);
-      unwinding(
-        s,
-        { ..walk(f, inner, { ..released, flight: [] }, w.body, pos), flight: released.flight },
-        w.span,
-      )
-    },
+    WalkedHandle(h) -> handled(f, s, st, e, h, pos),
     // A region answers what its world simulates, as a `handle` would.
-    ESimulate(x) ->
+    WalkedSimulate(t) ->
       unwinding(
         s,
         walk(
           f,
-          { ..apart(s, x.span), handles: s.handles.push({ ops: simulated_ops(), body: s.body }) },
+          {
+            ..apart(s, t.body.span),
+            handles: s.handles.push({ ops: simulated_ops(), body: s.body }),
+          },
           { ..st, flight: [] },
-          x.body,
-          pos,
-        ),
-        x.span,
-      ),
-    EParallel(p) -> {
-      let how = Taken(b"answered by a branch");
-      let held = p.branches.fold(st, |acc: St, x: Expr|
-        { ..walk(f, apart(s, expr_span(x)), { ..acc, flight: [] }, x, how), flight: acc.flight });
-      fresh(f, unwinding(s, held, p.span), e, pos)
-    },
-    ETagged(t) ->
-      t.holes.fold(st, |acc: St, h: Hole| walk(f, s, acc, h.value, Taken(b"handed to the tag"))),
-    ETryBlock(t) ->
-      answered_inside(
-        st,
-        walk(
-          f,
-          { ..s, handles: s.handles.push({ ops: f.try_ops(t.span), body: s.body }) },
-          st,
           t.body,
           pos,
         ),
-        t.span,
-        here(s),
+        e.span,
       ),
+    WalkedParallel(ts) -> {
+      let how = Taken(b"answered by a branch");
+      let held = ts.fold(st, |acc: St, t: WalkedThunk|
+        {
+          ..walk(f, apart(s, t.body.span), { ..acc, flight: [] }, t.body, how),
+          flight: acc.flight,
+        });
+      fresh(f, unwinding(s, held, e.span), e, pos)
+    },
   }
 
 /// `s` for a body that runs as a function of its own, called where it stands, once or not at all: a
@@ -820,13 +808,13 @@ fn answered_inside(before: St, after: St, at: Span, w: Where) -> St = {
         None -> acc,
       }
     });
-  let keys = staying.map(|x: Held| x.binding);
+  let holders = staying.map(|x: Held| x.holder);
   released(
     {
       ..after,
       releases: before.releases.concat(
         after.releases.drop(before.releases.len()).filter(|r: Release|
-          !on_failure(r.place) || !keys.contains(r.binding)),
+          !on_failure(r.place) || !holders.contains(r.held)),
       ),
     },
     staying,
@@ -838,41 +826,27 @@ fn answered_inside(before: St, after: St, at: Span, w: Where) -> St = {
 
 fn in_record() -> Pos = Taken(b"held in a record")
 
-/// An update of the binding `v` names, its value used as `how` says, once `replaced` judged it.
-fn update_of(
-  f: Facts,
-  s: Scope,
-  st: St,
-  v: { span: Span, name: QName },
-  fields: List<RecField>,
-  how: Pos,
-) -> St / {abort.raise} = {
-  let checked = replaced(f, s, st, EVar(v), fields);
-  match binding_named(s, checked, v.name) {
-    Some(b) -> used(f, s, checked, b, v.span, how),
-    None -> checked,
-  }
-}
-
 /// `st` with each resource field of `base` that an update writes over refused where the record still
 /// holds it, as writing over it would drop it unreleased; a binding whose moved-out fields the update
 /// each writes again is whole once more, for the update to take.
-fn replaced(f: Facts, s: Scope, st: St, base: Expr, fields: List<RecField>) -> St / {abort.raise} = {
-  let resources = match f.type_at(expr_span(base)) {
-    Some(t) -> match record_fields(t) {
-      Some(fs) -> fs.filter(|x: Field| f.resource(x.ty)).map(|x: Field| x.name),
-      None -> [],
-    },
+fn replaced(
+  f: Facts,
+  s: Scope,
+  st: St,
+  base: Walked,
+  sets: List<WalkedField>,
+) -> St / {abort.raise} = {
+  let resources = match record_fields(type_of(f, base)) {
+    Some(fs) -> fs.filter(|x: Field| f.resource(x.ty)).map(|x: Field| x.name),
     None -> [],
   };
-  let written = fields.filter(|x: RecField| resources.contains(x.name.name));
-  let held = match base { EVar(v) -> binding_named(s, st, v.name), _ -> None };
+  let written = sets.filter(|x: WalkedField| resources.contains(x.name));
+  let held = binding_read(s, st, base);
   let moved = match held { Some(b) -> b.taken, None -> [] };
-  let refused = written.fold(st, |acc: St, x: RecField|
-    if moved.contains(x.name.name) { acc } else { said(acc, written_over(f, x.name)) });
+  let refused = written.fold(st, |acc: St, x: WalkedField|
+    if moved.contains(x.name) { acc } else { said(acc, written_over(f, x.name, x.value.span)) });
   match held {
-    Some(b) -> if moved.len() > 0
-        && moved.all(|n: Bytes| fields.any(|x: RecField| x.name.name == n)) {
+    Some(b) -> if moved.len() > 0 && moved.all(|n: Bytes| sets.any(|x: WalkedField| x.name == n)) {
       put(refused, { ..b, taken: [] })
     } else { refused },
     None -> refused,
@@ -881,18 +855,17 @@ fn replaced(f: Facts, s: Scope, st: St, base: Expr, fields: List<RecField>) -> S
 
 /// `walked`, `x` walked from `st` as `pos` says: a resource it hands to what takes it is in flight
 /// until that runs, so a failure in a later argument lets it go.
-fn flown(f: Facts, s: Scope, st: St, walked: St, x: Expr, pos: Pos) -> St / {abort.raise} = {
+fn flown(f: Facts, s: Scope, st: St, walked: St, x: Walked, pos: Pos) -> St / {abort.raise} = {
   let flying = |held: List<Held>| { ..walked, flight: walked.flight.concat(held) };
   match pos {
-    Taken(_) -> match x {
-      EVar(v) -> match binding_named(s, st, v.name) {
+    Taken(_) -> match x.node {
+      WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
         Some(b) -> if live(b) && b.frame == s.frame { flying(held_by(st, b)) } else { walked },
         None -> walked,
       },
-      _ -> match f.type_at(expr_span(x)) {
-        Some(t) -> if f.resource(t) { flying([{ binding: expr_span(x).site, ty: t }]) }
-        else { walked },
-        None -> walked,
+      _ -> {
+        let t = type_of(f, x);
+        if f.resource(t) { flying([{ holder: HeldByNode(x.span.site), ty: t }]) } else { walked }
       },
     },
     _ -> walked,
@@ -906,14 +879,11 @@ fn landed(s: Scope, before: St, after: St, at: Span) -> St =
 
 /// A value `e` makes where it stands: one that is a resource has to be held by what it is handed
 /// to, or nothing would let it go.
-fn fresh(f: Facts, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
+fn fresh(f: Facts, st: St, e: Walked, pos: Pos) -> St / {abort.raise} =
   match pos {
     Taken(_) -> st,
-    _ -> if resource_at(f, expr_span(e)) { said(st, made_and_dropped(f, e, pos)) } else { st },
+    _ -> if resource_at(f, e) { said(st, made_and_dropped(f, e, pos)) } else { st },
   }
-
-fn resource_at(f: Facts, span: Span) -> Bool / {abort.raise} =
-  match f.type_at(span) { Some(t) -> f.resource(t), None -> false }
 
 /// The function a lambda used as `pos` says is made as.
 fn fn_at(span: Span, pos: Pos) -> Fn =
@@ -924,102 +894,62 @@ fn fn_at(span: Span, pos: Pos) -> Fn =
 
 // --- Calls ---------------------------------------------------------------------------------------
 
-/// A call of `func` on `args` and `named`, each passed as the callee takes it.
-fn applied(
-  f: Facts,
-  s: Scope,
-  st: St,
-  span: Span,
-  func: Expr,
-  args: List<Expr>,
-  named: List<NamedArg>,
-) -> St / {abort.raise} =
-  match func {
-    EVar(v) -> match binding_named(s, st, v.name) {
+/// A call of `func` on `args`, each passed as the callee takes it.
+fn applied(f: Facts, s: Scope, st: St, func: Walked, args: List<Walked>) -> St / {abort.raise} =
+  match func.node {
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
       // A function that is a resource is consumed by its call; one that borrows is only called.
       Some(b) -> {
-        let called = used(f, s, st, b, v.span, Called);
+        let called = used(f, s, st, b, func.span, Called);
         // What the function holds is the call's once its arguments are in hand.
         let flying = if b.owned && live(b) && b.frame == s.frame {
           { ..called, flight: called.flight.concat(held_by(st, b)) }
         } else { called };
-        let calling = if b.kind == Continuation {
-          { taking: { names: [], kept: [], all: true }, from: 0, params: [] }
-        } else { by_value(f, expr_span(func)) };
-        passed_to(f, s, flying, calling, args, named)
+        let calling = if b.kind == Continuation { { taking: all_taken(), params: [] } }
+        else { by_value(f, func) };
+        passed_to(f, s, flying, calling, args)
       },
-      None -> {
-        // The definition's parameters at the types this call fills, which say how it holds a lambda.
-        let params = match f.type_at(v.span) { Some(TyFn(t)) -> t.params, _ -> [] };
-        let calling = match f.member(v.span) {
-          Some(t) -> { taking: t, from: 0, params: [] },
-          None -> match f.named(v.name) {
-            Some(t) -> { taking: t, from: 0, params: params },
-            None -> by_value(f, expr_span(func)),
-          },
-        };
-        passed_to(f, s, st, calling, args, named)
-      },
+      None -> passed_to(f, s, st, by_value(f, func), args),
     },
-    EField(x) -> match f.member(span) {
-      Some(t) -> {
-        let pos = if takes(t, 0) { Taken(b"handed to the call, which takes it") } else { Lent };
-        passed_to(
-          f,
-          s,
-          flown(f, s, st, walk(f, s, st, x.base, pos), x.base, pos),
-          { taking: t, from: 1, params: [] },
-          args,
-          named,
-        )
-      },
-      None ->
-        passed_to(f, s, walk(f, s, st, x.base, Lent), by_value(f, expr_span(func)), args, named),
-    },
-    other ->
-      passed_to(f, s, walk(f, s, st, other, Read), by_value(f, expr_span(func)), args, named),
+    WalkedRead(WalkedDefinition(d)) -> passed_to(f, s, st, named(f, func, d.key), args),
+    WalkedRead(WalkedBuiltin(b)) -> passed_to(f, s, st, named(f, func, b.name), args),
+    // A constructor takes each value it holds.
+    WalkedRead(WalkedConstructor(_)) ->
+      passed_to(f, s, st, { taking: all_taken(), params: [] }, args),
+    // A function a field holds is read out of its record as the record is lent.
+    WalkedFieldRead(x) -> passed_to(f, s, walk(f, s, st, x.base, Lent), by_value(f, func), args),
+    _ -> passed_to(f, s, walk(f, s, st, func, Read), by_value(f, func), args),
   }
 
-/// The receiver `x` of a call on its value, `x.f(..)`, handed as the function's first argument takes it.
-fn receiver_used(f: Facts, s: Scope, st: St, x: QName, t: Taking) -> St / {abort.raise} =
-  match binding_named(s, st, x) {
-    Some(b) -> if !takes(t, 0) { used(f, s, st, b, x.span, Lent) } else {
-      let taken = used(f, s, st, b, x.span, Taken(b"handed to the call, which takes it"));
-      if live(b) && b.frame == s.frame { { ..taken, flight: taken.flight.concat(held_by(st, b)) } }
-      else { taken }
-    },
-    None -> st,
+fn all_taken() -> Taking = { kept: [], all: true }
+
+/// How a call takes its arguments: as `taking` says, and `params` its parameters' types where they
+/// are known, which say how it holds a lambda.
+type Calling = { taking: Taking, params: List<Type> }
+
+/// How a call of what the check holds under `key`, read as `func`, takes its arguments: as its
+/// declaration says, at the types the read fills, or as its type does where the check holds no
+/// declaration of it.
+fn named(f: Facts, func: Walked, key: Bytes) -> Calling / {abort.raise} =
+  match f.taking(key) {
+    Some(t) -> { taking: t, params: match type_of(f, func) { TyFn(fnt) -> fnt.params, _ -> [] } },
+    None -> by_value(f, func),
   }
 
-/// How a call takes its arguments: as `taking` says, its positional ones from parameter `from` on,
-/// and `params` its parameters' types where they are known, which say how it holds a lambda.
-type Calling = { taking: Taking, from: Int, params: List<Type> }
-
-/// How a call of a function value, of the type filed at `at`, takes its arguments.
-fn by_value(f: Facts, at: Span) -> Calling / {abort.raise} =
-  match f.type_at(at) {
-    Some(TyFn(t)) -> { taking: { names: [], kept: t.kept, all: false }, from: 0, params: t.params },
-    _ -> { taking: { names: [], kept: [], all: false }, from: 0, params: [] },
+/// How a call of the function value `func` takes its arguments, as its type says.
+fn by_value(f: Facts, func: Walked) -> Calling / {abort.raise} =
+  match type_of(f, func) {
+    TyFn(t) -> { taking: { kept: t.kept, all: false }, params: t.params },
+    _ -> { taking: { kept: [], all: false }, params: [] },
   }
 
-/// `args` passed to a call as `c` says, then each of `named` to the parameter it names.
-fn passed_to(
-  f: Facts,
-  s: Scope,
-  st: St,
-  c: Calling,
-  args: List<Expr>,
-  named: List<NamedArg>,
-) -> St / {abort.raise} = {
-  let t = c.taking;
-  let positional = args.fold({ st: st, at: c.from }, |acc: { st: St, at: Int }, x: Expr|
-    { st: passed(f, s, acc.st, x, takes(t, acc.at), c.params.at(acc.at)), at: acc.at + 1 }).st;
-  named.fold(positional, |acc: St, n: NamedArg|
-    match t.names.find_index(|x: Bytes| x == n.name.name) {
-      Some(i) -> passed(f, s, acc, n.value, takes(t, i), c.params.at(i)),
-      None -> passed(f, s, acc, n.value, false, None),
-    })
-}
+/// `args` passed to a call as `c` says.
+fn passed_to(f: Facts, s: Scope, st: St, c: Calling, args: List<Walked>) -> St / {abort.raise} =
+  args.fold({ st: st, at: 0 }, |acc: { st: St, at: Int }, x: Walked|
+    {
+      st: passed(f, s, acc.st, x, takes(c.taking, acc.at), c.params.at(acc.at)),
+      at: acc.at + 1,
+    }).st
 
 /// An argument handed to a parameter that takes it where `keep` holds, of type `ty` where that is
 /// known: a lambda there is judged by how the parameter holds it.
@@ -1027,121 +957,123 @@ fn passed(
   f: Facts,
   s: Scope,
   st: St,
-  arg: Expr,
+  arg: Walked,
   keep: Bool,
   ty: Option<Type>,
 ) -> St / {abort.raise} = {
   let pos = if keep { Taken(b"handed to a parameter that takes it") } else { Lent };
-  match arg {
-    ELambda(l) ->
-      lambda(f, s, st, l, fn_at(l.span, pos), match ty { Some(TyFn(t)) -> t.kept, _ -> [] }).st,
+  match arg.node {
+    WalkedLambda(l) ->
+      lambda(f, s, st, arg, l, fn_at(arg.span, pos), match ty {
+        Some(TyFn(t)) -> t.kept,
+        _ -> [],
+      }).st,
     _ -> flown(f, s, st, walk(f, s, st, arg, pos), arg, pos),
   }
 }
 
-/// A field read: a resource field read out of an owned binding moves the field out. `based` is the
-/// walk past the record where it is not a name.
+/// A field read `e`, of the field `name` of `base`: a resource field read out of an owned binding
+/// moves the field out. `based` is the walk past the record where it is not a name.
 fn field(
   f: Facts,
   s: Scope,
   st: St,
   based: St,
-  span: Span,
-  base: Expr,
-  name: Ident,
+  e: Walked,
+  base: Walked,
+  name: Bytes,
   pos: Pos,
 ) -> St / {abort.raise} =
-  match base {
-    EVar(v) -> match binding_named(s, st, v.name) {
-      None -> st,
-      Some(b) -> if !resource_at(f, span) {
-        // A field that is no resource is read whatever became of the record's other fields.
-        if b.gone != None && b.taken.len() == 0 { used(f, s, st, b, v.span, Lent) } else { st }
-      } else {
-        match pos {
-          Taken(how) -> if b.taken.contains(name.name) { said(st, field_twice(f, b, name, span)) }
-          else if !b.owned || b.gone != None || b.taken.len() > 0 {
-            used(f, s, st, b, v.span, Taken(how))
-          } else if others_held(f, base, name) { said(st, field_beside(f, b, name, span)) } else {
-            match s.fns.drop(b.depth).at(0) {
-              Some(fun) -> said(st, consumed_in_lambda(f, b, span, fun)),
-              None -> put(st, { ..b, taken: b.taken.push(name.name) }),
-            }
-          },
-          _ -> used(f, s, st, b, v.span, pos),
-        }
-      },
-    },
-    _ -> {
-      let lent = based;
+  match binding_read(s, st, base) {
+    Some(b) -> if !resource_at(f, e) {
+      // A field that is no resource is read whatever became of the record's other fields.
+      if b.gone != None && b.taken.len() == 0 { used(f, s, st, b, base.span, Lent) } else { st }
+    } else {
       match pos {
-        Taken(how) -> if !resource_at(f, span) { lent } else {
-          match path_root(s, st, base) {
-            Some(b) -> if b.owned { said(lent, moved_through(f, b, name, span)) }
-            else { said(lent, consumed_lent(f, b, span, how)) },
-            None -> lent,
+        Taken(how) -> if b.taken.contains(name) { said(st, field_twice(f, b, name, e.span)) }
+        else if !b.owned || b.gone != None || b.taken.len() > 0 {
+          used(f, s, st, b, base.span, Taken(how))
+        } else if others_held(f, base, name) { said(st, field_beside(f, b, name, e.span)) } else {
+          match s.fns.drop(b.depth).at(0) {
+            Some(fun) -> said(st, consumed_in_lambda(f, b, e.span, fun)),
+            None -> put(st, { ..b, taken: b.taken.push(name) }),
           }
         },
-        _ -> lent,
+        _ -> used(f, s, st, b, base.span, pos),
       }
+    },
+    None -> match base.node {
+      WalkedRead(WalkedLocal(_)) -> st,
+      _ -> match pos {
+        Taken(how) -> if !resource_at(f, e) { based } else {
+          match path_root(s, st, base) {
+            Some(b) -> if b.owned { said(based, moved_through(f, b, name, e.span)) }
+            else { said(based, consumed_lent(f, b, e.span, how)) },
+            None -> based,
+          }
+        },
+        _ -> based,
+      },
     },
   }
 
 /// The binding a path of field reads, `r.a.b`, starts from.
-fn path_root(s: Scope, st: St, e: Expr) -> Option<Binding> =
-  match e {
-    EVar(v) -> binding_named(s, st, v.name),
-    EField(x) -> path_root(s, st, x.base),
+fn path_root(s: Scope, st: St, e: Walked) -> Option<Binding> =
+  match e.node {
+    WalkedRead(WalkedLocal(l)) -> binding_of(st, l),
+    WalkedFieldRead(x) -> path_root(s, st, x.base),
     _ -> None,
   }
 
-/// Whether the record at `base` holds a resource beside its field `name`, which moving that field out
+/// Whether the record `base` holds a resource beside its field `name`, which moving that field out
 /// would leave behind.
-fn others_held(f: Facts, base: Expr, name: Ident) -> Bool / {abort.raise} =
-  match f.type_at(expr_span(base)) {
-    Some(t) -> match record_fields(t) {
-      Some(fs) -> fs.any(|x: Field| x.name != name.name && f.resource(x.ty)),
-      None -> true,
-    },
+fn others_held(f: Facts, base: Walked, name: Bytes) -> Bool / {abort.raise} =
+  match record_fields(type_of(f, base)) {
+    Some(fs) -> fs.any(|x: Field| x.name != name && f.resource(x.ty)),
     None -> true,
   }
 
 // --- Functions -----------------------------------------------------------------------------------
 
-/// A lambda's body walked as `fun` says it is held, its parameters owned where they are written
-/// `keep` or `given` holds their places.
+/// The lambda `e`, `l`, its body walked as `fun` says it is held, its parameters owned where they
+/// are written `keep` or `given` holds their places.
 fn lambda(
   f: Facts,
   s: Scope,
   st: St,
-  l: { span: Span, body: Expr, params: List<Param>, ret: Option<TypeExpr> },
+  e: Walked,
+  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row },
   fun: Fn,
   given: List<Int>,
 ) -> { st: St, captured: Captured } / {abort.raise} = {
-  let types = match f.type_at(l.span) { Some(TyFn(t)) -> t.params, _ -> [] };
   // Its body runs when it is called, so nothing a call around it holds in flight is the body's.
   let inner: Bound = {
-    s: { ..s, fns: s.fns.push(fun), block: [], frame: l.span.site, body: l.span.site },
+    s: {
+      ..s,
+      fns: s.fns.push(fun),
+      block: [],
+      frame: e.span.site,
+      body: e.span.site,
+      row: Some(l.row),
+    },
     st: { ..st, flight: [] },
   };
   let params = range(0, l.params.len()).fold(inner, |acc: Bound, i: Int| {
     let p = l.params.get(i);
-    match types.at(i) {
-      Some(t) -> bound(f, acc, p.name, t, f.resource(t), p.keep || given.contains(i)),
-      None -> acc,
-    }
+    let t = f.resolved(p.ty);
+    bound(acc, p.name, p.span, t, f.resource(t), l.kept.contains(i) || given.contains(i))
   });
   let body = let_go(
     f,
     walk(f, params.s, released_before(params.st, params.s, l.body), l.body, Taken(b"answered")),
     params.s,
     l.body,
-    expr_span(l.body),
+    l.body.span,
     Taken(b"answered"),
   );
   {
     st: { ..body, flight: st.flight },
-    captured: match body.captured.get(l.span.site) {
+    captured: match body.captured.get(e.span.site) {
       Some(c) -> c,
       None -> { consumed: [], borrows: [] },
     },
@@ -1150,10 +1082,10 @@ fn lambda(
 
 // --- Statements and branches ---------------------------------------------------------------------
 
-fn statement(f: Facts, b: Bound, x: Stmt) -> Bound / {abort.raise} =
+fn statement(f: Facts, b: Bound, x: WalkedStmt) -> Bound / {abort.raise} =
   match x {
-    SLet(l) -> match ((l.value, l.pat)) {
-      (ELambda(lam), PVar(v)) -> lambda_bound(f, b, v.name, lam),
+    WalkedLet(l) -> match ((l.value.node, l.pat)) {
+      (WalkedLambda(lam), TypedBinder(v)) -> lambda_bound(f, b, v.name, v.span, l.value, lam),
       // Any other value is bound, or taken apart, and a pattern that misses fails the `let`.
       _ -> {
         let valued = walk(f, b.s, b.st, l.value, value_pos(f, b, l.pat, l.value));
@@ -1162,13 +1094,13 @@ fn statement(f: Facts, b: Bound, x: Stmt) -> Bound / {abort.raise} =
     },
     // The `else` leaves the block, so what it consumes is gone only on its own path, and what the
     // block holds live is let go where it ends.
-    SLetElse(l) -> {
+    WalkedLetElse(l) -> {
       // The value runs first; where the pattern misses, the `else` answers the block instead.
       let valued = walk(f, b.s, b.st, l.value, value_pos(f, b, l.pat, l.value));
       let missed = released(
         valued,
         missed_whole(f, b, l.value),
-        expr_span(l.fallback),
+        l.fallback.span,
         ReleaseBefore,
         here(b.s),
       );
@@ -1183,9 +1115,9 @@ fn statement(f: Facts, b: Bound, x: Stmt) -> Bound / {abort.raise} =
         f,
         valued,
         walked,
-        let_go_leaving(f, walked, b.s.block, expr_span(l.fallback), b.s.answer),
+        let_go_leaving(f, walked, b.s.block, l.fallback, b.s.answer),
         b.s.block,
-        expr_span(l.fallback),
+        l.fallback.span,
       );
       patterned(
         f,
@@ -1194,30 +1126,32 @@ fn statement(f: Facts, b: Bound, x: Stmt) -> Bound / {abort.raise} =
         l.value,
       )
     },
-    SExpr(e) -> { ..b, st: walk(f, b.s, b.st, e, Dropped) },
-    SAssign(a) ->
+    WalkedDo(e) -> { ..b, st: walk(f, b.s, b.st, e, Dropped) },
+    WalkedAssign(a) ->
       { ..b, st: walk(f, b.s, b.st, a.value, Taken(b"assigned to a handler's variable")) },
   }
 
-/// A function a `let` binds, followed by what it captures: one that consumed a resource is a
-/// resource itself, and one that borrows a resource is usable while the resource is.
+/// A function a `let` binds as `name` at `at`, the lambda `e`, followed by what it captures: one
+/// that consumed a resource is a resource itself, and one that borrows a resource is usable while the
+/// resource is.
 fn lambda_bound(
   f: Facts,
   b: Bound,
-  name: Ident,
-  l: { span: Span, body: Expr, params: List<Param>, ret: Option<TypeExpr> },
+  name: Bytes,
+  at: Span,
+  e: Walked,
+  l: { params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row },
 ) -> Bound / {abort.raise} = {
-  let local: Fn = { span: l.span, held: false, local: true };
-  let first = lambda(f, b.s, b.st, l, local, []);
+  let local: Fn = { span: e.span, held: false, local: true };
+  let first = lambda(f, b.s, b.st, e, l, local, []);
   // What the function consumes it holds from its start, so a failure in it before it consumes one
   // lets that go: walked again with those held by its body.
   let o = if first.captured.consumed.len() == 0 { first }
-  else { lambda(f, b.s, held_from(b.st, first.captured.consumed, l.span.site), l, local, []) };
-  let ty = match f.type_at(l.span) { Some(t) -> t, None -> unit_type() };
+  else { lambda(f, b.s, held_from(b.st, first.captured.consumed, e.span.site), e, l, local, []) };
   let consumed = o.captured.consumed.len() > 0;
   let followed = consumed || o.captured.borrows.len() > 0;
-  let out = bound_as({ ..b, st: o.st }, name, ty, followed, consumed, Taker);
-  match out.st.bindings.get(binding_key(name.span.site)) {
+  let out = bound_as({ ..b, st: o.st }, name, at, type_of(f, e), followed, consumed, Taker);
+  match out.st.bindings.get(binding_key(at.site)) {
     Some(x) -> if followed {
       {
         ..out,
@@ -1234,138 +1168,130 @@ fn lambda_bound(
 
 /// How `let pat = value` uses the value: a lent binding read whole lends its parts; a value the
 /// pattern takes apart, or a resource, is taken; anything else is read.
-fn value_pos(f: Facts, b: Bound, pat: Pattern, value: Expr) -> Pos / {abort.raise} =
+fn value_pos(f: Facts, b: Bound, pat: TypedPattern<Type>, value: Walked) -> Pos / {abort.raise} =
   if lends(b.s, b.st, value) { Lent }
-  else if pattern_holds(f, pat) || resource_at(f, expr_span(value))
-      || (match f.type_at(expr_span(value)) { Some(t) -> f.opened(t), None -> false }) {
+  else if pattern_holds(f, pat) || resource_at(f, value) || f.opened(type_of(f, value)) {
     Taken(b"bound by a `let`")
   } else { Read }
 
 /// `b`, its value already walked, with what `pat` binds of the value bound.
-fn patterned(f: Facts, b: Bound, pat: Pattern, value: Expr) -> Bound / {abort.raise} = {
+fn patterned(f: Facts, b: Bound, pat: TypedPattern<Type>, value: Walked) -> Bound / {abort.raise} = {
   let owned = !lends(b.s, b.st, value);
-  let checked = if owned { wild_resources(f, b.st, pat, expr_span(value)) } else { b.st };
-  binders(f, pat).fold({ s: b.s, st: checked }, |acc: Bound, p: { name: Ident, ty: Type }|
-    bound(f, acc, p.name, p.ty, f.resource(p.ty), owned))
+  let checked = if owned { wild_resources(f, b.st, pat) } else { b.st };
+  binders(f, pat).fold(
+    { s: b.s, st: checked },
+    |acc: Bound, p: { name: Bytes, span: Span, ty: Type }|
+      bound(acc, p.name, p.span, p.ty, f.resource(p.ty), owned),
+  )
 }
 
 /// What a `let ... else` whose pattern missed its value lets go before the `else` runs: the value,
 /// which nothing took apart, where the `let` took it.
-fn missed_whole(f: Facts, b: Bound, value: Expr) -> List<Held> / {abort.raise} =
-  if !resource_at(f, expr_span(value)) || lends(b.s, b.st, value) { [] } else {
-    match value {
-      EVar(v) -> match binding_named(b.s, b.st, v.name) {
-        Some(x) -> if live(x) { held_by(b.st, x) } else { [] },
-        None -> [],
-      },
-      _ -> match f.type_at(expr_span(value)) {
-        Some(t) -> [{ binding: expr_span(value).site, ty: t }],
-        None -> [],
+fn missed_whole(f: Facts, b: Bound, value: Walked) -> List<Held> / {abort.raise} =
+  if !resource_at(f, value) || lends(b.s, b.st, value) { [] } else {
+    match binding_read(b.s, b.st, value) {
+      Some(x) -> if live(x) { held_by(b.st, x) } else { [] },
+      None -> match value.node {
+        WalkedRead(WalkedLocal(_)) -> [],
+        _ -> [{ holder: HeldByNode(value.span.site), ty: type_of(f, value) }],
       },
     }
   }
 
-/// `st` past the value of a `let` whose pattern `pat` may miss it: a miss fails at the pattern,
+/// `st` past the value of a `let` whose pattern `pat` may miss it: a miss fails at the value,
 /// letting go of what the body owns live there and of the value, which nothing took apart.
-fn missing(f: Facts, s: Scope, st: St, pat: Pattern, value: Expr) -> St / {abort.raise} =
+fn missing(
+  f: Facts,
+  s: Scope,
+  st: St,
+  pat: TypedPattern<Type>,
+  value: Walked,
+) -> St / {abort.raise} =
   if !may_miss(pat) { st } else {
-    let whole = match f.type_at(expr_span(value)) {
-      Some(t) -> if f.resource(t) && !lends(s, st, value) {
-        [{ binding: expr_span(value).site, ty: t }]
-      } else { [] },
-      None -> [],
-    };
-    { ..unwinding(s, { ..st, flight: st.flight.concat(whole) }, pat_span(pat)), flight: st.flight }
+    let t = type_of(f, value);
+    let whole = if f.resource(t) && !lends(s, st, value) {
+      [{ holder: HeldByNode(value.span.site), ty: t }]
+    } else { [] };
+    {
+      ..failing(s, { ..st, flight: st.flight.concat(whole) }, value.span, ReleaseMissing),
+      flight: st.flight,
+    }
   }
 
 /// Whether `pat` may not match a value of its type: anything but a name, `_` or a record of those.
-fn may_miss(pat: Pattern) -> Bool =
+fn may_miss(pat: TypedPattern<Type>) -> Bool =
   match pat {
-    PVar(_) -> false,
-    PWild(_) -> false,
-    PRecord(r) -> r.fields.any(|x: { name: Ident, pat: Pattern }| may_miss(x.pat)),
+    TypedBinder(_) -> false,
+    TypedWild(_) -> false,
+    TypedRecordPattern(r) -> r.fields.any(|x: TypedFieldPattern<Type>| may_miss(x.pat)),
     _ -> true,
   }
 
 /// Whether `value` is a lent binding, or a path of field reads from one, whose parts a pattern then
 /// borrows.
-fn lends(s: Scope, st: St, value: Expr) -> Bool =
-  match value {
-    EVar(v) -> match binding_named(s, st, v.name) { Some(b) -> !b.owned, None -> false },
-    EField(x) -> lends(s, st, x.base),
+fn lends(s: Scope, st: St, value: Walked) -> Bool =
+  match value.node {
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) { Some(b) -> !b.owned, None -> false },
+    WalkedFieldRead(x) -> lends(s, st, x.base),
     _ -> false,
   }
 
-/// Each name `pat` binds, at the type filed for it.
-fn binders(f: Facts, pat: Pattern) -> List<{ name: Ident, ty: Type }> / {abort.raise} =
-  match pat {
-    PVar(v) ->
-      [{ name: v.name, ty: match f.type_at(v.span) { Some(t) -> t, None -> unit_type() } }],
-    PCtor(c) ->
-      c.args.fold([], |acc: List<{ name: Ident, ty: Type }>, a: Pattern| acc.concat(binders(f, a))),
-    PRecord(r) ->
-      r.fields.fold([], |acc: List<{ name: Ident, ty: Type }>, x: { name: Ident, pat: Pattern }|
-        acc.concat(binders(f, x.pat))),
-    PList(l) -> {
-      let items = l.items.fold([], |acc: List<{ name: Ident, ty: Type }>, a: Pattern|
-        acc.concat(binders(f, a)));
-      match l.rest { Some(r) -> items.concat(binders(f, r)), None -> items }
-    },
-    POr(o) -> match o.alts.at(0) { Some(a) -> binders(f, a), None -> [] },
-    _ -> [],
-  }
+/// Each name `pat` binds, where, at the type the check gave it, resolved.
+fn binders(
+  f: Facts,
+  pat: TypedPattern<Type>,
+) -> List<{ name: Bytes, span: Span, ty: Type }> / {abort.raise} =
+  pattern_binders(pat).map(|p: TypedParam<Type>| { ..p, ty: f.resolved(p.ty) })
 
 /// Whether `pat` binds a resource by name, which takes the value it matches apart.
-fn pattern_holds(f: Facts, pat: Pattern) -> Bool / {abort.raise} =
-  binders(f, pat).any(|p: { name: Ident, ty: Type }| f.resource(p.ty))
+fn pattern_holds(f: Facts, pat: TypedPattern<Type>) -> Bool / {abort.raise} =
+  binders(f, pat).any(|p: { name: Bytes, span: Span, ty: Type }| f.resource(p.ty))
 
-/// `st` with each `_` of `pat` that stands for a resource refused: what it matches would be let go
-/// of without its release. `value` is where the whole value is, which a bare `_` stands for.
-fn wild_resources(f: Facts, st: St, pat: Pattern, value: Span) -> St / {abort.raise} =
+/// `st` with each `_` of `pat` that stands for a resource refused, and each `..` that leaves one
+/// out: what it matches would be let go of without its release.
+fn wild_resources(f: Facts, st: St, pat: TypedPattern<Type>) -> St / {abort.raise} =
   match pat {
-    PWild(w) -> if resource_at(f, w.span) || resource_at(f, value) { said(st, wild(f, w.span)) }
-    else { st },
-    PCtor(c) -> c.args.fold(st, |acc: St, a: Pattern| wild_resources(f, acc, a, dummy_span())),
-    PRecord(r) -> {
-      let named = r.fields.fold(st, |acc: St, x: { name: Ident, pat: Pattern }|
-        wild_resources(f, acc, x.pat, dummy_span()));
-      let left = if !r.rest { [] } else {
-        match f.type_at(r.span) {
-          Some(t) -> match record_fields(t) {
+    TypedWild(w) -> if f.resource(f.resolved(w.ty)) { said(st, wild(f, w.span)) } else { st },
+    TypedCase(c) -> c.args.fold(st, |acc: St, a: TypedPattern<Type>| wild_resources(f, acc, a)),
+    TypedRecordPattern(r) -> {
+      let named = r.fields.fold(st, |acc: St, x: TypedFieldPattern<Type>|
+        wild_resources(f, acc, x.pat));
+      match r.rest {
+        None -> named,
+        Some(at) -> {
+          let left = match record_fields(f.resolved(at.ty)) {
             Some(fs) ->
               fs.filter(|x: Field|
-                f.resource(x.ty)
-                  && !r.fields.any(|y: { name: Ident, pat: Pattern }| y.name.name == x.name)),
+                f.resource(x.ty) && !r.fields.any(|y: TypedFieldPattern<Type>| y.name == x.name)),
             None -> [],
-          },
-          None -> [],
-        }
-      };
-      if left.len() == 0 { named } else { said(named, rest_dropped(f, r.span)) }
+          };
+          if left.len() == 0 { named } else { said(named, rest_dropped(f, at.span)) }
+        },
+      }
     },
-    PList(l) -> {
-      let items = l.items.fold(st, |acc: St, a: Pattern| wild_resources(f, acc, a, dummy_span()));
+    TypedListPattern(l) -> {
+      let items = l.items.fold(st, |acc: St, a: TypedPattern<Type>| wild_resources(f, acc, a));
       match l.rest {
-        Some(PWild(w)) -> if resource_at(f, w.span) { said(items, rest_dropped(f, w.span)) }
-        else { items },
-        Some(p) -> wild_resources(f, items, p, dummy_span()),
+        Some(TypedWild(w)) -> if f.resource(f.resolved(w.ty)) {
+          said(items, rest_dropped(f, w.span))
+        } else { items },
+        Some(p) -> wild_resources(f, items, p),
         None -> items,
       }
     },
-    POr(o) -> o.alts.fold(st, |acc: St, a: Pattern| wild_resources(f, acc, a, value)),
+    TypedOr(alts) -> alts.fold(st, |acc: St, a: TypedPattern<Type>| wild_resources(f, acc, a)),
     _ -> st,
   }
 
 /// Paths that each started from `before` and ended in `ends`, each the evaluation of the node at
-/// the same place of `spans`, joined: what any path refused, and a binding any path consumed
+/// the same place of `branches`, joined: what any path refused, and a binding any path consumed
 /// consumed past the join, the paths that did not consume it letting it go where they end.
 fn joined(
   f: Facts,
-  binders: Map<Int, Int>,
   before: St,
   starts: List<St>,
   ends: List<St>,
-  branches: List<Expr>,
+  branches: List<Walked>,
   pos: Pos,
 ) -> St / {abort.raise} = {
   // What each path lets go of, as no path that consumed it can: before it runs, from where it
@@ -1382,10 +1308,9 @@ fn joined(
         }
       });
     let early = unconsumed.filter(|b: Binding|
-      released_by(before, binders, b, branch).place == ReleaseBefore);
-    let late = unconsumed.filter(|b: Binding|
-      released_by(before, binders, b, branch).place == ReleaseAfter);
-    let at = expr_span(branch);
+      released_by(before, b, branch).place == ReleaseBefore);
+    let late = unconsumed.filter(|b: Binding| released_by(before, b, branch).place == ReleaseAfter);
+    let at = branch.span;
     let letting = |from: St, bs: List<Binding>, place: ReleasePlace, value: List<Held>|
       bs.fold(from, |x: St, b: Binding|
         match x.bindings.get(b.key) {
@@ -1406,11 +1331,11 @@ fn joined(
         Some(z) -> gone_at(x, z, at, b"let go before its branch"),
         None -> x,
       });
-    let last = letting(ended, late, ReleaseAfter, answered_at(f, at, ReleaseAfter, pos));
+    let last = letting(ended, late, ReleaseAfter, answered_at(f, branch, ReleaseAfter, pos));
     // A branch whose value is lent on may not answer what is let go after it.
     let lent = match pos { Lent -> true, Read -> true, _ -> false };
-    let refused = if !lent || !resource_at(f, at) { [] } else {
-      late.filter(|b: Binding| answers(binders, branch, b.key)).map(|b: Binding|
+    let refused = if !lent || !resource_at(f, branch) { [] } else {
+      late.filter(|b: Binding| answers(branch, b.key)).map(|b: Binding|
         made_and_dropped(f, branch, pos))
     };
     { first: first.releases, last: last.releases, refused: refused }
@@ -1419,9 +1344,8 @@ fn joined(
     let acc = w.st;
     let mine = ending.get(w.at);
     // A value let go before its path runs is no longer held where that path fails.
-    let first = mine.first.filter(|r: Release| r.place == ReleaseBefore).map(|r: Release|
-      r.binding);
-    let fails = |r: Release| on_failure(r.place) && first.contains(r.binding);
+    let first = mine.first.filter(|r: Release| r.place == ReleaseBefore).map(|r: Release| r.held);
+    let fails = |r: Release| on_failure(r.place) && first.contains(r.held);
     {
       st: {
         module: acc.module,
@@ -1463,27 +1387,30 @@ fn joined(
   })
 }
 
-/// A `match`: an arm that binds a resource part of an owned value by name takes the value apart,
-/// and an arm that binds none leaves it whole; the arms of a lent value borrow its parts.
+/// The `match` `e` of `scrutinee`: an arm that binds a resource part of an owned value by name takes
+/// the value apart, and an arm that binds none leaves it whole; the arms of a lent value borrow its
+/// parts.
 fn matched(
   f: Facts,
   s: Scope,
   st: St,
-  span: Span,
-  scrutinee: Expr,
-  arms: List<MatchArm>,
+  e: Walked,
+  scrutinee: Walked,
+  arms: List<WalkedArm>,
   pos: Pos,
 ) -> St / {abort.raise} = {
-  let at = expr_span(scrutinee);
-  let held = match scrutinee { EVar(v) -> binding_named(s, st, v.name), _ -> None };
-  let opened = match f.type_at(at) { Some(t) -> f.opened(t), None -> false };
+  let at = scrutinee.span;
+  let held = binding_read(s, st, scrutinee);
+  let ty = type_of(f, scrutinee);
+  let opened = f.opened(ty);
   // A field read through a lent record lends the field, as one no arm takes apart leaves it whole.
-  let through = match scrutinee {
-    EField(_) ->
-      lends(s, st, scrutinee) || (!opened && !arms.any(|a: MatchArm| pattern_holds(f, a.pat))),
+  let through = match scrutinee.node {
+    WalkedFieldRead(_) ->
+      lends(s, st, scrutinee) || (!opened && !arms.any(|a: WalkedArm| pattern_holds(f, a.pat))),
     _ -> false,
   };
-  let made = held == None && !through && resource_at(f, at);
+  let local = match scrutinee.node { WalkedRead(WalkedLocal(_)) -> true, _ -> false };
+  let made = held == None && !local && !through && f.resource(ty);
   let start: St = match held {
     // Read lent here: what each arm does decides whether it takes the value.
     Some(b) -> used(f, s, st, b, at, Lent),
@@ -1491,9 +1418,10 @@ fn matched(
       // A resource the scrutinee makes is the match's, as if a binding held it.
       put(walk(f, s, st, scrutinee, Taken(b"matched")), {
         key: at.site,
+        holder: HeldByNode(at.site),
         name: b"the matched value",
         at: at,
-        ty: match f.type_at(at) { Some(t) -> t, None -> unit_type() },
+        ty: ty,
         kind: Value,
         owned: true,
         depth: s.fns.len(),
@@ -1502,8 +1430,8 @@ fn matched(
         taken: [],
         borrows: [],
         holds: [],
-        body: s.body,
-        answered: answered_here(s),
+        row: s.row,
+        answered: here(s).answered,
       })
     } else { walk(f, s, st, scrutinee, if through { Lent } else { Read }) },
   };
@@ -1514,7 +1442,7 @@ fn matched(
   let owned = match held { Some(b) -> b.owned, None -> made };
   // A value of a type that states a `release` is taken apart by every arm (`opened`): its parts are
   // no longer it, so nothing lets it go.
-  let ends = arms.map(|a: MatchArm| {
+  let ends = arms.map(|a: WalkedArm| {
     let binds = opened || pattern_holds(f, a.pat);
     let taken: St = match key {
       Some(k) -> if binds {
@@ -1522,9 +1450,8 @@ fn matched(
           Some(b) ->
             wild_resources(
               f,
-              gone_at(start, b, pat_span(a.pat), b"taken apart by a `match` arm"),
+              gone_at(start, b, a.pat_span, b"taken apart by a `match` arm"),
               a.pat,
-              dummy_span(),
             ),
           None -> start,
         }
@@ -1533,8 +1460,8 @@ fn matched(
     };
     let inner = binders(f, a.pat).fold(
       { s: { ..s, block: [] }, st: taken },
-      |acc: Bound, p: { name: Ident, ty: Type }|
-        bound(f, acc, p.name, p.ty, f.resource(p.ty), owned),
+      |acc: Bound, p: { name: Bytes, span: Span, ty: Type }|
+        bound(acc, p.name, p.span, p.ty, f.resource(p.ty), owned),
     );
     let guarded = match a.guard {
       Some(g) ->
@@ -1542,7 +1469,7 @@ fn matched(
           f,
           inner.st,
           walk(f, inner.s, inner.st, g, Read),
-          expr_span(g),
+          g.span,
           b"a guard, which hands the value to the next arm where it fails",
         ),
       None -> inner.st,
@@ -1560,27 +1487,26 @@ fn matched(
         ),
         inner.s,
         a.body,
-        expr_span(a.body),
+        a.body.span,
         pos,
       ),
     }
   });
   let out = joined(
     f,
-    s.binders,
     start,
     ends.map(|x: { start: St, end: St }| x.start),
     ends.map(|x: { start: St, end: St }| x.end),
-    arms.map(|a: MatchArm| a.body),
+    arms.map(|a: WalkedArm| a.body),
     pos,
   );
   // A value the scrutinee made that no arm took apart is let go where the `match` ends.
   match if made { out.bindings.get(at.site) } else { None } {
     Some(b) -> if b.gone != None { out } else {
       gone_at(
-        let_go_leaving(f, out, [at.site], span, pos),
+        let_go_leaving(f, out, [at.site], e, pos),
         b,
-        span,
+        e.span,
         b"let go where the `match` ends",
       )
     },
@@ -1611,20 +1537,21 @@ fn borrowed_only(f: Facts, before: St, after: St, at: Span, what: Bytes) -> St =
 
 // --- Handlers ------------------------------------------------------------------------------------
 
-/// A `handle`: the body runs where the `handle` stands, and each clause's parameters are lent, but
-/// for those the operation's handler takes. A clause, and the `return` clause, run as functions of
-/// their own, any number of times or none, so neither consumes what is bound outside it.
+/// The `handle` `e`, `h`: the body runs where the `handle` stands, and each clause's parameters are
+/// lent, but for those the operation's handler takes. A clause, and the `return` clause, run as
+/// functions of their own, any number of times or none, so neither consumes what is bound outside it.
 fn handled(
   f: Facts,
   s: Scope,
   st: St,
-  h: { span: Span, body: Expr, ret: Option<ReturnClause>, clauses: List<HandleClause>, vars: List<HandlerVar> },
+  e: Walked,
+  h: { body: Walked, row: Row, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> },
   pos: Pos,
 ) -> St / {abort.raise} = {
-  let ops = h.clauses.map(|c: HandleClause| f.op_named(c.eff, c.op));
+  let ops = h.clauses.map(|c: WalkedClause| Bytes::concat_all([c.effect, b".", c.op]));
   // Each variable starts from its initializer, which reads those above it, and its clauses read it.
-  let vars = h.vars.fold({ s: s, st: st }, |acc: Bound, v: HandlerVar| {
-    let held = resource_at(f, expr_span(v.init));
+  let vars = h.vars.fold({ s: s, st: st }, |acc: Bound, v: WalkedHandlerVar| {
+    let held = resource_at(f, v.init);
     let walked = walk(f, acc.s, acc.st, v.init, if held { Taken(b"held by a handler's variable") }
     else { Read });
     { ..acc, st: if held { said(walked, var_held(f, v)) } else { walked } }
@@ -1638,24 +1565,22 @@ fn handled(
       h.body,
       match h.ret { Some(_) -> Taken(b"answered to the `return` clause"), None -> pos },
     ),
-    h.span,
+    e.span,
     here(s),
   );
-  let clauses = h.clauses.fold(inside, |acc: St, c: HandleClause| {
-    let kept = f.op_kept(c.eff, c.op);
+  let clauses = h.clauses.fold(inside, |acc: St, c: WalkedClause| {
+    let kept = f.op_kept(c.effect, c.op);
     let given = range(0, c.params.len()).fold(
       { s: { ..apart(vars.s, c.span), block: [] }, st: { ..acc, flight: [] } },
       |x: Bound, i: Int| {
         let p = c.params.get(i);
-        match f.type_at(p.span) {
-          Some(t) -> bound(f, x, p, t, f.resource(t), kept.contains(i)),
-          None -> x,
-        }
+        let t = f.resolved(p.ty);
+        bound(x, p.name, p.span, t, f.resource(t), kept.contains(i))
       },
     );
     // A continuation is consumed by its one call.
     let resumed = match c.resume {
-      Some(k) -> bound_as(given, k, unit_type(), true, true, Continuation),
+      Some(k) -> bound_as(given, k.name, k.span, unit_type(), true, true, Continuation),
       None -> given,
     };
     let ended = let_go(
@@ -1669,7 +1594,7 @@ fn handled(
       ),
       resumed.s,
       c.body,
-      expr_span(c.body),
+      c.body.span,
       pos,
     );
     { ..ended, flight: acc.flight }
@@ -1682,10 +1607,8 @@ fn handled(
         s: { ..apart(vars.s, r.span), block: [] },
         st: { ..clauses, flight: [] },
       };
-      let held = match f.type_at(expr_span(h.body)) {
-        Some(t) -> bound(f, inner, r.binder, t, f.resource(t), true),
-        None -> inner,
-      };
+      let t = type_of(f, h.body);
+      let held = bound(inner, r.binder.name, r.binder.span, t, f.resource(t), true);
       let ended = let_go(
         f,
         lent_out(
@@ -1697,7 +1620,7 @@ fn handled(
         ),
         held.s,
         r.body,
-        expr_span(r.body),
+        r.body.span,
         pos,
       );
       { ..ended, flight: clauses.flight }
@@ -1753,27 +1676,24 @@ fn partly_moved(f: Facts, b: Binding, span: Span) -> Diag / {abort.raise} =
     [b"its other fields may still be read, but not the record whole"],
   )
 
-fn field_twice(f: Facts, b: Binding, name: Ident, span: Span) -> Diag =
+fn field_twice(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
   error_at(
     b"E0316",
     f.module,
     span,
-    Bytes::concat_all([
-      quoted(Bytes::concat_all([b.name, b".", name.name])),
-      b" is moved out twice",
-    ]),
+    Bytes::concat_all([quoted(Bytes::concat_all([b.name, b".", name])), b" is moved out twice"]),
     b"moved out again here",
     [b"a resource field is moved out of its record once"],
   )
 
-fn field_beside(f: Facts, b: Binding, name: Ident, span: Span) -> Diag =
+fn field_beside(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
   error_at(
     b"E0316",
     f.module,
     span,
     Bytes::concat_all([
       b"moving ",
-      quoted(name.name),
+      quoted(name),
       b" out of ",
       quoted(b.name),
       b" would leave another resource in it",
@@ -1782,7 +1702,7 @@ fn field_beside(f: Facts, b: Binding, name: Ident, span: Span) -> Diag =
     [
       Bytes::concat_all([
         b"take the record apart instead, `let { ",
-        name.name,
+        name,
         b", .. } = ",
         b.name,
         b";`, binding each resource it holds",
@@ -1836,22 +1756,22 @@ fn taker_handed(f: Facts, b: Binding, span: Span) -> Diag =
     ],
   )
 
-fn var_held(f: Facts, v: HandlerVar) -> Diag =
+fn var_held(f: Facts, v: WalkedHandlerVar) -> Diag =
   error_at(
     b"E0322",
     f.module,
     v.span,
-    Bytes::concat_all([b"the handler's variable ", quoted(v.name.name), b" would hold a resource"]),
+    Bytes::concat_all([b"the handler's variable ", quoted(v.name), b" would hold a resource"]),
     b"nothing lets a handler's variable go where its `handle` ends",
     [b"bind the resource with `let` around the `handle`, and lend it to the clauses that use it"],
   )
 
-fn moved_through(f: Facts, b: Binding, name: Ident, span: Span) -> Diag =
+fn moved_through(f: Facts, b: Binding, name: Bytes, span: Span) -> Diag =
   error_at_and(
     b"E0316",
     f.module,
     span,
-    Bytes::concat_all([b"`", name.name, b"` is moved out through a field of ", quoted(b.name)]),
+    Bytes::concat_all([b"`", name, b"` is moved out through a field of ", quoted(b.name)]),
     b"moved out here",
     f.module,
     b.at,
@@ -1861,21 +1781,17 @@ fn moved_through(f: Facts, b: Binding, name: Ident, span: Span) -> Diag =
     ],
   )
 
-fn written_over(f: Facts, name: Ident) -> Diag =
+fn written_over(f: Facts, name: Bytes, at: Span) -> Diag =
   error_at(
     b"E0322",
     f.module,
-    name.span,
-    Bytes::concat_all([
-      b"the record's ",
-      quoted(name.name),
-      b" would be dropped without its release",
-    ]),
+    at,
+    Bytes::concat_all([b"the record's ", quoted(name), b" would be dropped without its release"]),
     b"written over here",
     [
       Bytes::concat_all([
         b"move the field out first, `let old = r.",
-        name.name,
+        name,
         b";`, and consume it or let it go with its block",
       ]),
     ],
@@ -1963,11 +1879,11 @@ fn dropped_binding(f: Facts, b: Binding, span: Span) -> Diag =
     [b"pass it to what consumes it, or leave it bound: it is let go where its block ends"],
   )
 
-fn made_and_dropped(f: Facts, e: Expr, pos: Pos) -> Diag =
+fn made_and_dropped(f: Facts, e: Walked, pos: Pos) -> Diag =
   error_at(
     b"E0322",
     f.module,
-    expr_span(e),
+    e.span,
     b"a resource is made here and nothing holds it",
     match pos {
       Lent -> b"lent to a call, which never keeps it",

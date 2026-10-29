@@ -34,22 +34,22 @@ import std.string
 import compiler.check.lent (Passed, passed)
 import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
-                             typed_body_bin, typed_nodes, part_key, TypedRead, TypedUpdate,
+                             typed_body_bin, typed_expr_nodes, part_key, TypedRead, TypedUpdate,
                              WholeBody, TypedParam, NumericWitness, ConcreteWitness, ParamWitness,
                              witness_param, BodyPart, TypedCall, TypedLambda, TypedSimulate,
-                             TypedParallel, TypedHandle, TypedPerform, TypedClause, TypedThunk)
+                             TypedParallel, TypedHandle, TypedPerform, TypedClause, TypedThunk,
+                             TypedRelease, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
+                             ReleaseMissing, ReleaseFailing)
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, settled)
 import compiler.check.infer.checker (OpInfo, EffectInfo, CtorInfo, DefConstraint, InstanceInfo,
                                      NumericInfo, SpecInfo, DefInfo, Calls, Handed, Unguarded,
                                      Unshown, ZeroDivisor, Raise, TestInfo, LawBinder, LawInfo,
-                                     MemberSite, WitnessOrder, TrySite, LabelApplication, KnownDef,
+                                     MemberSite, WitnessOrder, LabelApplication, KnownDef,
                                      KnownTest, KeptFacts, Known, no_known, Checker, WalkedBody,
                                      report, report_error_at, resolve, resolve_row_in, abort_atom,
                                      def_of, Builtin, declared, builtins, builtin_named,
-                                     member_site_bin, witness_order_bin, ReleaseSite, ReleaseAfter,
-                                     ReleaseBefore, ReleaseUnwinding, ReleaseFailing,
-                                     release_site_bin)
+                                     member_site_bin, witness_order_bin, ReleaseSite)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
                                           collect_ctors, check_value_namespace, refuse_irregular)
@@ -159,14 +159,12 @@ pub fn published_pure(def_info: DefInfo) -> Bool =
   without_raises(def_info.footprint).len() == 0 && def_info.constraints.len() == 0
 
 /// What the emitter needs from the checker: the definitions published pure, for its constant table,
-/// each witnessed definition's witness order, the calls on values and the releases each body files,
-/// and each body the walks typed.
+/// each witnessed definition's witness order, the calls on values each body files, and each body the
+/// walks typed.
 pub type EmitFacts = {
   pure: List<Bytes>,
   orders: List<WitnessOrder>,
   members: List<MemberSite>,
-  /// Where each binding a body owns is let go, which the lowering writes its type's release at.
-  releases: List<ReleaseSite>,
   types: TypeTable,
   /// Each body the walks typed, its types named by key in `types`.
   bodies: List<TypedBody<Bytes>>,
@@ -175,16 +173,11 @@ pub type EmitFacts = {
 derive bin for EmitFacts
 
 /// What the emitter reads of one owner's bodies.
-pub type RootFacts = {
-  members: List<MemberSite>,
-  releases: List<ReleaseSite>,
-  types: TypeTable,
-  bodies: List<TypedBody<Bytes>>,
-}
+pub type RootFacts = { members: List<MemberSite>, types: TypeTable, bodies: List<TypedBody<Bytes>> }
 
 derive bin for RootFacts
 
-pub fn no_root_facts() -> RootFacts = { members: [], releases: [], types: Map::new(), bodies: [] }
+pub fn no_root_facts() -> RootFacts = { members: [], types: Map::new(), bodies: [] }
 
 /// The nodes of `all` the types `bodies` name are made of, which is all a table of them needs.
 pub fn types_named(all: TypeTable, bodies: List<TypedBody<Bytes>>) -> TypeTable / {abort.raise} =
@@ -208,12 +201,11 @@ pub fn facts_moved(facts: EmitFacts, moved: (Int) -> Int) -> EmitFacts =
     ..facts,
     orders: facts.orders.map(|x: WitnessOrder| { ..x, module: moved(x.module) }),
     members: facts.members.map(|x: MemberSite| { ..x, module: moved(x.module) }),
-    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: moved(x.module) }),
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: moved(x.module) }),
   }
 
-/// `facts` with only the calls on values, releases and bodies `kept` keeps by their module and
-/// owner, and the types those bodies name.
+/// `facts` with only the calls on values and bodies `kept` keeps by their module and owner, and the
+/// types those bodies name.
 pub fn facts_kept(
   facts: EmitFacts,
   kept: (Int, Bytes) -> Bool / {abort.raise},
@@ -222,7 +214,6 @@ pub fn facts_kept(
   {
     ..facts,
     members: facts.members.filter(|x: MemberSite| kept(x.module, x.owner)),
-    releases: facts.releases.filter(|x: ReleaseSite| kept(x.module, x.owner)),
     types: types_named(facts.types, bodies),
     bodies: bodies,
   }
@@ -236,9 +227,7 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
       owner,
       add(match m.get(owner) { Some(f) -> f, None -> { ..no_root_facts(), types: facts.types } }),
     );
-  let released = facts.releases.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: ReleaseSite|
-    into(m, x.owner, |f: RootFacts| { ..f, releases: f.releases.push(x) }));
-  let called = facts.members.fold(released, |m: Map<Bytes, RootFacts>, x: MemberSite|
+  let called = facts.members.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: MemberSite|
     into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
   facts.bodies.fold(called, |m: Map<Bytes, RootFacts>, x: TypedBody<Bytes>|
     into(m, x.owner, |f: RootFacts| { ..f, bodies: f.bodies.push(x) }))
@@ -248,13 +237,12 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
 fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
   {
     members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
-    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: module, owner: owner }),
     types: facts.types,
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
 /// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
-fn facts_encoding() -> Int = 5
+fn facts_encoding() -> Int = 6
 
 /// One owner's facts as its row files them: each place counted in the body's item, which no edit
 /// elsewhere, cut of its module or check of part of it moves.
@@ -274,12 +262,11 @@ pub fn facts_at(filed: Bytes, module: Int, owner: Bytes) -> Option<RootFacts> / 
     }
   }
 
-/// `checker` without the releases of a walk that is never lowered. A call on a value stays, its
-/// definition's: it says how the clause is written out, and a claim lowers the clause as written out.
+/// `checker` with the calls on values of a walk that is never lowered filed under its definition:
+/// they say how the clause is written out, and a claim lowers the clause as written out.
 fn lowered_only(checker: Checker) -> Checker / {abort.raise} =
   {
     ..checker,
-    release_sites: checker.release_sites.filter(|x: ReleaseSite| unlowered_of(x.owner) == None),
     member_sites: checker.member_sites.map(|x: MemberSite|
       match unlowered_of(x.owner) { Some(o) -> { ..x, owner: o }, None -> x }),
   }
@@ -295,7 +282,6 @@ fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
       if published_pure(def_info) { acc.push(def_info.name) } else { acc }),
     orders: checker.witness_orders,
     members: grouped(checker.member_sites, |x: MemberSite| x.owner),
-    releases: grouped(checker.release_sites, |x: ReleaseSite| x.owner),
     types: keyed.types,
     bodies: grouped(keyed.bodies, |x: TypedBody<Bytes>| x.owner),
   }
@@ -320,9 +306,19 @@ fn grouped<a>(xs: List<a>, owner: (a) -> Bytes) -> List<a> = {
 /// its owner's numbering, each place counted from where its item's text starts. A read inside the
 /// recursive group being inferred was not instantiated: the group shares its variables, so the
 /// definition is read at its own type variables, and fills each of its row variables the read did
-/// not with itself. A body that does not settle is left out, and what reads it finds none.
+/// not with itself. Each node holds what the ownership walk lets go there. A body that does not
+/// settle is left out, and what reads it finds none.
 fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
   let sorts = law_sorts(checker);
+  // Each owner's, by the site of the node each runs at.
+  let released = checker.release_sites.fold(
+    Map::new(),
+    |m: Map<Bytes, Map<Int, List<TypedRelease>>>, x: ReleaseSite| {
+      let at = match m.get(x.owner) { Some(a) -> a, None -> Map::new() };
+      let here = match at.get(x.at) { Some(xs) -> xs.push(x.release), None -> [x.release] };
+      m.insert(x.owner, at.insert(x.at, here))
+    },
+  );
   checker.typed_bodies.fold([], |acc: List<TypedBody<Type>>, b: WalkedTree| {
     let owner = def_of(checker, b.owner);
     let types = match owner {
@@ -337,6 +333,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
     let ty = |t: Type| numbered(resolve(checker, t), types, checker.kept_vars);
     let row = |r: Row| row_numbered(resolve_row_in(checker, r), rows);
     let placed = |sp: Span| moved_by(sp, 0 - b.base);
+    let here = match released.get(b.owner) { Some(at) -> at, None -> Map::new() };
     // A definition a `numeric` or `integer` constraint makes witnesses of takes them first.
     let witnesses = match owner {
       Some(d) ->
@@ -359,7 +356,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
       atom: |a: Atom| atom_numbered(resolve_atom(checker.subst, a), rows.labels),
       read: |read: WalkedReading|
         match read {
-          WalkedLocal(n) -> Some(ReadLocal(n)),
+          WalkedLocal(l) -> Some(ReadLocal(l.name)),
           WalkedConstructor(c) ->
             Some(ReadConstructor({ sum: c.sum, name: c.name, case: c.case, args: c.args.map(ty) })),
           WalkedBuiltin(f) -> match witnesses_passed(checker, f.name, f.args) {
@@ -412,6 +409,7 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           None -> None,
         },
       span: placed,
+      released: |site: Int| match here.get(site) { Some(xs) -> xs, None -> [] },
     };
     match settled(b.body, settling) {
       Some(body) ->
@@ -1080,7 +1078,7 @@ fn settled_m(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
 /// The nodes of the bodies the check behind `checker` settled in module 0 whose places `picked`
 /// picks.
 fn nodes_where(checker: Checker, picked: (Span) -> Bool) -> List<TypedExpr<Type>> / {abort.raise} =
-  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).filter(
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_expr_nodes(b.body)).filter(
     |e: TypedExpr<Type>| picked(e.span),
   )
 
@@ -1174,7 +1172,7 @@ fn rows_of_node(e: TypedExpr<Type>) -> List<Bytes> / {abort.raise} = {
 /// `checker` settled in module 0 performs, or the rows a read fills, where `picked` picks its place;
 /// a branch's place is its body's.
 fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
-  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_expr_nodes(b.body)).flat_map(
     |e: TypedExpr<Type>| {
       let own = if picked(e.span) { rows_of_node(e) } else { [] };
       match e.node {
@@ -1218,13 +1216,12 @@ test "a clause binding its continuation holds what resuming it performs" {
     b"effect trace {\n  write step() -> Unit\n}\n",
     b"fn traced() -> Int / {trace.write} = handle { let b = amb.flip(); trace.step(); if b { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + 1 }\n",
   ]);
-  let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
-    |e: TypedExpr<Type>|
-      match e.node {
-        TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
-        _ -> [],
-      },
-  );
+  let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>|
+    typed_expr_nodes(b.body)).flat_map(|e: TypedExpr<Type>|
+    match e.node {
+      TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
+      _ -> [],
+    });
   assert_eq(resumed, [b"{m.trace.step}"])
 }
 
@@ -1864,7 +1861,7 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
 fn passed_in(checker: Checker) -> List<List<NumericWitness>> / {abort.raise} =
   settled_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).flat_map(
     |b: TypedBody<Type>|
-      typed_nodes(b.body).fold([], |acc: List<List<NumericWitness>>, e: TypedExpr<Type>|
+      typed_expr_nodes(b.body).fold([], |acc: List<List<NumericWitness>>, e: TypedExpr<Type>|
         match e.node {
           TypedRead(ReadDefinition(d)) -> if d.witnesses.len() == 0 { acc }
           else { acc.push(d.witnesses) },
@@ -3414,15 +3411,6 @@ test "a `try` over several raises names the one it answers, and the others stay 
   ]);
   assert_eq(raising(b"fn f() -> Result<Int, Int> / {p.get} = try[p.get] { p.get() }"), [b"E0313"]);
   assert_eq(raising(b"fn f() -> Result<Int, Int> / {} = try[p.nope] { 1 }"), [b"E0104"])
-}
-
-test "the lowering reads which raise a `try` answers, by its effect's program-wide name" {
-  let out = checked_cx(
-    b"effect p { raise bad(n: Int, why: String) }\nfn f(n: Int) -> Result<Int, (Int, String)> / {} = try { p.bad(n, \"no\") }",
-  );
-  assert_eq(out.try_sites.map(|s: TrySite| (s.effect, s.op, s.arity, s.owner)), [
-    (b"m.p", b"bad", 2, b"m.f"),
-  ])
 }
 
 test "a raise is in the row, and a clause for it discharges it" {
@@ -5398,6 +5386,44 @@ test "a list written of parts, pushed or filtered or mapped to parts, is made of
   assert(diverges(walked(b"again", b"Many(xs) -> any(xs.push(t)), _ -> false"), b"again"))
 }
 
+test "a list joined of several places' parts is made of the parts a call hands it" {
+  // `join` is written as `List::concat` is: it answers parts of either list it is handed.
+  let tree = b"type T = | Leaf | Node(T, T) | Many(List<T>)\nfn join(xs: List<T>, ys: List<T>) -> List<T> = ys.fold(xs, |acc: List<T>, y: T| acc.push(y))\n";
+  let sized = |kids: Bytes|
+    Bytes::concat_all([
+      tree,
+      b"fn kids(t: T) -> List<T> = match t { ",
+      kids,
+      b", Leaf -> [] }\n",
+      b"fn size(t: T) -> Int = 1 + kids(t).fold(0, |n: Int, k: T| n + size(k))\n",
+    ]);
+  assert(!diverges(sized(b"Node(l, r) -> join([l], [r]), Many(xs) -> join(xs, [])"), b"size"));
+  // Joined with the tree itself, a list holds an element that is no smaller.
+  assert(diverges(sized(b"Node(l, r) -> join([l], [t]), Many(xs) -> xs"), b"size"));
+  // `flat` is written as `List::flat_map` is, and calls its function with each element.
+  assert(
+    !diverges(
+      tree.concat(
+        b"fn flat(xs: List<T>, f: (T) -> List<T>) -> List<T> = xs.fold([], |acc: List<T>, x: T| join(acc, f(x)))\nfn kids(t: T) -> List<T> = match t { Node(l, r) -> [l, r], Many(xs) -> xs, Leaf -> [] }\nfn all(t: T) -> List<T> = join([t], flat(kids(t), all))\n",
+      ),
+      b"all",
+    ),
+  )
+}
+
+test "a group whose calls reorder what never shrinks ends as its one shrinking measure says" {
+  // Swapping and rotating eight parameters orders them every way, which no loop that shrinks `t`
+  // reads.
+  let src = b"type T = | Leaf | Node(T, T)\nfn spin(t: T, a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int) -> Int = match t { Leaf -> a, Node(l, r) -> spin(l, b, a, c, d, e, f, g, h) + spin(r, b, c, d, e, f, g, h, a) }\n";
+  assert(!diverges(src, b"spin"));
+  assert(
+    diverges(
+      b"type T = | Leaf | Node(T, T)\nfn spin(t: T, a: Int, b: Int) -> Int = match t { Leaf -> a, Node(l, r) -> spin(l, b, a) + spin(t, a, b) }\n",
+      b"spin",
+    ),
+  )
+}
+
 /// Where a site's call is in the source the checker read, as an offset.
 fn offset_of(cx: Checker, s: Site) -> Int / {abort.raise} =
   match def_of(cx, s.caller) {
@@ -7100,7 +7126,7 @@ test "a recursion through a call on a value is a recursion, and a type states it
   )
 }
 
-test "a lent function parameter may be called, lent on, captured by a lambda lent in turn, and read in a `parallel` branch" {
+test "a lent function parameter may be called, lent on, captured by a lambda lent in turn, and read in a `parallel` branch or a region" {
   let lent = [
     b"fn f(g: (Int) -> Int) -> Int = g(1)",
     b"fn twice(h: (Int) -> Int, x: Int) -> Int = h(h(x))\nfn f(g: (Int) -> Int) -> Int = twice(g, 1)",
@@ -7109,6 +7135,7 @@ test "a lent function parameter may be called, lent on, captured by a lambda len
     b"fn f(g: (Int) -> Int) -> Int = { let h = |x: Int| g(x); let k = h; k(1) + [1].fold(0, |a: Int, x: Int| a + h(x)) }",
     b"fn f(g: (Int) -> Int, n: Int) -> Int = if n <= 0 { g(0) } else { f(g, n - 1) }",
     b"fn f(g: (Int) -> Int) -> (Int, Int) = parallel { g(1), g(2) }",
+    b"fn f(g: (Int) -> Int) -> Int = with_hold[r](1, |x: Int| ()) { h -> g(1) }",
     b"effect ask { read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + 1 }",
     // A lambda's parameter is not lent, and neither is what a call answers.
     b"fn f() -> ((Int) -> Int) -> (Int) -> Int = |h: (Int) -> Int| h",
@@ -7427,10 +7454,11 @@ fn release_places(body: Bytes) -> List<Bytes> / {abort.raise} =
   checker_m(Bytes::of_string(connections()).concat(body)).release_sites.fold(
     [],
     |acc: List<Bytes>, r: ReleaseSite|
-      match r.place {
+      match r.release.place {
         ReleaseAfter -> acc.push(b"after"),
         ReleaseBefore -> acc.push(b"before"),
         ReleaseUnwinding -> acc.push(b"unwinding"),
+        ReleaseMissing -> acc.push(b"missing"),
         ReleaseFailing(_) -> acc,
       },
   )
@@ -7439,9 +7467,9 @@ fn release_places(body: Bytes) -> List<Bytes> / {abort.raise} =
 fn failing_places(body: Bytes) -> List<Int> / {abort.raise} = {
   let sites = checker_m(Bytes::of_string(connections()).concat(body)).release_sites;
   sites.fold([], |acc: List<Int>, r: ReleaseSite|
-    if r.place != ReleaseAfter && r.place != ReleaseBefore { acc } else {
+    if r.release.place != ReleaseAfter && r.release.place != ReleaseBefore { acc } else {
       let n = sites.filter(|x: ReleaseSite|
-        x.at == r.at && x.place == ReleaseFailing(r.binding)).len(
+        x.at == r.at && x.release.place == ReleaseFailing(r.release.held)).len(
       );
       if n == 0 { acc } else { acc.push(n) }
     })
@@ -7919,7 +7947,7 @@ test "a `let` whose pattern misses lets go of what the body owns, and of the val
     release_places(
       b"fn maybe() -> Option<Int> = None\nfn f() -> Int / {abort.raise} = { let c = open(); let Some(n) = maybe(); send(c, n) }",
     ),
-    [b"unwinding", b"unwinding", b"unwinding", b"after"],
+    [b"unwinding", b"missing", b"unwinding", b"after"],
   );
   assert_eq(
     release_places(b"fn f() -> Int = { let c = open(); let (n, m) = (1, 2); send(c, n + m) }"),
@@ -8181,7 +8209,7 @@ test "a read inside its own recursive group settles at its definition's own vari
     b"fn len<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + len(rest) }",
     b"m.len",
   ).flat_map(
-    typed_nodes,
+    typed_expr_nodes,
   ).fold([], |acc: List<List<Type>>, e: TypedExpr<Type>|
     match e.node {
       TypedRead(ReadDefinition(d)) -> if d.full == b"m.len" { acc.push(d.args) } else { acc },
@@ -8195,7 +8223,7 @@ test "an update settles with the fields it copies from its base" {
     b"fn moved(p: {x: Int, y: Int}) -> {x: Int, y: Int} = { ..p, x: 1 }",
     b"m.moved",
   ).flat_map(
-    typed_nodes,
+    typed_expr_nodes,
   ).fold([], |acc: List<List<Bytes>>, e: TypedExpr<Type>|
     match e.node { TypedUpdate(u) -> acc.push(u.copies), _ -> acc });
   assert_eq(copies, [[b"y"]])

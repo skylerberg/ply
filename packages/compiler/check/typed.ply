@@ -7,10 +7,11 @@ import compiler.syntax.parsing (Span, span_bin)
 import compiler.syntax.patterns (Lit, lit_bin)
 import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
 import std.bin
+import std.derive.children
 import std.list
 
-/// One node: what it is, where its text stands, and its type.
-pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t }
+/// One node: what it is, where its text stands, its type, and what the check lets go there.
+pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t, releases: List<TypedRelease> }
 
 pub type TypedNode<t> =
   | TypedLit(Lit)
@@ -73,22 +74,70 @@ pub type TypedField<t> = { name: Bytes, value: TypedExpr<t> }
 
 pub type TypedArm<t> = { pat: TypedPattern<t>, guard: Option<TypedExpr<t>>, body: TypedExpr<t> }
 
-/// A pattern, each binder with the type it binds and each constructor resolved to its case.
+/// A pattern, each binder with the type it binds and each constructor resolved to its case. A `_`
+/// holds where it is written and the type of what it stands for, and a record pattern's `rest` where
+/// its `..` is written and the record's type: what the ownership walk refuses to drop.
 pub type TypedPattern<t> =
-  | TypedWild
+  | TypedWild({ span: Span, ty: t })
   | TypedBinder({ name: Bytes, ty: t, span: Span })
   | TypedLitPattern(Lit)
   | TypedRange({ lo: Lit, hi: Lit })
   | TypedCase({ sum: Bytes, name: Bytes, case: Int, args: List<TypedPattern<t>> })
-  | TypedRecordPattern({ fields: List<TypedFieldPattern<t>>, rest: Bool })
+  | TypedRecordPattern({ fields: List<TypedFieldPattern<t>>, rest: Option<{ span: Span, ty: t }> })
   | TypedListPattern({ items: List<TypedPattern<t>>, rest: Option<TypedPattern<t>> })
   | TypedOr(List<TypedPattern<t>>)
 
 pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
 
+/// Each binder `pat` writes, with where it is written and its type; of an or-pattern, its first
+/// alternative's, as every alternative binds the same names.
+pub fn pattern_binders<t>(pat: TypedPattern<t>) -> List<TypedParam<t>> =
+  match pat {
+    TypedBinder(v) -> [{ name: v.name, ty: v.ty, span: v.span }],
+    TypedCase(c) ->
+      c.args.fold([], |acc: List<TypedParam<t>>, a: TypedPattern<t>|
+        acc.concat(pattern_binders(a))),
+    TypedRecordPattern(r) ->
+      r.fields.fold([], |acc: List<TypedParam<t>>, x: TypedFieldPattern<t>|
+        acc.concat(pattern_binders(x.pat))),
+    TypedListPattern(l) -> {
+      let items = l.items.fold([], |acc: List<TypedParam<t>>, a: TypedPattern<t>|
+        acc.concat(pattern_binders(a)));
+      match l.rest { Some(r) -> items.concat(pattern_binders(r)), None -> items }
+    },
+    TypedOr(alts) -> match alts.at(0) { Some(a) -> pattern_binders(a), None -> [] },
+    _ -> [],
+  }
+
+/// A value a release lets go of at a node, and where it runs.
+pub type TypedRelease = { held: Holder, place: ReleasePlace }
+
+/// What holds a value a release lets go of: the binder at the site, or, where no binder holds it,
+/// the node at the site that made it.
+pub type Holder = | HeldByBinder(Int) | HeldByNode(Int)
+
+/// Where a release runs, by its node: after the node runs; before it, where the node is the last of
+/// its scope and does not name what is let go, so a tail call there stays a loop; where a raise, a
+/// clause that does not resume, or a cancel unwinds through the node, a call or a perform; where the
+/// pattern a `let` matches the node's value against misses; or where the release of what the
+/// payload names at the node fails, which unwinds from there.
+pub type ReleasePlace =
+  | ReleaseAfter
+  | ReleaseBefore
+  | ReleaseUnwinding
+  | ReleaseMissing
+  | ReleaseFailing(Holder)
+
+/// The key a release names the binder at site `binder` by: the site negated, so no node's site is
+/// one, and a later binder's key is the smaller, which puts the latest bound first in a walk of keys.
+pub fn binding_key(binder: Int) -> Int = 0 - binder - 1
+
+/// The key a walk follows what `h` names by.
+pub fn holder_key(h: Holder) -> Int =
+  match h { HeldByBinder(binder) -> binding_key(binder), HeldByNode(site) -> site }
+
 pub type TypedStmt<t> =
-  /// `pat_span` is where the pattern is written, where what a miss lets go of is let go.
-  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span, pat_span: Span })
+  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
   | TypedDo(TypedExpr<t>)
@@ -163,6 +212,14 @@ derive bin for TypedBody
 
 derive bin for TypedExpr
 
+derive children for TypedExpr
+
+derive bin for TypedRelease
+
+derive bin for Holder
+
+derive bin for ReleasePlace
+
 derive bin for TypedNode
 
 derive bin for Reading
@@ -189,97 +246,9 @@ derive bin for TypedHandlerVar
 
 // --- Reading a tree --------------------------------------------------------------------------------
 
-/// Every node of `e`, each before its parts.
-pub fn typed_nodes<t>(e: TypedExpr<t>) -> List<TypedExpr<t>> = {
-  let all = |xs: List<TypedExpr<t>>|
-    xs.fold([], |acc: List<TypedExpr<t>>, x: TypedExpr<t>| acc.concat(typed_nodes(x)));
-  let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> typed_nodes(y), None -> [] };
-  [e].concat(match e.node {
-    TypedLit(_) -> [],
-    TypedRead(_) -> [],
-    TypedUnary(u) -> typed_nodes(u.operand),
-    TypedBinary(b) -> typed_nodes(b.lhs).concat(typed_nodes(b.rhs)),
-    TypedCall(c) -> typed_nodes(c.callee).concat(all(c.args)),
-    TypedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
-    TypedMatch(m) ->
-      typed_nodes(m.scrutinee).concat(
-        m.arms.fold([], |acc: List<TypedExpr<t>>, a: TypedArm<t>|
-          acc.concat(opt(a.guard)).concat(typed_nodes(a.body))),
-      ),
-    TypedBlock(b) ->
-      b.stmts.fold([], |acc: List<TypedExpr<t>>, s: TypedStmt<t>|
-        acc.concat(match s {
-          TypedLet(l) -> typed_nodes(l.value),
-          TypedLetElse(l) -> typed_nodes(l.value).concat(typed_nodes(l.fallback)),
-          TypedDo(x) -> typed_nodes(x),
-          TypedAssign(a) -> typed_nodes(a.value),
-        })).concat(
-        opt(b.tail),
-      ),
-    TypedList(xs) -> all(xs),
-    TypedRecord(fs) -> all(fs.map(|f: TypedField<t>| f.value)),
-    TypedUpdate(u) -> typed_nodes(u.base).concat(all(u.sets.map(|f: TypedField<t>| f.value))),
-    TypedFieldRead(r) -> typed_nodes(r.base),
-    TypedPerform(p) -> all(p.args),
-    TypedLambda(l) -> typed_nodes(l.body),
-    TypedSimulate(th) -> typed_nodes(th.body),
-    TypedParallel(ts) -> all(ts.map(|th: TypedThunk<t>| th.body)),
-    TypedHandle(h) ->
-      all(h.vars.map(|v: TypedHandlerVar<t>| v.init)).concat(typed_nodes(h.body)).concat(
-        all(h.clauses.map(|c: TypedClause<t>| c.body)),
-      ).concat(match h.ret { Some(r) -> typed_nodes(r.body), None -> [] }),
-  })
-}
-
-/// `e` with `f` applied to each node's own part after its parts: the nodes a walk reaches, which
-/// `typed_nodes` lists.
-pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> TypedExpr<t> = {
-  let go = |x: TypedExpr<t>| nodes_mapped(x, f);
-  let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> Some(go(y)), None -> None };
-  let field = |x: TypedField<t>| { name: x.name, value: go(x.value) };
-  let node = match e.node {
-    TypedLit(_) -> e.node,
-    TypedRead(_) -> e.node,
-    TypedUnary(u) -> TypedUnary({ ..u, operand: go(u.operand) }),
-    TypedBinary(b) -> TypedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
-    TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go), row: c.row }),
-    TypedIf(i) ->
-      TypedIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
-    TypedMatch(m) ->
-      TypedMatch({
-        scrutinee: go(m.scrutinee),
-        arms: m.arms.map(|a: TypedArm<t>| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
-      }),
-    TypedBlock(b) ->
-      TypedBlock({
-        stmts: b.stmts.map(|st: TypedStmt<t>|
-          match st {
-            TypedLet(l) -> TypedLet({ ..l, value: go(l.value) }),
-            TypedLetElse(l) -> TypedLetElse({ ..l, value: go(l.value), fallback: go(l.fallback) }),
-            TypedDo(x) -> TypedDo(go(x)),
-            TypedAssign(a) -> TypedAssign({ ..a, value: go(a.value) }),
-          }),
-        tail: opt(b.tail),
-      }),
-    TypedList(xs) -> TypedList(xs.map(go)),
-    TypedRecord(fs) -> TypedRecord(fs.map(field)),
-    TypedUpdate(u) -> TypedUpdate({ ..u, base: go(u.base), sets: u.sets.map(field) }),
-    TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
-    TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
-    TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
-    TypedSimulate(th) -> TypedSimulate({ ..th, body: go(th.body) }),
-    TypedParallel(ts) -> TypedParallel(ts.map(|th: TypedThunk<t>| { ..th, body: go(th.body) })),
-    TypedHandle(h) ->
-      TypedHandle({
-        ..h,
-        body: go(h.body),
-        vars: h.vars.map(|v: TypedHandlerVar<t>| { ..v, init: go(v.init) }),
-        clauses: h.clauses.map(|c: TypedClause<t>| { ..c, body: go(c.body) }),
-        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
-      }),
-  };
-  { ..e, node: f(node) }
-}
+/// `b` as a reader of its values reads it, which no release changes: with nothing let go.
+pub fn unreleased<t>(b: TypedBody<t>) -> TypedBody<t> =
+  { ..b, body: typed_expr_nodes_mapped(b.body, |e: TypedExpr<t>| { ..e, releases: [] }) }
 
 /// `b` as a reader that draws every type parameter as `Int` reads it: with no witness passed or
 /// taken, each operator its operands' own.
@@ -287,13 +256,16 @@ pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
   {
     ..b,
     params: b.params.filter(|p: TypedParam<t>| !p.name.starts_with(witness_param(b""))),
-    body: nodes_mapped(b.body, |n: TypedNode<t>|
-      match n {
-        TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
-        TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
-        TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
-        TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
-        _ -> n,
+    body: typed_expr_nodes_mapped(b.body, |e: TypedExpr<t>|
+      {
+        ..e,
+        node: match e.node {
+          TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
+          TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
+          TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
+          TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
+          n -> n,
+        },
       }),
   }
 
@@ -319,7 +291,10 @@ pub fn retyped<a, b, s>(
 ) -> Retyped<TypedExpr<b>, s> / {abort.raise} = {
   let node = retyped_node(e.node, state, r);
   let t = (r.ty)(e.ty, node.state);
-  { out: { node: node.out, span: (r.span)(e.span), ty: t.ty }, state: t.state }
+  {
+    out: { node: node.out, span: (r.span)(e.span), ty: t.ty, releases: e.releases },
+    state: t.state,
+  }
 }
 
 /// `b` with every type written as `r` writes it.
@@ -472,7 +447,10 @@ fn retyped_pattern<a, b, s>(
       { out: acc.out.push(o.out), state: o.state }
     });
   match p {
-    TypedWild -> { out: TypedWild, state: state },
+    TypedWild(w) -> {
+      let t = (r.ty)(w.ty, state);
+      { out: TypedWild({ span: (r.span)(w.span), ty: t.ty }), state: t.state }
+    },
     TypedBinder(v) -> {
       let t = (r.ty)(v.ty, state);
       { out: TypedBinder({ name: v.name, ty: t.ty, span: (r.span)(v.span) }), state: t.state }
@@ -494,7 +472,20 @@ fn retyped_pattern<a, b, s>(
           { out: acc.out.push({ name: f.name, pat: o.out }), state: o.state }
         },
       );
-      { out: TypedRecordPattern({ fields: fields.out, rest: rp.rest }), state: fields.state }
+      match rp.rest {
+        None ->
+          { out: TypedRecordPattern({ fields: fields.out, rest: None }), state: fields.state },
+        Some(at) -> {
+          let t = (r.ty)(at.ty, fields.state);
+          {
+            out: TypedRecordPattern({
+              fields: fields.out,
+              rest: Some({ span: (r.span)(at.span), ty: t.ty }),
+            }),
+            state: t.state,
+          }
+        },
+      }
     },
     TypedListPattern(lp) -> {
       let items = each(lp.items, state);
@@ -522,15 +513,7 @@ fn retyped_stmt<a, b, s>(
     TypedLet(l) -> {
       let p = retyped_pattern(l.pat, state, r);
       let v = retyped(l.value, p.state, r);
-      {
-        out: TypedLet({
-          pat: p.out,
-          value: v.out,
-          span: (r.span)(l.span),
-          pat_span: (r.span)(l.pat_span),
-        }),
-        state: v.state,
-      }
+      { out: TypedLet({ pat: p.out, value: v.out, span: (r.span)(l.span) }), state: v.state }
     },
     TypedLetElse(l) -> {
       let p = retyped_pattern(l.pat, state, r);

@@ -14,11 +14,14 @@ import compiler.check.typed (BodyPart, TypedPattern, TypedParam, TypedFieldPatte
                              TypedCall, TypedIf, TypedMatch, TypedBlock, TypedList, TypedRecord,
                              TypedUpdate, TypedFieldRead, TypedPerform, TypedLambda, TypedSimulate,
                              TypedParallel, TypedHandle, TypedLet, TypedLetElse, TypedDo,
-                             TypedAssign)
+                             TypedAssign, TypedRelease)
+import std.derive.children
 import std.list
 
 /// One node: what it is, where its text stands, and its type.
 pub type Walked = { node: WalkedNode, span: Span, ty: Type }
+
+derive children for Walked
 
 pub type WalkedNode =
   | WalkedLit(Lit)
@@ -40,7 +43,8 @@ pub type WalkedNode =
   /// `effect` is the effect's name across the program, `resource` the label as written, and `atom`
   /// what the perform performs.
   | WalkedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<Walked> })
-  | WalkedLambda({ params: List<TypedParam<Type>>, body: Walked, row: Row })
+  /// `kept` are the places of the parameters written `keep`.
+  | WalkedLambda({ params: List<TypedParam<Type>>, kept: List<Int>, body: Walked, row: Row })
   | WalkedSimulate(WalkedThunk)
   | WalkedParallel(List<WalkedThunk>)
   /// `row` is what the body performs. `vars` are the handler's variables, made before the body
@@ -50,7 +54,7 @@ pub type WalkedNode =
   /// copies, where `defaults_filled` finds it.
   | WalkedDefault(Int)
 
-/// What a name read as a value is, as the walk found it: a binder in scope; a definition, its
+/// What a name read as a value is, as the walk found it: a local, by the site of its binder; a definition, its
 /// scheme's type variables filled by `args` and its row variables `quantified` by `rows`, where the
 /// read instantiated the scheme, and the labels it fills, as types; a constructor of a declared sum
 /// at the type arguments it fills; or a builtin at the type arguments and rows it fills, in its own
@@ -58,7 +62,7 @@ pub type WalkedNode =
 /// shares its variables. A definition's `key` is the name the check holds its scheme under, which
 /// for the prelude's functions is not `full`.
 pub type WalkedReading =
-  | WalkedLocal(Bytes)
+  | WalkedLocal({ name: Bytes, binder: Int })
   | WalkedDefinition({ full: Bytes, key: Bytes, args: List<Type>, rows: List<Row>, quantified: List<Int>, labels: List<Type> })
   | WalkedConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<Type> })
   | WalkedBuiltin({ name: Bytes, args: List<Type>, rows: List<Row> })
@@ -68,10 +72,16 @@ pub type WalkedThunk = { body: Walked, row: Row }
 
 pub type WalkedField = { name: Bytes, value: Walked }
 
-pub type WalkedArm = { pat: TypedPattern<Type>, guard: Option<Walked>, body: Walked }
+/// An arm, `pat_span` where its pattern is written.
+pub type WalkedArm = {
+  pat: TypedPattern<Type>,
+  pat_span: Span,
+  guard: Option<Walked>,
+  body: Walked,
+}
 
 pub type WalkedStmt =
-  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span, pat_span: Span })
+  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span })
   | WalkedDo(Walked)
@@ -161,12 +171,14 @@ pub fn record_of(fields: List<{ name: Bytes, value: Option<Walked> }>) -> Option
 
 pub fn arm_of(
   pat: Option<TypedPattern<Type>>,
+  pat_span: Span,
   guard: Option<Option<Walked>>,
   body: Option<Walked>,
 ) -> Option<WalkedArm> =
   match ((pat, guard, body)) {
-    (Some(p), Some(Some(g)), Some(b)) -> Some({ pat: p, guard: Some(g), body: b }),
-    (Some(p), None, Some(b)) -> Some({ pat: p, guard: None, body: b }),
+    (Some(p), Some(Some(g)), Some(b)) ->
+      Some({ pat: p, pat_span: pat_span, guard: Some(g), body: b }),
+    (Some(p), None, Some(b)) -> Some({ pat: p, pat_span: pat_span, guard: None, body: b }),
     _ -> None,
   }
 
@@ -183,10 +195,9 @@ pub fn let_of(
   pat: Option<TypedPattern<Type>>,
   value: Option<Walked>,
   span: Span,
-  pat_span: Span,
 ) -> Option<WalkedStmt> =
   match ((pat, value)) {
-    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span, pat_span: pat_span })),
+    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span })),
     _ -> None,
   }
 
@@ -228,7 +239,7 @@ pub fn or_pattern_of(alts: List<Option<TypedPattern<Type>>>) -> Option<TypedPatt
 
 pub fn record_pattern_of(
   fields: List<{ name: Bytes, pat: Option<TypedPattern<Type>> }>,
-  rest: Bool,
+  rest: Option<{ span: Span, ty: Type }>,
 ) -> Option<TypedPattern<Type>> =
   match fields.fold(
       Some([]),
@@ -360,10 +371,14 @@ pub fn update_of(
 
 pub fn lambda_of(
   params: List<TypedParam<Type>>,
+  kept: List<Int>,
   body: Option<Walked>,
   row: Row,
 ) -> Option<WalkedNode> =
-  match body { Some(b) -> Some(WalkedLambda({ params: params, body: b, row: row })), None -> None }
+  match body {
+    Some(b) -> Some(WalkedLambda({ params: params, kept: kept, body: b, row: row })),
+    None -> None,
+  }
 
 pub fn block_of(
   stmts: List<Option<WalkedStmt>>,
@@ -396,7 +411,7 @@ pub fn rewritten(e: Walked, f: (Walked) -> Walked) -> Walked = {
       WalkedMatch(m) ->
         WalkedMatch({
           scrutinee: go(m.scrutinee),
-          arms: m.arms.map(|a: WalkedArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+          arms: m.arms.map(|a: WalkedArm| { ..a, guard: opt(a.guard), body: go(a.body) }),
         }),
       WalkedBlock(b) ->
         WalkedBlock({
@@ -459,7 +474,8 @@ pub fn defaults_filled(e: Walked, copies: List<Option<Walked>>) -> Option<Walked
 /// atom; `read` settles a read, none where it cannot be; `witness` names the type parameter whose
 /// witness does an operator over an operand of a type, none where no constraint makes one; `copies`
 /// reads the fields an update of a base of the settled type copies, those `sets` writes left out,
-/// none where the type is no record's; and `span` counts a place from where the body's item starts.
+/// none where the type is no record's; `span` counts a place from where the body's item starts; and
+/// `released` reads what the ownership walk lets go at the node at a site.
 pub type Settling = {
   ty: (Type) -> Type / {abort.raise},
   witness: (Type) -> Option<Bytes> / {abort.raise},
@@ -468,12 +484,19 @@ pub type Settling = {
   read: (WalkedReading) -> Option<Reading<Type>> / {abort.raise},
   copies: (Type, List<Bytes>) -> Option<List<Bytes>> / {abort.raise},
   span: (Span) -> Span,
+  released: (Int) -> List<TypedRelease>,
 }
 
 /// The typed tree of `e`, settled as `s` settles it; none where a part cannot be.
 pub fn settled(e: Walked, s: Settling) -> Option<TypedExpr<Type>> / {abort.raise} =
   match settled_node(e.node, s) {
-    Some(n) -> Some({ node: n, span: (s.span)(e.span), ty: (s.ty)(e.ty) }),
+    Some(n) ->
+      Some({
+        node: n,
+        span: (s.span)(e.span),
+        ty: (s.ty)(e.ty),
+        releases: (s.released)(e.span.site),
+      }),
     None -> None,
   }
 
@@ -511,7 +534,7 @@ fn settled_thunk(t: WalkedThunk, s: Settling) -> Option<TypedThunk<Type>> / {abo
 
 fn settled_pattern(p: TypedPattern<Type>, s: Settling) -> TypedPattern<Type> / {abort.raise} =
   match p {
-    TypedWild -> TypedWild,
+    TypedWild(w) -> TypedWild({ span: (s.span)(w.span), ty: (s.ty)(w.ty) }),
     TypedBinder(v) -> TypedBinder({ name: v.name, ty: (s.ty)(v.ty), span: (s.span)(v.span) }),
     TypedLitPattern(l) -> TypedLitPattern(l),
     TypedRange(g) -> TypedRange(g),
@@ -521,7 +544,10 @@ fn settled_pattern(p: TypedPattern<Type>, s: Settling) -> TypedPattern<Type> / {
       TypedRecordPattern({
         fields: rp.fields.map(|f: TypedFieldPattern<Type>|
           { name: f.name, pat: settled_pattern(f.pat, s) }),
-        rest: rp.rest,
+        rest: match rp.rest {
+          Some(at) -> Some({ span: (s.span)(at.span), ty: (s.ty)(at.ty) }),
+          None -> None,
+        },
       }),
     TypedListPattern(lp) ->
       TypedListPattern({
@@ -535,14 +561,7 @@ fn settled_stmt(stmt: WalkedStmt, s: Settling) -> Option<TypedStmt<Type>> / {abo
   match stmt {
     WalkedLet(l) -> match settled(l.value, s) {
       Some(v) ->
-        Some(
-          TypedLet({
-            pat: settled_pattern(l.pat, s),
-            value: v,
-            span: (s.span)(l.span),
-            pat_span: (s.span)(l.pat_span),
-          }),
-        ),
+        Some(TypedLet({ pat: settled_pattern(l.pat, s), value: v, span: (s.span)(l.span) })),
       None -> None,
     },
     WalkedLetElse(l) -> match ((settled(l.value, s), settled(l.fallback, s))) {

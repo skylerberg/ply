@@ -26,12 +26,13 @@ import compiler.store.hash.printed (print_bodies, Printed, Unprintable)
 import compiler.check.typed
 import compiler.check.typed (TypedBody, TypedExpr, TypedCall, TypedRead, ReadDefinition, BodyPart,
                              WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
-                             unwitnessed, typed_nodes, nodes_mapped, TypedNode, ReadBuiltin)
+                             unwitnessed, typed_expr_nodes, typed_expr_nodes_mapped, ReadBuiltin,
+                             unreleased)
 import compiler.check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_root_facts,
                              elaborated, ended, stated, bodies_with, bodies_read, check_front_with,
                              EmitFacts)
 import compiler.check.infer.checker (DefInfo, TestInfo, KeptFacts, Walks, Every, WitnessOrder,
-                                     MemberSite, witnessed, Builtin, builtins, ReleaseSite)
+                                     MemberSite, witnessed, Builtin, builtins)
 import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key, law_owner)
 import compiler.check.termination (Ends, Stated)
@@ -118,7 +119,6 @@ type Gathered = { facts: RootFacts, missing: Option<Bytes> }
 fn joined_facts(g: RootFacts, f: RootFacts) -> RootFacts =
   {
     members: g.members.concat(f.members),
-    releases: g.releases.concat(f.releases),
     types: types_joined(g.types, f.types),
     bodies: g.bodies.concat(f.bodies),
   }
@@ -167,8 +167,6 @@ pub fn facts_read(
       joined_facts(acc, {
         members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        releases: f.releases.fold([], |a: List<ReleaseSite>, x: ReleaseSite|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
         types: f.types,
         bodies: f.bodies.fold([], |a: List<TypedBody<Bytes>>, x: TypedBody<Bytes>|
           match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
@@ -209,7 +207,6 @@ pub fn facts_read(
         orders: w.orders.fold([], |acc: List<WitnessOrder>, x: WitnessOrder|
           match moved.get(x.module) { Some(j) -> acc.push({ ..x, module: j }), None -> acc }),
         members: read.facts.members,
-        releases: read.facts.releases,
         types: read.facts.types,
         bodies: read.facts.bodies,
       }),
@@ -927,14 +924,19 @@ fn prelude_builtins(
 ) -> TypedBody<Type> / {abort.raise} =
   {
     ..b,
-    body: nodes_mapped(b.body, |n: TypedNode<Type>|
-      match n {
+    body: typed_expr_nodes_mapped(b.body, |e: TypedExpr<Type>|
+      match e.node {
         TypedRead(ReadDefinition(d)) -> match prover_builtin(modelled, d.full) {
           Some(name) ->
-            TypedRead(ReadBuiltin({ name: name, args: d.args, rows: d.rows, witnesses: [] })),
-          None -> n,
+            {
+              ..e,
+              node: TypedRead(
+                ReadBuiltin({ name: name, args: d.args, rows: d.rows, witnesses: [] }),
+              ),
+            },
+          None -> e,
         },
-        _ -> n,
+        _ -> e,
       }),
   }
 
@@ -1195,9 +1197,12 @@ fn claims_of_modules(
   ends: Map<Bytes, Bool>,
   stated: Map<Bytes, Bool>,
 ) -> List<Claim> / {abort.raise} = {
-  // Each body as the prover reads it, the prelude's builtins it models among what it reads.
+  // Each body as the prover reads it: the prelude's builtins it models among what it reads, and
+  // nothing let go, as a release changes no value.
   let modelled = prover_modelled();
-  let settled = settled_by_owner(bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, b)));
+  let settled = settled_by_owner(
+    bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, unreleased(b))),
+  );
   wanted.fold([], |acc: List<Claim>, i: Int| {
     let m = mods.get(i);
     m.module.items.fold(acc, |a: List<Claim>, item: Item|
@@ -1439,7 +1444,7 @@ test "the types a body binds and uses are filed by key, read from one table the 
       let bodies = |name: Bytes| bodies_read(sites(name).bodies, rows.types);
       // `go` uses `first` at `Int`.
       assert_eq(
-        bodies(b"m.go").flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).fold(
+        bodies(b"m.go").flat_map(|b: TypedBody<Type>| typed_expr_nodes(b.body)).fold(
           [],
           |acc: List<List<Type>>, e: TypedExpr<Type>|
             match e.node { TypedRead(ReadDefinition(d)) -> acc.push(d.args), _ -> acc },

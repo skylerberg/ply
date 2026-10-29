@@ -1538,7 +1538,11 @@ list `List::filter` keeps, a list `List::map` makes from a part of each element,
 `List::fold` when each step returns the accumulator or a part are all made of parts. Each element is
 a part, even though the list itself need not be smaller. A value an `if` or `match` chooses is
 whatever each branch is. What a group member returns is computed to a fixed point over the group,
-so a member that returns a part of its argument hands its caller a part.
+so a member that returns a part of its argument hands its caller a part. A definition outside the
+group is read the same way, so a helper that answers the parts of its argument, as a derived
+`<t>_children` does (§11), answers parts at each call. A result made of parts of several
+arguments, as `List::concat` joins two lists, is made of parts of whatever those arguments are
+parts of at the call: `[l].concat([r])` is made of parts of the tree `l` and `r` are taken from.
 
 Function values are followed too. A function given to `List::map`, `List::filter` or `List::fold`
 is called with each element, and one given to `Map::fold` with each key and value. A function
@@ -1552,7 +1556,8 @@ end. Any other may not return, and its row must say so with the atom `diverges` 
 
 - If its own recursion is not shown to shrink, or goes beyond what the check follows (a lambda
   deeper than it reads, or calls that combine into more than 10,000 size-change graphs), it must
-  write `diverges`. Without it, the definition is `E0302` with no fix offered, since the usual fix
+  write `diverges`. Only measures on a loop of calls that shrinks one count toward the graphs: a
+  parameter handed on in another order but never shrunk adds none. Without it, the definition is `E0302` with no fix offered, since the usual fix
   is a recursion that shrinks, a budget with `iterate`, or a `decreases` clause.
 - `diverges` belongs only on a loop that waits on something outside, such as a stream or a peer.
 - A caller inherits `diverges` like any other atom, and there `E0302` offers to add it.
@@ -3041,6 +3046,7 @@ The toolchain ships these derivers, each documented in its module:
 | `bin` | `std.bin` | `<snake_case(T)>_bin` | `std.bin.BinCodec<T>` |
 | `sql` | `std.sql` | `<snake_case(T)>_row` | `std.sql.RowCodec<T>` |
 | `map` | `std.derive.map` | `T::map` | the value with each type parameter's values mapped |
+| `children` | `std.derive.children` | `<snake_case(T)>_children`, `_children_mapped`, `_nodes`, `_nodes_folded`, `_nodes_mapped` | the `T`s directly inside a value or every one, in order, a fold over them, and the value with each replaced |
 
 `snake_case` is `std.text`'s, so two types that give the same name (`HTTPRequest` and `HttpRequest`
 both give `http_request`) are `E0105`. A `derive` must be in the module that declares its type
