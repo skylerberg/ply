@@ -218,6 +218,7 @@ helpers! {
     rt_box_wide(lo: I64, hi: I64, t: I64) -> Word;
     rt_branches(slots: *const Handed, n: I64);
     rt_memo(index: I64, keep: KeepRoot) -> Handed;
+    rt_const(index: I64, keep: KeepRoot) -> Handed;
     rt_never_lifted();
 }
 

@@ -1,8 +1,8 @@
 //! `compiler.unit`'s `shipped` natives, the family `shipped` a run is lent with `--allow shipped`:
 //! what this binary ships, which `ply-privileged` holds and installs, a function of the binary
-//! alone, so each is asked as computing; and the units a build enters for its constants.
+//! alone, so each is asked as computing; and the units a load enters for its derivers.
 
-use super::{COMPUTES, granted, text_at, texts_at};
+use super::{COMPUTES, granted, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::entry::{self, Ended, Opened, Run};
 use crate::native::{Addr, I64, TakenBytes};
@@ -73,10 +73,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
         machine_native(
             "shipped_definitions",
             rt_shipped_definitions as unsafe extern "C" fn(_) -> _,
-        ),
-        machine_native(
-            "shipped_values",
-            rt_shipped_values as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
         machine_native(
             "shipped_entered",
@@ -193,55 +189,6 @@ pub unsafe extern "C" fn rt_shipped_described(ctx: *mut Ctx) -> TakenBytes {
 pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
     shipping(ctx, "shipped_definitions", |c, ships| {
         c.given(ships.definitions().into_bytes())
-    })
-}
-
-/// What each stored root lent as parts at `rp` answers on the unit compiled into the library at
-/// `lp`, entered by name with nothing, binding no host, each within `timeout_ms` of wall clock, as
-/// parts each found: the answer as the run writes it, a `Bytes` holding what a build keeps its
-/// definition's value as, or none for a root that raised, ran out of time or is not in the unit.
-pub unsafe extern "C" fn rt_shipped_values(
-    ctx: *mut Ctx,
-    lp: Addr,
-    ln: I64,
-    rp: Addr,
-    rn: I64,
-    timeout_ms: I64,
-) -> TakenBytes {
-    shipping(ctx, "shipped_values", |c, _| {
-        let (Some(library), Some(roots)) = (text_at(c, lp, ln), texts_at(c, rp, rn)) else {
-            return TakenBytes(0);
-        };
-        let opened = match opened_unit(Path::new(&library)) {
-            Ok(opened) => opened,
-            Err(why) => {
-                c.fail(ply_core::Diagnostic::error(
-                    ply_core::codes::BACKEND_UNAVAILABLE,
-                    format!("the unit could not be loaded: {why}"),
-                ));
-                return TakenBytes(0);
-            }
-        };
-        let run = Run {
-            timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
-            ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
-        };
-        let answered = entry::on_program_thread(|| {
-            roots
-                .iter()
-                .map(|root| {
-                    let arguments = entry::NO_ARGUMENTS.to_vec();
-                    match entry::enter(&opened, root, arguments, &run, None, None).ended {
-                        Ended::Answered(bytes) => Some(bytes),
-                        _ => None,
-                    }
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_else(|| roots.iter().map(|_| None).collect());
-        let kept: Vec<Vec<u8>> = answered.into_iter().map(found).collect();
-        let kept: Vec<&[u8]> = kept.iter().map(Vec::as_slice).collect();
-        c.given(parts(&kept))
     })
 }
 

@@ -29,20 +29,53 @@ pub unsafe extern "C" fn rt_scheduler_left(ctx: *mut Ctx, was: Word) {
 }
 
 /// A read of the pure nullary definition at `index` in the unit's code table, which emitted code
-/// writes for a constant's read: its value's word form. The first read evaluates the definition and
-/// hands `keep`, the `keep#T` root of its type, the value, whose immortal copy the unit then keeps
-/// for good; each later read answers that copy. A value `keep` answers 0 for, one that may not
-/// outlive its entry, is kept nowhere, and each read evaluates the definition again. Where the
-/// evaluation fails or raises, this answers 0 with the context as the evaluation left it, and keeps
-/// nothing. Contexts reading one definition at once, on `parallel` branches or other threads, may
-/// each evaluate it; the first copy kept is the one every later read answers.
+/// writes for a plain definition's read: its value's word form. The first read evaluates the
+/// definition and hands `keep`, the `keep#T` root of its type, the value, whose immortal copy the
+/// unit then keeps for good; each later read answers that copy. A value `keep` answers 0 for, one
+/// that may not outlive its entry, is kept nowhere, and each read evaluates the definition again.
+/// Where the evaluation fails or raises, this answers 0 with the context as the evaluation left it,
+/// and keeps nothing. Contexts reading one definition at once, on `parallel` branches or other
+/// threads, may each evaluate it; the first copy kept is the one every later read answers.
 pub unsafe extern "C" fn rt_memo(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
-    let c = unsafe { &mut *ctx };
-    if let Ok(i) = usize::try_from(index.0)
-        && let Some(w) = c.tables.memoized(i)
-    {
+    if let Some(w) = memoized(unsafe { &*ctx }, index) {
         return Handed::of(w);
     }
+    unsafe { evaluated(ctx, index, keep) }
+}
+
+/// A read of the `const fn` at `index` in the unit's code table, as [`rt_memo`] reads a plain
+/// definition, but a raise that leaves the body fails the entry, so no handler around the read
+/// takes it: the definition's row says it raises nothing.
+pub unsafe extern "C" fn rt_const(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
+    if let Some(w) = memoized(unsafe { &*ctx }, index) {
+        return Handed::of(w);
+    }
+    let w = unsafe { evaluated(ctx, index, keep) };
+    let c = unsafe { &mut *ctx };
+    if c.failed == FAILED_PENDING {
+        if let Some(p) = c.pending.take() {
+            p.release();
+        }
+        c.failed = FAILED;
+        c.diagnostic = c.diagnostic.take().map(|d| {
+            d.note(
+                "a `const fn` must return a value: a raise that leaves its body ends the run, \
+                 and no handler around the read can catch it",
+            )
+        });
+    }
+    w
+}
+
+/// The value the unit kept of the definition at code-table index `index`, if it has.
+fn memoized(c: &Ctx, index: I64) -> Option<Word> {
+    c.tables.memoized(usize::try_from(index.0).ok()?)
+}
+
+/// The pure nullary definition at `index` evaluated, and its value kept for good through `keep`:
+/// the value, or 0 with the context failed.
+unsafe fn evaluated(ctx: *mut Ctx, index: I64, keep: KeepRoot) -> Handed {
+    let c = unsafe { &mut *ctx };
     let tables = Arc::clone(&c.tables);
     let Some(&code) = usize::try_from(index.0)
         .ok()
