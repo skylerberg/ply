@@ -138,11 +138,30 @@ fn relative(path: String) -> String / {toolchain.read, abort.raise} = {
   if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
 }
 
+/// Prints how many of a program's parts `objects` compiled, the cache holding the rest, and how long
+/// that took since `since`, when `phases` is on. `whose` names the program as its owner.
+fn compiled_timed(
+  phases: Bool,
+  whose: String,
+  objects: Result<cc::Objects, String>,
+  since: Int,
+) -> Unit / {process.err[proc], time.elapsed_ms} =
+  match objects {
+    Err(_) -> (),
+    Ok(o) ->
+      timed(
+        phases,
+        "compiled " ++ o.compiled.to_string() ++ " of " ++ whose ++ " " ++ o.paths.len().to_string()
+          ++ " parts",
+        since,
+      ),
+  }
+
 /// `objects` and the native `main` linked with the runtime's library into an executable: its path
 /// below the cache.
 fn linked(
   t: Toolchain,
-  objects: Result<List<String>, String>,
+  objects: Result<cc::Objects, String>,
   library: String,
   work: String,
 ) -> Result<String, List<Diag>> / {compilers.write[cc], toolchain.read, toolchain.write, abort.raise} =
@@ -151,7 +170,7 @@ fn linked(
     Ok(objects) -> match cc::executable[cc](
         t,
         native::main_c(),
-        objects,
+        objects.paths,
         [library].concat(toolchain.libraries()),
         work,
       ) {
@@ -344,8 +363,9 @@ fn builder_project() -> Project = {
 type Builder = { path: String, taken: Bool }
 
 /// The builder of the checkout's shipped modules on `runtime`, at `kept` below the cache: the one an
-/// earlier bootstrap kept there, or else built here and kept. A shipped module that did not move
-/// since this `ply` was built is answered by what this `ply` carries.
+/// earlier bootstrap kept there, or else built here and kept, printing how many of its parts were
+/// compiled where `phases` asks. A shipped module that did not move since this `ply` was built is
+/// answered by what this `ply` carries.
 fn builder_built(
   options: Options,
   t: Toolchain,
@@ -353,7 +373,8 @@ fn builder_built(
   files: List<Shipping>,
   kept: String,
   work: String,
-) -> Result<Builder, List<Diag>> / {Bootstraps, shipped.definitions, toolchain.bodies, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
+  phases: Bool,
+) -> Result<Builder, List<Diag>> / {Bootstraps, process.err[proc], shipped.definitions, toolchain.bodies, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
   let path = toolchain.cache() ++ "/" ++ kept;
   if toolchain.holds(kept) { Ok({ path: path, taken: true }) } else {
     let started = time.elapsed_ms();
@@ -384,19 +405,19 @@ fn builder_built(
         match ((held(front.dump, emission), entry_front(front.dump, entry))) {
           (Err(diags), _) -> Err(diags),
           (_, None) -> failed("the builder defines no `" ++ builder_entry() ++ "` to enter"),
-          (Ok(c), Some(carried)) -> match linked(
-              t,
-              cc::objects[cc](t, cc::split(c), native::native_flags(), work),
-              options.library,
-              work,
-            ) {
-            Err(diags) -> Err(diags),
-            Ok(exe) -> match packed_after(exe, packed_with(files, carried, [])) {
+          (Ok(c), Some(carried)) -> {
+            let compiling = time.elapsed_ms();
+            let objects = cc::objects[cc](t, cc::split(c), native::native_flags(), work);
+            compiled_timed(phases, "the builder's", objects, compiling);
+            match linked(t, objects, options.library, work) {
               Err(diags) -> Err(diags),
-              Ok(whole) -> if toolchain.moved(relative(whole), kept) {
-                Ok({ path: path, taken: false })
-              } else { failed("the builder could not be kept in the toolchain's cache") },
-            },
+              Ok(exe) -> match packed_after(exe, packed_with(files, carried, [])) {
+                Err(diags) -> Err(diags),
+                Ok(whole) -> if toolchain.moved(relative(whole), kept) {
+                  Ok({ path: path, taken: false })
+                } else { failed("the builder could not be kept in the toolchain's cache") },
+              },
+            }
           },
         }
       },
@@ -585,6 +606,7 @@ fn bootstrapped(
               identity_of(shipped.definitions(), builder_roots()),
             ),
             work,
+            phases,
           ) {
           Err(diags) -> Err(diags),
           Ok(builder) -> {
@@ -598,16 +620,14 @@ fn bootstrapped(
               Err(diags) -> Err(diags),
               Ok(made) -> {
                 timed(phases, "built `ply`", at);
-                let at = time.elapsed_ms();
-                match linked(
-                    t,
-                    cc::objects_kept[cc](t, made.sources, native::native_flags(), work),
-                    options.library,
-                    work,
-                  ) {
+                let compiling = time.elapsed_ms();
+                let objects = cc::objects_kept[cc](t, made.sources, native::native_flags(), work);
+                compiled_timed(phases, "`ply`'s", objects, compiling);
+                let linking = time.elapsed_ms();
+                match linked(t, objects, options.library, work) {
                   Err(diags) -> Err(diags),
                   Ok(exe) -> {
-                    timed(phases, "compiled and linked `ply`", at);
+                    timed(phases, "linked `ply`", linking);
                     finished(options, files, keys, made, exe, work, phases)
                   },
                 }
