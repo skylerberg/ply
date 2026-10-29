@@ -14,7 +14,7 @@ import compiler.check.typed (BodyPart, TypedPattern, TypedParam, TypedFieldPatte
                              TypedCall, TypedIf, TypedMatch, TypedBlock, TypedList, TypedRecord,
                              TypedUpdate, TypedFieldRead, TypedPerform, TypedLambda, TypedSimulate,
                              TypedParallel, TypedHandle, TypedLet, TypedLetElse, TypedDo,
-                             TypedAssign)
+                             TypedAssign, TypedRelease, release_placed)
 import std.list
 
 /// One node: what it is, where its text stands, and its type.
@@ -78,9 +78,9 @@ pub type WalkedArm = {
 }
 
 pub type WalkedStmt =
-  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span, pat_span: Span })
+  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
-  | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span, pat_span: Span })
+  | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span })
   | WalkedDo(Walked)
   /// `name = value;`: a clause giving its handler's variable a new value.
   | WalkedAssign({ name: Bytes, value: Walked, span: Span })
@@ -192,10 +192,9 @@ pub fn let_of(
   pat: Option<TypedPattern<Type>>,
   value: Option<Walked>,
   span: Span,
-  pat_span: Span,
 ) -> Option<WalkedStmt> =
   match ((pat, value)) {
-    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span, pat_span: pat_span })),
+    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span })),
     _ -> None,
   }
 
@@ -204,11 +203,10 @@ pub fn let_else_of(
   value: Option<Walked>,
   fallback: Option<Walked>,
   span: Span,
-  pat_span: Span,
 ) -> Option<WalkedStmt> =
   match ((pat, value, fallback)) {
     (Some(p), Some(v), Some(f)) ->
-      Some(WalkedLetElse({ pat: p, value: v, fallback: f, span: span, pat_span: pat_span })),
+      Some(WalkedLetElse({ pat: p, value: v, fallback: f, span: span })),
     _ -> None,
   }
 
@@ -516,7 +514,8 @@ pub fn walked_nodes(e: Walked) -> List<Walked> = {
 /// atom; `read` settles a read, none where it cannot be; `witness` names the type parameter whose
 /// witness does an operator over an operand of a type, none where no constraint makes one; `copies`
 /// reads the fields an update of a base of the settled type copies, those `sets` writes left out,
-/// none where the type is no record's; and `span` counts a place from where the body's item starts.
+/// none where the type is no record's; `span` counts a place from where the body's item starts; and
+/// `released` reads what the ownership walk lets go at the node at a site.
 pub type Settling = {
   ty: (Type) -> Type / {abort.raise},
   witness: (Type) -> Option<Bytes> / {abort.raise},
@@ -525,12 +524,19 @@ pub type Settling = {
   read: (WalkedReading) -> Option<Reading<Type>> / {abort.raise},
   copies: (Type, List<Bytes>) -> Option<List<Bytes>> / {abort.raise},
   span: (Span) -> Span,
+  released: (Int) -> List<TypedRelease>,
 }
 
 /// The typed tree of `e`, settled as `s` settles it; none where a part cannot be.
 pub fn settled(e: Walked, s: Settling) -> Option<TypedExpr<Type>> / {abort.raise} =
   match settled_node(e.node, s) {
-    Some(n) -> Some({ node: n, span: (s.span)(e.span), ty: (s.ty)(e.ty) }),
+    Some(n) ->
+      Some({
+        node: n,
+        span: (s.span)(e.span),
+        ty: (s.ty)(e.ty),
+        releases: (s.released)(e.span.site).map(|x: TypedRelease| release_placed(x, s.span)),
+      }),
     None -> None,
   }
 
@@ -595,14 +601,7 @@ fn settled_stmt(stmt: WalkedStmt, s: Settling) -> Option<TypedStmt<Type>> / {abo
   match stmt {
     WalkedLet(l) -> match settled(l.value, s) {
       Some(v) ->
-        Some(
-          TypedLet({
-            pat: settled_pattern(l.pat, s),
-            value: v,
-            span: (s.span)(l.span),
-            pat_span: (s.span)(l.pat_span),
-          }),
-        ),
+        Some(TypedLet({ pat: settled_pattern(l.pat, s), value: v, span: (s.span)(l.span) })),
       None -> None,
     },
     WalkedLetElse(l) -> match ((settled(l.value, s), settled(l.fallback, s))) {

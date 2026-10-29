@@ -9,8 +9,8 @@ import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
 import std.bin
 import std.list
 
-/// One node: what it is, where its text stands, and its type.
-pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t }
+/// One node: what it is, where its text stands, its type, and what the check lets go there.
+pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t, releases: List<TypedRelease> }
 
 pub type TypedNode<t> =
   | TypedLit(Lit)
@@ -88,9 +88,35 @@ pub type TypedPattern<t> =
 
 pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
 
+/// A value a release lets go of at a node, and where it runs.
+pub type TypedRelease = { held: Holder, place: ReleasePlace }
+
+/// What holds a value a release lets go of: the binder written at the span, or, where no binder
+/// holds it, the node at the site that made it.
+pub type Holder = | HeldByBinder(Span) | HeldByNode(Int)
+
+/// Where a release runs, by its node: after the node runs; before it, where the node is the last of
+/// its scope and does not name what is let go, so a tail call there stays a loop; where a raise, a
+/// clause that does not resume, or a cancel unwinds through the node, a call or a perform; where the
+/// pattern a `let` matches the node's value against misses; or where the release of what the
+/// payload names at the node fails, which unwinds from there.
+pub type ReleasePlace =
+  | ReleaseAfter
+  | ReleaseBefore
+  | ReleaseUnwinding
+  | ReleaseMissing
+  | ReleaseFailing(Holder)
+
+/// The key a walk follows the binder spelled at `span` by: its place in the text, negated so no
+/// node's site is one, as a binder keeps no site of its own.
+pub fn binder_key(span: Span) -> Int = 0 - span.start - 1
+
+/// The key a walk follows what `h` names by.
+pub fn holder_key(h: Holder) -> Int =
+  match h { HeldByBinder(span) -> binder_key(span), HeldByNode(site) -> site }
+
 pub type TypedStmt<t> =
-  /// `pat_span` is where the pattern is written, where what a miss lets go of is let go.
-  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span, pat_span: Span })
+  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
   | TypedDo(TypedExpr<t>)
@@ -165,6 +191,12 @@ derive bin for TypedBody
 
 derive bin for TypedExpr
 
+derive bin for TypedRelease
+
+derive bin for Holder
+
+derive bin for ReleasePlace
+
 derive bin for TypedNode
 
 derive bin for Reading
@@ -233,9 +265,9 @@ pub fn typed_nodes<t>(e: TypedExpr<t>) -> List<TypedExpr<t>> = {
   })
 }
 
-/// `e` with `f` applied to each node's own part after its parts: the nodes a walk reaches, which
-/// `typed_nodes` lists.
-pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> TypedExpr<t> = {
+/// `e` with `f` applied to each node after its parts: the nodes a walk reaches, which `typed_nodes`
+/// lists.
+pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedExpr<t>) -> TypedExpr<t>) -> TypedExpr<t> = {
   let go = |x: TypedExpr<t>| nodes_mapped(x, f);
   let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> Some(go(y)), None -> None };
   let field = |x: TypedField<t>| { name: x.name, value: go(x.value) };
@@ -280,8 +312,12 @@ pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> Ty
         ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
       }),
   };
-  { ..e, node: f(node) }
+  f({ ..e, node: node })
 }
+
+/// `b` as a reader of its values reads it, which no release changes: with nothing let go.
+pub fn unreleased<t>(b: TypedBody<t>) -> TypedBody<t> =
+  { ..b, body: nodes_mapped(b.body, |e: TypedExpr<t>| { ..e, releases: [] }) }
 
 /// `b` as a reader that draws every type parameter as `Int` reads it: with no witness passed or
 /// taken, each operator its operands' own.
@@ -289,13 +325,16 @@ pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
   {
     ..b,
     params: b.params.filter(|p: TypedParam<t>| !p.name.starts_with(witness_param(b""))),
-    body: nodes_mapped(b.body, |n: TypedNode<t>|
-      match n {
-        TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
-        TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
-        TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
-        TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
-        _ -> n,
+    body: nodes_mapped(b.body, |e: TypedExpr<t>|
+      {
+        ..e,
+        node: match e.node {
+          TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
+          TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
+          TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
+          TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
+          n -> n,
+        },
       }),
   }
 
@@ -321,7 +360,24 @@ pub fn retyped<a, b, s>(
 ) -> Retyped<TypedExpr<b>, s> / {abort.raise} = {
   let node = retyped_node(e.node, state, r);
   let t = (r.ty)(e.ty, node.state);
-  { out: { node: node.out, span: (r.span)(e.span), ty: t.ty }, state: t.state }
+  {
+    out: {
+      node: node.out,
+      span: (r.span)(e.span),
+      ty: t.ty,
+      releases: e.releases.map(|x: TypedRelease| release_placed(x, r.span)),
+    },
+    state: t.state,
+  }
+}
+
+/// `x` with the binder it names, if any, placed as `place` places it.
+pub fn release_placed(x: TypedRelease, place: (Span) -> Span) -> TypedRelease = {
+  let held = |h: Holder| match h { HeldByBinder(span) -> HeldByBinder(place(span)), _ -> h };
+  {
+    held: held(x.held),
+    place: match x.place { ReleaseFailing(h) -> ReleaseFailing(held(h)), p -> p },
+  }
 }
 
 /// `b` with every type written as `r` writes it.
@@ -540,15 +596,7 @@ fn retyped_stmt<a, b, s>(
     TypedLet(l) -> {
       let p = retyped_pattern(l.pat, state, r);
       let v = retyped(l.value, p.state, r);
-      {
-        out: TypedLet({
-          pat: p.out,
-          value: v.out,
-          span: (r.span)(l.span),
-          pat_span: (r.span)(l.pat_span),
-        }),
-        state: v.state,
-      }
+      { out: TypedLet({ pat: p.out, value: v.out, span: (r.span)(l.span) }), state: v.state }
     },
     TypedLetElse(l) -> {
       let p = retyped_pattern(l.pat, state, r);
