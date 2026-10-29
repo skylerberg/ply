@@ -53,6 +53,7 @@ import compiler.check.infer.derivability (HoldsFunction, HoldsHandle, Unconstrai
 import compiler.expand.rewrite.shared (count_in)
 import std.bytes
 import std.bytes (ascii_of_int)
+import std.list (zip)
 import std.option
 import std.prelude_source
 import std.string
@@ -89,7 +90,9 @@ import compiler.check.infer.expr (site_for, resolved_sites, site_among, report_u
                                   hint_of, infer_whole, rows_in, scales_like, tag_rule,
                                   settle_updates, group_member, expect_met, refuse_growth, Taken,
                                   written_as, as_written, holds_fn, atom_written, numeric_of,
-                                  ordered_vars, resolve_op)
+                                  ordered_vars, resolve_op, body_filed)
+import compiler.check.typed (WholeBody, ClauseBody, MeasureBody, TestRun, CaseListing, LawGuard,
+                             LawBody, TypedParam)
 import compiler.check.owned
 import compiler.check.owned (Taking)
 import compiler.check.infer.resources (resource_type, release_atoms)
@@ -2071,7 +2074,19 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
       ..c,
       env: env_bind(c.env, def.params.get(i).name.name, monomorphic(signature.params.get(i))),
     });
-  let body: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
+  let walked: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
+  let body: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      bound.walking,
+      WholeBody,
+      def.span.start,
+      params_typed_as(def.params, signature.params),
+      walked,
+      def.body,
+    ),
+  };
   let checked: Checker = expect_met(
     body.checker,
     expr_span(def.body),
@@ -3409,7 +3424,26 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                     ),
                   },
               };
-              let o: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
+              let ran: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
+              let o: Inferred = {
+                ..ran,
+                checker: body_filed(
+                  ran.checker,
+                  owner,
+                  TestRun,
+                  def.span.start,
+                  match def.cases {
+                    None -> [],
+                    Some(_) ->
+                      [
+                        { name: case_at(), ty: int_type(), span: dummy_span() },
+                        { name: case_identity(), ty: bytes_type(), span: dummy_span() },
+                      ],
+                  },
+                  ran,
+                  test_run(def),
+                ),
+              };
               let judged = owned_judged(
                 o.checker,
                 { resource: |t: Type| resource_type(o.checker, [], t), owner: owner },
@@ -3496,7 +3530,15 @@ fn tail_value(expr: Expr) -> Expr =
 /// and the label may raise, and perform nothing else.
 fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
   let o: Inferred = infer_whole(checker, test_listing(cases), hint_of(listing_ty()));
-  let c = o.checker;
+  let c = body_filed(
+    o.checker,
+    checker.walking,
+    CaseListing,
+    def.span.start,
+    [],
+    o,
+    test_listing(cases),
+  );
   match run_needs(resolve_row_in(c, o.row).atoms).at(0) {
     None -> c,
     Some(atom) ->
@@ -3707,9 +3749,23 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       ..note_typed(c, def.binders.get(i).span, types.tys.get(i), []),
       env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
     });
+  let binders_typed = zip(def.binders, types.tys).map(|b: { first: Binder, second: Type }|
+    { name: b.first.name.name, ty: b.second, span: b.first.name.span });
   let guarded: Checker = match def.guard {
     Some(g) -> {
-      let o: Inferred = infer_whole({ ..bound, performs: [] }, g);
+      let walked: Inferred = infer_whole({ ..bound, performs: [] }, g);
+      let o: Inferred = {
+        ..walked,
+        checker: body_filed(
+          walked.checker,
+          bound.walking,
+          LawGuard,
+          def.span.start,
+          binders_typed,
+          walked,
+          g,
+        ),
+      };
       let c: Checker = unfilled(
         expect(
           o.checker,
@@ -3725,7 +3781,19 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     },
     None -> bound,
   };
-  let body: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
+  let walked: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
+  let body: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      guarded.walking,
+      LawBody,
+      def.span.start,
+      binders_typed,
+      walked,
+      def.body,
+    ),
+  };
   let stated: Checker = expect(
     body.checker,
     expr_span(def.body),
@@ -4395,7 +4463,7 @@ pub fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               { checker: shadowed, specs: [] },
               |acc: { checker: Checker, specs: List<SpecInfo> }, i: Int| {
                 let clause = def.spec.get(i);
-                let o: WithAtoms = check_clause(acc.checker, def, clause, env);
+                let o: WithAtoms = check_clause(acc.checker, def, clause, i, env);
                 {
                   checker: o.checker,
                   specs: acc.specs.push({
@@ -4451,16 +4519,33 @@ fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abor
     })
 }
 
+/// `params` at the types `types` gives them, in order.
+fn params_typed_as(params: List<Param>, types: List<Type>) -> List<TypedParam<Type>> =
+  zip(params, types).map(|p: { first: Param, second: Type }|
+    { name: p.first.name.name, ty: p.second, span: p.first.name.span })
+
 fn check_measure(
   checker: Checker,
   def: FnDef,
   expr: Expr,
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
-  let o: Inferred = infer_whole(
+  let walked: Inferred = infer_whole(
     { ..spec_scope(checker, def, env), walking: unlowered(env.name) },
     expr,
   );
+  let o: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      env.name,
+      MeasureBody,
+      def.span.start,
+      params_typed_as(def.params, env.params),
+      walked,
+      expr,
+    ),
+  };
   let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), walking: checker.walking };
   let c1: Checker = expect(
     popped,
@@ -4482,6 +4567,7 @@ fn check_clause(
   checker: Checker,
   def: FnDef,
   clause: SpecClause,
+  index: Int,
   env: SpecEnv,
 ) -> WithAtoms / {abort.raise} = {
   let bound: Checker = spec_scope(checker, def, env);
@@ -4498,8 +4584,20 @@ fn check_clause(
     SSpace -> named(def.params.map(|param: Param| param.space)),
     SCost -> named(def.params.map(|param: Param| param.cost)),
   };
+  let ints = |names: List<Option<Ident>>|
+    names.fold([], |acc: List<TypedParam<Type>>, name: Option<Ident>|
+      match name {
+        Some(k) -> acc.push({ name: k.name, ty: int_type(), span: k.span }),
+        None -> acc,
+      });
+  let clause_params = params_typed_as(def.params, env.params).concat(match clause.kind {
+    SEnsures -> [{ name: result_name(), ty: env.ret, span: dummy_span() }],
+    SRequires -> [],
+    SSpace -> ints(def.params.map(|param: Param| param.space)),
+    SCost -> ints(def.params.map(|param: Param| param.cost)),
+  });
   let outer = with_result.spec_kind;
-  let o: Inferred = infer_whole(
+  let walked: Inferred = infer_whole(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
@@ -4509,6 +4607,18 @@ fn check_clause(
     },
     clause.expr,
   );
+  let o: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      env.name,
+      ClauseBody(index),
+      def.span.start,
+      clause_params,
+      walked,
+      clause.expr,
+    ),
+  };
   let popped: Checker = {
     ..o.checker,
     spec_kind: outer,

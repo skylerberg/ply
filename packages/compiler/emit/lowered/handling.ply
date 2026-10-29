@@ -6,28 +6,29 @@ import std.list
 import std.bytes (ascii_of_int)
 import compiler.emit.reps
 import compiler.emit.reps (Ctors, Def, no_ctors, gathered_of)
-import compiler.emit.code (Code, NHandle, NBlock, NApp, NLambda, NVar, NLit, NIf, NMatch, NRecord,
-                           NField, NBinary, Lambda, Capture, CodeClause, CodeReturn, CodeArm,
-                           CodeStmt, CLet, CDo, CodeField)
+import compiler.emit.code (Code, NBuiltin, NHandle, NBlock, NApp, NLambda, NDef, NLit, NIf, NMatch,
+                           NRecord, NField, NBinary, Lambda, Capture, CodeHandle, CodeClause,
+                           CodeArm, CodeStmt, CLet, CDo, CodeField, read_name, code_parts)
 import compiler.syntax.parsing (Span, span_between)
 import compiler.syntax.patterns (LBytes)
 import compiler.check.resolve.tables (qualify)
-import compiler.check.types (Type, TyCon, TyVar, TyRecord, Atom, RSingleton, fn_type, row_empty,
-                             fields_sorted, list_type, int_type, bytes_type, unit_type, option_type,
-                             bool_type, string_type, float_type, decimal_type, map_type)
+import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, Row, RSingleton, fn_type,
+                             row_empty, fields_sorted, list_type, int_type, bytes_type, unit_type,
+                             option_type, bool_type, string_type, float_type, decimal_type,
+                             map_type)
 import compiler.check.known (char_type, width_type, chan_type, task_type, array_type, columns_type,
                              list_node_type)
 import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Written, Lower, Lift, Dup, Worded, Contained, Root,
-                           root_name, root_text, op_name)
+import compiler.emit.keys (RootKey, Named, Written, Lower, Lift, Keeping, Opening, Dup, Worded,
+                           Contained, Root, root_name, root_text, op_name)
 import compiler.emit.pieces (spelled)
 import compiler.emit.evidence (evidence_type)
 import compiler.emit.tir (handed_of, all_given, Rep, RInt, RWord, RUnit, RImm, RAddr, Var, Arg,
                           AVar, AInt, AZero, Prim, Pack, Make, MClosure, Op, OHandle, OContainer,
                           Uses, Inst, Let, Do, Assign, Return, Handle, Fn, Rooted, Given, Owned,
                           RFlat, Leaf, Get, Path, PLeaf, PField, PPayload, Closure, Decl, Native,
-                          Call, Val, Handed, Static, no_links, rep_of_arg)
+                          Call, Val, Handed, no_links, rep_of_arg)
 import compiler.emit.tir
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label, Parallel, SiteHere,
@@ -35,15 +36,14 @@ import compiler.emit.tir.handling (HandleOp, HandleSite, Clause, Perform, Label,
                                    InstanceIn, Bridge, Answering, Keyed, Answers, Resumes, Stops,
                                    Forwarded, Returning, VarInit, VarRead, VarWrite, raised_at,
                                    task_at)
-import compiler.emit.typing (Typed)
-import compiler.check.infer.checker (FiledRows, RowArguments, Performs, prelude_effects, EffectInfo,
-                                     OpInfo)
+import compiler.emit.typing (Typed, unknown_type)
+import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, Builtin, builtins)
 import compiler.check.infer.expr (crossing_vars)
-import compiler.syntax.exprs (crossing_operations, task_operations, scheduler_module)
+import compiler.syntax.exprs (crossing_operations, task_operations, scheduler_module, prelude_own)
 import compiler.emit.answer (Need, Exact, GenericCall)
 import compiler.emit.lower.setting (Root, prelude_ctor)
 import compiler.emit.lower.held (held_as)
-import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, none_held)
+import compiler.emit.lower.base (Context, Lowering, started, emitted, opened, none_held, read_typed)
 import compiler.emit.lower.calling (context_of)
 import compiler.emit.lower.handling (label, clause_frame, body_frame, handled, branched,
                                      handle_planned, detaches)
@@ -77,6 +77,10 @@ fn place() -> Span = span_between(3, 9)
 
 fn nowhere() -> Span = span_between(0, 0)
 
+/// A read of builtin `name` at no type arguments, which a crossing types by its operands.
+fn bare_read(name: Bytes) -> Code =
+  { node: NBuiltin({ name: name, args: [], rows: [] }), span: nowhere(), ty: unknown_type() }
+
 /// The context root `m.<name>` of `p` is lowered in, and its body.
 fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> / {abort.raise} =
   p.roots.fold(None, |acc: Option<{ cx: Context, code: Code }>, r: Root|
@@ -88,19 +92,14 @@ fn rooted(p: Program, name: Bytes) -> Option<{ cx: Context, code: Code }> / {abo
     })
 
 /// The `handle` root `m.<name>` of `p` is, and the context it is lowered in.
-fn handle_at(
-  p: Program,
-  name: Bytes,
-) -> Option<{ cx: Context, h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> } }> / {abort.raise} =
+fn handle_at(p: Program, name: Bytes) -> Option<{ cx: Context, h: CodeHandle }> / {abort.raise} =
   match rooted(p, name) {
     None -> None,
     Some(r) -> match handle_of(r.code) { Some(h) -> Some({ cx: r.cx, h: h }), None -> None },
   }
 
 /// The `handle` `c` is, or ends in.
-fn handle_of(
-  c: Code,
-) -> Option<{ body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> }> =
+fn handle_of(c: Code) -> Option<CodeHandle> =
   match c.node {
     NHandle(h) -> Some(h),
     NBlock(b) -> match b.tail {
@@ -526,7 +525,7 @@ test "a clause resuming off its tail runs the handle's body detached, copying in
   match program_of(handles()) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      let planned = |g: { cx: Context, h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> } }|
+      let planned = |g: { cx: Context, h: CodeHandle }|
         handle_planned(g.cx, started([]), g.h, place());
       let frame_of = |name: Bytes|
         match handle_at(p, name) {
@@ -661,7 +660,7 @@ test "a place an operation's own type parameter stands at crosses carried, which
       let marked = |op: keys::TypeOp, t: Type, marks: List<Int>|
         keys::marked(keys::written(op, t, b"m"), marks);
       let names = |k: RootKey|
-        named_calls(written_at(p.setting.ctors, k).code, written_at(p.setting.ctors, k).typed).map(
+        named_calls(written_at(p.setting.ctors, k).code).map(
           |c: { name: Bytes, filed: Option<Typed> }|
             { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } },
         );
@@ -675,7 +674,7 @@ test "a place an operation's own type parameter stands at crosses carried, which
       );
       assert(
         names(marked(Lower, list_type(int), [1])).any(|c: { name: Bytes, at: List<Type> }|
-          c.name == b"lower_items#List<Int>^1"),
+          c.name == b"m.lower_items#List<Int>^1"),
       )
     },
   }
@@ -1930,7 +1929,7 @@ test "an encoding opens a lowering, hands the value to its type's root as the ro
       Some(r) -> {
         let start = params_of(r.cx);
         let s = start.vars.get(0);
-        let l = crossed(r.cx, start.st, b"?encode", [AVar(s)], nowhere(), place());
+        let l = crossed(r.cx, start.st, b"?encode", [AVar(s)], bare_read(b"?encode"), place());
         assert_eq(crossed_parts(l.st.insts), [
           b"builtin_elaborated_lower_open_p",
           b"m.lower#String",
@@ -1942,7 +1941,7 @@ test "an encoding opens a lowering, hands the value to its type's root as the ro
         ]);
         assert_eq(match l.arg { AVar(v) -> v.ty, _ -> int_type() }, bytes_type());
         // Decoding opens a lifting over the bytes' address and count and asks the type's root.
-        let back = crossed(r.cx, l.st, b"?decode", [l.arg], nowhere(), place());
+        let back = crossed(r.cx, l.st, b"?decode", [l.arg], bare_read(b"?decode"), place());
         assert_eq(crossed_parts(back.st.insts.drop(l.st.insts.len())), [
           b"payload",
           b"length",
@@ -1980,7 +1979,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
           start.st,
           b"?out_str",
           [AVar(start.vars.get(0))],
-          nowhere(),
+          bare_read(b"?out_str"),
           place(),
         );
         assert_eq(crossed_parts(text.st.insts).take(3), [
@@ -1996,7 +1995,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
           start.st,
           b"?out_float",
           [AVar(start.vars.get(1))],
-          nowhere(),
+          bare_read(b"?out_float"),
           place(),
         );
         assert_eq(crossed_parts(float.st.insts).take(2), [
@@ -2011,7 +2010,7 @@ test "a crossing native is handed machine words: a string as its bytes' address 
           start.st,
           b"?out_int",
           [AVar(start.vars.get(2))],
-          nowhere(),
+          bare_read(b"?out_int"),
           place(),
         );
         assert_eq(natives(int.st.insts), [{ name: b"builtin_elaborated_out_int_p", reps: [RInt] }])
@@ -2028,7 +2027,7 @@ test "an `assert_eq` at a type left open is the specialisations' to settle" {
       Some(r) -> match r.code.node {
         NApp(a) -> {
           let start = params_of(r.cx);
-          let l = builtin(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func.span, place());
+          let l = builtin(r.cx, start.st, b"assert_eq", start.vars.map(AVar), a.func, place());
           assert_eq(crossed_parts(l.st.insts), [b"unsettled assert_eq"]);
           assert(l.st.links.needs.any(|n: Need| n.reads == Exact));
           // A form holding it that leaks past its specialisations fails where it is printed.
@@ -2053,43 +2052,54 @@ fn call_args(text: Bytes, f: Bytes) -> List<List<Bytes>> / {abort.raise} =
 
 /// Every call a crossing root's code makes by name, each with what is filed where its name is
 /// written.
-fn named_calls(c: Code, typed: Map<Int, Typed>) -> List<{ name: Bytes, filed: Option<Typed> }> =
+fn named_calls(c: Code) -> List<{ name: Bytes, filed: Option<Typed> }> =
   match c.node {
     NApp(a) -> {
       let inner = a.args.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, x: Code|
-        acc.concat(named_calls(x, typed)));
-      match a.func.node {
-        NVar(v) -> if v.slot == None {
-          [{ name: v.name, filed: typed.get(a.func.span.site) }].concat(inner)
-        } else { inner },
-        _ -> inner,
+        acc.concat(named_calls(x)));
+      match read_name(a.func) {
+        Some(n) -> [{ name: n, filed: Some(read_typed(a.func)) }].concat(inner),
+        None -> inner,
       }
     },
     NBlock(b) ->
       b.stmts.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, s: CodeStmt|
         acc.concat(match s {
-          CLet(l) -> named_calls(l.value, typed),
-          CDo(d) -> named_calls(d.code, typed),
+          CLet(l) -> named_calls(l.value),
+          CDo(d) -> named_calls(d.code),
           _ -> [],
-        })).concat(match b.tail { Some(t) -> named_calls(t, typed), None -> [] }),
+        })).concat(match b.tail { Some(t) -> named_calls(t), None -> [] }),
     NIf(x) ->
-      named_calls(x.cond, typed).concat(named_calls(x.then_branch, typed)).concat(
-        named_calls(x.else_branch, typed),
-      ),
+      named_calls(x.cond).concat(named_calls(x.then_branch)).concat(named_calls(x.else_branch)),
     NMatch(m) ->
       m.arms.fold(
-        named_calls(m.scrutinee, typed),
+        named_calls(m.scrutinee),
         |acc: List<{ name: Bytes, filed: Option<Typed> }>, arm: CodeArm|
-          acc.concat(named_calls(arm.body, typed)),
+          acc.concat(named_calls(arm.body)),
       ),
     NRecord(r) ->
       r.fields.fold([], |acc: List<{ name: Bytes, filed: Option<Typed> }>, f: CodeField|
-        acc.concat(named_calls(f.value, typed))),
-    NField(f) -> named_calls(f.base, typed),
-    NBinary(b) -> named_calls(b.lhs, typed).concat(named_calls(b.rhs, typed)),
-    NLambda(l) -> named_calls(l.body, typed),
+        acc.concat(named_calls(f.value))),
+    NField(f) -> named_calls(f.base),
+    NBinary(b) -> named_calls(b.lhs).concat(named_calls(b.rhs)),
+    NLambda(l) -> named_calls(l.body),
     _ -> [],
   }
+
+/// Each read of a definition, a constructor or a builtin `c` makes, in order.
+fn reads_in(c: Code) -> List<Code> =
+  match read_name(c) {
+    Some(_) -> [c],
+    None -> code_parts(c).fold([], |acc: List<Code>, x: Code| acc.concat(reads_in(x))),
+  }
+
+/// Each lambda `c` writes, in order.
+fn lambdas_in(c: Code) -> List<Lambda> =
+  code_parts(c).fold(match c.node { NLambda(l) -> [l], _ -> [] }, |acc: List<Lambda>, x: Code|
+    acc.concat(lambdas_in(x)))
+
+/// The rows a read of a definition fills its row variables with.
+fn rows_filled(c: Code) -> List<Row> = match c.node { NDef(d) -> d.rows, _ -> [] }
 
 /// The byte strings `c` writes literally, in order: the names a crossing root writes.
 fn literal_bytes(c: Code) -> List<Bytes> =
@@ -2164,7 +2174,7 @@ test "an entry reads its arguments from the runtime's lifting, ends it, and writ
   {
     let code = e.code;
     assert_eq(
-      named_calls(code, e.typed).map(|c: { name: Bytes, filed: Option<Typed> }|
+      named_calls(code).map(|c: { name: Bytes, filed: Option<Typed> }|
         { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } }),
       [
         { name: b"?in_count", at: [] },
@@ -2173,7 +2183,7 @@ test "an entry reads its arguments from the runtime's lifting, ends it, and writ
         { name: b"?lift", at: [int_type()] },
         { name: b"?lift_close", at: [] },
         { name: b"?lower", at: [int_type()] },
-        { name: b"held", at: [] },
+        { name: b"m.held", at: [] },
       ],
     );
     assert_eq(e.params, []);
@@ -2196,8 +2206,9 @@ test "a generic definition's entry calls it as any caller does, at an Int for ea
   {
     let code = e.code;
     assert(
-      named_calls(code, e.typed).any(|c: { name: Bytes, filed: Option<Typed> }|
-        c.name == b"first" && (match c.filed { Some(t) -> t.args == [int_type()], None -> false })),
+      named_calls(code).any(|c: { name: Bytes, filed: Option<Typed> }|
+        c.name == b"m.first"
+          && (match c.filed { Some(t) -> t.args == [int_type()], None -> false })),
       None,
     );
     assert(!e.here.any(|d: Def| d.name == b"first"), None)
@@ -2219,14 +2230,14 @@ test "an entry of a definition generic over a row calls it as any caller does, a
   {
     let code = e.code;
     assert(
-      named_calls(code, e.typed).any(|c: { name: Bytes, filed: Option<Typed> }| c.name == b"none"),
+      named_calls(code).any(|c: { name: Bytes, filed: Option<Typed> }| c.name == b"m.none"),
       None,
     );
     // The call fills the row with nothing, so the entry's body performs nothing.
-    assert_eq(e.rows.fold([], |acc: List<FiledRows>, _: Int, r: FiledRows| acc.push(r)), [
-      RowArguments([row_empty()]),
-      Performs(row_empty()),
+    assert_eq(reads_in(code).filter(|r: Code| read_name(r) == Some(b"m.none")).map(rows_filled), [
+      [row_empty()],
     ]);
+    assert_eq(e.performs, row_empty());
     assert(!e.here.any(|d: Def| d.name == b"none"), None)
   }
 }
@@ -2249,7 +2260,7 @@ test "an entry under real handlers hands each a closure over the call inside it,
   {
     let code = e.code;
     assert_eq(
-      named_calls(code, e.typed).map(|c: { name: Bytes, filed: Option<Typed> }|
+      named_calls(code).map(|c: { name: Bytes, filed: Option<Typed> }|
         { name: c.name, at: match c.filed { Some(t) -> t.args, None -> [] } }),
       [
         { name: b"?in_count", at: [] },
@@ -2258,13 +2269,12 @@ test "an entry under real handlers hands each a closure over the call inside it,
         { name: b"?lower", at: [int_type()] },
         { name: b"std.a.a::served", at: [int_type()] },
         { name: b"std.b.b::served", at: [int_type()] },
-        { name: b"main", at: [] },
+        { name: b"m.main", at: [] },
       ],
     );
-    // Each closure is filed as what a real handler takes: nothing, answering what the root does.
+    // Each closure is what a real handler takes: nothing, answering what the root does.
     assert_eq(
-      e.typed.fold(0, |n: Int, _: Int, t: Typed|
-        if t.ty == fn_type([], int_type(), row_empty()) { n + 1 } else { n }),
+      lambdas_in(code).filter(|l: Lambda| TyFn(l.ty) == fn_type([], int_type(), row_empty())).len(),
       2,
     )
   }
@@ -2291,24 +2301,18 @@ test "an entry holds words for what its real handlers leave and add, and each cl
   );
   {
     let code = e.code;
-    assert_eq(
-      e.rows.get(code.span.site),
-      Some(
-        Performs({
-          atoms: [atom(b"m.log", MWrite), atom(b"abort", MRaise), atom(b"std.fs.fs", MRead)],
-          tail: None,
-        }),
-      ),
-    );
+    assert_eq(e.performs, {
+      atoms: [atom(b"m.log", MWrite), atom(b"abort", MRaise), atom(b"std.fs.fs", MRead)],
+      tail: None,
+    });
     // The closure `std.a.a`'s handler runs performs what `std.b.b`'s adds.
     assert(
-      e.rows.fold(false, |found: Bool, _: Int, r: FiledRows|
-        found
-          || r
-          == Performs({
+      lambdas_in(code).any(|l: Lambda|
+        l.row
+          == {
             atoms: [atom(b"std.a.a", MRead), atom(b"m.log", MWrite), atom(b"abort", MRaise)],
             tail: None,
-          })),
+          }),
       None,
     )
   }
@@ -2347,6 +2351,17 @@ test "a written root calls only crossing builtins, what it files a type for, and
         acc.concat([Lower, Lift].map(|op: keys::TypeOp| keys::written(op, t, b"m")))).concat(
         [list_type(int_type()), array, map].fold([], |acc: List<RootKey>, t: Type|
           acc.concat(container_defs(b"m", t).map(|d: Def| d.root))),
+      ).concat(
+        // A container a perform hands its operation's own type parameter in, kept and opened item by
+        // item: a list at its item, a map at its value.
+        [
+          { ty: list_type(int_type()), at: 1 },
+          { ty: map_type(string_type(), int_type()), at: 2 },
+        ].fold([], |acc: List<RootKey>, m: { ty: Type, at: Int }|
+          acc.concat(
+            [Keeping, Opening].map(|op: keys::TypeOp|
+              keys::marked(keys::written(op, m.ty, b"m"), [m.at])),
+          )),
       );
       // The loops the roots call are roots of their own.
       let roots = asked.fold([], |acc: List<{ key: RootKey, root: WrittenRoot }>, k: RootKey| {
@@ -2361,23 +2376,23 @@ test "a written root calls only crossing builtins, what it files a type for, and
       let externs = prelude_externs().map(|e: Extern| e.name);
       let faults = roots.fold([], |acc: List<Bytes>, r: { key: RootKey, root: WrittenRoot }| {
         let code = r.root.code;
-        named_calls(code, r.root.typed).fold(
-          acc,
-          |a: List<Bytes>, call: { name: Bytes, filed: Option<Typed> }| {
-            let local = r.root.here.any(|d: Def| d.name == call.name);
-            // A part lowered or lifted is filed at its type; the emitter's other builtins are
-            // settled by their operands.
-            let generated = call.name.starts_with(b"?")
-              && (!crossing_key(r.key) || crossing_builtin(call.name))
-              && ((call.name != b"?lower" && call.name != b"?lift")
-              || (match call.filed { Some(t) -> t.args.len() == 1, None -> false }));
-            let prelude = call.filed != None
-              && (ctor_spelled(call.name) || externs.contains(call.name)
-              || written_code().calls.concat(written_code().lifts).contains(call.name));
-            if local || generated || prelude { a }
-            else { a.push(Bytes::concat_all([root_text(root_name(r.key)), b" calls ", call.name])) }
-          },
-        )
+        named_calls(code).fold(acc, |a: List<Bytes>, call: { name: Bytes, filed: Option<Typed> }| {
+          let local = r.root.here.any(|d: Def| qualify(b"m", d.name) == call.name);
+          let bare = match prelude_own(call.name) { Some(n) -> n, None -> call.name };
+          // A part lowered or lifted is filed at its type; the emitter's other builtins are
+          // settled by their operands.
+          let generated = call.name.starts_with(b"?")
+            && (!crossing_key(r.key) || crossing_builtin(call.name))
+            && ((call.name != b"?lower" && call.name != b"?lift")
+            || (match call.filed { Some(t) -> t.args.len() == 1, None -> false }));
+          let prelude = call.filed != None
+            && (ctor_spelled(bare) || externs.contains(bare)
+            || written_code().calls.concat(written_code().lifts).contains(bare));
+          // The prelude's functions written in Ply are definitions, never builtins.
+          let ply_builtin = builtins().any(|b: Builtin| b.body && b.name == call.name);
+          if !ply_builtin && (local || generated || prelude) { a }
+          else { a.push(Bytes::concat_all([root_text(root_name(r.key)), b" calls ", call.name])) }
+        })
       });
       assert_eq(faults, []);
       // Every loop a written root calls is one `container_code` writes; a loop writing a
@@ -2413,7 +2428,7 @@ fn written_whole(ctors: Ctors, key: RootKey) -> Bool / {abort.raise} =
         match handle { Some(written_at(ctors, k)) } with { abort.raise(_) -> None } {
           None -> Stop(false),
           Some(r) -> {
-            let parts = named_calls(r.code, r.typed).fold(
+            let parts = named_calls(r.code).fold(
               [],
               |acc: List<RootKey>, call: { name: Bytes, filed: Option<Typed> }|
                 match call.filed {

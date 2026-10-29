@@ -1,0 +1,741 @@
+//! The typed tree: a body as the check settled it, written out. Each node holds its type and what
+//! the check resolved there, so nothing that reads the tree looks a node's facts up by its site.
+//! The tree is generic in how it writes a type: the checker and what lowers a body hold `Type`s,
+//! and a body stored with its row names each type by its key in the row's table.
+
+import compiler.syntax.parsing (Span, span_bin)
+import compiler.syntax.patterns (Lit, lit_bin)
+import compiler.check.types (Type, Row, Atom, row_bin, atom_bin)
+import std.bin
+import std.list
+
+/// One node: what it is, where its text stands, and its type.
+pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t }
+
+pub type TypedNode<t> =
+  | TypedLit(Lit)
+  | TypedRead(Reading<t>)
+  /// `witness` is the owner's type parameter whose witness does the operator, where its operand is
+  /// of one a `numeric` or `integer` constraint makes a witness of.
+  | TypedUnary({ op: Bytes, operand: TypedExpr<t>, witness: Option<Bytes> })
+  | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t>, witness: Option<Bytes> })
+  /// `args` are in the callee's parameters' order, a default the call leaves out among them. `row`
+  /// is what a call of a function value performs, as the type it calls through says; empty for a
+  /// call of a definition, a constructor or a builtin, whose read says it.
+  | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>>, row: Row })
+  | TypedIf({ cond: TypedExpr<t>, then_branch: TypedExpr<t>, else_branch: TypedExpr<t> })
+  | TypedMatch({ scrutinee: TypedExpr<t>, arms: List<TypedArm<t>> })
+  | TypedBlock({ stmts: List<TypedStmt<t>>, tail: Option<TypedExpr<t>> })
+  | TypedList(List<TypedExpr<t>>)
+  | TypedRecord(List<TypedField<t>>)
+  /// `{ ..base, f: e }`: the base's record with the fields `sets` writes replaced, at the node's type;
+  /// `copies` are the base's other fields, in the record's order.
+  | TypedUpdate({ base: TypedExpr<t>, sets: List<TypedField<t>>, copies: List<Bytes> })
+  | TypedFieldRead({ base: TypedExpr<t>, field: Bytes })
+  /// `effect` is the effect's name across the program, `resource` the label as written, and `atom`
+  /// what the perform performs.
+  | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, atom: Atom, args: List<TypedExpr<t>> })
+  | TypedLambda({ params: List<TypedParam<t>>, body: TypedExpr<t>, row: Row })
+  | TypedSimulate(TypedThunk<t>)
+  | TypedParallel(List<TypedThunk<t>>)
+  /// `row` is what the body performs. `vars` are the handler's variables, made before the body
+  /// runs, which its clauses read and assign.
+  | TypedHandle({ body: TypedExpr<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
+
+/// What a name read as a value is: a binder in scope; a definition at the type arguments, rows and
+/// labels the read fills, each in its scheme's order, with the witnesses it passes in the order of
+/// the parameters they are for; a constructor of a declared sum at the type arguments it fills; or a
+/// native, by its name across the program, at the type arguments and rows it fills, in its own
+/// order, with the witnesses it passes.
+pub type Reading<t> =
+  | ReadLocal(Bytes)
+  | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, labels: List<FilledLabel>, witnesses: List<NumericWitness> })
+  | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
+  | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row>, witnesses: List<NumericWitness> })
+
+/// A label a read fills: one named, or the owner's own label parameter at its place.
+pub type FilledLabel = | LabelNamed(Bytes) | LabelParam(Int)
+
+/// The type a `numeric` or `integer` constraint is met at, as a call passes it: a numeric type by
+/// name, a type parameter of the caller's by name, which passes the caller's own witness, or a type
+/// that states its own arithmetic by its constructor's name.
+pub type NumericWitness = | ConcreteWitness(Bytes) | ParamWitness(Bytes) | StatedWitness(Bytes)
+
+/// The parameter that holds the witness of type parameter `param`, which no source can spell.
+pub fn witness_param(param: Bytes) -> Bytes = b"?w_".concat(param)
+
+pub type TypedParam<t> = { name: Bytes, ty: t, span: Span }
+
+/// A body run as a function of no parameters, and what it performs.
+pub type TypedThunk<t> = { body: TypedExpr<t>, row: Row }
+
+pub type TypedField<t> = { name: Bytes, value: TypedExpr<t> }
+
+pub type TypedArm<t> = { pat: TypedPattern<t>, guard: Option<TypedExpr<t>>, body: TypedExpr<t> }
+
+/// A pattern, each binder with the type it binds and each constructor resolved to its case.
+pub type TypedPattern<t> =
+  | TypedWild
+  | TypedBinder({ name: Bytes, ty: t, span: Span })
+  | TypedLitPattern(Lit)
+  | TypedRange({ lo: Lit, hi: Lit })
+  | TypedCase({ sum: Bytes, name: Bytes, case: Int, args: List<TypedPattern<t>> })
+  | TypedRecordPattern({ fields: List<TypedFieldPattern<t>>, rest: Bool })
+  | TypedListPattern({ items: List<TypedPattern<t>>, rest: Option<TypedPattern<t>> })
+  | TypedOr(List<TypedPattern<t>>)
+
+pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
+
+pub type TypedStmt<t> =
+  /// `pat_span` is where the pattern is written, where what a miss lets go of is let go.
+  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span, pat_span: Span })
+  /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
+  | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
+  | TypedDo(TypedExpr<t>)
+  /// `name = value;`: a clause giving its handler's variable a new value.
+  | TypedAssign({ name: Bytes, value: TypedExpr<t>, span: Span })
+
+/// A clause of a `handle`: the operation it answers, under the label written or under every label,
+/// its parameters, the label it binds where it answers every label, its continuation, and its body.
+/// `row` is what its body performs and `resumed` what resuming its continuation does.
+pub type TypedClause<t> = {
+  effect: Bytes,
+  op: Bytes,
+  resource: Option<Bytes>,
+  every_label: Bool,
+  params: List<TypedParam<t>>,
+  label: Option<TypedParam<t>>,
+  resume: Option<TypedParam<t>>,
+  body: TypedExpr<t>,
+  row: Row,
+  resumed: Row,
+  span: Span,
+}
+
+/// A `handle`'s `return` clause, run on the body's answer; `row` is what it performs.
+pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, row: Row, span: Span }
+
+/// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
+pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpr<t>, span: Span }
+
+/// Which of its owner's bodies a typed body is: a definition's body, one of its spec clauses by
+/// its place among them, or its measure; a test's run or the listing of its cases; a law's guard
+/// or the proposition it states.
+pub type BodyPart =
+  | WholeBody
+  | ClauseBody(Int)
+  | MeasureBody
+  | TestRun
+  | CaseListing
+  | LawGuard
+  | LawBody
+
+/// A body the check settled: what owns it, the module it is in, which of its owner's bodies it is,
+/// the parameters it binds, in order, and its tree, each place in it counted from where its item's
+/// text starts.
+pub type TypedBody<t> = {
+  owner: Bytes,
+  module: Int,
+  part: BodyPart,
+  params: List<TypedParam<t>>,
+  body: TypedExpr<t>,
+}
+
+/// What tells a body apart from its owner's others, as text, which bodies are ordered by.
+pub fn part_key(part: BodyPart) -> Bytes =
+  match part {
+    WholeBody -> b"body",
+    ClauseBody(i) -> b"clause ".concat(Bytes::of_string(i.to_string())),
+    MeasureBody -> b"measure",
+    TestRun -> b"run",
+    CaseListing -> b"listing",
+    LawGuard -> b"guard",
+    LawBody -> b"law",
+  }
+
+derive bin for BodyPart
+
+derive bin for FilledLabel
+
+derive bin for NumericWitness
+
+derive bin for TypedBody
+
+derive bin for TypedExpr
+
+derive bin for TypedNode
+
+derive bin for Reading
+
+derive bin for TypedParam
+
+derive bin for TypedThunk
+
+derive bin for TypedField
+
+derive bin for TypedArm
+
+derive bin for TypedPattern
+
+derive bin for TypedFieldPattern
+
+derive bin for TypedStmt
+
+derive bin for TypedClause
+
+derive bin for TypedReturn
+
+derive bin for TypedHandlerVar
+
+// --- Reading a tree --------------------------------------------------------------------------------
+
+/// Every node of `e`, each before its parts.
+pub fn typed_nodes<t>(e: TypedExpr<t>) -> List<TypedExpr<t>> = {
+  let all = |xs: List<TypedExpr<t>>|
+    xs.fold([], |acc: List<TypedExpr<t>>, x: TypedExpr<t>| acc.concat(typed_nodes(x)));
+  let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> typed_nodes(y), None -> [] };
+  [e].concat(match e.node {
+    TypedLit(_) -> [],
+    TypedRead(_) -> [],
+    TypedUnary(u) -> typed_nodes(u.operand),
+    TypedBinary(b) -> typed_nodes(b.lhs).concat(typed_nodes(b.rhs)),
+    TypedCall(c) -> typed_nodes(c.callee).concat(all(c.args)),
+    TypedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
+    TypedMatch(m) ->
+      typed_nodes(m.scrutinee).concat(
+        m.arms.fold([], |acc: List<TypedExpr<t>>, a: TypedArm<t>|
+          acc.concat(opt(a.guard)).concat(typed_nodes(a.body))),
+      ),
+    TypedBlock(b) ->
+      b.stmts.fold([], |acc: List<TypedExpr<t>>, s: TypedStmt<t>|
+        acc.concat(match s {
+          TypedLet(l) -> typed_nodes(l.value),
+          TypedLetElse(l) -> typed_nodes(l.value).concat(typed_nodes(l.fallback)),
+          TypedDo(x) -> typed_nodes(x),
+          TypedAssign(a) -> typed_nodes(a.value),
+        })).concat(
+        opt(b.tail),
+      ),
+    TypedList(xs) -> all(xs),
+    TypedRecord(fs) -> all(fs.map(|f: TypedField<t>| f.value)),
+    TypedUpdate(u) -> typed_nodes(u.base).concat(all(u.sets.map(|f: TypedField<t>| f.value))),
+    TypedFieldRead(r) -> typed_nodes(r.base),
+    TypedPerform(p) -> all(p.args),
+    TypedLambda(l) -> typed_nodes(l.body),
+    TypedSimulate(th) -> typed_nodes(th.body),
+    TypedParallel(ts) -> all(ts.map(|th: TypedThunk<t>| th.body)),
+    TypedHandle(h) ->
+      all(h.vars.map(|v: TypedHandlerVar<t>| v.init)).concat(typed_nodes(h.body)).concat(
+        all(h.clauses.map(|c: TypedClause<t>| c.body)),
+      ).concat(match h.ret { Some(r) -> typed_nodes(r.body), None -> [] }),
+  })
+}
+
+/// `e` with `f` applied to each node's own part after its parts: the nodes a walk reaches, which
+/// `typed_nodes` lists.
+pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> TypedExpr<t> = {
+  let go = |x: TypedExpr<t>| nodes_mapped(x, f);
+  let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> Some(go(y)), None -> None };
+  let field = |x: TypedField<t>| { name: x.name, value: go(x.value) };
+  let node = match e.node {
+    TypedLit(_) -> e.node,
+    TypedRead(_) -> e.node,
+    TypedUnary(u) -> TypedUnary({ ..u, operand: go(u.operand) }),
+    TypedBinary(b) -> TypedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go), row: c.row }),
+    TypedIf(i) ->
+      TypedIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
+    TypedMatch(m) ->
+      TypedMatch({
+        scrutinee: go(m.scrutinee),
+        arms: m.arms.map(|a: TypedArm<t>| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+      }),
+    TypedBlock(b) ->
+      TypedBlock({
+        stmts: b.stmts.map(|st: TypedStmt<t>|
+          match st {
+            TypedLet(l) -> TypedLet({ ..l, value: go(l.value) }),
+            TypedLetElse(l) -> TypedLetElse({ ..l, value: go(l.value), fallback: go(l.fallback) }),
+            TypedDo(x) -> TypedDo(go(x)),
+            TypedAssign(a) -> TypedAssign({ ..a, value: go(a.value) }),
+          }),
+        tail: opt(b.tail),
+      }),
+    TypedList(xs) -> TypedList(xs.map(go)),
+    TypedRecord(fs) -> TypedRecord(fs.map(field)),
+    TypedUpdate(u) -> TypedUpdate({ ..u, base: go(u.base), sets: u.sets.map(field) }),
+    TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
+    TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
+    TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
+    TypedSimulate(th) -> TypedSimulate({ ..th, body: go(th.body) }),
+    TypedParallel(ts) -> TypedParallel(ts.map(|th: TypedThunk<t>| { ..th, body: go(th.body) })),
+    TypedHandle(h) ->
+      TypedHandle({
+        ..h,
+        body: go(h.body),
+        vars: h.vars.map(|v: TypedHandlerVar<t>| { ..v, init: go(v.init) }),
+        clauses: h.clauses.map(|c: TypedClause<t>| { ..c, body: go(c.body) }),
+        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+      }),
+  };
+  { ..e, node: f(node) }
+}
+
+/// `b` as a reader that draws every type parameter as `Int` reads it: with no witness passed or
+/// taken, each operator its operands' own.
+pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
+  {
+    ..b,
+    params: b.params.filter(|p: TypedParam<t>| !p.name.starts_with(witness_param(b""))),
+    body: nodes_mapped(b.body, |n: TypedNode<t>|
+      match n {
+        TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
+        TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
+        TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
+        TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
+        _ -> n,
+      }),
+  }
+
+// --- Writing a tree's types another way ------------------------------------------------------------
+
+/// How `retyped` writes a tree: `ty` writes a type, threading a state through the types in the
+/// order a walk meets them; `row` writes a row, `atom` an atom and `span` a place.
+pub type Retyping<a, b, s> = {
+  ty: (a, s) -> { ty: b, state: s } / {abort.raise},
+  row: (Row) -> Row / {abort.raise},
+  atom: (Atom) -> Atom / {abort.raise},
+  span: (Span) -> Span,
+}
+
+/// What retyping a part found, and the state after it.
+pub type Retyped<x, s> = { out: x, state: s }
+
+/// `e` with every type written as `r` writes it.
+pub fn retyped<a, b, s>(
+  e: TypedExpr<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedExpr<b>, s> / {abort.raise} = {
+  let node = retyped_node(e.node, state, r);
+  let t = (r.ty)(e.ty, node.state);
+  { out: { node: node.out, span: (r.span)(e.span), ty: t.ty }, state: t.state }
+}
+
+/// `b` with every type written as `r` writes it.
+pub fn body_retyped<a, b, s>(
+  b: TypedBody<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedBody<b>, s> / {abort.raise} = {
+  let ps = retyped_params(b.params, state, r);
+  let e = retyped(b.body, ps.state, r);
+  {
+    out: { owner: b.owner, module: b.module, part: b.part, params: ps.out, body: e.out },
+    state: e.state,
+  }
+}
+
+fn retyped_all<a, b, s>(
+  xs: List<TypedExpr<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedExpr<b>>, s> / {abort.raise} =
+  xs.fold({ out: [], state: state }, |acc: Retyped<List<TypedExpr<b>>, s>, x: TypedExpr<a>| {
+    let o = retyped(x, acc.state, r);
+    { out: acc.out.push(o.out), state: o.state }
+  })
+
+fn retyped_opt<a, b, s>(
+  x: Option<TypedExpr<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Option<TypedExpr<b>>, s> / {abort.raise} =
+  match x {
+    Some(y) -> {
+      let o = retyped(y, state, r);
+      { out: Some(o.out), state: o.state }
+    },
+    None -> { out: None, state: state },
+  }
+
+fn retyped_types<a, b, s>(
+  tys: List<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<b>, s> / {abort.raise} =
+  tys.fold({ out: [], state: state }, |acc: Retyped<List<b>, s>, t: a| {
+    let o = (r.ty)(t, acc.state);
+    { out: acc.out.push(o.ty), state: o.state }
+  })
+
+fn retyped_param<a, b, s>(
+  p: TypedParam<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedParam<b>, s> / {abort.raise} = {
+  let t = (r.ty)(p.ty, state);
+  { out: { name: p.name, ty: t.ty, span: (r.span)(p.span) }, state: t.state }
+}
+
+fn retyped_params<a, b, s>(
+  ps: List<TypedParam<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedParam<b>>, s> / {abort.raise} =
+  ps.fold({ out: [], state: state }, |acc: Retyped<List<TypedParam<b>>, s>, p: TypedParam<a>| {
+    let o = retyped_param(p, acc.state, r);
+    { out: acc.out.push(o.out), state: o.state }
+  })
+
+fn retyped_param_opt<a, b, s>(
+  p: Option<TypedParam<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Option<TypedParam<b>>, s> / {abort.raise} =
+  match p {
+    Some(q) -> {
+      let o = retyped_param(q, state, r);
+      { out: Some(o.out), state: o.state }
+    },
+    None -> { out: None, state: state },
+  }
+
+fn retyped_fields<a, b, s>(
+  fs: List<TypedField<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedField<b>>, s> / {abort.raise} =
+  fs.fold({ out: [], state: state }, |acc: Retyped<List<TypedField<b>>, s>, f: TypedField<a>| {
+    let o = retyped(f.value, acc.state, r);
+    { out: acc.out.push({ name: f.name, value: o.out }), state: o.state }
+  })
+
+fn retyped_thunk<a, b, s>(
+  t: TypedThunk<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedThunk<b>, s> / {abort.raise} = {
+  let o = retyped(t.body, state, r);
+  { out: { body: o.out, row: (r.row)(t.row) }, state: o.state }
+}
+
+fn retyped_reading<a, b, s>(
+  read: Reading<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Reading<b>, s> / {abort.raise} =
+  match read {
+    ReadLocal(n) -> { out: ReadLocal(n), state: state },
+    ReadDefinition(d) -> {
+      let args = retyped_types(d.args, state, r);
+      {
+        out: ReadDefinition({
+          full: d.full,
+          args: args.out,
+          rows: d.rows.map(r.row),
+          labels: d.labels,
+          witnesses: d.witnesses,
+        }),
+        state: args.state,
+      }
+    },
+    ReadConstructor(c) -> {
+      let args = retyped_types(c.args, state, r);
+      {
+        out: ReadConstructor({ sum: c.sum, name: c.name, case: c.case, args: args.out }),
+        state: args.state,
+      }
+    },
+    ReadBuiltin(f) -> {
+      let args = retyped_types(f.args, state, r);
+      {
+        out: ReadBuiltin({
+          name: f.name,
+          args: args.out,
+          rows: f.rows.map(r.row),
+          witnesses: f.witnesses,
+        }),
+        state: args.state,
+      }
+    },
+  }
+
+fn retyped_pattern<a, b, s>(
+  p: TypedPattern<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedPattern<b>, s> / {abort.raise} = {
+  let each = |ps: List<TypedPattern<a>>, st: s|
+    ps.fold({ out: [], state: st }, |acc: Retyped<List<TypedPattern<b>>, s>, x: TypedPattern<a>| {
+      let o = retyped_pattern(x, acc.state, r);
+      { out: acc.out.push(o.out), state: o.state }
+    });
+  match p {
+    TypedWild -> { out: TypedWild, state: state },
+    TypedBinder(v) -> {
+      let t = (r.ty)(v.ty, state);
+      { out: TypedBinder({ name: v.name, ty: t.ty, span: (r.span)(v.span) }), state: t.state }
+    },
+    TypedLitPattern(l) -> { out: TypedLitPattern(l), state: state },
+    TypedRange(g) -> { out: TypedRange(g), state: state },
+    TypedCase(c) -> {
+      let args = each(c.args, state);
+      {
+        out: TypedCase({ sum: c.sum, name: c.name, case: c.case, args: args.out }),
+        state: args.state,
+      }
+    },
+    TypedRecordPattern(rp) -> {
+      let fields = rp.fields.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedFieldPattern<b>>, s>, f: TypedFieldPattern<a>| {
+          let o = retyped_pattern(f.pat, acc.state, r);
+          { out: acc.out.push({ name: f.name, pat: o.out }), state: o.state }
+        },
+      );
+      { out: TypedRecordPattern({ fields: fields.out, rest: rp.rest }), state: fields.state }
+    },
+    TypedListPattern(lp) -> {
+      let items = each(lp.items, state);
+      match lp.rest {
+        Some(x) -> {
+          let o = retyped_pattern(x, items.state, r);
+          { out: TypedListPattern({ items: items.out, rest: Some(o.out) }), state: o.state }
+        },
+        None -> { out: TypedListPattern({ items: items.out, rest: None }), state: items.state },
+      }
+    },
+    TypedOr(alts) -> {
+      let o = each(alts, state);
+      { out: TypedOr(o.out), state: o.state }
+    },
+  }
+}
+
+fn retyped_stmt<a, b, s>(
+  stmt: TypedStmt<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedStmt<b>, s> / {abort.raise} =
+  match stmt {
+    TypedLet(l) -> {
+      let p = retyped_pattern(l.pat, state, r);
+      let v = retyped(l.value, p.state, r);
+      {
+        out: TypedLet({
+          pat: p.out,
+          value: v.out,
+          span: (r.span)(l.span),
+          pat_span: (r.span)(l.pat_span),
+        }),
+        state: v.state,
+      }
+    },
+    TypedLetElse(l) -> {
+      let p = retyped_pattern(l.pat, state, r);
+      let v = retyped(l.value, p.state, r);
+      let f = retyped(l.fallback, v.state, r);
+      {
+        out: TypedLetElse({ pat: p.out, value: v.out, fallback: f.out, span: (r.span)(l.span) }),
+        state: f.state,
+      }
+    },
+    TypedDo(x) -> {
+      let o = retyped(x, state, r);
+      { out: TypedDo(o.out), state: o.state }
+    },
+    TypedAssign(asg) -> {
+      let o = retyped(asg.value, state, r);
+      {
+        out: TypedAssign({ name: asg.name, value: o.out, span: (r.span)(asg.span) }),
+        state: o.state,
+      }
+    },
+  }
+
+fn retyped_clause<a, b, s>(
+  c: TypedClause<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedClause<b>, s> / {abort.raise} = {
+  let params = retyped_params(c.params, state, r);
+  let label = retyped_param_opt(c.label, params.state, r);
+  let resume = retyped_param_opt(c.resume, label.state, r);
+  let body = retyped(c.body, resume.state, r);
+  {
+    out: {
+      effect: c.effect,
+      op: c.op,
+      resource: c.resource,
+      every_label: c.every_label,
+      params: params.out,
+      label: label.out,
+      resume: resume.out,
+      body: body.out,
+      row: (r.row)(c.row),
+      resumed: (r.row)(c.resumed),
+      span: (r.span)(c.span),
+    },
+    state: body.state,
+  }
+}
+
+fn retyped_node<a, b, s>(
+  node: TypedNode<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedNode<b>, s> / {abort.raise} =
+  match node {
+    TypedLit(l) -> { out: TypedLit(l), state: state },
+    TypedRead(read) -> {
+      let o = retyped_reading(read, state, r);
+      { out: TypedRead(o.out), state: o.state }
+    },
+    TypedUnary(u) -> {
+      let o = retyped(u.operand, state, r);
+      { out: TypedUnary({ op: u.op, operand: o.out, witness: u.witness }), state: o.state }
+    },
+    TypedBinary(bin) -> {
+      let l = retyped(bin.lhs, state, r);
+      let rh = retyped(bin.rhs, l.state, r);
+      {
+        out: TypedBinary({ op: bin.op, lhs: l.out, rhs: rh.out, witness: bin.witness }),
+        state: rh.state,
+      }
+    },
+    TypedCall(c) -> {
+      let f = retyped(c.callee, state, r);
+      let args = retyped_all(c.args, f.state, r);
+      { out: TypedCall({ callee: f.out, args: args.out, row: (r.row)(c.row) }), state: args.state }
+    },
+    TypedIf(i) -> {
+      let c = retyped(i.cond, state, r);
+      let t = retyped(i.then_branch, c.state, r);
+      let el = retyped(i.else_branch, t.state, r);
+      { out: TypedIf({ cond: c.out, then_branch: t.out, else_branch: el.out }), state: el.state }
+    },
+    TypedMatch(m) -> {
+      let sc = retyped(m.scrutinee, state, r);
+      let arms = m.arms.fold(
+        { out: [], state: sc.state },
+        |acc: Retyped<List<TypedArm<b>>, s>, arm: TypedArm<a>| {
+          let p = retyped_pattern(arm.pat, acc.state, r);
+          let g = retyped_opt(arm.guard, p.state, r);
+          let body = retyped(arm.body, g.state, r);
+          { out: acc.out.push({ pat: p.out, guard: g.out, body: body.out }), state: body.state }
+        },
+      );
+      { out: TypedMatch({ scrutinee: sc.out, arms: arms.out }), state: arms.state }
+    },
+    TypedBlock(blk) -> {
+      let stmts = blk.stmts.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedStmt<b>>, s>, x: TypedStmt<a>| {
+          let o = retyped_stmt(x, acc.state, r);
+          { out: acc.out.push(o.out), state: o.state }
+        },
+      );
+      let tail = retyped_opt(blk.tail, stmts.state, r);
+      { out: TypedBlock({ stmts: stmts.out, tail: tail.out }), state: tail.state }
+    },
+    TypedList(xs) -> {
+      let o = retyped_all(xs, state, r);
+      { out: TypedList(o.out), state: o.state }
+    },
+    TypedRecord(fs) -> {
+      let o = retyped_fields(fs, state, r);
+      { out: TypedRecord(o.out), state: o.state }
+    },
+    TypedUpdate(u) -> {
+      let base = retyped(u.base, state, r);
+      let sets = retyped_fields(u.sets, base.state, r);
+      { out: TypedUpdate({ base: base.out, sets: sets.out, copies: u.copies }), state: sets.state }
+    },
+    TypedFieldRead(f) -> {
+      let base = retyped(f.base, state, r);
+      { out: TypedFieldRead({ base: base.out, field: f.field }), state: base.state }
+    },
+    TypedPerform(p) -> {
+      let args = retyped_all(p.args, state, r);
+      {
+        out: TypedPerform({
+          effect: p.effect,
+          op: p.op,
+          resource: p.resource,
+          atom: (r.atom)(p.atom),
+          args: args.out,
+        }),
+        state: args.state,
+      }
+    },
+    TypedLambda(l) -> {
+      let params = retyped_params(l.params, state, r);
+      let body = retyped(l.body, params.state, r);
+      {
+        out: TypedLambda({ params: params.out, body: body.out, row: (r.row)(l.row) }),
+        state: body.state,
+      }
+    },
+    TypedSimulate(t) -> {
+      let o = retyped_thunk(t, state, r);
+      { out: TypedSimulate(o.out), state: o.state }
+    },
+    TypedParallel(ts) -> {
+      let o = ts.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedThunk<b>>, s>, t: TypedThunk<a>| {
+          let x = retyped_thunk(t, acc.state, r);
+          { out: acc.out.push(x.out), state: x.state }
+        },
+      );
+      { out: TypedParallel(o.out), state: o.state }
+    },
+    TypedHandle(h) -> {
+      let vars = h.vars.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedHandlerVar<b>>, s>, v: TypedHandlerVar<a>| {
+          let init = retyped(v.init, acc.state, r);
+          let t = (r.ty)(v.ty, init.state);
+          {
+            out: acc.out.push({ name: v.name, ty: t.ty, init: init.out, span: (r.span)(v.span) }),
+            state: t.state,
+          }
+        },
+      );
+      let body = retyped(h.body, vars.state, r);
+      let clauses = h.clauses.fold(
+        { out: [], state: body.state },
+        |acc: Retyped<List<TypedClause<b>>, s>, c: TypedClause<a>| {
+          let o = retyped_clause(c, acc.state, r);
+          { out: acc.out.push(o.out), state: o.state }
+        },
+      );
+      let ret: Retyped<Option<TypedReturn<b>>, s> = match h.ret {
+        Some(rc) -> {
+          let binder = retyped_param(rc.binder, clauses.state, r);
+          let rbody = retyped(rc.body, binder.state, r);
+          {
+            out: Some({
+              binder: binder.out,
+              body: rbody.out,
+              row: (r.row)(rc.row),
+              span: (r.span)(rc.span),
+            }),
+            state: rbody.state,
+          }
+        },
+        None -> { out: None, state: clauses.state },
+      };
+      {
+        out: TypedHandle({
+          body: body.out,
+          row: (r.row)(h.row),
+          clauses: clauses.out,
+          ret: ret.out,
+          vars: vars.out,
+        }),
+        state: ret.state,
+      }
+    },
+  }

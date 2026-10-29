@@ -1,24 +1,23 @@
 //! The `Code` written for a type's operations: equality, ordering, reflection, digests and containers.
+//! Each node is written with its type, and each read of a definition, a constructor or a builtin
+//! with what it reads, as the check settles the code it lowers.
 
-import compiler.syntax.parsing (Span, dummy_span, site_digit)
-import compiler.emit.code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NField, NApp,
-                           NRecord, NMatch, NLambda, CodePattern, PxWild, PxVar, PxCtor, CLet, CDo,
-                           CodeStmt, CodeArm, CodeField, PxList)
+import compiler.emit.code (Code, NLit, NDef, NList, NRecord, NLambda, CodePattern, PxWild, PxCtor,
+                           CLet, CDo, CodeStmt, CodeArm)
 import compiler.syntax.items (Item, IInstance, NKey, NShow, INumeric, numeric_by)
 import compiler.check.resolve.tables (qualify)
 import compiler.check.known (array_name, bool_name, bytes_name, char_name, columns_name,
                              decimal_name, equal_ctor, err_ctor, float_name, greater_ctor, int_name,
                              less_ctor, list_name, map_name, none_ctor, ok_ctor, option_name,
-                             ordering_name, result_name, some_ctor, string_name, unit_name,
-                             ordering_type)
+                             result_name, some_ctor, string_name, unit_name, ordering_type)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
-                             Atom, int_type, bytes_type, bool_type, unit_type, named_type,
-                             list_type, fn_type, monomorphic, row_empty, row_open, arg_row,
-                             fields_sorted, string_type)
-import compiler.check.infer.checker (FiledRows, Performs, RowArguments)
-import compiler.emit.typing (Typed, unknown_type, filed_as)
+                             Atom, int_type, bytes_type, bool_type, unit_type, string_type,
+                             float_type, list_type, option_type, fn_type, monomorphic, row_empty,
+                             row_open, arg_row, fields_sorted)
+import compiler.emit.typing (unknown_type)
 import std.list
-import compiler.syntax.patterns (Lit, LInt, LBool, LStr, LBytes, LChar, LUnit)
+import std.list (zip)
+import compiler.syntax.patterns (LChar)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (KBool, KBoxed, KInt, width_named)
 import compiler.emit.keys
@@ -27,86 +26,14 @@ import compiler.emit.keys (RootKey, Written, TypeOp, Reflect, Shown, Digest, Con
 import compiler.emit.reps (Ctors, SumCtor, TyOpen, Def, EmitParam, at_args, kind_of, runtime_object,
                            holds_resource, ctor_fields_at, release_row)
 import compiler.emit.lower.strings (strings_root, strings_code)
-import compiler.emit.lower.setting (prelude_ctor)
 import compiler.emit.marks (marked_type, marked_key, plain, kept_form, marked)
 import compiler.store.hash.template (written_code)
-
-// --- Externs written in place -----------------------------------------------------
-
-/// The constructors and builtins written code names, each read at a site of its own past every
-/// site its parts are placed at.
-fn said_names() -> List<Bytes> =
-  [
-    equal_ctor(),
-    less_ctor(),
-    greater_ctor(),
-    b"std.value.VRecord",
-    b"std.value.VShown",
-    b"std.value.VCtor",
-    b"std.value.VMap",
-    b"std.value.VArray",
-    b"std.value.VList",
-    b"Bytes::slice",
-  ]
-
-fn said_at(k: Int) -> Span = { start: 0, end: 0, site: site_digit() + k }
-
-/// Name `name` of `said_names` read where written code says it, an `Ordering`'s constructor through
-/// the prelude's binder.
-fn said(name: Bytes) -> Code = {
-  let k = range(0, said_names().len()).fold(0 - 1, |acc: Int, i: Int|
-    if said_names().at(i) == Some(name) { i } else { acc });
-  {
-    node: NVar({ name: if ordering_named(name) { prelude_ctor(name) } else { name }, slot: None }),
-    span: said_at(k),
-  }
-}
-
-/// Constructor `name`, as the constructor table names it, written where a root's module may declare
-/// a constructor of the same name: a prelude constructor, which the table names bare, through the
-/// prelude's binder.
-fn written_ctor(name: Bytes) -> Bytes =
-  if name.index_of(b".") == None { prelude_ctor(name) } else { name }
-
-/// Whether `name` of `said_names` is a constructor of the prelude's `Ordering`.
-fn ordering_named(name: Bytes) -> Bool = [equal_ctor(), less_ctor(), greater_ctor()].contains(name)
-
-/// A list of `items` written code makes, the `k`th it files apart from its names.
-fn said_list(items: List<Code>, k: Int) -> Code =
-  { node: NList({ items: items }), span: said_at(said_names().len() + k) }
-
-/// `typed` with what written code files where it says a name, as `said_type` types it, and each of
-/// `lists`, the lists it makes, at its type.
-fn said_typed(typed: Map<Int, Typed>, lists: List<Type>) -> Map<Int, Typed> =
-  range(0, lists.len()).fold(
-    range(0, said_names().len()).fold(typed, |m: Map<Int, Typed>, i: Int|
-      match said_names().at(i) {
-        Some(name) -> m.insert(said_at(i).site, filed_as(said_type(name), [])),
-        None -> m,
-      }),
-    |m: Map<Int, Typed>, k: Int|
-      match lists.at(k) {
-        Some(t) -> m.insert(said_at(said_names().len() + k).site, filed_as(t, [])),
-        None -> m,
-      },
-  )
-
-/// The type a name of `said_names` is filed at: a constructor taking nothing its sum's, one applied
-/// a function answering its sum, which lays the value it makes; a builtin none, its call reading the
-/// builtin's own.
-fn said_type(name: Bytes) -> Type = {
-  let value = named_type(b"std.value.Value");
-  let string = string_type();
-  let making = |params: List<Type>| fn_type(params, value, row_empty());
-  let pair = |a: Bytes, b: Bytes, t: Type| TyRecord([{ name: a, ty: t }, { name: b, ty: value }]);
-  if ordering_named(name) { ordering_type() }
-  else if name == b"std.value.VRecord" { making([list_type(pair(b"name", b"value", string))]) }
-  else if name == b"std.value.VShown" { making([string]) }
-  else if name == b"std.value.VCtor" { making([string, list_type(value)]) }
-  else if name == b"std.value.VMap" { making([list_type(pair(b"key", b"value", value))]) }
-  else if name == b"std.value.VArray" || name == b"std.value.VList" { making([list_type(value)]) }
-  else { unknown_type() }
-}
+import compiler.emit.writing (bare, prelude_call, placed, int_code, bool_code, bytes_code,
+                              string_code, unit_code, slot_code, binder, field_code, binary_of,
+                              applied, builtin_call, native_call, compare_call, ctor_made,
+                              prelude_made, prelude_pattern, value_made, if_code, match_code,
+                              block_code, some_or, sequence, value_type, Bound, bound_from,
+                              bound_pattern, bound_read)
 
 /// Whether `t` is the record a map's entries list holds, `{key, value}`.
 fn is_entry(t: Type) -> Bool =
@@ -177,7 +104,7 @@ pub fn container_defs(module: Bytes, t: Type) -> List<Def> / {abort.raise} =
 /// index after them its loop; one container a reflection or digest, and the list it adds to and an
 /// index after it its loop, which answers that list.
 fn container_typed(op: Bytes, t: Type) -> { params: List<Type>, ret: Type } = {
-  let value = TyCon({ name: b"std.value.Value", args: [] });
+  let value = value_type();
   let entries = list_type(TyRecord([{ name: b"key", ty: value }, { name: b"value", ty: value }]));
   let gathered = |l: Type| { params: [t, l, int_type()], ret: l };
   if op == b"equal" { { params: [t, t], ret: bool_type() } }
@@ -191,15 +118,9 @@ fn container_typed(op: Bytes, t: Type) -> { params: List<Type>, ret: Type } = {
   else { { params: [t], ret: value } }
 }
 
-/// A root written for a type: its parameters, its body over them, what its body files, and the
-/// definitions its calls name, its own among them where it calls itself.
-pub type WrittenRoot = {
-  params: List<EmitParam>,
-  code: Code,
-  typed: Map<Int, Typed>,
-  rows: Map<Int, FiledRows>,
-  here: List<Def>,
-}
+/// A root written for a type: its parameters, its body over them, the definitions its calls name,
+/// its own among them where it calls itself, and what an entry's body performs.
+pub type WrittenRoot = { params: List<EmitParam>, code: Code, here: List<Def>, performs: Row }
 
 /// The root written for walk `op` of containers of type `t` in `module`, under the constructors
 /// `ctors`: one `walked_code` writes (a reflection, a showing or a digest of the container, or one
@@ -214,9 +135,9 @@ pub fn container_code(
 ) -> WrittenRoot / {abort.raise} =
   if strings_root(op) {
     let s = strings_code(module, op, t);
-    { params: s.params, code: s.code, typed: s.typed, rows: Map::new(), here: s.here }
+    { params: s.params, code: s.code, here: s.here, performs: row_empty() }
   } else {
-    let e = walked_code(module, op, t);
+    let e = walked_code(module, ctors, op, t);
     let word = |n: Bytes| { name: n, kind: KBoxed, ty: kind_of(t).ty, of: Some(t), lambda: None };
     let index = { name: b"i", kind: KInt, ty: TyOpen([]), of: Some(int_type()), lambda: None };
     {
@@ -224,65 +145,46 @@ pub fn container_code(
       else if op == b"equal" || op == b"ordered" { [word(b"a"), word(b"b")] }
       else { [word(b"a")] },
       code: e.code,
-      typed: e.typed,
-      rows: Map::new(),
       here: e.here,
+      performs: row_empty(),
     }
   }
 
 /// The body of the root written for `op` of containers of type `t`, as lowered code over its
-/// parameters `a`, `b` and, for the loops, `i`, the types it files, and the definitions its calls
-/// name. Two lists, arrays or columns are equal where they have one length and each
-/// pair at an index is equal, and ordered by the first pair that is not equal, a shorter one first
-/// where the other begins with it; two maps as the lists of their entries in key order are. A
-/// container is reflected, shown or digested item by item at the items' type, a map entry by entry.
+/// parameters `a`, `b` and, for the loops, `i`, and the definitions its calls name. Two lists, arrays
+/// or columns are equal where they have one length and each pair at an index is equal, and ordered by
+/// the first pair that is not equal, a shorter one first where the other begins with it; two maps as
+/// the lists of their entries in key order are. A container is reflected, shown or digested item by
+/// item at the items' type, a map entry by entry.
 fn walked_code(
   module: Bytes,
+  ctors: Ctors,
   op: Bytes,
   t: Type,
-) -> { code: Code, typed: Map<Int, Typed>, here: List<Def> } / {abort.raise} = {
-  let at = |node: Node, span: Span| { node: node, span: span };
-  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
-  let named = |name: Bytes| at(NVar({ name: name, slot: None }), dummy_span());
-  let lit = |l: Lit| at(NLit(l), dummy_span());
-  let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }), dummy_span());
-  let builtin = |name: Bytes, k: Int| at(NVar({ name: name, slot: None }), placed(k));
-  let binary = |op2: Bytes, l: Code, r: Code, k: Int|
-    at(NBinary({ op: op2, lhs: l, rhs: r }), placed(k));
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let args = match t { TyCon(c) -> c.args, _ -> [] };
   let kind = match t { TyCon(c) -> c.name, _ -> b"" };
   let fields_of = match t { TyRecord(fs) -> fs, TyNominal(x) -> x.fields, _ -> [] };
-  let value = TyCon({ name: b"std.value.Value", args: [] });
+  let value = value_type();
   // What a `Result`'s `Err` holds.
   let failure = match args.at(1) { Some(e) -> e, None -> unknown_type() };
   // A map is walked as the list of its entries.
   let walked = if kind == map_name() {
-    TyCon({
-      name: list_name(),
-      args: [
-        TyRecord([
-          { name: b"key", ty: match args.at(0) { Some(k) -> k, None -> unknown_type() } },
-          { name: b"value", ty: match args.at(1) { Some(v) -> v, None -> unknown_type() } },
-        ]),
-      ],
-    })
+    list_type(
+      TyRecord([
+        { name: b"key", ty: match args.at(0) { Some(k) -> k, None -> unknown_type() } },
+        { name: b"value", ty: match args.at(1) { Some(v) -> v, None -> unknown_type() } },
+      ]),
+    )
   } else { t };
   let item = match walked {
     TyCon(c) -> match c.args.at(0) { Some(e) -> e, None -> unknown_type() },
     _ -> unknown_type(),
   };
-  let field = |name: Bytes|
-    match item {
-      TyRecord(fs) ->
-        fs.fold(unknown_type(), |acc: Type, f: Field| if f.name == name { f.ty } else { acc }),
-      _ -> unknown_type(),
-    };
+  let field = |name: Bytes| field_of(item, name);
   let of = if kind == array_name() { b"Array::" }
   else if kind == columns_name() { b"Columns::" }
   else { b"List::" };
-  let loop_named = |name: Bytes|
-    local_root(module, root_text(root_name(keys::written(Contained(name), walked, module))));
   let here = if kind == map_name() {
     container_defs(module, t).concat(container_defs(module, walked))
   } else { container_defs(module, t) };
@@ -291,311 +193,278 @@ fn walked_code(
   let gathered_item = if op == b"digest_from" || op == b"digest_entries_from" { bytes_type() }
   else if op == b"reflect_entries_from" || op == b"shown_entries_from" { entry_of_values }
   else { value };
-  let typed = [
-    { k: 0, ty: filed_as(unknown_type(), args) },
-    { k: 1, ty: filed_as(unknown_type(), args) },
-    { k: 3, ty: filed_as(unknown_type(), [item]) },
-    { k: 4, ty: filed_as(unknown_type(), [item]) },
-    { k: 5, ty: filed_as(item, []) },
-    { k: 6, ty: filed_as(item, []) },
-    { k: 9, ty: filed_as(unknown_type(), [item]) },
-    { k: 13, ty: filed_as(unknown_type(), [item]) },
-    { k: 14, ty: filed_as(list_type(value), []) },
-    { k: 15, ty: filed_as(unknown_type(), [item]) },
-    { k: 16, ty: filed_as(unknown_type(), [field(b"key")]) },
-    { k: 17, ty: filed_as(unknown_type(), [field(b"value")]) },
-    { k: 18, ty: filed_as(entry_of_values, []) },
-    { k: 19, ty: filed_as(list_type(entry_of_values), []) },
-    { k: 20, ty: filed_as(list_type(bytes_type()), []) },
-    { k: 21, ty: filed_as(unknown_type(), [int_type()]) },
-    { k: 23, ty: filed_as(failure, []) },
-    { k: 24, ty: filed_as(failure, []) },
-    { k: 25, ty: filed_as(unknown_type(), [failure]) },
-    { k: 28, ty: filed_as(unknown_type(), [gathered_item]) },
-  ].fold(Map::new(), |m: Map<Int, Typed>, x: { k: Int, ty: Typed }|
-    m.insert(placed(x.k).site, x.ty));
-  let a = var(b"a", 0);
-  let b = var(b"b", 1);
-  let i = var(b"i", 2);
-  let x = var(b"x", 3);
-  let next = binary(b"add", i, lit(LInt(1)), 8);
-  let length = |c: Code, k: Int|
-    call(builtin(if kind == map_name() { b"Map::len" } else { of.concat(b"len") }, k), [c]);
-  let some = |name: Bytes, slot: Int, k: Int|
-    PxCtor({
-      name: prelude_ctor(some_ctor()),
-      args: [PxVar({ name: name, slot: Some(slot), span: placed(k) })],
-    });
-  let none = PxCtor({ name: prelude_ctor(none_ctor()), args: [] });
+  let typed = container_typed(op, t);
+  let param = |i: Int| match typed.params.at(i) { Some(p) -> p, None -> t };
+  let a = slot_code(b"a", 0, param(0));
+  let b = slot_code(b"b", 1, param(1));
+  let i = slot_code(b"i", 2, int_type());
+  let x = slot_code(b"x", 3, item);
+  let y = slot_code(b"y", 4, item);
+  let next = binary_of(b"add", i, int_code(1));
+  // A call of the loop `name` written for the walked container.
+  let looped = |name: Bytes, operands: List<Code>| {
+    let key = keys::written(Contained(name), walked, module);
+    call_of(module, key, operands, container_typed(name, walked).ret)
+  };
+  let length = |c: Code, over: List<Type>|
+    builtin_call(
+      if kind == map_name() { b"Map::len" } else { of.concat(b"len") },
+      over,
+      [c],
+      int_type(),
+    );
   // An array's or columns' item is read by the inline `get`, so no root calls a prelude function the
   // program may not reach.
-  let match_at = |list: Code, k: Int, name: Bytes, slot: Int, binder: Int, found: Code, ended: Code|
+  let match_at = |list: Code, name: Bytes, slot: Int, found: Code, ended: Code|
     if kind == array_name() || kind == columns_name() {
-      at(
-        NIf({
-          cond: binary(b"lt", i, length(list, k), 27),
-          then_branch: at(
-            NBlock({
-              stmts: [
-                CLet({
-                  name: name,
-                  slot: slot,
-                  value: call(builtin(of.concat(b"get"), k), [list, i]),
-                }),
-              ],
-              tail: Some(found),
+      if_code(
+        binary_of(b"lt", i, length(list, [item])),
+        block_code(
+          [
+            CLet({
+              name: name,
+              slot: slot,
+              value: builtin_call(of.concat(b"get"), [item], [list, i], item),
             }),
-            dummy_span(),
-          ),
-          else_branch: ended,
-        }),
-        dummy_span(),
+          ],
+          found,
+        ),
+        ended,
       )
     } else {
-      at(
-        NMatch({
-          scrutinee: call(builtin(b"List::at", k), [list, i]),
-          arms: [
-            { pat: some(name, slot, binder), guard: None, body: found },
-            { pat: none, guard: None, body: ended },
-          ],
-        }),
-        dummy_span(),
+      some_or(
+        prelude_call(b"List::at", [item], [list, i], option_type(item)),
+        name,
+        slot,
+        item,
+        found,
+        ended,
       )
     };
   // The list or array walked, a map's entries for a map.
-  let walked_of = |c: Code, k: Int|
-    if kind == map_name() { call(builtin(b"Map::entries", k), [c]) } else { c };
+  let walked_of = |c: Code|
+    if kind == map_name() { prelude_call(b"Map::entries", args, [c], walked) } else { c };
   // What a loop over one container adds to `b` for the item `x`.
-  let part = |builtin_name: Bytes, c: Code, k: Int| call(builtin(builtin_name, k), [c]);
+  let part = |builtin_name: Bytes, c: Code|
+    builtin_call(builtin_name, [c.ty], [c], if builtin_name == b"?encoded" { bytes_type() }
+    else { value });
   let gathered = |name: Bytes, pushed: (Code) -> Code|
-    match_at(a, 3, b"x", 3, 5, call(named(loop_named(name)), [a, pushed(b), next]), b);
-  let push = |list: Code, v: Code| call(builtin(b"List::push", 28), [list, v]);
+    match_at(a, b"x", 3, looped(name, [a, pushed(b), next]), b);
+  let push = |list: Code, v: Code| prelude_call(b"List::push", [gathered_item], [list, v], list.ty);
   let entry = |builtin_name: Bytes|
-    at(
+    bare(
       NRecord({
         fields: [
-          {
-            name: b"key",
-            value: part(builtin_name, at(NField({ base: x, field: b"key" }), dummy_span()), 16),
-          },
-          {
-            name: b"value",
-            value: part(builtin_name, at(NField({ base: x, field: b"value" }), dummy_span()), 17),
-          },
+          { name: b"key", value: part(builtin_name, field_code(x, b"key", field(b"key"))) },
+          { name: b"value", value: part(builtin_name, field_code(x, b"value", field(b"value"))) },
         ],
       }),
-      placed(18),
+      entry_of_values,
     );
-  let empty = |k: Int| at(NList({ items: [] }), placed(k));
+  let empty = |of_item: Type| bare(NList({ items: [] }), list_type(of_item));
   // `?compare` of the two items, or of their field `name`, and `then` where it answers `Equal`.
-  let ordered_then = |name: Bytes, k: Int, slot: Int, eq_at: Int, then: Code| {
-    let read = |c: Code|
-      if name == b"" { c } else { at(NField({ base: c, field: name }), dummy_span()) };
+  let ordered_then = |name: Bytes, slot: Int, then: Code| {
+    let read = |c: Code| if name == b"" { c } else { field_code(c, name, field(name)) };
     let o = b"o".concat(ascii_of_int(slot));
-    at(
-      NBlock({
-        stmts: [
-          CLet({
-            name: o,
-            slot: slot,
-            value: call(builtin(b"?compare", k), [read(x), read(var(b"y", 4))]),
-          }),
-        ],
-        tail: Some(
-          at(
-            NIf({
-              cond: binary(b"eq", var(o, slot), said(equal_ctor()), eq_at),
-              then_branch: then,
-              else_branch: var(o, slot),
-            }),
-            dummy_span(),
-          ),
+    let compared = compare_call(read(x), read(y));
+    block_code(
+      [CLet({ name: o, slot: slot, value: compared })],
+      if_code(
+        binary_of(
+          b"eq",
+          slot_code(o, slot, ordering_type()),
+          prelude_made(equal_ctor(), [], ordering_type()),
         ),
-      }),
-      dummy_span(),
+        then,
+        slot_code(o, slot, ordering_type()),
+      ),
     )
   };
   let body = if kind == b"" && op == b"equal" {
     // A record's fields in the order their names sort, each compared at its own type.
-    range(0, fields_of.len()).fold(lit(LBool(true)), |acc: Code, k: Int| {
-      let f = fields_of.get(k);
-      let read = |c: Code| at(NField({ base: c, field: f.name }), dummy_span());
-      let eq = binary(b"eq", read(a), read(b), 40 + k);
-      if k == 0 { eq } else { at(NBinary({ op: b"and", lhs: acc, rhs: eq }), dummy_span()) }
-    })
+    fields_of.fold(
+      { code: bool_code(true), first: true },
+      |acc: { code: Code, first: Bool }, f: Field| {
+        let read = |c: Code| field_code(c, f.name, f.ty);
+        let eq = binary_of(b"eq", read(a), read(b));
+        { code: if acc.first { eq } else { binary_of(b"and", acc.code, eq) }, first: false }
+      },
+    ).code
   } else if kind == result_name() {
     let arm = |pat: CodePattern, body2: Code| { pat: pat, guard: None, body: body2 };
-    let on = |scrutinee: Code, arms: List<CodeArm>|
-      at(NMatch({ scrutinee: scrutinee, arms: arms }), dummy_span());
-    let one = |ctor: Bytes, slot: Int, k: Int|
-      PxCtor({
-        name: prelude_ctor(ctor),
-        args: [
-          PxVar({ name: if slot == 3 { b"x" } else { b"y" }, slot: Some(slot), span: placed(k) }),
-        ],
-      });
-    let other = |ctor: Bytes| PxCtor({ name: prelude_ctor(ctor), args: [PxWild] });
-    let y = var(b"y", 4);
+    let one = |ctor: Bytes, slot: Int, held: Type|
+      prelude_pattern(ctor, [binder(if slot == 3 { b"x" } else { b"y" }, slot, held)]);
+    let other = |ctor: Bytes| prelude_pattern(ctor, [PxWild]);
+    let ok = match args.at(0) { Some(o) -> o, None -> unknown_type() };
+    let xs = |held: Type| slot_code(b"x", 3, held);
+    let ys = |held: Type| slot_code(b"y", 4, held);
     if op == b"equal" {
-      on(a, [
-        arm(
-          one(ok_ctor(), 3, 5),
-          on(b, [
-            arm(one(ok_ctor(), 4, 6), binary(b"eq", x, y, 7)),
-            arm(PxWild, lit(LBool(false))),
-          ]),
-        ),
-        arm(
-          one(err_ctor(), 3, 23),
-          on(b, [
-            arm(one(err_ctor(), 4, 24), binary(b"eq", x, y, 26)),
-            arm(PxWild, lit(LBool(false))),
-          ]),
-        ),
-      ])
+      match_code(
+        a,
+        [
+          arm(
+            one(ok_ctor(), 3, ok),
+            match_code(
+              b,
+              [
+                arm(one(ok_ctor(), 4, ok), binary_of(b"eq", xs(ok), ys(ok))),
+                arm(PxWild, bool_code(false)),
+              ],
+              bool_type(),
+            ),
+          ),
+          arm(
+            one(err_ctor(), 3, failure),
+            match_code(
+              b,
+              [
+                arm(one(err_ctor(), 4, failure), binary_of(b"eq", xs(failure), ys(failure))),
+                arm(PxWild, bool_code(false)),
+              ],
+              bool_type(),
+            ),
+          ),
+        ],
+        bool_type(),
+      )
     } else {
-      on(a, [
-        arm(
-          one(err_ctor(), 3, 23),
-          on(b, [
-            arm(one(err_ctor(), 4, 24), call(builtin(b"?compare", 25), [x, y])),
-            arm(other(ok_ctor()), said(less_ctor())),
-          ]),
-        ),
-        arm(
-          one(ok_ctor(), 3, 5),
-          on(b, [
-            arm(one(ok_ctor(), 4, 6), call(builtin(b"?compare", 9), [x, y])),
-            arm(other(err_ctor()), said(greater_ctor())),
-          ]),
-        ),
-      ])
+      match_code(
+        a,
+        [
+          arm(
+            one(err_ctor(), 3, failure),
+            match_code(
+              b,
+              [
+                arm(one(err_ctor(), 4, failure), compare_call(xs(failure), ys(failure))),
+                arm(other(ok_ctor()), prelude_made(less_ctor(), [], ordering_type())),
+              ],
+              ordering_type(),
+            ),
+          ),
+          arm(
+            one(ok_ctor(), 3, ok),
+            match_code(
+              b,
+              [
+                arm(one(ok_ctor(), 4, ok), compare_call(xs(ok), ys(ok))),
+                arm(other(err_ctor()), prelude_made(greater_ctor(), [], ordering_type())),
+              ],
+              ordering_type(),
+            ),
+          ),
+        ],
+        ordering_type(),
+      )
     }
   } else if kind == option_name() && op == b"equal" {
     let arm = |pat: CodePattern, body2: Code| { pat: pat, guard: None, body: body2 };
-    let on = |scrutinee: Code, arms: List<CodeArm>|
-      at(NMatch({ scrutinee: scrutinee, arms: arms }), dummy_span());
-    on(a, [
-      arm(none, on(b, [arm(none, lit(LBool(true))), arm(PxWild, lit(LBool(false)))])),
-      arm(
-        some(b"x", 3, 5),
-        on(b, [
-          arm(some(b"y", 4, 6), binary(b"eq", x, var(b"y", 4), 7)),
-          arm(PxWild, lit(LBool(false))),
-        ]),
-      ),
-    ])
+    let none = prelude_pattern(none_ctor(), []);
+    match_code(
+      a,
+      [
+        arm(
+          none,
+          match_code(b, [arm(none, bool_code(true)), arm(PxWild, bool_code(false))], bool_type()),
+        ),
+        arm(
+          prelude_pattern(some_ctor(), [binder(b"x", 3, item)]),
+          match_code(
+            b,
+            [
+              arm(prelude_pattern(some_ctor(), [binder(b"y", 4, item)]), binary_of(b"eq", x, y)),
+              arm(PxWild, bool_code(false)),
+            ],
+            bool_type(),
+          ),
+        ),
+      ],
+      bool_type(),
+    )
   } else if kind == option_name() {
     let arm = |pat: CodePattern, body2: Code| { pat: pat, guard: None, body: body2 };
-    let on = |scrutinee: Code, arms: List<CodeArm>|
-      at(NMatch({ scrutinee: scrutinee, arms: arms }), dummy_span());
-    on(a, [
-      arm(none, on(b, [arm(none, said(equal_ctor())), arm(PxWild, said(less_ctor()))])),
-      arm(
-        some(b"x", 3, 5),
-        on(b, [
-          arm(none, said(greater_ctor())),
-          arm(some(b"y", 4, 6), call(builtin(b"?compare", 9), [x, var(b"y", 4)])),
-        ]),
-      ),
-    ])
+    let none = prelude_pattern(none_ctor(), []);
+    let order = |name: Bytes| prelude_made(name, [], ordering_type());
+    match_code(
+      a,
+      [
+        arm(
+          none,
+          match_code(
+            b,
+            [arm(none, order(equal_ctor())), arm(PxWild, order(less_ctor()))],
+            ordering_type(),
+          ),
+        ),
+        arm(
+          prelude_pattern(some_ctor(), [binder(b"x", 3, item)]),
+          match_code(
+            b,
+            [
+              arm(none, order(greater_ctor())),
+              arm(prelude_pattern(some_ctor(), [binder(b"y", 4, item)]), compare_call(x, y)),
+            ],
+            ordering_type(),
+          ),
+        ),
+      ],
+      ordering_type(),
+    )
   } else if op == b"equal" {
-    at(
-      NIf({
-        cond: binary(b"eq", length(a, 0), length(b, 1), 2),
-        then_branch: call(named(loop_named(b"equal_from")), [
-          walked_of(a, 0),
-          walked_of(b, 1),
-          lit(LInt(0)),
-        ]),
-        else_branch: lit(LBool(false)),
-      }),
-      dummy_span(),
+    if_code(
+      binary_of(b"eq", length(a, args), length(b, args)),
+      looped(b"equal_from", [walked_of(a), walked_of(b), int_code(0)]),
+      bool_code(false),
     )
   } else if op == b"ordered" {
-    itself_equal(
-      call(named(loop_named(b"ordered_from")), [walked_of(a, 0), walked_of(b, 1), lit(LInt(0))]),
-    )
+    itself_equal(looped(b"ordered_from", [walked_of(a), walked_of(b), int_code(0)]), t)
   } else if op == b"equal_from" {
     match_at(
       a,
-      3,
       b"x",
       3,
-      5,
       match_at(
         b,
-        4,
         b"y",
         4,
-        6,
-        at(
-          NIf({
-            cond: binary(b"eq", x, var(b"y", 4), 7),
-            then_branch: call(named(loop_named(b"equal_from")), [a, b, next]),
-            else_branch: lit(LBool(false)),
-          }),
-          dummy_span(),
-        ),
-        lit(LBool(false)),
+        if_code(binary_of(b"eq", x, y), looped(b"equal_from", [a, b, next]), bool_code(false)),
+        bool_code(false),
       ),
-      lit(LBool(true)),
+      bool_code(true),
     )
   } else if op == b"ordered_from" {
     match_at(
       a,
-      3,
       b"x",
       3,
-      5,
       match_at(
         b,
-        4,
         b"y",
         4,
-        6,
         // Item by item, a map's entry by its key and then its value.
         if is_entry(item) {
-          ordered_then(
-            b"key",
-            16,
-            5,
-            10,
-            ordered_then(
-              b"value",
-              17,
-              6,
-              22,
-              call(named(loop_named(b"ordered_from")), [a, b, next]),
-            ),
-          )
-        } else {
-          ordered_then(b"", 9, 5, 10, call(named(loop_named(b"ordered_from")), [a, b, next]))
-        },
-        said(greater_ctor()),
+          ordered_then(b"key", 5, ordered_then(b"value", 6, looped(b"ordered_from", [a, b, next])))
+        } else { ordered_then(b"", 5, looped(b"ordered_from", [a, b, next])) },
+        prelude_made(greater_ctor(), [], ordering_type()),
       ),
-      at(
-        NIf({
-          cond: binary(b"lt", i, call(builtin(of.concat(b"len"), 13), [b]), 12),
-          then_branch: said(less_ctor()),
-          else_branch: said(equal_ctor()),
-        }),
-        dummy_span(),
+      if_code(
+        binary_of(b"lt", i, length(b, [item])),
+        prelude_made(less_ctor(), [], ordering_type()),
+        prelude_made(equal_ctor(), [], ordering_type()),
       ),
     )
   } else if op == b"reflect_from" || op == b"shown_from" {
     let name = if op == b"reflect_from" { b"?reflect" } else { b"?shown" };
-    gathered(op, |out: Code| push(out, part(name, x, 15)))
-  } else if op == b"digest_from" { gathered(op, |out: Code| push(out, part(b"?encoded", x, 15))) }
+    gathered(op, |out: Code| push(out, part(name, x)))
+  } else if op == b"digest_from" { gathered(op, |out: Code| push(out, part(b"?encoded", x))) }
   else if op == b"reflect_entries_from" || op == b"shown_entries_from" {
     let name = if op == b"reflect_entries_from" { b"?reflect" } else { b"?shown" };
     gathered(op, |out: Code| push(out, entry(name)))
   } else if op == b"digest_entries_from" {
     gathered(op, |out: Code|
       push(
-        push(out, part(b"?encoded", at(NField({ base: x, field: b"key" }), dummy_span()), 16)),
-        part(b"?encoded", at(NField({ base: x, field: b"value" }), dummy_span()), 17),
+        push(out, part(b"?encoded", field_code(x, b"key", field(b"key")))),
+        part(b"?encoded", field_code(x, b"value", field(b"value"))),
       ))
   } else if op == b"digest" {
     // The encoding `digest.rs` writes: the container's tag and count, then each item's encoding;
@@ -605,20 +474,19 @@ fn walked_code(
     else if kind == array_name() || kind == columns_name() { 10 }
     else { 9 };
     let loop_name = if kind == map_name() { b"digest_entries_from" } else { b"digest_from" };
-    call(named(b"?concat"), [
-      said_list(
-        [
-          lit(LBytes(byte_of_int(tag))),
-          call(said(b"Bytes::slice"), [
-            part(b"?encoded", length(a, 0), 21),
-            lit(LInt(1)),
-            lit(LInt(9)),
-          ]),
-          call(named(b"?concat"), [
-            call(named(loop_named(loop_name)), [walked_of(a, 1), empty(20), lit(LInt(0))]),
-          ]),
-        ],
-        0,
+    joined([
+      bytes_code(byte_of_int(tag)),
+      builtin_call(
+        b"Bytes::slice",
+        [],
+        [part(b"?encoded", length(a, args)), int_code(1), int_code(9)],
+        bytes_type(),
+      ),
+      builtin_call(
+        b"?concat",
+        [],
+        [looped(loop_name, [walked_of(a), empty(bytes_type()), int_code(0)])],
+        bytes_type(),
       ),
     ])
   } else {
@@ -631,75 +499,30 @@ fn walked_code(
       if reflecting { b"reflect_entries_from" } else { b"shown_entries_from" }
     } else if reflecting { b"reflect_from" }
     else { b"shown_from" };
-    call(said(made), [
-      call(named(loop_named(loop_name)), [
-        walked_of(a, 1),
-        empty(if kind == map_name() { 19 } else { 14 }),
-        lit(LInt(0)),
+    value_made(ctors, made, [
+      looped(loop_name, [
+        walked_of(a),
+        empty(if kind == map_name() { entry_of_values } else { value }),
+        int_code(0),
       ]),
     ])
   };
-  { code: body, typed: said_typed(typed, [list_type(bytes_type())]), here: here }
+  { code: body, here: here }
 }
 
 /// The name `root`, written in `module`, has there.
 pub fn local_root(module: Bytes, root: Bytes) -> Bytes / {abort.raise} =
   if module.len() == 0 { root } else { root.slice(module.len() + 1, root.len()) }
 
-/// A function the module of a declared sum states for it: `f`'s name in the sum's module, the type
-/// arguments a call of it files, its type at them, what it answers there, and the row a call fills
-/// each of its row variables with.
-pub type StatedFn = { f: Bytes, args: List<Type>, fn_type: Type, ret: Type, rows: List<Row> }
-
-/// The code written for a root, and what it files: the types at its sites and the rows its calls of
-/// definitions generic over rows fill them with.
-pub type WrittenCode = { code: Code, typed: Map<Int, Typed>, rows: Map<Int, FiledRows> }
-
-/// A value written code binds: its name, the slot holding it, and where its type is filed.
-type Bound = { name: Bytes, slot: Int, span: Span }
-
-/// A constructor's argument as `T#eq` reads it: bound on each side, and where they are compared.
-type Compared = { x: Bound, y: Bound, compared: Span }
-
-/// A constructor's argument as `T#cmp` reads it: bound on each side, where `compare` orders them,
-/// the slot holding that order, and where the order is tested.
-type Ordered = { x: Bound, y: Bound, compared: Span, order: Bound, decided: Span }
-
-/// A constructor's argument bound, and where a call the emitter settles by its type takes it.
-type Passed = { x: Bound, at: Span }
-
-/// A constructor's argument as a crossing reads it: its binder, and the code crossing it.
-type Crossed = { pat: CodePattern, part: Code }
-
-/// Each argument, of `types` in turn, bound as `x<j>` and handed to a call filed at its type.
-fn args_passed(w: Writing, types: List<Type>) -> { w: Writing, made: List<Passed> } =
-  written_each(w, types, |v: Writing, t: Type, j: Int| {
-    let x = bound_next(v, b"x".concat(ascii_of_int(j)), t);
-    let s = filing(x.w, filed_as(unknown_type(), [t]));
-    { w: s.w, made: { x: x.bound, at: s.span } }
-  })
-
-fn binder(b: Bound) -> CodePattern = PxVar({ name: b.name, slot: Some(b.slot), span: b.span })
-
-fn bound_read(b: Bound) -> Code =
-  { node: NVar({ name: b.name, slot: Some(b.slot) }), span: dummy_span() }
-
-/// What written code makes for each of `xs` in turn, by `each` from what was written so far, the
-/// item and its place among `xs`.
-fn written_each<a, b | e>(
-  w: Writing,
-  xs: List<a>,
-  each: (Writing, a, Int) -> { w: Writing, made: b } / e,
-) -> { w: Writing, made: List<b> } / e =
-  xs.fold({ w: w, made: [] }, |acc: { w: Writing, made: List<b> }, x: a| {
-    let m = each(acc.w, x, acc.made.len());
-    { w: m.w, made: acc.made.push(m.made) }
-  })
+/// A function the module of a declared sum states for it: `full`, its name across the program, the
+/// type arguments a call of it names it at, its type at them, what it answers there, and the row a
+/// call fills each of its row variables with.
+pub type StatedFn = { full: Bytes, args: List<Type>, fn_type: Type, ret: Type, rows: List<Row> }
 
 /// The key the module states for the declared sum `ty` (`key for T by f`), at `ty`'s arguments; none
 /// where it states none.
 pub fn keyed_by(module: Bytes, here: List<Def>, items: List<Item>, ty: Type) -> Option<StatedFn> =
-  stated_for(here, ty, |c: Bytes|
+  stated_for(module, here, ty, |c: Bytes|
     items.fold(None, |acc: Option<Bytes>, item: Item|
       match item {
         IInstance(d) -> if d.kind == NKey && qualify(module, d.target.name) == c { Some(d.by.name) }
@@ -716,7 +539,7 @@ pub fn numeric_stated(
   ty: Type,
   op: Bytes,
 ) -> Option<StatedFn> =
-  stated_for(here, ty, |c: Bytes|
+  stated_for(module, here, ty, |c: Bytes|
     items.fold(None, |acc: Option<Bytes>, item: Item|
       match item {
         INumeric(d) -> if qualify(module, d.target.name) == c {
@@ -725,10 +548,15 @@ pub fn numeric_stated(
         _ -> acc,
       }))
 
-/// The function `named` finds stated for the sum `ty` names, at `ty`'s arguments: each of its
-/// variables, type or row, the argument of `ty` its signature names it at, a row it names at none
-/// the empty row.
-fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Option<StatedFn> =
+/// The function `named` finds stated for the sum `ty` names, among `here`, the definitions of
+/// `module`, at `ty`'s arguments: each of its variables, type or row, the argument of `ty` its
+/// signature names it at, a row it names at none the empty row.
+fn stated_for(
+  module: Bytes,
+  here: List<Def>,
+  ty: Type,
+  named: (Bytes) -> Option<Bytes>,
+) -> Option<StatedFn> =
   match ty {
     TyCon(c) -> match named(c.name) {
       None -> None,
@@ -762,7 +590,7 @@ fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Opt
                   _ -> found,
                 }));
             Some({
-              f: f,
+              full: qualify(module, f),
               args: args,
               fn_type: at_args(sc.ty, sc.ty_vars, args),
               ret: at_args(fn_ty.ret, sc.ty_vars, args),
@@ -777,421 +605,274 @@ fn stated_for(here: List<Def>, ty: Type, named: (Bytes) -> Option<Bytes>) -> Opt
     _ -> None,
   }
 
-/// What calls of `s` whose names are written at `sites` file of the rows they fill: none where `s` is
-/// generic over no row.
-fn stated_rows(s: StatedFn, sites: List<Int>) -> Map<Int, FiledRows> =
-  if s.rows.len() == 0 { Map::new() } else {
-    sites.fold(Map::new(), |m: Map<Int, FiledRows>, site: Int| m.insert(site, RowArguments(s.rows)))
-  }
+/// A call of `s` on `args`.
+fn stated_call(s: StatedFn, args: List<Code>) -> Code =
+  applied(
+    bare(NDef({ full: s.full, args: s.args, rows: s.rows, labels: [] }), s.fn_type),
+    args,
+    s.ret,
+  )
 
-/// The body of a root doing what `s` does over its `arity` parameters, `a` and `b`, and what it
-/// files: a call of `s`.
-pub fn stated_code(s: StatedFn, arity: Int) -> WrittenCode = {
-  let placed = { start: 0, end: 0, site: 1 };
-  let var = |name: Bytes, slot: Int|
-    { node: NVar({ name: name, slot: Some(slot) }), span: dummy_span() };
-  {
-    code: {
-      node: NApp({
-        func: { node: NVar({ name: s.f, slot: None }), span: placed },
-        args: range(0, arity).map(|i: Int| var(if i == 0 { b"a" } else { b"b" }, i)),
-      }),
-      span: dummy_span(),
-    },
-    typed: said_typed(Map::new().insert(placed.site, filed_as(s.fn_type, s.args)), []),
-    rows: stated_rows(s, [placed.site]),
-  }
-}
+/// The body of a root doing what `s` does over its parameters `a` and `b`, of types `params`: a call
+/// of `s`.
+pub fn stated_code(s: StatedFn, params: List<Type>) -> Code =
+  stated_call(
+    s,
+    range(0, params.len()).map(|i: Int|
+      slot_code(if i == 0 { b"a" } else { b"b" }, i, match params.at(i) {
+        Some(t) -> t,
+        None -> unknown_type(),
+      })),
+  )
 
-/// The body of `T#cmp`, or of `T#eq` where `eq`, for a sum whose module states its key `k`, over its
-/// two parameters and what it files: the parameters' keys ordered, and equal where they order so, as
-/// values whose keys are equal are.
-pub fn keyed_code(k: StatedFn, eq: Bool) -> WrittenCode = {
-  let at = |node: Node, span: Span| { node: node, span: span };
-  let placed = |n: Int| { start: 0, end: n, site: n + 1 };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
-  let key_of = |x: Code, n: Int|
-    at(NApp({ func: at(NVar({ name: k.f, slot: None }), placed(n)), args: [x] }), dummy_span());
-  let ordered = at(
-    NApp({
-      func: at(NVar({ name: b"?compare", slot: None }), placed(0)),
-      args: [key_of(var(b"a", 0), 1), key_of(var(b"b", 1), 2)],
-    }),
-    dummy_span(),
+/// The body of `T#cmp`, or of `T#eq` where `eq`, for a sum `ty` whose module states its key `k`, over
+/// its two parameters: the parameters' keys ordered, and equal where they order so, as values whose
+/// keys are equal are.
+pub fn keyed_code(k: StatedFn, eq: Bool, ty: Type) -> Code = {
+  let ordered = compare_call(
+    stated_call(k, [slot_code(b"a", 0, ty)]),
+    stated_call(k, [slot_code(b"b", 1, ty)]),
   );
-  let called = |m: Map<Int, Typed>, n: Int| m.insert(placed(n).site, filed_as(k.fn_type, k.args));
-  {
-    code: if eq { at(NBinary({ op: b"eq", lhs: ordered, rhs: said(equal_ctor()) }), placed(3)) }
-    else { ordered },
-    typed: said_typed(
-      called(called(Map::new().insert(placed(0).site, filed_as(unknown_type(), [k.ret])), 1), 2),
-      [],
-    ),
-    rows: stated_rows(k, [placed(1).site, placed(2).site]),
-  }
+  if eq { binary_of(b"eq", ordered, prelude_made(equal_ctor(), [], ordering_type())) }
+  else { ordered }
 }
 
-/// The body of `T#eq` for a sum of constructors `cs`, as lowered code over its two parameters, and the
-/// binder types it files: each constructor's arguments compared in turn where both are that
-/// constructor.
-pub fn equality_code(cs: List<SumCtor>) -> WrittenCode = {
-  let at = |node: Node, span: Span| { node: node, span: span };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
-  let walked = cs.fold(
-    { arms: [], w: writing_from(2, 0) },
-    |acc: { arms: List<CodeArm>, w: Writing }, c: SumCtor| {
-      // Each argument bound on both sides, and where their comparison stands.
-      let fields = written_each(acc.w, c.fields, |q: Writing, t: Type, j: Int| {
-        let x = bound_next(q, b"x".concat(ascii_of_int(j)), t);
-        let y = bound_next(x.w, b"y".concat(ascii_of_int(j)), t);
-        let compared = placing(y.w);
-        { w: compared.w, made: { x: x.bound, y: y.bound, compared: compared.span } }
-      });
-      let same = fields.made.fold(None, |both: Option<Code>, f: Compared| {
-        let eq = at(NBinary({ op: b"eq", lhs: bound_read(f.x), rhs: bound_read(f.y) }), f.compared);
-        Some(match both {
-          None -> eq,
-          Some(b) -> at(NBinary({ op: b"and", lhs: b, rhs: eq }), dummy_span()),
-        })
-      });
-      let inner = at(
-        NMatch({
-          scrutinee: var(b"b", 1),
-          arms: [
-            {
-              pat: PxCtor({
-                name: written_ctor(c.name),
-                args: fields.made.map(|f: Compared| binder(f.y)),
-              }),
-              guard: None,
-              body: match same { Some(s) -> s, None -> at(NLit(LBool(true)), dummy_span()) },
-            },
-            { pat: PxWild, guard: None, body: at(NLit(LBool(false)), dummy_span()) },
-          ],
-        }),
-        dummy_span(),
-      );
-      {
-        arms: acc.arms.push({
-          pat: PxCtor({
-            name: written_ctor(c.name),
-            args: fields.made.map(|f: Compared| binder(f.x)),
-          }),
+/// The body of `T#eq` for the sum `ty` of constructors `cs`, as lowered code over its two
+/// parameters: each constructor's arguments compared in turn where both are that constructor.
+pub fn equality_code(ty: Type, cs: List<SumCtor>) -> Code = {
+  let sum = match ty { TyCon(c) -> c.name, _ -> b"" };
+  let arms = cs.map(|c: SumCtor| {
+    let xs = bound_from(2, b"x", c.fields);
+    let ys = bound_from(2 + xs.len(), b"y", c.fields);
+    let same = zip(xs, ys).fold(None, |both: Option<Code>, p: { first: Bound, second: Bound }| {
+      let eq = binary_of(b"eq", bound_read(p.first), bound_read(p.second));
+      Some(match both { None -> eq, Some(b) -> binary_of(b"and", b, eq) })
+    });
+    let inner = match_code(
+      slot_code(b"b", 1, ty),
+      [
+        {
+          pat: PxCtor({ sum: sum, name: c.name, case: c.index, args: ys.map(bound_pattern) }),
           guard: None,
-          body: inner,
-        }),
-        w: fields.w,
-      }
-    },
-  );
-  {
-    code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span()),
-    typed: walked.w.typed,
-    rows: Map::new(),
-  }
+          body: match same { Some(e) -> e, None -> bool_code(true) },
+        },
+        { pat: PxWild, guard: None, body: bool_code(false) },
+      ],
+      bool_type(),
+    );
+    {
+      pat: PxCtor({ sum: sum, name: c.name, case: c.index, args: xs.map(bound_pattern) }),
+      guard: None,
+      body: inner,
+    }
+  });
+  match_code(slot_code(b"a", 0, ty), arms, bool_type())
 }
 
-/// The body of `T#eq` for a type no sum names, as lowered code over its two parameters: `a == b`,
-/// which compares them as `==` at `T` does.
-pub fn compared_code() -> WrittenCode =
-  {
-    code: bare(NBinary({ op: b"eq", lhs: slot_code(b"a", 0), rhs: slot_code(b"b", 1) })),
-    typed: Map::new(),
-    rows: Map::new(),
-  }
+/// The body of `T#eq` for a type `ty` no sum names, as lowered code over its two parameters: `a ==
+/// b`, which compares them as `==` at `T` does.
+pub fn compared_code(ty: Type) -> Code =
+  binary_of(b"eq", slot_code(b"a", 0, ty), slot_code(b"b", 1, ty))
 
 /// The body of `T#cmp` for a type `ty` no sum names, as lowered code over its two parameters:
 /// `compare(a, b)`, which orders them as `compare` at `ty` does.
-pub fn ordered_code(ty: Type) -> WrittenCode = {
-  let c = call_at(writing(), b"compare", [slot_code(b"a", 0), slot_code(b"b", 1)], [ty]);
-  { code: c.code, typed: c.w.typed, rows: c.w.rows }
-}
+pub fn ordered_code(ty: Type) -> Code =
+  builtin_call(b"compare", [ty], [slot_code(b"a", 0, ty), slot_code(b"b", 1, ty)], ordering_type())
 
-/// The body of `T#cmp` for a sum of constructors `cs`, as lowered code over its two parameters, and
-/// the binder and call types it files: as the evaluator orders two constructors' values, by the
-/// constructors' names and then by each argument in turn as its type orders.
-pub fn ordering_code(cs: List<SumCtor>) -> WrittenCode = {
-  let at = |node: Node, span: Span| { node: node, span: span };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }), dummy_span());
-  // Past the parameters and the two ranks, whose comparisons stand at the first two places.
-  let lower = placing(writing_from(4, 0));
-  let higher = placing(lower.w);
+/// A constructor's argument as `T#cmp` reads it: bound on each side, and the slot holding the order
+/// they compare in.
+type Ordered = { x: Bound, y: Bound, order: Bound }
+
+/// The body of `T#cmp` for the sum `ty` of constructors `cs`, as lowered code over its two
+/// parameters: as the evaluator orders two constructors' values, by the constructors' names and then
+/// by each argument in turn as its type orders.
+pub fn ordering_code(ty: Type, cs: List<SumCtor>) -> Code = {
+  let sum = match ty { TyCon(c) -> c.name, _ -> b"" };
+  let a = slot_code(b"a", 0, ty);
+  let b = slot_code(b"b", 1, ty);
   let rank = |c: SumCtor|
     cs.fold(0, |n: Int, d: SumCtor| if compare(d.name, c.name) == Less { n + 1 } else { n });
   let ranked = |scrutinee: Code|
-    at(
-      NMatch({
-        scrutinee: scrutinee,
-        arms: cs.map(|c: SumCtor|
-          {
-            pat: PxCtor({ name: written_ctor(c.name), args: c.fields.map(|_: Type| PxWild) }),
-            guard: None,
-            body: at(NLit(LInt(rank(c))), dummy_span()),
-          }),
-      }),
-      dummy_span(),
-    );
-  let walked = cs.fold(
-    { arms: [], w: higher.w },
-    |acc: { arms: List<CodeArm>, w: Writing }, c: SumCtor| {
-      // Each argument bound on both sides, its `compare` filed at its type, and the order it gives
-      // held and tested.
-      let fields = written_each(acc.w, c.fields, |q: Writing, t: Type, j: Int| {
-        let x = bound_next(q, b"x".concat(ascii_of_int(j)), t);
-        let y = bound_next(x.w, b"y".concat(ascii_of_int(j)), t);
-        let compared = filing(y.w, filed_as(unknown_type(), [t]));
-        let order = slot_next(compared.w, b"o".concat(ascii_of_int(j)));
-        let decided = placing(order.w);
+    match_code(
+      scrutinee,
+      cs.map(|c: SumCtor|
         {
-          w: decided.w,
-          made: {
-            x: x.bound,
-            y: y.bound,
-            compared: compared.span,
-            order: order.bound,
-            decided: decided.span,
-          },
-        }
-      });
-      let compared = |f: Ordered|
-        at(
-          NApp({
-            func: at(NVar({ name: b"?compare", slot: None }), f.compared),
-            args: [bound_read(f.x), bound_read(f.y)],
+          pat: PxCtor({
+            sum: sum,
+            name: c.name,
+            case: c.index,
+            args: c.fields.map(|_: Type| PxWild),
           }),
-          dummy_span(),
-        );
+          guard: None,
+          body: int_code(rank(c)),
+        }),
+      int_type(),
+    );
+  let equal = prelude_made(equal_ctor(), [], ordering_type());
+  let walked = cs.fold(
+    { arms: [], slot: 4 },
+    |acc: { arms: List<CodeArm>, slot: Int }, c: SumCtor| {
+      let xs = bound_from(acc.slot, b"x", c.fields);
+      let ys = bound_from(acc.slot + xs.len(), b"y", c.fields);
+      let orders = bound_from(
+        acc.slot + 2 * xs.len(),
+        b"o",
+        c.fields.map(|_: Type| ordering_type()),
+      );
+      let fields = zip(zip(xs, ys), orders).map(
+        |p: { first: { first: Bound, second: Bound }, second: Bound }|
+          { x: p.first.first, y: p.first.second, order: p.second },
+      );
+      let compared = |f: Ordered| compare_call(bound_read(f.x), bound_read(f.y));
       // The first argument that orders apart decides, from the last back to the first.
-      let lex = fields.made.fold_right(None, |f: Ordered, later: Option<Code>|
+      let lex = fields.fold_right(None, |f: Ordered, later: Option<Code>|
         Some(match later {
           None -> compared(f),
           Some(l) ->
-            at(
-              NBlock({
-                stmts: [CLet({ name: f.order.name, slot: f.order.slot, value: compared(f) })],
-                tail: Some(
-                  at(
-                    NIf({
-                      cond: at(
-                        NBinary({ op: b"eq", lhs: bound_read(f.order), rhs: said(equal_ctor()) }),
-                        f.decided,
-                      ),
-                      then_branch: l,
-                      else_branch: bound_read(f.order),
-                    }),
-                    dummy_span(),
-                  ),
-                ),
-              }),
-              dummy_span(),
+            block_code(
+              [CLet({ name: f.order.name, slot: f.order.slot, value: compared(f) })],
+              if_code(binary_of(b"eq", bound_read(f.order), equal), l, bound_read(f.order)),
             ),
         }));
-      let inner = at(
-        NMatch({
-          scrutinee: var(b"b", 1),
-          arms: [
-            {
-              pat: PxCtor({
-                name: written_ctor(c.name),
-                args: fields.made.map(|f: Ordered| binder(f.y)),
-              }),
-              guard: None,
-              body: match lex { Some(l) -> l, None -> said(equal_ctor()) },
-            },
-            { pat: PxWild, guard: None, body: said(equal_ctor()) },
-          ],
-        }),
-        dummy_span(),
+      let inner = match_code(
+        b,
+        [
+          {
+            pat: PxCtor({ sum: sum, name: c.name, case: c.index, args: ys.map(bound_pattern) }),
+            guard: None,
+            body: match lex { Some(l) -> l, None -> equal },
+          },
+          { pat: PxWild, guard: None, body: equal },
+        ],
+        ordering_type(),
       );
       {
         arms: acc.arms.push({
-          pat: PxCtor({
-            name: written_ctor(c.name),
-            args: fields.made.map(|f: Ordered| binder(f.x)),
-          }),
+          pat: PxCtor({ sum: sum, name: c.name, case: c.index, args: xs.map(bound_pattern) }),
           guard: None,
           body: inner,
         }),
-        w: fields.w,
+        slot: acc.slot + 3 * xs.len(),
       }
     },
   );
-  let body = at(
-    NIf({
-      cond: at(NBinary({ op: b"lt", lhs: var(b"ra", 2), rhs: var(b"rb", 3) }), lower.span),
-      then_branch: said(less_ctor()),
-      else_branch: at(
-        NIf({
-          cond: at(NBinary({ op: b"gt", lhs: var(b"ra", 2), rhs: var(b"rb", 3) }), higher.span),
-          then_branch: said(greater_ctor()),
-          else_branch: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms }), dummy_span()),
-        }),
-        dummy_span(),
-      ),
-    }),
-    dummy_span(),
-  );
-  {
-    code: itself_equal(
-      at(
-        NBlock({
-          stmts: [
-            CLet({ name: b"ra", slot: 2, value: ranked(var(b"a", 0)) }),
-            CLet({ name: b"rb", slot: 3, value: ranked(var(b"b", 1)) }),
-          ],
-          tail: Some(body),
-        }),
-        dummy_span(),
+  let ra = slot_code(b"ra", 2, int_type());
+  let rb = slot_code(b"rb", 3, int_type());
+  itself_equal(
+    block_code(
+      [
+        CLet({ name: b"ra", slot: 2, value: ranked(a) }),
+        CLet({ name: b"rb", slot: 3, value: ranked(b) }),
+      ],
+      if_code(
+        binary_of(b"lt", ra, rb),
+        prelude_made(less_ctor(), [], ordering_type()),
+        if_code(
+          binary_of(b"gt", ra, rb),
+          prelude_made(greater_ctor(), [], ordering_type()),
+          match_code(a, walked.arms, ordering_type()),
+        ),
       ),
     ),
-    typed: said_typed(walked.w.typed, []),
-    rows: Map::new(),
-  }
-}
-
-/// `order`, the body of a written root ordering its parameters `a` and `b`, answering `Equal` at
-/// once where the two are one object: an order is reflexive, so nothing of it need be walked.
-fn itself_equal(order: Code) -> Code = {
-  let at = |node: Node| { node: node, span: dummy_span() };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
-  at(
-    NIf({
-      cond: at(
-        NApp({
-          func: at(NVar({ name: b"?same", slot: None })),
-          args: [var(b"a", 0), var(b"b", 1)],
-        }),
-      ),
-      then_branch: said(equal_ctor()),
-      else_branch: order,
-    }),
+    ty,
   )
 }
+
+/// `order`, the body of a written root ordering its parameters `a` and `b`, of type `ty`, answering
+/// `Equal` at once where the two are one object: an order is reflexive, so nothing of it need be
+/// walked.
+fn itself_equal(order: Code, ty: Type) -> Code =
+  if_code(
+    builtin_call(b"?same", [], [slot_code(b"a", 0, ty), slot_code(b"b", 1, ty)], bool_type()),
+    prelude_made(equal_ctor(), [], ordering_type()),
+    order,
+  )
 
 /// `n`'s low 64 bits, least significant byte first.
 fn le64(n: Int) -> Bytes =
   Bytes::concat_all(range(0, 8).map(|i: Int| byte_of_int(n >> 8 * i & 255)))
 
-/// The body of the root `Digest` is written as for `ty`, over its parameter `a`, a value of `ty`,
-/// and what it files: the encoding `digest.rs` writes, a record's and a constructor's own bytes
-/// written here and each part's encoding at its type. A type whose module states `key` is its key's
-/// encoding.
+/// `parts`, each bytes, joined.
+fn joined(parts: List<Code>) -> Code =
+  builtin_call(
+    b"?concat",
+    [],
+    [bare(NList({ items: parts }), list_type(bytes_type()))],
+    bytes_type(),
+  )
+
+/// The body of the root `Digest` is written as for `ty`, over its parameter `a`, a value of `ty`: the
+/// encoding `digest.rs` writes, a record's and a constructor's own bytes written here and each part's
+/// encoding at its type. A type whose module states `key` is its key's encoding.
 pub fn digest_code(
   module: Bytes,
   ctors: Ctors,
   here: List<Def>,
   items: List<Item>,
   ty: Type,
-) -> WrittenCode / {abort.raise} = {
-  let at = |node: Node| { node: node, span: dummy_span() };
-  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
-  let named = |name: Bytes| at(NVar({ name: name, slot: None }));
-  let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }));
-  let written = |b: Bytes| at(NLit(LBytes(b)));
+) -> Code / {abort.raise} = {
+  let a = slot_code(b"a", 0, ty);
   let counted = |tag: Int, n: Int| byte_of_int(tag).concat(le64(n));
   let blob = |tag: Int, b: Bytes| counted(tag, b.len()).concat(b);
-  // `x` encoded at its type: a call the emitter settles by what is filed at `span`.
-  let part = |x: Code, span: Span|
-    at(NApp({ func: { node: NVar({ name: b"?encoded", slot: None }), span: span }, args: [x] }));
-  // The place a part of type `t` is encoded at, `t` filed there.
-  let encoded_next = |q: Writing, t: Type| filing(q, filed_as(unknown_type(), [t]));
-  let joined = |parts: List<Code>| call(named(b"?concat"), [said_list(parts, 0)]);
+  // `x` encoded at its type, which the emitter settles.
+  let part = |x: Code| builtin_call(b"?encoded", [x.ty], [x], bytes_type());
   // A type of neither fields nor constructors is encoded as `?encoded` writes it in place.
-  let read = { code: part(var(b"a", 0), placed(1)), typed: Map::new(), rows: Map::new() };
+  let read = part(a);
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
-  let out = match fields_of {
-    Some(fs) -> {
-      let walked = written_each(writing_from(1, 1), fs, |q: Writing, f: Field, _: Int| {
-        let e = encoded_next(q, f.ty);
-        {
-          w: e.w,
-          made: [
-            written(blob(13, f.name)),
-            part(at(NField({ base: var(b"a", 0), field: f.name })), e.span),
-          ],
-        }
-      });
-      {
-        code: joined(
-          [written(counted(12, fs.len()))].concat(
-            walked.made.fold([], |all: List<Code>, two: List<Code>| all.concat(two)),
-          ),
-        ),
-        typed: walked.w.typed,
-        rows: Map::new(),
-      }
-    },
+  match fields_of {
+    Some(fs) ->
+      joined(
+        fs.fold([bytes_code(counted(12, fs.len()))], |acc: List<Code>, f: Field|
+          acc.concat([bytes_code(blob(13, f.name)), part(field_code(a, f.name, f.ty))])),
+      ),
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
         None -> read,
-        Some(cs) -> {
-          match keyed_by(module, here, items, ty) {
-            // Values whose keys are equal are equal, so the key is what is written.
-            Some(k) -> {
-              let encoded = encoded_next(writing_from(1, 1), k.ret);
-              let keyed = filing(encoded.w, filed_as(k.fn_type, k.args));
-              {
-                code: joined([
-                  written(byte_of_int(16)),
-                  part(
-                    call({ node: NVar({ name: k.f, slot: None }), span: keyed.span }, [
-                      var(b"a", 0),
-                    ]),
-                    encoded.span,
-                  ),
-                ]),
-                typed: keyed.w.typed,
-                rows: stated_rows(k, [keyed.span.site]),
-              }
-            },
-            None -> {
-              let walked = cs.fold(
-                { arms: [], w: writing_from(1, 1) },
-                |acc: { arms: List<CodeArm>, w: Writing }, sc: SumCtor| {
-                  let passed = args_passed(
-                    acc.w,
-                    sc.fields.map(|t: Type| at_args(t, sc.params, c.args)),
-                  );
+        Some(cs) -> match keyed_by(module, here, items, ty) {
+          // Values whose keys are equal are equal, so the key is what is written.
+          Some(k) -> joined([bytes_code(byte_of_int(16)), part(stated_call(k, [a]))]),
+          None ->
+            match_code(
+              a,
+              cs.fold(
+                { arms: [], slot: 1 },
+                |acc: { arms: List<CodeArm>, slot: Int }, sc: SumCtor| {
+                  let xs = bound_from(acc.slot, b"x", ctor_fields_at(sc, c.args));
                   let dot = range(0, sc.name.len()).fold(0 - 1, |d: Int, i: Int|
                     if sc.name.at(i) == 46 { i } else { d });
                   let simple = sc.name.slice(dot + 1, sc.name.len());
                   {
                     arms: acc.arms.push({
                       pat: PxCtor({
-                        name: written_ctor(sc.name),
-                        args: passed.made.map(|a: Passed| binder(a.x)),
+                        sum: c.name,
+                        name: sc.name,
+                        case: sc.index,
+                        args: xs.map(bound_pattern),
                       }),
                       guard: None,
                       body: joined(
-                        [written(blob(14, simple).concat(counted(15, sc.fields.len())))].concat(
-                          passed.made.map(|a: Passed| part(bound_read(a.x), a.at)),
+                        [bytes_code(blob(14, simple).concat(counted(15, xs.len())))].concat(
+                          xs.map(|x: Bound| part(bound_read(x))),
                         ),
                       ),
                     }),
-                    w: passed.w,
+                    slot: acc.slot + xs.len(),
                   }
                 },
-              );
-              {
-                code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
-                typed: walked.w.typed,
-                rows: Map::new(),
-              }
-            },
-          }
+              ).arms,
+              bytes_type(),
+            ),
         },
       },
       _ -> read,
     },
-  };
-  { ..out, typed: said_typed(out.typed, [list_type(bytes_type())]) }
+  }
 }
 
-/// The body of the root `Reflect` or `Shown` is written as for `ty`, over its parameter `a`, and
-/// what it files: a record's fields in their names' order, and a declared sum's constructor's name
-/// and arguments, each part reflected at its own type. Under `shown`, a sum whose module states a
-/// `show` is what that function writes, at the sum's arguments.
+/// The body of the root `Reflect` or `Shown` is written as for `ty`, over its parameter `a`: a
+/// record's fields in their names' order, and a declared sum's constructor's name and arguments, each
+/// part reflected at its own type. Under `shown`, a sum whose module states a `show` is what that
+/// function writes, at the sum's arguments.
 pub fn reflection_code(
   module: Bytes,
   ctors: Ctors,
@@ -1199,52 +880,39 @@ pub fn reflection_code(
   items: List<Item>,
   shown: Bool,
   ty: Type,
-) -> WrittenCode = {
-  let at = |node: Node| { node: node, span: dummy_span() };
-  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
-  let call = |f: Code, args: List<Code>| at(NApp({ func: f, args: args }));
-  let builtin = if shown { b"?shown" } else { b"?reflect" };
-  // `x` reflected at its type: a call the emitter settles by what is filed at `span`.
-  let part = |x: Code, span: Span|
-    at(NApp({ func: { node: NVar({ name: builtin, slot: None }), span: span }, args: [x] }));
+) -> Code = {
+  let a = slot_code(b"a", 0, ty);
+  let value = value_type();
+  // `x` reflected at its type, which the emitter settles.
+  let part = |x: Code|
+    builtin_call(if shown { b"?shown" } else { b"?reflect" }, [x.ty], [x], value);
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
-  let value = TyCon({ name: b"std.value.Value", args: [] });
   let field = TyRecord([{ name: b"name", ty: string_type() }, { name: b"value", ty: value }]);
-  let out = match fields_of {
-    Some(fs) -> {
-      // Each field's value reflected at its type, in a record filed at the field's type.
-      let walked = written_each(writing_from(1, 1), fs, |q: Writing, f: Field, _: Int| {
-        let reflected = filing(q, filed_as(unknown_type(), [f.ty]));
-        let made = filing(reflected.w, filed_as(field, []));
-        {
-          w: made.w,
-          made: {
-            node: NRecord({
-              fields: [
-                { name: b"name", value: at(NLit(LStr(f.name))) },
-                {
-                  name: b"value",
-                  value: part(at(NField({ base: var(b"a", 0), field: f.name })), reflected.span),
-                },
-              ],
-            }),
-            span: made.span,
-          },
-        }
-      });
-      {
-        code: call(said(b"std.value.VRecord"), [said_list(walked.made, 0)]),
-        typed: walked.w.typed,
-        rows: Map::new(),
-      }
-    },
+  match fields_of {
+    Some(fs) ->
+      value_made(ctors, b"std.value.VRecord", [
+        bare(
+          NList({
+            items: fs.map(|f: Field|
+              bare(
+                NRecord({
+                  fields: [
+                    { name: b"name", value: string_code(f.name) },
+                    { name: b"value", value: part(field_code(a, f.name, f.ty)) },
+                  ],
+                }),
+                field,
+              )),
+          }),
+          list_type(field),
+        ),
+      ]),
     None -> match ty {
       TyCon(c) -> match ctors.sums.get(c.name) {
-        None -> { code: part(var(b"a", 0), placed(1)), typed: Map::new(), rows: Map::new() },
+        None -> part(a),
         Some(cs) -> {
           let stated = if !shown { None } else {
-            stated_for(here, ty, |n: Bytes|
+            stated_for(module, here, ty, |n: Bytes|
               items.fold(None, |acc: Option<Bytes>, item: Item|
                 match item {
                   IInstance(d) -> if d.kind == NShow && qualify(module, d.target.name) == n {
@@ -1255,51 +923,43 @@ pub fn reflection_code(
           };
           match stated {
             // The function the module states, at the type's arguments.
-            Some(f) ->
-              {
-                code: call(said(b"std.value.VShown"), [
-                  call({ node: NVar({ name: f.f, slot: None }), span: placed(1) }, [var(b"a", 0)]),
-                ]),
-                typed: Map::new().insert(placed(1).site, filed_as(f.fn_type, f.args)),
-                rows: stated_rows(f, [placed(1).site]),
-              },
-            None -> {
-              let walked = cs.fold(
-                { arms: [], w: writing_from(1, 1) },
-                |acc: { arms: List<CodeArm>, w: Writing }, sc: SumCtor| {
-                  let passed = args_passed(
-                    acc.w,
-                    sc.fields.map(|t: Type| at_args(t, sc.params, c.args)),
-                  );
-                  {
-                    arms: acc.arms.push({
-                      pat: PxCtor({
-                        name: written_ctor(sc.name),
-                        args: passed.made.map(|a: Passed| binder(a.x)),
+            Some(f) -> value_made(ctors, b"std.value.VShown", [stated_call(f, [a])]),
+            None ->
+              match_code(
+                a,
+                cs.fold(
+                  { arms: [], slot: 1 },
+                  |acc: { arms: List<CodeArm>, slot: Int }, sc: SumCtor| {
+                    let xs = bound_from(acc.slot, b"x", ctor_fields_at(sc, c.args));
+                    {
+                      arms: acc.arms.push({
+                        pat: PxCtor({
+                          sum: c.name,
+                          name: sc.name,
+                          case: sc.index,
+                          args: xs.map(bound_pattern),
+                        }),
+                        guard: None,
+                        body: value_made(ctors, b"std.value.VCtor", [
+                          string_code(sc.name),
+                          bare(
+                            NList({ items: xs.map(|x: Bound| part(bound_read(x))) }),
+                            list_type(value),
+                          ),
+                        ]),
                       }),
-                      guard: None,
-                      body: call(said(b"std.value.VCtor"), [
-                        at(NLit(LStr(sc.name))),
-                        said_list(passed.made.map(|a: Passed| part(bound_read(a.x), a.at)), 1),
-                      ]),
-                    }),
-                    w: passed.w,
-                  }
-                },
-              );
-              {
-                code: at(NMatch({ scrutinee: var(b"a", 0), arms: walked.arms })),
-                typed: walked.w.typed,
-                rows: Map::new(),
-              }
-            },
+                      slot: acc.slot + xs.len(),
+                    }
+                  },
+                ).arms,
+                value,
+              ),
           }
         },
       },
-      _ -> { code: part(var(b"a", 0), placed(1)), typed: Map::new(), rows: Map::new() },
+      _ -> part(a),
     },
-  };
-  { ..out, typed: said_typed(out.typed, [list_type(field), list_type(value)]) }
+  }
 }
 
 // --- Letting go of a resource -----------------------------------------------------------------
@@ -1316,103 +976,73 @@ pub fn let_go_code(
   key: RootKey,
   ty: Type,
 ) -> WrittenRoot / {abort.raise} = {
-  let at = |node: Node| { node: node, span: dummy_span() };
-  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
-  let var = |name: Bytes, slot: Int| at(NVar({ name: name, slot: Some(slot) }));
-  let let_go = |x: Code| at(NApp({ func: at(NVar({ name: b"?let_go", slot: None })), args: [x] }));
-  let a = var(b"a", 0);
+  let a = slot_code(b"a", 0, ty);
   let fields_of = match ty { TyRecord(fs) -> Some(fs), TyNominal(x) -> Some(x.fields), _ -> None };
   let body = match fields_of {
     Some(fs) ->
       {
         code: sequence(
           fs.filter(|f: Field| holds_resource(ctors, f.ty)).map(|f: Field|
-            let_go(at(NField({ base: a, field: f.name })))),
+            let_go(field_code(a, f.name, f.ty))),
         ),
-        typed: Map::new(),
         here: [],
       },
     None -> match ty {
       TyCon(c) -> match ctors.released.get(c.name) {
         Some(by) -> {
           let local = local_root(module, by);
-          match stated_for(here, ty, |n: Bytes| if n == c.name { Some(local) } else { None }) {
-            Some(f) ->
-              {
-                code: at(
-                  NApp({
-                    func: { node: NVar({ name: f.f, slot: None }), span: placed(0) },
-                    args: [a],
-                  }),
-                ),
-                typed: Map::new().insert(placed(0).site, filed_as(f.fn_type, f.args)),
-                here: [],
-              },
-            None -> { code: unit_code(), typed: Map::new(), here: [] },
+          match stated_for(module, here, ty, |n: Bytes|
+              if n == c.name { Some(local) } else { None }) {
+            Some(f) -> { code: stated_call(f, [a]), here: [] },
+            None -> { code: unit_code(), here: [] },
           }
         },
         None -> if c.name == list_name() {
           // Each item let go in turn, from the first, by a loop over the list lent to it.
           let items = keys::written(Contained(b"let_go_items"), ty, module);
           {
-            code: call_of(module, items, [a, int_code(0)]),
-            typed: Map::new(),
+            code: call_of(module, items, [a, int_code(0)], unit_type()),
             here: [def_of(module, items, [ty, int_type()], unit_type(), release_row(ctors, ty))],
           }
         } else {
           match ctors.sums.get(c.name) {
-            None -> { code: unit_code(), typed: Map::new(), here: [] },
-            Some(cs) -> {
-              let walked = cs.fold(
-                { arms: [], w: writing_from(1, 0) },
-                |acc: { arms: List<CodeArm>, w: Writing }, sc: SumCtor| {
-                  // Each argument holding a resource bound, to be let go of; the rest unread.
-                  let bound = written_each(
-                    acc.w,
-                    ctor_fields_at(sc, c.args),
-                    |q: Writing, t: Type, j: Int|
-                      if holds_resource(ctors, t) {
-                        let b = bound_next(q, b"x".concat(ascii_of_int(j)), t);
-                        { w: b.w, made: Some(b.bound) }
-                      } else { { w: q, made: None } },
-                  );
-                  {
-                    arms: acc.arms.push({
-                      pat: PxCtor({
-                        name: written_ctor(sc.name),
-                        args: bound.made.map(|b: Option<Bound>|
-                          match b { Some(x) -> binder(x), None -> PxWild }),
-                      }),
-                      guard: None,
-                      body: sequence(
-                        bound.made.fold([], |all: List<Code>, b: Option<Bound>|
-                          match b { Some(x) -> all.push(let_go(bound_read(x))), None -> all }),
-                      ),
-                    }),
-                    w: bound.w,
-                  }
-                },
-              );
+            None -> { code: unit_code(), here: [] },
+            Some(cs) ->
               {
-                code: at(NMatch({ scrutinee: a, arms: walked.arms })),
-                typed: walked.w.typed,
+                code: match_code(
+                  a,
+                  cs.fold(
+                    { arms: [], slot: 1 },
+                    |acc: { arms: List<CodeArm>, slot: Int }, sc: SumCtor| {
+                      let xs = bound_from(acc.slot, b"x", ctor_fields_at(sc, c.args));
+                      let held = xs.filter(|x: Bound| holds_resource(ctors, x.ty));
+                      {
+                        arms: acc.arms.push({
+                          pat: PxCtor({
+                            sum: c.name,
+                            name: sc.name,
+                            case: sc.index,
+                            args: xs.map(|x: Bound|
+                              if holds_resource(ctors, x.ty) { bound_pattern(x) } else { PxWild }),
+                          }),
+                          guard: None,
+                          body: sequence(held.map(|x: Bound| let_go(bound_read(x)))),
+                        }),
+                        slot: acc.slot + xs.len(),
+                      }
+                    },
+                  ).arms,
+                  unit_type(),
+                ),
                 here: [],
-              }
-            },
+              },
           }
         },
       },
-      _ -> { code: unit_code(), typed: Map::new(), here: [] },
+      _ -> { code: unit_code(), here: [] },
     },
   };
-  rooted_at(
-    module,
-    key,
-    [ty],
-    unit_type(),
-    { code: body.code, w: { ..writing(), typed: body.typed }, here: body.here },
-    release_row(ctors, ty),
-  )
+  rooted_at(module, key, [ty], unit_type(), body, release_row(ctors, ty))
 }
 
 /// `let_go_items#List<T>` over its parameters `a`, lent, and `i`: each item of `a` from place `i`
@@ -1427,27 +1057,32 @@ pub fn let_go_items_code(
     TyCon(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type() },
     _ -> unknown_type(),
   };
-  let a = slot_code(b"a", 0);
-  let i = slot_code(b"i", 1);
-  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))]);
-  let got = call_at(writing(), b"List::at", [a, i], [plain(item)]);
-  let binder = filing(got.w, filed_as(plain(item), []));
-  let released = bare(
-    NApp({ func: bare(NVar({ name: b"?let_go", slot: None })), args: [slot_code(b"x", 2)] }),
-  );
+  let a = slot_code(b"a", 0, ty);
+  let i = slot_code(b"i", 1, int_type());
+  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))], unit_type());
+  let got = prelude_call(b"List::at", [plain(item)], [a, i], option_type(plain(item)));
   rooted_at(
     module,
     key,
     [ty, int_type()],
     unit_type(),
     {
-      code: some_or(got.code, b"x", 2, binder.span, sequence([released, next]), unit_code()),
-      w: binder.w,
+      code: some_or(
+        got,
+        b"x",
+        2,
+        plain(item),
+        sequence([let_go(slot_code(b"x", 2, plain(item))), next]),
+        unit_code(),
+      ),
       here: [],
     },
     release_row(ctors, ty),
   )
 }
+
+/// `x` let go by `?let_go`, which the lowering settles by the type `x` holds.
+fn let_go(x: Code) -> Code = builtin_call(b"?let_go", [], [x], unit_type())
 
 // --- Crossings --------------------------------------------------------------------------------
 
@@ -1516,9 +1151,10 @@ fn kept_side(ty: Type, kept: Bool) -> Type / {abort.raise} =
 
 /// `x`, a part of the marked type `ty`, made into its other form: unchanged where `ty` marks no
 /// place, else by `?keeping` or `?opening` at `ty`, which the part's own root answers.
-fn kept_part(w: Writing, x: Code, ty: Type, keeping: Bool) -> { code: Code, w: Writing } =
-  if !marked(ty) { { code: x, w: w } }
-  else { call_at(w, if keeping { b"?keeping" } else { b"?opening" }, [x], [ty]) }
+fn kept_part(x: Code, ty: Type, keeping: Bool) -> Code / {abort.raise} =
+  if !marked(ty) { x } else {
+    builtin_call(if keeping { b"?keeping" } else { b"?opening" }, [ty], [x], kept_side(ty, keeping))
+  }
 
 /// The body of `keeping#T` (`keeping`) or `opening#T` over its parameter `a`, `ty` marked at the
 /// places kept: at a marked place, the value kept beside its type's descriptor (`?keep`) or what
@@ -1533,53 +1169,54 @@ fn kept_code(
   ctors: Ctors,
   ty: Type,
   keeping: Bool,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let a = slot_code(b"a", 0);
-  let w = writing();
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
+  let from = kept_side(ty, !keeping);
+  let a = slot_code(b"a", 0, from);
   let into = kept_side(ty, keeping);
   let items_op = if keeping { b"keeping_items" } else { b"opening_items" };
   // The items of the container `over` made into the list `listed` (marked) is made of, from empty.
   let looped = |over: Type, listed: Type| {
     let loop = marked_key(Contained(items_op), over, module);
     let out = kept_side(listed, keeping);
-    let empty = filing(w, filed_as(out, []));
     {
-      code: call_of(module, loop, [
-        a,
-        { node: NList({ items: [] }), span: empty.span },
-        int_code(0),
-      ]),
-      w: empty.w,
+      code: call_of(module, loop, [a, bare(NList({ items: [] }), out), int_code(0)], out),
       here: [def_of(module, loop, [kept_side(over, !keeping), out, int_type()], out)],
     }
   };
   match ty {
     TyCon(c) -> if c.name == b"^" && c.args.len() == 1 {
-      let leaf = call_at(w, if keeping { b"?keep" } else { b"?open" }, [a], [c.args.get(0)]);
-      { code: leaf.code, w: leaf.w, here: [] }
-    } else if !marked(ty) { { code: a, w: w, here: [] } }
+      {
+        code: builtin_call(if keeping { b"?keep" } else { b"?open" }, [c.args.get(0)], [a], into),
+        here: [],
+      }
+    } else if !marked(ty) { { code: a, here: [] } }
     else if c.name == list_name() && c.args.len() == 1 { looped(ty, ty) }
     else if c.name == array_name() && c.args.len() == 1 {
       let items = looped(ty, list_type(c.args.get(0)));
-      let made = call_at(items.w, b"Array::of_list", [items.code], [
-        kept_side(c.args.get(0), keeping),
-      ]);
-      { code: made.code, w: made.w, here: items.here }
+      {
+        code: builtin_call(
+          b"Array::of_list",
+          [kept_side(c.args.get(0), keeping)],
+          [items.code],
+          into,
+        ),
+        here: items.here,
+      }
     } else if c.name == map_name() && c.args.len() == 2 {
       let entries = list_type(
         TyRecord([{ name: b"key", ty: c.args.get(0) }, { name: b"value", ty: c.args.get(1) }]),
       );
-      let from = kept_side(ty, !keeping);
-      let listed = call_at(w, b"Map::entries", [a], match from { TyCon(f) -> f.args, _ -> [] });
-      let fresh = call_at(listed.w, b"Map::new", [], match into { TyCon(i) -> i.args, _ -> [] });
+      let from_args = match from { TyCon(f) -> f.args, _ -> [] };
+      let into_args = match into { TyCon(i) -> i.args, _ -> [] };
+      let listed = prelude_call(b"Map::entries", from_args, [a], kept_side(entries, !keeping));
+      let fresh = builtin_call(b"Map::new", into_args, [], into);
       let loop = marked_key(
         Contained(if keeping { b"keeping_entries" } else { b"opening_entries" }),
         entries,
         module,
       );
       {
-        code: call_of(module, loop, [listed.code, fresh.code, int_code(0)]),
-        w: fresh.w,
+        code: call_of(module, loop, [listed, fresh, int_code(0)], into),
         here: [def_of(module, loop, [kept_side(entries, !keeping), into, int_type()], into)],
       }
     } else if runtime_object(c.name) {
@@ -1589,40 +1226,39 @@ fn kept_code(
         None -> uncrossed(b"a kept crossing of a type no root writes: ".concat(c.name)),
         Some(cs) -> {
           let arms = cs.fold(
-            { arms: [], w: { ..w, slot: 1 } },
-            |acc: { arms: List<CodeArm>, w: Writing }, sc: SumCtor| {
-              let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
-              let bound = written_each(acc.w, args, |v: Writing, t: Type, j: Int| {
-                let x = bound_next(v, b"x".concat(ascii_of_int(j)), kept_side(t, !keeping));
-                let part = kept_part(x.w, bound_read(x.bound), t, keeping);
-                { w: part.w, made: { pat: binder(x.bound), part: part.code } }
-              });
-              let ctor = filing(bound.w, filed_as(into, []));
-              let named = {
-                node: NVar({ name: written_ctor(sc.name), slot: None }),
-                span: ctor.span,
-              };
+            { arms: [], slot: 1 },
+            |acc: { arms: List<CodeArm>, slot: Int }, sc: SumCtor| {
+              let args = ctor_fields_at(sc, c.args);
+              let xs = bound_from(acc.slot, b"x", args.map(|t: Type| kept_side(t, !keeping)));
               {
                 arms: acc.arms.push({
                   pat: PxCtor({
-                    name: written_ctor(sc.name),
-                    args: bound.made.map(|b: Crossed| b.pat),
+                    sum: c.name,
+                    name: sc.name,
+                    case: sc.index,
+                    args: xs.map(bound_pattern),
                   }),
                   guard: None,
-                  body: if args.len() == 0 { named }
-                  else { bare(NApp({ func: named, args: bound.made.map(|b: Crossed| b.part) })) },
+                  body: ctor_made(
+                    c.name,
+                    sc.name,
+                    sc.index,
+                    zip(xs, args).map(|p: { first: Bound, second: Type }|
+                      kept_part(bound_read(p.first), p.second, keeping)),
+                    into,
+                  ),
                 }),
-                w: ctor.w,
+                slot: acc.slot + xs.len(),
               }
             },
           );
-          { code: bare(NMatch({ scrutinee: a, arms: arms.arms })), w: arms.w, here: [] }
+          { code: match_code(a, arms.arms, into), here: [] }
         },
       }
     },
-    TyRecord(fs) -> kept_record(a, fs, into, keeping, w),
-    TyNominal(x) -> kept_record(a, x.fields, into, keeping, w),
-    TyFn(f) -> kept_function(f.params, f.ret, kept_side(ty, !keeping), into, keeping, w),
+    TyRecord(fs) -> kept_record(a, fs, into, keeping),
+    TyNominal(x) -> kept_record(a, x.fields, into, keeping),
+    TyFn(f) -> kept_function(f.params, f.ret, from, into, keeping),
     TyVar(_) -> uncrossed(b"a kept crossing at a type variable"),
   }
 }
@@ -1633,18 +1269,20 @@ fn kept_record(
   fields: List<Field>,
   into: Type,
   keeping: Bool,
-  w: Writing,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let made = fields.fold(
-    { fields: [], w: w },
-    |acc: { fields: List<CodeField>, w: Writing }, f: Field| {
-      let part = kept_part(acc.w, bare(NField({ base: a, field: f.name })), f.ty, keeping);
-      { fields: acc.fields.push({ name: f.name, value: part.code }), w: part.w }
-    },
-  );
-  let record = filing(made.w, filed_as(into, []));
-  { code: { node: NRecord({ fields: made.fields }), span: record.span }, w: record.w, here: [] }
-}
+) -> { code: Code, here: List<Def> } / {abort.raise} =
+  {
+    code: bare(
+      NRecord({
+        fields: fields.map(|f: Field|
+          {
+            name: f.name,
+            value: kept_part(field_code(a, f.name, kept_side(f.ty, !keeping)), f.ty, keeping),
+          }),
+      }),
+      into,
+    ),
+    here: [],
+  }
 
 /// The function `a` (slot 0), of form `from`, parameters `params` and answer `ret` (each marked),
 /// wrapped into its other form `into`: a closure over `a` that makes each argument the other way,
@@ -1655,33 +1293,33 @@ fn kept_function(
   from: Type,
   into: Type,
   keeping: Bool,
-  w: Writing,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let n = params.len();
-  let args = range(0, n).fold(
-    { codes: [], w: w },
-    |acc: { codes: List<Code>, w: Writing }, j: Int| {
-      let p = kept_part(acc.w, slot_code(b"p".concat(ascii_of_int(j)), j), params.get(j), !keeping);
-      { codes: acc.codes.push(p.code), w: p.w }
-    },
-  );
+  let args = range(0, n).map(|j: Int|
+    kept_part(
+      slot_code(b"p".concat(ascii_of_int(j)), j, kept_side(params.get(j), keeping)),
+      params.get(j),
+      !keeping,
+    ));
   // The closure reads `a` as its capture, at the type the root takes it.
-  let f = typed_slot(args.w, b"f", n, from);
-  let called = bare(NApp({ func: f.code, args: args.codes }));
-  let answer = kept_part(f.w, called, ret, keeping);
-  let lambda = filing(answer.w, filed_as(into, []));
+  let called = applied(slot_code(b"f", n, from), args, kept_side(ret, !keeping));
+  let ty = match into {
+    TyFn(g) -> g,
+    _ -> { params: params, kept: [], once: false, ret: ret, effects: row_empty() },
+  };
   {
-    code: {
-      node: NLambda({
+    code: bare(
+      NLambda({
         params: n,
         size: n + 1,
         captures: [{ src: 0, dst: n }],
-        body: answer.code,
-        at: lambda.span,
+        body: kept_part(called, ret, keeping),
+        at: placed(0),
+        ty: ty,
+        row: row_empty(),
       }),
-      span: lambda.span,
-    },
-    w: rows_at(lambda.w, lambda.span, Performs({ atoms: [], tail: None })),
+      TyFn(ty),
+    ),
     here: [],
   }
 }
@@ -1693,35 +1331,57 @@ fn kept_function(
 fn kept_loop(module: Bytes, op: Bytes, over: Type) -> Option<WrittenRoot> / {abort.raise} = {
   let keeping = op.starts_with(b"keeping");
   let key = marked_key(Contained(op), over, module);
-  let a = slot_code(b"a", 0);
-  let out = slot_code(b"out", 1);
-  let i = slot_code(b"i", 2);
   let from = kept_side(over, !keeping);
-  let next = |made: Code| call_of(module, key, [a, made, binary_of(b"add", i, int_code(1))]);
+  let a = slot_code(b"a", 0, from);
+  let i = slot_code(b"i", 2, int_type());
   match item_of(over) {
     None -> None,
     Some(item) -> {
       let container = match over { TyCon(c) -> c.name, _ -> list_name() };
-      let at = call_at(writing(), container.concat(b"::at"), [a, i], [kept_side(item, !keeping)]);
-      let binder = filing(at.w, filed_as(kept_side(item, !keeping), []));
-      let x = slot_code(b"x", 3);
+      let held = kept_side(item, !keeping);
+      // A list's item is read by the prelude's `List::at`, written in Ply; any other's by its builtin.
+      let got = if container == list_name() {
+        prelude_call(b"List::at", [held], [a, i], option_type(held))
+      } else { builtin_call(container.concat(b"::at"), [held], [a, i], option_type(held)) };
+      let x = slot_code(b"x", 3, held);
       let body = if op.ends_with(b"entries") {
         let key_type = field_of(item, b"key");
         let value_type = field_of(item, b"value");
-        let k = kept_part(binder.w, bare(NField({ base: x, field: b"key" })), key_type, keeping);
-        let v = kept_part(k.w, bare(NField({ base: x, field: b"value" })), value_type, keeping);
+        let k = kept_part(field_code(x, b"key", kept_side(key_type, !keeping)), key_type, keeping);
+        let v = kept_part(
+          field_code(x, b"value", kept_side(value_type, !keeping)),
+          value_type,
+          keeping,
+        );
         let both = [kept_side(key_type, keeping), kept_side(value_type, keeping)];
-        let inserted = call_at(v.w, b"Map::insert", [out, k.code, v.code], both);
-        { code: inserted.code, w: inserted.w, into: TyCon({ name: map_name(), args: both }) }
+        let into = TyCon({ name: map_name(), args: both });
+        {
+          code: prelude_call(b"Map::insert", both, [slot_code(b"out", 1, into), k, v], into),
+          into: into,
+        }
       } else {
-        let made = kept_part(binder.w, x, item, keeping);
-        let pushed = call_at(made.w, b"List::push", [out, made.code], [kept_side(item, keeping)]);
-        { code: pushed.code, w: pushed.w, into: kept_side(list_type(item), keeping) }
+        let into = kept_side(list_type(item), keeping);
+        {
+          code: prelude_call(
+            b"List::push",
+            [kept_side(item, keeping)],
+            [slot_code(b"out", 1, into), kept_part(x, item, keeping)],
+            into,
+          ),
+          into: into,
+        }
       };
+      let out = slot_code(b"out", 1, body.into);
       Some(
         rooted_at(module, key, [from, body.into, int_type()], body.into, {
-          code: some_or(at.code, b"x", 3, binder.span, next(body.code), out),
-          w: body.w,
+          code: some_or(
+            got,
+            b"x",
+            3,
+            held,
+            call_of(module, key, [a, body.code, binary_of(b"add", i, int_code(1))], body.into),
+            out,
+          ),
           here: [],
         }),
       )
@@ -1753,15 +1413,17 @@ fn crossing_loop(
           key,
           [t, int_type()],
           unit_type(),
-          items_lowered(module, key, marked, item),
+          items_lowered(module, key, t, marked, item),
         ),
       )
     } else if op == b"lower_entries" {
-      Some(rooted_at(module, key, [t, int_type()], unit_type(), entries_lowered(module, key, item)))
+      Some(
+        rooted_at(module, key, [t, int_type()], unit_type(), entries_lowered(module, key, t, item)),
+      )
     } else if op == b"lift_items" {
-      Some(rooted_at(module, key, [t, int_type()], t, items_lifted(module, key, item)))
+      Some(rooted_at(module, key, [t, int_type()], t, items_lifted(module, key, t, item)))
     } else if op == b"lift_entries" {
-      Some(rooted_at(module, key, [t, int_type()], t, entries_lifted(module, key, marked)))
+      Some(rooted_at(module, key, [t, int_type()], t, entries_lifted(module, key, t, marked)))
     } else { None },
   }
 }
@@ -1772,12 +1434,12 @@ fn crossing_loop(
 /// lifting ended; then `callee` called on them, and its answer written into the lowering the runtime
 /// opened beneath, which it ends. A generic definition is called as any caller calls it at `at` and
 /// `rows`, through its own scheme; any other root is declared at `params` and `answer`, performing
-/// `row`, its own atoms. `hosts` are the real handlers the call runs under, each by the name the
-/// entry calls it by, the effect it answers and the atoms its own row adds, the first outermost:
-/// each is handed a closure over the call inside it, which performs what that call does, and
-/// answers it, leaving its caller the rest and what it adds, as the checker would file it. The body
-/// is filed as performing what the outermost leaves, the effects the entry holds a word for. A
-/// `pure` callee taking nothing is read as a constant is, so only the first entry runs its body.
+/// `row`, its own atoms. `hosts` are the real handlers the call runs under, each by its name across
+/// the program, the effect it answers and the atoms its own row adds, the first outermost: each is
+/// handed a closure over the call inside it, which performs what that call does, and answers it,
+/// leaving its caller the rest and what it adds. The body performs what the outermost leaves, the
+/// effects the entry holds a word for. A `pure` callee taking nothing is read as a constant is, so
+/// only the first entry runs its body.
 pub fn entered_code(
   module: Bytes,
   root: RootKey,
@@ -1792,75 +1454,67 @@ pub fn entered_code(
 ) -> WrittenRoot / {abort.raise} = {
   let key = keys::Entered(root);
   let read = range(0, params.len()).fold(
-    { stmts: [CDo({ code: native_call(b"?in_count", [int_code(tag_list())]) })], w: writing() },
-    |acc: { stmts: List<CodeStmt>, w: Writing }, i: Int| {
-      let l = call_at(acc.w, b"?lift", [], [params.get(i)]);
-      {
-        stmts: acc.stmts.push(CLet({ name: b"p".concat(ascii_of_int(i)), slot: i, value: l.code })),
-        w: l.w,
-      }
-    },
+    [CDo({ code: native_call(b"?in_count", [int_code(tag_list())], int_type()) })],
+    |acc: List<CodeStmt>, i: Int|
+      acc.push(
+        CLet({
+          name: b"p".concat(ascii_of_int(i)),
+          slot: i,
+          value: builtin_call(b"?lift", [params.get(i)], [], params.get(i)),
+        }),
+      ),
   );
-  // Each argument read is filed at its parameter's type: a real handler's closure, which reads
-  // them as captures, takes their types from there.
-  let reads = range(0, params.len()).fold(
-    { codes: [], w: read.w },
-    |acc: { codes: List<Code>, w: Writing }, i: Int| {
-      let r = typed_slot(acc.w, b"p".concat(ascii_of_int(i)), i, params.get(i));
-      { codes: acc.codes.push(r.code), w: r.w }
-    },
+  let reads = range(0, params.len()).map(|i: Int|
+    slot_code(b"p".concat(ascii_of_int(i)), i, params.get(i)));
+  let direct = applied(
+    bare(
+      NDef({ full: qualified_root(module, callee), args: at, rows: rows, labels: [] }),
+      fn_type(params, answer, { atoms: row.atoms, tail: None }),
+    ),
+    reads,
+    answer,
   );
-  let direct = call_at(reads.w, local_root(module, root_text(root_name(callee))), reads.codes, at);
   let generic = at.len() > 0 || rows.len() > 0;
-  let direct_rows = if rows.len() == 0 { direct.w }
-  else { rows_at(direct.w, function_span(direct.code), RowArguments(rows)) };
   let called = hosts.reverse().fold(
-    { code: direct.code, w: direct_rows, atoms: row.atoms },
-    |inner: { code: Code, w: Writing, atoms: List<Atom> }, host: { call: Bytes, effect: Bytes, adds: List<Atom> }| {
-      let lambda = filing(inner.w, filed_as(fn_type([], answer, row_empty()), []));
+    { code: direct, atoms: row.atoms, n: 0 },
+    |inner: { code: Code, atoms: List<Atom>, n: Int }, host: { call: Bytes, effect: Bytes, adds: List<Atom> }| {
+      let performs = { atoms: inner.atoms, tail: None };
+      let lambda_ty = { params: [], kept: [], once: false, ret: answer, effects: row_empty() };
       let left = inner.atoms.filter(|a: Atom| a.effect != host.effect);
-      let c = call_at(
-        rows_at(lambda.w, lambda.span, Performs({ atoms: inner.atoms, tail: None })),
-        host.call,
-        [
-          bare(
-            NLambda({
-              params: 0,
-              size: params.len(),
-              captures: range(0, params.len()).map(|i: Int| { src: i, dst: i }),
-              body: inner.code,
-              at: lambda.span,
-            }),
-          ),
-        ],
-        [answer],
-      );
+      let leaves = { atoms: left, tail: None };
       {
-        code: c.code,
-        w: rows_at(c.w, function_span(c.code), RowArguments([{ atoms: left, tail: None }])),
+        code: applied(
+          bare(
+            NDef({ full: host.call, args: [answer], rows: [leaves], labels: [] }),
+            fn_type([TyFn({ ..lambda_ty, effects: performs })], answer, leaves),
+          ),
+          [
+            bare(
+              NLambda({
+                params: 0,
+                size: params.len(),
+                captures: range(0, params.len()).map(|i: Int| { src: i, dst: i }),
+                body: inner.code,
+                at: placed(inner.n),
+                ty: lambda_ty,
+                row: performs,
+              }),
+              TyFn(lambda_ty),
+            ),
+          ],
+          answer,
+        ),
         atoms: host.adds.fold(left, |acc: List<Atom>, a: Atom|
           if acc.contains(a) { acc } else { acc.push(a) }),
+        n: inner.n + 1,
       }
     },
   );
-  let written = call_at(called.w, b"?lower", [called.code], [answer]);
-  let body = filing(written.w, filed_as(unit_type(), []));
-  rooted_at(module, key, [], unit_type(), {
-    code: {
-      node: NBlock({
-        stmts: read.stmts.push(CDo({ code: native_call(b"?lift_close", []) })),
-        tail: Some(written.code),
-      }),
-      span: body.span,
-    },
-    w: rows_at(body.w, body.span, Performs({ atoms: called.atoms, tail: None })),
-    here: if generic { [] }
-    else { [called_def(module, callee, params, answer, { atoms: row.atoms, tail: None }, pure)] },
-  })
+  {
+    ..rooted_at(module, key, [], unit_type(), { code: block_code(read.push(CDo({ code: native_call(b"?lift_close", [], unit_type()) })), builtin_call(b"?lower", [answer], [called.code], unit_type())), here: if generic { [] } else { [called_def(module, callee, params, answer, { atoms: row.atoms, tail: None }, pure)] } }),
+    performs: { atoms: called.atoms, tail: None },
+  }
 }
-
-/// Where the function a call names is written: what the checker files a read of a definition at.
-fn function_span(call: Code) -> Span = match call.node { NApp(a) -> a.func.span, _ -> call.span }
 
 /// Root `root` of `module`, taking `params`, answering `answer` and performing `row`, as a root
 /// written to enter it calls it: where `pure`, and it takes nothing, a constant read from what the
@@ -1886,96 +1540,90 @@ pub fn called_def(
     root: root,
   }
 
-/// The body of `lower#T` over its parameter `a`, a value of `ty`, what it files, and the
-/// definitions of the loops it calls: a scalar by the crossing native for its kind, a record its
-/// fields in name order each after its name, a declared sum its constructor by program-wide name
-/// and its arguments, a list, an array or a map its count and its items (a map's each key then its
-/// value, in key order; a `Columns` as the array of its records the runtime reads it as), a runtime
-/// object as a handle and a function as an anonymous one. A string,
-/// bytes, list, array or map is asked after first, and written as `AGAIN` where the lowering shares
-/// values and wrote it before.
+/// The body of `lower#T` over its parameter `a`, a value of `ty`, and the definitions of the loops
+/// it calls: a scalar by the crossing native for its kind, a record its fields in name order each
+/// after its name, a declared sum its constructor by program-wide name and its arguments, a list, an
+/// array or a map its count and its items (a map's each key then its value, in key order; a
+/// `Columns` as the array of its records the runtime reads it as), a runtime object as a handle and
+/// a function as an anonymous one. A string, bytes, list, array or map is asked after first, and
+/// written as `AGAIN` where the lowering shares values and wrote it before.
 fn lowering_code(
   module: Bytes,
   ctors: Ctors,
   ty: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let a = slot_code(b"a", 0);
-  let w = writing();
-  let alone = |c: Code| { code: c, w: w, here: [] };
-  let shared = |parts: List<Code>|
-    bare(
-      NIf({
-        cond: binary_of(b"eq", native_call(b"?out_again", [a]), int_code(0)),
-        then_branch: sequence(parts),
-        else_branch: unit_code(),
-      }),
-    );
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let held = plain(ty);
+  let a = slot_code(b"a", 0, held);
+  let out = |name: Bytes, args: List<Code>| native_call(name, args, unit_type());
+  let alone = |c: Code| { code: c, here: [] };
+  let shared = |parts: List<Code>|
+    if_code(
+      binary_of(b"eq", native_call(b"?out_again", [a], int_type()), int_code(0)),
+      sequence(parts),
+      unit_code(),
+    );
   let args_at = match held { TyCon(c) -> c.args, _ -> [] };
   match ty {
     TyCon(c) -> if c.name == b"^" && c.args.len() == 1 {
-      let carried = call_at(w, b"?out_carried", [a], [held]);
-      { code: carried.code, w: carried.w, here: [] }
+      alone(builtin_call(b"?out_carried", [held], [a], unit_type()))
     } else if c.args.len() == 0 && c.name == unit_name() {
-      alone(native_call(b"?out_tag", [int_code(tag_unit())]))
+      alone(out(b"?out_tag", [int_code(tag_unit())]))
     } else if c.args.len() == 0 && c.name == bool_name() {
-      alone(
-        native_call(b"?out_tag", [
-          bare(
-            NIf({ cond: a, then_branch: int_code(tag_true()), else_branch: int_code(tag_false()) }),
-          ),
-        ]),
-      )
-    } else if c.args.len() == 0 && c.name == int_name() { alone(native_call(b"?out_int", [a])) }
-    else if c.args.len() == 0 && c.name == float_name() { alone(native_call(b"?out_float", [a])) }
-    else if c.args.len() == 0 && c.name == decimal_name() {
-      alone(native_call(b"?out_decimal", [a]))
-    } else if c.args.len() == 0 && width_named(c.name) != None {
-      alone(native_call(b"?out_fixed", [a]))
-    } else if c.args.len() == 0 && c.name == char_name() {
-      let scalar = call_at(w, b"Int::of_char", [a], []);
-      { code: native_call(b"?out_char", [scalar.code]), w: scalar.w, here: [] }
+      alone(out(b"?out_tag", [if_code(a, int_code(tag_true()), int_code(tag_false()))]))
+    } else if c.args.len() == 0 && c.name == int_name() { alone(out(b"?out_int", [a])) }
+    else if c.args.len() == 0 && c.name == float_name() { alone(out(b"?out_float", [a])) }
+    else if c.args.len() == 0 && c.name == decimal_name() { alone(out(b"?out_decimal", [a])) }
+    else if c.args.len() == 0 && width_named(c.name) != None { alone(out(b"?out_fixed", [a])) }
+    else if c.args.len() == 0 && c.name == char_name() {
+      alone(out(b"?out_char", [builtin_call(b"Int::of_char", [], [a], int_type())]))
     } else if c.args.len() == 0 && c.name == string_name() {
-      alone(shared([native_call(b"?out_str", [a])]))
+      alone(shared([out(b"?out_str", [a])]))
     } else if c.args.len() == 0 && c.name == bytes_name() {
-      alone(shared([native_call(b"?out_bytes", [a])]))
-    } else if runtime_object(c.name) { alone(native_call(b"?out_handle", [a])) }
+      alone(shared([out(b"?out_bytes", [a])]))
+    } else if runtime_object(c.name) { alone(out(b"?out_handle", [a])) }
     else if c.name == list_name() && c.args.len() == 1 {
-      let n = call_at(w, b"List::len", [a], args_at);
       let items = marked_key(Contained(b"lower_items"), ty, module);
       {
         code: shared([
-          native_call(b"?out_count", [int_code(tag_list()), n.code]),
-          call_of(module, items, [a, int_code(0)]),
+          out(b"?out_count", [
+            int_code(tag_list()),
+            builtin_call(b"List::len", args_at, [a], int_type()),
+          ]),
+          call_of(module, items, [a, int_code(0)], unit_type()),
         ]),
-        w: n.w,
         here: [def_of(module, items, [held, int_type()], unit_type())],
       }
     } else if (c.name == array_name() || c.name == columns_name()) && c.args.len() == 1 {
       // A `Columns` crosses as the array of its records the runtime reads it as.
-      let n = call_at(w, c.name.concat(b"::len"), [a], args_at);
       let items = marked_key(Contained(b"lower_items"), ty, module);
       {
         code: shared([
-          native_call(b"?out_count", [int_code(tag_array()), n.code]),
-          call_of(module, items, [a, int_code(0)]),
+          out(b"?out_count", [
+            int_code(tag_array()),
+            builtin_call(c.name.concat(b"::len"), args_at, [a], int_type()),
+          ]),
+          call_of(module, items, [a, int_code(0)], unit_type()),
         ]),
-        w: n.w,
         here: [def_of(module, items, [held, int_type()], unit_type())],
       }
     } else if c.name == map_name() && c.args.len() == 2 {
       let entries = list_type(
         TyRecord([{ name: b"key", ty: c.args.get(0) }, { name: b"value", ty: c.args.get(1) }]),
       );
-      let n = call_at(w, b"Map::len", [a], args_at);
-      let listed = call_at(n.w, b"Map::entries", [a], args_at);
       let each = marked_key(Contained(b"lower_entries"), entries, module);
       {
         code: shared([
-          native_call(b"?out_count", [int_code(tag_map()), n.code]),
-          call_of(module, each, [listed.code, int_code(0)]),
+          out(b"?out_count", [
+            int_code(tag_map()),
+            builtin_call(b"Map::len", args_at, [a], int_type()),
+          ]),
+          call_of(
+            module,
+            each,
+            [prelude_call(b"Map::entries", args_at, [a], plain(entries)), int_code(0)],
+            unit_type(),
+          ),
         ]),
-        w: listed.w,
         here: [def_of(module, each, [plain(entries), int_type()], unit_type())],
       }
     } else {
@@ -1983,295 +1631,254 @@ fn lowering_code(
         None -> uncrossed(b"a crossing of a type no root writes: ".concat(c.name)),
         Some(cs) -> {
           let arms = cs.fold(
-            { arms: [], w: { ..w, slot: 1 } },
-            |acc: { arms: List<CodeArm>, w: Writing }, sc: SumCtor| {
-              let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
-              let bound = written_each(acc.w, args, |v: Writing, t: Type, j: Int| {
-                let x = bound_next(v, b"x".concat(ascii_of_int(j)), plain(t));
-                let part = call_at(x.w, b"?lower", [bound_read(x.bound)], [t]);
-                { w: part.w, made: { pat: binder(x.bound), part: part.code } }
-              });
+            { arms: [], slot: 1 },
+            |acc: { arms: List<CodeArm>, slot: Int }, sc: SumCtor| {
+              let args = ctor_fields_at(sc, c.args);
+              let xs = bound_from(acc.slot, b"x", args.map(plain));
               {
                 arms: acc.arms.push({
                   pat: PxCtor({
-                    name: written_ctor(sc.name),
-                    args: bound.made.map(|b: Crossed| b.pat),
+                    sum: c.name,
+                    name: sc.name,
+                    case: sc.index,
+                    args: xs.map(bound_pattern),
                   }),
                   guard: None,
                   body: sequence(
-                    [native_call(b"?out_ctor", [bytes_code(sc.name), int_code(args.len())])].concat(
-                      bound.made.map(|b: Crossed| b.part),
+                    [out(b"?out_ctor", [bytes_code(sc.name), int_code(args.len())])].concat(
+                      zip(xs, args).map(|p: { first: Bound, second: Type }|
+                        builtin_call(b"?lower", [p.second], [bound_read(p.first)], unit_type())),
                     ),
                   ),
                 }),
-                w: bound.w,
+                slot: acc.slot + xs.len(),
               }
             },
           );
-          { code: bare(NMatch({ scrutinee: a, arms: arms.arms })), w: arms.w, here: [] }
+          { code: match_code(a, arms.arms, unit_type()), here: [] }
         },
       }
     },
-    TyRecord(fs) -> record_lowered(a, fs, w),
-    TyNominal(x) -> record_lowered(a, x.fields, w),
+    TyRecord(fs) -> record_lowered(a, fs),
+    TyNominal(x) -> record_lowered(a, x.fields),
     // The runtime asks the function whether it may leave its run: a continuation's closure may not.
-    TyFn(_) -> alone(native_call(b"?out_fun", [a, bytes_code(b"")])),
+    TyFn(_) -> alone(out(b"?out_fun", [a, bytes_code(b"")])),
     TyVar(_) -> uncrossed(b"a crossing at a type variable"),
   }
 }
 
 /// A record's fields written in name order, each its name and then its value.
-fn record_lowered(
-  a: Code,
-  fields: List<Field>,
-  w: Writing,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
+fn record_lowered(a: Code, fields: List<Field>) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let fs = fields_sorted(fields);
-  let parts = fs.fold(
-    { parts: [native_call(b"?out_count", [int_code(tag_record()), int_code(fs.len())])], w: w },
-    |acc: { parts: List<Code>, w: Writing }, f: Field| {
-      let part = call_at(acc.w, b"?lower", [bare(NField({ base: a, field: f.name }))], [f.ty]);
-      {
-        parts: acc.parts.push(native_call(b"?out_name", [bytes_code(f.name)])).push(part.code),
-        w: part.w,
-      }
-    },
-  );
-  { code: sequence(parts.parts), w: parts.w, here: [] }
+  {
+    code: sequence(
+      fs.fold(
+        [native_call(b"?out_count", [int_code(tag_record()), int_code(fs.len())], unit_type())],
+        |acc: List<Code>, f: Field|
+          acc.push(native_call(b"?out_name", [bytes_code(f.name)], unit_type())).push(
+            builtin_call(b"?lower", [f.ty], [field_code(a, f.name, plain(f.ty))], unit_type()),
+          ),
+      ),
+    ),
+    here: [],
+  }
 }
 
-/// The body of `lift#T`, which reads a value of `ty` and answers it, what it files, and the
-/// definitions of the loops it calls: each kind read as `lowering_code` writes it, a record built
-/// from its fields read in name order, a sum's constructor chosen by the name read, a list, array
-/// or map built from as many items as its count says. A function made by the program does not
-/// cross back.
+/// The body of `lift#T`, which reads a value of `ty` and answers it, and the definitions of the
+/// loops it calls: each kind read as `lowering_code` writes it, a record built from its fields read
+/// in name order, a sum's constructor chosen by the name read, a list, array or map built from as
+/// many items as its count says. A function made by the program does not cross back.
 fn lifting_code(
   module: Bytes,
   ctors: Ctors,
   ty: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let w = writing();
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let held = plain(ty);
   let args_at = match held { TyCon(c) -> c.args, _ -> [] };
-  let alone = |c: Code| { code: c, w: w, here: [] };
-  let read_as = |name: Bytes| {
-    let r = call_at(w, name, [], [held]);
-    { code: r.code, w: r.w, here: [] }
-  };
+  let alone = |c: Code| { code: c, here: [] };
+  let read_as = |name: Bytes| alone(builtin_call(name, [held], [], held));
+  let tag = native_call(b"?in_tag", [], int_type());
+  let counted = |t: Int| native_call(b"?in_count", [int_code(t)], int_type());
   match ty {
     TyCon(c) -> if c.name == b"^" && c.args.len() == 1 { read_as(b"?in_carried") }
-    else if c.args.len() == 0 && c.name == unit_name() {
-      alone(sequence([native_call(b"?in_tag", []), unit_code()]))
-    } else if c.args.len() == 0 && c.name == bool_name() {
-      alone(binary_of(b"eq", native_call(b"?in_tag", []), int_code(tag_true())))
-    } else if c.args.len() == 0 && c.name == int_name() { alone(native_call(b"?in_int", [])) }
-    else if c.args.len() == 0 && c.name == float_name() { alone(native_call(b"?in_float", [])) }
-    else if c.args.len() == 0 && c.name == decimal_name() { read_as(b"?in_decimal") }
+    else if c.args.len() == 0 && c.name == unit_name() { alone(sequence([tag, unit_code()])) }
+    else if c.args.len() == 0 && c.name == bool_name() {
+      alone(binary_of(b"eq", tag, int_code(tag_true())))
+    } else if c.args.len() == 0 && c.name == int_name() {
+      alone(native_call(b"?in_int", [], int_type()))
+    } else if c.args.len() == 0 && c.name == float_name() {
+      alone(native_call(b"?in_float", [], float_type()))
+    } else if c.args.len() == 0 && c.name == decimal_name() { read_as(b"?in_decimal") }
     else if c.args.len() == 0 && width_named(c.name) != None { read_as(b"?in_fixed") }
     else if c.args.len() == 0 && c.name == char_name() {
-      let of = call_at(w, b"Char::of_int", [native_call(b"?in_char", [])], []);
-      let binder = filing(of.w, filed_as(ty, []));
-      {
-        code: bare(
-          NMatch({
-            scrutinee: of.code,
-            arms: [
-              {
-                pat: PxCtor({
-                  name: prelude_ctor(some_ctor()),
-                  args: [PxVar({ name: b"ch", slot: Some(0), span: binder.span })],
-                }),
-                guard: None,
-                body: slot_code(b"ch", 0),
-              },
-              // The runtime's reader refuses a code that is no character, so this arm never runs.
-              {
-                pat: PxCtor({ name: prelude_ctor(none_ctor()), args: [] }),
-                guard: None,
-                body: bare(NLit(LChar(0))),
-              },
-            ],
-          }),
+      alone(
+        some_or(
+          builtin_call(
+            b"Char::of_int",
+            [],
+            [native_call(b"?in_char", [], int_type())],
+            option_type(ty),
+          ),
+          b"ch",
+          0,
+          ty,
+          slot_code(b"ch", 0, ty),
+          // The runtime's reader refuses a code that is no character, so this arm never runs.
+          bare(NLit(LChar(0)), ty),
         ),
-        w: binder.w,
-        here: [],
-      }
+      )
     } else if c.args.len() == 0 && c.name == string_name() { read_as(b"?in_str") }
     else if c.args.len() == 0 && c.name == bytes_name() { read_as(b"?in_bytes") }
     else if runtime_object(c.name) { read_as(b"?in_handle") }
     else if c.name == list_name() && c.args.len() == 1 {
-      let empty = filing(w, filed_as(held, []));
       let items = marked_key(Contained(b"lift_items"), ty, module);
       {
-        code: call_of(module, items, [
-          { node: NList({ items: [] }), span: empty.span },
-          native_call(b"?in_count", [int_code(tag_list())]),
-        ]),
-        w: empty.w,
+        code: call_of(module, items, [bare(NList({ items: [] }), held), counted(tag_list())], held),
         here: [def_of(module, items, [held, int_type()], held)],
       }
     } else if (c.name == array_name() || c.name == columns_name()) && c.args.len() == 1 {
       let listed = list_type(c.args.get(0));
-      let empty = filing(w, filed_as(plain(listed), []));
       let items = marked_key(Contained(b"lift_items"), listed, module);
-      let made = call_at(
-        empty.w,
-        c.name.concat(b"::of_list"),
-        [
-          call_of(module, items, [
-            { node: NList({ items: [] }), span: empty.span },
-            native_call(b"?in_count", [int_code(tag_array())]),
-          ]),
-        ],
-        args_at,
-      );
       {
-        code: made.code,
-        w: made.w,
+        code: builtin_call(
+          c.name.concat(b"::of_list"),
+          args_at,
+          [
+            call_of(
+              module,
+              items,
+              [bare(NList({ items: [] }), plain(listed)), counted(tag_array())],
+              plain(listed),
+            ),
+          ],
+          held,
+        ),
         here: [def_of(module, items, [plain(listed), int_type()], plain(listed))],
       }
     } else if c.name == map_name() && c.args.len() == 2 {
-      let fresh = call_at(w, b"Map::new", [], args_at);
       let each = marked_key(Contained(b"lift_entries"), ty, module);
       {
-        code: call_of(module, each, [fresh.code, native_call(b"?in_count", [int_code(tag_map())])]),
-        w: fresh.w,
+        code: call_of(
+          module,
+          each,
+          [builtin_call(b"Map::new", args_at, [], held), counted(tag_map())],
+          held,
+        ),
         here: [def_of(module, each, [held, int_type()], held)],
       }
     } else {
       match ctors.sums.get(c.name) {
         None -> uncrossed(b"a crossing of a type no root reads: ".concat(c.name)),
         Some(cs) -> {
-          let made = cs.fold(
-            { made: [], w: w },
-            |acc: { made: List<{ name: Bytes, code: Code }>, w: Writing }, sc: SumCtor| {
-              let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
-              let parts = args.fold(
-                { parts: [], w: acc.w },
-                |b: { parts: List<Code>, w: Writing }, t: Type| {
-                  let part = call_at(b.w, b"?lift", [], [t]);
-                  { parts: b.parts.push(part.code), w: part.w }
-                },
-              );
-              let ctor = filing(parts.w, filed_as(held, []));
-              let named = {
-                node: NVar({ name: written_ctor(sc.name), slot: None }),
-                span: ctor.span,
-              };
-              {
-                made: acc.made.push({
-                  name: sc.name,
-                  code: if args.len() == 0 { named }
-                  else { bare(NApp({ func: named, args: parts.parts })) },
-                }),
-                w: ctor.w,
-              }
-            },
-          );
-          let chosen = range(0, made.made.len()).fold(unit_code(), |later: Code, n: Int| {
-            let k = made.made.len() - 1 - n;
-            let m = made.made.get(k);
-            if k == made.made.len() - 1 { m.code } else {
-              bare(
-                NIf({
-                  cond: binary_of(
-                    b"eq",
-                    native_call(b"?in_name_is", [bytes_code(m.name)]),
-                    int_code(1),
-                  ),
-                  then_branch: m.code,
-                  else_branch: later,
-                }),
+          let made = cs.map(|sc: SumCtor| {
+            let args = sc.fields.map(|f: Type| at_args(f, sc.params, c.args));
+            {
+              name: sc.name,
+              code: ctor_made(
+                c.name,
+                sc.name,
+                sc.index,
+                args.map(|t: Type| builtin_call(b"?lift", [t], [], plain(t))),
+                held,
+              ),
+            }
+          });
+          let chosen = range(0, made.len()).fold(unit_code(), |later: Code, n: Int| {
+            let k = made.len() - 1 - n;
+            let m = made.get(k);
+            if k == made.len() - 1 { m.code } else {
+              if_code(
+                binary_of(
+                  b"eq",
+                  native_call(b"?in_name_is", [bytes_code(m.name)], int_type()),
+                  int_code(1),
+                ),
+                m.code,
+                later,
               )
             }
           });
-          {
-            code: sequence([native_call(b"?in_count", [int_code(tag_ctor())]), chosen]),
-            w: made.w,
-            here: [],
-          }
+          alone(sequence([counted(tag_ctor()), chosen]))
         },
       }
     },
-    TyRecord(fs) -> record_lifted(held, fs, w),
-    TyNominal(x) -> record_lifted(held, x.fields, w),
+    TyRecord(fs) -> record_lifted(held, fs),
+    TyNominal(x) -> record_lifted(held, x.fields),
     TyFn(_) -> uncrossed(b"a function crossing back from the runtime"),
     TyVar(_) -> uncrossed(b"a crossing at a type variable"),
   }
 }
 
 /// A record of type `ty` read as its fields in name order, each its name and then its value.
-fn record_lifted(
-  ty: Type,
-  fields: List<Field>,
-  w: Writing,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let fs = fields_sorted(fields);
-  let read = fs.fold(
-    { fields: [], w: w },
-    |acc: { fields: List<CodeField>, w: Writing }, f: Field| {
-      let value = call_at(acc.w, b"?lift", [], [f.ty]);
-      {
-        fields: acc.fields.push({
-          name: f.name,
-          value: sequence([native_call(b"?in_field", [bytes_code(f.name)]), value.code]),
-        }),
-        w: value.w,
-      }
-    },
-  );
-  let record = filing(read.w, filed_as(ty, []));
+fn record_lifted(ty: Type, fields: List<Field>) -> { code: Code, here: List<Def> } / {abort.raise} =
   {
     code: sequence([
-      native_call(b"?in_count", [int_code(tag_record())]),
-      { node: NRecord({ fields: read.fields }), span: record.span },
+      native_call(b"?in_count", [int_code(tag_record())], int_type()),
+      bare(
+        NRecord({
+          fields: fields_sorted(fields).map(|f: Field|
+            {
+              name: f.name,
+              value: sequence([
+                native_call(b"?in_field", [bytes_code(f.name)], unit_type()),
+                builtin_call(b"?lift", [f.ty], [], plain(f.ty)),
+              ]),
+            }),
+        }),
+        ty,
+      ),
     ]),
-    w: record.w,
     here: [],
   }
-}
 
-/// `lower_items#C<T>` over its parameters `a` and `i`, `C` a list, an array or columns (the
-/// `container` with its carried places): each item of `a` from place `i` on written at the items'
-/// type, `item` with its carried places.
+/// `lower_items#C<T>` over its parameters `a`, of type `t`, and `i`, `C` a list, an array or columns
+/// (the `container` with its carried places): each item of `a` from place `i` on written at the
+/// items' type, `item` with its carried places.
 fn items_lowered(
   module: Bytes,
   key: RootKey,
+  t: Type,
   container: Type,
   item: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let a = slot_code(b"a", 0);
-  let i = slot_code(b"i", 1);
-  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))]);
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
+  let a = slot_code(b"a", 0, t);
+  let i = slot_code(b"i", 1, int_type());
+  let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))], unit_type());
+  let lowered = builtin_call(b"?lower", [item], [slot_code(b"x", 2, plain(item))], unit_type());
   match container {
     // An array's or columns' item is read in place below its length, no list made of it.
     TyCon(c) -> if c.name == array_name() || c.name == columns_name() {
-      let n = call_at(writing(), c.name.concat(b"::len"), [a], [plain(item)]);
-      let got = call_at(n.w, c.name.concat(b"::get"), [a, i], [plain(item)]);
-      let part = call_at(got.w, b"?lower", [slot_code(b"x", 2)], [item]);
       {
-        code: bare(
-          NIf({
-            cond: binary_of(b"lt", i, n.code),
-            then_branch: bare(
-              NBlock({
-                stmts: [CLet({ name: b"x", slot: 2, value: got.code })],
-                tail: Some(sequence([part.code, next])),
+        code: if_code(
+          binary_of(
+            b"lt",
+            i,
+            builtin_call(c.name.concat(b"::len"), [plain(item)], [a], int_type()),
+          ),
+          block_code(
+            [
+              CLet({
+                name: b"x",
+                slot: 2,
+                value: builtin_call(c.name.concat(b"::get"), [plain(item)], [a, i], plain(item)),
               }),
-            ),
-            else_branch: unit_code(),
-          }),
+            ],
+            sequence([lowered, next]),
+          ),
+          unit_code(),
         ),
-        w: part.w,
         here: [],
       }
     } else {
-      let at = call_at(writing(), b"List::at", [a, i], [plain(item)]);
-      let binder = filing(at.w, filed_as(plain(item), []));
-      let part = call_at(binder.w, b"?lower", [slot_code(b"x", 2)], [item]);
       {
-        code: some_or(at.code, b"x", 2, binder.span, sequence([part.code, next]), unit_code()),
-        w: part.w,
+        code: some_or(
+          prelude_call(b"List::at", [plain(item)], [a, i], option_type(plain(item))),
+          b"x",
+          2,
+          plain(item),
+          sequence([lowered, next]),
+          unit_code(),
+        ),
         here: [],
       }
     },
@@ -2279,84 +1886,87 @@ fn items_lowered(
   }
 }
 
-/// `lower_entries#List<{key, value}>` over its parameters `es` and `i`: each entry of `es` from
-/// place `i` on, its key and then its value, each at its own type, `entry` with its carried places.
+/// `lower_entries#List<{key, value}>` over its parameters `es`, of type `t`, and `i`: each entry of
+/// `es` from place `i` on, its key and then its value, each at its own type, `entry` with its carried
+/// places.
 fn entries_lowered(
   module: Bytes,
   key: RootKey,
+  t: Type,
   entry: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let es = slot_code(b"es", 0);
-  let i = slot_code(b"i", 1);
-  let at = call_at(writing(), b"List::at", [es, i], [plain(entry)]);
-  let binder = filing(at.w, filed_as(plain(entry), []));
-  let e = slot_code(b"e", 2);
-  let k = call_at(binder.w, b"?lower", [bare(NField({ base: e, field: b"key" }))], [
-    field_of(entry, b"key"),
-  ]);
-  let v = call_at(k.w, b"?lower", [bare(NField({ base: e, field: b"value" }))], [
-    field_of(entry, b"value"),
-  ]);
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
+  let es = slot_code(b"es", 0, t);
+  let i = slot_code(b"i", 1, int_type());
+  let e = slot_code(b"e", 2, plain(entry));
+  let part = |name: Bytes|
+    builtin_call(
+      b"?lower",
+      [field_of(entry, name)],
+      [field_code(e, name, plain(field_of(entry, name)))],
+      unit_type(),
+    );
   {
     code: some_or(
-      at.code,
+      prelude_call(b"List::at", [plain(entry)], [es, i], option_type(plain(entry))),
       b"e",
       2,
-      binder.span,
-      sequence([k.code, v.code, call_of(module, key, [es, binary_of(b"add", i, int_code(1))])]),
+      plain(entry),
+      sequence([
+        part(b"key"),
+        part(b"value"),
+        call_of(module, key, [es, binary_of(b"add", i, int_code(1))], unit_type()),
+      ]),
       unit_code(),
     ),
-    w: v.w,
     here: [],
   }
 }
 
-/// `lift_items#List<T>` over its parameters `acc` and `n`: `n` more items read onto `acc`, `item`
-/// with its carried places.
+/// `lift_items#List<T>` over its parameters `acc`, of type `t`, and `n`: `n` more items read onto
+/// `acc`, `item` with its carried places.
 fn items_lifted(
   module: Bytes,
   key: RootKey,
+  t: Type,
   item: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
-  let acc = slot_code(b"acc", 0);
-  let n = slot_code(b"n", 1);
-  let x = call_at(writing(), b"?lift", [], [item]);
-  let pushed = call_at(x.w, b"List::push", [acc, x.code], [plain(item)]);
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
+  let acc = slot_code(b"acc", 0, t);
+  let n = slot_code(b"n", 1, int_type());
+  let pushed = prelude_call(
+    b"List::push",
+    [plain(item)],
+    [acc, builtin_call(b"?lift", [item], [], plain(item))],
+    t,
+  );
   {
-    code: bare(
-      NIf({
-        cond: binary_of(b"eq", n, int_code(0)),
-        then_branch: acc,
-        else_branch: call_of(module, key, [pushed.code, binary_of(b"sub", n, int_code(1))]),
-      }),
+    code: if_code(
+      binary_of(b"eq", n, int_code(0)),
+      acc,
+      call_of(module, key, [pushed, binary_of(b"sub", n, int_code(1))], t),
     ),
-    w: pushed.w,
     here: [],
   }
 }
 
-/// `lift_entries#Map<K, V>` over its parameters `m` and `n`: `n` more entries read into `m`, each a
-/// key and then its value, `ty` with its carried places.
+/// `lift_entries#Map<K, V>` over its parameters `m`, of type `t`, and `n`: `n` more entries read
+/// into `m`, each a key and then its value, `ty` with its carried places.
 fn entries_lifted(
   module: Bytes,
   key: RootKey,
+  t: Type,
   ty: Type,
-) -> { code: Code, w: Writing, here: List<Def> } / {abort.raise} = {
+) -> { code: Code, here: List<Def> } / {abort.raise} = {
   let args = match ty { TyCon(c) -> c.args, _ -> [] };
-  let m = slot_code(b"m", 0);
-  let n = slot_code(b"n", 1);
-  let k = call_at(writing(), b"?lift", [], [args.get(0)]);
-  let v = call_at(k.w, b"?lift", [], [args.get(1)]);
-  let inserted = call_at(v.w, b"Map::insert", [m, k.code, v.code], args.map(plain));
+  let m = slot_code(b"m", 0, t);
+  let n = slot_code(b"n", 1, int_type());
+  let lifted = |k: Int| builtin_call(b"?lift", [args.get(k)], [], plain(args.get(k)));
+  let inserted = prelude_call(b"Map::insert", args.map(plain), [m, lifted(0), lifted(1)], t);
   {
-    code: bare(
-      NIf({
-        cond: binary_of(b"eq", n, int_code(0)),
-        then_branch: m,
-        else_branch: call_of(module, key, [inserted.code, binary_of(b"sub", n, int_code(1))]),
-      }),
+    code: if_code(
+      binary_of(b"eq", n, int_code(0)),
+      m,
+      call_of(module, key, [inserted, binary_of(b"sub", n, int_code(1))], t),
     ),
-    w: inserted.w,
     here: [],
   }
 }
@@ -2478,7 +2088,7 @@ fn rooted_at(
   key: RootKey,
   params: List<Type>,
   answer: Type,
-  body: { code: Code, w: Writing, here: List<Def> },
+  body: { code: Code, here: List<Def> },
   row: Row = { atoms: [], tail: None },
 ) -> WrittenRoot / {abort.raise} =
   {
@@ -2488,9 +2098,8 @@ fn rooted_at(
       { name: param_name(key, i), kind: k.kind, ty: k.ty, of: Some(t), lambda: None }
     }),
     code: body.code,
-    typed: body.w.typed,
-    rows: body.w.rows,
     here: [def_of(module, key, params, answer, row)].concat(body.here),
+    performs: row_empty(),
   }
 
 /// The name parameter `i` of crossing root `key` is read by.
@@ -2530,13 +2139,19 @@ fn def_of(
     root: key,
   }
 
-/// A call of root `key`, written in `module`, on `args`, by the name its definition has there.
-fn call_of(module: Bytes, key: RootKey, args: List<Code>) -> Code / {abort.raise} =
-  bare(
-    NApp({
-      func: bare(NVar({ name: local_root(module, root_text(root_name(key))), slot: None })),
-      args: args,
-    }),
+/// The name across the program of the definition root `key`, written in `module`, is.
+fn qualified_root(module: Bytes, key: RootKey) -> Bytes / {abort.raise} =
+  qualify(module, local_root(module, root_text(root_name(key))))
+
+/// A call of root `key`, written in `module`, on `args`, answering `ret`.
+fn call_of(module: Bytes, key: RootKey, args: List<Code>, ret: Type) -> Code / {abort.raise} =
+  applied(
+    bare(
+      NDef({ full: qualified_root(module, key), args: [], rows: [], labels: [] }),
+      fn_type(args.map(|a: Code| a.ty), ret, row_empty()),
+    ),
+    args,
+    ret,
   )
 
 // The tags PLV1 opens a value of each kind with.
@@ -2555,112 +2170,3 @@ fn tag_record() -> Int = 11
 fn tag_ctor() -> Int = 12
 
 fn tag_array() -> Int = 14
-
-/// Code being written: the site the next node it files a type for is placed at, and what is filed.
-/// What written code takes as it is written: the next place and the next slot, and what it has
-/// filed at the places taken.
-type Writing = { next: Int, slot: Int, typed: Map<Int, Typed>, rows: Map<Int, FiledRows> }
-
-fn writing() -> Writing = { next: 0, slot: 0, typed: Map::new(), rows: Map::new() }
-
-/// Writing that takes its places from `site` and its slots from `slot` on.
-fn writing_from(slot: Int, site: Int) -> Writing = { ..writing(), next: site, slot: slot }
-
-/// A place for a node, `t` filed there.
-fn filing(w: Writing, t: Typed) -> { span: Span, w: Writing } = {
-  let p = placing(w);
-  { span: p.span, w: { ..p.w, typed: p.w.typed.insert(p.span.site, t) } }
-}
-
-/// A place for a node nothing is filed at.
-fn placing(w: Writing) -> { span: Span, w: Writing } =
-  { span: { start: 0, end: w.next, site: w.next + 1 }, w: { ..w, next: w.next + 1 } }
-
-/// `name` bound to a value of type `t` at the next slot and place, its type filed there.
-fn bound_next(w: Writing, name: Bytes, t: Type) -> { w: Writing, bound: Bound } = {
-  let at = filing(w, filed_as(t, []));
-  { w: { ..at.w, slot: at.w.slot + 1 }, bound: { name: name, slot: at.w.slot, span: at.span } }
-}
-
-/// A slot of its own for a value written code binds with no place, as a `let` does.
-fn slot_next(w: Writing, name: Bytes) -> { w: Writing, bound: Bound } =
-  { w: { ..w, slot: w.slot + 1 }, bound: { name: name, slot: w.slot, span: dummy_span() } }
-
-/// `w` with `rows` filed at the node at `at`, as the checker files the rows a call or a lambda takes
-/// words for.
-fn rows_at(w: Writing, at: Span, rows: FiledRows) -> Writing =
-  { ..w, rows: w.rows.insert(at.site, rows) }
-
-/// A call of `name` on `args`, filed as called at type arguments `args_at` where its name is
-/// written.
-fn call_at(
-  w: Writing,
-  name: Bytes,
-  args: List<Code>,
-  args_at: List<Type>,
-) -> { code: Code, w: Writing } = {
-  let f = filing(w, filed_as(unknown_type(), args_at));
-  {
-    code: bare(
-      NApp({ func: { node: NVar({ name: name, slot: None }), span: f.span }, args: args }),
-    ),
-    w: f.w,
-  }
-}
-
-/// `scrutinee`, an `Option`, as `some` with its payload bound as `name` in slot `slot` (its binder
-/// at `binder`), or `none`.
-fn some_or(scrutinee: Code, name: Bytes, slot: Int, binder: Span, some: Code, none: Code) -> Code =
-  bare(
-    NMatch({
-      scrutinee: scrutinee,
-      arms: [
-        {
-          pat: PxCtor({
-            name: prelude_ctor(some_ctor()),
-            args: [PxVar({ name: name, slot: Some(slot), span: binder })],
-          }),
-          guard: None,
-          body: some,
-        },
-        { pat: PxCtor({ name: prelude_ctor(none_ctor()), args: [] }), guard: None, body: none },
-      ],
-    }),
-  )
-
-/// A node at no place, nothing filed for it.
-fn bare(n: Node) -> Code = { node: n, span: dummy_span() }
-
-fn int_code(n: Int) -> Code = bare(NLit(LInt(n)))
-
-fn bytes_code(b: Bytes) -> Code = bare(NLit(LBytes(b)))
-
-fn unit_code() -> Code = bare(NLit(LUnit))
-
-fn slot_code(name: Bytes, slot: Int) -> Code = bare(NVar({ name: name, slot: Some(slot) }))
-
-/// A read of slot `slot`, bound as `name`, filed as `ty`.
-fn typed_slot(w: Writing, name: Bytes, slot: Int, ty: Type) -> { code: Code, w: Writing } = {
-  let f = filing(w, filed_as(ty, []));
-  { code: { node: NVar({ name: name, slot: Some(slot) }), span: f.span }, w: f.w }
-}
-
-fn binary_of(op: Bytes, l: Code, r: Code) -> Code = bare(NBinary({ op: op, lhs: l, rhs: r }))
-
-/// A call of a builtin no filing types: a crossing native.
-fn native_call(name: Bytes, args: List<Code>) -> Code =
-  bare(NApp({ func: bare(NVar({ name: name, slot: None })), args: args }))
-
-/// `codes` run in order, the last one's value the block's.
-fn sequence(codes: List<Code>) -> Code =
-  match codes.at(codes.len() - 1) {
-    None -> unit_code(),
-    Some(last) -> if codes.len() == 1 { last } else {
-      bare(
-        NBlock({
-          stmts: codes.take(codes.len() - 1).map(|c: Code| CDo({ code: c })),
-          tail: Some(last),
-        }),
-      )
-    },
-  }
