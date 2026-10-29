@@ -7,7 +7,8 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_body, role_hold_new_callee, role_hold_take_callee,
                                 role_hold_acquired, role_hold_release_call, role_hold_close_call,
                                 role_hold_bracket_callee, role_tag_texts, role_tag_holes,
-                                role_var_first_read)
+                                role_var_first_read, role_try_arg, role_try_unit, role_try_value,
+                                role_try_ok_call, role_try_err_call)
 import std.list (prepend)
 import compiler.syntax.type_syntax (TypeExpr, Mode, MRaise, mode_text, is_raise)
 import compiler.syntax.items (DOrd, member_name, member_of, Opaque, is_shipped)
@@ -21,7 +22,7 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               exit_op, Slot, FromName, FromDefault, simulated_at, detached_at,
                               resumed_at, branch_at, try_places, prelude_module)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, Lit, LInt, LFixed, LWide, LStr, pat_span, has_or)
+                                 PBad, Lit, LInt, LFixed, LWide, LStr, LUnit, pat_span, has_or)
 import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
                              TyRecord, Field, Scheme, Subst, Free, UnifyError, Mismatch, Arity,
                              OccursTy, OccursRow, RowMismatch, atoms_covered, atoms_insert,
@@ -67,7 +68,7 @@ import compiler.check.infer.checker (OpInfo, EffectInfo, DefConstraint, NumericI
                                      with_unified, is_prelude_effect, seed_atom, abort_atom,
                                      builtin_type_arity, ctor_of, effect_of, def_of,
                                      simulated_atoms, mode_eq, lit_type, record_site, record_over,
-                                     ord_needs, binder_key)
+                                     ord_needs, binder_key, CtorInfo)
 import compiler.check.infer.names (value_key, Elsewise, Found, Unnamed, of_language_type,
                                    declared_value, ctor_name, unknown_name, unknown_name_said,
                                    kept_named, language_function, module_declares, no_function_said,
@@ -87,7 +88,7 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              match_of, call_of, PlacedDefault, defaults_placed, update_of,
                              perform_of, simulate_of, parallel_of, TypedClause, TypedHandlerVar,
                              params_typed, clause_of, return_of, handler_var_of, handle_of,
-                             assign_of)
+                             assign_of, TypedField, TypedHandle, TypedCall, TypedRecord)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -5708,11 +5709,124 @@ fn infer_try_block(
         checker: discharge(filed, mark, body_mark, [atom]),
         ty: result,
         row: { atoms: answered_row.atoms.filter(|a: Atom| a != atom), tail: answered_row.tail },
-        node: None,
+        node: tried_node(
+          filed,
+          span,
+          typed_at(b, expr_span(body)),
+          b.row,
+          { effect: hit.info.name, op: hit.op.name, params: hit.op.params },
+          carried,
+          result,
+        ),
       }
     },
   }
 }
+
+/// The `handle` the `try` at `span` is written out as, typed: `body` answers `Ok` of what it
+/// answers, and the clause for the raise `raised` answers `Err` of what the raise carries, nothing,
+/// its one value, or the record of them. Its binders are named so no source can spell them.
+fn tried_node(
+  checker: Checker,
+  span: Span,
+  body: Option<TypedExpr>,
+  body_row: Row,
+  raised: { effect: Bytes, op: Bytes, params: List<Type> },
+  carried: Type,
+  result: Type,
+) -> Option<TypedNode> / {abort.raise} =
+  match ((body, ctor_of(checker, b"Ok"), ctor_of(checker, b"Err"))) {
+    (Some(value), Some(ok), Some(err)) -> {
+      let at = try_places(span);
+      let unsited = { ..span, site: 0 };
+      let read = |name: Bytes, ty: Type, place: Span|
+        { node: TypedRead(ReadLocal(name)), span: place, ty: ty };
+      let answered = |c: CtorInfo, of: Type, arg: TypedExpr, call: Span, callee: Span|
+        {
+          node: TypedCall({
+            callee: {
+              node: TypedRead(ReadConstructor({ sum: c.type_name, name: c.name, case: c.index })),
+              span: callee,
+              ty: fn_type([of], result, row_empty()),
+            },
+            args: [arg],
+          }),
+          span: call,
+          ty: result,
+        };
+      let binders = range(0, raised.params.len()).map(|i: Int|
+        { name: b"?r".concat(ascii_of_int(i)), span: unsited });
+      let reads = range(0, raised.params.len()).fold([], |acc: List<TypedExpr>, i: Int|
+        match raised.params.at(i) {
+          Some(t) ->
+            acc.push(read(b"?r".concat(ascii_of_int(i)), t, minted(span, role_try_arg(i)))),
+          None -> acc,
+        });
+      let carried_value: TypedExpr = match reads {
+        [] -> { node: TypedLit(LUnit), span: minted(span, role_try_unit()), ty: unit_type() },
+        [one] -> one,
+        _ ->
+          {
+            node: TypedRecord(
+              range(0, reads.len()).fold([], |acc: List<TypedField>, i: Int|
+                match reads.at(i) {
+                  Some(x) -> acc.push({ name: b"_".concat(ascii_of_int(i)), value: x }),
+                  None -> acc,
+                }),
+            ),
+            span: at.carried,
+            ty: carried,
+          },
+      };
+      match params_typed(binders, raised.params) {
+        None -> None,
+        Some(params) ->
+          Some(
+            TypedHandle({
+              body: value,
+              row: body_row,
+              clauses: [
+                {
+                  effect: raised.effect,
+                  op: raised.op,
+                  resource: None,
+                  every_label: false,
+                  params: params,
+                  label: None,
+                  resume: None,
+                  body: answered(
+                    err,
+                    carried,
+                    carried_value,
+                    minted(span, role_try_err_call()),
+                    at.err,
+                  ),
+                  ty: fn_type(raised.params, result, row_empty()),
+                  row: row_empty(),
+                  resumed: row_empty(),
+                  span: at.clause,
+                },
+              ],
+              ret: Some({
+                binder: { name: b"?v", ty: value.ty, span: unsited },
+                body: answered(
+                  ok,
+                  value.ty,
+                  read(b"?v", value.ty, minted(span, role_try_value())),
+                  minted(span, role_try_ok_call()),
+                  at.ok,
+                ),
+                ty: fn_type([value.ty], result, row_empty()),
+                row: row_empty(),
+                span: at.ret,
+              }),
+              vars: [],
+            }),
+          ),
+      }
+    },
+    _ -> None,
+  }
 
 fn reach_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
   let a = backticked_text(atom_written(checker, site.atom));
