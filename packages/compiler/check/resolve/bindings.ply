@@ -7,10 +7,12 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, ETagged, EHole, EBad, ETryBlock,
                               Stmt, SLet, SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause,
-                              RecField, NamedArg, Hole, HandlerVar, ReturnClause, tagged_parser)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr)
+                              RecField, NamedArg, Hole, HandlerVar, ReturnClause, tagged_parser,
+                              expr_span)
+import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
+                                 pat_span)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
-                                    AtomExpr)
+                                    AtomExpr, ty_span)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IExtern,
                               IDerive, IInstance, INumeric, IEffectSet, NHost, NumericOp, FnDef,
                               TypeDef, TDAlias, TDSum, TDNominal, VariantDef, EffectDef, OpDef,
@@ -180,13 +182,27 @@ fn value_named(w: Walk, qname: QName, shorthand: Bool) -> Walk / {abort.raise} =
   noted(qualifier(w, qname), qname.name, refers, shorthand)
 }
 
-fn walk_field(w: Walk, field: RecField) -> Walk / {abort.raise} = {
-  let labelled = member(w, field.name, FieldName);
+/// A field's name the parser made rather than read, as a tuple's `_0`: it stands where its element
+/// does.
+fn made_field(name: Ident, at: Span) -> Bool =
+  name.span.start == at.start && name.span.end == at.end
+
+/// Whether a field is written by its name alone, `{ x }`: one name, written once, is the field and
+/// the local.
+fn pun(field: Ident, name: Ident) -> Bool =
+  name.name == field.name && name.span.start == field.span.start
+
+fn labelled(w: Walk, field: Ident, punned: Bool, at: Span) -> Walk =
+  if !punned && made_field(field, at) { w } else { member(w, field, FieldName) }
+
+fn walk_field(w: Walk, field: RecField) -> Walk / {abort.raise} =
   match field.value {
-    EVar(v) -> value_named(labelled, v.name, v.name.name.span.start == field.name.span.start),
-    _ -> walk_expr(labelled, field.value),
+    EVar(v) -> {
+      let punned = v.name.module == None && pun(field.name, v.name.name);
+      value_named(labelled(w, field.name, punned, v.span), v.name, punned)
+    },
+    _ -> walk_expr(labelled(w, field.name, false, expr_span(field.value)), field.value),
   }
-}
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
   noted(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
@@ -208,7 +224,7 @@ fn walk_type(w: Walk, t: TypeExpr) -> Walk / {abort.raise} =
     TFn(f) -> walk_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
     TRecord(r) ->
       r.fields.fold(w, |acc: Walk, field: { name: Ident, ty: TypeExpr }|
-        walk_type(member(acc, field.name, FieldName), field.ty)),
+        walk_type(labelled(acc, field.name, false, ty_span(field.ty)), field.ty)),
     _ -> w,
   }
 
@@ -240,13 +256,15 @@ fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
       c.args.fold(named_in(w, ValueSpace, c.name), |acc: Walk, x: Pattern|
         walk_pattern(acc, x, again)),
     PRecord(r) ->
-      r.fields.fold(w, |acc: Walk, field: { name: Ident, pat: Pattern }| {
-        let labelled = member(acc, field.name, FieldName);
+      r.fields.fold(w, |acc: Walk, field: { name: Ident, pat: Pattern }|
         match field.pat {
-          PVar(v) -> binder(labelled, v.name, v.span.start == field.name.span.start, again),
-          _ -> walk_pattern(labelled, field.pat, again),
-        }
-      }),
+          PVar(v) -> {
+            let punned = pun(field.name, v.name);
+            binder(labelled(acc, field.name, punned, v.span), v.name, punned, again)
+          },
+          _ ->
+            walk_pattern(labelled(acc, field.name, false, pat_span(field.pat)), field.pat, again),
+        }),
     PList(l) -> {
       let items = l.items.fold(w, |acc: Walk, x: Pattern| walk_pattern(acc, x, again));
       match l.rest { Some(rest) -> walk_pattern(items, rest, again), None -> items }

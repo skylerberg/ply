@@ -3,7 +3,7 @@
 //! renamed program is checked again: the rename is refused unless every name still refers to what
 //! it did.
 
-import std.fs (fs, File, Missing)
+import std.fs (fs, Kind, File, Dir, Missing)
 import std.json (Json, Str, Bool, Number, Array, Null, object)
 import std.list
 import std.bytes
@@ -378,11 +378,13 @@ type Read = {
   effects: List<{ name: Bytes, ops: List<Bytes> }>,
 }
 
-/// A program the rename loaded: what its load read, the path it was loaded for, each module's name
-/// and declarations as its check read them, and each of its files the rename edits.
+/// A program the rename loaded: the path it was loaded for, as given and as reports print it; where
+/// its own files are; each module's name and declarations as its check read them; and each of its
+/// files the rename edits.
 type Loaded = {
-  program: Program,
+  path: Resolved,
   root: String,
+  files: List<Rooted>,
   names: List<Bytes>,
   declarations: List<Decls>,
   reads: List<Read>,
@@ -455,9 +457,7 @@ fn loads_of(
     { loads: [], failures: [] },
     |acc: { loads: List<Loaded>, failures: List<Failure> }, path: Resolved| {
       let root = rooted(path);
-      if acc.loads.any(|l: Loaded| l.program.files.any(|f: sources::File| under(f.at, root))) {
-        acc
-      } else {
+      if acc.loads.any(|l: Loaded| l.files.any(|f: Rooted| under(f, root))) { acc } else {
         let program = load_program([path], false);
         let refused = |ds: List<Diag>|
           {
@@ -475,8 +475,9 @@ fn loads_of(
               {
                 ..acc,
                 loads: acc.loads.push({
-                  program: program,
+                  path: path,
                   root: displayed(root),
+                  files: program.files.map(|f: sources::File| f.at),
                   names: a.mods.map(|m: ParsedModule| m.name),
                   declarations: a.r.declarations,
                   reads: program.files.filter(|f: sources::File|
@@ -1030,16 +1031,123 @@ fn compared(
     })
 }
 
-/// What is wrong with the program `l` loaded once every edited file holds its renamed text.
-fn verified(rn: Renaming, l: Loaded, texts: Map<Bytes, Source>) -> List<Failure> / {abort.raise} = {
-  let spliced = |s: Source| match texts.get(s.name) { Some(t) -> t, None -> s };
-  match walked(l.program, l.program.sources.map(spliced), {
-      ..l.program.shipping,
-      read: l.program.shipping.read.map(spliced),
-    }).out {
-    Refused(ds) ->
-      [{ path: l.root, why: "would not check after the renames: " ++ errors_text(ds) }],
-    Analysed(after) -> compared(rn, l, after, texts),
+/// The files the renames leave, by label and path: each edited file's text where it ends up, and
+/// each path a file moves away from.
+type Renamed = { texts: Map<String, Bytes>, gone: Map<String, Bool> }
+
+fn key(label: String, path: String) -> String / {abort.raise} = {
+  let trimmed = if path.starts_with("./") { path.slice(2, path.len()) } else { path };
+  label ++ ":"
+    ++ (if trimmed == "." { "" }
+    else if trimmed.ends_with("/") { trimmed.slice(0, trimmed.len() - 1) }
+    else { trimmed })
+}
+
+fn renamed_kind(r: Renamed, label: String, path: String, was: Kind) -> Kind / {abort.raise} = {
+  let at = key(label, path);
+  if r.texts.contains(at) { File }
+  else if r.gone.contains(at) { Missing }
+  else if was == Missing && r.texts.keys().any(|k: String| k.starts_with(at ++ "/")) { Dir }
+  else { was }
+}
+
+/// What a read of a file answers once the renames are made, where they decide it: an edited file's
+/// text, or nothing where a file moved away.
+fn renamed_read(r: Renamed, label: String, path: String) -> Option<Option<Bytes>> / {abort.raise} =
+  match r.texts.get(key(label, path)) {
+    Some(text) -> Some(Some(text)),
+    None -> if r.gone.contains(key(label, path)) { Some(None) } else { None },
+  }
+
+/// What a directory lists once the renames are made: the names moved away gone, and the files and
+/// directories moved in there.
+fn renamed_listing(
+  r: Renamed,
+  label: String,
+  dir: String,
+  was: Option<List<String>>,
+) -> Option<List<String>> / {abort.raise} = {
+  let at = key(label, dir);
+  let prefix = if at.ends_with(":") { at } else { at ++ "/" };
+  let child = |k: String| k.slice(prefix.len(), k.len()).split("/").get(0);
+  let came = r.texts.keys().filter(|k: String| k.starts_with(prefix)).map(child);
+  let went = r.gone.keys().filter(|k: String|
+    k.starts_with(prefix) && !k.slice(prefix.len(), k.len()).contains("/")).map(
+    child,
+  );
+  let kept = was.unwrap_or([]).filter(|n: String| !went.contains(n));
+  let all = came.fold(kept, |names: List<String>, n: String|
+    if names.contains(n) { names } else { names.push(n) });
+  if was == None && came.len() == 0 { None } else { Some(all) }
+}
+
+/// `body` run over the files as the renames leave them, every other read as it is.
+fn over_renamed<a | e>(
+  r: Renamed,
+  body: () -> a / {fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], abort.raise | e},
+) -> a / {fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], abort.raise | e} = {
+  handle {
+    body()
+  } with {
+    fs.read_file[cwd](p) -> match renamed_read(r, "cwd", p) {
+      Some(decided) -> decided,
+      None -> fs.read_file[cwd](p),
+    },
+    fs.read_file[abs](p) -> match renamed_read(r, "abs", p) {
+      Some(decided) -> decided,
+      None -> fs.read_file[abs](p),
+    },
+    fs.kind[cwd](p) -> renamed_kind(r, "cwd", p, fs.kind[cwd](p)),
+    fs.kind[abs](p) -> renamed_kind(r, "abs", p, fs.kind[abs](p)),
+    fs.list_dir[cwd](p) -> renamed_listing(r, "cwd", p, fs.list_dir[cwd](p)),
+    fs.list_dir[abs](p) -> renamed_listing(r, "abs", p, fs.list_dir[abs](p)),
+  }
+}
+
+/// The library files of the checkout holding `path` as the renames leave them, each edited module's
+/// under its new name; none outside a checkout.
+fn renamed_library(
+  path: Resolved,
+  texts: Map<Bytes, Source>,
+) -> Option<List<library::Shipping>> / {fs.resolved[abs], fs.read_file[abs], fs.read[abs], abort.raise} =
+  match library::checkout_holding(path.absolute) {
+    None -> None,
+    Some(c) ->
+      Some(
+        library::shipping(c).map(|f: library::Shipping|
+          if !f.name.ends_with(".ply") { f } else {
+            match texts.get(Bytes::of_string(f.name.slice(0, f.name.len() - 4))) {
+              Some(t) -> { ..f, name: String::of_bytes_lossy(t.name) ++ ".ply", bytes: t.src },
+              None -> f,
+            }
+          }),
+      ),
+  }
+
+/// What is wrong with the program `l` loaded once the renames are made: loaded again over the
+/// renamed files, its library's derivers run on them, and checked with every body walked.
+fn verified(
+  rn: Renaming,
+  l: Loaded,
+  texts: Map<Bytes, Source>,
+  renamed: Renamed,
+) -> List<Failure> / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let checked = ||
+    over_renamed(renamed, || {
+      let program = load_program([l.path], false);
+      let refused = |ds: List<Diag>|
+        [{ path: l.root, why: "would not check after the renames: " ++ errors_text(ds) }];
+      match program.frame {
+        None -> refused(program.diags),
+        Some(_) -> match walked(program, program.sources, program.shipping).out {
+          Refused(ds) -> refused(ds),
+          Analysed(after) -> compared(rn, l, after, texts),
+        },
+      }
+    });
+  match renamed_library(l.path, texts) {
+    Some(files) -> library::over_shipping(files, checked),
+    None -> checked(),
   }
 }
 
@@ -1096,7 +1204,7 @@ fn planned(
   renames: Renames,
   loads: List<Loaded>,
   libraries: List<Library>,
-) -> Plan / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+) -> Plan / {shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let rn = renaming_of(renames, loads, libraries);
   let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
     acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
@@ -1174,8 +1282,23 @@ fn planned(
         module_mentions(displayed(r.file.at), r.file.text, tokens, moved_names),
       )
     }),
-    refusals: if refusals.len() > 0 { refusals }
-    else { loads.fold([], |acc: List<Failure>, l: Loaded| acc.concat(verified(rn, l, texts))) },
+    refusals: if refusals.len() > 0 { refusals } else {
+      let renamed = changes.fold(
+        { texts: Map::new(), gone: Map::new() },
+        |acc: Renamed, change: Change|
+          match change.to {
+            Some(to) ->
+              {
+                texts: acc.texts.insert(key(to.label, to.path), change.text),
+                gone: acc.gone.insert(key(change.at.label, change.at.path), true),
+              },
+            None -> if !change.changed { acc } else {
+              { ..acc, texts: acc.texts.insert(key(change.at.label, change.at.path), change.text) }
+            },
+          },
+      );
+      loads.fold([], |acc: List<Failure>, l: Loaded| acc.concat(verified(rn, l, texts, renamed)))
+    },
   }
 }
 
