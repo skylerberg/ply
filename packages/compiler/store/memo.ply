@@ -98,8 +98,9 @@ pub type Query<| e> = {
 /// - `lost`: per query, how many results it computed again because a valid record named a result
 ///   that no store held;
 /// - `judged`: each record [`would_stand`] judged, by its key;
-/// - `judging`: whether the run is judging a record for [`memo.kept`], which stops at a record that
-///   is being computed.
+/// - `judging`: whether the run is judging a record for [`memo.kept`];
+/// - `provisional`: for each key being computed, the stored result a judgment used before the
+///   computation finished.
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
@@ -115,6 +116,7 @@ pub type Run = {
   lost: Map<Bytes, Int>,
   judged: Map<Bytes, Bool>,
   judging: Bool,
+  provisional: Map<Bytes, Bytes>,
 }
 
 type Offer = { output: Bytes, by: Bytes, from: Bytes, nth: Int }
@@ -134,6 +136,7 @@ fn new_run() -> Run =
     lost: Map::new(),
     judged: Map::new(),
     judging: false,
+    provisional: Map::new(),
   }
 
 /// What the run's driver asked, each read by the digest of what it answered: what an answer made
@@ -412,6 +415,9 @@ pub effect memo_keep {
   /// Whether the record under `key` can be reused unchecked: it is in a pack made by the run's own
   /// queries over exactly the shipped files the run reads.
   read standing(key: Bytes) -> Bool
+  /// The pack's record under `key` where the store holds a record of its own under it: none where
+  /// it holds none, or the pack has none.
+  read below(key: Bytes) -> Option<Record>
   /// Tells the store which queries the run uses, before the run asks it anything: `id` names the set,
   /// and `queries` lists each query's hash, since a store eventually drops the records of queries no
   /// run uses.
@@ -483,7 +489,7 @@ fn fetched<| e>(
       Some(o) -> { run: s.run, output: o, head: s.head },
       // A result no store holds is computed again, and counted as lost where its query keeps its
       // results. It must match its record's digest, or the body reads something it does not record.
-      None -> {
+      None -> if s.run.open.contains(key) { abort.raise(judgment_stopped()) } else {
         let e = executed(queries, s.run, q, key, input, left - 1);
         if e.head != s.head {
           panic(
@@ -523,18 +529,31 @@ fn settled_at<| e>(
         let step = { query: q.name, input: input };
         // Reads are checked in order and stop at the first that changed, so reaching a record being
         // computed is a cycle a fresh run would also hit. A judgment for `memo.kept` asks for
-        // records no body asked for, so it only gives up there.
+        // records no body asked for, so it takes the stored result instead.
         if run.open.contains(key) {
-          if run.judging { abort.raise(judgment_stopped()) } else { circled(run, step) }
+          if !run.judging { circled(run, step) } else {
+            match memo_keep.head(key) {
+              Some(h) -> { run: { ..run, provisional: run.provisional.insert(key, h) }, head: h },
+              None -> abort.raise(judgment_stopped()),
+            }
+          }
         } else {
           let opened = { ..run, open: run.open.insert(key, true), trail: run.trail.push(step) };
           let done = checked(queries, opened, q, key, input, left - 1);
+          // What was settled from a result handed out before this one was done stands only where
+          // the result came out the same.
+          let early = match done.run.provisional.get(key) {
+            Some(h) -> h != done.head,
+            None -> false,
+          };
           {
             run: {
               ..done.run,
-              settled: done.run.settled.insert(key, done.head),
+              settled: (if early { run.settled } else { done.run.settled }).insert(key, done.head),
+              offers: if early { run.offers } else { done.run.offers },
               open: done.run.open.remove(key),
               trail: run.trail,
+              provisional: done.run.provisional.remove(key),
             },
             head: done.head,
           }
@@ -574,8 +593,9 @@ fn checked<| e>(
     },
   }
 
-/// An undone edit returns what it returned before: the record the one under `key` replaced is
-/// reused when its reads are unchanged and its result is still stored. Otherwise `q`'s body runs.
+/// An undone edit returns what it returned before: the record the one under `key` replaced, or the
+/// pack's own record where the store holds another, is reused when its reads are unchanged and its
+/// result is still stored. Otherwise `q`'s body runs.
 fn undone_or_run<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
@@ -583,21 +603,42 @@ fn undone_or_run<| e>(
   key: Bytes,
   input: Bytes,
   left: Int,
-) -> { run: Run, head: Bytes } / {memo_keep.read, memo_keep.write, abort.raise | e} =
-  match ((memo_keep.record(earlier_key(key)), memo_keep.record(key))) {
-    (Some(e), Some(r)) -> {
-      let t = stands(queries, run, e.reads, left);
-      if t.ok && memo_keep.output(e.output) != None {
-        memo_keep.adopt(earlier_key(key), r);
-        memo_keep.adopt(key, e);
-        took(
-          { ..t.run, restored: t.run.restored.push({ query: q.name, input: input }) },
-          q.name,
-          e.output,
-        )
-      } else { executed(queries, t.run, q, key, input, left) }
+) -> { run: Run, head: Bytes } / {memo_keep.read, memo_keep.write, abort.raise | e} = {
+  let earlier = taken_back(queries, run, memo_keep.record(earlier_key(key)), left);
+  let back = match earlier.record {
+    Some(_) -> earlier,
+    None -> taken_back(queries, earlier.run, memo_keep.below(key), left),
+  };
+  match back.record {
+    None -> executed(queries, back.run, q, key, input, left),
+    Some(e) -> {
+      match memo_keep.record(key) { Some(r) -> memo_keep.adopt(earlier_key(key), r), None -> () };
+      memo_keep.adopt(key, e);
+      took(
+        { ..back.run, restored: back.run.restored.push({ query: q.name, input: input }) },
+        q.name,
+        e.output,
+      )
     },
-    _ -> executed(queries, run, q, key, input, left),
+  }
+}
+
+/// `record` where its reads are unchanged and its result is still stored; else none.
+fn taken_back<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  record: Option<Record>,
+  left: Int,
+) -> { run: Run, record: Option<Record> } / {memo_keep.read, memo_keep.write, abort.raise | e} =
+  match record {
+    None -> { run: run, record: None },
+    Some(e) -> {
+      let t = stands(queries, run, e.reads, left);
+      {
+        run: t.run,
+        record: if t.ok && memo_keep.output(e.output) != None { Some(e) } else { None },
+      }
+    },
   }
 
 /// The message that ends a judgment for [`memo.kept`] that reached a record being computed.
@@ -705,13 +746,15 @@ fn resummarized<| e>(
     None -> (),
   }
 
-/// Whether the record under `key`, a record of the query `judged`, would be reused without its body
-/// running: the run settled it already, the pack below is valid as it is, or its summary or else its
-/// reads are unchanged, each read judged by [`judged_reads`]. The run remembers each judgment.
+/// Whether the record of the query `q` under `key` would be reused without its body running: the
+/// run settled it already, the pack below is valid as it is, its summary or else its reads are
+/// unchanged, or an undone edit would bring back the record it replaced or the pack's own; each
+/// read judged by [`judged_reads`]. A result of a query that does not keep long results must still
+/// be stored. The run remembers each judgment.
 fn would_stand<| e>(
   queries: Map<Bytes, Query<| e>>,
   run: Run,
-  judged: Bytes,
+  q: Query<| e>,
   key: Bytes,
   left: Int,
 ) -> { run: Run, ok: Bool } / {memo_keep.read, memo_keep.write, abort.raise | e} =
@@ -722,17 +765,47 @@ fn would_stand<| e>(
     match run.judged.get(key) {
       Some(ok) -> { run: run, ok: ok },
       None -> {
-        let j = match memo_keep.record(key) {
+        let current = match memo_keep.record(key) {
           None -> { run: run, ok: false },
           Some(rec) -> {
             let s = if rec.summary.len() == 0 { { run: run, ok: false } }
-            else { judged_reads(queries, run, judged, rec.summary, left - 1) };
-            if s.ok { s } else { judged_reads(queries, s.run, judged, rec.reads, left - 1) }
+            else { judged_reads(queries, run, q.name, rec.summary, left - 1) };
+            let d = if s.ok { s }
+            else { judged_reads(queries, s.run, q.name, rec.reads, left - 1) };
+            { run: d.run, ok: d.ok && (q.kept || memo_keep.output(rec.output) != None) }
           },
+        };
+        let j = if current.ok { current } else {
+          let earlier = judged_back(
+            queries,
+            current.run,
+            q.name,
+            memo_keep.record(earlier_key(key)),
+            left - 1,
+          );
+          if earlier.ok { earlier }
+          else { judged_back(queries, earlier.run, q.name, memo_keep.below(key), left - 1) }
         };
         { run: { ..j.run, judged: j.run.judged.insert(key, j.ok) }, ok: j.ok }
       },
     }
+  }
+
+/// Whether `record` would be taken back as [`taken_back`] takes one, judged as [`judged_reads`]
+/// judges, with no body of the query `judged` run.
+fn judged_back<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  judged: Bytes,
+  record: Option<Record>,
+  left: Int,
+) -> { run: Run, ok: Bool } / {memo_keep.read, memo_keep.write, abort.raise | e} =
+  match record {
+    None -> { run: run, ok: false },
+    Some(e) -> {
+      let t = judged_reads(queries, run, judged, e.reads, left);
+      { run: t.run, ok: t.ok && memo_keep.output(e.output) != None }
+    },
   }
 
 /// Whether each of `reads` returns what it returned before, without running any body of the query
@@ -768,7 +841,7 @@ fn judged_reads<| e>(
                 match offered {
                   Some(d) -> { run: acc.run, ok: d == digest },
                   None -> if name == judged {
-                    let w = would_stand(queries, acc.run, judged, asked, left);
+                    let w = would_stand(queries, acc.run, q, asked, left);
                     { run: w.run, ok: w.ok && memo_keep.head(asked) == Some(digest) }
                   } else {
                     let a = settled_at(queries, acc.run, q, asked, input, left);
@@ -865,12 +938,15 @@ fn executed<| e>(
       },
       memo.held(digest) -> memo_keep.output(digest),
       memo.kept(name, asked) -> {
-        let k = key_of(query_of(queries, name), asked);
+        let jq = query_of(queries, name);
+        let k = key_of(jq, asked);
         let was = st.run;
+        // A judgment runs bodies no ask may run: one that fails, or reaches a record being computed
+        // with no stored result, judges the record not kept.
         let judged = handle {
-          Some(would_stand(queries, { ..was, judging: true }, name, k, left - 1))
+          Some(would_stand(queries, { ..was, judging: true }, jq, k, left - 1))
         } with {
-          abort.raise(m) -> if m == judgment_stopped() { None } else { abort.raise(m) },
+          abort.raise(_) -> None,
         };
         match judged {
           // A judgment that reached a record being computed keeps nothing it settled.
@@ -945,6 +1021,9 @@ pub fn recorded<| e>(
   looked: List<Read>,
   output: Bytes,
 ) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} = {
+  // The store keeps the records of the queries a run names, so a run that only stores a command's
+  // result names its queries too.
+  memo_keep.running(queries_id(queries), hashes_of(queries));
   let defined = queries.fold(looked, |acc: List<Read>, name: Bytes, q: Query<| e>|
     acc.push(World(query_kind(), name, digest_of(Some(q.hash)))));
   let rec = {
@@ -1112,6 +1191,12 @@ pub fn over_held<a | e>(
       l.looked.digest
     },
     memo_keep.looked() -> running.looked.values().map(|x: Look| World(x.kind, x.at, x.digest)),
+    memo_keep.below(key) -> if !store.records.contains(key) { None } else {
+      let p = packed_at(running, inlined, key);
+      running = p.running;
+      inlined = p.inlined;
+      p.rec
+    },
     memo_keep.standing(key) -> if !running.trusted { false } else {
       let p = packed_at(running, inlined, key);
       running = p.running;
