@@ -125,8 +125,10 @@ unreported() {
 }
 
 # `ply test` over the package at PATH (relative to the repository) with ARGs: the CLI's suite from a
-# directory of its own, which its harness empties before each test and refuses without the marker,
-# and any other package as `ply test` runs it, granted nothing.
+# directory of its own, which its harness empties before each test and refuses without the marker;
+# the standard library's suites granted an emptied directory as the root `scratch`, which the tests
+# of its real handlers write under; and any other package as `ply test` runs it, granted nothing.
+# The scratch root's path is the same every run, since a pass is kept for the binding it ran under.
 tested() {
   local path=$1 status=0 dir
   shift
@@ -134,6 +136,11 @@ tested() {
     dir=$(mktemp -d)
     touch "$dir/.ply-scratch"
     (cd "$dir" && bounded "$ply" test "$root/$path" "$@" "${cli_grants[@]}") || status=$?
+    rm -rf "$dir"
+  elif [[ $path == "$(work std)" || $path == "$(work std-tests)" ]]; then
+    dir=$caches/ply-std-scratch
+    rm -rf "$dir" && mkdir -p "$dir"
+    bounded "$ply" test "$path" --json "$@" --fs "scratch=$dir" || status=$?
     rm -rf "$dir"
   else
     bounded "$ply" test "$path" --json "$@" || status=$?

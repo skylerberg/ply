@@ -3555,6 +3555,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
 | `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
+| `ply rename --map FILE [paths]` | renames each old name in the map file to its new name, in the `.ply` files under the paths (default: the package containing the working directory). `--words` renames words inside names instead. `--check` writes nothing and exits 1, listing what would change; `--json` reports the same and requires `--check`. Exits 2 without writing anything if the renamed program would not check, or a name in it would refer to something else. See **Renaming** below. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
 | `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |
 | `ply resolve [path]` | writes `ply.lock` from the manifests: each dependency's name, version, and the digest of each one not in this checkout (`in the checkout` for the rest; `"digest": null` in `--json`). Parses no modules. The only command that downloads registry dependencies, from `PLY_REGISTRY`, with their interface and attestation where published (`interface` and `attestation` in `--json`; attestations trusted as `PLY_ATTESTERS` says, §15.1). |
@@ -3640,6 +3641,90 @@ indentation, and takes no trailing comma as the last item of a list. A file it c
 is also an error (exit 2), so `--check` never passes a file it did not read. Directories whose names
 start with `.`, and directories named `target`, are skipped. A symlink found while walking is
 skipped; one named on the command line is an error.
+
+**Renaming.** `ply rename` replaces names in many files at once. The map file has one rename per
+line: the old name, a space, and the new name.
+
+```
+held_count cached_count
+Expr Expression
+```
+
+`ply rename` reads the program the way the compiler does. Each definition, local variable, effect
+operation, record field and module named by an old name is renamed where it is declared and
+wherever it is used, in every `.ply` file under the paths. A record field is renamed in every
+record type that has it and at every use: records are structural, so a field belongs to no one
+type. Then `ply rename` checks the renamed program, and refuses unless every name in it still
+refers to what it did.
+
+When several modules declare the same name, put the file that declares the one you mean first:
+
+```
+packages/cli/build.ply Made BuildOutput
+```
+
+This renames what that file binds under the name: its definition `Made`, wherever it is used (in
+files that import it by name, `import build (Made)`, and where a file writes it after the module's
+name, `build::Made`), and any local variable the file names `Made`. Other definitions named `Made`,
+and record fields spelled `Made`, stay as they are. A function of a type, `Stack::size`, is renamed
+by its own name (`size`), and follows its type when the type is renamed.
+
+To rename a module, give its file, or its directory ending in `/`, and the new name:
+
+```
+packages/compiler/emit/answer.ply output
+packages/compiler/emit/lowered/ tests
+```
+
+The file or directory moves, and every `import` of it changes to match, along with uses written
+`answer::name`. Other names spelled `answer` stay as they are. A string that contains the module's
+full name, such as `"compiler.emit.answer"`, is reported as a warning.
+
+To rename an operation of an effect, write the effect and the operation joined by a dot, after the
+file that declares the effect:
+
+```
+packages/std/fs.ply fs.read_file load_file
+```
+
+The operation is renamed inside the effect's declaration and wherever a file that imports from that
+module writes `fs.read_file`: calls, effect lists in signatures, and handlers.
+
+To rename only a record field, start the line with `.`. The field is renamed in every record type
+that has it and at every use, and a function or local variable spelled the same stays as it is:
+
+```
+.held cached
+```
+
+Types and values have separate names, so renaming a type leaves a variant or function spelled the
+same alone. If a module's name changes, its file moves: renaming `held` to `cached` moves
+`held/store.ply` to `cached/store.ply`.
+
+A name inside backticks in a comment is renamed too, where the file renames every use of that name
+the same way, so doc links stay correct. Text in strings is never changed. `ply rename` prints a
+warning with the line for a string that is nothing but a renamed name (`"build.Made"`), and for a
+string holding a word that a line without a file, or `--words`, renames, so you can decide whether
+to change it by hand.
+
+With `--words`, each line renames a word inside names. Words are separated by `_` or by a capital
+letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon`, and `MAX_TY` to
+`MAX_TYPE`. A name that would become a keyword stays as it is, so `ty` alone is not renamed.
+
+`ply rename` changes nothing, and exits 2, if:
+
+- a path's program does not check before the renames;
+- a line names a file the paths do not hold, a name that file does not bind, or a field no record
+  has;
+- a new name is a keyword or not a valid name;
+- a renamed name is declared with `extern`, so code outside Ply uses that name;
+- a module's file would be moved onto a file that already exists, or two files onto one;
+- the renamed program would not check, or a name in it would refer to something other than what it
+  did: two definitions with one name, or a local that another local of its new name hides.
+
+Only files under the paths are changed. A file of the same package outside the paths that uses a
+renamed name stops the rename, because the renamed program would not check. Another package that
+uses a renamed name is not checked; `ply check` reports it.
 
 **Editing one definition.** `ply show NAME` and `ply replace NAME` read and rewrite one definition
 without touching anything else in the file. The replacement is one item of the same kind and name,

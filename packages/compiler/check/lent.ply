@@ -68,9 +68,10 @@ type Valued = { seen: Seen, lent: List<Lent>, answers: List<Bytes> }
 /// What a local may be, as `Valued` says of a value.
 type Local = { lent: List<Bytes>, answers: List<Bytes> }
 
-/// Each local, and `room`, the rounds a `handle`'s answer is read again in, one more than there
-/// are lent parameters, since each round that changes it adds one.
-type Scope = { locals: Map<Bytes, Local>, callees: Callees, room: Int }
+/// Each local that may be a lent parameter, by its binder's site, and `room`, the rounds a
+/// `handle`'s answer is read again in, one more than there are lent parameters, since each round
+/// that changes it adds one.
+type Scope = { locals: Map<Int, Local>, callees: Callees, room: Int }
 
 type Stated = { s: Scope, v: Valued }
 
@@ -93,7 +94,7 @@ pub fn refusals(
     let s = def.params.fold(
       { locals: Map::new(), callees: callees, room: lent.len() + 1 },
       |sc: Scope, p: Param|
-        bound(sc, p.name.name, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
+        bound(sc, p.name.span.site, if lent.contains(p.name.name) { [p.name.name] } else { [] }),
     );
     held(s, quiet(), body, Answered).escapes.fold(
       { diags: [], fixed: [] },
@@ -193,14 +194,15 @@ fn place_text(place: Place) -> Bytes =
       ]),
   }
 
-fn bound(s: Scope, name: Bytes, lent: List<Bytes>) -> Scope =
-  bound_local(s, name, { lent: lent, answers: [] })
+fn bound(s: Scope, binder: Int, lent: List<Bytes>) -> Scope =
+  bound_local(s, binder, { lent: lent, answers: [] })
 
-fn bound_local(s: Scope, name: Bytes, l: Local) -> Scope = { ..s, locals: s.locals.insert(name, l) }
+fn bound_local(s: Scope, binder: Int, l: Local) -> Scope =
+  { ..s, locals: s.locals.insert(binder, l) }
 
 /// Every binder of `p`, each bound to what the value it takes apart may be.
 fn bound_pattern(s: Scope, p: TypedPattern<Type>, l: Local) -> Scope =
-  pattern_binders(p).fold(s, |sc: Scope, b: TypedParam<Type>| bound_local(sc, b.name, l))
+  pattern_binders(p).fold(s, |sc: Scope, b: TypedParam<Type>| bound_local(sc, b.span.site, l))
 
 fn params_of(lent: List<Lent>) -> List<Bytes> =
   lent.fold([], |ps: List<Bytes>, l: Lent| ps.push_unique(l.param))
@@ -237,7 +239,7 @@ fn walk(s: Scope, seen: Seen, e: Walked) -> Valued / {abort.raise} =
   match e.node {
     WalkedLit(_) -> plain(seen),
     WalkedDefault(_) -> plain(seen),
-    WalkedRead(WalkedLocal(n)) -> match s.locals.get(n) {
+    WalkedRead(WalkedLocal(x)) -> match s.locals.get(x.binder) {
       Some(l) ->
         {
           seen: read(seen, l.lent),
@@ -250,8 +252,7 @@ fn walk(s: Scope, seen: Seen, e: Walked) -> Valued / {abort.raise} =
     WalkedBinary(b) -> plain(spent(s, spent(s, seen, b.lhs), b.rhs)),
     WalkedUnary(u) -> plain(spent(s, seen, u.operand)),
     WalkedLambda(l) -> {
-      let inner = l.params.fold(s, |sc: Scope, p: TypedParam<Type>| bound(sc, p.name, []));
-      let body = held(inner, { ..seen, read: [] }, l.body, Answered);
+      let body = held(s, { ..seen, read: [] }, l.body, Answered);
       {
         seen: read({ ..body, read: seen.read }, body.read),
         lent: body.read.map(|p: Bytes| { param: p, span: e.span }),
@@ -297,7 +298,7 @@ fn applied(
   args: List<Walked>,
 ) -> Valued / {abort.raise} =
   match func.node {
-    WalkedRead(WalkedLocal(n)) -> match s.locals.get(n) {
+    WalkedRead(WalkedLocal(x)) -> match s.locals.get(x.binder) {
       Some(l) ->
         {
           seen: each(s, read(seen, l.lent), args, Applied),
@@ -365,12 +366,6 @@ fn statements(s: Scope, seen: Seen, stmts: List<WalkedStmt>) -> Stated / {abort.
       WalkedAssign(y) -> { ..st, v: { ..st.v, seen: held(st.s, st.v.seen, y.value, Stored) } },
     })
 
-/// A clause's scope: its parameters and the label it binds, none of them lent.
-fn clause_scope(s: Scope, c: WalkedClause) -> Scope = {
-  let given = c.params.fold(s, |sc: Scope, p: TypedParam<Type>| bound(sc, p.name, []));
-  match c.label { Some(t) -> bound(given, t.name, []), None -> given }
-}
-
 /// A `handle`: its value is its body's, or its `return` clause's, or a resuming clause's, and what
 /// a clause that does not resume answers goes back to the perform. Handlers are deep, so the
 /// continuation holds every lent parameter the body, `return` or any clause reads, and a call of
@@ -383,31 +378,26 @@ fn handled(
   clauses: List<WalkedClause>,
   vars: List<WalkedHandlerVar>,
 ) -> Valued / {abort.raise} = {
-  let inits = vars.fold(
-    { s: s, seen: seen },
-    |acc: { s: Scope, seen: Seen }, v: WalkedHandlerVar|
-      { s: bound(acc.s, v.name, []), seen: held(acc.s, acc.seen, v.init, Stored) },
-  );
-  let b = walk(s, { ..inits.seen, read: [] }, body);
+  let inits = vars.fold(seen, |acc: Seen, v: WalkedHandlerVar| held(s, acc, v.init, Stored));
+  let b = walk(s, { ..inits, read: [] }, body);
   let returning = match ret {
-    Some(r) -> bound_local(inits.s, r.binder.name, local_of(b)),
-    None -> inits.s,
+    Some(r) -> bound_local(s, r.binder.span.site, local_of(b)),
+    None -> s,
   };
   let caught = clauses.fold(
     joined(b.seen.read, match ret {
       Some(r) -> walk(returning, quiet(), r.body).seen.read,
       None -> [],
     }),
-    |acc: List<Bytes>, c: WalkedClause|
-      joined(acc, walk(clause_scope(inits.s, c), quiet(), c.body).seen.read),
+    |acc: List<Bytes>, c: WalkedClause| joined(acc, walk(s, quiet(), c.body).seen.read),
   );
-  let after = read({ ..b.seen, read: inits.seen.read }, caught);
+  let after = read({ ..b.seen, read: inits.read }, caught);
   let returned: Valued = match ret {
     Some(r) -> walk(returning, after, r.body),
     None -> { seen: after, lent: b.lent, answers: b.answers },
   };
   let resumed = |c: WalkedClause, k: TypedParam<Type>, answers: List<Bytes>|
-    bound_local(clause_scope(inits.s, c), k.name, { lent: caught, answers: answers });
+    bound_local(s, k.span.site, { lent: caught, answers: answers });
   let answers = answering(
     clauses,
     resumed,
@@ -417,7 +407,7 @@ fn handled(
   clauses.fold(returned, |acc: Valued, c: WalkedClause|
     match c.resume {
       Some(k) -> either(acc, walk(resumed(c, k, answers), acc.seen, c.body)),
-      None -> { ..acc, seen: held(clause_scope(inits.s, c), acc.seen, c.body, Answered) },
+      None -> { ..acc, seen: held(s, acc.seen, c.body, Answered) },
     })
 }
 

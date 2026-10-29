@@ -1,0 +1,356 @@
+//! `ply rename`: each name edited where its program's resolution and check say it is written, and
+//! a rename refused unless every name of the renamed program refers to what it did.
+
+import harness (Kept, Source, kept_in_memory, tree, file_of, stderr, said, Hermetic, Shipped,
+                manifest, dep)
+import std.string
+
+fn renamed(
+  files: List<Source>,
+  map: String,
+  argv: List<String>,
+) -> Kept / {Hermetic, Shipped, abort.raise, diverges} =
+  kept_in_memory(
+    tree(files.push({ path: "map.txt", text: map })),
+    ["rename", "--map", "map.txt"].concat(argv),
+    [],
+    None,
+  )
+
+fn app(files: List<Source>) -> List<Source> =
+  [{ path: "app/ply.pkg", text: manifest("app", "") }].concat(files)
+
+fn errors_of(k: Kept) -> List<String> = k.ran.err.filter(|line: String| line.starts_with("error"))
+
+fn store_tree() -> List<Source> =
+  app([
+    {
+      path: "app/held/store.ply",
+      text: "/// Reads [`held_count`].\npub fn held_count(xs: List<Int>) -> Int = xs.len()\n",
+    },
+    {
+      path: "app/main.ply",
+      text: "import held.store (held_count)\n\nfn main() -> Int = held_count([1, 2])\n\nfn said() -> String = f\"{held_count([])} held_count\"\n",
+    },
+  ])
+
+test "renaming a word moves the module, updates imports and doc links, and leaves strings alone" {
+  let k = renamed(store_tree(), "held cached\n", ["--words", "app"]);
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "app/main.ply"),
+    Some(
+      "import cached.store (cached_count)\n\nfn main() -> Int = cached_count([1, 2])\n\nfn said() -> String = f\"{cached_count([])} held_count\"\n",
+    ),
+  );
+  assert_eq(file_of(k.tree, "app/held/store.ply"), None);
+  assert_eq(
+    file_of(k.tree, "app/cached/store.ply"),
+    Some("/// Reads [`cached_count`].\npub fn cached_count(xs: List<Int>) -> Int = xs.len()\n"),
+  );
+  assert_eq(k.ran.err, ["warning: app/main.ply:5: a string contains the renamed name `held_count`"])
+}
+
+test "`--check` lists what would change, writes nothing, and exits 1" {
+  let k = renamed(store_tree(), "held_count total\n", ["--check", "app"]);
+  assert_eq(k.ran.code, 1);
+  assert_eq(k.ran.out, ["would rename in app/held/store.ply", "would rename in app/main.ply"]);
+  assert_eq(file_of(k.tree, "app/main.ply"), Some(store_tree().get(2).text))
+}
+
+test "two definitions becoming one name stops the rename" {
+  let text = "fn total() -> Int = 1\n\nfn sum() -> Int = total()\n";
+  let k = renamed([{ path: "m.ply", text: text }], "sum total\n", ["m.ply"]);
+  assert_eq(k.ran.code, 2);
+  assert(errors_of(k).len() > 0, Some(said(k.ran)));
+  assert_eq(file_of(k.tree, "m.ply"), Some(text))
+}
+
+test "a local renamed into the scope of another of its new name stops the rename" {
+  let text = "fn f(a: Int) -> Int = {\n  let b = 2;\n  a + b\n}\n";
+  let k = renamed([{ path: "m.ply", text: text }], "a b\n", ["m.ply"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k), ["error: m.ply:3: `a` would refer to something else after the renames"]);
+  assert_eq(file_of(k.tree, "m.ply"), Some(text))
+}
+
+test "a program that does not check is renamed nowhere, and only its own errors are said" {
+  let k = renamed([{ path: "m.ply", text: "fn f() -> Int = g()\n" }], "f h\n", ["m.ply"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k).len(), 1);
+  assert(errors_of(k).get(0).starts_with("error: m.ply: does not check: "), Some(said(k.ran)))
+}
+
+test "a keyword as the new name stops the rename" {
+  let k = renamed([{ path: "m.ply", text: "fn kind() -> Int = 1\n" }], "kind type\n", ["m.ply"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k).at(0), Some("error: `type` is a keyword"))
+}
+
+fn two_mades() -> List<Source> =
+  app([
+    { path: "app/build.ply", text: "pub type Made = { size: Int }\n" },
+    { path: "app/unit.ply", text: "pub type Made = { code: Int }\n" },
+    {
+      path: "app/main.ply",
+      text: "import build (Made)\nimport unit\n\nfn sizes(m: Made, u: unit::Made) -> Int = m.size + u.code\n",
+    },
+  ])
+
+test "a line that starts with a file renames only the definition in that file, and its uses" {
+  let one = renamed(two_mades(), "app/unit.ply Made UnitCode\n", ["app"]);
+  assert(one.ran.code == 0, Some(stderr(one.ran)));
+  assert_eq(file_of(one.tree, "app/build.ply"), Some("pub type Made = { size: Int }\n"));
+  assert_eq(file_of(one.tree, "app/unit.ply"), Some("pub type UnitCode = { code: Int }\n"));
+  assert_eq(
+    file_of(one.tree, "app/main.ply"),
+    Some(
+      "import build (Made)\nimport unit\n\nfn sizes(m: Made, u: unit::UnitCode) -> Int = m.size + u.code\n",
+    ),
+  );
+  let both = renamed(
+    two_mades(),
+    "app/unit.ply Made UnitCode\napp/build.ply Made BuildOutput\n",
+    ["app"],
+  );
+  assert(both.ran.code == 0, Some(stderr(both.ran)));
+  assert_eq(
+    file_of(both.tree, "app/main.ply"),
+    Some(
+      "import build (BuildOutput)\nimport unit\n\nfn sizes(m: BuildOutput, u: unit::UnitCode) -> Int = m.size + u.code\n",
+    ),
+  )
+}
+
+test "a line that starts with a file and names nothing it binds stops the rename" {
+  let k = renamed(two_mades(), "app/unit.ply Making Making2\n", ["app"]);
+  assert_eq(k.ran.code, 2);
+  assert_eq(errors_of(k), ["error: app/unit.ply: binds no `Making`"])
+}
+
+fn answer_module() -> List<Source> =
+  app([
+    { path: "app/emit/answer.ply", text: "pub fn size() -> Int = 1\n" },
+    {
+      path: "app/main.ply",
+      text: "import emit.answer\n\nfn main() -> Int = {\n  let answer = answer::size();\n  answer\n}\n",
+    },
+  ])
+
+test "a line that names a module's file renames the module and leaves names spelled the same alone" {
+  let k = renamed(answer_module(), "app/emit/answer.ply output\n", ["app"]);
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(file_of(k.tree, "app/emit/answer.ply"), None);
+  assert_eq(file_of(k.tree, "app/emit/output.ply"), Some("pub fn size() -> Int = 1\n"));
+  assert_eq(
+    file_of(k.tree, "app/main.ply"),
+    Some(
+      "import emit.output\n\nfn main() -> Int = {\n  let answer = output::size();\n  answer\n}\n",
+    ),
+  );
+  let directory = renamed(answer_module(), "app/emit/ code\n", ["app"]);
+  assert(directory.ran.code == 0, Some(stderr(directory.ran)));
+  assert_eq(file_of(directory.tree, "app/code/answer.ply"), Some("pub fn size() -> Int = 1\n"));
+  assert_eq(
+    file_of(directory.tree, "app/main.ply"),
+    Some(
+      "import code.answer\n\nfn main() -> Int = {\n  let answer = answer::size();\n  answer\n}\n",
+    ),
+  )
+}
+
+test "modules of one name in two packages each move, and an import of one follows it" {
+  let k = renamed(
+    [
+      { path: "lib/ply.pkg", text: manifest("lib", "") },
+      { path: "lib/twin.ply", text: "pub fn value() -> Int = 1\n" },
+      { path: "app/ply.pkg", text: manifest("app", dep("lib", "../lib")) },
+      { path: "app/twin.ply", text: "pub fn other() -> Int = 2\n" },
+      {
+        path: "app/main.ply",
+        text: "import lib.twin\nimport twin as own\n\nfn main() -> Int = twin::value() + own::other()\n",
+      },
+    ],
+    "lib/twin.ply fake\napp/twin.ply copy\n",
+    ["lib", "app"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(file_of(k.tree, "lib/fake.ply"), Some("pub fn value() -> Int = 1\n"));
+  assert_eq(file_of(k.tree, "app/copy.ply"), Some("pub fn other() -> Int = 2\n"));
+  assert_eq(
+    file_of(k.tree, "app/main.ply"),
+    Some(
+      "import lib.fake\nimport copy as own\n\nfn main() -> Int = fake::value() + own::other()\n",
+    ),
+  )
+}
+
+test "an effect operation is renamed where it is declared and wherever the effect names it" {
+  let k = renamed(
+    app([
+      {
+        path: "app/store.ply",
+        text: "pub effect store {\n  read fetch[r](key: Int) -> Int\n}\n\npub fn fetch() -> Int = 1\n",
+      },
+      {
+        path: "app/main.ply",
+        text: "import store (store)\n\nfn get() -> Int / {store.fetch[r]} = store.fetch[r](1)\n\nfn fetch() -> Int = 2\n",
+      },
+    ]),
+    "app/store.ply store.fetch load\n",
+    ["app"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "app/store.ply"),
+    Some("pub effect store {\n  read load[r](key: Int) -> Int\n}\n\npub fn fetch() -> Int = 1\n"),
+  );
+  assert_eq(
+    file_of(k.tree, "app/main.ply"),
+    Some(
+      "import store (store)\n\nfn get() -> Int / {store.load[r]} = store.load[r](1)\n\nfn fetch() -> Int = 2\n",
+    ),
+  )
+}
+
+test "a type and a variant spelled the same are renamed apart" {
+  let k = renamed(
+    app([
+      { path: "app/a.ply", text: "pub type Signed = { x: Int }\n" },
+      {
+        path: "app/b.ply",
+        text: "import a (Signed)\n\ntype Left = | Signed | Other\n\nfn f(s: Signed) -> Int = s.x\n",
+      },
+    ]),
+    "app/a.ply Signed SignedValue\n",
+    ["app"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "app/b.ply"),
+    Some(
+      "import a (SignedValue)\n\ntype Left = | Signed | Other\n\nfn f(s: SignedValue) -> Int = s.x\n",
+    ),
+  )
+}
+
+test "a line that starts with a file renames what the file binds, but no member or field spelled the same" {
+  let k = renamed(
+    [
+      {
+        path: "m.ply",
+        text: "type Diag = { at: Int }\n\nfn at() -> Int = 1\n\nfn make(at: Int) -> Diag = { at: at }\n\nfn f(b: Bytes, d: Diag) -> Int / {abort.raise} = b.at(0) + Bytes::at(b, 1) + d.at + at()\n",
+      },
+    ],
+    "m.ply at position\n",
+    ["m.ply"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "m.ply"),
+    Some(
+      "type Diag = { at: Int }\n\nfn position() -> Int = 1\n\nfn make(position: Int) -> Diag = { at: position }\n\nfn f(b: Bytes, d: Diag) -> Int / {abort.raise} = b.at(0) + Bytes::at(b, 1) + d.at + position()\n",
+    ),
+  )
+}
+
+test "a line that starts with `.` renames a field in every record, and no other name or builtin spelled the same" {
+  let k = renamed(
+    [
+      {
+        path: "m.ply",
+        text: "type Diag = { at: Int }\n\ntype Spot = { at: Int, line: Int }\n\nfn at() -> Int = 1\n\nfn make(at: Int) -> Diag = { at: at }\n\nfn f(d: Diag, s: Spot, b: Bytes) -> Int / {abort.raise} = d.at + s.at + at() + b.at(0)\n",
+      },
+    ],
+    ".at position\n",
+    ["m.ply"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "m.ply"),
+    Some(
+      "type Diag = { position: Int }\n\ntype Spot = { position: Int, line: Int }\n\nfn at() -> Int = 1\n\nfn make(at: Int) -> Diag = { position: at }\n\nfn f(d: Diag, s: Spot, b: Bytes) -> Int / {abort.raise} = d.position + s.position + at() + b.at(0)\n",
+    ),
+  );
+  let missing = renamed(two_mades(), ".nowhere somewhere\n", ["app"]);
+  assert_eq(missing.ran.code, 2);
+  assert_eq(errors_of(missing), [
+    "error: no record in the files being renamed has a field `nowhere`",
+  ])
+}
+
+test "a call on a value written after a `?` is read as the check read it" {
+  let text = "type R = { split: Int }\n\nfn r() -> R = { split: 1 }\n\nfn first(b: Bytes) -> Result<Int, Int> = Ok(b.len())\n\nfn f(b: Bytes) -> Result<Int, Int> = {\n  let n = first(b)?;\n  Ok(n + b.split(b\",\").len())\n}\n";
+  let k = renamed([{ path: "m.ply", text: text }], ".split part\n", ["m.ply"]);
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "m.ply"),
+    Some(text.replace("{ split: Int }", "{ part: Int }").replace("{ split: 1 }", "{ part: 1 }")),
+  )
+}
+
+test "a field written by its name alone is written out when only the value it reads is renamed" {
+  let k = renamed(
+    [
+      {
+        path: "m.ply",
+        text: "type R = { held: () -> Int, other: Int }\n\nfn held() -> Int = 1\n\nfn r() -> R = { held, other: 2 }\n",
+      },
+    ],
+    "m.ply held kept\n",
+    ["m.ply"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "m.ply"),
+    Some(
+      "type R = { held: () -> Int, other: Int }\n\nfn kept() -> Int = 1\n\nfn r() -> R = { held: kept, other: 2 }\n",
+    ),
+  )
+}
+
+test "a call on a value follows its type's function, and a named argument its parameter" {
+  let k = renamed(
+    [
+      {
+        path: "m.ply",
+        text: "type Stack = new { items: List<Int> }\n\nfn Stack::size(s: Stack, by: Int = 0) -> Int = s.items.len() + by\n\nfn f(s: Stack) -> Int = s.size(by: 1)\n",
+      },
+    ],
+    "m.ply size count\nby extra\n",
+    ["m.ply"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(
+    file_of(k.tree, "m.ply"),
+    Some(
+      "type Stack = new { items: List<Int> }\n\nfn Stack::count(s: Stack, extra: Int = 0) -> Int = s.items.len() + extra\n\nfn f(s: Stack) -> Int = s.count(extra: 1)\n",
+    ),
+  )
+}
+
+test "a string that writes a renamed name after `::` is reported, and left as it is" {
+  let text = "pub type Made = { x: Int }\n\nfn template() -> String = \"fn f(v: m::Made) -> Int = v.x\"\n";
+  let k = renamed([{ path: "m.ply", text: text }], "m.ply Made Built\n", ["m.ply"]);
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert_eq(k.ran.err, ["warning: m.ply:3: a string contains the renamed name `Made`"]);
+  assert(file_of(k.tree, "m.ply").unwrap_or("").contains("m::Made"), Some(said(k.ran)))
+}
+
+test "operations of two effects in one file may share a name" {
+  let k = renamed(
+    [
+      {
+        path: "m.ply",
+        text: "effect store {\n  read held[r](key: Int) -> Int\n}\n\neffect files {\n  read get[r](key: Int) -> Int\n}\n\nfn both() -> Int / {store.held[r], files.get[r]} = store.held[r](1) + files.get[r](2)\n",
+      },
+    ],
+    "m.ply store.held get\n",
+    ["m.ply"],
+  );
+  assert(k.ran.code == 0, Some(stderr(k.ran)));
+  assert(
+    file_of(k.tree, "m.ply").unwrap_or("").contains("store.get[r](1) + files.get[r](2)"),
+    Some(said(k.ran)),
+  )
+}

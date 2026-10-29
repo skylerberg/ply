@@ -2,6 +2,7 @@
 
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, span_bin, is_bare)
 import std.bin
+import compiler.check.member (MemberTarget, member_target_bin)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
                                     AtomExpr, Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_bin)
 import compiler.syntax.items (Item, IFn, IType, IExtern, is_shipped, is_builtin, FnDef, ExternDef,
@@ -14,14 +15,14 @@ import compiler.syntax.exprs (Expr, EBinary, Param, expr_span, Tagged, prelude_m
 import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
                                  LDec, LChar)
 import compiler.check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn,
-                             TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, atoms_insert,
-                             row_empty, row_open, row_singleton, named_type, int_type, bool_type,
-                             string_type, bytes_type, float_type, decimal_type, unit_type,
-                             list_type, option_type, fn_type, fields_sorted, ints_insert,
-                             ints_union, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
-                             fresh_row, subst_new, with_bindings, resolve_row, free_vars,
-                             env_bind_global, at_arguments, TyNominal, atom_bin, row_bin, type_bin,
-                             scheme_bin, TypeTable, owning_fn_type)
+                             TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, InScope,
+                             env_depth, atoms_insert, row_empty, row_open, row_singleton,
+                             named_type, int_type, bool_type, string_type, bytes_type, float_type,
+                             decimal_type, unit_type, list_type, option_type, fn_type,
+                             fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
+                             fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
+                             resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
+                             atom_bin, row_bin, type_bin, scheme_bin, TypeTable, owning_fn_type)
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
                              duration_type, task_type, chan_type, hold_name, hold_type, map_parts)
 import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
@@ -277,7 +278,7 @@ pub type OwnCall = { callee: Bytes, span: Span }
 /// read it. A call on a value, `base.name(args)`, at `site` calls `qualifier::name` with the value
 /// first, or the bare `name` where `qualifier` is empty; with no `name` either it calls the
 /// function the value holds in the field written. A name written `T::name` at `site` is
-/// `qualifier::name`. `callee` is the function's qualified name, empty for a field's, and
+/// `qualifier::name`. `callee` says what the site calls, and
 /// `reaches` the modules the defaults the call copies name. `named` is the place among the
 /// callee's parameters, the value's first, of each argument the call names, in the order written.
 /// Each site in this module and below is a node's of the item `owner` names.
@@ -286,7 +287,7 @@ pub type MemberSite = {
   site: Int,
   qualifier: Bytes,
   name: Bytes,
-  callee: Bytes,
+  callee: MemberTarget,
   owner: Bytes,
   reaches: List<Bytes>,
   named: List<Int>,
@@ -345,7 +346,7 @@ pub type HoleSite = {
   module: Int,
   span: Span,
   var: Int,
-  locals: List<{ name: Bytes, sc: Scheme }>,
+  locals: List<InScope>,
   declared: Option<List<Atom>>,
   owner: Bytes,
   text: Bytes,
@@ -417,8 +418,8 @@ pub type RegionSite = {
 /// `simulate` region's tasks.
 pub type Brand = | HoldsOf(Bytes) | Tasks
 
-/// A local bound outside the innermost `simulate` region, named inside it.
-pub type Crossing = { name: Bytes, span: Span }
+/// A local bound outside the innermost `simulate` region, read inside it.
+pub type Crossing = { binder: Int, name: Bytes, span: Span }
 
 /// A `simulate` region: `entering` names each binding from outside it whose value holds a task.
 pub type Simulation = {
@@ -660,6 +661,7 @@ pub type Checker = {
   /// The definition or test whose body is being walked, which every site the walk records is
   /// filed under; empty for a clause or a law, which are walked afresh each time.
   walking: Bytes,
+  binders: Map<Int, Int>,
   /// What the rows handed in say the emitter reads of each body published from them.
   kept: List<KeptFacts>,
   /// Each rigid variable a clause sees one of its operation's own type parameters as where a value
@@ -697,15 +699,14 @@ pub type Checker = {
 }
 
 /// What the code being walked may reach of what is bound around it. `vars` are the variables of the
-/// handler whose clause is being walked, each by the stamp its name is bound at, which an assignment
-/// may give a new value; `barred` names the place in the clause where none may, since what runs
-/// there may run after the clause has returned. `frame` is how many scopes were open where the
-/// innermost closure the code runs in began: a local bound in one of them is read as its capture.
-pub type Assignable = {
-  vars: List<{ stamp: Int, name: Bytes, ty: Type }>,
-  barred: Option<Bytes>,
-  frame: Int,
-}
+/// handler whose clause is being walked, which an assignment may give a new value; `barred` names
+/// the place in the clause where none may, since what runs there may run after the clause has
+/// returned. `frame` is how many scopes were open where the innermost closure the code runs in
+/// began: a local bound in one of them is read as its capture.
+pub type Assignable = { vars: List<HandlerVariable>, barred: Option<Bytes>, frame: Int }
+
+/// A handler's variable, by the site of the name that binds it.
+pub type HandlerVariable = { binder: Int, name: Bytes, ty: Type }
 
 /// `checker` inside `place`, which may run after the code around it, as a closure of its own: no
 /// assignment there may give the variables of the clause around it a value, and a read there of
@@ -713,7 +714,7 @@ pub type Assignable = {
 pub fn barred(checker: Checker, place: Bytes) -> Checker =
   {
     ..checker,
-    assignable: { ..checker.assignable, barred: Some(place), frame: checker.env.scopes.len() },
+    assignable: { ..checker.assignable, barred: Some(place), frame: env_depth(checker.env) },
   }
 
 /// `o`, walked from `barred(outer, ..)`, in `outer`'s place again.
@@ -805,8 +806,8 @@ pub type Growth = { param: Int, ty: Bytes }
 /// caller's own.
 pub type Fill = { module: Int, span: Span, callee: Bytes, grows: List<Growth> }
 
-/// What a name a body reads refers to, `module` empty where it is written bare.
-pub type NamedCallee = { module: Bytes, name: Bytes, callee: Callee }
+/// What a name a body reads and nothing in it binds refers to, by the site of the name.
+pub type NamedCallee = { site: Int, callee: Callee }
 
 /// What the walk of the function `name` leaves its group beside what its signature says, as
 /// another check reads it: what it performs with each label parameter of the definition named by
@@ -926,8 +927,6 @@ pub fn hold_atom(resource: Resource) -> Atom =
 pub fn is_region_effect(name: Bytes) -> Bool = name == hold()
 
 pub fn compare_values_name() -> Bytes = b"compare_values"
-
-pub fn result_name() -> Bytes = b"result"
 
 pub fn location_of(checker: Checker, span: Span) -> Location =
   { module: checker.module, span: span }
@@ -1684,7 +1683,7 @@ pub fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
 
 // --- Names ------------------------------------------------------------------------------
 
-pub type ValueKey = { name: Bytes, prelude: Bool }
+pub type ValueKey = | LocalKey(Int) | GlobalKey({ name: Bytes, prelude: Bool })
 
 // --- Types from type expressions ----------------------------------------------------------
 

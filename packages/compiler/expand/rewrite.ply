@@ -11,9 +11,10 @@ import compiler.syntax.parsing (Span, Ident, QName, ParseDiag, span_to, bare, du
 import compiler.syntax.type_syntax (TFn, MWrite, nullary)
 import compiler.syntax.items (Module, Item, IFn, ILaw, ISchema, FnDef, Binder, SchemaDef,
                               schema_guard_name, parse, dump_module)
+import compiler.syntax.calls (slotted, slot_args)
 import compiler.syntax.exprs (Expr, EVar, EApp, EBlock, EMatch, MatchArm, ELambda, ETry, EField,
-                              EPerform, EHandle, SLet, NamedArg, Tagged, slotted, slot_args,
-                              HandleClause, is_exit_effect, exit_op)
+                              EPerform, EHandle, SLet, NamedArg, Tagged, HandleClause,
+                              is_exit_effect, exit_op)
 import compiler.syntax.patterns (Pattern, PCtor, PVar)
 import compiler.emit.abi
 import compiler.emit.abi (Native, native_named)
@@ -28,17 +29,19 @@ import compiler.expand.rewrite.try_operator (expand_try)
 
 /// The function a call on a value calls: `qualifier::name`, or the bare `name` where `qualifier`
 /// is empty; its parameters' `names`, and the `defaults` a call that leaves one out copies.
-pub type MemberCallee = {
+pub type Written = {
   qualifier: Bytes,
   name: Bytes,
   names: List<Bytes>,
   defaults: List<Option<Expr>>,
 }
 
+pub type MemberCallee = | WrittenOut(Written) | InField
+
 /// The arguments the call at `at` of `m` on `on` passes, `args` and then `named` put where its
 /// parameters are; as written where the checker refused the call.
 fn member_passed(
-  m: MemberCallee,
+  m: Written,
   at: Span,
   on: Expr,
   args: List<Expr>,
@@ -52,7 +55,7 @@ fn member_passed(
 }
 
 /// The callee `m` written at `at`, a node whose names, identifiers, have no site.
-fn member_var(m: MemberCallee, at: Span) -> Expr = {
+fn member_var(m: Written, at: Span) -> Expr = {
   let named = { ..at, site: 0 };
   EVar({
     span: at,
@@ -71,33 +74,28 @@ fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
     EVar(v) -> match v.name.module {
       None -> expr,
       Some(of) -> if !starts_upper(of.name) { expr } else {
-        match sites.get(v.span.site) {
-          Some(m) -> if m.name.len() == 0 { expr } else { member_var(m, v.span) },
-          None -> expr,
-        }
+        match sites.get(v.span.site) { Some(WrittenOut(m)) -> member_var(m, v.span), _ -> expr }
       },
     },
     EApp(a) -> match a.func {
       EField(f) -> match sites.get(a.span.site) {
-        Some(m) -> if m.name.len() == 0 { expr } else {
+        Some(WrittenOut(m)) ->
           EApp({
             span: a.span,
             func: member_var(m, f.span),
             named: [],
             args: member_passed(m, a.span, f.base, a.args, a.named),
             labels: a.labels,
-          })
-        },
-        None -> expr,
+          }),
+        _ -> expr,
       },
       _ -> expr,
     },
-    EPerform(p) -> match sites.get(p.span.site) {
-      Some(m) -> {
-        let on = EVar({ span: made_at(p.eff.span, p.span, role_member_on()), name: p.eff });
-        let labels = match p.resource { Some(r) -> [r], None -> [] };
-        // With no name it is the call of what the binding holds in its field.
-        if m.name.len() == 0 {
+    EPerform(p) -> {
+      let on = EVar({ span: made_at(p.eff.span, p.span, role_member_on()), name: p.eff });
+      let labels = match p.resource { Some(r) -> [r], None -> [] };
+      match sites.get(p.span.site) {
+        Some(InField) ->
           EApp({
             span: p.span,
             func: EField({
@@ -108,18 +106,17 @@ fn member_called(sites: Map<Int, MemberCallee>, expr: Expr) -> Expr =
             named: [],
             args: p.args,
             labels: labels,
-          })
-        } else {
+          }),
+        Some(WrittenOut(m)) ->
           EApp({
             span: p.span,
             func: member_var(m, made_at(p.op.span, p.span, role_member_callee())),
             named: [],
             args: member_passed(m, p.span, on, p.args, []),
             labels: labels,
-          })
-        }
-      },
-      None -> expr,
+          }),
+        None -> expr,
+      }
     },
     _ -> expr,
   }
@@ -329,7 +326,7 @@ fn spawns_written(module: Module) -> Module =
 /// and perform its row parameter, which an instantiation fills. Both carry the schema's doc. A
 /// function among its parameters is kept: the body states what holds of it, wherever it goes.
 fn schema_fns(d: SchemaDef) -> List<Item> = {
-  let at = d.name.span;
+  let at = { ..d.name.span, site: 0 };
   let ident = |t: Bytes| { name: t, span: at };
   let params = d.params.concat(d.binders).map(|b: Binder|
     {

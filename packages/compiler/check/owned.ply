@@ -12,7 +12,7 @@ import compiler.check.typed (TypedParam, pattern_binders, TypedPattern, TypedWil
                              TypedCase, TypedRecordPattern, TypedListPattern, TypedOr,
                              TypedFieldPattern, Holder, HeldByBinder, HeldByNode, ReleasePlace,
                              ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
-                             ReleaseFailing, binder_key, holder_key)
+                             ReleaseFailing, binding_key, holder_key)
 import compiler.check.infer.walked (Walked, WalkedLit, WalkedRead, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, WalkedUnary, WalkedBinary,
                                     WalkedCall, WalkedIf, WalkedMatch, WalkedBlock, WalkedList,
@@ -20,8 +20,7 @@ import compiler.check.infer.walked (Walked, WalkedLit, WalkedRead, WalkedLocal, 
                                     WalkedLambda, WalkedSimulate, WalkedParallel, WalkedHandle,
                                     WalkedDefault, WalkedArm, WalkedStmt, WalkedLet, WalkedLetElse,
                                     WalkedDo, WalkedAssign, WalkedField, WalkedThunk, WalkedClause,
-                                    WalkedReturn, WalkedHandlerVar, walked_nodes_folded,
-                                    walked_children)
+                                    WalkedReturn, WalkedHandlerVar, walked_nodes_folded)
 import compiler.check.resolve.tables (Diag, error_at, error_at_and)
 import compiler.check.infer.checker (simulated_ops)
 import compiler.check.infer.names (simple_name_of)
@@ -171,12 +170,10 @@ type Held = { holder: Holder, ty: Type }
 /// it borrows, each by the site it is bound at.
 type Captured = { consumed: List<Int>, borrows: List<Int> }
 
-/// The names in scope, each the site of the binding it means, or none for one the walk does not
-/// follow; the functions the walk is inside of, innermost last; the sites bound in the block, body
+/// The functions the walk is inside of, innermost last; the sites bound in the block, body
 /// or arm being walked, which its end lets go; and the body running here, whose failures let go
 /// only what it binds.
 type Scope = {
-  names: Map<Bytes, Option<Int>>,
   fns: List<Fn>,
   block: List<Int>,
   handles: List<Handling>,
@@ -197,7 +194,6 @@ pub fn owned(f: Facts, params: List<Param>, body: Walked) -> Owned / {abort.rais
   let start: Bound = params.fold(
     {
       s: {
-        names: Map::new(),
         fns: [],
         block: [],
         handles: [],
@@ -264,7 +260,7 @@ fn let_go(f: Facts, st: St, s: Scope, last: Walked, at: Span, pos: Pos) -> St / 
   s.block.reverse().fold(st, |acc: St, site: Int|
     match acc.bindings.get(site) {
       Some(b) -> if !live(b) { acc } else {
-        let place = released_by(acc, s.names, b, last);
+        let place = released_by(acc, b, last);
         releasing(
           gone_at(acc, b, at, b"let go where its block ends"),
           b,
@@ -321,38 +317,31 @@ fn on_failure(p: ReleasePlace) -> Bool =
 /// reads it.
 fn lent_out(f: Facts, st: St, s: Scope, last: Walked, pos: Pos) -> St / {abort.raise} =
   match pos {
-    Lent -> lent_on(f, st, s.block, s.names, last),
-    Read -> lent_on(f, st, s.block, s.names, last),
+    Lent -> lent_on(f, st, s.block, last),
+    Read -> lent_on(f, st, s.block, last),
     _ -> st,
   }
 
-fn lent_on(
-  f: Facts,
-  st: St,
-  sites: List<Int>,
-  names: Map<Bytes, Option<Int>>,
-  last: Walked,
-) -> St / {abort.raise} =
+fn lent_on(f: Facts, st: St, sites: List<Int>, last: Walked) -> St / {abort.raise} =
   if !resource_at(f, last) { st } else {
     sites.fold(st, |acc: St, key: Int|
       match acc.bindings.get(key) {
-        Some(b) -> if live(b) && visible(names, b) && answers(last, b.name) {
-          said(acc, made_and_dropped(f, last, Lent))
-        } else { acc },
+        Some(b) -> if live(b) && answers(last, b.key) { said(acc, made_and_dropped(f, last, Lent)) }
+        else { acc },
         None -> acc,
       })
   }
 
-/// Whether `e` may answer what the binding `name` holds, or a field of it, rather than a value it
+/// Whether `e` may answer what the binding `key` holds, or a field of it, rather than a value it
 /// makes: a call answers what it owns, and a value built of the binding takes it.
-fn answers(e: Walked, name: Bytes) -> Bool =
+fn answers(e: Walked, key: Int) -> Bool =
   match e.node {
-    WalkedRead(WalkedLocal(n)) -> n == name,
-    WalkedFieldRead(x) -> answers(x.base, name),
-    WalkedBlock(b) -> match b.tail { Some(t) -> answers(t, name), None -> false },
-    WalkedIf(i) -> answers(i.then_branch, name) || answers(i.else_branch, name),
-    WalkedMatch(m) -> m.arms.any(|a: WalkedArm| answers(a.body, name)),
-    WalkedHandle(h) -> answers(h.body, name),
+    WalkedRead(WalkedLocal(l)) -> binding_key(l.binder) == key,
+    WalkedFieldRead(x) -> answers(x.base, key),
+    WalkedBlock(b) -> match b.tail { Some(t) -> answers(t, key), None -> false },
+    WalkedIf(i) -> answers(i.then_branch, key) || answers(i.else_branch, key),
+    WalkedMatch(m) -> m.arms.any(|a: WalkedArm| answers(a.body, key)),
+    WalkedHandle(h) -> answers(h.body, key),
     _ -> false,
   }
 
@@ -439,95 +428,27 @@ fn released(st: St, held: List<Held>, at: Span, place: ReleasePlace, w: Where) -
 
 /// Where `b` is let go at the end of its scope, whose last expression is `last`: before it where it
 /// does not name the binding, so a tail call there stays a loop, and after it otherwise.
-fn released_by(
-  st: St,
-  names: Map<Bytes, Option<Int>>,
-  b: Binding,
-  last: Walked,
-) -> { at: Span, place: ReleasePlace } =
-  { at: last.span, place: if named_by(st, names, last, b) { ReleaseAfter } else { ReleaseBefore } }
+fn released_by(st: St, b: Binding, last: Walked) -> { at: Span, place: ReleasePlace } =
+  { at: last.span, place: if named_by(st, last, b) { ReleaseAfter } else { ReleaseBefore } }
 
-/// Whether `e`, where `names` are in scope, names `b`, or a function a `let` binds that borrows or
-/// holds it: a binding a later one hides is named by nothing.
-fn named_by(st: St, names: Map<Bytes, Option<Int>>, e: Walked, b: Binding) -> Bool = {
-  let own = if visible(names, b) { [b.name] } else { [] };
-  let all = st.bindings.fold(own, |acc: List<Bytes>, key: Int, x: Binding|
-    if (x.borrows.contains(b.key) || x.holds.contains(b.key)) && visible(names, x) {
-      acc.push(x.name)
-    } else { acc });
-  all.len() > 0 && reads(e, all)
+/// Whether `e` reads `b`, or a function a `let` binds that borrows or holds it.
+fn named_by(st: St, e: Walked, b: Binding) -> Bool = {
+  let keys = st.bindings.fold([b.key], |acc: List<Int>, key: Int, x: Binding|
+    if x.borrows.contains(b.key) || x.holds.contains(b.key) { acc.push(key) } else { acc });
+  walked_nodes_folded(e, false, |found: Bool, x: Walked|
+    found
+      || (match x.node {
+        WalkedRead(WalkedLocal(l)) -> keys.contains(binding_key(l.binder)),
+        _ -> false,
+      }))
 }
-
-/// Whether `e` reads one of `names` as they stand around it: a binder inside it hides the name from
-/// where it binds on.
-fn reads(e: Walked, names: List<Bytes>) -> Bool =
-  if names.len() == 0 { false } else {
-    match e.node {
-      WalkedRead(WalkedLocal(n)) -> names.contains(n),
-      WalkedLambda(l) -> reads(l.body, hidden(names, l.params.map(|p: TypedParam<Type>| p.name))),
-      WalkedMatch(m) ->
-        reads(m.scrutinee, names)
-          || m.arms.any(|a: WalkedArm| {
-            let inner = hidden(names, pattern_names(a.pat));
-            reads(a.body, inner) || (match a.guard { Some(g) -> reads(g, inner), None -> false })
-          }),
-      WalkedBlock(b) -> {
-        let walked = b.stmts.fold(
-          { seen: false, names: names },
-          |acc: { seen: Bool, names: List<Bytes> }, x: WalkedStmt|
-            if acc.seen { acc } else {
-              match x {
-                WalkedLet(l) ->
-                  {
-                    seen: reads(l.value, acc.names),
-                    names: hidden(acc.names, pattern_names(l.pat)),
-                  },
-                WalkedLetElse(l) ->
-                  {
-                    seen: reads(l.value, acc.names) || reads(l.fallback, acc.names),
-                    names: hidden(acc.names, pattern_names(l.pat)),
-                  },
-                WalkedDo(d) -> { ..acc, seen: reads(d, acc.names) },
-                WalkedAssign(a) -> { ..acc, seen: reads(a.value, acc.names) },
-              }
-            },
-        );
-        walked.seen || (match b.tail { Some(t) -> reads(t, walked.names), None -> false })
-      },
-      WalkedHandle(h) ->
-        h.vars.any(|v: WalkedHandlerVar| reads(v.init, names)) || reads(h.body, names)
-          || h.clauses.any(|c: WalkedClause| {
-            let bound = c.params.map(|p: TypedParam<Type>| p.name).concat(match c.resume {
-              Some(k) -> [k.name],
-              None -> [],
-            });
-            reads(c.body, hidden(names, bound))
-          })
-          || (match h.ret {
-            Some(r) -> reads(r.body, hidden(names, [r.binder.name])),
-            None -> false,
-          }),
-      _ -> walked_children(e).any(|x: Walked| reads(x, names)),
-    }
-  }
-
-fn hidden(names: List<Bytes>, bound: List<Bytes>) -> List<Bytes> =
-  names.filter(|n: Bytes| !bound.contains(n))
-
-/// Each name `pat` binds.
-fn pattern_names(pat: TypedPattern<Type>) -> List<Bytes> =
-  pattern_binders(pat).map(|p: TypedParam<Type>| p.name)
-
-/// Whether `b` is what its name means where `names` are in scope.
-fn visible(names: Map<Bytes, Option<Int>>, b: Binding) -> Bool =
-  names.get(b.name) == Some(Some(b.key))
 
 /// `st` with each owned binding of `sites` that `last`, its scope's last expression, does not name
 /// let go before `last` runs, the last bound first, so `last` runs without it.
 fn released_before(st: St, s: Scope, last: Walked) -> St =
   s.block.reverse().fold(st, |acc: St, key: Int|
     match acc.bindings.get(key) {
-      Some(b) -> if !live(b) || named_by(acc, s.names, last, b) { acc } else {
+      Some(b) -> if !live(b) || named_by(acc, last, b) { acc } else {
         releasing(
           gone_at(acc, b, last.span, b"let go before its block's last expression"),
           b,
@@ -573,8 +494,7 @@ fn failing(s: Scope, st: St, at: Span, place: ReleasePlace) -> St = {
 // --- Bindings ----------------------------------------------------------------------------------
 
 /// `name`, bound at `at`, to a value of type `ty`, owned where `owned` holds and lent otherwise, and
-/// followed where `followed` holds: a resource, or a function that borrows one. Any other binding
-/// only shadows the names it hides.
+/// followed where `followed` holds: a resource, or a function that borrows one.
 fn bound(b: Bound, name: Bytes, at: Span, ty: Type, followed: Bool, owned: Bool) -> Bound =
   bound_as(b, name, at, ty, followed, owned, Value)
 
@@ -587,14 +507,14 @@ fn bound_as(
   owned: Bool,
   kind: Kind,
 ) -> Bound =
-  if !followed { shadowed(b, name) } else {
-    let key = binder_key(at);
+  if !followed { b } else {
+    let key = binding_key(at.site);
     let w = here(b.s);
     {
-      s: { ..b.s, names: b.s.names.insert(name, Some(key)), block: b.s.block.push(key) },
+      s: { ..b.s, block: b.s.block.push(key) },
       st: put(b.st, {
         key: key,
-        holder: HeldByBinder(at),
+        holder: HeldByBinder(at.site),
         name: name,
         at: at,
         ty: ty,
@@ -621,17 +541,13 @@ fn here(s: Scope) -> Where =
       if h.body == s.body { acc.concat(h.ops) } else { acc }),
   }
 
-/// A name that is not followed, which hides one that is.
-fn shadowed(b: Bound, name: Bytes) -> Bound =
-  { ..b, s: { ..b.s, names: b.s.names.insert(name, None) } }
-
-/// The binding a local read of `name` means, where the walk follows it.
-fn binding_of(s: Scope, st: St, name: Bytes) -> Option<Binding> =
-  match s.names.get(name) { Some(Some(site)) -> st.bindings.get(site), _ -> None }
+/// The binding the local read `l` names, where the walk follows it.
+fn binding_of(st: St, l: { name: Bytes, binder: Int }) -> Option<Binding> =
+  st.bindings.get(binding_key(l.binder))
 
 /// The binding `e` reads, where it is a read of a followed local.
 fn binding_read(s: Scope, st: St, e: Walked) -> Option<Binding> =
-  match e.node { WalkedRead(WalkedLocal(n)) -> binding_of(s, st, n), _ -> None }
+  match e.node { WalkedRead(WalkedLocal(l)) -> binding_of(st, l), _ -> None }
 
 fn put(st: St, b: Binding) -> St = { ..st, bindings: st.bindings.insert(b.key, b) }
 
@@ -711,7 +627,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Walked, pos: Pos) -> St / {abort.raise} =
   match e.node {
     WalkedLit(_) -> st,
     WalkedDefault(_) -> st,
-    WalkedRead(WalkedLocal(n)) -> match binding_of(s, st, n) {
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
       Some(b) -> used(f, s, st, b, e.span, pos),
       None -> st,
     },
@@ -742,7 +658,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Walked, pos: Pos) -> St / {abort.raise} =
     WalkedIf(i) -> {
       let c = walk(f, s, st, i.cond, Read);
       let branches = [i.then_branch, i.else_branch];
-      joined(f, s.names, c, [c, c], branches.map(|x: Walked| walk(f, s, c, x, pos)), branches, pos)
+      joined(f, c, [c, c], branches.map(|x: Walked| walk(f, s, c, x, pos)), branches, pos)
     },
     WalkedMatch(m) -> matched(f, s, st, e, m.scrutinee, m.arms, pos),
     WalkedBlock(b) -> {
@@ -943,7 +859,7 @@ fn flown(f: Facts, s: Scope, st: St, walked: St, x: Walked, pos: Pos) -> St / {a
   let flying = |held: List<Held>| { ..walked, flight: walked.flight.concat(held) };
   match pos {
     Taken(_) -> match x.node {
-      WalkedRead(WalkedLocal(n)) -> match binding_of(s, st, n) {
+      WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
         Some(b) -> if live(b) && b.frame == s.frame { flying(held_by(st, b)) } else { walked },
         None -> walked,
       },
@@ -981,7 +897,7 @@ fn fn_at(span: Span, pos: Pos) -> Fn =
 /// A call of `func` on `args`, each passed as the callee takes it.
 fn applied(f: Facts, s: Scope, st: St, func: Walked, args: List<Walked>) -> St / {abort.raise} =
   match func.node {
-    WalkedRead(WalkedLocal(n)) -> match binding_of(s, st, n) {
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) {
       // A function that is a resource is consumed by its call; one that borrows is only called.
       Some(b) -> {
         let called = used(f, s, st, b, func.span, Called);
@@ -1104,7 +1020,7 @@ fn field(
 /// The binding a path of field reads, `r.a.b`, starts from.
 fn path_root(s: Scope, st: St, e: Walked) -> Option<Binding> =
   match e.node {
-    WalkedRead(WalkedLocal(n)) -> binding_of(s, st, n),
+    WalkedRead(WalkedLocal(l)) -> binding_of(st, l),
     WalkedFieldRead(x) -> path_root(s, st, x.base),
     _ -> None,
   }
@@ -1235,7 +1151,7 @@ fn lambda_bound(
   let consumed = o.captured.consumed.len() > 0;
   let followed = consumed || o.captured.borrows.len() > 0;
   let out = bound_as({ ..b, st: o.st }, name, at, type_of(f, e), followed, consumed, Taker);
-  match out.st.bindings.get(binder_key(at)) {
+  match out.st.bindings.get(binding_key(at.site)) {
     Some(x) -> if followed {
       {
         ..out,
@@ -1315,7 +1231,7 @@ fn may_miss(pat: TypedPattern<Type>) -> Bool =
 /// borrows.
 fn lends(s: Scope, st: St, value: Walked) -> Bool =
   match value.node {
-    WalkedRead(WalkedLocal(n)) -> match binding_of(s, st, n) { Some(b) -> !b.owned, None -> false },
+    WalkedRead(WalkedLocal(l)) -> match binding_of(st, l) { Some(b) -> !b.owned, None -> false },
     WalkedFieldRead(x) -> lends(s, st, x.base),
     _ -> false,
   }
@@ -1372,7 +1288,6 @@ fn wild_resources(f: Facts, st: St, pat: TypedPattern<Type>) -> St / {abort.rais
 /// consumed past the join, the paths that did not consume it letting it go where they end.
 fn joined(
   f: Facts,
-  names: Map<Bytes, Option<Int>>,
   before: St,
   starts: List<St>,
   ends: List<St>,
@@ -1393,9 +1308,8 @@ fn joined(
         }
       });
     let early = unconsumed.filter(|b: Binding|
-      released_by(before, names, b, branch).place == ReleaseBefore);
-    let late = unconsumed.filter(|b: Binding|
-      released_by(before, names, b, branch).place == ReleaseAfter);
+      released_by(before, b, branch).place == ReleaseBefore);
+    let late = unconsumed.filter(|b: Binding| released_by(before, b, branch).place == ReleaseAfter);
     let at = branch.span;
     let letting = |from: St, bs: List<Binding>, place: ReleasePlace, value: List<Held>|
       bs.fold(from, |x: St, b: Binding|
@@ -1421,7 +1335,7 @@ fn joined(
     // A branch whose value is lent on may not answer what is let go after it.
     let lent = match pos { Lent -> true, Read -> true, _ -> false };
     let refused = if !lent || !resource_at(f, branch) { [] } else {
-      late.filter(|b: Binding| answers(branch, b.name)).map(|b: Binding|
+      late.filter(|b: Binding| answers(branch, b.key)).map(|b: Binding|
         made_and_dropped(f, branch, pos))
     };
     { first: first.releases, last: last.releases, refused: refused }
@@ -1580,7 +1494,6 @@ fn matched(
   });
   let out = joined(
     f,
-    s.names,
     start,
     ends.map(|x: { start: St, end: St }| x.start),
     ends.map(|x: { start: St, end: St }| x.end),
@@ -1641,7 +1554,7 @@ fn handled(
     let held = resource_at(f, v.init);
     let walked = walk(f, acc.s, acc.st, v.init, if held { Taken(b"held by a handler's variable") }
     else { Read });
-    shadowed({ ..acc, st: if held { said(walked, var_held(f, v)) } else { walked } }, v.name)
+    { ..acc, st: if held { said(walked, var_held(f, v)) } else { walked } }
   });
   let inside = answered_inside(
     vars.st,
@@ -1670,17 +1583,16 @@ fn handled(
       Some(k) -> bound_as(given, k.name, k.span, unit_type(), true, true, Continuation),
       None -> given,
     };
-    let labelled = match c.label { Some(t) -> shadowed(resumed, t.name), None -> resumed };
     let ended = let_go(
       f,
       lent_out(
         f,
-        walk(f, labelled.s, released_before(labelled.st, labelled.s, c.body), c.body, pos),
-        labelled.s,
+        walk(f, resumed.s, released_before(resumed.st, resumed.s, c.body), c.body, pos),
+        resumed.s,
         c.body,
         pos,
       ),
-      labelled.s,
+      resumed.s,
       c.body,
       c.body.span,
       pos,

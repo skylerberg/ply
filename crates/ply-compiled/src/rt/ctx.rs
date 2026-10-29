@@ -9,9 +9,9 @@ pub(super) static ENTRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
-    /// A word the released compiler's code spends one of as a call starts and gives back as it
-    /// returns, calling [`rt_no_fuel`] at none: [`RELEASED_FUEL`], so it never runs out.
-    pub fuel: i64,
+    // The runtime's own, in a word between the fields emitted code reads.
+    /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
+    pub(super) last_entry: usize,
     /// The lowest address a compiled frame may begin at. The watchdog raises it past every frame
     /// once the entry's clock runs out ([`watched`]).
     pub stack_floor: std::sync::atomic::AtomicUsize,
@@ -67,8 +67,6 @@ pub struct Ctx {
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub heap: Heap,
-    /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
-    pub(super) last_entry: usize,
     pub tables: Arc<Tables>,
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
@@ -199,7 +197,6 @@ impl Ctx {
         let alloc = heap.alloc();
         Ctx {
             failed: 0,
-            fuel: RELEASED_FUEL,
             stack_floor: std::sync::atomic::AtomicUsize::new(0),
             site_root: -1,
             site_start: 0,
