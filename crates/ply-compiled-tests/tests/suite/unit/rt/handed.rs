@@ -118,7 +118,7 @@ fn performed(ctx: &mut Ctx, op: &PlyOp, mode: Word, args: &[Word]) -> Word {
 #[test]
 fn a_raise_nothing_answers_shows_its_payload_lowered_through_its_type_and_lets_it_go() {
     let mut ctx = naming(&["m", "boom"]);
-    ctx.begin(1_000);
+    ctx.begin();
     let payload = boxed(&mut ctx, 42);
     performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     let d = ctx.take_failure().expect("the raise failed the entry");
@@ -139,7 +139,7 @@ type PendingAt = unsafe extern "C" fn(*mut Ctx, Word, Word) -> Word;
 #[test]
 fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation() {
     let mut ctx = naming(&["m", "boom", "other"]);
-    ctx.begin(1_000);
+    ctx.begin();
     let payload = boxed(&mut ctx, 42);
     performed(&mut ctx, &op(&BOXES), 2, &[payload]);
     assert_ne!(ctx.failed, 0, "the raise left the entry failed");
@@ -160,7 +160,7 @@ fn a_raise_nothing_answers_waits_for_the_code_whose_clause_answers_its_operation
 #[test]
 fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
     let mut ctx = naming(&["abort", "raise"]);
-    ctx.begin(1_000);
+    ctx.begin();
     let message: &str = "it broke";
     performed(&mut ctx, &op(&TEXTS), 0, &[&raw const message as Word]);
     let d = ctx.take_failure().expect("the panic failed the entry");
@@ -173,7 +173,7 @@ fn a_panic_nothing_answers_says_its_message_lowered_through_its_type() {
 #[test]
 fn an_operation_nothing_handles_is_handed_its_arguments_lowered_and_lets_them_go() {
     let mut ctx = naming(&["m", "ask"]);
-    ctx.begin(1_000);
+    ctx.begin();
     let arg = boxed(&mut ctx, 7);
     performed(&mut ctx, &op(&BOXES), 0, &[arg]);
     let d = ctx.take_failure().expect("nothing handles `m.ask`");
@@ -270,7 +270,7 @@ fn bracket(ctx: &mut Ctx, acquire_desc: &'static PlyFnDesc) -> Word {
 #[test]
 fn a_bracket_of_emitted_closures_cleans_up_what_it_acquired_and_lets_every_closure_go() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     CLEANED.with(|c| c.set(0));
     let answer = bracket(&mut ctx, &ACQUIRE);
     assert_eq!((answer, ctx.failed), (7, 0));
@@ -287,7 +287,7 @@ unsafe extern "C" fn acquire_six(ctx: *mut Ctx, _f: Word, _args: *const Word) ->
 #[test]
 fn a_bracket_cleans_up_after_a_body_that_unwinds() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     CLEANED.with(|c| c.set(0));
     let answer = bracket(&mut ctx, &ACQUIRE_SIX);
     assert_eq!((answer, ctx.failed), (0, FAILED_TARGET));
@@ -331,7 +331,7 @@ type LabelString = unsafe extern "C" fn(*mut Ctx, Word, *const PlyType) -> Word;
 #[test]
 fn a_label_a_clause_reads_is_lifted_through_the_string_type_its_site_handed() {
     let mut ctx = naming(&["m", "ask", "*", "files"]);
-    ctx.begin(1_000);
+    ctx.begin();
     LIFTED.with(|l| l.borrow_mut().clear());
     let label = unsafe { helper::<LabelString>("rt_label_string")(&mut ctx, 3, &STRING_T) };
     super::crossing::unfailed(&mut ctx);

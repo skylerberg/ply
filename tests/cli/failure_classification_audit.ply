@@ -39,9 +39,6 @@ fn assert_program_error(s: Sole, what: String) -> Unit / {abort.raise} = {
 
 fn json_false() -> Json = json::Bool(false)
 
-/// How deep calls nest, and values with them, as the guide states it.
-fn call_limit() -> Int = 10000
-
 fn message_of(s: Sole) -> String = str(path(s.failure, ["diagnostic", "message"]))
 
 type Case = { what: String, source: String, needle: String }
@@ -51,12 +48,12 @@ fn cases() -> List<Case> =
     {
       what: "a runaway recursion",
       source: "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
-      needle: "recursion limit",
+      needle: "what the native stack holds",
     },
     {
       what: "a runaway mutual recursion",
       source: "fn spin(n: Int) -> Int / {diverges} = 1 + spun(n + 1)\nfn spun(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins across two definitions\" { assert_eq(spin(0), 0) }\n",
-      needle: "recursion limit",
+      needle: "what the native stack holds",
     },
     {
       what: "an integer overflow",
@@ -125,7 +122,7 @@ test/nondet "a failure inside a handler clause body is still the program's" {
   [
     { needle: "panic: seeded wrong", clause: "panic(\"seeded wrong\")" },
     { needle: "division by zero", clause: "range(0, 4 / 0).len()" },
-    { needle: "recursion limit", clause: "spin(1)" },
+    { needle: "what the native stack holds", clause: "spin(1)" },
     { needle: "integer overflow", clause: "4611686018427387904 * 4" },
   ].fold((), |u: Unit, c: { needle: String, clause: String }| {
     program(
@@ -166,33 +163,25 @@ test/nondet "a run the clock stopped is abandoned rather than judged" {
   assert(int(path(again, ["summary", "abandoned"])) == 1, Some(shown(again)))
 }
 
-test/nondet "the recursion limit is a program error" {
+test/nondet "running out of stack is a program error, reported at the call that nested too deep" {
   program(
     "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(spin(0), 0) }\n",
   );
   let failure = nth(at(json_of(tested([])), "failures"), 0);
+  let d = at(failure, "diagnostic");
   assert(at(failure, "defect") == json_false(), Some(shown(failure)));
-  assert(str(path(failure, ["diagnostic", "code"])) == "E0502", Some(shown(failure)));
-  assert(
-    str(path(failure, ["diagnostic", "message"])).contains(
-      "recursion limit of " ++ call_limit().to_string() ++ " nested calls exceeded",
-    ),
-    Some(shown(failure)),
-  )
+  assert(str(at(d, "code")) == "E0502", Some(shown(failure)));
+  assert(str(at(d, "message")).contains("what the native stack holds"), Some(shown(failure)));
+  assert(str(at(nth(at(d, "labels"), 0), "snippet")).contains("spin("), Some(shown(failure)))
 }
 
-test/nondet "a task past the recursion limit is reported at its call, with the seed that replays it" {
+test/nondet "a task that runs out of stack is reported at its call, with the seed that replays it" {
   program(
     "fn spin(n: Int) -> Int / {diverges} = 1 + spin(n + 1)\ntest \"spins\" { assert_eq(simulate { task.join(task.spawn(|| spin(0))) }, 0) }\n",
   );
   let failure = nth(at(json_of(tested([])), "failures"), 0);
   let d = at(failure, "diagnostic");
-  assert(
-    str(at(d, "message")).contains(
-      "recursion limit of " ++ call_limit().to_string() ++ " nested calls exceeded",
-    ),
-    Some(shown(failure)),
-  );
+  assert(str(at(d, "message")).contains("what the native stack holds"), Some(shown(failure)));
   assert(str(at(nth(at(d, "labels"), 0), "snippet")).contains("spin("), Some(shown(failure)));
   assert(shown(at(d, "notes")).contains("replay with seed"), Some(shown(failure)))
 }
@@ -213,7 +202,7 @@ fn assert_suspected(edits: List<String>) -> Unit / {Spawned, abort.raise} = {
 }
 
 /// `step`'s row says it may not return, so an edit that makes it run away still checks, and fails
-/// at the call depth limit, since its call nests.
+/// once its stack runs out, since its call nests.
 fn recursion() -> String =
   \\fn step(n: Int) -> Int / {diverges} = if n <= 0 { 0 } else { step(n - 1) + 0 }
   \\
@@ -358,50 +347,17 @@ test/nondet "a first-ever runtime limit has no earlier text to compare" {
   )
 }
 
-// Nine tenths of the limit deep: a comparison that took more than a call a level would not finish,
-// and what runs above the test has the tenth left.
-test/nondet "a value the call limit permits is compared rather than aborting the run" {
-  let deep = (call_limit() * 9 / 10).to_string();
+// Built by iteration, so as deep as no recursion that built it stood: comparing it nests a call a
+// level.
+test/nondet "a deep value is compared rather than aborting the run" {
   program(
-    "type Chain = Nil | Link(Chain)\nfn build(n: Int) -> Chain = if n <= 0 { Nil } else { Link(build(n - 1)) }\ntest \"chains compare equal\" { assert_eq(build("
-      ++ deep
-      ++ "), build("
-      ++ deep
-      ++ ")) }\ntest \"a sibling still reports\" { assert_eq(1, 1) }\n",
+    "type Chain = Nil | Link(Chain)\n\nfn stack(n: Int) -> Chain = range(0, n).fold(Nil, |acc, x| Link(acc))\n\ntest \"deep values compare\" { assert_eq(stack(100000), stack(100000)) }\ntest \"a sibling still reports\" { assert_eq(1, 1) }\n",
   );
   let r = tested([]);
   let v = json_of(r);
   assert(r.code == 0, Some(shown(v)));
   assert(int(path(v, ["summary", "failed"])) == 0, Some(shown(v)));
   assert(int(path(v, ["summary", "passed"])) == 2, Some(shown(v)))
-}
-
-// Only reachable by iteration: a value built by recursion is at most as deep as the recursion that
-// built it. Comparing it takes a call a level, so it meets the call limit.
-test/nondet "a value deeper than the bound is an ordinary program error" {
-  let deep = (call_limit() * 2).to_string();
-  program(
-    "type Chain = Nil | Link(Chain)\n\nfn stack(n: Int) -> Chain = range(0, n).fold(Nil, |acc, x| Link(acc))\n\ntest \"deep values compare\" { assert_eq(stack("
-      ++ deep
-      ++ "), stack("
-      ++ deep
-      ++ ")) }\n",
-  );
-  let r = tested([]);
-  let v = json_of(r);
-  assert(r.code == 1, Some(shown(v)));
-  let s = {
-    failure: nth(at(v, "failures"), 0),
-    status: str(at(nth(at(v, "results"), 0), "status")),
-  };
-  assert_program_error(s, "a value deeper than the bound");
-  assert(str(path(s.failure, ["diagnostic", "code"])) == "E0502", Some(shown(s.failure)));
-  assert(
-    message_of(s).contains(
-      "recursion limit of " ++ call_limit().to_string() ++ " nested calls exceeded",
-    ),
-    Some(shown(s.failure)),
-  )
 }
 
 // No recursion in the program: a chain of `+` whose tree the front end and the emitter each walk

@@ -47,14 +47,19 @@ pub type LawRun = { interleaving: Interleaving<Judged>, observed: Bool }
 // --- Discharging ---------------------------------------------------------------
 
 /// Every claim asked, discharged. The runtime judges batches of points, each batch one claim's, and
-/// `sim` is the search a law over interleavings runs at each point its guard keeps.
+/// `sim` is the search a law over interleavings runs at each point its guard keeps. `told` is given
+/// each claim's outcome as soon as it is known, by the claim's place in the collection: one that
+/// needs no run before the runtime is asked anything.
 pub fn discharged<| e>(
   asked: List<Asked>,
   world: World,
   sim: plan::Plan,
   ask: (Ask) -> Reply / e,
+  told: (Int, Outcome) -> Unit / e,
 ) -> List<Outcome> / {abort.raise | e} = {
   let works = asked.map(|a: Asked| planned(a, world));
+  range(0, works.len()).fold((), |_: Unit, i: Int|
+    match ((works.at(i), asked.at(i))) { (Some(WDone(o)), Some(a)) -> told(a.claim, o), _ -> () });
   let batches = range(0, works.len()).fold([], |acc: List<Batch>, i: Int|
     match ((works.at(i), asked.at(i))) {
       (Some(WPoints(p)), Some(a)) ->
@@ -74,18 +79,17 @@ pub fn discharged<| e>(
         (Some(WDone(o)), _) -> { ..acc, outcomes: acc.outcomes.push(o) },
         (Some(WPoints(p)), Some(a)) -> {
           let js = match answers.at(acc.next) { Some(x) -> x, None -> [] };
-          {
-            outcomes: acc.outcomes.push(match p.kind {
-              KLaw -> match kept(a.obligation, p, js) {
-                Err(o) -> o,
-                Ok(points) -> searched(a, p, points, sim, ask),
-              },
-              KWitness(c) -> witnessed(a.obligation, p, js, c),
-              KEnum(witness) -> walked(a.obligation, p, js, witness),
-              KSearch(stopped) -> tried(a.obligation, p, js, stopped),
-            }),
-            next: acc.next + 1,
-          }
+          let outcome = match p.kind {
+            KLaw -> match kept(a.obligation, p, js) {
+              Err(o) -> o,
+              Ok(points) -> searched(a, p, points, sim, ask),
+            },
+            KWitness(c) -> witnessed(a.obligation, p, js, c),
+            KEnum(witness) -> walked(a.obligation, p, js, witness),
+            KSearch(stopped) -> tried(a.obligation, p, js, stopped),
+          };
+          told(a.claim, outcome);
+          { outcomes: acc.outcomes.push(outcome), next: acc.next + 1 }
         },
         _ -> acc,
       },
@@ -542,6 +546,7 @@ fn run_one<| e>(
       no_world(),
       sim,
       ask,
+      |_claim: Int, _outcome: Outcome| (),
     ).at(
       0,
     ) {
@@ -758,8 +763,39 @@ test "a run judges every claim's points in one batch, each as its kind asks" {
     no_world(),
     plan::default_plan(),
     ask,
+    |_claim: Int, _outcome: Outcome| (),
   );
   assert_eq(outcomes.map(is_proved), [false, true, true, true])
+}
+
+/// What a test hears of a discharge, in order.
+effect heard {
+  write heard(what: String) -> Unit
+}
+
+test "each claim is told once as it is decided, a settled one before the runtime is asked" {
+  let order = handle {
+    discharged(
+      [
+        { claim: 4, obligation: open_claim([int_binder("x")]), settled: undecided() },
+        { claim: 5, obligation: open_claim([int_binder("x")]), settled: Certified(settlement()) },
+      ],
+      no_world(),
+      plan::default_plan(),
+      |a: Ask| {
+        heard.heard("asked");
+        judging(|_mode: Mode, _point: List<Value>| JHeld)(a)
+      },
+      |claim: Int, _outcome: Outcome| heard.heard(claim.to_string()),
+    )
+  } with {
+    var said: List<String> = [],
+    heard.heard(what) -> {
+      said = said.push(what);
+    },
+    return _outcomes -> said,
+  };
+  assert_eq(order, ["5", "asked", "4"])
 }
 
 /// `tasks` tasks each reading a shared counter and writing it back: the lost update. A choice past

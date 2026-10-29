@@ -260,7 +260,7 @@ fn the_natives_read_what_the_codec_writes() {
 #[test]
 fn a_lifting_of_a_type_that_can_hold_a_function_fails_the_entry() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let refused: unsafe extern "C" fn(*mut Ctx) = helper("rt_never_lifted");
     unsafe { refused(&mut ctx) };
     assert_ne!(ctx.failed, 0, "the lifting was not refused");
@@ -595,7 +595,7 @@ fn lifting_beside(ctx: &mut Ctx, handles: &[u64]) -> Word {
 #[test]
 fn a_carried_value_lifted_moves_its_count_to_compiled_code_and_one_left_is_let_go() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let c: *mut Ctx = &mut ctx;
     let b = lifting_beside(&mut ctx, &[1]);
     unsafe {
@@ -639,7 +639,7 @@ fn a_handle_read_as_the_other_kind_fails_the_crossing_and_is_let_go_with_it() {
         ),
     ] {
         let mut ctx = context();
-        ctx.begin(1_000);
+        ctx.begin();
         let c: *mut Ctx = &mut ctx;
         lifting_beside(&mut ctx, &[at]);
         unsafe {
