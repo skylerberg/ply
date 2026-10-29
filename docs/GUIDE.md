@@ -3703,7 +3703,7 @@ to change it by hand.
 
 With `--words`, each line renames a word inside names. Words are separated by `_` or by a capital
 letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon`, and `MAX_TY` to
-`MAX_TYPE`.
+`MAX_TYPE`. A name that would become a keyword stays as it is, so `ty` alone is not renamed.
 
 `ply rename` changes nothing, and exits 2, if:
 
