@@ -5,7 +5,7 @@ import library
 import std.path (normalize)
 import walk (Failure)
 import sources
-import program (load_program, walked)
+import program (load_program_with_store, whole_of)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -14,7 +14,7 @@ import compiler.cc (toolchain)
 import compiler.load (Derives)
 import compiler.unit (shipped)
 import compiler.front.facts (Analysis)
-import compiler.front.seam (Refused, Analysed)
+import compiler.front.published (value_calls)
 import compiler.check.resolve.tables (ParsedModule, Diag, Decls, module_of_name)
 import compiler.check.resolve.bindings (written, Written, Module)
 import compiler.check.infer (item_owner)
@@ -110,12 +110,18 @@ fn shipped_files(
     None -> Map::new(),
   }
 
-pub fn calls_of(a: Analysis, index: Int) -> Map<Bytes, Map<Int, MemberTarget>> =
-  a.checked.facts.members.fold(
+pub fn calls_by_module(
+  a: Analysis,
+) -> Map<Int, Map<Bytes, Map<Int, MemberTarget>>> / {abort.raise} =
+  value_calls(a.mods, a.checked).sites.fold(
     Map::new(),
-    |acc: Map<Bytes, Map<Int, MemberTarget>>, s: MemberSite|
-      if s.module != index { acc }
-      else { acc.insert(s.owner, acc.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)) },
+    |acc: Map<Int, Map<Bytes, Map<Int, MemberTarget>>>, s: MemberSite| {
+      let module = acc.get(s.module).unwrap_or(Map::new());
+      acc.insert(
+        s.module,
+        module.insert(s.owner, module.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)),
+      )
+    },
   )
 
 pub fn entries_of(
@@ -132,7 +138,11 @@ pub fn entries_of(
     })
 }
 
-fn read_of(a: Analysis, file: sources::File) -> Option<Read> / {abort.raise} = {
+fn read_of(
+  a: Analysis,
+  calls: Map<Int, Map<Bytes, Map<Int, MemberTarget>>>,
+  file: sources::File,
+) -> Option<Read> / {abort.raise} = {
   let name = Bytes::of_string(file.module);
   match range(0, a.mods.len()).find(|i: Int| a.mods.get(i).name == name) {
     None -> None,
@@ -144,7 +154,7 @@ fn read_of(a: Analysis, file: sources::File) -> Option<Read> / {abort.raise} = {
         index: index,
         name: name,
         entries: entries_of(a, index, name, tree),
-        calls: calls_of(a, index),
+        calls: calls.get(index).unwrap_or(Map::new()),
         imports: range(0, tree.imports.len()).fold(
           [],
           |acc: List<{ decl: ImportDecl, target: Int }>, k: Int|
@@ -171,6 +181,7 @@ fn under(at: Rooted, root: Rooted) -> Bool =
     || at.path.starts_with(root.path ++ "/"))
 
 pub fn loads_of(
+  store: Option<Resolved>,
   given: List<Resolved>,
   pwd: String,
 ) -> { loads: List<Loaded>, failures: List<Failure> } / {fs.resolved[abs], shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
@@ -180,7 +191,7 @@ pub fn loads_of(
     |acc: { loads: List<Loaded>, failures: List<Failure> }, path: Resolved| {
       let root = rooted(path);
       if acc.loads.any(|l: Loaded| l.files.any(|f: Rooted| under(f, root))) { acc } else {
-        let program = load_program([path], false);
+        let program = load_program_with_store(store, [path], false);
         let library_files = shipped_files(path);
         let refused = |ds: List<Diag>|
           {
@@ -190,29 +201,32 @@ pub fn loads_of(
               why: "does not check: " ++ errors_text(ds),
             }),
           };
-        match program.frame {
-          None -> refused(program.diags),
-          Some(_) -> match walked(program).out {
-            Refused(ds) -> refused(ds),
-            Analysed(a) ->
-              {
-                ..acc,
-                loads: acc.loads.push({
-                  path: path,
-                  root: displayed(root),
-                  files: program.files.map(|f: sources::File| f.at),
-                  names: a.mods.map(|m: ParsedModule| m.name),
-                  indices: indices_of(a.mods.map(|m: ParsedModule| m.name)),
-                  module_files: program.read_at.map(|at: Rooted| file_of(pwd, library_files, at)),
-                  declarations: a.r.declarations,
-                  reads: program.files.filter(|f: sources::File|
-                    roots.any(|r: Rooted| under(f.at, r))).fold(
-                    [],
-                    |reads: List<Read>, f: sources::File|
-                      match read_of(a, f) { Some(r) -> reads.push(r), None -> reads },
-                  ),
-                }),
-              },
+        match whole_of(program) {
+          Err(ds) -> refused(ds),
+          Ok(a) -> {
+            let calls = calls_by_module(a);
+            let read_before = acc.loads.fold(Map::new(), |m: Map<String, Bool>, l: Loaded|
+              l.reads.fold(m, |into: Map<String, Bool>, r: Read|
+                into.insert(absolute(pwd, r.file.at), true)));
+            {
+              ..acc,
+              loads: acc.loads.push({
+                path: path,
+                root: displayed(root),
+                files: program.files.map(|f: sources::File| f.at),
+                names: a.mods.map(|m: ParsedModule| m.name),
+                indices: indices_of(a.mods.map(|m: ParsedModule| m.name)),
+                module_files: program.read_at.map(|at: Rooted| file_of(pwd, library_files, at)),
+                declarations: a.r.declarations,
+                reads: program.files.filter(|f: sources::File|
+                  roots.any(|r: Rooted| under(f.at, r))
+                    && !read_before.contains(absolute(pwd, f.at))).fold(
+                  [],
+                  |reads: List<Read>, f: sources::File|
+                    match read_of(a, calls, f) { Some(r) -> reads.push(r), None -> reads },
+                ),
+              }),
+            }
           },
         }
       }

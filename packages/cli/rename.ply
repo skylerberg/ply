@@ -1,8 +1,8 @@
 import std.fs (fs, Missing)
 import std.json (Json, Str, Bool, Number, Array, Null, object)
 import args (Flags)
-import paths (Rooted, absolute, parent_of, displayed, kind, read_file, write_file, create_dir,
-              move_file, spelled, here)
+import paths (Rooted, Resolved, absolute, parent_of, displayed, kind, read_file, write_file,
+              create_dir, move_file, spelled, here)
 import std.env (env)
 import report (Answer, schema_version, ok_code, compile_error)
 import walk (Failure)
@@ -15,8 +15,7 @@ import compiler.unit (shipped)
 import compiler.check.resolve.tables (Source, Declared, Namespace, space, namespaces)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex)
-import rename.lines (Defined, Moved, OperationLine, Renames, keyword_refusal, renamed, renames_of,
-                     shown)
+import rename.lines (Moved, OperationLine, Renames, keyword_refusal, renamed, renames_of, shown)
 import rename.strings (Mention, mentions_in, module_mentions)
 import rename.programs (Entry, Library, Loaded, Read, libraries_of, loads_of)
 import rename.edits (Edit, Edited, ModuleMove, applied, comment_edits, edited_of, moved_name,
@@ -30,8 +29,18 @@ type Plan = { changes: List<Change>, mentions: List<Mention>, refusals: List<Fai
 fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.raise} = {
   let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
     acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
-  let file_of = |path: String|
-    reads.find(|x: { load: Loaded, read: Read }| displayed(x.read.file.at) == path);
+  let by_path = reads.fold(
+    Map::new(),
+    |acc: Map<String, { load: Loaded, read: Read }>, x: { load: Loaded, read: Read }|
+      acc.insert(displayed(x.read.file.at), x),
+  );
+  let fields_written = reads.fold(
+    Map::new(),
+    |acc: Map<Bytes, Bool>, x: { load: Loaded, read: Read }|
+      x.read.entries.fold(acc, |into: Map<Bytes, Bool>, e: Entry|
+        e.names.members.fold(into, |found: Map<Bytes, Bool>, m: Member|
+          if m.kind == FieldName { found.insert(m.name, true) } else { found })),
+  );
   let missing = |path: String| { path: path, why: "is not among the files being renamed" };
   let declares = |x: { load: Loaded, read: Read }, name: Bytes|
     namespaces().any(|namespace: Namespace|
@@ -40,14 +49,15 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       || x.read.entries.any(|e: Entry|
         e.names.references.any(|r: Reference|
           r.name == name && (match r.refers { Local(_) -> true, _ -> false })));
-  renames.defined.fold([], |acc: List<Failure>, d: Defined|
-    match file_of(d.file) {
-      None -> acc.push(missing(d.file)),
-      Some(x) -> if declares(x, d.old) { acc }
-      else { acc.push({ path: d.file, why: "binds no " ++ shown(d.old) }) },
-    }).concat(
+  renames.defined.fold([], |acc: List<Failure>, old: Bytes, files: Map<String, Bytes>|
+    files.fold(acc, |found: List<Failure>, file: String, _: Bytes|
+      match by_path.get(file) {
+        None -> found.push(missing(file)),
+        Some(x) -> if declares(x, old) { found }
+        else { found.push({ path: file, why: "binds no " ++ shown(old) }) },
+      })).concat(
     renames.operations.fold([], |acc: List<Failure>, o: OperationLine|
-      match file_of(o.file) {
+      match by_path.get(o.file) {
         None -> acc.push(missing(o.file)),
         Some(x) -> if x.read.effects.any(|e: { name: Bytes, ops: List<Bytes> }|
             e.name == o.effect_name && e.ops.contains(o.op)) { acc } else {
@@ -59,23 +69,17 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       }),
   ).concat(
     renames.modules.fold([], |acc: List<Failure>, m: Moved|
-      if reads.any(|x: { load: Loaded, read: Read }| {
-          let f = displayed(x.read.file.at);
-          f == m.path || (m.path.ends_with("/") && f.starts_with(m.path))
-        }) { acc }
+      if by_path.keys().any(|f: String|
+          f == m.path || (m.path.ends_with("/") && f.starts_with(m.path))) { acc }
       else { acc.push(missing(m.path)) }),
   ).concat(
-    renames.fields.keys().filter(|old: Bytes|
-      !reads.any(|x: { load: Loaded, read: Read }|
-        x.read.entries.any(|e: Entry|
-          e.names.members.any(|m: Member| m.name == old && m.kind == FieldName)))).map(
-      |old: Bytes|
-        { path: "", why: "no record in the files being renamed has a field " ++ shown(old) },
-    ),
+    renames.fields.keys().filter(|old: Bytes| !fields_written.contains(old)).map(|old: Bytes|
+      { path: "", why: "no record in the files being renamed has a field " ++ shown(old) }),
   )
 }
 
 fn planned(
+  store: Option<Resolved>,
   pwd: String,
   renames: Renames,
   loads: List<Loaded>,
@@ -85,12 +89,13 @@ fn planned(
   let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
     acc.concat(l.reads.map(|r: Read| { load: l, read: r })));
   let edited = reads.map(|x: { load: Loaded, read: Read }| edited_of(rn, x.load, x.read));
+  let lexed = reads.map(|x: { load: Loaded, read: Read }| lex(x.read.file.text));
   let changes = range(0, reads.len()).map(|i: Int| {
     let r = reads.get(i).read;
     let e = edited.get(i);
     let text = applied(
       r.file.text,
-      e.edits.concat(comment_edits(r.file.text, lex(r.file.text).comments, e)),
+      e.edits.concat(comment_edits(r.file.text, lexed.get(i).comments, e)),
     );
     {
       at: r.file.at,
@@ -152,9 +157,9 @@ fn planned(
   });
   {
     changes: changes.filter(|change: Change| change.changed || change.to != None),
-    mentions: reads.fold([], |acc: List<Mention>, x: { load: Loaded, read: Read }| {
-      let r = x.read;
-      let tokens = lex(r.file.text).tokens;
+    mentions: range(0, reads.len()).fold([], |acc: List<Mention>, i: Int| {
+      let r = reads.get(i).read;
+      let tokens = lexed.get(i).tokens;
       acc.concat(mentions_in(displayed(r.file.at), r.file.text, tokens, olds, words)).concat(
         module_mentions(displayed(r.file.at), r.file.text, tokens, moved_names),
       )
@@ -175,7 +180,7 @@ fn planned(
           },
       );
       loads.fold([], |acc: List<Failure>, l: Loaded|
-        acc.concat(verified(rn, l, library, texts, renamed)))
+        acc.concat(verified(store, rn, l, library, texts, renamed)))
     },
   }
 }
@@ -280,11 +285,12 @@ pub fn run(
           let given = if flags.paths.len() == 0 { [here()] } else { flags.paths };
           let pwd = env.working_directory();
           let libraries = libraries_of(given);
-          let loading = loads_of(given, pwd);
+          let store = given.at(0);
+          let loading = loads_of(store, given, pwd);
           if loading.failures.len() > 0 {
             answered({ changes: [], mentions: [], refusals: [] }, loading.failures, false)
           } else {
-            let plan = planned(pwd, renames, loading.loads, libraries);
+            let plan = planned(store, pwd, renames, loading.loads, libraries);
             if plan.refusals.len() > 0 || flags.check { answered(plan, plan.refusals, flags.check) }
             else {
               answered(
