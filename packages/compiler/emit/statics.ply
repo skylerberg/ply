@@ -5,29 +5,21 @@
 
 import compiler.syntax.patterns (Lit, LStr, LBytes, LEmbedded, LDec, LFixed, LWide, LUnit)
 import compiler.syntax.parsing (dummy_span)
-import compiler.check.types (Type, TyCon, TyVar, TyRecord, TyNominal, Field, spelled_type,
-                             named_type, int_type, string_type, unit_type)
-import std.value
-import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VRecord,
-                  VCtor, VList, VMap, VArray, VHold)
-import compiler.emit.c (Width, width_named, width_index)
-import compiler.emit.keys (RootKey, Named)
-import compiler.emit.reps (Ctors, SumCtor, ctors_of, laid, laid_inside, laid_known, laid_by_pointer,
-                           word_form, ctor_fields_at, has_vars, no_ctors)
-import compiler.emit.layout (Laid, LSum, SumLaid, WordClass, CaseTest, WordIs, LowBits, Nullary,
-                             Inline, Boxed, Itself, Bits, RuntimeBox, Box, LWords, words, layouts,
-                             columns_laid, branch_laid, head_words, list_head, node_head, map_head,
-                             array_head, LPlaced, LRecord, FieldLaid, frame_count, register_words)
+import compiler.check.types (Type, TyCon, TyVar, named_type, int_type, string_type, unit_type,
+                             bytes_type, decimal_type, option_type)
+import compiler.check.known (width_type)
+import compiler.emit.c (Width, width_named)
+import compiler.emit.keys (Named)
+import compiler.emit.reps (Ctors, laid, laid_known, has_vars, no_ctors)
+import compiler.emit.layout (LSum, SumLaid, WordIs, LowBits, Nullary, Inline, Boxed, words, layouts,
+                             head_words, map_head, LPlaced, LRecord, FieldLaid, frame_count)
 import compiler.emit.tir (Fn, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Val, Literal,
                           Static, Prim, AInt, ABool, AVar, AFloat, AChar, ANum, AZero, Arg, Make,
-                          Made, MCase, Gathered, Pack, MRecord, FieldMade, Built, RInt, RBool,
-                          RFloat, RNum, RImm, RUnit, RFlat, RDec, RWide, RWord, RSum, Rep, Var,
-                          Return, Rooted, Kept, Owned, Lambda, Closure, no_links, rep_of_arg,
-                          in_box, no_closure_words)
-import compiler.emit.lower.held (values_of, words_held, held_with, record_fields, record_parts,
-                                 RecordPart, case_parts, typed_convention)
-import compiler.emit.tir.statics (StaticDef, StaticLaid, StaticHead, SBlock, SFile, WRaw, named,
-                                  text_block)
+                          Made, MCase, Gathered, Pack, MRecord, FieldMade, Built, RInt, RDec, RWide,
+                          RWord, RSum, Rep, Var, Return, Rooted, Owned, Lambda, Closure, no_links,
+                          rep_of_arg, in_box, no_closure_words)
+import compiler.emit.lower.held (values_of, words_held, record_parts)
+import compiler.emit.tir.statics (StaticDef, StaticLaid, SBlock, SFile, WRaw, named, text_block)
 import compiler.emit.tir.statics (SPlain, WBytes, WAddress, StaticWord)
 
 /// A value the build knows whole, as static data holds it: a string's or a byte string's bytes, an
@@ -45,714 +37,18 @@ pub fn laid_of(s: Datum) -> StaticLaid =
 /// The definitions `s` needs, each it addresses before it and itself last, which names it.
 pub fn statics_of(s: Datum) -> List<StaticDef> / {abort.raise} = [named(laid_of(s))]
 
-/// A value the build knows whole, as its type lays it in place: a word held raw (an `Int`'s, a
-/// `Float`'s bits, a `Bool`'s 0 or 1, a narrower width's bits extended as a register holds them, a
-/// `Char`'s immediate), a `Decimal`'s or a 128-bit width's two words, a record's fields in its type's order, a sum's case
-/// by its place among the sum's cases with that case's arguments in order, the address of a static
-/// object, a list's items or an array's elements in order (a `Columns`' records), or a map's
-/// entries in its order.
-pub type Known =
-  | KnownWord(Int)
-  | KnownPair({ lo: Int, hi: Int })
-  | KnownRecord(List<Known>)
-  | KnownCase({ case: Int, args: List<Known> })
-  | KnownObject(Datum)
-  | KnownList(List<Known>)
-  | KnownArray(List<Known>)
-  | KnownMap({ keys: List<Known>, values: List<Known> })
-
-/// Words of static data, and the statics they address, each after those it addresses.
-pub type Laying = { words: List<StaticWord>, defs: List<StaticDef> }
-
-/// The words `k`, a value of `ty`, takes where `ty` lays it in place (`emit.reps.laid`), and the
-/// statics they address, a boxed case's box among them. Each part is laid by its own type, so a sum
-/// of a boxed case's recursion group is laid by its cases, however the box lays it. Raises on a value
-/// its type lays in other words, or a case its type has not.
-pub fn laid_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} = {
-  let l = match k {
-    KnownWord(n) -> { words: [WRaw(n)], defs: [] },
-    KnownPair(d) -> { words: [WRaw(d.lo), WRaw(d.hi)], defs: [] },
-    KnownObject(d) -> {
-      let defs = statics_of(d);
-      { words: [WAddress({ name: defs.get(defs.len() - 1).name, tag: 0 })], defs: defs }
-    },
-    KnownRecord(ks) -> {
-      let types = record_types(ty);
-      let fields = match laid(ctors, ty) { LRecord(fs) -> fs.map(|f: FieldLaid| f.laid), _ -> [] };
-      if types.len() != ks.len() || fields.len() != ks.len() { mislaid(ty) } else {
-        range(0, ks.len()).fold(no_laying(), |out: Laying, i: Int|
-          joined(out, field_at(ctors, fields.get(i), types.get(i), ks.get(i))))
-      }
-    },
-    KnownCase(c) -> match ty {
-      TyCon(t) -> match laid(ctors, ty) {
-        LSum(s) -> match ctors.sums.get(t.name) {
-          Some(cs) -> match cs.at(c.case) {
-            Some(sc) -> {
-              let types = ctor_fields_at(sc, t.args);
-              if types.len() != c.args.len() { mislaid(ty) } else {
-                case_words(
-                  s,
-                  c.case,
-                  c.args.fold(
-                    { at: 0, out: no_laying() },
-                    |acc: { at: Int, out: Laying }, x: Known|
-                      {
-                        at: acc.at + 1,
-                        out: joined(acc.out, pointed_at(ctors, types.get(acc.at), x)),
-                      },
-                  ).out,
-                )
-              }
-            },
-            None -> mislaid(ty),
-          },
-          None -> mislaid(ty),
-        },
-        _ -> mislaid(ty),
-      },
-      _ -> mislaid(ty),
-    },
-    KnownList(ks) -> match container_args(ty, b"List") {
-      [item] -> {
-        let laid = ks.fold([], |acc: List<Laying>, x: Known| acc.push(pointed_at(ctors, item, x)));
-        objected(
-          laid.fold([], |acc: List<StaticDef>, l: Laying| acc.concat(l.defs)),
-          list_laid(laid.map(|l: Laying| l.words), stride_of(ctors, item)),
-        )
-      },
-      _ -> mislaid(ty),
-    },
-    KnownArray(ks) -> match container_args(ty, b"Array") {
-      [item] -> {
-        let a = array_static(
-          stride_of(ctors, item),
-          ks.fold([], |acc: List<Laying>, x: Known| acc.push(pointed_at(ctors, item, x))),
-        );
-        objected(a.defs, [a.array])
-      },
-      _ -> match container_args(ty, b"Columns") {
-        [record] -> {
-          let types = record_types(record);
-          columns_static(
-            ctors,
-            types,
-            ks.fold([], |acc: List<List<Laying>>, x: Known|
-              match x {
-                KnownRecord(fs) -> if fs.len() != types.len() { mislaid(record) } else {
-                  acc.push(
-                    fs.fold(
-                      { at: 0, out: [] },
-                      |f: { at: Int, out: List<Laying> }, y: Known|
-                        { at: f.at + 1, out: f.out.push(pointed_at(ctors, types.get(f.at), y)) },
-                    ).out,
-                  )
-                },
-                _ -> mislaid(record),
-              }),
-          )
-        },
-        _ -> mislaid(ty),
-      },
-    },
-    KnownMap(m) -> match container_args(ty, b"Map") {
-      [key, value] -> if m.keys.len() != m.values.len() { mislaid(ty) } else {
-        let keys = m.keys.fold([], |acc: List<Laying>, x: Known|
-          acc.push(pointed_at(ctors, key, x)));
-        let values = m.values.fold([], |acc: List<Laying>, x: Known|
-          acc.push(pointed_at(ctors, value, x)));
-        objected(
-          keys.concat(values).fold([], |acc: List<StaticDef>, l: Laying| acc.concat(l.defs)),
-          // An empty map's object holds no pair, so it is the same at every type, an open one too.
-          if m.keys.len() == 0 { map_laid([], [], 1, 1) } else {
-            map_laid(
-              keys.map(|l: Laying| l.words),
-              values.map(|l: Laying| l.words),
-              stride_of(ctors, key),
-              stride_of(ctors, value),
-            )
-          },
-        )
-      },
-      _ -> mislaid(ty),
-    },
-  };
-  if l.words.len() != words(laid(ctors, ty)) { mislaid(ty) } else { l }
-}
-
-/// The type arguments of `ty` where it is the builtin `name`; none otherwise.
-fn container_args(ty: Type, name: Bytes) -> List<Type> =
-  match ty { TyCon(t) -> if t.name == name { t.args } else { [] }, _ -> [] }
-
-/// The word addressing the last of `own`, which lays an object out after the statics `held` it
-/// holds, and every one of them in order.
-fn objected(held: List<StaticDef>, own: List<StaticDef>) -> Laying / {abort.raise} =
-  { words: [WAddress({ name: own.get(own.len() - 1).name, tag: 0 })], defs: held.concat(own) }
-
-/// The words apart a container lays elements of `item`: their words as it holds them
-/// (`layout.by_pointer`, a wide record one pointer), and at least one.
-fn stride_of(ctors: Ctors, item: Type) -> Int / {abort.raise} =
-  match laid_by_pointer(ctors, item) {
-    Some(l) -> max(1, words(l)),
-    None -> panic(String::of_bytes_lossy(b"a layout a type variable leaves open")),
-  }
-
-/// The words `k`, a value of `ty`, takes inside another value (`layout.inside`): a record wider than
-/// a call's registers in place behind a header whose count no code takes, anything else as
-/// `laid_at` lays it.
-fn inside_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} =
-  match lies_in(ctors, ty) {
-    LPlaced(_) -> {
-      let l = laid_at(ctors, ty, k);
-      { ..l, words: [WRaw(frame_count())].concat(l.words) }
-    },
-    _ -> laid_at(ctors, ty, k),
-  }
-
-/// The words `k`, a value of `ty`, takes as a record's field its holder lays as `l`: in place where
-/// `l` places it, and otherwise as a case's argument is, a record a holder within a call's
-/// registers keeps as a pointer among them.
-fn field_at(ctors: Ctors, l: Laid, ty: Type, k: Known) -> Laying / {abort.raise} =
-  match l { LPlaced(_) -> inside_at(ctors, ty, k), _ -> pointed_at(ctors, ty, k) }
-
-/// The words `k`, a value of `ty`, takes as a case's argument or a container's element
-/// (`layout.by_pointer`): a record wider than a call's registers as its static box's address,
-/// anything else as `inside_at` lays it.
-fn pointed_at(ctors: Ctors, ty: Type, k: Known) -> Laying / {abort.raise} =
-  match lies_in(ctors, ty) {
-    LPlaced(_) -> {
-      let w = word_at(ctors, ty, k);
-      { words: [w.word], defs: w.defs }
-    },
-    _ -> inside_at(ctors, ty, k),
-  }
-
-/// How a value of `ty` lies inside another (`reps.laid_inside`).
-fn lies_in(ctors: Ctors, ty: Type) -> Laid / {abort.raise} =
-  match laid_inside(ctors, ty) {
-    Some(l) -> l,
-    None -> panic(String::of_bytes_lossy(b"a layout a type variable leaves open")),
-  }
-
-/// An array of the elements laid as `held` as emitted code lays one out: its head counting them, then
-/// each element's words in place, `stride` words apart; and the statics its elements address.
-fn array_static(
-  stride: Int,
-  held: List<Laying>,
-) -> { array: StaticDef, defs: List<StaticDef> } / {abort.raise} =
-  {
-    array: named(
-      SBlock({
-        head: headed(array_head().name, [{ field: b"len", value: held.len() }]),
-        words: held.fold([], |acc: List<StaticWord>, l: Laying|
-          acc.concat(l.words).concat(range(l.words.len(), stride).map(|_: Int| WRaw(0)))),
-      }),
-    ),
-    defs: held.fold([], |acc: List<StaticDef>, l: Laying| acc.concat(l.defs)),
-  }
-
-/// A `Columns` of the records whose fields of `types` are laid as `rows`, as emitted code lays one
-/// out: each field's column an array of that field of every record, in the record's field order.
-fn columns_static(
-  ctors: Ctors,
-  types: List<Type>,
-  rows: List<List<Laying>>,
-) -> Laying / {abort.raise} = {
-  let columns = range(0, types.len()).map(|j: Int|
-    array_static(stride_of(ctors, types.get(j)), rows.map(|r: List<Laying>| r.get(j))));
-  objected(
-    columns.fold([], |acc: List<StaticDef>, c: { array: StaticDef, defs: List<StaticDef> }|
-      acc.concat(c.defs).push(c.array)),
-    [
-      named(
-        SBlock({
-          head: None,
-          words: range(0, columns_laid().first).map(|_: Int| WRaw(0)).concat(
-            columns.map(|c: { array: StaticDef, defs: List<StaticDef> }|
-              WAddress({ name: c.array.name, tag: 0 })),
-          ),
-        }),
-      ),
-    ],
-  )
-}
-
-/// The statics of a map of `keys` and `values`, each the words its type lays it as, `key_words` and
-/// `value_words` to each, pair by pair in its order: leaves of a node's width of pairs in order, the
-/// last of fewer, and branches of a node's width of children over them, each child's greatest key
-/// and its count of entries beside it, until one root stands; the map's own object, last, holds the
-/// root and how many levels of branches stand over the leaves. Each node has room for a full one, as
-/// a copy of it is written to.
-fn map_laid(
-  keys: List<List<StaticWord>>,
-  values: List<List<StaticWord>>,
-  key_words: Int,
-  value_words: Int,
-) -> List<StaticDef> / {abort.raise} = {
-  let t = layouts().tree;
-  let br = branch_laid(key_words);
-  let pairs = range(0, keys.len()).map(|i: Int|
-    { key: padded(keys.get(i), key_words), value: padded(values.get(i), value_words) });
-  let room = |kind: Int, n: Int, ws: List<StaticWord>, size: Int|
-    named(SBlock({ head: node_headed(kind, n, size), words: padded(ws, size) }));
-  let chunks = |n: Int| range(0, (n + t.width - 1) / t.width);
-  let leaves = chunks(pairs.len()).map(|i: Int| {
-    let run = pairs.drop(i * t.width).take(t.width);
-    {
-      def: room(
-        t.leaf,
-        run.len(),
-        run.fold(
-          [],
-          |acc: List<StaticWord>, p: { key: List<StaticWord>, value: List<StaticWord> }|
-            acc.concat(p.key).concat(p.value),
-        ),
-        t.width * (key_words + value_words),
-      ),
-      max: run.get(run.len() - 1).key,
-      size: run.len(),
-    }
-  });
-  let height = levels_over(leaves.len());
-  let tree = range(0, height).fold(
-    { level: leaves, defs: leaves.map(|n: Node| n.def) },
-    |s: { level: List<Node>, defs: List<StaticDef> }, _: Int| {
-      let up = chunks(s.level.len()).map(|i: Int| {
-        let kids = s.level.drop(i * t.width).take(t.width);
-        // Word `from` of the node, past its head, as the words after the head count it.
-        let slots = |from: Int, ws: List<StaticWord>| padded(ws, from - t.first);
-        {
-          def: room(
-            t.branch,
-            kids.len(),
-            slots(
-              br.sizes,
-              slots(br.keys, kids.map(|k: Node| WAddress({ name: k.def.name, tag: 0 }))).concat(
-                kids.fold([], |acc: List<StaticWord>, k: Node| acc.concat(k.max)),
-              ),
-            ).concat(
-              kids.map(|k: Node| WRaw(k.size * 2 + 1)),
-            ),
-            br.words,
-          ),
-          max: kids.get(kids.len() - 1).max,
-          size: kids.fold(0, |n: Int, k: Node| n + k.size),
-        }
-      });
-      { level: up, defs: s.defs.concat(up.map(|n: Node| n.def)) }
-    },
-  );
-  let root = match tree.level.at(0) {
-    Some(n) -> WAddress({ name: n.def.name, tag: 0 }),
-    None -> WRaw(0),
-  };
-  tree.defs.push(
-    named(
-      SBlock({
-        head: headed(map_head().name, [
-          { field: b"len", value: pairs.len() },
-          { field: b"height", value: height },
-        ]),
-        words: padded([], layouts().map.root - head_words(map_head())).push(root),
-      }),
-    ),
-  )
-}
-
-/// A node of a map's tree laid out: its static, its greatest key's words and how many entries lie
-/// under it.
-type Node = { def: StaticDef, max: List<StaticWord>, size: Int }
-
-/// How many levels of branches stand over `count` nodes laid a node's width to a branch, as
-/// `std.prelude`'s packing counts them.
-fn levels_over(count: Int) -> Int / {abort.raise} =
-  iterate({ count: count, levels: 0 }, 17, |s: { count: Int, levels: Int }|
-    if s.levels >= 16 || s.count <= 1 { Stop(s.levels) } else {
-      Continue({
-        count: (s.count + layouts().tree.width - 1) / layouts().tree.width,
-        levels: s.levels + 1,
-      })
-    })
-
-/// The statics of a list of the words `items`, as the runtime lays one out: up to a node's width in
-/// the list's own object's tail; past it, each full run of a node's width a leaf of its trie, the
-/// leaves gathered into branches until one root stands, and the rest the tail. A node has room for a
-/// full one, as a copy of it is written to; the list has room for its tail, and at least one item.
-/// The list's object is last.
-fn list_laid(items: List<List<StaticWord>>, stride: Int) -> List<StaticDef> / {abort.raise} = {
-  let laid = layouts();
-  let width = laid.trie.width;
-  let n = items.len();
-  let full = if n <= width { 0 } else { n / width * width };
-  // The words of `xs`, `s` to each, a word one leaves out zero.
-  let flat = |xs: List<List<StaticWord>>, s: Int|
-    xs.fold([], |acc: List<StaticWord>, x: List<StaticWord>|
-      acc.concat(range(0, s).map(|j: Int| match x.at(j) { Some(w) -> w, None -> WRaw(0) })));
-  let node = |kind: Int, xs: List<List<StaticWord>>, s: Int|
-    named(
-      SBlock({
-        head: node_headed(kind, xs.len(), width * s),
-        words: padded(flat(xs, s), width * s),
-      }),
-    );
-  let leaves = range(0, full / width).map(|i: Int|
-    node(laid.trie.leaf, items.slice(i * width, (i + 1) * width), stride));
-  let trie = iterate(
-    { level: leaves, defs: leaves },
-    n + 1,
-    |s: { level: List<StaticDef>, defs: List<StaticDef> }|
-      if s.level.len() <= 1 { Stop(s) } else {
-        let up = range(0, (s.level.len() + width - 1) / width).map(|i: Int|
-          node(
-            laid.trie.branch,
-            s.level.drop(i * width).take(width).map(|d: StaticDef|
-              [WAddress({ name: d.name, tag: 0 })]),
-            1,
-          ));
-        Continue({ level: up, defs: s.defs.concat(up) })
-      },
-  );
-  let root = match trie.level.at(0) {
-    Some(d) -> WAddress({ name: d.name, tag: 0 }),
-    None -> WRaw(0),
-  };
-  let tail = items.drop(full);
-  let room = max(1, tail.len());
-  let tail_words = flat(tail, stride);
-  // The words past the list's head: its root's, then its tail's.
-  let past_head = head_words(list_head());
-  let slots = range(past_head, laid.list.tail + room * stride).map(|i: Int|
-    if i == laid.list.root { root }
-    else { match tail_words.at(i - laid.list.tail) { Some(w) -> w, None -> WRaw(0) } });
-  let list = named(
+/// The empty map as static data, immortal as the runtime's own is: its object holds no pair, so it
+/// is the same at every type, an open one too.
+pub fn empty_map_static() -> StaticDef / {abort.raise} =
+  named(
     SBlock({
-      head: headed(list_head().name, [
-        { field: b"len", value: n },
-        { field: b"start", value: 0 },
-        { field: b"tail_len", value: tail.len() },
-        { field: b"room", value: room },
-      ]),
-      words: slots,
+      head: Some({
+        of: map_head().name,
+        fields: [{ field: b"len", value: 0 }, { field: b"height", value: 0 }],
+      }),
+      words: range(head_words(map_head()), layouts().map.root + 1).map(|_: Int| WRaw(0)),
     }),
-  );
-  trie.defs.push(list)
-}
-
-fn no_laying() -> Laying = { words: [], defs: [] }
-
-/// The head of the struct `of` with `fields` set.
-fn headed(of: Bytes, fields: List<{ field: Bytes, value: Int }>) -> Option<StaticHead> =
-  Some({ of: of, fields: fields })
-
-/// The head of a node of `kind` holding `n` items, pairs or children, with room for `room` words.
-fn node_headed(kind: Int, n: Int, room: Int) -> Option<StaticHead> =
-  headed(node_head().name, [
-    { field: b"len", value: n },
-    { field: b"room", value: room },
-    { field: b"kind", value: kind },
-  ])
-
-/// `ws` and zeros after them, `n` words in all.
-fn padded(ws: List<StaticWord>, n: Int) -> List<StaticWord> =
-  ws.concat(range(ws.len(), n).map(|_: Int| WRaw(0)))
-
-fn joined(a: Laying, b: Laying) -> Laying =
-  { words: a.words.concat(b.words), defs: a.defs.concat(b.defs) }
-
-/// The types of a record's fields in its type's order; none for another type.
-fn record_types(ty: Type) -> List<Type> = record_fields(ty).map(|f: Field| f.ty)
-
-fn mislaid<a>(ty: Type) -> a / {abort.raise} =
-  panic(
-    String::of_bytes_lossy(
-      b"a known value its type lays in other words: ".concat(spelled_type(ty)),
-    ),
   )
-
-/// Case `case` of the sum laid as `s`, its arguments laid as `payload`, as `sum_words` gathers the
-/// case: a boxed case's arguments in a static box after the case's place where the box holds one, the
-/// box's address its word.
-fn case_words(s: SumLaid, case: Int, payload: Laying) -> Laying / {abort.raise} =
-  match s.cases.at(case) {
-    None -> panic("a case its sum does not lay"),
-    Some(cl) -> match cl.payload {
-      Boxed(b) -> {
-        let boxed = named(
-          SBlock({
-            head: None,
-            words: (if b.skip > 0 { [WRaw(case)] } else { [] }).concat(payload.words),
-          }),
-        );
-        {
-          words: sum_words(s, case, [[WAddress({ name: boxed.name, tag: 0 })]]),
-          defs: payload.defs.push(boxed),
-        }
-      },
-      _ -> { words: sum_words(s, case, [payload.words]), defs: payload.defs },
-    },
-  }
-
-/// The one word `k`, a value of `ty`, is where one word is required (a container's item, an
-/// argument of a closure's uniform entry), as `emit.reps.word_form` says: its own, a scalar's bits,
-/// the runtime's box of it, or a box of its words; and the statics that word addresses.
-pub fn word_at(
-  ctors: Ctors,
-  ty: Type,
-  k: Known,
-) -> { word: StaticWord, defs: List<StaticDef> } / {abort.raise} = {
-  let l = laid_at(ctors, ty, k);
-  let boxed = || {
-    let b = named(SBlock({ head: None, words: l.words }));
-    { word: WAddress({ name: b.name, tag: 0 }), defs: l.defs.push(b) }
-  };
-  match word_form(ctors, ty) {
-    Itself -> { word: match l.words.at(0) { Some(w) -> w, None -> WRaw(0) }, defs: l.defs },
-    // A scalar of one word, a sum holding one among them, as the word it lays it in.
-    Bits -> match l.words { [w] -> { word: w, defs: [] }, _ -> mislaid(ty) },
-    RuntimeBox -> boxed(),
-    Box(_) -> boxed(),
-  }
-}
-
-/// Root `key`, a definition of no parameters answering `k`, a value of `ty`, from static data: its
-/// body binds the value, held as `ty` is, from the statics laying it out and answers it, counting no
-/// step, and its entry hands back the value's word form, so a read of it neither steps nor
-/// allocates. Raises where `k` is not a value of `ty`.
-pub fn kept_root(ctors: Ctors, key: RootKey, ty: Type, k: Known) -> Fn / {abort.raise} = {
-  let word = word_at(ctors, ty, k);
-  let held = held_known(ctors, ty, k, { insts: [], next: 0 });
-  {
-    key: key,
-    kind: Kept(word.word),
-    params: [],
-    conv: typed_convention(ctors, [], ty),
-    answer_ty: ty,
-    body: held.b.insts.push(Return(held.arg)),
-    lambdas: [],
-    base: 0,
-    members: [],
-    links: no_links(),
-    statics: holding(
-      { defs: [], seen: Map::new(), known: Map::new(), ctors: ctors },
-      word.defs,
-    ).defs,
-  }
-}
-
-/// The instructions binding a body's values so far, and the number of the next variable.
-type Binding = { insts: List<Inst>, next: Int }
-
-/// `k`, a value of `ty`, as the operand holding it as `ty` is held, the instructions binding what it
-/// is made of after `b`'s: a scalar itself, a decimal's two words, a static's address, a record
-/// gathered from its fields, a sum from its case's place and its arguments, or the box a boxed case
-/// is laid in.
-fn held_known(
-  ctors: Ctors,
-  ty: Type,
-  k: Known,
-  b: Binding,
-) -> { arg: Arg, b: Binding } / {abort.raise} = known_as(ctors, ty, k, b, held_with(ctors, ty))
-
-/// `held_known` of `k` held as `rep`, as a record's part or a case's argument lies inside it.
-fn known_as(
-  ctors: Ctors,
-  ty: Type,
-  k: Known,
-  b: Binding,
-  rep: Rep,
-) -> { arg: Arg, b: Binding } / {abort.raise} = {
-  let bound = |c: Binding, r: Rep, val: Val| {
-    let v = { id: c.next, ty: ty, rep: r };
-    {
-      arg: AVar(v),
-      b: {
-        insts: c.insts.push(Let({ var: v, val: val, at: dummy_span(), unwind: [] })),
-        next: c.next + 1,
-      },
-    }
-  };
-  let raw = match k { KnownWord(n) -> n, _ -> 0 };
-  let scalar = |a: Arg| match k { KnownWord(_) -> { arg: a, b: b }, _ -> mislaid(ty) };
-  let paired = |op: Bytes|
-    match k {
-      KnownPair(d) -> bound(b, rep, Prim({ op: op, on: RInt, args: [AInt(d.lo), AInt(d.hi)] })),
-      _ -> mislaid(ty),
-    };
-  match rep {
-    RInt -> scalar(AInt(raw)),
-    RBool -> scalar(ABool(raw != 0)),
-    RFloat -> scalar(AFloat(raw)),
-    RNum(w) -> scalar(ANum({ width: w, bits: raw })),
-    RImm -> if (raw - 2) % 8 == 0 { scalar(AChar((raw - 2) / 8)) } else { mislaid(ty) },
-    RUnit -> { arg: AZero(RUnit), b: b },
-    RDec -> paired(b"decimal"),
-    RWide(_) -> paired(b"wide"),
-    RWord -> match word_at(ctors, ty, k).word {
-      WAddress(a) -> if a.tag == 0 { bound(b, rep, Static(a.name)) } else { mislaid(ty) },
-      _ -> mislaid(ty),
-    },
-    RFlat(_) -> match k {
-      KnownRecord(ks) -> if ks.len() != record_fields(ty).len() { mislaid(ty) } else {
-        let p = record_parts(ctors, ty).fold(
-          { args: [], b: b },
-          |acc: { args: List<Arg>, b: Binding }, part: RecordPart| {
-            let h = known_as(ctors, part.ty, ks.get(part.field), acc.b, part.rep);
-            { args: acc.args.push(h.arg), b: h.b }
-          },
-        );
-        bound(p.b, rep, Gathered({ parts: p.args }))
-      },
-      _ -> mislaid(ty),
-    },
-    RSum(s) -> match ((k, ty)) {
-      (KnownCase(c), TyCon(t)) -> match s.laid.cases.at(c.case) {
-        Some(cl) -> match cl.payload {
-          Boxed(_) -> {
-            let l = laid_at(ctors, ty, k);
-            let box = bound(b, RWord, Static(l.defs.get(l.defs.len() - 1).name));
-            bound(box.b, rep, Gathered({ parts: [AInt(c.case), box.arg] }))
-          },
-          _ -> {
-            let cps = case_parts(ctors, ty, c.case);
-            if cps.len() != c.args.len() { mislaid(ty) } else {
-              let p = range(0, cps.len()).fold(
-                { args: [AInt(c.case)], b: b },
-                |acc: { args: List<Arg>, b: Binding }, i: Int| {
-                  let cp = cps.get(i);
-                  let h = known_as(ctors, cp.ty, c.args.get(i), acc.b, cp.rep);
-                  { args: acc.args.push(h.arg), b: h.b }
-                },
-              );
-              bound(p.b, rep, Gathered({ parts: p.args }))
-            }
-          },
-        },
-        None -> mislaid(ty),
-      },
-      _ -> mislaid(ty),
-    },
-    _ -> mislaid(ty),
-  }
-}
-
-/// `v`, a value of `ty` as `std.value` holds one, as the build knows it to lay it out; or why it
-/// cannot: a value its type does not hold, or one no build can know, a function's, a handle's or one
-/// that leaves something out.
-pub fn known_of_value(ctors: Ctors, ty: Type, v: Value) -> Result<Known, Bytes> / {abort.raise} =
-  match v {
-    VUnit -> if ty == TyRecord([]) { Ok(KnownRecord([])) }
-    else { scalar(ty, b"Unit", KnownRecord([])) },
-    VBool(b) -> scalar(ty, b"Bool", KnownWord(if b { 1 } else { 0 })),
-    VInt(n) -> scalar(ty, b"Int", KnownWord(n)),
-    VFloat(x) -> scalar(ty, b"Float", KnownWord(bits_of_float(x))),
-    VDecimal(d) ->
-      scalar(ty, b"Decimal", KnownPair(decimal_words(Bytes::of_string(d.to_string())))),
-    VChar(c) -> scalar(ty, b"Char", KnownWord(Int::of_char(c) * 8 + 2)),
-    VStr(s) -> scalar(ty, b"String", KnownObject(SStr(Bytes::of_string(s)))),
-    VBytes(b) -> scalar(ty, b"Bytes", KnownObject(SBytes(b))),
-    VFixed(name, bits) -> match width_named(Bytes::of_string(name)) {
-      Some(w) -> scalar(ty, Bytes::of_string(name), fixed_known(w, bits)),
-      None -> Err(b"a width of no known name"),
-    },
-    VRecord(fs) -> {
-      let types = record_types(ty);
-      if types.len() != fs.len() { Err(b"a record of other fields than its type's") } else {
-        match knowns_of(ctors, types, fs.map(|f: value::Field| f.value)) {
-          Ok(ks) -> Ok(KnownRecord(ks)),
-          Err(why) -> Err(why),
-        }
-      }
-    },
-    VCtor(name, args) -> match ty {
-      TyCon(t) -> match ctors.sums.get(t.name) {
-        Some(cs) -> match range(0, cs.len()).find(|i: Int|
-            cs.get(i).name == Bytes::of_string(name)) {
-          Some(i) -> {
-            let types = ctor_fields_at(cs.get(i), t.args);
-            if types.len() != args.len() { Err(b"a constructor of other arguments than its sum's") }
-            else {
-              match knowns_of(ctors, types, args) {
-                Ok(ks) -> Ok(KnownCase({ case: i, args: ks })),
-                Err(why) -> Err(why),
-              }
-            }
-          },
-          None -> Err(b"a constructor its sum does not declare"),
-        },
-        None -> Err(b"a constructor of no declared sum"),
-      },
-      _ -> Err(b"a constructor of no declared sum"),
-    },
-    VList(xs) -> match container_args(ty, b"List") {
-      [item] -> match knowns_of(ctors, xs.map(|_: Value| item), xs) {
-        Ok(ks) -> Ok(KnownList(ks)),
-        Err(why) -> Err(why),
-      },
-      _ -> Err(b"a list of no list's type"),
-    },
-    // A `Columns` crosses as the array of its records.
-    VArray(xs) -> match match container_args(ty, b"Array") {
-        [item] -> [item],
-        _ -> container_args(ty, b"Columns"),
-      } {
-      [item] -> match knowns_of(ctors, xs.map(|_: Value| item), xs) {
-        Ok(ks) -> Ok(KnownArray(ks)),
-        Err(why) -> Err(why),
-      },
-      _ -> Err(b"an array of no array's type"),
-    },
-    VMap(es) -> match container_args(ty, b"Map") {
-      [key, value] -> {
-        let types = es.fold([], |acc: List<Type>, _: value::Entry| acc.push(key).push(value));
-        let parts = es.fold([], |acc: List<Value>, e: value::Entry| acc.push(e.key).push(e.value));
-        match knowns_of(ctors, types, parts) {
-          Ok(ks) ->
-            Ok(
-              KnownMap({
-                keys: range(0, es.len()).map(|i: Int| ks.get(2 * i)),
-                values: range(0, es.len()).map(|i: Int| ks.get(2 * i + 1)),
-              }),
-            ),
-          Err(why) -> Err(why),
-        }
-      },
-      _ -> Err(b"a map of no map's type"),
-    },
-    _ -> Err(b"a value no build can know"),
-  }
-
-/// `k` where `ty` is the type of no arguments `name`, which a value known as `k` is of; why not
-/// otherwise.
-fn scalar(ty: Type, name: Bytes, k: Known) -> Result<Known, Bytes> =
-  match ty {
-    TyCon(c) -> if c.name == name && c.args.len() == 0 { Ok(k) }
-    else { Err(b"a value of another type than ".concat(spelled_type(ty))) },
-    _ -> Err(b"a value of another type than ".concat(spelled_type(ty))),
-  }
-
-/// Each of `vs` known at the type of `types` in its place, or why the first that cannot be is not.
-fn knowns_of(
-  ctors: Ctors,
-  types: List<Type>,
-  vs: List<Value>,
-) -> Result<List<Known>, Bytes> / {abort.raise} =
-  range(0, vs.len()).fold(Ok([]), |acc: Result<List<Known>, Bytes>, i: Int|
-    match acc {
-      Err(why) -> Err(why),
-      Ok(ks) -> match known_of_value(ctors, types.get(i), vs.get(i)) {
-        Ok(k) -> Ok(ks.push(k)),
-        Err(why) -> Err(why),
-      },
-    })
-
-/// The bits a width's value `bits` (nothing above the width) is held as: its register's word, sign-
-/// or zero-extended, below 128 bits; its low and its high word at 128.
-fn fixed_known(w: Width, bits: U128) -> Known / {abort.raise} =
-  if w.bits == 128 {
-    KnownPair({ lo: signed(bits & wrap_sub(1u128 << 64, 1u128)), hi: signed(bits >>> 64) })
-  } else if w.signed && bits >= 1u128 << w.bits - 1 {
-    KnownWord(0 - Int::of_u128((1u128 << w.bits) - bits))
-  } else { KnownWord(signed(bits)) }
 
 /// `f` with each constant its body and its closures' bodies bind laid out: a string, a byte string,
 /// an embedded file and a 128-bit width's value as the static object named by its content, listed
@@ -1198,8 +494,7 @@ fn signed(w: U128) -> Int / {abort.raise} =
   if w >= 1u128 << 63 { Int::of_u128(w - (1u128 << 63)) + (0 - 9223372036854775807 - 1) }
   else { Int::of_u128(w) }
 
-fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
-  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+fn local(id: Int, ty: Type, rep: Rep) -> Var = { id: id, ty: ty, rep: rep }
 
 fn bind(v: Var, val: Val) -> Inst = Let({ var: v, val: val, at: dummy_span(), unwind: [] })
 
@@ -1208,7 +503,7 @@ fn root(body: Block, lambdas: List<Lambda>) -> Fn =
     key: Named(b"m.f"),
     kind: Rooted,
     params: [],
-    conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
+    conv: { params: [], answer: RWord, destined: false, answered: Owned },
     answer_ty: TyCon({ name: b"T", args: [] }),
     body: body,
     lambdas: lambdas,
@@ -1230,7 +525,7 @@ fn bound_values(b: Block) -> List<Val> =
 fn name_of(d: Datum) -> Bytes / {abort.raise} = statics_of(d).get(0).name
 
 test "each constant a body binds is the static its content names, listed once, a closure's in its own body" {
-  let s = |id: Int| local(id, b"String", RWord);
+  let s = |id: Int| local(id, string_type(), RWord);
   let inner = root([bind(s(0), Literal(LStr(b"b"))), Return(AVar(s(0)))], []);
   let f = folded(
     no_ctors(),
@@ -1240,9 +535,9 @@ test "each constant a body binds is the static its content names, listed once, a
         If({
           cond: ABool(true),
           then: [bind(s(2), Literal(LStr(b"a")))],
-          otherwise: [bind(local(3, b"Bytes", RWord), Literal(LBytes(b"a")))],
+          otherwise: [bind(local(3, bytes_type(), RWord), Literal(LBytes(b"a")))],
         }),
-        bind(local(4, b"Bytes", RWord), Literal(LEmbedded(b"digest", 3))),
+        bind(local(4, bytes_type(), RWord), Literal(LEmbedded(b"digest", 3))),
         Return(AVar(s(1))),
       ],
       [Closure({ body: inner, captures: 0, at: dummy_span(), words: no_closure_words() })],
@@ -1273,7 +568,7 @@ test "the statics a lowering attached stay first, and a literal's join them afte
   let parent = named(SPlain([WAddress({ name: child.name, tag: 0 })]));
   let a = statics_of(SStr(b"a")).get(0);
   let f = folded(no_ctors(), {
-    ..root([bind(local(0, b"String", RWord), Literal(LStr(b"a"))), bind(local(1, b"String", RWord), Literal(LStr(b"b")))], []),
+    ..root([bind(local(0, string_type(), RWord), Literal(LStr(b"a"))), bind(local(1, string_type(), RWord), Literal(LStr(b"b")))], []),
     statics: [child, parent, a],
   });
   assert_eq(f.statics.map(|d: StaticDef| d.name), [
@@ -1296,7 +591,7 @@ test "a decimal literal is its two words, its scale as written and a zero never 
   });
   let d = folded(
     no_ctors(),
-    root([bind(local(0, b"Decimal", RDec), Literal(LDec(b"1_000.5m")))], []),
+    root([bind(local(0, decimal_type(), RDec), Literal(LDec(b"1_000.5m")))], []),
   );
   assert_eq(bound_values(d.body), [
     Prim({ op: b"decimal", on: RInt, args: [AInt(1 << 16 | 10005 << 32), AInt(0)] }),
@@ -1309,7 +604,7 @@ test "a 128-bit width is its two words in its registers, its low word first, and
   // A literal holding only its low word extends its sign into the high one.
   let f = folded(
     no_ctors(),
-    root([bind(local(0, b"I128", RWide(wide)), Literal(LFixed(b"I128", 0 - 5)))], []),
+    root([bind(local(0, width_type(wide), RWide(wide)), Literal(LFixed(b"I128", 0 - 5)))], []),
   );
   assert_eq(bound_values(f.body), [
     Prim({ op: b"wide", on: RInt, args: [AInt(0 - 5), AInt(0 - 1)] }),
@@ -1318,21 +613,26 @@ test "a 128-bit width is its two words in its registers, its low word first, and
   let big = folded(
     no_ctors(),
     root(
-      [bind(local(0, b"U128", RWide({ bits: 128, signed: false })), Literal(LWide(b"U128", 1, 7)))],
+      [
+        bind(
+          local(0, width_type({ bits: 128, signed: false }), RWide({ bits: 128, signed: false })),
+          Literal(LWide(b"U128", 1, 7)),
+        ),
+      ],
       [],
     ),
   );
   assert_eq(bound_values(big.body), [Prim({ op: b"wide", on: RInt, args: [AInt(7), AInt(1)] })]);
   // `()` stays the runtime's word.
-  let u = folded(no_ctors(), root([bind(local(0, b"Unit", RWord), Literal(LUnit))], []));
+  let u = folded(no_ctors(), root([bind(local(0, unit_type(), RWord), Literal(LUnit))], []));
   assert_eq(bound_values(u.body), [Literal(LUnit)])
 }
 
 test "a box made of what the build knows whole is a static box, its case's place first where it skips one" {
-  let text = local(0, b"String", RWord);
-  let boxed = local(1, b"m.T", RWord);
-  let tagged = local(2, b"m.T", RWord);
-  let word = local(3, b"Int", RWord);
+  let text = local(0, string_type(), RWord);
+  let boxed = local(1, named_type(b"m.T"), RWord);
+  let tagged = local(2, named_type(b"m.T"), RWord);
+  let word = local(3, int_type(), RWord);
   let made = |m: Made, args: List<Arg>| Make({ made: m, args: args, reuse: None });
   let f = folded(
     no_ctors(),
@@ -1366,9 +666,9 @@ test "a box made of what the build knows whole is a static box, its case's place
 }
 
 test "a box of what the build does not know, or at a type a variable leaves open, is made as it is" {
-  let param = local(0, b"String", RWord);
-  let boxed = local(1, b"m.T", RWord);
-  let open = { id: 2, ty: TyCon({ name: b"Option", args: [TyVar(0)] }), rep: RWord };
+  let param = local(0, string_type(), RWord);
+  let boxed = local(1, named_type(b"m.T"), RWord);
+  let open = { id: 2, ty: option_type(TyVar(0)), rep: RWord };
   let made = |m: Made, args: List<Arg>| Make({ made: m, args: args, reuse: None });
   let body = [
     bind(boxed, made(MCase({ case: 1, skip: 0, words: 2 }), [AInt(5), AVar(param)])),
@@ -1377,438 +677,4 @@ test "a box of what the build does not know, or at a type a variable leaves open
   let f = folded(no_ctors(), { ..root(body, []), params: [param] });
   assert_eq(f.body, body);
   assert_eq(f.statics, [])
-}
-
-fn sum_case(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> SumCtor =
-  { name: name, index: index, fields: fields, params: params }
-
-/// A table of the prelude's `Option` and `Result` and a list of `Int`s that holds itself in place.
-fn sample_ctors() -> Ctors =
-  ctors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"Option", [
-      sum_case(b"None", 0, [], [0]),
-      sum_case(b"Some", 1, [TyVar(0)], [0]),
-    ]).insert(b"Result", [
-      sum_case(b"Ok", 0, [TyVar(0)], [0, 1]),
-      sum_case(b"Err", 1, [TyVar(1)], [0, 1]),
-    ]).insert(b"m.Ints", [
-      sum_case(b"m.More", 0, [int_type(), named_type(b"m.Ints")], []),
-      sum_case(b"m.Done", 1, [], []),
-    ]),
-  )
-
-fn of(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
-
-fn pair() -> Type = TyRecord([{ name: b"a", ty: int_type() }, { name: b"b", ty: string_type() }])
-
-fn address_of(d: Datum) -> StaticWord / {abort.raise} = WAddress({ name: name_of(d), tag: 0 })
-
-test "a record, an Option and a Result are laid in place as their types lay them" {
-  let t = sample_ctors();
-  let lay = |ty: Type, k: Known| laid_at(t, ty, k);
-  let x = KnownObject(SStr(b"x"));
-  assert_eq(lay(pair(), KnownRecord([KnownWord(5), x])), {
-    words: [WRaw(5), address_of(SStr(b"x"))],
-    defs: statics_of(SStr(b"x")),
-  });
-  // An `Option` of a pointer takes its niche: `None` is 0, `Some` its pointer.
-  let maybe = of(b"Option", [string_type()]);
-  assert_eq(lay(maybe, KnownCase({ case: 1, args: [x] })).words, [address_of(SStr(b"x"))]);
-  assert_eq(lay(maybe, KnownCase({ case: 0, args: [] })).words, [WRaw(0)]);
-  // A `Result` of two pointers tags its `Err`'s.
-  let result = of(b"Result", [string_type(), string_type()]);
-  assert_eq(lay(result, KnownCase({ case: 1, args: [KnownObject(SStr(b"e"))] })).words, [
-    WAddress({ name: name_of(SStr(b"e")), tag: 1 }),
-  ]);
-  // An `Option` of an `Int` leaves no value free: a tag word, then its payload.
-  let count = of(b"Option", [int_type()]);
-  assert_eq(lay(count, KnownCase({ case: 1, args: [KnownWord(5)] })).words, [WRaw(1), WRaw(5)]);
-  assert_eq(lay(count, KnownCase({ case: 0, args: [] })).words, [WRaw(0), WRaw(0)]);
-  assert_eq(lay(unit_type(), KnownRecord([])).words, []);
-  // A record within a call's registers keeps a wide field as its static box's address; a wider one
-  // lays it in place behind its header.
-  let ints = |prefix: Bytes, n: Int|
-    range(0, n).map(|i: Int|
-      { name: prefix.concat(Bytes::of_string(i.to_string())), ty: int_type() });
-  let wide = TyRecord(ints(b"f", register_words() + 1));
-  let known_wide = KnownRecord(range(0, register_words() + 1).map(|i: Int| KnownWord(i)));
-  let holder = |n: Int| TyRecord(ints(b"a", n).push({ name: b"w", ty: wide }));
-  let held = |n: Int| KnownRecord(range(0, n).map(|i: Int| KnownWord(i)).push(known_wide));
-  let pointed = lay(holder(1), held(1)).words;
-  assert_eq(pointed.len(), 2);
-  assert(match pointed.at(1) { Some(WAddress(_)) -> true, _ -> false }, None);
-  let n = register_words();
-  assert_eq(lay(holder(n), held(n)).words.len(), n + 1 + register_words() + 1);
-  // A value its type lays in other words is refused.
-  assert_eq(
-    handle { lay(pair(), KnownWord(5)).words.len() } with { abort.raise(_) -> 0 - 1 },
-    0 - 1,
-  )
-}
-
-test "a boxed case is a static box after the statics its payload addresses, its sum's word that box" {
-  let t = sample_ctors();
-  let ints = named_type(b"m.Ints");
-  let done = KnownCase({ case: 1, args: [] });
-  let inner = laid_at(t, ints, KnownCase({ case: 0, args: [KnownWord(2), done] }));
-  let outer = laid_at(
-    t,
-    ints,
-    KnownCase({
-      case: 0,
-      args: [KnownWord(1), KnownCase({ case: 0, args: [KnownWord(2), done] })],
-    }),
-  );
-  assert_eq(inner.defs.map(|d: StaticDef| d.laid), [
-    SBlock({ head: None, words: [WRaw(2), WRaw(0)] }),
-  ]);
-  assert_eq(outer.defs.map(|d: StaticDef| d.laid), [
-    SBlock({ head: None, words: [WRaw(2), WRaw(0)] }),
-    SBlock({ head: None, words: [WRaw(1), inner.words.get(0)] }),
-  ]);
-  assert_eq(outer.words, [WAddress({ name: outer.defs.get(1).name, tag: 0 })]);
-  assert_eq(laid_at(t, ints, done), { words: [WRaw(0)], defs: [] })
-}
-
-test "a value is its word form where one word is required" {
-  let t = sample_ctors();
-  let word = |ty: Type, k: Known| word_at(t, ty, k);
-  assert_eq(word(int_type(), KnownWord(5)), { word: WRaw(5), defs: [] });
-  assert_eq(word(string_type(), KnownObject(SStr(b"x"))).word, address_of(SStr(b"x")));
-  let boxed = |ty: Type, k: Known| {
-    let w = word(ty, k);
-    match w.defs.at(w.defs.len() - 1) {
-      Some(d) -> if w.word == WAddress({ name: d.name, tag: 0 }) { Some(d.laid) } else { None },
-      None -> None,
-    }
-  };
-  assert_eq(word(int_type(), KnownWord(1 << 62)), { word: WRaw(1 << 62), defs: [] });
-  assert_eq(word(named_type(b"Bool"), KnownWord(1)), { word: WRaw(1), defs: [] });
-  assert_eq(word(named_type(b"Float"), KnownWord(7)), { word: WRaw(7), defs: [] });
-  assert_eq(word(named_type(b"U64"), KnownWord(0 - 1)), { word: WRaw(0 - 1), defs: [] });
-  // Two words are a box of them.
-  assert_eq(
-    boxed(named_type(b"Decimal"), KnownPair({ lo: 1, hi: 2 })),
-    Some(SBlock({ head: None, words: [WRaw(1), WRaw(2)] })),
-  );
-  // A record of two words is a box of its words.
-  assert_eq(
-    boxed(pair(), KnownRecord([KnownWord(5), KnownObject(SStr(b"x"))])),
-    Some(SBlock({ head: None, words: [WRaw(5), address_of(SStr(b"x"))] })),
-  )
-}
-
-test "a value std.value holds is known as its type lays it, and one its type holds not is refused" {
-  let t = sample_ctors();
-  let know = |ty: Type, v: Value| known_of_value(t, ty, v);
-  assert_eq(
-    know(pair(), VRecord([{ name: "a", value: VInt(5) }, { name: "b", value: VStr("x") }])),
-    Ok(KnownRecord([KnownWord(5), KnownObject(SStr(b"x"))])),
-  );
-  assert_eq(
-    know(of(b"Option", [string_type()]), VCtor("Some", [VStr("x")])),
-    Ok(KnownCase({ case: 1, args: [KnownObject(SStr(b"x"))] })),
-  );
-  // A width is held as its register holds it: a signed one sign-extended, 64 bits as the word's.
-  assert_eq(know(named_type(b"I8"), VFixed("I8", 255u128)), Ok(KnownWord(0 - 1)));
-  assert_eq(know(named_type(b"U8"), VFixed("U8", 255u128)), Ok(KnownWord(255)));
-  assert_eq(
-    know(named_type(b"U64"), VFixed("U64", wrap_sub(1u128 << 64, 1u128))),
-    Ok(KnownWord(0 - 1)),
-  );
-  assert_eq(
-    know(named_type(b"I128"), VFixed("I128", wrap_sub(0u128, 5u128))),
-    Ok(KnownPair({ lo: 0 - 5, hi: 0 - 1 })),
-  );
-  assert_eq(know(named_type(b"Char"), VChar('a')), Ok(KnownWord(97 * 8 + 2)));
-  assert_eq(
-    know(named_type(b"Decimal"), VDecimal(Decimal::of_int(3))),
-    Ok(KnownPair(decimal_words(b"3m"))),
-  );
-  let ints = of(b"List", [int_type()]);
-  assert_eq(know(ints, VList([VInt(1), VInt(2)])), Ok(KnownList([KnownWord(1), KnownWord(2)])));
-  let holding = TyRecord([{ name: b"a", ty: int_type() }, { name: b"b", ty: ints }]);
-  assert_eq(
-    know(holding, VRecord([{ name: "a", value: VInt(5) }, { name: "b", value: VList([VInt(1)]) }])),
-    Ok(KnownRecord([KnownWord(5), KnownList([KnownWord(1)])])),
-  );
-  // A map's entries are its keys and its values apart, in its order; a `Columns` its records.
-  assert_eq(
-    know(
-      of(b"Map", [string_type(), int_type()]),
-      VMap([{ key: VStr("b"), value: VInt(2) }, { key: VStr("a"), value: VInt(1) }]),
-    ),
-    Ok(
-      KnownMap({
-        keys: [KnownObject(SStr(b"b")), KnownObject(SStr(b"a"))],
-        values: [KnownWord(2), KnownWord(1)],
-      }),
-    ),
-  );
-  assert_eq(know(of(b"Array", [int_type()]), VArray([VInt(3)])), Ok(KnownArray([KnownWord(3)])));
-  assert_eq(
-    know(
-      of(b"Columns", [holding]),
-      VArray([VRecord([{ name: "a", value: VInt(5) }, { name: "b", value: VList([]) }])]),
-    ),
-    Ok(KnownArray([KnownRecord([KnownWord(5), KnownList([])])])),
-  );
-  let refused = |ty: Type, v: Value| match know(ty, v) { Err(_) -> true, Ok(_) -> false };
-  assert(refused(int_type(), VList([])), None);
-  assert(refused(int_type(), VStr("x")), None);
-  assert(refused(string_type(), VInt(1)), None);
-  assert(refused(ints, VMap([])), None);
-  assert(refused(ints, VHold), None)
-}
-
-test "a list is laid as the runtime lays one: up to a node's width in its tail, past it full leaves" {
-  let t = sample_ctors();
-  let ints = of(b"List", [int_type()]);
-  let upto = |n: Int| KnownList(range(0, n).map(|i: Int| KnownWord(i)));
-  // An `Int` item is its own bits.
-  let item = |i: Int| WRaw(i);
-  let lay = |n: Int| {
-    let l = laid_at(t, ints, upto(n));
-    let list = l.defs.get(l.defs.len() - 1);
-    assert_eq(l.words, [WAddress({ name: list.name, tag: 0 })]);
-    l.defs
-  };
-  let head = |n: Int, tail: Int, room: Int|
-    Some({
-      of: b"PlyListHead",
-      fields: [
-        { field: b"len", value: n },
-        { field: b"start", value: 0 },
-        { field: b"tail_len", value: tail },
-        { field: b"room", value: room },
-      ],
-    });
-  let address = |d: StaticDef| WAddress({ name: d.name, tag: 0 });
-  let nodes = |ws: List<StaticWord>| ws.concat(range(ws.len(), 32).map(|_: Int| WRaw(0)));
-  let node_head = |kind: Int, n: Int|
-    Some({
-      of: b"PlyNodeHead",
-      fields: [
-        { field: b"len", value: n },
-        { field: b"room", value: 32 },
-        { field: b"kind", value: kind },
-      ],
-    });
-  // An empty list still has room for one item.
-  assert_eq(lay(0).map(|d: StaticDef| d.laid), [
-    SBlock({ head: head(0, 0, 1), words: [WRaw(0), WRaw(0)] }),
-  ]);
-  assert_eq(lay(2).map(|d: StaticDef| d.laid), [
-    SBlock({ head: head(2, 2, 2), words: [WRaw(0), item(0), item(1)] }),
-  ]);
-  assert_eq(lay(32).map(|d: StaticDef| d.laid), [
-    SBlock({ head: head(32, 32, 32), words: [WRaw(0)].concat(range(0, 32).map(item)) }),
-  ]);
-  // Past a node's width the full runs are leaves; one leaf is the root itself.
-  let one = lay(40);
-  assert_eq(one.map(|d: StaticDef| d.laid), [
-    SBlock({ head: node_head(11, 32), words: range(0, 32).map(item) }),
-    SBlock({ head: head(40, 8, 8), words: [address(one.get(0))].concat(range(32, 40).map(item)) }),
-  ]);
-  // A tail emptied by a whole number of leaves keeps room for one item.
-  let two = lay(64);
-  assert_eq(two.map(|d: StaticDef| d.laid).drop(2), [
-    SBlock({ head: node_head(12, 2), words: nodes([address(two.get(0)), address(two.get(1))]) }),
-    SBlock({ head: head(64, 0, 1), words: [address(two.get(2)), WRaw(0)] }),
-  ]);
-  // Thirty-three leaves stand under two branches, under one more: a branch has room for a full one.
-  let deep = lay(33 * 32 + 3);
-  assert_eq(deep.len(), 37);
-  assert_eq(
-    deep.get(33).laid,
-    SBlock({ head: node_head(12, 32), words: range(0, 32).map(|i: Int| address(deep.get(i))) }),
-  );
-  assert_eq(
-    deep.get(34).laid,
-    SBlock({ head: node_head(12, 1), words: nodes([address(deep.get(32))]) }),
-  );
-  assert_eq(
-    deep.get(35).laid,
-    SBlock({
-      head: node_head(12, 2),
-      words: nodes([address(deep.get(33)), address(deep.get(34))]),
-    }),
-  );
-  assert_eq(
-    deep.get(36).laid,
-    SBlock({
-      head: head(33 * 32 + 3, 3, 3),
-      words: [address(deep.get(35))].concat(range(33 * 32, 33 * 32 + 3).map(item)),
-    }),
-  );
-  // An item is its word form, the statics it addresses before the list.
-  let strings = laid_at(t, of(b"List", [string_type()]), KnownList([KnownObject(SStr(b"x"))]));
-  assert_eq(strings.defs.get(0), statics_of(SStr(b"x")).get(0));
-  assert_eq(
-    strings.defs.get(1).laid,
-    SBlock({ head: head(1, 1, 1), words: [WRaw(0), address_of(SStr(b"x"))] }),
-  )
-}
-
-test "an array lays each element in place a stride apart, and a `Columns` one such array a field" {
-  let t = sample_ctors();
-  let head = |n: Int| Some({ of: b"PlyArrayHead", fields: [{ field: b"len", value: n }] });
-  let x = KnownObject(SStr(b"x"));
-  let y = KnownObject(SStr(b"y"));
-  let ints = laid_at(t, of(b"Array", [int_type()]), KnownArray([KnownWord(1), KnownWord(2)]));
-  assert_eq(ints.defs.map(|d: StaticDef| d.laid), [
-    SBlock({ head: head(2), words: [WRaw(1), WRaw(2)] }),
-  ]);
-  assert_eq(ints.words, [WAddress({ name: ints.defs.get(0).name, tag: 0 })]);
-  let empty = laid_at(t, of(b"Array", [int_type()]), KnownArray([]));
-  assert_eq(empty.defs.map(|d: StaticDef| d.laid), [SBlock({ head: head(0), words: [] })]);
-  // A record of two words takes two, a stride apart.
-  let pairs = laid_at(
-    t,
-    of(b"Array", [pair()]),
-    KnownArray([KnownRecord([KnownWord(5), x]), KnownRecord([KnownWord(6), y])]),
-  );
-  assert_eq(
-    pairs.defs.get(pairs.defs.len() - 1).laid,
-    SBlock({
-      head: head(2),
-      words: [WRaw(5), address_of(SStr(b"x")), WRaw(6), address_of(SStr(b"y"))],
-    }),
-  );
-  let columns = laid_at(
-    t,
-    of(b"Columns", [pair()]),
-    KnownArray([KnownRecord([KnownWord(5), x]), KnownRecord([KnownWord(6), y])]),
-  );
-  let a = laid_at(t, of(b"Array", [int_type()]), KnownArray([KnownWord(5), KnownWord(6)]));
-  let b = laid_at(t, of(b"Array", [string_type()]), KnownArray([x, y]));
-  assert_eq(
-    columns.defs.get(columns.defs.len() - 1).laid,
-    SBlock({ head: None, words: a.words.concat(b.words) }),
-  )
-}
-
-test "a map is laid as the runtime lays sorted entries: full leaves in order and branches over them" {
-  let t = sample_ctors();
-  let ints = of(b"Map", [int_type(), int_type()]);
-  let upto = |n: Int|
-    laid_at(
-      t,
-      ints,
-      KnownMap({
-        keys: range(0, n).map(|i: Int| KnownWord(i)),
-        values: range(0, n).map(|i: Int| KnownWord(0 - i)),
-      }),
-    ).defs;
-  let imm = |n: Int| WRaw(2 * n + 1);
-  let address = |d: StaticDef| WAddress({ name: d.name, tag: 0 });
-  let zeros = |n: Int| range(0, n).map(|_: Int| WRaw(0));
-  let map_head = |n: Int, height: Int|
-    Some({
-      of: b"PlyMapHead",
-      fields: [{ field: b"len", value: n }, { field: b"height", value: height }],
-    });
-  // A node's room is its words past its head: a leaf's 32 pairs of two, a branch's children, keys
-  // and sizes.
-  let node_head = |kind: Int, n: Int|
-    Some({
-      of: b"PlyNodeHead",
-      fields: [
-        { field: b"len", value: n },
-        { field: b"room", value: if kind == 13 { 64 } else { 99 } },
-        { field: b"kind", value: kind },
-      ],
-    });
-  let pairs = |from: Int, to: Int|
-    range(from, to).fold([], |acc: List<StaticWord>, i: Int| acc.push(WRaw(i)).push(WRaw(0 - i)));
-  assert_eq(upto(0).map(|d: StaticDef| d.laid), [
-    SBlock({ head: map_head(0, 0), words: [WRaw(0)] }),
-  ]);
-  let two = upto(2);
-  assert_eq(two.map(|d: StaticDef| d.laid), [
-    SBlock({ head: node_head(13, 2), words: pairs(0, 2).concat(zeros(60)) }),
-    SBlock({ head: map_head(2, 0), words: [address(two.get(0))] }),
-  ]);
-  // A branch holds its children, then each one's greatest key, then how many entries each holds.
-  let over = upto(33);
-  assert_eq(
-    over.get(1).laid,
-    SBlock({ head: node_head(13, 1), words: pairs(32, 33).concat(zeros(62)) }),
-  );
-  assert_eq(
-    over.get(2).laid,
-    SBlock({
-      head: node_head(14, 2),
-      words: [address(over.get(0)), address(over.get(1))].concat(zeros(31)).concat([
-        WRaw(31),
-        WRaw(32),
-      ]).concat(
-        zeros(31),
-      ).concat([imm(32), imm(1)]).concat(
-        zeros(31),
-      ),
-    }),
-  );
-  assert_eq(over.get(3).laid, SBlock({ head: map_head(33, 1), words: [address(over.get(2))] }));
-  // Thirty-four leaves stand under two branches and a root over them.
-  let deep = upto(33 * 32 + 1);
-  assert_eq(deep.len(), 38);
-  match deep.get(36).laid {
-    SBlock(root) -> {
-      assert_eq(root.head, node_head(14, 2));
-      // An `Int` key is its own bits; how many entries lie under each child an immediate.
-      assert_eq(root.words.slice(33, 35), [WRaw(32 * 32 - 1), WRaw(33 * 32)]);
-      assert_eq(root.words.slice(66, 68), [imm(32 * 32), imm(33)])
-    },
-    _ -> panic("a branch laid as no block"),
-  };
-  assert_eq(
-    deep.get(37).laid,
-    SBlock({ head: map_head(33 * 32 + 1, 2), words: [address(deep.get(36))] }),
-  )
-}
-
-test "a kept root answers its value from static data, and its entry hands back the value's word" {
-  let t = sample_ctors();
-  let kept = |ty: Type, k: Known| kept_root(t, Named(b"m.f"), ty, k);
-  // What a kept root's body binds is static data or gathered from it: nothing made, nothing called.
-  let only_statics = |f: Fn|
-    bound_values(f.body).all(|v: Val|
-      match v { Static(_) -> true, Gathered(_) -> true, _ -> false });
-  let last_static = |f: Fn| f.statics.get(f.statics.len() - 1).name;
-  // A scalar is answered as itself, its entry the word a container holds it as.
-  let seven = kept(int_type(), KnownWord(7));
-  assert_eq(seven.kind, Kept(WRaw(7)));
-  assert_eq(seven.body.get(seven.body.len() - 1), Return(AInt(7)));
-  // A list is its static object's address.
-  let list = kept(of(b"List", [int_type()]), KnownList([KnownWord(1)]));
-  assert_eq(list.kind, Kept(WAddress({ name: last_static(list), tag: 0 })));
-  assert(only_statics(list) && bound_values(list.body).contains(Static(last_static(list))), None);
-  // A record is gathered from its fields; its entry hands back the static box of its words.
-  let record = kept(pair(), KnownRecord([KnownWord(5), KnownObject(SStr(b"x"))]));
-  let boxed = named(SBlock({ head: None, words: [WRaw(5), address_of(SStr(b"x"))] }));
-  assert_eq(record.kind, Kept(WAddress({ name: boxed.name, tag: 0 })));
-  assert_eq(record.statics, statics_of(SStr(b"x")).push(boxed));
-  assert(only_statics(record), None);
-  assert_eq(record.conv.answer, held_with(t, pair()));
-  // A sum held in one word as a tagged pointer is its case and its payload; its entry the tagged word.
-  let result = of(b"Result", [string_type(), string_type()]);
-  let err = kept(result, KnownCase({ case: 1, args: [KnownObject(SStr(b"e"))] }));
-  assert_eq(err.kind, Kept(WAddress({ name: name_of(SStr(b"e")), tag: 1 })));
-  assert(only_statics(err), None);
-  // A boxed case is its static box.
-  let more = kept(
-    named_type(b"m.Ints"),
-    KnownCase({ case: 0, args: [KnownWord(2), KnownCase({ case: 1, args: [] })] }),
-  );
-  assert_eq(more.kind, Kept(WAddress({ name: last_static(more), tag: 0 })));
-  assert(only_statics(more), None);
-  // A value its type holds otherwise is refused.
-  assert_eq(
-    handle { kept(pair(), KnownWord(5)).body.len() } with { abort.raise(_) -> 0 - 1 },
-    0 - 1,
-  )
 }

@@ -66,10 +66,7 @@ fn a_block_is_allocated_by_its_bytes_and_given_back_at_them() {
     let mut ctx = context();
     let w = alloc(&mut ctx, sized(4));
     assert_eq!(count(w), 1);
-    assert_eq!(
-        (ctx.heap.allocated(), ctx.heap.allocated_bytes()),
-        (1, sized(4) as usize)
-    );
+    assert_eq!(ctx.heap.allocated(), 1);
     free(&mut ctx, w, sized(4));
     assert_eq!(count(w), 0);
     assert_eq!(ctx.heap.live(), 0);

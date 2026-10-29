@@ -4,8 +4,11 @@
 //! command's own.
 
 import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
+import surface
 import surface (range_of)
+import compiler.cc
 import compiler.check.resolve.tables (Diag, Label)
+import compiler.unit (entered_timeout_ms)
 import compiler.front.rows (Dump, EmitterRoot, ModuleSpan)
 import compiler.syntax.parsing (no_module)
 import diagnostic (Place, Raised, diag_of, noted, shown)
@@ -55,8 +58,6 @@ pub type SimulationOptions = {
 pub type TraceOptions = { sink: String, level: String }
 
 pub type Options = {
-  /// `--json`: stdout is the one document's, so the entry's own lines go to stderr.
-  json: Bool,
   tls: List<TlsCredential>,
   trust: List<String>,
   /// The `--tls` credentials whose listeners require a client certificate.
@@ -69,11 +70,10 @@ pub type Options = {
   trace: TraceOptions,
   drain_ms: Int,
   drain_lead_ms: Int,
-  steps: Int,
   timeout: Int,
   /// The one interleaving a run's `simulate` regions take.
   seed: Option<Seed>,
-  profile: String,
+  profile: cc::Profile,
   argv: List<String>,
 }
 
@@ -82,7 +82,6 @@ pub type Options = {
 /// second copy of the defaults, and the CLI's own parse below spreads over it.
 pub fn default_options() -> Options =
   {
-    json: false,
     tls: [],
     trust: [],
     mtls: [],
@@ -93,10 +92,9 @@ pub fn default_options() -> Options =
     trace: { sink: "json", level: "info" },
     drain_ms: 30000,
     drain_lead_ms: 0,
-    steps: 0,
     timeout: 0,
     seed: None,
-    profile: "development",
+    profile: cc::development(),
     argv: [],
   }
 
@@ -107,6 +105,11 @@ pub effect set Entering = {entering::machine.open, entering::machine.bind, enter
 
 /// How deeply an entry's calls may nest.
 pub fn max_calls() -> Int = 10000
+
+/// The run a check enters a definition under before anything runs: bound to no host, and stopped
+/// by the clock past `entered_timeout_ms`.
+pub fn evaluation_run() -> entering::Run =
+  { ..entering::unbounded(max_calls()), timeout_ms: entered_timeout_ms() }
 
 /// A root or a program a run is lent, as `std.machine` names one.
 pub fn lent(n: Named) -> entering::Named = { name: n.name, path: n.path }
@@ -121,14 +124,16 @@ pub type Drain = { lead_ms: Int, drain_ms: Int }
 
 /// What `ply run` lends the program it runs: its roots, its programs, its command line, its
 /// credentials, its configuration, its sink, the families `--allow` names, and its `stop`.
-pub fn run_grants(o: Options, config: Configured, stop: Stop) -> entering::Grants =
+/// `stderr` sends the program's own lines to stderr, as `--json` asks, since stdout is then the
+/// one document's.
+pub fn run_grants(o: Options, config: Configured, stop: Stop, stderr: Bool) -> entering::Grants =
   {
     ..entering::no_grants(),
     fs: o.fs.map(lent),
     exec: o.exec.map(lent),
     allow: o.allow,
     argv: Some(o.argv),
-    stderr: o.json,
+    stderr: stderr,
     given: given_of(o.tls, o.trust, o.mtls, config).push({
       name: "trace",
       fields: [o.trace.sink, o.trace.level],
@@ -193,6 +198,10 @@ pub fn arguments_of(values: List<Value>) -> Bytes =
 /// A runtime diagnostic's codes that say Ply failed rather than the program: a test that ends with
 /// one is `panicked`, and a claim's point says nothing.
 pub fn is_defect(code: Bytes) -> Bool = code == b"E0505" || code == b"E0415"
+
+/// Whether a runtime diagnostic's code says the clock stopped the run, which decides nothing about
+/// the program.
+pub fn is_abandoned(code: Bytes) -> Bool = code == b"W0612"
 
 /// `f` as a report renders it: each site placed in the module its root is written in, at an offset
 /// from where that root's definition starts. A raise with no place says what failed and not what
@@ -348,8 +357,8 @@ test "the flags name the search a run keys its seeded tests on" {
 }
 
 test "the defaults are one record" {
-  assert_eq(default_options().profile, "development");
-  assert_eq(default_options().steps, 0);
+  assert_eq(default_options().profile, cc::development());
+  assert_eq(default_options().timeout, 0);
   assert_eq(default_options().drain_ms, 30000);
   assert_eq(default_options().trace.level, "info")
 }
@@ -359,6 +368,7 @@ test "a run is lent what its flags name, and the stop it meets a signal with" {
     { ..default_options(), allow: ["shipped"], argv: ["a"] },
     unconfigured(),
     Unheard,
+    false,
   );
   assert_eq(quiet.argv, Some(["a"]));
   assert_eq(quiet.allow, ["shipped"]);
@@ -373,6 +383,7 @@ test "a run is lent what its flags name, and the stop it meets a signal with" {
     },
     { values: [{ key: "port", value: "80", secret: false }], schema: None, opened: true },
     Drains,
+    false,
   );
   assert_eq(serving.fs, [{ name: "cwd", path: "." }]);
   assert_eq(serving.given.map(|g: entering::Given| g.name), [
@@ -383,8 +394,17 @@ test "a run is lent what its flags name, and the stop it meets a signal with" {
     "drain",
   ]);
   assert_eq(serving.given.at(4), Some({ name: "drain", fields: ["250", "30000"] }));
-  let starting = run_grants(default_options(), unconfigured(), Ends);
-  assert_eq(starting.given.at(1), Some({ name: "end", fields: [] }))
+  let starting = run_grants(default_options(), unconfigured(), Ends, true);
+  assert_eq(starting.given.at(1), Some({ name: "end", fields: [] }));
+  assert(starting.stderr && !quiet.stderr)
+}
+
+test "`--config-schema` reaches the configuration, for a build as for a run" {
+  assert_eq(config_of(surface::parsed(["build", "--config-schema=m.spec"])).schema, Some("m.spec"));
+  assert_eq(
+    options_from(surface::parsed(["run", "--config-schema=m.spec"])).config.schema,
+    Some("m.spec"),
+  )
 }
 test "a failure's sites are placed at their roots, and an unplaced raise names its entry" {
   let roots = Map::new().insert(b"m.f", { module: 0, start: 100, end: 120 });
@@ -579,32 +599,30 @@ fn cut_pair(text: String) -> Option<(String, String)> / {abort.raise} =
 fn split_once(text: String, sep: String) -> Option<(String, String)> / {abort.raise} =
   match text.split_once(sep) { Some(cut) -> Some((cut.head, cut.tail)), None -> None }
 
+/// `--set`, `--config` and `--config-schema`.
+pub fn config_of(p: Parsed) -> ConfigOptions =
+  { set: values_of(p, "set"), files: values_of(p, "config"), schema: value(p, "config-schema") }
+
 /// The whole options record, from the parsed line. Each command reads the subset its flags cover;
 /// the parser already refused a flag the command does not take.
 pub fn options_from(p: Parsed) -> Options / {abort.raise} =
   {
     ..default_options(),
-    json: has(p, "json"),
     tls: creds(p),
     trust: values_of(p, "trust"),
     mtls: values_of(p, "mtls"),
     fs: named_paths(p, "fs"),
     exec: named_paths(p, "exec"),
     allow: values_of(p, "allow"),
-    config: {
-      set: values_of(p, "set"),
-      files: values_of(p, "config"),
-      schema: opt_text(p, "config-schema"),
-    },
+    config: config_of(p),
     trace: {
       sink: match value(p, "trace") { Some(s) -> s, None -> default_options().trace.sink },
       level: match value(p, "trace-level") { Some(l) -> l, None -> default_options().trace.level },
     },
     drain_ms: int_of(p, "drain-ms", default_options().drain_ms),
     drain_lead_ms: int_of(p, "drain-lead-ms", default_options().drain_lead_ms),
-    steps: int_of(p, "steps", default_options().steps),
     timeout: int_of(p, "timeout", default_options().timeout),
     seed: match opt_text(p, "seed") { Some(text) -> plan::parse_seed(text), None -> None },
-    profile: match value(p, "profile") { Some(pr) -> pr, None -> default_options().profile },
+    profile: surface::profile_of(p),
     argv: p.argv,
   }

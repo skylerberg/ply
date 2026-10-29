@@ -2,10 +2,10 @@
 //! command raised it, painted or plain — the heading, one block per label it can place, the notes.
 
 import compiler.check.resolve.tables (Diag, Label, Fix, Edit)
-import std.json (Json, Object, Null, Str, Bool, Number, Array, object)
+import std.json (Json, Member, Object, Null, Str, Bool, Number, Array, object)
 import compiler.syntax.lexer
 import std.bytes
-import std.value (Value, VBytes, VInt, filled, render)
+import std.value (Value, VBytes, VInt, VList, filled, render, render_all, shown_characters)
 import std.term (Style, plain, dim, red, yellow, ansi)
 import std.list (somes)
 import std.string
@@ -14,7 +14,8 @@ import compiler.syntax.parsing (no_module)
 /// A module the label indices point into: the program's files, then the shipped modules it pulled.
 pub type Place = { path: String, text: Bytes }
 
-/// A diagnostic the runtime raised, beside the values its text names; only `shown` reads it.
+/// A diagnostic the runtime raised, beside the values its text names: `shown` writes them into its
+/// text, and `raised_json` beside it whole.
 pub type Raised = { diag: Diag, values: List<Value> }
 
 /// The diagnostic with each value it names rendered in place.
@@ -148,7 +149,18 @@ fn fix_json(places: List<Place>, f: Fix) -> Json / {abort.raise} =
   ])
 
 pub fn to_json(diag: Diag, places: List<Place>) -> Json / {abort.raise} =
-  object([
+  object(members(diag, places))
+
+/// The diagnostic as `to_json` writes it once `shown`, with `values`: each value its text names, by
+/// slot, written whole where the text may show it cut.
+pub fn raised_json(raised: Raised, places: List<Place>) -> Json / {abort.raise} =
+  object(members(shown(raised), places).push({ key: "values", value: values_json(raised.values) }))
+
+/// Each value as `render_all` writes it, in order.
+pub fn values_json(values: List<Value>) -> Json = Array(values.map(|v: Value| Str(render_all(v))))
+
+fn members(diag: Diag, places: List<Place>) -> List<Member> / {abort.raise} =
+  [
     { key: "severity", value: Str(String::of_bytes_lossy(diag.severity)) },
     { key: "code", value: Str(String::of_bytes_lossy(diag.code)) },
     { key: "message", value: Str(String::of_bytes_lossy(diag.message)) },
@@ -158,7 +170,7 @@ pub fn to_json(diag: Diag, places: List<Place>) -> Json / {abort.raise} =
     },
     { key: "notes", value: Array(diag.notes_text.map(|n: Bytes| Str(String::of_bytes_lossy(n)))) },
     { key: "fixes", value: Array(diag.fixes.map(|f: Fix| fix_json(places, f))) },
-  ])
+  ]
 
 pub fn all_to_json(diags: List<Diag>, places: List<Place>) -> Json / {abort.raise} =
   Array(diags.map(|diag: Diag| to_json(diag, places)))
@@ -465,16 +477,30 @@ test "a raise's values are rendered into its message, notes and labels" {
   assert_eq(d.message, b"found 7")
 }
 
+test "a raise's JSON carries each value its text names whole, beside the text that shows it cut" {
+  let slot = String::of_bytes(b"\x010\x02");
+  let long = VList(range(0, shown_characters()).map(|i: Int| VInt(i)));
+  let raised = {
+    diag: a_diag_of(b"error", b"E0501", Bytes::of_string("found " ++ slot), [], [], []),
+    values: [long],
+  };
+  match raised_json(raised, one_place()) {
+    Object(m) -> {
+      assert_eq(m.get("values"), Some(Array([Str(render_all(long))])));
+      assert_eq(Object(m.remove("values")), to_json(shown(raised), one_place()))
+    },
+    _ -> panic("a diagnostic renders as an object"),
+  };
+  assert(render(long) != render_all(long))
+}
+
 // The rendered text of any byte is a byte literal the lexer reads back to that byte.
 test "every byte a value renders lexes back to the byte it came from" {
   let all = Bytes::concat_all(range(0, 256).map(|i: Int| byte_of_int(i)));
-  let chunks = range(0, 8).map(|c: Int| all.slice(c * 32, c * 32 + 32));
-  let back = chunks.map(|chunk: Bytes| {
-    let dump = lexer::dump(Bytes::of_string(render(VBytes(chunk))));
-    match dump.split(";") {
-      [first, ..] -> match first.split(":") { [_, _, kind, hex] -> kind ++ ":" ++ hex, _ -> first },
-      [] -> dump,
-    }
-  });
-  assert_eq(back, chunks.map(|chunk: Bytes| "b:" ++ chunk.hex_of()))
+  let dump = lexer::dump(Bytes::of_string(render_all(VBytes(all))));
+  let first = match dump.split(";") {
+    [first, ..] -> match first.split(":") { [_, _, kind, hex] -> kind ++ ":" ++ hex, _ -> first },
+    [] -> dump,
+  };
+  assert_eq(first, "b:" ++ all.hex_of())
 }

@@ -1,9 +1,9 @@
 //! `std.fs`'s natives: each operation on a path under the root its label names, or on a file a
 //! run holds open there, a job of the run's on the filing pool, and confined to its root there.
-//! Each answers what `ply_host::fs` writes of it. A read is no function of its arguments, and
-//! asking twice may answer otherwise, so every one is asked as a write.
+//! Each answers what `ply_host::fs` writes of it. A read is no function of its arguments: asking
+//! twice may answer otherwise.
 
-use super::{WRITES, asked, from_host, handed, text_at};
+use super::{Nondeterministic, asked, from_host, handed, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64};
@@ -24,7 +24,7 @@ fn filed(
     (pp, pn): (Addr, I64),
     second: impl FnOnce(&mut Ctx) -> Option<Second>,
 ) -> I64 {
-    asked(ctx, native, WRITES, I64(0), |c| {
+    asked(ctx, native, Nondeterministic, I64(0), |c| {
         let (Some(label), Some(path)) = (text_at(c, lp, ln), text_at(c, pp, pn)) else {
             return I64(0);
         };
@@ -46,7 +46,7 @@ fn filed(
 
 /// The ticket of `chunk` asked of the file `file` names under the root the label at `lp` names.
 fn on_file(ctx: *mut Ctx, native: &'static str, lp: Addr, ln: I64, file: I64, chunk: Chunk) -> I64 {
-    asked(ctx, native, WRITES, I64(0), |c| {
+    asked(ctx, native, Nondeterministic, I64(0), |c| {
         let Some(label) = text_at(c, lp, ln) else {
             return I64(0);
         };
@@ -481,11 +481,17 @@ pub unsafe extern "C" fn rt_fs_read_secret(
 
 /// The secret the run keeps under `number`, which it no longer keeps.
 pub unsafe extern "C" fn rt_fs_secret_taken(ctx: *mut Ctx, number: I64) -> SecretHandle {
-    asked(ctx, "fs_secret_taken", WRITES, SecretHandle::of(0), |c| {
-        let kept = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
-        match handed(c, "fs_secret_taken", "a secret's number", kept) {
-            Some(kept) => secret::sealed(c, false, kept),
-            None => SecretHandle::of(0),
-        }
-    })
+    asked(
+        ctx,
+        "fs_secret_taken",
+        Nondeterministic,
+        SecretHandle::of(0),
+        |c| {
+            let kept = from_host(c, |facilities| facilities.run().take_secret(number.0)).flatten();
+            match handed(c, "fs_secret_taken", "a secret's number", kept) {
+                Some(kept) => secret::sealed(c, false, kept),
+                None => SecretHandle::of(0),
+            }
+        },
+    )
 }

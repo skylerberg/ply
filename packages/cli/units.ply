@@ -3,16 +3,15 @@
 //! C is assembled over all of them and compiled here into a library: the runtime is handed the
 //! library and compiles nothing.
 
-import compiler.front.rows (BakedRow)
 import compiler.load (every_root, LoadedAnalysis)
 import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Baked, Emission, Made, shipped, shipped_runtime, answers_store, baked_key,
-                      emitted, emitter_identity, held)
+import compiler.unit (Emission, Made, shipped, shipped_runtime, answers_store, emitted,
+                      emitter_identity, held)
 import compiler.store.kept (Record, kept_records, with_kept)
-import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text)
+import compiler.emit.keys (RootKey)
 import std.env (env)
 import sources
 import std.fs (fs)
@@ -30,9 +29,9 @@ pub type Emitted = { text: Bytes, made: Made }
 /// deterministic one, whatever the answering keeps.
 pub effect emit {
   read unit(front: LoadedAnalysis, offered: List<RootKey>) -> Result<Emitted, List<Diag>>
-  /// The library `text`, a unit's C, compiles into under `profile`, `development` or `release`:
-  /// its path, which the runtime opens.
-  read compiled(text: Bytes, profile: String) -> Result<String, List<Diag>>
+  /// The library `text`, a unit's C, compiles into under `profile`: its path, which the runtime
+  /// opens.
+  read compiled(text: Bytes, profile: cc::Profile) -> Result<String, List<Diag>>
 }
 
 fn emitted_of(
@@ -78,28 +77,6 @@ fn told(
     },
   }
 
-// --- What a build kept of a `const` definition -----------------------------------
-
-/// The values kept of the `const` definitions among `wanted`, read through `read`. One with none
-/// kept is left to its body, which answers the same: a build keeps each before anything runs, and a
-/// program no build kept the values of, a mutant among them, runs without.
-fn kept_values<| e>(
-  rows: List<BakedRow>,
-  wanted: List<RootKey>,
-  read: (Bytes) -> Option<Bytes> / e,
-) -> List<Baked> / e =
-  if rows.len() == 0 { [] } else {
-    let offered = wanted.fold(Map::new(), |acc: Map<RootName, Bool>, k: RootKey|
-      acc.insert(root_name(k), true));
-    rows.fold([], |acc: List<Baked>, row: BakedRow|
-      if !offered.contains(root_name(Named(row.name))) { acc } else {
-        match read(baked_key(row.hash)) {
-          Some(bytes) -> acc.push({ name: row.name, bytes: bytes }),
-          None -> acc,
-        }
-      })
-  }
-
 /// The unit over `offered`, its C as the runtime compiles it, with the emitter's answers kept under
 /// the toolchain's cache.
 fn unit_of(
@@ -109,19 +86,16 @@ fn unit_of(
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped_runtime();
   let started = time.elapsed_ms();
-  let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), || {
-    let read = |key: Bytes| kept_records.get[ans](key);
+  let emission = with_kept[abs, ans](answers_store(kept_dir(), runtime, identity), ||
     emitted(
       runtime,
       front.dump,
       texts(front),
       front.inputs,
       offered,
-      read,
+      |key: Bytes| kept_records.get[ans](key),
       |rs: List<Record>| kept_records.put[ans](rs),
-      kept_values(front.dump.baked, offered, read),
-    )
-  });
+    ));
   told(emission, identity, time.elapsed_ms() - started);
   emitted_of(front, emission)
 }
@@ -144,7 +118,7 @@ pub fn whole(front: LoadedAnalysis) -> Result<Bytes, List<Diag>> / {emit.unit, a
 pub fn wanted(
   front: LoadedAnalysis,
   build: Bool,
-  profile: String,
+  profile: cc::Profile,
 ) -> Result<Option<String>, List<Diag>> / {emit.unit, emit.compiled, abort.raise} =
   if !build { Ok(None) } else {
     match whole(front) {
@@ -156,7 +130,7 @@ pub fn wanted(
 /// The library `text` compiles into under `profile`, where there is a text.
 pub fn library_of(
   text: Option<Bytes>,
-  profile: String,
+  profile: cc::Profile,
 ) -> Result<Option<String>, List<Diag>> / {emit.compiled} =
   match text {
     None -> Ok(None),
@@ -176,39 +150,26 @@ pub fn emitting<a | e>(
   }
 
 /// The library a unit's text compiles into under `profile`.
-pub fn library(
-  text: Bytes,
-  profile: String = "development",
-) -> Result<String, List<Diag>> / {emit.compiled} = emit.compiled(text, profile)
+pub fn library(text: Bytes, profile: cc::Profile) -> Result<String, List<Diag>> / {emit.compiled} =
+  emit.compiled(text, profile)
 
 /// The library an emitted unit compiles into under `profile`.
 pub fn library_over(
   r: Result<Emitted, List<Diag>>,
-  profile: String = "development",
+  profile: cc::Profile,
 ) -> Result<String, List<Diag>> / {emit.compiled} =
   match r { Ok(e) -> library(e.text, profile), Err(diags) -> Err(diags) }
 
 // --- Compiling a unit ---------------------------------------------------------------
 
-/// The profile a unit compiles under, and whether tcc compiles it. `PLY_C_PROFILE` overrides the
-/// `--profile` flag, and `PLY_CC_OPT` sets the optimisation level. tcc is used only where it compiles
-/// for x86-64 Linux. Elsewhere it cannot build a library that works: its arm64 calls reach only
-/// 128 MB, and on macOS dyld misreads the exports it writes. `PLY_CC` names the program to run as
-/// `cc`, whatever the profile.
-fn chosen(
-  profile: String,
-) -> { tcc: Bool, profile: cc::Profile } / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
-  let named = cc::profile_named(match env.variable("PLY_C_PROFILE") {
-    Some(p) -> p,
-    None -> profile,
-  });
-  let p = match env.variable("PLY_CC_OPT") { Some(o) -> { ..named, unit: o }, None -> named };
-  {
-    tcc: p.tcc && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
-      && cc::targets_x86_64_linux[tcc](),
-    profile: p,
-  }
-}
+/// Whether tcc compiles a unit under `profile`. Only where it compiles for x86-64 Linux: elsewhere
+/// it cannot build a library that works, since its arm64 calls reach only 128 MB and on macOS dyld
+/// misreads the exports it writes. Where `PLY_CC` names a compiler, every unit is compiled with it.
+fn by_tcc(
+  profile: cc::Profile,
+) -> Bool / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} =
+  profile.tcc && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
+    && cc::targets_x86_64_linux[tcc]()
 
 fn unbuildable(why: String) -> Diag =
   error_at(b"E0450", no_module(), dummy_span(), Bytes::of_string(why), b"", [
@@ -219,10 +180,9 @@ fn unbuildable(why: String) -> Diag =
 /// before, and a link where the cache holds none of them together.
 fn compiled_of(
   text: Bytes,
-  profile: String,
+  profile: cc::Profile,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
-  let choice = chosen(profile);
-  let built = if choice.tcc { cc::library[tcc](choice.profile, text) }
-  else { cc::library[cc](choice.profile, text) };
+  let built = if by_tcc(profile) { cc::library[tcc](profile, text) }
+  else { cc::library[cc](profile, text) };
   match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
 }

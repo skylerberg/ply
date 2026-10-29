@@ -3,7 +3,8 @@
 //! variable of its own type; every count is an instruction, which the ownership pass alone writes.
 //! Blocks nest only in `If`, `Case`, `Match`, `Loop` and `Handle`.
 
-import compiler.check.types (Type, TyCon, TyFn, int_type, row_empty)
+import compiler.check.known (none_ctor, some_ctor)
+import compiler.check.types (Type, TyFn, int_type, row_empty, string_type)
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.patterns (Lit, LUnit, LStr)
@@ -16,7 +17,7 @@ import compiler.emit.layout (SumLaid, LSum, LWords, P, R, WordIs, WordOutside, N
 import compiler.emit.tir.handling (HandleOp, HandleSite, WordsLaid, Label, instance_alone)
 import compiler.emit.tir.containers (ContainerOp)
 import compiler.emit.tir.calling (CallingOp)
-import compiler.emit.tir.statics (StaticDef, StaticWord)
+import compiler.emit.tir.statics (StaticDef)
 import compiler.emit.tir.strings (StringOp, StringArg, TakesBlock, OwnBlock, string_args,
                                   string_answer)
 
@@ -69,6 +70,15 @@ pub type FieldSet = { at: Int, ty: Type, arg: Arg }
 /// Whether a callee consumes what a parameter is handed or only reads it while the call runs.
 pub type Handed = | Given | Lent
 
+/// A variable a loop carries from pass to pass, `init` on the first.
+pub type Carried = { var: Var, init: Arg }
+
+/// The variables `state` carries.
+pub fn carried_vars(state: List<Carried>) -> List<Var> = state.map(|c: Carried| c.var)
+
+/// What `state` starts from.
+pub fn carried_inits(state: List<Carried>) -> List<Arg> = state.map(|c: Carried| c.init)
+
 /// How a root hands back its answer: with a count of its own the caller takes (`Owned`), or read
 /// out of the lent parameters it lists, by place, without one (`Borrowed`), valid while the caller
 /// holds what it lent them. `whole` is where the answer may be the argument itself rather than a
@@ -79,13 +89,44 @@ pub type Returned = | Owned | Borrowed(List<{ param: Int, whole: Bool }>)
 /// lying in place and takes one more C parameter, its destination: given a place's header address,
 /// an owned answer is written there, its counts the place's, and the root answers that address;
 /// given zero, it answers a box of its own. A borrowed answer is never given one.
-pub type Convention = {
-  params: List<Handed>,
-  reps: List<Rep>,
-  answer: Rep,
-  destined: Bool,
-  answered: Returned,
-}
+pub type Convention = { params: List<ParamTaking>, answer: Rep, destined: Bool, answered: Returned }
+
+/// How a root takes one parameter: handed over or lent, and held as `rep`.
+pub type ParamTaking = { handed: Handed, rep: Rep }
+
+/// How each parameter of `c` is held.
+pub fn reps_of(c: Convention) -> List<Rep> = c.params.map(|p: ParamTaking| p.rep)
+
+/// Whether each parameter of `c` is handed over or lent.
+pub fn handed_of(c: Convention) -> List<Handed> = c.params.map(|p: ParamTaking| p.handed)
+
+/// Parameters held as `reps`, each handed over.
+pub fn all_given(reps: List<Rep>) -> List<ParamTaking> =
+  reps.map(|r: Rep| { handed: Given, rep: r })
+
+/// How parameter `i` of `c` is held, where `c` has one.
+pub fn param_rep(c: Convention, i: Int) -> Option<Rep> =
+  match c.params.at(i) { Some(p) -> Some(p.rep), None -> None }
+
+/// Whether `c` is lent parameter `i`.
+pub fn param_lent(c: Convention, i: Int) -> Bool =
+  match c.params.at(i) { Some(p) -> p.handed == Lent, None -> false }
+
+/// `c` taking its first parameters as `handed` says, one for one, and the rest as it did.
+pub fn handed_at(c: Convention, handed: List<Handed>) -> Convention =
+  {
+    ..c,
+    params: c.params.fold([], |acc: List<ParamTaking>, p: ParamTaking|
+      acc.push(match handed.at(acc.len()) { Some(h) -> { ..p, handed: h }, None -> p })),
+  }
+
+/// Parameters held as `reps`, each lent where `lent` holds its place and handed over otherwise.
+pub fn lent_where(reps: List<Rep>, lent: List<Int>) -> List<ParamTaking> =
+  range(0, reps.len()).fold([], |acc: List<ParamTaking>, i: Int|
+    match reps.at(i) {
+      Some(r) -> acc.push({ handed: if lent.contains(i) { Lent } else { Given }, rep: r }),
+      None -> acc,
+    })
 
 /// What an operation does with each operand (`takes`), whether it answers a count of its own,
 /// whether it can fail, and whether it can stop for a handler that may resume it later.
@@ -212,7 +253,7 @@ pub type Inst =
   /// at this miss; every miss of one arm holds the same.
   | Miss
   /// A loop over `state`, rebound by each `Next` in `body`, left with an answer by `Done`.
-  | Loop({ state: List<Var>, init: List<Arg>, body: Block, answer: Var })
+  | Loop({ state: List<Carried>, body: Block, answer: Var })
   | Next(List<Arg>)
   | Done(Arg)
   | Return(Arg)
@@ -263,14 +304,11 @@ pub type Failure = | NoArm | NoLet
 /// where its definition's text starts, which they count from.
 pub type Lender = { root: RootKey, base: Int }
 
-/// Whether a function is a root a program calls, counting its steps and testing for failure, or
-/// a plain one the emitter writes for a type (a drop, share, keep or copy root) or as the closure a
-/// name read as a value is, which does neither but still grows its stack; or a definition
-/// answering a value a build kept, laid out as
-/// static data, which counts no step and whose entry hands back that value's word form, this word,
-/// so a read of it neither steps nor allocates; or a root crossing values to and from the runtime,
-/// which tests for failure as a root does but counts no step, since a program's steps are its own.
-pub type FnKind = | Rooted | Plain | Kept(StaticWord) | Crossing
+/// Whether a function is a root, which spends fuel and tests for failure: the program's own, an
+/// entry, or a type's lowering or lifting; or a plain one the emitter writes for a type (a drop,
+/// share, keep or copy root) or as the closure a name read as a value is, which does neither but
+/// still grows its stack.
+pub type FnKind = | Rooted | Plain
 
 /// What a root tells the unit beyond its C: its calls of generic definitions, numbered as their
 /// `Generic(n)` callees are, what a specialisation would read of each type variable it took a slow
@@ -329,14 +367,12 @@ pub type Lambda = | Closure({ body: Fn, captures: Int, at: Span, words: ClosureW
 
 /// The evidence words a closure's function takes past its own parameters, as the lambda's own row
 /// says, which the closure's entry by its type reads off the words its caller hands: the name of
-/// the static descriptor of that row, how many words, how many of its captures are the labels it was
-/// made with and how many, one word each, the closure holds after them, and which of those labels
-/// each word of a label the row leaves to its caller reads.
-pub type ClosureWords = { described: Bytes, count: Int, labels: Int, held: Int, left: List<Int> }
+/// the static descriptor of that row, how many words, and for each word of a label the row leaves
+/// to its caller, the place among the closure's captures of the label it was made with.
+pub type ClosureWords = { described: Bytes, count: Int, left: List<Int> }
 
 /// What a closure of a row taking no word takes.
-pub fn no_closure_words() -> ClosureWords =
-  { described: b"", count: 0, labels: 0, held: 0, left: [] }
+pub fn no_closure_words() -> ClosureWords = { described: b"", count: 0, left: [] }
 
 /// How a value held as `r` is held, as a fault names it.
 pub fn rep_said(r: Rep) -> Bytes =
@@ -491,10 +527,7 @@ pub fn word_record(v: Var) -> Bool =
 
 fn handed(args: List<Arg>, conv: Convention) -> List<{ arg: Arg, takes: Bool }> =
   range(0, args.len()).fold([], |acc: List<{ arg: Arg, takes: Bool }>, i: Int|
-    match args.at(i) {
-      Some(a) -> acc.push({ arg: a, takes: conv.params.at(i) != Some(Lent) }),
-      None -> acc,
-    })
+    match args.at(i) { Some(a) -> acc.push({ arg: a, takes: !param_lent(conv, i) }), None -> acc })
 
 /// The `uses` an operation over bytes is written with, as `strings.string_args` and
 /// `string_answer` say: it takes only the block it grows, answers a count of its own only where it
@@ -573,7 +606,7 @@ pub fn fails(v: Val) -> Bool =
     Unsettled(_) -> false,
   }
 
-/// Whether `val` may stop for a handler that can resume it more than once.
+/// Whether `val` may stop for a handler that resumes it later.
 pub fn stops_at(val: Val) -> Bool =
   match val {
     Call(c) -> c.stops,
@@ -664,10 +697,9 @@ test "a word, a view and a flat value with a counted leaf hold a count where a s
 }
 
 test "each operation consumes or borrows each operand as its signature says" {
-  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let s = { id: 1, ty: string_type(), rep: RWord };
   let conv = {
-    params: [Given, Lent],
-    reps: [RWord, RWord],
+    params: [{ handed: Given, rep: RWord }, { handed: Lent, rep: RWord }],
     answer: RInt,
     destined: false,
     answered: Owned,
@@ -740,7 +772,7 @@ test "what can fail is what tests the runtime: a checked operator, a call, never
   assert_eq(fails(Prim({ op: b"add", on: RFloat, args: [AFloat(0), AFloat(0)] })), false);
   assert_eq(fails(Prim({ op: b"add", on: RDec, args: [AZero(RDec), AZero(RDec)] })), true);
   assert_eq(fails(Prim({ op: b"of_int", on: RInt, args: [AInt(300)] })), true);
-  let w = { id: 2, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let w = { id: 2, ty: string_type(), rep: RWord };
   assert_eq(fails(Get({ of: w, path: PLeaf(0) })), false);
   let flat = { ..w, rep: RFlat([{ name: b"x", rep: RInt }]) };
   assert_eq(fails(Pack({ arg: AInt(7), to: RWord })), false);
@@ -766,7 +798,7 @@ test "a call stops where it says, a block where something it holds does, a handl
     Call({
       callee: Generic(0),
       args: [],
-      conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
+      conv: { params: [], answer: RWord, destined: false, answered: Owned },
       stops: stops,
     });
   let calling = |stops: Bool| [Do({ val: call(stops), at: dummy_span(), unwind: [] })];
@@ -803,7 +835,10 @@ test "a sum is one part of the form, counted through its cases, and a last-holde
     test: WordOutside({ at: 0, values: [0] }),
     payload: Inline({ offset: 0, laid: LWords([P]), stripped: None }),
   };
-  let maybe = RSum({ laid: { classes: [P], cases: [none, pointer] }, cases: [b"None", b"Some"] });
+  let maybe = RSum({
+    laid: { classes: [P], cases: [none, pointer] },
+    cases: [none_ctor(), some_ctor()],
+  });
   let flags = RSum({
     laid: {
       classes: [R({ lo: 0, hi: 1 })],
@@ -817,14 +852,14 @@ test "a sum is one part of the form, counted through its cases, and a last-holde
     maybe,
     RInt,
   ]);
-  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let s = { id: 1, ty: string_type(), rep: RWord };
   assert_eq(operands(LastOf(s)).map(|o: { arg: Arg, takes: Bool }| o.takes), [true]);
   assert_eq(answered(LastOf(s)), Owns);
   assert_eq(fails(LastOf(s)), false)
 }
 
 test "a walk takes what it copies and borrows what it shares or keeps, and a share answers no count" {
-  let s = { id: 1, ty: TyCon({ name: b"String", args: [] }), rep: RWord };
+  let s = { id: 1, ty: string_type(), rep: RWord };
   let walked = [Copy, Share, Keep].map(|op: TypeOp| Walked({ of: s, op: op }));
   assert_eq(walked.map(|v: Val| operands(v).map(|o: { arg: Arg, takes: Bool }| o.takes)), [
     [true],

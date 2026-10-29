@@ -1,277 +1,14 @@
 //! `std.db`'s TLS, notifications and copies, against a real server.
 
-import harness (Here, Shipped, Spawned, Wire, Loaded, ended, loaded, serving, unloaded, working,
-                write)
+import harness (Here, Wire, ended, serving, working, write)
 import postgres
-import postgres (Cluster, Postgres, done, over)
-import cli.machine (default_options)
+import postgres (Cluster, Postgres, over)
 import std.certgen (certgen)
-import std.machine as entering
 import std.process (process)
 import std.string
 import std.time (time)
 
-effect set Driving = {entering::machine.open, entering::machine.bind, entering::machine.enter, entering::machine.unbind, entering::machine.close}
-
 fn wired() -> String =
-  \\import std.net (net)
-  \\import std.random (entropy)
-  \\import std.seq
-  \\import std.string
-  \\import std.db
-  \\import std.sql
-  \\import std.db (db, with_server, transaction, copy_into, copy_from, ReadCommitted, ReadWrite, Notice, Notified, Reconnected, Unheard, Quiet)
-  \\import std.sql (stmt, PInt, PText, PNull, PBytes, PArray, PNumeric, CInt, Rows, Count, Failed, Row, DbError)
-  \\import std.seq (Seq, seq)
-  \\
-  \\effect set Wire = {net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next}
-  \\
-  \\fn served(answered: Result<Result<String, String>, String>) -> Result<String, String> =
-  \\  match answered { Err(why) -> Err(why), Ok(inner) -> inner }
-  \\
-  \\fn failure(e: DbError) -> String = e.code ++ ": " ++ e.detail
-  \\
-  \\fn number(rows: List<Row>) -> String =
-  \\  match rows {
-  \\    [row, ..] -> match row.get("n") { Some(CInt(n)) -> n.to_string(), _ -> "not a number" },
-  \\    [] -> "no row",
-  \\  }
-  \\
-  \\// How many of the server's sessions are encrypted, asked over a connection the URL secures.
-  \\pub fn encrypted(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
-  \\  served(with_server(url, 1, ||
-  \\    match db.query[pg_stat_ssl](stmt("select count(*) as n from pg_stat_ssl where ssl"), []) {
-  \\      Failed(e) -> Err(failure(e)),
-  \\      Count(_) -> Err("a count where rows were due"),
-  \\      Rows(rows) -> Ok(number(rows)),
-  \\    }))
-  \\
-  \\fn shown(n: Notice) -> String =
-  \\  match n {
-  \\    Notified(note) -> note.channel ++ ":" ++ note.payload,
-  \\    Reconnected -> "reconnected",
-  \\    Unheard(e) -> "unheard " ++ e.code,
-  \\    Quiet -> "quiet",
-  \\  }
-  \\
-  \\fn kept(r: Result<String, db::Rollback>) -> String = match r { Ok(s) -> s, Err(rolled) -> rolled.reason }
-  \\
-  \\// A notification is heard once its transaction commits, once however often it was sent there, never
-  \\// when the transaction rolls back, at once outside one, and not once its channel is let go.
-  \\pub fn notices(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
-  \\  with_server(url, 2, || {
-  \\    db.listen[jobs]();
-  \\    let inside = kept(transaction(ReadCommitted, ReadWrite, || {
-  \\      db.notify[jobs]("one");
-  \\      db.notify[jobs]("one");
-  \\      shown(db.notified(300))
-  \\    }));
-  \\    let committed = shown(db.notified(10000));
-  \\    let once = shown(db.notified(300));
-  \\    let rolled = kept(transaction(ReadCommitted, ReadWrite, || {
-  \\      db.notify[jobs]("two");
-  \\      db.rollback("undone");
-  \\      "not rolled back"
-  \\    }));
-  \\    let none = shown(db.notified(300));
-  \\    db.notify[jobs]("three");
-  \\    let at_once = shown(db.notified(10000));
-  \\    db.listen[other]();
-  \\    db.unlisten[jobs]();
-  \\    db.notify[jobs]("four");
-  \\    let after = shown(db.notified(300));
-  \\    String::join([inside, committed, once, rolled, none, at_once, after], " ")
-  \\  })
-  \\
-  \\// Until it has heard `want` things other than quiet, each written down as it is heard.
-  \\fn heard_until(want: Int, left: Int, acc: List<String>) -> String / {db.notified, db.execute[heard]} =
-  \\  if acc.len() >= want || left <= 0 { String::join(acc, ",") } else {
-  \\    match db.notified(1000) {
-  \\      Quiet -> heard_until(want, left - 1, acc),
-  \\      n -> {
-  \\        db.execute[heard](stmt("insert into heard (what) values ($1)"), [PText(shown(n))]);
-  \\        heard_until(want, left - 1, acc.push(shown(n)))
-  \\      },
-  \\    }
-  \\  }
-  \\
-  \\// A listener whose connection the test ends: what it heard before, that it reconnected, and after.
-  \\pub fn reconnects(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
-  \\  with_server(url, 1, || {
-  \\    db.listen[jobs]();
-  \\    heard_until(3, 120, [])
-  \\  })
-  \\
-  \\fn sample() -> List<List<sql::Param>> =
-  \\  [
-  \\    [PInt(1), PText("plain"), PBytes(b"\x00\x01\xff"), PArray([PText("a"), PText("b,c")]), PNumeric(1.5m)],
-  \\    [PInt(2), PText("tab\there\nnew line\\back"), PNull, PNull, PNull],
-  \\    [PInt(3), PText("\\N"), PBytes(b""), PArray([]), PNumeric(0m)],
-  \\  ]
-  \\
-  \\fn named(id: Int, name: String) -> List<sql::Param> = [PInt(id), PText(name), PNull, PNull, PNull]
-  \\
-  \\fn all() -> sql::Stmt = stmt("select id, name, data, tags, price from items order by id")
-  \\
-  \\fn counted() -> String / {db.query[items]} =
-  \\  match db.query[items](stmt("select count(*) as n from items"), []) {
-  \\    Rows(rows) -> number(rows),
-  \\    Failed(e) -> failure(e),
-  \\    Count(_) -> "a count",
-  \\  }
-  \\
-  \\// What a copy of `rows` into `items` answered: how many rows the server took, the SQLSTATE that
-  \\// refused it, or the budget its rows ran past.
-  \\fn copied_in<| e>(rows: Seq<List<sql::Param> | e>, chunk: Int, budget: Int) -> String / {db.copy_in[items], db.copy_rows[items], db.copy_end[items] | e} =
-  \\  match try[seq.spent] { copy_into[items](["id", "name", "data", "tags", "price"], rows, chunk, budget) } {
-  \\    Ok(Ok(n)) -> n.to_string(),
-  \\    Ok(Err(e)) -> e.code,
-  \\    Err(spent) -> "spent " ++ spent.to_string(),
-  \\  }
-  \\
-  \\// Rows copied in and out: what each copy answered, whether the rows copied out are the rows a query
-  \\// answers, and what a refused copy, an abandoned one and a rolled back one each left behind.
-  \\pub fn copies(url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
-  \\  with_server(url, 2, || {
-  \\    let into = copied_in(seq::of_list(sample()), 2, 100);
-  \\    let out = copy_from[items](all(), 2, |rows: Seq<Row | {db.copy_take[items]}>| try[seq.spent] { seq::to_list(rows, 100) });
-  \\    let same = match out {
-  \\      Ok(Ok(copied)) -> match db.query[items](all(), []) {
-  \\        Rows(queried) -> if copied == queried { "same" } else { "different" },
-  \\        _ -> "no rows",
-  \\      },
-  \\      Ok(Err(_)) -> "spent",
-  \\      Err(e) -> failure(e),
-  \\    };
-  \\    let twice = copied_in(seq::of_list([named(4, "new"), named(1, "again")]), 1, 100);
-  \\    let after_twice = counted();
-  \\    let spent = copied_in(seq::of_list(range(10, 15).map(|i: Int| named(i, "x"))), 2, 3);
-  \\    let after_spent = counted();
-  \\    let rolled = kept(transaction(ReadCommitted, ReadWrite, || {
-  \\      let copied = copied_in(seq::of_list([named(20, "y")]), 10, 10);
-  \\      db.rollback("rolled back after " ++ copied);
-  \\      "not rolled back"
-  \\    }));
-  \\    let after_rolled = counted();
-  \\    let broken = match copy_from[items](stmt("select 1 / (id - 2) as x from items order by id"), 1, |rows: Seq<Row | {db.copy_take[items]}>| try[seq.spent] { seq::to_list(rows, 100).len() }) {
-  \\      Ok(_) -> "kept",
-  \\      Err(e) -> e.code,
-  \\    };
-  \\    String::join([into, same, twice, after_twice, spent, after_spent, rolled, after_rolled, broken], " ")
-  \\  })
-  \\
-  \\fn main() -> Int = 0
-  \\
-
-/// The program bound to a host that trusts the certificates at `trusted`, as `--trust` would.
-fn hosted(trusted: List<String>) -> Loaded / {Here, Shipped, Driving, abort.raise} = {
-  write("inner.ply", wired());
-  loaded({ ..default_options(), trust: trusted })
-}
-
-/// A cluster speaking TLS under a certificate for `localhost`, and where that certificate is.
-fn secured() -> { cluster: Cluster, pem: String } / {Here, Wire, Postgres, certgen.issue, abort.raise, diverges} = {
-  let issued = certgen.issue();
-  let c = postgres::secured("ply", "pencil", issued.certificate, issued.key);
-  write("server.pem", issued.certificate);
-  { cluster: c, pem: working_pem() }
-}
-
-fn working_pem() -> String / {Here, abort.raise} = working() ++ "/server.pem"
-
-fn refused_08001(r: Result<String, String>, what: String) -> Bool =
-  match r { Err(why) -> why.starts_with("08001: ") && why.contains(what), Ok(_) -> false }
-
-test/nondet "a secured connection is encrypted and verified for its host" {
-  if postgres::available() {
-    let s = secured();
-    let l = hosted([s.pem]);
-    let modes = ["sslmode=verify-full", "sslmode=require", "sslmode=verify-ca"].map(
-      |mode: String| over(l, "encrypted", postgres::url(s.cluster, "localhost", "ply", mode)),
-    );
-    let plain = over(
-      l,
-      "encrypted",
-      postgres::url(s.cluster, "localhost", "ply", "sslmode=disable"),
-    );
-    done(l, s.cluster);
-    assert_eq(modes, [Ok("1"), Ok("1"), Ok("1")]);
-    // A plaintext connection to a server that offers TLS stays plaintext.
-    assert_eq(plain, Ok("0"))
-  }
-}
-
-test/nondet "a certificate not trusted, or not for the host, is refused" {
-  if postgres::available() {
-    let s = secured();
-    let trusting_none = hosted([]);
-    let untrusted = over(
-      trusting_none,
-      "encrypted",
-      postgres::url(s.cluster, "localhost", "ply", "sslmode=require"),
-    );
-    let _ = unloaded(trusting_none);
-    let l = hosted([s.pem]);
-    let elsewhere = over(
-      l,
-      "encrypted",
-      postgres::url(s.cluster, "127.0.0.1", "ply", "sslmode=verify-full"),
-    );
-    done(l, s.cluster);
-    assert(refused_08001(untrusted, "not trusted"), None);
-    assert(refused_08001(elsewhere, "not trusted"), None)
-  }
-}
-
-test/nondet "a server that will not speak TLS is not spoken to in plaintext" {
-  if postgres::available() {
-    let c = postgres::scram("ply", "pencil");
-    let l = hosted([]);
-    let r = over(l, "encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"));
-    done(l, c);
-    assert(refused_08001(r, "does not speak TLS"), None)
-  }
-}
-
-/// The major version of the postgres the run bound.
-fn major() -> Int / {Postgres, abort.raise} = {
-  let said = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
-  said.split(" ").fold(0, |found: Int, word: String|
-    if found > 0 { found } else {
-      match String::int_of_string(match word.split(".") { [major, ..] -> major, [] -> "" }) {
-        Some(n) -> n,
-        None -> 0,
-      }
-    })
-}
-
-// Direct negotiation is postgres 17's: an older server reads the handshake as a start-up it does not
-// understand and hangs up, which is refused rather than retried in plaintext.
-test/nondet "direct negotiation secures the connection without asking first" {
-  if postgres::available() {
-    let s = secured();
-    let l = hosted([s.pem]);
-    let r = over(
-      l,
-      "encrypted",
-      postgres::url(s.cluster, "localhost", "ply", "sslmode=verify-full&sslnegotiation=direct"),
-    );
-    done(l, s.cluster);
-    if major() >= 17 { assert_eq(r, Ok("1")) } else { assert(refused_08001(r, ""), None) }
-  }
-}
-
-test/nondet "a notification is heard when its transaction commits and never when it rolls back" {
-  if postgres::available() {
-    let c = postgres::scram("ply", "pencil");
-    let l = hosted([]);
-    let heard = over(l, "notices", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
-    done(l, c);
-    assert_eq(heard, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
-  }
-}
-
-fn listener() -> String =
   \\import std.net (net)
   \\import std.process (process)
   \\import std.random (entropy)
@@ -419,15 +156,134 @@ fn listener() -> String =
   \\    String::join([into, same, twice, after_twice, spent, after_spent, rolled, after_rolled, broken], " ")
   \\  })
   \\
-  \\fn main() -> Int / {Wire, process.read[proc], process.write[proc], abort.raise, diverges} = {
-  \\  let url = match process.args[proc]() { [u, ..] -> u, [] -> "" };
-  \\  match reconnects(url) {
-  \\    Ok(text) -> process.out[proc]("heard " ++ text),
-  \\    Err(why) -> process.out[proc]("refused " ++ why),
-  \\  };
-  \\  0
-  \\}
+  \\fn main() -> Unit / {Wire, process.read[proc], process.write[proc], abort.raise, diverges} =
+  \\  match process.args[proc]() {
+  \\    [entry, url] -> match answer(entry, url) {
+  \\      Ok(text) -> process.out[proc]("heard " ++ text),
+  \\      Err(why) -> process.out[proc]("refused " ++ why),
+  \\    },
+  \\    _ -> process.out[proc]("refused an entry and a connection string, please"),
+  \\  }
   \\
+  \\fn answer(entry: String, url: String) -> Result<String, String> / {Wire, abort.raise, diverges} =
+  \\  match entry {
+  \\    "encrypted" -> encrypted(url),
+  \\    "notices" -> notices(url),
+  \\    "reconnects" -> reconnects(url),
+  \\    "copies" -> copies(url),
+  \\    _ -> Err("no entry is named " ++ entry),
+  \\  }
+  \\
+
+/// `--trust` for each certificate at `trusted`.
+fn trusting(trusted: List<String>) -> List<String> =
+  trusted.fold([], |flags: List<String>, pem: String| flags.concat(["--trust", pem]))
+
+/// A cluster speaking TLS under a certificate for `localhost`, and where that certificate is.
+fn secured() -> { cluster: Cluster, pem: String } / {Here, Wire, Postgres, certgen.issue, abort.raise, diverges} = {
+  let issued = certgen.issue();
+  let c = postgres::secured("ply", "pencil", issued.certificate, issued.key);
+  write("server.pem", issued.certificate);
+  { cluster: c, pem: working_pem() }
+}
+
+fn working_pem() -> String / {Here, abort.raise} = working() ++ "/server.pem"
+
+fn refused_08001(r: Result<String, String>, what: String) -> Bool =
+  match r { Err(why) -> why.starts_with("08001: ") && why.contains(what), Ok(_) -> false }
+
+test/nondet "a secured connection is encrypted and verified for its host" {
+  if postgres::available() {
+    let s = secured();
+    write("inner.ply", wired());
+    let l = trusting([s.pem]);
+    let modes = ["sslmode=verify-full", "sslmode=require", "sslmode=verify-ca"].map(
+      |mode: String| over("encrypted", postgres::url(s.cluster, "localhost", "ply", mode), l),
+    );
+    let plain = over(
+      "encrypted",
+      postgres::url(s.cluster, "localhost", "ply", "sslmode=disable"),
+      l,
+    );
+    postgres::stop(s.cluster);
+    assert_eq(modes, [Ok("1"), Ok("1"), Ok("1")]);
+    // A plaintext connection to a server that offers TLS stays plaintext.
+    assert_eq(plain, Ok("0"))
+  }
+}
+
+test/nondet "a certificate not trusted, or not for the host, is refused" {
+  if postgres::available() {
+    let s = secured();
+    write("inner.ply", wired());
+    let trusting_none = trusting([]);
+    let untrusted = over(
+      "encrypted",
+      postgres::url(s.cluster, "localhost", "ply", "sslmode=require"),
+      trusting_none,
+    );
+    let l = trusting([s.pem]);
+    let elsewhere = over(
+      "encrypted",
+      postgres::url(s.cluster, "127.0.0.1", "ply", "sslmode=verify-full"),
+      l,
+    );
+    postgres::stop(s.cluster);
+    assert(refused_08001(untrusted, "not trusted"), None);
+    assert(refused_08001(elsewhere, "not trusted"), None)
+  }
+}
+
+test/nondet "a server that will not speak TLS is not spoken to in plaintext" {
+  if postgres::available() {
+    let c = postgres::scram("ply", "pencil");
+    write("inner.ply", wired());
+    let l = trusting([]);
+    let r = over("encrypted", postgres::url(c, "127.0.0.1", "ply", "sslmode=require"), l);
+    postgres::stop(c);
+    assert(refused_08001(r, "does not speak TLS"), None)
+  }
+}
+
+/// The major version of the postgres the run bound.
+fn major() -> Int / {Postgres, abort.raise} = {
+  let said = String::of_bytes_lossy(process.spawn[postgres](["--version"], "", []).out);
+  said.split(" ").fold(0, |found: Int, word: String|
+    if found > 0 { found } else {
+      match String::int_of_string(match word.split(".") { [major, ..] -> major, [] -> "" }) {
+        Some(n) -> n,
+        None -> 0,
+      }
+    })
+}
+
+// Direct negotiation is postgres 17's: an older server reads the handshake as a start-up it does not
+// understand and hangs up, which is refused rather than retried in plaintext.
+test/nondet "direct negotiation secures the connection without asking first" {
+  if postgres::available() {
+    let s = secured();
+    write("inner.ply", wired());
+    let l = trusting([s.pem]);
+    let r = over(
+      "encrypted",
+      postgres::url(s.cluster, "localhost", "ply", "sslmode=verify-full&sslnegotiation=direct"),
+      l,
+    );
+    postgres::stop(s.cluster);
+    if major() >= 17 { assert_eq(r, Ok("1")) } else { assert(refused_08001(r, ""), None) }
+  }
+}
+
+test/nondet "a notification is heard when its transaction commits and never when it rolls back" {
+  if postgres::available() {
+    let c = postgres::scram("ply", "pencil");
+    write("inner.ply", wired());
+    let l = trusting([]);
+    let heard = over("notices", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"), l);
+    postgres::stop(c);
+    assert_eq(heard, Ok("quiet jobs:one quiet undone quiet jobs:three quiet"))
+  }
+}
 
 /// Until `ready` answers, asking every tenth of a second for at most `tries` of them.
 fn until<| e>(
@@ -445,9 +301,9 @@ test/nondet "a listener whose connection is ended listens again and says so" {
   if postgres::available() {
     let c = postgres::scram("ply", "pencil");
     let _ = postgres::psql(c, "ply", "create table heard (what text)");
-    write("inner.ply", listener());
+    write("inner.ply", wired());
     let server = serving(
-      ["run", "--", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable")],
+      ["run", "--", "reconnects", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable")],
       [],
       0,
     );
@@ -482,14 +338,15 @@ test/nondet "rows are copied in and out whole or not at all" {
       "ply",
       "create table items (id int4 primary key, name text, data bytea, tags text[], price numeric(10, 2))",
     );
-    let l = hosted([]);
-    let copied = over(l, "copies", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"));
+    write("inner.ply", wired());
+    let l = trusting([]);
+    let copied = over("copies", postgres::url(c, "127.0.0.1", "ply", "sslmode=disable"), l);
     let left = postgres::psql(
       c,
       "ply",
       "select string_agg(id::text || '=' || coalesce(name, 'null'), ';' order by id) from items",
     );
-    done(l, c);
+    postgres::stop(c);
     assert_eq(copied, Ok("3 same 23505 3 spent 3 3 rolled back after 1 3 22012"));
     assert_eq(left, "1=plain;2=tab\there\nnew line\\back;3=\\N")
   }

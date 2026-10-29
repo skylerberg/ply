@@ -13,7 +13,7 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, ETagged,
                               Stmt, SLet, SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm,
                               HandleClause, ReturnClause, HandlerVar, Hole, RecField, expr_span)
-import compiler.check.types (Type, TyFn, Field, Row, record_fields, unit_type)
+import compiler.check.types (Type, TyFn, Field, record_fields, unit_type)
 import compiler.check.resolve.tables (Diag, error_at, error_at_and)
 import compiler.check.resolve.sets (mentions)
 import compiler.check.infer.checker (ReleasePlace, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
@@ -40,27 +40,11 @@ pub type Facts = {
   /// Whether a value of the resolved type states a `release` itself, so that taking it apart, which
   /// only its own module may, consumes it whole and runs no release.
   opened: (Type) -> Bool / {abort.raise},
-  /// The operation a clause or a perform names, as the stops it may make are named.
+  /// The operation a clause or a perform names, as `<effect>.<operation>`.
   op_named: (QName, Ident) -> Bytes / {abort.raise},
-  /// Whether an operation is declared `multi`: its clause may call its continuation more than once.
-  op_multi: (QName, Ident) -> Bool / {abort.raise},
-  /// The stop a perform of an operation may make for a clause that resumes it more than once.
-  op_stop: (QName, Ident) -> Option<Stop> / {abort.raise},
-  /// Whether an operation is one of a `nondet` effect.
-  op_nondet: (QName, Ident) -> Bool / {abort.raise},
-  /// The stop a call that performs a row may make for a clause that resumes it more than once.
-  row_stop: (Row) -> Option<Stop> / {abort.raise},
-  /// Whether a row names an operation of a `nondet` effect.
-  row_nondet: (Row) -> Bool / {abort.raise},
-  /// The row of the function a call on a value calls, by the span the check wrote the call out at.
-  member_row: (Span) -> Option<Row> / {abort.raise},
   /// The raises a `try` at a span answers, each as `<effect>.<operation>`.
   try_ops: (Span) -> List<Bytes> / {abort.raise},
 }
-
-/// The operations a perform or a call may stop for, each declared `multi`; `any` where it reaches
-/// one through a row variable written `multi`, which no clause in sight answers.
-pub type Stop = { ops: List<Bytes>, any: Bool }
 
 /// How a definition takes its arguments: the names a call may pass them by, and the places of
 /// those written `keep`; `all` for a constructor, which takes every value it is handed.
@@ -148,14 +132,9 @@ type Gone = { at: Span, how: Bytes }
 /// clause that never calls it abandons.
 type Kind = | Value | Taker | Continuation
 
-/// A stop a path passed that a clause may resume more than once, which every way on from it, up to
-/// the `handle` that answers it, may run again. `exempt` are the bindings that `handle` held before
-/// its body began, which the stop's continuation only borrows.
-type Stopped = { at: Span, stop: Stop, exempt: List<Int> }
-
-/// A `handle` the walk is inside the body of: the operations its clauses answer, and the sites of
-/// the bindings already live where its body starts, which a continuation it ends never holds.
-type Handling = { ops: List<Bytes>, outer: List<Int>, body: Int }
+/// A `handle` the walk is inside the body of: the operations its clauses answer, and the body it
+/// runs in.
+type Handling = { ops: List<Bytes>, body: Int }
 
 /// What the walk has seen: each binding by the site it is bound at, what it refuses, and what each
 /// function a `let` binds captured, by the function's site.
@@ -167,7 +146,6 @@ type St = {
   diags: List<Diag>,
   releases: List<Release>,
   captured: Map<Int, Captured>,
-  stopped: List<Stopped>,
   flight: List<Held>,
 }
 
@@ -221,7 +199,6 @@ pub fn owned(
         diags: [],
         releases: [],
         captured: Map::new(),
-        stopped: [],
         flight: [],
       },
     },
@@ -587,10 +564,7 @@ fn used(f: Facts, s: Scope, st: St, b: Binding, span: Span, pos: Pos) -> St / {a
       } else {
         match use {
           Taken(how) -> if b.kind == Taker && !b.owned { said(st, borrower_kept(f, b, span)) }
-          else if !b.owned { said(st, consumed_lent(f, b, span, how)) }
-          else if st.stopped.any(|x: Stopped| x.exempt.contains(b.key)) {
-            said(gone_at(st, b, span, how), consumed_replayed(f, b, span))
-          } else {
+          else if !b.owned { said(st, consumed_lent(f, b, span, how)) } else {
             match crossed.find(|x: Fn| !x.local) {
               Some(fun) -> said(gone_at(st, b, span, how), consumed_in_lambda(f, b, span, fun)),
               None -> captured_by(gone_at(st, b, span, how), crossed, b, true),
@@ -624,13 +598,6 @@ fn captured_by(st: St, crossed: List<Fn>, b: Binding, consumed: Bool) -> St =
       else { { ..was, borrows: borrowed.push_unique(b.key) } };
       { ..acc, captured: acc.captured.insert(fun.span.site, now) }
     })
-
-/// `st` with `b`, consumed at `span`, refused where a stop the `handle` holding it from before its
-/// body may resume more than once came first, as each resumption would consume it again.
-fn replay_refused(f: Facts, st: St, b: Binding, span: Span) -> St =
-  if st.stopped.any(|x: Stopped| x.exempt.contains(b.key)) {
-    said(st, consumed_replayed(f, b, span))
-  } else { st }
 
 /// A binding the function `b` borrows that a path has since consumed.
 fn borrowed_gone(st: St, b: Binding) -> Option<Binding> =
@@ -674,15 +641,8 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
       if u.op == b"neg" { unwinding(s, operand, u.span) } else { operand }
     },
     ELambda(l) -> fresh(f, lambda(f, s, st, l, fn_at(l.span, pos), []).st, e, pos),
-    EApp(a) -> {
-      let called = landed(s, st, applied(f, s, st, a.span, a.func, a.args, a.named), a.span);
-      let stops = match f.type_at(expr_span(a.func)) {
-        Some(TyFn(t)) ->
-          stopping(f, s, called, a.span, f.row_stop(t.effects), f.row_nondet(t.effects)),
-        _ -> called,
-      };
-      fresh(f, stops, e, pos)
-    },
+    EApp(a) ->
+      fresh(f, landed(s, st, applied(f, s, st, a.span, a.func, a.args, a.named), a.span), e, pos),
     EIf(i) -> {
       let c = walk(f, s, st, i.cond, Read);
       let branches = [i.then_branch, i.else_branch];
@@ -779,12 +739,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
           p.args,
           [],
         );
-        let landing = landed(s, st, called, p.span);
-        let stops = match f.member_row(p.span) {
-          Some(row) -> stopping(f, s, landing, p.span, f.row_stop(row), f.row_nondet(row)),
-          None -> landing,
-        };
-        fresh(f, stops, e, pos)
+        fresh(f, landed(s, st, called, p.span), e, pos)
       },
       None -> {
         let kept = f.op_kept(p.eff, p.op);
@@ -803,19 +758,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
             },
             at: acc.at + 1,
           }).st;
-        fresh(
-          f,
-          stopping(
-            f,
-            s,
-            landed(s, st, args, p.span),
-            p.span,
-            f.op_stop(p.eff, p.op),
-            f.op_nondet(p.eff, p.op),
-          ),
-          e,
-          pos,
-        )
+        fresh(f, landed(s, st, args, p.span), e, pos)
       },
     },
     EHandle(h) -> handled(f, s, st, h, pos),
@@ -835,10 +778,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
         s,
         walk(
           f,
-          {
-            ..apart(s, x.span),
-            handles: s.handles.push({ ops: simulated_ops(), outer: [], body: s.body }),
-          },
+          { ..apart(s, x.span), handles: s.handles.push({ ops: simulated_ops(), body: s.body }) },
           { ..st, flight: [] },
           x.body,
           pos,
@@ -858,7 +798,7 @@ fn walk(f: Facts, s: Scope, st: St, e: Expr, pos: Pos) -> St / {abort.raise} =
         st,
         walk(
           f,
-          { ..s, handles: s.handles.push({ ops: f.try_ops(t.span), outer: [], body: s.body }) },
+          { ..s, handles: s.handles.push({ ops: f.try_ops(t.span), body: s.body }) },
           st,
           t.body,
           pos,
@@ -1130,7 +1070,7 @@ fn field(
           } else if others_held(f, base, name) { said(st, field_beside(f, b, name, span)) } else {
             match s.fns.drop(b.depth).at(0) {
               Some(fun) -> said(st, consumed_in_lambda(f, b, span, fun)),
-              None -> replay_refused(f, put(st, { ..b, taken: b.taken.push(name.name) }), b, span),
+              None -> put(st, { ..b, taken: b.taken.push(name.name) }),
             }
           },
           _ -> used(f, s, st, b, v.span, pos),
@@ -1184,11 +1124,10 @@ fn lambda(
   given: List<Int>,
 ) -> { st: St, captured: Captured } / {abort.raise} = {
   let types = match f.type_at(l.span) { Some(TyFn(t)) -> t.params, _ -> [] };
-  // Its body runs when it is called, so nothing a call around it holds in flight, and no stop the
-  // path made before it, is the body's.
+  // Its body runs when it is called, so nothing a call around it holds in flight is the body's.
   let inner: Bound = {
     s: { ..s, fns: s.fns.push(fun), block: [], frame: l.span.site, body: l.span.site },
-    st: { ..st, flight: [], stopped: [] },
+    st: { ..st, flight: [] },
   };
   let params = range(0, l.params.len()).fold(inner, |acc: Bound, i: Int| {
     let p = l.params.get(i);
@@ -1206,7 +1145,7 @@ fn lambda(
     Taken(b"answered"),
   );
   {
-    st: { ..body, flight: st.flight, stopped: st.stopped },
+    st: { ..body, flight: st.flight },
     captured: match body.captured.get(l.span.site) {
       Some(c) -> c,
       None -> { consumed: [], borrows: [] },
@@ -1506,8 +1445,6 @@ fn joined(
           mine.last,
         ),
         flight: acc.flight,
-        stopped: x.stopped.fold(acc.stopped, |ys: List<Stopped>, y: Stopped|
-          if ys.contains(y) { ys } else { ys.push(y) }),
         captured: x.captured.fold(acc.captured, |m: Map<Int, Captured>, k: Int, c: Captured|
           match m.get(k) {
             Some(was) ->
@@ -1590,12 +1527,7 @@ fn matched(
           Some(b) ->
             wild_resources(
               f,
-              replay_refused(
-                f,
-                gone_at(start, b, pat_span(a.pat), b"taken apart by a `match` arm"),
-                b,
-                pat_span(a.pat),
-              ),
+              gone_at(start, b, pat_span(a.pat), b"taken apart by a `match` arm"),
               a.pat,
               dummy_span(),
             ),
@@ -1702,29 +1634,19 @@ fn handled(
     else { Read });
     shadowed({ ..acc, st: if held { said(walked, var_held(f, v)) } else { walked } }, v.name.name)
   });
-  let live = vars.st.bindings.fold(
-    vars.st.flight.map(|x: Held| x.binding),
-    |acc: List<Int>, key: Int, b: Binding|
-      if b.owned && b.gone == None { acc.push(key) } else { acc },
-  );
   let inside = answered_inside(
     vars.st,
     walk(
       f,
-      { ..s, handles: s.handles.push({ ops: ops, outer: live, body: s.body }) },
-      { ..vars.st, stopped: [] },
+      { ..s, handles: s.handles.push({ ops: ops, body: s.body }) },
+      vars.st,
       h.body,
       match h.ret { Some(_) -> Taken(b"answered to the `return` clause"), None -> pos },
     ),
     h.span,
     here(s),
   );
-  // A stop the body made for one of these clauses runs again no further than the `handle`.
-  let after = {
-    ..inside,
-    stopped: st.stopped.concat(inside.stopped.filter(|x: Stopped| !answered(x.stop, ops))),
-  };
-  let clauses = h.clauses.fold(after, |acc: St, c: HandleClause| {
+  let clauses = h.clauses.fold(inside, |acc: St, c: HandleClause| {
     let kept = f.op_kept(c.eff, c.op);
     let given = range(0, c.params.len()).fold(
       { s: { ..apart(vars.s, c.span), block: [] }, st: { ..acc, flight: [] } },
@@ -1736,10 +1658,9 @@ fn handled(
         }
       },
     );
-    // A one-shot operation's continuation is consumed by its one call; a `multi` one is called at will.
+    // A continuation is consumed by its one call.
     let resumed = match c.resume {
-      Some(k) -> if f.op_multi(c.eff, c.op) { shadowed(given, k.name) }
-      else { bound_as(given, k, unit_type(), true, true, Continuation) },
+      Some(k) -> bound_as(given, k, unit_type(), true, true, Continuation),
       None -> given,
     };
     let labelled = match c.label_binder { Some(t) -> shadowed(resumed, t.name), None -> resumed };
@@ -1786,43 +1707,6 @@ fn handled(
         pos,
       );
       { ..ended, flight: clauses.flight }
-    },
-  }
-}
-
-/// Whether a `handle` whose clauses answer `ops` ends what a stop may run again.
-fn answered(stop: Stop, ops: List<Bytes>) -> Bool =
-  !stop.any && stop.ops.len() > 0 && stop.ops.all(|op: Bytes| ops.contains(op))
-
-/// A perform or a call at `at` past its arguments: a stop it may make for a clause that resumes
-/// more than once may not run what it holds again, and it may run no `nondet` operation after a
-/// stop like that, which every resumption would perform again.
-fn stopping(
-  f: Facts,
-  s: Scope,
-  st: St,
-  at: Span,
-  stops: Option<Stop>,
-  worldly: Bool,
-) -> St / {abort.raise} = {
-  let replayed = if !worldly { st }
-  else { match st.stopped.at(0) { Some(x) -> said(st, replays_nondet(f, at, x.at)), None -> st } };
-  match stops {
-    None -> replayed,
-    Some(stop) -> {
-      // What a `handle` in this body that answers the stop held before its body began, its
-      // continuation never holds.
-      let exempt = match s.handles.reverse().find(|h: Handling| answered(stop, h.ops)) {
-        Some(h) -> h.outer,
-        None -> [],
-      };
-      let held = replayed.bindings.fold(replayed, |acc: St, site: Int, b: Binding|
-        if !live(b) || exempt.contains(site) || b.body != s.body { acc }
-        else { said(acc, resumed_twice(f, b, at)) });
-      // What a call around this one took before it is called is as live here.
-      let flying = replayed.flight.fold(held, |acc: St, x: Held|
-        if exempt.contains(x.binding) { acc } else { said(acc, flown_twice(f, at)) });
-      { ..flying, stopped: flying.stopped.push({ at: at, stop: stop, exempt: exempt }) }
     },
   }
 }
@@ -2097,69 +1981,6 @@ fn made_and_dropped(f: Facts, e: Expr, pos: Pos) -> Diag =
       _ -> b"its value is dropped",
     },
     [b"bind it with `let`, so it is let go where its block ends, or hand it to what takes it"],
-  )
-
-fn resumed_twice(f: Facts, b: Binding, at: Span) -> Diag =
-  error_at_and(
-    b"E0319",
-    f.module,
-    at,
-    Bytes::concat_all([
-      quoted(b.name),
-      b" is live across a stop a clause may resume more than once",
-    ]),
-    b"a clause for what this performs may run the rest of the body again",
-    f.module,
-    b.at,
-    b"owned from here",
-    [
-      b"each resumption would run what holds it again, so it would be used, and let go, more than once",
-      b"consume it before the stop, or answer the operation with a `handle` inside its block",
-    ],
-  )
-
-fn flown_twice(f: Facts, at: Span) -> Diag =
-  error_at(
-    b"E0319",
-    f.module,
-    at,
-    b"a resource handed to a call is live across a stop a clause may resume more than once",
-    b"a clause for what this performs may run the rest of the call's arguments again",
-    [
-      b"each resumption would hand it to the call again, so it would be consumed more than once",
-      b"bind what this answers with `let` before the call, so the call takes it after the stop",
-    ],
-  )
-
-fn consumed_replayed(f: Facts, b: Binding, span: Span) -> Diag =
-  error_at_and(
-    b"E0319",
-    f.module,
-    span,
-    Bytes::concat_all([
-      quoted(b.name),
-      b" is consumed past a stop a clause may resume more than once",
-    ]),
-    b"each resumption would consume it again",
-    f.module,
-    b.at,
-    b"owned from before the `handle` that answers the stop",
-    [b"consume it after the `handle`, or before the stop"],
-  )
-
-fn replays_nondet(f: Facts, at: Span, stop: Span) -> Diag =
-  error_at_and(
-    b"E0321",
-    f.module,
-    at,
-    b"a `nondet` operation runs where a clause may resume the body more than once",
-    b"each resumption would perform this again",
-    f.module,
-    stop,
-    b"the stop a clause may resume more than once",
-    [
-      b"the outside world is not run twice: answer the operation that resumes more than once with a `handle` before this runs",
-    ],
   )
 
 fn moved_on_one_path(module: Int, b: Binding) -> Diag =

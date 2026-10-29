@@ -268,14 +268,12 @@ pub fn run(
     ply_privileged::shipped::entered(&program.entry, definitions);
     let grants = grants(root, &shipped, &argv);
     let entry = program.entry;
-    // The program is the tool's own work rather than a program under test, so the budgets a run
-    // gives a program are not its. The entry runs on a thread of its own, with the stack a front
-    // end's recursion wants.
+    // The entry runs on a thread of its own, with the stack a front end's recursion wants.
     let work = std::thread::Builder::new()
         .name("ply".to_string())
         .stack_size(ply_compiled::rt::PROGRAM_STACK)
         .spawn(move || {
-            let launch = || ply_compiled::rt::unbounded(|| entered(&entry, &grants));
+            let launch = || entered(&entry, &grants);
             match count {
                 Some(asked) => {
                     let (launched, counted, sites) =

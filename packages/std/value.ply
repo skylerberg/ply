@@ -4,8 +4,9 @@
 //! counterexample binds. `render` writes the language's own spelling: a constructor by the name its
 //! module declares, a `new` record as the literal it is built by, a `std.set` set as the `#[..]`
 //! that builds it, an array as `Array::of_list([..])`.
-//! In a diagnostic, a list or map past `shown_items` items counts the rest, nesting past
-//! `shown_depth` shows as `…`, and a credential shows as `Secret(****)`; `render_all` writes every
+//! In a diagnostic, a value is cut once its text passes `shown_characters`, and what is left of
+//! each string, bytes value, list, map, record and constructor is counted; nesting past
+//! `shown_depth` shows as `…`, and a credential shows as `Secret(****)`. `render_all` writes every
 //! item at every depth, which is what a program shows. A fixed width holds the bit pattern it reads,
 //! so `-1i8` is `VFixed("I8", 255u128)`. Only a generated function (`FConst`, `FProject`, `FTable`)
 //! crosses back into a run, and `VElided` marks what a diagnostic's snapshot cut short.
@@ -69,21 +70,23 @@ pub type Fun =
   /// The first entry whose key equals the first argument, else `default`.
   | FTable({ arity: U8, entries: List<Entry>, default: Value })
 
-/// A list or a map shows this many items before the rest is counted.
-pub fn shown_items() -> Int = 32
+/// A value a diagnostic shows is cut once its text reaches this many characters.
+pub fn shown_characters() -> Int = 2000
 
 /// Nesting past this shows as `…`.
 pub fn shown_depth() -> Int = 16
 
-/// What a diagnostic shows: past `shown_items` and `shown_depth`, the rest is counted or elided.
-pub fn render(v: Value) -> String = rendered(v, 0, true)
+/// What a diagnostic shows: once the text reaches `shown_characters`, what is left of each string,
+/// bytes value, list, map, record and constructor is counted, and nesting past `shown_depth` shows
+/// as `…`.
+pub fn render(v: Value) -> String = rendered(v, 0, Some(shown_characters()))
 
 /// What a program shows (`std.show`): every item at every depth, in `render`'s format.
-pub fn render_all(v: Value) -> String = rendered(v, 0, false)
+pub fn render_all(v: Value) -> String = rendered(v, 0, None)
 
-fn rendered(v: Value, depth: Int, bounded: Bool) -> String =
-  if bounded && depth > shown_depth() { "…" } else {
-    let inner = |x: Value| rendered(x, depth + 1, bounded);
+/// `v` written in `room`, the characters a bounded render may still write; `None` writes it all.
+fn rendered(v: Value, depth: Int, room: Option<Int>) -> String =
+  if room != None && depth > shown_depth() { "…" } else {
     match v {
       VUnit -> "()",
       VBool(b) -> if b { "true" } else { "false" },
@@ -92,25 +95,51 @@ fn rendered(v: Value, depth: Int, bounded: Bool) -> String =
       VDecimal(d) -> d.to_string(),
       VFixed(ty, bits) -> fixed_text(ty, bits),
       VChar(c) -> "'" ++ char_escaped(c) ++ "'",
-      VStr(s) -> "\"" ++ escaped(s) ++ "\"",
-      VBytes(b) -> bytes_text(b, bounded),
-      VList(items) -> "[" ++ items_text(items.map(inner), bounded) ++ "]",
-      VArray(items) -> "Array::of_list([" ++ items_text(items.map(inner), bounded) ++ "])",
-      VRecord(fields) -> record_text(fields, depth, bounded),
+      VStr(s) ->
+        cut_text(
+          "\"",
+          "\"",
+          fitted(s.chars(), room, |acc: List<Char>, c: Char| escaped_char(acc, c, '"')),
+        ),
+      VBytes(b) -> cut_text("b\"", "\"", fitted(bytes_of(b), room, byte_chars)),
+      VList(items) -> "[" ++ values_text(items, depth, spent(room, "[")) ++ "]",
+      VArray(items) -> {
+        let head = "Array::of_list([";
+        head ++ values_text(items, depth, spent(room, head)) ++ "])"
+      },
+      VRecord(fields) -> record_text(fields, depth, room),
       VCtor(name, args) -> match set_elements(name, args) {
-        Some(keys) -> "#[" ++ items_text(keys.map(inner), bounded) ++ "]",
-        None -> if args.len() == 0 { ctor_name(name) }
-        else { ctor_name(name) ++ "(" ++ String::join(args.map(inner), ", ") ++ ")" },
+        Some(keys) -> "#[" ++ values_text(keys, depth, spent(room, "#[")) ++ "]",
+        None -> if args.len() == 0 { ctor_name(name) } else {
+          let head = ctor_name(name) ++ "(";
+          head ++ values_text(args, depth, spent(room, head)) ++ ")"
+        },
       },
       VMap(entries) ->
-        "{" ++ items_text(entries.map(|e: Entry| entry_text(e, depth, bounded)), bounded) ++ "}",
-      VFn(f) -> "<fn" ++ fun_text(f, inner) ++ ">",
+        "{"
+          ++ items_text(
+            entries,
+            spent(room, "{"),
+            |e: Entry, left: Option<Int>| entry_text(e, depth, left),
+            |e: Entry| weight(e.key),
+          )
+          ++ "}",
+      VFn(f) ->
+        "<fn"
+          ++ fun_text(f, spent(room, "<fn"), |x: Value, left: Option<Int>|
+            rendered(x, depth + 1, left))
+          ++ ">",
       VHold -> "<hold>",
       VSecret -> "Secret(****)",
       VElided(n) -> elided(n),
-      VShown(text) -> text,
+      VShown(text) -> if room == None { text }
+      else { cut_text("", "", fitted(text.chars(), room, |acc: List<Char>, c: Char| acc.push(c))) },
     }
   }
+
+/// The room left once `text` is written.
+fn spent(room: Option<Int>, text: String) -> Option<Int> =
+  match room { Some(n) -> Some(n - text.len()), None -> None }
 
 /// The name a constructor's module declares it under, which is how it is shown: where the module
 /// stands is no part of the value.
@@ -126,34 +155,68 @@ fn set_elements(name: String, args: List<Value>) -> Option<List<Value>> =
 
 fn elided(n: Int) -> String = if n == 0 { "…" } else { "… " ++ n.to_string() ++ " more" }
 
-fn entry_text(e: Entry, depth: Int, bounded: Bool) -> String =
+fn entry_text(e: Entry, depth: Int, room: Option<Int>) -> String =
   match e.key {
     VElided(n) -> elided(n),
-    k -> rendered(k, depth + 1, bounded) ++ ": " ++ rendered(e.value, depth + 1, bounded),
+    k -> {
+      let head = rendered(k, depth + 1, room) ++ ": ";
+      head ++ rendered(e.value, depth + 1, spent(room, head))
+    },
   }
 
-/// Past `shown_items`, the rest is counted; a snapshot already cut short says so itself.
-fn items_text(parts: List<String>, bounded: Bool) -> String =
-  if !bounded || parts.len() <= shown_items() { String::join(parts, ", ") }
-  else { String::join(take(parts, shown_items()).push(elided(parts.len() - shown_items())), ", ") }
+fn values_text(items: List<Value>, depth: Int, room: Option<Int>) -> String =
+  items_text(items, room, |x: Value, left: Option<Int>| rendered(x, depth + 1, left), weight)
 
-fn take(xs: List<String>, n: Int) -> List<String> =
-  range(0, n).map(|i: Int| match xs.at(i) { Some(x) -> x, None -> "" })
+/// How many items a value stands for among its list's: what a snapshot left out says how many.
+fn weight(v: Value) -> Int = match v { VElided(n) -> max(n, 1), _ -> 1 }
+
+/// The items joined, each written in the room those before it left; once the room is spent, the
+/// rest are counted, each as the number of items `count` says it stands for.
+fn items_text<a>(
+  items: List<a>,
+  room: Option<Int>,
+  item: (a, Option<Int>) -> String,
+  count: (a) -> Int,
+) -> String =
+  match room {
+    None -> String::join(items.map(|x: a| item(x, None)), ", "),
+    Some(n) -> {
+      let walked = items.fold(
+        { parts: [], left: n, more: 0 },
+        |s: { parts: List<String>, left: Int, more: Int }, x: a|
+          if s.left <= 0 { { ..s, more: s.more + count(x) } } else {
+            let text = item(x, Some(s.left));
+            { ..s, parts: s.parts.push(text), left: s.left - text.len() - 2 }
+          },
+      );
+      String::join(
+        if walked.more == 0 { walked.parts } else { walked.parts.push(elided(walked.more)) },
+        ", ",
+      )
+    },
+  }
 
 /// A tuple is the record `{_0: a, _1: b}` and shows as one.
-fn record_text(fields: List<Field>, depth: Int, bounded: Bool) -> String =
+fn record_text(fields: List<Field>, depth: Int, room: Option<Int>) -> String =
   if is_tuple(fields) {
     "("
-      ++ String::join(
-        range(0, fields.len()).map(|i: Int| tuple_item(fields, i, depth, bounded)),
-        ", ",
+      ++ items_text(
+        range(0, fields.len()),
+        spent(room, "("),
+        |i: Int, left: Option<Int>| tuple_item(fields, i, depth, left),
+        |_: Int| 1,
       )
       ++ ")"
   } else {
     "{"
-      ++ String::join(
-        fields.map(|f: Field| f.name ++ ": " ++ rendered(f.value, depth + 1, bounded)),
-        ", ",
+      ++ items_text(
+        fields,
+        spent(room, "{"),
+        |f: Field, left: Option<Int>| {
+          let head = f.name ++ ": ";
+          head ++ rendered(f.value, depth + 1, spent(left, head))
+        },
+        |_: Field| 1,
       )
       ++ "}"
   }
@@ -168,34 +231,49 @@ pub fn is_tuple(fields: List<Field>) -> Bool =
 pub fn field_named(fields: List<Field>, name: String) -> Option<Value> =
   fields.fold(None, |acc: Option<Value>, f: Field| if f.name == name { Some(f.value) } else { acc })
 
-fn tuple_item(fields: List<Field>, i: Int, depth: Int, bounded: Bool) -> String =
+fn tuple_item(fields: List<Field>, i: Int, depth: Int, room: Option<Int>) -> String =
   match field_named(fields, "_" ++ i.to_string()) {
-    Some(v) -> rendered(v, depth + 1, bounded),
+    Some(v) -> rendered(v, depth + 1, room),
     None -> "",
   }
 
-/// A generated function shows as the lambda it behaves as, each value in it as `inner` writes it.
-fn fun_text(f: Fun, inner: (Value) -> String) -> String =
+/// A generated function shows as the lambda it behaves as, each value in it as `inner` writes it in
+/// the room the text before it left.
+fn fun_text(f: Fun, room: Option<Int>, inner: (Value, Option<Int>) -> String) -> String =
   match f {
     FNamed(name) -> " " ++ name,
     FAnonymous -> "",
-    FConst(c) ->
-      " |" ++ String::join(range(0, Int::of_u8(c.arity)).map(|_: Int| "_"), ", ") ++ "| "
-        ++ inner(c.value),
+    FConst(c) -> {
+      let head = " |" ++ String::join(range(0, Int::of_u8(c.arity)).map(|_: Int| "_"), ", ")
+        ++ "| ";
+      head ++ inner(c.value, spent(room, head))
+    },
     FProject(p) -> " |" ++ params(p.arity) ++ "| x" ++ Int::of_u8(p.index).to_string(),
-    FTable(t) -> " |" ++ params(t.arity) ++ "| " ++ table_text(t.entries, t.default, inner),
+    FTable(t) -> {
+      let head = " |" ++ params(t.arity) ++ "| ";
+      head ++ table_text(t.entries, t.default, spent(room, head), inner)
+    },
   }
 
 fn params(arity: U8) -> String =
   String::join(range(0, Int::of_u8(arity)).map(|i: Int| "x" ++ i.to_string()), ", ")
 
-fn table_text(entries: List<Entry>, default: Value, inner: (Value) -> String) -> String =
-  range(0, entries.len()).fold(inner(default), |acc: String, j: Int|
-    match entries.at(entries.len() - 1 - j) {
-      Some(e) ->
-        "if x0 == " ++ inner(e.key) ++ " { " ++ inner(e.value) ++ " } else { " ++ acc ++ " }",
-      None -> acc,
-    })
+fn table_text(
+  entries: List<Entry>,
+  default: Value,
+  room: Option<Int>,
+  inner: (Value, Option<Int>) -> String,
+) -> String = {
+  let opened = entries.fold(
+    { parts: [], left: room },
+    |s: { parts: List<String>, left: Option<Int> }, e: Entry| {
+      let head = "if x0 == " ++ inner(e.key, s.left) ++ " { ";
+      let piece = head ++ inner(e.value, spent(s.left, head)) ++ " } else { ";
+      { parts: s.parts.push(piece), left: spent(s.left, piece) }
+    },
+  );
+  String::join(opened.parts, "") ++ inner(default, opened.left) ++ " }".repeat(entries.len())
+}
 
 // --- Slots ------------------------------------------------------------------
 
@@ -958,33 +1036,40 @@ fn digit_char(d: Int) -> Char = match "0123456789".chars().at(d) { Some(c) -> c,
 
 // --- Text -------------------------------------------------------------------
 
-fn escaped(s: String) -> String = String::of_chars(escaped_chars(s.chars(), '"'))
-
 /// As a character literal is written: a quote of its own kind is the one escaped.
-fn char_escaped(c: Char) -> String = String::of_chars(escaped_chars([c], '\''))
+fn char_escaped(c: Char) -> String = String::of_chars(escaped_char([], c, '\''))
 
-fn escaped_chars(cs: List<Char>, quote: Char) -> List<Char> =
-  cs.fold([], |acc: List<Char>, c: Char|
-    if c == '\n' { acc.push('\\').push('n') }
-    else if c == '\t' { acc.push('\\').push('t') }
-    else if c == '\r' { acc.push('\\').push('r') }
-    else if c == '\0' { acc.push('\\').push('0') }
-    else if c == '\\' || c == quote { acc.push('\\').push(c) }
-    else { acc.push(c) })
+/// `c` after `acc` as a literal quoted by `quote` writes it.
+fn escaped_char(acc: List<Char>, c: Char, quote: Char) -> List<Char> =
+  if c == '\n' { acc.push('\\').push('n') }
+  else if c == '\t' { acc.push('\\').push('t') }
+  else if c == '\r' { acc.push('\\').push('r') }
+  else if c == '\0' { acc.push('\\').push('0') }
+  else if c == '\\' || c == quote { acc.push('\\').push(c) }
+  else { acc.push(c) }
 
-fn bytes_text(b: Bytes, bounded: Bool) -> String = {
-  let n = b.len();
-  let cut = bounded && n > shown_items();
-  let shown = if cut { shown_items() } else { n };
-  // Every index read is below the length, so the clause never answers.
-  let body = handle {
-    range(0, shown).fold([], |acc: List<Char>, i: Int| byte_chars(acc, b.at(i)))
-  } with {
-    abort.raise(_) -> [],
-  };
-  let more = if cut { " " ++ elided(n - shown_items()) } else { "" };
-  "b\"" ++ String::of_chars(body) ++ "\"" ++ more
-}
+/// What a text keeps of its units, characters or bytes: what `write` makes of as many from the
+/// first as fit in the room, and how many are left out.
+type Fitted = { chars: List<Char>, more: Int }
+
+fn fitted<a>(units: List<a>, room: Option<Int>, write: (List<Char>, a) -> List<Char>) -> Fitted =
+  match room {
+    None -> { chars: units.fold([], write), more: 0 },
+    Some(n) ->
+      units.fold({ chars: [], more: 0 }, |s: Fitted, u: a|
+        if s.more > 0 { { ..s, more: s.more + 1 } } else {
+          let next = write(s.chars, u);
+          if next.len() > n { { ..s, more: 1 } } else { { ..s, chars: next } }
+        }),
+  }
+
+fn cut_text(open: String, close: String, f: Fitted) -> String =
+  open ++ String::of_chars(f.chars) ++ close
+    ++ (if f.more == 0 { "" } else { " " ++ elided(f.more) })
+
+// Every index read is below the length, so the clause never answers.
+fn bytes_of(b: Bytes) -> List<Int> =
+  handle { range(0, b.len()).map(|i: Int| b.at(i)) } with { abort.raise(_) -> [] }
 
 /// A byte as a bytes literal writes it: printable ASCII as itself, any other byte in hex.
 fn byte_chars(acc: List<Char>, c: Int) -> List<Char> =
@@ -1018,15 +1103,75 @@ test "scalars show as their literals do, without a width suffix" {
   )
 }
 
-test "text is quoted and escaped, and bytes past the first 32 are counted" {
+test "text is quoted and escaped" {
   assert_eq(render(VStr("a\"b\n")), "\"a\\\"b\\n\"");
   assert_eq(render(VStr("é")), "\"é\"");
-  assert_eq(render(VBytes(b"GET \x00\xff")), "b\"GET \\x00\\xff\"");
+  assert_eq(render(VBytes(b"GET \x00\xff")), "b\"GET \\x00\\xff\"")
+}
+
+/// A cut render's text before its last `… `, and the count that follows it.
+fn last_cut(text: String) -> { shown: String, more: Int } / {abort.raise} = {
+  let pieces = text.split("… ");
+  let count = match pieces.last() {
+    Some(last) -> match last.split(" ").at(0) { Some(n) -> n.int_of_string(), None -> None },
+    None -> None,
+  };
+  {
+    shown: String::join(pieces.take(pieces.len() - 1), "… "),
+    more: match count { Some(n) -> n, None -> 0 },
+  }
+}
+
+test "a value whose text fits the budget is shown whole" {
+  gen::check(values(), |v: Value|
+    render_all(v).len() > shown_characters() || render(v) == render_all(v))
+}
+
+test "past the budget, a string is cut and counts the characters it left out, as bytes count theirs" {
+  let n = shown_characters();
+  let text = |k: Int| VStr("a".repeat(k));
+  assert_eq(render(text(n)), render_all(text(n)));
+  assert_eq(render(text(n + 5)), render_all(text(n)) ++ " … 5 more");
+  let bytes = |s: String| render(VBytes(Bytes::of_string(s)));
+  assert_eq(bytes("a".repeat(n + 5)), "b" ++ render(text(n + 5)));
+  let escaped = "ab\"\n".repeat(n);
+  assert_eq(bytes(escaped), "b" ++ render(VStr(escaped)))
+}
+
+test "past the budget, each kind of container is cut alike, counting the items it left out" {
+  let ints = |k: Int| range(0, k).map(|i: Int| VInt(i));
+  let counted = |v: Value| {
+    let cut = last_cut(render(v));
+    cut.shown.split(", ").len() - 1 + cut.more
+  };
+  let n = shown_characters();
   assert_eq(
-    render(VBytes(Bytes::concat_all(range(0, 40).map(|_: Int| b"a")))),
-    "b\"" ++ String::of_bytes(Bytes::concat_all(range(0, 32).map(|_: Int| b"a")))
-      ++ "\" … 8 more",
-  )
+    [
+      counted(VList(ints(n))),
+      counted(VArray(ints(n))),
+      counted(VCtor("m.Row", ints(n))),
+      counted(VMap(ints(n).map(|x: Value| -> Entry { { key: x, value: x } }))),
+      counted(
+        VRecord(
+          range(0, n).map(|i: Int| -> Field { { name: "f" ++ i.to_string(), value: VInt(i) } }),
+        ),
+      ),
+    ],
+    [n, n, n, n, n],
+  );
+  let small = last_cut(render(VList(ints(n))));
+  let large = last_cut(render(VList(ints(2 * n))));
+  assert_eq(small.shown, large.shown);
+  assert_eq(large.more - small.more, n)
+}
+
+test "the budget is the whole value's, so what one part spends another cannot" {
+  let part = VStr("a".repeat(shown_characters() * 3 / 5));
+  assert_eq(render(VList([part])), render_all(VList([part])));
+  let both = render(VList([part, part]));
+  let kept = both.chars().filter(|c: Char| c == 'a').len();
+  assert(kept <= shown_characters());
+  assert_eq(kept + last_cut(both).more, 2 * (shown_characters() * 3 / 5))
 }
 
 test "a character shows as its literal, its own quote and the control characters escaped" {
@@ -1043,7 +1188,7 @@ test "characters order by scalar value, after every fixed width" {
   assert_eq(order(VFixed("U8", 255u128), VChar('a')), Less)
 }
 
-test "containers nest, a tuple shows as one, and a list past 32 items is counted" {
+test "containers nest, and a tuple shows as one" {
   assert_eq(render(VList([VInt(1), VInt(2)])), "[1, 2]");
   assert_eq(render(VArray([VInt(1), VInt(2)])), "Array::of_list([1, 2])");
   assert_eq(
@@ -1056,11 +1201,7 @@ test "containers nest, a tuple shows as one, and a list past 32 items is counted
   );
   assert_eq(render(VCtor("Some", [VInt(3)])), "Some(3)");
   assert_eq(render(VCtor("None", [])), "None");
-  assert_eq(render(VMap([{ key: VStr("k"), value: VInt(1) }])), "{\"k\": 1}");
-  assert_eq(
-    render(VList(range(0, 34).map(|i: Int| VInt(i)))),
-    "[" ++ String::join(range(0, 32).map(|i: Int| i.to_string()), ", ") ++ ", … 2 more]",
-  )
+  assert_eq(render(VMap([{ key: VStr("k"), value: VInt(1) }])), "{\"k\": 1}")
 }
 
 test "a constructor shows under the name its module declares, not where the module stands" {
@@ -1068,7 +1209,7 @@ test "a constructor shows under the name its module declares, not where the modu
   assert_eq(render(VCtor("app.models.Red", [])), "Red")
 }
 
-test "a set shows as the literal that builds it, its elements past 32 counted" {
+test "a set shows as the literal that builds it" {
   let set = |keys: List<Value>|
     VCtor("std.set.Set", [VMap(keys.map(|k: Value| { key: k, value: VUnit }))]);
   assert_eq(render(set([VInt(1), VStr("a")])), "#[1, \"a\"]");
@@ -1079,10 +1220,11 @@ test "a set shows as the literal that builds it, its elements past 32 counted" {
 }
 
 test "render_all writes what render does, every item at every depth" {
-  let long = VList(range(0, 40).map(|i: Int| VInt(i)));
+  let n = shown_characters();
+  let long = VList(range(0, n).map(|i: Int| VInt(i)));
   assert_eq(
     render_all(long),
-    "[" ++ String::join(range(0, 40).map(|i: Int| i.to_string()), ", ") ++ "]",
+    "[" ++ String::join(range(0, n).map(|i: Int| i.to_string()), ", ") ++ "]",
   );
   assert(render(long) != render_all(long));
   assert_eq(render_all(VCtor("m.Shipped", [VInt(2)])), "Shipped(2)");

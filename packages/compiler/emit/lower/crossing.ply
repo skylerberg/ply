@@ -14,8 +14,11 @@ import std.bytes
 import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.type_syntax (MRaise)
 import compiler.syntax.exprs (is_exit_effect, exit_op)
-import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type,
-                             int_type, unit_type, bytes_type, string_type, spelled_type, bool_type)
+import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, int_type,
+                             unit_type, bytes_type, string_type, spelled_type, bool_type,
+                             float_type, decimal_type)
+import compiler.check.known (is_bool, is_char, is_string, is_bytes, unit_name, bool_name, int_name,
+                             char_name, decimal_name, ordering_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.c (Width, width_named, width_index)
@@ -25,7 +28,7 @@ import compiler.emit.keys (RootKey, Root, Written, TypeOp, Lower, Lift, Dup, Wor
 import compiler.emit.tir (Rep, RInt, RBool, RImm, RWord, RFloat, RNum, RDec, RWide, RAddr, RUnit,
                           Arg, AVar, OStrings, string_uses, AInt, AZero, Var, Val, Uses, Prim, Get,
                           PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent, Owned,
-                          Static, Fn, Inst, Let, Return, Crossing, Pending, no_links)
+                          Static, Fn, Rooted, Inst, Let, Return, Pending, no_links)
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.strings (Grown)
 import compiler.emit.tir.handling (HandleOp, Unsettled, VarInit, VarRead, VarWrite)
@@ -36,7 +39,7 @@ import compiler.emit.lower.held (held_as, held_with, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Instanced, unreachable, bound,
                                  bound_as, done, handed, type_of, pair_words, noted, static_added,
                                  read_typed)
-import compiler.emit.reps (Ctors, SumCtor, OpMode, EffectName, type_vars, runtime_object)
+import compiler.emit.reps (Ctors, SumCtor, OpMode, EffectName, type_vars, runtime_object, word_type)
 import compiler.emit.print.counting (never_lifted_fn)
 import compiler.emit.marks (marks_of, marked_key, carried_by, marked_type, function_marks)
 import compiler.emit.answer (Exact)
@@ -251,7 +254,7 @@ fn lifted_part(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abor
 /// Whether `ty` names every part of a value of it: no type variable and no word erased to `_`.
 pub fn settled(ty: Type) -> Bool =
   match ty {
-    TyCon(c) -> c.name != b"_" && c.args.all(settled),
+    TyCon(c) -> ty != word_type() && c.args.all(settled),
     TyVar(_) -> false,
     TyFn(f) -> f.params.push(f.ret).all(settled),
     TyRecord(fs) -> fs.all(|f: Field| settled(f.ty)),
@@ -420,13 +423,7 @@ fn machine(
       WithBits -> native_int(given.st, m.name, given.args, m.fails, at),
       WithFloat -> {
         let b = native_int(given.st, m.name, given.args, m.fails, at);
-        bound_as(
-          b.st,
-          named_type(b"Float"),
-          RFloat,
-          Prim({ op: b"of_bits", on: RInt, args: [b.arg] }),
-          at,
-        )
+        bound_as(b.st, float_type(), RFloat, Prim({ op: b"of_bits", on: RInt, args: [b.arg] }), at)
       },
       WithBytes -> {
         let n = native_int(given.st, m.name, given.args, m.fails, at);
@@ -491,7 +488,7 @@ fn decimal_in(cx: Context, st: Lowering, ty: Type, at: Span) -> Lowered / {abort
   let hi = native_int(lo.st, b"?in_high", [], false, at);
   bound_as(
     hi.st,
-    named_type(b"Decimal"),
+    decimal_type(),
     RDec,
     Prim({ op: b"decimal", on: RInt, args: [lo.arg, hi.arg] }),
     at,
@@ -735,13 +732,7 @@ pub fn over_machine_words(
       MachineFunction(_) -> unreachable(b"a native answering a function value"),
       MachineFloat -> {
         let b = native_word(given.st, made, at);
-        bound_as(
-          b.st,
-          named_type(b"Float"),
-          RFloat,
-          Prim({ op: b"of_bits", on: RInt, args: [b.arg] }),
-          at,
-        )
+        bound_as(b.st, float_type(), RFloat, Prim({ op: b"of_bits", on: RInt, args: [b.arg] }), at)
       },
       MachineInt(t) -> integer_answered(native_word(given.st, made, at), t, at),
     }
@@ -775,9 +766,9 @@ fn object_answered(
 /// `Bool` as whether it is other than 0, a `Char` as the scalar value it is, and a width narrowed.
 fn integer_answered(w: Lowered, t: Type, at: Span) -> Lowered =
   match t {
-    TyCon(c) -> if c.name == b"Bool" {
+    TyCon(c) -> if is_bool(t) {
       bound_as(w.st, t, RBool, Prim({ op: b"ne", on: RInt, args: [w.arg, AInt(0)] }), at)
-    } else if c.name == b"Char" {
+    } else if is_char(t) {
       bound_as(w.st, t, RImm, Prim({ op: b"char_of", on: RInt, args: [w.arg] }), at)
     } else {
       match width_named(c.name) {
@@ -807,9 +798,9 @@ pub fn scalar_encoding(
   at: Span,
 ) -> Option<Lowered> / {abort.raise} =
   match ty {
-    TyCon(c) -> if c.args.len() > 0 { None } else if c.name == b"String" || c.name == b"Bytes" {
+    TyCon(c) -> if c.args.len() > 0 { None } else if is_string(ty) || is_bytes(ty) {
       let t = addressed(st, a, at);
-      let text = AInt(if c.name == b"String" { 1 } else { 0 });
+      let text = AInt(if is_string(ty) { 1 } else { 0 });
       let n = native_int(t.st, b"?text_encoded", [text, t.address, t.count], true, at);
       Some(taken_out(n.st, n.arg, bytes_type(), at))
     } else {
@@ -839,14 +830,14 @@ fn scalar_words(
   name: Bytes,
   at: Span,
 ) -> Option<{ st: Lowering, kind: Int, t: Int, lo: Arg, hi: Arg }> / {abort.raise} =
-  if name == b"Unit" { Some({ st: st, kind: 0, t: 0, lo: AInt(0), hi: AInt(0) }) }
-  else if name == b"Bool" {
+  if name == unit_name() { Some({ st: st, kind: 0, t: 0, lo: AInt(0), hi: AInt(0) }) }
+  else if name == bool_name() {
     let b = handed({ st: st, arg: a }, RBool, at);
     Some({ st: b.st, kind: 1, t: 0, lo: b.arg, hi: AInt(0) })
-  } else if name == b"Int" {
+  } else if name == int_name() {
     let n = handed({ st: st, arg: a }, RInt, at);
     Some({ st: n.st, kind: 2, t: 0, lo: n.arg, hi: AInt(0) })
-  } else if name == b"Char" {
+  } else if name == char_name() {
     let k = handed({ st: st, arg: a }, RImm, at);
     let v = bound_as(
       k.st,
@@ -856,7 +847,7 @@ fn scalar_words(
       at,
     );
     Some({ st: v.st, kind: 4, t: 0, lo: v.arg, hi: AInt(0) })
-  } else if name == b"Decimal" {
+  } else if name == decimal_name() {
     let p = pair_words(st, a, RDec, at);
     Some({ st: p.st, kind: 5, t: 0, lo: p.lo, hi: p.hi })
   } else {
@@ -1243,7 +1234,7 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Fn / {abort.raise} =
           let other = { id: 1, ty: w.ty, rep: RWord };
           let left = { id: 2, ty: w.ty, rep: rep };
           let right = { id: 3, ty: w.ty, rep: rep };
-          let answered_ty = if op == keys::Equal { bool_type() } else { named_type(b"Ordering") };
+          let answered_ty = if op == keys::Equal { bool_type() } else { ordering_type() };
           let answered = { id: 4, ty: answered_ty, rep: held_with(ctors, answered_ty) };
           let signed = { id: 5, ty: int_type(), rep: RInt };
           let word_ty = if op == keys::Equal { answered_ty } else { int_type() };
@@ -1285,11 +1276,10 @@ pub fn worded(ctors: Ctors, k: RootKey) -> Fn / {abort.raise} =
 fn entry_fn(k: RootKey, answer_ty: Type, answer: Rep, params: List<Var>, body: List<Inst>) -> Fn =
   {
     key: k,
-    kind: Crossing,
+    kind: Rooted,
     params: params,
     conv: {
-      params: params.map(|_: Var| Lent),
-      reps: params.map(|v: Var| v.rep),
+      params: params.map(|v: Var| { handed: Lent, rep: v.rep }),
       answer: answer,
       destined: false,
       answered: Owned,

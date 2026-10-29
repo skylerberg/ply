@@ -7,7 +7,14 @@ import compiler.emit.code (Lambda)
 import compiler.check.resolve.tables (qualify)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
                              Atom, int_type, spelled_type, named_type, option_type, list_type,
-                             string_type, bytes_type, row_empty, over_arg, atoms_union)
+                             string_type, bytes_type, bool_type, float_type, unit_type, map_type,
+                             row_empty, over_arg, atoms_union)
+import compiler.check.known (is_int, is_bool, is_float, is_decimal, is_bytes, is_char, list_item,
+                             array_element, columns_row, int_name, bool_name, char_name,
+                             decimal_name, float_name, unit_name, columns_name, task_name,
+                             chan_name, secret_name, hold_name, option_name, result_name, none_ctor,
+                             some_ctor, ok_ctor, err_ctor, array_type, char_type, result_type,
+                             width_type)
 import compiler.emit.layout
 import compiler.emit.layout (WordClass, P, C, R, S, U, LWords, LSum, SumLaid, CaseLaid, CaseArgs,
                              Payload, Nullary, Inline, Boxed, WordForm, Itself, Bits, RuntimeBox,
@@ -247,7 +254,7 @@ fn unkept_in(unkept: Map<Bytes, Unkept>, ty: Type) -> Unheld =
       x.fields.fold(no_unheld(), |a: Unheld, f: Field| unheld_joined(a, unkept_in(unkept, f.ty))),
     TyCon(c) -> if resumed(ty) != None || never_kept_name(c.name) { { always: true, vars: [] } }
     // A `Columns` holds an array of each field of its records.
-    else if c.name == b"Columns" {
+    else if c.name == columns_name() {
       c.args.fold(no_unheld(), |acc: Unheld, r: Type|
         match r {
           TyRecord(_) -> unheld_joined(acc, unkept_in(unkept, r)),
@@ -291,7 +298,8 @@ pub fn never_kept_name(name: Bytes) -> Bool = runtime_object(name)
 /// Whether the type named `name` is one of the runtime's own objects, which crosses as a handle
 /// whatever its arguments: a task, a channel, a secret, a hold or a scheduler's object.
 pub fn runtime_object(name: Bytes) -> Bool =
-  [b"Task", b"Chan", b"Secret", b"Hold"].contains(name) || scheduler_objects().contains(name)
+  [task_name(), chan_name(), secret_name(), hold_name()].contains(name)
+    || scheduler_objects().contains(name)
 
 /// The extern types the scheduler declares, each a block of the runtime's holding what its natives
 /// made it of, which the runtime lets go of.
@@ -579,7 +587,7 @@ pub fn type_vars(ty: Type) -> List<Int> =
 /// Whether argument `at` of `c` is the label a `Hold` is of, which rides first: no type, so it lays
 /// nothing out and its variable is no type's, as a label or row argument's is not.
 pub fn held_label(c: { name: Bytes, args: List<Type> }, at: Int) -> Bool =
-  at == 0 && c.name == b"Hold" && c.args.len() == 2
+  at == 0 && c.name == hold_name() && c.args.len() == 2
 
 fn ints_joined(a: List<Int>, b: List<Int>) -> List<Int> =
   b.fold(a, |acc: List<Int>, x: Int| if acc.contains(x) { acc } else { acc.push(x) })
@@ -589,7 +597,7 @@ pub fn laid_vars(ty: Type) -> List<Int> =
     TyVar(v) -> if v >= 0 { [v] } else { [] },
     TyRecord(fs) -> fs.fold([], |acc: List<Int>, f: Field| acc.concat(laid_vars(f.ty))),
     TyNominal(x) -> x.fields.fold([], |acc: List<Int>, f: Field| acc.concat(laid_vars(f.ty))),
-    TyCon(c) -> if (c.name == b"Array" || c.name == b"Columns") && c.args.len() == 1 {
+    TyCon(c) -> if array_element(ty) != None || columns_row(ty) != None {
       c.args.fold([], |acc: List<Int>, a: Type| acc.concat(laid_vars(a)))
     } else { [] },
     _ -> [],
@@ -604,6 +612,8 @@ pub type Def = {
   ret: Option<Kind>,
   ret_ty: Ty,
   pure: Bool,
+  /// A `const fn`, a raise that leaves whose body ends the run.
+  constant: Bool,
   arity: Int,
   scheme: Option<Scheme>,
   /// How many witnesses come before the parameters its scheme writes, each an `Int`.
@@ -645,9 +655,6 @@ pub type BoundLambda = {
   owner: RootKey,
   nth: Int,
   code: Lambda,
-  /// Whether it is a definition its owner named as a value, read as the lambda around a call of
-  /// it: run in place it counts no step but that call's.
-  named: Bool,
   module: Bytes,
   here: List<Def>,
   imports: List<Imported>,
@@ -656,10 +663,6 @@ pub type BoundLambda = {
   /// Every lambda its owner lends, those within it among them, by their places.
   written: List<Lambda>,
 }
-
-/// An owner's lambdas as `BoundLambda` reads its first: the rest are its `written`, and those past
-/// `lambdas` are definitions it names as values.
-pub type OwnerLambdas = { bound: BoundLambda, lambdas: Int }
 
 /// An imported name lowers like a builtin; only the import list tells them apart. `defs` is empty when the module is out of reach.
 /// `whole` binds the module itself, which only a qualified name reaches: a bare `min` is never a module `min`.
@@ -715,24 +718,22 @@ pub fn nullary_sum(cs: List<SumCtor>) -> Bool =
 /// field read or an inline builtin can take of its type.
 pub fn kind_of(ty: Type) -> { kind: Kind, ty: Ty } =
   match ty {
-    TyCon(c) -> if c.args.len() == 0 && c.name == b"Int" { { kind: KInt, ty: TyOpen([]) } }
-    else if c.args.len() == 0 && c.name == b"Bool" { { kind: KBool, ty: TyOpen([]) } }
-    else if c.args.len() == 0 && c.name == b"Float" { { kind: KFloat, ty: TyOpen([]) } }
-    else if c.args.len() == 0 && c.name == b"Decimal" { { kind: KDec, ty: TyOpen([]) } }
-    else if c.args.len() == 0 && c.name == b"Bytes" { { kind: KBoxed, ty: TyBytes } }
-    else if c.args.len() == 1 && c.name == b"List" { { kind: KBoxed, ty: TyList } }
-    else if c.args.len() == 1 && c.name == b"Array" {
-      {
-        kind: KBoxed,
-        ty: TyArr(match c.args.at(0) { Some(e) -> laid_field(b"e", e), None -> None }),
+    TyCon(c) -> if is_int(ty) { { kind: KInt, ty: TyOpen([]) } }
+    else if is_bool(ty) { { kind: KBool, ty: TyOpen([]) } }
+    else if is_float(ty) { { kind: KFloat, ty: TyOpen([]) } }
+    else if is_decimal(ty) { { kind: KDec, ty: TyOpen([]) } }
+    else if is_bytes(ty) { { kind: KBoxed, ty: TyBytes } }
+    else if list_item(ty) != None { { kind: KBoxed, ty: TyList } } else {
+      match array_element(ty) {
+        Some(e) -> { kind: KBoxed, ty: TyArr(laid_field(b"e", e)) },
+        None -> match width_named(c.name) {
+          Some(w) -> if c.args.len() > 0 { boxed() }
+          else if carried(w) { { kind: KNum(w), ty: TyOpen([]) } }
+          else { { kind: KWide(w), ty: TyOpen([]) } },
+          None -> boxed(),
+        },
       }
-    } else if c.args.len() == 0 {
-      match width_named(c.name) {
-        Some(w) -> if carried(w) { { kind: KNum(w), ty: TyOpen([]) } }
-        else { { kind: KWide(w), ty: TyOpen([]) } },
-        None -> boxed(),
-      }
-    } else { boxed() },
+    },
     // Field order is the checker's, sorted by name. A field of a variable's type may hold any kind's
     // word or bits, and a record it holds in place any width, so such a record is read by name, as
     // the runtime reads it.
@@ -986,11 +987,11 @@ fn vars_within(ctors: Ctors, ty: Type, cut: List<Bytes>, depth: Int) -> List<Int
 /// The words a value of the type named `name`, which no declared sum is, is laid in: a scalar's, none
 /// for `Unit`, and one pointer for any other.
 fn classes_named(name: Bytes) -> List<WordClass> =
-  if name == b"Unit" { [] }
-  else if name == b"Bool" { [R({ lo: 0, hi: 1 })] }
-  else if name == b"Char" { [C(0)] }
-  else if name == b"Decimal" { [raw(), raw()] }
-  else if name == b"Int" || name == b"Float" { [raw()] } else {
+  if name == unit_name() { [] }
+  else if name == bool_name() { [R({ lo: 0, hi: 1 })] }
+  else if name == char_name() { [C(0)] }
+  else if name == decimal_name() { [raw(), raw()] }
+  else if name == int_name() || name == float_name() { [raw()] } else {
     match width_named(name) {
       Some(w) -> if carried(w) { [raw()] } else { [raw(), raw()] },
       None -> [P],
@@ -1064,8 +1065,8 @@ pub fn word_form(ctors: Ctors, ty: Type) -> WordForm / {abort.raise} = {
     TyRecord(_) -> record,
     TyNominal(_) -> record,
     TyCon(c) -> if ctors.sums.contains(c.name) { held }
-    else if c.name == b"Int" || c.name == b"Bool" || c.name == b"Float" { Bits }
-    else if c.name == b"Decimal" { RuntimeBox } else {
+    else if is_int(ty) || is_bool(ty) || is_float(ty) { Bits }
+    else if is_decimal(ty) { RuntimeBox } else {
       match width_named(c.name) {
         Some(w) -> if carried(w) { Bits } else { RuntimeBox },
         None -> held,
@@ -1123,7 +1124,7 @@ pub fn has_vars(ty: Type) -> Bool =
 /// Whether a specialisation holds a value of `ty` apart from a word, or does its operators in C.
 pub fn held_apart(ty: Type) -> Bool =
   match ty {
-    TyCon(c) -> c.args.len() == 0 && (kind_of(ty).kind != KBoxed || c.name == b"Char"),
+    TyCon(c) -> c.args.len() == 0 && (kind_of(ty).kind != KBoxed || is_char(ty)),
     _ -> false,
   }
 
@@ -1201,6 +1202,7 @@ pub fn def_entry(
     ret: match ret { Some(r) -> Some(r.kind), None -> None },
     ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen([]) },
     pure: pure.contains(full),
+    constant: d.constant != None,
     arity: witnesses + d.params.len() + d.generics.labels.len(),
     scheme: schemes.get(full),
     witnesses: witnesses,
@@ -1214,17 +1216,11 @@ pub fn def_entry(
 test "a specialisation's root spells its layouts and the lambdas it runs" {
   let args = [
     TyRecord([
-      {
-        name: b"a",
-        ty: TyCon({
-          name: b"Array",
-          args: [TyRecord([{ name: b"x", ty: TyCon({ name: b"Float", args: [] }) }])],
-        }),
-      },
-      { name: b"b", ty: TyCon({ name: b"_", args: [] }) },
+      { name: b"a", ty: array_type(TyRecord([{ name: b"x", ty: float_type() }])) },
+      { name: b"b", ty: word_type() },
     ]),
-    TyCon({ name: b"List", args: [TyCon({ name: b"_", args: [] })] }),
-    TyCon({ name: b"U32", args: [] }),
+    list_type(word_type()),
+    width_type({ bits: 32, signed: false }),
   ];
   let name = root_text(root_name(at_key(b"m.f", args, [])));
   // The specialisation is of its definition, and each type it is at shows in its name, a record one
@@ -1232,7 +1228,7 @@ test "a specialisation's root spells its layouts and the lambdas it runs" {
   assert(name.starts_with(b"m.f@{a:Array<%") && name.index_of(b",List<_>,U32") != None, None);
   assert(root_name(at_key(b"m.f", args, [])) != root_name(at_key(b"m.f", args.take(2), [])), None);
   // A lambda a caller hands is spelled by the root that wrote it and which of its lambdas it is.
-  let u32 = [TyCon({ name: b"U32", args: [] })];
+  let u32 = [width_type({ bits: 32, signed: false })];
   let lent = |nth: Int| [{ param: 1, owner: Named(b"app.main"), nth: nth }];
   let handed = root_name(at_key(b"m.f", u32, lent(0)));
   assert(
@@ -1258,13 +1254,17 @@ fn sample_ctors() -> Ctors = {
     [],
     [],
     [],
-    Map::new().insert(b"Option", [
-      case_of(b"None", 0, [], [0]),
-      case_of(b"Some", 1, [a], [0]),
-    ]).insert(b"Result", [case_of(b"Ok", 0, [a], [0, 1]), case_of(b"Err", 1, [b], [0, 1])]).insert(
-      b"m.Color",
-      [case_of(b"m.Red", 0, [], []), case_of(b"m.Green", 1, [], []), case_of(b"m.Blue", 2, [], [])],
-    ).insert(b"m.Shape", [
+    Map::new().insert(option_name(), [
+      case_of(none_ctor(), 0, [], [0]),
+      case_of(some_ctor(), 1, [a], [0]),
+    ]).insert(result_name(), [
+      case_of(ok_ctor(), 0, [a], [0, 1]),
+      case_of(err_ctor(), 1, [b], [0, 1]),
+    ]).insert(b"m.Color", [
+      case_of(b"m.Red", 0, [], []),
+      case_of(b"m.Green", 1, [], []),
+      case_of(b"m.Blue", 2, [], []),
+    ]).insert(b"m.Shape", [
       case_of(b"m.Circle", 0, [int], []),
       case_of(b"m.Square", 1, [int], []),
     ]).insert(b"m.Size", [
@@ -1337,10 +1337,7 @@ test "a type lays a value out in its words, a record in its fields' and a sum by
   );
   // An enum's `None` is the value after its last case.
   assert_eq(classes(lay(option_type(named_type(b"m.Color")))), [R({ lo: 0, hi: 3 })]);
-  assert_eq(classes(lay(applied(b"Result", [int_type(), string_type()]))), [
-    R({ lo: 0, hi: 1 }),
-    U,
-  ]);
+  assert_eq(classes(lay(result_type(int_type(), string_type()))), [R({ lo: 0, hi: 1 }), U]);
   // A type variable has no layout: a settled type is owed in its place.
   assert_eq(handle { words(lay(TyVar(0))) } with { abort.raise(_) -> 0 - 1 }, 0 - 1)
 }
@@ -1442,9 +1439,9 @@ test "two sums laid alike share a layout key, and Option<Color> and Option<Strin
   assert(key(named_type(b"m.Shape")) != key(option_type(string_type())), None);
   assert_eq(
     key(option_type(option_type(string_type()))),
-    key(option_type(option_type(named_type(b"Bytes")))),
+    key(option_type(option_type(bytes_type()))),
   );
-  assert_eq(key(either(named_type(b"Char"))) == key(either(string_type())), false);
+  assert_eq(key(either(char_type())) == key(either(string_type())), false);
   // Whatever is laid as one pointer is one key, but a record, whose one word is a box of it.
   let pointer = key(string_type());
   assert_eq([list_type(int_type()), applied(b"m.Wrap", [int_type()])].map(key), [pointer, pointer]);
@@ -1484,13 +1481,7 @@ test "a value is one word as itself, a scalar's bits, the runtime's box, or a bo
   // its word form, and a record of none is nothing.
   let one = |t: Type| TyRecord([{ name: b"a", ty: t }]);
   assert_eq(
-    [
-      one(int_type()),
-      one(TyCon({ name: b"Map", args: [bytes_type(), named_type(b"Bool")] })),
-      one(named_type(b"Unit")),
-    ].map(
-      form,
-    ),
+    [one(int_type()), one(map_type(bytes_type(), bool_type())), one(unit_type())].map(form),
     [Box(1), Box(1), Itself],
   );
   assert_eq(
@@ -1508,7 +1499,7 @@ test "a value is one word as itself, a scalar's bits, the runtime's box, or a bo
     [],
     [],
     Map::new().insert(b"m.Id", [case_of(b"m.Id", 0, [int_type()], [])]).insert(b"m.Small", [
-      case_of(b"m.Small", 0, [named_type(b"U8")], []),
+      case_of(b"m.Small", 0, [width_type({ bits: 8, signed: false })], []),
     ]),
   );
   assert_eq([named_type(b"m.Id"), named_type(b"m.Small")].map(|t: Type| word_form(ids, t)), [

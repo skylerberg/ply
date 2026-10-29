@@ -15,17 +15,19 @@ pub struct Ctx {
     /// stack's own: a switch saves it with the stack it leaves and puts back the other's.
     pub fuel: i64,
     /// The lowest address a compiled frame may begin at: C frames can overflow within the fuel.
-    pub stack_floor: usize,
+    /// The watchdog raises it past every frame once the entry's clock runs out ([`watched`]).
+    pub stack_floor: std::sync::atomic::AtomicUsize,
     /// The site the body stored before a fallible call, as bytes from its root's start; the root
     /// is `-1` until one is.
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
-    /// Calls this entry has made: the prologue counts one, and so does every pass of a loop.
-    pub ticks: i64,
-    /// The tick at which compiled code calls [`rt_tick`] back; `i64::MAX` when neither the budget
-    /// nor the clock bounds this entry, so nothing calls back at all.
-    pub next_tick: i64,
+    // The runtime's own two, in the words between the fields emitted code reads.
+    /// The fuel this entry began with: how deeply its calls may nest.
+    pub(super) depth_bound: i64,
+    /// Chunks of stack this entry's calls made writable past what their stacks started with, so
+    /// growing is observable.
+    pub grown: u64,
     /// The innermost frame record on the running stack's chain: [`crate::frames::base`] at the
     /// bottom of a detached body's own stack, the one kind that records, and null on any other. A
     /// switch saves it with the stack it leaves and puts back the other's.
@@ -61,24 +63,9 @@ pub struct Ctx {
     /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
     /// which only that task may leave.
     pub task: i64,
-    /// The calls this entry may make; 0 is no bound.
-    pub(super) step_budget: i64,
-    /// The fuel this entry began with: how deeply its calls may nest.
-    pub(super) depth_bound: i64,
-    /// Calls and allocations a memoized answer cost when it was computed, charged to the entry that
-    /// read it, so a test reads the same cost whether a constant was memoized or not. Not budgeted.
-    pub charged: Cost,
-    /// Chunks of stack this entry's calls made writable past what their stacks started with, so
-    /// growing is observable.
-    pub grown: u64,
-    /// The costs as the program last left them for the scheduler's work, which it goes on from.
-    pub(crate) left_at: ProgramCost,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) time_budget_ms: u64,
-    /// The tick at which the clock is next read. Calls the program makes and calls the scheduler
-    /// makes both bring it nearer, however often each gives way to the other.
-    pub(super) clock_at: i64,
     pub heap: Heap,
     /// Objects the last entry allocated, kept because [`Ctx::end`] clears the heap's count.
     pub(super) last_entry: usize,
@@ -107,9 +94,6 @@ pub struct Ctx {
     pub(crate) runtime_factory: ply_core::RuntimeFactory,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
-    pub(crate) host_ops: u64,
-    /// The last at-most-once host operation this entry performed, for `E0426`.
-    pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_core::host::MachineId,
     /// Whether the entry's branches ran on the pool's threads, whose blocks then hold its objects too.
     pub(crate) pooled: bool,
@@ -137,8 +121,6 @@ pub struct Ctx {
     pub(crate) pending_words: Vec<Word>,
     /// Whether whoever runs this context's entries reads what they performed.
     pub(crate) traced: bool,
-    /// Whether the entry is a test's, whose program may read what it has cost.
-    pub tested: bool,
     /// How many holds this entry has made, which numbers the next.
     pub(super) holds_made: u64,
     /// The heap and poison site of the entry this one began inside, put back when it ends.
@@ -182,18 +164,6 @@ impl Unanswered {
             args.release();
         }
     }
-
-    /// The same raise, what it carries held once more.
-    pub(crate) fn copied(&self) -> Unanswered {
-        match self {
-            Unanswered::Abort(message) => Unanswered::Abort(message.clone()),
-            Unanswered::Raised { effect, op, args } => Unanswered::Raised {
-                effect: effect.clone(),
-                op: op.clone(),
-                args: args.copied(),
-            },
-        }
-    }
 }
 
 thread_local! {
@@ -228,13 +198,10 @@ impl Ctx {
         Ctx {
             failed: 0,
             fuel: 0,
-            stack_floor: 0,
+            stack_floor: std::sync::atomic::AtomicUsize::new(0),
             site_root: -1,
             site_start: 0,
             site_end: 0,
-            ticks: 0,
-            charged: Cost::default(),
-            next_tick: i64::MAX,
             frames: std::ptr::null_mut(),
             release_depth: 0,
             release_waiting: 0,
@@ -249,13 +216,10 @@ impl Ctx {
             performed_start: 0,
             performed_end: 0,
             task: 0,
-            step_budget: 0,
             depth_bound: 0,
             grown: 0,
-            left_at: ProgramCost::default(),
             deadline: None,
             time_budget_ms: 0,
-            clock_at: i64::MAX,
             heap: Heap::new(),
             last_entry: 0,
             tables,
@@ -272,8 +236,6 @@ impl Ctx {
             runtime_factory: ply_host::registry::unbound(),
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
-            host_ops: 0,
-            last_linear: None,
             id: ply_core::host::MachineId::next(),
             pooled: false,
             teardown: Vec::new(),
@@ -288,7 +250,6 @@ impl Ctx {
             pending: None,
             pending_words: Vec::new(),
             traced: false,
-            tested: false,
             holds_made: 0,
             outer: (std::ptr::null_mut(), std::ptr::null()),
             release_later: Vec::new(),
@@ -320,15 +281,8 @@ impl Ctx {
         let mut b = Ctx::new(Arc::clone(&self.tables));
         b.fuel = self.fuel;
         b.depth_bound = self.depth_bound;
-        // Zero is no bound, so a budget spent to the last call stays a bound of one.
-        b.step_budget = if self.step_budget > 0 {
-            (self.step_budget - self.ticks).max(1)
-        } else {
-            0
-        };
         b.deadline = self.deadline;
         b.time_budget_ms = self.time_budget_ms;
-        b.arm_tick();
         b.entry = self.entry;
         b.binding = Arc::clone(&self.binding);
         b.runtime_factory = Arc::clone(&self.runtime_factory);
@@ -338,7 +292,6 @@ impl Ctx {
         b.sim_steps = self.sim_steps;
         // A branch runs in the task its block is in.
         b.task = self.task;
-        b.tested = self.tested;
         // What a branch performed is this entry's, read wherever this entry's is.
         b.traced = self.recording != 0;
         b.rearm_recording();
@@ -358,20 +311,14 @@ impl Ctx {
         self.rearm_recording();
     }
 
-    /// Takes back what a finished branch did, in the order the branches are written: its memory,
-    /// its calls, and what it performed.
+    /// Takes back what a finished branch did, in the order the branches are written: its memory
+    /// and what it performed.
     pub(crate) fn absorb(&mut self, mut branch: Ctx) {
         self.heap.adopt_heap(std::mem::take(&mut branch.heap));
         self.pooled |= branch.pooled;
-        self.ticks = self.ticks.saturating_add(branch.ticks);
-        self.charged = self.charged.plus(branch.charged);
         self.grown += branch.grown;
         self.performed.append(&mut branch.performed);
         self.host_use.absorb(&branch.host_use);
-        self.host_ops = self.host_ops.saturating_add(branch.host_ops);
-        if branch.last_linear.is_some() {
-            self.last_linear = branch.last_linear.take();
-        }
         self.teardown.append(&mut branch.teardown);
     }
 
@@ -380,11 +327,6 @@ impl Ctx {
     /// own thread, so the run's region keeps no block in turn.
     pub(crate) fn runs_branches_at_once(&self) -> bool {
         !(self.regions.iter()).any(|(r, _)| unsafe { (**r).is_seeded() })
-    }
-
-    /// The calls left before this entry's budget is spent, or `None` when nothing bounds it.
-    pub(crate) fn steps_left(&self) -> Option<i64> {
-        (self.step_budget > 0).then(|| self.step_budget - self.ticks)
     }
 
     /// Fails this entry as one of its `parallel` branches failed.
@@ -400,37 +342,27 @@ impl Ctx {
         }
     }
 
-    /// Fails this entry as running out of its step budget does.
-    pub(crate) fn fail_out_of_steps(&mut self) {
-        self.ticks = self.step_budget.saturating_add(1);
-        self.tick();
-    }
-
-    /// Between calls, and only between calls, bounded as this thread's entries are.
+    /// Between calls, and only between calls, with no clock.
     pub fn begin(&mut self, fuel: i64) {
-        self.begin_bounded(fuel, step_budget(), time_budget_ms());
+        self.begin_bounded(fuel, 0);
     }
 
-    /// [`Ctx::begin`], the entry bounded by `steps` calls and `time_budget_ms` of wall clock, 0
-    /// for no bound.
-    pub fn begin_bounded(&mut self, fuel: i64, steps: i64, time_budget_ms: u64) {
+    /// [`Ctx::begin`], the entry bounded by `time_budget_ms` of wall clock, 0 for none. The context
+    /// stays where it is until [`Ctx::end`], since the watchdog writes to it.
+    pub fn begin_bounded(&mut self, fuel: i64, time_budget_ms: u64) {
+        self.unwatch();
         self.failed = 0;
         self.fuel = fuel;
         self.depth_bound = fuel;
-        self.ticks = 0;
-        self.charged = Cost::default();
-        self.step_budget = steps.max(0);
         self.grown = 0;
         self.heap.scheduling = false;
         self.time_budget_ms = time_budget_ms;
         self.deadline = (self.time_budget_ms > 0).then(|| {
             std::time::Instant::now() + std::time::Duration::from_millis(self.time_budget_ms)
         });
-        self.arm_tick();
-        self.stack_floor = stack_floor();
+        self.stack_floor.store(stack_floor(), Relaxed);
         self.frames = std::ptr::null_mut();
         self.site_root = -1;
-        self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Vec::new());
@@ -470,61 +402,46 @@ impl Ctx {
             heap::poison::swap(&raw const self.site_root),
         );
         self.outer_running = swap_running(self);
+        self.watch();
     }
 
-    /// When compiled code must call back next: the call one past the budget, the end of this
-    /// chunk, or never, when the entry is bounded by neither the budget nor a clock.
-    pub(super) fn arm_tick(&mut self) {
-        self.clock_at = self.ticks.saturating_add(TICK_CHUNK);
-        self.arm_tick_in_chunk();
-    }
-
-    /// [`Ctx::arm_tick`] where the program gives way to the scheduler or takes over from it: the
-    /// clock is read where it was to be.
-    pub(super) fn arm_tick_in_chunk(&mut self) {
-        let budgeted = self.step_budget > 0 && !self.heap.scheduling;
-        self.next_tick = match (budgeted, self.deadline.is_some()) {
-            (true, _) => self.step_budget.saturating_add(1).min(self.clock_at),
-            (false, true) => self.clock_at,
-            (false, false) => i64::MAX,
-        };
-    }
-
-    /// The call counter reached [`Ctx::next_tick`]: charge the budget, read the clock, and say
-    /// when to call back. Both bounds are decided here, so a call itself costs one increment and
-    /// one compare, and the clock is read once every [`TICK_CHUNK`] calls rather than on any.
-    pub(super) fn tick(&mut self) {
-        if self.step_budget > 0 && !self.heap.scheduling && self.ticks > self.step_budget {
-            let budget = self.step_budget;
-            let d = Diagnostic::error(
-                codes::STEP_BUDGET,
-                format!("did not finish within its budget of {budget} calls"),
-            )
-            .primary(Span::DUMMY, "still running here")
-            .note("`--steps N` raises the budget; 0 is no bound");
-            self.fail_with(FAILED_OUT_OF_STEPS, d);
-            return;
+    /// Has the watchdog end this context's run once its deadline passes, where it has one. The
+    /// context stays where it is until [`Ctx::unwatch`].
+    pub(crate) fn watch(&self) {
+        if let Some(deadline) = self.deadline {
+            watched(&self.stack_floor, deadline);
         }
-        if let Some(deadline) = self.deadline
-            && std::time::Instant::now() > deadline
-        {
-            let ms = self.time_budget_ms;
-            let d = Diagnostic::warning(
-                codes::RUN_ABANDONED,
-                format!("abandoned after {ms} ms of wall clock"),
-            )
-            .primary(Span::DUMMY, "still running here")
-            .note("the clock says nothing about the program, so this run decided nothing")
-            .note("`--timeout MS` sets the clock; 0 is no clock");
-            self.fail_with(FAILED_ABANDONED, d);
-            return;
+    }
+
+    /// Takes the context off the watchdog's list, before it moves or its memory goes.
+    pub(crate) fn unwatch(&self) {
+        if self.deadline.is_some() {
+            unwatched(&self.stack_floor);
         }
-        self.arm_tick();
+    }
+
+    /// Fails the entry where its wall clock ran out, answering whether it did.
+    pub(super) fn out_of_time(&mut self) -> bool {
+        if self.deadline.is_none_or(|d| std::time::Instant::now() <= d) {
+            return false;
+        }
+        let ms = self.time_budget_ms;
+        let d = Diagnostic::warning(
+            codes::RUN_ABANDONED,
+            format!("abandoned after {ms} ms of wall clock"),
+        )
+        .primary(Span::DUMMY, "still running here")
+        .note("the clock says nothing about the program, so this run decided nothing")
+        .note("`--timeout MS` sets the clock; 0 is no clock");
+        self.fail_with(FAILED_ABANDONED, d);
+        true
     }
 
     /// The thread's heap, poison site and running context put back as they were when this entry
-    /// began: what [`Ctx::end`] does first, and all a Rust unwind out of the entry can do.
+    /// began, and the watchdog told it is over: what [`Ctx::end`] does first, and all a Rust unwind
+    /// out of the entry can do.
     pub(crate) fn give_thread_back(&mut self) {
+        self.unwatch();
         heap::poison::swap(self.outer.1);
         heap::swap_current(self.outer.0);
         swap_running(self.outer_running);
@@ -811,13 +728,9 @@ impl Ctx {
         self.diagnostic.take()
     }
 
-    /// What the run asked of the host since the last take, and how many of those asks were
-    /// at-most-once operations.
-    pub fn take_host_use(&mut self) -> (ply_core::host::HostUse, u64) {
-        (
-            std::mem::take(&mut self.host_use),
-            std::mem::take(&mut self.host_ops),
-        )
+    /// What the run asked of the host since the last take.
+    pub fn take_host_use(&mut self) -> ply_core::host::HostUse {
+        std::mem::take(&mut self.host_use)
     }
 }
 

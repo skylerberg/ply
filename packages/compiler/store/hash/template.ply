@@ -1,7 +1,7 @@
 //! What the encoder makes of a definition's syntax: its template, the stored form with what it
 //! references left as nodes of the program (`stored.Template`). Every name is resolved here, once.
 
-import compiler.syntax.parsing (Span, Ident, QName, is_bare, bare, starts_upper, prelude_binder)
+import compiler.syntax.parsing (Span, Ident, QName, is_bare, bare, starts_upper)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
                                     AtomExpr)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
@@ -18,8 +18,8 @@ import compiler.syntax.items (FnDef, TypeDef, TDAlias, TDSum, VariantDef, Effect
                               SpecClause, schema_of, ReturnsFresh, ReturnsParam, TDNominal,
                               TDExtern, InstanceDef, NHost, numeric_ops, numeric_by, member_of,
                               member_name)
-import compiler.check.resolve.tables (qualify)
 import compiler.check.infer.checker (MemberSite)
+import compiler.check.known (list_name, map_name)
 import std.list
 import std.option
 import std.bytes
@@ -28,7 +28,7 @@ import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, CtorTa
                                   Index, qualifier, value_target, ctor_target, type_target,
                                   effect_target)
 import compiler.store.hash.encoding (rposition, width_index, float_bits, decimal_parts, Spot, Bound,
-                                     Choice, Called, Found, Pick, Waiting)
+                                     Choice, Found, Pick, Waiting)
 import compiler.store.hash.stored
 import compiler.store.hash.stored (Reference, Itself, Note, Picked, Ran, Slotted, Free, Literal,
                                    IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
@@ -86,7 +86,7 @@ pub type Encoder = {
   label_params: List<Bytes>,
   scope: Spot,
   runs: Int,
-  chose: Option<Map<Bytes, Called>>,
+  chose: Option<Map<Bytes, Choice>>,
   reads: List<Int>,
 }
 
@@ -116,7 +116,7 @@ pub fn node_template(
   index: Index,
   module: Int,
   owner: Bytes,
-  chose: Option<Map<Bytes, Called>>,
+  chose: Option<Map<Bytes, Choice>>,
   body: NodeBody,
 ) -> Template / {abort.raise} = {
   let encoder = { ..new_encoder(index, module), owner: owner, chose: chose };
@@ -131,7 +131,7 @@ pub fn test_template(
   index: Index,
   module: Int,
   owner: Bytes,
-  chose: Option<Map<Bytes, Called>>,
+  chose: Option<Map<Bytes, Choice>>,
   definition: TestDef,
 ) -> Template / {abort.raise} =
   TestOf(test_form({ ..new_encoder(index, module), owner: owner, chose: chose }, definition))
@@ -233,7 +233,7 @@ pub fn written_for(name: Bytes) -> List<Bytes> =
 /// Whether `name` is a container type a root crosses to or from the runtime through code of the
 /// prelude: a reference naming one, as a type or as the qualifier of a function, carries what that
 /// code calls (`crossed_by`).
-pub fn container_named(name: Bytes) -> Bool = name == b"List" || name == b"Map"
+pub fn container_named(name: Bytes) -> Bool = name == list_name() || name == map_name()
 
 /// What the code crossing a container to or from the runtime calls (`written_code`) where a text
 /// of `module` names the container type `name`: a root over one crosses it, at an entry or a
@@ -653,8 +653,8 @@ fn fields(encoder: Encoder, written: List<RecField>) -> Built<List<TemplateField
 
 /// What a call on a value written `.name(..)` at `at` may call: `m::f` where it names its function
 /// in full, and otherwise every function `X::name` of a module its own can see, in the order of
-/// their program-wide names. Which of them it is the value's type says, which no hash reads: the
-/// note carries the check's choice. `names` is whether the call names an argument.
+/// their program-wide names. Which of them it is the value's type says, which no hash reads. The
+/// note carries where the check placed each argument the call names, which `names` says it does.
 fn callees(
   encoder: Encoder,
   at: Span,
@@ -662,14 +662,10 @@ fn callees(
   names: Bool,
 ) -> { callees: Callees<Int, Spot>, note: Note } / {abort.raise} = {
   let site = site_key(encoder.owner, at.site);
-  let chosen = |choice: Choice| Picked(Found(choice));
-  // With no function to choose and no argument to place, the check has nothing to say.
-  let picked = |candidates: List<Bytes>|
-    match encoder.chose {
-      Some(chose) -> chosen(choice_of(chose.get(site), candidates)),
-      None -> if candidates.len() == 0 && !names { chosen(choice_of(None, [])) }
-      else { Picked(Waiting({ at: site, candidates: candidates })) },
-    };
+  let note = match encoder.chose {
+    Some(chose) -> Picked(Found(choice_at(chose, site))),
+    None -> if names { Picked(Waiting(site)) } else { Picked(Found({ named: [] })) },
+  };
   match member_of(name.name) {
     Some(member) ->
       {
@@ -680,7 +676,7 @@ fn callees(
             span: name.span,
           }),
         ),
-        note: picked([]),
+        note: note,
       },
     None -> {
       let index = encoder.index;
@@ -696,7 +692,7 @@ fn callees(
           Greater -> false,
           _ -> true,
         });
-      { callees: Among(found), note: picked(found.map(|node: Int| index.nodes.get(node).name)) }
+      { callees: Among(found), note: note }
     },
   }
 }
@@ -706,32 +702,17 @@ fn callees(
 pub fn site_key(owner: Bytes, site: Int) -> Bytes =
   Bytes::concat_all([owner, b"#", Bytes::of_string(site.to_string())])
 
-/// What a check found of each call on a value `sites` record, by `site_key`, each function by its
-/// program-wide name, as a call's candidates name it. A call of a function a record holds in a
-/// field calls none of a type's.
-pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Called> =
-  sites.fold(Map::new(), |acc: Map<Bytes, Called>, site: MemberSite|
-    if site.callee == b"" { acc } else {
-      acc.insert(site_key(site.owner, site.site), {
-        // The check names a function the prelude binds by its bare name.
-        callee: if site.qualifier == prelude_binder() { qualify(prelude_module(), site.callee) }
-        else { site.callee },
-        named: site.named,
-      })
-    })
+/// What a check found of each call on a value `sites` record, by `site_key`. A call of a function a
+/// record holds in a field calls none of a type's.
+pub fn called_at(sites: List<MemberSite>) -> Map<Bytes, Choice> =
+  sites.fold(Map::new(), |acc: Map<Bytes, Choice>, site: MemberSite|
+    if site.callee == b"" { acc }
+    else { acc.insert(site_key(site.owner, site.site), { named: site.named }) })
 
-/// `called`, what a check found of a call on a value, as a choice among `candidates`: none where
-/// it found nothing or calls a function none of them is.
-pub fn choice_of(called: Option<Called>, candidates: List<Bytes>) -> Choice / {abort.raise} =
-  match called {
-    None -> { callee: 0 - 1, named: [] },
-    Some(found) ->
-      {
-        callee: range(0, candidates.len()).fold(0 - 1, |acc: Int, i: Int|
-          if acc < 0 && candidates.get(i) == found.callee { i } else { acc }),
-        named: found.named,
-      },
-  }
+/// What the check found of the call at `site` among `chose`: one it says nothing of names no
+/// argument.
+pub fn choice_at(chose: Map<Bytes, Choice>, site: Bytes) -> Choice =
+  match chose.get(site) { Some(c) -> c, None -> { named: [] } }
 
 /// The call `value.name[labels](arguments, named)` written at `at`.
 fn on_value(
@@ -1195,15 +1176,8 @@ fn generics_of(
   rows: List<Ident>,
   labels: List<Ident>,
   kept: List<Ident>,
-  multi: List<Ident>,
 ) -> Generics =
-  {
-    types: types.len(),
-    rows: rows.len(),
-    labels: labels.len(),
-    kept: levels_of(types, kept),
-    multi: levels_of(rows, multi),
-  }
+  { types: types.len(), rows: rows.len(), labels: labels.len(), kept: levels_of(types, kept) }
 
 /// The places among `names` of the ones `marked` holds.
 fn levels_of(names: List<Ident>, marked: List<Ident>) -> List<Int> = {
@@ -1283,13 +1257,7 @@ fn function_form(
   let measure = optional_expression(bound, definition.decreases);
   let body = expression(measure.encoder, definition.body);
   {
-    generics: generics_of(
-      generics.types,
-      generics.effects,
-      generics.labels,
-      generics.kept,
-      generics.multi,
-    ),
+    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
     parameters: parameters.form,
     returned: optional_type(generic, definition.ret),
     row: optional_row(generic, definition.effects),
@@ -1297,13 +1265,8 @@ fn function_form(
     identities: identities(generic, definition),
     returns: returning(definition),
     decreases: measure.form,
-    // A `const` publishes no raise its body can make, so its callers read another definition, and
-    // its value is written out by the code the emitter writes, which it references as a
-    // comparison does.
-    baked: match definition.baked {
-      Some(_) -> Some(written_nodes(encoder, written_code().calls)),
-      None -> None,
-    },
+    // A `const` publishes no raise its body can make, so its callers read another definition.
+    constant: definition.constant != None,
     body: body.form,
   }
 }
@@ -1322,13 +1285,7 @@ fn type_form(
   let unqualified = |name: Ident| { module: None, name: name, span: name.span };
   let items = inner.index.items.get(inner.module);
   {
-    generics: generics_of(
-      generics.types,
-      generics.effects,
-      generics.labels,
-      generics.kept,
-      generics.multi,
-    ),
+    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
     over: generics.effects.len() > 0 || generics.labels.len() > 0,
     // What a use of the type must meet is part of what the type is, as it is of a `fn`.
     constraints: constraints(inner, definition.constraints),
@@ -1411,7 +1368,6 @@ fn operation_form(encoder: Encoder, operation: OpDef) -> Operation<Int, Slotted>
   {
     name: operation.name.name,
     mode: operation.mode,
-    multi: operation.multi,
     resource: operation.resource_param,
     types: operation.ty_params.len(),
     parameters: types(inner, operation.params).map(carried),
@@ -1522,13 +1478,7 @@ fn spec_form(
   };
   {
     kind: clause.kind,
-    generics: generics_of(
-      generics.types,
-      generics.effects,
-      generics.labels,
-      generics.kept,
-      generics.multi,
-    ),
+    generics: generics_of(generics.types, generics.effects, generics.labels, generics.kept),
     parameters: owner.params.len(),
     names: scoped.form,
     body: expression(scoped.encoder, clause.expr).form,

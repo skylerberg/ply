@@ -19,8 +19,8 @@ import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
 import compiler.check.resolve.scopes (find)
 import compiler.check.resolve.defaults (seeing_all)
 import compiler.store.hash.graph (Index, TestNode, LawNode, Node, NodeFn)
-import compiler.store.hash.forms (HashOutput, build_index, Pin, Fixing, Rehashed, rehash_index,
-                                  by_name, reached_functions, Which, TheFn, TheDecl, TheItem)
+import compiler.store.hash.forms (HashOutput, build_index, Fixing, by_name, reached_functions,
+                                  Which, TheFn, TheDecl, TheItem)
 import compiler.store.hash (UseNode, hashed_and_unused, body_key, checked_hashes)
 import compiler.store.hash.printed (print_bodies, Printed, Unprintable)
 import compiler.check.typed
@@ -46,7 +46,7 @@ import std.prelude_source
 import std.bin
 import std.hash (blake3)
 import std.list
-import compiler.expand.embed (EmbedAt, ItemWants, embed_tables, rewritten)
+import compiler.expand.embed (EmbedAt, ItemWants)
 import compiler.syntax.items (parse)
 import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows,
                             known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow, HDef,
@@ -240,13 +240,12 @@ pub type InterfaceAtom = { effect: Identity, resource: Resource, mode: Mode, op:
 
 pub type InterfaceRow = { atoms: List<InterfaceAtom>, tail: Option<Int> }
 
-/// What a definition published that a mixture swapping it in alone must agree with: its scheme and
-/// its footprint, canonical. It is a function of the definition's hash.
+/// What a definition publishes to its callers: its scheme and its footprint, canonical. It is a
+/// function of the definition's hash.
 pub type DefInterface = {
   ty_vars: List<Int>,
   row_vars: List<Int>,
   kept_vars: List<Int>,
-  multi_vars: List<Int>,
   label_vars: List<Int>,
   ty: InterfaceType,
   footprint: List<InterfaceAtom>,
@@ -279,7 +278,6 @@ pub fn def_interface_of(
     ty_vars: c.scheme.ty_vars,
     row_vars: c.scheme.row_vars,
     kept_vars: c.scheme.kept_vars,
-    multi_vars: c.scheme.multi_vars,
     label_vars: c.scheme.label_vars,
     ty: interface_type(decls, c.scheme.ty),
     footprint: match c.rows.at(0) {
@@ -339,33 +337,20 @@ pub type FiledBody = { hash: Bytes, body: Bytes }
 pub type FiledDef = { name: Bytes, hash: Bytes, interface: Bytes }
 
 /// Each definition `analysis` checked, as `FiledDef` keeps it.
-pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef> / {abort.raise} =
-  interfaces_among(checked, hashes, |_: Bytes| true)
-
-/// [`interfaces_of`] for the definitions whose hash `wanted` takes: no other's is worked out.
-pub fn interfaces_among(
-  checked: CheckOutput,
-  hashes: HashOutput,
-  wanted: (Bytes) -> Bool / {abort.raise},
-) -> List<FiledDef> / {abort.raise} = {
+pub fn interfaces_of(checked: CheckOutput, hashes: HashOutput) -> List<FiledDef> / {abort.raise} = {
   let hashed = by_name(hashes.defs);
   let decls = declared_hashes(hashes);
   checked.defs.fold([], |acc: List<FiledDef>, def_info: DefInfo|
     match hashed.get(def_info.name) {
-      Some(h) -> if !wanted(h) { acc } else {
+      Some(h) ->
         acc.push({
           name: def_info.name,
           hash: h,
           interface: interface_digest(def_interface_of(decls, def_info)),
-        })
-      },
+        }),
       None -> acc,
     })
 }
-
-/// The encoding a body's bytes and their envelope are written in; a body filed under another is
-/// not read back.
-pub fn body_encoding() -> Int = 9
 
 /// Every body hashing answered, each under the hash it verifies as: a name's one body answers for
 /// each hash the name has, and a `fn` and a declaration sharing a name have a body each.
@@ -729,7 +714,6 @@ pub fn shipped_dump(d: Dump) -> Dump =
     module_packages: [],
     ctors: [],
     keys: [],
-    baked: [],
     bodies: [],
     embeds: [],
     rows: no_rows(),
@@ -817,7 +801,6 @@ pub fn dump_of(outcome: AnalysisOutcome) -> Dump / {abort.raise} =
         hashes_digest: b"",
         keys: [],
         emitter_roots: [],
-        baked: [],
         emitter_ctors: [],
         ordinals: [],
         bodies: [],
@@ -1336,45 +1319,6 @@ pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>>
   }
 }
 
-/// Every definition and test re-hashed under `pins`. The package tables are the ones the program
-/// was analysed with — a rehash that resolved with pre-package rules would read a dependency's own
-/// modules as root ones — and the shipped modules sit one past the published table, as `claims` has
-/// it.
-pub fn rehash(
-  given: List<Source>,
-  pins: List<Pin>,
-  pkgs: List<PackageDeps> = [],
-  given_packages: List<Int> = [],
-  shipped: Int = 0,
-  embeds: List<EmbedAt> = [],
-) -> Rehashed / {abort.raise} = {
-  let read = with_prelude_module(given, pkgs, given_packages, shipped);
-  let module_packages = read.module_packages;
-  let tables = embed_tables(embeds);
-  let mods = parse_all(read.sources).map(|parsed: ParsedSource|
-    { ..parsed.module, module: rewritten(tables, parsed.name, parsed.module.module).module });
-  let packaged = if pkgs.len() == 0 { no_packages(mods) } else {
-    {
-      pkgs: pkgs,
-      module_packages: module_packages,
-      std: shipped - 2,
-      compiler: shipped - 1,
-      shipped: shipped,
-    }
-  };
-  match resolve_packaged(
-      mods,
-      packaged.pkgs,
-      packaged.module_packages,
-      packaged.std,
-      packaged.compiler,
-      packaged.shipped,
-    ) {
-    ResolveFailed(_) -> panic("a program the front end checked does not resolve"),
-    ResolveSucceeded(x) -> rehash_index(build_index(x.mods, x.r).index, pins),
-  }
-}
-
 // --- Pulling in the shipped modules --------------------------------------------
 
 /// A module with its tests and laws left out.
@@ -1459,7 +1403,7 @@ test "a type sharing its name with an effect is told apart from it in an interfa
   assert(opened(b"| Box(Int)") != opened(b"| Box(Int, Int)"), None)
 }
 
-test "an interface tells a taken parameter from a lent one, and a `keep` or `multi` variable from a plain one" {
+test "an interface tells a taken parameter from a lent one, and a `keep` variable from a plain one" {
   let filed = |src: Bytes|
     match analyse(parse_all([{ name: b"m", src: src }])) {
       Refused(_) -> panic("the program checks"),
@@ -1475,11 +1419,6 @@ test "an interface tells a taken parameter from a lent one, and a `keep` or `mul
   );
   assert(
     filed(b"pub fn f<keep a>(x: keep a) -> a = x\n") != filed(b"pub fn f<a>(x: a) -> a = x\n"),
-    None,
-  );
-  assert(
-    filed(b"pub fn f<| multi e>(g: () -> Int / e) -> Int / e = g()\n")
-      != filed(b"pub fn f<| e>(g: () -> Int / e) -> Int / e = g()\n"),
     None,
   )
 }
@@ -1670,35 +1609,24 @@ test "a function `std.prelude` writes in Ply is checked at the scheme its caller
 
 // --- Embeds: tests ---------------------------------------------------------------
 
-test "a body read whole prints each call on a value as a call of what its check found" {
+test "a body read whole prints a call on a value naming the parameter its argument fills" {
   let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
   match analyse(parse_all([{ name: b"m", src: src }])) {
     Refused(_) -> panic("the fixture checks"),
     Analysed(w) -> {
-      let item = |apart: Bool, name: Bytes|
-        match print_bodies(
-            w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
-            w.hashes.defs.concat(w.hashes.decls).map(|d: { name: Bytes, hash: Bytes }|
-              { name: d.name, hash: d.hash, public: true }),
-            [],
-            [],
-            [prelude_module()],
-            apart,
-          ) {
-          Printed(ms) ->
-            ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, it: Bytes|
-              if it.contains(Bytes::concat_all([b"fn ", name, b"("])) { it } else { acc }),
-          Unprintable(why) -> panic(String::of_bytes(why.message)),
-        };
-      let shown = |t: Bytes| Some(String::of_bytes_lossy(t));
-      // Set apart, as a bisection prints a mixture, a function of a type is a plain function.
-      let apart = item(true, b"more");
-      assert(apart.contains(b"Cart::scaled(_l0, _l2: 3)"), shown(apart));
-      let total = item(true, b"total");
-      assert(total.contains(b"Cart::size(_l0)") && !total.contains(b".size("), shown(total));
-      // Under its own names, as a deployed program prints, it names the parameter it fills.
-      let own = item(false, b"more");
-      assert(own.contains(b".scaled(_l2: 3)"), shown(own))
+      let more = match print_bodies(
+          w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
+          w.hashes.defs.concat(w.hashes.decls).map(|d: { name: Bytes, hash: Bytes }|
+            { name: d.name, hash: d.hash, public: true }),
+          [],
+          [prelude_module()],
+        ) {
+        Printed(ms) ->
+          ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, it: Bytes|
+            if it.contains(b"fn more(") { it } else { acc }),
+        Unprintable(why) -> panic(String::of_bytes(why.message)),
+      };
+      assert(more.contains(b".scaled(_l2: 3)"), Some(String::of_bytes_lossy(more)))
     },
   }
 }

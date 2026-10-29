@@ -3,7 +3,7 @@
 //! image, which reaches no host. What they are handed and answer is flat as `ply_host::sqlite`
 //! reads and writes it.
 
-use super::{WRITES, asked, from_host, handed, waited};
+use super::{Nondeterministic, asked, from_host, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, lent};
@@ -152,32 +152,39 @@ pub unsafe extern "C" fn rt_sqlite_open(
     busy_ms: I64,
     statements: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_open", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.open`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
-            return I64(0);
-        };
-        let path = path.to_string();
-        let mode = match mode.0 {
-            0 => Some(Mode::ReadOnly),
-            1 => Some(Mode::ReadWrite),
-            2 => Some(Mode::Create),
-            _ => None,
-        };
-        let Some(mode) = handed(c, "sqlite_open", "a mode", mode) else {
-            return I64(0);
-        };
-        let options = Options {
-            strict: strict.0 != 0,
-            busy_ms: busy_ms.0,
-            statements: statements.0,
-        };
-        let job = databases.open(root, path, mode, options, c.id, c.site());
-        waited(c, "sqlite_open", what, job)
-    })
+    asked(
+        ctx,
+        "sqlite_open",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.open`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
+                return I64(0);
+            };
+            let path = path.to_string();
+            let mode = match mode.0 {
+                0 => Some(Mode::ReadOnly),
+                1 => Some(Mode::ReadWrite),
+                2 => Some(Mode::Create),
+                _ => None,
+            };
+            let Some(mode) = handed(c, "sqlite_open", "a mode", mode) else {
+                return I64(0);
+            };
+            let options = Options {
+                strict: strict.0 != 0,
+                busy_ms: busy_ms.0,
+                statements: statements.0,
+            };
+            let job = databases.open(root, path, mode, options, c.id, c.site());
+            waited(c, "sqlite_open", what, job)
+        },
+    )
 }
 
 /// The ticket of a connection closed: byte 1, or byte 0 for a number that names none.
@@ -187,13 +194,20 @@ pub unsafe extern "C" fn rt_sqlite_close(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_close", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.close`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        waited(c, "sqlite_close", what, Ok(databases.close(root, conn.0)))
-    })
+    asked(
+        ctx,
+        "sqlite_close",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.close`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            waited(c, "sqlite_close", what, Ok(databases.close(root, conn.0)))
+        },
+    )
 }
 
 /// The ticket of a statement run on a connection: its reply. `reads_only` refuses one that could
@@ -211,7 +225,7 @@ fn ran(
     reads_only: bool,
     cursor: bool,
 ) -> I64 {
-    asked(ctx, native, WRITES, I64(0), |c: &mut Ctx| {
+    asked(ctx, native, Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((databases, root)) = rooted(c, unsafe { lent(label.0, label.1) }, what) else {
             return I64(0);
         };
@@ -325,28 +339,35 @@ pub unsafe extern "C" fn rt_sqlite_control(
     conn: I64,
     step: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_control", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.control`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        let step = match step.0 {
-            0 => Some(Control::Begin),
-            1 => Some(Control::BeginRead),
-            2 => Some(Control::Commit),
-            3 => Some(Control::Rollback),
-            _ => None,
-        };
-        let Some(step) = handed(c, "sqlite_control", "a transaction's step", step) else {
-            return I64(0);
-        };
-        waited(
-            c,
-            "sqlite_control",
-            what,
-            Ok(databases.control(root, conn.0, step)),
-        )
-    })
+    asked(
+        ctx,
+        "sqlite_control",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.control`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            let step = match step.0 {
+                0 => Some(Control::Begin),
+                1 => Some(Control::BeginRead),
+                2 => Some(Control::Commit),
+                3 => Some(Control::Rollback),
+                _ => None,
+            };
+            let Some(step) = handed(c, "sqlite_control", "a transaction's step", step) else {
+                return I64(0);
+            };
+            waited(
+                c,
+                "sqlite_control",
+                what,
+                Ok(databases.control(root, conn.0, step)),
+            )
+        },
+    )
 }
 
 /// The ticket of a compacted copy of a connection's database written to the path at `path_at`:
@@ -359,17 +380,24 @@ pub unsafe extern "C" fn rt_sqlite_backup(
     path_at: Addr,
     path_n: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_backup", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.backup`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
-            return I64(0);
-        };
-        let job = databases.backup(root, conn.0, path.to_string(), c.site());
-        waited(c, "sqlite_backup", what, job)
-    })
+    asked(
+        ctx,
+        "sqlite_backup",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.backup`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            let Some(path) = c.text(unsafe { lent(path_at, path_n) }) else {
+                return I64(0);
+            };
+            let job = databases.backup(root, conn.0, path.to_string(), c.site());
+            waited(c, "sqlite_backup", what, job)
+        },
+    )
 }
 
 /// The ticket of the next `rows` rows of a connection's open statement: its reply.
@@ -380,18 +408,25 @@ pub unsafe extern "C" fn rt_sqlite_fetch(
     conn: I64,
     rows: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_fetch", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.fetch`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        waited(
-            c,
-            "sqlite_fetch",
-            what,
-            Ok(databases.fetch(root, conn.0, rows.0)),
-        )
-    })
+    asked(
+        ctx,
+        "sqlite_fetch",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.fetch`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            waited(
+                c,
+                "sqlite_fetch",
+                what,
+                Ok(databases.fetch(root, conn.0, rows.0)),
+            )
+        },
+    )
 }
 
 /// The ticket of a connection's open statement ended: byte 1, or byte 0 where none is open.
@@ -401,11 +436,18 @@ pub unsafe extern "C" fn rt_sqlite_finish(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(ctx, "sqlite_finish", WRITES, I64(0), |c: &mut Ctx| {
-        let what = "`sqlite.finish`";
-        let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what) else {
-            return I64(0);
-        };
-        waited(c, "sqlite_finish", what, Ok(databases.finish(root, conn.0)))
-    })
+    asked(
+        ctx,
+        "sqlite_finish",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let what = "`sqlite.finish`";
+            let Some((databases, root)) = rooted(c, unsafe { lent(label_at, label_n) }, what)
+            else {
+                return I64(0);
+            };
+            waited(c, "sqlite_finish", what, Ok(databases.finish(root, conn.0)))
+        },
+    )
 }

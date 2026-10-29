@@ -11,15 +11,15 @@ import surface
 import machine
 import compiler.front.published (no_rows)
 import compiler.front.seam (Analysed, Refused, Within, view_of, test_root_at)
-import compiler.front.facts (View)
+import compiler.front.facts (View, test_label_spans)
 import compiler.front (analyse_pulling_std_with)
 import compiler.unit (codes, shipped)
 import compiler.store.hash.forms (TheItem, Which, listing_reach, reached_functions)
-import compiler.check.infer.checker (DefInfo, TestInfo)
+import compiler.check.infer.checker (DefInfo, TestInfo, Location)
 import compiler.emit.keys (RootKey, Named, Cases, Clause, RootName, root_name)
-import compiler.check.resolve.tables (Diag, Source, qualify)
+import compiler.check.resolve.tables (Diag, Label, Source, qualify)
 import diagnostic (Raised, diag_of, shown)
-import program (Timed, keep_command)
+import program (Timed, keep_command, sourced)
 import results
 import report (Answer, ok_code)
 import sources (Project)
@@ -40,15 +40,13 @@ import testing.select (Cached, Decision, Pass, Reason, Search, Stands, asked_by_
 import std.bytes
 import sim.plan
 import std.string
-import surface (parsed)
 import proof.goal (set_of)
 import std.option
-import tester (options_from)
 import tests.report (Entry, Case, Decided, Group, Program, Spent, opening_of, opening_lines,
                      name_column, result_lines, printed, answered, test_at, with_sim)
 import tests.concluded (entry_of, Done, job_of, ran_class, hashes_of, conclude_tests, seen_of,
                         conclusion_of, ran_outcome, ran_of, mutated, traces_of, standing,
-                        diagnosed_all, decided_faults, diagnosing, history_of)
+                        diagnosed_all, history_of)
 
 // --- The load ---------------------------------------------------------------
 
@@ -111,8 +109,9 @@ fn root_modules(analysis: View) -> Map<String, Bool> =
 
 pub fn scope_of(
   analysis: View,
-  options: Options,
-  named: Option<List<String>> = None,
+  filters: List<String>,
+  shard: Option<surface::Shard>,
+  named: Option<List<String>>,
 ) -> Scope / {abort.raise} = {
   let packaged = analysis.frame.packages.len() > 0;
   let root = root_modules(analysis);
@@ -120,8 +119,8 @@ pub fn scope_of(
   let in_scope = |t: TestInfo|
     if packaged { root.contains(String::of_bytes_lossy(t.module)) } else { !is_shipped(t.module) };
   let matches = |t: TestInfo|
-    kept(options.filters, loaded, String::of_bytes_lossy(t.module), String::of_bytes_lossy(t.key))
-      && in_shard(options.shard, t.key)
+    kept(filters, loaded, String::of_bytes_lossy(t.module), String::of_bytes_lossy(t.key))
+      && in_shard(shard, t.key)
       && (match named {
         Some(modules) -> modules.contains(String::of_bytes_lossy(t.module)),
         None -> true,
@@ -156,13 +155,13 @@ fn in_shard(shard: Option<surface::Shard>, key: Bytes) -> Bool / {abort.raise} =
 /// label, which only its listing knows.
 pub fn over_cases(
   analysis: View,
-  options: Options,
-  named: Option<List<String>> = None,
+  filters: List<String>,
+  named: Option<List<String>>,
 ) -> List<Int> / {abort.raise} = {
   let loaded = module_names(analysis.frame.order);
-  scope_of(analysis, { ..options, filters: [], shard: None }, named).visible.filter(|i: Int|
+  scope_of(analysis, [], None, named).visible.filter(|i: Int|
     match test_at(analysis, i) {
-      Some(t) -> t.cases && could_keep(options.filters, loaded, String::of_bytes_lossy(t.module)),
+      Some(t) -> t.cases && could_keep(filters, loaded, String::of_bytes_lossy(t.module)),
       None -> false,
     })
 }
@@ -187,7 +186,7 @@ pub fn listed(
         });
       match emit.unit(handed, offered_over(handed, tables, l.reach)) {
         Err(diags) -> Err(diags),
-        Ok(e) -> match units::library(e.text) {
+        Ok(e) -> match units::library(e.text, testing.options.machine.profile) {
           Err(diags) -> Err(diags),
           Ok(library) -> match tester::unit_of(testing, handed, Some(library), false) {
             Err(diags) -> Err(diags),
@@ -303,8 +302,150 @@ fn starting(
       ),
   }
 
-pub fn ranged(analysis: View, cases: Map<Int, Result<List<Listed>, Unlisted>>) -> Ranged = {
+/// One thing a run identifies by a key: test `test` by its name, or its case at position `case`
+/// by that case's label.
+type Claim = { test: Int, case: Option<Int> }
+
+fn claimed(claims: Map<Bytes, List<Claim>>, key: Bytes, by: Claim) -> Map<Bytes, List<Claim>> =
+  claims.insert(key, List::push(match claims.get(key) { Some(held) -> held, None -> [] }, by))
+
+/// The listings, except that a test fails as a whole, running none of its cases, when one of its
+/// cases has the label of another case in its table, of another test, or of a case of another
+/// test. A run identifies each case by its label, so two with one label would be mixed up.
+fn distinct_labels(
+  tests: List<TestInfo>,
+  labels: List<Location>,
+  listings: Map<Int, Result<List<Listed>, Unlisted>>,
+) -> Map<Int, Result<List<Listed>, Unlisted>> = {
+  let case_key = |t: TestInfo, c: Listed| qualify(t.module, Bytes::of_string(c.label));
+  let claims = range(0, tests.len()).fold(Map::new(), |acc: Map<Bytes, List<Claim>>, i: Int|
+    match tests.at(i) {
+      None -> acc,
+      Some(t) -> {
+        let named = claimed(acc, t.key, { test: i, case: None });
+        match listings.get(i) {
+          Some(Ok(listing)) ->
+            range(0, listing.len()).fold(named, |a: Map<Bytes, List<Claim>>, k: Int|
+              match listing.at(k) {
+                Some(c) -> claimed(a, case_key(t, c), { test: i, case: Some(k) }),
+                None -> a,
+              }),
+          _ -> named,
+        }
+      },
+    });
+  listings.fold(
+    listings,
+    |acc: Map<Int, Result<List<Listed>, Unlisted>>, i: Int, listed: Result<List<Listed>, Unlisted>|
+      match ((listed, tests.at(i))) {
+        (Ok(listing), Some(t)) -> {
+          let first = range(0, listing.len()).fold(None, |found: Option<Unlisted>, k: Int|
+            match ((found, listing.at(k))) {
+              (None, Some(c)) ->
+                label_clash(labels, i, k, c.label, match claims.get(case_key(t, c)) {
+                  Some(all) -> all,
+                  None -> [],
+                }),
+              _ -> found,
+            });
+          match first { Some(why) -> acc.insert(i, Err(why)), None -> acc }
+        },
+        _ -> acc,
+      },
+  )
+}
+
+/// Why test `i` fails when its case at position `k` has the label `label`, given everything in
+/// the run with that label's key; `None` when nothing else has it. `labels` is where each test's
+/// label is written.
+fn label_clash(
+  labels: List<Location>,
+  i: Int,
+  k: Int,
+  label: String,
+  claims: List<Claim>,
+) -> Option<Unlisted> =
+  match labels.at(i) {
+    None -> None,
+    Some(at) -> match claims.filter(|c: Claim| c.test != i) {
+      [other, ..] -> {
+        let named = other.case == None;
+        Some(
+          refused(
+            at,
+            match labels.at(other.test) {
+              Some(o) ->
+                [
+                  pointing(o, false, if named { "this test has that name" }
+                  else { "a case of this test has that label" }),
+                ],
+              None -> [],
+            },
+            "the case at position " ++ k.to_string() ++ " of the table has the label \"" ++ label
+              ++ "\", which "
+              ++ (if named { "is the name of another test" }
+              else { "a case of another test also has" }),
+          ),
+        )
+      },
+      [] -> {
+        let own = claims.fold([], |at: List<Int>, c: Claim|
+          match c.case { Some(n) -> at.push(n), None -> at });
+        if own.len() < 2 { None } else {
+          Some(
+            refused(
+              at,
+              [],
+              "the cases at positions " ++ places(own) ++ " of the table have the same label, \""
+                ++ label
+                ++ "\"",
+            ),
+          )
+        }
+      },
+    },
+  }
+
+/// A test failing as a whole with `message`, pointing at its label `at` and at `also`.
+fn refused(at: Location, also: List<Label>, message: String) -> Unlisted =
+  {
+    status: "failed",
+    failure: {
+      diag: diag_of("error", "E0105", message, [pointing(at, true, "this test")].concat(also), [
+        "each test and each case in a module needs its own label, so none of this test's cases ran",
+      ]),
+      values: [],
+    },
+  }
+
+fn pointing(at: Location, primary: Bool, text: String) -> Label =
+  {
+    module: at.module,
+    start: at.span.start,
+    end: at.span.end,
+    primary: primary,
+    text: Bytes::of_string(text),
+  }
+
+/// Positions in a table, listing the first three and counting the rest.
+fn places(at: List<Int>) -> String =
+  match at {
+    [a, b] -> a.to_string() ++ " and " ++ b.to_string(),
+    [a, b, c] -> a.to_string() ++ ", " ++ b.to_string() ++ " and " ++ c.to_string(),
+    [a, b, c, ..more] ->
+      a.to_string() ++ ", " ++ b.to_string() ++ ", " ++ c.to_string() ++ " and "
+        ++ more.len().to_string()
+        ++ " more",
+    [a] -> a.to_string(),
+    [] -> "",
+  }
+
+pub fn ranged(
+  analysis: View,
+  listings: Map<Int, Result<List<Listed>, Unlisted>>,
+) -> Ranged / {abort.raise} = {
   let tests = analysis.checked.tests;
+  let cases = distinct_labels(tests, test_label_spans(analysis.frame.outlines), listings);
   let plain = range(0, tests.len()).map(|i: Int|
     entry_of(i, match tests.at(i) { Some(t) -> t.key, None -> b"" }));
   if cases.len() == 0 { { analysis: analysis, judged: analysis, entries: plain } } else {
@@ -440,7 +581,7 @@ fn hosted_over(program: Program) -> Hosted / {abort.raise} = {
 }
 
 /// The run itself, what it establishes, filed, and what it is asked after: a mutation of a green
-/// run, and the cause of every failure. `judged` is the tests as a pass is recorded and a failure
+/// run, and what changed under every failure. `judged` is the tests as a pass is recorded and a failure
 /// suspected: a case reaching only what it runs. The binding of `program`'s unit is torn down once
 /// its tests ran; the unit stays the caller's to close.
 pub fn concluded_run(
@@ -461,7 +602,7 @@ pub fn concluded_run(
   configured: List<Diag>,
   targeted: Option<List<DefInfo>>,
   spent: Spent,
-) -> Answer / {process.out[proc], time.elapsed_us, entering::machine.open, entering::machine.enter, entering::machine.unbind, entering::machine.close, ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.unfiled, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, shipped.reached} = {
+) -> Answer / {process.out[proc], time.elapsed_us, entering::machine.open, entering::machine.enter, entering::machine.unbind, entering::machine.close, ledger.opened, ledger.passes, ledger.seen, ledger.baselines, ledger.texts, ledger.unfiled, ledger.history, ledger.filed, emit.unit, emit.compiled, shipped.answer, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, shipped.reached} = {
   let refiled = keeps.refiled;
   let kept = keeps.kept;
   // What the next run answers: this run's notices of its cache and its store are not in it.
@@ -512,11 +653,11 @@ pub fn concluded_run(
         acc.insert(d.case.index, d.reason)),
       out_of_scope: scope.out,
     },
-    if options.no_cache { Map::new() } else { seen_of(h) },
+    if flags.no_cache { Map::new() } else { seen_of(h) },
     done.map(conclusion_of),
   );
-  let said = if options.no_cache { [] } else {
-    history_of(analysis, timed.program.modules, c.filing);
+  let said = if flags.no_cache { [] } else {
+    history_of(analysis, sourced(timed.program, analysis.frame), timed.program.modules, c.filing);
     filing_said(
       ledger.filed({ ..c.filing, passes: c.filing.passes.concat(refiled) }),
       "could not write the test cache: ",
@@ -544,30 +685,10 @@ pub fn concluded_run(
     asked,
     targeted,
   );
-  // Every test the binding serves has run, a mutant's among them; a bisection's mixtures are hermetic.
+  // Every test the binding serves has run, a mutant's among them.
   let r = { ..tried, handshakes: tester::unbound(program.unit.testing) };
-  // After the run is filed, since a pass recorded now is a valid baseline for another's failure.
-  let found = diagnosed_all(options, timed, judged, program, c, by_test, r.failures);
-  let cause = decided_faults(
-    { ..r, failures: found.failures },
-    found.benches,
-    diagnosing(options),
-    tester::begun(options),
-  );
-  let proved = if options.no_cache || cause.proved.len() == 0 { [] } else {
-    filing_said(
-      ledger.filed({
-        passes: cause.proved.map(|key: Bytes| { key: key, trace: b"" }),
-        codes: [],
-        records: [],
-        seen: [],
-        reached: { fns: [], decls: [] },
-      }),
-      "could not write what the bisection's mixtures proved: ",
-      "every verdict stands; the next bisection runs those mixtures again",
-    )
-  };
-  let lazily = if options.no_cache || after { [] } else { ledger.opened() };
+  let found = diagnosed_all(flags.no_cache, timed, judged, c, r.failures);
+  let lazily = if flags.no_cache || after { [] } else { ledger.opened() };
   let concluding = time.elapsed_us() - started - elapsed;
   let answer = answered(
     style,
@@ -575,11 +696,11 @@ pub fn concluded_run(
     program,
     {
       ..r,
-      failures: found.failures,
-      warnings: r.warnings.concat(proved).concat(lazily),
+      warnings: r.warnings.concat(lazily),
       spent: { ..spent, tests_us: elapsed, conclude_us: concluding },
     },
-    cause.faults,
+    found.faults,
+    found.diffs,
     decided,
   );
   match kept {
@@ -686,7 +807,7 @@ test "a run takes in its root's tests, the library's own tree's among them, and 
       Analysed(w) -> view_of(w),
       Refused(_) -> panic("the fixture checks"),
     };
-    scope_of(w, options_from(parsed(["test"]), "/p")).visible.map(|i: Int|
+    scope_of(w, [], None, None).visible.map(|i: Int|
       match test_at(w, i) { Some(t) -> t.key, None -> b"" })
   };
   let program = {

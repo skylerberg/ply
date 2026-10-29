@@ -1210,9 +1210,9 @@ fn rowed_m(src: Bytes) -> Checker / {abort.raise} = {
 
 test "a clause binding its continuation holds what resuming it performs" {
   let src = Bytes::concat_all([
-    b"effect amb {\n  multi read flip() -> Bool\n}\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
     b"effect trace {\n  write step() -> Unit\n}\n",
-    b"fn traced() -> Int / {trace.write} = handle { let b = amb.flip(); trace.step(); if b { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
+    b"fn traced() -> Int / {trace.write} = handle { let b = amb.flip(); trace.step(); if b { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + 1 }\n",
   ]);
   let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
     |e: TypedExpr<Type>|
@@ -1287,10 +1287,10 @@ test "a lambda holds its own row, however wide the place it is passed to" {
 test "a call through a function value holds the row of the type it calls through" {
   let src = log_and_link().concat(
     Bytes::concat_all([
-      b"effect amb {\n  multi read flip() -> Bool\n}\n",
+      b"effect amb {\n  read flip() -> Bool\n}\n",
       b"type Job = { run: () -> Int / {log.write} }\n",
       b"fn ran(j: Job) -> Int / {log.write} = j.run()\n",
-      b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
+      b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + 1, return v -> v * 10 }\n",
     ]),
   );
   let checker = rowed_m(src);
@@ -1299,7 +1299,7 @@ test "a call through a function value holds the row of the type it calls through
   assert_eq(at(b"g()", b"\n"), [b"{m.log.note | e0}"]);
   assert_eq(at(b"j.run()", b"\n"), [b"{m.log.write}"]);
   // A continuation performs what the rest of the body does, which the clause answers.
-  assert_eq(at(b"k(true)", b" + k"), [b"{}"])
+  assert_eq(at(b"k(true)", b" + 1"), [b"{}"])
 }
 
 test "a handle holds its body's row as its clauses open it, and each clause's and its return clause's own" {
@@ -3868,7 +3868,7 @@ test "a `const fn` performs nothing but a raise, and ends" {
   assert_eq(check_codes(b"const fn never() -> Int = never()"), [b"E0156"])
 }
 
-test "a `const fn` answers a value a build can keep" {
+test "a `const fn` answers a value a process can keep" {
   assert_eq(check_codes(b"const fn f() -> (Int) -> Int = |x: Int| x"), [b"E0156"]);
   assert_eq(
     check_codes(
@@ -3999,9 +3999,48 @@ fn refusals(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
         if label.primary { src.slice(label.start, label.end) } else { acc }),
     ])
 
-// A test is keyed `<module>.<label>` wherever a run names it: what it reaches, its check, its pass
-// and the body its cases are listed by. Two of one label would be one name for two tests.
-test "a test, as a law, is keyed by its label, so a module's second test of one label is refused by name" {
+// A run identifies a test by `<module>.<name>` everywhere: what it reaches, its check, its pass and
+// the root that lists its cases. The parser gives a test over cases that shares a label its own
+// name, but two plain tests with one label would be one name for two tests.
+/// The messages of the `E0105`s module `m` of `src` reports, beside stand-ins for the two modules a
+/// test over cases reads.
+fn label_refusals(src: Bytes) -> List<Bytes> / {abort.raise} =
+  match resolved_all([
+      { name: b"m", src: src },
+      {
+        name: b"std.cases",
+        src: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+      },
+      { name: b"std.show", src: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+    ]) {
+    Err(dump) -> [dump],
+    Ok(x) ->
+      dedup_diags(check_program(x.r, x.mods).checker.diags).filter(|d: Diag|
+        d.code == b"E0105").map(|d: Diag| d.message),
+  }
+
+test "tests over cases may share a label with holes, but not over one table, and not with any other test" {
+  let over = |label: Bytes, table: Bytes|
+    Bytes::concat_all([b"test \"", label, b"\" for n: Int in ", table, b" { assert(n > 0) }\n"]);
+  let plain = |label: Bytes| Bytes::concat_all([b"test \"", label, b"\" { () }\n"]);
+  assert_eq(label_refusals(over(b"a {n}", b"[1]").concat(over(b"a {n}", b"[2]"))), []);
+  // The same table, however it is laid out, gives the same case labels.
+  assert_eq(label_refusals(over(b"a {n}", b"[1, 2]").concat(over(b"a {n}", b"[1,\n  2]"))), [
+    b"two tests over the same table are labelled \"a {n}\"",
+  ]);
+  // Without holes every case is labelled as written, so the label names one thing.
+  assert_eq(label_refusals(plain(b"a").concat(over(b"a", b"[1]"))), [
+    b"two tests are labelled \"a\"",
+  ]);
+  assert_eq(label_refusals(over(b"a", b"[1]").concat(over(b"a", b"[2]"))), [
+    b"two tests are labelled \"a\"",
+  ]);
+  assert_eq(label_refusals(plain(b"a {n}").concat(over(b"a {n}", b"[1]"))), [
+    b"two tests are labelled \"a {n}\"",
+  ])
+}
+
+test "a plain test, like a law, is identified by its label, so a second one with that label is refused" {
   let prefix = b"fn one() -> Int = 1\n";
   assert_eq(
     refusals(
@@ -5025,7 +5064,6 @@ test "a builtin is what the prelude declares: its scheme, its parameters' names 
     ty_vars: [],
     row_vars: [],
     kept_vars: [],
-    multi_vars: [],
     label_vars: [],
     ty: fn_type([bytes_type(), int_type(), int_type()], bytes_type(), row_singleton(abort_atom())),
   });
@@ -5037,7 +5075,6 @@ test "a declaration's generic list is its scheme's variables, numbered from zero
     ty_vars: [0, 1],
     row_vars: [0],
     kept_vars: [],
-    multi_vars: [],
     label_vars: [],
     ty: fn_type(
       [list_type(TyVar(0)), fn_type([TyVar(0)], TyVar(1), row_open(0))],
@@ -7068,7 +7105,7 @@ test "a lent function parameter may be called, lent on, captured by a lambda len
     b"fn f(g: (Int) -> Int) -> Int = { let h = |x: Int| g(x); let k = h; k(1) + [1].fold(0, |a: Int, x: Int| a + h(x)) }",
     b"fn f(g: (Int) -> Int, n: Int) -> Int = if n <= 0 { g(0) } else { f(g, n - 1) }",
     b"fn f(g: (Int) -> Int) -> (Int, Int) = parallel { g(1), g(2) }",
-    b"effect ask { multi read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + k(2) }",
+    b"effect ask { read get() -> Int }\nfn f(g: (Int) -> Int) -> Int = handle { g(ask.get()) } with { ask.get() resume k -> k(1) + 1 }",
     // A lambda's parameter is not lent, and neither is what a call answers.
     b"fn f() -> ((Int) -> Int) -> (Int) -> Int = |h: (Int) -> Int| h",
   ];
@@ -7092,7 +7129,7 @@ fn holding(param: Bytes) -> List<Bytes> = {
     f(b") -> () -> Int = || g(1)"),
     f(b") -> (Int) -> Int = { let h = g; h }"),
     f(b", c: Bool) -> (Int) -> Int = if c { g } else { |x: Int| x }"),
-    b"effect ask { read get() -> Int }\nfn forget<a>(x: a) -> Unit = ()\n".concat(
+    b"effect ask { read get() -> Int }\nfn forget(x: keep once (Int) -> Int) -> Unit = ()\n".concat(
       f(b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> { forget(k); 0 } }"),
     ),
   ]
@@ -7161,8 +7198,9 @@ test "a pattern binds every name it takes from a lent value to that value" {
 fn asking(param: Bytes, rest: Bytes) -> Bytes =
   Bytes::concat_all([
     b"effect ask { read get() -> Int }\neffect sink { write put((Int) -> Int) -> Unit }\n",
-    b"type Step = | Done(Int) | Wait((Int) -> Step)\n",
-    b"fn apply(h: (Int) -> (Int) -> Int, x: Int) -> (Int) -> Int = h(x)\n",
+    b"type Step = | Done(Int) | Wait(once (Int) -> Step)\n",
+    b"fn apply(h: keep once (Int) -> (Int) -> Int, x: Int) -> (Int) -> Int = h(x)\n",
+    b"fn peek(h: once (Int) -> Int) -> Int = 0\n",
     b"fn f(g: ",
     param,
     rest,
@@ -7174,7 +7212,7 @@ test "a continuation holds what its handler reads, and a call of it answers what
     b") -> Step = handle { ask.get() } with { return n -> Done(g(n)), ask.get() resume k -> Wait(k) }",
     // `k(0)` answers what the `handle` may, `g` among it.
     b") -> Unit / {sink.put} = { handle { let _ = ask.get(); g } with { ask.get() resume k -> { sink.put(k(0)); g } }; () }",
-    // Lent on, `k` would hand `apply` what a call of it answers.
+    // Handed on, `k` would hand `apply` what a call of it answers.
     b") -> Int = { let r = handle { let _ = ask.get(); g } with { ask.get() resume k -> apply(k, 0) }; r(1) }",
   ];
   assert_eq(
@@ -7187,7 +7225,7 @@ test "a continuation holds what its handler reads, and a call of it answers what
     check_codes(
       asking(
         b"(Int) -> Int",
-        b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> [1].map(k).len() }",
+        b") -> Int = handle { g(ask.get()) } with { ask.get() resume k -> peek(k) }",
       ),
     ),
     [],
@@ -7638,60 +7676,64 @@ test "a type that holds a `once` function is a resource where no type states a `
   )
 }
 
-test "a clause calls a one-shot operation's continuation at most once, and a `multi` one's at will" {
+test "a clause calls its continuation at most once" {
   assert_eq(
     check_codes(
       b"effect ask { read get() -> Int }\nfn f() -> Int = handle { ask.get() } with { ask.get() resume k -> k(1) + k(2) }\n",
     ),
     [b"E0316"],
-  );
-  assert_eq(
-    check_codes(
-      b"effect amb { multi read flip() -> Bool }\nfn f() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
-    ),
-    [],
   )
 }
 
-test "a resource is not live across a stop a clause may resume more than once" {
-  let amb = |body: Bytes|
-    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
-      body,
+test "a continuation kept in a value is a `once` function there, called at most once" {
+  let parked = |field: Bytes, rest: Bytes|
+    check_codes(
+      Bytes::concat_all([
+        b"effect amb { read flip() -> Bool }\ntype Saved = | Done(Int) | Parked(",
+        field,
+        b"(Bool) -> Saved)\nfn parked() -> Saved = handle { Done(if amb.flip() { 1 } else { 2 }) } with { amb.flip() resume k -> Parked(k) }\n",
+        rest,
+      ]),
     );
+  let done = b"fn done(s: keep Saved) -> Int = match s { Done(n) -> n, Parked(later) -> 0 }\n";
+  assert_eq(parked(b"", b""), [b"E0201"]);
   assert_eq(
-    check_codes(
-      amb(b"fn f() -> Unit / {amb.flip} = { let c = open(); let b = amb.flip(); close(c) }"),
-    ),
-    [b"E0319"],
-  );
-  // A `handle` inside the resource's block ends the continuation before it reaches what holds it.
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f() -> Unit = { let c = open(); let n = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }; close(c) }",
+    parked(
+      b"once ",
+      done.concat(
+        b"fn later() -> Int = match parked() { Parked(k) -> done(k(true)), Done(n) -> n }\n",
       ),
     ),
     [],
+  );
+  assert_eq(
+    parked(
+      b"once ",
+      done.concat(
+        b"fn twice() -> Int = match parked() { Parked(k) -> done(k(true)) + done(k(false)), Done(n) -> n }\n",
+      ),
+    ),
+    [b"E0316"],
   )
 }
 
-test "nothing `nondet` runs where a clause may resume the body more than once" {
-  let src = |body: Bytes|
-    Bytes::concat_all([
-      b"effect amb { multi read flip() -> Bool }\nnondet effect dial { read now() -> Int }\n",
-      body,
-    ]);
-  assert_eq(
-    check_codes(src(b"fn f() -> Int / {amb.flip, dial.now} = { let b = amb.flip(); dial.now() }")),
-    [b"E0321"],
-  );
+test "a `once` function stands only where its type is written `once`, and a function that may be called again stands for one" {
   assert_eq(
     check_codes(
-      src(
-        b"fn f() -> Int / {amb.flip, dial.now} = { let n = dial.now(); if amb.flip() { n } else { 0 } }",
-      ),
+      b"type Plain = | Plain((Int) -> Int)\nfn park(f: keep once (Int) -> Int) -> Plain = Plain(f)\n",
     ),
+    [b"E0201"],
+  );
+  assert_eq(
+    check_codes(b"fn run(f: keep once () -> Int) -> Int = f()\nfn g() -> Int = run(|| 1)\n"),
     [],
+  );
+  // A parameter is read both ways: what is handed a `once` function must take one.
+  assert_eq(
+    check_codes(
+      b"fn apply(h: (once () -> Int) -> Int) -> Int = h(|| 0)\nfn plain(g: () -> Int) -> Int = g() + g()\nfn f() -> Int = apply(plain)\n",
+    ),
+    [b"E0201"],
   )
 }
 
@@ -7819,38 +7861,6 @@ test "`..` and an alternative's `_` drop no resource" {
   )
 }
 
-test "what a call took is as live across a stop as what the body owns" {
-  let amb = |body: Bytes|
-    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
-      body,
-    );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn take(c: keep Conn, b: Bool) -> Unit = close(c)\nfn f() -> Unit / {amb.flip} = { let c = open(); take(c, amb.flip()) }",
-      ),
-    ),
-    [b"E0319"],
-  );
-  // What a `handle` held before its body began is borrowed past a stop it answers, never consumed.
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f() -> Int = { let c = open(); handle { let b = amb.flip(); close(c); 1 } with { amb.flip() resume k -> k(true) + k(false) } }",
-      ),
-    ),
-    [b"E0319"],
-  );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f() -> Int = { let c = open(); handle { let b = amb.flip(); send(c, 1) } with { amb.flip() resume k -> k(true) + k(false) } }",
-      ),
-    ),
-    [],
-  )
-}
-
 test "a handler's variable reads what is above it, hides what it names, and holds no resource" {
   let ask = |body: Bytes|
     Bytes::of_string(connections()).concat(b"effect ask { read get() -> Int }\n").concat(body);
@@ -7924,46 +7934,6 @@ test "a block lent whole is refused only where it may answer what it binds" {
       b"fn f(x: Conn, y: Conn) -> Int = send({ let c = open(); if send(c, 0) > 0 { x } else { y } }, 1)",
     ),
     [],
-  )
-}
-
-test "a lambda's body runs where it is called: what a call holds in flight and an earlier stop are not its" {
-  let amb = |body: Bytes|
-    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
-      body,
-    );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn run(c: keep Conn, g: () -> Bool / {amb.flip}) -> Bool / {amb.flip} = { close(c); g() }\nfn f() -> Bool / {amb.flip} = { let c = open(); run(c, || amb.flip()) }",
-      ),
-    ),
-    [],
-  );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f() -> Int = { let c = open(); handle { let pick = || amb.flip(); close(c); if pick() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) } }",
-      ),
-    ),
-    [],
-  );
-  // Moving a field out, or taking a value apart, past such a stop runs again on each resumption.
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f(r: keep { conn: Conn, n: Int }) -> Int = handle { let b = amb.flip(); close(r.conn); r.n } with { amb.flip() resume k -> k(true) + k(false) }",
-      ),
-    ),
-    [b"E0319"],
-  );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f(o: keep Option<Conn>) -> Int = handle { let b = amb.flip(); match o { Some(c) -> { close(c); 1 }, None -> 0 } } with { amb.flip() resume k -> k(true) + k(false) }",
-      ),
-    ),
-    [b"E0319"],
   )
 }
 
@@ -8142,36 +8112,6 @@ test "a `let` whose pattern misses into its `else` lets go of the value it misse
   ]);
   assert_eq(
     check_codes(src(b"fn f(t: keep Two) -> Int / {wire.shut} = { let A(n) = t else { 0 }; n }")),
-    [],
-  )
-}
-
-test "a call on a value is a stop where its function may make one" {
-  let amb = |body: Bytes|
-    Bytes::of_string(connections()).concat(
-      b"effect amb { multi read flip() -> Bool }\nfn Conn::flip(c: Conn) -> Bool / {amb.flip} = amb.flip()\n",
-    ).concat(
-      body,
-    );
-  assert_eq(
-    check_codes(
-      amb(b"fn f() -> Unit / {amb.flip} = { let c = open(); let b = c.flip(); close(c) }"),
-    ),
-    [b"E0319"],
-  )
-}
-
-test "a function's stop holds what is live where it is called, not where it is made" {
-  let amb = |body: Bytes|
-    Bytes::of_string(connections()).concat(b"effect amb { multi read flip() -> Bool }\n").concat(
-      body,
-    );
-  assert_eq(
-    check_codes(
-      amb(
-        b"fn f() -> Bool / {amb.flip} = { let c = open(); let g = || amb.flip(); close(c); g() }",
-      ),
-    ),
     [],
   )
 }

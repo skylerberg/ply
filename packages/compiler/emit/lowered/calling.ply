@@ -3,15 +3,15 @@
 
 import compiler.check.resolve.tables (qualify)
 import compiler.syntax.exprs (scheduler_module)
-import compiler.check.types (Type, TyCon, int_type, bool_type)
+import compiler.check.types (Type, int_type, bool_type, string_type)
+import compiler.check.known (hold_parts)
 import compiler.emit.keys (RootKey, FnArg, Named, Root, Generic, LawPart, LawGuard, LawBody, at_key,
                            RootName, root_name, root_text, filed_as, test_key, law_key, at_rowed,
-                           KeyType, Evidence)
-import compiler.check.types (RSingleton)
-import compiler.emit.tir (OHandle)
+                           KeyType, At, key_types, definition_of)
+import compiler.unit (roots_built)
+import compiler.emit.tir (handed_at, reps_of, handed_of, Carried, OHandle)
 import compiler.emit.tir.handling (Bridge, Perform, InstanceHeap)
 import compiler.emit.reps (BoundLambda, has_vars)
-import compiler.emit.typing (no_filings, unknown_type)
 import compiler.emit.lower.setting (root_body)
 import compiler.check.typed (WholeBody)
 import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MCase, Var, Arg, AVar,
@@ -20,7 +20,7 @@ import compiler.emit.tir (Rep, RInt, RBool, RWord, RImm, RFlat, RSum, RSlice, MC
                           Match, Loop, Next, Done, Restart, Enter, Return, Sited, Block, Fn, Member,
                           Closure, RNum, TInt, TRange, Convention, Lambda, Lent, Given, Plain,
                           Handle, rep_of_arg, MFramed)
-import compiler.emit.tir.calling (ConstantRead, Ticked)
+import compiler.emit.tir.calling (ConstantRead)
 import compiler.emit.tir.containers (Rest, ItemAt)
 import compiler.emit.lower (lowered_fn, lowered_group)
 import compiler.emit.lower.base (GroupMember)
@@ -89,11 +89,11 @@ fn corpus() -> Bytes =
     b"fn paired_step(n: Int) -> Int / {abort.raise} = iterate(pair(0, 1), n, |q: { x: Int, y: Int }| if q.x >= 10 { Stop(q.x + q.y) } else { Continue(pair(q.y, q.x + q.y)) })\n",
     b"fn walk1(p: { x: Int, y: Int }, n: Int) -> { x: Int, y: Int } = if n <= 0 { p } else { walk1(pair(p.y, p.x), n - 1) }\n",
     b"fn go<T>(x: T, n: Int) -> Int = if n <= 0 { 0 } else { go(x, n - 1) }\n",
-    b"effect amb {\n  multi read flip() -> Bool\n}\n",
+    b"effect amb {\n  read flip() -> Bool\n}\n",
     b"effect gauge {\n  read level() -> Float\n}\n",
     b"fn tailed() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
     b"fn gauged() -> Float = handle { gauge.level() + 1.0 } with { gauge.level() resume k -> k(1.5) }\n",
-    b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
+    b"fn off_tail() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + 1 }\n",
     b"fn ping(n: Int) -> Int / {diverges} = if n == 0 { 0 } else { pong(n - 1) }\n",
     b"fn pong(n: Int) -> Int / {diverges} = if n == 0 { let f = |x: Int| x * n; f(2) } else { ping(n - 1) }\n",
     b"fn chooser(whole: Bool) -> (Int) -> Int = |y: Int| if whole { y } else { 0 - y }\n",
@@ -175,7 +175,7 @@ fn names() -> List<Bytes> =
     b"go",
     b"tailed",
     b"gauged",
-    b"both",
+    b"off_tail",
     b"ping",
     b"pong",
     b"chooser",
@@ -346,7 +346,7 @@ test "a call of a definition hands its arguments as the callee carries them" {
       vals_in(f.body).fold([], |acc: List<{ reps: List<Rep>, answer: Rep }>, v: Val|
         match v {
           Call(c) -> if c.callee == Root(Named(b"m.add")) {
-            acc.push({ reps: c.conv.reps, answer: c.conv.answer })
+            acc.push({ reps: reps_of(c.conv), answer: c.conv.answer })
           } else { acc },
           _ -> acc,
         }),
@@ -357,7 +357,7 @@ test "a call of a definition hands its arguments as the callee carries them" {
     let f = form(b"handed");
     assert_eq(
       vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
-        match v { Call(c) -> acc.push(c.conv.reps.push(c.conv.answer)), _ -> acc }),
+        match v { Call(c) -> acc.push(reps_of(c.conv).push(c.conv.answer)), _ -> acc }),
       [[RWord, RWord]],
     )
   }
@@ -370,7 +370,7 @@ test "a small record crosses a call as its fields and its word, both ways" {
       vals_in(f.body).fold([], |acc: List<{ reps: List<Rep>, answer: Rep }>, v: Val|
         match v {
           Call(c) -> if c.callee == Root(Named(b"m.swapped")) {
-            acc.push({ reps: c.conv.reps, answer: c.conv.answer })
+            acc.push({ reps: reps_of(c.conv), answer: c.conv.answer })
           } else { acc },
           _ -> acc,
         }),
@@ -391,14 +391,14 @@ test "a lambda and a function value take a small record as its fields too" {
     match closure_of(f, 0) {
       None -> assert(false, Some("pair_summer makes no closure")),
       Some(c) ->
-        assert_eq(c.body.conv.reps.drop(c.captures).push(c.body.conv.answer), [fields, RInt]),
+        assert_eq(reps_of(c.body.conv).drop(c.captures).push(c.body.conv.answer), [fields, RInt]),
     }
   };
   {
     let f = form(b"applied_pair");
     assert_eq(
       vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
-        match v { Apply(a) -> acc.push(a.conv.reps.push(a.conv.answer)), _ -> acc }),
+        match v { Apply(a) -> acc.push(reps_of(a.conv).push(a.conv.answer)), _ -> acc }),
       [[fields, RImm, RImm, RInt]],
     )
   }
@@ -413,7 +413,7 @@ test "a call of a generic definition is the body's generic call at the reference
     assert_eq(
       vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
         match v {
-          Call(c) -> if c.callee == Generic(0) { acc.push(c.conv.reps.push(c.conv.answer)) }
+          Call(c) -> if c.callee == Generic(0) { acc.push(reps_of(c.conv).push(c.conv.answer)) }
           else { acc },
           _ -> acc,
         }),
@@ -424,13 +424,7 @@ test "a call of a generic definition is the body's generic call at the reference
   {
     let f = form(b"ident_word");
     assert_eq(f.links.generics, [
-      {
-        callee: Named(b"m.ident"),
-        args: [TyCon({ name: b"String", args: [] })],
-        carried: [],
-        fns: [],
-        rows: [],
-      },
+      { callee: Named(b"m.ident"), args: [string_type()], carried: [], fns: [], rows: [] },
     ])
   }
 }
@@ -478,7 +472,7 @@ test "a lambda is a closure of a function of its own taking its captures as word
       None -> assert(false, Some("adder makes no closure")),
       Some(c) -> {
         assert_eq(c.captures, 1);
-        assert_eq(c.body.conv.reps, [RInt, RInt]);
+        assert_eq(reps_of(c.body.conv), [RInt, RInt]);
         assert_eq(c.body.conv.answer, RInt);
         // The captured `Int` is held as its body reads it, so nothing opens a word to add it.
         assert_eq(
@@ -531,8 +525,8 @@ test "a closure is a block of its own, its descriptor first, whose entries give 
     match closure_of(f, 0) {
       None -> assert(false, Some("adder makes no closure")),
       Some(c) -> {
-        assert_eq(c.body.conv.params, [Given, Given]);
-        assert_eq(c.body.conv.reps, [RInt, RInt])
+        assert_eq(handed_of(c.body.conv), [Given, Given]);
+        assert_eq(reps_of(c.body.conv), [RInt, RInt])
       },
     };
     // The release counts nothing of the `Int`, and gives the block back.
@@ -558,7 +552,7 @@ test "a record a call would hand by reference is captured as its word" {
     let f = form(b"wide_captor");
     match closure_of(f, 0) {
       None -> assert(false, Some("wide_captor makes no closure")),
-      Some(c) -> assert_eq(c.body.conv.reps, [RWord]),
+      Some(c) -> assert_eq(reps_of(c.body.conv), [RWord]),
     }
   }
 }
@@ -601,7 +595,7 @@ test "a definition or a constructor named as a value is the closure of a lambda 
     match closure_of(f, 0) {
       None -> assert(false, Some("named makes no closure")),
       Some(c) -> {
-        assert_eq(c.body.conv.reps, [RInt, RInt]);
+        assert_eq(reps_of(c.body.conv), [RInt, RInt]);
         // The call counts the step; the closure standing for the name counts none of its own.
         assert_eq(c.body.kind, Plain);
         assert_eq(
@@ -634,7 +628,10 @@ test "a definition or a constructor named as a value is the closure of a lambda 
       vs.filter(|v: Val|
         match v {
           Op(o) ->
-            o.op == OCalling(ConstantRead({ callee: Root(Named(b"m.kept")), kept: int_type() })),
+            o.op
+              == OCalling(
+                ConstantRead({ callee: Root(Named(b"m.kept")), kept: int_type(), constant: false }),
+              ),
           _ -> false,
         }).len(
       ),
@@ -695,10 +692,7 @@ test "a hold's closures and what its builtins answer are typed by the hold, so n
     let holds = f.lambdas.fold([], |acc: List<Type>, l: Lambda|
       match l {
         Closure(c) -> match c.body.params.drop(c.captures) {
-          [p] -> match p.ty {
-            TyCon(t) -> if t.name == b"Hold" { acc.push(p.ty) } else { acc },
-            _ -> acc,
-          },
+          [p] -> if hold_parts(p.ty) != None { acc.push(p.ty) } else { acc },
           _ -> acc,
         },
       });
@@ -744,7 +738,7 @@ test "a function value is applied through the convention its type has, its row's
     let f = form(b"applied");
     assert_eq(
       vals_in(f.body).fold([], |acc: List<List<Rep>>, v: Val|
-        match v { Apply(a) -> acc.push(a.conv.reps.push(a.conv.answer)), _ -> acc }),
+        match v { Apply(a) -> acc.push(reps_of(a.conv).push(a.conv.answer)), _ -> acc }),
       [[RInt, RImm, RImm, RInt]],
     );
     assert_eq(f.links.called, [0])
@@ -756,10 +750,6 @@ test "a lambda a let binds and a call runs in place reads its captures off its c
     let f = form(b"local");
     let vs = vals_in(f.body);
     assert_eq(vs.filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len(), 0);
-    assert_eq(
-      vs.filter(|v: Val| match v { Op(o) -> o.op == OCalling(Ticked), _ -> false }).len(),
-      1,
-    );
     assert_eq(vs.filter(|v: Val| match v { Get(g) -> g.path == PCapture(0), _ -> false }).len(), 1)
   }
 }
@@ -827,7 +817,7 @@ test "a step iterate runs is a loop over its state and budget, each pass going o
     let f = form(b"stepped");
     match f.body.fold(None, |acc: Option<Inst>, i: Inst| match i { Loop(_) -> Some(i), _ -> acc }) {
       Some(Loop(l)) -> {
-        assert_eq(l.state.map(|v: Var| v.rep), [RInt, RInt]);
+        assert_eq(l.state.map(|c: Carried| c.var.rep), [RInt, RInt]);
         assert_eq(l.answer.rep, RInt);
         // The pass ends testing the `Iter` the step answered: a `Continue` goes on, a `Stop` leaves.
         match l.body.at(l.body.len() - 1) {
@@ -892,16 +882,9 @@ test "a fold, map or filter over a lambda is one loop in its caller, the lambda'
       // Each loop goes round the place of the item it reads and what it holds: the accumulator, or
       // the list it builds; a map's also the node it holds and the place there.
       assert_eq(forms.map(|f: Fn| loops_in(f.body)), [[2], [2], [2], [2], [2], [4], [2]]);
-      // None applies a function value; the walk's call, its loop and each pass count a step, and so
-      // does a lambda's run, where a definition's call counts its own.
       let applied = |f: Fn|
         vals_in(f.body).filter(|v: Val| match v { Apply(_) -> true, _ -> false }).len();
-      let ticked = |f: Fn|
-        vals_in(f.body).filter(|v: Val|
-          match v { Op(o) -> o.op == OCalling(Ticked), _ -> false }).len(
-        );
       assert_eq(forms.map(applied), [0, 0, 0, 0, 0, 0, 0]);
-      assert_eq(forms.map(ticked), [4, 4, 4, 3, 4, 4, 4]);
       // A map and a filter push onto the list they build, and a map's fold finds its leaves as the
       // prelude's does; nothing calls the prelude's walks.
       let prelude = |n: Bytes| Named(b"std.prelude.".concat(n));
@@ -939,23 +922,28 @@ fn specialised_form(
   args: List<Type>,
   fns: List<FnArg>,
   lent: List<Option<BoundLambda>>,
-) -> Result<Fn, Bytes> / {abort.raise} = specialised_rowed(p, name, args, fns, lent, [])
+) -> Result<Fn, Bytes> / {abort.raise} =
+  specialised_at(p, name, at_rowed(qualify(b"m", name), args.map(KeyType), fns, []), lent)
 
-/// `specialised_form` with the root's row variables at `rows`.
-fn specialised_rowed(
+/// The corpus's root `name` lowered as a build lowers its specialisation `key`, each parameter
+/// `lent` names running that lambda; or why not.
+fn specialised_at(
   p: Program,
   name: Bytes,
-  args: List<Type>,
-  fns: List<FnArg>,
+  key: RootKey,
   lent: List<Option<BoundLambda>>,
-  rows: List<List<Evidence>>,
 ) -> Result<Fn, Bytes> / {abort.raise} =
   match match root_at(p, name) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such root"),
     Some(r) -> {
-      let key = at_rowed(filed_as(r.key), args.map(KeyType), fns, rows);
-      // Lowered from its settled body at `args`, as a build lowers a specialisation.
-      let b = root_body(filed_in(p.analysis, filed_as(r.key)), WholeBody, r.base, [], args);
+      // Lowered from its settled body at the key's types, as a build lowers a specialisation.
+      let b = root_body(
+        filed_in(p.analysis, filed_as(r.key)),
+        WholeBody,
+        r.base,
+        [],
+        key_types(key),
+      );
       let params = range(0, b.params.len()).map(|i: Int|
         match lent.at(i) {
           Some(Some(bl)) -> { ..b.params.get(i), lambda: Some(bl) },
@@ -971,59 +959,79 @@ fn specialised_rowed(
     },
   }
 
-/// Generic root `generic` of `p` at `args` as the specialisation a build lowers where root `lender`
-/// hands its parameter `param` the first lambda it writes, typed as a build types it, with its
-/// lender's whole body; and the lender's base; or why not.
+/// Generic root `generic` of `p` as the specialisation a build of `p` settles on where root
+/// `lender` hands its parameter `param` the first lambda it writes, with its lender's whole body;
+/// and the lender's base; or why not.
 fn lent_run(
   p: Program,
   lender: Bytes,
   generic: Bytes,
-  args: List<Type>,
   param: Int,
-) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
-  lent_rowed(p, lender, generic, args, param, [])
-
-/// `lent_run` with the generic's row variables at `rows`.
-fn lent_rowed(
-  p: Program,
-  lender: Bytes,
-  generic: Bytes,
-  args: List<Type>,
-  param: Int,
-  rows: List<List<Evidence>>,
 ) -> Result<{ f: Fn, base: Int }, Bytes> / {abort.raise} =
   match match root_at(p, lender) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such lender"),
-    Some(l) -> {
-      let code = l.code;
-      let written = lambdas_of(known_body(root_text(root_name(l.key)), l.params, code));
-      match written.at(0) {
-        None -> Err(b"a lender that writes no lambda"),
-        Some(first) -> {
-          let bound = {
-            owner: l.key,
-            nth: 0,
-            code: first,
-            named: false,
-            module: b"m",
-            here: p.setting.here,
-            imports: p.setting.imports,
-            effects: p.setting.effects,
-            base: l.base,
-            written: written,
-          };
-          match specialised_rowed(
-              p,
-              generic,
-              args,
-              [{ param: param, owner: l.key, nth: 0 }],
-              range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
-              rows,
-            ) {
-            Ok(f) -> Ok({ f: f, base: l.base }),
-            Err(why) -> Err(why),
-          }
-        },
+    Some(l) -> match settled_lent(p.src, lender, generic, param) {
+      Err(why) -> Err(why),
+      Ok(key) -> {
+        let written = lambdas_of(known_body(root_text(root_name(l.key)), l.params, l.code));
+        match written.at(0) {
+          None -> Err(b"a lender that writes no lambda"),
+          Some(first) -> {
+            let bound = {
+              owner: l.key,
+              nth: 0,
+              code: first,
+              module: b"m",
+              here: p.setting.here,
+              imports: p.setting.imports,
+              effects: p.setting.effects,
+              base: l.base,
+              written: written,
+            };
+            match specialised_at(
+                p,
+                generic,
+                key,
+                range(0, param + 1).map(|i: Int| if i == param { Some(bound) } else { None }),
+              ) {
+              Ok(f) -> Ok({ f: f, base: l.base }),
+              Err(why) -> Err(why),
+            }
+          },
+        }
+      },
+    },
+  }
+
+/// The key a build of module `m` of text `src` settles a call of its generic root `generic` on
+/// where a root of its definition `lender` hands parameter `param` the first lambda it writes; or
+/// why there is none, naming the roots of `generic` the build makes.
+fn settled_lent(
+  src: Bytes,
+  lender: Bytes,
+  generic: Bytes,
+  param: Int,
+) -> Result<RootKey, Bytes> / {abort.raise} =
+  match roots_built([{ name: b"m", src: src }]) {
+    Err(why) -> Err(why),
+    Ok(keys) -> {
+      let of = keys.filter(|k: RootKey| definition_of(k) == Some(qualify(b"m", generic)));
+      match of.find(|k: RootKey|
+          match k {
+            At(a, _) ->
+              a.lent.any(|x: FnArg|
+                x.param == param && x.nth == 0
+                  && definition_of(x.owner) == Some(qualify(b"m", lender))),
+            _ -> false,
+          }) {
+        Some(k) -> Ok(k),
+        None ->
+          Err(
+            Bytes::concat_all([
+              b"no build lends that lambda; it makes ",
+              Bytes::join(of.map(|k: RootKey| root_text(root_name(k))), b", "),
+            ]),
+          ),
       }
     },
   }
@@ -1031,13 +1039,7 @@ fn lent_rowed(
 test "another root's lambda a specialisation runs in place takes its lender's sites, and only there" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(
-        p,
-        b"lends_word",
-        b"apply_to",
-        [TyCon({ name: b"String", args: [] })],
-        0,
-      ) {
+    Ok(p) -> match lent_run(p, b"lends_word", b"apply_to", 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         assert_eq(
@@ -1063,9 +1065,7 @@ test "another root's lambda a specialisation runs in place takes its lender's si
 test "a closure a lent lambda makes performs through its own words, never the bridge" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_rowed(p, b"lends_noting", b"apply_in", [int_type()], 0, [
-        [{ effect: b"m.log", resource: RSingleton }],
-      ]) {
+    Ok(p) -> match lent_run(p, b"lends_noting", b"apply_in", 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         let bridged = |f: Fn|
@@ -1090,7 +1090,7 @@ test "a closure a lent lambda makes performs through its own words, never the br
 test "a lambda lent to a parameter of a closed row performs through the word its callee holds for it" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_closed", b"noting", [int_type()], 0) {
+    Ok(p) -> match lent_run(p, b"lends_closed", b"noting", 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         let ops = vals_in(run.f.body).fold([], |acc: List<Bytes>, v: Val|
@@ -1112,7 +1112,7 @@ test "a lambda lent to a parameter of a closed row performs through the word its
 test "a lent lambda's own lambdas are its lender's: one it binds runs in place, its closures take the lender's sites, one it hands on is lent by the lender" {
   match program_of(corpus()) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"lends_on", b"apply_to", [int_type()], 0) {
+    Ok(p) -> match lent_run(p, b"lends_on", b"apply_to", 0) {
       Err(why) -> assert_eq(why, b""),
       Ok(run) -> {
         let lent = Sited(Some({ root: Named(b"m.lends_on"), base: run.base }));
@@ -1133,14 +1133,13 @@ test "a lent lambda's own lambdas are its lender's: one it binds runs in place, 
   }
 }
 
-/// The operators root `lender`'s lambda does over `Int`s where `fold_from` at `args` runs it in place,
-/// and how many it hands the runtime as words; or why it was not formed.
+/// The operators root `lender`'s lambda does over `Int`s where `fold_from` runs it in place, and how
+/// many it hands the runtime as words; or why it was not formed.
 fn folded_ops(
   p: Program,
   lender: Bytes,
-  args: List<Type>,
 ) -> Result<{ c: List<Bytes>, runtime: Int }, Bytes> / {abort.raise} =
-  match lent_run(p, lender, b"fold_from", args, 3) {
+  match lent_run(p, lender, b"fold_from", 3) {
     Err(why) -> Err(why),
     Ok(run) -> {
       let vals = vals_in(run.f.body);
@@ -1167,18 +1166,11 @@ test "a lent lambda run where its arguments and captures arrive as a type variab
     b"  fold_from(range(0, n), 0, Some(0), |so_far: Option<Int>, d: Int|\n",
     b"    match so_far { Some(v) -> Some(v * 10 + d), None -> None })\n",
   ]);
-  let erased = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
   match program_of(src) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      assert_eq(
-        folded_ops(p, b"bits", [unknown_type(), int_type()]),
-        Ok({ c: [b"add", b"shl", b"eq"], runtime: 0 }),
-      );
-      assert_eq(
-        folded_ops(p, b"digits", [unknown_type(), erased]),
-        Ok({ c: [b"add", b"mul", b"add"], runtime: 0 }),
-      )
+      assert_eq(folded_ops(p, b"bits"), Ok({ c: [b"add", b"shl", b"eq"], runtime: 0 }));
+      assert_eq(folded_ops(p, b"digits"), Ok({ c: [b"add", b"mul", b"add"], runtime: 0 }))
     },
   }
 }
@@ -1189,41 +1181,27 @@ test "a lent lambda's parameter is read at what its written type says, a type va
     b"fn heaviest<a>(pairs: List<{ item: a, weight: Int }>) -> Int =\n",
     b"  most(pairs, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
   ]);
-  match answered_by_form(src, [], lent_fold(b"m.most", [unknown_type()], 1, b"m.heaviest")) {
-    Err(why) -> assert_eq(why, b""),
-    Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
+  match settled_lent(src, b"heaviest", b"most", 1) {
+    Err(why) -> assert(why.len() == 0, Some(String::of_bytes_lossy(why))),
+    Ok(key) -> match answered_by_form(src, [], key) {
+      Err(why) -> assert_eq(why, b""),
+      Ok(text) -> assert_eq(text.index_of(b"rt_binary_p"), None),
+    },
   }
 }
-
-test "a walk over what a specialisation erased calls the prelude's walk, which lets go of none of it" {
-  let src = Bytes::concat_all([
-    b"fn upto<b>(xs: List<Int>, init: b, g: (b, Int) -> b) -> b = xs.fold(init, g)\n",
-    b"fn spans(xs: List<Int>) -> Option<{ at: Int, n: Int }> =\n",
-    b"  upto(xs, None, |acc: Option<{ at: Int, n: Int }>, k: Int|\n",
-    b"    match acc { Some(a) -> Some({ at: a.at, n: a.n + 1 }), None -> Some({ at: k, n: 1 }) })\n",
-  ]);
-  let words = TyCon({ name: b"Option", args: [TyCon({ name: b"_", args: [] })] });
-  match answered_by_form(src, [], lent_fold(b"m.upto", [words], 2, b"m.spans")) {
-    Err(why) -> assert(false, Some(String::of_bytes_lossy(why))),
-    // It calls the walk rather than holding a loop of its own.
-    Ok(text) -> assert(text.index_of(b"for (;;) {") == None, None),
-  }
-}
-
-/// The fold `def` at `args`, running at parameter `param` the first lambda `lender` writes.
-fn lent_fold(def: Bytes, args: List<Type>, param: Int, lender: Bytes) -> RootKey =
-  at_key(def, args, [{ param: param, owner: Named(lender), nth: 0 }])
 
 test "a closure a root writes calls a lambda the root was lent through its closure, as a function value" {
   let src = Bytes::concat_all([
     b"fn each<T>(xs: List<T>, g: (T) -> T) -> List<T> = xs.map(g)\n",
-    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> = each(xs, |x: T| f(f(x)))\n",
+    // A build lends `f` only to a root that calls it, here once besides its closure's calls.
+    b"fn twice_each<T>(xs: List<T>, f: (T) -> T) -> List<T> =\n",
+    b"  match xs.at(0) { Some(x) -> each(xs, |y: T| f(f(y))).push(f(x)), None -> [] }\n",
     b"fn bumped(xs: List<Int>) -> List<Int> = twice_each(xs, |n: Int| n + 1)\n",
   ]);
   match program_of(src) {
     Err(why) -> assert_eq(why, b""),
-    Ok(p) -> match lent_run(p, b"bumped", b"twice_each", [int_type()], 1) {
-      Err(why) -> assert_eq(why, b""),
+    Ok(p) -> match lent_run(p, b"bumped", b"twice_each", 1) {
+      Err(why) -> assert(why.len() == 0, Some(String::of_bytes_lossy(why))),
       Ok(run) ->
         assert_eq(
           range(0, run.f.lambdas.len()).map(|k: Int|
@@ -1297,13 +1275,7 @@ test "a closure matching a sum it captured reads the sum's cases, never the word
         let f = lowered_as_built(p, name);
         verified(owned(f))
       });
-      let in_place = match lent_run(
-          p,
-          b"or_lent",
-          b"apply_to",
-          [TyCon({ name: b"String", args: [] })],
-          0,
-        ) {
+      let in_place = match lent_run(p, b"or_lent", b"apply_to", 0) {
         Ok(run) -> verified(owned(run.f)),
         Err(why) -> Some(why),
       };
@@ -1511,7 +1483,7 @@ test "a tail group's members take and answer a record and a sum as their values,
   match group_form([b"walk", b"stride"]) {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      assert_eq(f.members.map(|m: Member| m.conv.reps.push(m.conv.answer).map(parted)), [
+      assert_eq(f.members.map(|m: Member| reps_of(m.conv).push(m.conv.answer).map(parted)), [
         [true, false, true],
         [true, false, true],
       ]);
@@ -1528,7 +1500,7 @@ test "a tail group's members take and answer a record and a sum as their values,
   match group_form([b"seek", b"probe"]) {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      assert_eq(f.members.map(|m: Member| m.conv.reps.push(m.conv.answer).map(parted)), [
+      assert_eq(f.members.map(|m: Member| reps_of(m.conv).push(m.conv.answer).map(parted)), [
         [true, false, true],
         [true, false, true],
       ]);
@@ -1593,7 +1565,7 @@ test "a list a root walks down by restarting on its rest is a view of the list i
         let f = lowered_as_built(p, name);
         Ok({
           held: f.params.map(|v: Var| v.rep).take(1),
-          taken: f.conv.reps.take(1),
+          taken: reps_of(f.conv).take(1),
           restarts: insts_in(f.body).any(|i: Inst| match i { Restart(_) -> true, _ -> false }),
           rests: rests_made(f.body),
         })
@@ -1665,7 +1637,7 @@ test "a restart and a loop over a record set its parameter or state value by val
     let f = form(b"paired_step");
     assert_eq(
       f.body.fold([], |acc: List<Bool>, i: Inst|
-        match i { Loop(l) -> acc.concat(l.state.map(|v: Var| parted(v.rep))), _ -> acc }),
+        match i { Loop(l) -> acc.concat(l.state.map(|c: Carried| parted(c.var.rep))), _ -> acc }),
       [true, false],
     );
     assert_eq(undeclared(printed_text(corpus_program(), owned(f))), [])
@@ -1681,7 +1653,7 @@ test "a continuation is a word the runtime calls with words, and a clause bindin
         None -> acc,
       });
   let conventions = |c: Fn|
-    applied(c).map(|v: Val| match v { Apply(a) -> a.conv.reps.push(a.conv.answer), _ -> [] });
+    applied(c).map(|v: Val| match v { Apply(a) -> reps_of(a.conv).push(a.conv.answer), _ -> [] });
   let resumed = |c: Fn|
     c.body.fold([], |acc: List<Var>, i: Inst|
       match i { Let(l) -> match l.val { Apply(_) -> acc.push(l.var), _ -> acc }, _ -> acc });
@@ -1705,12 +1677,12 @@ test "a continuation is a word the runtime calls with words, and a clause bindin
   tail_only(b"tailed");
   tail_only(b"gauged");
   {
-    let f = form(b"both");
+    let f = form(b"off_tail");
     match clause_of(f) {
       None -> assert(false, Some("no clause calls its continuation")),
       Some(c) -> {
         assert_eq(c.conv.answer, RWord);
-        assert_eq(conventions(c), [[RWord, RWord], [RWord, RWord]])
+        assert_eq(conventions(c), [[RWord, RWord]])
       },
     }
   }
@@ -1898,7 +1870,7 @@ test "a sum wider than a call's registers crosses a call by reference, its answe
     let f = form(b"wide_twice");
     assert_eq(
       root_calls(f).map(|c: { callee: RootKey, conv: Convention }|
-        c.conv.reps.map(wide).push(wide(c.conv.answer))),
+        reps_of(c.conv).map(wide).push(wide(c.conv.answer))),
       [[false, true], [true, false]],
     );
     assert_eq(undeclared(printed_text(corpus_program(), owned(f))), [])
@@ -1908,7 +1880,7 @@ test "a sum wider than a call's registers crosses a call by reference, its answe
 test "a lent sum wider than a call's registers is read through a const pointer, never written through" {
   {
     let f = form(b"wide_loop");
-    let lent = { ..f, conv: { ..f.conv, params: f.conv.params.set(0, Lent) } };
+    let lent = { ..f, conv: handed_at(f.conv, [Lent]) };
     assert_eq(head_types(lent.conv).params.at(0), Some(b"const Word*"));
     // A restart sets its own locals of the record's values, never the caller's words.
     let written = printed_text(corpus_program(), lent).split(b"\n").filter(|l: Bytes|
@@ -1925,14 +1897,14 @@ test "a closure and a function value take a sum wider than a call's registers by
     let f = form(b"wide_reader");
     match closure_of(f, 0) {
       None -> assert(false, Some("wide_reader makes no closure")),
-      Some(c) -> assert_eq(c.body.conv.reps.drop(c.captures).map(wide), [true]),
+      Some(c) -> assert_eq(reps_of(c.body.conv).drop(c.captures).map(wide), [true]),
     }
   };
   {
     let f = form(b"wide_applied");
     assert_eq(
       vals_in(f.body).fold([], |acc: List<Bool>, v: Val|
-        match v { Apply(a) -> acc.concat(a.conv.reps.map(wide)), _ -> acc }),
+        match v { Apply(a) -> acc.concat(reps_of(a.conv).map(wide)), _ -> acc }),
       [true, false, false],
     )
   }
@@ -1942,7 +1914,10 @@ test "a tail group's member takes a sum by reference, its wrapper handing on its
   match group_form([b"wide_even", b"wide_odd"]) {
     Err(why) -> assert_eq(why, b""),
     Ok(f) -> {
-      assert_eq(f.members.map(|m: Member| m.conv.reps.map(wide)), [[true, false], [true, false]]);
+      assert_eq(f.members.map(|m: Member| reps_of(m.conv).map(wide)), [
+        [true, false],
+        [true, false],
+      ]);
       let text = printed_text(corpus_program(), owned(f));
       assert(
         text.index_of(symbol_of(b"m.wide_even").concat(b"_group(ctx, 0, (Word)(intptr_t)p0"))
@@ -1958,7 +1933,7 @@ test "a sum whose constructors take nothing crosses a call as its one word, its 
     let f = form(b"hue_twice");
     assert_eq(
       root_calls(f).map(|c: { callee: RootKey, conv: Convention }|
-        c.conv.reps.push(c.conv.answer).map(|r: Rep|
+        reps_of(c.conv).push(c.conv.answer).map(|r: Rep|
           match r { RSum(_) -> values_of(r).len() == 1, _ -> false })),
       [[true, true], [true, true]],
     )

@@ -15,13 +15,15 @@ import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, 
                                  LDec, LChar)
 import compiler.check.types (Resource, RSingleton, RVar, Atom, Row, Type, TyVar, TyCon, TyFn,
                              TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified, atoms_insert,
-                             row_empty, row_open, row_singleton, named_type, applied_type, int_type,
-                             bool_type, string_type, bytes_type, float_type, decimal_type,
-                             unit_type, list_type, option_type, fn_type, fields_sorted, ints_insert,
+                             row_empty, row_open, row_singleton, named_type, int_type, bool_type,
+                             string_type, bytes_type, float_type, decimal_type, unit_type,
+                             list_type, option_type, fn_type, fields_sorted, ints_insert,
                              ints_union, fresh_new, fresh_ty_var, fresh_ty, fresh_row_var,
                              fresh_row, subst_new, with_bindings, resolve_row, free_vars,
                              env_bind_global, at_arguments, TyNominal, atom_bin, row_bin, type_bin,
                              scheme_bin, TypeTable, owning_fn_type)
+import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
+                             duration_type, task_type, chan_type, hold_name, hold_type, map_parts)
 import compiler.check.termination (Callee, Ending, Summary, summary_bin, ending_bin, callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolved, Scope, Diag, diag_bin, Label,
                                       error_with_labels, error_at, error_at_and)
@@ -66,11 +68,9 @@ pub type TypeDecl = {
 /// types then labels in `ty_vars` and rows in `row_vars`, which a use's arguments take the place of.
 pub type RecordDecl = { ty: Type, ty_vars: List<Int>, row_vars: List<Int> }
 
-/// `multi`: a clause for the operation may call its continuation more than once.
 pub type OpInfo = {
   name: Bytes,
   mode: Mode,
-  multi: Bool,
   resource_param: Bool,
   params: List<Type>,
   /// The places of the parameters the handler takes, written `keep`.
@@ -1028,7 +1028,7 @@ pub fn what_of(deriver: Deriver) -> Bytes =
     DHash -> b"content hash",
     DNumeric -> b"arithmetic",
     DInteger -> b"integer arithmetic",
-    DKept -> b"value a build keeps",
+    DKept -> b"value a process keeps",
   }
 
 pub fn row_aliases(def: FnDef) -> List<Bytes> =
@@ -1081,119 +1081,19 @@ pub fn abort_atom() -> Atom =
 
 fn abort_row() -> Row = row_singleton(abort_atom())
 
-fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
-  [
-    { name: b"Int", arity: 0 },
-    { name: b"Bool", arity: 0 },
-    { name: b"String", arity: 0 },
-    { name: b"Bytes", arity: 0 },
-    { name: b"U8", arity: 0 },
-    { name: b"U16", arity: 0 },
-    { name: b"U32", arity: 0 },
-    { name: b"U64", arity: 0 },
-    { name: b"I8", arity: 0 },
-    { name: b"I16", arity: 0 },
-    { name: b"I32", arity: 0 },
-    { name: b"I64", arity: 0 },
-    { name: b"U128", arity: 0 },
-    { name: b"I128", arity: 0 },
-    { name: b"Float", arity: 0 },
-    { name: b"Decimal", arity: 0 },
-    { name: b"Char", arity: 0 },
-    { name: b"Unit", arity: 0 },
-    { name: b"List", arity: 1 },
-    { name: b"Array", arity: 1 },
-    { name: b"Columns", arity: 1 },
-    { name: b"Map", arity: 2 },
-    { name: b"Hold", arity: 1 },
-    { name: b"Secret", arity: 1 },
-    { name: b"Task", arity: 1 },
-    { name: b"Chan", arity: 1 },
-    { name: b"Option", arity: 1 },
-    { name: b"Result", arity: 2 },
-    { name: b"Ordering", arity: 0 },
-    { name: b"Rounding", arity: 0 },
-    { name: b"Iter", arity: 2 },
-    { name: b"Instant", arity: 0 },
-    { name: b"Duration", arity: 0 },
-  ]
-
 /// Pure and nullary, so the runtime builds it once and each type conversion only looks a name up.
 fn builtin_type_arity_map() -> Map<Bytes, Int> =
-  builtin_type_arities().fold(Map::new(), |acc: Map<Bytes, Int>, x: { name: Bytes, arity: Int }|
+  builtin_types().fold(Map::new(), |acc: Map<Bytes, Int>, x: { name: Bytes, arity: Int }|
     if acc.contains(x.name) { acc } else { acc.insert(x.name, x.arity) })
 
 pub fn builtin_type_arity(name: Bytes) -> Option<Int> = builtin_type_arity_map().get(name)
-
-/// A field names one of `params`, or else a builtin type.
-type AlgebraicType = {
-  name: Bytes,
-  params: List<Bytes>,
-  variants: List<{ name: Bytes, fields: List<Bytes> }>,
-}
-
-fn prelude_adts() -> List<AlgebraicType> =
-  [
-    {
-      name: b"Option",
-      params: [b"a"],
-      variants: [{ name: b"None", fields: [] }, { name: b"Some", fields: [b"a"] }],
-    },
-    {
-      name: b"Result",
-      params: [b"a", b"e"],
-      variants: [{ name: b"Ok", fields: [b"a"] }, { name: b"Err", fields: [b"e"] }],
-    },
-    {
-      name: b"Ordering",
-      params: [],
-      variants: [
-        { name: b"Less", fields: [] },
-        { name: b"Equal", fields: [] },
-        { name: b"Greater", fields: [] },
-      ],
-    },
-    {
-      name: b"Rounding",
-      params: [],
-      variants: [
-        { name: b"HalfEven", fields: [] },
-        { name: b"HalfUp", fields: [] },
-        { name: b"Down", fields: [] },
-        { name: b"Up", fields: [] },
-        { name: b"Ceiling", fields: [] },
-        { name: b"Floor", fields: [] },
-      ],
-    },
-    {
-      name: b"Iter",
-      params: [b"s", b"r"],
-      variants: [{ name: b"Continue", fields: [b"s"] }, { name: b"Stop", fields: [b"r"] }],
-    },
-    // Nanoseconds: a point on a clock, and a span between two points, kept apart by their types.
-    { name: b"Instant", params: [], variants: [{ name: b"Instant", fields: [b"Int"] }] },
-    { name: b"Duration", params: [], variants: [{ name: b"Duration", fields: [b"Int"] }] },
-  ]
-
-/// The prelude's sum constructor `name` belongs to, and its place among the sum's; none for a name
-/// no prelude sum holds.
-pub fn prelude_ctor_at(name: Bytes) -> Option<{ sum: Bytes, case: Int }> =
-  prelude_adts().fold(None, |acc: Option<{ sum: Bytes, case: Int }>, adt: AlgebraicType|
-    match acc {
-      Some(_) -> acc,
-      None -> match range(0, adt.variants.len()).find(|i: Int|
-          match adt.variants.at(i) { Some(v) -> v.name == name, None -> false }) {
-        Some(i) -> Some({ sum: adt.name, case: i }),
-        None -> None,
-      },
-    })
 
 fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int / {abort.raise} =
   range(0, xs.len()).fold(0 - 1, |acc: Int, i: Int|
     if acc >= 0 { acc } else if xs.get(i) == v { i } else { acc })
 
 fn install_prelude_adts(checker: Checker) -> Checker / {abort.raise} =
-  prelude_adts().fold(checker, |c: Checker, adt: AlgebraicType| {
+  builtin_sums().fold(checker, |c: Checker, adt: BuiltinSum| {
     let vars = range(0, adt.params.len());
     let result = TyCon({ name: adt.name, args: vars.map(|v: Int| TyVar(v)) });
     range(0, adt.variants.len()).fold(c, |c2: Checker, index: Int| {
@@ -1203,14 +1103,7 @@ fn install_prelude_adts(checker: Checker) -> Checker / {abort.raise} =
         if at >= 0 { TyVar(at) } else { named_type(p) }
       });
       let ty = if fields.len() == 0 { result } else { fn_type(fields, result, row_empty()) };
-      let sc = {
-        ty_vars: vars,
-        row_vars: [],
-        kept_vars: [],
-        multi_vars: [],
-        label_vars: [],
-        ty: ty,
-      };
+      let sc = { ty_vars: vars, row_vars: [], kept_vars: [], label_vars: [], ty: ty };
       add_ctor({ ..c2, env: env_bind_global(c2.env, v.name, sc) }, {
         name: v.name,
         module: b"",
@@ -1271,7 +1164,6 @@ fn prelude_op(
   {
     name: name,
     mode: mode,
-    multi: false,
     resource_param: false,
     params: params,
     kept: [],
@@ -1281,7 +1173,6 @@ fn prelude_op(
       ty_vars: ty_vars,
       row_vars: row_vars,
       kept_vars: [],
-      multi_vars: [],
       label_vars: [],
       ty: fn_type(params, ret, row),
     }),
@@ -1296,8 +1187,8 @@ pub fn channel_ops() -> List<Bytes> = [b"send", b"recv", b"close", b"select"]
 pub fn prelude_effects() -> List<EffectInfo> = {
   let ta = TyVar(0);
   let body = fn_type([], ta, row_open(0));
-  let task = applied_type(b"Task", ta);
-  let chan = applied_type(b"Chan", ta);
+  let task = task_type(ta);
+  let chan = chan_type(ta);
   let none = { module: 0, span: dummy_span() };
   [
     {
@@ -1341,8 +1232,8 @@ pub fn prelude_effects() -> List<EffectInfo> = {
       nondet: true,
       at: none,
       ops: [
-        prelude_op(b"now", MRead, [], [], [], named_type(b"Instant"), row_empty()),
-        prelude_op(b"sleep", MWrite, [], [], [named_type(b"Duration")], unit_type(), row_empty()),
+        prelude_op(b"now", MRead, [], [], [], instant_type(), row_empty()),
+        prelude_op(b"sleep", MWrite, [], [], [duration_type()], unit_type(), row_empty()),
       ],
     },
     {
@@ -1492,11 +1383,10 @@ fn declared_type(
                 panic(
                   misdeclared(b"names a type that is not the language's own at that arity", name),
                 )
-              } else if name == b"Hold" {
+              } else if name == hold_name() {
                 match c.labels {
                   [l] -> match args.d.labels.get(l.name) {
-                    Some(label) ->
-                      { d: args.d, ty: TyCon({ name: name, args: [label, args.tys.get(0)] }) },
+                    Some(label) -> { d: args.d, ty: hold_type(label, args.tys.get(0)) },
                     None -> panic(misdeclared(b"names a label no generic list binds", l.name)),
                   },
                   _ -> panic(misdeclared(b"names a hold without its region's label", name)),
@@ -1699,8 +1589,6 @@ pub fn declared(
       row_vars: range(0, ret.d.fresh.next_row),
       kept_vars: def.generics.kept.fold([], |vs: List<Int>, p: Ident|
         match tys.tys.get(p.name) { Some(TyVar(v)) -> vs.push(v), _ -> vs }),
-      multi_vars: def.generics.multi.fold([], |vs: List<Int>, p: Ident|
-        match rows.rows.get(p.name) { Some(v) -> vs.push(v), None -> vs }),
       label_vars: [],
       ty: owning_fn_type(
         params.tys,
@@ -1852,7 +1740,7 @@ pub fn lit_type(literal: Lit) -> Type / {abort.raise} =
     LEmbedded(_, _) -> bytes_type(),
     LFloat(_) -> float_type(),
     LDec(_) -> decimal_type(),
-    LChar(_) -> named_type(b"Char"),
+    LChar(_) -> char_type(),
     _ -> unit_type(),
   }
 
@@ -2021,7 +1909,7 @@ pub fn vars_of_type(t: Type) -> List<Int> / {abort.raise} =
 fn map_key_types(t: Type, out: List<Type>) -> List<Type> / {abort.raise} =
   match t {
     TyCon(c) -> {
-      let own = if c.name == b"Map" && c.args.len() == 2 { out.push(c.args.get(0)) } else { out };
+      let own = match map_parts(t) { Some(p) -> out.push(p.key), None -> out };
       c.args.fold(own, |acc: List<Type>, a: Type| map_key_types(a, acc))
     },
     TyFn(f) ->

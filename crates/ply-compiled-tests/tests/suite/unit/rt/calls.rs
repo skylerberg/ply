@@ -1,12 +1,13 @@
-//! Reads of a pure nullary definition, as emitted code writes one for a constant: the first
-//! evaluates the definition and keeps its value for good through the type's keep root, and each
-//! later read answers that copy, charged what evaluating it cost. The definitions and keep roots
-//! here are written as emitted code writes them, over blocks laid out as it lays one.
+//! Reads of a pure nullary definition, as emitted code writes one: the first evaluates the
+//! definition and keeps its value for good through the type's keep root, and each later read
+//! answers that copy. A raise that leaves a `const fn` fails the entry. The definitions and keep
+//! roots here are written as emitted code writes them, over blocks laid out as it lays one.
 
 use crate::bare::{context_of, helper};
+use ply_compiled::c::builtin_helper_name;
 use ply_compiled::emitted::KeepRoot;
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
-use ply_compiled::rt::{Cost, Ctx, Tables};
+use ply_compiled::rt::{Ctx, FAILED, Tables};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -64,15 +65,13 @@ fn defining(f: Definition) -> Ctx {
 
 static FORTY_TWOS: AtomicUsize = AtomicUsize::new(0);
 
-/// Five calls and a box of 42.
 unsafe extern "C" fn forty_two(ctx: *mut Ctx, _args: *const Word) -> Word {
     FORTY_TWOS.fetch_add(1, Ordering::SeqCst);
-    unsafe { (*ctx).ticks += 5 };
     boxed(ctx, 42)
 }
 
 #[test]
-fn the_first_read_evaluates_and_keeps_and_each_later_one_answers_the_copy_charged_its_cost() {
+fn the_first_read_evaluates_and_keeps_and_each_later_one_answers_the_copy() {
     let mut ctx = defining(forty_two);
     let c: *mut Ctx = &mut ctx;
     let first = read(c, keep_box);
@@ -81,22 +80,12 @@ fn the_first_read_evaluates_and_keeps_and_each_later_one_answers_the_copy_charge
         (42, 1),
         "the evaluation's own value"
     );
-    assert_eq!(ctx.charged, Cost::default());
     let second = read(c, keep_box);
     let third = read(c, keep_box);
     assert_eq!(FORTY_TWOS.load(Ordering::SeqCst), 1, "evaluated once");
     assert_ne!(second, first);
     assert_eq!((held(second), count(second)), (42, IMMORTAL));
     assert_eq!(third, second, "every later read answers the one copy kept");
-    let twice = Cost {
-        steps: 2 * 5,
-        allocations: 2,
-        bytes: 2 * BOX,
-    };
-    assert_eq!(
-        ctx.charged, twice,
-        "each later read charged what evaluating cost"
-    );
     let_go(c, first);
     assert_eq!(
         ctx.heap.live(),
@@ -122,11 +111,6 @@ fn a_value_its_keep_root_refuses_is_kept_nowhere_and_each_read_evaluates_it() {
     assert_eq!(SEVENS.load(Ordering::SeqCst), 2);
     assert_eq!((count(first), count(second)), (1, 1));
     assert_eq!(ctx.tables.memoized(0), None);
-    assert_eq!(
-        ctx.charged,
-        Cost::default(),
-        "nothing kept, nothing charged"
-    );
     let_go(c, first);
     let_go(c, second);
     assert_eq!(ctx.heap.live(), 0);
@@ -224,99 +208,82 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
 type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
 type Left = unsafe extern "C" fn(*mut Ctx, Word);
 
-/// The program's calls and allocations, as a test's reading and a budget count them.
-fn spent(ctx: &Ctx) -> (i64, usize, usize) {
-    (ctx.ticks, ctx.heap.allocated(), ctx.heap.allocated_bytes())
-}
-
 #[test]
-fn the_schedulers_own_work_costs_the_program_nothing_however_it_nests() {
+fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
     let mut ctx = context_of(&[], Vec::new());
-    ctx.begin_bounded(1_000, 0, 0);
+    ctx.begin(1_000);
     let c: *mut Ctx = &mut ctx;
     let (entered, left) = (
         helper::<Entered>("rt_scheduler_entered"),
         helper::<Left>("rt_scheduler_left"),
     );
-    ctx.ticks = 5;
     let mine = boxed(c, 1);
-    let before = spent(&ctx);
+    let before = ctx.heap.allocated();
     let outer = unsafe { entered(c) };
     let inner = unsafe { entered(c) };
-    ctx.ticks += 100;
     let theirs = boxed(c, 2);
     unsafe { left(c, inner) };
-    assert_ne!(
-        spent(&ctx),
+    let nested = boxed(c, 3);
+    assert_eq!(
+        ctx.heap.allocated(),
         before,
         "a nested entry leaves the scheduler running"
     );
     unsafe { left(c, outer) };
     assert_eq!((outer, inner), (0, 1));
-    assert_eq!(spent(&ctx), before);
+    let_go(c, nested);
     let_go(c, theirs);
     let_go(c, mine);
     ctx.end();
 }
 
+fn read_const(ctx: *mut Ctx) -> Word {
+    unsafe { helper::<Memo>("rt_const")(ctx, 0, keep_box) }
+}
+
+static TENS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn ten(ctx: *mut Ctx, _args: *const Word) -> Word {
+    TENS.fetch_add(1, Ordering::SeqCst);
+    boxed(ctx, 10)
+}
+
 #[test]
-fn no_budget_of_calls_bounds_the_schedulers_own_work() {
-    let mut ctx = context_of(&[], Vec::new());
-    ctx.begin_bounded(1_000, 10, 0);
+fn a_constant_is_evaluated_once_and_every_later_read_answers_the_copy() {
+    let mut ctx = defining(ten);
     let c: *mut Ctx = &mut ctx;
-    let was = unsafe { helper::<Entered>("rt_scheduler_entered")(c) };
-    assert_eq!(
-        ctx.next_tick,
-        i64::MAX,
-        "no tick is asked for while only a budget bounds the run"
-    );
-    ctx.ticks += 50;
-    unsafe { helper::<Left>("rt_scheduler_left")(c, was) };
-    assert_eq!((ctx.ticks, ctx.next_tick), (0, 11));
-    assert!(ctx.take_failure().is_none());
+    let first = read_const(c);
+    let second = read_const(c);
+    let third = read_const(c);
+    assert_eq!(TENS.load(Ordering::SeqCst), 1, "evaluated once");
+    assert_eq!(held(first), 10);
+    assert_eq!((held(second), count(second)), (10, IMMORTAL));
+    assert_eq!(third, second);
+    let_go(c, first);
     ctx.end();
 }
 
-type Tick = unsafe extern "C" fn(*mut Ctx);
-
-/// `n` calls as compiled code counts each, calling back where the counter reaches `next_tick`,
-/// until the context fails.
-fn calls_made(ctx: *mut Ctx, n: i64) {
-    for _ in 0..n {
-        let c = unsafe { &mut *ctx };
-        c.ticks += 1;
-        if c.ticks >= c.next_tick {
-            unsafe { helper::<Tick>("rt_tick")(ctx) };
-        }
-        if unsafe { (*ctx).failed } != 0 {
-            return;
-        }
-    }
+/// `Bytes::at` refused, left pending as a raise of `abort.raise`.
+unsafe extern "C" fn refusing(ctx: *mut Ctx, _args: *const Word) -> Word {
+    let refused: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word) =
+        helper(&builtin_helper_name("?refused"));
+    unsafe { refused(ctx, 8, 5, 2, 0) };
+    0
 }
 
-// Main read the clock every 4096 calls, so a run past its deadline was abandoned within them.
 #[test]
-fn a_time_budget_ends_a_program_that_gives_way_to_the_scheduler_between_short_stretches() {
-    let mut ctx = context_of(&[], Vec::new());
-    ctx.begin_bounded(1_000, 0, 1);
+fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
+    let mut ctx = defining(refusing);
     let c: *mut Ctx = &mut ctx;
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let (entered, left) = (
-        helper::<Entered>("rt_scheduler_entered"),
-        helper::<Left>("rt_scheduler_left"),
-    );
-    for _ in 0..1_000 {
-        calls_made(c, 10);
-        let was = unsafe { entered(c) };
-        calls_made(c, 100);
-        unsafe { left(c, was) };
-        if unsafe { (*c).failed } != 0 {
-            break;
-        }
-    }
+    assert_eq!(read_const(c), 0);
+    assert_eq!(ctx.failed, FAILED, "a plain failure, no raise pending");
+    let said = ctx.take_failure().expect("a diagnostic");
     assert!(
-        ctx.take_failure().is_some(),
-        "110000 calls past the deadline, and the clock never read"
+        said.notes
+            .iter()
+            .any(|n| n.contains("`const fn` must return")),
+        "{said:?}"
     );
+    assert_eq!(ctx.tables.memoized(0), None);
     ctx.end();
 }

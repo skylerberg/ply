@@ -41,7 +41,6 @@
   "numeric"
   "host"
   "once"
-  "multi"
   "forall"
   "where"
   "returns"

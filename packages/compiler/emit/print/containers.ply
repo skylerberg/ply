@@ -2,7 +2,9 @@
 
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
-import compiler.check.types (Type, TyCon, TyFn, TyRecord, Field, record_fields, spelled_type)
+import compiler.check.types (Type, TyCon, TyFn, TyRecord, Field, record_fields, spelled_type,
+                             list_type, int_type, string_type, float_type, decimal_type)
+import compiler.check.known (array_type, columns_type)
 import compiler.emit.reps (laid, laid_by_pointer, laid_known, no_ctors)
 import compiler.emit.c (int_lit)
 import compiler.emit.typing (unknown_type)
@@ -19,9 +21,9 @@ import compiler.emit.keys (Root, Copy)
 import compiler.emit.answer (CallAt)
 import compiler.emit.release (root_of, laid_parts, form_parts)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, spelled)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSum, Leaf,
-                          Var, Arg, AVar, AInt, AZero, Made, MList, Uses, Convention, Given, Owned,
-                          counted, var_said, made_said, rep_of_arg, in_box, laid_made)
+import compiler.emit.tir (reps_of, Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSum,
+                          Leaf, Var, Arg, AVar, AInt, AZero, Made, MList, Uses, Convention, Given,
+                          Owned, counted, var_said, made_said, rep_of_arg, in_box, laid_made)
 import compiler.emit.layout (BranchLaid, branch_laid, refusal, first_room)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within, ArrayNew,
                                      ArraySet, ArrayOfList, ArrayGet, ColumnsNew, ColumnsSet,
@@ -974,8 +976,7 @@ fn copy_called(pr: Printing, a: Bytes, ty: Type) -> { pr: Printing, out: List<Pi
         expects: pr.expects.push({
           callee: CallAt(pr.calls.len()),
           head: head_types({
-            params: [Given],
-            reps: [RWord],
+            params: [{ handed: Given, rep: RWord }],
             answer: RWord,
             destined: false,
             answered: Owned,
@@ -1176,7 +1177,7 @@ fn array_of_list(
 ) -> Printing / {abort.raise} = {
   let ty = held_type(v.ty);
   let l = operand(pr, args, 0);
-  let listed = TyCon({ name: b"List", args: [ty] });
+  let listed = list_type(ty);
   let d = p.depth;
   let count = temp(site(p, pr));
   let n = count.name;
@@ -1393,7 +1394,7 @@ fn predicate_convention(pr: Printing, args: List<Arg>) -> Convention / {abort.ra
     Some(AVar(v)) -> match v.ty {
       TyFn(t) -> {
         let c = convention_of(pr.ctors, { params: t.params, ret: t.ret });
-        if c.reps == [RInt] && c.answer == RBool { c } else {
+        if reps_of(c) == [RInt] && c.answer == RBool { c } else {
           unprinted(b"a byte string's position whose predicate is held otherwise", var_said(v))
         }
       },
@@ -1497,7 +1498,7 @@ fn columns_of_list(
 ) -> Printing / {abort.raise} = {
   let ty = held_type(v.ty);
   let l = operand(pr, args, 0);
-  let listed = TyCon({ name: b"List", args: [ty] });
+  let listed = list_type(ty);
   let d = p.depth;
   let count = temp(site(p, pr));
   let n = count.name;
@@ -1635,7 +1636,7 @@ fn columns_set(
   );
   let b = temp(line(raised, d, b"} else {"));
   let column_type = |f: Int|
-    TyCon({ name: b"Array", args: [match fields.at(f) { Some(t) -> t, None -> unknown_type() }] });
+    array_type(match fields.at(f) { Some(t) -> t, None -> unknown_type() });
   let dups = Bytes::join(
     range(0, es.len()).map(|f: Int|
       spelled(duped(b.pr, column_type(f), RWord, [slot_of(b.name, ascii_of_int(f))]).out)).filter(
@@ -1878,27 +1879,22 @@ fn at_top() -> Place =
     depth: 0,
   }
 
-fn local(id: Int, ty: Bytes, rep: Rep) -> Var =
-  { id: id, ty: TyCon({ name: ty, args: [] }), rep: rep }
+fn local(id: Int, ty: Type, rep: Rep) -> Var = { id: id, ty: ty, rep: rep }
 
 test "a list literal is laid out by the emitted code, its tail holding what fits in one" {
-  let made_of = |item: Bytes, args: List<Arg>|
+  let made_of = |item: Type, args: List<Arg>|
     spelled(
       contained(
         at_top(),
         printing(Map::new().insert(0, b"p0")),
-        Some({
-          id: 1,
-          ty: TyCon({ name: b"List", args: [TyCon({ name: item, args: [] })] }),
-          rep: RWord,
-        }),
+        Some({ id: 1, ty: list_type(item), rep: RWord }),
         { made: MList(args.len()), args: args, reuse: None },
       ).out,
     );
-  let made = |args: List<Arg>| made_of(b"String", args);
+  let made = |args: List<Arg>| made_of(string_type(), args);
   let laid = layouts().list;
   let tail = |k: Int| Bytes::concat_all([b"[", ascii_of_int(laid.tail + k), b"] = "]);
-  let two = made([AVar(local(0, b"String", RWord)), AZero(RWord)]);
+  let two = made([AVar(local(0, string_type(), RWord)), AZero(RWord)]);
   let has = |text: Bytes, t: Bytes|
     assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
   // Room for the two items, each in its tail slot, the tail's length two.
@@ -1908,7 +1904,7 @@ test "a list literal is laid out by the emitted code, its tail holding what fits
   has(two, b"))->tail_len = 2;");
   assert_eq(made([]).index_of(b")["), None);
   // A `Decimal` lies in the tail as its two words.
-  let dec = made_of(b"Decimal", [AZero(RDec)]);
+  let dec = made_of(decimal_type(), [AZero(RDec)]);
   has(dec, b"ply_list_room(ctx, 1, 2)");
   has(dec, tail(1).concat(b"("));
   // Making a list cannot fail.
@@ -1922,11 +1918,7 @@ test "a list literal past a tail's room lays its whole leaves under a branch and
     contained(
       at_top(),
       printing(Map::new()),
-      Some({
-        id: 1,
-        ty: TyCon({ name: b"List", args: [TyCon({ name: b"Int", args: [] })] }),
-        rep: RWord,
-      }),
+      Some({ id: 1, ty: list_type(int_type()), rep: RWord }),
       { made: MList(n), args: range(0, n).map(AInt), reuse: None },
     ).out,
   );
@@ -1950,22 +1942,21 @@ test "a list literal past a tail's room lays its whole leaves under a branch and
 }
 
 test "a list's item is read where it lies and its rest shares its trie, neither through the runtime" {
-  let of = |item: Bytes| TyCon({ name: b"List", args: [TyCon({ name: item, args: [] })] });
-  let op = |c: ContainerOp, item: Bytes, into: Var|
+  let op = |c: ContainerOp, item: Type, into: Var|
     spelled(
       container_op(
         at_top(),
         printing(Map::new().insert(0, b"p0")),
         Some(into),
         c,
-        [AVar({ id: 0, ty: of(item), rep: RWord }), AInt(2)],
+        [AVar({ id: 0, ty: list_type(item), rep: RWord }), AInt(2)],
         { takes: [false, false], owned: c == Rest, fails: false, stops: false },
       ).out,
     );
-  let item = op(ItemAt, b"String", local(1, b"String", RWord));
-  let scalar = op(ItemAt, b"Int", local(1, b"Int", RInt));
-  let rest = op(Rest, b"String", { id: 1, ty: of(b"String"), rep: RWord });
-  let ints = op(Rest, b"Int", { id: 1, ty: of(b"Int"), rep: RWord });
+  let item = op(ItemAt, string_type(), local(1, string_type(), RWord));
+  let scalar = op(ItemAt, int_type(), local(1, int_type(), RInt));
+  let rest = op(Rest, string_type(), { id: 1, ty: list_type(string_type()), rep: RWord });
+  let ints = op(Rest, int_type(), { id: 1, ty: list_type(int_type()), rep: RWord });
   [item, scalar, rest, ints].fold((), |_: Unit, text: Bytes| {
     assert_eq([text.index_of(b"rt_list_at_p"), text.index_of(b"rt_list_rest_p")], [None, None]);
     assert_eq(text.index_of(b"ctx->failed"), None)
@@ -1980,14 +1971,12 @@ test "a list's item is read where it lies and its rest shares its trie, neither 
   assert(scalar.index_of(b"int64_t ") != None, Some(String::of_bytes_lossy(scalar)))
 }
 
-fn con(name: Bytes, args: List<Type>) -> Type = TyCon({ name: name, args: args })
-
 test "an array of `Int`s holds each as its bits a word apart, with no shape, and a bad length raises" {
-  let int = con(b"Int", []);
+  let int = int_type();
   let pr = container_op(
     at_top(),
     printing(Map::new().insert(0, b"p0")),
-    Some({ id: 1, ty: con(b"Array", [int]), rep: RWord }),
+    Some({ id: 1, ty: array_type(int), rep: RWord }),
     ArrayNew({ laid: laid(no_ctors(), int), stride: 1 }),
     [AVar({ id: 0, ty: int, rep: RInt }), AInt(7)],
     { takes: [false, true], owned: true, fails: true, stops: false },
@@ -2003,12 +1992,9 @@ test "an array of `Int`s holds each as its bits a word apart, with no shape, and
 }
 
 test "an array of records holds each record's words in place, and a write lets go of the one it replaces by its type" {
-  let int = con(b"Int", []);
-  let rec = TyRecord([
-    { name: b"s", ty: con(b"String", []) },
-    { name: b"x", ty: con(b"Float", []) },
-  ]);
-  let array = con(b"Array", [rec]);
+  let int = int_type();
+  let rec = TyRecord([{ name: b"s", ty: string_type() }, { name: b"x", ty: float_type() }]);
+  let array = array_type(rec);
   let pr = container_op(
     at_top(),
     printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2")),
@@ -2038,15 +2024,15 @@ test "an array of records holds each record's words in place, and a write lets g
 }
 
 test "a field of a Columns' record is read from its column in place, an index naming no record raising" {
-  let float = con(b"Float", []);
+  let float = float_type();
   let pr = container_op(
     at_top(),
     printing(Map::new().insert(0, b"p0").insert(1, b"p1")),
     Some({ id: 2, ty: float, rep: RFloat }),
     ColumnField({ k: 2, column: { laid: laid(no_ctors(), float), stride: 1 } }),
     [
-      AVar({ id: 0, ty: con(b"Columns", []), rep: RWord }),
-      AVar({ id: 1, ty: con(b"Int", []), rep: RInt }),
+      AVar({ id: 0, ty: columns_type(TyRecord([])), rep: RWord }),
+      AVar({ id: 1, ty: int_type(), rep: RInt }),
     ],
     { takes: [false, false], owned: false, fails: true, stops: false },
   );

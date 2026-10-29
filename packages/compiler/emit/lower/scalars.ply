@@ -7,10 +7,16 @@ import compiler.emit.code (Code, NLit, NUnary)
 import compiler.syntax.patterns (Lit, LInt, LBool, LFloat, LFixed, LWide, LChar, LStr, LBytes,
                                  LEmbedded, LDec, LUnit, LBad)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type,
-                             spelled_type, unit_type, fn_type, monomorphic)
+                             spelled_type, unit_type, fn_type, monomorphic, int_type, bool_type,
+                             bytes_type, decimal_type, float_type, string_type, option_type)
+import compiler.check.known (is_int, is_bool, is_float, is_decimal, is_char, is_string, is_bytes,
+                             is_unit, hold_name, secret_name, secret_item, option_item, list_item,
+                             array_element, map_parts, columns_row, result_parts, ordering_type,
+                             width_type, fixed_widths, some_ctor, none_ctor)
 import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, lit_int, is_bitop)
+import std.bytes (ascii_of_int)
 import compiler.emit.reps (Ctors, SumCtor, has_vars, type_vars, compared_by_root, keyed_sum,
                            numeric_sum, nullary_sum, generic_sum, written_sum, at_args, release_row)
 import compiler.check.infer.expr (kept_type)
@@ -43,10 +49,10 @@ pub fn literal(cx: Context, st: Lowering, l: Lit, at: Span) -> Lowered / {abort.
     LChar(v) -> { st: st, arg: AChar(v) },
     LFixed(name, bits) -> fixed(cx, st, l, name, bits, at),
     LWide(name, _, low) -> fixed(cx, st, l, name, low, at),
-    LStr(_) -> bound(cx, st, named_type(b"String"), Literal(l), at),
-    LBytes(_) -> bound(cx, st, named_type(b"Bytes"), Literal(l), at),
-    LEmbedded(_, _) -> bound(cx, st, named_type(b"Bytes"), Literal(l), at),
-    LDec(_) -> bound(cx, st, named_type(b"Decimal"), Literal(l), at),
+    LStr(_) -> bound(cx, st, string_type(), Literal(l), at),
+    LBytes(_) -> bound(cx, st, bytes_type(), Literal(l), at),
+    LEmbedded(_, _) -> bound(cx, st, bytes_type(), Literal(l), at),
+    LDec(_) -> bound(cx, st, decimal_type(), Literal(l), at),
     LUnit -> { st: st, arg: AZero(RUnit) },
     LBad -> unreachable(b"a literal that does not read"),
   }
@@ -140,7 +146,7 @@ fn classed(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let eq = op == b"eq" || op == b"ne";
-  let truth = named_type(b"Bool");
+  let truth = bool_type();
   let answer = if comparison(op) { truth } else { ty };
   {
     match c {
@@ -196,7 +202,7 @@ fn classed(
   }
 }
 
-fn is_secret(ty: Type) -> Bool = match ty { TyCon(c) -> c.name == b"Secret", _ -> false }
+fn is_secret(ty: Type) -> Bool = secret_item(ty) != None
 
 fn is_function(ty: Type) -> Bool = match ty { TyFn(_) -> true, _ -> false }
 
@@ -204,7 +210,7 @@ fn is_function(ty: Type) -> Bool = match ty { TyFn(_) -> true, _ -> false }
 fn functions_compared(st: Lowering, at: Span) -> Lowered = {
   let failed = bound_as(
     st,
-    named_type(b"Int"),
+    int_type(),
     RInt,
     Native({
       name: b"builtin_elaborated_functions_compared_p",
@@ -215,7 +221,7 @@ fn functions_compared(st: Lowering, at: Span) -> Lowered = {
   );
   bound_as(
     failed.st,
-    named_type(b"Bool"),
+    bool_type(),
     RBool,
     Prim({ op: b"ne", on: RInt, args: [failed.arg, AInt(0)] }),
     at,
@@ -230,7 +236,7 @@ fn handles_equal(l: Lowered, r: Lowered, op: Bytes, native: Bytes, at: Span) -> 
   let b = handed({ st: a.st, arg: r.arg }, RWord, at);
   let same = bound_as(
     b.st,
-    named_type(b"Int"),
+    int_type(),
     RInt,
     Native({
       name: native,
@@ -241,7 +247,7 @@ fn handles_equal(l: Lowered, r: Lowered, op: Bytes, native: Bytes, at: Span) -> 
   );
   bound_as(
     same.st,
-    named_type(b"Bool"),
+    bool_type(),
     RBool,
     Prim({ op: if op == b"eq" { b"ne" } else { b"eq" }, on: RInt, args: [same.arg, AInt(0)] }),
     at,
@@ -314,14 +320,8 @@ fn valued(cx: Context, fs: List<Field>) -> List<Field> =
 
 /// The sign `l` where it is not zero, else `r`, lowered in a block of its own after `l`'s state.
 fn decided(cx: Context, l: Lowered, r: Lowered, at: Span) -> Lowered = {
-  let j = fresh(continued(l.st, r.st), named_type(b"Int"), RInt);
-  let c = bound(
-    cx,
-    j.st,
-    named_type(b"Bool"),
-    Prim({ op: b"ne", on: RInt, args: [l.arg, AInt(0)] }),
-    at,
-  );
+  let j = fresh(continued(l.st, r.st), int_type(), RInt);
+  let c = bound(cx, j.st, bool_type(), Prim({ op: b"ne", on: RInt, args: [l.arg, AInt(0)] }), at);
   let right = set_join(c.st, r, j.var, at);
   {
     st: {
@@ -358,19 +358,13 @@ pub fn operated(
       else if name == b"?same" {
         let x = handed({ st: st, arg: a }, RWord, at);
         let y = handed({ st: x.st, arg: b }, RWord, at);
-        bound(
-          cx,
-          y.st,
-          named_type(b"Bool"),
-          Prim({ op: b"eq", on: RWord, args: [x.arg, y.arg] }),
-          at,
-        )
+        bound(cx, y.st, bool_type(), Prim({ op: b"eq", on: RWord, args: [x.arg, y.arg] }), at)
       } else if name == b"Float::of_int" || name == b"Float::of_bits" {
         let x = handed({ st: st, arg: a }, RInt, at);
         bound(
           cx,
           x.st,
-          named_type(b"Float"),
+          float_type(),
           Prim({
             op: if name == b"Float::of_int" { b"to_float" } else { b"of_bits" },
             on: RInt,
@@ -380,7 +374,7 @@ pub fn operated(
         )
       } else if name == b"bits_of_float" {
         let x = handed({ st: st, arg: a }, RFloat, at);
-        bound(cx, x.st, named_type(b"Int"), Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at)
+        bound(cx, x.st, int_type(), Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at)
       } else if float_function(name) != None { float_called(st, name, args, at) }
       else if decimal_conversion(name) { decimal_converted(cx, st, name, a, at) }
       else if wrapping(name) || saturating(name) || name.starts_with(b"checked_") {
@@ -400,7 +394,7 @@ pub fn operated(
               bound(
                 cx,
                 x.st,
-                named_type(b"Int"),
+                int_type(),
                 Prim({ op: b"to_int", on: width_held(w), args: [x.arg] }),
                 at,
               )
@@ -426,16 +420,10 @@ fn decimal_converted(
 ) -> Lowered / {abort.raise} =
   if name == b"Decimal::of_int" {
     let x = handed({ st: st, arg: a }, RInt, at);
-    bound(
-      cx,
-      x.st,
-      named_type(b"Decimal"),
-      Prim({ op: b"to_decimal", on: RInt, args: [x.arg] }),
-      at,
-    )
+    bound(cx, x.st, decimal_type(), Prim({ op: b"to_decimal", on: RInt, args: [x.arg] }), at)
   } else {
     let d = handed({ st: st, arg: a }, RDec, at);
-    bound(cx, d.st, named_type(b"Int"), Prim({ op: b"scale", on: RDec, args: [d.arg] }), at)
+    bound(cx, d.st, int_type(), Prim({ op: b"scale", on: RDec, args: [d.arg] }), at)
   }
 
 /// The type builtin `name` answers called on operands of type `ty`: its declared scheme at that
@@ -452,8 +440,8 @@ fn witnessed(cx: Context, st: Lowering, a: Arg, at: Span) -> Lowered / {abort.ra
     Some(s) -> if !cx.setting.ctors.named.contains(s.name) {
       unreachable(b"a stated witness of a type no constructor names")
     } else {
-      let tag = bound(cx, s.st, named_type(b"Int"), Tag(s.name), at);
-      bound(cx, tag.st, named_type(b"Int"), Prim({ op: b"witness", on: RInt, args: [tag.arg] }), at)
+      let tag = bound(cx, s.st, int_type(), Tag(s.name), at);
+      bound(cx, tag.st, int_type(), Prim({ op: b"witness", on: RInt, args: [tag.arg] }), at)
     },
   }
 
@@ -550,7 +538,7 @@ pub fn comparison_built(ctors: Ctors, t: Type, order: Bool) -> Bool / {abort.rai
             },
             _ -> Continue({ ..s, todo: rest }),
           },
-          CWord(w) -> if w == kept_type() || w == named_type(b"Unit") || w == TyRecord([])
+          CWord(w) -> if w == kept_type() || w == unit_type() || w == TyRecord([])
               || (!order && is_secret(w)) { Continue({ ..s, todo: rest }) }
           else { Stop(false) },
           _ -> Continue({ ..s, todo: rest }),
@@ -569,13 +557,12 @@ fn class_of(ctors: Ctors, ty: Type) -> Class =
           || (is_option(ty) && !has_vars(ty)) { CWalked(ty) }
       else if generic_sum(ctors, ty) { CSum(ty) }
       else { CWord(ty) }
-    } else if c.name == b"Int" { CInt }
-    else if c.name == b"Bool" { CBool }
-    else if c.name == b"Float" { CFloat }
-    else if c.name == b"Decimal" { CDec }
-    else if c.name == b"Char" { CChar }
-    else if c.name == b"String" || c.name == b"Bytes" { CText }
-    else if compared_by_root(ctors, c.name) {
+    } else if is_int(ty) { CInt }
+    else if is_bool(ty) { CBool }
+    else if is_float(ty) { CFloat }
+    else if is_decimal(ty) { CDec }
+    else if is_char(ty) { CChar }
+    else if is_string(ty) || is_bytes(ty) { CText } else if compared_by_root(ctors, c.name) {
       // A keyed sum compares as its key does, never by which constructor it is.
       if nullary_sum(match ctors.sums.get(c.name) { Some(cs) -> cs, None -> [] })
           && !keyed_sum(ctors, c.name)
@@ -619,7 +606,7 @@ fn equal_by(
   args: List<Arg>,
   at: Span,
 ) -> Lowered = {
-  let e = rooted(cx, st, key, args, [ty, ty], named_type(b"Bool"), at);
+  let e = rooted(cx, st, key, args, [ty, ty], bool_type(), at);
   if op == b"ne" { negation(cx, e, at) } else { e }
 }
 
@@ -650,18 +637,18 @@ fn ranked(
   match if comparison(op) { by_root(cx, r.st, ty, l.arg, r.arg, at) } else { None } {
     None -> if op != b"eq" && op != b"ne" { lacking(r.st, op) }
     else if is_function(ty) { functions_compared(r.st, at) } else {
-      let truth = named_type(b"Bool");
+      let truth = bool_type();
       unsettled(needing(r.st, ty), truth, held_as(cx.setting, truth), read_only([l.arg, r.arg]), at)
     },
     Some(o) -> {
       let s = bound(
         cx,
         o.st,
-        named_type(b"Int"),
+        int_type(),
         Prim({ op: b"sign", on: rep_of_arg(o.arg), args: [o.arg] }),
         at,
       );
-      bound(cx, s.st, named_type(b"Bool"), Prim({ op: op, on: RInt, args: [s.arg, AInt(0)] }), at)
+      bound(cx, s.st, bool_type(), Prim({ op: op, on: RInt, args: [s.arg, AInt(0)] }), at)
     },
   }
 
@@ -712,7 +699,7 @@ fn root_called(
 }
 
 fn negation(cx: Context, b: Lowered, at: Span) -> Lowered =
-  bound(cx, b.st, named_type(b"Bool"), Prim({ op: b"not", on: RBool, args: [b.arg] }), at)
+  bound(cx, b.st, bool_type(), Prim({ op: b"not", on: RBool, args: [b.arg] }), at)
 
 /// `compare(a, b)`, or `compare_values`, at the type its operands hold: through the root written
 /// for a declared sum, a container, an `Option` or a `Result` known throughout, which answers the
@@ -726,7 +713,7 @@ fn ordered(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
-  let order = answer_of(cx, name, ty, named_type(b"Ordering"));
+  let order = answer_of(cx, name, ty, ordering_type());
   let made = |s: Lowered|
     bound(cx, s.st, order, Prim({ op: b"ordering", on: RInt, args: [s.arg] }), at);
   if unsaid(ty) { open_at(cx, st, ty, [a, b], order, at) } else {
@@ -758,7 +745,7 @@ fn kept_sign(st: Lowering, a: Arg, b: Arg, at: Span) -> Lowered = {
   let r = handed({ st: l.st, arg: b }, RWord, at);
   bound_as(
     r.st,
-    named_type(b"Int"),
+    int_type(),
     RInt,
     Native({
       name: b"builtin_elaborated_kept_order_p",
@@ -787,7 +774,7 @@ fn extreme(
   let past = bound(
     cx,
     s.st,
-    named_type(b"Bool"),
+    bool_type(),
     Prim({ op: if most { b"gt" } else { b"lt" }, on: RInt, args: [s.arg, AInt(0)] }),
     at,
   );
@@ -797,7 +784,7 @@ fn extreme(
 /// The order of `a` and `b` where a root written for their type answers it: a declared sum, a
 /// container, an `Option` or a `Result` known throughout.
 fn by_root(cx: Context, st: Lowering, ty: Type, a: Arg, b: Arg, at: Span) -> Option<Lowered> = {
-  let order = named_type(b"Ordering");
+  let order = ordering_type();
   let at_root = |op: TypeOp, t: Type|
     Some(rooted(cx, st, keys::written(op, t, cx.setting.module), [a, b], [t, t], order, at));
   match class_of(cx.setting.ctors, ty) {
@@ -815,11 +802,10 @@ fn by_root(cx: Context, st: Lowering, ty: Type, a: Arg, b: Arg, at: Span) -> Opt
 /// and what a specialisation computes at a type left unsaid. The checker derives no order for a
 /// function, a credential or a runtime object, so none reaches here.
 fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered / {abort.raise} = {
-  let int = named_type(b"Int");
+  let int = int_type();
   let signed = |o: Lowered|
     bound(cx, o.st, int, Prim({ op: b"sign", on: rep_of_arg(o.arg), args: [o.arg] }), at);
-  if unsaid(ty) { signed(open_at(cx, r.st, ty, [l.arg, r.arg], named_type(b"Ordering"), at)) }
-  else {
+  if unsaid(ty) { signed(open_at(cx, r.st, ty, [l.arg, r.arg], ordering_type(), at)) } else {
     match by_root(cx, r.st, ty, l.arg, r.arg, at) {
       Some(o) -> signed(o),
       None -> match class_of(cx.setting.ctors, ty) {
@@ -845,7 +831,7 @@ fn sign_at(cx: Context, l: Lowered, r: Lowered, ty: Type, at: Span) -> Lowered /
 /// A `Float`'s bits as a word that orders as IEEE 754's total order does, every NaN read as one:
 /// a negative one's magnitude bits flipped.
 fn total_key(cx: Context, f: Lowered, at: Span) -> Lowered = {
-  let int = named_type(b"Int");
+  let int = int_type();
   let x = handed(f, RFloat, at);
   let bits = bound(cx, x.st, int, Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at);
   let sign = bound(
@@ -894,20 +880,20 @@ fn reflected(cx: Context, st: Lowering, name: Bytes, a: Arg, at: Span) -> Lowere
         );
         constructed_as(cx, f.st, b"std.value.VFn", [f.arg], value_type, at)
       },
-      TyCon(c) -> if c.name == b"Hold" { alone(b"std.value.VHold") }
-      else if c.name == b"Secret" { alone(b"std.value.VSecret") }
+      TyCon(c) -> if c.name == hold_name() { alone(b"std.value.VHold") }
+      else if c.name == secret_name() { alone(b"std.value.VSecret") }
       else if unsaid(ty) { open_at(cx, st, ty, [a], value_type, at) }
       else if written_sum(cx.setting.ctors, c) || walked_container(ty) || walked_columns(ty) {
         written(cx, st, op, ty, a, at)
       } else if c.args.len() > 0 { none() }
-      else if c.name == b"Int" { value(b"std.value.VInt") }
-      else if c.name == b"Bool" { value(b"std.value.VBool") }
-      else if c.name == b"Float" { value(b"std.value.VFloat") }
-      else if c.name == b"Decimal" { value(b"std.value.VDecimal") }
-      else if c.name == b"Char" { value(b"std.value.VChar") }
-      else if c.name == b"String" { value(b"std.value.VStr") }
-      else if c.name == b"Bytes" { value(b"std.value.VBytes") }
-      else if c.name == b"Unit" { alone(b"std.value.VUnit") } else {
+      else if is_int(ty) { value(b"std.value.VInt") }
+      else if is_bool(ty) { value(b"std.value.VBool") }
+      else if is_float(ty) { value(b"std.value.VFloat") }
+      else if is_decimal(ty) { value(b"std.value.VDecimal") }
+      else if is_char(ty) { value(b"std.value.VChar") }
+      else if is_string(ty) { value(b"std.value.VStr") }
+      else if is_bytes(ty) { value(b"std.value.VBytes") }
+      else if is_unit(ty) { alone(b"std.value.VUnit") } else {
         match width_named(c.name) {
           Some(w) -> width_reflected(cx, st, c.name, w, a, value_type, at),
           None -> none(),
@@ -930,8 +916,8 @@ fn width_reflected(
   value_type: Type,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let int = named_type(b"Int");
-  let u128 = named_type(b"U128");
+  let int = int_type();
+  let u128 = width_type({ bits: 128, signed: false });
   let made = |s: Lowering, lo: Arg, hi: Arg|
     bound(cx, s, u128, Prim({ op: b"wide", on: RInt, args: [lo, hi] }), at);
   let wide = if w.bits > 64 {
@@ -963,7 +949,7 @@ fn width_reflected(
 /// for a `Float`, a function, a credential or a runtime object, so none reaches here.
 fn encoded(cx: Context, st: Lowering, hashed: Bool, a: Arg, at: Span) -> Lowered / {abort.raise} = {
   let ty = type_of(a);
-  let bytes = answer_of(cx, if hashed { b"digest" } else { b"?encoded" }, ty, named_type(b"Bytes"));
+  let bytes = answer_of(cx, if hashed { b"digest" } else { b"?encoded" }, ty, bytes_type());
   let rooted_by = match ty {
     TyCon(c) -> written_sum(cx.setting.ctors, c) || walked_container(ty) || walked_columns(ty),
     TyRecord(_) -> true,
@@ -987,7 +973,7 @@ fn written(cx: Context, st: Lowering, op: TypeOp, ty: Type, a: Arg, at: Span) ->
     keys::written(op, ty, cx.setting.module),
     [a],
     [ty],
-    match op { Digest -> named_type(b"Bytes"), _ -> named_type(b"std.value.Value") },
+    match op { Digest -> bytes_type(), _ -> named_type(b"std.value.Value") },
     at,
   )
 
@@ -1055,8 +1041,7 @@ fn width_arithmetic(
   let b = match args.at(1) { Some(x) -> x, None -> AInt(0) };
   let ty = match a { AInt(_) -> type_of(b), _ -> type_of(a) };
   let checked = name.starts_with(b"checked_");
-  let answer = answer_of(cx, name, ty, if checked { TyCon({ name: b"Option", args: [ty] }) }
-  else { ty });
+  let answer = answer_of(cx, name, ty, if checked { option_type(ty) } else { ty });
   match class_of(cx.setting.ctors, ty) {
     CWidth(w) -> if w.bits > 64 {
       if checked {
@@ -1095,9 +1080,9 @@ fn int_held(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {
   match args {
     [_, x] -> {
       let ty = type_of(x);
-      let int = named_type(b"Int");
-      let option = answer_of(cx, b"to_int", ty, TyCon({ name: b"Option", args: [int] }));
-      let some = |l: Lowered| constructed_as(cx, l.st, b"Some", [l.arg], option, at);
+      let int = int_type();
+      let option = answer_of(cx, b"to_int", ty, option_type(int));
+      let some = |l: Lowered| constructed_as(cx, l.st, some_ctor(), [l.arg], option, at);
       match class_of(cx.setting.ctors, ty) {
         CInt -> some(handed({ st: st, arg: x }, RInt, at)),
         CWidth(w) -> if w.bits < 64 || (w.bits == 64 && w.signed) {
@@ -1107,7 +1092,7 @@ fn int_held(cx: Context, st: Lowering, args: List<Arg>, at: Span) -> Lowered / {
           let fits = bound(
             cx,
             h.st,
-            named_type(b"Bool"),
+            bool_type(),
             if w.bits == 64 {
               Prim({
                 op: b"le",
@@ -1161,10 +1146,7 @@ fn witnessed_operator(
             scalar(ty),
             name,
             args,
-            {
-              params: args.map(type_of),
-              ret: if comparison(op) { named_type(b"Bool") } else { ty },
-            },
+            { params: args.map(type_of), ret: if comparison(op) { bool_type() } else { ty } },
             at,
           )
         }
@@ -1208,7 +1190,7 @@ fn checked_width(
   let exact = bound(
     cx,
     y.st,
-    if unsigned { named_type(b"U64") } else { named_type(b"Int") },
+    if unsigned { width_type(word) } else { int_type() },
     Prim({
       op: if neg { b"exact_neg" }
       else if name == b"checked_add" { b"exact_add" }
@@ -1222,7 +1204,7 @@ fn checked_width(
   let fits = bound(
     cx,
     exact.st,
-    named_type(b"Bool"),
+    bool_type(),
     if unsigned {
       Prim({ op: b"le", on: RNum(word), args: [exact.arg, ANum({ width: word, bits: most(w) })] })
     } else { Prim({ op: b"within", on: RInt, args: [exact.arg, AInt(least(w)), AInt(most(w))] }) },
@@ -1258,7 +1240,7 @@ fn checked_in_place(
   let fits = bound(
     cx,
     y.st,
-    named_type(b"Bool"),
+    bool_type(),
     Prim({ op: name, on: k.on, args: if neg { [x.arg] } else { [x.arg, y.arg] } }),
     at,
   );
@@ -1287,8 +1269,8 @@ fn some_where(
   option: Type,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let some = constructed_as(cx, value.st, b"Some", [value.arg], option, at);
-  let none = constructed_as(cx, continued(opened(fits.st), some.st), b"None", [], option, at);
+  let some = constructed_as(cx, value.st, some_ctor(), [value.arg], option, at);
+  let none = constructed_as(cx, continued(opened(fits.st), some.st), none_ctor(), [], option, at);
   let j = fresh(continued(fits.st, none.st), option, held_as(cx.setting, option));
   let t = set_join(j.st, some, j.var, at);
   let e = set_join(t.st, none, j.var, at);
@@ -1356,18 +1338,12 @@ fn float_native_called(
 ) -> Lowered / {abort.raise} = {
   let given = args.fold({ st: st, bits: [] }, |acc: { st: Lowering, bits: List<Arg> }, a: Arg| {
     let x = handed({ st: acc.st, arg: a }, RFloat, at);
-    let b = bound_as(
-      x.st,
-      named_type(b"Int"),
-      RInt,
-      Prim({ op: b"bits", on: RFloat, args: [x.arg] }),
-      at,
-    );
+    let b = bound_as(x.st, int_type(), RInt, Prim({ op: b"bits", on: RFloat, args: [x.arg] }), at);
     { st: b.st, bits: acc.bits.push(b.arg) }
   });
   let answered = bound_as(
     given.st,
-    named_type(b"Int"),
+    int_type(),
     RInt,
     Native({
       name: builtin_helper(f.native).concat(b"_p"),
@@ -1378,7 +1354,7 @@ fn float_native_called(
   );
   bound_as(
     answered.st,
-    named_type(b"Float"),
+    float_type(),
     RFloat,
     Prim({ op: b"of_bits", on: RInt, args: [answered.arg] }),
     at,
@@ -1403,62 +1379,30 @@ fn divisor(op: Bytes, rhs: Code) -> Option<Int> =
     }
   }
 
-/// The type a width is.
-fn width_type(w: Width) -> Type =
-  named_type(
-    Bytes::concat_all([
-      if w.signed { b"I" } else { b"U" },
-      if w.bits == 8 { b"8" }
-      else if w.bits == 16 { b"16" }
-      else if w.bits == 32 { b"32" }
-      else if w.bits == 64 { b"64" }
-      else { b"128" },
-    ]),
-  )
+/// The width whose builtin `name` is, where `named` spells each width's builtin of that kind.
+fn width_called(
+  name: Bytes,
+  named: ({ name: Bytes, bits: Int, signed: Bool }) -> Bytes,
+) -> Option<Width> =
+  fixed_widths().find_map(|w: { name: Bytes, bits: Int, signed: Bool }|
+    if name == named(w) { Some({ bits: w.bits, signed: w.signed }) } else { None })
 
 fn of_int_width(name: Bytes) -> Option<Width> =
-  [b"U8", b"U16", b"U32", b"U64", b"I8", b"I16", b"I32", b"I64", b"U128", b"I128"].fold(
-    None,
-    |acc: Option<Width>, w: Bytes| if name == w.concat(b"::of_int") { width_named(w) } else { acc },
-  )
+  width_called(name, |w: { name: Bytes, bits: Int, signed: Bool }| w.name.concat(b"::of_int"))
 
 fn int_of_width(name: Bytes) -> Option<Width> =
-  [b"U8", b"U16", b"U32", b"U64", b"I8", b"I16", b"I32", b"I64", b"U128", b"I128"].fold(
-    None,
-    |acc: Option<Width>, w: Bytes|
-      if name
-          == Bytes::concat_all([
-            b"Int::of_",
-            if w.starts_with(b"U") { b"u" } else { b"i" },
-            digits_of(w),
-          ]) { width_named(w) }
-      else { acc },
-  )
+  width_called(name, |w: { name: Bytes, bits: Int, signed: Bool }|
+    Bytes::concat_all([b"Int::of_", if w.signed { b"i" } else { b"u" }, ascii_of_int(w.bits)]))
 
-/// A width's name past its sign.
-fn digits_of(w: Bytes) -> Bytes =
-  if w.ends_with(b"128") { b"128" }
-  else if w.ends_with(b"16") { b"16" }
-  else if w.ends_with(b"32") { b"32" }
-  else if w.ends_with(b"64") { b"64" }
-  else { b"8" }
-
-fn is_option(t: Type) -> Bool =
-  match t { TyCon(c) -> c.name == b"Option" && c.args.len() == 1, _ -> false }
+fn is_option(t: Type) -> Bool = option_item(t) != None
 
 /// Whether `==` and `compare` of two values of `t` walk them through roots written for `t`: a
 /// `List`, an `Array` or a `Map` whose type is known throughout.
 pub fn walked_container(t: Type) -> Bool =
-  !has_vars(t)
-    && (match t {
-      TyCon(c) -> c.name == b"List" || c.name == b"Array" || c.name == b"Map",
-      _ -> false,
-    })
+  !has_vars(t) && (list_item(t) != None || array_element(t) != None || map_parts(t) != None)
 
 /// Whether `t` is a `Columns` known throughout, which every operation per type walks record by
 /// record as the array of its records, through the roots written for it.
-pub fn walked_columns(t: Type) -> Bool =
-  !has_vars(t) && (match t { TyCon(c) -> c.name == b"Columns" && c.args.len() == 1, _ -> false })
+pub fn walked_columns(t: Type) -> Bool = !has_vars(t) && columns_row(t) != None
 
-fn is_result(t: Type) -> Bool =
-  !has_vars(t) && (match t { TyCon(c) -> c.name == b"Result" && c.args.len() == 2, _ -> false })
+fn is_result(t: Type) -> Bool = !has_vars(t) && result_parts(t) != None

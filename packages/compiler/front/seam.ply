@@ -9,8 +9,9 @@ import compiler.check.types (Atom, Type, TyCon, TyFn, TyRecord, TyVar, atoms_tex
                              read_atoms, Printer, printer_new, print_ty, Field, canonical_atoms,
                              canonical_scheme, canonical_type, bool_type, int_type, bytes_type,
                              unit_type, TyNominal, TypeTable, vars_in)
+import compiler.check.known (fixed_widths, list_item, array_element, columns_row, map_parts)
 import compiler.check.resolve.tables (Diag, qualify)
-import compiler.store.hash.forms (HashOutput, by_name, closure_of, of_key)
+import compiler.store.hash.forms (HashOutput, by_name, of_key)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash (digest)
 import compiler.check.infer (CheckOutput, RootFacts, facts_at, facts_by_owner, filed_facts,
@@ -38,7 +39,7 @@ import compiler.front.rows (span_at, loc_at, Written, fn_written, written_of, Pl
                             OpRow, EffectRow, CtorRow, HashRow, HDef, HLaw, HTest, HashFrame,
                             OrdinalRow, Dump, answered_diag)
 import compiler.front.facts (outlines_of, effect_written, effect_hosts, effect_public_of, type_rows,
-                             test_name_spans, law_literals, Frame, View, Analysis, TaggedSite,
+                             test_label_spans, law_literals, Frame, View, Analysis, TaggedSite,
                              tagged_of, root_tagged, TypedConst, typed_consts_of, root_consts,
                              StatementSite, statements_of, root_statements)
 
@@ -114,7 +115,6 @@ fn op_row(module: Int, op_info: OpInfo, cr: Carrier) -> OpRow / {abort.raise} =
   {
     name: op_info.name,
     mode: mode_text(op_info.mode),
-    multi: op_info.multi,
     resource_param: op_info.resource_param,
     kept: op_info.kept,
     params: op_info.params.map(canonical_type),
@@ -532,17 +532,7 @@ pub fn ctors_read(
 
 /// A fixed width by the runtime's numbering, `ply_core::INT_TYPES`.
 fn width_number(name: Bytes) -> Option<Int> =
-  if name == b"U8" { Some(0) }
-  else if name == b"U16" { Some(1) }
-  else if name == b"U32" { Some(2) }
-  else if name == b"U64" { Some(3) }
-  else if name == b"I8" { Some(4) }
-  else if name == b"I16" { Some(5) }
-  else if name == b"I32" { Some(6) }
-  else if name == b"I64" { Some(7) }
-  else if name == b"U128" { Some(8) }
-  else if name == b"I128" { Some(9) }
-  else { None }
+  fixed_widths().find_index(|w: { name: Bytes, bits: Int, signed: Bool }| w.name == name)
 
 /// Each sum type, and whether it holds a width whatever its parameters are.
 type Carrier = { sums: Map<Bytes, Bool> }
@@ -597,9 +587,9 @@ fn carry(cr: Carrier, vars: List<Int>, ty: Type) -> Carry / {abort.raise} =
       None -> {
         let args = carries(cr, vars, c.args);
         let plain = args.fold(true, |b: Bool, a: Carry| b && is_plain(a));
-        if (c.name == b"List" || c.name == b"Array" || c.name == b"Columns") && args.len() == 1 {
+        if list_item(ty) != None || array_element(ty) != None || columns_row(ty) != None {
           if plain { CPlain } else { CList(args.get(0)) }
-        } else if c.name == b"Map" && args.len() == 2 {
+        } else if map_parts(ty) != None {
           if plain { CPlain } else { CMap(args.get(0), args.get(1)) }
         } else {
           match cr.sums.get(c.name) {
@@ -859,7 +849,7 @@ fn tables(
   let effs = effect_written(outlines);
   let hosts = effect_hosts(outlines);
   let read = bodies_read(checked);
-  let names = test_name_spans(outlines);
+  let names = test_label_spans(outlines);
   let lits = law_literals(outlines);
   let cr = carrier_of(checked.ctors);
   {
@@ -882,8 +872,6 @@ fn tables(
     hashes_digest: digest(hashes),
     keys: root_keys(outlines, checked, hashes, within),
     emitter_roots: emitter_roots(outlines, checked, cr, within),
-    baked: const_sites(outlines, hashes).map(|site: ConstSite|
-      { name: site.name, hash: site.hash }),
     emitter_ctors: emitter_ctors_of(outlines, checked, cr),
     ordinals: outlines.map(ordinal_row),
     bodies: hashes.bodies,
@@ -951,64 +939,30 @@ pub fn view_dump(v: View, within: Option<Within>) -> Dump / {abort.raise} = {
 /// A stage that reports stops the rest, so a refusal is the diagnostics of exactly one stage.
 pub type AnalysisOutcome = | Refused(List<Diag>) | Analysed(Analysis)
 
-/// A `const` definition of a checked program: where it is written, and what a build keeps its value
-/// under (`kept_under`).
+/// A `const` definition of a checked program: where it is written, and the hash of all it reaches.
 pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
 
-/// Every `const` definition the program holds, whichever package declares it. One in a shipped
-/// module that the program does not reach has no hash, and is none of the program's.
-pub fn const_sites(outlines: List<Outline>, hashes: HashOutput) -> List<ConstSite> / {abort.raise} =
-  const_sites_where(outlines, hashes, |_: Bytes| true)
-
-/// Those of [`const_sites`] `wanted` says of, asked by program-wide name before a site is made:
-/// what a site is kept under costs a walk of all its definition reaches.
-fn const_sites_where(
-  outlines: List<Outline>,
-  hashes: HashOutput,
-  wanted: (Bytes) -> Bool,
-) -> List<ConstSite> / {abort.raise} = {
-  let hashed = by_name(hashes.defs);
-  range(0, outlines.len()).fold([], |acc: List<ConstSite>, i: Int| {
-    let o = outlines.get(i);
+/// Every `const` definition of `frame`'s root package declared as the type named `type_name`
+/// program-wide. One in a shipped module that the program does not reach has no hash, and is none
+/// of the program's.
+pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
+  let named = frame.consts.fold(Map::new(), |acc: Map<Bytes, Bool>, c: TypedConst|
+    if c.type_name == type_name { acc.insert(c.name, true) } else { acc });
+  let hashed = by_name(frame.hashes.defs);
+  range(0, frame.outlines.len()).fold([], |acc: List<ConstSite>, i: Int| {
+    let o = frame.outlines.get(i);
     o.items.fold(acc, |sites: List<ConstSite>, item: Outlined|
       match item {
-        OFn(f) -> if !f.baked || !wanted(qualify(o.name, f.name)) { sites } else {
+        OFn(f) -> {
           let name = qualify(o.name, f.name);
-          match hashed.get(name) {
-            Some(h) ->
-              sites.push({
-                module: i,
-                span: f.name_span,
-                name: name,
-                hash: kept_under(hashes, name, h),
-              }),
+          match if f.constant && named.contains(name) { hashed.get(name) } else { None } {
+            Some(h) -> sites.push({ module: i, span: f.name_span, name: name, hash: h }),
             None -> sites,
           }
         },
         _ -> sites,
       })
   })
-}
-
-/// What a build keeps the value of the `const` definition `name` under: its hash, which covers all
-/// it reaches, with each name that spells. A kept value names its constructors as the program does
-/// and a hash names nothing, so the same definition in a module of another name is another value.
-fn kept_under(hashes: HashOutput, name: Bytes, hash: Bytes) -> Bytes / {abort.raise} =
-  blake3(
-    Bytes::concat_all(
-      closure_of(hashes, [name]).keys().fold(
-        [b"ply const value 1\x00", hash],
-        |acc: List<Bytes>, reached: Bytes| acc.push(b"\x00").push(reached),
-      ),
-    ),
-  )
-
-/// Every `const` definition of `frame`'s root package declared as the type named `type_name`
-/// program-wide.
-pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
-  let named = frame.consts.fold(Map::new(), |acc: Map<Bytes, Bool>, c: TypedConst|
-    if c.type_name == type_name { acc.insert(c.name, true) } else { acc });
-  const_sites_where(frame.outlines, frame.hashes, |name: Bytes| named.contains(name))
 }
 
 fn known_defs(rows: List<KnownDefRow>) -> Map<Bytes, KnownDef> / {abort.raise} =

@@ -7,7 +7,7 @@ import compiler.check.infer.names (simple_name_of)
 import compiler.emit.code (Code, NVar, NDef, NCtor, NBuiltin, NKnown, NLambda, NApp, NUnary,
                            NBinary, NField, NIf, NBlock, NList, NRecord, NUpdate, NMatch, NPerform,
                            NSimulate, NParallel, NHandle, Lambda, Capture, CodeStmt, CLet, CLetPat,
-                           CDo, CodeField, CodeArm, CodeClause, PxList, PxVar)
+                           CDo, CodeField, CodeArm, CodeClause, PxList, PxVar, labels_among)
 import compiler.check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, Atom, RVar, int_type, bool_type,
                              option_type, run_needs, row_empty)
 import compiler.emit.typing (unknown_type)
@@ -15,25 +15,28 @@ import compiler.syntax.parsing (Span, dummy_span, prelude_binder)
 import compiler.syntax.exprs (prelude_module)
 import compiler.check.resolve.tables (qualify)
 import std.bytes (ascii_of_int)
+import std.list (zip)
 import compiler.emit.reps (Def, Imported, EmitParam, BoundLambda, has_vars, word_type, substituted,
                            substituted_fully, type_vars, resumption, resumed, resumed_as,
                            layout_key, laid_known)
 import compiler.emit.layout (P, classes, OfMap, MapRoot, MapHeight, NodeCount, NodeKey, NodeValue)
 import compiler.emit.tir.containers (ContainerOp, Laid, Length)
 import compiler.emit.answer (Layout, Exact)
-import compiler.emit.release (released_vars, map_node_name)
+import compiler.emit.release (released_vars)
+import compiler.check.known (list_item, map_parts, map_node_type, iter_parts, some_ctor,
+                             continue_ctor, stop_ctor)
 import compiler.emit.keys (RootKey, FnArg, Named, At, Test, KeyType, KeyLayout, Callee, Root,
                            Generic, Evidence, root_name, root_text, definition_of, key_types,
                            key_rows, unspecialised, at_key)
 import compiler.emit.tir
-import compiler.emit.tir (Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, RImm, Var, Arg, AVar, AInt,
-                          AZero, no_closure_words, Given, Convention, Val, Prim, Make, Get,
-                          Gathered, Pack, Native, Op, OCalling, MClosure, PCapture, PCase, TTag,
-                          TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case, Match, Loop,
-                          Next, Done, Restart, Enter, Return, Fail, NoArm, Sited, Block, Fn, FnKind,
-                          Rooted, Plain, Member, Closure, no_links, falls_through, rep_of_arg,
-                          counted, MFramed, OHandle, OContainer)
-import compiler.emit.tir.calling (ConstantRead, Ticked)
+import compiler.emit.tir (reps_of, all_given, Rep, RInt, RBool, RWord, RSlice, RSum, RUnit, RImm,
+                          Var, Arg, AVar, AInt, AZero, no_closure_words, Given, Convention, Val,
+                          Prim, Make, Get, Gathered, Pack, Native, Op, OCalling, MClosure, PCapture,
+                          PCase, TTag, TInt, Call, Apply, Inst, Let, Do, Decl, Assign, If, Case,
+                          Match, Loop, Next, Done, Restart, Enter, Return, Fail, NoArm, Sited,
+                          Block, Fn, FnKind, Rooted, Plain, Member, Closure, no_links,
+                          falls_through, rep_of_arg, counted, MFramed, OHandle, OContainer)
+import compiler.emit.tir.calling (ConstantRead)
 import compiler.emit.tir.handling (Entering, SiteHere)
 import compiler.emit.lower.setting (Setting, Root, imported_target, module_import)
 import compiler.syntax.exprs (scheduler_module)
@@ -46,8 +49,7 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToB
                                  bound_as, done, emitted, opened, static_added, nested, unnested,
                                  with_lambda, started, read_taken, type_of, handed, read_noted,
                                  read_note, capture_note, frame_entered, taken_as, noted, none_held,
-                                 held_count, held_args, held_words, held_instance, held_kept,
-                                 continued, erased)
+                                 Holding, holding_laid, held_values, held_inside, continued)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read, with_room, laid)
 import compiler.emit.lower.crossing (pending_raised)
@@ -95,7 +97,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     words: [],
     rows: key_rows(r.key),
     labels: h.labels,
-    label_names: r.params.drop(r.params.len() - h.labels).map(|p: EmitParam| p.name),
+    label_names: labels_among(r.params, h.labels).map(|p: EmitParam| p.name),
     label_values: [],
     handed: [],
     instance: None,
@@ -218,17 +220,17 @@ fn conventional(s: Setting, c: Crossing) -> Convention =
 
 /// How the root's body holds its parameters, which a restart hands its arguments to.
 pub fn params_held(cx: Context) -> List<Rep> / {abort.raise} =
-  match cx.tails { Restarts(reps) -> reps, _ -> convention(cx).reps }
+  match cx.tails { Restarts(reps) -> reps, _ -> reps_of(convention(cx)) }
 
 /// How the root's body holds its parameters: as its convention takes them, but a list the body walks
 /// down by restarting on a rest of it, which it holds as a view of the list it was handed, so each
 /// step reads the same list further on and copies nothing.
 fn walked_as(cx: Context) -> List<Rep> / {abort.raise} = {
-  let reps = convention(cx).reps;
+  let reps = reps_of(convention(cx));
   range(0, reps.len()).map(|i: Int|
     match reps.at(i) {
       Some(RWord) -> match cx.types.at(i) {
-        Some(TyCon(c)) -> if c.name == b"List" && walks(cx, cx.body, i) { RSlice } else { RWord },
+        Some(t) -> if list_item(t) != None && walks(cx, cx.body, i) { RSlice } else { RWord },
         _ -> RWord,
       },
       Some(r) -> r,
@@ -307,8 +309,7 @@ pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {ab
   }
 
 /// The walk a call of `d`, named at `at`, on `args` is: the prelude's fold, map or filter of a list,
-/// or its fold of a map, whose function, its last argument, is one that runs here (`runs_here`),
-/// over what no specialisation erased: a failure in the loop lets go of what it holds by its type.
+/// or its fold of a map, whose function, its last argument, is one that runs here (`runs_here`).
 /// None for any other call.
 fn walk_of(cx: Context, d: Defined, func: Code, args: List<Code>) -> Option<Walk> / {abort.raise} =
   match walking_by(d.def) {
@@ -317,7 +318,7 @@ fn walk_of(cx: Context, d: Defined, func: Code, args: List<Code>) -> Option<Walk
       let n = args.len() - 1;
       let runs = match args.at(n) { Some(f) -> runs_here(cx, f, walk_takes(b)), None -> false };
       match if runs { walk_typed(d, func) } else { None } {
-        Some(t) -> if erased(t.held) || t.over.any(erased) { None } else {
+        Some(t) -> {
           let ranged = b != EntryFolding
             && (match args.at(0) { Some(c) -> range_ends(cx, c) != None, None -> false });
           Some({ by: b, at: n, over: t.over, held: t.held, ranged: ranged })
@@ -360,9 +361,11 @@ fn walk_typed(d: Defined, func: Code) -> Option<{ over: List<Type>, held: Type }
   match d.def.scheme {
     Some(sc) -> match substituted_fully(sc.ty, reference_args(func)) {
       TyFn(f) -> match f.params.at(0) {
-        Some(TyCon(c)) -> if (c.name == b"List" && c.args.len() == 1)
-            || (c.name == b"Map" && c.args.len() == 2) { Some({ over: c.args, held: f.ret }) }
-        else { None },
+        Some(t) -> match ((list_item(t), map_parts(t))) {
+          (Some(item), _) -> Some({ over: [item], held: f.ret }),
+          (_, Some(m)) -> Some({ over: [m.key, m.value], held: f.ret }),
+          _ -> None,
+        },
         _ -> None,
       },
       _ -> None,
@@ -386,16 +389,9 @@ pub fn run_at(how: InPlace) -> Option<Int> =
   match how { Known -> None, Stepped -> Some(2), Walked(w) -> Some(w.at) }
 
 /// The argument of a call run in place as `how` says that is a call of `range` whose ends the walk
-/// counts between, which are lowered in its place after the call's other arguments.
+/// counts between, which are lowered in its place (`InPlaceArgs`).
 pub fn counted_at(how: InPlace) -> Option<Int> =
   match how { Walked(w) -> if w.ranged { Some(0) } else { None }, _ -> None }
-
-/// The ends of the range a `ranged` walk counts between, among the arguments `lowered` holds.
-fn range_of(lowered: List<Option<Arg>>, w: Walk) -> Option<{ lo: Arg, hi: Arg }> =
-  match ((lowered.at(w.at + 1), lowered.at(w.at + 2))) {
-    (Some(Some(lo)), Some(Some(hi))) -> Some({ lo: lo, hi: hi }),
-    _ -> None,
-  }
 
 /// What the definition `f` names as a value answers where a walk run in place as `how` says runs it:
 /// its call on the parameters the frame `walk_entered` opened holds, each slot read as a lambda's
@@ -600,13 +596,7 @@ pub fn applied(
         Apply({
           f: f,
           args: h.args,
-          conv: {
-            params: all.map(|_: Rep| Given),
-            reps: all,
-            answer: answer,
-            destined: false,
-            answered: tir::Owned,
-          },
+          conv: { params: all_given(all), answer: answer, destined: false, answered: tir::Owned },
           // A function value's type may carry no row of what calling it performs: a lambda's and a
           // definition read as a value are filed with none.
           stops: true,
@@ -642,13 +632,7 @@ pub fn applied(
         Apply({
           f: f,
           args: h.args,
-          conv: {
-            params: words.map(|_: Rep| Given),
-            reps: words,
-            answer: RWord,
-            destined: false,
-            answered: tir::Owned,
-          },
+          conv: { params: all_given(words), answer: RWord, destined: false, answered: tir::Owned },
           stops: true,
         }),
         at,
@@ -673,6 +657,22 @@ fn captures_released(st: Lowering, captures: List<Var>) -> Lowering =
   captures.fold(st, |s: Lowering, v: Var|
     released_vars(v.ty).fold(s, |q: Lowering, x: Int| noted(q, { var: x, reads: Exact })))
 
+/// A call's arguments lowered for a body run in place of it: each by its place, none at the
+/// function run in place; and the ends of the range a `ranged` walk counts between, which its first
+/// argument names.
+pub type InPlaceArgs = { args: List<Option<Arg>>, range: Option<{ lo: Arg, hi: Arg }> }
+
+/// A body run in place, opened: the context and state it is lowered in, and the loop it is a pass
+/// of, whose variables `left` closes the loop over.
+pub type Entered = { cx: Context, st: Lowering, looped: Looped }
+
+/// The loop a body run in place is a pass of: none for a known lambda's body; `iterate`'s; or a
+/// walk's, a map's with what a map walk holds besides.
+pub type Looped =
+  | NotLooped
+  | StepLoop(StepVars)
+  | WalkLoop({ walk: Walk, vars: WalkVars, entry: Option<EntryVars> })
+
 /// The state a body run in place of the call of `func` on `args` is lowered in, as `how` says. A
 /// known lambda's (`known_entered`). A step's: a pass of the loop `left` makes, its parameter the
 /// loop's state, its captures the caller's own values, the budget spent first. A walk's: the item
@@ -682,25 +682,27 @@ pub fn entered(
   st: Lowering,
   func: Code,
   args: List<Code>,
-  lowered: List<Option<Arg>>,
+  lowered: InPlaceArgs,
   how: InPlace,
   at: Span,
-) -> Opened / {abort.raise} =
+) -> Entered / {abort.raise} = {
+  let once = |o: Opened| { cx: o.cx, st: o.st, looped: NotLooped };
   match how {
-    Known -> known_entered(cx, st, func, lowered, at),
+    Known -> once(known_entered(cx, st, func, lowered.args, at)),
     Stepped -> match args.at(2) {
       None -> unreachable(b"a step that is not there"),
-      Some(code) -> stepped_in(cx, st, code, lowered, at),
+      Some(code) -> stepped_in(cx, st, code, lowered.args, at),
     },
     Walked(w) -> match args.at(w.at) {
       None -> unreachable(b"a walk's function that is not there"),
       Some(f) -> walk_entered(cx, st, f, lowered, w, at),
     },
   }
+}
 
 /// The frame a known lambda `func` runs in, in place of a call of it on `lowered`: its parameters
-/// those arguments, its captures read off its closure, a step counted as the call it replaces would
-/// count one; under its lender's setting where another root lent it.
+/// those arguments, its captures read off its closure; under its lender's setting where another
+/// root lent it.
 fn known_entered(
   cx: Context,
   st: Lowering,
@@ -738,25 +740,26 @@ fn known_entered(
 /// The state the function `f` a walk runs on each item is lowered in: a pass's own block, which
 /// reads the item at the pass's place first, then the function's frame, its parameters the
 /// accumulator and the item of a fold, the item of a map or a filter. A lambda written here takes
-/// its captures from the caller's own values and counts a step as the call it replaces would; a
-/// known one runs as `known_entered` runs it; a definition named as a value is called.
+/// its captures from the caller's own values; a known one runs as `known_entered` runs it; a
+/// definition named as a value is called.
 fn walk_entered(
   cx: Context,
   st: Lowering,
   f: Code,
-  lowered: List<Option<Arg>>,
+  lowered: InPlaceArgs,
   w: Walk,
   at: Span,
-) -> Opened / {abort.raise} = {
-  let v = walk_vars(cx, st, w);
-  let read = match ((w.ranged, lowered.at(0), range_of(lowered, w))) {
+) -> Entered / {abort.raise} = {
+  let made = walk_vars(cx, st, w);
+  let v = made.vars;
+  let read = match ((w.ranged, lowered.args.at(0), lowered.range)) {
     // The range's item at a place is its low end that far on.
     (true, _, Some(r)) -> if rep_of_arg(r.lo) != RInt {
       unreachable(b"a walk over a range from other than an integer")
     } else {
       {
         st: emitted(
-          opened(v.st),
+          opened(made.st),
           Let({
             var: v.item,
             val: Prim({ op: b"add", on: RInt, args: [r.lo, AVar(v.at)] }),
@@ -765,6 +768,7 @@ fn walk_entered(
           }),
         ),
         args: [AVar(v.item)],
+        entry: None,
       }
     },
     (false, Some(Some(xs)), _) -> if rep_of_arg(xs) != RWord {
@@ -772,10 +776,16 @@ fn walk_entered(
     } else {
       match w.by {
         EntryFolding -> {
-          let e = entry_vars(cx, v.st, w);
-          entry_read(cx, opened(e.st), v, e.vars, w, at)
+          let e = entry_vars(cx, made.st, w);
+          let r = entry_read(cx, opened(e.st), v, e.vars, w, at);
+          { st: r.st, args: r.args, entry: Some(e.vars) }
         },
-        _ -> { st: item_read_into(opened(v.st), xs, AVar(v.at), v.item, at), args: [AVar(v.item)] },
+        _ ->
+          {
+            st: item_read_into(opened(made.st), xs, AVar(v.at), v.item, at),
+            args: [AVar(v.item)],
+            entry: None,
+          },
       }
     },
     _ -> unreachable(b"a walk over no list"),
@@ -785,48 +795,43 @@ fn walk_entered(
     EntryFolding -> [AVar(v.held)].concat(read.args),
     _ -> read.args,
   };
-  match f.node {
+  let o = match f.node {
     NKnown(_) -> known_entered(cx, read.st, f, params.map(Some), at),
-    NLambda(l) -> lambda_entered(cx, read.st, l, params, true, at),
-    _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, false, at),
-  }
+    NLambda(l) -> lambda_entered(cx, read.st, l, params, at),
+    _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, at),
+  };
+  { cx: o.cx, st: o.st, looped: WalkLoop({ walk: w, vars: v, entry: read.entry }) }
 }
 
-/// What a map's walk holds beside a list's walk's, numbered from `st` alike in `entered` and in
-/// `left`: the node it holds and its place there, the leaf and place a pass reads, and the map's
-/// root, height and length, which do not change.
-type EntryVars = { node: Var, i: Var, leaf: Var, place: Var, root: Var, height: Var, len: Var }
+/// What a map's walk holds beside a list's walk's: the node it holds and its place there, the leaf
+/// and place a pass reads, and the map's root, height and length, which do not change.
+pub type EntryVars = { node: Var, i: Var, leaf: Var, place: Var, root: Var, height: Var, len: Var }
 
-fn entry_vars(
-  cx: Context,
-  st: Lowering,
-  w: Walk,
-) -> { st: Lowering, vars: EntryVars } / {abort.raise} = {
-  let node = map_node(w);
-  let made = [node, int_type(), node, int_type(), node, int_type(), int_type()].fold(
-    { st: st, vars: [] },
-    |acc: { st: Lowering, vars: List<Var> }, t: Type| {
-      let x = fresh(acc.st, t, held_as(cx.setting, t));
-      { st: x.st, vars: acc.vars.push(x.var) }
-    },
-  );
-  let vars = made.vars;
+fn entry_vars(cx: Context, st: Lowering, w: Walk) -> { st: Lowering, vars: EntryVars } = {
+  let made = |s: Lowering, t: Type| fresh(s, t, held_as(cx.setting, t));
+  let node = made(st, map_node(w));
+  let i = made(node.st, int_type());
+  let leaf = made(i.st, map_node(w));
+  let place = made(leaf.st, int_type());
+  let root = made(place.st, map_node(w));
+  let height = made(root.st, int_type());
+  let len = made(height.st, int_type());
   {
-    st: made.st,
+    st: len.st,
     vars: {
-      node: vars.get(0),
-      i: vars.get(1),
-      leaf: vars.get(2),
-      place: vars.get(3),
-      root: vars.get(4),
-      height: vars.get(5),
-      len: vars.get(6),
+      node: node.var,
+      i: i.var,
+      leaf: leaf.var,
+      place: place.var,
+      root: root.var,
+      height: height.var,
+      len: len.var,
     },
   }
 }
 
 /// The type of a node of the map a walk walks.
-fn map_node(w: Walk) -> Type = TyCon({ name: map_node_name(), args: w.over })
+fn map_node(w: Walk) -> Type = match w.over { [k, v] -> map_node_type(k, v), _ -> unknown_type() }
 
 /// A map walk's pass reading its entry, as the prelude's `map_folded` reads it: the node's pair at
 /// the place it holds while the place is in the node, else the first pair of the leaf above the
@@ -939,53 +944,44 @@ fn some_bound(st: Lowering, o: Arg, into: Var, at: Span) -> Lowering / {abort.ra
 fn cases_of(o: Arg) -> List<Bytes> = match rep_of_arg(o) { RSum(s) -> s.cases, _ -> [] }
 
 /// The place of `Some` among the cases of the `Option` `o` is held as.
-fn some_case(o: Arg) -> Int = match case_index(rep_of_arg(o), b"Some") { Some(i) -> i, None -> 0 }
+fn some_case(o: Arg) -> Int =
+  match case_index(rep_of_arg(o), some_ctor()) { Some(i) -> i, None -> 0 }
 
 /// The frame lambda `l`, written in this root's code, runs in, in place of a call of it on
-/// `params`: its captures the caller's own values, a step counted first where it is `ticked`.
+/// `params`: its captures the caller's own values.
 fn lambda_entered(
   cx: Context,
   st: Lowering,
   l: Lambda,
   params: List<Arg>,
-  ticked: Bool,
   at: Span,
 ) -> Opened / {abort.raise} = {
   let t = l.ty;
-  {
-    let counted = if ticked { done(st, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at) }
-    else { st };
-    let inner = {
-      ..cx,
-      answer_ty: t.ret,
-      frame: l.at,
-      captured: l.captures.map(|c: Capture| c.dst),
-    };
-    let taken = range(0, params.len()).fold(
-      { st: frame_entered(inner, counted, at), env: Map::new() },
-      |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
-        match params.at(j) {
-          Some(a) -> {
-            let p = match t.params.at(j) {
-              Some(ty) -> taken_as(cx, { st: acc.st, arg: a }, ty, at),
-              None -> { st: acc.st, arg: a },
-            };
-            { st: p.st, env: acc.env.insert(j, p.arg) }
-          },
-          None -> acc,
+  let inner = { ..cx, answer_ty: t.ret, frame: l.at, captured: l.captures.map(|c: Capture| c.dst) };
+  let taken = range(0, params.len()).fold(
+    { st: frame_entered(inner, st, at), env: Map::new() },
+    |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
+      match params.at(j) {
+        Some(a) -> {
+          let p = match t.params.at(j) {
+            Some(ty) -> taken_as(cx, { st: acc.st, arg: a }, ty, at),
+            None -> { st: acc.st, arg: a },
+          };
+          { st: p.st, env: acc.env.insert(j, p.arg) }
         },
-    );
-    match l.captures.fold(Some(taken.env), |acc: Option<Map<Int, Arg>>, cap: Capture|
-        match acc {
+        None -> acc,
+      },
+  );
+  match l.captures.fold(Some(taken.env), |acc: Option<Map<Int, Arg>>, cap: Capture|
+      match acc {
+        None -> None,
+        Some(m) -> match st.env.get(cap.src) {
+          Some(a) -> Some(m.insert(cap.dst, a)),
           None -> None,
-          Some(m) -> match st.env.get(cap.src) {
-            Some(a) -> Some(m.insert(cap.dst, a)),
-            None -> None,
-          },
-        }) {
-      None -> unreachable(b"a lambda's capture nothing bound"),
-      Some(env) -> { cx: inner, st: { ..taken.st, env: env } },
-    }
+        },
+      }) {
+    None -> unreachable(b"a lambda's capture nothing bound"),
+    Some(env) -> { cx: inner, st: { ..taken.st, env: env } },
   }
 }
 
@@ -1014,8 +1010,7 @@ fn f_of(st: Lowering, slot: Int) -> Option<Var> =
   match st.env.get(slot) { Some(AVar(v)) -> Some(v), _ -> None }
 
 /// A known lambda's body run in place in `cx`'s frame: another root's sites taken from here on where
-/// it is lent, a step counted as the call it replaces would count one but where it is a definition
-/// named as a value, its captures read off its closure `f`, its parameters the arguments `lowered`.
+/// it is lent, its captures read off its closure `f`, its parameters the arguments `lowered`.
 fn in_frame(
   cx: Context,
   st: Lowering,
@@ -1033,14 +1028,9 @@ fn in_frame(
         Some(bl) -> emitted(st, Sited(Some({ root: bl.owner, base: bl.base }))),
         None -> st,
       };
-      let counted = match lender {
-        Some(bl) -> if bl.named { sited }
-        else { done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at) },
-        None -> done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at),
-      };
       let held = captures_held(cx, k.lambda.body, k.lambda.captures);
       let caps = range(0, k.lambda.captures.len()).fold(
-        { st: counted, env: Map::new() },
+        { st: sited, env: Map::new() },
         |acc: { st: Lowering, env: Map<Int, Arg> }, i: Int|
           match k.lambda.captures.at(i) {
             None -> acc,
@@ -1124,65 +1114,46 @@ fn param_row(cx: Context, p: Int) -> Option<Row> =
 pub fn left(
   cx: Context,
   before: Lowering,
-  entered: Opened,
+  entered: Entered,
   body: Lowered,
-  lowered: List<Option<Arg>>,
-  how: InPlace,
+  lowered: InPlaceArgs,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  match how {
-    Known ->
+  match entered.looped {
+    NotLooped ->
       {
         st: resited(entered.st.insts, before.insts.len(), { ..body.st, env: before.env }),
         arg: body.arg,
       },
-    Walked(w) -> match w.by {
-      EntryFolding -> entries_left(cx, before, entered, body, lowered, w, at),
-      _ -> walk_left(cx, before, entered, body, lowered, w, at),
+    WalkLoop(w) -> match w.entry {
+      Some(e) -> entries_left(cx, before, entered, body, lowered, w.walk, w.vars, e, at),
+      None -> walk_left(cx, before, entered, body, lowered, w.walk, w.vars, at),
     },
-    Stepped -> match entered.st.env.get(0) {
-      Some(AVar(s)) -> match lowered.at(0) {
-        Some(Some(seed)) -> match lowered.at(1) {
-          Some(Some(budget)) -> {
-            let v = step_vars(cx, before, s.ty, entered.cx.answer_ty);
-            let spent_one = { id: before.next + 5, ty: int_type(), rep: RInt };
-            let ended = {
-              state: v.state,
-              left: spent_one,
+    StepLoop(v) -> match ((lowered.args.at(0), lowered.args.at(1))) {
+      (Some(Some(seed)), Some(Some(budget))) -> {
+        let ended = { state: v.state, left: v.spent, answer: v.answer, next: body.st.next, at: at };
+        let pass = match fused(body.st.insts, body.arg, ended) {
+          Some(f) -> f,
+          None -> tested(cx, body.st.insts, body.arg, ended),
+        };
+        let seeded = handed(
+          { st: { ..body.st, insts: before.insts, env: before.env, next: pass.next }, arg: seed },
+          v.state.rep,
+          at,
+        );
+        {
+          st: emitted(
+            seeded.st,
+            Loop({
+              state: [{ var: v.state, init: seeded.arg }, { var: v.left, init: budget }],
+              body: pass.block,
               answer: v.answer,
-              next: body.st.next,
-              at: at,
-            };
-            let pass = match fused(body.st.insts, body.arg, ended) {
-              Some(f) -> f,
-              None -> tested(cx, body.st.insts, body.arg, ended),
-            };
-            let seeded = handed(
-              {
-                st: { ..body.st, insts: before.insts, env: before.env, next: pass.next },
-                arg: seed,
-              },
-              v.state.rep,
-              at,
-            );
-            {
-              st: emitted(
-                seeded.st,
-                Loop({
-                  state: [v.state, v.left],
-                  init: [seeded.arg, budget],
-                  body: pass.block,
-                  answer: v.answer,
-                }),
-              ),
-              arg: AVar(v.answer),
-            }
-          },
-          _ -> unreachable(b"a step with no budget"),
-        },
-        _ -> unreachable(b"a step with no seed"),
+            }),
+          ),
+          arg: AVar(v.answer),
+        }
       },
-      _ -> unreachable(b"a step whose state no variable holds"),
+      _ -> unreachable(b"a step with no seed or no budget"),
     },
   }
 
@@ -1193,34 +1164,33 @@ fn resited(insts: Block, from: Int, back: Lowering) -> Lowering =
     emitted(back, Sited(None))
   } else { back }
 
-/// A walk's loop variables, numbered from `st` alike in `entered` and in `left`: the place of the
-/// item a pass reads, what the walk holds across its passes, its answer, and the item.
-type WalkVars = { st: Lowering, at: Var, held: Var, answer: Var, item: Var }
+/// A walk's loop variables: the place of the item a pass reads, what the walk holds across its
+/// passes, its answer, and the item.
+pub type WalkVars = { at: Var, held: Var, answer: Var, item: Var }
 
-fn walk_vars(cx: Context, st: Lowering, w: Walk) -> WalkVars = {
+fn walk_vars(cx: Context, st: Lowering, w: Walk) -> { st: Lowering, vars: WalkVars } = {
   let p = fresh(st, int_type(), RInt);
   let h = fresh(p.st, w.held, held_as(cx.setting, w.held));
   let a = fresh(h.st, w.held, held_as(cx.setting, w.held));
   let item = match w.over.at(0) { Some(t) -> t, None -> unknown_type() };
   let x = fresh(a.st, item, held_as(cx.setting, item));
-  { st: x.st, at: p.var, held: h.var, answer: a.var, item: x.var }
+  { st: x.st, vars: { at: p.var, held: h.var, answer: a.var, item: x.var } }
 }
 
 /// A walk's loop over the list `lowered` holds first, each pass lowered to `body` from `entered`'s
 /// state: it holds a fold's second argument, or an empty list with room for the items, and goes on
 /// with what the function answered, that pushed, or the item pushed where the function held of it;
-/// the pass at the list's length leaves with what it holds. It counts the steps the prelude's walk
-/// does: its call, its loop's entry and each pass.
+/// the pass at the list's length leaves with what it holds.
 fn walk_left(
   cx: Context,
   before: Lowering,
-  entered: Opened,
+  entered: Entered,
   body: Lowered,
-  lowered: List<Option<Arg>>,
+  lowered: InPlaceArgs,
   w: Walk,
+  v: WalkVars,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let v = walk_vars(cx, before, w);
   let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
   let back = resited(entered.st.insts, 0, { ..body.st, env: before.env });
   let after = bound_as(
@@ -1256,7 +1226,7 @@ fn walk_left(
   // The loop over `n` places, `n` the list's length or how far the range reaches.
   let looped = |s: Lowering, n: Arg| {
     let first = match w.by {
-      Folding -> match lowered.at(1) {
+      Folding -> match lowered.args.at(1) {
         Some(Some(init)) -> handed({ st: s, arg: init }, v.held.rep, at),
         _ -> unreachable(b"a fold with no first accumulator"),
       },
@@ -1264,7 +1234,6 @@ fn walk_left(
     };
     let ended = fresh(first.st, bool_type(), RBool);
     let pass = [
-      Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
       Let({
         var: ended.var,
         val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), n] }),
@@ -1276,21 +1245,23 @@ fn walk_left(
     {
       st: emitted(
         ended.st,
-        Loop({ state: [v.at, v.held], init: [AInt(0), first.arg], body: pass, answer: v.answer }),
+        Loop({
+          state: [{ var: v.at, init: AInt(0) }, { var: v.held, init: first.arg }],
+          body: pass,
+          answer: v.answer,
+        }),
       ),
       arg: AVar(v.answer),
     }
   };
-  let ticked = range(0, 2).fold(outside(item), |s: Lowering, _: Int|
-    done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at));
-  match ((w.ranged, lowered.at(0), range_of(lowered, w))) {
+  match ((w.ranged, lowered.args.at(0), lowered.range)) {
     (true, _, Some(r)) ->
-      range_guarded(cx, ticked, r.lo, r.hi, at, |s: Lowering, lo: Arg, hi: Arg| {
+      range_guarded(cx, outside(item), r.lo, r.hi, at, |s: Lowering, lo: Arg, hi: Arg| {
         let n = bound_as(s, int_type(), RInt, Prim({ op: b"sub", on: RInt, args: [hi, lo] }), at);
         looped(n.st, n.arg)
       }),
     (false, Some(Some(xs)), _) -> {
-      let n = length_read(ticked, xs, at);
+      let n = length_read(outside(item), xs, at);
       looped(n.st, n.arg)
     },
     _ -> unreachable(b"a walk over no list"),
@@ -1300,20 +1271,18 @@ fn walk_left(
 /// A map walk's loop, as the prelude's `Map::fold` and `map_folded` run it, each pass lowered to
 /// `body` from `entered`'s state: the seed where the map has no root, else a loop from the first
 /// leaf's first place, going on with what the function answered and the place after the one read,
-/// and leaving with what it holds once the map's every entry is done. It counts the steps the
-/// prelude's walk does, which it calls the same helpers of.
+/// and leaving with what it holds once the map's every entry is done.
 fn entries_left(
   cx: Context,
   before: Lowering,
-  entered: Opened,
+  entered: Entered,
   body: Lowered,
-  lowered: List<Option<Arg>>,
+  lowered: InPlaceArgs,
   w: Walk,
+  v: WalkVars,
+  e: EntryVars,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let v = walk_vars(cx, before, w);
-  let made = entry_vars(cx, v.st, w);
-  let e = made.vars;
   let outside = |s: Lowering| { ..s, insts: before.insts, env: before.env };
   let back = resited(entered.st.insts, 0, { ..body.st, env: before.env });
   let plus_one = |s: Lowering, x: Var|
@@ -1322,10 +1291,9 @@ fn entries_left(
   let place_next = plus_one(done_next.st, e.place);
   let h = handed({ st: place_next.st, arg: body.arg }, v.held.rep, at);
   let item = emitted(h.st, Next([done_next.arg, AVar(e.leaf), place_next.arg, h.arg]));
-  match ((lowered.at(0), lowered.at(1))) {
+  match ((lowered.args.at(0), lowered.args.at(1))) {
     (Some(Some(m)), Some(Some(init))) -> {
-      let tick = |s: Lowering| done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at);
-      let seed = handed({ st: tick(outside(item)), arg: init }, v.held.rep, at);
+      let seed = handed({ st: outside(item), arg: init }, v.held.rep, at);
       let root = laid(cx, seed.st, OfMap(MapRoot), [m], option_type(map_node(w)), at);
       let answer = fresh(root.st, w.held, held_as(cx.setting, w.held));
       let reads = |op: ContainerOp| Op({ op: OContainer(op), args: [m], uses: tir::reads(1) });
@@ -1341,13 +1309,9 @@ fn entries_left(
         [AVar(e.root), AVar(e.height)],
         at,
       );
-      let counted = emitted(
-        tick(first.st),
-        Let({ var: e.len, val: reads(Length), at: at, unwind: [] }),
-      );
-      let ended = fresh(counted, bool_type(), RBool);
+      let measured = emitted(first.st, Let({ var: e.len, val: reads(Length), at: at, unwind: [] }));
+      let ended = fresh(measured, bool_type(), RBool);
       let pass = [
-        Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
         Let({
           var: ended.var,
           val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), AVar(e.len)] }),
@@ -1359,8 +1323,12 @@ fn entries_left(
       let looped = emitted(
         ended.st,
         Loop({
-          state: [v.at, e.node, e.i, v.held],
-          init: [AInt(0), first.arg, AInt(0), seed.arg],
+          state: [
+            { var: v.at, init: AInt(0) },
+            { var: e.node, init: first.arg },
+            { var: e.i, init: AInt(0) },
+            { var: v.held, init: seed.arg },
+          ],
           body: pass,
           answer: v.answer,
         }),
@@ -1431,14 +1399,14 @@ fn stepped_in(
   code: Code,
   lowered: List<Option<Arg>>,
   at: Span,
-) -> Opened / {abort.raise} =
+) -> Entered / {abort.raise} = {
   match code.node {
     NLambda(l) -> match step_typed(l) {
       None -> unreachable(b"a step at no `Iter` type"),
       Some(t) -> match lowered.at(1) {
         Some(Some(budget)) -> {
           let v = step_vars(cx, st, t.state, t.answer);
-          let spent_one = pass_begun(
+          let begun = pass_begun(
             frame_entered({ ..cx, frame: l.at }, opened(v.st), at),
             v.left,
             budget,
@@ -1464,7 +1432,13 @@ fn stepped_in(
                   frame: l.at,
                   captured: l.captures.map(|cap: Capture| cap.dst),
                 },
-                st: { ..spent_one.st, env: env },
+                st: { ..begun.st, env: env },
+                looped: StepLoop({
+                  state: v.state,
+                  left: v.left,
+                  spent: begun.spent,
+                  answer: v.answer,
+                }),
               },
           }
         },
@@ -1473,10 +1447,12 @@ fn stepped_in(
     },
     _ -> unreachable(b"a step that is no lambda"),
   }
+}
 
 /// A step's pass begun in `st`: the loop's budget, `left` before this pass, checked against the
-/// `budget` it was handed, which raises once it is spent; then what this pass leaves the next.
-fn pass_begun(st: Lowering, left: Var, budget: Arg, at: Span) -> Lowered = {
+/// `budget` it was handed, which raises once it is spent; then what this pass leaves the next,
+/// `spent`.
+fn pass_begun(st: Lowering, left: Var, budget: Arg, at: Span) -> { st: Lowering, spent: Var } = {
   let c = bound_as(
     st,
     bool_type(),
@@ -1505,13 +1481,19 @@ fn pass_begun(st: Lowering, left: Var, budget: Arg, at: Span) -> Lowered = {
       otherwise: [],
     }),
   );
-  bound_as(
-    guarded,
-    int_type(),
-    RInt,
-    Prim({ op: b"sub", on: RInt, args: [AVar(left), AInt(1)] }),
-    at,
-  )
+  let spent = fresh(guarded, int_type(), RInt);
+  {
+    st: emitted(
+      spent.st,
+      Let({
+        var: spent.var,
+        val: Prim({ op: b"sub", on: RInt, args: [AVar(left), AInt(1)] }),
+        at: at,
+        unwind: [],
+      }),
+    ),
+    spent: spent.var,
+  }
 }
 
 /// `iterate(seed, budget, step)` on a step that is a function value: the loop the call of a step
@@ -1535,7 +1517,7 @@ pub fn iterated(
         let v = step_vars(cx, st, t.state, t.answer);
         let begun = pass_begun(opened(v.st), v.left, budget, at);
         let r = applied(cx, begun.st, step, [AVar(v.state)], row, false, at);
-        let left = match begun.arg { AVar(x) -> x, _ -> v.left };
+        let left = begun.spent;
         let pass = tested(cx, r.st.insts, r.arg, {
           state: v.state,
           left: left,
@@ -1552,8 +1534,7 @@ pub fn iterated(
           st: emitted(
             seeded.st,
             Loop({
-              state: [v.state, v.left],
-              init: [seeded.arg, budget],
+              state: [{ var: v.state, init: seeded.arg }, { var: v.left, init: budget }],
               body: pass.block,
               answer: v.answer,
             }),
@@ -1606,13 +1587,8 @@ fn step_typed(l: Lambda) -> Option<{ state: Type, answer: Type }> = iter_of(l.ty
 
 /// `a` and `b` of a step's type `(a) -> Iter<a, b>`, its parameters `params` and answer `ret`.
 fn iter_of(params: List<Type>, ret: Type) -> Option<{ state: Type, answer: Type }> =
-  match ret {
-    TyCon(c) -> if c.name != b"Iter" || c.args.len() != 2 || params.len() != 1 { None } else {
-      match params.at(0) {
-        Some(a) -> match c.args.at(1) { Some(b) -> Some({ state: a, answer: b }), None -> None },
-        None -> None,
-      }
-    },
+  match ((iter_parts(ret), params)) {
+    (Some(it), [a]) -> Some({ state: a, answer: it.answer }),
     _ -> None,
   }
 
@@ -1624,8 +1600,11 @@ fn fn_of(t: Type, arity: Int) -> Option<{ ty: Type, params: List<Type>, ret: Typ
     _ -> None,
   }
 
-/// A step's loop variables, numbered from `st` alike in `entered` and in `left`: its state, the
-/// budget left, and its answer.
+/// A step's loop variables: its state, the budget left before a pass and after its step is spent,
+/// and its answer.
+pub type StepVars = { state: Var, left: Var, spent: Var, answer: Var }
+
+/// A step loop's state, budget and answer, made from `st`.
 fn step_vars(
   cx: Context,
   st: Lowering,
@@ -1754,10 +1733,10 @@ fn ending(b: Block, made: Var, val: Val, e: Ended) -> Option<Pass> =
     Gathered(g) -> match ((made.rep, g.parts)) {
       (RSum(s), [AInt(i), a]) -> {
         let u = unmade(b, a);
-        if s.cases.at(i) == Some(b"Continue") {
+        if s.cases.at(i) == Some(continue_ctor()) {
           let h = held_into(u.arg, e.state, e);
           Some({ block: u.block.concat(h.block).push(Next([h.arg, AVar(e.left)])), next: h.next })
-        } else if s.cases.at(i) == Some(b"Stop") {
+        } else if s.cases.at(i) == Some(stop_ctor()) {
           let h = held_into(u.arg, e.answer, e);
           Some({ block: u.block.concat(h.block).push(Done(h.arg)), next: h.next })
         } else { None }
@@ -1799,13 +1778,13 @@ fn held_into(a: Arg, into: Var, e: Ended) -> { block: Block, arg: Arg, next: Int
 fn tested(cx: Context, b: Block, v: Arg, e: Ended) -> Pass =
   match v {
     AVar(x) -> {
-      let go = read_out(cx, x, b"Continue", e.state, e);
-      let stop = read_out(cx, x, b"Stop", e.answer, { ..e, next: go.next });
+      let go = read_out(cx, x, continue_ctor(), e.state, e);
+      let stop = read_out(cx, x, stop_ctor(), e.answer, { ..e, next: go.next });
       {
         block: b.push(
           Case({
             on: x,
-            test: TTag([b"Continue", b"Stop"]),
+            test: TTag([continue_ctor(), stop_ctor()]),
             arms: [
               { when: 0, body: go.block.push(Next([go.arg, AVar(e.left)])) },
               { when: 1, body: stop.block.push(Done(stop.arg)) },
@@ -1837,7 +1816,7 @@ fn read_out(
           path: PCase({ case: i, at: match arg_word(s.laid, i, 0) { Some(w) -> w, None -> 0 } }),
           rep: held_as(cx.setting, into.ty),
         },
-      _ -> { path: PCase({ case: if ctor == b"Stop" { 1 } else { 0 }, at: 0 }), rep: RWord },
+      _ -> { path: PCase({ case: if ctor == stop_ctor() { 1 } else { 0 }, at: 0 }), rep: RWord },
     };
     let r = { id: e.next, ty: into.ty, rep: read.rep };
     let h = held_into(AVar(r), into, { ..e, next: e.next + 1 });
@@ -1861,52 +1840,44 @@ fn spent() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
 /// lambda it writes comes after it.
 pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opened / {abort.raise} = {
   let s = shaped(cx, st.env, frame, at);
+  let reserved = with_lambda(
+    st,
+    Closure({
+      body: placeholder(cx),
+      captures: shape_captures(s).len(),
+      at: at,
+      words: no_closure_words(),
+    }),
+  ).st;
+  let caps = zip(frame.captures, s.captured).fold(
+    nested(reserved, shape_params(s), Map::new()),
+    |acc: Lowering, p: { first: Capture, second: Var }|
+      { ..acc, env: acc.env.insert(p.first.dst, AVar(p.second)) },
+  );
+  let given = {
+    ..caps,
+    env: range(0, s.own.len()).fold(caps.env, |m: Map<Int, Arg>, j: Int|
+      match s.own.at(j) { Some(p) -> m.insert(j, AVar(p)), None -> m }),
+  };
+  let read = words_read(given, s.words, frame.words, at);
+  let inside = held_inside(frame.held, s.holding);
   {
-    let reserved = with_lambda(
-      st,
-      Closure({ body: placeholder(cx), captures: s.captures, at: at, words: no_closure_words() }),
-    ).st;
-    let caps = range(0, frame.captures.len()).fold(
-      nested(reserved, s.params, Map::new()),
-      |acc: Lowering, i: Int|
-        match frame.captures.at(i) {
-          None -> acc,
-          Some(c) -> match s.params.at(i) {
-            None -> acc,
-            Some(q) -> { ..acc, env: acc.env.insert(c.dst, AVar(q)) },
-          },
-        },
-    );
-    let given = {
-      ..caps,
-      env: range(0, s.own).fold(caps.env, |m: Map<Int, Arg>, j: Int|
-        match s.params.at(s.captures + j) { Some(p) -> m.insert(j, AVar(p)), None -> m }),
-    };
-    let read = words_read(given, s.params.drop(s.captures + s.own), frame.words, at);
-    let left = frame_labels(cx, frame);
-    let holding = s.params.drop(frame.captures.len() + left.len()).take(held_count(frame.held));
-    {
-      cx: {
-        ..cx,
-        tails: Calls,
-        params: [],
-        types: [],
-        answer: s.conv.answer,
-        answer_ty: s.ret,
-        param_at: Map::new(),
-        frame: at,
-        captured: frame.captures.map(|c: Capture| c.dst),
-        words: held_words(frame.held, holding).concat(read.words),
-        label_values: labels_held(
-          cx,
-          left,
-          s.params.drop(frame.captures.len()).take(left.len()).map(AVar),
-        ),
-        instance: held_instance(frame.held, holding),
-        kept: held_kept(frame.held, holding),
-      },
-      st: read.st,
-    }
+    cx: {
+      ..cx,
+      tails: Calls,
+      params: [],
+      types: [],
+      answer: s.answer,
+      answer_ty: s.ret,
+      param_at: Map::new(),
+      frame: at,
+      captured: frame.captures.map(|c: Capture| c.dst),
+      words: inside.words.concat(read.words),
+      label_values: labels_held(cx, frame_labels(cx, frame), s.labels.map(AVar)),
+      instance: inside.instance,
+      kept: inside.kept,
+    },
+    st: read.st,
   }
 }
 
@@ -1926,8 +1897,8 @@ pub fn step_captured(cx: Context, st: Lowering, args: List<Code>, how: InPlace) 
   }
 
 /// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer` of
-/// the values it captures, each as its word: a lambda's `Rooted`, which counts a step as a call
-/// does, or a `Plain` one standing for what a name reads as a value, which counts none of its own.
+/// the values it captures, each as its word: a lambda's `Rooted`, which spends fuel as a call
+/// does, or a `Plain` one standing for what a name reads as a value, which spends none of its own.
 pub fn closure(
   cx: Context,
   outer: Lowering,
@@ -1937,99 +1908,97 @@ pub fn closure(
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let s = shaped(cx, outer.env, frame, at);
-  {
-    let nth = outer.lambdas.len();
-    let answered = if falls_through(inner.st.insts) { handed(inner, s.conv.answer, at) }
-    else { inner };
-    let insts = if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
-    else { answered.st.insts };
-    let body = {
-      key: cx.key,
-      kind: kind,
-      params: s.params,
-      conv: s.conv,
-      answer_ty: if frame.resumes != None { word_type() } else { s.ret },
-      // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
-      body: match cx.lender {
-        Some(l) -> [Sited(Some({ root: l.owner, base: cx.base }))].concat(insts),
-        None -> insts,
-      },
-      lambdas: [],
-      base: cx.base,
-      members: [],
-      links: no_links(),
-      statics: [],
-    };
-    let unraised = unnested(outer, answered.st);
-    let left = frame_labels(cx, frame);
-    // A function holding the word for `abort` raises through it what the runtime left pending.
-    let raising = match range(0, frame.held.words.len()).find(|j: Int|
-        match frame.held.words.at(j) {
-          Some(w) -> w.evidence.effect == b"abort" && !w.through,
-          None -> false,
-        }) {
-      None -> { st: unraised, pending: None },
-      Some(j) -> match s.params.at(frame.captures.len() + left.len() + j) {
-        Some(v) -> pending_raised(cx, unraised, v),
-        None -> { st: unraised, pending: None },
-      },
-    };
-    let after = raising.st;
-    let own = if frame.words.len() == 0 { { st: after, name: b"" } }
-    else { static_added(after, described(frame.words.map(|o: Own| o.evidence))) };
-    // `lambda_opened` reserved place `nth` for this closure.
-    let placed = {
-      ..own.st,
-      lambdas: own.st.lambdas.set(
-        nth,
-        Closure({
-          body: { ..body, links: { ..body.links, pending: raising.pending } },
-          captures: s.captures,
-          at: at,
-          words: {
-            described: own.name,
-            count: frame.words.len(),
-            labels: left.len(),
-            held: held_count(frame.held),
-            left: frame.words.fold([], |acc: List<Int>, o: Own|
-              match o.evidence.resource {
-                RVar(p) -> match range(0, left.len()).find(|i: Int| left.at(i) == Some(p)) {
-                  Some(i) -> acc.push(i),
+  let nth = outer.lambdas.len();
+  let laid = shape_captures(s);
+  let answered = if falls_through(inner.st.insts) { handed(inner, s.answer, at) } else { inner };
+  let insts = if falls_through(answered.st.insts) { answered.st.insts.push(Return(answered.arg)) }
+  else { answered.st.insts };
+  let body = {
+    key: cx.key,
+    kind: kind,
+    params: shape_params(s),
+    conv: shape_convention(s),
+    answer_ty: if frame.resumes != None { word_type() } else { s.ret },
+    // Written inside a lent lambda, its sites are the lender's, as the run it was written in.
+    body: match cx.lender {
+      Some(l) -> [Sited(Some({ root: l.owner, base: cx.base }))].concat(insts),
+      None -> insts,
+    },
+    lambdas: [],
+    base: cx.base,
+    members: [],
+    links: no_links(),
+    statics: [],
+  };
+  let unraised = unnested(outer, answered.st);
+  let left = frame_labels(cx, frame);
+  // A function holding the word for `abort` raises through it what the runtime left pending.
+  let raising = match held_inside(frame.held, s.holding).words.find(|w: Worded|
+      w.evidence.effect == b"abort" && !w.through) {
+    Some(w) -> match w.word {
+      AVar(v) -> pending_raised(cx, unraised, v),
+      _ -> { st: unraised, pending: None },
+    },
+    None -> { st: unraised, pending: None },
+  };
+  let after = raising.st;
+  let own = if frame.words.len() == 0 { { st: after, name: b"" } }
+  else { static_added(after, described(frame.words.map(|o: Own| o.evidence))) };
+  // `lambda_opened` reserved place `nth` for this closure.
+  let placed = {
+    ..own.st,
+    lambdas: own.st.lambdas.set(
+      nth,
+      Closure({
+        body: { ..body, links: { ..body.links, pending: raising.pending } },
+        captures: laid.len(),
+        at: at,
+        words: {
+          described: own.name,
+          count: frame.words.len(),
+          left: frame.words.fold([], |acc: List<Int>, o: Own|
+            match o.evidence.resource {
+              RVar(p) -> match zip(left, s.labels).find(|l: { first: Int, second: Var }|
+                  l.first == p) {
+                Some(l) -> match range(0, laid.len()).find(|k: Int|
+                    match laid.at(k) { Some(v) -> v.id == l.second.id, None -> false }) {
+                  Some(k) -> acc.push(k),
                   None -> acc,
                 },
-                _ -> acc,
-              }),
-          },
-        }),
-      ),
-    };
-    // Each capture laid in the closure as its body holds it, then each label its row leaves to
-    // its caller.
-    let caps = range(0, frame.captures.len()).fold(
-      { st: captured(cx, placed, frame.captures, at), args: [] },
-      |acc: { st: Lowering, args: List<Arg> }, i: Int| {
-        let rep = match s.params.at(i) { Some(q) -> q.rep, None -> RWord };
-        match match frame.captures.at(i) { Some(c) -> acc.st.env.get(c.src), None -> None } {
-          Some(a) -> {
-            let h = handed({ st: acc.st, arg: a }, rep, at);
-            { st: h.st, args: acc.args.push(h.arg) }
-          },
-          None -> unreachable(b"a capture nothing bound"),
-        }
-      },
-    );
-    bound_as(
-      function_laid(captures_released(caps.st, s.params.take(s.captures)), s.ty),
-      s.ty,
-      RWord,
-      Make({
-        made: MClosure({ nth: nth, captures: s.captures, params: s.own }),
-        args: caps.args.concat(left.map(|p: Int| label_value(cx, p))).concat(held_args(frame.held)),
-        reuse: None,
+                None -> acc,
+              },
+              _ -> acc,
+            }),
+        },
       }),
-      at,
-    )
-  }
+    ),
+  };
+  let caps = zip(frame.captures, s.captured).fold(
+    { st: captured(cx, placed, frame.captures, at), args: [] },
+    |acc: { st: Lowering, args: List<Arg> }, p: { first: Capture, second: Var }|
+      match acc.st.env.get(p.first.src) {
+        Some(a) -> {
+          let h = handed({ st: acc.st, arg: a }, p.second.rep, at);
+          { st: h.st, args: acc.args.push(h.arg) }
+        },
+        None -> unreachable(b"a capture nothing bound"),
+      },
+  );
+  bound_as(
+    function_laid(captures_released(caps.st, laid), s.ty),
+    s.ty,
+    RWord,
+    Make({
+      made: MClosure({ nth: nth, captures: laid.len(), params: s.own.len() }),
+      args: captures_laid(
+        caps.args,
+        left.map(|p: Int| label_value(cx, p)),
+        held_values(frame.held),
+      ),
+      reuse: None,
+    }),
+    at,
+  )
 }
 
 /// The state each member of a tail group is lowered in.
@@ -2101,8 +2070,7 @@ pub fn grouped(members: List<GroupMember>, bodies: List<Lowered>) -> Fn / {abort
         kind: Rooted,
         params: [which],
         conv: {
-          params: [Given],
-          reps: [RInt],
+          params: [{ handed: Given, rep: RInt }],
           answer: RWord,
           destined: false,
           answered: tir::Owned,
@@ -2154,7 +2122,7 @@ fn member_params(members: List<GroupMember>) -> List<List<Var>> / {abort.raise} 
   members.fold(
     { next: 1, out: [] },
     |acc: { next: Int, out: List<List<Var>> }, m: GroupMember| {
-      let reps = convention(m.cx).reps;
+      let reps = reps_of(convention(m.cx));
       let declared = m.cx.params.len();
       let handed_types = handed_param_types(handed_to(m.cx.setting, m.cx.key));
       {
@@ -2197,11 +2165,51 @@ pub type Defined = { full: Bytes, def: Def }
 /// it stands), and `given`, those the check filed at the reference, in this body's variables.
 type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<Type> }
 
-/// A closure's body as the lambda's type lays it out: its captures, each a word it reads out of the
-/// closure, lent, the labels its row leaves to its caller among them, last; then its own
-/// parameters as a body holds values of their types, given; then its words; how it answers; and
-/// the types of the closure and of its answer.
-type Shape = { params: List<Var>, conv: Convention, ty: Type, ret: Type, captures: Int, own: Int }
+/// A closure's body as the lambda's type lays it out: what it reads out of the closure (its
+/// captures, the labels its row leaves to its caller, and what it holds), its own parameters as a
+/// body holds values of their types, and its words; how it answers; and the types of the closure
+/// and of its answer.
+type Shape = {
+  captured: List<Var>,
+  labels: List<Var>,
+  holding: Holding<Var>,
+  own: List<Var>,
+  words: List<Var>,
+  answer: Rep,
+  ty: Type,
+  ret: Type,
+}
+
+/// What a closure holds in its block, in the order the block lays it.
+fn captures_laid<a>(captured: List<a>, labels: List<a>, holding: Holding<a>) -> List<a> =
+  captured.concat(labels).concat(holding_laid(holding))
+
+/// What the body shaped as `s` reads out of its closure, each in its place in the block.
+fn shape_captures(s: Shape) -> List<Var> = captures_laid(s.captured, s.labels, s.holding)
+
+/// The parameters of the body shaped as `s`, in the order the closure's entries hand them.
+fn shape_params(s: Shape) -> List<Var> = shape_captures(s).concat(s.own).concat(s.words)
+
+/// How the body shaped as `s` takes its parameters. The closure's entries hand it its captures,
+/// taken out of a closure held only by its caller, so it may spend them, as a step it hands its
+/// buffer does.
+fn shape_convention(s: Shape) -> Convention = {
+  let params = shape_params(s);
+  {
+    params: all_given(params.map(|v: Var| v.rep)),
+    answer: s.answer,
+    destined: false,
+    answered: tir::Owned,
+  }
+}
+
+/// `specs` as variables numbered from `first`, and the number after them.
+fn numbered(first: Int, specs: List<{ ty: Type, rep: Rep }>) -> { vars: List<Var>, next: Int } =
+  {
+    vars: specs.fold([], |acc: List<Var>, s: { ty: Type, rep: Rep }|
+      acc.push({ id: first + acc.len(), ty: s.ty, rep: s.rep })),
+    next: first + specs.len(),
+  }
 
 /// The function type `t` of the continuation a clause binds, performing what resuming it does.
 fn resumed_type(t: Type, resumes: Option<Row>) -> Type =
@@ -2210,59 +2218,57 @@ fn resumed_type(t: Type, resumes: Option<Row>) -> Type =
 /// The shape of the closure laid out as `frame` at `at`, from its function type.
 fn shaped(cx: Context, env: Map<Int, Arg>, frame: Frame, at: Span) -> Shape = {
   let f = frame.ty;
-  {
-    // A continuation is a word the runtime calls, and a clause binding one answers the word it
-    // hands back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
-    let continued = |j: Int| frame.resumes != None && j == frame.params - 1;
-    let answer = if frame.resumes != None { RWord } else { held_as(cx.setting, f.ret) };
-    let n = frame.captures.len();
-    let held = captures_held(cx, frame.body, frame.captures);
-    let caps = range(0, n).map(|i: Int| {
-      let rep = match held.at(i) { Some(r) -> r, None -> RWord };
+  // A continuation is a word the runtime calls, and a clause binding one answers the word it
+  // hands back, which for a tail-only clause is the resumed value `c.resumed` holds the count of.
+  let continued = |j: Int| frame.resumes != None && j == frame.params - 1;
+  let held = captures_held(cx, frame.body, frame.captures);
+  let captured = numbered(
+    0,
+    range(0, frame.captures.len()).map(|i: Int|
       {
-        id: i,
         ty: match frame.captures.at(i) {
           Some(c) -> match env.get(c.src) { Some(a) -> type_of(a), None -> unknown_type() },
           None -> unknown_type(),
         },
-        rep: rep,
-      }
-    });
-    let labelled = range(0, frame_labels(cx, frame).len()).map(|i: Int|
-      { id: n + i, ty: int_type(), rep: RInt });
-    let kept = held_count(frame.held);
-    // The words and the instance a closure holds are uncounted, the blocks they live in counted.
-    let uncounted = kept - frame.held.kept.len();
-    let holding = range(0, kept).map(|i: Int|
-      if i < uncounted { { id: n + labelled.len() + i, ty: evidence_type(), rep: RImm } }
-      else { { id: n + labelled.len() + i, ty: instance_block_type(), rep: RWord } });
-    let first = n + labelled.len() + kept;
-    let own = f.params.fold([], |acc: List<Var>, t: Type| {
-      let j = acc.len();
-      acc.push(if continued(j) {
-        { id: first + j, ty: resumption(resumed_type(t, frame.resumes)), rep: RWord }
-      } else { { id: first + j, ty: t, rep: held_as(cx.setting, t) } })
-    });
-    let laid = if frame.words.len() > words_apart() { words_laid_type() } else { evidence_type() };
-    let words = range(0, words_carried(frame.words.len())).map(|i: Int|
-      { id: first + own.len() + i, ty: laid, rep: RImm });
-    let params = caps.concat(labelled).concat(holding).concat(own).concat(words);
-    {
-      params: params,
-      conv: {
-        // The closure's entries hand the body its captures, taken out of a closure held only by
-        // its caller, so the body may spend them, as a step it hands its buffer does.
-        params: range(0, params.len()).map(|_: Int| Given),
-        reps: params.map(|v: Var| v.rep),
-        answer: answer,
-        destined: false,
-        answered: tir::Owned,
-      },
-      ty: TyFn(f),
-      ret: f.ret,
-      captures: first,
-      own: frame.params,
-    }
+        rep: match held.at(i) { Some(r) -> r, None -> RWord },
+      }),
+  );
+  let labels = numbered(
+    captured.next,
+    frame_labels(cx, frame).map(|_: Int| { ty: int_type(), rep: RInt }),
+  );
+  // The words and the instance a closure holds are uncounted, the blocks they live in counted.
+  let uncounted = { ty: evidence_type(), rep: RImm };
+  let words_held = numbered(labels.next, frame.held.words.map(|_: Worded| uncounted));
+  let instance = numbered(words_held.next, match frame.held.instance {
+    Some(_) -> [uncounted],
+    None -> [],
+  });
+  let kept = numbered(
+    instance.next,
+    frame.held.kept.map(|_: Arg| { ty: instance_block_type(), rep: RWord }),
+  );
+  let own = numbered(
+    kept.next,
+    f.params.fold([], |acc: List<{ ty: Type, rep: Rep }>, t: Type|
+      acc.push(if continued(acc.len()) {
+        { ty: resumption(resumed_type(t, frame.resumes)), rep: RWord }
+      } else { { ty: t, rep: held_as(cx.setting, t) } })),
+  );
+  let laid = if frame.words.len() > words_apart() { words_laid_type() } else { evidence_type() };
+  let words = numbered(
+    own.next,
+    range(0, words_carried(frame.words.len())).map(|_: Int| { ty: laid, rep: RImm }),
+  );
+  {
+    captured: captured.vars,
+    labels: labels.vars,
+    holding: { words: words_held.vars, instance: instance.vars.at(0), kept: kept.vars },
+    own: own.vars,
+    words: words.vars,
+    answer: if frame.resumes != None { RWord } else { held_as(cx.setting, f.ret) },
+    ty: TyFn(f),
+    ret: f.ret,
   }
 }
 
@@ -2286,7 +2292,7 @@ fn placeholder(cx: Context) -> Fn =
     key: cx.key,
     kind: Rooted,
     params: [],
-    conv: { params: [], reps: [], answer: RWord, destined: false, answered: tir::Owned },
+    conv: { params: [], answer: RWord, destined: false, answered: tir::Owned },
     answer_ty: word_type(),
     body: [],
     lambdas: [],
@@ -2418,7 +2424,9 @@ fn constant_read(
           ret,
           RWord,
           Op({
-            op: OCalling(ConstantRead({ callee: Root(d.def.root), kept: ret })),
+            op: OCalling(
+              ConstantRead({ callee: Root(d.def.root), kept: ret, constant: d.def.constant }),
+            ),
             args: [],
             uses: answers(),
           }),
@@ -2505,7 +2513,9 @@ fn jumped_handing(
             let h = handed_all(
               e.st,
               args.concat(e.args),
-              evidenced(conventional(cx.setting, c), given.labels.len(), given.words.len()).reps,
+              reps_of(
+                evidenced(conventional(cx.setting, c), given.labels.len(), given.words.len()),
+              ),
               at,
             );
             Some({
@@ -2665,7 +2675,7 @@ fn called_as(
         given,
         at,
       );
-      let h = handed_all(e.st, args.concat(e.args), conv.reps, at);
+      let h = handed_all(e.st, args.concat(e.args), reps_of(conv), at);
       handed(
         bound_as(
           h.st,
@@ -3317,10 +3327,6 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
 fn answers() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
   { takes: [], owned: true, fails: true, stops: false }
 
-/// A step counted, which can fail where the run is cancelled, and answers nothing.
-fn ticks() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
-  { takes: [], owned: false, fails: true, stops: false }
-
 /// Whether `args` are what `iterate` runs in place: a seed, a budget, and a step of one parameter.
 fn stepped(args: List<Code>) -> Bool =
   args.len() == 3
@@ -3341,7 +3347,7 @@ pub fn def_full(
   imports: List<Imported>,
   full: Bytes,
 ) -> Option<Defined> =
-  match here.find(|d: Def| qualify(module, d.name) == full) {
+  match last_of(here, |d: Def| qualify(module, d.name) == full) {
     Some(d) -> Some({ full: full, def: d }),
     None ->
       imports.fold(None, |acc: Option<Defined>, imp: Imported|
@@ -3353,6 +3359,11 @@ pub fn def_full(
           },
         }),
   }
+
+/// The last of `here` that `named` picks: what code the emitter writes declares for itself follows
+/// the module's own definitions, and takes their place.
+fn last_of(here: List<Def>, named: (Def) -> Bool) -> Option<Def> =
+  here.fold(None, |acc: Option<Def>, d: Def| if named(d) { Some(d) } else { acc })
 
 /// The definition `name` names in the root's module, which the lowering writes a call of itself.
 fn def_named(cx: Context, name: Bytes) -> Option<Defined> / {abort.raise} =
@@ -3367,7 +3378,7 @@ pub fn def_in(
   imports: List<Imported>,
   name: Bytes,
 ) -> Option<Defined> / {abort.raise} =
-  match here.fold(None, |acc: Option<Def>, d: Def| if d.name == name { Some(d) } else { acc }) {
+  match last_of(here, |d: Def| d.name == name) {
     Some(d) -> Some({ full: qualify(module, name), def: d }),
     None -> match imported_target(imports, name) {
       None -> None,
