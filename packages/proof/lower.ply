@@ -1,15 +1,16 @@
 //! `lower` — a claim's lowered code as prover terms, with what must hold for it to have a value.
 
-import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock, NList,
-                           NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
-                           NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField,
-                           CodeArm, Capture, CodePattern, PxWild, PxVar, PxLit, PxRange, PxCtor,
-                           PxRecord, PxList, CodePatternField, Lambda, irrefutable)
+import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NKnown,
+                           NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda,
+                           NSimulate, NParallel, NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat,
+                           CDo, CodeField, CodeArm, Capture, CodePattern, PxWild, PxVar, PxLit,
+                           PxRange, PxCtor, PxRecord, PxList, CodePatternField, Lambda, irrefutable,
+                           read_name)
 import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, LEmbedded, LFloat,
                                  LDec, LChar, LUnit, LBad)
-import context (Context, Ctor, Def, ctor, arity, ctor_sort, signature, builtin, is_pure,
-                is_recursive, unfoldable, self_recursive, is_identity, is_reflexive, ends,
-                recursive_body, operation_sort, may_call_key)
+import context (Context, Ctor, ctor, arity, ctor_sort, signature, builtin, is_pure, is_recursive,
+                unfoldable, self_recursive, is_identity, is_reflexive, ends, recursive_body,
+                operation_sort, may_call_key)
 import compiler.syntax.parsing (Span)
 import domain (Ty, Var, Fn, Record, Con, Variant)
 import lemma (Lemma)
@@ -17,17 +18,15 @@ import rules (RuleLog, Cited, Contract, note, unfolded)
 import compiler.front.published (ClaimClause)
 import compiler.syntax.items (SEnsures, SRequires)
 import sort (bool_ty, bytes_ty, float_ty, int_ty, string_ty, decimal_ty, is_con, list_elem, list_ty,
-             option_ty, record_of, substituted, field_ty, answered, matched, unified, foreign,
-             foreign_base, vars)
-import term (Terms, Made, Node, TInt, TBool, TStr, TDecimal, TFloat, TFixed, TUnit, TSym, TOpaque,
-             TLin, TApp, TCtor, TNil, TCons, TRecord, TField, TNot, TAnd, TOr, TCmp, TEq, TEqualAt,
-             TIf, TMatch, TClosure, CmpOp, Lt, Le, Gt, Ge, Arm, ArmTest, Always, TestCtor, TestLit,
-             TestList, Undecidable, true_id, false_id, new_terms, size, node, sort_of, force_int,
-             mk, int_lit, boolean, string, decimal, float_lit, fixed, unit, nil, cons, sym, opaque,
-             add, sub, neg, mul, field, not, and, or, cmp, eq, equal_at, app, float_nan, float_rank,
-             decimal_normalized, op_add, op_sub, op_mul, op_div, op_rem, op_concat, op_bit_and,
-             op_bit_or, op_bit_xor, op_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge,
-             op_float)
+             record_of, substituted, answered, matched, unified, foreign, foreign_base, vars)
+import term (Terms, Made, TInt, TBool, TStr, TDecimal, TFloat, TFixed, TUnit, TSym, TOpaque, TLin,
+             TApp, TCtor, TNil, TCons, TRecord, TIf, TMatch, TClosure, CmpOp, Lt, Le, Gt, Ge, Arm,
+             ArmTest, Always, TestCtor, TestLit, TestList, Undecidable, true_id, false_id,
+             new_terms, size, node, sort_of, force_int, mk, int_lit, boolean, string, decimal,
+             float_lit, fixed, unit, nil, cons, sym, opaque, add, sub, neg, mul, field, not, and,
+             or, cmp, eq, equal_at, app, float_nan, float_rank, decimal_normalized, op_add, op_sub,
+             op_mul, op_div, op_rem, op_concat, op_bit_and, op_bit_or, op_bit_xor, op_bit_not,
+             op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, op_ge, op_float)
 import std.list
 import std.option
 import std.string
@@ -590,18 +589,19 @@ fn through_pure(
 pub fn lower(lowering: Lowering, context: Context, c: Code, unfolds: Int) -> L / {abort.raise} =
   match c.node {
     NLit(l) -> literal(lowering, l),
-    NVar(v) -> match v.slot {
-      Some(s) -> local(lowering, s),
-      None -> {
-        let name = String::of_bytes_lossy(v.name);
-        let g = global(lowering, context, name);
-        match ctor(context, name) {
-          Some(k) -> if arity(k) == 0 {
-            at_site(built_value(g, context, k, unfolds), lowering, c.span)
-          } else { { lowering: constructing(g.lowering, context, k), id: g.id } },
-          None -> g,
-        }
-      },
+    NVar(v) -> {
+      let s = v.slot;
+      local(lowering, s)
+    },
+    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+      let name = String::of_bytes_lossy(fname);
+      let g = global(lowering, context, name);
+      match ctor(context, name) {
+        Some(k) -> if arity(k) == 0 {
+          at_site(built_value(g, context, k, unfolds), lowering, c.span)
+        } else { { lowering: constructing(g.lowering, context, k), id: g.id } },
+        None -> g,
+      }
     },
     NBinary(b) -> binary_code(lowering, context, b.op, b.lhs, b.rhs, unfolds),
     NUnary(u) -> unary(lowering, context, u.op, u.operand, unfolds),
@@ -1331,13 +1331,11 @@ type Callee = | Local | Named(String) | Unresolved(String) | Other
 /// Decided from the code, not the head's term: a local and a same-named definition lower alike.
 fn callee(context: Context, func: Code) -> Callee =
   match func.node {
-    NVar(v) -> match v.slot {
-      Some(_) -> Local,
-      None -> {
-        let name = String::of_bytes_lossy(v.name);
-        if ctor(context, name) != None || signature(context, name) != None { Named(name) }
-        else { Unresolved(name) }
-      },
+    NVar(_) -> Local,
+    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+      let name = String::of_bytes_lossy(fname);
+      if ctor(context, name) != None || signature(context, name) != None { Named(name) }
+      else { Unresolved(name) }
     },
     _ -> Other,
   }
@@ -1922,19 +1920,25 @@ fn fitted(
   binds: List<Option<Int>>,
 ) -> Option<List<Option<Int>>> / {abort.raise} =
   match pattern.node {
-    NVar(v) -> match v.slot {
-      Some(k) -> match binds.at(k) {
+    NVar(v) -> {
+      let k = v.slot;
+      match binds.at(k) {
         Some(Some(u)) -> if u == t { Some(binds) } else { None },
         Some(None) -> Some(binds.set(k, Some(t))),
         None -> None,
-      },
-      None -> if global(lowering, context, String::of_bytes_lossy(v.name)).id == t { Some(binds) }
-      else { None },
+      }
     },
+    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> if global(
+          lowering,
+          context,
+          String::of_bytes_lossy(fname),
+        ).id
+        == t { Some(binds) }
+    else { None },
     NLit(l) -> if literal(lowering, l).id == t { Some(binds) } else { None },
-    NApp(a) -> match a.func.node {
-      NVar(f) -> if f.slot != None { None } else {
-        let name = String::of_bytes_lossy(f.name);
+    NApp(a) -> match read_name(a.func) {
+      Some(f) -> {
+        let name = String::of_bytes_lossy(f);
         match node(lowering.terms, t) {
           TApp(called) -> match node(lowering.terms, called.head) {
             TOpaque(h) -> if h == name { fitted_all(lowering, context, a.args, called.args, binds) }
@@ -1946,7 +1950,7 @@ fn fitted(
           _ -> None,
         }
       },
-      _ -> None,
+      None -> None,
     },
     NList(l) -> {
       let s = spine(lowering.terms, t);
@@ -2506,7 +2510,10 @@ fn block(
         PxWild -> lower(acc, context, l.value, unfolds).lowering,
         PxVar(v) -> {
           let r = lower(acc, context, l.value, unfolds);
-          match v.slot { Some(s) -> bind(r.lowering, s, r.id), None -> r.lowering }
+          {
+            let s = v.slot;
+            bind(r.lowering, s, r.id)
+          }
         },
         pat -> {
           let r = lower(acc, context, l.value, unfolds);
@@ -2527,9 +2534,9 @@ fn block(
 fn destructured(lowering: Lowering, pat: CodePattern, t: Int) -> Option<Lowering> / {abort.raise} =
   match pat {
     PxWild -> Some(lowering),
-    PxVar(v) -> match v.slot {
-      Some(slot) -> Some(bind(lowering, slot, t)),
-      None -> Some(lowering),
+    PxVar(v) -> {
+      let slot = v.slot;
+      Some(bind(lowering, slot, t))
     },
     PxRecord(r) ->
       r.fields.fold(Some(lowering), |acc: Option<Lowering>, f: CodePatternField|
@@ -2558,7 +2565,13 @@ fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
         let rest = s.stack.take(s.stack.len() - 1);
         Continue(match top {
           PxVar(v) ->
-            { stack: rest, out: match v.slot { Some(slot) -> s.out.push(slot), None -> s.out } },
+            {
+              stack: rest,
+              out: {
+                let slot = v.slot;
+                s.out.push(slot)
+              },
+            },
           PxCtor(c) ->
             {
               stack: c.args.fold(rest, |acc: List<CodePattern>, a: CodePattern| acc.push(a)),
@@ -2599,9 +2612,9 @@ fn match_expr(
           TCtor(k) ->
             range(0, c.args.len()).fold(s.lowering, |acc: Lowering, i: Int|
               match ((c.args.at(i), k.args.at(i))) {
-                (Some(PxVar(v)), Some(field)) -> match v.slot {
-                  Some(slot) -> bind(acc, slot, field),
-                  None -> acc,
+                (Some(PxVar(v)), Some(field)) -> {
+                  let slot = v.slot;
+                  bind(acc, slot, field)
                 },
                 _ -> acc,
               }),
@@ -2767,7 +2780,10 @@ fn arm_shape(
     PxWild -> Some({ lowering: lowering, test: Always, binds: [] }),
     PxVar(v) ->
       Some({
-        lowering: match v.slot { Some(slot) -> bind(lowering, slot, scrutinee), None -> lowering },
+        lowering: {
+          let slot = v.slot;
+          bind(lowering, slot, scrutinee)
+        },
         test: Always,
         binds: [],
       }),
@@ -2788,7 +2804,10 @@ fn arm_shape(
             let f = sym(acc.lowering.terms, match sorts.at(i) { Some(s) -> s, None -> None });
             let lw2 = with_terms(acc.lowering, f.terms);
             let lw3 = match c.args.at(i) {
-              Some(PxVar(v)) -> match v.slot { Some(slot) -> bind(lw2, slot, f.id), None -> lw2 },
+              Some(PxVar(v)) -> {
+                let slot = v.slot;
+                bind(lw2, slot, f.id)
+              },
               _ -> lw2,
             };
             { lowering: lw3, binds: acc.binds.push(f.id) }
@@ -2825,9 +2844,9 @@ fn arm_shape(
               },
             };
             let lw2 = match item {
-              PxVar(v) -> match v.slot {
-                Some(slot) -> bind(stepped.lowering, slot, stepped.field),
-                None -> stepped.lowering,
+              PxVar(v) -> {
+                let slot = v.slot;
+                bind(stepped.lowering, slot, stepped.field)
               },
               _ -> stepped.lowering,
             };
@@ -2848,7 +2867,10 @@ fn arm_shape(
               }
             } else { tail.lowering };
             let lw3 = match r {
-              PxVar(v) -> match v.slot { Some(slot) -> bind(lw2, slot, tail.id), None -> lw2 },
+              PxVar(v) -> {
+                let slot = v.slot;
+                bind(lw2, slot, tail.id)
+              },
               _ -> lw2,
             };
             { lowering: lw3, binds: heads.binds.push(tail.id) }

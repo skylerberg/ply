@@ -3,7 +3,7 @@
 //! what the runtime keeps of its own (a native object, a hold) it tells apart by its first
 //! payload word.
 
-use crate::blocks::{self, Blocks};
+use crate::blocks::{self, Blocks, Filling};
 use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
 
 pub type Word = i64;
@@ -21,7 +21,7 @@ pub const FRAME: u32 = u32::MAX - 1;
 pub const SHARED: u32 = 1 << 31;
 
 /// A block's header: its count, in the low half of the word before its payload, and whether the
-/// scheduler's own work made it, which emitted code never reads.
+/// scheduler's own work made it, which emitted code clears on a block it takes itself.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
@@ -223,18 +223,32 @@ pub unsafe fn native_of<'a, T: Native>(w: Word) -> Option<&'a mut T> {
 /// An entry's blocks, whose memory goes back whole at its end; a persistent heap's never does.
 pub struct Heap {
     blocks: Blocks,
+    /// Boxed, so compiled code finds it wherever the heap moves.
+    alloc: Box<Alloc>,
     /// The native objects whose contents the end drops, each block's [`LISTED_AT`] its index here.
     natives: Vec<*mut Obj>,
     persistent: bool,
-    /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither these
-    /// counts nor the program's live blocks count them.
-    pub(crate) scheduling: bool,
-    /// Blocks the program allocated since the last reset.
-    count: usize,
+    /// Whether the scheduler's own work runs: the blocks it makes are its own, and neither the
+    /// program's counts nor its live blocks count them.
+    scheduling: bool,
     /// Dead blocks not yet given back, oldest first, under `delay()`.
     delayed: std::collections::VecDeque<(*mut Obj, usize)>,
     poison: bool,
     delay: usize,
+}
+
+/// What compiled code reads and writes of a heap to take a block of at most
+/// [`blocks::WORD_CLASSES`] words, and give one back, without calling the runtime, laid out as
+/// `compiler.emit.abi` declares `PlyAlloc`. Any other block goes through the runtime.
+#[repr(C)]
+pub struct Alloc {
+    /// The pages of the heap's blocks being filled, by class.
+    pub(crate) blocks: *mut Filling,
+    /// Blocks the program allocated since the last reset.
+    pub(crate) count: usize,
+    /// Nonzero while every block goes through the runtime: while the scheduler's own work runs, and
+    /// under `PLY_HEAP_POISON` or `PLY_HEAP_DELAY`, which the runtime alone keeps.
+    pub(crate) slow: usize,
 }
 
 thread_local! {
@@ -450,16 +464,35 @@ impl Default for Heap {
 
 impl Heap {
     pub fn new() -> Heap {
+        let mut blocks = Blocks::default();
+        let (poison, delay) = (poisoning(), delay());
+        let alloc = Box::new(Alloc {
+            blocks: blocks.filling(),
+            count: 0,
+            slow: usize::from(poison || delay > 0),
+        });
         Heap {
-            blocks: Blocks::default(),
+            blocks,
+            alloc,
             natives: Vec::new(),
             persistent: false,
             scheduling: false,
-            count: 0,
             delayed: std::collections::VecDeque::new(),
-            poison: poisoning(),
-            delay: delay(),
+            poison,
+            delay,
         }
+    }
+
+    /// What compiled code takes blocks from and gives them back to, wherever this heap moves.
+    pub(crate) fn alloc(&mut self) -> *mut Alloc {
+        &raw mut *self.alloc
+    }
+
+    /// The scheduler's own work begins, where `on`, or the program's runs again: whether the
+    /// scheduler's ran before.
+    pub(crate) fn set_scheduling(&mut self, on: bool) -> bool {
+        self.alloc.slow = usize::from(on || self.poison || self.delay > 0);
+        std::mem::replace(&mut self.scheduling, on)
     }
 
     /// Takes over a finished branch's memory: its blocks are this entry's from here on.
@@ -470,12 +503,14 @@ impl Heap {
             self.natives.push(o);
         }
         self.delayed.extend(other.delayed.drain(..));
-        self.count += other.count;
+        self.alloc.count += other.alloc.count;
     }
 
     /// `blocks` in place of the blocks this heap takes from, which it answers.
     pub(crate) fn swap_blocks(&mut self, blocks: Blocks) -> Blocks {
-        std::mem::replace(&mut self.blocks, blocks)
+        let was = std::mem::replace(&mut self.blocks, blocks);
+        self.alloc.blocks = self.blocks.filling();
+        was
     }
 
     /// A heap whose entries never end: what outlives every entry lives here.
@@ -509,7 +544,7 @@ impl Heap {
 
     /// Blocks allocated since the last reset.
     pub fn allocated(&self) -> usize {
-        self.count
+        self.alloc.count
     }
 
     /// How many live blocks the program made, the scheduler's own not among them.
@@ -569,7 +604,7 @@ impl Heap {
             })
         };
         if !self.scheduling {
-            self.count += 1;
+            self.alloc.count += 1;
         }
         p
     }
@@ -593,7 +628,7 @@ impl Heap {
         }
         self.drop_natives();
         self.blocks.reset();
-        self.count = 0;
+        self.alloc.count = 0;
         self.delayed.clear();
     }
 }

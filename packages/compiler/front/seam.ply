@@ -8,19 +8,19 @@ import compiler.emit.code (dump)
 import compiler.check.types (Atom, Type, TyCon, TyFn, TyRecord, TyVar, atoms_text, filed_atoms_text,
                              read_atoms, Printer, printer_new, print_ty, Field, canonical_atoms,
                              canonical_scheme, canonical_type, bool_type, int_type, bytes_type,
-                             unit_type, TyNominal, TypeTable, table_of, vars_in)
+                             unit_type, TyNominal, TypeTable, vars_in)
 import compiler.check.known (fixed_widths, list_item, array_element, columns_row, map_parts)
 import compiler.check.resolve.tables (Diag, qualify)
 import compiler.store.hash.forms (HashOutput, by_name, of_key)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash (digest)
 import compiler.check.infer (CheckOutput, RootFacts, facts_at, facts_by_owner, filed_facts,
-                             no_root_facts, root_facts_bin, published_pure)
+                             no_root_facts, root_facts_bin, published_pure, types_named)
 import compiler.check.infer.checker (Location, DefInfo, SpecInfo, TestInfo, LawInfo, LawBinder,
                                      EffectInfo, OpInfo, CtorInfo, Known, no_known, KnownDef,
-                                     KnownTest, KeptFacts, WitnessOrder, TypedSite, RowSite,
-                                     Performs, listing_ty, witness_order_bin, witnessed,
-                                     InstanceInfo, NumericInfo)
+                                     KnownTest, KeptFacts, WitnessOrder, listing_ty,
+                                     witness_order_bin, witnessed, InstanceInfo, NumericInfo)
+import compiler.check.typed (TypedBody, TypedExpr, TypedHandle, TypedClause, typed_nodes)
 import compiler.emit.keys (RootKey, Named, Cases, Clause, Requires, Ensures, LawPart, LawGuard,
                            LawBody, root_name, root_text, part_word, test_key, test_owner, law_key,
                            law_owner)
@@ -147,21 +147,24 @@ fn effect_row(
 
 /// The operations of `served` its real handler `handler` answers by a ticket's wait: each whose
 /// clause, as the check inferred it, performs what `std.internal.native.job_wait` alone performs.
-fn waited(read: BodiesRead, handler: Bytes, served: Bytes) -> List<Bytes> / {abort.raise} = {
-  let of_effect = served.concat(b".");
+fn waited(read: BodiesRead, handler: Bytes, served: Bytes) -> List<Bytes> / {abort.raise} =
   match facts_at(facts_filed(read, handler), 0, handler) {
     None -> [],
     Some(f) ->
-      f.rows.fold([], |acc: List<Bytes>, s: RowSite|
-        match s.filed {
-          Performs(row) -> if s.answers.starts_with(of_effect)
-              && row.atoms.any(|a: Atom| a.effect == b"std.internal.native.wait") {
-            acc.push(s.answers.slice(of_effect.len(), s.answers.len()))
-          } else { acc },
-          _ -> acc,
-        }),
+      f.bodies.flat_map(|b: TypedBody<Bytes>| typed_nodes(b.body)).fold(
+        [],
+        |acc: List<Bytes>, e: TypedExpr<Bytes>|
+          match e.node {
+            TypedHandle(h) ->
+              h.clauses.fold(acc, |ops: List<Bytes>, c: TypedClause<Bytes>|
+                if c.effect == served
+                    && c.row.atoms.any(|a: Atom| a.effect == b"std.internal.native.wait") {
+                  ops.push(c.op)
+                } else { ops }),
+            _ -> acc,
+          },
+      ),
   }
-}
 
 fn ctor_row(ctor_info: CtorInfo) -> CtorRow / {abort.raise} =
   {
@@ -1053,7 +1056,7 @@ fn test_known_row(
 /// walk of the rest recorded.
 type BodiesRead = { kept: Map<Bytes, Bytes>, walked: Map<Bytes, RootFacts> }
 
-pub fn bodies_read(checked: CheckOutput) -> BodiesRead =
+pub fn bodies_read(checked: CheckOutput) -> BodiesRead / {abort.raise} =
   {
     kept: checked.kept.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: KeptFacts|
       acc.insert(k.name, k.facts)),
@@ -1068,28 +1071,25 @@ fn facts_filed(read: BodiesRead, owner: Bytes) -> Bytes / {abort.raise} =
     None -> filed_facts(match read.walked.get(owner) { Some(f) -> f, None -> no_root_facts() }),
   }
 
-/// The types the facts of `defs` and `tests` name, read from `table`.
+/// The types the bodies of `defs` and `tests` name, read from `table`.
 pub fn types_of_rows(
   table: TypeTable,
   defs: List<KnownDefRow>,
   tests: List<KnownTestRow>,
 ) -> TypeTable / {abort.raise} = {
-  let named = |acc: List<Bytes>, filed: Bytes|
-    match facts_at(filed, 0, b"") {
-      Some(f) -> f.typed.fold(acc, |a: List<Bytes>, s: TypedSite| a.concat(s.args).push(s.ty)),
-      None -> acc,
-    };
-  table_of(
+  let bodies = |acc: List<TypedBody<Bytes>>, filed: Bytes|
+    match facts_at(filed, 0, b"") { Some(f) -> acc.concat(f.bodies), None -> acc };
+  types_named(
     table,
     tests.fold(
-      defs.fold([], |acc: List<Bytes>, r: KnownDefRow| named(acc, r.facts)),
-      |acc: List<Bytes>, r: KnownTestRow| named(acc, r.facts),
+      defs.fold([], |acc: List<TypedBody<Bytes>>, r: KnownDefRow| bodies(acc, r.facts)),
+      |acc: List<TypedBody<Bytes>>, r: KnownTestRow| bodies(acc, r.facts),
     ),
   )
 }
 
 /// What the emitter reads of a checked program beyond each body's own row: the definitions
-/// published pure, each definition's witness order, and the sites of each law, which is walked
+/// published pure, each definition's witness order, and the facts of each law, which is walked
 /// afresh every time, by its owner. Module indices are into `modules`.
 pub type WalkedFacts = {
   modules: List<Bytes>,
@@ -1106,11 +1106,13 @@ pub fn walked_of(modules: List<Bytes>, checked: CheckOutput) -> WalkedFacts / {a
   {
     modules: modules,
     pure: checked.facts.pure,
-    orders: checked.facts.elaboration.orders,
+    orders: checked.facts.orders,
     loose: facts_by_owner(checked.facts).fold(
       [],
       |acc: List<{ owner: Bytes, facts: RootFacts }>, owner: Bytes, f: RootFacts|
-        if laws.contains(owner) { acc.push({ owner: owner, facts: f }) } else { acc },
+        if laws.contains(owner) {
+          acc.push({ owner: owner, facts: { ..f, types: types_named(f.types, f.bodies) } })
+        } else { acc },
     ),
   }
 }

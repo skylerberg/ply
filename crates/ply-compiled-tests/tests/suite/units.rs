@@ -52,7 +52,7 @@ fn head() -> String {
          static inline int64_t ply_imm_value(Word w) { return w >> 1; }\n\
          typedef struct PlyCtx {\n",
     );
-    let mut fields: Vec<(usize, usize, &str)> = ["failed", "fuel", "stack_floor"]
+    let mut fields: Vec<(usize, usize, &str)> = ["failed", "stack_floor"]
         .iter()
         .map(|f| {
             let at = fact(&format!("PlyCtx.{f}.at"));
@@ -306,19 +306,17 @@ pub fn opened(
     Some(ply_compiled::c::load_opened(&lib).map_err(|e| format!("{e:#}")))
 }
 
-/// One entry of `native`'s `name`, with `fuel` nested calls to spend: what it answered as a word,
-/// or what it raised.
+/// One entry of `native`'s `name`: what it answered as a word, or what it raised.
 pub fn entered(
     native: &ply_compiled::c::Native,
     name: &str,
-    fuel: i64,
     args: &[ply_compiled::heap::Word],
 ) -> Result<ply_compiled::heap::Word, String> {
     let entry = native
         .entry(name)
         .unwrap_or_else(|| panic!("the unit does not take `{name}`"));
     let mut ctx = native.context();
-    ctx.begin(fuel);
+    ctx.begin();
     let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
     let failed = ctx.failed;
     let raised = ctx.take_failure().map(|d| d.message);

@@ -28,10 +28,9 @@ find "${trees[@]}" -type f -name '*.ply' ! -path '*/target/*' ! -path '*/bootstr
   sort -u > "$paths"
 
 cd "$grammar"
-out=$(npx tree-sitter parse --paths "$paths" 2>&1) || true
-
-if grep -qE '\((ERROR|MISSING)' <<< "$out"; then
-  grep -E '\((ERROR|MISSING)' <<< "$out" | head -20 >&2
+# `--quiet` prints only a module that has an `ERROR` or `MISSING` node, as it is parsed, and the
+# exit status says whether any had one.
+if ! npx tree-sitter parse --quiet --paths "$paths"; then
   echo "the grammar does not parse every Ply module above" >&2
   exit 1
 fi

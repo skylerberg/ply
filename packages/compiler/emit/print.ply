@@ -1,5 +1,5 @@
 //! The typed form printed as C: the only place C is spelled. A root prints as its C function, the
-//! fuel and stack checks every call makes, its body, the entry the runtime calls it by with words,
+//! stack probe it makes, its body, the entry the runtime calls it by with words,
 //! and then its closures' functions; what only the unit knows (a root's symbol, a site's root id) is
 //! a hole for it to fill.
 //! This module holds the recursion over blocks; each instruction's family prints it, and for an
@@ -30,19 +30,19 @@ import compiler.emit.tir (carried_vars, reps_of, all_given, param_rep, no_closur
                           Return, Restart, Enter, Fail, Handle, Sited, Lender, Inc, Dec, Reset,
                           Free, Opened, Block, Fn, Member, Rooted, Plain, Given, Owned, Lambda,
                           Closure, Uses, NoArm, LastOf, Walked, Unsettled, no_links, falls_through,
-                          var_said, laid_made, PPlace, Unwinds, Unwound, var_of)
+                          var_said, laid_made, PPlace, Unwinds, Unwound, var_of, any_held, calls_in)
 import compiler.emit.print.text (Under, Place, Printing, Printed, printing, function_body, line,
                                  text, pieces, pad, named, name_of, arg_text, assigned, label,
                                  check, failing_return, site, slot, part_names, part_name,
-                                 unprinted, fuel_returned)
+                                 unprinted)
 import compiler.emit.print.counts (block_opened, block_closed, count_printed, walked_value, last_of,
-                                   updated, exit_through, fuel_kept)
+                                   updated, exit_through)
 import compiler.emit.print.made (c_type, as_word, word_as, word_parts, made, got, gathered, statics,
                                  join_declared, set_parts, returned, head_types, head_params,
                                  head_names, params_opened, placed_write, laid_counted)
 import compiler.emit.print.worded (worded)
 import compiler.emit.print.placing (placing_of)
-import compiler.emit.print.fuel (fuel_head, restart_probe)
+import compiler.emit.print.probe (probe, head_probe, probed_fn)
 import compiler.emit.print.prims (literal, prim)
 import compiler.emit.print.containers (contained, container_op)
 import compiler.emit.print.strings (string_op)
@@ -111,9 +111,9 @@ fn root_printed(
   let entered = if !has_entry(f.key, declared_arity(f.params), ctors.stated) {
     { pr: body, out: [] }
   } else { runtime_entry(body, name, entered_of(f)) };
-  // A plain root spends no fuel; a drop root nests only so deep, past which its block waits.
+  // A plain root never probes; a drop root nests only so deep, past which its block waits.
   let opening = match f.kind {
-    Rooted -> fuel_head(f.conv.answer),
+    Rooted -> if head_probed(f) { head_probe(f.conv.answer) } else { b"" },
     Plain -> if !dropping(f.key) { b"" }
     else { Bytes::concat_all([b"  if (ply_drop_deep(ctx, p0, ", name, b")) return 0;\n"]) },
   };
@@ -185,7 +185,7 @@ fn group_printed(
     landing: None,
     group: None,
     unwinds: [],
-    leaving: fuel_returned(),
+    leaving: b"",
   };
   let start = {
     ..printing(match f.params.at(0) { Some(which) -> Map::new().insert(which.id, b"which"), None -> Map::new() }),
@@ -268,12 +268,10 @@ fn group_printed(
           b"(PlyCtx *ctx, int which",
           Bytes::concat_all(words.map(|w: Bytes| b", Word ".concat(w))),
           b") {\n",
-          fuel_head(f.conv.answer),
           Bytes::concat_all(group_buffers(f).map(|d: Bytes| Bytes::concat_all([b"  ", d, b"\n"]))),
           record_declared(switched),
-          fuel_kept(switched),
           b"  ply_loop: ",
-          restart_probe(f.conv.answer),
+          probe(f.conv.answer),
           b"\n  switch (which) {\n",
         ]),
       ),
@@ -330,13 +328,9 @@ fn dropping(k: RootKey) -> Bool =
 fn counted_here(k: RootKey) -> Option<Type> =
   match k { Written(w, _) -> match w.op { keys::Held(_) -> Some(w.ty), _ -> None }, _ -> None }
 
-/// The C `f`'s `Return` runs before it returns: a root's unit of fuel given back, a drop root's
-/// depth, nothing for another plain root.
+/// The C `f`'s `Return` runs before it returns: a drop root's depth given back, nothing for another.
 fn leaving_of(f: Fn) -> Bytes =
-  match f.kind {
-    Rooted -> fuel_returned(),
-    Plain -> if dropping(f.key) { b"ply_drop_done(ctx);" } else { b"" },
-  }
+  match f.kind { Plain -> if dropping(f.key) { b"ply_drop_done(ctx);" } else { b"" }, _ -> b"" }
 
 fn param_names(f: Fn) -> Map<Int, Bytes> / {abort.raise} =
   range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
@@ -386,7 +380,7 @@ fn body_printed(
   );
   let viewed = views_opened(f, opened);
   // A plain root's loop walks a value, which ends.
-  let probed = match f.kind { Rooted -> restart_probe(f.conv.answer), _ -> b";" };
+  let probed = match f.kind { Rooted -> probe(f.conv.answer), _ -> b";" };
   let looped = if restarts(f.body) {
     text(viewed, Bytes::concat_all([b"  ply_loop: ", probed, b"\n"]))
   } else { viewed };
@@ -412,7 +406,7 @@ fn body_printed(
       ),
   };
   let done = { ..closed, placing: given.placing };
-  let record = record_declared(done).concat(fuel_kept(done));
+  let record = record_declared(done);
   if record.len() == 0 { done } else { { ..done, out: [Text(record)].concat(done.out) } }
 }
 
@@ -441,22 +435,15 @@ fn views_opened(f: Fn, pr: Printing) -> Printing =
     })
 
 /// Whether a self call restarts the body anywhere in `b`.
-fn restarts(b: Block) -> Bool =
-  b.fold(false, |found: Bool, i: Inst|
-    found
-      || (match i {
-        Restart(_) -> true,
-        If(x) -> restarts(x.then) || restarts(x.otherwise),
-        Case(c) ->
-          restarts(c.rest)
-            || c.arms.fold(false, |any: Bool, a: { when: Int, body: Block }|
-              any || restarts(a.body)),
-        Match(m) ->
-          restarts(m.rest) || m.arms.fold(false, |any: Bool, a: Block| any || restarts(a)),
-        Loop(l) -> restarts(l.body),
-        Handle(h) -> restarts(h.body),
-        _ -> false,
-      }))
+fn restarts(b: Block) -> Bool = any_held(b, |i: Inst| match i { Restart(_) -> true, _ -> false })
+
+/// Whether root `f` probes the stack as it starts. One that restarts probes at its loop's label,
+/// which its start passes. One that calls nothing, by name or as a value, only adds its own frame
+/// below the last probe, which the floor's margin holds: whatever it reaches through the runtime is
+/// a closure or a type's root, and each of those probes. A type's root probes whatever it calls,
+/// since the runtime enters it through the type's descriptor, as nested in itself as a value is.
+fn head_probed(f: Fn) -> Bool =
+  !restarts(f.body) && (match f.key { Written(_, _) -> true, _ -> calls_in(f.body) })
 
 /// Where a failure goes once it has released what it holds: the enclosing handle's landing, or else
 /// out of the function.
@@ -794,7 +781,7 @@ fn taken_from_place(p: Place, pr: Printing, v: Var, of: Var, at: Int) -> Printin
         Bytes::concat_all([
           b"Word ",
           n.name,
-          b" = rt_alloc_bytes_p(ctx, ",
+          b" = ply_alloc(ctx, ",
           int_lit(header_bytes() + 8 * m),
           b"); memcpy(ply_words(",
           n.name,
@@ -1206,7 +1193,7 @@ test "a closure's function follows its root's, and its body numbers its temporar
   assert_eq(printed.lambdas, [])
 }
 
-test "a plain root counts no fuel or ticks; a drop root nests through the release depth and leaves by it" {
+test "a plain root never probes the stack; a drop root nests through the release depth and leaves by it" {
   let ty = TyCon({ name: b"m.T", args: [] });
   let o = { id: 0, ty: ty, rep: RWord };
   let plain = |op: keys::TypeOp|
@@ -1242,8 +1229,7 @@ test "a plain root counts no fuel or ticks; a drop root nests through the releas
   let shared = text_of(keys::Share);
   [dropped, shared].fold((), |_: Unit, t: Bytes| {
     assert(t.len() > 0, None);
-    assert_eq(t.index_of(b"fuel"), None);
-    assert_eq(t.index_of(b"ticks"), None);
+    assert_eq(t.index_of(probed_fn()), None);
     assert(t.index_of(b"ply_loop: ;") != None, None)
   });
   let at = |s: Bytes| match dropped.index_of(s) { Some(i) -> i, None -> 0 - 1 };

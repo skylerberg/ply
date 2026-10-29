@@ -99,9 +99,6 @@ pub struct Region {
     seeded: bool,
     /// The index in [`Ctx::stacks`] of the stack the region was opened on.
     opened_on: usize,
-    /// The calls a task may nest as it starts: as many as were left where the region was opened,
-    /// however deep the loop that starts it stands.
-    fuel: i64,
     loop_sp: usize,
     running: Option<u64>,
     slots: HashMap<u64, Box<Slot>>,
@@ -122,7 +119,6 @@ impl Region {
             ctx,
             seeded,
             opened_on: unsafe { (*ctx).current },
-            fuel: unsafe { (*ctx).fuel },
             loop_sp: 0,
             running: None,
             slots: HashMap::new(),
@@ -429,7 +425,6 @@ extern "C" fn task_entry(arg: usize) {
         c.stack_floor
             .store(unsafe { own.enter() }, Ordering::Relaxed);
         c.frames = std::ptr::null_mut();
-        c.fuel = r.fuel;
         if let Some(n) = slot.runs_as {
             c.task = n;
         }

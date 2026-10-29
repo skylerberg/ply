@@ -509,17 +509,26 @@ pub fn claim_rows(
       Some(claim) -> match outcomes.at(i) { None -> acc, Some(o) -> acc.push(claim_row(claim, o)) },
     })
 
+/// How many of the collection's definitions carry at least one obligation, whatever became of it.
+pub fn carried_by(collection: Collection) -> Int =
+  specified(
+    collection.defs.map(|def: Def| def.name),
+    laws_in(collection),
+    collection.claims.map(|claim: Claim| { owner: claim.owner, kind: claim.kind }),
+  )
+
 /// A run of obligations, decided: what the cache answered for each claim the run reports on, what
 /// `discharge` made of the rest from what the static prover settled, the evidence filed after, and
-/// the accounting a report reads.
+/// the accounting a report reads. Each claim's row is known as soon as its outcome is: the cache's
+/// answers first, then each claim as `discharge` decides it.
 pub fn decided<| e>(
   collection: Collection,
   wanted: List<Int>,
   use_cache: Bool,
   statics: Statics,
   reach: Bool,
-  discharge: (List<Int>, List<Static>) -> Result<Discharged, Refusal> / e,
-) -> Result<Verdicts, Refusal> / {abort.raise, proofs.cached, proofs.record | e} = {
+  discharge: (List<Int>, List<Static>) -> Result<Discharged, Refusal> / {discharging.decided | e},
+) -> Result<Verdicts, Refusal> / {abort.raise, proofs.cached, proofs.record, decisions.known | e} = {
   let asked = wanted.map(|i: Int| blank_claim(collection.claims, i));
   let keys = asked.map(|claim: Claim|
     {
@@ -538,25 +547,53 @@ pub fn decided<| e>(
   // `to_discharge` are places in the run; the static prover and a discharge read collection indices.
   let runs = selection.to_discharge.map(|at: Int| match wanted.at(at) { Some(i) -> i, None -> -1 });
   let static_answers = (statics.answer)(wanted, runs, reach, collection.plan.prove_budget);
-  let read = range(0, selection.from.len()).fold([], |acc: List<Option<Certificate>>, at: Int|
+  let row_at = |at: Int, outcome: Outcome|
+    {
+      claim: blank_claim(asked, at),
+      outcome: outcome,
+      reason: match selection.reasons.at(at) { Some(r) -> r, None -> Fresh },
+      reach: match static_answers.reaches {
+        Some(reached) -> match reached.at(at) { Some(r) -> r, None -> None },
+        None -> None,
+      },
+    };
+  // A claim the cache answered is proved by the evidence read back for it, where that reads.
+  let kept = range(0, selection.from.len()).fold(Map::new(), |acc: Map<Int, Outcome>, at: Int|
     match selection.from.at(at) {
       Some(Some(key)) -> {
         let h = match held.at(at) { Some(texts) -> texts, None -> [] };
         let text = if key == blank_keys(keys, at).bare { held_at(h, 0) } else { held_at(h, 1) };
-        acc.push(match text {
-          Some(t) -> match evidence_of(t) { Ok(e) -> Some(e), Err(_) -> None },
-          None -> None,
+        acc.insert(at, match text {
+          Some(t) -> match evidence_of(t) {
+            Ok(c) -> Proved(c),
+            Err(_) -> unanswered(blank_claim(asked, at)),
+          },
+          None -> unanswered(blank_claim(asked, at)),
         })
       },
       _ -> acc,
     });
-  match discharge(runs, static_answers.settled) {
+  kept.fold((), |_: Unit, at: Int, outcome: Outcome| decisions.known(row_at(at, outcome)));
+  let place_of = range(0, runs.len()).fold(Map::new(), |acc: Map<Int, Int>, k: Int|
+    acc.insert(runs.at_or(k, -1), selection.to_discharge.at_or(k, -1)));
+  let ran = handle {
+    discharge(runs, static_answers.settled)
+  } with {
+    discharging.decided(claim, outcome) ->
+      decisions.known(row_at(place_of.get_or(claim, -1), outcome)),
+  };
+  match ran {
     Err(why) -> Err(why),
     Ok(d) -> {
-      let outcomes = answered(asked, selection.from, read, selection.to_discharge, d.outcomes);
+      let all = answered(asked, kept, selection.to_discharge, d.outcomes);
+      // A claim the discharge made nothing of is known only now.
+      range(d.outcomes.len(), selection.to_discharge.len()).fold((), |_: Unit, k: Int| {
+        let at = selection.to_discharge.at_or(k, -1);
+        decisions.known(row_at(at, all.at_or(at, unanswered(blank_claim(asked, at)))))
+      });
       let filed = filings(
         keys,
-        outcomes.map(|o: Outcome| match o { Proved(c) -> Some(c.ran), _ -> None }),
+        all.map(|o: Outcome| match o { Proved(c) -> Some(c.ran), _ -> None }),
         selection.to_discharge,
         use_cache,
       );
@@ -565,26 +602,24 @@ pub fn decided<| e>(
           filed.fold(
             [],
             |acc: List<{ key: String, evidence: Bytes }>, f: { at: Int, key: String }|
-              match outcomes.at(f.at) {
+              match all.at(f.at) {
                 Some(Proved(c)) -> acc.push({ key: f.key, evidence: evidence_bytes(c) }),
                 _ -> acc,
               },
           ),
         )
       };
-      let laws = laws_in(collection);
-      let names = collection.defs.map(|def: Def| def.name);
       Ok({
-        outcomes: outcomes,
+        outcomes: all,
         reaches: static_answers.reaches,
         reasons: selection.reasons,
-        coverage: coverage(names, laws, claim_rows(collection, wanted, outcomes)),
-        cached: hits(selection),
-        specified: specified(
-          names,
-          laws,
-          collection.claims.map(|claim: Claim| { owner: claim.owner, kind: claim.kind }),
+        coverage: coverage(
+          collection.defs.map(|def: Def| def.name),
+          laws_in(collection),
+          claim_rows(collection, wanted, all),
         ),
+        cached: hits(selection),
+        specified: carried_by(collection),
         duration_ms: d.duration_ms,
         warnings: selection.warnings.map(refusal_warning).concat(d.warnings).concat(stored),
       })
@@ -607,39 +642,25 @@ fn filed_kind(text: Option<Bytes>) -> Option<String> / {abort.raise} =
       }),
   }
 
-/// Each claim's outcome, by its place in the run: the evidence read back for a claim the cache
-/// answered, in the order the keys were asked, and the discharge's for the rest, in its order.
+/// Each claim's outcome, by its place in the run: the cache's answer, by place, or the discharge's,
+/// in the order of `to_discharge`.
 fn answered(
   asked: List<Claim>,
-  from: List<Option<String>>,
-  read: List<Option<Certificate>>,
+  kept: Map<Int, Outcome>,
   to_discharge: List<Int>,
   discharged: List<Outcome>,
-) -> List<Outcome> =
-  range(0, asked.len()).fold(
-    { out: [], read_at: 0 },
-    |acc: { out: List<Outcome>, read_at: Int }, at: Int|
-      match from.at(at) {
-        Some(Some(_)) -> {
-          let outcome = match read.at(acc.read_at) {
-            Some(Some(c)) -> Proved(c),
-            _ -> unanswered(blank_claim(asked, at)),
-          };
-          { out: acc.out.push(outcome), read_at: acc.read_at + 1 }
-        },
-        _ -> {
-          let place = range(0, to_discharge.len()).fold(-1, |found: Int, k: Int|
-            if to_discharge.at(k) == Some(at) { k } else { found });
-          {
-            ..acc,
-            out: acc.out.push(match discharged.at(place) {
-              Some(o) -> o,
-              None -> unanswered(blank_claim(asked, at)),
-            }),
-          }
-        },
+) -> List<Outcome> = {
+  let place = range(0, to_discharge.len()).fold(Map::new(), |acc: Map<Int, Int>, k: Int|
+    acc.insert(to_discharge.at_or(k, -1), k));
+  range(0, asked.len()).map(|at: Int|
+    match kept.get(at) {
+      Some(o) -> o,
+      None -> match discharged.at(place.get_or(at, -1)) {
+        Some(o) -> o,
+        None -> unanswered(blank_claim(asked, at)),
       },
-  ).out
+    })
+}
 
 /// A claim neither read back nor discharged: the program and the store disagree, which is Ply's.
 fn unanswered(claim: Claim) -> Outcome =
@@ -653,6 +674,16 @@ fn unanswered(claim: Claim) -> Outcome =
     bindings: [],
   })
 
+/// A claim's outcome as soon as a discharge decides it, by the claim's place in the collection.
+pub effect discharging {
+  write decided(claim: Int, outcome: Outcome) -> Unit
+}
+
+/// A claim's row as soon as a run of claims knows its outcome.
+pub effect decisions {
+  write known(row: Row) -> Unit
+}
+
 /// What discharging the claims at `runs` comes to, on the program's unit, emitted, compiled and
 /// opened here and closed once the discharge is over: nothing is emitted for a discharge that runs
 /// nothing.
@@ -661,7 +692,7 @@ pub fn discharged_over(
   collection: Collection,
   runs: List<Int>,
   settled: List<Static>,
-) -> Result<Discharged, Refusal> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, abort.raise} =
+) -> Result<Discharged, Refusal> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.unit, emit.compiled, discharging.decided, abort.raise} =
   if runs.len() == 0 { Ok({ outcomes: [], duration_ms: Decimal::of_int(0), warnings: [] }) } else {
     let broken = |diags: List<Diag>| Err(Broken({ diags: diags, places: collection.places }));
     match units::whole(front) {
@@ -688,7 +719,7 @@ pub fn discharge_runs(
   p: Proving,
   runs: List<Int>,
   settled: List<Static>,
-) -> Discharged / {entering::machine.enter, time.elapsed_ms, abort.raise} = {
+) -> Discharged / {entering::machine.enter, time.elapsed_ms, discharging.decided, abort.raise} = {
   let started = time.elapsed_ms();
   let asked = range(0, runs.len()).fold([], |acc: List<Asked>, k: Int|
     match ((runs.at(k), settled.at(k))) {
@@ -699,19 +730,25 @@ pub fn discharge_runs(
       _ -> acc,
     });
   let ran = handle {
-    discharged(asked, collection.world, collection.plan.sim, |q: Ask|
-      match q {
-        AskJudged(batches) -> {
-          let j = judged_in_lanes(p, batches, collection.lanes);
-          ending.ended(j.warnings);
-          Judgements(j.each)
+    discharged(
+      asked,
+      collection.world,
+      collection.plan.sim,
+      |q: Ask|
+        match q {
+          AskJudged(batches) -> {
+            let j = judged_in_lanes(p, batches, collection.lanes);
+            ending.ended(j.warnings);
+            Judgements(j.each)
+          },
+          AskInterleaved(claim, point, seed, steps) -> {
+            let r = interleaved(p, claim, point, seed, steps);
+            ending.ended(r.warnings);
+            Interleaved(r.run)
+          },
         },
-        AskInterleaved(claim, point, seed, steps) -> {
-          let r = interleaved(p, claim, point, seed, steps);
-          ending.ended(r.warnings);
-          Interleaved(r.run)
-        },
-      })
+      |claim: Int, outcome: Outcome| discharging.decided(claim, outcome),
+    )
   } with {
     var warnings: List<Diag> = [],
     ending.ended(ws) -> {
@@ -935,7 +972,7 @@ fn entered(
   args: List<Value>,
 ) -> Entered / {entering::machine.enter, abort.raise} = {
   let o = entering::machine.enter(p.unit, root, machine::arguments_of(args), {
-    ..entering::unbounded(machine::max_calls()),
+    ..entering::unbounded(),
     timeout_ms: p.timeout_ms,
   });
   { answer: answered_of(o.ended, root), warnings: machine::warnings_of(o, p.roots) }
@@ -1043,7 +1080,7 @@ pub fn interleaved(
       },
     Ok(r) -> {
       let o = entering::machine.enter(p.unit, r.body, machine::arguments_of(point), {
-        ..entering::unbounded(machine::max_calls()),
+        ..entering::unbounded(),
         timeout_ms: p.timeout_ms,
         seed: Some({ root: seed.root, path: seed.path, steps: max(steps, 1) }),
       });
@@ -1102,20 +1139,27 @@ pub fn coverage_lines(
   cov: Coverage,
   carried: Int,
   explain: Bool,
-) -> List<String> / {abort.raise} = {
-  let unspecified = if cov.definitions > carried { cov.definitions - carried } else { 0 };
-  let head = indent() ++ count_of(cov.definitions, "definition") ++ " · " ++ carried.to_string()
+) -> List<String> / {abort.raise} =
+  [coverage_head(cov.definitions, carried)].concat(uncovered_lines(style, cov, explain))
+
+/// How many of the definitions carry a claim at all, which is known before any claim is decided.
+pub fn coverage_head(definitions: Int, carried: Int) -> String / {abort.raise} = {
+  let unspecified = if definitions > carried { definitions - carried } else { 0 };
+  indent() ++ count_of(definitions, "definition") ++ " · " ++ carried.to_string()
     ++ " carry an obligation · "
     ++ unspecified.to_string()
-    ++ " do not";
-  if cov.uncovered.len() == 0 { [head] } else {
+    ++ " do not"
+}
+
+/// The definitions no claim that holds covers, as a list to work through.
+pub fn uncovered_lines(style: Style, cov: Coverage, explain: Bool) -> List<String> / {abort.raise} =
+  if cov.uncovered.len() == 0 { [] } else {
     let shown = if explain || cov.uncovered.len() < 6 { cov.uncovered.len() } else { 6 };
     let rest = cov.uncovered.len() - shown;
     let tail = if rest > 0 { ", and " ++ rest.to_string() ++ " more (`--explain` for all)" }
     else { "" };
     let names = String::join(range(0, shown).map(|i: Int| cov.uncovered.at_or(i, "")), ", ");
     [
-      head,
       indent()
         ++ dim(
           style,
@@ -1124,7 +1168,6 @@ pub fn coverage_lines(
         ),
     ]
   }
-}
 
 pub fn row_head(style: Style, row: Row, places: List<Place>) -> String / {abort.raise} = {
   let detail = detail_of(row, places);

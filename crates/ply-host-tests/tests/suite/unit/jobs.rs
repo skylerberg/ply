@@ -133,3 +133,29 @@ fn an_unbound_factorys_runtimes_share_one_host() {
     let other = unbound()();
     assert_ne!(sockets(&*first), sockets(&*other));
 }
+
+/// A job done here runs on the asking thread and is answered before its ticket is waited on; one
+/// that panics is answered as one that failed.
+#[test]
+fn a_job_done_here_runs_on_the_asking_thread_and_is_answered_at_once() {
+    let runtime = ply_host::Host::new().runtime();
+    let run = run_of(&*runtime).expect("a host made the runtime");
+    let asking = std::thread::current().id();
+    let ticket = jobs::done_here(run, Span::DUMMY, "test", "a test job", move || {
+        assert_eq!(std::thread::current().id(), asking);
+        Ok(b"here".to_vec())
+    });
+    assert_eq!(
+        run.taken(&ticket).expect("its own ticket"),
+        Some(b"here".to_vec())
+    );
+    let ticket = jobs::done_here(run, Span::DUMMY, "test", "`fs.read_file`", || {
+        panic!("a host operation panicked")
+    });
+    let failed = job_bytes(&*runtime, &ticket).expect_err("the job panicked");
+    assert!(
+        failed.message.contains("`fs.read_file`"),
+        "{}",
+        failed.message
+    );
+}

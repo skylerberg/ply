@@ -1,28 +1,26 @@
 //! Whether an update copies, read off the body the emitter compiles, each read moving where its typed
 //! form moves it (`emit.moves`), so a move here is a move there.
 
-import compiler.syntax.parsing (Span, QName, dummy_span, span_bin, span_between)
-import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
-                           NMatch, NPerform, NLambda, NSimulate, NParallel, NHandle, NField,
-                           NUpdate, NKnown, NLabel, CodeStmt, CLet, CLetPat, CDo, CodeArm,
-                           CodeField, CodeClause, Capture, pat_slots)
+import compiler.syntax.parsing (Span, dummy_span, span_bin, span_between)
+import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NIf,
+                           NBlock, NList, NRecord, NMatch, NPerform, NLambda, NSimulate, NParallel,
+                           NHandle, NField, NUpdate, NKnown, NLabel, CodeStmt, CLet, CLetPat, CDo,
+                           CodeArm, CodeField, CodeClause, Capture, pat_slots)
 import compiler.emit.moves (Moves, no_moves, read_moved, capture_moved, field_taken, root_moves)
 import compiler.emit.lower.setting (Setting, ItemRoot, settings_in)
 import compiler.check.infer.definitions (Extern, parsed_natives)
 import compiler.syntax.items (Module, Derived, Item, IFn, ITest, ILaw, FnDef, ReturnsFresh,
                               ReturnsParam, parse)
 import compiler.expand.derive (derivation_of)
-import compiler.syntax.exprs (Param, prelude_module)
-import compiler.expand.rewrite (witness_param)
+import compiler.syntax.exprs (Param, prelude_module, prelude_own)
 import compiler.expand.embed (EmbedAt, EmbedFile, embed_tables, rewritten)
-import compiler.check.resolve.tables (ParsedModule, Resolved, ValueSpace, Source, qualify)
+import compiler.check.resolve.tables (ParsedModule, Resolved, Source, qualify)
 import compiler.check.resolve (ResolveOutcome, ResolveSucceeded, ResolveFailed, resolve_packaged)
-import compiler.check.resolve.scopes (no_packages, find)
-import compiler.check.infer.checker (Builtin, builtins, LabelSite, UpdateShape, WitnessOp,
-                                     WitnessRef, WitnessOrder, TypedSite, TrySite, MemberSite,
-                                     RowSite, ReleaseSite)
+import compiler.check.resolve.scopes (no_packages)
+import compiler.check.infer.checker (Builtin, builtins, WitnessOrder, MemberSite, ReleaseSite)
 import compiler.emit.keys (test_owner, law_owner)
-import compiler.check.infer (RootFacts, no_root_facts, root_facts_bin, types_named)
+import compiler.check.infer (RootFacts, root_facts_bin, types_named)
+import compiler.check.typed (TypedBody, witness_param)
 import compiler.front.facts (Analysis, cuts_of)
 import compiler.front.rows (Rows, KnownDefRow, KnownTestRow, Cut)
 import compiler.front.seam (WalkedFacts, Analysed, Refused)
@@ -32,7 +30,7 @@ import compiler.store.hash.encoding (hex)
 import compiler.front.interface (stubbed)
 import compiler.check.semantics (Handed, Element, Threaded, Taken, Number, Unsaid, Folded,
                                  prelude_iterates)
-import compiler.front.diagnostics (ParsedSource, parse_all, parse_at, parse_from)
+import compiler.front.diagnostics (parse_all, parse_at, parse_from)
 import std.bin
 import std.hash (blake3)
 import std.list
@@ -237,6 +235,9 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
     NLit(_) -> fresh(state),
     NLabel(_) -> fresh(state),
     NVar(v) -> var_owner(env, v.name, v.slot, read_moved(env.moves, c.span), state),
+    NDef(_) -> global_read(env, c, state),
+    NCtor(_) -> global_read(env, c, state),
+    NBuiltin(_) -> global_read(env, c, state),
     NUnary(u) -> fresh(walk(env, u.operand, state).state),
     NBinary(b) -> fresh(walk(env, b.rhs, walk(env, b.lhs, state).state).state),
     NLambda(l) ->
@@ -244,7 +245,7 @@ fn walk(env: Env, c: Code, state: CostState) -> WithOwner / {abort.raise} =
     // The branches' answers are fields of a tuple made here.
     NParallel(pr) -> fresh(pr.branches.fold(state, |s: CostState, b: Code| walk(env, b, s).state)),
     NApp(a) -> app(env, c.span, a.func, a.args, state),
-    NKnown(k) -> var_owner(env, k.name, Some(k.slot), read_moved(env.moves, c.span), state),
+    NKnown(k) -> var_owner(env, k.name, k.slot, read_moved(env.moves, c.span), state),
     NIf(i) -> {
       let t = walk(env, i.then_branch, walk(env, i.cond, state).state);
       let e = walk(env, i.else_branch, t.state);
@@ -405,7 +406,7 @@ fn poison(env: Env, state: CostState, caps: List<Capture>, body: Code, at: Span)
 
 fn first_name(c: Code, slot: Int) -> Option<Bytes> =
   match c.node {
-    NVar(v) -> if v.slot == Some(slot) { Some(v.name) } else { None },
+    NVar(v) -> if v.slot == slot { Some(v.name) } else { None },
     NLambda(l) -> through(l.captures, l.body, slot),
     NSimulate(x) -> through(x.captures, x.body, slot),
     NHandle(h) -> {
@@ -466,74 +467,56 @@ fn free(name: Bytes) -> Owner =
   )
 
 /// The owner of what reading `name` answers; `moved` where the form hands the slot's value on there.
-fn var_owner(
-  env: Env,
-  name: Bytes,
-  slot: Option<Int>,
-  moved: Bool,
-  state: CostState,
-) -> WithOwner / {abort.raise} =
-  match slot {
-    Some(s) -> match owner_of(state, s) {
-      Some(o) ->
-        {
-          state: state,
-          owner: if moved { o } else {
-            blocked(
-              CReadAgain,
-              Bytes::concat_all([
-                b"`",
-                name,
-                b"` is read again after this point, so this use clones it",
-              ]),
-            )
-          },
+fn var_owner(env: Env, name: Bytes, slot: Int, moved: Bool, state: CostState) -> WithOwner =
+  match owner_of(state, slot) {
+    Some(o) ->
+      {
+        state: state,
+        owner: if moved { o } else {
+          blocked(
+            CReadAgain,
+            Bytes::concat_all([
+              b"`",
+              name,
+              b"` is read again after this point, so this use clones it",
+            ]),
+          )
         },
-      None -> { state: state, owner: free(name) },
-    },
-    None -> {
-      let found = bound_in(env.prog, env.module, name);
-      let looked = look(state, name, found);
-      match found.def {
-        Some(d) ->
-          {
-            state: add_escaped(looked, d),
-            owner: blocked(CProgram, b"a top-level definition, which the program holds"),
-          },
-        None ->
-          {
-            state: looked,
-            owner: if sep_at(name) >= 0 && !env.prog.builtins.contains(name) {
-              blocked(CProgram, b"a module-qualified name denotes something the program holds")
-            } else { free(name) },
-          },
-      }
-    },
+      },
+    None -> { state: state, owner: free(name) },
   }
 
-fn sep_at(text: Bytes) -> Int =
-  range(0, text.len() - 1).fold(0 - 1, |acc: Int, i: Int|
-    if acc < 0 && text.at(i) == 58 && text.at(i + 1) == 58 { i } else { acc })
+/// What a read of a definition, a constructor or a builtin, `c`, names; none for any other code.
+/// The prelude's own functions are the builtins they model, by their names there.
+fn global_named(prog: Program, c: Code) -> Option<{ name: Bytes, found: Bound }> =
+  match c.node {
+    NDef(d) -> match prelude_own(d.full) {
+      Some(name) -> Some({ name: name, found: { bound: None, def: None } }),
+      None -> Some({ name: d.full, found: { bound: Some(d.full), def: prog.index.get(d.full) } }),
+    },
+    NCtor(k) -> Some({ name: k.name, found: { bound: Some(k.name), def: None } }),
+    NBuiltin(b) -> Some({ name: b.name, found: { bound: None, def: None } }),
+    _ -> None,
+  }
 
-fn qname_of(text: Bytes) -> QName / {abort.raise} = {
-  let sep = sep_at(text);
-  if sep < 0 { { module: None, name: { name: text, span: dummy_span() }, span: dummy_span() } }
-  else {
-    {
-      module: Some({ name: text.slice(0, sep), span: dummy_span() }),
-      name: { name: text.slice(sep + 2, text.len()), span: dummy_span() },
-      span: dummy_span(),
-    }
+/// A definition, a constructor or a builtin read as a value: a definition escapes, and the rest
+/// are free.
+fn global_read(env: Env, c: Code, state: CostState) -> WithOwner =
+  match global_named(env.prog, c) { Some(n) -> global_owner(n, state), None -> fresh(state) }
+
+fn global_owner(named: { name: Bytes, found: Bound }, state: CostState) -> WithOwner = {
+  let looked = look(state, named.name, named.found);
+  match named.found.def {
+    Some(d) ->
+      {
+        state: add_escaped(looked, d),
+        owner: blocked(CProgram, b"a top-level definition, which the program holds"),
+      },
+    None -> { state: looked, owner: free(named.name) },
   }
 }
 
 type Bound = { bound: Option<Bytes>, def: Option<Int> }
-
-fn bound_in(prog: Program, module: Int, name: Bytes) -> Bound / {abort.raise} =
-  match find(prog.r, module, ValueSpace, qname_of(name)) {
-    None -> { bound: None, def: None },
-    Some(b) -> { bound: Some(b.qualified), def: prog.index.get(b.qualified) },
-  }
 
 fn app(
   env: Env,
@@ -542,11 +525,7 @@ fn app(
   args: List<Code>,
   state: CostState,
 ) -> WithOwner / {abort.raise} = {
-  let named = match func.node {
-    NVar(v) -> if v.slot != None { None }
-    else { Some({ name: v.name, found: bound_in(env.prog, env.module, v.name) }) },
-    _ -> None,
-  };
+  let named = global_named(env.prog, func);
   let callee = match named { Some(x) -> x.found.def, None -> None };
   let builtin = match named {
     Some(x) -> if x.found.def != None || !env.prog.builtins.contains(x.name) { None }
@@ -555,9 +534,9 @@ fn app(
   };
   let n = args.len();
   // A callee written as a name is a call, not the definition escaping.
-  let before = match func.node {
-    NVar(_) -> match named { Some(x) -> look(state, x.name, x.found), None -> state },
-    _ -> walk(env, func, state).state,
+  let before = match named {
+    Some(x) -> look(state, x.name, x.found),
+    None -> match func.node { NVar(_) -> state, _ -> walk(env, func, state).state },
   };
   let walked: Args = args.fold({ state: before, owners: [] }, |acc: Args, arg: Code| {
     let w = match callback_owners(builtin, acc.owners.len(), acc.owners) {
@@ -1895,18 +1874,12 @@ fn loose_by_module(w: WalkedFacts, mods: List<ParsedModule>) -> Map<Int, Bytes> 
 }
 
 /// `f` as it reads whichever module its owner stands in, with the types it names.
-fn filed_facts_of(f: RootFacts) -> RootFacts =
+fn filed_facts_of(f: RootFacts) -> RootFacts / {abort.raise} =
   {
-    label_sites: f.label_sites.map(|x: LabelSite| { ..x, module: 0 }),
-    updates: f.updates.map(|x: UpdateShape| { ..x, module: 0 }),
-    ops: f.ops.map(|x: WitnessOp| { ..x, module: 0 }),
-    refs: f.refs.map(|x: WitnessRef| { ..x, module: 0 }),
-    tries: f.tries.map(|x: TrySite| { ..x, module: 0 }),
-    releases: f.releases.map(|x: ReleaseSite| { ..x, module: 0 }),
     members: f.members.map(|x: MemberSite| { ..x, module: 0 }),
-    typed: f.typed.map(|x: TypedSite| { ..x, module: 0 }),
-    types: types_named(f.types, f.typed),
-    rows: f.rows.map(|x: RowSite| { ..x, module: 0 }),
+    releases: f.releases.map(|x: ReleaseSite| { ..x, module: 0 }),
+    types: types_named(f.types, f.bodies),
+    bodies: f.bodies.map(|x: TypedBody<Bytes>| { ..x, module: 0 }),
   }
 
 // --- Tests ------------------------------------------------------------------
@@ -2207,7 +2180,7 @@ test "a kept walk is not taken once what a name its body looks up is bound to st
     bodies: kept.bodies.map(|k: KeptBody|
       {
         ..k,
-        looked: k.looked.map(|l: Looked| if l.name == b"mk" { { ..l, def: false } } else { l }),
+        looked: k.looked.map(|l: Looked| if l.name == b"a.mk" { { ..l, def: false } } else { l }),
       }),
   };
   let again = costed_over(first.store.insert(key, bin::encode(renamed, kept_module_bin())), p);

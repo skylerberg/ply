@@ -5,7 +5,7 @@
 //! that may be absent found.
 
 use crate::jobs::{Failure, Refusing};
-use crate::native::{found, int, parts};
+use crate::native::{found, found_read, int, parts};
 use crate::pool::Run;
 use ply_core::crypto::Framing;
 use ply_core::{Diagnostic, Resource, Span, Symbol, codes};
@@ -439,14 +439,10 @@ fn on_open_file(descriptors: &Mutex<Descriptors>, root: &Path, id: i64, work: Ch
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let open = held.open.get_mut(&id).filter(|open| open.root == root);
     match work {
-        Chunk::Read(max) => found(
-            open.filter(|open| open.how == Opening::Read)
-                .and_then(|open| {
-                    let mut out = Vec::new();
-                    (&open.file).take(max).read_to_end(&mut out).ok()?;
-                    Some(out)
-                }),
-        ),
+        Chunk::Read(max) => match open.filter(|open| open.how == Opening::Read) {
+            Some(open) => found_read(0, |out| (&open.file).take(max).read_to_end(out)),
+            None => found(None::<Vec<u8>>),
+        },
         Chunk::Write(body) => done(
             open.filter(|open| open.how != Opening::Read)
                 .is_some_and(|open| open.file.write_all(&body).is_ok()),
@@ -538,12 +534,10 @@ fn run(
             Ok(meta) if meta.is_file() && meta.len() > MAX_READ_BYTES => {
                 return Err(Failure::Refused(too_large(meta.len(), path, span)));
             }
-            Ok(meta) if meta.is_file() => {
-                let mut bytes = Vec::new();
-                let read = unfollowed(OpenOptions::new().read(true), &target)
-                    .and_then(|mut file| file.read_to_end(&mut bytes));
-                found(read.ok().map(|_| bytes))
-            }
+            Ok(meta) if meta.is_file() => found_read(meta.len() as usize, |out| {
+                unfollowed(OpenOptions::new().read(true), &target)
+                    .and_then(|mut file| file.read_to_end(out))
+            }),
             _ => found(None::<Vec<u8>>),
         },
         (Op::ListDir, _) => found(std::fs::read_dir(&target).ok().map(|entries| {

@@ -6,11 +6,11 @@
 //! built after a `match` let go of a subject held once takes the subject's cells, as compiled code
 //! does.
 
-import compiler.emit.code (Code, NLit, NVar, NUnary, NBinary, NApp, NKnown, NIf, NBlock, NList,
-                           NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate, NParallel,
-                           NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat, CDo, CodeField,
-                           CodeArm, CodePattern, PxVar, PxCtor, PxRecord, PxList, CodePatternField,
-                           Capture)
+import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NKnown,
+                           NIf, NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda,
+                           NSimulate, NParallel, NHandle, NField, NUpdate, CodeStmt, CLet, CLetPat,
+                           CDo, CodeField, CodeArm, CodePattern, PxVar, PxCtor, PxRecord, PxList,
+                           CodePatternField, Capture)
 import compiler.emit.moves (Moves, read_moved, capture_moved)
 import compiler.front.published (ClaimClause)
 import compiler.check.infer.checker (Builtin)
@@ -22,9 +22,9 @@ import compiler.check.semantics (Iterates, Handed, Threaded, Taken, Number, Mapp
 import context (Context, Def, Moved, ctor, signature, is_recursive, moved_of)
 import cost (Poly, Of, Same, Part, Other, Found, OnTail, OnIndex, zero, constant, size_of, plus,
              product, at_args, ceiling_of, callees, reachable, params_sized, arithmetic,
-             holding_keyed, descent, descent_calls, kept, is_length, dominated, stated, cx_owning,
-             found_by, takes_some, toward, assumed, possible, literal_size, calls_made,
-             iterating_of, by_entry, natives, name_key, dominated_space)
+             holding_keyed, descent, descent_calls, kept, is_length, stated, cx_owning, found_by,
+             takes_some, toward, assumed, possible, literal_size, calls_made, iterating_of,
+             by_entry, natives, name_key, dominated_space)
 import domain (Ty, Fn, Con, Record)
 import std.list
 
@@ -410,23 +410,21 @@ fn valued(w: Walked, holders: Holders, number: Bool) -> Walked =
 fn walk(env: Env, st: State, c: Code) -> Result<Walked, String> / {abort.raise} =
   match c.node {
     NLit(l) -> Ok(literal(st, l)),
-    NVar(v) ->
-      Ok(match v.slot {
-        Some(k) -> {
-          let s = slot_at(st, k);
-          let moved = read_moved(env.moves, c.span) || s.number;
-          {
-            ..none(st),
-            size: s.size,
-            of: s.of,
-            fun: s.fun,
-            number: s.number,
-            holders: if moved { s.holders } else { Many },
-            read: if moved { None } else { Some(k) },
-          }
-        },
-        None -> { ..none(st), fun: fun_named(env, String::of_bytes_lossy(v.name)), holders: Many },
-      }),
+    NVar(v) -> {
+      let s = slot_at(st, v.slot);
+      let moved = read_moved(env.moves, c.span) || s.number;
+      Ok({
+        ..none(st),
+        size: s.size,
+        of: s.of,
+        fun: s.fun,
+        number: s.number,
+        holders: if moved { s.holders } else { Many },
+        read: if moved { None } else { Some(v.slot) },
+      })
+    },
+    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) ->
+      Ok({ ..none(st), fun: fun_named(env, String::of_bytes_lossy(fname)), holders: Many }),
     NLabel(_) -> Ok(none(st)),
     NUnary(u) -> match walk({ ..env, tail: false }, st, u.operand) {
       Err(why) -> Err(why),
@@ -647,7 +645,7 @@ fn statement(env: Env, st: State, s: CodeStmt) -> Result<Walked, String> / {abor
 /// a local's last read, held once, outside a function value.
 fn let_go(env: Env, subject: Code, w: Walked) -> Bool =
   !env.lambda && read_moved(env.moves, subject.span) && !w.number && w.holders != Many
-    && (match subject.node { NVar(v) -> v.slot != None, _ -> false })
+    && (match subject.node { NVar(_) -> true, _ -> false })
 
 /// The cells a let-go subject leaves for the next constructor of its kind to take, where no other
 /// constructor's wait: a constructor with fields leaves them.
@@ -691,7 +689,7 @@ fn bound(
   parts: Holders,
 ) -> State / {abort.raise} =
   match pat {
-    PxVar(v) -> match v.slot { Some(k) -> bind(st, k, whole), None -> st },
+    PxVar(v) -> bind(st, v.slot, whole),
     PxList(l) -> {
       let heads = l.items.fold(st, |s: State, p: CodePattern|
         bound(env, s, p, part(parts, false), parts));
@@ -813,27 +811,28 @@ fn application(
   args: List<Code>,
 ) -> Result<Walked, String> / {abort.raise} =
   match func.node {
-    NVar(f) -> match f.slot {
-      Some(k) -> match walked_all(env, st, args, |_i: Int| Some(Many)) {
+    NVar(f) -> {
+      let k = f.slot;
+      match walked_all(env, st, args, |_i: Int| Some(Many)) {
         Err(why) -> Err(why),
         Ok(a) -> match slot_at(a.walked.state, k).fun {
           Some(p) -> Ok(valued(made(a.walked, p), Many, false)),
           None -> Err("a call of a function value whose space is not read"),
         },
-      },
-      None -> {
-        let name = String::of_bytes_lossy(f.name);
-        if name == env.own { called_back(env, st, args) }
-        else if ctor(env.cx, name) != None { built(env, st, f.name, args) }
-        else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name, SSpace) {
-          called(env, st, name, args)
-        } else {
-          match iterating_of(f.name) {
-            Some(it) -> iterating(env, st, name, it, args),
-            None -> builtin(env, st, name, args),
-          }
+      }
+    },
+    NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+      let name = String::of_bytes_lossy(fname);
+      if name == env.own { called_back(env, st, args) }
+      else if ctor(env.cx, name) != None { built(env, st, fname, args) }
+      else if env.cx.claims.defs.contains(name) && !by_entry(env.cx, name, SSpace) {
+        called(env, st, name, args)
+      } else {
+        match iterating_of(fname) {
+          Some(it) -> iterating(env, st, name, it, args),
+          None -> builtin(env, st, name, args),
         }
-      },
+      }
     },
     NLambda(l) -> match walked_all(env, st, args, |_i: Int| Some(Many)) {
       Err(why) -> Err(why),
@@ -1463,32 +1462,32 @@ fn callback(
         Ok(w) -> if w.calls > 0 { Err("a call back inside an iteration") }
         else { Ok({ space: w.space, holders: part_of(w), number: w.number }) },
       },
-      NVar(f) -> match f.slot {
-        Some(k) -> match slot_at(outer, k).fun {
+      NVar(f) -> {
+        let k = f.slot;
+        match slot_at(outer, k).fun {
           Some(p) -> Ok({ space: p, holders: Many, number: false }),
           None -> Err("a callback whose space is not read"),
-        },
-        None -> {
-          let name = String::of_bytes_lossy(f.name);
-          if ctor(env.cx, name) != None { Ok({ space: constant(), holders: Top, number: false }) }
-          else if name == env.own { Err("a call back inside an iteration") } else {
-            match env.known.get(name) {
-              None -> Err("a callback the bound does not read"),
-              Some(k) -> match k.anyhow {
+        }
+      },
+      NDef({ full: fname, .. }) | NCtor({ name: fname, .. }) | NBuiltin({ name: fname, .. }) -> {
+        let name = String::of_bytes_lossy(fname);
+        if ctor(env.cx, name) != None { Ok({ space: constant(), holders: Top, number: false }) }
+        else if name == env.own { Err("a call back inside an iteration") } else {
+          match env.known.get(name) {
+            None -> Err("a callback the bound does not read"),
+            Some(k) -> match k.anyhow {
+              Err(why) -> Err(why),
+              Ok(s) -> match at_args(
+                  s.space,
+                  params.map(|_p: Slot| None),
+                  params.map(|_p: Slot| None),
+                ) {
                 Err(why) -> Err(why),
-                Ok(s) -> match at_args(
-                    s.space,
-                    params.map(|_p: Slot| None),
-                    params.map(|_p: Slot| None),
-                  ) {
-                  Err(why) -> Err(why),
-                  Ok(q) ->
-                    Ok({ space: q, holders: s.holders, number: answers_number(env.cx, name) }),
-                },
+                Ok(q) -> Ok({ space: q, holders: s.holders, number: answers_number(env.cx, name) }),
               },
-            }
+            },
           }
-        },
+        }
       },
       _ -> Err("a callback the bound does not read"),
     },

@@ -346,7 +346,7 @@ From loosest to tightest binding. All binary operators are left-associative.
     conditions show an `Int` divisor is not zero.
   - Overflow, a `Decimal` result that cannot be represented exactly, and a shift count that is
     negative or at least the type's width end the program (`E0502`). These are machine limits
-    like the call depth limit, and do not appear in effect rows.
+    like running out of stack, and do not appear in effect rows.
   - `<<` discards bits shifted out. The `checked_*` builtins return `None` instead of failing
     (§12).
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
@@ -1408,9 +1408,9 @@ clause resumes somewhere other than its tail (§6.6): it runs the body on a sepa
 calls nest. A group whose `handle`s return directly, resume in tail position, or handle a raise (as
 `try` does) keeps its loop.
 
-Every other call nests, up to 10,000 deep (`E0502` beyond that): `1 + f(n - 1)`, a call inside
-`handle`, `with_hold` or a lambda, and a call of another function. Each task has its own depth
-(§9).
+Every other call nests: `1 + f(n - 1)`, a call inside `handle`, `with_hold` or a lambda, and a call
+of another function. Only the stack bounds how deep calls nest. It holds a gigabyte, and a call
+that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
 
 A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
@@ -1958,7 +1958,7 @@ pattern does not match (§5.1); `iterate` past its budget; `task.join` of a canc
 
 - A signature that leaves `abort.raise` out of its row when its body can raise is `E0302`, which
   names the operation and offers the row to write.
-- Overflow and the call depth limit end the program regardless of the row.
+- Overflow and running out of stack end the program regardless of the row.
 - A clause for `abort.raise` receives the message: `panic`'s argument, or what would otherwise be
   reported.
 - Unhandled, it is `E0501` for a failed assertion and `E0502` for anything else.
@@ -2434,13 +2434,15 @@ The report is printed as the run goes:
 
 1. what was selected and how it will run: the groups and workers, isolation, the host permissions,
    and what `--explain` says about selection;
-2. each group's results as that group finishes, in the order the groups ran, so a long run shows
-   progress and its first failure early;
+2. each group's results as that group finishes, in the order the groups ran, with the message and
+   place of each test that did not pass under its line. A long run shows progress and its first
+   failure early, and a run that ends early still shows every result it finished;
 3. the run's own figures (handshakes, the backend, simulation, and with `--explain` where the time
    went), the summary, and each failure's diagnosis.
 
-`--json` prints one object when the run ends. `--workspace` prints each package's heading before
-it runs.
+Under `--json`, items 1 and 2 go to standard error as the run goes, and one object goes to standard
+output when the run ends, in place of item 3. `--workspace` prints each package's heading before it
+runs.
 
 `--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). It
 is not a verdict: a test over it is *abandoned* (`W0612`), reported separately from failures,
@@ -2858,7 +2860,11 @@ proof may use what it promises but never unfolds its body; that package proves i
 fn` is known by its body too: a proof anywhere may unfold it, so its body and everything it reaches
 is part of what dependents are checked and proved against.
 
-**`ply prove` output.** It reports the definitions that carry no claim, then each claim's outcome.
+**`ply prove` output.** It first says how many definitions carry a claim. It then prints each
+claim's outcome as soon as the claim is decided: those the cache answered first, then the rest as
+they are proved. It ends with the definitions that no claim that holds covers, and the tally.
+Under `--json`, the lines it prints as it runs go to stderr, and the object takes the place of the
+rest (§16).
 
 - An `unproved` claim says what stands between it and a proof. Under `--json` this is `gap` (a
   sentence) and `gap_kind`: `open` (with each place the prover stopped as `stuck`);
@@ -3498,7 +3504,8 @@ color if `FORCE_COLOR` is set; otherwise none if `NO_COLOR` is set; otherwise co
 `CLICOLOR_FORCE` is set; otherwise color only on a terminal whose `TERM` is not `dumb`.
 
 **JSON.** Every command takes `--json`, and then prints exactly one compact JSON object on stdout,
-with sorted keys.
+with sorted keys. What a command prints while it runs, such as each result of `ply test` and `ply
+prove`, then goes to stderr, so a run that crashes or is stopped still shows what it finished.
 
 **Environment.** The command reads `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM`, `COLORTERM`,
 `PLY_CACHE_UPSTREAM` (§1), `PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the `PLY_C_*` variables
@@ -3540,7 +3547,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | lists the standard library's modules. `--show [NAME]` (a module's source, or a data file a module embeds), `--digest`. Used by `ply bootstrap`: `--answers DIR` (precompute every standard library module's check results into `DIR/pack`), `--answering` (print one line identifying how this `ply` checks the standard library; two `ply`s that print the same line produce the same results). No path. |
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
-| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` documents the standard library, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
+| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
 | `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |

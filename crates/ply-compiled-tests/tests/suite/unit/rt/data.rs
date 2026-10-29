@@ -15,7 +15,7 @@ type RefusedText = unsafe extern "C" fn(*mut Ctx, Word, *const u8, Word, *const 
 /// The diagnostic `refuse` leaves in a fresh context.
 fn left(refuse: impl FnOnce(&mut Ctx)) -> Diagnostic {
     let mut ctx = context_of(&[], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     refuse(&mut ctx);
     let d = ctx.take_failure().expect("a diagnostic");
     ctx.failed = 0;
@@ -117,7 +117,7 @@ type Pending = unsafe extern "C" fn(*mut Ctx, *const PlyType, Word) -> Word;
 /// for `abort.raise` takes it.
 fn failed_under_a_clause(refuse: impl FnOnce(*mut Ctx)) -> i64 {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     let c: *mut Ctx = &mut ctx;
     let failed = unsafe {
         refuse(c);

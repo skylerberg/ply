@@ -1,8 +1,8 @@
 //! Crossings: a value emitted code lays out written as PLV1 bytes the runtime reads (a lowering),
 //! or bytes the runtime wrote read into one (a lifting), by emitted code calling the natives here a
-//! part at a time. What the bytes cannot hold crosses beside them as a handle. Crossings stack in
-//! the context, so one begun inside another works on a frame of its own and leaves the outer as it
-//! found it.
+//! part at a time. What the bytes cannot hold a lowering writes as a handle, which nothing reads
+//! back. Crossings stack in the context, so one begun inside another works on a frame of its own
+//! and leaves the outer as it found it.
 //!
 //! A native that answers bytes leaves them in the context's taken bytes and answers their count;
 //! emitted code makes room for them and copies them out with [`rt_taken`] before it calls another.
@@ -92,27 +92,9 @@ impl Lowering {
     }
 }
 
-/// What crosses beside a lifting's bytes, holding a count until compiled code takes it: a runtime
-/// object, or a value the runtime kept with its type.
-pub enum Lifted {
-    Runtime(Word),
-    Carried(Carried),
-}
-
-impl Lifted {
-    fn release(self, ctx: *mut Ctx) {
-        match self {
-            Lifted::Runtime(w) => heap::release_object(ctx, w),
-            Lifted::Carried(v) => v.release(ctx),
-        }
-    }
-}
-
-/// Bytes being read, and what crosses beside them, each holding a count until compiled code takes
-/// it.
+/// Bytes being read.
 pub(crate) struct Lifting {
     r: Reader<Vec<u8>>,
-    beside: Vec<Option<Lifted>>,
     /// The name of the constructor read last.
     name: Option<Symbol>,
     /// The high word of the `Decimal` or width read last, until [`rt_in_high`] takes it.
@@ -124,27 +106,6 @@ impl Lifting {
     fn keep_high(&mut self, bits: u128) -> i64 {
         self.high = Some((bits >> 64) as u64 as i64);
         bits as u64 as i64
-    }
-
-    /// What the position the next `HANDLE` names holds, taken where it is a carried value as
-    /// `carried` says, and left where it is not.
-    fn take(&mut self, carried: bool) -> Result<Lifted, String> {
-        self.r.expect(tag::HANDLE)?;
-        let at = self.r.varint()?;
-        let slot = usize::try_from(at)
-            .ok()
-            .and_then(|at| self.beside.get_mut(at))
-            .ok_or_else(|| format!("handle {at}, which is not kept"))?;
-        match slot {
-            None => Err(format!("handle {at}, which was taken")),
-            Some(Lifted::Carried(_)) if !carried => Err(format!(
-                "handle {at}, a value kept with its type, read as a runtime object"
-            )),
-            Some(Lifted::Runtime(_)) if carried => Err(format!(
-                "handle {at}, a runtime object, read as a value kept with its type"
-            )),
-            Some(_) => Ok(slot.take().expect("the slot holds what it was matched as")),
-        }
     }
 }
 
@@ -550,29 +511,32 @@ pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     }))
 }
 
-/// A runtime object, given with the count the lifting held of it.
+// No lifting holds a handle, so these two fail the context. A builder the release built still
+// binds them.
 pub unsafe extern "C" fn rt_in_handle(ctx: *mut Ctx) -> Handle {
-    Handle::of(unsafe { &mut *ctx }.read(|l| match l.take(false)? {
-        Lifted::Runtime(w) => Ok(w),
-        Lifted::Carried(_) => unreachable!("a runtime object was taken"),
-    }))
+    Handle::of(unsafe { &mut *ctx }.read(no_handle))
 }
 
-/// A value the runtime kept with its type, such as a task's answer or a value a channel held, given
-/// with the count the lifting held of it.
 pub unsafe extern "C" fn rt_in_carried(ctx: *mut Ctx) -> Handed {
-    Handed::of(unsafe { &mut *ctx }.read(|l| match l.take(true)? {
-        Lifted::Carried(v) => Ok(v.handed().word()),
-        Lifted::Runtime(_) => unreachable!("a carried value was taken"),
-    }))
+    Handed::of(unsafe { &mut *ctx }.read(no_handle))
 }
 
-/// What a descriptor lifts by where a value of its type can hold a function, which crosses out of
-/// compiled code and never back: it fails the entry.
+fn no_handle(_: &mut Lifting) -> Result<Word, String> {
+    Err("a handle read from a lifting, which holds none".into())
+}
+
+/// What a descriptor lifts by for every type but `String`, the one type the runtime lifts: it fails
+/// the entry.
 pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
     unsafe { &mut *ctx }.fail(err_crossing(
-        "a value whose type can hold a function lifted from the runtime: a function crosses out \
-         of compiled code and never back",
+        "a value lifted through a descriptor that lifts none: the runtime lifts only a `String`",
+    ));
+}
+
+/// What a descriptor lowers by where no diagnostic shows a value of its type: it fails the entry.
+pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
+    unsafe { &mut *ctx }.fail(err_crossing(
+        "a value shown through a descriptor that does not lower it",
     ));
 }
 
@@ -613,7 +577,7 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
 pub unsafe extern "C" fn rt_lift_open(ctx: *mut Ctx, p: Addr, n: I64) {
     let c = unsafe { &mut *ctx };
     let bytes = unsafe { lent(p, n) }.to_vec();
-    c.lift_from(bytes, Vec::new());
+    c.lift_from(bytes);
 }
 
 /// Ends the innermost lifting, every byte of which must have been read.
@@ -643,35 +607,28 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
 }
 
 impl Ctx {
-    /// Begins a lifting of `bytes`, `beside` the handles they name, whose counts it takes; one that
-    /// does not open fails the context, lets `beside` go and lifts nothing, so the crossings still
-    /// nest.
-    pub fn lift_from(&mut self, bytes: Vec<u8>, mut beside: Vec<Lifted>) {
+    /// Begins a lifting of `bytes`; one that does not open fails the context and lifts nothing, so
+    /// the crossings still nest.
+    fn lift_from(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
             Err(why) => {
-                let ctx: *mut Ctx = self;
-                beside.drain(..).for_each(|b| b.release(ctx));
                 self.fail(err_crossing(&why));
                 Reader::new(codec::FORMAT.to_vec()).expect("the format alone opens")
             }
         };
         self.crossings.push(Crossing::Lifting(Lifting {
             r,
-            beside: beside.into_iter().map(Some).collect(),
             name: None,
             high: None,
         }));
     }
 
-    /// Ends the innermost lifting, letting go of what compiled code did not take of its handles;
-    /// an error where bytes are left.
+    /// Ends the innermost lifting; an error where bytes are left.
     fn close_lifting(&mut self) -> Result<(), String> {
         let Some(Crossing::Lifting(l)) = self.crossings.pop() else {
             unreachable!("the innermost crossing is a lifting");
         };
-        let ctx: *mut Ctx = self;
-        l.beside.into_iter().flatten().for_each(|b| b.release(ctx));
         l.r.end()
     }
 }
@@ -711,20 +668,14 @@ fn lowering(
 pub(crate) fn string_lifted(ctx: *mut Ctx, s: &str, string: &PlyType) -> Option<Handed> {
     let mut w = codec::Writer::new();
     w.str(s.as_bytes());
-    lifted_from(ctx, w.finish(), Vec::new(), string)
+    lifted_from(ctx, w.finish(), string)
 }
 
-/// `bytes` lifted through `ty`, `beside` the handles they name, whose counts it takes; `None` with
-/// the context failed where they do not cross.
-pub(crate) fn lifted_from(
-    ctx: *mut Ctx,
-    bytes: Vec<u8>,
-    beside: Vec<Lifted>,
-    ty: &PlyType,
-) -> Option<Handed> {
+/// `bytes` lifted through `ty`; `None` with the context failed where they do not cross.
+fn lifted_from(ctx: *mut Ctx, bytes: Vec<u8>, ty: &PlyType) -> Option<Handed> {
     let c = unsafe { &mut *ctx };
     let depth = c.crossings.len();
-    c.lift_from(bytes, beside);
+    c.lift_from(bytes);
     let w = unsafe { (ty.lift)(ctx) };
     let c = unsafe { &mut *ctx };
     if c.crossings.len() != depth + 1 {
@@ -745,7 +696,7 @@ impl Ctx {
             answers_entry: true,
             ..Lowering::new(false)
         }));
-        self.lift_from(bytes, Vec::new());
+        self.lift_from(bytes);
     }
 }
 

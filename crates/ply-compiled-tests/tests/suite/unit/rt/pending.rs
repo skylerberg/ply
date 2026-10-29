@@ -106,7 +106,7 @@ fn raised_on_keeps(ctx: &mut Ctx) {
 #[test]
 fn a_refusal_raised_on_through_the_bridge_keeps_its_note() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     refused(&mut ctx);
     raised_on_keeps(&mut ctx);
 }
@@ -115,7 +115,7 @@ fn a_refusal_raised_on_through_the_bridge_keeps_its_note() {
 #[test]
 fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     let said = "the sides differ";
     // `assert` with a message, numbered as `REFUSED` numbers it.
     let refused: unsafe extern "C" fn(*mut Ctx, Word, Word, Word, Word, Word) =
@@ -138,7 +138,7 @@ fn an_assertion_raised_on_through_the_bridge_stays_an_assertion() {
 #[test]
 fn a_clause_is_handed_the_message_of_a_raise_left_pending() {
     let mut ctx = context_of(&["abort", "raise"], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     refused(&mut ctx);
     let message = unsafe { helper::<Pending>("rt_pending_raised")(&mut ctx, &STRING_T, 0) };
     assert_eq!(ctx.failed, 0, "the message was handed over");

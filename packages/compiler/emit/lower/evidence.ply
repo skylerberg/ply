@@ -7,25 +7,22 @@
 //! words off those.
 
 import compiler.syntax.parsing (Span)
-import compiler.check.types (Type, TyCon, Row, Atom, Resource, RNamed, RSingleton, RVar, RAny,
-                             Scheme, int_type, row_empty)
-import compiler.check.infer.checker (RowArguments, Performs, PerformsAtom, simulated_names)
-import compiler.emit.typing (Filings, rows_filed_at)
-import compiler.emit.code (Code, NLabel, NVar, NUnary, NBinary, NApp, NIf, NBlock, NList, NRecord,
-                           NMatch, NPerform, NLambda, NSimulate, NParallel, NHandle, NField,
-                           NUpdate, NKnown, CodeStmt, CLet, CLetPat, CDo, CodeField, CodeArm,
-                           CodeClause, Capture, is_label_binder, labels_among)
+import compiler.check.types (Type, Row, Atom, Resource, RNamed, RSingleton, RVar, RAny, Scheme,
+                             int_type, row_empty)
+import compiler.check.infer.checker (simulated_names)
+import compiler.emit.code (Code, NLabel, NVar, NDef, NBuiltin, NPerform, NLambda, NSimulate,
+                           NHandle, CodeClause, is_label_binder, code_parts, labels_among)
 import compiler.emit.keys (RootKey, Entered, Evidence, key_rows, unspecialised)
 import compiler.emit.evidence (Own, Keyed, row_words, written_row, opened, labels_handed, keyed,
                                key_rows_of, covers, answered, ordered, evidence_type, words_apart,
                                words_carried, words_laid_type, words_laid_of, row_described_type)
 import compiler.emit.reps (Def)
 import compiler.emit.tir (Rep, RInt, RImm, Var, Arg, AVar, AInt, AZero, Op, OHandle, Static,
-                          Convention, Lent, Uses, reads)
+                          Convention, Lent, reads)
 import compiler.emit.tir.handling (HandleOp, WordsLaid, WordAt, Bridge, Unserved)
 import compiler.emit.tir.statics (StaticLaid, StaticWord, SPlain, WRaw, WField)
 import compiler.emit.lower.setting (Setting)
-import compiler.emit.lower.base (Context, Lowering, Lowered, Worded, bound_as, static_added)
+import compiler.emit.lower.base (Context, Lowering, Worded, bound_as, static_added)
 
 /// What a root of a definition is handed past its parameters: the words its row takes at the key's
 /// rows, in order; how many label parameters the definition has; how many labels the key's caller
@@ -90,13 +87,16 @@ pub fn root_opened(
   }
 }
 
-/// The state an entry's body starts in, opened as `o` says: holding, for each effect of the row
-/// filed at `at`, what the root and the real handlers it runs under perform, the object the runtime
-/// answers that effect by where nothing of the program does. Any other root as `o` says.
-pub fn entry_opened(o: { cx: Context, st: Lowering }, at: Span) -> { cx: Context, st: Lowering } =
+/// The state an entry's body starts in, opened as `o` says: holding, for each effect of what the
+/// root and the real handlers it runs under perform, `performs`, the object the runtime answers that
+/// effect by where nothing of the program does. Any other root as `o` says.
+pub fn entry_opened(
+  o: { cx: Context, st: Lowering },
+  performs: Row,
+) -> { cx: Context, st: Lowering } =
   match o.cx.key {
     Entered(_) -> {
-      let effects = filed_row(o.cx, at).atoms.fold([], |acc: List<Bytes>, a: Atom|
+      let effects = performs.atoms.fold([], |acc: List<Bytes>, a: Atom|
         if !answered(a.effect) || acc.contains(a.effect) { acc } else { acc.push(a.effect) });
       let held = effects.fold(
         { st: o.st, made: [], words: [] },
@@ -110,7 +110,7 @@ pub fn entry_opened(o: { cx: Context, st: Lowering }, at: Span) -> { cx: Context
                 evidence_type(),
                 RImm,
                 Op({ op: OHandle(op), args: [], uses: reads(0) }),
-                at,
+                o.cx.body.span,
               );
               { st: b.st, made: acc.made.push({ op: op, arg: b.arg }), arg: b.arg }
             },
@@ -184,18 +184,13 @@ pub fn words_read(
   }
 }
 
-/// The row the checker filed at `at` for what a lambda, a region's body or a branch written there
-/// performs; the empty row where it filed none.
-pub fn filed_row(cx: Context, at: Span) -> Row =
-  match rows_filed_at(cx.filed, at.site) { Some(Performs(r)) -> r, _ -> row_empty() }
-
-/// The row lambdas `codes` perform, as the checker filed each one's: their atoms once each, and the
-/// row variable the first that ends in one ends in.
-pub fn performed_by(cx: Context, codes: List<Code>) -> Row =
+/// The row lambdas `codes` perform: their atoms once each, and the row variable the first that
+/// ends in one ends in.
+pub fn performed_by(codes: List<Code>) -> Row =
   codes.fold(row_empty(), |acc: Row, c: Code|
     match c.node {
       NLambda(l) -> {
-        let r = filed_row(cx, l.at);
+        let r = l.row;
         {
           atoms: r.atoms.fold(acc.atoms, |xs: List<Atom>, a: Atom|
             if xs.contains(a) { xs } else { xs.push(a) }),
@@ -205,51 +200,60 @@ pub fn performed_by(cx: Context, codes: List<Code>) -> Row =
       _ -> acc,
     })
 
-/// The row a call of a builtin generic over one row fills it with, its name written at `callee`: what
-/// each function the builtin calls performs; the empty row where the checker filed none.
-pub fn builtin_row(cx: Context, callee: Span) -> Row =
-  match rows_filed_at(cx.filed, callee.site) {
-    Some(RowArguments(rs)) -> match rs.at(0) { Some(r) -> r, None -> row_empty() },
+/// The row a call of a builtin generic over one row fills it with, the builtin read as `func`: what
+/// each function the builtin calls performs; the empty row for any other callee.
+pub fn builtin_row(func: Code) -> Row =
+  match func.node {
+    NBuiltin(b) -> match b.rows.at(0) { Some(r) -> r, None -> row_empty() },
     _ -> row_empty(),
   }
 
-/// The words a row the checker filed at `at` takes, in the root's numbering: what a lambda, a clause
-/// or a call through a function value performs there; none where it filed none.
-pub fn filed_words(cx: Context, at: Span) -> Option<List<Own>> / {abort.raise} =
-  match rows_filed_at(cx.filed, at.site) {
-    Some(Performs(row)) -> Some(row_words(row, cx.rows, cx.labels)),
-    _ -> None,
+/// The rows node `c` holds of its own: what a lambda, a clause, a `return` clause or a region
+/// performs, what a read fills its callee's row variables with, and the atom a perform performs.
+fn rows_of(c: Code) -> { rows: List<Row>, atoms: List<Atom> } =
+  match c.node {
+    NLambda(l) -> { rows: [l.row], atoms: [] },
+    NSimulate(x) -> { rows: [x.row], atoms: [] },
+    NDef(d) -> { rows: d.rows, atoms: [] },
+    NBuiltin(b) -> { rows: b.rows, atoms: [] },
+    NPerform(p) -> { rows: [], atoms: [p.atom] },
+    NHandle(h) ->
+      {
+        rows: h.clauses.fold(
+          match h.ret { Some(r) -> [h.row, r.row], None -> [h.row] },
+          |acc: List<Row>, cl: CodeClause| acc.push(cl.row),
+        ),
+        atoms: [],
+      },
+    _ -> { rows: [], atoms: [] },
   }
 
-/// Whether every row the checker filed for a node of `c` names only the effects and resources it
-/// writes, no row variable and no label variable: the rows of a lambda another root may run in
-/// place, which read alike in any root's numbering.
-pub fn rows_static(filed: Filings, c: Code) -> Bool / {abort.raise} =
-  (match filed.rows.get(c.span.site) {
-      Some(Performs(r)) -> static_row(r),
-      Some(RowArguments(rs)) -> rs.all(static_row),
-      Some(PerformsAtom(a)) -> match a.resource { RVar(_) -> false, _ -> true },
-      None -> true,
-    })
-    && code_parts(c).all(|x: Code| rows_static(filed, x))
+/// Whether every row a node of `c` holds names only the effects and resources it writes, no row
+/// variable and no label variable: the rows of a lambda another root may run in place, which read
+/// alike in any root's numbering.
+pub fn rows_static(c: Code) -> Bool / {abort.raise} = {
+  let own = rows_of(c);
+  own.rows.all(static_row)
+    && own.atoms.all(|a: Atom| match a.resource { RVar(_) -> false, _ -> true })
+    && code_parts(c).all(rows_static)
+}
 
 fn static_row(r: Row) -> Bool =
   r.tail == None && r.atoms.all(|a: Atom| match a.resource { RVar(_) -> false, _ -> true })
 
 /// The labels of the root's numbering a body written as `c` reads, each once, added to `acc`: those
-/// the rows the checker filed for its nodes name, through the row variables at `cx.rows` too, and
-/// each label parameter it names.
+/// the rows its nodes hold name, through the row variables at `cx.rows` too, and each label
+/// parameter it names.
 pub fn labels_read(cx: Context, c: Code, acc: List<Int>) -> List<Int> = {
   let places = |ws: List<Own>|
     ws.fold([], |out: List<Int>, o: Own|
       match o.evidence.resource { RVar(p) -> out.push(p), _ -> out });
-  let filed = match cx.filed.rows.get(c.span.site) {
-    Some(Performs(r)) -> places(row_words(r, cx.rows, cx.labels)),
-    Some(RowArguments(rs)) ->
-      rs.fold([], |out: List<Int>, r: Row| out.concat(places(row_words(r, cx.rows, cx.labels)))),
-    Some(PerformsAtom(a)) -> match a.resource { RVar(p) -> [p], _ -> [] },
-    None -> [],
-  };
+  let own = rows_of(c);
+  let held = own.rows.fold(
+    own.atoms.fold([], |out: List<Int>, a: Atom|
+      match a.resource { RVar(p) -> out.push(p), _ -> out }),
+    |out: List<Int>, r: Row| out.concat(places(row_words(r, cx.rows, cx.labels))),
+  );
   let named = match c.node {
     NVar(v) ->
       range(0, cx.label_names.len()).filter(|i: Int|
@@ -260,46 +264,16 @@ pub fn labels_read(cx: Context, c: Code, acc: List<Int>) -> List<Int> = {
     _ -> [],
   };
   code_parts(c).fold(
-    filed.concat(named).fold(acc, |out: List<Int>, p: Int|
+    held.concat(named).fold(acc, |out: List<Int>, p: Int|
       if out.contains(p) { out } else { out.push(p) }),
     |out: List<Int>, x: Code| labels_read(cx, x, out),
   )
 }
 
-/// The code `c` holds, each part once.
-fn code_parts(c: Code) -> List<Code> =
-  match c.node {
-    NUnary(u) -> [u.operand],
-    NBinary(b) -> [b.lhs, b.rhs],
-    NApp(a) -> a.args.push(a.func),
-    NIf(i) -> [i.cond, i.then_branch, i.else_branch],
-    NBlock(b) ->
-      b.stmts.fold(match b.tail { Some(t) -> [t], None -> [] }, |acc: List<Code>, s: CodeStmt|
-        acc.push(match s { CLet(l) -> l.value, CLetPat(l) -> l.value, CDo(d) -> d.code })),
-    NList(l) -> l.items,
-    NRecord(r) -> r.fields.map(|f: CodeField| f.value),
-    NMatch(m) ->
-      m.arms.fold([m.scrutinee], |acc: List<Code>, a: CodeArm|
-        List::push(match a.guard { Some(g) -> acc.push(g), None -> acc }, a.body)),
-    NPerform(p) -> match p.label { Some(l) -> p.args.push(l), None -> p.args },
-    NLambda(l) -> [l.body],
-    NSimulate(s) -> [s.body],
-    NParallel(p) -> p.branches,
-    NHandle(h) ->
-      h.clauses.fold(
-        match h.ret { Some(r) -> [h.body, r.body], None -> [h.body] },
-        |acc: List<Code>, cl: CodeClause| acc.push(cl.body),
-      ),
-    NField(f) -> [f.base],
-    NUpdate(u) -> u.sets.map(|f: CodeField| f.value).push(u.base),
-    NKnown(k) -> [k.lambda.body],
-    _ -> [],
-  }
-
-/// The words a lambda, a clause or a `return` clause written at `at` is handed, as the checker filed
-/// its row there; none where it filed none, which only the runtime calls.
-pub fn words_at(cx: Context, at: Span) -> List<Own> / {abort.raise} =
-  match filed_words(cx, at) { Some(ws) -> ws, None -> [] }
+/// The words a lambda, a clause or a `return` clause performing `row` is handed, in the root's
+/// numbering.
+pub fn words_of(cx: Context, row: Row) -> List<Own> / {abort.raise} =
+  row_words(row, cx.rows, cx.labels)
 
 /// The word the body holds for each of `wanted`, in order. One through a row variable is the word
 /// the frame was handed through it for the same, the `n`th of those alike for the `n`th wanted; any
@@ -356,20 +330,16 @@ pub type Handing = {
 /// A word a callee takes, as its own numbering and as its caller's say what it answers.
 type Paired = { callee: Evidence, wanted: Own }
 
-/// What a call of `d` at `ref`, filling its labels with `labels`, hands it, as `Handing` says.
+/// What a call of `d`, read as `func`, filling its labels with `labels`, hands it, as `Handing`
+/// says.
 pub fn handing(
   cx: Context,
   st: Lowering,
   d: Def,
-  ref: Span,
+  func: Code,
   labels: List<Code>,
 ) -> Handing / {abort.raise} =
-  handing_filled(
-    cx,
-    d,
-    match rows_filed_at(cx.filed, ref.site) { Some(RowArguments(rs)) -> rs, _ -> [] },
-    labels,
-  )
+  handing_filled(cx, d, match func.node { NDef(r) -> r.rows, _ -> [] }, labels)
 
 /// What a call of `d` filling its row variables with `filled`, its labels with `labels`, hands it,
 /// as `Handing` says.

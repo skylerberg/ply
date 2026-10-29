@@ -147,7 +147,7 @@ fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
 /// A block of two [`APART`] branches: how many of them left the thread `ctx` runs on.
 fn left_apart(ctx: &mut Ctx) -> Word {
     let c: *mut Ctx = ctx;
-    ctx.begin(1_000);
+    ctx.begin();
     let mut slots = [0; 2].map(|_| alloc(c, PAIR, &[&raw const APART as Word, c as Word]));
     unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
     assert_eq!(ctx.failed, 0);
@@ -173,7 +173,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
         "a block entered on a thread of its own"
     );
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let [a, b] = branches(&mut ctx, [&ENTERS, &ENTERS]);
     assert_eq!(
         held(a) + held(b),
@@ -190,7 +190,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
 #[test]
 fn branches_emitted_code_made_answer_in_their_slots_and_are_let_go() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let [a, b] = branches(&mut ctx, [&FIRST, &SECOND]);
     assert_eq!(ctx.failed, 0);
     assert_eq!((held(a), held(b)), (1, 2));
@@ -208,7 +208,7 @@ fn a_branch_crossing_threads_is_marked_by_its_descriptor() {
         return;
     }
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let [a, b] = branches(&mut ctx, [&WALKS, &SECOND]);
     assert!(
         WALKED.load(Ordering::SeqCst),
@@ -225,7 +225,7 @@ fn a_branch_crossing_threads_is_marked_by_its_descriptor() {
 #[test]
 fn a_failing_branch_in_turn_leaves_0_and_those_after_it_are_let_go_unrun() {
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let slots = branches(&mut ctx, [&FAILS_HERE, &UNRUN]);
     assert_eq!(ctx.failed, 1);
     assert_eq!(slots, [0, 0]);
@@ -243,7 +243,7 @@ fn a_branch_that_answered_past_one_that_failed_is_left_for_emitted_code() {
         return;
     }
     let mut ctx = context();
-    ctx.begin(1_000);
+    ctx.begin();
     let [failed, answered] = branches(&mut ctx, [&FAILS, &SECOND]);
     assert_eq!((ctx.failed, failed), (1, 0));
     assert_eq!(held(answered), 2);
