@@ -103,6 +103,25 @@ pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, ty: t, ro
 /// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
 pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpr<t>, span: Span }
 
+/// Which of its owner's bodies a typed body is: a definition's body, one of its spec clauses by
+/// its place among them, or its measure; a test's run or the listing of its cases; a law's guard
+/// or the proposition it states.
+pub type BodyPart =
+  | WholeBody
+  | ClauseBody(Int)
+  | MeasureBody
+  | TestRun
+  | CaseListing
+  | LawGuard
+  | LawBody
+
+/// A body the check walked, typed: what owns it, which of its bodies it is, and its tree.
+pub type TypedBody<t> = { owner: Bytes, part: BodyPart, body: TypedExpr<t> }
+
+derive bin for BodyPart
+
+derive bin for TypedBody
+
 derive bin for TypedExpr
 
 derive bin for TypedNode
@@ -560,4 +579,418 @@ pub fn defaults_placed(
           }),
       )
     }
+  }
+
+// --- Writing a tree's types another way ------------------------------------------------------------
+
+/// How `retyped` writes a tree's types: `ty` writes one, threading a state through the types in
+/// the order a walk meets them; `row` writes a row and `atom` an atom; `read` settles a read before
+/// its types and rows are written.
+pub type Retyping<a, b, s> = {
+  ty: (a, s) -> { ty: b, state: s } / {abort.raise},
+  row: (Row) -> Row / {abort.raise},
+  atom: (Atom) -> Atom / {abort.raise},
+  read: (Reading<a>) -> Reading<a> / {abort.raise},
+}
+
+/// What retyping a part found, and the state after it.
+pub type Retyped<x, s> = { out: x, state: s }
+
+/// `e` with every type written as `r` writes it.
+pub fn retyped<a, b, s>(
+  e: TypedExpr<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedExpr<b>, s> / {abort.raise} = {
+  let node = retyped_node(e.node, state, r);
+  let t = (r.ty)(e.ty, node.state);
+  { out: { node: node.out, span: e.span, ty: t.ty }, state: t.state }
+}
+
+fn retyped_all<a, b, s>(
+  xs: List<TypedExpr<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedExpr<b>>, s> / {abort.raise} =
+  xs.fold({ out: [], state: state }, |acc: Retyped<List<TypedExpr<b>>, s>, x: TypedExpr<a>| {
+    let o = retyped(x, acc.state, r);
+    { out: acc.out.push(o.out), state: o.state }
+  })
+
+fn retyped_opt<a, b, s>(
+  x: Option<TypedExpr<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Option<TypedExpr<b>>, s> / {abort.raise} =
+  match x {
+    Some(y) -> {
+      let o = retyped(y, state, r);
+      { out: Some(o.out), state: o.state }
+    },
+    None -> { out: None, state: state },
+  }
+
+fn retyped_types<a, b, s>(
+  tys: List<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<b>, s> / {abort.raise} =
+  tys.fold({ out: [], state: state }, |acc: Retyped<List<b>, s>, t: a| {
+    let o = (r.ty)(t, acc.state);
+    { out: acc.out.push(o.ty), state: o.state }
+  })
+
+fn retyped_param<a, b, s>(
+  p: TypedParam<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedParam<b>, s> / {abort.raise} = {
+  let t = (r.ty)(p.ty, state);
+  { out: { name: p.name, ty: t.ty, span: p.span }, state: t.state }
+}
+
+fn retyped_params<a, b, s>(
+  ps: List<TypedParam<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedParam<b>>, s> / {abort.raise} =
+  ps.fold({ out: [], state: state }, |acc: Retyped<List<TypedParam<b>>, s>, p: TypedParam<a>| {
+    let o = retyped_param(p, acc.state, r);
+    { out: acc.out.push(o.out), state: o.state }
+  })
+
+fn retyped_param_opt<a, b, s>(
+  p: Option<TypedParam<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Option<TypedParam<b>>, s> / {abort.raise} =
+  match p {
+    Some(q) -> {
+      let o = retyped_param(q, state, r);
+      { out: Some(o.out), state: o.state }
+    },
+    None -> { out: None, state: state },
+  }
+
+fn retyped_fields<a, b, s>(
+  fs: List<TypedField<a>>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<List<TypedField<b>>, s> / {abort.raise} =
+  fs.fold({ out: [], state: state }, |acc: Retyped<List<TypedField<b>>, s>, f: TypedField<a>| {
+    let o = retyped(f.value, acc.state, r);
+    { out: acc.out.push({ name: f.name, value: o.out }), state: o.state }
+  })
+
+fn retyped_thunk<a, b, s>(
+  t: TypedThunk<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedThunk<b>, s> / {abort.raise} = {
+  let o = retyped(t.body, state, r);
+  { out: { body: o.out, row: (r.row)(t.row) }, state: o.state }
+}
+
+fn retyped_reading<a, b, s>(
+  read: Reading<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<Reading<b>, s> / {abort.raise} =
+  match (r.read)(read) {
+    ReadLocal(n) -> { out: ReadLocal(n), state: state },
+    ReadDefinition(d) -> {
+      let args = retyped_types(d.args, state, r);
+      {
+        out: ReadDefinition({
+          full: d.full,
+          args: args.out,
+          rows: d.rows.map(r.row),
+          quantified: d.quantified,
+        }),
+        state: args.state,
+      }
+    },
+    ReadConstructor(c) -> {
+      let args = retyped_types(c.args, state, r);
+      {
+        out: ReadConstructor({ sum: c.sum, name: c.name, case: c.case, args: args.out }),
+        state: args.state,
+      }
+    },
+    ReadBuiltin(f) -> {
+      let args = retyped_types(f.args, state, r);
+      {
+        out: ReadBuiltin({ name: f.name, args: args.out, rows: f.rows.map(r.row) }),
+        state: args.state,
+      }
+    },
+  }
+
+fn retyped_pattern<a, b, s>(
+  p: TypedPattern<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedPattern<b>, s> / {abort.raise} = {
+  let each = |ps: List<TypedPattern<a>>, st: s|
+    ps.fold({ out: [], state: st }, |acc: Retyped<List<TypedPattern<b>>, s>, x: TypedPattern<a>| {
+      let o = retyped_pattern(x, acc.state, r);
+      { out: acc.out.push(o.out), state: o.state }
+    });
+  match p {
+    TypedWild -> { out: TypedWild, state: state },
+    TypedBinder(v) -> {
+      let t = (r.ty)(v.ty, state);
+      { out: TypedBinder({ name: v.name, ty: t.ty, span: v.span }), state: t.state }
+    },
+    TypedLitPattern(l) -> { out: TypedLitPattern(l), state: state },
+    TypedRange(g) -> { out: TypedRange(g), state: state },
+    TypedCase(c) -> {
+      let args = each(c.args, state);
+      {
+        out: TypedCase({ sum: c.sum, name: c.name, case: c.case, args: args.out }),
+        state: args.state,
+      }
+    },
+    TypedRecordPattern(rp) -> {
+      let fields = rp.fields.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedFieldPattern<b>>, s>, f: TypedFieldPattern<a>| {
+          let o = retyped_pattern(f.pat, acc.state, r);
+          { out: acc.out.push({ name: f.name, pat: o.out }), state: o.state }
+        },
+      );
+      { out: TypedRecordPattern({ fields: fields.out, rest: rp.rest }), state: fields.state }
+    },
+    TypedListPattern(lp) -> {
+      let items = each(lp.items, state);
+      match lp.rest {
+        Some(x) -> {
+          let o = retyped_pattern(x, items.state, r);
+          { out: TypedListPattern({ items: items.out, rest: Some(o.out) }), state: o.state }
+        },
+        None -> { out: TypedListPattern({ items: items.out, rest: None }), state: items.state },
+      }
+    },
+    TypedOr(alts) -> {
+      let o = each(alts, state);
+      { out: TypedOr(o.out), state: o.state }
+    },
+  }
+}
+
+fn retyped_stmt<a, b, s>(
+  stmt: TypedStmt<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedStmt<b>, s> / {abort.raise} =
+  match stmt {
+    TypedLet(l) -> {
+      let p = retyped_pattern(l.pat, state, r);
+      let v = retyped(l.value, p.state, r);
+      { out: TypedLet({ pat: p.out, value: v.out, span: l.span }), state: v.state }
+    },
+    TypedLetElse(l) -> {
+      let p = retyped_pattern(l.pat, state, r);
+      let v = retyped(l.value, p.state, r);
+      let f = retyped(l.fallback, v.state, r);
+      {
+        out: TypedLetElse({ pat: p.out, value: v.out, fallback: f.out, span: l.span }),
+        state: f.state,
+      }
+    },
+    TypedDo(x) -> {
+      let o = retyped(x, state, r);
+      { out: TypedDo(o.out), state: o.state }
+    },
+    TypedAssign(asg) -> {
+      let o = retyped(asg.value, state, r);
+      { out: TypedAssign({ name: asg.name, value: o.out, span: asg.span }), state: o.state }
+    },
+  }
+
+fn retyped_clause<a, b, s>(
+  c: TypedClause<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedClause<b>, s> / {abort.raise} = {
+  let params = retyped_params(c.params, state, r);
+  let label = retyped_param_opt(c.label, params.state, r);
+  let resume = retyped_param_opt(c.resume, label.state, r);
+  let body = retyped(c.body, resume.state, r);
+  let t = (r.ty)(c.ty, body.state);
+  {
+    out: {
+      effect: c.effect,
+      op: c.op,
+      resource: c.resource,
+      every_label: c.every_label,
+      params: params.out,
+      label: label.out,
+      resume: resume.out,
+      body: body.out,
+      ty: t.ty,
+      row: (r.row)(c.row),
+      resumed: (r.row)(c.resumed),
+      span: c.span,
+    },
+    state: t.state,
+  }
+}
+
+fn retyped_node<a, b, s>(
+  node: TypedNode<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedNode<b>, s> / {abort.raise} =
+  match node {
+    TypedLit(l) -> { out: TypedLit(l), state: state },
+    TypedRead(read) -> {
+      let o = retyped_reading(read, state, r);
+      { out: TypedRead(o.out), state: o.state }
+    },
+    TypedUnary(u) -> {
+      let o = retyped(u.operand, state, r);
+      { out: TypedUnary({ op: u.op, operand: o.out }), state: o.state }
+    },
+    TypedBinary(bin) -> {
+      let l = retyped(bin.lhs, state, r);
+      let rh = retyped(bin.rhs, l.state, r);
+      { out: TypedBinary({ op: bin.op, lhs: l.out, rhs: rh.out }), state: rh.state }
+    },
+    TypedCall(c) -> {
+      let f = retyped(c.callee, state, r);
+      let args = retyped_all(c.args, f.state, r);
+      { out: TypedCall({ callee: f.out, args: args.out }), state: args.state }
+    },
+    TypedIf(i) -> {
+      let c = retyped(i.cond, state, r);
+      let t = retyped(i.then_branch, c.state, r);
+      let el = retyped(i.else_branch, t.state, r);
+      { out: TypedIf({ cond: c.out, then_branch: t.out, else_branch: el.out }), state: el.state }
+    },
+    TypedMatch(m) -> {
+      let sc = retyped(m.scrutinee, state, r);
+      let arms = m.arms.fold(
+        { out: [], state: sc.state },
+        |acc: Retyped<List<TypedArm<b>>, s>, arm: TypedArm<a>| {
+          let p = retyped_pattern(arm.pat, acc.state, r);
+          let g = retyped_opt(arm.guard, p.state, r);
+          let body = retyped(arm.body, g.state, r);
+          { out: acc.out.push({ pat: p.out, guard: g.out, body: body.out }), state: body.state }
+        },
+      );
+      { out: TypedMatch({ scrutinee: sc.out, arms: arms.out }), state: arms.state }
+    },
+    TypedBlock(blk) -> {
+      let stmts = blk.stmts.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedStmt<b>>, s>, x: TypedStmt<a>| {
+          let o = retyped_stmt(x, acc.state, r);
+          { out: acc.out.push(o.out), state: o.state }
+        },
+      );
+      let tail = retyped_opt(blk.tail, stmts.state, r);
+      { out: TypedBlock({ stmts: stmts.out, tail: tail.out }), state: tail.state }
+    },
+    TypedList(xs) -> {
+      let o = retyped_all(xs, state, r);
+      { out: TypedList(o.out), state: o.state }
+    },
+    TypedRecord(fs) -> {
+      let o = retyped_fields(fs, state, r);
+      { out: TypedRecord(o.out), state: o.state }
+    },
+    TypedUpdate(u) -> {
+      let base = retyped(u.base, state, r);
+      let sets = retyped_fields(u.sets, base.state, r);
+      { out: TypedUpdate({ base: base.out, sets: sets.out }), state: sets.state }
+    },
+    TypedFieldRead(f) -> {
+      let base = retyped(f.base, state, r);
+      { out: TypedFieldRead({ base: base.out, field: f.field }), state: base.state }
+    },
+    TypedPerform(p) -> {
+      let args = retyped_all(p.args, state, r);
+      {
+        out: TypedPerform({
+          effect: p.effect,
+          op: p.op,
+          resource: p.resource,
+          atom: (r.atom)(p.atom),
+          args: args.out,
+        }),
+        state: args.state,
+      }
+    },
+    TypedLambda(l) -> {
+      let params = retyped_params(l.params, state, r);
+      let body = retyped(l.body, params.state, r);
+      {
+        out: TypedLambda({ params: params.out, body: body.out, row: (r.row)(l.row) }),
+        state: body.state,
+      }
+    },
+    TypedSimulate(t) -> {
+      let o = retyped_thunk(t, state, r);
+      { out: TypedSimulate(o.out), state: o.state }
+    },
+    TypedParallel(ts) -> {
+      let o = ts.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedThunk<b>>, s>, t: TypedThunk<a>| {
+          let x = retyped_thunk(t, acc.state, r);
+          { out: acc.out.push(x.out), state: x.state }
+        },
+      );
+      { out: TypedParallel(o.out), state: o.state }
+    },
+    TypedHandle(h) -> {
+      let vars = h.vars.fold(
+        { out: [], state: state },
+        |acc: Retyped<List<TypedHandlerVar<b>>, s>, v: TypedHandlerVar<a>| {
+          let init = retyped(v.init, acc.state, r);
+          let t = (r.ty)(v.ty, init.state);
+          {
+            out: acc.out.push({ name: v.name, ty: t.ty, init: init.out, span: v.span }),
+            state: t.state,
+          }
+        },
+      );
+      let body = retyped(h.body, vars.state, r);
+      let clauses = h.clauses.fold(
+        { out: [], state: body.state },
+        |acc: Retyped<List<TypedClause<b>>, s>, c: TypedClause<a>| {
+          let o = retyped_clause(c, acc.state, r);
+          { out: acc.out.push(o.out), state: o.state }
+        },
+      );
+      let ret: Retyped<Option<TypedReturn<b>>, s> = match h.ret {
+        Some(rc) -> {
+          let binder = retyped_param(rc.binder, clauses.state, r);
+          let rbody = retyped(rc.body, binder.state, r);
+          let t = (r.ty)(rc.ty, rbody.state);
+          {
+            out: Some({
+              binder: binder.out,
+              body: rbody.out,
+              ty: t.ty,
+              row: (r.row)(rc.row),
+              span: rc.span,
+            }),
+            state: t.state,
+          }
+        },
+        None -> { out: None, state: clauses.state },
+      };
+      {
+        out: TypedHandle({
+          body: body.out,
+          row: (r.row)(h.row),
+          clauses: clauses.out,
+          ret: ret.out,
+          vars: vars.out,
+        }),
+        state: ret.state,
+      }
+    },
   }
