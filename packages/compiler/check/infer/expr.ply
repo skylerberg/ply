@@ -1,6 +1,6 @@
 //! Expressions inferred: what a place expects, patterns and matches, effects and their handlers.
 
-import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare, qname_text,
+import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare, qname_text, bare,
                                 prelude_binder, made_at, minted, role_member_on, role_member_callee,
                                 role_hold_acquire, role_hold_acquire_read, role_hold_release,
                                 role_hold_release_read, role_hold_open, role_hold_close,
@@ -32,10 +32,11 @@ import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, Ty
                              ints_union, subst_new, mark_rigid_ty, mark_rigid_row, is_rigid_row,
                              shallow, resolved_tail, solve_continuation_row, free_vars, unify,
                              unify_row, covariant_con, env_push, env_pop, env_bind, env_lookup,
-                             env_local, env_depth_of, env_locals, instantiate_with, instantiate,
-                             rename_scheme, at_arguments, region_mark, written_label, leaving_type,
-                             label_type, resolve_atom, atom_text, resource_text, type_text,
-                             row_text, printer_new, print_ty, print_row, TyNominal, record_fields)
+                             env_local, env_locals, instantiate_with, instantiate, rename_scheme,
+                             at_arguments, region_mark, written_label, leaving_type, label_type,
+                             resolve_atom, atom_text, resource_text, type_text, row_text,
+                             printer_new, print_ty, print_row, TyNominal, record_fields, InScope,
+                             env_depth)
 import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_fix, insertion,
                                       ValueSpace, EffectSpace, lookup, lookup_declared,
                                       error_with_labels, error_at, label_at, backticked,
@@ -43,6 +44,7 @@ import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_
 import compiler.check.resolve.scopes (find, closed_notes, find_of_type, declaring_type, of_binder,
                                       of_module)
 import compiler.check.resolve.defaults (filled_args)
+import compiler.check.resolve.bindings (expression_binders)
 import compiler.check.semantics (Element, prelude_iterates)
 import std.bytes
 import std.bytes (ascii_of_int)
@@ -51,27 +53,27 @@ import std.string
 import compiler.check.guards
 import compiler.check.guards (Guards, Reader, Local, Elsewhere)
 import compiler.check.infer.checker (OpInfo, EffectInfo, DefConstraint, NumericInfo, Misses,
-                                     RaiseWhy, Unshown, ZeroDivisor, DirectPerform, OpaquePerform,
-                                     PerformSource, PerformThroughArgs, PerformVia, PerformSite,
-                                     Maybe, MemberSite, OpKey, BitOp, ConcatSite, ColumnsSite,
-                                     UpdateField, UpdateSite, LabelApplication, Assumed, ClauseSite,
-                                     SpawnSite, HandoffSite, OpenRegion, RegionSite, Crossing,
-                                     RigidParam, ConstraintSite, GroupDef, Checker, Assignable,
-                                     barred, unbarred, Inferred, WithTy, WithVar, HoleSite, WithRow,
-                                     WithName, Expected, WithKey, WithHit, WithResource,
-                                     WithBodyRow, Fill, RowFound, ReadOf, RowOf, AtomOf, FilledOf,
-                                     hold, hold_atom, is_region_effect, location_of, module_name,
-                                     scope_of, report, report_error_at, report_error_at_and,
-                                     err_labels, backticked_text, plural, supplied, new_ty,
-                                     new_ty_var, new_row, new_row_var, resolve, resolve_row_in,
-                                     with_unified, is_prelude_effect, seed_atom, abort_atom,
-                                     builtin_type_arity, ctor_of, effect_of, def_of,
-                                     simulated_atoms, mode_eq, lit_type, record_site, record_over,
-                                     ord_needs, binder_key)
+                                     LocalKey, GlobalKey, HandlerVariable, RaiseWhy, Unshown,
+                                     ZeroDivisor, DirectPerform, OpaquePerform, PerformSource,
+                                     PerformThroughArgs, PerformVia, PerformSite, Maybe, MemberSite,
+                                     OpKey, BitOp, ConcatSite, ColumnsSite, UpdateField, UpdateSite,
+                                     LabelApplication, Assumed, ClauseSite, SpawnSite, HandoffSite,
+                                     OpenRegion, RegionSite, Crossing, RigidParam, ConstraintSite,
+                                     GroupDef, Checker, Assignable, barred, unbarred, Inferred,
+                                     WithTy, WithVar, HoleSite, WithRow, WithName, Expected,
+                                     WithKey, WithHit, WithResource, WithBodyRow, Fill, RowFound,
+                                     ReadOf, RowOf, AtomOf, FilledOf, hold, hold_atom,
+                                     is_region_effect, location_of, module_name, scope_of, report,
+                                     report_error_at, report_error_at_and, err_labels,
+                                     backticked_text, plural, supplied, new_ty, new_ty_var, new_row,
+                                     new_row_var, resolve, resolve_row_in, with_unified,
+                                     is_prelude_effect, seed_atom, abort_atom, builtin_type_arity,
+                                     ctor_of, effect_of, def_of, simulated_atoms, mode_eq, lit_type,
+                                     record_site, record_over, ord_needs, binder_key)
 import compiler.check.infer.names (value_key, Elsewise, Found, Unnamed, of_language_type,
                                    declared_value, ctor_name, unknown_name, unknown_name_said,
                                    kept_named, language_function, module_declares, no_function_said,
-                                   written_binder, simple_name_of)
+                                   written_binder, simple_name_of, local_at)
 import compiler.check.infer.declarations (conv_type, op_named, effect_name, duplicate, assume,
                                           hold_written, open_region_named, rigid_params,
                                           assumed_for, OrderedPart, own_parts, note_parts, Judged,
@@ -84,11 +86,12 @@ import compiler.check.infer.coverage (integer_of, CoveragePattern, check_exhaust
 fn reader_of(checker: Checker) -> Reader =
   {
     name: |q: QName|
-      if !is_bare(q) { Elsewhere } else {
-        match env_local(checker.env, q.name.name) {
-          Some(b) -> Local({ stamp: b.stamp, ty: b.scheme.ty }),
+      match local_at(checker, q) {
+        Some(binder) -> match env_local(checker.env, binder) {
+          Some(l) -> Local({ binder: binder, ty: l.scheme.ty }),
           None -> Elsewhere,
-        }
+        },
+        None -> Elsewhere,
       },
     head: |ty: Type| shallow(checker.subst, ty),
     builtin: |f: Expr| prelude_named(checker, f),
@@ -110,16 +113,16 @@ fn leaving(checker: Checker, before: Guards) -> Checker =
 /// A `let` of one name is known as what its value reads as where the value was written.
 fn known_as(before: Checker, bound: Checker, pat: Pattern, value: Expr) -> Checker / {abort.raise} =
   match pat {
-    PVar(v) -> match env_local(bound.env, v.name.name) {
+    PVar(v) -> match env_local(bound.env, v.name.span.site) {
       None -> bound,
-      Some(b) -> {
+      Some(_) -> {
         // The names are those before the `let`, and the calls those its value made.
         let r = guards::read(
           { ..reader_of(before), on_value: reader_of(bound).on_value },
           bound.guards,
           value,
         );
-        { ..bound, guards: guards::bind(r.g, b.stamp, r.value) }
+        { ..bound, guards: guards::bind(r.g, v.name.span.site, r.value) }
       },
     },
     _ -> bound,
@@ -178,20 +181,13 @@ fn requires_shown(
 
 fn callee_source(checker: Checker, func: Expr) -> PerformSource / {abort.raise} =
   match func {
-    EVar(v) -> {
-      let depth = if is_bare(v.name) { env_depth_of(checker.env, v.name.name.name) } else { None };
-      match depth {
-        Some(d) -> if d > 0 { OpaquePerform } else {
-          // A builtin is bound in no module, so it is named as written.
-          match declared_value(checker, v.name) {
-            Some(n) -> PerformVia(n),
-            None -> PerformVia(v.name.name.name),
-          }
-        },
-        None -> match declared_value(checker, v.name) {
-          Some(n) -> PerformVia(n),
-          None -> PerformThroughArgs,
-        },
+    EVar(v) -> if local_at(checker, v.name) != None { OpaquePerform } else {
+      match declared_value(checker, v.name) {
+        Some(n) -> PerformVia(n),
+        // A builtin is bound in no module, so it is named as written.
+        None -> if is_bare(v.name) && env_lookup(checker.env, v.name.name.name) != None {
+          PerformVia(v.name.name.name)
+        } else { PerformThroughArgs },
       }
     },
     _ -> OpaquePerform,
@@ -776,11 +772,8 @@ fn columns_refused(checker: Checker, span: Span, why: Bytes) -> Checker =
     b"an `Array<T>` holds any type",
   ])
 
-fn bind_all(
-  checker: Checker,
-  bindings: List<{ name: Bytes, ty: Type }>,
-) -> Checker / {abort.raise} =
-  bindings.fold(checker, |c: Checker, b: { name: Bytes, ty: Type }|
+fn bind_all(checker: Checker, bindings: List<Binder>) -> Checker / {abort.raise} =
+  bindings.fold(checker, |c: Checker, b: Binder|
     { ..c, env: env_bind(c.env, b.name, monomorphic(b.ty)) })
 
 // --- What a place expects ----------------------------------------------------------------------
@@ -984,7 +977,11 @@ pub fn infer_whole(
     checker: o.checker.copied_defaults.fold(
       { ..o.checker, copied_defaults: [] },
       |c: Checker, d: { expr: Expr, ty: Type }| {
-        let typed: Inferred = infer(c, d.expr, hint_of(d.ty));
+        let binders = expression_binders(c.resolved, c.module, d.expr).fold(
+          c.binders,
+          |found: Map<Int, Int>, site: Int, binder: Int| found.insert(site, binder),
+        );
+        let typed: Inferred = infer({ ..c, binders: binders }, d.expr, hint_of(d.ty));
         expect_met(typed.checker, expr_span(d.expr), d.ty, typed.ty, b"a parameter's default")
       },
     ),
@@ -1272,7 +1269,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
             },
           };
           {
-            checker: { ..t.checker, env: env_bind(t.checker.env, p.name.name, monomorphic(t.ty)) },
+            checker: { ..t.checker, env: env_bind(t.checker.env, p.name, monomorphic(t.ty)) },
             tys: acc.tys.push(t.ty),
           }
         },
@@ -1287,7 +1284,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
               reader,
               ps.checker.guards,
               match l.params.at(l.params.len() - 1) {
-                Some(p) -> (reader.name)({ module: None, name: p.name, span: p.name.span }),
+                Some(p) -> (reader.name)(bare(p.name)),
                 None -> Elsewhere,
               },
             ),
@@ -2080,133 +2077,147 @@ pub fn settle_updates(checker: Checker) -> Checker / {abort.raise} = {
 /// types it: a variable of the handler whose clause is walked, which the read is written out as one
 /// of the runtime's, or a capture of the innermost closure, which a body another function lends that
 /// closure to reads off it.
-fn held_read(checker: Checker, name: Bytes, span: Span, ty: Type) -> Checker / {abort.raise} =
+fn held_read(checker: Checker, binder: Int, span: Span, ty: Type) -> Checker / {abort.raise} =
   if checker.assignable.vars.len() == 0 && checker.assignable.frame == 0 { checker } else {
-    match env_local(checker.env, name) {
-      Some(l) -> if (match env_depth_of(checker.env, name) {
-            Some(d) -> d < checker.assignable.frame,
-            None -> false,
-          })
-          || checker.assignable.vars.fold(
-            false,
-            |found: Bool, v: { stamp: Int, name: Bytes, ty: Type }| found || v.stamp == l.stamp,
-          ) { note_typed(checker, span, ty, []) }
-      else { checker },
+    match env_local(checker.env, binder) {
+      Some(l) -> if l.depth < checker.assignable.frame
+          || checker.assignable.vars.any(|v: HandlerVariable| v.binder == binder) {
+        note_typed(checker, span, ty, [])
+      } else { checker },
       None -> checker,
     }
   }
 
-/// The name `qname`, read by the node at `at`, where what the check finds of the read is filed.
+/// The name `qname`, read where its name is written, filed at `at`.
 fn infer_var(checker: Checker, qname: QName, at: Span) -> Inferred / {abort.raise} = {
   let k: WithKey = value_key(checker, qname);
   match k.key {
-    None -> {
-      let o: WithTy = new_ty(k.checker);
-      { checker: o.checker, ty: o.ty, row: row_empty() }
+    None -> unknown_read(k.checker),
+    Some(LocalKey(binder)) -> match env_local(k.checker.env, binder) {
+      Some(l) -> read_local(k.checker, qname, at, binder, l.scheme),
+      None -> unknown_read(unknown_name(k.checker, qname)),
     },
-    Some(key) -> match env_lookup(k.checker.env, key.name) {
-      Some(sc) -> {
-        let inst = instantiate_with(sc, k.checker.fresh);
-        let c: Checker = crossed({ ..k.checker, fresh: inst.fresh }, key.name, at);
-        let constrained: Checker = note_constraints(
-          note_instance(c, at, inst.ty),
-          at,
-          key.name,
-          inst.args,
-          inst.ty,
-        );
-        let own = constrained.own_fns.contains(key.name);
-        let through = match qname.module {
-          Some(binder) -> if of_module(binder.name) != None
-              || find_module_binding(scope_of(constrained).modules, binder.name) != None { None }
-          else { declaring_type(constrained.resolved, constrained.module, binder.name) },
-          None -> None,
-        };
-        let named: Checker = match through {
-          // A language type's function its home module declares is written out as that
-          // module's. The prelude's is its own name as written.
-          None -> if is_bare(qname) { constrained } else if !key.prelude {
-            match of_language_type(constrained, qname) {
-              Found(m) -> if m.qname.module == None { constrained } else {
-                {
-                  ..constrained,
-                  member_sites: constrained.member_sites.push({
-                    reaches: [],
-                    named: [],
-                    module: constrained.module,
-                    site: at.site,
-                    qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
-                    name: m.qname.name.name,
-                    callee: b"",
-                    owner: constrained.walking,
-                  }),
-                }
-              },
-              _ -> constrained,
-            }
-          } else { constrained },
-          Some(t) ->
-            {
-              ..constrained,
-              member_sites: constrained.member_sites.push({
-                reaches: [],
-                named: [],
-                module: constrained.module,
-                site: at.site,
-                qualifier: of_binder(constrained.resolved.scopes.get(t.owner).module),
-                name: member_name(t.simple, qname.name.name),
-                callee: b"",
-                owner: constrained.walking,
-              }),
-            },
-        };
-        let referred: Checker = if !own { named }
-        else { { ..named, refs: named.refs.push(key.name) } };
-        let noted: Checker = if inst.args.len() == 0 || !own { referred } else {
-          {
-            ..referred,
-            group_fills: referred.group_fills.push({
-              module: referred.module,
-              span: at,
-              callee: key.name,
-              args: inst.args,
-            }),
-          }
-        };
-        // A constructor's labels are its type's arguments, which no call fills.
-        let ls = if inst.labels.len() > 0 && noted.ctor_index.contains(key.name) { [] }
-        else { inst.labels };
-        // Every `Columns` is made by a call that answers one, so its element is judged there.
-        let made = match inst.ty { TyFn(f) -> f.ret, other -> other };
-        let columned: Checker = if mentions_columns(made) {
-          { ..noted, columns: noted.columns.push({ module: noted.module, span: at, ty: made }) }
-        } else { noted };
-        let global = match env_depth_of(columned.env, key.name) { Some(d) -> d == 0, None -> true };
-        let typed: Checker = if !global { held_read(columned, key.name, at, inst.ty) } else {
-          let filed: Checker = note_named(columned, at, inst.ty, inst.args, key.name);
-          if inst.rows.len() == 0 { filed } else {
-            note_row(
-              filed,
-              at,
-              ReadOf({ named: key.name, quantified: sc.row_vars, filled: inst.rows }),
-            )
-          }
-        };
-        { checker: note_labels(typed, at, key.name, ls, inst.ty), ty: inst.ty, row: row_empty() }
-      },
-      None -> {
-        let o: WithTy = new_ty(unknown_name(k.checker, qname));
-        { checker: o.checker, ty: o.ty, row: row_empty() }
-      },
+    Some(GlobalKey(g)) -> match env_lookup(k.checker.env, g.name) {
+      Some(sc) -> read_global(k.checker, qname, at, g, sc),
+      None -> unknown_read(unknown_name(k.checker, qname)),
     },
   }
 }
 
-fn crossed(checker: Checker, name: Bytes, span: Span) -> Checker / {abort.raise} =
+fn unknown_read(checker: Checker) -> Inferred / {abort.raise} = {
+  let o: WithTy = new_ty(checker);
+  { checker: o.checker, ty: o.ty, row: row_empty() }
+}
+
+fn read_local(
+  checker: Checker,
+  qname: QName,
+  at: Span,
+  binder: Int,
+  sc: Scheme,
+) -> Inferred / {abort.raise} = {
+  let inst = instantiate_with(sc, checker.fresh);
+  let c: Checker = crossed({ ..checker, fresh: inst.fresh }, binder, qname.name.name, at);
+  let noted: Checker = made_columns(note_instance(c, at, inst.ty), at, inst.ty);
+  { checker: held_read(noted, binder, at, inst.ty), ty: inst.ty, row: row_empty() }
+}
+
+fn read_global(
+  checker: Checker,
+  qname: QName,
+  at: Span,
+  g: { name: Bytes, prelude: Bool },
+  sc: Scheme,
+) -> Inferred / {abort.raise} = {
+  let inst = instantiate_with(sc, checker.fresh);
+  let c: Checker = { ..checker, fresh: inst.fresh };
+  let constrained: Checker = note_constraints(
+    note_instance(c, at, inst.ty),
+    at,
+    g.name,
+    inst.args,
+    inst.ty,
+  );
+  let own = constrained.own_fns.contains(g.name);
+  let through = match qname.module {
+    Some(binder) -> if of_module(binder.name) != None
+        || find_module_binding(scope_of(constrained).modules, binder.name) != None { None }
+    else { declaring_type(constrained.resolved, constrained.module, binder.name) },
+    None -> None,
+  };
+  let named: Checker = match through {
+    // A language type's function its home module declares is written out as that
+    // module's. The prelude's is its own name as written.
+    None -> if is_bare(qname) { constrained } else if !g.prelude {
+      match of_language_type(constrained, qname) {
+        Found(m) -> if m.qname.module == None { constrained } else {
+          {
+            ..constrained,
+            member_sites: constrained.member_sites.push({
+              reaches: [],
+              named: [],
+              module: constrained.module,
+              site: at.site,
+              qualifier: match m.qname.module { Some(q) -> q.name, None -> b"" },
+              name: m.qname.name.name,
+              callee: b"",
+              owner: constrained.walking,
+            }),
+          }
+        },
+        _ -> constrained,
+      }
+    } else { constrained },
+    Some(t) ->
+      {
+        ..constrained,
+        member_sites: constrained.member_sites.push({
+          reaches: [],
+          named: [],
+          module: constrained.module,
+          site: at.site,
+          qualifier: of_binder(constrained.resolved.scopes.get(t.owner).module),
+          name: member_name(t.simple, qname.name.name),
+          callee: b"",
+          owner: constrained.walking,
+        }),
+      },
+  };
+  let referred: Checker = if !own { named } else { { ..named, refs: named.refs.push(g.name) } };
+  let noted: Checker = if inst.args.len() == 0 || !own { referred } else {
+    {
+      ..referred,
+      group_fills: referred.group_fills.push({
+        module: referred.module,
+        span: at,
+        callee: g.name,
+        args: inst.args,
+      }),
+    }
+  };
+  // A constructor's labels are its type's arguments, which no call fills.
+  let ls = if inst.labels.len() > 0 && noted.ctor_index.contains(g.name) { [] }
+  else { inst.labels };
+  let filed: Checker = note_named(made_columns(noted, at, inst.ty), at, inst.ty, inst.args, g.name);
+  let typed: Checker = if inst.rows.len() == 0 { filed } else {
+    note_row(filed, at, ReadOf({ named: g.name, quantified: sc.row_vars, filled: inst.rows }))
+  };
+  { checker: note_labels(typed, at, g.name, ls, inst.ty), ty: inst.ty, row: row_empty() }
+}
+
+/// Every `Columns` is made by a call that answers one, so its element is judged there.
+fn made_columns(checker: Checker, at: Span, ty: Type) -> Checker / {abort.raise} = {
+  let made = match ty { TyFn(f) -> f.ret, other -> other };
+  if !mentions_columns(made) { checker } else {
+    { ..checker, columns: checker.columns.push({ module: checker.module, span: at, ty: made }) }
+  }
+}
+
+fn crossed(checker: Checker, binder: Int, name: Bytes, span: Span) -> Checker / {abort.raise} =
   if checker.sim_scope == 0 { checker } else {
-    match env_depth_of(checker.env, name) {
-      Some(d) -> if d > 0 && d < checker.sim_scope {
-        { ..checker, crossings: checker.crossings.push({ name: name, span: span }) }
+    match env_local(checker.env, binder) {
+      Some(l) -> if l.depth < checker.sim_scope {
+        { ..checker, crossings: checker.crossings.push({ binder: binder, name: name, span: span }) }
       } else { checker },
       None -> checker,
     }
@@ -2441,14 +2452,8 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
       } else { { checker: bound, row: b.row, fallback: None } }
     },
     SAssign(a) -> {
-      // The binding the name stands for here, which a `let` or a parameter of the same name hides.
-      let target = match env_local(checker.env, a.name.name) {
-        Some(l) ->
-          checker.assignable.vars.fold(
-            None,
-            |found: Option<{ stamp: Int, name: Bytes, ty: Type }>, v: { stamp: Int, name: Bytes, ty: Type }|
-              if v.stamp == l.stamp { Some(v) } else { found },
-          ),
+      let target = match local_at(checker, bare(a.name)) {
+        Some(binder) -> checker.assignable.vars.find(|v: HandlerVariable| v.binder == binder),
         None -> None,
       };
       match target {
@@ -2525,7 +2530,7 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
     },
   }
 
-type LetBound = { checker: Checker, row: Row, out: List<{ name: Bytes, ty: Type }> }
+type LetBound = { checker: Checker, row: Row, out: List<Binder> }
 
 fn refutable(checker: Checker, pat: Pattern) -> Bool / {abort.raise} =
   uncovered(checker, [[coverage_pat(checker, pat)]], 1).len() > 0
@@ -2941,8 +2946,8 @@ fn prelude_named(checker: Checker, func: Expr) -> Bytes / {abort.raise} =
       }
     } else {
       match value_key(checker, v.name).key {
-        Some(k) -> if !k.prelude { b"" } else { k.name },
-        None -> b"",
+        Some(GlobalKey(g)) -> if g.prelude { g.name } else { b"" },
+        _ -> b"",
       }
     },
     _ -> b"",
@@ -3153,32 +3158,29 @@ fn int_builtin_text(func: Expr, args: List<Expr>) -> Bytes =
 /// builtin's name around one is refused rather than called.
 fn operator_hidden(checker: Checker, func: Expr, args: List<Expr>) -> Checker / {abort.raise} =
   match ((func, written_operator(func, args))) {
-    (EVar(v), Some(o)) -> match env_depth_of(checker.env, o.name) {
-      Some(depth) -> if depth == 0 { checker } else {
-        report_error_at(
-          checker,
-          b"E0105",
-          v.span,
+    (EVar(v), Some(o)) -> if local_at(checker, v.name) == None { checker } else {
+      report_error_at(
+        checker,
+        b"E0105",
+        v.span,
+        Bytes::concat_all([
+          b"`",
+          o.text,
+          b"` is the builtin `",
+          o.name,
+          b"`, which a binding here hides",
+        ]),
+        Bytes::concat_all([b"this would call the local `", o.name, b"`"]),
+        [
           Bytes::concat_all([
-            b"`",
+            b"`a ",
             o.text,
-            b"` is the builtin `",
+            b" b` is written in the name `",
             o.name,
-            b"`, which a binding here hides",
+            b"`; give the binding another name",
           ]),
-          Bytes::concat_all([b"this would call the local `", o.name, b"`"]),
-          [
-            Bytes::concat_all([
-              b"`a ",
-              o.text,
-              b" b` is written in the name `",
-              o.name,
-              b"`; give the binding another name",
-            ]),
-          ],
-        )
-      },
-      None -> checker,
+        ],
+      )
     },
     _ -> checker,
   }
@@ -3687,7 +3689,10 @@ fn applied_call(
 
 // --- Patterns and matches -----------------------------------------------------------------------
 
-type Bound = { checker: Checker, out: List<{ name: Bytes, ty: Type }> }
+/// A name a pattern binds, and its type.
+type Binder = { name: Ident, ty: Type }
+
+type Bound = { checker: Checker, out: List<Binder> }
 
 /// A pattern on a constructor its type's module keeps. A bare name's refusal is said here and a
 /// qualified one's where it was looked up; what the pattern binds is bound all the same, so that
@@ -3697,7 +3702,7 @@ fn bind_kept(
   name: QName,
   args: List<Pattern>,
   closed: Diag,
-  out: List<{ name: Bytes, ty: Type }>,
+  out: List<Binder>,
 ) -> Bound / {abort.raise} =
   args.fold(
     { checker: if is_bare(name) { report(checker, closed) } else { checker }, out: out },
@@ -3711,7 +3716,7 @@ fn bind_pattern(
   checker: Checker,
   p: Pattern,
   scrutinee: Type,
-  out: List<{ name: Bytes, ty: Type }>,
+  out: List<Binder>,
 ) -> Bound / {abort.raise} =
   match p {
     // The ownership walk refuses a `_` that stands for a resource.
@@ -3724,7 +3729,7 @@ fn bind_pattern(
     PVar(v) ->
       {
         checker: note_typed(checker, v.span, scrutinee, []),
-        out: out.push({ name: v.name.name, ty: scrutinee }),
+        out: out.push({ name: v.name, ty: scrutinee }),
       },
     PLit(l) ->
       {
@@ -3905,7 +3910,7 @@ fn bind_pattern(
       } else {
         let fs = r.fields.fold(
           { checker: checker, fs: [], out: out },
-          |acc: { checker: Checker, fs: List<Field>, out: List<{ name: Bytes, ty: Type }> }, f: { name: Ident, pat: Pattern }| {
+          |acc: { checker: Checker, fs: List<Field>, out: List<Binder> }, f: { name: Ident, pat: Pattern }| {
             let t: WithTy = new_ty(acc.checker);
             let b: Bound = bind_pattern(t.checker, f.pat, t.ty, acc.out);
             { checker: b.checker, fs: acc.fs.push({ name: f.name.name, ty: t.ty }), out: b.out }
@@ -3929,15 +3934,15 @@ fn bind_pattern(
 fn same_binders(
   checker: Checker,
   span: Span,
-  want: List<{ name: Bytes, ty: Type }>,
-  got: List<{ name: Bytes, ty: Type }>,
+  want: List<Binder>,
+  got: List<Binder>,
 ) -> Checker / {abort.raise} = {
-  let wanted = want.map(|w: { name: Bytes, ty: Type }| w.name);
-  let found = got.map(|g: { name: Bytes, ty: Type }| g.name);
+  let wanted = want.map(|w: Binder| w.name.name);
+  let found = got.map(|g: Binder| g.name.name);
   let missing = wanted.filter(|n: Bytes| !found.contains(n));
   let extra = found.filter(|n: Bytes| !wanted.contains(n));
-  let typed = got.fold(checker, |c: Checker, g: { name: Bytes, ty: Type }|
-    match binder_ty(want, g.name) {
+  let typed = got.fold(checker, |c: Checker, g: Binder|
+    match binder_ty(want, g.name.name) {
       Some(t) -> expect(c, span, t, g.ty, b"an or-pattern binds each name at one type").checker,
       None -> c,
     });
@@ -4042,9 +4047,9 @@ fn bind_range(
   }
 }
 
-fn binder_ty(bs: List<{ name: Bytes, ty: Type }>, name: Bytes) -> Option<Type> =
-  bs.fold(None, |acc: Option<Type>, b: { name: Bytes, ty: Type }|
-    match acc { Some(_) -> acc, None -> if b.name == name { Some(b.ty) } else { None } })
+fn binder_ty(bs: List<Binder>, name: Bytes) -> Option<Type> =
+  bs.fold(None, |acc: Option<Type>, b: Binder|
+    match acc { Some(_) -> acc, None -> if b.name.name == name { Some(b.ty) } else { None } })
 
 fn infer_match(
   checker: Checker,
@@ -4538,8 +4543,7 @@ fn crossing_refused(
   }
 
 /// Whether `x` in `x.name(..)` is a local binding, so the call is one on its value and no perform.
-fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} =
-  is_bare(x) && (match env_depth_of(checker.env, x.name.name) { Some(d) -> d > 0, None -> false })
+fn on_a_local(checker: Checker, x: QName) -> Bool / {abort.raise} = local_at(checker, x) != None
 
 fn names_effect(checker: Checker, x: QName) -> Bool / {abort.raise} =
   lookup(scope_of(checker).bound, EffectSpace, x.name.name) != None
@@ -4759,7 +4763,7 @@ fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.rais
         [],
       );
       {
-        checker: { ..noted, env: env_bind(noted.env, v.name.name, monomorphic(ty)) },
+        checker: { ..noted, env: env_bind(noted.env, v.name, monomorphic(ty)) },
         row: j.row,
         vars: acc.vars.push({ name: v.name, ty: ty }),
       }
@@ -4778,16 +4782,16 @@ fn with_vars(
 ) -> Checker / {abort.raise} = {
   let pushed: Checker = { ..checker, env: env_push(checker.env) };
   let bound = vars.fold(
-    { checker: pushed, stamps: [] },
-    |acc: { checker: Checker, stamps: List<{ stamp: Int, name: Bytes, ty: Type }> }, v: { name: Ident, ty: Type }|
+    { checker: pushed, vars: [] },
+    |acc: { checker: Checker, vars: List<HandlerVariable> }, v: { name: Ident, ty: Type }|
       {
-        checker: { ..acc.checker, env: env_bind(acc.checker.env, v.name.name, monomorphic(v.ty)) },
-        stamps: acc.stamps.push({ stamp: acc.checker.env.binds, name: v.name.name, ty: v.ty }),
+        checker: { ..acc.checker, env: env_bind(acc.checker.env, v.name, monomorphic(v.ty)) },
+        vars: acc.vars.push({ binder: v.name.span.site, name: v.name.name, ty: v.ty }),
       },
   );
   {
     ..bound.checker,
-    assignable: { vars: bound.stamps, barred: barred, frame: checker.env.scopes.len() },
+    assignable: { vars: bound.vars, barred: barred, frame: env_depth(checker.env) },
   }
 }
 
@@ -4958,11 +4962,7 @@ fn infer_handle(
                     let at = clause.params.get(i).span;
                     {
                       ..c,
-                      env: env_bind(
-                        c.env,
-                        clause.params.get(i).name,
-                        monomorphic(shape.params.get(i)),
-                      ),
+                      env: env_bind(c.env, clause.params.get(i), monomorphic(shape.params.get(i))),
                       // The ownership walk reads what each parameter holds, by its binder's key, as a
                       // parameter keeps no site of its own.
                       valued: c.valued.push({
@@ -4975,8 +4975,7 @@ fn infer_handle(
                 // The label the call site named, as the clause body's own `String`: a clause that
                 // answers every label could not otherwise tell which one it answered.
                 let with_label: Checker = match clause.label_binder {
-                  Some(t) ->
-                    { ..bound, env: env_bind(bound.env, t.name, monomorphic(string_type())) },
+                  Some(t) -> { ..bound, env: env_bind(bound.env, t, monomorphic(string_type())) },
                   None -> bound,
                 };
                 let raised = Bytes::concat_all([
@@ -4991,7 +4990,7 @@ fn infer_handle(
                     // A filed type holds no row, so what resuming `k` performs is filed apart.
                     let bound_k: Checker = {
                       ..note_row(with_label, resumed_at(clause.span), RowOf(resumed)),
-                      env: env_bind(with_label.env, k.name, monomorphic(continuation)),
+                      env: env_bind(with_label.env, k, monomorphic(continuation)),
                     };
                     if !raise { bound_k } else {
                       report_error_at(
@@ -5091,10 +5090,7 @@ fn infer_handle(
   let returned = match ret {
     Some(rc) -> {
       let pushed: Checker = with_vars(under, made.vars, Some(b"the `return` clause"));
-      let bound: Checker = {
-        ..pushed,
-        env: env_bind(pushed.env, rc.binder.name, monomorphic(b.ty)),
-      };
+      let bound: Checker = { ..pushed, env: env_bind(pushed.env, rc.binder, monomorphic(b.ty)) };
       let o: Inferred = infer(bound, rc.body, hint);
       {
         checker: note_row(
@@ -5736,7 +5732,7 @@ fn infer_with_hold(
     Some(around) -> {
       let refused: Checker = region_reopened(entering.checker, resource, around);
       let b: Inferred = infer(
-        { ..refused, env: env_bind(env_push(refused.env), binder.name, monomorphic(hold_ty)) },
+        { ..refused, env: env_bind(env_push(refused.env), binder, monomorphic(hold_ty)) },
         body,
         hint,
       );
@@ -5756,7 +5752,7 @@ fn infer_with_hold(
       let opened: Checker = open_region(entering.checker, resource.name, label, resource.span);
       let mark = opened.performs.len();
       let b: Inferred = infer(
-        { ..opened, env: env_bind(env_push(opened.env), binder.name, monomorphic(hold_ty)) },
+        { ..opened, env: env_bind(env_push(opened.env), binder, monomorphic(hold_ty)) },
         body,
         hint,
       );
@@ -5846,40 +5842,25 @@ fn hold_filed(checker: Checker, span: Span, held: Type, hold: Type, answer: Type
 }
 
 /// By the types at the open: a binding whose type mentions a task only inside the region holds none.
-fn task_carriers(checker: Checker) -> List<{ name: Bytes, ty: Type }> / {abort.raise} =
-  env_locals(checker.env).fold(
+fn task_carriers(checker: Checker) -> List<{ binder: Int, ty: Type }> / {abort.raise} =
+  env_locals(checker.env).fold([], |acc: List<{ binder: Int, ty: Type }>, l: InScope| {
+    let ty = resolve(checker, l.sc.ty);
+    if holds_task(ty) { acc.push({ binder: l.binder, ty: ty }) } else { acc }
+  })
+
+fn carried_in(
+  xs: List<Crossing>,
+  carriers: List<{ binder: Int, ty: Type }>,
+) -> List<{ name: Bytes, span: Span, ty: Type }> =
+  xs.fold([], |acc: List<Crossing>, x: Crossing|
+    if acc.any(|y: Crossing| y.binder == x.binder) { acc } else { acc.push(x) }).fold(
     [],
-    |acc: List<{ name: Bytes, ty: Type }>, l: { name: Bytes, sc: Scheme }|
-      match env_lookup(checker.env, l.name) {
-        Some(sc) -> {
-          let ty = resolve(checker, sc.ty);
-          if holds_task(ty)
-              && !acc.fold(false, |b: Bool, x: { name: Bytes, ty: Type }| b || x.name == l.name) {
-            acc.push({ name: l.name, ty: ty })
-          } else { acc }
-        },
+    |acc: List<{ name: Bytes, span: Span, ty: Type }>, x: Crossing|
+      match carriers.find(|c: { binder: Int, ty: Type }| c.binder == x.binder) {
+        Some(c) -> acc.push({ name: x.name, span: x.span, ty: c.ty }),
         None -> acc,
       },
   )
-
-/// A name the body takes from outside is the innermost binding of it, the one the open saw.
-fn carried_in(
-  xs: List<Crossing>,
-  carriers: List<{ name: Bytes, ty: Type }>,
-) -> List<{ name: Bytes, span: Span, ty: Type }> =
-  xs.fold([], |acc: List<{ name: Bytes, span: Span, ty: Type }>, x: Crossing|
-    if acc.fold(false, |b: Bool, y: { name: Bytes, span: Span, ty: Type }| b || y.name == x.name) {
-      acc
-    } else {
-      match carriers.fold(None, |found: Option<Type>, k: { name: Bytes, ty: Type }|
-          match found {
-            Some(_) -> found,
-            None -> if k.name == x.name { Some(k.ty) } else { None },
-          }) {
-        Some(ty) -> acc.push({ name: x.name, span: x.span, ty: ty }),
-        None -> acc,
-      }
-    })
 
 fn infer_simulate(
   checker: Checker,
@@ -5891,7 +5872,7 @@ fn infer_simulate(
   let crossed_at = checker.crossings.len();
   let carriers = task_carriers(checker);
   let b: Inferred = infer(
-    { ..checker, simulate_depth: checker.simulate_depth + 1, sim_scope: checker.env.scopes.len() },
+    { ..checker, simulate_depth: checker.simulate_depth + 1, sim_scope: env_depth(checker.env) },
     body,
     hint,
   );

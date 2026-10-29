@@ -1,9 +1,9 @@
 //! Names as the checker looks them up, and what it says of one it cannot find.
 
 import compiler.syntax.parsing (Span, Ident, QName, is_bare, qname_text, starts_upper)
-import compiler.syntax.items (deriver_text, SRequires, SCost, SSpace, member_name)
+import compiler.syntax.items (deriver_text, SRequires, SCost, SSpace, member_name, result_name)
 import compiler.syntax.exprs (sees_homes, prelude_module)
-import compiler.check.types (TyCon, TyFn, env_lookup, env_depth_of, TyNominal)
+import compiler.check.types (TyCon, TyFn, env_lookup, TyNominal)
 import compiler.check.resolve.tables (Binding, ModuleBinding, Declared, ModuleEntry, Diag,
                                       Namespace, ValueSpace, TypeSpace, lookup, lookup_declared,
                                       space, qualify, default_binder, error_at, label_at,
@@ -14,8 +14,9 @@ import std.bytes
 import std.option
 import std.string
 import std.text (closest)
-import compiler.check.infer.checker (Checker, WithName, result_name, module_name, scope_of, report,
-                                     report_error_at, err_labels, ctor_of, ValueKey)
+import compiler.check.infer.checker (Checker, WithName, module_name, scope_of, report,
+                                     report_error_at, err_labels, ctor_of, ValueKey, LocalKey,
+                                     GlobalKey)
 
 // --- Names ------------------------------------------------------------------------------
 
@@ -256,6 +257,10 @@ fn lookup_failure(checker: Checker, namespace: Namespace, qname: QName) -> Check
     },
   }
 
+/// The binder of the local `qname` reads, where it reads one.
+pub fn local_at(checker: Checker, qname: QName) -> Option<Int> =
+  if is_bare(qname) { checker.binders.get(qname.name.span.site) } else { None }
+
 pub fn value_key(
   checker: Checker,
   qname: QName,
@@ -263,23 +268,23 @@ pub fn value_key(
   if !is_bare(qname) {
     match of_language_type(checker, qname) {
       Found(m) ->
-        { checker: checker, key: Some({ name: m.callee, prelude: m.qname.module == None }) },
+        {
+          checker: checker,
+          key: Some(GlobalKey({ name: m.callee, prelude: m.qname.module == None })),
+        },
       // A capital no import binds and no module declares is a type of the language's.
       Unnamed(of) -> { checker: no_function_of(checker, of.name, qname.name), key: None },
       Elsewise -> {
         let g: WithName = global(checker, ValueSpace, qname);
         match g.name {
-          Some(n) -> { checker: g.checker, key: Some({ name: n, prelude: false }) },
+          Some(n) -> { checker: g.checker, key: Some(GlobalKey({ name: n, prelude: false })) },
           None -> { checker: g.checker, key: None },
         }
       },
     }
   } else {
-    let name = qname.name.name;
-    match env_depth_of(checker.env, name) {
-      Some(depth) -> if depth > 0 {
-        { checker: checker, key: Some({ name: name, prelude: false }) }
-      } else { value_key_global(checker, qname) },
+    match local_at(checker, qname) {
+      Some(binder) -> { checker: checker, key: Some(LocalKey(binder)) },
       None -> value_key_global(checker, qname),
     }
   }
@@ -308,10 +313,10 @@ fn value_key_global(
 ) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} = {
   let name = qname.name.name;
   match lookup(scope_of(checker).bound, ValueSpace, name) {
-    Some(b) -> { checker: checker, key: Some({ name: b.qualified, prelude: false }) },
-    None -> match env_depth_of(checker.env, name) {
-      Some(0) -> { checker: checker, key: Some({ name: name, prelude: true }) },
-      _ -> { checker: unknown_name(checker, qname), key: None },
+    Some(b) -> { checker: checker, key: Some(GlobalKey({ name: b.qualified, prelude: false })) },
+    None -> match env_lookup(checker.env, name) {
+      Some(_) -> { checker: checker, key: Some(GlobalKey({ name: name, prelude: true })) },
+      None -> { checker: unknown_name(checker, qname), key: None },
     },
   }
 }
@@ -528,7 +533,7 @@ fn builtin_or_home(
       },
       None -> false,
     });
-  if takes && env_depth_of(checker.env, declared) == Some(0) {
+  if takes && env_lookup(checker.env, declared) != None {
     Some({
       qname: { module: None, name: { name: declared, span: name.span }, span: name.span },
       callee: declared,

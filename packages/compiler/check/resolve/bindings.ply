@@ -7,13 +7,15 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, ETagged, EHole, EBad, ETryBlock,
                               Stmt, SLet, SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause,
-                              RecField, NamedArg, Hole, HandlerVar, ReturnClause)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList)
+                              RecField, NamedArg, Hole, HandlerVar, ReturnClause, tagged_parser)
+import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
                                     AtomExpr)
-import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, FnDef,
-                              TypeDef, TDAlias, TDSum, TDNominal, VariantDef, EffectDef, OpDef,
-                              TestDef, LawDef, SpecClause, SEnsures, Binder, ImportDecl, INames)
+import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IExtern,
+                              IDerive, FnDef, TypeDef, TDAlias, TDSum, TDNominal, VariantDef,
+                              EffectDef, OpDef, TestDef, LawDef, SpecClause, SRequires, SEnsures,
+                              SCost, SSpace, ReturnsParam, Binder, ImportDecl, INames, result_name,
+                              test_run, test_listing, case_params)
 import compiler.check.resolve.tables (Resolved, Namespace, ValueSpace, TypeSpace, EffectSpace,
                                       SetSpace, Binding, find_module_binding)
 import compiler.check.resolve.scopes (find)
@@ -45,48 +47,53 @@ pub type Reference = {
   shorthand: Bool,
 }
 
+/// `found` holds each name by its site: the trees an item is read as may share a name.
 type Walk = {
   module: Int,
   resolved: Resolved,
-  scopes: List<Map<Bytes, Int>>,
-  found: List<Reference>,
+  scopes: List<Map<Bytes, Refers>>,
+  found: Map<Int, Reference>,
 }
 
-fn noted(w: Walk, site: Int, at: Span, name: Bytes, refers: Refers, shorthand: Bool) -> Walk =
+fn walk_of(resolved: Resolved, index: Int) -> Walk =
+  { module: index, resolved: resolved, scopes: [Map::new()], found: Map::new() }
+
+fn reference(name: Ident, refers: Refers, shorthand: Bool) -> Reference =
   {
-    ..w,
-    found: w.found.push({
-      site: site,
-      start: at.start,
-      end: at.end,
-      name: name,
-      refers: refers,
-      shorthand: shorthand,
-    }),
+    site: name.span.site,
+    start: name.span.start,
+    end: name.span.end,
+    name: name.name,
+    refers: refers,
+    shorthand: shorthand,
   }
+
+fn noted(w: Walk, name: Ident, refers: Refers, shorthand: Bool) -> Walk =
+  { ..w, found: w.found.insert(name.span.site, reference(name, refers, shorthand)) }
 
 fn pushed(w: Walk) -> Walk = { ..w, scopes: w.scopes.push(Map::new()) }
 
 fn popped(w: Walk) -> Walk =
   if w.scopes.len() > 0 { { ..w, scopes: w.scopes.take(w.scopes.len() - 1) } } else { w }
 
-fn scoped(w: Walk, name: Bytes, site: Int) -> Walk / {abort.raise} = {
+fn scoped(w: Walk, name: Bytes, refers: Refers) -> Walk / {abort.raise} = {
   let inner = w.scopes.at(w.scopes.len() - 1).unwrap_or(Map::new());
-  { ..w, scopes: w.scopes.take(w.scopes.len() - 1).push(inner.insert(name, site)) }
+  { ..w, scopes: w.scopes.take(w.scopes.len() - 1).push(inner.insert(name, refers)) }
 }
 
-/// `name`, written at the node numbered `site`, bound in the innermost scope.
-fn bound(w: Walk, name: Ident, site: Int, shorthand: Bool) -> Walk / {abort.raise} =
-  noted(scoped(w, name.name, site), site, name.span, name.name, Local(site), shorthand)
+fn local(w: Walk, name: Bytes) -> Option<Refers> =
+  w.scopes.fold(None, |found: Option<Refers>, scope: Map<Bytes, Refers>|
+    match scope.get(name) { Some(r) -> Some(r), None -> found })
 
-fn in_scope(w: Walk, vars: List<HandlerVar>) -> Walk / {abort.raise} =
-  vars.fold(w, |acc: Walk, v: HandlerVar| scoped(acc, v.name.name, v.name.span.site))
+fn bound(w: Walk, name: Ident) -> Walk / {abort.raise} = binder(w, name, false, false)
 
-fn bound_name(w: Walk, name: Ident) -> Walk / {abort.raise} = bound(w, name, name.span.site, false)
-
-fn local(w: Walk, name: Bytes) -> Option<Int> =
-  w.scopes.fold(None, |found: Option<Int>, scope: Map<Bytes, Int>|
-    match scope.get(name) { Some(site) -> Some(site), None -> found })
+/// `name` binding a local in the innermost scope, the local its site names; or, in an or-pattern's
+/// alternative after the first (`again`), naming the local the first alternative bound.
+fn binder(w: Walk, name: Ident, shorthand: Bool, again: Bool) -> Walk / {abort.raise} =
+  if again { noted(w, name, local(w, name.name).unwrap_or(Unbound), shorthand) } else {
+    let site = name.span.site;
+    noted(scoped(w, name.name, Local(site)), name, Local(site), shorthand)
+  }
 
 fn bare(name: Ident) -> QName = { module: None, name: name, span: name.span }
 
@@ -100,31 +107,24 @@ fn qualifier(w: Walk, qname: QName) -> Walk / {abort.raise} =
   match qname.module {
     None -> w,
     Some(q) -> match find_module_binding(w.resolved.scopes.get(w.module).modules, q.name) {
-      Some(m) -> noted(w, 0, q.span, q.name, Module(m.target), false),
+      Some(m) -> noted(w, q, Module(m.target), false),
       None -> w,
     },
   }
 
-fn value_named(w: Walk, site: Int, qname: QName) -> Walk / {abort.raise} = {
+fn value_named(w: Walk, qname: QName) -> Walk / {abort.raise} = {
   let refers = match qname.module {
     None -> match local(w, qname.name.name) {
-      Some(binder) -> Local(binder),
+      Some(r) -> r,
       None -> definition(w, ValueSpace, qname),
     },
     Some(_) -> definition(w, ValueSpace, qname),
   };
-  noted(qualifier(w, qname), site, qname.name.span, qname.name.name, refers, false)
+  noted(qualifier(w, qname), qname.name, refers, false)
 }
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
-  noted(
-    qualifier(w, qname),
-    0,
-    qname.name.span,
-    qname.name.name,
-    definition(w, namespace, qname),
-    false,
-  )
+  noted(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
 
 fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise} =
   match find(w.resolved, w.module, EffectSpace, eff) {
@@ -135,9 +135,7 @@ fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise} =
 fn operation(w: Walk, eff: QName, op: Ident) -> Walk / {abort.raise} =
   noted(
     named_in(w, EffectSpace, eff),
-    0,
-    op.span,
-    op.name,
+    op,
     Operation({ effect: effect_of(w, eff), name: op.name }),
     false,
   )
@@ -145,10 +143,7 @@ fn operation(w: Walk, eff: QName, op: Ident) -> Walk / {abort.raise} =
 fn walk_type(w: Walk, t: TypeExpr) -> Walk / {abort.raise} =
   match t {
     TCon(c) -> c.rows.fold(c.args.fold(named_in(w, TypeSpace, c.name), walk_type), walk_row),
-    TFn(f) -> {
-      let typed = walk_type(f.params.fold(w, walk_type), f.ret);
-      match f.effects { Some(r) -> walk_row(typed, r), None -> typed }
-    },
+    TFn(f) -> walk_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
     TRecord(r) ->
       r.fields.fold(w, |acc: Walk, field: { name: Ident, ty: TypeExpr }| walk_type(acc, field.ty)),
     _ -> w,
@@ -164,64 +159,92 @@ fn walk_row(w: Walk, r: RowExpr) -> Walk / {abort.raise} =
     |acc: Walk, alias: QName| named_in(acc, SetSpace, alias),
   )
 
+fn walk_effects(w: Walk, r: Option<RowExpr>) -> Walk / {abort.raise} =
+  match r { Some(x) -> walk_row(w, x), None -> w }
+
 fn walk_optional_type(w: Walk, t: Option<TypeExpr>) -> Walk / {abort.raise} =
   match t { Some(x) -> walk_type(w, x), None -> w }
 
-/// The constructors a pattern names, then the locals it binds, in the innermost scope.
-fn walk_pattern(w: Walk, p: Pattern) -> Walk / {abort.raise} =
+/// The constructors a pattern names, then the locals it binds, in the innermost scope. `again` is
+/// an or-pattern's alternative after the first, whose names are the first one's locals.
+fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
   match p {
-    PVar(v) -> bound(w, v.name, v.span.site, false),
-    PCtor(c) -> c.args.fold(named_in(w, ValueSpace, c.name), walk_pattern),
+    PVar(v) -> binder(w, v.name, false, again),
+    PCtor(c) ->
+      c.args.fold(named_in(w, ValueSpace, c.name), |acc: Walk, x: Pattern|
+        walk_pattern(acc, x, again)),
     PRecord(r) ->
       r.fields.fold(w, |acc: Walk, field: { name: Ident, pat: Pattern }|
         match field.pat {
-          PVar(v) -> if v.span.start == field.name.span.start {
-            bound(acc, v.name, v.span.site, true)
-          } else { walk_pattern(acc, field.pat) },
-          _ -> walk_pattern(acc, field.pat),
+          PVar(v) -> if v.span.start == field.name.span.start { binder(acc, v.name, true, again) }
+          else { binder(acc, v.name, false, again) },
+          _ -> walk_pattern(acc, field.pat, again),
         }),
     PList(l) -> {
-      let items = l.items.fold(w, walk_pattern);
-      match l.rest { Some(rest) -> walk_pattern(items, rest), None -> items }
+      let items = l.items.fold(w, |acc: Walk, x: Pattern| walk_pattern(acc, x, again));
+      match l.rest { Some(rest) -> walk_pattern(items, rest, again), None -> items }
+    },
+    POr(o) -> match o.alts {
+      [head, ..rest] ->
+        rest.fold(walk_pattern(w, head, again), |acc: Walk, alt: Pattern|
+          walk_pattern(acc, alt, true)),
+      [] -> w,
     },
     _ -> w,
   }
 
-fn walk_param(w: Walk, p: Param) -> Walk / {abort.raise} = {
-  let typed = walk_optional_type(w, p.ty);
-  bound_name(match p.default { Some(d) -> walk_expr(typed, d), None -> typed }, p.name)
+/// A scope binding the parameters, then each one's type and default.
+fn walk_params(w: Walk, ps: List<Param>) -> Walk / {abort.raise} =
+  ps.fold(ps.fold(pushed(w), |acc: Walk, p: Param| bound(acc, p.name)), |acc: Walk, p: Param| {
+    let typed = walk_optional_type(acc, p.ty);
+    match p.default { Some(d) -> walk_expr(typed, d), None -> typed }
+  })
+
+/// A clause in its definition's scope: an `ensures` also binds `result`, the clause its binder, and
+/// a `cost` or `space` clause the name each parameter gives its steps or what it holds.
+fn walk_spec(w: Walk, ps: List<Param>, s: SpecClause) -> Walk / {abort.raise} = {
+  let named = |of: (Param) -> Option<Ident>|
+    ps.fold(pushed(w), |acc: Walk, p: Param| match of(p) { Some(k) -> bound(acc, k), None -> acc });
+  let scope = match s.kind {
+    SEnsures -> scoped(pushed(w), result_name(), Local(s.span.site)),
+    SCost -> named(|p: Param| p.cost),
+    SSpace -> named(|p: Param| p.space),
+    SRequires -> pushed(w),
+  };
+  popped(walk_expr(scope, s.expr))
 }
 
 fn walk_stmt(w: Walk, s: Stmt) -> Walk / {abort.raise} =
   match s {
-    SLet(l) -> walk_pattern(walk_optional_type(walk_expr(w, l.value), l.ty), l.pat),
+    SLet(l) -> walk_pattern(walk_optional_type(walk_expr(w, l.value), l.ty), l.pat, false),
     SLetElse(l) ->
-      walk_pattern(walk_optional_type(walk_expr(walk_expr(w, l.value), l.fallback), l.ty), l.pat),
+      walk_pattern(
+        walk_optional_type(walk_expr(walk_expr(w, l.value), l.fallback), l.ty),
+        l.pat,
+        false,
+      ),
     SExpr(e) -> walk_expr(w, e),
-    SAssign(a) -> {
-      let refers = match local(w, a.name.name) { Some(binder) -> Local(binder), None -> Unbound };
-      walk_expr(noted(w, a.span.site, a.name.span, a.name.name, refers, false), a.value)
-    },
+    SAssign(a) ->
+      walk_expr(noted(w, a.name, local(w, a.name.name).unwrap_or(Unbound), false), a.value),
   }
 
+/// A handler's variables in scope, as the clauses and the `return` clause see them.
+fn in_scope(w: Walk, vars: List<HandlerVar>) -> Walk / {abort.raise} =
+  vars.fold(pushed(w), |acc: Walk, v: HandlerVar| scoped(acc, v.name.name, Local(v.name.span.site)))
+
 fn walk_clause(w: Walk, vars: List<HandlerVar>, c: HandleClause) -> Walk / {abort.raise} = {
-  let with_vars = in_scope(operation(pushed(w), c.eff, c.op), vars);
-  let with_params = c.params.fold(with_vars, bound_name);
-  let with_label = match c.label_binder {
-    Some(l) -> bound_name(with_params, l),
-    None -> with_params,
-  };
-  let with_resume = match c.resume { Some(k) -> bound_name(with_label, k), None -> with_label };
+  let with_params = c.params.fold(in_scope(operation(w, c.eff, c.op), vars), bound);
+  let with_label = match c.label_binder { Some(l) -> bound(with_params, l), None -> with_params };
+  let with_resume = match c.resume { Some(k) -> bound(with_label, k), None -> with_label };
   popped(walk_expr(with_resume, c.body))
 }
 
 fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
   match e {
-    EVar(v) -> value_named(w, v.span.site, v.name),
+    EVar(v) -> value_named(w, v.name),
     EBinary(b) -> walk_expr(walk_expr(w, b.lhs), b.rhs),
     EUnary(u) -> walk_expr(w, u.operand),
-    ELambda(l) ->
-      popped(walk_expr(walk_optional_type(l.params.fold(pushed(w), walk_param), l.ret), l.body)),
+    ELambda(l) -> popped(walk_expr(walk_optional_type(walk_params(w, l.params), l.ret), l.body)),
     EApp(a) ->
       a.args.fold(
         a.named.fold(walk_expr(w, a.func), |acc: Walk, n: NamedArg| walk_expr(acc, n.value)),
@@ -230,7 +253,7 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
     EIf(i) -> walk_expr(walk_expr(walk_expr(w, i.cond), i.then_branch), i.else_branch),
     EMatch(m) ->
       m.arms.fold(walk_expr(w, m.scrutinee), |acc: Walk, arm: MatchArm| {
-        let bound_arm = walk_pattern(pushed(acc), arm.pat);
+        let bound_arm = walk_pattern(pushed(acc), arm.pat, false);
         let guarded = match arm.guard { Some(g) -> walk_expr(bound_arm, g), None -> bound_arm };
         popped(walk_expr(guarded, arm.body))
       }),
@@ -244,34 +267,29 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
     ETry(t) -> walk_expr(w, t.operand),
     EField(f) -> walk_expr(w, f.base),
     EList(l) -> l.items.fold(w, walk_expr),
-    EPerform(p) -> p.args.fold(operation(w, p.eff, p.op), walk_expr),
+    EPerform(p) -> match if p.eff.module == None { local(w, p.eff.name.name) } else { None } {
+      Some(Local(b)) -> p.args.fold(noted(w, p.eff.name, Local(b), false), walk_expr),
+      _ -> p.args.fold(operation(w, p.eff, p.op), walk_expr),
+    },
     EHandle(h) -> {
-      let inits = h.vars.fold(w, |acc: Walk, v: HandlerVar|
-        noted(
-          walk_expr(walk_optional_type(acc, v.ty), v.init),
-          v.name.span.site,
-          v.name.span,
-          v.name.name,
-          Local(v.name.span.site),
-          false,
-        ));
-      let clauses = h.clauses.fold(walk_expr(inits, h.body), |acc: Walk, c: HandleClause|
+      let made = h.vars.fold(pushed(w), |acc: Walk, v: HandlerVar|
+        bound(walk_expr(walk_optional_type(acc, v.ty), v.init), v.name));
+      let clauses = h.clauses.fold(walk_expr(popped(made), h.body), |acc: Walk, c: HandleClause|
         walk_clause(acc, h.vars, c));
       match h.ret {
-        Some(r) -> {
-          let with_vars = in_scope(pushed(clauses), h.vars);
-          popped(walk_expr(bound_name(with_vars, r.binder), r.body))
-        },
+        Some(r) -> popped(walk_expr(bound(in_scope(clauses, h.vars), r.binder), r.body)),
         None -> clauses,
       }
     },
     EWithHold(h) -> {
       let around = walk_expr(walk_expr(w, h.acquire), h.release);
-      popped(walk_expr(bound_name(pushed(around), h.binder), h.body))
+      popped(walk_expr(bound(pushed(around), h.binder), h.body))
     },
     ESimulate(s) -> walk_expr(w, s.body),
     EParallel(p) -> p.branches.fold(w, walk_expr),
-    ETagged(t) -> t.holes.fold(w, |acc: Walk, hole: Hole| walk_expr(acc, hole.value)),
+    ETagged(t) ->
+      t.holes.fold(qualifier(w, tagged_parser(t)), |acc: Walk, hole: Hole|
+        walk_expr(acc, hole.value)),
     ETryBlock(t) -> {
       let raised = match t.raise { Some(r) -> operation(w, r.eff, r.op), None -> w };
       walk_expr(raised, t.body)
@@ -280,19 +298,38 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
   }
 
 fn walk_fn(w: Walk, f: FnDef) -> Walk / {abort.raise} = {
-  let params = f.params.fold(pushed(named_in(w, ValueSpace, bare(f.name))), walk_param);
-  let typed = match f.effects {
-    Some(r) -> walk_row(walk_optional_type(params, f.ret), r),
-    None -> walk_optional_type(params, f.ret),
+  let params = walk_params(named_in(w, ValueSpace, bare(f.name)), f.params);
+  let typed = walk_effects(walk_optional_type(params, f.ret), f.effects);
+  let returned = match f.returns {
+    Some(ReturnsParam(p)) -> noted(typed, p, local(typed, p.name).unwrap_or(Unbound), false),
+    _ -> typed,
   };
-  let specs = f.spec.fold(typed, |acc: Walk, s: SpecClause| walk_expr(acc, s.expr));
+  let specs = f.spec.fold(returned, |acc: Walk, s: SpecClause| walk_spec(acc, f.params, s));
   let measured = match f.decreases { Some(d) -> walk_expr(specs, d), None -> specs };
   popped(walk_expr(measured, f.body))
+}
+
+/// A law's or a schema's binders, then its guard and its body, the binders in scope.
+fn walk_quantified(
+  w: Walk,
+  binders: List<Binder>,
+  guard: Option<Expr>,
+  body: Expr,
+) -> Walk / {abort.raise} = {
+  let bound_all = binders.fold(pushed(w), |acc: Walk, b: Binder|
+    bound(walk_type(acc, b.ty), b.name));
+  let guarded = match guard { Some(g) -> walk_expr(bound_all, g), None -> bound_all };
+  popped(walk_expr(guarded, body))
 }
 
 fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
   match item {
     IFn(f) -> walk_fn(w, f),
+    IExtern(x) -> {
+      let params = walk_params(named_in(w, ValueSpace, bare(x.name)), x.params);
+      let typed = walk_effects(walk_type(params, x.ret), x.effects);
+      popped(x.spec.fold(typed, |acc: Walk, s: SpecClause| walk_spec(acc, x.params, s)))
+    },
     IType(t) -> {
       let declared = named_in(w, TypeSpace, bare(t.name));
       match t.body {
@@ -309,9 +346,7 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
       eff.ops.fold(named_in(w, EffectSpace, bare(eff.name)), |acc: Walk, op: OpDef| {
         let declared = noted(
           acc,
-          0,
-          op.name.span,
-          op.name.name,
+          op.name,
           Operation({ effect: qualified, name: op.name.name }),
           false,
         );
@@ -320,44 +355,65 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
     },
     ITest(t) -> match t.cases {
       Some(c) -> {
-        let table = walk_type(walk_expr(w, c.table), c.ty);
-        popped(walk_expr(walk_expr(bound_name(pushed(table), c.binder), c.label), t.body))
+        let entered = case_params(c).fold(
+          pushed(w),
+          |acc: Walk, p: { name: Ident, ty: TypeExpr }| bound(walk_type(acc, p.ty), p.name),
+        );
+        popped(walk_expr(walk_expr(entered, test_run(t)), test_listing(c)))
       },
       None -> walk_expr(w, t.body),
     },
-    ILaw(l) -> {
-      let binders = l.binders.fold(pushed(w), |acc: Walk, b: Binder|
-        bound(walk_type(acc, b.ty), b.name, b.span.site, false));
-      let guarded = match l.guard { Some(g) -> walk_expr(binders, g), None -> binders };
-      popped(walk_expr(guarded, l.body))
-    },
+    ILaw(l) -> walk_quantified(w, l.binders, l.guard, l.body),
+    ISchema(s) -> walk_quantified(w, s.params.concat(s.binders), s.guard, s.body),
     IDerive(d) -> named_in(w, TypeSpace, bare(d.target)),
     _ -> w,
   }
 
-fn walk_import(w: Walk, i: ImportDecl) -> Walk / {abort.raise} =
-  match i.kind {
-    INames(names) ->
-      names.fold(w, |acc: Walk, n: Ident| {
-        let q = bare(n);
-        let refers = [ValueSpace, TypeSpace, EffectSpace, SetSpace].fold(
-          Unbound,
-          |found: Refers, space: Namespace|
-            match found { Unbound -> definition(acc, space, q), _ -> found },
-        );
-        noted(acc, 0, n.span, n.name, refers, false)
-      }),
-    _ -> w,
-  }
+/// What each name `module`'s imports bind refers to; an import has no item, so its names no site.
+fn import_references(
+  resolved: Resolved,
+  index: Int,
+  module: Module,
+) -> List<Reference> / {abort.raise} = {
+  let w = walk_of(resolved, index);
+  module.imports.fold([], |acc: List<Reference>, i: ImportDecl|
+    match i.kind {
+      INames(names) ->
+        names.fold(acc, |found: List<Reference>, n: Ident| {
+          let refers = [ValueSpace, TypeSpace, EffectSpace, SetSpace].fold(
+            Unbound,
+            |r: Refers, space: Namespace|
+              match r { Unbound -> definition(w, space, bare(n)), _ -> r },
+          );
+          found.push(reference(n, refers, false))
+        }),
+      _ -> acc,
+    })
+}
 
 /// Every name `item`, an item of the module at index `index` of `resolved`, writes, with what it
-/// refers to. A local's site is unique within its item, not its module.
+/// refers to. A name's site is unique within its item, not its module.
 pub fn item_references(
   resolved: Resolved,
   index: Int,
   item: Item,
-) -> List<Reference> / {abort.raise} =
-  walk_item({ module: index, resolved: resolved, scopes: [Map::new()], found: [] }, item).found
+) -> List<Reference> / {abort.raise} = walk_item(walk_of(resolved, index), item).found.values()
+
+/// The binder of each local `item` names, by the site of the name: how a check of the item finds
+/// its locals.
+pub fn item_binders(resolved: Resolved, index: Int, item: Item) -> Map<Int, Int> / {abort.raise} =
+  binders_of(walk_item(walk_of(resolved, index), item).found)
+
+/// The binder of each local `expr`, written in the module at `index`, names, by the site of the name.
+pub fn expression_binders(
+  resolved: Resolved,
+  index: Int,
+  expr: Expr,
+) -> Map<Int, Int> / {abort.raise} = binders_of(walk_expr(walk_of(resolved, index), expr).found)
+
+fn binders_of(found: Map<Int, Reference>) -> Map<Int, Int> =
+  found.fold(Map::new(), |binders: Map<Int, Int>, site: Int, r: Reference|
+    match r.refers { Local(b) -> binders.insert(site, b), _ -> binders })
 
 /// Every name `module`, the module at index `index` of `resolved`, writes, with what it refers to:
 /// its imports' names, then each item's.
@@ -365,22 +421,32 @@ pub fn references(
   resolved: Resolved,
   index: Int,
   module: Module,
-) -> List<Reference> / {abort.raise} = {
-  let start: Walk = { module: index, resolved: resolved, scopes: [Map::new()], found: [] };
+) -> List<Reference> / {abort.raise} =
   module.items.fold(
-    module.imports.fold(start, walk_import).found,
+    import_references(resolved, index, module),
     |acc: List<Reference>, item: Item| acc.concat(item_references(resolved, index, item)),
   )
-}
 
 // --- Tests ------------------------------------------------------------------
 
-fn written(src: Bytes) -> List<Reference> / {abort.raise} = {
-  let r = parse(src);
-  let x = expand(r.node, r.parser.diags);
-  let d: Expansion = expand_derives(0, b"m", x.module);
-  match resolve_modules([{ name: b"m", module: d.module, derived: d.derived }]) {
-    ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
+fn written(src: Bytes) -> List<Reference> / {abort.raise} = written_beside(src, [])
+
+/// The references of `src`, the module `m`, in a program of it and `others`.
+fn written_beside(
+  src: Bytes,
+  others: List<{ name: Bytes, src: Bytes }>,
+) -> List<Reference> / {abort.raise} = {
+  let parsed = |name: Bytes, text: Bytes| {
+    let r = parse(text);
+    let x = expand(r.node, r.parser.diags);
+    let d: Expansion = expand_derives(0, name, x.module);
+    { name: name, module: d.module, derived: d.derived }
+  };
+  let mods = others.map(|o: { name: Bytes, src: Bytes }| parsed(o.name, o.src)).push(
+    parsed(b"m", src),
+  );
+  match resolve_modules(mods) {
+    ResolveFailed(ds) -> panic(String::of_bytes_lossy(ds.get(0).message)),
     ResolveSucceeded(y) -> {
       let at = range(0, y.mods.len()).find(|i: Int| y.mods.get(i).name == b"m").unwrap_or(0);
       references(y.r, at, y.mods.get(at).module)
@@ -388,21 +454,21 @@ fn written(src: Bytes) -> List<Reference> / {abort.raise} = {
   }
 }
 
-/// What the name written at the `n`th place `text` occurs in `src` refers to.
+/// Where the `n`th `text` in `src` starts, counting from 0.
+fn place(src: Bytes, text: Bytes, n: Int) -> Int / {abort.raise} =
+  range(0, n).fold(src.index_of(text).unwrap_or(-1), |from: Int, k: Int|
+    src.index_of_from(text, from + 1).unwrap_or(-1))
+
+/// What the name written at the `n`th `text` in `src` refers to.
 fn refers_at(
   refs: List<Reference>,
   src: Bytes,
   text: Bytes,
   n: Int,
 ) -> Option<Refers> / {abort.raise} = {
-  let at = range(0, n).fold(src.index_of(text).unwrap_or(-1), |from: Int, k: Int|
-    src.index_of_from(text, from + 1).unwrap_or(-1));
+  let at = place(src, text, n);
   refs.find(|r: Reference| r.start == at && r.name == text).map(|r: Reference| r.refers)
 }
-
-fn place(src: Bytes, text: Bytes, n: Int) -> Int / {abort.raise} =
-  range(0, n).fold(src.index_of(text).unwrap_or(-1), |from: Int, k: Int|
-    src.index_of_from(text, from + 1).unwrap_or(-1))
 
 test "a local shadows another, and each use refers to the binder in scope where it is written" {
   let src = b"fn f(x: Int) -> Int = { let y = x; let x = y + 1; x }\n\nfn g() -> Int = f(1)\n";
@@ -438,11 +504,53 @@ test "a type and a variant spelled the same are told apart by where each is writ
 }
 
 test "a handler's variable, parameter and operation each refer to what declares them" {
-  let src = b"effect tally {\n  write count(n: Int) -> Unit\n}\n\nfn f() -> Int = handle {\n  tally.count(2);\n  0\n} with {\n  var total = 0,\n  tally.count(amount) -> {\n    total = total + amount;\n  },\n  return v -> v + total,\n}\n";
+  let src = b"effect tally {\n  write count(n: Int) -> Unit\n}\n\nfn f() -> Int = handle {\n  tally.count(2);\n  0\n} with {\n  var total = 0,\n  var twice = total * 2,\n  tally.count(amount) -> {\n    total = total + amount;\n  },\n  return v -> v + total,\n}\n";
   let refs = written(src);
   assert_eq(refers_at(refs, src, b"count", 1), refers_at(refs, src, b"count", 0));
   assert_eq(refers_at(refs, src, b"count", 2), refers_at(refs, src, b"count", 0));
-  assert_eq(refers_at(refs, src, b"total", 1), refers_at(refs, src, b"total", 0));
-  assert_eq(refers_at(refs, src, b"total", 3), refers_at(refs, src, b"total", 0));
+  let total = refers_at(refs, src, b"total", 0);
+  assert_eq(refers_at(refs, src, b"total", 1), total);
+  assert_eq(refers_at(refs, src, b"total", 2), total);
+  assert_eq(refers_at(refs, src, b"total", 3), total);
+  assert_eq(refers_at(refs, src, b"total", 4), total);
   assert_eq(refers_at(refs, src, b"amount", 1), refers_at(refs, src, b"amount", 0))
+}
+
+test "an or-pattern's names are its first alternative's, and a call on a local names the local" {
+  let src = b"type T = | A(Int) | B(Int)\n\nfn f(t: T, xs: List<Int>) -> Int = match t {\n  A(value) | B(value) -> value + xs.len(),\n}\n";
+  let refs = written(src);
+  assert_eq(refers_at(refs, src, b"value", 1), refers_at(refs, src, b"value", 0));
+  assert_eq(refers_at(refs, src, b"value", 2), refers_at(refs, src, b"value", 0));
+  assert_eq(refers_at(refs, src, b"xs", 1), refers_at(refs, src, b"xs", 0))
+}
+
+test "`ensures` binds `result`, and `cost` each parameter's cost name" {
+  let src = b"fn f(g: (Int) -> Int cost k, limit: Int = 3) -> Int\n  ensures result >= limit\n  cost k\n= g(limit)\n";
+  let refs = written(src);
+  assert_eq(refers_at(refs, src, b"limit", 1), refers_at(refs, src, b"limit", 0));
+  assert_eq(refers_at(refs, src, b"limit", 2), refers_at(refs, src, b"limit", 0));
+  assert(match refers_at(refs, src, b"result", 0) { Some(Local(_)) -> true, _ -> false });
+  assert_eq(refers_at(refs, src, b"k", 1), refers_at(refs, src, b"k", 0))
+}
+
+test "a test over cases reads its case, in its body and its label, by the binder it writes" {
+  let cases = b"pub type Table<a> = List<a>\n\npub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a = table.get(at)\n\npub fn listed<a>(table: List<a>, label: (a) -> String) -> List<String> = table.map(label)\n";
+  let src = b"test \"case {item}\" for item: Int in [1, 2] { assert(item > 0) }\n";
+  let show = b"pub fn display<a>(value: a) -> String = \"\"\n";
+  let refs = written_beside(src, [
+    { name: b"std.cases", src: cases },
+    { name: b"std.show", src: show },
+  ]);
+  let binder = refers_at(refs, src, b"item", 1);
+  assert(match binder { Some(Local(_)) -> true, _ -> false });
+  assert_eq(refers_at(refs, src, b"item", 0), binder);
+  assert_eq(refers_at(refs, src, b"item", 2), binder);
+  assert_eq(refs.filter(|r: Reference| r.name == b"item").len(), 3)
+}
+
+test "each name an item writes is noted at a site of its own" {
+  let src = b"effect tally {\n  write count(n: Int) -> Unit\n}\n\ntype Shape = | Dot | Box(Int)\n\nfn area(s: Shape) -> Int / {tally.count} = match s {\n  Dot -> 0,\n  Box(side) -> { tally.count(side); side * side },\n}\n";
+  let refs = written(src);
+  assert(refs.len() > 8);
+  assert(refs.all(|r: Reference| r.site != 0))
 }

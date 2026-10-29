@@ -16,9 +16,9 @@ import compiler.syntax.patterns (Lit, LInt, LFixed, LWide, LBool, LStr, LBytes, 
                                  LDec, LChar)
 import compiler.check.types (Resource, RSingleton, RVar, RNamed, RAny, Atom, Row, Type, TyVar,
                              TyCon, TyFn, TyRecord, Field, Scheme, Fresh, Subst, TypeEnv, Unified,
-                             atoms_insert, row_empty, row_open, row_singleton, named_type,
-                             applied_type, int_type, bool_type, string_type, bytes_type, float_type,
-                             decimal_type, unit_type, list_type, option_type, fn_type,
+                             InScope, env_depth, atoms_insert, row_empty, row_open, row_singleton,
+                             named_type, applied_type, int_type, bool_type, string_type, bytes_type,
+                             float_type, decimal_type, unit_type, list_type, option_type, fn_type,
                              fields_sorted, ints_insert, ints_union, fresh_new, fresh_ty_var,
                              fresh_ty, fresh_row_var, fresh_row, subst_new, with_bindings,
                              resolve_row, free_vars, env_bind_global, at_arguments, TyNominal,
@@ -375,7 +375,7 @@ pub type HoleSite = {
   module: Int,
   span: Span,
   var: Int,
-  locals: List<{ name: Bytes, sc: Scheme }>,
+  locals: List<InScope>,
   declared: Option<List<Atom>>,
   owner: Bytes,
   text: Bytes,
@@ -545,8 +545,8 @@ pub type RegionSite = {
 /// `simulate` region's tasks.
 pub type Brand = | HoldsOf(Bytes) | Tasks
 
-/// A local bound outside the innermost `simulate` region, named inside it.
-pub type Crossing = { name: Bytes, span: Span }
+/// A local bound outside the innermost `simulate` region, read inside it.
+pub type Crossing = { binder: Int, name: Bytes, span: Span }
 
 /// A `simulate` region: `entering` names each binding from outside it whose value holds a task.
 pub type Simulation = {
@@ -793,6 +793,8 @@ pub type Checker = {
   /// The definition or test whose body is being walked, which every site the walk records is
   /// filed under; empty for a clause or a law, which are walked afresh each time.
   walking: Bytes,
+  /// The binder of each local the item being walked reads, by the site of the read.
+  binders: Map<Int, Int>,
   /// What the rows handed in say the emitter reads of each body published from them.
   kept: List<KeptFacts>,
   /// Each rigid variable a clause sees one of its operation's own type parameters as where a value
@@ -830,15 +832,14 @@ pub type Checker = {
 }
 
 /// What the code being walked may reach of what is bound around it. `vars` are the variables of the
-/// handler whose clause is being walked, each by the stamp its name is bound at, which an assignment
-/// may give a new value; `barred` names the place in the clause where none may, since what runs
-/// there may run after the clause has returned. `frame` is how many scopes were open where the
-/// innermost closure the code runs in began: a local bound in one of them is read as its capture.
-pub type Assignable = {
-  vars: List<{ stamp: Int, name: Bytes, ty: Type }>,
-  barred: Option<Bytes>,
-  frame: Int,
-}
+/// handler whose clause is being walked, which an assignment may give a new value; `barred` names
+/// the place in the clause where none may, since what runs there may run after the clause has
+/// returned. `frame` is how many scopes were open where the innermost closure the code runs in
+/// began: a local bound in one of them is read as its capture.
+pub type Assignable = { vars: List<HandlerVariable>, barred: Option<Bytes>, frame: Int }
+
+/// A handler's variable, by the site of the name that binds it.
+pub type HandlerVariable = { binder: Int, name: Bytes, ty: Type }
 
 /// `checker` inside `place`, which may run after the code around it, as a closure of its own: no
 /// assignment there may give the variables of the clause around it a value, and a read there of
@@ -846,7 +847,7 @@ pub type Assignable = {
 pub fn barred(checker: Checker, place: Bytes) -> Checker =
   {
     ..checker,
-    assignable: { ..checker.assignable, barred: Some(place), frame: checker.env.scopes.len() },
+    assignable: { ..checker.assignable, barred: Some(place), frame: env_depth(checker.env) },
   }
 
 /// `o`, walked from `barred(outer, ..)`, in `outer`'s place again.
@@ -1057,8 +1058,6 @@ pub fn hold_atom(resource: Resource) -> Atom =
 pub fn is_region_effect(name: Bytes) -> Bool = name == hold()
 
 pub fn compare_values_name() -> Bytes = b"compare_values"
-
-pub fn result_name() -> Bytes = b"result"
 
 pub fn location_of(checker: Checker, span: Span) -> Location =
   { module: checker.module, span: span }
@@ -1914,7 +1913,9 @@ pub fn refuse_externs(checker: Checker, parsed: ParsedModule) -> Checker =
 
 // --- Names ------------------------------------------------------------------------------
 
-pub type ValueKey = { name: Bytes, prelude: Bool }
+/// What a name reads: a local, by the site of the name that binds it, or a global by its name,
+/// `prelude` where the prelude declares it.
+pub type ValueKey = | LocalKey(Int) | GlobalKey({ name: Bytes, prelude: Bool })
 
 // --- Types from type expressions ----------------------------------------------------------
 
