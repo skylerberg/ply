@@ -38,7 +38,8 @@ import std.string
 import compiler.check.lent (Passed, passed)
 import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
                              ReadBuiltin, FilledLabel, LabelNamed, LabelParam, retyped,
-                             typed_body_bin)
+                             typed_body_bin, typed_nodes, part_key, TypedRead, TypedUpdate,
+                             WholeBody)
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, settled)
 import compiler.check.infer.checker (Location, OpInfo, EffectInfo, CtorInfo, DefConstraint,
@@ -353,7 +354,7 @@ fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
     typed: facts.typed.map(|x: TypedSite| { ..x, module: module, owner: owner }),
     types: facts.types,
     rows: facts.rows.map(|x: RowSite| { ..x, module: module, owner: owner }),
-    bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, owner: owner }),
+    bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
 /// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
@@ -8447,4 +8448,57 @@ test "a function that borrows a record's field is used only while the record hol
     ),
     [b"E0316"],
   )
+}
+
+/// Each settled body of `src`'s module, under its owner and part.
+fn settled_of(src: Bytes) -> List<TypedBody<Type>> / {abort.raise} = settled_bodies(checker_m(src))
+
+/// The settled bodies of `owner` in `src`'s module.
+fn whole_body(src: Bytes, owner: Bytes) -> List<TypedExpr<Type>> / {abort.raise} =
+  settled_of(src).filter(|b: TypedBody<Type>| b.owner == owner && b.part == WholeBody).map(
+    |b: TypedBody<Type>| b.body,
+  )
+
+test "every body a check walks settles, filed under its owner and part" {
+  let c = checker_m(
+    Bytes::concat_all([
+      b"type Shape = | Circle(Int) | Square(Int)\n",
+      b"fn area(s: Shape, scale: Int = 1) -> Int = match s { Circle(r) -> 3 * r * r * scale, Square(w) -> w * w * scale }\n",
+      b"fn twice(x: Int) -> Int requires x > 0 = area(Circle(x)) + area(Square(x), scale: 2)\n",
+      b"test \"areas\" { assert_eq(twice(1), 7) }\n",
+      b"law \"square\" forall (n: Int) where n > 0 { area(Square(n)) == n * n }\n",
+    ]),
+  );
+  let settled = settled_bodies(c);
+  assert_eq(settled.len(), c.typed_bodies.len());
+  assert_eq(
+    settled.map(|b: TypedBody<Type>| part_key(b.part)).sort_by(|a: Bytes, b: Bytes|
+      compare(a, b) != Greater),
+    [b"body", b"body", b"clause 0", b"guard", b"law", b"run"],
+  )
+}
+
+test "a read inside its own recursive group settles at its definition's own variables" {
+  let reads = whole_body(
+    b"fn len<a>(xs: List<a>) -> Int = match xs { [] -> 0, [_, ..rest] -> 1 + len(rest) }",
+    b"m.len",
+  ).flat_map(
+    typed_nodes,
+  ).fold([], |acc: List<List<Type>>, e: TypedExpr<Type>|
+    match e.node {
+      TypedRead(ReadDefinition(d)) -> if d.full == b"m.len" { acc.push(d.args) } else { acc },
+      _ -> acc,
+    });
+  assert_eq(reads, [[TyVar(0)]])
+}
+
+test "an update settles with the fields it copies from its base" {
+  let copies = whole_body(
+    b"fn moved(p: {x: Int, y: Int}) -> {x: Int, y: Int} = { ..p, x: 1 }",
+    b"m.moved",
+  ).flat_map(
+    typed_nodes,
+  ).fold([], |acc: List<List<Bytes>>, e: TypedExpr<Type>|
+    match e.node { TypedUpdate(u) -> acc.push(u.copies), _ -> acc });
+  assert_eq(copies, [[b"y"]])
 }
