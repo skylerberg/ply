@@ -93,14 +93,14 @@ pub effect set Bootstraps = {compilers.write[cc], toolchain.read, toolchain.writ
 
 fn failed<a>(why: String) -> Result<a, List<Diag>> = Err([nowhere(why)])
 
-/// The toolchain native programs compile with under `profile`: `cc -O2`, which links them too,
-/// checked under `development`. A native program is the compiler, so both profiles optimise it:
-/// `-O1` compiles nearly as slowly, and unoptimised it checks several times slower.
-fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc]} =
+/// The toolchain that compiles and links native programs under `profile`. It is always `cc`.
+fn toolchain_for(profile: String) -> Result<Toolchain, List<Diag>> / {compilers.read[cc]} = {
+  let p = cc::profile_named(profile);
   match compilers.found[cc]() {
     None -> failed("no `cc` is installed to compile C with"),
-    Some(compiler) -> Ok(cc::toolchain_of(compiler, "-O2", profile != "release")),
+    Some(compiler) -> Ok(cc::toolchain_of(compiler, p.native, p.checked)),
   }
+}
 
 /// The runtime the library at `library` is, as a program linked with it and nothing else says.
 fn described(
@@ -520,16 +520,15 @@ fn answered(
   }
 }
 
-/// A step of a bootstrap and the milliseconds it took.
-type Took = { step: String, ms: Int }
+/// Prints to standard error how long `step` took since `since`, when `phases` is on. Each step
+/// prints as it finishes, so a long bootstrap shows its progress and a failed one shows how far it
+/// got.
+fn timed(phases: Bool, step: String, since: Int) -> Unit / {process.err[proc], time.elapsed_ms} =
+  if phases {
+    process.err[proc]("phases: " ++ step ++ " " ++ (time.elapsed_ms() - since).to_string() ++ "ms")
+  } else { () }
 
-fn took(steps: List<Took>, step: String, since: Int) -> List<Took> / {time.elapsed_ms} =
-  steps.push({ step: step, ms: time.elapsed_ms() - since })
-
-/// What a bootstrap that built `ply` made: what each step took.
-type Built = { steps: List<Took> }
-
-fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
+fn wrote(options: Options) -> Answer =
   {
     json: object([
       { key: "command", value: Str("bootstrap") },
@@ -539,8 +538,7 @@ fn wrote(options: Options, built: Built, phases: Bool) -> Answer =
     lines: [
       "built `ply` from " ++ options.root ++ " under " ++ options.profile,
       "wrote " ++ options.out,
-    ].concat(if !phases { [] }
-    else { built.steps.map(|t: Took| "phases: " ++ t.step ++ " " ++ t.ms.to_string() ++ "ms") }),
+    ],
     errs: [],
     code: ok_code(),
   }
@@ -564,14 +562,14 @@ fn installed(
 /// What names what every step of one bootstrap is made from: its shipped modules, and how it links.
 type Keys = { shipped: Bytes, linking: Bytes }
 
-/// The checkout's `ply` built below `work`, each step timed into `steps`.
+/// Builds the checkout's `ply` in `work`, printing each step's time with [`timed`].
 fn bootstrapped(
   options: Options,
   t: Toolchain,
   files: List<Shipping>,
   work: String,
   phases: Bool,
-) -> Result<Built, List<Diag>> / {Bootstraps, shipped.definitions, toolchain.bodies, toolchain.reused, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
+) -> Result<Unit, List<Diag>> / {Bootstraps, process.err[proc], shipped.definitions, toolchain.bodies, toolchain.reused, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
   let started = time.elapsed_ms();
   match described(t, options.library, work) {
     Err(diags) -> Err(diags),
@@ -582,7 +580,7 @@ fn bootstrapped(
           shipped: shipped_key(files),
           linking: linking_key(t, library, toolchain.libraries()),
         };
-        let steps = took([], "described the runtime", started);
+        timed(phases, "described the runtime", started);
         let at = time.elapsed_ms();
         match builder_built(
             options,
@@ -598,8 +596,8 @@ fn bootstrapped(
           ) {
           Err(diags) -> Err(diags),
           Ok(builder) -> {
-            let steps = took(
-              steps,
+            timed(
+              phases,
               if builder.taken { "took the kept builder" } else { "built the builder" },
               at,
             );
@@ -607,7 +605,7 @@ fn bootstrapped(
             match ply_built(options, builder.path, work, phases) {
               Err(diags) -> Err(diags),
               Ok(made) -> {
-                let steps = took(steps, "built `ply`", at);
+                timed(phases, "built `ply`", at);
                 let at = time.elapsed_ms();
                 match linked(
                     t,
@@ -616,16 +614,10 @@ fn bootstrapped(
                     work,
                   ) {
                   Err(diags) -> Err(diags),
-                  Ok(exe) ->
-                    finished(
-                      options,
-                      files,
-                      keys,
-                      made,
-                      exe,
-                      work,
-                      took(steps, "compiled and linked `ply`", at),
-                    ),
+                  Ok(exe) -> {
+                    timed(phases, "compiled and linked `ply`", at);
+                    finished(options, files, keys, made, exe, work, phases)
+                  },
                 }
               },
             }
@@ -636,7 +628,8 @@ fn bootstrapped(
   }
 }
 
-/// The `ply` linked at `exe` written where it goes with its pack, the last steps timed after `steps`.
+/// Writes the `ply` linked at `exe`, with its pack, to where it goes, printing each step's time with
+/// [`timed`].
 fn finished(
   options: Options,
   files: List<Shipping>,
@@ -644,21 +637,25 @@ fn finished(
   made: { front: Bytes, sources: List<cc::Source> },
   exe: String,
   work: String,
-  steps: List<Took>,
-) -> Result<Built, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, time.elapsed_ms, entropy.next, abort.raise} = {
+  phases: Bool,
+) -> Result<Unit, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, process.err[proc], time.elapsed_ms, entropy.next, abort.raise} = {
   let at = time.elapsed_ms();
   match answered(exe, files, made.front, keys, work) {
     Err(diags) -> Err(diags),
     Ok(a) -> {
-      let steps = took(
-        steps,
-        if a.taken { "took the kept answers" } else { "answered the shipped modules" },
+      timed(
+        phases,
+        if a.taken { "reused the standard library's stored check results" }
+        else { "checked the standard library with the new `ply`" },
         at,
       );
       let at = time.elapsed_ms();
       match installed(exe, options.out, packed_with(files, made.front, a.answered)) {
         Err(diags) -> Err(diags),
-        Ok(_) -> Ok({ steps: took(steps, "packed and wrote `ply`", at) }),
+        Ok(_) -> {
+          timed(phases, "packed and wrote `ply`", at);
+          Ok(())
+        },
       }
     },
   }
@@ -666,7 +663,7 @@ fn finished(
 
 pub fn run(
   flags: Flags,
-) -> Answer / {Bootstraps, compilers.read[cc], env.working_directory, env.variable, shipped.definitions, toolchain.bodies, toolchain.reused, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
+) -> Answer / {Bootstraps, process.err[proc], compilers.read[cc], env.working_directory, env.variable, shipped.definitions, toolchain.bodies, toolchain.reused, shipped.answer, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], entropy.next, time.now_ms, shipped.reached, Derives, abort.raise} = {
   let s = style_of(flags);
   match library::toolchain(checkout_of(flags)) {
     Err(unread) -> reported(s, "bootstrap", unread.diags, unread.places),
@@ -683,10 +680,7 @@ pub fn run(
           result
         },
       };
-      match built {
-        Err(diags) -> reported(s, "bootstrap", diags, []),
-        Ok(b) -> wrote(options, b, phases),
-      }
+      match built { Err(diags) -> reported(s, "bootstrap", diags, []), Ok(_) -> wrote(options) }
     },
   }
 }
@@ -721,6 +715,23 @@ test "a checkout named outside the working directory is the path it names" {
   assert_eq(options.root, "/src/ply");
   assert_eq(options.library, "/src/ply/target/debug/libply_runtime.a");
   assert_eq(options.out, "/src/ply/target/debug/ply")
+}
+
+test "a step's time prints when it finishes if phases are on, and not otherwise" {
+  let told = |phases: Bool|
+    handle {
+      timed(phases, "built `ply`", 10)
+    } with {
+      var lines: List<String> = [],
+      process.err[proc](line) -> {
+        lines = lines.push(line);
+        ()
+      },
+      time.elapsed_ms() -> 35,
+      return _done -> lines,
+    };
+  assert_eq(told(true), ["phases: built `ply` 25ms"]);
+  assert_eq(told(false), [])
 }
 
 // The CI's first bootstrap writes below `target/stage1`, which no build made before it.
