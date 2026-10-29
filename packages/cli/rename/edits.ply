@@ -3,8 +3,8 @@ import std.json (Bool)
 import paths (RootedPath, absolute, child, displayed, kind)
 import walk (Failure)
 import compiler.check.resolve.tables (Decls, Declaration, Namespace, ValueSpace, TypeSpace,
-                                      EffectSpace, SetSpace, space, namespaces, qualify,
-                                      module_of_name)
+                                      EffectSpace, SetSpace, Binding, space, namespaces,
+                                      bindings_in, qualify, module_of_name)
 import compiler.check.resolve.bindings (written, Reference, Member, Local, Definition, Operation,
                                         Module, Unbound, FieldName, CalledName, ArgumentName)
 import compiler.check.member (CallsFunction)
@@ -261,14 +261,67 @@ fn qualifier_new(rn: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes
     else { move.after.at(move.after.len() - 1).unwrap_or(text) },
   }
 
+fn definition_new(
+  rn: Renaming,
+  l: Loaded,
+  namespace: Namespace,
+  qualified: Bytes,
+  written: Bytes,
+) -> Bytes / {abort.raise} =
+  match key_of(l, qualified).and_then(|k: DefinitionKey|
+      in_space(rn.definitions, namespace).get(k)) {
+    Some(n) -> if member_of(written) != None { n } else { own_part(n) },
+    None -> written,
+  }
+
+pub type SharedName = { path: String, line: Int, old: Bytes, new: Bytes, other: Namespace }
+
+pub fn shared_names(rn: Renaming, loads: List<Loaded>) -> List<SharedName> / {abort.raise} =
+  loads.fold([], |acc: List<SharedName>, l: Loaded|
+    l.reads.fold(acc, |found: List<SharedName>, r: Read| {
+      let file = absolute(rn.pwd, r.file.at);
+      let bound = l.scopes.get(r.index).bound;
+      let after = namespaces().map(|namespace: Namespace|
+        {
+          namespace: namespace,
+          names: bindings_in(bound, namespace).fold(
+            Map::new(),
+            |names: Map<Bytes, Bool>, b: Binding|
+              names.insert(definition_new(rn, l, namespace, b.qualified, b.name), true),
+          ),
+        });
+      namespaces().fold(found, |f: List<SharedName>, namespace: Namespace|
+        space(l.declarations.get(r.index), namespace).fold(
+          f,
+          |into: List<SharedName>, d: Declaration| {
+            let new = in_space(rn.definitions, namespace).get({
+              file: file,
+              name: d.name,
+            }).unwrap_or(
+              d.name,
+            );
+            if new == d.name { into } else {
+              match after.find(|a: { namespace: Namespace, names: Map<Bytes, Bool> }|
+                  a.namespace != namespace && a.names.contains(new)) {
+                Some(a) ->
+                  into.push({
+                    path: displayed(r.file.at),
+                    line: line_at(r.file.text, d.span.start),
+                    old: d.name,
+                    new: new,
+                    other: a.namespace,
+                  }),
+                None -> into,
+              }
+            }
+          },
+        ))
+    }))
+
 fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
   match x.refers {
     Local(_) -> simple_name(rn.renames, displayed(r.file.at), x.name),
-    Definition(d) -> match key_of(l, d.qualified).and_then(|k: DefinitionKey|
-        in_space(rn.definitions, d.namespace).get(k)) {
-      Some(n) -> if member_of(x.name) != None { n } else { own_part(n) },
-      None -> x.name,
-    },
+    Definition(d) -> definition_new(rn, l, d.namespace, d.qualified, x.name),
     Operation(o) -> match key_of(l, o.effect).and_then(|k: DefinitionKey| rn.operations.get(k)) {
       Some(ops) -> ops.get(o.name).unwrap_or(x.name),
       None -> x.name,

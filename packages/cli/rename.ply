@@ -12,20 +12,28 @@ import std.time (time)
 import compiler.cc (toolchain)
 import compiler.load (Derives)
 import compiler.unit (shipped)
-import compiler.check.resolve.tables (Source, Declaration, Namespace, space, namespaces)
+import compiler.check.resolve.tables (Source, Declaration, Namespace, space, namespaces,
+                                      describe_namespace)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex)
 import rename.lines (Moved, OperationLine, Renames, keyword_refusal, renamed, renames_of, shown)
 import rename.strings (Mention, mentions_in, module_mentions)
 import rename.programs (Entry, Library, Loaded, Read, libraries_of, loads_of)
-import rename.edits (Edit, Edited, ModuleMove, applied, comment_edits, edited_of, moved_name,
-                     own_part, renaming_of, uses_renamed)
+import rename.edits (Edit, Edited, ModuleMove, SharedName, applied, comment_edits, edited_of,
+                     shared_names, moved_name, own_part, renaming_of, uses_renamed)
 import rename.verify (Renamed, retargeted_calls, verified)
 import program (Parses)
 
 type Change = { at: RootedPath, text: Bytes, changed: Bool, to: Option<RootedPath> }
 
-type Plan = { changes: List<Change>, mentions: List<Mention>, refusals: List<Failure> }
+type Plan = {
+  changes: List<Change>,
+  mentions: List<Mention>,
+  shared: List<SharedName>,
+  refusals: List<Failure>,
+}
+
+fn nothing_planned() -> Plan = { changes: [], mentions: [], shared: [], refusals: [] }
 
 fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.raise} = {
   let reads = loads.fold([], |acc: List<{ load: Loaded, read: Read }>, l: Loaded|
@@ -169,6 +177,7 @@ fn planned(
   });
   {
     changes: changes.filter(|change: Change| change.changed || change.to != None),
+    shared: shared_names(rn, loads),
     mentions: range(0, reads.len()).fold([], |acc: List<Mention>, i: Int| {
       let r = reads.get(i).read;
       let tokens = lexed.get(i).tokens;
@@ -249,6 +258,19 @@ fn json_report(plan: Plan, failures: List<Failure>, code: Int) -> Json =
       ),
     },
     {
+      key: "shared_names",
+      value: Array(
+        plan.shared.map(|s: SharedName|
+          object([
+            { key: "path", value: Str(s.path) },
+            { key: "line", value: Number(Decimal::of_int(s.line)) },
+            { key: "from", value: Str(String::of_bytes_lossy(s.old)) },
+            { key: "to", value: Str(String::of_bytes_lossy(s.new)) },
+            { key: "also", value: Str(String::of_bytes_lossy(describe_namespace(s.other))) },
+          ])),
+      ),
+    },
+    {
       key: "errors",
       value: Array(
         failures.map(|f: Failure|
@@ -281,13 +303,21 @@ fn answered(plan: Plan, failures: List<Failure>, check: Bool) -> CommandOutput =
         "warning: " ++ m.path ++ ":" ++ m.line.to_string()
           ++ ": a string contains the renamed name "
           ++ shown(m.name)),
+    ).concat(
+      plan.shared.map(|s: SharedName|
+        "warning: " ++ s.path ++ ":" ++ s.line.to_string() ++ ": renaming " ++ shown(s.old)
+          ++ " to "
+          ++ shown(s.new)
+          ++ " gives it the name of a "
+          ++ String::of_bytes_lossy(describe_namespace(s.other))
+          ++ " this module also uses"),
     ),
     code: code,
   }
 }
 
 fn refused_with(why: String) -> CommandOutput =
-  answered({ changes: [], mentions: [], refusals: [] }, [{ path: "", reason: why }], false)
+  answered(nothing_planned(), [{ path: "", reason: why }], false)
 
 pub fn run(
   flags: Flags,
@@ -303,13 +333,12 @@ pub fn run(
           let pwd = env.working_directory();
           let libraries = libraries_of(given);
           let loading = loads_of(given, pwd);
-          if loading.failures.len() > 0 {
-            answered({ changes: [], mentions: [], refusals: [] }, loading.failures, false)
-          } else {
+          if loading.failures.len() > 0 { answered(nothing_planned(), loading.failures, false) }
+          else {
             let plan = planned(pwd, renames, loading.loads, libraries);
-            if flags.check { answered(plan, plan.refusals, true) } else if plan.refusals.len() > 0 {
-              answered({ changes: [], mentions: [], refusals: [] }, plan.refusals, false)
-            } else {
+            if flags.check { answered(plan, plan.refusals, true) }
+            else if plan.refusals.len() > 0 { answered(nothing_planned(), plan.refusals, false) }
+            else {
               answered(
                 plan,
                 plan.changes.fold([], |acc: List<Failure>, change: Change|
