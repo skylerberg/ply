@@ -198,13 +198,9 @@ pub const ANSWERED: &str = "answered";
 /// (`ply run`'s front end, `ply check`'s answer), each swept on its own.
 pub const REUSED: &str = "reused";
 
-/// The stage-directory entry holding one runnable per program a builder built, each under what it
-/// is a function of besides its text and each swept on its own.
-pub const PROGRAMS: &str = "programs";
-
 /// The stage-directory entries that hold files swept one by one, where any other is a stage swept
 /// whole.
-const BY_FILE: [&str; 3] = [ANSWERED, REUSED, PROGRAMS];
+const BY_FILE: [&str; 2] = [ANSWERED, REUSED];
 
 /// An entry used within this long is never swept: a run may be reading it, or about to open what
 /// it just wrote.
