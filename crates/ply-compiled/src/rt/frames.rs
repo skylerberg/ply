@@ -14,9 +14,6 @@ pub const FAILED_OUT_OF_STACK: i64 = 3;
 /// The harness stopped the entry at its wall clock, which is not a verdict on the program.
 pub const FAILED_ABANDONED: i64 = 5;
 
-/// The entry spent its step budget without finishing.
-pub const FAILED_OUT_OF_STEPS: i64 = 6;
-
 /// The task was cancelled: it unwinds to its entry, which reports it cancelled rather than failed.
 pub const FAILED_CANCELLED: i64 = 7;
 

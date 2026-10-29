@@ -19,10 +19,6 @@ pub struct Tables {
     pub functions: Vec<usize>,
     /// Each pure nullary function's memoized answer by index, as an immortal word; `0` is none.
     pub memo: Box<[AtomicI64]>,
-    /// What computing each memoized answer cost, in calls, allocations and their bytes, stored
-    /// before the answer is: a later read charges it, so a cost is the same whether or not it was
-    /// memoized.
-    pub memo_costs: Box<[(AtomicI64, AtomicI64, AtomicI64)]>,
     /// Owns the memo's blocks for as long as the unit lives.
     pub immortals: Mutex<Heap>,
     /// Every root, sorted by `id`: what a body's stored site names.
@@ -46,29 +42,11 @@ impl Tables {
     }
 
     /// Remembers `kept`, an immortal copy emitted code made, as pure nullary function `index`'s
-    /// answer, with what computing it cost, which every later read charges. The first kept stays;
-    /// one another thread keeps after it stays in the unit's persistent heap, unread.
-    pub fn keep(&self, index: usize, kept: Word, cost: Cost) {
-        let (Some((steps, allocations, bytes)), Some(slot)) =
-            (self.memo_costs.get(index), self.memo.get(index))
-        else {
-            return;
-        };
-        steps.store(cost.steps, Release);
-        allocations.store(cost.allocations, Release);
-        bytes.store(cost.bytes, Release);
-        let _ = slot.compare_exchange(0, kept, AcqRel, Acquire);
-    }
-
-    /// What computing the memoized answer at `index` cost.
-    pub fn memo_cost(&self, index: usize) -> Cost {
-        match self.memo_costs.get(index) {
-            Some((steps, allocations, bytes)) => Cost {
-                steps: steps.load(Acquire),
-                allocations: allocations.load(Acquire),
-                bytes: bytes.load(Acquire),
-            },
-            None => Cost::default(),
+    /// answer. The first kept stays; one another thread keeps after it stays in the unit's
+    /// persistent heap, unread.
+    pub fn keep(&self, index: usize, kept: Word) {
+        if let Some(slot) = self.memo.get(index) {
+            let _ = slot.compare_exchange(0, kept, AcqRel, Acquire);
         }
     }
 }

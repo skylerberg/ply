@@ -36,7 +36,7 @@ import compiler.emit.tir (reps_of, all_given, Rep, RInt, RBool, RWord, RSlice, R
                           Assign, If, Case, Match, Loop, Next, Done, Restart, Enter, Return, Fail,
                           NoArm, Sited, Block, Fn, FnKind, Rooted, Plain, Member, Closure, no_links,
                           falls_through, rep_of_arg, counted, MFramed, OHandle, OContainer)
-import compiler.emit.tir.calling (ConstantRead, Ticked)
+import compiler.emit.tir.calling (ConstantRead)
 import compiler.emit.tir.handling (Entering, SiteHere)
 import compiler.emit.lower.setting (Setting, Root, imported_target, ctor_named, module_import)
 import compiler.syntax.exprs (scheduler_module)
@@ -713,8 +713,8 @@ pub fn entered(
 }
 
 /// The frame a known lambda `func` runs in, in place of a call of it on `lowered`: its parameters
-/// those arguments, its captures read off its closure, a step counted as the call it replaces would
-/// count one; under its lender's setting where another root lent it.
+/// those arguments, its captures read off its closure; under its lender's setting where another
+/// root lent it.
 fn known_entered(
   cx: Context,
   st: Lowering,
@@ -753,8 +753,8 @@ fn known_entered(
 /// The state the function `f` a walk runs on each item is lowered in: a pass's own block, which
 /// reads the item at the pass's place first, then the function's frame, its parameters the
 /// accumulator and the item of a fold, the item of a map or a filter. A lambda written here takes
-/// its captures from the caller's own values and counts a step as the call it replaces would; a
-/// known one runs as `known_entered` runs it; a definition named as a value is called.
+/// its captures from the caller's own values; a known one runs as `known_entered` runs it; a
+/// definition named as a value is called.
 fn walk_entered(
   cx: Context,
   st: Lowering,
@@ -810,8 +810,8 @@ fn walk_entered(
   };
   let o = match f.node {
     NKnown(_) -> known_entered(cx, read.st, f, params.map(Some), at),
-    NLambda(l) -> lambda_entered(cx, read.st, l, params, true, at),
-    _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, false, at),
+    NLambda(l) -> lambda_entered(cx, read.st, l, params, at),
+    _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, at),
   };
   { cx: o.cx, st: o.st, looped: WalkLoop({ walk: w, vars: v, entry: read.entry }) }
 }
@@ -961,21 +961,17 @@ fn some_case(o: Arg) -> Int =
   match case_index(rep_of_arg(o), some_ctor()) { Some(i) -> i, None -> 0 }
 
 /// The frame lambda `l`, written in this root's code, runs in, in place of a call of it on
-/// `params`: its captures the caller's own values, a step counted first where it is `ticked`.
+/// `params`: its captures the caller's own values.
 fn lambda_entered(
   cx: Context,
   st: Lowering,
   l: Lambda,
   params: List<Arg>,
-  ticked: Bool,
   at: Span,
 ) -> Opened / {abort.raise} =
   match filed_fn(cx, l.at, l.params) {
     None -> unfiled(cx, b"a lambda a walk runs", l.at),
     Some(t) -> {
-      let counted = if ticked {
-        done(st, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at)
-      } else { st };
       let inner = {
         ..cx,
         answer_ty: t.ret,
@@ -983,7 +979,7 @@ fn lambda_entered(
         captured: l.captures.map(|c: Capture| c.dst),
       };
       let taken = range(0, params.len()).fold(
-        { st: frame_entered(inner, counted, at), env: Map::new() },
+        { st: frame_entered(inner, st, at), env: Map::new() },
         |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
           match params.at(j) {
             Some(a) -> {
@@ -1035,8 +1031,7 @@ fn f_of(st: Lowering, slot: Int) -> Option<Var> =
   match st.env.get(slot) { Some(AVar(v)) -> Some(v), _ -> None }
 
 /// A known lambda's body run in place in `cx`'s frame: another root's sites taken from here on where
-/// it is lent, a step counted as the call it replaces would count one but where it is a definition
-/// named as a value, its captures read off its closure `f`, its parameters the arguments `lowered`.
+/// it is lent, its captures read off its closure `f`, its parameters the arguments `lowered`.
 fn in_frame(
   cx: Context,
   st: Lowering,
@@ -1054,14 +1049,9 @@ fn in_frame(
         Some(bl) -> emitted(st, Sited(Some({ root: bl.owner, base: bl.base }))),
         None -> st,
       };
-      let counted = match lender {
-        Some(bl) -> if bl.named { sited }
-        else { done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at) },
-        None -> done(sited, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at),
-      };
       let held = captures_held(cx, k.lambda.body, k.lambda.captures);
       let caps = range(0, k.lambda.captures.len()).fold(
-        { st: counted, env: Map::new() },
+        { st: sited, env: Map::new() },
         |acc: { st: Lowering, env: Map<Int, Arg> }, i: Int|
           match k.lambda.captures.at(i) {
             None -> acc,
@@ -1196,8 +1186,7 @@ fn walk_vars(cx: Context, st: Lowering, w: Walk) -> { st: Lowering, vars: WalkVa
 /// A walk's loop over the list `lowered` holds first, each pass lowered to `body` from `entered`'s
 /// state: it holds a fold's second argument, or an empty list with room for the items, and goes on
 /// with what the function answered, that pushed, or the item pushed where the function held of it;
-/// the pass at the list's length leaves with what it holds. It counts the steps the prelude's walk
-/// does: its call, its loop's entry and each pass.
+/// the pass at the list's length leaves with what it holds.
 fn walk_left(
   cx: Context,
   before: Lowering,
@@ -1251,7 +1240,6 @@ fn walk_left(
     };
     let ended = fresh(first.st, bool_type(), RBool);
     let pass = [
-      Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
       Let({
         var: ended.var,
         val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), n] }),
@@ -1272,16 +1260,14 @@ fn walk_left(
       arg: AVar(v.answer),
     }
   };
-  let ticked = range(0, 2).fold(outside(item), |s: Lowering, _: Int|
-    done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at));
   match ((w.ranged, lowered.args.at(0), lowered.range)) {
     (true, _, Some(r)) ->
-      range_guarded(cx, ticked, r.lo, r.hi, at, |s: Lowering, lo: Arg, hi: Arg| {
+      range_guarded(cx, outside(item), r.lo, r.hi, at, |s: Lowering, lo: Arg, hi: Arg| {
         let n = bound_as(s, int_type(), RInt, Prim({ op: b"sub", on: RInt, args: [hi, lo] }), at);
         looped(n.st, n.arg)
       }),
     (false, Some(Some(xs)), _) -> {
-      let n = length_read(ticked, xs, at);
+      let n = length_read(outside(item), xs, at);
       looped(n.st, n.arg)
     },
     _ -> unreachable(b"a walk over no list"),
@@ -1291,8 +1277,7 @@ fn walk_left(
 /// A map walk's loop, as the prelude's `Map::fold` and `map_folded` run it, each pass lowered to
 /// `body` from `entered`'s state: the seed where the map has no root, else a loop from the first
 /// leaf's first place, going on with what the function answered and the place after the one read,
-/// and leaving with what it holds once the map's every entry is done. It counts the steps the
-/// prelude's walk does, which it calls the same helpers of.
+/// and leaving with what it holds once the map's every entry is done.
 fn entries_left(
   cx: Context,
   before: Lowering,
@@ -1314,8 +1299,7 @@ fn entries_left(
   let item = emitted(h.st, Next([done_next.arg, AVar(e.leaf), place_next.arg, h.arg]));
   match ((lowered.args.at(0), lowered.args.at(1))) {
     (Some(Some(m)), Some(Some(init))) -> {
-      let tick = |s: Lowering| done(s, Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at);
-      let seed = handed({ st: tick(outside(item)), arg: init }, v.held.rep, at);
+      let seed = handed({ st: outside(item), arg: init }, v.held.rep, at);
       let root = laid(cx, seed.st, OfMap(MapRoot), [m], option_type(map_node(w)), at);
       let answer = fresh(root.st, w.held, held_as(cx.setting, w.held));
       let reads = |op: ContainerOp| Op({ op: OContainer(op), args: [m], uses: tir::reads(1) });
@@ -1331,13 +1315,9 @@ fn entries_left(
         [AVar(e.root), AVar(e.height)],
         at,
       );
-      let counted = emitted(
-        tick(first.st),
-        Let({ var: e.len, val: reads(Length), at: at, unwind: [] }),
-      );
-      let ended = fresh(counted, bool_type(), RBool);
+      let measured = emitted(first.st, Let({ var: e.len, val: reads(Length), at: at, unwind: [] }));
+      let ended = fresh(measured, bool_type(), RBool);
       let pass = [
-        Do({ val: Op({ op: OCalling(Ticked), args: [], uses: ticks() }), at: at, unwind: [] }),
         Let({
           var: ended.var,
           val: Prim({ op: b"ge", on: RInt, args: [AVar(v.at), AVar(e.len)] }),
@@ -1937,8 +1917,8 @@ pub fn step_captured(cx: Context, st: Lowering, args: List<Code>, how: InPlace) 
   }
 
 /// The closure of the body lowered to `inner` from `lambda_opened`'s state, made after `outer` of
-/// the values it captures, each as its word: a lambda's `Rooted`, which counts a step as a call
-/// does, or a `Plain` one standing for what a name reads as a value, which counts none of its own.
+/// the values it captures, each as its word: a lambda's `Rooted`, which spends fuel as a call
+/// does, or a `Plain` one standing for what a name reads as a value, which spends none of its own.
 pub fn closure(
   cx: Context,
   outer: Lowering,
@@ -3390,10 +3370,6 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
 /// What an operation that answers a word of its own and can fail does with its operands: it has none.
 fn answers() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
   { takes: [], owned: true, fails: true, stops: false }
-
-/// A step counted, which can fail where the run is cancelled, and answers nothing.
-fn ticks() -> { takes: List<Bool>, owned: Bool, fails: Bool, stops: Bool } =
-  { takes: [], owned: false, fails: true, stops: false }
 
 /// Whether `args` are what `iterate` runs in place: a seed, a budget, and a step of one parameter.
 fn stepped(args: List<Code>) -> Bool =

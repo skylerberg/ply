@@ -12,7 +12,6 @@
 mod dns;
 mod env;
 mod fs;
-pub mod meter;
 mod process;
 pub mod random;
 pub mod shipped;
@@ -135,7 +134,6 @@ pub fn natives() -> Vec<MachineNative> {
     natives.extend(dns::natives());
     natives.extend(env::natives());
     natives.extend(fs::natives());
-    natives.extend(meter::natives());
     natives.extend(process::natives());
     natives.extend(random::natives());
     natives.extend(shipped::natives());

@@ -60,7 +60,6 @@ import compiler.check.resolve.tables (Diag, Label, error_with_labels)
 import std.bin
 import std.list
 import std.graph
-import std.pace (meter, paced, spent, outgrown)
 import std.bytes (u64_le, hex_digit, ascii_of_int)
 import std.fs
 import std.fs (fs)
@@ -107,15 +106,15 @@ pub effect shipped {
   /// covers all its definition reaches.
   read definitions() -> Bytes
   /// What each of `roots`, each a `stored_root` of a `const` definition, answers on the unit
-  /// compiled into the library `library`, each entered by name with nothing, no host bound, under
-  /// `steps` calls: its value's encoding, or none where it raised, ran past its calls, or the unit
-  /// holds no such root.
-  read values(library: String, roots: List<String>, steps: Int) -> List<Option<Bytes>>
+  /// compiled into the library `library`, each entered by name with nothing, no host bound, within
+  /// `timeout_ms` milliseconds of wall clock: its value's encoding, or none where it raised, the
+  /// clock stopped it, or the unit holds no such root.
+  read values(library: String, roots: List<String>, timeout_ms: Int) -> List<Option<Bytes>>
   /// What `root` of the unit compiled into the library `library` answers for `arguments`, the list
-  /// of what it takes, under `steps` calls, no host bound, each value as PLV1 writes it: none where
-  /// it raised, ran past its calls or the unit holds no such root. The unit is opened the first
-  /// time a process enters it and kept for every later call.
-  read entered(library: String, root: String, arguments: Bytes, steps: Int) -> Option<Bytes>
+  /// of what it takes, within `timeout_ms` milliseconds of wall clock, no host bound, each value as
+  /// PLV1 writes it: none where it raised, the clock stopped it or the unit holds no such root. The
+  /// unit is opened the first time a process enters it and kept for every later call.
+  read entered(library: String, root: String, arguments: Bytes, timeout_ms: Int) -> Option<Bytes>
 }
 
 host for shipped by shipping
@@ -149,12 +148,16 @@ fn shipping<a | e>(go: () -> a / {shipped.read | e}) -> a / {native.read, abort.
       observed("", "", 6);
       shipped_definitions()
     },
-    shipped.values(library, roots, steps) ->
+    shipped.values(library, roots, timeout_ms) ->
       kept_values(
-        shipped_values(library, in_parts(roots.map(|root: String| Bytes::of_string(root))), steps),
+        shipped_values(
+          library,
+          in_parts(roots.map(|root: String| Bytes::of_string(root))),
+          timeout_ms,
+        ),
       ),
-    shipped.entered(library, root, arguments, steps) ->
-      found(shipped_entered(library, root, arguments, steps)),
+    shipped.entered(library, root, arguments, timeout_ms) ->
+      found(shipped_entered(library, root, arguments, timeout_ms)),
   }
 
 /// Every shipped module's name, as parts.
@@ -186,7 +189,7 @@ extern fn shipped_definitions() -> Bytes / {native.read}
 
 /// What each stored root of `roots`, as parts, answers on the unit compiled into `library`, as
 /// parts each found.
-extern fn shipped_values(library: String, roots: Bytes, steps: Int) -> Bytes / {native.read}
+extern fn shipped_values(library: String, roots: Bytes, timeout_ms: Int) -> Bytes / {native.read}
 
 /// What `shipped_values` said, each stored root's answer as the run wrote it: the encoding of a
 /// definition's value the root answers as `Bytes`, each read out of it; none for a root that
@@ -213,7 +216,7 @@ extern fn shipped_entered(
   library: String,
   root: String,
   arguments: Bytes,
-  steps: Int,
+  timeout_ms: Int,
 ) -> Bytes / {native.read}
 
 /// The runtime this binary is linked with, as it describes itself.
@@ -2622,8 +2625,9 @@ fn settling<s>(
 /// A `const` definition and the encoding of its value a build kept, which its stored root wrote.
 pub type Baked = { name: Bytes, bytes: Bytes }
 
-/// The calls a `const` definition may make before a build gives up on it.
-pub fn const_budget() -> Int = 100000000
+/// The milliseconds of wall clock a build or a check gives a `const` definition, a deriver, a tagged
+/// literal's parser or a statement it computes before anything runs, past which it is stopped.
+pub fn const_timeout_ms() -> Int = 60000
 
 /// The bytes a `const` definition's value's encoding may take.
 pub fn const_room() -> Int = 16777216
@@ -4231,7 +4235,7 @@ test "a cold unit asks the emitter for each root once, place by place" {
   let dump = three_modules_dump();
   let every = offered_roots(dump).keys;
   // Each place asks for its roots once each: no handing moves under a body already written.
-  let paced = {
+  let phases = {
     now: || 0,
     told: |t: PlaceTally|
       if t.asked == t.roots - t.kept { () } else {
@@ -4263,54 +4267,11 @@ test "a cold unit asks the emitter for each root once, place by place" {
       |_: Bytes| None,
       |_: List<Record>| (),
       [],
-      Some(paced),
+      Some(phases),
     ) {
     Ok(e) -> assert_eq((e.kept, e.misassumed), (0, [])),
     Err(why) -> assert_eq(why, b""),
   }
-}
-
-/// A chain of `n` modules, each calling the one before it.
-fn chained(n: Int) -> List<{ name: Bytes, src: Bytes }> =
-  range(0, n).map(|i: Int| {
-    let before = b"m".concat(ascii_of_int(i - 1));
-    {
-      name: b"m".concat(ascii_of_int(i)),
-      src: if i == 0 { b"pub fn f(x: Int) -> Int = x + 1\n" } else {
-        Bytes::concat_all([
-          b"import ",
-          before,
-          b"\npub fn f(x: Int) -> Int = ",
-          before,
-          b"::f(x) * 2 + ",
-          ascii_of_int(i),
-          b"\n",
-        ])
-      },
-    }
-  })
-
-/// How many objects the emission of a chain of `n` modules allocates, those it holds once its walk
-/// ends among them.
-fn made_by_walk(n: Int) -> Int / {meter.read, abort.raise} = {
-  let modules = chained(n);
-  let dump = dump_of(analyse(parse_all(modules)));
-  let sources = sources_placed(dump, modules);
-  spent(||
-    emitted(
-      a_runtime(b"r"),
-      dump,
-      sources,
-      Map::new(),
-      offered_roots(dump).keys,
-      |_: Bytes| None,
-      |_: List<Record>| (),
-    )).allocations
-}
-
-test "what a unit's walk allocates grows with the program it walks, no faster" {
-  let measures = [4, 8, 16, 32].map(|n: Int| { size: n, steps: made_by_walk(n), bound: n });
-  assert(!outgrown(measures), Some(f"{measures}"))
 }
 
 test "a unit holds a `const` definition as its kept value laid out as static data, its body asked for nothing" {
@@ -5322,10 +5283,10 @@ test "a unit is refused where its runtime binds a helper or lays out what its co
   let r = a_runtime(b"r");
   assert_eq(over(r), []);
   let moved = { ..r, facts: r.facts.insert(b"PlyCtx.frames.at", 72) };
-  let refused = over({ ..moved, helpers: moved.helpers.filter(|n: Native| n.name != b"rt_tick") });
+  let refused = over({ ..moved, helpers: moved.helpers.filter(|n: Native| n.name != b"rt_no_fuel") });
   assert_eq(refused, [
     b"E0481",
-    b"the runtime has no helper `rt_tick`, which emitted code calls",
+    b"the runtime has no helper `rt_no_fuel`, which emitted code calls",
     b"the runtime lays out `PlyCtx.frames.at` as 72, where this compiler declares 64",
     runtime_refused([]).notes_text.get(0),
   ]);
@@ -5928,45 +5889,5 @@ test "a cold walk asks the emitter for each root once over one scope, and a warm
     let warm = walk_in_store(kept_program());
     assert_eq((warm.emitter.built, warm.emitter.asked), (0, []));
     assert_eq(warm.answers.keys(), cold.answers.keys())
-  })
-}
-
-/// The base-2 logarithm of `n`, rounded down.
-fn log2(n: Int) -> Int =
-  range(0, 63).fold(0, |k: Int, i: Int| if n >> i + 1 > 0 { i + 1 } else { k })
-
-test "a walk's steps grow with the roots it answers, however long the chain of calls that finds them" {
-  let p = program_of(three_modules_dump(), [], []);
-  // Root `i` of a chain of roots written for types of module `a`, each calling the next.
-  let link = |i: Int| keys::written(keys::Drop, spelled(b"a.T".concat(ascii_of_int(i))), b"a");
-  paced(|n: Int| n * (log2(n) + 1), |n: Int| {
-    let at = range(0, n).fold(Map::new(), |m: Map<RootName, Int>, i: Int|
-      m.insert(root_name(link(i)), i));
-    let answer = |k: RootKey|
-      match at.get(root_name(k)) {
-        Some(i) ->
-          {
-            text: b"",
-            tables: { ..no_tables(), calls: if i + 1 < n { [link(i + 1)] } else { [] } },
-          },
-        None -> panic("no root of the chain"),
-      };
-    walked(
-      p,
-      b"",
-      no_ctors(),
-      [link(0)],
-      |_: Bytes| None,
-      |_: List<Record>| (),
-      None,
-      (),
-      |_: Unit, roots: List<RootKey>, _: Map<RootName, Handing>, _: Done|
-        {
-          held: (),
-          answers: roots.map(|k: RootKey| { name: root_name(k), answer: answer(k) }),
-          found: [],
-        },
-    ).answers.len(
-    )
   })
 }

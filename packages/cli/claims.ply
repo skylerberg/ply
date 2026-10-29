@@ -16,6 +16,7 @@ import proof.decide (Diagnosed, Static, decision_word, steps_of, unasked)
 import proof.lower (Blocker, blocker_parts)
 import proof.statics (Prover, claims_for, diagnosed, modules_of, prover_of, settled, settled_by)
 import machine
+import surface
 import units
 import units (emit)
 import compiler.front.facts (Analysis, schemas_instantiated)
@@ -68,7 +69,7 @@ pub type Options = {
   sim: machine::SimulationOptions,
 }
 
-pub type ProveOptions = { budget: Option<Int>, steps: Option<Int> }
+pub type ProveOptions = { budget: Option<Int>, timeout: Option<Int> }
 
 /// What a run reads from the store and files there, which whoever opened the store handles: the
 /// evidence filed under each key this program names, and the baseline a reader accepted for each
@@ -89,7 +90,7 @@ pub fn options_from(p: Parsed, root: String) -> Options / {abort.raise} =
     no_incremental: has(p, "no-incremental"),
     no_cache: has(p, "no-cache"),
     jobs: match value(p, "jobs") { Some(v) -> parse_nat(v), None -> None },
-    prove: { budget: nat_value(p, "prove-budget"), steps: nat_value(p, "prove-steps") },
+    prove: { budget: nat_value(p, "prove-budget"), timeout: nat_value(p, "timeout") },
     sim: machine::sim_options_from(p),
   }
 
@@ -118,9 +119,10 @@ pub type Claim = {
   schema: Option<String>,
 }
 
-/// The bounds a run discharges under: the static prover's budget, the calls each evaluation of a
-/// claim may make, and the search a law over interleavings runs.
-pub type Plan = { prove_budget: Int, step_budget: Int, sim: plan::Plan }
+/// The bounds a run discharges under: the static prover's budget, the milliseconds of wall clock
+/// each entry a claim's evaluation makes may take (0 for no clock), and the search a law over
+/// interleavings runs.
+pub type Plan = { prove_budget: Int, timeout_ms: Int, sim: plan::Plan }
 
 /// What a run loaded: the places its spans point into and what loading it had to say.
 pub type Collected = { places: List<Place>, warnings: List<Diag> }
@@ -157,7 +159,7 @@ pub type Collection = {
 pub fn plan_of(options: Options) -> Plan / {abort.raise} =
   {
     prove_budget: or_else(options.prove.budget, 10000),
-    step_budget: or_else(options.prove.steps, 1000000000),
+    timeout_ms: or_else(options.prove.timeout, surface::default_timeout_ms()),
     sim: machine::sim_plan_of(options.sim),
   }
 
@@ -773,14 +775,14 @@ fn judged_lanes(
 // --- Judging a claim ---------------------------------------------------------------
 
 /// What a discharge judges on: the program's unit, the obligations the world owes in its order,
-/// where each law is declared by its key, where each root is written, and the calls each entry a
-/// claim makes may make.
+/// where each law is declared by its key, where each root is written, and the milliseconds of wall
+/// clock each entry a claim makes may take.
 pub type Proving = {
   unit: Int,
   obligations: List<Obligation>,
   laws: Map<String, { module: Bytes, label: Bytes }>,
   roots: Map<Bytes, ModuleSpan>,
-  step_budget: Int,
+  timeout_ms: Int,
 }
 
 /// The claims of `collection` judged on the opened unit `unit` of `front`.
@@ -794,7 +796,7 @@ pub fn proving_of(unit: Int, front: LoadedAnalysis, collection: Collection) -> P
         acc.insert(String::of_bytes_lossy(l.key), { module: l.module, label: l.name }),
     ),
     roots: machine::roots_of(front.dump),
-    step_budget: collection.plan.step_budget,
+    timeout_ms: collection.plan.timeout_ms,
   }
 
 /// What one batch's points came to, and what the entries that judged them ended with.
@@ -930,7 +932,7 @@ fn boolean(answer: Result<Value, Judged>) -> Result<Bool, Judged> =
     Err(j) -> Err(j),
   }
 
-/// `root` entered at `args` on the unit, within the claim's calls, no host bound.
+/// `root` entered at `args` on the unit, within the claim's clock, no host bound.
 fn entered(
   p: Proving,
   root: String,
@@ -938,13 +940,14 @@ fn entered(
 ) -> Entered / {entering::machine.enter, abort.raise} = {
   let o = entering::machine.enter(p.unit, root, machine::arguments_of(args), {
     ..entering::unbounded(machine::max_calls()),
-    steps: p.step_budget,
+    timeout_ms: p.timeout_ms,
   });
   { answer: answered_of(o.ended, root), warnings: machine::warnings_of(o, p.roots) }
 }
 
-/// What an entry's ending says of a point: the value its root answered; a raise of the program's;
-/// or Ply's fault, which says nothing about the claim.
+/// What an entry's ending says of a point: the value its root answered; a raise of the program's,
+/// or the clock stopping it (`W0612`), either one a gap in the claim and never cached; or Ply's
+/// fault, which says nothing about the claim.
 fn answered_of(ended: entering::Ended, root: String) -> Result<Value, Judged> / {abort.raise} =
   match ended {
     entering::Answered(bytes) -> match value::decode(bytes) {
@@ -1045,7 +1048,7 @@ pub fn interleaved(
     Ok(r) -> {
       let o = entering::machine.enter(p.unit, r.body, machine::arguments_of(point), {
         ..entering::unbounded(machine::max_calls()),
-        steps: p.step_budget,
+        timeout_ms: p.timeout_ms,
         seed: Some({ root: seed.root, path: seed.path, steps: max(steps, 1) }),
       });
       let verdict = match boolean(answered_of(o.ended, r.body)) {
@@ -1280,7 +1283,7 @@ fn sim_json(s: plan::Plan) -> Json / {abort.raise} =
 pub fn plan_json(p: Plan) -> Json / {abort.raise} =
   object([
     { key: "prove_budget", value: int(p.prove_budget) },
-    { key: "step_budget", value: int(p.step_budget) },
+    { key: "timeout_ms", value: int(p.timeout_ms) },
     { key: "sim", value: sim_json(p.sim) },
   ])
 
@@ -1390,7 +1393,7 @@ pub fn a_claim(owner: String, kind: Kind) -> Claim =
 pub fn a_place() -> Place = { path: "m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }
 
 pub fn a_plan() -> Plan =
-  { prove_budget: 10000, step_budget: 1000000000, sim: plan::default_plan() }
+  { prove_budget: 10000, timeout_ms: surface::default_timeout_ms(), sim: plan::default_plan() }
 
 pub fn proved(rules: List<Rule>, steps: Int) -> Outcome =
   Proved({ rules: rules, steps: steps, guard_satisfiable: true, sorts: [], ran: false })
@@ -1656,6 +1659,14 @@ test "seconds are two places, whatever the clock read" {
   assert_eq(seconds(Decimal::of_int(0)), "0.00")
 }
 
+test "a claim's entries run under the clock `--timeout` names, and a test's where it names none" {
+  let timeout = |line: List<String>| plan_of(options_from(surface::parsed(line), ".")).timeout_ms;
+  assert_eq(timeout(["prove", "--timeout", "250"]), 250);
+  assert_eq(timeout(["review", "--timeout", "0"]), 0);
+  assert_eq(timeout(["prove"]), surface::default_timeout_ms());
+  assert_eq(plan_of(no_options()).timeout_ms, surface::default_timeout_ms())
+}
+
 /// The empty job: nothing cached, the defaults.
 pub fn no_options() -> Options =
   {
@@ -1663,7 +1674,7 @@ pub fn no_options() -> Options =
     no_incremental: false,
     no_cache: false,
     jobs: None,
-    prove: { budget: None, steps: None },
+    prove: { budget: None, timeout: None },
     sim: machine::no_sim_options(),
   }
 

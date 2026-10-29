@@ -257,7 +257,8 @@ and the text is read like an interpolated string's (escapes apply, `{{` and `}}`
 - If the parser returns `Err`, the literal is an error (`E0153`) reported at character `offset` of
   the text as written, with `message`. An escape or a doubled brace counts as one character, and
   the offset just past the end points at the closing quote.
-- A parser that raises, or makes more than ten million calls, is an error (`E0154`).
+- A parser that raises, or does not finish within a `const fn`'s time limit (§3.5), is an error
+  (`E0154`).
 
 The literal's hash covers its parser and its text. Editing anything the parser depends on rechecks
 every definition that uses the tag. `f` and `b` are not tags, since `f"` and `b"` start the strings
@@ -646,16 +647,16 @@ Its row is empty no matter what its body could raise, because the build already 
 `pub const fn` exports it. `const` cannot be combined with `transparent` or `reuse`.
 
 `ply check`, `ply run`, `ply test`, `ply prove` and `ply build` evaluate every `const fn` before
-doing anything else, with a budget of 100 million calls. One that raises is `E0157`, showing what it
-raised and where. One that exceeds the budget, or whose value encodes to more than 16 MiB, is
-`E0158`. In either case nothing in the program runs. The value is cached under the definition's
-hash, which covers its body, everything it reaches and every file it embeds, so it is evaluated
-again only after one of those changes.
+doing anything else, with a limit of 60 seconds of wall clock. One that raises is `E0157`, showing
+what it raised and where. One that does not finish within the limit, or whose value encodes to more
+than 16 MiB, is `E0158`. In either case nothing in the program runs. The value is cached under the
+definition's hash, which covers its body, everything it reaches and every file it embeds, so it is
+evaluated again only after one of those changes. A `const fn` that ran out of time is not cached,
+since the clock says nothing about the program.
 
-A call of a `const fn` reads the stored value and does not run the body: `std.pace`'s `spent`
-(§8.1) counts no steps or allocations for it. A program built without stored values, such as a mutant (§8.5) or a
-bisection step (§8.4), evaluates the body once per run instead. The result is the same either way,
-since the body is pure.
+A call of a `const fn` reads the stored value and does not run the body. A program built without
+stored values, such as a mutant (§8.5) or a bisection step (§8.4), evaluates the body once per run
+instead. The result is the same either way, since the body is pure.
 
 Storage is compact. An `Array` of `Int`s that fit in 63 bits, or of fixed widths narrower than 64
 bits, is stored as one block of words. An `Array` of records, `Float`s, 64-bit widths or
@@ -1424,10 +1425,9 @@ Every other call nests, up to 10,000 deep (`E0502` beyond that): `1 + f(n - 1)`,
 `handle`, `with_hold` or a lambda, and a call of another function. Each task has its own depth
 (§9).
 
-There is also a limit on total work: one entry point may make at most a billion calls by default.
-A loop that never ends fails with `E0503` when that budget runs out. `--steps N` changes it (`0` is
-no limit), and `ply run` has no limit by default, since a server is meant to run forever. The count
-is the same on every machine, so the result is too (§8.4).
+A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
+evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
+server is meant to run forever; `--timeout MS` sets one.
 
 `range`, the byte scanners, `List::map`, `List::filter` and `List::fold` do not nest calls.
 `std.prelude` writes the list functions in Ply as tail calls over the list's internal tree, so
@@ -1493,7 +1493,6 @@ an ordinary name when no `{` follows it.
   deterministic test may contain one and its result can be cached.
 - If several branches fail, the leftmost failure is the block's, whichever happened first. A branch
   to its right may already have performed effects.
-- The branches share one step budget (`E0503`, §8.4), as if run in turn.
 - A block whose branches could reach a `handle` around it, or a `simulate` region (§9), runs its
   branches in turn, with the same result. A handler clause that resumes in tail position, captures
   nothing and has no handler variables does not force this: each branch gets its own copy on its
@@ -1571,7 +1570,7 @@ end. Any other may not return, and its row must say so with the atom `diverges` 
   is a recursion that shrinks, a budget with `iterate`, or a `decreases` clause.
 - `diverges` belongs only on a loop that waits on something outside, such as a stream or a peer.
 - A caller inherits `diverges` like any other atom, and there `E0302` offers to add it.
-- A test, law or clause that may not return needs no `diverges`: its step budget bounds it.
+- A test, law or clause that may not return needs no `diverges`: its timeout bounds it.
 
 `ply check --types` says under each such definition why it may not return: its own recursion is
 not shown to shrink, or goes beyond what the check follows, or it calls a named definition that may
@@ -1977,7 +1976,7 @@ pattern does not match (§5.1); `iterate` past its budget; `task.join` of a canc
 
 - A signature that leaves `abort.raise` out of its row when its body can raise is `E0302`, which
   names the operation and offers the row to write.
-- Overflow, the call depth limit and a used-up step budget end the program regardless of the row.
+- Overflow and the call depth limit end the program regardless of the row.
 - A clause for `abort.raise` receives the message: `panic`'s argument, or what would otherwise be
   reported.
 - Unhandled, it is `E0501` for a failed assertion and `E0502` for anything else.
@@ -2353,43 +2352,6 @@ referenced or given arguments.
   once nothing holds it, so an object left alive is a leak, and a defect in Ply. What the build
   stored, a cached constant's stored copy, and what a scheduler holds for itself are not the test's.
 
-**Measuring cost.** `std.pace`'s `spent(f)` returns `f()` together with what it cost, counted by
-the runtime rather than by the clock, so the numbers are the same on every machine:
-
-- `steps`: the calls it made, `f`'s own included, counted as `--steps` counts them;
-- `allocations`: the objects it created;
-- `bytes`: the memory those took (an update in place costs none; a copy does).
-
-`spent` reads these through the effect `pace::meter`. Its real handler (§6.10) serves only a run of
-`ply test`: what a computation costs is the compiler's choice, so no program's result may depend on
-it, and any other run fails at its first reading with `E0424`. The readings themselves are not part
-of what `spent` returns. To count what a test performs, handle the effect in the test.
-
-A cached constant costs what computing it costs, whether or not an earlier call computed it, so a
-cost is the same however often it is read, and the same in both build profiles (§8.6). A `const fn`
-whose value the build stored costs nothing to read (§3.5). Operations the scheduler handles (`task`'s,
-and under `simulate` also `clock`'s, `random`'s and `sim`'s) cost the program nothing: the
-scheduler's own work counts no steps, objects or bytes, and no `--steps` budget limits it.
-
-```ply
-import std.pace (spent)
-
-type Chain = | Link(Int, Chain) | End
-
-fn chain(n: Int) -> Chain = if n <= 0 { End } else { Link(n, chain(n - 1)) }
-
-test "ten more levels cost ten more calls and ten more objects" {
-  let small = spent(|| chain(10));
-  let large = spent(|| chain(20));
-  assert_eq(large.steps - small.steps, 10);
-  assert_eq(large.allocations - small.allocations, 10)
-}
-```
-
-Functions that `std.prelude` writes in Ply, such as `List::map` or `List::fold`, cost the steps
-their bodies take, which may change between releases. `std.pace::paced` checks how `steps` grows
-with input size instead of pinning an exact number.
-
 **Tests over cases.** A test can run once for each element of a table. Each run is a *case*:
 
 ```ply
@@ -2525,10 +2487,6 @@ The report is printed as the run goes:
 `--json` prints one object when the run ends. `--workspace` prints each package's heading before
 it runs.
 
-`--steps N` is how many calls each test may make (default 1,000,000,000; `0` is no limit). A test
-over the limit fails with `E0503`. This is a program error like any other and is recorded as one,
-because the count is a property of the program.
-
 `--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). It
 is not a verdict: a test over it is *abandoned* (`W0612`), reported separately from failures,
 recorded nowhere, and run again next time. A run with an abandoned test is not a success, since it
@@ -2653,7 +2611,8 @@ Errors:
   from outside come in: the region may not use a variable from outside whose value holds one. Each
   region numbers its own tasks and channels, so a handle that sneaks into another region (in a
   closure or through a type parameter) fails there at run time with `E0413`.
-- `E0414`: no task can make progress (deadlock), or the step budget ran out.
+- `E0414`: no task can make progress (deadlock), or an interleaving took more scheduling steps than
+  `--sim-steps` allows.
 - `E0416`: a `simulate` inside another. A `simulate` inside a task of the program's own scheduler
   (§14) is allowed, its schedule drawn from the entry's seed.
 - `E0425`: a host operation inside the region, refused before the handler runs, whether or not it
@@ -2777,8 +2736,8 @@ on is `proved`.
 | `defect` | Ply failed, not the program; nothing is claimed |
 
 A property that cannot be proved is not a claim a program may rely on. Check it in a test (§8.1)
-instead, over values `std.gen` generates or sizes `std.pace` doubles. Then it says what a test
-says: that it held where it was run.
+instead, over values `std.gen` generates. Then it says what a test says: that it held where it was
+run.
 
 **What the prover can do.** It proves claims using: evaluation of ground terms; enumeration of
 finite domains up to 4096 points; linear `Int` arithmetic; case splits; congruence; constructor
@@ -2959,7 +2918,10 @@ Flags:
 - `--filter SUBSTRING`: the claims whose owner's name contains the text, as `ply test` matches a
   key (§8.2); repeat to match any.
 - `--prove-budget N`: static reasoning steps per claim; a claim that runs out is `unproved`.
-- `--prove-steps N`: calls per evaluation of a claim (default 1,000,000,000).
+- `--timeout MS`: wall-clock time each entry a claim's evaluation makes may take (default 60000;
+  `0` is no limit), as `ply test --timeout` bounds a test. An evaluation over it is abandoned
+  (`W0612`) and proves nothing: the claim is `unproved` as one whose evaluation raised, with the
+  runtime's message as its `gap`, and it is not cached.
 - `--reach`: ask the static prover alone about every claim, cached or not. Under `--json`, each
   claim then has `reach`: what it decided (`proved`, `guard_unsatisfiable`, `open` or
   `budget_spent`), the steps it took, and each place it left the fragment it can decide, as `{kind,
@@ -3036,8 +2998,7 @@ Steps within the bound are `proved`. Anything else leaves the bound `unproved` (
 name, definitions calling each other, another package's definition with no `cost` bound, an `Int`
 parameter the steps grow with, and a definition that takes, returns or builds a value of a type with
 a `key` or `numeric` (§4.4), whose comparisons and operators call functions the reading cannot see.
-If a bound cannot be shown this way, do not write it: delete the clause and check the definition's
-growth in a test with `std.pace::paced`.
+If a bound cannot be shown this way, do not write it.
 
 **Space bounds.** A `space` clause bounds the memory a call holds beyond what it is given:
 
@@ -3178,12 +3139,13 @@ derive sql for Order
 - A deriver is any module's `pub fn derive(declaration: derive::Declaration) -> Result<String,
   derive::Refused>`, performing nothing but raises. `std.derive` describes a declaration.
 - The checker compiles a deriver once and runs it for each declaration in isolation, with a `const
-  fn`'s budget (§3.5). Each result is cached under the declaration and the source of the modules the
-  deriver reaches, so it reruns only after an edit to one of them.
+  fn`'s time limit (§3.5). Each result is cached under the declaration and the source of the modules
+  the deriver reaches, so it reruns only after an edit to one of them. A run that raised or ran out
+  of time is not cached.
 - A deriver is a standard library module or one of the program's own, and a deriver's own modules
   derive nothing through a deriver.
 - A name no import binds is `E0207`. A module whose `derive` is not a deriver is `E0160`. A deriver
-  that raises, runs out of budget, returns anything other than functions, or writes a definition
+  that raises, runs out of time, returns anything other than functions, or writes a definition
   that does not check is `E0155`.
 
 `std.derive.map` writes `T::map` for a sum or a `new` record: the value rebuilt with each type
@@ -3202,8 +3164,8 @@ comment.
   `List::filter`, `List::fold`, and `Map`'s functions except `Map::new` and `Map::len`. A call reads
   these by their signatures and clauses, as it reads an `extern fn`, so `List::set`'s `requires` is
   checked where it is called (§6.8).
-- A call of a native function counts as one step. A function written in Ply takes the steps its body
-  takes.
+- In a `cost` bound (§10), a call of a native function counts as one step, and a function written
+  in Ply takes the steps its body takes.
 - Comparing (`==`, `!=`, `compare`, `compare_values`), hashing (`digest`) or reflecting (`reflect`,
   `shown`) a list or map uses `List::at`, `List::push` and `Map::entries`, so a definition that does
   so depends on them and its hash covers them.
@@ -3603,15 +3565,15 @@ is a `.ply` file or a directory; left out, it is the package that contains the w
 their paths as written. `ply doc` works outside any package for builtins and the standard library.
 
 **Flag groups.** *simulation* (§9); *host* (the flags in §14 other than trace and drain); *prove*
-(`--prove-budget`, `--prove-steps`); *trace* (`--trace`, `--trace-level`); *drain* (`--drain-ms`,
+(`--prove-budget`, `--timeout`, §10); *trace* (`--trace`, `--trace-level`); *drain* (`--drain-ms`,
 `--drain-lead-ms`).
 
 | command | flags |
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the last part of the path), `--lib` (a library: one `pub` definition, no `main`). Refuses an invalid package name and an existing directory. |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (the checking phases and how much was reused from the cache; with `--types`, also effect sets, where each type came from, and each place a body can raise, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--steps`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
-| `ply run [path] [-- ARGS]` | `--seed` (always one interleaving), `--steps` and `--timeout` (no limit by default, since a server runs forever), `--profile`, `--explain` (whether checking was reused from an earlier run, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain. `ARGS` is what `process.args` returns. A `.plyx` path runs the built artifact. |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply run [path] [-- ARGS]` | `--seed` (always one interleaving), `--timeout` (no limit by default, since a server runs forever), `--profile`, `--explain` (whether checking was reused from an earlier run, and the load's phases), `--require-signer KEY` (repeatable; §15.2), host, trace, drain. `ARGS` is what `process.args` returns. A `.plyx` path runs the built artifact. |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--workspace`, `--verify-deps`, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, prove, simulation |
 | `ply build [path]` | `--entry NAME`, `-o FILE` (default `<entry module>.plyx` for a program, `<package>.plyz` for a library), `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY` (signatures in `<FILE>.sig`), `--verify` (compare, write nothing; §15.2) |
@@ -3664,24 +3626,25 @@ reuse it.
 three things after checking and before anything else:
 
 1. **Tagged literals** (§2.3). Each literal in the root package's modules is parsed by calling its
-   parser, in isolation with no permissions, with a budget of ten million calls. A refusal is
-   `E0153` or `E0154`. The verdict depends only on the parser and the text, so it is cached under the
-   hash of everything the parser reaches and the text, and a parser runs again only for a new text or
-   after an edit to something it reaches. A dependency's literals are that package's to check. In a
-   program loaded without this step, a literal its parser rejects ends the run where it is read
+   parser, in isolation with no permissions, with the time limit a `const fn` has (§3.5). A refusal
+   is `E0153` or `E0154`. The verdict depends only on the parser and the text, so it is cached under
+   the hash of everything the parser reaches and the text, and a parser runs again only for a new
+   text or after an edit to something it reaches. A parser that runs out of time is not cached, since
+   the clock says nothing about the parser. A dependency's literals are that package's to check. In
+   a program loaded without this step, a literal its parser rejects ends the run where it is read
    (`E0502`).
 2. **Constants** (§3.5). Each `const fn` in the program, whichever package declares it, is
-   evaluated in isolation with its own budget, and its value is cached under the definition's hash.
-   A `const fn` that raises is evaluated again by every load until it is fixed, so its error points
-   at the current source.
+   evaluated in isolation, and its value is cached under the definition's hash. A `const fn` that
+   raises is evaluated again by every load until it is fixed, so its error points at the current
+   source.
 3. **SQL statements.** The statements the root package's modules run are checked against the schema
    (§3.5) their module reaches: each `db.query`, `db.batch`, `db.execute`, `db.returning` and
    `db.copy_out`; `std.db`'s `fetch` and `fetch_returning`; and `std.sqlite`'s `query`, `execute`,
    `returning`, `run` and `fold_rows`. A statement is checked when it can be computed before the
    program runs: text (joined by `++` or not), a call of a definition on such values,
    `sqlite::bound` of one, or a tagged literal. Each definition a statement is computed by runs in
-   isolation with the literals' budget; one that raises leaves the statement to be checked at run
-   time. Errors are reported at the call, with the statement, where it came from, and the schema:
+   isolation with the literals' time limit; one that raises or runs out of time leaves the statement
+   to be checked at run time. Errors are reported at the call, with the statement, where it came from, and the schema:
    - `E0431`: text the SQL parser rejects.
    - `E0435`: the statement's tables do not include the table the call's label names.
    - `E0436`: the operation does not match the statement: a write run as a query, a read (or a

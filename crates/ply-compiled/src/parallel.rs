@@ -4,10 +4,11 @@
 use crate::blocks::Blocks;
 use crate::emitted::Block;
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_OUT_OF_STEPS, PROGRAM_STACK, stack_floor};
+use crate::rt::{Ctx, PROGRAM_STACK, stack_floor};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering::Relaxed;
 
 /// A branch's closure called with nothing.
 fn call(ctx: *mut Ctx, f: Word) -> Word {
@@ -153,6 +154,15 @@ struct Branch {
     answer: Word,
 }
 
+/// Takes a branch's context off the watchdog's list as its run ends, however it ends.
+struct Unwatch(*mut Ctx);
+
+impl Drop for Unwatch {
+    fn drop(&mut self) {
+        unsafe { (*self.0).unwatch() };
+    }
+}
+
 /// A branch handed to a pool thread. The parent waits for every branch before it reads one again,
 /// and nothing else names a branch's context or what its closure reaches but shared objects.
 struct Handed(*mut Branch);
@@ -166,7 +176,9 @@ impl Handed {
         let branch = unsafe { &mut *self.0 };
         let ctx: *mut Ctx = &mut *branch.ctx;
         let c = unsafe { &mut *ctx };
-        c.stack_floor = stack_floor();
+        c.stack_floor.store(stack_floor(), Relaxed);
+        let _unwatch = Unwatch(ctx);
+        c.watch();
         let branch_was = BRANCH_OF.with(|of| of.replace(c.id.0));
         let own = worker_taken(c.id.0).map(|w| c.heap.swap_blocks(w));
         let heap_was = heap::swap_current(&mut c.heap);
@@ -212,10 +224,7 @@ unsafe fn in_parallel(
             scope.spawn(move |_| unsafe { handed.run() });
         }
     });
-    // Left to right: the first branch that failed, or that ran past what the budget had left once
-    // the branches before it had spent theirs, is how evaluating them in turn would have ended.
-    let left = parent.steps_left();
-    let mut spent = 0i64;
+    // Left to right: the first branch that failed is how evaluating them in turn would have ended.
     let mut ended = false;
     for (slot, run) in branches.iter_mut().zip(runs) {
         let Branch { ctx, answer, .. } = run;
@@ -225,16 +234,10 @@ unsafe fn in_parallel(
             parent.absorb(ctx);
             continue;
         }
-        spent = spent.saturating_add(ctx.ticks);
-        let out_of_steps =
-            ctx.failed == FAILED_OUT_OF_STEPS || left.is_some_and(|left| spent > left);
         let failure = ctx.take_branch_failure();
         *slot = if failure.is_some() { 0 } else { answer };
         parent.absorb(ctx);
-        if out_of_steps {
-            parent.fail_out_of_steps();
-            ended = true;
-        } else if let Some(f) = failure {
+        if let Some(f) = failure {
             parent.fail_from_branch(f);
             ended = true;
         }

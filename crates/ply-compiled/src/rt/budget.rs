@@ -1,6 +1,9 @@
-//! Fuel, stacks, ticks, and the step and time budgets an entry runs within.
+//! Fuel, stacks, and the wall clock an entry runs within.
 
 use super::*;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Condvar, Once, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 /// The prologue's refusal: this call would nest past the budget the machine handed the entry.
 pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
@@ -14,23 +17,28 @@ pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
 }
 
-/// The prologue's slow path, for a frame below `ctx.stack_floor`: makes room below the floor of the
-/// stack it runs on and lowers the floor to match. Answers 1, or 0 with the context failed for a
-/// call nesting past what the native stack holds, on a thread's own stack, whose floor is final, on
-/// a runtime stack whose reservation is spent, and on a stack the runtime does not know.
+/// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
+/// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
+/// otherwise makes room below the floor of the stack it runs on and lowers the floor to match.
+/// Answers 1, or 0 with the context failed for a spent clock, a call nesting past what the native
+/// stack holds, on a thread's own stack, whose floor is final, on a runtime stack whose reservation
+/// is spent, and on a stack the runtime does not know.
 pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
     let c = unsafe { &mut *ctx };
+    if c.out_of_time() {
+        return 0;
+    }
     // A floor another context's growth or a restored frame left stale needs no system call.
     let floor = stack_floor();
     if at >= floor {
-        c.stack_floor = floor;
+        c.stack_floor.store(floor, Relaxed);
         return 1;
     }
     if ply_core::limit::running_low(at).is_some() && ply_core::limit::extend_running() {
         c.grown += 1;
-        c.stack_floor = stack_floor();
+        c.stack_floor.store(stack_floor(), Relaxed);
         return 1;
     }
     let d = error("this call would nest past what the native stack holds");
@@ -53,7 +61,7 @@ pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
         (*ctx).fuel = fuel;
         (*ctx).frames = frames;
         (*ctx).task = task;
-        (*ctx).stack_floor = stack_floor();
+        (*ctx).stack_floor.store(stack_floor(), Relaxed);
     }
 }
 
@@ -62,7 +70,7 @@ pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
 /// its own for the call's duration. Answers 0 with the context failed when no stack can be had.
 pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
     if let Some(floor) = floor_here() {
-        unsafe { (*ctx).stack_floor = floor };
+        unsafe { (*ctx).stack_floor.store(floor, Relaxed) };
         return call();
     }
     let Some(stack) = Stack::take() else {
@@ -93,7 +101,9 @@ struct Hop<'a, F> {
 extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
     let hop = arg as *mut Hop<'_, F>;
     let call = unsafe {
-        (*(*hop).ctx).stack_floor = (*hop).stack.enter();
+        (*(*hop).ctx)
+            .stack_floor
+            .store((*hop).stack.enter(), Relaxed);
         (*(*hop).ctx).frames = std::ptr::null_mut();
         (*hop).call.take().expect("a hop runs its call once")
     };
@@ -116,57 +126,81 @@ pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
     c.fail_with(FAILED_OUT_OF_STACK, d)
 }
 
-/// The callback the counter reaching [`Ctx::next_tick`] makes: the entry gets more work, or it
-/// gets none.
-pub unsafe extern "C" fn rt_tick(ctx: *mut Ctx) {
-    let ctx = unsafe { &mut *ctx };
-    ctx.tick();
+/// Nothing. The released compiler's code calls it once its counter reaches [`Ctx::next_tick`],
+/// which this runtime never lets it do.
+pub unsafe extern "C" fn rt_tick(_ctx: *mut Ctx) {}
+
+/// How soon the watchdog raises an expired entry's floor again, since a stack switch lowers it.
+const REWATCH: Duration = Duration::from_millis(10);
+
+/// The floors of the contexts running against a deadline, each by its address, which a thread
+/// raises past every frame once the deadline passes: the context's next call or loop restart then
+/// reaches [`rt_stack_more`], which ends the entry. Calls themselves pay nothing for the clock.
+struct Watch {
+    watched: Mutex<Vec<(usize, Instant)>>,
+    changed: Condvar,
 }
 
-/// Calls between two callbacks while an entry is still within its bounds.
-pub(super) const TICK_CHUNK: i64 = 4096;
-
-thread_local! {
-    /// The calls one entry may make; 0 is no bound.
-    static THREAD_STEP_BUDGET: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+fn watch() -> &'static Watch {
+    static WATCH: OnceLock<Watch> = OnceLock::new();
+    static STARTED: Once = Once::new();
+    let w = WATCH.get_or_init(|| Watch {
+        watched: Mutex::new(Vec::new()),
+        changed: Condvar::new(),
+    });
+    STARTED.call_once(|| {
+        std::thread::Builder::new()
+            .name("ply-deadlines".into())
+            .spawn(move || w.run())
+            .expect("the deadline watchdog's thread starts");
+    });
+    w
 }
 
-/// Runs `f` with entries on this thread bounded by `steps` rather than by the default budget.
-pub fn with_step_budget<R>(steps: i64, f: impl FnOnce() -> R) -> R {
-    let before = THREAD_STEP_BUDGET.with(|t| t.replace(Some(steps.max(0))));
-    let out = f();
-    THREAD_STEP_BUDGET.with(|t| t.set(before));
-    out
+impl Watch {
+    fn run(&self) -> ! {
+        let mut watched = self.watched.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            let now = Instant::now();
+            let mut wake: Option<Instant> = None;
+            for &(floor, deadline) in watched.iter() {
+                let next = if deadline <= now {
+                    // SAFETY: a context leaves the list before it moves or its memory goes.
+                    unsafe { (*(floor as *const AtomicUsize)).store(usize::MAX, Relaxed) };
+                    now + REWATCH
+                } else {
+                    deadline
+                };
+                wake = Some(wake.map_or(next, |w| w.min(next)));
+            }
+            watched = match wake {
+                Some(at) => {
+                    let wait = at.saturating_duration_since(now);
+                    let waited = self.changed.wait_timeout(watched, wait);
+                    waited.unwrap_or_else(PoisonError::into_inner).0
+                }
+                None => (self.changed.wait(watched)).unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+    }
 }
 
-pub fn step_budget() -> i64 {
-    THREAD_STEP_BUDGET
-        .with(|t| t.get())
-        .unwrap_or(ply_core::DEFAULT_STEP_BUDGET)
+/// Has the watchdog raise `floor` once `deadline` passes, until [`unwatched`].
+pub(crate) fn watched(floor: &AtomicUsize, deadline: Instant) {
+    let w = watch();
+    let at = std::ptr::from_ref(floor) as usize;
+    (w.watched.lock().unwrap_or_else(PoisonError::into_inner)).push((at, deadline));
+    w.changed.notify_one();
 }
 
-/// Runs `f` with entries on this thread bounded by neither budget: the compiler's own work is
-/// not the program's, so the program's bounds are not its.
-pub fn unbounded<R>(f: impl FnOnce() -> R) -> R {
-    with_step_budget(0, || with_time_budget(0, f))
-}
-
-thread_local! {
-    /// The wall clock an entry may take, in milliseconds; 0 is none. It abandons a run rather than
-    /// judging it, so only a harness that will say so sets one.
-    static THREAD_TIME_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-}
-
-/// Runs `f` with entries on this thread bounded by `ms` rather than by none.
-pub fn with_time_budget<R>(ms: u64, f: impl FnOnce() -> R) -> R {
-    let before = THREAD_TIME_BUDGET_MS.with(|t| t.replace(Some(ms)));
-    let out = f();
-    THREAD_TIME_BUDGET_MS.with(|t| t.set(before));
-    out
-}
-
-pub fn time_budget_ms() -> u64 {
-    THREAD_TIME_BUDGET_MS.with(|t| t.get()).unwrap_or(0)
+/// Takes `floor` off the watchdog's list, where it is on it.
+pub(crate) fn unwatched(floor: &AtomicUsize) {
+    let at = std::ptr::from_ref(floor) as usize;
+    let mut watched = watch()
+        .watched
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    watched.retain(|&(f, _)| f != at);
 }
 
 /// The stack of a thread that runs a program, as large as a runtime stack can grow: the runtime

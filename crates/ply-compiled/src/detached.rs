@@ -623,7 +623,9 @@ extern "C" fn entry(arg: usize) {
             .take()
             .expect("a detached body starts with its closure");
         let own = c.detached[id].stack.as_ref();
-        c.stack_floor = unsafe { own.expect("a detached body starts on its stack").enter() };
+        let floor = unsafe { own.expect("a detached body starts on its stack").enter() };
+        c.stack_floor
+            .store(floor, std::sync::atomic::Ordering::Relaxed);
         c.frames = frames::base();
         (id, body)
     };

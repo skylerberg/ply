@@ -21,9 +21,6 @@ pub fn context_of(fields: &[&str], functions: Vec<usize>) -> Ctx {
     Ctx::new(Arc::new(Tables {
         fields: fields.iter().map(ply_core::Symbol::new).collect(),
         memo: functions.iter().map(|_| AtomicI64::new(0)).collect(),
-        memo_costs: (functions.iter())
-            .map(|_| (AtomicI64::new(0), AtomicI64::new(0), AtomicI64::new(0)))
-            .collect(),
         functions,
         immortals: Mutex::new(Heap::persistent()),
         roots: Vec::new(),

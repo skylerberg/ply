@@ -197,16 +197,16 @@ pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
 }
 
 /// What each stored root lent as parts at `rp` answers on the unit compiled into the library at
-/// `lp`, entered by name with nothing, binding no host, under `steps` calls, as parts each found:
-/// the answer as the run writes it, a `Bytes` holding what a build keeps its definition's value
-/// as, or none for a root that raised, ran past its calls or is not in the unit.
+/// `lp`, entered by name with nothing, binding no host, each within `timeout_ms` of wall clock, as
+/// parts each found: the answer as the run writes it, a `Bytes` holding what a build keeps its
+/// definition's value as, or none for a root that raised, ran out of time or is not in the unit.
 pub unsafe extern "C" fn rt_shipped_values(
     ctx: *mut Ctx,
     lp: Addr,
     ln: I64,
     rp: Addr,
     rn: I64,
-    steps: I64,
+    timeout_ms: I64,
 ) -> TakenBytes {
     shipping(ctx, "shipped_values", |c, _| {
         let (Some(library), Some(roots)) = (text_at(c, lp, ln), texts_at(c, rp, rn)) else {
@@ -223,7 +223,7 @@ pub unsafe extern "C" fn rt_shipped_values(
             }
         };
         let run = Run {
-            steps: steps.0,
+            timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
             ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
         };
         let answered = entry::on_program_thread(|| {
@@ -246,8 +246,8 @@ pub unsafe extern "C" fn rt_shipped_values(
 }
 
 /// What the root at `rp` of the unit compiled into the library at `lp` answers for the arguments,
-/// the PLV1 list at `ap`, under `steps` calls, found: none where it raised, ran past its calls or
-/// answered nothing a run can hold.
+/// the PLV1 list at `ap`, within `timeout_ms` of wall clock, found: none where it raised, ran out
+/// of time or answered nothing a run can hold.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_shipped_entered(
     ctx: *mut Ctx,
@@ -257,7 +257,7 @@ pub unsafe extern "C" fn rt_shipped_entered(
     rn: I64,
     ap: Addr,
     an: I64,
-    steps: I64,
+    timeout_ms: I64,
 ) -> TakenBytes {
     shipping(ctx, "shipped_entered", |c, _| {
         let (Some(library), Some(root)) = (text_at(c, lp, ln), text_at(c, rp, rn)) else {
@@ -275,7 +275,7 @@ pub unsafe extern "C" fn rt_shipped_entered(
         };
         let arguments = unsafe { lent(ap, an) }.to_vec();
         let run = Run {
-            steps: steps.0,
+            timeout_ms: u64::try_from(timeout_ms.0).unwrap_or(0),
             ..Run::unbounded(ply_core::DEFAULT_MAX_CALLS as i64)
         };
         let answered = entry::on_program_thread(|| {
