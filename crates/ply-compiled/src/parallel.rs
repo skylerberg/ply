@@ -4,7 +4,7 @@
 use crate::blocks::Blocks;
 use crate::emitted::Block;
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, PROGRAM_STACK, stack_floor};
+use crate::rt::{Ctx, OBJECT_ANY_THREAD, PROGRAM_STACK, stack_floor};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -107,8 +107,7 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     // entered inside another's branch, as a test a run's lane enters is, would then carry a whole
     // other test on its stack and its clock, so its own blocks run in turn.
     let nested = BRANCH_OF.with(|of| of.get() != 0 && of.get() != c.id.0);
-    // An object other than the bridge lives on this thread's stack.
-    let at_once = !nested && allowed && bridged_only(c, words);
+    let at_once = !nested && allowed && any_thread(words);
     match pool() {
         Some(pool) if n >= 2 && at_once && share(ctx, branches) => unsafe {
             in_parallel(ctx, pool, branches, words)
@@ -117,14 +116,18 @@ pub(crate) unsafe fn run(ctx: *mut Ctx, slots: *mut Word, n: usize, allowed: boo
     }
 }
 
-/// Whether every word of the row whose descriptor and words are `words` is the bridge
-/// ([`crate::rt::BRIDGE`]).
-fn bridged_only(c: &Ctx, (desc, words): (Word, Word)) -> bool {
+/// Whether a branch on another thread may enter every word of the row whose descriptor and words
+/// are `words`: whether each object's flags hold [`OBJECT_ANY_THREAD`].
+fn any_thread((desc, words): (Word, Word)) -> bool {
     if desc == 0 {
         return true;
     }
     let n = unsafe { *(desc as *const Word) };
-    (0..n).all(|i| unsafe { *(words as *const Word).add(i as usize) } == c.bridge)
+    (0..n).all(|i| {
+        let object = unsafe { *(words as *const Word).add(i as usize) };
+        let flags = unsafe { *(object as *const i64) };
+        flags & OBJECT_ANY_THREAD != 0
+    })
 }
 
 /// What the block means: each branch in turn, until one fails, each handed the block's `words`.

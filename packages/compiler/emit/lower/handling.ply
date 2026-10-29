@@ -458,6 +458,7 @@ fn forwarding(
                   task: placed.tasks + i,
                   record: start + 1 + 2 * f.ops + 3 * j,
                 })),
+              any_thread: None,
             }),
           ),
           args: [block.arg],
@@ -728,9 +729,11 @@ fn tables_of(kp: KeyPlan) -> Int =
     match s { ByTable(t) -> n + 1 + 3 * (t.clauses.len() + t.words.len()), _ -> n })
 
 /// The object for key `kp` laid at word `object` of instance `i` after `st`, so it lives as long as
-/// the instance, its tables from word `table` of the instance on: its operands the instance, the word its key is routed to around the `handle` (zero
-/// where no slot forwards to it), the words its tables forward to, then the labels the tables' rows
-/// answer.
+/// the instance, its tables from word `table` of the instance on: its operands the instance, the
+/// word its key is routed to around the `handle` (zero where no slot forwards to it), the words its
+/// tables forward to, the labels the tables' rows answer, then, where entering it from another
+/// thread writes nothing the `handle` holds, the words its clauses perform through. Each word it
+/// reaches must let other threads in for it to.
 fn object_laid(
   cx: Context,
   st: Lowering,
@@ -748,12 +751,11 @@ fn object_laid(
   let first_label = 2 + kp.outer.len();
   let clause_slot = |c: Int| {
     let cl = clauses.get(c);
-    let entry = match entry_of(clause_mode(cx, cl)) {
-      Answers -> if module_of(cx.key) == scheduler_module() && !cl.binds_label { Schedules }
-      else { Answers },
-      other -> other,
-    };
-    Answering({ entry: entry, record: i.layout.records.get(c), labelled: cl.binds_label })
+    Answering({
+      entry: clause_entry(cx, cl),
+      record: i.layout.records.get(c),
+      labelled: cl.binds_label,
+    })
   };
   // Each row's label as an operand, made where the label is named.
   let labelled = |s: Lowering, labels: List<Arg>, r: Resource|
@@ -807,19 +809,54 @@ fn object_laid(
       },
   );
   let outer = bridged(laid.st, kp.outer.map(|w: Worded| w.word), at);
-  let operands = [i.word].concat(routed_to.args).concat(outer.args).concat(laid.labels);
+  // Entering the object from another thread writes nothing its `handle` holds where the `handle`
+  // has no variables and each clause the object enters answers in its tail, capturing nothing.
+  let entered = kp.slots.fold([], |acc: List<Int>, s: SlotPlan|
+    match s { ByClause(c) -> acc.push(c), ByTable(t) -> acc.concat(t.clauses), ByWord -> acc });
+  let stateless = i.layout.count == 0
+    && entered.all(|c: Int| {
+      let cl = clauses.get(c);
+      cl.captures.len() == 0 && (match clause_entry(cx, cl) { Answers -> true, _ -> false })
+    });
+  // The words those clauses perform through, each once.
+  let performed = if !stateless { [] } else {
+    entered.fold([], |acc: List<Arg>, c: Int|
+      routed(cx, words_of(cx, clauses.get(c).row)).fold(acc, |a: List<Arg>, w: Arg|
+        if w == AZero(RImm) || a.contains(w) { a } else { a.push(w) }))
+  };
+  let operands = [i.word].concat(routed_to.args).concat(outer.args).concat(laid.labels).concat(
+    performed,
+  );
+  let reached = range(1, 2 + outer.args.len()).concat(
+    range(operands.len() - performed.len(), operands.len()),
+  ).filter(|k: Int| operands.at(k) != Some(AZero(RImm)));
   bound_as(
     outer.st,
     evidence_type(),
     RImm,
     Op({
-      op: OHandle(ObjectAt({ at: object, slots: laid.slots })),
+      op: OHandle(
+        ObjectAt({
+          at: object,
+          slots: laid.slots,
+          any_thread: if stateless { Some(reached) } else { None },
+        }),
+      ),
       args: operands,
       uses: reads(operands.len()),
     }),
     at,
   )
 }
+
+/// How clause `cl` is entered from its slot: as its mode says, but for a clause answering in its
+/// tail in the scheduler's module, which answers as the scheduler.
+fn clause_entry(cx: Context, cl: CodeClause) -> Entry / {abort.raise} =
+  match entry_of(clause_mode(cx, cl)) {
+    Answers -> if module_of(cx.key) == scheduler_module() && !cl.binds_label { Schedules }
+    else { Answers },
+    other -> other,
+  }
 
 /// How a clause of the runtime's mode `mode` is entered from its slot.
 fn entry_of(mode: Int) -> Entry =

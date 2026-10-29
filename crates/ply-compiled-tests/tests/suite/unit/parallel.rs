@@ -4,7 +4,7 @@
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Handed, PlyFnDesc};
 use ply_compiled::heap::{HEADER, SHARED, Word};
-use ply_compiled::rt::Ctx;
+use ply_compiled::rt::{Ctx, OBJECT_ANY_THREAD};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
@@ -103,7 +103,7 @@ unsafe extern "C" fn apart(ctx: *mut Ctx, f: Word, _args: *const Word) -> Word {
 /// of them left the thread it entered on.
 unsafe extern "C" fn enters(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let mut inner = context();
-    block(ctx, left_apart(&mut inner))
+    block(ctx, left_apart(&mut inner, &[]))
 }
 
 const fn desc(
@@ -144,10 +144,16 @@ fn branches(ctx: &mut Ctx, descs: [&'static PlyFnDesc; 2]) -> [Word; 2] {
     slots
 }
 
-/// A block of two [`APART`] branches: how many of them left the thread `ctx` runs on.
-fn left_apart(ctx: &mut Ctx) -> Word {
+/// A block of two [`APART`] branches handed `words` for what they perform: how many of them left
+/// the thread `ctx` runs on.
+fn left_apart(ctx: &mut Ctx, words: &[Word]) -> Word {
     let c: *mut Ctx = ctx;
     ctx.begin();
+    let row = [words.len() as Word];
+    if !words.is_empty() {
+        ctx.entering_desc = row.as_ptr() as Word;
+        ctx.entering_words = words.as_ptr() as Word;
+    }
     let mut slots = [0; 2].map(|_| alloc(c, PAIR, &[&raw const APART as Word, c as Word]));
     unsafe { helper::<Run>("rt_branches")(c, slots.as_mut_ptr(), 2) };
     assert_eq!(ctx.failed, 0);
@@ -168,7 +174,7 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
         return;
     }
     assert_eq!(
-        left_apart(&mut context()),
+        left_apart(&mut context(), &[]),
         2,
         "a block entered on a thread of its own"
     );
@@ -183,6 +189,25 @@ fn a_machine_entered_on_a_branch_runs_its_own_blocks_in_turn() {
     free(&mut ctx, a);
     free(&mut ctx, b);
     ctx.end();
+}
+
+/// An evidence object of no operations, as emitted code lays one out: its flags alone.
+static ANY_THREAD: [Word; 1] = [OBJECT_ANY_THREAD];
+static THIS_THREAD: [Word; 1] = [0];
+
+/// A block whose branches perform through an object that does not let other threads in, such as a
+/// `handle` with a variable, runs them in turn.
+#[test]
+fn a_block_runs_at_once_only_where_every_word_it_hands_lets_other_threads_in() {
+    if !multicore() {
+        return;
+    }
+    let word = |object: &'static [Word; 1]| object.as_ptr() as Word;
+    assert_eq!(left_apart(&mut context(), &[word(&ANY_THREAD)]), 2);
+    assert_eq!(
+        left_apart(&mut context(), &[word(&ANY_THREAD), word(&THIS_THREAD)]),
+        0
+    );
 }
 
 /// Each branch's closure block is taken and let go once it has run, and its answer written
