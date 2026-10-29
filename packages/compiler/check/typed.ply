@@ -4,6 +4,7 @@
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (Lit)
 import compiler.check.types (Type, Row)
+import std.list
 
 /// One node: what it is, where its text stands, and its type.
 pub type TypedExpr = { node: TypedNode, span: Span, ty: Type }
@@ -28,7 +29,9 @@ pub type TypedNode =
   | TypedLambda({ params: List<TypedParam>, body: TypedExpr, row: Row })
   | TypedSimulate(TypedThunk)
   | TypedParallel(List<TypedThunk>)
-  | TypedHandle({ body: TypedExpr, clauses: List<TypedClause>, ret: Option<TypedReturn> })
+  /// `row` is what the body performs. `vars` are the handler's variables, made before the body
+  /// runs, which its clauses read and assign.
+  | TypedHandle({ body: TypedExpr, row: Row, clauses: List<TypedClause>, ret: Option<TypedReturn>, vars: List<TypedHandlerVar> })
 
 /// What a name read as a value is: a binder in scope, a definition at the type arguments the read
 /// fills, a constructor of a declared sum, or a builtin.
@@ -63,21 +66,34 @@ pub type TypedStmt =
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | TypedLetElse({ pat: TypedPattern, value: TypedExpr, fallback: TypedExpr, span: Span })
   | TypedDo(TypedExpr)
+  /// `name = value;`: a clause giving its handler's variable a new value.
+  | TypedAssign({ name: Bytes, value: TypedExpr, span: Span })
 
-/// A clause of a `handle`: the operation it answers, its parameters, the label it binds where it
-/// answers every label, its continuation, and its body.
+/// A clause of a `handle`: the operation it answers, under the label written or under every label,
+/// its parameters, the label it binds where it answers every label, its continuation, and its body.
+/// It runs as a closure of type `ty`; `row` is what its body performs and `resumed` what resuming
+/// its continuation does.
 pub type TypedClause = {
   effect: Bytes,
   op: Bytes,
   resource: Option<Bytes>,
+  every_label: Bool,
   params: List<TypedParam>,
   label: Option<TypedParam>,
   resume: Option<TypedParam>,
   body: TypedExpr,
+  ty: Type,
+  row: Row,
+  resumed: Row,
   span: Span,
 }
 
-pub type TypedReturn = { binder: TypedParam, body: TypedExpr, span: Span }
+/// A `handle`'s `return` clause, run as a closure of type `ty` on the body's answer; `row` is what
+/// it performs.
+pub type TypedReturn = { binder: TypedParam, body: TypedExpr, ty: Type, row: Row, span: Span }
+
+/// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
+pub type TypedHandlerVar = { name: Bytes, ty: Type, init: TypedExpr, span: Span }
 
 // --- Building nodes --------------------------------------------------------------------------------
 
@@ -237,6 +253,88 @@ pub fn parallel_of(branches: List<{ body: Option<TypedExpr>, row: Row }>) -> Opt
     None -> None,
   }
 
+/// The parameters `names` at the types `tys`, place for place; none where the two differ in length.
+pub fn params_typed(
+  names: List<{ name: Bytes, span: Span }>,
+  tys: List<Type>,
+) -> Option<List<TypedParam>> =
+  match names.zip_strict(tys) {
+    Some(ps) ->
+      Some(
+        ps.map(|p: { first: { name: Bytes, span: Span }, second: Type }|
+          { name: p.first.name, ty: p.second, span: p.first.span }),
+      ),
+    None -> None,
+  }
+
+pub fn clause_of(
+  head: { effect: Bytes, op: Bytes, resource: Option<Bytes>, every_label: Bool },
+  params: Option<List<TypedParam>>,
+  label: Option<TypedParam>,
+  resume: Option<TypedParam>,
+  body: Option<TypedExpr>,
+  ty: Type,
+  row: Row,
+  resumed: Row,
+  span: Span,
+) -> Option<TypedClause> =
+  match ((params, body)) {
+    (Some(ps), Some(b)) ->
+      Some({
+        effect: head.effect,
+        op: head.op,
+        resource: head.resource,
+        every_label: head.every_label,
+        params: ps,
+        label: label,
+        resume: resume,
+        body: b,
+        ty: ty,
+        row: row,
+        resumed: resumed,
+        span: span,
+      }),
+    _ -> None,
+  }
+
+pub fn return_of(
+  binder: TypedParam,
+  body: Option<TypedExpr>,
+  ty: Type,
+  row: Row,
+  span: Span,
+) -> Option<TypedReturn> =
+  match body {
+    Some(b) -> Some({ binder: binder, body: b, ty: ty, row: row, span: span }),
+    None -> None,
+  }
+
+pub fn handler_var_of(
+  name: Bytes,
+  ty: Type,
+  init: Option<TypedExpr>,
+  span: Span,
+) -> Option<TypedHandlerVar> =
+  match init { Some(i) -> Some({ name: name, ty: ty, init: i, span: span }), None -> None }
+
+pub fn handle_of(
+  body: Option<TypedExpr>,
+  row: Row,
+  clauses: List<Option<TypedClause>>,
+  ret: Option<Option<TypedReturn>>,
+  vars: List<Option<TypedHandlerVar>>,
+) -> Option<TypedNode> =
+  match ((body, Option::all(clauses), ret, Option::all(vars))) {
+    (Some(b), Some(cs), None, Some(vs)) ->
+      Some(TypedHandle({ body: b, row: row, clauses: cs, ret: None, vars: vs })),
+    (Some(b), Some(cs), Some(Some(r)), Some(vs)) ->
+      Some(TypedHandle({ body: b, row: row, clauses: cs, ret: Some(r), vars: vs })),
+    _ -> None,
+  }
+
+pub fn assign_of(name: Bytes, value: Option<TypedExpr>, span: Span) -> Option<TypedStmt> =
+  match value { Some(v) -> Some(TypedAssign({ name: name, value: v, span: span })), None -> None }
+
 pub fn update_of(
   base: Option<TypedExpr>,
   sets: List<{ name: Bytes, value: Option<TypedExpr> }>,
@@ -290,6 +388,7 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
               TypedLetElse(l) ->
                 TypedLetElse({ ..l, value: go(l.value), fallback: go(l.fallback) }),
               TypedDo(x) -> TypedDo(go(x)),
+              TypedAssign(a) -> TypedAssign({ ..a, value: go(a.value) }),
             }),
           tail: opt(b.tail),
         }),
@@ -308,9 +407,11 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
       TypedParallel(ts) -> TypedParallel(ts.map(|t: TypedThunk| { ..t, body: go(t.body) })),
       TypedHandle(h) ->
         TypedHandle({
+          ..h,
           body: go(h.body),
           clauses: h.clauses.map(|c: TypedClause| { ..c, body: go(c.body) }),
           ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+          vars: h.vars.map(|v: TypedHandlerVar| { ..v, init: go(v.init) }),
         }),
       TypedLit(l) -> TypedLit(l),
       TypedRead(r) -> TypedRead(r),
@@ -339,6 +440,7 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
           TypedLet(l) -> nodes_of(l.value),
           TypedLetElse(l) -> nodes_of(l.value).concat(nodes_of(l.fallback)),
           TypedDo(x) -> nodes_of(x),
+          TypedAssign(a) -> nodes_of(a.value),
         })).concat(
         opt(b.tail),
       ),
@@ -351,10 +453,9 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
     TypedSimulate(t) -> nodes_of(t.body),
     TypedParallel(ts) -> all(ts.map(|t: TypedThunk| t.body)),
     TypedHandle(h) ->
-      nodes_of(h.body).concat(all(h.clauses.map(|c: TypedClause| c.body))).concat(match h.ret {
-        Some(r) -> nodes_of(r.body),
-        None -> [],
-      }),
+      all(h.vars.map(|v: TypedHandlerVar| v.init)).concat(nodes_of(h.body)).concat(
+        all(h.clauses.map(|c: TypedClause| c.body)),
+      ).concat(match h.ret { Some(r) -> nodes_of(r.body), None -> [] }),
     TypedLit(_) -> [],
     TypedRead(_) -> [],
   })

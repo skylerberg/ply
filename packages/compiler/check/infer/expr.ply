@@ -85,7 +85,9 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              block_of, lambda_of, do_of, let_of, let_else_of, case_pattern_of,
                              list_pattern_of, or_pattern_of, record_pattern_of, TypedArm, arm_of,
                              match_of, call_of, PlacedDefault, defaults_placed, update_of,
-                             perform_of, simulate_of, parallel_of)
+                             perform_of, simulate_of, parallel_of, TypedClause, TypedHandlerVar,
+                             params_typed, clause_of, return_of, handler_var_of, handle_of,
+                             assign_of)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -2630,7 +2632,7 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
               ).checker,
               row: o.row,
               fallback: None,
-              node: None,
+              node: assign_of(a.name.name, typed_at(o, expr_span(a.value)), a.span),
             }
           },
         },
@@ -4942,6 +4944,7 @@ type HandleAcc = {
   selected: List<OpKey>,
   clause_rows: Row,
   around: List<ClauseSite>,
+  clauses: List<Option<TypedClause>>,
 }
 
 fn spawn_counts(checker: Checker) -> List<Int> =
@@ -4957,13 +4960,18 @@ fn answers_raise(checker: Checker, clause: HandleClause) -> Bool / {abort.raise}
 
 /// The variables a `handle` declares, typed where it stands: what each holds, and what making them
 /// performs.
-type MadeVars = { checker: Checker, row: Row, vars: List<{ name: Ident, ty: Type }> }
+type MadeVars = {
+  checker: Checker,
+  row: Row,
+  vars: List<{ name: Ident, ty: Type }>,
+  nodes: List<Option<TypedHandlerVar>>,
+}
 
 /// Each initializer sees the variables above it, as values: none of them is assignable there.
 fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.raise} = {
   let pushed: Checker = { ..checker, env: env_push(checker.env) };
   let made = vars.fold(
-    { checker: pushed, row: row_empty(), vars: [] },
+    { checker: pushed, row: row_empty(), vars: [], nodes: [] },
     |acc: MadeVars, v: HandlerVar| {
       let written: { checker: Checker, ty: Option<Type> } = match v.ty {
         Some(te) -> {
@@ -5001,6 +5009,9 @@ fn made_vars(checker: Checker, vars: List<HandlerVar>) -> MadeVars / {abort.rais
         checker: { ..noted, env: env_bind(noted.env, v.name.name, monomorphic(ty)) },
         row: j.row,
         vars: acc.vars.push({ name: v.name, ty: ty }),
+        nodes: acc.nodes.push(
+          handler_var_of(v.name.name, ty, typed_at(o, expr_span(v.init)), v.span),
+        ),
       }
     },
   );
@@ -5079,11 +5090,12 @@ fn infer_handle(
       selected: [],
       clause_rows: row_empty(),
       around: [],
+      clauses: [],
     },
     |acc: HandleAcc, clause: HandleClause| {
       let r: WithHit = resolve_op(acc.checker, clause.eff, clause.op);
       match r.hit {
-        None -> { ..acc, checker: r.checker },
+        None -> { ..acc, checker: r.checker, clauses: acc.clauses.push(None) },
         Some(hit) -> {
           let res: WithResource = clause_resource_for(
             r.checker,
@@ -5093,7 +5105,7 @@ fn infer_handle(
             clause.span,
           );
           match res.resource {
-            None -> { ..acc, checker: res.checker },
+            None -> { ..acc, checker: res.checker, clauses: acc.clauses.push(None) },
             Some(resource_) -> {
               let shape: OpShape = instantiate_op_for_clause(
                 crossing_refused(res.checker, hit.info, hit.op, clause.span),
@@ -5104,6 +5116,7 @@ fn infer_handle(
                 let bound = clause.params.len();
                 {
                   ..acc,
+                  clauses: acc.clauses.push(None),
                   checker: report_error_at_and(
                     shape.checker,
                     b"E0202",
@@ -5311,6 +5324,33 @@ fn infer_handle(
                   // No mode atom stands for a raise, so a clause for one leaves the effect's others be.
                   handled: if raise { acc.handled } else { atoms_insert(acc.handled, atom) },
                   selected: acc.selected.push(key),
+                  clauses: acc.clauses.push(
+                    clause_of(
+                      {
+                        effect: hit.info.name,
+                        op: hit.op.name,
+                        resource: match clause.resource { Some(r) -> Some(r.name), None -> None },
+                        every_label: clause.every_label,
+                      },
+                      params_typed(
+                        clause.params.map(|i: Ident| { name: i.name, span: i.span }),
+                        shape.params,
+                      ),
+                      match clause.label_binder {
+                        Some(t) -> Some({ name: t.name, ty: string_type(), span: t.span }),
+                        None -> None,
+                      },
+                      match clause.resume {
+                        Some(k) -> Some({ name: k.name, ty: continuation, span: k.span }),
+                        None -> None,
+                      },
+                      typed_at(body_, expr_span(clause.body)),
+                      closed,
+                      body_.row,
+                      resumed,
+                      clause.span,
+                    ),
+                  ),
                   clause_rows: j.row,
                   around: acc.around.push({
                     span: clause.span,
@@ -5348,10 +5388,18 @@ fn infer_handle(
         ),
         ty: o.ty,
         row: o.row,
-        node: None,
+        clause: Some(
+          return_of(
+            { name: rc.binder.name, ty: b.ty, span: rc.binder.span },
+            typed_at(o, expr_span(rc.body)),
+            fn_type([b.ty], o.ty, row_empty()),
+            o.row,
+            rc.span,
+          ),
+        ),
       }
     },
-    None -> { checker: under, ty: b.ty, row: row_empty(), node: None },
+    None -> { checker: under, ty: b.ty, row: row_empty(), clause: None },
   };
   let agreed: Checker = match result_var.t {
     Some(t) ->
@@ -5405,7 +5453,18 @@ fn infer_handle(
     fn_type([], b.ty, row_empty()),
     [],
   );
-  { checker: typed, ty: returned.ty, row: j3.row, node: None }
+  {
+    checker: typed,
+    ty: returned.ty,
+    row: j3.row,
+    node: handle_of(
+      typed_at(b, expr_span(body)),
+      b.row,
+      walked.clauses,
+      returned.clause,
+      made.nodes,
+    ),
+  }
 }
 
 /// The raise a `try` names.
