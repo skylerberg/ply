@@ -8,10 +8,9 @@ use crate::vm;
 use ply_core::limit::{self, Reserved};
 use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 
-/// The address space each stack reserves: 10,000 nested calls of frames past 100 KB each, so the
-/// fuel ends a recursion before its stack does.
+/// The address space each stack reserves, which bounds how deeply a computation on it nests.
 pub const RESERVE: usize = 1 << 30;
 
 /// Made writable at a time, from the top down; a stack starts with one.
@@ -128,20 +127,6 @@ impl Stack {
     pub fn prepare(&self, entry: extern "C" fn(usize), arg: usize) -> usize {
         let top = self.top() & !15;
         unsafe { lay_out(top, entry as usize, arg) }
-    }
-
-    /// The bytes live on this stack when `sp` is its stack pointer: from `sp` to the top. Nothing
-    /// when `sp` is not this stack's, as it is for a computation that stopped on another.
-    pub fn live(&self, sp: usize) -> Option<&[u8]> {
-        if !self.holds(sp) {
-            return None;
-        }
-        Some(unsafe { std::slice::from_raw_parts(sp as *const u8, self.top() - sp) })
-    }
-
-    pub unsafe fn restore(&self, sp: usize, bytes: &[u8]) {
-        debug_assert_eq!(bytes.len(), self.top() - sp);
-        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), sp as *mut u8, bytes.len()) }
     }
 }
 

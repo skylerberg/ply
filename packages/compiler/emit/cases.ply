@@ -2,13 +2,12 @@
 
 import compiler.emit.print.lists (item_fn, leaf_fn)
 import compiler.emit.print.head (writable_fn)
-import compiler.emit.print.fuel (entered_fn, entered_helper)
-import compiler.syntax.parsing (span_key, span_between)
+import compiler.emit.print.probe (probed_fn, probed_helper)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.check.infer (facts_at)
 import compiler.check.types (Type, TyCon, TyRecord, RSingleton, int_type, bytes_type, string_type,
-                             type_spelled, fn_type, row_empty, float_type, unit_type, bool_type,
-                             list_type, option_type, map_type, iter_type, secret_type)
+                             type_spelled, float_type, unit_type, bool_type, list_type, option_type,
+                             map_type, iter_type)
 import compiler.check.known (ordering_type, result_type, array_type, columns_type, list_node_type)
 import compiler.emit.typing (unknown_type)
 import compiler.front
@@ -30,9 +29,9 @@ import compiler.emit.c (bytes_join)
 import compiler.emit.roots (builtin_helper, symbol_of, entry_of)
 import compiler.emit.release (root_of)
 import compiler.emit.keys
-import compiler.emit.keys (RootKey, Named, Written, Clause, ClauseKind, Requires, Ensures, FnArg,
-                           TypeOp, Order, Reflect, Shown, Digest, Contained, Lift, Lower, RootName,
-                           at_key, root_name, root_text, module_of, test_key)
+import compiler.emit.keys (RootKey, Named, Written, Clause, ClauseKind, Requires, Ensures, TypeOp,
+                           Order, Reflect, Shown, Digest, Contained, Lift, Lower, RootName, at_key,
+                           root_name, root_text, module_of, test_key)
 import compiler.emit.answer (Defined, Expect, CallAt, GenericAt, SharedFn, expected_callee, Head,
                              word_head, GenericCall, Need, Exact, Layout, Scalar, no_generics,
                              Tables, no_tables, Emitted, RootAnswer, Published, Answer)
@@ -40,13 +39,12 @@ import compiler.emit.statics (SBytes, SEmbedded, statics_of)
 import compiler.emit.reps (Ctors, SumCtor, no_ctors, ctors_of, ctor_sums, at_args, has_vars)
 import compiler.emit.compare (program_of, formed)
 import compiler.emit.lower.setting (Root)
-import compiler.emit.typing (Typed)
+import compiler.emit.code (Code, code_parts)
 import compiler.unit (offered_roots)
 import compiler.emit (said, emit_program, emit_roots_answer, lowered_roots, zip_sources, scope_of,
                       answered)
-import compiler.emit.entry (emitted_of)
-import compiler.emit.print.counting (allocates, last_fn, rel_fn, free_fn, call_text, call_start,
-                                     takes_count, lets_count_go, lets_go_of, counts_any)
+import compiler.emit.print.counting (allocates, rel_fn, free_fn, call_start, takes_count,
+                                     lets_count_go, lets_go_of, counts_any)
 import compiler.emit.tir (Plain, Block, Inst, Var, Let, If, Case, Match, Loop, Get, PCapture, Decl,
                           Pack, AZero, Lambda, Closure, Fn)
 import compiler.front.seam
@@ -112,12 +110,13 @@ test "a handle in a definition generic over rows forwards what it does not answe
 }
 
 test "a body that would overrun this thread's stack makes room on the stack it runs on" {
-  let out = emit_all_program([{ name: b"m", src: b"fn g(b: Bytes) -> Bytes = b\n" }], [], true);
+  let src = b"fn g(n: Int) -> Int = if n <= 0 { 0 } else { 1 + g(n - 1) }\n";
+  let out = emit_all_program([{ name: b"m", src: src }], [], true);
   let text = match out.at(0) { Some(e) -> e.text, None -> b"" };
   // Through the head's entry, which probes the stack.
   assert(
-    text.index_of(entered_fn().concat(b"(ctx)")) != None
-      && entered_helper().index_of(b"rt_stack_more_p(ctx)") != None,
+    text.index_of(probed_fn().concat(b"(ctx)")) != None
+      && probed_helper().index_of(b"rt_stack_more_p(ctx)") != None,
     Some(String::of_bytes_lossy(text)),
   )
 }
@@ -127,12 +126,22 @@ test "a self call in tail position restarts the body instead of nesting" {
     b"fn count(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { count(n - 1, acc + n) }\n",
     b"fn upto(xs: List<Int>, i: Int, acc: Int) -> Int = match i >= xs.len() { true -> acc, false -> upto(xs, i + 1, acc + 1) }\n",
     b"fn all_below(xs: List<Int>, bound: Int, i: Int) -> Bool = i >= xs.len() || (i < bound && all_below(xs, bound, i + 1))\n",
+    b"fn any_at_least(xs: List<Int>, bound: Int, i: Int) -> Bool = i < xs.len() && ((match xs.at(i) { Some(x) -> x >= bound, None -> false }) || any_at_least(xs, bound, i + 1))\n",
+    b"fn last(xs: List<Int>, i: Int, seen: Option<Int>) -> Option<Int> = match xs.at(i) { None -> seen, Some(x) -> last(xs, i + 1, Some(x)) }\n",
+    b"fn collect(n: Int, acc: List<Int>) -> List<Int> = { let next = acc.push(n); if n <= 0 { next } else { collect(n - 1, next) } }\n",
+    b"fn digit_sum(xs: List<Int>, i: Int, acc: Int) -> Result<Int, String> = if i >= xs.len() { Ok(acc) } else { let d = (match xs.at(i) { Some(d) -> Ok(d), None -> Err(\"past the end\") })?; digit_sum(xs, i + 1, acc + d) }\n",
+    b"fn countdown(pair: { left: Int, seen: Int }) -> Int = match pair { { left, seen } if left <= 0 -> seen, { left, seen } -> countdown({ left: left - 1, seen: seen + 1 }) }\n",
     b"fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }\n",
     b"fn inner(n: Int) -> Int = { let k = if n > 5 { inner(n - 1) } else { 0 }; k + 1 }\n",
   ]);
   let out = emit_all_program([{ name: b"m", src: src }], [], true);
-  assert_eq(out.len(), 5);
+  assert_eq(out.len(), 10);
   assert_eq(out.map(|e: Emitted| e.text.index_of(b"goto ply_loop;") != None), [
+    true,
+    true,
+    true,
+    true,
+    true,
     true,
     true,
     true,
@@ -228,13 +237,13 @@ test "a cycle whose member holds a handle that resumes off its tail, or whose ca
   ])
 }
 
-/// The C between a `handle`'s opening, where its instance takes the fuel it stands at, and its
-/// landing label, for a unit whose first definition holds one.
+/// The C between a `handle`'s opening, where its instance takes the task opening it, and its landing
+/// label, for a unit whose first definition holds one.
 fn handled_body(src: Bytes, release: Bool) -> Bytes / {abort.raise} = {
   let out = emit_all_program([{ name: b"m", src: src }], [], release);
   match out.at(0) {
     None -> b"nothing was emitted",
-    Some(e) -> match e.text.index_of(b"[0] = ctx->fuel;") {
+    Some(e) -> match e.text.index_of(b"] = ctx->task;") {
       None -> b"no handle was opened",
       Some(pushed) -> match e.text.index_of(b": ;\n") {
         None -> b"no handle lands",
@@ -380,10 +389,24 @@ fn expects_named(t: Tables) -> List<CallHead> =
       head: e.head,
     })
 
-/// A root's own code: what its function runs past its fuel head, leaving out its entry and its
+/// A root's own code: its function, leaving out the static helpers before it, and its entry and its
 /// closures, which follow it.
 fn own_code(text: Bytes) -> Bytes / {abort.raise} = {
-  let from = match text.index_of(entered_fn()) { Some(i) -> i, None -> 0 };
+  let opened = text.split(b"\n").fold(
+    { at: 0, found: None },
+    |s: { at: Int, found: Option<Int> }, line: Bytes|
+      match s.found {
+        Some(_) -> s,
+        None ->
+          {
+            at: s.at + line.len() + 1,
+            found: if line.ends_with(b") {") && !line.starts_with(b"static ")
+                && !line.starts_with(b" ") { Some(s.at) }
+            else { None },
+          },
+      },
+  );
+  let from = match opened.found { Some(i) -> i, None -> 0 };
   let rest = text.slice(from, text.len());
   match rest.index_of(b"\n}\n") { Some(i) -> rest.slice(0, i), None -> rest }
 }
@@ -2839,7 +2862,7 @@ test "a byte `byte_of_int` answers is the unit's own, so a loop appending bytes 
   )
 }
 
-test "a conversion the runtime calls through a type's descriptor spends fuel" {
+test "a conversion the runtime calls through a type's descriptor probes the stack" {
   let pair = TyCon({ name: b"P", args: [] });
   let worded = [keys::Worded(Lower), keys::Worded(Lift)].fold(
     [],
@@ -2849,7 +2872,7 @@ test "a conversion the runtime calls through a type's descriptor spends fuel" {
   worded.fold((), |_: Unit, k: RootKey| {
     let text = answered_body(answers, printed(k)).text;
     assert(
-      text.index_of(entered_fn().concat(b"(ctx)")) != None,
+      text.index_of(probed_fn().concat(b"(ctx)")) != None,
       Some(String::of_bytes_lossy(printed(k))),
     )
   })
@@ -3924,7 +3947,11 @@ test "a tail loop whose members number their variables apart runs as one at the 
   assert_eq(looped.tables.generics.needs, [])
 }
 
-test "a type nothing in the program settles is filed as `Unit`, so a body of no type variable reads none" {
+/// The type of each node of `c`.
+fn types_in(c: Code) -> List<Type> =
+  code_parts(c).fold([c.ty], |acc: List<Type>, x: Code| acc.concat(types_in(x)))
+
+test "a type nothing in the program settles is `Unit`, so a body of no type variable reads none" {
   let src = Bytes::concat_all([
     b"fn empty() -> Int = { let xs = []; xs.len() }\n",
     b"fn wrapped(n: Int) -> Bool = match Ok(n) { Ok(_) -> true, Err(_) -> false }\n",
@@ -3936,19 +3963,10 @@ test "a type nothing in the program settles is filed as `Unit`, so a body of no 
   match program_of(src) {
     Err(why) -> assert_eq(why, b""),
     Ok(p) -> {
-      let open = p.roots.filter(|r: Root| {
-        let f = r.filed;
-        f.typed.values().any(|t: Typed| has_vars(t.ty) || t.args.any(has_vars))
-      });
+      let open = p.roots.filter(|r: Root| types_in(r.code).any(has_vars));
       assert_eq(open.map(|r: Root| printed(r.key)), []);
       let empty = p.roots.filter(|r: Root| printed(r.key) == b"m.empty");
-      assert(
-        empty.all(|r: Root| {
-          let f = r.filed;
-          f.typed.values().any(|t: Typed| t.ty == list_type(unit_type()))
-        }),
-        None,
-      )
+      assert(empty.all(|r: Root| types_in(r.code).contains(list_type(unit_type()))), None)
     },
   }
 }
@@ -4159,11 +4177,7 @@ test "a body is lowered from what its row files of it, walked now or published f
     if row.name == b"a.moved" { row.facts } else { acc });
   match facts_at(filed, 0, b"a.moved") {
     None -> panic("the row files what the walk read"),
-    Some(f) -> {
-      assert_eq(f.updates.len(), 1);
-      assert(f.refs.len() > 0);
-      assert(f.typed.len() > 0)
-    },
+    Some(f) -> assert(f.bodies.len() > 0),
   };
   let seeded = analyse_with(parse_all(sited(b"")), walked.rows);
   match seeded {
@@ -4440,7 +4454,7 @@ test "a constant tree is static boxes, its leaves and cases laid as the printer 
 // handle holds it as it holds any answer, and lets it go as nothing.
 test "a handle whose body answers a constant holds it as it holds any answer, whatever its clauses" {
   let src = Bytes::concat_all([
-    b"effect amb {\n  multi write flip() -> Bool\n}\n",
+    b"effect amb {\n  write flip() -> Bool\n}\n",
     b"fn branched() -> String = handle { if amb.flip() { \"a\" } else { \"b\" } } with { amb.flip() resume k -> k(true) }\n",
     b"fn returned() -> String = handle { if amb.flip() { \"a\" } else { \"b\" } } with { amb.flip() resume k -> k(true), return v -> v }\n",
     b"fn alone() -> String = handle { \"a\" } with { amb.flip() resume k -> k(true), return v -> v }\n",

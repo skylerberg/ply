@@ -167,60 +167,14 @@ fn a_recursion_past_a_stacks_first_chunk_stays_in_one_reservation() {
         "the recursion never passed the stack's second chunk"
     );
     assert!(stack.floor() < stack.top() - 2 * CHUNK + STACK_MARGIN);
-    let live = stack
-        .live(stopped)
-        .expect("the recursion stopped on its own stack");
-    let low = live.as_ptr() as usize;
-    assert!(frames.iter().all(|&f| (low..stack.top()).contains(&f)));
+    assert!(
+        stack.holds(stopped),
+        "the recursion stopped on its own stack"
+    );
+    assert!(frames.iter().all(|&f| (stopped..stack.top()).contains(&f)));
     run_task();
     assert_eq!(with(|p| p.log.clone()), [10, 0]);
     PONG.with(|p| *p.borrow_mut() = None);
-}
-
-/// Restored at the same addresses, a snapshot of a stop twenty megabytes down resumes the frame it
-/// was taken in, which counts on from where it was.
-#[test]
-fn a_snapshot_restored_in_place_resumes_the_same_frame_again() {
-    let stack = taken();
-    let mut d = descent(&stack, 2);
-    let d = &raw mut d;
-    start(stack.prepare(descend_then_count, d as usize));
-    let run = run_task;
-    run();
-    assert_eq!(with(|p| p.log.clone()), [10]);
-    let captured = with(|p| p.task);
-    let snapshot = stack
-        .live(captured)
-        .expect("the task stopped on the stack it was given")
-        .to_vec();
-    assert!(
-        snapshot.len() > 2 * CHUNK,
-        "the task stopped short of its depth"
-    );
-    run();
-    assert_eq!(with(|p| p.log.clone()), [10, 20]);
-    unsafe { stack.restore(captured, &snapshot) };
-    with(|p| p.task = captured);
-    run();
-    assert_eq!(
-        with(|p| p.log.clone()),
-        [10, 20, 20],
-        "the second resumption of the captured frame counts from where it was captured"
-    );
-    run();
-    assert_eq!(with(|p| p.log.clone()), [10, 20, 20, 0]);
-    assert!(!unsafe { (*d).refused });
-    PONG.with(|p| *p.borrow_mut() = None);
-}
-
-/// A computation that stops on another stack, a task's or a nested body's, has nothing live on
-/// this one; `live` says so rather than reading past the mapping.
-#[test]
-fn a_stack_pointer_another_stack_holds_has_nothing_live_on_this_one() {
-    let stack = taken();
-    let other = taken();
-    assert!(stack.live(other.top() - 64).is_none());
-    assert_eq!(stack.live(stack.top() - 64).map(|b| b.len()), Some(64));
 }
 
 /// A stack grows a chunk at a time until its reservation is spent, and its floor never passes the
@@ -304,7 +258,7 @@ fn a_task_that_grew_resumes_under_its_own_floor() {
     };
     let native = loaded.expect("the unit loads");
     let mut ctx = native.context();
-    ctx.begin(100);
+    ctx.begin();
     let task = taken();
     let mut g = Grows {
         ctx: &raw mut ctx,

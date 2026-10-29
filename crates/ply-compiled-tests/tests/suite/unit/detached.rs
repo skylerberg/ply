@@ -1,25 +1,21 @@
 //! Detached bodies run as compiled code runs them, the code written by hand: a body holding values
 //! across `amb.flip()` in records of its own frames and of a runtime frame between them, a value of
-//! every kind each, and clauses that resume its continuation twice, never, or leave it parked.
+//! every kind each, and clauses that resume its continuation once, twice, never, or leave it parked.
 
-use super::frames::{boxed, count, dup, every_kind, freed, release_box};
+use super::frames::{boxed, count, every_kind, freed, release_box};
 use crate::bare::{context_of, helper};
 use ply_compiled::detached::{INSTANCE_DETACHED, INSTANCE_HEAD, INSTANCE_VARS};
 use ply_compiled::emitted::{Block, Handed, PlyFnDesc, PlyOp};
 use ply_compiled::frames::{PlyFrame, held_across};
 use ply_compiled::heap::{HEADER, Word, imm, imm_value};
 use ply_compiled::native::{Answered, I64};
-use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_stop};
+use ply_compiled::rt::{Ctx, rt_detached_open, rt_detached_perform};
 use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 /// The unit's fields, by index.
 const AMB: i64 = 0;
 const FLIP: i64 = 1;
-
-/// Resumes at most once, and may resume again.
-const ONCE: i64 = 2;
-const AGAIN: i64 = 4;
 
 /// What each block the body holds is told apart by: its own box, the closure and the box it
 /// captures, the carried box, and the box the frame it calls holds.
@@ -34,8 +30,8 @@ thread_local! {
     /// What each continuation a clause was handed says of itself: whether its descriptor has no
     /// typed entry, and whether sharing and keeping it answer 0.
     static TOKENS: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
-    /// The clause's record in the running `handle`'s instance, and whether it may resume again.
-    static STOP: Cell<(*const Word, i64)> = const { Cell::new((std::ptr::null(), 0)) };
+    /// The clause's record in the running `handle`'s instance.
+    static STOP: Cell<*const Word> = const { Cell::new(std::ptr::null()) };
 }
 
 fn seen(n: u32) {
@@ -57,9 +53,8 @@ struct Linked {
     slot: Word,
 }
 
-unsafe extern "C" fn box_each(ctx: *mut Ctx, slots: *mut Word, d: i64) {
-    let w = unsafe { *slots };
-    if d > 0 { dup(w) } else { release_box(ctx, w) }
+unsafe extern "C" fn box_each(ctx: *mut Ctx, slots: *mut Word, _d: i64) {
+    release_box(ctx, unsafe { *slots });
 }
 
 /// Runs `call` with a box told apart by `marker` held in a record of its frame, then counts it and
@@ -114,9 +109,8 @@ unsafe fn through_a_runtime_frame(ctx: *mut Ctx) -> Word {
     let (r, back) = unsafe {
         held_across(ctx, held, || {
             holding_a_box(ctx, HELD[4], || {
-                let (record, again) = STOP.get();
                 let flip =
-                    rt_detached_stop(ctx, record, &FLIP_OP, I64(-1), std::ptr::null(), I64(again));
+                    rt_detached_perform(ctx, STOP.get(), &FLIP_OP, I64(-1), std::ptr::null());
                 let flip = std::mem::transmute::<Handed, Word>(flip);
                 if (*ctx).failed != 0 {
                     0
@@ -150,8 +144,22 @@ unsafe fn clause_ran(ctx: *mut Ctx, k: Word) {
     TOKENS.with(|t| t.borrow_mut().push(seen));
 }
 
-/// `amb.flip() resume k -> k(true) * 10 + k(false)`, `k` applied and let go of as emitted code
-/// applies and lets go of a function value: through its descriptor.
+/// `amb.flip() resume k -> k(true) * 10`, `k` applied and let go of as emitted code applies and
+/// lets go of a function value: through its descriptor.
+unsafe extern "C" fn once(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
+    unsafe {
+        clause_ran(ctx, *args);
+        let k = Block::of(*args);
+        let first = k.call(ctx, &[imm(1)]);
+        k.let_go_function(ctx);
+        if (*ctx).failed != 0 {
+            return 0;
+        }
+        imm(imm_value(first) * 10)
+    }
+}
+
+/// `amb.flip() resume k -> k(true) * 10 + k(false)`, as a copy of `k` kept in a value may be called.
 unsafe extern "C" fn twice(ctx: *mut Ctx, _block: Word, args: *const Word) -> Word {
     unsafe {
         clause_ran(ctx, *args);
@@ -221,6 +229,7 @@ const fn desc(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> Word
 }
 
 static BODY: PlyFnDesc = desc(body);
+static ONCE: PlyFnDesc = desc(once);
 static TWICE: PlyFnDesc = desc(twice);
 static NEVER: PlyFnDesc = desc(never);
 static PARKS: PlyFnDesc = desc(parks);
@@ -265,12 +274,11 @@ fn instance(ctx: *mut Ctx, clause: Word) -> (Word, *const Word) {
     (w, record)
 }
 
-/// `handle { body() } with { amb.flip() resume k -> <clause> }`, the clause resuming as `resumes`
-/// says.
-unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc, resumes: i64) -> Word {
+/// `handle { body() } with { amb.flip() resume k -> <clause> }`.
+unsafe fn handled(ctx: *mut Ctx, clause: &'static PlyFnDesc) -> Word {
     let body = closure(ctx, &BODY);
     let (instance, record) = instance(ctx, closure(ctx, clause));
-    STOP.set((record, i64::from(resumes == AGAIN)));
+    STOP.set(record);
     let answer =
         unsafe { rt_detached_open(ctx, Block::of(body), Block::of(0), Block::of(instance)) };
     unsafe { Block::of(instance).let_go_function(ctx) };
@@ -285,19 +293,18 @@ fn failure(ctx: *mut Ctx) -> String {
 /// nowhere.
 const TOKEN: (bool, bool) = (true, true);
 
-/// Each run past the stop finds everything its frames held held once more for the snapshot, so a
-/// release in the first cannot free what the second reads; when the clause lets go of the
-/// continuation, the snapshot's holds go too, and everything comes back once.
+/// The run past the stop finds everything its frames held held once, and everything comes back
+/// once.
 #[test]
-fn a_stop_resumed_twice_finds_every_value_held_for_each_run_and_everything_comes_back_once() {
+fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
-        let answer = handled(ctx, &TWICE, AGAIN);
+        (*ctx).begin();
+        let answer = handled(ctx, &ONCE);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-        assert_eq!(imm_value(answer), 12);
-        assert_eq!(taken(&SEEN), [2; 10]);
+        assert_eq!(imm_value(answer), 10);
+        assert_eq!(taken(&SEEN), [1; 5]);
         assert_eq!(taken(&CLAUSES_UNRECORDED), [true]);
         assert_eq!(taken(&TOKENS), [TOKEN]);
         assert_eq!(freed(), HELD);
@@ -308,15 +315,15 @@ fn a_stop_resumed_twice_finds_every_value_held_for_each_run_and_everything_comes
 }
 
 #[test]
-fn a_stop_resumed_at_most_once_is_not_snapshotted_and_a_second_resumption_is_refused() {
+fn a_second_resumption_of_a_stop_is_refused_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
-        handled(ctx, &TWICE, ONCE);
+        (*ctx).begin();
+        handled(ctx, &TWICE);
         assert_ne!((*ctx).failed, 0);
         let said = failure(ctx);
-        assert!(said.contains("has already ended"), "{said}");
+        assert!(said.contains("resumed a second time"), "{said}");
         assert_eq!(taken(&SEEN), [1; 5]);
         assert_eq!(freed(), HELD);
         assert_eq!(text_holders(), 1);
@@ -326,44 +333,40 @@ fn a_stop_resumed_at_most_once_is_not_snapshotted_and_a_second_resumption_is_ref
 }
 
 /// A clause that lets go of its continuation without resuming it abandons the body: what the
-/// body's frames held, and what its snapshot held, comes back once, and no frame runs on.
+/// body's frames held comes back once, and no frame runs on.
 #[test]
 fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
-    for resumes in [ONCE, AGAIN] {
-        unsafe {
-            (*ctx).begin(1_000);
-            let answer = handled(ctx, &NEVER, resumes);
-            assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-            assert_eq!(imm_value(answer), 42);
-            assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
-            assert_eq!(taken(&TOKENS), [TOKEN]);
-            assert_eq!(freed(), HELD, "resumes {resumes}");
-            assert_eq!(text_holders(), 1);
-            assert_eq!((*ctx).heap.live(), 0, "resumes {resumes}");
-            (*ctx).end();
-        }
+    unsafe {
+        (*ctx).begin();
+        let answer = handled(ctx, &NEVER);
+        assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
+        assert_eq!(imm_value(answer), 42);
+        assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
+        assert_eq!(taken(&TOKENS), [TOKEN]);
+        assert_eq!(freed(), HELD);
+        assert_eq!(text_holders(), 1);
+        assert_eq!((*ctx).heap.live(), 0);
+        (*ctx).end();
     }
 }
 
 /// An entry that ends with a body suspended and its continuation still held gives back what the
-/// body and its snapshot held before its heap goes, each once.
+/// body held before its heap goes, each once.
 #[test]
 fn an_entry_ending_with_a_body_suspended_gives_back_what_it_held_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
-    for resumes in [ONCE, AGAIN] {
-        unsafe {
-            (*ctx).begin(1_000);
-            handled(ctx, &PARKS, resumes);
-            assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
-            assert!(freed().is_empty());
-            assert!(text_holders() > 1);
-            (*ctx).end();
-            assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
-            assert_eq!(freed(), HELD, "resumes {resumes}");
-            assert_eq!(text_holders(), 1);
-        }
+    unsafe {
+        (*ctx).begin();
+        handled(ctx, &PARKS);
+        assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
+        assert!(freed().is_empty());
+        assert!(text_holders() > 1);
+        (*ctx).end();
+        assert!(taken(&SEEN).is_empty(), "a frame ran past the stop");
+        assert_eq!(freed(), HELD);
+        assert_eq!(text_holders(), 1);
     }
 }

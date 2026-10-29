@@ -347,7 +347,17 @@ fn paged<[t]>(id: Int, page: Int, held: List<Row>, fuel: Int) -> Seq<Row | {db.c
 // --- Batching ----------------------------------------------------------------------
 
 /// A lookup stepped to the ask it waits on, and what it does with the answer.
-type Pending<b> = | Looked(b) | Asking({ s: Stmt, ps: List<Param>, next: (Answer) -> Pending<b> })
+type Pending<b> = | Looked(b) | Asking(Stmt, List<Param>, once (Answer) -> Pending<b>)
+
+/// What a round knows of one lookup: its answer, or the ask it waits on.
+type Step<b> = | Finished(b) | Asked({ s: Stmt, ps: List<Param> })
+
+/// The continuations of a round's waiting lookups, one per `Asked` step.
+type Waiting<b> = | NoneWaiting | Waits(once (Answer) -> Pending<b>, Waiting<b>)
+
+/// A round of lookups: each one's step in order, and the waiting ones' continuations, the last to
+/// ask first.
+type Round<b> = { steps: List<Step<b>>, waiting: Waiting<b> }
 
 /// `lookup` over each of `xs`, answering what `List::map` would. Each lookup runs until it asks the store,
 /// and the asks of one round that share a statement are one `db.batch`. A lookup only reads, so its
@@ -356,44 +366,87 @@ pub fn batched<a, b, [t]>(
   xs: List<a>,
   lookup: keep (a) -> b / {db.query[t]},
 ) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} =
-  rounds[t](xs.map(|x: a| stepped[t](|| lookup(x))))
+  rounds[t](started[t](xs, lookup, { steps: [], waiting: NoneWaiting }))
 
 fn stepped<b, [t]>(go: keep () -> b / {db.query[t]}) -> Pending<b> =
-  handle { Looked(go()) } with { db.query[t](s, ps) resume k -> Asking({ s: s, ps: ps, next: k }) }
+  handle { Looked(go()) } with { db.query[t](s, ps) resume k -> Asking(s, ps, k) }
+
+/// `round` with each of `xs` looked up to its first ask.
+fn started<a, b, [t]>(
+  xs: List<a>,
+  lookup: keep (a) -> b / {db.query[t]},
+  round: keep Round<b>,
+) -> Round<b> =
+  match xs {
+    [] -> round,
+    [x, ..rest] -> started[t](rest, lookup, added(round, stepped[t](|| lookup(x)))),
+  }
+
+/// `round` with `p` the step of its next lookup.
+fn added<b>(round: keep Round<b>, p: keep Pending<b>) -> Round<b> = {
+  let { steps, waiting } = round;
+  match p {
+    Looked(v) -> { steps: steps.push(Finished(v)), waiting: waiting },
+    Asking(s, ps, k) -> { steps: steps.push(Asked({ s: s, ps: ps })), waiting: Waits(k, waiting) },
+  }
+}
 
 fn rounds<b, [t]>(
-  ps: List<Pending<b>>,
+  round: keep Round<b>,
 ) -> List<b> / {db.query[t], db.batch[t], abort.raise, diverges} = {
-  let waiting = range(0, ps.len()).filter(|i: Int|
-    match ps.at(i) { Some(Asking(_)) -> true, _ -> false });
-  if waiting.len() == 0 {
-    ps.fold([], |acc: List<b>, p: Pending<b>| match p { Looked(v) -> acc.push(v), _ -> acc })
+  let { steps, waiting } = round;
+  let asking = range(0, steps.len()).filter(|i: Int|
+    match steps.at(i) { Some(Asked(_)) -> true, _ -> false });
+  if asking.len() == 0 {
+    steps.fold([], |acc: List<b>, s: Step<b>| match s { Finished(v) -> acc.push(v), _ -> acc })
   } else {
-    let answers = asked[t](ps, waiting);
+    let answers = asked[t](steps, asking);
     rounds[t](
-      range(0, ps.len()).map(|i: Int|
-        match ps.at(i) {
-          Some(Asking(a)) ->
-            (a.next)(match answers.get(i) {
-              Some(answer) -> answer,
-              None -> Failed(db_error("XX000", "", "a batched ask went unanswered")),
-            }),
-          Some(done) -> done,
-          None -> Looked(panic("an index the round holds")),
-        }),
+      resumed(steps, 0, answers, reversed(waiting, NoneWaiting), {
+        steps: [],
+        waiting: NoneWaiting,
+      }),
     )
   }
 }
 
+/// `waiting` in the other order, the first to ask first, onto `onto`.
+fn reversed<b>(waiting: keep Waiting<b>, onto: keep Waiting<b>) -> Waiting<b> =
+  match waiting { NoneWaiting -> onto, Waits(k, rest) -> reversed(rest, Waits(k, onto)) }
+
+/// `next` with each of `steps`, the `at`th of the round on, stepped again: a finished one as it
+/// was, and an asking one by resuming the first of `waiting` with its answer.
+fn resumed<b>(
+  steps: List<Step<b>>,
+  at: Int,
+  answers: Map<Int, Answer>,
+  waiting: keep Waiting<b>,
+  next: keep Round<b>,
+) -> Round<b> / {abort.raise} =
+  match steps {
+    [] -> next,
+    [Finished(v), ..rest] -> resumed(rest, at + 1, answers, waiting, added(next, Looked(v))),
+    [Asked(_), ..rest] -> match waiting {
+      Waits(k, later) -> {
+        let answer = match answers.get(at) {
+          Some(answer) -> answer,
+          None -> Failed(db_error("XX000", "", "a batched ask went unanswered")),
+        };
+        resumed(rest, at + 1, answers, later, added(next, k(answer)))
+      },
+      NoneWaiting -> panic("a waiting lookup has no continuation"),
+    },
+  }
+
 /// One round's asks answered, by their place: a statement asked once is a `db.query`, and one asked
 /// more is a `db.batch` of all its parameter lists, in the order the asks were made.
 fn asked<b, [t]>(
-  ps: List<Pending<b>>,
-  waiting: List<Int>,
+  steps: List<Step<b>>,
+  asking: List<Int>,
 ) -> Map<Int, Answer> / {db.query[t], db.batch[t]} = {
-  let groups = waiting.fold([], |acc: List<{ s: Stmt, at: List<Int> }>, i: Int|
-    match ps.at(i) {
-      Some(Asking(a)) -> match range(0, acc.len()).fold(None, |found: Option<Int>, g: Int|
+  let groups = asking.fold([], |acc: List<{ s: Stmt, at: List<Int> }>, i: Int|
+    match steps.at(i) {
+      Some(Asked(a)) -> match range(0, acc.len()).fold(None, |found: Option<Int>, g: Int|
           match found {
             Some(_) -> found,
             None -> match acc.at(g) {
@@ -409,7 +462,7 @@ fn asked<b, [t]>(
       },
       _ -> acc,
     });
-  let params = |i: Int| match ps.at(i) { Some(Asking(a)) -> a.ps, _ -> [] };
+  let params = |i: Int| match steps.at(i) { Some(Asked(a)) -> a.ps, _ -> [] };
   groups.fold(Map::new(), |acc: Map<Int, Answer>, g: { s: Stmt, at: List<Int> }|
     match g.at {
       [only] -> acc.insert(only, db.query[t](g.s, params(only))),

@@ -167,7 +167,7 @@ module.exports = grammar({
     _generic_parameter: $ => choice($.type_parameter, $.label_parameter),
     type_parameter: $ => seq(optional($.keep_marker), $.identifier),
     label_parameter: $ => seq('[', commaSep1($.identifier), ']'),
-    row_parameter: $ => seq(optional('multi'), $.identifier),
+    row_parameter: $ => $.identifier,
 
     // --- Types --------------------------------------------------------------
 
@@ -263,7 +263,6 @@ module.exports = grammar({
     ),
 
     operation: $ => seq(
-      optional('multi'),
       field('mode', choice('read', 'write', 'raise')),
       field('name', $.identifier),
       optional($.resource_label),

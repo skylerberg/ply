@@ -31,7 +31,7 @@ import mutants (targets)
 import paths
 import program (Timed, front_of, modules_of, own_diags, timed_over, timed_uncached_over, unmoved,
                 program_view, asked_line, command_kept)
-import report (Answer, ok_code, refused, reuse_members, with_front_end)
+import report (Answer, ok_code, printed, refused, reuse_members, with_front_end)
 import sources (Embed, File, Project, imported_reader, load_resolved, shipped_imported)
 import std.process (process)
 import std.json (Object, Str, Bool, object, int, parse_string)
@@ -54,7 +54,7 @@ import signature (atom_texts)
 import proof.goal (set_of)
 import std.option
 import tests.report (Entry, Case, group_of_class, classes_of, decided_of, Program, Spent, no_spent,
-                     primary_of, placed_cases, phases_json, printed, unbound, test_at, canonical,
+                     primary_of, placed_cases, phases_json, unbound, test_at, canonical,
                      footprint_text)
 import tests.concluded (hash_at, test_hash_at, seeded_of, entry_of, cases_of, traces_of, standing)
 import tests.cases (Keeping, kept_bin, all_cached, Scope, scope_of, over_cases, listed,
@@ -89,9 +89,9 @@ fn loaded(
   };
   match reused {
     Some(t) -> { ..t, read_ms: 0, front_ms: 0, file_ms: 0 },
-    None -> if options.no_cache {
+    None -> if flags.no_cache {
       timed_uncached_over(flags.paths, project, started, flags.verify_deps)
-    } else { timed_over(flags.paths, project, started, verify: flags.verify_deps) },
+    } else { timed_over(flags.paths, project, started, flags.verify_deps) },
   }
 }
 
@@ -108,7 +108,7 @@ pub fn iterated(
   let started = time.elapsed_ms();
   let project = load_resolved(flags.paths);
   let key = match argv {
-    Some(line) -> if held == None && keeps_answer(options) {
+    Some(line) -> if held == None && keeps_answer(flags, options) {
       Some(command_key(queried::program(), asked_line(line, flags.paths)))
     } else { None },
     None -> None,
@@ -131,11 +131,10 @@ pub fn iterated(
 
 /// A run whose answer the next may take: one that consults the store, answers once and as a plain
 /// run does, and reads no configuration file the key does not cover.
-fn keeps_answer(options: Options) -> Bool =
-  !options.no_cache && !options.watch && !options.explain && !options.coverage
-    && options.mutate == None
-    && options.config.files.len() == 0
-    && options.config.schema == None
+fn keeps_answer(flags: Flags, options: Options) -> Bool =
+  !flags.no_cache && !flags.watch && !flags.explain && !options.coverage && options.mutate == None
+    && options.machine.config.files.len() == 0
+    && options.machine.config.schema == None
 
 /// The keys of the passes that answer each test in scope.
 fn answered_by(answering: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
@@ -143,8 +142,8 @@ fn answered_by(answering: List<List<Bytes>>, scope: Scope) -> List<Bytes> =
     acc.concat(match answering.at(i) { Some(ks) -> ks, None -> [] }))
 
 /// The answer a run kept under `key`, where it answers this one: nothing its load read moved, or
-/// each read answers as it did; and every pass it took still stands. A text run prints what that one
-/// printed before its answer. Beside it, the marks found on what the key held.
+/// each read answers as it did; and every pass it took still stands. It prints what that run printed
+/// before its answer. Beside it, the marks found on what the key held.
 fn replayed(
   flags: Flags,
   options: Options,
@@ -153,7 +152,7 @@ fn replayed(
   begun: Int,
 ) -> { answer: Option<Answer>, marks: List<Bytes> } / {semantics.cached, shipped.answer, toolchain.reused, time.elapsed_us, process.out[proc], fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.resolved[cwd], fs.resolved[abs], entering::machine.moved, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.variables, env.working_directory, Derives, abort.raise} = {
   let kept = command_kept(flags.paths, project, key);
-  let supplied = configuration::supplied(options.config);
+  let supplied = configuration::supplied(options.machine.config);
   match match kept.output {
       Some(b) -> match bin::decode(b, kept_bin()) { Ok(k) -> Some(k), Err(_) -> None },
       None -> None,
@@ -172,7 +171,7 @@ fn replayed(
         None -> { answer: None, marks: kept.marks },
         Some(Err(_)) -> { answer: None, marks: kept.marks },
         Some(Ok(json)) -> {
-          if !flags.json { printed(k.opening) };
+          printed(k.opening);
           {
             answer: Some({
               json: match json {
@@ -229,7 +228,7 @@ fn over_load(
         held: None,
         embeds: t.program.embeds,
       },
-    Some(w) -> match config_schema::refusal(w, options.config.schema) {
+    Some(w) -> match config_schema::refusal(w, options.machine.config.schema) {
       Some(d) ->
         {
           answer: unbound(s, { diags: [d], places: t.program.places }),
@@ -435,17 +434,19 @@ fn selected(
 ) -> Answer / {semantics.cached, process.out[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, Entering, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved[cwd], fs.resolved[abs], emit.unit, emit.compiled, shipped.answer, Derives, abort.raise, shipped.reached} = {
   let configuring = time.elapsed_us();
   let testing = tester::begun(options);
-  results::with_ledger(results::store_for(flags.paths, options.no_cache), || {
-    let opened = if options.no_cache { [] } else { ledger.opened() };
+  results::with_ledger(results::store_for(flags.paths, flags.no_cache), || {
+    let opened = if flags.no_cache { [] } else { ledger.opened() };
     // Which tests there are is the tables' to say, so each test over cases lists its own first,
     // unless a run kept what it listed while all its table reaches stands.
     let hashed = hashed_by_kind(analysis);
-    let asked = over_cases(analysis, options, named_modules(flags.paths, timed.program.files)).map(
-      |i: Int| { test: i, hash: listing_hash(analysis, timed.program.places, hashed, i) },
-    );
+    let asked = over_cases(
+      analysis,
+      flags.filters,
+      named_modules(flags.paths, timed.program.files),
+    ).map(|i: Int| { test: i, hash: listing_hash(analysis, timed.program.places, hashed, i) });
     let place = listings_at(flags.paths);
     let stamp = Bytes::of_string(shipped_stamps().runtime);
-    let kept = if options.no_cache { Map::new() }
+    let kept = if flags.no_cache { Map::new() }
     else if place.label == "cwd" { listings::kept[cwd](place.dir, stamp, asked) }
     else { listings::kept[abs](place.dir, stamp, asked) };
     let unkept = asked.filter(|a: listings::Asked| !kept.contains(a.test));
@@ -453,7 +454,8 @@ fn selected(
     let handing = time.elapsed_us();
     // Each unit is emitted over a dump of what it enters, but a schema with constants to enter runs
     // the whole program's.
-    let whole = if options.config.schema != None { Some(front_of(timed, analysis)) } else { None };
+    let whole = if options.machine.config.schema != None { Some(front_of(timed, analysis)) }
+    else { None };
     let hand = |within: Within|
       match whole { Some(front) -> front, None -> front_of(timed, analysis, Some(within)) };
     let lister = if to_list.len() == 0 { None } else {
@@ -464,7 +466,7 @@ fn selected(
     match listed(testing, lister, to_list) {
       Err(diags) -> unbound(style, { diags: diags, places: timed.program.places }),
       Ok(found) -> {
-        if options.no_cache { () }
+        if flags.no_cache { () }
         else if place.label == "cwd" { listings::keep[cwd](place.dir, stamp, unkept, found) }
         else { listings::keep[abs](place.dir, stamp, unkept, found) };
         let cases = kept.fold(
@@ -565,8 +567,13 @@ fn decided_run(
   let options = testing.options;
   let analysis = over.analysis;
   let selecting = time.elapsed_us();
-  let scope = scope_of(analysis, options, named_modules(flags.paths, timed.program.files));
-  let filed_under = if options.no_cache { None } else { Some(shipped_stamps().runtime) };
+  let scope = scope_of(
+    analysis,
+    flags.filters,
+    options.shard,
+    named_modules(flags.paths, timed.program.files),
+  );
+  let filed_under = if flags.no_cache { None } else { Some(shipped_stamps().runtime) };
   let p = program_of(
     options,
     timed,
@@ -583,8 +590,8 @@ fn decided_run(
   let searching = machine::sim_plan_of(options.sim);
   let search = search_of(searching);
   let loaded = views::held_texts(timed.program.shipping, timed.program.reached);
-  let supplied = configuration::supplied(options.config);
-  let asked = cases_of(rows_of(analysis), search, options, supplied, loaded);
+  let supplied = configuration::supplied(options.machine.config);
+  let asked = cases_of(rows_of(analysis), search, flags.no_cache, options, supplied, loaded);
   let first = decide(asked.cases);
   let building = time.elapsed_us();
   // What a test runs is the unit's to say, so a run that would execute anything emits it before
@@ -595,12 +602,18 @@ fn decided_run(
   let within = run_within(over, running);
   let handed = hand(within);
   let unit_at = time.elapsed_us();
-  let emitted = run_unit(handed, over, running, within.owners, options.config.schema != None);
+  let emitted = run_unit(
+    handed,
+    over,
+    running,
+    within.owners,
+    options.machine.config.schema != None,
+  );
   match emitted {
     Err(diags) -> unbound(style, { diags: diags, places: p.places }),
     Ok(unit) -> {
       let keyed = match unit {
-        Some(e) -> if options.no_cache { Map::new() }
+        Some(e) -> if flags.no_cache { Map::new() }
         else { code_keys(first, codes_of(handed, e, over.entries), search) },
         None -> Map::new(),
       };
@@ -622,9 +635,9 @@ fn decided_run(
       );
       // A run that executes nothing builds no unit, unless a schema has constants to enter or a
       // table had cases to list.
-      let build = decided.runs.len() > 0 || options.config.schema != None;
+      let build = decided.runs.len() > 0 || options.machine.config.schema != None;
       let text = match unit { Some(e) -> if build { Some(e.text) } else { None }, None -> None };
-      let made = match units::library_of(text, options.profile) {
+      let made = match units::library_of(text, options.machine.profile) {
         Err(diags) -> Err(diags),
         Ok(library) -> tester::unit_of(testing, handed, library, true),
       };
@@ -636,7 +649,7 @@ fn decided_run(
             tester::closed(made_unit);
             unbound(style, { diags: diags, places: p.places })
           };
-          match configuration::opened_by(options.config, |name: String|
+          match configuration::opened_by(options.machine.config, |name: String|
               schema_of(made_unit, name)) {
             Err(diags) -> refused(diags),
             Ok(r) -> match tester::bound(
@@ -688,7 +701,8 @@ fn decided_run(
                     let again = cases_of(
                       rows_of(analysis),
                       search,
-                      { ..options, no_cache: false },
+                      false,
+                      options,
                       supplied,
                       loaded,
                     );

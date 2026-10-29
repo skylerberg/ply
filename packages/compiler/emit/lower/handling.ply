@@ -3,21 +3,19 @@
 //! instance its evidence objects' clause slots point into, inline or detached on a stack of its own
 //! where a clause resumes off its tail. Effects are named program-wide.
 
-import compiler.emit.code (Code, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo, CodeArm,
-                           CodeField, NApp, NVar, NIf, NBlock, NMatch, NUnary, NBinary, NField,
-                           NUpdate, NRecord, NList, NPerform, NParallel, NHandle, NLambda,
-                           slots_read, all_read, pat_slots)
+import compiler.emit.code (Code, CodeHandle, CodeClause, CodeReturn, CodeStmt, CLet, CLetPat, CDo,
+                           CodeArm, CodeField, NApp, NVar, NBuiltin, NIf, NBlock, NMatch, NUnary,
+                           NBinary, NField, NUpdate, NRecord, NList, NPerform, NParallel, NHandle,
+                           NLambda, slots_read, all_read, pat_slots)
 import compiler.emit.keys (Evidence)
 import compiler.emit.evidence (evidence_type, instance_block_type, row_described_type)
 import compiler.syntax.parsing (Span)
-import compiler.syntax.exprs (is_exit_effect, scheduler_module)
+import compiler.syntax.exprs (scheduler_module)
 import compiler.syntax.items (is_shipped)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Row, Resource,
-                             RNamed, RSingleton, RAny, RVar, int_type, string_type, fields_sorted,
-                             fn_type, row_empty)
+import compiler.check.types (Type, TyFn, TyRecord, Row, Resource, RNamed, RSingleton, RAny, RVar,
+                             int_type, string_type, fields_sorted, row_empty)
 import compiler.check.infer.expr (kept_type, crossing_vars, crossing_own)
 import compiler.emit.typing (unknown_type)
-import compiler.expand.rewrite (named_program_wide)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
 import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, is_raise)
 import std.bytes (ascii_of_int)
@@ -26,24 +24,21 @@ import compiler.emit.keys (module_of)
 import compiler.emit.marks (carried_by, kept_form)
 import compiler.emit.tir (RInt, RWord, RImm, Arg, AVar, AZero, Inst, Block, Op, OHandle, Get,
                           PField, Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
-                          Enter, Handle, Uses, AInt, Static, falls_through, reads)
+                          Enter, Handle, AInt, Static, falls_through, reads)
 import compiler.emit.tir.handling (Perform, Label, Parallel, Unsettled, Clause, Bridge, Instance,
                                    InstanceHeap, InstanceIn, Entering, ForwardsLaid, ForwardsSet,
                                    ObjectAt, Mapped, Slot, Answering, Forwarding, Forwarded, Keyed,
                                    KeyedRow, Entry, Answers, Schedules, Stops, Resumes, Raises,
                                    HandleInstance, Returning, raised_at)
-import compiler.emit.lower.crossing (op_described, type_described, effect_of, exit_effect_named,
-                                     own_types)
+import compiler.emit.lower.crossing (op_described, type_described, effect_of, own_types)
 import compiler.emit.lower.kept (crossed_kept)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Frame, Worded, Held, unreachable,
-                                 fresh, bound_as, done, emitted, continued, filed, unfiled, type_of,
-                                 handed, static_added)
-import compiler.emit.lower.evidence (words_at, routed, around, bridged, held_routed, label_resource,
-                                     value_handing, described, label_value, filed_row)
+                                 fresh, bound_as, done, emitted, continued, type_of, handed,
+                                 static_added)
+import compiler.emit.lower.evidence (words_of, routed, around, bridged, held_routed, label_resource,
+                                     value_handing, described, label_value)
 import compiler.emit.lower.held (held_as)
-import compiler.emit.lower.setting (op_mode_of)
 import compiler.emit.lower.data (recorded_as)
-import compiler.emit.lower.resumes (off_tail_code)
 
 /// Operation `op` of `effect` performed on `resource` with `args`, at `label` where one is read,
 /// written `written`: the label opened as the field-table entry it is, each argument handed over as
@@ -58,13 +53,12 @@ pub fn performed(
   label: Option<Arg>,
   written: Option<Code>,
   args: List<Arg>,
-  answer: Option<Type>,
+  answer: Type,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  match effect_named(cx, p.effect) {
+  match effect_of(cx, p.effect) {
     None -> unreachable(b"an effect the lowering does not resolve: ".concat(p.effect)),
-    Some(named) -> {
-      let en = match effect_of(cx, named.global) { Some(e) -> e, None -> named };
+    Some(en) -> {
       let index = range(0, en.ops.len()).find(|k: Int|
         match en.ops.at(k) { Some(o) -> o.name == p.op, None -> false });
       let resource = match written {
@@ -101,13 +95,9 @@ pub fn performed(
           { st: w.st, args: acc.args.push(w.arg) }
         },
       );
-      let typed = match answer {
-        Some(a) -> Some(a),
-        None -> match filed(cx, at) { Some(f) -> Some(f.ty), None -> None },
-      };
-      match typed {
-        None -> unfiled(cx, b"a perform", at),
-        Some(ty) -> {
+      let ty = answer;
+      {
+        {
           let out = if is_raise(mode) { { ty: ty, marked: None } }
           else { crossed_out(declared.ret, kept, ty) };
           let d = op_described(
@@ -153,7 +143,7 @@ pub fn performed(
             None -> answered,
             Some(m) -> crossed_kept(cx, answered.st, answered.arg, m, false, at),
           }
-        },
+        }
       }
     },
   }
@@ -208,10 +198,12 @@ pub fn crossing_of(
   p: { effect: Bytes, op: Bytes, resource: Bytes },
   codes: List<Code>,
   args: List<Arg>,
+  answer: Type,
   at: Span,
 ) -> Option<{ name: Bytes, types: List<Type>, rows: List<Row> }> / {abort.raise} =
-  match ((effect_named(cx, p.effect), filed(cx, at))) {
-    (Some(named), Some(t)) -> {
+  match effect_of(cx, p.effect) {
+    Some(named) -> {
+      let t = { ty: answer };
       let crossing = match prelude_effects().find(|e: EffectInfo| e.name == named.global) {
         Some(e) -> match e.ops.find(|o: OpInfo| o.name == p.op) {
           Some(o) -> crossing_vars(o),
@@ -233,7 +225,7 @@ pub fn crossing_of(
               Some(TyFn(f)) -> if f.effects.tail == None { acc } else {
                 acc.push(match codes.at(i) {
                   Some(c) -> match c.node {
-                    NLambda(l) -> filed_row(cx, l.at),
+                    NLambda(l) -> l.row,
                     _ -> match args.at(i) {
                       Some(a) -> match type_of(a) { TyFn(g) -> g.effects, _ -> row_empty() },
                       None -> row_empty(),
@@ -273,9 +265,9 @@ pub fn clause_frame(clause: CodeClause, held: Held) -> Frame =
       + (if clause.resume { 1 } else { 0 }),
     size: clause.size,
     captures: clause.captures,
-    resumes: clause.resume,
+    resumes: if clause.resume { Some(clause.resumed) } else { None },
     body: clause.body,
-    ty: None,
+    ty: clause.ty,
     words: [],
     held: held,
   }
@@ -287,9 +279,9 @@ pub fn ret_frame(r: CodeReturn, held: Held) -> Frame =
     params: 1,
     size: r.size,
     captures: r.captures,
-    resumes: false,
+    resumes: None,
     body: r.body,
-    ty: None,
+    ty: r.ty,
     words: [],
     held: held,
   }
@@ -310,12 +302,12 @@ pub type Planned = {
 /// held.
 pub type Forwards = { word: Arg, outer: List<Worded> }
 
-/// The `handle` `h` written at `at` planned after `st`, its instance laid out: the fuel and unwind
-/// words, each clause's record, then the return clause's, its variables and its keyed tables.
+/// The `handle` `h` written at `at` planned after `st`, its instance laid out: the unwind words, each
+/// clause's record, then the return clause's, its variables and its keyed tables.
 pub fn handle_planned(
   cx: Context,
   st: Lowering,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   at: Span,
 ) -> Planned / {abort.raise} = {
   let detached = detaches(h.clauses);
@@ -532,8 +524,7 @@ fn forwarding_header(
 
 /// Whether clause `cl` answers `abort.raise`, which a raise the runtime left pending reaches.
 fn answers_abort(cx: Context, cl: CodeClause) -> Bool / {abort.raise} =
-  cl.op == b"raise"
-    && (match effect_named(cx, cl.effect) { Some(en) -> en.global == b"abort", None -> false })
+  cl.op == b"raise" && cl.effect == b"abort"
 
 /// How many variables the `handle` whose body is `body` holds: what its body's first statements
 /// install.
@@ -544,7 +535,7 @@ fn handler_vars(body: Code) -> Int =
         match s {
           CDo(d) -> match d.code.node {
             NApp(a) -> match a.func.node {
-              NVar(v) -> if v.name == b"?handler_init" { n + 1 } else { n },
+              NBuiltin(v) -> if v.name == b"?handler_init" { n + 1 } else { n },
               _ -> n,
             },
             _ -> n,
@@ -561,10 +552,11 @@ pub fn clause_held(
   cx: Context,
   st: Lowering,
   plan: Planned,
+  row: Row,
   at: Span,
 ) -> { st: Lowering, held: Held } / {abort.raise} = {
   let around = match plan.forwarding { Some(f) -> { ..cx, words: f.outer }, None -> cx };
-  let words = held_routed(around, st, words_at(cx, at), at);
+  let words = held_routed(around, st, words_of(cx, row), at);
   {
     st: words.st,
     held: {
@@ -582,9 +574,9 @@ fn handle_keys(
   clauses: List<CodeClause>,
 ) -> List<{ evidence: Evidence, effect: EffectName }> / {abort.raise} =
   clauses.fold([], |acc: List<{ evidence: Evidence, effect: EffectName }>, cl: CodeClause| {
-    let en = match effect_named(cx, cl.effect) {
-      None -> { written: cl.effect, global: cl.effect, ops: [] },
-      Some(named) -> match effect_of(cx, named.global) { Some(e) -> e, None -> named },
+    let en = match effect_of(cx, cl.effect) {
+      Some(e) -> e,
+      None -> { global: cl.effect, ops: [] },
     };
     let answered = { effect: en.global, resource: clause_resource(cx, cl) };
     if acc.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == answered) { acc }
@@ -598,7 +590,7 @@ fn handle_keys(
 pub fn handle_entered(
   cx: Context,
   st: Lowering,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   plan: Planned,
   at: Span,
 ) -> { cx: Context, st: Lowering } / {abort.raise} = {
@@ -621,7 +613,7 @@ pub fn handle_entered(
 pub fn instance_objects(
   cx: Context,
   st: Lowering,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   plan: Planned,
   at: Span,
 ) -> { st: Lowering, words: List<Worded> } / {abort.raise} = {
@@ -701,11 +693,7 @@ fn key_planned(cx: Context, clauses: List<CodeClause>, k: Key) -> KeyPlan / {abo
     range(0, clauses.len()).filter(|c: Int|
       match clauses.at(c) {
         Some(cl) ->
-          cl.op == op
-            && (match effect_named(cx, cl.effect) {
-              Some(en) -> en.global == k.evidence.effect,
-              None -> false,
-            })
+          cl.op == op && cl.effect == k.evidence.effect
             && (every || clause_resource(cx, cl) == k.evidence.resource),
         None -> false,
       });
@@ -835,11 +823,7 @@ fn object_laid(
 
 /// How a clause of the runtime's mode `mode` is entered from its slot.
 fn entry_of(mode: Int) -> Entry =
-  if mode == 3 { Raises }
-  else if mode == 1 { Resumes }
-  else if mode == 2 { Stops(false) }
-  else if mode == 4 { Stops(true) }
-  else { Answers }
+  if mode == 3 { Raises } else if mode == 1 { Resumes } else if mode == 2 { Stops } else { Answers }
 
 /// Whether clause `c` may stop its `handle` with what it answers, which its instance then holds.
 fn may_stop(c: Clause) -> Bool = match entry_of(c.mode) { Resumes -> true, _ -> false }
@@ -863,7 +847,7 @@ fn clause_resource(cx: Context, cl: CodeClause) -> Resource =
 /// to what is around it, and the instance its landing reads.
 pub fn body_frame(
   cx: Context,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   plan: Planned,
   own: List<Worded>,
   answer: Type,
@@ -875,9 +859,9 @@ pub fn body_frame(
     params: 0,
     size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
     captures: reads.map(|r: Int| { src: r, dst: r }),
-    resumes: false,
+    resumes: None,
     body: h.body,
-    ty: Some(fn_type([], answer, row_empty())),
+    ty: { params: [], kept: [], once: false, ret: answer, effects: row_empty() },
     words: [],
     held: {
       words: own.concat(match plan.forwarding { Some(f) -> f.outer, None -> [] }),
@@ -897,7 +881,7 @@ pub fn handled(
   body: Lowered,
   clauses: List<Arg>,
   ret: Option<Arg>,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   plan: Planned,
   at: Span,
 ) -> Lowered / {abort.raise} = {
@@ -1017,7 +1001,7 @@ pub fn detached_landed(
   cx: Context,
   before: Lowering,
   body: Lowered,
-  h: { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn> },
+  h: CodeHandle,
   plan: Planned,
   answer: Type,
   at: Span,
@@ -1064,13 +1048,7 @@ pub fn detached_landed(
 /// one's effect, operation and mode; it enters each through its record.
 fn preset_clauses(cx: Context, clauses: List<CodeClause>) -> List<Clause> / {abort.raise} =
   clauses.map(|cl: CodeClause|
-    {
-      effect: match effect_named(cx, cl.effect) { Some(en) -> en.global, None -> cl.effect },
-      op: cl.op,
-      mode: clause_mode(cx, cl),
-      string: None,
-      handler: 0,
-    })
+    { effect: cl.effect, op: cl.op, mode: clause_mode(cx, cl), string: None, handler: 0 })
 
 /// A `parallel` block of the closures `branches`, which perform `performs`: the runtime runs them,
 /// at once where it may, handing each the words of that row, and the block answers the tuple of
@@ -1174,7 +1152,7 @@ fn clause_laid(
   closure: Arg,
   at: Span,
 ) -> Laid / {abort.raise} =
-  match effect_named(cx, cl.effect) {
+  match effect_of(cx, cl.effect) {
     None -> { ..acc, unknown: match acc.unknown { Some(u) -> Some(u), None -> Some(cl.effect) } },
     Some(en) -> {
       let stringed = cl.binds_label || (en.global == b"abort" && cl.op == b"raise");
@@ -1199,16 +1177,12 @@ fn clause_laid(
   }
 
 /// As the runtime numbers a clause: `3` answers a raise, `0` never resumes, `1` resumes in tail
-/// position only, and off its tail `2` resumes at most once and `4` may resume again.
+/// position only, and `2` resumes off its tail.
 fn clause_mode(cx: Context, cl: CodeClause) -> Int / {abort.raise} =
-  if named_program_wide(cl.effect) != None
-      || (match effect_named(cx, cl.effect) {
-        Some(e) -> is_raise(op_mode(e, cl.op)),
-        None -> false,
-      }) { 3 }
+  if match effect_of(cx, cl.effect) { Some(e) -> is_raise(op_mode(e, cl.op)), None -> false } { 3 }
   else if !cl.resume { 0 }
   else if resume_in_tail_only(cl) { 1 }
-  else { off_tail_code(cl) }
+  else { 2 }
 
 /// Whether a clause resumes off its tail, so its `handle`'s body runs on a stack of its own.
 pub fn detaches(clauses: List<CodeClause>) -> Bool =
@@ -1225,7 +1199,7 @@ fn resume_in_tail_only(cl: CodeClause) -> Bool = {
 fn tail_calls_of(code: Code, k: Int) -> Int =
   match code.node {
     NApp(a) -> match a.func.node {
-      NVar(v) -> if v.slot == Some(k) && a.args.len() == 1 && !all_read(a.args).contains(k) { 1 }
+      NVar(v) -> if v.slot == k && a.args.len() == 1 && !all_read(a.args).contains(k) { 1 }
       else { 0 },
       _ -> 0,
     },
@@ -1304,28 +1278,6 @@ fn param_of(t: Type) -> Type =
   match t {
     TyFn(f) -> match f.params.at(0) { Some(p) -> p, None -> unknown_type() },
     _ -> unknown_type(),
-  }
-
-/// The effect a body names `written`: one a `try` names program-wide, one the module's scope binds,
-/// or one of the prelude's, which are known program-wide by their bare names.
-fn effect_named(cx: Context, written: Bytes) -> Option<EffectName> / {abort.raise} =
-  if is_exit_effect(written) { Some(exit_effect_named(written)) } else {
-    match named_program_wide(written) {
-      Some(global) ->
-        Some(match effect_of(cx, global) {
-          Some(e) -> e,
-          None -> { written: written, global: global, ops: [] },
-        }),
-      None -> match cx.setting.effects.fold(None, |acc: Option<EffectName>, e: EffectName|
-          if e.written == written { Some(e) } else { acc }) {
-        Some(e) -> Some(e),
-        None ->
-          prelude_effects().fold(None, |acc: Option<EffectName>, e: EffectInfo|
-            if e.name == written {
-              Some({ written: e.name, global: e.name, ops: e.ops.map(op_mode_of) })
-            } else { acc }),
-      },
-    }
   }
 
 /// Operation `op` as effect `e` declares it: a read of no types it says where it does not declare it.

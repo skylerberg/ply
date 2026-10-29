@@ -27,12 +27,9 @@ pub fn encoded_defs() -> Vec<Def> {
             "m.ladder",
             1,
             &format!(
-                "  if (ctx->fuel <= 0) {{ rt_no_fuel_p(ctx); return 0; }}\n\
-                 \x20 ctx->fuel -= 1;\n\
-                 \x20 int64_t n = ply_imm_value(p0);\n\
+                "  int64_t n = ply_imm_value(p0);\n\
                  \x20 Word r = ply_imm(0);\n\
                  \x20 if (n > 0) {{ r = {ladder}(ctx, ply_imm(n - 1)); if (ctx->failed) return 0; r = ply_imm(ply_imm_value(r) + 1); }}\n\
-                 \x20 ctx->fuel += 1;\n\
                  \x20 return r;"
             ),
         ),
@@ -137,7 +134,7 @@ fn ints(xs: &[i64]) -> Vec<u8> {
 }
 
 fn run() -> Run {
-    Run::unbounded(10_000)
+    Run::unbounded()
 }
 
 #[test]
@@ -249,25 +246,6 @@ fn a_raise_ends_its_entry_and_no_other() {
     }
 }
 
-/// How deeply the entry's calls may nest is the run's, and a call past it fails the entry.
-#[test]
-fn a_recursion_past_the_runs_depth_fails_rather_than_running_on() {
-    let dir = tempfile::tempdir().expect("a scratch directory");
-    let Some(opened) = opened(dir.path()) else {
-        return;
-    };
-    let shallow = Run::unbounded(8);
-    assert!(
-        int_answered(&opened, "m.ladder", &[100], &shallow)
-            .is_err_and(|why| why.contains("nested calls")),
-    );
-    assert_eq!(
-        int_answered(&opened, "m.ladder", &[100], &run()),
-        Ok(100),
-        "the same call answers on a depth that fits it, so the failure above says nothing else"
-    );
-}
-
 /// An entry may begin while another runs on the same thread: it runs on a context of its own and
 /// leaves the outer one's as it found it.
 #[test]
@@ -277,22 +255,22 @@ fn an_entry_inside_another_runs_on_a_context_of_its_own() {
         return;
     };
     let mut outer = crate::bare::context();
-    outer.begin(1_000);
+    outer.begin();
     assert_eq!(int_answered(&opened, "m.double", &[8], &run()), Ok(16));
     assert_eq!(outer.heap.live(), 0);
     outer.end();
     assert_eq!(int_answered(&opened, "m.double", &[9], &run()), Ok(18));
 }
 
-/// An entry on a program thread nests as deeply as its run allows, however little stack the thread
-/// that asks for it has: 100,000 nested calls from a thread of 256 KiB.
+/// An entry on a program thread nests on that thread's stack, however little stack the thread that
+/// asks for it has: 100,000 nested calls from a thread of 256 KiB.
 #[test]
 fn an_entry_on_a_program_thread_nests_past_its_callers_stack() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let Some(opened) = opened(dir.path()) else {
         return;
     };
-    let deep = Run::unbounded(200_000);
+    let deep = Run::unbounded();
     let asked = std::thread::Builder::new()
         .stack_size(256 * 1024)
         .spawn(move || {

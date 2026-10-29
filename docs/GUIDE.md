@@ -175,7 +175,6 @@ The following words are keywords only where shown, and ordinary identifiers ever
 | `release` | in `release for <Type> by <function>` (§7.1) |
 | `keep` | before a parameter's type, a function type's parameter, an operation's parameter, or a type parameter (§4.7, §7.1) |
 | `once` | before the `(` of a function type (§7.1) |
-| `multi` | before `read` or `write` in an operation declaration, and before a row parameter (§6.1, §6.6) |
 | `where`, `derivable`, `identity` | after a signature's row, after a type's parameter list, or after a law's binders; `identity(a)` at the start of a law's or schema's `where` |
 | `returns`, `fresh` | between a function's signature and its specifications |
 | `requires`, `ensures` | between a function's signature and its body |
@@ -347,7 +346,7 @@ From loosest to tightest binding. All binary operators are left-associative.
     conditions show an `Int` divisor is not zero.
   - Overflow, a `Decimal` result that cannot be represented exactly, and a shift count that is
     negative or at least the type's width end the program (`E0502`). These are machine limits
-    like the call depth limit, and do not appear in effect rows.
+    like running out of stack, and do not appear in effect rows.
   - `<<` discards bits shifted out. The `checked_*` builtins return `None` instead of failing
     (§12).
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
@@ -940,8 +939,6 @@ write `<| e>` when there are no type parameters. A row variable among the type p
 
 - A type parameter marked `keep`, as in `<keep a>`, may be filled with a resource (§7.1). Filling
   an ordinary type parameter with a resource is `E0317`.
-- A row parameter marked `multi`, as in `<| multi e>`, may include `multi` operations, whose
-  handlers can resume the code more than once (§6.6).
 
 **Label parameters.** A name in brackets is a resource label parameter (§6.2): `fn relay<[l]>(b:
 Bytes) -> Unit / {net.send[l]} = net.send[l](b)`.
@@ -1120,8 +1117,10 @@ that releases them when it ends, and cannot outlive it.
 {db.read[users]}` and `(A) -> B / e` have effect rows. With no `/` the row is empty, both in
 signatures and in declared types. A function value may perform less than its type allows (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys. `once (A) -> B` is a function
-that may be called at most once and never copied; it is a resource (§7.1). `keep` before a function
-type's parameter means the function may keep what it is passed, as on a `fn` (§7.1).
+that may be called at most once and never copied; it is a resource (§7.1). A function that may be
+called again may be passed where a `once` one is expected, but a `once` one goes only where its
+type is written `once` (`E0201`). `keep` before a function type's parameter means the function may
+keep what it is passed, as on a `fn` (§7.1).
 
 **Written:** every parameter type and return type of a top-level `fn` (`E0126`), every `forall`
 binder type, and every top-level `fn`'s effect row. Callers, in this package or another, are
@@ -1390,7 +1389,7 @@ c])`, where `sum` walks the list with `at`. A list the function returns, stores,
 loop, or passes to a call that might keep it or an element of it (such as `List::fold`, which hands
 each element to a function value) is allocated. A frame holds at most 128 words of such lists
 (each list takes its elements' words plus three); further lists are allocated. Every list in a
-function that may be resumed more than once by a handler (§6.6) is allocated.
+function that may stop at a perform for a handler to resume later (§6.6) is allocated.
 
 ### 5.7 Iteration
 
@@ -1409,18 +1408,17 @@ clause resumes somewhere other than its tail (§6.6): it runs the body on a sepa
 calls nest. A group whose `handle`s return directly, resume in tail position, or handle a raise (as
 `try` does) keeps its loop.
 
-Every other call nests, up to 10,000 deep (`E0502` beyond that): `1 + f(n - 1)`, a call inside
-`handle`, `with_hold` or a lambda, and a call of another function. Each task has its own depth
-(§9).
+Every other call nests: `1 + f(n - 1)`, a call inside `handle`, `with_hold` or a lambda, and a call
+of another function. Only the stack bounds how deep calls nest. It holds a gigabyte, and a call
+that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
 
 A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
 server is meant to run forever; `--timeout MS` sets one.
 
-`range`, the byte scanners, `List::map`, `List::filter` and `List::fold` do not nest calls.
-`std.prelude` writes the list functions in Ply as tail calls over the list's internal tree, so
-each element costs a step of the walk (plus the steps of `push` for `map` and `filter`), besides
-what the function they are given takes. `iterate` is a loop with an early exit and a step budget:
+`range`, the byte scanners, `List::map`, `List::filter` and `List::fold` do not nest calls:
+`std.prelude` writes the list functions in Ply as tail calls over the list's internal tree.
+`iterate` is a loop with an early exit and a budget of passes:
 
 ```ply
 fn first_gap(xs: List<Int>) -> Int =
@@ -1637,8 +1635,6 @@ Each operation is a `read`, a `write` or a `raise`.
   checker can tell that writing `[orders]` does not conflict with reading `[users]`.
 - `nondet` marks an effect whose results are not determined by the program's state, such as a
   clock or the network (§8.3).
-- `multi` before an operation's mode, `multi read flip[r]() -> Bool`, lets a handler resume the
-  code after the perform more than once (§6.6).
 - A parameter marked `keep` takes ownership of a resource the perform passes, instead of borrowing
   it (§7.1).
 
@@ -1868,12 +1864,11 @@ gets its handlers from where it is called, according to its row there; this incl
 
 ### 6.6 `resume`
 
-In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the *continuation*: the
-rest of the body after the perform, as a function. The clause then has the `handle`'s type.
+In `amb.flip[coin]() resume k -> k(true) * 2`, `resume k` binds the *continuation*: the rest of
+the body after the perform, as a function. The clause then has the `handle`'s type.
 
-- `k` may be called at most once (`E0316`), unless the operation is declared `multi` (§6.1), as
-  `flip` is. Then it may be called any number of times, and the body is held to what running twice
-  allows (§7.1).
+- `k` is a `once` function (§4.7): it may be called at most once (`E0316`), and a value that holds
+  it is a resource (§7.1), so wherever `k` goes it is called at most once.
 - Without `resume`, a clause's value is returned to the perform site. A clause for a `raise` is
   different (§6.8).
 - `k` is a function value. It may be kept after the `handle` ends and called later. Whatever the
@@ -1891,9 +1886,8 @@ around it.
 - Nested brackets release innermost first.
 - A cancel does not interrupt an `acquire` or a `release`: it takes effect when that one returns
   (§9), so whatever was acquired is fully released.
-- The body receives what `acquire` returned as is, and may keep it past the release. A continuation
-  captured inside the body and resumed twice releases twice. `with_hold` (§7.2) is the bracket whose
-  body cannot keep what it holds and which releases exactly once.
+- The body receives what `acquire` returned as is, and may keep it past the release. `with_hold`
+  (§7.2) is the bracket whose body cannot keep what it holds.
 
 ### 6.7 Unhandled effects
 
@@ -1964,7 +1958,7 @@ pattern does not match (§5.1); `iterate` past its budget; `task.join` of a canc
 
 - A signature that leaves `abort.raise` out of its row when its body can raise is `E0302`, which
   names the operation and offers the row to write.
-- Overflow and the call depth limit end the program regardless of the row.
+- Overflow and running out of stack end the program regardless of the row.
 - A clause for `abort.raise` receives the message: `panic`'s argument, or what would otherwise be
   reported.
 - Unhandled, it is `E0501` for a failed assertion and `E0502` for anything else.
@@ -2071,34 +2065,8 @@ A clause assigns a variable with `name = value;`, anywhere in its blocks and in 
   variables can be assigned.
 
 A clause without `resume` gives the body back the values it ended with. A clause with `resume k`
-continues the body, each time it calls `k`, with the values it holds then, and changes made during
-that resumption stay in it unless what it returns carries them out (as `return` can). Where a
-handler stands decides what a resumption sees. A handler inside the continuation that a clause
-resumes twice starts each resumption from the values it had when the continuation was captured. A
-handler outside it is shared by every resumption.
-
-```ply
-effect amb {
-  read flip() -> Bool
-}
-
-fn counted() -> Int / {amb.flip} =
-  handle {
-    tally.add(if amb.flip() { 1 } else { 10 })
-  } with {
-    var sum = 0,
-    tally.add(n) -> {
-      sum = sum + n;
-    },
-    return u -> sum,
-  }
-
-fn each() -> Int = handle { counted() } with { amb.flip() resume k -> k(true) + k(false) }
-```
-
-`each()` is `1 + 10`: `counted`'s handler is inside the continuation that `flip`'s clause resumes,
-so each resumption starts from `sum = 0`. If the handler were moved around `each`'s `handle`, there
-would be one shared `sum`, and the second resumption would add to what the first left.
+continues the body, when it calls `k`, with the values it holds then, and changes made during that
+resumption stay in it unless what it returns carries them out (as `return` can).
 
 Tasks spawned under a handler share its variables (§9). A clause runs without other tasks'
 clauses interleaving until it performs something that may wait, such as a `task` or `clock`
@@ -2218,12 +2186,8 @@ again.
   the owner holds the resource, but may not be returned, kept or stored (`E0318`).
 - A clause, a `return` clause, a `simulate` body and a `parallel` branch may run any number of
   times or none, so each may borrow a resource from outside but not consume it (`E0316`).
-- An operation's continuation (§6.6) is a resource too: unless the operation is `multi`, `resume
-  k` binds a `k` the clause may call at most once (`E0316`). A clause for a `multi` operation may
-  run the rest of the body more than once, so no resource may be live across a perform of one (or a
-  call that may perform one) (`E0319`), and no `nondet` operation may run after it, under the
-  clause that could resume it twice (`E0321`). Handle the `multi` operation in an inner `handle`
-  first.
+- An operation's continuation (§6.6) is a `once` function, so it is a resource too: `resume k`
+  binds a `k` the clause may call at most once (`E0316`).
 
 **Errors.**
 
@@ -2232,8 +2196,6 @@ again.
   a function that consumed one passed on; a continuation resumed twice.
 - `E0317`: a resource would be copied: compared, shown, or used as an ordinary type parameter.
 - `E0318`: a borrowed resource consumed, or a function borrowing one that might outlive it.
-- `E0319`: a resource live across a `multi` operation.
-- `E0321`: a `nondet` operation where a `multi` clause may resume the code twice.
 - `E0322`: a resource created or named where nothing owns it.
 - `E0323`: `keep` before a type that is neither a resource nor a function type.
 
@@ -2304,10 +2266,9 @@ hold: its functions take the `Hold`, and refuse to work on something already rel
 hold carries `hold.read[r]` in its row, so it must be built and consumed inside the region; letting
 it leave is `E0446`.
 
-A continuation captured inside a `with_hold` body and resumed after the hold was released (by a
-clause that resumes twice, §6.6) finds the hold gone. Its first `Hold::get`, or else the region's
-own `}`, ends the program with `E0331`, and `release` does not run again. Where the acquired value
-is a host resource, an at-most-once operation on it refuses the second resumption first (`E0426`).
+A continuation captured inside a `with_hold` body and resumed after the hold was released finds
+the hold gone. Its first `Hold::get`, or else the region's own `}`, ends the program with `E0331`,
+and `release` does not run again.
 
 **Errors.**
 
@@ -2319,8 +2280,8 @@ is a host resource, an at-most-once operation on it refuses the second resumptio
   mentioning `Hold`, `Task` or `Chan`; or a variant field, operation parameter or result holding a
   function whose written row reaches one (§4.6).
 - `E0449`: a task, channel or continuation reaching a host operation, a host result, or an entry
-  point's argument or result (at run time). A continuation's type is an ordinary function type, so
-  this is the only check that catches it.
+  point's argument or result (at run time). A continuation's type is a function type, so this is
+  the only check that catches it.
 
 ## 8. Tests
 
@@ -2473,13 +2434,15 @@ The report is printed as the run goes:
 
 1. what was selected and how it will run: the groups and workers, isolation, the host permissions,
    and what `--explain` says about selection;
-2. each group's results as that group finishes, in the order the groups ran, so a long run shows
-   progress and its first failure early;
+2. each group's results as that group finishes, in the order the groups ran, with the message and
+   place of each test that did not pass under its line. A long run shows progress and its first
+   failure early, and a run that ends early still shows every result it finished;
 3. the run's own figures (handshakes, the backend, simulation, and with `--explain` where the time
    went), the summary, and each failure's diagnosis.
 
-`--json` prints one object when the run ends. `--workspace` prints each package's heading before
-it runs.
+Under `--json`, items 1 and 2 go to standard error as the run goes, and one object goes to standard
+output when the run ends, in place of item 3. `--workspace` prints each package's heading before it
+runs.
 
 `--timeout MS` is how much wall-clock time each test may take (default 60000; `0` is no limit). It
 is not a verdict: a test over it is *abandoned* (`W0612`), reported separately from failures,
@@ -2897,7 +2860,11 @@ proof may use what it promises but never unfolds its body; that package proves i
 fn` is known by its body too: a proof anywhere may unfold it, so its body and everything it reaches
 is part of what dependents are checked and proved against.
 
-**`ply prove` output.** It reports the definitions that carry no claim, then each claim's outcome.
+**`ply prove` output.** It first says how many definitions carry a claim. It then prints each
+claim's outcome as soon as the claim is decided: those the cache answered first, then the rest as
+they are proved. It ends with the definitions that no claim that holds covers, and the tally.
+Under `--json`, the lines it prints as it runs go to stderr, and the object takes the place of the
+rest (§16).
 
 - An `unproved` claim says what stands between it and a proof. Under `--json` this is `gap` (a
   sentence) and `gap_kind`: `open` (with each place the prover stopped as `stuck`);
@@ -3537,7 +3504,8 @@ color if `FORCE_COLOR` is set; otherwise none if `NO_COLOR` is set; otherwise co
 `CLICOLOR_FORCE` is set; otherwise color only on a terminal whose `TERM` is not `dumb`.
 
 **JSON.** Every command takes `--json`, and then prints exactly one compact JSON object on stdout,
-with sorted keys.
+with sorted keys. What a command prints while it runs, such as each result of `ply test` and `ply
+prove`, then goes to stderr, so a run that crashes or is stopped still shows what it finished.
 
 **Environment.** The command reads `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM`, `COLORTERM`,
 `PLY_CACHE_UPSTREAM` (§1), `PLY_REGISTRY` and `PLY_REGISTRY_TOKEN` (§15.1), the `PLY_C_*` variables
@@ -3579,7 +3547,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply hosts [path]` | host, trace, drain, `--digest` |
 | `ply std` | lists the standard library's modules. `--show [NAME]` (a module's source, or a data file a module embeds), `--digest`. Used by `ply bootstrap`: `--answers DIR` (precompute every standard library module's check results into `DIR/pack`), `--answering` (print one line identifying how this `ply` checks the standard library; two `ply`s that print the same line produce the same results). No path. |
 | `ply explain CODE` | one line on what a diagnostic code means; `--all` lists every code. No path. |
-| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` documents the standard library, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
+| `ply doc NAME [path]` | documentation for a full or unique simple name (§2.1). For a definition: its signature with parameter names, its doc, `returns` and spec clauses, location, hash, footprint, and the laws that mention it. For a law schema: the schema and the laws that use it. For a type: its fields or variants (not an opaque sum's) and its functions. For an effect: its operations (one operation is `effect.op`). Also effect sets, and modules with what they export. A name under `std` or `compiler` documents what the toolchain ships, the same everywhere. Any other name the program does not define is looked up among the builtins, then the standard library. Pages are read from cached check results, so no module is parsed to print one. |
 | `ply fmt [paths]` | rewrites every `.ply` file under the paths (default: the package containing the working directory) in the standard layout. `--check` writes nothing and exits 1, naming the files that would change; `--json` reports the same and requires `--check`. |
 | `ply show NAME [path]` | prints one `fn` or `type` as its file has it: its doc and the comment lines above it, `pub`, the body, and a comment ending its last line. `--json` adds the byte range. |
 | `ply replace NAME [path]` | rewrites one `fn` or `type` from `--with FILE` or stdin, formatted, leaving every other byte of the file alone. Refused with `E0128` (exit 2, nothing written) unless the program still checks and no other definition's name or hash changes. `--check` writes nothing. |

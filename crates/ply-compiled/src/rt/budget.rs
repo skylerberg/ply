@@ -1,21 +1,16 @@
-//! Fuel, stacks, and the wall clock an entry runs within.
+//! Stacks, and the wall clock an entry runs within.
 
 use super::*;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The prologue's refusal: this call would nest past the budget the machine handed the entry.
-pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
-    let ctx = unsafe { &mut *ctx };
-    let depth = ctx.depth_bound;
-    let d = Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("recursion limit of {depth} nested calls exceeded"),
-    )
-    .primary(ctx.site(), "the call that overran it");
-    ctx.fail_with(FAILED_OUT_OF_FUEL, d);
-}
+/// What [`Ctx::fuel`] holds: more calls than any run makes.
+pub const RELEASED_FUEL: i64 = i64::MAX / 2;
+
+/// Nothing. The released compiler's code calls it once [`Ctx::fuel`] runs out, which this runtime
+/// never lets it do.
+pub unsafe extern "C" fn rt_no_fuel(_ctx: *mut Ctx) {}
 
 /// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
 /// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
@@ -30,7 +25,7 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     if c.out_of_time() {
         return 0;
     }
-    // A floor another context's growth or a restored frame left stale needs no system call.
+    // A floor another context's growth or a switch of stacks left stale needs no system call.
     let floor = stack_floor();
     if at >= floor {
         c.stack_floor.store(floor, Relaxed);
@@ -41,24 +36,27 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
         c.stack_floor.store(stack_floor(), Relaxed);
         return 1;
     }
-    let d = error("this call would nest past what the native stack holds");
+    let d = Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        "this call would nest past what the native stack holds",
+    )
+    .primary(c.site(), "the call that nested too deep");
     c.fail_with(FAILED_OUT_OF_STACK, d);
     0
 }
 
 /// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::fuel`], [`Ctx::frames`] and [`Ctx::task`] as this stack left them,
-/// whatever ran meanwhile, this stack the running one again and the floor its own.
+/// switches back, with [`Ctx::frames`] and [`Ctx::task`] as this stack left them, whatever ran
+/// meanwhile, this stack the running one again and the floor its own.
 ///
 /// # Safety
 /// As [`switch`], and `ctx` is the context both stacks run under.
 pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
-    let (fuel, frames, task) = unsafe { ((*ctx).fuel, (*ctx).frames, (*ctx).task) };
+    let (frames, task) = unsafe { ((*ctx).frames, (*ctx).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
         ply_core::limit::set_running(running);
-        (*ctx).fuel = fuel;
         (*ctx).frames = frames;
         (*ctx).task = task;
         (*ctx).stack_floor.store(stack_floor(), Relaxed);
@@ -125,10 +123,6 @@ pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
     );
     c.fail_with(FAILED_OUT_OF_STACK, d)
 }
-
-/// Nothing. The released compiler's code calls it once its counter reaches [`Ctx::next_tick`],
-/// which this runtime never lets it do.
-pub unsafe extern "C" fn rt_tick(_ctx: *mut Ctx) {}
 
 /// How soon the watchdog raises an expired entry's floor again, since a stack switch lowers it.
 const REWATCH: Duration = Duration::from_millis(10);
@@ -203,23 +197,43 @@ pub(crate) fn unwatched(floor: &AtomicUsize) {
     watched.retain(|&(f, _)| f != at);
 }
 
-/// The stack of a thread that runs a program, as large as a runtime stack can grow: the runtime
-/// recurses on the native stack, a compiled body honours its call bound there, and an unoptimised
-/// frame runs to tens of kilobytes. Reserved, not committed. A `parallel` block's thread is one: a
+/// The stack of a thread that runs a program, as large as a runtime stack can grow, so a program
+/// nests as deeply on one as on the other. Reserved, not committed. A `parallel` block's thread is one: a
 /// run's lane enters a whole test on it.
 pub const PROGRAM_STACK: usize = crate::stack::RESERVE;
 
 /// Room below the floor for the runtime's frames and the deepest compiled frame itself.
 pub const STACK_MARGIN: usize = 512 * 1024;
 
+thread_local! {
+    /// This thread's own stack, asked of the platform once per thread: it can be a `/proc` read.
+    static OWN: (usize, usize) = stack_of_this_thread();
+}
+
+/// Gives the system back the pages of this thread's own stack below the running frame, down to the
+/// floor: what a call that nested to the floor left touched, which the thread would otherwise hold
+/// as long as it lives. Nothing where this frame is on another stack, whose owner gives it back.
+pub(crate) fn let_go_below_here() {
+    // Left in place for the frames of the call that lets the rest go; a multiple of every page size.
+    const KEPT: usize = 64 << 10;
+    let here = 0u8;
+    let at = std::ptr::from_ref(&here) as usize;
+    OWN.with(|&(bottom, top)| {
+        if !(bottom..top).contains(&at) {
+            return;
+        }
+        let from = bottom.saturating_add(STACK_MARGIN).next_multiple_of(KEPT);
+        let to = at.saturating_sub(KEPT) / KEPT * KEPT;
+        if to > from {
+            unsafe { crate::vm::let_go(from as *mut u8, to - from) };
+        }
+    });
+}
+
 /// The floor compiled code honours on the stack this frame is on: the running runtime stack's, or
 /// this thread's own. `None` on a stack the runtime does not know, a segment a Rust recursion grew
 /// onto.
 pub(crate) fn floor_here() -> Option<usize> {
-    thread_local! {
-        // Asked of the platform once per thread: it can be a `/proc` read.
-        static OWN: (usize, usize) = stack_of_this_thread();
-    }
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
     if let Some(low) = ply_core::limit::running_low(at) {

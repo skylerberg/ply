@@ -53,6 +53,7 @@ import compiler.check.infer.derivability (HoldsFunction, HoldsHandle, Unconstrai
 import compiler.expand.rewrite.shared (count_in)
 import std.bytes
 import std.bytes (ascii_of_int)
+import std.list (zip)
 import std.option
 import std.prelude_source
 import std.string
@@ -89,7 +90,9 @@ import compiler.check.infer.expr (site_for, resolved_sites, site_among, report_u
                                   hint_of, infer_whole, rows_in, scales_like, tag_rule,
                                   settle_updates, group_member, expect_met, refuse_growth, Taken,
                                   written_as, as_written, holds_fn, atom_written, numeric_of,
-                                  ordered_vars, resolve_op)
+                                  ordered_vars, resolve_op, body_filed)
+import compiler.check.typed (WholeBody, ClauseBody, MeasureBody, TestRun, CaseListing, LawGuard,
+                             LawBody, TypedParam)
 import compiler.check.owned
 import compiler.check.owned (Taking)
 import compiler.check.infer.resources (resource_type, release_atoms)
@@ -1340,13 +1343,11 @@ fn owned_refused(
 ) -> { checker: Checker, released: List<Atom> } / {abort.raise} = {
   let kept = def.generics.kept.fold([], |acc: List<Int>, ident: Ident|
     match sig.ty_params.get(ident.name) { Some(TyVar(v)) -> acc.push(v), _ -> acc });
-  let multi = def.generics.multi.fold([], |acc: List<Int>, ident: Ident|
-    match sig.row_params.get(ident.name) { Some(v) -> acc.push(v), None -> acc });
   let resource = |t: Type| resource_type(checker, kept, t);
   let j = owned_judged(
     keep_refused(checker, def, sig, resource),
-    { multi: multi, resource: resource, owner: name },
-    { params: def.params, body: def.body, types: sig.params, row: sig.published_row },
+    { resource: resource, owner: name },
+    { params: def.params, body: def.body, types: sig.params },
     typed,
     sites,
   );
@@ -1359,13 +1360,11 @@ fn released_atoms(checker: Checker, held: List<owned::Owning>) -> List<Atom> / {
   held.fold([], |acc: List<Atom>, x: owned::Owning|
     unanswered(checker, x).fold(acc, |xs: List<Atom>, a: Atom| atoms_insert(xs, a)))
 
-/// How a body is judged: the row variables written `multi` where it is a definition's, what a
-/// resource is there, and the owner its releases are filed under.
-type Judging = { multi: List<Int>, resource: (Type) -> Bool / {abort.raise}, owner: Bytes }
+/// How a body is judged: what a resource is there, and the owner its releases are filed under.
+type Judging = { resource: (Type) -> Bool / {abort.raise}, owner: Bytes }
 
-/// A body judged: a definition's, its parameters at `types`, or a test's, with none; `row` what it
-/// may perform.
-type Judged = { params: List<Param>, body: Expr, types: List<Type>, row: Row }
+/// A body judged: a definition's, its parameters at `types`, or a test's, with none.
+type Judged = { params: List<Param>, body: Expr, types: List<Type> }
 
 /// `checker` with the ownership walk of `b`'s body reported and its releases filed under `j.owner`;
 /// `held`, the values the body itself owns, any of which it may let go, those a lambda in it owns
@@ -1378,18 +1377,16 @@ fn owned_judged(
   sites: List<MemberSite>,
 ) -> { checker: Checker, held: List<owned::Owning> } / {abort.raise} = {
   let resource = j.resource;
-  let multi = j.multi;
   // A lambda's own type, row and all, is what `valued` files for it, over the typed one.
   let at = checker.valued.fold(
     typed.fold(Map::new(), |m: Map<Int, Type>, x: TypedAt| m.insert(x.span.site, x.ty)),
     |m: Map<Int, Type>, x: { span: Span, ty: Type }| m.insert(x.span.site, x.ty),
   );
-  // Only a body that binds, reads or makes a resource, answers an operation, or may stop for a
-  // clause that resumes more than once has anything to judge.
+  // Only a body that binds, reads or makes a resource, or answers an operation, has anything to
+  // judge.
   let any = b.types.any(resource)
     || at.fold(false, |found: Bool, k: Int, t: Type| found || resource(t))
-    || count_in(b.body, |e: Expr| match e { EHandle(_) -> true, _ -> false }) > 0
-    || row_stop(checker, multi, resolve_row_in(checker, b.row)) != None;
+    || count_in(b.body, |e: Expr| match e { EHandle(_) -> true, _ -> false }) > 0;
   if !any { { checker: { ..checker, valued: [] }, held: [] } } else {
     let members = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite|
       m.insert(x.site, x.callee));
@@ -1434,32 +1431,6 @@ fn owned_judged(
           match resolve_op(checker, eff, op).hit {
             Some(hit) -> Bytes::concat_all([hit.info.name, b".", hit.op.name]),
             None -> b"",
-          },
-        op_multi: |eff: QName, op: Ident|
-          match resolve_op(checker, eff, op).hit { Some(hit) -> hit.op.multi, None -> false },
-        op_stop: |eff: QName, op: Ident|
-          match resolve_op(checker, eff, op).hit {
-            Some(hit) -> if hit.op.multi {
-              Some({ ops: [Bytes::concat_all([hit.info.name, b".", hit.op.name])], any: false })
-            } else { None },
-            None -> None,
-          },
-        op_nondet: |eff: QName, op: Ident|
-          match resolve_op(checker, eff, op).hit { Some(hit) -> hit.info.nondet, None -> false },
-        row_stop: |row: Row| row_stop(checker, multi, resolve_row_in(checker, row)),
-        row_nondet: |row: Row|
-          resolve_row_in(checker, row).atoms.any(|a: Atom|
-            match effect_info(checker, a.effect) { Some(e) -> e.nondet, None -> false }),
-        member_row: |span: Span|
-          match members.get(span.site) {
-            Some(callee) -> match def_of(checker, callee) {
-              Some(d) -> match resolve(checker, d.scheme.ty) {
-                TyFn(t) -> Some(t.effects),
-                _ -> None,
-              },
-              None -> None,
-            },
-            None -> None,
           },
         try_ops: |span: Span|
           checker.try_sites.filter(|x: TrySite|
@@ -1565,24 +1536,6 @@ fn copies_refused(
             }),
       }
     })
-
-/// The stop a call performing `row` may make for a clause that resumes it more than once: each
-/// operation `row` names that is declared `multi`, and any at all through a row variable of `multi`,
-/// the definition's row parameters written `multi`.
-fn row_stop(checker: Checker, multi: List<Int>, row: Row) -> Option<owned::Stop> / {abort.raise} = {
-  let ops = row.atoms.fold([], |acc: List<Bytes>, a: Atom|
-    match effect_info(checker, a.effect) {
-      None -> acc,
-      Some(e) ->
-        e.ops.fold(acc, |names: List<Bytes>, o: OpInfo|
-          if !o.multi { names }
-          else if match a.op { Some(n) -> n == o.name, None -> o.mode == a.mode } {
-            names.push(Bytes::concat_all([e.name, b".", o.name]))
-          } else { names }),
-    });
-  let any = match row.tail { Some(v) -> multi.contains(v), None -> false };
-  if ops.len() == 0 && !any { None } else { Some({ ops: ops, any: any }) }
-}
 
 /// The effect a resolved atom names, by its full name.
 fn effect_info(checker: Checker, name: Bytes) -> Option<EffectInfo> =
@@ -1963,19 +1916,16 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
 
 /// The signature's label parameters generalize among the type variables; they belong in their own
 /// list, in the order the generic list wrote them, and a phantom one is still a parameter. The type
-/// parameters written `keep` and the row parameters written `multi` are marked among the rest.
+/// parameters written `keep` are marked among the rest.
 fn split_labels(scheme: Scheme, def: FnDef, signature: Signature) -> Scheme = {
   let ids = def.generics.labels.fold([], |acc: List<Int>, ident: Ident|
     match signature.label_params.get(ident.name) { Some(v) -> acc.push(v), None -> acc });
   let kept = def.generics.kept.fold([], |acc: List<Int>, ident: Ident|
     match signature.ty_params.get(ident.name) { Some(TyVar(v)) -> acc.push(v), _ -> acc });
-  let multi = def.generics.multi.fold([], |acc: List<Int>, ident: Ident|
-    match signature.row_params.get(ident.name) { Some(v) -> acc.push(v), None -> acc });
   {
     ty_vars: ints_difference(scheme.ty_vars, ids),
     row_vars: scheme.row_vars,
     kept_vars: kept.filter(|v: Int| scheme.ty_vars.contains(v)),
-    multi_vars: multi.filter(|v: Int| scheme.row_vars.contains(v)),
     label_vars: if ids.len() == 0 { scheme.label_vars } else { ids },
     ty: scheme.ty,
   }
@@ -2124,7 +2074,19 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
       ..c,
       env: env_bind(c.env, def.params.get(i).name.name, monomorphic(signature.params.get(i))),
     });
-  let body: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
+  let walked: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
+  let body: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      bound.walking,
+      WholeBody,
+      def.span.start,
+      params_typed_as(def.params, signature.params),
+      walked,
+      def.body,
+    ),
+  };
   let checked: Checker = expect_met(
     body.checker,
     expr_span(def.body),
@@ -3462,11 +3424,30 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                     ),
                   },
               };
-              let o: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
+              let ran: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
+              let o: Inferred = {
+                ..ran,
+                checker: body_filed(
+                  ran.checker,
+                  owner,
+                  TestRun,
+                  def.span.start,
+                  match def.cases {
+                    None -> [],
+                    Some(_) ->
+                      [
+                        { name: case_at(), ty: int_type(), span: dummy_span() },
+                        { name: case_identity(), ty: bytes_type(), span: dummy_span() },
+                      ],
+                  },
+                  ran,
+                  test_run(def),
+                ),
+              };
               let judged = owned_judged(
                 o.checker,
-                { multi: [], resource: |t: Type| resource_type(o.checker, [], t), owner: owner },
-                { params: [], body: test_run(def), types: [], row: o.row },
+                { resource: |t: Type| resource_type(o.checker, [], t), owner: owner },
+                { params: [], body: test_run(def), types: [] },
                 o.checker.typed.drop(entered.typed.len()),
                 o.checker.member_sites.drop(entered.member_sites.len()),
               );
@@ -3549,7 +3530,15 @@ fn tail_value(expr: Expr) -> Expr =
 /// and the label may raise, and perform nothing else.
 fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abort.raise} = {
   let o: Inferred = infer_whole(checker, test_listing(cases), hint_of(listing_ty()));
-  let c = o.checker;
+  let c = body_filed(
+    o.checker,
+    checker.walking,
+    CaseListing,
+    def.span.start,
+    [],
+    o,
+    test_listing(cases),
+  );
   match run_needs(resolve_row_in(c, o.row).atoms).at(0) {
     None -> c,
     Some(atom) ->
@@ -3760,9 +3749,23 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       ..note_typed(c, def.binders.get(i).span, types.tys.get(i), []),
       env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
     });
+  let binders_typed = zip(def.binders, types.tys).map(|b: { first: Binder, second: Type }|
+    { name: b.first.name.name, ty: b.second, span: b.first.name.span });
   let guarded: Checker = match def.guard {
     Some(g) -> {
-      let o: Inferred = infer_whole({ ..bound, performs: [] }, g);
+      let walked: Inferred = infer_whole({ ..bound, performs: [] }, g);
+      let o: Inferred = {
+        ..walked,
+        checker: body_filed(
+          walked.checker,
+          bound.walking,
+          LawGuard,
+          def.span.start,
+          binders_typed,
+          walked,
+          g,
+        ),
+      };
       let c: Checker = unfilled(
         expect(
           o.checker,
@@ -3778,7 +3781,19 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     },
     None -> bound,
   };
-  let body: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
+  let walked: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
+  let body: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      guarded.walking,
+      LawBody,
+      def.span.start,
+      binders_typed,
+      walked,
+      def.body,
+    ),
+  };
   let stated: Checker = expect(
     body.checker,
     expr_span(def.body),
@@ -4448,7 +4463,7 @@ pub fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               { checker: shadowed, specs: [] },
               |acc: { checker: Checker, specs: List<SpecInfo> }, i: Int| {
                 let clause = def.spec.get(i);
-                let o: WithAtoms = check_clause(acc.checker, def, clause, env);
+                let o: WithAtoms = check_clause(acc.checker, def, clause, i, env);
                 {
                   checker: o.checker,
                   specs: acc.specs.push({
@@ -4504,16 +4519,33 @@ fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abor
     })
 }
 
+/// `params` at the types `types` gives them, in order.
+fn params_typed_as(params: List<Param>, types: List<Type>) -> List<TypedParam<Type>> =
+  zip(params, types).map(|p: { first: Param, second: Type }|
+    { name: p.first.name.name, ty: p.second, span: p.first.name.span })
+
 fn check_measure(
   checker: Checker,
   def: FnDef,
   expr: Expr,
   env: SpecEnv,
 ) -> Checker / {abort.raise} = {
-  let o: Inferred = infer_whole(
+  let walked: Inferred = infer_whole(
     { ..spec_scope(checker, def, env), walking: unlowered(env.name) },
     expr,
   );
+  let o: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      env.name,
+      MeasureBody,
+      def.span.start,
+      params_typed_as(def.params, env.params),
+      walked,
+      expr,
+    ),
+  };
   let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), walking: checker.walking };
   let c1: Checker = expect(
     popped,
@@ -4535,6 +4567,7 @@ fn check_clause(
   checker: Checker,
   def: FnDef,
   clause: SpecClause,
+  index: Int,
   env: SpecEnv,
 ) -> WithAtoms / {abort.raise} = {
   let bound: Checker = spec_scope(checker, def, env);
@@ -4551,8 +4584,20 @@ fn check_clause(
     SSpace -> named(def.params.map(|param: Param| param.space)),
     SCost -> named(def.params.map(|param: Param| param.cost)),
   };
+  let ints = |names: List<Option<Ident>>|
+    names.fold([], |acc: List<TypedParam<Type>>, name: Option<Ident>|
+      match name {
+        Some(k) -> acc.push({ name: k.name, ty: int_type(), span: k.span }),
+        None -> acc,
+      });
+  let clause_params = params_typed_as(def.params, env.params).concat(match clause.kind {
+    SEnsures -> [{ name: result_name(), ty: env.ret, span: dummy_span() }],
+    SRequires -> [],
+    SSpace -> ints(def.params.map(|param: Param| param.space)),
+    SCost -> ints(def.params.map(|param: Param| param.cost)),
+  });
   let outer = with_result.spec_kind;
-  let o: Inferred = infer_whole(
+  let walked: Inferred = infer_whole(
     {
       ..with_result,
       spec_kind: Some(clause.kind),
@@ -4562,6 +4607,18 @@ fn check_clause(
     },
     clause.expr,
   );
+  let o: Inferred = {
+    ..walked,
+    checker: body_filed(
+      walked.checker,
+      env.name,
+      ClauseBody(index),
+      def.span.start,
+      clause_params,
+      walked,
+      clause.expr,
+    ),
+  };
   let popped: Checker = {
     ..o.checker,
     spec_kind: outer,

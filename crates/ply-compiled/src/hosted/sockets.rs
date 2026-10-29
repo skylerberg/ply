@@ -2,7 +2,7 @@
 //! the label the clause that asks binds. What they are handed and answer is flat as
 //! `ply_host::tcp::wire` reads and writes it; an operation that waits answers a ticket.
 
-use super::{READS, WRITES, asked, done, from_host, given, handed, waited};
+use super::{Nondeterministic, asked, done, from_host, given, handed, waited};
 use crate::c::{MachineNative, machine_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
@@ -192,21 +192,27 @@ pub unsafe extern "C" fn rt_net_listen(
     label_n: I64,
     at: I64,
 ) -> I64 {
-    asked(ctx, "net_listen", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(at) = handed(c, "net_listen", "a port", port(at)) else {
-            return I64(0);
-        };
-        match net.listen(label, at, c.site()) {
-            Ok(handle) => I64(handle),
-            Err(d) => {
-                c.fail(d);
-                I64(0)
+    asked(
+        ctx,
+        "net_listen",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(at) = handed(c, "net_listen", "a port", port(at)) else {
+                return I64(0);
+            };
+            match net.listen(label, at, c.site()) {
+                Ok(handle) => I64(handle),
+                Err(d) => {
+                    c.fail(d);
+                    I64(0)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// A listener on `port` of the loopback address that serves TLS with the credential at
@@ -219,24 +225,30 @@ pub unsafe extern "C" fn rt_net_listen_tls(
     credential_at: Addr,
     credential_n: I64,
 ) -> I64 {
-    asked(ctx, "net_listen_tls", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(at) = handed(c, "net_listen_tls", "a port", port(at)) else {
-            return I64(0);
-        };
-        let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
-            return I64(0);
-        };
-        match net.listen_tls(label, at, credential, c.site()) {
-            Ok(handle) => I64(handle),
-            Err(d) => {
-                c.fail(d);
-                I64(0)
+    asked(
+        ctx,
+        "net_listen_tls",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(at) = handed(c, "net_listen_tls", "a port", port(at)) else {
+                return I64(0);
+            };
+            let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
+                return I64(0);
+            };
+            match net.listen_tls(label, at, credential, c.site()) {
+                Ok(handle) => I64(handle),
+                Err(d) => {
+                    c.fail(d);
+                    I64(0)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// A listener at exactly the address at `to_at`, with the options at `options_at` set before the
@@ -253,7 +265,7 @@ pub unsafe extern "C" fn rt_net_listen_on(
     asked(
         ctx,
         "net_listen_on",
-        WRITES,
+        Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
             let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
@@ -286,7 +298,7 @@ pub unsafe extern "C" fn rt_net_listen_unix(
     asked(
         ctx,
         "net_listen_unix",
-        WRITES,
+        Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
             let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
@@ -314,22 +326,28 @@ pub unsafe extern "C" fn rt_net_connect(
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_connect", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
-            return I64(0);
-        };
-        let (Some(at), Some(timeout)) = (
-            handed(c, "net_connect", "a port", port(at)),
-            handed(c, "net_connect", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let job = net.connect(label, host.to_string(), at, timeout);
-        waited(c, "net_connect", "`net.connect`", Ok(job))
-    })
+    asked(
+        ctx,
+        "net_connect",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
+                return I64(0);
+            };
+            let (Some(at), Some(timeout)) = (
+                handed(c, "net_connect", "a port", port(at)),
+                handed(c, "net_connect", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let job = net.connect(label, host.to_string(), at, timeout);
+            waited(c, "net_connect", "`net.connect`", Ok(job))
+        },
+    )
 }
 
 /// The ticket of a TLS connection to the host named at `host_at`, verified as that name: its
@@ -343,22 +361,28 @@ pub unsafe extern "C" fn rt_net_connect_tls(
     at: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_connect_tls", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
-            return I64(0);
-        };
-        let (Some(at), Some(timeout)) = (
-            handed(c, "net_connect_tls", "a port", port(at)),
-            handed(c, "net_connect_tls", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let job = net.connect_tls(label, host.to_string(), at, timeout);
-        waited(c, "net_connect_tls", "`net.connect_tls`", Ok(job))
-    })
+    asked(
+        ctx,
+        "net_connect_tls",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(host) = c.text(unsafe { lent(host_at, host_n) }) else {
+                return I64(0);
+            };
+            let (Some(at), Some(timeout)) = (
+                handed(c, "net_connect_tls", "a port", port(at)),
+                handed(c, "net_connect_tls", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let job = net.connect_tls(label, host.to_string(), at, timeout);
+            waited(c, "net_connect_tls", "`net.connect_tls`", Ok(job))
+        },
+    )
 }
 
 /// The ticket of a connection to exactly the address at `to_at`: its handle, or why not.
@@ -373,22 +397,28 @@ pub unsafe extern "C" fn rt_net_connect_to(
     options_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_connect_to", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-        let options = SocketOption::list(unsafe { lent(options_at, options_n) });
-        let (Some(to), Some(options), Some(timeout)) = (
-            handed(c, "net_connect_to", "an address", to),
-            handed(c, "net_connect_to", "socket options", options),
-            handed(c, "net_connect_to", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let job = net.connect_to(label, to, options, timeout);
-        waited(c, "net_connect_to", "`net.connect_to`", Ok(job))
-    })
+    asked(
+        ctx,
+        "net_connect_to",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let options = SocketOption::list(unsafe { lent(options_at, options_n) });
+            let (Some(to), Some(options), Some(timeout)) = (
+                handed(c, "net_connect_to", "an address", to),
+                handed(c, "net_connect_to", "socket options", options),
+                handed(c, "net_connect_to", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let job = net.connect_to(label, to, options, timeout);
+            waited(c, "net_connect_to", "`net.connect_to`", Ok(job))
+        },
+    )
 }
 
 /// The ticket of a connection to the Unix socket at the path at `path_at` under the root named at
@@ -404,23 +434,29 @@ pub unsafe extern "C" fn rt_net_connect_unix(
     path_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_connect_unix", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let (Some(root), Some(path)) = (
-            c.text(unsafe { lent(root_at, root_n) }),
-            c.text(unsafe { lent(path_at, path_n) }),
-        ) else {
-            return I64(0);
-        };
-        let Some(timeout) = handed(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
-        else {
-            return I64(0);
-        };
-        let job = net.connect_unix(label, root, path, timeout, c.site());
-        waited(c, "net_connect_unix", "`net.connect_unix`", job)
-    })
+    asked(
+        ctx,
+        "net_connect_unix",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let (Some(root), Some(path)) = (
+                c.text(unsafe { lent(root_at, root_n) }),
+                c.text(unsafe { lent(path_at, path_n) }),
+            ) else {
+                return I64(0);
+            };
+            let Some(timeout) = handed(c, "net_connect_unix", "a deadline", deadline(timeout_ms))
+            else {
+                return I64(0);
+            };
+            let job = net.connect_unix(label, root, path, timeout, c.site());
+            waited(c, "net_connect_unix", "`net.connect_unix`", job)
+        },
+    )
 }
 
 /// The ticket of a connection's TLS handshake: the microseconds it took found, or none.
@@ -430,13 +466,19 @@ pub unsafe extern "C" fn rt_net_handshake(
     label_n: I64,
     conn: I64,
 ) -> I64 {
-    asked(ctx, "net_handshake", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let job = net.handshake(label, conn.0, c.site());
-        waited(c, "net_handshake", "`net.handshake`", job)
-    })
+    asked(
+        ctx,
+        "net_handshake",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let job = net.handshake(label, conn.0, c.site());
+            waited(c, "net_handshake", "`net.handshake`", job)
+        },
+    )
 }
 
 /// The ticket of a plaintext connection secured as its client, verifying the server as the name
@@ -454,19 +496,26 @@ pub unsafe extern "C" fn rt_net_start_tls(
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_start_tls", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(name) = c.text(unsafe { lent(name_at, name_n) }) else {
-            return I64(0);
-        };
-        let Some(upgrade) = upgrade(c, "net_start_tls", alpn_at, alpn_n, unread, timeout_ms) else {
-            return I64(0);
-        };
-        let job = net.start_tls(label, conn.0, name, upgrade, c.site());
-        waited(c, "net_start_tls", "`net.start_tls`", job)
-    })
+    asked(
+        ctx,
+        "net_start_tls",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(name) = c.text(unsafe { lent(name_at, name_n) }) else {
+                return I64(0);
+            };
+            let Some(upgrade) = upgrade(c, "net_start_tls", alpn_at, alpn_n, unread, timeout_ms)
+            else {
+                return I64(0);
+            };
+            let job = net.start_tls(label, conn.0, name, upgrade, c.site());
+            waited(c, "net_start_tls", "`net.start_tls`", job)
+        },
+    )
 }
 
 /// The ticket of a plaintext connection secured as its server, with the credential named at
@@ -484,19 +533,26 @@ pub unsafe extern "C" fn rt_net_serve_tls(
     unread: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_serve_tls", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
-            return I64(0);
-        };
-        let Some(upgrade) = upgrade(c, "net_serve_tls", alpn_at, alpn_n, unread, timeout_ms) else {
-            return I64(0);
-        };
-        let job = net.serve_tls(label, conn.0, credential, upgrade, c.site());
-        waited(c, "net_serve_tls", "`net.serve_tls`", job)
-    })
+    asked(
+        ctx,
+        "net_serve_tls",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(credential) = c.text(unsafe { lent(credential_at, credential_n) }) else {
+                return I64(0);
+            };
+            let Some(upgrade) = upgrade(c, "net_serve_tls", alpn_at, alpn_n, unread, timeout_ms)
+            else {
+                return I64(0);
+            };
+            let job = net.serve_tls(label, conn.0, credential, upgrade, c.site());
+            waited(c, "net_serve_tls", "`net.serve_tls`", job)
+        },
+    )
 }
 
 /// What an upgrade is asked with: the protocols at `alpn_at` as parts, the count of plaintext
@@ -537,13 +593,19 @@ pub unsafe extern "C" fn rt_net_accept(
     label_n: I64,
     listener: I64,
 ) -> I64 {
-    asked(ctx, "net_accept", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let job = net.accept(label, listener.0, c.site());
-        waited(c, "net_accept", "`net.accept`", job)
-    })
+    asked(
+        ctx,
+        "net_accept",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let job = net.accept(label, listener.0, c.site());
+            waited(c, "net_accept", "`net.accept`", job)
+        },
+    )
 }
 
 /// The ticket of at most `max` bytes of a connection found, none for the deadline.
@@ -555,7 +617,7 @@ pub unsafe extern "C" fn rt_net_recv(
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_recv", WRITES, I64(0), |c: &mut Ctx| {
+    asked(ctx, "net_recv", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return I64(0);
         };
@@ -581,7 +643,7 @@ pub unsafe extern "C" fn rt_net_send(
     payload_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_send", WRITES, I64(0), |c: &mut Ctx| {
+    asked(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return I64(0);
         };
@@ -603,19 +665,26 @@ pub unsafe extern "C" fn rt_net_send_secret(
     framed: SecretHandle,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "net_send_secret", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let Some(framed) = secret::held(c, &framed) else {
-            return I64(0);
-        };
-        let Some(timeout) = handed(c, "net_send_secret", "a deadline", deadline(timeout_ms)) else {
-            return I64(0);
-        };
-        let job = net.send_secret(label, conn.0, framed.bytes(), timeout, c.site());
-        waited(c, "net_send_secret", "`net.send_secret`", job)
-    })
+    asked(
+        ctx,
+        "net_send_secret",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let Some(framed) = secret::held(c, &framed) else {
+                return I64(0);
+            };
+            let Some(timeout) = handed(c, "net_send_secret", "a deadline", deadline(timeout_ms))
+            else {
+                return I64(0);
+            };
+            let job = net.send_secret(label, conn.0, framed.bytes(), timeout, c.site());
+            waited(c, "net_send_secret", "`net.send_secret`", job)
+        },
+    )
 }
 
 /// Ends a connection's sending.
@@ -625,18 +694,24 @@ pub unsafe extern "C" fn rt_net_close_write(
     label_n: I64,
     conn: I64,
 ) {
-    asked(ctx, "net_close_write", WRITES, (), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return;
-        };
-        let closed = net.close_write(label, conn.0, c.site());
-        done(c, closed);
-    });
+    asked(
+        ctx,
+        "net_close_write",
+        Nondeterministic,
+        (),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return;
+            };
+            let closed = net.close_write(label, conn.0, c.site());
+            done(c, closed);
+        },
+    );
 }
 
 /// Closes a socket of any kind.
 pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    asked(ctx, "net_close", WRITES, (), |c: &mut Ctx| {
+    asked(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return;
         };
@@ -657,7 +732,7 @@ pub unsafe extern "C" fn rt_net_set_option(
     asked(
         ctx,
         "net_set_option",
-        WRITES,
+        Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
             set_option(
@@ -720,25 +795,31 @@ pub unsafe extern "C" fn rt_net_local_port(
     label_n: I64,
     socket: I64,
 ) -> I64 {
-    asked(ctx, "net_local_port", READS, I64(-1), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(-1);
-        };
-        match net.local_port(label, socket.0, c.site()) {
-            Ok(at) => I64(at.map_or(-1, i64::from)),
-            Err(d) => {
-                c.fail(d);
-                I64(-1)
+    asked(
+        ctx,
+        "net_local_port",
+        Nondeterministic,
+        I64(-1),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(-1);
+            };
+            match net.local_port(label, socket.0, c.site()) {
+                Ok(at) => I64(at.map_or(-1, i64::from)),
+                Err(d) => {
+                    c.fail(d);
+                    I64(-1)
+                }
             }
-        }
-    })
+        },
+    )
 }
 
 /// What a native that reads what a socket is answers, under `label` and of `socket`.
 type Described = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
 
 /// What `read` answers of a socket, a datagram one where `datagram` says it must be: what a socket
-/// is, read as it stands, which reading again changes nothing of.
+/// is, read as it stands.
 fn described(
     ctx: *mut Ctx,
     native: &'static str,
@@ -748,15 +829,21 @@ fn described(
     datagram: bool,
     read: Described,
 ) -> TakenBytes {
-    asked(ctx, native, READS, TakenBytes(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return TakenBytes(0);
-        };
-        let span = c.site();
-        let answer = held_datagram(&net, label, socket, datagram, span)
-            .and_then(|()| read(&net, label, socket.0, span));
-        given(c, answer)
-    })
+    asked(
+        ctx,
+        native,
+        Nondeterministic,
+        TakenBytes(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return TakenBytes(0);
+            };
+            let span = c.site();
+            let answer = held_datagram(&net, label, socket, datagram, span)
+                .and_then(|()| read(&net, label, socket.0, span));
+            given(c, answer)
+        },
+    )
 }
 
 /// The address this end of a socket is bound to, found.
@@ -877,20 +964,26 @@ pub unsafe extern "C" fn rt_udp_bind(
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
-    asked(ctx, "udp_bind", WRITES, TakenBytes(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return TakenBytes(0);
-        };
-        let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-        let options = SocketOption::list(unsafe { lent(options_at, options_n) });
-        let (Some(to), Some(options)) = (
-            handed(c, "udp_bind", "an address", to),
-            handed(c, "udp_bind", "socket options", options),
-        ) else {
-            return TakenBytes(0);
-        };
-        c.given(ply_host::udp::bind(&net, label, &to, &options))
-    })
+    asked(
+        ctx,
+        "udp_bind",
+        Nondeterministic,
+        TakenBytes(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return TakenBytes(0);
+            };
+            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let options = SocketOption::list(unsafe { lent(options_at, options_n) });
+            let (Some(to), Some(options)) = (
+                handed(c, "udp_bind", "an address", to),
+                handed(c, "udp_bind", "socket options", options),
+            ) else {
+                return TakenBytes(0);
+            };
+            c.given(ply_host::udp::bind(&net, label, &to, &options))
+        },
+    )
 }
 
 /// A datagram socket's far end fixed at the address at `to_at`: nothing, or why not.
@@ -902,17 +995,23 @@ pub unsafe extern "C" fn rt_udp_connect(
     to_at: Addr,
     to_n: I64,
 ) -> TakenBytes {
-    asked(ctx, "udp_connect", WRITES, TakenBytes(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return TakenBytes(0);
-        };
-        let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-        let Some(to) = handed(c, "udp_connect", "an address", to) else {
-            return TakenBytes(0);
-        };
-        let answer = ply_host::udp::connect(&net, label, socket.0, &to, c.site());
-        given(c, answer)
-    })
+    asked(
+        ctx,
+        "udp_connect",
+        Nondeterministic,
+        TakenBytes(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return TakenBytes(0);
+            };
+            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let Some(to) = handed(c, "udp_connect", "an address", to) else {
+                return TakenBytes(0);
+            };
+            let answer = ply_host::udp::connect(&net, label, socket.0, &to, c.site());
+            given(c, answer)
+        },
+    )
 }
 
 /// The ticket of the payload at `payload_at` sent as one datagram to the address at `to_at`: its
@@ -929,21 +1028,27 @@ pub unsafe extern "C" fn rt_udp_send_to(
     payload_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "udp_send_to", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let to = Endpoint::read(unsafe { lent(to_at, to_n) });
-        let (Some(to), Some(timeout)) = (
-            handed(c, "udp_send_to", "an address", to),
-            handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let payload = unsafe { lent(payload_at, payload_n) }.to_vec();
-        let job = ply_host::udp::send_to(&net, label, socket.0, to, payload, timeout, c.site());
-        waited(c, "udp_send_to", "`udp.send_to`", job)
-    })
+    asked(
+        ctx,
+        "udp_send_to",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let to = Endpoint::read(unsafe { lent(to_at, to_n) });
+            let (Some(to), Some(timeout)) = (
+                handed(c, "udp_send_to", "an address", to),
+                handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let payload = unsafe { lent(payload_at, payload_n) }.to_vec();
+            let job = ply_host::udp::send_to(&net, label, socket.0, to, payload, timeout, c.site());
+            waited(c, "udp_send_to", "`udp.send_to`", job)
+        },
+    )
 }
 
 /// The ticket of the payload at `payload_at` sent as one datagram to the far end `connect` fixed:
@@ -957,7 +1062,7 @@ pub unsafe extern "C" fn rt_udp_send(
     payload_n: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "udp_send", WRITES, I64(0), |c: &mut Ctx| {
+    asked(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return I64(0);
         };
@@ -979,19 +1084,25 @@ pub unsafe extern "C" fn rt_udp_recv_from(
     max: I64,
     timeout_ms: I64,
 ) -> I64 {
-    asked(ctx, "udp_recv_from", WRITES, I64(0), |c: &mut Ctx| {
-        let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
-            return I64(0);
-        };
-        let (Some(max), Some(timeout)) = (
-            handed(c, "udp_recv_from", "a byte count", count(max)),
-            handed(c, "udp_recv_from", "a deadline", deadline(timeout_ms)),
-        ) else {
-            return I64(0);
-        };
-        let job = ply_host::udp::recv_from(&net, label, socket.0, max, timeout, c.site());
-        waited(c, "udp_recv_from", "`udp.recv_from`", job)
-    })
+    asked(
+        ctx,
+        "udp_recv_from",
+        Nondeterministic,
+        I64(0),
+        |c: &mut Ctx| {
+            let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
+                return I64(0);
+            };
+            let (Some(max), Some(timeout)) = (
+                handed(c, "udp_recv_from", "a byte count", count(max)),
+                handed(c, "udp_recv_from", "a deadline", deadline(timeout_ms)),
+            ) else {
+                return I64(0);
+            };
+            let job = ply_host::udp::recv_from(&net, label, socket.0, max, timeout, c.site());
+            waited(c, "udp_recv_from", "`udp.recv_from`", job)
+        },
+    )
 }
 
 /// Sets the option at `option_at` on a datagram socket: nothing, or why not.
@@ -1006,7 +1117,7 @@ pub unsafe extern "C" fn rt_udp_set_option(
     asked(
         ctx,
         "udp_set_option",
-        WRITES,
+        Nondeterministic,
         TakenBytes(0),
         |c: &mut Ctx| {
             set_option(
@@ -1025,7 +1136,7 @@ pub unsafe extern "C" fn rt_udp_set_option(
 
 /// Closes a datagram socket.
 pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
-    asked(ctx, "udp_close", WRITES, (), |c: &mut Ctx| {
+    asked(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { lent(label_at, label_n) }) else {
             return;
         };

@@ -264,7 +264,7 @@ fn a_descriptors_refusal_fails_the_entry() {
         ("rt_never_shown", "does not lower it"),
     ] {
         let mut ctx = context();
-        ctx.begin(1_000);
+        ctx.begin();
         let refused: unsafe extern "C" fn(*mut Ctx) = helper(refusal);
         unsafe { refused(&mut ctx) };
         assert_ne!(ctx.failed, 0, "{refusal} refused nothing");

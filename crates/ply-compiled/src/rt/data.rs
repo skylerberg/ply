@@ -10,8 +10,7 @@ use crate::native::Addr;
 /// type of what `acquire` answers, which both take a count of, and `answer` the type of what `body`
 /// answers, let go of where `cleanup` fails. A value a clause unwinds with is abandoned with the
 /// unwind, uncounted: its type is not known here. What this holds across each call is in a record
-/// on the stack's chain, so a stop under the call that is resumed more than once holds it once a
-/// resume.
+/// on the stack's chain, so a body abandoned at a stop under the call lets it go.
 pub unsafe extern "C" fn rt_with_cleanup(
     ctx: *mut Ctx,
     acquire: Block,
@@ -61,7 +60,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
         return Handed::of(0);
     }
     let held = unsafe { Carried::new(Handed::of(acquired), held) };
-    let standing = c.fuel;
     let (answered, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
@@ -88,8 +86,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     unsafe { body.let_go_function(ctx) };
     let c = unsafe { &mut *ctx };
-    // `cleanup` runs as deep as the bracket stands, however deep the body was when it ended.
-    c.fuel = standing;
     let ending = c.failed;
     let Some(aside) = Unwinding::set_aside(c) else {
         held.release(ctx);

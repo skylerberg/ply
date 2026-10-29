@@ -46,8 +46,6 @@ pub const OBLIGATION_REFUTED: &str = "E0419";
 pub const HOST_UNBOUND: &str = "E0424";
 /// A host operation performed inside a `simulate` region, or in a test the search re-runs.
 pub const HOST_IN_SIMULATION: &str = "E0425";
-/// A continuation was resumed a second time across an at-most-once host operation.
-pub const HOST_CONTINUATION_RESUMED: &str = "E0426";
 /// A listener, a connection presenting one, or `--mtls` named a credential the binding does not
 /// hold.
 pub const TLS_CREDENTIAL_UNKNOWN: &str = "E0429";
