@@ -5,19 +5,21 @@
 //! as its operation takes it, and each branch tests a value held as a `Bool`.
 //! A body that breaks one is refused, which fails a build.
 
-import compiler.emit.tir (FieldSet, Rep, RWord, RInt, RBool, RNum, RFlat, RSlice, RToken, Leaf, Var,
-                          Arg, AVar, AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Updated,
-                          Native, Op, Get, Take, Static, Prim, Path, PLeaf, PField, PArg, Made,
-                          MClosure, MList, Unsettled, AZero, Inst, Let, Do, Decl, Assign, If, Case,
-                          Match, Miss, Loop, Next, Done, Return, Restart, Enter, Fail, NoArm,
-                          Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Fn, Member, Rooted,
-                          Lambda, Closure, Handed, Given, Lent, Owned, Borrowed, Returned,
+import compiler.emit.tir (param_rep, param_lent, reps_of, handed_of, lent_where, FieldSet, Rep,
+                          RWord, RInt, RBool, RNum, RFlat, RSlice, RToken, Leaf, Var, Arg, AVar,
+                          AInt, ABool, Val, Call, Apply, Make, Pack, Gathered, Updated, Native, Op,
+                          Get, Take, Static, Prim, Path, PLeaf, PField, PArg, Made, MClosure, MList,
+                          Unsettled, AZero, Inst, Let, Do, Decl, Assign, If, Case, Match, Miss,
+                          Loop, Next, Done, Return, Restart, Enter, Fail, NoArm, Handle, Sited, Inc,
+                          Dec, Reset, Free, Opened, Block, Fn, Member, Rooted, Lambda, Closure,
+                          Handed, Given, Lent, Owned, Borrowed, Returned, Carried, carried_vars,
                           Convention, Answered, Owns, ReadsOf, Lasts, no_links, counted, operands,
                           answered, unpacks, fails, used_as, rep_of_arg, var_of, parts_of, Test,
                           TTag, TInt, TRange, RSum, RUnit, RAddr, LastOf, Walked, MCase, PCase,
                           PPayload, OContainer, OStrings, stops_at, Uses, string_uses, framed_reads,
-                          MFramed, PPlace, word_record, OHandle, RImm, Unwinds, Unwound)
-import compiler.emit.tir.containers (Taken)
+                          MFramed, PPlace, word_record, OHandle, RImm, Unwinds, Unwound,
+                          carried_inits)
+import compiler.emit.tir.containers (Taken, Retained)
 import compiler.emit.tir.handling (instance_alone, Returning)
 import compiler.emit.tir.strings (StringOp, StringArg, ReadsAt, Number, WritesBlock, OwnBlock,
                                   Copied, Grown, ByteRead, string_args, string_answer)
@@ -26,8 +28,10 @@ import compiler.emit.layout (WordClass, P, S, U, LSum, Always, WordIs, WordOutsi
                              Nullary, LWords)
 import compiler.emit.keys (Named, Root, TypeOp, Copy, Keep, Share)
 import compiler.emit.release (boxed_alone)
-import compiler.emit.reps (FieldTy, TyRec, kind_of, in_place, has_vars)
-import compiler.check.types (Type, TyCon, TyRecord, record_fields)
+import compiler.emit.reps (FieldTy, TyRec, kind_of, in_place, has_vars, word_type)
+import compiler.check.known (none_ctor, some_ctor)
+import compiler.check.types (Type, TyCon, TyRecord, record_fields, bool_type, int_type, list_type,
+                             option_type, string_type)
 import compiler.syntax.parsing (dummy_span)
 import std.bytes (ascii_of_int)
 import std.math (ilog2)
@@ -121,7 +125,7 @@ fn binding(bound: Map<Int, Rep>, b: Block) -> Map<Int, Rep> =
         c.arms.fold(binding(m, c.rest), |a: Map<Int, Rep>, arm: { when: Int, body: Block }|
           binding(a, arm.body)),
       Match(x) -> x.arms.fold(binding(m, x.rest), binding),
-      Loop(l) -> binding(bound_as(l.state.fold(m, bound_as), l.answer), l.body),
+      Loop(l) -> binding(bound_as(carried_vars(l.state).fold(m, bound_as), l.answer), l.body),
       Handle(h) -> binding(bound_as(m, h.answer), h.body),
       Reset(r) -> bound_as(m, r.token),
       Opened(o) -> o.words.fold(m, bound_as),
@@ -169,7 +173,7 @@ fn used_otherwise(bound: Map<Int, Rep>, b: Block) -> Option<Var> = {
         Match(x) ->
           x.arms.fold(used_otherwise(bound, x.rest), |f: Option<Var>, arm: Block|
             match f { Some(_) -> f, None -> used_otherwise(bound, arm) }),
-        Loop(l) -> match of_args(l.init) {
+        Loop(l) -> match of_args(carried_inits(l.state)) {
           Some(v) -> Some(v),
           None -> used_otherwise(bound, l.body),
         },
@@ -276,7 +280,7 @@ fn holding_params(params: List<Var>, conv: Convention, immortal: Map<Int, Bool>)
     |h: Holding, i: Int|
       match params.at(i) {
         None -> h,
-        Some(p) -> if !counted(p.rep) { h } else if conv.params.at(i) == Some(Lent) {
+        Some(p) -> if !counted(p.rep) { h } else if param_lent(conv, i) {
           { ..h, borrowed: h.borrowed.insert(p.id, []), lent: h.lent.insert(p.id, i) }
         } else { { ..h, owned: h.owned.insert(p.id, 1) } },
       },
@@ -296,16 +300,19 @@ fn body_fault(f: Fn, cx: Within, start: Holding, b: Block) -> Option<Bytes> = {
 fn entered_as(f: Fn, member: Option<Int>, args: List<Arg>) -> Bool =
   match member {
     None -> held_as_reps(args, f.params.map(|p: Var| p.rep)),
-    Some(i) -> match f.members.at(i) { Some(m) -> held_as_reps(args, m.conv.reps), None -> false },
+    Some(i) -> match f.members.at(i) {
+      Some(m) -> held_as_reps(args, reps_of(m.conv)),
+      None -> false,
+    },
   }
 
 /// Whether each of a root's parameters is held as its convention takes it, or as a view of the list
 /// whose word it takes.
 fn held_as_taken(f: Fn) -> Bool =
-  f.params.len() == f.conv.reps.len()
+  f.params.len() == f.conv.params.len()
     && range(0, f.params.len()).all(|i: Int|
       match f.params.at(i) {
-        Some(p) -> match f.conv.reps.at(i) {
+        Some(p) -> match param_rep(f.conv, i) {
           Some(r) -> p.rep == r || (p.rep == RSlice && r == RWord),
           None -> false,
         },
@@ -316,8 +323,8 @@ fn held_as_taken(f: Fn) -> Bool =
 /// `member`'s of `f`'s group, or `f`'s own.
 fn handed_by(f: Fn, member: Option<Int>) -> List<Handed> =
   match member {
-    None -> f.conv.params,
-    Some(i) -> match f.members.at(i) { Some(m) -> m.conv.params, None -> [] },
+    None -> handed_of(f.conv),
+    Some(i) -> match f.members.at(i) { Some(m) -> handed_of(m.conv), None -> [] },
   }
 
 /// `args` handed to parameters taken as `handed`: one given is consumed; one lent is only read, and
@@ -388,7 +395,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
           } else if answers_count(d.val) {
             { ..acc, fault: Some(b"a value whose count nothing holds") }
           } else {
-            match bytes_fault(acc.h, None, d.val) {
+            match or_else(bytes_fault(acc.h, None, d.val), uses_fault(None, d.val)) {
               Some(f) -> faulted(acc, f.why, f.v),
               None -> failing(cx, used(acc, operands(d.val)), d.val, d.unwind),
             }
@@ -524,17 +531,17 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
             }
           },
         },
-        Loop(l) -> if l.init.len() != l.state.len() || !same_reps(l.init, l.state) {
+        Loop(l) -> if !l.state.all(|c: Carried| same_rep(c.init, c.var.rep)) {
           { ..acc, fault: Some(b"a loop's state set from values held otherwise") }
         } else {
-          let fed = l.init.fold(acc, passed);
-          let start = l.state.fold(fed.h, |h: Holding, s: Var|
+          let fed = carried_inits(l.state).fold(acc, passed);
+          let start = carried_vars(l.state).fold(fed.h, |h: Holding, s: Var|
             if counted(s.rep) { { ..h, owned: h.owned.insert(s.id, 1) } } else { h });
           let body = walked(
             f,
             {
               ..cx,
-              looped: Some({ held: fed.h.owned, state: l.state, answer: l.answer }),
+              looped: Some({ held: fed.h.owned, state: carried_vars(l.state), answer: l.answer }),
               arm: None,
             },
             { ..fed, h: start, missed: None, done: false },
@@ -668,7 +675,7 @@ fn walked(f: Fn, cx: Within, w: Walk, b: Block) -> Walk =
 fn let_walked(cx: Within, acc: Walk, y: Var, val: Val, unwind: List<Var>) -> Walk =
   match or_else(
       field_fault(acc.h, match cx.looped { Some(lp) -> lp.held, None -> Map::new() }, y, val),
-      bytes_fault(acc.h, Some(y), val),
+      or_else(bytes_fault(acc.h, Some(y), val), uses_fault(Some(y), val)),
     ) {
     Some(f) -> faulted(acc, f.why, f.v),
     None -> noted(bound_walked(cx, acc, y, val, unwind), y, val),
@@ -847,6 +854,23 @@ fn whole_fault(h: Holding, args: List<Arg>) -> Option<{ why: Bytes, v: Var }> =
 /// (a block as its word, an address as one, a number as a value holding no count), writes only into
 /// a block this body holds a count of, and answers as `string_answer` says; the bytes a crossing
 /// answered are taken as a block of their own, from a count.
+/// Why `val`, answering into `y`, is an operation whose `uses` does not say what it does with each
+/// of its operands, one for one.
+fn uses_fault(y: Option<Var>, val: Val) -> Option<{ why: Bytes, v: Var }> = {
+  let unmatched = |args: List<Arg>, uses: Uses|
+    if uses.takes.len() == args.len() { None } else {
+      Some({
+        why: b"an operation whose uses name other than its operands: v",
+        v: match y { Some(a) -> a, None -> first_var(args, unknown_var()) },
+      })
+    };
+  match val {
+    Op(o) -> unmatched(o.args, o.uses),
+    Native(n) -> unmatched(n.args, n.uses),
+    _ -> None,
+  }
+}
+
 fn bytes_fault(h: Holding, y: Option<Var>, val: Val) -> Option<{ why: Bytes, v: Var }> =
   match val {
     Get(g) -> match g.path {
@@ -970,7 +994,7 @@ fn first_var(args: List<Arg>, otherwise: Var) -> Var =
   }
 
 /// A variable standing for none, which a fault about no variable names.
-fn unknown_var() -> Var = { id: 0 - 1, ty: TyCon({ name: b"_", args: [] }), rep: RInt }
+fn unknown_var() -> Var = { id: 0 - 1, ty: word_type(), rep: RInt }
 
 /// The first of `args` a field was taken out of.
 fn taken_whole(h: Holding, args: List<Arg>) -> Option<Var> =
@@ -1733,7 +1757,7 @@ fn held_otherwise(v: Var, val: Val) -> Option<Bytes> =
 fn called_otherwise(v: Var, args: List<Arg>, conv: Convention) -> Option<Bytes> =
   if conv.answer != v.rep {
     Some(b"a call's answer bound otherwise than its convention holds it: v")
-  } else if !conv_reps(args, conv.reps) {
+  } else if !conv_reps(args, reps_of(conv)) {
     Some(b"a call's operand held otherwise than its convention takes it: v")
   } else if !borrows_lent(args.map(rep_of_arg), conv) {
     Some(b"a call's answer borrowed of other than a counted operand it lends: v")
@@ -1746,7 +1770,7 @@ fn borrows_lent(held: List<Rep>, conv: Convention) -> Bool =
     Owned -> true,
     Borrowed(from) ->
       from.all(|x: { param: Int, whole: Bool }|
-        conv.params.at(x.param) == Some(Lent)
+        param_lent(conv, x.param)
           && (match held.at(x.param) { Some(r) -> counted(r), None -> false })),
   }
 
@@ -1795,11 +1819,11 @@ fn tests_as_held(t: Test, r: Rep) -> Bool =
 
 fn numeric(r: Rep) -> Bool = match r { RInt -> true, RBool -> true, RNum(_) -> true, _ -> false }
 
-fn word(id: Int) -> Var = { id: id, ty: TyCon({ name: b"String", args: [] }), rep: RWord }
+fn word(id: Int) -> Var = { id: id, ty: string_type(), rep: RWord }
 
-fn int(id: Int) -> Var = { id: id, ty: TyCon({ name: b"Int", args: [] }), rep: RInt }
+fn int(id: Int) -> Var = { id: id, ty: int_type(), rep: RInt }
 
-fn flag(id: Int) -> Var = { id: id, ty: TyCon({ name: b"Bool", args: [] }), rep: RBool }
+fn flag(id: Int) -> Var = { id: id, ty: bool_type(), rep: RBool }
 
 /// A root over `params`, each given unless `lent` names it, answering as `answer`.
 fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
@@ -1808,8 +1832,7 @@ fn root_of(params: List<Var>, lent: List<Int>, answer: Rep, body: Block) -> Fn =
     kind: Rooted,
     params: params,
     conv: {
-      params: range(0, params.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
-      reps: params.map(|p: Var| p.rep),
+      params: lent_where(params.map(|p: Var| p.rep), lent),
       answer: answer,
       destined: false,
       answered: Owned,
@@ -1829,8 +1852,7 @@ fn call_of(args: List<Arg>, lent: List<Int>) -> Val =
     callee: Root(Named(b"m.g")),
     args: args,
     conv: {
-      params: range(0, args.len()).map(|i: Int| if lent.contains(i) { Lent } else { Given }),
-      reps: args.map(rep_of_arg),
+      params: lent_where(args.map(rep_of_arg), lent),
       answer: RWord,
       destined: false,
       answered: Owned,
@@ -1842,7 +1864,7 @@ fn bind(v: Var, val: Val, unwind: List<Var>) -> Inst =
   Let({ var: v, val: val, at: dummy_span(), unwind: unwind })
 
 test "a record is written over only in the box of a record of its own fields" {
-  let text = TyCon({ name: b"String", args: [] });
+  let text = string_type();
   let boxed = |id: Int, names: List<Bytes>|
     { id: id, ty: TyRecord(names.map(|n: Bytes| { name: n, ty: text })), rep: RWord };
   let over = |from: List<Bytes>| {
@@ -1948,17 +1970,13 @@ test "a variable is used held as it was bound, which its C names follow" {
 }
 
 test "the values holding no count are a static, what is gathered, held again or read in place of such values, and a join set only from them" {
-  let c = { id: 0, ty: TyCon({ name: b"Bool", args: [] }), rep: RBool };
+  let c = { id: 0, ty: bool_type(), rep: RBool };
   let p = word(1);
   let s = word(2);
   let t = word(3);
   let j = word(4);
   let k = word(5);
-  let o = {
-    id: 6,
-    ty: TyCon({ name: b"Option", args: [TyCon({ name: b"String", args: [] })] }),
-    rep: maybe_word(),
-  };
+  let o = { id: 6, ty: option_type(string_type()), rep: maybe_word() };
   let branch = |join: Var, other: Arg|
     If({
       cond: AVar(c),
@@ -2136,8 +2154,7 @@ test "a loop holds the same counts across each of its passes, and a count it lef
     root_of([p], [], RWord, [
       Inc({ var: p, n: 1 }),
       Loop({
-        state: [s],
-        init: [AVar(p)],
+        state: [{ var: s, init: AVar(p) }],
         body: [
           If({
             cond: ABool(true),
@@ -2158,7 +2175,7 @@ test "a loop holds the same counts across each of its passes, and a count it lef
   assert_eq(
     verified(
       root_of([p], [], RWord, [
-        Loop({ state: [s], init: [AVar(p)], body: [Dec(s)], answer: a }),
+        Loop({ state: [{ var: s, init: AVar(p) }], body: [Dec(s)], answer: a }),
         Return(AVar(a)),
       ]),
     ),
@@ -2430,16 +2447,10 @@ test "a field taken out of its block is never read again, nor the block used who
   );
   // A record the block holds in place is its own header and words, which no count can be taken of:
   // the reader's record type says so, and so does the block's layout whatever the reader is bound as.
-  let inner = TyRecord([
-    { name: b"a", ty: TyCon({ name: b"Int", args: [] }) },
-    { name: b"s", ty: TyCon({ name: b"String", args: [] }) },
-  ]);
+  let inner = TyRecord([{ name: b"a", ty: int_type() }, { name: b"s", ty: string_type() }]);
   let holder = {
     ..p,
-    ty: TyRecord([
-      { name: b"in", ty: inner },
-      { name: b"t", ty: TyCon({ name: b"String", args: [] }) },
-    ]),
+    ty: TyRecord([{ name: b"in", ty: inner }, { name: b"t", ty: string_type() }]),
   };
   let placed = |reader: Var|
     verified(
@@ -2733,7 +2744,12 @@ test "an operand is held as its operation takes it, and a counted answer is held
   let int_call = Call({
     callee: Root(Named(b"m.g")),
     args: [AVar(p)],
-    conv: { params: [Given], reps: [RInt], answer: RWord, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: Given, rep: RInt }],
+      answer: RWord,
+      destined: false,
+      answered: Owned,
+    },
     stops: false,
   });
   assert_eq(
@@ -2756,11 +2772,20 @@ test "an operand is held as its operation takes it, and a counted answer is held
   assert_eq(
     verified(root_of([p], [], RWord, [Dec(n), Return(AVar(p))])),
     Some(b"a count let go of a value that holds none: v1"),
+  );
+  let retained = Op({
+    op: OContainer(Retained),
+    args: [AVar(p)],
+    uses: { takes: [], owned: true, fails: false, stops: false },
+  });
+  assert_eq(
+    verified(root_of([p], [], RWord, [bind(r, retained, []), Return(AVar(r))])),
+    Some(b"an operation whose uses name other than its operands: v2"),
   )
 }
 
 test "a root holds a parameter as its convention takes it or as a view of the list it takes, and restarts on arguments held as its parameters are" {
-  let list = TyCon({ name: b"List", args: [TyCon({ name: b"Int", args: [] })] });
+  let list = list_type(int_type());
   let view = { id: 0, ty: list, rep: RSlice };
   let w = { id: 1, ty: list, rep: RWord };
   let n = int(2);
@@ -2768,8 +2793,7 @@ test "a root holds a parameter as its convention takes it or as a view of the li
     {
       ..root_of([view, n], [], RInt, body),
       conv: {
-        params: [Given, Given],
-        reps: [RWord, RInt],
+        params: [{ handed: Given, rep: RWord }, { handed: Given, rep: RInt }],
         answer: RInt,
         destined: false,
         answered: Owned,
@@ -2784,7 +2808,12 @@ test "a root holds a parameter as its convention takes it or as a view of the li
   assert_eq(
     verified({
       ..root_of([n], [], RInt, [Return(AVar(n))]),
-      conv: { params: [Given], reps: [RWord], answer: RInt, destined: false, answered: Owned },
+      conv: {
+        params: [{ handed: Given, rep: RWord }],
+        answer: RInt,
+        destined: false,
+        answered: Owned,
+      },
     }),
     Some(b"a parameter held otherwise than its convention takes it"),
   )
@@ -3059,7 +3088,7 @@ fn maybe_word() -> Rep =
         },
       ],
     },
-    cases: [b"None", b"Some"],
+    cases: [none_ctor(), some_ctor()],
   })
 
 test "a sum is opened as the box its one case is boxed in, or as its one word in an arm on its case, and read where its case lays words" {
@@ -3085,7 +3114,7 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
         rest: [Dec(o), Return(AInt(0))],
       }),
     ]);
-  let arm = |inside: Block| on([b"None", b"Some"], inside);
+  let arm = |inside: Block| on([none_ctor(), some_ctor()], inside);
   assert_eq(verified(arm([Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])), None);
   assert_eq(
     verified(root_of([o], [], RInt, [Opened({ of: o, words: [s] }), Dec(s), Return(AInt(0))])),
@@ -3112,7 +3141,7 @@ test "a sum is opened as the box its one case is boxed in, or as its one word in
   assert_eq(read({ case: 1, at: 1 }), Some(b"a case's payload read past what the case lays: v2"));
   assert_eq(read({ case: 0, at: 0 }), Some(b"a case's payload read past what the case lays: v2"));
   assert_eq(
-    verified(on([b"Some", b"None"], [Dec(o), Return(AInt(0))])),
+    verified(on([some_ctor(), none_ctor()], [Dec(o), Return(AInt(0))])),
     Some(b"a case on a sum testing other constructors than the sum's: v0"),
   );
   let gathered = { ..word(4), rep: maybe };

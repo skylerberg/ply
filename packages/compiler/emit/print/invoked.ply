@@ -6,7 +6,7 @@
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
 import compiler.syntax.parsing (span_between)
-import compiler.check.types (Type, TyCon, TyFn, TyVar, row_empty)
+import compiler.check.types (Type, TyCon, TyFn, TyVar, row_empty, int_type, string_type)
 import compiler.emit.c (int_lit, tick_line)
 import compiler.emit.reps (Ctors, word_type, resumption, laid_known)
 import compiler.emit.roots (symbol_of, root_id)
@@ -15,7 +15,8 @@ import compiler.emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOp, ro
 import compiler.emit.layout (header_bytes, words, register_words)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, LambdaEntry, spelled)
 import compiler.emit.answer (Expect, GenericAt, SharedFn, call_at)
-import compiler.emit.tir (no_closure_words, Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord,
+import compiler.emit.tir (param_lent, ParamTaking, handed_of, reps_of, all_given, Carried,
+                          no_closure_words, Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord,
                           RFlat, RSum, RUnit, RImm, Leaf, Var, Arg, AVar, Given, Lent, Owned,
                           Borrowed, Convention, Made, MClosure, Fn, Member, Lambda, Closure,
                           ClosureWords, Uses, Return, Rooted, rep_of_arg, made_said, no_links,
@@ -85,7 +86,7 @@ fn invoked(
   conv: Convention,
   noting: (Printing) -> Printing / {abort.raise},
 ) -> Printing / {abort.raise} = {
-  let handed = handed_as(pr, p.depth, args, conv.reps);
+  let handed = handed_as(pr, p.depth, args, reps_of(conv));
   let answer = conv.answer;
   let named_as = match into { Some(v) -> named(handed.pr, v), None -> temp(handed.pr) };
   let answered = part_names(named_as.name, answer);
@@ -671,26 +672,17 @@ pub fn loop_opened(
   p: Place,
   pr: Printing,
   label: Int,
-  state: List<Var>,
-  init: List<Arg>,
+  state: List<Carried>,
   answer: Var,
 ) -> Printing = {
-  let held = range(0, state.len()).fold(pr, |q: Printing, i: Int|
-    match state.at(i) {
-      Some(v) -> {
-        let n = named(q, v);
-        let ns = part_names(n.name, v.rep);
-        let ts = c_types(v.rep);
-        let xs = match init.at(i) { Some(a) -> arg_parts(pr, a), None -> zeros(v.rep) };
-        range(0, ns.len()).fold(n.pr, |r: Printing, k: Int|
-          line(
-            r,
-            p.depth,
-            Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(xs, k), b";"]),
-          ))
-      },
-      None -> q,
-    });
+  let held = state.fold(pr, |q: Printing, c: Carried| {
+    let n = named(q, c.var);
+    let ns = part_names(n.name, c.var.rep);
+    let ts = c_types(c.var.rep);
+    let xs = arg_parts(pr, c.init);
+    range(0, ns.len()).fold(n.pr, |r: Printing, k: Int|
+      line(r, p.depth, Bytes::concat_all([nth(ts, k), b" ", nth(ns, k), b" = ", nth(xs, k), b";"])))
+  });
   line(declared(held, p.depth, answer), p.depth, b"for (;;) {")
 }
 
@@ -745,22 +737,10 @@ pub fn lambda_text(
       // The function's own parameters, as the closure's type takes them past its captures, and
       // then its words; and as a call by the closure's type hands them, the row's descriptor and
       // its words in place of the words.
-      let own = {
-        ..c.body.conv,
-        params: c.body.conv.params.drop(c.captures),
-        reps: c.body.conv.reps.drop(c.captures),
-      };
+      let own = { ..c.body.conv, params: c.body.conv.params.drop(c.captures) };
       let carried = words_carried(c.words.count);
-      let plain = {
-        ..own,
-        params: own.params.take(own.params.len() - carried),
-        reps: own.reps.take(own.reps.len() - carried),
-      };
-      let typed = {
-        ..plain,
-        params: plain.params.concat([Given, Given]),
-        reps: plain.reps.concat([RImm, RImm]),
-      };
+      let plain = { ..own, params: own.params.take(own.params.len() - carried) };
+      let typed = typed_convention(plain);
       let answer = own.answer;
       // Each capture laid in the block past the descriptor as the body holds it.
       let caps = c.body.params.take(c.captures).fold(
@@ -779,7 +759,7 @@ pub fn lambda_text(
       });
       let uniform = uniform_entry(taken.pr, name, {
         conv: typed,
-        types: c.body.params.drop(c.captures).take(plain.reps.len()).map(|v: Var| v.ty).concat([
+        types: c.body.params.drop(c.captures).take(plain.params.len()).map(|v: Var| v.ty).concat([
           row_described_type(),
           words_laid_type(),
         ]),
@@ -828,7 +808,7 @@ pub fn lambda_text(
                 keep: kept.symbol,
               },
               c.captures,
-              typed.reps,
+              reps_of(typed),
               answer,
             ),
           ),
@@ -915,16 +895,15 @@ fn typed_entry(
   words: ClosureWords,
 ) -> List<Piece> / {abort.raise} = {
   let typed = typed_convention(plain);
-  let k = plain.reps.len();
+  let k = plain.params.len();
   let desc = b"p".concat(ascii_of_int(k));
   let array = b"p".concat(ascii_of_int(k + 1));
   let buffered = if answer_buffer(plain.answer) > 0 { [b"o"] } else { [] };
   let leading = head_names(plain).take(head_names(plain).len() - buffered.len());
   let n = words.count;
   let own = Bytes::concat_all([b"(const Word *)&", words.described]);
-  // A capture may lie in several words, a label and what follows it in one each: counted from the end.
-  let labels = range(0, words.left.len()).map(|j: Int|
-    nth(taken.names, taken.names.len() - words.held - words.labels + words.left.get(j)));
+  let labels = words.left.map(|k: Int|
+    match taken.names.at(k) { Some(names) -> nth(names, 0), None -> b"0" });
   let mapped = if n == 0 { b"" } else {
     Bytes::concat_all([
       b"  Word w[",
@@ -973,8 +952,13 @@ fn typed_entry(
         name,
         b"(ctx",
         Bytes::concat_all(
-          taken.names.concat(leading).concat(passed).concat(buffered).map(|a: Bytes|
-            b", ".concat(a)),
+          taken.names.fold([], |acc: List<Bytes>, names: List<Bytes>| acc.concat(names)).concat(
+            leading,
+          ).concat(
+            passed,
+          ).concat(
+            buffered,
+          ).map(|a: Bytes| b", ".concat(a)),
         ),
         b");\n}\n",
       ]),
@@ -997,8 +981,8 @@ fn capture_params(caps: List<Var>) -> Bytes =
     }),
   )
 
-/// What `captures_read` writes, the printing after it, and the names it reads the captures into.
-type Taken = { pr: Printing, out: List<Piece>, names: List<Bytes> }
+/// What `captures_read` writes, the printing after it, and the names it reads each capture into.
+type Taken = { pr: Printing, out: List<Piece>, names: List<List<Bytes>> }
 
 /// A closure's captures, laid in its block of `bytes` as `parts` say, read out of the closure `self`
 /// into `c<i>`, which its function takes. An entry that `takes` the closure moves them out of it
@@ -1012,7 +996,7 @@ fn captures_read(
 ) -> Taken / {abort.raise} = {
   let read = range(0, parts.len()).fold(
     { pr: pr, reads: [], dups: [], names: [] },
-    |acc: { pr: Printing, reads: List<Bytes>, dups: List<Piece>, names: List<Bytes> }, i: Int|
+    |acc: { pr: Printing, reads: List<Bytes>, dups: List<Piece>, names: List<List<Bytes>> }, i: Int|
       match parts.at(i) {
         None -> acc,
         Some(part) -> {
@@ -1035,7 +1019,7 @@ fn captures_read(
                 ])),
             ),
             dups: acc.dups.concat(d.out),
-            names: acc.names.concat(names),
+            names: acc.names.push(names),
           }
         },
       },
@@ -1246,7 +1230,7 @@ fn entry_text(
         None -> { text: [], arg: b"ctx->bridge" },
       }
     };
-  let opened = range(0, c.reps.len()).fold(
+  let opened = range(0, c.params.len()).fold(
     { text: [], args: [], values: [] },
     |acc: { text: List<Piece>, args: List<Bytes>, values: List<List<Bytes>> }, j: Int|
       if match e.types.at(j) { Some(t) -> is_evidence(t), None -> false } {
@@ -1257,7 +1241,7 @@ fn entry_text(
           values: acc.values.push([a.arg]),
         }
       } else {
-        let o = entry_opened(j, c.reps.get(j));
+        let o = entry_opened(j, c.params.get(j).rep);
         {
           text: acc.text.concat(o.text),
           args: acc.args.concat(o.args),
@@ -1283,12 +1267,13 @@ fn entry_text(
       }
     },
   };
-  let let_go = range(0, c.reps.len()).fold(
+  let let_go = range(0, c.params.len()).fold(
     { pr: promoted.pr, out: [] },
     |acc: { pr: Printing, out: List<Piece> }, j: Int|
-      if c.params.at(j) != Some(Lent)
-          || (match e.types.at(j) { Some(t) -> is_evidence(t), None -> false }) { acc } else {
-        let s = released(acc.pr, e.types.get(j), c.reps.get(j), opened.values.get(j));
+      if !param_lent(c, j) || (match e.types.at(j) { Some(t) -> is_evidence(t), None -> false }) {
+        acc
+      } else {
+        let s = released(acc.pr, e.types.get(j), c.params.get(j).rep, opened.values.get(j));
         {
           pr: s.pr,
           out: if s.out.len() == 0 { acc.out }
@@ -1330,11 +1315,11 @@ pub fn group_wrapper(
       let name = symbol_of(root_text(root_name(m.key)));
       let answer = m.conv.answer;
       let width = f.members.fold(0, |w: Int, x: Member|
-        if x.conv.reps.len() > w { x.conv.reps.len() } else { w });
-      let words = range(0, m.conv.reps.len()).fold(
+        if x.conv.params.len() > w { x.conv.params.len() } else { w });
+      let words = range(0, m.conv.params.len()).fold(
         { pr: pr, prep: [], words: [] },
         |acc: { pr: Printing, prep: List<Piece>, words: List<Bytes> }, j: Int| {
-          let r = m.conv.reps.get(j);
+          let r = m.conv.params.get(j).rep;
           let param = b"p".concat(ascii_of_int(j));
           let made = b"ply_g".concat(ascii_of_int(j));
           match passing(r) {
@@ -1495,7 +1480,7 @@ fn descriptor_of(f: Bytes) -> Bytes =
 /// The convention a closure's typed entry takes, `plain` its function's: past `plain`'s parameters,
 /// the descriptor of the row its caller names and the array of the words for it.
 pub fn typed_convention(plain: Convention) -> Convention =
-  { ..plain, params: plain.params.concat([Given, Given]), reps: plain.reps.concat([RImm, RImm]) }
+  { ..plain, params: plain.params.concat(all_given([RImm, RImm])) }
 
 /// The entry the descriptor of the function value `f` holds at convention `c`, cast to it: what a
 /// call of `f` by its type calls, handing `f` first.
@@ -1506,13 +1491,7 @@ pub fn typed_callee(f: Bytes, c: Convention) -> Bytes =
 /// answer owned, each held as a body holds a value of its type over the constructor table `ctors`.
 pub fn convention_of(ctors: Ctors, t: { params: List<Type>, ret: Type }) -> Convention = {
   let reps = t.params.map(|x: Type| held_with(ctors, x));
-  {
-    params: reps.map(|_: Rep| Given),
-    reps: reps,
-    answer: held_with(ctors, t.ret),
-    destined: false,
-    answered: Owned,
-  }
+  { params: all_given(reps), answer: held_with(ctors, t.ret), destined: false, answered: Owned }
 }
 
 /// The C type of the entry a closure of convention `c` is called through by its type: the closure,
@@ -1619,7 +1598,12 @@ test "a call lays a record wider than a call's registers in a buffer it hands, a
   let n = register_words() + 1;
   let wide = RFlat(range(0, n).map(|i: Int| { name: b"f".concat(ascii_of_int(i)), rep: RInt }));
   let local = |id: Int| { id: id, ty: TyCon({ name: b"T", args: [] }), rep: wide };
-  let conv = { params: [Given], reps: [wide], answer: wide, destined: false, answered: Owned };
+  let conv = {
+    params: [{ handed: Given, rep: wide }],
+    answer: wide,
+    destined: false,
+    answered: Owned,
+  };
   let callee = Root(Named(b"m.g"));
   let pr = call(place(), printing(Map::new().insert(0, b"w")), Some(local(1)), {
     callee: callee,
@@ -1639,7 +1623,7 @@ test "a call lays a record wider than a call's registers in a buffer it hands, a
   assert_eq(pr.expects.map(|e: Expect| e.head), [head_types(conv)])
 }
 
-fn int() -> Type = TyCon({ name: b"Int", args: [] })
+fn int() -> Type = int_type()
 
 test "a function value is called through its descriptor's entry at its type's convention, and a continuation through its uniform entry" {
   let names = printing(Map::new().insert(0, b"f").insert(1, b"x"));
@@ -1647,7 +1631,12 @@ test "a function value is called through its descriptor's entry at its type's co
   let typed = applied(place(), names, Some({ id: 2, ty: int(), rep: RInt }), {
     f: AVar({ id: 0, ty: fty, rep: RWord }),
     args: [AVar({ id: 1, ty: int(), rep: RInt })],
-    conv: { params: [Given], reps: [RInt], answer: RInt, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: Given, rep: RInt }],
+      answer: RInt,
+      destined: false,
+      answered: Owned,
+    },
     stops: false,
   });
   // The typed entry, cast to the function type's convention, takes the closure and the argument.
@@ -1657,7 +1646,12 @@ test "a function value is called through its descriptor's entry at its type's co
   let resumed = applied(place(), names, Some({ id: 2, ty: int(), rep: RWord }), {
     f: AVar({ id: 0, ty: resumption(int()), rep: RWord }),
     args: [AVar({ id: 1, ty: int(), rep: RWord })],
-    conv: { params: [Given], reps: [RWord], answer: RWord, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: Given, rep: RWord }],
+      answer: RWord,
+      destined: false,
+      answered: Owned,
+    },
     stops: true,
   });
   // A continuation is called as the runtime calls a function value: its uniform entry, its arguments
@@ -1708,10 +1702,9 @@ test "a closure is a block of its own with its descriptor first, a stacked one c
 }
 
 test "a root's entry lets go of what the root only borrows after the call, a borrowed answer counted once more first" {
-  let string = TyCon({ name: b"String", args: [] });
+  let string = string_type();
   let lending = {
-    params: [Lent, Given],
-    reps: [RWord, RInt],
+    params: [{ handed: Lent, rep: RWord }, { handed: Given, rep: RInt }],
     answer: RWord,
     destined: false,
     answered: Borrowed([{ param: 0, whole: true }]),
@@ -1740,7 +1733,11 @@ test "a root's entry lets go of what the root only borrows after the call, a bor
     Some(String::of_bytes_lossy(text)),
   );
   // Given everything and answering a count of its own, the root takes what the entry was handed.
-  let given = entry({ ..lending, params: [Given, Given], answered: Owned });
+  let given = entry({
+    ..lending,
+    params: lending.params.map(|p: ParamTaking| { ..p, handed: Given }),
+    answered: Owned,
+  });
   assert(given.index_of(b"return f(ctx, a0, a1);") != None, Some(String::of_bytes_lossy(given)))
 }
 
@@ -1756,8 +1753,11 @@ test "a closure's entries hand over its captures out of its block, its release l
     kind: Rooted,
     params: params,
     conv: {
-      params: [Given, Given, Given],
-      reps: [RWord, RWord, RInt],
+      params: [
+        { handed: Given, rep: RWord },
+        { handed: Given, rep: RWord },
+        { handed: Given, rep: RInt },
+      ],
       answer: RInt,
       destined: false,
       answered: Owned,

@@ -22,7 +22,8 @@ import configuration
 import configuration (Configuration, Resolution)
 import std.config (SInt, SSecret)
 import compiler.check.resolve.tables (Diag, Label)
-import diagnostic (Place, Raised, Spot, shown, spot_of, all_to_json, all_to_text)
+import diagnostic (Place, Raised, Spot, raised_json, shown, spot_of, to_json, all_to_json,
+                   all_to_text)
 import entries
 import entry (Main, Module, entry_point)
 import compiler.cc (toolchain)
@@ -328,7 +329,7 @@ fn document(
   e: Ended,
   ok: Bool,
   code: Int,
-  diags: List<Diag>,
+  raised: Option<Raised>,
 ) -> Json / {abort.raise} =
   object(
     [
@@ -348,7 +349,15 @@ fn document(
         value: configuration::report_json(configuration::report(resolution.configuration)),
       },
       { key: "shutdown", value: shutdown_json(e) },
-      { key: "diagnostics", value: all_to_json(diags, places_of(target)) },
+      {
+        key: "diagnostics",
+        value: Array(
+          noted(resolution, e).map(|d: Diag| to_json(d, places_of(target))).concat(match raised {
+            Some(r) -> [raised_json(r, places_of(target))],
+            None -> [],
+          }),
+        ),
+      },
     ]),
   )
 
@@ -367,7 +376,7 @@ fn exited(
   code: Int,
 ) -> Answer / {abort.raise} =
   {
-    json: document(target, en, resolution, e, code == ok_code(), code, noted(resolution, e)),
+    json: document(target, en, resolution, e, code == ok_code(), code, None),
     lines: handshake_lines(style, e),
     errs: stop_lines(style, e).concat(warned_lines(style, e.warnings)),
     code: code,
@@ -381,7 +390,7 @@ fn answered(
   e: Ended,
 ) -> Answer / {abort.raise} =
   {
-    json: document(target, en, resolution, e, true, ok_code(), noted(resolution, e)),
+    json: document(target, en, resolution, e, true, ok_code(), None),
     lines: handshake_lines(style, e).concat([
       indent() ++ (match e.value { Some(v) -> render(v), None -> "" }),
     ]),
@@ -395,11 +404,12 @@ fn raised(
   en: String,
   resolution: Resolution,
   e: Ended,
-  diag: Diag,
+  r: Raised,
 ) -> Answer / {abort.raise} = {
+  let diag = shown(r);
   let code = if drained(diag) { drain_incomplete() } else { failed() };
   {
-    json: document(target, en, resolution, e, false, code, noted(resolution, e).push(diag)),
+    json: document(target, en, resolution, e, false, code, Some(r)),
     lines: [],
     errs: stop_lines(style, e).concat(all_to_text(style, [diag], places_of(target))).concat(
       raised_at(style, target, diag),
@@ -421,7 +431,7 @@ fn ended(
     Some(code) -> exited(style, target, en, resolution, e, code),
     None -> match e.raised {
       None -> answered(style, target, en, resolution, e),
-      Some(r) -> raised(style, target, en, resolution, e, shown(r)),
+      Some(r) -> raised(style, target, en, resolution, e, r),
     },
   }
 
@@ -1331,14 +1341,19 @@ test "a raise is exit 1, and says where it was raised for a reader with the file
   assert_eq(ran.answer.errs.at_or(ran.answer.errs.len() - 1, ""), "   raised at m.ply:1:20")
 }
 
-test "a raise shows the values it carries, rendered where its text names them" {
+test "a raise shows the values it carries where its text names them, and the document each whole" {
   let raise = {
     ..answered_with(VInt(42)),
     value: None,
     raised: Some({ diag: a_diag(b"E0501", b"expected \x010\x02", []), values: [VInt(3)] }),
   };
   let ran = ran_over(bare(), Ok(a_program()), Ok(reaching_nothing()), raise);
-  assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: expected 3")
+  assert_eq(ran.answer.errs.at_or(0, ""), "Error[E0501]: expected 3");
+  let text = to_string(
+    ran_over(as_json(), Ok(a_program()), Ok(reaching_nothing()), raise).answer.json,
+  );
+  assert(text.contains("\"message\":\"expected 3\""));
+  assert(text.contains("\"values\":[\"3\"]"))
 }
 
 test "an expired drain is exit 3, and is not attributed to a line of the program" {

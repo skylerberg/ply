@@ -9,7 +9,8 @@ import compiler.syntax.parsing (Span, dummy_span)
 import compiler.syntax.patterns (LUnit, LInt, LBytes)
 import compiler.check.types (Type, TyCon, TyFn, TyRecord, int_type, bool_type, string_type,
                              bytes_type, option_type, named_type, list_type, fn_type, monomorphic,
-                             row_empty)
+                             row_empty, secret_type, decimal_type)
+import compiler.check.known (char_type, width_type, some_ctor, none_ctor)
 import compiler.emit.typing (Typed, filed_as, unknown_type)
 import compiler.emit.code (Code, Node, NLit, NVar, NBinary, NApp, NIf, NBlock, NMatch, CLet, PxVar,
                            PxCtor)
@@ -17,10 +18,10 @@ import compiler.emit.keys
 import compiler.emit.keys (Root, Contained, root_name, root_text)
 import compiler.emit.reps (Def, EmitParam, SumCtor, kind_of)
 import compiler.emit.roots (builtin_helper)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RDec, RWord, RAddr, RSum, RImm, Var, Arg, AVar,
-                          AInt, AZero, Prim, Get, Path, PPayload, PCase, Native, Op, OContainer,
-                          OStrings, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg,
-                          RFlat, Gathered)
+import compiler.emit.tir (reps_of, Rep, RInt, RBool, RNum, RDec, RWord, RAddr, RSum, RImm, Var, Arg,
+                          AVar, AInt, AZero, Prim, Get, Path, PPayload, PCase, Native, Op,
+                          OContainer, OStrings, Make, MList, Call, If, Case, TTag, string_uses,
+                          rep_of_arg, RFlat, Gathered)
 import compiler.emit.tir.containers (Length, Taken, Laid)
 import compiler.emit.layout (Recast, refusal, refusals)
 import compiler.emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Compared,
@@ -200,10 +201,7 @@ fn one_converted(c: Asked, st: Lowering, a: Arg) -> Lowered / {abort.raise} = {
   } else if n == b"Secret::of_string" || n == b"Secret::of_bytes" {
     let t = addressed(st, a, at);
     let text = AInt(if n == b"Secret::of_string" { 1 } else { 0 });
-    let secret = TyCon({
-      name: b"Secret",
-      args: [if n == b"Secret::of_string" { string_type() } else { bytes_type() }],
-    });
+    let secret = secret_type(if n == b"Secret::of_string" { string_type() } else { bytes_type() });
     let h = bound_as(
       t.st,
       secret,
@@ -296,7 +294,7 @@ fn root_called(c: Asked, st: Lowering, op: Bytes, t: Type, args: List<Arg>) -> L
     typed.params.map(|p: { name: Bytes, ty: Type }| p.ty),
     typed.ret,
   );
-  let reps = conv.reps;
+  let reps = reps_of(conv);
   let given = range(0, args.len()).fold(
     { st: st, args: [] },
     |acc: { st: Lowering, args: List<Arg> }, i: Int|
@@ -434,7 +432,7 @@ fn byte_read(c: Asked, st: Lowering, a: Arg, i: Arg, four: Bool) -> Lowered / {a
   let read = if four {
     strings_op(
       opened(ok.st),
-      named_type(b"U32"),
+      width_type({ bits: 32, signed: false }),
       RNum({ bits: 32, signed: false }),
       U32Read,
       [x.address, k.arg],
@@ -501,7 +499,7 @@ fn secret_operated(c: Asked, st: Lowering, args: List<Arg>) -> Lowered / {abort.
     let n = native_int(h.st, b"?secret_len", h.words, c.at);
     compared(n.st, b"eq", n.arg, AInt(0), c.at)
   } else {
-    let secret = TyCon({ name: b"Secret", args: [bytes_type()] });
+    let secret = secret_type(bytes_type());
     let made = bound_as(
       h.st,
       secret,
@@ -560,7 +558,7 @@ fn secret_derived(c: Asked, st: Lowering, args: List<Arg>) -> Lowered / {abort.r
   }
 }
 
-fn secret_of(of: Type) -> Type = TyCon({ name: b"Secret", args: [of] })
+fn secret_of(of: Type) -> Type = secret_type(of)
 
 /// The secret native `native` makes of `args`, which it borrows, held as a `Secret` of `of`.
 fn secret_made(
@@ -826,7 +824,7 @@ fn told_refused(c: Asked, st: Lowering, m: Arg) -> Lowering / {abort.raise} = {
   let untold = |r: Lowering| refused_text(c, r, [AInt(0), AInt(0 - 1)]);
   let setting = c.cx.setting;
   let o = option_type(string_type());
-  match ((m, ctor_named(setting, prelude_ctor(b"Some")))) {
+  match ((m, ctor_named(setting, prelude_ctor(some_ctor())))) {
     (AVar(given), Some(full)) -> match ctor_sum(setting, full) {
       None -> untold(st),
       Some(sum) -> {
@@ -942,9 +940,9 @@ fn maybe(
 ) -> Lowered / {abort.raise} = {
   let none = compared(k.st, b"lt", k.arg, AInt(0), at);
   let o = option_type(ty);
-  let n = constructed_as(cx, opened(none.st), prelude_ctor(b"None"), [], o, at);
+  let n = constructed_as(cx, opened(none.st), prelude_ctor(none_ctor()), [], o, at);
   let p = payload(opened(continued(none.st, n.st)));
-  let s = constructed_as(cx, p.st, prelude_ctor(b"Some"), [p.arg], o, at);
+  let s = constructed_as(cx, p.st, prelude_ctor(some_ctor()), [p.arg], o, at);
   joined(cx, none, n, s, false, at)
 }
 
@@ -959,7 +957,7 @@ fn decimal_of_bits(c: Asked, st: Lowering, low: Arg, high: Arg) -> Lowered / {ab
     Prim({ op: b"decimal_flags", on: RInt, args: [lo.arg] }),
     c.at,
   );
-  let d = named_type(b"Decimal");
+  let d = decimal_type();
   maybe(
     c.cx,
     k,
@@ -1076,8 +1074,6 @@ fn root_typed(op: Bytes, t: Type) -> { params: List<{ name: Bytes, ty: Type }>, 
   }
 }
 
-fn char_type() -> Type = named_type(b"Char")
-
 fn param_name(ps: List<{ name: Bytes, ty: Type }>, slot: Int) -> Bytes =
   match ps.at(slot) { Some(p) -> p.name, None -> b"" }
 
@@ -1131,13 +1127,13 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> Written / {abort.raise
         arms: [
           {
             pat: PxCtor({
-              name: prelude_ctor(b"Some"),
+              name: prelude_ctor(some_ctor()),
               args: [PxVar({ name: x, slot: Some(slot), span: placed(k) })],
             }),
             guard: None,
             body: some,
           },
-          { pat: PxCtor({ name: prelude_ctor(b"None"), args: [] }), guard: None, body: none },
+          { pat: PxCtor({ name: prelude_ctor(none_ctor()), args: [] }), guard: None, body: none },
         ],
       }),
     );

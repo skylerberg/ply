@@ -5,8 +5,8 @@
 
 import compiler.store.hash.encoding (hex)
 import std.internal.native (native, observed, found, parts, in_parts, int_of)
-import compiler.check.types (Type, TyVar, TyFn, TyCon, Scheme, type_text, type_spelled, digits,
-                             string_type)
+import compiler.check.types (int_type, Type, TyVar, TyFn, TyCon, Scheme, type_text, type_spelled,
+                             digits, string_type)
 import compiler.emit.answer (Answer, RootAnswer, Tables, Defined, Head, Expect, CallAt, SharedFn,
                              GenericAt, expected_callee, word_head, no_generics, answer_bin,
                              tables_bin, root_answer_bin, no_tables, GenericCall, Generics, Need,
@@ -612,11 +612,13 @@ pub type Made = { bodies: List<UnitBody>, offered: List<Offered> }
 /// A unit's C, the roots it takes, and what it was made of.
 pub type Produced = { text: Bytes, taken: List<RootName>, made: Made }
 
-/// A unit produced over answers an earlier run kept and answers the emitter gave now: how many of
-/// the offered roots each covered, the natives the unit calls that the runtime does not implement as
-/// they are declared, and its calls written against a handing other than their callee's.
+/// A unit produced over answers an earlier run kept and answers the emitter gave now: the roots it
+/// was produced over, how many of the offered roots each covered, the natives the unit calls that the
+/// runtime does not implement as they are declared, and its calls written against a handing other
+/// than their callee's.
 pub type Emission = {
   produced: Produced,
+  roots: List<RootKey>,
   kept: Int,
   asked: Int,
   unserved: List<Unserved>,
@@ -2735,13 +2737,14 @@ pub fn emitted<| e>(
         settled_bodies(settled.answers, all.keys, unemitted),
         |acc: Map<RootName, Answer>, n: RootName, b: Baked| acc.insert(n, kept_body(program, p, b)),
       );
+      let roots = every.concat(
+        all.added.filter(|k: RootKey| !shared.contains(root_name(k))),
+      ).filter(|k: RootKey| !unemitted.contains(root_name(k))).concat(
+        entries,
+      );
       let produced = produce(
         ctors,
-        every.concat(all.added.filter(|k: RootKey| !shared.contains(root_name(k)))).filter(
-          |k: RootKey| !unemitted.contains(root_name(k)),
-        ).concat(
-          entries,
-        ).map(|k: RootKey|
+        roots.map(|k: RootKey|
           match k {
             // An entry takes no words: what it reads crosses through the runtime.
             Entered(_) -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
@@ -2763,6 +2766,7 @@ pub fn emitted<| e>(
       );
       Ok({
         produced: produced,
+        roots: roots,
         kept: all.kept,
         asked: all.asked,
         unserved: unserved(runtime),
@@ -2774,6 +2778,26 @@ pub fn emitted<| e>(
     // Every program the front end checked makes a unit, so a panic making one is Ply's own.
     abort.raise(m) -> Err(Bytes::of_string(m)),
   }
+
+/// The roots a build of `modules` produces its unit over, run by a runtime that implements every
+/// native the compiler declares; or why it made no unit.
+pub fn roots_built(
+  modules: List<{ name: Bytes, src: Bytes }>,
+) -> Result<List<RootKey>, Bytes> / {abort.raise} = {
+  let dump = dump_of(analyse(parse_all(modules)));
+  match emitted(
+      serving(b"r", program_natives([]).map(declared_signature)),
+      dump,
+      sources_placed(dump, modules),
+      Map::new(),
+      offered_roots(dump).keys,
+      |_: Bytes| None,
+      |_: List<Record>| (),
+    ) {
+    Ok(e) -> Ok(e.roots),
+    Err(why) -> Err(why),
+  }
+}
 
 /// The definition the root named `n` specialises, where `keys` holds it as a specialisation.
 fn specialising(keys: Map<RootName, RootKey>, n: RootName) -> Option<Bytes> =
@@ -4061,7 +4085,7 @@ test "a specialisation's kept answer moves with the declaration of a type it is 
   assert(at(two, e) != at(three, e), None);
   assert_eq(at(two, e), at(declaring(b"| A | B"), e));
   // A type no program declares is no part of it.
-  let int = TyCon({ name: b"Int", args: [] });
+  let int = int_type();
   assert_eq(at(two, int), at(three, int))
 }
 
@@ -4107,6 +4131,7 @@ test "a call written against a handing its callee does not publish fails the bui
   let dump = dump_of(analyse(parse_all([{ name: b"m", src: b"fn one() -> Int = 1\n" }])));
   let e = {
     produced: { text: b"", taken: [], made: { bodies: [], offered: [] } },
+    roots: [],
     kept: 0,
     asked: 0,
     unserved: [],

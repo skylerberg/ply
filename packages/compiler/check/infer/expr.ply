@@ -36,6 +36,9 @@ import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, Ty
                              rename_scheme, at_arguments, region_mark, written_label, leaving_type,
                              label_type, resolve_atom, atom_text, resource_text, type_text,
                              row_text, printer_new, print_ty, print_row, TyNominal, record_fields)
+import compiler.check.known (is_integer_name, is_float, is_string, is_bytes, bool_name,
+                             columns_name, secret_name, columns_row, list_item, hold_parts,
+                             result_parts, result_type, hold_type, fixed_widths)
 import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_fix, insertion,
                                       ValueSpace, EffectSpace, lookup, lookup_declared,
                                       error_with_labels, error_at, label_at, backticked,
@@ -628,7 +631,7 @@ pub fn settle_bit_ops(checker: Checker) -> Checker / {abort.raise} = {
               } else { b"a type parameter takes the bit operators under `where integer(a)`" },
             ],
           ),
-        TyCon(k) -> if k.args.len() == 0 && is_int_name(k.name) { c }
+        TyCon(k) -> if k.args.len() == 0 && is_integer_name(k.name) { c }
         else { bits_mismatch(c, entry, ty) },
         _ -> bits_mismatch(c, entry, ty),
       }
@@ -667,7 +670,7 @@ fn bits_mismatch(checker: Checker, entry: BitOp, ty: Type) -> Checker / {abort.r
       entry.span,
       Bytes::concat_all([entry.what, b" is not defined on `", name, b"`"]),
       Bytes::concat_all([b"has type `", name, b"`"]),
-      if name == b"Bool" { notes.push(bool_bits_note()) } else { notes },
+      if name == bool_name() { notes.push(bool_bits_note()) } else { notes },
     )
   }
 }
@@ -712,7 +715,8 @@ fn mentions_columns(ty: Type) -> Bool =
   match ty {
     TyVar(_) -> false,
     TyCon(c) ->
-      c.name == b"Columns" || c.args.fold(false, |any: Bool, a: Type| any || mentions_columns(a)),
+      c.name == columns_name()
+        || c.args.fold(false, |any: Bool, a: Type| any || mentions_columns(a)),
     TyFn(f) ->
       mentions_columns(f.ret)
         || f.params.fold(false, |any: Bool, p: Type| any || mentions_columns(p)),
@@ -725,10 +729,8 @@ fn columns_elements(ty: Type) -> List<Type> =
   match ty {
     TyVar(_) -> [],
     TyCon(c) ->
-      c.args.fold(
-        if c.name == b"Columns" && c.args.len() == 1 { c.args } else { [] },
-        |acc: List<Type>, a: Type| acc.concat(columns_elements(a)),
-      ),
+      c.args.fold(columns_row(ty).to_list(), |acc: List<Type>, a: Type|
+        acc.concat(columns_elements(a))),
     TyFn(f) ->
       f.params.fold(columns_elements(f.ret), |acc: List<Type>, p: Type|
         acc.concat(columns_elements(p))),
@@ -1519,11 +1521,11 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     EList(l) -> {
       let elem: WithTy = new_ty(checker);
       let each = match hinted(checker, hint) {
-        Some(TyCon(c)) -> match c.args {
-          [t] -> if c.name == b"List" { Some({ ty: t, met: met_of(hint) }) } else { None },
-          _ -> None,
+        Some(h) -> match list_item(h) {
+          Some(t) -> Some({ ty: t, met: met_of(hint) }),
+          None -> None,
         },
-        _ -> None,
+        None -> None,
       };
       let items = l.items.fold(
         { checker: elem.checker, row: row_empty(), ty: elem.ty, tails: [] },
@@ -1720,7 +1722,7 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
     t,
     tagged_parser(t),
     [if holed { list_type(string_type()) } else { string_type() }],
-    TyCon({ name: b"Result", args: [value.ty, refusal_type(holed)] }),
+    result_type(value.ty, refusal_type(holed)),
   );
   if !holed { { checker: parsed.checker, ty: value.ty, row: row_empty() } } else {
     let hole: WithTy = new_ty(parsed.checker);
@@ -2212,20 +2214,10 @@ fn crossed(checker: Checker, name: Bytes, span: Span) -> Checker / {abort.raise}
     }
   }
 
-/// `Int` and the eight widths are the integer types; the bit operators are defined at those nine only.
-pub fn is_int_name(n: Bytes) -> Bool =
-  n == b"Int" || n == b"U8" || n == b"U16" || n == b"U32" || n == b"U64" || n == b"I8"
-    || n == b"I16"
-    || n == b"I32"
-    || n == b"I64"
-    || n == b"U128"
-    || n == b"I128"
-
 /// Whether a `/` or `%` can meet a zero divisor: a `Float` answers one, and a literal other than zero
 /// is never one. An operand type not settled yet may still be an integer's.
 fn divides_by_zero(checker: Checker, op: Bytes, ty: Type, divisor: Expr) -> Bool / {abort.raise} =
-  (op == b"div" || op == b"rem") && !nonzero_literal(divisor)
-    && (match resolve(checker, ty) { TyCon(k) -> k.name != b"Float", _ -> true })
+  (op == b"div" || op == b"rem") && !nonzero_literal(divisor) && !is_float(resolve(checker, ty))
 
 fn nonzero_literal(e: Expr) -> Bool =
   match e {
@@ -2246,8 +2238,7 @@ fn is_bits(op: Bytes) -> Bool =
 /// The two types `++` joins, when the substitution already says which one this is.
 fn concat_name(ty: Type) -> Option<Bytes> =
   match ty {
-    TyCon(k) -> if k.args.len() == 0 && (k.name == b"String" || k.name == b"Bytes") { Some(k.name) }
-    else { None },
+    TyCon(k) -> if is_string(ty) || is_bytes(ty) { Some(k.name) } else { None },
     _ -> None,
   }
 
@@ -3004,9 +2995,10 @@ fn region_labels(ty: Type, acc: List<Int>) -> List<Int> / {abort.raise} =
   match ty {
     TyVar(_) -> acc,
     TyCon(c) -> {
-      let own = if c.name == b"Hold" {
-        match c.args.at(0) { Some(TyVar(v)) -> ints_insert(acc, v), _ -> acc }
-      } else { acc };
+      let own = match hold_parts(ty) {
+        Some(p) -> match p.label { TyVar(v) -> ints_insert(acc, v), _ -> acc },
+        None -> acc,
+      };
       c.args.fold(own, |a: List<Int>, x: Type| region_labels(x, a))
     },
     TyFn(f) ->
@@ -3748,7 +3740,7 @@ fn bind_pattern(
               let with_builtin = base.push(
                 Bytes::concat_all([b"`", nm, b"` is a builtin type and declares none"]),
               );
-              if nm == b"Secret" {
+              if nm == secret_name() {
                 with_builtin.push(
                   b"that is deliberate: a pattern binding the payload would be a one-line escape from every guarantee `Secret` makes",
                 ).push(
@@ -3980,15 +3972,19 @@ fn unsigned_le(a: Int, b: Int) -> Bool = {
 }
 
 /// Whether one integer literal is no greater than another of its type.
-fn literal_le(ty: Bytes, lo: Lit, hi: Lit) -> Bool =
+fn literal_le(ty: Bytes, lo: Lit, hi: Lit) -> Bool = {
+  // An unsigned width narrower than 64 bits orders alike either way.
+  let unsigned = fixed_widths().any(|w: { name: Bytes, bits: Int, signed: Bool }|
+    w.name == ty && !w.signed);
   match ((lo, hi)) {
     (LInt(a), LInt(b)) -> a <= b,
-    (LFixed(_, a), LFixed(_, b)) -> if ty == b"U64" { unsigned_le(a, b) } else { a <= b },
+    (LFixed(_, a), LFixed(_, b)) -> if unsigned { unsigned_le(a, b) } else { a <= b },
     (LWide(_, ah, al), LWide(_, bh, bl)) -> if ah == bh { unsigned_le(al, bl) }
-    else if ty == b"U128" { unsigned_le(ah, bh) }
+    else if unsigned { unsigned_le(ah, bh) }
     else { ah <= bh },
     _ -> false,
   }
+}
 
 /// A range's bounds are two integer literals of one type, the first no greater than the second.
 fn bind_range(
@@ -5336,11 +5332,11 @@ fn infer_try_block(
   let mark = checker.performs.len();
   // Where a `Result` is expected of the `try`, its body is expected to be what the `Ok` holds.
   let answer = match hinted(checker, hint) {
-    Some(TyCon(c)) -> match c.args {
-      [ok, _] -> if c.name == b"Result" { Some({ ty: ok, met: met_of(hint) }) } else { None },
-      _ -> None,
+    Some(h) -> match result_parts(h) {
+      Some(p) -> Some({ ty: p.ok, met: met_of(hint) }),
+      None -> None,
     },
-    _ -> None,
+    None -> None,
   };
   let b: Inferred = infer(checker, body, answer);
   let body_mark = b.checker.performs.len();
@@ -5357,7 +5353,7 @@ fn infer_try_block(
       let might = match raise { Some(_) -> [], None -> body_row.atoms.filter(tried) };
       {
         checker: discharge(o.checker, mark, body_mark, might),
-        ty: TyCon({ name: b"Result", args: [b.ty, o.ty] }),
+        ty: result_type(b.ty, o.ty),
         row: { atoms: atoms_difference(body_row.atoms, might), tail: body_row.tail },
       }
     },
@@ -5372,7 +5368,7 @@ fn infer_try_block(
       let answered_row = resolve_row_in(opened, b.row);
       let c: Checker = passing_raise(opened, span, answered_row, atom);
       let carried = carried_type(hit.op.params);
-      let result = TyCon({ name: b"Result", args: [b.ty, carried] });
+      let result = result_type(b.ty, carried);
       // The `handle` the `try` is written out as, typed where its parts will stand.
       let at = try_places(span);
       let parts = [
@@ -5731,7 +5727,7 @@ fn infer_with_hold(
   let before: WithRow = join(performed, span, a.row, r.row);
   let entering: WithRow = join(before.checker, span, before.row, let_go);
   let label = region_label(entering.checker, resource.name);
-  let hold_ty = TyCon({ name: b"Hold", args: [label_type(label), a.ty] });
+  let hold_ty = hold_type(label_type(label), a.ty);
   match open_region_named(entering.checker, resource.name) {
     Some(around) -> {
       let refused: Checker = region_reopened(entering.checker, resource, around);
