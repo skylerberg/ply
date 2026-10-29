@@ -2568,16 +2568,16 @@ value is killed by that case, which the table no longer contains.
 ### 8.6 Compiled backend
 
 Every command compiles the program to C and runs the compiled code; there is no interpreter.
-`--profile development` (the default: `tcc` on x86-64 Linux, else `cc -O0`) or `--profile release`
-(`cc -O2`) picks the C toolchain settings.
+`ply test` and `ply run` take `--profile development` (the default: `tcc` on x86-64 Linux, else
+`cc -O0`) or `--profile release` (`cc -O2`), which picks the C toolchain settings. Other commands
+compile under `development`.
 
 Every program that checks compiles. A definition Ply fails to compile is a defect in Ply, reported
 as `E0505` when the program is built.
 
 | variable | effect |
 | --- | --- |
-| `PLY_C_PROFILE=development\|release` | the profile, overriding `--profile` |
-| `PLY_CC=cmd`, `PLY_CC_OPT=flag` | the C compiler and its optimization flag, overriding the profile's |
+| `PLY_CC=cmd` | the C compiler to run in place of `cc`; while it is set, `tcc` is not used |
 | `PLY_C_CACHE=DIR` | where compiled code and other build results are cached, keyed by content (default `ply/cache` under the user's cache directory: `~/Library/Caches` on macOS, `$XDG_CACHE_HOME` or `~/.cache` elsewhere) |
 | `PLY_C_CACHE_MAX=BYTES` | a size limit for the cache, enforced by deleting the least recently used entries first, but never one used in the last hour; `0` is no limit |
 
@@ -3633,7 +3633,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | `ply hash [path]` | `--deps` (references and everything reachable from each) |
 | `ply defs [path]` | every definition: location, hash, signature, footprint and references; `--filter SUBSTRING` |
 | `ply callers DEF [path]` | what refers to a definition directly, and every definition, test and law of your own modules that reaches it |
-| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`), using the parts its `ply.work` lists (§3.3). `--runtime LIBRARY` (default: the runtime's static library under `target/<profile>`), `--profile development\|release` (default `development`; both compile the C with `cc -O2`, and `development`'s checks its reference counts), `--out PATH` (default `target/<profile>/ply`). Reuses work from earlier bootstraps whenever what it depends on is unchanged. |
+| `ply bootstrap [<checkout>]` | builds a native `ply` from a checkout (default `.`), using the parts its `ply.work` lists (§3.3). `--profile development\|release` (default `development`; both compile the C with `cc -O2`, and `development`'s checks its reference counts), `--runtime LIBRARY` (default: the runtime's static library in `target/debug`, or `target/release` under `--profile release`), `--out PATH` (default `ply` in that same directory). Reuses work from earlier bootstraps whenever what it depends on is unchanged. |
 | `ply work [<path>]` | where the `ply.work` at or above a directory (default `.`) places each package and each part of `ply`: one role and path per line, or `--json` (§3.3) |
 | `ply cache clear\|stats\|compact [path]` | empty the cache / report what it holds and how much space could be reclaimed / reclaim that space |
 | `ply cache inspect <DEF> [path]` | what the cache holds for a definition, declaration or test, by full name, simple name or a hash prefix of 4 or more hex digits: its location, hash, type or form, footprint, the effects it names, its body's size, and whether a run proved a test at its hash |
