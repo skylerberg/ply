@@ -100,7 +100,9 @@ pub type Query<| e> = {
 /// - `judged`: each record [`would_stand`] judged, by its key;
 /// - `judging`: whether the run is judging a record for [`memo.kept`];
 /// - `provisional`: for each key being computed, the stored result a judgment used before the
-///   computation finished.
+///   computation finished;
+/// - `below`: by key, what a summary takes from below a call of an unsummarized query, worked out
+///   once a run ([`below_of`]).
 pub type Run = {
   settled: Map<Bytes, Bytes>,
   asked: List<Read>,
@@ -117,6 +119,7 @@ pub type Run = {
   judged: Map<Bytes, Bool>,
   judging: Bool,
   provisional: Map<Bytes, Bytes>,
+  below: Map<Bytes, Option<List<Noted>>>,
 }
 
 type Offer = { output: Bytes, by: Bytes, from: Bytes, nth: Int }
@@ -137,6 +140,7 @@ fn new_run() -> Run =
     judged: Map::new(),
     judging: false,
     provisional: Map::new(),
+    below: Map::new(),
   }
 
 /// What the run's driver asked, each read by the digest of what it answered: what an answer made
@@ -551,6 +555,7 @@ fn settled_at<| e>(
               ..done.run,
               settled: (if early { run.settled } else { done.run.settled }).insert(key, done.head),
               offers: if early { run.offers } else { done.run.offers },
+              below: if early { run.below } else { done.run.below },
               open: done.run.open.remove(key),
               trail: run.trail,
               provisional: done.run.provisional.remove(key),
@@ -584,8 +589,9 @@ fn checked<| e>(
           if s.ok { took(s.run, q.name, r.output) } else {
             let d = stands(queries, s.run, r.reads, left);
             if d.ok {
-              if q.summarized { resummarized(queries, key, r) };
-              took(d.run, q.name, r.output)
+              let summed = if q.summarized { resummarized(queries, d.run, key, r, left) }
+              else { d.run };
+              took(summed, q.name, r.output)
             } else { undone_or_run(queries, d.run, q, key, input, left) }
           }
         },
@@ -685,66 +691,115 @@ fn stands<| e>(
 fn asked_id(name: Bytes, input: Bytes) -> Bytes =
   blake3(Bytes::concat_all([b"ply.memo.asked\x00", sized(name), input]))
 
-/// A summary being built: the reads still to visit, the ids already listed, the summary so far,
-/// and whether every record below was found.
-type Summing = { work: List<Read>, seen: Map<Bytes, Bool>, summary: List<Read>, whole: Bool }
+/// A read a summary lists, beside the id it is listed once under.
+type Noted = { id: Bytes, read: Read }
 
-/// `x` continued with `rest`, with `r` added to the summary unless `id` is listed already.
-fn noting(x: Summing, rest: List<Read>, id: Bytes, r: Read) -> Summing =
-  if x.seen.contains(id) { { ..x, work: rest } }
-  else { { ..x, work: rest, seen: x.seen.insert(id, true), summary: x.summary.push(r) } }
+/// A summary being built: the ids it lists, and what it lists, in order; none where a record below
+/// is missing from every store.
+type Noting = { run: Run, seen: Map<Bytes, Bool>, noted: Option<List<Noted>> }
+
+/// `acc` with each of `ns` it does not list yet.
+fn noting(acc: Noting, ns: List<Noted>) -> Noting =
+  ns.fold(acc, |a: Noting, n: Noted|
+    match a.noted {
+      Some(l) -> if a.seen.contains(n.id) { a }
+      else { { ..a, seen: a.seen.insert(n.id, true), noted: Some(l.push(n)) } },
+      None -> a,
+    })
 
 /// The summary of `reads`: every place they and the records below them read, every summarized query
 /// they call and the definition of every unsummarized query below them, down to the summarized
 /// records, each once. None where a record below is missing from every store.
 fn summary_of<| e>(
   queries: Map<Bytes, Query<| e>>,
+  run: Run,
   reads: List<Read>,
-) -> Option<List<Read>> / {memo_keep.read, abort.raise} = {
-  let made = iterate(
-    { work: reads, seen: Map::new(), summary: [], whole: true },
-    100000000,
-    |x: Summing|
-      match x.work {
-        [] -> Stop(x),
-        [r, ..rest] -> match r {
-          World(kind, at, _) -> Continue(noting(x, rest, place_id(kind, at), r)),
-          Asked(name, input, _) -> match queries.get(name) {
-            None -> Stop({ ..x, whole: false }),
-            Some(aq) -> if aq.summarized { Continue(noting(x, rest, asked_id(name, input), r)) }
-            else {
-              let id = asked_id(name, input);
-              if x.seen.contains(id) { Continue({ ..x, work: rest }) } else {
-                let defined = noting(
-                  { ..x, seen: x.seen.insert(id, true) },
-                  rest,
-                  place_id(query_kind(), name),
-                  World(query_kind(), name, digest_of(Some(aq.hash))),
-                );
-                match memo_keep.record(key_of(aq, input)) {
-                  None -> Stop({ ..defined, whole: false }),
-                  Some(below) -> Continue({ ..defined, work: below.reads.concat(defined.work) }),
+  left: Int,
+) -> { run: Run, summary: Option<List<Read>> } / {memo_keep.read, abort.raise} = {
+  let made = noted_below(queries, run, reads, left);
+  {
+    run: made.run,
+    summary: match made.noted { Some(ns) -> Some(ns.map(|n: Noted| n.read)), None -> None },
+  }
+}
+
+/// What `reads` put in a summary, as [`summary_of`] lists it.
+fn noted_below<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  reads: List<Read>,
+  left: Int,
+) -> { run: Run, noted: Option<List<Noted>> } / {memo_keep.read, abort.raise} =
+  if left <= 0 { panic(String::of_bytes_lossy(too_deep())) } else {
+    let made = reads.fold(
+      { run: run, seen: Map::new(), noted: Some([]) },
+      |acc: Noting, r: Read|
+        match acc.noted {
+          None -> acc,
+          Some(_) -> match r {
+            World(kind, at, _) -> noting(acc, [{ id: place_id(kind, at), read: r }]),
+            Asked(name, input, _) -> match queries.get(name) {
+              None -> { ..acc, noted: None },
+              Some(aq) -> if aq.summarized { noting(acc, [{ id: asked_id(name, input), read: r }]) }
+              else {
+                let b = below_of(queries, acc.run, aq, input, left - 1);
+                match b.below {
+                  Some(ns) -> noting({ ..acc, run: b.run }, ns),
+                  None -> { ..acc, run: b.run, noted: None },
                 }
-              }
+              },
             },
           },
         },
-      },
-  );
-  if made.whole { Some(made.summary) } else { None }
+    );
+    { run: made.run, noted: made.noted }
+  }
+
+/// What a summary takes from below a call of the unsummarized query `q` for `input`: the query's
+/// definition, then what its record's reads put in a summary. A run works it out once for each
+/// call, however many summaries take it.
+fn below_of<| e>(
+  queries: Map<Bytes, Query<| e>>,
+  run: Run,
+  q: Query<| e>,
+  input: Bytes,
+  left: Int,
+) -> { run: Run, below: Option<List<Noted>> } / {memo_keep.read, abort.raise} = {
+  let key = key_of(q, input);
+  match run.below.get(key) {
+    Some(b) -> { run: run, below: b },
+    None -> {
+      let made = match memo_keep.record(key) {
+        None -> { run: run, noted: None },
+        Some(r) ->
+          noted_below(
+            queries,
+            run,
+            [World(query_kind(), q.name, digest_of(Some(q.hash)))].concat(r.reads),
+            left,
+          ),
+      };
+      { run: { ..made.run, below: made.run.below.insert(key, made.noted) }, below: made.noted }
+    },
+  }
 }
 
 /// The record `r` stored again under `key` with the summary of its reads now: for a record whose
 /// summary changed while its reads did not.
 fn resummarized<| e>(
   queries: Map<Bytes, Query<| e>>,
+  run: Run,
   key: Bytes,
   r: Record,
-) -> Unit / {memo_keep.read, memo_keep.write, abort.raise} =
-  match summary_of(queries, r.reads) {
+  left: Int,
+) -> Run / {memo_keep.read, memo_keep.write, abort.raise} = {
+  let made = summary_of(queries, run, r.reads, left);
+  match made.summary {
     Some(s) -> if s != r.summary { memo_keep.adopt(key, { ..r, summary: s }) },
     None -> (),
-  }
+  };
+  made.run
+}
 
 /// Whether the record of the query `q` under `key` would be reused without its body running: the
 /// run settled it already, the pack below is valid as it is, its summary or else its reads are
@@ -978,13 +1033,20 @@ fn executed<| e>(
     };
     let s = ran.st;
     let d = digest_of(Some(ran.output));
-    let summary = if !q.summarized { [] }
-    else { match summary_of(queries, s.reads) { Some(made) -> made, None -> [] } };
-    let rec = { query: q.hash, input: input, reads: s.reads, output: d, summary: summary };
+    let summed = if !q.summarized { { run: s.run, summary: None } }
+    else { summary_of(queries, s.run, s.reads, left) };
+    let rec = {
+      query: q.hash,
+      input: input,
+      reads: s.reads,
+      output: d,
+      summary: match summed.summary { Some(made) -> made, None -> [] },
+    };
     // Only an answer kept is worth restoring when an edit is undone.
     if q.kept { kept_earlier(key, rec) };
     memo_keep.keep(key, rec, ran.output, q.kept);
-    { run: s.run, head: d }
+    // What a summary took from below the record it replaces no longer holds.
+    { run: { ..summed.run, below: summed.run.below.remove(key) }, head: d }
   }
 
 // --- Results computed over what a driver asked ------------------------------------------------
@@ -1705,6 +1767,27 @@ test "a summary moves with the definition of a query below it" {
   let moved = asked_over(redefined, only_record(first.world, top), b"top", b"a");
   assert_eq(moved.output, b"mid 4!");
   assert_eq(moved.executed, 2)
+}
+
+fn twice(input: Bytes) -> Bytes / {memo.read} =
+  memo.ask(b"top", input).concat(memo.ask(b"also", input))
+
+test "a summary taking what another took from below the same call is the one a run of its own makes" {
+  let q = summed().insert(b"also", { ..query(b"also", b"a1", topped), summarized: true }).insert(
+    b"twice",
+    query(b"twice", b"w1", twice),
+  );
+  let world = test_world([{ at: b"a", text: b"four" }]);
+  let summary = |w: World|
+    match w.held.records.get(key_of(query_of(q, b"also"), b"a")) {
+      Some(r) -> r.summary,
+      None -> panic("the record is kept"),
+    };
+  // `top` and `also` both read `middle`, which `twice` asks for through them in one run.
+  let shared = asked_over(q, world, b"twice", b"a");
+  let alone = asked_over(q, world, b"also", b"a");
+  assert_eq(summary(shared.world), summary(alone.world));
+  assert(summary(alone.world).contains(World(b"file", b"a", digest_of(Some(b"four")))))
 }
 
 // --- Packs ----------------------------------------------------------------------------------

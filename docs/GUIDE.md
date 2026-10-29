@@ -1479,14 +1479,14 @@ an ordinary name when no `{` follows it.
   deterministic test may contain one and its result can be cached.
 - If several branches fail, the leftmost failure is the block's, whichever happened first. A branch
   to its right may already have performed effects.
-- A block whose branches could reach a `handle` around it, or a `simulate` region (§9), runs its
-  branches in turn, with the same result. A handler clause that resumes in tail position, captures
-  nothing and has no handler variables does not force this: each branch gets its own copy on its
-  own thread. A block written directly in a definition's body is judged against that definition's
-  row, so a `handle` that handles none of the branches' effects does not force it. A block inside a
-  lambda or a `handle` body runs in turn under any `handle` around it. So does a block whose
-  branches hold a task or a continuation, and every block of a program started from another
-  program's branch, as each test in a `ply test` run is.
+- A block runs its branches in turn, with the same result, where they could reach a `simulate`
+  region (§9) or a `handle` with state. A `handle` has state where it has handler variables, or
+  where a clause the branches can reach captures a value, takes `resume`, answers a raise, or
+  performs through a `handle` with state. Every other `handle` answers each branch on the branch's
+  own thread. A block is judged by the handlers the branches' effects reach, so a `handle` that
+  handles none of them does not force it. A block also runs in turn where its branches hold a task
+  or a continuation, and in every program started from another program's branch, as each test in a
+  `ply test` run is.
 - `E0309`: two branches perform operations of one effect on one resource and one of them writes;
   or one branch calls a function value with an open row (a row variable) while another performs
   anything; or a branch opens a `simulate` region or performs a `task` operation, since a task
