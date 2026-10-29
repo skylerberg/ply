@@ -50,7 +50,8 @@ import compiler.emit.lower.base (Context, Lowering, Lowered, Target, ToCtor, ToB
                                  bound_as, done, emitted, opened, static_added, nested, unnested,
                                  with_lambda, started, read_taken, type_of, handed, read_noted,
                                  read_note, capture_note, frame_entered, taken_as, noted, none_held,
-                                 Holding, holding_laid, held_values, held_inside, continued)
+                                 Holding, holding_laid, held_values, held_inside, continued,
+                                 BoundClosures)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read, with_room, laid)
 import compiler.emit.lower.crossing (pending_raised)
@@ -105,6 +106,7 @@ pub fn context_of(setting: Setting, r: Root, body: Code) -> Context / {abort.rai
     instance: None,
     kept: [],
     performs: r.performs,
+    bound: bound_closures(body, root_text(root_name(r.key))),
   });
   { ..cx, tails: Restarts(walked_as(cx)) }
 }
@@ -379,14 +381,6 @@ fn prelude_walks() -> List<{ name: Bytes, by: Walking }> =
     { name: b"List::filter", by: Filtering },
     { name: b"Map::fold", by: EntryFolding },
   ]
-
-/// Whether `func` reads one of the prelude's walks.
-fn reads_walk(func: Code) -> Bool =
-  match func.node {
-    NDef(f) ->
-      prelude_walks().any(|w: { name: Bytes, by: Walking }| prelude_named(w.name) == f.full),
-    _ -> false,
-  }
 
 fn prelude_named(name: Bytes) -> Bytes = qualify(prelude_module(), name)
 
@@ -1091,17 +1085,16 @@ fn in_frame(
   lowered: List<Option<Arg>>,
   lender: Option<BoundLambda>,
   at: Span,
-) -> Opened / {abort.raise} =
-  match f {
-    None -> unreachable(b"a known lambda whose closure no variable holds"),
+) -> Opened / {abort.raise} = {
+  let typed = k.lambda.ty;
+  let sited = match lender {
+    Some(bl) -> emitted(st, Sited(Some({ root: bl.owner, base: bl.base }))),
+    None -> st,
+  };
+  let caps = match f {
     Some(closure) -> {
-      let typed = k.lambda.ty;
-      let sited = match lender {
-        Some(bl) -> emitted(st, Sited(Some({ root: bl.owner, base: bl.base }))),
-        None -> st,
-      };
       let held = captures_held(cx, k.lambda.body, k.lambda.captures);
-      let caps = range(0, k.lambda.captures.len()).fold(
+      range(0, k.lambda.captures.len()).fold(
         { st: sited, env: Map::new() },
         |acc: { st: Lowering, env: Map<Int, Arg> }, i: Int|
           match k.lambda.captures.at(i) {
@@ -1117,32 +1110,63 @@ fn in_frame(
               { st: read.st, env: acc.env.insert(c.dst, read.arg) }
             },
           },
-      );
-      let inner = {
-        ..cx,
-        answer_ty: typed.ret,
-        frame: k.lambda.at,
-        captured: k.lambda.captures.map(|c: Capture| c.dst),
-        // A lambda another root lent holds, as its own, the words a call of it here would hand it.
-        words: match lender { Some(_) -> lent_words(cx, closure), None -> cx.words },
-      };
-      let params = range(0, lowered.len()).fold(
-        { st: frame_entered(inner, caps.st, at), env: caps.env },
-        |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
-          match lowered.at(j) {
-            Some(Some(a)) -> {
-              let p = match typed.params.at(j) {
-                Some(t) -> taken_as(cx, { st: acc.st, arg: a }, t, at),
-                None -> { st: acc.st, arg: a },
-              };
-              { st: p.st, env: acc.env.insert(j, p.arg) }
-            },
-            _ -> acc,
-          },
-      );
-      { cx: inner, st: { ..params.st, env: params.env } }
+      )
     },
-  }
+    // A lambda that makes no closure runs on what its captures held where its `let` stands.
+    None -> match if lender == None { st.unmade.get(k.lambda.at.site) } else { None } {
+      Some(env) -> { st: sited, env: env },
+      None -> unreachable(b"a known lambda whose closure no variable holds"),
+    },
+  };
+  let inner = {
+    ..cx,
+    answer_ty: typed.ret,
+    frame: k.lambda.at,
+    captured: k.lambda.captures.map(|c: Capture| c.dst),
+    // A lambda another root lent holds, as its own, the words a call of it here would hand it.
+    words: match ((lender, f)) {
+      (Some(_), Some(closure)) -> lent_words(cx, closure),
+      _ -> cx.words,
+    },
+  };
+  let params = range(0, lowered.len()).fold(
+    { st: frame_entered(inner, caps.st, at), env: caps.env },
+    |acc: { st: Lowering, env: Map<Int, Arg> }, j: Int|
+      match lowered.at(j) {
+        Some(Some(a)) -> {
+          let p = match typed.params.at(j) {
+            Some(t) -> taken_as(cx, { st: acc.st, arg: a }, t, at),
+            None -> { st: acc.st, arg: a },
+          };
+          { st: p.st, env: acc.env.insert(j, p.arg) }
+        },
+        _ -> acc,
+      },
+  );
+  { cx: inner, st: { ..params.st, env: params.env } }
+}
+
+/// `st` past the `let` of lambda `l`, which makes no closure: what each of its captures holds here,
+/// read as a closure made here would read it, kept for its one call, which runs it in place in this
+/// frame.
+pub fn unmade_bound(cx: Context, st: Lowering, l: Lambda) -> Lowering / {abort.raise} =
+  l.captures.fold(
+    { ..captured(cx, st, l.captures, l.at), unmade: st.unmade.insert(l.at.site, Map::new()) },
+    |acc: Lowering, c: Capture|
+      match ((acc.env.get(c.src), acc.unmade.get(l.at.site))) {
+        (Some(a), Some(held)) ->
+          { ..acc, unmade: acc.unmade.insert(l.at.site, held.insert(c.dst, a)) },
+        _ ->
+          unreachable(
+            Bytes::concat_all([
+              b"a capture nothing bound where its lambda makes no closure: slot ",
+              ascii_of_int(c.src),
+              b", the lambda at ",
+              ascii_of_int(l.at.start),
+            ]),
+          ),
+      },
+  )
 
 /// The words a call of the function value parameter `closure` would hand it where `cx` stands:
 /// those of the row its type performs, each through the row variable it names or the innermost word
@@ -2246,21 +2270,208 @@ pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code = {
 type KnownLambda = { owner: Bytes, nth: Int }
 
 /// Each known lambda a call in `c` would run in place, once per such call: one called, and one a
-/// prelude walk is handed. A read of a known lambda holds its body again, which is not read here:
-/// the calls in it count where the lambda is written.
-fn in_place_sites(c: Code) -> List<KnownLambda> = {
-  let known = |x: Code| match x.node { NKnown(k) -> [{ owner: k.owner, nth: k.nth }], _ -> [] };
+/// prelude walk is handed.
+fn in_place_sites(c: Code) -> List<KnownLambda> =
+  bound_uses(c, []).reads.filter(|r: BoundRead| r.run).map(|r: BoundRead| r.lambda)
+
+/// What lies between a body's frame and code inside it: a lambda whose closure the body makes,
+/// by its text's site; one a walk or a step runs in place, which makes none; or code run elsewhere,
+/// a clause or a simulated, parallel or handled body.
+type Around = | Made(Int) | Ran | Elsewhere
+
+/// A read of a known lambda: which, its text's site, whether a call or a walk runs it there and
+/// whether in place, and what lies around the read.
+type BoundRead = { lambda: KnownLambda, site: Int, run: Bool, in_place: Bool, around: List<Around> }
+
+/// A `let` of a lambda the body knows, by its text's site, what lies around it, whether the lambda
+/// reads a function it captured, and whether a `handle` lies in its scope, whose code reads it as a
+/// plain closure, unknown to the reads here.
+type BoundLet = { site: Int, around: List<Around>, holds_function: Bool, handled_after: Bool }
+
+type BoundUses = { reads: List<BoundRead>, lets: List<BoundLet> }
+
+fn no_uses() -> BoundUses = { reads: [], lets: [] }
+
+fn uses_joined(a: BoundUses, b: BoundUses) -> BoundUses =
+  { reads: a.reads.concat(b.reads), lets: a.lets.concat(b.lets) }
+
+/// The reads of known lambdas in `c` and the `let`s of the lambdas it knows, `around` lying around
+/// it. A read of a known lambda holds its body again, which is not read here: the reads in it
+/// count where the lambda is written.
+fn bound_uses(c: Code, around: List<Around>) -> BoundUses =
   match c.node {
-    NKnown(_) -> [],
-    _ -> {
-      let here = match c.node {
-        NApp(a) ->
-          known(a.func).concat(if !reads_walk(a.func) { [] }
-          else { match a.args.at(a.args.len() - 1) { Some(x) -> known(x), None -> [] } }),
-        _ -> [],
+    NKnown(k) -> read_of(k, false, around),
+    NApp(a) -> {
+      let walk = walk_takes_of(a.func);
+      let last = a.args.len() - 1;
+      let called = match a.func.node {
+        NKnown(k) -> read_of(k, true, around),
+        _ -> bound_uses(a.func, around),
       };
-      code_parts(c).fold(here, |acc: List<KnownLambda>, x: Code| acc.concat(in_place_sites(x)))
+      a.args.fold({ uses: called, at: 0 }, |acc: { uses: BoundUses, at: Int }, x: Code| {
+        let here = match x.node {
+          NLambda(l) ->
+            bound_uses(
+              l.body,
+              around.push(
+                if (acc.at == last && walk == Some(l.params)) || (acc.at == 2 && step_of(a)) { Ran }
+                else { Made(l.at.site) },
+              ),
+            ),
+          NKnown(k) -> read_of(k, acc.at == last && walk == Some(k.lambda.params), around),
+          _ -> bound_uses(x, around),
+        };
+        { uses: uses_joined(acc.uses, here), at: acc.at + 1 }
+      }).uses
     },
+    NBlock(b) -> {
+      let handled = |s: CodeStmt|
+        match s {
+          CLet(l) -> has_handle(l.value),
+          CLetPat(l) -> has_handle(l.value),
+          CDo(d) -> has_handle(d.code),
+        };
+      let stmts = b.stmts.fold(
+        { uses: no_uses(), at: 0 },
+        |acc: { uses: BoundUses, at: Int }, s: CodeStmt| {
+          let here = match s {
+            CLet(l) -> match l.value.node {
+              NLambda(lam) ->
+                uses_joined(
+                  {
+                    reads: [],
+                    lets: if has_handle(lam.body) { [] } else {
+                      [
+                        {
+                          site: lam.at.site,
+                          around: around,
+                          holds_function: reads_captured_function(
+                            lam.body,
+                            lam.captures.map(|cap: Capture| cap.dst),
+                          ),
+                          handled_after: b.stmts.drop(acc.at + 1).any(handled)
+                            || (match b.tail { Some(t) -> has_handle(t), None -> false }),
+                        },
+                      ]
+                    },
+                  },
+                  bound_uses(lam.body, around.push(Made(lam.at.site))),
+                ),
+              // Another name for a known lambda reads nothing of it.
+              NKnown(_) -> no_uses(),
+              _ -> bound_uses(l.value, around),
+            },
+            CLetPat(l) -> bound_uses(l.value, around),
+            CDo(d) -> bound_uses(d.code, around),
+          };
+          { uses: uses_joined(acc.uses, here), at: acc.at + 1 }
+        },
+      ).uses;
+      match b.tail { Some(t) -> uses_joined(stmts, bound_uses(t, around)), None -> stmts }
+    },
+    NLambda(l) -> bound_uses(l.body, around.push(Made(l.at.site))),
+    NSimulate(_) ->
+      code_parts(c).fold(no_uses(), |acc: BoundUses, x: Code|
+        uses_joined(acc, bound_uses(x, around.push(Elsewhere)))),
+    NParallel(_) ->
+      code_parts(c).fold(no_uses(), |acc: BoundUses, x: Code|
+        uses_joined(acc, bound_uses(x, around.push(Elsewhere)))),
+    // `known_values` leaves a `handle` as it is: nothing in it is known.
+    NHandle(_) -> no_uses(),
+    _ ->
+      code_parts(c).fold(no_uses(), |acc: BoundUses, x: Code|
+        uses_joined(acc, bound_uses(x, around))),
+  }
+
+/// The read `k` is of a known lambda, which a call or a walk runs there where `run`.
+fn read_of(k: KnownRead, run: Bool, around: List<Around>) -> BoundUses =
+  {
+    reads: [
+      {
+        lambda: { owner: k.owner, nth: k.nth },
+        site: k.lambda.at.site,
+        run: run,
+        in_place: k.in_place,
+        around: around,
+      },
+    ],
+    lets: [],
+  }
+
+/// Whether `c`, code of a frame whose slots `slots` its lambda captured, reads one of them as a
+/// function, there or in a lambda inside it that captures it in turn.
+fn reads_captured_function(c: Code, slots: List<Int>) -> Bool =
+  slots.len() > 0
+    && (match c.node {
+      NVar(v) -> slots.contains(v.slot) && (match c.ty { TyFn(_) -> true, _ -> false }),
+      NKnown(k) -> slots.contains(k.slot),
+      NLambda(l) ->
+        reads_captured_function(
+          l.body,
+          l.captures.filter(|cap: Capture| slots.contains(cap.src)).map(|cap: Capture| cap.dst),
+        ),
+      NSimulate(x) ->
+        reads_captured_function(
+          x.body,
+          x.captures.filter(|cap: Capture| slots.contains(cap.src)).map(|cap: Capture| cap.dst),
+        ),
+      _ -> code_parts(c).any(|x: Code| reads_captured_function(x, slots)),
+    })
+
+/// How many parameters the function a prelude walk `func` names is called with; none for any other
+/// function.
+fn walk_takes_of(func: Code) -> Option<Int> =
+  match func.node {
+    NDef(f) -> match prelude_walks().find(|w: { name: Bytes, by: Walking }|
+        prelude_named(w.name) == f.full) {
+      Some(w) -> Some(walk_takes(w.by)),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+/// Whether the call `a` is an `iterate` that runs its step in place.
+fn step_of(a: { func: Code, args: List<Code>, row: Row }) -> Bool =
+  match a.func.node { NBuiltin(b) -> b.name == b"iterate" && stepped(a.args), _ -> false }
+
+/// How body `c` of root `owner` makes the closures of the lambdas its `let`s bind. One a frame's
+/// call runs in place makes none. One read only by calls and walks lies in the frame, where what
+/// lies between its `let` and each read is a walk or a step run in place, or a lambda whose closure
+/// makes none or lies in the frame too; an in-place run of it reads its captures out of it, so lies
+/// inside a lambda of its own, where the closure is that lambda's capture. One with a `handle` in
+/// its scope is allocated: the `handle`'s code reads it as a plain closure.
+pub fn bound_closures(c: Code, owner: Bytes) -> BoundClosures = {
+  let uses = bound_uses(c, []);
+  let own = uses.reads.filter(|r: BoundRead| r.lambda.owner == owner);
+  let reads_of = |l: BoundLet| own.filter(|r: BoundRead| r.site == l.site);
+  let between = |l: BoundLet, r: BoundRead| r.around.drop(l.around.len());
+  // A lambda that holds a function, another lambda or a parameter, runs it out of its closure.
+  let unmade = uses.lets.filter(|l: BoundLet|
+    !l.holds_function && !l.handled_after
+      && (match reads_of(l) {
+        [] -> true,
+        [r] -> r.run && r.in_place && between(l, r).len() == 0,
+        _ -> false,
+      })).map(|l: BoundLet| l.site);
+  let framed_after = |framed: List<Int>|
+    uses.lets.filter(|l: BoundLet|
+      !unmade.contains(l.site) && !l.handled_after
+        && reads_of(l).all(|r: BoundRead| {
+          let b = between(l, r);
+          r.run
+            && (!r.in_place
+            || b.any(|a: Around| match a { Made(s) -> !unmade.contains(s), _ -> false }))
+            && b.all(|a: Around|
+              match a {
+                Ran -> true,
+                Made(s) -> framed.contains(s) || unmade.contains(s),
+                Elsewhere -> false,
+              })
+        })).map(|l: BoundLet| l.site);
+  // A holder's `let` follows what it holds, so each pass settles one more step of the chain.
+  {
+    framed: range(0, uses.lets.len()).fold([], |framed: List<Int>, _: Int| framed_after(framed)),
+    unmade: unmade,
   }
 }
 
