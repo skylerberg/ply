@@ -3650,9 +3650,10 @@ When several modules declare the same name, put the file that declares the one y
 packages/cli/build.ply Made BuildOutput
 ```
 
-This renames `Made` in that file, in files that import it by name (`import build (Made)`), and
-where a file writes it after the module's name (`build::Made`). Other definitions named `Made`, and
-locals and fields spelled `Made`, stay as they are. A function of a type, `Stack::size`, is renamed
+This renames what that file binds under the name: its definition `Made`, wherever it is used (in
+files that import it by name, `import build (Made)`, and where a file writes it after the module's
+name, `build::Made`), and any local variable the file names `Made`. Other definitions named `Made`,
+and record fields spelled `Made`, stay as they are. A function of a type, `Stack::size`, is renamed
 by its own name (`size`), and follows its type when the type is renamed.
 
 To rename a module, give its file, or its directory ending in `/`, and the new name:
@@ -3681,9 +3682,10 @@ same alone. If a module's name changes, its file moves: renaming `held` to `cach
 `held/store.ply` to `cached/store.ply`.
 
 A name inside backticks in a comment is renamed too, where the file renames every use of that name
-the same way, so doc links stay correct. Text in strings is never changed. When a string contains a
-renamed name, `ply rename` prints a warning with the line, so you can decide whether to change it by
-hand.
+the same way, so doc links stay correct. Text in strings is never changed. `ply rename` prints a
+warning with the line for a string that is nothing but a renamed name (`"build.Made"`), and for a
+string holding a word that a line without a file, or `--words`, renames, so you can decide whether
+to change it by hand.
 
 With `--words`, each line renames a word inside names. Words are separated by `_` or by a capital
 letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon`, and `MAX_TY` to
@@ -3692,7 +3694,7 @@ letter. The line `ty type` changes `ty_vars` to `type_vars`, `TyCon` to `TypeCon
 `ply rename` changes nothing, and exits 2, if:
 
 - a path's program does not check before the renames;
-- a line names a file the paths do not hold, or a name that file does not declare;
+- a line names a file the paths do not hold, or a name that file does not bind;
 - a new name is a keyword or not a valid name;
 - a renamed name is declared with `extern`, so code outside Ply uses that name;
 - a module's file would be moved onto a file that already exists, or two files onto one;

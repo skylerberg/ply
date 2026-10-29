@@ -256,18 +256,35 @@ fn spelled_names(text: Bytes) -> List<{ start: Int, name: Bytes }> / {abort.rais
     is_ident_start(text.at(i)) && (i == 0 || !is_ident_continue(text.at(i - 1)))).map(|i: Int|
     { start: i, name: text.slice(i, text.skip(i, name_bytes())) })
 
-/// Each string in a file that holds a renamed name as a whole word, once per string and name.
+/// The name a string holds when it holds nothing but a name, or a path of names, the last one.
+fn whole_reference(t: Token) -> Option<Bytes> / {abort.raise} = {
+  let inside = match t.kind { StringLiteral(s) -> s, BytesLiteral(b) -> b, _ -> b"" };
+  let parts = joined(inside.split(b"::"), b".").split(b".");
+  if inside.len() > 0 && !parts.any(|p: Bytes| !is_name(p)) { parts.at(parts.len() - 1) }
+  else { None }
+}
+
+/// Each string in a file that holds a renamed name: one that is nothing but a name of `wholes`, or
+/// a path ending in one, and one holding a name of `words` as a whole word. Once per string and name.
 fn mentions_in(
   path: String,
   text: Bytes,
   tokens: List<Token>,
-  olds: Map<Bytes, Bool>,
+  wholes: Map<Bytes, Bool>,
+  words: Map<Bytes, Bool>,
 ) -> List<Mention> / {abort.raise} =
-  tokens.filter(is_text).fold([], |acc: List<Mention>, t: Token|
-    spelled_names(text.slice(t.start, t.end)).fold(
+  tokens.filter(is_text).fold([], |acc: List<Mention>, t: Token| {
+    let whole = match whole_reference(t) {
+      Some(name) -> if wholes.contains(name) { [{ start: 0, name: name }] } else { [] },
+      None -> [],
+    };
+    whole.concat(
+      spelled_names(text.slice(t.start, t.end)).filter(|n: { start: Int, name: Bytes }|
+        words.contains(n.name)),
+    ).fold(
       { seen: Map::new(), found: acc },
       |s: { seen: Map<Bytes, Bool>, found: List<Mention> }, n: { start: Int, name: Bytes }|
-        if !olds.contains(n.name) || s.seen.contains(n.name) { s } else {
+        if s.seen.contains(n.name) { s } else {
           {
             seen: s.seen.insert(n.name, true),
             found: s.found.push({
@@ -277,7 +294,8 @@ fn mentions_in(
             }),
           }
         },
-    ).found)
+    ).found
+  })
 
 /// Each string in a file that holds the full name of a module that moves.
 fn module_mentions(
@@ -509,18 +527,19 @@ type ModuleMove = { to: Rooted, name: Bytes }
 
 /// What the map comes to over the loaded programs: each definition's new name, by its namespace
 /// and program-wide name; each effect's operations' new names; each module's new name and file, by
-/// its name; and the functions the edited files declare, whose parameters a named argument names.
+/// its name; and the file that declares each function of the edited files, whose parameters a
+/// named argument names.
 type Renaming = {
   renames: Renames,
   definitions: Spaces,
   operations: Map<Bytes, Map<Bytes, Bytes>>,
   modules: Map<Bytes, ModuleMove>,
-  declared: Map<Bytes, Bool>,
+  declared: Map<Bytes, String>,
   refusals: List<Failure>,
 }
 
-/// `name`'s new name, declared in `file`: as a line naming the file renames it, else as the map
-/// renames every name spelled so.
+/// The new name of `name`, which `file` binds: as a line naming the file renames it, else as the
+/// map renames every name spelled so.
 fn simple_name(renames: Renames, file: String, name: Bytes) -> Bytes / {abort.raise} =
   match renames.defined.find(|d: Defined| d.file == file && d.old == name) {
     Some(d) -> d.new,
@@ -560,7 +579,7 @@ fn with_definitions(rn: Renaming, r: Read, decls: Decls) -> Renaming / {abort.ra
   namespaces().fold(rn, |acc: Renaming, namespace: Namespace|
     space(decls, namespace).fold(acc, |into: Renaming, d: Declared| {
       let new = declared_name(rn.renames, path, decls, d.name);
-      let seen = if namespace == ValueSpace { into.declared.insert(d.qualified, true) }
+      let seen = if namespace == ValueSpace { into.declared.insert(d.qualified, path) }
       else { into.declared };
       if new == d.name { { ..into, declared: seen } } else if r.externs.contains(d.name) {
         { ..into, declared: seen, refusals: into.refusals.push(extern_refusal(path, d.name)) }
@@ -692,7 +711,7 @@ fn qualifier_new(rn: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes
 
 fn reference_new(rn: Renaming, l: Loaded, r: Read, x: Reference) -> Bytes / {abort.raise} =
   match x.refers {
-    Local(_) -> renamed(rn.renames, x.name),
+    Local(_) -> simple_name(rn.renames, displayed(r.file.at), x.name),
     Definition(d) -> match in_space(rn.definitions, d.namespace).get(d.qualified) {
       Some(n) -> if member_of(x.name) != None { n } else { own_part(n) },
       None -> x.name,
@@ -728,7 +747,10 @@ fn member_new(rn: Renaming, r: Read, owner: Bytes, m: Member) -> Bytes / {abort.
         Some(c) -> c,
         None -> match a.callee { Definition(d) -> d.qualified, _ -> b"" },
       };
-      if rn.declared.contains(callee) { renamed(rn.renames, m.name) } else { m.name }
+      match rn.declared.get(callee) {
+        Some(file) -> simple_name(rn.renames, file, m.name),
+        None -> m.name,
+      }
     },
   }
 }
@@ -1038,13 +1060,16 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
   let missing = |path: String| { path: path, why: "is not among the files being renamed" };
   let declares = |x: { load: Loaded, read: Read }, name: Bytes|
     namespaces().any(|namespace: Namespace|
-      space(x.load.declarations.get(x.read.index), namespace).any(|d: Declared|
-        d.name == name || own_part(d.name) == name));
+        space(x.load.declarations.get(x.read.index), namespace).any(|d: Declared|
+          d.name == name || own_part(d.name) == name))
+      || x.read.entries.any(|e: Entry|
+        e.names.references.any(|r: Reference|
+          r.name == name && (match r.refers { Local(_) -> true, _ -> false })));
   renames.defined.fold([], |acc: List<Failure>, d: Defined|
     match file_of(d.file) {
       None -> acc.push(missing(d.file)),
       Some(x) -> if declares(x, d.old) { acc }
-      else { acc.push({ path: d.file, why: "declares no " ++ shown(d.old) }) },
+      else { acc.push({ path: d.file, why: "binds no " ++ shown(d.old) }) },
     }).concat(
     renames.operations.fold([], |acc: List<Failure>, o: OperationLine|
       match file_of(o.file) {
@@ -1099,6 +1124,8 @@ fn planned(
   let olds = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
     e.renamed.fold(acc, |into: Map<Bytes, Bool>, old: Bytes, _: List<Bytes>|
       if qualifiers.contains(old) { into } else { into.insert(old, true) }));
+  let words = olds.fold(Map::new(), |acc: Map<Bytes, Bool>, old: Bytes, _: Bool|
+    if renames.words || renames.names.contains(old) { acc.insert(old, true) } else { acc });
   let names = edited.fold(Map::new(), |acc: Map<Bytes, Bool>, e: Edited|
     e.edits.fold(acc, |into: Map<Bytes, Bool>, x: Edit|
       x.names.fold(into, |n: Map<Bytes, Bool>, name: Bytes| n.insert(name, true))));
@@ -1143,7 +1170,7 @@ fn planned(
     mentions: reads.fold([], |acc: List<Mention>, x: { load: Loaded, read: Read }| {
       let r = x.read;
       let tokens = lex(r.file.text).tokens;
-      acc.concat(mentions_in(displayed(r.file.at), r.file.text, tokens, olds)).concat(
+      acc.concat(mentions_in(displayed(r.file.at), r.file.text, tokens, olds, words)).concat(
         module_mentions(displayed(r.file.at), r.file.text, tokens, moved_names),
       )
     }),
