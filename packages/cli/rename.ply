@@ -28,7 +28,7 @@ import compiler.front.facts (Analysis)
 import compiler.front.seam (Refused, Analysed)
 import compiler.check.resolve.tables (Source, ParsedModule, Diag, Decls, Declared, Namespace,
                                       ValueSpace, TypeSpace, EffectSpace, SetSpace, space,
-                                      namespaces)
+                                      namespaces, qualify)
 import compiler.check.resolve.bindings (written, Written, Reference, Member, Refers, Local,
                                         Definition, Operation, Module, Unbound, FieldName,
                                         CalledName, ArgumentName)
@@ -265,7 +265,8 @@ fn whole_reference(t: Token) -> Option<Bytes> / {abort.raise} = {
 }
 
 /// Each string in a file that holds a renamed name: one that is nothing but a name of `wholes`, or
-/// a path ending in one, and one holding a name of `words` as a whole word. Once per string and name.
+/// a path ending in one; one that writes a name of `wholes` after `::`, as code in a string does;
+/// and one holding a name of `words` as a whole word. Once per string and name.
 fn mentions_in(
   path: String,
   text: Bytes,
@@ -278,9 +279,12 @@ fn mentions_in(
       Some(name) -> if wholes.contains(name) { [{ start: 0, name: name }] } else { [] },
       None -> [],
     };
+    let inside = text.slice(t.start, t.end);
     whole.concat(
-      spelled_names(text.slice(t.start, t.end)).filter(|n: { start: Int, name: Bytes }|
-        words.contains(n.name)),
+      spelled_names(inside).filter(|n: { start: Int, name: Bytes }|
+        words.contains(n.name)
+          || (wholes.contains(n.name) && n.start >= 2
+          && inside.slice(n.start - 2, n.start) == b"::")),
     ).fold(
       { seen: Map::new(), found: acc },
       |s: { seen: Map<Bytes, Bool>, found: List<Mention> }, n: { start: Int, name: Bytes }|
@@ -533,6 +537,7 @@ type ModuleMove = { to: Rooted, name: Bytes }
 type Renaming = {
   renames: Renames,
   definitions: Spaces,
+  qualified: Spaces,
   operations: Map<Bytes, Map<Bytes, Bytes>>,
   modules: Map<Bytes, ModuleMove>,
   declared: Map<Bytes, String>,
@@ -667,6 +672,7 @@ fn renaming_of(
     {
       renames: renames,
       definitions: no_spaces(),
+      qualified: no_spaces(),
       operations: Map::new(),
       modules: Map::new(),
       declared: Map::new(),
@@ -676,12 +682,47 @@ fn renaming_of(
       l.reads.fold(acc, |rn: Renaming, r: Read| {
         let decls = l.declarations.get(r.index);
         let named = with_operations(with_definitions(rn, r, decls), r, decls);
-        match package_of(r.file.at, libraries) {
-          Some(package) -> with_move(named, r, package),
-          None -> named,
-        }
+        with_qualified(
+          match package_of(r.file.at, libraries) {
+            Some(package) -> with_move(named, r, package),
+            None -> named,
+          },
+          r,
+          decls,
+        )
       }),
   )
+
+/// `rn` with the program-wide name each definition `r` declares has once the renames are made: its
+/// module's new name and its own. Two definitions of one name in a namespace are refused.
+fn with_qualified(rn: Renaming, r: Read, decls: Decls) -> Renaming / {abort.raise} = {
+  let module = match rn.modules.get(r.name) { Some(m) -> m.name, None -> r.name };
+  namespaces().fold(rn, |acc: Renaming, namespace: Namespace| {
+    let named = space(decls, namespace).fold(
+      { rn: acc, taken: Map::new() },
+      |x: { rn: Renaming, taken: Map<Bytes, Bool> }, d: Declared| {
+        let new = qualify(
+          module,
+          in_space(x.rn.definitions, namespace).get(d.qualified).unwrap_or(d.name),
+        );
+        {
+          rn: {
+            ..x.rn,
+            qualified: with_entry(x.rn.qualified, namespace, d.qualified, new),
+            refusals: if !x.taken.contains(new) { x.rn.refusals } else {
+              x.rn.refusals.push({
+                path: displayed(r.file.at),
+                why: "two of its definitions would be named " ++ shown(own_part(new)),
+              })
+            },
+          },
+          taken: x.taken.insert(new, true),
+        }
+      },
+    );
+    named.rn
+  })
+}
 
 // --- The edits ----------------------------------------------------------------
 
@@ -889,73 +930,45 @@ fn keyword_refusal(new: Bytes) -> Option<Failure> / {abort.raise} =
 
 // --- Checking the renamed program ---------------------------------------------
 
-/// How a program before the renames maps onto it after them: each module's index after, by its
-/// name before; each definition's program-wide name after, by its name before, as its module
-/// declares them in order; and each module whose declarations no longer pair.
-type Mapping = { modules: Map<Bytes, Int>, pairs: Spaces, failures: List<Failure> }
-
-fn paired(acc: Mapping, before: Decls, after: Decls, name: Bytes) -> Mapping / {abort.raise} =
-  namespaces().fold(acc, |m: Mapping, namespace: Namespace| {
-    let was = space(before, namespace);
-    let is = space(after, namespace);
-    if was.len() != is.len() {
-      {
-        ..m,
-        failures: m.failures.push({
-          path: String::of_bytes_lossy(name),
-          why: "two of its definitions would have the same name",
-        }),
-      }
-    } else {
-      range(0, was.len()).fold(m, |into: Mapping, k: Int|
-        {
-          ..into,
-          pairs: with_entry(into.pairs, namespace, was.get(k).qualified, is.get(k).qualified),
-        })
-    }
-  })
-
-fn mapping_of(l: Loaded, after: Analysis, texts: Map<Bytes, Source>) -> Mapping / {abort.raise} = {
+/// Each module's index in the program after the renames, by its name before them.
+fn modules_after(
+  l: Loaded,
+  after: Analysis,
+  texts: Map<Bytes, Source>,
+) -> Map<Bytes, Int> / {abort.raise} = {
   let index = range(0, after.mods.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     m.insert(after.mods.get(i).name, i));
-  range(0, l.names.len()).fold(
-    { modules: Map::new(), pairs: no_spaces(), failures: [] },
-    |acc: Mapping, i: Int| {
-      let old = l.names.get(i);
-      let new = match texts.get(old) { Some(t) -> t.name, None -> old };
-      match index.get(new) {
-        None -> acc,
-        Some(j) ->
-          paired(
-            { ..acc, modules: acc.modules.insert(old, j) },
-            l.declarations.get(i),
-            after.r.declarations.get(j),
-            old,
-          ),
-      }
-    },
-  )
+  l.names.fold(Map::new(), |acc: Map<Bytes, Int>, old: Bytes|
+    match index.get(match texts.get(old) { Some(t) -> t.name, None -> old }) {
+      Some(j) -> acc.insert(old, j),
+      None -> acc,
+    })
 }
 
 /// What `refers`, in the program before the renames, refers to after them.
-fn mapped(rn: Renaming, l: Loaded, m: Mapping, refers: Refers) -> Refers / {abort.raise} =
+fn mapped(
+  rn: Renaming,
+  l: Loaded,
+  modules: Map<Bytes, Int>,
+  refers: Refers,
+) -> Refers / {abort.raise} =
   match refers {
     Local(b) -> Local(b),
     Definition(d) ->
       Definition({
-        qualified: in_space(m.pairs, d.namespace).get(d.qualified).unwrap_or(d.qualified),
+        qualified: in_space(rn.qualified, d.namespace).get(d.qualified).unwrap_or(d.qualified),
         namespace: d.namespace,
       }),
     Operation(o) ->
       Operation({
-        effect: m.pairs.effects.get(o.effect).unwrap_or(o.effect),
+        effect: rn.qualified.effects.get(o.effect).unwrap_or(o.effect),
         name: match rn.operations.get(o.effect) {
           Some(ops) -> ops.get(o.name).unwrap_or(o.name),
           None -> o.name,
         },
       }),
     Module(i) -> match l.names.at(i) {
-      Some(name) -> match m.modules.get(name) { Some(j) -> Module(j), None -> Unbound },
+      Some(name) -> match modules.get(name) { Some(j) -> Module(j), None -> Unbound },
       None -> Unbound,
     },
     Unbound -> Unbound,
@@ -973,7 +986,7 @@ fn moved_failure(r: Read, x: Reference) -> Failure / {abort.raise} =
 fn entry_failures(
   rn: Renaming,
   l: Loaded,
-  m: Mapping,
+  modules: Map<Bytes, Int>,
   r: Read,
   imports: Bool,
   before: Entry,
@@ -984,17 +997,18 @@ fn entry_failures(
   let wrong = if imports {
     range(0, refs.len()).filter(|i: Int|
       now.names.references.at(i).map(|y: Reference| y.refers)
-        != Some(mapped(rn, l, m, refs.get(i).refers))).map(|i: Int| refs.get(i))
+        != Some(mapped(rn, l, modules, refs.get(i).refers))).map(|i: Int| refs.get(i))
   } else {
     let by_site = now.names.references.fold(Map::new(), |acc: Map<Int, Refers>, y: Reference|
       acc.insert(y.site, y.refers));
     refs.filter(|x: Reference|
-      !is_made(x.site) && by_site.get(x.site) != Some(mapped(rn, l, m, x.refers)))
+      !is_made(x.site) && by_site.get(x.site) != Some(mapped(rn, l, modules, x.refers)))
   };
   let was = r.calls.get(before.owner).unwrap_or(Map::new());
   let is = calls.get(now.owner).unwrap_or(Map::new());
   let retargeted = was.fold(0, |n: Int, site: Int, callee: Bytes|
-    if is.get(site) == Some(m.pairs.values.get(callee).unwrap_or(callee)) { n } else { n + 1 });
+    if is.get(site) == Some(rn.qualified.values.get(callee).unwrap_or(callee)) { n }
+    else { n + 1 });
   wrong.map(|x: Reference| moved_failure(r, x)).concat(if retargeted == 0 { [] } else {
     [
       {
@@ -1006,17 +1020,16 @@ fn entry_failures(
   })
 }
 
-/// What is wrong with `after`, the program renamed: a module whose declarations no longer pair with
-/// what it declared, or what is wrong with an item of an edited file.
+/// What is wrong with `after`, the program renamed: what is wrong with an item of an edited file.
 fn compared(
   rn: Renaming,
   l: Loaded,
   after: Analysis,
   texts: Map<Bytes, Source>,
 ) -> List<Failure> / {abort.raise} = {
-  let m = mapping_of(l, after, texts);
-  l.reads.fold(m.failures, |acc: List<Failure>, r: Read|
-    match ((m.modules.get(r.name), texts.get(r.name))) {
+  let modules = modules_after(l, after, texts);
+  l.reads.fold([], |acc: List<Failure>, r: Read|
+    match ((modules.get(r.name), texts.get(r.name))) {
       (Some(j), Some(t)) -> {
         let now = entries_of(after, j, t.name, numbered_module(parse(t.src).node));
         let calls = calls_of(after, j);
@@ -1024,7 +1037,9 @@ fn compared(
           acc.push({ path: displayed(r.file.at), why: "would no longer parse as it did" })
         } else {
           range(0, now.len()).fold(acc, |found: List<Failure>, k: Int|
-            found.concat(entry_failures(rn, l, m, r, k == 0, r.entries.get(k), now.get(k), calls)))
+            found.concat(
+              entry_failures(rn, l, modules, r, k == 0, r.entries.get(k), now.get(k), calls),
+            ))
         }
       },
       _ -> acc,
