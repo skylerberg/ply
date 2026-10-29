@@ -29,7 +29,12 @@ import compiler.check.types (atoms_insert, RNamed, RSingleton, RVar, RAny, Atom,
                              env_bind_global, env_remove_global, env_depth_of, generalize,
                              leaving_row, resolve_atom, atom_text, resource_text, type_text,
                              row_text, Printer, printer_new, printer_naming, print_ty, TyNominal,
-                             record_fields, at_arguments)
+                             record_fields, at_arguments, string_type, secret_type)
+import compiler.check.known (is_int, is_bool, is_char, is_float, is_string, is_bytes, is_unit,
+                             secret_item, task_answer, chan_item, task_type, is_integer_name,
+                             float_name, char_name, decimal_name, bool_name, string_name,
+                             bytes_name, unit_name, list_name, array_name, columns_name, map_name,
+                             hold_name, task_name, chan_name, secret_name)
 import compiler.check.termination (Callee, GroupMember, BuiltinCallee, ConstructorCallee,
                                    DefinedCallee, OtherCallee, Ending, Ends, Diverges, Summary,
                                    Verdict, verdict, unknown_summary)
@@ -77,13 +82,13 @@ import compiler.check.infer.names (Found, of_language_type, declared_value, writ
                                    simple_name_of, home_module)
 import compiler.check.infer.declarations (conv_type, conv_atom, op_named, duplicate,
                                           constraints_in_force, member_scheme, written_signature,
-                                          first_reason, witnessing)
+                                          first_reason, witnessing, scheduler_handle)
 import compiler.check.infer.expr (site_for, resolved_sites, site_among, report_unify, expect,
                                   note_typed, settle_bit_ops, settle_concats, settle_columns,
                                   hint_of, infer_whole, rows_in, scales_like, tag_rule,
-                                  settle_updates, is_int_name, group_member, expect_met,
-                                  refuse_growth, Taken, written_as, as_written, holds_fn,
-                                  atom_written, numeric_of, ordered_vars, resolve_op)
+                                  settle_updates, group_member, expect_met, refuse_growth, Taken,
+                                  written_as, as_written, holds_fn, atom_written, numeric_of,
+                                  ordered_vars, resolve_op)
 import compiler.check.owned
 import compiler.check.owned (Taking)
 import compiler.check.infer.resources (resource_type, release_atoms)
@@ -397,14 +402,14 @@ pub fn machine_value(t: Type, scheme: Scheme, objects: List<Bytes>) -> Option<Ma
       else { place_of(scheme.row_vars, r).map(MachineFunction) },
       None -> None,
     },
-    TyCon(c) -> if c.name == b"Secret" && c.args.len() == 1 { Some(MachineSecret(t)) }
-    else if ((c.name == b"Task" || c.name == b"Chan") && c.args.len() == 1)
-        || objects.contains(c.name) { Some(MachineObject(t)) }
-    else if c.args.len() > 0 { None }
-    else if c.name == b"Int" || c.name == b"Bool" || c.name == b"Char" { Some(MachineInt(t)) }
-    else if c.name == b"Float" { Some(MachineFloat) }
-    else if c.name == b"String" || c.name == b"Bytes" { Some(MachineText(t)) }
-    else if c.name == b"Unit" { Some(MachineUnit) } else {
+    TyCon(c) -> if secret_item(t) != None { Some(MachineSecret(t)) }
+    else if task_answer(t) != None || chan_item(t) != None || objects.contains(c.name) {
+      Some(MachineObject(t))
+    } else if c.args.len() > 0 { None }
+    else if is_int(t) || is_bool(t) || is_char(t) { Some(MachineInt(t)) }
+    else if is_float(t) { Some(MachineFloat) }
+    else if is_string(t) || is_bytes(t) { Some(MachineText(t)) }
+    else if is_unit(t) { Some(MachineUnit) } else {
       match width_named(c.name) {
         Some(w) -> if w.bits <= 64 { Some(MachineInt(t)) } else { None },
         None -> None,
@@ -463,7 +468,7 @@ fn laid_over_var(t: Type) -> Bool =
   match t {
     TyVar(_) -> false,
     TyFn(_) -> false,
-    TyCon(c) -> !(c.name == b"Task" || c.name == b"Chan") && c.args.any(names_var),
+    TyCon(c) -> !scheduler_handle(c.name) && c.args.any(names_var),
     _ -> names_var(t),
   }
 
@@ -3182,9 +3187,9 @@ pub fn settle_numerics(checker: Checker) -> Checker / {abort.raise} = {
           ),
       },
       TyCon(k) -> if k.args.len() != 0 { numeric_mismatch(c, entry, ty, what) }
-      else if is_int_name(k.name) || k.name == b"Float" { c }
+      else if is_integer_name(k.name) || k.name == float_name() { c }
       // Characters order by scalar value, which is what a range test such as `c >= 'a'` reads.
-      else if k.name == b"Char" && is_ordered(entry.op) { c } else if k.name == b"Decimal" {
+      else if k.name == char_name() && is_ordered(entry.op) { c } else if k.name == decimal_name() {
         if entry.op == b"div" {
           report_error_at(
             c,
@@ -4100,13 +4105,13 @@ fn ungeneratable_within(
 ) -> Option<Bytes> / {abort.raise} =
   match ty {
     TyVar(_) -> None,
-    TyCon(c) -> if c.name == b"Hold" {
+    TyCon(c) -> if c.name == hold_name() {
       Some(b"a `Hold` is created by `with_hold` and exists only inside its region")
-    } else if c.name == b"Task" {
+    } else if c.name == task_name() {
       Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it")
-    } else if c.name == b"Chan" {
+    } else if c.name == chan_name() {
       Some(b"a `Chan` is a key into the scheduler of the `simulate` region that made it")
-    } else if c.name == b"Secret" {
+    } else if c.name == secret_name() {
       Some(
         b"a `Secret` is a credential: quantifying over one would have the prover mint credentials and print them in counterexamples",
       )
@@ -4169,10 +4174,12 @@ pub fn not_identity(
 
 /// The scalars whose `==` is identity.
 fn compares_as_is(name: Bytes) -> Bool =
-  is_int_name(name) || [b"Bool", b"Char", b"String", b"Bytes", b"Unit"].contains(name)
+  is_integer_name(name)
+    || [bool_name(), char_name(), string_name(), bytes_name(), unit_name()].contains(name)
 
 /// The containers the language lays out, whose `==` compares what they hold and nothing else.
-fn holds_by_value(name: Bytes) -> Bool = [b"List", b"Array", b"Columns", b"Map"].contains(name)
+fn holds_by_value(name: Bytes) -> Bool =
+  [list_name(), array_name(), columns_name(), map_name()].contains(name)
 
 fn laid_out(name: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all([
@@ -4221,11 +4228,11 @@ fn not_identity_within(
     },
     TyCon(c) -> match stated(c.name) {
       Some(x) -> Some(x),
-      None -> if compares_as_is(c.name) { None } else if c.name == b"Float" {
+      None -> if compares_as_is(c.name) { None } else if c.name == float_name() {
         refused(
           b"`Float`'s `==` is IEEE 754's: `NaN != NaN`, and `0.0 == -0.0` though the two are different values",
         )
-      } else if c.name == b"Decimal" {
+      } else if c.name == decimal_name() {
         refused(b"a `Decimal` keeps its scale: `1.5m == 1.50m`, though the two print apart")
       } else if holds_by_value(c.name) { within(c.args, visiting, room) }
       // A sum holds itself only at its own parameters or at fixed types, so its arguments decide it.
@@ -4240,9 +4247,9 @@ fn not_identity_within(
             )
           },
           None ->
-            refused(if [b"Hold", b"Task", b"Chan"].contains(c.name) {
+            refused(if c.name == hold_name() || scheduler_handle(c.name) {
               Bytes::concat_all([b"a `", c.name, b"` names a location rather than a value"])
-            } else if c.name == b"Secret" {
+            } else if c.name == secret_name() {
               b"a `Secret` holds a credential nothing written in Ply reads"
             } else { laid_out(c.name) }),
         }
@@ -4752,7 +4759,7 @@ fn may_carry(def: FnDef) -> Bool = {
 fn type_may_carry(t: TypeExpr, names: List<Bytes>) -> Bool =
   match t {
     TCon(c) ->
-      ((!is_bare(c.name) || c.name.name.name == b"Map"
+      ((!is_bare(c.name) || c.name.name.name == map_name()
         || (builtin_type_arity(c.name.name.name) == None && !names.contains(c.name.name.name)))
         && c.args.any(|a: TypeExpr| writes_param(a, names)))
         || c.args.any(|a: TypeExpr| type_may_carry(a, names)),
@@ -4843,14 +4850,14 @@ test "an extern declares the words a call passes, its witnesses first, and wheth
 test "a shipped module's extern over machine types is called over machine words, and any other over its encoding" {
   let call = |src: Bytes|
     externs_in(b"std.native", src).map(|e: Extern| { words: e.words, call: e.call });
-  let int = TyCon({ name: b"Int", args: [] });
-  let text = TyCon({ name: b"String", args: [] });
+  let int = int_type();
+  let text = string_type();
   assert_eq(call(b"extern fn named(id: Int, sep: String) -> Bytes\n"), [
     {
       words: 3,
       call: Some({
         params: [MachineInt(int), MachineText(text)],
-        answer: MachineText(TyCon({ name: b"Bytes", args: [] })),
+        answer: MachineText(bytes_type()),
       }),
     },
   ]);
@@ -4865,13 +4872,12 @@ test "a shipped module's extern over machine types is called over machine words,
     { words: 0, call: Some({ params: [], answer: MachineInt(int) }) },
   ]);
   // A secret crosses as its handle, either way.
-  let secret = |of: Type| TyCon({ name: b"Secret", args: [of] });
   assert_eq(call(b"extern fn sealed(s: Secret<Bytes>) -> Secret<String>\n"), [
     {
       words: 1,
       call: Some({
-        params: [MachineSecret(secret(TyCon({ name: b"Bytes", args: [] })))],
-        answer: MachineSecret(secret(text)),
+        params: [MachineSecret(secret_type(bytes_type()))],
+        answer: MachineSecret(secret_type(text)),
       }),
     },
   ]);
@@ -4886,7 +4892,7 @@ test "a shipped module's extern over machine types is called over machine words,
       { words: 2, call: Some({ params: [MachineObject(kept)], answer: MachineHanded(0) }) },
     ],
   );
-  let task = TyCon({ name: b"Task", args: [TyVar(0)] });
+  let task = task_type(TyVar(0));
   assert_eq(call(b"extern fn started<a | e>(t: Task<a>, body: () -> Unit / e) -> Int\n"), [
     {
       words: 4,

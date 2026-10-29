@@ -8,14 +8,15 @@
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, TyCon)
+import compiler.check.known (none_ctor, some_ctor, ok_ctor, err_ctor)
 import compiler.emit.reps (laid_known)
 import compiler.emit.c (KNum, KInt, KBool, KFloat, KDec, KWide, ctype, width_index, int_lit)
 import compiler.emit.pieces (Piece, Text, spelled)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RFlat, RSlice, RToken,
-                          Var, Arg, AVar, AInt, AZero, Made, MCase, Path, PField, PArg, PCapture,
-                          PLeaf, PCase, PPlace, MRecord, FieldMade, Built, PPayload, RUnit, RSum,
-                          Convention, Given, Lent, Owned, rep_of_arg, rep_said, var_said, made_said,
-                          in_box)
+import compiler.emit.tir (lent_where, param_rep, param_lent, Rep, RInt, RBool, RNum, RFloat, RDec,
+                          RWide, RWord, RFlat, RSlice, RToken, Var, Arg, AVar, AInt, AZero, Made,
+                          MCase, Path, PField, PArg, PCapture, PLeaf, PCase, PPlace, MRecord,
+                          FieldMade, Built, PPayload, RUnit, RSum, Convention, Given, Lent, Owned,
+                          rep_of_arg, rep_said, var_said, made_said, in_box)
 import compiler.emit.layout (Laid, LWords, LRecord, LSum, LPlaced, SumLaid, P, S, U, Nullary,
                              Inline, Boxed, WordIs, LowBits, words, header_bytes, pointer_floor,
                              tag_bits, CaseArgs, sum_laid, record_laid, raw, FieldLaid)
@@ -110,11 +111,11 @@ pub fn word_as(w: Bytes, r: Rep) -> Bytes =
 pub fn head_types(c: Convention) -> { answer: Bytes, params: List<Bytes> } =
   {
     answer: c_type(c.answer),
-    params: range(0, c.reps.len()).fold([], |acc: List<Bytes>, i: Int|
-      match c.reps.at(i) {
+    params: range(0, c.params.len()).fold([], |acc: List<Bytes>, i: Int|
+      match param_rep(c, i) {
         Some(r) ->
           acc.concat(match passing(r) {
-            ByReference -> if c.params.at(i) == Some(Lent) { [b"const Word*"] } else { [b"Word*"] },
+            ByReference -> if param_lent(c, i) { [b"const Word*"] } else { [b"Word*"] },
             InWords -> c_types(r),
           }),
         None -> acc,
@@ -135,8 +136,8 @@ pub fn head_params(c: Convention) -> List<Bytes> = {
 /// `p<i>`, or its values `p<i>_<k>` (for one crossing by reference `p<i>`, the address of its
 /// words), then `o`, the answer's buffer, or `d`, its destination.
 pub fn head_names(c: Convention) -> List<Bytes> =
-  range(0, c.reps.len()).fold([], |acc: List<Bytes>, i: Int|
-    match c.reps.at(i) {
+  range(0, c.params.len()).fold([], |acc: List<Bytes>, i: Int|
+    match param_rep(c, i) {
       Some(r) -> {
         let name = b"p".concat(ascii_of_int(i));
         acc.concat(match passing(r) { ByReference -> [name], InWords -> part_names(name, r) })
@@ -1131,13 +1132,24 @@ fn pointer_laid() -> Laid = LWords([P])
 
 /// An `Option<Int>`'s layout, a tag word and the payload, and an `Option<String>`'s, its one word.
 fn tagged_sum() -> Rep =
-  RSum({ laid: sum_laid([sum_args([]), sum_args([LWords([raw()])])]), cases: [b"None", b"Some"] })
+  RSum({
+    laid: sum_laid([sum_args([]), sum_args([LWords([raw()])])]),
+    cases: [none_ctor(), some_ctor()],
+  })
 
 fn pointer_sum() -> Rep =
-  RSum({ laid: sum_laid([sum_args([]), sum_args([pointer_laid()])]), cases: [b"None", b"Some"] })
+  RSum({
+    laid: sum_laid([sum_args([]), sum_args([pointer_laid()])]),
+    cases: [none_ctor(), some_ctor()],
+  })
 
 fn given(reps: List<Rep>, answer: Rep) -> Convention =
-  { params: reps.map(|_: Rep| Given), reps: reps, answer: answer, destined: false, answered: Owned }
+  {
+    params: reps.map(|r: Rep| { handed: Given, rep: r }),
+    answer: answer,
+    destined: false,
+    answered: Owned,
+  }
 
 test "a small record crosses a call as its leaves, and answers its first leaf" {
   assert_eq(c_types(point()), [b"double", b"double"]);
@@ -1157,10 +1169,10 @@ test "a record wider than a call's registers crosses as the address of its words
   assert_eq(head_types(given([wide], RInt)), { answer: b"int64_t", params: [b"Word*"] });
   assert_eq(head_params(given([wide, RInt], RInt)), [b"Word* p0", b"int64_t p1"]);
   // One lent is only read: its words are the caller's.
-  assert_eq(head_params({ ..given([wide, RInt], RInt), params: [Lent, Lent] }), [
-    b"const Word* p0",
-    b"int64_t p1",
-  ]);
+  assert_eq(
+    head_params({ ..given([wide, RInt], RInt), params: lent_where([wide, RInt], [0, 1]) }),
+    [b"const Word* p0", b"int64_t p1"],
+  );
   // The callee opens the words into its own C values, a `Decimal` taking two: the last leaf lies at
   // word 8 of 9.
   let opened = Bytes::join(params_opened([b"p0", b"p1"], [wide, RInt]), b" ");
@@ -1209,7 +1221,7 @@ test "a sum of one word is its word form, and a wider one's words are counted ag
   assert_eq(dups_of(tagged_sum(), [b"t", b"n"]), b"");
   let either = RSum({
     laid: sum_laid([sum_args([LWords([raw()])]), sum_args([pointer_laid()])]),
-    cases: [b"Ok", b"Err"],
+    cases: [ok_ctor(), err_ctor()],
   });
   // Only the case laying the pointer counts it, told by the tag word.
   let either_dups = dups_of(either, [b"t", b"x"]);

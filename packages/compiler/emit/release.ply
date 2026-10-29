@@ -5,7 +5,13 @@
 
 import compiler.check.types (Type, TyCon, TyFn, TyVar, TyRecord, TyNominal, Field, record_fields,
                              field_get, spelled_type, int_type, unit_type, row_empty, label_type,
-                             over_arg)
+                             over_arg, string_type, list_type, option_type, map_type, secret_type,
+                             bool_type, float_type, decimal_type)
+import compiler.check.known
+import compiler.check.known (list_node_name, list_node_type, map_node_type, task_name, chan_name,
+                             secret_name, string_name, bytes_name, list_name, map_name, array_name,
+                             columns_name, hold_name, option_name, none_ctor, some_ctor, array_type,
+                             columns_type, task_type, chan_type, hold_type, width_type)
 import std.bytes (ascii_of_int)
 import compiler.syntax.parsing (dummy_span)
 import compiler.emit.layout (Laid, LWords, LRecord, LSum, LPlaced, FieldLaid, SumLaid, CaseLaid,
@@ -18,11 +24,12 @@ import compiler.emit.reps
 import compiler.emit.reps (Ctors, SumCtor, ctors_of)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Written, Drop, Dup, Copy, Share, Keep, written)
-import compiler.emit.tir (Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken, Leaf, AVar, AZero,
-                          AInt, Block, Inst, Let, Do, If, Case, Match, Loop, Handle, Return,
-                          Restart, Inc, Dec, Reset, Opened, Fn, Rooted, Plain, Handed, Given, Lent,
-                          Owned, Borrowed, Convention, Member, TTag, Val, LastOf, Walked, Lambda,
-                          Closure, no_links, counted, parts_of, stops_at, handle_stops, Call, Test)
+import compiler.emit.tir (handed_of, param_lent, Var, Rep, RWord, RInt, RSum, RFlat, RSlice, RToken,
+                          Leaf, AVar, AZero, AInt, Block, Inst, Let, Do, If, Case, Match, Loop,
+                          Handle, Return, Restart, Inc, Dec, Reset, Opened, Fn, Rooted, Plain,
+                          Handed, Given, Lent, Owned, Borrowed, Convention, Member, TTag, Val,
+                          LastOf, Walked, Lambda, Closure, no_links, counted, parts_of, stops_at,
+                          handle_stops, Call, Test)
 import compiler.emit.tir.handling (HandleSite, instance_alone)
 import compiler.emit.lower.held (held_with)
 import compiler.emit.answer (Need, Reads, Scalar, Layout, Exact)
@@ -182,7 +189,10 @@ fn pointer(ctors: Ctors, ty: Type, c: WordClass) -> Option<Counted> / {abort.rai
         TyNominal(_) -> Object(drop_of(ty)),
         TyCon(n) -> if laid_block(n.name) || ctors.sums.contains(n.name) { Object(drop_of(ty)) }
         else if runtime_handle(n.name) { RuntimeHandle }
-        else { refused(unknown_pointer(), ty) },
+        // `release_needs` keys every type a body lets go of exactly, so no build erases one.
+        else if ty == reps::word_type() {
+          refused(b"a word erased to `_`, which only a key no build makes lets go of", ty)
+        } else { refused(unknown_pointer(), ty) },
         _ -> refused(unknown_pointer(), ty),
       })
     },
@@ -198,31 +208,25 @@ fn function_valued(ty: Type) -> Bool = match ty { TyFn(_) -> true, _ -> reps::re
 /// Whether the type named `name` is a handle the runtime gives back, holding nothing emitted code
 /// lets go of.
 fn runtime_handle(name: Bytes) -> Bool =
-  [b"Task", b"Chan", b"Secret"].contains(name) || reps::scheduler_objects().contains(name)
+  [task_name(), chan_name(), secret_name()].contains(name)
+    || reps::scheduler_objects().contains(name)
 
 /// Whether blocks of the type named `name` hold what emitted code lays out and lets go of.
 fn laid_block(name: Bytes) -> Bool =
   [
-    b"String",
-    b"Bytes",
-    b"List",
+    string_name(),
+    bytes_name(),
+    list_name(),
     list_node_name(),
-    b"Map",
-    map_node_name(),
-    b"Array",
-    b"Columns",
-    b"Hold",
+    map_name(),
+    known::map_node_name(),
+    array_name(),
+    columns_name(),
+    hold_name(),
     reps::gathered_name(),
   ].contains(
     name,
   )
-
-/// The name the checker gives a node of a list's trie, an extern type the prelude declares: a
-/// program's own type of the bare name is another type.
-pub fn list_node_name() -> Bytes = b"std.prelude.ListNode"
-
-/// The name the checker gives a node of a map's tree, an extern type the prelude declares.
-pub fn map_node_name() -> Bytes = b"std.prelude.MapNode"
 
 /// The type variables letting go of a value of `ty` reads: each it names but under a function's type
 /// or a continuation's, which its descriptor lets go of, or a task's, a channel's or a secret's, which
@@ -265,9 +269,10 @@ fn entered(needs: List<Need>, f: Fn) -> List<Need> = {
   else { f.members.map(|m: Member| { params: m.params, conv: m.conv }) };
   held.fold(needs, |acc: List<Need>, h: { params: List<Var>, conv: Convention }| {
     let lent = range(0, h.params.len()).fold(acc, |a: List<Need>, k: Int|
-      match ((h.params.at(k), h.conv.params.at(k))) {
-        (Some(v), Some(Lent)) -> if counted(v.rep) { reading(a, v.ty, Exact) } else { a },
-        _ -> a,
+      match h.params.at(k) {
+        Some(v) -> if param_lent(h.conv, k) && counted(v.rep) { reading(a, v.ty, Exact) }
+        else { a },
+        None -> a,
       });
     match h.conv.answered {
       Owned -> lent,
@@ -614,16 +619,12 @@ fn named_opening(
   let lies = |t: Type| by_pointer(laid_of(t));
   let element = |t: Type| laid_parts(ctors, t, lies(t), 0);
   let stride = |t: Type| max(1, words(lies(t)));
-  if name == b"String" || name == b"Bytes" { StrBlock } else if name == b"List" {
-    ListOf({
-      node: drop_of(TyCon({ name: list_node_name(), args: args })),
-      item: element(arg(0)),
-      stride: stride(arg(0)),
-    })
+  if name == string_name() || name == bytes_name() { StrBlock } else if name == list_name() {
+    ListOf({ node: drop_of(list_node_type(arg(0))), item: element(arg(0)), stride: stride(arg(0)) })
   } else if name == list_node_name() {
     NodeOf({ node: drop_of(ty), item: element(arg(0)), stride: stride(arg(0)) })
-  } else if name == b"Map" { MapOf(drop_of(TyCon({ name: map_node_name(), args: args }))) }
-  else if name == map_node_name() {
+  } else if name == map_name() { MapOf(drop_of(map_node_type(arg(0), arg(1)))) }
+  else if name == known::map_node_name() {
     PairsOf({
       node: drop_of(ty),
       key: element(arg(0)),
@@ -631,12 +632,12 @@ fn named_opening(
       key_words: stride(arg(0)),
       value_words: stride(arg(1)),
     })
-  } else if name == b"Array" {
+  } else if name == array_name() {
     let l = by_pointer(laid_of(arg(0)));
     ArrayOf({ element: laid_parts(ctors, arg(0), l, 0), stride: max(1, words(l)) })
-  } else if name == b"Columns" {
-    ColumnsOf(field_types(arg(0)).map(|t: Type| drop_of(TyCon({ name: b"Array", args: [t] }))))
-  } else if name == b"Hold" {
+  } else if name == columns_name() {
+    ColumnsOf(field_types(arg(0)).map(|t: Type| drop_of(array_type(t))))
+  } else if name == hold_name() {
     // The checker lays a hold's region label first and the type it holds last.
     Holding({ at: hold_laid().held, ty: arg(args.len() - 1), rep: RWord })
   } else if runtime_handle(name) { HandleBlock } else if name == reps::gathered_name() {
@@ -900,7 +901,12 @@ fn plain(k: RootKey, param: Var, handed: Handed, body: List<Inst>) -> Fn =
     key: k,
     kind: Plain,
     params: [param],
-    conv: { params: [handed], reps: [param.rep], answer: RWord, destined: false, answered: Owned },
+    conv: {
+      params: [{ handed: handed, rep: param.rep }],
+      answer: RWord,
+      destined: false,
+      answered: Owned,
+    },
     answer_ty: plain_answer(k),
     body: body,
     lambdas: [],
@@ -1253,16 +1259,16 @@ fn table() -> Ctors =
     [],
     [],
     [],
-    Map::new().insert(b"Option", [
-      { name: b"None", index: 0, fields: [], params: [0] },
-      { name: b"Some", index: 1, fields: [TyVar(0)], params: [0] },
+    Map::new().insert(option_name(), [
+      { name: none_ctor(), index: 0, fields: [], params: [0] },
+      { name: some_ctor(), index: 1, fields: [TyVar(0)], params: [0] },
     ]).insert(b"m.L", [
       { name: b"m.Nil", index: 0, fields: [], params: [] },
       { name: b"m.Cons", index: 1, fields: [int_type(), named(b"m.L")], params: [] },
     ]).insert(b"m.E", [
       { name: b"m.Num", index: 0, fields: [int_type()], params: [] },
       { name: b"m.Add", index: 1, fields: [named(b"m.E"), named(b"m.E")], params: [] },
-      { name: b"m.Name", index: 2, fields: [named(b"String")], params: [] },
+      { name: b"m.Name", index: 2, fields: [string_type()], params: [] },
     ]).insert(b"m.A", [{ name: b"m.A", index: 0, fields: [named(b"m.B")], params: [] }]).insert(
       b"m.B",
       [
@@ -1271,7 +1277,7 @@ fn table() -> Ctors =
       ],
     ).insert(b"m.R", [
       { name: b"m.Done", index: 0, fields: [], params: [] },
-      { name: b"m.Text", index: 1, fields: [named(b"String")], params: [] },
+      { name: b"m.Text", index: 1, fields: [string_type()], params: [] },
     ]).insert(b"m.T", [
       { name: b"m.Hello", index: 0, fields: [], params: [] },
       { name: b"m.Bye", index: 1, fields: [], params: [] },
@@ -1296,19 +1302,9 @@ fn reaching() -> Ctors = {
     [],
     t.sums.insert(b"m.Job", [
       { name: b"m.Idle", index: 0, fields: [], params: [] },
-      {
-        name: b"m.Run",
-        index: 1,
-        fields: [TyCon({ name: b"Task", args: [int_type()] })],
-        params: [],
-      },
+      { name: b"m.Run", index: 1, fields: [task_type(int_type())], params: [] },
     ]).insert(b"m.Pair", [
-      {
-        name: b"m.Pair",
-        index: 0,
-        fields: [a, TyCon({ name: b"List", args: [b] })],
-        params: [0, 1],
-      },
+      { name: b"m.Pair", index: 0, fields: [a, list_type(b)], params: [0, 1] },
     ]).insert(b"m.Ghost", [
       { name: b"m.Ghost", index: 0, fields: [int_type()], params: [0] },
     ]).insert(b"m.Deep", [
@@ -1323,7 +1319,7 @@ fn reaching() -> Ctors = {
       {
         name: b"m.Again",
         index: 1,
-        fields: [named(b"m.Loop"), TyCon({ name: b"Hold", args: [int_type()] })],
+        fields: [named(b"m.Loop"), hold_type(label_type(b"r"), int_type())],
         params: [],
       },
     ]).insert(b"m.Act", [
@@ -1353,7 +1349,7 @@ fn reaching() -> Ctors = {
 test "a block reaching a handle, a hold or a function value at any depth is never kept, and only such a block" {
   let t = reaching();
   let con = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
-  let chan = con(b"Chan", [int_type()]);
+  let chan = chan_type(int_type());
   let fun = TyFn({
     kept: [],
     once: false,
@@ -1362,32 +1358,29 @@ test "a block reaching a handle, a hold or a function value at any depth is neve
     effects: row_empty(),
   });
   let never = [
-    con(b"List", [chan]),
-    con(b"Map", [named(b"String"), fun]),
-    con(b"Array", [TyRecord([{ name: b"s", ty: named(b"Secret") }])]),
-    con(b"Columns", [TyRecord([{ name: b"f", ty: fun }, { name: b"n", ty: int_type() }])]),
-    con(b"Option", [con(b"Option", [con(b"Task", [int_type()])])]),
+    list_type(chan),
+    map_type(string_type(), fun),
+    array_type(TyRecord([{ name: b"s", ty: secret_type(string_type()) }])),
+    columns_type(TyRecord([{ name: b"f", ty: fun }, { name: b"n", ty: int_type() }])),
+    option_type(option_type(task_type(int_type()))),
     named(b"m.Job"),
-    con(b"m.Pair", [chan, named(b"String")]),
-    con(b"m.Pair", [int_type(), con(b"List", [chan])]),
+    con(b"m.Pair", [chan, string_type()]),
+    con(b"m.Pair", [int_type(), list_type(chan)]),
     named(b"m.Deep"),
     named(b"m.Loop"),
     named(b"m.Act"),
-    con(b"Hold", [int_type()]),
-    TyRecord([
-      { name: b"a", ty: named(b"m.E") },
-      { name: b"b", ty: con(b"List", [named(b"m.Job")]) },
-    ]),
+    hold_type(label_type(b"r"), int_type()),
+    TyRecord([{ name: b"a", ty: named(b"m.E") }, { name: b"b", ty: list_type(named(b"m.Job")) }]),
   ];
   // A phantom parameter holds nothing, and a `Columns` only what its records' fields hold.
   let kept = [
-    named(b"String"),
-    con(b"List", [int_type()]),
-    con(b"Columns", [TyRecord([{ name: b"n", ty: int_type() }])]),
-    con(b"Option", [named(b"String")]),
+    string_type(),
+    list_type(int_type()),
+    columns_type(TyRecord([{ name: b"n", ty: int_type() }])),
+    option_type(string_type()),
     named(b"m.E"),
     named(b"m.A"),
-    con(b"m.Pair", [int_type(), named(b"String")]),
+    con(b"m.Pair", [int_type(), string_type()]),
     con(b"m.Ghost", [chan]),
   ];
   let wrong = |tys: List<Type>, expected: Bool|
@@ -1499,14 +1492,11 @@ fn expr_laid() -> SumLaid = {
 
 fn point() -> Type =
   TyRecord([
-    { name: b"a", ty: named(b"String") },
+    { name: b"a", ty: string_type() },
     { name: b"b", ty: int_type() },
     {
       name: b"c",
-      ty: TyRecord([
-        { name: b"x", ty: applied(b"List", [int_type()]) },
-        { name: b"y", ty: int_type() },
-      ]),
+      ty: TyRecord([{ name: b"x", ty: list_type(int_type()) }, { name: b"y", ty: int_type() }]),
     },
   ])
 
@@ -1518,22 +1508,23 @@ fn laid_for(ty: Type) -> Laid / {abort.raise} =
   if ty == point() { point_laid() }
   else if ty == named(b"m.L") { LSum(list_laid()) }
   else if ty == named(b"m.E") { LSum(expr_laid()) }
-  else if ty == applied(b"Option", [named(b"String")]) { LSum(maybe_laid()) }
+  else if ty == option_type(string_type()) { LSum(maybe_laid()) }
   else if ty == named(b"m.A") { LSum(alone_laid()) }
   else if ty == named(b"m.B") { LSum(more_laid()) }
   else if ty == named(b"m.R") { LSum(reply_laid()) }
   else if ty == named(b"m.T") { LSum(todo_laid()) }
   else if ty == named(b"m.Hue") { LSum(hue_laid()) }
-  else if ty == applied(b"Option", [named(b"m.R")]) { LSum(maybe_of(reply_laid())) }
-  else if ty == applied(b"Option", [named(b"m.Hue")]) { LSum(maybe_of(hue_laid())) }
-  else if ty == int_type() || ty == named(b"Bool") { LWords([raw()]) }
-  else if ty == named(b"Float") { LWords([raw()]) }
-  else if ty == named(b"U128") || ty == named(b"Decimal") { LWords([raw(), raw()]) }
-  else { LWords([P]) }
+  else if ty == option_type(named(b"m.R")) { LSum(maybe_of(reply_laid())) }
+  else if ty == option_type(named(b"m.Hue")) { LSum(maybe_of(hue_laid())) }
+  else if ty == int_type() || ty == bool_type() { LWords([raw()]) }
+  else if ty == float_type() { LWords([raw()]) }
+  else if ty == width_type({ bits: 128, signed: false }) || ty == decimal_type() {
+    LWords([raw(), raw()])
+  } else { LWords([P]) }
 
-fn form_for(ty: Type) -> WordForm =
-  if ty == int_type() || ty == named(b"Bool") || ty == named(b"Float") { Bits }
-  else if ty == named(b"U128") || ty == named(b"Decimal") { RuntimeBox }
+fn form_for(ty: Type) -> WordForm / {abort.raise} =
+  if ty == int_type() || ty == bool_type() || ty == float_type() { Bits }
+  else if ty == width_type({ bits: 128, signed: false }) || ty == decimal_type() { RuntimeBox }
   else if ty == point() { Box(3) }
   else if ty == named(b"m.E") { Box(2) }
   else { Itself }
@@ -1549,42 +1540,44 @@ test "a record counts its pointers at their words, a record held in it at its ow
     effects: row_empty(),
   });
   assert_eq(laid_parts(table(), point(), point_laid(), 0), [
-    object(named(b"String"), 0),
-    object(applied(b"List", [int_type()]), 2),
+    object(string_type(), 0),
+    object(list_type(int_type()), 2),
   ]);
   assert_eq(laid_parts(table(), fn_ty, LWords([P]), 3), [
     WordAt({ at: 3, masked: false, how: Through }),
   ]);
-  assert_eq(laid_parts(table(), applied(b"Task", [int_type()]), LWords([P]), 0), [
+  assert_eq(laid_parts(table(), task_type(int_type()), LWords([P]), 0), [
     WordAt({ at: 0, masked: false, how: RuntimeHandle }),
   ]);
   // What a `parallel` block gathers is a box let go of at its drop root, which opens it as each
   // answer's word form: an `Int` counts nothing there.
-  let gathered = reps::gathered_of([named(b"String"), int_type()]);
+  let gathered = reps::gathered_of([string_type(), int_type()]);
   assert_eq(laid_parts(table(), gathered, LWords([P]), 0), [object(gathered, 0)]);
   assert_eq(
     opening_with(table(), gathered, RWord, laid_for, form_for),
-    InBox({ parts: [{ at: 0, ty: named(b"String"), rep: RWord }], words: 2 }),
+    InBox({ parts: [{ at: 0, ty: string_type(), rep: RWord }], words: 2 }),
   );
   assert_eq(laid_parts(table(), int_type(), LWords([raw()]), 0), []);
   // A pointer of a type that lays no block, sum or handle is Ply's own failure, not guessed at.
-  let said = handle {
-    match laid_parts(table(), named(b"m.Opaque"), LWords([P]), 0) { _ -> b"" }
-  } with {
-    abort.raise(m) -> Bytes::of_string(m),
-  };
-  assert(said.contains(unknown_pointer()), None)
+  let said = |t: Type|
+    handle {
+      match laid_parts(table(), t, LWords([P]), 0) { _ -> b"" }
+    } with {
+      abort.raise(m) -> Bytes::of_string(m),
+    };
+  assert(said(named(b"m.Opaque")).contains(unknown_pointer()), None);
+  assert(said(reps::word_type()).contains(b"only a key no build makes"), None)
 }
 
 test "a sum of one word goes to its own drop root, but as its payload where one case lays a pointer alone" {
-  let maybe = applied(b"Option", [named(b"String")]);
+  let maybe = option_type(string_type());
   let l = named(b"m.L");
   let sum_word = |root: Type| [WordAt({ at: 0, masked: false, how: SumWord(drop_of(root)) })];
-  assert_eq(laid_parts(table(), maybe, LSum(maybe_laid()), 0), [object(named(b"String"), 0)]);
+  assert_eq(laid_parts(table(), maybe, LSum(maybe_laid()), 0), [object(string_type(), 0)]);
   // Nullary values past 0 are no pointers, so the payload's root is reached past the floor alone.
   assert_eq(
     laid_parts(table(), maybe, LSum({ ..maybe_laid(), classes: [S(3)] }), 0),
-    sum_word(named(b"String")),
+    sum_word(string_type()),
   );
   assert_eq(laid_parts(table(), l, LSum(list_laid()), 0), sum_word(l));
   assert_eq(laid_parts(table(), l, LSum({ ..list_laid(), classes: [P] }), 1), [object(l, 1)]);
@@ -1599,7 +1592,7 @@ test "a wider sum is let go of by its case, a boxed case at its box's own root" 
     sum: expr_laid(),
     cases: [
       { case: 1, parts: [WordAt({ at: 1, masked: false, how: CaseBox({ sum: e, case: 1 }) })] },
-      { case: 2, parts: [object(named(b"String"), 1)] },
+      { case: 2, parts: [object(string_type(), 1)] },
     ],
   });
   assert_eq(laid_parts(table(), e, LSum(expr_laid()), 0), [by_case]);
@@ -1618,16 +1611,13 @@ test "a stripped word of a case's payload is read with its tag bits clear" {
       },
     ],
   };
-  let maybe = applied(b"Option", [named(b"String")]);
+  let maybe = option_type(string_type());
   assert_eq(laid_parts(table(), maybe, LSum(laid), 0), [
     ByCase({
       at: 0,
       sum: laid,
       cases: [
-        {
-          case: 1,
-          parts: [WordAt({ at: 1, masked: true, how: Object(drop_of(named(b"String"))) })],
-        },
+        { case: 1, parts: [WordAt({ at: 1, masked: true, how: Object(drop_of(string_type())) })] },
       ],
     }),
   ])
@@ -1636,22 +1626,34 @@ test "a stripped word of a case's payload is read with its tag bits clear" {
 test "a word form counts as its type lays it in one word, a scalar's box by its size" {
   let parts = |ty: Type| form_parts_of(table(), ty, form_for(ty), laid_for(ty));
   // A scalar of one word is its own bits, which count nothing.
-  assert_eq([int_type(), named(b"Bool"), named(b"Float")].map(parts), [[], [], []]);
-  assert_eq(parts(named(b"U128")), [
-    WordAt({ at: 0, masked: false, how: ScalarWord({ ty: named(b"U128"), words: 2 }) }),
+  assert_eq([int_type(), bool_type(), float_type()].map(parts), [[], [], []]);
+  assert_eq(parts(width_type({ bits: 128, signed: false })), [
+    WordAt({
+      at: 0,
+      masked: false,
+      how: ScalarWord({ ty: width_type({ bits: 128, signed: false }), words: 2 }),
+    }),
   ]);
   // A 128-bit width a record holds is its two words, which count nothing.
-  assert_eq(laid_parts(table(), named(b"U128"), reps::laid(table(), named(b"U128")), 0), []);
+  assert_eq(
+    laid_parts(
+      table(),
+      width_type({ bits: 128, signed: false }),
+      reps::laid(table(), width_type({ bits: 128, signed: false })),
+      0,
+    ),
+    [],
+  );
   // A descriptor counts and lets go of such a word form through the head's functions, of a size the
   // head defines one for; a string's through its type's roots.
   assert_eq(
     [
       int_type(),
-      named(b"Float"),
-      named(b"Decimal"),
-      named(b"U64"),
-      named(b"U128"),
-      named(b"Bool"),
+      float_type(),
+      decimal_type(),
+      width_type({ bits: 64, signed: false }),
+      width_type({ bits: 128, signed: false }),
+      bool_type(),
     ].map(|t: Type| word_form_heads(table(), t)),
     [
       Some(immediate_heads()),
@@ -1662,10 +1664,10 @@ test "a word form counts as its type lays it in one word, a scalar's box by its 
       Some(immediate_heads()),
     ],
   );
-  assert_eq(word_form_heads(table(), named(b"String")), None);
+  assert_eq(word_form_heads(table(), string_type()), None);
   assert_eq(scalar_box_words(), [2]);
   assert_eq(parts(point()), [object(point(), 0)]);
-  assert_eq(parts(named(b"String")), [object(named(b"String"), 0)])
+  assert_eq(parts(string_type()), [object(string_type(), 0)])
 }
 
 test "a flat record's leaves count by their fields' types" {
@@ -1676,9 +1678,9 @@ test "a flat record's leaves count by their fields' types" {
     { name: b"c.y", rep: RInt },
   ]);
   assert_eq(held_parts_with(table(), point(), flat, laid_for, form_for), [
-    [object(named(b"String"), 0)],
+    [object(string_type(), 0)],
     [],
-    [object(applied(b"List", [int_type()]), 0)],
+    [object(list_type(int_type()), 0)],
     [],
   ])
 }
@@ -1757,8 +1759,7 @@ test "a box's drop root opens it, binding its counted words, and lets go of each
     let f = generated_here(drop_of(point()));
     assert_eq(f.kind, Plain);
     assert_eq(f.conv, {
-      params: [Given],
-      reps: [RWord],
+      params: [{ handed: Given, rep: RWord }],
       answer: RWord,
       destined: false,
       answered: Owned,
@@ -1793,7 +1794,7 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
           c.on.ty == reply && c.test == TTag([b"m.Done", b"m.Text"])
             && dropping(
               c.arms.fold([], |acc: Block, a: { when: Int, body: Block }| acc.concat(a.body)),
-            ).opened.any(|v: Var| v.ty == named(b"String")),
+            ).opened.any(|v: Var| v.ty == string_type()),
         _ -> false,
       });
   // A sum's case holding a sum.
@@ -1816,7 +1817,7 @@ test "a sum of one word whose case lays a sum of one word in place lets go of it
     let f = generated_here(drop_of(applied(b"Option", [reply])));
     match arm_of(f, 1) { Some(a) -> assert(by_its_case(a.body), None), None -> assert(false, None) }
   };
-  let hues = applied(b"Option", [named(b"m.Hue")]);
+  let hues = option_type(named(b"m.Hue"));
   assert_eq(case_blocks(table(), hues, maybe_of(hue_laid())), []);
   // A walk of the outer sum goes through the inner sum's own root.
   assert_eq(
@@ -1845,7 +1846,7 @@ test "a boxed case's drop root holds its sums whole, and a sum of its type there
 }
 
 test "a container's drop root opens it whole, and its opening names its parts' roots" {
-  let list = applied(b"List", [named(b"String")]);
+  let list = list_type(string_type());
   let o = { id: 0, ty: list, rep: RWord };
   // It opens the list whole, the opening walking its items, and binds and lets go of no word itself.
   {
@@ -1857,31 +1858,31 @@ test "a container's drop root opens it whole, and its opening names its parts' r
   assert_eq(
     opened(list),
     ListOf({
-      node: drop_of(applied(list_node_name(), [named(b"String")])),
-      item: [object(named(b"String"), 0)],
+      node: drop_of(list_node_type(string_type())),
+      item: [object(string_type(), 0)],
       stride: 1,
     }),
   );
   // The prelude's node, as the checker names it, opens as a node and is let go of at its own root.
-  let node = applied(list_node_name(), [named(b"String")]);
+  let node = list_node_type(string_type());
   assert_eq(
     opened(node),
-    NodeOf({ node: drop_of(node), item: [object(named(b"String"), 0)], stride: 1 }),
+    NodeOf({ node: drop_of(node), item: [object(string_type(), 0)], stride: 1 }),
   );
   assert_eq(laid_parts(table(), node, LWords([P]), 0), [object(node, 0)]);
-  let pairs = applied(map_node_name(), [int_type(), named(b"String")]);
+  let pairs = map_node_type(int_type(), string_type());
   assert_eq(laid_parts(table(), pairs, LWords([P]), 0), [object(pairs, 0)]);
   assert_eq(
-    opened(applied(b"Hold", [named(b"String")])),
-    Holding({ at: 1, ty: named(b"String"), rep: RWord }),
+    opened(applied(b"Hold", [string_type()])),
+    Holding({ at: 1, ty: string_type(), rep: RWord }),
   );
   // A hold as the checker types it, its region's label first: it holds what its last argument is.
   assert_eq(
-    opened(applied(b"Hold", [label_type(b"r"), named(b"String")])),
-    Holding({ at: 1, ty: named(b"String"), rep: RWord }),
+    opened(hold_type(label_type(b"r"), string_type())),
+    Holding({ at: 1, ty: string_type(), rep: RWord }),
   );
-  assert_eq(opened(named(b"Decimal")), ScalarBox(2));
-  assert_eq(opened(named(b"U128")), ScalarBox(2));
+  assert_eq(opened(decimal_type()), ScalarBox(2));
+  assert_eq(opened(width_type({ bits: 128, signed: false })), ScalarBox(2));
   assert_eq(
     opened(named(b"m.E")),
     InBox({
@@ -1894,11 +1895,11 @@ test "a container's drop root opens it whole, and its opening names its parts' r
 test "a word a block holds is its type's word form, a function's or a continuation's let go of through its descriptor" {
   let stored = |ty: Type| stored_parts(table(), { at: 1, ty: ty, rep: RWord });
   let word = |how: Counted| [WordAt({ at: 0, masked: false, how: how })];
-  let record = TyRecord([{ name: b"a", ty: named(b"String") }, { name: b"b", ty: int_type() }]);
+  let record = TyRecord([{ name: b"a", ty: string_type() }, { name: b"b", ty: int_type() }]);
   assert_eq(stored(int_type()), []);
   assert_eq(stored(record), [object(record, 0)]);
-  assert_eq(stored(named(b"Bool")), []);
-  assert_eq(stored(named(b"String")), [object(named(b"String"), 0)]);
+  assert_eq(stored(bool_type()), []);
+  assert_eq(stored(string_type()), [object(string_type(), 0)]);
   assert_eq(
     stored(
       TyFn({ kept: [], once: false, params: [int_type()], ret: int_type(), effects: row_empty() }),
@@ -1922,7 +1923,7 @@ test "a program's own `ListNode` is its own type, released as its declaration la
     [],
     [],
     Map::new().insert(b"m.ListNode", [
-      { name: b"m.Node", index: 0, fields: [named(b"String")], params: [] },
+      { name: b"m.Node", index: 0, fields: [string_type()], params: [] },
       { name: b"m.End", index: 1, fields: [], params: [] },
     ]),
   );
@@ -1966,7 +1967,7 @@ test "a wide sum laid by the layout module is let go of by case, its boxed case 
           assert_eq(
             c.cases.map(|k: { case: Int, parts: List<Part> }|
               k.parts.map(|p: Part| match p { WordAt(w) -> w.how, ByCase(_) -> Through })),
-            [[CaseBox({ sum: e, case: 1 })], [Object(drop_of(named(b"String")))]],
+            [[CaseBox({ sum: e, case: 1 })], [Object(drop_of(string_type()))]],
           );
           // Its box's drop root holds its sums whole, as their own type lays them.
           {
@@ -1988,7 +1989,7 @@ test "a wide sum laid by the layout module is let go of by case, its boxed case 
 }
 
 test "copy, share and keep roots walk a block, a sum of one word through its word, a boxed case its box" {
-  let node = applied(list_node_name(), [named(b"String")]);
+  let node = list_node_type(string_type());
   let l = named(b"m.L");
   let e = named(b"m.E");
   // What the root walks, as its type and how it holds it, and how: the value it answers.
@@ -2005,8 +2006,7 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
   {
     let f = generated_here(root_of(Copy, node));
     assert_eq(f.conv, {
-      params: [Given],
-      reps: [RWord],
+      params: [{ handed: Given, rep: RWord }],
       answer: RWord,
       destined: false,
       answered: Owned,
@@ -2015,7 +2015,7 @@ test "copy, share and keep roots walk a block, a sum of one word through its wor
   };
   {
     let f = generated_here(root_of(Share, l));
-    assert_eq(f.conv.params, [Lent]);
+    assert_eq(handed_of(f.conv), [Lent]);
     assert_eq(f.conv.answer, RInt);
     assert_eq(walk(f), Some({ ty: l, rep: sum_rep(table(), l, list_laid()), op: Share }))
   };
@@ -2037,12 +2037,12 @@ test "a dup root counts its word form once more and answers it; a release root l
   {
     let f = generated_here(k(Dup));
     let o = f.params.get(0);
-    assert_eq(f.conv.params, [Lent]);
+    assert_eq(handed_of(f.conv), [Lent]);
     assert(f.body.contains(Inc({ var: o, n: 1 })) && f.body.contains(Return(AVar(o))), None)
   };
   {
     let f = generated_here(k(keys::Release));
-    assert_eq(f.conv.params, [Given]);
+    assert_eq(handed_of(f.conv), [Given]);
     assert_eq(dropping(f.body).decs, f.params)
   }
 }
@@ -2050,13 +2050,13 @@ test "a dup root counts its word form once more and answers it; a release root l
 test "a body reads exactly each variable it lets go of a value of, and the layout of each it counts" {
   let at = |name: Bytes, args: List<Type>| TyCon({ name: name, args: args });
   let local = |id: Int, ty: Type| { id: id, ty: ty, rep: RWord };
-  let list = local(0, at(b"List", [TyVar(0)]));
+  let list = local(0, list_type(TyVar(0)));
   let counted_once = local(1, TyVar(1));
   let function = local(
     2,
     TyFn({ kept: [], once: false, params: [TyVar(5)], ret: TyVar(6), effects: row_empty() }),
   );
-  let task = local(3, at(b"Task", [TyVar(7)]));
+  let task = local(3, task_type(TyVar(7)));
   let held = local(4, at(b"Hold", [TyVar(2)]));
   let failing = local(5, TyVar(3));
   let token = { id: 6, ty: TyVar(8), rep: RToken(2) };
@@ -2065,7 +2065,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
     key: keys::Named(b"m.f"),
     kind: Rooted,
     params: [],
-    conv: { params: [], reps: [], answer: RInt, destined: false, answered: Owned },
+    conv: { params: [], answer: RInt, destined: false, answered: Owned },
     answer_ty: int_type(),
     body: [
       Dec(list),
@@ -2094,7 +2094,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
   assert_eq(release_reads(f).len(), 4);
   // A body counting only what its types settle reads none of its variables.
   assert_eq(
-    release_reads({ ..f, body: [Dec(local(8, at(b"List", [int_type()]))), Return(AInt(0))] }),
+    release_reads({ ..f, body: [Dec(local(8, list_type(int_type()))), Return(AInt(0))] }),
     [],
   );
   // Its entry lets go of what it lends once the call is done, and counts once more what it answers
@@ -2106,8 +2106,7 @@ test "a body reads exactly each variable it lets go of a value of, and the layou
       ..f,
       params: [x, n],
       conv: {
-        params: [Lent, Lent],
-        reps: [RWord, RInt],
+        params: [{ handed: Lent, rep: RWord }, { handed: Lent, rep: RInt }],
         answer: RWord,
         destined: false,
         answered: Borrowed([{ param: 0, whole: true }]),
@@ -2128,7 +2127,7 @@ test "a value held across what may stop is read by its layout too, as the frame'
     Call({
       callee: keys::Root(keys::Named(b"m.g")),
       args: [],
-      conv: { params: [], reps: [], answer: RWord, destined: false, answered: Owned },
+      conv: { params: [], answer: RWord, destined: false, answered: Owned },
       stops: stops,
     });
   let root = |body: Block|
@@ -2136,7 +2135,7 @@ test "a value held across what may stop is read by its layout too, as the frame'
       key: keys::Named(b"m.f"),
       kind: Rooted,
       params: [],
-      conv: { params: [], reps: [], answer: RInt, destined: false, answered: Owned },
+      conv: { params: [], answer: RInt, destined: false, answered: Owned },
       answer_ty: int_type(),
       body: body.push(Return(AInt(0))),
       lambdas: [],

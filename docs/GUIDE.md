@@ -3755,6 +3755,10 @@ an edit replaces the text between `start` and `end` of `file` (an empty range in
 Applying the edits as given leaves a program where the diagnostic no longer applies. On a terminal,
 a fix is shown as a `= fix:` line under the message.
 
+A diagnostic the runtime raises, such as a failed assertion, writes each value it names in its text.
+A long value is cut there, and `… N more` says how many characters, bytes or items were left out.
+Under `--json` each value it names also comes whole, as `values` beside the text that names it.
+
 ## 18. What Ply does not have
 
 These describe the language as it is today.
