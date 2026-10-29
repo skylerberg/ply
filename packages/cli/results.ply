@@ -1,32 +1,21 @@
 //! What a command keeps in the store between runs and reads back: for `ply test` the keys passes are
-//! filed under, each test's baseline, the definitions seen pass, and the bodies and interfaces a
+//! filed under, each test's baseline, the definitions seen pass, and the definition texts a
 //! failure's diagnosis reads; for `ply prove` and `ply review` evidence and accepted baselines.
 
 import std.bin
-import std.fs
 import std.fs (fs, mem_empty)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import std.bytes
-import std.prelude_source
-import compiler.front.checking.world (Answering)
-import compiler.front.checking.groups (queries)
-import compiler.front.published (FiledBody, FiledDef, body_encoding, filed_bodies)
 import compiler.store.hash.forms (Fixed, ModuleHashed, ModuleRecord, NodeRef, RecordedGraph,
                                   module_record, record_digest, recorded_graph, recorded_reach)
-import compiler.front.seam (Analysed)
-import compiler.store.hash (body_key)
-import compiler.store.hash.encoding (hex)
-import compiler.load (analysed, answers_afresh, assembled, deriving_nothing, prepared)
 import compiler.check.resolve.tables (Diag)
-import compiler.unit (shipped)
 import loads
 import paths
 import store.tables
 import store.twin (on_twin)
-import store.engine (Warning)
-import testing.conclude (Filing, PassRecord, ReachedHashes)
+import testing.conclude (Filing, PassRecord)
 import testing.select (Pass)
 import claims (proofs, Accepted)
 import std.env (env)
@@ -174,53 +163,28 @@ fn last_passes_over<[r]>(
   }
 }
 
-/// A body filed under another encoding is not one this compiler reads.
-fn bodies_over<[r]>(
+fn texts_over<[r]>(
   c0: tables::Cache,
   hashes: List<Bytes>,
 ) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], abort.raise} =
   hashes.fold({ value: [], cache: c0 }, |acc: StoreRead<List<Option<Bytes>>>, h: Bytes| {
-    let got = tables::body[r](acc.cache, h);
-    {
-      value: acc.value.push(match got.value {
-        Some(b) -> if b.encoding == body_encoding() { Some(b.bytes) } else { None },
-        None -> None,
-      }),
-      cache: got.cache,
-    }
-  })
-
-fn interfaces_over<[r]>(
-  c0: tables::Cache,
-  hashes: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], abort.raise} =
-  hashes.fold({ value: [], cache: c0 }, |acc: StoreRead<List<Option<Bytes>>>, h: Bytes| {
-    let got = tables::def_of[r](acc.cache, h);
+    let got = tables::text[r](acc.cache, h);
     { value: acc.value.push(got.value), cache: got.cache }
   })
 
-/// Of `reached`, each function the store holds no interface or no body of, and each declaration it
-/// holds no body of, read from the index alone.
-pub fn unfiled_in(cache: tables::Cache, reached: ReachedHashes) -> ReachedHashes / {abort.raise} =
-  {
-    fns: reached.fns.filter(|h: Bytes|
-      !tables::holds_def(cache, h) || !tables::holds_body(cache, h)),
-    decls: reached.decls.filter(|h: Bytes| !tables::holds_body(cache, h)),
-  }
+/// Of `hashes`, those the store holds no text of, read from the index alone.
+pub fn unfiled_in(cache: tables::Cache, hashes: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  hashes.filter(|h: Bytes| !tables::holds_text(cache, h))
 
-/// What a pass ran, each interface and body under its hash, and the era of `modules`: its record of
-/// each module, made only for one the store does not hold.
-pub fn kept_over<[r]>(
+/// What a pass ran, each text under its hash, and the era of `modules`: its record of each module,
+/// made only for one the store does not hold.
+pub fn kept_over(
   c0: tables::Cache,
-  defs: List<FiledDef>,
-  bodies: List<FiledBody>,
+  texts: List<{ hash: Bytes, text: Bytes }>,
   modules: List<ModuleHashed>,
-) -> tables::Cache / {fs.read[r], abort.raise} = {
-  let held = bodies.fold(
-    defs.fold(c0, |c: tables::Cache, d: FiledDef| tables::put_def[r](c, d.hash, d.interface)),
-    |c: tables::Cache, b: FiledBody|
-      tables::put_body[r](c, b.hash, { encoding: body_encoding(), bytes: b.body }),
-  );
+) -> tables::Cache / {abort.raise} = {
+  let held = texts.fold(c0, |c: tables::Cache, t: { hash: Bytes, text: Bytes }|
+    tables::put_text(c, t.hash, t.text));
   if modules.len() == 0 { held } else {
     let recorded = modules.fold(held, |c: tables::Cache, m: ModuleHashed|
       if tables::holds_module_record(c, m.record) { c }
@@ -280,7 +244,7 @@ fn said(cache: tables::Cache) -> List<Diag> = loads::diags_of(tables::warnings(c
 /// `ply test`'s reads and writes, over the store a run opened, each said once.
 pub fn with_ledger<a | e>(
   kept: Option<OpenStore>,
-  go: () -> a / {ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.bodies, ledger.interfaces, ledger.unfiled, ledger.history, ledger.filed | e},
+  go: () -> a / {ledger.opened, ledger.passes, ledger.code_passes, ledger.seen, ledger.baselines, ledger.texts, ledger.unfiled, ledger.history, ledger.filed | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
   handle {
     go()
@@ -324,34 +288,20 @@ pub fn with_ledger<a | e>(
         o.value
       },
     },
-    ledger.bodies(hashes) -> match held {
+    ledger.texts(hashes) -> match held {
       None -> hashes.map(|h: Bytes| None),
       Some(k) -> {
-        let o = if k.place.label == "cwd" { bodies_over[cwd](k.cache, hashes) }
-        else { bodies_over[abs](k.cache, hashes) };
+        let o = if k.place.label == "cwd" { texts_over[cwd](k.cache, hashes) }
+        else { texts_over[abs](k.cache, hashes) };
         held = Some({ ..k, cache: o.cache });
         o.value
       },
     },
-    ledger.interfaces(hashes) -> match held {
-      None -> hashes.map(|h: Bytes| None),
-      Some(k) -> {
-        let o = if k.place.label == "cwd" { interfaces_over[cwd](k.cache, hashes) }
-        else { interfaces_over[abs](k.cache, hashes) };
-        held = Some({ ..k, cache: o.cache });
-        o.value
-      },
-    },
-    ledger.unfiled(reached) -> match held {
-      None -> { fns: [], decls: [] },
-      Some(k) -> unfiled_in(k.cache, reached),
-    },
-    ledger.history(defs, bodies, modules) -> match held {
+    ledger.unfiled(hashes) -> match held { None -> [], Some(k) -> unfiled_in(k.cache, hashes) },
+    ledger.history(texts, modules) -> match held {
       None -> (),
       Some(k) -> {
-        let c = if k.place.label == "cwd" { kept_over[cwd](k.cache, defs, bodies, modules) }
-        else { kept_over[abs](k.cache, defs, bodies, modules) };
-        held = Some({ ..k, cache: c });
+        held = Some({ ..k, cache: kept_over(k.cache, texts, modules) });
       },
     },
     ledger.filed(f) -> match held {
@@ -508,12 +458,6 @@ pub fn with_review<a | e>(
 
 fn hashed(s: String) -> Bytes = blake3(Bytes::of_string(s))
 
-/// A body that is its own component, filed under the hash of its payload.
-fn solo(payload: String) -> { hash: Bytes, body: Bytes } / {abort.raise} = {
-  let body = byte_of_int(0) ++ b"\x00\x00\x00\x00" ++ Bytes::of_string(payload);
-  { hash: match body_key(body) { Some(k) -> k, None -> b"" }, body: body }
-}
-
 /// A function as hashing fixes it, under the hash its name keys, referencing `edges`.
 fn fixed(name: Bytes, edges: List<NodeRef>) -> Fixed =
   {
@@ -568,19 +512,15 @@ fn a_filing() -> Filing / {abort.raise} =
 
 fn built() -> tables::Stamps = { runtime: "runtime", code: "code" }
 
-/// What a later run reads back of a filing over the era of `a_module`, beside a body filed before
+fn old_f() -> { hash: Bytes, text: Bytes } = { hash: hashed("old f"), text: b"fn f() -> Int = 1\n" }
+
+/// What a later run reads back of a filing over the era of `a_module`, beside a text filed before
 /// it, and what one whose runtime stamp moved reads of its code keys.
 fn read_back(
   f: Filing,
-) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, bodies: List<Option<Bytes>> } / {abort.raise} = {
-  let b = solo("old f");
+) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   on_twin(mem_empty(), || {
-    let c0 = kept_over[mem](
-      tables::open_cache[mem]("cache", built()),
-      [],
-      [{ hash: b.hash, body: b.body }],
-      [a_module()],
-    );
+    let c0 = kept_over(tables::open_cache[mem]("cache", built()), [old_f()], [a_module()]);
     let c1 = tables::flush_cache[mem](noted[mem, mem](c0, f));
     let r = tables::open_cache[mem]("cache", built());
     let moved = tables::open_cache[mem]("cache", { ..built(), runtime: "another" });
@@ -593,10 +533,9 @@ fn read_back(
       ),
       seen: [hashed("f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
       baselines: last_passes_over[mem](r, [b"m.t", b"m.u"]).value,
-      bodies: bodies_over[mem](r, [b.hash, hashed("missing")]).value,
+      texts: texts_over[mem](r, [old_f().hash, hashed("missing")]).value,
     }
   }).value
-}
 
 test "a run's passes, baselines and sightings are kept, and a baseline is walked from its era" {
   let back = read_back(a_filing());
@@ -615,7 +554,7 @@ test "a run's passes, baselines and sightings are kept, and a baseline is walked
     }),
     None,
   ]);
-  assert_eq(back.bodies, [Some(solo("old f").body), None])
+  assert_eq(back.texts, [Some(old_f().text), None])
 }
 
 test "a baseline whose era lost a module record is no baseline" {
@@ -627,30 +566,19 @@ test "a baseline whose era lost a module record is no baseline" {
   assert_eq(back, [None])
 }
 
-// Bodies outlive a build: what keeps an older build's from being read is that its baselines do not.
-test "another build's baselines are dropped with its passes, and a body under another encoding is not read" {
-  let mine = solo("f as this build stores it");
-  let theirs = solo("f as another stored it");
+// A text is a function of its hash, so it outlives a build; the baselines that would read it do not.
+test "another build's baselines are dropped with its passes, and the texts stay" {
   let back = on_twin(mem_empty(), || {
-    let filed = tables::put_body[mem](
-      kept_over[mem](
-        tables::open_cache[mem]("cache", built()),
-        [],
-        [{ hash: mine.hash, body: mine.body }],
-        [a_module()],
-      ),
-      theirs.hash,
-      { encoding: body_encoding() + 1, bytes: theirs.body },
-    );
+    let filed = kept_over(tables::open_cache[mem]("cache", built()), [old_f()], [a_module()]);
     let c1 = tables::flush_cache[mem](noted[mem, mem](filed, a_filing()));
     let moved = tables::open_cache[mem]("cache", { ..built(), runtime: "another" });
     {
       baselines: last_passes_over[mem](moved, [b"m.t"]).value,
-      bodies: bodies_over[mem](moved, [mine.hash, theirs.hash]).value,
+      texts: texts_over[mem](moved, [old_f().hash]).value,
     }
   }).value;
   assert_eq(back.baselines, [None]);
-  assert_eq(back.bodies, [Some(mine.body), None])
+  assert_eq(back.texts, [Some(old_f().text)])
 }
 
 test "a filing of nothing keeps nothing" {
@@ -664,67 +592,4 @@ test "a filing of nothing keeps nothing" {
   assert_eq(back.passes, [None, None]);
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])
-}
-
-/// Calls on values: of a module's own type, and of a type another module declares, naming an
-/// argument, where a check of the caller against its imports places that module first.
-fn calling_on_values() -> List<{ path: String, body: Bytes }> =
-  [
-    {
-      path: "p/low.ply",
-      body: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
-    },
-    { path: "p/m.ply", body: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
-    {
-      path: "p/solo.ply",
-      body: b"pub type U = | U(Int)\nfn U::size(u: U) -> Int = match u { U(n) -> n }\npub fn g(u: U) -> Int = u.size()\n",
-    },
-  ]
-
-test "a program filed read whole and filed from its modules' answers keeps one body under each hash" {
-  let tree = fs::mem_of(calling_on_values());
-  let listed = Bytes::concat_all(
-    queries().map(
-      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {Answering, abort.raise} }|
-        Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
-    ),
-  );
-  let filed = handle {
-    match prepared[t]("p") {
-      Err(_) -> panic("the program is read"),
-      Ok(p) -> match ((
-          deriving_nothing(|| assembled[t](p, answers_afresh[t](p), true)),
-          analysed(p.own.files, Map::new()).out,
-        )) {
-        (Ok(c), Analysed(w)) -> { answered: filed_bodies(c.hashes), whole: filed_bodies(w.hashes) },
-        _ -> panic("the program checks"),
-      },
-    }
-  } with {
-    fs.list_dir[t](path) -> fs::mem_list(tree, path),
-    fs.kind[t](path) -> fs::mem_kind(tree, path),
-    fs.read_file[t](path) -> fs::mem_read(tree, path),
-    // Every toolchain ships `std.prelude`, which every module imports.
-    shipped.names() -> ["std.prelude"],
-    shipped.module(name) -> if name == "std.prelude" { Some(prelude_source::text()) } else { None },
-    shipped.reached(view, pulled) -> (),
-    shipped.answer(path, offset, len) -> None,
-    shipped.definitions() -> listed,
-    shipped.stamps() -> "",
-    shipped.runtime() -> panic("the program names no library deriver"),
-  };
-  let hashes = |bodies: List<FiledBody>|
-    bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, b: FiledBody| acc.insert(b.hash, true)).keys();
-  assert(filed.whole.len() > 0);
-  assert_eq(hashes(filed.answered), hashes(filed.whole));
-  let warned = on_twin(mem_empty(), || {
-    let c = kept_over[mem](
-      kept_over[mem](tables::open_cache[mem]("cache", built()), [], filed.answered, []),
-      [],
-      filed.whole,
-      [],
-    );
-    tables::warnings(c).map(|w: Warning| w.message)
-  }).value;
-  assert_eq(warned, [])
 }

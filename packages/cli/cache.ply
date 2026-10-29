@@ -10,7 +10,7 @@ import compiler.unit (shipped)
 import compiler.front
 import compiler.front.facts (View)
 import compiler.front.rows (Outlined, OType, KnownTestRow)
-import compiler.front.published (FiledBody, body_encoding, filed_bodies)
+import compiler.front.published (FiledBody, filed_bodies)
 import compiler.front.seam (bodies_read, def_known_row)
 import compiler.check.infer.checker (CtorInfo, DefInfo, EffectInfo, OpInfo, TestInfo, Location)
 import compiler.store.memo_files
@@ -67,9 +67,8 @@ pub type Stats = {
   definitions_seen: Int,
   obligations: Int,
   reviews: Int,
-  /// What the store keeps of the definitions a pass ran, which a later era's bisection reads.
-  defs: Int,
-  bodies: Int,
+  /// The texts of the definitions passing tests ran, which a later failure's diffs read.
+  texts: Int,
   segments: Int,
   data_bytes: Int,
   /// The bytes of entries a later filing replaced or dropped, which compaction reclaims.
@@ -77,7 +76,7 @@ pub type Stats = {
   memo: memo_files::Usage,
 }
 
-pub type Pruned = { defs: Int, bodies: Int }
+pub type Pruned = { texts: Int }
 
 pub type Compacted = {
   directory: String,
@@ -95,8 +94,6 @@ pub type Cleared = { directory: String, warnings: List<Diag>, cleared: Int }
 pub type EntryKind = | FnEntry | TypeEntry | EffectEntry | TestEntry(Bool)
 
 pub type EffectHash = { name: String, hash: String }
-
-pub type Body = { encoding: Int, bytes: Int }
 
 pub type Variant = { name: String, fields: List<String> }
 
@@ -127,7 +124,8 @@ pub type Entry = {
   interface: Interface,
   footprint: Option<List<String>>,
   effect_hashes: List<EffectHash>,
-  body: Option<Body>,
+  /// How many bytes its stored body takes, where it has one.
+  body: Option<Int>,
   outcome: Option<Outcome>,
 }
 
@@ -236,13 +234,7 @@ fn stats_json(stats: Stats) -> Json / {abort.raise} =
     { key: "definitions_seen", value: int(stats.definitions_seen) },
     { key: "obligations", value: int(stats.obligations) },
     { key: "reviews", value: int(stats.reviews) },
-    {
-      key: "history",
-      value: object([
-        { key: "definitions", value: int(stats.defs) },
-        { key: "bodies", value: int(stats.bodies) },
-      ]),
-    },
+    { key: "history", value: object([{ key: "texts", value: int(stats.texts) }]) },
     { key: "store", value: store_json(stats) },
     { key: "memo", value: memo_json(stats.memo) },
     { key: "warnings", value: all_to_json(stats.warnings, []) },
@@ -273,10 +265,8 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
       ++ stats.reviews.to_string()
       ++ " accepted "
       ++ plural(stats.reviews, "review"),
-    indent() ++ "history · " ++ bold(style, stats.defs.to_string()) ++ " "
-      ++ plural(stats.defs, "definition")
-      ++ " · "
-      ++ count_of(stats.bodies, "body"),
+    indent() ++ "history · " ++ bold(style, stats.texts.to_string()) ++ " definition "
+      ++ plural(stats.texts, "text"),
     indent() ++ "  " ++ count_of(stats.segments, "segment") ++ " "
       ++ dim(style, size_text(stats.data_bytes))
       ++ " · reclaimable "
@@ -300,7 +290,6 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
         ++ yellow(style, "more than half of what is kept is unreachable; run `ply cache compact`"),
     )
   } else { head };
-  // A hybrid program earns a real cache entry, which a reader could mistake for corruption.
   if stats.results == 0 { advised } else {
     advised.push(
       indent() ++ "  " ++ dim(style, "a result entry is one proven configuration, not one test"),
@@ -323,8 +312,7 @@ fn compact_json(c: Compacted) -> Json / {abort.raise} =
     {
       key: "dropped",
       value: object([
-        { key: "definitions", value: int(c.dropped.defs) },
-        { key: "bodies", value: int(c.dropped.bodies) },
+        { key: "texts", value: int(c.dropped.texts) },
         { key: "records", value: int(c.memo.records) },
         { key: "answers", value: int(c.memo.answers) },
       ]),
@@ -340,12 +328,8 @@ fn compact_lines(style: Style, c: Compacted) -> List<String> / {abort.raise} = {
   let d = c.dropped;
   let head = [indent() ++ green(style, "compacted") ++ " " ++ dim(style, c.directory)];
   // Only what was dropped; zeroes would read as though something happened.
-  let pruned = if d.defs + d.bodies == 0 { head } else {
-    head.push(
-      indent() ++ "  dropped " ++ count_of(d.defs, "definition") ++ " · "
-        ++ count_of(d.bodies, "body")
-        ++ " no pass ran",
-    )
+  let pruned = if d.texts == 0 { head } else {
+    head.push(indent() ++ "  dropped " ++ count_of(d.texts, "definition text") ++ " no pass ran")
   };
   let swept = if c.memo.records + c.memo.answers == 0 { pruned } else {
     pruned.push(
@@ -474,7 +458,7 @@ fn effect_hashes_line(e: Entry) -> String =
 
 fn body_line(entry: Entry) -> String / {abort.raise} =
   match entry.body {
-    Some(b) -> count_of(b.bytes, "byte") ++ " (encoding " ++ b.encoding.to_string() ++ ")",
+    Some(bytes) -> count_of(bytes, "byte"),
     None -> "— none: a declaration's is its form",
   }
 
@@ -512,12 +496,8 @@ fn interface_json(i: Interface) -> Json =
     OfTest(nd) -> object([{ key: "nondet", value: Bool(nd) }]),
   }
 
-fn body_json(b: Option<Body>) -> Json =
-  match b {
-    Some(v) ->
-      object([{ key: "encoding", value: int(v.encoding) }, { key: "bytes", value: int(v.bytes) }]),
-    None -> Null,
-  }
+fn body_json(b: Option<Int>) -> Json =
+  match b { Some(bytes) -> object([{ key: "bytes", value: int(bytes) }]), None -> Null }
 
 fn entry_json(e: Entry) -> Json =
   object([
@@ -683,8 +663,7 @@ fn stats_of<[r]>(
     definitions_seen: u.counts.seen,
     obligations: u.counts.evidence,
     reviews: u.counts.reviews,
-    defs: u.counts.defs,
-    bodies: u.counts.bodies,
+    texts: u.counts.texts,
     segments: u.segments,
     data_bytes: u.data_bytes,
     garbage_bytes: if u.data_bytes > u.live_bytes { u.data_bytes - u.live_bytes } else { 0 },
@@ -708,7 +687,7 @@ fn compacted_of<[r]>(
   {
     directory: shown(place, ""),
     warnings: loads::diags_of(tables::warnings(done)),
-    dropped: { defs: pruned.pruned.defs, bodies: pruned.pruned.bodies },
+    dropped: { texts: pruned.pruned.texts },
     memo: memo,
     bytes_before: before,
     bytes_after: kept_bytes[r](place),
@@ -797,11 +776,7 @@ fn matches_in(
     |acc: Map<Bytes, Int>, b: FiledBody| acc.insert(b.hash, b.body.len()),
   );
   let held = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
-  let body_of = |hash: Bytes|
-    match bodies.get(hash) {
-      Some(n) -> Some({ encoding: body_encoding(), bytes: n }),
-      None -> None,
-    };
+  let body_of = |hash: Bytes| bodies.get(hash);
   let fns = w.checked.defs.fold([], |acc: List<Entry>, d: DefInfo| {
     let hash = held(d.name, defs);
     if !names(query, d.name, hash) { acc } else {
@@ -966,8 +941,7 @@ fn no_stats() -> Stats =
     definitions_seen: 0,
     obligations: 0,
     reviews: 0,
-    defs: 0,
-    bodies: 0,
+    texts: 0,
     segments: 0,
     data_bytes: 0,
     garbage_bytes: 0,
@@ -1032,8 +1006,7 @@ test "the statistics read as five lines and the sizes under them" {
     definitions_seen: 3,
     obligations: 1,
     reviews: 0,
-    defs: 4,
-    bodies: 4,
+    texts: 4,
     segments: 2,
     data_bytes: 1000,
     garbage_bytes: 250,
@@ -1054,7 +1027,7 @@ test "the statistics read as five lines and the sizes under them" {
   assert_eq(lines.at_or(2, ""), "   store format 1");
   assert_eq(lines.at_or(3, ""), "   results · 2 cached results · 3 definitions seen");
   assert_eq(lines.at_or(4, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
-  assert_eq(lines.at_or(5, ""), "   history · 4 definitions · 4 bodies");
+  assert_eq(lines.at_or(5, ""), "   history · 4 definition texts");
   assert_eq(lines.at_or(6, ""), "     2 segments 1000 B · reclaimable 250 B (25%)");
   assert_eq(lines.at_or(7, ""), "   memo · 3 records · 5 longer answers");
   assert_eq(
@@ -1074,7 +1047,7 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
   let c: Compacted = {
     directory: "/p/.ply-cache",
     warnings: [],
-    dropped: { defs: 0, bodies: 0 },
+    dropped: { texts: 0 },
     memo: { records: 0, answers: 0, bytes: 0 },
     bytes_before: 900,
     bytes_after: 900,
@@ -1087,13 +1060,13 @@ test "compaction that dropped nothing and reclaimed nothing still says what it d
   ]);
   let swept: Compacted = {
     ..c,
-    dropped: { defs: 2, bodies: 2 },
+    dropped: { texts: 2 },
     memo: { records: 1, answers: 3, bytes: 300 },
     bytes_after: 400,
   };
   assert_eq(compact_lines(plain(), swept), [
     "   compacted /p/.ply-cache",
-    "     dropped 2 definitions · 2 bodies no pass ran",
+    "     dropped 2 definition texts no pass ran",
     "     dropped 1 record · 3 answers nothing reads",
     "     900 B → 400 B (500 B reclaimed)",
     "     every result is kept, so no test re-runs",

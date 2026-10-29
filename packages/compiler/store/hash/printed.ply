@@ -1,4 +1,4 @@
-//! Stored bodies printed back to source: what a mixture and an artifact print. A body decodes to
+//! Stored bodies printed back to source: what an artifact prints. A body decodes to
 //! its stored form (`stored.stored_bin`), each reference in it is named where the print can name
 //! it, and `fmt` prints the syntax that makes.
 
@@ -77,12 +77,11 @@ pub fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} 
         let list = range(0, read(s.at)).fold(
           { at: s.at + 4, choices: [] },
           |acc: { at: Int, choices: List<Choice> }, _i: Int| {
-            let k = read(acc.at + 4);
+            let k = read(acc.at);
             {
-              at: acc.at + 8 + 4 * k,
+              at: acc.at + 4 + 4 * k,
               choices: acc.choices.push({
-                callee: read(acc.at) - 1,
-                named: range(0, k).map(|j: Int| read(acc.at + 8 + 4 * j)),
+                named: range(0, k).map(|j: Int| read(acc.at + 4 + 4 * j)),
               }),
             }
           },
@@ -148,13 +147,10 @@ type Part = {
   printed: Bool,
 }
 
-/// `apart` is a printing that sets each body in a module of its own, away from the one that wrote it.
 /// `meant` is what each definition names, where the caller said, by `meant_key`.
 type Layout = {
   parts: List<Part>,
   by_hash: Map<Bytes, List<Slot>>,
-  relink: Map<Bytes, Bytes>,
-  apart: Bool,
   meant: Map<Bytes, Map<Bytes, Bool>>,
 }
 
@@ -334,14 +330,12 @@ fn target_of(
   reference: Reference,
 ) -> Spelled<Target> / {abort.raise} =
   match reference {
-    Hashed(written) -> {
-      let hash = match printer.layout.relink.get(written) { Some(to) -> to, None -> written };
+    Hashed(hash) ->
       {
         naming: if printer.layout.by_hash.contains(hash) { naming }
         else { { ..naming, missing: naming.missing.insert(hash, true) } },
         node: { hash: hash, class: 0 - 1 },
-      }
-    },
+      },
     Member(class) -> {
       let hashes = if printer.part < 0 { [] }
       else { printer.layout.parts.get(printer.part).hashes };
@@ -892,10 +886,9 @@ fn fields_of(
     },
   )
 
-/// A call on a value. Under the program's own names the value's type answers the call as it did;
-/// set apart, a function of a type is a plain function under another name, so the call is printed
-/// as a call of the one it calls. A printed function's parameters are named by their places, so an
-/// argument the call names is named so too, where the check said which parameter it fills.
+/// A call on a value, which the value's type answers as it did. A printed function's parameters are
+/// named by their places, so an argument the call names is named so too, where the check said
+/// which parameter it fills.
 fn on_value_of(
   printer: BodyPrinter,
   naming: Naming,
@@ -908,7 +901,7 @@ fn on_value_of(
   let given = fields_of(printer, arguments.naming, depth, call.named);
   let choice: Choice = match given.naming.picks.at(given.naming.picked) {
     Some(found) -> found,
-    None -> { callee: 0 - 1, named: [] },
+    None -> { named: [] },
   };
   let after = { ..given.naming, picked: given.naming.picked + 1 };
   let named_arguments = range(0, given.node.len()).map(|i: Int|
@@ -919,7 +912,6 @@ fn on_value_of(
       span: span,
     });
   let labels = call.labels.map(|label: Label| label_of(depth, label));
-  let apart = printer.layout.apart;
   let local = match call.base {
     Variable(value) -> match value.named { Local(_) -> true, _ -> false },
     _ -> false,
@@ -947,40 +939,19 @@ fn on_value_of(
       _ -> written,
     }
   };
-  let plain = |callee: QName|
-    EApp({
-      span: span,
-      func: EVar({ span: span, name: callee }),
-      named: named_arguments,
-      args: List::concat([base.node], arguments.node),
-      labels: labels,
-    });
   match call.callees {
     InFull(value) -> {
       let name = value_named(printer, after, depth, value);
-      {
-        naming: name.naming,
-        node: if apart { plain(name.node) } else { on_value(qualified_text(name.node)) },
-      }
+      { naming: name.naming, node: on_value(qualified_text(name.node)) }
     },
-    Among(references) -> {
-      let chosen = if apart { choice.callee } else { 0 - 1 };
-      let walked = range(0, references.len()).fold(
-        { naming: after, node: None },
-        |acc: Spelled<Option<QName>>, i: Int| {
-          let target = target_of(printer, acc.naming, references.get(i));
-          if i == chosen {
-            let name = named(printer, target.naming, target.node, None);
-            { naming: name.naming, node: Some(name.node) }
-          } else if chosen >= 0 { { naming: target.naming, node: acc.node } }
-          else { { naming: seen(printer, target.naming, target.node), node: acc.node } }
-        },
-      );
+    Among(references) ->
       {
-        naming: walked.naming,
-        node: match walked.node { Some(name) -> plain(name), None -> on_value(call.name) },
-      }
-    },
+        naming: references.fold(after, |n: Naming, reference: Reference| {
+          let target = target_of(printer, n, reference);
+          seen(printer, target.naming, target.node)
+        }),
+        node: on_value(call.name),
+      },
   }
 }
 
@@ -1570,10 +1541,7 @@ fn items_of(
       );
       let declaration = IType({
         vis: VPub,
-        // Set apart, what only the type's module may write is written wherever a body landed.
-        opaque: if declared.opaque && !printer.layout.apart {
-          Some({ span: span, answer: [], take: [] })
-        } else { None },
+        opaque: if declared.opaque { Some({ span: span, answer: [], take: [] }) } else { None },
         name: ident(name),
         generics: generics_of(declared.generics),
         constraints: constraints_of(declared.constraints),
@@ -1947,12 +1915,7 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
   done.out
 }
 
-fn layout_of(
-  parts: List<Part>,
-  relink: Map<Bytes, Bytes>,
-  apart: Bool,
-  meant: Map<Bytes, Map<Bytes, Bool>>,
-) -> Layout / {abort.raise} = {
+fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout / {abort.raise} = {
   let bound = binders(
     parts.fold(Map::new(), |acc: Map<Bytes, Bool>, part: Part| acc.insert(part.module, true)).keys(
     ),
@@ -1972,8 +1935,6 @@ fn layout_of(
           }),
         ))
     }),
-    relink: relink,
-    apart: apart,
     meant: meant,
   }
 }
@@ -2088,10 +2049,6 @@ fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
 /// a shipped one only through it, so a name filed without it is never the one a reference is printed
 /// under.
 ///
-/// `apart` says the names set each body in a module of its own, as a search's do. What only a
-/// type's module may write is then written wherever a body landed, so an `opaque` type is printed
-/// open; it runs as it did, and is no longer stored under the hash it was.
-///
 /// `meant` is what each definition names, for those the caller knows it of. Two modules that
 /// declare one thing alike file one body under two names, which the checker may still tell apart;
 /// a reference to it from a definition listed here is printed under the name that definition
@@ -2100,9 +2057,7 @@ pub fn print_bodies(
   bodies: List<Bytes>,
   names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
   tests: List<Bytes>,
-  relink: List<{ from: Bytes, to: Bytes }>,
   shipped: List<Bytes>,
-  apart: Bool = false,
   meant: List<{ name: Bytes, hash: Bytes, names: List<Bytes> }> = [],
 ) -> Printing / {abort.raise} = {
   let comps = bodies.map(comp_of);
@@ -2132,9 +2087,6 @@ pub fn print_bodies(
     None -> {
       let l = layout_of(
         parted.parts,
-        relink.fold(Map::new(), |acc: Map<Bytes, Bytes>, r: { from: Bytes, to: Bytes }|
-          acc.insert(r.from, r.to)),
-        apart,
         meant.fold(
           Map::new(),
           |acc: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|

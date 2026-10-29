@@ -27,7 +27,7 @@ bootstrap. After an edit to Ply sources alone, cargo has nothing to rebuild.
 | `packages/std` | the standard library; `prelude.ply` declares the builtins |
 | `packages/compiler` | the compiler, a directory per phase (`syntax/`, `expand/`, `check/`, `front/`, `store/`, `emit/`), the builder's entry point (`build.main`), and the code that runs the C compiler and linker (`cc.ply`, `native.ply`) |
 | `packages/cli` | the `ply` command |
-| `packages/testing` | test results and failure diagnosis: what a test run concludes, and bisection to find the change that broke a test |
+| `packages/testing` | test results and failure diagnosis: what a test run concludes, and what changed under a test that fails |
 | `packages/proof` | the prover behind `ply prove` |
 | `packages/sim` | the search over task interleavings behind `simulate` |
 | `packages/store` | what `ply` keeps under `.ply-cache` between runs |
