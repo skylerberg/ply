@@ -431,8 +431,10 @@ fn beside<| e>(
       }
     })
 
-/// Where `path` beside the shipped module `module` lies below its package's root, the root first.
-/// `None` for an absolute path or one that leaves the package.
+/// Where `path` beside the shipped module `module` lies among the shipped files, the root of the
+/// package it lies in first: its module's own, or another package of them the path climbs into,
+/// as `../std/prelude.ply` beside `compiler.prelude_source` lies in `std`. `None` for an absolute
+/// path or one that leaves the shipped files.
 fn shipped_place(module: Bytes, path: Bytes) -> Option<List<Bytes>> =
   if path.starts_with(b"/") { None } else {
     match path.split(b"/").fold(
@@ -441,9 +443,9 @@ fn shipped_place(module: Bytes, path: Bytes) -> Option<List<Bytes>> =
           match inside {
             None -> None,
             Some(dir) -> if part == b"" || part == b"." { inside }
-            else if part != b".." { Some(dir.push(part)) }
-            else if dir.len() > 1 { Some(dir.drop_last(1)) }
-            else { None },
+            else if part == b".." { if dir.len() > 0 { Some(dir.drop_last(1)) } else { None } }
+            else if dir.len() == 0 && !shipped_root(part) { None }
+            else { Some(dir.push(part)) },
           },
       ) {
       Some(parts) -> if parts.len() < 2 { None } else { Some(parts) },
@@ -451,9 +453,12 @@ fn shipped_place(module: Bytes, path: Bytes) -> Option<List<Bytes>> =
     }
   }
 
+/// Whether `part` of a path is the root of a package of the shipped modules.
+fn shipped_root(part: Bytes) -> Bool = is_shipped(part) && part.index_of(b".") == None
+
 /// The name the shipped modules give the module at `path` beside the shipped module `module`:
 /// `../b.ply` beside `std.deep.a` is `std.b`. `None` for a path that names no module or that leaves
-/// the package.
+/// the shipped files.
 fn shipped_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} =
   if !path.ends_with(b".ply") { None } else {
     match shipped_place(module, path) {
@@ -467,7 +472,7 @@ fn shipped_name(module: Bytes, path: Bytes) -> Option<Bytes> / {abort.raise} =
 
 /// The name the shipped modules give the data file at `path` beside the shipped module `module`:
 /// its place below the package's root, `std/oid/names.txt` for `oid/names.txt` beside `std.oid`.
-/// `None` for a path that names a module, that is absolute, or that leaves the package.
+/// `None` for a path that names a module, that is absolute, or that leaves the shipped files.
 pub fn shipped_data_name(module: Bytes, path: Bytes) -> Option<Bytes> =
   if path.ends_with(b".ply") { None } else {
     match shipped_place(module, path) {
@@ -2948,6 +2953,28 @@ test "a load reads a compiler module's imports of its own package and the module
   assert_eq(s.data, [])
 }
 
+test "a load reads the library's module text and data file a compiler module embeds" {
+  let texts = [
+    {
+      name: b"compiler.fmt",
+      src: b"pub fn f() -> Bytes = embed(\"../std/words.ply\")\npub fn g() -> Bytes = embed(\"../std/oid/names.txt\")\n",
+    },
+    { name: b"std.words", src: b"" },
+  ];
+  let s = shipped_pulled(
+    [{ name: b"app", src: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
+    { root: b"", manifest: None, supplied: [] },
+    texts.map(|t: Source| t.name),
+    |name: Bytes|
+      texts.fold(None, |acc: Option<Bytes>, t: Source|
+        if t.name == name { Some(t.src) } else { acc }),
+    |name: Bytes| if name == b"std/oid/names.txt" { Some(b"2.5.4.3 cn\n") } else { None },
+    pulls_of,
+  );
+  assert_eq(s.read.map(|t: Source| t.name), [b"compiler.fmt", b"std.words"]);
+  assert_eq(s.data.map(|d: { name: Bytes, bytes: Bytes }| d.name), [b"std/oid/names.txt"])
+}
+
 /// Shipped modules of which `std.words` embeds a data file twice over and `std.idle` embeds
 /// another, with what a load asked for of each kind.
 fn data_pulled_by(
@@ -3932,7 +3959,7 @@ test "a dependency is pinned by what its modules embed as well as by their text"
   assert(embedding_lib(Some(b"one")) != embedding_lib(Some(b"two")))
 }
 
-test "what sits beside a shipped module is filed under its package's root, and nothing outside it is" {
+test "what sits beside a shipped module is filed under the root of the package it lies in, and nothing outside the shipped files is" {
   assert_eq(shipped_name(b"std.internal.prelude_source", b"../prelude.ply"), Some(b"std.prelude"));
   assert_eq(shipped_name(b"std.a", b"b.ply"), Some(b"std.b"));
   assert_eq(shipped_name(b"std.a", b"./deep/b.ply"), Some(b"std.deep.b"));
@@ -3940,7 +3967,14 @@ test "what sits beside a shipped module is filed under its package's root, and n
   assert_eq(shipped_name(b"std.a", b"../b.ply"), None);
   assert_eq(shipped_name(b"std.a", b"/b.ply"), None);
   assert_eq(shipped_name(b"std.a", b".."), None);
-  assert_eq(shipped_name(b"std.a", b"notes.txt"), None)
+  assert_eq(shipped_name(b"std.a", b"notes.txt"), None);
+  // A path may climb into another package of the shipped modules, and no further.
+  assert_eq(shipped_name(b"compiler.prelude_source", b"../std/prelude.ply"), Some(b"std.prelude"));
+  assert_eq(shipped_name(b"compiler.emit.a", b"../../std/deep/b.ply"), Some(b"std.deep.b"));
+  assert_eq(shipped_name(b"compiler.a", b"../nowhere/b.ply"), None);
+  assert_eq(shipped_name(b"compiler.a", b"../std.deep/b.ply"), None);
+  assert_eq(shipped_name(b"compiler.a", b"../../std/b.ply"), None);
+  assert_eq(shipped_name(b"compiler.a", b"../std"), None)
 }
 
 test "a shipped module embeds what the shipped modules hold beside it, and other bytes are another definition" {
@@ -4005,7 +4039,8 @@ test "a data file beside a shipped module is named by its place below the packag
   assert_eq(shipped_data_name(b"std.oid", b"./oid//names.txt"), Some(b"std/oid/names.txt"));
   assert_eq(shipped_data_name(b"std.oid", b"names.txt"), Some(b"std/names.txt"));
   assert_eq(shipped_data_name(b"std.deep.a", b"../b.txt"), Some(b"std/b.txt"));
-  // A path that leaves the package names nothing, however it gets there.
+  assert_eq(shipped_data_name(b"compiler.a", b"../std/oid/names.txt"), Some(b"std/oid/names.txt"));
+  // A path that leaves the shipped files names nothing, however it gets there.
   assert_eq(shipped_data_name(b"std.a", b"../b.txt"), None);
   assert_eq(shipped_data_name(b"std.a", b"x/../../b.txt"), None);
   assert_eq(shipped_data_name(b"std.a", b"/etc/hosts"), None);
