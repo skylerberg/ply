@@ -84,7 +84,8 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              unary_of, binary_of, if_of, list_of, field_read_of, record_of,
                              block_of, lambda_of, do_of, let_of, let_else_of, case_pattern_of,
                              list_pattern_of, or_pattern_of, record_pattern_of, TypedArm, arm_of,
-                             match_of, call_of, PlacedDefault, defaults_placed)
+                             match_of, call_of, PlacedDefault, defaults_placed, update_of,
+                             perform_of, simulate_of, parallel_of)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -1842,8 +1843,8 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
 /// The branches' answers as a tuple, which is what evaluating them left to right answers.
 fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferred / {abort.raise} = {
   let out = range(0, branches.len()).fold(
-    { checker: checker, fs: [], row: row_empty(), rows: [] },
-    |acc: { checker: Checker, fs: List<Field>, row: Row, rows: List<{ span: Span, row: Row }> }, i: Int| {
+    { checker: checker, fs: [], row: row_empty(), rows: [], branches: [] },
+    |acc: { checker: Checker, fs: List<Field>, row: Row, rows: List<{ span: Span, row: Row }>, branches: List<{ body: Option<TypedExpr>, row: Row }> }, i: Int| {
       let b = branches.get(i);
       let o: Inferred = infer(acc.checker, b);
       let j: WithRow = join(o.checker, span, acc.row, o.row);
@@ -1856,6 +1857,7 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
         fs: acc.fs.push({ name: b"_".concat(ascii_of_int(i)), ty: o.ty }),
         row: j.row,
         rows: acc.rows.push({ span: expr_span(b), row: o.row }),
+        branches: acc.branches.push({ body: typed_at(o, expr_span(b)), row: o.row }),
       }
     },
   );
@@ -1864,7 +1866,7 @@ fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferre
     checker: { ..out.checker, parallels: out.checker.parallels.push(site) },
     ty: TyRecord(fields_sorted(out.fs)),
     row: out.row,
-    node: None,
+    node: parallel_of(out.branches),
   }
 }
 
@@ -1934,9 +1936,9 @@ fn infer_nominal(
   met: Meetings,
 ) -> Inferred / {abort.raise} = {
   let known = backticked(n.fields.map(|field: Field| field.name), b", ");
-  let walked: WithRow = written.fold(
-    { checker: checker, row: row_empty() },
-    |acc: WithRow, f: RecField| {
+  let walked = written.fold(
+    { checker: checker, row: row_empty(), values: [] },
+    |acc: { checker: Checker, row: Row, values: List<{ name: Bytes, value: Option<TypedExpr> }> }, f: RecField| {
       let o: Inferred = infer(acc.checker, f.value, field_hint(n.fields, f.name.name, met));
       let met: Checker = match field_get(n.fields, f.name.name) {
         Some(t) -> expect_met(o.checker, expr_span(f.value), t, o.ty, b"a field of a `new` record"),
@@ -1957,7 +1959,12 @@ fn infer_nominal(
             ],
           ),
       };
-      join(met, span, acc.row, o.row)
+      let j: WithRow = join(met, span, acc.row, o.row);
+      {
+        checker: j.checker,
+        row: j.row,
+        values: acc.values.push({ name: f.name.name, value: typed_at(o, expr_span(f.value)) }),
+      }
     },
   );
   let named = written.map(|f: RecField| f.name.name);
@@ -1985,7 +1992,7 @@ fn infer_nominal(
     checker: note_stated_in(keyed, span, TyNominal(n)),
     ty: TyNominal(n),
     row: walked.row,
-    node: None,
+    node: record_of(walked.values),
   }
 }
 
@@ -2001,8 +2008,8 @@ fn infer_record_update(
   let b: Inferred = infer(checker, base);
   let known = match record_fields(shallow(b.checker.subst, b.ty)) { Some(fs) -> fs, None -> [] };
   let fs = written.fold(
-    { checker: b.checker, fs: [], row: b.row },
-    |acc: { checker: Checker, fs: List<UpdateField>, row: Row }, field: RecField| {
+    { checker: b.checker, fs: [], row: b.row, values: [] },
+    |acc: { checker: Checker, fs: List<UpdateField>, row: Row, values: List<{ name: Bytes, value: Option<TypedExpr> }> }, field: RecField| {
       let o: Inferred = infer(
         acc.checker,
         field.value,
@@ -2013,10 +2020,15 @@ fn infer_record_update(
         checker: j.checker,
         fs: acc.fs.push({ name: field.name.name, span: field.name.span, ty: o.ty }),
         row: j.row,
+        values: acc.values.push({
+          name: field.name.name,
+          value: typed_at(o, expr_span(field.value)),
+        }),
       }
     },
   );
   let base_span = expr_span(base);
+  let node = update_of(typed_at(b, base_span), fs.values);
   match resolve(fs.checker, b.ty) {
     TyVar(_) -> {
       let t: WithTy = new_ty(fs.checker);
@@ -2036,12 +2048,12 @@ fn infer_record_update(
         },
         ty: t.ty,
         row: fs.row,
-        node: None,
+        node: node,
       }
     },
     shape -> {
       let o: WithTy = update_shape(fs.checker, span, base_span, shape, fs.fs);
-      { checker: o.checker, ty: o.ty, row: fs.row, node: None }
+      { checker: o.checker, ty: o.ty, row: fs.row, node: node }
     },
   }
 }
@@ -4896,14 +4908,20 @@ fn infer_perform(
             };
             // An operation's answer is read off no reference, so the perform's own type is filed.
             let typed: Checker = note_typed(taken.checker, span, shape.ret, []);
+            let node = perform_of(
+              hit.info.name,
+              hit.op.name,
+              match resource { Some(r) -> Some(r.name), None -> None },
+              as_.nodes,
+            );
             if taken.short {
               {
                 checker: record_site(typed, abort_atom(), span, DirectPerform),
                 ty: shape.ret,
                 row: { ..j2.row, atoms: atoms_insert(j2.row.atoms, abort_atom()) },
-                node: None,
+                node: node,
               }
-            } else { { checker: typed, ty: shape.ret, row: j2.row, node: None } }
+            } else { { checker: typed, ty: shape.ret, row: j2.row, node: node } }
           }
         },
       }
@@ -6159,7 +6177,12 @@ fn infer_simulate(
     row_without_covered(resolve_row_in(recorded, b.row), handled),
     row_singleton(seed),
   );
-  { checker: j.checker, ty: b.ty, row: j.row, node: None }
+  {
+    checker: j.checker,
+    ty: b.ty,
+    row: j.row,
+    node: simulate_of(typed_at(b, expr_span(body)), b.row),
+  }
 }
 
 // --- Definitions ----------------------------------------------------------------------------------

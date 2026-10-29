@@ -23,11 +23,11 @@ pub type TypedNode =
   /// `{ ..base, f: e }`: the base's record with the fields `sets` writes replaced, at the node's type.
   | TypedUpdate({ base: TypedExpr, sets: List<TypedField> })
   | TypedFieldRead({ base: TypedExpr, field: Bytes })
+  /// `effect` is the effect's name across the program, and `resource` the label as written.
   | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, args: List<TypedExpr> })
   | TypedLambda({ params: List<TypedParam>, body: TypedExpr, row: Row })
-  | TypedSimulate(TypedExpr)
-  /// Each branch a lambda of no parameters.
-  | TypedParallel(List<TypedExpr>)
+  | TypedSimulate(TypedThunk)
+  | TypedParallel(List<TypedThunk>)
   | TypedHandle({ body: TypedExpr, clauses: List<TypedClause>, ret: Option<TypedReturn> })
 
 /// What a name read as a value is: a binder in scope, a definition at the type arguments the read
@@ -39,6 +39,9 @@ pub type Reading =
   | ReadBuiltin(Bytes)
 
 pub type TypedParam = { name: Bytes, ty: Type, span: Span }
+
+/// A body run as a function of no parameters, and what it performs.
+pub type TypedThunk = { body: TypedExpr, row: Row }
 
 pub type TypedField = { name: Bytes, value: TypedExpr }
 
@@ -207,6 +210,33 @@ pub fn record_pattern_of(
     None -> None,
   }
 
+pub fn perform_of(
+  effect_name: Bytes,
+  op: Bytes,
+  resource: Option<Bytes>,
+  args: List<Option<TypedExpr>>,
+) -> Option<TypedNode> =
+  match Option::all(args) {
+    Some(xs) -> Some(TypedPerform({ effect: effect_name, op: op, resource: resource, args: xs })),
+    None -> None,
+  }
+
+pub fn simulate_of(body: Option<TypedExpr>, row: Row) -> Option<TypedNode> =
+  match body { Some(b) -> Some(TypedSimulate({ body: b, row: row })), None -> None }
+
+pub fn parallel_of(branches: List<{ body: Option<TypedExpr>, row: Row }>) -> Option<TypedNode> =
+  match branches.fold(
+      Some([]),
+      |acc: Option<List<TypedThunk>>, b: { body: Option<TypedExpr>, row: Row }|
+        match ((acc, b.body)) {
+          (Some(ts), Some(x)) -> Some(ts.push({ body: x, row: b.row })),
+          _ -> None,
+        },
+    ) {
+    Some(ts) -> Some(TypedParallel(ts)),
+    None -> None,
+  }
+
 pub fn update_of(
   base: Option<TypedExpr>,
   sets: List<{ name: Bytes, value: Option<TypedExpr> }>,
@@ -266,18 +296,24 @@ pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
       TypedList(xs) -> TypedList(xs.map(go)),
       TypedRecord(fs) ->
         TypedRecord(fs.map(|fd: TypedField| { name: fd.name, value: go(fd.value) })),
+      TypedUpdate(u) ->
+        TypedUpdate({
+          base: go(u.base),
+          sets: u.sets.map(|fd: TypedField| { name: fd.name, value: go(fd.value) }),
+        }),
       TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
       TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
       TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
-      TypedSimulate(b) -> TypedSimulate(go(b)),
-      TypedParallel(bs) -> TypedParallel(bs.map(go)),
+      TypedSimulate(t) -> TypedSimulate({ ..t, body: go(t.body) }),
+      TypedParallel(ts) -> TypedParallel(ts.map(|t: TypedThunk| { ..t, body: go(t.body) })),
       TypedHandle(h) ->
         TypedHandle({
           body: go(h.body),
           clauses: h.clauses.map(|c: TypedClause| { ..c, body: go(c.body) }),
           ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
         }),
-      other -> other,
+      TypedLit(l) -> TypedLit(l),
+      TypedRead(r) -> TypedRead(r),
     },
   })
 }
@@ -308,17 +344,19 @@ pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
       ),
     TypedList(xs) -> all(xs),
     TypedRecord(fs) -> all(fs.map(|fd: TypedField| fd.value)),
+    TypedUpdate(u) -> nodes_of(u.base).concat(all(u.sets.map(|fd: TypedField| fd.value))),
     TypedFieldRead(r) -> nodes_of(r.base),
     TypedPerform(p) -> all(p.args),
     TypedLambda(l) -> nodes_of(l.body),
-    TypedSimulate(b) -> nodes_of(b),
-    TypedParallel(bs) -> all(bs),
+    TypedSimulate(t) -> nodes_of(t.body),
+    TypedParallel(ts) -> all(ts.map(|t: TypedThunk| t.body)),
     TypedHandle(h) ->
       nodes_of(h.body).concat(all(h.clauses.map(|c: TypedClause| c.body))).concat(match h.ret {
         Some(r) -> nodes_of(r.body),
         None -> [],
       }),
-    _ -> [],
+    TypedLit(_) -> [],
+    TypedRead(_) -> [],
   })
 }
 
