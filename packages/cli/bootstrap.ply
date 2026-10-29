@@ -29,7 +29,7 @@ import compiler.native
 import compiler.native (Packed)
 import compiler.store.packs
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.check.resolve.tables (Diag, error_at)
+import compiler.check.resolve.tables (Diag, error_at, noted)
 import compiler.unit (shipped, answers_store, emitted, emitter_identity, held, identity_of)
 import compiler.emit.abi (Runtime, runtime_of)
 import compiler.store.kept (Record, kept_records, with_kept)
@@ -478,7 +478,7 @@ fn answered(
   keys: Keys,
   work: String,
 ) -> Result<{ answered: List<Packed>, taken: Bool }, List<Diag>> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], shipped.definitions, abort.raise} = {
-  let answering = exe ++ "-answering";
+  let answering = answering_of(exe);
   if !fs.copy[abs](below_root(exe), below_root(answering)) {
     failed("the new `ply` could not be copied to answer with")
   } else {
@@ -517,6 +517,31 @@ fn answered(
         }
       },
     }
+  }
+}
+
+/// The copy of the `ply` linked at `exe` that answers for the shipped modules: its front end packed,
+/// and no answers.
+fn answering_of(exe: String) -> String = exe ++ "-answering"
+
+/// `diags`, the failure of a bootstrap after it linked `ply` at `exe`, with the `ply` that failed
+/// kept at `<out>.failed` and the last of them noting where: the copy that answered for the shipped
+/// modules where one was made, else the `ply` as linked. The scratch directory holding `exe` is
+/// cleared after, and `out` is left as it was.
+fn failure_kept(
+  exe: String,
+  out: String,
+  diags: List<Diag>,
+) -> List<Diag> / {fs.write[abs], abort.raise} = {
+  let kept = out ++ ".failed";
+  let copied = fs.create_dir[abs](below_root(parent(out)))
+    && (fs.copy[abs](below_root(answering_of(exe)), below_root(kept))
+    || fs.copy[abs](below_root(exe), below_root(kept)));
+  let note = Bytes::of_string(if copied { "the new `ply` that failed is kept at `" ++ kept ++ "`" }
+  else { "the new `ply` that failed could not be kept at `" ++ kept ++ "`" });
+  match diags.at(diags.len() - 1) {
+    Some(last) -> diags.set(diags.len() - 1, noted(last, note)),
+    None -> [noted(nowhere("the bootstrap failed"), note)],
   }
 }
 
@@ -608,7 +633,10 @@ fn bootstrapped(
                   Err(diags) -> Err(diags),
                   Ok(exe) -> {
                     timed(phases, "compiled and linked `ply`", at);
-                    finished(options, files, keys, made, exe, work, phases)
+                    match finished(options, files, keys, made, exe, work, phases) {
+                      Err(diags) -> Err(failure_kept(exe, options.out, diags)),
+                      Ok(_) -> Ok(()),
+                    }
                   },
                 }
               },
@@ -727,6 +755,26 @@ test "a ply installed below a directory not yet made is written there" {
   assert_eq(ran.value, Ok(()));
   assert_eq(fs::mem_read(ran.tree, "out/stage1/ply"), Some(b"codepack"));
   assert_eq(fs::mem_list(ran.tree, "out/stage1"), Some(["ply"]))
+}
+
+test "a bootstrap that fails after its link keeps the ply that failed beside its out, and says where" {
+  let failure = [nowhere("the new `ply` did not answer the shipped modules")];
+  let kept = |files: List<{ path: String, body: Bytes }>|
+    fs::on_mem[abs](fs::mem_of(files), || failure_kept("/work/exe", "/out/stage1/ply", failure));
+  let answering = kept([
+    { path: "work/exe", body: b"linked" },
+    { path: "work/exe-answering", body: b"answering" },
+    { path: "out/stage1/ply", body: b"working" },
+  ]);
+  // The copy that answered failed, so it is the one kept; the `ply` already at the out stays.
+  assert_eq(fs::mem_read(answering.tree, "out/stage1/ply.failed"), Some(b"answering"));
+  assert_eq(fs::mem_read(answering.tree, "out/stage1/ply"), Some(b"working"));
+  assert_eq(answering.value.map(|d: Diag| d.notes_text), [
+    [b"the new `ply` that failed is kept at `/out/stage1/ply.failed`"],
+  ]);
+  // A failure before any copy answered keeps the `ply` as linked.
+  let linked = kept([{ path: "work/exe", body: b"linked" }]);
+  assert_eq(fs::mem_read(linked.tree, "out/stage1/ply.failed"), Some(b"linked"))
 }
 
 fn two_shipped() -> List<Shipping> =
