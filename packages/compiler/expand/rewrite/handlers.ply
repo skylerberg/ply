@@ -16,7 +16,7 @@ import compiler.syntax.parsing (Span, Ident, QName, bare, minted, made_at, role_
                                 role_var_callee, role_var_index, role_snapshot_block,
                                 role_snapshot_let, role_snapshot_binder)
 import compiler.syntax.items (Module, Item)
-import compiler.check.resolve.sets (pattern_binders)
+import compiler.check.resolve.bindings (item_locals)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -24,7 +24,7 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               HandleClause, RecField, expr_span, ETagged, Hole)
 import compiler.syntax.patterns (LInt)
 import std.bytes (ascii_of_int)
-import compiler.expand.rewrite.shared (map_item, any_expr, read_at, bound_at)
+import compiler.expand.rewrite.shared (map_item, map_expr, nodes_of, any_expr, read_at, bound_at)
 
 // --- Witnesses -----------------------------------------------------------------------------
 
@@ -129,17 +129,28 @@ fn is_hold(expr: Expr) -> Bool = match expr { EWithHold(_) -> true, _ -> false }
 // lambda or a nested body, reads the values they had where it was made.
 
 /// Every `handle` with variables of a module written out as one without.
-pub fn expand_handler_vars(module: Module) -> Module =
-  if !any_expr(module, has_vars) { module }
-  else { { ..module, items: module.items.map(|item: Item| map_item(item, expanded_vars)) } }
+pub fn expand_handler_vars(module: Module) -> Module / {abort.raise} =
+  if !any_expr(module, has_vars) { module } else {
+    {
+      ..module,
+      items: module.items.map(|item: Item| {
+        let locals = item_locals(item);
+        map_item(item, |e: Expr| expanded_vars(locals, e))
+      }),
+    }
+  }
 
 fn has_vars(expr: Expr) -> Bool = match expr { EHandle(h) -> h.vars.len() > 0, _ -> false }
 
-/// The variables a clause reads through the runtime: each by name, its place among its handler's,
-/// and where it is declared, where the checker filed its type.
-type Held = { vars: List<{ name: Bytes, at: Int, decl: Span }>, tag: Bytes }
+/// The variables a clause reads through the runtime, and the binder of each local the item names,
+/// by the site of the name.
+type Held = { vars: List<HeldVar>, tag: Bytes, locals: Map<Int, Int> }
 
-fn expanded_vars(expr: Expr) -> Expr =
+/// A handler's variable: its name, the site of the name that binds it, its place among its
+/// handler's, and where it is declared, where the checker filed its type.
+type HeldVar = { name: Bytes, binder: Int, at: Int, decl: Span }
+
+fn expanded_vars(locals: Map<Int, Int>, expr: Expr) -> Expr =
   match expr {
     EHandle(h) -> if h.vars.len() == 0 { expr } else {
       let tag = ascii_of_int(h.span.site);
@@ -149,8 +160,14 @@ fn expanded_vars(expr: Expr) -> Expr =
         Bytes::concat_all([b"?hv", tag, b"_", ascii_of_int(x.index)]);
       let held = {
         vars: vs.map(|x: { index: Int, value: HandlerVar }|
-          { name: x.value.name.name, at: x.index, decl: x.value.span }),
+          {
+            name: x.value.name.name,
+            binder: x.value.name.span.site,
+            at: x.index,
+            decl: x.value.span,
+          }),
         tag: tag,
+        locals: locals,
       };
       // Each initializer reads the variables above it from where their first values are bound.
       let made = vs.map(|x: { index: Int, value: HandlerVar }|
@@ -161,7 +178,7 @@ fn expanded_vars(expr: Expr) -> Expr =
           value: vs.take(x.index).fold(
             x.value.init,
             |e: Expr, above: { index: Int, value: HandlerVar }|
-              renamed_free(e, above.value.name.name, first(above)).e,
+              renamed_free(locals, e, above.value.name.span.site, first(above)).e,
           ),
         }));
       let installed = vs.map(|x: { index: Int, value: HandlerVar }| {
@@ -184,11 +201,9 @@ fn expanded_vars(expr: Expr) -> Expr =
               tail: Some(h.body),
               stmts: installed,
             }),
-            clauses: h.clauses.map(|c: HandleClause|
-              { ..c, body: in_clause(hidden_by(held, clause_binders(c)), c.body) }),
+            clauses: h.clauses.map(|c: HandleClause| { ..c, body: in_clause(held, c.body) }),
             ret: match h.ret {
-              Some(rc) ->
-                Some({ ..rc, body: in_clause(hidden_by(held, [rc.binder.name]), rc.body) }),
+              Some(rc) -> Some({ ..rc, body: in_clause(held, rc.body) }),
               None -> None,
             },
             vars: [],
@@ -208,29 +223,13 @@ fn var_call(at: Span, name: Bytes, i: Int, args: List<Expr>) -> Expr =
     [ELit({ span: minted(at, role_var_index()), lit: LInt(i) })].concat(args),
   )
 
-fn clause_binders(c: HandleClause) -> List<Bytes> = {
-  let named = c.params.map(|p: Ident| p.name);
-  let labelled = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
-  match c.resume { Some(k) -> labelled.push(k.name), None -> labelled }
-}
-
 /// `held` without the variables `names` hide.
-fn hidden_by(held: Held, names: List<Bytes>) -> Held =
-  {
-    ..held,
-    vars: held.vars.filter(|x: { name: Bytes, at: Int, decl: Span }| !names.contains(x.name)),
-  }
-
-fn held_named(
-  held: Held,
-  v: { span: Span, name: QName },
-) -> Option<{ name: Bytes, at: Int, decl: Span }> =
+fn held_named(held: Held, v: { span: Span, name: QName }) -> Option<HeldVar> =
   if v.name.module != None { None } else {
-    held.vars.fold(
-      None,
-      |found: Option<{ name: Bytes, at: Int, decl: Span }>, x: { name: Bytes, at: Int, decl: Span }|
-        if x.name == v.name.name.name { Some(x) } else { found },
-    )
+    match held.locals.get(v.name.name.span.site) {
+      Some(b) -> held.vars.find(|x: HeldVar| x.binder == b),
+      None -> None,
+    }
   }
 
 /// The read of variable `at` at `span`, the site of the read it stands for or of the variable's
@@ -260,12 +259,12 @@ fn in_clause(held: Held, e: Expr) -> Expr =
             match s {
               SLet(l) ->
                 {
-                  held: hidden_by(acc.held, pattern_binders(l.pat, [])),
+                  held: acc.held,
                   stmts: acc.stmts.push(SLet({ ..l, value: in_clause(acc.held, l.value) })),
                 },
               SLetElse(l) ->
                 {
-                  held: hidden_by(acc.held, pattern_binders(l.pat, [])),
+                  held: acc.held,
                   stmts: acc.stmts.push(
                     SLetElse({
                       ..l,
@@ -305,7 +304,7 @@ fn in_clause(held: Held, e: Expr) -> Expr =
           ..m,
           scrutinee: go(m.scrutinee),
           arms: m.arms.map(|arm: MatchArm| {
-            let inner = hidden_by(held, pattern_binders(arm.pat, []));
+            let inner = held;
             {
               ..arm,
               guard: match arm.guard { Some(g) -> Some(in_clause(inner, g)), None -> None },
@@ -353,8 +352,8 @@ fn in_clause(held: Held, e: Expr) -> Expr =
 fn snapshot(held: Held, e: Expr) -> Expr = {
   let taken = held.vars.fold(
     { e: e, used: [] },
-    |acc: { e: Expr, used: List<{ name: Bytes, at: Int, decl: Span }> }, x: { name: Bytes, at: Int, decl: Span }| {
-      let r = renamed_free(acc.e, x.name, snap_name(held, x.at));
+    |acc: { e: Expr, used: List<HeldVar> }, x: HeldVar| {
+      let r = renamed_free(held.locals, acc.e, x.binder, snap_name(held, x.at));
       { e: r.e, used: if r.hit { acc.used.push(x) } else { acc.used } }
     },
   );
@@ -362,7 +361,7 @@ fn snapshot(held: Held, e: Expr) -> Expr = {
     let from = expr_span(e);
     EBlock({
       span: minted(from, role_snapshot_block()),
-      stmts: taken.used.map(|x: { name: Bytes, at: Int, decl: Span }|
+      stmts: taken.used.map(|x: HeldVar|
         SLet({
           span: made_at(x.decl, from, role_snapshot_let(x.at)),
           pat: bound_at(snap_name(held, x.at), made_at(x.decl, from, role_snapshot_binder(x.at))),
@@ -376,244 +375,21 @@ fn snapshot(held: Held, e: Expr) -> Expr = {
 
 type Renamed = { e: Expr, hit: Bool }
 
-/// `e` with each free `from` read as `to`, and whether there was one.
-fn renamed_free(e: Expr, from: Bytes, to: Bytes) -> Renamed = {
-  let go = |x: Expr| renamed_free(x, from, to);
-  let all = |xs: List<Expr>|
-    xs.fold({ es: [], hit: false }, |acc: { es: List<Expr>, hit: Bool }, x: Expr| {
-      let r = go(x);
-      { es: acc.es.push(r.e), hit: acc.hit || r.hit }
-    });
-  // Under binders that hide `from`, nothing is free.
-  let under = |names: List<Bytes>, x: Expr|
-    if names.contains(from) { { e: x, hit: false } } else { go(x) };
-  match e {
-    EVar(v) -> if v.name.module == None && v.name.name.name == from {
-      { e: EVar({ ..v, name: bare({ name: to, span: v.name.name.span }) }), hit: true }
-    } else { { e: e, hit: false } },
-    ELambda(l) -> {
-      let r = under(l.params.map(|p: Param| p.name.name), l.body);
-      { e: ELambda({ ..l, body: r.e }), hit: r.hit }
-    },
-    EBlock(b) -> {
-      let walked = b.stmts.fold(
-        { stmts: [], hit: false, hidden: false },
-        |acc: { stmts: List<Stmt>, hit: Bool, hidden: Bool }, s: Stmt|
-          if acc.hidden { { ..acc, stmts: acc.stmts.push(s) } } else {
-            match s {
-              SLet(l) -> {
-                let r = go(l.value);
-                {
-                  stmts: acc.stmts.push(SLet({ ..l, value: r.e })),
-                  hit: acc.hit || r.hit,
-                  hidden: pattern_binders(l.pat, []).contains(from),
-                }
-              },
-              SLetElse(l) -> {
-                let r = go(l.value);
-                let f = go(l.fallback);
-                {
-                  stmts: acc.stmts.push(SLetElse({ ..l, value: r.e, fallback: f.e })),
-                  hit: acc.hit || r.hit || f.hit,
-                  hidden: pattern_binders(l.pat, []).contains(from),
-                }
-              },
-              SExpr(x) -> {
-                let r = go(x);
-                { ..acc, stmts: acc.stmts.push(SExpr(r.e)), hit: acc.hit || r.hit }
-              },
-              SAssign(a) -> {
-                let r = go(a.value);
-                {
-                  ..acc,
-                  stmts: acc.stmts.push(SAssign({ ..a, value: r.e })),
-                  hit: acc.hit || r.hit,
-                }
-              },
-            }
-          },
-      );
-      let t = match b.tail {
-        Some(x) -> if walked.hidden { { e: x, hit: false } } else { go(x) },
-        None -> { e: EBad({ span: b.span }), hit: false },
-      };
-      {
-        e: EBlock({
-          ..b,
-          stmts: walked.stmts,
-          tail: match b.tail { Some(_) -> Some(t.e), None -> None },
-        }),
-        hit: walked.hit || t.hit,
-      }
-    },
-    EMatch(m) -> {
-      let s = go(m.scrutinee);
-      let arms = m.arms.fold(
-        { arms: [], hit: s.hit },
-        |acc: { arms: List<MatchArm>, hit: Bool }, arm: MatchArm| {
-          let names = pattern_binders(arm.pat, []);
-          let g = match arm.guard {
-            Some(x) -> {
-              let r = under(names, x);
-              { e: Some(r.e), hit: r.hit }
-            },
-            None -> { e: None, hit: false },
-          };
-          let b = under(names, arm.body);
-          { arms: acc.arms.push({ ..arm, guard: g.e, body: b.e }), hit: acc.hit || g.hit || b.hit }
-        },
-      );
-      { e: EMatch({ ..m, scrutinee: s.e, arms: arms.arms }), hit: arms.hit }
-    },
-    EHandle(h) -> {
-      // Each initializer sees the variables above it, which may hide `from`.
-      let inits = h.vars.fold(
-        { vs: [], hidden: false },
-        |acc: { vs: List<{ v: HandlerVar, hit: Bool }>, hidden: Bool }, v: HandlerVar| {
-          let r = if acc.hidden { { e: v.init, hit: false } } else { go(v.init) };
-          {
-            vs: acc.vs.push({ v: { ..v, init: r.e }, hit: r.hit }),
-            hidden: acc.hidden || v.name.name == from,
-          }
-        },
-      ).vs;
-      let body = go(h.body);
-      let held = h.vars.map(|v: HandlerVar| v.name.name);
-      let cs = h.clauses.fold(
-        { cs: [], hit: false },
-        |acc: { cs: List<HandleClause>, hit: Bool }, c: HandleClause| {
-          let r = under(held.concat(clause_binders(c)), c.body);
-          { cs: acc.cs.push({ ..c, body: r.e }), hit: acc.hit || r.hit }
-        },
-      );
-      let ret = match h.ret {
-        Some(rc) -> {
-          let r = under(held.push(rc.binder.name), rc.body);
-          { e: Some({ ..rc, body: r.e }), hit: r.hit }
-        },
-        None -> { e: None, hit: false },
-      };
-      {
-        e: EHandle({
-          ..h,
-          body: body.e,
-          clauses: cs.cs,
-          ret: ret.e,
-          vars: inits.map(|x: { v: HandlerVar, hit: Bool }| x.v),
-        }),
-        hit: inits.fold(false, |acc: Bool, x: { v: HandlerVar, hit: Bool }| acc || x.hit)
-          || body.hit
-          || cs.hit
-          || ret.hit,
-      }
-    },
-    EWithHold(c) -> {
-      let a = go(c.acquire);
-      let r = go(c.release);
-      let b = under([c.binder.name], c.body);
-      { e: EWithHold({ ..c, acquire: a.e, release: r.e, body: b.e }), hit: a.hit || r.hit || b.hit }
-    },
-    ESimulate(x) -> {
-      let r = go(x.body);
-      { e: ESimulate({ ..x, body: r.e }), hit: r.hit }
-    },
-    EParallel(x) -> {
-      let r = all(x.branches);
-      { e: EParallel({ ..x, branches: r.es }), hit: r.hit }
-    },
-    ETryBlock(x) -> {
-      let r = go(x.body);
-      { e: ETryBlock({ ..x, body: r.e }), hit: r.hit }
-    },
-    EBinary(b) -> {
-      let l = go(b.lhs);
-      let r = go(b.rhs);
-      { e: EBinary({ ..b, lhs: l.e, rhs: r.e }), hit: l.hit || r.hit }
-    },
-    EUnary(u) -> {
-      let r = go(u.operand);
-      { e: EUnary({ ..u, operand: r.e }), hit: r.hit }
-    },
-    EApp(a) -> {
-      let f = go(a.func);
-      let xs = all(a.args);
-      let ns = a.named.map(|n: NamedArg| {
-        let r = go(n.value);
-        { n: { ..n, value: r.e }, hit: r.hit }
-      });
-      {
-        e: EApp({
-          ..a,
-          func: f.e,
-          args: xs.es,
-          named: ns.map(|x: { n: NamedArg, hit: Bool }| x.n),
-        }),
-        hit: f.hit || xs.hit
-          || ns.fold(false, |acc: Bool, x: { n: NamedArg, hit: Bool }| acc || x.hit),
-      }
-    },
-    EIf(i) -> {
-      let c = go(i.cond);
-      let t = go(i.then_branch);
-      let f = go(i.else_branch);
-      {
-        e: EIf({ ..i, cond: c.e, then_branch: t.e, else_branch: f.e }),
-        hit: c.hit || t.hit || f.hit,
-      }
-    },
-    ERecord(r) -> {
-      let fs = renamed_fields(r.fields, from, to);
-      { e: ERecord({ ..r, fields: fs.fields }), hit: fs.hit }
-    },
-    ERecordUpdate(r) -> {
-      let b = go(r.base);
-      let fs = renamed_fields(r.fields, from, to);
-      { e: ERecordUpdate({ ..r, base: b.e, fields: fs.fields }), hit: b.hit || fs.hit }
-    },
-    ETry(t) -> {
-      let r = go(t.operand);
-      { e: ETry({ ..t, operand: r.e }), hit: r.hit }
-    },
-    EField(f) -> {
-      let r = go(f.base);
-      { e: EField({ ..f, base: r.e }), hit: r.hit }
-    },
-    EList(l) -> {
-      let r = all(l.items);
-      { e: EList({ ..l, items: r.es }), hit: r.hit }
-    },
-    EPerform(p) -> {
-      let r = all(p.args);
-      { e: EPerform({ ..p, args: r.es }), hit: r.hit }
-    },
-    ETagged(t) -> {
-      let hs = t.holes.map(|h: Hole| {
-        let r = go(h.value);
-        { h: { ..h, value: r.e }, hit: r.hit }
-      });
-      {
-        e: ETagged({ ..t, holes: hs.map(|x: { h: Hole, hit: Bool }| x.h) }),
-        hit: hs.fold(false, |acc: Bool, x: { h: Hole, hit: Bool }| acc || x.hit),
-      }
-    },
-    ELit(_) -> { e: e, hit: false },
-    EHole(_) -> { e: e, hit: false },
-    EBad(_) -> { e: e, hit: false },
-  }
-}
-
-fn renamed_fields(
-  fs: List<RecField>,
-  from: Bytes,
-  to: Bytes,
-) -> { fields: List<RecField>, hit: Bool } = {
-  let rs = fs.map(|f: RecField| {
-    let r = renamed_free(f.value, from, to);
-    { f: { ..f, value: r.e }, hit: r.hit }
-  });
+/// `e` with each read of the local bound at `binder` read as `to`, and whether there was one.
+fn renamed_free(locals: Map<Int, Int>, e: Expr, binder: Int, to: Bytes) -> Renamed = {
+  let reads = |x: Expr|
+    match x {
+      EVar(v) -> v.name.module == None && locals.get(v.name.name.span.site) == Some(binder),
+      _ -> false,
+    };
   {
-    fields: rs.map(|x: { f: RecField, hit: Bool }| x.f),
-    hit: rs.fold(false, |acc: Bool, x: { f: RecField, hit: Bool }| acc || x.hit),
+    e: map_expr(e, |x: Expr|
+      match x {
+        EVar(v) -> if reads(x) { EVar({ ..v, name: bare({ name: to, span: v.name.name.span }) }) }
+        else { x },
+        _ -> x,
+      }),
+    hit: nodes_of(e).any(reads),
   }
 }
 

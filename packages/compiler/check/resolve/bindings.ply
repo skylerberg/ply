@@ -32,8 +32,8 @@ pub type Refers =
   | Unbound
 
 /// A name as written: the site of its node, where its text starts and ends, the text, and what it
-/// refers to. `shorthand` is a record pattern's field written by its name alone, `{ x }`, where one
-/// name is both the field and the local it binds.
+/// refers to. `shorthand` is a record's or a record pattern's field written by its name alone,
+/// `{ x }`, where one name is both the field and what it reads or binds.
 pub type Reference = {
   site: Int,
   start: Int,
@@ -118,16 +118,20 @@ fn definition(w: Walk, namespace: Namespace, qname: QName) -> Refers / {abort.ra
     None -> Unbound,
   }
 
+/// What `qname`'s qualifier names: a module, or a type whose function `qname` is.
 fn qualifier(w: Walk, qname: QName) -> Walk / {abort.raise} =
   match qname.module {
     None -> w,
     Some(q) -> match (w.module_named)(q.name) {
       Some(m) -> noted(w, q, Module(m), false),
-      None -> w,
+      None -> match definition(w, TypeSpace, bare(q)) {
+        Unbound -> w,
+        type_named -> noted(w, q, type_named, false),
+      },
     },
   }
 
-fn value_named(w: Walk, qname: QName) -> Walk / {abort.raise} = {
+fn value_named(w: Walk, qname: QName, shorthand: Bool) -> Walk / {abort.raise} = {
   let refers = match qname.module {
     None -> match local(w, qname.name.name) {
       Some(r) -> r,
@@ -135,8 +139,14 @@ fn value_named(w: Walk, qname: QName) -> Walk / {abort.raise} = {
     },
     Some(_) -> definition(w, ValueSpace, qname),
   };
-  noted(qualifier(w, qname), qname.name, refers, false)
+  noted(qualifier(w, qname), qname.name, refers, shorthand)
 }
+
+fn walk_field(w: Walk, field: RecField) -> Walk / {abort.raise} =
+  match field.value {
+    EVar(v) -> value_named(w, v.name, v.name.name.span.start == field.name.span.start),
+    _ -> walk_expr(w, field.value),
+  }
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
   noted(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
@@ -253,7 +263,7 @@ fn walk_clause(w: Walk, vars: List<HandlerVar>, c: HandleClause) -> Walk / {abor
 
 fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
   match e {
-    EVar(v) -> value_named(w, v.name),
+    EVar(v) -> value_named(w, v.name, false),
     EBinary(b) -> walk_expr(walk_expr(w, b.lhs), b.rhs),
     EUnary(u) -> walk_expr(w, u.operand),
     ELambda(l) -> popped(walk_expr(walk_optional_type(walk_params(w, l.params), l.ret), l.body)),
@@ -273,9 +283,8 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
       let stmts = b.stmts.fold(pushed(w), walk_stmt);
       popped(match b.tail { Some(t) -> walk_expr(stmts, t), None -> stmts })
     },
-    ERecord(r) -> r.fields.fold(w, |acc: Walk, field: RecField| walk_expr(acc, field.value)),
-    ERecordUpdate(u) ->
-      u.fields.fold(walk_expr(w, u.base), |acc: Walk, field: RecField| walk_expr(acc, field.value)),
+    ERecord(r) -> r.fields.fold(w, walk_field),
+    ERecordUpdate(u) -> u.fields.fold(walk_expr(w, u.base), walk_field),
     ETry(t) -> walk_expr(w, t.operand),
     EField(f) -> walk_expr(w, f.base),
     EList(l) -> l.items.fold(w, walk_expr),
@@ -427,6 +436,11 @@ pub fn expression_binders(
 /// how code made after the check, which no resolution reads, finds its locals.
 pub fn body_binders(params: List<Ident>, body: Expr) -> Map<Int, Int> / {abort.raise} =
   binders_of(walk_expr(params.fold(pushed(unresolved()), bound), body).found)
+
+/// The binder of each local `item` names, by the site of the name, with nothing resolved: how a
+/// walk that reads the item as written, as hashing does, finds its locals.
+pub fn item_locals(item: Item) -> Map<Int, Int> / {abort.raise} =
+  binders_of(walk_item(unresolved(), item).found)
 
 fn binders_of(found: Map<Int, Reference>) -> Map<Int, Int> =
   found.fold(Map::new(), |binders: Map<Int, Int>, site: Int, r: Reference|
