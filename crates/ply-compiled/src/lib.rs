@@ -13,7 +13,6 @@ pub mod entry;
 pub mod flat;
 pub mod frames;
 pub mod heap;
-pub mod host;
 pub mod hosted;
 pub mod machine;
 pub mod native;

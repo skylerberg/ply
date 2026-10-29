@@ -112,9 +112,7 @@ CLI_TREE_CHECKS=(
 )
 
 # `probes/` directories no cargo build reaches, as `dir:job`; the job must be in `ci`'s `needs`.
-declare -a PROBE_JOBS=(
-  "ucontext:plan"
-)
+declare -a PROBE_JOBS=()
 
 # `<family>-<run id>` entries only the newest of which is ever restored. What one job hands the jobs
 # of its own run is never a cache, which the repository's other runs evict while those jobs wait for

@@ -1,0 +1,361 @@
+//! A body stopped where a clause resumes it off its tail holds what it held at the stop when it
+//! resumes: every kind of value, held by the performing frame or by any frame or runtime frame
+//! under it, read after the resumption with the heap churned while the body waited, and given back
+//! once.
+
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+effect pick {
+  read choose() -> Int
+}
+
+fn made(n: Int) -> Result<Int, String> =
+  if n > 0 { Err(Int::to_string(n).concat(" was too big for this")) } else { Ok(n) }
+
+/// Strings made and let go, so a block the body held would be made again were it freed.
+fn churned() -> Int =
+  range(0, 16).map(|i: Int| i.to_string().concat(" churned")).fold(0, |n: Int, s: String|
+    n + s.len())
+
+fn kept_err(n: Int) -> Int =
+  handle {
+    let r = made(n);
+    let b = amb.flip[coin]();
+    match r { Err(s) -> s.len() * (if b { 1 } else { 100 }), Ok(x) -> x }
+  } with {
+    amb.flip[coin]() resume k -> {
+      let answer = k(churned() > 0);
+      answer
+    },
+    return x -> x,
+  }
+
+test "an Err held across a stop is there when it resumes" { assert_eq(kept_err(5), 22) }
+
+/// What `body` answers resumed with `true` past a churn of the heap, off the clause's tail, so the
+/// body waits on a stack of its own.
+fn resumed<a>(body: () -> a / {abort.raise, amb.flip[coin]}) -> List<a> / {abort.raise} =
+  handle {
+    [body()]
+  } with {
+    amb.flip[coin]() resume k -> {
+      let answer: List<a> = k(churned() > 0);
+      answer
+    },
+  }
+
+/// Whether `ok` holds of what `make` made, held across a stop, after the resumption.
+fn kept<a>(
+  make: () -> a / {abort.raise},
+  ok: (a, Bool) -> Bool / {abort.raise},
+) -> List<Bool> / {abort.raise} =
+  resumed(|| {
+    let x = make();
+    let b = amb.flip[coin]();
+    ok(x, b)
+  })
+
+fn word(b: Bool) -> String = if b { "yes" } else { "no" }
+
+fn text(n: Int, s: String) -> String = n.to_string().concat(s)
+
+type Shape = | A(String) | B(List<Int>) | C
+
+type Mixed = | N(Int) | S(String)
+
+type Small = { s: String, n: Int }
+
+type Big = { a: String, b: Int, c: Small, d: Option<String>, e: Mixed, f: (Int, Int, Int, Int) }
+
+test "a sum of every shape held across a stop is there when it resumes" {
+  let once = [true];
+  assert_eq(
+    kept(|| made(7), |r: Result<Int, String>, _: Bool| r == Err("7 was too big for this")),
+    once,
+  );
+  assert_eq(kept(|| made(0), |r: Result<Int, String>, _: Bool| r == Ok(0)), once);
+  assert_eq(
+    kept(
+      || if churned() > 0 { Ok(text(3, "ok")) } else { Err(0) },
+      |r: Result<String, Int>, _: Bool| r == Ok("3ok"),
+    ),
+    once,
+  );
+  assert_eq(kept(|| Some(text(4, "some")), |o: Option<String>, _: Bool| o == Some("4some")), once);
+  assert_eq(
+    kept(|| if churned() < 0 { Some(text(4, "x")) } else { None }, |o: Option<String>, _: Bool|
+      o == None),
+    once,
+  );
+  assert_eq(kept(|| A(text(5, "a")), |x: Shape, _: Bool| x == A("5a")), once);
+  assert_eq(kept(|| B([5, 6, churned()]), |x: Shape, _: Bool| x == B([5, 6, churned()])), once);
+  assert_eq(kept(|| C, |x: Shape, _: Bool| x == C), once);
+  assert_eq(
+    kept(|| [N(8), S(text(8, "s")), N(4096)], |xs: List<Mixed>, _: Bool|
+      xs == [N(8), S("8s"), N(4096)]),
+    once,
+  )
+}
+
+test "a record carried as its fields, and one past a call's registers holding a record and a sum, are there when it resumes" {
+  let once = [true];
+  assert_eq(
+    kept(|| { s: text(6, "small"), n: 6 }, |x: Small, _: Bool| x == { s: "6small", n: 6 }),
+    once,
+  );
+  assert_eq(
+    kept(
+      ||
+        {
+          a: text(7, "a"),
+          b: 7,
+          c: { s: text(7, "c"), n: 70 },
+          d: Some(text(7, "d")),
+          e: S(text(7, "e")),
+          f: (7, 7, 7, 7),
+        },
+      |x: Big, _: Bool|
+        x == { a: "7a", b: 7, c: { s: "7c", n: 70 }, d: Some("7d"), e: S("7e"), f: (7, 7, 7, 7) },
+    ),
+    once,
+  )
+}
+
+test "strings, bytes, lists, maps and arrays held across a stop are there when it resumes" {
+  let once = [true];
+  assert_eq(kept(|| text(9, "str"), |s: String, _: Bool| s == "9str"), once);
+  assert_eq(kept(|| Bytes::of_string(text(9, "bytes")), |s: Bytes, _: Bool| s == b"9bytes"), once);
+  assert_eq(
+    kept(|| [text(9, "a"), text(9, "b")], |xs: List<String>, _: Bool| xs == ["9a", "9b"]),
+    once,
+  );
+  assert_eq(
+    kept(|| Map::new().insert(text(9, "k"), 9), |m: Map<String, Int>, _: Bool|
+      m.get("9k") == Some(9) && m.len() == 1),
+    once,
+  );
+  assert_eq(
+    kept(|| Array::of_list([{ s: text(9, "arr") }]), |xs: Array<{ s: String }>, _: Bool|
+      xs.at(0) == Some({ s: "9arr" }) && xs.len() == 1),
+    once,
+  )
+}
+
+test "a closure and a named function held across a stop are there when it resumes" {
+  let once = [true];
+  let tail = text(2, "tail");
+  assert_eq(
+    kept(|| |s: String| s.concat(tail), |f: (String) -> String, b: Bool|
+      f(word(b)) == word(b).concat("2tail")),
+    once,
+  );
+  assert_eq(kept(|| Int::to_string, |f: (Int) -> String, _: Bool| f(12) == "12"), once)
+}
+
+test "a scalar of every width held across a stop is what it was when it resumes" {
+  let once = [true];
+  assert_eq(
+    kept(|| [0, 8, 4096, 9223372036854775807, 0 - 4611686018427387905], |xs: List<Int>, _: Bool|
+      xs == [0, 8, 4096, 9223372036854775807, 0 - 4611686018427387905]),
+    once,
+  );
+  assert_eq(kept(|| Float::of_bits(9221120237041090561), |x: Float, _: Bool| x != x), once);
+  assert_eq(kept(|| 1.25m + Decimal::of_int(churned()), |x: Decimal, _: Bool| x > 1.25m), once);
+  assert_eq(kept(|| 'z', |x: Char, _: Bool| x == 'z'), once);
+  assert_eq(kept(|| U8::of_int(200), |x: U8, _: Bool| to_int(x) == Some(200)), once);
+  assert_eq(
+    kept(|| I64::of_int(9223372036854775807), |x: I64, _: Bool|
+      to_int(x) == Some(9223372036854775807)),
+    once,
+  );
+  assert_eq(kept(|| churned() > 0, |x: Bool, _: Bool| x), once);
+  assert_eq(kept(|| (), |x: Unit, _: Bool| x == ()), once)
+}
+
+/// A body holding one value of each kind in its own frame across one stop, read after it.
+fn many(n: Int) -> List<String> =
+  handle {
+    let s = text(n, "s");
+    let o = Some(text(n, "o"));
+    let r: Result<Int, String> = Err(text(n, "r"));
+    let shape = A(text(n, "a"));
+    let small = { s: text(n, "m"), n: n };
+    let xs = [text(n, "x")];
+    let m = Map::new().insert(text(n, "k"), n);
+    let f = |t: String| t.concat(s);
+    let b = amb.flip[coin]();
+    [
+      [
+        s,
+        match o { Some(v) -> v, None -> "" },
+        match r { Err(e) -> e, Ok(_) -> "" },
+        match shape { A(v) -> v, _ -> "" },
+        small.s,
+        xs.fold("", String::concat),
+        match m.get(text(n, "k")) { Some(v) -> v.to_string(), None -> "" },
+        f(word(b)),
+      ].fold("", |acc: String, t: String| acc.concat(t).concat(",")),
+    ]
+  } with {
+    amb.flip[coin]() resume k -> {
+      let answer: List<String> = k(churned() > 0);
+      answer
+    },
+  }
+
+test "what one frame holds of each kind is there when it resumes, and given back once" {
+  assert_eq(many(3), ["3s,3o,3r,3a,3m,3x,3,yes3s,"])
+}
+
+fn under_two(n: Int) -> String / {amb.flip[coin]} = {
+  let t = text(n, "two");
+  t.concat(word(amb.flip[coin]()))
+}
+
+fn under_one(n: Int) -> String / {amb.flip[coin]} = {
+  let t = text(n, "one");
+  under_two(n).concat(t)
+}
+
+fn applied(f: (Int) -> String / {amb.flip[coin]}) -> String / {amb.flip[coin]} = f(1)
+
+/// `x`, of the function's own type variable, held across a stop and handed back: the function lets
+/// go of no count of it, so only its frame's record holds it while the body waits.
+fn across<a>(x: a) -> a / {amb.flip[coin]} = {
+  let b = amb.flip[coin]();
+  if b { x } else { x }
+}
+
+/// `x` held across a stop and handed on to another generic function.
+fn handed_on<a>(x: a) -> List<a> / {amb.flip[coin]} = {
+  let b = amb.flip[coin]();
+  twice_over(x, b)
+}
+
+fn twice_over<a>(x: a, b: Bool) -> List<a> = if b { [x] } else { [x, x] }
+
+test "what callers two frames down, a lent lambda and a call through a value hold is there when it resumes" {
+  assert_eq(resumed(|| under_one(4)), ["4twoyes4one"]);
+  let s = text(4, "lent");
+  assert_eq(resumed(|| applied(|i: Int| s.concat(word(amb.flip[coin]())))), ["4lentyes"]);
+  let f: (Int) -> String / {amb.flip[coin]} = under_one;
+  assert_eq(resumed(|| f(4)), ["4twoyes4one"])
+}
+
+test "a generic function holding a value of its type variable across a stop keeps it, at every counted type" {
+  assert_eq(resumed(|| across(text(4, "g"))), ["4g"]);
+  assert_eq(resumed(|| across({ s: text(4, "r"), n: 4 })), [{ s: "4r", n: 4 }]);
+  assert_eq(resumed(|| across(Some(text(4, "o")))), [Some("4o")]);
+  assert_eq(resumed(|| handed_on(text(4, "h"))), [["4h"]]);
+  assert_eq(resumed(|| handed_on(made(4))), [[made(4)]])
+}
+
+test "a stacked closure's capture is there when each stop its callback makes resumes" {
+  let s = text(1, "cap");
+  assert_eq(
+    resumed(|| [1, 2].map(|x: Int| s.concat(word(amb.flip[coin]()))).fold("", String::concat)),
+    ["1capyes1capyes"],
+  )
+}
+
+test "what a frame holds under a runtime's frame is there when it resumes" {
+  let held = |f: () -> String / {abort.raise, amb.flip[coin]}| {
+    let t = text(6, "held");
+    f().concat(t)
+  };
+  assert_eq(
+    resumed(||
+      held(|| {
+        let p = parallel { text(1, "par").concat(word(amb.flip[coin]())), text(1, "q") };
+        p._0.concat(p._1)
+      })),
+    ["1paryes1q6held"],
+  );
+  assert_eq(
+    resumed(||
+      held(||
+        bracket(|| text(6, "b"), |s: String| (), |s: String| s.concat(word(amb.flip[coin]()))))),
+    ["6byes6held"],
+  );
+  assert_eq(
+    resumed(||
+      held(||
+        iterate(0, 10, |i: Int|
+          if i < 2 { Continue(i + 1) } else { Stop(word(amb.flip[coin]())) }))),
+    ["yes6held"],
+  );
+  assert_eq(
+    resumed(||
+      held(|| handle { text(6, "r") } with { return x -> x.concat(word(amb.flip[coin]())) })),
+    ["6ryes6held"],
+  );
+  assert_eq(
+    resumed(||
+      held(|| {
+        let m = List::map;
+        m([1], |x: Int| word(amb.flip[coin]())).fold("", String::concat)
+      })),
+    ["yes6held"],
+  )
+}
+
+type Saved = | Done(String) | Parked(once (Bool) -> Saved)
+
+fn parked(n: Int) -> Saved =
+  handle {
+    let t = text(n, "parked");
+    Done(t.concat(word(amb.flip[coin]())))
+  } with {
+    amb.flip[coin]() resume k -> Parked(k),
+  }
+
+fn later(s: keep Saved) -> String =
+  match s {
+    Parked(k) -> {
+      let c = churned();
+      match k(c > 0) { Done(t) -> t, Parked(again) -> "" }
+    },
+    Done(t) -> t,
+  }
+
+test "a resumption after the handle returned finds what the body held" {
+  assert_eq(later(parked(2)), "2parkedyes")
+}
+
+test "a stop inside a handle in place holds what that handle's frame holds across its body" {
+  let nested = |n: Int| {
+    let t = text(n, "in");
+    let r = handle { text(n, "body").concat(word(amb.flip[coin]())) } with { pick.choose() -> 1 };
+    r.concat(t)
+  };
+  assert_eq(resumed(|| nested(7)), ["7bodyyes7in"])
+}
+
+/// A clause of an inner handle that resumes its continuation after a stop the outer clause
+/// resumes: the inner clause's run past that stop resumes the inner body.
+fn resumed_past_a_stop(n: Int) -> List<String> =
+  handle {
+    let held = text(n, "h");
+    let inner = handle {
+      let c = pick.choose();
+      held.concat(c.to_string())
+    } with {
+      pick.choose() resume k -> {
+        let b = amb.flip[coin]();
+        let resumed: String = k(if b { 1 } else { 2 });
+        resumed.concat("!")
+      },
+    };
+    [inner]
+  } with {
+    amb.flip[coin]() resume k -> {
+      let answer: List<String> = k(churned() > 0);
+      answer
+    },
+  }
+
+test "a clause resuming its body past a stop an outer clause resumes finds what the body held" {
+  assert_eq(resumed_past_a_stop(8), ["8h1!"])
+}

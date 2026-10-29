@@ -175,7 +175,6 @@ The following words are keywords only where shown, and ordinary identifiers ever
 | `release` | in `release for <Type> by <function>` (§7.1) |
 | `keep` | before a parameter's type, a function type's parameter, an operation's parameter, or a type parameter (§4.7, §7.1) |
 | `once` | before the `(` of a function type (§7.1) |
-| `multi` | before `read` or `write` in an operation declaration, and before a row parameter (§6.1, §6.6) |
 | `where`, `derivable`, `identity` | after a signature's row, after a type's parameter list, or after a law's binders; `identity(a)` at the start of a law's or schema's `where` |
 | `returns`, `fresh` | between a function's signature and its specifications |
 | `requires`, `ensures` | between a function's signature and its body |
@@ -940,8 +939,6 @@ write `<| e>` when there are no type parameters. A row variable among the type p
 
 - A type parameter marked `keep`, as in `<keep a>`, may be filled with a resource (§7.1). Filling
   an ordinary type parameter with a resource is `E0317`.
-- A row parameter marked `multi`, as in `<| multi e>`, may include `multi` operations, whose
-  handlers can resume the code more than once (§6.6).
 
 **Label parameters.** A name in brackets is a resource label parameter (§6.2): `fn relay<[l]>(b:
 Bytes) -> Unit / {net.send[l]} = net.send[l](b)`.
@@ -1120,8 +1117,10 @@ that releases them when it ends, and cannot outlive it.
 {db.read[users]}` and `(A) -> B / e` have effect rows. With no `/` the row is empty, both in
 signatures and in declared types. A function value may perform less than its type allows (§6.2).
 Functions cannot be compared, encoded, ordered or used as map keys. `once (A) -> B` is a function
-that may be called at most once and never copied; it is a resource (§7.1). `keep` before a function
-type's parameter means the function may keep what it is passed, as on a `fn` (§7.1).
+that may be called at most once and never copied; it is a resource (§7.1). A function that may be
+called again may be passed where a `once` one is expected, but a `once` one goes only where its
+type is written `once` (`E0201`). `keep` before a function type's parameter means the function may
+keep what it is passed, as on a `fn` (§7.1).
 
 **Written:** every parameter type and return type of a top-level `fn` (`E0126`), every `forall`
 binder type, and every top-level `fn`'s effect row. Callers, in this package or another, are
@@ -1390,7 +1389,7 @@ c])`, where `sum` walks the list with `at`. A list the function returns, stores,
 loop, or passes to a call that might keep it or an element of it (such as `List::fold`, which hands
 each element to a function value) is allocated. A frame holds at most 128 words of such lists
 (each list takes its elements' words plus three); further lists are allocated. Every list in a
-function that may be resumed more than once by a handler (§6.6) is allocated.
+function that may stop at a perform for a handler to resume later (§6.6) is allocated.
 
 ### 5.7 Iteration
 
@@ -1637,8 +1636,6 @@ Each operation is a `read`, a `write` or a `raise`.
   checker can tell that writing `[orders]` does not conflict with reading `[users]`.
 - `nondet` marks an effect whose results are not determined by the program's state, such as a
   clock or the network (§8.3).
-- `multi` before an operation's mode, `multi read flip[r]() -> Bool`, lets a handler resume the
-  code after the perform more than once (§6.6).
 - A parameter marked `keep` takes ownership of a resource the perform passes, instead of borrowing
   it (§7.1).
 
@@ -1868,12 +1865,11 @@ gets its handlers from where it is called, according to its row there; this incl
 
 ### 6.6 `resume`
 
-In `amb.flip[coin]() resume k -> k(true) + k(false)`, `resume k` binds the *continuation*: the
-rest of the body after the perform, as a function. The clause then has the `handle`'s type.
+In `amb.flip[coin]() resume k -> k(true) * 2`, `resume k` binds the *continuation*: the rest of
+the body after the perform, as a function. The clause then has the `handle`'s type.
 
-- `k` may be called at most once (`E0316`), unless the operation is declared `multi` (§6.1), as
-  `flip` is. Then it may be called any number of times, and the body is held to what running twice
-  allows (§7.1).
+- `k` is a `once` function (§4.7): it may be called at most once (`E0316`), and a value that holds
+  it is a resource (§7.1), so wherever `k` goes it is called at most once.
 - Without `resume`, a clause's value is returned to the perform site. A clause for a `raise` is
   different (§6.8).
 - `k` is a function value. It may be kept after the `handle` ends and called later. Whatever the
@@ -1891,9 +1887,8 @@ around it.
 - Nested brackets release innermost first.
 - A cancel does not interrupt an `acquire` or a `release`: it takes effect when that one returns
   (§9), so whatever was acquired is fully released.
-- The body receives what `acquire` returned as is, and may keep it past the release. A continuation
-  captured inside the body and resumed twice releases twice. `with_hold` (§7.2) is the bracket whose
-  body cannot keep what it holds and which releases exactly once.
+- The body receives what `acquire` returned as is, and may keep it past the release. `with_hold`
+  (§7.2) is the bracket whose body cannot keep what it holds.
 
 ### 6.7 Unhandled effects
 
@@ -2071,34 +2066,8 @@ A clause assigns a variable with `name = value;`, anywhere in its blocks and in 
   variables can be assigned.
 
 A clause without `resume` gives the body back the values it ended with. A clause with `resume k`
-continues the body, each time it calls `k`, with the values it holds then, and changes made during
-that resumption stay in it unless what it returns carries them out (as `return` can). Where a
-handler stands decides what a resumption sees. A handler inside the continuation that a clause
-resumes twice starts each resumption from the values it had when the continuation was captured. A
-handler outside it is shared by every resumption.
-
-```ply
-effect amb {
-  read flip() -> Bool
-}
-
-fn counted() -> Int / {amb.flip} =
-  handle {
-    tally.add(if amb.flip() { 1 } else { 10 })
-  } with {
-    var sum = 0,
-    tally.add(n) -> {
-      sum = sum + n;
-    },
-    return u -> sum,
-  }
-
-fn each() -> Int = handle { counted() } with { amb.flip() resume k -> k(true) + k(false) }
-```
-
-`each()` is `1 + 10`: `counted`'s handler is inside the continuation that `flip`'s clause resumes,
-so each resumption starts from `sum = 0`. If the handler were moved around `each`'s `handle`, there
-would be one shared `sum`, and the second resumption would add to what the first left.
+continues the body, when it calls `k`, with the values it holds then, and changes made during that
+resumption stay in it unless what it returns carries them out (as `return` can).
 
 Tasks spawned under a handler share its variables (§9). A clause runs without other tasks'
 clauses interleaving until it performs something that may wait, such as a `task` or `clock`
@@ -2218,12 +2187,8 @@ again.
   the owner holds the resource, but may not be returned, kept or stored (`E0318`).
 - A clause, a `return` clause, a `simulate` body and a `parallel` branch may run any number of
   times or none, so each may borrow a resource from outside but not consume it (`E0316`).
-- An operation's continuation (§6.6) is a resource too: unless the operation is `multi`, `resume
-  k` binds a `k` the clause may call at most once (`E0316`). A clause for a `multi` operation may
-  run the rest of the body more than once, so no resource may be live across a perform of one (or a
-  call that may perform one) (`E0319`), and no `nondet` operation may run after it, under the
-  clause that could resume it twice (`E0321`). Handle the `multi` operation in an inner `handle`
-  first.
+- An operation's continuation (§6.6) is a `once` function, so it is a resource too: `resume k`
+  binds a `k` the clause may call at most once (`E0316`).
 
 **Errors.**
 
@@ -2232,8 +2197,6 @@ again.
   a function that consumed one passed on; a continuation resumed twice.
 - `E0317`: a resource would be copied: compared, shown, or used as an ordinary type parameter.
 - `E0318`: a borrowed resource consumed, or a function borrowing one that might outlive it.
-- `E0319`: a resource live across a `multi` operation.
-- `E0321`: a `nondet` operation where a `multi` clause may resume the code twice.
 - `E0322`: a resource created or named where nothing owns it.
 - `E0323`: `keep` before a type that is neither a resource nor a function type.
 
@@ -2304,10 +2267,9 @@ hold: its functions take the `Hold`, and refuse to work on something already rel
 hold carries `hold.read[r]` in its row, so it must be built and consumed inside the region; letting
 it leave is `E0446`.
 
-A continuation captured inside a `with_hold` body and resumed after the hold was released (by a
-clause that resumes twice, §6.6) finds the hold gone. Its first `Hold::get`, or else the region's
-own `}`, ends the program with `E0331`, and `release` does not run again. Where the acquired value
-is a host resource, an at-most-once operation on it refuses the second resumption first (`E0426`).
+A continuation captured inside a `with_hold` body and resumed after the hold was released finds
+the hold gone. Its first `Hold::get`, or else the region's own `}`, ends the program with `E0331`,
+and `release` does not run again.
 
 **Errors.**
 
@@ -2319,8 +2281,8 @@ is a host resource, an at-most-once operation on it refuses the second resumptio
   mentioning `Hold`, `Task` or `Chan`; or a variant field, operation parameter or result holding a
   function whose written row reaches one (§4.6).
 - `E0449`: a task, channel or continuation reaching a host operation, a host result, or an entry
-  point's argument or result (at run time). A continuation's type is an ordinary function type, so
-  this is the only check that catches it.
+  point's argument or result (at run time). A continuation's type is a function type, so this is
+  the only check that catches it.
 
 ## 8. Tests
 

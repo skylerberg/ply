@@ -47,18 +47,30 @@ pub unsafe extern "C" fn rt_detached_open(
 /// The perform of the operation `op` describes, on the field-table entry `resource` and with the
 /// words at `args`, which this takes, answered off its tail by the clause whose record is at
 /// `record`: the `handle`'s body stops there, and the clause runs where it was entered or resumed
-/// from, which may resume it more than once where `again`. Answers what the body is resumed with.
+/// from. Answers what the body is resumed with.
+pub unsafe extern "C" fn rt_detached_perform(
+    ctx: *mut Ctx,
+    record: *const Word,
+    op: *const PlyOp,
+    resource: I64,
+    args: *const Handed,
+) -> Handed {
+    let described = unsafe { &*op };
+    let args = args_of(args.cast(), described.params_len).to_vec();
+    Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0) })
+}
+
+/// [`rt_detached_perform`] under the name and signature the released compiler's emitted code binds,
+/// which hands one word more; nothing reads it.
 pub unsafe extern "C" fn rt_detached_stop(
     ctx: *mut Ctx,
     record: *const Word,
     op: *const PlyOp,
     resource: I64,
     args: *const Handed,
-    again: I64,
+    _again: I64,
 ) -> Handed {
-    let described = unsafe { &*op };
-    let args = args_of(args.cast(), described.params_len).to_vec();
-    Handed::of(unsafe { crate::detached::stop_over(ctx, record, args, resource.0, again.0 != 0) })
+    unsafe { rt_detached_perform(ctx, record, op, resource, args) }
 }
 
 /// An operation's entry in an evidence object, as compiled code calls it: the slot's environment,

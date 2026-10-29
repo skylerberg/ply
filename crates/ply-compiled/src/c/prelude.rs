@@ -198,6 +198,12 @@ helpers! {
     rt_task_captures(op: *const PlyOp) -> Word;
     rt_task_raises(op: *const PlyOp, args: *const Handed) -> Word;
     rt_detached_open(body: Block, forwards: Block, instance: Block) -> Handed;
+    rt_detached_perform(
+        record: *const Word,
+        op: *const PlyOp,
+        resource: I64,
+        args: *const Handed
+    ) -> Handed;
     rt_detached_stop(
         record: *const Word,
         op: *const PlyOp,

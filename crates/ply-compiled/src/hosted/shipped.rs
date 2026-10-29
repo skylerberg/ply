@@ -2,7 +2,7 @@
 //! what this binary ships, which `ply-privileged` holds and installs, a function of the binary
 //! alone, so each is asked as computing; and the units a load enters for its derivers.
 
-use super::{COMPUTES, granted, text_at};
+use super::{Deterministic, granted, text_at};
 use crate::c::{MachineNative, machine_native};
 use crate::entry::{self, Ended, Opened, Run};
 use crate::native::{Addr, I64, TakenBytes};
@@ -91,7 +91,7 @@ fn shipping(
         ctx,
         "shipped",
         native,
-        COMPUTES,
+        Deterministic,
         TakenBytes(0),
         |c| match SHIPS.get() {
             Some(ships) => answer(c, ships.as_ref()),

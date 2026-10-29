@@ -97,9 +97,6 @@ pub struct Ctx {
     pub(crate) runtime_factory: ply_core::RuntimeFactory,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_core::host::HostUse,
-    pub(crate) host_ops: u64,
-    /// The last at-most-once host operation this entry performed, for `E0426`.
-    pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_core::host::MachineId,
     /// Whether the entry's branches ran on the pool's threads, whose blocks then hold its objects too.
     pub(crate) pooled: bool,
@@ -168,18 +165,6 @@ impl Unanswered {
     pub(crate) fn release(self) {
         if let Unanswered::Raised { args, .. } = self {
             args.release();
-        }
-    }
-
-    /// The same raise, what it carries held once more.
-    pub(crate) fn copied(&self) -> Unanswered {
-        match self {
-            Unanswered::Abort(message) => Unanswered::Abort(message.clone()),
-            Unanswered::Raised { effect, op, args } => Unanswered::Raised {
-                effect: effect.clone(),
-                op: op.clone(),
-                args: args.copied(),
-            },
         }
     }
 }
@@ -256,8 +241,6 @@ impl Ctx {
             runtime_factory: ply_host::registry::unbound(),
             re_executed: false,
             host_use: ply_core::host::HostUse::default(),
-            host_ops: 0,
-            last_linear: None,
             id: ply_core::host::MachineId::next(),
             pooled: false,
             teardown: Vec::new(),
@@ -341,10 +324,6 @@ impl Ctx {
         self.grown += branch.grown;
         self.performed.append(&mut branch.performed);
         self.host_use.absorb(&branch.host_use);
-        self.host_ops = self.host_ops.saturating_add(branch.host_ops);
-        if branch.last_linear.is_some() {
-            self.last_linear = branch.last_linear.take();
-        }
         self.teardown.append(&mut branch.teardown);
     }
 
@@ -389,7 +368,6 @@ impl Ctx {
         self.stack_floor.store(stack_floor(), Relaxed);
         self.frames = std::ptr::null_mut();
         self.site_root = -1;
-        self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Vec::new());
@@ -755,13 +733,9 @@ impl Ctx {
         self.diagnostic.take()
     }
 
-    /// What the run asked of the host since the last take, and how many of those asks were
-    /// at-most-once operations.
-    pub fn take_host_use(&mut self) -> (ply_core::host::HostUse, u64) {
-        (
-            std::mem::take(&mut self.host_use),
-            std::mem::take(&mut self.host_ops),
-        )
+    /// What the run asked of the host since the last take.
+    pub fn take_host_use(&mut self) -> ply_core::host::HostUse {
+        std::mem::take(&mut self.host_use)
     }
 }
 

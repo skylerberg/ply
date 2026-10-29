@@ -46,9 +46,9 @@ pub(crate) fn release_fun(f: Word) {
     unsafe { Block::of(f).let_go_function(running()) };
 }
 
-/// What a runtime frame holds while it calls into the program. A frame's locals are on the stack a
-/// snapshot copies byte for byte, so memory one owned would be freed once per restore; what is kept
-/// in [`Ctx::stacks`] is copied with the snapshot instead, and a restore puts the copy back.
+/// What a runtime frame holds while it calls into the program. A frame's locals are on a stack
+/// that is never unwound where its body is abandoned, so what one owned would never be let go;
+/// what is kept in [`Ctx::stacks`] is let go with the stack instead.
 pub(crate) enum Kept {
     /// The pending raise a `bracket`'s release runs during, and the failure it carries.
     Pending(Unanswered, Option<Diagnostic>),
@@ -61,24 +61,17 @@ pub(crate) enum Kept {
 
 impl Kept {
     pub(crate) fn release(self) {
-        if let Kept::Pending(raise, _) = self {
-            raise.release();
-        }
-    }
-
-    /// The same, what it holds held once more, for a snapshot of its stack.
-    pub(crate) fn copied(&self) -> Kept {
         match self {
-            Kept::Pending(raise, failure) => Kept::Pending(raise.copied(), failure.clone()),
-            Kept::Args(words) => Kept::Args(words.clone()),
-            Kept::Clause(id) => Kept::Clause(*id),
+            Kept::Pending(raise, _) => raise.release(),
+            // The clause took the words; only their buffer goes.
+            Kept::Args(words) => drop(words),
+            Kept::Clause(_) => {}
         }
     }
 }
 
-/// `clause` called with `args`, which it takes. The clause reads its arguments from where a
-/// snapshot of this stack copies them, so a stop inside it that is resumed more than once frees
-/// them once a resume.
+/// `clause` called with `args`, which it takes as it is entered. Their buffer is kept rather than
+/// owned by this frame, so a clause abandoned at a stop inside it still gives the buffer back.
 pub(crate) fn call_clause(ctx: *mut Ctx, clause: Word, args: Vec<Word>) -> Word {
     let c = unsafe { &mut *ctx };
     let at = args.as_ptr();
@@ -93,11 +86,6 @@ pub(crate) fn call_clause(ctx: *mut Ctx, clause: Word, args: Vec<Word>) -> Word 
 pub(crate) struct Raised(pub(crate) Vec<Carried>);
 
 impl Raised {
-    pub(super) fn copied(&self) -> Raised {
-        let ctx = running();
-        Raised(self.0.iter().map(|v| v.dup(ctx)).collect())
-    }
-
     pub(crate) fn release(self) {
         let ctx = running();
         self.0.into_iter().for_each(|v| v.release(ctx));
