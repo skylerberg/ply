@@ -12,7 +12,8 @@ import compiler.emit.answer (Answer, RootAnswer, Tables, Defined, Head, Expect, 
                              tables_bin, root_answer_bin, no_tables, GenericCall, Generics, Need,
                              Pass, Reads, Scalar, Layout, Exact, Rowed, settled_by_callers,
                              Published)
-import compiler.emit.tir.statics (StaticDef, SFile, StaticWord, WField, named, words_of)
+import compiler.emit.tir.statics (StaticDef, SFile, SPlain, StaticWord, WField, WAddress, named,
+                                  words_of)
 import compiler.emit.print.statics (static_c, static_extern, escaped, c_string)
 import compiler.emit.release (root_of)
 import compiler.emit.statics (SStr, statics_of)
@@ -44,7 +45,8 @@ import compiler.check.infer.definitions (Extern, externs_in, declared_natives, p
                                          MachineHanded, MachineFunction, MachineUnit)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.print.head (unit_head, unit_tail, bound, pointer_declared)
-import compiler.cc (tail_mark)
+import compiler.cc
+import compiler.cc (part_mark)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Runtime, Unserved, unserved, unserved_line, runtime_of,
                           uniform_native, serving, Machine, machine_name)
@@ -56,7 +58,7 @@ import compiler.check.resolve.tables (Diag, Label, error_with_labels)
 import std.bin
 import std.list
 import std.graph
-import std.bytes (u64_le, hex_digit, ascii_of_int)
+import std.bytes (u64_le, u64_be, ascii_of_int)
 import std.fs
 import std.fs (fs)
 import std.hash (blake3)
@@ -559,9 +561,9 @@ pub fn keep_file<[r]>(
 }
 
 /// A root a unit is offered: its arity, whether it is pure and takes nothing, which the unit gives a
-/// memo slot, and the root its failure sites name: its own name, or the definition it specialises,
-/// whose text they count from.
-pub type Offered = { name: RootName, arity: Int, constant: Bool, site: RootName }
+/// memo slot, the root its failure sites name (its own name, or the definition it specialises, whose
+/// text they count from), and `home`, the module whose parts its body sits among (`home_of`).
+pub type Offered = { name: RootName, arity: Int, constant: Bool, site: RootName, home: Bytes }
 
 /// A constructor of the unit's table and its arity. The runtime holds each argument of one it makes
 /// as its word, which no body reads in place.
@@ -836,6 +838,14 @@ fn static_fields(d: StaticDef) -> List<Bytes> =
   words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
     match w { WField(n) -> acc.push(n), _ -> acc })
 
+/// Whether a static's C holds a position in the unit's field table, which moves with the unit.
+fn holds_field(d: StaticDef) -> Bool = static_fields(d).len() > 0
+
+/// The statics whose addresses a static's words hold.
+fn addressed(d: StaticDef) -> List<Bytes> =
+  words_of(d).fold([], |acc: List<Bytes>, w: StaticWord|
+    match w { WAddress(a) -> acc.push(a.name), _ -> acc })
+
 type Placed = { fields: Map<Bytes, Int>, lambdas: Map<Bytes, Int> }
 
 fn placed_of(p: Pools) -> Placed / {abort.raise} =
@@ -848,13 +858,6 @@ fn place(m: Map<Bytes, Int>, key: Bytes) -> Int / {abort.raise} =
   }
 
 // --- Sites ----------------------------------------------------------------------
-
-/// The bucket a body compiles in: the top bits of its root id, so it is a function of the name
-/// alone and an edit recompiles the one bucket holding the body.
-fn bucket_of(name: RootName) -> Int = root_id(root_text(name)) >>> 57
-
-fn bucket_mark(id: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b"/* --- bucket ", hex_digit(id / 16), hex_digit(id % 16), b" --- */"])
 
 /// A placeholder in a body's C, `@@kN@@`: where it opens and closes, its kind byte, and what
 /// follows the kind.
@@ -879,8 +882,8 @@ fn holes(text: Bytes) -> List<Hole> / {abort.raise} =
       },
     })
 
-/// What a placeholder names in the unit's tables, its kind leading so a bucket's table sorts by
-/// kind; `None` for a root, written as its id.
+/// What a placeholder names in the unit's tables, its kind leading so a part's table sorts by kind;
+/// `None` for a root, written as its id.
 fn hole_key(h: Hole, tables: Tables) -> Option<Bytes> / {abort.raise} =
   if h.kind == 84 { Some(b"T".concat(h.digits)) }
   else if h.kind == 114 { None } else {
@@ -899,12 +902,11 @@ fn unit_place(key: Bytes, p: Placed, tags: Map<Bytes, Int>) -> Int / {abort.rais
   else { place(p.lambdas, rest) }
 }
 
-/// The table a bucket's C reads the unit's positions from, which the loader fills.
-fn bucket_table(id: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b"ply_bk_", hex_digit(id / 16), hex_digit(id % 16)])
+/// The table a part's C reads the unit's positions from, which the `tables` part defines.
+fn part_table(label: String) -> Bytes = b"ply_part".concat(Bytes::of_string(label))
 
-/// A body's C with each placeholder written as its bucket names it: a root as its id, and the rest
-/// as a position in the bucket's own table, so the C reads the same whatever else the unit holds.
+/// A body's C with each placeholder written as its part names it: a root as its id, and the rest as
+/// a position in the part's own table, so the C reads the same whatever else the unit holds.
 fn resolved(
   text: Bytes,
   hs: List<Hole>,
@@ -943,13 +945,10 @@ fn counted(label: Bytes, n: Int) -> Bytes = Bytes::concat_all([label, b" ", asci
 fn lines(label: Bytes, xs: List<Bytes>) -> Bytes =
   Bytes::concat_all([counted(label, xs.len())].concat(xs.map(|x: Bytes| x.concat(b"\n"))))
 
-/// A bucket's table: the unit's position for each of the bucket's keys.
-type BucketRow = { id: Int, places: List<Int> }
-
 /// What a unit says about itself for its loader to read: the helpers it binds, each constant with
 /// its row of the code table, the pools its positions index, and each root the runtime enters
-/// through its entry, `R#entered`, which it takes. What the loader takes by address, `laid` lays out
-/// instead.
+/// through its entry, `R#entered`, which it takes. What the loader takes by address, the `taken` and
+/// `tables` parts lay out instead.
 fn exports_text(
   helpers: List<Native>,
   constants: List<Bytes>,
@@ -1001,78 +1000,199 @@ fn embedded(exports: Bytes) -> Bytes / {abort.raise} =
     b";\n",
   ])
 
-/// What the loader takes by address, so it looks no symbol up and fills no table: each bucket's
-/// table holding the unit's positions, the code table in the unit's order, each of `taken` by name
-/// in byte order with its entry and how many words it takes, and `ply_descriptor`, which holds
-/// those beside what the unit says about itself and its two binders. A native program's `main`
-/// hands the runtime the descriptor, so the program exports nothing for `dlsym` to find. The code
-/// and the entries are defined in the buckets' objects, and a table closes with a zero so that none
-/// is empty.
-fn laid(
-  taken: List<Taken>,
-  lambdas: List<Bytes>,
-  buckets: List<BucketRow>,
-) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    b"\n/* --- what the loader takes by address --- */\n",
-    Bytes::concat_all(
-      buckets.map(|r: BucketRow|
-        Bytes::concat_all([
-          b"const uint32_t ",
-          bucket_table(r.id),
-          b"[] = {",
-          Bytes::concat_all(
-            r.places.map(|n: Int| Bytes::concat_all([b" ", ascii_of_int(n), b","])),
-          ),
-          b" };\n",
-        ])),
-    ),
-    Bytes::concat_all(
-      ordered(lambdas.concat(taken.map(|t: Taken| t.entry).filter(|e: Bytes| e.len() > 0))).map(
-        |n: Bytes| Bytes::concat_all([b"extern char ", n, b";\n"]),
+/// A part of the unit's C after the runtime's: its mark on a line of its own, then `c`.
+fn section(label: String, c: Bytes) -> Bytes =
+  Bytes::concat_all([b"\n", part_mark(label), b"\n", c])
+
+/// What the runtime reads of each root a unit takes, which `taken_part` lays out and the
+/// descriptor points at.
+fn taken_struct() -> Bytes =
+  b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n"
+
+/// Each of `entries`, which a part holding a body defines, declared once so its address can be taken.
+fn entries_declared(entries: List<Bytes>) -> Bytes / {abort.raise} =
+  Bytes::concat_all(
+    ordered(entries).map(|n: Bytes| Bytes::concat_all([b"extern char ", n, b";\n"])),
+  )
+
+/// The `taken` part, which moves with the roots the unit takes: each of `taken` by name in byte
+/// order, with its entry and how many words it takes, closed with a zero.
+fn taken_part(taken: List<Taken>) -> Bytes / {abort.raise} =
+  section(
+    "taken",
+    Bytes::concat_all([
+      taken_struct(),
+      entries_declared(taken.map(|t: Taken| t.entry).filter(|e: Bytes| e.len() > 0)),
+      b"const struct ply_taken ply_taken[] = {\n",
+      Bytes::concat_all(
+        taken.map(|t: Taken|
+          Bytes::concat_all([
+            b"  { \"",
+            escaped(root_text(t.name)),
+            b"\", ",
+            if t.entry.len() == 0 { b"(void *)0" } else { b"(void *)&".concat(t.entry) },
+            b", ",
+            ascii_of_int(t.arity),
+            b" },\n",
+          ])),
       ),
-    ),
-    b"void *const ply_code[] = {\n",
-    Bytes::concat_all(lambdas.map(|n: Bytes| Bytes::concat_all([b"  (void *)&", n, b",\n"]))),
-    b"  0 };\n",
-    b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
-    b"const struct ply_taken ply_taken[] = {\n",
-    Bytes::concat_all(
-      taken.map(|t: Taken|
-        Bytes::concat_all([
-          b"  { \"",
-          escaped(root_text(t.name)),
-          b"\", ",
-          if t.entry.len() == 0 { b"(void *)0" } else { b"(void *)&".concat(t.entry) },
-          b", ",
-          ascii_of_int(t.arity),
-          b" },\n",
-        ])),
-    ),
-    b"  { 0, 0, 0 } };\n",
-    b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
-    b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, ",
-    ascii_of_int(lambdas.len()),
-    b", ply_taken, ",
-    ascii_of_int(taken.len()),
-    b" };\n",
-  ])
+      b"  { 0, 0, 0 } };\n",
+    ]),
+  )
+
+/// The `tables` part, which moves with the unit's tables: what the loader takes by address, so it
+/// looks no symbol up and fills no table. Each part's table holding the unit's positions, the code
+/// table in the unit's order closed with a zero, what the unit says about itself, and
+/// `ply_descriptor`, which holds those, the `taken` part's `ply_taken` and its `taken` rows, and the
+/// unit's two binders. A native program's `main` hands the runtime the descriptor, so the program
+/// exports nothing for `dlsym` to find.
+fn tables_part(
+  parts: List<Part>,
+  lambdas: List<Bytes>,
+  exports: Bytes,
+  taken: Int,
+) -> Bytes / {abort.raise} =
+  section(
+    "tables",
+    Bytes::concat_all([
+      Bytes::concat_all(
+        parts.filter(|p: Part| p.places.len() > 0).map(|p: Part|
+          Bytes::concat_all([
+            b"const uint32_t ",
+            part_table(p.label),
+            b"[] = {",
+            Bytes::concat_all(
+              p.places.map(|n: Int| Bytes::concat_all([b" ", ascii_of_int(n), b","])),
+            ),
+            b" };\n",
+          ])),
+      ),
+      entries_declared(lambdas),
+      b"void *const ply_code[] = {\n",
+      Bytes::concat_all(lambdas.map(|n: Bytes| Bytes::concat_all([b"  (void *)&", n, b",\n"]))),
+      b"  0 };\n",
+      embedded(exports),
+      taken_struct(),
+      b"extern const struct ply_taken ply_taken[];\n",
+      b"void ply_bind(void **fns);\n",
+      b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
+      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, ",
+      ascii_of_int(lambdas.len()),
+      b", ply_taken, ",
+      ascii_of_int(taken),
+      b" };\n",
+    ]),
+  )
+
+/// The `fields` part, which moves with the unit's field table: each of `statics` that holds a field's
+/// position, in their order, each static they address that a part defines declared first; nothing
+/// where none does.
+fn fields_part(
+  statics: List<StaticDef>,
+  constant_c: (StaticDef) -> Bytes / {abort.raise},
+) -> Bytes / {abort.raise} = {
+  let held = statics.filter(holds_field);
+  let own = held.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDef| acc.insert(d.name, true));
+  if held.len() == 0 { b"" } else {
+    section(
+      "fields",
+      Bytes::concat_all([
+        Bytes::concat_all(
+          ordered(held.fold([], |acc: List<Bytes>, d: StaticDef| acc.concat(addressed(d)))).filter(
+            |n: Bytes| !own.contains(n),
+          ).map(
+            static_extern,
+          ),
+        ),
+        Bytes::concat_all(held.map(constant_c)),
+      ]),
+    )
+  }
+}
 
 // --- Placing it -----------------------------------------------------------------
 
 type Placing = {
   name: RootName,
-  bucket: Int,
   text: Bytes,
   reaches: List<RootName>,
-  /// The static objects its C names, which the unit's tail defines.
+  /// The static objects its C names.
   statics: List<Bytes>,
   /// The functions closures alike share that its C names, which its part defines once.
   shared: List<SharedFn>,
 }
 
-/// A body's placeholders and what each names, which its bucket's table is made of.
+/// A body's placeholders and what each names, which its part's table is made of.
 type Marked = { body: UnitBody, holes: List<Hole>, keys: List<Option<Bytes>> }
+
+/// Where a unit's C starts a new part, in bytes of its bodies' C before their placeholders are
+/// resolved: at a body whose root id has its low `bits` bits all zero, once the part holds `min`;
+/// and before a body that would take the part past `max`, so a body larger than `max` sits alone.
+/// Since names pick the cuts, an edit to a body seldom moves one.
+pub type PartRule = { bits: Int, min: Int, max: Int }
+
+/// The rule a build cuts its units into parts by.
+pub fn part_rule() -> PartRule = { bits: 6, min: 65536, max: 1048576 }
+
+/// The module whose parts root `k`'s body sits among: for a specialisation that runs another
+/// root's lambdas in place, the first such root's module, so an edit to a lambda moves only its own
+/// module's parts; otherwise its own.
+fn home_of(k: RootKey) -> Bytes =
+  match key_lent(k).at(0) { Some(f) -> module_of(f.owner), None -> module_of(k) }
+
+/// Where a body sits in the unit's C: among its home module's bodies, by name.
+fn order_key(home: Bytes, name: RootName) -> Bytes =
+  Bytes::concat_all([home, b"\x00", root_text(name)])
+
+/// `bodies`, in the unit's order, cut into parts by `rule`.
+fn parted(bodies: List<Marked>, rule: PartRule) -> List<List<Marked>> = {
+  let walked = bodies.fold(
+    { parts: [], part: [], bytes: 0 },
+    |acc: { parts: List<List<Marked>>, part: List<Marked>, bytes: Int }, m: Marked| {
+      let size = m.body.text.len();
+      let picked = root_id(root_text(m.body.name)) & (1 << rule.bits) - 1 == 0;
+      if acc.part.len() > 0 && ((acc.bytes >= rule.min && picked) || acc.bytes + size > rule.max) {
+        { parts: acc.parts.push(acc.part), part: [m], bytes: size }
+      } else { { parts: acc.parts, part: acc.part.push(m), bytes: acc.bytes + size } }
+    },
+  );
+  if walked.part.len() == 0 { walked.parts } else { walked.parts.push(walked.part) }
+}
+
+/// A part's label: its first body's root id as 16 hex digits, which no word labelling a part of the
+/// unit's tail is.
+fn part_label(name: RootName) -> String / {abort.raise} =
+  String::of_bytes(hex(u64_be(root_id(root_text(name)))))
+
+/// A part of a unit's C: its label, the unit's position for each key of its table, its bodies, and
+/// the constants it defines, each after those it addresses.
+type Part = { label: String, places: List<Int>, bodies: List<Placing>, constants: List<StaticDef> }
+
+/// The keys a part's table holds: each one its bodies' placeholders name, once, in byte order.
+fn part_keys(group: List<Marked>) -> List<Bytes> / {abort.raise} =
+  ordered(
+    group.fold([], |acc: List<Bytes>, m: Marked|
+      m.keys.fold(acc, |ks: List<Bytes>, k: Option<Bytes>|
+        match k { Some(key) -> ks.push(key), None -> ks })),
+  )
+
+/// The constants the part of `group`'s bodies defines, in the order they name them, and every
+/// constant defined once it does: each one they name that holds no field's position and that no
+/// earlier part defines, as `defined` holds those.
+fn constants_defined(
+  group: List<Marked>,
+  defined: Map<Bytes, Bool>,
+) -> { constants: List<StaticDef>, defined: Map<Bytes, Bool> } =
+  group.fold(
+    { constants: [], defined: defined },
+    |acc: { constants: List<StaticDef>, defined: Map<Bytes, Bool> }, m: Marked|
+      m.body.tables.statics.fold(
+        acc,
+        |a: { constants: List<StaticDef>, defined: Map<Bytes, Bool> }, d: StaticDef|
+          if holds_field(d) || a.defined.contains(d.name) { a }
+          else { { constants: a.constants.push(d), defined: a.defined.insert(d.name, true) } },
+      ),
+  )
 
 /// What a body's C names of the unit's definitions: its own, a group's every member, and its calls.
 fn reaches_of(name: RootName, tables: Tables) -> List<RootName> =
@@ -1091,82 +1211,62 @@ fn prototype(symbol: Bytes, head: Head) -> Bytes =
     b");\n",
   ])
 
-fn bucket_key(p: Placing) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    hex_digit(p.bucket / 16),
-    hex_digit(p.bucket % 16),
-    b"\x00",
-    root_text(p.name),
-  ])
-
-/// The head, which every part compiles after, then a marked bucket per class of names, which
-/// declares its table, the static objects its bodies name and the prototypes of what they reach,
-/// then the tail, `statics`, the static objects' definitions, what the unit says about itself and
-/// `tables`, what it lays out for its loader: one translation unit that the loader also compiles in
-/// parts, cut on the marks. A bucket declares its table and its statics and never defines them, so
-/// its C reads the same whatever the unit holds beside it. A bucket declares the pointer to each of
-/// `machine`, the natives of shipped modules the unit calls over machine words, that its bodies call,
-/// and the tail binds them all.
+/// The head, which every part compiles after; then each part of `parts`; then the runtime's part,
+/// which binds the pointer to each of `machine`, the natives of shipped modules the unit calls over
+/// machine words, beside the head's own; then `tail`, the parts after it. The loader compiles each
+/// part alone, cut on the marks.
 fn assembled(
-  bodies: List<Placing>,
-  sizes: Map<Int, Int>,
+  parts: List<Part>,
   taken: Map<RootName, Taken>,
-  statics: Bytes,
-  exports: Bytes,
-  tables: Bytes,
+  constant_c: (StaticDef) -> Bytes / {abort.raise},
   machine: List<Native>,
-) -> Bytes / {abort.raise} = {
-  let by_bucket = bodies.fold(Map::new(), |acc: Map<Bytes, Placing>, p: Placing|
-    acc.insert(bucket_key(p), p));
-  let groups = by_bucket.values().fold([], |acc: List<List<Placing>>, p: Placing| {
-    let last = acc.len() - 1;
-    if last >= 0 && acc.get(last).get(0).bucket == p.bucket { acc.set(last, acc.get(last).push(p)) }
-    else { acc.push([p]) }
-  });
+  tail: Bytes,
+) -> Bytes / {abort.raise} =
   Bytes::concat_all([
     unit_head(),
-    Bytes::concat_all(
-      groups.map(|group: List<Placing>|
-        Bytes::concat_all([
-          bucket_mark(group.get(0).bucket),
-          b"\n",
-          match sizes.get(group.get(0).bucket) {
-            Some(n) -> if n == 0 { b"" } else {
-              Bytes::concat_all([
-                b"extern const uint32_t ",
-                bucket_table(group.get(0).bucket),
-                b"[];\n",
-              ])
-            },
-            None -> b"",
-          },
-          Bytes::concat_all(
-            ordered(group.fold([], |acc: List<Bytes>, p: Placing| acc.concat(p.statics))).map(
-              static_extern,
-            ),
-          ),
-          Bytes::concat_all(
-            names_ordered(
-              group.fold([], |acc: List<RootName>, p: Placing| acc.concat(p.reaches)),
-            ).map(|name: RootName|
-              match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" }),
-          ),
-          {
-            let called = group.fold(Map::new(), |acc: Map<Bytes, Bool>, p: Placing|
-              pointers_named(p.text, b"builtin_", acc));
-            Bytes::concat_all(
-              machine.filter(|n: Native| called.contains(n.name)).map(pointer_declared),
-            )
-          },
-          b"\n",
-          shared_written(group),
-          Bytes::concat_all(group.map(|p: Placing| p.text.concat(b"\n"))),
-        ])),
-    ),
+    Bytes::concat_all(parts.map(|p: Part| part_c(p, taken, constant_c, machine))),
     unit_tail(machine),
-    statics,
-    embedded(exports),
-    tables,
+    tail,
+  ])
+
+/// A part's C: its mark, then what it takes from the rest of the unit, declared (its table, each
+/// constant its bodies name that it does not define, the prototype of each root they reach and the
+/// pointer to each of `machine` they call), then its constants, the functions its closures share and
+/// its bodies. It reads the same whatever the unit holds beside it, but for which of the constants
+/// it names an earlier part defines.
+fn part_c(
+  p: Part,
+  taken: Map<RootName, Taken>,
+  constant_c: (StaticDef) -> Bytes / {abort.raise},
+  machine: List<Native>,
+) -> Bytes / {abort.raise} = {
+  let defined = p.constants.fold(Map::new(), |acc: Map<Bytes, Bool>, d: StaticDef|
+    acc.insert(d.name, true));
+  let called = p.bodies.fold(Map::new(), |acc: Map<Bytes, Bool>, body: Placing|
+    pointers_named(body.text, b"builtin_", acc));
+  Bytes::concat_all([
+    part_mark(p.label),
+    b"\n",
+    if p.places.len() == 0 { b"" }
+    else { Bytes::concat_all([b"extern const uint32_t ", part_table(p.label), b"[];\n"]) },
+    Bytes::concat_all(
+      ordered(p.bodies.fold([], |acc: List<Bytes>, body: Placing| acc.concat(body.statics))).filter(
+        |n: Bytes| !defined.contains(n),
+      ).map(
+        static_extern,
+      ),
+    ),
+    Bytes::concat_all(
+      names_ordered(
+        p.bodies.fold([], |acc: List<RootName>, body: Placing| acc.concat(body.reaches)),
+      ).map(|name: RootName|
+        match taken.get(name) { Some(t) -> prototype(t.symbol, t.head), None -> b"" }),
+    ),
+    Bytes::concat_all(machine.filter(|n: Native| called.contains(n.name)).map(pointer_declared)),
+    b"\n",
+    Bytes::concat_all(p.constants.map(constant_c)),
+    shared_written(p.bodies),
+    Bytes::concat_all(p.bodies.map(|body: Placing| body.text.concat(b"\n"))),
   ])
 }
 
@@ -1197,10 +1297,54 @@ fn shared_written(group: List<Placing>) -> Bytes =
         else { { seen: a.seen.insert(f.symbol, true), out: a.out.push(f.text) } }),
   ).out.fold(b"", |acc: Bytes, t: Bytes| acc.concat(t))
 
+/// Body `m` placed in the part whose table is `table`, of the keys `local` holds: its placeholders
+/// resolved, `site` the root its failure sites name.
+fn placing(
+  m: Marked,
+  site: RootName,
+  table: Bytes,
+  local: Map<Bytes, Int>,
+) -> Placing / {abort.raise} =
+  {
+    name: m.body.name,
+    text: resolved(m.body.text, m.holes, m.keys, m.body.tables, site, table, local),
+    reaches: reaches_of(m.body.name, m.body.tables),
+    statics: m.body.tables.statics.map(|d: StaticDef| d.name),
+    shared: m.body.tables.shared,
+  }
+
+/// `bodies`, in the unit's order, cut into parts by `rule`: each part's table holding the unit's
+/// `position` of each key its bodies name, and each body's placeholders resolved against it, `site`
+/// the root the body's failure sites name.
+fn parts_of(
+  bodies: List<Marked>,
+  rule: PartRule,
+  site: (RootName) -> RootName / {abort.raise},
+  position: (Bytes) -> Int / {abort.raise},
+) -> List<Part> / {abort.raise} =
+  parted(bodies, rule).fold(
+    { parts: [], defined: Map::new() },
+    |acc: { parts: List<Part>, defined: Map<Bytes, Bool> }, group: List<Marked>| {
+      let label = part_label(group.get(0).body.name);
+      let keys = part_keys(group);
+      let local = positions(keys);
+      let c = constants_defined(group, acc.defined);
+      {
+        parts: acc.parts.push({
+          label: label,
+          places: keys.map(position),
+          bodies: group.map(|m: Marked| placing(m, site(m.body.name), part_table(label), local)),
+          constants: c.constants,
+        }),
+        defined: c.defined,
+      }
+    },
+  ).parts
+
 /// The unit over `offered`, from each root's answer: closed under calls, its tables sorted by
-/// content, its bodies resolved against them and bucketed, and what it holds embedded in its C.
-/// `modules` is how many modules the program it was emitted from has, and `inputs` the bytes of
-/// each file it embeds, by digest.
+/// content, its bodies resolved against them and cut into parts by `rule`, and what it holds
+/// embedded in its C. `modules` is how many modules the program it was emitted from has, and
+/// `inputs` the bytes of each file it embeds, by digest.
 pub fn produce(
   ctors: List<Ctor>,
   offered: List<Offered>,
@@ -1208,9 +1352,12 @@ pub fn produce(
   answers: Map<RootName, Answer>,
   inputs: Map<Bytes, Bytes>,
   machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
+  rule: PartRule,
 ) -> Produced / {abort.raise} = {
-  let arity = offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
+  let offers = offered.fold(Map::new(), |acc: Map<RootName, Offered>, o: Offered|
     acc.insert(o.name, o));
+  let offer_of = |n: RootName|
+    match offers.get(n) { Some(o) -> o, None -> panic("every body a unit takes was offered it") };
   let names = names_ordered(offered.map(|o: Offered| o.name));
   let s = taken_bodies(answers, names);
   let machine = machine_called(s.bodies, machine_of);
@@ -1220,7 +1367,7 @@ pub fn produce(
       None -> panic("every definition a unit takes emitted, and an emitted body publishes its C"),
     };
   let constants = names.filter(|n: RootName|
-    match arity.get(n) { Some(o) -> o.constant, None -> false });
+    match offers.get(n) { Some(o) -> o.constant, None -> false });
   let statics = statics_placed(s.bodies);
   let pools = pools_of(
     s.bodies,
@@ -1228,28 +1375,26 @@ pub fn produce(
     constants.map(|n: RootName| { name: n, entry: published(n).entry }),
   );
   let placed = placed_of(pools);
-  let laid_statics = Bytes::concat_all(
-    statics.map(|d: StaticDef|
-      static_c(
-        d,
-        |f: Bytes| place(placed.fields, f),
-        |k: RootKey| symbol_of(root_text(root_name(k))),
-        |digest: Bytes|
-          match inputs.get(digest) {
-            Some(b) -> b,
-            None ->
-              panic(
-                "a unit holds an embedded file it was not handed the bytes of, which its driver reads for every embed it emits",
-              ),
-          },
-      )),
-  );
+  let constant_c = |d: StaticDef|
+    static_c(
+      d,
+      |f: Bytes| place(placed.fields, f),
+      |k: RootKey| symbol_of(root_text(root_name(k))),
+      |digest: Bytes|
+        match inputs.get(digest) {
+          Some(b) -> b,
+          None ->
+            panic(
+              "a unit holds an embedded file it was not handed the bytes of, which its driver reads for every embed it emits",
+            ),
+        },
+    );
   let tags = positions(ctors.map(|c: Ctor| c.name));
   let taken = names.map(|n: RootName| {
     let d = published(n);
     {
       name: n,
-      arity: match arity.get(n) { Some(o) -> o.arity, None -> 0 },
+      arity: match offers.get(n) { Some(o) -> o.arity, None -> 0 },
       symbol: d.symbol,
       entry: d.entry,
       head: d.head,
@@ -1280,52 +1425,17 @@ pub fn produce(
           None -> (),
         },
       }));
-  let marked = s.bodies.map(|k: UnitBody| {
+  let marked = s.bodies.fold(Map::new(), |acc: Map<Bytes, Marked>, k: UnitBody| {
     let hs = holes(k.text);
-    { body: k, holes: hs, keys: hs.map(|h: Hole| hole_key(h, k.tables)) }
-  });
-  // Each bucket's table: every key its bodies' placeholders name, once, in byte order.
-  let keyed = marked.fold(Map::new(), |acc: Map<Int, Map<Bytes, Bool>>, m: Marked| {
-    let b = bucket_of(m.body.name);
-    acc.insert(
-      b,
-      m.keys.fold(
-        match acc.get(b) { Some(x) -> x, None -> Map::new() },
-        |ks: Map<Bytes, Bool>, k: Option<Bytes>|
-          match k { Some(key) -> ks.insert(key, true), None -> ks },
-      ),
-    )
-  });
-  let locals = keyed.fold(
-    Map::new(),
-    |acc: Map<Int, Map<Bytes, Int>>, b: Int, ks: Map<Bytes, Bool>|
-      acc.insert(b, positions(ks.keys())),
+    acc.insert(order_key(offer_of(k.name).home, k.name), {
+      body: k,
+      holes: hs,
+      keys: hs.map(|h: Hole| hole_key(h, k.tables)),
+    })
+  }).values(
   );
-  let bodies = marked.map(|m: Marked| {
-    let b = bucket_of(m.body.name);
-    {
-      name: m.body.name,
-      bucket: b,
-      text: resolved(
-        m.body.text,
-        m.holes,
-        m.keys,
-        m.body.tables,
-        match arity.get(m.body.name) {
-          Some(o) -> o.site,
-          None -> panic("every body a unit takes was offered it"),
-        },
-        bucket_table(b),
-        match locals.get(b) { Some(l) -> l, None -> Map::new() },
-      ),
-      reaches: reaches_of(m.body.name, m.body.tables),
-      statics: m.body.tables.statics.map(|d: StaticDef| d.name),
-      shared: m.body.tables.shared,
-    }
-  });
-  let rows = keyed.fold([], |acc: List<BucketRow>, b: Int, ks: Map<Bytes, Bool>|
-    if ks.len() == 0 { acc }
-    else { acc.push({ id: b, places: ks.keys().map(|k: Bytes| unit_place(k, placed, tags)) }) });
+  let parts = parts_of(marked, rule, |n: RootName| offer_of(n).site, |k: Bytes|
+    unit_place(k, placed, tags));
   let exports = exports_text(
     bound().concat(machine),
     constants.map(|n: RootName|
@@ -1343,14 +1453,15 @@ pub fn produce(
   let by_name = taken.fold(Map::new(), |acc: Map<RootName, Taken>, t: Taken| acc.insert(t.name, t));
   {
     text: assembled(
-      bodies,
-      keyed.fold(Map::new(), |acc: Map<Int, Int>, b: Int, ks: Map<Bytes, Bool>|
-        acc.insert(b, ks.len())),
+      parts,
       by_name,
-      laid_statics,
-      exports,
-      laid(by_name.values(), pools.lambdas, rows),
+      constant_c,
       machine,
+      Bytes::concat_all([
+        fields_part(statics, constant_c),
+        taken_part(by_name.values()),
+        tables_part(parts, pools.lambdas, exports, by_name.len()),
+      ]),
     ),
     taken: names,
     made: { bodies: s.bodies, offered: offered },
@@ -2630,7 +2741,14 @@ pub fn emitted<| e>(
         roots.map(|k: RootKey|
           match k {
             // An entry takes no words: what it reads crosses through the runtime.
-            Entered(_) -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+            Entered(_) ->
+              {
+                name: root_name(k),
+                arity: 0,
+                constant: false,
+                site: sited_as(k),
+                home: home_of(k),
+              },
             _ -> match p.roots.get(sited_as(k)) {
               Some(r) ->
                 {
@@ -2638,14 +2756,23 @@ pub fn emitted<| e>(
                   arity: r.arity,
                   constant: r.pure && r.arity == 0 && (match k { At(_, _) -> false, _ -> true }),
                   site: sited_as(k),
+                  home: home_of(k),
                 },
-              None -> { name: root_name(k), arity: 0, constant: false, site: sited_as(k) },
+              None ->
+                {
+                  name: root_name(k),
+                  arity: 0,
+                  constant: false,
+                  site: sited_as(k),
+                  home: home_of(k),
+                },
             },
           }),
         p.modules.len(),
         held,
         inputs,
         |called: Map<Bytes, Bool>| machine_bound(called_externs(called, p)),
+        part_rule(),
       );
       Ok({
         produced: produced,
@@ -3103,12 +3230,12 @@ fn by_def<v>(entries: List<{ key: Bytes, value: v }>) -> Map<RootName, v> =
   entries.fold(Map::new(), |m: Map<RootName, v>, x: { key: Bytes, value: v }|
     m.insert(def_root(x.key), x.value))
 
-/// The bucket the body of definition `n` compiles in.
-fn def_bucket(n: Bytes) -> Int = bucket_of(def_root(n))
+/// Root `k` offered as a call of `arity` words.
+fn offer_root(k: RootKey, arity: Int) -> Offered =
+  { name: root_name(k), arity: arity, constant: false, site: root_name(k), home: home_of(k) }
 
 /// Definition `n` offered as a call of `arity` words.
-fn offer(n: Bytes, arity: Int) -> Offered =
-  { name: def_root(n), arity: arity, constant: false, site: def_root(n) }
+fn offer(n: Bytes, arity: Int) -> Offered = offer_root(Named(n), arity)
 
 test "a generic call settles on each argument its callee's code needs, and leaves the rest" {
   let needs = by_def([
@@ -3431,6 +3558,7 @@ fn codes_over(
       by_def(answers),
       Map::new(),
       no_machine,
+      part_rule(),
     ).made,
   ).fold(Map::new(), |m: Map<Bytes, Bytes>, n: RootName, code: Bytes| m.insert(root_text(n), code))
 
@@ -3492,7 +3620,7 @@ test "a cycle is digested whole, whatever order the unit holds its roots in" {
 
 // A body names a constructor's tag by the constructor, so the same answer serves programs whose
 // tables differ, and each unit writes the position its own table gives.
-test "a constructor's tag is its bucket's to read, at the position the unit's own table gives it" {
+test "a constructor's tag is its part's to read, at the position the unit's own table gives it" {
   let answer = {
     text: b"Word f_m.f(PlyCtx *ctx) { return @@Tm.Line@@ + @@TNone@@; }",
     tables: { ..no_tables(), symbols: [{ symbol: b"f_m.f", entry: b"e_m.f", head: word_head(0) }] },
@@ -3505,6 +3633,7 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
       by_def([{ key: b"m.f", value: answer }]),
       Map::new(),
       no_machine,
+      part_rule(),
     ).text;
   let alone = unit([
     { name: b"None", arity: 0 },
@@ -3518,55 +3647,178 @@ test "a constructor's tag is its bucket's to read, at the position the unit's ow
     { name: b"m.Dot", arity: 0 },
     { name: b"m.Line", arity: 1 },
   ]);
-  let table = bucket_table(def_bucket(b"m.f"));
+  let label = part_label(def_root(b"m.f"));
+  let table = part_table(label);
   let body = Bytes::concat_all([b"{ return ", table, b"[1] + ", table, b"[0]; }"]);
   assert(alone.index_of(body) != None, None);
   assert(beside.index_of(body) != None, None);
-  // The bucket declares the table, and the unit lays it out filled beside its descriptor.
+  // The part declares the table, and the `tables` part lays it out filled beside the descriptor.
   let declared = Bytes::concat_all([b"extern const uint32_t ", table, b"[];\n"]);
-  assert(bucket_part(alone, def_bucket(b"m.f")).index_of(declared) != None, None);
+  assert(part_labelled(alone, label).index_of(declared) != None, None);
   let filled = |places: Bytes|
     Bytes::concat_all([b"const uint32_t ", table, b"[] = {", places, b" };\n"]);
-  assert(alone.index_of(filled(b" 0, 2,")) != None, None);
-  assert(beside.index_of(filled(b" 0, 4,")) != None, None)
+  assert(part_labelled(alone, "tables").index_of(filled(b" 0, 2,")) != None, None);
+  assert(part_labelled(beside, "tables").index_of(filled(b" 0, 4,")) != None, None)
 }
 
-/// A bucket's part of a unit's C: from its mark to the next part's.
-fn bucket_part(unit: Bytes, id: Int) -> Bytes / {abort.raise} =
-  match unit.index_of(bucket_mark(id)) {
-    None -> b"",
-    Some(start) -> match unit.index_of_from(b"/* --- ", start + 1) {
-      Some(end) -> unit.slice(start, end),
-      None -> unit.slice(start, unit.len()),
-    },
-  }
+/// A rule that cuts a unit's C before every body, so each sits in a part of its own.
+fn one_each() -> PartRule = { bits: 0, min: 0, max: 1 << 40 }
 
-test "a bucket's C reads the same whatever another bucket adds to the unit's tables" {
-  let other = range(0, 4096).fold(b"", |found: Bytes, i: Int| {
-    let n = b"a.other".concat(ascii_of_int(i));
-    if found == b"" && def_bucket(n) != def_bucket(b"m.f") { n } else { found }
-  });
+/// A rule that cuts a unit's C before every body whose root id is even, however little the part
+/// holds.
+fn by_names() -> PartRule = { bits: 1, min: 0, max: 1 << 40 }
+
+/// A part of a unit's C as `cc.split` cuts it: its label, and its C from its mark on.
+type Cut = { label: String, text: Bytes }
+
+/// The parts `cc.split` cuts unit `text` into, in the order the unit holds them.
+fn parts_in(text: Bytes) -> List<Cut> / {abort.raise} =
+  cc::split(text).parts.sort_by(|a: Cut, b: Cut| found_at(text, a.text) < found_at(text, b.text))
+
+/// The parts of unit `text` that hold its bodies: each before the runtime's.
+fn body_parts(text: Bytes) -> List<Cut> / {abort.raise} =
+  parts_in(text).fold({ out: [], past: false }, |acc: { out: List<Cut>, past: Bool }, c: Cut|
+    if acc.past || c.label == "runtime" { { ..acc, past: true } }
+    else { { ..acc, out: acc.out.push(c) } }).out
+
+/// The C of the part of unit `text` labelled `label`, or nothing.
+fn part_labelled(text: Bytes, label: String) -> Bytes / {abort.raise} =
+  match parts_in(text).find(|c: Cut| c.label == label) { Some(c) -> c.text, None -> b"" }
+
+/// The C of the first part of unit `text` that holds `c`, or nothing.
+fn part_holding(text: Bytes, c: Bytes) -> Bytes / {abort.raise} =
+  match parts_in(text).find(|p: Cut| p.text.index_of(c) != None) { Some(p) -> p.text, None -> b"" }
+
+/// How `one_body` opens the definition of `name`.
+fn body_of(name: Bytes) -> Bytes = Bytes::concat_all([b"Word f_", name, b"(PlyCtx *ctx)"])
+
+/// Where `needle` first stands in `hay`, or -1.
+fn found_at(hay: Bytes, needle: Bytes) -> Int =
+  match hay.index_of(needle) { Some(i) -> i, None -> 0 - 1 }
+
+/// The definitions `m.b0` onwards, `n` of them.
+fn numbered(n: Int) -> List<Bytes> = range(0, n).map(|i: Int| b"m.b".concat(ascii_of_int(i)))
+
+/// The C of the unit over definitions `names`, each body as `one_body` writes it but `edited`'s, which
+/// `edited_body` does, cut by `rule`.
+fn unit_over(names: List<Bytes>, edited: Bytes, rule: PartRule) -> Bytes / {abort.raise} =
+  produce(
+    [],
+    names.map(|n: Bytes| offer(n, 0)),
+    1,
+    by_def(
+      names.map(|n: Bytes|
+        { key: n, value: if n == edited { edited_body(n) } else { one_body(n, []) } }),
+    ),
+    Map::new(),
+    no_machine,
+    rule,
+  ).text
+
+/// Each of `xs` that `ys` does not hold.
+fn missing_from(xs: List<Cut>, ys: List<Cut>) -> List<Cut> = xs.filter(|x: Cut| !ys.contains(x))
+
+test "a part's C reads the same whatever another part adds to the unit's tables" {
+  // A body naming a field of the unit's field table, the name `field`.
+  let fielded = |n: Bytes, field: Bytes| {
+    let b = one_body(n, []);
+    { text: b.text.concat(b" /* @@f0@@ */"), tables: { ..b.tables, fields: [field] } }
+  };
   let unit = |names: List<Bytes>|
     produce(
       [{ name: b"None", arity: 0 }],
       names.map(|n: Bytes| offer(n, 0)),
       1,
-      by_def(names.map(|n: Bytes| { key: n, value: one_body(n, []) })),
+      by_def(names.map(|n: Bytes| { key: n, value: fielded(n, n) })),
       Map::new(),
       no_machine,
+      one_each(),
     ).text;
   let alone = unit([b"m.f"]);
-  let beside = unit([b"m.f", other]);
-  assert(bucket_part(alone, def_bucket(b"m.f")) != b"", None);
-  assert_eq(bucket_part(beside, def_bucket(b"m.f")), bucket_part(alone, def_bucket(b"m.f")));
-  // What moved is the rest of the unit: `other`'s bucket and the static its body names.
-  assert(alone != beside, None)
+  let beside = unit([b"m.f", b"a.other"]);
+  let label = part_label(def_root(b"m.f"));
+  assert(part_labelled(alone, label).index_of(body_of(b"m.f")) != None, None);
+  assert_eq(part_labelled(beside, label), part_labelled(alone, label));
+  // What moved is `a.other`'s part and the unit's tables, where `m.f`'s field is one place on.
+  assert(part_labelled(beside, "tables") != part_labelled(alone, "tables"), None)
+}
+
+test "an edit to one body's C changes only the part holding it" {
+  let names = numbered(16);
+  let before = unit_over(names, b"", by_names());
+  let after = unit_over(names, b"m.b7", by_names());
+  let bodies = body_parts(before);
+  assert(bodies.len() > 1 && bodies.len() < names.len(), None);
+  assert_eq(parts_in(after).map(|c: Cut| c.label), parts_in(before).map(|c: Cut| c.label));
+  let changed = missing_from(parts_in(after), parts_in(before));
+  assert_eq(changed.map(|c: Cut| c.text), [part_holding(after, body_of(b"m.b7"))]);
+  assert(changed.get(0).text.index_of(b"/* edited */") != None, None)
+}
+
+// Read backwards, each case is the body removed: the parts it changes are the same.
+test "a body added or removed changes the part it sits in and at most one beside it" {
+  let names = numbered(16);
+  let before = body_parts(unit_over(names, b"", by_names()));
+  [2, 7, 11, 13].fold((), |_: Unit, i: Int| {
+    let added = Bytes::concat_all([b"m.b", ascii_of_int(i), b"x"]);
+    let after = body_parts(unit_over(names.push(added), b"", by_names()));
+    let gone = missing_from(before, after);
+    let came = missing_from(after, before);
+    assert(gone.len() <= 1 && came.len() <= 2, Some(String::of_bytes_lossy(added)));
+    assert(came.any(|c: Cut| c.text.index_of(body_of(added)) != None), None)
+  })
+}
+
+test "a small program's bodies are one part" {
+  assert_eq(body_parts(unit_over(numbered(8), b"", part_rule())).len(), 1)
+}
+
+test "a body larger than the most a part holds sits alone, and the rest share parts up to it" {
+  let big = b"m.b3";
+  let names = numbered(8);
+  let padded = {
+    let b = one_body(big, []);
+    { ..b, text: b.text.concat(b" ".repeat(300)) }
+  };
+  let text = produce(
+    [],
+    names.map(|n: Bytes| offer(n, 0)),
+    1,
+    by_def(
+      names.map(|n: Bytes| { key: n, value: if n == big { padded } else { one_body(n, []) } }),
+    ),
+    Map::new(),
+    no_machine,
+    { bits: 62, min: 1 << 40, max: 250 },
+  ).text;
+  assert_eq(part_holding(text, body_of(big)).split(b"(PlyCtx *ctx)").len() - 1, 1);
+  assert(body_parts(text).len() < names.len(), None)
+}
+
+test "each part is labelled apart: a body's by its first body's root id, the tail's by a word" {
+  let names = numbered(12);
+  let text = unit_over(names, b"", one_each());
+  // `cc.split` refuses a unit two parts of which share a label.
+  let labels = parts_in(text).map(|c: Cut| c.label);
+  assert_eq(
+    body_parts(text).map(|c: Cut| c.label),
+    ordered(names).map(|n: Bytes| part_label(def_root(n))),
+  );
+  let digits = b"0123456789abcdef";
+  assert(
+    body_parts(text).all(|c: Cut| {
+      let label = Bytes::of_string(c.label);
+      label.len() == 16 && range(0, 16).all(|i: Int| digits.index_of(label.slice(i, i + 1)) != None)
+    }),
+    None,
+  );
+  assert_eq(labels.drop(names.len()), ["runtime", "taken", "tables"])
 }
 
 test "a root whose entry the unit takes is listed as entered, though the unit holds no body of it" {
   let entry = |n: Bytes| root_name(Entered(Named(n)));
-  let def = |n: Bytes| { name: def_root(n), arity: 0, constant: false, site: def_root(n) };
-  let entered = |n: Bytes| { name: entry(n), arity: 0, constant: false, site: def_root(n) };
+  let def = |n: Bytes| offer(n, 0);
+  let entered = |n: Bytes| { ..offer_root(Entered(Named(n)), 0), site: def_root(n) };
   // `m.h`'s callers settle its body, so only its entry is offered.
   let p = produce(
     [],
@@ -3580,12 +3832,16 @@ test "a root whose entry the unit takes is listed as entered, though the unit ho
     ]),
     Map::new(),
     no_machine,
+    part_rule(),
   );
   assert(p.taken.contains(entry(b"m.f")), None);
   assert(p.text.index_of(b"entered m.f") != None, None);
   assert(p.text.index_of(b"entered m.h") != None, None);
   assert_eq(p.text.index_of(b"entered m.g"), None)
 }
+
+/// What unit `text` holds before its first part, which every part compiles after.
+fn head_in(text: Bytes) -> Bytes / {abort.raise} = cc::split(text).head
 
 test "every part of a unit compiles after the head, and the runtime's part opens with the tail" {
   let p = produce(
@@ -3595,12 +3851,9 @@ test "every part of a unit compiles after the head, and the runtime's part opens
     by_def([{ key: b"m.f", value: one_body(b"m.f", []) }]),
     Map::new(),
     no_machine,
+    part_rule(),
   );
-  let head = match p.text.index_of(b"/* --- bucket ") {
-    Some(at) -> p.text.slice(0, at),
-    None -> b"",
-  };
-  assert(head == unit_head(), None);
+  assert(head_in(p.text) == unit_head(), None);
   assert(p.text.index_of(unit_tail([])) != None, None);
   // The unit lists what it binds in the order its `ply_bind` reads their addresses.
   assert(
@@ -3616,20 +3869,12 @@ test "every part of a unit compiles after the head, and the runtime's part opens
   )
 }
 
-/// The first of `prefix` and a number whose bucket is none of `others'`.
-fn bucket_apart(prefix: Bytes, others: List<Bytes>) -> Bytes =
-  range(0, 4096).fold(b"", |found: Bytes, i: Int| {
-    let n = prefix.concat(ascii_of_int(i));
-    let free = others.fold(true, |ok: Bool, o: Bytes| ok && def_bucket(o) != def_bucket(n));
-    if found == b"" && free { n } else { found }
-  })
-
-// A bucket is compiled alone, so it declares what its bodies call at the width each is taken at,
-// and nothing else; and a body sits once, in the bucket its name alone decides.
-test "a bucket holds the bodies its names decide and declares what they reach, and nothing else" {
+// A part is compiled alone, so it declares what its bodies call at the width each is taken at, and
+// nothing else; and a body sits once, in one part.
+test "a part declares what its bodies reach, and nothing else" {
   let caller = b"m.caller";
-  let callee = bucket_apart(b"m.callee", [caller]);
-  let apart = bucket_apart(b"m.apart", [caller, callee]);
+  let callee = b"m.callee";
+  let apart = b"m.apart";
   let p = produce(
     [],
     [offer(caller, 0), offer(callee, 2), offer(apart, 0)],
@@ -3641,30 +3886,49 @@ test "a bucket holds the bodies its names decide and declares what they reach, a
     ]),
     Map::new(),
     no_machine,
+    one_each(),
   );
   let declares = |part: Bytes, name: Bytes, arity: Int|
     part.index_of(prototype(b"f_".concat(name), word_head(arity))) != None;
-  let calling = bucket_part(p.text, def_bucket(caller));
+  let calling = part_holding(p.text, body_of(caller));
   assert(
     declares(calling, caller, 0) && declares(calling, callee, 2),
     Some(String::of_bytes_lossy(calling)),
   );
   assert(!declares(calling, apart, 0), Some(String::of_bytes_lossy(calling)));
-  let alone = bucket_part(p.text, def_bucket(apart));
+  let alone = part_holding(p.text, body_of(apart));
   assert(
     !declares(alone, caller, 0) && !declares(alone, callee, 2),
     Some(String::of_bytes_lossy(alone)),
   );
-  let head = match p.text.index_of(b"/* --- bucket ") {
-    Some(at) -> p.text.slice(0, at),
-    None -> p.text,
-  };
+  let head = head_in(p.text);
   [caller, callee, apart].fold((), |u: Unit, name: Bytes| {
-    let defined = Bytes::concat_all([b"Word f_", name, b"(PlyCtx *ctx)"]);
-    assert_eq(p.text.split(defined).len() - 1, 1);
-    assert_eq(bucket_part(p.text, def_bucket(name)).split(defined).len() - 1, 1);
+    assert_eq(p.text.split(body_of(name)).len() - 1, 1);
     assert(head.index_of(b"f_".concat(name)) == None, None)
   })
+}
+
+test "a specialisation running a lambda another module lends sits among that module's bodies" {
+  let lent = at_key(b"std.walk.each", [int_type()], [{ param: 1, owner: Named(b"m.a"), nth: 0 }]);
+  assert_eq(home_of(lent), b"m");
+  assert_eq(home_of(at_key(b"std.walk.each", [int_type()], [])), b"std.walk");
+  let roots = [Named(b"m.a"), lent, Named(b"n.b")];
+  let text = produce(
+    [],
+    roots.map(|k: RootKey| offer_root(k, 0)),
+    1,
+    roots.fold(Map::new(), |acc: Map<RootName, Answer>, k: RootKey|
+      acc.insert(root_name(k), one_body(printed(k), []))),
+    Map::new(),
+    no_machine,
+    part_rule(),
+  ).text;
+  // By its name alone it would sit after `n.b`.
+  let at = |k: RootKey| found_at(text, body_of(printed(k)));
+  assert(
+    at(Named(b"m.a")) >= 0 && at(Named(b"m.a")) < at(lent) && at(lent) < at(Named(b"n.b")),
+    None,
+  )
 }
 
 // A call written to another head than its callee's is C two compilers disagree over silently, as
@@ -3729,6 +3993,7 @@ test "a call written to another head than the callee defines fails the unit" {
         ]),
         Map::new(),
         no_machine,
+        part_rule(),
       ).taken
     };
   assert_eq(made({ answer: b"double", params: [b"double"] }), Ok([callee, caller].map(def_root)));
@@ -3743,7 +4008,7 @@ test "a call written to another head than the callee defines fails the unit" {
   }
 }
 
-/// The unit over `answers`, each root offered as a call.
+/// The unit over `answers`, each root offered as a call and its body in a part of its own.
 fn unit_of(
   answers: List<{ key: Bytes, value: Answer }>,
   inputs: Map<Bytes, Bytes>,
@@ -3755,37 +4020,68 @@ fn unit_of(
     by_def(answers),
     inputs,
     no_machine,
+    one_each(),
   )
 
 /// `a` naming `defs` beside its own statics.
 fn naming(a: Answer, defs: List<StaticDef>) -> Answer =
   { ..a, tables: { ..a.tables, statics: a.tables.statics.concat(defs) } }
 
-/// The part of unit `text` after the tail's mark: the pointers it binds and the unit's own.
-fn tail_of(text: Bytes) -> Bytes / {abort.raise} =
-  match text.index_of(tail_mark()) { Some(at) -> text.slice(at, text.len()), None -> b"" }
+/// How a static's definition opens.
+fn static_defined(d: StaticDef) -> Bytes = Bytes::concat_all([b"const struct ", d.name, b" {"])
 
-test "a static two bodies name is defined once, in the tail, and declared by each bucket that names it" {
-  let shared = statics_of(SStr(b"shared-constant"));
-  let name = shared.get(0).name;
-  let one = b"m.one";
-  let two = bucket_apart(b"m.two", [one]);
-  let apart = bucket_apart(b"m.apart", [one, two]);
+test "a static is defined once, in the part of the first body that names it, and declared by each other part that names it" {
+  let child = statics_of(SStr(b"shared-constant")).get(0);
+  let parent = named(SPlain([WAddress({ name: child.name, tag: 0 })]));
   let p = unit_of(
     [
-      { key: one, value: naming(one_body(one, []), shared) },
-      { key: two, value: naming(one_body(two, []), shared) },
-      { key: apart, value: one_body(apart, []) },
+      { key: b"m.one", value: naming(one_body(b"m.one", []), [child]) },
+      { key: b"m.two", value: naming(one_body(b"m.two", []), [child, parent]) },
+      { key: b"m.apart", value: one_body(b"m.apart", []) },
     ],
     Map::new(),
   );
-  let defined = Bytes::concat_all([b"const struct ", name, b" {"]);
-  assert_eq(p.text.split(defined).len() - 1, 1);
-  assert(tail_of(p.text).index_of(defined) != None, None);
-  let declares = |id: Int| bucket_part(p.text, id).index_of(static_extern(name)) != None;
-  assert_eq([one, two, apart].map(|n: Bytes| declares(def_bucket(n))), [true, true, false]);
+  let one = part_holding(p.text, body_of(b"m.one"));
+  let two = part_holding(p.text, body_of(b"m.two"));
+  assert(found_at(p.text, one) < found_at(p.text, two), None);
+  assert_eq(p.text.split(static_defined(child)).len() - 1, 1);
+  assert(
+    one.index_of(static_defined(child)) != None && one.index_of(static_extern(child.name)) == None,
+    Some(String::of_bytes_lossy(one)),
+  );
+  // The later part declares the child it names, then defines the parent that addresses it.
+  let declared = found_at(two, static_extern(child.name));
+  assert(
+    declared >= 0 && declared < found_at(two, static_defined(parent))
+      && two.index_of(static_defined(child)) == None,
+    Some(String::of_bytes_lossy(two)),
+  );
+  assert(part_holding(p.text, body_of(b"m.apart")).index_of(child.name) == None, None);
+  // No static holds a field's position, so the unit has no `fields` part.
+  assert_eq(part_labelled(p.text, "fields"), b"");
   // No pool: the unit says nothing of its constants to its loader.
   assert(p.text.index_of(b"consts ") == None, None)
+}
+
+test "a static holding a field's position is defined in the `fields` part, and declared where a body names it" {
+  let child = statics_of(SStr(b"child")).get(0);
+  let held = named(SPlain([WField(b"op"), WAddress({ name: child.name, tag: 0 })]));
+  let p = unit_of(
+    [{ key: b"m.f", value: naming(one_body(b"m.f", []), [child, held]) }],
+    Map::new(),
+  );
+  let fields = part_labelled(p.text, "fields");
+  let own = part_holding(p.text, body_of(b"m.f"));
+  assert(
+    fields.index_of(static_defined(held)) != None
+      && fields.index_of(static_extern(child.name)) != None,
+    Some(String::of_bytes_lossy(fields)),
+  );
+  assert(
+    own.index_of(static_defined(child)) != None && own.index_of(static_extern(held.name)) != None,
+    Some(String::of_bytes_lossy(own)),
+  );
+  assert_eq([child, held].map(|d: StaticDef| p.text.split(static_defined(d)).len() - 1), [1, 1])
 }
 
 test "an embedded file is laid out once from the bytes the unit is handed, raw" {
@@ -3798,9 +4094,8 @@ test "an embedded file is laid out once from the bytes the unit is handed, raw" 
     ],
     Map::new().insert(digest, b"\x00\xff"),
   );
-  let laid = tail_of(p.text);
-  assert_eq(laid.split(b"\"\\000\\377\"").len() - 1, 1);
-  assert(laid.index_of(b"{ .len = 2, .room = 2 }") != None, None)
+  assert_eq(p.text.split(b"\"\\000\\377\"").len() - 1, 1);
+  assert(p.text.index_of(b"{ .len = 2, .room = 2 }") != None, None)
 }
 
 test "two statics of one name holding different content stop the unit" {
@@ -5154,7 +5449,7 @@ test "a unit is refused where the runtime implements a shipped module's `extern 
   )
 }
 
-test "a unit declares a shipped module's native over machine words where a bucket calls it, and binds it after the rest" {
+test "a unit declares a shipped module's native over machine words where a part calls it, and binds it after the rest" {
   let native = [
     {
       name: b"std.native",
@@ -5448,14 +5743,16 @@ test "a unit takes what it is offered, resolves its bodies and says what it hold
     answers,
     Map::new(),
     no_machine,
+    part_rule(),
   );
   assert_eq(p.taken, [def_root(b"m.f")]);
-  let own = statics_of(SStr(b"m.f")).get(0).name;
+  let own = statics_of(SStr(b"m.f")).get(0);
+  let body = part_holding(p.text, body_of(b"m.f"));
   assert(
-    p.text.index_of(
+    body.index_of(
         Bytes::concat_all([
           b"Word f_m.f(PlyCtx *ctx) { return (Word)(intptr_t)&",
-          own,
+          own.name,
           b" + ",
           ascii_of_int(root_id(b"m.f")),
           b"; }",
@@ -5464,28 +5761,28 @@ test "a unit takes what it is offered, resolves its bodies and says what it hold
       != None,
     None,
   );
-  assert(p.text.index_of(b"Word f_m.f(PlyCtx*);\n") != None, None);
-  // The tail defines the static the body names, then says what the unit holds.
-  let tail = match p.text.index_of(tail_mark()) { Some(i) -> i, None -> p.text.len() };
-  assert(
-    p.text.index_of_from(Bytes::concat_all([b"const struct ", own, b" {"]), tail) != None,
-    None,
-  );
-  assert(p.text.index_of(b"};\n\n/* --- what this unit says about itself") != None, None);
+  // The body's part declares it and defines the static it names.
+  assert(body.index_of(b"Word f_m.f(PlyCtx*);\n") != None, None);
+  assert(body.index_of(static_defined(own)) != None, None);
   // A constant says its row of the code table, and the loader takes that table and each
   // definition's entry by address.
-  assert(p.text.index_of(b"\"constants 1\" \"\\n\"\n\"m.f 0\" \"\\n\"") != None, None);
+  let tables = part_labelled(p.text, "tables");
+  assert(tables.index_of(b"\"constants 1\" \"\\n\"\n\"m.f 0\" \"\\n\"") != None, None);
   assert(p.text.index_of(b"\"taken ") == None && p.text.index_of(b"\"lambdas ") == None, None);
-  assert(p.text.index_of(b"void *const ply_code[] = {\n  (void *)&e_m.f,\n  0 };\n") != None, None);
   assert(
-    p.text.index_of(
-        b"const struct ply_taken ply_taken[] = {\n  { \"m.f\", (void *)&e_m.f, 0 },\n  { 0, 0, 0 } };\n",
+    tables.index_of(b"extern char e_m.f;\nvoid *const ply_code[] = {\n  (void *)&e_m.f,\n  0 };\n")
+      != None,
+    None,
+  );
+  assert(
+    part_labelled(p.text, "taken").index_of(
+        b"extern char e_m.f;\nconst struct ply_taken ply_taken[] = {\n  { \"m.f\", (void *)&e_m.f, 0 },\n  { 0, 0, 0 } };\n",
       )
       != None,
     None,
   );
   assert(
-    p.text.index_of(b"(void *)ply_bind, (void *)0, ply_code, 1, ply_taken, 1 };\n") != None,
+    tables.index_of(b"(void *)ply_bind, (void *)0, ply_code, 1, ply_taken, 1 };\n") != None,
     None,
   )
 }
@@ -5494,12 +5791,13 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
   let roots = [Named(b"m.z"), Entered(Named(b"m.a")), Named(b"m.B")];
   let p = produce(
     [],
-    roots.map(|k: RootKey| { name: root_name(k), arity: 2, constant: false, site: root_name(k) }),
+    roots.map(|k: RootKey| offer_root(k, 2)),
     1,
     roots.fold(Map::new(), |acc: Map<RootName, Answer>, k: RootKey|
       acc.insert(root_name(k), one_body(printed(k), []))),
     Map::new(),
     no_machine,
+    part_rule(),
   );
   assert(
     p.text.index_of(
@@ -5508,19 +5806,35 @@ test "a unit lays its definitions out by name in byte order, each name as a C li
       != None,
     Some(String::of_bytes_lossy(p.text)),
   );
+  let taken_struct = b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n";
   assert_eq(
-    laid(
-      [{ name: def_root(b"m.\"q\""), arity: 0, symbol: b"f", entry: b"e", head: word_head(0) }],
-      [],
-      [],
-    ),
-    Bytes::concat_all([
-      b"\n/* --- what the loader takes by address --- */\nextern char e;\nvoid *const ply_code[] = {\n  0 };\n",
-      b"struct ply_taken { const char *name; void *entry; unsigned long arity; };\n",
-      b"const struct ply_taken ply_taken[] = {\n  { \"m.\\\"q\\\"\", (void *)&e, 0 },\n  { 0, 0, 0 } };\n",
-      b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
-      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, 0, ply_taken, 1 };\n",
+    taken_part([
+      { name: def_root(b"m.\"q\""), arity: 0, symbol: b"f", entry: b"e", head: word_head(0) },
     ]),
+    Bytes::concat_all([
+      b"\n/* --- part taken --- */\n",
+      taken_struct,
+      b"extern char e;\n",
+      b"const struct ply_taken ply_taken[] = {\n  { \"m.\\\"q\\\"\", (void *)&e, 0 },\n  { 0, 0, 0 } };\n",
+    ]),
+  );
+  // The descriptor's layout is the runtime's, and it takes the `taken` part's table by address.
+  let tables = tables_part([], [], b"", 1);
+  assert(
+    tables.starts_with(b"\n/* --- part tables --- */\nvoid *const ply_code[] = {\n  0 };\n"),
+    None,
+  );
+  assert(
+    tables.ends_with(
+      Bytes::concat_all([
+        taken_struct,
+        b"extern const struct ply_taken ply_taken[];\n",
+        b"void ply_bind(void **fns);\n",
+        b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
+        b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, 0, ply_taken, 1 };\n",
+      ]),
+    ),
+    Some(String::of_bytes_lossy(tables)),
   )
 }
 
