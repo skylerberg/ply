@@ -13,13 +13,13 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               SpecClause, Derived, parse, test_run, test_listing, IInstance,
                               InstanceKind, NKey, NShow, NInvariant, NHost, NRelease, INumeric,
                               member_name, member_of, numeric_ops, numeric_by, is_pub, TDAlias,
-                              TDExtern)
+                              TDExtern, result_name, case_params)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
                               SLetElse, SExpr, SAssign, Param, MatchArm, HandleClause, HandlerVar,
                               RecField, expr_span, is_ordered, ETagged, Hole, tagged_parser,
-                              tagged_filler, case_at, case_identity, call_operator, prelude_module)
+                              tagged_filler, call_operator, prelude_module, case_at, case_identity)
 import compiler.check.types (atoms_insert, RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar,
                              TyCon, TyFn, TyRecord, Field, Scheme, Free, atoms_covered,
                              atoms_sorted, row_empty, row_open, row_is_pure_but_raise, run_needs,
@@ -27,7 +27,7 @@ import compiler.check.types (atoms_insert, RNamed, RSingleton, RVar, RAny, Atom,
                              bool_type, bytes_type, unit_type, fn_type, monomorphic, field_get,
                              ints_union, ints_difference, subst_new, mark_rigid_ty, is_rigid_row,
                              free_vars, unify, unify_row, env_push, env_pop, env_bind,
-                             env_bind_global, env_remove_global, env_depth_of, generalize,
+                             env_bind_global, env_remove_global, env_lookup, generalize,
                              leaving_row, resolve_atom, atom_text, resource_text, type_text,
                              row_text, Printer, printer_new, printer_naming, print_ty, TyNominal,
                              record_fields, at_arguments, string_type, secret_type)
@@ -44,8 +44,11 @@ import compiler.check.resolve.tables (ParsedModule, Binding, ModuleBinding, Decl
                                       error_with_labels, error_at, label_at, backticked, Parameters,
                                       ParamInfo)
 import compiler.check.resolve.scopes (find, of_module)
-import compiler.check.resolve.sets (pattern_binders)
-import compiler.expand.rewrite (MemberCallee, with_member_calls, Elaborated, elaborated_natives)
+import compiler.expand.rewrite.shared (picked_in)
+import compiler.check.resolve.bindings (item_binders)
+import compiler.expand.rewrite (MemberCallee, WrittenOut, InField, with_member_calls, Elaborated,
+                                elaborated_natives)
+import compiler.check.member (MemberTarget, CallsFunction, CallsField)
 import compiler.emit.layout (intrinsic_named)
 import compiler.emit.c (width_named)
 import compiler.emit.keys (test_owner, law_owner)
@@ -71,17 +74,16 @@ import compiler.check.infer.checker (TrySite, DeclaredAlias, DeclaredExtern, Dec
                                      Given, Only, HandedBody, Checker, Inferred, WithTy, WithTys,
                                      WithSig, Signed, Walk, Body, TagRefusal, Growth, NamedCallee,
                                      WalkedBody, ModuleFns, TypedSites, StatedFns, Reached, Count,
-                                     Generalized, compare_values_name, result_name, location_of,
-                                     scope_of, report, report_error_at, report_error_at_and,
-                                     err_labels, backticked_text, plural, row_aliases, new_ty,
-                                     resolve, resolve_row_in, with_unified, simulated_names,
-                                     seed_atom, builtin_type_arity, effect_of, def_of, set_def,
-                                     Builtin, prelude_imports, declared, builtins, refuse_externs,
-                                     mode_eq, is_direct, builtin_bound, insert_constraint,
-                                     dedup_constraints, Shapes, derivable, vars_of_type, hold,
-                                     TypedAt)
+                                     Generalized, compare_values_name, location_of, scope_of,
+                                     report, report_error_at, report_error_at_and, err_labels,
+                                     backticked_text, plural, row_aliases, new_ty, resolve,
+                                     resolve_row_in, with_unified, simulated_names, seed_atom,
+                                     builtin_type_arity, effect_of, def_of, set_def, Builtin,
+                                     prelude_imports, declared, builtins, refuse_externs, mode_eq,
+                                     is_direct, builtin_bound, insert_constraint, dedup_constraints,
+                                     Shapes, derivable, vars_of_type, hold, TypedAt)
 import compiler.check.infer.names (Found, of_language_type, declared_value, written_binder,
-                                   simple_name_of, home_module)
+                                   local_at, simple_name_of, home_module)
 import compiler.check.infer.declarations (conv_type, conv_atom, op_named, duplicate,
                                           constraints_in_force, member_scheme, written_signature,
                                           first_reason, witnessing, scheduler_handle)
@@ -99,105 +101,19 @@ import compiler.check.infer.resources (resource_type, release_atoms)
 
 // --- Definitions ----------------------------------------------------------------------------------
 
-type Refs = { names: List<QName> }
-
-/// Every name a body reads that no binder inside it shadows: a parameter or a `let` named like a
-/// top-level definition reads the binder, not the definition.
-fn refs_of(expr: Expr, bound: List<Bytes>) -> Refs = collect_refs(expr, bound, { names: [] })
-
-fn param_names(params: List<Param>) -> List<Bytes> = params.map(|param: Param| param.name.name)
-
-fn collect_refs(e: Expr, bound: List<Bytes>, out: Refs) -> Refs =
-  match e {
-    ELit(_) -> out,
-    ETagged(t) ->
-      t.holes.fold(
-        {
-          names: if t.holes.len() == 0 { out.names.push(tagged_parser(t)) }
-          else { out.names.push(tagged_parser(t)).push(tagged_filler(t)) },
-        },
-        |acc: Refs, h: Hole| collect_refs(h.value, bound, acc),
-      ),
-    EBad(_) -> out,
-    EHole(_) -> out,
-    EVar(v) -> if is_bare(v.name) && bound.contains(v.name.name.name) { out }
-    else { { names: out.names.push(v.name) } },
-    EBinary(b) -> collect_refs(b.rhs, bound, collect_refs(b.lhs, bound, out)),
-    EUnary(u) -> collect_refs(u.operand, bound, out),
-    ELambda(l) -> collect_refs(l.body, bound.concat(param_names(l.params)), out),
-    EApp(a) ->
-      a.args.fold(collect_refs(a.func, bound, out), |acc: Refs, x: Expr|
-        collect_refs(x, bound, acc)),
-    EIf(i) ->
-      collect_refs(
-        i.else_branch,
-        bound,
-        collect_refs(i.then_branch, bound, collect_refs(i.cond, bound, out)),
-      ),
-    EMatch(m) ->
-      m.arms.fold(collect_refs(m.scrutinee, bound, out), |acc: Refs, arm: MatchArm| {
-        let inner = pattern_binders(arm.pat, bound);
-        collect_refs(arm.body, inner, match arm.guard {
-          Some(g) -> collect_refs(g, inner, acc),
-          None -> acc,
-        })
-      }),
-    EBlock(b) -> {
-      let ss = b.stmts.fold(
-        { bound: bound, out: out },
-        |acc: { bound: List<Bytes>, out: Refs }, s: Stmt|
-          match s {
-            SExpr(x) -> { ..acc, out: collect_refs(x, acc.bound, acc.out) },
-            SAssign(x) -> { ..acc, out: collect_refs(x.value, acc.bound, acc.out) },
-            SLet(l) ->
-              {
-                bound: pattern_binders(l.pat, acc.bound),
-                out: collect_refs(l.value, acc.bound, acc.out),
-              },
-            SLetElse(l) ->
-              {
-                bound: pattern_binders(l.pat, acc.bound),
-                out: collect_refs(l.fallback, acc.bound, collect_refs(l.value, acc.bound, acc.out)),
-              },
-          },
-      );
-      match b.tail { Some(t) -> collect_refs(t, ss.bound, ss.out), None -> ss.out }
-    },
-    ERecord(r) -> r.fields.fold(out, |acc: Refs, f: RecField| collect_refs(f.value, bound, acc)),
-    ERecordUpdate(r) ->
-      r.fields.fold(collect_refs(r.base, bound, out), |acc: Refs, f: RecField|
-        collect_refs(f.value, bound, acc)),
-    EField(f) -> collect_refs(f.base, bound, out),
-    ETry(t) -> collect_refs(t.operand, bound, out),
-    EList(l) -> l.items.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
-    EPerform(p) -> p.args.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
-    EHandle(h) -> {
-      // Each initializer sees the variables above it.
-      let inits = h.vars.fold(
-        { refs: out, bound: bound },
-        |acc: { refs: Refs, bound: List<Bytes> }, v: HandlerVar|
-          { refs: collect_refs(v.init, acc.bound, acc.refs), bound: acc.bound.push(v.name.name) },
-      );
-      let b = collect_refs(h.body, bound, inits.refs);
-      let held = bound.concat(h.vars.map(|v: HandlerVar| v.name.name));
-      let cs = h.clauses.fold(b, |acc: Refs, c: HandleClause| {
-        let named = held.concat(c.params.map(|i: Ident| i.name));
-        let labelled = match c.label_binder { Some(t) -> named.push(t.name), None -> named };
-        let inner = match c.resume { Some(k) -> labelled.push(k.name), None -> labelled };
-        collect_refs(c.body, inner, acc)
-      });
-      match h.ret { Some(rc) -> collect_refs(rc.body, held.push(rc.binder.name), cs), None -> cs }
-    },
-    EWithHold(c) ->
-      collect_refs(
-        c.body,
-        bound.push(c.binder.name),
-        collect_refs(c.release, bound, collect_refs(c.acquire, bound, out)),
-      ),
-    ESimulate(s) -> collect_refs(s.body, bound, out),
-    EParallel(v) -> v.branches.fold(out, |acc: Refs, x: Expr| collect_refs(x, bound, acc)),
-    ETryBlock(t) -> collect_refs(t.body, bound, out),
-  }
+/// Each name `def`'s body and clauses read, as written; a tagged literal reads its tag's functions.
+fn names_read(def: FnDef) -> List<QName> =
+  picked_in({ doc: None, imports: [], items: [IFn(def)] }, |e: Expr|
+    match e { EVar(_) -> true, ETagged(_) -> true, _ -> false }).fold(
+    [],
+    |acc: List<QName>, e: Expr|
+      match e {
+        EVar(v) -> acc.push(v.name),
+        ETagged(t) -> if t.holes.len() == 0 { acc.push(tagged_parser(t)) }
+        else { acc.push(tagged_parser(t)).push(tagged_filler(t)) },
+        _ -> acc,
+      },
+  )
 
 /// A module's functions as their signatures bind them, for the walk of its bodies.
 pub type SignedModule = {
@@ -702,7 +618,7 @@ fn member_declared(checker: Checker, parsed: ParsedModule, def: FnDef) -> Checke
       let type_name = qualify(parsed.name, m.of);
       match checker.types.get(type_name) {
         None -> if builtin_type_arity(m.of) != None && home_module(m.of) == parsed.name {
-          if env_depth_of(checker.env, def.name.name) != Some(0) { checker } else {
+          if env_lookup(checker.env, def.name.name) == None { checker } else {
             report_error_at(
               checker,
               b"E0105",
@@ -783,7 +699,7 @@ fn walked_first(fns: List<FnDef>) -> List<Int> / {abort.raise} = {
   let index = range(0, fns.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
     acc.insert(fns.get(i).name.name, i));
   let adj = fns.map(|d: FnDef|
-    refs_of(d.body, param_names(d.params)).names.fold([], |acc: List<Int>, qname: QName|
+    names_read(d).fold([], |acc: List<Int>, qname: QName|
       if !is_bare(qname) { acc } else {
         match index.get(qname.name.name) {
           Some(i) -> if acc.contains(i) { acc } else { acc.push(i) },
@@ -980,7 +896,7 @@ fn group_callee_kind(
           if qualified.get(i) == n { GroupMember(i) } else { acc }),
       None -> match of_language_type(checker, qname) {
         Found(m) -> if m.qname.module == None { BuiltinCallee(m.callee) } else { OtherCallee },
-        _ -> if is_bare(qname) && env_depth_of(checker.env, qname.name.name) == Some(0) {
+        _ -> if is_bare(qname) && env_lookup(checker.env, qname.name.name) != None {
           BuiltinCallee(qname.name.name)
         } else { OtherCallee },
       },
@@ -1318,8 +1234,9 @@ fn walked_or_filed(
 /// `sites` being the calls on values the walk of that body wrote out.
 fn lent_refused(checker: Checker, def: FnDef, sites: List<MemberSite>) -> Checker / {abort.raise} =
   if !lent::lends(def) { checker } else {
-    let at = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite| m.insert(x.site, x.callee));
-    lent::refusals(checker.module, def, {
+    let at = sites.fold(Map::new(), |m: Map<Int, MemberTarget>, x: MemberSite|
+      m.insert(x.site, x.callee));
+    lent::refusals(checker.module, def, checker.binders, {
       named: |q: QName| lent_target(checker, q),
       member: |s: Span| at.get(s.site),
       takes: |n: Bytes| checker.takings.get(n),
@@ -1388,7 +1305,7 @@ fn owned_judged(
     || at.fold(false, |found: Bool, k: Int, t: Type| found || resource(t))
     || count_in(b.body, |e: Expr| match e { EHandle(_) -> true, _ -> false }) > 0;
   if !any { { checker: { ..checker, valued: [] }, held: [] } } else {
-    let members = sites.fold(Map::new(), |m: Map<Int, Bytes>, x: MemberSite|
+    let members = sites.fold(Map::new(), |m: Map<Int, MemberTarget>, x: MemberSite|
       m.insert(x.site, x.callee));
     let taking = |name: Bytes| -> Option<Taking> {
       match checker.takings.get(name) {
@@ -1415,10 +1332,7 @@ fn owned_judged(
             ToUnknown -> None,
           },
         member: |span: Span|
-          match members.get(span.site) {
-            Some(callee) -> if callee.len() == 0 { None } else { taking(callee) },
-            None -> None,
-          },
+          match members.get(span.site) { Some(CallsFunction(n)) -> taking(n), _ -> None },
         op_kept: |eff: QName, op: Ident|
           match resolve_op(checker, eff, op).hit { Some(hit) -> hit.op.kept, None -> [] },
         opened: |t: Type|
@@ -1437,6 +1351,7 @@ fn owned_judged(
             x.module == checker.module && x.site == span.site).map(|x: TrySite|
             Bytes::concat_all([x.effect, b".", x.op])),
       },
+      checker.binders,
       b.params,
       b.body,
       b.types,
@@ -1647,7 +1562,7 @@ fn lent_target(checker: Checker, q: QName) -> Target / {abort.raise} =
       Some(n) -> ToFunction(n),
       None -> match of_language_type(checker, q) {
         Found(m) -> ToFunction(m.callee),
-        _ -> if is_bare(q) && env_depth_of(checker.env, q.name.name) == Some(0) {
+        _ -> if is_bare(q) && env_lookup(checker.env, q.name.name) != None {
           ToFunction(q.name.name)
         } else { ToUnknown },
       },
@@ -1752,29 +1667,13 @@ fn signed_body(
   }
 }
 
-/// What each name `def` reads refers to, as the termination walk asks of a name it did not bind:
-/// read once here, where the module's scope is at hand.
-fn named_callees(checker: Checker, def: FnDef) -> List<NamedCallee> / {abort.raise} = {
-  let read = def.params.fold(refs_of(def.body, []).names, |acc: List<QName>, p: Param|
-    match p.default { Some(d) -> acc.concat(refs_of(d, []).names), None -> acc });
-  read.fold(
-    { seen: Map::new(), out: [] },
-    |acc: { seen: Map<Bytes, Bool>, out: List<NamedCallee> }, q: QName| {
-      let module = match q.module { Some(m) -> m.name, None -> b"" };
-      let key = member_name(module, q.name.name);
-      if acc.seen.contains(key) { acc } else {
-        {
-          seen: acc.seen.insert(key, true),
-          out: acc.out.push({
-            module: module,
-            name: q.name.name,
-            callee: group_callee_kind(checker, [], q),
-          }),
-        }
-      }
-    },
-  ).out
-}
+/// What each name `def` reads and nothing in it binds refers to, by the site of the name, as the
+/// termination walk asks of a name it did not bind: read once here, where the module's scope is at
+/// hand.
+fn named_callees(checker: Checker, def: FnDef) -> List<NamedCallee> / {abort.raise} =
+  names_read(def).fold([], |acc: List<NamedCallee>, q: QName|
+    if local_at(checker, q) != None { acc }
+    else { acc.push({ site: q.name.span.site, callee: group_callee_kind(checker, [], q) }) })
 
 /// `callee`, or the slot it has in the group `qualified` where it is a member.
 fn member_or(qualified: List<Bytes>, callee: Callee) -> Callee / {abort.raise} =
@@ -1807,18 +1706,21 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
   // body walked to read an ending from.
   let filed = bodies.map(|b: Body| b.filed);
   let walked = filed.fold(false, |any: Bool, k: Option<KnownDef>| any || k == None);
-  let names = bodies.fold(Map::new(), |acc: Map<Bytes, Callee>, b: Body|
-    b.names.fold(acc, |held: Map<Bytes, Callee>, x: NamedCallee|
-      held.insert(member_name(x.module, x.name), member_or(qualified, x.callee))));
+  let names = bodies.map(|b: Body|
+    b.names.fold(Map::new(), |held: Map<Int, Callee>, x: NamedCallee|
+      held.insert(x.site, member_or(qualified, x.callee))));
   // A body is read with its calls on values written out: one of a builtin through the prelude's
   // binder, one of a function of a type through its module's.
-  let named = |qname: QName| {
+  let named = |slot: Int, qname: QName| {
     let through = match qname.module { Some(x) -> x.name, None -> b"" };
     if through == prelude_binder() { BuiltinCallee(qname.name.name) } else {
       match of_module(through) {
         Some(home) -> member_or(qualified, DefinedCallee(qualify(home, qname.name.name))),
-        None -> match names.get(member_name(through, qname.name.name)) {
-          Some(callee) -> callee,
+        None -> match names.at(slot) {
+          Some(read) -> match read.get(qname.name.span.site) {
+            Some(callee) -> callee,
+            None -> OtherCallee,
+          },
           None -> OtherCallee,
         },
       }
@@ -1846,6 +1748,7 @@ fn settle_group(checker: Checker, m: ModuleFns, comp: List<Int>) -> Checker / {a
       names: qualified,
       params: bodies.map(|b: Body| b.params),
       resolve: named,
+      binders: defs.map(|d: FnDef| item_binders(tagged.resolved, tagged.module, IFn(d))),
       stated: |slot: Int, span: Span|
         match stated.at(slot) {
           Some(s) -> match s.get(span.site) { Some(cs) -> cs, None -> [] },
@@ -2023,6 +1926,7 @@ fn witness_order(checker: Checker, def: FnDef, scheme: Scheme) -> Checker / {abo
 fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {abort.raise} = {
   let checker: Checker = {
     ..outer,
+    binders: item_binders(outer.resolved, outer.module, IFn(def)),
     scope: signature.scope,
     ty_params: signature.ty_params,
     row_params: signature.row_params,
@@ -2070,10 +1974,7 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
     });
   let pushed: Checker = { ..defaults, env: env_push(defaults.env) };
   let bound: Checker = range(0, def.params.len()).fold(pushed, |c: Checker, i: Int|
-    {
-      ..c,
-      env: env_bind(c.env, def.params.get(i).name.name, monomorphic(signature.params.get(i))),
-    });
+    { ..c, env: env_bind(c.env, def.params.get(i).name, monomorphic(signature.params.get(i))) });
   let walked: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
   let body: Inferred = {
     ..walked,
@@ -3386,7 +3287,11 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
             None -> acc.checker,
             Some(first) -> refuse_shared_label(acc.checker, written, first),
           };
-          let c: Checker = { ..seen, scope: seen.scope + 1 };
+          let c: Checker = {
+            ..seen,
+            scope: seen.scope + 1,
+            binders: item_binders(seen.resolved, seen.module, item),
+          };
           let owner = test_owner(parsed.name, def.name);
           let footprint: WithAtoms = match c.known.tests.get(qualify(parsed.name, def.name)) {
             Some(cached) ->
@@ -3414,15 +3319,11 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
               let pushed: Checker = { ..c1, env: env_push(c1.env) };
               let entered: Checker = match def.cases {
                 None -> pushed,
-                Some(_) ->
-                  {
-                    ..pushed,
-                    env: env_bind(
-                      env_bind(pushed.env, case_at(), monomorphic(int_type())),
-                      case_identity(),
-                      monomorphic(bytes_type()),
-                    ),
-                  },
+                Some(cases) ->
+                  case_params(cases).fold(pushed, |c: Checker, p: { name: Ident, ty: TypeExpr }| {
+                    let t: WithTy = conv_type(c, p.ty);
+                    { ..t.checker, env: env_bind(t.checker.env, p.name, monomorphic(t.ty)) }
+                  }),
               };
               let ran: Inferred = infer_whole(entered, test_run(def), hint_of(unit_type()));
               let o: Inferred = {
@@ -3729,6 +3630,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
     raise_notes: [],
     auto_ty_params: true,
     walking: law_owner(parsed.name, def.name),
+    binders: item_binders(outer.resolved, outer.module, ILaw(def)),
   };
   let types: WithTys = def.binders.fold(
     { checker: checker, tys: [] },
@@ -3747,7 +3649,7 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
   let bound: Checker = range(0, def.binders.len()).fold(pushed, |c: Checker, i: Int|
     {
       ..note_typed(c, def.binders.get(i).span, types.tys.get(i), []),
-      env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
+      env: env_bind(c.env, def.binders.get(i).name, monomorphic(types.tys.get(i))),
     });
   let binders_typed = zip(def.binders, types.tys).map(|b: { first: Binder, second: Type }|
     { name: b.first.name.name, ty: b.second, span: b.first.name.span });
@@ -4458,7 +4360,10 @@ pub fn check_specs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
         match spec_env_of(c, name) {
           None -> c,
           Some(env) -> {
-            let shadowed: Checker = check_cost_names(check_result_shadow(c, def), def);
+            let shadowed: Checker = check_cost_names(
+              check_result_shadow({ ..c, binders: item_binders(c.resolved, c.module, item) }, def),
+              def,
+            );
             let walked = range(0, def.spec.len()).fold(
               { checker: shadowed, specs: [] },
               |acc: { checker: Checker, specs: List<SpecInfo> }, i: Int| {
@@ -4514,9 +4419,8 @@ fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abor
   );
   let pushed: Checker = { ..assumed, env: env_push(assumed.env) };
   range(0, def.params.len()).fold(pushed, |c: Checker, i: Int|
-    if i >= env.params.len() { c } else {
-      { ..c, env: env_bind(c.env, def.params.get(i).name.name, monomorphic(env.params.get(i))) }
-    })
+    if i >= env.params.len() { c }
+    else { { ..c, env: env_bind(c.env, def.params.get(i).name, monomorphic(env.params.get(i))) } })
 }
 
 /// `params` at the types `types` gives them, in order.
@@ -4575,11 +4479,15 @@ fn check_clause(
   let named = |names: List<Option<Ident>>|
     names.fold(bound, |c: Checker, name: Option<Ident>|
       match name {
-        Some(k) -> { ..c, env: env_bind(c.env, k.name, monomorphic(int_type())) },
+        Some(k) -> { ..c, env: env_bind(c.env, k, monomorphic(int_type())) },
         None -> c,
       });
   let with_result: Checker = match clause.kind {
-    SEnsures -> { ..bound, env: env_bind(bound.env, result_name(), monomorphic(env.ret)) },
+    SEnsures ->
+      {
+        ..bound,
+        env: env_bind(bound.env, { name: result_name(), span: clause.span }, monomorphic(env.ret)),
+      },
     SRequires -> bound,
     SSpace -> named(def.params.map(|param: Param| param.space)),
     SCost -> named(def.params.map(|param: Param| param.cost)),
@@ -4905,15 +4813,22 @@ pub fn members_in(
 ) -> Map<Bytes, Map<Int, MemberCallee>> =
   all.fold(Map::new(), |acc: Map<Bytes, Map<Int, MemberCallee>>, s: MemberSite|
     if s.module != module { acc } else {
-      let params = match signatures.get(s.callee) { Some(g) -> g.params, None -> [] };
+      let params = match s.callee {
+        CallsFunction(n) -> match signatures.get(n) { Some(g) -> g.params, None -> [] },
+        _ -> [],
+      };
       let sites = match acc.get(s.owner) { Some(m) -> m, None -> Map::new() };
       acc.insert(
         s.owner,
-        sites.insert(s.site, {
-          qualifier: s.qualifier,
-          name: s.name,
-          names: params.map(|p: ParamInfo| p.name),
-          defaults: params.map(|p: ParamInfo| p.default),
+        sites.insert(s.site, match s.callee {
+          CallsField -> InField,
+          _ ->
+            WrittenOut({
+              qualifier: s.qualifier,
+              name: s.name,
+              names: params.map(|p: ParamInfo| p.name),
+              defaults: params.map(|p: ParamInfo| p.default),
+            }),
         }),
       )
     })

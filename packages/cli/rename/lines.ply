@@ -1,0 +1,261 @@
+import std.fs (fs)
+import std.json (Bool)
+import paths (kind, read_file)
+import walk (Failure)
+import compiler.syntax.lexer (lex, Identifier, is_ident_start, is_ident_continue)
+
+pub type Defined = { file: String, old: Bytes, new: Bytes }
+
+pub type Moved = { path: String, new: Bytes }
+
+pub type OperationLine = { file: String, effect_name: Bytes, op: Bytes, new: Bytes }
+
+pub type Renames = {
+  words: Bool,
+  names: Map<Bytes, Bytes>,
+  fields: Map<Bytes, Bytes>,
+  defined: List<Defined>,
+  modules: List<Moved>,
+  operations: List<OperationLine>,
+}
+
+type Piece = { text: Bytes, word: Bool }
+
+pub fn shown(b: Bytes) -> String = "`" ++ String::of_bytes_lossy(b) ++ "`"
+
+fn is_upper(c: Int) -> Bool = c >= 65 && c <= 90
+
+fn is_lower(c: Int) -> Bool = c >= 97 && c <= 122
+
+fn is_letter(c: Int) -> Bool = is_upper(c) || is_lower(c)
+
+pub fn is_name(text: Bytes) -> Bool / {abort.raise} =
+  text.len() > 0 && is_ident_start(text.at(0))
+    && !range(0, text.len()).any(|i: Int| !is_ident_continue(text.at(i)))
+
+fn is_word(text: Bytes) -> Bool / {abort.raise} =
+  text.len() > 0 && is_lower(text.at(0))
+    && !range(0, text.len()).any(|i: Int|
+      !(is_lower(text.at(i)) || (text.at(i) >= 48 && text.at(i) <= 57)))
+
+fn is_words(text: Bytes) -> Bool / {abort.raise} = !text.split(b"_").any(|w: Bytes| !is_word(w))
+
+fn fields_of(line: Bytes) -> List<Bytes> / {abort.raise} =
+  [b"\t", b"\r"].fold(line.split(b" "), |parts: List<Bytes>, separator: Bytes|
+    parts.fold([], |acc: List<Bytes>, part: Bytes| acc.concat(part.split(separator)))).filter(
+    |f: Bytes| f != b"",
+  )
+
+fn refusal_of(
+  renames: Renames,
+  taken: Bool,
+  old: Bytes,
+  new: Bytes,
+) -> Option<String> / {abort.raise} =
+  if taken { Some(shown(old) ++ " appears twice") }
+  else if renames.words && !(is_word(old) && is_words(new)) {
+    Some(
+      "with `--words`, an old word is lowercase letters and digits, and a new one is such words joined by `_`",
+    )
+  } else if !renames.words && !(is_name(old) && is_name(new)) {
+    Some(shown(old) ++ " and " ++ shown(new) ++ " must both be valid names")
+  } else { None }
+
+fn names_module(field: Bytes) -> Bool = field.ends_with(b".ply") || field.ends_with(b"/")
+
+fn with_line(renames: Renames, fields: List<Bytes>) -> Result<Renames, String> / {abort.raise} =
+  if fields.len() == 2 && names_module(fields.get(0)) {
+    let path = String::of_bytes_lossy(fields.get(0));
+    if renames.words { Err("`--words` renames words, not modules") }
+    else if renames.modules.any(|m: Moved| m.path == path) { Err(path ++ " appears twice") }
+    else if !is_name(fields.get(1)) { Err(shown(fields.get(1)) ++ " is not a valid module name") }
+    else { Ok({ ..renames, modules: renames.modules.push({ path: path, new: fields.get(1) }) }) }
+  } else if fields.len() == 2 && fields.get(0).starts_with(b".") {
+    let old = fields.get(0).slice(1, fields.get(0).len());
+    if renames.words { Err("`--words` renames words, not fields") } else {
+      match refusal_of(renames, renames.fields.contains(old), old, fields.get(1)) {
+        Some(why) -> Err(why),
+        None -> Ok({ ..renames, fields: renames.fields.insert(old, fields.get(1)) }),
+      }
+    }
+  } else if fields.len() == 2 {
+    let old = fields.get(0);
+    let taken = renames.names.contains(old) || renames.defined.any(|d: Defined| d.old == old);
+    match refusal_of(renames, taken, old, fields.get(1)) {
+      Some(why) -> Err(why),
+      None -> Ok({ ..renames, names: renames.names.insert(old, fields.get(1)) }),
+    }
+  } else if fields.len() == 3 && !renames.words && fields.get(1).index_of(b".") != None {
+    let file = String::of_bytes_lossy(fields.get(0));
+    let parts = fields.get(1).split(b".");
+    if parts.len() != 2 || !is_name(parts.get(0)) || !is_name(parts.get(1))
+        || !is_name(fields.get(2)) {
+      Err(
+        shown(fields.get(1)) ++ " must be an effect and one of its operations, like `fs.read_file`",
+      )
+    } else if renames.operations.any(|o: OperationLine|
+        o.file == file && o.effect_name == parts.get(0) && o.op == parts.get(1)) {
+      Err(shown(fields.get(1)) ++ " appears twice")
+    } else {
+      Ok({
+        ..renames,
+        operations: renames.operations.push({
+          file: file,
+          effect_name: parts.get(0),
+          op: parts.get(1),
+          new: fields.get(2),
+        }),
+      })
+    }
+  } else if fields.len() == 3 && !renames.words {
+    let file = String::of_bytes_lossy(fields.get(0));
+    let old = fields.get(1);
+    let taken = renames.names.contains(old)
+      || renames.defined.any(|d: Defined| d.old == old && d.file == file);
+    match refusal_of(renames, taken, old, fields.get(2)) {
+      Some(why) -> Err(why),
+      None ->
+        Ok({
+          ..renames,
+          defined: renames.defined.push({
+            file: String::of_bytes_lossy(fields.get(0)),
+            old: fields.get(1),
+            new: fields.get(2),
+          }),
+        }),
+    }
+  } else {
+    Err(
+      "each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+    )
+  }
+
+pub fn renames_of(text: Bytes, words: Bool) -> Result<Renames, String> / {abort.raise} = {
+  let lines = text.split(b"\n");
+  range(0, lines.len()).fold(
+    Ok({
+      words: words,
+      names: Map::new(),
+      fields: Map::new(),
+      defined: [],
+      modules: [],
+      operations: [],
+    }),
+    |acc: Result<Renames, String>, i: Int|
+      match acc {
+        Err(_) -> acc,
+        Ok(renames) -> {
+          let fields = fields_of(lines.get(i));
+          if fields.len() == 0 { acc } else {
+            match with_line(renames, fields) {
+              Ok(r) -> Ok(r),
+              Err(why) -> Err("line " ++ (i + 1).to_string() ++ ": " ++ why),
+            }
+          }
+        },
+      },
+  )
+}
+
+fn breaks_at(name: Bytes, i: Int) -> Bool / {abort.raise} = {
+  let c = name.at(i);
+  let before = name.at(i - 1);
+  if is_letter(c) != is_letter(before) || c == 95 != (before == 95) { true }
+  else if is_lower(before) && is_upper(c) { true }
+  else { is_upper(before) && is_upper(c) && i + 1 < name.len() && is_lower(name.at(i + 1)) }
+}
+
+fn pieces_of(name: Bytes) -> List<Piece> / {abort.raise} = {
+  let bounds = [0].concat(range(1, name.len()).filter(|i: Int| breaks_at(name, i))).push(
+    name.len(),
+  );
+  range(0, bounds.len() - 1).map(|k: Int| {
+    let text = name.slice(bounds.get(k), bounds.get(k + 1));
+    { text: text, word: is_letter(text.at(0)) }
+  })
+}
+
+fn mapped_bytes(text: Bytes, change: (Int) -> Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all(range(0, text.len()).map(|i: Int| byte_of_int(change(text.at(i)))))
+
+fn lower(text: Bytes) -> Bytes / {abort.raise} =
+  mapped_bytes(text, |c: Int| if is_upper(c) { c + 32 } else { c })
+
+fn upper(text: Bytes) -> Bytes / {abort.raise} =
+  mapped_bytes(text, |c: Int| if is_lower(c) { c - 32 } else { c })
+
+fn capitalized(word: Bytes) -> Bytes / {abort.raise} =
+  upper(word.slice(0, 1)).concat(word.slice(1, word.len()))
+
+pub fn joined(words: List<Bytes>, separator: Bytes) -> Bytes =
+  words.fold(b"", |acc: Bytes, w: Bytes|
+    if acc == b"" { w } else { Bytes::concat_all([acc, separator, w]) })
+
+fn written_as(piece: Bytes, words: List<Bytes>, shouting: Bool) -> Bytes / {abort.raise} =
+  if is_lower(piece.at(0)) { joined(words, b"_") }
+  else if shouting { joined(words.map(upper), b"_") }
+  else { Bytes::concat_all(words.map(capitalized)) }
+
+pub fn renamed(renames: Renames, name: Bytes) -> Bytes / {abort.raise} =
+  if !renames.words { match renames.names.get(name) { Some(n) -> n, None -> name } } else {
+    let shouting = !range(0, name.len()).any(|i: Int| is_lower(name.at(i)));
+    let worded = Bytes::concat_all(
+      pieces_of(name).map(|p: Piece|
+        if !p.word { p.text } else {
+          match renames.names.get(lower(p.text)) {
+            Some(replacement) -> written_as(p.text, replacement.split(b"_"), shouting),
+            None -> p.text,
+          }
+        }),
+    );
+    if keyword_refusal(worded) == None { worded } else { name }
+  }
+
+pub fn field_name(renames: Renames, name: Bytes) -> Bytes / {abort.raise} =
+  match renames.fields.get(name) { Some(n) -> n, None -> renamed(renames, name) }
+
+pub fn keyword_refusal(new: Bytes) -> Option<Failure> / {abort.raise} =
+  match lex(new).tokens.at(0) {
+    Some(t) -> match t.kind {
+      Identifier(n) -> if n == new { None }
+      else { Some({ path: "", why: shown(new) ++ " is not a valid name" }) },
+      _ -> Some({ path: "", why: shown(new) ++ " is a keyword" }),
+    },
+    None -> Some({ path: "", why: shown(new) ++ " is not a valid name" }),
+  }
+
+fn words_of(map: Bytes) -> Renames / {abort.raise} =
+  match renames_of(map, true) { Ok(r) -> r, Err(why) -> panic(why) }
+
+test "`--words` replaces a word inside names, keeps each name's casing and never writes a keyword" {
+  let r = words_of(b"ty type\nexpr type_expression\n");
+  assert_eq(renamed(r, b"ty_vars"), b"type_vars");
+  assert_eq(renamed(r, b"TyCon"), b"TypeCon");
+  assert_eq(renamed(r, b"MAX_TY"), b"MAX_TYPE");
+  assert_eq(renamed(r, b"EExpr"), b"ETypeExpression");
+  assert_eq(renamed(r, b"expr2"), b"type_expression2");
+  assert_eq(renamed(r, b"__ty"), b"__type");
+  assert_eq(renamed(r, b"types"), b"types");
+  assert_eq(renamed(r, b"ty"), b"ty");
+  assert_eq(renamed(r, b"TDNominal"), b"TDNominal")
+}
+
+fn refusal_in(map: Bytes, words: Bool) -> Option<String> / {abort.raise} =
+  match renames_of(map, words) { Ok(_) -> None, Err(why) -> Some(why) }
+
+test "each line of a map needs an old name and a new name" {
+  assert_eq(refusal_in(b"a b\n\n  c\td\r\n", false), None);
+  assert_eq(
+    refusal_in(b"a b c d\n", false),
+    Some(
+      "line 1: each line needs an old name and a new name, after the file that declares the old name when only that definition is renamed",
+    ),
+  );
+  assert_eq(refusal_in(b"m.ply a b\nn.ply a c\n", false), None);
+  assert_eq(refusal_in(b"m.ply a b\nm.ply a c\n", false), Some("line 2: `a` appears twice"));
+  assert(refusal_in(b"m.ply a b\n", true) != None);
+  assert_eq(refusal_in(b"a b\na c\n", false), Some("line 2: `a` appears twice"));
+  assert(refusal_in(b"Ty type\n", true) != None);
+  assert(refusal_in(b"ty Type\n", true) != None);
+  assert_eq(refusal_in(b"ty type_name\n", true), None)
+}
