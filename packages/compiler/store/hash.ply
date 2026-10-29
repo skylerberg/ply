@@ -25,8 +25,8 @@ import std.string
 import compiler.check.infer.checker (MemberSite)
 import compiler.store.hash.graph (NodeEffect, NodeFn, NodeType, Node, TestNode, LawNode, Index,
                                   owner_type)
-import compiler.store.hash.encoding (hex, Choice, Called, Found, Pick, Waiting)
-import compiler.store.hash.template (site_key, called_at, choice_of, test_template, law_template,
+import compiler.store.hash.encoding (hex, Choice, Found, Pick, Waiting)
+import compiler.store.hash.template (site_key, called_at, choice_at, test_template, law_template,
                                      spec_template, type_template, new_encoder)
 import compiler.store.hash.fill (Finished, references, type_references)
 import compiler.store.hash.forms (First, build_index, listed_refs, member_hash, framed_picks,
@@ -77,7 +77,7 @@ pub fn body_component(body: Bytes) -> Option<{ id: Bytes, members: List<Bytes> }
 /// `body` with each call on a value its hashing left pending written as `chose`, what its check
 /// found of each call by `site_key`, says: the body hashing after the check stores. Any other body
 /// is itself.
-pub fn checked_body(body: Bytes, chose: Map<Bytes, Called>) -> Bytes / {abort.raise} = {
+pub fn checked_body(body: Bytes, chose: Map<Bytes, Choice>) -> Bytes / {abort.raise} = {
   let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
   if kind != 2 && kind != 3 { body } else {
     let from = if kind == 2 { 1 } else { 5 };
@@ -91,8 +91,7 @@ pub fn checked_body(body: Bytes, chose: Map<Bytes, Called>) -> Bytes / {abort.ra
       body.slice(1, from),
       framed_picks(
         picks.map(|member: List<Pick>|
-          member.map(|p: Pick|
-            match p { Found(c) -> c, Waiting(s) -> choice_of(chose.get(s.at), s.candidates) })),
+          member.map(|p: Pick| match p { Found(c) -> c, Waiting(site) -> choice_at(chose, site) })),
       ),
       body.slice(from + 4 + n, body.len()),
     ])
@@ -1181,7 +1180,6 @@ fn printed_of(
       out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
       all_public(named_hashes(out)),
       [],
-      [],
       shipped,
     ) {
     Printed(ms) -> ms,
@@ -1424,7 +1422,7 @@ test "a body that calls on a value prints back importing each module whose funct
   assert_eq(by_name(named_hashes(again)), by_name(named_hashes(out)))
 }
 
-test "a call on a value prints as a call of what its check found it calls, set apart or not" {
+test "a call on a value prints as it was written, naming the parameter an argument fills" {
   let src = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)";
   let index = indexed([{ name: b"m", src: src }]);
   let body_of = |name: Bytes|
@@ -1435,27 +1433,19 @@ test "a call on a value prints as a call of what its check found it calls, set a
       ..chosen_in(index, 0),
       called: Some(
         Map::of_entries([
-          {
-            key: site_key(b"m.total", body_of(b"m.total").site),
-            value: { callee: b"m.Cart::size", named: [] },
-          },
-          {
-            key: site_key(b"m.more", body_of(b"m.more").site),
-            value: { callee: b"m.Cart::scaled", named: [2] },
-          },
+          { key: site_key(b"m.total", body_of(b"m.total").site), value: { named: [] } },
+          { key: site_key(b"m.more", body_of(b"m.more").site), value: { named: [2] } },
         ]),
       ),
     }),
     [],
   ).nodes;
-  let item = |apart: Bool, name: Bytes|
+  let item = |name: Bytes|
     match print_bodies(
         fixed.map(|f: Fixed| f.body),
         fixed.map(|f: Fixed| { name: f.name, hash: f.hash, public: true }),
         [],
         [],
-        [],
-        apart,
       ) {
       Printed(ms) ->
         ms.get(0).text.split(b"\n\n").fold(b"", |acc: Bytes, it: Bytes|
@@ -1463,17 +1453,11 @@ test "a call on a value prints as a call of what its check found it calls, set a
       Unprintable(why) -> panic(String::of_bytes(why.message)),
     };
   let shown = |t: Bytes| Some(String::of_bytes_lossy(t));
-  // Set apart, a function of a type is a plain function under another name.
-  let apart = item(true, b"total");
-  assert(apart.contains(b"Cart::size(_l0)") && !apart.contains(b".size("), shown(apart));
-  // Under its own names it is written as it was, which hashes back to what it was stored under.
-  let own = item(false, b"total");
+  let own = item(b"total");
   assert(own.contains(b".size()"), shown(own));
   // A printed function's parameters are named by their places, and so is an argument a call names.
-  let named_apart = item(true, b"more");
-  assert(named_apart.contains(b"Cart::scaled(_l0, _l2: 3)"), shown(named_apart));
-  let named_own = item(false, b"more");
-  assert(named_own.contains(b".scaled(_l2: 3)"), shown(named_own))
+  let named = item(b"more");
+  assert(named.contains(b".scaled(_l2: 3)"), shown(named))
 }
 
 test "a `with_hold`'s region is part of its hash" {
@@ -1585,7 +1569,7 @@ test "a reference is printed under a name the module holding it exports" {
   assert_eq(named.get(b"shelf.width"), named.get(b"hidden.span"));
   let names = named_hashes(out).map(|x: { name: Bytes, hash: Bytes }|
     { name: x.name, hash: x.hash, public: x.name != b"hidden.span" });
-  match print_bodies(out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body), names, [], [], [
+  match print_bodies(out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body), names, [], [
       b"hidden",
       b"shelf",
     ]) {
@@ -1761,7 +1745,6 @@ test "one effect declaration under two names is refused, since a body cannot say
       all_public(named_hashes(out)),
       [],
       [],
-      [],
     ) {
     Printed(_) -> panic("two names for one declaration must be refused"),
     Unprintable(why) ->
@@ -1822,8 +1805,6 @@ test "a type two modules declare alike is printed under the name a definition na
         closure.map(|x: Closed| { name: x.name, hash: x.hash, public: true }),
         [],
         [],
-        [],
-        false,
         if told {
           closure.map(|x: Closed|
             { name: x.name, hash: x.hash, names: x.refs.map(|i: Int| closure.get(i).name) })
@@ -1863,7 +1844,7 @@ test "a `new` record is its name and its fields, and no alias of those fields" {
   assert_eq(vendored.get(b"a.Date"), vendored.get(b"b.Date"))
 }
 
-test "a type's hash says whether it is opaque, what holds it moves with it, and set apart it prints open" {
+test "a type's hash says whether it is opaque, and what holds it moves with it" {
   let m = |src: Bytes| by_name(named_hashes(hash_index(indexed([{ name: b"m", src: src }]))));
   let open = m(b"pub type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
   let closed = m(b"pub opaque type Date = new { day: Int }\npub fn day(d: Date) -> Int = d.day");
@@ -1875,29 +1856,7 @@ test "a type's hash says whether it is opaque, what holds it moves with it, and 
   let sum = m(b"pub type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
   let closed_sum = m(b"pub opaque type Tok = | Tok(Int)\npub fn mk() -> Tok = Tok(1)");
   assert(sum.get(b"m.Tok") != closed_sum.get(b"m.Tok"));
-  assert(sum.get(b"m.mk") != closed_sum.get(b"m.mk"));
-  let out = hash_index(
-    indexed([
-      {
-        name: b"m",
-        src: b"pub opaque type Tok = | Tok(Int)\nkey for Tok by n\nfn n(t: Tok) -> Int = match t { Tok(i) -> i }\npub opaque type Date = new { day: Int }\npub fn mk() -> Date = { day: n(Tok(1)) }",
-      },
-    ]),
-  );
-  // Set apart from the module that wrote them, its bodies build the type from wherever they are.
-  let apart = match print_bodies(
-      out.bodies.map(|b: { name: Bytes, body: Bytes }| b.body),
-      all_public(named_hashes(out)),
-      [],
-      [],
-      [],
-      true,
-    ) {
-    Printed(open) -> open.get(0).text,
-    Unprintable(why) -> panic(String::of_bytes(why.message)),
-  };
-  assert(apart.contains(b"pub type Tok = | Tok(Int)"));
-  assert(!apart.contains(b"opaque"))
+  assert(sum.get(b"m.mk") != closed_sum.get(b"m.mk"))
 }
 
 test "an alias is transparent, so its name is no part of it" {
@@ -2072,7 +2031,7 @@ test "the published hashes digest to a pinned value" {
 }
 
 test "a stored body is keyed by its own bytes, and bytes no envelope holds by nothing" {
-  let picked = [{ callee: 3, named: [] }, { callee: 0 - 1, named: [2, 1] }];
+  let picked = [{ named: [] }, { named: [2, 1] }];
   let found = picked.map(|c: Choice| Found(c));
   let solo = solo_body({ bytes: b"abc", chosen: found });
   assert_eq(body_key(solo), Some(blake3(b"abc")));
@@ -2105,10 +2064,10 @@ test "a stored body is keyed by its own bytes, and bytes no envelope holds by no
   assert_eq(body_key(b"\x07rest"), None);
   assert_eq(body_key(b"\x01\x00"), None);
   // A call its check is yet to say of keys its body under nothing, until the check completes it.
-  let site = { at: site_key(b"m.f", 1), candidates: [b"m.A::f", b"m.B::f"] };
+  let site = site_key(b"m.f", 1);
   let open = [Found(picked.get(0)), Waiting(site)];
-  let found_open = [Found(picked.get(0)), Found({ callee: 1, named: [2, 1] })];
-  let said = Map::new().insert(site.at, { callee: b"m.B::f", named: [2, 1] });
+  let found_open = [Found(picked.get(0)), Found({ named: [2, 1] })];
+  let said = Map::new().insert(site, { named: [2, 1] });
   let pending = solo_body({ bytes: b"abc", chosen: open });
   let pending_member = member_body(
     { members: [], packed: b"xyz", picks: [[], open], classes: Map::new() },

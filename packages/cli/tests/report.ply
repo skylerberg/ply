@@ -24,10 +24,9 @@ import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, t
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, styles)
 import tester (Chosen, Hosted, Options, TestUnit, Unlisted)
-import trials (Evident)
+import suspects (SuspectDiff)
 import testing.schedule (Atom, Counts, Scheduled, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, shared)
-import testing.bisect (SearchStats)
 import testing.delta (kind_word)
 import testing.diagnose (Suspect)
 import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
@@ -294,39 +293,20 @@ pub type Outcome = {
   performs: Int,
 }
 
-pub type Culprit = { names: List<String>, at: Option<ModuleSpan> }
-
-/// What a failure's cause came to. The runtime sends this whole shape — a program that searched
-/// answers with its own verdict, and the document publishes whichever side decided.
-pub type Bisect = {
-  conclusive: Bool,
-  requested: Bool,
-  reason: String,
-  culprits: List<Culprit>,
-  verdict: String,
-  skipped: Option<String>,
-  confidence: String,
-  groups: List<List<String>>,
-  search: SearchStats,
-}
-
 pub type Site = { task: String, definition: Option<String>, access: String, at: Option<ModuleSpan> }
 
 /// The two steps whose reordering at scheduling point `step` flipped a passing interleaving to this
 /// one.
 pub type Race = { left: Site, right: Site, step: Int }
 
-/// One failure as the runtime reports it: what happened, and the facts its cause is decided from.
+/// One failure as the runtime reports it.
 pub type Failed = {
   key: String,
   /// The label as the source wrote it.
   name: String,
   diagnostic: Raised,
-  /// Two of the gate's facts; the mode is this run's own flag.
+  /// Ply failed rather than the program.
   defect: Bool,
-  host: Bool,
-  /// `None` when the test never passed, so there is no earlier definition set to compare against.
-  search: Option<Evident>,
   /// The definitions in the closure the store has never seen pass, each with its current hash.
   suspects: List<{ name: String, hash: Option<String> }>,
   /// Nothing in this test's closure changed, which is not the same as nothing being ranked.
@@ -341,14 +321,12 @@ pub type Failed = {
   declared: Option<List<String>>,
 }
 
-/// One failure as a report shows it: the runtime's account, and what this program decided about its
-/// cause.
+/// One failure as a report shows it: the runtime's account, and what changed under it.
 pub type Fault = {
   key: String,
   name: String,
   diagnostic: Raised,
   defect: Bool,
-  bisect: Bisect,
   /// Ranked, most likely first.
   suspects: List<Suspect>,
   unchanged: Bool,
@@ -430,8 +408,6 @@ fn opt_bool(v: Option<Bool>) -> Json = match v { Some(b) -> Bool(b), None -> Nul
 fn covers(xs: List<Int>, wanted: Int) -> Bool = xs.filter(|x: Int| x == wanted).len() > 0
 
 fn no_group() -> Group = { tests: [], footprint: "" }
-
-fn no_culprit() -> Culprit = { names: [], at: None }
 
 // --- Fixed point ------------------------------------------------------------
 
@@ -1008,28 +984,6 @@ pub fn summary_line(style: Style, report: RunReport, counted: Counts) -> String 
 
 // --- One failure ------------------------------------------------------------
 
-fn culprit_line(
-  style: Style,
-  places: List<Place>,
-  c: Culprit,
-  first: Bool,
-) -> String / {abort.raise} =
-  "  " ++ red(style, if first { "culprit:" } else { "        " }) ++ " "
-    ++ String::join(c.names, " + ")
-    ++ dim_place(style, places, c.at)
-
-/// The culprit before the diff: the culprit is the answer.
-pub fn bisect_lines(style: Style, places: List<Place>, b: Bisect) -> List<String> / {abort.raise} =
-  if b.conclusive {
-    range(0, b.culprits.len()).fold([], |acc: List<String>, i: Int|
-      acc.push(culprit_line(style, places, b.culprits.at_or(i, no_culprit()), i == 0))).push(
-      "    " ++ dim(style, b.reason),
-    )
-  }
-  // Silent when no bisection was asked for.
-  else if !b.requested { [] }
-  else { ["  " ++ dim(style, "no culprit:") ++ " " ++ b.reason] }
-
 fn note_lines(style: Style, diag: Diag) -> List<String> =
   diag.notes_text.map(|n: Bytes| "  " ++ dim(style, "=") ++ " " ++ String::of_bytes_lossy(n))
 
@@ -1085,8 +1039,8 @@ pub fn described(x: Suspect) -> String =
   match x.change { Some(c) -> x.name ++ " (" ++ kind_word(c) ++ ")", None -> x.name }
 
 fn suspect_lines(style: Style, fault: Fault) -> List<String> = {
-  let rest = fault.suspects.filter(|x: Suspect| !x.culprit).map(described);
-  if rest.len() > 0 { ["  " ++ yellow(style, "suspects:") ++ " " ++ String::join(rest, ", ")] }
+  let named = fault.suspects.map(described);
+  if named.len() > 0 { ["  " ++ yellow(style, "suspects:") ++ " " ++ String::join(named, ", ")] }
   else if fault.unchanged {
     ["  " ++ dim(style, "suspects: none — nothing in this test's closure changed")]
   } else { [] }
@@ -1094,9 +1048,7 @@ fn suspect_lines(style: Style, fault: Fault) -> List<String> = {
 
 fn failure_lines(style: Style, places: List<Place>, fault: Fault) -> List<String> / {abort.raise} = {
   let d = shown(fault.diagnostic);
-  [bold(style, fault.key)].concat(bisect_lines(style, places, fault.bisect)).concat([
-    "  " ++ String::of_bytes_lossy(d.message),
-  ]).concat(
+  [bold(style, fault.key), "  " ++ String::of_bytes_lossy(d.message)].concat(
     at_lines(style, places, d),
   ).concat(
     secondary_lines(style, places, d),
@@ -1117,8 +1069,50 @@ fn failure_blocks(
   faults.fold([], |acc: List<String>, fault: Fault|
     acc.push("").concat(failure_lines(style, program.places, fault).map(|l: String| indent() ++ l)))
 
-/// A test the clock stopped: no culprit, no suspects, nothing to bisect — the machine ran out of
-/// patience, and what the test would have decided is still unknown.
+/// A diff is cut at this many lines, so one large change does not bury the others.
+fn diff_lines_shown() -> Int = 40
+
+fn painted(style: Style, line: String) -> String =
+  if line.starts_with("+") { green(style, line) }
+  else if line.starts_with("-") { red(style, line) }
+  else if line.starts_with("@@") { dim(style, line) }
+  else { line }
+
+/// One change: its name, how it changed and where it is now, then its diff under the two lines
+/// that name the sides.
+fn diff_lines(style: Style, places: List<Place>, d: SuspectDiff) -> List<String> / {abort.raise} = {
+  let head = "  " ++ bold(style, d.name) ++ " (" ++ kind_word(d.change) ++ ")"
+    ++ dim_place(style, places, d.at);
+  let body = match d.diff {
+    None -> ["    " ++ dim(style, "its text from when the test last passed is not stored")],
+    Some(text) -> {
+      let lines = text.split("\n").drop(2).filter(|l: String| l != "");
+      let shown = lines.take(diff_lines_shown()).map(|l: String| "    " ++ painted(style, l));
+      if lines.len() <= diff_lines_shown() { shown } else {
+        shown.push(
+          "    " ++ dim(style, "… " ++ count_of(lines.len() - diff_lines_shown(), "more line")),
+        )
+      }
+    },
+  };
+  [head].concat(body)
+}
+
+/// Each change the failures' suspects name, once, after every failure.
+fn diff_blocks(
+  style: Style,
+  program: Program,
+  diffs: List<SuspectDiff>,
+) -> List<String> / {abort.raise} =
+  if diffs.len() == 0 { [] } else {
+    ["", indent() ++ bold(style, "changed since the failing tests last passed:")].concat(
+      diffs.flat_map(|d: SuspectDiff|
+        diff_lines(style, program.places, d).map(|l: String| indent() ++ l)),
+    )
+  }
+
+/// A test the clock stopped: no suspects — the machine ran out of patience, and what the test would
+/// have decided is still unknown.
 fn abandoned_lines(
   style: Style,
   places: List<Place>,
@@ -1358,8 +1352,8 @@ fn race_json(v: Option<Race>) -> Json =
       ]),
   }
 
-/// The failure artifact: what failed and where, whether it is Ply's fault, how to replay it, and the
-/// cause this program decided, led by the culprit.
+/// The failure artifact: what failed and where, whether it is Ply's fault, how to replay it, and what
+/// changed under it, most likely cause first.
 pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
   object([
     { key: "key", value: Str(fault.key) },
@@ -1371,7 +1365,6 @@ pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
     { key: "replay", value: string_or_null(fault.replay) },
     // Only when the search actually observed the flip.
     { key: "race", value: race_json(fault.race) },
-    { key: "culprit", value: culprit_json(fault.bisect) },
     { key: "suspects", value: Array(fault.suspects.map(suspect_json)) },
     { key: "module", value: string_or_null(fault.module) },
     { key: "test_hash", value: string_or_null(fault.test_hash) },
@@ -1384,34 +1377,6 @@ pub fn fault_json(program: Program, fault: Fault) -> Json / {abort.raise} =
     },
   ])
 
-/// The verdict as the document carries it: what to change, how sure the system is, and how it
-/// found out. Built here rather than read from the runtime's copy of the row, because a program
-/// that searched is the side that decided.
-fn culprit_json(b: Bisect) -> Json =
-  object([
-    { key: "verdict", value: Str(b.verdict) },
-    { key: "skipped", value: string_or_null(b.skipped) },
-    { key: "confidence", value: Str(b.confidence) },
-    { key: "definitions", value: Array(b.culprits.map(|c: Culprit| Str(c.names.at_or(0, "")))) },
-    {
-      key: "groups",
-      value: Array(b.groups.map(|g: List<String>| Array(g.map(|n: String| Str(n))))),
-    },
-    { key: "reason", value: Str(b.reason) },
-    {
-      key: "search",
-      value: object([
-        { key: "candidates", value: int(b.search.candidates) },
-        { key: "clusters", value: int(b.search.clusters) },
-        { key: "evaluated", value: int(b.search.evaluated) },
-        { key: "cached", value: int(b.search.cached) },
-        { key: "memoized", value: int(b.search.memoized) },
-        { key: "unresolved", value: int(b.search.unresolved) },
-        { key: "exhausted", value: Bool(b.search.exhausted) },
-      ]),
-    },
-  ])
-
 fn suspect_json(x: Suspect) -> Json =
   object([
     { key: "name", value: Str(x.name) },
@@ -1421,7 +1386,18 @@ fn suspect_json(x: Suspect) -> Json =
     },
     { key: "hash", value: string_or_null(x.hash) },
     { key: "before", value: string_or_null(x.before) },
-    { key: "culprit", value: Bool(x.culprit) },
+    { key: "test", value: Bool(x.test) },
+  ])
+
+fn diff_json(program: Program, d: SuspectDiff) -> Json / {abort.raise} =
+  object([
+    { key: "name", value: Str(d.name) },
+    { key: "change", value: Str(kind_word(d.change)) },
+    {
+      key: "location",
+      value: match d.at { Some(at) -> place_json(program.places, at), None -> Null },
+    },
+    { key: "diff", value: string_or_null(d.diff) },
   ])
 
 fn parallelism_json(v: Parallelism) -> Json =
@@ -1512,13 +1488,14 @@ fn extra_documents(report: RunReport) -> List<Member> = {
 }
 
 /// Bumped whenever a field in the failure artifact changes meaning or leaves.
-fn artifact_schema() -> Int = 7
+fn artifact_schema() -> Int = 8
 
 fn document(
   flags: Flags,
   program: Program,
   report: RunReport,
   faults: List<Fault>,
+  diffs: List<SuspectDiff>,
   warnings: List<Diag>,
   ok: Bool,
   decided: Decided,
@@ -1566,6 +1543,7 @@ fn document(
         ),
       },
       { key: "failures", value: Array(faults.map(|f: Fault| fault_json(program, f))) },
+      { key: "diffs", value: Array(diffs.map(|d: SuspectDiff| diff_json(program, d))) },
       // Not a warning: every later run believes an escaped entry.
       { key: "diagnostics", value: all_to_json(report.escapes, program.places) },
       { key: "warnings", value: all_to_json(warnings, program.places) },
@@ -1600,6 +1578,7 @@ fn closing_lines(
   program: Program,
   report: RunReport,
   faults: List<Fault>,
+  diffs: List<SuspectDiff>,
   warnings: List<Diag>,
 ) -> List<String> / {abort.raise} =
   [
@@ -1609,6 +1588,7 @@ fn closing_lines(
     [summary_line(style, report, counts_of(program, report.reaches))],
     warned_lines(style, report.escapes),
     failure_blocks(style, program, faults),
+    diff_blocks(style, program, diffs),
     abandoned_blocks(style, program, report),
     nothing_lines(style, flags, program),
     warned_lines(style, warnings),
@@ -1628,13 +1608,14 @@ pub fn answered(
   program: Program,
   report: RunReport,
   faults: List<Fault>,
+  diffs: List<SuspectDiff>,
   decided: Decided,
 ) -> Answer / {abort.raise} = {
   let warnings = collected(program, report);
   let ok = green_run(report);
   {
-    json: document(flags, program, report, faults, warnings, ok, decided),
-    lines: closing_lines(style, flags, program, report, faults, warnings),
+    json: document(flags, program, report, faults, diffs, warnings, ok, decided),
+    lines: closing_lines(style, flags, program, report, faults, diffs, warnings),
     errs: [],
     code: if ok { ok_code() } else { run_failed() },
   }

@@ -2486,21 +2486,26 @@ is not a verdict: a test over it is *abandoned* (`W0612`), reported separately f
 recorded nowhere, and run again next time. A run with an abandoned test is not a success, since it
 decided nothing about that test.
 
-**Bisection.** When a deterministic test that passed before fails, `ply test` bisects over the
-definitions that changed to find the one that broke it. `--bisect auto|always|never` (default
-`auto`) and `--bisect-budget N` (evaluations, default 64) control this. `--json` prints one object
-with each failure's diagnostic, declared footprint, suspects, culprit and replay command
-(`schema_version` 7). Suspects are ranked culprits first, then definitions that were edited before
-ones whose hash only changed because of an edit elsewhere. Each result lists, as `performs`, the
-operations its test performed, including handled ones. `--watch` reruns on every `.ply` change and
-on every change to a file the last run embedded, keeping caches in memory.
+**Suspects.** A failure lists its suspects: the definitions its test reaches that changed since the
+test last passed, and the test itself when its own text changed. A passing run stores the text of
+each test that passed and of each definition it reached. A definition whose hash changed is edited
+when its text differs from the stored one, and changed only because something it uses changed when
+its text is the same. The test comes first, then each definition that was edited, added or
+removed, then the rest. After the failures, `ply test` prints each change once as a diff of its
+text then and now, with where it is now. A diff longer than 40 lines is cut short. A test that never
+passed, or a run under `--no-cache`, has no earlier version to compare: its suspects are the
+definitions it reaches that no passing run has seen.
+
+`--json` prints one object with each failure's diagnostic, declared footprint, suspects and replay
+command, and `diffs`: each change once, with its name, kind, location and unified diff
+(`schema_version` 8). Each result lists, as `performs`, the operations its test performed,
+including handled ones. `--watch` reruns on every `.ply` change and on every change to a file the
+last run embedded, keeping caches in memory.
 
 Each case of a test over cases (§8.1) passes, fails and is reported under its own label, so a
 failing table names every failing case. In `--json`, a case's entry under `selection.tests` has
 `case`: the test it belongs to (`of`), its position in the table (`at`), and its `identity`, the
-BLAKE3 hash of its value. A failing case is checked against what it runs, which excludes the table,
-and is given a culprit when a single change explains it. Otherwise it is not bisected (`skipped` is
-`case`).
+BLAKE3 hash of its value. A failing case's suspects are what it runs, which excludes the table.
 
 ### 8.5 Coverage and mutation testing
 
@@ -3566,7 +3571,7 @@ their paths as written. `ply doc` works outside any package for builtins and the
 | --- | --- |
 | `ply new PATH` | `--name NAME` (default: the last part of the path), `--lib` (a library: one `pub` definition, no `main`). Refuses an invalid package name and an existing directory. |
 | `ply check [path]` | `--types`, `--costs`, `--explain` (the checking phases and how much was reused from the cache; with `--types`, also effect sets, where each type came from, and each place a body can raise, §6.8), `--workspace`, `--verify-deps` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--bisect`, `--bisect-budget`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage`, `--mutate [DEF]`, `--mutate-budget`, `--profile`, `--workspace`, `--verify-deps`, host, simulation |
 | `ply run [path] [-- ARGS]` | `--seed` (always one interleaving), `--timeout` (no limit by default, since a server runs forever), `--profile`, `--explain` (on standard error: whether checking was reused from an earlier run, the load's phases, the host operations the program may perform, and how it handles a stop signal), `--require-signer KEY` (repeatable; §15.2), host, trace, drain. `ARGS` is what `process.args` returns. A `.plyx` path runs the built artifact. |
 | `ply prove [path]` | `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--reach`, `--workspace`, `--verify-deps`, prove, simulation |
 | `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, prove, simulation |

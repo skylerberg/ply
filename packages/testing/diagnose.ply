@@ -1,20 +1,10 @@
-//! `diagnose` — turning one failure into its cause: the suspects, ranked and annotated with what
-//! changed since the test last passed and with what bisection proved.
+//! `diagnose` — a failure's suspects: the definitions that changed in its test's closure since the
+//! test last passed, ranked for a person who reads the list from the top.
 //!
-//! The ranking is the whole point of the module. A person reads the list from the top, so the order
-//! is: what bisection named a culprit, then everything else — and among those, a body that was edited
-//! outranks one whose hash merely moved, because a moved hash is what an untouched dependency looks
-//! like.
-//!
-//! A cause need not look changed, so a culprit outside the suspect set is added rather than dropped:
-//! the test's own closure is where suspicion starts, not where it ends.
+//! The test's own edit comes first, then a definition that was edited, then one whose hash only
+//! moved because something under it changed, which is what an untouched dependency looks like.
 
-import bisect (Auto, Bisected, DoesNotCheck, a_failure, a_pass, Host, Minimal, NoHybrids, Partial,
-               Sole, Bisection, Budget, MissingBody, Mode, Never, NoChanges, NeverPassed, Nondet,
-               NotAttempted, NotInTheGraph, NotRequested, Panicked, Skipped, Trial, Verdict, bisect,
-               culprits, default_budget, mode_budget, not_attempted, precheck, unresolved_trial)
-import delta (Added, Change, ChangeKind, Delta, Derived, Edited, added, change, change_is_candidate,
-              derived, edited, is_candidate, kind_word, no_edges, with_components)
+import delta (Change, ChangeKind, Decl, Delta, Derived, change, edited, derived, added, kind_word)
 import std.list
 
 /// One definition a failure might be explained by, with everything the run knows about it.
@@ -23,435 +13,99 @@ pub type Suspect = {
   hash: Option<String>,
   /// Its hash when the test last passed.
   before: Option<String>,
-  /// Absent when the configurations were never compared, so an edit looks like a moved hash.
+  /// Absent when the two eras were never compared, so an edit looks like a moved hash.
   change: Option<ChangeKind>,
-  /// Whether bisection put it in the minimal failure-inducing set.
-  culprit: Bool,
+  /// The failing test itself, whose own body changed.
+  test: Bool,
 }
 
 pub fn suspect(name: String, hash: Option<String>) -> Suspect =
-  { name: name, hash: hash, before: None, change: None, culprit: false }
+  { name: name, hash: hash, before: None, change: None, test: false }
 
-/// Most-likely-first: a bisected culprit, then an edit before a hash that merely moved, then the name.
 fn before(a: Suspect, b: Suspect) -> Bool =
-  if a.culprit != b.culprit { a.culprit }
-  else if inherited(a) != inherited(b) { inherited(a) < inherited(b) }
+  if a.test != b.test { a.test }
+  else if moved_only(a) != moved_only(b) { !moved_only(a) }
   else { compare(a.name, b.name) == Less }
 
-fn inherited(s: Suspect) -> Int =
-  match s.change { Some(k) -> if is_candidate(k) { 0 } else { 1 }, None -> 0 }
+fn moved_only(s: Suspect) -> Bool = s.change == Some(Derived)
 
-pub fn sorted_suspects(xs: List<Suspect>) -> List<Suspect> / {abort.raise} =
-  xs.fold([], |acc: List<Suspect>, s: Suspect| {
-    let position = range(0, acc.len()).fold(acc.len(), |i: Int, j: Int|
-      if i < acc.len() { i } else if before(s, acc.get(j)) { j } else { i });
-    let head = range(0, position).map(|j: Int| acc.get(j));
-    range(position, acc.len()).fold(head.push(s), |out: List<Suspect>, j: Int| out.push(acc.get(j)))
-  })
-
-pub type Attribution = {
-  /// The same set as the failure's suspects, ranked and annotated.
-  suspects: List<Suspect>,
-  bisection: Bisection,
-}
-
-/// `found` is each suspect's current hash, which the caller read out of the hash table: a name that is
-/// both a `fn` and a `type` is one suspect, since it is one thing to look at.
-pub fn from_suspects(
+/// The suspects of one failure: `found` is each definition of its closure no pass has seen, with its
+/// current hash, and `delta` what changed since the test last passed, when it passed before. A name
+/// that is both a `fn` and a `type` is one suspect, since it is one thing to look at.
+pub fn suspects_of(
   found: List<{ name: String, hash: Option<String> }>,
-) -> Attribution / {abort.raise} =
-  {
-    suspects: sorted_suspects(
-      found.map(|f: { name: String, hash: Option<String> }| suspect(f.name, f.hash)),
-    ),
-    bisection: not_attempted(NotRequested),
-  }
-
-/// Folds a bisection into the suspects, then re-ranks.
-pub fn resolve(a: Attribution, bisection: Bisection) -> Attribution / {abort.raise} = {
-  let named = culprits(bisection);
-  let marked = a.suspects.map(|s: Suspect| { ..s, culprit: named.contains(s.name) });
-  // A culprit outside the suspect set is still the answer: a cause need not look changed.
-  let added = named.fold(marked, |acc: List<Suspect>, name: String|
-    if acc.any(|s: Suspect| s.name == name) { acc }
-    else { acc.push({ ..suspect(name, None), culprit: true }) });
-  { suspects: sorted_suspects(added), bisection: bisection }
-}
-
-/// Folds what changed since the test last passed into the suspects, then re-ranks. A candidate the
-/// search may flip has to be ranked too, or the first suspect is not the best guess.
-pub fn annotate(a: Attribution, delta: Delta) -> Attribution / {abort.raise} = {
-  let marked = a.suspects.map(|s: Suspect|
-    match change(delta, s.name) {
-      Some(c) -> { ..s, before: c.before, change: Some(c.kind) },
-      None -> s,
-    });
-  let added = delta.changes.fold(marked, |acc: List<Suspect>, c: Change|
-    if acc.any(|s: Suspect| s.name == c.name) { acc }
-    else { acc.push({ ..suspect(c.name, c.after), before: c.before, change: Some(c.kind) }) });
-  { ..a, suspects: sorted_suspects(added) }
-}
-
-// --- The pipeline -------------------------------------------------------------
-
-pub type Options = { bisect: Mode, budget: Budget }
-
-pub fn never() -> Options = { bisect: Never, budget: default_budget() }
-
-/// One failure, and everything a run knows about it that is not in the diagnostic.
-pub type Evidence = {
-  nondet: Bool,
-  /// The evaluator failed rather than the program — a defect in Ply, not a change to attribute.
-  defect: Bool,
-  /// The failing run reached a host handler, as observed rather than predicted by selection.
-  host: Bool,
-  /// The raw closure ∩ changed intersection, with each one's current hash.
-  suspects: List<{ name: String, hash: Option<String> }>,
-  /// Whether an earlier, passing run is on record.
-  baseline: Bool,
-}
-
-/// One cluster and an unedited test is the common case, decided by counting, not evaluating.
-pub fn needs_a_hybrid(delta: Delta) -> Bool = {
-  let n = delta.clusters.len();
-  if n == 0 { false }
-  else if n == 1 { match delta.own { Some(_) -> true, None -> false } }
-  else { true }
-}
-
-/// What no hybrid at all answers: the store cannot produce the bodies a mixture needs.
-fn no_hybrid(_delta: Delta, _flipped: List<Int>) -> Trial = unresolved_trial(MissingBody)
-
-/// One failure becomes its attribution. `delta` is the classified diff, absent when there was no
-/// baseline to compare against; `hybrid` builds and runs a mixture, and `absent` is why none can be
-/// built, when none can; `classified` says how many changed definitions could not be told apart from
-/// a hash that merely moved, and `test_classified` whether the test's own hash could.
-pub fn diagnose<a | e>(
-  evidence: Evidence,
-  options: Options,
   delta: Option<Delta>,
-  classified: Int,
-  test_classified: Bool,
-  hybrid: (Delta, List<Int>) -> Trial / e,
-  absent: Option<Skipped>,
-) -> Attribution / {abort.raise | e} = {
-  let start = from_suspects(evidence.suspects);
-  let gate = precheck({
-    mode: options.bisect,
-    defect: evidence.defect,
-    host: evidence.host,
-    nondet: evidence.nondet,
-    baseline: evidence.baseline,
-  });
-  let bisection = match gate {
-    Some(why) -> not_attempted(why),
-    None -> match delta {
-      None -> not_attempted(NeverPassed),
-      Some(d) -> {
-        let budget = mode_budget(options.bisect, options.budget);
-        match absent {
-          None -> searched(bisect(d, hybrid, budget), classified, test_classified),
-          Some(why) -> if needs_a_hybrid(d) { not_attempted(why) }
-          else { searched(bisect(d, no_hybrid, budget), classified, test_classified) },
-        }
-      },
+) -> List<Suspect> = {
+  let listed = found.map(|f: { name: String, hash: Option<String> }| suspect(f.name, f.hash));
+  let all = match delta {
+    None -> listed,
+    Some(d) -> {
+      let marked = listed.map(|s: Suspect|
+        match change(d, s.name) {
+          Some(c) -> { ..s, before: c.before, change: Some(c.kind) },
+          None -> s,
+        });
+      let changed = d.changes.fold(marked, |acc: List<Suspect>, c: Change|
+        if acc.any(|s: Suspect| s.name == c.name) { acc } else {
+          match change(d, c.name) {
+            Some(shown) ->
+              acc.push({
+                ..suspect(shown.name, shown.after),
+                before: shown.before,
+                change: Some(shown.kind),
+              }),
+            None -> acc,
+          }
+        });
+      match d.own {
+        None -> changed,
+        Some(c) ->
+          changed.push({
+            ..suspect(c.name, c.after),
+            before: c.before,
+            change: Some(c.kind),
+            test: true,
+          }),
+      }
     },
   };
-  let annotated = match delta { Some(d) -> annotate(start, d), None -> start };
-  resolve(annotated, bisection)
-}
-
-/// What a search's verdict needs to say about the classification it could not finish.
-fn searched(b: Bisection, classified: Int, test_classified: Bool) -> Bisection = {
-  let one = if classified > 0 && b.verdict != NotAttempted(NoChanges) {
-    Some(
-      "; " ++ classified.to_string()
-        ++ " of the changed definitions could not be told apart from a hash that merely moved, so the search considered them all",
-    )
-  } else { None };
-  let two = if !test_classified && b.verdict == NotInTheGraph {
-    Some(
-      "; the test's own hash also moved and could not be classified, so an edit to the test has not been ruled out",
-    )
-  } else { None };
-  match one {
-    Some(text) -> match two {
-      Some(more) -> { ..b, reason: b.reason ++ text ++ more },
-      None -> { ..b, reason: b.reason ++ text },
-    },
-    None -> match two { Some(more) -> { ..b, reason: b.reason ++ more }, None -> b },
-  }
-}
-
-// --- Helpers ------------------------------------------------------------------
-
-/// Whether one string occurs in another, which is all a note's presence needs.
-fn string_contains(haystack: String, needle: String) -> Bool = {
-  let n = haystack.len();
-  let m = needle.len();
-  if m > n { false }
-  else { range(0, n - m + 1).filter(|i: Int| haystack.slice(i, i + m) == needle).len() > 0 }
+  all.sort_by(before)
 }
 
 // --- Tests ------------------------------------------------------------------
-//
-// The ranking is what a person reads top-down, so it is pinned whole — including the case a culprit
-// the closure never held, which must be added rather than dropped.
 
-/// The same scripted mixture `bisect`'s own tests use: it fails exactly when every culprit index is
-/// in the mixture, which is the rule ddmin is built for.
-fn scripted(culprit: List<Int>, unanswerable: List<Int>, flipped: List<Int>) -> Trial =
-  if unanswerable.any(|n: Int| flipped.contains(n)) { unresolved_trial(DoesNotCheck) }
-  else if culprit.all(|k: Int| flipped.contains(k)) { a_failure() }
-  else { a_pass() }
-
-fn a_suspect(name: String, kind: String) -> Suspect / {abort.raise} =
-  match kind {
-    "culprit" -> { ..suspect(name, Some("h1")), culprit: true },
-    "unknown" -> suspect(name, Some("h1")),
-    "derived" -> { ..suspect(name, Some("h1")), change: Some(Derived) },
-    "edited" -> { ..suspect(name, Some("h1")), change: Some(Edited) },
-    _ -> panic("no such kind"),
-  }
-
-fn describe(xs: List<Suspect>) -> List<String> =
-  xs.map(|s: Suspect|
-    s.name ++ ":" ++ (if s.culprit { "culprit" } else { "-" }) ++ ":" ++ change_word(s.change))
+fn described(xs: List<Suspect>) -> List<String> =
+  xs.map(|s: Suspect| s.name ++ ":" ++ change_word(s.change) ++ (if s.test { ":test" } else { "" }))
 
 fn change_word(c: Option<ChangeKind>) -> String = match c { Some(k) -> kind_word(k), None -> "-" }
 
-fn scripted_bisection(verdict: Verdict, names: List<List<String>>) -> Bisection =
-  { ..not_attempted(NotRequested), verdict: verdict, groups: names }
+fn found(names: List<String>) -> List<{ name: String, hash: Option<String> }> =
+  names.map(|n: String| { name: n, hash: Some("h1") })
 
-fn with_suspects(xs: List<Suspect>) -> Attribution =
-  { suspects: xs, bisection: not_attempted(NotRequested) }
+test "a failure that never passed is ranked by name alone" {
+  assert_eq(described(suspects_of(found(["zeta", "alpha"]), None)), ["alpha:-", "zeta:-"])
+}
 
-test "the order a person reads is culprits, then an edit before a moved hash, then the name" {
-  let mixed = [
-    a_suspect("z-derived", "derived"),
-    a_suspect("y-unknown", "unknown"),
-    a_suspect("x-edited", "edited"),
-    a_suspect("w-derived", "derived"),
-    a_suspect("v-culprit", "unknown"),
-  ];
-  // The culprit flag comes from the bisection, not from a hand-built field.
-  let a = resolve(with_suspects(mixed), scripted_bisection(Bisected, [["v-culprit"]]));
-  assert_eq(describe(a.suspects), [
-    "v-culprit:culprit:-",
-    "x-edited:-:edited",
-    "y-unknown:-:-",
-    "w-derived:-:derived",
-    "z-derived:-:derived",
+test "the test's own edit comes first, then an edit, then a hash that only moved" {
+  let d = {
+    own: Some(edited("m.t", "t1", "t2")),
+    changes: [edited("known", "h1", "h2"), added("new", "h3"), derived("moved", "h4", "h5")],
+  };
+  // A name the closure listed keeps its hash; a change the closure never listed is added.
+  assert_eq(described(suspects_of(found(["moved", "known", "unseen"]), Some(d))), [
+    "m.t:edited:test",
+    "known:edited",
+    "new:added",
+    "unseen:-",
+    "moved:derived",
   ])
 }
 
-test "a verdict that names nobody marks nobody, and a hand-set flag is the bisection's to overrule" {
-  let a = resolve(
-    with_suspects([a_suspect("zeta", "culprit"), a_suspect("alpha", "unknown")]),
-    scripted_bisection(Bisected, []),
-  );
-  assert_eq(describe(a.suspects), ["alpha:-:-", "zeta:-:-"])
-}
-
-test "a culprit the closure never held is added, not dropped" {
-  let a = resolve(
-    with_suspects([a_suspect("known", "unknown")]),
-    scripted_bisection(Sole, [["unlooked-for"]]),
-  );
-  assert_eq(describe(a.suspects), ["unlooked-for:culprit:-", "known:-:-"])
-}
-
-test "annotation fills in what changed and ranks candidates it did not know about" {
-  let delta = with_components(
-    None,
-    [edited("known", "h1", "h2", true), added("new", "h3"), derived("moved", "h4", "h5")],
-    no_edges(),
-    [],
-  );
-  let a = annotate(
-    with_suspects([a_suspect("known", "unknown"), a_suspect("moved", "unknown")]),
-    delta,
-  );
-  // The known name keeps its place; the two the closure never held are added, an edit before a
-  // hash that only moved.
-  assert_eq(describe(a.suspects), ["known:-:edited", "new:-:added", "moved:-:derived"]);
-  // A name that is both a `fn` and a `type` is one suspect, and it is the edit that shows.
-  let two = annotate(with_suspects([a_suspect("x", "unknown")]), delta);
-  assert_eq(two.suspects.len(), 4)
-}
-
-test "one cluster and an unedited test needs no hybrid at all" {
-  let none = with_components(Some(edited("m.t", "h1", "h2", true)), [], no_edges(), []);
-  let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let two = with_components(
-    None,
-    [edited("a", "h1", "h2", true), edited("b", "h1", "h2", true)],
-    no_edges(),
-    [],
-  );
-  assert_eq(needs_a_hybrid(none), false);
-  assert_eq(needs_a_hybrid(one), false);
-  assert_eq(needs_a_hybrid(two), true);
-  // With a test edit too, one cluster is not decided by counting: `H(∅)` has to be asked.
-  let edited_test = with_components(
-    Some(edited("m.t", "h1", "h2", true)),
-    [edited("a", "h1", "h2", true)],
-    no_edges(),
-    [],
-  );
-  assert_eq(needs_a_hybrid(edited_test), true)
-}
-
-fn evidence(
-  suspects: List<Suspect>,
-  defects: { nondet: Bool, defect: Bool, host: Bool, baseline: Bool },
-) -> Evidence =
-  {
-    nondet: defects.nondet,
-    defect: defects.defect,
-    host: defects.host,
-    suspects: suspects.map(|s: Suspect| { name: s.name, hash: s.hash }),
-    baseline: defects.baseline,
-  }
-
-/// `nondet` is a keyword, so the flag a `test/nondet` sets is named for what it means here.
-fn a_gate(nondet_test: Bool, defect: Bool, host: Bool, baseline: Bool) -> Evidence =
-  evidence([], { nondet: nondet_test, defect: defect, host: host, baseline: baseline })
-
-test "the gate decides before any hybrid is built" {
-  let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Never, budget: default_budget() };
-  // `--bisect=never` is not attempted, with the reason a caller can look up.
-  let a = diagnose(
-    a_gate(false, false, false, true),
-    options,
-    Some(one),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  assert_eq(a.bisection.verdict, NotAttempted(NotRequested));
-  assert_eq(a.bisection.reason, "bisection was not requested for this run");
-  // With no baseline there is no earlier definition set to compare against, whatever else is true.
-  let asking = { ..options, bisect: Auto };
-  let a = diagnose(
-    a_gate(false, false, false, false),
-    asking,
-    Some(one),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  assert_eq(a.bisection.verdict, NotAttempted(NeverPassed));
-  // A host was reached: re-running the test would repeat what it did outside the program.
-  let a = diagnose(
-    a_gate(false, false, true, true),
-    asking,
-    Some(one),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  assert_eq(a.bisection.verdict, NotAttempted(Host));
-  // The one gate, in its one order: a defect in Ply, then a host, then `nondet`.
-  let a = diagnose(a_gate(true, true, true, true), asking, Some(one), 0, true, no_hybrid, None);
-  assert_eq(a.bisection.verdict, NotAttempted(Panicked));
-  let a = diagnose(a_gate(true, false, true, true), asking, Some(one), 0, true, no_hybrid, None);
-  assert_eq(a.bisection.verdict, NotAttempted(Host));
-  let a = diagnose(a_gate(true, false, false, true), asking, Some(one), 0, true, no_hybrid, None);
-  assert_eq(a.bisection.verdict, NotAttempted(Nondet))
-}
-
-test "one cluster with no test edit is decided by counting, even with no hybrid to build" {
-  // Nothing can mix two eras, but nothing needs to: one cluster and an unedited test is the answer.
-  let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Auto, budget: default_budget() };
-  let a = diagnose(
-    a_gate(false, false, false, true),
-    options,
-    Some(one),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  assert_eq(a.bisection.verdict, Sole);
-  assert_eq(a.bisection.confidence, Minimal);
-  assert_eq(a.bisection.search.evaluated, 0);
-  assert_eq(culprits(a.bisection), ["a"]);
-  // Two clusters do need one, and the absence is reported as the absence it is.
-  let two = with_components(
-    None,
-    [edited("a", "h1", "h2", true), edited("b", "h1", "h2", true)],
-    no_edges(),
-    [],
-  );
-  let a = diagnose(
-    a_gate(false, false, false, true),
-    options,
-    Some(two),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  assert_eq(a.bisection.verdict, NotAttempted(NoHybrids))
-}
-
-test "the reason says what could not be classified, and when a test edit was not ruled out" {
-  // The classifier's count and the delta's own field come from the same comparison, so a fixture
-  // that says two definitions could not be told apart has to say it in both.
-  let two = {
-    ..with_components(None, [edited("a", "h1", "h2", true), edited("b", "h1", "h2", true)], no_edges(), []),
-    unclassified: 2,
+test "an edit and a derived change of one name are one suspect, and the edit shows" {
+  let d = {
+    own: None,
+    changes: [derived("x", "h1", "h2"), { ..edited("x", "h3", "h4"), ns: Decl }],
   };
-  let options = { bisect: Auto, budget: default_budget() };
-  let culprit = [1];
-  let mix = |_d: Delta, flipped: List<Int>| scripted(culprit, [], flipped);
-  let a = diagnose(a_gate(false, false, false, true), options, Some(two), 2, true, mix, None);
-  assert_eq(
-    a.bisection.reason,
-    "narrowed 2 changed definitions to b in 4 runs (0 answered from the cache); 2 of the changed definitions could not be told apart from a hash that merely moved, so the search considered them all",
-  );
-  assert_eq(a.bisection.confidence, Partial);
-  // Every mixture failing is `not_in_the_graph`, and an unclassified test hash means an edit to the
-  // test has not been ruled out.
-  let all = |_d: Delta, flipped: List<Int>| scripted([], [], flipped);
-  let a = diagnose(a_gate(false, false, false, true), options, Some(two), 0, false, all, None);
-  assert_eq(a.bisection.verdict, NotInTheGraph);
-  assert(
-    string_contains(
-      a.bisection.reason,
-      "; the test's own hash also moved and could not be classified, so an edit to the test has not been ruled out",
-    ),
-  )
-}
-
-test "a diagnosis ranks the suspects it was handed, the culprit first" {
-  let one = with_components(None, [edited("a", "h1", "h2", true)], no_edges(), []);
-  let options = { bisect: Auto, budget: default_budget() };
-  let a = diagnose(
-    evidence([a_suspect("b", "unknown"), a_suspect("a", "unknown")], {
-      nondet: false,
-      defect: false,
-      host: false,
-      baseline: true,
-    }),
-    options,
-    Some(one),
-    0,
-    true,
-    no_hybrid,
-    Some(NoHybrids),
-  );
-  // `a` is the sole culprit, so it is first; `b` is an unknown, ranked behind it.
-  assert_eq(describe(a.suspects), ["a:culprit:edited", "b:-:-"])
-}
-
-test "an options value starts from the mode that asks for nothing" {
-  assert_eq(never().bisect, Never);
-  assert_eq(never().budget, default_budget())
+  assert_eq(described(suspects_of([], Some(d))), ["x:edited"]);
+  assert_eq(suspects_of([], Some(d)).map(|s: Suspect| s.before), [Some("h3")])
 }
