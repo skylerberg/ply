@@ -22,10 +22,12 @@ pub struct Ctx {
     pub site_root: i64,
     pub site_start: i64,
     pub site_end: i64,
-    /// A counter the released compiler's code adds each call to, and the count past which it calls
-    /// [`rt_tick`]: `i64::MAX`, so it never does.
-    pub ticks: i64,
-    pub next_tick: i64,
+    // The runtime's own two, in the words between the fields emitted code reads.
+    /// The fuel this entry began with: how deeply its calls may nest.
+    pub(super) depth_bound: i64,
+    /// Chunks of stack this entry's calls made writable past what their stacks started with, so
+    /// growing is observable.
+    pub grown: u64,
     /// The innermost frame record on the running stack's chain: [`crate::frames::base`] at the
     /// bottom of a detached body's own stack, the one kind that records, and null on any other. A
     /// switch saves it with the stack it leaves and puts back the other's.
@@ -61,11 +63,6 @@ pub struct Ctx {
     /// The task running, as `abi.ply`'s `ctx_struct` says: what an instance records as it opens,
     /// which only that task may leave.
     pub task: i64,
-    /// The fuel this entry began with: how deeply its calls may nest.
-    pub(super) depth_bound: i64,
-    /// Chunks of stack this entry's calls made writable past what their stacks started with, so
-    /// growing is observable.
-    pub grown: u64,
     /// When the running entry's time budget is spent, if it has one.
     pub(super) deadline: Option<std::time::Instant>,
     pub(super) time_budget_ms: u64,
@@ -205,8 +202,6 @@ impl Ctx {
             site_root: -1,
             site_start: 0,
             site_end: 0,
-            ticks: 0,
-            next_tick: i64::MAX,
             frames: std::ptr::null_mut(),
             release_depth: 0,
             release_waiting: 0,

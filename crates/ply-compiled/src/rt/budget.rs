@@ -126,10 +126,6 @@ pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
     c.fail_with(FAILED_OUT_OF_STACK, d)
 }
 
-/// Nothing. The released compiler's code calls it once its counter reaches [`Ctx::next_tick`],
-/// which this runtime never lets it do.
-pub unsafe extern "C" fn rt_tick(_ctx: *mut Ctx) {}
-
 /// How soon the watchdog raises an expired entry's floor again, since a stack switch lowers it.
 const REWATCH: Duration = Duration::from_millis(10);
 

@@ -105,7 +105,7 @@ fn the_runtime_describes_its_functions_and_layouts_as_its_types_say() {
     for line in [
         "helper rt_release_later 0 - Handed DropRoot",
         "helper rt_alloc_bytes 0 Block Word",
-        "helper rt_tick 0 -",
+        "helper rt_no_fuel 0 -",
         "native ?out_str 0 - Addr I64",
         "native ?refused 1 - I64 I64 I64 I64",
     ] {
