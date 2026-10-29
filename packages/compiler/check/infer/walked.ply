@@ -25,8 +25,10 @@ pub type WalkedNode =
   | WalkedRead(WalkedReading)
   | WalkedUnary({ op: Bytes, operand: Walked })
   | WalkedBinary({ op: Bytes, lhs: Walked, rhs: Walked })
-  /// `args` are in the callee's parameters' order, a default the call leaves out among them.
-  | WalkedCall({ callee: Walked, args: List<Walked> })
+  /// `args` are in the callee's parameters' order, a default the call leaves out among them. `row`
+  /// is what a call of a function value performs, as the type it calls through says; empty for a
+  /// call of a definition, a constructor or a builtin, whose read says it.
+  | WalkedCall({ callee: Walked, args: List<Walked>, row: Row })
   | WalkedIf({ cond: Walked, then_branch: Walked, else_branch: Walked })
   | WalkedMatch({ scrutinee: Walked, arms: List<WalkedArm> })
   | WalkedBlock({ stmts: List<WalkedStmt>, tail: Option<Walked> })
@@ -68,7 +70,7 @@ pub type WalkedField = { name: Bytes, value: Walked }
 pub type WalkedArm = { pat: TypedPattern<Type>, guard: Option<Walked>, body: Walked }
 
 pub type WalkedStmt =
-  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span })
+  | WalkedLet({ pat: TypedPattern<Type>, value: Walked, span: Span, pat_span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | WalkedLetElse({ pat: TypedPattern<Type>, value: Walked, fallback: Walked, span: Span })
   | WalkedDo(Walked)
@@ -121,9 +123,9 @@ pub fn binary_of(op: Bytes, lhs: Option<Walked>, rhs: Option<Walked>) -> Option<
     _ -> None,
   }
 
-pub fn call_of(callee: Option<Walked>, args: List<Option<Walked>>) -> Option<WalkedNode> =
+pub fn call_of(callee: Option<Walked>, args: List<Option<Walked>>, row: Row) -> Option<WalkedNode> =
   match ((callee, Option::all(args))) {
-    (Some(f), Some(xs)) -> Some(WalkedCall({ callee: f, args: xs })),
+    (Some(f), Some(xs)) -> Some(WalkedCall({ callee: f, args: xs, row: row })),
     _ -> None,
   }
 
@@ -180,9 +182,10 @@ pub fn let_of(
   pat: Option<TypedPattern<Type>>,
   value: Option<Walked>,
   span: Span,
+  pat_span: Span,
 ) -> Option<WalkedStmt> =
   match ((pat, value)) {
-    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span })),
+    (Some(p), Some(v)) -> Some(WalkedLet({ pat: p, value: v, span: span, pat_span: pat_span })),
     _ -> None,
   }
 
@@ -317,10 +320,7 @@ pub fn return_of(
   row: Row,
   span: Span,
 ) -> Option<WalkedReturn> =
-  match body {
-    Some(b) -> Some({ binder: binder, body: b, row: row, span: span }),
-    None -> None,
-  }
+  match body { Some(b) -> Some({ binder: binder, body: b, row: row, span: span }), None -> None }
 
 pub fn handler_var_of(
   name: Bytes,
@@ -385,7 +385,7 @@ pub fn rewritten(e: Walked, f: (Walked) -> Walked) -> Walked = {
     node: match e.node {
       WalkedUnary(u) -> WalkedUnary({ ..u, operand: go(u.operand) }),
       WalkedBinary(b) -> WalkedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
-      WalkedCall(c) -> WalkedCall({ callee: go(c.callee), args: c.args.map(go) }),
+      WalkedCall(c) -> WalkedCall({ ..c, callee: go(c.callee), args: c.args.map(go) }),
       WalkedIf(i) ->
         WalkedIf({
           cond: go(i.cond),
@@ -534,7 +534,14 @@ fn settled_stmt(stmt: WalkedStmt, s: Settling) -> Option<TypedStmt<Type>> / {abo
   match stmt {
     WalkedLet(l) -> match settled(l.value, s) {
       Some(v) ->
-        Some(TypedLet({ pat: settled_pattern(l.pat, s), value: v, span: (s.span)(l.span) })),
+        Some(
+          TypedLet({
+            pat: settled_pattern(l.pat, s),
+            value: v,
+            span: (s.span)(l.span),
+            pat_span: (s.span)(l.pat_span),
+          }),
+        ),
       None -> None,
     },
     WalkedLetElse(l) -> match ((settled(l.value, s), settled(l.fallback, s))) {
@@ -607,7 +614,7 @@ fn settled_node(node: WalkedNode, s: Settling) -> Option<TypedNode<Type>> / {abo
       _ -> None,
     },
     WalkedCall(c) -> match ((settled(c.callee, s), settled_all(c.args, s))) {
-      (Some(f), Some(xs)) -> Some(TypedCall({ callee: f, args: xs })),
+      (Some(f), Some(xs)) -> Some(TypedCall({ callee: f, args: xs, row: (s.row)(c.row) })),
       _ -> None,
     },
     WalkedIf(i) -> match ((

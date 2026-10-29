@@ -9,14 +9,14 @@ import compiler.check.types (Type, TyVar, TyFn, FunctionType, Row, Atom, row_emp
 import compiler.check.typed (TypedExpr, TypedLit, TypedRead, TypedUnary, TypedBinary, TypedCall,
                              TypedIf, TypedMatch, TypedBlock, TypedList, TypedRecord, TypedUpdate,
                              TypedFieldRead, TypedPerform, TypedLambda, TypedSimulate,
-                             TypedParallel, TypedHandle, ReadLocal, ReadDefinition,
-                             ReadConstructor, ReadBuiltin, FilledLabel, LabelNamed, LabelParam,
-                             TypedParam, TypedThunk, TypedField, TypedArm, TypedPattern, TypedWild,
-                             TypedBinder, TypedLitPattern, TypedRange, TypedCase,
-                             TypedRecordPattern, TypedListPattern, TypedOr, TypedFieldPattern,
-                             TypedStmt, TypedLet, TypedLetElse, TypedDo, TypedAssign, TypedClause,
-                             TypedReturn, TypedHandlerVar, typed_nodes, NumericWitness,
-                             ConcreteWitness, ParamWitness, StatedWitness, witness_param)
+                             TypedParallel, TypedHandle, ReadLocal, ReadDefinition, ReadConstructor,
+                             ReadBuiltin, FilledLabel, LabelNamed, LabelParam, TypedParam,
+                             TypedThunk, TypedField, TypedArm, TypedPattern, TypedWild, TypedBinder,
+                             TypedLitPattern, TypedRange, TypedCase, TypedRecordPattern,
+                             TypedListPattern, TypedOr, TypedFieldPattern, TypedStmt, TypedLet,
+                             TypedLetElse, TypedDo, TypedAssign, TypedClause, TypedReturn,
+                             TypedHandlerVar, typed_nodes, NumericWitness, ConcreteWitness,
+                             ParamWitness, StatedWitness, witness_param)
 import compiler.expand.rewrite (witness_code, stated_witness_name, numeric_op_code)
 import compiler.check.infer.checker (ReleaseSite, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
                                      ReleaseFailing, binder_key)
@@ -41,7 +41,8 @@ pub type Node =
   | NBuiltin({ name: Bytes, args: List<Type>, rows: List<Row> })
   | NUnary({ op: Bytes, operand: Code })
   | NBinary({ op: Bytes, lhs: Code, rhs: Code })
-  | NApp({ func: Code, args: List<Code> })
+  /// `row` is what a call of a function value performs, as the type it calls through says.
+  | NApp({ func: Code, args: List<Code>, row: Row })
   | NIf({ cond: Code, then_branch: Code, else_branch: Code })
   | NBlock({ stmts: List<CodeStmt>, tail: Option<Code> })
   | NList({ items: List<Code> })
@@ -99,12 +100,12 @@ pub type CodeArm = { pat: CodePattern, guard: Option<Code>, body: Code }
 /// A free name a barrier copies in on entry: its slot outside and its slot here.
 pub type Capture = { src: Int, dst: Int }
 
-/// A handler clause opens its own barrier: its parameters and `resume` binder take the leading
-/// slots. It runs as a closure of type `ty`; `row` is what its body performs and `resumed` what
-/// resuming its continuation does.
 /// A `handle`: its body, its clauses and `return` clause, and what the body performs.
 pub type CodeHandle = { body: Code, clauses: List<CodeClause>, ret: Option<CodeReturn>, row: Row }
 
+/// A handler clause opens its own barrier: its parameters and `resume` binder take the leading
+/// slots. It runs as a closure of type `ty`; `row` is what its body performs and `resumed` what
+/// resuming its continuation does.
 pub type CodeClause = {
   effect: Bytes,
   op: Bytes,
@@ -150,6 +151,54 @@ pub fn read_name(c: Code) -> Option<Bytes> =
     NBuiltin(b) -> Some(b.name),
     _ -> None,
   }
+
+/// `c` with `f` applied to each node after its parts.
+pub fn nodes_mapped(c: Code, f: (Node) -> Node) -> Code = {
+  let go = |x: Code| nodes_mapped(x, f);
+  let opt = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
+  let fields = |fs: List<CodeField>| fs.map(|x: CodeField| { name: x.name, value: go(x.value) });
+  let lambda = |l: Lambda| { ..l, body: go(l.body) };
+  let node = match c.node {
+    NUnary(u) -> NUnary({ ..u, operand: go(u.operand) }),
+    NBinary(b) -> NBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    NApp(a) -> NApp({ ..a, func: go(a.func), args: a.args.map(go) }),
+    NIf(i) ->
+      NIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
+    NBlock(b) ->
+      NBlock({
+        stmts: b.stmts.map(|s: CodeStmt|
+          match s {
+            CLet(l) -> CLet({ ..l, value: go(l.value) }),
+            CLetPat(l) -> CLetPat({ ..l, value: go(l.value) }),
+            CDo(d) -> CDo({ code: go(d.code) }),
+          }),
+        tail: opt(b.tail),
+      }),
+    NList(l) -> NList({ items: l.items.map(go) }),
+    NRecord(r) -> NRecord({ fields: fields(r.fields) }),
+    NMatch(m) ->
+      NMatch({
+        scrutinee: go(m.scrutinee),
+        arms: m.arms.map(|a: CodeArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+      }),
+    NPerform(p) -> NPerform({ ..p, label: opt(p.label), args: p.args.map(go) }),
+    NLambda(l) -> NLambda(lambda(l)),
+    NSimulate(s) -> NSimulate({ ..s, body: go(s.body) }),
+    NParallel(p) -> NParallel({ branches: p.branches.map(go) }),
+    NHandle(h) ->
+      NHandle({
+        ..h,
+        body: go(h.body),
+        clauses: h.clauses.map(|cl: CodeClause| { ..cl, label: opt(cl.label), body: go(cl.body) }),
+        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+      }),
+    NField(x) -> NField({ ..x, base: go(x.base) }),
+    NUpdate(u) -> NUpdate({ ..u, base: go(u.base), sets: fields(u.sets) }),
+    NKnown(k) -> NKnown({ ..k, lambda: lambda(k.lambda) }),
+    _ -> c.node,
+  };
+  { ..c, node: f(node) }
+}
 
 /// The code `c` holds, each part once.
 pub fn code_parts(c: Code) -> List<Code> =
@@ -602,10 +651,7 @@ fn label_ty() -> Type = int_type()
 /// field-table entry of the name.
 fn label_args(stack: Stack, labels: List<FilledLabel>) -> Seq =
   labels.fold({ codes: [], stack: stack }, |acc: Seq, l: FilledLabel| {
-    let named = match l {
-      LabelNamed(n) -> Some(n),
-      LabelParam(i) -> acc.stack.labels.at(i),
-    };
+    let named = match l { LabelNamed(n) -> Some(n), LabelParam(i) -> acc.stack.labels.at(i) };
     match named {
       None ->
         {
@@ -729,11 +775,7 @@ fn lower_node(e: TypedExpr<Type>, stack: Stack) -> Lowered / {abort.raise} =
           let w = read_local(o.stack, witness_param(p), int_type(), e.span);
           {
             code: {
-              ..hidden_call(
-                b"?numeric_unary",
-                [int_code(if u.op == b"bitnot" { 1 } else { 0 }), w.code, o.code],
-                e.ty,
-              ),
+              ..hidden_call(b"?numeric_unary", [int_code(if u.op == b"bitnot" { 1 } else { 0 }), w.code, o.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
@@ -750,11 +792,7 @@ fn lower_node(e: TypedExpr<Type>, stack: Stack) -> Lowered / {abort.raise} =
           let w = read_local(r.stack, witness_param(p), int_type(), e.span);
           {
             code: {
-              ..hidden_call(
-                b"?numeric_binary",
-                [int_code(numeric_op_code(b.op)), w.code, l.code, r.code],
-                e.ty,
-              ),
+              ..hidden_call(b"?numeric_binary", [int_code(numeric_op_code(b.op)), w.code, l.code, r.code], e.ty),
               span: e.span,
             },
             stack: w.stack,
@@ -792,11 +830,12 @@ fn lower_node(e: TypedExpr<Type>, stack: Stack) -> Lowered / {abort.raise} =
       },
     },
     TypedUpdate(u) -> updated(e, u.base, u.sets, u.copies, stack),
-    // A definition's witnesses lead its arguments and its labels follow them.
+    // A definition's or a native's witnesses lead its arguments, and a definition's labels follow them.
     TypedCall(c) -> {
       let fu = lower_in(c.callee, stack);
       let ws = match c.callee.node {
         TypedRead(ReadDefinition(d)) -> witness_args(fu.stack, d.witnesses, c.callee.span),
+        TypedRead(ReadBuiltin(b)) -> witness_args(fu.stack, b.witnesses, c.callee.span),
         _ -> { codes: [], stack: fu.stack },
       };
       let r = lower_seq(c.args, ws.stack);
@@ -805,7 +844,10 @@ fn lower_node(e: TypedExpr<Type>, stack: Stack) -> Lowered / {abort.raise} =
         _ -> { codes: [], stack: r.stack },
       };
       {
-        code: at(e, NApp({ func: fu.code, args: ws.codes.concat(r.codes).concat(ls.codes) })),
+        code: at(
+          e,
+          NApp({ func: fu.code, args: ws.codes.concat(r.codes).concat(ls.codes), row: c.row }),
+        ),
         stack: ls.stack,
       }
     },
@@ -884,10 +926,7 @@ fn updated(
     let b = read(r.stack);
     { code: at(e, NUpdate({ base: b.code, copies: copies, sets: r.fields })), stack: b.stack }
   };
-  let local = match base.node {
-    TypedRead(ReadLocal(n)) -> st_depth(stack, n) != None,
-    _ -> false,
-  };
+  let local = match base.node { TypedRead(ReadLocal(n)) -> st_depth(stack, n) != None, _ -> false };
   if local { made(|st: Stack| lower_in(base, st), stack) } else {
     let o = lower_in(base, stack);
     let name = b"?u".concat(ascii_of_int(e.span.site));
@@ -897,7 +936,10 @@ fn updated(
     {
       code: at(
         e,
-        NBlock({ stmts: [CLet({ name: name, slot: slot, value: o.code })], tail: Some(inner.code) }),
+        NBlock({
+          stmts: [CLet({ name: name, slot: slot, value: o.code })],
+          tail: Some(inner.code),
+        }),
       ),
       stack: unscope_st(inner.stack, depth),
     }
@@ -1003,9 +1045,8 @@ fn as_path_update(
     match fields.fold(None, |acc: Option<TypedExpr<Type>>, f: TypedField<Type>|
         match acc {
           Some(_) -> acc,
-          None -> if copy_path(f, stack) == None { None } else {
-            match f.value.node { TypedFieldRead(x) -> Some(x.base), _ -> None }
-          },
+          None -> if copy_path(f, stack) == None { None }
+          else { match f.value.node { TypedFieldRead(x) -> Some(x.base), _ -> None } },
         }) {
       None -> None,
       Some(base) -> {
@@ -1032,9 +1073,8 @@ fn as_path_update(
 /// from, when the field is `p.<its own name>` for such a path `p`, which tells two paths apart.
 fn copy_path(field: TypedField<Type>, stack: Stack) -> Option<Bytes> =
   match field.value.node {
-    TypedFieldRead(x) -> if x.field != field.name || in_flight(field.value, stack) { None } else {
-      match x.base.node { TypedFieldRead(_) -> path_spelled(x.base, stack), _ -> None }
-    },
+    TypedFieldRead(x) -> if x.field != field.name || in_flight(field.value, stack) { None }
+    else { match x.base.node { TypedFieldRead(_) -> path_spelled(x.base, stack), _ -> None } },
     _ -> None,
   }
 
@@ -1198,11 +1238,14 @@ fn closure_type(params: List<TypedParam<Type>>, ret: Type) -> FunctionType =
 
 /// `stack` noting where each of `params` put its name: slots from `from` on in barrier `depth`.
 fn params_noted(stack: Stack, params: List<TypedParam<Type>>, depth: Int, from: Int) -> Stack =
-  params.fold({ stack: stack, slot: from }, |acc: { stack: Stack, slot: Int }, p: TypedParam<Type>|
-    {
-      stack: binder_noted(acc.stack, p.name, binder_key(p.span), depth, acc.slot, p.ty),
-      slot: acc.slot + 1,
-    }).stack
+  params.fold(
+    { stack: stack, slot: from },
+    |acc: { stack: Stack, slot: Int }, p: TypedParam<Type>|
+      {
+        stack: binder_noted(acc.stack, p.name, binder_key(p.span), depth, acc.slot, p.ty),
+        slot: acc.slot + 1,
+      },
+  ).stack
 
 // --- handlers ---------------------------------------------------------------
 // A clause reads and assigns its handler's variables through the runtime, which holds the
@@ -1292,9 +1335,10 @@ fn handled(
           body: cb.code,
           at: c.span,
           ty: closure_type(
-            c.params.concat(match c.label { Some(t) -> [t], None -> [] }).concat(
-              match c.resume { Some(k) -> [k], None -> [] },
-            ),
+            c.params.concat(match c.label { Some(t) -> [t], None -> [] }).concat(match c.resume {
+              Some(k) -> [k],
+              None -> [],
+            }),
             c.body.ty,
           ),
           row: c.row,
@@ -1328,7 +1372,10 @@ fn handled(
       }
     },
   };
-  let installed_handle = at(e, NHandle({ body: started, clauses: cls.clauses, ret: answered.ret, row: row }));
+  let installed_handle = at(
+    e,
+    NHandle({ body: started, clauses: cls.clauses, ret: answered.ret, row: row }),
+  );
   {
     code: if made.stmts.len() == 0 { installed_handle }
     else { at(e, NBlock({ stmts: made.stmts, tail: Some(installed_handle) })) },
@@ -1342,10 +1389,9 @@ fn held_var(stack: Stack, name: Bytes) -> Option<HeldVar> =
   match stack.held.fold(None, |acc: Option<HeldVar>, h: HeldVar|
       if h.name == name { Some(h) } else { acc }) {
     None -> None,
-    Some(h) ->
-      if range(h.depth, stack.frames.len()).any(|i: Int| find(st_at(stack, i), name) != None) {
-        None
-      } else { Some(h) },
+    Some(h) -> if range(h.depth, stack.frames.len()).any(|i: Int|
+        find(st_at(stack, i), name) != None) { None }
+    else { Some(h) },
   }
 
 /// The runtime's read of the variable `h` of the clause running.
@@ -1425,6 +1471,7 @@ fn hidden_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
         ty: fn_type(args.map(|a: Code| a.ty), ty, row_empty()),
       },
       args: args,
+      row: row_empty(),
     }),
     span: dummy_span(),
     ty: ty,
@@ -1473,8 +1520,11 @@ fn arms_into(
 ) -> ArmAcc / {abort.raise} = {
   let keys = match alts.at(0) {
     Some(p) ->
-      code_binders(p).fold(Map::new(), |m: Map<Bytes, Int>, b: { name: Bytes, span: Span, slot: Int }|
-        m.insert(b.name, binder_key(b.span))),
+      code_binders(p).fold(
+        Map::new(),
+        |m: Map<Bytes, Int>, b: { name: Bytes, span: Span, slot: Int }|
+          m.insert(b.name, binder_key(b.span)),
+      ),
     None -> Map::new(),
   };
   alts.fold(acc, |a: ArmAcc, alt: CodePattern| {
@@ -1531,7 +1581,7 @@ fn lower_from(
       [p] -> {
         let o = lower_in(l.value, acc.stack);
         // What a miss lets go of is read where the value stands, before the pattern binds.
-        let missed = match o.stack.releases.at.get(l.span.site) {
+        let missed = match o.stack.releases.at.get(l.pat_span.site) {
           Some(xs) -> xs.filter(|x: ReleaseSite| x.place == ReleaseUnwinding),
           None -> [],
         };
@@ -1580,7 +1630,11 @@ fn lower_from(
             ..acc,
             stack: failing(
               o.stack,
-              Bytes::concat_all([b"an assignment to `", a.name, b"`, which no clause's handler holds"]),
+              Bytes::concat_all([
+                b"an assignment to `",
+                a.name,
+                b"`, which no clause's handler holds",
+              ]),
             ),
           }),
       }
@@ -1689,8 +1743,7 @@ fn code_binders(p: CodePattern) -> List<{ name: Bytes, span: Span, slot: Int }> 
     PxVar(v) -> [{ name: v.name, span: v.span, slot: v.slot }],
     PxCtor(c) -> code_binders_all(c.args),
     PxRecord(r) -> code_binders_all(r.fields.map(|f: CodePatternField| f.pat)),
-    PxList(l) ->
-      code_binders_all(match l.rest { Some(r) -> l.items.push(r), None -> l.items }),
+    PxList(l) -> code_binders_all(match l.rest { Some(r) -> l.items.push(r), None -> l.items }),
     PxWild -> [],
     PxLit(_) -> [],
     PxRange(_) -> [],

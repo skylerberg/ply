@@ -1,17 +1,20 @@
 //! The rows an analysis publishes for the driver.
 
-import compiler.syntax.parsing (Span, Ident, ParseDiag, dummy_span, parse_diag, parse_label, start)
-import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, TDSum, SpecKind, FnDef, LawDef, OfSchema)
-import compiler.syntax.exprs (expr_span, prelude_module)
+import compiler.syntax.parsing (Span, Ident, ParseDiag, dummy_span, moved_by, parse_diag,
+                                parse_label, start)
+import compiler.syntax.items (Module, Item, IFn, IType, ITest, ILaw, TDSum, SpecKind, FnDef, LawDef,
+                              OfSchema)
+import compiler.syntax.exprs (expr_span, prelude_module, prelude_own)
 import compiler.emit.code (Code, NLit, NVar, NDef, NCtor, NBuiltin, NUnary, NBinary, NApp, NIf,
                            NBlock, NList, NRecord, NMatch, NPerform, NLabel, NLambda, NSimulate,
                            NParallel, NHandle, NField, NUpdate, NKnown, CodeField, CodeArm,
                            CodeClause, CodeStmt, CLet, CLetPat, CDo, Capture, lower_fn)
 import compiler.check.types (Scheme, Type, Row, Field, Atom, Resource, TyFn, TyVar, TyCon, TyRecord,
-                             TyNominal, int_type, unit_type, HeldType, held_type_bin,
-                             types_held, types_of, canonical_beside, resource_bin)
+                             TyNominal, int_type, unit_type, HeldType, held_type_bin, types_held,
+                             types_of, canonical_beside, resource_bin)
 import compiler.syntax.type_syntax (Mode, mode_bin)
-import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify, module_of_name, default_binder)
+import compiler.check.resolve.tables (Source, ParsedModule, Diag, Resolved, qualify, module_of_name,
+                                      default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
 import compiler.check.resolve.scopes (find)
 import compiler.check.resolve.defaults (seeing_all)
@@ -23,7 +26,7 @@ import compiler.store.hash.printed (print_bodies, Printed, Unprintable)
 import compiler.check.typed
 import compiler.check.typed (TypedBody, TypedExpr, TypedCall, TypedRead, ReadDefinition, BodyPart,
                              WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
-                             unwitnessed, typed_nodes)
+                             unwitnessed, typed_nodes, nodes_mapped, TypedNode, ReadBuiltin)
 import compiler.check.infer (CheckOutput, RootFacts, types_joined, facts_at, no_root_facts,
                              elaborated, ended, stated, bodies_with, bodies_read, check_front_with,
                              EmitFacts)
@@ -33,6 +36,7 @@ import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key, law_owner)
 import compiler.check.termination (Ends, Stated)
 import compiler.check.lent (Passed)
+import compiler.check.semantics (prelude_iterates)
 import compiler.front.diagnostics (ParsedSource, parse_all, parse_at, outside_every_module, placed,
                                    with_prelude_source)
 import compiler.front.pkg (PackageSources, Closure, closure, closed, pins_of, first_segment)
@@ -44,7 +48,9 @@ import std.hash (blake3)
 import std.list
 import compiler.expand.embed (EmbedAt, ItemWants, embed_tables, rewritten)
 import compiler.syntax.items (parse)
-import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows, known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow, HDef, HashFrame, Dump, answered_diag)
+import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefRow, KnownTestRow, Rows,
+                            known_def_row_bin, rows_bin, ModuleSpan, DefRow, TestRow, HDef,
+                            HashFrame, Dump, answered_diag)
 import compiler.front.facts (Analysis, pkg_tables, toolchain_tree, tree_named, home_of, Tree,
                              NoTree)
 import compiler.front.seam (test_root_at, view_of, view_dump, Analysed, AnalysisOutcome, Refused,
@@ -894,8 +900,16 @@ fn claimed(
 /// Body `part` of `owner` as the prover reads it, drawing every type parameter as `Int`
 /// (`unwitnessed`), its places counted from the start of the program's text, the item's being at
 /// `base`.
-fn settled_at(settled: Settled, owner: Bytes, part: BodyPart, base: Int) -> Option<TypedBody<Type>> / {abort.raise} =
-  match match settled.get(owner) { Some(bs) -> bs.find(|b: TypedBody<Type>| b.part == part), None -> None } {
+fn settled_at(
+  settled: Settled,
+  owner: Bytes,
+  part: BodyPart,
+  base: Int,
+) -> Option<TypedBody<Type>> / {abort.raise} =
+  match match settled.get(owner) {
+      Some(bs) -> bs.find(|b: TypedBody<Type>| b.part == part),
+      None -> None,
+    } {
     None -> None,
     Some(b) ->
       Some(
@@ -903,9 +917,42 @@ fn settled_at(settled: Settled, owner: Bytes, part: BodyPart, base: Int) -> Opti
           ty: |t: Type, u: Unit| { ty: t, state: u },
           row: |r: Row| r,
           atom: |a: Atom| a,
-          span: |sp: Span| { ..sp, start: sp.start + base, end: sp.end + base },
+          span: |sp: Span| moved_by(sp, base),
         }).out,
       ),
+  }
+
+/// The prelude's functions the prover models as builtins, by their names in the prelude: each
+/// builtin the prelude declares, written in Ply or not, but those that iterate, whose `cost` bounds
+/// it reads.
+pub fn prover_modelled() -> Map<Bytes, Bool> / {abort.raise} =
+  builtins().fold(Map::new(), |m: Map<Bytes, Bool>, b: Builtin|
+    match prelude_iterates(b.name) { Some(_) -> m, None -> m.insert(b.name, true) })
+
+/// The builtin the prover reads a read of definition `full` as: one of `modelled`, by its name in
+/// the prelude; none for any other read, a definition to it.
+pub fn prover_builtin(modelled: Map<Bytes, Bool>, full: Bytes) -> Option<Bytes> =
+  match prelude_own(full) {
+    Some(name) -> if modelled.contains(name) { Some(name) } else { None },
+    None -> None,
+  }
+
+/// `b` with each read of a definition `modelled` holds a read of the builtin it models.
+fn prelude_builtins(
+  modelled: Map<Bytes, Bool>,
+  b: TypedBody<Type>,
+) -> TypedBody<Type> / {abort.raise} =
+  {
+    ..b,
+    body: nodes_mapped(b.body, |n: TypedNode<Type>|
+      match n {
+        TypedRead(ReadDefinition(d)) -> match prover_builtin(modelled, d.full) {
+          Some(name) ->
+            TypedRead(ReadBuiltin({ name: name, args: d.args, rows: d.rows, witnesses: [] })),
+          None -> n,
+        },
+        _ -> n,
+      }),
   }
 
 /// A clause the check settled, which it settles of every checked definition.
@@ -946,7 +993,10 @@ fn def_claim(
       let clause = def.spec.get(i);
       {
         kind: clause.kind,
-        clause: { at: span_at(m, expr_span(clause.expr)), code: clause_claimed(code(ClauseBody(i))) },
+        clause: {
+          at: span_at(m, expr_span(clause.expr)),
+          code: clause_claimed(code(ClauseBody(i))),
+        },
       }
     }),
   })
@@ -986,7 +1036,7 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
     NBuiltin(_) -> c,
     NUnary(u) -> { ..c, node: NUnary({ op: u.op, operand: g(u.operand) }) },
     NBinary(b) -> { ..c, node: NBinary({ op: b.op, lhs: g(b.lhs), rhs: g(b.rhs) }) },
-    NApp(a) -> { ..c, node: NApp({ func: g(a.func), args: gs(a.args) }) },
+    NApp(a) -> { ..c, node: NApp({ ..a, func: g(a.func), args: gs(a.args) }) },
     NKnown(_) -> c,
     NIf(i) ->
       {
@@ -1022,10 +1072,7 @@ fn given_in(c: Code, given: Map<Int, Code>) -> Code = {
         }),
       },
     NPerform(p) ->
-      {
-        ..c,
-        node: NPerform({ ..p, label: given_opt(p.label, given), args: gs(p.args) }),
-      },
+      { ..c, node: NPerform({ ..p, label: given_opt(p.label, given), args: gs(p.args) }) },
     NLambda(l) -> {
       let past = given_past(l.captures, given);
       { ..c, node: NLambda({ ..l, captures: past.captures, body: given_in(l.body, past.given) }) }
@@ -1083,32 +1130,34 @@ fn instantiated(
 ) -> Option<Code> / {abort.raise} =
   match ((call.node, home_of(mods, of))) {
     (TypedCall(a), Some(home)) -> match a.callee.node {
-      TypedRead(ReadDefinition(callee)) ->
-        match fn_named(mods.get(home).module, default_binder(callee.full)) {
+      TypedRead(ReadDefinition(callee)) -> match fn_named(
+          mods.get(home).module,
+          default_binder(callee.full),
+        ) {
+        None -> None,
+        Some(def) -> match settled_at(settled, callee.full, WholeBody, def.span.start) {
           None -> None,
-          Some(def) -> match settled_at(settled, callee.full, WholeBody, def.span.start) {
-            None -> None,
-            Some(b) -> {
-              let params = def.params.len() - binders;
-              let l = lower_fn(b.params.drop(params).concat(b.params.take(params)), [], b.body);
-              let given = range(0, params).fold(
-                Some(Map::new()),
-                |acc: Option<Map<Int, Code>>, k: Int|
-                  match ((acc, a.args.at(k))) {
-                    (Some(held), Some(arg)) -> {
-                      let x = lower_fn([], [], arg);
-                      if x.failed.len() > 0 { None } else { Some(held.insert(binders + k, x.code)) }
-                    },
-                    _ -> None,
+          Some(b) -> {
+            let params = def.params.len() - binders;
+            let l = lower_fn(b.params.drop(params).concat(b.params.take(params)), [], b.body);
+            let given = range(0, params).fold(
+              Some(Map::new()),
+              |acc: Option<Map<Int, Code>>, k: Int|
+                match ((acc, a.args.at(k))) {
+                  (Some(held), Some(arg)) -> {
+                    let x = lower_fn([], [], arg);
+                    if x.failed.len() > 0 { None } else { Some(held.insert(binders + k, x.code)) }
                   },
-              );
-              match given {
-                Some(held) -> if l.failed.len() > 0 { None } else { Some(given_in(l.code, held)) },
-                None -> None,
-              }
-            },
+                  _ -> None,
+                },
+            );
+            match given {
+              Some(held) -> if l.failed.len() > 0 { None } else { Some(given_in(l.code, held)) },
+              None -> None,
+            }
           },
         },
+      },
       _ -> None,
     },
     _ -> None,
@@ -1163,7 +1212,9 @@ fn claims_of_modules(
   ends: Map<Bytes, Bool>,
   stated: Map<Bytes, Bool>,
 ) -> List<Claim> / {abort.raise} = {
-  let settled = settled_by_owner(bodies);
+  // Each body as the prover reads it, the prelude's builtins it models among what it reads.
+  let modelled = prover_modelled();
+  let settled = settled_by_owner(bodies.map(|b: TypedBody<Type>| prelude_builtins(modelled, b)));
   wanted.fold([], |acc: List<Claim>, i: Int| {
     let m = mods.get(i);
     m.module.items.fold(acc, |a: List<Claim>, item: Item|
@@ -1458,8 +1509,9 @@ test "the types a body binds and uses are filed by key, read from one table the 
       );
       // `first` takes `d` at its own type parameter, the scheme's first variable.
       assert_eq(
-        bodies(b"m.first").flat_map(|b: TypedBody<Type>| b.params).filter(|p: TypedParam<Type>|
-          p.name == b"d").map(|p: TypedParam<Type>| p.ty),
+        bodies(b"m.first").flat_map(|b: TypedBody<Type>| b.params).filter(
+          |p: TypedParam<Type>| p.name == b"d",
+        ).map(|p: TypedParam<Type>| p.ty),
         [TyVar(0)],
       )
     },

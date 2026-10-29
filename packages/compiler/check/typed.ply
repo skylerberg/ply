@@ -19,8 +19,10 @@ pub type TypedNode<t> =
   /// of one a `numeric` or `integer` constraint makes a witness of.
   | TypedUnary({ op: Bytes, operand: TypedExpr<t>, witness: Option<Bytes> })
   | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t>, witness: Option<Bytes> })
-  /// `args` are in the callee's parameters' order, a default the call leaves out among them.
-  | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>> })
+  /// `args` are in the callee's parameters' order, a default the call leaves out among them. `row`
+  /// is what a call of a function value performs, as the type it calls through says; empty for a
+  /// call of a definition, a constructor or a builtin, whose read says it.
+  | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>>, row: Row })
   | TypedIf({ cond: TypedExpr<t>, then_branch: TypedExpr<t>, else_branch: TypedExpr<t> })
   | TypedMatch({ scrutinee: TypedExpr<t>, arms: List<TypedArm<t>> })
   | TypedBlock({ stmts: List<TypedStmt<t>>, tail: Option<TypedExpr<t>> })
@@ -43,18 +45,13 @@ pub type TypedNode<t> =
 /// What a name read as a value is: a binder in scope; a definition at the type arguments, rows and
 /// labels the read fills, each in its scheme's order, with the witnesses it passes in the order of
 /// the parameters they are for; a constructor of a declared sum at the type arguments it fills; or a
-/// builtin at the type arguments and rows it fills, in its own order.
+/// native, by its name across the program, at the type arguments and rows it fills, in its own
+/// order, with the witnesses it passes.
 pub type Reading<t> =
   | ReadLocal(Bytes)
-  | ReadDefinition({
-    full: Bytes,
-    args: List<t>,
-    rows: List<Row>,
-    labels: List<FilledLabel>,
-    witnesses: List<NumericWitness>,
-  })
+  | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, labels: List<FilledLabel>, witnesses: List<NumericWitness> })
   | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
-  | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row> })
+  | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row>, witnesses: List<NumericWitness> })
 
 /// A label a read fills: one named, or the owner's own label parameter at its place.
 pub type FilledLabel = | LabelNamed(Bytes) | LabelParam(Int)
@@ -90,7 +87,8 @@ pub type TypedPattern<t> =
 pub type TypedFieldPattern<t> = { name: Bytes, pat: TypedPattern<t> }
 
 pub type TypedStmt<t> =
-  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span })
+  /// `pat_span` is where the pattern is written, where what a miss lets go of is let go.
+  | TypedLet({ pat: TypedPattern<t>, value: TypedExpr<t>, span: Span, pat_span: Span })
   /// `let p = v else { .. };`: where `pat` does not match, `fallback` is the block's value.
   | TypedLetElse({ pat: TypedPattern<t>, value: TypedExpr<t>, fallback: TypedExpr<t>, span: Span })
   | TypedDo(TypedExpr<t>)
@@ -244,7 +242,7 @@ pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> Ty
     TypedRead(_) -> e.node,
     TypedUnary(u) -> TypedUnary({ ..u, operand: go(u.operand) }),
     TypedBinary(b) -> TypedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
-    TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go) }),
+    TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go), row: c.row }),
     TypedIf(i) ->
       TypedIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
     TypedMatch(m) ->
@@ -294,6 +292,7 @@ pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
         TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
         TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
         TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
+        TypedRead(ReadBuiltin(f)) -> TypedRead(ReadBuiltin({ ..f, witnesses: [] })),
         _ -> n,
       }),
   }
@@ -451,7 +450,12 @@ fn retyped_reading<a, b, s>(
     ReadBuiltin(f) -> {
       let args = retyped_types(f.args, state, r);
       {
-        out: ReadBuiltin({ name: f.name, args: args.out, rows: f.rows.map(r.row) }),
+        out: ReadBuiltin({
+          name: f.name,
+          args: args.out,
+          rows: f.rows.map(r.row),
+          witnesses: f.witnesses,
+        }),
         state: args.state,
       }
     },
@@ -518,7 +522,15 @@ fn retyped_stmt<a, b, s>(
     TypedLet(l) -> {
       let p = retyped_pattern(l.pat, state, r);
       let v = retyped(l.value, p.state, r);
-      { out: TypedLet({ pat: p.out, value: v.out, span: (r.span)(l.span) }), state: v.state }
+      {
+        out: TypedLet({
+          pat: p.out,
+          value: v.out,
+          span: (r.span)(l.span),
+          pat_span: (r.span)(l.pat_span),
+        }),
+        state: v.state,
+      }
     },
     TypedLetElse(l) -> {
       let p = retyped_pattern(l.pat, state, r);
@@ -595,7 +607,7 @@ fn retyped_node<a, b, s>(
     TypedCall(c) -> {
       let f = retyped(c.callee, state, r);
       let args = retyped_all(c.args, f.state, r);
-      { out: TypedCall({ callee: f.out, args: args.out }), state: args.state }
+      { out: TypedCall({ callee: f.out, args: args.out, row: (r.row)(c.row) }), state: args.state }
     },
     TypedIf(i) -> {
       let c = retyped(i.cond, state, r);
