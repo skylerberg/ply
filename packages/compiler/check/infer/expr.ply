@@ -13,7 +13,8 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_release_binder, role_hold_release_param,
                                 role_hold_release_held, role_hold_bracket, role_hold_new,
                                 role_hold_close_param, role_hold_take, role_hold_take_held,
-                                role_hold_body_param)
+                                role_hold_body_param, role_tag_read, role_tag_parse, role_tag_fill,
+                                role_tag_let, role_tag_binder)
 import std.list (prepend)
 import compiler.syntax.type_syntax (TypeExpr, Mode, MRaise, mode_text, is_raise)
 import compiler.syntax.items (DOrd, member_name, member_of, Opaque, is_shipped)
@@ -25,7 +26,8 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
                               tagged_filler, call_operator, written_operator, is_exit_effect,
                               exit_op, Slot, FromName, FromDefault, simulated_at, detached_at,
-                              resumed_at, branch_at, try_places, prelude_module)
+                              resumed_at, branch_at, try_places, prelude_module, tagged_parts,
+                              TaggedPart)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
                                  PBad, Lit, LInt, LFixed, LWide, LStr, LUnit, pat_span, has_or)
 import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
@@ -94,7 +96,7 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              perform_of, simulate_of, parallel_of, TypedClause, TypedHandlerVar,
                              params_typed, clause_of, return_of, handler_var_of, handle_of,
                              assign_of, TypedField, TypedHandle, TypedCall, TypedRecord,
-                             TypedLambda, TypedLet, TypedBlock)
+                             TypedLambda, TypedLet, TypedBlock, TypedList, TypedCase)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -1750,15 +1752,20 @@ fn tag_fn(
   callee: QName,
   takes: List<Type>,
   answers: Type,
-) -> { checker: Checker, row: Row, name: Bytes } / {abort.raise} = {
+) -> { checker: Checker, row: Row, name: Bytes, callee: Option<TypedExpr> } / {abort.raise} = {
   let f: Inferred = infer_var(checker, callee, callee.span);
   let named: Checker = called(f.checker, callee.span);
   match declared_value(named, callee) {
     // A name that names nothing is said by the lookup.
-    None -> { checker: named, row: row_empty(), name: b"" },
+    None -> { checker: named, row: row_empty(), name: b"", callee: None },
     Some(name) -> {
       let refused = |cc: Checker, message: Bytes, label: Bytes|
-        { checker: not_a_tag(cc, t, callee, message, label), row: row_empty(), name: name };
+        {
+          checker: not_a_tag(cc, t, callee, message, label),
+          row: row_empty(),
+          name: name,
+          callee: None,
+        };
       let generic = match env_lookup(named.env, name) {
         Some(sc) -> sc.ty_vars.len() + sc.row_vars.len() + sc.label_vars.len() > 0,
         None -> false,
@@ -1788,7 +1795,7 @@ fn tag_fn(
               Bytes::concat_all([b"performs `", row_text(row), b"`"]),
               b"a tag's function only raises",
             )
-          } else { { checker: u, row: row, name: name } }
+          } else { { checker: u, row: row, name: name, callee: typed_at(f, callee.span) } }
         },
         other ->
           refused(
@@ -1815,15 +1822,26 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
     [if holed { list_type(string_type()) } else { string_type() }],
     TyCon({ name: b"Result", args: [value.ty, refusal_type(holed)] }),
   );
-  if !holed { { checker: parsed.checker, ty: value.ty, row: row_empty(), node: None } } else {
+  let result = TyCon({ name: b"Result", args: [value.ty, refusal_type(holed)] });
+  if !holed {
+    {
+      checker: parsed.checker,
+      ty: value.ty,
+      row: row_empty(),
+      node: tagged_node(parsed.checker, t, parsed.callee, result, value.ty, None),
+    }
+  } else {
     let hole: WithTy = new_ty(parsed.checker);
     let answer: WithTy = new_ty(hole.checker);
     // A tag with no parser is said once, by the lookup of the parser.
-    let filled = if parsed.name == b"" { { checker: answer.checker, row: row_empty(), name: b"" } }
-    else { tag_fn(answer.checker, t, tagged_filler(t), [value.ty, list_type(hole.ty)], answer.ty) };
-    let held: WithRow = t.holes.fold(
-      { checker: filled.checker, row: row_empty() },
-      |acc: WithRow, h: Hole| {
+    let filled = if parsed.name == b"" {
+      { checker: answer.checker, row: row_empty(), name: b"", callee: None }
+    } else {
+      tag_fn(answer.checker, t, tagged_filler(t), [value.ty, list_type(hole.ty)], answer.ty)
+    };
+    let held = t.holes.fold(
+      { checker: filled.checker, row: row_empty(), nodes: [] },
+      |acc: { checker: Checker, row: Row, nodes: List<Option<TypedExpr>> }, h: Hole| {
         let o: Inferred = infer(acc.checker, h.value, hint_of(hole.ty));
         let met: Checker = expect_met(
           o.checker,
@@ -1832,7 +1850,8 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
           o.ty,
           b"a hole of a tagged literal",
         );
-        join(met, t.span, acc.row, o.row)
+        let j: WithRow = join(met, t.span, acc.row, o.row);
+        { checker: j.checker, row: j.row, nodes: acc.nodes.push(typed_at(o, expr_span(h.value))) }
       },
     );
     let recorded: Checker = filled.row.atoms.fold(held.checker, |cc: Checker, atom: Atom|
@@ -1845,9 +1864,95 @@ fn infer_tagged(checker: Checker, t: Tagged) -> Inferred / {abort.raise} = {
       [],
     );
     let j: WithRow = join(listed, t.span, held.row, filled.row);
-    { checker: j.checker, ty: answer.ty, row: j.row, node: None }
+    {
+      checker: j.checker,
+      ty: answer.ty,
+      row: j.row,
+      node: tagged_node(
+        j.checker,
+        t,
+        parsed.callee,
+        result,
+        value.ty,
+        Some({ callee: filled.callee, holes: held.nodes, hole: hole.ty, answer: answer.ty }),
+      ),
+    }
   }
 }
+
+/// The block the tagged literal `t` is written out as, typed: what the call of its parser answers
+/// `Ok` of, `value`, bound to a name no source can spell, and read, or with holes handed with them
+/// to its filler, which answers `answer`. `result` is what the parser answers.
+fn tagged_node(
+  checker: Checker,
+  t: Tagged,
+  parser: Option<TypedExpr>,
+  result: Type,
+  value: Type,
+  fill: Option<{ callee: Option<TypedExpr>, holes: List<Option<TypedExpr>>, hole: Type, answer: Type }>,
+) -> Option<TypedNode> / {abort.raise} =
+  match ((parser, ctor_of(checker, b"Ok"))) {
+    (Some(parse), Some(ok)) -> {
+      let at = |role: Int| minted(t.span, role);
+      let texts = tagged_parts(t).map(|part: TaggedPart|
+        { node: TypedLit(LStr(part.text)), span: part.quoted, ty: string_type() });
+      let call = |callee: TypedExpr, args: List<TypedExpr>, ret: Type, place: Span|
+        { node: TypedCall({ callee: callee, args: args }), span: place, ty: ret };
+      let parsed = call(
+        parse,
+        match fill {
+          None -> texts,
+          Some(_) ->
+            [{ node: TypedList(texts), span: at(role_tag_texts()), ty: list_type(string_type()) }],
+        },
+        result,
+        at(role_tag_parse()),
+      );
+      let read = { node: TypedRead(ReadLocal(b"?literal")), span: at(role_tag_read()), ty: value };
+      let tail: Option<TypedExpr> = match fill {
+        None -> Some(read),
+        Some(f) -> match ((f.callee, Option::all(f.holes))) {
+          (Some(filler), Some(holes)) ->
+            Some(
+              call(
+                filler,
+                [
+                  read,
+                  { node: TypedList(holes), span: at(role_tag_holes()), ty: list_type(f.hole) },
+                ],
+                f.answer,
+                at(role_tag_fill()),
+              ),
+            ),
+          _ -> None,
+        },
+      };
+      match tail {
+        Some(x) ->
+          Some(
+            TypedBlock({
+              stmts: [
+                TypedLet({
+                  pat: TypedCase({
+                    sum: ok.type_name,
+                    name: ok.name,
+                    case: ok.index,
+                    args: [
+                      TypedBinder({ name: b"?literal", ty: value, span: at(role_tag_binder()) }),
+                    ],
+                  }),
+                  value: parsed,
+                  span: at(role_tag_let()),
+                }),
+              ],
+              tail: Some(x),
+            }),
+          ),
+        None -> None,
+      }
+    },
+    _ -> None,
+  }
 
 /// The branches' answers as a tuple, which is what evaluating them left to right answers.
 fn infer_parallel(checker: Checker, span: Span, branches: List<Expr>) -> Inferred / {abort.raise} = {
