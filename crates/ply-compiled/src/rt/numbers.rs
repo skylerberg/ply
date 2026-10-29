@@ -1,14 +1,7 @@
-//! A `Float`'s remainder, the boxes of `Decimal`s and 128-bit widths, and the failures compiled
-//! arithmetic and matching raise.
+//! The boxes of `Decimal`s and 128-bit widths, and the failures compiled arithmetic and matching
+//! raise.
 
 use super::*;
-
-/// `a % b` over two `Float`s' bits. Compiled code calls `fmod`; a builder the release built still
-/// binds this.
-pub unsafe extern "C" fn rt_float_rem(_ctx: *mut Ctx, a: i64, b: i64) -> i64 {
-    let (a, b) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
-    ply_core::float::bits(a % b) as i64
-}
 
 /// The box of a 128-bit width, the width at `t` in [`ply_core::INT_TYPES`], whose bits are `lo`
 /// and above it `hi`.

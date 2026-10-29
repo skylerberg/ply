@@ -1,6 +1,7 @@
 //! Effect sets and law schemas: what a set holds and what an instantiation of a schema states.
 
 import compiler.syntax.parsing (Span, Ident, QName, dummy_span, is_bare, span_between)
+import compiler.syntax.sites (numbered_made)
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, RowExpr, AtomExpr, MRead,
                                     mode_text)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IEffectSet, Cases,
@@ -22,138 +23,7 @@ import compiler.check.resolve.tables (ParsedModule, EffectSpace, SetSpace, Value
                                       qualify, label_at, error_with_labels, error_at, error_at_and,
                                       backticked)
 import compiler.check.resolve.scopes (private_name, find)
-
-// --- Defaults: what a default may be -----------------------------------------------------
-
-pub fn pattern_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
-  match p {
-    PVar(v) -> out.push(v.name.name),
-    PCtor(c) -> c.args.fold(out, |acc: List<Bytes>, a: Pattern| pattern_binders(a, acc)),
-    PRecord(r) ->
-      r.fields.fold(out, |acc: List<Bytes>, f: { name: Ident, pat: Pattern }|
-        pattern_binders(f.pat, acc)),
-    PList(l) -> {
-      let items = l.items.fold(out, |acc: List<Bytes>, x: Pattern| pattern_binders(x, acc));
-      match l.rest { None -> items, Some(r) -> pattern_binders(r, items) }
-    },
-    POr(o) -> o.alts.fold(out, |acc: List<Bytes>, a: Pattern| pattern_binders(a, acc)),
-    PWild(_) -> out,
-    PLit(_) -> out,
-    PRange(_) -> out,
-    PBad(_) -> out,
-  }
-
-/// Which of `params` the expression names free, in evaluation order.
-pub fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) -> List<Bytes> =
-  match e {
-    EHole(_) -> out,
-    EVar(v) -> if is_bare(v.name) && !bound.contains(v.name.name.name)
-        && params.contains(v.name.name.name) { out.push(v.name.name.name) }
-    else { out },
-    ELambda(l) ->
-      mentions(
-        l.body,
-        params,
-        l.params.fold(bound, |acc: List<Bytes>, p: Param| acc.push(p.name.name)),
-        out,
-      ),
-    EApp(a) -> {
-      let o1 = mentions(a.func, params, bound, out);
-      let o2 = a.args.fold(o1, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc));
-      a.named.fold(o2, |acc: List<Bytes>, arg: NamedArg| mentions(arg.value, params, bound, acc))
-    },
-    EBinary(b) -> mentions(b.rhs, params, bound, mentions(b.lhs, params, bound, out)),
-    EUnary(u) -> mentions(u.operand, params, bound, out),
-    EIf(i) ->
-      mentions(
-        i.else_branch,
-        params,
-        bound,
-        mentions(i.then_branch, params, bound, mentions(i.cond, params, bound, out)),
-      ),
-    EMatch(m) ->
-      m.arms.fold(mentions(m.scrutinee, params, bound, out), |acc: List<Bytes>, arm: MatchArm| {
-        let inner = pattern_binders(arm.pat, bound);
-        let g = match arm.guard { None -> acc, Some(x) -> mentions(x, params, inner, acc) };
-        mentions(arm.body, params, inner, g)
-      }),
-    EBlock(b) -> {
-      let walked = b.stmts.fold(
-        { bound: bound, out: out },
-        |acc: { bound: List<Bytes>, out: List<Bytes> }, s: Stmt|
-          match s {
-            SLet(l) ->
-              {
-                bound: pattern_binders(l.pat, acc.bound),
-                out: mentions(l.value, params, acc.bound, acc.out),
-              },
-            // The `else` block runs where the pattern bound nothing.
-            SLetElse(l) ->
-              {
-                bound: pattern_binders(l.pat, acc.bound),
-                out: mentions(
-                  l.fallback,
-                  params,
-                  acc.bound,
-                  mentions(l.value, params, acc.bound, acc.out),
-                ),
-              },
-            SExpr(x) -> { ..acc, out: mentions(x, params, acc.bound, acc.out) },
-            SAssign(x) -> { ..acc, out: mentions(x.value, params, acc.bound, acc.out) },
-          },
-      );
-      match b.tail { None -> walked.out, Some(t) -> mentions(t, params, walked.bound, walked.out) }
-    },
-    ERecord(r) ->
-      r.fields.fold(out, |acc: List<Bytes>, f: RecField| mentions(f.value, params, bound, acc)),
-    ERecordUpdate(r) ->
-      r.fields.fold(mentions(r.base, params, bound, out), |acc: List<Bytes>, f: RecField|
-        mentions(f.value, params, bound, acc)),
-    EField(f) -> mentions(f.base, params, bound, out),
-    EList(l) -> l.items.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
-    ETry(t) -> mentions(t.operand, params, bound, out),
-    // `x.f(..)` on a binding `x` is a call on its value, which names `x`.
-    EPerform(p) -> {
-      let receiver = p.eff.name.name;
-      let named = if is_bare(p.eff) && !bound.contains(receiver) && params.contains(receiver) {
-        out.push(receiver)
-      } else { out };
-      p.args.fold(named, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc))
-    },
-    EHandle(h) -> {
-      let vars = h.vars.fold(
-        { out: out, bound: bound },
-        |acc: { out: List<Bytes>, bound: List<Bytes> }, v: HandlerVar|
-          { out: mentions(v.init, params, acc.bound, acc.out), bound: acc.bound.push(v.name.name) },
-      );
-      let body = mentions(h.body, params, bound, vars.out);
-      let clauses = h.clauses.fold(body, |acc: List<Bytes>, c: HandleClause| {
-        let named = c.params.fold(vars.bound, |b: List<Bytes>, i: Ident| b.push(i.name));
-        let resumed = match c.resume { Some(k) -> named.push(k.name), None -> named };
-        let labelled = match c.label_binder { Some(t) -> resumed.push(t.name), None -> resumed };
-        mentions(c.body, params, labelled, acc)
-      });
-      match h.ret {
-        Some(r) -> mentions(r.body, params, vars.bound.push(r.binder.name), clauses),
-        None -> clauses,
-      }
-    },
-    EWithHold(c) ->
-      mentions(
-        c.body,
-        params,
-        bound,
-        mentions(c.release, params, bound, mentions(c.acquire, params, bound, out)),
-      ),
-    ESimulate(s) -> mentions(s.body, params, bound, out),
-    ETryBlock(t) -> mentions(t.body, params, bound, out),
-    EParallel(v) ->
-      v.branches.fold(out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
-    ELit(_) -> out,
-    ETagged(t) ->
-      t.holes.fold(out, |acc: List<Bytes>, h: Hole| mentions(h.value, params, bound, acc)),
-    EBad(_) -> out,
-  }
+import compiler.expand.rewrite.shared (bare_names_read)
 
 // --- Effect sets ---------------------------------------------------------------------------
 
@@ -623,7 +493,22 @@ type RowExpander = {
   module: Int,
   reached: List<ModuleBinding>,
   diags: List<Diag>,
+  rows: Int,
 }
+
+fn made_atom(a: AtomExpr) -> AtomExpr =
+  {
+    ..a,
+    eff: {
+      module: match a.eff.module {
+        Some(m) -> Some({ ..m, span: { ..m.span, site: 0 } }),
+        None -> None,
+      },
+      name: { ..a.eff.name, span: { ..a.eff.name.span, site: 0 } },
+      span: { ..a.eff.span, site: 0 },
+    },
+    op: match a.op { Some(o) -> Some({ ..o, span: { ..o.span, site: 0 } }), None -> None },
+  }
 
 type ExpandedRow = { expander: RowExpander, r: RowExpr }
 
@@ -632,7 +517,9 @@ fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.ra
     let o = row.aliases.fold(
       { expander: expander, atoms: row.atoms },
       |acc: { expander: RowExpander, atoms: List<AtomExpr> }, qname: QName|
-        if is_diverges_name(qname) { { ..acc, atoms: acc.atoms.push(diverges_expr(qname)) } } else {
+        if is_diverges_name(qname) {
+          { ..acc, atoms: acc.atoms.push(made_atom(diverges_expr(qname))) }
+        } else {
           match set_named(acc.expander.resolved, acc.expander.table, acc.expander.module, qname) {
             Err(d) -> { ..acc, expander: { ..acc.expander, diags: acc.expander.diags.push(d) } },
             Ok(id) ->
@@ -642,7 +529,7 @@ fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.ra
                   let u = usable(a.expander.resolved, a.expander.module, member, qname.span);
                   {
                     expander: { ..a.expander, reached: with_reach(a.expander.reached, u.bind) },
-                    atoms: a.atoms.push(u.atom),
+                    atoms: a.atoms.push(made_atom(u.atom)),
                   }
                 },
               ),
@@ -650,7 +537,7 @@ fn row_with_sets(expander: RowExpander, row: RowExpr) -> ExpandedRow / {abort.ra
         },
     );
     {
-      expander: o.expander,
+      expander: { ..o.expander, rows: o.expander.rows + 1 },
       r: {
         atoms: o.atoms,
         aliases: row.aliases,
@@ -668,7 +555,14 @@ fn module_sets(
   m: Int,
   parsed: ParsedModule,
 ) -> { module: ParsedModule, expander: RowExpander } / {abort.raise} = {
-  let start: RowExpander = { resolved: resolved, table: table, module: m, reached: [], diags: [] };
+  let start: RowExpander = {
+    resolved: resolved,
+    table: table,
+    module: m,
+    reached: [],
+    diags: [],
+    rows: 0,
+  };
   let walked = parsed.module.items.fold(
     { expander: start, items: [] },
     |acc: { expander: RowExpander, items: List<Item> }, item: Item|
@@ -692,7 +586,11 @@ fn module_sets(
         },
         _ -> {
           let o = rows_item(acc.expander, item);
-          { expander: o.expander, items: acc.items.push(o.it) }
+          {
+            expander: o.expander,
+            items: acc.items.push(if o.expander.rows == acc.expander.rows { o.it }
+            else { numbered_made(o.it) }),
+          }
         },
       },
   );
@@ -1149,10 +1047,8 @@ fn has_instance(module: Module) -> Bool =
 /// before it, is called that: an argument written here never reads a binder.
 fn apart(name: Bytes, args: List<Expr>, taken: List<Bytes>, room: Int) -> Bytes / {abort.raise} =
   iterate(name, room, |n: Bytes|
-    if !taken.contains(n)
-        && args.fold(true, |free: Bool, x: Expr| free && mentions(x, [n], [], []).len() == 0) {
-      Stop(n)
-    } else { Continue(n.concat(b"_")) })
+    if !taken.contains(n) && !args.any(|x: Expr| bare_names_read(x).contains(n)) { Stop(n) }
+    else { Continue(n.concat(b"_")) })
 
 /// Each type parameter `schema`'s `where identity(a)` constrains, by its place among the type
 /// arguments its definitions are called at: the type parameters its parameters' and binders' types
@@ -1239,7 +1135,9 @@ fn instance(
             ),
           }
         } else {
-          let through = { name: reached_binder(home.name), span: i.schema.span };
+          let at = { ..i.span, site: 0 };
+          let schema_at = { ..i.schema.span, site: 0 };
+          let through = { name: reached_binder(home.name), span: schema_at };
           let end = span_between(i.span.end, i.span.end);
           let names = schema.binders.fold([], |acc: List<Bytes>, binder: Binder|
             acc.push(
@@ -1249,15 +1147,15 @@ fn instance(
             names.map(|n: Bytes|
               EVar({ span: end, name: { module: None, name: { name: n, span: end }, span: end } })),
           );
-          let call = |callee: Bytes, at: Span|
+          let call = |callee: Bytes, made: Span|
             EApp({
-              span: at,
+              span: made,
               func: EVar({
-                span: i.schema.span,
+                span: schema_at,
                 name: {
                   module: Some(through),
-                  name: { name: callee, span: i.schema.name.span },
-                  span: i.schema.span,
+                  name: { name: callee, span: { ..i.schema.name.span, site: 0 } },
+                  span: schema_at,
                 },
               }),
               named: [],
@@ -1269,13 +1167,9 @@ fn instance(
             law: {
               ..d,
               binders: names.map(|n: Bytes|
-                {
-                  name: { name: n, span: i.span },
-                  ty: TVar({ name: n, span: i.span }),
-                  span: i.span,
-                }),
+                { name: { name: n, span: at }, ty: TVar({ name: n, span: at }), span: at }),
               guard: match schema.guard {
-                Some(_) -> Some(call(schema_guard_name(name), i.schema.span)),
+                Some(_) -> Some(call(schema_guard_name(name), schema_at)),
                 None -> None,
               },
               of: Some({
@@ -1284,7 +1178,7 @@ fn instance(
                 shown: schema.binders.map(|binder: Binder| binder.name.name),
                 identities: schema_identities(schema),
               }),
-              body: call(name, i.span),
+              body: call(name, at),
             },
             diags: diags,
           }
@@ -1310,7 +1204,7 @@ pub fn instantiated(r: Resolved, mods: List<ParsedModule>) -> Instantiated / {ab
               None -> { ..w, items: w.items.push(item) },
               Some(i) -> {
                 let o = instance(w.r, mods, m, d, i, w.diags);
-                { r: o.r, items: w.items.push(ILaw(o.law)), diags: o.diags }
+                { r: o.r, items: w.items.push(numbered_made(ILaw(o.law))), diags: o.diags }
               },
             },
             _ -> { ..w, items: w.items.push(item) },

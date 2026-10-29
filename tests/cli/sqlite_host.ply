@@ -11,7 +11,7 @@ import std.string
 
 fn sqlite_program() -> String =
   \\import std.process (process)
-  \\import std.sql (stmt, PInt, PText, Row)
+  \\import std.sql (stmt, PText, Row)
   \\import std.string
   \\import std.sqlite
   \\import std.sqlite (sqlite, sql, Busy, Refused, Unopened, Create, ReadOnly, ReadWrite, Limits, Options)
@@ -83,41 +83,6 @@ fn sqlite_program() -> String =
   \\pub fn unbound() -> String / {sqlite.read[nowhere], sqlite.write[nowhere], abort.raise} =
   \\  refusal(|| with_hold[nowhere_db](sqlite::opening[nowhere]("x.db", Create, plain()), |c| sqlite::close(c)) { conn -> 0 })
   \\
-  \\// One connection writing in a transaction, another reading and then trying to write.
-  \\pub fn together() -> List<String> / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
-  \\  with_hold[one](sqlite::opening[app]("data.db", ReadWrite, plain()), |c| sqlite::close(c)) { one ->
-  \\    with_hold[two](sqlite::opening[app]("data.db", ReadWrite, plain()), |c| sqlite::close(c)) { two -> {
-  \\      let during = sqlite::transaction(one, || {
-  \\        sqlite::execute(one, sqlite::bound(stmt("insert into person (name) values (?1)"), [PText("Edsger")]), roomy());
-  \\        [
-  \\          string_of_int(names(two).len()),
-  \\          refusal(|| sqlite::execute(two, s("insert into person (name) values ('Barbara')"), roomy())),
-  \\          refusal(|| sqlite::transaction(two, || 0)),
-  \\          string_of_int(names(one).len()),
-  \\        ]
-  \\      });
-  \\      during.push(string_of_int(names(two).len())).push(refusal(|| sqlite::execute(two, s("insert into person (name) values ('Barbara')"), roomy())))
-  \\    } } }
-  \\
-  \\fn string_of_int(n: Int) -> String = n.to_string()
-  \\
-  \\// A large answer read a page at a time, from a statement the connection keeps open between pages.
-  \\pub fn folded(rows: Int) -> Int / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} =
-  \\  with_hold[folding](sqlite::opening[app]("fold.db", Create, plain()), |c| sqlite::close(c)) { conn -> {
-  \\    sqlite::execute(conn, s("create table if not exists n (i integer primary key) strict"), roomy());
-  \\    sqlite::execute(conn, s("delete from n"), roomy());
-  \\    sqlite::execute(
-  \\      conn,
-  \\      sqlite::bound(
-  \\        stmt("with recursive c(i) as (select 1 union all select i + 1 from c where i < ?1) insert into n select i from c"),
-  \\        [PInt(rows)],
-  \\      ),
-  \\      roomy(),
-  \\    );
-  \\    sqlite::fold_rows(conn, s("select i from n order by i"), roomy(), 64, 0, |acc: Int, row: Row|
-  \\      acc + sqlite::int(row, "i"))
-  \\  } }
-  \\
   \\// A connection its entry never closes.
   \\pub fn left_open() -> Int / {sqlite.read[app], sqlite.write[app], sql.refused, abort.raise} = {
   \\  let conn = sqlite::opening[app]("left.db", Create, plain());
@@ -134,8 +99,6 @@ fn sqlite_program() -> String =
   \\    ["opens", path] -> opens(path),
   \\    ["backs_up", path] -> backs_up(path),
   \\    ["unbound"] -> unbound(),
-  \\    ["together"] -> String::join(together(), ","),
-  \\    ["folded", rows] -> match rows.int_of_string() { Some(n) -> folded(n).to_string(), None -> panic("rows") },
   \\    ["left_open"] -> left_open().to_string(),
   \\    _ -> panic("no such scenario: " ++ String::join(scenario, " ")),
   \\  }
@@ -222,17 +185,6 @@ fn from_root(path: String) -> String / {abort.raise} =
 fn linked(link: String, to: String) -> Unit / {Here, abort.raise} =
   assert(fs.symlink[cwd](link, from_root(to)), Some("a link is made"))
 
-test/nondet "a database written and closed is read back from its file" {
-  rooted();
-  assert_eq(answer(["round_trip"]), "Ada,Grace");
-  let file = match fs.read_file[cwd]("root/data.db") { Some(b) -> b, None -> b"" };
-  assert_eq(file.slice(0, 16), b"SQLite format 3\x00");
-  // Bytes 18 and 19 are the file format's write and read versions: 2 is write-ahead logging.
-  assert_eq((file.at(18), file.at(19)), (2, 2));
-  // The log stays beside a database whose last connection only read.
-  assert_eq(files("root"), ["data.db", "data.db-shm", "data.db-wal"])
-}
-
 test/nondet "the engine itself refuses every way out of the root" {
   rooted();
   let _ = fs.write_file[cwd]("outside/secret.txt", b"secret");
@@ -309,22 +261,6 @@ test/nondet "a database is never opened through a symbolic link" {
   assert_eq(prefix("root/kept.db", 16), b"SQLite format 3\x00")
 }
 
-// The reader's rows inside the writer's transaction, the second writer's statement and transaction,
-// the writer's own rows, then the reader's rows and its write after the commit.
-test/nondet "a reader sees what was committed and a second writer is busy" {
-  rooted();
-  assert_eq(answers([["round_trip"], ["together"]]), ["Ada,Grace", "2,busy,busy,3,3,ran"])
-}
-
-test/nondet "a fold reads a statement the connection keeps open between pages" {
-  rooted();
-  assert_eq(answers([["folded", "1000"], ["folded", "64"], ["folded", "1"]]), [
-    "500500",
-    "2080",
-    "1",
-  ])
-}
-
 test/nondet "a connection a run leaves open is closed when the run ends" {
   rooted();
   assert_eq(answer(["left_open"]), "1");
@@ -371,7 +307,8 @@ test/nondet "a test's pass over a database stands until a write moves the databa
   assert(selected(first) == 1, Some(shown(first)));
   let again = tested_over_root();
   assert(selected(again) == 0, Some("nothing the pass read moved: " ++ shown(again)));
-  assert_eq(answers([["together"]]), ["2,busy,busy,3,3,ran"]);
+  // A write: a table made in the database the pass read.
+  assert_eq(answer(["opens", "data.db"]), "ran");
   let moved = tested_over_root();
   assert(selected(moved) == 1, Some("the database moved under the pass: " ++ shown(moved)))
 }

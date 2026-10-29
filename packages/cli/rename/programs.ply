@@ -1,0 +1,221 @@
+import std.fs (fs, File)
+import std.json (Bool)
+import paths (Rooted, Resolved, absolute, child, displayed, kind, read_file, rooted)
+import library
+import std.path (normalize)
+import walk (Failure)
+import sources
+import program (load_program, walked)
+import diagnostic (errors_text)
+import builder (builder)
+import std.random (entropy)
+import std.time (time)
+import compiler.cc (toolchain)
+import compiler.load (Derives)
+import compiler.unit (shipped)
+import compiler.front.facts (Analysis)
+import compiler.front.seam (Refused, Analysed)
+import compiler.check.resolve.tables (ParsedModule, Diag, Decls, module_of_name)
+import compiler.check.resolve.bindings (written, Written, Module)
+import compiler.check.infer (item_owner)
+import compiler.check.infer.checker (MemberSite)
+import compiler.check.member (MemberTarget)
+import compiler.syntax.items (parse, Module, ImportDecl, Item, IEffect, IExtern, OpDef)
+import compiler.syntax.sites (numbered_module)
+
+pub type Library = { root: Rooted, name: String }
+
+pub fn module_path(file: Rooted, package: Rooted) -> String / {abort.raise} =
+  file.path.slice(if package.path == "" { 0 } else { package.path.len() + 1 }, file.path.len() - 4)
+
+pub fn in_root(path: String, at: Rooted) -> String / {abort.raise} =
+  if at.label == "abs" && path.starts_with("/") { path.slice(1, path.len()) } else { path }
+
+pub fn package_of(
+  file: Rooted,
+  libraries: List<Library>,
+) -> Option<Rooted> / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+  let parts = file.path.split("/");
+  match range(0, parts.len()).map(|k: Int| parts.len() - 1 - k).map(|k: Int|
+      { label: file.label, path: String::join(parts.take(k), "/") }).find(|dir: Rooted|
+      kind(child(dir, "ply.pkg")) == File) {
+    Some(package) -> Some(package),
+    None ->
+      libraries.find(|l: Library|
+        l.root.label == file.label && file.path.starts_with(l.root.path ++ "/")).map(
+        |l: Library| l.root,
+      ),
+  }
+}
+
+pub fn libraries_of(
+  given: List<Resolved>,
+) -> List<Library> / {fs.resolved[abs], fs.read_file[abs], abort.raise} =
+  given.fold([], |acc: List<Library>, r: Resolved|
+    match library::part_of(r.absolute) {
+      Some(part) -> if normalize(r.absolute) == part.dir {
+        acc.push({ root: rooted(r), name: part.prefix })
+      } else { acc },
+      None -> acc,
+    })
+
+pub type Entry = { owner: Bytes, names: Written }
+
+pub type Read = {
+  file: sources::File,
+  index: Int,
+  name: Bytes,
+  entries: List<Entry>,
+  calls: Map<Bytes, Map<Int, MemberTarget>>,
+  imports: List<{ decl: ImportDecl, target: Int }>,
+  externs: Map<Bytes, Bool>,
+  effects: List<{ name: Bytes, ops: List<Bytes> }>,
+}
+
+pub type Loaded = {
+  path: Resolved,
+  root: String,
+  files: List<Rooted>,
+  names: List<Bytes>,
+  indices: Map<Bytes, Int>,
+  module_files: List<Option<String>>,
+  declarations: List<Decls>,
+  reads: List<Read>,
+}
+
+pub fn indices_of(names: List<Bytes>) -> Map<Bytes, Int> / {abort.raise} =
+  range(0, names.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int| m.insert(names.get(i), i))
+
+pub type DefinitionKey = { file: String, name: Bytes }
+
+pub fn name_in(module: Bytes, qualified: Bytes) -> Bytes / {abort.raise} =
+  if module.len() == 0 { qualified } else { qualified.slice(module.len() + 1, qualified.len()) }
+
+pub fn key_of(l: Loaded, qualified: Bytes) -> Option<DefinitionKey> / {abort.raise} = {
+  let module = module_of_name(qualified);
+  match l.indices.get(module).and_then(|i: Int| l.module_files.at(i)) {
+    Some(Some(file)) -> Some({ file: file, name: name_in(module, qualified) }),
+    _ -> None,
+  }
+}
+
+fn file_of(pwd: String, files: Map<String, String>, at: Rooted) -> Option<String> =
+  if at.label == "shipped" { files.get(at.path) } else { Some(absolute(pwd, at)) }
+
+fn shipped_files(
+  path: Resolved,
+) -> Map<String, String> / {fs.resolved[abs], fs.read_file[abs], fs.read[abs], abort.raise} =
+  match library::checkout_holding(path.absolute) {
+    Some(c) -> library::module_files(c),
+    None -> Map::new(),
+  }
+
+pub fn calls_of(a: Analysis, index: Int) -> Map<Bytes, Map<Int, MemberTarget>> =
+  a.checked.facts.members.fold(
+    Map::new(),
+    |acc: Map<Bytes, Map<Int, MemberTarget>>, s: MemberSite|
+      if s.module != index { acc }
+      else { acc.insert(s.owner, acc.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)) },
+  )
+
+pub fn entries_of(
+  a: Analysis,
+  index: Int,
+  name: Bytes,
+  tree: Module,
+) -> List<Entry> / {abort.raise} = {
+  let names = written(a.r, index, tree);
+  range(0, names.len()).map(|k: Int|
+    {
+      owner: if k == 0 { b"" } else { item_owner(name, tree.items.get(k - 1)) },
+      names: names.get(k),
+    })
+}
+
+fn read_of(a: Analysis, file: sources::File) -> Option<Read> / {abort.raise} = {
+  let name = Bytes::of_string(file.module);
+  match range(0, a.mods.len()).find(|i: Int| a.mods.get(i).name == name) {
+    None -> None,
+    Some(index) -> {
+      let tree = numbered_module(parse(file.text).node);
+      let targets = a.r.imports.get(index);
+      Some({
+        file: file,
+        index: index,
+        name: name,
+        entries: entries_of(a, index, name, tree),
+        calls: calls_of(a, index),
+        imports: range(0, tree.imports.len()).fold(
+          [],
+          |acc: List<{ decl: ImportDecl, target: Int }>, k: Int|
+            match targets.at(k) {
+              Some(t) -> acc.push({ decl: tree.imports.get(k), target: t }),
+              None -> acc,
+            },
+        ),
+        externs: tree.items.fold(Map::new(), |acc: Map<Bytes, Bool>, item: Item|
+          match item { IExtern(x) -> acc.insert(x.name.name, true), _ -> acc }),
+        effects: tree.items.fold([], |acc: List<{ name: Bytes, ops: List<Bytes> }>, item: Item|
+          match item {
+            IEffect(e) -> acc.push({ name: e.name.name, ops: e.ops.map(|op: OpDef| op.name.name) }),
+            _ -> acc,
+          }),
+      })
+    },
+  }
+}
+
+fn under(at: Rooted, root: Rooted) -> Bool =
+  at.label == root.label
+    && (root.path == "" || root.path == "." || at.path == root.path
+    || at.path.starts_with(root.path ++ "/"))
+
+pub fn loads_of(
+  given: List<Resolved>,
+  pwd: String,
+) -> { loads: List<Loaded>, failures: List<Failure> } / {fs.resolved[abs], shipped.answer, toolchain.reused, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let roots = given.map(rooted);
+  given.fold(
+    { loads: [], failures: [] },
+    |acc: { loads: List<Loaded>, failures: List<Failure> }, path: Resolved| {
+      let root = rooted(path);
+      if acc.loads.any(|l: Loaded| l.files.any(|f: Rooted| under(f, root))) { acc } else {
+        let program = load_program([path], false);
+        let library_files = shipped_files(path);
+        let refused = |ds: List<Diag>|
+          {
+            ..acc,
+            failures: acc.failures.push({
+              path: displayed(root),
+              why: "does not check: " ++ errors_text(ds),
+            }),
+          };
+        match program.frame {
+          None -> refused(program.diags),
+          Some(_) -> match walked(program).out {
+            Refused(ds) -> refused(ds),
+            Analysed(a) ->
+              {
+                ..acc,
+                loads: acc.loads.push({
+                  path: path,
+                  root: displayed(root),
+                  files: program.files.map(|f: sources::File| f.at),
+                  names: a.mods.map(|m: ParsedModule| m.name),
+                  indices: indices_of(a.mods.map(|m: ParsedModule| m.name)),
+                  module_files: program.read_at.map(|at: Rooted| file_of(pwd, library_files, at)),
+                  declarations: a.r.declarations,
+                  reads: program.files.filter(|f: sources::File|
+                    roots.any(|r: Rooted| under(f.at, r))).fold(
+                    [],
+                    |reads: List<Read>, f: sources::File|
+                      match read_of(a, f) { Some(r) -> reads.push(r), None -> reads },
+                  ),
+                }),
+              },
+          },
+        }
+      }
+    },
+  )
+}

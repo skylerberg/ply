@@ -5,9 +5,9 @@
 //! definition's: where the walk sees the lambda called, with what it is called with, and otherwise
 //! with its parameters unknown.
 
-import compiler.syntax.parsing (Span, Ident, QName, span_bin, span_between)
-import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, LInt, LFixed, LWide, LBad, LBool)
+import compiler.syntax.parsing (Span, Ident, QName, span_bin, span_between, bare)
+import compiler.syntax.patterns (Pattern, binder_names, PWild, PVar, PLit, PRange, PCtor, PRecord,
+                                 PList, POr, PBad, LInt, LFixed, LWide, LBad, LBool)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
@@ -108,7 +108,8 @@ pub type Group = {
   defs: List<FnDef>,
   names: List<Bytes>,
   params: List<List<Type>>,
-  resolve: (QName) -> Callee / {abort.raise},
+  resolve: (Int, QName) -> Callee / {abort.raise},
+  binders: List<Map<Int, Int>>,
   stated: (Int, Span) -> List<Callee> / {abort.raise},
   ending_of: (Bytes) -> Ending / {abort.raise},
   summary_of: (Bytes) -> Option<Summary>,
@@ -140,9 +141,9 @@ type Local =
   /// A parameter of function type, whose calls the walk records.
   | FunctionParam(Int)
   /// A lambda bound by `let`, walked where it is called, in the scope it was written in.
-  | LetLambda({ params: List<Param>, body: Expr, locals: Map<Bytes, Local> })
+  | LetLambda({ params: List<Param>, body: Expr, locals: Map<Int, Local> })
 
-type Scope = { locals: Map<Bytes, Local>, facts: List<Fact> }
+type Scope = { locals: Map<Int, Local>, facts: List<Fact> }
 
 type Call = { callee: Int, args: List<Term>, facts: List<Fact>, span: Span }
 
@@ -935,7 +936,7 @@ fn handed_lambda(
       };
       Some({
         scope: range(0, l.params.len()).fold(scope, |s: Scope, j: Int|
-          bound(s, l.params.get(j).name.name, match it.params.get(j) {
+          bound(s, l.params.get(j).name, match it.params.get(j) {
             Element -> element,
             Threaded(_) -> threaded,
             _ -> UnknownTerm,
@@ -984,7 +985,14 @@ fn part_of(t: Term, p: Place) -> Bool =
 fn part_place(t: Term) -> Option<Place> =
   match t { Below(p) -> Some(p), Inside(p) -> Some(p), _ -> None }
 
-fn local(scope: Scope, name: Bytes) -> Option<Local> = scope.locals.get(name)
+fn binder_of(context: MemberContext, q: QName) -> Option<Int> =
+  match q.module {
+    Some(_) -> None,
+    None -> match context.group.binders.at(context.me) {
+      Some(binders) -> binders.get(q.name.span.site),
+      None -> None,
+    },
+  }
 
 fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
   match e {
@@ -997,7 +1005,7 @@ fn term(context: MemberContext, scope: Scope, e: Expr) -> Term / {abort.raise} =
       LBad -> UnknownTerm,
       _ -> NoParts,
     },
-    EVar(v) -> match local_of(scope, v.name) {
+    EVar(v) -> match local_of(context, scope, v.name) {
       Some(KnownTerm(t)) -> t,
       Some(FunctionParam(i)) -> Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 }),
       Some(LetLambda(_)) -> UnknownTerm,
@@ -1445,23 +1453,27 @@ fn place_of(t: Term) -> Option<Place> =
 
 fn entry_scope(context: MemberContext, def: FnDef) -> Scope / {abort.raise} =
   {
-    locals: range(0, def.params.len()).fold(Map::new(), |m: Map<Bytes, Local>, i: Int|
-      m.insert(def.params.get(i).name.name, if function_param(context.group, context.me, i) {
-        FunctionParam(i)
-      } else { KnownTerm(Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 })) })),
+    locals: range(0, def.params.len()).fold(Map::new(), |m: Map<Int, Local>, i: Int|
+      m.insert(
+        def.params.get(i).name.span.site,
+        if function_param(context.group, context.me, i) { FunctionParam(i) }
+        else { KnownTerm(Exactly({ base: Some(PlaceBase({ param: i, path: [] })), k: 0 })) },
+      )),
     facts: [],
   }
 
-fn bound(scope: Scope, name: Bytes, t: Term) -> Scope =
-  { ..scope, locals: scope.locals.insert(name, KnownTerm(t)) }
+fn bound(scope: Scope, name: Ident, t: Term) -> Scope = known(scope, name.span.site, t)
+
+fn known(scope: Scope, binder: Int, t: Term) -> Scope =
+  { ..scope, locals: scope.locals.insert(binder, KnownTerm(t)) }
 
 fn unknown_params(s: Scope, ps: List<Param>) -> Scope =
-  ps.fold(s, |sc: Scope, p: Param| bound(sc, p.name.name, UnknownTerm))
+  ps.fold(s, |sc: Scope, p: Param| bound(sc, p.name, UnknownTerm))
 
 fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
   match p {
     PWild(_) -> s,
-    PVar(v) -> bound(s, v.name.name, t),
+    PVar(v) -> bound(s, v.name, t),
     PLit(_) -> s,
     PRange(_) -> s,
     PCtor(k) -> k.args.fold(s, |sc: Scope, x: Pattern| bind(sc, x, below(t))),
@@ -1475,34 +1487,26 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
         None -> items,
       }
     },
-    // Each alternative binds the same names; one whose parts differ between them is unknown.
+    // Each alternative binds the first one's names; one whose parts differ between them is
+    // unknown.
     POr(o) -> match o.alts {
       [] -> s,
       [first, ..others] -> {
         let one = bind(s, first, t);
+        let names = binder_names(first);
         others.fold(one, |sc: Scope, alt: Pattern| {
           let other = bind(s, alt, t);
-          pattern_names(alt).fold(sc, |acc: Scope, n: Bytes|
-            if local(acc, n) == local(other, n) { acc } else { bound(acc, n, UnknownTerm) })
+          let theirs = binder_names(alt);
+          names.fold(sc, |acc: Scope, n: Ident|
+            match theirs.find(|m: Ident| m.name == n.name) {
+              Some(m) -> if acc.locals.get(n.span.site) == other.locals.get(m.span.site) { acc }
+              else { bound(acc, n, UnknownTerm) },
+              None -> bound(acc, n, UnknownTerm),
+            })
         })
       },
     },
     PBad(_) -> s,
-  }
-
-fn pattern_names(p: Pattern) -> List<Bytes> =
-  match p {
-    PVar(v) -> [v.name.name],
-    PCtor(k) -> k.args.fold([], |acc: List<Bytes>, x: Pattern| acc.concat(pattern_names(x))),
-    PRecord(r) ->
-      r.fields.fold([], |acc: List<Bytes>, f: { name: Ident, pat: Pattern }|
-        acc.concat(pattern_names(f.pat))),
-    PList(l) -> {
-      let items = l.items.fold([], |acc: List<Bytes>, x: Pattern| acc.concat(pattern_names(x)));
-      match l.rest { Some(r) -> items.concat(pattern_names(r)), None -> items }
-    },
-    POr(o) -> match o.alts { [a, ..] -> pattern_names(a), [] -> [] },
-    _ -> [],
   }
 
 /// A `let` of a lambda keeps the lambda, walked where it is called.
@@ -1514,7 +1518,7 @@ fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {ab
           {
             ..scope,
             locals: scope.locals.insert(
-              v.name.name,
+              v.name.span.site,
               LetLambda({ params: f.params, body: f.body, locals: scope.locals }),
             ),
           },
@@ -1524,7 +1528,10 @@ fn statement_scope(context: MemberContext, scope: Scope, x: Stmt) -> Scope / {ab
     },
     SLetElse(l) -> bind(scope, l.pat, term(context, scope, l.value)),
     SExpr(_) -> scope,
-    SAssign(a) -> bound(scope, a.name.name, UnknownTerm),
+    SAssign(a) -> match binder_of(context, bare(a.name)) {
+      Some(b) -> known(scope, b, UnknownTerm),
+      None -> scope,
+    },
   }
 
 /// What holds where `e` evaluated to `truth`.
@@ -1718,11 +1725,11 @@ fn reached(acc: Seen, name: Bytes, span: Span) -> Seen =
 /// What a free name names; a name the walk bound is its own.
 fn callee_of(context: MemberContext, scope: Scope, q: QName) -> Callee / {abort.raise} =
   match q.module {
-    None -> match local(scope, q.name.name) {
+    None -> match local_of(context, scope, q) {
       Some(_) -> OtherCallee,
-      None -> context.group.resolve(q),
+      None -> context.group.resolve(context.me, q),
     },
-    Some(_) -> context.group.resolve(q),
+    Some(_) -> context.group.resolve(context.me, q),
   }
 
 fn builtin(context: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> / {abort.raise} =
@@ -1732,15 +1739,15 @@ fn builtin(context: MemberContext, scope: Scope, func: Expr) -> Option<Bytes> / 
   }
 
 /// The local a bare name binds.
-fn local_of(s: Scope, q: QName) -> Option<Local> =
-  match q.module { None -> local(s, q.name.name), Some(_) -> None }
+fn local_of(context: MemberContext, s: Scope, q: QName) -> Option<Local> =
+  match binder_of(context, q) { Some(b) -> s.locals.get(b), None -> None }
 
 fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.raise} =
   match e {
     ELit(_) -> acc,
     EHole(_) -> acc,
     // A function named but not called here is called wherever the value goes, with nothing known.
-    EVar(v) -> match local_of(s, v.name) {
+    EVar(v) -> match local_of(context, s, v.name) {
       Some(FunctionParam(i)) -> used(acc, { param: i, args: None }),
       Some(LetLambda(f)) -> lambda_escapes(context, s, acc, f),
       Some(KnownTerm(_)) -> acc,
@@ -1847,29 +1854,26 @@ fn walk(context: MemberContext, s: Scope, acc: Seen, e: Expr) -> Seen / {abort.r
         |a: { seen: Seen, scope: Scope }, v: HandlerVar|
           {
             seen: walk(context, a.scope, a.seen, v.init),
-            scope: bound(a.scope, v.name.name, UnknownTerm),
+            scope: bound(a.scope, v.name, UnknownTerm),
           },
       );
       let body = walk(context, s, inits.seen, h.body);
       // A clause and `return` read the handler's variables, of which nothing is known.
-      let held = h.vars.fold(s, |sc: Scope, v: HandlerVar| bound(sc, v.name.name, UnknownTerm));
+      let held = h.vars.fold(s, |sc: Scope, v: HandlerVar| bound(sc, v.name, UnknownTerm));
       let returned = match h.ret {
-        Some(r) -> walk(context, bound(held, r.binder.name, UnknownTerm), body, r.body),
+        Some(r) -> walk(context, bound(held, r.binder, UnknownTerm), body, r.body),
         None -> body,
       };
       h.clauses.fold(returned, |a: Seen, k: HandleClause| {
-        let params = k.params.fold(held, |sc: Scope, p: Ident| bound(sc, p.name, UnknownTerm));
-        let resumed = match k.resume {
-          Some(r) -> bound(params, r.name, UnknownTerm),
-          None -> params,
-        };
+        let params = k.params.fold(held, |sc: Scope, p: Ident| bound(sc, p, UnknownTerm));
+        let resumed = match k.resume { Some(r) -> bound(params, r, UnknownTerm), None -> params };
         walk(context, resumed, a, k.body)
       })
     },
     EWithHold(w) ->
       walk(
         context,
-        bound(s, w.binder.name, UnknownTerm),
+        bound(s, w.binder, UnknownTerm),
         walk(context, s, walk(context, s, acc, w.acquire), w.release),
         w.body,
       ),
@@ -1963,13 +1967,13 @@ fn inlined(
   context: MemberContext,
   s: Scope,
   acc: Seen,
-  f: { params: List<Param>, body: Expr, locals: Map<Bytes, Local> },
+  f: { params: List<Param>, body: Expr, locals: Map<Int, Local> },
   args: List<Term>,
 ) -> Seen / {abort.raise} =
   if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
     let inside = range(0, f.params.len()).fold(
       { locals: f.locals, facts: s.facts },
-      |sc: Scope, i: Int| bound(sc, f.params.get(i).name.name, actual(args, i)),
+      |sc: Scope, i: Int| bound(sc, f.params.get(i).name, actual(args, i)),
     );
     walk({ ..context, depth: context.depth + 1 }, inside, acc, f.body)
   }
@@ -1978,7 +1982,7 @@ fn lambda_escapes(
   context: MemberContext,
   scope: Scope,
   acc: Seen,
-  f: { params: List<Param>, body: Expr, locals: Map<Bytes, Local> },
+  f: { params: List<Param>, body: Expr, locals: Map<Int, Local> },
 ) -> Seen / {abort.raise} =
   if context.depth >= inline_bound() { too_deep(acc, f.body) } else {
     walk(
@@ -2010,7 +2014,10 @@ fn applied(
   // escape: that invocation calls it as this one does, which its summary reads back.
   let own_place = |i: Int, x: Expr|
     match x {
-      EVar(w) -> match local_of(scope, w.name) { Some(FunctionParam(j)) -> j == i, _ -> false },
+      EVar(w) -> match local_of(context, scope, w.name) {
+        Some(FunctionParam(j)) -> j == i,
+        _ -> false,
+      },
       _ -> false,
     };
   let walk_recursion = |a: Seen| {
@@ -2026,7 +2033,7 @@ fn applied(
     )
   };
   match func {
-    EVar(v) -> match local_of(scope, v.name) {
+    EVar(v) -> match local_of(context, scope, v.name) {
       Some(LetLambda(f)) ->
         inlined(context, scope, walk_args(acc), f, args.map(|x: Expr| term(context, scope, x))),
       Some(FunctionParam(i)) ->
@@ -2131,10 +2138,10 @@ fn handed(
     ELambda(l) ->
       calls.fold(acc, |seen: Seen, call: List<Term>| {
         let inside = range(0, l.params.len()).fold(s, |sc: Scope, j: Int|
-          bound(sc, l.params.get(j).name.name, actual(call, j)));
+          bound(sc, l.params.get(j).name, actual(call, j)));
         walk(context, inside, seen, l.body)
       }),
-    EVar(v) -> match local_of(s, v.name) {
+    EVar(v) -> match local_of(context, s, v.name) {
       Some(LetLambda(f)) ->
         calls.fold(acc, |seen: Seen, call: List<Term>| inlined(context, s, seen, f, call)),
       Some(FunctionParam(i)) ->

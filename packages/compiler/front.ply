@@ -5,7 +5,10 @@ import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IS
                               SRequires, ImportDecl, INames, dump_item, stated_type, item_span,
                               IAlias, IModule, IDerive, IInstance, INumeric)
 import compiler.syntax.type_syntax (MWrite)
-import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module, scheduler_module)
+import compiler.syntax.exprs (sees_homes, hidden_binder, prelude_module, scheduler_module, Expr,
+                              EPerform, expr_span)
+import compiler.syntax.sites (numbered_module)
+import compiler.expand.rewrite.shared (picked_in)
 import compiler.emit.code (Code, dump)
 import compiler.check.types (Atom, RSingleton, Scheme, Type, TyFn, atoms_text, scheme_text,
                              canonical_scheme, named_type, int_type, bytes_type, unit_type)
@@ -1611,6 +1614,39 @@ pub fn written_reach() -> List<Bytes> =
     b"entries_gathered",
     b"Map::entries",
   ].map(|n: Bytes| qualify(prelude_module(), n))
+
+test "a call back into its group through a home module's function is seen to descend when every module is walked" {
+  let user = [
+    {
+      name: b"m",
+      src: b"pub type Expr<r> = | Leaf(r) | Maybe(Option<Expr<r>>)\npub fn mapped<r, s>(e: Expr<r>, f: (r) -> s) -> Expr<s> = match e { Leaf(x) -> Leaf(f(x)), Maybe(o) -> Maybe(o.map(|y: Expr<r>| mapped(y, f))) }\n",
+    },
+  ];
+  let shipped = [
+    {
+      name: b"std.option",
+      src: b"pub fn Option::map<a, b | e>(o: Option<a>, f: (a) -> b / e) -> Option<b> / e bounded = match o { None -> None, Some(x) -> Some(f(x)) }\n",
+    },
+  ];
+  match analyse_pulling_std(user, shipped).out {
+    Refused(ds) -> panic(String::of_bytes_lossy(Bytes::concat_all(ds.map(|d: Diag| d.message)))),
+    Analysed(_) -> (),
+  }
+}
+
+test "a call written after a `?` holds the site its module as written gives it" {
+  let src = b"fn parsed(s: String) -> Result<Int, String> = Ok(1)\nfn f(s: String) -> Result<Int, String> = { let n = parsed(s)?; Ok(n + s.len()) }\n";
+  let sites = |m: Module|
+    picked_in(m, |e: Expr| match e { EPerform(p) -> p.op.name == b"len", _ -> false }).map(
+      expr_span,
+    ).map(|at: Span| at.site);
+  let written = sites(numbered_module(parse(src).node));
+  assert_eq(written.len(), 1);
+  match analyse_pulling_std([{ name: b"m", src: src }], []).out {
+    Refused(ds) -> panic(String::of_bytes_lossy(Bytes::concat_all(ds.map(|d: Diag| d.message)))),
+    Analysed(w) -> assert_eq(sites(w.mods.get(0).module), written),
+  }
+}
 
 test "the emitter's root keys cover every root and no two share one" {
   let src = b"fn pos(x: Int) -> Bool = x > 0\nfn f(x: Int) -> Int requires pos(x) ensures x >= 0 = x\ntest \"t\" { assert_eq(f(1), 1) }\nlaw \"l\" forall (x: Int) { f(x) == x }";

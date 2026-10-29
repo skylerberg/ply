@@ -2,22 +2,24 @@
 
 import compiler.syntax.parsing (Span, Ident, QName, Input, Parser, Parsed, SoFar, ParseDiag, Label,
                                 Eaten, ParseStart, span_to, dummy_span, no_ident, no_qname, bare,
-                                qualified, unexpected, unknown_deriver, error_at, error_at_and,
-                                push_diag, error_here, unclosed, token_kind, token_kind_at,
-                                current_span, span_at, previous_span, at_token, at_eof,
-                                at_ident_text, is_ident, is_str, starts_upper, advance, bump, eat,
-                                expect, expect_close, expect_ident, expect_gt, with_no_brace,
-                                fresh_item, start, qname, comma_list, parsed_or, failed,
-                                token_lparen, token_rparen, token_lbrace, token_rbrace,
-                                token_lbracket, token_rbracket, token_comma, token_colon,
-                                token_coloncolon, token_dot, token_eq, token_lt, token_gt,
-                                token_underscore, token_ge, token_pipe, token_slash, token_arrow,
-                                token_hashbracket, at_pos, keyword_pub, keyword_fn, keyword_type,
-                                keyword_effect, keyword_nondet, keyword_test, keyword_import,
-                                dump_node, erase_spans, dump_count, dump_presence, dump_payload,
-                                dump_word, dump_bool, dump_list, dump_opt, dump_ident, dump_qname,
-                                dump_diags, Doc, doc_at, module_doc, token_between, dump_doc,
-                                primary_span_of, span_bin, ident_bin, span_between, prelude_binder)
+                                made_at, role_case_at_param, role_case_identity_param,
+                                role_case_at_type, role_case_identity_type, qualified, unexpected,
+                                unknown_deriver, error_at, error_at_and, push_diag, error_here,
+                                unclosed, token_kind, token_kind_at, current_span, span_at,
+                                previous_span, at_token, at_eof, at_ident_text, is_ident, is_str,
+                                starts_upper, advance, bump, eat, expect, expect_close,
+                                expect_ident, expect_gt, with_no_brace, fresh_item, start, qname,
+                                comma_list, parsed_or, failed, token_lparen, token_rparen,
+                                token_lbrace, token_rbrace, token_lbracket, token_rbracket,
+                                token_comma, token_colon, token_coloncolon, token_dot, token_eq,
+                                token_lt, token_gt, token_underscore, token_ge, token_pipe,
+                                token_slash, token_arrow, token_hashbracket, at_pos, keyword_pub,
+                                keyword_fn, keyword_type, keyword_effect, keyword_nondet,
+                                keyword_test, keyword_import, dump_node, erase_spans, dump_count,
+                                dump_presence, dump_payload, dump_word, dump_bool, dump_list,
+                                dump_opt, dump_ident, dump_qname, dump_diags, Doc, doc_at,
+                                module_doc, token_between, dump_doc, primary_span_of, span_bin,
+                                ident_bin, span_between, prelude_binder)
 import std.bin
 import std.list
 import compiler.syntax.lexer (TokenKind, Token, Identifier, StringLiteral, InterpolatedHead,
@@ -115,6 +117,8 @@ pub type SpecKind = | SRequires | SEnsures | SCost | SSpace
 derive bin for SpecKind
 
 pub type SpecClause = { kind: SpecKind, expr: Expr, span: Span }
+
+pub fn result_name() -> Bytes = b"result"
 
 /// `returns fresh`, or `returns xs`: what the answer may share with the arguments. The cost checker
 /// shows it of the body, and a caller in another package reads it in place of the body.
@@ -228,6 +232,7 @@ pub type OpDef = {
   resource_param: Bool,
   ty_params: List<Ident>,
   params: List<TypeExpr>,
+  param_names: List<Ident>,
   /// The places of the parameters written `keep`, which the handler takes.
   kept: List<Int>,
   ret: TypeExpr,
@@ -1704,30 +1709,32 @@ fn record_docs(input: Input, t: TypeExpr) -> List<FieldDoc> / {abort.raise} =
 
 // --- `effect` ---------------------------------------------------------------
 
-/// `name: Type` is allowed for documentation; only the type is part of the signature.
-pub fn op_param(input: Input, parser: Parser) -> Result<Parsed<TypeExpr>, Parser> / {abort.raise} = {
-  let { parser, node: p } = kept_op_param(input, parser)?;
-  Ok({ parser: parser, node: p.ty })
-}
+type OpParam = { name: Option<Ident>, keep: Bool, ty: TypeExpr }
 
-/// An operation's parameter, its documentation name dropped, and whether it is written `keep`: the
-/// handler takes what it is handed.
-fn kept_op_param(
-  input: Input,
-  parser: Parser,
-) -> Result<Parsed<{ keep: Bool, ty: TypeExpr }>, Parser> / {abort.raise} = {
+/// An operation's parameter: its type, the name it may be written with for documentation, and
+/// whether it is written `keep`: the handler takes what it is handed.
+fn op_param(input: Input, parser: Parser) -> Result<Parsed<OpParam>, Parser> / {abort.raise} = {
   let named = (is_ident(input, parser) || at_token(input, parser, token_underscore()))
     && token_kind_at(input, parser, 1) == token_colon();
+  let name = match token_kind(input, parser) {
+    Identifier(n) -> if named { Some({ name: n, span: current_span(input, parser) }) }
+    else { None },
+    _ -> None,
+  };
   let p2 = if named { bump(input, bump(input, parser)) } else { parser };
   let keep = at_ident_text(input, p2, b"keep") && starts_type(input, p2, 1);
   let p3 = if keep { advance(input, p2).parser } else { p2 };
   let { parser, node: t } = ty(input, p3)?;
-  Ok({ parser: parser, node: { keep: keep, ty: t } })
+  Ok({ parser: parser, node: { name: name, keep: keep, ty: t } })
 }
 
 /// The places among `params` of those written `keep`.
-fn kept_places(params: List<{ keep: Bool, ty: TypeExpr }>) -> List<Int> =
+fn kept_places(params: List<OpParam>) -> List<Int> =
   range(0, params.len()).filter(|i: Int| match params.at(i) { Some(p) -> p.keep, None -> false })
+
+fn param_names(params: List<OpParam>) -> List<Ident> =
+  params.fold([], |acc: List<Ident>, p: OpParam|
+    match p.name { Some(n) -> acc.push(n), None -> acc })
 
 fn op_resource_param(input: Input, parser: Parser) -> Result<Parsed<Bool>, Parser> / {abort.raise} =
   if !at_token(input, parser, token_lbracket()) { Ok({ parser: parser, node: false }) } else {
@@ -1778,7 +1785,7 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
       token_lparen(),
       b"`(` to start the operation parameters",
     )?;
-    let { parser, node: ps } = comma_list(input, parser, token_rparen(), op_param)?;
+    let { parser, node: written } = comma_list(input, parser, token_rparen(), op_param)?;
     let { parser, node: cl } = expect_close(
       input,
       parser,
@@ -1803,7 +1810,8 @@ fn raise_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
           mode: MRaise,
           resource_param: false,
           ty_params: [],
-          params: ps,
+          params: written.map(|p: OpParam| p.ty),
+          param_names: param_names(written),
           kept: [],
           ret: TUnit({ span: cl }),
           doc: doc_at(input, st.node.start),
@@ -1831,8 +1839,7 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
     token_lparen(),
     b"`(` to start the operation parameters",
   )?;
-  let { parser, node: written } = comma_list(input, parser, token_rparen(), kept_op_param)?;
-  let ps = written.map(|p: { keep: Bool, ty: TypeExpr }| p.ty);
+  let { parser, node: written } = comma_list(input, parser, token_rparen(), op_param)?;
   let { parser, .. } = expect_close(
     input,
     parser,
@@ -1849,7 +1856,8 @@ fn moded_op(input: Input, parser: Parser) -> Result<Parsed<OpDef>, Parser> / {ab
       mode: m,
       resource_param: rp,
       ty_params: tps,
-      params: ps,
+      params: written.map(|p: OpParam| p.ty),
+      param_names: param_names(written),
       kept: kept_places(written),
       ret: ret,
       doc: doc_at(input, start.start),
@@ -2225,8 +2233,21 @@ pub fn test_run(d: TestDef) -> Expr =
 /// What a test over cases answers its cases by: each one's label and identity.
 pub fn test_listing(c: Cases) -> Expr = listing(c.binder, c.ty, c.table, c.label, c.for_span)
 
-/// The names a test over cases is entered with, in the order its root takes them.
-pub fn case_params() -> List<Bytes> = [case_at(), case_identity()]
+/// The parameters a test over cases is entered with, in the order its root takes them.
+pub fn case_params(c: Cases) -> List<{ name: Ident, ty: TypeExpr }> = {
+  let made = |name: Bytes, role: Int| { name: name, span: made_at(c.in_span, c.in_span, role) };
+  let named = |name: Bytes, role: Int| {
+    let at = made_at(c.in_span, c.in_span, role);
+    TCon({ span: at, name: bare({ name: name, span: at }), args: [], labels: [], rows: [] })
+  };
+  [
+    { name: made(case_at(), role_case_at_param()), ty: named(b"Int", role_case_at_type()) },
+    {
+      name: made(case_identity(), role_case_identity_param()),
+      ty: named(b"Bytes", role_case_identity_type()),
+    },
+  ]
+}
 
 // --- `item` -----------------------------------------------------------------
 

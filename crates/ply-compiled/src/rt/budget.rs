@@ -5,13 +5,6 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-/// What [`Ctx::fuel`] holds: more calls than any run makes.
-pub const RELEASED_FUEL: i64 = i64::MAX / 2;
-
-/// Nothing. The released compiler's code calls it once [`Ctx::fuel`] runs out, which this runtime
-/// never lets it do.
-pub unsafe extern "C" fn rt_no_fuel(_ctx: *mut Ctx) {}
-
 /// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
 /// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
 /// otherwise makes room below the floor of the stack it runs on and lowers the floor to match.
