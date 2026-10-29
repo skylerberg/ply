@@ -5,36 +5,32 @@
 
 import std.bin
 import std.bytes
-import std.bytes (ascii_of_int)
-import compiler.syntax.parsing (Ident, Span, span_between, prelude_binder)
+import compiler.syntax.parsing (Ident, Span, prelude_binder)
 import compiler.syntax.type_syntax (Mode, MRead, MWrite, MRaise, MBad, mode_text)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, int_type,
-                             bool_type, float_type, decimal_type, bytes_type, fn_type, row_empty,
-                             unit_type)
-import compiler.emit.typing (Typed, Filings, filings, no_filings, filed_as, unknown_type)
-import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, FnDef, TestDef, LawDef, Binder,
-                              INames, IModule, IAlias, test_run)
-import compiler.syntax.exprs (Param, freed_by, case_at, case_identity, scheduler_module)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, Scheme, Row,
+                             Atom, int_type, bool_type, float_type, decimal_type, bytes_type,
+                             fn_type, row_empty, unit_type)
+import compiler.emit.typing (Typed, Filings, filings, no_filings, filed_as, unknown_type, body_at)
+import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, FnDef, TestDef, LawDef, INames, IModule, IAlias)
+import compiler.syntax.exprs (freed_by, scheduler_module)
 import compiler.check.resolve.tables (ParsedModule, Resolved, ModuleBinding, Binding, lookup,
                                       ValueSpace, qualify)
 import compiler.check.resolve.scopes (of_module, of_binder)
 import compiler.expand.rewrite (program_wide)
-import compiler.check.typed (TypedBody)
-import compiler.check.infer (EmitFacts, RootFacts, expanded_mods, no_root_facts, item_owner)
-import compiler.check.infer.checker (TypedSite, LabelSite, MemberSite, UpdateShape, TrySite,
-                                     WitnessOp, WitnessRef, RowSite, Builtin, builtins, EffectInfo,
-                                     OpInfo, binder_key, ReleaseSite)
-import compiler.check.infer.definitions (Extern, MachineCall, machine_calls, parsed_natives)
+import compiler.check.typed
+import compiler.check.typed (TypedBody, TypedParam, BodyPart, WholeBody, TestRun, part_key,
+                             body_retyped)
+import compiler.check.infer (RootFacts, item_owner, facts_by_owner)
+import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OpInfo)
+import compiler.check.infer.definitions (MachineCall, machine_calls, parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.seam (WalkedFacts, walked_facts_bin, ctors_read)
 import compiler.front.rows (Rows, KnownDefRow, CtorRow, EffectRow, OpRow)
 import compiler.front.published (facts_read, rows_of, walked_facts)
-import compiler.emit.code (Code, lower_fn, Releasing)
-import compiler.emit.reps (Def, Imported, Ctors, SumCtor, Ty, TyOpen, TyBytes, EffectName, OpMode,
-                           EmitParam, ctors_of, ctor_sums, sig_of, def_entry, param_kinds,
-                           param_types, typed_kind, type_vars, with_released)
-import compiler.emit.c (Kind, KBoxed, KInt, KBool, KFloat, KDec, bytes_join_dots)
-import compiler.emit.keys (RootKey, Named, LawBody, test_key, law_key, law_owner)
+import compiler.emit.code (Code, lower_fn)
+import compiler.emit.reps (Def, Imported, Ctors, SumCtor, TyOpen, EffectName, OpMode, EmitParam, ctors_of, ctor_sums, sig_of, def_entry, type_vars, with_released, kind_of, substituted)
+import compiler.emit.c (KInt, KBool, KFloat, KDec, bytes_join_dots)
+import compiler.emit.keys (RootKey, Named, LawBody, test_key, law_key)
 
 /// What the emitter hands the lowering for every root of one module: `builtins` are the natives the
 /// program declares, `declared` the scheme the prelude declares each builtin at, by the same
@@ -54,8 +50,7 @@ pub type Setting = {
 
 /// A definition of the module as a root: its key, where its text starts, its parameters as the
 /// emitter holds them (each label a trailing `Int`), the types its scheme gives them and its answer
-/// (unknown where none speaks), its body lowered to `Code`, and what the checker filed for its
-/// item's nodes.
+/// (unknown where none speaks), its body lowered to `Code`, and what an entry's body performs.
 pub type Root = {
   key: RootKey,
   base: Int,
@@ -63,7 +58,7 @@ pub type Root = {
   types: List<Type>,
   answer_ty: Type,
   code: Code,
-  filed: Filings,
+  performs: Row,
 }
 
 /// Module `module` of the analysed program `a` as the emitter reads it, and each definition, test
@@ -115,7 +110,7 @@ pub fn settings_in<b | e>(
   match facts_read(rows, walked, None, mods) {
     Err(why) -> Err(why),
     Ok(facts) -> {
-      let expanded = expanded_mods(mods, facts.elaboration, a.r.signatures);
+      let expanded = mods;
       let pure = facts.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
       let schemes = rows.defs.fold(Map::new(), |acc: Map<Bytes, Scheme>, row: KnownDefRow|
         acc.insert(row.name, row.scheme));
@@ -136,7 +131,7 @@ pub fn settings_in<b | e>(
       let declared = declared_schemes();
       let effects = declared_effects(a.r, checked_operations(a.checked.effects));
       let machine = machine_calls(parsed_natives(expanded));
-      let owned = facts_by_item(facts);
+      let owned = facts_by_owner(facts);
       Ok(
         wanted.filter(|i: Int| i < expanded.len()).map(|i: Int| {
           let m = expanded.get(i);
@@ -152,7 +147,7 @@ pub fn settings_in<b | e>(
                 expanded,
                 m.module,
                 defs_of,
-                facts.elaboration.members.filter(|s: MemberSite| s.module == i),
+                facts.members.filter(|s: MemberSite| s.module == i),
               ).concat(
                 scheduler_imported(defs_of),
               ),
@@ -178,131 +173,93 @@ pub fn settings_in<b | e>(
     },
   }
 
-/// What the checker filed of each item `facts` holds sites of, by the item's owner.
-pub fn facts_by_item(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
-  let into = |m: Map<Bytes, RootFacts>, owner: Bytes, add: (RootFacts) -> RootFacts|
-    m.insert(
-      owner,
-      add(match m.get(owner) { Some(f) -> f, None -> { ..no_root_facts(), types: facts.types } }),
-    );
-  let e = facts.elaboration;
-  let labelled = facts.label_sites.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: LabelSite|
-    into(m, x.owner, |f: RootFacts| { ..f, label_sites: f.label_sites.push(x) }));
-  let updated = e.updates.fold(labelled, |m: Map<Bytes, RootFacts>, x: UpdateShape|
-    into(m, x.owner, |f: RootFacts| { ..f, updates: f.updates.push(x) }));
-  let witnessed = e.ops.fold(updated, |m: Map<Bytes, RootFacts>, x: WitnessOp|
-    into(m, x.owner, |f: RootFacts| { ..f, ops: f.ops.push(x) }));
-  let referenced = e.refs.fold(witnessed, |m: Map<Bytes, RootFacts>, x: WitnessRef|
-    into(m, x.owner, |f: RootFacts| { ..f, refs: f.refs.push(x) }));
-  let tried = e.tries.fold(referenced, |m: Map<Bytes, RootFacts>, x: TrySite|
-    into(m, x.owner, |f: RootFacts| { ..f, tries: f.tries.push(x) }));
-  let released = e.releases.fold(tried, |m: Map<Bytes, RootFacts>, x: ReleaseSite|
-    into(m, x.owner, |f: RootFacts| { ..f, releases: f.releases.push(x) }));
-  let called = e.members.fold(released, |m: Map<Bytes, RootFacts>, x: MemberSite|
-    into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
-  let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite|
-    into(m, x.owner, |f: RootFacts| { ..f, typed: f.typed.push(x) }));
-  let rowed = facts.rows.fold(typed, |m: Map<Bytes, RootFacts>, x: RowSite|
-    into(m, x.owner, |f: RootFacts| { ..f, rows: f.rows.push(x) }));
-  facts.bodies.fold(rowed, |m: Map<Bytes, RootFacts>, x: TypedBody<Bytes>|
-    into(m, x.owner, |f: RootFacts| { ..f, bodies: f.bodies.push(x) }))
-}
-
-/// What the checker filed for the nodes of the item `owner` names, by site; nothing for an item it
-/// filed nothing of.
+/// What the checker filed of the item `owner` names; nothing for an item it filed nothing of.
 pub fn filings_of(owned: Map<Bytes, RootFacts>, owner: Bytes) -> Filings / {abort.raise} =
   match owned.get(owner) { None -> no_filings(), Some(f) -> filings(f) }
 
-/// Where the body of an item, of whose nodes the checker filed `filed`, lets go of the resources it
-/// owns, its parameters `params`.
-pub fn releasing_of(filed: Filings, params: List<Param>) -> Releasing =
-  { sites: filed.releases, params: params.map(|p: Param| binder_key(p.name.span)) }
+/// A body as a root lowers it: its parameters as the root holds them, each label parameter a
+/// trailing `Int`, and its code.
+pub type RootBody = { params: List<EmitParam>, code: Code }
+
+/// Body `part` of the item the check filed `filed` of, whose text starts at `base`, at the type
+/// arguments `args`, none for the body as written. Panics where the check settled no such body: a
+/// checked program's every body settles.
+pub fn settled_at(
+  filed: Filings,
+  part: BodyPart,
+  base: Int,
+  args: List<Type>,
+) -> TypedBody<Type> / {abort.raise} =
+  match body_at(filed, part, base) {
+    None -> unlowered(b"the check settled no body for its ".concat(part_key(part))),
+    Some(found) -> if args.len() == 0 { found } else {
+      body_retyped(found, (), {
+        ty: |t: Type, u: Unit| { ty: substituted(t, args), state: u },
+        row: |r: Row| r,
+        atom: |a: Atom| a,
+        span: |sp: Span| sp,
+      }).out
+    },
+  }
+
+/// The parameters of a root of body `b`, with the label parameters `labels` after its own.
+pub fn root_params(b: TypedBody<Type>, labels: List<Bytes>) -> List<EmitParam> =
+  b.params.map(|q: TypedParam<Type>| {
+    let held = kind_of(q.ty);
+    { name: q.name, kind: held.kind, ty: held.ty, of: Some(q.ty), lambda: None }
+  }).concat(labels.map(|n: Bytes| { name: n, kind: KInt, ty: TyOpen([]), of: None, lambda: None }))
+
+/// The code body `b` of the item the check filed `filed` of lowers to, with the label parameters
+/// `labels` after its own. Panics where a part of it does not lower: a checked body always does.
+pub fn body_code(b: TypedBody<Type>, labels: List<Bytes>, filed: Filings) -> Code / {abort.raise} = {
+  let l = lower_fn(b.params, labels, b.body, filed.releases);
+  match l.failed.at(0) { Some(why) -> unlowered(why), None -> l.code }
+}
+
+/// Body `part` as `settled_at` reads it, lowered as a root.
+pub fn root_body(
+  filed: Filings,
+  part: BodyPart,
+  base: Int,
+  labels: List<Bytes>,
+  args: List<Type>,
+) -> RootBody / {abort.raise} = {
+  let b = settled_at(filed, part, base, args);
+  { params: root_params(b, labels), code: body_code(b, labels, filed) }
+}
+
+fn unlowered<a>(why: Bytes) -> a / {abort.raise} =
+  panic(String::of_bytes_lossy(b"a checked body does not lower: ".concat(why)))
+
+/// Body `part` of an item as root `key`, its text starting at `base`, answering `answer_ty`.
+fn body_root(
+  key: RootKey,
+  filed: Filings,
+  part: BodyPart,
+  base: Int,
+  labels: List<Bytes>,
+  answer_ty: Type,
+) -> Root / {abort.raise} = {
+  let b = root_body(filed, part, base, labels, []);
+  {
+    key: key,
+    base: base,
+    params: b.params,
+    types: b.params.map(param_type),
+    answer_ty: answer_ty,
+    code: b.code,
+    performs: row_empty(),
+  }
+}
 
 /// Test `t` of `module` as the root a build makes of it: its run, which over cases takes a case's
 /// place and identity.
-fn test_root(module: Bytes, filed: Filings, t: TestDef) -> Root / {abort.raise} = {
-  let names = if t.cases == None { [] } else { [case_at(), case_identity()] };
-  let ps = params_carried(
-    names,
-    if t.cases == None { [] }
-    else { [Some({ kind: KInt, ty: TyOpen([]) }), Some({ kind: KBoxed, ty: TyBytes })] },
-    if t.cases == None { [] } else { [Some(int_type()), Some(bytes_type())] },
-  );
-  {
-    key: test_key(module, t.name),
-    base: t.span.start,
-    params: ps,
-    types: ps.map(param_type),
-    answer_ty: unit_type(),
-    code: lower_fn(
-      names,
-      [],
-      filed.labels,
-      test_run(t),
-      of_binder(module),
-      releasing_of(filed, []),
-    ).code,
-    filed: filed,
-  }
-}
+fn test_root(module: Bytes, filed: Filings, t: TestDef) -> Root / {abort.raise} =
+  body_root(test_key(module, t.name), filed, TestRun, t.span.start, [], unit_type())
 
 /// Law `l` of `module` as the root a build makes of its body, its binders its parameters.
-fn law_root_of(module: Bytes, filed: Filings, l: LawDef) -> Root / {abort.raise} = {
-  let ps = law_params(law_owner(module, l.name), filed, l.binders);
-  {
-    key: law_key(module, l.name, LawBody),
-    base: l.span.start,
-    params: ps,
-    types: ps.map(param_type),
-    answer_ty: bool_type(),
-    code: lower_fn(
-      l.binders.map(|b: Binder| b.name.name),
-      [],
-      filed.labels,
-      l.body,
-      of_binder(module),
-      releasing_of(filed, []),
-    ).code,
-    filed: filed,
-  }
-}
-
-/// The binders of law `owner` as its roots take them, each of the type the checker filed for it and
-/// held as a value of that type is. Panics on a binder it filed nothing for, as it files every one.
-pub fn law_params(
-  owner: Bytes,
-  filed: Filings,
-  binders: List<Binder>,
-) -> List<EmitParam> / {abort.raise} = {
-  let typed = filed.typed;
-  match binders.find(|b: Binder| !typed.contains(b.span.site)) {
-    Some(b) ->
-      panic(
-        String::of_bytes_lossy(
-          Bytes::concat_all([
-            b"a law's binder the check filed nothing for: `",
-            owner,
-            b"` site ",
-            ascii_of_int(b.span.site),
-            b" at ",
-            ascii_of_int(b.span.start),
-            b":",
-            ascii_of_int(b.span.end),
-          ]),
-        ),
-      ),
-    None ->
-      params_carried(
-        binders.map(|b: Binder| b.name.name),
-        binders.map(|b: Binder| Some(typed_kind(typed, b.span))),
-        binders.map(|b: Binder|
-          match typed.get(b.span.site) {
-            Some(t) -> if t.ty == unknown_type() { None } else { Some(t.ty) },
-            None -> None,
-          }),
-      ),
-  }
-}
+fn law_root_of(module: Bytes, filed: Filings, l: LawDef) -> Root / {abort.raise} =
+  body_root(law_key(module, l.name, LawBody), filed, typed::LawBody, l.span.start, [], bool_type())
 
 /// Definition `def` of `module` as a root, as the emitter prepares one.
 fn root_of(
@@ -312,29 +269,14 @@ fn root_of(
   def: FnDef,
 ) -> Root / {abort.raise} = {
   let full = qualify(module, def.name.name);
-  let sig = sig_of(schemes, full);
-  let names = def.params.map(|p: Param| p.name.name);
-  let labels = def.generics.labels.map(|i: Ident| i.name);
-  let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k)).concat(
-    labels.map(|_: Bytes| Some({ kind: KInt, ty: TyOpen([]) })),
-  );
-  let ps = params_carried(names.concat(labels), kinds, param_types(def, sig));
-  {
-    key: Named(full),
-    base: def.span.start,
-    params: ps,
-    types: ps.map(param_type),
-    answer_ty: match sig { Some(s) -> s.ret, None -> unknown_type() },
-    code: lower_fn(
-      names,
-      labels,
-      filed.labels,
-      def.body,
-      of_binder(module),
-      releasing_of(filed, def.params),
-    ).code,
-    filed: filed,
-  }
+  body_root(
+    Named(full),
+    filed,
+    WholeBody,
+    def.span.start,
+    def.generics.labels.map(|i: Ident| i.name),
+    match sig_of(schemes, full) { Some(s) -> s.ret, None -> unknown_type() },
+  )
 }
 
 /// The type parameter `p` holds: the one its definition's scheme gives it, else the scalar the
@@ -439,29 +381,29 @@ pub fn declared_at(s: Setting, name: Bytes, args: List<Type>) -> Option<CallType
         });
       match sc.ty {
         TyFn(f) ->
-          Some({ params: f.params.map(|p: Type| substituted(p, by)), ret: substituted(f.ret, by) }),
+          Some({ params: f.params.map(|p: Type| instantiated(p, by)), ret: instantiated(f.ret, by) }),
         _ -> None,
       }
     },
   }
 
 /// `ty` with each variable `by` types written as that type.
-fn substituted(ty: Type, by: Map<Int, Type>) -> Type =
+fn instantiated(ty: Type, by: Map<Int, Type>) -> Type =
   match ty {
     TyVar(v) -> match by.get(v) { Some(t) -> t, None -> ty },
-    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| substituted(a, by)) }),
+    TyCon(c) -> TyCon({ ..c, args: c.args.map(|a: Type| instantiated(a, by)) }),
     TyFn(f) ->
       TyFn({
         ..f,
-        params: f.params.map(|p: Type| substituted(p, by)),
-        ret: substituted(f.ret, by),
+        params: f.params.map(|p: Type| instantiated(p, by)),
+        ret: instantiated(f.ret, by),
       }),
-    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: substituted(f.ty, by) })),
+    TyRecord(fs) -> TyRecord(fs.map(|f: Field| { ..f, ty: instantiated(f.ty, by) })),
     TyNominal(x) ->
       TyNominal({
         ..x,
-        args: x.args.map(|a: Type| substituted(a, by)),
-        fields: x.fields.map(|f: Field| { ..f, ty: substituted(f.ty, by) }),
+        args: x.args.map(|a: Type| instantiated(a, by)),
+        fields: x.fields.map(|f: Field| { ..f, ty: instantiated(f.ty, by) }),
       }),
   }
 
@@ -523,21 +465,6 @@ pub fn defs_in(
 ) -> List<Def> =
   m.items.fold([], |acc: List<Def>, item: Item|
     match item { IFn(d) -> acc.push(def_entry(module, d, pure, schemes)), _ -> acc })
-
-/// Parameters `names` held as `kinds` say, and of the type `types` gives each.
-pub fn params_carried(
-  names: List<Bytes>,
-  kinds: List<Option<{ kind: Kind, ty: Ty }>>,
-  types: List<Option<Type>>,
-) -> List<EmitParam> =
-  range(0, names.len()).map(|i: Int|
-    {
-      name: match names.at(i) { Some(n) -> n, None -> b"" },
-      kind: match kinds.at(i) { Some(Some(p)) -> p.kind, _ -> KInt },
-      ty: match kinds.at(i) { Some(Some(p)) -> p.ty, _ -> TyOpen([]) },
-      of: match types.at(i) { Some(t) -> t, None -> None },
-      lambda: None,
-    })
 
 /// Every effect the program declares, written as a clause the lowering writes names it, by its
 /// program-wide name, with its operations as `operations` holds them.

@@ -3,14 +3,14 @@
 //! broken invariant. Nothing here calls the lowering's recursion, which `emit.lower` alone holds.
 
 import compiler.emit.code
-import compiler.emit.code (Code, CodeArm, Capture)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, named_type)
-import compiler.emit.typing (Typed, Filings, unknown_type)
+import compiler.emit.code (Code, CodeArm, Capture, NDef, NBuiltin, NCtor)
+import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, FunctionType,
+                             Row, named_type)
+import compiler.emit.typing (Typed, unknown_type)
 import compiler.syntax.parsing (Span, dummy_span)
-import std.bytes (ascii_of_int)
 import compiler.emit.reps (EmitParam)
 import compiler.emit.answer (Need)
-import compiler.emit.keys (RootKey, Evidence, root_name, root_text)
+import compiler.emit.keys (RootKey, Evidence)
 import compiler.emit.evidence (Own)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, Var, Arg, AVar, AInt, ABool,
                           AFloat, ANum, AChar, AZero, Val, Pack, Native, Inst, Let, Do, Decl,
@@ -34,17 +34,15 @@ import compiler.emit.tir.statics (StaticDef, StaticLaid, SPlain, WAddress, WByte
 /// lowered reads, or nowhere in the root's own, and `captured` the slots of that frame that hold
 /// what the frame around it handed in. `lends` is whether the root lends its own lambdas,
 /// as read under this setting, and `written` what it lends then: the lambdas its body writes and
-/// the definitions it hands as values, read once for the whole body. `filed` is what the checker
-/// filed for the nodes of the body being lowered: the root's item's, or its lender's in a lambda run
-/// in place. `words` are the evidence words the body holds, innermost first; `rows` and `labels`
-/// what the root's key fills its definition's row variables with and how many label parameters the
-/// definition has, which the checker's rows are read at; `label_names` those parameters' names in
+/// the definitions it hands as values, read once for the whole body. `words` are the evidence words
+/// the body holds, innermost first; `rows` and `labels` what the root's key fills its definition's
+/// row variables with and how many label parameters the definition has, which the rows its nodes
+/// hold are read at; `label_names` those parameters' names in
 /// their order, which a label a call fills is read by; `label_values` the value each label of the
 /// root's numbering has in the function being lowered, where it holds one; and `handed` the root's
 /// parameters past its definition's, which a restart hands back as they are.
 pub type Context = {
   setting: Setting,
-  filed: Filings,
   key: RootKey,
   full: Bytes,
   base: Int,
@@ -75,6 +73,8 @@ pub type Context = {
   /// The counted blocks of the heap instances the body's words live in, which a closure holding
   /// those words holds too.
   kept: List<Arg>,
+  /// What an entry's body performs, which the runtime answers where nothing of the program does.
+  performs: Row,
 }
 
 /// The instance of the `handle` whose clauses or body a function is, which holds that handle's
@@ -184,9 +184,10 @@ pub type Frame = {
   params: Int,
   size: Int,
   captures: List<Capture>,
-  resumes: Bool,
+  /// What resuming the continuation the frame's last parameter is performs, where it is one.
+  resumes: Option<Row>,
   body: Code,
-  ty: Option<Type>,
+  ty: FunctionType,
   words: List<Own>,
   held: Held,
 }
@@ -322,50 +323,33 @@ pub fn noted(st: Lowering, need: Need) -> Lowering =
   if st.links.needs.contains(need) { st }
   else { { ..st, links: { ..st.links, needs: st.links.needs.push(need) } } }
 
-/// What the checker filed for the node at `at` of the body being lowered, or of its lender's in a
-/// lambda run in place. A node of a kind the checker files for always has one; `None` is a
-/// defect in Ply, never a cue to read something else.
-pub fn filed(cx: Context, at: Span) -> Option<Typed> = cx.filed.typed.get(at.site)
+/// What a read of a definition, a constructor or a builtin, `c`, holds: its type and the type
+/// arguments it fills.
+pub fn read_typed(c: Code) -> Typed =
+  {
+    ty: c.ty,
+    args: match c.node {
+      NDef(d) -> d.args,
+      NBuiltin(b) -> b.args,
+      NCtor(k) -> k.args,
+      _ -> [],
+    },
+  }
 
-/// Panics over `what` at `at`, which the checker filed nothing for, naming the owner, the site and
-/// the place.
-pub fn unfiled<a>(cx: Context, what: Bytes, at: Span) -> a / {abort.raise} =
-  unreachable(
-    Bytes::concat_all([
-      what,
-      b" the check filed nothing for: `",
-      match cx.lender { Some(l) -> root_text(root_name(l.owner)), None -> cx.full },
-      b"` site ",
-      ascii_of_int(at.site),
-      b" at ",
-      ascii_of_int(at.start),
-      b":",
-      ascii_of_int(at.end),
-    ]),
-  )
-
-/// `l`, the value of slot `slot`, bound as `name`, read at `at`: where the slot is one the frame was
-/// handed or holds a word, taken at the type the checker filed for the read, else at its own, since
-/// a body another root lends the lambda to holds a capture as a word of no type, and a
-/// specialisation is handed a parameter of its full type as the call crosses it, a word where a
-/// variable the call does not carry stands; any other slot holds the type its binder gave it.
+/// `l`, the value of slot `slot`, bound as `name`, read at `at` as a value of type `ty`: where the
+/// slot is one the frame was handed or holds a word, taken at that type, since a body another root
+/// lends the lambda to holds a capture as a word of no type, and a specialisation is handed a
+/// parameter of its full type as the call crosses it, a word where a variable the call does not
+/// carry stands; any other slot holds the type its binder gave it.
 pub fn read_taken(
   cx: Context,
   l: Lowered,
   name: Bytes,
   slot: Int,
+  ty: Type,
   at: Span,
-) -> Lowered / {abort.raise} = {
-  let captured = cx.captured.contains(slot);
-  if !captured && rep_of_arg(l.arg) != RWord { l } else {
-    match filed(cx, at) {
-      None -> if captured {
-        unfiled(cx, Bytes::concat_all([b"a read of capture `", name, b"`"]), at)
-      } else { taken_as(cx, l, type_of(l.arg), at) },
-      Some(t) -> taken_as(cx, l, if t.ty == unknown_type() { type_of(l.arg) } else { t.ty }, at),
-    }
-  }
-}
+) -> Lowered / {abort.raise} =
+  if !cx.captured.contains(slot) && rep_of_arg(l.arg) != RWord { l } else { taken_as(cx, l, ty, at) }
 
 /// The type an operand holds.
 pub fn type_of(a: Arg) -> Type =

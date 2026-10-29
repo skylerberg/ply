@@ -47,6 +47,7 @@ import compiler.check.infer.derivability (HoldsFunction, HoldsHandle, Unconstrai
 import compiler.expand.rewrite.shared (count_in)
 import std.bytes
 import std.bytes (ascii_of_int)
+import std.list (zip)
 import std.option
 import std.prelude_source
 import std.string
@@ -85,7 +86,7 @@ import compiler.check.infer.expr (site_for, resolved_sites, site_among, report_u
                                   refuse_growth, Taken, written_as, as_written, holds_fn,
                                   atom_written, numeric_of, ordered_vars, resolve_op, body_filed)
 import compiler.check.typed (WholeBody, ClauseBody, MeasureBody, TestRun, CaseListing, LawGuard,
-                             LawBody)
+                             LawBody, TypedParam)
 import compiler.check.owned
 import compiler.check.owned (Taking)
 import compiler.check.infer.resources (resource_type, release_atoms)
@@ -2123,7 +2124,15 @@ fn check_fn_body(outer: Checker, def: FnDef, signature: Signature) -> Walk / {ab
   let walked: Inferred = infer_whole(bound, def.body, hint_of(signature.ret));
   let body: Inferred = {
     ..walked,
-    checker: body_filed(walked.checker, bound.walking, WholeBody, def.span.start, walked, def.body),
+    checker: body_filed(
+      walked.checker,
+      bound.walking,
+      WholeBody,
+      def.span.start,
+      params_typed_as(def.params, signature.params),
+      walked,
+      def.body,
+    ),
   };
   let checked: Checker = expect_met(
     body.checker,
@@ -3436,6 +3445,14 @@ pub fn check_tests(checker: Checker, parsed: ParsedModule) -> Checker / {abort.r
                   owner,
                   TestRun,
                   def.span.start,
+                  match def.cases {
+                    None -> [],
+                    Some(_) ->
+                      [
+                        { name: case_at(), ty: int_type(), span: dummy_span() },
+                        { name: case_identity(), ty: bytes_type(), span: dummy_span() },
+                      ],
+                  },
                   ran,
                   test_run(def),
                 ),
@@ -3531,6 +3548,7 @@ fn check_listing(checker: Checker, def: TestDef, cases: Cases) -> Checker / {abo
     checker.walking,
     CaseListing,
     def.span.start,
+    [],
     o,
     test_listing(cases),
   );
@@ -3744,12 +3762,22 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
       ..note_typed(c, def.binders.get(i).span, types.tys.get(i), []),
       env: env_bind(c.env, def.binders.get(i).name.name, monomorphic(types.tys.get(i))),
     });
+  let binders_typed = zip(def.binders, types.tys).map(|b: { first: Binder, second: Type }|
+    { name: b.first.name.name, ty: b.second, span: b.first.name.span });
   let guarded: Checker = match def.guard {
     Some(g) -> {
       let walked: Inferred = infer_whole({ ..bound, performs: [] }, g);
       let o: Inferred = {
         ..walked,
-        checker: body_filed(walked.checker, bound.walking, LawGuard, def.span.start, walked, g),
+        checker: body_filed(
+          walked.checker,
+          bound.walking,
+          LawGuard,
+          def.span.start,
+          binders_typed,
+          walked,
+          g,
+        ),
       };
       let c: Checker = unfilled(
         expect(
@@ -3769,7 +3797,15 @@ fn check_law(outer: Checker, parsed: ParsedModule, def: LawDef) -> Checker / {ab
   let walked: Inferred = infer_whole({ ..guarded, performs: [] }, def.body);
   let body: Inferred = {
     ..walked,
-    checker: body_filed(walked.checker, guarded.walking, LawBody, def.span.start, walked, def.body),
+    checker: body_filed(
+      walked.checker,
+      guarded.walking,
+      LawBody,
+      def.span.start,
+      binders_typed,
+      walked,
+      def.body,
+    ),
   };
   let stated: Checker = expect(
     body.checker,
@@ -4494,6 +4530,11 @@ fn spec_scope(checker: Checker, written: FnDef, env: SpecEnv) -> Checker / {abor
     })
 }
 
+/// `params` at the types `types` gives them, in order.
+fn params_typed_as(params: List<Param>, types: List<Type>) -> List<TypedParam<Type>> =
+  zip(params, types).map(|p: { first: Param, second: Type }|
+    { name: p.first.name.name, ty: p.second, span: p.first.name.span })
+
 fn check_measure(
   checker: Checker,
   def: FnDef,
@@ -4506,7 +4547,15 @@ fn check_measure(
   );
   let o: Inferred = {
     ..walked,
-    checker: body_filed(walked.checker, env.name, MeasureBody, def.span.start, walked, expr),
+    checker: body_filed(
+      walked.checker,
+      env.name,
+      MeasureBody,
+      def.span.start,
+      params_typed_as(def.params, env.params),
+      walked,
+      expr,
+    ),
   };
   let popped: Checker = { ..o.checker, env: env_pop(o.checker.env), walking: checker.walking };
   let c1: Checker = expect(
@@ -4546,6 +4595,18 @@ fn check_clause(
     SSpace -> named(def.params.map(|param: Param| param.space)),
     SCost -> named(def.params.map(|param: Param| param.cost)),
   };
+  let ints = |names: List<Option<Ident>>|
+    names.fold([], |acc: List<TypedParam<Type>>, name: Option<Ident>|
+      match name {
+        Some(k) -> acc.push({ name: k.name, ty: int_type(), span: k.span }),
+        None -> acc,
+      });
+  let clause_params = params_typed_as(def.params, env.params).concat(match clause.kind {
+    SEnsures -> [{ name: result_name(), ty: env.ret, span: dummy_span() }],
+    SRequires -> [],
+    SSpace -> ints(def.params.map(|param: Param| param.space)),
+    SCost -> ints(def.params.map(|param: Param| param.cost)),
+  });
   let outer = with_result.spec_kind;
   let walked: Inferred = infer_whole(
     {
@@ -4564,6 +4625,7 @@ fn check_clause(
       env.name,
       ClauseBody(index),
       def.span.start,
+      clause_params,
       walked,
       clause.expr,
     ),

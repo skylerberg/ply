@@ -8,6 +8,7 @@
 //! `lower#T` and `lift#T`, the roots written for each type that crosses, are `emit.written`'s; a
 //! part of one at another type, `?lower(x)` and `?lift()`, is a call of that type's root here.
 
+import compiler.emit.code (Code, NBuiltin)
 import std.list
 import std.bytes
 import compiler.syntax.parsing (Span, dummy_span)
@@ -15,26 +16,23 @@ import compiler.syntax.type_syntax (MRaise)
 import compiler.syntax.exprs (is_exit_effect, exit_op)
 import compiler.check.types (Type, TyCon, TyVar, TyFn, TyRecord, TyNominal, Field, named_type,
                              int_type, unit_type, bytes_type, string_type, spelled_type, bool_type)
-import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo, RowArguments)
-import compiler.emit.typing (unknown_type, rows_filed_at)
+import compiler.check.infer.checker (prelude_effects, EffectInfo)
+import compiler.emit.typing (unknown_type)
 import compiler.emit.c (Width, width_named, width_index)
 import compiler.emit.roots (builtin_helper)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Root, Written, TypeOp, Lower, Lift, Dup, Worded)
-import compiler.emit.tir (Rep, RInt, RBool, RImm, RWord, RFloat, RNum, RDec, RWide, RAddr, RUnit,
-                          Arg, AVar, OStrings, string_uses, AInt, AZero, Var, Val, Uses, Prim, Get,
-                          PField, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent,
-                          Owned, Static, Fn, Inst, Let, Do, Return, Crossing, Pending, no_links)
+import compiler.emit.tir (Rep, RInt, RBool, RImm, RWord, RFloat, RNum, RDec, RWide, RAddr, RUnit, Arg, AVar, OStrings, string_uses, AInt, AZero, Var, Val, Uses, Prim, Get, PPayload, Pack, Call, Native, Op, OContainer, OHandle, Lent, Owned, Static, Fn, Inst, Let, Return, Crossing, Pending, no_links)
 import compiler.emit.tir.containers (Taken, Length)
 import compiler.emit.tir.strings (Grown)
 import compiler.emit.tir.handling (HandleOp, Unsettled, VarInit, VarRead, VarWrite)
 import compiler.emit.tir.statics (SPlain, SStruct, WRaw, WAddress, WEntry, WBytes, WField, WHead)
 import compiler.emit.release (word_form_heads)
-import compiler.emit.lower.setting (CallTypes, builtin_at, op_mode_of)
+import compiler.emit.lower.setting (CallTypes, op_mode_of)
 import compiler.emit.lower.held (held_as, held_with, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Instanced, unreachable, bound,
-                                 bound_as, done, handed, type_of, pair_words, filed, unfiled, noted,
-                                 static_added)
+                                 bound_as, done, handed, type_of, pair_words, noted, static_added,
+                                 read_typed)
 import compiler.emit.reps (Ctors, SumCtor, OpMode, EffectName, type_vars, runtime_object)
 import compiler.emit.print.counting (never_lifted_fn)
 import compiler.emit.marks (marks_of, marked_key, carried_by, marked_type, function_marks)
@@ -83,7 +81,7 @@ pub fn crossed(
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let at_type = called_at(cx, callee, args);
@@ -110,7 +108,7 @@ pub fn crossed(
       at,
     );
     handed(w, held_as(cx.setting, at_type), at)
-  } else if handler_builtin(name) { handler_var(cx, st, name, args, at) }
+  } else if handler_builtin(name) { handler_var(cx, st, name, args, callee, at) }
   else if name == b"?encode" {
     match args {
       [x] -> encoded(cx, st, x, at_type, true, at),
@@ -141,21 +139,23 @@ fn handler_var(
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match cx.instance {
-    Some(i) -> instance_var(cx, st, i, name, args, at),
+    Some(i) -> instance_var(cx, st, i, name, args, callee, at),
     None -> unreachable(b"a handler variable outside every handle's instance"),
   }
 
-/// Handler builtin `name` on `args` where the handle's instance `i` holds its variables: each at
-/// its place's two words, its value and its type's descriptor.
+/// Handler builtin `name`, read as `callee`, on `args` where the handle's instance `i` holds its
+/// variables: each at its place's two words, its value and its type's descriptor.
 fn instance_var(
   cx: Context,
   st: Lowering,
   i: Instanced,
   name: Bytes,
   args: List<Arg>,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let place = |a: Arg| match a { AInt(n) -> Some(i.vars + 2 * n), _ -> None };
@@ -167,11 +167,11 @@ fn instance_var(
     });
   match args {
     [p] -> if name != b"?handler_var" { unreachable(b"a handler variable set to nothing") } else {
-      match ((place(p), filed(cx, at))) {
-        (Some(word_at), Some(t)) ->
+      match ((place(p), callee.ty)) {
+        (Some(word_at), TyFn(t)) ->
           handed(
-            bound_as(st, t.ty, RWord, op(VarRead(word_at), [], []), at),
-            held_as(cx.setting, t.ty),
+            bound_as(st, t.ret, RWord, op(VarRead(word_at), [], []), at),
+            held_as(cx.setting, t.ret),
             at,
           ),
         _ -> unreachable(b"a handler variable read at no place or type"),
@@ -195,12 +195,9 @@ fn instance_var(
 
 /// The type a generic crossing builtin is called at, as filed where its name is written: its first
 /// type argument; else what its first operand holds.
-pub fn called_at(cx: Context, callee: Span, args: List<Arg>) -> Type =
-  match filed(cx, callee) {
-    Some(t) -> match t.args.at(0) {
-      Some(a) -> a,
-      None -> match args.at(0) { Some(x) -> type_of(x), None -> unknown_type() },
-    },
+pub fn called_at(cx: Context, callee: Code, args: List<Arg>) -> Type =
+  match read_typed(callee).args.at(0) {
+    Some(a) -> a,
     None -> match args.at(0) { Some(x) -> type_of(x), None -> unknown_type() },
   }
 
@@ -642,7 +639,7 @@ pub fn over_machine_words(
   call: MachineCall,
   args: List<Arg>,
   answer: Option<Type>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   if args.len() != call.params.len() {
@@ -695,10 +692,7 @@ pub fn over_machine_words(
           },
           MachineFunction(k) -> {
             let f = lent(acc, args.get(i));
-            match match rows_filed_at(cx.filed, callee.site) {
-                Some(RowArguments(rows)) -> rows.at(k),
-                _ -> None,
-              } {
+            match match callee.node { NBuiltin(b) -> b.rows.at(k), _ -> None } {
               None -> unreachable(b"a function value a native takes at no row"),
               Some(r) -> {
                 let e = value_handing(cx, f.st, r, at);

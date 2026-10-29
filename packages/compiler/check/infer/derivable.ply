@@ -8,7 +8,7 @@ import compiler.check.types (Type, TyVar, TyCon, TyRecord, TyFn, Field, ints_ins
                              is_rigid_ty, type_text, printer_new, print_ty, TyNominal, arg_label,
                              arg_row)
 import compiler.check.resolve.tables (Diag, Label, qualify, default_binder, error_at, label_at)
-import compiler.expand.rewrite (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
+import compiler.check.typed (NumericWitness, ConcreteWitness, ParamWitness, StatedWitness)
 import compiler.check.infer.derivability (DeriveRefusal, HoldsFunction, HoldsHandle, HoldsFloat,
                                           Unconstrained, HoldsSecret, HoldsNative, refusal_note,
                                           secret_reason, float_reason)
@@ -541,16 +541,26 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   walked.checker
 }
 
-/// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
-fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
+/// What a `numeric` or `integer` constraint, `deriver`, met at the type `ty`, which the check
+/// settled, passes: a numeric type's witness, one stated by a type that states its arithmetic, or
+/// the witness of a type parameter of the reading definition's that a constraint makes one of; none
+/// where `ty` meets no such constraint.
+pub fn settled_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
+  match ty {
+    TyVar(v) -> match checker.witnessed.get(v) { Some(w) -> Some(ParamWitness(w.param)), None -> None },
+    _ -> concrete_witness(checker, deriver, ty),
+  }
+
+/// The witness the numeric type `ty` passes for `deriver`, or the type that states its arithmetic.
+fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
   match ty {
     TyCon(k) -> if k.args.len() != 0 { None }
     else if is_int_name(k.name) { Some(ConcreteWitness(k.name)) }
-    else if site.deriver == DNumeric && (k.name == b"Float" || k.name == b"Decimal") {
+    else if deriver == DNumeric && (k.name == b"Float" || k.name == b"Decimal") {
       Some(ConcreteWitness(k.name))
     }
     // `numeric(a)` holds the ordered comparisons, which a type takes from its `key`.
-    else if site.deriver == DNumeric {
+    else if deriver == DNumeric {
       match numeric_of(checker.numeric_types, k.name) {
         Some(x) -> match instance_of(checker.instances, k.name, NKey) {
           Some(_) -> Some(StatedWitness(x.ctor)),
@@ -559,6 +569,12 @@ fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option
         None -> None,
       }
     } else { None },
+    _ -> None,
+  }
+
+/// What `numeric(a)` or `integer(a)` was instantiated at, as the witness the call passes.
+fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
+  match ty {
     TyVar(v) -> if !site.assumed.contains(v) { None } else {
       match site.params.fold(None, |acc: Option<Bytes>, r: RigidParam|
           if r.var == v { Some(r.name) } else { acc }) {
@@ -566,11 +582,10 @@ fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option
         None -> None,
       }
     },
-    _ -> None,
+    _ -> concrete_witness(checker, site.deriver, ty),
   }
 
-/// A predicate's site: the callee is called, the type admits the predicate, and the witness it
-/// passes joins the others the same call passes, in the callee's order and once per parameter.
+/// A predicate's site: the callee is called, and the type admits the predicate.
 fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker / {abort.raise} = {
   let callee = default_binder(site.callee);
   let dv = deriver_text(site.deriver);
@@ -597,32 +612,7 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
     }
   } else {
     match predicate_witness(checker, site, ty) {
-      Some(w) -> {
-        let n = checker.witness_refs.len();
-        let fresh = {
-          module: site.module,
-          site: site.span.site,
-          witnesses: [w],
-          params: [site.param],
-          owner: site.owner,
-        };
-        match checker.witness_refs.at(n - 1) {
-          Some(r) -> if r.module == site.module && r.site == site.span.site
-              && r.owner == site.owner {
-            if r.params.contains(site.param) { checker } else {
-              {
-                ..checker,
-                witness_refs: checker.witness_refs.set(n - 1, {
-                  ..r,
-                  witnesses: r.witnesses.push(w),
-                  params: r.params.push(site.param),
-                }),
-              }
-            }
-          } else { { ..checker, witness_refs: checker.witness_refs.push(fresh) } },
-          None -> { ..checker, witness_refs: checker.witness_refs.push(fresh) },
-        }
-      },
+      Some(_) -> checker,
       None -> match ty {
         TyVar(v) -> if is_rigid_ty(checker.subst, v) {
           report_error_at(

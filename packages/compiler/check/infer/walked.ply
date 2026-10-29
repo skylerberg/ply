@@ -44,6 +44,9 @@ pub type WalkedNode =
   /// `row` is what the body performs. `vars` are the handler's variables, made before the body
   /// runs, which its clauses read and assign.
   | WalkedHandle({ body: Walked, row: Row, clauses: List<WalkedClause>, ret: Option<WalkedReturn>, vars: List<WalkedHandlerVar> })
+  /// A default a call on a value copies, typed once the walk ends: its place among the walk's
+  /// copies, where `defaults_filled` finds it.
+  | WalkedDefault(Int)
 
 /// What a name read as a value is, as the walk found it: a binder in scope; a definition, its
 /// scheme's type variables filled by `args` and its row variables `quantified` by `rows`, where the
@@ -82,21 +85,27 @@ pub type WalkedClause = {
   label: Option<TypedParam<Type>>,
   resume: Option<TypedParam<Type>>,
   body: Walked,
-  ty: Type,
   row: Row,
   resumed: Row,
   span: Span,
 }
 
 /// A `handle`'s `return` clause, as `TypedReturn` says.
-pub type WalkedReturn = { binder: TypedParam<Type>, body: Walked, ty: Type, row: Row, span: Span }
+pub type WalkedReturn = { binder: TypedParam<Type>, body: Walked, row: Row, span: Span }
 
 /// A variable a `handle` holds, as `TypedHandlerVar` says.
 pub type WalkedHandlerVar = { name: Bytes, ty: Type, init: Walked, span: Span }
 
 /// A body the walk typed: what owns it, which of its bodies it is, where its item's text starts,
-/// and its tree.
-pub type WalkedTree = { owner: Bytes, part: BodyPart, module: Int, base: Int, body: Walked }
+/// the parameters it binds, and its tree.
+pub type WalkedTree = {
+  owner: Bytes,
+  part: BodyPart,
+  module: Int,
+  base: Int,
+  params: List<TypedParam<Type>>,
+  body: Walked,
+}
 
 // --- Building nodes --------------------------------------------------------------------------------
 
@@ -280,7 +289,6 @@ pub fn clause_of(
   label: Option<TypedParam<Type>>,
   resume: Option<TypedParam<Type>>,
   body: Option<Walked>,
-  ty: Type,
   row: Row,
   resumed: Row,
   span: Span,
@@ -296,7 +304,6 @@ pub fn clause_of(
         label: label,
         resume: resume,
         body: b,
-        ty: ty,
         row: row,
         resumed: resumed,
         span: span,
@@ -307,12 +314,11 @@ pub fn clause_of(
 pub fn return_of(
   binder: TypedParam<Type>,
   body: Option<Walked>,
-  ty: Type,
   row: Row,
   span: Span,
 ) -> Option<WalkedReturn> =
   match body {
-    Some(b) -> Some({ binder: binder, body: b, ty: ty, row: row, span: span }),
+    Some(b) -> Some({ binder: binder, body: b, row: row, span: span }),
     None -> None,
   }
 
@@ -426,98 +432,36 @@ pub fn rewritten(e: Walked, f: (Walked) -> Walked) -> Walked = {
         }),
       WalkedLit(l) -> WalkedLit(l),
       WalkedRead(r) -> WalkedRead(r),
+      WalkedDefault(n) -> WalkedDefault(n),
     },
-  })
-}
-
-/// Every node of `e`, each before its parts.
-pub fn nodes_of(e: Walked) -> List<Walked> = {
-  let all = |xs: List<Walked>| xs.fold([], |acc: List<Walked>, x: Walked| acc.concat(nodes_of(x)));
-  let opt = |x: Option<Walked>| match x { Some(y) -> nodes_of(y), None -> [] };
-  [e].concat(match e.node {
-    WalkedUnary(u) -> nodes_of(u.operand),
-    WalkedBinary(b) -> nodes_of(b.lhs).concat(nodes_of(b.rhs)),
-    WalkedCall(c) -> nodes_of(c.callee).concat(all(c.args)),
-    WalkedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
-    WalkedMatch(m) ->
-      nodes_of(m.scrutinee).concat(
-        m.arms.fold([], |acc: List<Walked>, a: WalkedArm|
-          acc.concat(opt(a.guard)).concat(nodes_of(a.body))),
-      ),
-    WalkedBlock(b) ->
-      b.stmts.fold([], |acc: List<Walked>, s: WalkedStmt|
-        acc.concat(match s {
-          WalkedLet(l) -> nodes_of(l.value),
-          WalkedLetElse(l) -> nodes_of(l.value).concat(nodes_of(l.fallback)),
-          WalkedDo(x) -> nodes_of(x),
-          WalkedAssign(a) -> nodes_of(a.value),
-        })).concat(
-        opt(b.tail),
-      ),
-    WalkedList(xs) -> all(xs),
-    WalkedRecord(fs) -> all(fs.map(|fd: WalkedField| fd.value)),
-    WalkedUpdate(u) -> nodes_of(u.base).concat(all(u.sets.map(|fd: WalkedField| fd.value))),
-    WalkedFieldRead(r) -> nodes_of(r.base),
-    WalkedPerform(p) -> all(p.args),
-    WalkedLambda(l) -> nodes_of(l.body),
-    WalkedSimulate(t) -> nodes_of(t.body),
-    WalkedParallel(ts) -> all(ts.map(|t: WalkedThunk| t.body)),
-    WalkedHandle(h) ->
-      all(h.vars.map(|v: WalkedHandlerVar| v.init)).concat(nodes_of(h.body)).concat(
-        all(h.clauses.map(|c: WalkedClause| c.body)),
-      ).concat(match h.ret { Some(r) -> nodes_of(r.body), None -> [] }),
-    WalkedLit(_) -> [],
-    WalkedRead(_) -> [],
   })
 }
 
 // --- Defaults a call on a value copies -------------------------------------------------------------
 
-/// A parameter's default copied into the call at site `call`, typed: the argument at `place`.
-pub type PlacedDefault = { call: Int, place: Int, value: Option<Walked> }
-
-/// `e` with each default in `defaults` put in its call's arguments at its place. None where a
-/// default is not typed or its call is not one of `e`'s.
-pub fn defaults_placed(e: Walked, defaults: List<PlacedDefault>) -> Option<Walked> =
-  if defaults.len() == 0 { Some(e) } else {
-    let by_call = defaults.fold(Map::new(), |m: Map<Int, List<PlacedDefault>>, d: PlacedDefault|
-      m.insert(d.call, match m.get(d.call) { Some(ds) -> ds.push(d), None -> [d] }));
-    let calls = nodes_of(e).filter(|x: Walked|
-      match x.node { WalkedCall(_) -> by_call.contains(x.span.site), _ -> false });
-    let untyped = defaults.any(|d: PlacedDefault| match d.value { Some(_) -> false, None -> true });
-    if calls.len() != by_call.len() || untyped { None } else {
-      Some(
-        rewritten(e, |x: Walked|
-          match ((x.node, by_call.get(x.span.site))) {
-            (WalkedCall(c), Some(ds)) ->
-              {
-                ..x,
-                node: WalkedCall({
-                  callee: c.callee,
-                  args: ds.sort_by(|a: PlacedDefault, b: PlacedDefault| a.place <= b.place).fold(
-                    c.args,
-                    |args: List<Walked>, d: PlacedDefault|
-                      match d.value {
-                        Some(v) -> args.take(d.place).push(v).concat(args.drop(d.place)),
-                        None -> args,
-                      },
-                  ),
-                }),
-              },
-            _ -> x,
-          }),
-      )
-    }
+/// `e` with each default a call on a value copied at its place, `copies` the typed copies in the
+/// order they were made; none where one is not typed.
+pub fn defaults_filled(e: Walked, copies: List<Option<Walked>>) -> Option<Walked> =
+  if copies.any(|c: Option<Walked>| match c { Some(_) -> false, None -> true }) { None } else {
+    Some(
+      rewritten(e, |x: Walked|
+        match x.node {
+          WalkedDefault(n) -> match copies.at(n) { Some(Some(c)) -> c, _ -> x },
+          _ -> x,
+        }),
+    )
   }
 
 // --- Settling ------------------------------------------------------------------------------------------
 
 /// How `settled` makes the typed tree of a walk's: `ty` settles a type, `row` a row and `atom` an
-/// atom; `read` settles a read, none where it cannot be; `copies` reads the fields an update of a
-/// base of the settled type copies, those `sets` writes left out, none where the type is no
-/// record's; and `span` counts a place from where the body's item starts.
+/// atom; `read` settles a read, none where it cannot be; `witness` names the type parameter whose
+/// witness does an operator over an operand of a type, none where no constraint makes one; `copies`
+/// reads the fields an update of a base of the settled type copies, those `sets` writes left out,
+/// none where the type is no record's; and `span` counts a place from where the body's item starts.
 pub type Settling = {
   ty: (Type) -> Type / {abort.raise},
+  witness: (Type) -> Option<Bytes> / {abort.raise},
   row: (Row) -> Row / {abort.raise},
   atom: (Atom) -> Atom / {abort.raise},
   read: (WalkedReading) -> Option<Reading<Type>> / {abort.raise},
@@ -624,7 +568,6 @@ fn settled_clause(c: WalkedClause, s: Settling) -> Option<TypedClause<Type>> / {
         label: settled_param_opt(c.label, s),
         resume: settled_param_opt(c.resume, s),
         body: b,
-        ty: (s.ty)(c.ty),
         row: (s.row)(c.row),
         resumed: (s.row)(c.resumed),
         span: (s.span)(c.span),
@@ -637,11 +580,30 @@ fn settled_node(node: WalkedNode, s: Settling) -> Option<TypedNode<Type>> / {abo
     WalkedLit(l) -> Some(TypedLit(l)),
     WalkedRead(read) -> match (s.read)(read) { Some(r) -> Some(TypedRead(r)), None -> None },
     WalkedUnary(u) -> match settled(u.operand, s) {
-      Some(x) -> Some(TypedUnary({ op: u.op, operand: x })),
+      Some(x) ->
+        Some(
+          TypedUnary({
+            op: u.op,
+            operand: x,
+            witness: if u.op == b"neg" || u.op == b"bitnot" { (s.witness)(u.operand.ty) }
+            else { None },
+          }),
+        ),
       None -> None,
     },
+    // A logical operator and a concatenation take no witness, and an equality compares as the
+    // type's own.
     WalkedBinary(b) -> match ((settled(b.lhs, s), settled(b.rhs, s))) {
-      (Some(l), Some(r)) -> Some(TypedBinary({ op: b.op, lhs: l, rhs: r })),
+      (Some(l), Some(r)) ->
+        Some(
+          TypedBinary({
+            op: b.op,
+            lhs: l,
+            rhs: r,
+            witness: if [b"and", b"or", b"concat", b"eq", b"ne"].contains(b.op) { None }
+            else { (s.witness)(b.lhs.ty) },
+          }),
+        ),
       _ -> None,
     },
     WalkedCall(c) -> match ((settled(c.callee, s), settled_all(c.args, s))) {
@@ -778,7 +740,6 @@ fn settled_node(node: WalkedNode, s: Settling) -> Option<TypedNode<Type>> / {abo
               Some({
                 binder: settled_param(r.binder, s),
                 body: b,
-                ty: (s.ty)(r.ty),
                 row: (s.row)(r.row),
                 span: (s.span)(r.span),
               }),
@@ -792,4 +753,6 @@ fn settled_node(node: WalkedNode, s: Settling) -> Option<TypedNode<Type>> / {abo
         _ -> None,
       }
     },
+    // A copy the walk's end did not fill: its default did not type, which the check reported.
+    WalkedDefault(_) -> None,
   }

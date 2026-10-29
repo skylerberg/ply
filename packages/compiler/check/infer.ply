@@ -1,31 +1,25 @@
 //! The type checker: schemes, footprints and constraints for every definition, test, law, effect and constructor.
 
-import compiler.syntax.parsing (Span, span_between, site_digit, minted, role_witness,
-                                role_witness_passed)
+import compiler.syntax.parsing (Span, span_between, site_digit, dummy_span)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, IExtern, DOrd, DNumeric, deriver_text,
-                              Derived, NInvariant, parse)
-import compiler.syntax.exprs (Expr, prelude_module, try_places, detached_at, simulated_at,
-                              branch_at, resumed_at, expr_span)
+                              Derived, NInvariant, parse, is_predicate)
+import compiler.syntax.exprs (Expr, prelude_module, try_places, expr_span)
 import compiler.expand.rewrite.shared (picked_in)
 import std.list (zip)
-import compiler.check.types (Atom, Row, RVar, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord,
+import compiler.check.types (Atom, Row, RVar, RSingleton, RAny, RNamed, Type, TyVar, TyCon, TyFn, canonical_beside, TyRecord,
                              record_fields, Field, atoms_sorted, resolve_atom, row_empty, row_open,
                              row_singleton, without_raises, int_type, bool_type, bytes_type,
                              list_type, iter_type, fn_type, shallow, written_label, label_of,
                              atoms_text, scheme_text, type_text, TyNominal, TypeTable, held_type,
-                             table_of, tables_joined, type_table_bin, vars_in, unit_type)
+                             table_of, tables_joined, type_table_bin, vars_in, unit_type, type_at)
 import compiler.check.termination (Ends, Stated, Diverges, Site)
-import compiler.check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix,
-                                      with_fix, insertion, qualify, error_at, Parameters)
+import compiler.check.resolve.tables (ParsedModule, Source, Resolved, Diag, Label, Edit, Fix, with_fix, insertion, qualify, error_at)
 import compiler.check.resolve (resolve_modules, ResolveSucceeded, ResolveFailed, dump_diags,
                                has_error)
 import compiler.check.resolve.defaults (Expanded)
-import compiler.expand.rewrite (expand, updated_item, witnessed_item, tried_item, Answered,
-                                NumericWitness, ConcreteWitness, ParamWitness, expand_tagged,
-                                member_called_item, MemberCallee)
-import compiler.expand.rewrite.handlers (expand_holds, expand_handler_vars)
+import compiler.expand.rewrite (expand)
 import compiler.expand.embed (rewritten)
 import compiler.emit.layout (Intrinsic, intrinsics)
 import compiler.emit.keys (test_owner, law_owner)
@@ -37,35 +31,22 @@ import std.option
 import std.string
 import compiler.check.lent (Passed, passed)
 import compiler.check.typed (TypedExpr, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
-                             ReadBuiltin, FilledLabel, LabelNamed, LabelParam, retyped,
+                             ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
                              typed_body_bin, typed_nodes, part_key, TypedRead, TypedUpdate,
-                             WholeBody)
+                             WholeBody, TypedParam, NumericWitness, ConcreteWitness, ParamWitness,
+                             witness_param, BodyPart, TypedCall, TypedLambda, TypedSimulate,
+                             TypedParallel, TypedHandle, TypedPerform, TypedClause, TypedThunk)
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, settled)
-import compiler.check.infer.checker (Location, OpInfo, EffectInfo, CtorInfo, DefConstraint,
-                                     InstanceInfo, NumericInfo, SpecInfo, DefInfo, Calls, Handed,
-                                     Unguarded, Unshown, ZeroDivisor, Raise, TestInfo, LawBinder,
-                                     LawInfo, MemberSite, WitnessOp, WitnessRef, WitnessOrder,
-                                     UpdateShape, TrySite, LabelApplication, LabelSite, OperandAt,
-                                     TypedAt, TypedSite, RowAt, ReadOf, RowOf, AtomOf, FilledOf,
-                                     RowSite, RowArguments, Performs, PerformsAtom, filed_rows_text,
-                                     KnownDef, KnownTest, KeptFacts, Known, no_known, Checker,
-                                     WalkedBody, report, report_error_at, resolve, resolve_row_in,
-                                     abort_atom, def_of, Builtin, declared, builtins, builtin_named,
-                                     update_shape_bin, try_site_bin, member_site_bin,
-                                     label_site_bin, typed_site_bin, row_site_bin, witness_op_bin,
-                                     witness_ref_bin, witness_order_bin, ReleaseSite, ReleaseAfter,
-                                     ReleaseBefore, ReleaseUnwinding, ReleaseFailing,
-                                     release_site_bin)
+import compiler.check.infer.checker (OpInfo, EffectInfo, CtorInfo, DefConstraint, InstanceInfo, NumericInfo, SpecInfo, DefInfo, Calls, Handed, Unguarded, Unshown, ZeroDivisor, Raise, TestInfo, LawBinder, LawInfo, MemberSite, WitnessOrder, TrySite, LabelApplication, KnownDef, KnownTest, KeptFacts, Known, no_known, Checker, WalkedBody, report, report_error_at, resolve, resolve_row_in, abort_atom, def_of, Builtin, declared, builtins, builtin_named, member_site_bin, witness_order_bin, ReleaseSite, ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseFailing, release_site_bin)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (collect_nominals, collect_types, collect_effects,
                                           collect_ctors, check_value_namespace, refuse_irregular)
 import compiler.check.infer.expr (settle_bit_ops, settle_concats, settle_columns, settle_updates,
                                   kept_type)
-import compiler.check.infer.definitions (SignedModule, signed_fns, externs_of, externs_in,
-                                         walked_fns, settle_numerics, check_tests, check_laws,
-                                         check_schemas, check_specs, unlowered_of, members_in)
-import compiler.check.infer.derivable (with_orders, check_map_keys, check_constraints)
+import compiler.check.infer.definitions (SignedModule, signed_fns, externs_of, externs_in, walked_fns, settle_numerics, check_tests, check_laws, check_schemas, check_specs, unlowered_of)
+import compiler.check.infer.derivable (with_orders, check_map_keys, check_constraints,
+                                       settled_witness)
 import compiler.check.infer.solved (collect_stated, check_instances, attribute_generated,
                                     check_comparisons, check_parallels, check_simulations,
                                     check_regions, fresh_cx)
@@ -165,111 +146,40 @@ pub fn published_pure(def_info: DefInfo) -> Bool =
   without_raises(def_info.footprint).len() == 0 && def_info.constraints.len() == 0
 
 /// What the emitter needs from the checker: the definitions published pure, for its constant table,
-/// the labels every call fills, the shape of every record update, the type of each typed site and
-/// the rows of each site that hands on or takes evidence.
+/// each witnessed definition's witness order, the calls on values and the releases each body files,
+/// and each body the walks typed.
 pub type EmitFacts = {
   pure: List<Bytes>,
-  label_sites: List<LabelSite>,
-  elaboration: Elaboration,
-  typed: List<TypedSite>,
+  orders: List<WitnessOrder>,
+  members: List<MemberSite>,
+  /// Where each binding a body owns is let go, which the lowering writes its type's release at.
+  releases: List<ReleaseSite>,
   types: TypeTable,
-  rows: List<RowSite>,
   /// Each body the walks typed, its types named by key in `types`.
   bodies: List<TypedBody<Bytes>>,
 }
 
-/// What lowering reads that only the checker knows: the shape of every record update, the raise
-/// every `try` answers, and where a `numeric` or `integer` parameter's witness is read and what each
-/// call passes for it.
-pub type Elaboration = {
-  updates: List<UpdateShape>,
-  ops: List<WitnessOp>,
-  refs: List<WitnessRef>,
-  orders: List<WitnessOrder>,
-  tries: List<TrySite>,
-  members: List<MemberSite>,
-  /// Where each binding a body owns is let go, which the lowering writes its type's release at.
-  releases: List<ReleaseSite>,
-}
-
-fn elaboration_of(checker: Checker) -> Elaboration / {abort.raise} =
-  if checker.copied_defaults.len() > 0 {
-    panic("a default a call on a value copied was left untyped")
-  } else { elaboration_in(lowered_only(checker)) }
-
-fn elaboration_in(checker: Checker) -> Elaboration / {abort.raise} =
-  {
-    tries: checker.try_sites,
-    releases: checker.release_sites,
-    members: checker.member_sites,
-    updates: checker.update_shapes,
-    ops: checker.operands.fold([], |acc: List<WitnessOp>, o: OperandAt|
-      match resolve(checker, o.ty) {
-        TyVar(v) -> match checker.witnessed.get(v) {
-          Some(w) ->
-            acc.push({ module: o.module, site: o.span.site, param: w.param, owner: o.owner }),
-          None -> acc,
-        },
-        _ -> acc,
-      }),
-    refs: checker.witness_refs,
-    orders: checker.witness_orders,
-  }
-
-derive bin for Elaboration
-
 derive bin for EmitFacts
 
-/// What the emitter reads of one body: the sites a walk of it recorded.
+/// What the emitter reads of one owner's bodies.
 pub type RootFacts = {
-  label_sites: List<LabelSite>,
-  updates: List<UpdateShape>,
-  ops: List<WitnessOp>,
-  refs: List<WitnessRef>,
-  tries: List<TrySite>,
   members: List<MemberSite>,
   releases: List<ReleaseSite>,
-  typed: List<TypedSite>,
   types: TypeTable,
-  rows: List<RowSite>,
   bodies: List<TypedBody<Bytes>>,
 }
 
 derive bin for RootFacts
 
-pub fn no_root_facts() -> RootFacts =
-  {
-    label_sites: [],
-    updates: [],
-    ops: [],
-    refs: [],
-    tries: [],
-    members: [],
-    releases: [],
-    typed: [],
-    types: Map::new(),
-    rows: [],
-    bodies: [],
-  }
+pub fn no_root_facts() -> RootFacts = { members: [], releases: [], types: Map::new(), bodies: [] }
 
-/// The nodes of `all` the types `sites` and `bodies` name are made of, which is all a table of
-/// them needs.
-pub fn types_named(
-  all: TypeTable,
-  sites: List<TypedSite>,
-  bodies: List<TypedBody<Bytes>>,
-) -> TypeTable / {abort.raise} =
-  table_of(
-    all,
-    bodies.fold(
-      sites.fold([], |acc: List<Bytes>, s: TypedSite| acc.concat(s.args).push(s.ty)),
-      |acc: List<Bytes>, b: TypedBody<Bytes>| acc.concat(keys_in(b.body)),
-    ),
-  )
+/// The nodes of `all` the types `bodies` name are made of, which is all a table of them needs.
+pub fn types_named(all: TypeTable, bodies: List<TypedBody<Bytes>>) -> TypeTable / {abort.raise} =
+  table_of(all, bodies.fold([], |acc: List<Bytes>, b: TypedBody<Bytes>| acc.concat(keys_in(b))))
 
-/// Every type key `e` names, in the order a walk meets them.
-fn keys_in(e: TypedExpr<Bytes>) -> List<Bytes> / {abort.raise} =
-  retyped(e, [], {
+/// Every type key `b` names, in the order a walk meets them.
+fn keys_in(b: TypedBody<Bytes>) -> List<Bytes> / {abort.raise} =
+  body_retyped(b, [], {
     ty: |k: Bytes, seen: List<Bytes>| { ty: k, state: seen.push(k) },
     row: |r: Row| r,
     atom: |a: Atom| a,
@@ -279,89 +189,62 @@ fn keys_in(e: TypedExpr<Bytes>) -> List<Bytes> / {abort.raise} =
 /// Both tables of types, as one.
 pub fn types_joined(a: TypeTable, b: TypeTable) -> TypeTable = tables_joined(a, b)
 
-fn owned(m: Map<Bytes, RootFacts>, owner: Bytes) -> RootFacts =
-  match m.get(owner) { Some(f) -> f, None -> no_root_facts() }
+/// `facts` with each module index read through `moved`.
+pub fn facts_moved(facts: EmitFacts, moved: (Int) -> Int) -> EmitFacts =
+  {
+    ..facts,
+    orders: facts.orders.map(|x: WitnessOrder| { ..x, module: moved(x.module) }),
+    members: facts.members.map(|x: MemberSite| { ..x, module: moved(x.module) }),
+    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: moved(x.module) }),
+    bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: moved(x.module) }),
+  }
 
-/// Every site a walk recorded, under the definition or test whose body it was walking; a clause's
-/// and a law's are under the empty name.
-pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> / {abort.raise} = {
-  let labelled = facts.label_sites.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: LabelSite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, label_sites: f.label_sites.push(x) })
-  });
-  let updated = facts.elaboration.updates.fold(
-    labelled,
-    |m: Map<Bytes, RootFacts>, x: UpdateShape| {
-      let f = owned(m, x.owner);
-      m.insert(x.owner, { ..f, updates: f.updates.push(x) })
-    },
-  );
-  let witnessed = facts.elaboration.ops.fold(updated, |m: Map<Bytes, RootFacts>, x: WitnessOp| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, ops: f.ops.push(x) })
-  });
-  let referenced = facts.elaboration.refs.fold(
-    witnessed,
-    |m: Map<Bytes, RootFacts>, x: WitnessRef| {
-      let f = owned(m, x.owner);
-      m.insert(x.owner, { ..f, refs: f.refs.push(x) })
-    },
-  );
-  let tried = facts.elaboration.tries.fold(referenced, |m: Map<Bytes, RootFacts>, x: TrySite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, tries: f.tries.push(x) })
-  });
-  let released = facts.elaboration.releases.fold(
-    tried,
-    |m: Map<Bytes, RootFacts>, x: ReleaseSite| {
-      let f = owned(m, x.owner);
-      m.insert(x.owner, { ..f, releases: f.releases.push(x) })
-    },
-  );
-  let called = facts.elaboration.members.fold(
-    released,
-    |m: Map<Bytes, RootFacts>, x: MemberSite| {
-      let f = owned(m, x.owner);
-      m.insert(x.owner, { ..f, members: f.members.push(x) })
-    },
-  );
-  let typed = facts.typed.fold(called, |m: Map<Bytes, RootFacts>, x: TypedSite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, typed: f.typed.push(x) })
-  });
-  let rowed = facts.rows.fold(typed, |m: Map<Bytes, RootFacts>, x: RowSite| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, rows: f.rows.push(x) })
-  });
-  let bodied = facts.bodies.fold(rowed, |m: Map<Bytes, RootFacts>, x: TypedBody<Bytes>| {
-    let f = owned(m, x.owner);
-    m.insert(x.owner, { ..f, bodies: f.bodies.push(x) })
-  });
-  bodied.fold(Map::new(), |m: Map<Bytes, RootFacts>, owner: Bytes, f: RootFacts|
-    m.insert(owner, { ..f, types: types_named(facts.types, f.typed, f.bodies) }))
+/// `facts` with only the calls on values, releases and bodies `kept` keeps by their module and
+/// owner, and the types those bodies name.
+pub fn facts_kept(
+  facts: EmitFacts,
+  kept: (Int, Bytes) -> Bool / {abort.raise},
+) -> EmitFacts / {abort.raise} = {
+  let bodies = facts.bodies.filter(|x: TypedBody<Bytes>| kept(x.module, x.owner));
+  {
+    ..facts,
+    members: facts.members.filter(|x: MemberSite| kept(x.module, x.owner)),
+    releases: facts.releases.filter(|x: ReleaseSite| kept(x.module, x.owner)),
+    types: types_named(facts.types, bodies),
+    bodies: bodies,
+  }
+}
+
+/// Each owner's facts, by the definition, test or law whose body they are of, each naming its
+/// types in all of `facts.types`.
+pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, RootFacts> = {
+  let into = |m: Map<Bytes, RootFacts>, owner: Bytes, add: (RootFacts) -> RootFacts|
+    m.insert(
+      owner,
+      add(match m.get(owner) { Some(f) -> f, None -> { ..no_root_facts(), types: facts.types } }),
+    );
+  let released = facts.releases.fold(Map::new(), |m: Map<Bytes, RootFacts>, x: ReleaseSite|
+    into(m, x.owner, |f: RootFacts| { ..f, releases: f.releases.push(x) }));
+  let called = facts.members.fold(released, |m: Map<Bytes, RootFacts>, x: MemberSite|
+    into(m, x.owner, |f: RootFacts| { ..f, members: f.members.push(x) }));
+  facts.bodies.fold(called, |m: Map<Bytes, RootFacts>, x: TypedBody<Bytes>|
+    into(m, x.owner, |f: RootFacts| { ..f, bodies: f.bodies.push(x) }))
 }
 
 /// `facts` filed under `owner` in `module`.
 fn owned_by(facts: RootFacts, module: Int, owner: Bytes) -> RootFacts =
   {
-    label_sites: facts.label_sites.map(|x: LabelSite| { ..x, module: module, owner: owner }),
-    updates: facts.updates.map(|x: UpdateShape| { ..x, module: module, owner: owner }),
-    ops: facts.ops.map(|x: WitnessOp| { ..x, module: module, owner: owner }),
-    refs: facts.refs.map(|x: WitnessRef| { ..x, module: module, owner: owner }),
-    tries: facts.tries.map(|x: TrySite| { ..x, module: module, owner: owner }),
-    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: module, owner: owner }),
     members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
-    typed: facts.typed.map(|x: TypedSite| { ..x, module: module, owner: owner }),
+    releases: facts.releases.map(|x: ReleaseSite| { ..x, module: module, owner: owner }),
     types: facts.types,
-    rows: facts.rows.map(|x: RowSite| { ..x, module: module, owner: owner }),
     bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
   }
 
 /// The encoding `filed_facts` writes, its first byte; bytes of another are no facts.
-fn facts_encoding() -> Int = 4
+fn facts_encoding() -> Int = 5
 
-/// One body's sites as its row files them: each by its node's site in the body's item, which no
-/// edit elsewhere, cut of its module or check of part of it moves.
+/// One owner's facts as its row files them: each place counted in the body's item, which no edit
+/// elsewhere, cut of its module or check of part of it moves.
 pub fn filed_facts(facts: RootFacts) -> Bytes / {abort.raise} =
 
   // A row names its types by key; the table they are read from goes with the rows, held once.
@@ -378,63 +261,31 @@ pub fn facts_at(filed: Bytes, module: Int, owner: Bytes) -> Option<RootFacts> / 
     }
   }
 
-/// `checker` without the sites of a walk that is never lowered. A call on a value stays, its
+/// `checker` without the releases of a walk that is never lowered. A call on a value stays, its
 /// definition's: it says how the clause is written out, and a claim lowers the clause as written out.
-fn lowered_only(checker: Checker) -> Checker / {abort.raise} = {
-  let kept = |owner: Bytes| unlowered_of(owner) == None;
+fn lowered_only(checker: Checker) -> Checker / {abort.raise} =
   {
     ..checker,
-    label_sites: checker.label_sites.filter(|x: LabelSite| kept(x.owner)),
-    try_sites: checker.try_sites.filter(|x: TrySite| kept(x.owner)),
-    release_sites: checker.release_sites.filter(|x: ReleaseSite| kept(x.owner)),
+    release_sites: checker.release_sites.filter(|x: ReleaseSite| unlowered_of(x.owner) == None),
     member_sites: checker.member_sites.map(|x: MemberSite|
       match unlowered_of(x.owner) { Some(o) -> { ..x, owner: o }, None -> x }),
-    update_shapes: checker.update_shapes.filter(|x: UpdateShape| kept(x.owner)),
-    operands: checker.operands.filter(|x: OperandAt| kept(x.owner)),
-    witness_refs: checker.witness_refs.filter(|x: WitnessRef| kept(x.owner)),
-    typed: checker.typed.filter(|x: TypedAt| kept(x.owner)),
-    rows_at: checker.rows_at.filter(|x: RowAt| kept(x.owner)),
   }
-}
 
-/// What the checker filed for the emitter, each owner's sites together, owners in the order their
-/// bodies were first walked, so a check of part of a program files each owner's as a whole check does.
+/// What the checker filed for the emitter, each owner's together, owners in the order their bodies
+/// were first walked, so a check of part of a program files each owner's as a whole check does.
 fn facts_of(all: Checker) -> EmitFacts / {abort.raise} = {
   let checker = lowered_only(all);
-  let settled = settled_sites({ ..checker, typed: checker.typed.concat(witness_reads(checker)) });
-  let keyed = keyed_bodies(settled_bodies(checker), settled.types, settled.keyed);
-  let e = elaboration_in(checker);
+  // The rows a body is published from name their types in the table handed in with them.
+  let keyed = keyed_bodies(settled_bodies(checker), checker.known.types);
   {
     pure: checker.defs.fold([], |acc: List<Bytes>, def_info: DefInfo|
       if published_pure(def_info) { acc.push(def_info.name) } else { acc }),
-    label_sites: grouped(checker.label_sites, |x: LabelSite| x.owner),
-    elaboration: {
-      ..e,
-      updates: grouped(e.updates, |x: UpdateShape| x.owner),
-      ops: grouped(e.ops, |x: WitnessOp| x.owner),
-      refs: grouped(e.refs, |x: WitnessRef| x.owner),
-      tries: grouped(e.tries, |x: TrySite| x.owner),
-      members: grouped(e.members, |x: MemberSite| x.owner),
-    },
-    typed: grouped(settled.sites, |x: TypedSite| x.owner),
+    orders: checker.witness_orders,
+    members: grouped(checker.member_sites, |x: MemberSite| x.owner),
+    releases: grouped(checker.release_sites, |x: ReleaseSite| x.owner),
     types: keyed.types,
-    rows: grouped(settled_rows(checker), |x: RowSite| x.owner),
     bodies: grouped(keyed.bodies, |x: TypedBody<Bytes>| x.owner),
   }
-}
-
-/// Each read of a witness the elaboration writes out, at the `Int` a witness is: where an operator
-/// reads its operands' and where a call passes one, which a closure capturing it reads it at.
-fn witness_reads(checker: Checker) -> List<TypedAt> / {abort.raise} = {
-  let e = elaboration_in(checker);
-  let at = |site: Int, role: Int| minted({ start: 0, end: 0, site: site }, role);
-  let read = |module: Int, span: Span, owner: Bytes|
-    { module: module, span: span, ty: int_type(), args: [], owner: owner, named: b"" };
-  e.ops.map(|o: WitnessOp| read(o.module, at(o.site, role_witness()), o.owner)).concat(
-    e.refs.flat_map(|r: WitnessRef|
-      range(0, r.witnesses.len()).map(|i: Int|
-        read(r.module, at(r.site, role_witness_passed(i)), r.owner))),
-  )
 }
 
 /// `xs` with each owner's together, owners in the order they first stand, each one's in its order.
@@ -452,68 +303,11 @@ fn grouped<a>(xs: List<a>, owner: (a) -> Bytes) -> List<a> = {
   g.order.map(|o: Bytes| match g.by.get(o) { Some(ys) -> ys, None -> [] }).flatten()
 }
 
-/// Each typed site resolved and read in its owner's numbering, beside the table of what they name.
-fn settled_sites(
-  checker: Checker,
-) -> { sites: List<TypedSite>, types: TypeTable, keyed: Map<Type, Bytes> } / {abort.raise} = {
-  let sorts = law_sorts(checker);
-  let numbering_of = |owner: Bytes|
-    match def_of(checker, owner) {
-      Some(d) -> by_place(d.scheme.ty_vars),
-      // A law's sorts are its own variables.
-      None -> match sorts.get(owner) { Some(s) -> s, None -> Map::new() },
-    };
-  let settled = checker.typed.fold(
-    // The rows a body is published from name their types in the table handed in with them.
-    {
-      sites: [],
-      types: checker.known.types,
-      keyed: Map::new(),
-      owner: b"",
-      numbering: numbering_of(b""),
-    },
-    |acc: Settling, t: TypedAt| {
-      let numbering = if t.owner == acc.owner { acc.numbering } else { numbering_of(t.owner) };
-      let read = |ty: Type| numbered(resolve(checker, ty), numbering, checker.kept_vars);
-      // A read inside the recursive group being inferred was not instantiated: the group shares its
-      // variables, so the definition is used at its own, read in the reader's numbering.
-      let used_at = if t.args.len() > 0 || t.named == b"" { t.args } else {
-        match def_of(checker, t.named) {
-          Some(d) -> d.scheme.ty_vars.map(|v: Int| TyVar(v)),
-          None -> [],
-        }
-      };
-      let args = used_at.fold(
-        { table: acc.types, keyed: acc.keyed, keys: [] },
-        |h: { table: TypeTable, keyed: Map<Type, Bytes>, keys: List<Bytes> }, ty: Type| {
-          let held = held_once(h.table, h.keyed, read(ty));
-          { table: held.table, keyed: held.keyed, keys: h.keys.push(held.key) }
-        },
-      );
-      let own = held_once(args.table, args.keyed, read(t.ty));
-      {
-        sites: acc.sites.push({
-          module: t.module,
-          site: t.span.site,
-          ty: own.key,
-          args: args.keys,
-          owner: t.owner,
-        }),
-        types: own.table,
-        keyed: own.keyed,
-        owner: t.owner,
-        numbering: numbering,
-      }
-    },
-  );
-  { sites: settled.sites, types: settled.types, keyed: settled.keyed }
-}
 /// Each body the walks typed, settled: resolved under the check's final substitution and read in
-/// its owner's numbering, as `settled_sites` reads types and `settled_rows` rows, each place counted
-/// from where its item's text starts. A read inside the recursive group being inferred was not
-/// instantiated: the group shares its variables, so the definition is read at its own type
-/// variables, and fills each of its row variables the read did not with itself. A body that does
-/// not settle is left out, and what reads it finds none.
+/// its owner's numbering, each place counted from where its item's text starts. A read inside the
+/// recursive group being inferred was not instantiated: the group shares its variables, so the
+/// definition is read at its own type variables, and fills each of its row variables the read did
+/// not with itself. A body that does not settle is left out, and what reads it finds none.
 fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
   let sorts = law_sorts(checker);
   checker.typed_bodies.fold([], |acc: List<TypedBody<Type>>, b: WalkedTree| {
@@ -529,8 +323,24 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
     };
     let ty = |t: Type| numbered(resolve(checker, t), types, checker.kept_vars);
     let row = |r: Row| row_numbered(resolve_row_in(checker, r), rows);
+    let placed = |sp: Span| { ..sp, start: sp.start - b.base, end: sp.end - b.base };
+    // A definition a `numeric` or `integer` constraint makes witnesses of takes them first.
+    let witnesses = match owner {
+      Some(d) ->
+        d.scheme.ty_vars.fold([], |acc: List<TypedParam<Type>>, v: Int|
+          match checker.witnessed.get(v) {
+            Some(w) -> acc.push({ name: witness_param(w.param), ty: int_type(), span: dummy_span() }),
+            None -> acc,
+          }),
+      None -> [],
+    };
     let settling = {
       ty: ty,
+      witness: |t: Type|
+        match resolve(checker, t) {
+          TyVar(v) -> match checker.witnessed.get(v) { Some(w) -> Some(w.param), None -> None },
+          _ -> None,
+        },
       row: row,
       atom: |a: Atom| atom_numbered(resolve_atom(checker.subst, a), rows.labels),
       read: |read: WalkedReading|
@@ -554,17 +364,18 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
                   )),
               None -> x.rows,
             };
-            match labels_settled(checker, x.labels, rows.labels) {
-              Some(ls) ->
+            match ((labels_settled(checker, x.labels, rows.labels), witnesses_passed(checker, x.full, args))) {
+              (Some(ls), Some(ws)) ->
                 Some(
                   ReadDefinition({
                     full: x.full,
                     args: args.map(ty),
                     rows: filled.map(row),
                     labels: ls,
+                    witnesses: ws,
                   }),
                 ),
-              None -> None,
+              _ -> None,
             }
           },
         },
@@ -573,13 +384,43 @@ fn settled_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
           Some(fs) -> Some(fs.map(|f: Field| f.name).filter(|n: Bytes| !sets.contains(n))),
           None -> None,
         },
-      span: |sp: Span| { ..sp, start: sp.start - b.base, end: sp.end - b.base },
+      span: placed,
     };
     match settled(b.body, settling) {
-      Some(body) -> acc.push({ owner: b.owner, module: b.module, part: b.part, body: body }),
+      Some(body) ->
+        acc.push({
+          owner: b.owner,
+          module: b.module,
+          part: b.part,
+          params: witnesses.concat(
+            b.params.map(|p: TypedParam<Type>| { ..p, ty: ty(p.ty), span: placed(p.span) }),
+          ),
+          body: body,
+        }),
       None -> acc,
     }
   })
+}
+
+/// The witnesses a read of `full` at `args` passes, one per type parameter a `numeric` or `integer`
+/// constraint of its makes a witness of, in the parameters' order; none where one is met at a type
+/// that has none.
+fn witnesses_passed(checker: Checker, full: Bytes, args: List<Type>) -> Option<List<NumericWitness>> / {abort.raise} = {
+  let cs = match checker.constraints.get(full) { Some(xs) -> xs, None -> [] };
+  range(0, args.len()).fold(Some([]), |acc: Option<List<NumericWitness>>, i: Int|
+    match acc {
+      None -> None,
+      Some(ws) -> match cs.find(|c: DefConstraint| c.param == i && is_predicate(c.deriver)) {
+        None -> acc,
+        Some(c) -> match args.at(i) {
+          Some(t) -> match settled_witness(checker, c.deriver, resolve(checker, t)) {
+            Some(w) -> Some(ws.push(w)),
+            None -> None,
+          },
+          None -> None,
+        },
+      },
+    })
 }
 
 /// The labels `filled`, the label types a read fills, settled to: each one named, or the owner's
@@ -611,7 +452,6 @@ fn labels_settled(
 fn keyed_bodies(
   bodies: List<TypedBody<Type>>,
   table: TypeTable,
-  keyed: Map<Type, Bytes>,
 ) -> { bodies: List<TypedBody<Bytes>>, types: TypeTable } / {abort.raise} = {
   let keying = {
     ty: |t: Type, s: { table: TypeTable, keyed: Map<Type, Bytes> }| {
@@ -623,74 +463,17 @@ fn keyed_bodies(
     span: |sp: Span| sp,
   };
   let out = bodies.fold(
-    { bodies: [], state: { table: table, keyed: keyed } },
+    { bodies: [], state: { table: table, keyed: Map::new() } },
     |acc: { bodies: List<TypedBody<Bytes>>, state: { table: TypeTable, keyed: Map<Type, Bytes> } }, b: TypedBody<Type>| {
-      let o = retyped(b.body, acc.state, keying);
-      {
-        bodies: acc.bodies.push({ owner: b.owner, module: b.module, part: b.part, body: o.out }),
-        state: o.state,
-      }
+      let o = body_retyped(b, acc.state, keying);
+      { bodies: acc.bodies.push(o.out), state: o.state }
     },
   );
   { bodies: out.bodies, types: out.state.table }
 }
 
-/// Each row a walk found, resolved under the check's final substitution and read in its owner's
-/// numbering, as `settled_sites` reads types. A read of a definition generic over no row files none.
-fn settled_rows(checker: Checker) -> List<RowSite> / {abort.raise} = {
-  let numbering_of = |owner: Bytes|
-    match def_of(checker, owner) {
-      Some(d) -> { rows: by_place(d.scheme.row_vars), labels: by_place(d.scheme.label_vars) },
-      None -> { rows: Map::new(), labels: Map::new() },
-    };
-  checker.rows_at.fold(
-    { sites: [], owner: b"", numbering: numbering_of(b"") },
-    |acc: RowSettling, r: RowAt| {
-      let numbering = if r.owner == acc.owner { acc.numbering } else { numbering_of(r.owner) };
-      let read = |row: Row| row_numbered(resolve_row_in(checker, row), numbering);
-      let filed = match r.found {
-        ReadOf(x) -> {
-          // A read inside the recursive group being inferred shares the variables its scheme did
-          // not quantify, so the definition is used at its own there.
-          let filled = |v: Int|
-            range(0, x.quantified.len()).fold(v, |w: Int, i: Int|
-              if x.quantified.get(i) == v { x.filled.get(i) } else { w });
-          let vars = match def_of(checker, x.named) {
-            Some(d) -> d.scheme.row_vars.map(filled),
-            None -> x.filled,
-          };
-          if vars.len() == 0 { None }
-          else { Some(RowArguments(vars.map(|v: Int| read(row_open(v))))) }
-        },
-        RowOf(row) -> Some(Performs(read(row))),
-        AtomOf(atom) ->
-          Some(PerformsAtom(atom_numbered(resolve_atom(checker.subst, atom), numbering.labels))),
-        FilledOf(rows) -> Some(RowArguments(rows.map(read))),
-      };
-      {
-        sites: match filed {
-          Some(f) ->
-            acc.sites.push({
-              module: r.module,
-              site: r.span.site,
-              filed: f,
-              owner: r.owner,
-              answers: r.answers,
-            }),
-          None -> acc.sites,
-        },
-        owner: r.owner,
-        numbering: numbering,
-      }
-    },
-  ).sites
-}
-
 /// An owner's row and label variables, each by its place in the owner's scheme.
 type RowNumbering = { rows: Map<Int, Int>, labels: Map<Int, Int> }
-
-/// Rows settled so far, and the owner of the last with its numbering.
-type RowSettling = { sites: List<RowSite>, owner: Bytes, numbering: RowNumbering }
 
 /// `row`, resolved, read in `numbering`: what it ends in by its place among the row variables, and
 /// each label its atoms name by its place among the label variables. A row variable the owner does
@@ -725,17 +508,7 @@ fn law_sorts(checker: Checker) -> Map<Bytes, Map<Int, Int>> / {abort.raise} =
       by_place(vars_in(l.binders.map(|b: LawBinder| resolve(checker, b.ty)))),
     ))
 
-/// Sites settled so far: each site, the table their types are held in, the key of each type a site
-/// held, and the owner of the last site with its numbering.
-type Settling = {
-  sites: List<TypedSite>,
-  types: TypeTable,
-  keyed: Map<Type, Bytes>,
-  owner: Bytes,
-  numbering: Map<Int, Int>,
-}
-
-/// `ty` held in `table`, found in `keyed` where a site held it already.
+/// `ty` held in `table`, found in `keyed` where it was held already.
 fn held_once(
   table: TypeTable,
   keyed: Map<Type, Bytes>,
@@ -795,9 +568,13 @@ fn renumbers(ty: Type) -> Bool =
         || x.fields.fold(false, |found: Bool, f: Field| found || renumbers(f.ty)),
   }
 
-/// The elaboration, and the definitions whose calls the checker saw end, which are the recursive
-/// ones a proof may unroll.
-pub type Elaborated = { elaboration: Elaboration, ends: Map<Bytes, Bool>, stated: Map<Bytes, Bool> }
+/// What a check of a program found: which definitions end, which end by the measures they state,
+/// and each body it settled.
+pub type Elaborated = {
+  ends: Map<Bytes, Bool>,
+  stated: Map<Bytes, Bool>,
+  bodies: List<TypedBody<Type>>,
+}
 
 pub fn elaborated(
   resolved: Resolved,
@@ -806,9 +583,9 @@ pub fn elaborated(
   let out = check_program(resolved, mods);
   if has_error(out.checker.diags) { None } else {
     Some({
-      elaboration: elaboration_of(out.checker),
       ends: ended(out.checker.defs),
       stated: stated(out.checker.defs),
+      bodies: settled_bodies(out.checker),
     })
   }
 }
@@ -822,75 +599,34 @@ pub fn stated(defs: List<DefInfo>) -> Map<Bytes, Bool> =
   defs.fold(Map::new(), |acc: Map<Bytes, Bool>, def_info: DefInfo|
     match def_info.ending { Stated -> acc.insert(def_info.name, true), _ -> acc })
 
-/// The same, with the definitions `known` holds rows for published from them rather than walked: only
-/// a walked body's updates are shaped.
-pub fn elaboration_with(
+/// The bodies a check of `mods` settles, with the definitions `known` holds rows for published from
+/// them rather than walked.
+pub fn bodies_with(
   resolved: Resolved,
   mods: List<ParsedModule>,
   known: Known,
-) -> Option<Elaboration> / {abort.raise} = {
+) -> Option<List<TypedBody<Type>>> / {abort.raise} = {
   let out = check_program_with(resolved, mods, known);
-  if has_error(out.checker.diags) { None } else { Some(elaboration_of(out.checker)) }
+  if has_error(out.checker.diags) { None } else { Some(settled_bodies(out.checker)) }
 }
 
-/// What the check found of module `module`'s items that writing them out reads, each item's under
-/// its owner, by site.
-type Owned = {
-  members: Map<Bytes, Map<Int, MemberCallee>>,
-  shapes: Map<Bytes, Map<Int, List<Bytes>>>,
-  answered: Map<Bytes, Map<Int, Answered>>,
-  ops: Map<Bytes, Map<Int, Bytes>>,
-  refs: Map<Bytes, Map<Int, List<NumericWitness>>>,
-  orders: Map<Bytes, List<Bytes>>,
-}
-
-/// `m` with `x` filed at `site` under `owner`.
-fn filed_under<v>(
-  m: Map<Bytes, Map<Int, v>>,
-  owner: Bytes,
-  site: Int,
-  x: v,
-) -> Map<Bytes, Map<Int, v>> = {
-  let sites = match m.get(owner) { Some(s) -> s, None -> Map::new() };
-  m.insert(owner, sites.insert(site, x))
-}
-
-fn of_owner<v>(m: Map<Bytes, Map<Int, v>>, owner: Bytes) -> Map<Int, v> =
-  match m.get(owner) { Some(s) -> s, None -> Map::new() }
-
-fn owned_in(
-  e: Elaboration,
-  module: Int,
-  signatures: Map<Bytes, Parameters>,
-) -> Owned / {abort.raise} =
-  {
-    members: members_in(e.members, module, signatures),
-    shapes: e.updates.fold(Map::new(), |acc: Map<Bytes, Map<Int, List<Bytes>>>, s: UpdateShape|
-      if s.module != module { acc } else { filed_under(acc, s.owner, s.site, s.names) }),
-    answered: e.tries.fold(Map::new(), |acc: Map<Bytes, Map<Int, Answered>>, s: TrySite|
-      if s.module != module { acc }
-      else { filed_under(acc, s.owner, s.site, { effect: s.effect, op: s.op, arity: s.arity }) }),
-    ops: e.ops.fold(Map::new(), |acc: Map<Bytes, Map<Int, Bytes>>, o: WitnessOp|
-      if o.module != module { acc } else { filed_under(acc, o.owner, o.site, o.param) }),
-    // A call's witnesses in its callee's scheme order, the order its witness parameters take.
-    refs: e.refs.fold(
-      Map::new(),
-      |acc: Map<Bytes, Map<Int, List<NumericWitness>>>, r: WitnessRef|
-        if r.module != module { acc } else {
-          let ranked = range(0, r.params.len()).fold([], |sorted: List<Int>, k: Int| {
-            let n = sorted.len();
-            let i = range(0, n).fold(n, |p: Int, j: Int|
-              if p < n { p }
-              else if r.params.get(k) < r.params.get(sorted.get(j)) { j }
-              else { p });
-            sorted.take(i).push(k).concat(sorted.drop(i))
-          });
-          filed_under(acc, r.owner, r.site, ranked.map(|k: Int| r.witnesses.get(k)))
+/// `bodies` as a row stores them, each type read off `types`, the table it names them in.
+pub fn bodies_read(bodies: List<TypedBody<Bytes>>, types: TypeTable) -> List<TypedBody<Type>> / {abort.raise} =
+  bodies.fold(
+    { out: [], read: Map::new() },
+    |acc: { out: List<TypedBody<Type>>, read: Map<Bytes, Type> }, b: TypedBody<Bytes>| {
+      let o = body_retyped(b, acc.read, {
+        ty: |k: Bytes, seen: Map<Bytes, Type>| {
+          let t = type_at(types, k, seen);
+          { ty: t.ty, state: t.read }
         },
-    ),
-    orders: e.orders.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, o: WitnessOrder|
-      if o.module != module { acc } else { acc.insert(o.name, o.params) }),
-  }
+        row: |r: Row| r,
+        atom: |a: Atom| a,
+        span: |sp: Span| sp,
+      });
+      { out: acc.out.push(o.out), read: o.state }
+    },
+  ).out
 
 /// The owner what a check finds of `item`'s nodes is filed under: a definition's own name, a test's
 /// and a law's as `test_owner` and `law_owner` name them; none for an item with no body.
@@ -901,74 +637,6 @@ pub fn item_owner(module: Bytes, item: Item) -> Bytes / {abort.raise} =
     ILaw(d) -> law_owner(module, d.name),
     _ -> b"",
   }
-
-/// A module with every tagged literal written out as the call it runs as, every call on a value
-/// as the call of its type's function, every record update as the literal it stands for, and
-/// every `try` as its `handle`, each item by what was found of its own nodes. The tagged literals go
-/// first: they need nothing of the checker, and what they become is forms the others already walk.
-/// A handler's variables go last, so what reads them is in the forms it is lowered in. With
-/// `witnessed`, every `numeric` or `integer` parameter's witness is passed and read too.
-fn written_out(m: ParsedModule, o: Owned, witnessed: Bool) -> Module / {abort.raise} = {
-  let tagged = expand_tagged(m.module);
-  let items = tagged.items.map(|item: Item| {
-    let owner = item_owner(m.name, item);
-    tried_item(
-      updated_item(member_called_item(item, of_owner(o.members, owner)), of_owner(o.shapes, owner)),
-      of_owner(o.answered, owner),
-    )
-  });
-  let out = expand_handler_vars(expand_holds({ ..tagged, items: items }));
-  if !witnessed { out } else {
-    {
-      ..out,
-      items: out.items.map(|item: Item| {
-        let owner = item_owner(m.name, item);
-        witnessed_item(item, of_owner(o.ops, owner), of_owner(o.refs, owner), o.orders)
-      }),
-    }
-  }
-}
-
-/// The modules written out, and every `numeric` or `integer` parameter's witness passed and read:
-/// what the emitter lowers, and what only the checker knows. `signatures` are the resolver's of
-/// these modules, which say what a call on a value fills.
-pub fn expanded_mods(
-  mods: List<ParsedModule>,
-  elaboration: Elaboration,
-  signatures: Map<Bytes, Parameters>,
-) -> List<ParsedModule> / {abort.raise} =
-  range(0, mods.len()).map(|i: Int| expanded_mod(mods, i, elaboration, signatures))
-
-/// Module `i` of `mods` as `expanded_mods` writes it out.
-pub fn expanded_mod(
-  mods: List<ParsedModule>,
-  i: Int,
-  elaboration: Elaboration,
-  signatures: Map<Bytes, Parameters>,
-) -> ParsedModule / {abort.raise} = {
-  let m: ParsedModule = mods.get(i);
-  {
-    name: m.name,
-    module: written_out(m, owned_in(elaboration, i, signatures), true),
-    derived: m.derived,
-  }
-}
-
-/// The modules written out and no witness passed: what a claim lowers, since the prover draws every
-/// type parameter as `Int` and reads an operator over one as `Int`'s.
-pub fn updated_mods(
-  mods: List<ParsedModule>,
-  elaboration: Elaboration,
-  signatures: Map<Bytes, Parameters>,
-) -> List<ParsedModule> / {abort.raise} =
-  range(0, mods.len()).map(|i: Int| {
-    let m: ParsedModule = mods.get(i);
-    {
-      name: m.name,
-      module: written_out(m, owned_in(elaboration, i, signatures), false),
-      derived: m.derived,
-    }
-  })
 
 /// Every use of a label-generic definition is a call, and every call fills its labels.
 fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
@@ -1017,17 +685,7 @@ fn check_label_apps(checker: Checker) -> Checker / {abort.raise} = {
           },
           _ -> unfilled,
         })
-      } else {
-        {
-          ..in_module,
-          label_sites: in_module.label_sites.push({
-            module: a.module,
-            site: a.span.site,
-            labels: names,
-            owner: a.owner,
-          }),
-        }
-      }
+      } else { in_module }
     };
     { ..judged, module: c.module }
   });
@@ -1364,17 +1022,37 @@ fn placed(src: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diags(checked_m(src).checker.diags).map(|diag: Diag|
     [diag.code].concat(diag.labels.map(|label: Label| src.slice(label.start, label.end))))
 
-/// Each type the check behind `checker` filed at `at`, its site and place, a function's written
-/// without its row.
-fn filed_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  checker.typed.filter(|t: TypedAt| t.span == at).map(|t: TypedAt| shown(resolve(checker, t.ty)))
+/// The bodies the check behind `checker` settled in module 0, each place counted from the start of
+/// the module's text.
+fn settled_m(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
+  let key = |owner: Bytes, part: BodyPart| Bytes::concat_all([owner, b"#", part_key(part)]);
+  let bases = checker.typed_bodies.fold(Map::new(), |m: Map<Bytes, Int>, b: WalkedTree|
+    m.insert(key(b.owner, b.part), b.base));
+  settled_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).map(|b: TypedBody<Type>| {
+    let base = match bases.get(key(b.owner, b.part)) { Some(x) -> x, None -> 0 };
+    body_retyped(b, (), {
+      ty: |t: Type, s: Unit| { ty: t, state: s },
+      row: |r: Row| r,
+      atom: |a: Atom| a,
+      span: |sp: Span| { ..sp, start: sp.start + base, end: sp.end + base },
+    }).out
+  })
+}
 
-/// Each type the check behind `checker` filed for a node written from `at.start` to `at.end`, none
-/// made for another.
+/// The nodes of the bodies the check behind `checker` settled in module 0 whose places `picked`
+/// picks.
+fn nodes_where(checker: Checker, picked: (Span) -> Bool) -> List<TypedExpr<Type>> / {abort.raise} =
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).filter(
+    |e: TypedExpr<Type>| picked(e.span),
+  )
+
+/// Whether `s` is the place of a node written from `at.start` to `at.end`, none made for another.
+fn written_over(s: Span, at: Span) -> Bool =
+  s.start == at.start && s.end == at.end && s.site > 0 && s.site < site_digit()
+
+/// The type of each node written from `at.start` to `at.end`, a function's written without its row.
 fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  checker.typed.filter(|t: TypedAt|
-    t.span.start == at.start && t.span.end == at.end && t.span.site > 0
-      && t.span.site < site_digit()).map(|t: TypedAt| shown(resolve(checker, t.ty)))
+  nodes_where(checker, |s: Span| written_over(s, at)).map(|e: TypedExpr<Type>| shown(e.ty))
 
 /// The expression of module 0 of the check behind `checker` written from `at.start` to `at.end`.
 fn written_node(checker: Checker, at: Span) -> Expr / {abort.raise} =
@@ -1401,81 +1079,108 @@ fn placed_in(src: Bytes, from: Bytes, to: Bytes) -> Span / {abort.raise} =
     },
   }
 
-test "each closure a handle, a simulate and a parallel make is filed at a place of its own, and a handle's answer at the handle" {
-  let src = Bytes::concat_all([
-    b"effect amb {\n  multi read flip() -> Bool\n}\n",
-    b"effect link {\n  write send[s](payload: Int) -> Int\n}\n",
-    b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
-    b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
-    b"fn tagged(x: Int) -> Int = handle { forward[conn](x) } with { link.send[*t](p) -> p + 1 }\n",
-    b"fn summed(n: Int) -> Int = { let (a, b) = parallel { n + 1, n > 2 }; a }\n",
-    b"fn ticked() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
-  ]);
-  let checker = checker_m(src);
-  let at = |from: Bytes, to: Bytes| written_at(checker, placed_in(src, from, to));
-  let node = |from: Bytes, to: Bytes| expr_span(written_node(checker, placed_in(src, from, to)));
-  let branch = |text: Bytes| {
-    let s = placed_in(src, text, text).start;
-    filed_at(checker, branch_at(written_node(checker, span_between(s, s + text.len()))))
+/// `row` as a reader writes it: a row variable as `e` and a label variable as `l` with its place
+/// among its owner's, `?` for a label its owner does not quantify.
+fn row_text(row: Row) -> Bytes / {abort.raise} = {
+  let atoms = Bytes::join(row.atoms.map(atom_placed_text), b", ");
+  let tail = match row.tail {
+    None -> b"",
+    Some(v) ->
+      Bytes::concat_all([if atoms.len() == 0 { b"" } else { b" " }, b"| ", place_text(b"e", v)]),
   };
-  // A clause takes its operation's parameters, the label it binds and its continuation, and answers
-  // the handle's answer where it resumes, the operation's answer otherwise.
-  assert_eq(at(b"amb.flip() resume", b", return"), [b"((Bool) -> Int) -> Int"]);
-  assert_eq(at(b"link.send[*t]", b" }\n"), [b"(Int, String) -> Int"]);
-  assert_eq(at(b"return v", b" }\n"), [b"(Int) -> Int"]);
-  assert_eq(at(b"handle { if", b"\nfn tagged"), [b"Int"]);
-  assert_eq(filed_at(checker, detached_at(node(b"handle { if", b"\nfn tagged"))), [b"() -> Int"]);
-  assert_eq(filed_at(checker, simulated_at(node(b"simulate", b"\n"))), [b"() -> Int"]);
-  assert_eq(branch(b"n + 1"), [b"() -> Int"]);
-  assert_eq(branch(b"n > 2"), [b"() -> Bool"])
+  Bytes::concat_all([b"{", atoms, tail, b"}"])
 }
 
-test "a clause binding its continuation files what resuming it performs, which no filed type holds" {
+fn atom_placed_text(atom: Atom) -> Bytes / {abort.raise} = {
+  let resource = match atom.resource {
+    RSingleton -> b"",
+    RAny -> b"[*]",
+    RNamed(n) -> Bytes::concat_all([b"[", n, b"]"]),
+    RVar(v) -> Bytes::concat_all([b"[", place_text(b"l", v), b"]"]),
+  };
+  Bytes::concat_all([
+    atom.effect,
+    b".",
+    match atom.op { Some(op) -> op, None -> mode_text(atom.mode) },
+    resource,
+  ])
+}
+
+fn place_text(letter: Bytes, place: Int) -> Bytes / {abort.raise} =
+  if place < 0 { b"?" } else { letter.concat(ascii_of_int(place)) }
+
+/// What the node `e` performs, or the rows a read of it fills, as a reader writes them.
+fn rows_of_node(e: TypedExpr<Type>) -> List<Bytes> / {abort.raise} = {
+  let filled = |rows: List<Row>|
+    if rows.len() == 0 { [] }
+    else { [Bytes::concat_all([b"[", Bytes::join(rows.map(row_text), b", "), b"]"])] };
+  match e.node {
+    TypedRead(ReadDefinition(d)) -> filled(d.rows),
+    TypedRead(ReadBuiltin(f)) -> filled(f.rows),
+    TypedLambda(l) -> [row_text(l.row)],
+    TypedSimulate(t) -> [row_text(t.row)],
+    TypedHandle(h) -> [row_text(h.row)],
+    TypedPerform(p) -> [atom_placed_text(p.atom)],
+    _ -> [],
+  }
+}
+
+/// What each node, clause, `return` clause and `parallel` branch of the bodies the check behind
+/// `checker` settled in module 0 performs, or the rows a read fills, where `picked` picks its place;
+/// a branch's place is its body's.
+fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
+  settled_m(checker).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
+    |e: TypedExpr<Type>| {
+      let own = if picked(e.span) { rows_of_node(e) } else { [] };
+      match e.node {
+        TypedHandle(h) ->
+          own.concat(
+            h.clauses.filter(|c: TypedClause<Type>| picked(c.span)).map(
+              |c: TypedClause<Type>| row_text(c.row),
+            ),
+          ).concat(
+            match h.ret { Some(r) -> if picked(r.span) { [row_text(r.row)] } else { [] }, None -> [] },
+          ),
+        TypedParallel(ts) ->
+          own.concat(
+            ts.filter(|t: TypedThunk<Type>| picked(t.body.span)).map(|t: TypedThunk<Type>|
+              row_text(t.row)),
+          ),
+        _ -> own,
+      }
+    },
+  )
+
+/// The rows at `at`, its site and place.
+fn rows_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  rows_where(checker, |s: Span| s == at)
+
+/// The rows of the nodes written from `at.start` to `at.end`, none made for another.
+fn rows_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+  rows_where(checker, |s: Span| written_over(s, at))
+
+/// The checker of a check of `m` holding `src`, which checks. No row its bodies settle to names a
+/// label its owner's scheme does not quantify.
+fn rowed_m(src: Bytes) -> Checker / {abort.raise} = {
+  let checker = checker_m(src);
+  assert_eq(rows_where(checker, |s: Span| true).filter(|t: Bytes| t.index_of(b"?") != None), []);
+  checker
+}
+
+test "a clause binding its continuation holds what resuming it performs" {
   let src = Bytes::concat_all([
     b"effect amb {\n  multi read flip() -> Bool\n}\n",
     b"effect trace {\n  write step() -> Unit\n}\n",
     b"fn traced() -> Int / {trace.write} = handle { let b = amb.flip(); trace.step(); if b { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false) }\n",
   ]);
-  let checker = rowed_m(src);
-  let written = placed_in(src, b"amb.flip() resume", b" }\n");
-  let clause = match checker.typed.filter(|t: TypedAt|
-      t.span.start == written.start && t.span.end == written.end && t.span.site < site_digit()) {
-    [t, ..] -> t.span,
-    [] -> panic("the clause is filed nowhere"),
-  };
-  assert_eq(rows_at(checker, resumed_at(clause)), [b"{m.trace.step}"])
-}
-
-/// The rows the check behind `checker` filed at the places of module 0 `picked` picks, as a reader
-/// writes them.
-fn rows_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} = {
-  let noted = checker.rows_at.filter(|r: RowAt| r.module == 0 && picked(r.span));
-  settled_rows(checker).filter(|s: RowSite|
-    s.module == 0
-      && noted.fold(false, |found: Bool, r: RowAt|
-        found || (r.owner == s.owner && r.span.site == s.site))).map(|s: RowSite|
-    filed_rows_text(s.filed))
-}
-
-/// The rows filed at `at`, its site and place.
-fn rows_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  rows_where(checker, |s: Span| s == at)
-
-/// The rows filed for a node written from `at.start` to `at.end`, none made for another.
-fn rows_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
-  rows_where(checker, |s: Span|
-    s.start == at.start && s.end == at.end && s.site > 0 && s.site < site_digit())
-
-/// The checker of a check of `m` holding `src`, which checks. No row it files names a label its
-/// owner's scheme does not quantify.
-fn rowed_m(src: Bytes) -> Checker / {abort.raise} = {
-  let checker = checker_m(src);
-  assert_eq(
-    settled_rows(checker).map(|s: RowSite| filed_rows_text(s.filed)).filter(|t: Bytes|
-      t.index_of(b"?") != None),
-    [],
+  let resumed = settled_m(rowed_m(src)).flat_map(|b: TypedBody<Type>| typed_nodes(b.body)).flat_map(
+    |e: TypedExpr<Type>|
+      match e.node {
+        TypedHandle(h) -> h.clauses.map(|c: TypedClause<Type>| row_text(c.resumed)),
+        _ -> [],
+      },
   );
-  checker
+  assert_eq(resumed, [b"{m.trace.step}"])
 }
 
 fn log_and_link() -> Bytes =
@@ -1486,7 +1191,7 @@ fn log_and_link() -> Bytes =
     b"fn into<|e>(g: () -> Int / {log.note | e}) -> Int / {log.note | e} = g()\n",
   ])
 
-test "a read of a definition generic over rows files what it fills each of them with, a label as the reader's own" {
+test "a read of a definition generic over rows holds what it fills each of them with, a label as the reader's own" {
   let src = log_and_link().concat(
     Bytes::concat_all([
       b"fn logged() -> Int / {log.write} = apply(|| { log.note(1); 2 })\n",
@@ -1522,7 +1227,7 @@ test "a row variable nothing settles ends the row it is read in" {
   assert_eq(rows_written_at(checker, placed_in(src, b"run(1)", b"(1)")), [b"[{}]"])
 }
 
-test "a lambda is filed with its own row, however wide the place it is passed to" {
+test "a lambda holds its own row, however wide the place it is passed to" {
   let src = log_and_link().concat(
     Bytes::concat_all([
       b"fn quiet() -> Int / {log.write} = into(|| 3)\n",
@@ -1538,28 +1243,7 @@ test "a lambda is filed with its own row, however wide the place it is passed to
   assert_eq(at(b"|| f()", b")\n"), [b"{| e0}"])
 }
 
-test "a call through a function value is filed with the row of the type it calls through" {
-  let src = log_and_link().concat(
-    Bytes::concat_all([
-      b"effect amb {\n  multi read flip() -> Bool\n}\n",
-      b"type Job = { run: () -> Int / {log.write} }\n",
-      b"fn ran(j: Job) -> Int / {log.write} = j.run()\n",
-      b"fn both() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) + k(false), return v -> v * 10 }\n",
-      b"fn called() -> Int = apply(|| 1)\n",
-    ]),
-  );
-  let checker = rowed_m(src);
-  let at = |from: Bytes, to: Bytes| rows_written_at(checker, placed_in(src, from, to));
-  assert_eq(at(b"f()", b"\n"), [b"{| e0}"]);
-  assert_eq(at(b"g()", b"\n"), [b"{m.log.note | e0}"]);
-  assert_eq(at(b"j.run()", b"\n"), [b"{m.log.write}"]);
-  // A continuation performs what the rest of the body does, which the clause answers.
-  assert_eq(at(b"k(true)", b" + k"), [b"{}"]);
-  // A call of a definition files its rows where the definition is read.
-  assert_eq(at(b"apply(|| 1)", b"\n"), [])
-}
-
-test "a handle files its body's row as its clauses open it, and each clause's and its return clause's own" {
+test "a handle holds its body's row as its clauses open it, and each clause's and its return clause's own" {
   let src = log_and_link().concat(
     Bytes::concat_all([
       b"fn caught() -> Int / {link.send[conn]} = handle { log.note(1); link.send[conn](2) } with { log.note(n) -> { let _ = link.send[conn](n); () }, return v -> v + 1 }\n",
@@ -1574,14 +1258,12 @@ test "a handle files its body's row as its clauses open it, and each clause's an
   assert_eq(at(b"return v", b" }\n"), [b"{}"]);
   assert_eq(at(b"handle { k() } with { log.note(n) -> () }\n", b"\n"), [b"{m.log.note | e0}"]);
   // Over a lambda's parameter, what it is handed comes to hold the operations the clauses answer.
-  let local = b"handle { k() } with { log.note(n) -> () };";
-  assert_eq(at(local, b";"), [b"{m.log.note}"]);
-  assert_eq(at(b"k() } with { log.note(n) -> () };", b" }"), [b"{m.log.note}"]);
+  assert_eq(at(b"handle { k() } with { log.note(n) -> () };", b";"), [b"{m.log.note}"]);
   assert_eq(at(b"log.note(n) -> () };", b" };"), [b"{}"]);
   assert_eq(at(b"|k| handle", b"; run"), [b"{}"])
 }
 
-test "a try files its body's row, and the clauses it is written out with perform nothing" {
+test "a try holds its body's row, and the clauses it is written out with perform nothing" {
   let src = Bytes::concat_all([
     b"effect parse {\n  raise bad(why: String)\n}\n",
     b"effect log {\n  write note(n: Int) -> Unit\n}\n",
@@ -1596,7 +1278,7 @@ test "a try files its body's row, and the clauses it is written out with perform
   assert_eq(rows_at(checker, at.clause), [b"{}"])
 }
 
-test "each branch of a `parallel` is filed with what it performs" {
+test "each branch of a `parallel` holds what it performs" {
   let src = Bytes::concat_all([
     b"effect log {\n  write note(n: Int) -> Unit\n}\n",
     b"fn summed(n: Int) -> Int / {log.write} = { let (a, b) = parallel { n + 1, { log.note(n); n } }; a + b }\n",
@@ -1604,13 +1286,13 @@ test "each branch of a `parallel` is filed with what it performs" {
   let checker = rowed_m(src);
   let branch = |text: Bytes| {
     let s = placed_in(src, text, text).start;
-    rows_at(checker, branch_at(written_node(checker, span_between(s, s + text.len()))))
+    rows_at(checker, expr_span(written_node(checker, span_between(s, s + text.len()))))
   };
   assert_eq(branch(b"n + 1"), [b"{}"]);
   assert_eq(branch(b"{ log.note(n); n }"), [b"{m.log.note}"])
 }
 
-test "a perform files its atom, on a label parameter as its definition's own" {
+test "a perform holds its atom, on a label parameter as its definition's own" {
   let src = log_and_link().concat(
     Bytes::concat_all([
       b"fn forward<[l]>(x: Int) -> Int / {link.send[l]} = link.send[l](x)\n",
@@ -1628,7 +1310,7 @@ test "a perform files its atom, on a label parameter as its definition's own" {
   assert_eq(at(b"log.note(3)", b"\n"), [b"m.log.note"])
 }
 
-test "the constructor a `?` hands its failure on by is filed at the `?`, as a written one is" {
+test "the constructor a `?` hands its failure on by is read at the `?`, as a written one is" {
   let src = Bytes::concat_all([
     b"fn half(n: Int) -> Result<Int, String> = if n > 0 { Ok(n) } else { Err(\"no\") }\n",
     b"fn quarter(n: Int) -> Result<Int, String> = { let h = half(n)?; half(h) }\n",
@@ -1638,7 +1320,7 @@ test "the constructor a `?` hands its failure on by is filed at the `?`, as a wr
   assert_eq(written_at(checker, span_between(q, q + 1)), [b"(String) -> Result<Int, String>"])
 }
 
-test "the parts of the handle a try is written out as are filed where the rewrite puts them" {
+test "the parts of the handle a try is written out as stand where the rewrite puts them" {
   let src = Bytes::concat_all([
     b"effect parse {\n  raise bad(why: String)\n  raise missing(key: String, line: Int)\n}\n",
     b"fn digit(b: Int) -> Int / {parse.bad} = if b < 10 { b } else { parse.bad(\"no\") }\n",
@@ -1647,24 +1329,23 @@ test "the parts of the handle a try is written out as are filed where the rewrit
     b"fn found(key: String) -> Int = match try { lookup(key) } { Ok(n) -> n, Err(_) -> 0 }\n",
   ]);
   let checker = checker_m(src);
+  let typed = |at: Span|
+    nodes_where(checker, |s: Span| s == at).map(|e: TypedExpr<Type>| shown(e.ty));
   let one = expr_span(written_node(checker, placed_in(src, b"try { digit", b"\n")));
   let at = try_places(one);
   let result = b"Result<Int, String>";
-  assert_eq(filed_at(checker, one), [result]);
-  assert_eq(filed_at(checker, at.ret), [b"(Int) -> ".concat(result)]);
-  assert_eq(filed_at(checker, at.clause), [b"(String) -> ".concat(result)]);
-  assert_eq(filed_at(checker, at.ok), [b"(Int) -> ".concat(result)]);
-  assert_eq(filed_at(checker, at.err), [b"(String) -> ".concat(result)]);
-  assert_eq(filed_at(checker, at.carried), []);
+  assert_eq(typed(one), [result]);
+  assert_eq(typed(at.ok), [b"(Int) -> ".concat(result)]);
+  assert_eq(typed(at.err), [b"(String) -> ".concat(result)]);
+  assert_eq(typed(at.carried), []);
   // A raise of several values is carried as the record of them, which has a place of its own.
   let lookup = b"try { lookup(key) }";
   let s = placed_in(src, lookup, lookup).start;
   let several = try_places(expr_span(written_node(checker, span_between(s, s + lookup.len()))));
-  assert_eq(filed_at(checker, several.carried).len(), 1);
-  assert_eq(filed_at(checker, several.clause).len(), 1)
+  assert_eq(typed(several.carried).len(), 1)
 }
 
-test "a default a call takes is filed at a place of its own in the call, at the call's types" {
+test "a default a call leaves out is among its arguments, at the call's types" {
   let src = Bytes::concat_all([
     b"type Box = | Box(Int)\n",
     b"fn greet(name: String, title: Option<String> = None) -> Int = match title { Some(_) -> 1, None -> 0 }\n",
@@ -1676,18 +1357,26 @@ test "a default a call takes is filed at a place of its own in the call, at the 
     b"fn measured(b: Box) -> Int = b.size()\n",
   ]);
   let checker = checker_m(src);
-  // Each type filed in the call `call` writes, at a place no node written there takes.
-  let placed = |call: Bytes| {
+  // The type of the last argument of the call `call` writes.
+  let last = |call: Bytes| {
     let s = placed_in(src, call, call).start;
-    checker.typed.filter(|t: TypedAt|
-      t.span.start == s && t.span.end == s + call.len() && t.span.site != 0).map(|t: TypedAt|
-      shown(resolve(checker, t.ty)))
+    nodes_where(checker, |sp: Span| sp.start == s && sp.end == s + call.len()).fold(
+      [],
+      |acc: List<Bytes>, e: TypedExpr<Type>|
+        match e.node {
+          TypedCall(c) -> match c.args.at(c.args.len() - 1) {
+            Some(a) -> acc.push(shown(a.ty)),
+            None -> acc,
+          },
+          _ -> acc,
+        },
+    )
   };
-  assert_eq(placed(b"greet(\"a\")"), [b"Option<String>"]);
-  assert_eq(placed(b"pick(\"s\")"), [b"Option<String>"]);
-  assert_eq(placed(b"pick(1)"), [b"Option<Int>"]);
-  assert_eq(placed(b"assert(n > 0)"), [b"Option<String>"]);
-  assert_eq(placed(b"b.size()"), [b"Option<Int>"])
+  assert_eq(last(b"greet(\"a\")"), [b"Option<String>"]);
+  assert_eq(last(b"pick(\"s\")"), [b"Option<String>"]);
+  assert_eq(last(b"pick(1)"), [b"Option<Int>"]);
+  assert_eq(last(b"assert(n > 0)"), [b"Option<String>"]);
+  assert_eq(last(b"b.size()"), [b"Option<Int>"])
 }
 
 test "a definition's scheme is generalized and its footprint inferred" {
@@ -2107,11 +1796,16 @@ test "a definition's witnesses take its scheme's order, which its calls pass the
   assert(passed.fold(false, |b: Bool, ws: List<NumericWitness>| b || ws == [ParamWitness(b"a")]))
 }
 
-/// The witnesses each call of module 0 of the check behind `checker` passes, in the order it passes
-/// them.
+/// The witnesses each read of a definition in module 0 of the check behind `checker` passes, in
+/// the order it passes them.
 fn passed_in(checker: Checker) -> List<List<NumericWitness>> / {abort.raise} =
-  owned_in(elaboration_in(checker), 0, Map::new()).refs.values().flat_map(
-    |m: Map<Int, List<NumericWitness>>| m.values(),
+  settled_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).flat_map(
+    |b: TypedBody<Type>|
+      typed_nodes(b.body).fold([], |acc: List<List<NumericWitness>>, e: TypedExpr<Type>|
+        match e.node {
+          TypedRead(ReadDefinition(d)) -> if d.witnesses.len() == 0 { acc } else { acc.push(d.witnesses) },
+          _ -> acc,
+        }),
   )
 
 /// A one-module program as the checker leaves it.

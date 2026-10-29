@@ -6,7 +6,7 @@
 
 import std.list
 import compiler.syntax.parsing (Span, dummy_span)
-import compiler.emit.code (Code, NApp, NVar)
+import compiler.emit.code (Code, NApp, NBuiltin)
 import compiler.check.types (Type, TyVar, TyCon, TyFn, TyRecord, TyNominal, Field, int_type,
                              bool_type, unit_type, option_type, record_fields)
 import compiler.check.resolve.tables (qualify)
@@ -17,13 +17,11 @@ import compiler.emit.layout (Intrinsic, OfList, OfMap, ListStart, TailLen, ListR
                              PairSet, PairTake, LeafCut, BranchCut, KidOut, KidBack, KidPut,
                              KidDrop, MapSwap, Recast, P, S, CaseLaid, Inline, classes, words,
                              intrinsic_named)
-import compiler.emit.reps (Def, has_vars, laid_vars, laid_inside, numeric_sum, laid_by_pointer)
+import compiler.emit.reps (Def, has_vars, laid_vars, numeric_sum, laid_by_pointer)
 import compiler.emit.answer (Layout)
 import compiler.emit.roots (builtin_helper, generated_builtin)
 import compiler.emit.release (released_vars)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, RWord, RSum, RFlat, Leaf,
-                          Var, Arg, AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer,
-                          OHandle, OCalling, Let, Prim, If, Static, rep_of_arg)
+import compiler.emit.tir (Rep, RInt, RBool, RWord, RSum, RFlat, Leaf, Var, Arg, AVar, AInt, AZero, RUnit, Make, MList, Native, Op, OContainer, OHandle, OCalling, Let, Prim, If, Static, rep_of_arg)
 import compiler.emit.tir.handling (Unsettled, Entering)
 import compiler.emit.tir.calling (Observed)
 import compiler.emit.lower.evidence (value_handing, builtin_row)
@@ -32,11 +30,9 @@ import compiler.emit.tir.containers (ContainerOp, Laid, Length, Elements, Within
                                      ColumnsOfList, ColumnsGet, ColumnField, ColumnOf, ItemAt, Rest,
                                      LeafOf, Room, Position, Element)
 import compiler.emit.lower.setting (imported_target, qualified, from_import, module_import,
-                                    builtin_at, prelude_ctor)
+                                    builtin_at)
 import compiler.emit.lower.held (held_as, laid_leaves)
-import compiler.emit.lower.base (Context, Lowering, Lowered, unreachable, bound_as, done, handed,
-                                 noted, filed, unfiled, type_of, as_words, opened, continued, fresh,
-                                 emitted)
+import compiler.emit.lower.base (Context, Lowering, Lowered, unreachable, bound_as, done, handed, noted, type_of, opened, continued, fresh, emitted, read_typed)
 import compiler.emit.lower.base
 import compiler.emit.lower.data (constructed_as)
 import compiler.emit.lower.scalars (operated, stated, binary, numeric_in_place, numeric_converted,
@@ -58,19 +54,17 @@ pub fn builtin(
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  if filed(cx, callee) == None && !name.starts_with(b"?") {
-    unfiled(cx, b"a builtin's call", callee)
-  } else { builtin_filed(cx, st, name, args, callee, at) }
+  builtin_filed(cx, st, name, args, callee, at)
 
 fn builtin_filed(
   cx: Context,
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match intrinsic_at(cx, name) {
@@ -145,7 +139,7 @@ fn empty_map(
   cx: Context,
   st: Lowering,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match called_at(cx, b"Map::new", callee).ret {
@@ -164,10 +158,8 @@ fn empty_map(
 pub fn columned(cx: Context, base: Code, name: Bytes) -> Bool =
   match base.node {
     NApp(a) -> match a.func.node {
-      NVar(f) -> if f.slot != None || a.args.len() != 2 || f.name != b"Columns::get"
-          || cx.setting.here.any(|d: Def| d.name == f.name)
-          || from_import(cx.setting.imports, f.name) != None { false }
-      else { match column_at(cx, a.func.span, name) { Some(_) -> true, None -> false } },
+      NBuiltin(f) -> if a.args.len() != 2 || f.name != b"Columns::get" { false }
+      else { match column_at(cx, a.func, name) { Some(_) -> true, None -> false } },
       _ -> false,
     },
     _ -> false,
@@ -183,7 +175,7 @@ pub fn column_read(
   name: Bytes,
   at: Span,
 ) -> Lowered / {abort.raise} =
-  match column_at(cx, match base.node { NApp(a) -> a.func.span, _ -> base.span }, name) {
+  match column_at(cx, match base.node { NApp(a) -> a.func, _ -> base }, name) {
     None -> unreachable(b"a field of a Columns' record no column holds: ".concat(name)),
     Some(c) -> match args {
       [xs, i] -> {
@@ -209,7 +201,7 @@ pub fn column_read(
 /// place among the record's fields, its type, and how its column lays it out.
 fn column_at(
   cx: Context,
-  callee: Span,
+  callee: Code,
   name: Bytes,
 ) -> Option<{ k: Int, ty: Type, column: Element }> =
   match called_at(cx, b"Columns::get", callee).args.at(0) {
@@ -231,11 +223,17 @@ fn column_at(
   }
 
 /// A list literal of `items`, each held as the item's type holds it and taken by the list, which
-/// lays it as that type lays it, of the type the checker filed for it.
-pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered / {abort.raise} =
-  match filed(cx, at) {
-    None -> unfiled(cx, b"a list", at),
-    Some(t) -> {
+/// lays it as that type lays it, of type `ty`.
+pub fn listed(
+  cx: Context,
+  st: Lowering,
+  items: List<Arg>,
+  ty: Type,
+  at: Span,
+) -> Lowered / {abort.raise} =
+  {
+    let t = { ty: ty };
+    {
       let item = match t.ty { TyCon(c) -> c.args.at(0), _ -> None };
       let held = items.fold(
         { st: match item { Some(i) -> layout_needed(st, i), None -> st }, args: [] },
@@ -255,7 +253,7 @@ pub fn listed(cx: Context, st: Lowering, items: List<Arg>, at: Span) -> Lowered 
         Make({ made: MList(items.len()), args: held.args, reuse: None }),
         at,
       )
-    },
+    }
   }
 
 /// Item `i` of the list `xs`, which a length test admitted, as a value of `item` is held: borrowed
@@ -330,13 +328,13 @@ fn layout_noted(st: Lowering, ty: Type) -> Lowering =
 /// builtin's declared scheme gives it at the type arguments filed there, and those type arguments.
 type Settled = { ret: Option<Type>, args: List<Type> }
 
-fn called_at(cx: Context, name: Bytes, callee: Span) -> Settled =
+fn called_at(cx: Context, name: Bytes, callee: Code) -> Settled =
   {
-    ret: match builtin_at(cx.setting, filed(cx, callee), name) {
+    ret: match builtin_at(cx.setting, Some(read_typed(callee)), name) {
       Some(c) -> Some(c.ret),
       None -> None,
     },
-    args: match filed(cx, callee) { Some(t) -> t.args, None -> [] },
+    args: read_typed(callee).args,
   }
 
 /// A builtin that is no scalar's: written in place where it reads or writes a container's cells, and
@@ -347,7 +345,7 @@ fn contained(
   name: Bytes,
   args: List<Arg>,
   f: Settled,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
 
@@ -439,7 +437,7 @@ fn called(
   name: Bytes,
   args: List<Arg>,
   f: Settled,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   if !cx.setting.builtins.contains(name) {
@@ -465,10 +463,10 @@ fn left_open(
   name: Bytes,
   args: List<Arg>,
   f: Settled,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} = {
-  let types = match builtin_at(cx.setting, filed(cx, callee), name) {
+  let types = match builtin_at(cx.setting, Some(read_typed(callee)), name) {
     Some(t) -> Some(t),
     None -> match f.ret {
       Some(ret) -> Some({ params: args.map(type_of), ret: ret }),
@@ -977,11 +975,11 @@ fn found_at(
         }),
         at,
       );
-      let some = constructed_as(cx, got.st, prelude_ctor(b"Some"), [got.arg], answer, at);
+      let some = constructed_as(cx, got.st, b"Some", [got.arg], answer, at);
       let none = constructed_as(
         cx,
         opened(continued(inside.st, some.st)),
-        prelude_ctor(b"None"),
+        b"None",
         [],
         answer,
         at,
@@ -1013,7 +1011,7 @@ fn positioned(
   cx: Context,
   st: Lowering,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match args {
@@ -1021,7 +1019,7 @@ fn positioned(
       let bw = handed({ st: st, arg: b }, RWord, at);
       let fr = handed({ st: bw.st, arg: from }, RInt, at);
       let fw = handed({ st: fr.st, arg: f }, RWord, at);
-      let words = value_handing(cx, fw.st, builtin_row(cx, callee), at);
+      let words = value_handing(cx, fw.st, builtin_row(callee), at);
       let ty = option_type(int_type());
       let index = bound_as(
         words.st,
@@ -1046,11 +1044,11 @@ fn positioned(
         Prim({ op: b"ge", on: RInt, args: [index.arg, AInt(0)] }),
         at,
       );
-      let some = constructed_as(cx, opened(found.st), prelude_ctor(b"Some"), [index.arg], ty, at);
+      let some = constructed_as(cx, opened(found.st), b"Some", [index.arg], ty, at);
       let none = constructed_as(
         cx,
         opened(continued(found.st, some.st)),
-        prelude_ctor(b"None"),
+        b"None",
         [],
         ty,
         at,
@@ -1068,7 +1066,7 @@ fn bracketed(
   cx: Context,
   st: Lowering,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} =
   match args {
@@ -1079,7 +1077,7 @@ fn bracketed(
         let rw = handed({ st: bw.st, arg: release }, RWord, at);
         let held = type_described(cx, rw.st, a.ret, at);
         let answer = type_described(cx, held.st, b.ret, at);
-        let words = value_handing(cx, answer.st, builtin_row(cx, callee), at);
+        let words = value_handing(cx, answer.st, builtin_row(callee), at);
         let ran = bound_as(
           done(
             words.st,

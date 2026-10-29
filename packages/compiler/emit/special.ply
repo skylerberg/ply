@@ -1,26 +1,18 @@
 //! Specialisation: definitions written at type arguments, and the needs that ask for them.
 
 import compiler.syntax.parsing (Ident)
-import compiler.emit.code (Code, lower_fn)
+import compiler.emit.code (Code)
 import compiler.syntax.items (FnDef)
 import compiler.check.resolve.tables (qualify)
-import compiler.check.resolve.scopes (of_binder)
-import compiler.check.infer.checker (WitnessOp)
-import compiler.check.types (Type, TyVar, TyCon, TyFn, TyNominal, Scheme)
+import compiler.check.types (Type, TyVar, Scheme)
+import compiler.check.typed (WholeBody)
 import std.list
-import compiler.syntax.exprs (Param, Expr)
-import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn)
-import compiler.expand.rewrite.shared (map_expr)
-import compiler.expand.rewrite (unwitnessed, witness_param, is_witness_param)
-import compiler.emit.c (KInt, Kind)
 import compiler.emit.keys (RootKey, Named, At, FnArg, RootName, root_name, filed_as, key_types,
                            key_lent)
-import compiler.emit.answer (Need, Scalar, Exact)
-import compiler.emit.reps (Ctors, Ty, TyOpen, Def, EmitParam, BoundLambda, Sig, sig_of, param_kinds,
-                           param_types, substituted, numeric_named, numeric_sum, filings_at,
-                           has_vars)
+import compiler.emit.answer (Need, Exact)
+import compiler.emit.reps (Def, EmitParam, BoundLambda, has_vars)
 import compiler.emit.typing (Filings, unknown_type)
-import compiler.emit.lower.setting (Setting, Root, params_carried, releasing_of)
+import compiler.emit.lower.setting (Setting, Root, root_body)
 import compiler.emit.lower (group_lowered, tail_calls, TailCall)
 import compiler.emit.lower.calling (holds_handle, instance_key)
 import compiler.emit.lower.handling (detaches)
@@ -28,48 +20,6 @@ import compiler.emit.tir (Fn)
 import compiler.emit.entry (formed_from, root_at)
 
 // --- Specialisation ----------------------------------------------------------------------------
-
-/// The scheme's number of each type parameter `def` writes by name, read off where its parameters'
-/// and answer's written types and its scheme's agree.
-fn generics_numbered(def: FnDef, scheme: Scheme) -> Map<Bytes, Int> =
-  match scheme.ty {
-    TyFn(f) -> {
-      // The witnesses the elaboration added lead the parameters, and the scheme holds none of them.
-      let written = def.params.filter(|p: Param| !is_witness_param(p.name.name)).map(|p: Param|
-        p.ty);
-      let paired = range(0, written.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-        match written.at(i) {
-          Some(Some(w)) -> match f.params.at(i) { Some(t) -> numbered_by(w, t, acc), None -> acc },
-          _ -> acc,
-        });
-      match def.ret { Some(w) -> numbered_by(w, f.ret, paired), None -> paired }
-    },
-    _ -> Map::new(),
-  }
-
-fn numbered_by(written: TypeExpr, ty: Type, acc: Map<Bytes, Int>) -> Map<Bytes, Int> =
-  match written {
-    TVar(id) -> match ty { TyVar(v) -> acc.insert(id.name, v), _ -> acc },
-    TCon(c) -> match ty {
-      TyCon(k) -> pairwise(c.args, k.args, acc),
-      TyNominal(x) -> pairwise(c.args, x.args, acc),
-      _ -> acc,
-    },
-    TFn(w) -> match ty {
-      TyFn(f) -> numbered_by(w.ret, f.ret, pairwise(w.params, f.params, acc)),
-      _ -> acc,
-    },
-    _ -> acc,
-  }
-
-fn pairwise(written: List<TypeExpr>, tys: List<Type>, acc: Map<Bytes, Int>) -> Map<Bytes, Int> =
-  if written.len() != tys.len() { acc } else {
-    range(0, written.len()).fold(acc, |m: Map<Bytes, Int>, i: Int|
-      match written.at(i) {
-        Some(w) -> match tys.at(i) { Some(t) -> numbered_by(w, t, m), None -> m },
-        None -> m,
-      })
-  }
 
 /// The specialisations `wanted` holds, by the definition each specialises.
 pub fn specialisations_wanted(wanted: List<RootKey>) -> Map<Bytes, List<RootKey>> =
@@ -79,128 +29,29 @@ pub fn specialisations_wanted(wanted: List<RootKey>) -> Map<Bytes, List<RootKey>
       _ -> acc,
     })
 
-/// `f`, the form of generic `def`, noting among its needs the variables whose numeric witness it
-/// reads: a scalar argument does that arithmetic in C.
-pub fn witnessed_needs(f: Fn, def: FnDef, scheme: Option<Scheme>, ops: List<WitnessOp>) -> Fn =
-  match scheme {
-    None -> f,
-    Some(sc) -> {
-      let numbering = generics_numbered(def, sc);
-      let needs = ops.fold(f.links.needs, |acc: List<Need>, o: WitnessOp|
-        if root_name(Named(o.owner)) != root_name(f.key) { acc } else {
-          match numbering.get(o.param) {
-            Some(v) -> if acc.contains({ var: v, reads: Scalar }) { acc }
-            else { acc.push({ var: v, reads: Scalar }) },
-            None -> acc,
-          }
-        });
-      { ..f, links: { ..f.links, needs: needs } }
-    },
-  }
-
-/// `e`, written in generic `def`, as a specialisation of it at `args` holds it: each operator whose
-/// witness is a parameter held as one numeric type alone, or at a sum of `ctors` whose module
-/// states its arithmetic, done as that type's own.
-pub fn written_at(
-  ctors: Ctors,
-  full: Bytes,
-  def: FnDef,
-  args: List<Type>,
-  schemes: Map<Bytes, Scheme>,
-  e: Expr,
-) -> Expr = {
-  let numbering = match schemes.get(full) {
-    Some(sc) -> generics_numbered(def, sc),
-    None -> Map::new(),
-  };
-  let concrete = numbering.fold(Map::new(), |acc: Map<Bytes, Bool>, param: Bytes, i: Int|
-    match args.at(i) {
-      Some(t) -> if numeric_named(t) == None && !numeric_sum(ctors, t) { acc }
-      else { acc.insert(witness_param(param), true) },
-      None -> acc,
-    });
-  map_expr(e, |x: Expr| unwitnessed(x, |w: Bytes| concrete.contains(w)))
-}
-
-/// What a root of `def`, named `full`, at `args` reads its definition as: the body `written_at`
-/// them, and the signature at `args`.
-pub fn definition_at(
-  ctors: Ctors,
-  full: Bytes,
-  def: FnDef,
-  args: List<Type>,
-  schemes: Map<Bytes, Scheme>,
-  ops: List<WitnessOp>,
-) -> { body: Expr, sig: Option<Sig> } = {
-  {
-    body: written_at(ctors, full, def, args, schemes, def.body),
-    sig: match sig_of(schemes, full) {
-      Some(s) ->
-        Some({
-          params: s.params.map(|t: Type| substituted(t, args)),
-          ret: substituted(s.ret, args),
-        }),
-      None -> None,
-    },
-  }
-}
-
-/// The parameters of `def` at signature `sig` as a root of it holds them, each label a trailing
-/// `Int`, with the names of the written ones and of its labels.
-fn params_at(
-  def: FnDef,
-  sig: Option<Sig>,
-) -> { names: List<Bytes>, labels: List<Bytes>, ps: List<EmitParam> } = {
-  let names = def.params.map(|param: Param| param.name.name);
-  let kinds = param_kinds(def, sig).map(|k: { kind: Kind, ty: Ty }| Some(k));
-  let labels = def.generics.labels.map(|ident: Ident| ident.name);
-  let all_names = labels.fold(names, |acc: List<Bytes>, n: Bytes| acc.push(n));
-  let all_kinds = labels.fold(kinds, |acc: List<Option<{ kind: Kind, ty: Ty }>>, n: Bytes|
-    acc.push(Some({ kind: KInt, ty: TyOpen([]) })));
-  { names: names, labels: labels, ps: params_carried(all_names, all_kinds, param_types(def, sig)) }
-}
-
 /// `def` of the module `s` reads formed as root `root`, at its type arguments and running the
-/// lambdas it lends in place: its parameters and what the checker filed of its nodes, `filed`, read
-/// at them, and each operator whose witness is a parameter now held as one numeric type alone done
-/// as that type's own.
+/// lambdas it lends in place, of whose item the check filed `filed`.
 pub fn specialised_formed(
   s: Setting,
   def: FnDef,
   root: RootKey,
   lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
-  schemes: Map<Bytes, Scheme>,
-  ops: List<WitnessOp>,
   filed: Filings,
 ) -> Fn / {abort.raise} = {
-  let full = qualify(s.module, def.name.name);
   let args = key_types(root);
-  let source = definition_at(s.ctors, full, def, args, schemes, ops);
-  let held = params_at(def, source.sig);
+  let b = root_body(filed, WholeBody, def.span.start, def.generics.labels.map(|i: Ident| i.name), args);
   // Each lambda the root runs, read where its owner lowered it: a root is keyed by only the lambdas
   // its callers' owners lend.
-  let ps = key_lent(root).fold(held.ps, |ps: List<EmitParam>, f: FnArg|
+  let ps = key_lent(root).fold(b.params, |ps: List<EmitParam>, f: FnArg|
     match lambda_at(f.owner, f.nth) {
       None -> panic("a lambda this root runs in place of a call is not one its owner lowers"),
-      Some(bl) ->
-        range(0, ps.len()).map(|i: Int|
-          if i == f.param { { ..ps.get(i), lambda: Some(bl) } } else { ps.get(i) }),
+      Some(bl) -> range(0, ps.len()).fold([], |out: List<EmitParam>, i: Int|
+        match ps.at(i) {
+          Some(p) -> out.push(if i == f.param { { ..p, lambda: Some(bl) } } else { p }),
+          None -> out,
+        }),
     });
-  formed_from(
-    s,
-    def.span.start,
-    root,
-    ps,
-    lower_fn(
-      held.names,
-      held.labels,
-      filed.labels,
-      source.body,
-      of_binder(s.module),
-      releasing_of(filed, def.params),
-    ).code,
-    filings_at(filed, args),
-  )
+  formed_from(s, def.span.start, root, ps, b.code)
 }
 
 // --- Tail loops at type arguments --------------------------------------------------------------
@@ -232,18 +83,15 @@ fn instance_args(filed: List<Type>, args: List<Type>) -> Option<List<Type>> =
 fn tail_reached(s: Setting, w: AsWritten, args: List<Type>) -> Reached / {abort.raise} =
   tail_calls(s.here, w.code, []).fold(
     { key: Named(b""), out: [], grown: [] },
-    |acc: Reached, t: TailCall| {
-      let callee = qualify(s.module, t.name);
-      let filed = match w.filed.typed.get(t.at.site) { Some(x) -> x.args, None -> [] };
-      match instance_args(filed, args) {
-        None -> if acc.grown.contains(callee) { acc }
-        else { { ..acc, grown: acc.grown.push(callee) } },
+    |acc: Reached, t: TailCall|
+      match instance_args(t.args, args) {
+        None -> if acc.grown.contains(t.full) { acc }
+        else { { ..acc, grown: acc.grown.push(t.full) } },
         Some(at) -> {
-          let k = instance_key(callee, at);
+          let k = instance_key(t.full, at);
           if acc.out.contains(k) { acc } else { { ..acc, out: acc.out.push(k) } }
         },
-      }
-    },
+      },
   )
 
 /// The definitions of `module`, beside `here`, that definition `from` reaches through calls in tail
@@ -262,7 +110,7 @@ pub fn tail_reached_defs(
         [] -> Stop(r),
         [n, ..rest] -> if r.seen.contains(n) { Continue({ ..r, work: rest }) } else {
           let next = match read_of(n) {
-            Some(w) -> tail_calls(here, w.code, []).map(|t: TailCall| qualify(module, t.name)),
+            Some(w) -> tail_calls(here, w.code, []).map(|t: TailCall| t.full),
             None -> [],
           };
           Continue({ seen: r.seen.insert(n, true), work: rest.concat(next) })
@@ -370,8 +218,6 @@ fn in_order(order: Map<Bytes, Int>, keys: List<RootKey>) -> List<RootKey> / {abo
 /// lowers at its type arguments, its body's code read there.
 fn instance_root(
   s: Setting,
-  schemes: Map<Bytes, Scheme>,
-  ops: List<WitnessOp>,
   defs: Map<Bytes, FnDef>,
   read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
   key: RootKey,
@@ -384,19 +230,8 @@ fn instance_root(
   };
   let w = match read_of(full) { Some(w) -> w, None -> panic("a tail loop's member no walk read") };
   let args = key_types(key);
-  let source = definition_at(s.ctors, full, def, args, schemes, ops);
-  let held = params_at(def, source.sig);
-  let code = if args.len() == 0 { w.code } else {
-    lower_fn(
-      held.names,
-      held.labels,
-      w.filed.labels,
-      source.body,
-      of_binder(s.module),
-      releasing_of(w.filed, def.params),
-    ).code
-  };
-  root_at(s, key, def.span.start, held.ps, code, filings_at(w.filed, args))
+  let b = root_body(w.filed, WholeBody, def.span.start, def.generics.labels.map(|i: Ident| i.name), args);
+  root_at(s, key, def.span.start, b.params, b.code)
 }
 
 /// The tail loop of `keys`, `instance_group`'s members in order, formed as one root under the first's
@@ -406,12 +241,11 @@ fn instance_root(
 pub fn instances_formed(
   s: Setting,
   schemes: Map<Bytes, Scheme>,
-  ops: List<WitnessOp>,
   defs: Map<Bytes, FnDef>,
   read_of: (Bytes) -> Option<AsWritten> / {abort.raise},
   keys: List<RootKey>,
 ) -> List<Fn> / {abort.raise} = {
-  let f = group_lowered(s, keys.map(|k: RootKey| instance_root(s, schemes, ops, defs, read_of, k)));
+  let f = group_lowered(s, keys.map(|k: RootKey| instance_root(s, defs, read_of, k)));
   let open = keys.fold(0, |most: Int, k: RootKey| {
     let w = open_width(schemes, k);
     if w > most { w } else { most }

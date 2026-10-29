@@ -1,8 +1,7 @@
 //! How the emitter holds a value of a type: kinds, carriers, the constructor table, each type's
 //! layout by `emit.layout`, its key and its word form.
 
-import compiler.syntax.parsing (Span)
-import compiler.syntax.items (FnDef)
+import compiler.syntax.items (FnDef, Constraint, is_predicate)
 import compiler.syntax.type_syntax (Mode)
 import compiler.emit.code (Lambda)
 import compiler.check.resolve.tables (qualify)
@@ -14,12 +13,11 @@ import compiler.emit.layout (WordClass, P, C, R, S, U, LWords, LSum, SumLaid, Ca
                              Payload, Nullary, Inline, Boxed, WordForm, Itself, Bits, RuntimeBox,
                              Box, record_laid, sum_laid, words, classes, raw, inside, by_pointer,
                              flat_words)
-import compiler.emit.typing (Typed, Filings, unknown_type)
+import compiler.emit.typing (unknown_type)
 import compiler.front.rows (CtorRow)
 import std.list
 import compiler.check.lent (passed)
-import compiler.emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KWide, Kind, width_named, carried,
-                        in_imm)
+import compiler.emit.c (KBool, KBoxed, KDec, KFloat, KInt, KNum, KWide, Kind, width_named, carried)
 import compiler.emit.keys (RootKey, Named, at_key, root_name, root_text)
 
 /// The program's constructor table: the names its tags are positions of.
@@ -654,8 +652,6 @@ pub type BoundLambda = {
   here: List<Def>,
   imports: List<Imported>,
   effects: List<EffectName>,
-  /// What the checker filed of its owner's nodes, at the specialisation's types where it is one's.
-  filed: Filings,
   base: Int,
   /// Every lambda its owner lends, those within it among them, by their places.
   written: List<Lambda>,
@@ -787,30 +783,6 @@ pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
     Some(s) -> match s.ty { TyFn(f) -> Some({ params: f.params, ret: f.ret }), _ -> None },
     None -> None,
   }
-
-/// How each parameter of `def` arrives: the witnesses the expansion put before what the definition
-/// writes are `Int`s, and the rest are as its scheme says. A parameter no scheme speaks for is a word,
-/// which every parameter arrives as.
-pub fn param_kinds(def: FnDef, sig: Option<Sig>) -> List<{ kind: Kind, ty: Ty }> = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = def.params.len() - given.len();
-  range(0, def.params.len()).map(|i: Int|
-    if i < witnesses { { kind: KInt, ty: TyOpen([]) } }
-    else { match given.at(i - witnesses) { Some(t) -> kind_of(t), None -> boxed() } })
-}
-
-/// The type of each parameter of `def`, as `param_kinds` reads them; none where no scheme speaks.
-pub fn param_types(def: FnDef, sig: Option<Sig>) -> List<Option<Type>> = {
-  let given = match sig { Some(s) -> s.params, None -> [] };
-  let witnesses = def.params.len() - given.len();
-  range(0, def.params.len()).map(|i: Int|
-    if i < witnesses { Some(int_type()) } else { given.at(i - witnesses) })
-}
-
-/// The type the checker filed for the node at `at`, as a value of it is held; a word where it filed
-/// none.
-pub fn typed_kind(typed: Map<Int, Typed>, at: Span) -> { kind: Kind, ty: Ty } =
-  match typed.get(at.site) { Some(t) -> kind_of(t.ty), None -> boxed() }
 
 // --- Layouts by type ----------------------------------------------------------------------------
 
@@ -1206,21 +1178,11 @@ pub fn substituted_fully(ty: Type, args: List<Type>) -> Type =
       }),
   }
 
-/// What `filed`, a definition's, says at type arguments `args`: what a specialisation of it reads.
-pub fn filings_at(filed: Filings, args: List<Type>) -> Filings =
-  {
-    ..filed,
-    typed: filed.typed.fold(Map::new(), |acc: Map<Int, Typed>, k: Int, t: Typed|
-      acc.insert(k, {
-        ..t,
-        ty: substituted(t.ty, args),
-        args: t.args.map(|a: Type| substituted(a, args)),
-      })),
-  }
-
 // --- the emitter's entry ----------------------------------------------------
 
-/// A definition as its callers read it, its answer as its scheme says.
+/// A definition as its callers read it, its answer as its scheme says: a witness for each type
+/// parameter a `numeric` or `integer` constraint names leads its parameters, and its labels follow
+/// them.
 pub fn def_entry(
   module: Bytes,
   d: FnDef,
@@ -1230,16 +1192,18 @@ pub fn def_entry(
   let full = qualify(module, d.name.name);
   let sig = sig_of(schemes, full);
   let ret = match sig { Some(s) -> Some(kind_of(s.ret)), None -> None };
+  let witnesses = d.constraints.fold([], |acc: List<Bytes>, c: Constraint|
+    if !is_predicate(c.deriver) || acc.contains(c.param.name) { acc } else { acc.push(c.param.name) }).len();
   {
     name: d.name.name,
     ret: match ret { Some(r) -> Some(r.kind), None -> None },
     ret_ty: match ret { Some(r) -> r.ty, None -> TyOpen([]) },
     pure: pure.contains(full),
-    arity: d.params.len() + d.generics.labels.len(),
+    arity: witnesses + d.params.len() + d.generics.labels.len(),
     scheme: schemes.get(full),
-    witnesses: d.params.len() - (match sig { Some(s) -> s.params.len(), None -> 0 }),
+    witnesses: witnesses,
     lent: range(0, d.params.len()).filter(|i: Int|
-      match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }),
+      match d.params.at(i) { Some(p) -> passed(p).lent, None -> false }).map(|i: Int| i + witnesses),
     root: Named(full),
   }
 }

@@ -5,30 +5,29 @@
 //! through the context's taken bytes. A call that would fail hands the runtime what its builtin's
 //! refusal names, raw, and the runtime raises as the builtin always has.
 
-import compiler.syntax.parsing (Span, dummy_span)
-import compiler.syntax.patterns (LUnit, LInt, LBytes)
+import compiler.syntax.parsing (Span)
+import compiler.syntax.patterns (LUnit)
 import compiler.check.types (Type, TyCon, TyFn, TyRecord, int_type, bool_type, string_type,
                              bytes_type, option_type, named_type, list_type, fn_type, monomorphic,
                              row_empty)
-import compiler.emit.typing (Typed, filed_as, unknown_type)
-import compiler.emit.code (Code, Node, NLit, NVar, NBinary, NApp, NIf, NBlock, NMatch, CLet, PxVar,
-                           PxCtor)
+import compiler.emit.typing (unknown_type)
+import compiler.emit.code (Code, NDef, CLet)
+import compiler.emit.writing (bare, slot_code, applied, int_code, bytes_code, binary_of, if_code,
+                              block_code, builtin_call, some_or)
+import compiler.check.resolve.tables (qualify)
 import compiler.emit.keys
 import compiler.emit.keys (Root, Contained, root_name, root_text)
 import compiler.emit.reps (Def, EmitParam, SumCtor, kind_of)
 import compiler.emit.roots (builtin_helper)
-import compiler.emit.tir (Rep, RInt, RBool, RNum, RDec, RWord, RAddr, RSum, RImm, Var, Arg, AVar,
-                          AInt, AZero, Prim, Get, Path, PPayload, PCase, Native, Op, OContainer,
-                          OStrings, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg,
-                          RFlat, Gathered)
-import compiler.emit.tir.containers (Length, Taken, Laid)
+import compiler.emit.tir (Rep, RInt, RBool, RNum, RDec, RWord, RSum, RImm, Var, Arg, AVar, AInt, AZero, Prim, Get, Path, PCase, Native, Op, OContainer, OStrings, Make, MList, Call, If, Case, TTag, string_uses, rep_of_arg, RFlat, Gathered)
+import compiler.emit.tir.containers (Length, Laid)
 import compiler.emit.layout (Recast, refusal, refusals)
 import compiler.emit.tir.strings (StringOp, Made, Copied, ByteSet, ByteRead, U32Read, Compared,
                                   Found, CharsIn, CharStart, Scanned)
-import compiler.emit.lower.setting (ctor_named, ctor_sum, prelude_ctor)
+import compiler.emit.lower.setting (ctor_sum)
 import compiler.emit.lower.held (held_as, case_index, arg_word, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, Lowered, unreachable, bound_as, done, handed,
-                                 opened, pair_words, continued, joined, short_circuit, filed)
+                                 opened, pair_words, continued, joined, short_circuit)
 import compiler.emit.lower.data (constructed_as, open_needed, recorded_as)
 import compiler.emit.lower.scalars (literal)
 import compiler.emit.lower.crossing (addressed, taken_out, blake3_of, concatenated)
@@ -88,18 +87,15 @@ pub fn lowered(
   st: Lowering,
   name: Bytes,
   args: List<Arg>,
-  callee: Span,
+  callee: Code,
   at: Span,
 ) -> Lowered / {abort.raise} = {
   let c = { cx: cx, name: name, at: at };
   let named = if name.starts_with(b"String::") { string_type() } else { bytes_type() };
   // A root written over a string's bytes files a byte builtin there as answering a string.
-  let ty = match filed(cx, callee) {
-    Some(t) -> match t.ty {
-      TyFn(f) -> if f.ret == string_type() || f.ret == bytes_type() { f.ret } else { named },
-      _ -> named,
-    },
-    None -> named,
+  let ty = match callee.ty {
+    TyFn(f) -> if f.ret == string_type() || f.ret == bytes_type() { f.ret } else { named },
+    _ -> named,
   };
   if secret_operation(name) { secret_operated(c, st, args) }
   else if secret_derivations().contains(name) { secret_derived(c, st, args) } else {
@@ -826,8 +822,9 @@ fn told_refused(c: Asked, st: Lowering, m: Arg) -> Lowering / {abort.raise} = {
   let untold = |r: Lowering| refused_text(c, r, [AInt(0), AInt(0 - 1)]);
   let setting = c.cx.setting;
   let o = option_type(string_type());
-  match ((m, ctor_named(setting, prelude_ctor(b"Some")))) {
-    (AVar(given), Some(full)) -> match ctor_sum(setting, full) {
+  let full = b"Some";
+  match m {
+    AVar(given) -> match ctor_sum(setting, full) {
       None -> untold(st),
       Some(sum) -> {
         // Read at the type `assert` declares, whatever type its argument was made at.
@@ -942,9 +939,9 @@ fn maybe(
 ) -> Lowered / {abort.raise} = {
   let none = compared(k.st, b"lt", k.arg, AInt(0), at);
   let o = option_type(ty);
-  let n = constructed_as(cx, opened(none.st), prelude_ctor(b"None"), [], o, at);
+  let n = constructed_as(cx, opened(none.st), b"None", [], o, at);
   let p = payload(opened(continued(none.st, n.st)));
-  let s = constructed_as(cx, p.st, prelude_ctor(b"Some"), [p.arg], o, at);
+  let s = constructed_as(cx, p.st, b"Some", [p.arg], o, at);
   joined(cx, none, n, s, false, at)
 }
 
@@ -1033,9 +1030,9 @@ fn native_of(name: Bytes) -> Bytes / {abort.raise} = builtin_helper(name).concat
 
 // --- Roots written for the builtins that build or walk a list -------------------------------
 
-/// A root written for a type, its parameters, its body as lowered code, what that body files at
-/// each site, and the definitions its calls name.
-pub type Written = { params: List<EmitParam>, code: Code, typed: Map<Int, Typed>, here: List<Def> }
+/// A root written for a type, its parameters, its body as lowered code, and the definitions its
+/// calls name.
+pub type Written = { params: List<EmitParam>, code: Code, here: List<Def> }
 
 /// Whether `op` names a root written here: each a loop, the builtin's call starting it.
 pub fn strings_root(op: Bytes) -> Bool =
@@ -1091,129 +1088,107 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> Written / {abort.raise
   let key = keys::written(Contained(op), t, module);
   let typed_of = root_typed(op, t);
   let name = local_name(module, root_text(root_name(key)));
+  let param_types = typed_of.params.map(|x: { name: Bytes, ty: Type }| x.ty);
   let def = {
     name: name,
     ret: Some(kind_of(typed_of.ret).kind),
     ret_ty: kind_of(typed_of.ret).ty,
     pure: true,
     arity: typed_of.params.len(),
-    scheme: Some(
-      monomorphic(
-        fn_type(
-          typed_of.params.map(|x: { name: Bytes, ty: Type }| x.ty),
-          typed_of.ret,
-          row_empty(),
-        ),
-      ),
-    ),
+    scheme: Some(monomorphic(fn_type(param_types, typed_of.ret, row_empty()))),
     witnesses: 0,
     lent: [],
     root: key,
   };
-  let at = |node: Node| { node: node, span: dummy_span() };
-  let placed = |k: Int| { start: 0, end: k, site: k + 1 };
-  let v = |slot: Int| at(NVar({ name: param_name(typed_of.params, slot), slot: Some(slot) }));
-  let lit = |n: Int| at(NLit(LInt(n)));
-  let builtin = |b: Bytes, k: Int, args: List<Code>|
-    at(NApp({ func: { node: NVar({ name: b, slot: None }), span: placed(k) }, args: args }));
-  let again = |args: List<Code>|
-    at(NApp({ func: at(NVar({ name: name, slot: None })), args: args }));
-  let bin = |o: Bytes, l: Code, r: Code| at(NBinary({ op: o, lhs: l, rhs: r }));
-  let cond = |c: Code, a: Code, b: Code| at(NIf({ cond: c, then_branch: a, else_branch: b }));
-  let bound = |n: Bytes, slot: Int, value: Code, tail: Code|
-    at(NBlock({ stmts: [CLet({ name: n, slot: slot, value: value })], tail: Some(tail) }));
-  let local = |n: Bytes, slot: Int| at(NVar({ name: n, slot: Some(slot) }));
-  // `scrutinee`'s `Some(x)`, `x` at `slot` filed at site `k`, then `some`, or `none`.
-  let on_some = |scrutinee: Code, x: Bytes, slot: Int, k: Int, some: Code, none: Code|
-    at(
-      NMatch({
-        scrutinee: scrutinee,
-        arms: [
-          {
-            pat: PxCtor({
-              name: prelude_ctor(b"Some"),
-              args: [PxVar({ name: x, slot: Some(slot), span: placed(k) })],
-            }),
-            guard: None,
-            body: some,
-          },
-          { pat: PxCtor({ name: prelude_ctor(b"None"), args: [] }), guard: None, body: none },
-        ],
-      }),
+  let v = |slot: Int|
+    slot_code(
+      param_name(typed_of.params, slot),
+      slot,
+      match param_types.at(slot) { Some(p) -> p, None -> unknown_type() },
     );
-  let filed = |entries: List<{ k: Int, ty: Type, args: List<Type> }>|
-    entries.fold(Map::new(), |m: Map<Int, Typed>, e: { k: Int, ty: Type, args: List<Type> }|
-      m.insert(placed(e.k).site, filed_as(e.ty, e.args)));
+  let again = |args: List<Code>|
+    applied(
+      bare(
+        NDef({ full: qualify(module, name), args: [], rows: [], labels: [] }),
+        fn_type(param_types, typed_of.ret, row_empty()),
+      ),
+      args,
+      typed_of.ret,
+    );
+  let lit = int_code;
+  let bin = binary_of;
+  let cond = if_code;
+  let bound = |n: Bytes, slot: Int, value: Code, tail: Code|
+    block_code([CLet({ name: n, slot: slot, value: value })], tail);
+  let call = |b: Bytes, args: List<Code>, ret: Type| builtin_call(b, [], args, ret);
   let item = match t { TyCon(c) -> match c.args.at(0) { Some(x) -> x, None -> t }, _ -> t };
-  let shaped = if op == b"range_from" {
+  let code = if op == b"range_from" {
     // `if lo < hi { again(lo + 1, hi, acc.push(lo)) } else { acc }`
-    {
-      code: cond(
-        bin(b"lt", v(0), v(1)),
-        again([bin(b"add", v(0), lit(1)), v(1), builtin(b"List::push", 1, [v(2), v(0)])]),
-        v(2),
-      ),
-      typed: filed([{ k: 1, ty: unknown_type(), args: [int_type()] }]),
-    }
-  } else if op == b"split_from" {
-    // The piece before the next separator pushed and the walk going on past it, else the rest.
-    let found = builtin(b"Bytes::index_of_from", 1, [v(0), v(1), v(2)]);
-    let piece = |to: Code, k: Int| builtin(b"Bytes::slice", k, [v(0), v(2), to]);
-    // A string's pieces are its bytes sliced, and strings themselves.
-    let sliced = fn_type([t, int_type(), int_type()], t, row_empty());
-    {
-      code: on_some(
-        found,
-        b"at",
-        4,
-        2,
-        again([
-          v(0),
-          v(1),
-          bin(b"add", local(b"at", 4), builtin(b"Bytes::len", 3, [v(1)])),
-          builtin(b"List::push", 4, [v(3), piece(local(b"at", 4), 5)]),
-        ]),
-        builtin(b"List::push", 6, [v(3), piece(builtin(b"Bytes::len", 7, [v(0)]), 8)]),
-      ),
-      typed: filed([
-        { k: 1, ty: unknown_type(), args: [] },
-        { k: 2, ty: int_type(), args: [] },
-        { k: 3, ty: unknown_type(), args: [] },
-        { k: 4, ty: unknown_type(), args: [t] },
-        { k: 5, ty: sliced, args: [] },
-        { k: 6, ty: unknown_type(), args: [t] },
-        { k: 7, ty: unknown_type(), args: [] },
-        { k: 8, ty: sliced, args: [] },
+    cond(
+      bin(b"lt", v(0), v(1)),
+      again([
+        bin(b"add", v(0), lit(1)),
+        v(1),
+        builtin_call(b"List::push", [int_type()], [v(2), v(0)], t),
       ]),
-    }
+      v(2),
+    )
+  } else if op == b"split_from" {
+    // The piece before the next separator pushed and the walk going on past it, else the rest. A
+    // string's pieces are its bytes sliced, and strings themselves.
+    let found = call(b"Bytes::index_of_from", [v(0), v(1), v(2)], option_type(int_type()));
+    let piece = |to: Code| call(b"Bytes::slice", [v(0), v(2), to], t);
+    let at = slot_code(b"at", 4, int_type());
+    some_or(
+      found,
+      b"at",
+      4,
+      int_type(),
+      again([
+        v(0),
+        v(1),
+        bin(b"add", at, call(b"Bytes::len", [v(1)], int_type())),
+        builtin_call(b"List::push", [t], [v(3), piece(at)], list_type(t)),
+      ]),
+      builtin_call(
+        b"List::push",
+        [t],
+        [v(3), piece(call(b"Bytes::len", [v(0)], int_type()))],
+        list_type(t),
+      ),
+    )
   } else if op == b"chars_from" {
     // The character whose UTF-8 starts at byte `at`, decoded by its lead byte, pushed, and the
     // walk going on past it.
-    let byte = |k: Int, off: Int| builtin(b"Bytes::at", k, [v(0), bin(b"add", v(1), lit(off))]);
-    let more = |acc: Code, k: Int, off: Int|
-      bin(b"add", bin(b"mul", acc, lit(64)), bin(b"sub", byte(k, off), lit(128)));
-    let b0 = local(b"b0", 3);
-    let width = local(b"w", 4);
+    let byte = |off: Int| call(b"Bytes::at", [v(0), bin(b"add", v(1), lit(off))], int_type());
+    let more = |acc: Code, off: Int|
+      bin(b"add", bin(b"mul", acc, lit(64)), bin(b"sub", byte(off), lit(128)));
+    let b0 = slot_code(b"b0", 3, int_type());
+    let width = slot_code(b"w", 4, int_type());
     let lead = |base: Int| bin(b"sub", b0, lit(base));
     let scalar = cond(
       bin(b"eq", width, lit(1)),
       b0,
       cond(
         bin(b"eq", width, lit(2)),
-        more(lead(192), 3, 1),
+        more(lead(192), 1),
         cond(
           bin(b"eq", width, lit(3)),
-          more(more(lead(224), 4, 1), 5, 2),
-          more(more(more(lead(240), 6, 1), 7, 2), 8, 3),
+          more(more(lead(224), 1), 2),
+          more(more(more(lead(240), 1), 2), 3),
         ),
       ),
     );
-    let pushed = on_some(
-      builtin(b"Char::of_int", 9, [local(b"n", 5)]),
+    let pushed = some_or(
+      call(b"Char::of_int", [slot_code(b"n", 5, int_type())], option_type(char_type())),
       b"c",
       6,
-      10,
-      again([v(0), bin(b"add", v(1), width), builtin(b"List::push", 11, [v(2), local(b"c", 6)])]),
+      char_type(),
+      again([
+        v(0),
+        bin(b"add", v(1), width),
+        builtin_call(b"List::push", [char_type()], [v(2), slot_code(b"c", 6, char_type())], list_type(char_type())),
+      ]),
       v(2),
     );
     let w = cond(
@@ -1221,132 +1196,88 @@ pub fn strings_code(module: Bytes, op: Bytes, t: Type) -> Written / {abort.raise
       lit(1),
       cond(bin(b"lt", b0, lit(224)), lit(2), cond(bin(b"lt", b0, lit(240)), lit(3), lit(4))),
     );
-    {
-      code: cond(
-        bin(b"lt", v(1), builtin(b"Bytes::len", 1, [v(0)])),
-        bound(b"b0", 3, byte(2, 0), bound(b"w", 4, w, bound(b"n", 5, scalar, pushed))),
-        v(2),
-      ),
-      typed: filed(
-        [1, 2, 3, 4, 5, 6, 7, 8].map(|k: Int| { k: k, ty: unknown_type(), args: [] }).concat([
-          { k: 9, ty: unknown_type(), args: [] },
-          { k: 10, ty: char_type(), args: [] },
-          { k: 11, ty: unknown_type(), args: [char_type()] },
-        ]),
-      ),
-    }
+    cond(
+      bin(b"lt", v(1), call(b"Bytes::len", [v(0)], int_type())),
+      bound(b"b0", 3, byte(0), bound(b"w", 4, w, bound(b"n", 5, scalar, pushed))),
+      v(2),
+    )
   } else if op == b"of_chars_from" {
     // Each character's UTF-8, its bytes from its scalar value by its width, appended.
-    let n = local(b"n", 4);
-    let byte_at = |e: Code, k: Int| builtin(b"byte_of_int", k, [e]);
-    let tail = |shift: Int, k: Int|
-      byte_at(bin(b"add", lit(128), bin(b"rem", bin(b"div", n, lit(shift)), lit(64))), k);
-    let joined = |a: Code, b: Code, k: Int| builtin(b"Bytes::concat", k, [a, b]);
+    let n = slot_code(b"n", 4, int_type());
+    let byte_at = |e: Code| call(b"byte_of_int", [e], bytes_type());
+    let tail = |shift: Int|
+      byte_at(bin(b"add", lit(128), bin(b"rem", bin(b"div", n, lit(shift)), lit(64))));
+    let joined = |a: Code, b: Code| call(b"Bytes::concat", [a, b], bytes_type());
     let utf8 = cond(
       bin(b"lt", n, lit(128)),
-      byte_at(n, 3),
+      byte_at(n),
       cond(
         bin(b"lt", n, lit(2048)),
-        joined(byte_at(bin(b"add", lit(192), bin(b"div", n, lit(64))), 5), tail(1, 6), 7),
+        joined(byte_at(bin(b"add", lit(192), bin(b"div", n, lit(64)))), tail(1)),
         cond(
           bin(b"lt", n, lit(65536)),
-          joined(
-            joined(byte_at(bin(b"add", lit(224), bin(b"div", n, lit(4096))), 8), tail(64, 9), 10),
-            tail(1, 11),
-            12,
-          ),
+          joined(joined(byte_at(bin(b"add", lit(224), bin(b"div", n, lit(4096)))), tail(64)), tail(1)),
           joined(
             joined(
-              joined(
-                byte_at(bin(b"add", lit(240), bin(b"div", n, lit(262144))), 13),
-                tail(4096, 14),
-                15,
-              ),
-              tail(64, 16),
-              17,
+              joined(byte_at(bin(b"add", lit(240), bin(b"div", n, lit(262144)))), tail(4096)),
+              tail(64),
             ),
-            tail(1, 18),
-            19,
+            tail(1),
           ),
         ),
       ),
     );
-    {
-      code: on_some(
-        builtin(b"List::at", 1, [v(0), v(1)]),
-        b"c",
-        3,
-        2,
-        bound(
-          b"n",
-          4,
-          builtin(b"Int::of_char", 20, [local(b"c", 3)]),
-          again([v(0), bin(b"add", v(1), lit(1)), builtin(b"String::concat", 21, [v(2), utf8])]),
-        ),
-        v(2),
+    some_or(
+      builtin_call(b"List::at", [char_type()], [v(0), v(1)], option_type(char_type())),
+      b"c",
+      3,
+      char_type(),
+      bound(
+        b"n",
+        4,
+        call(b"Int::of_char", [slot_code(b"c", 3, char_type())], int_type()),
+        again([v(0), bin(b"add", v(1), lit(1)), call(b"String::concat", [v(2), utf8], string_type())]),
       ),
-      typed: filed(
-        range(3, 22).map(|k: Int| { k: k, ty: unknown_type(), args: [] }).concat([
-          { k: 1, ty: unknown_type(), args: [char_type()] },
-          { k: 2, ty: char_type(), args: [] },
-        ]),
-      ),
-    }
+      v(2),
+    )
   } else if op == b"jwk_from" {
     // Each text after the ones before it, behind a `.`, which no base64url text holds.
-    let dot = builtin(b"Secret::of_bytes", 3, [at(NLit(LBytes(b".")))]);
-    let text = builtin(b"Secret::bytes", 4, [local(b"x", 3)]);
-    {
-      code: on_some(
-        builtin(b"List::at", 1, [v(0), v(1)]),
-        b"x",
-        3,
-        2,
-        again([
-          v(0),
-          bin(b"add", v(1), lit(1)),
-          builtin(b"Secret::concat", 5, [v(2), builtin(b"Secret::concat", 6, [dot, text])]),
-        ]),
-        v(2),
-      ),
-      typed: filed([
-        { k: 1, ty: unknown_type(), args: [item] },
-        { k: 2, ty: item, args: [] },
-        { k: 3, ty: unknown_type(), args: [] },
-        { k: 4, ty: unknown_type(), args: [] },
-        { k: 5, ty: unknown_type(), args: [] },
-        { k: 6, ty: unknown_type(), args: [] },
+    let joined = secret_of(bytes_type());
+    let dot = call(b"Secret::of_bytes", [bytes_code(b".")], joined);
+    let text = call(b"Secret::bytes", [slot_code(b"x", 3, item)], joined);
+    some_or(
+      builtin_call(b"List::at", [item], [v(0), v(1)], option_type(item)),
+      b"x",
+      3,
+      item,
+      again([
+        v(0),
+        bin(b"add", v(1), lit(1)),
+        call(b"Secret::concat", [v(2), call(b"Secret::concat", [dot, text], joined)], joined),
       ]),
-    }
+      v(2),
+    )
   } else {
     // `concat_all_from`: each byte string appended to the one grown so far.
-    {
-      code: on_some(
-        builtin(b"List::at", 1, [v(0), v(1)]),
-        b"b",
-        3,
-        2,
-        again([
-          v(0),
-          bin(b"add", v(1), lit(1)),
-          builtin(b"Bytes::concat", 3, [v(2), local(b"b", 3)]),
-        ]),
-        v(2),
-      ),
-      typed: filed([
-        { k: 1, ty: unknown_type(), args: [item] },
-        { k: 2, ty: item, args: [] },
-        { k: 3, ty: unknown_type(), args: [] },
+    some_or(
+      builtin_call(b"List::at", [item], [v(0), v(1)], option_type(item)),
+      b"b",
+      3,
+      item,
+      again([
+        v(0),
+        bin(b"add", v(1), lit(1)),
+        call(b"Bytes::concat", [v(2), slot_code(b"b", 3, item)], bytes_type()),
       ]),
-    }
+      v(2),
+    )
   };
   {
     params: typed_of.params.map(|x: { name: Bytes, ty: Type }| {
       let k = kind_of(x.ty);
       { name: x.name, kind: k.kind, ty: k.ty, of: Some(x.ty), lambda: None }
     }),
-    code: shaped.code,
-    typed: shaped.typed,
+    code: code,
     here: [def],
   }
 }
@@ -1389,9 +1320,7 @@ test "each root written here takes its own parameters and is the one definition 
     let w = strings_code(b"m", x.op, x.t);
     assert_eq(w.params.map(|p: EmitParam| p.of), x.params.map(|p: Type| Some(p)));
     assert_eq(w.here.map(|d: Def| d.root), [keys::written(Contained(x.op), x.t, b"m")]);
-    assert_eq(w.here.map(|d: Def| d.arity), [x.params.len()]);
-    // Every builtin its body calls is filed where its name is written.
-    assert(w.typed.len() > 0, None)
+    assert_eq(w.here.map(|d: Def| d.arity), [x.params.len()])
   });
   assert(!strings_root(b"equal_from"), None)
 }

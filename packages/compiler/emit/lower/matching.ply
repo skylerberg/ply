@@ -5,9 +5,9 @@
 //! constructor's test is lowered knowing the constructor.
 
 import compiler.emit.code (Code, CodeArm, CodePattern, CodePatternField, PxWild, PxVar, PxLit,
-                           PxRange, PxCtor, PxRecord, PxList, NVar, NApp, NLit)
+                           PxRange, PxCtor, PxRecord, PxList, NVar, NCtor, NApp, NLit)
 import compiler.syntax.patterns (Lit, LInt, LFixed, LBool, LUnit)
-import compiler.syntax.parsing (Span, dummy_span, starts_upper)
+import compiler.syntax.parsing (Span, dummy_span)
 import compiler.check.types (Type, TyCon, named_type)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.reps (SumCtor, at_args)
@@ -15,7 +15,7 @@ import compiler.emit.tir (Rep, RInt, RBool, RNum, RWord, RSlice, RSum, RUnit, Va
                           ABool, ANum, AZero, Prim, Get, Gathered, PCase, PLeaf, Inst, Decl, Assign,
                           If, Case, Match, Miss, Fail, NoArm, NoLet, Block, Test, TTag, TInt,
                           TRange, TLength, rep_of_arg)
-import compiler.emit.lower.setting (Setting, ctor_named, ctor_sum)
+import compiler.emit.lower.setting (Setting)
 import compiler.emit.lower.held (held_as, case_index, arg_word)
 import compiler.emit.lower.base (Context, Lowering, Lowered, Armed, unreachable, fresh, bound_as,
                                  emitted, opened, continued, join_type, join_held, set_join,
@@ -101,38 +101,25 @@ pub fn compared_side(cx: Context, op: Bytes, lhs: Code, rhs: Code) -> Option<Boo
   else { None }
 
 /// Whether `c` is a constructor, or one applied to arguments.
-fn constructor(c: Code) -> Bool / {abort.raise} =
+fn constructor(c: Code) -> Bool =
   match c.node {
-    NVar(v) -> v.slot == None && starts_upper(last_segment(v.name)),
+    NCtor(_) -> true,
+    NApp(a) -> match a.func.node { NCtor(_) -> true, _ -> false },
+    _ -> false,
+  }
+
+/// Whether `c` is a constructor whose value compares as it was built, by its tag and arguments, or
+/// one applied to arguments: not one of a type whose module states a `key`, whose values compare as
+/// their keys do.
+fn tested_as_built(cx: Context, c: Code) -> Bool =
+  match c.node {
+    NCtor(k) -> !cx.setting.ctors.keyed.contains(k.name),
     NApp(a) -> match a.func.node {
-      NVar(v) -> v.slot == None && starts_upper(last_segment(v.name)),
+      NCtor(k) -> !cx.setting.ctors.keyed.contains(k.name),
       _ -> false,
     },
     _ -> false,
   }
-
-/// Whether `c` is a constructor whose value compares as it was built, by its tag and arguments: not
-/// one of a type whose module states a `key`, whose values compare as their keys do.
-fn tested_as_built(cx: Context, c: Code) -> Bool / {abort.raise} =
-  constructor(c)
-    && (match c.node {
-      NVar(v) -> !keyed(cx, v.name),
-      NApp(a) -> match a.func.node { NVar(v) -> !keyed(cx, v.name), _ -> true },
-      _ -> true,
-    })
-
-fn keyed(cx: Context, written: Bytes) -> Bool =
-  match ctor_named(cx.setting, written) {
-    Some(n) -> cx.setting.ctors.keyed.contains(n),
-    None -> false,
-  }
-
-/// What follows the last `.` or `::` of `name`.
-fn last_segment(name: Bytes) -> Bytes / {abort.raise} = {
-  let cut = range(0, name.len()).fold(0, |acc: Int, i: Int|
-    if name.at(i) == 46 || name.at(i) == 58 { i + 1 } else { acc });
-  name.slice(cut, name.len())
-}
 
 /// Which of the constructor side's arguments the driver lowers before `compared`, in order: each the
 /// comparison cannot test as its pattern would, which it compares by its type's equality instead;
@@ -145,7 +132,8 @@ pub fn compared_args(cx: Context, ctor: Code) -> List<Bool> / {abort.raise} =
 fn pattern_like(cx: Context, x: Code) -> Bool / {abort.raise} =
   match x.node {
     NLit(_) -> true,
-    NVar(v) -> v.slot != None || tested_as_built(cx, x),
+    NVar(_) -> true,
+    NCtor(_) -> tested_as_built(cx, x),
     NApp(a) -> tested_as_built(cx, x) && a.args.all(|y: Code| pattern_like(cx, y)),
     _ -> false,
   }
@@ -185,23 +173,20 @@ fn value_tested(
 ) -> Lowering / {abort.raise} =
   match x.node {
     NLit(l) -> literal_tested(cx, read.st, read.arg, l, differ),
-    NVar(v) -> match v.slot {
-      Some(s) -> match read.st.env.get(s) {
-        Some(a) -> {
-          let w = unviewed({ st: read.st, arg: a }, dummy_span());
-          equal_to(cx, { ..read, st: w.st }, w.arg, differ)
-        },
-        None -> unreachable(b"a comparison with a slot nothing bound"),
+    NVar(v) -> match read.st.env.get(v.slot) {
+      Some(a) -> {
+        let w = unviewed({ st: read.st, arg: a }, dummy_span());
+        equal_to(cx, { ..read, st: w.st }, w.arg, differ)
       },
-      None -> match ctor_of(cx.setting, type_of(read.arg), v.name) {
-        Some(k) -> tag_tested(cx, read.st, read.arg, k, differ),
-        None -> unreachable(b"a comparison with a global's value: ".concat(v.name)),
-      },
+      None -> unreachable(b"a comparison with a slot nothing bound"),
+    },
+    NCtor(v) -> match ctor_of(cx.setting, type_of(read.arg), v.sum, v.case) {
+      Some(k) -> tag_tested(cx, read.st, read.arg, k, differ),
+      None -> unreachable(b"a comparison with a constructor of no declared sum: ".concat(v.name)),
     },
     NApp(a) -> match a.func.node {
-      NVar(f) -> if f.slot != None { unreachable(b"a constructor compared with a call's value") }
-      else {
-        match ctor_of(cx.setting, type_of(read.arg), f.name) {
+      NCtor(f) -> {
+        match ctor_of(cx.setting, type_of(read.arg), f.sum, f.case) {
           Some(k) ->
             a.args.fold(
               { st: tag_tested(cx, read.st, read.arg, k, differ), at: 0 },
@@ -248,10 +233,10 @@ fn pattern_bound(
 ) -> Lowering / {abort.raise} =
   match pat {
     PxWild -> st,
-    PxVar(v) -> match v.slot { Some(s) -> { ..st, env: st.env.insert(s, subject) }, None -> st },
+    PxVar(v) -> { ..st, env: st.env.insert(v.slot, subject) },
     PxLit(l) -> literal_tested(cx, st, subject, l, failing),
     PxRange(r) -> range_tested(cx, st, subject, r.lo, r.hi, failing),
-    PxCtor(c) -> match ctor_of(cx.setting, type_of(subject), c.name) {
+    PxCtor(c) -> match ctor_of(cx.setting, type_of(subject), c.sum, c.case) {
       None -> unreachable(b"a constructor of no declared sum: ".concat(c.name)),
       Some(k) ->
         c.args.fold(
@@ -476,22 +461,19 @@ fn nest(b: Block, failing: Block) -> Block =
 /// declared order, its place among them, and its arguments' types at the type it was tested at.
 type CtorOf = { full: Bytes, names: List<Bytes>, index: Int, args: List<Type> }
 
-/// Constructor `written` of a value of type `ty`, where a sum the program declares holds it.
-fn ctor_of(s: Setting, ty: Type, written: Bytes) -> Option<CtorOf> =
-  match ctor_named(s, written) {
+/// The constructor at place `case` of the sum `sum` the program declares, of a value of type `ty`.
+fn ctor_of(s: Setting, ty: Type, sum: Bytes, case: Int) -> Option<CtorOf> =
+  match s.ctors.sums.get(sum) {
     None -> None,
-    Some(full) -> match ctor_sum(s, full) {
+    Some(cs) -> match cs.at(case) {
       None -> None,
-      Some(sum) -> match sum.ctors.at(sum.index) {
-        None -> None,
-        Some(c) ->
-          Some({
-            full: full,
-            names: sum.ctors.map(|x: SumCtor| x.name),
-            index: sum.index,
-            args: arg_types(c, ty),
-          }),
-      },
+      Some(c) ->
+        Some({
+          full: c.name,
+          names: cs.map(|x: SumCtor| x.name),
+          index: case,
+          args: arg_types(c, ty),
+        }),
     },
   }
 

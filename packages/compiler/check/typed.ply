@@ -15,8 +15,10 @@ pub type TypedExpr<t> = { node: TypedNode<t>, span: Span, ty: t }
 pub type TypedNode<t> =
   | TypedLit(Lit)
   | TypedRead(Reading<t>)
-  | TypedUnary({ op: Bytes, operand: TypedExpr<t> })
-  | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t> })
+  /// `witness` is the owner's type parameter whose witness does the operator, where its operand is
+  /// of one a `numeric` or `integer` constraint makes a witness of.
+  | TypedUnary({ op: Bytes, operand: TypedExpr<t>, witness: Option<Bytes> })
+  | TypedBinary({ op: Bytes, lhs: TypedExpr<t>, rhs: TypedExpr<t>, witness: Option<Bytes> })
   /// `args` are in the callee's parameters' order, a default the call leaves out among them.
   | TypedCall({ callee: TypedExpr<t>, args: List<TypedExpr<t>> })
   | TypedIf({ cond: TypedExpr<t>, then_branch: TypedExpr<t>, else_branch: TypedExpr<t> })
@@ -39,16 +41,31 @@ pub type TypedNode<t> =
   | TypedHandle({ body: TypedExpr<t>, row: Row, clauses: List<TypedClause<t>>, ret: Option<TypedReturn<t>>, vars: List<TypedHandlerVar<t>> })
 
 /// What a name read as a value is: a binder in scope; a definition at the type arguments, rows and
-/// labels the read fills, each in its scheme's order; a constructor of a declared sum at the type
-/// arguments it fills; or a builtin at the type arguments and rows it fills, in its own order.
+/// labels the read fills, each in its scheme's order, with the witnesses it passes in the order of
+/// the parameters they are for; a constructor of a declared sum at the type arguments it fills; or a
+/// builtin at the type arguments and rows it fills, in its own order.
 pub type Reading<t> =
   | ReadLocal(Bytes)
-  | ReadDefinition({ full: Bytes, args: List<t>, rows: List<Row>, labels: List<FilledLabel> })
+  | ReadDefinition({
+    full: Bytes,
+    args: List<t>,
+    rows: List<Row>,
+    labels: List<FilledLabel>,
+    witnesses: List<NumericWitness>,
+  })
   | ReadConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<t> })
   | ReadBuiltin({ name: Bytes, args: List<t>, rows: List<Row> })
 
 /// A label a read fills: one named, or the owner's own label parameter at its place.
 pub type FilledLabel = | LabelNamed(Bytes) | LabelParam(Int)
+
+/// The type a `numeric` or `integer` constraint is met at, as a call passes it: a numeric type by
+/// name, a type parameter of the caller's by name, which passes the caller's own witness, or a type
+/// that states its own arithmetic by its constructor's name.
+pub type NumericWitness = | ConcreteWitness(Bytes) | ParamWitness(Bytes) | StatedWitness(Bytes)
+
+/// The parameter that holds the witness of type parameter `param`, which no source can spell.
+pub fn witness_param(param: Bytes) -> Bytes = b"?w_".concat(param)
 
 pub type TypedParam<t> = { name: Bytes, ty: t, span: Span }
 
@@ -82,8 +99,7 @@ pub type TypedStmt<t> =
 
 /// A clause of a `handle`: the operation it answers, under the label written or under every label,
 /// its parameters, the label it binds where it answers every label, its continuation, and its body.
-/// It runs as a closure of type `ty`; `row` is what its body performs and `resumed` what resuming
-/// its continuation does.
+/// `row` is what its body performs and `resumed` what resuming its continuation does.
 pub type TypedClause<t> = {
   effect: Bytes,
   op: Bytes,
@@ -93,15 +109,13 @@ pub type TypedClause<t> = {
   label: Option<TypedParam<t>>,
   resume: Option<TypedParam<t>>,
   body: TypedExpr<t>,
-  ty: t,
   row: Row,
   resumed: Row,
   span: Span,
 }
 
-/// A `handle`'s `return` clause, run as a closure of type `ty` on the body's answer; `row` is what
-/// it performs.
-pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, ty: t, row: Row, span: Span }
+/// A `handle`'s `return` clause, run on the body's answer; `row` is what it performs.
+pub type TypedReturn<t> = { binder: TypedParam<t>, body: TypedExpr<t>, row: Row, span: Span }
 
 /// A variable a `handle` holds: its type, and its first value, which reads the variables above it.
 pub type TypedHandlerVar<t> = { name: Bytes, ty: t, init: TypedExpr<t>, span: Span }
@@ -119,8 +133,15 @@ pub type BodyPart =
   | LawBody
 
 /// A body the check settled: what owns it, the module it is in, which of its owner's bodies it is,
-/// and its tree, each place in it counted from where its item's text starts.
-pub type TypedBody<t> = { owner: Bytes, module: Int, part: BodyPart, body: TypedExpr<t> }
+/// the parameters it binds, in order, and its tree, each place in it counted from where its item's
+/// text starts.
+pub type TypedBody<t> = {
+  owner: Bytes,
+  module: Int,
+  part: BodyPart,
+  params: List<TypedParam<t>>,
+  body: TypedExpr<t>,
+}
 
 /// What tells a body apart from its owner's others, as text, which bodies are ordered by.
 pub fn part_key(part: BodyPart) -> Bytes =
@@ -137,6 +158,8 @@ pub fn part_key(part: BodyPart) -> Bytes =
 derive bin for BodyPart
 
 derive bin for FilledLabel
+
+derive bin for NumericWitness
 
 derive bin for TypedBody
 
@@ -210,6 +233,71 @@ pub fn typed_nodes<t>(e: TypedExpr<t>) -> List<TypedExpr<t>> = {
   })
 }
 
+/// `e` with `f` applied to each node's own part after its parts: the nodes a walk reaches, which
+/// `typed_nodes` lists.
+pub fn nodes_mapped<t>(e: TypedExpr<t>, f: (TypedNode<t>) -> TypedNode<t>) -> TypedExpr<t> = {
+  let go = |x: TypedExpr<t>| nodes_mapped(x, f);
+  let opt = |x: Option<TypedExpr<t>>| match x { Some(y) -> Some(go(y)), None -> None };
+  let field = |x: TypedField<t>| { name: x.name, value: go(x.value) };
+  let node = match e.node {
+    TypedLit(_) -> e.node,
+    TypedRead(_) -> e.node,
+    TypedUnary(u) -> TypedUnary({ ..u, operand: go(u.operand) }),
+    TypedBinary(b) -> TypedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+    TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go) }),
+    TypedIf(i) ->
+      TypedIf({ cond: go(i.cond), then_branch: go(i.then_branch), else_branch: go(i.else_branch) }),
+    TypedMatch(m) ->
+      TypedMatch({
+        scrutinee: go(m.scrutinee),
+        arms: m.arms.map(|a: TypedArm<t>| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+      }),
+    TypedBlock(b) ->
+      TypedBlock({
+        stmts: b.stmts.map(|st: TypedStmt<t>|
+          match st {
+            TypedLet(l) -> TypedLet({ ..l, value: go(l.value) }),
+            TypedLetElse(l) -> TypedLetElse({ ..l, value: go(l.value), fallback: go(l.fallback) }),
+            TypedDo(x) -> TypedDo(go(x)),
+            TypedAssign(a) -> TypedAssign({ ..a, value: go(a.value) }),
+          }),
+        tail: opt(b.tail),
+      }),
+    TypedList(xs) -> TypedList(xs.map(go)),
+    TypedRecord(fs) -> TypedRecord(fs.map(field)),
+    TypedUpdate(u) -> TypedUpdate({ ..u, base: go(u.base), sets: u.sets.map(field) }),
+    TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
+    TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
+    TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
+    TypedSimulate(th) -> TypedSimulate({ ..th, body: go(th.body) }),
+    TypedParallel(ts) -> TypedParallel(ts.map(|th: TypedThunk<t>| { ..th, body: go(th.body) })),
+    TypedHandle(h) ->
+      TypedHandle({
+        ..h,
+        body: go(h.body),
+        vars: h.vars.map(|v: TypedHandlerVar<t>| { ..v, init: go(v.init) }),
+        clauses: h.clauses.map(|c: TypedClause<t>| { ..c, body: go(c.body) }),
+        ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+      }),
+  };
+  { ..e, node: f(node) }
+}
+
+/// `b` as a reader that draws every type parameter as `Int` reads it: with no witness passed or
+/// taken, each operator its operands' own.
+pub fn unwitnessed<t>(b: TypedBody<t>) -> TypedBody<t> =
+  {
+    ..b,
+    params: b.params.filter(|p: TypedParam<t>| !p.name.starts_with(witness_param(b""))),
+    body: nodes_mapped(b.body, |n: TypedNode<t>|
+      match n {
+        TypedUnary(u) -> TypedUnary({ ..u, witness: None }),
+        TypedBinary(x) -> TypedBinary({ ..x, witness: None }),
+        TypedRead(ReadDefinition(d)) -> TypedRead(ReadDefinition({ ..d, witnesses: [] })),
+        _ -> n,
+      }),
+  }
+
 // --- Writing a tree's types another way ------------------------------------------------------------
 
 /// How `retyped` writes a tree: `ty` writes a type, threading a state through the types in the
@@ -233,6 +321,20 @@ pub fn retyped<a, b, s>(
   let node = retyped_node(e.node, state, r);
   let t = (r.ty)(e.ty, node.state);
   { out: { node: node.out, span: (r.span)(e.span), ty: t.ty }, state: t.state }
+}
+
+/// `b` with every type written as `r` writes it.
+pub fn body_retyped<a, b, s>(
+  b: TypedBody<a>,
+  state: s,
+  r: Retyping<a, b, s>,
+) -> Retyped<TypedBody<b>, s> / {abort.raise} = {
+  let ps = retyped_params(b.params, state, r);
+  let e = retyped(b.body, ps.state, r);
+  {
+    out: { owner: b.owner, module: b.module, part: b.part, params: ps.out, body: e.out },
+    state: e.state,
+  }
 }
 
 fn retyped_all<a, b, s>(
@@ -334,6 +436,7 @@ fn retyped_reading<a, b, s>(
           args: args.out,
           rows: d.rows.map(r.row),
           labels: d.labels,
+          witnesses: d.witnesses,
         }),
         state: args.state,
       }
@@ -448,7 +551,6 @@ fn retyped_clause<a, b, s>(
   let label = retyped_param_opt(c.label, params.state, r);
   let resume = retyped_param_opt(c.resume, label.state, r);
   let body = retyped(c.body, resume.state, r);
-  let t = (r.ty)(c.ty, body.state);
   {
     out: {
       effect: c.effect,
@@ -459,12 +561,11 @@ fn retyped_clause<a, b, s>(
       label: label.out,
       resume: resume.out,
       body: body.out,
-      ty: t.ty,
       row: (r.row)(c.row),
       resumed: (r.row)(c.resumed),
       span: (r.span)(c.span),
     },
-    state: t.state,
+    state: body.state,
   }
 }
 
@@ -481,12 +582,15 @@ fn retyped_node<a, b, s>(
     },
     TypedUnary(u) -> {
       let o = retyped(u.operand, state, r);
-      { out: TypedUnary({ op: u.op, operand: o.out }), state: o.state }
+      { out: TypedUnary({ op: u.op, operand: o.out, witness: u.witness }), state: o.state }
     },
     TypedBinary(bin) -> {
       let l = retyped(bin.lhs, state, r);
       let rh = retyped(bin.rhs, l.state, r);
-      { out: TypedBinary({ op: bin.op, lhs: l.out, rhs: rh.out }), state: rh.state }
+      {
+        out: TypedBinary({ op: bin.op, lhs: l.out, rhs: rh.out, witness: bin.witness }),
+        state: rh.state,
+      }
     },
     TypedCall(c) -> {
       let f = retyped(c.callee, state, r);
@@ -599,16 +703,14 @@ fn retyped_node<a, b, s>(
         Some(rc) -> {
           let binder = retyped_param(rc.binder, clauses.state, r);
           let rbody = retyped(rc.body, binder.state, r);
-          let t = (r.ty)(rc.ty, rbody.state);
           {
             out: Some({
               binder: binder.out,
               body: rbody.out,
-              ty: t.ty,
               row: (r.row)(rc.row),
               span: (r.span)(rc.span),
             }),
-            state: t.state,
+            state: rbody.state,
           }
         },
         None -> { out: None, state: clauses.state },
