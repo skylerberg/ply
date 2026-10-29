@@ -46,8 +46,6 @@ pub struct Exports {
     pub constants: Vec<(String, usize)>,
     /// How many modules the unit was emitted from.
     pub modules: usize,
-    /// What the fixpoint dropped and why.
-    pub refusals: Vec<(String, String)>,
     pub fields: Vec<Symbol>,
     /// Each root the unit is entered at through its `R#entered`, as its [`ENTERED`] lines say.
     pub entered: Vec<String>,
@@ -110,10 +108,6 @@ impl Exports {
             out.push_str(&format!("{name} {slot}\n"));
         }
         out.push_str(&format!("modules {}\n", self.modules));
-        out.push_str(&format!("refused {}\n", self.refusals.len()));
-        for (function, construct) in &self.refusals {
-            out.push_str(&format!("{function}\n{construct}\n"));
-        }
         out.push_str(&encode_fields(&self.fields));
         for root in &self.entered {
             out.push_str(&format!("{ENTERED}{root}\n"));
@@ -147,12 +141,13 @@ impl Exports {
             constants.push((name.to_string(), slot.parse().ok()?));
         }
         let modules = count(line(s, &mut at)?, "modules")?;
-        let n = count(line(s, &mut at)?, "refused")?;
-        let mut refusals = Vec::with_capacity(n);
-        for _ in 0..n {
-            let function = line(s, &mut at)?.to_string();
-            let construct = line(s, &mut at)?.to_string();
-            refusals.push((function, construct));
+        // A unit the last release wrote lists what its emitter refused, two lines each.
+        let mut past = at;
+        if let Some(n) = line(s, &mut past).and_then(|l| count(l, "refused")) {
+            for _ in 0..2 * n {
+                line(s, &mut past)?;
+            }
+            at = past;
         }
         let fields = decode_fields(s, &mut at)?;
         // Each root entered, a line each; a line a later unit says reads as nothing.
@@ -166,7 +161,6 @@ impl Exports {
             helpers,
             constants,
             modules,
-            refusals,
             fields,
             entered,
         })

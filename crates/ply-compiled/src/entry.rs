@@ -39,7 +39,7 @@ impl Opened {
     /// emitted against another runtime.
     pub fn open(library: &std::path::Path) -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let (native, _) = crate::c::load_opened(library).map_err(|e| format!("{e:#}"))?;
+        let native = crate::c::load_opened(library).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -49,7 +49,7 @@ impl Opened {
     /// The program this executable was linked with.
     pub fn linked() -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let (native, _) = crate::c::load_linked().map_err(|e| format!("{e:#}"))?;
+        let native = crate::c::load_linked().map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),

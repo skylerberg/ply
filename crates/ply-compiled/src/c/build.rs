@@ -1,7 +1,6 @@
 //! Loading a unit: its C compiled, its object bound to this runtime's helpers, and what it says
 //! about itself read back into the tables its code runs against.
 
-use super::Refused;
 use super::descriptor::{Descriptor, TakenRow};
 use super::exports::Exports;
 use super::load::Library;
@@ -71,12 +70,12 @@ impl Native {
 }
 
 /// The unit compiled into the library at `path`, finished against its own constructor table.
-pub fn load_opened(path: &std::path::Path) -> Result<(Native, Vec<Refused>)> {
+pub fn load_opened(path: &std::path::Path) -> Result<Native> {
     finish_unit(Library::open(path)?)
 }
 
 /// The program this executable was linked with, finished as a loaded unit is.
-pub fn load_linked() -> Result<(Native, Vec<Refused>)> {
+pub fn load_linked() -> Result<Native> {
     let Some(lib) = Library::linked() else {
         bail!("this executable was linked with no program");
     };
@@ -84,7 +83,7 @@ pub fn load_linked() -> Result<(Native, Vec<Refused>)> {
 }
 
 /// A unit's object, however it was compiled or linked, finished against what it says about itself.
-fn finish_unit(lib: Library) -> Result<(Native, Vec<Refused>)> {
+fn finish_unit(lib: Library) -> Result<Native> {
     let Some(unit) = lib.descriptor() else {
         bail!(
             "the unit at {} lays out no descriptor for its loader",
@@ -95,20 +94,7 @@ fn finish_unit(lib: Library) -> Result<(Native, Vec<Refused>)> {
     // reads it.
     let unit: &'static Descriptor = unsafe { &*std::ptr::from_ref(unit) };
     let exports = Exports::read(unit)?;
-    let refused = refused_of(&exports);
-    let native = finish(lib, unit, exports)?;
-    Ok((native, refused))
-}
-
-fn refused_of(exports: &Exports) -> Vec<Refused> {
-    exports
-        .refusals
-        .iter()
-        .map(|(function, construct)| Refused {
-            function: function.clone(),
-            construct: construct.clone(),
-        })
-        .collect()
+    finish(lib, unit, exports)
 }
 
 /// A loaded object, what it lays out and what it says, made into an enterable `Native`: each root's
@@ -121,7 +107,6 @@ fn finish(lib: Library, unit: &'static Descriptor, exports: Exports) -> Result<N
         helpers: _,
         constants: _,
         modules: _,
-        refusals: _,
         fields,
         entered,
     } = exports;

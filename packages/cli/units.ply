@@ -9,8 +9,8 @@ import compiler.check.resolve.tables (Diag, error_at)
 import compiler.cc
 import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
-import compiler.unit (Baked, Dropped, Emission, Made, shipped, shipped_runtime, answers_store,
-                      baked_key, emitted, emitter_identity, held)
+import compiler.unit (Baked, Emission, Made, shipped, shipped_runtime, answers_store, baked_key,
+                      emitted, emitter_identity, held)
 import compiler.store.kept (Record, kept_records, with_kept)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text)
 import std.env (env)
@@ -37,10 +37,9 @@ pub effect emit {
 
 fn emitted_of(
   front: LoadedAnalysis,
-  offered: List<RootKey>,
   emission: Result<Emission, Bytes>,
 ) -> Result<Emitted, List<Diag>> / {abort.raise} =
-  match held(front.dump, offered, emission) {
+  match held(front.dump, emission) {
     Err(diags) -> Err(diags),
     Ok(text) ->
       Ok({
@@ -59,63 +58,23 @@ fn kept_dir() -> String / {toolchain.bodies, abort.raise} = below_root(toolchain
 fn texts(front: LoadedAnalysis) -> List<Bytes> =
   front.files.map(|f: { path: String, name: String, text: Bytes }| f.text)
 
-/// What a developer asks of emission through the environment: `PLY_C_ONLY` and `PLY_C_SKIP` narrow
-/// what is offered, `PLY_C_REFUSALS` says what the unit took and refused, and `PLY_C_PHASES` what
-/// the emitter was asked and what was read back.
-type Knobs = { only: Option<List<String>>, skip: List<String>, refusals: Bool, phases: Bool }
-
-fn listed(text: String) -> List<String> = text.split(",").filter(|s: String| s != "")
-
-fn knobs() -> Knobs / {env.variable} =
-  {
-    only: match env.variable("PLY_C_ONLY") { Some(t) -> Some(listed(t)), None -> None },
-    skip: match env.variable("PLY_C_SKIP") { Some(t) -> listed(t), None -> [] },
-    refusals: env.variable("PLY_C_REFUSALS") != None,
-    phases: env.variable("PLY_C_PHASES") != None,
-  }
-
-/// `offered` with only the definitions `PLY_C_ONLY` names, and none under a prefix `PLY_C_SKIP` names.
-fn narrowed(k: Knobs, offered: List<RootKey>) -> List<RootKey> / {abort.raise} =
-  offered.filter(|r: RootKey| {
-    let name = String::of_bytes(root_text(root_name(r)));
-    let wanted = match k.only {
-      None -> true,
-      Some(names) -> names.filter(|w: String| w == name).len() > 0,
-    };
-    wanted && k.skip.filter(|prefix: String| name.starts_with(prefix)).len() == 0
-  })
-
+/// What the emitter was asked and what was read back, said where `PLY_C_PHASES` asks.
 fn told(
-  k: Knobs,
-  offered: Int,
   emission: Result<Emission, Bytes>,
   identity: Bytes,
   ms: Int,
-) -> Unit / {process.err[proc], abort.raise} =
+) -> Unit / {env.variable, process.err[proc], abort.raise} =
   match emission {
     Err(_) -> (),
-    Ok(e) -> {
-      if k.refusals {
-        e.produced.dropped.fold((), |_: Unit, d: Dropped|
-          process.err[proc](
-            "C backend refused `" ++ String::of_bytes(root_text(d.function)) ++ "`: "
-              ++ String::of_bytes(d.construct),
-          ));
-        process.err[proc](
-          "C backend took " ++ e.produced.taken.len().to_string() ++ " of " ++ offered.to_string()
-            ++ " definitions",
-        )
-      };
-      if k.phases {
-        process.err[proc](
-          "phases: emitter " ++ String::of_bytes(identity) ++ ", " ++ e.kept.to_string()
-            ++ " answers read back, "
-            ++ e.asked.to_string()
-            ++ " asked of it, "
-            ++ ms.to_string()
-            ++ "ms",
-        )
-      }
+    Ok(e) -> if env.variable("PLY_C_PHASES") != None {
+      process.err[proc](
+        "phases: emitter " ++ String::of_bytes(identity) ++ ", " ++ e.kept.to_string()
+          ++ " answers read back, "
+          ++ e.asked.to_string()
+          ++ " asked of it, "
+          ++ ms.to_string()
+          ++ "ms",
+      )
     },
   }
 
@@ -147,8 +106,6 @@ fn unit_of(
   front: LoadedAnalysis,
   offered: List<RootKey>,
 ) -> Result<Emitted, List<Diag>> / {shipped.runtime, shipped.definitions, toolchain.bodies, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise} = {
-  let k = knobs();
-  let wanted = narrowed(k, offered);
   let identity = emitter_identity(shipped.definitions());
   let runtime = shipped_runtime();
   let started = time.elapsed_ms();
@@ -159,14 +116,14 @@ fn unit_of(
       front.dump,
       texts(front),
       front.inputs,
-      wanted,
+      offered,
       read,
       |rs: List<Record>| kept_records.put[ans](rs),
-      kept_values(front.dump.baked, wanted, read),
+      kept_values(front.dump.baked, offered, read),
     )
   });
-  told(k, wanted.len(), emission, identity, time.elapsed_ms() - started);
-  emitted_of(front, wanted, emission)
+  told(emission, identity, time.elapsed_ms() - started);
+  emitted_of(front, emission)
 }
 
 /// A unit's C alone, for whoever only enters it.
@@ -233,28 +190,23 @@ pub fn library_over(
 
 // --- Compiling a unit ---------------------------------------------------------------
 
-/// Which compiler a profile compiles with, at what level, and whether its code checks what it
-/// assumes. `PLY_C_PROFILE` wins over the flag. `development` compiles fast for code that runs slowly
-/// enough, and checked: tcc where it compiles for x86-64 Linux, else `cc -O0`; `release` is `cc -O2`.
-/// Elsewhere a library tcc links does not hold a unit: its arm64 calls reach only 128 MB, and on
-/// macOS dyld misreads the exports it writes. `PLY_CC` names `cc`'s program and is used whatever the
-/// profile, and `PLY_CC_OPT` names the level.
+/// The profile a unit compiles under, and whether tcc compiles it. `PLY_C_PROFILE` overrides the
+/// `--profile` flag, and `PLY_CC_OPT` sets the optimisation level. tcc is used only where it compiles
+/// for x86-64 Linux. Elsewhere it cannot build a library that works: its arm64 calls reach only
+/// 128 MB, and on macOS dyld misreads the exports it writes. `PLY_CC` names the program to run as
+/// `cc`, whatever the profile.
 fn chosen(
   profile: String,
-) -> { tcc: Bool, level: String, checked: Bool } / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
-  let release = match env.variable("PLY_C_PROFILE") {
-    Some(p) -> p == "release",
-    None -> profile == "release",
-  };
-  let level = match env.variable("PLY_CC_OPT") {
-    Some(o) -> o,
-    None -> if release { "-O2" } else { "-O0" },
-  };
+) -> { tcc: Bool, profile: cc::Profile } / {compilers.found[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
+  let named = cc::profile_named(match env.variable("PLY_C_PROFILE") {
+    Some(p) -> p,
+    None -> profile,
+  });
+  let p = match env.variable("PLY_CC_OPT") { Some(o) -> { ..named, unit: o }, None -> named };
   {
-    tcc: !release && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
+    tcc: p.tcc && env.variable("PLY_CC") == None && compilers.found[tcc]() != None
       && cc::targets_x86_64_linux[tcc](),
-    level: level,
-    checked: !release,
+    profile: p,
   }
 }
 
@@ -270,8 +222,7 @@ fn compiled_of(
   profile: String,
 ) -> Result<String, List<Diag>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
   let choice = chosen(profile);
-  let built = if choice.tcc {
-    cc::library[tcc](choice.level, choice.checked, cc::library_flags(), text)
-  } else { cc::library[cc](choice.level, choice.checked, cc::library_flags(), text) };
+  let built = if choice.tcc { cc::library[tcc](choice.profile, text) }
+  else { cc::library[cc](choice.profile, text) };
   match built { Ok(path) -> Ok(path), Err(why) -> Err([unbuildable(why)]) }
 }

@@ -156,18 +156,28 @@ fn a_units_helpers_bind_by_name_to_the_runtimes_own() {
     }
 }
 
-/// A table reads as a unit writes one: its helpers, constants, modules, refusals, pools and entered
-/// roots, in that order.
+/// A table reads as a unit writes one: its helpers, constants, modules, pools and entered roots,
+/// in that order.
 #[test]
 fn a_units_table_reads_as_a_unit_writes_it() {
-    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nrefused 0\nfields 1\nop\n\
-                entered m.main\n";
+    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.modules, 3);
     assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.entered, ["m.main"]);
     assert_eq!(read.encode(), said);
+}
+
+/// The last release's units list what their emitter refused after their modules: such a table reads
+/// as the same table without the list, since the release's builder runs on this runtime.
+#[test]
+fn a_table_listing_refusals_reads_as_one_without_them() {
+    let listed = "helpers 0\nconstants 0\nmodules 3\nrefused 1\nm.f\nwhy\nfields 1\nop\n\
+                  entered m.main\n";
+    let bare = "helpers 0\nconstants 0\nmodules 3\nfields 1\nop\nentered m.main\n";
+    let read = ply_compiled::c::Exports::decode(listed).expect("the listing table reads");
+    assert_eq!(read.encode(), bare);
 }
 
 /// What a unit was emitted against is what it calls: a helper the runtime lacks, or has under
@@ -220,8 +230,7 @@ fn a_unit_compiles_loads_binds_and_answers() {
     let Some(loaded) = units::opened(dir.path(), &[probe], |_| {}) else {
         return;
     };
-    let (native, refused) = loaded.expect("the unit loads");
-    assert!(refused.is_empty());
+    let native = loaded.expect("the unit loads");
     assert_eq!(native.names(), ["m.probe"]);
     assert_eq!(native.arity("m.probe"), Some(2));
     let answer = units::entered(&native, "m.probe", 10, &[imm(20), imm(22)]).expect("it answers");
@@ -296,7 +305,7 @@ extern "C" fn enter_from_an_unknown_stack(arg: usize) {
 fn ladder_from_an_unknown_stack() -> Option<(i64, u64, i64, Option<String>)> {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
-    let (native, _) = loaded.expect("the unit loads");
+    let native = loaded.expect("the unit loads");
     let mut ctx = native.context();
     ctx.begin(DEEP * 2);
     let mut u = Unknown {
@@ -344,7 +353,7 @@ fn a_recursion_past_a_threads_floor_fails_out_of_stack() {
         .spawn(|| {
             let dir = tempfile::tempdir().expect("a scratch directory");
             let loaded = units::opened(dir.path(), &deep_calls(), |_| {})?;
-            let (native, _) = loaded.expect("the unit loads");
+            let native = loaded.expect("the unit loads");
             let entry = native.entry("m.ladder").expect("`m.ladder` is taken");
             let mut ctx = native.context();
             ctx.begin(DEEP * 2);
@@ -376,7 +385,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
     let Some(loaded) = units::opened(dir.path(), &deep_calls(), |_| {}) else {
         return;
     };
-    let (native, _) = loaded.expect("the unit loads");
+    let native = loaded.expect("the unit loads");
     let entry = native.entry("m.spin").expect("`m.spin` is taken");
     let mut ctx = native.context();
     ctx.begin(10_000);
@@ -401,7 +410,7 @@ fn a_recursion_with_no_base_case_still_stops_at_the_fuel() {
 /// A unit says each constant with its row of the code table.
 #[test]
 fn a_unit_says_its_constants_slots() {
-    let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nrefused 0\nfields 0\n";
+    let with = "helpers 0\nconstants 1\nm.table 4\nmodules 0\nfields 0\n";
     let read = ply_compiled::c::Exports::decode(with).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.encode(), with);
@@ -415,7 +424,7 @@ fn a_unit_says_its_constants_slots() {
 /// among lines a runtime that does not know them reads as nothing.
 #[test]
 fn a_unit_says_each_root_it_is_entered_at_after_its_tables() {
-    let tables = "helpers 0\nconstants 0\nmodules 0\nrefused 0\nfields 0\n";
+    let tables = "helpers 0\nconstants 0\nmodules 0\nfields 0\n";
     let said = format!("{tables}entered m.main\nentered m.run\n");
     let read = ply_compiled::c::Exports::decode(&said).expect("the table reads");
     assert_eq!(read.entered, ["m.main", "m.run"]);

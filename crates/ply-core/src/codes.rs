@@ -66,8 +66,6 @@ pub const SPAN_UNBALANCED: &str = "E0445";
 pub const HOLD_RELEASED: &str = "E0331";
 /// A value branded with a region's name would outlive the region.
 pub const REGION_ESCAPE: &str = "E0446";
-/// A definition the program reaches that the C backend cannot compile.
-pub const DEFINITION_REFUSED: &str = "E0448";
 /// A task, channel or continuation crossing a runtime boundary, where no type is left to check it.
 pub const REGION_ESCAPE_AT_BOUNDARY: &str = "E0449";
 pub const BACKEND_UNAVAILABLE: &str = "E0450";

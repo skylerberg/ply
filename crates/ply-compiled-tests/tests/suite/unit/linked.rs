@@ -25,8 +25,7 @@ fn a_linked_program_loads_from_the_descriptor_its_main_hands_over() {
         "no descriptor is no program"
     );
     unsafe { install(unit) }.expect("a descriptor installs");
-    let (native, refused) = ply_compiled::c::load_linked().expect("the linked unit loads");
-    assert!(refused.is_empty());
+    let native = ply_compiled::c::load_linked().expect("the linked unit loads");
     assert_eq!(native.names(), ["m.seven"]);
     let answer = units::entered(&native, "m.seven", 10, &[]).expect("it answers");
     assert_eq!(imm_value(answer), 7);
