@@ -6,8 +6,9 @@ import compiler.syntax.parsing (Span, Ident, QName, site_digit, minted, minted_t
                                 role_try_return, role_detached, role_update_copy,
                                 role_member_default)
 import compiler.syntax.items (Module, Item, IFn, ITest, ILaw, ISchema, IExtern, IType, IEffect,
-                              IDerive, FnDef, Binder, SpecClause, ReturnsParam, TDAlias, TDSum,
-                              TDNominal, VariantDef, OpDef, parse)
+                              IDerive, IInstance, INumeric, IEffectSet, FnDef, Binder, SpecClause,
+                              ReturnsParam, TDAlias, TDSum, TDNominal, VariantDef, OpDef, NumericOp,
+                              parse)
 import compiler.syntax.type_syntax (TypeExpr, TCon, TFn, TRecord, RowExpr, AtomExpr)
 import compiler.expand.rewrite.shared (picked_in)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -30,26 +31,45 @@ pub fn numbered_module(m: Module) -> Module / {abort.raise} = { ..m, items: m.it
 /// test's cases, then its body; a law's binders, then its guard and its body. A field's name, a
 /// label, a type variable and the item keep no number.
 /// Raises on an item of more nodes than a minted site leaves room for.
-pub fn numbered(item: Item) -> Item / {abort.raise} = {
-  let mark = |s: Span, n: Int| { ..s, site: n };
-  let out: { item: Item, n: Int } = match item {
+pub fn numbered(item: Item) -> Item / {abort.raise} =
+  within(numbering(|s: Span, k: Int| { ..s, site: k }, item, 1))
+
+/// `made`, which a maker wrote from the numbered item `written`, with each node it made numbered
+/// past every number `written` holds. A made node is one with no number; a node `made` kept from
+/// `written` keeps its number, so what the item was written with keeps its sites.
+pub fn numbered_past(written: Item, made: Item) -> Item / {abort.raise} = {
+  let past = numbering(|s: Span, k: Int| { ..s, site: k }, written, 1).n;
+  within(numbering(|s: Span, k: Int| if s.site == 0 { { ..s, site: k } } else { s }, made, past))
+}
+
+fn within(out: { item: Item, n: Int }) -> Item / {abort.raise} =
+  if out.n >= site_digit() { panic("an item of more nodes than its sites can number") }
+  else { out.item }
+
+/// `item` with each node marked by `mark` with its number, counting from `n`, and the next number.
+fn numbering(
+  mark: (Span, Int) -> Span,
+  item: Item,
+  n: Int,
+) -> { item: Item, n: Int } / {abort.raise} =
+  match item {
     IFn(d) -> {
-      let f = numbered_fn(mark, d, 1);
+      let f = numbered_fn(mark, d, n);
       { item: IFn(f.d), n: f.n }
     },
     IType(d) -> {
       let body = match d.body {
         TDAlias(t) -> {
-          let o = num_type(mark, t, 2);
+          let o = num_type(mark, t, n + 1);
           { b: TDAlias(o.t), n: o.n }
         },
         TDNominal(t) -> {
-          let o = num_type(mark, t, 2);
+          let o = num_type(mark, t, n + 1);
           { b: TDNominal(o.t), n: o.n }
         },
         TDSum(vs) -> {
           let o = vs.fold(
-            { vs: [], n: 2 },
+            { vs: [], n: n + 1 },
             |acc: { vs: List<VariantDef>, n: Int }, v: VariantDef| {
               let fs = num_types(mark, v.fields, acc.n + 1);
               { vs: acc.vs.push({ ..v, name: named(mark, v.name, acc.n), fields: fs.ts }), n: fs.n }
@@ -57,29 +77,65 @@ pub fn numbered(item: Item) -> Item / {abort.raise} = {
           );
           { b: TDSum(o.vs), n: o.n }
         },
-        other -> { b: other, n: 2 },
+        other -> { b: other, n: n + 1 },
       };
-      { item: IType({ ..d, name: named(mark, d.name, 1), body: body.b }), n: body.n }
+      { item: IType({ ..d, name: named(mark, d.name, n), body: body.b }), n: body.n }
     },
     IEffect(d) -> {
-      let ops = d.ops.fold({ ops: [], n: 2 }, |acc: { ops: List<OpDef>, n: Int }, op: OpDef| {
+      let ops = d.ops.fold({ ops: [], n: n + 1 }, |acc: { ops: List<OpDef>, n: Int }, op: OpDef| {
         let ps = num_types(mark, op.params, acc.n + 1);
         let r = num_type(mark, op.ret, ps.n);
+        let documented = idents(mark, op.param_names, r.n);
         {
-          ops: acc.ops.push({ ..op, name: named(mark, op.name, acc.n), params: ps.ts, ret: r.t }),
-          n: r.n,
+          ops: acc.ops.push({
+            ..op,
+            name: named(mark, op.name, acc.n),
+            params: ps.ts,
+            ret: r.t,
+            param_names: documented.names,
+          }),
+          n: documented.n,
         }
       });
-      { item: IEffect({ ..d, name: named(mark, d.name, 1), ops: ops.ops }), n: ops.n }
+      { item: IEffect({ ..d, name: named(mark, d.name, n), ops: ops.ops }), n: ops.n }
     },
-    IDerive(d) -> { item: IDerive({ ..d, target: named(mark, d.target, 1) }), n: 2 },
+    IDerive(d) -> { item: IDerive({ ..d, target: named(mark, d.target, n) }), n: n + 1 },
+    IInstance(d) ->
+      {
+        item: IInstance({ ..d, target: named(mark, d.target, n), by: named(mark, d.by, n + 1) }),
+        n: n + 2,
+      },
+    INumeric(d) -> {
+      let ops = idents(mark, d.ops.map(|x: NumericOp| x.by), n + 1);
+      {
+        item: INumeric({
+          ..d,
+          target: named(mark, d.target, n),
+          ops: range(0, d.ops.len()).map(|i: Int| { ..d.ops.get(i), by: ops.names.get(i) }),
+        }),
+        n: ops.n,
+      }
+    },
+    IEffectSet(d) -> {
+      let atoms = num_atoms(mark, d.atoms, n + 1);
+      let includes = num_qnames(mark, d.includes, atoms.n);
+      {
+        item: IEffectSet({
+          ..d,
+          name: named(mark, d.name, n),
+          atoms: atoms.xs,
+          includes: includes.qs,
+        }),
+        n: includes.n,
+      }
+    },
     ITest(d) -> match d.cases {
       None -> {
-        let b: Num = num_expr(mark, d.body, 1);
+        let b: Num = num_expr(mark, d.body, n);
         { item: ITest({ ..d, body: b.e }), n: b.n }
       },
       Some(c) -> {
-        let ty = num_type(mark, c.ty, 4);
+        let ty = num_type(mark, c.ty, n + 3);
         let table: Num = num_expr(mark, c.table, ty.n);
         let label: Num = num_expr(mark, c.label, table.n);
         let b: Num = num_expr(mark, d.body, label.n);
@@ -88,9 +144,9 @@ pub fn numbered(item: Item) -> Item / {abort.raise} = {
             ..d,
             cases: Some({
               ..c,
-              for_span: mark(c.for_span, 1),
-              in_span: mark(c.in_span, 2),
-              binder: named(mark, c.binder, 3),
+              for_span: mark(c.for_span, n),
+              in_span: mark(c.in_span, n + 1),
+              binder: named(mark, c.binder, n + 2),
               ty: ty.t,
               table: table.e,
               label: label.e,
@@ -102,27 +158,27 @@ pub fn numbered(item: Item) -> Item / {abort.raise} = {
       },
     },
     ILaw(d) -> {
-      let bs = binders(mark, d.binders, 1);
+      let bs = binders(mark, d.binders, n);
       let g: { e: Option<Expr>, n: Int } = maybe(mark, d.guard, bs.n);
       let b: Num = num_expr(mark, d.body, g.n);
       { item: ILaw({ ..d, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
     },
     ISchema(d) -> {
-      let ps = binders(mark, d.params, 1);
+      let ps = binders(mark, d.params, n);
       let bs = binders(mark, d.binders, ps.n);
       let g: { e: Option<Expr>, n: Int } = maybe(mark, d.guard, bs.n);
       let b: Num = num_expr(mark, d.body, g.n);
       { item: ISchema({ ..d, params: ps.bs, binders: bs.bs, guard: g.e, body: b.e }), n: b.n }
     },
     IExtern(d) -> {
-      let ps: Params = params(mark, d.params, 2);
+      let ps: Params = params(mark, d.params, n + 1);
       let r = num_type(mark, d.ret, ps.n);
       let e = num_maybe_row(mark, d.effects, r.n);
       let sp = clauses(mark, d.spec, e.n);
       {
         item: IExtern({
           ..d,
-          name: named(mark, d.name, 1),
+          name: named(mark, d.name, n),
           params: ps.ps,
           ret: r.t,
           effects: e.r,
@@ -131,11 +187,7 @@ pub fn numbered(item: Item) -> Item / {abort.raise} = {
         n: sp.n,
       }
     },
-    _ -> { item: item, n: 1 },
-  };
-  if out.n >= site_digit() { panic("an item of more nodes than its sites can number") }
-  else { out.item }
-}
+  }
 
 /// `copied`, the default the call at `at` takes for its parameter `slot`, with every node and name
 /// in it at `at`: what a check files of one call's copy is that call's own, and formatting the
@@ -304,19 +356,26 @@ fn num_maybe_type(
     None -> { t: None, n: n },
   }
 
-fn num_row(mark: (Span, Int) -> Span, r: RowExpr, n: Int) -> { r: RowExpr, n: Int } = {
-  let atoms = r.atoms.fold({ xs: [], n: n }, |acc: { xs: List<AtomExpr>, n: Int }, a: AtomExpr| {
+fn num_atoms(
+  mark: (Span, Int) -> Span,
+  atoms: List<AtomExpr>,
+  n: Int,
+) -> { xs: List<AtomExpr>, n: Int } =
+  atoms.fold({ xs: [], n: n }, |acc: { xs: List<AtomExpr>, n: Int }, a: AtomExpr| {
     let e = num_qname(mark, a.eff, acc.n);
     let op = maybe_named(mark, a.op, e.n);
     { xs: acc.xs.push({ ..a, eff: e.q, op: op.name }), n: op.n }
-  });
-  let aliases = r.aliases.fold(
-    { qs: [], n: atoms.n },
-    |acc: { qs: List<QName>, n: Int }, q: QName| {
-      let o = num_qname(mark, q, acc.n);
-      { qs: acc.qs.push(o.q), n: o.n }
-    },
-  );
+  })
+
+fn num_qnames(mark: (Span, Int) -> Span, qs: List<QName>, n: Int) -> { qs: List<QName>, n: Int } =
+  qs.fold({ qs: [], n: n }, |acc: { qs: List<QName>, n: Int }, q: QName| {
+    let o = num_qname(mark, q, acc.n);
+    { qs: acc.qs.push(o.q), n: o.n }
+  })
+
+fn num_row(mark: (Span, Int) -> Span, r: RowExpr, n: Int) -> { r: RowExpr, n: Int } = {
+  let atoms = num_atoms(mark, r.atoms, n);
+  let aliases = num_qnames(mark, r.aliases, atoms.n);
   { r: { ..r, atoms: atoms.xs, aliases: aliases.qs }, n: aliases.n }
 }
 

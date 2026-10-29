@@ -1,6 +1,6 @@
 //! What each name written in a module refers to, by where it was written: the name resolution the
-//! checker and the tools that read or rewrite code share. A field's or a method's name is a typing
-//! result, so it is not here.
+//! checker and the tools that read or rewrite code share. A name only types settle, a field's or a
+//! call on a value's, is told apart from the rest as what it is written as.
 
 import compiler.syntax.parsing (Span, Ident, QName)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -12,12 +12,14 @@ import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRec
 import compiler.syntax.type_syntax (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr,
                                     AtomExpr)
 import compiler.syntax.items (Module, Item, IFn, IType, IEffect, ITest, ILaw, ISchema, IExtern,
-                              IDerive, FnDef, TypeDef, TDAlias, TDSum, TDNominal, VariantDef,
-                              EffectDef, OpDef, TestDef, LawDef, SpecClause, SRequires, SEnsures,
-                              SCost, SSpace, ReturnsParam, Binder, ImportDecl, INames, result_name,
-                              test_run, test_listing, case_params)
+                              IDerive, IInstance, INumeric, IEffectSet, NHost, NumericOp, FnDef,
+                              TypeDef, TDAlias, TDSum, TDNominal, VariantDef, EffectDef, OpDef,
+                              TestDef, LawDef, SpecClause, SRequires, SEnsures, SCost, SSpace,
+                              ReturnsParam, Binder, ImportDecl, INames, result_name, test_run,
+                              test_listing, case_params)
 import compiler.check.resolve.tables (Resolved, Namespace, ValueSpace, TypeSpace, EffectSpace,
-                                      SetSpace, Binding, find_module_binding)
+                                      SetSpace, Binding, find_module_binding, lookup_declared,
+                                      namespaces)
 import compiler.check.resolve.scopes (find)
 import std.list
 
@@ -43,7 +45,20 @@ pub type Reference = {
   shorthand: Bool,
 }
 
-/// `found` holds each name by its site: the trees an item is read as may share a name.
+/// A name only types settle, as written: a record's field, by its name alone, since records are
+/// structural; the function or field a call on a value names, which the checker's member site at
+/// the call's site settles; or a named argument, the parameter of what the call at `call` calls,
+/// `callee` where the call names it rather than calling on a value.
+pub type Member = { start: Int, end: Int, name: Bytes, kind: MemberKind }
+
+pub type MemberKind = | FieldName | CalledName(Int) | ArgumentName({ call: Int, callee: Refers })
+
+/// What one item, or a module's imports, writes: each name with what it refers to, and each name
+/// only types settle.
+pub type Written = { references: List<Reference>, members: List<Member> }
+
+/// `found` holds each name by its site, and `members` each member by where it starts: the trees an
+/// item is read as may share a name. `members` is `None` for a walk that only wants the references.
 /// `find` is what a name the walk does not bind names, and `module_named` the module a qualifier
 /// names; a walk of code no resolution reads finds neither, and so binds its locals alone.
 type Walk = {
@@ -51,6 +66,7 @@ type Walk = {
   module_named: (Bytes) -> Option<Int> / {abort.raise},
   scopes: List<Map<Bytes, Refers>>,
   found: Map<Int, Reference>,
+  members: Option<Map<Int, Member>>,
 }
 
 fn walk_of(resolved: Resolved, index: Int) -> Walk =
@@ -63,6 +79,7 @@ fn walk_of(resolved: Resolved, index: Int) -> Walk =
       },
     scopes: [Map::new()],
     found: Map::new(),
+    members: None,
   }
 
 fn unresolved() -> Walk =
@@ -71,6 +88,7 @@ fn unresolved() -> Walk =
     module_named: |_: Bytes| None,
     scopes: [Map::new()],
     found: Map::new(),
+    members: None,
   }
 
 fn reference(name: Ident, refers: Refers, shorthand: Bool) -> Reference =
@@ -85,6 +103,26 @@ fn reference(name: Ident, refers: Refers, shorthand: Bool) -> Reference =
 
 fn noted(w: Walk, name: Ident, refers: Refers, shorthand: Bool) -> Walk =
   { ..w, found: w.found.insert(name.span.site, reference(name, refers, shorthand)) }
+
+fn member(w: Walk, name: Ident, kind: MemberKind) -> Walk =
+  match w.members {
+    None -> w,
+    Some(m) ->
+      {
+        ..w,
+        members: Some(
+          m.insert(name.span.start, {
+            start: name.span.start,
+            end: name.span.end,
+            name: name.name,
+            kind: kind,
+          }),
+        ),
+      },
+  }
+
+fn refers_of(w: Walk, name: Ident) -> Refers =
+  match w.found.get(name.span.site) { Some(r) -> r.refers, None -> Unbound }
 
 fn pushed(w: Walk) -> Walk = { ..w, scopes: w.scopes.push(Map::new()) }
 
@@ -142,11 +180,13 @@ fn value_named(w: Walk, qname: QName, shorthand: Bool) -> Walk / {abort.raise} =
   noted(qualifier(w, qname), qname.name, refers, shorthand)
 }
 
-fn walk_field(w: Walk, field: RecField) -> Walk / {abort.raise} =
+fn walk_field(w: Walk, field: RecField) -> Walk / {abort.raise} = {
+  let labelled = member(w, field.name, FieldName);
   match field.value {
-    EVar(v) -> value_named(w, v.name, v.name.name.span.start == field.name.span.start),
-    _ -> walk_expr(w, field.value),
+    EVar(v) -> value_named(labelled, v.name, v.name.name.span.start == field.name.span.start),
+    _ -> walk_expr(labelled, field.value),
   }
+}
 
 fn named_in(w: Walk, namespace: Namespace, qname: QName) -> Walk / {abort.raise} =
   noted(qualifier(w, qname), qname.name, definition(w, namespace, qname), false)
@@ -167,18 +207,22 @@ fn walk_type(w: Walk, t: TypeExpr) -> Walk / {abort.raise} =
     TCon(c) -> c.rows.fold(c.args.fold(named_in(w, TypeSpace, c.name), walk_type), walk_row),
     TFn(f) -> walk_effects(walk_type(f.params.fold(w, walk_type), f.ret), f.effects),
     TRecord(r) ->
-      r.fields.fold(w, |acc: Walk, field: { name: Ident, ty: TypeExpr }| walk_type(acc, field.ty)),
+      r.fields.fold(w, |acc: Walk, field: { name: Ident, ty: TypeExpr }|
+        walk_type(member(acc, field.name, FieldName), field.ty)),
     _ -> w,
   }
 
-fn walk_row(w: Walk, r: RowExpr) -> Walk / {abort.raise} =
-  r.aliases.fold(
-    r.atoms.fold(w, |acc: Walk, a: AtomExpr|
+fn walk_row(w: Walk, r: RowExpr) -> Walk / {abort.raise} = walk_atoms(w, r.atoms, r.aliases)
+
+/// The effects and operations a row or an effect set names, then the sets it takes in.
+fn walk_atoms(w: Walk, atoms: List<AtomExpr>, sets: List<QName>) -> Walk / {abort.raise} =
+  sets.fold(
+    atoms.fold(w, |acc: Walk, a: AtomExpr|
       match a.op {
         Some(op) -> operation(acc, a.eff, op),
         None -> named_in(acc, EffectSpace, a.eff),
       }),
-    |acc: Walk, alias: QName| named_in(acc, SetSpace, alias),
+    |acc: Walk, set: QName| named_in(acc, SetSpace, set),
   )
 
 fn walk_effects(w: Walk, r: Option<RowExpr>) -> Walk / {abort.raise} =
@@ -196,12 +240,13 @@ fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
       c.args.fold(named_in(w, ValueSpace, c.name), |acc: Walk, x: Pattern|
         walk_pattern(acc, x, again)),
     PRecord(r) ->
-      r.fields.fold(w, |acc: Walk, field: { name: Ident, pat: Pattern }|
+      r.fields.fold(w, |acc: Walk, field: { name: Ident, pat: Pattern }| {
+        let labelled = member(acc, field.name, FieldName);
         match field.pat {
-          PVar(v) -> if v.span.start == field.name.span.start { binder(acc, v.name, true, again) }
-          else { binder(acc, v.name, false, again) },
-          _ -> walk_pattern(acc, field.pat, again),
-        }),
+          PVar(v) -> binder(labelled, v.name, v.span.start == field.name.span.start, again),
+          _ -> walk_pattern(labelled, field.pat, again),
+        }
+      }),
     PList(l) -> {
       let items = l.items.fold(w, |acc: Walk, x: Pattern| walk_pattern(acc, x, again));
       match l.rest { Some(rest) -> walk_pattern(items, rest, again), None -> items }
@@ -267,11 +312,21 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
     EBinary(b) -> walk_expr(walk_expr(w, b.lhs), b.rhs),
     EUnary(u) -> walk_expr(w, u.operand),
     ELambda(l) -> popped(walk_expr(walk_optional_type(walk_params(w, l.params), l.ret), l.body)),
-    EApp(a) ->
+    EApp(a) -> {
+      let called = match a.func {
+        EField(f) -> member(walk_expr(w, f.base), f.field, CalledName(a.span.site)),
+        _ -> walk_expr(w, a.func),
+      };
+      let callee = match a.func { EVar(v) -> refers_of(called, v.name.name), _ -> Unbound };
       a.args.fold(
-        a.named.fold(walk_expr(w, a.func), |acc: Walk, n: NamedArg| walk_expr(acc, n.value)),
+        a.named.fold(called, |acc: Walk, n: NamedArg|
+          walk_expr(
+            member(acc, n.name, ArgumentName({ call: a.span.site, callee: callee })),
+            n.value,
+          )),
         walk_expr,
-      ),
+      )
+    },
     EIf(i) -> walk_expr(walk_expr(walk_expr(w, i.cond), i.then_branch), i.else_branch),
     EMatch(m) ->
       m.arms.fold(walk_expr(w, m.scrutinee), |acc: Walk, arm: MatchArm| {
@@ -286,10 +341,14 @@ fn walk_expr(w: Walk, e: Expr) -> Walk / {abort.raise} =
     ERecord(r) -> r.fields.fold(w, walk_field),
     ERecordUpdate(u) -> u.fields.fold(walk_expr(w, u.base), walk_field),
     ETry(t) -> walk_expr(w, t.operand),
-    EField(f) -> walk_expr(w, f.base),
+    EField(f) -> member(walk_expr(w, f.base), f.field, FieldName),
     EList(l) -> l.items.fold(w, walk_expr),
     EPerform(p) -> match if p.eff.module == None { local(w, p.eff.name.name) } else { None } {
-      Some(Local(b)) -> p.args.fold(noted(w, p.eff.name, Local(b), false), walk_expr),
+      Some(Local(b)) ->
+        p.args.fold(
+          member(noted(w, p.eff.name, Local(b), false), p.op, CalledName(p.span.site)),
+          walk_expr,
+        ),
       _ -> p.args.fold(operation(w, p.eff, p.op), walk_expr),
     },
     EHandle(h) -> {
@@ -371,7 +430,8 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
           Operation({ effect: qualified, name: op.name.name }),
           false,
         );
-        walk_type(op.params.fold(declared, walk_type), op.ret)
+        let typed = walk_type(op.params.fold(declared, walk_type), op.ret);
+        popped(op.param_names.fold(pushed(typed), bound))
       })
     },
     ITest(t) -> match t.cases {
@@ -387,38 +447,44 @@ fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
     ILaw(l) -> walk_quantified(w, l.binders, l.guard, l.body),
     ISchema(s) -> walk_quantified(w, s.params.concat(s.binders), s.guard, s.body),
     IDerive(d) -> named_in(w, TypeSpace, bare(d.target)),
-    _ -> w,
+    IInstance(d) ->
+      named_in(
+        named_in(w, if d.kind == NHost { EffectSpace } else { TypeSpace }, bare(d.target)),
+        ValueSpace,
+        bare(d.by),
+      ),
+    INumeric(d) ->
+      d.ops.fold(named_in(w, TypeSpace, bare(d.target)), |acc: Walk, x: NumericOp|
+        named_in(acc, ValueSpace, bare(x.by))),
+    IEffectSet(d) -> walk_atoms(named_in(w, SetSpace, bare(d.name)), d.atoms, d.includes),
   }
 
-/// What each name `module`'s imports bind refers to; an import has no item, so its names no site.
+/// What each name `module`'s imports bind refers to: what the module each import names declares
+/// under it. An import has no item, so its names no site.
 fn import_references(
   resolved: Resolved,
   index: Int,
   module: Module,
 ) -> List<Reference> / {abort.raise} = {
-  let w = walk_of(resolved, index);
-  module.imports.fold([], |acc: List<Reference>, i: ImportDecl|
-    match i.kind {
-      INames(names) ->
-        names.fold(acc, |found: List<Reference>, n: Ident| {
-          let refers = [ValueSpace, TypeSpace, EffectSpace, SetSpace].fold(
-            Unbound,
-            |r: Refers, space: Namespace|
-              match r { Unbound -> definition(w, space, bare(n)), _ -> r },
-          );
-          found.push(reference(n, refers, false))
-        }),
+  let targets = resolved.imports.get(index);
+  range(0, module.imports.len()).fold([], |acc: List<Reference>, k: Int|
+    match ((module.imports.get(k).kind, targets.at(k))) {
+      (INames(names), Some(target)) ->
+        names.fold(acc, |found: List<Reference>, n: Ident|
+          found.push(reference(n, declared_in(resolved, target, n.name), false))),
       _ -> acc,
     })
 }
 
-/// Every name `item`, an item of the module at index `index` of `resolved`, writes, with what it
-/// refers to. A name's site is unique within its item, not its module.
-pub fn item_references(
-  resolved: Resolved,
-  index: Int,
-  item: Item,
-) -> List<Reference> / {abort.raise} = walk_item(walk_of(resolved, index), item).found.values()
+fn declared_in(resolved: Resolved, module: Int, name: Bytes) -> Refers / {abort.raise} =
+  namespaces().fold(Unbound, |r: Refers, namespace: Namespace|
+    match r {
+      Unbound -> match lookup_declared(resolved.declarations.get(module), namespace, name) {
+        Some(d) -> Definition({ qualified: d.qualified, namespace: namespace }),
+        None -> Unbound,
+      },
+      _ -> r,
+    })
 
 /// The binder of each local `item` names, by the site of the name: how a check of the item finds
 /// its locals.
@@ -446,14 +512,17 @@ fn binders_of(found: Map<Int, Reference>) -> Map<Int, Int> =
   found.fold(Map::new(), |binders: Map<Int, Int>, site: Int, r: Reference|
     match r.refers { Local(b) -> binders.insert(site, b), _ -> binders })
 
-/// Every name `module`, the module at index `index` of `resolved`, writes, with what it refers to:
-/// its imports' names, then each item's.
-pub fn references(
-  resolved: Resolved,
-  index: Int,
-  module: Module,
-) -> List<Reference> / {abort.raise} =
+/// What `module`, the module at index `index` of `resolved` as its text is written and numbered,
+/// writes: its imports' names, then each item's, in order. A name's site is unique within its item,
+/// not its module, and is the site the check files what it found of the name under.
+pub fn written(resolved: Resolved, index: Int, module: Module) -> List<Written> / {abort.raise} =
   module.items.fold(
-    import_references(resolved, index, module),
-    |acc: List<Reference>, item: Item| acc.concat(item_references(resolved, index, item)),
+    [{ references: import_references(resolved, index, module), members: [] }],
+    |acc: List<Written>, item: Item| {
+      let w = walk_item({ ..walk_of(resolved, index), members: Some(Map::new()) }, item);
+      acc.push({
+        references: w.found.values(),
+        members: match w.members { Some(m) -> m.values(), None -> [] },
+      })
+    },
   )

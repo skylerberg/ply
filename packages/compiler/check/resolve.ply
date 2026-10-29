@@ -16,7 +16,8 @@ import compiler.check.resolve.scopes (Builder, World, PackageDeps, no_packages, 
 import compiler.check.resolve.sets (instantiated, expand_sets, bytes_concat_diags)
 import compiler.check.resolve.defaults (Expanded, expand)
 import compiler.syntax.sites (numbered_module)
-import compiler.check.resolve.bindings (references, Reference, Refers, Local, Unbound)
+import compiler.check.resolve.bindings (written, Written, Reference, Refers, Local, Unbound, Member,
+                                        FieldName, CalledName, ArgumentName, Definition)
 
 // --- `resolve` ---------------------------------------------------------------------------
 
@@ -50,10 +51,13 @@ pub fn resolve_packaged(
     shipped: shipped,
   })
 
+/// Each module is numbered as written before anything is made in it, so a written node has one site
+/// in every tree made of it, and a tool reading the module as written meets the check's sites.
 fn resolve_with(
-  mods: List<ParsedModule>,
+  written: List<ParsedModule>,
   packages: { pkgs: List<PackageDeps>, module_packages: List<Int>, std: Int, compiler: Int, shipped: Int },
 ) -> ResolveOutcome / {abort.raise} = {
+  let mods = written.map(|m: ParsedModule| { ..m, module: numbered_module(m.module) });
   let n = mods.len();
   // The index: the first module of each name; a second non-anonymous one is `E0105`.
   let indexed = range(0, n).fold(
@@ -118,9 +122,7 @@ fn resolve_with(
     let sets = expand_sets(made.r, made.mods);
     if made.diags.len() > 0 { ResolveFailed(made.diags) }
     else if sets.diags.len() > 0 { ResolveFailed(sets.diags) } else {
-      // Numbered first: filling defaults reads the layer, which reads names by their sites.
-      let numbered = sets.mods.map(|m: ParsedModule| { ..m, module: numbered_module(m.module) });
-      let x = expand(sets.r, numbered, []);
+      let x = expand(sets.r, sets.mods, []);
       if x.diags.len() > 0 { ResolveFailed(x.diags) } else { ResolveSucceeded(x) }
     }
   }
@@ -603,15 +605,18 @@ test "a default is refused when it calls, names a parameter, or names what its m
 
 // --- Names, as the layer binds them -----------------------------------------
 
-fn written(src: Bytes) -> List<Reference> / {abort.raise} = written_beside(src, [])
+fn references_of(src: Bytes) -> List<Reference> / {abort.raise} = references_beside(src, [])
 
-/// The references of `src`, the module `m`, in a program of it and `others`.
-fn written_beside(src: Bytes, others: List<Source>) -> List<Reference> / {abort.raise} =
+fn references_beside(src: Bytes, others: List<Source>) -> List<Reference> / {abort.raise} =
+  written_beside(src, others).fold([], |acc: List<Reference>, w: Written| acc.concat(w.references))
+
+/// What `src`, the module `m`, writes, in a program of it and `others`.
+fn written_beside(src: Bytes, others: List<Source>) -> List<Written> / {abort.raise} =
   match resolve(others.push({ name: b"m", src: src })) {
     ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
     ResolveSucceeded(y) -> {
       let at = range(0, y.mods.len()).find(|i: Int| y.mods.get(i).name == b"m").unwrap_or(0);
-      references(y.r, at, y.mods.get(at).module)
+      written(y.r, at, numbered_module(parse(src).node))
     },
   }
 
@@ -633,7 +638,7 @@ fn refers_at(
 
 test "a local shadows another, and each use refers to the binder in scope where it is written" {
   let src = b"fn f(x: Int) -> Int = { let y = x; let x = y + 1; x }\n\nfn g() -> Int = f(1)\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert_eq(refers_at(refs, src, b"x", 1), refers_at(refs, src, b"x", 0));
   assert_eq(refers_at(refs, src, b"x", 3), refers_at(refs, src, b"x", 2));
   assert(refers_at(refs, src, b"x", 3) != refers_at(refs, src, b"x", 0));
@@ -644,7 +649,7 @@ test "a local shadows another, and each use refers to the binder in scope where 
 
 test "a record field is not the local spelled the same, but a field a pattern writes by its name alone is" {
   let src = b"type R = { held: Int }\n\nfn f(held: Int) -> R = { held: held }\n\nfn g(r: R) -> Int = match r { { held } -> held }\n\nfn h(r: R) -> Int = r.held\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert_eq(refers_at(refs, src, b"held", 0), None);
   assert_eq(refers_at(refs, src, b"held", 2), None);
   assert_eq(refers_at(refs, src, b"held", 3), refers_at(refs, src, b"held", 1));
@@ -656,7 +661,7 @@ test "a record field is not the local spelled the same, but a field a pattern wr
 
 test "a field a record writes by its name alone reads the local, and `T::name` names the type `T`" {
   let src = b"type R = { held: Int, kept: Int }\n\nfn R::made(held: Int) -> R = { held, kept: held }\n\nfn f() -> R = R::made(1)\n";
-  let refs = written(src);
+  let refs = references_of(src);
   let shorthand = refs.find(|r: Reference| r.start == place(src, b"held", 2));
   assert_eq(shorthand.map(|r: Reference| r.shorthand), Some(true));
   assert_eq(refers_at(refs, src, b"held", 2), refers_at(refs, src, b"held", 1));
@@ -666,9 +671,39 @@ test "a field a record writes by its name alone reads the local, and `T::name` n
   assert_eq(refers_at(refs, src, b"made", 1), declared)
 }
 
+test "a field, a call on a value's member and a named argument are each told apart as what they are" {
+  let src = b"type R = { held: Int }\n\nfn R::grown(r: R, by: Int) -> R = { held: r.held + by }\n\nfn f(r: R) -> R = r.grown(by: 2)\n\nfn g(r: R) -> R = R::grown(r, by: 1)\n";
+  let members = written_beside(src, []).fold([], |acc: List<Member>, w: Written|
+    acc.concat(w.members));
+  let kind_at = |text: Bytes, n: Int|
+    members.find(|m: Member| m.start == place(src, text, n)).map(|m: Member| m.kind);
+  assert_eq(kind_at(b"held", 0), Some(FieldName));
+  assert_eq(kind_at(b"held", 1), Some(FieldName));
+  assert_eq(kind_at(b"held", 2), Some(FieldName));
+  assert(match kind_at(b"grown", 1) { Some(CalledName(_)) -> true, _ -> false });
+  assert(match kind_at(b"by", 2) { Some(ArgumentName(a)) -> a.callee == Unbound, _ -> false });
+  assert(match kind_at(b"by", 3) {
+    Some(ArgumentName(a)) -> match a.callee {
+      Definition(d) -> d.qualified == b"m.R::grown",
+      _ -> false,
+    },
+    _ -> false,
+  })
+}
+
+test "an instance, an effect set and an operation's parameter name each refer to what they name" {
+  let src = b"effect tally {\n  write count(amount: Int) -> Unit\n}\n\neffect set Counting = {tally.count}\n\ntype Money = { cents: Int }\n\nfn cents_of(m: Money) -> Int = m.cents\n\nkey for Money by cents_of\n";
+  let refs = references_of(src);
+  assert_eq(refers_at(refs, src, b"Money", 2), refers_at(refs, src, b"Money", 0));
+  assert_eq(refers_at(refs, src, b"cents_of", 1), refers_at(refs, src, b"cents_of", 0));
+  assert_eq(refers_at(refs, src, b"count", 1), refers_at(refs, src, b"count", 0));
+  assert(match refers_at(refs, src, b"amount", 0) { Some(Local(_)) -> true, _ -> false });
+  assert(refs.all(|r: Reference| r.site != 0))
+}
+
 test "a type and a variant spelled the same are told apart by where each is written" {
   let src = b"type Taken = { x: Int }\n\ntype Left = | Taken | Other\n\nfn f(t: Taken) -> Left = Taken\n";
-  let refs = written(src);
+  let refs = references_of(src);
   let as_type = refers_at(refs, src, b"Taken", 2);
   let as_variant = refers_at(refs, src, b"Taken", 3);
   assert_eq(as_type, refers_at(refs, src, b"Taken", 0));
@@ -678,7 +713,7 @@ test "a type and a variant spelled the same are told apart by where each is writ
 
 test "a handler's variable, parameter and operation each refer to what declares them" {
   let src = b"effect tally {\n  write count(n: Int) -> Unit\n}\n\nfn f() -> Int = handle {\n  tally.count(2);\n  0\n} with {\n  var total = 0,\n  var twice = total * 2,\n  tally.count(amount) -> {\n    total = total + amount;\n  },\n  return v -> v + total,\n}\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert_eq(refers_at(refs, src, b"count", 1), refers_at(refs, src, b"count", 0));
   assert_eq(refers_at(refs, src, b"count", 2), refers_at(refs, src, b"count", 0));
   let total = refers_at(refs, src, b"total", 0);
@@ -691,7 +726,7 @@ test "a handler's variable, parameter and operation each refer to what declares 
 
 test "an or-pattern's names are its first alternative's, and a call on a local names the local" {
   let src = b"type T = | A(Int) | B(Int)\n\nfn f(t: T, xs: List<Int>) -> Int = match t {\n  A(value) | B(value) -> value + xs.len(),\n}\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert_eq(refers_at(refs, src, b"value", 1), refers_at(refs, src, b"value", 0));
   assert_eq(refers_at(refs, src, b"value", 2), refers_at(refs, src, b"value", 0));
   assert_eq(refers_at(refs, src, b"xs", 1), refers_at(refs, src, b"xs", 0))
@@ -699,7 +734,7 @@ test "an or-pattern's names are its first alternative's, and a call on a local n
 
 test "`ensures` binds `result`, and `cost` each parameter's cost name" {
   let src = b"fn f(g: (Int) -> Int cost k, limit: Int = 3) -> Int\n  ensures result >= limit\n  cost k\n= g(limit)\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert_eq(refers_at(refs, src, b"limit", 1), refers_at(refs, src, b"limit", 0));
   assert_eq(refers_at(refs, src, b"limit", 2), refers_at(refs, src, b"limit", 0));
   assert(match refers_at(refs, src, b"result", 0) { Some(Local(_)) -> true, _ -> false });
@@ -710,7 +745,7 @@ test "a test over cases reads its case, in its body and its label, by the binder
   let cases = b"pub type Table<a> = List<a>\n\npub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a = table.get(at)\n\npub fn listed<a>(table: List<a>, label: (a) -> String) -> List<String> = table.map(label)\n";
   let src = b"test \"case {item}\" for item: Int in [1, 2] { assert(item > 0) }\n";
   let show = b"pub fn display<a>(value: a) -> String = \"\"\n";
-  let refs = written_beside(src, [
+  let refs = references_beside(src, [
     { name: b"std.cases", src: cases },
     { name: b"std.show", src: show },
   ]);
@@ -723,7 +758,7 @@ test "a test over cases reads its case, in its body and its label, by the binder
 
 test "each name an item writes is noted at a site of its own" {
   let src = b"effect tally {\n  write count(n: Int) -> Unit\n}\n\ntype Shape = | Dot | Box(Int)\n\nfn area(s: Shape) -> Int / {tally.count} = match s {\n  Dot -> 0,\n  Box(side) -> { tally.count(side); side * side },\n}\n";
-  let refs = written(src);
+  let refs = references_of(src);
   assert(refs.len() > 8);
   assert(refs.all(|r: Reference| r.site != 0))
 }
