@@ -19,9 +19,9 @@ import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, 
                               is_arithmetic, is_ordered, ETagged, Tagged, Hole, tagged_parser,
                               tagged_filler, call_operator, written_operator, is_exit_effect,
                               exit_op, Slot, FromName, FromDefault, simulated_at, detached_at,
-                              resumed_at, branch_at, try_places)
+                              resumed_at, branch_at, try_places, prelude_module)
 import compiler.syntax.patterns (Pattern, PWild, PVar, PLit, PRange, PCtor, PRecord, PList, POr,
-                                 PBad, Lit, LInt, LFixed, LWide, pat_span, has_or)
+                                 PBad, Lit, LInt, LFixed, LWide, LStr, pat_span, has_or)
 import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, TyVar, TyCon, TyFn,
                              TyRecord, Field, Scheme, Subst, Free, UnifyError, Mismatch, Arity,
                              OccursTy, OccursRow, RowMismatch, atoms_covered, atoms_insert,
@@ -39,7 +39,7 @@ import compiler.check.types (RNamed, RSingleton, RVar, RAny, Atom, Row, Type, Ty
 import compiler.check.resolve.tables (Binding, ModuleBinding, Diag, Label, with_fix, insertion,
                                       ValueSpace, EffectSpace, lookup, lookup_declared,
                                       error_with_labels, error_at, label_at, backticked,
-                                      find_module_binding)
+                                      find_module_binding, qualify)
 import compiler.check.resolve.scopes (find, closed_notes, find_of_type, declaring_type, of_binder,
                                       of_module)
 import compiler.check.resolve.defaults (filled_args)
@@ -78,6 +78,12 @@ import compiler.check.infer.declarations (conv_type, op_named, effect_name, dupl
                                           note_sites, note_stated, scheduler_handle)
 import compiler.check.infer.coverage (integer_of, CoveragePattern, check_exhaustive, coverage_pat,
                                       uncovered, shown)
+import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPerform, TypedStmt,
+                             TypedParam, TypedPattern, TypedWild, TypedBinder, TypedLitPattern,
+                             TypedRange, ReadLocal, ReadDefinition, ReadConstructor, ReadBuiltin,
+                             unary_of, binary_of, if_of, list_of, field_read_of, record_of,
+                             block_of, lambda_of, do_of, let_of, let_else_of, case_pattern_of,
+                             list_pattern_of, or_pattern_of, record_pattern_of)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -1159,9 +1165,14 @@ fn infer(checker: Checker, expr: Expr, hint: Option<Hint> = None) -> Inferred / 
   }
 }
 
+/// What `o` found of the expression written at `at`, as its node of the typed tree.
+fn typed_at(o: Inferred, at: Span) -> Option<TypedExpr> =
+  match o.node { Some(n) -> Some({ node: n, span: at, ty: o.ty }), None -> None }
+
 fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {abort.raise} =
   match expr {
-    ELit(l) -> { checker: checker, ty: lit_type(l.lit), row: row_empty(), node: None },
+    ELit(l) ->
+      { checker: checker, ty: lit_type(l.lit), row: row_empty(), node: Some(TypedLit(l.lit)) },
     EBad(_) -> {
       let o: WithTy = new_ty(checker);
       { checker: o.checker, ty: o.ty, row: row_empty(), node: None }
@@ -1187,7 +1198,15 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         },
         ty: TyVar(o.var),
         row: row_empty(),
-        node: None,
+        // A run that reaches it raises.
+        node: Some(
+          TypedPerform({
+            effect: b"abort",
+            op: b"raise",
+            resource: None,
+            args: [{ node: TypedLit(LStr(b"unfilled hole")), span: h.span, ty: string_type() }],
+          }),
+        ),
       }
     },
     EVar(v) -> {
@@ -1205,7 +1224,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
                 else { { ..noted, bit_ops: noted.bit_ops.push(bit_op) } },
                 ty: o.ty,
                 row: o.row,
-                node: None,
+                node: o.node,
               }
             },
             None -> o,
@@ -1216,6 +1235,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
     },
     EUnary(u) -> {
       let o: Inferred = infer(checker, u.operand);
+      let node = unary_of(u.op, typed_at(o, expr_span(u.operand)));
       if u.op == b"neg" {
         {
           checker: note_operand(
@@ -1228,7 +1248,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           ),
           ty: o.ty,
           row: o.row,
-          node: None,
+          node: node,
         }
       } else if u.op == b"bitnot" {
         {
@@ -1239,7 +1259,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           ),
           ty: o.ty,
           row: o.row,
-          node: None,
+          node: node,
         }
       } else {
         let x: Expected = expect(
@@ -1249,7 +1269,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           o.ty,
           b"operand of a unary operator",
         );
-        { checker: x.checker, ty: bool_type(), row: o.row, node: None }
+        { checker: x.checker, ty: bool_type(), row: o.row, node: node }
       }
     },
     EBinary(b) -> infer_binary(checker, b.span, b.op, b.lhs, b.rhs),
@@ -1259,8 +1279,8 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
       let expected = match hinted(checker, hint) { Some(TyFn(f)) -> f.params, _ -> [] };
       let ps = l.params.fold(
-        { checker: pushed, tys: [] },
-        |acc: { checker: Checker, tys: List<Type> }, p: Param| {
+        { checker: pushed, tys: [], params: [] },
+        |acc: { checker: Checker, tys: List<Type>, params: List<TypedParam> }, p: Param| {
           let t: WithTy = match p.ty {
             Some(te) -> {
               let o: WithTy = conv_type(acc.checker, te);
@@ -1278,6 +1298,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
           {
             checker: { ..t.checker, env: env_bind(t.checker.env, p.name.name, monomorphic(t.ty)) },
             tys: acc.tys.push(t.ty),
+            params: acc.params.push({ name: p.name.name, ty: t.ty, span: p.name.span }),
           }
         },
       );
@@ -1338,7 +1359,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         },
         ty: fn_type(ps.tys, body.ty, body.row),
         row: row_empty(),
-        node: None,
+        node: lambda_of(ps.params, typed_at(body, expr_span(l.body)), body.row),
       };
       unbarred(outer, made)
     },
@@ -1413,28 +1434,38 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       );
       let j1: WithRow = join(agreed.checker, i.span, c.row, t.row);
       let j2: WithRow = join(j1.checker, i.span, j1.row, el.row);
-      { checker: j2.checker, ty: agreed.ty, row: j2.row, node: None }
+      {
+        checker: j2.checker,
+        ty: agreed.ty,
+        row: j2.row,
+        node: if_of(
+          typed_at(c, expr_span(i.cond)),
+          typed_at(t, expr_span(i.then_branch)),
+          typed_at(el, expr_span(i.else_branch)),
+        ),
+      }
     },
     EMatch(m) -> infer_match(checker, m.span, m.scrutinee, m.arms, hint),
     EBlock(b) -> {
       let pushed: Checker = { ..checker, env: env_push(checker.env) };
-      let stmts: { checker: Checker, row: Row, fallbacks: List<Fallback> } = b.stmts.fold(
-        { checker: pushed, row: row_empty(), fallbacks: [] },
-        |acc: { checker: Checker, row: Row, fallbacks: List<Fallback> }, s: Stmt| {
+      let stmts = b.stmts.fold(
+        { checker: pushed, row: row_empty(), fallbacks: [], nodes: [] },
+        |acc: { checker: Checker, row: Row, fallbacks: List<Fallback>, nodes: List<Option<TypedStmt>> }, s: Stmt| {
           let o: StmtOut = infer_stmt(acc.checker, s, hint);
           let j: WithRow = join(o.checker, b.span, acc.row, o.row);
           {
             checker: j.checker,
             row: j.row,
             fallbacks: match o.fallback { Some(f) -> acc.fallbacks.push(f), None -> acc.fallbacks },
+            nodes: acc.nodes.push(o.node),
           }
         },
       );
-      let tail: Inferred = match b.tail {
+      let tail: { checker: Checker, ty: Type, row: Row, node: Option<Option<TypedExpr>> } = match b.tail {
         Some(t) -> {
           let o: Inferred = infer(stmts.checker, t, hint);
           let j: WithRow = join(o.checker, b.span, stmts.row, o.row);
-          { checker: j.checker, ty: o.ty, row: j.row, node: None }
+          { checker: j.checker, ty: o.ty, row: j.row, node: Some(typed_at(o, expr_span(t))) }
         },
         None -> { checker: stmts.checker, ty: unit_type(), row: stmts.row, node: None },
       };
@@ -1448,7 +1479,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         checker: leaving({ ..closed, env: env_pop(closed.env) }, checker.guards),
         ty: agreed.ty,
         row: tail.row,
-        node: None,
+        node: block_of(stmts.nodes, tail.node),
       }
     },
     ERecord(r) -> {
@@ -1470,14 +1501,27 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         expected -> {
           let known = match expected { Some(TyRecord(fs)) -> fs, _ -> [] };
           let fs = r.fields.fold(
-            { checker: checker, fs: [], row: row_empty() },
-            |acc: { checker: Checker, fs: List<Field>, row: Row }, f: RecField| {
+            { checker: checker, fs: [], row: row_empty(), values: [] },
+            |acc: { checker: Checker, fs: List<Field>, row: Row, values: List<{ name: Bytes, value: Option<TypedExpr> }> }, f: RecField| {
               let o: Inferred = infer(acc.checker, f.value, field_hint(known, f.name.name, met));
               let j: WithRow = join(o.checker, r.span, acc.row, o.row);
-              { checker: j.checker, fs: acc.fs.push({ name: f.name.name, ty: o.ty }), row: j.row }
+              {
+                checker: j.checker,
+                fs: acc.fs.push({ name: f.name.name, ty: o.ty }),
+                row: j.row,
+                values: acc.values.push({
+                  name: f.name.name,
+                  value: typed_at(o, expr_span(f.value)),
+                }),
+              }
             },
           );
-          { checker: fs.checker, ty: TyRecord(fields_sorted(fs.fs)), row: fs.row, node: None }
+          {
+            checker: fs.checker,
+            ty: TyRecord(fields_sorted(fs.fs)),
+            row: fs.row,
+            node: record_of(fs.values),
+          }
         },
       }
     },
@@ -1488,7 +1532,13 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
       let base = resolve(b.checker, b.ty);
       match record_fields(base) {
         Some(fs) -> match field_get(fs, f.field.name) {
-          Some(t) -> { checker: b.checker, ty: t, row: b.row, node: None },
+          Some(t) ->
+            {
+              checker: b.checker,
+              ty: t,
+              row: b.row,
+              node: field_read_of(typed_at(b, expr_span(f.base)), f.field.name),
+            },
           None -> {
             let known = fs.map(|x: Field| x.name);
             let o: WithTy = new_ty(
@@ -1532,8 +1582,8 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         _ -> None,
       };
       let items = l.items.fold(
-        { checker: elem.checker, row: row_empty(), ty: elem.ty, tails: [] },
-        |acc: { checker: Checker, row: Row, ty: Type, tails: List<Int> }, x: Expr| {
+        { checker: elem.checker, row: row_empty(), ty: elem.ty, tails: [], nodes: [] },
+        |acc: { checker: Checker, row: Row, ty: Type, tails: List<Int>, nodes: List<Option<TypedExpr>> }, x: Expr| {
           let o: Inferred = infer(acc.checker, x, hint_after(each, acc.ty));
           let j: WithRow = join(o.checker, l.span, acc.row, o.row);
           let n: Joined = join_next(
@@ -1542,7 +1592,13 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
             o.ty,
             b"list elements must agree",
           );
-          { checker: n.checker, row: j.row, ty: n.ty, tails: n.tails }
+          {
+            checker: n.checker,
+            row: j.row,
+            ty: n.ty,
+            tails: n.tails,
+            nodes: acc.nodes.push(typed_at(o, expr_span(x))),
+          }
         },
       );
       let closed: Checker = close_tails(items.checker, items.tails);
@@ -1550,7 +1606,7 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
         checker: note_typed(closed, l.span, list_type(items.ty), []),
         ty: list_type(items.ty),
         row: items.row,
-        node: None,
+        node: list_of(items.nodes),
       }
     },
     EPerform(p) -> if !on_a_local(checker, p.eff) {
@@ -2206,11 +2262,20 @@ fn infer_var(checker: Checker, qname: QName, at: Span) -> Inferred / {abort.rais
             )
           }
         };
+        let reading = if !global { ReadLocal(key.name) } else {
+          match ctor_of(typed, key.name) {
+            Some(c) -> ReadConstructor({ sum: c.type_name, name: key.name, case: c.index }),
+            None -> if !key.prelude { ReadDefinition({ full: key.name, args: inst.args }) }
+            else if typed.prelude_fns.contains(key.name) {
+              ReadDefinition({ full: qualify(prelude_module(), key.name), args: inst.args })
+            } else { ReadBuiltin(key.name) },
+          }
+        };
         {
           checker: note_labels(typed, at, key.name, ls, inst.ty),
           ty: inst.ty,
           row: row_empty(),
-          node: None,
+          node: Some(TypedRead(reading)),
         }
       },
       None -> {
@@ -2307,6 +2372,7 @@ fn infer_binary(
     { ..o, checker: leaving(o.checker, l.checker.guards) }
   } else { infer(l.checker, rhs, hint_of(l.ty)) };
   let j: WithRow = join(r.checker, span, l.row, r.row);
+  let node = binary_of(op, typed_at(l, expr_span(lhs)), typed_at(r, expr_span(rhs)));
   // A shift's operand is its left; every other operator here reads both sides at one type.
   let c: Checker = if op == b"and" || op == b"or" || op == b"concat" { j.checker }
   else { note_operand(j.checker, span, l.ty) };
@@ -2337,14 +2403,14 @@ fn infer_binary(
         ),
         ty: l.ty,
         row: { ..j.row, atoms: atoms_insert(j.row.atoms, abort_atom()) },
-        node: None,
+        node: node,
       }
     } else {
       {
         checker: divisor.checker,
         ty: if is_arithmetic(op) { l.ty } else { bool_type() },
         row: j.row,
-        node: None,
+        node: node,
       }
     }
   } else if is_bits(op) {
@@ -2379,14 +2445,14 @@ fn infer_binary(
         Bytes::concat_all([b"both operands of `", bits_text(op), b"` have one type"]),
       ).checker
     };
-    { checker: c2, ty: l.ty, row: j.row, node: None }
+    { checker: c2, ty: l.ty, row: j.row, node: node }
   } else if op == b"and" || op == b"or" {
     let c1: Checker = expect(c, expr_span(lhs), bool_type(), l.ty, b"left operand").checker;
     let c2: Checker = expect(c1, expr_span(rhs), bool_type(), r.ty, b"right operand").checker;
-    { checker: c2, ty: bool_type(), row: j.row, node: None }
+    { checker: c2, ty: bool_type(), row: j.row, node: node }
   } else if op == b"concat" {
     match mixed_concat(c, expr_span(lhs), resolve(c, l.ty), expr_span(rhs), resolve(c, r.ty)) {
-      Some(reported) -> { checker: reported, ty: l.ty, row: j.row, node: None },
+      Some(reported) -> { checker: reported, ty: l.ty, row: j.row, node: node },
       None -> {
         let x: Expected = expect(
           c,
@@ -2401,7 +2467,7 @@ fn infer_binary(
             concats: x.checker.concats.push({ module: x.checker.module, span: span, ty: l.ty }),
           }
         } else { x.checker };
-        { checker: noted, ty: l.ty, row: j.row, node: None }
+        { checker: noted, ty: l.ty, row: j.row, node: node }
       },
     }
   } else {
@@ -2419,7 +2485,7 @@ fn infer_binary(
       },
       ty: bool_type(),
       row: j.row,
-      node: None,
+      node: node,
     }
   }
 }
@@ -2427,14 +2493,16 @@ fn infer_binary(
 /// A `let ... else` block, whose value the enclosing block's tail must agree with.
 type Fallback = { span: Span, ty: Type }
 
-type StmtOut = { checker: Checker, row: Row, fallback: Option<Fallback> }
+/// What a walk of a statement found: what it performs, the `else` block a `let ... else` answers in
+/// its block's place, and the statement as the typed tree holds it.
+type StmtOut = { checker: Checker, row: Row, fallback: Option<Fallback>, node: Option<TypedStmt> }
 
 /// `hint` is the enclosing block's, which a `let ... else` block answers in its place.
 fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {abort.raise} =
   match stmt {
     SExpr(e) -> {
       let o: Inferred = infer(checker, e);
-      { checker: o.checker, row: o.row, fallback: None }
+      { checker: o.checker, row: o.row, fallback: None, node: do_of(typed_at(o, expr_span(e))) }
     },
     SLet(l) -> {
       let b: LetBound = let_bound(checker, l.pat, l.ty, l.value);
@@ -2459,8 +2527,11 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
           ),
           row: { ..b.row, atoms: atoms_insert(b.row.atoms, abort_atom()) },
           fallback: None,
+          node: let_of(b.pat, b.value, l.span),
         }
-      } else { { checker: bound, row: b.row, fallback: None } }
+      } else {
+        { checker: bound, row: b.row, fallback: None, node: let_of(b.pat, b.value, l.span) }
+      }
     },
     SAssign(a) -> {
       // The binding the name stands for here, which a `let` or a parameter of the same name hides.
@@ -2493,6 +2564,7 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
             ),
             row: o.row,
             fallback: None,
+            node: None,
           }
         },
         Some(v) -> match checker.assignable.barred {
@@ -2511,6 +2583,7 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
               ),
               row: o.row,
               fallback: None,
+              node: None,
             }
           },
           None -> {
@@ -2525,6 +2598,7 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
               ).checker,
               row: o.row,
               fallback: None,
+              node: None,
             }
           },
         },
@@ -2543,11 +2617,20 @@ fn infer_stmt(checker: Checker, stmt: Stmt, hint: Option<Hint>) -> StmtOut / {ab
         },
         row: j.row,
         fallback: Some({ span: expr_span(l.fallback), ty: f.ty }),
+        node: let_else_of(b.pat, b.value, typed_at(f, expr_span(l.fallback)), l.span),
       }
     },
   }
 
-type LetBound = { checker: Checker, row: Row, out: List<{ name: Bytes, ty: Type }> }
+/// What a `let` found: what its value performs, the names its pattern binds, not yet in scope, and
+/// its pattern and value as the typed tree holds them.
+type LetBound = {
+  checker: Checker,
+  row: Row,
+  out: List<{ name: Bytes, ty: Type }>,
+  pat: Option<TypedPattern>,
+  value: Option<TypedExpr>,
+}
 
 fn refutable(checker: Checker, pat: Pattern) -> Bool / {abort.raise} =
   uncovered(checker, [[coverage_pat(checker, pat)]], 1).len() > 0
@@ -2582,7 +2665,8 @@ fn let_bound(
   annotation: Option<TypeExpr>,
   value: Expr,
 ) -> LetBound / {abort.raise} = {
-  let annotated: Inferred = match annotation {
+  // The pattern binds at the written type where there is one; the value keeps its own.
+  let annotated: { checker: Checker, ty: Type, row: Row, value: Option<TypedExpr> } = match annotation {
     Some(te) -> {
       let w: WithTy = conv_type(checker, te);
       let v: Inferred = infer(hold_written(w.checker, te, w.ty, false), value, hint_of(w.ty));
@@ -2590,16 +2674,16 @@ fn let_bound(
         checker: expect_met(v.checker, expr_span(value), w.ty, v.ty, b"`let` annotation"),
         ty: w.ty,
         row: v.row,
-        node: None,
+        value: typed_at(v, expr_span(value)),
       }
     },
     None -> {
       let v: Inferred = infer(checker, value);
-      { checker: v.checker, ty: v.ty, row: v.row, node: None }
+      { checker: v.checker, ty: v.ty, row: v.row, value: typed_at(v, expr_span(value)) }
     },
   };
   let b: Bound = bind_pattern(annotated.checker, pat, annotated.ty, []);
-  { checker: b.checker, row: annotated.row, out: b.out }
+  { checker: b.checker, row: annotated.row, out: b.out, pat: b.pat, value: annotated.value }
 }
 
 fn infer_app(
@@ -3711,7 +3795,16 @@ fn applied_call(
 
 // --- Patterns and matches -----------------------------------------------------------------------
 
-type Bound = { checker: Checker, out: List<{ name: Bytes, ty: Type }> }
+/// What binding a pattern found: the names it binds, at their types, and the pattern as the typed
+/// tree holds it, none where the check reported an error in it.
+type Bound = { checker: Checker, out: List<{ name: Bytes, ty: Type }>, pat: Option<TypedPattern> }
+
+/// Sub-patterns bound one after another, each one's typed pattern in order.
+type BoundEach = {
+  checker: Checker,
+  out: List<{ name: Bytes, ty: Type }>,
+  pats: List<Option<TypedPattern>>,
+}
 
 /// A pattern on a constructor its type's module keeps. A bare name's refusal is said here and a
 /// qualified one's where it was looked up; what the pattern binds is bound all the same, so that
@@ -3722,14 +3815,17 @@ fn bind_kept(
   args: List<Pattern>,
   closed: Diag,
   out: List<{ name: Bytes, ty: Type }>,
-) -> Bound / {abort.raise} =
-  args.fold(
+) -> Bound / {abort.raise} = {
+  let bound = args.fold(
     { checker: if is_bare(name) { report(checker, closed) } else { checker }, out: out },
-    |acc: Bound, arg: Pattern| {
+    |acc: { checker: Checker, out: List<{ name: Bytes, ty: Type }> }, arg: Pattern| {
       let t: WithTy = new_ty(acc.checker);
-      bind_pattern(t.checker, arg, t.ty, acc.out)
+      let b: Bound = bind_pattern(t.checker, arg, t.ty, acc.out);
+      { checker: b.checker, out: b.out }
     },
-  )
+  );
+  { checker: bound.checker, out: bound.out, pat: None }
+}
 
 fn bind_pattern(
   checker: Checker,
@@ -3743,19 +3839,27 @@ fn bind_pattern(
       {
         checker: { ..checker, valued: checker.valued.push({ span: w.span, ty: scrutinee }) },
         out: out,
+        pat: Some(TypedWild),
       },
-    PBad(_) -> { checker: checker, out: out },
+    PBad(_) -> { checker: checker, out: out, pat: None },
     PVar(v) ->
       {
         checker: note_typed(checker, v.span, scrutinee, []),
         out: out.push({ name: v.name.name, ty: scrutinee }),
+        pat: Some(TypedBinder({ name: v.name.name, ty: scrutinee, span: v.span })),
       },
     PLit(l) ->
       {
         checker: expect(checker, l.span, scrutinee, lit_type(l.lit), b"pattern literal").checker,
         out: out,
+        pat: Some(TypedLitPattern(l.lit)),
       },
-    PRange(r) -> { checker: bind_range(checker, r.span, r.lo, r.hi, scrutinee), out: out },
+    PRange(r) ->
+      {
+        checker: bind_range(checker, r.span, r.lo, r.hi, scrutinee),
+        out: out,
+        pat: Some(TypedRange({ lo: r.lo, hi: r.hi })),
+      },
     PCtor(c) -> {
       let n: WithName = ctor_name(checker, c.name);
       let info = match n.name { Some(q) -> ctor_of(n.checker, q), None -> None };
@@ -3791,8 +3895,9 @@ fn bind_pattern(
               notes,
             ),
             out: out,
+            pat: None,
           }
-        } else { { checker: n.checker, out: out } },
+        } else { { checker: n.checker, out: out, pat: None } },
         (Some(ci), _) -> {
           let inst = instantiate(ci.scheme, n.checker.fresh);
           let c1: Checker = { ..n.checker, fresh: inst.fresh };
@@ -3830,10 +3935,26 @@ fn bind_pattern(
                 [],
               ),
               out: out,
+              pat: None,
             }
           } else {
-            range(0, c.args.len()).fold({ checker: c2, out: out }, |acc: Bound, i: Int|
-              bind_pattern(acc.checker, c.args.get(i), shape.fields.get(i), acc.out))
+            let each = range(0, c.args.len()).fold(
+              { checker: c2, out: out, pats: [] },
+              |acc: BoundEach, i: Int| {
+                let b: Bound = bind_pattern(
+                  acc.checker,
+                  c.args.get(i),
+                  shape.fields.get(i),
+                  acc.out,
+                );
+                { checker: b.checker, out: b.out, pats: acc.pats.push(b.pat) }
+              },
+            );
+            {
+              checker: each.checker,
+              out: each.out,
+              pat: case_pattern_of(ci.type_name, ci.name, ci.index, each.pats),
+            }
           }
         },
       }
@@ -3847,11 +3968,16 @@ fn bind_pattern(
         list_type(elem.ty),
         b"list pattern",
       ).checker;
-      let items = l.items.fold({ checker: c1, out: out }, |acc: Bound, x: Pattern|
-        bind_pattern(acc.checker, x, elem.ty, acc.out));
+      let items = l.items.fold({ checker: c1, out: out, pats: [] }, |acc: BoundEach, x: Pattern| {
+        let b: Bound = bind_pattern(acc.checker, x, elem.ty, acc.out);
+        { checker: b.checker, out: b.out, pats: acc.pats.push(b.pat) }
+      });
       match l.rest {
-        Some(r) -> bind_pattern(items.checker, r, list_type(elem.ty), items.out),
-        None -> items,
+        Some(r) -> {
+          let b: Bound = bind_pattern(items.checker, r, list_type(elem.ty), items.out);
+          { checker: b.checker, out: b.out, pat: list_pattern_of(items.pats, Some(b.pat)) }
+        },
+        None -> { checker: items.checker, out: items.out, pat: list_pattern_of(items.pats, None) },
       }
     },
     // Each alternative binds against the scrutinee alone; the first one's names are the arm's.
@@ -3859,20 +3985,33 @@ fn bind_pattern(
       [] -> panic("an or-pattern with no alternatives"),
       [head, ..rest] -> {
         let first: Bound = bind_pattern(checker, head, scrutinee, []);
-        let agreed: Checker = rest.fold(first.checker, |c: Checker, alt: Pattern| {
-          let b: Bound = bind_pattern(c, alt, scrutinee, []);
-          same_binders(b.checker, pat_span(alt), first.out, b.out)
-        });
-        { checker: agreed, out: out.concat(first.out) }
+        let agreed = rest.fold(
+          { checker: first.checker, pats: [first.pat] },
+          |acc: { checker: Checker, pats: List<Option<TypedPattern>> }, alt: Pattern| {
+            let b: Bound = bind_pattern(acc.checker, alt, scrutinee, []);
+            {
+              checker: same_binders(b.checker, pat_span(alt), first.out, b.out),
+              pats: acc.pats.push(b.pat),
+            }
+          },
+        );
+        { checker: agreed.checker, out: out.concat(first.out), pat: or_pattern_of(agreed.pats) }
       },
     },
     PRecord(r) -> match record_fields(resolve(checker, scrutinee)) {
       Some(known) -> {
-        let bound: Bound = r.fields.fold(
-          { checker: checker, out: out },
-          |acc: Bound, f: { name: Ident, pat: Pattern }|
+        let bound = r.fields.fold(
+          { checker: checker, out: out, fields: [] },
+          |acc: { checker: Checker, out: List<{ name: Bytes, ty: Type }>, fields: List<{ name: Bytes, pat: Option<TypedPattern> }> }, f: { name: Ident, pat: Pattern }|
             match field_get(known, f.name.name) {
-              Some(t) -> bind_pattern(acc.checker, f.pat, t, acc.out),
+              Some(t) -> {
+                let b: Bound = bind_pattern(acc.checker, f.pat, t, acc.out);
+                {
+                  checker: b.checker,
+                  out: b.out,
+                  fields: acc.fields.push({ name: f.name.name, pat: b.pat }),
+                }
+              },
               None ->
                 {
                   checker: report_error_at(
@@ -3884,17 +4023,20 @@ fn bind_pattern(
                     [],
                   ),
                   out: acc.out,
+                  fields: acc.fields.push({ name: f.name.name, pat: None }),
                 },
             },
         );
+        let pat = record_pattern_of(bound.fields, r.rest);
         // What `..` leaves out is read by the ownership walk, which refuses one that drops a resource.
         if r.rest {
           {
-            ..bound,
             checker: {
               ..bound.checker,
               valued: bound.checker.valued.push({ span: r.span, ty: scrutinee }),
             },
+            out: bound.out,
+            pat: pat,
           }
         } else {
           let named = r.fields.map(|f: { name: Ident, pat: Pattern }| f.name.name);
@@ -3910,8 +4052,9 @@ fn bind_pattern(
                 [b"add the missing fields, or end the pattern with `..`"],
               ),
               out: bound.out,
+              pat: None,
             }
-          } else { bound }
+          } else { { checker: bound.checker, out: bound.out, pat: pat } }
         }
       },
       None -> if r.rest {
@@ -3925,14 +4068,20 @@ fn bind_pattern(
             [b"annotate the matched value"],
           ),
           out: out,
+          pat: None,
         }
       } else {
         let fs = r.fields.fold(
-          { checker: checker, fs: [], out: out },
-          |acc: { checker: Checker, fs: List<Field>, out: List<{ name: Bytes, ty: Type }> }, f: { name: Ident, pat: Pattern }| {
+          { checker: checker, fs: [], out: out, fields: [] },
+          |acc: { checker: Checker, fs: List<Field>, out: List<{ name: Bytes, ty: Type }>, fields: List<{ name: Bytes, pat: Option<TypedPattern> }> }, f: { name: Ident, pat: Pattern }| {
             let t: WithTy = new_ty(acc.checker);
             let b: Bound = bind_pattern(t.checker, f.pat, t.ty, acc.out);
-            { checker: b.checker, fs: acc.fs.push({ name: f.name.name, ty: t.ty }), out: b.out }
+            {
+              checker: b.checker,
+              fs: acc.fs.push({ name: f.name.name, ty: t.ty }),
+              out: b.out,
+              fields: acc.fields.push({ name: f.name.name, pat: b.pat }),
+            }
           },
         );
         {
@@ -3944,6 +4093,7 @@ fn bind_pattern(
             b"record pattern",
           ).checker,
           out: fs.out,
+          pat: record_pattern_of(fs.fields, false),
         }
       },
     },
