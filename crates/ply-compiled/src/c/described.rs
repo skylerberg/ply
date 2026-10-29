@@ -42,8 +42,7 @@ macro_rules! laid {
 /// emitted code reads: a field it reads anew is named here.
 fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
-    // Only the released compiler's code reads `fuel`.
-    laid!(out, Ctx as "PlyCtx": failed, fuel, stack_floor, site_root, site_start, site_end,
+    laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
         frames, release_depth, release_waiting, target, entering_desc, entering_words,
         recording, bridge, hosted, unserved, performed_root,
         performed_start, performed_end, task, alloc);

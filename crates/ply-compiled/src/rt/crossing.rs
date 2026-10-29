@@ -511,20 +511,6 @@ pub unsafe extern "C" fn rt_in_name_is(ctx: *mut Ctx, p: Addr, n: I64) -> I64 {
     }))
 }
 
-// No lifting holds a handle, so these two fail the context. A builder the release built still
-// binds them.
-pub unsafe extern "C" fn rt_in_handle(ctx: *mut Ctx) -> Handle {
-    Handle::of(unsafe { &mut *ctx }.read(no_handle))
-}
-
-pub unsafe extern "C" fn rt_in_carried(ctx: *mut Ctx) -> Handed {
-    Handed::of(unsafe { &mut *ctx }.read(no_handle))
-}
-
-fn no_handle(_: &mut Lifting) -> Result<Word, String> {
-    Err("a handle read from a lifting, which holds none".into())
-}
-
 /// What a descriptor lifts by for every type but `String`, the one type the runtime lifts: it fails
 /// the entry.
 pub unsafe extern "C" fn rt_never_lifted(ctx: *mut Ctx) {
@@ -538,14 +524,6 @@ pub unsafe extern "C" fn rt_never_shown(ctx: *mut Ctx) {
     unsafe { &mut *ctx }.fail(err_crossing(
         "a value shown through a descriptor that does not lower it",
     ));
-}
-
-/// Begins a lowering inside whatever crossing is under way; where `again` is not 0, a value written
-/// a second time is written as `AGAIN`.
-pub unsafe extern "C" fn rt_lower_open(ctx: *mut Ctx, again: I64) {
-    unsafe { &mut *ctx }
-        .crossings
-        .push(Crossing::Lowering(Lowering::new(again.0 != 0)));
 }
 
 /// Begins a lowering of a value a diagnostic shows inside whatever crossing is under way, which
@@ -571,13 +549,6 @@ pub unsafe extern "C" fn rt_lower_close(ctx: *mut Ctx) -> I64 {
         return I64(0);
     }
     c.give(l.w.finish())
-}
-
-/// Begins a lifting of the `n` bytes at `p`, which hold one value and no handle.
-pub unsafe extern "C" fn rt_lift_open(ctx: *mut Ctx, p: Addr, n: I64) {
-    let c = unsafe { &mut *ctx };
-    let bytes = unsafe { lent(p, n) }.to_vec();
-    c.lift_from(bytes);
 }
 
 /// Ends the innermost lifting, every byte of which must have been read.
@@ -609,7 +580,7 @@ pub unsafe extern "C" fn rt_taken(ctx: *mut Ctx, dst: Addr, n: I64) {
 impl Ctx {
     /// Begins a lifting of `bytes`; one that does not open fails the context and lifts nothing, so
     /// the crossings still nest.
-    fn lift_from(&mut self, bytes: Vec<u8>) {
+    pub fn lift_from(&mut self, bytes: Vec<u8>) {
         let r = match Reader::new(bytes) {
             Ok(r) => r,
             Err(why) => {
