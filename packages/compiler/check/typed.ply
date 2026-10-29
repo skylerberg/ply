@@ -13,13 +13,15 @@ pub type TypedNode =
   | TypedRead(Reading)
   | TypedUnary({ op: Bytes, operand: TypedExpr })
   | TypedBinary({ op: Bytes, lhs: TypedExpr, rhs: TypedExpr })
-  /// `labels` are the resources the call fills its callee's label parameters with, in their order.
-  | TypedCall({ callee: TypedExpr, args: List<TypedExpr>, labels: List<Bytes> })
+  /// `args` are in the callee's parameters' order, a default the call leaves out among them.
+  | TypedCall({ callee: TypedExpr, args: List<TypedExpr> })
   | TypedIf({ cond: TypedExpr, then_branch: TypedExpr, else_branch: TypedExpr })
   | TypedMatch({ scrutinee: TypedExpr, arms: List<TypedArm> })
   | TypedBlock({ stmts: List<TypedStmt>, tail: Option<TypedExpr> })
   | TypedList(List<TypedExpr>)
   | TypedRecord(List<TypedField>)
+  /// `{ ..base, f: e }`: the base's record with the fields `sets` writes replaced, at the node's type.
+  | TypedUpdate({ base: TypedExpr, sets: List<TypedField> })
   | TypedFieldRead({ base: TypedExpr, field: Bytes })
   | TypedPerform({ effect: Bytes, op: Bytes, resource: Option<Bytes>, args: List<TypedExpr> })
   | TypedLambda({ params: List<TypedParam>, body: TypedExpr, row: Row })
@@ -85,6 +87,12 @@ pub fn unary_of(op: Bytes, operand: Option<TypedExpr>) -> Option<TypedNode> =
 pub fn binary_of(op: Bytes, lhs: Option<TypedExpr>, rhs: Option<TypedExpr>) -> Option<TypedNode> =
   match ((lhs, rhs)) {
     (Some(l), Some(r)) -> Some(TypedBinary({ op: op, lhs: l, rhs: r })),
+    _ -> None,
+  }
+
+pub fn call_of(callee: Option<TypedExpr>, args: List<Option<TypedExpr>>) -> Option<TypedNode> =
+  match ((callee, Option::all(args))) {
+    (Some(f), Some(xs)) -> Some(TypedCall({ callee: f, args: xs })),
     _ -> None,
   }
 
@@ -199,6 +207,15 @@ pub fn record_pattern_of(
     None -> None,
   }
 
+pub fn update_of(
+  base: Option<TypedExpr>,
+  sets: List<{ name: Bytes, value: Option<TypedExpr> }>,
+) -> Option<TypedNode> =
+  match ((base, record_of(sets))) {
+    (Some(b), Some(TypedRecord(fs))) -> Some(TypedUpdate({ base: b, sets: fs })),
+    _ -> None,
+  }
+
 pub fn lambda_of(params: List<TypedParam>, body: Option<TypedExpr>, row: Row) -> Option<TypedNode> =
   match body { Some(b) -> Some(TypedLambda({ params: params, body: b, row: row })), None -> None }
 
@@ -210,4 +227,136 @@ pub fn block_of(
     (Some(ss), Some(Some(t))) -> Some(TypedBlock({ stmts: ss, tail: Some(t) })),
     (Some(ss), None) -> Some(TypedBlock({ stmts: ss, tail: None })),
     _ -> None,
+  }
+
+// --- Walking the tree ------------------------------------------------------------------------------
+
+/// `e` with each node rewritten by `f` once its parts are.
+pub fn rewritten(e: TypedExpr, f: (TypedExpr) -> TypedExpr) -> TypedExpr = {
+  let go = |x: TypedExpr| rewritten(x, f);
+  let opt = |x: Option<TypedExpr>| match x { Some(y) -> Some(rewritten(y, f)), None -> None };
+  f({
+    ..e,
+    node: match e.node {
+      TypedUnary(u) -> TypedUnary({ ..u, operand: go(u.operand) }),
+      TypedBinary(b) -> TypedBinary({ ..b, lhs: go(b.lhs), rhs: go(b.rhs) }),
+      TypedCall(c) -> TypedCall({ callee: go(c.callee), args: c.args.map(go) }),
+      TypedIf(i) ->
+        TypedIf({
+          cond: go(i.cond),
+          then_branch: go(i.then_branch),
+          else_branch: go(i.else_branch),
+        }),
+      TypedMatch(m) ->
+        TypedMatch({
+          scrutinee: go(m.scrutinee),
+          arms: m.arms.map(|a: TypedArm| { pat: a.pat, guard: opt(a.guard), body: go(a.body) }),
+        }),
+      TypedBlock(b) ->
+        TypedBlock({
+          stmts: b.stmts.map(|s: TypedStmt|
+            match s {
+              TypedLet(l) -> TypedLet({ ..l, value: go(l.value) }),
+              TypedLetElse(l) ->
+                TypedLetElse({ ..l, value: go(l.value), fallback: go(l.fallback) }),
+              TypedDo(x) -> TypedDo(go(x)),
+            }),
+          tail: opt(b.tail),
+        }),
+      TypedList(xs) -> TypedList(xs.map(go)),
+      TypedRecord(fs) ->
+        TypedRecord(fs.map(|fd: TypedField| { name: fd.name, value: go(fd.value) })),
+      TypedFieldRead(r) -> TypedFieldRead({ ..r, base: go(r.base) }),
+      TypedPerform(p) -> TypedPerform({ ..p, args: p.args.map(go) }),
+      TypedLambda(l) -> TypedLambda({ ..l, body: go(l.body) }),
+      TypedSimulate(b) -> TypedSimulate(go(b)),
+      TypedParallel(bs) -> TypedParallel(bs.map(go)),
+      TypedHandle(h) ->
+        TypedHandle({
+          body: go(h.body),
+          clauses: h.clauses.map(|c: TypedClause| { ..c, body: go(c.body) }),
+          ret: match h.ret { Some(r) -> Some({ ..r, body: go(r.body) }), None -> None },
+        }),
+      other -> other,
+    },
+  })
+}
+
+/// Every node of `e`, each before its parts.
+pub fn nodes_of(e: TypedExpr) -> List<TypedExpr> = {
+  let all = |xs: List<TypedExpr>|
+    xs.fold([], |acc: List<TypedExpr>, x: TypedExpr| acc.concat(nodes_of(x)));
+  let opt = |x: Option<TypedExpr>| match x { Some(y) -> nodes_of(y), None -> [] };
+  [e].concat(match e.node {
+    TypedUnary(u) -> nodes_of(u.operand),
+    TypedBinary(b) -> nodes_of(b.lhs).concat(nodes_of(b.rhs)),
+    TypedCall(c) -> nodes_of(c.callee).concat(all(c.args)),
+    TypedIf(i) -> all([i.cond, i.then_branch, i.else_branch]),
+    TypedMatch(m) ->
+      nodes_of(m.scrutinee).concat(
+        m.arms.fold([], |acc: List<TypedExpr>, a: TypedArm|
+          acc.concat(opt(a.guard)).concat(nodes_of(a.body))),
+      ),
+    TypedBlock(b) ->
+      b.stmts.fold([], |acc: List<TypedExpr>, s: TypedStmt|
+        acc.concat(match s {
+          TypedLet(l) -> nodes_of(l.value),
+          TypedLetElse(l) -> nodes_of(l.value).concat(nodes_of(l.fallback)),
+          TypedDo(x) -> nodes_of(x),
+        })).concat(
+        opt(b.tail),
+      ),
+    TypedList(xs) -> all(xs),
+    TypedRecord(fs) -> all(fs.map(|fd: TypedField| fd.value)),
+    TypedFieldRead(r) -> nodes_of(r.base),
+    TypedPerform(p) -> all(p.args),
+    TypedLambda(l) -> nodes_of(l.body),
+    TypedSimulate(b) -> nodes_of(b),
+    TypedParallel(bs) -> all(bs),
+    TypedHandle(h) ->
+      nodes_of(h.body).concat(all(h.clauses.map(|c: TypedClause| c.body))).concat(match h.ret {
+        Some(r) -> nodes_of(r.body),
+        None -> [],
+      }),
+    _ -> [],
+  })
+}
+
+// --- Defaults a call on a value copies -------------------------------------------------------------
+
+/// A parameter's default copied into the call at site `call`, typed: the argument at `place`.
+pub type PlacedDefault = { call: Int, place: Int, value: Option<TypedExpr> }
+
+/// `e` with each default in `defaults` put in its call's arguments at its place. None where a
+/// default is not typed or its call is not one of `e`'s.
+pub fn defaults_placed(e: TypedExpr, defaults: List<PlacedDefault>) -> Option<TypedExpr> =
+  if defaults.len() == 0 { Some(e) } else {
+    let by_call = defaults.fold(Map::new(), |m: Map<Int, List<PlacedDefault>>, d: PlacedDefault|
+      m.insert(d.call, match m.get(d.call) { Some(ds) -> ds.push(d), None -> [d] }));
+    let calls = nodes_of(e).filter(|x: TypedExpr|
+      match x.node { TypedCall(_) -> by_call.contains(x.span.site), _ -> false });
+    let untyped = defaults.any(|d: PlacedDefault| match d.value { Some(_) -> false, None -> true });
+    if calls.len() != by_call.len() || untyped { None } else {
+      Some(
+        rewritten(e, |x: TypedExpr|
+          match ((x.node, by_call.get(x.span.site))) {
+            (TypedCall(c), Some(ds)) ->
+              {
+                ..x,
+                node: TypedCall({
+                  callee: c.callee,
+                  args: ds.sort_by(|a: PlacedDefault, b: PlacedDefault| a.place <= b.place).fold(
+                    c.args,
+                    |args: List<TypedExpr>, d: PlacedDefault|
+                      match d.value {
+                        Some(v) -> args.take(d.place).push(v).concat(args.drop(d.place)),
+                        None -> args,
+                      },
+                  ),
+                }),
+              },
+            _ -> x,
+          }),
+      )
+    }
   }

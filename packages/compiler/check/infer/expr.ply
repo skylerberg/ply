@@ -83,7 +83,8 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              TypedRange, ReadLocal, ReadDefinition, ReadConstructor, ReadBuiltin,
                              unary_of, binary_of, if_of, list_of, field_read_of, record_of,
                              block_of, lambda_of, do_of, let_of, let_else_of, case_pattern_of,
-                             list_pattern_of, or_pattern_of, record_pattern_of)
+                             list_pattern_of, or_pattern_of, record_pattern_of, TypedArm, arm_of,
+                             match_of, call_of, PlacedDefault, defaults_placed)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -916,7 +917,7 @@ fn infer_args(
   met: Meetings,
   ranged: Option<Ranged>,
   first: Option<Type> = None,
-) -> { checker: Checker, tys: List<Type>, row: Row } / {abort.raise} = {
+) -> { checker: Checker, tys: List<Type>, row: Row, nodes: List<Option<TypedExpr>> } / {abort.raise} = {
   let before = match first { Some(_) -> 1, None -> 0 };
   let walked = range(before, before + exprs.len()).fold(
     {
@@ -927,8 +928,9 @@ fn infer_args(
         (Some(ty), Some(p)) -> Meeting({ expected: p, found: ty, before: met }),
         _ -> met,
       },
+      nodes: [],
     },
-    |acc: { checker: Checker, tys: List<Type>, row: Row, met: Meetings }, i: Int| {
+    |acc: { checker: Checker, tys: List<Type>, row: Row, met: Meetings, nodes: List<Option<TypedExpr>> }, i: Int| {
       let x = exprs.get(i - before);
       let param = params.at(i);
       let hint = match param { Some(p) -> Some({ ty: p, met: acc.met }), None -> None };
@@ -971,29 +973,45 @@ fn infer_args(
           Some(p) -> Meeting({ expected: p, found: o.ty, before: acc.met }),
           None -> acc.met,
         },
+        nodes: acc.nodes.push(typed_at(o, expr_span(x))),
       }
     },
   );
-  { checker: walked.checker, tys: walked.tys, row: walked.row }
+  { checker: walked.checker, tys: walked.tys, row: walked.row, nodes: walked.nodes }
 }
 
 /// An expression nothing encloses, typed with each default its calls on values copied: a default
-/// is no part of the expression a walk reads, so it is typed where the walk ends.
+/// is no part of the expression a walk reads, so it is typed where the walk ends, and its node is
+/// then put among its call's arguments. A default holds no call on a value that copies another.
 pub fn infer_whole(
   checker: Checker,
   expr: Expr,
   hint: Option<Hint> = None,
 ) -> Inferred / {abort.raise} = {
   let o: Inferred = infer(checker, expr, hint);
+  let typed = o.checker.copied_defaults.fold(
+    { checker: { ..o.checker, copied_defaults: [] }, placed: [] },
+    |acc: { checker: Checker, placed: List<PlacedDefault> }, d: { expr: Expr, ty: Type, call: Int, place: Int }| {
+      let t: Inferred = infer(acc.checker, d.expr, hint_of(d.ty));
+      {
+        checker: expect_met(t.checker, expr_span(d.expr), d.ty, t.ty, b"a parameter's default"),
+        placed: acc.placed.push({
+          call: d.call,
+          place: d.place,
+          value: typed_at(t, expr_span(d.expr)),
+        }),
+      }
+    },
+  );
+  let whole = match typed_at(o, expr_span(expr)) {
+    Some(e) -> if typed.checker.copied_defaults.len() > 0 { None }
+    else { defaults_placed(e, typed.placed) },
+    None -> None,
+  };
   {
     ..o,
-    checker: o.checker.copied_defaults.fold(
-      { ..o.checker, copied_defaults: [] },
-      |c: Checker, d: { expr: Expr, ty: Type }| {
-        let typed: Inferred = infer(c, d.expr, hint_of(d.ty));
-        expect_met(typed.checker, expr_span(d.expr), d.ty, typed.ty, b"a parameter's default")
-      },
-    ),
+    checker: { ..typed.checker, copied_defaults: [] },
+    node: match whole { Some(e) -> Some(e.node), None -> None },
   }
 }
 
@@ -1398,7 +1416,9 @@ fn infer_here(checker: Checker, expr: Expr, hint: Option<Hint>) -> Inferred / {a
                 let j1: WithRow = join(o.checker, a.span, acc.row, o.row);
                 {
                   checker: j1.checker,
-                  rest: acc.rest.push(Settled({ written: x, ty: o.ty })),
+                  rest: acc.rest.push(
+                    Settled({ written: x, ty: o.ty, node: typed_at(o, expr_span(x)) }),
+                  ),
                   row: j1.row,
                 }
               },
@@ -2808,7 +2828,7 @@ fn unnamed(checker: Checker, named: List<NamedArg>) -> Checker =
 /// or nothing, with the error that says why: there is no calling nothing without one.
 type DottedCallee =
   | HeldInField(Type)
-  | OfType({ qname: QName, callee: Bytes, ty: Type, row: Row, labelled: Bool })
+  | OfType({ qname: QName, callee: Bytes, ty: Type, row: Row, labelled: Bool, node: Option<TypedNode> })
   | NoCallee(Diag)
 
 /// A call on a value read as far as its callee: the callee's parameters, what the value met of
@@ -2882,7 +2902,14 @@ fn dotted_callee(
     };
     {
       checker: ready,
-      callee: OfType({ qname: m.qname, callee: m.callee, ty: f0.ty, row: f0.row, labelled: names }),
+      callee: OfType({
+        qname: m.qname,
+        callee: m.callee,
+        ty: f0.ty,
+        row: f0.row,
+        labelled: names,
+        node: f0.node,
+      }),
       at: callee,
       params: params,
       before: 1,
@@ -2959,7 +2986,7 @@ fn dotted(
   let answered = |o: Inferred, noted: Checker| {
     let j: WithRow = join(noted, span, b.row, o.row);
     let k: WithRow = join(j.checker, span, j.row, taken.row);
-    { checker: k.checker, ty: o.ty, row: k.row, node: None }
+    { checker: k.checker, ty: o.ty, row: k.row, node: o.node }
   };
   match d.callee {
     NoCallee(said) -> {
@@ -2970,7 +2997,12 @@ fn dotted(
       let o: Inferred = applied_call(
         span,
         EField({ span: span_to(expr_span(base), name.span), base: base, field: name }),
-        { checker: taken.checker, ty: held, row: row_empty(), node: None },
+        {
+          checker: taken.checker,
+          ty: held,
+          row: row_empty(),
+          node: field_read_of(typed_at(b, expr_span(base)), name.name),
+        },
         None,
         args,
         labels,
@@ -2998,8 +3030,8 @@ fn dotted(
       let o: Inferred = applied_call(
         span,
         EVar({ span: d.at, name: m.qname }),
-        { checker: taken.checker, ty: m.ty, row: m.row, node: None },
-        Some({ written: base, ty: b.ty }),
+        { checker: taken.checker, ty: m.ty, row: m.row, node: m.node },
+        Some({ written: base, ty: b.ty, node: typed_at(b, expr_span(base)) }),
         args,
         if m.labelled { [] } else { labels },
         hint,
@@ -3556,7 +3588,7 @@ fn infer_app_general(
 
 /// What a parameter after a call's written arguments takes: a named value, typed already, or its
 /// default.
-pub type Taken = | Settled({ written: Expr, ty: Type }) | Copied(Expr)
+pub type Taken = | Settled({ written: Expr, ty: Type, node: Option<TypedExpr> }) | Copied(Expr)
 
 /// A call of a callee typed already, `f0`, which `func` only writes: `on` is the value a call is
 /// made on, the callee's first argument, typed already too, `given` the arguments after it, and
@@ -3565,7 +3597,7 @@ fn applied_call(
   span: Span,
   func: Expr,
   f0: Inferred,
-  on: Option<{ written: Expr, ty: Type }>,
+  on: Option<{ written: Expr, ty: Type, node: Option<TypedExpr> }>,
   given: List<Expr>,
   labels: List<Ident>,
   hint: Option<Hint>,
@@ -3586,7 +3618,7 @@ fn applied_call(
     ),
     ty: f0.ty,
     row: f0.row,
-    node: None,
+    node: f0.node,
   };
   let repeats = callee_repeats(f.checker, func, args);
   // What the callee's answer is expected to be says what its type variables are, for the arguments.
@@ -3607,7 +3639,7 @@ fn applied_call(
     _ -> { params: [], met: NothingMet },
   };
   let builtin = prelude_named(f.checker, func);
-  let written: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
+  let written = infer_args(
     f.checker,
     given,
     span,
@@ -3618,24 +3650,35 @@ fn applied_call(
     ranged_lambda(f.checker, builtin, args),
     first: match on { Some(x) -> Some(x.ty), None -> None },
   );
-  // A default is typed where the walk of the body ends: it is no part of the call.
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = range(0, rest.len()).fold(
-    written,
-    |acc: { checker: Checker, tys: List<Type>, row: Row }, k: Int|
+  // A default is typed where the walk of the body ends, and placed among the arguments then.
+  let as_ = range(0, rest.len()).fold(
+    {
+      checker: written.checker,
+      tys: written.tys,
+      row: written.row,
+      nodes: match on { Some(x) -> [x.node].concat(written.nodes), None -> written.nodes },
+    },
+    |acc: { checker: Checker, tys: List<Type>, row: Row, nodes: List<Option<TypedExpr>> }, k: Int|
       match ((rest.get(k), called.params.at(written.tys.len() + k))) {
-        (Settled(x), _) -> { ..acc, tys: acc.tys.push(x.ty) },
+        (Settled(x), _) -> { ..acc, tys: acc.tys.push(x.ty), nodes: acc.nodes.push(x.node) },
         (Copied(d), Some(p)) ->
           {
             ..acc,
             checker: {
               ..acc.checker,
-              copied_defaults: acc.checker.copied_defaults.push({ expr: d, ty: p }),
+              copied_defaults: acc.checker.copied_defaults.push({
+                expr: d,
+                ty: p,
+                call: span.site,
+                place: written.tys.len() + k,
+              }),
             },
             tys: acc.tys.push(p),
           },
-        _ -> acc,
+        _ -> { ..acc, nodes: acc.nodes.push(None) },
       },
   );
+  let node = call_of(typed_at(f0, expr_span(func)), as_.nodes);
   let j0: WithRow = join(as_.checker, span, f.row, as_.row);
   let c: Checker = j0.checker;
   match resolve(c, f.ty) {
@@ -3756,7 +3799,7 @@ fn applied_call(
         j0.row,
         effects,
       );
-      { checker: j.checker, ty: fn_.ret, row: j.row, node: None }
+      { checker: j.checker, ty: fn_.ret, row: j.row, node: node }
     },
     TyVar(_) -> {
       let ret: WithTy = new_ty(c);
@@ -3775,7 +3818,7 @@ fn applied_call(
         j0.row,
         eff.row,
       );
-      { checker: j.checker, ty: ret.ty, row: j.row, node: None }
+      { checker: j.checker, ty: ret.ty, row: j.row, node: node }
     },
     other -> {
       let o: WithTy = new_ty(
@@ -4230,9 +4273,9 @@ fn infer_match(
   let s: Inferred = infer(checker, scrutinee);
   let result: WithTy = new_ty(s.checker);
   // An arm is reached past every arm before it: `acc.checker`'s guards hold what those missing says.
-  let walked: { checker: Checker, row: Row, ty: Type, tails: List<Int> } = arms.fold(
-    { checker: result.checker, row: s.row, ty: result.ty, tails: [] },
-    |acc: { checker: Checker, row: Row, ty: Type, tails: List<Int> }, arm: MatchArm| {
+  let walked = arms.fold(
+    { checker: result.checker, row: s.row, ty: result.ty, tails: [], arms: [] },
+    |acc: { checker: Checker, row: Row, ty: Type, tails: List<Int>, arms: List<Option<TypedArm>> }, arm: MatchArm| {
       let outside = reader_of(acc.checker);
       let pushed: Checker = { ..acc.checker, env: env_push(acc.checker.env) };
       let b: Bound = bind_pattern(pushed, arm.pat, s.ty, []);
@@ -4241,7 +4284,7 @@ fn infer_match(
         ..bound,
         guards: guards::matched(outside, bound.guards, scrutinee, arm.pat),
       };
-      let guarded: WithBodyRow = match arm.guard {
+      let guarded: { checker: Checker, row: Row, node: Option<Option<TypedExpr>> } = match arm.guard {
         Some(g) -> {
           let o: Inferred = infer(inside, g);
           let c: Checker = expect(
@@ -4252,9 +4295,13 @@ fn infer_match(
             b"match guard",
           ).checker;
           let j: WithRow = join(c, span, acc.row, o.row);
-          { checker: assuming(j.checker, g, true), row: j.row }
+          {
+            checker: assuming(j.checker, g, true),
+            row: j.row,
+            node: Some(typed_at(o, expr_span(g))),
+          }
         },
-        None -> { checker: inside, row: acc.row },
+        None -> { checker: inside, row: acc.row, node: None },
       };
       let body: Inferred = infer(guarded.checker, arm.body, hint_after(hint, acc.ty));
       let j: WithRow = join(body.checker, span, guarded.row, body.row);
@@ -4270,7 +4317,13 @@ fn infer_match(
         body.ty,
         b"match arms must agree",
       );
-      { checker: n.checker, row: j.row, ty: n.ty, tails: n.tails }
+      {
+        checker: n.checker,
+        row: j.row,
+        ty: n.ty,
+        tails: n.tails,
+        arms: acc.arms.push(arm_of(b.pat, guarded.node, typed_at(body, expr_span(arm.body)))),
+      }
     },
   );
   {
@@ -4281,7 +4334,7 @@ fn infer_match(
     ),
     ty: walked.ty,
     row: walked.row,
-    node: None,
+    node: match_of(typed_at(s, expr_span(scrutinee)), walked.arms),
   }
 }
 
@@ -4745,16 +4798,7 @@ fn infer_perform(
   // An exit effect's carried type is made where it is first read, so it is read once, below.
   let wanted = if is_exit_effect(eff.name.name) { [] }
   else { match resolve_op(checker, eff, ident).hit { Some(hit) -> hit.op.params, None -> [] } };
-  let as_: { checker: Checker, tys: List<Type>, row: Row } = infer_args(
-    checker,
-    args,
-    span,
-    [],
-    None,
-    wanted,
-    NothingMet,
-    None,
-  );
+  let as_ = infer_args(checker, args, span, [], None, wanted, NothingMet, None);
   let r: WithHit = resolve_op(as_.checker, eff, ident);
   match r.hit {
     None -> {
