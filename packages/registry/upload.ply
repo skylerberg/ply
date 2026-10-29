@@ -19,9 +19,7 @@ import fake
 import std.option
 import std.string
 
-pub type Refusal = { status: Int, reason: String }
-
-fn refused<a>(status: Int, reason: String) -> Result<a, Refusal> =
+fn fail<a>(status: Int, reason: String) -> Result<a, http::Error> =
   Err({ status: status, reason: reason })
 
 // --- Who may publish --------------------------------------------------------------
@@ -45,13 +43,13 @@ pub fn bearer_token(headers: Headers) -> Option<String> / {abort.raise} =
 pub fn authorize(
   name: String,
   headers: Headers,
-) -> Result<Unit, Refusal> / {config.secret[tokens], abort.raise} =
+) -> Result<Unit, http::Error> / {config.secret[tokens], abort.raise} =
   match bearer_token(headers) {
-    None -> refused(401, "a publish or a yank carries `Authorization: Bearer <token>`"),
+    None -> fail(401, "a publish or a yank carries `Authorization: Bearer <token>`"),
     Some(presented) -> match config.secret[tokens](token_key(name)) {
-      None -> refused(403, "no token may change `" ++ name ++ "` on this registry"),
+      None -> fail(403, "no token may change `" ++ name ++ "` on this registry"),
       Some(stored) -> if stored.verify(presented) { Ok(()) }
-      else { refused(403, "this token may not change `" ++ name ++ "`") },
+      else { fail(403, "this token may not change `" ++ name ++ "`") },
     },
   }
 
@@ -64,25 +62,25 @@ pub fn validate_archive(
   version: Version,
   claimed: Option<String>,
   body: Bytes,
-) -> Result<Release, Refusal> / {abort.raise} =
+) -> Result<Release, http::Error> / {abort.raise} =
   match claimed {
-    None -> refused(400, "a publish carries `X-Ply-Digest: b3:<hex>`, the digest of its body"),
+    None -> fail(400, "a publish carries `X-Ply-Digest: b3:<hex>`, the digest of its body"),
     Some(claimed_digest) -> match decode_library(body) {
       Err(r) ->
-        refused(422, "the body is not a library archive: " ++ String::of_bytes_lossy(r.message)),
+        fail(422, "the body is not a library archive: " ++ String::of_bytes_lossy(r.message)),
       Ok(x) -> match digest_of(library_domain(), body) {
-        None -> refused(422, "the body is too short to be a library archive"),
+        None -> fail(422, "the body is too short to be a library archive"),
         Some(d) -> if digest_text(d) != claimed_digest {
-          refused(
+          fail(
             422,
             "the body's digest is " ++ digest_text(d) ++ ", and `X-Ply-Digest` says "
               ++ claimed_digest,
           )
         } else if x.digest != d {
-          refused(422, "the archive's own digest field is not the digest of its bytes")
+          fail(422, "the archive's own digest field is not the digest of its bytes")
         } else {
           match manifest_of(body, x.sections) {
-            None -> refused(422, "the archive holds no manifest"),
+            None -> fail(422, "the archive holds no manifest"),
             Some(text) -> validate_manifest(name, version, digest_text(d), text),
           }
         },
@@ -104,13 +102,13 @@ fn validate_manifest(
   version: Version,
   digest: String,
   text: Bytes,
-) -> Result<Release, Refusal> / {abort.raise} = {
+) -> Result<Release, http::Error> / {abort.raise} = {
   let c = check_manifest(text);
   match c.manifest {
-    None -> refused(422, "the archive's manifest does not check"),
-    Some(m) -> if c.diags.len() > 0 { refused(422, "the archive's manifest does not check") }
+    None -> fail(422, "the archive's manifest does not check"),
+    Some(m) -> if c.diags.len() > 0 { fail(422, "the archive's manifest does not check") }
     else if m.name != name || m.version != version {
-      refused(
+      fail(
         422,
         "the archive holds `" ++ m.name ++ "` " ++ render_version(m.version)
           ++ ", and was sent as `"
@@ -119,11 +117,11 @@ fn validate_manifest(
           ++ render_version(version),
       )
     } else if m.entry != None {
-      refused(422, "`" ++ name ++ "` names an entry, and only a library is published")
+      fail(422, "`" ++ name ++ "` names an entry, and only a library is published")
     } else {
       match non_registry_dependency(m) {
         Some(d) ->
-          refused(
+          fail(
             422,
             "the dependency `" ++ d.name
               ++ "` is not from the registry, and a published package depends only on it",
@@ -148,18 +146,18 @@ pub fn validate_interface(
   semantics: String,
   archive: String,
   body: Bytes,
-) -> Result<Unit, Refusal> / {abort.raise} =
+) -> Result<Unit, http::Error> / {abort.raise} =
   match envelope_of(body) {
-    None -> refused(422, "the body is not an interface"),
+    None -> fail(422, "the body is not an interface"),
     Some(e) -> if e.semantics != Bytes::of_string(semantics) {
-      refused(
+      fail(
         422,
         "the interface was cut under the semantics " ++ String::of_bytes_lossy(e.semantics)
           ++ ", and was sent as "
           ++ semantics,
       )
     } else if e.archive != Bytes::of_string(archive) {
-      refused(
+      fail(
         422,
         "the interface was cut from " ++ String::of_bytes_lossy(e.archive)
           ++ ", and the version is "
@@ -177,23 +175,23 @@ pub fn validate_attestation(
   archive: String,
   attester: Bytes,
   body: Bytes,
-) -> Result<Unit, Refusal> / {abort.raise} =
+) -> Result<Unit, http::Error> / {abort.raise} =
   match signed_of(body) {
-    None -> refused(422, "the body is not a signed document"),
+    None -> fail(422, "the body is not a signed document"),
     Some(doc) -> match bin::decode(doc.payload, attestation_bin()) {
-      Err(_) -> refused(422, "what the body signs is not an attestation"),
+      Err(_) -> fail(422, "what the body signs is not an attestation"),
       Ok(a) -> if a.name != name || a.version != version {
-        refused(422, "the attestation is of `" ++ a.name ++ "` " ++ render_version(a.version))
+        fail(422, "the attestation is of `" ++ a.name ++ "` " ++ render_version(a.version))
       } else if a.archive != archive {
-        refused(422, "the attestation is of " ++ a.archive ++ ", and the version is " ++ archive)
+        fail(422, "the attestation is of " ++ a.archive ++ ", and the version is " ++ archive)
       } else if a.semantics != semantics {
-        refused(
+        fail(
           422,
           "the attestation is under the semantics " ++ a.semantics ++ ", and was sent as "
             ++ semantics,
         )
       } else if trusted_signer(doc, [attester]) == None {
-        refused(403, "the attestation is not signed by this registry's attester")
+        fail(403, "the attestation is not signed by this registry's attester")
       } else { Ok(()) },
     },
   }
@@ -204,9 +202,9 @@ fn non_registry_dependency(m: Manifest) -> Option<Dep> =
 
 // --- Tests ------------------------------------------------------------------
 
-fn status_of<a>(r: Result<a, Refusal>) -> Int = match r { Ok(_) -> 0, Err(e) -> e.status }
+fn status_of<a>(r: Result<a, http::Error>) -> Int = match r { Ok(_) -> 0, Err(e) -> e.status }
 
-fn reason_of<a>(r: Result<a, Refusal>) -> String = match r { Ok(_) -> "", Err(e) -> e.reason }
+fn reason_of<a>(r: Result<a, http::Error>) -> String = match r { Ok(_) -> "", Err(e) -> e.reason }
 
 fn with_auth(value: String) -> Headers =
   http::set_header(http::empty_headers(), "authorization", value)
