@@ -1,10 +1,7 @@
-//! How deep a program may nest, and the stack it nests on.
+//! The stack a program nests on.
 
 use std::cell::Cell;
 use std::ptr::NonNull;
-
-/// The most nested calls a program may hold at once.
-pub const DEFAULT_MAX_CALLS: usize = 10_000;
 
 /// A stack the runtime reserved whole and switched this thread onto: writable from its top down to
 /// what it has committed so far, and never moved.

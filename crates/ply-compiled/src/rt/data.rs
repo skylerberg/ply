@@ -60,7 +60,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
         return Handed::of(0);
     }
     let held = unsafe { Carried::new(Handed::of(acquired), held) };
-    let standing = c.fuel;
     let (answered, body, cleanup, held) = if cancelled {
         c.failed = FAILED_CANCELLED;
         (None, body, cleanup, held)
@@ -87,8 +86,6 @@ pub unsafe extern "C" fn rt_with_cleanup(
     };
     unsafe { body.let_go_function(ctx) };
     let c = unsafe { &mut *ctx };
-    // `cleanup` runs as deep as the bracket stands, however deep the body was when it ended.
-    c.fuel = standing;
     let ending = c.failed;
     let Some(aside) = Unwinding::set_aside(c) else {
         held.release(ctx);

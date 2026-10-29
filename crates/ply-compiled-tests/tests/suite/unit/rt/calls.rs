@@ -59,7 +59,7 @@ fn read(ctx: *mut Ctx, keep: KeepRoot) -> Word {
 /// A context over a unit of the one definition `f`.
 fn defining(f: Definition) -> Ctx {
     let mut ctx = context_of(&[], vec![f as usize]);
-    ctx.begin(1_000);
+    ctx.begin();
     ctx
 }
 
@@ -180,7 +180,7 @@ fn contexts_reading_one_definition_at_once_each_answer_it_and_one_copy_is_kept()
             let barrier = Arc::clone(&barrier);
             std::thread::spawn(move || {
                 let mut mine = tables.context();
-                mine.begin(1_000);
+                mine.begin();
                 let c: *mut Ctx = &mut mine;
                 barrier.wait();
                 let w = read(c, keep_box);
@@ -211,7 +211,7 @@ type Left = unsafe extern "C" fn(*mut Ctx, Word);
 #[test]
 fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
     let mut ctx = context_of(&[], Vec::new());
-    ctx.begin(1_000);
+    ctx.begin();
     let c: *mut Ctx = &mut ctx;
     let (entered, left) = (
         helper::<Entered>("rt_scheduler_entered"),

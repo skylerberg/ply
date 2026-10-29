@@ -258,7 +258,7 @@ fn a_task_that_grew_resumes_under_its_own_floor() {
     };
     let native = loaded.expect("the unit loads");
     let mut ctx = native.context();
-    ctx.begin(100);
+    ctx.begin();
     let task = taken();
     let mut g = Grows {
         ctx: &raw mut ctx,

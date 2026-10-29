@@ -300,7 +300,7 @@ fn a_stop_resumed_once_runs_on_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
+        (*ctx).begin();
         let answer = handled(ctx, &ONCE);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert_eq!(imm_value(answer), 10);
@@ -319,7 +319,7 @@ fn a_second_resumption_of_a_stop_is_refused_and_everything_comes_back_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
+        (*ctx).begin();
         handled(ctx, &TWICE);
         assert_ne!((*ctx).failed, 0);
         let said = failure(ctx);
@@ -339,7 +339,7 @@ fn a_body_whose_continuation_dies_unresumed_gives_back_what_it_held_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
+        (*ctx).begin();
         let answer = handled(ctx, &NEVER);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert_eq!(imm_value(answer), 42);
@@ -359,7 +359,7 @@ fn an_entry_ending_with_a_body_suspended_gives_back_what_it_held_once() {
     let mut owned = unit();
     let ctx = &raw mut owned;
     unsafe {
-        (*ctx).begin(1_000);
+        (*ctx).begin();
         handled(ctx, &PARKS);
         assert_eq!((*ctx).failed, 0, "{}", failure(ctx));
         assert!(freed().is_empty());

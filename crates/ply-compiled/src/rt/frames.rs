@@ -5,9 +5,6 @@ use super::*;
 /// `Ctx::failed` when the entry failed with the diagnostic it records.
 pub const FAILED: i64 = 1;
 
-/// `Ctx::failed` when the fuel ran out.
-pub const FAILED_OUT_OF_FUEL: i64 = 2;
-
 /// A call would nest past what its stack holds, or a body or task could not be given a stack.
 pub const FAILED_OUT_OF_STACK: i64 = 3;
 

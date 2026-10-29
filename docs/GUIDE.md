@@ -346,7 +346,7 @@ From loosest to tightest binding. All binary operators are left-associative.
     conditions show an `Int` divisor is not zero.
   - Overflow, a `Decimal` result that cannot be represented exactly, and a shift count that is
     negative or at least the type's width end the program (`E0502`). These are machine limits
-    like the call depth limit, and do not appear in effect rows.
+    like running out of stack, and do not appear in effect rows.
   - `<<` discards bits shifted out. The `checked_*` builtins return `None` instead of failing
     (§12).
 - `+%`, `-%` and `*%` wrap at the type's width, and `+|`, `-|` and `*|` saturate at its limits:
@@ -1408,9 +1408,9 @@ clause resumes somewhere other than its tail (§6.6): it runs the body on a sepa
 calls nest. A group whose `handle`s return directly, resume in tail position, or handle a raise (as
 `try` does) keeps its loop.
 
-Every other call nests, up to 10,000 deep (`E0502` beyond that): `1 + f(n - 1)`, a call inside
-`handle`, `with_hold` or a lambda, and a call of another function. Each task has its own depth
-(§9).
+Every other call nests: `1 + f(n - 1)`, a call inside `handle`, `with_hold` or a lambda, and a call
+of another function. Only the stack bounds how deep calls nest. It holds a gigabyte, and a call
+that would nest past it ends the program (`E0502`). Each task has a stack of its own (§9).
 
 A loop that never ends runs until a clock stops it. A test, and each entry `ply prove` makes to
 evaluate a claim, has 60 seconds by default (§8.4, §10). `ply run` has no clock by default, since a
@@ -1958,7 +1958,7 @@ pattern does not match (§5.1); `iterate` past its budget; `task.join` of a canc
 
 - A signature that leaves `abort.raise` out of its row when its body can raise is `E0302`, which
   names the operation and offers the row to write.
-- Overflow and the call depth limit end the program regardless of the row.
+- Overflow and running out of stack end the program regardless of the row.
 - A clause for `abort.raise` receives the message: `panic`'s argument, or what would otherwise be
   reported.
 - Unhandled, it is `E0501` for a failed assertion and `E0502` for anything else.
