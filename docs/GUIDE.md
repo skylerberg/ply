@@ -2571,8 +2571,8 @@ Every command compiles the program to C and runs the compiled code; there is no 
 `--profile development` (the default: `tcc` on x86-64 Linux, else `cc -O0`) or `--profile release`
 (`cc -O2`) picks the C toolchain settings.
 
-A definition the backend cannot compile is an error (`E0448`), reported when the program is built
-and naming the construct it refused.
+Every program that checks compiles. A definition Ply fails to compile is a defect in Ply, reported
+as `E0505` when the program is built.
 
 | variable | effect |
 | --- | --- |
@@ -2587,8 +2587,6 @@ These variables are for working on `ply` itself:
 | --- | --- |
 | `PLY_C_STAGE=DIR` | where the compiler's own build stages are kept, separate from the cache (default `ply/stage` next to it) |
 | `PLY_C_PHASES=1` | print what each build phase did and how long it took |
-| `PLY_C_REFUSALS=1` | print which definitions the backend refused |
-| `PLY_C_ONLY=a,b`, `PLY_C_SKIP=prefix,...` | compile only the named definitions, or skip those with a prefix; callers of what was skipped are reported, not raised |
 | `PLY_HEAP_POISON=1` | fill freed memory with a pattern and fail on any read of it |
 | `PLY_HEAP_DELAY=N` | reuse freed memory only after `N` more frees |
 
@@ -2949,7 +2947,7 @@ is part of what dependents are checked and proved against.
   close); `raised` (with the point as `raised_at`); `unwitnessed` (proved under a guard no value
   was found to satisfy); `endless` (a law over a `simulate` region whose binders cannot be covered
   by running); or `unsearched` (a law with more interleavings than the search ran).
-- A failure of Ply's own, such as a proposition the C backend cannot compile, is a `defect`,
+- A failure of Ply's own, such as a proposition its unit holds no root of, is a `defect`,
   reported under `E0505` as `ply test` reports one, with `defect`: its `code`, `message`, the
   `bindings` Ply failed at, and a `summary`.
 - `summary` counts `proved`, `refuted`, `vacuous`, `unproved` and `defect`.

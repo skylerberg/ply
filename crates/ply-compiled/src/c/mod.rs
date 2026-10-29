@@ -28,25 +28,6 @@ pub fn semantics_digest() -> &'static str {
     env!("PLY_SEMANTICS_DIGEST")
 }
 
-/// What the emitter refused, and where.
-#[derive(Debug)]
-pub struct Refused {
-    pub function: String,
-    pub construct: String,
-}
-
-impl std::fmt::Display for Refused {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "`{}` is outside the compiled fragment: {}",
-            self.function, self.construct
-        )
-    }
-}
-
-impl std::error::Error for Refused {}
-
 /// Where the emitter's answers are kept between runs, beside the objects they compile to and under
 /// the same sweep.
 pub fn bodies_dir() -> std::path::PathBuf {

@@ -301,7 +301,7 @@ fn a_task_that_grew_resumes_under_its_own_floor() {
     let Some(loaded) = units::opened(dir.path(), &[], |_| {}) else {
         return;
     };
-    let (native, _) = loaded.expect("the unit loads");
+    let native = loaded.expect("the unit loads");
     let mut ctx = native.context();
     ctx.begin(100);
     let task = taken();

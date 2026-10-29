@@ -180,7 +180,6 @@ pub fn exports_of(defs: &[Def]) -> Laid {
                 .collect(),
             constants: Vec::new(),
             modules: 1,
-            refusals: Vec::new(),
             fields: Vec::new(),
             entered: Vec::new(),
         },
@@ -300,7 +299,7 @@ pub fn opened(
     dir: &Path,
     defs: &[Def],
     adjust: impl FnOnce(&mut Laid),
-) -> Option<Result<(ply_compiled::c::Native, Vec<ply_compiled::Refused>), String>> {
+) -> Option<Result<ply_compiled::c::Native, String>> {
     let mut exports = exports_of(defs);
     adjust(&mut exports);
     let lib = library(dir, &text(defs, &exports))?;

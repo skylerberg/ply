@@ -14,10 +14,10 @@ import compiler.emit.reps (SumCtor, at_args)
 import compiler.emit.tir (Rep, RInt, RBool, RNum, RWord, RSlice, RSum, RUnit, Var, Arg, AVar, AInt,
                           ABool, ANum, AZero, Prim, Get, Gathered, PCase, PLeaf, Inst, Decl, Assign,
                           If, Case, Match, Miss, Fail, NoArm, NoLet, Block, Test, TTag, TInt,
-                          TRange, TLength, Matching, rep_of_arg)
+                          TRange, TLength, rep_of_arg)
 import compiler.emit.lower.setting (Setting, ctor_named, ctor_sum)
 import compiler.emit.lower.held (held_as, case_index, arg_word)
-import compiler.emit.lower.base (Context, Lowering, Lowered, Armed, refuse, fresh, bound_as,
+import compiler.emit.lower.base (Context, Lowering, Lowered, Armed, unreachable, fresh, bound_as,
                                  emitted, opened, continued, join_type, join_held, set_join,
                                  type_of, handed, unviewed)
 import compiler.emit.lower.data (field, open_needed)
@@ -47,36 +47,30 @@ pub fn closed(
   after: Lowering,
   tail: Bool,
   at: Span,
-) -> Lowered =
-  if continued(before, after).refused != None {
-    { st: continued(before, after), arg: AZero(RWord) }
-  } else {
-    let ty = join_type(cx, arms.map(|a: Armed| a.body));
-    let j = fresh(continued(before, after), ty, join_held(cx, ty, tail));
-    let made = arms.fold(
-      { st: j.st, blocks: [] },
-      |acc: { st: Lowering, blocks: List<Block> }, a: Armed| {
-        let set = set_join(acc.st, a.body, j.var, at);
-        let block = match a.guard {
-          None -> set.block,
-          Some(g) -> g.st.insts.push(If({ cond: g.arg, then: set.block, otherwise: [Miss] })),
-        };
-        { st: set.st, blocks: acc.blocks.push(nest(block, [Miss])) }
-      },
-    );
-    {
-      st: {
-        ..made.st,
-        insts: before.insts.push(Decl(j.var)).push(
-          Match({
-            arms: made.blocks,
-            rest: [Fail({ why: NoArm, at: at, letting: [], unwind: [] })],
-          }),
-        ),
-      },
-      arg: AVar(j.var),
-    }
+) -> Lowered = {
+  let ty = join_type(cx, arms.map(|a: Armed| a.body));
+  let j = fresh(continued(before, after), ty, join_held(cx, ty, tail));
+  let made = arms.fold(
+    { st: j.st, blocks: [] },
+    |acc: { st: Lowering, blocks: List<Block> }, a: Armed| {
+      let set = set_join(acc.st, a.body, j.var, at);
+      let block = match a.guard {
+        None -> set.block,
+        Some(g) -> g.st.insts.push(If({ cond: g.arg, then: set.block, otherwise: [Miss] })),
+      };
+      { st: set.st, blocks: acc.blocks.push(nest(block, [Miss])) }
+    },
+  );
+  {
+    st: {
+      ..made.st,
+      insts: before.insts.push(Decl(j.var)).push(
+        Match({ arms: made.blocks, rest: [Fail({ why: NoArm, at: at, letting: [], unwind: [] })] }),
+      ),
+    },
+    arg: AVar(j.var),
   }
+}
 
 /// `let pat = value`: `value`'s state with the pattern's tests, each failing the `let` where it does
 /// not hold, and its binders in its environment.
@@ -197,18 +191,16 @@ fn value_tested(
           let w = unviewed({ st: read.st, arg: a }, dummy_span());
           equal_to(cx, { ..read, st: w.st }, w.arg, differ)
         },
-        None -> refuse(read.st, Matching, b"a comparison with a slot nothing bound").st,
+        None -> unreachable(b"a comparison with a slot nothing bound"),
       },
       None -> match ctor_of(cx.setting, type_of(read.arg), v.name) {
         Some(k) -> tag_tested(cx, read.st, read.arg, k, differ),
-        None ->
-          refuse(read.st, Matching, b"a comparison with a global's value: ".concat(v.name)).st,
+        None -> unreachable(b"a comparison with a global's value: ".concat(v.name)),
       },
     },
     NApp(a) -> match a.func.node {
-      NVar(f) -> if f.slot != None {
-        refuse(read.st, Matching, b"a constructor compared with a call's value").st
-      } else {
+      NVar(f) -> if f.slot != None { unreachable(b"a constructor compared with a call's value") }
+      else {
         match ctor_of(cx.setting, type_of(read.arg), f.name) {
           Some(k) ->
             a.args.fold(
@@ -231,16 +223,16 @@ fn value_tested(
                 }
               },
             ).st,
-          None -> refuse(read.st, Matching, b"a constructor compared with a call's value").st,
+          None -> unreachable(b"a constructor compared with a call's value"),
         }
       },
-      _ -> refuse(read.st, Matching, b"a constructor compared whose argument is computed").st,
+      _ -> unreachable(b"a constructor compared whose argument is computed"),
     },
-    _ -> refuse(read.st, Matching, b"a constructor compared whose argument is computed").st,
+    _ -> unreachable(b"a constructor compared whose argument is computed"),
   }
 
 /// `read == a` by their type's equality, tested in an `If` that leaves by `differ`.
-fn equal_to(cx: Context, read: Lowered, a: Arg, differ: Block) -> Lowering = {
+fn equal_to(cx: Context, read: Lowered, a: Arg, differ: Block) -> Lowering / {abort.raise} = {
   let eq = binary(cx, read, { st: read.st, arg: a }, b"eq", dummy_span());
   emitted(eq.st, If({ cond: eq.arg, then: [], otherwise: differ }))
 }
@@ -254,79 +246,77 @@ fn pattern_bound(
   pat: CodePattern,
   failing: Block,
 ) -> Lowering / {abort.raise} =
-  if st.refused != None { st } else {
-    match pat {
-      PxWild -> st,
-      PxVar(v) -> match v.slot { Some(s) -> { ..st, env: st.env.insert(s, subject) }, None -> st },
-      PxLit(l) -> literal_tested(cx, st, subject, l, failing),
-      PxRange(r) -> range_tested(cx, st, subject, r.lo, r.hi, failing),
-      PxCtor(c) -> match ctor_of(cx.setting, type_of(subject), c.name) {
-        None -> refuse(st, Matching, b"a constructor of no declared sum: ".concat(c.name)).st,
-        Some(k) ->
-          c.args.fold(
-            { st: tag_tested(cx, st, subject, k, failing), at: 0 },
-            |acc: { st: Lowering, at: Int }, sub: CodePattern|
-              match sub {
+  match pat {
+    PxWild -> st,
+    PxVar(v) -> match v.slot { Some(s) -> { ..st, env: st.env.insert(s, subject) }, None -> st },
+    PxLit(l) -> literal_tested(cx, st, subject, l, failing),
+    PxRange(r) -> range_tested(cx, st, subject, r.lo, r.hi, failing),
+    PxCtor(c) -> match ctor_of(cx.setting, type_of(subject), c.name) {
+      None -> unreachable(b"a constructor of no declared sum: ".concat(c.name)),
+      Some(k) ->
+        c.args.fold(
+          { st: tag_tested(cx, st, subject, k, failing), at: 0 },
+          |acc: { st: Lowering, at: Int }, sub: CodePattern|
+            match sub {
+              PxWild -> { ..acc, at: acc.at + 1 },
+              _ -> {
+                let a = as_read(
+                  cx,
+                  arg_read(cx, acc.st, subject, k, acc.at),
+                  k,
+                  acc.at,
+                  match sub { PxCtor(_) -> true, _ -> false },
+                );
+                { st: pattern_bound(cx, a.st, a.arg, sub, failing), at: acc.at + 1 }
+              },
+            },
+        ).st,
+    },
+    PxRecord(r) ->
+      r.fields.fold(st, |acc: Lowering, f: CodePatternField|
+        match f.pat {
+          PxWild -> acc,
+          sub -> {
+            let a = field(cx, { st: acc, arg: subject }, f.name, dummy_span());
+            pattern_bound(cx, a.st, a.arg, sub, failing)
+          },
+        }),
+    PxList(l) -> match subject {
+      AVar(v) -> match listed_type(v) {
+        None -> unreachable(b"a list pattern over a value held as no list"),
+        Some(item) -> {
+          let n = l.items.len();
+          let tested = case_tested(
+            st,
+            subject,
+            TLength({ at_least: if l.rest == None { n + 1 } else { n } }),
+            n,
+            failing,
+          );
+          let seen = viewed(tested, v);
+          let items = l.items.fold(
+            { st: seen.st, at: 0 },
+            |acc: { st: Lowering, at: Int }, x: CodePattern|
+              match x {
                 PxWild -> { ..acc, at: acc.at + 1 },
                 _ -> {
-                  let a = as_read(
-                    cx,
-                    arg_read(cx, acc.st, subject, k, acc.at),
-                    k,
-                    acc.at,
-                    match sub { PxCtor(_) -> true, _ -> false },
-                  );
-                  { st: pattern_bound(cx, a.st, a.arg, sub, failing), at: acc.at + 1 }
+                  let a = item_read(cx, acc.st, seen.list, seen.from, item, acc.at);
+                  { st: pattern_bound(cx, a.st, a.arg, x, failing), at: acc.at + 1 }
                 },
               },
-          ).st,
-      },
-      PxRecord(r) ->
-        r.fields.fold(st, |acc: Lowering, f: CodePatternField|
-          match f.pat {
-            PxWild -> acc,
-            sub -> {
-              let a = field(cx, { st: acc, arg: subject }, f.name, dummy_span());
-              pattern_bound(cx, a.st, a.arg, sub, failing)
+          );
+          match l.rest {
+            None -> items.st,
+            Some(PxWild) -> items.st,
+            Some(r) -> {
+              let a = rest_read(items.st, v, seen.list, seen.from, n);
+              pattern_bound(cx, a.st, a.arg, r, failing)
             },
-          }),
-      PxList(l) -> match subject {
-        AVar(v) -> match listed_type(v) {
-          None -> refuse(st, Matching, b"a list pattern over a value held as no list").st,
-          Some(item) -> {
-            let n = l.items.len();
-            let tested = case_tested(
-              st,
-              subject,
-              TLength({ at_least: if l.rest == None { n + 1 } else { n } }),
-              n,
-              failing,
-            );
-            let seen = viewed(tested, v);
-            let items = l.items.fold(
-              { st: seen.st, at: 0 },
-              |acc: { st: Lowering, at: Int }, x: CodePattern|
-                match x {
-                  PxWild -> { ..acc, at: acc.at + 1 },
-                  _ -> {
-                    let a = item_read(cx, acc.st, seen.list, seen.from, item, acc.at);
-                    { st: pattern_bound(cx, a.st, a.arg, x, failing), at: acc.at + 1 }
-                  },
-                },
-            );
-            match l.rest {
-              None -> items.st,
-              Some(PxWild) -> items.st,
-              Some(r) -> {
-                let a = rest_read(items.st, v, seen.list, seen.from, n);
-                pattern_bound(cx, a.st, a.arg, r, failing)
-              },
-            }
-          },
+          }
         },
-        _ -> refuse(st, Matching, b"a list pattern over a constant").st,
       },
-    }
+      _ -> unreachable(b"a list pattern over a constant"),
+    },
   }
 
 /// A literal pattern's test: an integer's or a `Bool`'s in a `Case`, `()` none, and any other the
@@ -527,17 +517,22 @@ fn arg_type(k: CtorOf, at: Int) -> Type =
 /// its type holds it: no value of no words; read out of the case's payload of a sum laid out; and of
 /// a sum whose layout a type variable leaves open as a word, a placeholder whose layout its callers
 /// settle.
-fn arg_read(cx: Context, st: Lowering, subject: Arg, k: CtorOf, at: Int) -> Lowered = {
+fn arg_read(
+  cx: Context,
+  st: Lowering,
+  subject: Arg,
+  k: CtorOf,
+  at: Int,
+) -> Lowered / {abort.raise} = {
   let ty = arg_type(k, at);
   let want = held_as(cx.setting, ty);
   if want == RUnit { { st: st, arg: AZero(RUnit) } } else {
     match subject {
       AVar(v) -> match v.rep {
         RSum(s) -> match case_index(v.rep, k.full) {
-          None ->
-            refuse(st, Matching, b"a constructor its sum's cases do not hold: ".concat(k.full)),
+          None -> unreachable(b"a constructor its sum's cases do not hold: ".concat(k.full)),
           Some(i) -> match arg_word(s.laid, i, at) {
-            None -> refuse(st, Matching, b"an argument its case's layout does not hold"),
+            None -> unreachable(b"an argument its case's layout does not hold"),
             // An argument lies in the payload as its type holds it.
             Some(w) -> {
               let lies = held_as(cx.setting, ty);
@@ -564,7 +559,7 @@ fn arg_read(cx: Context, st: Lowering, subject: Arg, k: CtorOf, at: Int) -> Lowe
             want,
             dummy_span(),
           ),
-        _ -> refuse(st, Matching, b"a constructor's argument read out of no sum: ".concat(k.full)),
+        _ -> unreachable(b"a constructor's argument read out of no sum: ".concat(k.full)),
       },
       // A constant's tag test was decided, so this read is never reached.
       _ -> { st: st, arg: AZero(want) },

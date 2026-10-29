@@ -1,6 +1,6 @@
 //! The state a root's body is lowered in, and what every part of the lowering shares: binding a
 //! value, a block of its own, a join, a frame of its own for a body lowered as a function, a
-//! refusal. Nothing here calls the lowering's recursion, which `emit.lower` alone holds.
+//! broken invariant. Nothing here calls the lowering's recursion, which `emit.lower` alone holds.
 
 import compiler.emit.code
 import compiler.emit.code (Code, CodeArm, Capture)
@@ -16,9 +16,8 @@ import compiler.emit.tir (Rep, RInt, RBool, RNum, RFloat, RDec, RWide, Var, Arg,
                           AFloat, ANum, AChar, AZero, Val, Pack, Native, Inst, Let, Do, Decl,
                           Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart, Enter,
                           Fail, Handle, Sited, Inc, Dec, Reset, Free, Opened, Block, Lambda, Links,
-                          Declined, Family, Spine, RWord, RUnit, RSlice, Gathered, Prim, Unsettled,
-                          rep_of_arg, falls_through, counted, operands, parts_of, no_links, Unwinds,
-                          Unwound)
+                          RWord, RUnit, RSlice, Gathered, Prim, Unsettled, rep_of_arg,
+                          falls_through, counted, operands, parts_of, no_links, Unwinds, Unwound)
 import compiler.emit.lower.setting (Setting)
 import compiler.emit.lower.held (held_as)
 import compiler.emit.tir.statics (StaticDef, StaticLaid, SPlain, WAddress, WBytes, named)
@@ -138,13 +137,12 @@ pub type Worded = { evidence: Evidence, word: Arg, through: Bool, handled: Bool 
 pub type Tails = | Restarts(List<Rep>) | Enters(List<RootKey>) | Calls
 
 /// A body lowered so far: the next variable's number, what each slot holds, the block being
-/// written, the first refusal, the closures' bodies made so far, the static objects the root and its
-/// closures name so far, each after those it names, and what the root tells the unit.
+/// written, the closures' bodies made so far, the static objects the root and its closures name so
+/// far, each after those it names, and what the root tells the unit.
 pub type Lowering = {
   next: Int,
   env: Map<Int, Arg>,
   insts: List<Inst>,
-  refused: Option<Declined>,
   lambdas: List<Lambda>,
   statics: List<StaticDef>,
   links: Links,
@@ -209,19 +207,16 @@ pub fn started(params: List<Var>) -> Lowering =
     env: range(0, params.len()).fold(Map::new(), |m: Map<Int, Arg>, i: Int|
       match params.at(i) { Some(p) -> m.insert(i, AVar(p)), None -> m }),
     insts: [],
-    refused: None,
     lambdas: [],
     statics: [],
     links: no_links(),
     unwinding: [],
   }
 
-/// `st` refused for the reason `why` the part `by` gives, unless it was refused already.
-pub fn refuse(st: Lowering, by: Family, why: Bytes) -> Lowered =
-  {
-    st: match st.refused { Some(_) -> st, None -> { ..st, refused: Some({ by: by, why: why }) } },
-    arg: AZero(RInt),
-  }
+/// Panics: the lowering met `why`, which the checker or `emit.code` rules out of every program they
+/// hand it, so reaching it is a defect in Ply.
+pub fn unreachable<a>(why: Bytes) -> a / {abort.raise} =
+  panic(String::of_bytes_lossy(b"the lowering met what no checked program holds: ".concat(why)))
 
 /// A new variable of type `ty` held as `rep`.
 pub fn fresh(st: Lowering, ty: Type, rep: Rep) -> { st: Lowering, var: Var } =
@@ -288,39 +283,19 @@ fn with_note(st: Lowering, note: Bytes, args: List<Arg>, at: Span) -> Lowering =
 pub fn opened(st: Lowering) -> Lowering = { ..st, insts: [] }
 
 /// `outer`, whose block and environment go on, after a block of its own lowered to `inner`: the
-/// variables, closures, statics, links and refusal `inner` added.
+/// variables, closures, statics and links `inner` added.
 pub fn continued(outer: Lowering, inner: Lowering) -> Lowering =
-  {
-    ..outer,
-    next: inner.next,
-    refused: match outer.refused { Some(r) -> Some(r), None -> inner.refused },
-    lambdas: inner.lambdas,
-    statics: inner.statics,
-    links: inner.links,
-  }
+  { ..outer, next: inner.next, lambdas: inner.lambdas, statics: inner.statics, links: inner.links }
 
 /// The first state of a body lowered as a function of its own inside `st`'s: its variables numbered
 /// from its parameters, `env` its slots, the root's closures, statics and links carried on.
 pub fn nested(st: Lowering, params: List<Var>, env: Map<Int, Arg>) -> Lowering =
-  {
-    ..started(params),
-    env: env,
-    refused: st.refused,
-    lambdas: st.lambdas,
-    statics: st.statics,
-    links: st.links,
-  }
+  { ..started(params), env: env, lambdas: st.lambdas, statics: st.statics, links: st.links }
 
 /// `outer` after a function of its own lowered to `inner`: `outer`'s variables, block and
-/// environment, and the closures, statics, links and refusal `inner` added.
+/// environment, and the closures, statics and links `inner` added.
 pub fn unnested(outer: Lowering, inner: Lowering) -> Lowering =
-  {
-    ..outer,
-    refused: match outer.refused { Some(r) -> Some(r), None -> inner.refused },
-    lambdas: inner.lambdas,
-    statics: inner.statics,
-    links: inner.links,
-  }
+  { ..outer, lambdas: inner.lambdas, statics: inner.statics, links: inner.links }
 
 /// `st` holding the static object laid as `laid`, named by its content as `emit.tir.statics.named`
 /// names it, once however often it is added; and that name, which `Val.Static` reads the object by.
@@ -349,15 +324,13 @@ pub fn noted(st: Lowering, need: Need) -> Lowering =
 
 /// What the checker filed for the node at `at` of the body being lowered, or of its lender's in a
 /// lambda run in place. A node of a kind the checker files for always has one; `None` is a
-/// refusal, never a cue to read something else.
+/// defect in Ply, never a cue to read something else.
 pub fn filed(cx: Context, at: Span) -> Option<Typed> = cx.filed.typed.get(at.site)
 
-/// `st` refused for `what` at `at`, which the checker filed nothing for: the owner, the site, the
-/// place.
-pub fn unfiled(cx: Context, st: Lowering, what: Bytes, at: Span) -> Lowered =
-  refuse(
-    st,
-    Spine,
+/// Panics over `what` at `at`, which the checker filed nothing for, naming the owner, the site and
+/// the place.
+pub fn unfiled<a>(cx: Context, what: Bytes, at: Span) -> a / {abort.raise} =
+  unreachable(
     Bytes::concat_all([
       what,
       b" the check filed nothing for: `",
@@ -376,12 +349,18 @@ pub fn unfiled(cx: Context, st: Lowering, what: Bytes, at: Span) -> Lowered =
 /// a body another root lends the lambda to holds a capture as a word of no type, and a
 /// specialisation is handed a parameter of its full type as the call crosses it, a word where a
 /// variable the call does not carry stands; any other slot holds the type its binder gave it.
-pub fn read_taken(cx: Context, l: Lowered, name: Bytes, slot: Int, at: Span) -> Lowered = {
+pub fn read_taken(
+  cx: Context,
+  l: Lowered,
+  name: Bytes,
+  slot: Int,
+  at: Span,
+) -> Lowered / {abort.raise} = {
   let captured = cx.captured.contains(slot);
   if !captured && rep_of_arg(l.arg) != RWord { l } else {
     match filed(cx, at) {
       None -> if captured {
-        unfiled(cx, l.st, Bytes::concat_all([b"a read of capture `", name, b"`"]), at)
+        unfiled(cx, Bytes::concat_all([b"a read of capture `", name, b"`"]), at)
       } else { taken_as(cx, l, type_of(l.arg), at) },
       Some(t) -> taken_as(cx, l, if t.ty == unknown_type() { type_of(l.arg) } else { t.ty }, at),
     }
