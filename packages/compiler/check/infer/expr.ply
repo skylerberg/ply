@@ -8,7 +8,12 @@ import compiler.syntax.parsing (Span, Ident, QName, span_to, dummy_span, is_bare
                                 role_hold_acquired, role_hold_release_call, role_hold_close_call,
                                 role_hold_bracket_callee, role_tag_texts, role_tag_holes,
                                 role_var_first_read, role_try_arg, role_try_unit, role_try_value,
-                                role_try_ok_call, role_try_err_call)
+                                role_try_ok_call, role_try_err_call, role_hold_acquire_let,
+                                role_hold_acquire_binder, role_hold_release_let,
+                                role_hold_release_binder, role_hold_release_param,
+                                role_hold_release_held, role_hold_bracket, role_hold_new,
+                                role_hold_close_param, role_hold_take, role_hold_take_held,
+                                role_hold_body_param)
 import std.list (prepend)
 import compiler.syntax.type_syntax (TypeExpr, Mode, MRaise, mode_text, is_raise)
 import compiler.syntax.items (DOrd, member_name, member_of, Opaque, is_shipped)
@@ -88,7 +93,8 @@ import compiler.check.typed (TypedExpr, TypedNode, TypedLit, TypedRead, TypedPer
                              match_of, call_of, PlacedDefault, defaults_placed, update_of,
                              perform_of, simulate_of, parallel_of, TypedClause, TypedHandlerVar,
                              params_typed, clause_of, return_of, handler_var_of, handle_of,
-                             assign_of, TypedField, TypedHandle, TypedCall, TypedRecord)
+                             assign_of, TypedField, TypedHandle, TypedCall, TypedRecord,
+                             TypedLambda, TypedLet, TypedBlock)
 
 // --- What the conditions on the way hold -----------------------------------------------------------
 
@@ -6165,7 +6171,14 @@ fn infer_with_hold(
         checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
         ty: b.ty,
         row: j.row,
-        node: None,
+        node: held_node(
+          span,
+          { acquire: typed_at(a, expr_span(acquire)), release: typed_at(r, expr_span(release)) },
+          { name: binder.name, span: made_at(binder.span, span, role_hold_body_param()) },
+          typed_at(b, expr_span(body)),
+          { held: a.ty, hold: hold_ty, answer: b.ty },
+          { acquired: a.row, released: entering.row, body: b.row },
+        ),
       }
     },
     None -> {
@@ -6208,11 +6221,141 @@ fn infer_with_hold(
         checker: hold_rowed(j.checker, span, a.row, entering.row, b.row, j.row),
         ty: leaving_type(resolve(j.checker, b.ty), label),
         row: j.row,
-        node: None,
+        node: held_node(
+          span,
+          { acquire: typed_at(a, expr_span(acquire)), release: typed_at(r, expr_span(release)) },
+          { name: binder.name, span: made_at(binder.span, span, role_hold_body_param()) },
+          typed_at(b, expr_span(body)),
+          { held: a.ty, hold: hold_ty, answer: b.ty },
+          { acquired: a.row, released: entering.row, body: b.row },
+        ),
       }
     },
   }
 }
+
+/// The bracket `with_hold` at `span` is written out as, typed. `acquire` and `release` are bound
+/// first, outside the hold's binder; the bracket's open makes a hold of what the acquire answered,
+/// its close takes it back out and hands it to the release, and its body is the region's, taking
+/// the hold as `binder`. The builtins it calls and the names it binds no source can spell.
+fn held_node(
+  span: Span,
+  given: { acquire: Option<TypedExpr>, release: Option<TypedExpr> },
+  binder: { name: Bytes, span: Span },
+  body: Option<TypedExpr>,
+  tys: { held: Type, hold: Type, answer: Type },
+  rows: { acquired: Row, released: Row, body: Row },
+) -> Option<TypedNode> =
+  match ((given.acquire, given.release, body)) {
+    (Some(acquire), Some(release), Some(region)) -> {
+      let at = |role: Int| minted(span, role);
+      let unsited = |role: Int| { ..minted(span, role), site: 0 };
+      let fn_of = |params: List<Type>, ret: Type| fn_type(params, ret, row_empty());
+      let acquire_ty = fn_of([], tys.held);
+      let release_ty = fn_of([tys.held], unit_type());
+      let read = |name: Bytes, ty: Type, place: Span|
+        { node: TypedRead(ReadLocal(name)), span: place, ty: ty };
+      let builtin = |name: Bytes, ty: Type, place: Span|
+        { node: TypedRead(ReadBuiltin(name)), span: place, ty: ty };
+      let call = |callee: TypedExpr, args: List<TypedExpr>, ret: Type, place: Span|
+        { node: TypedCall({ callee: callee, args: args }), span: place, ty: ret };
+      let lambda = |params: List<TypedParam>, inner: TypedExpr, row: Row, place: Span|
+        {
+          node: TypedLambda({ params: params, body: inner, row: row }),
+          span: place,
+          ty: fn_type(params.map(|q: TypedParam| q.ty), inner.ty, row),
+        };
+      let opened = lambda(
+        [],
+        call(
+          builtin(b"?hold_new", fn_of([tys.held], tys.hold), at(role_hold_new_callee())),
+          [
+            call(
+              read(b"?acquire", acquire_ty, at(role_hold_acquire_read())),
+              [],
+              tys.held,
+              at(role_hold_acquired()),
+            ),
+          ],
+          tys.hold,
+          at(role_hold_new()),
+        ),
+        rows.acquired,
+        at(role_hold_open()),
+      );
+      let closed = lambda(
+        [{ name: b"?held", ty: tys.hold, span: unsited(role_hold_close_param()) }],
+        call(
+          read(b"?release", release_ty, at(role_hold_release_read())),
+          [
+            call(
+              builtin(b"?hold_take", fn_of([tys.hold], tys.held), at(role_hold_take_callee())),
+              [read(b"?held", tys.hold, at(role_hold_take_held()))],
+              tys.held,
+              at(role_hold_take()),
+            ),
+          ],
+          unit_type(),
+          at(role_hold_close_call()),
+        ),
+        rows.released,
+        at(role_hold_close()),
+      );
+      let ran = lambda(
+        [{ name: binder.name, ty: tys.hold, span: binder.span }],
+        region,
+        rows.body,
+        at(role_hold_body()),
+      );
+      let bound = |name: Bytes, value: TypedExpr, binder_role: Int, let_role: Int|
+        TypedLet({
+          pat: TypedBinder({ name: name, ty: value.ty, span: at(binder_role) }),
+          value: value,
+          span: at(let_role),
+        });
+      Some(
+        TypedBlock({
+          stmts: [
+            bound(
+              b"?acquire",
+              lambda([], acquire, rows.acquired, at(role_hold_acquire())),
+              role_hold_acquire_binder(),
+              role_hold_acquire_let(),
+            ),
+            bound(
+              b"?release",
+              lambda(
+                [{ name: b"?held", ty: tys.held, span: unsited(role_hold_release_param()) }],
+                call(
+                  release,
+                  [read(b"?held", tys.held, at(role_hold_release_held()))],
+                  unit_type(),
+                  at(role_hold_release_call()),
+                ),
+                rows.released,
+                at(role_hold_release()),
+              ),
+              role_hold_release_binder(),
+              role_hold_release_let(),
+            ),
+          ],
+          tail: Some(
+            call(
+              builtin(
+                b"?hold_bracket",
+                fn_of([opened.ty, closed.ty, ran.ty], tys.answer),
+                at(role_hold_bracket_callee()),
+              ),
+              [opened, closed, ran],
+              tys.answer,
+              at(role_hold_bracket()),
+            ),
+          ),
+        }),
+      )
+    },
+    _ -> None,
+  }
 
 /// `checker` with what the closures the hold at `span` is written out as perform filed where they
 /// are written, and the calls through them: the acquire and the open performing `acquired`, the
