@@ -1,149 +1,146 @@
 //! Parameter defaults: what one may be, qualified against the module that wrote it, and filled into every call.
 
 import compiler.syntax.parsing (Span, Ident, dummy_span, is_bare, starts_upper)
-import compiler.syntax.items (Item, IFn, ITest, ILaw, FnDef, SpecClause, SCost, SSpace, Binder,
-                              parse, is_pub)
+import compiler.syntax.items (Item, IFn, ITest, ILaw, FnDef, SpecClause, Binder, parse, is_pub)
 import compiler.syntax.exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
                               ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
                               EWithHold, ESimulate, EParallel, EBad, EHole, ETryBlock, Stmt, SLet,
                               SLetElse, SExpr, SAssign, Param, NamedArg, MatchArm, HandleClause,
-                              ReturnClause, HandlerVar, RecField, expr_span, ETagged, Hole, slotted,
-                              slot_args, Slot, FromDefault, Unplaced, NoSuchParameter,
-                              FilledByPosition, home_modules, sees_homes)
+                              ReturnClause, HandlerVar, RecField, expr_span, ETagged, Hole,
+                              home_modules, sees_homes)
+import compiler.syntax.calls (slotted, slot_args, Slot, FromDefault, Unplaced, NoSuchParameter,
+                              FilledByPosition)
 import std.list
 import compiler.check.resolve.tables (ParsedModule, ValueSpace, ModuleBinding, Scope, Diag,
                                       Resolved, lookup_declared, find_module_binding, qualify,
                                       error_at, list_names, ParamInfo, Parameters)
 import compiler.check.resolve.scopes (find, of_binder)
-import compiler.check.resolve.sets (pattern_binders, mentions, reach, bytes_concat_diags)
-
-// --- Defaults: what a default may be -----------------------------------------------------
-
-/// A pure, closed expression: a value, not something that runs.
-fn is_default_expr(expr: Expr) -> Bool / {abort.raise} =
-  match expr {
-    EApp(a) ->
-      a.named.len() == 0 && (match a.func { EVar(v) -> starts_upper(v.name.name.name), _ -> false })
-        && all_default(a.args),
-    EPerform(_) -> false,
-    EHandle(_) -> false,
-    EWithHold(_) -> false,
-    ESimulate(_) -> false,
-    EParallel(_) -> false,
-    ETry(_) -> false,
-    ETryBlock(_) -> false,
-    ETagged(_) -> false,
-    ELit(_) -> true,
-    EVar(_) -> true,
-    EBinary(b) -> is_default_expr(b.lhs) && is_default_expr(b.rhs),
-    EUnary(u) -> is_default_expr(u.operand),
-    ELambda(l) -> is_default_expr(l.body),
-    EIf(i) ->
-      is_default_expr(i.cond) && is_default_expr(i.then_branch) && is_default_expr(i.else_branch),
-    EMatch(m) ->
-      is_default_expr(m.scrutinee)
-        && m.arms.fold(true, |acc: Bool, arm: MatchArm|
-          acc && is_default_expr(arm.body)
-            && (match arm.guard { None -> true, Some(g) -> is_default_expr(g) })),
-    EBlock(b) ->
-      b.stmts.fold(true, |acc: Bool, stmt: Stmt|
-          acc
-            && (match stmt {
-              SLet(l) -> is_default_expr(l.value),
-              SLetElse(l) -> is_default_expr(l.value) && is_default_expr(l.fallback),
-              SExpr(x) -> is_default_expr(x),
-              SAssign(_) -> false,
-            }))
-        && (match b.tail { None -> true, Some(t) -> is_default_expr(t) }),
-    ERecord(r) -> r.fields.fold(true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
-    ERecordUpdate(r) ->
-      is_default_expr(r.base)
-        && r.fields.fold(true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
-    EField(f) -> is_default_expr(f.base),
-    EList(l) -> all_default(l.items),
-    EHole(_) -> true,
-    EBad(_) -> true,
-  }
-
-fn all_default(exprs: List<Expr>) -> Bool / {abort.raise} =
-  exprs.fold(true, |acc: Bool, expr: Expr| acc && is_default_expr(expr))
+import compiler.check.resolve.sets (reach, bytes_concat_diags)
+import compiler.check.resolve.bindings (item_binders)
 
 // --- Defaults: qualifying one against the module that wrote it -----------------------------
 
+/// `binders` is the binder of each local the defining item names, by the site of the name, and
+/// `params` the sites of its parameters' names; `refused` says the default runs or names one.
 type Qualifier = {
   owner: Int,
   public: Bool,
-  bound: List<Bytes>,
+  binders: Map<Int, Int>,
+  params: List<Int>,
   imports: List<ModuleBinding>,
   diags: List<Diag>,
+  refused: Bool,
 }
+
+/// `qualifier` refusing the default for what is written at `span`: a default is a pure, closed
+/// expression, a value rather than something that runs.
+fn refused(qualifier: Qualifier, span: Span) -> Qualifier =
+  {
+    ..qualifier,
+    refused: true,
+    diags: qualifier.diags.push(
+      error_at(
+        b"E0121",
+        qualifier.owner,
+        span,
+        b"a parameter default must be a pure, closed expression",
+        b"this runs, rather than being a value",
+        [
+          b"the default is copied into every call that omits the argument, so a call or a `perform` in it would run at the caller and not here",
+          b"a literal, a constructor applied to literals, a record or a list is fine",
+        ],
+      ),
+    ),
+  }
 
 type Qualified = { q: Qualifier, e: Expr }
 
 fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualified / {abort.raise} =
   match expr {
     EHole(_) -> { q: qualifier, e: expr },
-    EVar(v) -> if !is_bare(v.name) || qualifier.bound.contains(v.name.name.name) {
-      { q: qualifier, e: expr }
-    } else {
-      match find(resolved, qualifier.owner, ValueSpace, v.name) {
-        // A builtin or a prelude constructor: in reach everywhere, so it needs no qualifying.
-        None -> { q: qualifier, e: expr },
-        Some(b) -> if b.owner == qualifier.owner && qualifier.public
-            && !decl_public(resolved, qualifier.owner, v.name.name.name) {
+    EVar(v) -> if !is_bare(v.name) { { q: qualifier, e: expr } } else {
+      match qualifier.binders.get(v.name.name.span.site) {
+        Some(binder) -> if !qualifier.params.contains(binder) { { q: qualifier, e: expr } } else {
           {
             q: {
               ..qualifier,
+              refused: true,
               diags: qualifier.diags.push(
                 error_at(
-                  b"E0122",
+                  b"E0121",
                   qualifier.owner,
-                  v.name.span,
+                  v.span,
                   Bytes::concat_all([
-                    b"a default on a `pub fn` cannot mention `",
+                    b"a parameter default cannot mention `",
                     v.name.name.name,
                     b"`",
                   ]),
-                  b"not exported by this module",
-                  [
-                    b"the default is copied into every call site that omits the argument, and a caller in another module may not name this",
-                  ],
+                  b"names a parameter of this same signature",
+                  [b"a call site has no such binding for the default to be copied into"],
                 ),
               ),
             },
             e: expr,
           }
-        } else {
-          let module = of_binder(resolved.scopes.get(b.owner).module);
-          let imports = match find_module_binding(qualifier.imports, module) {
-            Some(_) -> qualifier.imports,
-            None -> qualifier.imports.push({ binder: module, target: b.owner, span: dummy_span() }),
-          };
-          {
-            q: { ..qualifier, imports: imports },
-            e: EVar({
-              span: v.span,
-              name: {
-                module: Some({ name: module, span: v.name.span }),
-                name: v.name.name,
-                span: v.name.span,
+        },
+        None -> match find(resolved, qualifier.owner, ValueSpace, v.name) {
+          // A builtin or a prelude constructor: in reach everywhere, so it needs no qualifying.
+          None -> { q: qualifier, e: expr },
+          Some(b) -> if b.owner == qualifier.owner && qualifier.public
+              && !decl_public(resolved, qualifier.owner, v.name.name.name) {
+            {
+              q: {
+                ..qualifier,
+                diags: qualifier.diags.push(
+                  error_at(
+                    b"E0122",
+                    qualifier.owner,
+                    v.name.span,
+                    Bytes::concat_all([
+                      b"a default on a `pub fn` cannot mention `",
+                      v.name.name.name,
+                      b"`",
+                    ]),
+                    b"not exported by this module",
+                    [
+                      b"the default is copied into every call site that omits the argument, and a caller in another module may not name this",
+                    ],
+                  ),
+                ),
               },
-            }),
-          }
+              e: expr,
+            }
+          } else {
+            let module = of_binder(resolved.scopes.get(b.owner).module);
+            let imports = match find_module_binding(qualifier.imports, module) {
+              Some(_) -> qualifier.imports,
+              None ->
+                qualifier.imports.push({ binder: module, target: b.owner, span: dummy_span() }),
+            };
+            {
+              q: { ..qualifier, imports: imports },
+              e: EVar({
+                span: v.span,
+                name: {
+                  module: Some({ name: module, span: v.name.span }),
+                  name: v.name.name,
+                  span: v.name.span,
+                },
+              }),
+            }
+          },
         },
       }
     },
     ELambda(l) -> {
-      let mark = qualifier.bound.len();
-      let inner = l.params.fold(qualifier.bound, |acc: List<Bytes>, p: Param|
-        acc.push(p.name.name));
-      let o: Qualified = qualify_expr(resolved, { ..qualifier, bound: inner }, l.body);
-      {
-        q: { ..o.q, bound: o.q.bound.take(mark) },
-        e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }),
-      }
+      let o: Qualified = qualify_expr(resolved, qualifier, l.body);
+      { q: o.q, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
     },
-    EApp(a) -> {
+    // Only a constructor is applied in a default.
+    EApp(a) -> if a.named.len() > 0
+        || !(match a.func { EVar(v) -> starts_upper(v.name.name.name), _ -> false }) {
+      { q: refused(qualifier, a.span), e: expr }
+    } else {
       let f = qualify_expr(resolved, qualifier, a.func);
       let args = qualify_exprs(resolved, f.q, a.args);
       let named = a.named.fold(
@@ -163,53 +160,38 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
       let arms = m.arms.fold(
         { q: s.q, xs: [] },
         |acc: { q: Qualifier, xs: List<MatchArm> }, arm: MatchArm| {
-          let mark = acc.q.bound.len();
-          let inner = { ..acc.q, bound: pattern_binders(arm.pat, acc.q.bound) };
           let g: { q: Qualifier, e: Option<Expr> } = match arm.guard {
-            None -> { q: inner, e: None },
+            None -> { q: acc.q, e: None },
             Some(x) -> {
-              let o: Qualified = qualify_expr(resolved, inner, x);
+              let o: Qualified = qualify_expr(resolved, acc.q, x);
               { q: o.q, e: Some(o.e) }
             },
           };
           let body: Qualified = qualify_expr(resolved, g.q, arm.body);
-          {
-            q: { ..body.q, bound: body.q.bound.take(mark) },
-            xs: acc.xs.push({ pat: arm.pat, guard: g.e, body: body.e, span: arm.span }),
-          }
+          { q: body.q, xs: acc.xs.push({ pat: arm.pat, guard: g.e, body: body.e, span: arm.span }) }
         },
       );
       { q: arms.q, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
     },
     EBlock(b) -> {
-      let mark = qualifier.bound.len();
       let stmts: { q: Qualifier, xs: List<Stmt> } = b.stmts.fold(
         { q: qualifier, xs: [] },
         |acc: { q: Qualifier, xs: List<Stmt> }, s: Stmt|
           match s {
             SLet(l) -> {
               let o: Qualified = qualify_expr(resolved, acc.q, l.value);
-              {
-                q: { ..o.q, bound: pattern_binders(l.pat, o.q.bound) },
-                xs: acc.xs.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })),
-              }
+              { q: o.q, xs: acc.xs.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })) }
             },
             SLetElse(l) -> {
               let o: Qualified = qualify_expr(resolved, acc.q, l.value);
               let fb: Qualified = qualify_expr(resolved, o.q, l.fallback);
-              {
-                q: { ..fb.q, bound: pattern_binders(l.pat, fb.q.bound) },
-                xs: acc.xs.push(SLetElse({ ..l, value: o.e, fallback: fb.e })),
-              }
+              { q: fb.q, xs: acc.xs.push(SLetElse({ ..l, value: o.e, fallback: fb.e })) }
             },
             SExpr(x) -> {
               let o: Qualified = qualify_expr(resolved, acc.q, x);
               { q: o.q, xs: acc.xs.push(SExpr(o.e)) }
             },
-            SAssign(x) -> {
-              let o: Qualified = qualify_expr(resolved, acc.q, x.value);
-              { q: o.q, xs: acc.xs.push(SAssign({ ..x, value: o.e })) }
-            },
+            SAssign(x) -> { q: refused(acc.q, x.span), xs: acc.xs.push(s) },
           },
       );
       let tail: { q: Qualifier, e: Option<Expr> } = match b.tail {
@@ -219,10 +201,7 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
           { q: o.q, e: Some(o.e) }
         },
       };
-      {
-        q: { ..tail.q, bound: tail.q.bound.take(mark) },
-        e: EBlock({ span: b.span, tail: tail.e, stmts: stmts.xs }),
-      }
+      { q: tail.q, e: EBlock({ span: b.span, tail: tail.e, stmts: stmts.xs }) }
     },
     EBinary(b) -> {
       let l = qualify_expr(resolved, qualifier, b.lhs);
@@ -256,43 +235,9 @@ fn qualify_expr(resolved: Resolved, qualifier: Qualifier, expr: Expr) -> Qualifi
       let o = qualify_exprs(resolved, qualifier, l.items);
       { q: o.q, e: EList({ span: l.span, items: o.xs }) }
     },
-    ETry(t) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, t.operand);
-      { q: o.q, e: ETry({ span: t.span, operand: o.e }) }
-    },
-    // Refused by `is_default_expr` already; reached only after the checker has reported it.
-    EPerform(p) -> {
-      let o = qualify_exprs(resolved, qualifier, p.args);
-      {
-        q: o.q,
-        e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }),
-      }
-    },
-    EHandle(h) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, h.body);
-      { q: o.q, e: EHandle({ ..h, body: o.e }) }
-    },
-    EWithHold(c) -> {
-      let a: Qualified = qualify_expr(resolved, qualifier, c.acquire);
-      let r: Qualified = qualify_expr(resolved, a.q, c.release);
-      let o: Qualified = qualify_expr(resolved, r.q, c.body);
-      { q: o.q, e: EWithHold({ ..c, acquire: a.e, release: r.e, body: o.e }) }
-    },
-    ESimulate(s) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, s.body);
-      { q: o.q, e: ESimulate({ span: s.span, body: o.e }) }
-    },
-    ETryBlock(t) -> {
-      let o: Qualified = qualify_expr(resolved, qualifier, t.body);
-      { q: o.q, e: ETryBlock({ ..t, body: o.e }) }
-    },
-    EParallel(v) -> {
-      let o = qualify_exprs(resolved, qualifier, v.branches);
-      { q: o.q, e: EParallel({ span: v.span, branches: o.xs }) }
-    },
     ELit(_) -> { q: qualifier, e: expr },
-    ETagged(_) -> { q: qualifier, e: expr },
     EBad(_) -> { q: qualifier, e: expr },
+    _ -> { q: refused(qualifier, expr_span(expr)), e: expr },
   }
 
 fn qualify_exprs(
@@ -344,7 +289,11 @@ fn collect_fn(
   c: Collected,
   def: FnDef,
 ) -> Collected / {abort.raise} = {
-  let names = def.params.map(|param: Param| param.name.name);
+  // Read only where a default is written, which few definitions do.
+  let binders = if def.params.any(|param: Param| param.default != None) {
+    item_binders(resolved, m, IFn(def))
+  } else { Map::new() };
+  let params = def.params.map(|param: Param| param.name.span.site);
   let walked: { c: Collected, params: List<ParamInfo> } = def.params.fold(
     { c: c, params: [] },
     |acc: { c: Collected, params: List<ParamInfo> }, param: Param|
@@ -352,18 +301,25 @@ fn collect_fn(
         None ->
           { ..acc, params: acc.params.push({ name: param.name.name, default: None, imports: [] }) },
         Some(d) -> {
-          let adm = admissible(m, d, names, acc.c.diags);
-          if !adm.ok {
+          let o = qualify_expr(
+            resolved,
             {
-              c: { ..acc.c, diags: adm.diags },
+              owner: m,
+              public: is_pub(def.vis),
+              binders: binders,
+              params: params,
+              imports: [],
+              diags: acc.c.diags,
+              refused: false,
+            },
+            d,
+          );
+          if o.q.refused {
+            {
+              c: { ..acc.c, diags: o.q.diags },
               params: acc.params.push({ name: param.name.name, default: None, imports: [] }),
             }
           } else {
-            let o = qualify_expr(
-              resolved,
-              { owner: m, public: is_pub(def.vis), bound: [], imports: [], diags: adm.diags },
-              d,
-            );
             // The writing module needs the binder as much as any caller does.
             let owner_imports = o.q.imports.fold(
               acc.c.owner_imports,
@@ -390,48 +346,6 @@ fn collect_fn(
     }),
   }
 }
-
-fn admissible(
-  m: Int,
-  expr: Expr,
-  names: List<Bytes>,
-  diags: List<Diag>,
-) -> { ok: Bool, diags: List<Diag> } / {abort.raise} =
-  if !is_default_expr(expr) {
-    {
-      ok: false,
-      diags: diags.push(
-        error_at(
-          b"E0121",
-          m,
-          expr_span(expr),
-          b"a parameter default must be a pure, closed expression",
-          b"this runs, rather than being a value",
-          [
-            b"the default is copied into every call that omits the argument, so a call                  or a `perform` in it would run at the caller and not here",
-            b"a literal, a constructor applied to literals, a record or a list is fine",
-          ],
-        ),
-      ),
-    }
-  } else {
-    let mentioned = mentions(expr, names, [], []);
-    if mentioned.len() > 0 {
-      {
-        ok: false,
-        diags: diags.push(
-          error_at(
-            b"E0121",
-            m,
-            expr_span(expr),
-            Bytes::concat_all([b"a parameter default cannot mention `", mentioned.get(0), b"`"]),
-            b"names a parameter of this same signature",
-            [b"a call site has no such binding for the default to be copied into"],
-          ),
-        ),
-      }
-    } else { { ok: true, diags: diags } }
-  }
 
 /// The builtins that carry a default: `assert(cond, message: None)`.
 fn builtin_signature(name: Bytes) -> Option<Parameters> =
@@ -460,7 +374,13 @@ fn builtin_signature(name: Bytes) -> Option<Parameters> =
 
 // --- Defaults: filling every call --------------------------------------------------------
 
-type Filler = { module: Int, scope: List<Bytes>, implicit: List<ModuleBinding>, diags: List<Diag> }
+/// `binders` is the binder of each local the item being filled names, by the site of the name.
+type Filler = {
+  module: Int,
+  binders: Map<Int, Int>,
+  implicit: List<ModuleBinding>,
+  diags: List<Diag>,
+}
 
 type Filled = { filler: Filler, expr: Expr }
 
@@ -498,14 +418,9 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       { filler: o.filler, expr: EUnary({ span: u.span, op: u.op, operand: o.expr }) }
     },
     ELambda(l) -> {
-      let mark = filler.scope.len();
-      let inner = {
-        ..filler,
-        scope: l.params.fold(filler.scope, |acc: List<Bytes>, p: Param| acc.push(p.name.name)),
-      };
-      let o: Filled = fill_expr(f, inner, l.body);
+      let o: Filled = fill_expr(f, filler, l.body);
       {
-        filler: { ..o.filler, scope: o.filler.scope.take(mark) },
+        filler: o.filler,
         expr: ELambda({ span: l.span, body: o.expr, params: l.params, ret: l.ret }),
       }
     },
@@ -544,18 +459,16 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       let arms = m.arms.fold(
         { filler: s.filler, xs: [] },
         |acc: { filler: Filler, xs: List<MatchArm> }, arm: MatchArm| {
-          let mark = acc.filler.scope.len();
-          let inner = { ..acc.filler, scope: pattern_binders(arm.pat, acc.filler.scope) };
           let g: { filler: Filler, expr: Option<Expr> } = match arm.guard {
-            None -> { filler: inner, expr: None },
+            None -> { filler: acc.filler, expr: None },
             Some(x) -> {
-              let o: Filled = fill_expr(f, inner, x);
+              let o: Filled = fill_expr(f, acc.filler, x);
               { filler: o.filler, expr: Some(o.expr) }
             },
           };
           let body: Filled = fill_expr(f, g.filler, arm.body);
           {
-            filler: { ..body.filler, scope: body.filler.scope.take(mark) },
+            filler: body.filler,
             xs: acc.xs.push({ pat: arm.pat, guard: g.expr, body: body.expr, span: arm.span }),
           }
         },
@@ -563,7 +476,6 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       { filler: arms.filler, expr: EMatch({ span: m.span, scrutinee: s.expr, arms: arms.xs }) }
     },
     EBlock(b) -> {
-      let mark = filler.scope.len();
       let stmts: { filler: Filler, xs: List<Stmt> } = b.stmts.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<Stmt> }, s: Stmt|
@@ -571,7 +483,7 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
             SLet(l) -> {
               let o: Filled = fill_expr(f, acc.filler, l.value);
               {
-                filler: { ..o.filler, scope: pattern_binders(l.pat, o.filler.scope) },
+                filler: o.filler,
                 xs: acc.xs.push(SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.expr })),
               }
             },
@@ -579,7 +491,7 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
               let o: Filled = fill_expr(f, acc.filler, l.value);
               let fb: Filled = fill_expr(f, o.filler, l.fallback);
               {
-                filler: { ..fb.filler, scope: pattern_binders(l.pat, fb.filler.scope) },
+                filler: fb.filler,
                 xs: acc.xs.push(SLetElse({ ..l, value: o.expr, fallback: fb.expr })),
               }
             },
@@ -600,10 +512,7 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
           { filler: o.filler, expr: Some(o.expr) }
         },
       };
-      {
-        filler: { ..tail.filler, scope: tail.filler.scope.take(mark) },
-        expr: EBlock({ span: b.span, tail: tail.expr, stmts: stmts.xs }),
-      }
+      { filler: tail.filler, expr: EBlock({ span: b.span, tail: tail.expr, stmts: stmts.xs }) }
     },
     ERecord(rec) -> {
       let o = fill_fields(f, filler, rec.fields);
@@ -638,41 +547,17 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       let vars: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
         { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
-          // Each initializer sees the variables above it.
-          let mark = acc.filler.scope.len();
-          let above = acc.xs.map(|x: HandlerVar| x.name.name);
-          let o: Filled = fill_expr(
-            f,
-            { ..acc.filler, scope: acc.filler.scope.concat(above) },
-            v.init,
-          );
-          {
-            filler: { ..o.filler, scope: o.filler.scope.take(mark) },
-            xs: acc.xs.push({ ..v, init: o.expr }),
-          }
+          let o: Filled = fill_expr(f, acc.filler, v.init);
+          { filler: o.filler, xs: acc.xs.push({ ..v, init: o.expr }) }
         },
       );
-      let names = h.vars.map(|v: HandlerVar| v.name.name);
       let body: Filled = fill_expr(f, vars.filler, h.body);
       let clauses: { filler: Filler, xs: List<HandleClause> } = h.clauses.fold(
         { filler: body.filler, xs: [] },
         |acc: { filler: Filler, xs: List<HandleClause> }, c: HandleClause| {
-          let mark = acc.filler.scope.len();
-          let with_params = c.params.fold(
-            acc.filler.scope.concat(names),
-            |sc: List<Bytes>, p: Ident| sc.push(p.name),
-          );
-          let with_label = match c.label_binder {
-            None -> with_params,
-            Some(t) -> with_params.push(t.name),
-          };
-          let with_resume = match c.resume {
-            None -> with_label,
-            Some(k) -> with_label.push(k.name),
-          };
-          let o: Filled = fill_expr(f, { ..acc.filler, scope: with_resume }, c.body);
+          let o: Filled = fill_expr(f, acc.filler, c.body);
           {
-            filler: { ..o.filler, scope: o.filler.scope.take(mark) },
+            filler: o.filler,
             xs: acc.xs.push({
               eff: c.eff,
               op: c.op,
@@ -690,16 +575,8 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
       let ret: { filler: Filler, expr: Option<ReturnClause> } = match h.ret {
         None -> { filler: clauses.filler, expr: None },
         Some(rc) -> {
-          let mark = clauses.filler.scope.len();
-          let o: Filled = fill_expr(
-            f,
-            { ..clauses.filler, scope: clauses.filler.scope.concat(names).push(rc.binder.name) },
-            rc.body,
-          );
-          {
-            filler: { ..o.filler, scope: o.filler.scope.take(mark) },
-            expr: Some({ binder: rc.binder, body: o.expr, span: rc.span }),
-          }
+          let o: Filled = fill_expr(f, clauses.filler, rc.body);
+          { filler: o.filler, expr: Some({ binder: rc.binder, body: o.expr, span: rc.span }) }
         },
       };
       {
@@ -716,14 +593,9 @@ fn fill_children(f: Filling, filler: Filler, expr: Expr) -> Filled / {abort.rais
     EWithHold(c) -> {
       let acquire: Filled = fill_expr(f, filler, c.acquire);
       let release: Filled = fill_expr(f, acquire.filler, c.release);
-      let mark = release.filler.scope.len();
-      let o: Filled = fill_expr(
-        f,
-        { ..release.filler, scope: release.filler.scope.push(c.binder.name) },
-        c.body,
-      );
+      let o: Filled = fill_expr(f, release.filler, c.body);
       {
-        filler: { ..o.filler, scope: o.filler.scope.take(mark) },
+        filler: o.filler,
         expr: EWithHold({ ..c, acquire: acquire.expr, release: release.expr, body: o.expr }),
       }
     },
@@ -768,7 +640,7 @@ fn signature_of(f: Filling, filler: Filler, func: Expr) -> Option<Parameters> / 
   match func {
     EVar(v) ->      // Constructors carry no defaults; a local binder shadows everything, making this a call through a value.
       if is_bare(v.name) && starts_upper(v.name.name.name) { None }
-      else if is_bare(v.name) && filler.scope.contains(v.name.name.name) { None } else {
+      else if is_bare(v.name) && filler.binders.contains(v.name.name.span.site) { None } else {
         match find(f.r, filler.module, ValueSpace, v.name) {
           Some(b) -> f.index.get(b.qualified),
           None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
@@ -784,7 +656,7 @@ type Call = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr>, l
 fn performed(filler: Filler, call: Call, on: Expr, op: Ident) -> Option<Filled> =
   match on {
     EVar(v) -> if call.named.len() == 0
-        || (is_bare(v.name) && filler.scope.contains(v.name.name.name)) { None } else {
+        || (is_bare(v.name) && filler.binders.contains(v.name.name.span.site)) { None } else {
       let written = match v.name.module {
         Some(m) -> Bytes::concat_all([m.name, b"::", v.name.name.name]),
         None -> v.name.name.name,
@@ -956,35 +828,12 @@ fn fill_item(
 ) -> { filler: Filler, it: Item } / {abort.raise} =
   match item {
     IFn(d) -> {
-      let mark = filler.scope.len();
-      let inner = {
-        ..filler,
-        scope: d.params.fold(filler.scope, |acc: List<Bytes>, param: Param|
-          acc.push(param.name.name)),
-      };
       // A default is not walked here: it was qualified against this module in `collect`.
-      // A `cost` clause also reads the parameters' cost names, and a `space` clause their space names.
-      let costed = d.params.fold(inner.scope, |acc: List<Bytes>, param: Param|
-        match param.cost { Some(k) -> acc.push(k.name), None -> acc });
-      let spaced = d.params.fold(inner.scope, |acc: List<Bytes>, param: Param|
-        match param.space { Some(s) -> acc.push(s.name), None -> acc });
       let spec: { filler: Filler, xs: List<SpecClause> } = d.spec.fold(
-        { filler: inner, xs: [] },
+        { filler: filler, xs: [] },
         |acc: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
-          let o = fill_expr(
-            f,
-            {
-              ..acc.filler,
-              scope: if clause.kind == SCost { costed }
-              else if clause.kind == SSpace { spaced }
-              else { inner.scope },
-            },
-            clause.expr,
-          );
-          {
-            filler: { ..o.filler, scope: inner.scope },
-            xs: acc.xs.push({ kind: clause.kind, expr: o.expr, span: clause.span }),
-          }
+          let o = fill_expr(f, acc.filler, clause.expr);
+          { filler: o.filler, xs: acc.xs.push({ ..clause, expr: o.expr }) }
         },
       );
       let measured: { filler: Filler, expr: Option<Expr> } = match d.decreases {
@@ -996,7 +845,7 @@ fn fill_item(
       };
       let body: Filled = fill_expr(f, measured.filler, d.body);
       {
-        filler: { ..body.filler, scope: body.filler.scope.take(mark) },
+        filler: body.filler,
         it: IFn({
           vis: d.vis,
           name: d.name,
@@ -1022,15 +871,12 @@ fn fill_item(
         let o: Filled = fill_expr(f, filler, d.body);
         { filler: o.filler, it: ITest({ ..d, body: o.expr }) }
       },
-      // The case's name is in scope in the label and the body, never in the table.
       Some(c) -> {
-        let mark = filler.scope.len();
         let table: Filled = fill_expr(f, filler, c.table);
-        let inner = { ..table.filler, scope: table.filler.scope.push(c.binder.name) };
-        let label: Filled = fill_expr(f, inner, c.label);
+        let label: Filled = fill_expr(f, table.filler, c.label);
         let body: Filled = fill_expr(f, label.filler, d.body);
         {
-          filler: { ..body.filler, scope: body.filler.scope.take(mark) },
+          filler: body.filler,
           it: ITest({
             ..d,
             cases: Some({ ..c, table: table.expr, label: label.expr }),
@@ -1040,24 +886,15 @@ fn fill_item(
       },
     },
     ILaw(d) -> {
-      let mark = filler.scope.len();
-      let inner = {
-        ..filler,
-        scope: d.binders.fold(filler.scope, |acc: List<Bytes>, binder: Binder|
-          acc.push(binder.name.name)),
-      };
       let g = match d.guard {
-        None -> { filler: inner, expr: None },
+        None -> { filler: filler, expr: None },
         Some(x) -> {
-          let o: Filled = fill_expr(f, inner, x);
+          let o: Filled = fill_expr(f, filler, x);
           { filler: o.filler, expr: Some(o.expr) }
         },
       };
       let body: Filled = fill_expr(f, g.filler, d.body);
-      {
-        filler: { ..body.filler, scope: body.filler.scope.take(mark) },
-        it: ILaw({ ..d, guard: g.expr, body: body.expr }),
-      }
+      { filler: body.filler, it: ILaw({ ..d, guard: g.expr, body: body.expr }) }
     },
     _ -> { filler: filler, it: item },
   }
@@ -1090,9 +927,9 @@ pub fn expand(
     |acc: Expanded, m: Int| {
       let mod: ParsedModule = mods.get(m);
       let items: { filler: Filler, xs: List<Item> } = mod.module.items.fold(
-        { filler: { module: m, scope: [], implicit: [], diags: acc.diags }, xs: [] },
+        { filler: { module: m, binders: Map::new(), implicit: [], diags: acc.diags }, xs: [] },
         |ia: { filler: Filler, xs: List<Item> }, item: Item| {
-          let o = fill_item(f, ia.filler, item);
+          let o = fill_item(f, { ..ia.filler, binders: item_binders(f.r, m, item) }, item);
           { filler: o.filler, xs: ia.xs.push(o.it) }
         },
       );
@@ -1150,14 +987,3 @@ pub fn seeing_all(r: Resolved) -> Resolved =
   { ..r, sees: r.scopes.map(|_: Scope| range(0, r.scopes.len())) }
 
 // --- Tests ------------------------------------------------------------------
-
-test "a default is a value, and may not name a parameter of its own signature" {
-  let src = b"fn f(a: Int = 1, b: Int = g(1), c: Int = a) -> Int = 0";
-  let m = parse(src).node;
-  let f = match m.items.get(0) { IFn(d) -> d, _ -> panic("a fn") };
-  let names = f.params.map(|param: Param| param.name.name);
-  let d = |i: Int| match f.params.get(i).default { Some(x) -> x, None -> panic("a default") };
-  assert(is_default_expr(d(0)));
-  assert(!is_default_expr(d(1)));
-  assert_eq(mentions(d(2), names, [], []), [b"a"])
-}
