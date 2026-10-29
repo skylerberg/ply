@@ -234,26 +234,23 @@ fn answer_read(
     },
   }
 
-/// A call of the function value `c.f` on `c.args`: through the entry its descriptor holds at its
-/// function type's convention, which takes the closure; a continuation's, which has none, through
-/// its uniform entry, which borrows it, each argument and the answer a word.
+/// A call of the function value `c.f` on `c.args`: through the entry by its function type's
+/// convention, which takes the closure, named where the closure is known to be one of the root's
+/// and otherwise read off its descriptor; a continuation's, which has none, through its uniform
+/// entry, which borrows it, each argument and the answer a word.
 pub fn applied(
   p: Place,
   pr: Printing,
   into: Option<Var>,
-  c: { f: Arg, args: List<Arg>, conv: Convention, stops: Bool },
+  c: { f: Arg, args: List<Arg>, conv: Convention, stops: Bool, closure: Option<Int> },
 ) -> Printing / {abort.raise} = {
   let f = arg_text(pr, c.f);
   if applied_typed(c.f) {
-    invoked(
-      p,
-      pr,
-      into,
-      { callee: [Text(typed_callee(f, c.conv))], first: [f] },
-      c.args,
-      c.conv,
-      |q: Printing| q,
-    )
+    let entry = match c.closure {
+      Some(n) -> typed_symbol(lambda_symbol(p.u.symbol, n)),
+      None -> typed_callee(f, c.conv),
+    };
+    invoked(p, pr, into, { callee: [Text(entry)], first: [f] }, c.args, c.conv, |q: Printing| q)
   } else {
     let names = c.args.map(|a: Arg| arg_text(pr, a));
     let arr = temp(pr);
@@ -727,12 +724,8 @@ pub fn lambda_text(
   match l {
     Closure(c) -> {
       let name = lambda_symbol(symbol_of(root_text(root_name(root.key))), nth);
-      // The function's own parameters, as the closure's type takes them past its captures, and
-      // then its words; and as a call by the closure's type hands them, the row's descriptor and
-      // its words in place of the words.
-      let own = { ..c.body.conv, params: c.body.conv.params.drop(c.captures) };
-      let carried = words_carried(c.words.count);
-      let plain = { ..own, params: own.params.take(own.params.len() - carried) };
+      let own = own_convention(l);
+      let plain = plain_convention(l);
       let typed = typed_convention(plain);
       let answer = own.answer;
       // Each capture laid in the block past the descriptor as the body holds it.
@@ -766,6 +759,7 @@ pub fn lambda_text(
         out: [
           Text(
             Bytes::concat_all([
+              b"static ",
               c_type(answer),
               b" ",
               name,
@@ -809,6 +803,41 @@ pub fn lambda_text(
       }
     },
   }
+
+/// How closure `l`'s function takes its own parameters, past its captures, and answers.
+fn own_convention(l: Lambda) -> Convention =
+  match l { Closure(c) -> { ..c.body.conv, params: c.body.conv.params.drop(c.captures) } }
+
+/// How a call by closure `l`'s type hands its function its own parameters: as `own_convention`
+/// says, but for the words, in whose place it hands the row's descriptor and its words.
+fn plain_convention(l: Lambda) -> Convention =
+  match l {
+    Closure(c) -> {
+      let own = own_convention(l);
+      { ..own, params: own.params.take(own.params.len() - words_carried(c.words.count)) }
+    },
+  }
+
+/// The C name of the entry by its type of the closure function `name`.
+fn typed_symbol(name: Bytes) -> Bytes = name.concat(b"_typed")
+
+/// The head of the entry by its type of closure function `name`, whose function takes its own
+/// parameters as `plain` says.
+fn typed_head(name: Bytes, plain: Convention) -> Bytes =
+  Bytes::concat_all([
+    b"static ",
+    c_type(plain.answer),
+    b" ",
+    typed_symbol(name),
+    b"(PlyCtx *ctx, Word self",
+    Bytes::concat_all(head_params(typed_convention(plain)).map(|h: Bytes| b", ".concat(h))),
+    b")",
+  ])
+
+/// The declaration of the entry by its type of closure `nth` of the root named `symbol`, which a
+/// call the root makes of a closure it knows enters before the entry is written.
+pub fn typed_declared(symbol: Bytes, nth: Int, l: Lambda) -> Bytes =
+  typed_head(lambda_symbol(symbol, nth), plain_convention(l)).concat(b";\n")
 
 /// The entry the runtime calls a closure of function `name` through, words in and out: the closure
 /// counted once more and handed with each argument, opened as `e` holds it, to the typed entry its
@@ -887,7 +916,6 @@ fn typed_entry(
   plain: Convention,
   words: ClosureWords,
 ) -> List<Piece> / {abort.raise} = {
-  let typed = typed_convention(plain);
   let k = plain.params.len();
   let desc = b"p".concat(ascii_of_int(k));
   let array = b"p".concat(ascii_of_int(k + 1));
@@ -923,21 +951,7 @@ fn typed_entry(
   let passed = if n == 0 { [] } else if n <= words_apart() {
     range(0, n).map(|i: Int| Bytes::concat_all([b"w[", ascii_of_int(i), b"]"]))
   } else { [b"(Word)(intptr_t)w"] };
-  [
-    Text(
-      Bytes::concat_all([
-        b"static ",
-        c_type(plain.answer),
-        b" ",
-        name,
-        b"_typed(PlyCtx *ctx, Word self",
-        Bytes::concat_all(head_params(typed).map(|h: Bytes| b", ".concat(h))),
-        b") {\n",
-      ]),
-    ),
-  ].concat(
-    taken.out,
-  ).push(
+  [Text(typed_head(name, plain).concat(b" {\n"))].concat(taken.out).push(
     Text(
       Bytes::concat_all([
         mapped,
@@ -1120,7 +1134,7 @@ fn descriptor(
     Bytes::join(
       [
         entries.uniform,
-        Bytes::concat_all([b"(void (*)(void))", name, b"_typed"]),
+        b"(void (*)(void))".concat(typed_symbol(name)),
         convention_id(own, answer),
         entries.release,
         entries.share,
@@ -1596,24 +1610,33 @@ test "a call lays a record wider than a call's registers in a buffer it hands, a
 
 fn int() -> Type = int_type()
 
-test "a function value is called through its descriptor's entry at its type's convention, and a continuation through its uniform entry" {
+test "a function value is called through its descriptor's entry at its type's convention, a closure of the root's by that entry's name, and a continuation through its uniform entry" {
   let names = printing(Map::new().insert(0, b"f").insert(1, b"x"));
   let fty = TyFn({ kept: [], once: false, params: [int()], ret: int(), effects: row_empty() });
-  let typed = applied(place(), names, Some({ id: 2, ty: int(), rep: RInt }), {
-    f: AVar({ id: 0, ty: fty, rep: RWord }),
-    args: [AVar({ id: 1, ty: int(), rep: RInt })],
-    conv: {
-      params: [{ handed: Given, rep: RInt }],
-      answer: RInt,
-      destined: false,
-      answered: Owned,
-    },
-    stops: false,
-  });
+  let typed = |closure: Option<Int>|
+    spelled(
+      applied(place(), names, Some({ id: 2, ty: int(), rep: RInt }), {
+        f: AVar({ id: 0, ty: fty, rep: RWord }),
+        args: [AVar({ id: 1, ty: int(), rep: RInt })],
+        conv: {
+          params: [{ handed: Given, rep: RInt }],
+          answer: RInt,
+          destined: false,
+          answered: Owned,
+        },
+        stops: false,
+        closure: closure,
+      }).out,
+    );
   // The typed entry, cast to the function type's convention, takes the closure and the argument.
-  let t = spelled(typed.out);
+  let t = typed(None);
   assert(t.index_of(b"(int64_t (*)(PlyCtx *, Word, int64_t))") != None);
   assert(t.index_of(b"->typed)(ctx, f, x)") != None);
+  // A closure known to be the root's third is entered by name, never through its descriptor.
+  let known = typed(Some(3));
+  assert(
+    known.index_of(b"f_lambda3_typed(ctx, f, x)") != None && known.index_of(b"->typed") == None,
+  );
   let resumed = applied(place(), names, Some({ id: 2, ty: int(), rep: RWord }), {
     f: AVar({ id: 0, ty: resumption(int()), rep: RWord }),
     args: [AVar({ id: 1, ty: int(), rep: RWord })],
@@ -1624,6 +1647,7 @@ test "a function value is called through its descriptor's entry at its type's co
       answered: Owned,
     },
     stops: true,
+    closure: None,
   });
   // A continuation is called as the runtime calls a function value: its uniform entry, its arguments
   // an array of words.
@@ -1748,8 +1772,20 @@ test "a closure's entries hand over its captures out of its block, its release l
   );
   let name = symbol_of(b"m.outer").concat(b"_lambda0");
   let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  // The body takes its captures as words, then its own parameters.
-  has(Bytes::concat_all([name, b"(PlyCtx *ctx, Word q0, Word q1, int64_t p0)"]));
+  // The body, which only its own root's file names, takes its captures as words, then its own
+  // parameters.
+  has(
+    Bytes::concat_all([b"static int64_t ", name, b"(PlyCtx *ctx, Word q0, Word q1, int64_t p0)"]),
+  );
+  // A call of the closure its root knows enters the typed entry declared before the root.
+  assert_eq(
+    typed_declared(symbol_of(b"m.outer"), 0, l),
+    Bytes::concat_all([
+      b"static int64_t ",
+      name,
+      b"_typed(PlyCtx *ctx, Word self, int64_t p0, Word p1, Word p2);\n",
+    ]),
+  );
   // Its entries hand it the captures: the typed one, which takes the closure, moves them out of a
   // block held only there and gives the block back; otherwise each is counted once more, the
   // continuation through its descriptor.

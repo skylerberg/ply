@@ -7,7 +7,8 @@ import compiler.check.infer.names (simple_name_of)
 import compiler.emit.code (Code, NVar, NDef, NCtor, NBuiltin, NKnown, NLambda, NApp, NUnary,
                            NBinary, NField, NIf, NBlock, NList, NRecord, NUpdate, NMatch, NPerform,
                            NSimulate, NParallel, NHandle, Lambda, Capture, CodeStmt, CLet, CLetPat,
-                           CDo, CodeField, CodeArm, CodeClause, PxList, PxVar, labels_among)
+                           CDo, CodeField, CodeArm, CodeClause, PxList, PxVar, KnownRead,
+                           labels_among, code_parts)
 import compiler.check.types (Type, TyFn, TyVar, TyCon, Scheme, Row, Atom, RVar, int_type, bool_type,
                              option_type, run_needs, row_empty)
 import compiler.emit.typing (unknown_type)
@@ -307,16 +308,14 @@ fn hands_back(cx: Context, c: Code, i: Int, r: Int) -> Bool / {abort.raise} =
   }
 
 /// What the call of `func` on `args` calls: a lambda known to the slot it reads, run in place where
-/// this frame was handed it, and otherwise its closure called as a function value, as a closure the
-/// root writes calls a lambda the root was lent; a function value; a constructor; a walk over a list
-/// run in place; a definition; a step `iterate` runs in place of each of its passes; or a builtin,
-/// an import's extern by its own name.
+/// it runs in place and this frame was handed it, and otherwise its closure called as a function
+/// value, as a closure the root writes calls a lambda the root was lent; a function value; a
+/// constructor; a walk over a list run in place; a definition; a step `iterate` runs in place of
+/// each of its passes; or a builtin, an import's extern by its own name.
 pub fn target(cx: Context, func: Code, args: List<Code>) -> Option<Target> / {abort.raise} =
   match func.node {
-    NKnown(k) -> match frame_of(cx, k.owner, k.nth) {
-      None -> Some(ToValue),
-      Some(_) -> Some(ToInPlace(Known)),
-    },
+    NKnown(k) -> if !k.in_place || frame_of(cx, k.owner, k.nth) == None { Some(ToValue) }
+    else { Some(ToInPlace(Known)) },
     NVar(_) -> Some(ToValue),
     NCtor(c) -> Some(ToCtor(c.name)),
     NDef(f) -> match defined(cx, f.full) {
@@ -364,14 +363,30 @@ pub fn range_ends(cx: Context, c: Code) -> Option<List<Code>> / {abort.raise} =
 
 /// What `d` does with each item where it is one of the prelude's walks, which a call runs in place
 /// or hands a function value, never lending it a lambda.
-fn walking_by(d: Def) -> Option<Walking> = {
-  let by = if d.name == b"List::fold" { Some(Folding) }
-  else if d.name == b"List::map" { Some(Mapping) }
-  else if d.name == b"List::filter" { Some(Filtering) }
-  else if d.name == b"Map::fold" { Some(EntryFolding) }
-  else { None };
-  if by != None && d.root == Named(prelude_named(d.name)) { by } else { None }
-}
+fn walking_by(d: Def) -> Option<Walking> =
+  if d.root != Named(prelude_named(d.name)) { None } else {
+    match prelude_walks().find(|w: { name: Bytes, by: Walking }| w.name == d.name) {
+      Some(w) -> Some(w.by),
+      None -> None,
+    }
+  }
+
+/// The prelude's walks, by name, and what each does with each item.
+fn prelude_walks() -> List<{ name: Bytes, by: Walking }> =
+  [
+    { name: b"List::fold", by: Folding },
+    { name: b"List::map", by: Mapping },
+    { name: b"List::filter", by: Filtering },
+    { name: b"Map::fold", by: EntryFolding },
+  ]
+
+/// Whether `func` reads one of the prelude's walks.
+fn reads_walk(func: Code) -> Bool =
+  match func.node {
+    NDef(f) ->
+      prelude_walks().any(|w: { name: Bytes, by: Walking }| prelude_named(w.name) == f.full),
+    _ -> false,
+  }
 
 fn prelude_named(name: Bytes) -> Bytes = qualify(prelude_module(), name)
 
@@ -541,12 +556,7 @@ pub fn resumption_closed(
 
 /// A read of a slot known to hold the closure of a lambda its owner wrote: the closure itself, read
 /// as `read_taken` reads a slot.
-pub fn known(
-  cx: Context,
-  st: Lowering,
-  k: { name: Bytes, slot: Int, lambda: Lambda, owner: Bytes, nth: Int },
-  at: Span,
-) -> Lowered / {abort.raise} =
+pub fn known(cx: Context, st: Lowering, k: KnownRead, at: Span) -> Lowered / {abort.raise} =
   match st.env.get(k.slot) {
     Some(a) ->
       read_taken(
@@ -624,6 +634,7 @@ pub fn applied(
           // A function value's type may carry no row of what calling it performs: a lambda's and a
           // definition read as a value are filed with none.
           stops: true,
+          closure: match f { AVar(v) -> st.closures.get(v.id), _ -> None },
         }),
         at,
       )
@@ -658,6 +669,7 @@ pub fn applied(
           args: h.args,
           conv: { params: all_given(words), answer: RWord, destined: false, answered: tir::Owned },
           stops: true,
+          closure: None,
         }),
         at,
       );
@@ -820,7 +832,8 @@ fn walk_entered(
     _ -> read.args,
   };
   let o = match f.node {
-    NKnown(_) -> known_entered(cx, read.st, f, params.map(Some), at),
+    NKnown(k) -> if k.in_place { known_entered(cx, read.st, f, params.map(Some), at) }
+    else { lambda_entered(cx, read.st, called_frame(k), params, at) },
     NLambda(l) -> lambda_entered(cx, read.st, l, params, at),
     _ -> lambda_entered(cx, read.st, named_lambda(f, params.len()), params, at),
   };
@@ -1039,7 +1052,7 @@ fn in_frame(
   cx: Context,
   st: Lowering,
   f: Option<Var>,
-  k: { name: Bytes, slot: Int, lambda: Lambda, owner: Bytes, nth: Int },
+  k: KnownRead,
   lowered: List<Option<Arg>>,
   lender: Option<BoundLambda>,
   at: Span,
@@ -1858,10 +1871,21 @@ pub fn lambda_opened(cx: Context, st: Lowering, frame: Frame, at: Span) -> Opene
       words: no_closure_words(),
     }),
   ).st;
+  // A capture of a closure the root makes is known to be that closure inside the body too.
   let caps = zip(frame.captures, s.captured).fold(
     nested(reserved, shape_params(s), Map::new()),
     |acc: Lowering, p: { first: Capture, second: Var }|
-      { ..acc, env: acc.env.insert(p.first.dst, AVar(p.second)) },
+      {
+        ..acc,
+        env: acc.env.insert(p.first.dst, AVar(p.second)),
+        closures: match st.env.get(p.first.src) {
+          Some(AVar(outer)) -> match st.closures.get(outer.id) {
+            Some(n) -> acc.closures.insert(p.second.id, n),
+            None -> acc.closures,
+          },
+          _ -> acc.closures,
+        },
+      },
   );
   let given = {
     ..caps,
@@ -1993,7 +2017,7 @@ pub fn closure(
         None -> unreachable(b"a capture nothing bound"),
       },
   );
-  bound_as(
+  let made = bound_as(
     function_laid(captures_released(caps.st, laid), s.ty),
     s.ty,
     RWord,
@@ -2007,7 +2031,11 @@ pub fn closure(
       reuse: None,
     }),
     at,
-  )
+  );
+  match made.arg {
+    AVar(v) -> { ..made, st: { ..made.st, closures: made.st.closures.insert(v.id, nth) } },
+    _ -> made,
+  }
 }
 
 /// The state each member of a tail group is lowered in.
@@ -2151,21 +2179,50 @@ fn member_params(members: List<GroupMember>) -> List<List<Var>> / {abort.raise} 
   ).out
 
 /// A root's body as it is lowered: each read of a slot `let` binds to a lambda, and each of its
-/// parameters a specialisation was handed a lambda for, written as the lambda it is known to be, so
-/// a call of it runs the lambda in place. A lambda holding a `handle` stays a closure.
-pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code =
+/// parameters a specialisation was handed a lambda for, written as the lambda it is known to be. A
+/// call of one runs the lambda in place where it is the only call that would, and otherwise calls
+/// its closure, so no function holds a lambda's body twice. A lambda holding a `handle` stays a
+/// closure.
+pub fn known_body(full: Bytes, params: List<EmitParam>, body: Code) -> Code = {
+  let slots = range(0, params.len()).fold([], |acc: List<KnownSlot>, i: Int|
+    match match params.at(i) { Some(p) -> p.lambda, None -> None } {
+      Some(bl) -> if has_handle(bl.code.body) { acc } else {
+        acc.push({ slot: i, owner: root_text(root_name(bl.owner)), nth: bl.nth, code: bl.code })
+      },
+      None -> acc,
+    });
+  let own = lambdas_of(body);
+  let sites = in_place_sites(known_values(body, slots, full, own, []));
   known_values(
     body,
-    range(0, params.len()).fold([], |acc: List<KnownSlot>, i: Int|
-      match match params.at(i) { Some(p) -> p.lambda, None -> None } {
-        Some(bl) -> if has_handle(bl.code.body) { acc } else {
-          acc.push({ slot: i, owner: root_text(root_name(bl.owner)), nth: bl.nth, code: bl.code })
-        },
-        None -> acc,
-      }),
+    slots,
     full,
-    lambdas_of(body),
+    own,
+    sites.filter(|s: KnownLambda| sites.filter(|t: KnownLambda| t == s).len() > 1),
   )
+}
+
+/// A known lambda, by its owner and its place among the owner's lambdas.
+type KnownLambda = { owner: Bytes, nth: Int }
+
+/// Each known lambda a call in `c` would run in place, once per such call: one called, and one a
+/// prelude walk is handed. A read of a known lambda holds its body again, which is not read here:
+/// the calls in it count where the lambda is written.
+fn in_place_sites(c: Code) -> List<KnownLambda> = {
+  let known = |x: Code| match x.node { NKnown(k) -> [{ owner: k.owner, nth: k.nth }], _ -> [] };
+  match c.node {
+    NKnown(_) -> [],
+    _ -> {
+      let here = match c.node {
+        NApp(a) ->
+          known(a.func).concat(if !reads_walk(a.func) { [] }
+          else { match a.args.at(a.args.len() - 1) { Some(x) -> known(x), None -> [] } }),
+        _ -> [],
+      };
+      code_parts(c).fold(here, |acc: List<KnownLambda>, x: Code| acc.concat(in_place_sites(x)))
+    },
+  }
+}
 
 /// A definition the root names: its full name and how the emitter reads it.
 pub type Defined = { full: Bytes, def: Def }
@@ -3087,6 +3144,26 @@ fn named_lambda(c: Code, n: Int) -> Lambda = {
   }
 }
 
+/// The frame a walk's pass calls the closure of the known lambda `k` in, where `k` runs by a call:
+/// the lambda's parameters, then the closure, captured past them.
+fn called_frame(k: KnownRead) -> Lambda =
+  { ..k.lambda, size: k.lambda.params + 1, captures: [{ src: k.slot, dst: k.lambda.params }] }
+
+/// What the known lambda `k` answers where a walk run in place runs it by a call: its closure,
+/// which the pass's frame (`called_frame`) captured, called on the parameters the frame holds.
+pub fn known_run(cx: Context, st: Lowering, k: KnownRead, at: Span) -> Lowered / {abort.raise} = {
+  let f = known(cx, st, { ..k, slot: k.lambda.params }, at);
+  let read = range(0, k.lambda.params).fold(
+    { st: f.st, args: [] },
+    |acc: { st: Lowering, args: List<Arg> }, j: Int|
+      match acc.st.env.get(j) {
+        Some(x) -> { st: read_noted(cx, acc.st, read_note(), j, at), args: acc.args.push(x) },
+        None -> acc,
+      },
+  );
+  applied(cx, read.st, f.arg, read.args, k.lambda.row, false, at)
+}
+
 /// Each definition `c` hands a definition as a value, as `named_lambda` reads it, in one fixed order,
 /// names read in `module`, which defines `here` and imports `imports`.
 pub fn named_in(
@@ -3240,11 +3317,17 @@ pub fn holds_handle(c: Code, counted: (List<CodeClause>) -> Bool) -> Bool = {
 type KnownSlot = { slot: Int, owner: Bytes, nth: Int, code: Lambda }
 
 /// `c`, code of the root `owner`, with each read of a slot `bound` names written as the lambda it is
-/// known to be, through lambdas that capture the slot. A slot a `let` binds to a lambda, or to such
-/// a read, is known for the rest of its block. `own` is the root's lambdas before any is rewritten,
-/// which is what numbers them.
-fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>) -> Code = {
-  let go = |x: Code| known_values(x, bound, owner, own);
+/// known to be, through lambdas that capture the slot, a call of it run in place but for the
+/// lambdas `again` holds. A slot a `let` binds to a lambda, or to such a read, is known for the rest
+/// of its block. `own` is the root's lambdas before any is rewritten, which is what numbers them.
+fn known_values(
+  c: Code,
+  bound: List<KnownSlot>,
+  owner: Bytes,
+  own: List<Lambda>,
+  again: List<KnownLambda>,
+) -> Code = {
+  let go = |x: Code| known_values(x, bound, owner, own, again);
   let known = |slot: Int|
     bound.fold(None, |found: Option<KnownSlot>, k: KnownSlot|
       if k.slot == slot { Some(k) } else { found });
@@ -3254,7 +3337,15 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
   let maybe = |x: Option<Code>| match x { Some(y) -> Some(go(y)), None -> None };
   let node = match c.node {
     NVar(v) -> match known(v.slot) {
-      Some(k) -> NKnown({ name: v.name, slot: k.slot, lambda: k.code, owner: k.owner, nth: k.nth }),
+      Some(k) ->
+        NKnown({
+          name: v.name,
+          slot: k.slot,
+          lambda: k.code,
+          owner: k.owner,
+          nth: k.nth,
+          in_place: !again.contains({ owner: k.owner, nth: k.nth }),
+        }),
       None -> c.node,
     },
     NApp(a) -> NApp({ ..a, func: go(a.func), args: a.args.map(go) }),
@@ -3268,7 +3359,7 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
         |acc: { bound: List<KnownSlot>, stmts: List<CodeStmt> }, stmt: CodeStmt|
           match stmt {
             CLet(l) -> {
-              let value = known_values(l.value, acc.bound, owner, own);
+              let value = known_values(l.value, acc.bound, owner, own, again);
               let rest = acc.bound.filter(|k: KnownSlot| k.slot != l.slot);
               {
                 bound: match value.node {
@@ -3291,20 +3382,22 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
               {
                 bound: acc.bound,
                 stmts: acc.stmts.push(
-                  CLetPat({ ..l, value: known_values(l.value, acc.bound, owner, own) }),
+                  CLetPat({ ..l, value: known_values(l.value, acc.bound, owner, own, again) }),
                 ),
               },
             CDo(d) ->
               {
                 bound: acc.bound,
-                stmts: acc.stmts.push(CDo({ code: known_values(d.code, acc.bound, owner, own) })),
+                stmts: acc.stmts.push(
+                  CDo({ code: known_values(d.code, acc.bound, owner, own, again) }),
+                ),
               },
           },
       );
       NBlock({
         stmts: walked.stmts,
         tail: match b.tail {
-          Some(t) -> Some(known_values(t, walked.bound, owner, own)),
+          Some(t) -> Some(known_values(t, walked.bound, owner, own, again)),
           None -> None,
         },
       })
@@ -3317,8 +3410,10 @@ fn known_values(c: Code, bound: List<KnownSlot>, owner: Bytes, own: List<Lambda>
         arms: m.arms.map(|a: CodeArm| { ..a, guard: maybe(a.guard), body: go(a.body) }),
       }),
     NPerform(x) -> NPerform({ ..x, label: maybe(x.label), args: x.args.map(go) }),
-    NLambda(l) -> NLambda({ ..l, body: known_values(l.body, inside(l.captures), owner, own) }),
-    NSimulate(x) -> NSimulate({ ..x, body: known_values(x.body, inside(x.captures), owner, own) }),
+    NLambda(l) ->
+      NLambda({ ..l, body: known_values(l.body, inside(l.captures), owner, own, again) }),
+    NSimulate(x) ->
+      NSimulate({ ..x, body: known_values(x.body, inside(x.captures), owner, own, again) }),
     NParallel(pr) -> NParallel({ ..pr, branches: pr.branches.map(go) }),
     NField(f) -> NField({ ..f, base: go(f.base) }),
     NUpdate(u) ->
