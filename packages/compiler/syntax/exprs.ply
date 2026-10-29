@@ -23,8 +23,10 @@ import compiler.syntax.parsing (positional, Span, Ident, QName, Input, Parser, P
                                 role_tag_parse, role_tag_fill, role_tag_texts, role_tag_holes,
                                 role_case_block, role_case_table_let, role_case_table_binder,
                                 role_case_call, role_case_callee, role_case_table_read,
-                                role_case_label_lambda, role_case_label_param, role_case_let,
-                                role_case_binder, role_case_at_read, role_case_identity_read)
+                                role_case_label_lambda, role_case_callee_module,
+                                role_case_table_module, role_case_table_name, role_case_label_param,
+                                role_case_let, role_case_binder, role_case_at_read,
+                                role_case_identity_read)
 import compiler.syntax.lexer (TokenKind, Identifier, IntLiteral, FixedLiteral, WideLiteral,
                               FloatLiteral, DecimalLiteral, StringLiteral, LineString, BytesLiteral,
                               InterpolatedHead, InterpolatedMiddle, InterpolatedTail, CharLiteral,
@@ -94,324 +96,6 @@ pub type RecField = { name: Ident, value: Expr }
 pub type NamedArg = { name: Ident, value: Expr, span: Span }
 
 type Arg = | APos(Expr) | ANamed(NamedArg)
-
-/// Why a named argument fills nothing: it names no parameter, or one an argument before it filled.
-pub type Unplaced = | NoSuchParameter | FilledByPosition | GivenByName
-
-/// What a call passes a parameter: its positional argument or its named argument at a place, or
-/// the parameter's default.
-pub type Slot = | FromArg(Int) | FromName(Int) | FromDefault(Expr)
-
-/// A call's arguments put where its callee's parameters are: `slots` one per parameter in order
-/// where `missing` names none, the named arguments that fill nothing, and the parameters left
-/// with neither an argument nor a default.
-pub type Slotted = {
-  slots: List<Slot>,
-  unplaced: List<{ arg: NamedArg, why: Unplaced }>,
-  missing: List<Bytes>,
-}
-
-/// `args` and then `named` put where a callee's parameters are, `names` each parameter's name and
-/// `defaults` what a call that leaves it out passes. A default the call at `at` takes stands at a
-/// place of its own there (`placed_default`).
-pub fn slotted(
-  names: List<Bytes>,
-  defaults: List<Option<Expr>>,
-  args: List<Expr>,
-  named: List<NamedArg>,
-  at: Span,
-) -> Slotted = {
-  let index = |name: Bytes|
-    range(0, names.len()).fold(None, |found: Option<Int>, i: Int|
-      match found {
-        Some(_) -> found,
-        None -> if names.at(i) == Some(name) { Some(i) } else { None },
-      });
-  let placed = range(0, named.len()).fold(
-    { taken: [], unplaced: [] },
-    |acc: { taken: List<{ at: Int, from: Int }>, unplaced: List<{ arg: NamedArg, why: Unplaced }> }, j: Int|
-      match named.at(j) {
-        None -> acc,
-        Some(arg) -> {
-          let refused = |why: Unplaced|
-            { ..acc, unplaced: acc.unplaced.push({ arg: arg, why: why }) };
-          match index(arg.name.name) {
-            None -> refused(NoSuchParameter),
-            Some(i) -> if i < args.len() { refused(FilledByPosition) }
-            else if acc.taken.fold(false, |b: Bool, t: { at: Int, from: Int }| b || t.at == i) {
-              refused(GivenByName)
-            } else { { ..acc, taken: acc.taken.push({ at: i, from: j }) } },
-          }
-        },
-      },
-  );
-  range(0, names.len()).fold(
-    { slots: [], unplaced: placed.unplaced, missing: [] },
-    |acc: Slotted, i: Int| {
-      let by_name = placed.taken.fold(None, |found: Option<Int>, t: { at: Int, from: Int }|
-        if t.at == i { Some(t.from) } else { found });
-      if i < args.len() { { ..acc, slots: acc.slots.push(FromArg(i)) } } else {
-        match ((by_name, defaults.at(i))) {
-          (Some(j), _) -> { ..acc, slots: acc.slots.push(FromName(j)) },
-          (None, Some(Some(d))) ->
-            { ..acc, slots: acc.slots.push(FromDefault(placed_default(d, at, i))) },
-          _ ->
-            { ..acc, missing: acc.missing.push(match names.at(i) { Some(n) -> n, None -> b"" }) },
-        }
-      }
-    },
-  )
-}
-
-/// The arguments `slots` pass, out of a call's `args` and `named`.
-pub fn slot_args(slots: List<Slot>, args: List<Expr>, named: List<NamedArg>) -> List<Expr> =
-  slots.fold([], |acc: List<Expr>, slot: Slot|
-    match slot {
-      FromArg(i) -> match args.at(i) { Some(x) -> acc.push(x), None -> acc },
-      FromName(j) -> match named.at(j) { Some(n) -> acc.push(n.value), None -> acc },
-      FromDefault(d) -> acc.push(d),
-    })
-
-/// `copied`, the default the call at `at` takes for its parameter `slot`, with every place in it at
-/// `at`: what a check files of one call's copy is that call's own, and formatting the default moves
-/// none of it. Copied before its call's item is numbered, it is numbered with the item; after, each
-/// of its nodes is minted from the call, by the parameter and the node's place in a walk of it.
-fn placed_default(copied: Expr, at: Span, slot: Int) -> Expr =
-  placed_expr({ at: at, base: role_member_default(slot) }, copied, 0).e
-
-type Placing = { at: Span, base: Int }
-
-type PlacedExpr = { e: Expr, n: Int }
-
-type PlacedExprs = { es: List<Expr>, n: Int }
-
-type PlacedPat = { p: Pattern, n: Int }
-
-type PlacedPats = { ps: List<Pattern>, n: Int }
-
-fn place(pl: Placing, n: Int) -> Span =
-  if pl.at.site == 0 { pl.at } else { minted(pl.at, pl.base + n) }
-
-fn ident_placed(i: Ident, s: Span) -> Ident = { name: i.name, span: { ..s, site: 0 } }
-
-fn qname_placed(q: QName, s: Span) -> QName =
-  {
-    module: match q.module { Some(m) -> Some(ident_placed(m, s)), None -> None },
-    name: ident_placed(q.name, s),
-    span: s,
-  }
-
-/// `e` placed as `placed_default` places a default, its walk starting at `n`; how far it got.
-fn placed_expr(pl: Placing, e: Expr, n: Int) -> PlacedExpr = {
-  let s = place(pl, n);
-  let each = |xs: List<Expr>, from: Int|
-    xs.fold({ es: [], n: from }, |acc: PlacedExprs, x: Expr| {
-      let o: PlacedExpr = placed_expr(pl, x, acc.n);
-      { es: acc.es.push(o.e), n: o.n }
-    });
-  let fields = |fs: List<RecField>, from: Int|
-    fs.fold({ fs: [], n: from }, |acc: { fs: List<RecField>, n: Int }, f: RecField| {
-      let v: PlacedExpr = placed_expr(pl, f.value, acc.n + 1);
-      { fs: acc.fs.push({ name: ident_placed(f.name, place(pl, acc.n)), value: v.e }), n: v.n }
-    });
-  let maybe = |x: Option<Expr>, from: Int|
-    match x {
-      Some(y) -> {
-        let o: PlacedExpr = placed_expr(pl, y, from);
-        { e: Some(o.e), n: o.n }
-      },
-      None -> { e: None, n: from },
-    };
-  match e {
-    ELit(l) -> { e: ELit({ span: s, lit: l.lit }), n: n + 1 },
-    EVar(v) -> { e: EVar({ span: s, name: qname_placed(v.name, s) }), n: n + 1 },
-    EBinary(b) -> {
-      let l: PlacedExpr = placed_expr(pl, b.lhs, n + 1);
-      let r: PlacedExpr = placed_expr(pl, b.rhs, l.n);
-      { e: EBinary({ span: s, op: b.op, lhs: l.e, rhs: r.e }), n: r.n }
-    },
-    EUnary(u) -> {
-      let o: PlacedExpr = placed_expr(pl, u.operand, n + 1);
-      { e: EUnary({ span: s, op: u.op, operand: o.e }), n: o.n }
-    },
-    ELambda(l) -> {
-      let ps = l.params.fold({ ps: [], n: n + 1 }, |acc: { ps: List<Param>, n: Int }, q: Param| {
-        let at = place(pl, acc.n);
-        { ps: acc.ps.push({ ..q, name: ident_placed(q.name, at), span: at }), n: acc.n + 1 }
-      });
-      let body: PlacedExpr = placed_expr(pl, l.body, ps.n);
-      { e: ELambda({ span: s, body: body.e, params: ps.ps, ret: l.ret }), n: body.n }
-    },
-    EApp(a) -> {
-      let f: PlacedExpr = placed_expr(pl, a.func, n + 1);
-      let xs: PlacedExprs = each(a.args, f.n);
-      let ns = a.named.fold(
-        { ns: [], n: xs.n },
-        |acc: { ns: List<NamedArg>, n: Int }, arg: NamedArg| {
-          let o: PlacedExpr = placed_expr(pl, arg.value, acc.n);
-          { ns: acc.ns.push({ name: ident_placed(arg.name, s), value: o.e, span: s }), n: o.n }
-        },
-      );
-      {
-        e: EApp({
-          span: s,
-          func: f.e,
-          named: ns.ns,
-          args: xs.es,
-          labels: a.labels.map(|i: Ident| ident_placed(i, s)),
-        }),
-        n: ns.n,
-      }
-    },
-    EIf(i) -> {
-      let c: PlacedExpr = placed_expr(pl, i.cond, n + 1);
-      let t: PlacedExpr = placed_expr(pl, i.then_branch, c.n);
-      let el: PlacedExpr = placed_expr(pl, i.else_branch, t.n);
-      { e: EIf({ span: s, cond: c.e, then_branch: t.e, else_branch: el.e }), n: el.n }
-    },
-    EMatch(m) -> {
-      let sc: PlacedExpr = placed_expr(pl, m.scrutinee, n + 1);
-      let arms = m.arms.fold(
-        { arms: [], n: sc.n },
-        |acc: { arms: List<MatchArm>, n: Int }, arm: MatchArm| {
-          let pt: PlacedPat = placed_pat(pl, arm.pat, acc.n + 1);
-          let g: { e: Option<Expr>, n: Int } = maybe(arm.guard, pt.n);
-          let b: PlacedExpr = placed_expr(pl, arm.body, g.n);
-          {
-            arms: acc.arms.push({ pat: pt.p, guard: g.e, body: b.e, span: place(pl, acc.n) }),
-            n: b.n,
-          }
-        },
-      );
-      { e: EMatch({ span: s, scrutinee: sc.e, arms: arms.arms }), n: arms.n }
-    },
-    EBlock(b) -> {
-      let st = b.stmts.fold(
-        { stmts: [], n: n + 1 },
-        |acc: { stmts: List<Stmt>, n: Int }, stmt: Stmt|
-          match stmt {
-            SLet(l) -> {
-              let pt: PlacedPat = placed_pat(pl, l.pat, acc.n + 1);
-              let v: PlacedExpr = placed_expr(pl, l.value, pt.n);
-              {
-                stmts: acc.stmts.push(
-                  SLet({ span: place(pl, acc.n), pat: pt.p, ty: l.ty, value: v.e }),
-                ),
-                n: v.n,
-              }
-            },
-            SLetElse(l) -> {
-              let pt: PlacedPat = placed_pat(pl, l.pat, acc.n + 1);
-              let v: PlacedExpr = placed_expr(pl, l.value, pt.n);
-              let fb: PlacedExpr = placed_expr(pl, l.fallback, v.n);
-              {
-                stmts: acc.stmts.push(
-                  SLetElse({
-                    span: place(pl, acc.n),
-                    pat: pt.p,
-                    ty: l.ty,
-                    value: v.e,
-                    fallback: fb.e,
-                  }),
-                ),
-                n: fb.n,
-              }
-            },
-            SExpr(x) -> {
-              let o: PlacedExpr = placed_expr(pl, x, acc.n);
-              { stmts: acc.stmts.push(SExpr(o.e)), n: o.n }
-            },
-            SAssign(x) -> {
-              let at = place(pl, acc.n);
-              let v: PlacedExpr = placed_expr(pl, x.value, acc.n + 1);
-              {
-                stmts: acc.stmts.push(
-                  SAssign({ span: at, name: ident_placed(x.name, at), value: v.e }),
-                ),
-                n: v.n,
-              }
-            },
-          },
-      );
-      let t: { e: Option<Expr>, n: Int } = maybe(b.tail, st.n);
-      { e: EBlock({ span: s, tail: t.e, stmts: st.stmts }), n: t.n }
-    },
-    ERecord(r) -> {
-      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, n + 1);
-      { e: ERecord({ span: s, fields: fs.fs }), n: fs.n }
-    },
-    ERecordUpdate(r) -> {
-      let base: PlacedExpr = placed_expr(pl, r.base, n + 1);
-      let fs: { fs: List<RecField>, n: Int } = fields(r.fields, base.n);
-      { e: ERecordUpdate({ span: s, base: base.e, fields: fs.fs }), n: fs.n }
-    },
-    ETry(t) -> {
-      let o: PlacedExpr = placed_expr(pl, t.operand, n + 1);
-      { e: ETry({ span: s, operand: o.e }), n: o.n }
-    },
-    EField(f) -> {
-      let base: PlacedExpr = placed_expr(pl, f.base, n + 1);
-      {
-        e: EField({ span: s, base: base.e, field: ident_placed(f.field, place(pl, base.n)) }),
-        n: base.n + 1,
-      }
-    },
-    EList(l) -> {
-      let xs: PlacedExprs = each(l.items, n + 1);
-      { e: EList({ span: s, items: xs.es }), n: xs.n }
-    },
-    EBad(_) -> { e: EBad({ span: s }), n: n + 1 },
-    EHole(h) -> { e: EHole({ span: s, text: h.text }), n: n + 1 },
-    // No default holds a perform, a handle, a hold, a region, a tagged literal or a `try` block.
-    _ -> { e: e, n: n + 1 },
-  }
-}
-
-/// `p` placed as `placed_expr` places the expression it stands in.
-fn placed_pat(pl: Placing, p: Pattern, n: Int) -> PlacedPat = {
-  let s = place(pl, n);
-  let each = |ps: List<Pattern>, from: Int|
-    ps.fold({ ps: [], n: from }, |acc: PlacedPats, x: Pattern| {
-      let o: PlacedPat = placed_pat(pl, x, acc.n);
-      { ps: acc.ps.push(o.p), n: o.n }
-    });
-  match p {
-    PWild(_) -> { p: PWild({ span: s }), n: n + 1 },
-    PVar(v) -> { p: PVar({ span: s, name: ident_placed(v.name, s) }), n: n + 1 },
-    PLit(l) -> { p: PLit({ span: s, lit: l.lit }), n: n + 1 },
-    PRange(r) -> { p: PRange({ ..r, span: s }), n: n + 1 },
-    PCtor(c) -> {
-      let xs: PlacedPats = each(c.args, n + 1);
-      { p: PCtor({ span: s, name: qname_placed(c.name, s), args: xs.ps }), n: xs.n }
-    },
-    PRecord(r) -> {
-      let fs = r.fields.fold(
-        { fs: [], n: n + 1 },
-        |acc: { fs: List<{ name: Ident, pat: Pattern }>, n: Int }, f: { name: Ident, pat: Pattern }| {
-          let o: PlacedPat = placed_pat(pl, f.pat, acc.n + 1);
-          { fs: acc.fs.push({ name: ident_placed(f.name, place(pl, acc.n)), pat: o.p }), n: o.n }
-        },
-      );
-      { p: PRecord({ span: s, rest: r.rest, fields: fs.fs }), n: fs.n }
-    },
-    PList(l) -> {
-      let xs: PlacedPats = each(l.items, n + 1);
-      let rest: { p: Option<Pattern>, n: Int } = match l.rest {
-        Some(x) -> {
-          let o: PlacedPat = placed_pat(pl, x, xs.n);
-          { p: Some(o.p), n: o.n }
-        },
-        None -> { p: None, n: xs.n },
-      };
-      { p: PList({ span: s, rest: rest.p, items: xs.ps }), n: rest.n }
-    },
-    POr(o) -> {
-      let xs: PlacedPats = each(o.alts, n + 1);
-      { p: POr({ span: s, alts: xs.ps }), n: xs.n }
-    },
-    PBad(_) -> { p: PBad({ span: s }), n: n + 1 },
-  }
-}
 
 /// A parameter; only a `fn` parameter may carry a `default`, or name with `cost` the steps a call of
 /// it takes and with `space` the memory a call of it holds, which only that definition's `cost` and
@@ -524,12 +208,10 @@ pub fn try_places(at: Span) -> TryPlaces =
     carried: minted(at, role_try_carried()),
   }
 
-fn tag_fn(t: Tagged, name: Bytes, role: Int) -> QName =
-  {
-    module: Some(t.tag),
-    name: { name: name, span: t.tag.span },
-    span: { ..t.tag.span, site: minted(t.span, role).site },
-  }
+fn tag_fn(t: Tagged, name: Bytes, role: Int) -> QName = {
+  let at = { ..t.tag.span, site: minted(t.span, role).site };
+  { module: Some(t.tag), name: { name: name, span: at }, span: at }
+}
 
 /// The function a tagged literal's check runs, as the literal's module names it: `literal` over
 /// the text of one with no hole, and `compile` over the texts around the holes of one with any. Its
@@ -1545,31 +1227,30 @@ pub fn case_at() -> Bytes = b"?at"
 /// The name a case's test is entered with its identity under; no source can spell it.
 pub fn case_identity() -> Bytes = b"?identity"
 
-fn cases_name(name: Bytes, at: Span) -> QName = {
-  let named = { ..at, site: 0 };
+fn cases_name(name: Bytes, module_at: Span, name_at: Span) -> QName =
   {
-    module: Some({ name: cases_binder(), span: named }),
-    name: { name: name, span: named },
-    span: named,
+    module: Some({ name: cases_binder(), span: module_at }),
+    name: { name: name, span: name_at },
+    span: name_at,
   }
-}
 
 /// A call into `std.cases`, made for the case's word at `from`. Both calls' callees stand at the
 /// case's type, where what they require of it is reported once.
-fn cases_call(span: Span, from: Span, ty: TypeExpr, name: Bytes, args: List<Expr>) -> Expr =
+fn cases_call(span: Span, from: Span, ty: TypeExpr, name: Bytes, args: List<Expr>) -> Expr = {
+  let callee = made_at(ty_span(ty), from, role_case_callee());
   EApp({
     span: span,
     func: EVar({
-      span: made_at(ty_span(ty), from, role_case_callee()),
-      name: cases_name(name, ty_span(ty)),
+      span: callee,
+      name: cases_name(name, made_at(ty_span(ty), from, role_case_callee_module()), callee),
     }),
     named: [],
     args: args,
     labels: [],
   })
+}
 
-fn local(name: Bytes, at: Span) -> Expr =
-  EVar({ span: at, name: bare({ name: name, span: { ..at, site: 0 } }) })
+fn local(name: Bytes, at: Span) -> Expr = EVar({ span: at, name: bare({ name: name, span: at }) })
 
 fn table_binder() -> Bytes = b"?table"
 
@@ -1578,15 +1259,16 @@ fn table_binder() -> Bytes = b"?table"
 fn table_bound(ty: TypeExpr, table: Expr, from: Span) -> Stmt = {
   let at = expr_span(table);
   let typed = { ..at, site: 0 };
+  let binder = made_at(at, from, role_case_table_binder());
+  let named = cases_name(
+    b"Table",
+    made_at(at, from, role_case_table_module()),
+    made_at(at, from, role_case_table_name()),
+  );
   SLet({
     span: made_at(at, from, role_case_table_let()),
-    pat: PVar({
-      span: made_at(at, from, role_case_table_binder()),
-      name: { name: table_binder(), span: typed },
-    }),
-    ty: Some(
-      TCon({ span: typed, name: cases_name(b"Table", at), args: [ty], labels: [], rows: [] }),
-    ),
+    pat: PVar({ span: binder, name: { name: table_binder(), span: binder } }),
+    ty: Some(TCon({ span: typed, name: named, args: [ty], labels: [], rows: [] })),
     value: table,
   })
 }

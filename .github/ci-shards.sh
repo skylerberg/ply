@@ -14,9 +14,10 @@
 #                                trees `ply bootstrap` reads embed is in one
 #   ci-shards.sh cache-keys      just the checks of the keys a job writes and reads,
 #                                of what `supersede` deletes and of the actions
-#   ci-shards.sh toolchain-inputs
+#   ci-shards.sh toolchain-inputs [core]
 #                                each path a bootstrap reads Ply from, one a line,
-#                                which the toolchain key hashes
+#                                which the toolchain key hashes; with `core`, of
+#                                the standard library only its prelude (`PRELUDE`)
 #   ci-shards.sh work ROLE       each path `ply.work` gives ROLE (`ply work`), one a
 #                                line
 #   ci-shards.sh store-paths     where the runs keep their stores, one pattern a
@@ -146,6 +147,11 @@ ACTIONS=(
 
 # The file that says where a bootstrap reads a checkout's parts (`toolchain_inputs`).
 TOOLCHAIN_WORKSPACE=ply.work
+
+# The prelude, the module of the language's own definitions, and the copy of its text the checker
+# reads builtins from, as paths under the library's tree: the one part of the library a `ply` takes
+# as given rather than reading a checkout's (`toolchain_inputs core`).
+PRELUDE=(prelude.ply prelude_source.ply)
 
 # What `ply work` prints of this checkout's `ply.work`, a role and a path a line, read once by the
 # commands that place a package, and the tables made of it.
@@ -483,7 +489,8 @@ ci_files() {
 # compared: it is the part a restore can match on, and the part both sides spell out. A cache is
 # for what a miss only slows: the repository's other runs evict any entry while a run's jobs wait
 # for runners, so a key that names the run is one a later run reads, and none is restored with
-# `fail-on-cache-miss`.
+# `fail-on-cache-miss`. No job restores a key it saved: the cache does not always show a key at once
+# after a save, so the read fails a save that worked.
 cmd_cache_keys() {
   local files=() file family
   for family in ${PER_JOB[@]+"${PER_JOB[@]}"}; do
@@ -513,6 +520,7 @@ cmd_cache_keys() {
       if (key == "") return
       steplit[++nlit] = key
       if (kind == "save") {
+        jobsaved[key] = FILENAME ":" FNR
         if (per_job(key) && index(value, key "${{ matrix.id }}-") == 0) jobless[++njobless] = FILENAME ":" FNR " saves \"" key "\""
         if (key in saved) return
         saved[key] = 1
@@ -524,6 +532,7 @@ cmd_cache_keys() {
         read[key] = 1
       } else {
         read[key] = 1
+        if (key in jobsaved) readback[++nreadback] = FILENAME ":" FNR " restores \"" key "\", which its job saved at " jobsaved[key]
       }
     }
     # A step is done: what it saves is saved from its path, and what it restores is only an entry
@@ -536,7 +545,9 @@ cmd_cache_keys() {
       if (mode == "restore" && stepfail && steprun) needed[++nneeded] = stepwhere
       nlit = 0; steppath = ""; inpath = 0; stepfail = 0; steprun = 0
     }
-    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0 }
+    FNR == 1 { flush(); mode = ""; inkeys = 0; indent = 0; split("", jobsaved) }
+    # A job of a workflow is a run of steps of its own.
+    /^  [A-Za-z0-9_-]+:[[:space:]]*$/ { flush(); mode = ""; inkeys = 0; split("", jobsaved); next }
     # A new list item is a new step; the rules below read the one they are in.
     /^[[:space:]]*-[[:space:]]/ { flush(); mode = ""; inkeys = 0 }
     /uses:[[:space:]]*actions\/cache\/save@/ { mode = "save"; inkeys = 0; stepwhere = FILENAME ":" FNR; next }
@@ -625,6 +636,10 @@ cmd_cache_keys() {
         printf "FAIL: %s restores a key that names the run with fail-on-cache-miss: what a job needs from another job of its run goes as an artifact\n", needed[i] > "/dev/stderr"
         bad = 1
       }
+      for (i = 1; i <= nreadback; i++) {
+        printf "FAIL: %s: the cache does not always show a key at once after a save\n", readback[i] > "/dev/stderr"
+        bad = 1
+      }
       nf = split(families, fk, " ")
       for (j = 1; j <= nf; j++) {
         if (fk[j] == "") continue
@@ -670,12 +685,23 @@ lexical() {
 
 # Each path of the repository a bootstrap reads Ply from, one a line: `ply.work`, the standard
 # library's, the compiler's and the program's trees it places, and every package the manifest of one
-# of those names by path, and theirs.
+# of those names by path, and theirs. With `core`, of the library only its prelude (`PRELUDE`), and a
+# prelude the tree does not hold fails, since a key that hashed nothing for it would match any.
 toolchain_inputs() {
-  local all prev dir rel
+  local scope=${1:-all} all prev dir rel file
   all=$({
     printf '%s\n' "$TOOLCHAIN_WORKSPACE"
-    role std
+    if [[ $scope == core ]]; then
+      for file in "${PRELUDE[@]}"; do
+        if [[ ! -f $root/$(role std)/$file ]]; then
+          echo "the library holds no $(role std)/$file, which PRELUDE names" >&2
+          exit 1
+        fi
+        printf '%s/%s\n' "$(role std)" "$file"
+      done
+    else
+      role std
+    fi
     role compiler
     role cli
   } | LC_ALL=C sort -u)
@@ -696,12 +722,21 @@ toolchain_inputs() {
   printf '%s\n' "$all"
 }
 
-# The trees the toolchain key hashes (`toolchain_inputs`) held to what a bootstrap reads: an `embed`
-# that leaves its tree is an input too, and must land in one, or a `ply` kept under the key would
-# stand for a file that moved.
+# The paths the toolchain key hashes (`toolchain_inputs`), and those its core hashes, held to what a
+# bootstrap reads: an `embed` that leaves its path is an input too, and must land in one, or a `ply`
+# kept under the key would stand for a file that moved.
 cmd_toolchain_embeds() {
-  local inputs trees path file rel target covered bad=0
-  inputs=$(toolchain_inputs)
+  local bad=0
+  toolchain_embeds all || bad=$((bad + 1))
+  toolchain_embeds core || bad=$((bad + 1))
+  return $((bad > 0))
+}
+
+# `cmd_toolchain_embeds` of the paths `toolchain_inputs SCOPE` lists. Within a tree only an `embed`
+# that climbs out of its module's directory can leave it; a file of the core leaves itself with any.
+toolchain_embeds() {
+  local scope=$1 inputs trees path file rel target covered pattern bad=0
+  inputs=$(toolchain_inputs "$scope")
   trees=$(grep -vxF -- "$TOOLCHAIN_WORKSPACE" <<< "$inputs" || true)
   if [[ -z $trees ]]; then
     echo "FAIL: $TOOLCHAIN_WORKSPACE places no part of the toolchain, so the toolchain key is held to nothing" >&2
@@ -715,19 +750,25 @@ cmd_toolchain_embeds() {
       [[ $target == "$path" || $target == "$path"/* ]] && covered=yes
     done <<< "$inputs"
     if [ "$covered" = no ]; then
-      echo "FAIL: ${file#"$root"/} embeds $target, outside every tree the toolchain key hashes" >&2
+      echo "FAIL: ${file#"$root"/} embeds $target, outside every path the $scope toolchain key hashes" >&2
       bad=$((bad + 1))
     fi
   done < <(while IFS= read -r path; do
-    [ -d "$root/$path" ] || continue
-    # `file:path` per embed that climbs out of its module's directory; a line of a `\\` text is a
-    # program a test writes, not this tree's.
-    { grep -rHE --include='*.ply' 'embed(_dir)?\("[^"]*\.\.[^"]*"' "$root/$path" || true; } |
+    if [ -d "$root/$path" ]; then
+      pattern='embed(_dir)?\("[^"]*\.\.[^"]*"'
+    elif [ -f "$root/$path" ]; then
+      pattern='embed(_dir)?\("[^"]*"'
+    else
+      continue
+    fi
+    # `file:path` per embed that can leave its path; a line of a `\\` text is a program a test
+    # writes, not part of the tree.
+    { grep -rHE --include='*.ply' "$pattern" "$root/$path" || true; } |
       { grep -vE '^[^:]*:[[:space:]]*\\\\' || true; } |
       sed -E 's/^([^:]*):.*embed(_dir)?\("([^"]*)".*/\1:\3/'
   done <<< "$inputs")
   if [ "$bad" -eq 0 ]; then
-    printf 'toolchain key: the %d paths a bootstrap reads Ply from hold every file they embed\n' "$(grep -c . <<< "$inputs")"
+    printf 'toolchain key (%s): the %d paths a bootstrap reads Ply from hold every file they embed\n' "$scope" "$(grep -c . <<< "$inputs")"
   fi
   return $((bad > 0))
 }
@@ -1316,7 +1357,7 @@ case "${1:-}" in
     cmd_prune_check
     cmd_actions
     ;;
-  toolchain-inputs) toolchain_inputs ;;
+  toolchain-inputs) toolchain_inputs "${2:-all}" ;;
   work) role "${2:?a role}" ;;
   store-paths) cmd_store_paths ;;
   ply-trees) cmd_ply_trees ;;
@@ -1335,7 +1376,7 @@ case "${1:-}" in
   supersede) cmd_supersede "${2:?a run id}" "${3:?a ref}" ;;
   nightly-modules) echo "${CLI_NIGHTLY[*]}" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|exclude-filter|gate-filter|host-filter|tree-checks|tree-check-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules}" >&2
     exit 2
     ;;
 esac

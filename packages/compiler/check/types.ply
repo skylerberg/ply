@@ -3,6 +3,7 @@
 import compiler.syntax.type_syntax (Mode, MRead, MWrite, MBad, MRaise, is_raise, mode_text, angled,
                                     mode_bin)
 import compiler.syntax.lexer (is_ident_continue)
+import compiler.syntax.parsing (Ident)
 import std.bin
 import std.list
 import std.bytes (ascii_of_int)
@@ -888,80 +889,70 @@ fn unify_row_at(
 
 // --- The environment ----------------------------------------------------------------------
 
-/// `stamps` holds each local binding's stamp; a global has none.
-pub type Scope = { schemes: Map<Bytes, Scheme>, open: List<Bytes>, stamps: Map<Bytes, Int> }
-/// `binds` counts the local bindings made so far, popped scopes' among them, so a stamp names one
-/// binding however its name is bound again.
-pub type TypeEnv = { scopes: List<Scope>, binds: Int }
+/// A scope's locals, each by the site of the name that binds it; the local each name it binds
+/// stands for in it; and in `open` those whose schemes may still reach a free variable.
+pub type Scope = { locals: Map<Int, Scheme>, names: Map<Bytes, Int>, open: List<Int> }
 
-fn scope_new() -> Scope = { schemes: Map::new(), open: [], stamps: Map::new() }
+pub type TypeEnv = { globals: Map<Bytes, Scheme>, open: List<Bytes>, scopes: List<Scope> }
 
-pub fn env_new() -> TypeEnv = { scopes: [scope_new()], binds: 0 }
+pub type InScope = { binder: Int, name: Bytes, sc: Scheme }
+
+fn scope_new() -> Scope = { locals: Map::new(), names: Map::new(), open: [] }
+
+pub fn env_new() -> TypeEnv = { globals: Map::new(), open: [], scopes: [] }
 pub fn env_push(env: TypeEnv) -> TypeEnv = { ..env, scopes: env.scopes.push(scope_new()) }
 pub fn env_pop(env: TypeEnv) -> TypeEnv =
-  if env.scopes.len() > 1 { { ..env, scopes: env.scopes.take(env.scopes.len() - 1) } } else { env }
+  if env.scopes.len() > 0 { { ..env, scopes: env.scopes.take(env.scopes.len() - 1) } } else { env }
 
-pub fn env_bind(env: TypeEnv, name: Bytes, scheme: Scheme) -> TypeEnv / {abort.raise} = {
+pub fn env_depth(env: TypeEnv) -> Int = env.scopes.len() + 1
+
+pub fn env_bind(env: TypeEnv, name: Ident, scheme: Scheme) -> TypeEnv / {abort.raise} = {
+  let binder = name.span.site;
   let last = env.scopes.len() - 1;
   let s = env.scopes.get(last);
   {
+    ..env,
     scopes: env.scopes.set(last, {
-      schemes: s.schemes.insert(name, scheme),
-      open: s.open.push(name),
-      stamps: s.stamps.insert(name, env.binds),
-    }),
-    binds: env.binds + 1,
-  }
-}
-
-pub fn env_bind_global(env: TypeEnv, name: Bytes, scheme: Scheme) -> TypeEnv / {abort.raise} = {
-  let s = env.scopes.get(0);
-  {
-    ..env,
-    scopes: env.scopes.set(0, {
-      ..s,
-      schemes: s.schemes.insert(name, scheme),
-      open: s.open.push(name),
+      locals: s.locals.insert(binder, scheme),
+      names: s.names.insert(name.name, binder),
+      open: s.open.push(binder),
     }),
   }
 }
 
-pub fn env_remove_global(env: TypeEnv, name: Bytes) -> TypeEnv / {abort.raise} = {
-  let s = env.scopes.get(0);
-  {
-    ..env,
-    scopes: env.scopes.set(0, {
-      ..s,
-      schemes: s.schemes.remove(name),
-      open: s.open.filter(|n: Bytes| n != name),
-    }),
-  }
-}
+pub fn env_bind_global(env: TypeEnv, name: Bytes, scheme: Scheme) -> TypeEnv / {abort.raise} =
+  { ..env, globals: env.globals.insert(name, scheme), open: env.open.push(name) }
 
-pub fn env_lookup(env: TypeEnv, name: Bytes) -> Option<Scheme> =
-  env.scopes.fold(None, |acc: Option<Scheme>, scope: Scope|
-    match scope.schemes.get(name) { Some(x) -> Some(x), None -> acc })
+pub fn env_remove_global(env: TypeEnv, name: Bytes) -> TypeEnv / {abort.raise} =
+  { ..env, globals: env.globals.remove(name), open: env.open.filter(|n: Bytes| n != name) }
 
-/// The local binding a name is in scope as: its stamp and what it was bound at.
-pub fn env_local(env: TypeEnv, name: Bytes) -> Option<{ stamp: Int, scheme: Scheme }> =
-  env.scopes.fold(None, |acc: Option<{ stamp: Int, scheme: Scheme }>, scope: Scope|
-    match scope.stamps.get(name) {
+pub fn env_lookup(env: TypeEnv, name: Bytes) -> Option<Scheme> = env.globals.get(name)
+
+/// The local the name at `binder` binds, with its depth.
+pub fn env_local(
+  env: TypeEnv,
+  binder: Int,
+) -> Option<{ scheme: Scheme, depth: Int }> / {abort.raise} =
+  range(0, env.scopes.len()).fold(None, |acc: Option<{ scheme: Scheme, depth: Int }>, i: Int|
+    match env.scopes.get(i).locals.get(binder) {
+      Some(scheme) -> Some({ scheme: scheme, depth: i + 1 }),
       None -> acc,
-      Some(stamp) -> match scope.schemes.get(name) {
-        Some(scheme) -> Some({ stamp: stamp, scheme: scheme }),
-        None -> acc,
-      },
     })
 
-/// The innermost scope holding `name`, as a depth; `0` is the globals.
-pub fn env_depth_of(env: TypeEnv, name: Bytes) -> Option<Int> / {abort.raise} =
-  range(0, env.scopes.len()).fold(None, |acc: Option<Int>, i: Int|
-    if env.scopes.get(i).schemes.contains(name) { Some(i) } else { acc })
-
-pub fn env_locals(env: TypeEnv) -> List<{ name: Bytes, sc: Scheme }> =
-  env.scopes.drop(1).fold([], |acc: List<{ name: Bytes, sc: Scheme }>, scope: Scope|
-    scope.schemes.fold(acc, |a: List<{ name: Bytes, sc: Scheme }>, k: Bytes, scheme: Scheme|
-      a.push({ name: k, sc: scheme })))
+/// The local each name in scope stands for, outermost scope first.
+pub fn env_locals(env: TypeEnv) -> List<InScope> / {abort.raise} = {
+  let n = env.scopes.len();
+  range(0, n).fold([], |acc: List<InScope>, i: Int| {
+    let scope = env.scopes.get(i);
+    scope.names.fold(acc, |found: List<InScope>, name: Bytes, binder: Int|
+      if range(i + 1, n).any(|j: Int| env.scopes.get(j).names.contains(name)) { found } else {
+        match scope.locals.get(binder) {
+          Some(sc) -> found.push({ binder: binder, name: name, sc: sc }),
+          None -> found,
+        }
+      })
+  })
+}
 
 fn scheme_free(subst: Subst, scheme: Scheme) -> Free / {abort.raise} = {
   let fv = free_vars(subst, scheme.ty, { tys: [], rows: [] });
@@ -973,33 +964,39 @@ fn scheme_free(subst: Subst, scheme: Scheme) -> Free / {abort.raise} = {
 
 /// Also closes every binding that reaches no free variable.
 pub fn env_free_vars(subst: Subst, env: TypeEnv) -> { e: TypeEnv, free: Free } / {abort.raise} = {
+  let globals = still_open(subst, env.open, |name: Bytes| env.globals.get(name), {
+    tys: [],
+    rows: [],
+  });
   let walked = env.scopes.fold(
-    { scopes: [], free: { tys: [], rows: [] } },
+    { scopes: [], free: globals.free },
     |acc: { scopes: List<Scope>, free: Free }, scope: Scope| {
-      let kept = scope.open.fold(
-        { open: [], free: acc.free },
-        |a: { open: List<Bytes>, free: Free }, name: Bytes|
-          match scope.schemes.get(name) {
-            None -> a,
-            Some(scheme) -> {
-              let fv = scheme_free(subst, scheme);
-              if fv.tys.len() == 0 && fv.rows.len() == 0 { a } else {
-                {
-                  open: a.open.push(name),
-                  free: {
-                    tys: ints_union(a.free.tys, fv.tys),
-                    rows: ints_union(a.free.rows, fv.rows),
-                  },
-                }
-              }
-            },
-          },
-      );
+      let kept = still_open(subst, scope.open, |binder: Int| scope.locals.get(binder), acc.free);
       { scopes: acc.scopes.push({ ..scope, open: kept.open }), free: kept.free }
     },
   );
-  { e: { ..env, scopes: walked.scopes }, free: walked.free }
+  { e: { ..env, open: globals.open, scopes: walked.scopes }, free: walked.free }
 }
+
+fn still_open<k>(
+  subst: Subst,
+  open: List<k>,
+  scheme_of: (k) -> Option<Scheme>,
+  free: Free,
+) -> { open: List<k>, free: Free } / {abort.raise} =
+  open.fold({ open: [], free: free }, |a: { open: List<k>, free: Free }, key: k|
+    match scheme_of(key) {
+      None -> a,
+      Some(scheme) -> {
+        let fv = scheme_free(subst, scheme);
+        if fv.tys.len() == 0 && fv.rows.len() == 0 { a } else {
+          {
+            open: a.open.push(key),
+            free: { tys: ints_union(a.free.tys, fv.tys), rows: ints_union(a.free.rows, fv.rows) },
+          }
+        }
+      },
+    })
 
 fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type / {abort.raise} =
   match t {

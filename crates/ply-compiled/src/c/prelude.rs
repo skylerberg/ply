@@ -106,17 +106,13 @@ machine! {
     "?in_count" => rt_in_count(I64) -> I64;
     "?in_field" => rt_in_field(Addr, I64);
     "?in_name_is" => rt_in_name_is(Addr, I64) -> I64;
-    "?in_handle" => rt_in_handle() -> Handle;
-    "?lower_open" => rt_lower_open(I64);
     "?shown_open" => rt_shown_open();
     "?lower_close" => rt_lower_close() -> I64;
-    "?lift_open" => rt_lift_open(Addr, I64);
     "?lift_close" => rt_lift_close();
     "?taken" => rt_taken(Addr, I64);
     "?hold_made" => rt_hold_made(Handed) -> Handle;
     "?hold_read" => rt_hold_read(Handle) -> Handed;
     "?hold_taken" => rt_hold_taken(Handle) -> Handed;
-    "?in_carried" => rt_in_carried() -> Handed;
     "?refused" => rt_refused(I64, I64, I64, I64) -> Raises;
     "?assert_failed" => rt_assert_failed(Addr, I64, Addr, I64) -> Raises;
 }
@@ -164,8 +160,6 @@ macro_rules! helpers {
 
 helpers! {
     rt_box_decimal(lo, hi) -> Word;
-    rt_float_rem(a, b) -> Word;
-    rt_no_fuel();
     rt_no_match();
     rt_let_no_match();
     rt_overflow(what);

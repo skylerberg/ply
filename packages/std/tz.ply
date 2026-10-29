@@ -5,10 +5,11 @@
 //! `tzdata.zi` of zone lines and rules, and `version` names the release. `zone("Europe/Paris")`
 //! finds a zone by its name there, written exactly as the database writes it, and makes it of the
 //! lines and rules that describe it; a link such as `US/Eastern` answers the zone it names, under
-//! that zone's own name. `tz"Europe/Paris"` is one checked when the program is. `utc` and `fixed`
-//! make a zone without the database, and `zone_in` one from a release a program embeds itself.
-//! Nothing here reads a clock or the host's own zone: an instant is an argument, and so is a
-//! zone.
+//! that zone's own name. `canonical` finds that name in any case. `tz"Europe/Paris"` is one checked
+//! when the program is. `utc` and `fixed` make a zone without the database, and `zone_in` one from
+//! a release a program embeds itself. Nothing here reads a clock or the host's own zone: an instant
+//! is an argument, and so is a zone. `extended` writes an instant with its zone as RFC 9557 does,
+//! and `zoned` reads one back, holding its zone to its offset.
 //!
 //! A `Zone` holds every change of its clocks from the first the database records to the end of
 //! what an `Instant` holds, the rules that run for ever written out year by year, so a question
@@ -26,7 +27,7 @@
 
 import std.bytes (is_digit)
 import std.date
-import std.date (DateTime, Extended, OffsetDateTime, Overflow, Period)
+import std.date (DateTime, Extended, OffsetDateTime, Overflow, Period, SuffixTag)
 import std.gen
 import std.gen (Gen)
 import std.laws (agrees)
@@ -98,6 +99,12 @@ pub type Why =
   | OffsetRange
   /// More changes than the limit.
   | TooMany
+  /// A reading's zone, whose clocks stand at another offset at the instant the reading names.
+  | Disagrees
+  /// A reading's tag other than its zone marked critical, which nothing here acts on.
+  | Critical
+  /// A reading of an instant outside what an `Instant` holds, 1677 to 2262.
+  | InstantRange
 
 /// A refusal, and the byte of the data its line starts at: zero where the name is unknown.
 pub type Refusal = new { why: Why, at: Int }
@@ -117,6 +124,9 @@ pub fn refusal_message(refused: Refusal) -> String =
     NoAbbreviation -> "nothing settles the abbreviation a zone line starts with",
     OffsetRange -> "an offset a day or more from UTC",
     TooMany -> "more changes of the zone's clocks than the limit",
+    Disagrees -> "the zone's clocks stand at another offset at the instant the reading names",
+    Critical -> "a tag of the reading other than its zone is marked critical, and nothing reads it",
+    InstantRange -> "an instant outside what an `Instant` holds, 1677 to 2262",
   }
 
 // --- The database ---------------------------------------------------------------
@@ -140,8 +150,8 @@ pub fn links() -> List<Link> =
   match try[abort.raise] { links_of(shipped()) } { Ok(found) -> found, Err(_) -> [] }
 
 /// The zone of a name: one the database lists, a link to one, or an offset written `+05:30` or
-/// `-03:30:15`, a sign and `hh:mm` with seconds or none. A name is matched as written: the
-/// database's names differ in case from no other, and `europe/paris` is none of them. Raises
+/// `-03:30:15`, a sign and `hh:mm` with seconds or none. A name is matched as written, and
+/// `europe/paris` is none: `canonical` finds the database's name for one in any case. Raises
 /// `tz.refused` for a name that is none.
 pub fn zone(name: String) -> Zone / {tz.refused} =
   match offset_named(name) {
@@ -151,6 +161,22 @@ pub fn zone(name: String) -> Zone / {tz.refused} =
 
 /// `zone`, with its refusal as an `Err`.
 pub fn parse(name: String) -> Result<Zone, Refusal> = try { zone(name) }
+
+/// The name `zone` gives the zone `name` names, matching it in any case and through a link:
+/// `us/eastern` is `America/New_York`, and `+05:30` is itself. The database's names differ from
+/// one another in more than case, so at most one matches. `None` for a name that is no zone's or
+/// link's in any case, and no offset.
+pub fn canonical(name: String) -> Option<String> =
+  match offset_named(name) {
+    Some(z) -> Some(table(z).name),
+    None -> {
+      let wanted = name.ascii_lower();
+      match names().find(|n: String| n.ascii_lower() == wanted) {
+        Some(found) -> Some(found),
+        None -> links().find(|l: Link| l.name.ascii_lower() == wanted).map(|l: Link| l.target),
+      }
+    },
+  }
 
 /// What a `tz"..."` literal is checked by: the zone `zone` answers, or why the text names none,
 /// with the nearest name the database has where one is near.
@@ -1032,6 +1058,33 @@ pub fn of_instant(z: Zone, at: Instant) -> OffsetDateTime = {
 pub fn extended(z: Zone, at: Instant) -> Extended =
   { instant: of_instant(z, at), zone: Some({ name: name(z), critical: false }), tags: [] }
 
+/// An instant, and the zone whose clocks read it.
+pub type Zoned = { zone: Zone, at: Instant }
+
+/// The zone and instant an RFC 9557 reading names, as `std.date`'s `parse_rfc9557` reads one and
+/// `extended` writes one: the instant its offset says, in the zone its suffix names, or in the
+/// fixed zone of its offset where it names none. An offset of zero is read as `Z`, which may stand
+/// beside any zone: the instant is UTC's, and the zone reads it. `std.date` reads `+00:00` and
+/// `-00:00` as `Z` too. Raises `tz.refused`: `Unknown` where the suffix names no zone, `Disagrees`
+/// where its clocks stand at another offset then, `Critical` where a tag other than the zone is
+/// marked critical, and `InstantRange` where the instant is outside what an `Instant` holds.
+pub fn zoned(e: Extended) -> Zoned / {tz.refused} = {
+  if e.tags.any(|tag: SuffixTag| tag.critical) { refuse(Critical, 0) };
+  let at = match date::instant(e.instant) { Some(i) -> i, None -> refuse(InstantRange, 0) };
+  let minutes = date::offset_minutes(e.instant);
+  match e.zone {
+    None -> match fixed(minutes * 60) {
+      Some(z) -> { zone: z, at: at },
+      None -> refuse(OffsetRange, 0),
+    },
+    Some(tag) -> {
+      let z = zone(tag.name);
+      if minutes != 0 && date::offset_minutes(of_instant(z, at)) != minutes { refuse(Disagrees, 0) }
+      else { { zone: z, at: at } }
+    },
+  }
+}
+
 /// The seconds that read `wall` on the zone's clocks, and the change that skipped it where one
 /// did: the stretch before the change numbered `index`, over which the clocks stand at `kind`,
 /// and each stretch after it that starts within a day of the reading.
@@ -1775,6 +1828,74 @@ test "an instant is written with its zone as RFC 9557 does, at an offset of whol
   assert_eq(
     date::rfc3339(of_instant(the_zone("Africa/Monrovia"), the_instant("1960-01-01T12:00:00Z"))),
     "1960-01-01T11:15:00-00:45",
+  )
+}
+
+/// What `zoned` makes of an RFC 9557 text, or why it refused.
+fn reading(text: String) -> Result<Zoned, Why> / {abort.raise} =
+  match date::parse_rfc9557(text) {
+    None -> panic(text ++ " is no RFC 9557 reading"),
+    Some(e) -> match try { zoned(e) } { Ok(found) -> Ok(found), Err(refused) -> Err(refused.why) },
+  }
+
+test "a reading written with its zone is read back as that zone and instant" {
+  let at = the_instant("2026-10-25T00:30:00Z");
+  let long_ago = the_instant("1890-01-01T12:00:00Z");
+  [
+    (the_zone("Europe/Paris"), at),
+    (the_zone("US/Eastern"), at),
+    (fixed(31500).expect("eight and three quarters"), at),
+    // An offset of seconds is written to the nearest minute, and read back so.
+    (the_zone("Europe/Paris"), long_ago),
+  ].fold((), |u: Unit, c: (Zone, Instant)|
+    match c {
+      (z, instant) ->
+        assert_eq(reading(date::rfc9557(extended(z, instant))), Ok({ zone: z, at: instant })),
+    })
+}
+
+test "a reading's zone is held to its offset, and a tag nothing here reads may not be critical" {
+  let paris = the_zone("Europe/Paris");
+  let summer = the_instant("2026-07-01T10:00:00Z");
+  assert_eq(reading("2026-07-01T12:00:00+02:00[Europe/Paris]"), Ok({ zone: paris, at: summer }));
+  assert_eq(
+    reading("2026-07-01T12:00:00+02:00[!Europe/Paris][u-ca=gregory]"),
+    Ok({ zone: paris, at: summer }),
+  );
+  // `Z` stands beside any zone, which reads the instant.
+  assert_eq(reading("2026-07-01T10:00:00Z[Europe/Paris]"), Ok({ zone: paris, at: summer }));
+  // Both readings of the hour the clocks went back through are the zone's, each its own instant.
+  assert_eq(
+    reading("2026-10-25T02:30:00+02:00[Europe/Paris]"),
+    Ok({ zone: paris, at: the_instant("2026-10-25T00:30:00Z") }),
+  );
+  assert_eq(
+    reading("2026-10-25T02:30:00+01:00[Europe/Paris]"),
+    Ok({ zone: paris, at: the_instant("2026-10-25T01:30:00Z") }),
+  );
+  assert_eq(
+    reading("2026-07-01T15:30:00+05:30"),
+    Ok({ zone: fixed(19800).expect("five and a half hours"), at: summer }),
+  );
+  assert_eq(reading("2026-07-01T11:00:00+01:00[Europe/Paris]"), Err(Disagrees));
+  assert_eq(reading("2026-07-01T12:00:00+02:00[Europe/Nowhere]"), Err(Unknown));
+  assert_eq(reading("2026-07-01T12:00:00+02:00[Europe/Paris][!u-ca=hebrew]"), Err(Critical));
+  assert_eq(reading("1600-01-01T00:00:00Z[Europe/Paris]"), Err(InstantRange))
+}
+
+test "a name is found in any case and through a link, named as `zone` names it" {
+  assert_eq(canonical("Europe/Paris"), Some("Europe/Paris"));
+  assert_eq(canonical("europe/PARIS"), Some("Europe/Paris"));
+  assert_eq(canonical("us/eastern"), Some("America/New_York"));
+  assert_eq(canonical("+05:30"), Some("+05:30"));
+  assert_eq(canonical("Europe/Nowhere"), None);
+  assert_eq(canonical(""), None);
+  // Every name and link of the database is found in another case, as the zone it names.
+  assert_eq(names().filter(|n: String| canonical(n.ascii_upper()) != Some(n)), []);
+  assert_eq(
+    links().filter(|l: Link| canonical(l.name.ascii_lower()) != Some(l.target)).map(|l: Link|
+      l.name),
+    [],
   )
 }
 
